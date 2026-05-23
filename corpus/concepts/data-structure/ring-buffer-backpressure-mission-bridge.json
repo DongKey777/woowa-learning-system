@@ -1,0 +1,45 @@
+{
+  "id": "data-structure/ring-buffer-backpressure-mission-bridge",
+  "title": "Ring Buffer Backpressure Mission Bridge",
+  "category": "data-structure",
+  "level": "intermediate",
+  "summary": "이 bridge는 ring buffer와 bounded queue backpressure를 연결한다. 고정 크기 buffer, producer consumer 속도 차이, overflow drop/reject/block 정책 같은 질문을 다룬다.",
+  "body_markdown": "# Ring Buffer Backpressure Mission Bridge\n\n## 미션 장면\n\n로그, 이벤트, 샘플 데이터를 고정 크기 buffer에 담고 consumer가 따라오지 못하면 어떻게 할지 정해야 한다. Ring buffer는 공간을 재사용하지만 overflow 정책을 대신 정해주지는 않는다.\n\n## 선택 기준\n\n- 데이터를 절대 잃으면 안 되는지, 최신 상태만 중요해서 오래된 데이터를 버려도 되는지 먼저 정한다.\n- producer를 block해도 되는 호출 경로인지, block이 장애 전파를 만들지 확인한다.\n- overflow 때 `drop-old`, `drop-new`, `reject/fail-fast`, `block`, `spill-to-disk` 중 어떤 정책이 domain에 맞는지 고른다.\n- 단일 producer/consumer인지, 다중 producer/consumer인지에 따라 동기화 모델과 구현 난도가 달라진다.\n- 관측용 telemetry와 결제/예약 command는 같은 buffer 정책을 쓰면 안 된다.\n- consumer가 일시적으로만 느린지, 지속적으로 처리량이 부족한지 구분한다. 지속 부족이면 buffer 크기 조정만으로 해결되지 않는다.\n- caller가 timeout, retry, fallback을 처리할 수 있으면 reject가 명확하고, 처리할 수 없으면 block이나 durable handoff를 검토한다.\n\n## Full/Empty와 backpressure 계약\n\n| 상태 | 구현 invariant | 운영 의미 |\n|---|---|---|\n| empty | 읽을 slot이 없고 consumer는 대기/미스 처리 | consumer lag가 0에 가까움 |\n| not full | producer가 O(1)로 기록 가능 | 정상 처리 구간 |\n| full + block | producer가 빈 slot을 기다림 | upstream 속도를 늦추는 backpressure |\n| full + reject | enqueue 실패를 즉시 반환 | caller가 retry/backoff를 결정 |\n| full + drop-old | 가장 오래된 unread slot을 버리고 최신 값을 씀 | 최신성 보존, 손실 metric 필수 |\n| full + drop-new | 새 입력을 버림 | 기존 순서 보존, 최신 입력 손실 |\n\nRing buffer 자체는 fixed-size storage다. Backpressure는 full 상태를 producer에게 block, reject, drop count 같은 관찰 가능한 신호로 돌려줄 때 생긴다. full 상태를 조용히 overwrite하면 backpressure가 아니라 데이터 손실이다.\n\n## 리뷰에서 보이는 냄새\n\n무한 큐로 속도 차이를 숨기면 결국 memory pressure나 긴 지연으로 드러난다. 고정 크기 buffer는 문제를 빨리 드러내는 대신 drop/block/reject 선택이 필요하다.\n\n## 개념 handoff\n\nRing buffer는 head/tail index가 원형으로 움직이는 구조다. 중요한 이벤트를 절대 잃으면 안 되는지, 최신 샘플만 중요하기 때문에 오래된 것을 버려도 되는지 먼저 정한다.\n\n## 핵심 invariant\n\n- buffer capacity는 고정이고, head/tail 또는 sequence가 readable slot과 writable slot을 구분해야 한다.\n- full 상태에서 unread 데이터를 덮어쓸 수 있는지는 명시된 overflow 정책으로만 결정되어야 한다.\n- FIFO 전달을 보장하는 정책에서는 producer가 쓴 순서와 consumer가 읽는 순서가 유지되어야 한다.\n- 다중 스레드에서는 write 완료 전 consumer가 slot을 보지 않도록 memory visibility가 보장되어야 한다.\n- backpressure는 \"속도 차이를 없애는 것\"이 아니라 초과 상태를 block/drop/reject 같은 신호로 드러내는 것이다.\n- `head == tail` 하나만으로 empty와 full을 동시에 표현할 수 없다. `size`, one-empty-slot, sequence number 중 하나가 필요하다.\n- sequence 기반 구현은 index wrap-around 이후에도 \"이 slot의 세대\"를 구분해야 stale read/write를 막을 수 있다.\n- capacity가 1이면 one-empty-slot 방식의 유효 저장 공간이 0이 될 수 있다. 최소 capacity와 표현 방식을 함께 정해야 한다.\n\n## Complexity/운영 비용\n\n- enqueue/dequeue는 보통 `O(1)`이고 메모리는 `O(capacity)`로 고정된다.\n- modulo 연산 대신 power-of-two capacity와 bit mask를 쓰면 hot path 비용을 줄일 수 있지만, 정확성이 먼저다.\n- lock, CAS, sequence padding, false sharing 회피가 p99 latency에 영향을 준다.\n- block 정책은 upstream thread pool을 고갈시킬 수 있고, drop 정책은 데이터 손실 관측/알림이 필요하다.\n- 운영 지표는 fill ratio, dropped count, rejected count, producer wait time, consumer lag를 같이 본다.\n\n## 실패 반례\n\n- 결제 이벤트를 `drop-old` ring buffer에 넣으면 consumer 지연 시 실제 돈과 기록이 어긋난다.\n- HTTP request thread에서 무기한 block하면 consumer 장애가 API 장애로 전파된다.\n- overflow metric 없이 drop하면 장애가 조용히 지나가고 사후 분석이 불가능하다.\n- 다중 producer가 같은 tail을 동기화 없이 갱신하면 slot overwrite와 순서 깨짐이 발생한다.\n- full 상태를 `head == tail`로 오판하면 빈 buffer처럼 보여 consumer가 읽지 못하거나 producer가 unread slot을 덮어쓴다.\n- producer가 slot에 payload를 쓰기 전에 tail을 먼저 공개하면 consumer가 부분 기록된 데이터를 읽을 수 있다.\n- capacity를 크게 잡아도 consumer 처리량이 producer보다 낮으면 fill ratio는 결국 100%에 붙는다.\n\n## 흔한 오해\n\n- Ring buffer는 backpressure 정책이 아니라 bounded storage 구현이다.\n- 고정 크기라고 해서 자동으로 안전한 것이 아니다. 꽉 찼을 때의 의미를 정해야 한다.\n- `drop-old`는 항상 빠른 해결책이 아니다. 최신 상태만 의미 있는 gauge나 샘플링에만 자연스럽다.\n- 무한 큐는 backpressure가 없는 것이 아니라 실패를 메모리 증가와 긴 지연으로 미루는 것이다.\n\n## Drill 후보\n\n용량 3 buffer에 이벤트 5개가 들어오고 consumer가 2개만 처리할 때 drop-old와 reject-new 결과를 비교해 본다.\n",
+  "aliases": [
+    "ring buffer backpressure mission bridge",
+    "fixed size circular buffer overflow",
+    "ring buffer 백프레셔",
+    "고정 크기 큐 overflow"
+  ],
+  "expected_queries": [
+    "ring buffer는 일반 queue와 뭐가 달라?",
+    "고정 크기 buffer가 꽉 차면 producer를 막아야 해 drop해야 해?",
+    "로그나 이벤트를 ring buffer에 넣을 때 overflow 정책은 어떻게 정해?"
+  ],
+  "symptoms": [
+    "큐가 무한히 커져 메모리를 잡아먹어요",
+    "오래된 이벤트를 버릴지 새 이벤트를 거절할지 정하지 않았어요",
+    "producer와 consumer 속도 차이를 숨기고 있어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/ring-buffer"
+    ],
+    "next_docs": [
+      "data-structure/bounded-queue-overflow-policy-chooser"
+    ],
+    "confusable_with": [
+      "data-structure/ring-buffer",
+      "data-structure/bounded-queue-overflow-policy-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/ring-buffer-backpressure-mission-bridge.md",
+    "revision_history": []
+  }
+}

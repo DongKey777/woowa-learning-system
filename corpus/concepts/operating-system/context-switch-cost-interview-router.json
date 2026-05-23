@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/context-switch-cost-interview-router",
+  "title": "Context Switch Cost Interview Router",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 context switch 비용 면접 질문을 register save/restore, scheduler, cache locality, thread pool saturation으로 분기한다.",
+  "body_markdown": "# Context Switch Cost Interview Router\n\n## 관찰 증거\n\n- runnable thread가 많고 CPU 사용률은 높지만 처리량이 오르지 않는다.\n- thread dump에 WAITING/BLOCKED/RUNNABLE이 섞여 있고 요청 latency tail이 길다.\n- \"스레드를 더 늘리면 빨라질까?\"라는 질문이 나온다.\n- context switch, CPU migration, cache miss, run queue, pool queue가 같은 구간에서 증가한다.\n- blocking I/O나 lock wait 때문에 thread 수가 늘었지만 실제로 runnable한 작업은 적을 수 있다.\n\n이 router의 첫 분기는 **voluntary switch인지 involuntary switch인지**, 그리고 runnable 과다인지 sleep/wait 과다인지다. context switch 수만 높다고 곧바로 \"스레드가 너무 많다\"로 결론내리면 I/O wait, lock park, cgroup throttle을 놓칠 수 있다.\n\n## 1차 분기\n\n| 답변 신호 | 다음 확인 | 연결 문서 |\n|---|---|---|\n| 전환 자체 비용 | register, stack pointer, scheduler bookkeeping | `context-switching-deadlock-lockfree` |\n| 캐시 지역성 악화 | CPU cache/TLB warm state가 깨지는지 | `run-queue-load-average-cpu-saturation` |\n| thread pool 과다 | queue 대기와 backpressure가 있는지 | `thread-pool-backpressure-saturation-playbook` |\n| lock 대기 증가 | BLOCKED/parked thread, monitor/lock owner | lock contention 자료 |\n| I/O 대기 증가 | runnable인지 sleep/wait인지 구분 | OS wait 지표 |\n| cgroup throttle | runnable하지만 quota 때문에 실행 못 하는지 | CPU throttling router |\n\n## 관찰 지표를 읽는 법\n\nContext switch 수는 단독 결론이 아니라 증상 후보를 좁히는 힌트다. 처리량, CPU 사용률, run queue, thread state, cache miss, lock wait, GC pause와 함께 봐야 한다. 전환 수가 늘어도 I/O 대기를 잘 숨기는 데 도움이 되는 경우가 있고, 반대로 CPU-bound workload에서는 runnable thread 과다가 locality와 scheduler overhead를 키울 수 있다.\n\nThread dump에서는 RUNNABLE이 많다고 모두 CPU를 쓰는 것은 아니라는 점을 주의한다. Native I/O, lock 대기, safepoint 대기처럼 dump 표현과 실제 OS state가 어긋날 수 있어 OS scheduler 지표와 함께 맞춘다.\n\nLinux CFS 계열 scheduler는 runnable task를 run queue에서 시간 배분한다. 그래서 비용의 첫 축은 저장/복원 자체이고, 두 번째 축은 run queue 대기, CPU migration, cache/TLB locality 손실이다. 특정 kernel version에서 몇 ns라고 외우는 답변보다, workload와 관찰 지표로 비용을 설명하는 편이 안전하다.\n\n```bash\npidstat -w -u -p <pid> 1\ncat /proc/<pid>/sched\nperf stat -e context-switches,cpu-migrations,cache-misses -p <pid> -- sleep 10\n```\n\n검증은 context switch 감소 자체가 아니라 처리량, p99, run queue, pool queue가 같이 개선되는지로 한다.\n\n## 면접 답변 골격\n\nContext switch는 현재 실행 context를 저장하고 다른 thread/process context를 복원하는 과정이다. 직접 비용에는 register, stack pointer, program counter 같은 실행 상태 저장/복원과 scheduler bookkeeping이 포함된다. 하지만 면접에서 더 중요한 축은 간접 비용이다. CPU cache/TLB locality가 식고, runnable queue가 길어지고, CPU migration, lock contention, pool saturation이 tail latency를 키울 수 있다.\n\n그래서 \"context switch는 비싸니 thread를 쓰면 안 된다\"가 아니라, workload 성격에 따라 균형을 잡아야 한다고 말한다. I/O-bound 작업은 일정 수준의 concurrency가 필요할 수 있고, CPU-bound 작업은 core 수와 runnable queue를 고려해 과도한 thread 증가를 피한다.\n\n## 운영 대응 축\n\n운영에서는 thread 수를 먼저 늘리는 대신 pool queue, active thread, rejection/backpressure, blocking call, lock wait를 확인한다. CPU-bound 병목이면 parallelism을 제한하고 작업 단위를 조정한다. Blocking I/O가 주된 원인이면 timeout, bulkhead, backpressure, async 전환 여부를 검토한다. 단, async도 queue와 backpressure 없이 쓰면 병목 위치만 옮길 수 있다.\n\n## 피해야 할 단정\n\n- Context switch는 함수 호출과 같은 비용이라는 설명은 부족하다.\n- Context switch 수가 높다는 이유만으로 thread 수가 원인이라고 단정하지 않는다.\n- CPU usage가 높다고 항상 유용한 계산을 하고 있는 것은 아니다.\n- Thread pool을 키우는 것은 증상 완화일 수 있지만 lock, I/O, downstream 지연의 근본 해결이 아닐 수 있다.\n\n## 관련 playbook\n\n운영 증상으로 들어오면 thread 수를 먼저 늘리지 말고 runnable queue, pool queue, blocking I/O, CPU saturation을 함께 확인한다.\n",
+  "aliases": [
+    "context switch interview router",
+    "context switch cost explanation",
+    "컨텍스트 스위치 비용 면접",
+    "스레드 전환 비용 라우터"
+  ],
+  "expected_queries": [
+    "context switch가 왜 비싼지 면접 답변을 정리해줘",
+    "스레드를 많이 만들면 왜 느려지는지 설명해줘",
+    "thread pool과 context switch를 어떻게 연결해서 말하지?"
+  ],
+  "symptoms": [
+    "context switch를 단순 함수 호출 비용처럼 설명해요",
+    "CPU register와 scheduler queue만 말하고 cache locality를 빼먹어요",
+    "thread pool saturation과 runnable queue 증가를 연결하지 못해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/context-switching-deadlock-lockfree"
+    ],
+    "next_docs": [
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "confusable_with": [
+      "operating-system/context-switching-deadlock-lockfree",
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/context-switch-cost-interview-router.md",
+    "revision_history": []
+  }
+}

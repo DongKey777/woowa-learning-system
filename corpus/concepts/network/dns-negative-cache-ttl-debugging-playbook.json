@@ -1,0 +1,57 @@
+{
+  "id": "network/dns-negative-cache-ttl-debugging-playbook",
+  "title": "DNS Negative Cache TTL Debugging Playbook",
+  "category": "network",
+  "level": "advanced",
+  "summary": "이 문서는 레코드 생성/수정 후에도 NXDOMAIN 또는 NODATA가 남는 장애를 authoritative DNS, recursive resolver, stub resolver, OS/JVM/browser runtime cache로 분해해 negative TTL 잔여 시간과 SOA authority section을 추적하는 advanced DNS debugging playbook이다.",
+  "body_markdown": "# DNS Negative Cache TTL Debugging Playbook\n\n> 한 줄 요약: DNS 레코드를 고친 뒤에도 일부 클라이언트가 계속 `NXDOMAIN`을 보면, \"DNS 전파가 늦다\"가 아니라 **어느 resolver 층이 어떤 negative TTL을 아직 들고 있는지**를 추적해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [DNS Negative Caching, NXDOMAIN Behavior](./dns-negative-caching-nxdomain-behavior.md)\n> - [DNS Negative Cache Failover Playbook](./dns-negative-cache-failover-playbook.md)\n> - [DNS Cache TTL Interview Symptom Router](./dns-cache-ttl-interview-symptom-router.md)\n> - [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n> - [DNS Split Horizon Behavior](./dns-split-horizon-behavior.md)\n\nretrieval-anchor-keywords: DNS negative cache TTL debugging, NXDOMAIN after record fix, stale NXDOMAIN, SOA authority section, resolver layering, authoritative vs recursive, NODATA cache, JVM DNS cache\n\n## 핵심 개념\n\n이 문서는 negative caching 자체 설명보다 **수정 이후에도 실패가 남는 운영 디버깅**에 초점을 둔다. DNS 조회 경로는 보통 애플리케이션, 런타임 캐시(runtime cache), OS stub resolver, 사내 또는 ISP recursive resolver, authoritative server로 나뉜다. 레코드를 control plane에서 만들었거나 zone file에 반영했다는 사실은 authoritative 층의 상태를 말할 뿐이다. 이미 어떤 recursive resolver가 \"그 이름은 없다\"는 부정 응답(negative answer)을 TTL과 함께 저장했다면, 그 resolver를 쓰는 클라이언트는 TTL이 끝날 때까지 계속 실패할 수 있다.\n\nRFC 2308 기준으로 부정 응답도 시간 제한(time to live)을 가진다. 응답 section에 실제 레코드가 없으므로 authoritative server는 authority section에 SOA 레코드를 실어 TTL 근거를 전달한다. 이때 negative TTL은 SOA의 TTL과 SOA MINIMUM 값 중 더 작은 쪽을 기준으로 만들어지고, cache 안에서는 일반 TTL처럼 감소한다. 그래서 디버깅의 시작점은 \"지금 authoritative가 맞는가\"와 \"어떤 recursive가 감소 중인 SOA TTL을 들고 있는가\"를 분리하는 것이다.\n\n## 디버깅 순서\n\n### 1. Authoritative source of truth부터 고정한다\n\n먼저 해당 zone의 authoritative name server에 직접 묻는다. 여기서도 `NXDOMAIN`이면 cache 문제가 아니라 record publish, delegation, split-horizon view, zone serial 반영 문제다. authoritative에는 새 `A`나 `AAAA`가 있고 public resolver 일부만 `NXDOMAIN`이면 그때부터 negative cache 잔여 시간 문제로 본다.\n\n```bash\ndig @ns1.example-dns.net api.example.com A +noall +answer +authority\ndig @ns1.example-dns.net api.example.com AAAA +noall +answer +authority\ndig @ns1.example-dns.net api.example.com SOA +noall +answer\n```\n\n### 2. Recursive resolver별로 남은 TTL을 표본화한다\n\n영향 사용자 네트워크의 resolver, 사내 resolver, public resolver를 나눠 같은 이름과 record type을 묻는다. `+authority`를 켜면 cached negative answer가 SOA와 함께 보일 수 있다. 남은 TTL이 resolver마다 다르면 \"전파\"가 아니라 각 resolver의 cache entry 수명이 다르게 남은 것이다.\n\n```bash\ndig @8.8.8.8 api.example.com A +noall +answer +authority\ndig @1.1.1.1 api.example.com A +noall +answer +authority\ndig @<affected-resolver-ip> api.example.com A +noall +answer +authority\n```\n\n주의할 점은 TTL을 지금 낮춰도 이미 저장된 negative cache가 즉시 짧아지지 않는다는 것이다. TTL 조정은 다음에 새 응답을 받은 cache부터 의미가 있다. 그래서 사후 대응에서는 \"flush할 수 있는 resolver인가\", \"기다려야 하는 최대 잔여 TTL은 얼마인가\", \"대체 hostname이 이미 존재하는가\"를 현실적으로 판단한다.\n\n### 3. NXDOMAIN, NODATA, CNAME 중간 실패를 갈라낸다\n\n`NXDOMAIN`은 이름 자체가 없다는 신호에 가깝고, `NOERROR`지만 answer가 비어 있으면 이름은 있으나 요청한 타입이 없다는 NODATA 계열로 본다. 예를 들어 `A`는 정상인데 `AAAA`를 뒤늦게 만들었다면 일부 resolver가 \"AAAA 없음\"을 따로 cache할 수 있다. CNAME chain도 최종 target만 보지 말고 각 hop을 직접 조회한다. 중간 CNAME 이름이 잠깐 없었던 이력이 있으면 최종 `A`가 정상이어도 chain 중간 negative cache 때문에 연결이 실패할 수 있다.\n\n## Layer별 판단 표\n\n| 관찰 | 더 가까운 원인 | 확인 |\n|---|---|---|\n| authoritative도 `NXDOMAIN` | record publish 또는 delegation 실패 | zone serial, control plane, split-horizon view |\n| authoritative는 정상, 특정 recursive만 `NXDOMAIN` | recursive negative cache 잔존 | SOA TTL, resolver별 remaining TTL |\n| recursive 조회는 정상, 앱 process만 실패 | OS/JVM/runtime DNS cache | process restart, JVM `networkaddress.cache.negative.ttl`, client resolver 설정 |\n| `A`는 정상, `AAAA`만 없음 | RR type별 NODATA cache | `A`/`AAAA`를 따로 조회 |\n| 최종 target은 정상, 원래 이름만 실패 | CNAME chain 중간 negative cache | chain 각 hop 직접 조회 |\n| 사내망만 실패 | split-horizon 또는 forwarding resolver cache | 내부 authoritative view와 forwarder cache |\n\n## 운영 대응\n\n가장 안전한 대응은 장애 시점에 새 이름을 처음 만들지 않는 것이다. 배포 전 placeholder record를 만들어 positive cache 상태를 유지하고, target만 바꾸면 negative cache tail을 크게 줄일 수 있다. 이미 문제가 난 뒤라면 모든 사용자 cache를 지우겠다는 계획보다 영향 resolver를 식별하고, 잔여 TTL 동안 우회 경로를 제공하는 편이 현실적이다. 사내 resolver는 flush 가능할 수 있지만 public recursive resolver는 운영자가 강제로 지울 수 없다고 가정한다.\n\n애플리케이션 쪽도 분리해야 한다. Java는 런타임 DNS cache 정책이 별도로 있을 수 있고, HTTP/gRPC client는 이미 열린 connection이나 channel을 계속 쓸 수 있다. 따라서 DNS가 정상으로 돌아온 뒤에도 process restart, connection pool drain, channel 재생성이 필요한지 확인한다. 다만 이 조치는 DNS cache 자체를 고치는 것이 아니라, process가 들고 있던 stale negative 또는 stale endpoint 상태를 버리는 조치다.\n\n## 흔한 함정\n\n- authoritative 직접 조회 성공 하나로 장애 종료를 선언한다.\n- `NXDOMAIN`과 `NOERROR` empty answer를 같은 실패로 기록한다.\n- CNAME chain 중간 이름을 보지 않고 최종 target만 확인한다.\n- TTL을 낮춘 뒤 \"왜 즉시 풀리지 않느냐\"고 판단한다.\n- browser cache 삭제로 OS/JVM/recursive cache까지 사라졌다고 생각한다.\n- DNS 수정 후에도 기존 connection reuse가 old endpoint traffic을 만드는 경우를 DNS 실패로 계속 분류한다.\n\n## 한 줄 정리\n\nDNS negative cache 장애의 핵심은 레코드가 지금 존재하느냐가 아니라, **레코드가 없던 시점에 만들어진 부정 응답이 어느 resolver 층에서 언제 만료되는가**다.\n",
+  "aliases": [
+    "DNS negative cache TTL debugging",
+    "NXDOMAIN after record fix",
+    "resolver negative TTL",
+    "authoritative vs recursive DNS cache",
+    "stale NXDOMAIN cache",
+    "SOA minimum negative TTL"
+  ],
+  "expected_queries": [
+    "authoritative DNS는 고쳤는데 recursive resolver가 NXDOMAIN을 계속 줄 때 어디부터 봐?",
+    "DNS negative TTL 잔여 시간을 SOA authority section과 resolver layer별로 추적하는 방법은?",
+    "새 레코드 생성 전 조회한 클라이언트만 DNS 수정 후에도 안 붙는 이유를 디버깅해줘",
+    "CNAME chain 중간 NXDOMAIN과 AAAA NODATA cache를 최종 A 레코드 문제와 어떻게 구분해?",
+    "DNS 레코드 fix 후 resolver, OS, JVM cache 중 어느 층이 stale negative answer를 들고 있는지 확인하는 절차는?"
+  ],
+  "symptoms": [
+    "authoritative DNS에는 새 레코드가 있는데 일부 recursive resolver가 계속 NXDOMAIN을 반환한다",
+    "TTL을 낮췄는데도 레코드 생성 전 조회했던 클라이언트만 계속 없는 이름으로 본다",
+    "DNS 수정 완료를 authoritative 응답 하나로 판단해서 resolver, OS, runtime cache 잔여 시간을 놓친다",
+    "CNAME 중간 이름이나 AAAA NODATA cache를 최종 A 레코드 문제로 오해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/dns-basics",
+      "network/dns-negative-caching-nxdomain-behavior",
+      "network/dns-cache-ttl-interview-symptom-router"
+    ],
+    "next_docs": [
+      "network/dns-negative-cache-failover-playbook",
+      "network/dns-split-horizon-behavior",
+      "network/dns-ttl-cache-failure-patterns"
+    ],
+    "confusable_with": [
+      "network/dns-negative-caching-nxdomain-behavior",
+      "network/dns-negative-cache-failover-playbook",
+      "network/dns-cache-ttl-interview-symptom-router",
+      "network/dns-ttl-cache-failure-patterns",
+      "network/dns-split-horizon-behavior"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/dns-negative-cache-ttl-debugging-playbook.md",
+    "revision_history": []
+  }
+}

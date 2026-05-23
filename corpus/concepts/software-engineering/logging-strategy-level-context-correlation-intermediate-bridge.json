@@ -1,0 +1,57 @@
+{
+  "id": "software-engineering/logging-strategy-level-context-correlation-intermediate-bridge",
+  "title": "로깅 전략 다음 단계 — 레벨 · 컨텍스트(MDC) · Correlation ID",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# 로깅 전략 다음 단계 — 레벨 · 컨텍스트(MDC) · Correlation ID\n\n> 한 줄 요약: 다음 단계 로깅 = *레벨 정책 + MDC 컨텍스트 + Correlation ID + 구조화 로깅*. 운영자가 *문제 한 건*을 추적할 수 있어야 한다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n기초 로깅(`log.info(\"...\")`)에서 다음 단계로 가는 이유는 두 가지다.\n\n1. **추적성** — 운영에서 \"10:23에 들어온 그 요청\"의 모든 로그를 한 줄로 묶고 싶다.\n2. **볼륨 관리** — 모든 걸 INFO로 찍으면 운영 로그 폭증. 레벨 정책 + 샘플링 필요.\n\n이 두 가지를 풀려면 *레벨 정책 + MDC + Correlation ID + 구조화 로깅* 네 가지를 같이 본다.\n\n## 한 장 정리\n\n| 도구 | 역할 |\n|---|---|\n| Log Level Policy | 어떤 정보가 어느 레벨에 — 일관성 보장 |\n| MDC (Mapped Diagnostic Context) | thread-local 컨텍스트 자동 부착 |\n| Correlation ID | 분산 환경에서 한 요청을 묶는 ID |\n| Structured Logging (JSON) | 기계가 파싱 가능한 모양 |\n| Sampling | 볼륨이 큰 로그를 일부만 |\n\n## 로그 레벨 정책 — 어떤 정보를 어디에\n\n| 레벨 | 의미 | 적용 예 | 운영 환경 노출 |\n|---|---|---|---|\n| `ERROR` | *사람이 즉시 봐야 할 사건* | DB 연결 실패, 정의된 invariant 위반, 5xx 응답 | 알람 |\n| `WARN` | 회복 가능한 비정상, 향후 대응 필요 | retry 후 성공, deprecated API 호출 | 대시보드 |\n| `INFO` | 비즈니스 상태 변화 | 예약 생성됨, 결제 성공 | 보관 |\n| `DEBUG` | 디버깅용 상세 | 변수 값, 분기 흐름 | 보통 prod off |\n| `TRACE` | 매우 상세 | 매 라인 흐름 | dev only |\n\n흔한 함정:\n- `INFO`에 *기술 디테일*을 적음 — \"JDBC 쿼리 실행\" 같은 건 DEBUG로.\n- `ERROR`를 너무 자주 — 진짜 호출 가치 떨어짐. 알람 피로 누적.\n- 같은 사건을 *코드마다* 다른 레벨로 — 정책 문서로 통일.\n\n## MDC — Thread-Local 컨텍스트\n\n```java\n// Servlet Filter / Spring Interceptor\npublic void doFilter(HttpServletRequest req, ...) {\n    String requestId = req.getHeader(\"X-Request-Id\");\n    if (requestId == null) requestId = UUID.randomUUID().toString();\n    MDC.put(\"requestId\", requestId);\n    MDC.put(\"userId\", currentUserId(req));\n    try {\n        chain.doFilter(req, ...);\n    } finally {\n        MDC.clear();   // thread reuse 대비 필수\n    }\n}\n\n// 다른 곳에서\nlog.info(\"Reservation created\");\n// → logback pattern에 %X{requestId}가 있으면 자동으로 부착됨\n```\n\nlogback pattern 설정:\n\n```xml\n<pattern>%d %level [%X{requestId}] [%X{userId}] %logger - %msg%n</pattern>\n```\n\n이러면 모든 로그가 자동으로 `[a1b2c3] [user-42]` 헤더를 가진다. *별도 코드 변경 없이* 추적성이 생긴다.\n\n⚠️ MDC는 *thread-local*이라 비동기/리액티브 환경에서 자동 전파되지 않는다. CompletableFuture / Reactor / @Async를 쓰면 별도 전파 처리 필요 (`MDC.getCopyOfContextMap()` 같이).\n\n## Correlation ID — 분산 환경\n\n마이크로서비스 환경:\n\n```\n[Gateway] req-id=abc123 → [Order Service] req-id=abc123 → [Payment Service] req-id=abc123\n```\n\n한 사용자 요청이 여러 서비스를 거치는 동안 *같은 req-id*를 전파한다. 운영 시 그 ID로 검색하면 모든 서비스 로그가 한 번에 뜬다.\n\n구현:\n- Gateway가 `X-Request-Id` 또는 `X-Correlation-Id` 헤더 발급.\n- 각 서비스가 incoming header를 MDC에 넣고, outgoing 호출에 같은 헤더 추가.\n- 분산 추적 시스템 (Sleuth, Micrometer Tracing, OpenTelemetry)이 자동 처리.\n\nSpring Boot 3 + Micrometer Tracing이 *traceId / spanId*를 자동 MDC에 주입 + outgoing http 헤더에 자동 전파.\n\n## 구조화 로깅 (Structured Logging / JSON)\n\n```\n# 평문 로그\n2025-12-25 10:00:00 INFO  ReservationService - Created reservation id=42 member=7\n\n# JSON 로그\n{\"ts\":\"2025-12-25T10:00:00Z\",\"level\":\"INFO\",\"logger\":\"ReservationService\",\n \"msg\":\"Created reservation\",\"reservation_id\":42,\"member_id\":7,\n \"request_id\":\"abc123\",\"trace_id\":\"xyz789\"}\n```\n\nJSON이 *기계가 파싱*하기 쉬우므로 ELK/Loki/CloudWatch Logs Insights 등에서 *필드별 검색/집계*가 가능.\n\n`logback-spring.xml`에 `logstash-logback-encoder` 같은 encoder 추가로 전환.\n\n## 자주 헷갈리는 지점\n\n- **`ERROR.printStackTrace()`** — System.err로 가서 *구조화 안 됨*. 반드시 `log.error(\"msg\", e)` 형식.\n- **MDC 안 비움** — Thread pool 환경에서 *다른 요청에 이전 MDC가 남음*. `finally`에서 `MDC.clear()` 필수.\n- **MDC를 비동기 작업에서 자동 전파될 거라 가정** — 안 됨. `CompletableFuture.supplyAsync(() -> { MDC.setContextMap(...); ... })` 같이 명시.\n- **로그에 PII (이메일/전화번호/비밀번호) 직접 출력** — 마스킹 또는 hash. 운영 로그는 *유출 시 사고*.\n- **DEBUG를 prod에서 켬** — 볼륨 폭증. 부분적으로 켜야 한다면 패키지별/시간 제한.\n\n## 학습자가 자주 만나는 시나리오\n\n- 미션 \"예약 생성에 실패하면 로그를 어떻게 남길까?\"\n  - `log.warn(\"Reservation create failed\", e)` (회복 가능한 비즈니스 실패) 또는 `log.error(\"...\")` (시스템 에러).\n- \"한 요청의 모든 로그를 묶고 싶다\" → MDC + 요청 ID Filter.\n- \"Spring 자동 traceId 사용\" → Spring Boot 3 + Micrometer Tracing 의존만 추가하면 자동.\n- \"Production에 DEBUG 잠시 켜야 함\" → `logging.level.com.example.reservation: DEBUG` env var 또는 actuator `/loggers` endpoint.\n- \"외부 API 호출이 너무 많아 로그가 폭증\" → 샘플링 (10%만 INFO, 100% WARN/ERROR).\n\n## 빠른 확인 질문\n\n- `ERROR`와 `WARN`의 핵심 차이?\n  - ERROR는 *사람이 즉시 봐야 함*, WARN은 *회복 가능한 비정상*.\n- MDC 사용 시 `MDC.clear()`가 꼭 필요한 이유?\n  - Thread pool 재사용 시 *이전 요청 컨텍스트 누수*.\n- 분산 환경에서 Correlation ID의 역할?\n  - 여러 서비스를 거치는 한 요청을 *하나로 묶음*.\n\n## 한 줄 정리\n\n로깅의 다음 단계 = *레벨 정책 + MDC 컨텍스트 + Correlation ID + 구조화 로깅*. 운영자가 한 요청을 *처음부터 끝까지* 추적할 수 있어야 진짜 가치가 나온다.\n\nretrieval-anchor-keywords: logging strategy, log level policy, ERROR WARN INFO DEBUG, MDC mapped diagnostic context, correlation id, trace id propagation, structured logging JSON, logback pattern, logstash-logback-encoder, Micrometer Tracing, Spring Boot 3 observability, log sampling, MDC clear thread pool, PII masking\n",
+  "aliases": [
+    "logging strategy",
+    "log level policy",
+    "MDC",
+    "Mapped Diagnostic Context",
+    "correlation id",
+    "trace id",
+    "request id",
+    "structured logging",
+    "JSON logging",
+    "로깅 전략",
+    "로그 레벨 정책",
+    "컨텍스트 로깅",
+    "분산 추적 ID"
+  ],
+  "expected_queries": [
+    "로그 레벨을 어떻게 골라야 해?",
+    "MDC가 정확히 뭐야 어떻게 써?",
+    "Correlation ID를 어떻게 만들어?",
+    "구조화 로깅이 평문보다 좋은 이유는?",
+    "같은 요청의 로그를 어떻게 묶어?",
+    "로그가 너무 많이 쌓이는데 어떻게 줄여?"
+  ],
+  "symptoms": [
+    "로그 레벨(DEBUG/INFO/WARN/ERROR)을 어떻게 골라야 할지 헷갈림",
+    "요청 단위로 로그를 묶고 싶은데 방법을 모름",
+    "같은 사용자/요청의 로그가 흩어져서 추적이 어려움",
+    "로그 볼륨이 너무 커서 운영에 부담"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/logging-strategy-basics"
+    ],
+    "next_docs": [
+      "spring/spring-logging-basics-primer"
+    ],
+    "confusable_with": [
+      "software-engineering/logging-strategy-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/logging-strategy-level-context-correlation-intermediate-bridge.md",
+    "revision_history": []
+  }
+}

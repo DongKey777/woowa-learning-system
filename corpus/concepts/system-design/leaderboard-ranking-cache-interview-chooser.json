@@ -1,0 +1,46 @@
+{
+  "id": "system-design/leaderboard-ranking-cache-interview-chooser",
+  "title": "Leaderboard Ranking Cache Interview Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 leaderboard 설계에서 exact rank, top N, shard merge, cache freshness를 구분한다.",
+  "body_markdown": "# Leaderboard Ranking Cache Interview Chooser\n\n## 10초 chooser\n\n| 요구 | 후보 | 이유 |\n|---|---|---|\n| 작은 범위 top N | Redis Sorted Set | 구현이 단순하고 빠름 |\n| 동적 rank/select를 직접 구현 | Order Statistic Tree | rank query 설명에 적합 |\n| 대규모 multi-shard global rank | precompute + merge | 정확도와 지연 trade-off |\n\n## 헷갈리는 축\n\nLeaderboard는 top N 조회, 특정 사용자의 rank 조회, 주변 rank 조회가 서로 다른 query다. 하나의 DB index로 모두 처리할 수도 있지만 write rate와 read latency 요구가 커지면 cache나 precompute가 필요하다.\n\nRedis Sorted Set은 score 기반 정렬과 rank query에 유용하지만, memory, persistence, shard merge, tie-breaking 정책을 같이 설계해야 한다.\n\nRanking/cache consistency는 \"Redis를 쓰면 빠르다\"에서 끝나지 않는다. Source of truth, ranking projection, cache/snapshot이 어느 순서로 갱신되고 실패 시 어떻게 수렴하는지를 정해야 한다. 특히 점수 correction, season reset, tie-breaking 변경은 cache에 남은 오래된 rank를 드러내기 쉽다.\n\n## Wrong-bucket neighbor\n\n정확한 global rank가 항상 필요한지 먼저 물어야 한다. 게임이나 이벤트에서는 몇 초 지연된 rank가 허용될 수 있고, 결제/정산 순위처럼 정확성이 중요한 곳은 reconciliation이 필요하다.\n\n## 핵심 요구사항\n\n- top N, 특정 사용자 rank, 사용자 주변 rank를 낮은 latency로 조회한다.\n- score update가 많아도 ranking cache와 source of truth가 수렴해야 한다.\n- tie-breaking, season reset, region/tenant별 board, cheating correction을 처리한다.\n- exact rank와 eventually consistent rank 중 product가 필요한 수준을 정한다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `Leaderboard`, `ScoreEvent`, `UserScore`, `RankSnapshot`, `RankQuery`다. `ScoreEvent`는 append-only event로 남기고, `UserScore`는 현재 점수 projection이며, `RankSnapshot`은 빠른 top N 조회를 위한 materialized view다.\n\n트래픽은 score write와 rank read가 이벤트 시간대에 함께 burst될 수 있다. Redis Sorted Set은 single-board top N과 rank query에 좋지만, multi-region/global board는 shard별 top K를 merge하거나 주기적으로 snapshot을 만든다.\n\n점수 update는 idempotent하게 처리한다. `ScoreEvent`에 event id와 monotonic score version을 두고, projection은 같은 event를 두 번 적용하지 않으며 늦게 도착한 이전 version이 최신 rank를 되돌리지 못하게 한다. Redis Sorted Set을 쓰더라도 member score 갱신과 tie-breaker materialization이 같은 version 기준으로 움직여야 한다.\n\n## Consistency/Latency Trade-off\n\n실시간 exact rank는 모든 score update가 즉시 하나의 정렬 구조에 반영되어야 하므로 hot board에서 병목이 된다. 몇 초 지연을 허용하면 queue 기반 projection, precompute, CDN/cache를 써서 read latency를 낮출 수 있다.\n\nCache freshness를 높이면 write path가 cache update에 민감해지고, cache를 느슨하게 두면 사용자가 방금 점수를 올렸는데 rank가 늦게 변한다. 사용자 본인 점수는 read-your-write로 보정하고 global top N은 eventual로 둘 수 있다.\n\n일관성 수준을 query별로 나누는 것이 중요하다. \"내 점수와 내 주변 rank\"는 방금 제출한 score version을 overlay해서 read-your-write처럼 보이게 하고, \"전체 top N\"은 projection lag를 표시하거나 몇 초 eventual로 둔다. 두 결과가 같은 화면에 함께 보이면 기준 시각이나 freshness label을 맞춰야 사용자가 모순으로 느끼지 않는다.\n\nCache update 방식도 trade-off가 다르다. Write-through는 freshness가 좋지만 Redis 장애가 write path에 붙을 수 있고, cache-aside는 단순하지만 miss storm과 stale read를 조심해야 한다. Periodic snapshot은 read가 안정적이지만 correction 반영이 늦으므로 drift metric과 reconciliation job이 필요하다.\n\n## 실패 반례\n\n- 모든 rank 조회를 DB `ORDER BY score DESC`로 처리해 참가자 증가와 함께 p99가 무너진다.\n- tie-breaking 정책이 없어 같은 score 사용자의 순위가 요청마다 흔들린다.\n- cache key가 season, region, rule version을 포함하지 않아 reset 뒤 이전 시즌 rank가 섞인다.\n- 늦게 도착한 score event가 최신 projection을 덮어 사용자의 rank를 되돌린다.\n- shard별 rank를 단순 합산해 global rank가 틀어진다.\n- 부정 점수 correction 후 cache/snapshot이 갱신되지 않아 잘못된 순위가 계속 보인다.\n\n## 면접 답변 Skeleton\n\n1. \"먼저 query를 top N, 내 rank, 주변 rank로 나누고 exactness 요구를 확인합니다.\"\n2. \"ScoreEvent를 source로 남기고 event id와 score version으로 UserScore projection을 idempotent하게 갱신합니다.\"\n3. \"작은 board는 Sorted Set, 대규모 global board는 shard별 top K merge와 periodic snapshot을 선택하고 freshness를 명시합니다.\"\n4. \"내 rank는 read-your-write overlay로 보정하고, global top N은 projection lag와 reconciliation으로 관리합니다.\"\n5. \"Tie-breaking, season reset, correction, cache invalidation key를 설계에 포함합니다.\"\n6. \"metric은 rank query p99, projection lag, cache hit ratio, rank drift, stale rank rate, hot board skew입니다.\"\n\n## Safe Next Docs\n\n자료구조 관점은 `order-statistic-tree-rank-select-primer`, cache 전략은 `redis-cache-aside-write-through-interview-chooser`로 이어진다.\n",
+  "aliases": [
+    "leaderboard ranking cache chooser",
+    "리더보드 설계 면접",
+    "rank query top N leaderboard",
+    "실시간 순위 캐시 설계"
+  ],
+  "expected_queries": [
+    "Leaderboard system design은 어떻게 답해?",
+    "실시간 순위와 top N을 어떻게 빠르게 조회해?",
+    "Redis Sorted Set은 어떤 한계가 있어?"
+  ],
+  "symptoms": [
+    "모든 rank query를 DB order by로 처리하려 합니다",
+    "exact real-time rank와 eventually consistent rank를 구분하지 못합니다",
+    "shard별 leaderboard merge 비용을 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/real-time-leaderboard-design"
+    ],
+    "next_docs": [
+      "data-structure/order-statistic-tree-rank-select-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser"
+    ],
+    "confusable_with": [
+      "data-structure/order-statistic-tree-rank-select-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/leaderboard-ranking-cache-interview-chooser.md",
+    "revision_history": []
+  }
+}

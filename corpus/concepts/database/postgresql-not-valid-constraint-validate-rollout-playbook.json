@@ -1,0 +1,60 @@
+{
+  "id": "database/postgresql-not-valid-constraint-validate-rollout-playbook",
+  "title": "PostgreSQL NOT VALID / VALIDATE CONSTRAINT Rollout Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# PostgreSQL NOT VALID / VALIDATE CONSTRAINT Rollout Playbook\n\n> 한 줄 요약: `NOT VALID`는 constraint를 안 지키겠다는 뜻이 아니라, 기존 row 검증을 나중으로 미루고 새 write부터 constraint를 적용한 뒤 `VALIDATE CONSTRAINT`로 과거 데이터를 따라잡는 rollout 도구다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [온라인 스키마 변경 전략](./online-schema-change-strategies.md)\n- [Online Backfill Verification, Drift Checks, and Cutover Gates](./online-backfill-verification-cutover-gates.md)\n- [Index Maintenance Window, Rollout, and Fallback Playbook](./index-maintenance-window-rollout-playbook.md)\n- [Destructive Schema Cleanup, Column Retirement, and Contract-Phase Safety](./destructive-schema-cleanup-column-retirement.md)\n- [Deferred Constraint / Commit-Time Validation Chooser](./deferred-constraint-commit-time-validation-chooser.md)\n- [FK Delete Policy Mission Drill](./fk-delete-policy-mission-drill.md)\n- [Generated Columns / Functional Index Migration](./generated-columns-functional-index-migration.md)\n\nretrieval-anchor-keywords: PostgreSQL NOT VALID constraint, VALIDATE CONSTRAINT, convalidated false, online constraint validation, add foreign key not valid, add check constraint not valid, Postgres constraint backfill, operational schema migration, foreign key rollout, check constraint rollout\n\n## 10초 판단표\n\n| 상황 | 선택 | 이유 |\n|---|---|---|\n| 작은 테이블이고 기존 row가 모두 깨끗하다는 증거가 있다 | 즉시 `ADD CONSTRAINT` 가능 | scan 비용과 lock window가 감당 가능하면 단순한 경로가 낫다 |\n| 큰 운영 테이블에 FK/CHECK를 추가한다 | `ADD CONSTRAINT ... NOT VALID` 후 `VALIDATE CONSTRAINT` | 새 write에는 constraint를 적용하면서 기존 row 검증 scan을 별도 window로 분리한다 |\n| `UNIQUE`나 `PRIMARY KEY`를 무중단으로 추가하고 싶다 | 보통 concurrent index + 별도 attach 전략 | `NOT VALID`를 모든 constraint에 적용할 수 있다고 보면 위험하다 |\n| 기존 dirty data가 남아 있다 | cleanup/backfill 먼저 | `VALIDATE`는 과거 row가 하나라도 깨지면 실패한다 |\n| 중간 transaction 상태만 잠깐 깨지는 문제다 | deferrable constraint 검토 | `NOT VALID`는 commit-time ordering 도구가 아니라 과거 row validation 지연 도구다 |\n\n## 핵심 mental model\n\n`NOT VALID`의 핵심은 시간 축을 둘로 나누는 것이다.\n\n- constraint를 추가한 이후의 새 row와 변경 row는 constraint를 지켜야 한다.\n- constraint를 추가하기 전부터 있던 기존 row는 아직 전부 검사하지 않았을 수 있다.\n- `VALIDATE CONSTRAINT`가 기존 row를 확인하고 통과하면 catalog에서 validated 상태가 된다.\n\n그래서 `NOT VALID` 상태는 \"constraint가 꺼져 있음\"이 아니다. 더 정확히는 \"앞으로 들어오는 데이터에는 gate가 있고, 과거 데이터에는 아직 증명서가 없음\"이다.\n\nPostgreSQL에서 이 패턴은 주로 `FOREIGN KEY`와 `CHECK` constraint rollout에 쓴다. `NOT NULL`, `UNIQUE`, `PRIMARY KEY`까지 같은 방식으로 일반화하면 오개념이 된다. unique 계열은 index build, concurrent index, attach, duplicate cleanup이라는 별도 전략으로 다뤄야 한다.\n\n## 기본 rollout 순서\n\n운영에서 안전한 순서는 보통 다음과 같다.\n\n1. application validation이나 write path를 먼저 배포해서 앞으로 나쁜 row가 덜 생기게 한다.\n2. 기존 dirty data를 찾아 cleanup/backfill한다.\n3. constraint를 `NOT VALID`로 추가한다.\n4. 새 write가 constraint violation을 내지 않는지 관찰한다.\n5. 트래픽과 batch가 낮은 window에서 `VALIDATE CONSTRAINT`를 실행한다.\n6. `convalidated=true`를 확인하고 후속 cleanup이나 contract phase로 넘어간다.\n\n예시:\n\n```sql\nALTER TABLE orders\n  ADD CONSTRAINT orders_customer_fk\n  FOREIGN KEY (customer_id) REFERENCES customers(id)\n  NOT VALID;\n\nALTER TABLE orders\n  VALIDATE CONSTRAINT orders_customer_fk;\n```\n\n`CHECK`도 같은 mental model로 볼 수 있다.\n\n```sql\nALTER TABLE payments\n  ADD CONSTRAINT payments_amount_positive\n  CHECK (amount > 0) NOT VALID;\n\nALTER TABLE payments\n  VALIDATE CONSTRAINT payments_amount_positive;\n```\n\nvalidation 상태는 catalog에서 확인한다.\n\n```sql\nSELECT conname, convalidated\nFROM pg_constraint\nWHERE conrelid = 'orders'::regclass;\n```\n\n## 운영 증거와 관찰 포인트\n\n`NOT VALID`가 lock을 모두 없애 주지는 않는다. DDL은 catalog를 바꾸고, `VALIDATE`는 기존 row를 읽어야 한다. 따라서 \"완전 online\"이라고 말하지 말고, 어떤 비용을 어느 단계로 옮겼는지 봐야 한다.\n\n관찰할 것:\n\n- `pg_stat_activity`에서 validation query가 얼마나 오래 도는지\n- lock wait가 생기는지\n- validation scan 때문에 IO, cache pressure, replica lag가 커지는지\n- FK validation에서 referencing column과 referenced key 쪽 index가 적절한지\n- violation 발견 시 어떤 row 범위에서 깨지는지\n\n특히 FK는 두 테이블의 관계를 확인한다. 참조하는 쪽 column에 index가 없거나, 데이터 분포가 치우쳐 있거나, referenced table이 hot하면 validation이 예상보다 비싸질 수 있다. `NOT VALID`는 검증 시점을 나눈 것이지 검증 비용 자체를 삭제한 것이 아니다.\n\n## Failure matrix\n\n| 증상 | 가능 원인 | 다음 확인 |\n|---|---|---|\n| `ADD CONSTRAINT ... NOT VALID` 직후 새 insert/update가 실패한다 | 새 write path가 아직 invariant를 지키지 않는다 | application validation, default, nullable 전환 순서 확인 |\n| `VALIDATE CONSTRAINT`가 실패한다 | 기존 dirty row가 남아 있다 | violation row를 찾고 cleanup/backfill 후 재시도 |\n| validation 동안 IO가 튄다 | 큰 테이블 scan이 cache와 storage를 압박한다 | 낮은 트래픽 window, batch pause, replica lag guardrail 확인 |\n| lock wait가 길어진다 | concurrent DDL/long transaction이 catalog 또는 table lock을 붙잡고 있다 | `pg_stat_activity`, blocking PID, migration window 확인 |\n| validated 후에도 application bug가 계속 난다 | DB constraint와 domain invariant가 서로 다른 것을 보고 있다 | CHECK/FK가 실제 business rule의 충분조건인지 재검토 |\n\n## Deferred constraint와 헷갈리지 않기\n\n둘 다 \"검증을 나중으로 미룬다\"는 말이 붙지만 방향이 다르다.\n\n- `NOT VALID`: constraint 추가 시점의 기존 row 검증을 나중으로 미룬다.\n- deferred constraint: 한 transaction 안의 statement별 검증을 commit 시점으로 미룬다.\n\n예를 들어 circular FK insert나 unique 값 swap은 deferred constraint의 문제다. 반대로 이미 수천만 row가 있는 테이블에 FK를 추가하면서 기존 row scan을 배포 시간에서 분리하고 싶은 문제는 `NOT VALID` rollout의 문제다.\n\nwrong-bucket 신호:\n\n- \"commit까지는 중간 상태가 잠깐 깨져도 돼\"라고 말하면 deferred constraint 쪽이다.\n- \"과거 row를 한 번에 scan하면 운영이 위험해\"라고 말하면 `NOT VALID` 쪽이다.\n- \"중복 없는 unique key를 새로 만들고 싶어\"라면 concurrent unique index와 duplicate cleanup 쪽을 봐야 한다.\n\n## 검증 질문\n\n1. `NOT VALID` constraint를 추가한 뒤 새 row는 constraint를 지키는가, 아니면 validation 전까지 모두 허용되는가?\n2. `VALIDATE CONSTRAINT`가 하는 일은 catalog flag 변경뿐인가, 아니면 기존 row scan과 확인이 포함되는가?\n3. `NOT VALID`를 `UNIQUE`, `PRIMARY KEY`, `NOT NULL` rollout의 일반 해법처럼 설명하면 왜 위험한가?\n4. FK rollout에서 referencing column index와 long transaction을 확인해야 하는 이유는 무엇인가?\n5. deferred constraint와 `NOT VALID` constraint를 한 문장으로 구분하면 어떻게 말할 수 있는가?\n\n## 한 줄 정리\n\n`NOT VALID`는 기존 데이터 검증을 안전한 운영 단계로 분리해 주는 PostgreSQL rollout 도구지만, validation scan·lock wait·dirty data cleanup은 여전히 설계해야 한다.\n",
+  "aliases": [
+    "PostgreSQL NOT VALID constraint",
+    "VALIDATE CONSTRAINT rollout",
+    "online constraint validation",
+    "add foreign key not valid",
+    "add check constraint not valid",
+    "Postgres constraint backfill",
+    "convalidated false",
+    "DB constraint rollout"
+  ],
+  "expected_queries": [
+    "PostgreSQL에서 NOT VALID constraint를 쓰면 기존 데이터 검증과 새 write 검증이 어떻게 나뉘어?",
+    "운영 테이블에 foreign key를 추가할 때 ADD CONSTRAINT NOT VALID와 VALIDATE CONSTRAINT rollout 순서를 알려줘",
+    "CHECK constraint를 NOT VALID로 추가한 뒤 convalidated=false 상태를 언제까지 허용해도 돼?",
+    "VALIDATE CONSTRAINT는 lock-free인지, 어떤 lock wait와 IO 비용을 봐야 하는지 설명해줘",
+    "deferred constraint와 NOT VALID constraint는 둘 다 검증을 늦추는 기능인데 어떤 차이가 있어?"
+  ],
+  "symptoms": [
+    "운영 테이블에 FK나 CHECK constraint를 추가해야 하지만 기존 row 전체 scan과 긴 migration lock이 걱정돼",
+    "application validation은 이미 넣었는데 DB constraint를 한 번에 추가하면 오래 걸릴까 봐 rollout 순서가 막혀",
+    "NOT VALID를 쓰면 완전히 lock-free online migration이라고 오해하고 VALIDATE 단계의 IO 비용을 놓치고 있어",
+    "VALIDATE CONSTRAINT가 실패했는데 새 write 문제인지 과거 dirty data 문제인지 구분하지 못하고 있어",
+    "deferred constraint와 NOT VALID constraint를 같은 commit-time validation 기능으로 착각하고 있어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/online-schema-change-strategies",
+      "database/online-backfill-verification-cutover-gates",
+      "database/index-maintenance-window-rollout-playbook"
+    ],
+    "next_docs": [
+      "database/destructive-schema-cleanup-column-retirement",
+      "database/deferred-constraint-commit-time-validation-chooser",
+      "database/fk-delete-policy-mission-drill",
+      "database/generated-columns-functional-index-migration"
+    ],
+    "confusable_with": [
+      "database/deferred-constraint-commit-time-validation-chooser",
+      "database/index-maintenance-window-rollout-playbook",
+      "database/generated-columns-functional-index-migration",
+      "database/online-schema-change-strategies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/postgresql-not-valid-constraint-validate-rollout-playbook.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "id": "spring/aop-proxy-self-invocation-interview-drill",
+  "title": "AOP Proxy Self Invocation Interview Drill",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 drill은 Spring AOP proxy와 self-invocation 함정을 면접 답변으로 구성한다. @Transactional이 proxy boundary에서만 적용되는 점과 private/direct call caveat를 강조한다.",
+  "body_markdown": "# AOP Proxy Self Invocation Interview Drill\n\n## 질문\n\n\"Spring AOP가 proxy 기반일 때 self-invocation에서 @Transactional이 적용되지 않는 이유를 설명해 주세요.\"\n\n## 기대 답변 축\n\n- Spring AOP는 대개 target 객체를 감싼 proxy가 method call을 가로채 advice를 적용한다.\n- proxy boundary는 \"Spring이 주입한 Bean reference를 통해 외부에서 들어오는 호출\"에 생긴다.\n- 외부 bean이 proxy를 통해 호출할 때 transaction interceptor 같은 advice chain이 실행된다.\n- 같은 객체 내부의 `this.otherMethod()` 또는 생략된 `otherMethod()` 호출은 proxy를 거치지 않고 target method를 직접 호출하므로 advice가 새로 적용되지 않는다.\n- `private` method, 직접 `new`로 만든 객체, subclass proxy에서의 `final` method는 proxy가 가로챌 수 있는 호출 지점이 아니거나 제한된다.\n- 해결은 transaction 경계를 외부 service로 분리하거나, proxy 경로로 호출되게 구조를 바꾸는 것이다.\n\n## 면접 답변 골격\n\n1. Spring AOP는 기본적으로 proxy 기반이라 \"호출 경로\"가 핵심이라고 시작한다.\n2. client가 bean을 주입받으면 보통 target 객체가 아니라 proxy를 받으며, proxy가 advice 체인을 실행한 뒤 target method를 호출한다.\n3. annotation은 method에 붙지만 interception은 proxy boundary에서 일어난다. 그래서 \"annotation이 있는가\"보다 \"그 method call이 proxy를 통과했는가\"가 먼저다.\n4. `this.method()`는 이미 target 객체 내부에 들어온 뒤의 직접 호출이므로 proxy가 개입할 지점이 없다.\n5. 따라서 `@Transactional`, `@Cacheable`, `@Async`, custom advice 모두 self-invocation에서는 기대대로 적용되지 않을 수 있다.\n6. `private` helper에 annotation을 붙이는 해결은 아니다. private method는 외부 proxy dispatch 대상이 아니고, public entry method 안에서 직접 호출될 뿐이다.\n7. 해결은 annotation을 더 붙이는 것이 아니라 transaction boundary와 객체 책임을 proxy 경로에 맞게 재설계하는 것이다.\n\n## Call Path 비교\n\n| 호출 | proxy 통과 | 결과 |\n|---|---|---|\n| `otherService.save()` | 예 | transaction advice 적용 가능 |\n| `this.save()` | 아니오 | target method 직접 호출, `save()`의 advice가 새로 적용되지 않음 |\n| `save()` 생략 호출 | 아니오 | Java가 같은 객체의 method call로 해석하므로 `this.save()`와 같다 |\n| `new OrderService().save()` | 아니오 | Spring Bean proxy가 아니라 평범한 객체라 advice chain이 없다 |\n| `private void save()` | 아니오 | 외부 proxy dispatch 대상이 아니며 override/intercept 지점으로 설계할 수 없다 |\n| final class/method | 제한 가능 | CGLIB subclass proxy 방식에서는 override 기반 interception이 막힌다 |\n\nJDK dynamic proxy는 interface 기반이고, CGLIB proxy는 subclass 기반이라는 차이가 있지만, self-invocation 문제의 핵심은 둘 다 \"외부에서 proxy로 들어온 호출만 가로챈다\"는 점이다.\n\nSpring 6+ class-based proxy에서는 `protected`나 package-visible method까지 transaction 대상이 될 수 있는 경우가 있다. 그래도 self-invocation, `private` method, 직접 `new` 객체 문제는 해결되지 않는다. visibility 지원 범위와 proxy를 통과했는지는 별도 축이다.\n\n## 직접 확인하는 증거\n\n- `AopUtils.isAopProxy(bean)`가 `true`여도 내부 `this.save()` 호출은 target 내부 직접 호출일 수 있다.\n- `org.springframework.transaction.interceptor` DEBUG 로그에서 외부 호출에는 transaction begin/commit이 보이고, 내부 호출에는 inner method entry가 보이지 않으면 proxy boundary를 우회한 것이다.\n- inner method에 `REQUIRES_NEW`, `timeout`, `readOnly`처럼 관측하기 쉬운 속성을 붙여도 내부 호출에서 변화가 없고 외부 proxy 호출에서만 변화가 있으면 self-invocation 증거다.\n- outer method가 이미 `@Transactional`이면 inner 코드에서 transaction active가 `true`로 보일 수 있다. 이것은 inner annotation이 적용됐다는 뜻이 아니라 outer transaction 안에서 실행됐다는 뜻일 수 있다.\n\n## 해결 선택지\n\n- transaction이 필요한 method를 별도 bean/service로 분리해 외부 proxy 호출이 되게 한다.\n- 유스케이스 경계가 잘못 잡힌 경우 public method 하나에 transaction을 걸고 내부 private method로 세부 절차를 나눈다.\n- 자기 자신 proxy를 주입받거나 `AopContext.currentProxy()`를 쓰는 방식은 기술적으로 가능해도 exposeProxy 설정과 Spring AOP 결합도가 필요해 우선 선택지는 아니다.\n- AspectJ weaving은 proxy 한계를 우회할 수 있지만 설정 복잡도와 팀 운영 비용을 함께 설명해야 한다.\n\n## 짧은 모범 답변\n\nSpring AOP는 대개 proxy가 method 호출을 가로채 advice를 적용하는 구조입니다. 외부 bean이 주입받은 proxy를 통해 호출하면 transaction interceptor가 실행되지만, 같은 객체 내부의 `this.someMethod()` 호출은 proxy를 거치지 않고 target method를 직접 호출합니다. 그래서 self-invocation에서는 `@Transactional`이 붙어 있어도 새 transaction boundary가 적용되지 않을 수 있습니다. `private` helper나 직접 `new`로 만든 객체도 proxy boundary 밖이라는 점을 같이 봐야 하고, 보통은 transaction 경계를 별도 service로 분리하거나 외부 proxy 호출 구조로 바꿔 해결합니다.\n\n## 약점 태그\n\n- `annotation-magic`: annotation 자체가 실행을 바꾼다고 생각함\n- `proxy-path`: proxy를 거치는 call path를 설명하지 못함\n- `boundary-design`: 해결을 AopContext 노출 같은 기술 hack으로만 봄\n\n## 복습 연결\n\ncall path 라우팅은 `transactional-self-invocation-call-path-router`로 이어진다.\n",
+  "aliases": [
+    "Spring AOP self invocation interview",
+    "proxy transactional answer drill",
+    "AOP 프록시 면접 답변",
+    "self invocation 트랜잭션 설명",
+    "@Async",
+    "@Cacheable",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "Spring AOP proxy를 면접에서 어떻게 설명해?",
+    "self-invocation에서 @Transactional이 왜 안 먹어?",
+    "proxy 기반 AOP의 한계를 설명해줘",
+    "private 메서드나 직접 호출에서는 AOP가 왜 안 걸려?"
+  ],
+  "symptoms": [
+    "annotation이 있으면 무조건 적용된다고 생각해요",
+    "this.method 호출과 proxy.method 호출 차이를 모릅니다",
+    "private/final method AOP 제약을 빼먹어요",
+    "직접 new로 만든 객체에도 advice가 붙는다고 생각해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/aop-basics"
+    ],
+    "next_docs": [
+      "spring/transactional-self-invocation-call-path-router"
+    ],
+    "confusable_with": [
+      "spring/aop-proxy-mechanism",
+      "spring/transactional-self-invocation-call-path-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/aop-proxy-self-invocation-interview-drill.md",
+    "revision_history": []
+  }
+}

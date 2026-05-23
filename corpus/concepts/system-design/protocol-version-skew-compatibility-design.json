@@ -1,0 +1,52 @@
+{
+  "id": "system-design/protocol-version-skew-compatibility-design",
+  "title": "Protocol Version Skew / Compatibility 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Protocol Version Skew / Compatibility 설계를 다루는 deep_dive 문서다. protocol version skew와 compatibility 설계는 old/new producer, consumer, client, server가 동시에 존재하는 기간에도 요청과 이벤트가 안전하게 해석되도록 버전 호환 규칙과 deprecation 경계를 운영하는 설계다. 검색 질의가 protocol version skew, compatibility, mixed version fleet, client server skew처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Protocol Version Skew / Compatibility 설계\n\n> 한 줄 요약: protocol version skew와 compatibility 설계는 old/new producer, consumer, client, server가 동시에 존재하는 기간에도 요청과 이벤트가 안전하게 해석되도록 버전 호환 규칙과 deprecation 경계를 운영하는 설계다.\n\nretrieval-anchor-keywords: protocol version skew, compatibility, mixed version fleet, client server skew, event schema compatibility, backward compatible protocol, forward compatible protocol, deprecation window, unknown field handling, version negotiation, capability negotiation\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Service Mesh Control Plane 설계](./service-mesh-control-plane-design.md)\n> - [API Gateway Control Plane 설계](./api-gateway-control-plane-design.md)\n> - [Event Bus Control Plane 설계](./event-bus-control-plane-design.md)\n> - [Deploy Rollback Safety / Compatibility Envelope 설계](./deploy-rollback-safety-compatibility-envelope-design.md)\n> - [Zero-Downtime Schema Migration Platform 설계](./zero-downtime-schema-migration-platform-design.md)\n> - [Config Rollback Safety 설계](./config-rollback-safety-design.md)\n> - [Capability Negotiation / Feature Gating 설계](./capability-negotiation-feature-gating-design.md)\n> - [Adapter Retirement / Compatibility Bridge Decommission 설계](./adapter-retirement-compatibility-bridge-decommission-design.md)\n\n## 핵심 개념\n\n배포 중에는 세상이 한 버전으로 통일되어 있지 않다.\n\n- old client / new server\n- new client / old server\n- old producer / new consumer\n- new producer / old consumer\n\n이 기간을 version skew라고 본다.\n좋은 시스템은 skew를 없애려 하지 않고 **skew를 견딜 수 있는 compatibility envelope를 설계**한다.\n\n## 깊이 들어가기\n\n### 1. 왜 skew가 생기는가\n\n대표 원인:\n\n- 점진 배포\n- mobile / edge client 지연 업그레이드\n- async consumer 장기 생존\n- replay / backfill 중 과거 payload 재처리\n- partial rollback\n\n즉, mixed-version window는 예외가 아니라 정상 상태에 가깝다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 서버 배포 30분\n- mobile client upgrade 반영 수일\n- consumer mixed-version 기간 수시간\n- event retention 수주\n\n이때 봐야 할 숫자:\n\n- oldest supported version\n- skew window length\n- incompatible request ratio\n- unknown field parse failure\n- deprecation lag\n\nprotocol compatibility는 QPS보다 \"얼마나 오래 구버전을 떠안아야 하는가\"가 더 중요하다.\n\n### 3. Compatibility 규칙\n\n대표 규칙:\n\n- unknown field ignore\n- additive field only\n- enum extension safe handling\n- required field 도입 시 default / fallback 제공\n- semantic meaning 변경 금지\n\n즉, field 추가보다 field 의미 변경이 더 위험할 때가 많다.\n\n### 4. API protocol vs event protocol\n\n둘은 비슷해 보이지만 다르다.\n\n- API protocol: request/response 협상과 status semantics가 중요\n- event protocol: long retention과 replay가 있어 과거 payload 호환이 중요\n\n이벤트는 retention 동안 과거 버전을 계속 읽을 수 있어야 하므로 deprecation 창이 더 길어지는 경우가 많다.\n\n### 5. Version negotiation and envelope\n\n선택지:\n\n- explicit version header\n- content-type / schema version\n- route versioning\n- feature capability bit\n\n핵심은 버전 숫자보다도 \"상대가 어떤 기능을 이해하는지\"를 명확히 아는 것이다.\n\n### 6. Deprecation과 point-of-removal\n\n호환성을 영원히 유지할 수는 없다.\n그래서 다음을 정해야 한다.\n\n- deprecation announce 시점\n- new use 금지 시점\n- old traffic 임계치\n- replay / archive 영향\n- removal point\n\n특히 이벤트 프로토콜은 \"현재 live traffic이 없음\"만으로 지워선 안 된다.\n\n### 7. Observability\n\n운영자는 다음을 봐야 한다.\n\n- 버전별 traffic 비율\n- skew window가 얼마나 남았는가\n- parse fallback 발생률\n- deprecated version 아직 사용 중인 caller\n- rollback 시 어떤 skew 조합이 생기는가\n\n이 데이터가 있어야 deprecation도 안전하게 할 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: mobile client와 server API 진화\n\n문제:\n\n- 오래된 앱 버전이 며칠간 남아 있다\n\n해결:\n\n- additive response field만 먼저 도입한다\n- required semantic 변경은 capability gating으로 감싼다\n- old client traffic이 충분히 줄어든 뒤 제거한다\n\n### 시나리오 2: event schema field 추가\n\n문제:\n\n- producer가 새 필드를 보내지만 일부 consumer는 아직 old version이다\n\n해결:\n\n- unknown field ignore를 기본으로 한다\n- semantic default를 둔다\n- replay consumer까지 포함해 compatibility를 검증한다\n\n### 시나리오 3: protocol rollback\n\n문제:\n\n- 새 binary를 되돌렸는데 새 protocol payload가 이미 일부 발생했다\n\n해결:\n\n- old binary가 new field를 무시 가능한지 확인한다\n- 불가능하면 full rollback 대신 forward-fix 또는 protocol adapter를 둔다\n- removal cleanup 전까지만 true rollback을 허용한다\n\n## 코드로 보기\n\n```pseudo\nfunction handleRequest(req):\n  version = negotiator.resolve(req)\n  if !compatibility.supports(version):\n    return error(\"unsupported_version\")\n  normalized = adapter.normalize(req, version)\n  return handler.process(normalized)\n\nfunction consume(event):\n  schema = registry.lookup(event.version)\n  decoded = decoder.decodeIgnoringUnknown(event, schema)\n  process(decoded)\n```\n\n```java\npublic DecodedEvent decode(EventPayload payload) {\n    return decoder.decode(payload, CompatibilityMode.IGNORE_UNKNOWN_FIELDS);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Strict single-version | 단순하다 | 점진 배포와 rollback이 어렵다 | 내부 low-latency control path |\n| Additive compatibility | 안전하다 | schema discipline이 필요하다 | 대부분의 API/event protocol |\n| Long deprecation window | 안전한 제거가 쉽다 | 운영 부담이 남는다 | mobile / retained events |\n| Fast removal | 복잡도가 줄어든다 | skew incident risk가 크다 | internal short-lived protocol |\n\n핵심은 protocol version skew 설계가 버전 번호 논의가 아니라 **mixed-version 기간을 정상 상태로 보고 그 안에서 안전하게 해석되는 규칙을 설계하는 것**이라는 점이다.\n\n## 꼬리질문\n\n> Q: additive field면 항상 안전한가요?\n> 의도: syntactic vs semantic compatibility 구분 확인\n> 핵심: 구문상 추가는 안전할 수 있어도 의미 변경이나 required behavior 변화는 여전히 위험하다.\n\n> Q: live traffic에 old version이 없으면 protocol 제거해도 되나요?\n> 의도: replay / retained payload 고려 확인\n> 핵심: 이벤트나 archive, delayed consumer가 남아 있으면 아직 제거하면 안 될 수 있다.\n\n> Q: version header만 있으면 해결되나요?\n> 의도: negotiation의 한계 이해 확인\n> 핵심: 헤더는 식별 수단일 뿐이고, 실제 안전성은 unknown field 처리, default semantics, deprecation policy에 달려 있다.\n\n> Q: rollback 때 protocol skew가 왜 더 심해지나요?\n> 의도: partial rollback 사고방식 확인\n> 핵심: 일부는 new payload를 이미 만들었는데 처리자는 old binary로 돌아가면 지원 조합이 더 복잡해지기 때문이다.\n\n## 한 줄 정리\n\nProtocol version skew / compatibility 설계는 old/new producer, consumer, client, server가 동시에 존재하는 기간을 전제로, mixed-version 해석 규칙과 deprecation 경계를 명시하는 운영 설계다.\n",
+  "aliases": [
+    "protocol version skew",
+    "compatibility",
+    "mixed version fleet",
+    "client server skew",
+    "event schema compatibility",
+    "backward compatible protocol",
+    "forward compatible protocol",
+    "deprecation window",
+    "unknown field handling",
+    "version negotiation",
+    "capability negotiation",
+    "Protocol Version Skew / Compatibility 설계"
+  ],
+  "expected_queries": [
+    "Protocol Version Skew / Compatibility 설계 설계 핵심을 설명해줘",
+    "protocol version skew가 왜 필요한지 알려줘",
+    "Protocol Version Skew / Compatibility 설계 실무 트레이드오프는 뭐야?",
+    "protocol version skew 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Protocol Version Skew / Compatibility 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Protocol Version Skew / Compatibility 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Protocol Version Skew / Compatibility 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/protocol-version-skew-compatibility-design.md",
+    "revision_history": []
+  }
+}

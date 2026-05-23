@@ -1,0 +1,76 @@
+{
+  "id": "system-design/outbox-watermark-token-primer",
+  "title": "Outbox Watermark Token Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "이 문서는 시스템 설계 입문자가 outbox row에 붙은 commit metadata를 downstream read freshness 기준선으로 어떻게 재사용하는지, required watermark와 applied watermark를 왜 따로 봐야 하는지 처음 잡는 primer다. 이벤트 기준선 넘기기, 읽기 모델이 어디까지 따라왔는지 확인, 숫자 하나로 stale read 판단, shard 범위 안에서만 비교, 주문 결제 뒤 최신 상태 확인 같은 자연어 paraphrase가 본 문서의 핵심 개념에 매핑된다.",
+  "body_markdown": "# Outbox Watermark Token Primer\n\n> 한 줄 요약: outbox row에 붙는 commit metadata는 \"downstream read model이 최소 여기까지 따라와야 한다\"는 단순한 기준선으로 재사용할 수 있고, 이 숫자를 token처럼 넘기면 stale read를 비교 한 번으로 설명하기 쉬워진다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Projection Applied Watermark Basics](./projection-applied-watermark-basics.md)\n- [Watermark Metadata Persistence Basics](./watermark-metadata-persistence-basics.md)\n- [Shard-Aware Watermark Scope Primer](./shard-aware-watermark-scope-primer.md)\n- [Change Data Capture / Outbox Relay](./change-data-capture-outbox-relay-design.md)\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)\n- [Database: Incremental Summary Table Refresh and Watermark Discipline](../database/incremental-summary-table-refresh-watermark.md)\n- [Design Pattern: Read Model Staleness and Read-Your-Writes](../design-pattern/read-model-staleness-read-your-writes.md)\n- [system design 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: outbox watermark token primer, outbox commit metadata token, commit lsn consistency token, outbox required watermark, downstream read watermark, what is outbox watermark, beginner consistency token, cdc outbox downstream read, read model watermark basics, outbox commit sequence token, shard aware watermark scope, outbox id across shards, outbox watermark cache metadata, refill metadata persistence, cache applied watermark bridge, outbox pattern + watermark token, required vs applied watermark, CDC outbox 동작, LSN log sequence number 의미, shard-aware watermark scope, read freshness 보장 토큰, monotonic read across shard, cache invalidation + watermark, outbox sequence consistency\n\n---\n\n## 핵심 개념\n\n먼저 가장 단순한 mental model부터 보자.\n\n> outbox row에 붙은 commit 번호를 \"이 downstream은 최소 여기까지 처리했는가?\"를 묻는 기준선으로 재사용할 수 있다.\n\n주문 `#123` 결제가 끝난 트랜잭션 안에서 `orders` row와 `outbox` row가 같이 commit되었다고 하자.\n이때 outbox row의 `id=9001`이나 `commit_lsn=9:001` 같은 metadata는 relay가 나중에 읽을 행 번호로만 쓰일 필요가 없다.\n\n같은 값을 downstream read 쪽에서는 이렇게 읽을 수 있다.\n\n- `required_watermark=9001`: 이 요청이 기대하는 최소 기준선\n- `projection.applied_watermark=8998`: 이 read model이 현재 따라온 위치\n\n그러면 질문은 복잡한 이론이 아니라 아래 한 줄이 된다.\n\n- `8998 < 9001`이면 아직 너무 오래됐다\n- `9001 <= applied_watermark`면 이 read model은 최소 그 commit까지는 반영했다\n\n핵심은 token이 원본 주문 전체를 담는 게 아니라, downstream이 **최소 어디까지 따라와야 하는지**를 담는다는 점이다.\n\n## 한눈에 보기\n\n| 단계 | source 쪽에서 생기는 값 | read 쪽에서 비교하는 값 | 읽는 사람이 물어볼 질문 |\n|---|---|---|---|\n| 1. 주문/결제 commit | `outbox.id=9001` | 아직 없음 | \"무슨 변경이 확정됐나?\" |\n| 2. relay publish | event에 `required_watermark=9001` 추가 | 아직 없음 | \"downstream이 어디까지 따라와야 하나?\" |\n| 3. projection apply | read model이 `applied_watermark=8998 -> 9001`로 전진 | `projection.applied_watermark` | \"이 read model은 그 commit을 봤나?\" |\n| 4. 사용자 조회 | request가 `required_watermark=9001` 전달 | `applied_watermark >= 9001` 검사 | \"지금 이 화면은 그 변경 이후 상태인가?\" |\n\n```text\nprimary tx(order row + outbox row#9001)\n  -> relay publishes event(required_watermark=9001)\n  -> projection catches up(applied_watermark=8998, then 9001)\n  -> read request compares 9001 vs applied_watermark\n```\n\n초보자는 여기서 \"token 생성\"보다 read model이 자기 watermark를 같이 들고 있는가를 먼저 보면 된다.\n그 read-side 기준선을 따로 정리한 문서는 [Projection Applied Watermark Basics](./projection-applied-watermark-basics.md)다.\n그리고 그 값을 cache refill 때 entry metadata로 남겨 다음 hit에서도 다시 검사하는 연결 고리는 [Watermark Metadata Persistence Basics](./watermark-metadata-persistence-basics.md)에서 이어서 설명한다.\n\n## 왜 outbox commit metadata가 token이 되나\n\n이게 성립하는 이유는 outbox row가 business row와 같은 commit 경계 안에서 만들어지기 때문이다.\n\n1. source transaction이 business row와 outbox row를 함께 commit한다\n2. 따라서 outbox row의 commit metadata는 \"그 business change가 확정된 순간\"과 붙어 있다\n3. relay는 이 metadata를 event에 실어 보낼 수 있다\n4. downstream projection은 자기 `applied_watermark`를 저장해 둔다\n5. read 요청은 둘을 비교해 stale 여부를 판단한다\n\n즉, token의 핵심은 \"message broker가 언제 publish했나\"가 아니라 source commit이 어디까지 확정됐나이다.\n\n여기서 ordering scope만 기억하면 된다.\n\n- 같은 aggregate 또는 같은 partition 안에서 비교 가능한가\n- projection의 `applied_watermark`도 같은 순서 체계를 따르는가\n\nbeginner 단계에서는 이 두 조건만 맞으면 충분하다.\n전역 글로벌 순서를 만들겠다는 순간 문서가 훨씬 어려워진다.\n특히 shard가 나뉘면 outbox id나 commit position은 범위 없이 직접 비교하면 안 되는데, 이 지점을 따로 정리한 문서는 [Shard-Aware Watermark Scope Primer](./shard-aware-watermark-scope-primer.md)다.\n\n## 주문 결제 예시로 따라가기\n\n주문 `#123`을 결제했다고 하자.\n\n```text\ntx commit\n- orders[123].status = PAID\n- outbox row id = 9001\n```\n\nrelay가 이 outbox row를 읽어 이벤트를 발행한다.\n\n```json\n{\n  \"event_type\": \"order_paid\",\n  \"order_id\": \"123\",\n  \"required_watermark\": 9001\n}\n```\n\n그런데 주문 상세 read model은 아직 `applied_watermark=8998` 상태일 수 있다.\n이때 사용자가 결제 완료 알림을 누르거나, 결제 직후 주문 상세를 열면 읽기 경로는 이렇게 판단한다.\n\n```pseudo\nif projection.appliedWatermark < requiredWatermark:\n  return fallback_to_primary_or_wait()\nreturn projection.read(orderId)\n```\n\n중요한 점은 downstream row 자체를 일일이 diff하지 않아도 된다는 것이다.\n`9001` 하나만 비교해도 \"이 read model이 그 commit 이전인가 이후인가\"를 빠르게 나눌 수 있다.\n\n이 패턴은 주문 상세뿐 아니라 아래에도 그대로 적용된다.\n\n- notification click 후 원본 상세 조회\n- dashboard card가 최신 승인 상태를 보여야 하는 경우\n- search/document read model이 방금 반영된 상태를 봐야 하는 경우\n\n## 어떤 값을 token으로 쓰면 쉬운가\n\n| 후보 값 | 초보자에게 왜 쉬운가 | 주의할 점 |\n|---|---|---|\n| outbox auto-increment id | 구현이 단순하고 눈으로 보기 쉽다 | shard가 여러 개면 table id 하나로 전역 비교는 어렵다 |\n| commit lsn / binlog position | source commit 순서를 더 직접적으로 반영한다 | DB 엔진별 표현이 달라질 수 있다 |\n| per-aggregate sequence | aggregate 단위 비교가 명확하다 | 다른 aggregate끼리는 직접 비교하면 안 된다 |\n| app timestamp | 이해는 쉽다 | clock skew와 동률 때문에 watermark로는 약하다 |\n\nbeginner 설계에서는 보통 아래 둘 중 하나로 시작한다.\n\n- 같은 DB/table 범위면 `outbox.id`\n- CDC/log 기반이면 `commit_lsn` 또는 equivalent position\n\n반대로 relay가 publish한 시각이나 앱 서버 시계 timestamp를 기준선으로 쓰면, source commit과 느슨하게 연결돼서 설명력이 떨어진다.\n\n## 흔한 오해와 함정\n\n- `outbox event id만 있으면 무조건 consistency token이다`라고 보면 안 된다. read model이 같은 순서 체계의 `applied_watermark`를 저장하고 있어야 비교가 된다.\n- `token이 있으니 exactly-once가 보장된다`는 뜻이 아니다. token은 freshness 기준선이지 delivery semantics 자체가 아니다.\n- `모든 downstream read가 항상 이 token을 받아야 한다`고 볼 필요는 없다. 결제 확인, 승인 완료, 알림 진입처럼 틀리면 안 되는 read부터 붙이면 된다.\n- `relay publish 완료 시간`을 token으로 쓰면 source commit과 어긋날 수 있다. 비교 기준은 publish 시각보다 source commit metadata가 더 안전하다.\n- `watermark가 같으면 화면 값이 100% 완벽하다`는 과장도 피해야 한다. 이 token은 최소한 \"그 commit 이전 상태는 아니다\"를 보여 주는 단순한 하한선이다.\n\n## 실무에서 쓰는 모습\n\n| 제품 흐름 | source에서 token 만드는 곳 | read에서 하는 가장 단순한 대응 |\n|---|---|---|\n| 결제 완료 -> 주문 상세 | 주문 row + outbox row commit | projection watermark 미달이면 primary fallback |\n| 승인 완료 알림 -> 권한 화면 | approval row + outbox row commit | 미달이면 \"처리 중\" 또는 fresh source read |\n| 검색 index -> 상세 화면 | indexing event에 `required_watermark` 전달 | stale index hit을 바로 채택하지 않고 overlay/fallback |\n| 백오피스 대시보드 | aggregate update + outbox | widget별 applied watermark를 보고 restatement/placeholder 결정 |\n\n관측 신호도 단순하게 시작할 수 있다.\n\n- `required_watermark`\n- `applied_watermark`\n- `fallback_reason=watermark`\n- `projection_lag_by_watermark`\n\n이 정도만 있어도 \"이상하게 stale하다\"를 숫자로 설명하기 쉬워진다.\n\n## 더 깊이 가려면\n\n- [Change Data Capture / Outbox Relay](./change-data-capture-outbox-relay-design.md)\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Database: Incremental Summary Table Refresh and Watermark Discipline](../database/incremental-summary-table-refresh-watermark.md)\n- [Design Pattern: Read Model Staleness and Read-Your-Writes](../design-pattern/read-model-staleness-read-your-writes.md)\n\n## 면접/시니어 질문 미리보기\n\n> Q: outbox row의 metadata가 왜 downstream consistency token으로 쓸 만한가요?\n> 의도: source commit 경계와 read-side 비교 기준을 연결할 수 있는지 확인\n> 핵심: business row와 outbox row가 같은 transaction에서 commit되므로, outbox metadata는 \"그 변경이 최소 언제 확정됐는가\"를 downstream에 전달하는 하한선이 된다.\n\n> Q: token은 event payload 전체와 어떻게 다른가요?\n> 의도: payload 내용과 ordering/freshness 기준을 구분하는지 확인\n> 핵심: payload는 무엇이 바뀌었는지 설명하고, token은 read model이 최소 어디까지 따라와야 하는지 비교하는 숫자다.\n\n> Q: beginner 단계에서 가장 단순한 구현은 무엇인가요?\n> 의도: 과한 글로벌 ordering 없이 시작점을 설명하는지 확인\n> 핵심: outbox row의 monotonic id나 commit_lsn을 event의 `required_watermark`로 싣고, projection은 `applied_watermark`를 저장한 뒤 read에서 둘을 비교한다.\n\n## 한 줄 정리\n\noutbox commit metadata는 \"이 downstream read는 최소 여기까지 반영해야 한다\"는 simple consistency token으로 재사용할 수 있고, read model의 applied watermark와 비교하면 downstream stale 여부를 훨씬 단순하게 설명할 수 있다.\n",
+  "aliases": [
+    "outbox watermark token primer",
+    "outbox commit metadata token",
+    "commit lsn consistency token",
+    "outbox required watermark",
+    "downstream read watermark",
+    "what is outbox watermark",
+    "beginner consistency token",
+    "cdc outbox downstream read",
+    "read model watermark basics",
+    "outbox commit sequence token",
+    "shard aware watermark scope",
+    "outbox id across shards",
+    "outbox watermark cache metadata",
+    "refill metadata persistence",
+    "cache applied watermark bridge",
+    "outbox pattern",
+    "아웃박스 패턴",
+    "watermark",
+    "워터마크",
+    "required watermark",
+    "applied watermark",
+    "CDC",
+    "change data capture",
+    "LSN",
+    "log sequence number",
+    "commit LSN",
+    "read freshness token",
+    "read consistency token",
+    "monotonic read across shard"
+  ],
+  "expected_queries": [
+    "outbox row의 commit 번호를 왜 consistency token처럼 써도 돼?",
+    "required watermark는 어디서 만들어지고 읽기 요청까지 어떻게 넘어가?",
+    "projection이 아직 덜 따라왔는지 숫자 하나로 판단하는 감각을 설명해줘",
+    "outbox id와 applied watermark를 같은 범위에서만 비교해야 하는 이유가 뭐야?",
+    "알림이나 주문 상세에서 outbox 기반 기준선을 언제 붙이면 좋은지 예시가 필요해"
+  ],
+  "symptoms": [
+    "outbox 숫자를 왜 read freshness 기준선으로 써도 되는지 모르겠어",
+    "required watermark와 applied watermark가 자꾸 같은 값처럼 보여",
+    "shard가 나뉘면 outbox id를 그대로 비교해도 되는지 헷갈려"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/change-data-capture-outbox-relay-design",
+      "system-design/read-after-write-consistency-basics"
+    ],
+    "next_docs": [
+      "system-design/projection-applied-watermark-basics",
+      "system-design/watermark-metadata-persistence-basics",
+      "system-design/shard-aware-watermark-scope-primer"
+    ],
+    "confusable_with": [
+      "system-design/projection-applied-watermark-basics",
+      "system-design/notification-causal-token-walkthrough",
+      "system-design/consistency-idempotency-async-workflow-foundations"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/outbox-watermark-token-primer.md",
+    "revision_history": []
+  }
+}

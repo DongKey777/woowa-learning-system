@@ -1,0 +1,55 @@
+{
+  "id": "language/saturating-arithmetic-clamping-domain-contracts",
+  "title": "Saturating Arithmetic Clamping and Domain Contracts",
+  "category": "language",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Saturating Arithmetic, Clamping, and Domain Contracts\n\n> 한 줄 요약: overflow를 막기 위해 값을 min/max로 clamp하는 saturating arithmetic는 편리해 보이지만, 많은 backend 도메인에선 bug를 숨길 수 있다. 어디서 saturate할지와 어디서 fail-fast할지를 안 나누면 재고, quota, retry, backoff, metrics가 조용히 틀어진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Integer Overflow, Exact Arithmetic, and Unit Conversion Pitfalls](./integer-overflow-exact-arithmetic-unit-conversion-pitfalls.md)\n> - [BigInteger, Unsigned Parsing, and Numeric Boundary Semantics](./biginteger-unsigned-parsing-boundaries.md)\n> - [Value Object Invariants, Canonicalization, and Boundary Design](./value-object-invariants-canonicalization-boundary-design.md)\n> - [Executor Sizing, Queue, Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n\n> retrieval-anchor-keywords: saturating arithmetic, clamp, clamped value, fail fast arithmetic, numeric overflow policy, retry backoff clamp, quota max cap, counter saturation, domain contract, arithmetic policy\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nsaturating arithmetic는 범위를 넘는 값을 예외 대신 경계값으로 눌러 버린다.\n\n예:\n\n- 너무 크면 `MAX_VALUE`\n- 너무 작으면 `MIN_VALUE`\n- quota는 0 미만으로 안 내려가게 clamp\n\n문제는 이 정책이 domain contract와 맞지 않으면  \n오류를 복구하는 게 아니라 숨기게 된다는 점이다.\n\n## 깊이 들어가기\n\n### 1. fail-fast와 saturate는 다른 철학이다\n\n- fail-fast: 계약 위반을 즉시 드러낸다\n- saturate: 값 범위를 강제로 안전 영역에 눌러 담는다\n\n어느 쪽이 맞는지는 수학보다 도메인 의미가 결정한다.\n\n### 2. UI/telemetry와 core business logic는 정책이 다를 수 있다\n\nclamp가 잘 맞는 경우:\n\n- progress bar 표시\n- retry delay upper cap\n- metrics bucket boundary\n\nclamp가 위험한 경우:\n\n- 재고 수량\n- 정산 금액\n- quota 청구 기준\n- 권한/제한 카운터\n\n즉 saturating arithmetic는 표현 계층엔 맞고 core invariant엔 위험할 수 있다.\n\n### 3. backoff는 saturation이 합리적일 수 있다\n\nretry backoff는 보통 upper bound를 두는 것이 자연스럽다.\n\n- 100ms\n- 200ms\n- 400ms\n- ...\n- max 30s\n\n이 경우는 saturate가 의도된 정책이다.  \n하지만 왜 clamp하는지 문서화되지 않으면 그냥 overflow workaround처럼 보일 수 있다.\n\n### 4. 재고/잔액/청구는 saturation이 bug를 숨길 수 있다\n\n예를 들어 잔액이 음수가 되면 안 된다고 해서 0으로 clamp하면,  \n실제로는 중복 차감이나 순서 역전 버그를 숨기는 결과가 된다.\n\n이런 곳은 보통:\n\n- atomic SQL\n- exact arithmetic\n- invariant validation\n\n이 먼저다.\n\n### 5. saturating policy도 값 객체로 잠그는 편이 좋다\n\nclamp가 맞는 도메인이라면 helper util보다 value object나 명시적 policy 이름이 낫다.\n\n- `BackoffMillis.nextCapped()`\n- `TokenBucketLevel.saturatedAdd()`\n\n이렇게 해야 \"이 clamp가 의도된 것인지 임시 땜질인지\"가 드러난다.\n\n## 재현 조건\n\nclamp 정책 문제는 값이 경계에 붙는 순간보다, 그 경계값이 domain 의미를 숨길 때 드러난다.\n\n- backoff delay가 여러 번 증가해 max cap에 도달한다\n- 재고나 잔액 계산에서 음수 결과를 0으로 눌러 버린다\n- quota counter가 max에 붙은 뒤 실제 초과 사용량이 metric에서 사라진다\n- UI progress clamp helper를 domain 계산에도 재사용한다\n\n재현할 때는 \"값이 범위 안에 있다\"만 보지 말고, clamp가 발생했다는 사실 자체를 관측할 수 있는지 확인해야 한다.\n\n## failure matrix\n\n| 상황 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| retry delay가 max cap에 붙음 | overflow workaround | 의도된 backoff policy | cap-hit metric, retry budget |\n| 잔액 음수를 0으로 clamp | 사용자에게 안전한 표시 | invariant 위반 은폐 | 중복 차감/순서 역전 흔적 |\n| quota 초과가 max counter로만 보임 | metric cardinality 절약 | 초과량 손실 | saturated count와 raw overflow count 차이 |\n| progress bar 120%를 100%로 표시 | domain 값 교정 | presentation clamp | 원본 값은 별도 보존 |\n| `Math.min/Math.max` helper가 여기저기 쓰임 | 공통 유틸 재사용 | policy 이름 부재 | 호출 지점별 domain 의미가 다름 |\n\n## 검증/validation\n\n- clamp가 의도된 곳은 cap hit 횟수와 cap 전 원본 값을 관측 지표로 남긴다.\n- core invariant 경로는 `Math.addExact`, value object validation, DB constraint를 통해 실패가 드러나는지 테스트한다.\n- 같은 경계값이라도 presentation, telemetry, billing, authorization에서 정책이 다른지 decision table로 검토한다.\n- property-based test나 boundary fixture로 `max - 1`, `max`, `max + 1`, `-1`, `0`을 모두 넣어 fail-fast와 saturate branch를 분리한다.\n\n## 오해와 wrong bucket\n\n- clamp를 overflow 방지책으로만 설명하면 wrong bucket이다. clamp는 \"어떤 값으로 눌러도 의미가 유지된다\"는 domain 정책이 먼저 필요하다.\n- UI에서 안전한 clamp를 재고/잔액/청구에도 안전하다고 옮기면 invariant 위반을 숨길 수 있다.\n- fail-fast가 사용자 경험을 항상 해친다고 단정하면 안 된다. core data에서는 빠르게 실패해야 복구와 보상이 가능해지는 경우가 많다.\n\n## 실전 시나리오\n\n### 시나리오 1: retry delay가 overflow 대신 max delay에 붙는다\n\nbackoff upper cap은 합리적이다.  \n다만 cap 도달이 정상인지 이상 징후인지 metric으로 남기는 편이 좋다.\n\n### 시나리오 2: quota 잔량이 0으로 clamp되어 초과 사용이 숨는다\n\n고객은 더 썼는데 시스템은 그냥 0으로만 보인다.  \n청구나 제한 enforcement 버그가 숨겨질 수 있다.\n\n### 시나리오 3: UI용 표시 clamp를 domain 계산에도 재사용한다\n\n표시 로직은 괜찮았지만 business logic까지 같은 util을 써서 correctness가 흔들린다.\n\n## 코드로 보기\n\n### 1. 명시적 saturation helper 감각\n\n```java\nlong capped = Math.min(candidate, MAX_DELAY_MILLIS);\n```\n\n### 2. fail-fast가 더 맞는 경우\n\n```java\nlong exact = Math.addExact(current, delta);\nif (exact < 0) {\n    throw new IllegalStateException(\"negative inventory\");\n}\n```\n\n### 3. policy 이름으로 드러내기\n\n```java\npublic record BackoffMillis(long value) {\n    public BackoffMillis nextCapped(long max) {\n        long doubled = value > max / 2 ? max : value * 2;\n        return new BackoffMillis(Math.min(doubled, max));\n    }\n}\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| fail-fast arithmetic | invariant 위반을 빨리 드러낸다 | 예외 처리와 복구 설계가 필요하다 |\n| saturating arithmetic | 상한/하한 정책을 부드럽게 적용할 수 있다 | 잘못 쓰면 버그를 조용히 숨긴다 |\n| value object로 정책 고정 | clamp 의도를 명확히 드러낸다 | 타입과 메서드 설계가 늘어난다 |\n\n핵심은 saturation을 overflow workaround가 아니라 domain policy로 다루는 것이다.\n\n## 꼬리질문\n\n> Q: saturating arithmetic는 언제 맞나요?\n> 핵심: backoff cap, UI display bound, telemetry bucket처럼 clamp가 의도된 경우에 더 맞다.\n\n> Q: 언제 위험한가요?\n> 핵심: 재고, 잔액, 청구처럼 invariant 위반을 숨기면 안 되는 core business logic에서 위험하다.\n\n> Q: `Math.*Exact`와 어떻게 다르나요?\n> 핵심: exact는 위반을 드러내고, saturate는 경계값으로 눌러 담는다.\n\n## 한 줄 정리\n\nsaturating arithmetic는 계산 실수 방지책이 아니라 clamp policy이므로, fail-fast가 맞는 곳과 의도적으로 saturate할 곳을 명확히 나눠야 한다.\n",
+  "aliases": [
+    "Saturating Arithmetic Clamping and Domain Contracts",
+    "saturating arithmetic clamp fail-fast policy",
+    "numeric overflow domain contract",
+    "retry backoff clamp quota invariant",
+    "clamped value vs fail fast arithmetic",
+    "자바 saturating arithmetic clamp 정책",
+    "record"
+  ],
+  "expected_queries": [
+    "saturating arithmetic와 clamp는 fail-fast arithmetic과 어떤 domain contract 차이가 있어?",
+    "retry backoff는 max cap으로 clamp해도 자연스럽지만 재고나 잔액 clamp는 왜 bug를 숨길 수 있어?",
+    "overflow 방지로 min max clamp를 적용하기 전에 어디서 saturate하고 어디서 예외를 낼지 어떻게 정해?",
+    "quota counter metrics bucket UI progress와 core business invariant에서 clamp 정책이 왜 달라질 수 있어?",
+    "numeric overflow policy를 value object invariant와 validation boundary에 어떻게 문서화해?"
+  ],
+  "symptoms": [
+    "overflow를 피하려고 무조건 min max clamp를 적용해 재고, 잔액, quota 같은 core invariant 위반을 조용히 숨겨",
+    "UI progress나 retry backoff처럼 clamp가 자연스러운 곳과 정산 금액이나 권한 카운터처럼 fail-fast가 필요한 곳을 구분하지 못해",
+    "saturating arithmetic을 overflow workaround로만 적용하고 어디서 saturate하고 어디서 exception을 낼지 domain contract로 문서화하지 않아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/integer-overflow-exact-arithmetic-unit-conversion-pitfalls",
+      "language/biginteger-unsigned-parsing-boundaries",
+      "language/value-object-invariants-canonicalization-boundary-design"
+    ],
+    "next_docs": [
+      "language/parser-overflow-boundaries-parseint-parselong-tointexact",
+      "language/executor-sizing-queue-rejection-policy",
+      "software-engineering/validation-boundary-input-vs-domain-invariant-mini-bridge"
+    ],
+    "confusable_with": [
+      "language/integer-overflow-exact-arithmetic-unit-conversion-pitfalls",
+      "language/parser-overflow-boundaries-parseint-parselong-tointexact",
+      "language/biginteger-unsigned-parsing-boundaries"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/saturating-arithmetic-clamping-domain-contracts.md",
+    "revision_history": []
+  }
+}

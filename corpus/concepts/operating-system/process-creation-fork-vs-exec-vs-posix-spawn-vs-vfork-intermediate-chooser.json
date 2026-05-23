@@ -1,0 +1,57 @@
+{
+  "id": "operating-system/process-creation-fork-vs-exec-vs-posix-spawn-vs-vfork-intermediate-chooser",
+  "title": "프로세스 생성 — fork vs exec vs posix_spawn vs vfork 어떻게 고를까",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "'Unix 프로세스 생성은 *fork → exec*가 전통이다 — `fork()`로 부모 메모리를",
+  "body_markdown": "# 프로세스 생성 — fork vs exec vs posix_spawn vs vfork 어떻게 고를까\n\n> 한 줄 요약: 학습 default = fork-exec. 큰 부모 + 자주 spawn = posix_spawn 검토. vfork는 직접 호출보다 라이브러리/런타임 wrapper를 우선한다. Linux의 clone()은 스레드/네임스페이스까지 포괄하는 저수준 도구다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\nUnix는 \"프로세스 생성\"을 *두 단계*로 나눴다.\n\n```\n[1단계] fork()  — 부모를 복사한 자식 만듦\n[2단계] exec()  — 자식이 자기 메모리를 새 프로그램으로 교체\n```\n\n이 분리의 가치: *부모-자식 사이 setup*을 자식 코드에서 자유롭게. 예: fd redirect, signal handler 변경, env var 조정 후 exec.\n\n이 문서의 역할은 API 이름 암기가 아니라 **첫 분기**를 잡는 것이다.\n\n- 자식에서 임의의 setup 코드가 필요한가 → `fork()` 후 setup 후 `execve()`\n- setup이 fd action, signal mask, process group 같은 제한된 작업이면 충분한가 → `posix_spawn()`\n- 부모 주소 공간이 크고 spawn 빈도가 높은가 → `fork()` page table 복사 비용을 측정하고 `posix_spawn()`을 검토\n- thread/container runtime을 만드는가 → 직접 `fork`보다 `pthread`, runtime, `clone()` 계열 abstraction 확인\n\n## 한 장 정리\n\n| API | 동작 | 비용 | 적합 |\n|---|---|---|---|\n| **`fork()`** | 부모 복제 (COW) | 큰 부모면 page table 복사 비싸짐 | 일반 |\n| **`exec()`** | 현재 프로세스 이미지 교체 | 새 프로그램 로드/동적 링커/page fault 비용 | fork와 함께 |\n| **`vfork()`** | 부모 멈추고 자식이 같은 메모리 공유 | page table 복사를 피함 | 직접 사용은 매우 제한적 |\n| **`posix_spawn()`** | fork+exec 성격 + 제한된 pre-exec action | 구현에 따라 fork/vfork/clone 계열 | 큰 부모, 자주 spawn |\n| **`clone()`** (Linux) | 부모와 무엇을 공유할지 선택 | 가장 유연 | Linux 전용 도구 |\n| `system()` / `popen()` | 라이브러리 wrapper (fork+exec) | 일반 | 단순한 shell 호출 |\n\n## \"fork-exec\" 전통 패턴\n\n```c\npid_t pid = fork();\nif (pid == 0) {\n    // 자식 프로세스\n    dup2(fd, STDOUT_FILENO);   // setup\n    execvp(\"ls\", argv);          // 새 프로그램으로 교체\n    perror(\"exec failed\");      // exec 성공하면 여기 도달 안 함\n    _exit(1);\n} else if (pid > 0) {\n    // 부모 프로세스\n    waitpid(pid, &status, 0);\n}\n```\n\n장점: setup이 *자식 코드에서 자유*. dup2/signal/env 다 가능.\n단점: 부모가 *크면* fork가 비쌈. fork 직후 exec하면 *복사한 메모리 즉시 폐기* — 낭비.\n\n## \"posix_spawn\" — fork-exec 결합\n\n```c\nposix_spawn_file_actions_t actions;\nposix_spawn_file_actions_init(&actions);\nposix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);\n\nposix_spawnp(&pid, \"ls\", &actions, NULL, argv, environ);\n```\n\n특징: setup은 별도 `actions`/attributes로 미리 정의한다. POSIX 관점에서는 fork+exec 성격의 표준 API이고, glibc 2.24 이후 Linux 구현은 `CLONE_VM`/`CLONE_VFORK` 기반 `clone()` 경로를 사용한다. 그래서 큰 부모에서 page table 복사를 피하는 효과를 기대할 수 있지만, 모든 OS/libc에서 같은 내부 구현이라고 단정하면 안 된다.\n\n장점: 큰 부모(예: JVM 수 GB)에서 자식을 *수십 번* spawn할 때 fork보다 빠름.\n단점: setup 표현력이 *fork 후 자유 코드*보다 적음. `actions` API 학습 필요.\n\nJava/JVM에서는 버전과 OS에 따라 launch mechanism이 달라질 수 있다. Linux에서 `posix_spawn` 경로를 쓰는 JDK가 많지만, 운영 문서에는 `-Djdk.lang.Process.launchMechanism` 설정, JDK 버전, 실제 `strace` 결과를 확인한 뒤 적는다.\n\n`posix_spawn()` 호출이 0을 반환해도 child의 `execve()`가 이미 성공했다는 뜻은 아니다. pre-exec housekeeping이나 exec 단계 실패는 child exit status 127 같은 형태로 나올 수 있으므로, 장애 분석에서는 parent의 spawn return, child exit status, stderr capture를 분리해서 기록한다.\n\n## \"vfork\" — 위험한 최적화\n\n```c\npid_t pid = vfork();   // 부모는 멈춤, 자식이 같은 메모리에 동작\nif (pid == 0) {\n    execvp(...);\n    _exit(127);    // exec 실패 시에도 exit handlers를 타지 않고 즉시 종료\n}\n```\n\n장점: fork보다 page table 비용이 작을 수 있다.\n단점:\n- 부모 *멈춤* — 동시성 어려움.\n- 자식이 부모 메모리 *수정하거나*, 호출한 함수에서 return하거나, exec/_exit 전 임의 함수를 호출하면 undefined behavior 위험이 있다.\n- Linux에서는 `vfork()`가 parent address space를 공유하고 parent를 멈추는 특수 경로다.\n- glibc `posix_spawn()` 같은 wrapper가 제한된 action만 허용해 이 위험한 구간을 감싼다.\n\n→ **새 코드에선 vfork 사용 ❌**. legacy 호환 빼고.\n\n## \"clone\" — Linux 유연 API\n\n```c\n// Linux: clone()으로 무엇을 공유할지 비트 마스크\nclone(child_func, stack, CLONE_VM | CLONE_FS | CLONE_FILES | SIGCHLD, ...);\n```\n\n`CLONE_VM` (메모리 공유 = thread), `CLONE_NEWPID` (PID namespace = container), `CLONE_NEWNET` (네트워크 namespace) 등.\n\n- POSIX thread는 *내부적으로 clone*.\n- Docker container는 *clone + namespace 플래그*.\n\n학습 코드에선 거의 직접 호출 ❌, *추상 API*(pthread, container runtime)를 통해.\n\n## \"어떤 걸 골라?\" — 흐름\n\n```\n1. 학습 / 단순 한두 번 spawn?\n       → fork-exec (또는 system()/popen())\n\n2. 큰 부모(JVM, 큰 데이터 가진 process) + 자주 spawn?\n       → posix_spawn (또는 Java ProcessBuilder가 자동)\n\n3. Thread를 만들고 싶음?\n       → pthread_create (내부적으로 clone)\n\n4. Container 생성?\n       → 직접 clone + namespace 플래그 (또는 container runtime)\n\n5. vfork?\n       → 새 코드에선 ❌\n```\n\n## Java/JVM 시각\n\n```java\nProcessBuilder pb = new ProcessBuilder(\"ls\", \"-la\");\npb.redirectOutput(...);\nProcess p = pb.start();\n```\n\nJVM 내부 launch mechanism은 JDK/OS 설정에 따라 달라질 수 있다. Linux에서는 `fork`, `posix_spawn`, `vfork` 계열 선택지가 문서화/구현되어 온 적이 있고, macOS는 `posix_spawn`, Windows는 `CreateProcess` 계열이다. 면접이나 장애 분석에서는 \"ProcessBuilder는 무조건 X\"보다 실제 런타임을 확인한다고 답하는 편이 정확하다.\n\n⚠️ JVM 메모리가 크면 fork-based 호출은 page table 복사 비용과 overcommit 정책 영향을 받을 수 있다. `posix_spawn` 경로가 이를 줄일 수 있지만, 관찰 없이 안전하다고 단정하지 않는다.\n\n## 자주 헷갈리는 지점\n\n- **\"fork = 새 프로세스 생성\"** — 정확히는 *부모 복제*. exec 안 부르면 부모와 같은 프로그램의 두 인스턴스.\n- **\"Copy-on-Write 덕분에 fork는 가벼움\"** — 페이지 내용은 lazy 복사되지만 큰 부모에서는 page table 처리와 overcommit 정책만으로도 비용이 커질 수 있다.\n- **\"vfork = posix_spawn\"** — 다르다. `posix_spawn`은 표준 API이고 구현이 `fork`, `vfork`, `clone` 계열 중 하나를 고를 수 있다.\n- **\"clone = 스레드 전용\"** — Linux 모든 프로세스/스레드/container 생성의 underlying. flag로 결정.\n- **\"Thread를 만들 때 fork\"** — fork는 *프로세스*. Thread는 pthread_create (clone with VM share).\n\n## 관찰과 검증\n\n장애나 성능 이슈에서는 API 추측보다 실제 syscall을 먼저 본다.\n\n```bash\n# 어떤 프로세스 생성 syscall이 쓰이는지 확인\nstrace -ff -ttT -e trace=clone,clone3,fork,vfork,execve,wait4 <cmd>\n\n# 큰 부모에서 fork 비용 후보를 볼 때\ngrep -E 'VmRSS|VmHWM|Threads' /proc/<pid>/status\ngrep -E 'PageTables|VmPTE' /proc/<pid>/status /proc/meminfo 2>/dev/null\n```\n\n검증 질문:\n\n- spawn p99가 부모 RSS/page table 크기와 같이 증가하는가\n- child에서 필요한 setup이 `posix_spawn_file_actions_*`로 표현 가능한가\n- `execve()` 실패 시 exit status와 stderr 수집이 명확한가\n- 멀티스레드 부모에서 fork 후 child가 async-signal-safe하지 않은 코드를 실행하지 않는가\n- 런타임/JDK 설정을 바꾼 뒤 `strace`에서 실제 launch syscall이 기대와 맞게 바뀌었는가\n\n## 학습자가 자주 만나는 시나리오\n\n- 학습 단계 shell 명령 실행 → `system()` 또는 ProcessBuilder.\n- 다중 프로세스 prefork 서버 → 시작 시 fork-exec, 이후 listen.\n- 큰 데이터를 가진 부모에서 자식 process 생성 → posix_spawn (or Java ProcessBuilder).\n- Docker/podman 구현 → clone + namespace flags.\n\n## 빠른 확인 질문\n\n- fork-exec를 두 단계로 분리한 이유?\n  - 자식 setup(fd, env, signal)을 코드에서 자유롭게.\n- posix_spawn이 큰 부모에서 fork-exec보다 유리할 수 있는 이유?\n  - 구현에 따라 fork의 page table 처리 비용을 줄이는 launch 경로를 쓸 수 있기 때문이다.\n- vfork를 새 코드에 권장 ❌인 이유?\n  - 부모 멈춤 + 메모리 공유로 undefined behavior 위험.\n\n## 한 줄 정리\n\n프로세스 생성은 *fork-exec*가 전통 + 단순. 큰 부모는 *posix_spawn*을 검토. *vfork*는 직접 쓰기보다 wrapper를 신뢰. Linux *clone*은 thread/container까지 포괄하는 저수준 API.\n\nretrieval-anchor-keywords: process creation, fork exec, posix_spawn, vfork deprecation, Linux clone, namespace flags container, copy-on-write COW, page table copy cost, ProcessBuilder Java posix_spawn, system popen wrapper, pthread_create clone, prefork server pattern, dup2 fork pattern\n",
+  "aliases": [
+    "fork",
+    "exec",
+    "execve",
+    "posix_spawn",
+    "vfork",
+    "clone",
+    "프로세스 생성",
+    "copy-on-write",
+    "fork-exec pattern",
+    "process spawn",
+    "프로세스 fork",
+    "자식 프로세스 생성"
+  ],
+  "expected_queries": [
+    "fork와 exec 차이가 뭐야?",
+    "posix_spawn 언제 써?",
+    "vfork와 fork 차이가 뭐고 vfork가 안전해?",
+    "프로세스 생성 비용을 줄이는 법은?",
+    "어떤 프로세스 생성 API를 고를까?",
+    "Java ProcessBuilder가 내부적으로 뭘 호출해?"
+  ],
+  "symptoms": [
+    "fork와 exec 관계가 헷갈림",
+    "posix_spawn이 왜 등장했는지 모름",
+    "vfork가 안전한지 모름",
+    "다중 프로세스 시작 비용을 어떻게 줄일지 모름"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "operating-system/fork-exec-copy-on-write-behavior"
+    ],
+    "confusable_with": [
+      "operating-system/fork-exec-copy-on-write-behavior",
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/process-creation-fork-vs-exec-vs-posix-spawn-vs-vfork-intermediate-chooser.md",
+    "revision_history": []
+  }
+}

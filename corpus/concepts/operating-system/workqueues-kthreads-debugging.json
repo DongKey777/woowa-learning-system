@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/workqueues-kthreads-debugging",
+  "title": "Workqueues Kthreads Debugging",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 workqueue와 kthread를 kernel이 오래 걸리는 work를 user/request path에서 떼어내 처리하는",
+  "body_markdown": "# Workqueues, Kthreads, Debugging\n\n> 한 줄 요약: workqueue와 kthread는 커널이 오래 걸리는 일을 유저 경로에서 떼어내기 위해 쓰는 실행 단위이고, 병목이 생기면 커널 내부의 숨은 worker 과부하가 드러난다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Softirq, Hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n> - [Run Queue, Load Average, CPU Saturation](./run-queue-load-average-cpu-saturation.md)\n> - [CPU Affinity, IRQ Affinity, Core Locality](./cpu-affinity-irq-affinity-core-locality.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n\n> retrieval-anchor-keywords: workqueue, kthread, kernel worker, kworker, unbound workqueue, flush_work, delayed_work, /sys/kernel/debug/workqueue, hidden worker\n\n## 핵심 개념\n\n커널은 즉시 처리하지 않아도 되는 작업을 workqueue나 kthread로 넘긴다. 이들은 커널 내부 worker처럼 움직이며, 병목이나 폭주가 생기면 latency와 CPU 사용이 예상과 다르게 보일 수 있다.\n\n- `workqueue`: 커널이 비동기 작업을 보내는 큐다\n- `kthread`: 커널 스레드다\n- `kworker`: workqueue를 실제로 실행하는 worker다\n\n왜 중요한가:\n\n- I/O completion, reclaim, filesystem maintenance 같은 작업이 worker로 밀릴 수 있다\n- 유저 스레드가 아니라 커널 worker가 병목일 수 있다\n- \"CPU는 낮은데 왜 늦지?\"의 답이 될 수 있다\n\n이 문서는 [softirq, hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)와 [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)를 커널 worker 관점으로 연결한다.\n\n## 깊이 들어가기\n\n### 1. workqueue는 커널의 백그라운드 작업대다\n\n커널은 긴 일을 바로 하지 않고 work item으로 넘긴다.\n\n- filesystem flush\n- reclaim 보조 작업\n- deferred maintenance\n- I/O 후속 처리\n\n### 2. kthread는 커널 전용 실행 흐름이다\n\n일부 작업은 커널 스레드로 따로 돈다.\n\n- kswapd 같은 메모리 관련 스레드\n- 특정 driver worker\n- daemon-like kernel activity\n\n### 3. worker가 막히면 유저도 영향을 받는다\n\n커널 worker가 밀리면 다음이 늦어진다.\n\n- completion\n- reclaim\n- filesystem housekeeping\n- deferred flush\n\n즉 유저 스레드가 멀쩡해도 시스템은 느려질 수 있다.\n\n다만 kworker가 CPU를 쓰는 것 자체는 정상이다. 문제로 보려면 특정 worker의 지속 CPU, 관련 kernel symbol, app latency, I/O/reclaim/network 지표가 같은 시간대에 맞아야 한다.\n\n### 4. unbound workqueue는 유연하지만 예측이 어렵다\n\n- 특정 CPU에 묶이지 않는다\n- load balance가 좋을 수 있다\n- 하지만 locality와 병목 추적이 어려울 수 있다\n\n## 실전 시나리오\n\n### 시나리오 1: I/O 완료가 늦는데 user-space는 한가하다\n\n가능한 원인:\n\n- worker가 backlog를 쌓고 있다\n- workqueue가 밀린다\n- softirq 이후 후속 작업이 늦는다\n\n진단:\n\n```bash\nps -eLo pid,tid,cls,rtprio,pri,psr,comm | grep kworker | head\nmount | grep debugfs || sudo mount -t debugfs none /sys/kernel/debug\nls /sys/kernel/debug/workqueue 2>/dev/null\nperf top -g\n```\n\n### 시나리오 2: reclaim이 늦고 메모리 압박이 길다\n\n가능한 원인:\n\n- kswapd가 busy하다\n- shrinker/worker가 따라잡지 못한다\n- workqueue 폭주가 섞인다\n\n### 시나리오 3: 특정 커널 이벤트 후 전체 지연이 튄다\n\n가능한 원인:\n\n- deferred work가 한꺼번에 실행된다\n- worker가 CPU affinity와 안 맞는다\n- hot core에서 커널 worker가 몰린다\n\n이 경우는 [CPU Affinity, IRQ Affinity, Core Locality](./cpu-affinity-irq-affinity-core-locality.md)와 같이 본다.\n\n## 운영 Playbook\n\n### 관찰 증거\n\n- `kworker/*`, `kswapd`, driver kthread, `jbd2/*`, filesystem worker가 장애 시간대에 CPU를 쓴다.\n- user-space profiler에는 병목이 약한데 `perf top -g`에는 kernel path가 보인다.\n- `/proc/softirqs`, block I/O, memory PSI 중 하나가 worker CPU와 같은 시간대에 오른다.\n\n### 확인 순서\n\n1. `ps -eLo pid,tid,psr,stat,comm | egrep 'kworker|kswapd|jbd2|ksoftirqd'`로 어떤 kernel thread인지 분리한다.\n2. `perf top -g` 또는 짧은 system-wide profile로 symbol family를 본다.\n3. block/fs/network/reclaim 중 어느 하위 시스템 지표와 같이 움직이는지 확인한다.\n4. debugfs/ftrace가 가능하면 workqueue event를 켜서 enqueue와 execute 지연을 본다.\n5. CPU affinity/cpuset/IRQ affinity가 hot core를 만들었는지 확인한다.\n\n### Failure Matrix\n\n| worker/signal | 해석 | 다음 확인 |\n|---------------|------|-----------|\n| `jbd2/*` 높음 | filesystem journal commit | fsync, dirty/writeback, storage await |\n| `kswapd` 높음 | background reclaim | memory PSI, cgroup memory events |\n| `ksoftirqd/*` 높음 | softirq가 thread context로 밀림 | NIC drops, `/proc/softirqs`, IRQ affinity |\n| `kworker` + block symbol | block/fs deferred work | iostat, blk trace/perf |\n| worker는 낮고 run queue 높음 | 일반 CPU saturation 가능 | user profiler, CFS throttling |\n\n### 검증\n\n원인별 조치 후에는 해당 worker CPU만 보는 대신 관련 하위 지표가 같이 안정되는지 확인한다. 예를 들어 storage tuning이면 `jbd2`/kworker CPU, `await`, fsync p99가 함께 줄어야 한다.\n\n## 코드로 보기\n\n### kworker 확인\n\n```bash\nps -eLo pid,tid,comm | grep kworker | head\n```\n\n### workqueue 관찰 힌트\n\n```bash\nls /sys/kernel/debug/workqueue 2>/dev/null\n```\n\ndebugfs가 꺼진 운영 환경에서는 이 경로가 없을 수 있다. 그때는 `perf`, PSI, subsystem metric으로 간접 증거를 맞춘다.\n\n### 단순 모델\n\n```text\nkernel event\n  -> deferred to workqueue/kthread\n  -> worker backlog grows\n  -> completion/reclaim latency increases\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| workqueue 사용 | 즉시 경로를 짧게 한다 | backlog 관리가 필요하다 | deferred work |\n| kthread 전용화 | 제어가 분명하다 | 고정 비용이 든다 | 장기 작업 |\n| unbound worker | 유연하다 | 추적이 어려울 수 있다 | 일반 커널 백그라운드 |\n| affinity 고정 | locality가 좋다 | hot spot 위험 | latency-sensitive kernel work |\n\n## 꼬리질문\n\n> Q: workqueue는 왜 필요한가요?\n> 핵심: 오래 걸리는 일을 즉시 경로에서 떼어내기 위해서다.\n\n> Q: kworker가 보이면 문제인가요?\n> 핵심: 아니다. 다만 backlog나 지연이 커지면 병목 신호가 된다.\n\n> Q: user-space가 느린데 workqueue를 왜 보나요?\n> 핵심: completion과 reclaim 같은 커널 후속 작업이 영향을 줄 수 있기 때문이다.\n\n## 한 줄 정리\n\nworkqueue와 kthread는 커널의 deferred execution 경로이며, backlog가 쌓이면 유저 경로가 아닌 커널 worker가 성능 병목이 될 수 있다.\n",
+  "aliases": [
+    "workqueues kthreads debugging",
+    "kernel worker overload",
+    "deferred work queue",
+    "kthread backlog",
+    "workqueue saturation",
+    "hidden kernel worker"
+  ],
+  "expected_queries": [
+    "workqueue와 kthread는 kernel이 오래 걸리는 일을 user path에서 떼어내는 실행 단위야?",
+    "kworker saturation을 workqueues와 kthreads debugging으로 어떻게 좁혀?",
+    "deferred work backlog가 application p99 latency를 만들 수 있어?",
+    "eBPF perf로 kernel worker overload를 어떻게 관측해?"
+  ],
+  "symptoms": [
+    "user request path에서 떼어낸 kernel deferred work가 workqueue/kthread backlog로 밀린다.",
+    "kworker saturation을 봤지만 어떤 kernel work가 쌓였는지 더 좁혀야 한다.",
+    "softirq follow-up이나 reclaim work가 hidden worker overload로 나타난다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-thread-virtual-memory-context-switch-scheduler-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/workqueues-kthreads-debugging.md",
+    "revision_history": []
+  }
+}

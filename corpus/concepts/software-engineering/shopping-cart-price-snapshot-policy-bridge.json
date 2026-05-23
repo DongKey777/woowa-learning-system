@@ -1,0 +1,51 @@
+{
+  "id": "software-engineering/shopping-cart-price-snapshot-policy-bridge",
+  "title": "shopping-cart 가격 스냅샷 정책 ↔ Checkout Consistency 브릿지",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "이 mission_bridge는 shopping-cart 주문 가격 snapshot, checkout 재검증, payment amount, transaction/event consistency 경계를 연결한다.",
+  "body_markdown": "# shopping-cart 가격 스냅샷 정책 ↔ Checkout Consistency 브릿지\n\n## 한 줄 요약\n\n> 장바구니 가격은 구매 후보의 현재 표시값이고, 주문 가격 snapshot은 checkout에서 서버가 재검증한 뒤 거래 기록으로 굳힌 값이다. 결제 요청, 주문 저장, 주문 완료 이벤트는 모두 이 확정 snapshot을 기준으로 맞춰야 한다.\n\n## 미션 장면\n\n장바구니 미션에서 학습자가 자주 헷갈리는 지점은 \"장바구니에 담긴 가격\"과 \"주문으로 확정된 가격\"이다. 상품 가격은 운영 중 바뀔 수 있고, 장바구니는 아직 거래 기록이 아니라 구매 의도에 가깝다. 주문 생성(checkout) 시점에는 현재 상품 가격, 수량, 할인 결과를 다시 계산한 뒤 주문 항목 가격 스냅샷(price snapshot)으로 고정해야 한다.\n\n이 문서는 `shopping-cart-order-snapshot-from-cart-bridge`보다 한 단계 좁게 \"가격 값의 기준과 시점\"을 잡는다. 주문이 cart를 참조하면 안 된다는 말은 구조의 문제이고, 여기서는 어떤 가격을 결제 승인 금액과 주문 이력의 source of truth로 삼을지의 문제다.\n\n## 리뷰에서 보이는 냄새\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"주문 상세에서 현재 상품 가격을 다시 읽어도 되나요?\" | 과거 주문 조회가 `Product.currentPrice`에 의존 | 주문 조회는 order item snapshot을 읽는다 |\n| \"cart item에 담긴 가격을 주문 가격으로 쓰면 안 되나요?\" | 사용자가 오래 열어 둔 cart 화면으로 checkout | checkout 직전 서버가 최신 가격과 할인 정책을 재검증한다 |\n| \"결제 승인 금액과 주문 저장 금액이 달라요\" | payment request와 order snapshot이 다른 계산 경로를 탐 | 둘 다 같은 확정 금액 객체에서 출발하게 만든다 |\n| \"주문 완료 이벤트에 어떤 금액을 담아야 하나요?\" | domain event 또는 outbox payload가 cart total을 사용 | commit된 order snapshot 기준으로 이벤트를 만든다 |\n\n리뷰에서 많이 보이는 냄새는 주문 상세가 `Product.currentPrice`를 다시 읽는 구조다. 이러면 상품 가격 수정이 과거 주문 금액까지 바꾸는 것처럼 보인다. 반대로 `CartItem`에 저장된 임시 가격을 무조건 믿으면 checkout 직전 가격 변경, 판매 중지, 쿠폰 재계산 같은 정책을 놓칠 수 있다.\n\n## source of truth 경계\n\n핵심은 \"확정 전 계산\"과 \"확정 후 조회\"를 분리하는 것이다. Checkout service는 현재 상품 정보와 할인 정책을 조합해 최종 unit price, discount amount, line total, order total을 만든다. Order item은 그 결과를 snapshot field로 보관하고, 주문 조회는 snapshot만 읽는다.\n\nCart 화면의 총액은 사용자에게 보여 준 read snapshot이다. Checkout command에 그 값이 같이 오더라도 authoritative amount가 아니다. 서버가 다시 계산한 금액과 요청 금액이 다르면, 최신 금액을 다시 안내할지 conflict로 막을지 정책을 드러내야 한다. 그냥 \"둘 중 큰 값/작은 값\"을 저장하는 식으로 넘기면 source of truth가 흐려진다.\n\n상품 master의 현재 가격은 checkout 직전 재검증 입력으로는 중요하지만, 주문 확정 뒤 조회 기준은 아니다. 주문 완료 후 과거 금액을 설명해야 할 때는 현재 상품 가격이 아니라 `order_item.unit_price_snapshot`, `discount_snapshot`, `total_snapshot` 같은 확정 필드를 본다.\n\n## transaction/event 경계\n\n가격 snapshot은 계산만으로 끝나지 않는다. 주문 row, 주문 item snapshot, 적용 할인 결과, 장바구니 비우기처럼 같은 유스케이스에서 함께 맞아야 하는 로컬 write는 하나의 짧은 transaction 안에서 commit되는지 검토한다. 주문은 저장됐는데 할인 snapshot이 빠지거나, 결제 승인 금액은 새 계산값인데 order row는 예전 cart total을 저장하면 이후 read-after-write나 환불 흐름에서 설명할 수 없는 mismatch가 생긴다.\n\n결제가 붙으면 승인 요청 금액도 같은 확정 금액에서 출발해야 한다. 외부 결제 API는 로컬 DB transaction과 같은 원자성으로 묶이지 않으므로, `spring/shopping-cart-payment-transaction-boundary-bridge`의 경계가 이어진다. 여기서 중요한 것은 \"결제 승인 전에 무엇을 freeze했는가\", \"승인 성공 후 어떤 snapshot을 commit했는가\", \"DB 반영 실패 시 어떤 approval id로 보상할 것인가\"를 같은 용어로 남기는 것이다.\n\nDomain event도 snapshot 이후에 생각한다. `OrderCompleted`나 outbox payload가 필요하다면 cart total이나 current product price를 다시 계산해서 담지 말고, commit된 order snapshot의 금액을 담아야 한다. 아직 transaction이 commit되기 전의 도메인 이벤트는 내부 사실 전달용일 수 있지만, 외부 시스템이 의존하는 integration event는 commit된 사실과 idempotency key를 기준으로 만들어야 한다.\n\n## 구현 스케치\n\n- `CheckoutPricing`: 최신 상품 가격, 수량, 할인 정책을 입력받아 확정 후보 금액을 만든다.\n- `Money`/`OrderLinePrice`: unit price, discount, line total의 불변식을 닫는다.\n- `OrderItemSnapshot`: checkout 시점 상품명, 옵션, 단가, 할인액, 수량을 저장한다.\n- `PaymentRequest`: order snapshot의 total에서 만들어지고, 별도 cart total을 다시 계산하지 않는다.\n- `OrderCompletedEvent`: commit된 order id와 snapshot 금액을 기준으로 후속 read model/outbox에 전달한다.\n\n이름은 미션 코드 스타일에 맞추면 된다. 중요한 것은 \"현재 상품 가격을 읽는 코드가 모두 나쁘다\"가 아니라, 현재 가격을 읽는 단계가 checkout 재검증인지, 주문 이력 조회인지, 결제 승인 요청인지가 분리돼야 한다는 점이다.\n\n## 미션 PR 코멘트 패턴\n\n- \"주문 상세가 상품 현재 가격을 다시 읽고 있습니다. 과거 거래 금액은 order item snapshot으로 보존해 주세요.\"\n- \"장바구니 화면 총액은 사용자가 본 값이지 주문 source of truth가 아닙니다. checkout에서 서버가 재계산한 금액을 snapshot으로 굳혀야 합니다.\"\n- \"결제 승인 요청과 order 저장이 서로 다른 계산 경로를 타면 금액 mismatch를 설명하기 어렵습니다. 같은 확정 금액 객체에서 출발하게 해 주세요.\"\n- \"주문 완료 이벤트가 cart total을 다시 계산해 보내면 이후 가격 변경에 흔들립니다. commit된 order snapshot 기준으로 payload를 만들지 검토해 주세요.\"\n\n## Drill 후보\n\n\"상품 가격이 주문 후 바뀌었을 때 주문 상세 금액도 바뀌어야 하나?\"를 먼저 물어본다. 기대 답변은 주문은 거래 기록이므로 snapshot을 보존한다는 것이다. 이어서 \"그럼 장바구니에 담긴 오래된 가격은 그대로 믿어도 되나?\"를 물어 checkout 재검증(revalidation)까지 연결한다. 마지막으로 \"결제 승인 요청과 주문 완료 이벤트는 어느 금액을 기준으로 해야 하나?\"를 물어 같은 확정 snapshot을 payment와 event boundary까지 전파해야 한다는 답을 확인한다.\n\n흔한 실수는 snapshot을 만들었다는 이유로 checkout 검증을 생략하거나, 현재 상품 가격을 읽는 모든 코드를 나쁘다고 단정하는 것이다. 또 다른 실수는 order snapshot은 저장했지만 payment request나 outbox payload가 여전히 cart total을 다시 계산하는 경로에 남아 있는 것이다.\n\n## 다음 학습\n\n- cart/order 구조 snapshot 자체가 헷갈리면 `software-engineering/shopping-cart-order-snapshot-from-cart-bridge`\n- checkout 직전 서버 재계산과 요청 금액 mismatch 처리는 `software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge`\n- order item snapshot을 table modeling으로 보면 `database/shopping-cart-order-item-snapshot-table-bridge`\n- 결제 승인과 로컬 commit의 원자성 차이는 `spring/shopping-cart-payment-transaction-boundary-bridge`\n- 결제 완료 직후 confirmation read path는 `system-design/shopping-cart-price-snapshot-read-after-payment-bridge`\n",
+  "aliases": [
+    "shopping cart price snapshot policy",
+    "장바구니 가격 스냅샷 정책",
+    "checkout current price vs order snapshot",
+    "주문 가격 고정 시점"
+  ],
+  "expected_queries": [
+    "shopping-cart에서 주문 가격은 장바구니 가격을 그대로 써도 돼?",
+    "결제 중 상품 가격이 바뀌면 어떤 가격이 맞아?",
+    "order item price snapshot은 왜 필요해?"
+  ],
+  "symptoms": [
+    "주문 완료 후 상품 가격 변경이 과거 주문 금액을 바꿉니다",
+    "장바구니 총액과 결제 승인 금액이 다릅니다",
+    "가격 source of truth가 product, cart, order에 흩어져 있습니다",
+    "주문 완료 이벤트나 결제 요청이 snapshot 확정 전 금액을 사용합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/shopping-cart-order-snapshot-from-cart-bridge"
+    ],
+    "next_docs": [
+      "system-design/shopping-cart-price-snapshot-read-after-payment-bridge",
+      "software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge",
+      "database/shopping-cart-order-item-snapshot-table-bridge",
+      "spring/shopping-cart-payment-transaction-boundary-bridge"
+    ],
+    "confusable_with": [
+      "software-engineering/shopping-cart-order-snapshot-from-cart-bridge",
+      "software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge",
+      "database/shopping-cart-order-item-snapshot-table-bridge",
+      "system-design/shopping-cart-price-snapshot-read-after-payment-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/shopping-cart-price-snapshot-policy-bridge.md",
+    "revision_history": []
+  }
+}

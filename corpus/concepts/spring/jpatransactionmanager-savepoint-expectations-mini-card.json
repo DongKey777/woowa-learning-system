@@ -1,0 +1,51 @@
+{
+  "id": "spring/jpatransactionmanager-savepoint-expectations-mini-card",
+  "title": "Spring JpaTransactionManager Savepoint Expectations Mini Card",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "'이 문서는 JpaTransactionManager에서 Propagation.NESTED를 JPA nested transaction이",
+  "body_markdown": "# Spring Mini Card: `JpaTransactionManager`에서 `NESTED` 기대가 자주 깨지는 이유\n\n> 한 줄 요약: `JpaTransactionManager`에서 `NESTED`를 봤을 때 초급자가 먼저 기억할 문장은 \"`JPA 중첩 트랜잭션`이 아니라, 조건부 JDBC savepoint일 뿐\"이다.\n>\n> 문서 역할: 이 문서는 초급자가 `JpaTransactionManager`, `NESTED`, savepoint, persistence context를 한 장에서 연결해 \"`안쪽만 롤백될 줄 알았는데 왜 JPA 상태가 그대로지?`\" 같은 기대 mismatch를 빠르게 줄이는 **beginner mini card**를 담당한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Spring Transaction Propagation Beginner Primer: `REQUIRED`, `REQUIRES_NEW`, rollback-only](./spring-transaction-propagation-required-requires-new-rollbackonly-primer.md)\n- [Spring Transaction Propagation: NESTED / REQUIRES_NEW Case Studies](./spring-transaction-propagation-nested-requires-new-case-studies.md)\n- [Spring Persistence Context Flush / Clear / Detach Boundaries](./spring-persistence-context-flush-clear-detach-boundaries.md)\n- [@Transactional 기초: 트랜잭션 어노테이션이 하는 일](./spring-transactional-basics.md)\n- [Savepoint와 Partial Rollback](../database/savepoint-partial-rollback.md)\n- [JDBC · JPA · MyBatis](../database/jdbc-jpa-mybatis.md)\n\nretrieval-anchor-keywords: jpatransactionmanager nested beginner, jpa nested savepoint expectation, jpatransactionmanager savepoint caveat, nestedtransactionallowed false jpa, jpa does not support nested transactions, persistence context savepoint mismatch, nested jpa beginner card, jpa nested rollback misconception, jdbc oriented thinking safer, savepoint only jdbc connection, entity manager cached objects nested, jpa savepoint primer, transactional nested jpa not behaving, spring jpa nested caveat beginner, spring jpatransactionmanager savepoint expectations mini card basics\n\n## 먼저 mental model 한 줄\n\n초급자는 `JpaTransactionManager`의 `NESTED`를 이렇게 먼저 보면 된다.\n\n- JDBC 감각: 같은 DB 연결에 savepoint를 찍고 일부만 되감기\n- JPA 감각: `EntityManager`와 persistence context가 엔티티 상태를 계속 들고 있기\n\n즉 `NESTED`를 붙였다고 해서 **JPA 객체 세계까지 자동으로 \"안쪽만 되돌리기\"가 되는 것은 아니다.**\n\n## 30초 비교표\n\n| 질문 | `DataSourceTransactionManager` 쪽 감각 | `JpaTransactionManager` 쪽 감각 |\n|---|---|---|\n| 기본 전제 | JDBC 연결이 중심이다 | `EntityManager`와 persistence context가 중심이다 |\n| `NESTED`를 기대할 때 먼저 떠올릴 것 | savepoint가 되나? | savepoint가 되어도 JPA 상태가 같이 되감기진 않는다 |\n| 기본 `nestedTransactionAllowed` | 보통 `true` | 기본 `false` |\n| 초급자에게 더 안전한 사고방식 | \"JDBC savepoint 기능\" | \"JPA 중첩 트랜잭션을 기대하지 말기\" |\n\n핵심은 이것이다.\n\n**`JpaTransactionManager`의 `NESTED`는 \"JPA가 중첩 트랜잭션을 이해한다\"는 뜻이 아니라, 필요하면 JDBC savepoint를 쓸 수 있다는 쪽에 더 가깝다.**\n\n## 왜 기대가 깨지나\n\nSpring 공식 문서 기준으로 초급자가 꼭 기억할 사실은 네 가지다.\n\n1. `JpaTransactionManager`의 `nestedTransactionAllowed` 기본값은 `false`다.\n2. 켜더라도 savepoint는 **JDBC Connection**에 적용된다.\n3. JPA 자체는 nested transaction을 지원하지 않으므로, JPA access code가 그 안쪽 경계에 \"의미상 참여\"할 것을 기대하면 안 된다.\n4. 실제 savepoint 기대는 같은 `DataSource` 참여와 JDBC driver savepoint 지원까지 맞아야 한다.\n\n즉 아래 기대가 자주 틀린다.\n\n- \"`@Transactional(propagation = NESTED)`면 안쪽 JPA `save()`만 되돌아가겠지\"\n- \"savepoint로 롤백했으니 persistence context 안 객체 상태도 원래대로 돌아오겠지\"\n- \"JPA에서도 JDBC 배치처럼 부분 롤백 감각이 그대로 보이겠지\"\n\n## 제일 작은 예시\n\n```java\n@Service\npublic class OrderService {\n\n    private final OrderRepository orderRepository;\n    private final AuditWriter auditWriter;\n\n    public OrderService(OrderRepository orderRepository, AuditWriter auditWriter) {\n        this.orderRepository = orderRepository;\n        this.auditWriter = auditWriter;\n    }\n\n    @Transactional\n    public void outer(Long id) {\n        Order order = orderRepository.findById(id).orElseThrow();\n        order.changeStatus(\"PAID\");\n\n        try {\n            auditWriter.writeNestedAudit(id);\n        } catch (RuntimeException ignored) {\n        }\n\n        // 초급자는 여기서 order 상태가 savepoint 이전으로 돌아갔다고 기대하기 쉽다.\n    }\n}\n\n@Service\npublic class AuditWriter {\n\n    private final OrderRepository orderRepository;\n\n    public AuditWriter(OrderRepository orderRepository) {\n        this.orderRepository = orderRepository;\n    }\n\n    @Transactional(propagation = Propagation.NESTED)\n    public void writeNestedAudit(Long orderId) {\n        orderRepository.save(new AuditOrder(orderId));\n        throw new RuntimeException(\"fail inner\");\n    }\n}\n```\n\n이 예시는 `OrderService -> AuditWriter`처럼 Spring proxy를 지나는 호출을 전제로 한다.\n같은 클래스 안에서 `inner()`를 직접 부르면 `@Transactional` self-invocation 때문에 `NESTED` advice 자체가 적용되지 않을 수 있으므로, savepoint 문제를 보기 전에 proxy 경계 문제부터 걸린다.\n\n초급자 기대:\n\n```text\ninner만 rollback\n바깥 JPA 상태는 savepoint 이전으로 자동 복구\n```\n\n실제 초급자 관찰 포인트:\n\n```text\nsavepoint는 JDBC 쪽 이야기다\npersistence context는 이미 들고 있는 엔티티 상태를 계속 볼 수 있다\n즉 \"DB 일부 롤백\"과 \"메모리 속 JPA 상태 복구\"를 같은 일로 보면 틀리기 쉽다\n```\n\n## savepoint와 persistence context를 분리해서 보기\n\n`NESTED`에서 가장 위험한 오해는 \"savepoint rollback = EntityManager 상태 rollback\"으로 읽는 것이다. 실제 판단은 flush 여부까지 같이 봐야 한다.\n\n| inner 작업 상태 | DB savepoint 관점 | JPA persistence context 관점 |\n|---|---|---|\n| 아직 flush되지 않은 JPA 변경 | rollback할 SQL이 아직 없을 수 있다 | managed entity/new entity 상태가 남아 outer flush 때 다시 드러날 수 있다 |\n| flush된 SQL이 savepoint 뒤에 있음 | savepoint rollback으로 DB 변경은 되돌릴 수 있다 | 1차 캐시 객체 상태가 자동으로 원복됐다고 보면 안 된다 |\n| JDBC template로 직접 실행한 SQL | 같은 connection/savepoint 조건이 맞으면 부분 rollback 의미가 비교적 직접적이다 | EntityManager가 그 DB 변화를 이미 알고 있다고 기대하면 안 된다 |\n\n그래서 JPA 중심 코드에서 `NESTED`를 쓸 때는 rollback 성공 여부만 보지 말고, 이후 `clear()`, `refresh()`, detach, 재조회 같은 persistence context 정리 전략이 필요한지도 같이 설계해야 한다.\n\n## 언제 JDBC-oriented thinking이 더 안전한가\n\n아래 질문에 `예`가 나오면 JPA nested 환상보다 JDBC savepoint 감각으로 보는 편이 안전하다.\n\n| 상황 | 더 안전한 1차 사고방식 |\n|---|---|\n| \"정말 savepoint가 핵심인가?\" | JDBC 관점으로 본다 |\n| \"안쪽 실패 후 일부 SQL만 되감고 계속 가고 싶은가?\" | JDBC/배치 스타일 사고가 더 맞다 |\n| \"엔티티 상태 복구보다 DB 체크포인트가 더 중요하나?\" | JDBC 쪽이 더 직접적이다 |\n| \"JPA persistence context가 개입하면 더 헷갈리나?\" | `NESTED`보다 설계 단순화 또는 JDBC 분리를 먼저 본다 |\n\n짧게 말하면:\n\n- **부분 SQL 롤백**이 핵심이면 JDBC 사고가 더 직접적이다.\n- **엔티티 상태와 영속성 컨텍스트 일관성**이 핵심이면 `NESTED` 기대를 낮추는 편이 안전하다.\n\n## 초급자용 선택 카드\n\n| 내가 원하는 것 | 먼저 떠올릴 선택 |\n|---|---|\n| 안쪽 작업만 별도 커밋으로 남기기 | `REQUIRES_NEW` |\n| 같은 물리 트랜잭션 안에서 savepoint 되돌리기 | JDBC 쪽 `NESTED` 감각 |\n| JPA 엔티티 변경과 rollback 경계를 덜 헷갈리기 | `REQUIRED`/`REQUIRES_NEW`로 단순화 |\n| JPA와 JDBC를 섞되 savepoint가 꼭 필요하기 | `JpaTransactionManager` + JDBC 참여 조건을 아주 조심해서 보기 |\n\n특히 초급자는 \"`NESTED`가 안쪽 성공/실패를 예쁘게 분리해 주겠지\"라고 기대하기 쉽다.\n하지만 JPA 문맥에서는 **부분 롤백보다 경계 단순화가 먼저**인 경우가 많다.\n\n## 증상 라우터\n\n| 증상 | 먼저 볼 것 | 안전한 해석 |\n|---|---|---|\n| `NESTED`를 붙였는데 예외가 난다 | transaction manager와 `nestedTransactionAllowed` | JPA nested transaction 지원으로 읽지 말고 savepoint 가능 여부부터 본다 |\n| savepoint rollback 뒤 entity 필드가 기대와 다르다 | persistence context 상태 | DB savepoint와 1차 캐시의 객체 상태 복구는 같은 일이 아니다 |\n| 안쪽 실패를 잡았는데 바깥 commit 결과가 이상하다 | flush timing과 dirty checking | rollback된 SQL과 아직 managed 상태인 entity 변경을 분리해 본다 |\n| `REQUIRES_NEW`와 `NESTED` 중 고르기 어렵다 | 물리 트랜잭션 분리 필요성 | 별도 commit/rollback 단위가 필요하면 `REQUIRES_NEW`, 같은 connection savepoint가 핵심이면 `NESTED` 후보 |\n\n## 보수적 사용 원칙\n\n- JPA 엔티티 변경이 중심이면 `NESTED`를 기본 선택지로 두지 않는다.\n- savepoint가 꼭 필요하면 같은 `DataSource`, JDBC driver savepoint 지원, transaction manager 설정을 먼저 확인한다.\n- savepoint rollback 뒤에는 persistence context를 `clear`, `refresh`, detach 같은 방식으로 어떻게 정리할지 별도 설계한다.\n- 테스트는 \"DB row가 되돌아갔는가\"와 \"managed entity 상태가 되돌아갔는가\"를 따로 검증한다.\n- 초급 단계에서는 `REQUIRED`/`REQUIRES_NEW`로 경계를 명확히 하는 편이 설명과 운영 모두 단순한 경우가 많다.\n\n## 자주 하는 오해\n\n- \"`JpaTransactionManager`도 `NESTED`가 있으니 JPA nested transaction을 지원한다\"가 아니다.\n- \"savepoint rollback이면 persistence context의 엔티티 상태도 자동 복구된다\"가 아니다.\n- \"`REQUIRES_NEW`와 `NESTED`는 둘 다 안쪽 분리니까 거의 비슷하다\"가 아니다.\n- \"JPA 코드가 중심인데도 JDBC 배치 partial rollback 감각을 그대로 적용해도 된다\"가 아니다.\n\n## 한 줄 정리\n\n`JpaTransactionManager`에서 `NESTED` 기대가 깨지는 이유는 savepoint가 **JDBC 연결 수준**의 기능인데, 초급자는 이를 **JPA 영속성 컨텍스트까지 되감기는 기능**으로 오해하기 쉽기 때문이다.\n",
+  "aliases": [
+    "JpaTransactionManager NESTED",
+    "JPA nested savepoint",
+    "nestedTransactionAllowed",
+    "persistence context savepoint mismatch",
+    "JPA nested rollback misconception",
+    "JDBC savepoint",
+    "NESTED propagation JPA caveat",
+    "@Service",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "JpaTransactionManager에서 NESTED propagation은 JPA 중첩 트랜잭션이야?",
+    "JPA에서 savepoint rollback 후 persistence context 상태가 왜 그대로일 수 있어?",
+    "nestedTransactionAllowed 기본값과 JDBC savepoint 기대를 어떻게 봐야 해?",
+    "flush하지 않은 JPA 변경은 NESTED rollback 뒤 어떻게 봐야 해?",
+    "@Transactional NESTED와 REQUIRES_NEW를 beginner 관점으로 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "@Transactional(NESTED)를 붙였는데 JpaTransactionManager에서 nested transaction이 안 된다고 나온다.",
+    "savepoint rollback 뒤 DB row와 persistence context 안 entity 상태가 다르게 보인다.",
+    "inner JPA save가 rollback됐다고 생각했는데 outer commit 때 다시 flush되는 것처럼 보인다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transactional-basics"
+    ],
+    "next_docs": [
+      "spring/jpa-dirty-checking-version-strategy"
+    ],
+    "confusable_with": [
+      "spring/transaction-propagation-nested-requires-new-case-studies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-jpatransactionmanager-savepoint-expectations-mini-card.md",
+    "revision_history": []
+  }
+}

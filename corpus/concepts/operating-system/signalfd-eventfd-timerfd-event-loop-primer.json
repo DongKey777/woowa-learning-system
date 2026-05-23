@@ -1,0 +1,61 @@
+{
+  "id": "operating-system/signalfd-eventfd-timerfd-event-loop-primer",
+  "title": "signalfd eventfd timerfd Event Loop Primer",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# signalfd eventfd timerfd Event Loop Primer\n\n> 한 줄 요약: `signalfd`, `eventfd`, `timerfd`는 signal, cross-thread wakeup, timer를 모두 \"읽을 수 있는 fd\"로 바꿔 Linux event loop의 control plane을 `epoll` 안에 모으는 도구다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [I/O Models and Event Loop](./io-models-and-event-loop.md)\n- [File Descriptor Basics](./file-descriptor-basics.md)\n- [Signal과 Graceful Shutdown primer](./signal-graceful-shutdown-primer.md)\n- [eventfd, signalfd, Epoll Control-Plane Integration](./eventfd-signalfd-epoll-control-plane-integration.md)\n- [Timerfd, Epoll Timer Integration](./timerfd-epoll-timer-integration.md)\n- [pipe, socketpair, eventfd, memfd IPC Selection](./pipe-socketpair-eventfd-memfd-ipc-selection.md)\n- [epoll kqueue io_uring Readiness Primer](./epoll-kqueue-iouring-readiness-primer.md)\n\nretrieval-anchor-keywords: signalfd, eventfd, timerfd, epoll control plane, fd based event loop, self-pipe trick, cross-thread wakeup, signal mask, timer expiration counter, kqueue portability\n\n## 먼저 멘탈모델\n\nEvent loop를 소켓 I/O만 기다리는 구조로 보면 운영 제어 경로가 금방 흩어진다.\n\n- 네트워크 연결은 `epoll`에서 기다린다\n- 종료 신호는 signal handler가 처리한다\n- worker가 새 작업을 넣으면 condition variable이나 pipe로 깨운다\n- timeout은 별도 timer thread가 담당한다\n\n작은 프로그램에서는 이 구조도 버틸 수 있지만, 서버가 커지면 shutdown, reload, timeout, backpressure, worker wakeup의 순서가 얽힌다. Linux의 `signalfd`, `eventfd`, `timerfd`는 이런 제어 신호를 fd readiness event로 바꾼다.\n\n```text\nsocket fd     -> client I/O ready\nsignalfd      -> SIGTERM/SIGHUP/SIGCHLD arrived\neventfd       -> another thread/process requested wakeup\ntimerfd       -> timeout/backoff/heartbeat expired\nall of them   -> epoll_wait() returns events\n```\n\n핵심은 \"모든 문제가 fd가 되면 자동으로 해결된다\"가 아니다. 핵심은 이벤트를 받는 지점을 한 루프로 모아 상태 전이를 한 곳에서 설계할 수 있다는 점이다.\n\n## 세 fd의 역할 구분\n\n### 1. signalfd: signal을 handler 밖으로 꺼낸다\n\n`signalfd`는 대상 signal을 block한 뒤, 해당 signal을 fd에서 `read`할 수 있게 만든다. `SIGTERM`, `SIGHUP`, `SIGCHLD` 같은 제어 signal을 async signal handler 안에서 직접 처리하지 않고 event loop dispatch 단계에서 처리할 수 있다.\n\n중요한 전제:\n\n- signal을 받으려는 thread 또는 process에서 signal mask를 올바르게 설정해야 한다\n- `signalfd`는 signal을 없애는 API가 아니라 blocked pending signal을 읽는 API다\n- `SIGKILL`, `SIGSTOP`처럼 잡을 수 없는 signal은 당연히 처리할 수 없다\n\n좋은 사용 예시는 graceful shutdown, 설정 reload, child process reap처럼 \"운영 제어 이벤트\"를 loop 안의 상태 기계로 넘기는 것이다.\n\n### 2. eventfd: payload가 아니라 wakeup counter다\n\n`eventfd`는 64비트 counter를 가진 notification fd다. 다른 thread가 work queue에 작업을 넣은 뒤 `eventfd`에 write하면 event loop는 readable event를 받고 깨어난다.\n\n여기서 payload와 wakeup을 분리해야 한다.\n\n- 실제 작업 데이터: protected queue, lock-free queue, shared memory 등 별도 구조에 둔다\n- wakeup 신호: `eventfd` counter로 보낸다\n- loop 처리: eventfd를 read해서 counter를 drain하고 queue를 처리한다\n\n`eventfd`에 업무 메시지를 직접 담으려 하면 금방 한계가 온다. request/response, framing, fd passing, 큰 payload가 필요하면 `pipe`, `socketpair`, `memfd`, shared memory를 다시 검토해야 한다.\n\n### 3. timerfd: timer expiration을 readable event로 만든다\n\n`timerfd`는 one-shot timeout, periodic heartbeat, retry backoff 같은 시간 이벤트를 fd로 표현한다. `CLOCK_MONOTONIC` 기반으로 만들면 wall clock 변경에 덜 흔들리는 timeout을 구성할 수 있다.\n\n주의할 점:\n\n- `timerfd` readable은 \"타이머 만료가 있었다\"는 뜻이지 handler가 정시에 실행됐다는 뜻은 아니다\n- `read`하면 만료 횟수 counter를 얻는다\n- event loop가 막혀 있거나 CPU pressure가 크면 여러 만료가 누적될 수 있다\n- jitter, drift, scheduler delay는 `timerfd` 사용만으로 사라지지 않는다\n\n즉 `timerfd`는 timer thread를 줄이는 도구이지 시간 정확성을 보장하는 마법이 아니다.\n\n## self-pipe trick과의 경계\n\nSelf-pipe trick은 signal handler에서 pipe에 1바이트를 써서 `select`/`poll`/`epoll`을 깨우는 오래된 패턴이다. portable하고 널리 알려져 있지만, signal handler 제약과 pipe lifecycle을 직접 관리해야 한다.\n\nLinux 전용 event loop라면 다음처럼 생각하면 된다.\n\n| 상황 | 더 자연스러운 선택 | 이유 |\n|---|---|---|\n| signal을 loop에서 구조적으로 처리 | `signalfd` | signal metadata를 fd read로 받고 handler 로직을 줄인다 |\n| 다른 thread가 loop를 깨움 | `eventfd` | counter 기반 wakeup이라 의미가 분명하다 |\n| timer를 loop에 통합 | `timerfd` | expiration을 fd readiness로 받는다 |\n| Linux 외 플랫폼까지 같은 코드 경로 필요 | self-pipe 또는 platform abstraction | `signalfd`/`eventfd`/`timerfd`는 Linux API다 |\n| byte stream 또는 메시지 payload 필요 | pipe/socketpair | eventfd는 payload channel이 아니다 |\n\n정리하면 self-pipe trick은 \"portable wakeup primitive\"에 가깝고, `signalfd`/`eventfd`/`timerfd`는 Linux event loop에서 control plane을 더 명시적으로 모델링하는 도구다.\n\n## epoll과 같이 쓸 때 얻는 장점\n\n`epoll`에 이 fd들을 함께 등록하면 data plane과 control plane을 같은 dispatch loop에서 다룰 수 있다.\n\n```text\nepoll_wait()\n  -> socket: read/write/accept\n  -> signalfd: shutdown/reload/reap state transition\n  -> eventfd: drain work queue\n  -> timerfd: expire timeout/backoff/heartbeat\n```\n\n운영 설계상 장점:\n\n- 종료 중 새 요청 차단, in-flight drain, timer 취소를 한 상태 기계로 묶기 쉽다\n- worker thread와 reactor thread 사이 wakeup 경로가 명확해진다\n- signal handler에서 복잡한 일을 하지 않아도 된다\n- timeout과 network readiness를 같은 우선순위 정책으로 처리할 수 있다\n- \"왜 loop가 깨어났는가\"를 fd별로 관찰하기 쉬워진다\n\n다만 `epoll`이 fairness, handler latency, backpressure를 대신 설계해 주지는 않는다. 한 이벤트 handler가 오래 실행되면 signal, timer, socket 처리가 모두 늦어진다.\n\n## 흔한 오해\n\n### 오해 1: epoll에 넣으면 모두 non-blocking이 된다\n\nfd가 readable event를 준다는 것과 handler 내부가 non-blocking이라는 것은 다르다. fd 생성 시 `SFD_NONBLOCK`, `EFD_NONBLOCK`, `TFD_NONBLOCK` 같은 flag를 쓰고, handler 안에서 blocking syscall을 호출하지 않도록 별도 discipline이 필요하다.\n\n### 오해 2: signalfd를 쓰면 signal handler가 전혀 필요 없다\n\n대부분의 제어 signal은 `signalfd`로 옮길 수 있지만, signal mask 설정이 틀리면 의도와 다르게 다른 thread로 signal이 전달될 수 있다. 또한 잡을 수 없는 signal은 처리 대상이 아니다.\n\n### 오해 3: eventfd는 메시지 큐다\n\n`eventfd`는 counter다. \"몇 번 깨워야 하는가\" 또는 \"일이 생겼는가\"를 표현하기 좋지만 업무 payload, 우선순위, request id, error detail을 담는 구조는 아니다.\n\n### 오해 4: timerfd는 정확한 스케줄러다\n\n`timerfd`는 만료 알림을 fd로 바꿔 줄 뿐이다. CPU throttling, run queue saturation, handler 지연, stop-the-world pause가 있으면 실제 처리 시점은 늦어진다.\n\n### 오해 5: Linux fd 기반 모델은 어디서나 그대로 이식된다\n\n`signalfd`, `eventfd`, `timerfd`는 Linux 전용 API다. BSD/macOS 계열에서는 `kqueue`의 `EVFILT_SIGNAL`, `EVFILT_TIMER`, `EVFILT_USER` 같은 filter로 비슷한 control event를 구성할 수 있지만 semantics와 API가 다르다. portable runtime을 만들려면 \"signal/timer/wakeup을 event loop control plane으로 추상화한다\"는 설계 개념만 공유하고 구현은 platform adapter로 나누는 편이 안전하다.\n\n## 운영 디버깅 신호\n\nfd 기반 event loop가 기대대로 동작하는지 볼 때는 \"이벤트가 오느냐\"와 \"제때 처리되느냐\"를 분리해서 본다.\n\n- `strace`에서 `epoll_wait`, `read(signalfd)`, `read(eventfd)`, `read(timerfd)` 호출이 기대한 순서로 보이는가\n- `/proc/<pid>/fd`와 `/proc/<pid>/fdinfo`에서 control fd가 의도한 process에만 열려 있는가\n- `CLOEXEC` 누락으로 child process에 control fd가 새지 않았는가\n- eventfd write는 발생하는데 queue drain 로그가 없지는 않은가\n- timerfd expiration count가 1보다 크게 자주 누적되지는 않는가\n- `SIGTERM` 이후 새 요청 차단, in-flight drain, timer 취소, worker stop 순서가 로그로 확인되는가\n- event loop thread의 CPU 사용률, run queue delay, handler latency, long task 로그가 증가하지 않는가\n- edge-triggered epoll을 쓴다면 fd를 `EAGAIN`까지 drain하고 있는가\n\n장애 분석에서는 \"fd가 readable이었는가\"보다 \"readable event를 받은 뒤 상태 기계가 어떤 결정을 했는가\"가 더 중요할 때가 많다.\n\n## 설계 체크리스트\n\n- 이 event loop가 담당하는 fd ownership은 어느 thread/process에 있는가\n- signal mask는 모든 thread 생성 순서와 맞게 설정됐는가\n- wakeup fd와 실제 queue payload의 일관성은 어떤 lock 또는 memory ordering으로 보장되는가\n- timer는 one-shot 재설정 방식인가, periodic 누적 방식인가\n- shutdown 시 signalfd, eventfd, timerfd, socket fd를 어떤 순서로 unregister/close하는가\n- `CLOEXEC`와 non-blocking flag를 생성 시점에 붙였는가\n- Linux 외 플랫폼을 지원해야 한다면 `kqueue`/self-pipe adapter 경계가 있는가\n\n## 검증 질문\n\n1. `eventfd`를 worker queue wakeup에 쓸 때, 업무 payload를 eventfd counter에 담지 않는 이유를 설명할 수 있는가?\n2. `signalfd`를 쓰려면 signal mask를 왜 먼저 설정해야 하는가?\n3. `timerfd` read 결과의 expiration count가 5라면 운영적으로 무엇을 의심해야 하는가?\n4. self-pipe trick이 여전히 필요한 상황은 어떤 portability 요구에서 나오는가?\n5. `epoll`에 control fd를 넣었는데도 shutdown이 늦다면 fd API보다 먼저 어떤 handler latency와 state transition을 확인해야 하는가?\n6. BSD/macOS `kqueue`로 옮길 때 Linux `signalfd`/`eventfd`/`timerfd`와 1:1 이름 매핑을 기대하면 왜 위험한가?\n\n## 한 줄 정리\n\nLinux event loop에서 `signalfd`, `eventfd`, `timerfd`를 `epoll`에 함께 넣으면 signal, cross-thread wakeup, timer를 같은 fd readiness 모델로 다룰 수 있다. 하지만 portability, payload 경계, signal mask, timer jitter, handler latency는 여전히 애플리케이션 설계와 운영 검증의 책임이다.\n",
+  "aliases": [
+    "signalfd eventfd timerfd primer",
+    "fd based event loop control plane",
+    "epoll signal timer wakeup 통합",
+    "Linux event loop signal wakeup timer",
+    "self pipe trick 대안",
+    "cross thread wakeup eventfd",
+    "timerfd signalfd eventfd 차이",
+    "signal timer cross-thread wakeup fd 통합"
+  ],
+  "expected_queries": [
+    "Linux event loop에서 signal, thread wakeup, timer를 fd로 같이 다루는 mental model을 알려줘",
+    "signalfd eventfd timerfd는 각각 언제 쓰고 epoll과 어떻게 연결돼?",
+    "self-pipe trick과 signalfd/eventfd는 어떤 경계가 있어?",
+    "eventfd를 cross-thread wakeup에 쓰면 queue payload는 어디에 둬야 해?",
+    "timerfd를 epoll에 넣으면 timeout thread가 필요 없어지는 거야?",
+    "Linux signalfd eventfd timerfd를 BSD kqueue 환경에서도 똑같이 쓸 수 있어?"
+  ],
+  "symptoms": [
+    "signal handler, timer thread, worker wakeup, socket I/O가 각각 따로 돌아서 종료 경로가 복잡해요",
+    "epoll은 socket만 감시하는 도구라고 생각해요",
+    "self-pipe trick과 signalfd/eventfd의 경계를 구분하지 못해요",
+    "eventfd에 업무 데이터를 실어 보내려 하고 wakeup과 payload를 섞어요",
+    "timerfd를 쓰면 timer 지연이나 drift가 사라진다고 오해해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/io-models-and-event-loop",
+      "operating-system/file-descriptor-basics",
+      "operating-system/signal-graceful-shutdown-primer"
+    ],
+    "next_docs": [
+      "operating-system/eventfd-signalfd-epoll-control-plane-integration",
+      "operating-system/timerfd-epoll-timer-integration",
+      "operating-system/epoll-level-edge-oneshot-wakeup-semantics",
+      "operating-system/epoll-kqueue-iouring-readiness-primer"
+    ],
+    "confusable_with": [
+      "operating-system/eventfd-signalfd-epoll-control-plane-integration",
+      "operating-system/timerfd-epoll-timer-integration",
+      "operating-system/pipe-socketpair-eventfd-memfd-ipc-selection",
+      "operating-system/epoll-kqueue-iouring-readiness-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/signalfd-eventfd-timerfd-event-loop-primer.md",
+    "revision_history": []
+  }
+}

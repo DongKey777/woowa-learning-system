@@ -1,0 +1,46 @@
+{
+  "id": "operating-system/memory-low-min-reclaim-protection",
+  "title": "memory.low memory.min Reclaim Protection",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 memory.low와 memory.min을 cgroup이 reclaim에서 우선 보호받을 memory amount를",
+  "body_markdown": "# memory.low, memory.min, Reclaim Protection\n\n> 한 줄 요약: `memory.low`와 `memory.min`은 cgroup이 reclaim에서 우선적으로 보호받을 메모리를 정하는 장치라서, 중요한 워크로드의 cache와 heap을 완충하는 데 유용하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [memory.high vs memory.max, Cgroup Behavior](./memory-high-vs-memory-max-cgroup-behavior.md)\n> - [memory.reclaim, Cgroup v2 Proactive Reclaim](./memory-reclaim-cgroup-v2-proactive-reclaim.md)\n> - [OOM Killer, cgroup Memory Pressure](./oom-killer-cgroup-memory-pressure.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n> - [vm.swappiness, Reclaim Behavior](./vm-swappiness-reclaim-behavior.md)\n\n> retrieval-anchor-keywords: memory.low, memory.min, reclaim protection, protected memory, cgroup v2 memory, reclaim priority, memory pressure, protected cache\n\n## 핵심 개념\n\ncgroup v2의 `memory.low`와 `memory.min`은 reclaim 대상이 되었을 때 특정 워크로드의 메모리를 더 보호해 주는 역할을 한다.\n\n- `memory.low`: 이 값 아래 사용량은 best-effort로 보호한다\n- `memory.min`: 이 값 아래 사용량은 더 강하게 보호되며, 과도하게 잡으면 다른 cgroup이나 전체 노드 압박을 키울 수 있다\n- `reclaim protection`: 압박이 와도 우선적으로 덜 건드리는 전략이다\n\n왜 중요한가:\n\n- 핵심 API의 heap이나 page cache를 보호할 수 있다\n- batch와 foreground를 같은 노드에서 돌릴 때 간섭을 줄일 수 있다\n- OOM 전에 느려지는 경로를 완화할 수 있다\n\n이 문서는 [memory.high vs memory.max, Cgroup Behavior](./memory-high-vs-memory-max-cgroup-behavior.md)와 같이 읽으면 좋다.\n\n## 깊이 들어가기\n\n### 1. low와 min은 같은 말이 아니다\n\n- `memory.low`: 최대한 보호하고 싶다는 힌트에 가깝다\n- `memory.min`: 더 강하게 보호하고 싶은 최소 경계다\n\n### 2. 보호는 공짜가 아니다\n\n한 cgroup을 보호하면 다른 cgroup이 더 많이 reclaim당할 수 있다.\n\n- noisy neighbor를 다른 쪽으로 밀어낼 수 있다\n- 전체 노드 메모리 압박은 여전히 존재한다\n- 잘못 쓰면 다른 워크로드가 먼저 느려진다\n\n### 3. foreground와 background를 분리할 때 유용하다\n\n- API heap\n- 핵심 cache\n- latency-sensitive worker\n\n이런 것들을 `memory.low`로 보호하고, batch는 더 쉽게 reclaim되도록 설계할 수 있다.\n\n### 4. protection은 PSI와 함께 봐야 한다\n\n보호를 해도 실제 stall이 줄었는지 확인해야 한다.\n\n계층형 cgroup에서는 parent와 sibling의 설정도 함께 작동한다. 하위 cgroup에 값을 줬더라도 상위 계층의 여유와 다른 sibling의 사용량 때문에 체감 보호가 달라질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 배치가 돌아도 API cache가 덜 흔들린다\n\n가능한 원인:\n\n- `memory.low`로 핵심 cgroup이 보호된다\n- batch가 reclaim을 더 많이 맞는다\n- latency-sensitive 영역이 완충된다\n\n### 시나리오 2: 보호를 걸었는데 다른 cgroup이 느려진다\n\n가능한 원인:\n\n- 보호가 너무 강하다\n- 노드 여유가 없다\n- reclaim 압박이 전이됐다\n\n### 시나리오 3: `memory.high`와 조합이 이상하다\n\n가능한 원인:\n\n- high와 low의 계층이 충돌한다\n- 보호 경계가 너무 넓다\n- overall pressure가 그대로다\n\n## 운영 Playbook\n\n### 재현 조건\n\n- foreground API와 batch가 같은 노드에서 돌고, batch 시작 후 API cache refault, major fault, memory PSI가 증가한다.\n- `memory.high/max`만으로는 batch를 누르지만 foreground의 hot cache까지 같이 식는다.\n- `memory.low/min` 적용 후 foreground는 좋아졌지만 sibling cgroup의 stall/OOM이 늘었다.\n\n### 확인 순서\n\n1. cgroup v2인지 확인하고 대상 cgroup의 `memory.current`, `memory.stat`, `memory.events`, `memory.pressure`를 기록한다.\n2. foreground와 background를 sibling으로 분리했는지, parent cgroup에 충분한 memory budget이 있는지 본다.\n3. `memory.low`를 먼저 작은 값으로 두고 refault, workingset, PSI 변화가 줄어드는지 본다.\n4. `memory.min`은 정말 보호해야 하는 최소 working set에만 쓰고, sibling OOM/reclaim 증가를 같이 본다.\n5. `memory.high` throttle과 `memory.max` kill 정책이 protection과 충돌하지 않는지 확인한다.\n\n### Failure Matrix\n\n| 관찰 | 1차 분기 | 다음 확인 |\n|------|----------|-----------|\n| foreground PSI 감소, batch PSI 증가 | 의도한 보호 작동 | SLO와 batch 허용 지연 |\n| 전체 PSI 그대로 높음 | 노드 총량 부족 | capacity, memory.max, swap/reclaim |\n| sibling OOM 증가 | protection 과다 | low/min 합계, parent budget |\n| foreground cache 여전히 refault | low 부족 또는 잘못된 cgroup | `memory.stat` workingset/refault, process placement |\n| `memory.high` events 증가 | throttle 경로 우세 | high 값과 protection 계층 |\n\n### 검증\n\n보호 설정의 성공 기준은 `memory.current`가 목표값 근처에 머무는 것이 아니라 foreground p99, PSI, refault가 줄고 sibling 피해가 허용 범위에 남는 것이다. 값 변경 전후를 같은 부하에서 비교하고, cgroup 계층 전체 합계가 물리 메모리를 과하게 예약하지 않는지 확인한다.\n\n## 코드로 보기\n\n### 설정 감각\n\n```bash\necho 2147483648 > /sys/fs/cgroup/memory.low\necho 1073741824 > /sys/fs/cgroup/memory.min\n```\n\n### 상태 확인\n\n```bash\ncat /sys/fs/cgroup/memory.current\ncat /sys/fs/cgroup/memory.events\ncat /sys/fs/cgroup/memory.pressure\n```\n\n### 감각 모델\n\n```text\nprotected cgroup\n  -> reclaim hits other cgroups first\n  -> latency-sensitive memory stays warmer\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| memory.low 사용 | 핵심 워크로드를 보호한다 | 다른 워크로드가 더 희생된다 | API 우선 |\n| memory.min 사용 | 더 강하게 보호한다 | 노드 공정성이 나빠질 수 있다 | 핵심 cache |\n| 보호 없음 | 단순하다 | noisy neighbor에 취약 | 비중요 워크로드 |\n\n## 꼬리질문\n\n> Q: memory.low와 memory.min 차이는?\n> 핵심: 둘 다 보호지만 min이 더 강한 경계다.\n\n> Q: 보호하면 무엇이 희생되나요?\n> 핵심: 다른 cgroup의 reclaim 압박이 커진다.\n\n> Q: 언제 유용한가요?\n> 핵심: API와 batch를 같은 노드에서 돌릴 때다.\n\n## 한 줄 정리\n\n`memory.low`와 `memory.min`은 reclaim에서 특정 cgroup을 보호하는 장치라서, latency-sensitive 워크로드를 배치 간섭으로부터 완충하는 데 유용하다.\n",
+  "aliases": [
+    "memory.low memory.min",
+    "cgroup reclaim protection",
+    "protected memory workload",
+    "cache heap reclaim protection",
+    "memory min hard protection",
+    "memory low best effort protection"
+  ],
+  "expected_queries": [
+    "memory.low와 memory.min은 cgroup reclaim protection에서 어떻게 달라?",
+    "중요한 workload의 cache와 heap을 reclaim에서 보호하려면 어떤 cgroup knob를 써?",
+    "memory.low는 best-effort protection이고 memory.min은 더 강한 protection이라는 뜻은?",
+    "memory.high max와 low min을 함께 설계할 때 어떤 tradeoff가 있어?"
+  ],
+  "symptoms": [
+    "중요한 workload의 heap이나 page cache를 reclaim에서 어느 정도 보호하고 싶다.",
+    "memory.high/max만 설정했더니 protected workload와 background workload가 같은 압박을 맞는다.",
+    "memory.low와 memory.min의 보호 강도 차이를 이해하지 못해 OOM/reclaim tradeoff가 흐려진다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/demand-paging-page-fault-primer",
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/swap-in-reclaim-fault-path-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/memory-low-min-reclaim-protection.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "security/refresh-token-family-reuse-interview-drill",
+  "title": "Refresh Token Family Reuse Interview Drill",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 drill은 refresh token rotation과 reuse detection, token family invalidation을 면접 답변으로 연습한다.",
+  "body_markdown": "# Refresh Token Family Reuse Interview Drill\n\n## 보장 범위\n\n이 drill은 refresh token rotation에서 이미 사용된 refresh token이 다시 들어왔을 때 왜 같은 token family를 무효화하는지 설명하는 연습이다. Access token TTL, JWT signing key rotation, API key leak, browser session fixation과 섞지 않는다.\n\nRefresh token family invalidation은 \"어느 쪽이 공격자인지 확정\"하는 장치가 아니다. 정상 client와 attacker가 같은 family에서 경쟁할 가능성을 보고, 더 이상의 access token 발급을 멈추는 containment 정책이다.\n\n## Source-aware caveat\n\n`token family`, `grace window`, `reuse detection` 같은 용어와 기본 정책은 authorization server 제품과 provider 설정마다 다를 수 있다. 일부 provider는 family 단위 폐기를 명시하고, 일부는 session/device 단위나 계정 단위 revoke 정책을 별도 옵션으로 둔다. 이 drill은 면접 답변의 보안 논리를 고정하는 용도이고, 실제 운영에서는 provider 문서, 저장소 schema, audit event 정의, 재로그인 UX 정책을 함께 확인해야 한다.\n\n여기서 reuse detection은 refresh token 상태 전이 문제다. Access token 만료, JWT key rotation, resource server authorization 실패, cookie session fixation을 같은 원인으로 설명하지 않는다.\n\n## 질문\n\n\"Refresh token rotation에서 재사용이 감지되면 왜 token family를 무효화하나요?\"\n\n## 기대 답변 축\n\nRefresh token rotation은 token을 사용할 때마다 새 refresh token을 발급하고 이전 token을 폐기하는 방식이다. 정상 client는 최신 token만 가진다.\n\n이미 성공적으로 사용 처리된 refresh token이 다시 들어오면, 네트워크 retry인지 탈취된 token 재사용인지 구분하기 어렵다. 특히 attacker와 정상 client가 같은 family에서 최신 token을 두고 경쟁할 수 있다.\n\n그래서 같은 family에 속한 refresh token 전체를 무효화하고 재로그인을 요구하는 정책이 일반적이다. 사용자 피해를 줄이려면 device/session 단위 scope와 risk signal을 함께 본다.\n\n## 상태 모델을 먼저 말하기\n\n면접 답변에서는 \"재사용된 token 하나를 막는다\"보다 상태 전이를 먼저 설명하는 편이 정확하다.\n\n| 상태 | 의미 | 다음 판단 |\n|---|---|---|\n| `active` | 아직 refresh exchange에 쓰이지 않음 | 정상 exchange 후보 |\n| `used`/`rotated` | 이미 새 token 발급에 소비됨 | 다시 제출되면 reuse signal |\n| `revoked` | logout, compromise, admin revoke 등으로 폐기됨 | token exchange 실패 |\n| `family_revoked` | 같은 family descendants까지 폐기됨 | 재로그인 또는 step-up 필요 |\n\n정상 refresh는 old token을 `used`로 바꾸고 next token을 같은 transaction에서 발급한다. 그 뒤 old token이 다시 오면 단순 만료가 아니라 \"이미 소비된 bearer credential이 재등장했다\"는 신호다.\n\n## 관찰 증거\n\n- 저장소에 refresh token 원문이 아니라 hash가 저장되고, `family_id`, `token_id`/`jti`, parent id, status, issued/used/revoked time이 남는다.\n- 정상 refresh에서는 old token이 atomically `used` 처리되고, 같은 transaction에서 next token이 발급된다.\n- reuse event는 이미 `used` 또는 `revoked` 상태인 token이 다시 제출된 기록이다.\n- 같은 family에서 서로 다른 IP, device id, user-agent가 짧은 시간 안에 경쟁하면 compromise 가능성이 커진다.\n- family invalidation 후에는 해당 family의 모든 descendant refresh token이 token exchange에 실패해야 한다.\n\n## 운영 대응\n\n1. Refresh token은 rotation을 기본으로 두고, 재사용 가능한 long-lived static token을 피한다.\n2. 정상 refresh 처리는 compare-and-set 또는 transaction으로 old token 사용 처리와 new token 발급을 묶는다.\n3. 네트워크 retry를 고려해 매우 짧은 idempotency window를 둘 수 있지만, window 밖 reuse는 family compromise로 본다.\n4. Reuse가 감지되면 family를 invalidate하고 해당 device/session 재로그인을 요구한다.\n5. 위험도가 높으면 같은 계정의 다른 session도 step-up auth나 전역 logout 대상으로 올린다.\n6. 사용자 알림, audit event, support trace id를 남겨 false positive와 실제 탈취를 사후 구분할 수 있게 한다.\n\n## 섞지 않을 것\n\n- Access token TTL을 줄이는 것은 피해 시간을 줄이는 보조책이지 refresh token 탈취 탐지를 대체하지 않는다.\n- JWT signing key rotation은 token 서명 신뢰 경계 문제이고, 이미 발급된 refresh token family의 소비 상태와는 별개다.\n- Reuse detection은 \"누가 공격자인지 식별\"이 아니라 \"이 family에서 더 이상 안전하게 발급을 계속할 수 없음\"을 판단하는 정책이다.\n- Family scope가 device/session이면 해당 family만 끊고, 계정 전체 revoke는 risk signal이 더 강할 때 별도 정책으로 올린다.\n\n## 약점 태그\n\n`rotation`, `reuse-detection`, `token-family`, `session-scope`\n\n## 흔한 오답\n\nAccess token TTL을 짧게 하면 모든 문제가 해결된다고 말하면 부족하다. Refresh token이 탈취되면 attacker는 계속 새 access token을 받을 수 있으므로 refresh layer의 탐지와 폐기가 필요하다.\n\n\"재사용된 token 하나만 삭제하면 된다\"도 부족하다. 이미 정상 client와 attacker 중 누가 최신 token을 가졌는지 모르는 상태라 family 전체를 끊어야 한다.\n\n\"family invalidation은 모든 기기 logout\"이라고 단정하면 과하다. 보통 family는 device/session 범위로 잡고, 계정 전체 차단은 risk signal이 더 강할 때 선택한다.\n\n\"reuse는 그냥 401을 반환하면 끝\"이라고 말해도 부족하다. 401 응답은 외부 결과일 뿐이고, 내부적으로는 family status 변경, descendant revoke, audit event, 사용자 재인증 흐름이 함께 일어나야 한다.\n\n## Safe Next Docs\n\n대규모 invalidation은 `refresh-token-family-invalidation-at-scale`, JWT revoke lag는 `jwt-rotation-revocation-interview-playbook`으로 이어진다.\n",
+  "aliases": [
+    "refresh token family reuse drill",
+    "refresh token rotation reuse detection 면접",
+    "token family invalidation answer",
+    "refresh token 탈취 재사용 탐지"
+  ],
+  "expected_queries": [
+    "Refresh token rotation은 왜 필요해?",
+    "refresh token reuse가 감지되면 왜 family를 무효화해?",
+    "access token 만료와 refresh token 탈취 대응을 어떻게 설계해?"
+  ],
+  "symptoms": [
+    "refresh token을 계속 같은 값으로 재사용합니다",
+    "reuse detection 이후에도 일부 세션을 살려 둡니다",
+    "access token 짧은 TTL만으로 충분하다고 생각합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/refresh-token-rotation-reuse-detection"
+    ],
+    "next_docs": [
+      "security/refresh-token-family-invalidation-at-scale",
+      "security/jwt-rotation-revocation-interview-playbook"
+    ],
+    "confusable_with": [
+      "security/jwt-rotation-revocation-interview-playbook",
+      "security/session-revocation-at-scale"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/refresh-token-family-reuse-interview-drill.md",
+    "revision_history": []
+  }
+}

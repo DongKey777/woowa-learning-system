@@ -1,0 +1,59 @@
+{
+  "id": "language/serialization-compatibility-serial-version-uid",
+  "title": "Serialization Compatibility and serialVersionUID",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 Java native serialization compatibility와 serialVersionUID, readObject/writeObject hooks, transient invariant, schema evolution risk를 점검하는 advanced playbook이다.",
+  "body_markdown": "# Serialization Compatibility and `serialVersionUID`\n\n> 한 줄 요약: Java native serialization은 클래스 구조와 직렬화 계약이 강하게 묶이므로, `serialVersionUID`를 이해하지 못하면 작은 필드 변경도 역직렬화 호환성을 깨뜨릴 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java IO, NIO, Serialization, JSON Mapping](./io-nio-serialization.md)\n> - [Serialization Proxy Pattern and Invariant Preservation](./serialization-proxy-pattern-invariant-preservation.md)\n> - [`serialPersistentFields`, `readObjectNoData`, and Native Serialization Evolution Escape Hatches](./serialpersistentfields-readobjectnodata-evolution-escape-hatches.md)\n> - [Record Serialization Evolution](./record-serialization-evolution.md)\n> - [Value Object Invariants, Canonicalization, and Boundary Design](./value-object-invariants-canonicalization-boundary-design.md)\n> - [JSON `null`, Missing Field, Unknown Property, and Schema Evolution](./json-null-missing-unknown-field-schema-evolution.md)\n> - [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)\n> - [String Intern and Pool Pitfalls](./string-intern-pool-pitfalls.md)\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n\n> retrieval-anchor-keywords: serialization compatibility, `serialVersionUID`, `Serializable`, `ObjectInputStream`, `ObjectOutputStream`, readObject, writeObject, default serialization, schema evolution, backward compatibility, forward compatibility, serial persistent fields, transient, value object invariant, null vs missing field, serialization proxy, writeReplace, readResolve, readObjectNoData, putFields, readFields\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nJava native serialization은 객체의 필드와 타입 정보를 바이트 형태로 저장한다.  \n문제는 이 포맷이 \"현재 클래스 구현\"에 강하게 의존한다는 점이다.\n\n`serialVersionUID`는 역직렬화 시 클래스 버전이 호환되는지 판단하는 식별자다.  \n명시적으로 선언하지 않으면 컴파일러와 JVM이 자동 계산한 값에 의존하게 된다.\n\n### 왜 이게 중요한가\n\n- 필드 추가/삭제가 잦으면 호환성이 흔들린다\n- 클래스 이름은 같아도 구조가 달라지면 역직렬화가 깨질 수 있다\n- 장기 저장 포맷으로는 운영 리스크가 크다\n\n## 깊이 들어가기\n\n### 1. 자동 생성 `serialVersionUID`는 왜 위험한가\n\n`serialVersionUID`를 명시하지 않으면 클래스 내부 변경이 곧 버전 변경으로 이어질 수 있다.\n\n예를 들어 다음은 모두 호환성에 영향을 줄 수 있다.\n\n- 필드 추가\n- 필드 타입 변경\n- 접근 제어자 변경\n- 상속 구조 변경\n- `private` helper 추가가 계산 결과에 영향을 주는 경우\n\n작은 리팩터링이 저장 데이터와의 계약을 깨뜨릴 수 있다는 뜻이다.\n\n### 2. 역직렬화는 필드만 복원하는 과정이 아니다\n\nserialization은 단순한 DTO 복사가 아니다.\n\n- `readObject`\n- `writeObject`\n- `readResolve`\n- `writeReplace`\n- `serialPersistentFields`\n\n같은 hooks가 개입할 수 있다.  \n즉 포맷 호환성은 필드 목록뿐 아니라 클래스의 커스텀 로직에도 달려 있다.\n\n이 중 `serialPersistentFields`, `PutField`/`GetField`, `readObjectNoData()` 같은 escape hatch는 [serialPersistentFields, readObjectNoData, and Native Serialization Evolution Escape Hatches](./serialpersistentfields-readobjectnodata-evolution-escape-hatches.md)에서 더 자세히 다룬다.\n\n### 3. `transient`는 계약의 일부다\n\n`transient` 필드는 직렬화 대상에서 빠진다.  \n그 자체는 단순해 보이지만, 복원 후 객체 불변식(invariant)을 다시 세워야 할 수 있다.\n\n이 감각은 value object에서 특히 중요하다.  \n정규화와 invariant를 생성 시점에 보장했다면 역직렬화 경로도 같은 의미를 회복해야 한다.\n\n예를 들어 다음 항목은 `transient`로 놓기 쉽다.\n\n- 캐시\n- derived field\n- 보안 민감 정보\n- runtime-only handle\n\n그런데 이 값이 객체 의미에 꼭 필요하면 `readObject`에서 재구성 로직이 필요하다.\n\n### 4. class evolution은 backward와 forward를 나눠 봐야 한다\n\n- backward compatibility: 새 코드가 옛 데이터를 읽을 수 있는가\n- forward compatibility: 옛 코드가 새 데이터를 읽을 수 있는가\n\n실무에서는 대개 backward compatibility를 우선한다.  \n예전 데이터가 남아 있는 시간이 길기 때문이다.\n\n## 재현 조건\n\nserialization compatibility 문제는 새 코드만 실행해서는 잘 안 보인다. 반드시 예전 바이트와 새 클래스를 교차해야 한다.\n\n- 이전 버전 클래스로 객체를 직렬화한 뒤, 새 버전 코드에서 읽는다\n- 새 버전으로 저장한 데이터를 rollback된 옛 코드가 읽을 수 있는지 확인한다\n- `serialVersionUID`를 명시하지 않은 상태에서 필드/상속/접근자 변경을 적용한다\n- `transient` 필드가 복원 후 invariant에 필요한 값인지 확인한다\n\n재현 artifact는 \"객체를 다시 만들 수 있는 코드\"가 아니라 실제 serialized bytes여야 한다. 그래야 클래스 구조 변화와 runtime deserialization 경로를 같이 검증할 수 있다.\n\n## failure matrix\n\n| 변경/상황 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| `InvalidClassException` 발생 | 파일 손상 | `serialVersionUID` / class descriptor mismatch | stream은 읽히지만 class compatibility 실패 |\n| 필드 추가 뒤 null 값 등장 | mapper bug | old data에는 missing field | default/readObject 보정 필요 |\n| `transient` 캐시가 null | JVM serialization 오류 | 복원 후 재구성 누락 | `readObject`나 lazy rebuild 없음 |\n| rollback 후 새 데이터 읽기 실패 | 배포 순서 문제만 | forward compatibility 미보장 | old code가 new stream field를 처리 못함 |\n| native serialization을 장기 저장에 사용 | 간단한 binary DTO | schema evolution owner 부재 | fixture 없이 class 변경 반복 |\n\n## 검증/validation\n\n- 버전별 golden serialized fixture를 저장하고 old-bytes/new-code, new-bytes/old-code 조합을 테스트한다.\n- `serialver`나 build-time check로 명시적 `serialVersionUID` 변경이 의도된 것인지 리뷰한다.\n- `readObject`, `readResolve`, `writeReplace`, `serialPersistentFields`가 있는 타입은 hook별 branch를 따로 테스트한다.\n- 역직렬화 뒤 public invariant와 value object normalization이 생성자 경로와 같은지 확인한다.\n\n## 오해와 wrong bucket\n\n- `serialVersionUID`를 고정하면 모든 변경이 안전하다는 설명은 틀리다. UID는 compatibility gate 중 하나이고, 필드 의미와 invariant 복원은 별도다.\n- 필드 추가/삭제가 항상 깨진다고 단정해도 과하다. Java serialization에는 일부 호환 가능한 변경이 있지만, 팀이 fixture로 확인하지 않으면 운영 예측성이 낮다.\n- native serialization 장애를 JSON schema evolution과 같은 bucket으로 넣으면 분석이 흐려진다. 여기서는 class descriptor, UID, hook, classloader까지 같이 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 배포 후 오래된 캐시를 못 읽는다\n\n클래스 구조를 바꾸고 나서 예전 파일, 세션, 캐시 데이터를 읽지 못하는 경우다.  \n이때 `InvalidClassException`이 대표적인 증상이다.\n\n점검 순서:\n\n1. `serialVersionUID`가 명시돼 있는지 본다\n2. 필드 변경 내역을 본다\n3. 커스텀 serialization hook이 있는지 본다\n4. 저장 포맷을 native serialization에 의존하고 있는지 본다\n\n### 시나리오 2: 필드를 하나 추가했는데 장애가 난다\n\nnative serialization은 \"호환되는 변경\"의 범위가 좁다.  \n필드 추가가 항상 안전한 것도 아니고, 삭제가 항상 안전한 것도 아니다.\n\n### 시나리오 3: 클래스명만 같으면 된다고 생각한다\n\n클래스명은 같아도 `serialVersionUID`나 필드 구조가 다르면 호환되지 않을 수 있다.  \n이 점 때문에 장기 저장 포맷으로는 JSON이나 명시적 schema를 더 자주 선택한다.\n\n## 코드로 보기\n\n### 1. 명시적 `serialVersionUID`\n\n```java\nimport java.io.Serializable;\n\npublic class UserProfile implements Serializable {\n    private static final long serialVersionUID = 1L;\n\n    private final String userId;\n    private transient String cachedDisplayName;\n\n    public UserProfile(String userId) {\n        this.userId = userId;\n    }\n\n    public String userId() {\n        return userId;\n    }\n}\n```\n\n### 2. 커스텀 복원 로직\n\n```java\nimport java.io.IOException;\nimport java.io.ObjectInputStream;\nimport java.io.Serializable;\n\npublic class SessionToken implements Serializable {\n    private static final long serialVersionUID = 1L;\n\n    private String tokenValue;\n    private transient boolean expired;\n\n    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {\n        in.defaultReadObject();\n        this.expired = false;\n    }\n}\n```\n\n### 3. 호환성에 안전한 방향으로 바꾸기\n\n```java\n// 장기 저장 포맷은 native serialization보다\n// 명시적 JSON/schema DTO가 더 예측 가능하다.\n```\n\n### 4. 역직렬화 예외를 봐야 하는 지점\n\n```java\ntry (ObjectInputStream in = new ObjectInputStream(inputStream)) {\n    Object value = in.readObject();\n}\n```\n\n문제가 나면 `InvalidClassException`, `StreamCorruptedException` 같은 예외를 통해 계약 위반을 먼저 의심한다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| native serialization | 구현이 빠르다 | 호환성과 보안 리스크가 크다 |\n| 명시적 `serialVersionUID` | 버전 제어가 가능하다 | 변경 규칙을 팀이 지켜야 한다 |\n| 커스텀 hooks | 진화 전략을 넣을 수 있다 | 복잡도가 높다 |\n| JSON / schema 포맷 | 명시적이고 디버깅이 쉽다 | 코드가 더 필요하다 |\n\n핵심은 \"직렬화가 된다\"와 \"오래 안전하게 유지된다\"를 분리해서 보는 것이다.\n\n## 꼬리질문\n\n> Q: `serialVersionUID`를 왜 명시하나요?\n> 핵심: 자동 계산에 의존하면 사소한 구현 변경도 호환성 깨짐으로 이어질 수 있기 때문이다.\n\n> Q: `transient` 필드는 왜 위험할 수 있나요?\n> 핵심: 직렬화에서 빠진 뒤 복원 시 객체 불변식을 다시 만들어야 하기 때문이다.\n\n> Q: native serialization을 장기 저장에 잘 안 쓰는 이유는 무엇인가요?\n> 핵심: 클래스 구조 변화와 보안 문제에 취약하고 진화 규칙이 불명확하기 때문이다.\n\n## 한 줄 정리\n\n`serialVersionUID`는 native serialization의 버전 계약이고, 구조 변화가 잦거나 장기 보관이 필요하면 명시적 포맷으로 바꾸는 게 더 안전하다.\n",
+  "aliases": [
+    "Serialization Compatibility and serialVersionUID",
+    "Java native serialization serialVersionUID",
+    "Serializable ObjectInputStream compatibility",
+    "readObject writeObject readResolve writeReplace",
+    "serialPersistentFields transient invariant",
+    "자바 serialVersionUID 호환성",
+    "final",
+    "record",
+    "static"
+  ],
+  "expected_queries": [
+    "Java native serialization에서 serialVersionUID는 역직렬화 compatibility를 어떻게 판단해?",
+    "serialVersionUID를 자동 생성에 맡기면 작은 리팩터링도 저장 데이터 호환성을 깨뜨릴 수 있어?",
+    "readObject writeObject readResolve writeReplace transient는 serialization contract에서 어떤 역할을 해?",
+    "native serialization을 장기 저장 포맷으로 쓰면 schema evolution과 value object invariant를 어떻게 봐야 해?",
+    "serialPersistentFields와 serialization proxy는 serialVersionUID 문제와 어떻게 연결돼?"
+  ],
+  "symptoms": [
+    "serialVersionUID를 명시하지 않아 작은 필드나 class 구조 변경이 저장 데이터 역직렬화 호환성을 예측하기 어렵게 만들어",
+    "Java native serialization을 단순 DTO 복사처럼 이해해 readObject writeObject readResolve writeReplace transient invariant 복구 경로를 놓쳐",
+    "장기 저장 포맷으로 native serialization을 쓰면서 schema evolution, null vs missing, classloader memory leak 위험을 함께 검토하지 않아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/io-nio-serialization",
+      "language/serialization-proxy-pattern-invariant-preservation",
+      "language/value-object-invariants-canonicalization-boundary-design"
+    ],
+    "next_docs": [
+      "language/serialpersistentfields-readobjectnodata-evolution-escape-hatches",
+      "language/record-serialization-evolution",
+      "language/json-null-missing-unknown-field-schema-evolution"
+    ],
+    "confusable_with": [
+      "language/serialization-proxy-pattern-invariant-preservation",
+      "language/serialpersistentfields-readobjectnodata-evolution-escape-hatches",
+      "language/record-serialization-evolution",
+      "language/java-binary-compatibility-linkage-errors",
+      "language/io-nio-serialization"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/serialization-compatibility-serial-version-uid.md",
+    "revision_history": []
+  }
+}

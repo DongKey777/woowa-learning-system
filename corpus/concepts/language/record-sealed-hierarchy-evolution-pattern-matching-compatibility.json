@@ -1,0 +1,58 @@
+{
+  "id": "language/record-sealed-hierarchy-evolution-pattern-matching-compatibility",
+  "title": "Record Sealed Hierarchy Evolution and Pattern Matching Compatibility",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 record component와 sealed hierarchy variant가 진화할 때 pattern matching exhaustive switch, default branch, unknown variant, payload compatibility가 어떻게 충돌하는지 설명하는 advanced deep dive다.",
+  "body_markdown": "# Record/Sealed Hierarchy Evolution and Pattern Matching Compatibility\n\n> 한 줄 요약: record와 sealed hierarchy는 닫힌 모델을 잘 표현하지만, API와 payload가 진화하면 그 닫힘이 곧 호환성 제약이 된다. component 추가, variant 추가, default branch 남용, unknown variant 처리 부재는 컴파일 안정성과 runtime compatibility를 서로 어긋나게 만들 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Record Serialization Evolution](./record-serialization-evolution.md)\n> - [Sealed Interfaces and Exhaustive Switch Design](./sealed-interfaces-exhaustive-switch-design.md)\n> - [Enum Persistence, JSON, and Unknown Value Evolution](./enum-persistence-json-unknown-value-evolution.md)\n> - [Java Binary Compatibility and Runtime Linkage Errors](./java-binary-compatibility-linkage-errors.md)\n> - [JSON `null`, Missing Field, Unknown Property, and Schema Evolution](./json-null-missing-unknown-field-schema-evolution.md)\n\n> retrieval-anchor-keywords: record evolution, sealed hierarchy evolution, pattern matching compatibility, exhaustive switch, default branch hazard, unknown variant, API evolution, payload variant, record component addition, closed world model, compatibility tradeoff\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nrecord와 sealed hierarchy는 \"닫힌 모델\"에 강하다.  \n하지만 시스템이 진화하는 순간 이 장점은 제약으로도 돌아온다.\n\n대표적인 진화 축:\n\n- record component 추가/삭제\n- sealed variant 추가\n- pattern matching switch 분기 변경\n- payload unknown variant 처리\n\n즉 닫힌 타입 모델은 설계 안정성을 주지만,  \n호환성 전략 없이 확장하면 old consumer와 new producer가 쉽게 어긋난다.\n\n## 깊이 들어가기\n\n### 1. record component 추가는 payload contract 변경이다\n\nrecord에 component를 추가하면 소스상으론 단순해 보여도:\n\n- canonical constructor 시그니처 변화\n- JSON binding 요구 변화\n- old payload compatibility 변화\n\n가 한꺼번에 생긴다.\n\n즉 \"필드 하나 추가\"가 단순 refactor가 아니다.\n\n### 2. sealed hierarchy variant 추가는 exhaustive switch에 직접 영향 준다\n\n새 variant를 추가하면 그 장점이 드러난다.\n\n- exhaustive switch는 컴파일 타임에 누락을 더 잘 드러낸다\n\n하지만 동시에 단점도 있다.\n\n- old binary/payload consumer는 새 variant를 모를 수 있다\n- default branch가 있으면 새 variant가 조용히 삼켜질 수 있다\n\n즉 compile-time safety와 cross-version runtime safety는 다른 문제다.\n\n### 3. default branch는 안전망이 아니라 호환성 선택이다\n\nsealed hierarchy에서 `default`를 두면 편하다.  \n하지만 그 순간 \"새 variant가 들어왔을 때 어떻게 할지\"를 조용히 결정해버린다.\n\n- fail-fast\n- unknown variant로 보존\n- fallback 처리\n\n즉 default branch는 문법 편의가 아니라 evolution policy다.\n\n### 4. internal closed world와 external payload world를 구분해야 한다\n\n서비스 내부 도메인은 sealed로 닫아도 좋다.  \n하지만 외부 payload까지 완전히 닫혀 있다고 가정하면 위험할 수 있다.\n\n그래서 흔한 패턴은 이렇다.\n\n- 외부 입력: unknown variant 허용 또는 보존\n- 내부 도메인: sealed hierarchy로 닫기\n\n즉 boundary에서 anti-corruption mapping이 필요하다.\n\n### 5. pattern matching은 가독성 도구이면서 migration 경계다\n\npattern matching switch는 좋지만, 분기 누락이나 unknown handling이 숨어들 수 있다.  \n특히 payload replay나 이벤트 버전 혼재 상황에선 compile success보다 runtime variant strategy가 더 중요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 이벤트 결과 타입에 새 variant를 추가했다\n\n`PendingReview`를 추가했더니 최신 코드는 안전해졌지만,  \nold consumer는 이 값을 모르고 실패하거나 default로 삼켜버린다.\n\n### 시나리오 2: record component를 추가한 뒤 old client 요청이 깨진다\n\nrecord DTO가 깔끔해 보였지만 새 필수 component가 생기며  \n예전 payload가 더 이상 바인딩되지 않는다.\n\n### 시나리오 3: default branch가 장애를 숨긴다\n\n새 variant가 왔는데 default에서 그냥 generic failure로 바꿔버린다.  \n컴파일은 통과하지만 도메인 의미가 사라진다.\n\n### 시나리오 4: 외부 API variant를 sealed로 직접 모델링했다\n\npartner API가 variant를 추가하자 sealed model이 곧바로 깨졌다.  \n이 경우는 raw DTO와 내부 sealed model을 분리하는 편이 낫다.\n\n## 코드로 보기\n\n### 1. sealed hierarchy와 pattern matching\n\n```java\npublic sealed interface PaymentState permits Authorized, Captured, Failed {}\n\npublic record Authorized(String id) implements PaymentState {}\npublic record Captured(String id) implements PaymentState {}\npublic record Failed(String reason) implements PaymentState {}\n```\n\n### 2. 새 variant 추가 시 생각할 것\n\n```java\npublic record PendingReview(String reviewer) implements PaymentState {}\n```\n\n이 순간 switch exhaustiveness는 좋아지지만, old consumer/runtime payload compatibility는 따로 검토해야 한다.\n\n### 3. boundary 분리 감각\n\n```java\n// external DTO는 unknown variant를 보존하고,\n// 내부 도메인은 sealed hierarchy로 닫는 편이 더 안전할 수 있다.\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| sealed + exhaustive switch | 내부 모델 안정성과 분기 누락 방지에 좋다 | variant 추가 시 cross-version 호환성 전략이 필요하다 |\n| default branch 적극 사용 | 코드는 빨리 쓸 수 있다 | unknown variant를 조용히 숨길 수 있다 |\n| external DTO / internal sealed 분리 | 진화와 내부 안정성을 함께 가져가기 쉽다 | 매핑 계층이 늘어난다 |\n| record DTO 직접 노출 | 간결하다 | component 변화가 곧 payload 계약 변화가 된다 |\n\n핵심은 record/sealed를 문법 선택이 아니라 closed-world modeling과 compatibility boundary의 선택으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: sealed hierarchy에 variant를 추가하면 좋은 것 아닌가요?\n> 핵심: 내부 compile-time safety에는 좋지만, old consumer/runtime payload compatibility는 별도 문제다.\n\n> Q: default branch는 왜 조심해야 하나요?\n> 핵심: 새로운 variant를 조용히 삼켜 evolution bug를 숨길 수 있기 때문이다.\n\n> Q: record DTO는 왜 진화에 민감한가요?\n> 핵심: component 구조와 canonical constructor가 곧 binding/serialization 계약이 되기 쉽기 때문이다.\n\n> Q: 외부 payload도 sealed로 바로 모델링해도 되나요?\n> 핵심: 외부 세계가 truly closed라는 보장이 약하면 boundary DTO와 내부 sealed model을 분리하는 편이 안전하다.\n\n## 한 줄 정리\n\nrecord와 sealed는 내부 도메인을 단단하게 만들지만, payload와 버전이 진화하는 환경에서는 unknown handling과 boundary 분리를 같이 설계해야 진짜 안전하다.\n",
+  "aliases": [
+    "Record Sealed Hierarchy Evolution and Pattern Matching Compatibility",
+    "record evolution sealed hierarchy compatibility",
+    "exhaustive switch unknown variant",
+    "default branch hazard sealed hierarchy",
+    "pattern matching compatibility Java",
+    "자바 record sealed hierarchy evolution",
+    "Generic",
+    "enum",
+    "permits"
+  ],
+  "expected_queries": [
+    "record component 추가와 sealed hierarchy variant 추가가 API payload compatibility에 어떤 영향을 줘?",
+    "sealed exhaustive switch는 compile time safety를 주지만 runtime unknown variant 문제는 왜 별도로 봐야 해?",
+    "pattern matching switch의 default branch는 새 variant를 조용히 삼킬 수 있는 evolution policy라는 뜻이 뭐야?",
+    "internal sealed closed world와 external payload unknown variant world를 어떻게 분리해야 해?",
+    "record serialization evolution과 binary compatibility를 함께 고려하는 Java API 진화 전략을 설명해줘"
+  ],
+  "symptoms": [
+    "record component 추가를 단순 필드 추가로 보고 constructor signature, JSON binding, old payload compatibility 변화까지 고려하지 않아",
+    "sealed hierarchy에 새 variant를 추가하면 exhaustive switch compile safety는 올라가지만 old binary나 payload consumer runtime compatibility는 별도 문제라는 점을 놓쳐",
+    "pattern matching switch에 default branch를 넣어 새 variant를 조용히 삼키면서 unknown variant policy를 명시하지 않아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/record-serialization-evolution",
+      "language/sealed-interfaces-exhaustive-switch-design",
+      "language/java-binary-compatibility-linkage-errors"
+    ],
+    "next_docs": [
+      "language/enum-persistence-json-unknown-value-evolution",
+      "language/json-null-missing-unknown-field-schema-evolution",
+      "language/records-sealed-pattern-matching"
+    ],
+    "confusable_with": [
+      "language/record-serialization-evolution",
+      "language/sealed-interfaces-exhaustive-switch-design",
+      "language/enum-persistence-json-unknown-value-evolution",
+      "language/records-sealed-pattern-matching"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/record-sealed-hierarchy-evolution-pattern-matching-compatibility.md",
+    "revision_history": []
+  }
+}

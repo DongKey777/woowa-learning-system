@@ -1,0 +1,46 @@
+{
+  "id": "system-design/payment-ledger-idempotency-interview-drill",
+  "title": "Payment Ledger Idempotency Interview Drill",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 drill은 결제 시스템 설계 면접에서 ledger, idempotency key, reconciliation을 답변하는 구조를 제공한다.",
+  "body_markdown": "# Payment Ledger Idempotency Interview Drill\n\n## 질문\n\n\"결제 시스템에서 중복 승인과 실패 복구를 어떻게 설계하나요?\"\n\n## 기대 답변 축\n\nClient retry는 정상 동작으로 보고 idempotency key를 받는다. 같은 key로 같은 요청이 다시 오면 새 결제를 만들지 않고 기존 처리 상태를 반환한다.\n\nMoney movement는 ledger로 남긴다. 주문 상태 하나만 바꾸면 장애 후 감사와 정산이 어렵다. Ledger entry는 append-only 성격으로 두고, 상태 변경은 ledger와 reconcile 가능한 형태로 설계한다.\n\n외부 PG 호출과 내부 DB transaction은 하나의 atomic transaction으로 묶기 어렵다. 그래서 pending 상태, webhook, reconciliation job, outbox/inbox 같은 복구 경로를 둔다.\n\n## 약점 태그\n\n`idempotency-key`, `ledger-entry`, `pending-state`, `reconciliation`, `status-contract`, `wrong-bucket`\n\n## 흔한 오답\n\n\"버튼을 비활성화하면 중복 결제가 안 난다\"는 backend 설계가 아니다. 네트워크 retry, browser refresh, webhook duplicate, PG timeout을 서버가 견딜 수 있어야 한다.\n\n## 핵심 요구사항\n\n- 같은 주문과 같은 idempotency key에 대해 결제가 두 번 승인되거나 두 번 정산되지 않아야 한다.\n- 외부 PG 성공, 내부 DB 실패, webhook 지연, client timeout을 복구할 수 있어야 한다.\n- 금액 이동은 감사 가능한 append-only ledger로 남기고 주문 상태와 reconcile 가능해야 한다.\n- 사용자에게는 pending, paid, failed, refunded 같은 상태를 일관되게 보여준다.\n- API retry, webhook duplicate, reconciliation replay가 모두 같은 상태/ledger contract로 수렴해야 한다.\n\n## 정확한 보장 범위\n\n결제 시스템에서 \"중복 결제 방지\"는 버튼 중복 클릭 방지가 아니라 서버가 같은 business operation을 한 번만 money movement로 반영한다는 뜻이다. API idempotency key는 client retry를 같은 `PaymentIntent`에 매핑하고, PG transaction id와 ledger unique key는 webhook/reconcile 중복 반영을 막는다.\n\n외부 PG 승인과 내부 DB commit은 하나의 ACID transaction이 아니다. 그래서 `pending` 상태가 필요하고, timeout은 성공/실패를 모른다는 의미이지 곧바로 실패가 아니다. 최종 상태는 PG 조회, webhook, reconciliation job으로 수렴시킨다.\n\nLedger는 append-only 회계 근거다. 주문의 `PAID` 상태는 ledger entry와 reconcile 가능한 projection이어야 한다. 환불/취소도 기존 entry 수정이 아니라 reversal/refund entry를 append해서 감사 가능성을 유지한다.\n\n## Status/Idempotency Contract\n\n`IdempotencyRecord`는 `(merchant/account, idempotency_key)`를 unique로 잡고 request hash, payment intent id, current status, response snapshot, expiry를 저장한다. 같은 key와 같은 hash의 재시도는 기존 status와 response를 반환하고, 같은 key에 다른 hash가 오면 `409 idempotency_key_reused`로 막는다.\n\nPaymentIntent 상태는 `created`, `pending_pg`, `authorized`, `captured/paid`, `failed`, `cancelled`, `refunding`, `refunded`, `unknown_reconcile_required`처럼 명시한다. Client timeout이나 PG timeout은 `unknown_reconcile_required` 또는 `pending_pg`로 두고, 사용자는 \"확인 중\"으로 보게 한다.\n\nLedger append는 `(payment_intent_id, ledger_type, pg_transaction_id)` 또는 business event id에 unique constraint를 둔다. Webhook duplicate와 reconciliation replay는 같은 ledger key를 다시 insert하려다 conflict가 나면 기존 entry를 읽고 성공 처리한다. 주문 상태 업데이트는 ledger append와 같은 local transaction 안에서 하거나 outbox로 projection을 갱신한다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `PaymentIntent`, `IdempotencyRecord`, `LedgerEntry`, `Order`, `PGTransaction`, `ReconciliationJob`이다. `PaymentIntent`는 요청 단위 상태를 갖고, `LedgerEntry`는 금액 변화의 불변 기록이다. `IdempotencyRecord`는 key, request hash, response snapshot, status, expiry를 저장한다.\n\n트래픽은 checkout 순간에 burst가 생기고, client retry와 PG webhook retry가 같은 결제를 여러 경로로 다시 건드린다. Payment API, webhook consumer, reconciliation job이 같은 transaction id와 idempotency key를 공유하도록 모델링해야 한다.\n\n## Consistency/Latency Trade-off\n\n외부 PG 호출과 내부 DB commit은 분산 트랜잭션으로 강하게 묶기 어렵다. 따라서 결제 시도는 `pending`으로 먼저 기록하고, PG 결과와 webhook, reconciliation을 통해 최종 상태로 수렴시키는 eventual consistency를 선택한다.\n\n사용자 응답 latency를 낮추려면 PG 승인 후 즉시 성공을 반환할 수 있지만, 내부 ledger 기록이 실패하면 복구 경로가 필수다. 반대로 모든 정산 검증을 동기 처리하면 checkout latency와 실패율이 커진다.\n\n## 실패 반례\n\n- idempotency key 없이 timeout retry를 새 결제로 처리해 같은 카드가 두 번 승인된다.\n- 주문 상태만 `PAID`로 바꾸고 ledger entry가 없어 정산/환불/감사에서 근거가 사라진다.\n- webhook duplicate를 새 성공 이벤트로 반영해 ledger가 중복 append된다.\n- PG 성공 후 DB 실패를 `failed`로 확정해 사용자와 PG의 실제 상태가 갈라진다.\n- 같은 idempotency key를 다른 금액/주문에 재사용했는데 request hash 검증 없이 기존 성공을 반환한다.\n- 환불을 기존 결제 ledger row 수정으로 처리해 원장 trail이 끊긴다.\n- PG timeout을 실패로 단정하고 새 결제를 열어 원 PG 승인과 새 승인 두 개가 모두 capture된다.\n- reconciliation job이 재실행될 때 idempotent하지 않아 이미 반영된 성공을 다시 projection에 더한다.\n\n## 운영 지표\n\n- `duplicate_charge_count`: 같은 order/payment intent에 중복 승인 또는 중복 capture가 감지된 수.\n- `idempotency_conflict_count`: 같은 key의 request hash 불일치 수.\n- `pending_age_p95`: pending/unknown 상태가 유지되는 시간.\n- `reconciliation_mismatch_count`: PG 상태와 내부 ledger/order 상태 불일치 수.\n- `webhook_duplicate_rate`: dedup된 webhook 비율.\n- `ledger_projection_lag`: ledger append부터 order/payment projection 반영까지의 지연.\n- `refund_reversal_failure_count`: refund/reversal ledger append 실패 수.\n\n## Wrong Bucket\n\n- Frontend 버튼 비활성화로 중복 결제를 막겠다고 답하면 wrong bucket이다. 서버 API, webhook, reconcile replay가 모두 retry/duplicate를 견뎌야 한다.\n- Order status 업데이트 문제로만 보면 wrong bucket이다. 돈의 이동은 ledger이고 order status는 그 projection이다.\n- PG timeout을 HTTP 실패 처리 문제로만 보면 wrong bucket이다. 외부 상태가 unknown인 결제 domain 문제라 조회/reconciliation contract가 필요하다.\n- Idempotency key만 있으면 exactly-once라고 설명하면 wrong bucket이다. API key, PG transaction dedup, ledger unique constraint, local transaction/outbox가 함께 있어야 한다.\n\n## 면접 답변 Skeleton\n\n1. \"결제는 retry가 정상인 시스템이므로 idempotency key와 request hash로 같은 요청을 같은 결과에 매핑합니다.\"\n2. \"PaymentIntent는 pending부터 시작하고, 실제 money movement는 append-only LedgerEntry로 남깁니다.\"\n3. \"같은 key에 다른 request hash가 오면 conflict로 막고, 같은 key 재시도에는 기존 status/response snapshot을 반환합니다.\"\n4. \"PG 호출, webhook consumer, reconciliation job 모두 같은 PG transaction id와 ledger unique key로 중복을 제거합니다.\"\n5. \"외부 호출과 DB commit은 atomic하지 않으니 pending/unknown 상태와 재조회/reconcile job으로 수렴시킵니다.\"\n6. \"중요 metric은 duplicate charge, idempotency conflict, pending age, reconciliation mismatch, webhook duplicate, ledger projection lag입니다.\"\n\n## 복습 연결\n\nWebhook 재전송은 `payment-webhook-idempotency-reconciliation-drill`, dedup 저장소는 `idempotency-key-and-deduplication`으로 이어진다.\n",
+  "aliases": [
+    "payment ledger idempotency interview drill",
+    "결제 시스템 ledger idempotency 면접",
+    "payment system design duplicate charge",
+    "결제 중복 승인 재시도 설계"
+  ],
+  "expected_queries": [
+    "Payment system design에서 중복 결제를 어떻게 막아?",
+    "결제 ledger와 idempotency key를 어떻게 설계해?",
+    "PG 승인 성공 후 DB 저장 실패는 어떻게 복구해?"
+  ],
+  "symptoms": [
+    "결제 API retry를 막기만 하면 된다고 생각합니다",
+    "잔액이나 주문 상태만 업데이트하고 ledger를 남기지 않습니다",
+    "외부 PG 성공 내부 DB 실패 케이스를 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design"
+    ],
+    "next_docs": [
+      "system-design/payment-webhook-idempotency-reconciliation-drill",
+      "database/idempotency-key-and-deduplication"
+    ],
+    "confusable_with": [
+      "system-design/payment-webhook-idempotency-reconciliation-drill",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/payment-ledger-idempotency-interview-drill.md",
+    "revision_history": []
+  }
+}

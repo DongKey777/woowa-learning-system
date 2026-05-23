@@ -1,0 +1,61 @@
+{
+  "id": "database/replication-failover-split-brain",
+  "title": "Replication Failover and Split Brain",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 replication failover, primary promotion, split brain, quorum, fencing, stale primary 차단을 다루는 advanced playbook이다.",
+  "body_markdown": "# Replication Failover and Split Brain\n\n**난이도: 🔴 Advanced**\n\n> replica 장애가 났을 때 failover는 복구 전략이지만, 잘못하면 split brain으로 정합성을 깨뜨릴 수 있다.\n\n> 관련 문서: [MVCC, Replication, Sharding](./mvcc-replication-sharding.md), [Replica Lag와 Read-after-Write](./replica-lag-read-after-write-strategies.md), [트랜잭션 격리수준과 락](./transaction-isolation-locking.md), [Failover Visibility Window, Topology Cache, and Freshness Playbook](./failover-visibility-window-topology-cache-playbook.md), [Commit Horizon After Failover, Loss Boundaries, and Verification](./commit-horizon-after-failover-verification.md)\n\nretrieval-anchor-keywords: failover, split brain, stale primary, quorum, fencing, failover visibility, promotion safety, commit horizon, loss boundary\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 중요한가](#왜-중요한가)\n- [Replication Failover](#replication-failover)\n- [Split Brain](#split-brain)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [SQL/운영 예제](#sql운영-예제)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n\n</details>\n\n## 왜 중요한가\n\nreplica는 읽기 확장과 장애 대비에 유용하다.\n하지만 failover가 자동화될수록 다음 문제가 숨어든다.\n\n- primary 장애를 누가, 언제, 어떤 기준으로 감지할 것인가\n- 새 primary 승격 전에 기존 primary가 정말 쓰기를 멈췄는가\n- 네트워크 분리 상황에서 두 노드가 동시에 살아 있다고 믿지 않는가\n\n즉 failover는 \"죽은 노드를 살리는 문제\"가 아니라 **동시에 두 개의 진실이 생기지 않게 하는 문제**다.\n\n---\n\n## Replication Failover\n\nReplication failover는 **primary가 내려갔을 때 replica를 승격해 서비스를 이어가는 과정**이다.\n\n일반적인 흐름:\n\n1. 장애 감지\n2. 최신 replica 선택\n3. 승격 promotion\n4. 애플리케이션 라우팅 전환\n5. 구 primary 격리\n\n핵심은 5번이다.\n승격만 하고 옛 primary를 완전히 격리하지 않으면 split brain으로 이어질 수 있다.\n\n### 자동화가 위험한 지점\n\n- health check는 네트워크 단절을 장애로 오판할 수 있다\n- replication lag가 큰 replica가 승격되면 데이터 유실이 생길 수 있다\n- 애플리케이션 connection pool이 옛 primary에 계속 붙어 있을 수 있다\n\n---\n\n## Split Brain\n\nSplit brain은 **클러스터가 둘 이상의 노드를 primary로 착각해 동시에 쓰기를 허용하는 상태**다.\n\n왜 위험한가:\n\n- 같은 비즈니스 키에 서로 다른 최종값이 생길 수 있다\n- 복구 후 충돌 해결이 수동 작업이 된다\n- 장애 복구가 오히려 데이터 손상으로 이어진다\n\n대표 원인:\n\n- 네트워크 분리\n- failover coordinator 오류\n- fencing 미적용\n- 동시에 두 노드가 \"내가 primary\"라고 판단하는 구성\n\n### 방지 장치\n\n- quorum 기반 판단\n- lease / lock 기반 primary 소유권\n- fencing, STONITH 같은 강제 차단\n- write endpoint를 단일 진실원(source of truth)로 운영\n\n---\n\n## 깊이 들어가기\n\n### 1. failover는 promotion만으로 끝나지 않는다\n\n승격 직후에도 이전 primary의 쓰기 경로를 막아야 한다.\n\n- DB 레벨에서 read-only 전환\n- 네트워크 레벨에서 VIP/endpoint 차단\n- 애플리케이션 레벨 connection 재시도 정책 점검\n\n### 2. replica가 최신이라고 믿으면 안 된다\n\n가장 최근에 동기화된 replica가 항상 안전한 승격 대상은 아니다.\n\n- last applied position 확인\n- write loss 허용 범위 정의\n- 장애 시점 이후의 트랜잭션 유실 가능성 평가\n\n### 3. 장애 감지와 차단은 분리해야 한다\n\n장애를 감지했다고 바로 승격하면 안 된다.\n감지 후에는 반드시 \"기존 primary가 더 이상 쓰지 못한다\"는 보장이 필요하다.\n\n### 4. 복구보다 재발 방지가 더 중요하다\n\nfailover가 잦으면 원인은 따로 있다.\n\n- 과도한 connection 수\n- 장기 트랜잭션\n- replica lag\n- 네트워크 불안정\n\n즉 운영은 \"자동 복구\"보다 \"왜 자동 복구가 필요했는가\"를 봐야 한다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: primary 장애 후 replica 승격\n\n1. primary 다운\n2. coordinator가 가장 최신 replica를 승격\n3. 앱이 새 endpoint로 재연결\n4. 옛 primary는 복구 후 rejoin\n\n이때 옛 primary가 조용히 다시 쓰기를 받으면 데이터가 갈라진다.\n\n### 시나리오 2: 네트워크 분리로 두 primary 발생\n\n1. A는 B를 못 본다\n2. B는 A를 못 본다\n3. 둘 다 \"상대가 죽었다\"고 판단\n4. 각각 쓰기 허용\n\n이게 전형적인 split brain이다.\n운영자는 \"복구\"가 아니라 **어느 쪽 쓰기를 버릴지** 결정해야 한다.\n\n---\n\n## SQL/운영 예제\n\n```sql\n-- 복구 전: 현재 노드가 쓰기 가능한지 확인\nSELECT @@read_only, @@super_read_only;\n\n-- failover 후: 승격 대상은 쓰기를 허용하고\n-- 이전 primary는 read-only로 잠가야 한다\n```\n\n```bash\n# 운영 예시\n# 1) 현재 primary 헬스 확인\n# 2) replica lag 확인\n# 3) fencing 후 승격\n# 4) application endpoint 전환\n```\n\n```text\nbad:\n  health check failed -> promote replica -> leave old primary reachable\n\ngood:\n  health check failed -> fence old primary -> promote replica -> switch traffic\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| manual failover | 안전성 높음 | 복구 느림 | 핵심 데이터, 작은 규모 |\n| automated failover | 빠름 | 오판 위험 | 운영 성숙도가 높을 때 |\n| quorum + fencing | split brain 방지 | 구성 복잡 | 고가용성 시스템 |\n| 단순 재시작 | 쉽다 | 데이터 분기 위험 | 비중요 서비스 |\n\n---\n\n## 꼬리질문\n\n- failover와 split brain은 어떻게 다른가?\n- replica lag가 큰 노드를 승격하면 어떤 문제가 생기는가?\n- fencing은 왜 failover에서 핵심인가?\n- 자동 failover가 항상 좋은 선택은 아닌 이유는 무엇인가?\n\n---\n\n## 한 줄 정리\n\nfailover는 장애 복구이지만, split brain 방지는 별도 문제다. primary 전환보다 중요한 건 기존 primary를 확실히 격리하는 것이다.\n",
+  "aliases": [
+    "replication failover",
+    "split brain",
+    "stale primary",
+    "primary promotion safety",
+    "quorum failover",
+    "fencing token",
+    "commit horizon",
+    "write loss boundary",
+    "old primary still writable",
+    "dual primary incident"
+  ],
+  "expected_queries": [
+    "failover에서 replica promotion보다 old primary fencing이 더 중요한 이유가 뭐야?",
+    "split brain은 왜 두 개의 primary가 동시에 쓰기를 받는 데이터 손상 사고로 이어져?",
+    "quorum, lease, fencing token으로 failover safety를 어떻게 설계해야 해?",
+    "최신 replica를 승격해도 commit horizon과 write loss boundary를 왜 확인해야 해?",
+    "네트워크 partition을 단순 장애로 오판하면 자동 failover가 어떻게 위험해져?"
+  ],
+  "symptoms": [
+    "replica를 primary로 승격했는데 old primary가 여전히 write를 받을 수 있어",
+    "네트워크 분리 상황에서 두 노드가 동시에 primary라고 판단할 위험을 설명해야 해",
+    "failover 자동화가 promotion만 하고 fencing이나 endpoint 차단을 놓쳤어",
+    "가장 최신 replica를 골랐는데도 write loss boundary와 commit horizon을 검증해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/mvcc-replication-sharding",
+      "database/failover-promotion-read-divergence"
+    ],
+    "next_docs": [
+      "database/failover-visibility-window-topology-cache-playbook",
+      "database/commit-horizon-after-failover-verification",
+      "database/db-lease-fencing-coordination"
+    ],
+    "confusable_with": [
+      "database/failover-promotion-read-divergence",
+      "database/commit-horizon-after-failover-verification",
+      "database/db-lease-fencing-coordination",
+      "database/quorum-write-read-intuition",
+      "database/primary-switch-write-fencing",
+      "database/stale-lease-renewal-failure-fencing"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/replication-failover-split-brain.md",
+    "revision_history": []
+  }
+}

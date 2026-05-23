@@ -1,0 +1,52 @@
+{
+  "id": "system-design/read-write-quorum-staleness-budget-design",
+  "title": "Read / Write Quorum & Staleness Budget 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Read / Write Quorum & Staleness Budget 설계를 다루는 deep_dive 문서다. read/write quorum과 staleness budget 설계는 분산 저장소에서 읽기·쓰기 응답성과 정합성, 장애 허용성을 균형 있게 맞추기 위해 quorum 크기와 허용 stale 범위를 명시하는 consistency management 설계다. 검색 질의가 read quorum, write quorum, staleness budget, bounded staleness처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Read / Write Quorum & Staleness Budget 설계\n\n> 한 줄 요약: read/write quorum과 staleness budget 설계는 분산 저장소에서 읽기·쓰기 응답성과 정합성, 장애 허용성을 균형 있게 맞추기 위해 quorum 크기와 허용 stale 범위를 명시하는 consistency management 설계다.\n\nretrieval-anchor-keywords: read quorum, write quorum, staleness budget, bounded staleness, read repair, hinted handoff, leaderless replication, consistency level, quorum tradeoff, read your writes budget\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Consistency Repair / Anti-Entropy Platform 설계](./consistency-repair-anti-entropy-platform-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Session Store Design at Scale](./session-store-design-at-scale.md)\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Control Plane / Data Plane Separation 설계](./control-plane-data-plane-separation-design.md)\n> - [Consensus Membership Reconfiguration 설계](./consensus-membership-reconfiguration-design.md)\n\n## 핵심 개념\n\n분산 저장소에서는 \"항상 최신을 읽는다\"와 \"항상 빠르게 읽는다\"를 동시에 100% 보장하기 어렵다.\n그래서 실전 설계는 다음을 숫자로 정한다.\n\n- 쓰기를 몇 개 replica에 확인받을 것인가\n- 읽기를 몇 개 replica에서 확인할 것인가\n- 얼마나 stale한 결과를 허용할 것인가\n- 어떤 경로는 read-your-writes가 필요한가\n- drift를 나중에 어떻게 repair할 것인가\n\n즉, consistency는 추상 철학이 아니라 **quorum과 staleness budget을 운영 계약으로 명시하는 일**이다.\n\n## 깊이 들어가기\n\n### 1. 왜 staleness budget이 중요한가\n\n많은 시스템이 \"eventual consistency\"라고만 말하고 끝난다.\n하지만 실전에서는 이 질문이 더 중요하다.\n\n- 500ms stale은 괜찮은가\n- 5초 stale은 괜찮은가\n- tenant 설정은 1분 stale이 허용되는가\n- 결제 상태는 stale이 전혀 안 되는가\n\n즉, eventual이라는 단어 대신 **허용 가능한 stale 범위**를 정해야 한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- replica 3개\n- 각 replica p95 read 8ms\n- cross-zone read 25ms\n- 쓰기 QPS 5만\n- read-your-writes 요구는 전체 요청의 2%\n\n이때 봐야 할 숫자:\n\n- quorum latency\n- replica lag\n- stale read ratio\n- repair backlog\n- tail latency increase\n\n정합성을 올릴수록 대부분 latency와 availability 비용이 따라온다.\n\n### 3. Quorum 직관\n\n단순화하면 다음을 생각한다.\n\n- `N`: replica 수\n- `W`: write quorum\n- `R`: read quorum\n\n`R + W > N`이면 겹치는 replica가 생겨 최신 데이터를 읽을 가능성이 높아진다.\n하지만 현실은 이것만으로 끝나지 않는다.\n\n- replica lag\n- clock skew\n- failed write의 partial ack\n- read repair 지연\n\n즉, 수식은 시작점이고 운영 현실이 더 중요하다.\n\n### 4. Leader-based vs leaderless\n\n둘은 consistency 관리 방식이 다르다.\n\n- leader-based: write ordering이 비교적 명확\n- leaderless: quorum과 repair가 더 중요\n\nleaderless 환경에서는 특히 다음이 중요하다.\n\n- read repair\n- hinted handoff\n- conflict resolution\n- stale replica selection\n\n### 5. Session guarantees\n\n모든 요청에 강한 consistency를 강요하지 않아도,\n특정 사용자 세션에는 더 강한 보장을 줄 수 있다.\n\n대표 예:\n\n- read-your-writes\n- monotonic reads\n- sticky routing\n- recent-write pinning\n\n이건 전체 cluster policy와 사용자 경험 policy를 분리하는 좋은 예다.\n\n### 6. Bounded staleness와 fallback policy\n\n실전에서는 \"최신이 아니어도 된다\"보다 \"얼마까지 늦어도 된다\"가 중요하다.\n\n예:\n\n- feature flag snapshot은 30초 stale 허용\n- profile count는 5초 stale 허용\n- inventory available count는 거의 stale 불가\n\n그리고 stale 허용을 넘으면 어떻게 할지도 정해야 한다.\n\n- stricter read quorum으로 상승\n- same-region sticky read\n- blocking refresh\n- fail closed / fail open\n\n### 7. Repair and observability\n\nquorum과 stale 허용은 나중에 repair 체계와 같이 봐야 한다.\n\n- read repair가 얼마나 자주 일어나는가\n- anti-entropy backlog가 쌓이는가\n- replica lag가 budget 안에 있는가\n- stale read가 어떤 tenant/region에서 많은가\n\n즉, consistency는 write path 설정이 아니라 관측과 repair를 포함한 운영 체계다.\n\n## 실전 시나리오\n\n### 시나리오 1: 세션 직후 프로필 조회\n\n문제:\n\n- 사용자가 방금 프로필을 바꿨는데 다음 화면에서 옛값이 보이면 안 된다\n\n해결:\n\n- 최근 쓰기한 사용자만 sticky read를 적용한다\n- 전체 시스템엔 강한 read quorum을 강요하지 않는다\n\n### 시나리오 2: 글로벌 설정 조회\n\n문제:\n\n- 전 세계 edge에서 읽지만 약간 stale해도 괜찮다\n\n해결:\n\n- bounded staleness snapshot을 사용한다\n- stale budget을 넘기면 stronger refresh path로 fallback한다\n\n### 시나리오 3: leaderless cart store\n\n문제:\n\n- 일부 replica가 늦게 따라와 cart read가 뒤섞인다\n\n해결:\n\n- read quorum을 높이거나 recent-write 세션엔 stricter policy를 둔다\n- read repair와 anti-entropy를 꾸준히 돌린다\n\n## 코드로 보기\n\n```pseudo\nfunction read(key, policy):\n  if policy.requiresReadYourWrites():\n    return readFromPinnedReplica(key)\n  replicas = pickReplicas(key, policy.readQuorum)\n  result = reconcile(replicas.read())\n  if result.staleness > policy.stalenessBudget:\n    return refreshWithStrongerQuorum(key)\n  return result\n\nfunction write(key, value, policy):\n  acks = replicas.write(key, value)\n  if acks < policy.writeQuorum:\n    fail()\n```\n\n```java\npublic ReadResult read(Key key, ConsistencyPolicy policy) {\n    ReplicaSet replicas = replicaSelector.select(key, policy.readQuorum());\n    return reconciler.readAndMerge(replicas, policy.stalenessBudget());\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Low quorum / high stale tolerance | 빠르고 가용성이 좋다 | 오래된 값이 보일 수 있다 | 캐시성 읽기, analytics |\n| Higher quorum | 최신성이 좋아진다 | latency와 cost가 오른다 | 중요한 상태 조회 |\n| Session-level stronger consistency | UX를 지킨다 | routing 복잡도 증가 | profile, session, cart |\n| Full strong consistency everywhere | 이해는 쉽다 | 성능과 가용성 비용이 크다 | 매우 제한된 핵심 경로 |\n\n핵심은 read/write quorum과 staleness budget이 DB 옵션이 아니라 **도메인별 consistency 계약을 latency, availability, repair 비용과 함께 정하는 시스템 설계 문제**라는 점이다.\n\n## 꼬리질문\n\n> Q: `R + W > N`이면 항상 최신을 읽나요?\n> 의도: quorum 공식의 한계 이해 확인\n> 핵심: 이론적으로 겹침을 만들지만, replica lag나 partial failure, conflict resolution까지 고려해야 실제로 최신 보장이 된다.\n\n> Q: eventual consistency와 bounded staleness는 어떻게 다른가요?\n> 의도: 운영 계약 수준 차이 이해 확인\n> 핵심: eventual은 방향성이고, bounded staleness는 허용 가능한 지연을 숫자로 제한한 더 구체적 계약이다.\n\n> Q: 모든 사용자에게 stronger read를 주면 더 안전하지 않나요?\n> 의도: selective consistency 감각 확인\n> 핵심: 안전성은 높아질 수 있지만 latency와 availability 비용이 커져, 최근 쓰기한 세션만 강화하는 전략이 더 현실적일 수 있다.\n\n> Q: consistency 문제를 repair 시스템과 같이 봐야 하는 이유는?\n> 의도: 설정과 운영의 연결 이해 확인\n> 핵심: stale read와 replica drift는 결국 read repair, anti-entropy, lag 관찰을 통해 운영에서 관리되기 때문이다.\n\n## 한 줄 정리\n\nRead/write quorum과 staleness budget 설계는 분산 저장소의 정합성 수준을 숫자로 명시하고, latency·availability·repair 비용과 균형 있게 맞추는 consistency management 문제다.\n",
+  "aliases": [
+    "read quorum",
+    "write quorum",
+    "staleness budget",
+    "bounded staleness",
+    "read repair",
+    "hinted handoff",
+    "leaderless replication",
+    "consistency level",
+    "quorum tradeoff",
+    "read your writes budget",
+    "Read / Write Quorum & Staleness Budget 설계",
+    "read write quorum staleness budget design"
+  ],
+  "expected_queries": [
+    "Read / Write Quorum & Staleness Budget 설계 설계 핵심을 설명해줘",
+    "read quorum가 왜 필요한지 알려줘",
+    "Read / Write Quorum & Staleness Budget 설계 실무 트레이드오프는 뭐야?",
+    "read quorum 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Read / Write Quorum & Staleness Budget 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Read / Write Quorum & Staleness Budget 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Read / Write Quorum & Staleness Budget 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/read-write-quorum-staleness-budget-design.md",
+    "revision_history": []
+  }
+}

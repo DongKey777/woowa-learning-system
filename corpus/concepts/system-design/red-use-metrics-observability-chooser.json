@@ -1,0 +1,46 @@
+{
+  "id": "system-design/red-use-metrics-observability-chooser",
+  "title": "RED USE Metrics Observability Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 chooser는 실무 관측성에서 RED metrics와 USE metrics를 서비스 요청과 리소스 포화 관점으로 구분한다.",
+  "body_markdown": "# RED USE Metrics Observability Chooser\n\n## 10초 chooser\n\n| 보고 싶은 것 | 먼저 볼 프레임 | 핵심 지표 |\n|---|---|---|\n| API 사용자가 겪는 품질 | RED | Rate, Errors, Duration |\n| CPU/메모리/디스크/네트워크 리소스 | USE | Utilization, Saturation, Errors |\n| 장애 원인 좁히기 | RED에서 USE로 이동 | 사용자 영향 확인 후 자원 병목 추적 |\n| batch/stream 처리 지연 | workload 지표 + USE | throughput, lag, retry, saturation |\n| downstream 장애 전파 | RED + dependency metric | dependency error/latency, circuit state |\n\n## 헷갈리는 축\n\nRED는 request-serving service에 잘 맞다. 초당 요청 수, 실패 비율, latency 분포를 보면 사용자가 실제로 느끼는 품질을 빠르게 잡을 수 있다.\n\nUSE는 resource에 잘 맞다. CPU 사용률, run queue, disk queue, network error, memory pressure처럼 \"자원이 바쁜가, 기다리는가, 오류가 나는가\"를 본다.\n\n경계는 \"무엇의 건강을 말하는가\"다. Service health를 말할 때는 RED가 기준이고, resource health를 말할 때는 USE가 기준이다. Queue, connection pool, thread pool처럼 service와 resource 사이에 있는 것은 saturation 지표로 다루되, 사용자 영향은 RED와 같이 확인한다.\n\n## 선택 경계 decision table\n\n| 상황 | RED만 보면 놓치는 것 | USE만 보면 놓치는 것 | 안전한 조합 |\n|---|---|---|---|\n| p99 latency 상승, error 낮음 | resource wait의 위치 | 사용자가 느끼는 tail 영향 | RED duration -> pool/queue USE -> trace span |\n| CPU 90%지만 error/latency 정상 | 아직 병목 전인지 모름 | 실제 사용자 영향 없음 | USE 경고 + RED/SLO 확인 후 증설 판단 |\n| CPU 낮고 latency 높음 | 대기열 원인 | CPU 기준으로 false negative | RED duration + connection/lock/downstream saturation |\n| request rate 급감 | client drop/traffic shift | resource가 한가해 보여 정상 오판 | RED rate + ingress/access log + deploy/traffic audit |\n| batch lag 증가 | request RED가 없을 수 있음 | lag가 사용자 SLA와 연결되는지 모름 | throughput/lag + worker USE + downstream RED |\n\n## 관찰 증거 고르기\n\n장애 첫 화면은 RED로 사용자 영향을 확인한다. 어느 endpoint의 request rate가 변했는지, error 비율이 상태 코드별로 어떻게 나뉘는지, duration이 평균이 아니라 p50/p95/p99에서 어떻게 움직이는지 본다.\n\n그다음 USE로 원인 후보를 좁힌다. CPU utilization만 보지 말고 run queue와 throttling을 같이 보고, disk utilization만 보지 말고 queue depth와 fs error를 같이 본다. Network도 throughput이 낮다고 안전한 것이 아니라 retransmit, connection reset, packet drop이 증가했는지 확인한다.\n\n로그와 trace는 metric 판단을 검증하는 증거다. RED에서 5xx가 늘었으면 sample log로 error class와 dependency를 확인하고, p99가 올랐으면 trace span으로 queue wait인지 processing time인지 분리한다.\n\nMetric 이름은 같아 보여도 aggregation scope가 다르면 다른 질문에 답한다. `http_server_requests_seconds`의 전체 p95는 전체 service 품질을 말하지만 endpoint별 p99는 특정 route를 말한다. CPU utilization은 host 단위인지 container quota 단위인지에 따라 해석이 달라진다. Dashboard에서 같은 축에 올리기 전에 label scope와 denominator를 확인해야 한다.\n\n## 지표 선택 trade-off\n\nRED는 사용자 영향에 가깝지만 원인을 직접 말해주지는 않는다. USE는 병목을 찾는 데 좋지만 사용자가 실제로 아픈지 과장하거나 축소할 수 있다. 그래서 alert는 SLO/RED 중심, dashboard drilldown은 USE 중심으로 나누는 편이 안전하다.\n\nCardinality를 높이면 tenant, endpoint, shard별 원인을 빨리 찾지만 metric 비용과 query latency가 늘어난다. 운영 지표는 \"항상 붙일 label\"과 \"incident 때만 켜는 debug label\"을 분리해야 한다.\n\nRED alert를 너무 세분화하면 작은 cohort noise에 흔들리고, USE alert를 너무 직접 page로 연결하면 CPU spike마다 사람을 깨운다. Page는 사용자 영향 또는 빠른 burn에 붙이고, resource saturation은 원인 후보를 빠르게 찾는 drilldown과 사전 경고로 두는 편이 안전하다.\n\n## 안전한 stop condition\n\n관측성 보강은 지표를 끝없이 늘리는 작업이 아니다. 장애 판단에 필요한 질문인 \"누가 영향을 받는가\", \"어느 계층이 포화인가\", \"완화 후 좋아졌는가\"에 답할 수 있으면 멈춘다.\n\n새 metric이나 label을 추가했는데 cardinality가 급증하거나 dashboard query가 느려지면 stop한다. 그때는 aggregation level을 낮추고 exemplar, trace sample, log query로 drilldown을 맡긴다.\n\nIncident 후 보강도 같은 기준을 쓴다. 다음 장애에서 첫 5분 안에 영향도, 범위, 병목 후보를 구분할 수 있으면 충분하다. \"궁금한 모든 것\"을 metric으로 만들면 비용과 noise가 늘어 실제 대응 속도가 떨어진다.\n\n## Wrong-bucket neighbor\n\nCPU가 낮아도 서비스 latency는 오를 수 있다. Connection pool wait, lock contention, downstream timeout처럼 resource utilization만으로는 보이지 않는 대기열이 있기 때문이다.\n\n반대로 RED가 나쁘다고 항상 resource를 증설하면 안 된다. Bad deploy, bad config, auth failure, data hot key처럼 USE가 정상인 장애도 많다. RED는 \"아프다\"를 알려주고, USE는 \"자원이 원인일 수 있다\"를 알려준다.\n\n## Safe Next Docs\n\nAlert로 연결하려면 `slo-burn-rate-alerting-playbook`, metric pipeline 설계는 `metrics-pipeline-tsdb-design`으로 이어진다.\n",
+  "aliases": [
+    "RED USE metrics chooser",
+    "RED와 USE 메트릭 차이",
+    "request service resource metrics",
+    "관측성 지표 선택"
+  ],
+  "expected_queries": [
+    "RED metrics랑 USE metrics는 언제 써?",
+    "서비스 장애를 볼 때 request 지표와 resource 지표를 어떻게 나눠?",
+    "latency error saturation 중 무엇을 먼저 봐야 해?"
+  ],
+  "symptoms": [
+    "CPU만 보고 서비스 장애를 판단합니다",
+    "request latency와 resource saturation을 한 그래프에 섞습니다",
+    "에러율은 낮지만 p95 latency가 오른 상황을 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/observability-logs-metrics-traces-interview-chooser"
+    ],
+    "next_docs": [
+      "system-design/slo-burn-rate-alerting-playbook",
+      "system-design/metrics-pipeline-tsdb-design"
+    ],
+    "confusable_with": [
+      "system-design/observability-logs-metrics-traces-interview-chooser",
+      "system-design/metrics-pipeline-tsdb-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/red-use-metrics-observability-chooser.md",
+    "revision_history": []
+  }
+}

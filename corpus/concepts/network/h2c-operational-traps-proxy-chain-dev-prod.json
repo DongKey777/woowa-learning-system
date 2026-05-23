@@ -1,0 +1,55 @@
+{
+  "id": "network/h2c-operational-traps-proxy-chain-dev-prod",
+  "title": "h2c Operational Traps: Proxy Chain, Dev/Prod Drift",
+  "category": "network",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# h2c Operational Traps: Proxy Chain, Dev/Prod Drift\n\n> 한 줄 요약: h2c 장애는 대부분 \"HTTP/2를 지원한다\"는 믿음에서 시작된다. 실제로는 dev proxy, ingress, mesh sidecar, local grpc client가 cleartext 진입 방식을 다르게 기대하면서 환경별로만 깨지는 함정이 많다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [h2c, Cleartext Upgrade, Prior Knowledge, Routing](./h2c-cleartext-upgrade-prior-knowledge-routing.md)\n> - [ALPN Negotiation Failure, Routing Mismatch](./alpn-negotiation-failure-routing-mismatch.md)\n> - [Service Mesh, Sidecar Proxy](./service-mesh-sidecar-proxy.md)\n> - [Service Mesh Local Reply, Timeout, Reset Attribution](./service-mesh-local-reply-timeout-reset-attribution.md)\n> - [gRPC vs REST](./grpc-vs-rest.md)\n\nretrieval-anchor-keywords: h2c operational traps, cleartext h2 drift, dev prod protocol mismatch, prior knowledge trap, Upgrade h2c trap, ingress h2c, grpc cleartext mismatch, proxy chain protocol drift, local dev grpc h2c, mesh cleartext routing\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nh2c operational trap의 전형적인 모습은 이렇다.\n\n- 로컬에선 된다\n- 특정 ingress 뒤에서만 안 된다\n- TLS 종단점 앞에선 괜찮다\n- cleartext hop이 끼는 내부망에서만 깨진다\n\n즉 문제는 HTTP/2 자체보다 **cleartext 진입 모드가 환경마다 다르게 가정되는 것**이다.\n\n먼저 경계 하나를 고정한다. `h2`는 보통 TLS 위에서 ALPN으로 협상하고, `h2c`는 cleartext HTTP/2다. `Upgrade: h2c`는 HTTP/1.1 upgrade 흐름이고, prior knowledge는 첫 byte부터 HTTP/2 preface를 보낸다. 둘 다 \"HTTP/2 지원\"이라는 한 단어로 묶으면 proxy chain에서 바로 오판한다.\n\n### Retrieval Anchors\n\n- `h2c operational traps`\n- `cleartext h2 drift`\n- `dev prod protocol mismatch`\n- `prior knowledge trap`\n- `Upgrade h2c trap`\n- `ingress h2c`\n- `grpc cleartext mismatch`\n- `proxy chain protocol drift`\n\n## 깊이 들어가기\n\n### 1. dev/prod drift가 가장 흔한 함정이다\n\n예:\n\n- 로컬 gRPC server는 prior knowledge 허용\n- staging ingress는 `Upgrade: h2c`만 이해\n- prod mesh는 cleartext H2 자체를 막음\n\n개발자는 \"같은 gRPC 서비스\"라고 보지만, 실제 wire entry mode는 다르다.\n\n### 2. cleartext hop이 숨어 있으면 문제를 놓치기 쉽다\n\n외부에선 TLS+h2가 정상이어도 내부 경로는 다를 수 있다.\n\n- ingress 이후 cleartext\n- sidecar to app cleartext\n- service-to-service cleartext in trusted subnet\n\n이때 outer hop 기준으론 h2로 보여도, inner hop은 h2c mismatch일 수 있다.\n\n### 3. proxy chain이 upgrade header를 보존하지 않을 수 있다\n\n`Upgrade: h2c` 경로는 중간 홉이:\n\n- header를 이해하고\n- 보존하고\n- 전환 결과를 일관되게 처리\n\n해야 한다.\n\n하지만 일부 hop이:\n\n- header를 제거\n- HTTP/1.1로 처리\n- partial fallback\n\n하면 \"가끔은 되고 가끔은 안 되는\" 이상한 상태가 생긴다.\n\n또한 `Upgrade`는 hop-by-hop 성격이 강하다. 한 hop에서 upgrade가 성공했다고 해서 다음 hop까지 h2c가 자동으로 유지되는 것이 아니다. Reverse proxy가 upstream으로 다시 HTTP/1.1을 열거나, gRPC bridge/translation을 수행하거나, sidecar가 local reply/reset으로 끊을 수 있다.\n\n### 4. prior knowledge는 더 단순해 보여도 더 날카롭다\n\n처음부터 preface를 보내기 때문에:\n\n- 지원하는 hop에선 단순하다\n- 모르는 hop에선 즉시 protocol error/connection close\n\n로 끝나기 쉽다. 현재 HTTP/2 표준에서는 cleartext HTTP/2 연결 성립을 prior knowledge 중심으로 다루고, 과거의 HTTP/1.1 `Upgrade: h2c` 방식은 더 이상 넓은 상호운용 기본값으로 기대하기 어렵다. 그래서 운영 문서에는 \"h2c 지원\"이 아니라 \"prior knowledge를 받는가, 또는 legacy upgrade를 받는가\"를 분리해 적어야 한다.\n\n즉 prior knowledge는 controlled environment엔 좋지만, heterogeneous proxy chain엔 예민하다.\n\n### 5. gRPC는 fallback이 적어 더 거칠게 깨진다\n\nbrowser 트래픽은 종종 H1/H2 fallback이 자연스럽다.  \ngRPC cleartext는 그렇지 않다.\n\n- 원하는 transport가 아니면 바로 실패\n- client surface는 `UNAVAILABLE` 정도로 뭉개짐\n- app 로그는 비어 있을 수 있음\n\n그래서 h2c trap은 흔히 \"gRPC만 안 됨\"으로 드러난다.\n\n### 6. 운영 체크리스트는 hop-by-hop이어야 한다\n\n좋은 질문:\n\n- 각 hop의 entry mode는 무엇인가\n- TLS termination 이후 protocol이 어떻게 바뀌는가\n- upgrade header/preface가 보존되는가\n- fail 시 fallback인지 reset인지 protocol error인지\n\n한 hop만 보면 환경 차이를 놓친다.\n\n아래처럼 \"client가 본 protocol\"과 \"upstream hop protocol\"을 분리해 적어야 한다.\n\n| hop | entry mode | 실패 surface |\n|---|---|---|\n| client -> ingress | TLS+h2 / H1 upgrade / prior knowledge | ALPN fail, 426, reset |\n| ingress -> sidecar | H1 upstream / h2c upgrade / h2c prior knowledge | header strip, downgrade, local reply |\n| sidecar -> app | raw h2c / H1 bridge / TLS+h2 | server preface error, no app log |\n\n이 표가 없으면 \"ingress는 HTTP/2 지원\"이라는 말이 outer hop만 뜻했는지, app upstream까지 뜻했는지 계속 섞인다.\n\n### 7. 운영 playbook\n\n1. client -> edge, edge -> mesh, mesh -> app을 별도 hop으로 그린다.\n2. 각 hop마다 `TLS+h2`, `HTTP/1.1`, `h2c prior knowledge`, `legacy h2c upgrade` 중 하나로 entry mode를 적는다.\n3. 실패한 hop에서 connection preface가 실제로 도착했는지 packet capture나 proxy debug log로 본다.\n4. `Upgrade`와 `Connection` 같은 hop-by-hop header가 다음 hop까지 이어진다고 가정하지 않는다.\n5. gRPC surface가 `UNAVAILABLE`이어도 app log가 비어 있으면 proxy local reply, reset, protocol error를 먼저 본다.\n6. dev/prod 차이는 \"같은 코드\"가 아니라 \"같은 hop별 protocol contract\"인지로 비교한다.\n\n## 실전 시나리오\n\n### 시나리오 1: dev에서는 되는 grpcurl이 prod ingress 뒤에서만 실패한다\n\ncleartext hop에서 h2c entry mode mismatch일 수 있다.\n\n### 시나리오 2: mesh 도입 후 internal gRPC가 갑자기 HTTP/1.1처럼 보이거나 reset 된다\n\nsidecar가 cleartext H2 전제를 깨거나 prior knowledge를 못 넘기는 패턴일 수 있다.\n\n### 시나리오 3: 일부 서비스만 h2c를 허용해 route별로 동작이 다르다\n\nroute/proxy config drift를 의심해야 한다.\n\n### 시나리오 4: client는 `UNAVAILABLE`, server는 무로그\n\ncleartext entry 단계에서 프록시가 protocol mismatch로 자른 것일 수 있다.\n\n## 코드로 보기\n\n### 운영 체크 포인트\n\n```text\n- outer hop protocol: h2 or h1?\n- inner cleartext hop: h2c upgrade or prior knowledge?\n- ingress / sidecar / app server support matrix aligned?\n- failure surface: downgrade / reset / protocol error / local reply\n- is h2c only inside a trusted hop, or crossing an unknown proxy?\n```\n\n### 설계 감각\n\n```text\nprefer one cleartext H2 entry mode per environment\ndocument hop-by-hop protocol expectations\ndon't assume dev prior-knowledge == prod ingress support\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| one-mode-only h2c | 운영 인지가 쉽다 | 유연성이 줄어든다 | controlled internal env |\n| mixed upgrade + prior knowledge | 일부 환경 호환성이 좋아질 수 있다 | drift와 debug cost가 커진다 | 과도기 |\n| TLS+h2 everywhere | 표준적이다 | 인증서/termination 비용이 늘 수 있다 | production-default |\n| cleartext gRPC | 단순하고 빠를 수 있다 | trap과 mismatch 리스크가 크다 | trusted/local-only |\n\n핵심은 h2c를 단순 기능이 아니라 **환경 간 protocol drift를 만들기 쉬운 운영 선택**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: 왜 h2c 문제는 dev/prod에서 다르게 보이나요?\n> 핵심: 각 환경의 proxy chain이 upgrade/prior knowledge를 다르게 이해할 수 있기 때문이다.\n\n> Q: prior knowledge가 왜 더 예민한가요?\n> 핵심: 모르는 hop에선 graceful fallback보다 즉시 protocol failure로 끝나기 쉽기 때문이다.\n\n> Q: h2c 운영에서 가장 중요한 습관은 무엇인가요?\n> 핵심: hop-by-hop protocol expectation을 명시하고 한 환경에서 하나의 cleartext 진입 모드만 쓰는 것이다.\n\n## 한 줄 정리\n\nh2c operational trap은 HTTP/2 지원 여부보다 환경별 proxy chain이 cleartext 진입 방식을 얼마나 일관되게 이해하느냐의 문제다.\n",
+  "aliases": [
+    "h2c operational traps",
+    "cleartext h2 drift",
+    "dev prod protocol mismatch",
+    "prior knowledge trap",
+    "ingress h2c",
+    "grpc cleartext mismatch"
+  ],
+  "expected_queries": [
+    "h2c가 dev에서는 되는데 prod ingress 뒤에서만 깨지는 이유를 proxy chain 기준으로 설명해줘",
+    "Upgrade h2c와 prior knowledge가 dev prod drift를 만드는 대표 함정은 뭐야?",
+    "mesh sidecar가 cleartext HTTP/2를 막거나 HTTP/1.1로 바꾸면 gRPC가 어떻게 실패해?",
+    "h2c 운영 체크리스트를 hop-by-hop entry mode 기준으로 정리해줘",
+    "local grpc client와 ingress h2c 기대치가 달라 UNAVAILABLE이 나는 장면을 진단해줘"
+  ],
+  "symptoms": [
+    "로컬 gRPC는 되는데 prod ingress나 mesh 뒤에서만 h2c가 UNAVAILABLE/reset으로 깨진다",
+    "TLS 종단 전에는 h2가 정상인데 cleartext hop 이후 protocol drift를 놓친다",
+    "Upgrade h2c header 보존 여부와 prior knowledge preface 지원 여부를 hop-by-hop으로 확인하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/h2c-cleartext-upgrade-prior-knowledge-routing",
+      "network/grpc-vs-rest"
+    ],
+    "next_docs": [
+      "network/service-mesh-sidecar-proxy",
+      "network/service-mesh-local-reply-timeout-reset-attribution",
+      "network/alpn-negotiation-failure-routing-mismatch"
+    ],
+    "confusable_with": [
+      "network/h2c-cleartext-upgrade-prior-knowledge-routing",
+      "network/alpn-negotiation-failure-routing-mismatch",
+      "network/service-mesh-sidecar-proxy",
+      "network/service-mesh-local-reply-timeout-reset-attribution",
+      "network/grpc-vs-rest"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/h2c-operational-traps-proxy-chain-dev-prod.md",
+    "revision_history": []
+  }
+}

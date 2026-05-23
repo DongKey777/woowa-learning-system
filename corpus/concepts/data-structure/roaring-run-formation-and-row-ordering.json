@@ -1,0 +1,58 @@
+{
+  "id": "data-structure/roaring-run-formation-and-row-ordering",
+  "title": "Roaring Run Formation and Row Ordering",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 Roaring Bitmap에서 row ordering과 sorted ingest가 active high key",
+  "body_markdown": "# Roaring Run Formation and Row Ordering\n\n> 한 줄 요약: sorted ingest와 row ordering은 Roaring에서 단순히 압축률을 조금 높이는 정도가 아니라, active chunk 수와 chunk별 run 수를 바꿔 `Roaring vs WAH/EWAH`의 break-even 자체를 이동시킨다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Roaring Bitmap](./roaring-bitmap.md)\n> - [Roaring Container Transition Heuristics](./roaring-container-transition-heuristics.md)\n> - [Chunk-Boundary Pathologies In Roaring](./chunk-boundary-pathologies-in-roaring.md)\n> - [Roaring Lazy Union And Repair Costs](./roaring-lazy-union-and-repair-costs.md)\n> - [Row-Ordering and Bitmap Compression Playbook](./row-ordering-and-bitmap-compression-playbook.md)\n> - [Roaring Production Profiling Checklist](./roaring-production-profiling-checklist.md)\n> - [Roaring Run-Churn Observability Guide](./roaring-run-churn-observability-guide.md)\n> - [Roaring Bitmap Selection Playbook](./roaring-bitmap-selection-playbook.md)\n> - [Compressed Bitmap Families: WAH, EWAH, CONCISE](./compressed-bitmap-families-wah-ewah-concise.md)\n> - [Bit-Sliced Bitmap Index](./bit-sliced-bitmap-index.md)\n\n> retrieval-anchor-keywords: roaring run formation, roaring row ordering, sorted ingest roaring, id locality bitmap, roaring vs wah break even, roaring vs ewah break even, run count locality, active chunk count, high key locality, sorted row ids, run container locality, run fragmentation roaring, warehouse bitmap sort key, chunk boundary reset, global run vs chunk local run, row ordering sensitive bitmap, sorted docid ingest, bitmap id locality, run optimize locality, roaring chunk boundary pathology, cross-chunk run restart, whole bitmap run codec vs roaring, roaring production profiling, roaring run churn observability, row ordering drift observability, chunk-local cardinality histogram, active chunk heatmap\n\n## 핵심 개념\n\nRoaring이 실제로 보는 것은 \"컬럼 값이 정렬됐는가\"가 아니라 **최종 row ID가 얼마나 붙어 있느냐**다.\n\n같은 predicate hit 집합이라도 row ordering이 좋아지면 Roaring에서는 세 가지가 바뀐다.\n\n- hit가 퍼지는 `high key` 수, 즉 active container 수가 줄어든다\n- 각 container 안 run 수가 줄어든다\n- chunk별 cardinality가 더 명확해져 `array/bitmap/run` 전환 churn이 줄어든다\n\n반대로 WAH/EWAH는 bitmap 전체 word stream에서 clean run이 얼마나 오래 이어지는지를 본다.  \n그래서 locality가 **chunk-local** 수준이면 Roaring 이득이 먼저 커지고,  \nlocality가 **chunk boundary를 넘어 전역적으로** 길어지면 WAH/EWAH 쪽 이득이 더 가파르게 커질 수 있다.\n\n즉 break-even은 고정된 cardinality 기준이 아니라,  \n**row ordering이 run count와 run 지속 구간을 어디까지 길게 만들어 주는가**에 의해 움직인다.\n\n## 깊이 들어가기\n\n### 1. sorted ingest가 중요한 이유는 값 정렬이 아니라 row-ID 정렬이 되기 때문이다\n\nbulk load나 compaction이 특정 차원 기준으로 정렬된 채 row ID를 배정하면,  \n그 차원 predicate에 해당하는 bit들이 인접한 위치에 놓인다.\n\n| ingest/배치 방식 | Roaring이 보는 모양 | 결과 감각 |\n|---|---|---|\n| 랜덤 ingest, 랜덤 surrogate ID | hit가 많은 `high key`에 흩어지고 run이 잘게 끊긴다 | array container가 많이 남고 runOptimize 이득이 약하다 |\n| predicate 차원 기준 정렬 ingest | hit가 소수의 인접 chunk에 몰리고 run 수가 낮아진다 | run container와 dense bitmap container가 안정되기 쉽다 |\n| `(country, date)` 같은 복합 정렬 | 큰 덩어리 안에 작은 지역성이 생긴다 | run 수는 줄지만 차원 경계마다 새 run이 생긴다 |\n| micro-batch 내부만 정렬 | batch마다 locality가 있지만 전역 연속성은 짧다 | batch 경계만큼 run reset이 추가된다 |\n\n핵심은 \"정렬했다\" 자체가 아니라,  \n그 정렬이 **최종 비트 위치의 인접성**으로 남았는가다.\n\n### 2. Roaring에서 row ordering은 `cardinality`보다 `run 수`와 `active chunk 수`를 더 크게 흔든다\n\nRoaring의 container 비용 감각은 대략 다음 세 식으로 볼 수 있다.\n\n- array container: `2 * cardinality`\n- bitmap container: `8192`\n- run container: `2 + 4 * runs`\n\n정렬이 좋아지면 cardinality 자체보다 아래 두 값이 먼저 떨어진다.\n\n- `k = active chunk 수`\n- 각 chunk의 `runs_i = run 수`\n\n그래서 전체 비용은 대략 아래처럼 생각하는 편이 맞다.\n\n- `총 비용 ~= Σ container_cost(i) + O(k)` header/index\n- `run container 비용 ~= Σ (2 + 4 * runs_i)`\n\n즉 row ordering은 \"1이 몇 개인가\"보다:\n\n- 몇 개의 chunk에 퍼졌는가\n- chunk 안에서 몇 번 on/off가 바뀌는가\n- `4096` 근처 chunk를 얼마나 많이 만드는가\n\n를 바꾼다.\n\n이게 중요한 이유는, 같은 `100만`건 hit여도:\n\n- contiguous ID band면 `runs_i`가 거의 `1`에 가깝고\n- 랜덤 ID면 `runs_i`가 cardinality에 가까워질 수 있기 때문이다\n\nRoaring은 whole-bitmap run codec이 아니므로,  \n아주 완벽한 연속 구간이 있어도 chunk 경계마다 최소 한 번은 run이 다시 시작된다.\n이때 왜 전역 interval 수보다 active chunk 수와 seam 수가 footprint를 더 잘 설명하는지는 [Chunk-Boundary Pathologies In Roaring](./chunk-boundary-pathologies-in-roaring.md)에서 별도로 다룬다.\n\n### 3. 그래서 좋은 row ordering은 Roaring에도 이득이지만, 이득의 기울기는 WAH/EWAH와 다르다\n\n긴 연속 구간 하나가 `N`개의 16-bit chunk를 가로지른다고 하자.\n\n- **Roaring**\n  - 적어도 `N`개의 active container가 필요하다\n  - 각 container는 최소 `1`개의 run 또는 dense bitmap 표현을 가진다\n  - chunk index/header 비용이 계속 붙는다\n- **WAH/EWAH**\n  - word stream 전체에서 clean run이 그대로 이어질 수 있다\n  - chunk boundary 같은 논리적 reset이 없다\n  - run이 길어질수록 fill-word skip 이득이 더 직접적으로 커진다\n\n따라서 locality가 약할 때는 Roaring의 적응성이 유리하고,  \nlocality가 매우 강해서 \"거의 전역적인 clean run\"이 만들어지기 시작하면 WAH/EWAH 쪽 break-even이 앞으로 당겨진다.\n\n다르게 말하면:\n\n- **local clustering**: Roaring 우세가 유지되기 쉽다\n- **global clustering**: WAH/EWAH 우세 구간이 빨리 시작될 수 있다\n\n### 4. break-even을 움직이는 것은 sorted ingest의 `강도`와 `지속성`이다\n\nrow ordering 개선이 항상 WAH/EWAH 승리로 끝나는 것은 아니다.\n\n| ordering 품질 | Roaring 쪽 변화 | WAH/EWAH 쪽 변화 | break-even 이동 |\n|---|---|---|---|\n| 랜덤 / 약한 locality | sparse array 위주, run 수 높음 | dirty literal이 많아 fill 이득이 약함 | Roaring 쪽이 상대적으로 유리 |\n| segment 내부만 좋은 locality | active chunk와 run 수가 줄어듦 | clean run도 늘지만 segment/batch 경계에서 자주 리셋 | 둘 다 좋아지되 Roaring 경쟁력이 유지되기 쉽다 |\n| 전역적으로 강한 정렬, read-mostly | chunk마다 1~소수 run으로 안정화 | chunk 경계를 넘어 clean fill이 길게 지속 | WAH/EWAH 쪽으로 break-even이 이동 |\n| 초기엔 정렬됐지만 late row/revoke가 누적 | run fragmentation 증가, churn 재발 | clean run이 dirty literal로 깨짐 | 다시 Roaring 쪽으로 이동하거나 둘 다 악화 |\n\n즉 정렬의 효과는 **정적 상태**보다 **시간이 지나도 locality가 유지되는가**에서 갈린다.\n\n### 5. ID locality가 좋아지면 Roaring의 run container뿐 아니라 `container 선택` 자체가 달라진다\n\nsorted ingest가 강한 경우 Roaring에서는 아래 현상이 함께 생긴다.\n\n- hit가 적은 chunk는 아예 비게 되어 container 수가 감소한다\n- hit가 몰린 chunk는 `4096`을 훌쩍 넘어 bitmap으로 안정된다\n- 연속 구간 위주 chunk는 run container가 bitmap보다 훨씬 작아진다\n- `4096` 근처를 오가던 애매한 chunk가 줄어 container churn hotspot이 줄어든다\n\n반대로 랜덤 ordering은:\n\n- 많은 chunk를 조금씩만 건드린다\n- run 수를 올려 run container 이득을 깨뜨린다\n- sparse/dense 경계 chunk를 많이 만들어 rebuild 빈도를 높인다\n\n그래서 sorted ingest는 \"runOptimize 잘 먹는다\"에 그치지 않고,  \nRoaring이 원래 강한 mixed-density 적응을 **더 안정적인 분포**로 만들어 준다.\n\n### 6. WAH/EWAH와 비교할 때 봐야 할 지표는 전역 density가 아니라 locality 계층이다\n\n실전에서 아래 순서로 보면 판단이 빨라진다.\n\n1. predicate hit가 몇 개의 row band로 모이나\n2. 그 band가 16-bit chunk 경계를 얼마나 자주 넘나드나\n3. segment/micro-batch 경계가 전역 run을 얼마나 자주 끊나\n4. late ingest가 기존 band 사이에 얼마나 자주 끼어드나\n5. 연산이 bulk scan 위주인가, mixed set-op/update 위주인가\n\n이 locality 변화를 실제 운영 데이터로 확인하려면 `active chunk 수`, chunk별 cardinality histogram, run 수 tail, transition hotspot을 함께 남겨야 한다. 계측 항목 자체는 [Roaring Production Profiling Checklist](./roaring-production-profiling-checklist.md)에서 바로 이어서 볼 수 있다.  \n특히 row ordering regression이 `active chunk spread`와 `run fragmentation`으로 어떻게 드러나는지는 [Roaring Run-Churn Observability Guide](./roaring-run-churn-observability-guide.md)에서 운영 대시보드 관점으로 다시 정리했다.\n\n이 질문에 대한 감각은 보통 이렇게 정리된다.\n\n- **band가 짧고 많이 끊긴다**  \n  WAH/EWAH는 dirty literal이 많아지고, Roaring은 그래도 sparse chunk를 국소적으로 처리할 수 있다.\n- **band가 길고 chunk 경계를 넘어 오래 유지된다**  \n  Roaring도 좋아지지만, WAH/EWAH가 global fill model 덕분에 더 빨리 작아지고 더 오래 skip한다.\n- **band는 길지만 update가 자주 낀다**  \n  전역 run model인 WAH/EWAH가 민감해질 수 있고, Roaring의 mixed container가 다시 실용적일 수 있다.\n\n### 7. warehouse / bitmap index에서 자주 보는 패턴\n\n#### 패턴 1: `country` 기준 정렬된 fact table\n\n`country = KR` bitmap이 큰 연속 band를 만들면:\n\n- Roaring: 적은 active chunk, 적은 run 수, 일부 full chunk\n- WAH/EWAH: 긴 one-fill과 zero-fill\n\n테이블이 크고 read-mostly일수록 WAH/EWAH 쪽 break-even이 가까워질 수 있다.\n\n#### 패턴 2: 날짜 append만 유지되는 event table\n\n`country`나 `device_type`는 시간축 전체에 흩어진다.\n\n- Roaring: sparse chunk를 array/bitmap 혼합으로 흡수\n- WAH/EWAH: dirty literal이 많아져 정렬 이득이 약함\n\n이 경우는 Roaring이 더 자연스러운 기본값인 경우가 많다.\n\n#### 패턴 3: daily partition 안에서만 정렬\n\n하루 단위로는 locality가 좋지만 일자 경계마다 run이 리셋된다.\n\n- Roaring: partition마다 적은 run을 얻지만 active chunk 수는 누적된다\n- WAH/EWAH: fill 이득은 있으나 day boundary만큼 reset이 늘어난다\n\n전역 reclustering이 없으면 break-even 이동이 제한적이다.\n\n#### 패턴 4: bulk build 후 랜덤 revoke\n\n초기에는 둘 다 잘 압축되지만 시간이 지나면서 run fragmentation이 쌓인다.\n\n이때는 \"초기 압축률\"보다:\n\n- average runs per active chunk\n- active chunk 수 증가 속도\n- fill/literal 비율 악화 속도\n\n를 봐야 한다.\n\n## 빠른 판단표\n\n| 관찰 신호 | 해석 |\n|---|---|\n| runOptimize 직후 크기 감소가 크고, active chunk 수도 작다 | sorted ingest가 Roaring locality로 잘 번역되고 있다 |\n| 평균 `runs_i`는 낮지만 active chunk 수가 많다 | local band는 있으나 전역적으로는 많이 퍼져 있어 WAH/EWAH 이득이 제한될 수 있다 |\n| 연속 full chunk가 길게 이어지고 update가 드물다 | WAH/EWAH 쪽 break-even이 빠르게 가까워진다 |\n| `4096` 근처 chunk와 random hole punching이 많다 | Roaring churn 문제를 먼저 봐야 하고, WAH/EWAH로 옮겨도 global run 이득이 작을 가능성이 높다 |\n\n## 꼬리질문\n\n> Q: sorted ingest만 하면 Roaring이 항상 WAH/EWAH보다 불리해지나요?\n> 의도: locality 개선과 global run model을 구분하는지 확인\n> 핵심: 아니다. locality가 chunk-local 수준인지, chunk boundary를 넘어 매우 길게 유지되는지에 따라 break-even 이동 폭이 달라진다.\n\n> Q: Roaring에서 row ordering이 바꾸는 핵심 지표는 무엇인가요?\n> 의도: global cardinality보다 local shape를 보는지 확인\n> 핵심: active chunk 수, chunk별 run 수, 그리고 `4096` 근처 churn hotspot 수다.\n\n> Q: 왜 같은 정렬 이득이 WAH/EWAH에 더 크게 작용할 수 있나요?\n> 의도: whole-bitmap run model과 chunk-local run model의 차이를 설명할 수 있는지 확인\n> 핵심: WAH/EWAH는 clean run을 chunk 경계 없이 이어가지만, Roaring은 16-bit container 경계마다 최소 단위가 다시 생기기 때문이다.\n\n## 한 줄 정리\n\nsorted ingest와 row ordering은 Roaring의 run 수와 active chunk 수를 낮춰 큰 이득을 주지만, locality가 chunk boundary를 넘어 전역 clean run으로 길게 유지될수록 `Roaring vs WAH/EWAH`의 break-even은 점점 WAH/EWAH 쪽으로 이동한다.\n",
+  "aliases": [
+    "Roaring run formation",
+    "Roaring row ordering",
+    "sorted ingest Roaring",
+    "bitmap id locality",
+    "active chunk count",
+    "run count locality",
+    "Roaring vs WAH break even"
+  ],
+  "expected_queries": [
+    "Roaring Bitmap에서 sorted ingest와 row ordering이 active chunk 수와 run 수를 어떻게 바꿔?",
+    "값이 정렬됐는지보다 최종 row ID locality가 중요한 이유는?",
+    "Roaring run formation과 WAH EWAH whole bitmap run compression의 break-even은 어떻게 달라?",
+    "warehouse bitmap sort key가 Roaring container 비용에 미치는 영향을 설명해줘",
+    "row ordering drift가 run fragmentation과 active high key 증가로 보이는 이유는?"
+  ],
+  "symptoms": [
+    "값 정렬 자체가 아니라 최종 row ID의 인접성이 Roaring run formation을 결정한다는 점을 놓친다",
+    "row ordering이 cardinality보다 active chunk 수와 chunk별 run 수를 더 크게 흔든다는 비용 모델을 보지 않는다",
+    "Roaring은 chunk-local run, WAH/EWAH는 whole bitmap run stream을 본다는 break-even 차이를 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/roaring-bitmap",
+      "data-structure/row-ordering-and-bitmap-compression-playbook"
+    ],
+    "next_docs": [
+      "data-structure/roaring-production-profiling-checklist",
+      "data-structure/roaring-run-churn-observability-guide",
+      "data-structure/compressed-bitmap-families-wah-ewah-concise",
+      "data-structure/bit-sliced-bitmap-index"
+    ],
+    "confusable_with": [
+      "data-structure/row-ordering-and-bitmap-compression-playbook",
+      "data-structure/chunk-boundary-pathologies-in-roaring",
+      "data-structure/compressed-bitmap-families-wah-ewah-concise",
+      "data-structure/roaring-container-transition-heuristics",
+      "data-structure/bit-sliced-bitmap-sort-key-sensitivity",
+      "data-structure/warehouse-sort-key-co-design-for-bitmap-indexes"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/roaring-run-formation-and-row-ordering.md",
+    "revision_history": []
+  }
+}

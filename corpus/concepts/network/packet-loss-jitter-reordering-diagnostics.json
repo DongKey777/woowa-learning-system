@@ -1,0 +1,59 @@
+{
+  "id": "network/packet-loss-jitter-reordering-diagnostics",
+  "title": "Packet Loss, Jitter, Reordering Diagnostics",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 packet loss, jitter, packet reordering, retransmission,",
+  "body_markdown": "# Packet Loss, Jitter, Reordering Diagnostics\n\n> 한 줄 요약: 패킷 손실, 지터, 재정렬은 같은 \"느림\"으로 보이지만 원인이 달라서, 재전송과 지연 분포를 같이 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TCP 혼잡 제어](./tcp-congestion-control.md)\n> - [HTTP/2 멀티플렉싱과 HOL blocking](./http2-multiplexing-hol-blocking.md)\n> - [HTTP/3, QUIC Practical Trade-offs](./http3-quic-practical-tradeoffs.md)\n> - [MTU, Fragmentation, MSS, Blackhole](./mtu-fragmentation-mss-blackhole.md)\n> - [Nagle 알고리즘과 Delayed ACK](./nagle-delayed-ack-small-packet-latency.md)\n> - [Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB](./request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md)\n\nretrieval-anchor-keywords: packet loss, jitter, reordering, retransmission, out-of-order, tail latency, p95, p99, tc netem, tcpdump, ss -ti\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 재현 조건, 관찰 증거, failure matrix\n\n이 문서의 1차 분기는 \"네트워크가 느리다\"가 아니라 \"loss, jitter, reordering 중 무엇이 tail latency를 만든 것인가\"다. p99 상승은 신호이고, proof는 전송 계층 수치와 애플리케이션 timing을 함께 검증/validation해야 얻는다.\n\n### 재현 조건\n\n- `tc netem`으로 loss, delay variance, reorder를 각각 따로 주입해 지표 변화를 비교한다.\n- 같은 endpoint를 유선/무선/VPN 경로로 나눠 p50, p95, p99와 retransmission을 본다.\n- packet capture 시간축과 application timeout/retry log를 맞춘다.\n\n### 관찰 증거\n\n- 평균은 정상인데 p99만 튄다.\n- `retransmission`, `out-of-order`, RTT 분포가 특정 구간에서 같이 흔들린다.\n- retry를 공격적으로 켰을 때 queueing과 timeout ratio가 더 나빠진다.\n\n### failure matrix\n\n| 증상 | 1차 분기 | 관찰 신호 | 검증/validation | wrong-bucket / 오선택 |\n|---|---|---|---|---|\n| throughput과 p99가 같이 악화 | packet loss/혼잡 | retransmission, cwnd 감소 | `ss -ti`, tcpdump, NIC/drop counter를 같은 시간축으로 확인 | 서버 CPU 부족으로만 분류 |\n| 평균 정상, tail만 흔들림 | jitter | RTT/latency 분산 증가 | phase timing과 path별 RTT histogram을 비교 | DB 쿼리 지연으로만 분류 |\n| 스트림이 가끔 멈춘 듯 보임 | reordering 또는 MTU/tunnel 문제 | out-of-order segment, duplicate ACK | tcpdump sequence 분석과 tunnel/MTU 설정을 확인 | HTTP/2 애플리케이션 버그로만 분류 |\n\n## 핵심 개념\n\n네트워크가 \"느리다\"는 말에는 적어도 세 가지 다른 현상이 섞인다.\n\n- `packet loss`: 패킷이 사라져 재전송이 필요하다\n- `jitter`: 지연이 들쭉날쭉하다\n- `reordering`: 패킷이 순서와 다르게 도착한다\n\n이 셋은 모두 사용자 체감 지연을 올리지만, 관찰 지점은 조금 다르다.\n\n### Retrieval Anchors\n\n- `packet loss`\n- `jitter`\n- `reordering`\n- `retransmission`\n- `out-of-order`\n- `tail latency`\n- `p95`\n- `p99`\n- `tc netem`\n- `tcpdump`\n\n## 깊이 들어가기\n\n### 1. packet loss는 왜 가장 먼저 의심하나\n\n패킷이 사라지면 TCP는 재전송해야 한다.\n\n- 처리량이 줄어든다\n- RTT가 늘어난 것처럼 보인다\n- application timeout이 터질 수 있다\n\n손실은 단순히 \"데이터 하나 잃음\"이 아니라 **전송 알고리즘이 속도를 줄이는 신호**다.  \n그래서 loss가 높아지면 tail latency가 먼저 흔들리는 경우가 많다.\n\n### 2. jitter는 왜 더 다루기 어려운가\n\n손실이 없더라도 지연이 들쭉날쭉하면 p95/p99가 튄다.\n\n- 평균 latency는 정상처럼 보일 수 있다\n- 일부 요청만 갑자기 늦어진다\n- retry와 timeout을 더 자주 건드리게 된다\n\n즉 jitter는 \"평균이 아니라 분산의 문제\"다.\n\n### 3. reordering은 왜 혼란을 주나\n\n패킷이 순서대로 오지 않으면 TCP는 재정렬을 기다린다.\n\n- out-of-order segment가 생긴다\n- fast retransmit이 발생할 수 있다\n- 스트림이 멈춘 것처럼 보일 수 있다\n\n특히 같은 연결에 작은 요청과 큰 응답이 섞여 있으면 reordering의 체감이 더 커질 수 있다.\n\n### 4. 세 가지는 어떻게 구분하나\n\n실무에서는 다음 신호를 같이 본다.\n\n- `retransmission` 증가: loss 가능성\n- RTT 분포 넓어짐: jitter 가능성\n- `out-of-order` 증가: reordering 가능성\n- `cwnd` 감소: 손실 또는 혼잡 가능성\n\n패킷 수치 하나만 보면 오판하기 쉽다.  \n그래서 tcpdump, ss, 애플리케이션 p95/p99를 같이 본다.\n\n### 5. 왜 tail latency가 먼저 망가지나\n\n평균은 작은 손실을 숨긴다.\n\n- 대부분 요청은 빠르다\n- 일부만 재전송이나 재정렬을 만난다\n- 그 일부가 p99를 끌어올린다\n\n운영에서 중요한 것은 평균이 아니라 **느린 꼬리 요청이 왜 생겼는가**다.\n\n## 실전 시나리오\n\n### 시나리오 1: 평균은 정상인데 p99만 튄다\n\n가능한 원인:\n\n- loss가 간헐적으로 난다\n- 지터가 커졌다\n- 특정 경로에서 reordering이 늘었다\n\n이 경우 단순 capacity 증가보다 경로 진단이 먼저다.\n\n### 시나리오 2: 모바일 네트워크에서만 느리다\n\n무선망은 loss, jitter, handover가 섞여 있다.\n\n- HTTP/2는 HOL blocking 영향이 커질 수 있다\n- HTTP/3는 이런 환경에서 더 유리할 수 있다\n\n### 시나리오 3: VPN 뒤에서만 가끔 멈춘다\n\n터널링은 MTU와 reordering 문제를 함께 만들 수 있다.\n\n- 큰 패킷이 깨지거나 드롭된다\n- 재전송이 늘어난다\n- 체감은 timeout처럼 보인다\n\n### 시나리오 4: 재시도하니 더 느려진다\n\n손실이나 jitter가 있는데 timeout과 retry가 공격적이면 네트워크가 더 바빠진다.\n\n- 요청이 중복된다\n- queue가 쌓인다\n- tail latency가 더 나빠진다\n\n이건 [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)과 같이 봐야 한다.\n\n## 코드로 보기\n\n### 관찰 명령\n\n```bash\nss -ti dst api.example.com\ntcpdump -i eth0 host api.example.com\n```\n\n### Linux에서 네트워크 에뮬레이션\n\n```bash\nsudo tc qdisc add dev eth0 root netem loss 1% delay 40ms 10ms reorder 25% 50%\nsudo tc qdisc del dev eth0 root\n```\n\n이런 실험은 실제 장애를 만들려는 게 아니라, 지표가 어떻게 흔들리는지 감각을 잡는 용도다.\n\n### 수치로 볼 때\n\n```text\nloss: 재전송 증가\njitter: latency 분산 증가\nreordering: out-of-order segment 증가\n```\n\n### 애플리케이션에서 봐야 할 것\n\n```text\nconnect time\ntime to first byte\nretries\np95 / p99\ntimeout ratio\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 평균 latency 중심 | 보기 쉽다 | tail 문제를 숨긴다 | 대략적 모니터링 |\n| p95/p99 중심 | 꼬리 문제를 드러낸다 | 원인 추적이 어렵다 | 운영 장애 분석 |\n| loss/jitter/reordering 분리 | 원인에 가깝게 본다 | 계측이 복잡하다 | 성능 문제 디버깅 |\n\n핵심은 \"느리다\"를 수치로 해체하는 것이다.\n\n## 꼬리질문\n\n> Q: loss와 jitter는 어떻게 다르나요?\n> 핵심: loss는 패킷이 사라지는 것이고, jitter는 지연이 일정하지 않은 것이다.\n\n> Q: reordering이 왜 문제가 되나요?\n> 핵심: TCP가 순서를 맞추기 위해 기다리면서 응답 전달이 늦어진다.\n\n> Q: 평균 latency가 멀쩡한데 왜 p99가 튀나요?\n> 핵심: 일부 요청만 loss, jitter, reordering을 만나기 때문이다.\n\n## 한 줄 정리\n\n패킷 손실, 지터, 재정렬은 모두 느림으로 보이지만, 재전송 수와 지연 분포를 함께 보면 원인을 더 정확히 분해할 수 있다.\n",
+  "aliases": [
+    "packet loss",
+    "jitter",
+    "packet reordering",
+    "retransmission diagnostics",
+    "tail latency network",
+    "loss jitter reordering",
+    "network instability diagnosis"
+  ],
+  "expected_queries": [
+    "packet loss jitter reordering을 어떻게 구분해서 진단해?",
+    "p99 tail latency가 네트워크 손실 때문에 튀는지 어떻게 확인해?",
+    "TCP retransmission과 QUIC loss recovery는 관측 표면이 어떻게 달라?",
+    "특정 region이나 mobile network에서만 packet loss가 보이면 무엇을 봐야 해?",
+    "jitter와 reordering이 streaming이나 gRPC에 미치는 영향을 설명해줘"
+  ],
+  "symptoms": [
+    "latency p99 급등을 app code나 DB 문제로만 본다",
+    "packet loss, jitter, reordering을 같은 네트워크 느림으로 뭉개고 증상 차이를 보지 않는다",
+    "TCP retransmission과 QUIC packet loss recovery의 표면 차이를 놓친다",
+    "특정 ASN, region, mobile network에서만 생기는 손실 패턴을 집계하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/tcp-congestion-control",
+      "network/request-timing-decomposition"
+    ],
+    "next_docs": [
+      "network/mtu-pmtud-icmp-blackhole-path-diagnostics",
+      "network/http2-multiplexing-hol-blocking",
+      "network/http3-quic-practical-tradeoffs",
+      "network/udp-fragmentation-quic-packetization"
+    ],
+    "confusable_with": [
+      "network/tcp-congestion-control",
+      "network/mtu-pmtud-icmp-blackhole-path-diagnostics",
+      "network/syn-retransmission-handshake-timeout",
+      "network/http2-multiplexing-hol-blocking",
+      "network/grpc-deadline-exceeded-first-triage-card",
+      "network/mtu-fragmentation-mss-blackhole"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/packet-loss-jitter-reordering-diagnostics.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "id": "database/failover-promotion-read-divergence",
+  "title": "Failover Promotion과 Read Divergence",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "'이 문서는 failover promotion 뒤 old primary, new primary, stale replica, topology cache 때문에 read authority가 갈라지는 read divergence 증상을 라우팅하는 intermediate symptom router다.",
+  "body_markdown": "# Failover Promotion과 Read Divergence\n\n> 한 줄 요약: failover가 끝나도 읽기 결과가 바로 하나로 모이지 않으면, 사용자는 같은 데이터베이스를 두 개의 진실로 경험한다.\n\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../spring/spring-persistence-transaction-web-service-repository-primer.md)\n\n관련 문서: [Replication Failover and Split Brain](./replication-failover-split-brain.md), [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md), [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md), [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md), [Failover Visibility Window, Topology Cache, and Freshness Playbook](./failover-visibility-window-topology-cache-playbook.md), [Commit Horizon After Failover, Loss Boundaries, and Verification](./commit-horizon-after-failover-verification.md)\nretrieval-anchor-keywords: promotion, read divergence, stale primary, write fencing, topology cache, visibility window, topology invalidation, commit horizon, post promotion stale read, failover freshness split, old primary still serving reads, some pods old some new, stale endpoint after promotion, failover promotion read divergence basics, failover promotion read divergence beginner\n\n## 빠른 증상 라우팅\n\n| 보이는 증상 | 먼저 볼 문서 | 이유 |\n|---|---|---|\n| failover 직후 일부 요청은 새 값, 일부 요청은 옛값을 본다 | 이 문서 | 승격 이후 read authority가 둘로 갈라지는 현상 자체를 설명한다 |\n| lag metric 상승과 fallback threshold, replica health score 설계가 핵심이다 | [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md) | steady-state lag 관측과 정책 문제가 중심이다 |\n| topology cache invalidation, DNS TTL, cache bust, temporary primary pinning 액션이 바로 필요하다 | [Failover Visibility Window, Topology Cache, and Freshness Playbook](./failover-visibility-window-topology-cache-playbook.md) | visibility window를 줄이는 운영 순서를 다룬다 |\n| 새 primary가 실제로 최근 commit을 포함했는지부터 확인해야 한다 | [Commit Horizon After Failover, Loss Boundaries, and Verification](./commit-horizon-after-failover-verification.md) | divergence가 아니라 data loss / horizon gap 여부를 먼저 가린다 |\n\n## 핵심 개념\n\nFailover promotion은 replica를 새 primary로 승격하는 과정이다.\n그런데 승격 자체보다 더 자주 깨지는 것은, 승격 전후에 생기는 **읽기 경로의 분기**다.\n\n왜 중요한가:\n\n- 옛 primary와 새 primary가 잠깐 동시에 읽히면 결과가 달라진다\n- topology cache가 늦게 바뀌면 앱이 잘못된 endpoint를 계속 읽는다\n- 승격은 되었지만 읽기 라우팅이 아직 바뀌지 않으면 데이터가 “사라진 것처럼” 보인다\n\n이 문서는 split brain보다 한 단계 더 미묘한, **읽기만 갈라지는 증상**에 초점을 둔다.\n\n## 깊이 들어가기\n\n### 1. promotion 직후 왜 read divergence가 생기는가\n\n승격이 완료되면 새 primary는 쓰기를 받기 시작한다.\n하지만 애플리케이션과 캐시는 즉시 바뀌지 않을 수 있다.\n\n- 커넥션 풀은 옛 topology를 잠시 유지한다\n- read endpoint DNS TTL이 남아 있다\n- replica 목록 갱신이 늦는다\n- 일부 노드는 옛 primary를 아직 읽기 대상으로 본다\n\n결과적으로 같은 시점에 서로 다른 노드가 서로 다른 값을 보여준다.\n\n### 2. stale primary가 더 위험한 경우\n\n옛 primary가 read-only로 잘 잠겼다면 그나마 낫다.\n하지만 read-only 전환이 늦으면 문제가 더 복잡해진다.\n\n- 옛 primary가 최신 쓰기를 보지 못한 채 읽힌다\n- 새 primary는 최신 상태를 보여준다\n- 사용자별로 다른 페이지에서 다른 진실이 나온다\n\n이때 문제는 단순한 lag가 아니라, **누가 authoritative source인가**가 흔들리는 것이다.\n\n### 3. topology cache가 만드는 착시\n\n클라이언트나 라우터는 종종 DB topology를 캐시한다.\n\n- primary 후보\n- replica 목록\n- read/write endpoint 매핑\n\nfailover 후 이 캐시가 늦게 갱신되면, 앱은 이미 전환된 줄 알고 옛 서버를 계속 읽는다.\n그래서 장애 대응에서는 DB 전환과 함께 앱 캐시 무효화가 필요하다.\n\nlag metric이 낮다고 안심하면 안 되는 이유도 여기에 있다.\npromotion 이후에는 replica apply delay가 아니라 **topology cache stale** 때문에 read divergence가 길어질 수 있다.\n이런 경우 운영 액션은 [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md)보다 [Failover Visibility Window, Topology Cache, and Freshness Playbook](./failover-visibility-window-topology-cache-playbook.md)에 더 가깝다.\n\n### 4. 읽기 다이버전스를 줄이는 방법\n\n- read endpoint를 단일 진실원으로 운영\n- failover 시 읽기 라우팅까지 같이 전환\n- topology cache TTL을 짧게 가져감\n- 일정 시간은 primary pinning으로 보호\n\n즉 승격이 아니라 **승격 + 읽기 경로 통일**이 완성 조건이다.\n\n## 실전 시나리오\n\n### 시나리오 1: 새 primary 승격 후 관리자 화면이 서로 다른 값을 보여줌\n\n승격은 끝났지만 일부 앱은 옛 replica 목록을 사용한다.\n관리자는 목록과 상세에서 다른 상태를 보고 혼란을 겪는다.\n\n### 시나리오 2: read-only 전환이 늦은 옛 primary\n\n옛 primary가 잠깐이라도 읽기 경로에 남아 있으면, 사용자는 “데이터가 두 갈래로 갈라졌다”고 느낀다.\n이때는 fencing과 라우팅 동시 전환이 필요하다.\n\n### 시나리오 3: DNS TTL이 길어 failover가 늦게 반영됨\n\n새 endpoint로 바뀌었는데도 클라이언트가 옛 IP를 계속 바라보면, 승격 이후에도 read divergence가 지속된다.\n이건 DB 문제가 아니라 트래픽 전환 문제다.\n\n## 코드로 보기\n\n```text\nbefore failover:\n  app -> primary A / replicas B,C\n\nafter failover:\n  app must switch to primary B and stop reading A\n\nbad:\n  some requests still read A while others read B\n```\n\n```sql\n-- 승격 이후 확인해야 할 상태\nSELECT @@read_only, @@super_read_only;\n```\n\n```java\n// topology cache를 짧게 유지하고, failover 이벤트에서 무효화한다.\nclass TopologyCache {\n    void onFailoverEvent() {\n        this.invalidateAll();\n    }\n}\n```\n\nfailover는 서버를 바꾸는 작업이 아니라, **읽기 기준점을 하나로 다시 묶는 작업**이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 빠른 promotion | 복구가 빠르다 | 읽기 다이버전스 위험 | RTO가 중요할 때 |\n| 보수적 promotion | 정합성이 높다 | 복구가 느리다 | 금융/관리 데이터 |\n| 짧은 topology TTL | 전환이 빨라진다 | 조회 부하가 늘 수 있다 | failover가 잦은 시스템 |\n| primary pinning | read-after-write가 안정적이다 | primary 부하 증가 | 전환 직후 안정화 구간 |\n\n## 꼬리질문\n\n> Q: failover가 끝났는데 왜 읽기 결과가 갈라지나요?\n> 의도: promotion과 read routing의 분리를 아는지 확인\n> 핵심: 앱/캐시/TTL이 늦게 바뀌면 서로 다른 노드를 읽는다\n\n> Q: split brain과 read divergence는 같은 문제인가요?\n> 의도: 쓰기 충돌과 읽기 불일치를 구분하는지 확인\n> 핵심: split brain은 둘 다 쓰는 문제, read divergence는 읽기 진실이 갈라지는 문제다\n\n> Q: failover 직후 무엇을 가장 먼저 확인해야 하나요?\n> 의도: 운영 우선순위 이해 여부 확인\n> 핵심: old primary 격리, read-only 상태, topology 갱신이다\n\n## 한 줄 정리\n\nFailover promotion은 primary를 바꾸는 것으로 끝나지 않고, 읽기 라우팅과 topology cache까지 함께 바꿔야 read divergence를 막을 수 있다.\n",
+  "aliases": [
+    "failover promotion read divergence",
+    "promotion read divergence",
+    "stale primary read",
+    "topology cache",
+    "visibility window",
+    "post promotion stale read",
+    "old primary still serving reads",
+    "some pods old some new",
+    "failover 후 읽기 결과 다름",
+    "승격 후 stale read"
+  ],
+  "expected_queries": [
+    "failover promotion 후 read divergence가 생기는 이유를 old primary, new primary, topology cache 관점에서 설명해줘",
+    "새 primary 승격 후 일부 요청만 옛 값을 읽으면 replication lag와 topology cache stale을 어떻게 구분해?",
+    "some pods old some new 상태에서 read authority를 하나로 모으려면 무엇을 봐야 해?",
+    "failover 직후 stale primary가 읽기 경로에 남으면 어떤 사용자 증상이 생겨?",
+    "promotion read divergence와 commit horizon write loss는 어떻게 다르게 판단해?"
+  ],
+  "symptoms": [
+    "failover 직후 어떤 화면은 새 값, 어떤 화면은 옛 값을 보여 read authority가 갈라져 있어",
+    "새 primary 승격은 됐는데 일부 app instance가 old primary나 stale replica를 계속 읽고 있어",
+    "lag metric은 정상인데 topology cache나 DNS TTL 때문에 stale read가 이어지는 것 같아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/replication-failover-split-brain",
+      "database/replica-lag-read-after-write-strategies"
+    ],
+    "next_docs": [
+      "database/failover-visibility-window-topology-cache-playbook",
+      "database/commit-horizon-after-failover-verification",
+      "database/replica-lag-observability-routing-slo",
+      "database/replica-read-routing-anomalies"
+    ],
+    "confusable_with": [
+      "database/failover-visibility-window-topology-cache-playbook",
+      "database/commit-horizon-after-failover-verification",
+      "database/replica-lag-observability-routing-slo",
+      "database/replication-failover-split-brain",
+      "database/ghost-reads-mixed-routing-write-fence-tokens",
+      "database/read-repair-reconciliation-after-failover"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/failover-promotion-read-divergence.md",
+    "revision_history": []
+  }
+}

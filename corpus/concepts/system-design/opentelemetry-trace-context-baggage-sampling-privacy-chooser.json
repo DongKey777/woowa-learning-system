@@ -1,0 +1,60 @@
+{
+  "id": "system-design/opentelemetry-trace-context-baggage-sampling-privacy-chooser",
+  "title": "OpenTelemetry Trace Context, Baggage, Sampling, and Privacy Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# OpenTelemetry Trace Context, Baggage, Sampling, and Privacy Chooser\n\n> 한 줄 요약: OpenTelemetry context propagation은 \"요청 ID 하나를 넘기는 일\"이 아니라, **trace 식별자(traceparent), vendor 상태(tracestate), cross-service key-value(baggage), sampling 결정을 서로 다른 책임으로 나누는 설계**다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Tracing Sampling Head Tail Exemplar Chooser](./tracing-sampling-head-tail-exemplar-chooser.md)\n- [Observability Logs Metrics Traces Interview Chooser](./observability-logs-metrics-traces-interview-chooser.md)\n- [X-Request-ID Gateway App Log Trace Beginner Bridge](../network/x-request-id-gateway-app-log-trace-beginner-bridge.md)\n- [Browser DevTools Traceparent vs Tracestate Mini Card](../network/browser-devtools-traceparent-vs-tracestate-mini-card.md)\n\nretrieval-anchor-keywords: OpenTelemetry, W3C trace context, traceparent, tracestate, baggage, context propagation, head sampling, tail sampling, privacy, cardinality, X-Request-ID\n\n## 먼저 나눌 세 header\n\n분산 추적에서 여러 서비스가 같은 요청을 하나의 trace로 묶으려면 context를 전파해야 한다. 하지만 모든 header가 같은 의미는 아니다.\n\n| 항목 | 주된 책임 |\n|---|---|\n| `traceparent` | trace id, parent span id, trace flags를 표준 형식으로 전달 |\n| `tracestate` | vendor별 추가 trace state를 제한된 형식으로 전달 |\n| `baggage` | 서비스 경계를 넘어 전달할 application-level key-value |\n\n`X-Request-ID`는 운영상 여전히 유용할 수 있지만, W3C trace context와 같은 표준 trace graph 정보를 모두 담지는 않는다.\n\n## 10초 chooser\n\n| 질문 신호 | 먼저 볼 개념 | 이유 |\n|---|---|---|\n| 이 요청이 어느 trace에 속하는가 | `traceparent` | trace id와 parent span이 핵심이다 |\n| vendor-specific sampling/debug state가 필요하다 | `tracestate` | trace system 내부 상태 전달용이다 |\n| tenant id 같은 작은 context를 모든 service로 전달하고 싶다 | `baggage` | application key-value propagation이다 |\n| 로그에서 요청 단위 검색만 필요하다 | X-Request-ID | 간단한 correlation에는 충분할 수 있다 |\n| 장애 요청만 나중에 trace로 남기고 싶다 | tail sampling | 결과를 보고 sampling 결정한다 |\n| edge에서 빠르게 sampling 비용을 제한한다 | head sampling | 초기에 결정해 비용을 줄인다 |\n\n중요한 경계: baggage는 trace 식별자가 아니다. traceparent를 대체하지 않는다.\n\n## traceparent는 correlation의 뼈대다\n\n`traceparent`는 서비스 간에 trace의 기본 신원을 전달한다.\n\n일반적으로 포함하는 축은:\n\n- version\n- trace id\n- parent span id\n- trace flags\n\n서비스 B가 서비스 A의 요청을 받으면, 전달된 trace id를 이어받아 새 span을 만들고 parent-child 관계를 구성한다.\n\n따라서 traceparent가 끊기면 distributed trace graph가 끊긴다. 로그에 request id가 남아 있어도 trace UI에서 parent-child span이 이어지지 않을 수 있다.\n\n## tracestate는 아무 데이터나 넣는 곳이 아니다\n\n`tracestate`는 vendor나 tracing system이 필요한 추가 상태를 전달하는 공간이다. 예를 들어 sampling 관련 내부 상태나 vendor-specific routing 정보가 들어갈 수 있다.\n\n하지만 이것을 application context 저장소처럼 쓰면 안 된다.\n\n- header 크기 제한이 있다.\n- key ordering/format 제약이 있다.\n- 여러 vendor가 함께 쓰는 환경에서 충돌이 날 수 있다.\n- 민감 정보 저장소가 아니다.\n\napplication-level 값은 필요하면 baggage를 검토하되, 그 역시 엄격히 제한해야 한다.\n\n## baggage는 강력하지만 위험하다\n\nbaggage는 service boundary를 넘어 key-value를 전파한다. 예를 들어 다음처럼 \"관찰에 필요한 작은 분류값\"을 전달할 수 있다.\n\n```text\ntenant_tier=free\nexperiment=checkout-v2\n```\n\n그러나 baggage는 매우 조심해야 한다.\n\n| 위험 | 설명 |\n|---|---|\n| privacy | email, token, phone 같은 PII/secret이 여러 서비스와 로그로 퍼질 수 있다 |\n| cardinality | user id처럼 고유값이 metric label로 흘러가면 비용과 성능이 터진다 |\n| trust boundary | 외부 client가 보낸 값을 내부 정책에 그대로 쓰면 안 된다 |\n| header bloat | 모든 downstream 요청에 붙어 network와 proxy limit에 영향을 준다 |\n\n원칙은 \"low-cardinality, non-sensitive, bounded key만 allowlist\"다. baggage를 넣기 전에 그 값이 log, metric, trace backend에 저장되어도 되는지 먼저 묻는다.\n\n## sampling과 context propagation은 분리한다\n\ntrace context를 전파하는 것과 trace를 저장하는 것은 다르다.\n\nsampling이 되지 않은 요청도 trace id를 계속 전파하면, 로그와 metric exemplar에서 correlation이 가능해진다.\n\n| 방식 | 결정 시점 | 장점 | 비용 |\n|---|---|---|---|\n| head sampling | 요청 초반 | agent/export 비용을 빨리 줄임 | 나중에 에러가 난 요청을 놓칠 수 있음 |\n| tail sampling | collector가 trace 결과를 본 뒤 | 에러/느린 요청을 더 잘 보존 | buffer와 collector 비용이 큼 |\n\n실무에서는 전체 트래픽 head sample + error/slow trace tail policy + logs/metrics correlation을 조합하는 경우가 많다.\n\n## trace가 없을 때의 방어 설계\n\nsampling 때문에 특정 요청의 full trace가 없을 수 있다. 이것을 장애라고만 보면 안 된다. 설계상 가능한 상태다.\n\n그래서 다음 연결고리를 남긴다.\n\n- access log에 trace id 또는 request id\n- application log에 trace id/span id MDC\n- metric exemplar에 trace id 연결\n- error event에 trace id와 request id 포함\n- sampling policy 변경 이력\n\n이렇게 해두면 full trace가 없어도 logs와 metrics로 사건을 따라갈 수 있고, 다음 배포에서 sampling rule을 조정할 근거가 생긴다.\n\n## privacy guardrail\n\nOpenTelemetry를 붙이면 데이터가 여러 backend로 흐른다. 수집 자체가 observability data pipeline이므로 개인정보/보안 기준을 함께 잡아야 한다.\n\n권장 guardrail:\n\n1. baggage key allowlist를 둔다.\n2. PII/secret은 baggage와 span attribute에서 금지한다.\n3. user id가 필요하면 hash/pseudonymization과 retention 정책을 별도로 검토한다.\n4. high-cardinality value를 metric label로 승격하지 않는다.\n5. 외부 inbound baggage는 신뢰하지 말고 sanitize한다.\n6. sampling 전후에 어떤 데이터가 저장되는지 문서화한다.\n\n추적이 잘 되는 시스템과 데이터가 과도하게 새는 시스템은 종이 한 장 차이다.\n\n## 흔한 실수\n\n| 실수 | 교정 |\n|---|---|\n| `traceparent`와 `baggage`를 같은 요청 ID로 본다 | trace identity와 application context는 다르다 |\n| baggage에 user email을 넣는다 | PII 전파와 저장 문제가 생긴다 |\n| sampling off면 context도 전파하지 않는다 | 저장은 안 해도 correlation id는 유지할 수 있다 |\n| X-Request-ID만 있으면 tracing이 끝났다고 본다 | parent-child span graph는 별도다 |\n| tail sampling만 켜면 비용 문제가 사라진다 | collector buffer와 decision latency 비용이 생긴다 |\n\n## 검증 질문\n\n1. `traceparent`, `tracestate`, `baggage`의 책임을 한 문장씩 나눌 수 있는가?\n2. baggage에 high-cardinality나 PII를 넣으면 어떤 운영 문제가 생기는가?\n3. head sampling과 tail sampling은 각각 어느 지점에서 결정을 내리는가?\n4. trace가 저장되지 않은 요청을 logs/metrics와 연결하려면 무엇을 남겨야 하는가?\n5. X-Request-ID와 W3C trace context를 같이 둘 때 역할을 어떻게 나눌 수 있는가?\n\n## 안전한 다음 문서\n\n- sampling 선택은 [Tracing Sampling Head Tail Exemplar Chooser](./tracing-sampling-head-tail-exemplar-chooser.md)\n- logs/metrics/traces 역할 분리는 [Observability Logs Metrics Traces Interview Chooser](./observability-logs-metrics-traces-interview-chooser.md)\n- header-level trace context는 [Browser DevTools Traceparent vs Tracestate Mini Card](../network/browser-devtools-traceparent-vs-tracestate-mini-card.md)\n\n좋은 OTel 설계는 trace를 많이 남기는 설계가 아니라, 어떤 context를 전파하고 어떤 데이터를 저장하지 않을지까지 정한 설계다.\n",
+  "aliases": [
+    "OpenTelemetry trace context",
+    "W3C trace context",
+    "traceparent",
+    "tracestate",
+    "baggage header",
+    "distributed tracing baggage",
+    "trace sampling privacy",
+    "observability context propagation",
+    "OTel baggage",
+    "추적 컨텍스트 전파"
+  ],
+  "expected_queries": [
+    "OpenTelemetry에서 traceparent, tracestate, baggage는 각각 무엇을 전파하는지 비교해줘",
+    "baggage header에 사용자 정보를 넣으면 왜 privacy와 cardinality 문제가 생겨?",
+    "head sampling과 tail sampling을 OTel collector 기준으로 어떻게 선택해야 해?",
+    "trace가 sampling돼서 없을 때 logs metrics와 correlation을 어떻게 설계해야 해?",
+    "X-Request-ID와 W3C trace context를 같이 쓸 때 어떤 책임을 나눠야 해?"
+  ],
+  "symptoms": [
+    "traceparent와 baggage를 모두 correlation id처럼 취급한다",
+    "baggage에 user email이나 token 같은 민감 정보를 넣어도 된다고 생각한다",
+    "head sampling과 tail sampling이 어느 지점에서 결정을 내리는지 설명하지 못한다",
+    "sampling 때문에 특정 장애 요청의 trace가 없을 때 로그/메트릭과 연결하는 방법을 모른다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/tracing-sampling-head-tail-exemplar-chooser",
+      "system-design/observability-logs-metrics-traces-interview-chooser",
+      "network/x-request-id-gateway-app-log-trace-beginner-bridge"
+    ],
+    "next_docs": [
+      "network/browser-devtools-traceparent-vs-tracestate-mini-card",
+      "system-design/red-use-metrics-observability-chooser",
+      "software-engineering/logging-strategy-level-context-correlation-intermediate-bridge"
+    ],
+    "confusable_with": [
+      "system-design/tracing-sampling-head-tail-exemplar-chooser",
+      "network/browser-devtools-traceparent-vs-tracestate-mini-card",
+      "network/x-request-id-gateway-app-log-trace-beginner-bridge",
+      "system-design/observability-logs-metrics-traces-interview-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/opentelemetry-trace-context-baggage-sampling-privacy-chooser.md",
+    "revision_history": []
+  }
+}

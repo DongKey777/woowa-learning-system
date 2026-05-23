@@ -1,0 +1,49 @@
+{
+  "id": "system-design/backup-restore-disaster-recovery-drill-design",
+  "title": "Backup, Restore, Disaster Recovery Drill 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Backup, Restore, Disaster Recovery Drill 설계를 다루는 playbook 문서다. 백업과 복구 설계는 데이터를 저장하는 것보다, 원하는 시점과 우선순위로 실제 복원이 가능한지 반복적으로 검증하는 운영 복구 시스템이다. 검색 질의가 backup restore, disaster recovery, point in time recovery, snapshot backup처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Backup, Restore, Disaster Recovery Drill 설계\n\n> 한 줄 요약: 백업과 복구 설계는 데이터를 저장하는 것보다, 원하는 시점과 우선순위로 실제 복원이 가능한지 반복적으로 검증하는 운영 복구 시스템이다.\n\nretrieval-anchor-keywords: backup restore, disaster recovery, point in time recovery, snapshot backup, wal shipping, restore drill, rpo rto, backup catalog, immutable backup, integrity verification, cross-region vault, resilience validation\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Audit Evidence Vault 설계](./audit-evidence-vault-design.md)\n> - [Object Metadata Service 설계](./object-metadata-service-design.md)\n> - [File Storage / Presigned URL / CDN 설계](./file-storage-presigned-url-cdn-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Service Discovery / Health Routing 설계](./service-discovery-health-routing-design.md)\n> - [Failure Injection / Resilience Validation Platform 설계](./failure-injection-resilience-validation-platform-design.md)\n\n## 핵심 개념\n\n백업은 \"복사본이 있다\"는 사실만으로는 의미가 약하다.\n실전에서 중요한 질문은 다음이다.\n\n- 언제 시점으로 복구할 수 있는가\n- 복구에 얼마나 걸리는가\n- 어떤 시스템부터 우선 복구할 것인가\n- control plane이 망가져도 복구를 시작할 수 있는가\n- 백업이 실제로 깨지지 않았는가\n\n즉, DR은 저장 정책이 아니라 **복원 경로와 연습 절차를 가진 운영 시스템**이다.\n\n## 깊이 들어가기\n\n### 1. Failover와 restore는 다르다\n\n많은 팀이 멀티 리전 failover를 가지고 있으면 DR이 끝났다고 생각한다.\n하지만 둘은 다르다.\n\n- **failover**: 이미 준비된 다른 리전으로 트래픽을 넘긴다\n- **restore**: 손상되거나 삭제된 데이터를 특정 시점으로 되살린다\n\n리전은 살아 있지만 논리적 삭제나 잘못된 배치가 전체에 복제되면, failover만으로는 해결되지 않는다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 운영 DB 20 TB\n- 하루 변경량 800 GB\n- object storage 200 TB\n- RPO 15분\n- 핵심 서비스 RTO 60분\n\n이때 봐야 할 숫자:\n\n- snapshot 생성 주기\n- incremental log 보관량\n- restore throughput\n- cross-region copy 지연\n- drill 성공률\n- integrity verification 시간\n\n복구 설계는 저장 비용보다 restore 속도와 검증 시간이 병목이 되는 경우가 많다.\n\n### 3. 백업 계층과 카탈로그\n\n보통 복구 가능한 시스템은 다음 계층을 가진다.\n\n- full snapshot\n- incremental log 또는 change stream\n- backup catalog\n- checksum / manifest\n- key material reference\n\ncatalog가 없으면 \"어떤 백업이 어떤 시점과 어떤 스키마에 대응하는가\"를 알 수 없다.\n즉, 백업 파일보다 메타데이터 관리가 더 중요할 수 있다.\n\n### 4. Immutable backup과 격리된 신뢰 경계\n\n랜섬웨어나 운영자 실수는 production credential을 이미 가진 상태에서 발생할 수 있다.\n그래서 다음 원칙이 중요하다.\n\n- backup vault는 production 계정과 분리한다\n- delete는 time lock 또는 별도 승인 경로를 둔다\n- encryption key와 data catalog를 같은 계정에 두지 않는다\n- backup 읽기와 restore 실행 권한을 분리한다\n\n복구 체계 자체가 production과 같은 blast radius 안에 있으면 위기 때 같이 망가진다.\n\n### 5. 복구는 순서가 핵심이다\n\n모든 시스템을 동시에 복원하려고 하면 길을 잃는다.\n보통은 다음 순서를 정한다.\n\n1. identity와 secrets\n2. control plane 메타데이터\n3. 핵심 transaction store\n4. derived index와 cache\n5. 비핵심 분석 시스템\n\n검색 인덱스나 캐시는 다시 만들 수 있지만, 원장과 계정 데이터는 그렇지 않다.\n\n### 6. Drill은 게임데이가 아니라 정기 검증이다\n\n백업이 있어도 restore를 한 번도 안 해 보면 의미가 없다.\n권장 drill 항목:\n\n- 무작위 시점 PITR 복원\n- 샘플 row checksum 비교\n- 서비스 부팅 가능 여부\n- 애플리케이션 smoke test\n- 운영자가 실제 runbook대로 복구 가능한지 확인\n\n핵심은 \"복구 스크립트가 있다\"가 아니라 \"반복 가능한가\"다.\n\n### 7. 복원 후 정합성 검증\n\nrestore가 끝나도 바로 트래픽을 붙이면 위험하다.\n\n검증 항목:\n\n- row count와 checksum\n- 핵심 도메인 invariant\n- CDC/queue lag 초기화 상태\n- service discovery / routing 재등록 여부\n- 최근 이벤트 재적용 범위\n\n특히 derived system은 원본을 restore한 뒤 다시 backfill할지, 복제 로그를 재적용할지 판단해야 한다.\n\n### 8. 증상 -> 원인 -> 트레이드오프 -> 다음 확인\n\n복구 상황에서는 \"백업이 있다\"보다 \"어떤 시점으로, 어떤 순서로, 검증 가능한가\"가 중요하다.\n\n| 증상 | 가능한 원인 | 선택 트레이드오프 | 다음 확인 |\n|---|---|---|---|\n| PITR 후보가 여러 개라 어느 시점인지 불명확 | 오염 시작 시각 불명확, delayed detection | 이른 시점은 데이터 손실이 크고 늦은 시점은 오염이 남을 수 있다 | audit log, bad batch window, checksum diff |\n| restore 속도가 RTO를 넘긴다 | snapshot 크기, cross-region copy 지연, verification 병목 | 부분 복구는 빠르지만 전체 기능을 바로 살리지는 못한다 | restore throughput, priority dataset, dependency boot order |\n| backup catalog는 있지만 key material이 없다 | secrets/control plane도 같이 손상 | key 복구를 우선하면 시간이 늘지만 데이터만 복원해도 읽을 수 없다 | KMS/key escrow 상태, break-glass 권한 |\n| replica failover 후에도 데이터가 이상하다 | 논리 삭제나 오염이 replica에 복제됨 | failover는 빠르지만 corruption recovery는 별도 restore가 필요하다 | corruption propagation time, clean backup availability |\n| restore 후 derived index가 맞지 않는다 | source와 index 시점 불일치, CDC gap | index restore는 빠르지만 원본과 어긋날 수 있고 rebuild는 느리다 | source checkpoint, CDC offset, index checksum |\n\noverclaim guard:\n\n- cross-region replica는 백업 대체물이 아니다. 논리 손상, 잘못된 배치, 권한 탈취는 replica에도 전파될 수 있다.\n- restore 완료는 서비스 정상화와 다르다. domain invariant, 권한, queue/CDC offset, 외부 callback 중복 처리까지 확인해야 한다.\n- drill 성공은 다음 장애의 성공 보장이 아니라 현재 runbook과 병목을 검증한 증거다. 데이터 크기, schema, 의존성이 바뀌면 다시 측정해야 한다.\n- RPO/RTO는 선언값이 아니라 최근 drill에서 측정된 값이어야 한다. backup size, restore bandwidth, key 복구 절차가 바뀌면 숫자도 다시 잰다.\n\n## 실전 시나리오\n\n### 시나리오 1: 운영 배치가 잘못되어 대량 논리 삭제 발생\n\n문제:\n\n- 삭제가 정상 트랜잭션으로 commit되어 다른 리전에도 복제된다\n\n해결:\n\n- 오염 시점을 기준으로 PITR restore 후보를 만든다\n- 격리된 복구 환경에서 차이를 비교한다\n- 필요한 엔티티만 선택 복구하거나 보정 이벤트를 발행한다\n\n### 시나리오 2: 랜섬웨어로 production control plane 손상\n\n문제:\n\n- 운영 계정과 메타데이터가 동시에 망가졌다\n\n해결:\n\n- 분리된 backup vault와 catalog에서 restore를 시작한다\n- service discovery와 secrets를 먼저 복구한다\n- production credential과 독립된 break-glass 절차를 사용한다\n\n### 시나리오 3: 리전 손실 후 핵심 DB 복원\n\n문제:\n\n- active-active가 아니거나 일부 데이터는 single-writer였다\n\n해결:\n\n- 핵심 DB를 우선 restore한다\n- derived index와 cache는 늦게 재구축한다\n- external callback과 webhook은 replay-safe하게 재연결한다\n\n## 코드로 보기\n\n```pseudo\nfunction restore(request):\n  backup = catalog.resolveChainAtOrBefore(request.targetTime)\n  env = isolatedEnvironment.create()\n  restoreSnapshot(env, backup.snapshot)\n  applyLogs(env, backup.logsUntil(request.targetTime))\n  verifyChecksums(env)\n  if request.promote and verificationPassed() and reconciliationPlanReady():\n    cutoverTraffic(env)\n```\n\n```java\npublic RestorePlan plan(Instant targetTime) {\n    BackupChain chain = backupCatalog.resolve(targetTime);\n    return restorePlanner.build(chain);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Snapshot only | 단순하다 | RPO가 커진다 | 중요도가 낮은 시스템 |\n| Snapshot + log shipping | PITR이 가능하다 | 운영 복잡도 증가 | 핵심 DB |\n| Cross-region replica | failover가 빠르다 | 논리 손상이 같이 복제될 수 있다 | 고가용성 우선 |\n| Immutable backup vault | 안전하다 | 접근 절차가 느려질 수 있다 | 높은 보안 요구 |\n| Frequent restore drill | 신뢰도가 높다 | 시간과 비용이 든다 | 중요한 프로덕션 |\n\n핵심은 백업이 저장 정책이 아니라 **복원 가능한 상태를 지속적으로 증명하는 운영 계약**이라는 점이다.\n\n## 꼬리질문\n\n> Q: 멀티 리전 replica가 있으면 백업이 덜 중요하지 않나요?\n> 의도: 가용성과 복구 차이 이해 확인\n> 핵심: 논리 손상과 운영 실수는 replica에도 복제될 수 있어 별도 backup이 여전히 필요하다.\n\n> Q: RPO와 RTO 중 무엇이 더 중요한가요?\n> 의도: 복구 목표 수립 감각 확인\n> 핵심: 둘 다 중요하지만 도메인마다 허용 손실량과 허용 중단 시간이 다르므로 함께 숫자로 정해야 한다.\n\n> Q: derived index를 같이 restore해야 하나요?\n> 의도: source-of-truth 우선순위 이해 확인\n> 핵심: 보통 원본 저장소 복구가 먼저이고, derived system은 재구축으로 대체할 수 있다.\n\n> Q: restore drill은 왜 production과 닮은 격리 환경이 필요한가요?\n> 의도: runbook 검증의 현실성 이해 확인\n> 핵심: 실제 의존성과 성능 병목이 드러나야 drill 결과가 믿을 만하다.\n\n## 한 줄 정리\n\nBackup, restore, disaster recovery drill 설계는 백업 파일을 쌓는 것이 아니라, 원하는 시점과 우선순위로 실제 복원이 가능한지 반복 검증하는 운영 복구 체계를 만드는 일이다.\n",
+  "aliases": [
+    "backup restore",
+    "disaster recovery",
+    "point in time recovery",
+    "snapshot backup",
+    "wal shipping",
+    "restore drill",
+    "rpo rto",
+    "backup catalog",
+    "immutable backup",
+    "integrity verification",
+    "cross-region vault",
+    "resilience validation"
+  ],
+  "expected_queries": [
+    "Backup, Restore, Disaster Recovery Drill 설계 장애 대응 순서를 알려줘",
+    "backup restore 복구 설계 체크리스트가 뭐야?",
+    "Backup, Restore, Disaster Recovery Drill 설계에서 blast radius를 어떻게 제한해?",
+    "backup restore 운영 리스크를 줄이는 방법은?"
+  ],
+  "symptoms": [
+    "Backup, Restore, Disaster Recovery Drill 설계 관련 장애나 마이그레이션 리스크가 발생해 단계별 대응이 필요하다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/backup-restore-disaster-recovery-drill-design.md",
+    "revision_history": []
+  }
+}

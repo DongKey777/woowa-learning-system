@@ -1,0 +1,53 @@
+{
+  "id": "database/connection-pool-starvation-symptom-router",
+  "title": "Connection pool 고갈 — 누수 / 긴 트랜잭션 / N+1 / 풀 사이즈 어디에 원인이 있나",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 문서는 database 카테고리에서 Connection pool 고갈 — 누수 / 긴 트랜잭션 / N+1 / 풀 사이즈 어디에 원인이 있나를 다루는 symptom_router 문서다. connection pool 고갈, HikariCP timeout, DB connection leak, 커넥션 풀 부족, pool exhausted symptom 같은 lexical 표현과 HikariCP timed out 에러가 나는데 원인을 어떻게 찾아?, connection pool이 고갈되는 진짜 원인을 어떻게 진단해? 같은 자연어 질문을 같은 개념으로 묶어, 학습자가 증상, 비교, 설계 판단, 코드리뷰 맥락 중 어디에서 들어오더라도 본문의 핵심 분기와 다음 문서로 안정적으로 이어지게 한다.",
+  "body_markdown": "# Connection pool 고갈 — 누수 / 긴 트랜잭션 / N+1 / 풀 사이즈 어디에 원인이 있나\n\n> 한 줄 요약: *\"Connection is not available\"* 메시지는 *원인이 아니라 증상*이다. 풀 사이즈 자체보다 *커넥션이 너무 오래 잡혀 있다는 사실*이 먼저고, 그 이유는 (1) leak 미반환, (2) 트랜잭션이 외부 호출로 길어짐, (3) N+1로 한 요청이 100개를 빌림, (4) 진짜로 풀이 작음 — 순서대로 진단한다.\n\n**난이도: 🟡 Intermediate**\n\n**증상 분기**: connection pool / HikariCP\n\n관련 문서:\n\n- [Connection Pool 기초](./connection-pool-basics.md) — 일반 개념\n- [HikariCP 튜닝](./hikari-connection-pool-tuning.md) — 파라미터 디테일\n- [Transaction + Locking + Connection Pool Primer](./transaction-locking-connection-pool-primer.md) — 세 가지가 얽힌 모양\n\n## 어떤 증상에서 이 문서를 펴는가\n\n학습자/주니어가 다음 중 하나를 본다:\n\n- *\"HikariPool-1 - Connection is not available, request timed out after 30000ms\"* (가장 흔함)\n- *\"평소엔 100ms이던 API가 트래픽 살짝 늘면 30초로 폭주.\"* — *latency cliff*\n- *\"DB CPU는 5%, 앱 CPU도 낮은데 응답은 안 옴.\"*\n\n세 증상 모두 *pool exhaustion*의 동일한 모양 — *커넥션을 빌리려는 요청이 풀에서 대기*하고 있다.\n\n본능적으로 *\"풀 사이즈를 20에서 50으로\"* 늘리려는 충동이 든다. 하지만 *진짜 원인*이 풀 사이즈인 경우는 드물다. 진단 순서대로 좁힌다.\n\n## 원인 분기 (확률 높은 순)\n\n### 분기 1 — Connection Leak (커넥션 미반환)\n\n가장 자주 발생한다. JdbcTemplate/JPA 사용 시는 잘 안 일어나지만, *직접 Connection을 들고 다니는 코드*가 있으면 위험.\n\n```java\npublic List<Item> findItems() {\n    Connection conn = dataSource.getConnection();   // ❌ try-with-resources 없음\n    PreparedStatement ps = conn.prepareStatement(...);\n    ResultSet rs = ps.executeQuery();\n    // ... 예외 발생 시 conn.close() 호출 안 됨\n}\n```\n\n**진단**:\n\n- HikariCP `leakDetectionThreshold` 옵션을 *활성화* (예: 10초)\n- 누수 발생 시 *스택 트레이스가 로그*에 찍힌다 (*\"Connection leak detection triggered\"*)\n\n**해결**:\n\n- *try-with-resources* 또는 *JdbcTemplate/JPA*로 마이그레이션\n- 직접 빌리는 코드는 *반환 책임을 명시*\n\n### 분기 2 — 트랜잭션이 외부 I/O를 포함\n\n```java\n@Transactional\npublic void create(...) {\n    repository.save(...);                       // 커넥션 빌림 (트랜잭션 시작)\n    httpClient.notify(externalApi);             // ❌ 외부 호출 (수 초)\n    auditService.log(...);\n}\n```\n\n`@Transactional`은 보통 *첫 DB 접근 시점부터 커밋까지* 같은 커넥션을 잡는다. 안에서 *외부 HTTP 호출*이 있으면 *그 호출 시간만큼* 커넥션이 묶인다. 외부 API가 1초 걸리면 *1 RPS = 1 커넥션 전속*에 가까운 병목이 생길 수 있다.\n\n**진단**:\n\n- 느린 요청의 *스택 트레이스 샘플링* — `RestTemplate.execute` / `WebClient.block` 같은 외부 I/O가 트랜잭션 안에 있는지\n- DB 쿼리 시간 vs 메소드 실행 시간 *gap*이 큰지\n\n**해결**:\n\n- 외부 호출은 *트랜잭션 밖*으로 (`@TransactionalEventListener(AFTER_COMMIT)` 또는 큐 발행)\n- *짧은 트랜잭션 → 외부 호출 → 짧은 트랜잭션* 분리\n\n### 분기 3 — N+1 쿼리\n\n한 요청이 *N+1 쿼리*를 날리면 요청당 DB round trip이 크게 늘어난다. 트랜잭션 밖 auto-commit 경로라면 쿼리마다 커넥션 borrow/return이 반복될 수 있고, `@Transactional` 안이라면 같은 커넥션을 오래 점유한다. 둘 다 풀 작은 환경에서는 *경합*을 키운다.\n\n```java\nList<Order> orders = orderRepository.findAll();        // 1 쿼리\nfor (Order o : orders) {\n    o.getItems().size();                                // N 쿼리 (lazy)\n}\n```\n\n**진단**:\n\n- 쿼리 로깅 활성화 (`logging.level.org.hibernate.SQL=DEBUG`)\n- 한 요청에 *예상보다 많은* SELECT 발행 여부\n\n**해결**:\n\n- *fetch join* 또는 *@EntityGraph*\n- *batch fetch size* 설정\n- DTO projection으로 *필요한 컬럼만*\n\n### 분기 4 — DB Lock 대기로 트랜잭션이 길어짐\n\n다른 트랜잭션이 *같은 row를 잡고 있어* 내가 락 대기 중일 수 있다. 락 대기 = *커넥션은 잡혀있고 DB는 일을 안 함*.\n\n**진단**:\n\n- DB 측 `SHOW PROCESSLIST` (MySQL) 또는 `pg_stat_activity` (Postgres)에서 *waiting* 상태 트랜잭션\n- *lock_wait_timeout* 발생 빈도\n\n**해결**:\n\n- 트랜잭션 *짧게* + 락 대상을 *마지막에* 만지기\n- 인덱스 최적화 (full table scan으로 lock 범위 폭발 방지)\n\n### 분기 5 — 진짜 풀 사이즈 부족\n\n위 4분기를 모두 점검해 *문제 없음*이면 그제야 풀 사이즈를 본다. 일반 가이드:\n\n```\npool_size = (CPU 코어 수 * 2) + 디스크 수\n```\n\n(HikariCP 권장식, *대부분 10~30 사이*에 들어옴)\n\n100개로 늘려도 *DB 측이 동시 100개 처리 가능*해야 의미 있다. *DB 한도*가 50이면 앱 풀 100은 *경합을 DB로 옮길 뿐*.\n\n**해결**:\n\n- *DB max_connections*와 *앱 풀 합계*를 함께 본다\n- 여러 앱 인스턴스의 *합산 풀*이 DB 한도를 안 넘는지\n\n## observation -> branch -> next check\n\n| observation | branch | next check |\n|---|---|---|\n| `active`가 `maximumPoolSize`에 붙고 `idle=0`, `pending`이 계속 쌓인다 | pool starvation confirmed | connection borrow time, active connection age, longest transaction을 같은 시간축으로 본다 |\n| `leakDetectionThreshold` stack trace가 같은 코드 지점을 가리킨다 | connection leak | 직접 `DataSource.getConnection()` 사용, 예외 경로, stream/cursor close 누락을 확인한다 |\n| SQL 시간은 짧은데 service method 전체 시간이 길다 | transaction holds connection during non-DB work | `@Transactional` 내부 외부 HTTP, 파일 I/O, 메시지 발행, 긴 계산을 밖으로 뺀다 |\n| pool timeout 직전에 lock wait/deadlock 로그가 먼저 나온다 | DB lock wait causes pool exhaustion | pool을 늘리기 전에 blocker row/key와 transaction 범위를 줄인다 |\n| 한 endpoint에서 query count가 요청당 수십~수백 개로 튄다 | N+1 or chatty DAO | Hibernate statistics, SQL log, DTO projection/fetch join/batch size로 요청당 borrow 횟수를 줄인다 |\n| 모든 connection이 짧게 반환되는데 RPS 증가와 함께 pending만 선형 증가한다 | true capacity sizing | Little's Law로 필요한 동시 DB 작업 수를 계산하고 DB max connection, app instance 수를 함께 맞춘다 |\n\n## 분기 체크리스트\n\n- [ ] HikariCP `leakDetectionThreshold` 로그에 *leak 스택 트레이스*가 있는가? (있으면 분기 1)\n- [ ] 트랜잭션 안에 *외부 I/O*가 있는가? (있으면 분기 2)\n- [ ] 한 요청에 *N+1 쿼리*가 발생하는가? (Hibernate 로그) (있으면 분기 3)\n- [ ] DB 측에 *락 대기 트랜잭션*이 자주 보이는가? (있으면 분기 4)\n- [ ] 위 모두 아니고 *RPS 실측치 / 평균 응답시간*으로 *최소 풀 사이즈*를 계산했는가? (분기 5)\n\n## 흔한 함정\n\n### 함정 — *풀 사이즈만 늘려서 해결*\n\n분기 1~4 중 하나가 살아있으면 *풀을 늘려도 시간문제*. 단지 *고갈 시점이 늦춰질 뿐*. 더 나쁘게는 DB 측 부담이 늘어 *전체 시스템*이 더 흔들린다.\n\n### 함정 — Pool 사이즈 = max threads\n\n서블릿 컨테이너 thread 수와 풀 사이즈를 *같게* 설정하면 *모든 thread가 커넥션 대기 가능*. 일부 thread가 *커넥션 없이 동작 가능한 작업*을 처리하도록 분리해 두는 게 안전.\n\n## 다음 문서\n\n- 더 큰 그림: [Connection Pool 기초](./connection-pool-basics.md)\n- HikariCP 파라미터 튜닝: [HikariCP Tuning](./hikari-connection-pool-tuning.md)\n- 트랜잭션 + 락 + 풀이 얽힌 모양: [Transaction + Locking + Pool Primer](./transaction-locking-connection-pool-primer.md)\n- Pool 메트릭과 Lock 대기의 분기: [Pool Metrics + Lock Wait Timeout Mini Bridge](./pool-metrics-lock-wait-timeout-mini-bridge.md)\n",
+  "aliases": [
+    "connection pool 고갈",
+    "HikariCP timeout",
+    "DB connection leak",
+    "커넥션 풀 부족",
+    "pool exhausted symptom",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "HikariCP timed out 에러가 나는데 원인을 어떻게 찾아?",
+    "connection pool이 고갈되는 진짜 원인을 어떻게 진단해?",
+    "커넥션 풀 사이즈를 늘리면 해결되는 거야?",
+    "pool exhausted가 떴는데 어디부터 봐야 해?"
+  ],
+  "symptoms": [
+    "HikariPool: Connection is not available, request timed out after 30000ms 에러가 반복된다",
+    "평소엔 멀쩡하다가 트래픽이 늘면 응답 시간이 급격히 늘어난다",
+    "CPU/DB 부하는 낮은데 API 응답이 느려지고 timeout이 발생한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "database/connection-pool",
+      "database/hikari-connection-pool-tuning",
+      "database/transaction-locking-connection-pool-primer",
+      "database/pool-metrics-lock-wait-timeout-mini-bridge"
+    ],
+    "confusable_with": [
+      "database/connection-pool",
+      "database/hikari-connection-pool-tuning",
+      "database/transaction-locking-connection-pool-primer",
+      "operating-system/backend-api-latency-runtime-triage-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/connection-pool-starvation-symptom-router.md",
+    "revision_history": []
+  }
+}

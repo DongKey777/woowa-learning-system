@@ -1,0 +1,45 @@
+{
+  "id": "database/explain-execution-plan-interview-drill",
+  "title": "Explain Execution Plan Interview Drill",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 drill은 EXPLAIN 실행 계획을 면접 답변으로 읽는 연습 문서다. access type, key, rows, extra, 실제 SQL 검증을 다룬다.",
+  "body_markdown": "# Explain Execution Plan Interview Drill\n\n## 질문\n\n\"느린 SQL을 받으면 EXPLAIN에서 어떤 항목을 보나요?\"\n\n## 기대 답변 축\n\n- 실제 실행된 SQL과 bind parameter를 먼저 확인한다.\n- access type, possible_keys/key, rows estimate, filtered, Extra를 본다.\n- full scan이 항상 나쁜 것은 아니고, 작은 table이나 낮은 selectivity에서는 합리적일 수 있다.\n- `Using temporary`, `Using filesort`는 원인을 더 봐야 하며 무조건 장애 신호는 아니다.\n- 추정과 실제가 다르면 statistics, cardinality, query shape를 확인한다.\n\n## 보장 범위\n\n- EXPLAIN은 optimizer가 선택한 접근 경로와 비용 추정을 보여준다. 실제 응답 시간, lock wait, buffer cache 상태, 네트워크 지연까지 보장하지 않는다.\n- `key`가 채워졌다는 사실만으로 좋은 계획이라고 말할 수 없다. 선택한 index로 얼마나 많은 row를 읽는지, filtering 후 몇 row가 남는지, 정렬과 임시 테이블이 왜 필요한지를 같이 봐야 한다.\n- `rows`는 추정치다. 통계가 오래됐거나 data skew가 심하면 실제 row 수와 크게 다를 수 있다.\n- `EXPLAIN ANALYZE`나 실제 실행 metric이 가능하면 추정 계획과 실제 실행을 비교해야 한다. 면접에서는 \"plan만 보고 끝내지 않고 실제 SQL과 관측값으로 검증한다\"가 핵심이다.\n\n## DB별 caveat\n\n| DB/도구 | 보수적으로 읽을 점 | caveat |\n|---|---|---|\n| MySQL `EXPLAIN` | `type`, `possible_keys`, `key`, `rows`, `filtered`, `Extra`로 접근 경로와 추정 row 수를 본다 | `rows`와 `filtered`는 추정이다. `Using filesort`/`Using temporary`는 주의 신호지만 row 수, `LIMIT`, 메모리 spill, 대체 index 가능성을 봐야 한다 |\n| MySQL `EXPLAIN ANALYZE` | iterator별 실제 실행 시간/row를 더 볼 수 있다 | 실제로 실행하므로 쓰기 statement나 운영 데이터에서는 영향 범위를 조심한다 |\n| PostgreSQL `EXPLAIN` | scan 방식, join 알고리즘, cost, estimated rows/width를 본다 | cost 단위는 절대 시간이 아니라 planner의 상대 추정이다. bind 값, statistics, generic/custom plan에 따라 달라질 수 있다 |\n| PostgreSQL `EXPLAIN ANALYZE` | 실제 실행 시간과 actual rows를 보여 추정과 현실을 비교한다 | statement가 실제 실행된다. `INSERT/UPDATE/DELETE`는 `BEGIN; EXPLAIN ANALYZE ...; ROLLBACK;` 같은 안전한 경계가 필요하다 |\n\n실행 계획은 \"왜 이 쿼리가 이 경로로 읽을 가능성이 높은가\"를 말해 주는 증거다. \"왜 사용자 요청이 느렸는가\" 전체를 단독으로 증명하지는 않는다. lock wait, connection pool 대기, disk I/O, cache miss, network, application serialization은 별도 evidence가 필요하다.\n\n## Evidence로 확인할 것\n\n- 최종 SQL evidence: ORM이 실제로 보낸 SQL과 bind parameter.\n- plan evidence: access type/scan node, chosen index, estimated rows, filter 조건, sort/temp/hash/join node.\n- actual evidence: actual rows, loop count, execution time, buffers/temp spill, scanned rows, returned rows.\n- data evidence: table cardinality, status 분포, tenant skew, histogram/statistics 최신성.\n- runtime evidence: slow query log, lock wait/deadlock log, connection pool wait, p95/p99 latency, CPU/I/O metric.\n- regression evidence: index 추가 전후 다른 쿼리 plan이 나빠지지 않았는지.\n\n## 작은 시나리오\n\n관리자 예약 목록이 느리다.\n\n```sql\nSELECT *\nFROM reservation\nWHERE status = 'ACTIVE'\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n`EXPLAIN`에서 `key=idx_status`, `rows=800000`, `Extra=Using filesort`가 보였다면 \"index를 탔으니 완료\"가 아니다. `ACTIVE`가 대부분의 row라면 status index는 선택도가 낮고, 정렬을 위해 많은 row를 읽을 수 있다. 이때 evidence는 `(status, created_at)` 복합 index 후보, 실제 scanned rows, returned rows, `LIMIT` 적용 위치, sort spill 여부다. 반대로 table이 200 row라면 full scan이 합리적일 수 있다.\n\n## 운영 검증 순서\n\n1. ORM이 만든 최종 SQL과 bind parameter를 slow query log 또는 SQL logging으로 확인한다.\n2. 같은 bind 값으로 EXPLAIN을 보고 access type, key, rows, filtered, Extra를 읽는다.\n3. 가능하면 실제 실행 시간, scanned rows, returned rows, temporary table 사용량, sort spill 여부를 metric으로 확인한다.\n4. 추정과 실제가 다르면 statistics 갱신, histogram, cardinality, predicate 형태, function wrapping, implicit cast를 점검한다.\n5. index 추가 후에는 읽기 성능만 보지 않고 write cost, storage, 기존 plan 회귀를 같이 확인한다.\n\n## 잘못된 결론 guard\n\n| 신호 | 성급한 결론 | 더 봐야 할 것 |\n|---|---|---|\n| `type=ALL` | 항상 index 누락 | table 크기, selectivity, full scan이 더 싼지 |\n| `Using filesort` | 무조건 장애 | 정렬 row 수, limit, sort buffer, index order 대체 가능성 |\n| `key` 사용 | 최적화 완료 | rows estimate, filtered, covering 여부, 실제 scanned rows |\n| plan 변화 | DB가 이상함 | 통계 변경, bind 값 분포, schema/index 변경 이력 |\n\n## wrong-bucket / 오선택\n\n| wrong-bucket | 왜 위험한가 | 옮겨야 할 질문 |\n|---|---|---|\n| \"느리다 = index가 없다\" | lock wait, pool starvation, N+1, network, cache miss일 수 있다 | 실제 SQL 1개가 느린가, 호출 수가 많은가, 기다린 시간이 DB 실행 시간인가 |\n| \"`key`가 있으니 괜찮다\" | 낮은 선택도 index로 대량 scan할 수 있다 | chosen index가 몇 row를 읽고 몇 row를 버리는가 |\n| \"`Using filesort`면 무조건 나쁘다\" | 작은 결과나 `LIMIT`에는 충분히 싸고, index order 대체가 write cost를 키울 수 있다 | 정렬 대상 row 수와 spill 여부가 무엇인가 |\n| \"`type=ALL`이면 장애다\" | 작은 table, 통계상 full scan이 더 싼 table, covering 어려운 조건일 수 있다 | table 크기와 predicate selectivity가 어느 정도인가 |\n| \"EXPLAIN이 lock 문제를 증명한다\" | plan은 lock wait 시간을 직접 보여주지 않는다 | lock wait/deadlock evidence가 별도로 있는가 |\n\n## 검증 질문\n\n1. EXPLAIN에 넣은 SQL과 운영에서 느린 SQL의 bind 값이 같은가?\n2. estimated rows와 actual rows가 얼마나 차이 나는가?\n3. chosen index가 조건 필터와 정렬 순서를 모두 돕는가, 한쪽만 돕는가?\n4. `Using temporary`/`Using filesort`가 실제 temp spill이나 p95 지연으로 이어졌는가?\n5. index 추가가 write latency, storage, 다른 query plan에 미치는 비용을 확인했는가?\n6. 느린 시간이 DB execution인지 lock wait인지 connection pool wait인지 분리했는가?\n\n## 약점 태그\n\n- `key-only`: key 사용 여부만 보고 판단함\n- `estimate-blind`: rows estimate와 실제 결과 차이를 보지 않음\n- `extra-overreact`: filesort/temporary를 무조건 문제로 봄\n\n## 복습 연결\n\n기본 읽기는 `explain-execution-plan-reading-intermediate-primer`, Hibernate 검증은 `hibernate-sql-log-explain-lock-verification-primer`로 이어진다.\n",
+  "aliases": [
+    "EXPLAIN interview drill",
+    "execution plan answer practice",
+    "실행 계획 면접 답변",
+    "type all key rows 설명"
+  ],
+  "expected_queries": [
+    "EXPLAIN을 면접에서 어떻게 읽는다고 말해야 해?",
+    "쿼리가 느릴 때 실행 계획에서 무엇을 봐?",
+    "index를 탔는지 어떻게 확인해?"
+  ],
+  "symptoms": [
+    "EXPLAIN 결과에서 key만 보고 끝내요",
+    "rows estimate와 filtered를 해석하지 못해요",
+    "filesort와 temporary를 무조건 장애로 봐요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/explain-execution-plan-reading-intermediate-primer"
+    ],
+    "next_docs": [
+      "database/hibernate-sql-log-explain-lock-verification-primer"
+    ],
+    "confusable_with": [
+      "database/explain-execution-plan-reading-intermediate-primer",
+      "database/index-explain-mission-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/explain-execution-plan-interview-drill.md",
+    "revision_history": []
+  }
+}

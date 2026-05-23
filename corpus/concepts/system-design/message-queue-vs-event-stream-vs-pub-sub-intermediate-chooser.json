@@ -1,0 +1,60 @@
+{
+  "id": "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+  "title": "Message Queue vs Event Stream vs Pub-Sub — 어떤 메시징 모델을 고를까",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Message Queue vs Event Stream vs Pub-Sub — 어떤 메시징 모델을 고를까\n\n> 한 줄 요약: Queue = *한 메시지 한 consumer*(작업 분배), Stream = *영구 저장 + 다중 consumer*(이벤트 fan-out), Pub-Sub = *브로커 분리*(발행자/구독자 decouple). 셋은 모델이 다르다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n같은 \"메시징\"이라도 *메시지의 운명*이 다르다.\n\n```\n[Message Queue]\n  producer → queue → consumer 1     # 메시지 하나는 하나의 consumer만\n                  ↓\n                  consumer 2 (대기)\n  메시지 처리 후 삭제. consumer가 비어있으면 새 메시지 받아 처리.\n\n[Event Stream]\n  producer → topic ──┬──> consumer A (offset 100)\n                    ├──> consumer B (offset 50)\n                    └──> consumer C (offset 30)\n  메시지가 *영구 저장* (기간 설정). 각 consumer가 *자기 offset*으로 읽음.\n\n[Pub-Sub]\n  publisher → topic → subscriber A\n                   ├──> subscriber B\n                   └──> subscriber C\n  발행자가 *누가 구독하는지* 모름. 브로커가 분배.\n  보통 메시지 영구 저장 안 함 (real-time only).\n```\n\n## 한 장 정리\n\n| 항목 | Message Queue | Event Stream | Pub-Sub |\n|---|---|---|---|\n| 대표 시스템 | RabbitMQ, ActiveMQ, AWS SQS | Apache Kafka, AWS Kinesis | Redis Pub-Sub, AWS SNS |\n| 메시지 보존 | 처리 후 삭제 | 일정 기간 영구 저장 (재읽기 가능) | real-time만 (구독자 없으면 사라짐) |\n| 한 메시지의 consumer 수 | 1 (work queue) | N (각자 offset) | N (구독자) |\n| 순서 보장 | queue 단위 | partition 단위 | 없음 또는 보장 약함 |\n| 처리 모델 | 작업 분배 (load balancing) | 이벤트 fan-out + 재처리 | 즉시 알림 |\n| 적합 use case | 비동기 작업, 큰 워크로드 | 이벤트 소싱, CDC, 분석 | 실시간 알림, 캐시 무효화 |\n| 운영 복잡도 | 중간 | 높음 | 낮음 |\n| 보존 비용 | 낮음 (처리 후 삭제) | 높음 (디스크) | 거의 없음 |\n\n## \"어느 걸 골라?\"\n\n```\n1. 비동기 작업 분배 (메일 발송, 이미지 변환, 대용량 처리)\n       → Message Queue (RabbitMQ, SQS)\n\n2. 이벤트 영구 기록 + 여러 consumer가 각자 처리\n       → Event Stream (Kafka)\n       예: 주문 이벤트 → 결제 / 배송 / 분석 / 로그 각자 처리\n\n3. 실시간 알림 (캐시 무효화, 사용자 알림)\n       → Pub-Sub (Redis Pub-Sub, WebSocket)\n\n4. CDC (DB 변경 → 검색 인덱스 / 캐시 동기화)\n       → Event Stream\n\n5. 학습/소규모, 단순함\n       → 우선 Message Queue (or DB-based outbox)\n```\n\n## Kafka vs RabbitMQ — 자주 묻는 비교\n\n| | Kafka | RabbitMQ |\n|---|---|---|\n| 주 모델 | Event Stream (topic + partition) | Message Queue (queue + routing) |\n| 메시지 보존 | 기간 기반 (default 7일) | 처리 후 삭제 |\n| Throughput | 수십만~수백만 msg/s | 수만 msg/s |\n| 순서 보장 | partition 안에서 strict | queue 안에서 strict |\n| 라우팅 | 기본 partition by key | exchange + binding (직접/topic/fanout) |\n| consumer | offset 기반 (각자 위치) | broker가 push, ack |\n| 운영 | 무거움 (Zookeeper 또는 KRaft) | 가벼움 |\n| 장기 보관 | ✓ (디스크) | 처리되면 사라짐 |\n\n요지: **Kafka = 이벤트 영구 기록 + 분석/replay**. **RabbitMQ = 빠르고 유연한 작업 분배**.\n\n## At-Least-Once vs Exactly-Once\n\n학습자 자주 혼동.\n\n| 모델 | 의미 | 함정 |\n|---|---|---|\n| At-most-once | 최대 1번 (잃을 수 있음) | 단순. 메일/알림 같이 중복이 더 나쁘면 적합 |\n| At-least-once | 최소 1번 (중복 가능) | 대부분 메시징 default. **idempotent consumer 필수** |\n| Exactly-once | 정확히 1번 | 분산 환경 진정한 exactly-once *어려움*. Kafka transactional producer + idempotent consumer 조합. |\n\n⚠️ **\"Exactly-once\" 자체가 단순한 보장이 아니라 *transactional pattern*의 결과**. 일반 시스템은 *at-least-once + idempotent consumer*로 같은 효과.\n\nidempotent consumer 패턴:\n```java\n// 메시지마다 unique key\nString messageKey = msg.getKey();\nif (processedKeyStore.contains(messageKey)) {\n    return;  // 이미 처리\n}\nprocess(msg);\nprocessedKeyStore.add(messageKey);\n```\n\n## \"Topic\"의 의미가 시스템마다 다름\n\n| 시스템 | \"Topic\" 의미 |\n|---|---|\n| Kafka | 영구 저장 stream, partition 보유 |\n| RabbitMQ | exchange 한 종류 (topic exchange) — 라우팅 키 패턴 매칭 |\n| Redis | Pub-Sub channel (영구 저장 ❌) |\n| SNS | 발행 대상 (보존 없음) |\n\n이름이 같아도 *모델은 다르다*. 시스템 도입 시 *topic 의미 정확 확인*.\n\n## 자주 헷갈리는 지점\n\n- **\"Kafka = 메시지 큐\"** — *주 모델이 Event Stream*. Queue처럼도 쓸 수 있지만 본체는 영구 저장 + 다중 consumer.\n- **\"exactly-once는 옵션 한 줄\"** — 분산 환경에서 *진짜 exactly-once* 어려움. 보통 *at-least-once + idempotent*.\n- **\"Pub-Sub은 메시지가 보장\"** — 실시간 only. 구독자 없으면 *그냥 사라짐*. Kafka로 영구 저장 필요.\n- **\"Topic 하나 = consumer 하나\"** — Kafka는 *consumer group*으로 분배 + 다른 group은 *각자 모든 메시지*.\n- **\"메시지 큐 = 항상 비동기\"** — 동기 RPC 위에 큐를 두면 *동기 흐름 위 비동기 인프라*가 됨. trade-off 인지.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"이메일 발송을 비동기로\" → Message Queue (Spring 환경에선 SQS 또는 Redis Queue, 또는 단순 outbox pattern).\n- \"주문 생성 시 결제/배송/분석에 각각 알림\" → Event Stream (Kafka) 또는 multiple Pub-Sub fan-out.\n- \"한 사용자의 모든 메시지가 순서대로\" → Partition key = userId, Kafka.\n- \"캐시 무효화\" → Pub-Sub (Redis), 또는 CDC + Stream.\n- \"학습 단계에서 메시지 큐 처음\" → DB 기반 outbox pattern (별도 시스템 없이 simulate) → 익숙해지면 RabbitMQ.\n\n## 빠른 확인 질문\n\n- Message Queue와 Event Stream의 본질 차이?\n  - Queue는 *처리 후 삭제 + 한 consumer*, Stream은 *영구 저장 + 다중 consumer*.\n- Kafka가 *영구 저장*하는 이유?\n  - Replay 가능 + 다중 consumer가 각자 offset으로 읽기 + 분석.\n- \"Exactly-once\"를 실용에서 어떻게 달성?\n  - 보통 *at-least-once + idempotent consumer* 조합.\n\n## 한 줄 정리\n\nQueue = 작업 분배 (한 메시지 한 consumer), Stream = 이벤트 영구 fan-out (Kafka), Pub-Sub = real-time 분배 (보존 ❌). 모델이 다르므로 *처리하려는 패턴*이 결정 핵심.\n\nretrieval-anchor-keywords: Message Queue vs Event Stream, RabbitMQ vs Kafka, Pub-Sub model, AWS SQS SNS Kinesis, Redis Pub-Sub Streams, at-least-once at-most-once exactly-once, idempotent consumer pattern, event sourcing, change data capture CDC, consumer group offset, partition key Kafka, outbox pattern, transactional outbox\n",
+  "aliases": [
+    "Message Queue",
+    "Event Stream",
+    "Pub-Sub",
+    "Publish-Subscribe",
+    "Kafka",
+    "RabbitMQ",
+    "SQS",
+    "SNS",
+    "Redis Streams",
+    "메시지 큐",
+    "이벤트 스트림",
+    "발행-구독",
+    "at-least-once delivery",
+    "exactly-once semantics",
+    "event sourcing"
+  ],
+  "expected_queries": [
+    "Message Queue랑 Event Stream 차이가 뭐야?",
+    "Kafka와 RabbitMQ 어떤 거 고를까?",
+    "Pub-Sub 모델이 Queue랑 어떻게 달라?",
+    "at-least-once와 exactly-once 차이는?",
+    "어떤 메시징 시스템을 골라야 해?",
+    "이벤트 기반 아키텍처 도입 기준은?"
+  ],
+  "symptoms": [
+    "메시지 큐와 이벤트 스트림 차이를 모름",
+    "Kafka와 RabbitMQ 중 뭘 골라야 할지 헷갈림",
+    "\"Topic\"이 Queue와 어떻게 다른지 헷갈림",
+    "exactly-once가 정말 가능한지 모름"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/message-queue-basics"
+    ],
+    "next_docs": [
+      "system-design/db-read-replica-write-primary-routing-primer"
+    ],
+    "confusable_with": [
+      "system-design/message-queue-basics",
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser.md",
+    "revision_history": []
+  }
+}

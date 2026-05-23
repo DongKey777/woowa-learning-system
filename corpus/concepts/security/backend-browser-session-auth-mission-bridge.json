@@ -1,0 +1,52 @@
+{
+  "id": "security/backend-browser-session-auth-mission-bridge",
+  "title": "Backend Browser Session Auth Mission Bridge",
+  "category": "security",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Backend Browser Session Auth Mission Bridge\n\n> 한 줄 요약: 브라우저 세션 인증은 cookie scope, request credentials, session id와 server state, saved request, CSRF/AuthN/AuthZ가 이어진 protocol이라 한 칸씩 끊어 봐야 한다.\n\n**난이도: Beginner**\n\n## 핵심 모델: session id와 server state는 한 몸이다\n\n브라우저 세션 인증에서 cookie 값은 보통 \"로그인 정보 전체\"가 아니라 server-side session을 찾기 위한 id다. 서버는 그 id로 session store를 조회하고, 그 안의 security context나 principal을 복원한다. 따라서 `Cookie` header가 있다는 사실만으로 인증이 끝난 것은 아니다. session id가 틀렸거나, store가 비었거나, security context가 저장되지 않았으면 서버는 여전히 anonymous로 볼 수 있다.\n\n기본 흐름은 다음 네 단계다.\n\n| 단계 | 증거 | 실패하면 의심할 곳 |\n|---|---|---|\n| cookie 발급 | login response `Set-Cookie` | 로그인 성공 처리, cookie 속성 |\n| cookie 저장 | Application cookie store | Domain/Path/Expires/SameSite/Secure |\n| cookie 전송 | 다음 API request `Cookie` | fetch credentials, scope, scheme, site |\n| server state 복원 | server session/principal log, response status | session store, invalidation, security context |\n\n## Cookie scope와 credentials\n\nCookie는 이름이 같아도 모든 요청에 붙지 않는다. Domain은 host match 범위, Path는 URL prefix 범위, Expires/Max-Age는 생존 시간, Secure는 HTTPS 전송 조건, HttpOnly는 JavaScript 접근 제한을 결정한다. SameSite는 site 경계에서 cookie 전송을 제한한다. modern browser에서는 scheme까지 고려한 site 개념을 쓰므로 \"origin이 다르다\"와 \"site가 다르다\"를 섞지 않는 편이 안전하다.\n\ncross-origin fetch/axios 요청은 cookie 속성만 맞아도 자동으로 붙지 않을 수 있다. 브라우저 API의 `credentials: \"include\"` 또는 axios `withCredentials: true` 같은 설정이 필요하고, 서버 CORS response도 credential 요청을 허용해야 한다. credential 요청에서는 `Access-Control-Allow-Origin: *`가 아니라 실제 origin 허용과 `Access-Control-Allow-Credentials: true`가 필요하다.\n\nSameSite도 별도 축이다. cross-site XHR/fetch에서 cookie를 보내려면 보통 `SameSite=None; Secure` 조건이 필요하다. local 개발 환경에서는 origin, site, HTTP/HTTPS 조건이 운영과 달라질 수 있으므로 DevTools의 actual `Cookie` header와 Issues blocked reason으로 확인해야 한다.\n\n## Server-side session 복원\n\n서버 입장에서는 request `Cookie`에서 session id를 꺼낸 뒤 store에서 state를 찾는다. store는 in-memory, Redis, database, framework-managed session 등일 수 있다. 서버 재시작, session invalidation, 잘못된 cookie name, path/domain 충돌, 여러 backend instance 사이의 session store 불일치가 있으면 cookie가 있어도 principal 복원에 실패한다.\n\n복원 여부를 보려면 \"로그인 API가 성공했다\"보다 다음 요청에서 서버가 본 session id, session lookup hit/miss, principal name, authorities를 확인한다. 보안상 session id 전문을 로그에 남기지는 말고 짧게 mask 하거나 존재 여부와 store hit만 확인하는 식으로 다룬다.\n\n## Saved request와 redirect surface\n\n브라우저 기반 security framework는 인증되지 않은 사용자가 보호 URL을 호출하면 원래 요청을 saved request로 저장하고 login으로 redirect할 수 있다. 로그인 성공 뒤 saved request로 돌아가는 동작은 페이지 흐름에서는 자연스럽지만, JSON API 호출에서는 혼란을 만든다.\n\nDevTools에서는 final `200`만 보면 안 된다. API가 기대한 JSON이 아니라 login HTML을 받았다면 redirect chain을 따라가야 한다. `302 -> /login -> 200 text/html`이면 \"API 성공\"이 아니라 auth failure surface가 HTML로 노출된 것이다. SPA/API에서는 상황에 따라 redirect 대신 `401` JSON을 주는 구성이 더 명확할 수 있다.\n\n## CSRF, AuthN, AuthZ를 분리하기\n\n인증(AuthN)은 \"누구인가\"를 복원하는 단계다. principal이 없거나 session이 유효하지 않으면 `401` 또는 login redirect로 표면화될 수 있다. 인가(AuthZ)는 \"그 사용자가 이 자원/행동을 할 수 있는가\"다. principal은 있는데 role, scope, ownership, admin flag가 맞지 않으면 `403`이 자연스럽다.\n\nCSRF는 또 다른 축이다. 로그인된 사용자의 state-changing request라도 CSRF token이 없거나 불일치하면 framework가 controller 전에 `403`으로 거절할 수 있다. 그래서 `403`을 보면 \"권한 없음\" 하나로 고정하지 말고, CSRF token/header/cookie와 authorization rule을 분리해서 본다.\n\n## 구체적인 debugging workflow\n\n1. Network `Preserve log`를 켜고 login부터 실패 API까지 한 번에 재현한다.\n2. login response의 `Set-Cookie`와 Issues blocked reason을 확인한다.\n3. Application tab에서 cookie Domain, Path, SameSite, Secure, Expires/Max-Age를 다음 API URL과 대조한다.\n4. 실패 API request header에 `Cookie`가 실제로 붙었는지 확인한다.\n5. 붙지 않았다면 fetch/axios credentials, SameSite, Secure, Domain/Path, CORS credential response를 본다.\n6. 붙었는데 서버가 anonymous라면 session id 추출, store lookup, security context 저장/복원 로그를 본다.\n7. principal이 있는데 `403`이면 CSRF token 문제인지, role/scope/ownership 문제인지, URL matcher 문제인지 나눈다.\n8. `200`인데 HTML이면 redirect chain과 saved request 흐름을 확인하고 API failure surface를 조정한다.\n\n## 잘못 넣기 쉬운 bucket\n\n- `Set-Cookie`가 보였으니 다음 요청도 인증됐다고 판단한다.\n- Application tab cookie를 request `Cookie` header 증거로 사용한다.\n- request `Cookie`가 있으니 principal 복원도 성공했다고 본다.\n- `403`을 모두 CORS 문제나 모두 role 문제로 몰아간다.\n- CSRF 실패를 \"로그인 안 됨\"으로 설명한다.\n- login HTML `200`을 API 성공으로 처리한다.\n- saved request redirect를 세션 유지 성공의 증거로만 보고, API surface 문제를 놓친다.\n- SameSite와 fetch credentials를 같은 설정으로 취급한다.\n\n## 미션에 적용하는 방식\n\nspring-roomescape 관리자 기능이나 shopping-cart 주문 흐름에서 \"로그인은 됐는데 다음 API가 실패한다\"는 말이 나오면, 먼저 브라우저 session protocol을 따라간다. cookie가 저장됐는지, 전송됐는지, 서버가 session state를 찾았는지, principal 이후 권한/CSRF에서 막혔는지를 나눈 뒤에 Spring Security 설정이나 controller 로직을 본다.\n\n## 확인 질문\n\n- 로그인 response에 `Set-Cookie`가 있었고 브라우저가 차단하지 않았는가?\n- Application tab의 cookie Domain/Path/SameSite/Secure가 실패 API URL에 맞는가?\n- 실패 API request에 `Cookie` header가 실제로 붙었는가?\n- cross-origin 요청이면 client credentials와 server CORS credential response가 둘 다 맞는가?\n- 서버는 session id를 추출했고 session store lookup에 성공했는가?\n- security context/principal이 복원됐는가, 아니면 anonymous인가?\n- `403`이라면 CSRF token 실패, role/scope/ownership 실패, URL matcher 실패 중 어디인가?\n- `200` response가 JSON API 응답인지, redirect 뒤 login HTML인지 확인했는가?\n\n## 한 줄 정리\n\n브라우저 세션 인증 디버깅은 CORS 설정 하나로 몰아가지 말고 cookie scope, credentials, session id lookup, server state, saved request, CSRF/AuthN/AuthZ를 각각 증거로 확인해야 한다.\n",
+  "aliases": [
+    "backend browser session auth bridge",
+    "cookie cors auth mission bridge",
+    "browser session login loop bridge",
+    "Spring session auth debug bridge",
+    "쿠키 CORS 인증 브리지"
+  ],
+  "expected_queries": [
+    "backend 미션에서 login은 됐는데 다음 API가 401 403이면 어떻게 봐야 해?",
+    "cookie CORS session principal을 mission bridge로 연결해줘",
+    "Application에는 cookie가 있는데 서버는 anonymous인 문제를 어떻게 설명해?",
+    "API가 login HTML 200을 받는 auth failure surface를 학습자용으로 풀어줘",
+    "spring-roomescape 인증 디버깅을 browser session 관점으로 정리해줘"
+  ],
+  "symptoms": [
+    "로그인은 성공한 것 같은데 다음 API가 401, 403, login HTML 200으로 보인다",
+    "cookie가 저장됐는지 전송됐는지 서버가 복원했는지 한 번에 섞어 디버깅한다",
+    "CORS 설정을 바꾸면 인증 문제가 해결될 것처럼 보고 principal/session 경계를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/authentication-authorization-session-foundations",
+      "security/cookie-failure-three-way-splitter"
+    ],
+    "next_docs": [
+      "security/backend-cookie-cors-auth-debug-drill",
+      "network/api-gateway-auth-failure-surface-map",
+      "network/application-tab-vs-request-cookie-header-mini-card"
+    ],
+    "confusable_with": [
+      "security/cookie-failure-three-way-splitter",
+      "security/cors-basics",
+      "network/api-gateway-auth-failure-surface-map"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/backend-browser-session-auth-mission-bridge.md",
+    "revision_history": []
+  }
+}

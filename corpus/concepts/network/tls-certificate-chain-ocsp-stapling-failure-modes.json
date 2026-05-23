@@ -1,0 +1,59 @@
+{
+  "id": "network/tls-certificate-chain-ocsp-stapling-failure-modes",
+  "title": "TLS Certificate Chain, OCSP Stapling Failure Modes",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 TLS certificate chain validation, intermediate certificate,",
+  "body_markdown": "# TLS Certificate Chain, OCSP Stapling Failure Modes\n\n> 한 줄 요약: TLS 인증서는 \"있다/없다\"보다 체인 검증, 만료, 중간 인증서, revocation 확인이 함께 맞아야 살아난다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TLS Session Resumption, 0-RTT, Replay Risk](./tls-session-resumption-0rtt-replay-risk.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [API Gateway, Reverse Proxy 운영 포인트](./api-gateway-reverse-proxy-operational-points.md)\n> - [DNS, CDN, HTTP/2, HTTP/3](./dns-cdn-websocket-http2-http3.md)\n> - [Timeout 타입: connect, read, write](./timeout-types-connect-read-write.md)\n\nretrieval-anchor-keywords: certificate chain, intermediate certificate, root CA, OCSP stapling, revocation, SAN, SNI, certificate expiration, TLS alert, trust store\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 재현 조건, 관찰 증거, failure matrix\n\n이 문서의 1차 분기는 \"인증서가 있나 없나\"가 아니라 \"chain, hostname, trust store, revocation 중 어느 검증 단계가 실패했는가\"다. TLS alert나 브라우저 경고는 신호이고, proof는 실제 certificate path와 client trust decision을 검증/validation해야 얻는다.\n\n### 재현 조건\n\n- `openssl s_client -showcerts -servername <host>`로 full chain과 SNI별 인증서를 확인한다.\n- 브라우저, Java SDK, mobile 등 trust store가 다른 client를 나눠 handshake 결과를 비교한다.\n- OCSP stapling on/off, intermediate 포함/누락, cert rotation 직후 구간을 분리해 본다.\n\n### 관찰 증거\n\n- 일부 client만 `unable to get local issuer certificate` 또는 hostname mismatch를 낸다.\n- 새 인증서 배포 후 특정 LB/region만 실패한다.\n- handshake 시간만 늘고 app log에는 요청이 도달하지 않는다.\n\n### failure matrix\n\n| 증상 | 1차 분기 | 관찰 신호 | 검증/validation | wrong-bucket / 오선택 |\n|---|---|---|---|---|\n| 일부 client만 chain 실패 | intermediate/trust store 불일치 | 브라우저는 통과, SDK는 실패 | fullchain, issuer path, client CA bundle을 비교 | 서버 인증서 만료로만 분류 |\n| 특정 hostname만 실패 | SAN/SNI mismatch | cert SAN에 hostname 없음 | SNI별 cert와 requested host를 대조 | DNS 문제로만 분류 |\n| handshake 지연/실패 | OCSP stapling/revocation 경로 | OCSP response 만료, stapling cache miss | `-status`, responder reachability, LB stapling 설정을 확인 | app latency로만 분류 |\n\n## 핵심 개념\n\nTLS 인증은 인증서 하나만 보는 문제가 아니다.\n\n- 서버 인증서가 유효해야 한다\n- 중간 인증서가 체인에 있어야 한다\n- 클라이언트 trust store가 root CA를 신뢰해야 한다\n- revocation 상태가 문제가 없어야 한다\n- SNI와 SAN이 요청 호스트와 맞아야 한다\n\n### Retrieval Anchors\n\n- `certificate chain`\n- `intermediate certificate`\n- `root CA`\n- `OCSP stapling`\n- `revocation`\n- `SAN`\n- `SNI`\n- `certificate expiration`\n- `trust store`\n\n## 깊이 들어가기\n\n### 1. certificate chain이 왜 필요한가\n\n브라우저와 클라이언트는 서버 인증서만 딱 보고 믿지 않는다.\n\n- 서버 인증서\n- intermediate CA\n- root CA\n\n이 체인이 이어져야 한다.  \n중간 인증서가 빠지면 클라이언트는 \"누가 이 인증서를 발급했는지\"를 증명하지 못한다.\n\n### 2. SAN과 SNI가 왜 자주 깨지나\n\n인증서는 이제 보통 SAN(Subject Alternative Name)에 실제 호스트 이름을 넣는다.\n\n- `api.example.com`\n- `www.example.com`\n- 와일드카드 도메인\n\n클라이언트는 SNI로 \"어떤 호스트의 인증서를 줄지\"를 서버에 알려준다.  \n이 둘이 어긋나면 이름 불일치 에러가 난다.\n\n### 3. OCSP stapling은 무엇을 하는가\n\nrevocation 확인은 \"이 인증서가 아직 취소되지 않았나\"를 묻는 절차다.\n\n- 서버가 OCSP 응답을 미리 받아 stapling한다\n- 클라이언트는 별도 요청 없이 revocation 상태를 확인한다\n- 지연과 프라이버시를 줄일 수 있다\n\n하지만 stapling이 잘못되면:\n\n- 응답이 만료된다\n- 중간 장비가 OCSP 조회를 실패한다\n- TLS handshake가 늦어지거나 실패할 수 있다\n\n### 4. 체인 실패가 왜 운영에서 자주 보이나\n\n많은 운영 사고는 인증서 자체보다 배포와 구성에서 난다.\n\n- 새 인증서를 넣었는데 intermediate를 빼먹었다\n- LB와 backend가 서로 다른 cert bundle을 쓴다\n- cert rotation 후 stapling cache가 갱신되지 않는다\n- 일부 리전만 오래된 trust chain을 본다\n\n### 5. 만료보다 더 흔한 문제\n\n인증서 만료는 쉽게 보이지만, 실제로는 아래가 더 자주 문제다.\n\n- 잘못된 체인\n- 잘못된 hostname\n- trust store 불일치\n- OCSP 실패\n- 배포 중 인증서 파일 경로 오류\n\n즉, \"expire 전에 알림\"만으로는 부족하다. **체인이 실제로 검증되는지**를 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 새 인증서를 넣었는데 일부 클라이언트만 실패한다\n\n원인 후보:\n\n- intermediate certificate 누락\n- old proxy 캐시\n- 특정 클라이언트 trust store 차이\n\n### 시나리오 2: 브라우저는 되는데 일부 SDK만 실패한다\n\nSDK의 trust store가 OS와 다를 수 있다.\n\n- Java keystore\n- mobile embedded trust store\n- outdated CA bundle\n\n### 시나리오 3: handshake가 갑자기 느려졌다\n\nOCSP stapling이나 revocation check가 응답을 못 받아서 지연될 수 있다.\n\n- OCSP responder 장애\n- network path 차단\n- stapling cache miss\n\n### 시나리오 4: 특정 도메인만 SNI mismatch가 난다\n\nLB 뒤에서 여러 인증서를 쓰는데 host routing이 틀어졌을 수 있다.\n\n이 경우는 [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)와 같이 봐야 한다.\n\n## 코드로 보기\n\n### openssl로 체인 확인\n\n```bash\nopenssl s_client -connect api.example.com:443 -servername api.example.com -showcerts\n```\n\n### 만료일 확인\n\n```bash\nopenssl x509 -in cert.pem -noout -dates -subject -issuer\n```\n\n### curl로 handshake와 인증 에러 보기\n\n```bash\ncurl -v https://api.example.com/health\n```\n\n### Nginx 감각\n\n```nginx\nssl_certificate     /etc/ssl/fullchain.pem;\nssl_certificate_key /etc/ssl/private.key;\nssl_stapling on;\nssl_stapling_verify on;\n```\n\n포인트:\n\n- `fullchain.pem`을 써서 intermediate를 포함한다\n- stapling을 켜면 revocation 상태를 더 효율적으로 전달할 수 있다\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| fullchain 배포 | 체인 누락을 줄인다 | 파일 관리가 필요하다 | 대부분의 운영 |\n| OCSP stapling | revocation 확인 비용을 줄인다 | cache/응답 실패를 관리해야 한다 | 공개 서비스 |\n| 단순 인증서만 배포 | 설정이 쉬워 보인다 | 체인 오류가 자주 난다 | 피해야 함 |\n\n핵심은 인증서를 \"갱신했다\"가 아니라 **클라이언트가 실제로 검증할 수 있는 상태인가**다.\n\n## 꼬리질문\n\n> Q: 인증서 체인이 왜 중요한가요?\n> 핵심: 중간 CA를 통해 root까지 신뢰 경로를 만들어야 하기 때문이다.\n\n> Q: OCSP stapling은 왜 쓰나요?\n> 핵심: revocation 확인을 빠르고 덜 노출되게 하기 위해서다.\n\n> Q: SNI와 SAN이 왜 둘 다 필요한가요?\n> 핵심: SNI는 어떤 인증서를 줄지 고르는 신호이고, SAN은 그 인증서가 어떤 이름을 커버하는지 보여준다.\n\n## 한 줄 정리\n\nTLS 인증 실패는 만료만이 아니라 체인, hostname, trust store, OCSP stapling이 함께 맞아야 하는 경로 문제로 봐야 한다.\n",
+  "aliases": [
+    "TLS certificate chain",
+    "OCSP stapling failure",
+    "intermediate certificate missing",
+    "certificate chain validation",
+    "stapled OCSP freshness",
+    "trust store mismatch",
+    "TLS handshake cert error"
+  ],
+  "expected_queries": [
+    "TLS certificate chain failure를 leaf intermediate trust store 관점으로 진단해줘",
+    "OCSP stapling이 stale하면 어떤 handshake failure가 생겨?",
+    "SNI별 certificate chain mismatch를 어떻게 확인해?",
+    "certificate rotation 후 일부 edge만 old intermediate를 내보내는 문제는?",
+    "OCSP CRL revocation과 stapling failure는 어떻게 달라?"
+  ],
+  "symptoms": [
+    "leaf certificate만 보고 intermediate chain 누락이나 trust store 차이를 놓친다",
+    "OCSP stapling stale/expired가 일부 client handshake failure로 보이는 이유를 설명하지 못한다",
+    "SNI에 따라 다른 certificate chain이 나가는 문제를 hostname routing과 연결하지 않는다",
+    "certificate rotation 뒤 일부 edge나 pod만 old chain을 내보내는 문제를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/tls-loadbalancing-proxy",
+      "network/sni-routing-mismatch-hostname-failure"
+    ],
+    "next_docs": [
+      "network/ocsp-crl-revocation-tradeoffs",
+      "network/certificate-rotation-sni-blast-radius",
+      "network/mtls-handshake-failure-diagnosis",
+      "network/tls-session-resumption-0rtt-replay-risk"
+    ],
+    "confusable_with": [
+      "network/ocsp-crl-revocation-tradeoffs",
+      "network/certificate-rotation-sni-blast-radius",
+      "network/mtls-handshake-failure-diagnosis",
+      "network/sni-routing-mismatch-hostname-failure",
+      "network/captive-portal-intercepting-proxy-behavior",
+      "network/tls-loadbalancing-proxy"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/tls-certificate-chain-ocsp-stapling-failure-modes.md",
+    "revision_history": []
+  }
+}

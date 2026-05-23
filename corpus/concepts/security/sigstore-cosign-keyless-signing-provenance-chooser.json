@@ -1,0 +1,56 @@
+{
+  "id": "security/sigstore-cosign-keyless-signing-provenance-chooser",
+  "title": "Sigstore / Cosign Keyless Signing / Provenance Chooser",
+  "category": "security",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Sigstore / Cosign Keyless Signing / Provenance Chooser\n\n> 한 줄 요약: Cosign keyless signing은 \"누가 이 artifact에 서명했는가\"를 OIDC identity와 transparency log로 검증하게 해준다. 하지만 signature, provenance, SBOM은 서로 다른 질문에 답하므로 배포 정책에서 분리해서 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Supply Chain Security / SBOM / Signing Basics](./supply-chain-security-sbom-signing-basics.md)\n- [Public Key / Digital Signature Primer](./public-key-digital-signature-primer.md)\n- [Certificate Transparency / SCT Monitoring Playbook](./certificate-transparency-sct-monitoring-playbook.md)\n- [Signing Key Compromise Recovery Playbook](./signing-key-compromise-recovery-playbook.md)\n- [Workload Identity vs Long-Lived Service Account Keys](./workload-identity-vs-long-lived-service-account-keys.md)\n- [Secret Scanning / Credential Leak Response](./secret-scanning-credential-leak-response.md)\n\nretrieval-anchor-keywords: sigstore keyless signing, cosign oidc signing, fulcio certificate identity, rekor transparency log, artifact signature policy, provenance attestation, sbom versus provenance, container image verification, oidc workload identity, supply chain signing\n\n## 범위와 mental model\n\nSigstore는 maintainer나 CI job마다 장기 private signing key를 배포하지 않고도 build output을 서명하고 싶을 때 유용하다. 흔한 keyless flow에서는 Cosign이 ephemeral keypair를 만들고, CI provider 같은 trusted issuer에서 OIDC identity token을 받아 Fulcio에 제시한다. Fulcio는 그 identity와 ephemeral public key를 묶은 short-lived certificate를 발급하고, Cosign은 artifact digest에 서명한 뒤 Rekor에 verification material을 남긴다.\n\nVerifier는 나중에 artifact digest, signature, certificate chain, certificate identity, OIDC issuer, transparency evidence를 확인한다. 따라서 보안 결정은 \"Sigstore를 켰는가\"가 아니라, deploy 시점에 어떤 claim이 반드시 참이어야 하는가다.\n\n| Claim | 답하는 질문 |\n|---|---|\n| Signature | 이 bytes가 policy가 허용한 key/certificate로 서명됐는가 |\n| Certificate identity | signing 시점의 주체가 기대한 repository, workflow, service account, email인가 |\n| Rekor transparency | signing event가 감사 가능하고 예상 밖 identity 사용을 monitoring할 수 있는가 |\n| Provenance | artifact가 특정 source, workflow, builder, material set에서 만들어졌는가 |\n| SBOM | artifact에 어떤 component가 들어 있는가 |\n\n이 통제들은 조합할 수 있지만 서로를 자동으로 대체하지 않는다.\n\n## 10초 chooser\n\n| Need | Prefer | Why |\n|---|---|---|\n| unsigned image 배포 차단 | Cosign signature verification | admission 시점에 artifact integrity와 signer policy를 확인한다 |\n| CI에 장기 signing key를 두고 싶지 않음 | keyless OIDC signing | signer key는 ephemeral이고 trust는 OIDC issuer, Fulcio, Rekor, policy로 이동한다 |\n| 어떤 workflow가 artifact를 만들었는지 증명 | provenance attestation | signature만으로 build step이나 source material은 설명되지 않는다 |\n| 어떤 library가 들어 있는지 확인 | SBOM | provenance는 출처, SBOM은 구성요소 목록을 말한다 |\n| 예상 밖 identity로 signing된 흔적 탐지 | Rekor / transparency monitoring | transparency는 monitoring이 붙을 때 방어 신호가 된다 |\n\n작은 내부 서비스라면 valid signature, exact image digest, expected certificate identity, expected OIDC issuer 정도가 최소 policy가 될 수 있다. 규제나 고신뢰 release path라면 provenance predicate, builder allowlist, SBOM retention, vulnerability triage, unexpected signature incident playbook까지 붙인다.\n\n## Verification policy 모양\n\n가장 약한 정책은 \"signature가 존재한다\"에서 끝나는 것이다. 너무 넓다. 더 안전한 정책은 다음을 묻는다.\n\n1. Is the artifact digest exactly the one being deployed?\n2. Does the signature verify against the certificate public key?\n3. Does the certificate chain lead to the expected Sigstore trust root or private deployment root?\n4. Does the certificate identity match the repository, workflow, branch, tag, or service account expected for this environment?\n5. Does the OIDC issuer match the intended CI or identity provider?\n6. Is there acceptable transparency evidence or a private transparency equivalent?\n7. If provenance is required, does the attestation bind to the same digest and expected builder?\n\n가능하면 exact identity match를 쓴다. Regex policy는 운영상 편하지만 fork, pull request context, 개인 repository, 너무 넓은 organization을 실수로 허용하기 쉽다. Branch/tag rule은 단순 문자열 매칭이 아니라 release policy로 다룬다.\n\n## Failure matrix\n\n| Failure mode | What still works | What is not proven | Conservative response |\n|---|---|---|---|\n| signature valid, identity가 너무 넓음 | cryptographic integrity | 올바른 release actor | production deploy 전에 identity/issuer policy를 좁힌다 |\n| Rekor entry는 있지만 provenance 없음 | signing event 감사 가능 | build source, builder, dependency set | release artifact에는 signature뿐 아니라 provenance를 요구한다 |\n| SBOM은 있지만 signature 없음 | component inventory | trusted pipeline 산출물인지 | SBOM은 분석용으로 쓰고 deploy authorization으로 쓰지 않는다 |\n| OIDC issuer compromise | attacker-controlled identity로 cert 발급 가능 | 사람/workflow 정당성 | log entry monitoring, trust policy rotation/suspend |\n| Fulcio/Rekor unavailable | mode에 따라 기존 bundle verify 가능 | fresh online transparency check | 승인된 offline bundle path 없으면 production은 fail closed |\n| private artifact를 public log에 못 남김 | privacy | public auditability | private Sigstore 또는 internal bundle retention/monitoring |\n\n가장 큰 오해는 Rekor를 승인 서비스처럼 보는 것이다. Rekor는 signing metadata를 기록하고 witness할 뿐, release manager가 그 signing을 의도했는지 알지 못한다. 조직이 identity allowlist를 유지하고, unexpected entry를 monitoring하며, alert를 incident response로 연결해야 한다.\n\n## Provenance, SBOM, signature 경계\n\nSignature는 artifact digest를 signer와 묶는다. \"이 bytes가 내가 신뢰하는 signer를 통과했는가\"에 답한다. Provenance는 artifact digest를 source revision, builder, workflow, materials, parameter 같은 build context와 묶는다. \"이 artifact가 기대한 process로 만들어졌는가\"에 답한다. SBOM은 component와 version 목록이다. \"어떤 package가 들어 있고 어떤 CVE 영향권인가\"에 답한다.\n\n서로 대체하지 않는다. Compromised workflow가 악성 build를 정상 서명했다면 signed malicious build는 여전히 악성이다. Verifier가 아무 builder나 허용하면 valid provenance도 약하다. SBOM과 artifact가 같은 digest와 release policy로 묶이지 않으면, SBOM 생성 뒤 artifact swap을 막지 못한다.\n\n## Source-aware caveats\n\nSigstore의 공개 문서는 keyless signing을 ephemeral key + OIDC identity 흐름으로 설명한다. Fulcio가 short-lived certificate를 발급하고 Rekor가 timestamped verification material을 기록한다. Sigstore security model도 unauthorized identity를 찾으려면 log monitoring이 필요하다고 말한다. Transparency without monitoring은 나중에 볼 수 있는 증거만 만들 뿐 즉시 방어가 아니다.\n\n도구 세부사항은 바뀔 수 있다. Bundle format, default upload behavior, private Sigstore deployment option, Rekor API version은 특히 그렇다. 학습 답변에서는 안정적인 경계를 유지한다. Artifact digest, signature, certificate identity, OIDC issuer, transparency evidence를 검증하고, provenance와 SBOM은 별도 claim으로 둔다.\n\nReferences:\n\n- Sigstore Cosign signing overview: https://docs.sigstore.dev/cosign/signing/overview/\n- Sigstore Rekor overview: https://docs.sigstore.dev/logging/overview/\n- Sigstore security model: https://docs.sigstore.dev/about/security/\n\n## 한 줄 정리\n\nCosign keyless signing은 장기 signing key를 줄이고 artifact를 OIDC identity에 묶는 도구다. 하지만 배포 정책은 명시해야 한다. Signature는 integrity/signer, Rekor는 auditability, provenance는 build origin, SBOM은 component inventory를 담당한다.\n",
+  "aliases": [
+    "sigstore keyless signing",
+    "cosign oidc signing",
+    "cosign certificate identity",
+    "fulcio short lived certificate",
+    "rekor transparency log",
+    "artifact signature policy",
+    "provenance attestation chooser",
+    "sbom versus provenance",
+    "container image signing verification",
+    "oidc workload identity signing"
+  ],
+  "expected_queries": [
+    "Cosign keyless로 컨테이너 이미지를 서명하면 무엇을 검증해야 해?",
+    "signature, SBOM, provenance 차이를 배포 정책 관점에서 비교해줘",
+    "Rekor entry가 있으면 빌드 출처까지 보장되는 거야?",
+    "OIDC 기반 keyless signing을 CI에서 쓸 때 실패 모드는 뭐야?",
+    "서명 검증 정책에서 certificate identity를 어떻게 고정해야 해?"
+  ],
+  "symptoms": [
+    "장기 private signing key를 CI에 두지 않고 container image를 서명하고 싶다",
+    "cryptographic verification은 통과하지만 certificate identity가 기대한 repository나 workflow와 다르다",
+    "release에 SBOM은 있지만 build provenance가 없거나, provenance는 있지만 deploy-time signature policy가 없다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/supply-chain-security-sbom-signing-basics",
+      "security/public-key-digital-signature-primer"
+    ],
+    "next_docs": [
+      "security/certificate-transparency-sct-monitoring-playbook",
+      "security/signing-key-compromise-recovery-playbook"
+    ],
+    "confusable_with": [
+      "security/supply-chain-security-sbom-signing-basics",
+      "security/public-key-digital-signature-primer",
+      "security/certificate-transparency-sct-monitoring-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/sigstore-cosign-keyless-signing-provenance-chooser.md",
+    "revision_history": []
+  }
+}

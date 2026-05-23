@@ -1,0 +1,50 @@
+{
+  "id": "spring/unexpectedrollbackexception-mini-debugging-card",
+  "title": "Spring UnexpectedRollbackException Mini Debugging Card",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "'이 문서는 UnexpectedRollbackException을 초급자가 마지막 save 문제로 오해하지 않도록,",
+  "body_markdown": "# Mini Debugging Card for `UnexpectedRollbackException`\n\n> 한 줄 요약: `UnexpectedRollbackException`은 \"마지막 save가 문제\"라는 뜻이 아니라, **이미 rollback-only가 된 트랜잭션을 catch-and-continue 코드가 끝까지 끌고 왔다**는 신호인 경우가 많다.\n>\n> 문서 역할: 이 문서는 spring 카테고리 안에서 초급자가 `UnexpectedRollbackException`, `transaction marked as rollback-only`, `catch 했는데 마지막에 터짐`을 빠르게 symptom-to-cause로 연결하는 **beginner debugging card**를 담당한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Spring Transaction Propagation Beginner Primer: `REQUIRED`, `REQUIRES_NEW`, rollback-only](./spring-transaction-propagation-required-requires-new-rollbackonly-primer.md)\n- [Spring Mini Card: rollback-only 실패 vs checked exception인데 commit된 것처럼 보이는 놀람](./spring-rollbackonly-vs-checked-exception-commit-surprise-card.md)\n- [Spring `UnexpectedRollbackException` and Rollback-Only Marker Traps](./spring-unexpectedrollback-rollbackonly-marker-traps.md)\n- [Spring Transaction Debugging Playbook](./spring-transaction-debugging-playbook.md)\n- [Spring Service-Layer Transaction Boundary Patterns](./spring-service-layer-transaction-boundary-patterns.md)\n- [Spring Persistence Context Flush / Clear / Detach Boundaries](./spring-persistence-context-flush-clear-detach-boundaries.md)\n- [트랜잭션 기초](../database/transaction-basics.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: unexpectedrollbackexception mini debugging card, rollback-only checklist, transaction marked rollback-only checklist, catch 했는데 마지막에 터짐, rollback 안 되는 것 같아요, swallow exception transaction, catch and continue transactional, unexpectedrollbackexception beginner, commit 시점에 터짐 why, 왜 마지막 커밋에서 터져요, audit save then unexpectedrollbackexception, same transaction continue after failure, rollback-only vs checked exception, checked exception commit surprise 비교, spring unexpectedrollbackexception basics\n\n## 이 문서가 먼저 잡는 질문\n\n이 문서는 아래처럼 **예외가 이미 한 번 지나갔는데 마지막에 다시 터진다**는 질문에서 먼저 잡히도록 조정했다.\n\n| 학습자 질문 모양 | 이 문서에서 먼저 주는 답 |\n|---|---|\n| \"`UnexpectedRollbackException`이 왜 마지막에 나와요?\" | 마지막 줄보다 앞에서 같은 트랜잭션이 이미 rollback-only가 됐는지 먼저 보라고 답한다 |\n| \"예외를 catch 했는데 왜 결국 실패해요?\" | catch는 예외 전달을 숨길 뿐 트랜잭션 상태를 복구하지 못한다고 먼저 자른다 |\n| \"audit save는 남길 줄 알았는데 왜 같이 롤백돼요?\" | audit도 같은 트랜잭션이면 함께 rollback된다고 먼저 설명한다 |\n| \"rollback 안 된 게 아니라 마지막에 늦게 드러난 건가요?\" | 맞다. 표면화 지점과 최초 실패 지점을 분리해서 보라고 안내한다 |\n\n## 먼저 mental model 한 줄\n\n`UnexpectedRollbackException`은 보통 \"마지막 줄이 갑자기 실패했다\"가 아니라, **중간에 이미 실패 판정이 난 트랜잭션을 바깥 코드가 모르고 계속 진행했다**는 뜻이다.\n\n초급자는 아래 세 문장만 먼저 붙이면 된다.\n\n- 중간 예외가 같은 트랜잭션에 영향을 줬다.\n- 그 트랜잭션이 rollback-only가 됐다.\n- 바깥에서 계속 진행하다가 commit 시점에 예외가 드러났다.\n\n## 30초 symptom-to-cause 체크표\n\n| 보이는 증상 | 가장 먼저 의심할 원인 | 지금 확인할 것 |\n|---|---|---|\n| `UnexpectedRollbackException`이 메서드 마지막에 터진다 | 앞에서 이미 rollback-only가 찍혔다 | 마지막 `save`보다 **더 앞의 첫 예외** |\n| 로그에 `transaction marked as rollback-only`가 보인다 | 같은 tx 참여자가 실패했다 | inner method가 `REQUIRED`로 합류했는지 |\n| `try/catch`로 예외를 먹었는데도 commit에서 실패한다 | catch는 예외 전달만 숨기고 tx 상태는 못 되돌린다 | catch 블록 앞에서 무슨 예외가 났는지 |\n| audit/save 하나는 남길 줄 알았는데 같이 롤백된다 | audit도 같은 tx에 묶였다 | 정말 독립 커밋이어야 하는 작업인지 |\n| stack trace는 outer service 끝에서 보이는데 원인은 inner service 같다 | 표면화 지점과 최초 실패 지점이 다르다 | 최초 예외 발생 메서드와 그 propagation |\n\n핵심은 \"`UnexpectedRollbackException`이 난 줄\"이 아니라 **rollback-only를 처음 만든 줄**을 찾는 것이다.\n\n## 가장 흔한 실수: catch-and-continue\n\n```java\n@Transactional\npublic void placeOrder() {\n    try {\n        paymentService.charge();\n    } catch (Exception ex) {\n        log.warn(\"결제 실패는 일단 무시\", ex);\n    }\n\n    auditRepository.save(new AuditLog(\"done\"));\n}\n```\n\n초급자 눈에는 이렇게 보이기 쉽다.\n\n- `charge()` 실패는 처리했다\n- 그 뒤 `auditRepository.save(...)`는 정상 저장될 것 같다\n\n하지만 실제로는 아래처럼 읽어야 할 때가 많다.\n\n```text\n1. placeOrder tx 시작\n2. paymentService.charge()가 같은 tx에 참여\n3. 안쪽 실패로 현재 tx가 rollback-only가 됨\n4. catch가 예외 전달만 막음\n5. 바깥 코드는 계속 진행\n6. commit 시점에 UnexpectedRollbackException 발생\n```\n\n즉 catch는 \"화면에 보이는 예외\"를 숨길 수 있어도, **이미 실패 예정인 트랜잭션을 성공 상태로 복구하지는 못한다**.\n\n## 어디를 보면 되나\n\n### 1. 마지막 `save`부터 보지 말고, 그 앞 예외부터 본다\n\n초급자가 자주 하는 오해:\n\n- \"`auditRepository.save()`가 문제인가?\"\n- \"`마지막 repository 호출이 rollback을 만들었나?\"\n\n더 안전한 순서는 이것이다.\n\n1. 같은 request / 같은 service call 안에서 처음 던져진 예외를 찾는다.\n2. 그 예외를 누가 catch 했는지 본다.\n3. 그 메서드들이 같은 transaction에 참여했는지 본다.\n\n### 2. inner method가 같은 tx였는지 확인한다\n\n가장 흔한 패턴은 inner method가 기본 전파인 `REQUIRED`라서 바깥 tx에 그냥 같이 탔던 경우다.\n\n| 질문 | 예/아니오가 뜻하는 것 |\n|---|---|\n| inner method도 `@Transactional`이고 기본값인가 | 대개 같은 tx 참여 가능성이 크다 |\n| outer와 inner가 같은 service call 흐름 안에 있나 | rollback-only가 전파되기 쉽다 |\n| 예외를 inner 또는 outer에서 잡고 계속 갔나 | commit 시점 지연 폭발 패턴과 맞는다 |\n\n### 3. \"정말 같이 롤백돼야 하는 작업인지\" 다시 본다\n\n특히 아래 작업은 초급자가 같은 tx에 묶어 두고 기대를 잘못 잡기 쉽다.\n\n- 실패 기록 audit\n- 알림 발송 이력 저장\n- 보조 테이블 상태 기록\n\n이런 작업이 \"본 작업 실패와 상관없이 남아야 하는 기록\"이라면, 같은 tx에 두는 순간 기대와 어긋날 수 있다.\n\n## 자주 보이는 원인 4개\n\n| 원인 | 왜 `UnexpectedRollbackException`으로 보이나 | 초급자용 대응 방향 |\n|---|---|---|\n| inner `REQUIRED` 실패 후 outer가 계속 진행 | 같은 tx가 이미 rollback-only다 | 실패를 숨기지 말고 먼저 전파 여부를 본다 |\n| `try/catch`로 예외만 먹음 | tx 상태는 그대로 실패 예정이다 | catch 뒤 계속 쓰는 코드가 있는지 본다 |\n| audit/보조 기록도 같은 tx에 저장 | 함께 rollback된다 | 독립 경계가 필요한지 검토한다 |\n| flush/commit 시점에 DB 제약 예외가 늦게 드러남 | 표면화 시점이 뒤로 밀린다 | 실제 최초 예외가 commit 근처인지도 확인한다 |\n\n## 빠른 자기 점검 5문장\n\n- \"마지막 줄이 아니라 그 앞에서 예외가 있었나?\"\n- \"그 예외를 내가 catch만 하고 끝내지 않았나?\"\n- \"inner call이 같은 transaction에 참여한 건 아닌가?\"\n- \"지금 저장하려는 audit/보조 기록이 정말 같은 transaction이어야 하나?\"\n- \"`UnexpectedRollbackException`이 원인 자체가 아니라 결과 신호일 수 있다는 점을 놓치지 않았나?\"\n\n## 어디로 이어서 보면 좋나\n\n- `REQUIRED`와 `REQUIRES_NEW` 감각이 아직 약하면 [Spring Transaction Propagation Beginner Primer: `REQUIRED`, `REQUIRES_NEW`, rollback-only](./spring-transaction-propagation-required-requires-new-rollbackonly-primer.md)로 먼저 간다.\n- rollback-only가 왜 찍히는지 더 자세히 보려면 [Spring `UnexpectedRollbackException` and Rollback-Only Marker Traps](./spring-unexpectedrollback-rollbackonly-marker-traps.md)로 이어간다.\n- 실제 로그/TRACE 기준 디버깅 순서를 보고 싶으면 [Spring Transaction Debugging Playbook](./spring-transaction-debugging-playbook.md)로 간다.\n\n## 한 줄 정리\n\n`UnexpectedRollbackException`은 \"rollback이 안 됐다\"가 아니라, **앞에서 이미 rollback-only가 된 트랜잭션을 catch-and-continue가 끝까지 끌고 와 commit 시점에 드러난 신호**다.\n",
+  "aliases": [
+    "UnexpectedRollbackException mini card",
+    "transaction marked as rollback-only",
+    "catch 했는데 마지막에 터짐",
+    "마지막 save가 문제가 아님",
+    "rollback-only beginner debugging",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "UnexpectedRollbackException 초급 디버깅 순서를 알려줘",
+    "catch 했는데 마지막에 transaction marked as rollback-only가 터지는 이유는?",
+    "마지막 save가 아니라 이전 실패가 원인인지 어떻게 확인해?",
+    "rollback-only marker를 symptom-to-cause로 빠르게 설명해줘"
+  ],
+  "symptoms": [
+    "catch 했는데 method 끝에서 UnexpectedRollbackException이 난다.",
+    "마지막 save나 commit 라인이 원인처럼 보이지만 이전 예외가 rollback-only를 만들었다.",
+    "rollback-only 메시지를 봤지만 어떤 내부 작업이 marker를 찍었는지 모른다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-exception-handling-basics"
+    ],
+    "next_docs": [
+      "spring/spring-exception-handling-basics"
+    ],
+    "confusable_with": [
+      "spring/transaction-propagation-required-requires-new-rollbackonly-primer",
+      "spring/rollbackonly-vs-checked-exception-commit-surprise-card",
+      "spring/unexpectedrollback-rollbackonly-marker-traps",
+      "spring/transactional-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-unexpectedrollbackexception-mini-debugging-card.md",
+    "revision_history": []
+  }
+}

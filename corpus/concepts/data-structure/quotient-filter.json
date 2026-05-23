@@ -1,0 +1,56 @@
+{
+  "id": "data-structure/quotient-filter",
+  "title": "Quotient Filter",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 Quotient Filter를 hash fingerprint를 quotient와 remainder로 나누어",
+  "body_markdown": "# Quotient Filter\n\n> 한 줄 요약: Quotient Filter는 fingerprint를 quotient/remainder로 나눠 저장하는 approximate membership 구조로, Bloom보다 locality가 좋고 일부 동적 운영도 가능한 compact filter다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Bloom Filter](./bloom-filter.md)\n> - [Cuckoo Filter](./cuckoo-filter.md)\n> - [Xor Filter](./xor-filter.md)\n> - [Sketch and Filter Selection Playbook](./sketch-filter-selection-playbook.md)\n\n> retrieval-anchor-keywords: quotient filter, approximate membership, quotient remainder filter, compact hash filter, probabilistic set, cache-friendly filter, dynamic membership filter, bloom alternative, fingerprint filter, compact prefilter\n\n## 핵심 개념\n\nQuotient Filter도 approximate membership filter다.  \n전체 key 대신 hash fingerprint만 저장한다는 점은 Cuckoo Filter와 비슷하지만, 저장 방식은 다르다.\n\n핵심 아이디어:\n\n- 해시 fingerprint를 `quotient`와 `remainder`로 나눈다\n- quotient는 bucket 위치를 뜻한다\n- remainder는 bucket 근처에 압축 저장한다\n\n즉 해시 테이블과 run-length/cluster 개념이 섞인 듯한 구조로,  \nmembership prefilter를 **메모리 지역성 좋게 저장**하려는 발상이다.\n\n## 10초 chooser\n\n| 상황 | 먼저 고를 후보 | 이유 |\n|---|---|---|\n| 가장 단순한 false positive prefilter가 필요하다 | Bloom Filter | 구현과 설명이 가장 쉽다 |\n| deletion이 중요한 mutable filter가 필요하다 | Cuckoo Filter | fingerprint relocation과 deletion 모델이 직접적이다 |\n| 정적 집합을 극단적으로 compact하게 만들고 싶다 | Xor Filter | build 후 immutable lookup에 강하다 |\n| page/cache locality가 중요하고 quotient/remainder cluster 관리 비용을 감당할 수 있다 | Quotient Filter | 좁은 영역 scan과 compact fingerprint 저장이 장점이다 |\n\nwrong-bucket neighbor:\n\n- Quotient Filter는 **Bloom Filter의 비트 배열 구현 디테일**이 아니다. quotient 위치와 remainder payload, run metadata가 핵심이다.\n- Quotient Filter는 **Xor Filter처럼 build-only immutable 구조**로만 이해하면 부족하다. 일부 동적 운영이 가능하지만 cluster 관리 비용이 붙는다.\n- Quotient Filter는 **정확한 set**이 아니다. false positive 가능성이 있으므로 권한/결제 같은 확정 판단에는 원본 확인이 필요하다.\n\n## 깊이 들어가기\n\n### 1. quotient / remainder 분리가 왜 중요한가\n\nfingerprint 전체를 그대로 위치 계산과 저장에 같이 쓰면 비효율이 생길 수 있다.  \nQuotient Filter는 이를 두 부분으로 나눈다.\n\n- quotient: \"어느 버킷 그룹인가\"\n- remainder: \"그 그룹 안에서 어떤 값인가\"\n\n이렇게 하면 비슷한 quotient를 가진 항목이 물리적으로 가까운 곳에 모인다.  \n그래서 lookup과 scan이 cache-friendly해질 수 있다.\n\n### 2. metadata bit가 구조를 유지한다\n\nQuotient Filter는 remainder만 저장하는 것이 아니라,  \n각 slot에 몇 개의 상태 bit를 두어 cluster/run 경계를 추적한다.\n\n보통 표준 설명에서는 다음 세 bit를 많이 쓴다.\n\n- `is_occupied`: canonical slot에 해당 quotient를 가진 원소가 적어도 하나 있음\n- `is_continuation`: 이 slot의 remainder가 같은 quotient run의 첫 원소가 아니라 continuation임\n- `is_shifted`: 이 slot의 remainder가 자기 canonical slot이 아니라 cluster 안에서 밀려 있음\n\n즉 단순 비트 배열보다 구조 유지 메타데이터가 중요하다.  \n그래서 구현은 Bloom보다 복잡하지만 locality는 더 좋을 수 있다.\n\nlookup은 \"quotient 위치로 바로 가서 그 slot 하나만 본다\"가 아니다.\ncanonical slot에서 cluster 시작점을 복원하고, 해당 quotient의 run boundary까지 이동한 뒤,\n그 run 안의 remainder를 비교한다. metadata가 깨지면 false positive rate가 조금 나빠지는 정도가 아니라\nrun을 잘못 찾아 false negative나 delete corruption까지 만들 수 있다.\n\n### 3. Bloom / Cuckoo / Xor와 어디서 갈리나\n\n대략적인 선택 감각은 이렇다.\n\n- Bloom: 가장 단순\n- Cuckoo: deletion과 동적 운영\n- Xor: 정적 집합에서 매우 compact\n- Quotient: locality 좋은 fingerprint filter, 일부 동적 운영 가능\n\nQuotient Filter는 특히 disk/page 친화 구조나  \n순차 scan locality가 중요한 곳에서 매력적일 수 있다.\n\n### 4. backend에서 어디에 맞나\n\n다음처럼 memory page / cache line locality가 중요한 membership prefilter에서 어울린다.\n\n- SSD-backed on-disk filter\n- compact in-memory negative lookup filter\n- snapshot 기반 membership index\n\nBloom처럼 여러 random bit를 건드리는 대신,  \n상대적으로 좁은 영역을 검사하는 패턴을 만들기 쉽다는 점이 장점이다.\n\n### 5. 한계와 운영 포인트\n\nQuotient Filter도 만능은 아니다.\n\n- cluster가 길어지면 lookup이 느려질 수 있다\n- load factor 관리가 중요하다\n- resize / rebuild 전략이 필요하다\n- deletion은 tombstone 하나로 끝나지 않고 run/cluster metadata repair가 필요하다\n- false positive 확률은 주로 remainder bit 수와 load factor에 좌우된다\n\n즉 구조적 locality를 얻는 대신,  \nmetadata와 cluster maintenance 복잡도를 받아들여야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: on-disk membership prefilter\n\nrandom bit 접근이 비싼 저장장치에서는  \n좁은 구간 scan 중심 구조가 Bloom보다 더 매력적일 수 있다.\n\n### 시나리오 2: compact negative lookup filter\n\n메모리 예산이 타이트한 in-memory filter에서  \n동적 업데이트도 어느 정도 필요하다면 검토해볼 수 있다.\n\n### 시나리오 3: immutable snapshot filter\n\n세그먼트나 snapshot 단위로 membership filter를 유지할 때  \ncache locality가 중요한 경우 잘 맞는다.\n\n### 시나리오 4: 부적합한 경우\n\n가장 단순한 구현이 필요하면 Bloom,  \n정적 집합에서 극한 압축이 중요하면 Xor Filter가 더 나을 수 있다.\n\n## 코드로 보기\n\n아래 코드는 quotient/remainder 분리 감각만 보여주는 학습용 스케치다.\n실제 구현은 `occupied`, `continuation`, `shifted` 같은 metadata bit 조합으로\ncanonical slot, run boundary, shifted cluster를 복원해야 하며 lookup/delete/rebuild도 함께 설계해야 한다.\n\n```java\npublic class QuotientFilterSketch {\n    private final short[] remainders;\n    private final boolean[] used;\n    private final boolean[] occupied;\n    private final boolean[] continuation;\n    private final boolean[] shifted;\n\n    public QuotientFilterSketch(int capacity) {\n        this.remainders = new short[capacity];\n        this.used = new boolean[capacity];\n        this.occupied = new boolean[capacity];\n        this.continuation = new boolean[capacity];\n        this.shifted = new boolean[capacity];\n    }\n\n    public void add(String key) {\n        int hash = key.hashCode();\n        int quotient = Math.floorMod(hash >>> 8, remainders.length);\n        short remainder = (short) (hash & 0xFF);\n\n        occupied[quotient] = true;\n        int slot = quotient;\n        while (used[slot]) {\n            slot = (slot + 1) % remainders.length;\n        }\n        used[slot] = true;\n        remainders[slot] = remainder;\n        shifted[slot] = slot != quotient;\n        continuation[slot] = slot != quotient; // real code must compute run boundary, not just this shortcut\n    }\n}\n```\n\n따라서 이 예제를 production filter로 보면 안 된다. 위 코드는 빈 slot 찾기와 bit 이름만 보여주며,\n실제 run boundary 복원과 insertion shifting은 빠져 있다. run boundary가 깨지면 false positive rate 문제가 아니라 lookup correctness 자체가 흔들릴 수 있다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Quotient Filter | locality가 좋고 compact하며 일부 동적 운영이 가능하다 | metadata와 cluster 관리가 복잡하다 | cache-friendly membership prefilter |\n| Bloom Filter | 단순하고 구현이 쉽다 | random bit 접근이 많다 | 일반적인 prefilter |\n| Cuckoo Filter | deletion이 편하고 동적 운영이 가능하다 | relocation/insert failure 관리가 필요하다 | mutable membership filter |\n| Xor Filter | 정적 집합에서 매우 compact하다 | 동적 업데이트가 어렵다 | immutable snapshot filter |\n\n중요한 질문은 \"필터를 얼마나 자주 바꾸는가\"와 \"memory locality가 얼마나 중요한가\"다.\n\n## 꼬리질문\n\n> Q: Quotient Filter가 Bloom보다 나은 경우는 언제인가요?\n> 의도: locality와 구현 단순성 trade-off 이해 확인\n> 핵심: random bit access보다 좁은 범위 scan locality가 더 중요한 환경일 때다.\n\n> Q: 왜 metadata bit가 중요한가요?\n> 의도: remainder 배열만으로는 구조 복원이 안 된다는 점 이해 확인\n> 핵심: cluster와 run 경계를 알아야 lookup과 delete가 가능하기 때문이다.\n\n> Q: Xor Filter와 가장 큰 차이는 무엇인가요?\n> 의도: 정적/동적 compact filter 구분 확인\n> 핵심: Xor Filter는 정적 집합 지향이고, Quotient Filter는 더 동적인 운영과 locality 쪽에 가깝다.\n\n## 한 줄 정리\n\nQuotient Filter는 quotient/remainder 분리와 메타데이터를 이용해 locality 좋은 approximate membership을 제공하는 compact filter로, Bloom과 Xor 사이의 운영적 절충안에 가깝다.\n",
+  "aliases": [
+    "Quotient Filter",
+    "quotient remainder filter",
+    "compact hash filter",
+    "approximate membership filter",
+    "fingerprint filter",
+    "cache-friendly filter",
+    "Bloom alternative"
+  ],
+  "expected_queries": [
+    "Quotient Filter는 Bloom Filter나 Cuckoo Filter와 무엇이 달라?",
+    "quotient remainder로 fingerprint를 나눠 cache-friendly membership filter를 만드는 방식은?",
+    "Quotient Filter의 metadata bits는 cluster와 run boundary를 어떻게 유지해?",
+    "SSD-backed on-disk filter나 compact negative lookup filter에 Quotient Filter가 맞는 이유는?",
+    "approximate membership filter에서 Bloom Cuckoo Xor Quotient를 비교해줘"
+  ],
+  "symptoms": [
+    "approximate membership filter를 Bloom과 Cuckoo만으로 보고 quotient/remainder locality 기반 filter 선택지를 놓친다",
+    "quotient는 bucket 위치, remainder는 compact fingerprint payload라는 분리를 이해하지 못한다",
+    "metadata bit로 cluster/run 경계를 유지하는 구현 복잡도와 locality 이점을 함께 보지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/bloom-filter-vs-cuckoo-filter"
+    ],
+    "next_docs": [
+      "data-structure/bloom-filter",
+      "data-structure/cuckoo-filter",
+      "data-structure/xor-filter",
+      "data-structure/sketch-filter-selection-playbook"
+    ],
+    "confusable_with": [
+      "data-structure/bloom-filter",
+      "data-structure/cuckoo-filter",
+      "data-structure/xor-filter",
+      "data-structure/bloom-filter-vs-cuckoo-filter",
+      "data-structure/sketch-filter-selection-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/quotient-filter.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "id": "database/postgresql-prepared-transactions-2pc-xa-chooser",
+  "title": "PostgreSQL Prepared Transactions 2PC/XA Chooser",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# PostgreSQL Prepared Transactions 2PC/XA Chooser\n\n> 한 줄 요약: PostgreSQL prepared transaction은 \"나중에 커밋할 수 있는 편리한 트랜잭션\"이 아니라, 외부 coordinator가 있는 2PC에서 PostgreSQL이 participant로 멈춰 서는 위험한 중간 상태다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [XA와 Two-Phase Commit의 함정](./xa-two-phase-commit-pitfalls.md)\n- [Outbox vs CDC vs Saga 결정 가이드](./outbox-vs-cdc-vs-saga-decision-guide.md)\n- [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md)\n- [Saga Pivot Transaction Design](./saga-pivot-transaction-design.md)\n- [Exactly-Once 신화와 DB + Queue 경계](./exactly-once-myths-db-queue.md)\n- [트랜잭션 경계 체크리스트 카드](./transaction-boundary-external-io-checklist-card.md)\n- [Prepared Statement Plan Cache Parameter Sniffing Router](./prepared-statement-plan-cache-parameter-sniffing-router.md)\n\n## 핵심 멘탈모델\n\nPostgreSQL의 `PREPARE TRANSACTION`은 SQL statement를 미리 컴파일하는 prepared statement가 아니다. 현재 transaction의 변경, lock, commit 가능 상태를 디스크에 기록한 뒤 세션과 분리하고, 나중에 `COMMIT PREPARED` 또는 `ROLLBACK PREPARED`로 최종 결정을 받게 만드는 기능이다.\n\n그래서 이 기능의 첫 질문은 \"편리한가?\"가 아니라 \"누가 최종 결정을 durable하게 기억하는가?\"다. 정상적인 2PC라면 외부 coordinator가 모든 participant의 prepare 결과와 최종 commit/rollback 결정을 자기 로그에 남긴다. PostgreSQL은 그 결정이 올 때까지 기다리는 participant다.\n\n이 중간 상태가 길어지면 운영 위험이 커진다.\n\n- prepared transaction은 세션이 끊겨도 `pg_prepared_xacts`에 남을 수 있다.\n- 아직 최종 commit/rollback이 아니므로 관련 lock과 transaction 상태가 오래 유지될 수 있다.\n- 장애 복구자가 업무상 commit해야 하는지 rollback해야 하는지 모르면 dangling 상태가 된다.\n- DB 재시작으로 \"정리될 것\"이라고 기대하면 안 된다. prepared transaction은 복구 대상 상태로 남는 쪽에 가깝다.\n\n## 30초 선택표\n\n| 지금 풀려는 문제 | PostgreSQL prepared transaction 후보인가 | 더 맞는 bucket |\n|---|---|---|\n| 두 PostgreSQL DB를 외부 transaction manager가 2PC로 묶고, coordinator log와 recovery runbook이 있다 | 예 | `PREPARE TRANSACTION` + `COMMIT PREPARED`/`ROLLBACK PREPARED` |\n| 주문 DB commit과 Kafka publish 누락을 줄이고 싶다 | 보통 아니오 | outbox, CDC relay, consumer idempotency |\n| 결제 API 승인과 DB 저장을 하나의 rollback으로 묶고 싶다 | 아니오 | saga, 보상 트랜잭션, idempotency key |\n| Spring `@Transactional` 안에서 여러 repository 호출을 묶고 싶다 | 아니오 | 일반 local transaction |\n| 같은 SQL을 빠르게 반복 실행하고 싶다 | 완전히 다른 개념 | prepared statement / plan cache |\n| `pg_prepared_xacts`에 오래된 row가 남았다 | 새 설계 후보가 아니라 incident | coordinator log 확인 후 commit/rollback prepared |\n\n기억할 문장은 하나다. prepared transaction은 \"분산 업무 흐름을 쉽게 만드는 도구\"가 아니라, **2PC의 prepare phase를 PostgreSQL 안에 오래 보관할 수 있게 하는 도구**다.\n\n## SQL 흐름과 상태 전이\n\n가장 작은 흐름은 아래처럼 생긴다.\n\n```sql\nBEGIN;\nUPDATE account SET balance = balance - 10000 WHERE id = 1;\nUPDATE account SET balance = balance + 10000 WHERE id = 2;\n\nPREPARE TRANSACTION 'transfer-2026-05-15-001';\n-- 여기서부터 세션의 일반 transaction은 끝났지만,\n-- PostgreSQL 안에는 prepared transaction 상태가 남는다.\n\nCOMMIT PREPARED 'transfer-2026-05-15-001';\n-- 또는\nROLLBACK PREPARED 'transfer-2026-05-15-001';\n```\n\n`PREPARE TRANSACTION` 이후 애플리케이션 세션이 죽어도 PostgreSQL은 \"최종 결정을 기다리는 상태\"를 유지할 수 있다. 운영자는 `pg_prepared_xacts`로 남은 항목을 본다.\n\n```sql\nSELECT gid, prepared, owner, database\nFROM pg_prepared_xacts\nORDER BY prepared;\n```\n\n여기서 오래된 `gid`가 보이면 \"정리하면 되나?\"가 아니라 \"coordinator가 어떤 결정을 durable하게 기록했나?\"를 먼저 찾아야 한다. 근거 없이 `ROLLBACK PREPARED`를 눌러도 사고고, 근거 없이 `COMMIT PREPARED`를 눌러도 사고다.\n\n## Dangling prepared transaction 위험\n\ndangling prepared transaction은 prepare까지 끝났지만 최종 commit/rollback 결정이 회수되지 않은 상태다. 이 상태가 위험한 이유는 데이터가 애매해서만이 아니다. DB 자원을 계속 붙잡을 수 있기 때문이다.\n\n운영에서 먼저 보는 위험은 네 가지다.\n\n| 위험 | 왜 문제가 되나 | 관측 신호 |\n|---|---|---|\n| lock 장기 보유 | prepared transaction이 건드린 row/table에 후속 DML/DDL이 막힐 수 있다 | lock wait, migration 멈춤, blocker가 일반 session으로 안 보임 |\n| vacuum/정리 지연 | 오래된 transaction horizon이 남아 row version 정리를 늦출 수 있다 | dead tuple 증가, autovacuum 지연, bloat 의심 |\n| 복구 판단 불능 | coordinator log 없이 commit/rollback을 고르면 업무 상태가 깨진다 | `gid`만 있고 외부 결정 로그가 없음 |\n| 용량 고갈 | `max_prepared_transactions`를 켜면 prepared xact slot도 운영 자원이 된다 | prepare 실패, 오래된 `pg_prepared_xacts` 누적 |\n\n그래서 `max_prepared_transactions`는 \"에러가 나니까 올리는 값\"으로 보면 안 된다. 2PC를 실제로 운영할 coordinator, timeout, alert, 수동 복구 절차가 있을 때만 켜는 운영 스위치에 가깝다. 기본값이 0인 환경이 흔한 것도 이 기능을 평소 요청 처리에서 가볍게 쓰지 말라는 신호로 읽는 편이 안전하다.\n\n## XA, saga, outbox와 wrong-bucket 구분\n\nPostgreSQL prepared transaction은 XA 전체가 아니다. XA는 여러 resource manager를 묶기 위한 표준과 transaction manager 생태계까지 포함하는 말이고, PostgreSQL의 `PREPARE TRANSACTION`은 그중 DB participant가 prepare 상태를 유지하는 로컬 기능이다. coordinator가 없으면 2PC가 아니라 \"DB 안에 미완성 결정을 방치하는 방법\"이 된다.\n\nOutbox와도 bucket이 다르다. outbox는 업무 변경과 \"발행할 이벤트 row\"를 같은 local transaction에 넣고, relay/CDC가 나중에 밖으로 흘려보내는 패턴이다. 목표는 DB commit과 publish 사이의 dual-write 구멍을 줄이는 것이다. prepared transaction처럼 외부 broker나 consumer를 같은 원자적 commit에 묶는 약속이 아니다.\n\nSaga와도 bucket이 다르다. saga는 여러 local transaction을 업무 단계와 보상 단계로 이어서 최종 수렴을 설계한다. 결제 승인처럼 되돌리기 어려운 pivot 이후에는 rollback보다 forward recovery가 중요하다. `PREPARE TRANSACTION`은 이런 업무 보상 규칙을 만들어 주지 않는다.\n\nPrepared statement와는 이름만 비슷하다. `PreparedStatement`, SQL plan cache, parameter sniffing은 \"SQL 실행 계획과 파라미터\" 문제다. `PREPARE TRANSACTION`은 \"commit을 미뤄 둔 transaction 상태\" 문제다. learner query에 \"prepared\"가 들어왔다고 두 문서를 섞으면 완전히 다른 답이 나온다.\n\n## 복구 runbook의 최소 조건\n\nprepared transaction을 설계에 넣으려면 코드보다 먼저 운영 질문에 답해야 한다.\n\n1. `gid`가 어떤 업무 command, coordinator decision log, participant 목록과 1:1로 매핑되는가?\n2. coordinator가 prepare 성공 후 죽었을 때 최종 결정을 어디서 읽는가?\n3. `pg_prepared_xacts.prepared`가 몇 분 이상이면 alert를 울릴 것인가?\n4. 수동 복구자는 `COMMIT PREPARED`와 `ROLLBACK PREPARED` 중 무엇을 고르는지 문서화되어 있는가?\n5. prepared transaction이 잡은 lock 때문에 배포, migration, vacuum이 멈췄을 때 중단 기준은 무엇인가?\n6. 같은 `gid` 재사용, retry, timeout이 idempotent하게 처리되는가?\n\n이 질문에 답이 없으면 설계 선택지는 보통 prepared transaction이 아니다. local transaction을 짧게 commit하고, outbox/inbox/idempotency/reconciliation으로 복구 가능한 경계를 만드는 쪽이 더 운영 가능하다.\n\n## 설계 smell\n\n아래 신호가 보이면 prepared transaction을 쓰기 전에 bucket부터 다시 나눈다.\n\n- request thread 안에서 `PREPARE TRANSACTION`을 호출하고 사용자 응답 뒤에 나중에 commit하려 한다.\n- `pg_prepared_xacts`에 오래 남아도 자동으로 안전하게 정리된다고 생각한다.\n- external payment approve, HTTP call, message publish를 DB rollback으로 같이 되돌릴 수 있다고 설명한다.\n- `max_prepared_transactions`만 올리면 분산 정합성 문제가 해결된다고 본다.\n- coordinator decision log 없이 `gid` 이름 규칙만으로 복구할 수 있다고 말한다.\n- outbox row를 만들지 않고 broker publish와 DB write를 prepared transaction으로 묶으려 한다.\n- prepared statement 성능 문제와 prepared transaction 복구 문제를 같은 문서로 설명한다.\n\n특히 외부 API가 끼는 장면에서는 \"DB가 prepared 상태니까 외부도 준비 상태겠지\"가 성립하지 않는다. 외부 시스템이 XA participant가 아니면 DB의 prepare는 외부 side effect를 되돌리지 못한다.\n\n## 면접 답변 축\n\nQ: PostgreSQL prepared transaction은 언제 쓰나요?  \nA: 외부 coordinator가 있는 2PC에서 PostgreSQL이 participant로 prepare 상태를 durable하게 보관해야 할 때 쓴다. 일반 local transaction, prepared statement, saga, outbox 대체재로 쓰는 것은 bucket이 다르다.\n\nQ: `PREPARE TRANSACTION` 뒤 coordinator가 죽으면 무슨 일이 생기나요?  \nA: PostgreSQL에는 `pg_prepared_xacts` 항목이 남고, 관련 lock/transaction 상태가 최종 결정을 기다릴 수 있다. 복구자는 coordinator log를 보고 `COMMIT PREPARED` 또는 `ROLLBACK PREPARED`를 선택해야 한다.\n\nQ: 왜 운영에서 위험한가요?  \nA: prepare 상태는 \"안전하게 끝난 상태\"가 아니라 \"commit/rollback 결정을 기다리는 상태\"다. 오래 남으면 lock wait, migration blocking, vacuum 지연, 수동 복구 판단 오류로 이어질 수 있다.\n\nQ: 결제와 주문 저장을 한 번에 맞추려면 이걸 쓰면 되나요?  \nA: 결제 시스템이 XA participant로 들어오고 transaction manager가 전체를 조정하는 특수한 구성이 아니면 보통 아니다. 일반 서비스 설계에서는 outbox로 발행 누락을 줄이고, saga/idempotency/보상으로 외부 부작용을 수렴시키는 쪽을 먼저 본다.\n\n## 한 줄 정리\n\nPostgreSQL prepared transaction은 2PC coordinator가 있을 때만 조심스럽게 쓰는 prepare 상태 보관 장치이며, coordinator log와 dangling prepared transaction 복구 절차가 없으면 outbox나 saga보다 더 안전한 선택이 아니라 더 위험한 미완성 상태가 된다.\n",
+  "aliases": [
+    "PostgreSQL prepared transaction",
+    "PREPARE TRANSACTION",
+    "COMMIT PREPARED",
+    "ROLLBACK PREPARED",
+    "pg_prepared_xacts",
+    "max_prepared_transactions",
+    "dangling prepared transaction",
+    "in-doubt transaction",
+    "prepared xact lock",
+    "2PC participant",
+    "two phase commit PostgreSQL",
+    "XA wrong bucket",
+    "outbox saga wrong bucket"
+  ],
+  "expected_queries": [
+    "PostgreSQL PREPARE TRANSACTION과 COMMIT PREPARED는 어떤 상황에서 써야 하고 언제 쓰면 안 돼?",
+    "pg_prepared_xacts에 오래된 prepared transaction이 남아 있으면 어떤 락과 vacuum 위험이 생겨?",
+    "max_prepared_transactions를 켜고 2PC를 쓰면 XA, saga, outbox 문제를 전부 해결할 수 있어?",
+    "결제 API와 주문 DB를 하나로 묶고 싶을 때 PostgreSQL prepared transaction 대신 outbox나 saga를 선택해야 하는 기준은 뭐야?",
+    "coordinator가 죽어서 dangling prepared transaction이 남았을 때 commit prepared와 rollback prepared 중 무엇을 고르는 근거는 뭐야?",
+    "Spring @Transactional이나 JDBC prepared statement랑 PostgreSQL prepared transaction은 어떻게 달라?",
+    "PREPARE TRANSACTION 후 세션이 끊기면 transaction 상태와 lock은 어떻게 남아?"
+  ],
+  "symptoms": [
+    "PREPARE TRANSACTION을 prepared statement, JDBC PreparedStatement, Spring @Transactional과 같은 것으로 섞고 있다",
+    "pg_prepared_xacts에 오래된 prepared transaction이 남았는데 commit할지 rollback할지 판단 근거가 없다",
+    "PostgreSQL prepared transaction을 켜면 외부 결제 API, 메시지 발행, 다른 서비스 호출까지 같이 rollback될 거라고 기대한다",
+    "outbox, saga, XA, 2PC를 모두 \"분산 트랜잭션\" 한 박스로 넣어서 선택 기준이 흐려졌다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics",
+      "database/xa-two-phase-commit-pitfalls",
+      "database/outbox-vs-cdc-vs-saga-decision-guide"
+    ],
+    "next_docs": [
+      "database/xa-two-phase-commit-pitfalls",
+      "database/outbox-vs-cdc-vs-saga-decision-guide",
+      "database/outbox-saga-eventual-consistency",
+      "database/saga-pivot-transaction-design",
+      "database/exactly-once-myths-db-queue"
+    ],
+    "confusable_with": [
+      "database/xa-two-phase-commit-pitfalls",
+      "database/outbox-vs-cdc-vs-saga-decision-guide",
+      "database/outbox-saga-eventual-consistency",
+      "database/saga-pivot-transaction-design",
+      "database/exactly-once-myths-db-queue"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/postgresql-prepared-transactions-2pc-xa-chooser.md",
+    "revision_history": []
+  }
+}

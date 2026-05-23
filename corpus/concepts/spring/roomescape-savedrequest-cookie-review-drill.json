@@ -1,0 +1,46 @@
+{
+  "id": "spring/roomescape-savedrequest-cookie-review-drill",
+  "title": "Roomescape SavedRequest Cookie Review Drill",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "이 drill은 roomescape 로그인 후 SavedRequest와 JSESSIONID cookie 흐름을 복습한다.",
+  "body_markdown": "# Roomescape SavedRequest Cookie Review Drill\n\n## 한 줄 요약\n\n로그인 후 다시 로그인 페이지로 돌아가는 문제는 `SavedRequest` 하나로 풀지 않는다. 원래 URL 복원, cookie 저장/전송, server session persistence, 최종 authorization을 순서대로 분리해서 말해야 한다.\n\n## 질문\n\n관리자(Admin) 페이지에 접근한 뒤 로그인했는데 다시 로그인 페이지로 돌아간다. 저장된 요청(SavedRequest), `JSESSIONID`, 요청 쿠키 헤더(Cookie header) 관점에서 확인 순서를 말해봐.\n\n조건:\n\n- form login 기반 브라우저 흐름이다.\n- 처음 접근한 URL은 보호된 admin URL이다.\n- 로그인 성공 응답은 한 번 보였다.\n- 이후 다시 login 화면으로 튄다.\n\n## 기대 답변 축\n\n먼저 미인증 요청이 어떤 응답으로 처리됐는지 본다. 브라우저 form login 흐름이면 `302` login redirect가 자연스럽고, API 계약이면 `401` 응답일 수 있다. 이때 Spring Security가 원래 관리자 요청을 요청 캐시(RequestCache)에 저장할 수 있고, 그 결과가 저장된 요청(SavedRequest)이다.\n\nSavedRequest의 역할은 \"어디로 돌아갈지\"를 기억하는 것이다. 인증을 유지하거나 권한을 부여하는 장치가 아니다. 그래서 SavedRequest가 있어도 다음 요청에서 session이 이어지지 않으면 사용자는 다시 anonymous로 보이고, 원래 URL로 돌아가려는 순간 다시 login redirect가 난다.\n\n다음은 로그인 성공 응답에서 세션 쿠키(session cookie)가 내려오는지 확인한다. `Set-Cookie: JSESSIONID=...`가 없으면 다음 요청에서 서버 세션을 찾을 근거가 약하다. 단, stateless 설정을 일부러 쓰는 경우라면 세션 기반 SavedRequest 흐름 자체가 맞는 설계인지부터 확인해야 한다.\n\n세 번째는 브라우저가 쿠키를 저장했는지와 실제 요청에 보냈는지를 나눈다. Application 탭에 쿠키가 보여도 요청 `Cookie` header가 비어 있을 수 있다. 이 경우는 SavedRequest 복원보다 쿠키 전송(cookie attach) 조건, 즉 Domain, Path, Secure, SameSite, fetch credentials를 먼저 본다.\n\n네 번째는 서버가 세션에서 인증 정보(SecurityContext)를 복원했는지다. principal이 없으면 여전히 미인증 흐름이고, principal은 있는데 admin 권한이 없으면 `403 Forbidden` 인가 실패다. 인증이 복원된 뒤에야 SavedRequest가 원래 URL로 돌려보내는지 확인한다.\n\n마지막으로 CORS 콘솔 문구만으로 결론 내리지 않는다. Network 탭의 실제 status, redirect location, response header, request header를 근거로 단계별로 좁힌다.\n\n## 모범 답변 흐름\n\n```text\n1. /admin 요청의 첫 실패가 302 /login인지 401인지 확인한다.\n2. 그 요청이 RequestCache에 저장될 수 있는 브라우저 흐름인지 확인한다.\n3. 로그인 성공 response에 Set-Cookie: JSESSIONID가 있는지 본다.\n4. 다음 /admin 요청 request header에 Cookie: JSESSIONID가 붙는지 본다.\n5. Cookie가 안 붙으면 Domain/Path/Secure/SameSite/credentials를 본다.\n6. Cookie가 붙는데도 anonymous면 server session persistence와 SecurityContextRepository를 본다.\n7. principal은 있는데 403이면 SavedRequest가 아니라 admin authorization을 본다.\n8. principal도 있고 권한도 있는데 엉뚱한 URL로 가면 SavedRequest/success handler 우선순위를 본다.\n```\n\n이 순서의 핵심은 redirect loop를 하나의 원인으로 단정하지 않는 것이다. \"다시 login으로 감\"은 cookie attach 실패일 수도 있고, session persistence 실패일 수도 있고, login page 보호 설정 문제일 수도 있고, SavedRequest cleanup 문제일 수도 있다.\n\n## 미니 케이스\n\n### 케이스 A: `Set-Cookie`가 없다\n\n로그인 성공 response에 `Set-Cookie: JSESSIONID=...`가 없다면 다음 요청에서 기존 server session을 찾기 어렵다. form login을 stateful로 설계한 것이 맞는지, session creation policy, custom authentication success handler, SecurityContext 저장 여부를 본다.\n\n여기서 SameSite를 먼저 고치는 것은 순서가 틀렸다. SameSite는 \"받은 cookie를 cross-site 요청에 붙일 수 있는가\"의 문제다. 아직 cookie가 내려오지 않았다면 server-side persistence 경계를 먼저 본다.\n\n### 케이스 B: Application 탭에는 있는데 request `Cookie` header가 없다\n\n이때는 SavedRequest가 아니라 cookie attach 문제다. 확인 순서는 다음과 같다.\n\n| 조건 | 확인 질문 |\n|---|---|\n| Domain | 현재 요청 host와 cookie domain이 맞는가 |\n| Path | admin 요청 path가 cookie path 범위 안인가 |\n| Secure | HTTPS가 아닌데 Secure cookie를 기대하는가 |\n| SameSite | cross-site 요청인데 `Lax`/`Strict`로 막히는가 |\n| credentials | fetch `credentials: \"include\"` 또는 axios `withCredentials`가 있는가 |\n| CORS response | credential 요청에 `Access-Control-Allow-Credentials: true`와 구체 origin이 있는가 |\n\n특히 SameSite는 \"다른 port\"와 \"다른 site\"를 헷갈리기 쉽다. local 개발에서 origin은 port까지 포함하지만 site 판단은 scheme과 registrable domain 기준으로 보인다. 그래도 실전 디버깅에서는 spec 암기보다 Network 탭에서 실제 `Cookie` header가 붙었는지를 먼저 증거로 삼는다.\n\n### 케이스 C: `Cookie` header는 있는데 서버가 anonymous다\n\n이제 cookie 전송은 통과했다. 다음 축은 session persistence다. 같은 session id로 서버가 session을 찾는지, login 성공 시 SecurityContext가 저장됐는지, session fixation 보호로 바뀐 새 `JSESSIONID`를 보고 있는지, custom filter가 SecurityContext를 덮어쓰는지 확인한다.\n\n이 상황을 SavedRequest 문제로 부르면 원인이 흐려진다. SavedRequest는 주소 메모이고, SecurityContext persistence는 로그인 상태 저장/복원이다.\n\n### 케이스 D: principal은 있는데 admin `403`이다\n\n인증은 복원됐다. 이제는 authorization 문제다. admin role/authority 이름, `ROLE_` prefix, matcher 순서, method security를 본다. 이 단계에서 cookie/SameSite를 계속 바꾸면 이미 통과한 축을 다시 만지는 것이다.\n\n### 케이스 E: 인증과 권한은 맞는데 원래 URL로 안 돌아간다\n\n이때야 SavedRequest 복원과 success handler 정책을 본다. 로그인 전 요청이 RequestCache에 저장됐는지, custom success handler가 default target을 항상 우선하는지, SavedRequest가 로그인 페이지나 static resource를 잘못 저장했는지 확인한다.\n\n## 채점 기준\n\n| 답변 요소 | 좋은 답변 신호 |\n|---|---|\n| SavedRequest | \"원래 요청 복원\"이지 인증 자체가 아니라고 구분한다 |\n| JSESSIONID | `Set-Cookie` 수신과 다음 요청의 `Cookie` header 전송을 나눠 본다 |\n| 인증 복원 | 서버가 세션에서 `SecurityContext`를 읽었는지 확인한다 |\n| 인가 분리 | 미인증 redirect/401과 권한 부족 403을 분리한다 |\n| 브라우저 근거 | Application 탭이 아니라 Network 탭 header와 status를 본다 |\n| SameSite/CORS | cookie attach 조건으로 다루고, SavedRequest와 섞지 않는다 |\n| redirect loop | loop를 SavedRequest 단일 원인으로 단정하지 않는다 |\n\n## 흔한 약한 답변\n\n- \"쿠키가 있으니까 세션 문제는 아니다\"라고 말한다.\n- SavedRequest가 있으면 인증도 자동으로 된다고 생각한다.\n- CORS 에러 문구만 보고 SameSite, Path, Secure, credentials 확인을 건너뛴다.\n- 로그인 성공 후 redirect location만 보고 다음 요청의 cookie attach를 보지 않는다.\n- principal이 없어서 `/login`으로 간 것과 principal은 있는데 `403`인 것을 섞는다.\n- session persistence 실패를 SavedRequest cleanup 문제로 해결하려고 한다.\n\n좋은 답변은 \"저장된 요청 복원\", \"세션 쿠키 전송\", \"인증 컨텍스트 복원\", \"인가 판단\"을 순서대로 분리한다.\n\n## 약점 태그\n\n`session-persistence`, `cookie-attach`, `savedrequest`, `securitycontext-restore`\n\n## 복습 연결 concept\n\n약하면 `spring-roomescape-login-savedrequest-cookie-bridge`와 `cors-samesite-credentials-interview-router`를 본다. 답변에서 \"쿠키가 보인다\"와 \"요청에 붙었다\"를 같은 말로 쓰면 다시 풀어본다.\n\n## 추가 채점 질문\n\n```text\n로그인 성공 response:\nSet-Cookie: JSESSIONID=abc; Path=/; SameSite=Lax\n\n다음 요청:\nGET https://api.example.com/admin/reservations\nOrigin: https://app.example.net\nCookie header 없음\n```\n\n이 장면에서 1차 원인은 SavedRequest가 아니다. cookie가 다음 요청에 붙지 않았으므로 Domain/SameSite/Secure/credentials/CORS credential contract를 먼저 본다. SavedRequest는 cookie가 붙고 session이 복원된 뒤에도 원래 URL 복귀가 실패할 때 보는 축이다.\n",
+  "aliases": [
+    "roomescape savedrequest cookie drill",
+    "룸이스케이프 SavedRequest 쿠키 드릴",
+    "JSESSIONID redirect loop review drill",
+    "로그인 후 원래 페이지 복귀 복습"
+  ],
+  "expected_queries": [
+    "SavedRequest랑 JSESSIONID 흐름 복습 질문 내줘",
+    "로그인 후 redirect loop가 날 때 확인 순서 연습하고 싶어",
+    "roomescape 로그인 쿠키 드릴 풀어볼래"
+  ],
+  "symptoms": [
+    "로그인 후 다시 login 페이지로 돌아갑니다",
+    "Application 탭에는 cookie가 있지만 request에는 없습니다",
+    "원래 요청 복원과 인증 복원을 섞습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-roomescape-login-savedrequest-cookie-bridge"
+    ],
+    "next_docs": [
+      "security/savedrequest-redirect-loop-symptom-router",
+      "security/cors-samesite-credentials-interview-router"
+    ],
+    "confusable_with": [
+      "spring/spring-roomescape-login-savedrequest-cookie-bridge",
+      "security/cors-samesite-credentials-interview-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/roomescape-savedrequest-cookie-review-drill.md",
+    "revision_history": []
+  }
+}

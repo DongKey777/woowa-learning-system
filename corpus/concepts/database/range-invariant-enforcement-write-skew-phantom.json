@@ -1,0 +1,82 @@
+{
+  "id": "database/range-invariant-enforcement-write-skew-phantom",
+  "title": "Range Invariant Enforcement for Write Skew and Phantom Anomalies",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 write skew와 phantom을 range invariant, set invariant, overlap invariant로 분류하고 UNIQUE, exclusion constraint, slotization, guard row, serializable, compensation 중 enforcement surface를 고르는 advanced chooser다.",
+  "body_markdown": "# Range Invariant Enforcement for Write Skew and Phantom Anomalies\n\n> 한 줄 요약: write skew와 phantom은 row 하나가 아니라 범위·집합 규칙이 흔들릴 때 생기므로, 조회 후 판단보다 constraint, slotization, guard row 같은 저장 시점 enforcement로 옮겨야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Write Skew와 Phantom Read 사례](./write-skew-phantom-read-case-studies.md)\n- [Guard Row vs Serializable Retry vs Reconciliation for Set Invariants](./guard-row-vs-serializable-vs-reconciliation-set-invariants.md)\n- [Write Skew Detection과 Compensation Patterns](./write-skew-detection-compensation-patterns.md)\n- [Exclusion Constraint Case Studies for Overlap and Range Invariants](./exclusion-constraint-overlap-case-studies.md)\n- [Engine Fallbacks for Overlap Enforcement](./engine-fallbacks-overlap-enforcement.md)\n- [트랜잭션 격리수준과 락](./transaction-isolation-locking.md)\n- [Gap Lock과 Next-Key Lock](./gap-lock-next-key-lock.md)\n- [Compare-and-Swap과 Pessimistic Locks](./compare-and-swap-vs-pessimistic-locks.md)\n- [Transaction Boundary, Isolation, and Locking Decision Framework](./transaction-boundary-isolation-locking-decision-framework.md)\n\nretrieval-anchor-keywords: range invariant, set invariant, predicate lock, serializable snapshot isolation, write skew prevention, phantom-safe constraint, overlap invariant, capacity guard row, slotization, reservation ledger, temporal overlap protection, engine fallback, PostgreSQL vs MySQL overlap, guard row vs serializable, reconciliation loop, write skew 의미와 방지, phantom 읽기와 범위 invariant, 시간 범위 겹침 방지 DB, check-then-act race 방지, exclusion constraint 언제, range lock predicate lock 비교, serializable snapshot isolation 의미, UNIQUE vs exclusion vs guard row 선택, 예약 시간 겹침 DB 방어\n\n## 핵심 개념\n\nWrite skew와 phantom을 같이 보면 공통점이 있다. 둘 다 \"한 row가 충돌했는가\"보다 **범위나 집합 규칙이 유지되는가**가 핵심이다.\n\n- `unique(email)`처럼 한 row 또는 정확한 key를 보호하는 문제는 point invariant에 가깝다.\n- \"같은 회의실에 겹치는 시간대 예약 금지\"는 overlap/range invariant다.\n- \"당직자는 최소 1명 남아야 한다\", \"전체 예약 합계는 capacity를 넘지 않아야 한다\"는 set/capacity invariant다.\n\n문제가 되는 이유는 애플리케이션이 자주 다음 패턴으로 구현하기 때문이다.\n\n1. 조회한다.\n2. 조건이 만족된다고 판단한다.\n3. insert/update 한다.\n\n이 구조는 동시에 두 트랜잭션이 같은 \"없음\" 또는 \"여유 있음\"을 관찰하면 쉽게 새어 버린다.\n\n## 깊이 들어가기\n\n### 1. row lock으로는 범위 규칙을 다 못 막는다\n\nrow lock은 이미 존재하는 row 충돌에는 강하다. 하지만 아래 문제는 다르다.\n\n- 아직 존재하지 않는 row의 삽입이 금지되어야 하는 경우\n- 여러 row의 합계나 개수가 규칙을 만족해야 하는 경우\n- 서로 다른 row를 수정해도 전체 규칙이 깨지는 경우\n\n즉 \"누가 같은 row를 건드렸는가\"가 아니라 \"트랜잭션이 어떤 predicate를 믿고 있었는가\"가 중요하다.\n\n### 2. invariant 모양에 따라 enforcement 방식도 달라진다\n\n| invariant 유형 | 예시 | 우선 검토할 enforcement |\n|---|---|---|\n| point uniqueness | 이메일 중복 금지, `(seat_id, slot_id)` 중복 금지 | `UNIQUE`, PK, upsert arbitration |\n| overlap / range | 시간 구간 예약 겹침 금지 | exclusion-style constraint, slotization, predicate-safe locking |\n| set / count / sum | 당직 최소 1명, 총 예약 수량 <= capacity | guard row, ledger/counter row, serializable, atomic conditional update |\n| distributed boundary | 여러 서비스 합산 quota, 외부 시스템 포함 예약 | reservation ledger, post-commit validation, compensation |\n\n## wrong-bucket / 오선택과 confusable neighbor\n\n| 학습자가 처음 붙이는 이름 | wrong-bucket / 오선택 | confusable neighbor | 실제로 먼저 물어야 할 질문 | 왜 그 버킷만으로는 부족한가 |\n|---|---|---|---|---|\n| \"중복 방지니까 `UNIQUE`면 되나요?\" | exact key uniqueness로만 보기 | `database/engine-fallbacks-overlap-enforcement` | 같은 exact key 하나가 충돌하나? | `UNIQUE(room_id, start_at)`는 시작 시각만 막을 뿐 `10:00~11:00`과 `10:30~11:30` overlap을 자동으로 막지 않는다 |\n| \"row lock을 걸면 되나요?\" | 존재 row 충돌 문제로만 보기 | `database/write-skew-phantom-read-case-studies` | 이미 존재하는 대표 row가 있나? | base booking table에서 `0 row`를 읽고 `FOR UPDATE`를 붙여도 아직 없는 phantom insert를 같은 의미로 잠그는 보장은 엔진/쿼리 path에 따라 달라진다 |\n| \"격리수준을 올리면 끝인가요?\" | isolation level 선택 문제로만 보기 | `database/guard-row-vs-serializable-vs-reconciliation-set-invariants` | 불변식이 DB가 볼 수 있는 predicate로 표현됐나? | isolation은 관측/충돌을 다루는 장치이고, overlap 금지나 capacity 상한 자체를 도메인 제약으로 정의해 주지는 않는다 |\n| \"idempotency key가 있으면 되나요?\" | 같은 요청 재시도 중복 문제로만 보기 | `database/lost-update-vs-write-skew-vs-phantom-timeline-guide` | 같은 요청 재전송 문제인가, 서로 다른 요청 간 자원 충돌인가? | idempotency는 같은 client command의 중복 실행을 줄일 뿐, 다른 사용자의 시간대 overlap이나 총량 초과를 대신 막지 않는다 |\n\n핵심은 격리수준 이름을 외우는 것이 아니라, **불변식이 어떤 모양인지 먼저 분류하는 것**이다.\n\n### 3. overlap invariant는 \"겹침 금지\"를 저장 규칙으로 내려야 한다\n\n회의실 예약을 예로 들면:\n\n- 나쁜 모델: `겹치는 예약이 없으면 insert`\n- 더 나은 모델: 겹침 금지를 constraint semantics나 discrete slot row로 표현\n\n연속 구간이면 overlap 판단이 필요하므로 exclusion-style constraint가 맞을 수 있다.\n시간 단위가 15분, 30분처럼 bucket으로 잘리면 slot row + unique key가 더 단순할 수 있다.\n\n즉 overlap 문제는 \"조회 결과가 비어 있는가\"보다 \"저장 시점에 겹침을 거부할 수 있는가\"로 옮겨야 한다.\n\n### 4. capacity invariant는 guard row나 ledger를 별도로 세워야 한다\n\n합계/개수 제약은 row 여러 개를 보고 판단하면 write skew가 잘 생긴다.\n\n예:\n\n- 예약 총합이 `capacity`를 넘지 않아야 함\n- 잔여 좌석 수가 음수가 되면 안 됨\n- 당직 의사가 최소 1명은 남아야 함\n\n이런 문제는 다음 패턴이 더 안전하다.\n\n- capacity를 대표하는 guard row를 한 곳에 두고 조건부 update\n- reservation ledger에 claim을 먼저 남기고 합계를 원자적으로 판정\n- 가능한 경우 serializable이나 predicate-safe locking 사용\n\n중요한 점은 \"합계를 계산하는 질의\"와 \"승인 결정을 기록하는 쓰기\"가 분리되면 다시 새기 쉽다는 것이다.\n\n### 5. 격리수준은 도움을 주지만 모델링을 대신하지는 않는다\n\nSerializable이나 next-key/predicate 계열 보호는 도움이 된다. 하지만 다음 한계가 남는다.\n\n- 엔진별 동작 차이가 크다\n- 성능 비용이 커질 수 있다\n- 애플리케이션이 규칙을 정확히 표현하지 못하면 여전히 새는 구간이 생긴다\n\n즉 격리수준은 최종 안전망일 수는 있어도, 잘못된 모델을 마법처럼 고쳐 주지는 않는다.\n\n### 6. 완전 차단이 어렵다면 검증과 보상을 붙인다\n\n외부 시스템이나 다중 서비스가 걸리면 모든 규칙을 단일 트랜잭션으로 막기 어렵다.\n\n이때는:\n\n- 가능한 한 로컬에서는 constraint/guard row로 먼저 줄이고\n- 커밋 후 validation으로 위반 여부를 감지하고\n- 보상 작업을 idempotent하게 설계한다\n\n이 흐름이 [Write Skew Detection과 Compensation Patterns](./write-skew-detection-compensation-patterns.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1. 당직 의사 최소 1명 규칙\n\n두 의사가 동시에 자기 row만 off로 바꾸면 row 충돌은 없어도 규칙은 깨질 수 있다.\n이 문제는 단순 row lock보다 `on_call_count` guard row나 serializable 판정이 더 직접적이다.\n\n### 시나리오 2. 회의실 시간 구간 예약\n\n겹치는 예약이 없는지 먼저 조회하고 insert하면 phantom이 난다.\n연속 구간이면 exclusion-style constraint, discrete slot이면 slot row + unique key가 더 안전하다.\n\n### 시나리오 3. 재고/좌석 capacity 초과\n\n여러 주문이 동시에 \"아직 남아 있다\"고 보고 각각 감소시키면 합계가 음수가 될 수 있다.\ncapacity row에 조건부 update를 걸거나 reservation ledger를 통해 승인 순서를 만들 필요가 있다.\n\n## 코드로 보기\n\n```sql\n-- discrete slot으로 환원 가능한 경우\nCREATE UNIQUE INDEX uq_room_slot\nON room_slot_reservation(room_id, slot_id);\n```\n\n```sql\n-- guard row를 두고 조건부로 승인 수량을 올리는 패턴\nUPDATE inventory_guard\nSET reserved = reserved + :delta,\n    version = version + 1\nWHERE sku_id = :sku_id\n  AND reserved + :delta <= capacity\n  AND version = :version;\n```\n\n```text\ndecision pattern\n1. exact key 충돌인가?\n   -> unique / primary key\n2. overlap 금지인가?\n   -> exclusion-style constraint or slotization\n3. 합계 / 개수 / 최소치 규칙인가?\n   -> guard row / ledger / conditional update\n4. 단일 트랜잭션으로 닫히지 않는가?\n   -> validation + idempotent compensation\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 조회 후 판단 + insert/update | 구현이 빠르다 | phantom/write skew에 취약하다 | 중요도가 낮거나 임시 실험 |\n| unique / check / exclusion-style constraint | 규칙을 저장 시점에 강제한다 | 엔진/모델 제약이 있다 | DB가 규칙을 직접 표현할 수 있을 때 |\n| slotization | 설명 가능하고 테스트하기 쉽다 | row 수가 늘어난다 | 시간이 discrete bucket으로 나뉠 때 |\n| guard row / ledger | 합계 불변식에 강하다 | 추가 모델링이 필요하다 | capacity/count 규칙이 핵심일 때 |\n| serializable / predicate-safe locking | 강한 보호를 준다 | 비용이 크고 운영 튜닝이 필요하다 | 높은 정합성이 우선일 때 |\n| post-commit validation + compensation | 분산 경계에 현실적이다 | 늦게 발견될 수 있다 | 완전한 사전 차단이 어려울 때 |\n\n## 꼬리질문\n\n> Q: write skew를 막으려면 무조건 serializable이면 되나요?\n> 의도: 격리수준과 모델링 책임을 구분하는지 확인\n> 핵심: 강한 보호는 되지만 비용이 크고, guard row/constraint로 더 직접적으로 표현할 수 있으면 그 편이 낫다\n\n> Q: overlap invariant와 capacity invariant는 왜 다른가요?\n> 의도: 불변식의 모양에 따라 enforcement가 달라진다는 점을 이해하는지 확인\n> 핵심: overlap은 구간 관계, capacity는 합계/개수 규칙이라 같은 도구가 항상 맞지 않는다\n\n> Q: slotization은 언제 exclusion-style constraint보다 낫나요?\n> 의도: 문법보다 모델 단순화를 우선할 수 있는지 확인\n> 핵심: 시간이나 자원이 discrete bucket으로 자연스럽게 나뉘는 경우다\n\n## 한 줄 정리\n\nWrite skew와 phantom을 줄이려면, 범위·집합 불변식을 조회 결과에 맡기지 말고 constraint, slotization, guard row, validation/compensation 같은 저장 시점 enforcement로 내려야 한다.\n",
+  "aliases": [
+    "range invariant",
+    "set invariant",
+    "predicate lock",
+    "serializable snapshot isolation",
+    "write skew prevention",
+    "phantom-safe constraint",
+    "overlap invariant",
+    "capacity guard row",
+    "slotization",
+    "reservation ledger",
+    "write skew",
+    "write-skew",
+    "phantom read",
+    "phantom 읽기",
+    "phantom anomaly",
+    "팬텀 읽기",
+    "팬텀 row",
+    "range lock",
+    "predicate locking",
+    "SSI",
+    "serializable snapshot",
+    "exclusion constraint",
+    "범위 invariant",
+    "집합 invariant",
+    "범위 조건 중복",
+    "시간 범위 겹침",
+    "시간대 겹침 방지",
+    "overlap 방지",
+    "check-then-act race",
+    "range based race",
+    "예약 시간 겹침",
+    "예약 범위 충돌"
+  ],
+  "expected_queries": [
+    "write skew와 phantom을 막으려면 range invariant를 어떤 저장 시점 enforcement로 내려야 해?",
+    "exact uniqueness, overlap invariant, capacity set invariant를 각각 어떤 도구로 닫아야 하는지 비교해줘",
+    "check-then-insert가 absence나 overlap에서 phantom에 취약한 이유를 설명해줘",
+    "slotization, exclusion constraint, guard row, serializable retry를 어떤 기준으로 선택해?",
+    "단일 transaction으로 완전히 못 닫는 range invariant는 validation과 compensation을 어떻게 붙여?"
+  ],
+  "symptoms": [
+    "조회 후 판단하고 insert/update하는 check-then-act 구조로 absence, overlap, capacity invariant를 지키려 해",
+    "write skew와 phantom이 row 하나 충돌이 아니라 범위나 집합 규칙 위반이라는 점을 놓치고 있어",
+    "exact uniqueness, overlap/range, set/count/sum invariant마다 UNIQUE, exclusion, slotization, guard row, serializable 중 무엇을 고를지 결정해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/write-skew-phantom-read-case-studies",
+      "database/transaction-isolation-locking"
+    ],
+    "next_docs": [
+      "database/guard-row-vs-serializable-vs-reconciliation-set-invariants",
+      "database/engine-fallbacks-overlap-enforcement",
+      "database/exclusion-constraint-overlap-case-studies"
+    ],
+    "confusable_with": [
+      "database/guard-row-vs-serializable-vs-reconciliation-set-invariants",
+      "database/engine-fallbacks-overlap-enforcement",
+      "database/write-skew-phantom-read-case-studies",
+      "database/exclusion-constraint-overlap-case-studies",
+      "database/lost-update-vs-write-skew-vs-phantom-timeline-guide",
+      "database/read-committed-repeatable-read-anomalies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/range-invariant-enforcement-write-skew-phantom.md",
+    "revision_history": []
+  }
+}

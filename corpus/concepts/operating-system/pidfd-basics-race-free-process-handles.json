@@ -1,0 +1,47 @@
+{
+  "id": "operating-system/pidfd-basics-race-free-process-handles",
+  "title": "pidfd Basics Race-Free Process Handles",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 pidfd를 PID number reuse 문제를 피하면서 process를 안정적으로 가리키는",
+  "body_markdown": "# pidfd Basics, Race-Free Process Handles\n\n> 한 줄 요약: pidfd는 PID 재사용 문제를 피하면서 프로세스를 안정적으로 가리키는 커널 핸들이라, 종료 감시와 signal 전달을 더 안전하게 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)\n> - [PID Namespace, Init Semantics](./pid-namespace-init-semantics.md)\n> - [Linux Process State Machine, Zombie, Orphan](./linux-process-state-zombie-orphan.md)\n> - [signals, process supervision](./signals-process-supervision.md)\n> - [UNIX Domain Socket, FD Passing, Credentials](./unix-domain-socket-fd-passing-credentials.md)\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n\n> retrieval-anchor-keywords: pidfd, pidfd_open, pidfd_send_signal, PID reuse, race-free handle, process handle, pollable process, waitid\n\n## 핵심 개념\n\nPID는 숫자라 재사용될 수 있다. pidfd는 이 숫자 대신 프로세스를 안정적으로 가리키는 파일 디스크립터다.\n\n- `pidfd_open`: PID를 pidfd로 연다\n- `pidfd_send_signal`: pidfd를 통해 signal을 보낸다\n- `race-free`: PID 재사용으로 인한 착오를 줄인다\n\n왜 중요한가:\n\n- supervisor가 잘못된 PID에 signal을 보낼 위험을 줄인다\n- process lifecycle 관찰이 안정적이다\n- container와 namespace 환경에서 유용하다\n- 다만 pidfd를 얻은 뒤의 handle이 안정적인 것이지, 잘못 찾은 PID를 pidfd로 여는 실수까지 자동으로 고치지는 않는다\n\n이 문서는 [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)와 [PID Namespace, Init Semantics](./pid-namespace-init-semantics.md)를 더 안전한 process handle 관점에서 본다.\n\n## 깊이 들어가기\n\n### 1. PID는 재사용될 수 있다\n\n프로세스가 끝난 뒤 같은 숫자가 다른 프로세스에 할당될 수 있다.\n\n- `kill(pid)`만으로는 race가 생길 수 있다\n- supervisor는 잘못된 대상에 signal을 보낼 가능성이 있다\n- pidfd는 이런 문제를 줄인다\n\n### 2. pidfd는 파일 디스크립터처럼 다룬다\n\n- poll/epoll과 함께 다룰 수 있다\n- 프로세스 종료를 안정적으로 관찰할 수 있다\n- FD 기반 관리 모델에 잘 맞는다\n\n### 3. container/supervision과 궁합이 좋다\n\n- PID namespace 안팎에서 더 안전하다\n- daemon manager가 child를 안정적으로 제어할 수 있다\n- lifecycle race를 줄인다\n\n### 4. pidfd는 만능이 아니라 도구다\n\n- 모든 코드가 pidfd를 쓰는 것은 아니다\n- 기존 supervisor와 통합이 필요하다\n- 커널/배포판 지원을 확인해야 한다\n\n### 5. race-free 범위는 \"handle 획득 이후\"다\n\n`pidfd_open(pid, 0)`은 그 시점의 process를 fd로 고정한다. 하지만 pid 값을 이름 검색, pidfile, 로그에서 먼저 얻는 사이에 재사용이 일어나면 이미 다른 process를 열 수 있다.\n\n- child를 직접 만들 수 있으면 `clone3()`의 `CLONE_PIDFD`처럼 생성 시점에 pidfd를 받는 경로가 가장 안전하다\n- 기존 PID를 열어야 하면 start time, cgroup, executable, parent 관계 같은 보조 신호로 대상을 검증한다\n- pidfd 기반 signal은 handle 획득 뒤의 PID reuse race를 줄이지만 권한, namespace visibility, process exit 상태는 여전히 확인해야 한다\n\n## 실전 시나리오\n\n### 시나리오 1: supervisor가 가끔 잘못된 프로세스에 signal을 보낸다\n\n가능한 원인:\n\n- PID 재사용 race\n- 오래된 PID 캐시\n- 프로세스 확인 시점과 signal 시점의 간극\n\n진단 방향:\n\n- pidfd 기반으로 교체 검토\n- `waitid`와 process lifecycle 관찰 강화\n- PID를 어디서 얻는지, pidfd를 언제 여는지, 열기 전 대상 검증이 있는지 확인\n\n### 시나리오 2: 종료 감시가 안정적이지 않다\n\n가능한 원인:\n\n- child reaping과 signal 전달이 분리되어 있다\n- wrapper가 PID를 잘못 다룬다\n- namespace 경계를 오해한다\n\n### 시나리오 3: 컨테이너 운영에서 PID 관리가 자주 꼬인다\n\n가능한 원인:\n\n- namespace별 PID가 다르다\n- host PID와 container PID를 혼동한다\n- zombie/exit 감시가 분산돼 있다\n\n## 코드로 보기\n\n### pidfd 개념 감각\n\n```text\nopen pidfd for process\n  -> keep stable handle\n  -> signal or poll on handle\n  -> avoid PID reuse race\n```\n\n### 핵심 API 이름\n\n```c\npidfd_open(pid, 0);\npidfd_send_signal(pidfd, SIGTERM, NULL, 0);\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| pidfd 사용 | race를 줄인다 | 코드와 환경이 더 복잡하다 | supervisor |\n| pid 숫자만 사용 | 단순하다 | 재사용 race와 대상 검증 누락이 있다 | 작은 도구 |\n| pidfd + poll | 종료 관찰이 쉽다 | 호환성 확인 필요 | runtime manager |\n| 생성 시점 pidfd 획득 | lookup race를 가장 줄인다 | API/커널 지원이 필요하다 | process manager |\n\n## 꼬리질문\n\n> Q: pidfd는 왜 필요한가요?\n> 핵심: PID 재사용으로 인한 race를 줄이기 위해서다.\n\n> Q: pidfd와 kill(pid)의 차이는?\n> 핵심: pidfd는 안정적인 핸들, kill은 숫자 PID를 직접 쓴다.\n\n> Q: pidfd는 어디에 유용한가요?\n> 핵심: supervisor, container runtime, lifecycle 관리다.\n\n## 한 줄 정리\n\npidfd는 PID 재사용 race를 줄이는 안정적인 process handle이라서, supervisor와 container runtime에 특히 유용하다.\n",
+  "aliases": [
+    "pidfd basics",
+    "race-free process handle",
+    "PID reuse race",
+    "pidfd signal",
+    "process exit monitoring",
+    "stable process reference"
+  ],
+  "expected_queries": [
+    "pidfd는 PID reuse race를 어떻게 피하는 process handle이야?",
+    "process 종료 감시와 signal 전달을 pidfd로 더 안전하게 하는 이유는?",
+    "PID 숫자와 pidfd kernel handle은 어떻게 달라?",
+    "namespace와 PID 재사용 환경에서 process reference를 안정적으로 잡는 법은?"
+  ],
+  "symptoms": [
+    "`pidfd Basics Race-Free Process Handles`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`pidfd Basics Race-Free Process Handles`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`pidfd Basics Race-Free Process Handles`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "PID 숫자를 안정적인 process handle로 보고 PID reuse, namespace boundary, race-free signal/exit observation 문제를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics",
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-creation-fork-vs-exec-vs-posix-spawn-vs-vfork-intermediate-chooser"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/pidfd-basics-race-free-process-handles.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "id": "software-engineering/api-slow-cpu-low-pool-wait-cause-router",
+  "title": "API가 느린데 CPU는 낮을 때 pool wait부터 가르는 원인 라우터",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# API가 느린데 CPU는 낮을 때 pool wait부터 가르는 원인 라우터\n\n> 한 줄 요약: API가 느린데 CPU가 낮으면 \"계산이 느리다\"보다 **어딘가의 대기열에서 기다린다**는 신호일 수 있다. 먼저 request timeline에서 기다린 위치를 잡고, thread pool, DB connection pool, upstream connection pool, DB query/lock 중 하나로 보낸다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [HikariCP 커넥션 풀 튜닝](../database/hikari-connection-pool-tuning.md)\n- [Timeout 로그 타임라인 체크리스트 카드](../database/timeout-log-timeline-first-failure-checklist-card.md)\n- [Pool 지표와 Lock Wait Timeout 미니 브리지](../database/pool-metrics-lock-wait-timeout-mini-bridge.md)\n- [Blocking I/O Thread Pool Backpressure Primer](../operating-system/blocking-io-thread-pool-backpressure-primer.md)\n- [Upstream Queueing / Connection Pool Wait Tail Latency](../network/upstream-queueing-connection-pool-wait-tail-latency.md)\n- [느린 쿼리 분석 플레이북](../database/slow-query-analysis-playbook.md)\n- [Java Thread Dump State Interpretation](../language/java/thread-dump-state-interpretation.md)\n- [JFR Thread Dump GC First Aid Playbook](../language/java/jfr-thread-dump-gc-first-aid-playbook.md)\n- [Lock Contention Futex Wait Off CPU Debugging](../operating-system/lock-contention-futex-offcpu-debugging.md)\n- [Tail Latency P99 Debugging Playbook](../system-design/tail-latency-p99-debugging-playbook.md)\n- [Spring TaskExecutor / TaskScheduler Overload Semantics](../spring/spring-taskexecutor-taskscheduler-overload-rejection-semantics.md)\n\n## 먼저 붙일 질문\n\n처음에는 \"서버가 느리다\"를 한 덩어리로 보지 말고 **요청이 어느 입구에서 줄을 섰는지**만 나눈다.\n\n| 먼저 보이는 신호 | 더 가까운 원인 | 먼저 갈 문서 |\n|---|---|---|\n| executor queue가 늘고 worker가 계속 바쁘다 | thread pool / worker pool 포화 | [Blocking I/O Thread Pool Backpressure Primer](../operating-system/blocking-io-thread-pool-backpressure-primer.md) |\n| Hikari `active ~= max`, `idle = 0`, `threads awaiting connection` | DB connection pool 대기 | [HikariCP 커넥션 풀 튜닝](../database/hikari-connection-pool-tuning.md) |\n| WebClient/Reactor Netty `pending acquire`, upstream pool wait | HTTP client connection pool 대기 | [Upstream Queueing / Connection Pool Wait Tail Latency](../network/upstream-queueing-connection-pool-wait-tail-latency.md) |\n| upstream span 자체가 길고 pending acquire는 낮다 | downstream 서비스 지연 | [Tail Latency P99 Debugging Playbook](../system-design/tail-latency-p99-debugging-playbook.md) |\n| query 시간이 실제로 길고 `EXPLAIN` row가 크다 | DB query/plan 문제 | [느린 쿼리 분석 플레이북](../database/slow-query-analysis-playbook.md) |\n| DB lock wait, blocker, `Lock wait timeout exceeded` | lock 대기 때문에 connection hold time 증가 | [Pool 지표와 Lock Wait Timeout 미니 브리지](../database/pool-metrics-lock-wait-timeout-mini-bridge.md) |\n| thread dump에 `BLOCKED`, 같은 monitor, `futex`/park가 반복된다 | 애플리케이션 lock contention | [Lock Contention Futex Wait Off CPU Debugging](../operating-system/lock-contention-futex-offcpu-debugging.md) |\n| GC log/JFR의 pause가 latency spike와 같은 시각에 겹친다 | JVM GC / safepoint pause | [JFR Thread Dump GC First Aid Playbook](../language/java/jfr-thread-dump-gc-first-aid-playbook.md) |\n\n## 증거로 가르는 여섯 갈래\n\n| 갈래 | 강한 증거 | 조심할 오판 |\n|---|---|---|\n| thread pool wait | executor queue 증가, active worker 포화, thread dump가 worker 부족이나 blocking I/O에 묶임 | DB pool wait 때문에 worker가 대기하는 것을 thread 수 부족으로만 본다 |\n| DB connection pool wait | Hikari `active ~= max`, `idle = 0`, borrow/acquire timer 증가, `threads awaiting connection` 선행 | maximumPoolSize만 키우고 connection hold time의 원인을 놓친다 |\n| upstream pool wait | HTTP client `pending acquire`, connection active max, connect/read timeout보다 acquire timeout이 먼저 증가 | downstream 서비스가 느린 것과 client pool 좌석 부족을 섞는다 |\n| downstream 자체 지연 | dependency span duration, upstream p95/p99, remote 5xx/timeout이 같은 시각에 증가 | caller CPU가 낮다는 이유로 외부 의존성 병목을 제외한다 |\n| lock wait | DB blocker/waiter, lock timeout, Java `BLOCKED`/park stack, 같은 lock owner 반복 | query 실행 시간이 짧다고 DB나 lock을 완전히 제외한다 |\n| GC/safepoint | JFR/GC log pause, safepoint event, allocation spike가 request latency 구간과 겹침 | 평균 CPU가 낮으니 runtime pause가 아니라고 단정한다 |\n\n## 빠른 순서\n\n1. 요청 전체 시간을 `controller 진입 전`, `service 내부`, `DB borrow`, `query`, `upstream call`, `response write`로 나눈다.\n2. CPU가 낮으면 계산보다 대기열을 먼저 의심한다.\n3. pool 지표는 원인 판결이 아니라 **어느 입구가 막혔는지**를 보여 주는 표지로 읽는다.\n4. dependency span을 보고 `pending acquire`가 긴지, remote response 자체가 긴지 나눈다.\n5. thread dump는 \"worker가 어디서 기다리는지\"를 확인할 때 연다.\n6. GC log/JFR pause와 latency spike timestamp가 겹치는지 확인한다.\n7. pool size를 키우기 전에 hold time, timeout, retry, 외부 I/O in transaction을 확인한다.\n\n## 흔한 오해\n\n- `threads awaiting connection`이 보이면 Hikari maximumPoolSize만 올리면 된다고 본다. 실제 원인은 긴 트랜잭션, lock wait, 외부 API 호출을 트랜잭션 안에서 기다린 구조일 수 있다.\n- slow query가 없으니 DB는 완전히 무관하다고 본다. query는 빨라도 connection을 빌리기 전 대기 시간이 길 수 있다.\n- CPU가 낮으니 서버가 한가하다고 본다. thread가 socket, DB connection, lock, upstream 응답을 기다리면 CPU는 낮아도 p95는 커진다.\n- thread pool과 connection pool을 같은 queue로 본다. thread pool은 실행 worker의 좌석이고, connection pool은 DB나 upstream과 통신할 연결 좌석이다.\n- upstream `pending acquire`와 downstream latency를 같은 뜻으로 본다. 전자는 caller 쪽 연결 좌석 대기이고, 후자는 remote 서비스가 응답을 늦게 준 것이다.\n- 짧은 GC pause를 무시한다. p95/p99 구간과 pause timestamp가 겹치면 평균 CPU가 낮아도 사용자 latency에는 보일 수 있다.\n\n## 한 문장 판단\n\n`CPU 낮음 + p95 증가 + slow query 없음`이면 먼저 **대기 위치**를 찾고, `executor queue`, `threads awaiting connection`, `pending acquire`, `downstream span`, `lock wait`, `GC pause`, `query time` 중 가장 먼저 증가한 신호로 다음 문서를 고른다.\n",
+  "aliases": [
+    "api slow cpu low pool wait",
+    "API 느린데 CPU 낮음",
+    "app slow db fast",
+    "thread pool vs connection pool starvation",
+    "backend latency first split",
+    "요청은 느린데 쿼리는 빠름",
+    "커넥션 풀 대기인지 스레드 풀 대기인지",
+    "CPU 낮은데 GC pause lock wait downstream 대기",
+    "pool wait vs downstream latency vs GC pause"
+  ],
+  "expected_queries": [
+    "API는 느린데 CPU가 낮고 DB 쿼리는 빠르면 어디부터 봐야 해?",
+    "thread pool starvation이랑 DB connection pool starvation을 처음에 어떻게 구분해?",
+    "Hikari active idle awaiting 지표와 executor queue가 같이 보일 때 원인 순서를 어떻게 잡아?",
+    "요청 p95가 늘었는데 slow query가 없으면 thread dump부터 봐야 해 pool metrics부터 봐야 해?",
+    "upstream pending acquire와 DB pool wait 중 어느 대기열이 tail latency 원인인지 빠르게 가르는 표가 필요해",
+    "CPU가 낮은데 downstream 지연, DB lock wait, GC pause 중 무엇이 p95를 만들었는지 어떻게 나눠?"
+  ],
+  "symptoms": [
+    "API p95가 튀는데 CPU 사용률은 낮고 slow query도 뚜렷하지 않다",
+    "DB 쿼리 자체는 빠른데 요청 전체 시간만 길어져 thread pool과 connection pool 중 어디를 볼지 모르겠다",
+    "Hikari `threads awaiting connection`, executor queue, upstream pending acquire가 한 번에 보여 어느 대기열이 원인인지 헷갈린다",
+    "CPU는 낮지만 lock wait, downstream 응답 지연, GC pause가 간헐적으로 latency spike와 겹친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/test-strategy-basics",
+      "operating-system/process-thread-memory-state-classification-practice-drill"
+    ],
+    "next_docs": [
+      "database/timeout-log-timeline-first-failure-checklist-card",
+      "database/hikari-connection-pool-tuning",
+      "database/pool-metrics-lock-wait-timeout-mini-bridge",
+      "operating-system/blocking-io-thread-pool-backpressure-primer",
+      "network/upstream-queueing-connection-pool-wait-tail-latency",
+      "database/slow-query-analysis-playbook",
+      "language/thread-dump-state-interpretation",
+      "system-design/tail-latency-p99-debugging-playbook",
+      "language/jfr-thread-dump-gc-first-aid-playbook",
+      "operating-system/lock-contention-futex-offcpu-debugging"
+    ],
+    "confusable_with": [
+      "database/hikari-connection-pool-tuning",
+      "database/slow-query-analysis-playbook",
+      "operating-system/blocking-io-thread-pool-backpressure-primer",
+      "network/upstream-queueing-connection-pool-wait-tail-latency",
+      "language/jfr-thread-dump-gc-first-aid-playbook",
+      "operating-system/lock-contention-futex-offcpu-debugging",
+      "system-design/tail-latency-p99-debugging-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/api-slow-cpu-low-pool-wait-cause-router.md",
+    "revision_history": []
+  }
+}

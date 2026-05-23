@@ -1,0 +1,47 @@
+{
+  "id": "language/threadlocal-leak-web-request-router",
+  "title": "ThreadLocal Leak Web Request Router",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 웹 요청/thread pool 환경의 ThreadLocal leak와 context contamination을 분기한다. remove 누락, 이전 사용자 정보 잔존, async context propagation 같은 질문을 다룬다.",
+  "body_markdown": "# ThreadLocal Leak Web Request Router\n\n## 관찰 증거\n\n같은 worker thread가 여러 요청을 재사용하는지, 요청 종료 시 `remove()`가 호출되는지, async boundary에서 context를 명시적으로 복사하고 정리했는지 본다. 웹 요청의 ThreadLocal 문제는 크게 context contamination과 value retention으로 갈린다.\n\n| 증상 | 핵심 원인 | 사용자 영향 |\n|---|---|---|\n| 이전 요청 값이 다음 요청에 남음 | cleanup 누락 | 다른 사용자 context가 섞이는 보안/정합성 문제 |\n| 요청이 끝났는데 객체가 계속 retention | thread pool thread의 ThreadLocalMap이 value 참조 | heap 증가, classloader leak, OOM 위험 |\n| async executor에서 값이 사라짐 | propagation 누락 | trace/user/security context가 끊김 |\n| async executor에서 엉뚱한 값이 보임 | propagation과 cleanup이 모두 불명확 | 오래된 context가 새 작업에 섞임 |\n\n```bash\njcmd <pid> Thread.print > /tmp/thread.txt        # 오래 사는 worker thread 이름과 상태 확인\njcmd <pid> GC.class_histogram > /tmp/histo.txt   # 의심 class 개수 증가 확인\njcmd <pid> GC.heap_dump /tmp/heap.hprof          # retention path 확인용\n```\n\nHeap dump를 뜰 수 있는 상황이면 `Thread -> threadLocals -> table -> value` 경로에 큰 request object, security principal, MDC map, byte buffer, application classloader가 남는지 본다. `Thread.print`나 class histogram만으로는 retention path가 확정되지 않는다.\n\n## 원인 모델\n\n`ThreadLocal` 값은 thread 객체 안의 `ThreadLocalMap`에 저장된다. key는 `ThreadLocal` 참조이고 value는 실제 context 객체다. Java 구현에서 key는 weak reference지만 value는 strong reference다. key가 GC되어도 value가 즉시 사라진다는 뜻은 아니다. 해당 thread가 오래 살아 있고 map 정리가 일어나지 않으면 stale value가 남을 수 있다.\n\nServlet worker, scheduler, 일반 executor worker는 요청보다 오래 산다. 그래서 요청 단위 값은 \"요청이 끝날 때 thread에서 제거된다\"는 불변식이 있어야 한다. `static final ThreadLocal`은 key GC 문제를 줄일 수 있지만, value cleanup 누락과 이전 요청 contamination을 해결하지 못한다.\n\n## 1차 분기\n\n| 관찰 | 먼저 의심 | 다음 확인 |\n|---|---|---|\n| 같은 worker thread name에서 이전 userId/traceId가 다음 요청 로그에 찍힘 | `remove()` 누락 | filter/interceptor `finally` 경로 |\n| async executor로 넘어가면 context가 사라짐 | propagation 누락 | task wrapping, `TaskDecorator`, context snapshot |\n| async executor에서 엉뚱한 context가 보임 | propagation + cleanup 둘 다 문제 | wrapper가 set 후 finally remove 하는지 |\n| heap dump에 old request/session/security object가 thread에 매달림 | ThreadLocal value retention | key/value, classloader, pool thread 생존 기간 |\n| virtual thread 도입 후 ThreadLocal 객체 수가 폭증 | per-task ThreadLocal 남용 | ScopedValue, explicit parameter, request scope 대안 |\n\n이전 요청 값이 다음 요청에 보이면 cleanup 누락 가능성이 높다. Async executor에서 값이 사라지면 propagation 문제다. Async executor에서 값이 \"남아 있거나 섞이면\" cleanup 누락과 잘못된 propagation을 같이 봐야 한다.\n\n## 요청 경계 invariant\n\nFilter/interceptor finally block에서 정리되는지, 예외 경로에서도 cleanup이 되는지 확인한다. 요청 경계의 invariant는 \"set을 수행한 abstraction이 같은 call path의 `finally`에서 clear/remove까지 책임진다\"이다.\n\n```java\nclass RequestContextFilter implements Filter {\n    @Override\n    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)\n            throws IOException, ServletException {\n        try {\n            RequestContextHolder.set(extractContext(request));\n            chain.doFilter(request, response);\n        } finally {\n            RequestContextHolder.clear(); // 내부에서 ThreadLocal.remove()\n        }\n    }\n}\n```\n\n나쁜 모양은 set만 있고 remove가 없는 코드다.\n\n```java\nvoid handle(Request request) {\n    CURRENT_USER.set(request.user());\n    service.handle(request); // 예외가 나면 값이 worker thread에 남을 수 있음\n}\n```\n\n여러 ThreadLocal을 각각 다른 filter/interceptor에서 관리하면 cleanup 순서가 엇갈린다. 예를 들어 `MDC`, `SecurityContext`, custom request context가 서로 다른 곳에서 set/remove 되면 예외 경로에서 하나만 남을 수 있다. 요청 context 소유자를 하나로 모으거나, 최소한 모든 cleanup이 같은 요청 종료 지점에서 실행되는지 확인한다.\n\n## async/executor invariant\n\nAsync boundary에서는 부모 thread의 ThreadLocal을 \"자동으로 따라온다\"고 가정하지 않는다. 필요한 값만 immutable snapshot으로 넘기고, worker에서는 `try/finally`로 정리한다.\n\n```java\nRunnable wrapWithContext(Runnable task) {\n    RequestContext snapshot = RequestContextHolder.current();\n    return () -> {\n        try {\n            RequestContextHolder.set(snapshot);\n            task.run();\n        } finally {\n            RequestContextHolder.clear();\n        }\n    };\n}\n```\n\n`InheritableThreadLocal`은 thread 생성 시점의 값을 자식 thread로 복사한다. thread pool은 thread를 작업마다 새로 만들지 않기 때문에 per-request propagation 해법이 아니다. 오히려 오래된 값이 worker에 남는 원인이 될 수 있다.\n\nVirtual thread는 보통 요청/작업마다 thread 생명주기가 짧아 platform thread pool보다 cross-request contamination 위험이 작다. 그래도 큰 객체를 ThreadLocal에 넣으면 작업 수만큼 메모리 압력이 생기고, carrier thread로 자동 전파된다고 가정할 수도 없다. 값 전달이 핵심이면 명시적 parameter나 request-scoped abstraction을 먼저 본다.\n\n## 관찰 지표\n\n- 로그: 같은 thread name에서 요청 A의 userId/traceId가 요청 B에 찍히는지 본다.\n- metric: request 종료 후 MDC/context size가 남는지, executor queue/active thread, heap old-gen 증가와 같이 본다.\n- heap: `ThreadLocalMap$Entry`, `Thread`, `SecurityContext`, `RequestAttributes`, 큰 DTO/byte array retention path를 확인한다.\n- pool: servlet worker, async executor, scheduler처럼 오래 사는 thread에서 문제가 커진다.\n- 배포 차이: 새 filter/interceptor, MDC 설정, security context wrapper, async 전환이 들어간 시점을 본다.\n\n## Wrong-bucket / caveat\n\n- `ThreadLocal` key를 `static final`로 만들면 leak이 사라진다고 생각한다. key 생존과 value cleanup은 다른 문제다.\n- 요청 종료 cleanup 없이 \"다음 요청에서 덮어쓰니까 괜찮다\"고 본다. 예외/분기/비동기 경로에서는 덮어쓰지 않을 수 있다.\n- `InheritableThreadLocal`로 async propagation을 해결하려 한다. thread pool 재사용과 섞이면 더 오래된 값이 전파될 수 있다.\n- MDC/RequestContext/SecurityContext를 각각 다른 곳에서 set/remove 해서 cleanup 순서가 어긋난다.\n- heap 증가를 모두 ThreadLocal leak로 단정한다. cache, queue backlog, request body buffering, classloader static reference도 같은 증상을 낼 수 있으므로 retention path로 확인한다.\n- 값이 사라지는 문제와 값이 남는 문제를 같은 처방으로 고친다. propagation 누락은 snapshot 전달 문제이고, contamination/retention은 cleanup 문제다. executor wrapper는 둘 다 다루지만 원인은 분리해서 설명해야 한다.\n\n## 안전한 설계 방향\n\n가능하면 request-scoped 값은 메서드 인자나 명시적 context 객체로 넘긴다. 프레임워크 integration 때문에 ThreadLocal을 써야 한다면 소유자를 하나로 정하고, set/clear가 반드시 같은 abstraction 안에 있도록 만든다. async boundary는 \"복사할 값\"과 \"정리할 시점\"을 코드에 드러내야 한다.\n\n## 검증 포인트\n\n- 단일 thread executor로 재현 테스트를 만든다. task A가 `ThreadLocal.set(\"userA\")` 후 remove하지 않고 끝난 뒤, task B 시작 시 값이 보이면 cleanup 실패다.\n- servlet filter 테스트에서는 정상 응답, 예외 발생, early return, async dispatch 경로 모두에서 `clear()`가 호출되는지 본다.\n- executor wrapper 테스트에서는 task 실행 전 snapshot이 들어가고, task 종료 후 같은 worker에서 `current()`가 비어 있는지 확인한다.\n- heap dump에서는 ThreadLocal value가 어떤 thread에 붙어 있는지와 GC root가 thread인지 static field인지 구분한다.\n- 로그 기반 검증은 thread name, request id, user id를 같이 남겨야 한다. user id만 보면 실제 contamination과 로그 correlation 오류를 구분하기 어렵다.\n\n## 관련 playbook\n\nJDK 수준의 저장/전파 원리는 `threadlocal-leaks-context-propagation`, Spring MVC/Security 요청 컨텍스트와 async pool은 `spring-requestcontextholder-threadlocal-leakage-async-pools`로 이어진다.\n",
+  "aliases": [
+    "threadlocal leak web request router",
+    "servlet thread pool threadlocal cleanup",
+    "ThreadLocal 누수 웹 요청",
+    "요청 컨텍스트 ThreadLocal 정리",
+    "final",
+    "static"
+  ],
+  "expected_queries": [
+    "ThreadLocal을 웹 요청에서 쓰면 왜 누수가 날 수 있어?",
+    "thread pool에서 ThreadLocal 값을 remove하지 않으면 뭐가 문제야?",
+    "요청별 context가 다른 사용자에게 섞이는 증상을 어디서 봐?"
+  ],
+  "symptoms": [
+    "이전 요청의 사용자 정보가 다음 요청에 남아요",
+    "ThreadLocal 값이 remove되지 않아 메모리가 늘어요",
+    "async/thread pool 전환 후 context가 이상해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/threadlocal-leaks-context-propagation"
+    ],
+    "next_docs": [
+      "spring/requestcontextholder-threadlocal-leakage-async-pools"
+    ],
+    "confusable_with": [
+      "language/threadlocal-leaks-context-propagation",
+      "spring/requestcontextholder-threadlocal-leakage-async-pools"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/threadlocal-leak-web-request-router.md",
+    "revision_history": []
+  }
+}

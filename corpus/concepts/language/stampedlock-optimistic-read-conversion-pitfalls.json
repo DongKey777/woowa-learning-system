@@ -1,0 +1,58 @@
+{
+  "id": "language/stampedlock-optimistic-read-conversion-pitfalls",
+  "title": "StampedLock Optimistic Read and Conversion Pitfalls",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 StampedLock optimistic read, validate, read fallback, non-reentrant behavior, tryConvertToWriteLock failure, mutable object graph pitfalls를 점검하는 advanced playbook이다.",
+  "body_markdown": "# `StampedLock` Optimistic Read and Conversion Pitfalls\n\n> 한 줄 요약: `StampedLock`의 optimistic read는 lock-free snapshot이 아니라 \"읽고 나서 validate하는 추측\"이다. non-reentrant 특성, lock conversion 실패, 긴 읽기 구간, mutable object graph를 함께 이해하지 않으면 오히려 더 위험한 동시성 코드를 만들 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n> - [Thread Dump State Interpretation](./thread-dump-state-interpretation.md)\n> - [VarHandle, Unsafe, Atomics](./varhandle-unsafe-atomics.md)\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n\n> retrieval-anchor-keywords: StampedLock, optimistic read, validate, lock conversion, tryConvertToWriteLock, non-reentrant lock, read mostly workload, mutable object graph, write starvation, optimistic snapshot, backend contention\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n`StampedLock`은 세 가지 모드를 제공한다.\n\n- write lock\n- read lock\n- optimistic read\n\n여기서 optimistic read는 \"안 잠그고 읽어도 괜찮을 것이라 가정하고, 나중에 검증하는 방식\"이다.\n\n즉 의미가 다르다.\n\n- read lock: 실제로 읽기 락을 잡는다\n- optimistic read: 잠그지 않고 stamp만 받아 later validation 한다\n\n그래서 optimistic read는 snapshot 보장 자체가 아니라 **검증 가능한 추측**이다.\n\n## 재현 조건\n\n| 재현 조건 | 관찰되는 문제 |\n|---|---|\n| optimistic read로 여러 필드를 읽는 동안 writer가 중간 값을 바꾼다 | validate 실패 또는 서로 다른 시점 값이 섞인 계산 |\n| validate 전에 읽은 값으로 외부 호출/로그 적재/상태 변경을 한다 | fallback으로 복구할 수 없는 부작용 |\n| read lock을 잡은 채 같은 `StampedLock`을 다시 타는 메서드를 호출한다 | non-reentrant 때문에 self-deadlock 또는 진행 정지 |\n| `tryConvertToWriteLock` 성공만 가정한다 | upgrade 실패 시 unlock/재획득 경로가 빠져 correctness가 깨짐 |\n\n## 확인 순서\n\n1. optimistic read 구간에서 읽은 값이 모두 지역 변수에만 머무는지 확인한다.\n2. `validate(stamp)` 실패 시 read lock으로 다시 읽는 fallback이 있는지 본다.\n3. lock을 잡은 채 호출하는 메서드가 같은 lock 경로로 재진입하지 않는지 call graph를 본다.\n4. conversion 실패(`0L`)에서 read lock을 해제하고 write lock을 다시 잡는 경로가 있는지 확인한다.\n5. 읽는 대상이 짧은 scalar state인지, mutable object graph 순회인지 구분한다.\n\n## 깊이 들어가기\n\n### 1. optimistic read는 읽은 뒤 validate해야 한다\n\n전형적인 패턴은 이렇다.\n\n- optimistic stamp 획득\n- 필요한 필드를 지역 변수로 읽음\n- `validate(stamp)` 호출\n- 실패하면 read lock으로 다시 읽음\n\n즉 먼저 읽고 나중에 검증한다.  \n검증 전 값에 기반해 부작용을 일으키면 안 된다.\n\n### 2. mutable object graph에서는 더 조심해야 한다\n\nprimitive 두 개 읽는 정도는 비교적 안전하게 설명하기 쉽다.  \n하지만 reference graph를 따라가면 문제가 커진다.\n\n- 객체 참조는 읽었는데 내부 필드가 바뀐다\n- 컬렉션 크기와 실제 요소 상태가 엇갈린다\n- 읽은 여러 필드가 서로 다른 시점 값을 섞는다\n\n즉 optimistic read는 짧고 단순한 state snapshot에 더 잘 맞는다.\n\n### 3. `StampedLock`은 reentrant가 아니다\n\n같은 thread가 다시 같은 lock을 잡는다고 안전하지 않다.  \n콜백, 로깅, 다른 메서드 재진입이 섞이면 예상보다 쉽게 꼬인다.\n\n그래서 다음 패턴은 위험하다.\n\n- lock 잡은 채 다른 메서드 호출\n- 그 메서드가 다시 같은 lock 경로를 탐\n- 재귀 구조와 함께 사용\n\n이건 `ReentrantReadWriteLock`과 사고방식이 다르다.\n\n### 4. lock conversion도 항상 성공하는 게 아니다\n\n`tryConvertToWriteLock()` 같은 API는 유용해 보이지만,  \n항상 upgrade가 되는 것은 아니다.\n\n즉 read 후 조건 확인, 그다음 write로 승격하는 흐름은  \n\"실패할 수 있는 fast path\"로 설계해야 한다.\n\n성공만 가정하면 fallback 경로가 빠지고 correctness가 흔들린다.\n\n### 5. 성능 이득은 workload가 맞을 때만 나온다\n\n`StampedLock`은 read-mostly, short critical section, simple state일 때 이득이 있을 수 있다.  \n하지만 write가 자주 오거나 읽기 구간이 길면 복잡도만 늘어난다.\n\n즉 \"고급 lock이니 더 빠르다\"가 아니라,  \nworkload가 lock model과 맞는지부터 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 캐시 메타데이터를 자주 읽고 드물게 갱신한다\n\nsize, version, lastUpdated 같은 짧은 필드 집합이면 optimistic read 후보가 될 수 있다.  \n하지만 읽은 값으로 바로 외부 부작용을 일으키면 fallback이 어려워진다.\n\n### 시나리오 2: 객체 그래프를 optimistic read로 순회한다\n\n참조를 따라가며 많은 값을 읽는 순간 validate 성공 의미가 약해진다.  \n짧은 scalar snapshot이 아니면 이득보다 위험이 커질 수 있다.\n\n### 시나리오 3: 같은 서비스 메서드에서 lock 재진입이 생긴다\n\n코드 구조가 예쁘게 분리되어 보여도,  \n내부적으로 같은 `StampedLock`을 다시 타면 자기 자신과 충돌할 수 있다.\n\n### 시나리오 4: thread dump에 lock 경합이 보이는데 `StampedLock`으로 바꾸고 싶다\n\n원인이 긴 critical section이나 mutable graph라면 lock 타입 변경만으로는 해결되지 않는다.  \nimmutable snapshot, copy-on-write, state partition이 더 맞을 수 있다.\n\n## failure matrix\n\n| 실패 모드 | 흔한 원인 | 검증 |\n|---|---|---|\n| stale/mixed read | validate 누락, mutable graph 순회 | writer interleaving test, validate 실패 경로 커버 |\n| self-deadlock | non-reentrant lock 안에서 같은 lock 재진입 | thread dump, call graph |\n| lost update | conversion 실패를 성공처럼 처리 | `tryConvertToWriteLock == 0L` 테스트 |\n| 성능 회귀 | 긴 optimistic read, 잦은 writer로 fallback 폭증 | validate failure rate, read/write ratio 계측 |\n\n## 검증 체크\n\n- optimistic read로 읽은 값은 validate 전까지 외부로 내보내지 않는다.\n- validate 실패 fallback 코드가 단위 테스트와 stress test에서 실행된다.\n- lock 구간 안에서 callback, logger appender, repository 호출처럼 재진입 가능성이 있는 경로를 피한다.\n- `StampedLock` 도입 전후로 throughput만 보지 말고 fallback 비율과 tail latency를 같이 본다.\n\n## 코드로 보기\n\n### 1. 전형적인 optimistic read 패턴\n\n```java\nimport java.util.concurrent.locks.StampedLock;\n\npublic final class Point {\n    private final StampedLock lock = new StampedLock();\n    private double x;\n    private double y;\n\n    public double distanceFromOrigin() {\n        long stamp = lock.tryOptimisticRead();\n        double currentX = x;\n        double currentY = y;\n\n        if (!lock.validate(stamp)) {\n            stamp = lock.readLock();\n            try {\n                currentX = x;\n                currentY = y;\n            } finally {\n                lock.unlockRead(stamp);\n            }\n        }\n\n        return Math.hypot(currentX, currentY);\n    }\n}\n```\n\n### 2. conversion은 fallback을 전제로 한다\n\n```java\nlong stamp = lock.readLock();\ntry {\n    if (needsWrite()) {\n        long writeStamp = lock.tryConvertToWriteLock(stamp);\n        if (writeStamp == 0L) {\n            lock.unlockRead(stamp);\n            stamp = lock.writeLock();\n        } else {\n            stamp = writeStamp;\n        }\n        mutate();\n    }\n} finally {\n    lock.unlock(stamp);\n}\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| `StampedLock` optimistic read | read-mostly workload에서 이득이 있을 수 있다 | validate/fallback, non-reentrant 제약, 코드 복잡도가 크다 |\n| `ReentrantReadWriteLock` | 모델이 더 익숙하고 reentrant다 | optimistic path는 없다 |\n| immutable snapshot/copy-on-write | correctness reasoning이 쉽다 | 쓰기 비용과 메모리 비용이 늘 수 있다 |\n| plain `synchronized` | 가장 단순하다 | 고경합 read-heavy workload엔 비효율적일 수 있다 |\n\n핵심은 `StampedLock`을 속도 도구가 아니라 **reasoning 비용이 비싼 특수 lock**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: optimistic read는 lock을 잡는 건가요?\n> 핵심: 아니다. 값을 읽은 뒤 stamp validation으로 충돌이 없었는지 확인하는 방식이다.\n\n> Q: 왜 validate 전에 읽은 값으로 부작용을 내면 안 되나요?\n> 핵심: 그 값이 일관된 snapshot이 아닐 수 있어서 fallback으로 복구할 수 없기 때문이다.\n\n> Q: `StampedLock`은 왜 조심해야 하나요?\n> 핵심: non-reentrant이고 mutable graph에서 reasoning이 어려워 correctness bug를 만들기 쉽기 때문이다.\n\n> Q: 언제 고려할 만한가요?\n> 핵심: 읽기가 압도적으로 많고 짧은 scalar state를 읽는 경우에 한해 신중히 고려할 만하다.\n\n## 한 줄 정리\n\n`StampedLock`의 optimistic read는 \"싸게 읽는다\"가 아니라 \"검증 가능한 추측을 한다\"는 모델이므로, 짧은 state snapshot이 아닌 곳에 무리하게 쓰면 위험하다.\n",
+  "aliases": [
+    "StampedLock Optimistic Read and Conversion Pitfalls",
+    "StampedLock optimistic read validate",
+    "tryConvertToWriteLock failure",
+    "StampedLock non-reentrant",
+    "optimistic read mutable object graph",
+    "자바 StampedLock optimistic read",
+    "final",
+    "synchronized",
+    "volatile"
+  ],
+  "expected_queries": [
+    "StampedLock optimistic read는 lock-free snapshot이 아니라 validate하는 추측이라는 뜻이 뭐야?",
+    "StampedLock optimistic read에서 validate 실패 시 read lock fallback을 어떻게 설계해야 해?",
+    "mutable object graph를 optimistic read로 읽으면 서로 다른 시점 값이 섞일 수 있는 이유가 뭐야?",
+    "StampedLock은 non-reentrant라서 ReentrantReadWriteLock과 어떤 사고방식이 달라?",
+    "tryConvertToWriteLock이 실패할 수 있는 fast path라면 update flow를 어떻게 짜야 해?"
+  ],
+  "symptoms": [
+    "StampedLock optimistic read를 lock-free snapshot처럼 이해해 validate 전 값으로 부작용을 일으키거나 검증 실패 fallback을 빠뜨려",
+    "StampedLock이 non-reentrant라는 점을 모르고 lock을 잡은 채 같은 lock 경로로 재진입하는 메서드나 callback을 호출해",
+    "tryConvertToWriteLock이 항상 성공한다고 가정해 read 후 조건 확인과 write upgrade 실패 경로를 안전하게 설계하지 않아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-concurrency-utilities",
+      "language/thread-dump-state-interpretation",
+      "language/java-memory-model-happens-before-volatile-final"
+    ],
+    "next_docs": [
+      "language/varhandle-unsafe-atomics",
+      "language/locksupport-park-unpark-permit-semantics",
+      "language/thread-interruption-cooperative-cancellation-playbook"
+    ],
+    "confusable_with": [
+      "language/java-concurrency-utilities",
+      "language/varhandle-unsafe-atomics",
+      "language/thread-dump-state-interpretation",
+      "language/java-aba-problem"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/stampedlock-optimistic-read-conversion-pitfalls.md",
+    "revision_history": []
+  }
+}

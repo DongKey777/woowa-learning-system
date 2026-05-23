@@ -1,0 +1,55 @@
+{
+  "id": "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge",
+  "title": "Process · OS Thread · Virtual Thread — 동시성 단위의 위계",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Process · OS Thread · Virtual Thread — 동시성 단위의 위계\n\n> 한 줄 요약: Process는 주소 공간 격리(무거움), OS Thread는 공유(중간), Virtual Thread는 JVM이 스케줄링(가벼움). 위로 갈수록 안전, 아래로 갈수록 많이 띄울 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n같은 \"동시 실행\"이라도 *누가 격리/스케줄링/스위칭*을 책임지느냐가 다르다.\n\n```\n[Process]\n  주소 공간 분리 (가상 메모리)\n  OS가 스케줄링\n  IPC로 통신\n  컨텍스트 스위치 비쌈\n\n[OS Thread]\n  같은 Process 안 (주소 공간 공유)\n  OS가 스케줄링\n  공유 메모리로 직접 통신\n  컨텍스트 스위치 OS Thread 대비 중간\n\n[Virtual Thread (Java 21)]\n  JVM 사용자 공간에서 스케줄링\n  OS Thread (carrier) 위에 N개 mount\n  blocking I/O 호출 시 자동 unmount → 다른 vthread 실행\n  생성/스위칭이 platform thread보다 훨씬 가벼움\n```\n\n## 한 장 정리\n\n| 항목 | Process | OS Thread | Virtual Thread |\n|---|---|---|---|\n| 주소 공간 | 격리 (자체) | 공유 (같은 Process) | 공유 (같은 Process) |\n| 스케줄러 | OS 커널 | OS 커널 | JVM (carrier thread 위) |\n| 생성 비용 | 상대적으로 큼 | 중간 | 상대적으로 작음 |\n| 메모리 비용 | MB 단위 | OS/JVM stack budget | 동적 stack chunk, ThreadLocal 크기에 민감 |\n| 동시 가능 개수 | 격리/메모리 비용에 빨리 제한 | stack/thread 수에 제한 | 대기 작업을 훨씬 많이 표현 가능 |\n| 격리 안전성 | 매우 안전 (한쪽 죽어도 OK) | 공유 (race condition 위험) | 공유 |\n| Blocking I/O 처리 | OS가 다른 process 스케줄 | OS가 다른 thread 스케줄 | JVM이 vthread unmount, carrier 재사용 |\n| CPU bound 작업 효율 | 비슷 | 좋음 | OS Thread와 비슷 (가치 작음) |\n| I/O bound 작업 효율 | 보통 | 좋음 | **매우 좋음** |\n\n## \"왜 Virtual Thread가 가벼운가\"\n\n기존 모델 (Thread per Request):\n\n```\n1000 동시 요청 → 1000 OS Thread → thread stack 예약/커밋 예산 증가\n→ 메모리 압박, OS 스케줄러 부담\n→ 동시 처리 한계\n```\n\nVirtual Thread 모델:\n\n```\n1000 동시 요청 → 1000 Virtual Thread (필요한 stack chunk를 JVM이 동적으로 관리)\n→ JVM이 제한된 carrier thread 집합 위에 mount/unmount\n→ 대부분의 blocking I/O 진입 시 unmount → carrier가 다른 vthread 실행\n```\n\n핵심은 blocking I/O 대기 동안 platform thread를 그대로 붙잡아 두지 않는 것이다. JVM이 가능한 경우 carrier를 풀어주고, I/O가 완료되면 그 virtual thread를 다시 mount한다.\n\n## \"그럼 Virtual Thread를 다 써도 돼?\"\n\n학습자가 자주 묻는 질문. 답: **I/O bound면 yes, CPU bound면 가치 작음**.\n\n### Virtual Thread가 빛나는 경우\n\n- 수많은 동시 HTTP 요청 / DB 조회 / 외부 API 호출 (I/O bound)\n- 기존 Thread Pool 사이즈가 *동시성 한계*인 시스템\n- 작업이 blocking I/O로 자주 대기\n\n### Virtual Thread가 *효과 없는* 경우\n\n- CPU 집약 (암호화, 압축, ML 추론) — OS Thread와 같음\n- 동시성 자체가 낮음 (몇 개만)\n- ThreadLocal에 무거운 객체 다수 저장 (vthread는 ThreadLocal이 *각각 별도*라 메모리 누수 위험)\n- JDK 21-23에서 `synchronized` 블록 안 blocking I/O — vthread가 *carrier에 pinning*될 수 있음\n- JDK 24+에서도 lock 안 remote I/O는 monitor contention과 tail latency를 만들 수 있음\n\n### Pinning과 lock convoy 함정\n\n```java\n// JDK 21-23: synchronized 블록 안 blocking I/O는 pinning 후보\n// JDK 24+: pinning보다 monitor contention / lock convoy 후보\nsynchronized (lock) {\n    httpClient.send(request);   // blocking I/O를 큰 lock 안에 둠\n}\n\n// 더 안전한 방향: 공유 상태만 짧게 잠그고 remote I/O는 lock 밖으로 이동\nRequest snapshot;\nsynchronized (lock) {\n    snapshot = copySharedState();\n}\nhttpClient.send(snapshot.request());\n```\n\nJDK 21-23에서는 `synchronized`가 virtual thread pinning의 대표 원인이었다. JDK 24+에서는 JEP 491 이후 일반적인 monitor pinning이 크게 줄었지만, `synchronized` 안에서 느린 remote I/O를 기다리면 여전히 다른 요청을 줄 세우는 lock convoy가 된다. 따라서 정답은 \"무조건 ReentrantLock으로 바꾸기\"가 아니라 **임계영역을 줄이고 blocking I/O를 lock 밖으로 빼기**다.\n\n## Context Switch 비용\n\n각 단계별 전형 비용:\n\n```\nProcess context switch:     무겁다 (주소 공간/TLB/cache 영향)\nOS Thread context switch:   커널 스케줄링과 cache locality 비용\nVirtual Thread switch:      JVM 사용자 공간 스케줄링이라 훨씬 싸다\n```\n\n정확한 숫자는 CPU, OS, JVM, workload마다 달라진다. 대량 동시성에서는 context switch 자체보다 runnable thread 폭증, cache miss, downstream wait가 함께 처리량을 결정한다.\n\n## Process 격리의 가치 vs Thread 공유의 효율\n\n| 시나리오 | 권장 단위 |\n|---|---|\n| 한 컴포넌트 크래시가 다른 컴포넌트에 영향 X | Process (예: 마이크로서비스 분리, container) |\n| 같은 데이터를 자주 공유 | Thread |\n| 외부 라이브러리가 안 안전 | Process |\n| 빠른 동기화/통신 | Thread |\n| 보안 / sandbox | Process |\n| 수만 동시 I/O | Virtual Thread |\n\n## 자주 헷갈리는 지점\n\n- **\"Virtual Thread = 비동기 = Reactive\"** — 아니다. Virtual Thread는 *동기 코드*를 그대로 쓰면서 carrier 효율만 높임. Reactive는 *프로그래밍 모델 변경*.\n- **\"Virtual Thread Pool 만들어 쓰자\"** — Virtual Thread는 *Pool에 두지 않는다*. 매번 새로 만든다 (생성 비용 작음). `Executors.newVirtualThreadPerTaskExecutor()`.\n- **\"OS Thread는 사라질 거야\"** — 아니다. CPU bound는 여전히 OS Thread (또는 ForkJoinPool). Virtual Thread는 I/O 영역 보강.\n- **\"Process가 가장 안전하니까 다 Process로\"** — 컨텍스트 스위치, 통신, 메모리 비용이 커진다. 격리가 *진짜 필요한* 곳에만.\n- **\"Java 21로 올리면 자동 Virtual Thread\"** — 아니다. 명시적으로 `Thread.startVirtualThread(...)` 또는 Virtual Thread Executor 사용.\n\n## 학습자가 자주 만나는 시나리오\n\n- 미션 Spring MVC + 외부 API 다수 호출 → Tomcat이 Virtual Thread 지원 시 자동 효과 (`spring.threads.virtual.enabled=true`).\n- CompletableFuture로 비동기 짠 코드 → Virtual Thread로 *동기적 코드*로 다시 쓸 수 있음 (가독성 ↑).\n- 동시 1000개 외부 API 호출 → 기존 Thread Pool이면 Pool 크기 한계. Virtual Thread면 자유.\n- \"Pinning\"이 운영 시 발견되면 JDK 버전을 먼저 확인한다. JDK 21-23에서는 `jdk.tracePinnedThreads`와 JFR `VirtualThreadPinned`가 synchronized pinning 추적에 특히 유용했고, JDK 24+에서는 JEP 491 이후 남은 native/foreign boundary, `pinnedReason`, monitor contention을 함께 본다.\n\n## 빠른 확인 질문\n\n- Process와 Thread의 핵심 차이?\n  - 주소 공간 격리 여부.\n- Virtual Thread가 OS Thread보다 가벼운 이유?\n  - JVM 사용자 공간에서 스케줄링, blocking I/O 시 carrier 반납.\n- Virtual Thread가 *효과 없는* 작업 유형?\n  - CPU bound (암호화, 압축, 계산).\n\n## 한 줄 정리\n\nProcess → OS Thread → Virtual Thread는 *격리 vs 효율*의 위계다. I/O bound 동시성이 핵심이라면 Virtual Thread가 큰 이득이지만, CPU bound 작업이나 lock 안 remote I/O처럼 실제 병목이 다른 곳에 있으면 큰 차이가 없다.\n\nretrieval-anchor-keywords: Process vs Thread vs Virtual Thread, Project Loom Java 21, virtual thread carrier, virtual thread pinning, JDK 24 JEP 491 synchronized pinning, lock convoy, context switch cost, Thread per Request, Virtual Thread Executor, JVM scheduler, OS scheduler, address space isolation, lightweight thread, fiber, structured concurrency\n",
+  "aliases": [
+    "Process vs Thread",
+    "Thread vs Virtual Thread",
+    "가상 스레드",
+    "Virtual Thread",
+    "Project Loom",
+    "JVM Thread vs OS Thread",
+    "프로세스 vs 스레드",
+    "동시성 단위",
+    "context switch cost",
+    "lightweight thread"
+  ],
+  "expected_queries": [
+    "Process, Thread, Virtual Thread 차이가 뭐야?",
+    "Virtual Thread를 무조건 써도 돼?",
+    "Context switch 비용이 어디서 생겨?",
+    "프로세스 격리와 스레드 공유의 차이는?",
+    "OS Thread와 Virtual Thread 차이가 정확히 뭐야?",
+    "동시성 단위가 어떤 위계로 되어 있어?"
+  ],
+  "symptoms": [
+    "Process / Thread / Virtual Thread 차이를 한 번에 정리 못 함",
+    "virtual thread를 무조건 다 써도 되나 헷갈림",
+    "context switch가 어디서 일어나는지 모름",
+    "프로세스 격리와 스레드 공유의 trade-off를 모름"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/jvm-thread-vs-os-thread-bridge"
+    ],
+    "next_docs": [
+      "language/virtual-threads-project-loom"
+    ],
+    "confusable_with": [
+      "operating-system/jvm-thread-vs-os-thread-bridge",
+      "language/virtual-threads-project-loom"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge.md",
+    "revision_history": []
+  }
+}

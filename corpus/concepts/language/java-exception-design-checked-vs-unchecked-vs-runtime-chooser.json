@@ -1,0 +1,58 @@
+{
+  "id": "language/java-exception-design-checked-vs-unchecked-vs-runtime-chooser",
+  "title": "Java 예외 설계 — Checked vs Unchecked vs Runtime 어떻게 고를까",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "'Java의 예외는 *Checked* (Exception 직계, 컴파일러가 try/catch 강제)와",
+  "body_markdown": "# Java 예외 설계 — Checked vs Unchecked vs Runtime 어떻게 고를까\n\n> 한 줄 요약: 현대 Java/Spring 코드는 *자체 비즈니스 예외 = RuntimeException 계열*. Checked는 외부 라이브러리에서만 등장하고 *경계에서 변환*한다. 호출자가 실제로 복구 가능한 경우가 아니라면 Checked로 만들지 않는다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n```\nThrowable\n├── Error           ← JVM 수준 (OutOfMemory 등). 잡지 마라.\n└── Exception\n    ├── Checked     ← 컴파일러가 try/catch 또는 throws 강제 (IOException, SQLException, ...)\n    └── RuntimeException ← Unchecked. 강제 없음. (NullPointerException, IllegalArgumentException, ...)\n```\n\n학습자가 자주 던지는 질문: \"내 비즈니스 예외는 어디에 두지?\"\n\n답: **거의 대부분 RuntimeException 계열로**. 다음 절의 *3가지 결정 기준*을 본 다음에 결론이 같다는 걸 확인하자.\n\n## 한 장 정리 — 결정 3가지 기준\n\n### 기준 1: 호출자가 *실제로 복구 가능한가*\n\n```java\n// Checked Exception이 의미를 가지는 드문 경우 — 호출자가 *복구* 가능\ntry {\n    Connection conn = dataSource.getConnection();\n    // ... use ...\n} catch (SQLException e) {\n    // 호출자가 \"다른 DataSource로 폴백\" 같은 복구 가능?\n    // 보통 못한다 → SQLException은 Checked이지만 실제로는 잡아 RuntimeException으로 던지는 게 보편\n}\n```\n\n거의 모든 비즈니스 예외는 *복구 불가능*하다. \"예약 시간이 과거\"라는 예외가 발생하면, 호출자가 *시간을 자동으로 미래로 바꿔 재시도*하지 않는다. 사용자에게 다시 입력받는다. → Checked로 강제할 가치 없다.\n\n### 기준 2: throws 절이 시그니처에 가치를 주는가\n\n```java\n// throws가 의미 있는 경우\npublic Connection openConnection() throws SQLException { ... }\n\n// throws가 시그니처를 더럽히는 경우 (전형적인 안티)\npublic Reservation create(Long memberId, LocalDateTime time)\n    throws ReservationTimeInPastException, MemberNotFoundException,\n           ThemeNotAvailableException, DuplicateReservationException { ... }\n```\n\n비즈니스 예외 4개를 throws에 적으면, 이 메서드를 호출하는 *모든 코드*가 4개 또는 모(Exception)을 잡아야 한다. 시그니처가 *비즈니스 의도가 아니라 예외 목록*에 점령된다.\n\n### 기준 3: 외부 라이브러리 예외와 분리하고 싶은가\n\n```java\n// 외부 라이브러리 예외 (Checked SQLException)를\n// 도메인 의도 RuntimeException으로 변환\npublic Member findById(Long id) {\n    try {\n        return memberRepository.findById(id);\n    } catch (SQLException e) {     // 외부 Checked\n        throw new MemberNotFoundException(id, e);  // 자체 RuntimeException\n    }\n}\n```\n\n이 변환을 *경계*(Repository 구현 어댑터)에서 하면 도메인/Service 코드는 *자체 예외만* 본다. 외부 의존이 도메인 시그니처를 더럽히지 않는다.\n\n## 한 장 정리 — 예외 분류\n\n| 카테고리 | 예시 | 부모 클래스 | throws 필요? |\n|---|---|---|---|\n| **비즈니스 예외** | `ReservationTimeInPastException`, `MemberNotFoundException`, `InsufficientStockException` | `RuntimeException` (또는 자체 추상) | ❌ |\n| **검증 예외** | `IllegalArgumentException`, Bean Validation 예외 | `RuntimeException` | ❌ |\n| **시스템 예외** | `DataIntegrityViolationException`, `OptimisticLockException` | `RuntimeException` (Spring 변환) | ❌ |\n| **외부 라이브러리** | `IOException`, `SQLException` | `Exception` (Checked) | ⚠️ 경계에서 변환 |\n| **JVM Error** | `OutOfMemoryError`, `StackOverflowError` | `Error` | 잡지 마라 |\n\n## 비즈니스 예외 계층 설계\n\n학습자 자주 헷갈리는 부분: \"예외 계층을 어떻게 짜?\"\n\n권장 패턴:\n\n```java\n// 최상위 비즈니스 예외 (도메인 추상)\npublic abstract class BusinessException extends RuntimeException {\n    private final String code;\n    protected BusinessException(String code, String message) {\n        super(message);\n        this.code = code;\n    }\n    public String code() { return code; }\n}\n\n// 구체 예외 (도메인별)\npublic class ReservationTimeInPastException extends BusinessException {\n    public ReservationTimeInPastException(LocalDateTime time) {\n        super(\"RESERVATION_TIME_IN_PAST\",\n              \"reservation time \" + time + \" is in the past\");\n    }\n}\n\npublic class MemberNotFoundException extends BusinessException {\n    public MemberNotFoundException(Long memberId) {\n        super(\"MEMBER_NOT_FOUND\", \"member \" + memberId + \" not found\");\n    }\n}\n```\n\n이점:\n\n- `@ExceptionHandler(BusinessException.class)`로 *비즈니스 계열*을 한 번에 catch 가능.\n- 각 구체 예외가 *code*를 가져 클라이언트 분기에 활용.\n- 시스템 예외와 분리되어 5xx vs 4xx 응답 구분 자연스러움.\n\n## 예외 변환 패턴 — 외부 Checked → 자체 Runtime\n\n```java\n// Repository 구현 (인프라 경계)\npublic class JpaMemberRepository implements MemberRepository {\n    public Member findById(MemberId id) {\n        try {\n            MemberEntity entity = jpaDao.findById(id.value())\n                .orElseThrow(() -> new MemberNotFoundException(id.value()));\n            return mapper.toDomain(entity);\n        } catch (DataAccessException e) {            // Spring 변환된 RuntimeException\n            // 더 의미 있는 도메인 예외로 변환\n            throw new MemberLoadFailedException(id, e);\n        }\n    }\n}\n```\n\n이 변환을 *경계*에서 하면 도메인 코드는 *항상 자체 예외*만 마주친다.\n\n## 자주 헷갈리는 지점\n\n- **\"throws를 적으면 명시적이라 좋다\"** — 명시적이라기보단 *전파에 따른 시그니처 오염*이 크다. 비즈니스 예외는 RuntimeException으로.\n- **\"RuntimeException = 진짜 위험한 에러\"** — 그렇지 않다. *컴파일러 강제 여부*만 다르다. 비즈니스 의도 표현에도 적합.\n- **\"외부 Checked Exception을 그대로 던짐\"** — 도메인 시그니처에 외부 의존 침투. 경계에서 변환.\n- **\"IllegalArgumentException으로 모든 검증 실패 처리\"** — 클라이언트가 *어떤 검증인지* 분기 불가. 도메인 의미 있는 예외로 세분화.\n- **\"`catch (Exception e)`로 다 잡고 무시\"** — 디버깅 지옥. 잡되 *변환하거나 다시 throw*. 정말 무시해야 할 이유가 있을 때만 예외.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"예약 시간 검증 실패 시\" → `ReservationTimeInPastException extends BusinessException` (RuntimeException).\n- \"회원 없음\" → `MemberNotFoundException extends BusinessException`.\n- \"JPA 저장 실패 (DataIntegrityViolation)\" → 자체 도메인 예외로 변환 (`DuplicateReservationException`).\n- \"파일 IO 실패 (IOException, Checked)\" → Repository 어댑터에서 catch + 자체 RuntimeException.\n- \"Spring `RestClient`/외부 API 호출 실패\" → `RestClientException` (이미 RuntimeException) → 자체 예외로 추가 변환 가능.\n\n## ExceptionHandler 매핑 예시\n\n```java\n@RestControllerAdvice\nclass GlobalExceptionHandler {\n    @ExceptionHandler(BusinessException.class)\n    ProblemDetail handleBusiness(BusinessException e) {\n        HttpStatus status = mapToStatus(e);    // 도메인별 status 매핑\n        ProblemDetail pd = ProblemDetail.forStatusAndDetail(status, e.getMessage());\n        pd.setProperty(\"code\", e.code());\n        return pd;\n    }\n\n    @ExceptionHandler(Exception.class)\n    ProblemDetail handleUnexpected(Exception e) {\n        // 5xx — stacktrace는 로그만, 응답에는 trace_id만\n        log.error(\"unexpected\", e);\n        ProblemDetail pd = ProblemDetail.forStatusAndDetail(\n            HttpStatus.INTERNAL_SERVER_ERROR, \"internal error\");\n        pd.setProperty(\"trace_id\", traceContext.id());\n        return pd;\n    }\n}\n```\n\n비즈니스 예외와 시스템 예외가 *분리되어 있어서* 핸들러 단에서 단순하게 분기된다.\n\n## 빠른 확인 질문\n\n- 자체 비즈니스 예외를 RuntimeException 계열로 두는 이유 두 가지?\n  - 호출자가 보통 복구 못 함 + throws 절이 시그니처를 더럽힘.\n- 외부 Checked Exception을 어디서 변환?\n  - 인프라 경계(Repository 구현 어댑터, 외부 호출 클라이언트).\n- 비즈니스 예외 계층을 만드는 이점?\n  - `@ExceptionHandler`로 일괄 매핑 + code 필드로 클라이언트 분기.\n\n## 한 줄 정리\n\nJava 예외 설계의 현대 권장: *자체 비즈니스 예외 = RuntimeException 계열*, 외부 Checked 예외는 경계에서 변환. Checked가 의미를 가지는 경우는 *호출자가 실제로 복구 가능*할 때뿐이고, 비즈니스 코드에는 그런 경우가 거의 없다.\n\nretrieval-anchor-keywords: Java exception design, Checked vs Unchecked, RuntimeException default, throws clause, exception translation pattern, business exception, system exception, BusinessException hierarchy, exception code mapping, @ExceptionHandler ProblemDetail, ResponseEntityExceptionHandler, IllegalArgumentException pitfall, DataAccessException translation\n",
+  "aliases": [
+    "Checked Exception",
+    "Unchecked Exception",
+    "RuntimeException",
+    "Java exception design",
+    "throws clause",
+    "exception translation",
+    "business exception",
+    "system exception",
+    "exception hierarchy",
+    "자바 예외 설계",
+    "체크 예외",
+    "언체크 예외",
+    "예외 변환"
+  ],
+  "expected_queries": [
+    "Checked Exception이랑 Unchecked Exception 중 뭘 만들어?",
+    "RuntimeException을 그냥 던지면 안 돼?",
+    "throws 절을 매번 적는 게 맞아?",
+    "비즈니스 예외와 시스템 예외를 어떻게 나눠?",
+    "예외를 어떤 계층으로 설계해?",
+    "외부 라이브러리 예외를 어떻게 다뤄?"
+  ],
+  "symptoms": [
+    "Checked Exception을 만들지 RuntimeException으로 갈지 헷갈림",
+    "throws 절이 시그니처를 더럽힘",
+    "비즈니스 예외와 시스템 예외를 어떻게 나눌지 모름",
+    "예외 계층을 어떻게 설계할지 막막함"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-exception-handling-basics"
+    ],
+    "next_docs": [
+      "software-engineering/api-error-contract-design-intermediate-bridge"
+    ],
+    "confusable_with": [
+      "language/java-exception-handling-basics",
+      "software-engineering/api-error-contract-design-intermediate-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/java-exception-design-checked-vs-unchecked-vs-runtime-chooser.md",
+    "revision_history": []
+  }
+}

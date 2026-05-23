@@ -1,0 +1,60 @@
+{
+  "id": "language/string-intern-constant-pool-memory-deep-dive",
+  "title": "String Intern, Constant Pool, and Memory Deep Dive",
+  "category": "language",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# String Intern, Constant Pool, and Memory Deep Dive\n\n> 한 줄 요약: `String.intern()`은 같은 내용의 canonical `String` 객체를 돌려주지만, class constant pool, runtime constant pool, StringTable, heap, metaspace는 서로 다른 층이므로 메모리 증상을 섞어 읽으면 안 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [String Intern and Pool Pitfalls](./string-intern-pool-pitfalls.md)\n> - [Java String 기초](./java-string-basics.md)\n> - [Object Layout and JOL Intuition](./object-layout-jol-intuition.md)\n> - [Heap Dump Retained Size Primer](./heap-dump-retained-size-primer.md)\n> - [Compressed Oops and Class Pointers](./compressed-oops-class-pointers.md)\n> - [Class Data Sharing Startup and Memory Primer](./class-data-sharing-startup-memory-primer.md)\n\n> retrieval-anchor-keywords:\n> - String intern\n> - string pool\n> - StringTable\n> - class constant pool\n> - runtime constant pool\n> - heap string object\n> - metaspace class metadata\n> - G1 string deduplication\n> - Compact Strings\n\n## 핵심 개념\n\n문자열 메모리 질문은 보통 세 층이 섞이면서 어려워진다.\n\n| 이름 | 먼저 잡을 위치 | 무엇을 담나 | 흔한 오해 |\n|---|---|---|---|\n| class-file constant pool | `.class` 파일 안 | 리터럴, symbolic reference 같은 상수 항목 | 런타임 heap 객체 저장소라고 생각함 |\n| runtime constant pool | class metadata 영역, HotSpot에서는 metaspace 계열로 이해 | 로딩된 class의 상수/참조 해석 정보 | 문자열 내용 bytes가 여기 산다고 생각함 |\n| String pool / StringTable | VM이 관리하는 canonicalization table | 같은 내용의 interned `String`을 찾는 매핑 | 모든 interned string이 metaspace에 있다고 생각함 |\n| actual `String` object | Java heap | `String` 객체와 backing storage | intern되면 heap 밖으로 이동한다고 생각함 |\n\n짧게 말하면, **상수 풀은 class metadata 쪽 개념이고, interned `String` 객체 자체는 일반적으로 heap 객체로 본다.**\nStringTable은 \"어떤 내용이면 어떤 canonical `String`을 돌려줄지\"를 찾는 VM 내부 테이블이지, 애플리케이션 객체를 담는 컬렉션이 아니다.\n\n## `intern()`이 보장하는 것과 보장하지 않는 것\n\n`s.intern()`은 같은 내용의 문자열에 대해 같은 canonical `String` 참조를 돌려준다. 그래서 두 문자열 `s`, `t`가 같은 내용을 가지면 `s.intern() == t.intern()`은 참이 될 수 있다.\n\n하지만 실무 규칙은 그대로다.\n\n- 비즈니스 내용 비교는 `equals()`가 기본이다.\n- `intern()`은 identity를 맞추는 도구이지, 문자열 비교 습관을 바꾸는 도구가 아니다.\n- pool lookup, table pressure, retention 경로가 생기므로 bounded vocabulary일 때만 검토한다.\n\n```java\nString literal = \"PAID\";             // 리터럴은 intern 대상\nString copied = new String(\"PAID\");  // 별도 heap String 객체\n\nliteral == copied;            // false일 수 있음\nliteral == copied.intern();   // true\nliteral.equals(copied);       // true\n```\n\n`new String(\"PAID\")` 예시는 최소 두 가지를 같이 만든다. `\"PAID\"` 리터럴은 pool에 있는 canonical 문자열을 가리키고, `new String(...)`은 같은 내용을 가진 별도 heap 객체를 만든다.\n\n## constant pool과 string pool을 분리해서 읽기\n\nclass-file constant pool에는 문자열 리터럴에 대한 항목이 들어갈 수 있다. 클래스가 로딩되면 JVM은 이를 runtime constant pool과 class metadata 구조로 해석한다.\n\n여기서 중요한 caveat는 두 가지다.\n\n1. class metadata는 heap이 아니라 metaspace/native memory 관측과 더 가깝다.\n2. 문자열 리터럴의 실제 `String` 객체와 backing storage는 heap 객체로 관측된다.\n\n즉 heap dump에서 `\"PAID\"`가 보인다고 해서 \"constant pool이 heap에 있다\"고 말하면 부정확하다. 더 정확한 표현은 \"class metadata가 리터럴 문자열을 참조하고, 그 리터럴에 대응하는 `String` 객체는 heap에 있다\"이다.\n\n## interned string은 언제 회수되는가\n\n현대 HotSpot을 기준으로 intern된 문자열 객체도 결국 heap 객체다. 그렇다고 \"intern했으니 무조건 영원히 산다\"도 아니고, \"언제나 쉽게 회수된다\"도 아니다.\n\n실전에서는 아래처럼 판단한다.\n\n| 값의 출처 | retention 위험 | 해석 |\n|---|---|---|\n| 문자열 리터럴, compile-time constant | class/classloader 수명과 엮임 | 애플리케이션 class가 살아 있는 동안 사실상 오래 산다고 봄 |\n| 작은 enum-like token | 낮거나 통제 가능 | bounded set이면 intern 후보가 될 수 있음 |\n| request id, user input, log line | 높음 | unique 값이 많아 table과 heap pressure를 키움 |\n| plugin/classloader별 generated value | 상황 의존 | classloader retention과 함께 heap dump로 확인 |\n\n`intern()` 남용은 보통 \"값이 중복돼서 메모리를 줄이자\"에서 시작하지만, unique 값이 많으면 lookup 비용과 table 관리 비용이 먼저 보인다.\n\n## Compact Strings와 G1 String Dedup은 intern이 아니다\n\n세 기능을 같은 최적화로 보면 안 된다.\n\n| 기능 | 줄이는 것 | identity가 같아지나 | 핵심 caveat |\n|---|---|---|---|\n| `String.intern()` | 중복 `String` 객체를 canonical 참조로 모을 수 있음 | 예, intern 결과끼리는 같아질 수 있음 | 전역 table lookup과 retention 위험 |\n| Compact Strings | Latin-1로 표현 가능한 문자열 backing storage 크기 | 아니오 | Java 9+ 구현 최적화, public API 계약 아님 |\n| G1 String Deduplication | 같은 내용을 가진 backing storage 중복 | 아니오 | `String` 객체 identity는 유지됨 |\n\nCompact Strings 때문에 현대 Java에서 `String` 내부를 단순히 `final char[]`로 설명하면 부정확하다. 구현은 JDK 버전에 따라 달라질 수 있으므로, 문서나 리뷰에서는 \"backing storage\"라고 표현하는 편이 더 안전하다.\n\nG1 String Deduplication도 intern과 다르다. dedup은 여러 `String` 객체가 같은 backing storage를 공유하게 만들 수 있지만, 두 객체가 같은 객체가 되는 것은 아니다. 그래서 `==` 결과는 바뀌지 않는다.\n\n## heap dump에서 문자열 중복을 봤을 때\n\n문자열이 많다는 사실만으로 `intern()`을 넣으면 안 된다. 먼저 질문을 나눈다.\n\n| 관측 | 먼저 볼 질문 | 가능한 대응 |\n|---|---|---|\n| 같은 짧은 status token이 매우 많다 | vocabulary가 작고 고정인가 | enum 변환, bounded canonical map, 제한적 intern |\n| 긴 payload 일부가 반복된다 | 객체 수명과 owner가 명확한가 | parser normalization, cache scope 제한 |\n| request id가 모두 다르다 | 중복이 아니라 high cardinality인가 | intern 금지, 로그/태그 cardinality 점검 |\n| classloader unload 후 문자열이 남는다 | 누가 strong reference를 잡나 | heap dump retained path와 classloader leak 분석 |\n\n대부분의 서비스에서는 \"무조건 intern\"보다 아래 순서가 안전하다.\n\n1. heap dump에서 `String` 개수, retained size, dominator를 본다.\n2. 값의 cardinality를 샘플링한다.\n3. bounded set이면 enum/value object/canonical map부터 검토한다.\n4. `intern()`은 hot path 비용과 rollback 가능성을 측정한 뒤 제한적으로 적용한다.\n\n## 코드로 보는 안전한 경계\n\n### 1. bounded vocabulary만 canonicalize\n\n```java\nenum PaymentState {\n    READY, PAID, FAILED, CANCELLED\n}\n\nfinal class PaymentStateParser {\n    PaymentState parse(String raw) {\n        return PaymentState.valueOf(raw);\n    }\n}\n```\n\n상태값처럼 작고 닫힌 집합이면 `String`을 계속 들고 있기보다 enum으로 올리는 편이 더 명확하다.\n\n### 2. intern을 쓴다면 입력 범위를 막기\n\n```java\nfinal class HttpMethodNormalizer {\n    String normalize(String raw) {\n        return switch (raw) {\n            case \"GET\", \"POST\", \"PUT\", \"PATCH\", \"DELETE\" -> raw.intern();\n            default -> raw;\n        };\n    }\n}\n```\n\n이 코드는 임의 입력을 intern하지 않는다. 허용된 작은 vocabulary만 canonical identity를 얻는다.\n\n### 3. 잘못된 사용\n\n```java\nString requestKey(String userId, String traceId) {\n    return (userId + \":\" + traceId).intern();\n}\n```\n\n`traceId`처럼 cardinality가 큰 값은 중복 제거 후보가 아니다. 이 코드는 pool lookup과 heap pressure를 늘릴 가능성이 크다.\n\n## 운영 관측 메모\n\n| 확인하고 싶은 것 | 도구 예시 | 해석 caveat |\n|---|---|---|\n| `String` 객체 수와 retained path | heap dump, MAT, JFR allocation profile | intern 여부보다 누가 잡고 있는지가 먼저 |\n| StringTable 크기/통계 | HotSpot의 `jcmd <pid> VM.stringtable` 지원 여부 확인 | JDK/빌드별 출력 차이 있음 |\n| 중복 backing storage | GC log/JFR, G1 String Dedup 통계 | identity 중복과 다름 |\n| object layout | JOL | Compact Strings, compressed oops, alignment 영향 |\n\n운영에서 중요한 결론은 \"pool에 넣었는가\"가 아니라 **값의 cardinality와 수명이 통제되는가**다.\n\n## 꼬리질문\n\n- runtime constant pool과 StringTable을 같은 pool이라고 말해도 되는가?\n- intern된 문자열이 heap dump에 보일 때 어떤 retention path를 먼저 볼 것인가?\n- G1 String Dedup이 켜져 있으면 `intern()`이 필요 없어지는가?\n- `String` 내부 구현을 `char[]`라고 설명하면 어느 JDK부터 위험한가?\n\n## 한 줄 정리\n\nString intern 메모리 이슈는 `equals()` 문제가 아니라 heap `String` 객체, metaspace class metadata, VM StringTable, backing storage 최적화를 분리해서 읽는 문제다.\n",
+  "aliases": [
+    "String Intern Constant Pool Memory Deep Dive",
+    "Java string pool heap metaspace",
+    "StringTable memory caveat",
+    "runtime constant pool vs string pool",
+    "interned string heap object",
+    "compact string intern memory",
+    "자바 문자열 풀 상수 풀 메모리",
+    "enum",
+    "final",
+    "native"
+  ],
+  "expected_queries": [
+    "Java String intern과 class constant pool, runtime constant pool, StringTable이 heap과 metaspace에서 어떻게 다른지 설명해줘",
+    "interned String 객체가 heap에 있다는 말과 class metadata가 metaspace에 있다는 말을 어떻게 같이 이해해야 해?",
+    "String.intern, G1 String deduplication, Compact Strings는 identity와 backing storage 관점에서 무엇이 달라?",
+    "new String 리터럴 intern 상수 표현식이 만드는 객체 수와 pool 참조를 메모리 관점으로 알려줘",
+    "heap dump에서 문자열 중복이 보일 때 intern을 써야 하는지 bounded vocabulary와 retention 관점으로 판단해줘"
+  ],
+  "symptoms": [
+    "string pool, class constant pool, runtime constant pool을 모두 같은 메모리 공간으로 생각해 heap과 metaspace 관측을 잘못 해석해",
+    "intern된 문자열은 전부 영원히 살아남거나 전부 metaspace에 있다고 단정해 heap dump와 class metadata retention을 섞어 봐",
+    "G1 String deduplication, Compact Strings, String.intern이 모두 같은 최적화라고 보고 identity와 backing storage 차이를 놓쳐"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/string-intern-pool-pitfalls",
+      "language/java-string-basics",
+      "language/object-layout-jol-intuition"
+    ],
+    "next_docs": [
+      "language/class-data-sharing-startup-memory-primer",
+      "language/class-data-sharing-appcds",
+      "language/heap-dump-retained-size-primer",
+      "language/compressed-oops-class-pointers"
+    ],
+    "confusable_with": [
+      "language/string-intern-pool-pitfalls",
+      "language/java-string-basics",
+      "language/object-layout-jol-intuition",
+      "language/class-data-sharing-appcds"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/string-intern-constant-pool-memory-deep-dive.md",
+    "revision_history": []
+  }
+}

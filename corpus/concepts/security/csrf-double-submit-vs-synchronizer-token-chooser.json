@@ -1,0 +1,59 @@
+{
+  "id": "security/csrf-double-submit-vs-synchronizer-token-chooser",
+  "title": "CSRF Double Submit vs Synchronizer Token Chooser",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 chooser는 CSRF 방어 중 Synchronizer Token Pattern과 Signed Double Submit Cookie를 고르는 기준을 다룬다. SameSite는 보조 방어이고, stateful server session, stateless API, HMAC session binding, cookie injection, sibling subdomain, duplicated csrf cookie 같은 실패 모드를 기준으로 선택한다.",
+  "body_markdown": "# CSRF Double Submit vs Synchronizer Token Chooser\n\n> 한 줄 요약: 서버가 세션 상태를 이미 갖고 있으면 Synchronizer Token이 단순하고 강하다. 서버 상태를 줄여야 한다면 naive double submit이 아니라 세션 값에 묶은 signed double submit을 써야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [CSRF 방어 비교 큰그림](./csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge.md)\n- [CSRF vs SameSite Session Cookie Chooser](./csrf-vs-samesite-session-cookie-chooser.md)\n- [CSRF in SPA + BFF Architecture](./csrf-in-spa-bff-architecture.md)\n- [Cookie Prefixes: `__Host-`, `__Secure-`](./cookie-prefixes-host-secure-primer.md)\n- [CORS / SameSite / Credentials Router](./cors-samesite-credentials-interview-router.md)\n\nretrieval-anchor-keywords: csrf synchronizer token vs double submit, signed double submit cookie, csrf token server state, stateless csrf token, cookie injection csrf, subdomain csrf cookie, samesite not enough, csrf 토큰 세션 바인딩, double submit 실패 모드\n\n## 핵심 선택 축\n\n이 문서는 이미 쿠키 기반 인증을 쓰는 앱에서 **Synchronizer Token**과 **Signed Double Submit Cookie** 중 무엇을 고를지 다룬다. SameSite는 기본 방어층이지만, 통제하지 못하는 하위 도메인, 상태 변경 GET, 오래된 브라우저가 있으면 token 검증이 필요하다.\n\n## 30초 chooser\n\n| 상황 | 우선 선택 | 이유 | 주의점 |\n|---|---|---|---|\n| 서버 세션 저장소가 있고 form/session 앱이다 | Synchronizer Token | 토큰을 서버 세션과 직접 비교하므로 모델이 단순하다 | 수평 확장 시 session store 일관성을 봐야 한다 |\n| API 서버를 stateless에 가깝게 유지해야 한다 | Signed Double Submit | 서버가 CSRF token 자체를 저장하지 않아도 된다 | HMAC + 세션 바인딩 없으면 취약하다 |\n| 하위 도메인, customer subdomain, legacy HTTP 경로가 있다 | Synchronizer 또는 `__Host-` 기반 signed token | cookie injection과 shadowing 위험을 줄인다 | `Domain=.example.com` 쿠키를 피한다 |\n| XSS 의심이 있거나 JS가 token을 읽는다 | 둘 다 단독 방어 아님 | 공격 스크립트가 token을 읽거나 요청을 만들 수 있다 | CSP, 출력 이스케이프, HttpOnly 범위를 함께 본다 |\n| \"SameSite=Lax니까 끝\"이라고 판단 중이다 | token + Origin/Referer 보강 | Lax는 일부 top-level navigation과 same-site subdomain을 남긴다 | 상태 변경 GET부터 제거한다 |\n\n## Synchronizer Token이 맞는 경우\n\nSynchronizer Token Pattern은 서버가 로그인 세션마다 예측 불가능한 값을 만들고, 그 값을 form hidden field나 response header로 내려 준 뒤 상태 변경 요청에서 다시 받는다. 서버는 요청 token과 세션에 저장한 token을 비교한다. 이미 `JSESSIONID` 같은 서버 세션이 있고 Spring Security 기본 CSRF 흐름을 쓰는 앱이라면 이 방식이 가장 설명하기 쉽다.\n\n장점은 검증 근거가 서버에 있다는 점이다. 공격자가 피해자 브라우저에 쿠키를 자동 첨부하게 만들 수는 있어도, 세션에 저장된 token 값을 알 수 없으면 요청을 통과시키기 어렵다. 토큰을 매 요청마다 바꾸면 더 안전해 보이지만, 뒤로가기와 여러 탭 UX를 깨뜨리기 쉽다. 보통은 세션 단위 token이나 완만한 회전 정책이 더 운영하기 좋다.\n\n단점도 분명하다. 서버가 세션 상태를 유지해야 하고, 여러 인스턴스가 같은 session store를 봐야 한다. 완전 stateless API를 목표로 한다면 이 비용이 부담이 된다.\n\n## Signed Double Submit의 실패 모드\n\nDouble Submit Cookie는 CSRF token을 쿠키에도 두고, 클라이언트가 같은 값을 header나 form field에도 보내게 한 뒤 서버가 둘을 비교하는 패턴이다. 문제는 **naive double submit**이다. 단순히 \"쿠키 값 == 헤더 값\"만 확인하면, 공격자가 대상 도메인에 쿠키를 심을 수 있는 환경에서 우회될 수 있다. 취약한 sibling subdomain, dangling subdomain takeover, plaintext HTTP 경로, 중복 쿠키 이름이 대표 신호다.\n\n그래서 새 구현은 signed double submit으로 봐야 한다. 서버 비밀키로 HMAC을 만들고, token을 현재 로그인 세션에 종속된 값과 묶는다. 서버는 요청에서 받은 random part와 현재 세션 값을 다시 HMAC해 비교한다. 이렇게 하면 공격자가 임의 쿠키를 심어도 현재 세션에 맞는 서명을 만들 수 없다.\n\n쿠키 설정도 중요하다. 가능하면 `__Host-` prefix, `Secure`, `Path=/`, `Domain` 미지정을 사용해 하위 도메인이 같은 이름의 쿠키를 덮기 어렵게 만든다. 다만 SPA가 cookie에서 CSRF token을 읽어 header로 복사해야 한다면 그 token cookie는 보통 `HttpOnly`일 수 없다. 이 지점에서 XSS 방어가 약하면 CSRF token도 같이 무너진다.\n\n## 검토할 증상\n\n첫째, DevTools에 CSRF cookie가 두 개 보이면 cookie shadowing을 의심한다. 서버가 읽는 값, JS가 header로 복사하는 값, `Domain`과 `Path`를 확인한다.\n\n둘째, login callback 직후 첫 POST만 403이면 token 발급 시점과 SPA 초기화 순서를 본다. 세션은 생겼지만 CSRF token endpoint를 아직 호출하지 않았거나, old token을 cache한 상태일 수 있다.\n\n셋째, CORS를 열었으니 CSRF도 안전하다고 생각하면 버킷이 틀렸다. CORS는 응답 노출 정책이고, CSRF는 인증 쿠키가 붙은 상태 변경 요청이 성공하는 문제다.\n\n## 한 줄 정리\n\n세션 상태가 있으면 Synchronizer Token을 기본으로 두고, stateless가 필요할 때만 세션에 묶은 signed double submit을 고른다. SameSite는 이 결정을 대체하지 않는 보조 방어다.\n",
+  "aliases": [
+    "CSRF double submit chooser",
+    "signed double submit cookie",
+    "synchronizer token pattern stateful",
+    "HMAC CSRF token",
+    "stateless CSRF token",
+    "cookie injection CSRF",
+    "subdomain cookie shadowing",
+    "SameSite defense in depth",
+    "session bound CSRF token",
+    "double submit failure mode"
+  ],
+  "expected_queries": [
+    "서버 세션이 있는 웹앱에서 Synchronizer Token과 Signed Double Submit 중 무엇을 골라야 해?",
+    "SameSite=Lax가 켜져 있어도 민감한 상태 변경 요청에 CSRF token을 계속 둬야 하는 이유를 설명해줘",
+    "Double Submit Cookie를 단순 비교로 구현하면 하위 도메인 cookie injection에 왜 약해져?",
+    "SPA나 BFF에서 stateless CSRF 방어를 고를 때 HMAC과 session binding을 어떻게 봐야 해?",
+    "CSRF token을 매 요청마다 바꾸는 것보다 로그인 세션에 묶는 것이 왜 실무적으로 나은가?"
+  ],
+  "symptoms": [
+    "SameSite=Lax가 있는데 CSRF token을 생략해도 되는지 확신이 없어",
+    "서버 세션 저장소를 줄이고 싶어서 double submit cookie를 쓰려는데 서명과 세션 바인딩이 필요한지 헷갈려",
+    "하위 도메인이나 중복 쿠키가 있는 환경에서 CSRF 검증이 우회될 수 있는지 걱정돼"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/xss-csrf-basics",
+      "security/session-cookie-jwt-basics"
+    ],
+    "next_docs": [
+      "security/csrf-in-spa-bff-architecture",
+      "security/cookie-prefixes-host-secure-primer",
+      "security/oauth-state-cookie-csrf-router"
+    ],
+    "confusable_with": [
+      "security/csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge",
+      "security/csrf-vs-samesite-session-cookie-chooser",
+      "security/csrf-in-spa-bff-architecture",
+      "security/cookie-prefixes-host-secure-primer",
+      "security/duplicate-cookie-name-shadowing"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/csrf-double-submit-vs-synchronizer-token-chooser.md",
+    "revision_history": []
+  }
+}

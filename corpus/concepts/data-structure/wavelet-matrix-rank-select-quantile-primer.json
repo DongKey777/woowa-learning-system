@@ -1,0 +1,62 @@
+{
+  "id": "data-structure/wavelet-matrix-rank-select-quantile-primer",
+  "title": "Wavelet Matrix Rank Select Quantile Primer",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Wavelet Matrix Rank Select Quantile Primer\n\n> 한 줄 요약: Wavelet Matrix는 정적 정수 배열을 비트 레벨별로 안정 분할해 rank, select, 구간 k번째 값, 구간 빈도 질의를 빠르게 처리하는 압축 시퀀스 자료구조다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Wavelet Tree Intuition](./wavelet-tree.md)\n> - [Succinct Bitvector Rank Select](./succinct-bitvector-rank-select.md)\n> - [Coordinate Compression Patterns](./coordinate-compression-patterns.md)\n> - [Persistent Segment Tree](./persistent-segment-tree.md)\n> - [Order Statistic Tree](./order-statistic-tree.md)\n> - [Fenwick and Segment Tree Operations Playbook](./fenwick-segment-tree-operations-playbook.md)\n\n> retrieval-anchor-keywords: wavelet matrix, rank select, quantile query, range kth query, range frequency, stable partition, bit levels, compressed sequence, static sequence, coordinate compression\n\n## 핵심 감각\n\nWavelet Matrix를 처음 볼 때는 \"배열을 비트별로 여러 번 안정 정렬한 구조\"라고 잡으면 된다.\n여기서 안정 정렬은 전체를 완전히 정렬한다는 뜻이 아니라, 각 비트 레벨에서 `0`인 원소를 앞에,\n`1`인 원소를 뒤에 보내되 같은 그룹 안의 상대 순서를 유지한다는 뜻이다.\n\n예를 들어 모든 값을 같은 비트 폭으로 보고, 가장 높은 비트부터 낮은 비트로 내려간다.\n각 레벨은 두 가지 정보를 가진다.\n\n- 현재 레벨에서 각 위치의 비트가 0인지 1인지 나타내는 bitvector\n- 다음 레벨에서 0 그룹과 1 그룹이 어디서 시작하는지 알려주는 offset\n\n이 두 정보와 bitvector의 `rank`가 있으면 \"부모 레벨의 구간 `[l, r)`이 다음 레벨의 어느\n구간으로 옮겨지는가\"를 계산할 수 있다. 이 구간 이동이 Wavelet Matrix의 핵심이다.\n\n## Bit levels와 stable partition\n\n값 배열이 다음과 같고 3비트로 표현한다고 하자.\n\n```text\nA = [3, 1, 4, 1, 5]\n3 = 011, 1 = 001, 4 = 100, 1 = 001, 5 = 101\n```\n\n가장 높은 비트부터 본다.\n\n```text\nlevel 2 bit: 0 0 1 0 1\nstable partition after level 2:\n0-group values: 3, 1, 1\n1-group values: 4, 5\nnext sequence:  3, 1, 1, 4, 5\n```\n\n다음 레벨은 이 `next sequence` 위에서 다시 같은 일을 한다.\n중요한 불변식은 두 가지다.\n\n- 각 레벨에서 비트가 0인 원소와 1인 원소를 나누지만, 같은 그룹 안의 상대 순서는 유지한다.\n- 다음 레벨의 위치는 이전 레벨의 rank 결과로만 추적한다.\n\nWavelet Tree는 값 범위 노드가 명시적인 트리처럼 보이지만, Wavelet Matrix는 레벨별 bitvector\n배열로 같은 탐색 정보를 평평하게 저장한다. 그래서 pointer tree보다 cache locality가 좋고,\n구현은 \"레벨을 내려가며 위치를 변환한다\"는 형태가 된다.\n\n## rank와 select\n\n`rank(value, pos)`는 prefix `A[0..pos)` 안에 `value`가 몇 번 등장했는지 묻는다.\nWavelet Matrix에서는 `value`의 비트를 높은 자리부터 읽으며 레벨을 내려간다.\n\n현재 레벨에서 찾는 비트가 `0`이면:\n\n```text\nl = rank0(level, l)\nr = rank0(level, r)\n```\n\n찾는 비트가 `1`이면 1 그룹 시작 offset을 더한다.\n\n```text\nl = zero_count[level] + rank1(level, l)\nr = zero_count[level] + rank1(level, r)\n```\n\n마지막 레벨까지 내려간 뒤 `r - l`이 그 값의 등장 횟수다.\n\n`select(value, k)`는 반대 방향이다. `value`가 등장하는 위치 중 k번째 원래 위치를 찾는다.\n구현은 보통 먼저 해당 value가 마지막 레벨에서 차지하는 범위를 찾고, 레벨을 역방향으로 올라오며\nbitvector의 `select0` 또는 `select1`을 사용해 원래 위치를 복원한다. 그래서 select까지\n지원하려면 rank만 되는 bitvector가 아니라 select도 빠른 bitvector가 필요하다.\n\n## quantile과 range frequency\n\n`quantile(l, r, k)`는 구간 `A[l..r)`에서 k번째로 작은 값을 찾는 질의다.\n각 레벨에서 현재 구간 안에 0 비트를 가진 원소가 몇 개인지 센다.\n\n```text\nzeros = rank0(level, r) - rank0(level, l)\n\nif k < zeros:\n    answer bit = 0\n    l = rank0(level, l)\n    r = rank0(level, r)\nelse:\n    answer bit = 1\n    k -= zeros\n    l = zero_count[level] + rank1(level, l)\n    r = zero_count[level] + rank1(level, r)\n```\n\n모든 비트 레벨을 내려가며 답의 비트를 조립하면 구간 k번째 값이 된다.\n\n`range frequency(l, r, low, high)`는 구간 안에서 값이 `[low, high)`에 속하는 원소 수를 묻는다.\n보통 `count_less_than(l, r, high) - count_less_than(l, r, low)`로 계산한다.\n`count_less_than`은 레벨을 내려가며 기준값의 현재 비트가 1일 때 현재 구간의 0 그룹 전체를\n답에 더하고 1 그룹으로 내려가는 식으로 처리한다.\n\n이 구조가 잘 답하는 질문은 다음과 같다.\n\n- `A[l..r)`에서 k번째 작은 값은 무엇인가?\n- `A[l..r)`에서 값 `x`는 몇 번 등장하는가?\n- `A[l..r)`에서 `x` 미만 또는 `[a, b)` 범위 값은 몇 개인가?\n- 정적 시퀀스에서 특정 값의 k번째 등장 위치는 어디인가?\n\n## Wavelet Tree와의 차이\n\nWavelet Tree와 Wavelet Matrix는 모두 정적 시퀀스 위에서 값 분포를 탐색한다.\n차이는 저장 방식과 인덱스 이동 방식에 있다.\n\n| 구분 | Wavelet Tree | Wavelet Matrix |\n|---|---|---|\n| 형태 | 값 범위를 재귀 노드로 나누는 트리 | 비트 레벨별 bitvector 배열 |\n| 분기 기준 | 보통 value range의 mid | 값의 현재 bit |\n| 위치 이동 | 노드별 rank로 자식 구간 이동 | 레벨별 rank와 zero offset으로 다음 레벨 이동 |\n| 구현 감각 | 명시적 트리, 재귀 탐색 | 평평한 레벨 배열, 반복 탐색 |\n| 장점 | 개념적으로 value range partition이 직관적 | 큰 정수 도메인과 cache locality에 유리 |\n\n학습 관점에서는 Wavelet Tree가 \"값 범위 트리\"라면, Wavelet Matrix는 \"비트별 stable partition\n행렬\"이다. 둘 다 상대 순서를 보존해야 range query가 성립한다는 점은 같다.\n\n## Coordinate compression이 필요한 이유\n\nWavelet Matrix는 값을 비트로 내려가며 본다. 값 도메인이 `0..10^18`처럼 크면 비트 폭은\n60에 가깝고, 레벨 수와 메모리, 상수 시간이 모두 커진다.\n\n질의가 값의 순서만 필요하다면 coordinate compression을 먼저 적용한다.\n\n```text\n원래 값:  [100, 5000, 100, 9]\n압축 값:  [1,   2,    1,   0]\n복원표:   [9, 100, 5000]\n```\n\n압축 후 `quantile`이 반환한 값은 압축 rank이므로, 실제 값은 복원표로 되돌린다.\n단, `[low, high)` 같은 원래 값 경계가 들어오는 range frequency에서는 `lower_bound`,\n`upper_bound`로 압축 경계를 정확히 바꿔야 한다. 좌표 압축은 순서를 보존하지만 값 사이의\n거리나 간격을 보존하지 않는다.\n\n## Static sequence 전제\n\n기본 Wavelet Matrix는 정적 배열에 강하다.\nbuild 이후 배열 값이 바뀌지 않는다는 전제 덕분에 레벨별 stable partition과 rank/select\n구조를 촘촘하게 만들 수 있다.\n\n다음 요구가 있으면 바로 의심해야 한다.\n\n- point update가 자주 들어온다\n- insert/delete로 sequence 길이가 바뀐다\n- 최신 값이 계속 들어와 coordinate universe가 닫히지 않는다\n- 질의보다 쓰기가 많다\n\n동적 Wavelet Matrix 변형도 있지만 구현 난도가 높고 상수가 커진다.\n일반 학습과 면접, 대부분의 오프라인 알고리즘 문제에서는 \"정적 배열 + 많은 질의\"가 기본 선택\n조건이다.\n\n## Fenwick, Segment Tree, Persistent Segment Tree와의 선택 경계\n\nWavelet Matrix가 좋아 보이는 문제도 다른 구조가 더 단순할 수 있다.\n\n| 요구 | 먼저 볼 구조 | 이유 |\n|---|---|---|\n| point update + prefix/range sum | Fenwick Tree | 값 분포보다 누적 집계가 목적이다 |\n| range update, range min/max/sum | Segment Tree | 구간 상태를 갱신하고 합성해야 한다 |\n| 시간 버전별 kth/rank query | Persistent Segment Tree | 업데이트 이력과 버전 차이를 직접 표현한다 |\n| 정렬 집합에서 insert/delete/rank/kth | Order Statistic Tree | online key 집합과 동적 변경에 자연스럽다 |\n| 정적 배열의 range kth/rank/frequency가 많음 | Wavelet Matrix | build 후 많은 값 분포 질의를 빠르게 처리한다 |\n\nPersistent Segment Tree도 정적 prefix 버전들을 만들어 `A[l..r)`의 kth를 처리할 수 있다.\n그 방식은 \"prefix frequency tree 두 개의 차이\"로 구간 분포를 얻는다. Wavelet Matrix는 같은\n목표를 더 압축된 bitvector 레벨로 보는 쪽에 가깝다. 구현 환경에서 persistent node allocation이\n쉽고 값 도메인이 압축되어 있으면 Persistent Segment Tree가 더 편할 수 있고, rank/select/frequency\n계열을 한 구조로 묶고 싶으면 Wavelet Matrix가 더 자연스럽다.\n\n## 구현 전 체크리스트\n\n- 값 배열이 build 이후 바뀌지 않는가?\n- 값 범위를 그대로 비트로 볼지, coordinate compression을 먼저 할지 정했는가?\n- 질의 경계가 `[l, r)`인지 `[l, r]`인지 문서와 테스트에서 통일했는가?\n- `rank0`, `rank1`, `select0`, `select1` 중 실제 필요한 연산을 bitvector가 지원하는가?\n- quantile의 `k`가 0-based인지 1-based인지 정했는가?\n- 압축 값을 반환할 때 원래 값으로 복원하는 단계를 빠뜨리지 않았는가?\n\n## 검증 질문\n\n> Q: Wavelet Matrix에서 stable partition이 깨지면 어떤 질의가 먼저 위험해지나?\n> 의도: range query가 위치 순서 보존에 의존한다는 점 확인\n> 핵심: 같은 비트 그룹 안의 상대 순서가 깨지면 부모 구간을 다음 레벨 구간으로 옮기는 rank mapping이 실제 원소 순서와 맞지 않는다.\n\n> Q: `quantile(l, r, k)`에서 현재 레벨의 zero count가 `k`보다 작거나 같으면 왜 1 그룹으로 내려가나?\n> 의도: kth 탐색의 분기 기준 확인\n> 핵심: 0 그룹에 있는 값들이 현재 비트 기준으로 더 작으므로, 그 개수를 건너뛰고 `k -= zeros` 한 뒤 1 그룹에서 남은 순위를 찾는다.\n\n> Q: `rank(value, pos)`와 `range frequency(l, r, value)`는 어떻게 연결되나?\n> 의도: prefix rank와 구간 빈도의 관계 확인\n> 핵심: `rank(value, r) - rank(value, l)`이 `[l, r)` 안 value 등장 횟수다.\n\n> Q: 큰 long 값 배열에서 coordinate compression을 하면 어떤 정보가 사라지나?\n> 의도: 압축의 안전 조건 확인\n> 핵심: 대소 순서는 보존되지만 실제 값 차이와 거리 정보는 사라진다. 거리 기반 질의에는 원래 좌표가 필요하다.\n\n> Q: 업데이트가 많은 leaderboard에 기본 Wavelet Matrix를 바로 쓰면 왜 위험한가?\n> 의도: static sequence 전제 확인\n> 핵심: 값 변경마다 여러 레벨의 stable partition과 rank/select 구조가 영향을 받으므로 재구성 비용이 커진다. online rank/kth에는 Order Statistic Tree나 Fenwick/Segment Tree가 더 자연스러울 수 있다.\n\n## 한 줄 정리\n\nWavelet Matrix는 정적 시퀀스의 값 분포 질의를 비트 레벨 stable partition과 rank/select로 푸는 구조이며, 업데이트 구조가 아니라 조회가 많은 스냅샷 구조로 선택해야 한다.\n",
+  "aliases": [
+    "Wavelet Matrix",
+    "wavelet matrix rank select",
+    "wavelet matrix quantile",
+    "range quantile query",
+    "range frequency query",
+    "static sequence rank select",
+    "stable partition bit levels",
+    "compressed integer sequence",
+    "웨이블릿 매트릭스",
+    "정적 배열 구간 k번째 값"
+  ],
+  "expected_queries": [
+    "Wavelet Matrix는 rank select quantile range frequency를 어떤 mental model로 이해해야 해?",
+    "Wavelet Matrix와 Wavelet Tree는 bitvector를 쓰는데 구조적으로 뭐가 달라?",
+    "정적 배열에서 구간 k번째 값과 특정 값 빈도를 빠르게 묻는 자료구조를 고르는 기준은?",
+    "Wavelet Matrix를 만들 때 bit level stable partition과 coordinate compression이 왜 필요해?",
+    "Fenwick Tree Segment Tree Persistent Segment Tree와 Wavelet Matrix는 언제 갈라서 선택해?",
+    "업데이트가 많은 ranking 문제에 Wavelet Matrix를 쓰면 왜 위험해?"
+  ],
+  "symptoms": [
+    "정적 배열에서 range kth, rank, frequency를 모두 segment tree 여러 개로만 풀려고 한다",
+    "Wavelet Matrix와 Wavelet Tree가 둘 다 bitvector를 쓰니 같은 구조라고 착각한다",
+    "값 도메인이 큰데 coordinate compression 없이 bit level 구조를 만들 수 있다고 생각한다",
+    "업데이트가 자주 섞이는 online sequence에 기본 Wavelet Matrix를 그대로 적용하려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/wavelet-tree",
+      "data-structure/succinct-bitvector-rank-select",
+      "data-structure/coordinate-compression-patterns"
+    ],
+    "next_docs": [
+      "data-structure/persistent-segment-tree",
+      "data-structure/order-statistic-tree",
+      "data-structure/fenwick-segment-tree-operations-playbook"
+    ],
+    "confusable_with": [
+      "data-structure/wavelet-tree",
+      "data-structure/persistent-segment-tree",
+      "data-structure/order-statistic-tree",
+      "data-structure/fenwick-segment-tree-operations-playbook",
+      "data-structure/coordinate-compression-patterns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/wavelet-matrix-rank-select-quantile-primer.md",
+    "revision_history": []
+  }
+}

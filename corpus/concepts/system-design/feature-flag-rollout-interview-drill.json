@@ -1,0 +1,46 @@
+{
+  "id": "system-design/feature-flag-rollout-interview-drill",
+  "title": "Feature Flag Rollout Interview Drill",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 drill은 feature flag 시스템 설계 면접에서 targeting, percentage rollout, kill switch, config propagation을 답변한다.",
+  "body_markdown": "# Feature Flag Rollout Interview Drill\n\n## 질문\n\n\"Feature flag 시스템을 설계해 보세요.\"\n\n## 기대 답변 축\n\nFlag는 단순 boolean이 아니라 targeting rule, percentage rollout, environment, owner, expiry를 가진 config다. 평가 엔진은 user/tenant/context를 받아 flag variant를 결정한다.\n\nPercentage rollout은 sticky해야 한다. 같은 사용자가 요청마다 다른 variant를 받으면 UX와 실험 분석이 흔들린다. 보통 user id hash bucket으로 안정적인 배정을 만든다.\n\n운영 기능으로 kill switch와 rollback이 중요하다. Flag config 배포가 느리거나 config service가 죽어도 안전한 default와 local cache가 필요하다.\n\n## 보장 범위\n\nFeature flag의 보장은 deploy와 release를 분리하는 것이다. 코드는 먼저 배포하되 노출 대상, 비율, variant를 runtime config로 조절해 blast radius를 줄인다. 문제가 생기면 binary rollback보다 빠르게 기능을 끄거나 특정 cohort에서 제외할 수 있다.\n\n하지만 flag는 모든 rollback을 대신하지 않는다. 새 코드가 DB schema를 이미 바꿨거나, 메시지 포맷을 깨뜨렸거나, 외부 side effect를 발생시켰다면 flag off만으로 상태를 되돌릴 수 없다. Flag path 양쪽이 모두 테스트되어야 하고, default 값이 안전해야 하며, owner와 expiry가 있어야 운영 가능한 장치가 된다.\n\n## 설계 구성요소\n\n| 구성요소 | 확인 질문 | 실패 시 영향 |\n|---|---|---|\n| Control plane | 누가 flag를 만들고 승인하는가 | 권한 없는 변경, 감사 불가 |\n| Evaluation engine | user/tenant/context를 어떻게 평가하는가 | 요청마다 다른 variant, 잘못된 targeting |\n| Distribution | polling/streaming/cache 전파 지연은 얼마인가 | kill switch 반영 지연 |\n| Local cache | config service 장애 시 무엇을 쓰는가 | 전체 서비스가 config 장애에 종속 |\n| Audit/approval | 변경 이력과 rollback 버튼이 있는가 | 장애 원인 추적 실패 |\n| Lifecycle | owner, expiry, cleanup이 있는가 | stale flag와 테스트 조합 폭증 |\n\n## 운영 지표\n\n- flag evaluation latency와 error rate\n- config propagation lag, SDK cache age, stream reconnect count\n- fallback/default 사용 횟수\n- variant별 traffic 분포와 sticky bucket drift\n- kill switch 적용 시간, rollback 성공률\n- tenant/user cohort별 error rate, latency, business metric\n- stale flag 수, expiry 초과 flag 수, owner 없는 flag 수\n- control plane 변경 감사 로그와 승인 누락 건수\n\n면접에서는 \"percentage rollout\"을 말한 뒤 반드시 sticky bucket과 지표 검증을 붙인다. 10% rollout이 실제로 10% traffic인지, 같은 사용자가 계속 같은 variant를 받는지, kill switch가 몇 초 안에 반영되는지를 운영 지표로 확인해야 한다.\n\n## Trade-off\n\n중앙 config service는 통제와 감사가 쉽지만 runtime dependency가 된다. Local cache와 SDK embedding은 availability를 높이지만 stale config를 더 오래 볼 수 있다. Streaming은 빠른 kill switch에 유리하지만 연결 관리가 필요하고, polling은 단순하지만 전파 지연이 생긴다.\n\nServer-side flag는 민감한 rule을 숨기고 일관된 결정을 내리기 쉽다. Client-side flag는 UI 반응이 빠르지만 rule과 variant가 노출될 수 있고 오래된 앱 버전이 남는다. 많은 flag를 오래 유지하면 코드 경로와 테스트 조합이 폭발하므로 release flag, experiment flag, ops kill switch를 구분하고 cleanup 계획을 둬야 한다.\n\n## 실패 반례\n\n- percentage rollout이 random per request라 사용자가 요청마다 다른 UI를 본다.\n- config service 장애 시 모든 flag가 false로 떨어져 결제, 로그인 같은 핵심 기능이 꺼진다.\n- kill switch가 local cache TTL 때문에 10분 뒤에야 반영된다.\n- client-side flag에 권한 rule이나 숨겨야 할 기능명이 노출된다.\n- flag off path를 테스트하지 않아 장애 때 끄자마자 NullPointerException이 난다.\n- DB schema가 새 코드 전용으로 바뀌어 flag를 꺼도 old path가 동작하지 않는다.\n- owner와 expiry가 없어 1년 뒤 누구도 의미를 모르는 flag가 critical path에 남는다.\n\n## 면접 답변 골격\n\n\"Feature flag는 if문 하나가 아니라 targeting rule, percentage rollout, owner, expiry, audit을 가진 runtime config입니다. Evaluation engine은 user나 tenant context를 받아 variant를 결정하고, percentage rollout은 user id hash bucket으로 sticky하게 배정합니다. Control plane 변경은 SDK나 sidecar로 전파하되 config service 장애 시 local cache와 안전한 default를 사용합니다. 운영에서는 evaluation latency, propagation lag, fallback 사용률, variant별 error rate와 business metric, stale flag 수를 봅니다. 단, flag off는 DB migration이나 외부 side effect를 되돌리지 못하므로 backward compatibility와 lifecycle cleanup이 같이 필요합니다.\"\n\n## 약점 태그\n\n- `targeting-rule`\n- `sticky-bucket`\n- `kill-switch`\n- `config-propagation`\n- `safe-default`\n- `flag-lifecycle`\n\n## 흔한 오답\n\nFlag를 계속 남겨두면 코드 경로가 두 배로 늘고 테스트 비용이 증가한다. 면접에서는 flag lifecycle과 stale flag cleanup도 언급하면 설계가 운영 가능해진다.\n\n## 복습 연결\n\nConfig distribution은 `config-distribution-system-design`, rollback 안전성은 `config-rollback-safety-design`으로 이어진다.\n",
+  "aliases": [
+    "feature flag rollout interview drill",
+    "feature flag 점진 배포 면접",
+    "kill switch percentage rollout design",
+    "기능 플래그 운영 설계"
+  ],
+  "expected_queries": [
+    "Feature flag system design은 어떻게 답해?",
+    "percentage rollout과 kill switch를 어떻게 설계해?",
+    "flag 변경이 서비스에 전파되는 방식은 무엇을 고려해?"
+  ],
+  "symptoms": [
+    "flag를 if문 설정값 정도로만 설명합니다",
+    "사용자별 sticky rollout을 고려하지 않습니다",
+    "flag config 장애가 전체 서비스 장애로 번질 수 있음을 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/feature-flag-control-plane-design"
+    ],
+    "next_docs": [
+      "system-design/config-distribution-system-design",
+      "system-design/config-rollback-safety-design"
+    ],
+    "confusable_with": [
+      "system-design/config-distribution-system-design",
+      "system-design/config-rollback-safety-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/feature-flag-rollout-interview-drill.md",
+    "revision_history": []
+  }
+}

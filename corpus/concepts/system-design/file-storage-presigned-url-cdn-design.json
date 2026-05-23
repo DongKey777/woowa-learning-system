@@ -1,0 +1,54 @@
+{
+  "id": "system-design/file-storage-presigned-url-cdn-design",
+  "title": "File Storage Presigned URL + CDN 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 File Storage Presigned URL + CDN 설계를 다루는 deep_dive 문서다. 대용량 파일 업로드/다운로드는 애플리케이션을 통하지 않고 object storage와 CDN으로 직접 흘려보내는 구조가 확장성과 비용 면에서 유리하다. 검색 질의가 file storage presigned url cdn design, presigned url 뭐예요, cdn 파일 업로드 설계, 처음 배우는데 파일 저장 큰 그림처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# File Storage Presigned URL + CDN 설계\n\n> 한 줄 요약: 대용량 파일 업로드/다운로드는 애플리케이션을 통하지 않고 object storage와 CDN으로 직접 흘려보내는 구조가 확장성과 비용 면에서 유리하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [CDN 기초 (CDN Basics)](./cdn-basics.md)\n> - [Object Metadata Service 설계](./object-metadata-service-design.md)\n> - [HTTP의 무상태성과 쿠키, 세션, 캐시](../network/http-state-session-cache.md)\n> - [Cache-Control 실전](../network/cache-control-practical.md)\n> - [HTTPS / HSTS / MITM](../security/https-hsts-mitm.md)\n> - [Signed URL / Presigned Upload Threat Model](../security/signed-url-presigned-upload-threat-model.md)\n> - [Spring Security 아키텍처](../spring/spring-security-architecture.md)\n> - [Spring Multipart Upload Request Pipeline](../spring/spring-multipart-upload-request-pipeline.md)\n\nretrieval-anchor-keywords: file storage presigned url cdn design, presigned url 뭐예요, cdn 파일 업로드 설계, 처음 배우는데 파일 저장 큰 그림, object storage direct upload, signed url upload flow, cdn download architecture, private bucket public bucket, file upload scalability, multipart resumable upload, presigned url security, 파일 업로드 서버 안 거치는 이유, cdn cache-control file download, 파일 저장 설계 헷갈, beginner file storage architecture\n\n---\n\n## 핵심 개념\n\n파일 저장 시스템은 \"파일을 저장하는 API\"가 아니다.  \n실제로는 다음을 같이 해결해야 한다.\n\n- 업로드 대역폭을 애플리케이션에서 떼어낸다.\n- 접근 제어를 유지한다.\n- 파일 크기가 커져도 서버가 죽지 않게 한다.\n- 다운로드는 빠르게, 비용은 적게 만든다.\n- 썸네일/미리보기/바이러스 검사 같은 후처리를 분리한다.\n\n그래서 보통 구조는 다음과 같다.\n\n- metadata service\n- object storage\n- presigned URL\n- CDN\n- async processing pipeline\n\n---\n\n## 깊이 들어가기\n\n### 1. 직접 업로드 vs Presigned URL\n\n| 방식 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 앱 서버 경유 | 제어가 쉽다 | 대역폭/메모리 비용이 크다 | 매우 작은 파일 |\n| Presigned URL | 서버 부하가 낮다 | 권한/만료 관리가 필요하다 | 일반적인 파일 업로드 |\n\nPresigned URL의 핵심은 \"클라이언트가 storage에 직접 쓰되, 서버가 허용한 짧은 시간만 가능하게 하는 것\"이다.\n\n### 2. 업로드 흐름\n\n1. 클라이언트가 업로드 요청을 보낸다.\n2. 서버가 권한을 확인한다.\n3. 서버가 presigned URL과 object key를 발급한다.\n4. 클라이언트가 storage에 직접 업로드한다.\n5. 업로드 완료 이벤트로 후처리를 시작한다.\n\n### 3. 다운로드 흐름과 CDN\n\n다운로드는 object storage를 직접 때리면 비용과 지연이 커진다.  \n그래서 CDN을 앞에 두고 cache-control과 versioning을 맞춘다.\n\n핵심 포인트:\n\n- public 파일과 private 파일을 분리한다.\n- URL에 version 또는 object key를 넣는다.\n- 무효화가 필요하면 key를 새로 발급한다.\n\n### 4. 후처리 파이프라인\n\n파일 저장은 업로드 끝이 아니다.\n\n- 바이러스 검사\n- 이미지 리사이즈\n- thumbnail 생성\n- 메타데이터 추출\n- 변환 작업(PDF preview 등)\n\n이 작업은 비동기 큐로 분리해야 한다.\n\n### 5. 보안\n\nPresigned URL은 편하지만 남용되기 쉽다.\n\n- 만료 시간을 짧게 잡는다.\n- 업로드 가능한 MIME type과 크기를 제한한다.\n- object key를 예측 불가능하게 만든다.\n- 공개/비공개 버킷을 분리한다.\n\n보안 경계는 [HTTPS / HSTS / MITM](../security/https-hsts-mitm.md)와 [Spring Security 아키텍처](../spring/spring-security-architecture.md) 관점으로 같이 봐야 한다.\n\n### 6. 비용과 성능\n\n가장 큰 비용은 보통 세 가지다.\n\n- egress\n- storage\n- CDN cache miss\n\n대용량 업로드 시스템은 \"서버 CPU\"보다 \"네트워크와 저장 비용\"이 먼저 터지는 경우가 많다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 프로필 이미지 업로드\n\n요구사항:\n\n- 5MB 이하\n- 썸네일 생성 필요\n- 인증된 사용자만 업로드 가능\n\n설계:\n\n- presigned URL 발급\n- object storage direct upload\n- thumbnail worker 비동기 처리\n- CDN으로 이미지 서빙\n\n### 시나리오 2: 대용량 동영상 업로드\n\n문제:\n\n- 파일이 너무 커서 재전송 비용이 크다.\n\n대응:\n\n- multipart/resumable upload\n- chunk 단위 전송\n- 업로드 세션 관리\n- 완료 후 merge\n\n### 시나리오 3: 공개 자료 배포\n\n문제:\n\n- 다운로드 트래픽이 폭증할 수 있다.\n\n대응:\n\n- CDN 앞단 배치\n- cache-control 최적화\n- versioned URL\n\n---\n\n## 코드로 보기\n\n```pseudo\nfunction createUploadSession(userId, fileName, contentType):\n    assert authorized(userId)\n    objectKey = generateKey(userId, fileName)\n    url = storage.presignPut(objectKey, expiresIn=10m, contentType=contentType)\n    saveMetadata(objectKey, userId, status=\"UPLOADING\")\n    return {objectKey, url}\n```\n\n```java\npublic UploadSession createUploadSession(long userId, String fileName, String contentType) {\n    assertAuthorized(userId);\n    String objectKey = objectKeyGenerator.generate(userId, fileName);\n    URL presigned = objectStorage.presignPut(objectKey, Duration.ofMinutes(10), contentType);\n    fileMetadataRepository.save(new FileMetadata(objectKey, userId, UPLOADING));\n    return new UploadSession(objectKey, presigned);\n}\n```\n\n### cache-control 예시\n\n```http\nCache-Control: public, max-age=86400, immutable\n```\n\n버전이 바뀌는 파일이라면 URL을 바꾸는 편이 무효화보다 낫다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 앱 서버 경유 | 제어가 쉽다 | 비싸고 느리다 | 작은 파일 |\n| Presigned URL | 부하가 낮다 | 권한/만료 설계 필요 | 일반적인 파일 저장 |\n| CDN 전면 배치 | 다운로드가 빠르다 | 무효화가 어렵다 | 정적/반정적 파일 |\n| Private bucket | 보안이 좋다 | 서빙이 복잡하다 | 민감 자료 |\n\n핵심 기준은 \"파일 업로드/다운로드를 앱의 책임으로 둘지, storage/CDN의 책임으로 옮길지\"다.\n\n---\n\n## 꼬리질문\n\n> Q: 왜 업로드를 애플리케이션 서버를 거치게 하지 않나요?\n> 의도: 병목과 비용 구조를 이해하는지 확인\n> 핵심: 서버 대역폭과 메모리를 낭비하고, 대용량 파일에서 확장성이 떨어진다.\n\n> Q: CDN 캐시는 왜 안 맞는 경우가 있나요?\n> 의도: cache-control과 key versioning 이해 여부 확인\n> 핵심: 무효화와 권한 경계를 잘못 잡으면 stale data 또는 보안 문제가 생긴다.\n\n## 한 줄 정리\n\n파일 저장은 presigned URL로 업로드를 분리하고, CDN으로 다운로드를 분산하며, 후처리와 보안을 비동기로 분리하는 설계다.\n",
+  "aliases": [
+    "file storage presigned url cdn design",
+    "presigned url 뭐예요",
+    "cdn 파일 업로드 설계",
+    "처음 배우는데 파일 저장 큰 그림",
+    "object storage direct upload",
+    "signed url upload flow",
+    "cdn download architecture",
+    "private bucket public bucket",
+    "file upload scalability",
+    "multipart resumable upload",
+    "presigned url security",
+    "파일 업로드 서버 안 거치는 이유"
+  ],
+  "expected_queries": [
+    "File Storage Presigned URL + CDN 설계 설계 핵심을 설명해줘",
+    "file storage presigned url cdn design가 왜 필요한지 알려줘",
+    "File Storage Presigned URL + CDN 설계 실무 트레이드오프는 뭐야?",
+    "file storage presigned url cdn design 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`File Storage Presigned URL + CDN 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`File Storage Presigned URL + CDN 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`File Storage Presigned URL + CDN 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [
+      "system-design/cdn-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/file-storage-presigned-url-cdn-design.md",
+    "revision_history": []
+  }
+}

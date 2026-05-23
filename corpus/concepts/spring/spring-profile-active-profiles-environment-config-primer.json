@@ -1,0 +1,56 @@
+{
+  "id": "spring/spring-profile-active-profiles-environment-config-primer",
+  "title": "Spring Profile 입문 — 환경별 설정 분리와 @ActiveProfiles",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "'Spring Profile은 *환경별로 다른 설정/Bean*을 활성화하는 메커니즘이다.",
+  "body_markdown": "# Spring Profile 입문 — 환경별 설정 분리와 @ActiveProfiles\n\n> 한 줄 요약: Spring Profile = 환경별 설정/Bean 활성화 스위치. 파일은 `application-{profile}.yml`로, Bean은 `@Profile(\"...\")`로, 테스트는 `@ActiveProfiles(\"...\")`로 선택한다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n같은 코드베이스로 *여러 환경*(local 개발, 통합 테스트, 스테이징, 운영)을 돌릴 때 다음이 달라진다.\n\n- DB URL — local h2 / staging RDS / prod RDS\n- 외부 API 엔드포인트 — mock / sandbox / prod\n- 로깅 수준 — DEBUG / INFO / WARN\n- 일부 Bean 동작 — local에서는 fake mail, prod에서는 real SMTP\n\nSpring Profile은 이를 *환경 이름 (dev / test / prod)*으로 묶어 조건적으로 활성화한다.\n\n## 한 장 정리\n\n| 도구 | 위치 | 효과 |\n|---|---|---|\n| `application.yml` | 기본 (모든 프로파일) | 공통 설정 |\n| `application-{profile}.yml` | profile 활성화 시 추가 로드 | 환경별 override |\n| `@Profile(\"dev\")` on Bean | Bean 등록 | 해당 profile일 때만 Bean 등록 |\n| `spring.profiles.active=dev` | env var / VM option / application.yml | active 프로파일 선언 |\n| `@ActiveProfiles(\"test\")` | 테스트 클래스 | 테스트에서 active 프로파일 |\n\n## 환경별 application.yml 분리\n\n```yaml\n# application.yml (공통)\nspring:\n  application:\n    name: roomescape\n\n# application-local.yml (local 개발)\nspring:\n  datasource:\n    url: jdbc:h2:mem:test\n  jpa:\n    show-sql: true\n\n# application-prod.yml (운영)\nspring:\n  datasource:\n    url: ${DB_URL}\n    username: ${DB_USER}\n    password: ${DB_PASSWORD}\n  jpa:\n    show-sql: false\nlogging:\n  level:\n    root: INFO\n```\n\n활성화:\n\n```bash\n# CLI\njava -jar app.jar --spring.profiles.active=prod\n\n# env var\nSPRING_PROFILES_ACTIVE=prod java -jar app.jar\n\n# IDE Run Configuration\nVM options: -Dspring.profiles.active=local\n```\n\n## `@Profile`로 Bean 단위 분기\n\n```java\n@Configuration\nclass MailConfig {\n    @Bean\n    @Profile(\"local\")\n    MailSender fakeMailSender() {\n        return new FakeMailSender();   // 콘솔에 print만\n    }\n\n    @Bean\n    @Profile(\"!local\")               // local 아닐 때\n    MailSender smtpMailSender() {\n        return new SmtpMailSender();\n    }\n}\n```\n\n`@Profile`은 클래스나 메서드에 붙인다. `!profile`로 부정 표현, `&` `|`로 AND/OR도 가능 (`@Profile(\"prod & cloud\")`).\n\n## 테스트에서 `@ActiveProfiles`\n\n```java\n@SpringBootTest\n@ActiveProfiles(\"test\")\nclass ReservationIntegrationTest {\n    // application-test.yml + @Profile(\"test\") Bean이 활성화됨\n}\n```\n\n`@ActiveProfiles`는 `spring.profiles.active`를 *그 테스트 클래스 범위에서* 강제. 보통 `application-test.yml`을 만들어 in-memory DB / fake 서비스로 셋업.\n\n자세한 *test override 함정*은 `spring/spring-activeprofiles-vs-test-overrides-primer`에서.\n\n## 기본 프로파일 — 흔한 함정\n\n`spring.profiles.active`를 지정 안 하면 *default* 프로파일이 활성화된다. Spring의 기본 default 이름은 `default`.\n\n```java\n@Bean\n@Profile(\"default\")\nDataSource embeddedDataSource() {\n    // ← spring.profiles.active 지정 안 하면 활성화됨\n}\n```\n\n**함정**: 운영에서 `spring.profiles.active=prod`를 환경변수로 안 넘기면 `default`가 활성화되어 *임베디드 H2*가 뜨거나 *fake Bean*이 동작한다. 운영 배포 스크립트에 active 프로파일 명시 필수.\n\n권장 방어:\n\n- application.yml에 `spring.profiles.active: local`로 *명시적 기본*을 둠.\n- 운영 배포에서는 env var로 강제 override.\n- prod 환경 부팅 시 active profile이 `prod`인지 체크하는 `ApplicationRunner` 등을 둠.\n\n## 환경별 설정 vs 외부화 설정\n\n학습자 자주 물음: \"Profile vs 환경변수, 어떻게 결정해?\"\n\n- **Profile** — *세트(set)*로 묶이는 설정. dev 세트 = \"h2 + show-sql=true + DEBUG 로깅 + fake mail\" 같이 *동시에 켜지는* 설정 묶음.\n- **환경변수 (`@Value`, `@ConfigurationProperties`)** — *개별 값*. DB URL, API key 같이 *환경별로 값만 다른* 설정.\n\n보통 *Profile로 큰 구조 분리* + *환경변수로 secret/host 주입*.\n\n```yaml\n# application-prod.yml\nspring:\n  datasource:\n    url: ${DB_URL}            # 환경변수에서 값\n    password: ${DB_PASSWORD}   # 절대 yml에 직접 적지 말 것\n```\n\n## 자주 헷갈리는 지점\n\n- **`spring.profiles.active`를 application.yml에 적고 운영에서 override 안 됨** — env var가 yml을 *override*함이 기본 규칙. 헷갈리면 `--debug` 옵션으로 effective config 확인.\n- **`@Profile` 안 붙은 Bean** — 모든 profile에서 활성화. 의도 안 한 운영 동작이 생길 수 있음.\n- **profile-specific yml의 *override 범위*** — 같은 키만 덮어쓰는 게 아니라 *map merge*. nested key 덮을 때 의도 확인.\n- **테스트에서 `@ActiveProfiles` 안 붙임** — `default` 또는 코드에 명시된 active로 동작. 의도 안 한 Bean 활성화 가능.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"local에서는 h2, 운영에서는 MySQL\" → `application-local.yml` + `application-prod.yml`. SPRING_PROFILES_ACTIVE env var로 분기.\n- \"테스트에서 외부 API 호출을 mock으로\" → `@Profile(\"test\") @Primary Bean MockApiClient` + `@ActiveProfiles(\"test\")`.\n- \"로깅 수준을 환경별로\" → profile-specific yml에 `logging.level.root: DEBUG` (local) / `INFO` (prod).\n- \"secret을 yml에 안 적고 싶음\" → application.yml에 `${ENV_VAR_NAME}` placeholder + 환경변수/Secret Manager 주입.\n- \"profile 여러 개 동시 활성화\" → `spring.profiles.active=prod,cloud` 콤마 구분.\n\n## 빠른 확인 질문\n\n- `spring.profiles.active`를 지정 안 하면?\n  - `default` 프로파일 활성화. 의도 안 한 default Bean이 뜰 위험.\n- `@Profile`은 어디에 붙이나?\n  - `@Configuration` 클래스 또는 `@Bean` 메서드.\n- `@ActiveProfiles`의 역할?\n  - 테스트 클래스 범위에서 `spring.profiles.active`를 강제.\n\n## 한 줄 정리\n\nSpring Profile은 *환경별 설정/Bean 묶음 스위치*. application-{profile}.yml + `@Profile` + `@ActiveProfiles` 세 가지로 구현된다. default 프로파일 함정과 secret 외부화 두 가지를 같이 챙긴다.\n\nretrieval-anchor-keywords: Spring Profile, @Profile, @ActiveProfiles, spring.profiles.active, application-prod.yml, application-dev.yml, profile-specific Bean, default profile pitfall, ConfigurationProperties, env var override, SPRING_PROFILES_ACTIVE, test profile, secret externalization, application.yml merge\n",
+  "aliases": [
+    "Spring Profile",
+    "@Profile",
+    "@ActiveProfiles",
+    "application-prod.yml",
+    "application-dev.yml",
+    "spring.profiles.active",
+    "환경별 설정",
+    "profile 활성화",
+    "dev test prod 분리",
+    "spring boot profile",
+    "@Bean",
+    "@Configuration"
+  ],
+  "expected_queries": [
+    "Spring Profile이 정확히 뭐야?",
+    "dev / test / prod 환경별 application.yml 어떻게 분리해?",
+    "@Profile 어노테이션을 어디 붙여?",
+    "테스트에서 @ActiveProfiles는 어떻게 써?",
+    "spring.profiles.active를 어디서 설정해?",
+    "기본 프로파일이 뭐야?"
+  ],
+  "symptoms": [
+    "dev / test / prod 설정을 어떻게 분리할지 모름",
+    "@Profile 어노테이션을 어디 붙여야 할지 헷갈림",
+    "테스트에서 환경 설정을 어떻게 바꿔치울지 모름",
+    "기본 프로파일이 무엇인지 모르고 의도하지 않은 Bean이 뜸"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-activeprofiles-vs-test-overrides-primer"
+    ],
+    "next_docs": [
+      "spring/test-slice-jdbctest-vs-webmvctest-vs-springboottest-chooser"
+    ],
+    "confusable_with": [
+      "spring/spring-activeprofiles-vs-test-overrides-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-profile-active-profiles-environment-config-primer.md",
+    "revision_history": []
+  }
+}

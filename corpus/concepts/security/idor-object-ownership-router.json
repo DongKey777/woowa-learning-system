@@ -1,0 +1,46 @@
+{
+  "id": "security/idor-object-ownership-router",
+  "title": "IDOR Object Ownership Router",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 router는 IDOR와 object ownership 누락 증상을 roomescape/shopping-cart 리소스 권한 체크로 연결한다.",
+  "body_markdown": "# IDOR Object Ownership Router\n\n## 관찰 증거\n\n`/orders/123`, `/reservations/77`처럼 resource id를 직접 받는 API에서 id만 바꿨는데 다른 사용자 데이터가 보이면 IDOR(Insecure Direct Object Reference)를 의심한다.\n\n이 증상은 \"로그인이 안 됨\"이 아니라 \"로그인한 사용자가 해당 object를 볼 수 있는지 확인하지 않음\"에 가깝다. 따라서 token 검증, 세션 유지, CORS 설정을 먼저 고치는 문제가 아니라 object-level authorization 경계를 확인해야 한다.\n\n## 1차 분기\n\nAuthentication은 사용자가 누구인지 확인한다. Authorization은 그 사용자가 해당 resource를 볼 수 있는지 확인한다. IDOR는 보통 로그인은 되어 있지만 object-level authorization이 빠진 상태다.\n\nRole이 `USER`인지 확인하는 것만으로는 부족하다. 주문, 예약, 장바구니, 결제처럼 소유자가 있는 리소스는 owner id, tenant id, membership, delegation scope를 함께 확인해야 한다. 반대로 `ADMIN` role도 무조건 전부 허용이 아니라, 운영 범위나 support case 같은 scope가 정의되어야 한다.\n\nIDOR의 핵심은 identifier가 예측 가능한지 여부가 아니다. UUID처럼 맞추기 어려운 id를 쓰더라도, id를 아는 사용자가 그 object에 접근할 권한이 없으면 거부해야 한다. 난수 id는 발견 가능성을 낮추는 보조 방어일 뿐 object-level authorization을 대체하지 않는다.\n\n## 확인해야 할 경계\n\n| 리소스 | 부족한 체크 | 필요한 체크 |\n|---|---|---|\n| 주문 상세 | `hasRole(USER)` | `order.userId == principal.id` 또는 위임 권한 |\n| 예약 취소 | 로그인 여부 | 예약 소유자, 관리자 권한, 취소 가능 상태 |\n| 장바구니 item | item id 존재 여부 | cart owner, tenant, item이 해당 cart에 속하는지 |\n| 결제/환불 | 주문 id 존재 여부 | payer/merchant/tenant scope와 action 권한 |\n| 관리자 검색 | admin role만 확인 | tenant/branch/support 범위, 검색 조건의 범위 제한 |\n\n권한 모델이 RBAC만으로 끝나는 경우는 드물다. RBAC는 \"어떤 기능을 사용할 수 있는가\"를 다루고, ownership은 \"어떤 object에 대해 그 기능을 적용할 수 있는가\"를 다룬다.\n\n## 다음 확인\n\n가능하면 조회 query 자체에 owner 조건을 넣는다. `findById(id)` 후 service에서 체크하는 방식은 누락 위험이 크다. `findByIdAndOwnerId(id, userId)`처럼 저장소 계약이 권한 경계를 드러내면 리뷰하기 쉽다.\n\nclient가 보낸 `userId`, `ownerId`, `tenantId`는 권한 근거가 아니라 조회 조건 후보일 뿐이다. 권한 판단의 subject는 session/JWT에서 나온 principal이고, resource owner와 tenant는 DB나 신뢰 가능한 domain model에서 읽어야 한다. path id와 principal id가 우연히 같은지만 보는 것도 부족하다. `cartItemId`가 정말 그 cart에 속하는지처럼 parent-child 관계까지 확인해야 한다.\n\n다만 query에 owner 조건을 넣더라도 \"리소스가 존재하지 않음\"과 \"존재하지만 권한 없음\"을 어떻게 응답할지는 정책 문제다. 외부 사용자에게 resource existence를 숨기려면 404를 줄 수 있고, 내부 관리 도구처럼 감사가 중요한 곳은 403과 audit log가 더 적절할 수 있다. 중요한 것은 어느 쪽이든 권한 없는 데이터가 response body에 섞이면 안 된다는 점이다.\n\n## 리뷰 포인트\n\n1. Controller가 받은 path id를 그대로 repository `findById`에 넘긴 뒤 response로 반환하지 않는지 본다.\n2. Service method signature에 `principalId`, `tenantId`, `authority` 같은 인가 입력이 드러나는지 본다.\n3. Repository query가 `WHERE id = ? AND owner_id = ?` 또는 membership join을 포함하는지 본다.\n4. list/search API에서 한 건 조회와 같은 owner/tenant filter가 적용되는지 확인한다.\n5. 테스트가 \"다른 사용자의 id를 넣으면 실패\"하는 negative case를 포함하는지 본다.\n6. admin/support override가 별도 permission, scope, reason, audit log 없이 role 이름 하나로 열려 있지 않은지 본다.\n\n## 사고 범위 판단\n\nIDOR가 발견되면 단일 endpoint만 보지 않는다. 같은 resource id를 받는 조회, 수정, 삭제, 다운로드, 상태 변경 endpoint를 함께 검색한다. `GET /orders/{id}`만 막고 `POST /orders/{id}/cancel`이나 invoice download를 놓치면 같은 취약점이 다른 action으로 남는다.\n\n목록, 검색, 집계, export endpoint도 같이 본다. 상세 조회는 막았지만 목록 API가 다른 tenant의 row를 섞어 반환하거나 count/total amount 같은 aggregate로 존재를 새게 만들 수 있다.\n\n로그에서는 actor user id, target resource id, action, decision, reason code, tenant id를 남겨야 한다. 단, target 데이터 자체나 민감 정보는 로그에 직접 남기지 않는다.\n\n## 면접 답변 한 문장\n\nIDOR는 identifier를 예측할 수 있어서 생기는 문제가 아니라, identifier로 찾은 object에 대해 현재 principal의 접근 권한을 검증하지 않아서 생기는 object-level authorization 문제라고 답하면 된다.\n\n## 관련 playbook\n\n권한 모델 선택은 `rbac-abac-resource-ownership-interview-chooser`, 미션 연결은 `tenant-isolation-mission-authz-bridge`로 이어진다.\n",
+  "aliases": [
+    "IDOR object ownership router",
+    "IDOR 객체 소유권 권한 체크",
+    "insecure direct object reference symptom",
+    "다른 사람 주문 예약 조회 버그"
+  ],
+  "expected_queries": [
+    "IDOR는 무엇이고 어떻게 막아?",
+    "다른 사람 리소스 ID를 넣으면 조회되는 문제를 어떻게 고쳐?",
+    "authorization에서 ownership check는 어디서 해야 해?"
+  ],
+  "symptoms": [
+    "URL의 id만 바꾸면 다른 사람 데이터가 보입니다",
+    "role check만 하고 resource owner check를 하지 않습니다",
+    "repository 조회 후 권한 필터링을 누락합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/resource-authz-ownership-drill"
+    ],
+    "next_docs": [
+      "security/rbac-abac-resource-ownership-interview-chooser",
+      "security/tenant-isolation-mission-authz-bridge"
+    ],
+    "confusable_with": [
+      "security/rbac-abac-resource-ownership-interview-chooser",
+      "security/role-permission-resource-authz-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/idor-object-ownership-router.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "system-design/notification-preferences-delivery-interview-chooser",
+  "title": "Notification Preferences Delivery Interview Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 notification system 설계에서 preference evaluation, channel routing, retry/dedup을 분리한다.",
+  "body_markdown": "# Notification Preferences Delivery Interview Chooser\n\n## 10초 chooser\n\n| 관심사 | 컴포넌트 | 핵심 질문 |\n|---|---|---|\n| 알림을 만들 것인가 | Event ingestion | 어떤 business event가 notification이 되는가 |\n| 누구에게 보낼 것인가 | Preference/eligibility | 수신 동의, quiet hours, block |\n| 어떻게 보낼 것인가 | Channel dispatcher | push/email/SMS retry와 provider 장애 |\n\n## 헷갈리는 축\n\n알림 생성과 발송은 분리한다. 주문 완료 이벤트가 발생했다고 해서 같은 transaction 안에서 외부 push provider까지 호출하면 장애 전파가 커진다.\n\nPreference는 발송 직전에 평가하는 편이 안전하다. 이벤트가 생성된 뒤 사용자가 수신 거부를 바꿀 수 있기 때문이다.\n\nPreference correctness는 \"한 번 읽었는가\"보다 \"어떤 결정이 어떤 preference version으로 내려졌는가\"에 가깝다. `NotificationIntent`에는 당시의 정책 판단과 audit용 snapshot을 남길 수 있지만, 실제 외부 channel 호출 직전에는 최신 hard opt-out, block, quiet hours, endpoint 상태를 다시 확인한다.\n\nDelivery는 idempotency key와 dedup key가 필요하다. retry가 같은 알림을 여러 번 보내면 사용자 신뢰가 떨어진다.\n\n## Wrong-bucket neighbor\n\nNotification system은 message queue 자체가 아니다. Queue는 delivery pipeline의 일부이고, 알림 정책, preference, channel provider fallback이 별도 설계 축이다.\n\n## 핵심 요구사항\n\n- business event를 알림 후보로 변환하되, 사용자 preference와 eligibility를 적용한다.\n- push, email, SMS 같은 channel별 delivery latency와 비용, 실패 처리를 분리한다.\n- 중복 발송을 막고 retry, provider 장애, quiet hours, unsubscribe를 처리한다.\n- 사용자가 알림 설정을 바꾼 뒤에는 가능한 한 빠르게 발송 정책에 반영한다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `NotificationEvent`, `NotificationIntent`, `PreferenceSnapshot`, `PreferenceVersion`, `DeliveryAttempt`, `ChannelEndpoint`, `DedupKey`다. `NotificationIntent`는 \"보낼 수 있는 알림 후보\"이고, `DeliveryAttempt`는 특정 channel/provider로 보낸 개별 시도다. `PreferenceVersion`은 \"이 발송 판단이 어떤 설정을 기준으로 했는가\"를 남겨 사후 감사와 재처리 판단에 쓴다.\n\n트래픽은 business event burst와 provider throttle에 영향을 받는다. Preference read는 fanout 전에 대량으로 발생할 수 있고, channel dispatcher는 provider별 rate limit과 retry queue를 가진다. Inbox형 알림은 DB projection으로 남기고, push/email/SMS는 외부 provider 호출로 분리한다.\n\n## Consistency/Latency Trade-off\n\nPreference를 event 생성 시점에 snapshot하면 fanout이 빠르지만, 사용자가 직후 수신 거부를 바꾼 경우 잘못 발송될 수 있다. 발송 직전에 preference를 다시 평가하면 안전하지만 read 비용과 latency가 늘어난다.\n\n정확성을 높이는 일반적인 타협은 두 단계다. Fanout 단계에서는 coarse eligibility로 후보만 줄이고, provider 호출 직전에는 최신 preference를 authoritative store 또는 강한 invalidation이 붙은 cache에서 다시 읽는다. Cache를 쓰는 경우 unsubscribe/block 같은 hard preference 변경은 TTL 만료에 맡기지 말고 version bump, write-through, invalidation event 중 하나로 빠르게 반영해야 한다.\n\n모든 알림이 같은 preference 규칙을 따르지는 않는다. 마케팅 알림은 opt-in/opt-out을 강하게 지켜야 하고, 보안/결제 같은 transactional 알림은 법적 unsubscribe와 별개로 보낼 수 있지만 channel endpoint 유효성, abuse block, quiet hours 정책은 여전히 명시해야 한다. \"중요하니 무조건 보낸다\"가 아니라 알림 class별 override 근거를 분리해야 한다.\n\nDelivery retry는 at-least-once가 현실적이므로 dedup key와 provider message id를 저장해야 한다. 강한 exactly-once를 주장하기보다 사용자에게 중복 체감이 없도록 idempotent delivery state를 설계하는 편이 면접에서 설득력 있다.\n\n## 실패 반례\n\n- 주문 transaction 안에서 push provider를 동기 호출해 provider 장애가 주문 성공률을 떨어뜨린다.\n- quiet hours나 unsubscribe 변경을 fanout 후에 무시해 원치 않는 알림을 보낸다.\n- preference cache TTL만 믿어 hard opt-out 이후 몇 분 동안 마케팅 알림을 계속 보낸다.\n- transactional 알림이라는 이유로 channel endpoint block이나 abuse suppression까지 무시한다.\n- retry마다 새 dedup key를 만들어 같은 사용자가 같은 알림을 여러 번 받는다.\n- provider throttle을 고려하지 않아 queue backlog가 쌓이고 지연 알림이 폭발한다.\n\n## 면접 답변 Skeleton\n\n1. \"알림은 event ingestion, preference/eligibility evaluation, channel delivery를 분리합니다.\"\n2. \"NotificationIntent에는 audit용 preference version을 남기고, DeliveryAttempt 직전에는 최신 hard opt-out과 endpoint 상태를 다시 확인합니다.\"\n3. \"알림 class별로 marketing, transactional, security 정책을 분리하고 dedup key로 중복 발송을 막습니다.\"\n4. \"Provider 장애는 retry queue, fallback channel, DLQ로 격리합니다.\"\n5. \"metric은 delivery success rate, duplicate delivery, preference violation, provider throttle, queue age입니다.\"\n\n## Safe Next Docs\n\n모바일 push 세부는 `mobile-push-notification-pipeline-design`, retry/dedup 실패 처리는 `webhook-retry-dedup-deadletter-playbook`으로 이어진다.\n",
+  "aliases": [
+    "notification delivery preference chooser",
+    "알림 시스템 설계 면접",
+    "push email sms notification design",
+    "notification preferences fanout"
+  ],
+  "expected_queries": [
+    "Notification system design은 어떻게 답해?",
+    "알림 선호도와 delivery retry를 어떻게 나눠?",
+    "push email SMS 채널을 어떻게 설계해?"
+  ],
+  "symptoms": [
+    "알림 생성과 실제 발송을 같은 트랜잭션으로 묶으려 합니다",
+    "사용자 preference를 발송 직전에 확인하지 않습니다",
+    "retry가 중복 발송을 만들 수 있다는 점을 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/notification-system-design"
+    ],
+    "next_docs": [
+      "system-design/mobile-push-notification-pipeline-design",
+      "system-design/webhook-retry-dedup-deadletter-playbook"
+    ],
+    "confusable_with": [
+      "system-design/mobile-push-notification-pipeline-design",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/notification-preferences-delivery-interview-chooser.md",
+    "revision_history": []
+  }
+}

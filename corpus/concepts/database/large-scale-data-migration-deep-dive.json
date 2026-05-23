@@ -1,0 +1,72 @@
+{
+  "id": "database/large-scale-data-migration-deep-dive",
+  "title": "대용량 데이터 마이그레이션 deep_dive — 1000만 행 안전하게 옮기기",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# 대용량 데이터 마이그레이션 deep_dive — 1000만 행 안전하게 옮기기\n\n> 한 줄 요약: 대용량 마이그는 \"**기본 ALTER로 lock**\" 함정을 피하기 위해\n> **online schema change 도구 + chunked backfill + dual-write + cutover plan +\n> 검증 단계**가 모두 있어야 안전하다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [트랜잭션 격리수준과 락](./transaction-isolation-locking.md)\n- [Replica Lag와 Read-After-Write 전략](./replica-lag-read-after-write-strategies.md)\n- [트랜잭션 실전 시나리오](./transaction-case-studies.md)\n- [CDC Schema Evolution Compatibility Playbook](./cdc-schema-evolution-compatibility-playbook.md)\n- [Connection Pool 기초](./connection-pool-basics.md)\n- [Failover와 Redundancy primer](../system-design/failover-redundancy-primer.md)\n- [database 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: large scale migration deep dive, 1000만 행 무중단 마이그, online schema change, pt-online-schema-change gh-ost, dual-write 전략, backfill chunk batch size, cutover plan, migration rollback, replica drift migration, ALTER TABLE lock 회피\n\n## 먼저 멘탈모델 — 왜 대용량은 어려운가\n\n작은 데이터(수만 행) ALTER TABLE은 빠르지만, **수백만~수억 행은**:\n\n1. **Lock 시간 폭증**: MySQL InnoDB 일부 ALTER는 row-level lock 또는 metadata lock 수십 분\n2. **Replication Lag**: master에서 끝나도 replica가 따라잡는 데 시간 필요\n3. **저장 공간**: 새 테이블 생성 + 데이터 복사로 디스크 2배 필요\n4. **Online 트래픽 충돌**: 마이그 중 들어오는 INSERT/UPDATE/DELETE 처리\n5. **실패 시 rollback**: 절반쯤 진행하다 실패하면?\n\n**해결 원칙**:\n- \"한 번에 다 못 한다\" → **chunk로 나눔**\n- \"lock 못 한다\" → **online tool 사용 or dual-write**\n- \"갑자기 못 바꾼다\" → **단계별 전환 + rollback 가능**\n\n## 5가지 마이그 시나리오\n\n| 시나리오 | 권장 패턴 |\n|---|---|\n| 컬럼 추가 (`ADD COLUMN`) | online DDL 또는 pt-osc/gh-ost |\n| 컬럼 type 변경 | shadow column + backfill + cutover |\n| 인덱스 추가 | online index build (대부분 DB 지원) |\n| 큰 테이블 분리/통합 | dual-write + chunked backfill + cutover |\n| DB 전체 이전 (MySQL → PostgreSQL) | dual-write + replication + cutover |\n\n## 도구 1: Online Schema Change\n\n### MySQL InnoDB Online DDL\n\nMySQL 5.6+는 일부 ALTER가 online (lock 없이 진행).\n\n```sql\nALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT NULL,\nALGORITHM=INPLACE, LOCK=NONE;\n```\n\n**가능한 작업**:\n- 컬럼 추가 (가장 흔함)\n- 인덱스 생성\n- 외래키 추가\n\n**불가능한 작업** (lock 발생):\n- 컬럼 type 변경\n- Primary Key 변경\n- 가벼운 데이터 검증\n\n### pt-online-schema-change (Percona Toolkit)\n\ntrigger-based online DDL.\n\n**작동 원리**:\n1. 새 스키마로 빈 테이블 생성 (`_users_new`)\n2. trigger 등록: 원본 INSERT/UPDATE/DELETE → 새 테이블에도 똑같이\n3. 원본 데이터를 chunk로 새 테이블에 복사\n4. 완료되면 `RENAME TABLE`로 atomic 교체 (수 ms lock)\n\n**장점**: 대부분의 ALTER에 적용\n**단점**: trigger overhead (15-20% 쓰기 성능 ↓), 디스크 2배 필요\n\n### gh-ost (GitHub)\n\nbinlog-based online DDL. trigger 사용 X.\n\n**작동 원리**:\n1. 새 테이블 생성\n2. binlog를 읽어서 새 테이블에 적용 (master에 부하 ↓)\n3. 데이터 chunk 복사\n4. Cut-over 시점 단축\n\n**장점**: trigger 없음 → 성능 영향 적음, 더 안전한 cut-over\n**단점**: replication 의존 (RBR — Row-Based Replication 필요)\n\n### 비교\n\n| 도구 | 트리거 | binlog | 성능 영향 | 사용 시점 |\n|---|---|---|---|---|\n| InnoDB Online DDL | X | X | 매우 적음 | 단순 추가 |\n| pt-osc | Yes | X | 중간 | 일반적 ALTER |\n| gh-ost | X | Yes | 적음 | 큰 테이블, 안전 우선 |\n\n## 패턴: Shadow Column + Backfill\n\n컬럼 type 변경 같은 ALTER가 online 불가능한 경우.\n\n### 단계\n\n```\nT1. ALTER TABLE users ADD COLUMN email_new VARCHAR(320);\n    -- 새 컬럼 추가 (lock 짧음)\n\nT2. Application code 변경: \n    INSERT/UPDATE 시 email_new에도 같은 값 쓰기 (dual-write)\n\nT3. Backfill: \n    UPDATE users SET email_new = email WHERE id BETWEEN ... AND ... (chunk)\n\nT4. Read switch:\n    Application이 email_new 읽기 시작\n\nT5. Drop:\n    ALTER TABLE users DROP COLUMN email;\n    ALTER TABLE users RENAME COLUMN email_new TO email;\n```\n\n각 단계가 reversible해야 안전. 마지막 step만 비가역.\n\n### Backfill chunk 설계\n\n```sql\n-- chunk size 1000\nUPDATE users \nSET email_new = email\nWHERE id BETWEEN 1 AND 1000\n  AND email_new IS NULL;\n```\n\n**chunk size 결정**:\n- 너무 작음 (100): 트래픽은 영향 적지만 끝나기까지 오래\n- 너무 큼 (10000+): lock 시간 길어짐, replication lag\n\n**일반 범위**: 1000-5000\n\n**pseudo-code**:\n```python\nstart_id = 0\nbatch = 1000\nwhile True:\n    end_id = start_id + batch\n    affected = execute(f\"UPDATE ... WHERE id BETWEEN {start_id} AND {end_id} AND email_new IS NULL\")\n    log.info(f\"Migrated id {start_id}-{end_id}, affected={affected}\")\n    if affected == 0 and start_id > MAX_ID:\n        break\n    start_id = end_id\n    time.sleep(0.5)  # ← throttle: replication lag 방지\n```\n\n## 패턴: Dual-Write Strategy\n\n새 DB / 테이블 / column으로 전환할 때.\n\n### 6단계 흐름\n\n```\n1. 새 destination 준비 (테이블, 인덱스, 스키마)\n\n2. Dual-Write 시작:\n   - Application: 기존 + 새 destination에 동시 쓰기\n   - 기존이 source of truth (failure 시 fallback)\n   - 새 destination 일관성 검증\n\n3. Backfill:\n   - 기존 데이터를 새 destination에 복사 (chunk)\n   - 진행 상태 저장 (resume 가능)\n\n4. Dual-Read shadow mode:\n   - 양쪽에서 읽되, 결과 비교만 (응답은 기존 사용)\n   - drift 감지\n\n5. Read switch:\n   - 새 destination이 source of truth\n   - 기존은 dual-write로 유지 (rollback safety)\n\n6. Cleanup:\n   - 일정 기간(1주~1달) dual-write 유지\n   - 안정 확인 후 기존 destination drop\n```\n\n### Dual-Write 함정\n\n```python\ndef save_user(user):\n    old_db.save(user)  # 성공\n    new_db.save(user)  # 실패 → 불일치!\n```\n\n**해결**:\n- 트랜잭션 outbox 패턴 (DB + 메시지큐로 atomic)\n- 또는 idempotent write + reconciliation job (주기적 비교/수정)\n\n## Resume + Progress Tracking\n\n마이그 도중 실패해도 처음부터 다시 안 하도록.\n\n### 진행 상태 저장\n\n```sql\nCREATE TABLE migration_progress (\n    migration_id VARCHAR(64) PRIMARY KEY,\n    last_processed_id BIGINT,\n    status VARCHAR(20),  -- 'running', 'completed', 'failed'\n    started_at TIMESTAMP,\n    updated_at TIMESTAMP\n);\n```\n\n매 chunk 끝나면 `last_processed_id` 갱신. 재시작 시 거기서부터 resume.\n\n### Idempotent backfill\n\n```sql\nUPDATE users SET email_new = email\nWHERE id BETWEEN ? AND ?\n  AND email_new IS NULL;   -- ← 이미 처리된 row는 skip\n```\n\n`email_new IS NULL` 조건으로 idempotent. 중복 실행해도 OK.\n\n## Replication Lag 관리\n\n마이그 중 master 쓰기 부하 ↑ → replica lag.\n\n### 모니터링\n\n```sql\n-- MySQL\nSHOW SLAVE STATUS\\G  -- Seconds_Behind_Master\n-- PostgreSQL\nSELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()));\n```\n\n### Throttling\n\n```python\nwhile True:\n    lag = check_replica_lag()\n    if lag > 10:  # 10초 이상\n        time.sleep(5)\n        continue\n    process_chunk()\n```\n\n### Read traffic 영향\n\n서비스가 replica에서 읽으면 stale 데이터 노출 가능. 마이그 시간엔:\n- 중요한 읽기는 master 강제 (Read-Your-Writes)\n- 일시적 traffic shaping (마이그 chunk size ↓)\n\n## Cutover Plan\n\n새 DB로 전환하는 결정적 순간.\n\n### 단계\n\n```\nT-1d. 새 DB 데이터 sync 완료 확인 (lag < 1초)\nT-1h. dry-run cutover (staging 또는 maintenance window)\nT-30m. monitoring + alert 강화\nT0.   Cutover:\n        1. read-only mode (incoming writes block)\n        2. 최종 sync (binlog catch-up)\n        3. application config 변경 (새 DB 가리키기)\n        4. read-only 해제\n        5. smoke test (a few writes/reads)\nT+5m. 정상 트래픽 확인 (error rate, latency)\nT+1h. 안정 확인 → 기존 DB read-only로 유지 (rollback safety)\nT+1w. 기존 DB drop 결정\n```\n\n### Rollback plan\n\n```\nT0+30m. 만약 새 DB 문제 → rollback:\n        1. application config 다시 기존 DB로\n        2. dual-write로 유지된 변경 손실 확인\n        3. data drift 검토 + fix\n```\n\n**핵심**: cutover 전 모든 step이 rollback 가능한지 확인.\n\n## 검증 (Validation)\n\n### Row Count\n\n```sql\nSELECT COUNT(*) FROM old.users;\nSELECT COUNT(*) FROM new.users;\n```\n\n차이가 0인지 매 chunk 후 확인.\n\n### Checksum / Hash\n\n```sql\n-- MySQL pt-table-checksum\nSELECT COUNT(*), SHA1(GROUP_CONCAT(id, email)) FROM users;\n```\n\n`pt-table-checksum` 도구가 자동화.\n\n### Sample Comparison\n\n```python\nsample = random.sample(all_ids, 1000)\nfor id in sample:\n    old_row = old_db.fetch(id)\n    new_row = new_db.fetch(id)\n    if old_row != new_row:\n        log.error(f\"drift: id={id}\")\n```\n\n### Streaming Validation\n\nCDC (Change Data Capture)로 양쪽 변경을 streaming하며 비교.\n\n## 자주 만나는 문제\n\n### \"Lock wait timeout exceeded\"\n\n큰 ALTER 또는 큰 chunk가 다른 트랜잭션과 충돌.\n\n해결:\n- chunk size ↓\n- 트래픽 낮은 시간에 진행\n- pt-osc/gh-ost 사용\n\n### \"Replica drift\"\n\n마이그 중 master가 너무 빠르면 replica가 못 따라감.\n\n해결:\n- throttle (chunk 간 sleep)\n- replica lag 모니터링 + 임계치 도달 시 대기\n\n### \"Out of memory\"\n\n큰 chunk가 memory 부족.\n\n해결:\n- batch size ↓\n- streaming/cursor 사용 (`SELECT ... LIMIT N OFFSET M` 대신 `WHERE id > last_id LIMIT N`)\n\n### \"Index도 backfill 필요\"\n\n새 컬럼에 인덱스 만들면 그 인덱스가 backfill 끝난 후에 만들어져야 빠름.\n\n```\n1. column 추가\n2. backfill 완료\n3. THEN 인덱스 추가 (online DDL)\n```\n\n## 실전 체크리스트\n\n```\nBefore:\n[ ] 현재 row count 측정\n[ ] 디스크 여유 확인 (2× 데이터 크기)\n[ ] backup 최신\n[ ] rollback plan 작성\n[ ] staging에서 dry-run\n[ ] monitoring/alert 강화 준비\n\nDuring:\n[ ] chunk size 적정\n[ ] throttle (replication lag <10s)\n[ ] progress 매 N분 로깅\n[ ] 트래픽 영향 모니터링\n\nAfter cutover:\n[ ] row count 일치 확인\n[ ] checksum 일치\n[ ] application metrics 정상\n[ ] rollback 가능한 상태 유지 (1주+)\n[ ] cleanup 결정 시점 명시\n```\n\n## 빠른 확인 질문\n\n- pt-osc와 gh-ost 차이?  답: trigger 기반 vs binlog 기반. gh-ost가 master 부하 적음\n- Dual-write의 핵심 함정?  답: 두 destination에 atomic 보장 안 됨 → outbox 패턴 또는 reconciliation\n- Backfill chunk size 일반?  답: 1000-5000. 너무 작으면 느림, 너무 크면 lock\n- Resume 안전성 보장 방법?  답: progress 테이블에 last_processed_id 저장 + idempotent UPDATE\n- Cutover의 핵심?  답: read-only → 최종 sync → config 전환 → smoke test → rollback safety 유지\n- Replication lag 관리?  답: 모니터링 + 임계치 초과 시 throttle\n\n## 한 줄 정리\n\n대용량 마이그는 \"**online DDL 도구(pt-osc/gh-ost) + chunked backfill + dual-write +\nprogress tracking + cutover 단계화 + rollback safety**\"가 모두 결합되어야 하며,\n각 단계가 reversible해야 production에서 안전하게 진행할 수 있다.\n",
+  "aliases": [
+    "large scale migration",
+    "대용량 마이그레이션",
+    "대용량 데이터 이행",
+    "batch backfill",
+    "백필 패턴",
+    "chunked migration",
+    "online schema change",
+    "무중단 스키마 변경",
+    "dual-write strategy",
+    "이중 쓰기 전략",
+    "shadow write",
+    "cutover plan",
+    "DB 마이그 cutover",
+    "migration rollback",
+    "1000만 행 마이그",
+    "1억 행 마이그",
+    "locking issue migration",
+    "replica drift migration",
+    "pt-online-schema-change",
+    "gh-ost",
+    "chunked update batch size",
+    "migration progress 측정",
+    "backfill resume"
+  ],
+  "expected_queries": [
+    "1000만 행 이상의 데이터를 ALTER TABLE 없이 안전하게 옮기는 방법은?",
+    "pt-online-schema-change와 gh-ost의 차이는?",
+    "dual-write 전략은 어떻게 작동하고 단계별 흐름은?",
+    "backfill을 chunk로 나눌 때 batch size를 어떻게 정해?",
+    "마이그 도중 실패해도 resume하려면 어떤 진행 상태를 저장해?",
+    "새 DB로 cutover 시 데이터 손실 없이 전환하는 단계는?"
+  ],
+  "symptoms": [
+    "1000만 행 이상 데이터를 마이그해야 하는데 막막해",
+    "ALTER TABLE이 너무 오래 걸려서 lock으로 다 막혀",
+    "새 컬럼 추가 후 backfill을 어떻게 안전하게 할지 모르겠어",
+    "마이그 도중 실패하면 어떻게 resume해야 할지 모르겠어",
+    "마이그 중 새 데이터가 들어와도 정합성을 유지하려면",
+    "새 DB로 cutover할 때 데이터 손실 없이 전환하는 방법"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-isolation-locking",
+      "database/replica-lag-read-after-write-strategies",
+      "database/transaction-case-studies"
+    ],
+    "next_docs": [
+      "database/cdc-schema-evolution-compatibility-playbook"
+    ],
+    "confusable_with": [
+      "database/cdc-schema-evolution-compatibility-playbook",
+      "database/transaction-case-studies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/large-scale-data-migration-deep-dive.md",
+    "revision_history": []
+  }
+}

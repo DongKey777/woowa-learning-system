@@ -1,0 +1,46 @@
+{
+  "id": "system-design/hedged-requests-tail-latency-chooser",
+  "title": "Hedged Requests Tail Latency Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 p99 tail latency를 줄이기 위한 hedged requests와 retry/backpressure의 trade-off를 구분한다.",
+  "body_markdown": "# Hedged Requests Tail Latency Chooser\n\n## 10초 chooser\n\n| 상황 | 전략 후보 | 주의 |\n|---|---|---|\n| 일부 replica만 느림 | Hedged request | idempotency와 extra load |\n| 요청 실패 후 재시도 | Retry | backoff와 retry budget |\n| 전체가 포화 | Load shedding/backpressure | 중복 요청 금지 |\n\n## 헷갈리는 축\n\nRetry는 실패나 timeout 이후 다시 보내는 전략이다. Hedged request는 느린 응답을 기다리는 중 일정 지연 후 같은 요청을 다른 replica에 병렬로 보내 tail을 줄이는 전략이다.\n\nHedging은 성공한 첫 응답을 사용하고 나머지를 취소하거나 무시한다. 하지만 downstream에는 추가 부하를 만든다.\n\n## 보장 범위\n\nHedged request의 보장은 평균 latency 개선이 아니라 tail latency 완화다. 일부 replica나 shard만 느리고, 다른 replica가 같은 요청을 처리할 수 있으며, 요청이 idempotent하거나 read-only이고, 시스템에 여유 capacity가 있을 때 p99를 낮출 수 있다.\n\n이 전략은 공통 dependency가 느린 상황, downstream이 이미 포화된 상황, 모든 replica가 같은 queue에 막힌 상황에는 맞지 않는다. 그런 경우 중복 요청은 지연을 줄이는 대신 load amplification으로 장애를 키운다.\n\n## 운영 설계 포인트\n\n| 결정 | 실무 기준 | 실패 모드 |\n|---|---|---|\n| hedge delay | p95 또는 동적 percentile 이후 발사 | 너무 빠르면 요청이 거의 두 배가 됨 |\n| 대상 replica | 원 요청과 독립적인 replica/shard | 같은 병목으로 보내면 효과 없음 |\n| budget | 전체 request 중 hedge 비율 제한 | traffic amplification 통제 실패 |\n| cancellation | 첫 응답 후 나머지 cancel/ignore | 불필요한 CPU/IO 지속 |\n| idempotency | read-only 또는 dedup key | side effect 중복 |\n| overload guard | saturation 높으면 hedge off | brownout을 outage로 확대 |\n\n## 운영 지표\n\n- p95/p99/p999 latency와 timeout rate\n- hedge 발사 비율, duplicate amplification factor\n- 원 요청 승리율과 hedge 요청 승리율\n- cancel 성공률, orphan request 비율\n- downstream CPU, queue depth, connection pool, QPS 증가율\n- retry budget과 hedge budget 소모량\n- idempotency dedup hit, duplicate side effect 탐지\n- overload guard로 hedge가 비활성화된 횟수\n\n면접에서는 p99가 줄었다는 결과만 말하지 말고, 추가 QPS가 얼마나 늘었는지와 downstream saturation이 안전 범위인지 같이 말해야 한다.\n\n## Trade-off\n\nHedge delay를 짧게 잡으면 p99는 줄기 쉽지만 거의 모든 요청이 중복되어 비용과 부하가 커진다. Delay를 길게 잡으면 부하는 적지만 tail 완화 효과가 작다. Retry는 실패 복구에 적합하고, hedging은 느린 replica 회피에 적합하다. 둘을 함께 쓰면 amplification이 곱해질 수 있으므로 retry budget과 hedge budget을 하나의 client-side budget으로 묶는 편이 안전하다.\n\nHedging은 read path에서 특히 유용하다. write path에 적용하려면 idempotency key, dedup window, compare-and-set, cancellation semantics가 있어야 한다. 그래도 결제, 재고 차감, 메시지 발행처럼 side effect가 큰 작업은 hedging보다 timeout, queue, backpressure, idempotent retry를 우선 검토한다.\n\n## 실패 반례\n\n쓰기 요청이나 side effect가 있는 API에 hedging을 적용하려면 idempotency key, dedup, cancellation semantics가 필요하다. 전체 시스템이 포화된 상황에서는 hedge가 장애를 키운다.\n\n- 모든 replica가 같은 DB lock을 기다리는데 hedge를 보내 DB connection만 더 소모한다.\n- p50 이후 바로 hedge를 발사해 정상 traffic에서도 QPS가 2배 가까이 증가한다.\n- 첫 응답 후 cancel이 전파되지 않아 느린 요청이 계속 expensive query를 수행한다.\n- non-idempotent POST에 hedging을 적용해 주문이나 결제가 중복 생성된다.\n- retry와 hedge가 동시에 켜져 client 하나가 장애 상황에서 요청을 여러 배로 증폭한다.\n- load balancer가 같은 hot shard로 중복 요청을 보내 독립성을 얻지 못한다.\n\n## 면접 답변 골격\n\n\"Hedged request는 timeout 후 재시도하는 retry와 달리, 요청이 일정 percentile보다 늦어질 때 같은 요청을 다른 replica에 병렬로 보내 먼저 성공한 응답을 쓰는 tail latency 전략입니다. 일부 replica만 느리고 요청이 read-only 또는 idempotent이며 capacity 여유가 있을 때 p99를 낮출 수 있습니다. 대신 duplicate QPS가 생기므로 hedge delay, budget, cancellation, overload guard가 필요합니다. 운영 지표는 p99뿐 아니라 hedge rate, amplification factor, hedge winner rate, cancel 성공률, downstream saturation을 같이 봅니다. 전체가 포화되었거나 side effect가 있는 write에는 hedging보다 backpressure, load shedding, idempotent retry를 우선합니다.\"\n\n## Safe Next Docs\n\nSafe retry/dedup은 `idempotency-key-store-dedup-window-replay-safe-retry-design`, 포화 대응은 `rate-limit-vs-queue-load-shedding-chooser`로 이어진다.\n",
+  "aliases": [
+    "hedged requests tail latency chooser",
+    "hedged request와 retry 차이",
+    "꼬리 지연 중복 요청 전략",
+    "p99 latency duplicate request tradeoff"
+  ],
+  "expected_queries": [
+    "Hedged request는 retry랑 뭐가 달라?",
+    "p99 latency 줄이려고 중복 요청을 보내도 돼?",
+    "hedging은 언제 위험해?"
+  ],
+  "symptoms": [
+    "tail latency를 줄이려고 모든 요청을 즉시 중복 전송합니다",
+    "non-idempotent API에 hedged request를 적용하려 합니다",
+    "downstream 부하가 이미 높은데 hedge로 더 밀어붙입니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/tail-latency-p99-debugging-playbook"
+    ],
+    "next_docs": [
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "system-design/rate-limit-vs-queue-load-shedding-chooser"
+    ],
+    "confusable_with": [
+      "network/timeout-retry-backoff-practical",
+      "system-design/retry-amplification-and-backpressure-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/hedged-requests-tail-latency-chooser.md",
+    "revision_history": []
+  }
+}

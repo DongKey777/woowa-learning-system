@@ -1,0 +1,52 @@
+{
+  "id": "security/key-rotation-runbook",
+  "title": "Key Rotation Runbook",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 Key Rotation Runbook를 다루는 deep_dive 문서다. key rotation은 새 키를 만드는 작업이 아니라, 발급, 배포, 검증, 중복 허용, 폐기, 감사까지 포함한 운영 절차다. 검색 질의가 key rotation, runbook, dual validation, key version처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# Key Rotation Runbook\n\n> 한 줄 요약: key rotation은 새 키를 만드는 작업이 아니라, 발급, 배포, 검증, 중복 허용, 폐기, 감사까지 포함한 운영 절차다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Secret Management, Rotation, Leak Patterns](./secret-management-rotation-leak-patterns.md)\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n> - [JWT Signature Verification Failure Playbook](./jwt-signature-verification-failure-playbook.md)\n> - [JWT / JWKS Outage Recovery / Failover Drills](./jwt-jwks-outage-recovery-failover-drills.md)\n> - [JWKS Rotation Cutover Failure / Recovery](./jwks-rotation-cutover-failure-recovery.md)\n> - [Signing Key Compromise Recovery Playbook](./signing-key-compromise-recovery-playbook.md)\n> - [Service-to-Service Auth: mTLS, JWT, SPIFFE](./service-to-service-auth-mtls-jwt-spiffe.md)\n> - [mTLS Certificate Rotation / Trust Bundle Rollout](./mtls-certificate-rotation-trust-bundle-rollout.md)\n> - [Secret Scanning / Credential Leak Response](./secret-scanning-credential-leak-response.md)\n\nretrieval-anchor-keywords: key rotation, runbook, dual validation, key version, grace window, revoke old key, JWKS, signing key, rotation incident, cutover, audit trail, kid rollover, verification failure, rollback decision, failover drill, key compromise recovery\n\n---\n\n## 핵심 개념\n\nkey rotation은 보안 사고 대응이자 정기 운영이다.  \n새 키를 발급하는 것보다 더 중요한 것은 구 키와 신 키가 잠깐 같이 동작하도록 하되, 어느 시점에 구 키를 끊을지 명확히 하는 것이다.\n\n회전 대상:\n\n- JWT signing key\n- API signing secret\n- webhook secret\n- encryption key\n- mTLS key/cert\n\nrunbook이 없으면 rotation은 장애가 된다.\n\n---\n\n## 깊이 들어가기\n\n### 1. rotation의 핵심은 cutover다\n\n순서는 대체로 이렇다.\n\n1. 새 키 생성\n2. 새 키 배포\n3. verifier가 새 키를 신뢰하는지 확인\n4. signer가 새 키를 쓰도록 전환\n5. old key를 잠깐 중복 허용\n6. old key 폐기\n7. 감사 로그와 지표 확인\n\n### 2. dual validation 기간이 필요하다\n\n회전 직후에는 새 키와 옛 키를 둘 다 검증해야 하는 순간이 생긴다.\n\n- JWT: JWKS에서 새/옛 key를 함께 노출\n- webhook: old/new secret을 짧게 병행\n- mTLS: trust bundle overlap\n\n이 기간이 너무 짧으면 실패가 난다.  \n너무 길면 보안 이득이 줄어든다.\n\n### 3. issuer와 verifier의 배포 속도가 다르다\n\n서비스마다 rollout 속도가 다르므로, 키 회전은 \"모든 곳이 동시에 바뀐다\"는 가정으로 하면 안 된다.\n\n- auth server는 빨리 바뀔 수 있다\n- edge proxy는 늦을 수 있다\n- mobile client는 더 늦다\n\n그래서 key version과 grace window가 필요하다.\n\n### 4. revoke와 rotation은 다르다\n\n- `rotation`: 앞으로 쓸 새 키로 이동\n- `revoke`: 이미 유출된 키를 즉시 중단\n\n사고 때는 두 가지를 같이 해야 한다.\n\n### 5. runbook은 사람의 기억을 대체한다\n\n실패하지 않는 rotation은 문서화된 rotation이다.\n\n- 누가 승인하는가\n- 어디를 먼저 바꾸는가\n- 실패 시 되돌리는가\n- 어떤 지표를 보고 cutover 하는가\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: JWT signing key를 교체해야 함\n\n대응:\n\n- 새 private key 생성\n- JWKS에 새 public key 추가\n- access token TTL을 짧게 유지\n- old key 제거 시점을 예약\n\n### 시나리오 2: webhook secret 유출 가능성이 있음\n\n대응:\n\n- old/new secret 동시 허용 시간을 잡는다\n- provider와 receiver를 함께 바꾼다\n- replay된 event를 재확인한다\n\n### 시나리오 3: rotation 후 일부 서비스만 실패\n\n대응:\n\n- verifier cache를 확인한다\n- bundle propagation을 확인한다\n- rollback 여부를 판단한다\n\n---\n\n## 코드로 보기\n\n### 1. key version 선택 개념\n\n```java\npublic String signWithCurrentKey(String payload) {\n    KeyVersion current = keyRegistry.currentSigningKey();\n    return signer.sign(current.privateKey(), payload, current.keyId());\n}\n```\n\n### 2. dual validation 개념\n\n```java\npublic boolean verify(String token) {\n    for (PublicKey key : keyRegistry.verificationKeys()) {\n        if (verifier.verifyWith(key, token)) {\n            return true;\n        }\n    }\n    return false;\n}\n```\n\n### 3. runbook 체크리스트\n\n```text\n1. 새 키 생성\n2. 배포 대상 확인\n3. dual validation 가능 여부 확인\n4. cutover 시점 공지\n5. old key revoke\n6. 실패 지표 모니터링\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| planned rotation | 사고를 줄인다 | 운영 작업이 필요하다 | 모든 중요한 키 |\n| emergency rotation | 유출 대응이 빠르다 | 급격한 장애 위험 | 사고 대응 |\n| dual validation | 무중단 전환이 쉽다 | old key가 잠깐 남는다 | 대부분의 회전 |\n| hard cutover | 정리가 빠르다 | 실패 가능성이 높다 | 통제된 환경 |\n\n판단 기준은 이렇다.\n\n- verifier와 signer를 모두 통제할 수 있는가\n- key version을 명시적으로 관리하는가\n- rollback 기준이 있는가\n- audit trail이 남는가\n\n---\n\n## 꼬리질문\n\n> Q: key rotation과 revoke의 차이는 무엇인가요?\n> 의도: 전환과 중단의 차이를 이해하는지 확인\n> 핵심: rotation은 새 키로 옮기는 것이고 revoke는 옛 키를 끊는 것이다.\n\n> Q: dual validation이 왜 필요한가요?\n> 의도: 무중단 전환의 현실을 아는지 확인\n> 핵심: 배포 시차 때문에 old와 new를 잠깐 같이 받아야 하기 때문이다.\n\n> Q: runbook이 왜 필요한가요?\n> 의도: 운영 절차의 중요성을 아는지 확인\n> 핵심: rotation 실패가 장애가 되지 않도록 순서를 고정하기 위해서다.\n\n> Q: signing key rotation에서 가장 먼저 확인할 것은 무엇인가요?\n> 의도: 배포와 검증 경계 이해 확인\n> 핵심: verifier가 새 key를 언제부터 신뢰하는지다.\n\n## 한 줄 정리\n\nkey rotation runbook은 \"새 키 배포\"가 아니라 \"무중단 cutover와 안전한 폐기\"를 보장하는 운영 절차다.\n",
+  "aliases": [
+    "key rotation",
+    "runbook",
+    "dual validation",
+    "key version",
+    "grace window",
+    "revoke old key",
+    "JWKS",
+    "signing key",
+    "rotation incident",
+    "cutover",
+    "audit trail",
+    "kid rollover"
+  ],
+  "expected_queries": [
+    "Key Rotation Runbook 핵심 개념을 설명해줘",
+    "key rotation가 왜 필요한지 알려줘",
+    "Key Rotation Runbook 실무 설계 포인트는 뭐야?",
+    "key rotation에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Key Rotation Runbook`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
+    "`Key Rotation Runbook` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Key Rotation Runbook`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/owasp-top10-basics"
+    ],
+    "next_docs": [
+      "security/authentication-form-login-vs-jwt-vs-session-cookie-chooser"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/key-rotation-runbook.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "id": "system-design/session-revocation-basics",
+  "title": "Session Revocation Basics",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "이 문서는 system-design 카테고리에서 Session Revocation Basics를 다루는 primer 문서다. logout, revoke propagation, short-lived token은 \"토큰을 어떻게 검증하나\"보다 \"이미 발급된 자격을 언제부터 어떻게 못 쓰게 만드나\"의 문제를 다루며, token-based auth도 lifecycle control을 위해 결국 서버 상태를 필요로 한다. 검색 질의가 session revocation basics, logout 뭐예요, logout propagation basics, forced logout basics처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Session Revocation Basics\n\n> 한 줄 요약: logout, revoke propagation, short-lived token은 \"토큰을 어떻게 검증하나\"보다 \"이미 발급된 자격을 언제부터 어떻게 못 쓰게 만드나\"의 문제를 다루며, token-based auth도 lifecycle control을 위해 결국 서버 상태를 필요로 한다.\n\nretrieval-anchor-keywords: session revocation basics, logout 뭐예요, logout propagation basics, forced logout basics, short-lived access token basics, short-lived token why, jwt logout basics, logout all devices basics, session version basics, refresh token basics, browser logout tail, mobile logout tail, beginner auth lifecycle, beginner system design auth, session revocation basics basics\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Stateless Sessions Primer](./stateless-sessions-primer.md)\n- [Browser BFF Session Boundary Primer](./browser-bff-session-boundary-primer.md)\n- [Session Store Design at Scale](./session-store-design-at-scale.md)\n- [Canonical Revocation Plane Across Token Generations](./canonical-revocation-plane-across-token-generations-design.md)\n- [Revocation Bus Regional Lag Recovery](./revocation-bus-regional-lag-recovery-design.md)\n- [Signed Cookies / Server Sessions / JWT Tradeoffs](../security/signed-cookies-server-sessions-jwt-tradeoffs.md)\n- [Security: Session Revocation at Scale](../security/session-revocation-at-scale.md)\n- [Security: Revocation Propagation Lag / Debugging](../security/revocation-propagation-lag-debugging.md)\n- [Security: Browser / BFF Token Boundary / Session Translation](../security/browser-bff-token-boundary-session-translation.md)\n\n---\n\n## 핵심 개념\n\n초보자가 가장 많이 헷갈리는 지점은 이것이다.\n\n- token-based auth를 쓰면 서버가 세션을 안 들고 있을 것 같다\n- 그래서 logout도 \"클라이언트에서 token만 지우면 끝\"처럼 느껴진다\n\n하지만 실전에서 중요한 질문은 \"토큰이 self-contained인가\"보다 아래에 가깝다.\n\n- 이 사용자를 지금부터 막아야 하는가\n- 특정 기기만 끊을 것인가, 모든 기기를 끊을 것인가\n- 비밀번호 변경이나 계정 정지 후에 언제부터 deny되어야 하는가\n- 이미 발급된 access token이 edge/cache/BFF에 남아 있으면 어떻게 할 것인가\n\n즉, session revocation은 **인증 정보를 발급하는 문제**보다 **이미 발급된 인증 정보를 수명 주기 동안 통제하는 문제**다.\n\n아주 단순하게 그리면 아래처럼 본다.\n\n```text\nlogin\n  -> access token issued\n  -> refresh/session state issued\n\nlogout / password reset / admin disable\n  -> revocation state written somewhere\n  -> gateways, verifiers, caches, BFFs learn that state\n  -> old token eventually stops working\n```\n\n여기서 핵심은 마지막 줄이다.\nold token이 \"즉시\" 멈출 수도 있지만, 많은 시스템에서는 **전파 시간과 TTL만큼 tail**이 남는다.\n\n---\n\n## 깊이 들어가기: Logout, Token TTL, Lifecycle State\n\n### 1. logout와 revocation은 비슷하지만 같은 단어는 아니다\n\n`logout`은 \"이 세션을 끝내라\"라는 이벤트다.\n`revocation`은 그 의도가 실제 검증 경로에 반영되어 더 이상 통과시키지 않는 상태다.\n\n사용자 눈에는 \"로그아웃했는데 왜 아직 한두 번은 통과하지?\"처럼 보일 수 있다.\n\n| 동작 | 서버가 해야 하는 일 |\n|---|---|\n| 현재 브라우저 로그아웃 | cookie/session 종료 + BFF mapping 정리 |\n| 모든 기기 로그아웃 | subject 기준 전역 revoke 또는 version bump |\n| 비밀번호 변경 후 강제 로그아웃 | subject/session epoch 상승 + refresh/session family 정리 |\n\n### 2. short-lived access token은 revoke tail을 줄일 뿐이다\n\n짧은 TTL이 주는 효과:\n\n- 오래된 access token을 들고 있어도 오래 못 쓴다\n- revoke event가 일부 verifier에 늦게 도착해도 최대 피해 시간을 줄인다\n\n하지만 사용자는 계속 로그인 상태를 원한다. 그래서 refresh token이나 server session이 남고,\n이 경로는 여전히 서버 상태를 봐야 한다.\n\n```text\nshort-lived access token = fast read path\nlonger-lived refresh/session state = lifecycle control path\n```\n\n### 3. token auth도 lifecycle control 때문에 결국 상태가 필요하다\n\n상태가 필요한 대표 요구:\n\n- logout, logout all devices\n- 비밀번호 변경 후 기존 세션 무효화\n- 계정 정지나 직원 퇴사 후 즉시 차단\n- refresh token rotation과 재사용 탐지\n\n| 상태 모델 | 예시 |\n|---|---|\n| session inventory | `user -> active sessions` |\n| revoke list / revoke-before time | `revoke_before = 10:30` |\n| session version / subject epoch | `token.version < current_version`면 deny |\n| refresh family store | refresh rotation, reuse detection |\n\n---\n\n## 깊이 들어가기: Revocation 전파와 브라우저/모바일 차이\n\n### 4. revoke propagation이 어려운 이유는 검증 지점이 여러 층이기 때문이다\n\nrevocation은 보통 한 DB row만 바꾸고 끝나지 않는다.\n\n검증 레이어: API gateway, edge verifier, regional cache, BFF의 downstream token cache, refresh/session store\n\n이 과정 중 일부가 늦으면 `logout tail`이 보인다.\n\n```text\nuser clicks logout\n  -> origin says revoked\n  -> region A gateway denies\n  -> region B edge cache still allows for 20s\n```\n\n실무에서는 경로별로 강도를 나눈다.\n\n- 저위험 경로: short TTL + eventual revoke propagation\n- 고위험 경로: direct introspection, version check, shorter cache TTL\n\n### 5. 브라우저 logout와 모바일/API logout는 같은 그림이 아니다\n\n브라우저 + BFF에서 자주 보는 일:\n\n- browser cookie 삭제\n- server-side session 종료\n- downstream token cache 정리\n\n모바일/API bearer flow에서는:\n\n- 새 refresh는 막는다\n- 기존 access token은 TTL 또는 revoke propagation이 끝나야 완전히 죽는다\n\n### 6. 초보자가 자주 하는 오해\n\n`로그아웃은 클라이언트에서 token만 지우면 된다`\n— 다른 기기, refresh token, BFF cache가 남아 있을 수 있다.\n\n`JWT면 revoke를 못 하니까 그냥 만료만 기다려야 한다`\n— version check, revoke-before, introspection, short TTL 같은 설계를 함께 쓴다.\n\n`short-lived access token이면 보안 문제가 거의 끝난다`\n— 탈취 대응, refresh rotation, device scope revoke는 여전히 남는다.\n\n---\n\n## 면접 답변 골격\n\n짧게 답하면 이렇게 정리할 수 있다.\n\n> token-based auth를 쓰더라도 logout이나 권한 변경 같은 lifecycle control 때문에 서버 상태가 필요합니다. access token은 짧게 두어 revoke tail을 줄이고, refresh token이나 session/version store를 통해 실제 무효화를 통제하는 식이 흔합니다. 또 브라우저+BFF와 모바일 bearer flow는 검증 지점이 달라서 logout propagation 방식도 다르게 설계해야 합니다.\n\n---\n\n## 꼬리질문\n\n> Q: short-lived access token이면 왜 revoke store가 또 필요한가요?\n> 의도: TTL과 lifecycle control을 구분하는지 확인\n> 핵심: TTL은 피해 시간을 줄일 뿐이고, logout all devices나 refresh 차단은 서버 상태가 필요하다.\n\n> Q: JWT는 self-contained인데 왜 버전 체크를 붙이나요?\n> 의도: 서명 검증과 최신 계정 상태 반영을 구분하는지 확인\n> 핵심: 권한 변경, 계정 정지, 비밀번호 변경을 즉시 반영하려면 현재 서버 상태와 비교해야 한다.\n\n> Q: 브라우저 logout와 모바일 logout가 왜 다르게 느껴지나요?\n> 의도: cookie/BFF 경계와 bearer token 경계를 구분하는지 확인\n> 핵심: 브라우저는 session mapping과 downstream token translation이 있고, 모바일/API는 access token TTL과 refresh revoke가 더 직접적인 문제다.\n\n> Q: revoke propagation이 느린데 왜 모든 요청을 introspection하지 않나요?\n> 의도: 즉시성, 비용, 가용성 trade-off를 이해하는지 확인\n> 핵심: 고위험 경로만 direct check를 강화하고, 나머지는 short TTL과 eventual propagation으로 비용을 낮추는 경우가 많다.\n\n## 한 줄 정리\n\ntoken-based auth도 logout, revoke, refresh, 권한 변경 같은 lifecycle control을 위해 결국 state plane이 필요하며, short-lived token은 그 state를 없애는 것이 아니라 revoke tail을 줄이는 도구다.\n",
+  "aliases": [
+    "session revocation basics",
+    "logout 뭐예요",
+    "logout propagation basics",
+    "forced logout basics",
+    "short-lived access token basics",
+    "short-lived token why",
+    "jwt logout basics",
+    "logout all devices basics",
+    "session version basics",
+    "refresh token basics",
+    "browser logout tail",
+    "mobile logout tail"
+  ],
+  "expected_queries": [
+    "Session Revocation Basics 설계 핵심을 설명해줘",
+    "session revocation basics가 왜 필요한지 알려줘",
+    "Session Revocation Basics 실무 트레이드오프는 뭐야?",
+    "session revocation basics 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Session Revocation Basics`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`Session Revocation Basics`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`Session Revocation Basics`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "security/jwt-rotation-revocation-interview-playbook",
+      "system-design/canonical-revocation-plane-across-token-generations-design"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/session-revocation-basics.md",
+    "revision_history": []
+  }
+}

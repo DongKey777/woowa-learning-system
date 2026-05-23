@@ -1,0 +1,46 @@
+{
+  "id": "database/join-n-plus-one-interview-router",
+  "title": "Join N Plus One Interview Router",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 N+1 query, join row explosion, fetch plan 문제를 면접/운영 증상으로 분기한다.",
+  "body_markdown": "# Join N Plus One Interview Router\n\n## 관찰 증거\n\n- parent 목록 조회 후 각 row마다 child 조회 SQL이 반복된다.\n- join 후 row 수가 parent 수보다 크게 늘고 pagination이 흔들린다.\n- API 응답 DTO에 필요한 필드보다 entity graph를 과하게 로딩한다.\n- Hibernate statistics, datasource query count, trace span을 보면 요청 1건의 SQL 수가 입력 row 수에 비례한다.\n- DB time보다 network round-trip과 ORM hydration 비용이 커져 application latency가 먼저 흔들릴 수 있다.\n- 같은 endpoint를 page size 10, 50, 100으로 바꿨을 때 SQL count가 `1 + N`, row count가 `N x child 평균 개수`, payload size가 어느 축으로 늘어나는지 분리해서 본다.\n- 증거는 \"느리다\"가 아니라 query count, returned row count, selected column 수, ORM entity/collection fetch count, p95 latency 중 무엇이 함께 움직이는지로 잡는다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 | 우선 후보 |\n|---|---|---|---|\n| SQL 횟수 `1 + N` | lazy loading 반복 | SQL log, Hibernate statistics, trace span | fetch join, batch size, entity graph |\n| row 수 폭증 | one-to-many join multiplicity | returned row count, `distinct`, pagination 위치 | 2-step ID pagination, batch fetch |\n| 필요 필드 적음 | entity loading 과함 | select column, hydration cost | DTO projection |\n| to-one 연관만 필요 | round-trip만 과함 | row duplication 없음 확인 | fetch join 또는 entity graph |\n\n## 면접 답변 골격\n\nN+1은 한 번의 목록 조회 뒤 연관 데이터를 row마다 추가 조회하는 패턴이다. 해결은 fetch join, batch size, entity graph, DTO projection 중 query 목적과 pagination 조건에 맞게 고른다.\n\n면접에서는 바로 해결책부터 말하기보다 증거를 먼저 묶는 편이 좋다. \"목록 20개에서 SQL 21번이 나갔고, page size를 50으로 바꾸면 51번으로 늘었다\"면 N+1 증거다. 반대로 SQL은 1번인데 row가 parent 수보다 훨씬 많아지고 pagination이 흔들리면 join multiplicity 문제다.\n\n## fetch plan 선택\n\n| 상황 | 선택 | 주의점 |\n|---|---|---|\n| 읽기 전용 화면이고 필요한 column이 정해짐 | DTO projection | 변경 추적, lazy navigation이 필요한 use case에는 부적합 |\n| `ManyToOne`, `OneToOne`처럼 row 수가 늘지 않는 연관 | fetch join 또는 entity graph | select 폭이 커지는지 확인 |\n| `OneToMany` 목록을 함께 보여줘야 함 | batch size, subselect, 2-step fetch | fetch join pagination 왜곡 주의 |\n| page 단위 목록 + collection 요약 필요 | ID page 먼저 조회 후 ID 목록으로 collection fetch | 정렬 기준과 ID 재조회 순서 보존 필요 |\n| use case마다 로딩 모양이 다름 | named/dynamic entity graph | 전역 eager로 바꾸지 않는다 |\n\n## 운영 검증\n\n운영에서는 \"SQL이 몇 번 나갔는가\"와 \"row가 몇 개 돌아왔는가\"를 함께 본다. Fetch join은 round-trip을 줄이지만 one-to-many에서 row duplication과 pagination 왜곡을 만들 수 있다. Batch size는 query 수를 줄이지만 필요한 범위 밖의 연관도 묶어 가져올 수 있다. DTO projection은 읽기 API에는 강하지만 변경 추적이 필요한 use case에는 맞지 않을 수 있다.\n\nfetch plan 변경 후에는 같은 입력으로 query count, returned row count, DB execution time, network payload, ORM hydration time을 다시 잰다. SQL 횟수만 줄고 row 폭발이나 payload 증가가 더 커졌다면 N+1을 다른 병목으로 바꾼 것이다.\n\n## 보장 범위와 한계\n\nN+1 제거는 query count를 줄인다는 보장이지 항상 더 빠르다는 보장은 아니다. 하나의 거대한 join이 DB CPU, sort, network payload, ORM de-duplication 비용을 키울 수 있다. 따라서 \"N+1이면 fetch join\"으로 고정하지 말고 목록 크기, cardinality, pagination, 필요한 필드, cache hit를 기준으로 선택해야 한다.\n\n## 실패 반례\n\n- `@OneToMany` fetch join으로 SQL은 1번이 되었지만 row explosion 때문에 페이지가 중복되거나 누락된다.\n- `distinct`로 entity 중복은 사라졌지만 DB가 반환한 row 수와 network payload는 그대로 크다.\n- lazy loading을 없애려고 eager를 기본값으로 바꿔 모든 API에서 불필요한 join이 발생한다.\n- batch size가 너무 커서 작은 요청에도 큰 IN query와 lock contention이 생긴다.\n\n## 면접 답변 축\n\n답변은 세 단계가 좋다. 첫째, N+1은 parent 조회 1번 뒤 child 조회가 N번 반복되는 round-trip 문제라고 정의한다. 둘째, SQL log나 query count로 증명하고 row explosion과 구분한다. 셋째, 해결책은 fetch join, batch size, entity graph, DTO projection을 cardinality와 pagination 조건에 맞춰 선택한다고 말한다.\n\n## 관련 playbook\n\nSQL row 수가 늘어난 문제는 `join-row-explosion-symptom-router`, JPA 경계 냄새는 `jpa-lazy-loading-n-plus-one-boundary-smells`로 이어진다.\n",
+  "aliases": [
+    "join N+1 interview router",
+    "N+1 query answer",
+    "조인 N+1 면접",
+    "fetch join DTO projection routing"
+  ],
+  "expected_queries": [
+    "N+1 문제를 면접에서 어떻게 설명해?",
+    "join과 fetch join 차이를 어디까지 말해야 해?",
+    "SQL row explosion과 N+1을 어떻게 구분해?",
+    "N+1을 잡을 때 fetch join, batch size, DTO projection 중 뭘 고르지?"
+  ],
+  "symptoms": [
+    "목록 20개 조회에 SQL이 21번 나가요",
+    "join을 추가했더니 row 수가 예상보다 늘었어요",
+    "DTO projection과 entity graph 중 무엇을 써야 할지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/sql-join-basics"
+    ],
+    "next_docs": [
+      "software-engineering/jpa-lazy-loading-n-plus-one-boundary-smells"
+    ],
+    "confusable_with": [
+      "database/join-row-explosion-symptom-router",
+      "software-engineering/jpa-lazy-loading-n-plus-one-boundary-smells"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/join-n-plus-one-interview-router.md",
+    "revision_history": []
+  }
+}

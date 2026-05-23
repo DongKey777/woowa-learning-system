@@ -1,0 +1,52 @@
+{
+  "id": "system-design/experimentation-ab-testing-platform-design",
+  "title": "Experimentation / A/B Testing Platform 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Experimentation / A/B Testing Platform 설계를 다루는 deep_dive 문서다. 실험 플랫폼은 사용자 배정을 안정적으로 관리하고, 지표 수집과 분석을 통해 제품 변경의 효과를 검증하는 의사결정 시스템이다. 검색 질의가 experimentation platform, A/B testing, bucketing, randomization처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Experimentation / A/B Testing Platform 설계\n\n> 한 줄 요약: 실험 플랫폼은 사용자 배정을 안정적으로 관리하고, 지표 수집과 분석을 통해 제품 변경의 효과를 검증하는 의사결정 시스템이다.\n\nretrieval-anchor-keywords: experimentation platform, A/B testing, bucketing, randomization, guardrail metrics, experiment assignment, statistical power, holdout, feature rollout, analysis pipeline\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Recommendation / Feed Ranking Architecture](./recommendation-feed-ranking-architecture.md)\n> - [Search 시스템 설계](./search-system-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n\n## 핵심 개념\n\n실험 플랫폼은 단순히 트래픽을 반반 나누는 기능이 아니다.  \n실전에서는 아래를 함께 관리한다.\n\n- 안정적인 사용자 배정\n- 실험군/대조군 충돌 방지\n- 지표 수집과 정제\n- 통계적 유의성 판단\n- guardrail metric\n- ramp up / ramp down\n\n즉, experimentation은 제품 변경을 과학적으로 검증하는 운영 인프라다.\n\n## 깊이 들어가기\n\n### 1. 무엇을 실험하는가\n\n흔한 대상:\n\n- UI 변경\n- 추천 알고리즘\n- 검색 랭킹\n- pricing 페이지\n- notification cadence\n\n실험은 기능을 켜는 문제가 아니라, **비즈니스 지표에 어떤 변화가 생겼는지 확인하는 문제**다.\n\n### 2. Capacity Estimation\n\n예:\n\n- DAU 1,000만\n- 하루 100개 실험\n- 요청당 5개 assignment lookup\n\n이 정도면 assignment path가 아주 가벼워야 한다.  \n실험 시스템이 느리면 제품 path 전체를 망친다.\n\n봐야 할 숫자:\n\n- assignment QPS\n- exposure count\n- conversion window\n- sample size\n- analysis latency\n\n### 3. Assignment 모델\n\n실험 배정은 안정적이어야 한다.\n\n- stable bucketing\n- mutually exclusive layer\n- holdout group\n- user-level vs session-level assignment\n\n같은 사용자는 같은 버킷에 들어가야 분석이 깨지지 않는다.\n\n### 4. Metric design\n\n실험에는 primary metric과 guardrail metric이 필요하다.\n\n- primary: 전환율, 클릭률, retention\n- guardrail: latency, error rate, revenue, churn\n\n좋아 보이는 실험이 시스템을 망가뜨리면 안 된다.\n\n### 5. Exposure와 분석\n\n실험 결과는 노출 기준으로 봐야 한다.\n\n- assigned\n- exposed\n- converted\n\n노출되지 않은 실험 대상까지 포함하면 결론이 왜곡된다.\n\n### 6. 데이터 정합성\n\n분석이 틀어지는 흔한 이유:\n\n- logging missing\n- assignment drift\n- metric definition change\n- late arrival\n\n그래서 experiment event와 metric event를 함께 설계해야 한다.\n\n### 7. Ramp와 종료\n\n실험은 시작보다 종료가 어렵다.\n\n- 1%\n- 10%\n- 50%\n- 100%\n\n문제 있으면 즉시 rollback한다.  \n성공하면 holdout을 남기거나 전면 적용한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 추천 변경 실험\n\n문제:\n\n- 새 랭킹 모델이 전환율을 올리는지 알아야 한다\n\n해결:\n\n- stable bucketing\n- primary/guardrail metric\n- ramp up\n\n### 시나리오 2: 가격 페이지 실험\n\n문제:\n\n- 가격 노출 방식이 구매율에 영향을 준다\n\n해결:\n\n- user-level assignment\n- revenue guardrail\n- 충분한 sample size 확보\n\n### 시나리오 3: 분석 지연\n\n문제:\n\n- 결과가 늦게 들어와 판단이 늦다\n\n해결:\n\n- metrics pipeline 최적화\n- late event 보정\n- near-real-time dashboard\n\n## 코드로 보기\n\n```pseudo\nfunction assign(userId, experiment):\n  bucket = hash(userId + experiment.id) % 10000\n  return experiment.armFor(bucket)\n\nfunction recordExposure(userId, experiment, arm):\n  logExposure(userId, experiment.id, arm)\n```\n\n```java\npublic String bucketFor(long userId, String experimentId) {\n    return bucketer.assign(userId, experimentId);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| User-level bucketing | 분석이 안정적이다 | 전환이 느릴 수 있다 | 대부분 |\n| Session-level bucketing | 반응이 빠르다 | 노이즈가 크다 | 짧은 실험 |\n| Central assignment | 일관성이 좋다 | latency가 생긴다 | 공통 플랫폼 |\n| Client assignment | 빠르다 | 조작 가능성 | 경량 실험 |\n| Holdout group | 장기 효과 측정 가능 | 매출 기회 손실 | 성숙한 조직 |\n\n핵심은 실험이 단순한 반반 분할이 아니라 **배정, 측정, 해석, 롤백을 포함한 의사결정 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: feature flag와 experimentation platform은 어떻게 다른가요?\n> 의도: 운영 제어와 실험 검증 구분 확인\n> 핵심: flag는 기능 제어, experimentation은 효과 검증이 중심이다.\n\n> Q: 왜 stable bucketing이 중요한가요?\n> 의도: 분석 일관성 이해 확인\n> 핵심: 같은 사용자가 여러 arm에 흔들리면 실험 결과가 왜곡된다.\n\n> Q: primary metric과 guardrail metric은 왜 둘 다 필요한가요?\n> 의도: 단일 지표 함정 이해 확인\n> 핵심: 목표를 올려도 시스템을 해치지 않는지 봐야 한다.\n\n> Q: exposure와 assignment의 차이는 무엇인가요?\n> 의도: 실험 분석 기준 이해 확인\n> 핵심: 배정은 대상, 노출은 실제 본 사용자다.\n\n## 한 줄 정리\n\nExperimentation / A/B testing platform은 사용자 배정과 metric 분석을 안정화해 제품 변경의 효과를 신뢰성 있게 검증하는 시스템이다.\n\n",
+  "aliases": [
+    "experimentation platform",
+    "A/B testing",
+    "bucketing",
+    "randomization",
+    "guardrail metrics",
+    "experiment assignment",
+    "statistical power",
+    "holdout",
+    "feature rollout",
+    "analysis pipeline",
+    "Experimentation / A/B Testing Platform 설계",
+    "experimentation ab testing platform design"
+  ],
+  "expected_queries": [
+    "Experimentation / A/B Testing Platform 설계 설계 핵심을 설명해줘",
+    "experimentation platform가 왜 필요한지 알려줘",
+    "Experimentation / A/B Testing Platform 설계 실무 트레이드오프는 뭐야?",
+    "experimentation platform 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Experimentation / A/B Testing Platform 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Experimentation / A/B Testing Platform 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Experimentation / A/B Testing Platform 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/experimentation-ab-testing-platform-design.md",
+    "revision_history": []
+  }
+}

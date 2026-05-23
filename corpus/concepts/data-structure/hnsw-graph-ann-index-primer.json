@@ -1,0 +1,59 @@
+{
+  "id": "data-structure/hnsw-graph-ann-index-primer",
+  "title": "HNSW Graph ANN Index Primer",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# HNSW Graph ANN Index Primer\n\n> 한 줄 요약: HNSW는 고차원 벡터를 다층 proximity graph로 묶고, 위층의 긴 hop에서 아래층의 촘촘한 이웃 탐색으로 내려오며 nearest neighbor 후보를 빠르게 찾는 approximate index다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Graph Basics](./graph-basics.md)\n> - [고차원 벡터 양자화 — PQ vs OPQ vs RVQ chooser](./vector-quantization-rvq-pq-opq-chooser.md)\n> - [Knowledge Search / RAG Platform 설계](../system-design/knowledge-search-rag-platform-design.md)\n> - [Document Search / Ranking Platform 설계](../system-design/document-search-ranking-platform-design.md)\n> - [Search 시스템 설계](../system-design/search-system-design.md)\n\n> retrieval-anchor-keywords: hnsw graph ann, hierarchical navigable small world, hnsw index, vector search graph index, approximate nearest neighbor graph, efconstruction, efsearch, hnsw layers, recall latency memory tradeoff, proximity graph search, ann recall tuning\n\n## 언제 이 문서를 보나\n\n이 문서는 검색/RAG 문서에서 \"vector search\"가 나왔는데 내부 인덱스가 왜 빠른지 설명해야 할 때 본다. [Knowledge Search / RAG Platform 설계](../system-design/knowledge-search-rag-platform-design.md)는 retrieval, reranking, citation까지 시스템 관점을 잡고, [고차원 벡터 양자화](./vector-quantization-rvq-pq-opq-chooser.md)는 벡터를 작게 저장하는 압축 관점을 잡는다. HNSW의 역할은 다르다. 압축보다 먼저, 또는 압축된 벡터 위에서, **어떤 후보를 거리 계산 대상으로 볼지**를 그래프 탐색으로 줄인다.\n\n실무 질문은 보통 세 가지다. 첫째, layer가 왜 여러 개인가. 둘째, `efConstruction`과 `efSearch`가 각각 무엇을 바꾸는가. 셋째, recall을 올리면 왜 latency와 memory가 함께 오른다고 말하는가. 이 세 질문에 답하면 HNSW를 단순한 BFS나 Dijkstra 변형으로 오해하지 않게 된다.\n\n## 핵심 모델\n\nHNSW는 \"가까운 벡터끼리 edge로 연결된 그래프\"를 만든다. 하지만 모든 노드를 한 층에만 둔 그래프라면 멀리 떨어진 영역으로 이동하는 데 많은 local hop이 필요하다. 그래서 HNSW는 skip list와 비슷한 발상을 쓴다. 일부 노드는 높은 layer에도 복제되고, 높은 layer는 노드 수가 적어 edge 하나가 더 먼 영역을 건너뛴다. 아래층으로 내려갈수록 노드가 많아지고 이웃 관계가 촘촘해진다.\n\n검색은 top layer에서 시작한다. 현재 entry point에서 query vector와 가장 가까운 이웃으로 greedy하게 이동하다가 더 좋아지는 이웃이 없으면 한 층 내려간다. 이 과정을 base layer까지 반복한다. 마지막 base layer에서는 greedy 한 점으로 끝내지 않고 후보 집합을 넓게 유지하면서 nearest neighbor 후보를 모은다.\n\n중요한 표현은 \"approximate\"다. HNSW는 모든 벡터와의 거리를 계산해 정답을 보장하는 exact scan이 아니다. 좋은 그래프와 충분한 탐색 폭이면 exact top-k에 매우 가까운 recall을 얻지만, 파라미터를 낮추면 정답 이웃을 지나칠 수 있다.\n\n## Build Path: Layers, M, efConstruction\n\n색인 build에서 각 벡터는 랜덤하게 최고 layer를 배정받는다. 높은 layer에 올라가는 노드는 적고, base layer에는 모든 노드가 들어간다. 새 벡터를 넣을 때는 기존 그래프를 검색해서 가까운 후보를 찾고, 그 후보 중 일부와 edge를 만든다.\n\n`M`은 각 노드가 유지하는 이웃 수의 상한에 가깝다. `M`이 크면 그래프 연결성이 좋아지고 우회 경로가 많아져 recall이 오르기 쉽다. 대신 edge 저장량이 늘고, 탐색 중 살펴볼 neighbor도 많아진다. HNSW 메모리에서 원본 벡터 저장 공간만 보지 말아야 하는 이유가 여기에 있다. 그래프 edge 배열도 `N * M`에 가까운 큰 상수 비용을 가진다.\n\n`efConstruction`은 build 중 이웃 후보를 얼마나 넓게 탐색할지 정한다. 값이 크면 새 노드를 연결할 때 더 많은 후보를 비교하므로 graph quality가 좋아진다. 가까운 영역의 edge가 더 잘 잡히고 disconnected-looking local trap이 줄어든다. 하지만 build latency가 길어지고, build 중 임시 candidate queue와 distance computation 비용이 증가한다. 운영적으로는 \"한 번 오래 build해도 되는 offline index\"인지, \"계속 update되는 near-real-time index\"인지에 따라 허용값이 달라진다.\n\n## Query Path: efSearch\n\n`efSearch`는 query 시점의 beam width다. base layer에서 top-k만 딱 유지하는 것이 아니라, 더 큰 후보 pool을 유지하며 탐색한다. 예를 들어 k=10이어도 `efSearch=64`라면 후보 64개 안에서 계속 더 좋은 이웃을 확장한 뒤 최종 10개를 반환한다.\n\n값이 작으면 latency는 낮아진다. 하지만 그래프에서 잠깐 잘못된 local region으로 들어갔을 때 빠져나올 여지가 줄어 recall이 떨어진다. 값이 크면 recall은 올라가지만 distance 계산과 priority queue 작업이 늘어난다. 그래서 `efSearch`는 build 품질을 바꾸는 옵션이 아니라 **query마다 latency와 recall을 교환하는 runtime knob**로 봐야 한다.\n\n또 하나의 실무 포인트는 filter다. 카테고리, tenant, ACL 같은 필터를 뒤늦게 적용하면 HNSW가 찾은 좋은 후보가 필터로 대부분 버려질 수 있다. filtered HNSW나 pre-filtered shard 설계가 필요한 이유다. 이 부분은 문서 검색/권한 필터를 다루는 [Document Search / Ranking Platform 설계](../system-design/document-search-ranking-platform-design.md)와 연결된다.\n\n## Recall, Memory, Latency Tradeoff\n\nHNSW의 품질은 보통 recall@k, query p95/p99 latency, index memory, build time을 함께 본다. 하나만 보면 잘못된 선택이 쉽다.\n\n| 조정 | 좋아지는 것 | 나빠지는 것 | 주의 |\n|---|---|---|---|\n| `M` 증가 | 연결성, recall | edge memory, traversal cost | 모든 query 비용에 영향을 준다 |\n| `efConstruction` 증가 | graph quality, recall ceiling | build time, build memory | 이미 만든 index에는 소급 적용되지 않는다 |\n| `efSearch` 증가 | query recall | query latency, CPU | query별로 조정 가능하다 |\n| vector quantization 결합 | vector memory | distance accuracy, recall | 그래프 edge memory는 그대로 남을 수 있다 |\n\nHNSW와 PQ/OPQ를 섞는 시스템에서는 두 종류의 오차가 겹친다. HNSW는 \"후보를 놓칠 수 있는 탐색 오차\"를 만들고, PQ/OPQ는 \"거리 계산이 원본 벡터 거리와 달라지는 압축 오차\"를 만든다. 그러므로 HNSW-PQ가 느슨한 설정으로도 빠르다는 말만 믿기보다, HNSW-flat 대비 recall과 memory를 나눠 측정해야 한다.\n\n## 헷갈리는 비교\n\nHNSW는 inverted index가 아니다. Inverted index는 term에서 posting list로 후보 문서를 찾고 BM25 같은 lexical score를 계산한다. HNSW는 embedding vector 간 거리로 가까운 점을 찾는다. Hybrid search에서는 둘이 경쟁하기보다 서로 다른 candidate source가 된다.\n\nHNSW는 KD-tree나 R-tree의 고차원 버전도 아니다. 낮은 차원 공간 인덱스는 split plane이나 bounding box로 branch를 제거하지만, 고차원에서는 거리가 비슷해져 pruning이 약해진다. HNSW는 공간을 딱 자르기보다 근접 이웃 그래프를 타고 이동한다.\n\n마지막으로 HNSW는 ranking model 전체가 아니다. ANN은 후보 생성이고, 최종 결과 품질은 reranking, filter, freshness, citation policy가 함께 만든다. RAG 플랫폼에서 HNSW 튜닝만 잘해도 답변 품질이 자동으로 보장되는 것은 아니다.\n\n## 한 줄 정리\n\nHNSW를 설명할 때는 \"다층 근접 그래프\", \"`efConstruction`은 build 품질\", \"`efSearch`는 query 탐색 폭\", \"`M`은 연결성과 edge memory\"를 분리한다. 빠른 이유는 모든 벡터를 보지 않기 때문이고, 위험한 이유도 모든 벡터를 보지 않기 때문이다.\n",
+  "aliases": [
+    "hnsw graph ann",
+    "hierarchical navigable small world",
+    "hnsw index",
+    "vector search graph index",
+    "approximate nearest neighbor graph",
+    "efconstruction",
+    "efsearch",
+    "recall latency memory tradeoff",
+    "hnsw layers",
+    "proximity graph search",
+    "multi layer graph search",
+    "ann recall tuning"
+  ],
+  "expected_queries": [
+    "HNSW 그래프 인덱스에서 layer와 efConstruction efSearch가 각각 뭘 결정해?",
+    "벡터 검색에서 HNSW는 왜 빠르지만 exact nearest neighbor가 아니라고 말해?",
+    "HNSW memory overhead와 recall latency tradeoff를 운영 파라미터 기준으로 설명해줘",
+    "graph based ANN index에서 M, efConstruction, efSearch를 어떻게 조정해야 해?",
+    "HNSW와 PQ/OPQ 같은 vector quantization은 서로 어떤 책임이 달라?"
+  ],
+  "symptoms": [
+    "HNSW를 그냥 그래프 BFS로 이해해서 layer와 greedy descent의 역할을 놓친다",
+    "efConstruction과 efSearch를 같은 성능 옵션으로 묶어 build 품질과 query beam을 구분하지 못한다",
+    "vector quantization과 HNSW를 둘 다 ANN이라고만 보고 그래프 메모리와 벡터 압축의 책임을 섞는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/graph-basics",
+      "data-structure/vector-quantization-rvq-pq-opq-chooser"
+    ],
+    "next_docs": [
+      "data-structure/vector-quantization-rvq-pq-opq-chooser",
+      "system-design/knowledge-search-rag-platform-design",
+      "system-design/document-search-ranking-platform-design"
+    ],
+    "confusable_with": [
+      "data-structure/vector-quantization-rvq-pq-opq-chooser",
+      "system-design/knowledge-search-rag-platform-design",
+      "data-structure/kd-tree-vs-r-tree-geohash-spatial-index-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/hnsw-graph-ann-index-primer.md",
+    "revision_history": []
+  }
+}

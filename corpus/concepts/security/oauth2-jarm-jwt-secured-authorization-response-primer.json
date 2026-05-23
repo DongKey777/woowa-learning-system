@@ -1,0 +1,66 @@
+{
+  "id": "security/oauth2-jarm-jwt-secured-authorization-response-primer",
+  "title": "OAuth 2.0 JARM / JWT Secured Authorization Response Primer",
+  "category": "security",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# OAuth 2.0 JARM / JWT Secured Authorization Response Primer\n\n> 한 줄 요약: JARM은 authorization response를 signed JWT로 감싸 `code`, `state`, `iss`, `aud`가 중간에서 바뀌지 않았는지 확인하게 해 준다. 하지만 이것은 ID Token도 아니고, PKCE나 `state`를 없애도 된다는 뜻도 아니다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [OAuth2 Authorization Code Grant](./oauth2-authorization-code-grant.md)\n- [OAuth PAR / JAR Basics](./oauth-par-jar-basics.md)\n- [OAuth State Nonce PKCE Interview Chooser](./oauth-state-nonce-pkce-interview-chooser.md)\n- [Login Callback Artifact Cheat Sheet](./login-callback-artifact-cheat-sheet.md)\n- [OIDC ID Token vs Access Token Audience Primer](./oidc-id-token-vs-access-token-audience-primer.md)\n- [OIDC, ID Token, UserInfo](./oidc-id-token-userinfo-boundaries.md)\n- [JWT Validation 함정 deep_dive](./jwt-validation-pitfalls-deep-dive.md)\n- [JWT Signature Verification Failure Playbook](./jwt-signature-verification-failure-playbook.md)\n- [OAuth Client Authentication: `client_secret_basic`, `private_key_jwt`, mTLS](./oauth-client-authentication-private-key-jwt-mtls.md)\n\nretrieval-anchor-keywords: JARM, JWT secured authorization response, signed authorization response, authorization response JWT, response_mode jwt, query.jwt, form_post.jwt, code state iss aud, OAuth mix-up protection, authorization server mix-up, PKCE wrong bucket, OIDC ID Token wrong bucket\n\n## 먼저 위치를 잡기\n\nOAuth Authorization Code Grant에서 브라우저를 타고 돌아오는 callback은 보통 이렇게 보인다.\n\n```text\nGET /callback?code=...&state=...\n```\n\nJARM을 쓰면 authorization server가 이 응답 값을 JWT로 묶어 서명하고, client는 callback에서 먼저 그 JWT를 검증한다.\n\n```text\nGET /callback?response=<signed authorization response JWT>\n```\n\n또는 provider와 response mode에 따라 `form_post`로 JWT가 전달될 수 있다. 중요한 점은 \"JWT처럼 보인다\"가 아니라 **authorization response parameters가 서명된 봉투 안으로 들어간다**는 것이다.\n\n대표 claims는 이런 모양이다.\n\n```json\n{\n  \"iss\": \"https://issuer.example.com\",\n  \"aud\": \"client-123\",\n  \"exp\": 1710000300,\n  \"iat\": 1710000000,\n  \"code\": \"SplxlOBeZQQYbYS6WxSbIA\",\n  \"state\": \"af0ifjsldkj\"\n}\n```\n\n여기서 `code`는 여전히 token endpoint로 가져갈 authorization code이고, `state`는 여전히 요청 상관관계 값이다. `iss`는 어느 authorization server가 이 응답을 만들었는지, `aud`는 어느 OAuth client를 대상으로 한 응답인지 확인하는 claim이다.\n\n## JAR/PAR와 JARM을 섞지 않는다\n\n이름이 비슷해서 자주 섞인다.\n\n| 장치 | 보호하는 대상 | 흐름에서의 위치 | 짧은 설명 |\n|---|---|---|---|\n| JAR | authorization request | 로그인 시작 전 | request object를 JWT로 서명한다 |\n| PAR | authorization request | 로그인 시작 전, back-channel | request를 먼저 authorization server에 push한다 |\n| JARM | authorization response | callback 순간 | response parameter를 JWT로 서명해 돌려준다 |\n\nJAR/PAR는 \"client가 authorization server에 무엇을 요청했는가\"를 단단하게 만든다. JARM은 \"authorization server가 client에게 무엇을 돌려줬는가\"를 단단하게 만든다.\n\n그래서 고보안 환경에서는 조합이 가능하다.\n\n- JAR/PAR: request tampering과 front-channel request 노출을 줄인다.\n- JARM: callback response tampering과 issuer/client mix-up을 줄인다.\n- PKCE: code를 훔쳐도 verifier 없이는 token exchange를 못 하게 한다.\n- `state`: 시작한 browser/session transaction과 callback을 연결한다.\n\n서로 겹치는 듯 보여도 검증 지점이 다르다.\n\n## callback에서 검증하는 순서\n\nJARM callback은 \"JWT니까 decode해서 code만 꺼낸다\"가 아니다. 최소한 아래 순서를 지킨다.\n\n1. 현재 callback transaction이 기대한 authorization server를 찾는다. 보통 `state`에 묶인 server-side transaction, provider별 callback route, client registration이 힌트가 된다.\n2. 그 issuer에 대해 미리 신뢰한 metadata와 signing key set만 사용한다.\n3. JARM JWT signature와 허용 알고리즘을 검증한다.\n4. `iss`가 기대한 issuer와 정확히 일치하는지 본다.\n5. `aud`가 내 OAuth client id인지 본다.\n6. `exp`, `iat` 같은 시간 claim이 짧은 window 안에 있는지 본다.\n7. JWT 안의 `state`가 저장된 one-time state와 일치하는지 본다.\n8. 검증된 JWT claims에서 `code`를 꺼내 token endpoint로 보낸다.\n9. token exchange에서는 여전히 PKCE `code_verifier`, client authentication, redirect URI 정책을 검증한다.\n\n여기서 JOSE header나 JWT payload를 서명 검증 전에 신뢰하면 안 된다. `kid`는 미리 정한 issuer의 key set 안에서 후보를 좁히는 힌트이고, `iss`도 검증 성공 후 exact match로 수락 조건을 통과해야 한다.\n\n## mix-up protection에서 보는 것\n\nOAuth mix-up은 client가 여러 authorization server를 상대할 때 더 위험하다. 예를 들어 사용자는 provider A로 로그인한다고 생각했는데, callback 처리나 token endpoint 선택이 provider B와 섞일 수 있다.\n\nJARM은 이때 세 가지 증거를 response 안에 묶는다.\n\n- `iss`: 이 response를 만든 authorization server\n- `aud`: 이 response를 받아야 하는 client\n- signature: 위 claims와 `code`, `state`가 issuer의 서명 아래 있었는지\n\nclient는 token endpoint 호출 전에 \"내가 지금 provider A transaction을 처리 중인데, signed response의 issuer도 A인가?\"를 확인할 수 있다. 이 검증이 있으면 잘못된 issuer의 code를 엉뚱한 token endpoint로 보내는 위험을 줄인다.\n\n다만 JARM만으로 provider 선택 상태 관리가 사라지지는 않는다.\n\n- state store에는 provider/client registration 정보를 같이 묶는다.\n- provider별 issuer와 JWKS를 분리한다.\n- 가능하면 redirect URI를 provider/client별로 명확히 나눈다.\n- token endpoint는 signed response의 issuer와 매칭된 endpoint만 사용한다.\n\n## Wrong-bucket: PKCE, state, ID Token\n\nJARM을 도입할 때 가장 위험한 말은 \"이제 JWT로 서명됐으니 다른 검증은 줄여도 되겠네\"다.\n\n| 값 | JARM이 해 주는 것 | JARM이 대신하지 않는 것 |\n|---|---|---|\n| `code` | callback에 온 code가 signed response 안에 있었는지 확인 | token endpoint에서 code 재사용, redirect URI, PKCE verifier 검증 |\n| `state` | signed response 안의 state가 변조되지 않았는지 확인 | 저장된 one-time state와 browser/session transaction 대조 |\n| `iss` | 어느 authorization server가 response를 냈는지 확인 | issuer별 metadata/key 신뢰 설정 자체 |\n| `aud` | 어느 OAuth client를 대상으로 한 response인지 확인 | API resource server audience 검증 |\n| ID Token | 아무것도 대신하지 않음 | user authentication event, subject, nonce, ID Token audience 검증 |\n\n특히 JARM JWT와 OIDC ID Token은 둘 다 JWT라서 헷갈리기 쉽다.\n\n- JARM JWT: authorization response 봉투다. callback handler가 소비한다.\n- ID Token: OIDC client가 end-user authentication event를 검증하는 token이다.\n- Access Token: resource server/API 접근 credential이다.\n\n따라서 JARM JWT를 API `Authorization: Bearer`에 넣거나, JARM의 `aud=client_id`를 resource server audience 검증처럼 설명하면 wrong-bucket이다.\n\n## 실무 체크리스트\n\nJARM을 붙였다면 code path에서 다음 증거가 보여야 한다.\n\n1. callback handler가 unsigned `code` query parameter를 먼저 소비하지 않는다.\n2. JARM response JWT는 provider/issuer별 trusted key로 검증된다.\n3. `iss`, `aud`, `exp`, `state` mismatch가 서로 다른 reason code로 남는다.\n4. 검증 실패 시 token endpoint 호출이 실행되지 않는다.\n5. state와 JARM response는 성공/실패 후 one-time으로 정리된다.\n6. token exchange 단계에서는 PKCE verifier와 client authentication이 별도로 적용된다.\n7. OIDC ID Token 검증은 token response 이후 별도 경로에서 signature, issuer, audience, expiry, nonce를 확인한다.\n\n로그에는 원문 JWT, code, state, verifier를 그대로 남기지 않는다. 대신 `issuer`, `client_registration_id`, `jarm_validation_result`, `state_lookup=hit|miss`, `token_exchange_started=false` 같은 증거를 남기면 운영자가 bucket을 나눌 수 있다.\n\n## 짧은 면접 답변 틀\n\n\"JARM은 authorization response의 code/state 같은 callback parameter를 JWT로 서명해 client가 issuer, audience, expiry, state를 검증한 뒤 code를 쓰게 하는 response hardening입니다. mix-up 공격에서는 signed response의 `iss`와 client `aud`를 token exchange 전에 확인할 수 있어 잘못된 authorization server 응답을 줄입니다. 다만 JARM은 PKCE, state correlation, OIDC ID Token nonce/audience 검증을 대체하지 않습니다. JARM JWT는 callback response 봉투이고, ID Token이나 access token과 같은 bucket에 넣으면 안 됩니다.\"\n\n## Safe Next Docs\n\n- request 쪽 hardening이 궁금하면 [OAuth PAR / JAR Basics](./oauth-par-jar-basics.md)로 간다.\n- `state`, `nonce`, PKCE를 분리해서 말해야 하면 [OAuth State Nonce PKCE Interview Chooser](./oauth-state-nonce-pkce-interview-chooser.md)로 간다.\n- ID Token과 access token audience가 섞이면 [OIDC ID Token vs Access Token Audience Primer](./oidc-id-token-vs-access-token-audience-primer.md)로 간다.\n- JWT signature/key/claim 검증 실패를 운영 bucket으로 나누려면 [JWT Signature Verification Failure Playbook](./jwt-signature-verification-failure-playbook.md)을 본다.\n",
+  "aliases": [
+    "JARM",
+    "JWT secured authorization response",
+    "signed authorization response",
+    "authorization response JWT",
+    "OAuth response mode jwt",
+    "response_mode jwt",
+    "query.jwt",
+    "form_post.jwt",
+    "signed code state response",
+    "authorization response mix-up",
+    "issuer in authorization response",
+    "OAuth mix-up protection",
+    "JARM code state issuer audience",
+    "OIDC ID Token wrong bucket",
+    "PKCE wrong bucket"
+  ],
+  "expected_queries": [
+    "JARM은 authorization code flow에서 어떤 값을 보호해?",
+    "signed authorization response가 state나 PKCE를 대체하는지 궁금해",
+    "code state iss aud가 JARM JWT 안에 있으면 무엇을 검증해야 해?",
+    "OAuth mix-up attack을 JARM이 어떻게 줄여?",
+    "JARM JWT와 OIDC ID Token을 왜 같은 토큰으로 보면 안 돼?",
+    "authorization response JWT를 API bearer token처럼 쓰면 왜 틀려?"
+  ],
+  "symptoms": [
+    "callback handler에서 JARM JWT signature를 검증하기 전에 code나 state를 먼저 꺼내 token endpoint로 보낸다",
+    "JARM response JWT를 OIDC ID Token이나 API access token처럼 해석해 token purpose와 audience 검증을 섞는다",
+    "signed authorization response가 있으니 PKCE, state, nonce 검증을 줄여도 된다고 생각한다",
+    "여러 authorization server를 쓰면서 issuer와 client registration을 state에 묶지 않아 mix-up 위험을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/oauth2-authorization-code-grant",
+      "security/oauth-par-jar-basics",
+      "security/oauth-state-nonce-pkce-interview-chooser",
+      "security/jwt-validation-pitfalls-deep-dive"
+    ],
+    "next_docs": [
+      "security/oauth-client-authentication-private-key-jwt-mtls",
+      "security/oidc-id-token-vs-access-token-audience-primer",
+      "security/jwt-signature-verification-failure-playbook"
+    ],
+    "confusable_with": [
+      "security/oauth-par-jar-basics",
+      "security/oauth-state-nonce-pkce-interview-chooser",
+      "security/oidc-id-token-vs-access-token-audience-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/oauth2-jarm-jwt-secured-authorization-response-primer.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "id": "operating-system/fork-exec-copy-on-write-behavior",
+  "title": "Fork, Exec, Copy-on-Write Behavior",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "'이 문서는 fork, execve, copy-on-write를 process lifecycle과 page fault",
+  "body_markdown": "# Fork, Exec, Copy-on-Write Behavior\n\n> 한 줄 요약: fork는 처음엔 싸지만 copy-on-write 때문에 첫 write가 비싸질 수 있고, exec는 새 주소 공간으로 갈아타면서 이전 상태를 버린다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md)\n> - [Process Spawn API Comparison: `fork()`, `vfork()`, `posix_spawn()`, `exec()`, `clone()`](./process-spawn-api-comparison.md)\n> - [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md)\n> - [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n> - [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)\n> - [Linux Process State Machine, Zombie, Orphan](./linux-process-state-zombie-orphan.md)\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [Open File Description, dup, fork, Shared Offsets](./open-file-description-dup-fork-shared-offsets.md)\n> - [O_CLOEXEC, FD Inheritance, Exec-Time Leaks](./o-cloexec-fd-inheritance-exec-leaks.md)\n> - [시스템 콜과 User-Kernel Boundary](./syscall-user-kernel-boundary.md)\n\n> retrieval-anchor-keywords: fork, execve, copy-on-write, COW, vfork, address space, page duplication, child process, first write penalty\n\nretrieval-anchor-keywords: fork copy-on-write 동작, fork vs exec 차이, execve address space 교체, pre-fork 서버 메모리 모델, O_CLOEXEC close-on-exec, file descriptor 상속 exec, vfork vs fork, posix_spawn vs fork+exec, child process first write penalty\n\n## 핵심 개념\n\n`fork()`는 부모 프로세스를 복제해 자식을 만들지만, 실제 페이지는 즉시 전부 복사하지 않는다. 대신 write가 발생할 때 copy-on-write(COW)로 페이지를 분리한다. `execve()`는 그 뒤 프로세스 이미지를 새 프로그램으로 갈아타는 동작이다.\n\n- `fork`: 부모 주소 공간을 복제하는 것처럼 보이지만 COW를 쓴다\n- `execve`: 현재 프로세스 이미지를 새 프로그램으로 바꾼다\n- `COW`: 쓰기 시에만 실제 복제를 수행한다\n\n왜 중요한가:\n\n- pre-fork 서버는 fork가 빠르다고 느끼지만 첫 write가 비쌀 수 있다\n- 큰 heap이나 캐시를 가진 프로세스는 fork 비용이 커진다\n- exec는 상태를 갈아엎기 때문에 안정적이지만 초기화 비용이 든다\n\n이 문서는 [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)와 [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)를 프로세스 생성 관점으로 묶는다. 반대로 `fork()` / `vfork()` / `posix_spawn()` / `exec()` / `clone()`의 역할 구분 자체가 먼저 필요하면 [Process Spawn API Comparison: `fork()`, `vfork()`, `posix_spawn()`, `exec()`, `clone()`](./process-spawn-api-comparison.md)을 먼저 보는 편이 안전하다.\n\n## 깊이 들어가기\n\n### 1. fork는 page table을 빠르게 복제한다\n\n부모의 메모리를 물리적으로 즉시 전부 복사하는 것이 아니라, page table과 참조 관계를 복제한다.\n\n- 초기 fork는 상대적으로 빠르다\n- 자식과 부모가 같은 페이지를 읽는 동안은 싸다\n- write가 시작되면 COW가 터진다\n\n### 2. 첫 write는 page fault와 연결된다\n\n자식이 메모리를 쓰는 순간 새 페이지가 필요할 수 있다.\n\n- minor fault가 발생할 수 있다\n- 실제 복제가 늦게 일어난다\n- fork 직후 write-heavy 경로는 비용이 크다\n\n### 3. exec는 이전 메모리 이미지를 교체한다\n\n`execve()`는 기존 주소 공간을 새 프로그램 이미지로 바꾼다.\n\n- 부모/자식 관계를 유지하되 코드와 메모리 이미지는 갈아탄다\n- 단, close-on-exec가 아닌 file descriptor는 새 이미지에도 남는다\n- 초기화 비용은 있지만 상태를 단순하게 만든다\n- shell wrapper, init 프로세스, worker exec 패턴에 중요하다\n\n### 4. fork/exec는 서버 설계와 연결된다\n\n- pre-fork worker model\n- shell spawning\n- script execution\n- daemon reload\n\n## 실전 시나리오\n\n### 시나리오 1: fork는 빠른데 자식 첫 요청이 느리다\n\n가능한 원인:\n\n- COW로 첫 write가 비싸다\n- 큰 부모 heap을 복제한다\n- page fault와 reclaim이 겹친다\n\n진단:\n\n```bash\nperf stat -p <pid> -e minor-faults,major-faults,page-faults -- sleep 30\nstrace -f -ttT -e trace=fork,vfork,clone,execve -p <pid>\n```\n\n### 시나리오 2: worker 생성이 많을수록 메모리 압박이 커진다\n\n가능한 원인:\n\n- fork된 자식들이 곧바로 write한다\n- COW가 대량 page duplication으로 변한다\n- pid limit과 memory pressure가 같이 온다\n\n### 시나리오 3: exec 기반 모델이 느리지만 안정적이다\n\n가능한 원인:\n\n- 새 주소 공간 초기화 비용\n- cold start fault\n- 그러나 상태 분리가 좋아 장애 격리가 쉬움\n\n## 코드로 보기\n\n### fork 후 write 감각\n\n```c\npid_t pid = fork();\nif (pid == 0) {\n    // child writes -> COW may trigger\n}\n```\n\n### exec 모델\n\n```c\nexecl(\"/usr/bin/java\", \"java\", \"-jar\", \"app.jar\", NULL);\n```\n\n### 단순 모델\n\n```text\nfork\n  -> pages shared read-only\n  -> first write duplicates pages\n  -> exec replaces entire address space\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| fork + COW | 시작이 빠르다 | 첫 write 비용이 크다 | pre-fork worker |\n| exec 기반 | 상태가 단순하다 | 초기화 비용이 든다 | daemon restart |\n| vfork | 매우 빠를 수 있다 | 제약이 강하다 | 특수 케이스 |\n| thread pool | 주소 공간 공유 | 장애 전파 위험 | 일반 서버 |\n\n## 꼬리질문\n\n> Q: fork가 왜 처음엔 싸나요?\n> 핵심: 실제 페이지를 바로 복사하지 않고 COW를 쓰기 때문이다.\n\n> Q: exec는 무엇을 하나요?\n> 핵심: 현재 프로세스 이미지를 새 프로그램으로 교체한다.\n\n> Q: COW는 언제 비싸지나요?\n> 핵심: 자식이나 부모가 페이지를 실제로 쓰기 시작할 때다.\n\n## 한 줄 정리\n\nfork는 copy-on-write 덕분에 초기에는 싸지만, write-heavy 경로에서는 첫 페이지 복제가 비용이 되어 tail latency를 키울 수 있다.\n",
+  "aliases": [
+    "fork exec copy on write",
+    "fork copy-on-write behavior",
+    "execve address space replacement",
+    "child process first write penalty",
+    "pre fork server memory cost",
+    "close on exec leak",
+    "fork는 싸지만 첫 write는 비싸다",
+    "프로세스 생성 COW",
+    "fork",
+    "exec",
+    "execve",
+    "copy-on-write",
+    "COW",
+    "child process spawn",
+    "자식 프로세스 생성",
+    "pre-fork server",
+    "pre-fork 모델",
+    "address space replacement",
+    "주소 공간 교체",
+    "file descriptor inheritance",
+    "fd 상속",
+    "O_CLOEXEC",
+    "close-on-exec",
+    "posix_spawn",
+    "vfork"
+  ],
+  "expected_queries": [
+    "fork는 메모리를 바로 복사하지 않는다는데 copy-on-write는 어떻게 동작해?",
+    "fork 뒤 첫 write가 느린 이유를 page fault와 연결해서 설명해줘",
+    "execve는 새 프로세스를 만드는 것과 주소 공간을 교체하는 것 중 어느 쪽이야?",
+    "close-on-exec를 안 걸면 자식 프로세스에 file descriptor가 왜 새어 나가?",
+    "pre-fork 서버에서 큰 heap을 가진 부모가 worker를 만들 때 어떤 비용을 봐야 해?"
+  ],
+  "symptoms": [
+    "fork가 부모 메모리를 즉시 전부 복사한다고 이해해 COW와 첫 write 비용을 놓친다",
+    "exec가 새 프로세스를 만든다고만 생각해 현재 PID의 주소 공간 교체라는 점을 놓친다",
+    "file descriptor가 exec 뒤에도 남을 수 있다는 close-on-exec 누락을 추적하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics",
+      "operating-system/demand-paging-page-fault-primer"
+    ],
+    "next_docs": [
+      "operating-system/process-spawn-api-comparison",
+      "operating-system/major-minor-page-faults-runtime-diagnostics",
+      "operating-system/o-cloexec-fd-inheritance-exec-leaks",
+      "operating-system/pid-limit-process-table-exhaustion"
+    ],
+    "confusable_with": [
+      "operating-system/process-spawn-api-comparison",
+      "operating-system/demand-paging-page-fault-primer",
+      "operating-system/o-cloexec-fd-inheritance-exec-leaks",
+      "operating-system/linux-process-state-zombie-orphan",
+      "operating-system/process-creation-fork-vs-exec-vs-posix-spawn-vs-vfork-intermediate-chooser",
+      "operating-system/clone-flags-thread-like-process-like-namespace-isolated"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/fork-exec-copy-on-write-behavior.md",
+    "revision_history": []
+  }
+}

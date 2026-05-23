@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/cgroup-memory-limit-oom-router",
+  "title": "Cgroup Memory Limit OOM Router",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "이 symptom_router는 cgroup/container memory limit에서 발생하는 OOMKilled를 분기한다. Java heap dump 깨끗함, RSS가 heap보다 큼, native memory, page cache, Kubernetes OOMKilled 같은 증상을 다룬다.",
+  "body_markdown": "# Cgroup Memory Limit OOM Router\n\n## 관찰 증거\n\n컨테이너 memory limit, RSS, Java heap used/max, direct buffer pool, thread count, metaspace, page cache를 같은 시간대에 본다. `OOMKilled`는 JVM 내부 `OutOfMemoryError`와 다르게 OS/cgroup이 프로세스를 죽인 결과일 수 있다.\n\n이 router의 첫 분기는 **JVM heap OOME인지, cgroup memory controller가 죽인 것인지**다. Kubernetes의 `OOMKilled`는 container runtime/orchestrator가 본 결과이고, kernel 쪽 증거는 cgroup v2 `memory.events`의 `oom_kill` 증가와 kill 시각의 `memory.current`/RSS 구성이다.\n\n```bash\n# Kubernetes 표면 증거\nkubectl describe pod <pod>\nkubectl top pod <pod> --containers\n\n# 컨테이너 안 cgroup v2 기준. namespace/runtime에 따라 보이는 경로와 범위가 다를 수 있다.\ncat /sys/fs/cgroup/memory.max\ncat /sys/fs/cgroup/memory.current\ncat /sys/fs/cgroup/memory.events\ncat /sys/fs/cgroup/memory.events.local\ncat /sys/fs/cgroup/memory.stat\n\n# 프로세스 관점\ncat /proc/<pid>/status | egrep 'VmRSS|VmHWM|Threads'\ncat /proc/<pid>/smaps_rollup\njcmd <pid> GC.heap_info\njcmd <pid> VM.native_memory summary\n```\n\n`VM.native_memory`는 NMT가 켜져 있어야 충분히 유용하다. 사후 분석이 필요한 서비스라면 재현 환경에서 `-XX:NativeMemoryTracking=summary` 또는 `detail` 비용을 검토한다.\n\n## 1차 분기\n\n| 관찰 | 먼저 의심 | 다음 확인 |\n|---|---|---|\n| `memory.events`의 `oom_kill` 증가, pod `OOMKilled` | cgroup limit 초과 kill | kill 시각의 `memory.current`, RSS, restart count |\n| Java heap used가 max 근처 | heap retention/leak | heap dump, GC after heap, retained size |\n| heap은 여유인데 RSS가 limit 근처 | off-heap/native/page cache/thread stack | direct buffer, NMT, thread count, mmap, smaps |\n| `inactive_file`/page cache가 큼 | file I/O/page cache accounting | working set, tmpfs, log/write pattern |\n| thread count가 큼 | thread stack 메모리 | stack size, executor/virtual vs platform thread |\n| direct buffer pool이 큼 | Netty/NIO/direct memory | `MaxDirectMemorySize`, pool metric, buffer release |\n\nHeap이 꽉 찼으면 Java object retention을 본다. Heap은 여유인데 RSS가 높으면 direct buffer, native memory, thread stack, mmap, page cache를 본다.\n\n## 다음 확인\n\nJVM ergonomics가 container limit을 제대로 인식하는지, `MaxRAMPercentage`, direct memory limit, metaspace, code cache, thread stack size가 합산 memory budget 안에 있는지 확인한다.\n\n예를 들어 1GiB container에서 `-Xmx800m`을 주면 heap만으로는 그럴듯해 보여도 아래 메모리가 같은 cgroup limit 안에서 경쟁한다.\n\n| 예산 항목 | 흔한 관찰 지표 |\n|---|---|\n| Java heap | `jcmd GC.heap_info`, GC log heap after/before |\n| Direct/off-heap | NMT, `BufferPoolMXBean`, Netty allocator metric |\n| Metaspace/code cache | NMT, JVM flags, class count |\n| Thread stacks | `/proc/<pid>/status Threads`, `-Xss`, thread dump |\n| Native libraries/JIT/JNI | NMT, `smaps_rollup` |\n| Page cache/tmpfs/mmap | `memory.stat`, `smaps`, file I/O pattern |\n\n## memory.events 읽기\n\ncgroup v2의 `memory.events`는 누적 카운터다. 한 번 출력한 숫자보다 \"문제 시각 전후로 증가했는가\"가 중요하다. 또한 `memory.events`는 계층적 값을 포함할 수 있으므로, 현재 cgroup 자체의 local event를 보려면 `memory.events.local`도 같이 본다.\n\n```text\nlow 0\nhigh 12\nmax 34\noom 2\noom_kill 1\n```\n\n- `high`: `memory.high` throttle/reclaim 압박이 있었는지 본다.\n- `max`: `memory.max` 한도에 도달한 횟수다.\n- `oom`: cgroup에서 OOM 상황이 발생했다.\n- `oom_kill`: 실제 kill이 발생했다. Kubernetes `OOMKilled`와 함께 강한 증거다.\n\n`memory.max`는 hard limit이고, usage가 줄지 않으면 cgroup 안에서 OOM killer가 동작할 수 있다. 반면 `memory.high`는 kill보다 reclaim/throttle 압박 신호에 가깝다. `high` 증가만으로 kill을 말하지 말고 latency, reclaim pressure, GC slowdown 후보로 분기한다.\n\n## 컨테이너/호스트 경계\n\n컨테이너 안에서 보이는 `/sys/fs/cgroup`은 cgroup namespace와 runtime 설정에 따라 제한된 view일 수 있다. Pod가 여러 container를 갖거나 sidecar가 있는 경우에는 pod 단위 limit, container 단위 limit, JVM 프로세스 RSS를 섞지 않는다.\n\n확인 순서:\n\n1. pod/container의 limit과 restart reason을 Kubernetes에서 확인한다.\n2. 같은 container cgroup의 `memory.current`, `memory.max`, `memory.events(.local)`, `memory.stat`을 읽는다.\n3. JVM pid의 `/proc/<pid>/status`, `smaps_rollup`, NMT를 같은 시각에 맞춘다.\n4. host node pressure, eviction, ephemeral storage 문제와 cgroup OOM을 분리한다.\n\n## 잘못된 대응\n\n- `OutOfMemoryError` 로그가 없으니 메모리 문제가 아니라고 단정한다. cgroup kill은 JVM이 예외를 남기기 전에 끝날 수 있다.\n- heap dump가 깨끗하니 원인이 없다고 본다. direct buffer, native memory, page cache, thread stack은 heap dump에 잘 안 보인다.\n- container limit은 그대로 두고 `-Xmx`만 크게 늘린다. RSS budget이 더 좁아져 OOMKilled가 빨라질 수 있다.\n- pod memory limit만 올리고 왜 증가했는지 보지 않는다. leak이면 재발 시간만 늦춘다.\n- `kubectl top` 현재값만 보고 결론낸다. kill 순간의 peak와 누적 counter가 더 중요하다.\n\n## 운영 분기 절차\n\n1. `kubectl describe pod`에서 `Reason: OOMKilled`, exit code, restart 시각을 확인한다.\n2. `memory.events`에서 `oom_kill` 전후 증가를 확인한다.\n3. JVM 로그에 `OutOfMemoryError`가 있었는지와 cgroup kill 시각을 분리한다.\n4. kill 직전 heap after GC가 max 근처였는지 본다.\n5. heap이 아니면 RSS 구성: direct memory, thread stack, metaspace/code cache, mmap/page cache를 나눈다.\n6. memory budget 표를 만들고 `Xmx + direct + metaspace + stacks + native + page cache 여유`가 limit 안에 들어오는지 검산한다.\n7. 조치 후에는 restart count, `oom_kill`, RSS peak, heap after GC baseline을 같이 본다.\n\n검증은 \"다시 안 죽었다\"만으로 끝내지 않는다. 같은 부하에서 `oom_kill` delta가 0이고, `memory.current` peak가 limit까지 붙지 않으며, heap/off-heap/page cache 중 어느 항목이 줄었는지 설명 가능해야 한다.\n\n## 관련 playbook\n\nDirect buffer/off-heap bridge와 OOM heap dump playbook을 같이 보며 heap 내부와 외부를 나눠 조사한다.\n",
+  "aliases": [
+    "cgroup memory limit oom router",
+    "container oomkilled java memory",
+    "cgroup 메모리 제한 OOM",
+    "컨테이너 OOMKilled 원인 분기"
+  ],
+  "expected_queries": [
+    "컨테이너 OOMKilled인데 Java heap dump에는 원인이 안 보여",
+    "cgroup memory limit과 JVM heap size를 어떻게 맞춰야 해?",
+    "RSS가 heap보다 큰데 어디 메모리를 봐야 해?"
+  ],
+  "symptoms": [
+    "Kubernetes에서 OOMKilled가 찍혀요",
+    "heap max보다 낮게 쓰는데 pod가 죽어요",
+    "native memory와 page cache를 구분하지 못하고 있어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/direct-buffer-offheap-oom-bridge"
+    ],
+    "next_docs": [
+      "language/oom-heap-dump-playbook"
+    ],
+    "confusable_with": [
+      "operating-system/direct-buffer-offheap-oom-bridge",
+      "language/oom-heap-dump-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/cgroup-memory-limit-oom-router.md",
+    "revision_history": []
+  }
+}

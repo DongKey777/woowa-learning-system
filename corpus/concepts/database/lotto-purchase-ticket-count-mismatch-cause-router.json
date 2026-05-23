@@ -1,0 +1,55 @@
+{
+  "id": "database/lotto-purchase-ticket-count-mismatch-cause-router",
+  "title": "lotto 구매 저장 뒤 티켓 수 불일치 원인 라우터",
+  "category": "database",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# lotto 구매 저장 뒤 티켓 수 불일치 원인 라우터\n\n## 한 줄 요약\n\n> lotto에서 구매 금액으로 계산한 장수와 DB의 ticket row 수가 다르게 보인다면, \"입력 금액에서 기대 장수가 맞게 나왔는지\"와 \"그 기대 장수만큼 같은 구매 트랜잭션 안에 실제 row가 남았는지\"를 분리해야 한다.\n\n## 가능한 원인\n\n1. **입력 금액 validation이 기대 장수 계산보다 느슨하다.** 로또 한 장 가격이 1,000원이라면 구매 금액은 1,000원 이상이고 1,000으로 나누어떨어져야 한다. `\"5000원\"`, `\"5,000\"`, 공백, 음수, 0, 소수, 문자열 파싱 실패를 제각각 처리하면 화면에서는 성공처럼 보이는데 내부 ticket count는 다르게 계산될 수 있다. 저장 전에 정규화된 `amount` 하나를 만들고, 그 값으로 validation과 ticket count를 모두 계산해야 한다.\n2. **정수 나눗셈과 나머지 처리가 섞였다.** `ticketCount = amount / 1000`은 정수 나눗셈이라 `5500 / 1000 = 5`가 된다. 이 값으로 저장하면 500원이 조용히 버려져 \"금액은 5,500원인데 티켓은 5장\" 같은 불일치가 생긴다. 나머지가 0이 아니면 저장하지 않는 것이 validation 문제이고, 나머지를 버린 채 진행하면 계산 문제다.\n3. **purchase 1건과 ticket 여러 장의 저장 구조가 처음부터 흐리다.** `purchase`와 `ticket`의 부모-자식 경계가 없거나, 장수 의미를 `purchase.amount`, `purchase.ticket_count`, `ticket` row 사이에 일관되게 묶지 못하면 저장 후 개수 비교 자체가 흔들린다. 이 갈래는 [lotto 구매 1회/여러 장 티켓 저장 ↔ 부모-자식 테이블 모델링 브릿지](./lotto-purchase-ticket-parent-child-modeling-bridge.md)로 이어진다.\n4. **persisted ticket row count를 purchase id 기준으로 세지 않았다.** 화면 DTO의 티켓 개수, generator가 반환한 리스트 크기, repository `saveAll`에 넘긴 리스트 크기, DB에 commit된 `ticket` row 수는 서로 다른 관찰값이다. 저장 불일치를 말하려면 `select count(*) from ticket where purchase_id = ?`처럼 특정 purchase에 연결된 row count를 확인해야 한다. 전체 ticket 수나 마지막 사용자 전체 구매 내역을 세면 fixture나 기존 데이터가 섞인다.\n5. **같은 구매 유스케이스를 한 트랜잭션으로 묶지 못했거나 rollback이 확인되지 않았다.** `purchase` insert와 `ticket` 여러 장 insert가 서로 다른 commit 단위로 흩어지면, 중간 실패 때 \"구매는 있는데 티켓이 덜 있는\" 모양이 생길 수 있다. ticket 저장 중 예외가 나면 purchase까지 rollback되는지, checked exception이나 내부 catch 때문에 rollback이 막히지 않는지, `REQUIRES_NEW` 같은 전파 설정으로 commit 단위가 쪼개지지 않는지 확인한다. 이 경우는 [lotto 구매 1회/여러 장 티켓 저장 ↔ Spring `@Transactional` 경계 브릿지](../spring/lotto-purchase-ticket-transaction-boundary-bridge.md)를 먼저 본다.\n6. **중복 제출이나 duplicate generation을 저장 구조 문제로 착각하고 있다.** 새로고침, 재시도, 버튼 중복 클릭 때문에 같은 구매 요청이 두 번 들어오면 ticket row 수가 \"과하게 많은\" 쪽으로 어긋난다. 반대로 로또 번호 generator가 같은 조합을 여러 번 반환해도 row 수는 맞을 수 있으므로, \"row count mismatch\"와 \"티켓 번호 조합 중복\"을 분리해야 한다. 중복 요청 갈래는 [lotto 구매 재시도/중복 티켓 저장 ↔ 멱등성 키와 UNIQUE 브릿지](./lotto-purchase-duplicate-submit-idempotency-bridge.md)로 가서 중복 허용 surface를 본다.\n7. **fixture setup 때문에 기존 ticket row가 섞였다.** 테스트에서 DB를 비우지 않았거나, 같은 사용자/구매자 fixture를 재사용하거나, `purchase_id`가 아니라 `member_id`로 티켓을 세면 이전 테스트의 row가 함께 잡힌다. 이 경우 production 저장 버그가 아니라 테스트 격리 문제일 수 있다.\n8. **조회가 purchase 단위가 아니라 다른 단위를 보여 준다.** 저장은 맞는데 화면이나 조회 API가 `purchase` 1건 기준이 아니라 전체 `ticket` 집합이나 다른 구매 묶음을 펼쳐 보여 주면, 학습자는 저장 불일치처럼 느끼기 쉽다. 이때는 [lotto 구매 1회 재조회 ↔ PurchaseRepository 경계 브릿지](../software-engineering/lotto-purchase-history-repository-boundary-bridge.md)로 가서 조회 모델의 기준 단위를 확인한다.\n\n## 빠른 자기 진단\n\n1. **입력에서 기대 장수까지를 먼저 고정한다.** `amount = 5000`, `ticketPrice = 1000`, `expectedTicketCount = 5`, `amount % ticketPrice = 0`처럼 테스트에 그대로 적을 수 있어야 한다.\n2. **나머지가 있는 금액은 성공 케이스에서 제외한다.** `5500원`을 넣었을 때 5장을 저장하는 것이 요구사항인지, 예외를 던져 아무것도 저장하지 않는 것이 요구사항인지 결정한다. 보통 lotto 미션에서는 후자가 더 검증하기 쉽다.\n3. **저장 전후 count를 같은 purchase id로 비교한다.** 저장 직후 반환 DTO의 `tickets.size()`만 보지 말고, commit 이후 `ticket where purchase_id = savedPurchaseId` count를 본다.\n4. **트랜잭션 실패 테스트를 만든다.** ticket 3번째 저장에서 예외가 나도록 fake repository나 constraint violation을 유도했을 때 purchase row와 앞선 ticket row가 모두 남지 않아야 한다.\n5. **중복의 종류를 나눈다.** 같은 요청이 두 번 처리되어 row가 두 배가 된 것인지, 한 요청 안에서 generator가 같은 번호 조합을 만든 것인지, 조회가 같은 row를 join으로 중복 표시하는 것인지 분리한다.\n6. **fixture를 비운 뒤 단일 구매만 검증한다.** 테스트 시작 전 DB cleanup, unique user, 새 purchase id를 사용하고, 전체 row count 대신 purchase id scoped count를 assert한다.\n\n## 잘못 넣기 쉬운 버킷\n\n- **validation 실패를 transaction 문제로 분류하기.** 금액이 1,000으로 나누어떨어지지 않는데 일부 장수만 저장했다면 먼저 입력 validation과 계산 문제다.\n- **generator 중복을 ticket row count mismatch로 말하기.** 번호 조합이 중복된 것은 도메인 규칙 문제이고, row 수가 기대 장수와 다른 것은 저장/계산 문제다.\n- **전체 ticket table count로 단일 구매 저장을 판단하기.** 기존 fixture나 다른 구매가 섞이면 저장 로직이 맞아도 실패한다.\n- **화면 DTO 개수와 DB persisted row count를 같은 증거로 취급하기.** DTO 조립, 조회 join, lazy loading, transaction commit 전후 시점이 다를 수 있다.\n- **중복 제출을 부모-자식 모델링 문제로만 해결하려 하기.** 모델링이 맞아도 request idempotency나 UNIQUE 제약이 없으면 같은 구매 요청이 두 번 들어올 수 있다.\n\n## 검증 질문\n\n1. 실패 케이스의 입력 금액, 정규화된 amount, `amount / 1000`, `amount % 1000` 값은 각각 무엇인가?\n2. 저장된 purchase id 하나에 대해 DB의 `ticket` row count는 기대 장수와 같은가?\n3. ticket 저장 중간 예외가 발생하면 purchase row도 rollback되는가?\n4. 같은 HTTP 요청 또는 같은 command가 두 번 실행된 로그가 있는가?\n5. \"중복\"이라고 부르는 것이 같은 번호 조합 중복인가, 같은 ticket row 중복인가, 같은 purchase가 두 번 생긴 것인가?\n6. 테스트 fixture는 매 테스트마다 비워지며, assert는 전체 테이블이 아니라 방금 만든 purchase id를 기준으로 하는가?\n\n## 다음 학습\n\n- 부모-자식 저장 구조부터 다시 잡으려면 [lotto 구매 1회/여러 장 티켓 저장 ↔ 부모-자식 테이블 모델링 브릿지](./lotto-purchase-ticket-parent-child-modeling-bridge.md)\n- 저장 원자 단위를 어디에 둘지 보려면 [lotto 구매 1회/여러 장 티켓 저장 ↔ Spring `@Transactional` 경계 브릿지](../spring/lotto-purchase-ticket-transaction-boundary-bridge.md)\n- 중복 티켓 증가가 재전송 문제인지 확인하려면 [lotto 구매 재시도/중복 티켓 저장 ↔ 멱등성 키와 UNIQUE 브릿지](./lotto-purchase-duplicate-submit-idempotency-bridge.md)\n- 조회가 어떤 구매 단위를 기준으로 삼아야 하는지 정리하려면 [lotto 구매 1회 재조회 ↔ PurchaseRepository 경계 브릿지](../software-engineering/lotto-purchase-history-repository-boundary-bridge.md)\n",
+  "aliases": [
+    "lotto 티켓 수 불일치",
+    "로또 구매 저장 뒤 티켓 개수 이상",
+    "lotto purchase ticket count mismatch",
+    "로또 purchase 와 ticket 수가 안 맞아요",
+    "lotto 저장했는데 ticket row 개수가 달라요",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "로또 구매 한 번이 끝났는데 왜 purchase 한 건에 ticket 개수가 기대한 장수와 다르게 남을 수 있어?",
+    "구매 완료는 떴는데 나중에 조회하면 티켓이 빠져 있거나 중복으로 보일 때 어디부터 의심해야 해?",
+    "lotto 저장 흐름에서 purchase 와 ticket 을 같은 트랜잭션으로 보라는 리뷰는 무슨 뜻이야?",
+    "금액으로는 5장 샀는데 DB 에는 4장만 보일 때 모델링 문제인지 중복 제출인지 어떻게 가를까?",
+    "로또 웹 버전에서 ticket row 수가 들쭉날쭉하면 parent-child 저장 구조와 재전송 중 무엇부터 봐야 해?"
+  ],
+  "symptoms": [
+    "lotto 구매를 저장했는데 구매 금액으로 계산한 장수와 DB ticket row 수가 맞지 않아요",
+    "한 번 구매했는데 purchase 는 1건인데 ticket 이 덜 저장되거나 더 저장돼 보여요",
+    "로또 구매 완료 화면은 성공인데 다시 조회하면 티켓 수가 달라져요",
+    "리뷰에서 purchase 와 ticket 을 같은 원자 단위로 보라는 말을 들었는데 왜 필요한지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/lotto-purchase-flow-service-layer-bridge"
+    ],
+    "next_docs": [
+      "database/lotto-purchase-ticket-parent-child-modeling-bridge",
+      "spring/lotto-purchase-ticket-transaction-boundary-bridge",
+      "database/lotto-purchase-duplicate-submit-idempotency-bridge",
+      "software-engineering/lotto-purchase-history-repository-boundary-bridge"
+    ],
+    "confusable_with": [
+      "database/lotto-purchase-ticket-parent-child-modeling-bridge",
+      "spring/lotto-purchase-ticket-transaction-boundary-bridge",
+      "database/lotto-purchase-duplicate-submit-idempotency-bridge",
+      "software-engineering/lotto-purchase-history-repository-boundary-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/lotto-purchase-ticket-count-mismatch-cause-router.md",
+    "revision_history": []
+  }
+}

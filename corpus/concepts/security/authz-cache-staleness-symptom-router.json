@@ -1,0 +1,45 @@
+{
+  "id": "security/authz-cache-staleness-symptom-router",
+  "title": "Authz Cache Staleness Symptom Router",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 symptom_router는 authorization cache staleness 증상을 디버그한다. DB 권한은 바뀌었는데 API decision은 그대로, 특정 인스턴스 stale, invalidation 이벤트 후 접근 지속 같은 표현을 다룬다.",
+  "body_markdown": "# Authz Cache Staleness Symptom Router\n\n## 한 줄 판단\n\n권한 DB가 바뀌었는데 API decision이 그대로라면 token claim, policy source, authorization cache, resource cache를 분리해서 봐야 한다. DB row만으로는 cache staleness를 증명할 수 없다.\n\n## 첫 분기\n\n처음 1분은 \"어느 버킷의 오래된 값인가\"를 가르는 데 쓴다.\n\n| 첫 질문 | 예/아니오가 가르는 것 |\n|---|---|\n| 새 token 또는 새 session에서도 같은가? | token/session claim stale인지, 서버 decision/cache stale인지 |\n| cache bypass 또는 forced refresh에서 decision이 바뀌는가? | cache 문제인지, 정책/DB 자체 문제인지 |\n| 특정 instance/region에서만 재현되는가? | local cache/invalidation 전파 문제인지, shared source 문제인지 |\n| resource owner/tenant 변경이 함께 있었는가? | role cache가 아니라 resource/ownership cache 문제인지 |\n| 외부 status가 404 concealment인가? | not-found와 authz deny를 내부 reason으로 분리해야 하는지 |\n\n## 섞으면 안 되는 것\n\n| 항목 | 변하지 않는 기간 | staleness 증거 |\n|---|---|---|\n| Session cookie | session이 유지되는 동안 subject 식별자를 운반 | cookie 자체가 stale authz decision을 담는 것은 아님 |\n| JWT/access token claim | token 만료 또는 재발급 전까지 | `roles`, `scope`, `tenant` claim이 오래된 값인지 |\n| Authz decision cache | TTL 또는 invalidation 전까지 | cache key, hit/miss, cached decision, policy version |\n| Resource/ownership cache | resource cache TTL 전까지 | owner/tenant/scope가 오래된 row인지 |\n| Policy config cache | 배포/refresh 전까지 | policy version, rule set hash |\n\nToken에 오래된 role이 들어 있는 문제와 서버 authz cache가 오래된 문제는 대응이 다르다. token 문제는 재발급/만료/deny-list를 보고, cache 문제는 key 설계/TTL/invalidation/event delivery를 본다.\n\n## 관찰 증거\n\n한 요청의 authorization decision log에 subject, resource, policy version, cache key, cache hit/miss, decision source를 남긴다. 아래 필드가 없으면 \"stale 같다\"에서 멈춘다.\n\n| 필드 | 이유 |\n|---|---|\n| subject id / token id / session id | 같은 사용자인지, token이 바뀌었는지 확인 |\n| resource type / id / owner / tenant | resource-level 조건이 최신인지 확인 |\n| requested action | 어떤 permission 판단인지 확인 |\n| policy version / rule name | 어떤 정책이 적용됐는지 확인 |\n| cache key / cache layer | user-role cache인지 decision cache인지 resource cache인지 분리 |\n| cache hit/miss / TTL remaining | stale decision이 cache에서 온 것인지 증명 |\n| instance id | 특정 인스턴스만 문제인지 확인 |\n| decision source | DB, token claim, local cache, distributed cache, fallback 중 어디인지 확인 |\n| decision reason code | allow/deny뿐 아니라 role miss, ownership miss, tenant mismatch, concealment를 분리 |\n| invalidation event id/time | cache가 바뀌어야 했던 시점과 실제 반영 시점을 비교 |\n\n## 10초 분기표\n\n| 관찰 | 원인 후보 | 다음 액션 |\n|---|---|---|\n| 모든 인스턴스가 같은 오래된 allow | token claim 또는 shared cache | token issued_at/exp, distributed cache TTL |\n| 특정 인스턴스만 오래된 allow | local cache invalidation 실패 | instance id, event receipt time, local cache dump |\n| role 변경 후 새 로그인까지 안 바뀜 | token/session claim 고정 | token 재발급, session attribute refresh |\n| resource owner 변경 후 접근 허용 | resource cache stale | resource cache key/TTL, owner version |\n| invalidate event는 발행됨, 일부만 반영 | pub/sub lag 또는 consumer failure | event id, ack log, retry/dead letter |\n| deny가 오래 남음 | deny cache TTL 문제 | allow와 deny cache 정책 분리 |\n\n## wrong-bucket 비교\n\n| 증상 | 잘못 가기 쉬운 결론 | 더 정확한 분기 |\n|---|---|---|\n| role 제거 후 접근 가능 | JWT만 문제 | gateway/app/downstream decision source를 나눠 token, session, authz cache를 각각 본다 |\n| grant 후 계속 403 | 정책이 틀림 | stale deny/negative cache와 policy bug를 cache bypass로 분리한다 |\n| 일부 resource만 허용 | role cache 문제 | resource ownership/tenant cache key를 먼저 본다 |\n| 모든 요청이 401 | authz cache 문제 | authentication/session/JWT verification 문제를 먼저 본다 |\n| 404가 늘어남 | 데이터 삭제 | concealment 404인지 실제 not-found인지 internal reason code로 확인한다 |\n\n## 검증 순서\n\n1. 같은 subject, action, resource로 권한 변경 전후 요청을 재현한다.\n2. DB update commit time, policy change time, invalidation event id를 기록한다.\n3. 각 request의 decision log에서 token/session id, policy version, cache key, hit/miss, instance id를 비교한다.\n4. cache bypass 또는 forced refresh 옵션이 있다면 같은 request를 한 번 더 보내 decision이 바뀌는지 본다.\n5. 여러 인스턴스에 같은 request를 보내 특정 인스턴스 문제인지 확인한다.\n6. token claim이 오래된 경우 cache를 지우기보다 token lifetime, refresh, revocation 전략으로 분기한다.\n7. staleness 허용 시간이 비즈니스 위험과 맞는지 TTL을 재검토한다.\n\n검증 완료 조건은 \"DB가 최신이다\"가 아니라 \"요청 decision이 어떤 source/version에서 나왔고, 변경 이후 허용된 stale window 안에 새 decision으로 수렴했다\"이다.\n\n## 공격 모델\n\nstale allow는 권한 회수 뒤에도 접근이 유지되는 문제다. 퇴사자, 매장 권한 회수, tenant 이동, 관리자 role 제거 같은 이벤트에서 위험이 커진다.\n\nstale deny는 보안 침해보다는 가용성/운영 장애에 가깝지만, 사용자가 권한을 받았는데 계속 막히는 장애로 나타난다. allow cache와 deny cache는 TTL과 invalidation 정책을 다르게 가져갈 수 있다.\n\n## 흔한 오해\n\nDB row가 최신이면 서버 decision도 최신이라고 생각하기 쉽다. 실제 decision은 token claim, resource cache, policy cache, decision cache 중 하나에서 나온 값일 수 있다.\n\n쿠키를 삭제하면 authz cache가 해결된다고 보면 안 된다. session cookie는 subject를 식별할 뿐이고, decision cache가 서버에 남아 있으면 같은 stale decision을 다시 만들 수 있다.\n\n모든 cache를 짧게 하면 안전하다고 단정할 수 없다. staleness는 줄지만 DB 부하, latency, 장애 전파가 커진다. 중요한 revoke 경로에는 TTL 단축보다 명시적 invalidation과 decision log가 더 중요하다.\n\n## 관련 playbook\n\nrevoke lag가 token lifetime에서 오는지 authz cache에서 오는지 token revoke lag bridge와 함께 본다.\n",
+  "aliases": [
+    "authz cache staleness router",
+    "stale authorization decision cache",
+    "권한 캐시 stale 증상",
+    "authorization cache inconsistency"
+  ],
+  "expected_queries": [
+    "권한 변경 후에도 API가 예전 권한으로 판단하면 어디부터 봐?",
+    "authz cache가 stale한지 어떻게 증거를 잡아?",
+    "role 변경 이벤트가 왔는데 권한 판단이 늦게 바뀌어"
+  ],
+  "symptoms": [
+    "DB 권한은 바뀌었는데 API decision은 그대로예요",
+    "특정 서버 인스턴스만 오래된 권한을 써요",
+    "cache invalidation 이벤트는 성공했는데 접근이 계속돼요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/authz-cache-inconsistency-runtime-debugging"
+    ],
+    "next_docs": [
+      "security/token-revoke-lag-authz-cache-bridge"
+    ],
+    "confusable_with": [
+      "security/authz-cache-inconsistency-runtime-debugging",
+      "security/authz-decision-logging-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/authz-cache-staleness-symptom-router.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "id": "spring/autoconfiguration-condition-interview-router",
+  "title": "AutoConfiguration Condition Interview Router",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 Spring Boot AutoConfiguration과 conditional bean 생성 문제를 면접/디버깅 질문에서 분기한다. ConditionEvaluationReport의 positive/negative match reason을 증거로 삼는다.",
+  "body_markdown": "# AutoConfiguration Condition Interview Router\n\n## 관찰 증거\n\n- dependency는 있는데 기대한 bean이 없다.\n- 같은 starter라도 classpath, property, existing bean, exclusion 설정에 따라 auto configuration 결과가 달라질 수 있다.\n- condition report에는 auto configuration class와 bean method별 matched/unmatched reason이 남는다.\n- 사용자가 같은 역할의 bean을 직접 등록하면 Boot 기본 bean이 back-off할 수 있다.\n- test slice에서는 전체 application context가 아니므로 production과 조건 평가 결과가 달라질 수 있다.\n- source의 `@ConditionalOn...` annotation은 가설이고, 실제 runtime evidence는 현재 classpath/property/bean definition으로 평가된 report다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| bean missing | classpath/property condition 불일치 | ConditionEvaluationReport |\n| 내 bean이 선택되지 않음 | 여러 bean 후보, `@Primary`, `@Qualifier` | injection candidate selection |\n| test만 다름 | slice test context | imported auto config |\n| local만 다름 | profile/property 차이 | `spring.autoconfigure.exclude`, active profile |\n| starter는 있는데 설정이 무시됨 | user bean override/back-off | bean name, type, `@ConditionalOnBean` |\n\n## 면접 답변 골격\n\nSpring Boot AutoConfiguration은 classpath와 property, existing bean 같은 조건을 보고 기본 bean 구성을 제공한다. magic이 아니라 conditional configuration의 조합이다.\n\n면접에서는 \"starter를 넣으면 무조건 bean이 생긴다\"가 아니라 \"auto configuration 후보가 로딩된 뒤 조건이 맞을 때 기본 구성을 제공하고, 사용자가 같은 역할의 bean을 제공하면 보통 물러나는 구조\"라고 설명하는 편이 안전하다. 그리고 디버깅에서는 추측하지 않고 `ConditionEvaluationReport`의 positive/negative match reason을 근거로 삼는다고 말해야 한다. 조건은 대체로 세 축으로 나뉜다.\n\n| 조건 축 | 대표 예 | 답변 포인트 |\n|---|---|---|\n| classpath | `@ConditionalOnClass` | 라이브러리가 있어야 후보 설정이 열린다 |\n| property | `@ConditionalOnProperty` | 설정값으로 기능을 켜고 끈다 |\n| bean presence | `@ConditionalOnMissingBean`, `@ConditionalOnBean` | 이미 등록된 bean definition을 기준으로 기본값 제공 여부를 정한다 |\n\n## Condition Evaluation 증거 읽기\n\n| 증거 | 확인 방법 | 해석 |\n|---|---|---|\n| positive match | `--debug` condition report, Actuator `/actuator/conditions` | auto configuration 후보와 조건이 runtime에서 통과했다 |\n| negative match | 같은 report의 unmatched reason | classpath, property, bean presence, web type, exclusion 중 하나가 막았다 |\n| exclusions | report 또는 `spring.autoconfigure.exclude` | 후보가 조건 평가 전에 의도적으로 제외됐을 수 있다 |\n| existing bean | bean definition 목록, report의 `@ConditionalOnMissingBean` reason | 사용자 bean 때문에 Boot 기본값이 back-off했을 수 있다 |\n| test slice 차이 | `@WebMvcTest`, `@DataJpaTest`, imported auto config 목록 | production context와 애초에 올리는 bean/config 범위가 다르다 |\n\n`ConditionEvaluationReport`는 \"왜 Bean이 생성됐는가/생성되지 않았는가\"를 현재 실행 환경 기준으로 남긴다. 따라서 면접 답변에서는 `@ConditionalOnClass`를 봤다는 말에서 멈추지 말고, 실제 classpath에 그 class가 있는지와 report가 어떤 reason을 기록했는지까지 이어야 한다.\n\n## 디버깅 순서\n\n1. `ConditionEvaluationReport`에서 해당 auto configuration이 matched인지 unmatched인지 먼저 본다.\n2. report를 보는 경로를 정한다. 로컬 재현이면 `--debug`, 운영/통합 환경이면 노출 정책을 확인한 Actuator `conditions`, 테스트면 `ApplicationContextRunner`나 test context 로그가 증거가 된다.\n3. unmatched라면 classpath, property, required bean, web application type, exclusion 중 어느 축에서 빠졌는지 찾는다.\n4. matched인데 bean이 없다면 `@ConditionalOnMissingBean` back-off, bean name/type 조건, bean definition 등록 순서를 본다.\n5. `@ConditionalOnMissingBean`은 \"내 bean을 이겼다\"가 아니라 \"이미 사용자가 제공한 bean이 있으니 Boot 기본값을 만들지 않았다\"는 확장 지점으로 읽는다.\n6. bean은 있는데 주입이 다르면 여러 후보 중 `@Primary`, `@Qualifier`, bean name으로 무엇이 선택됐는지 본다.\n7. test에서만 다르면 `@SpringBootTest`, slice test, imported auto configuration 차이를 분리한다. 조건 자체가 틀린 상황을 qualifier 문제로 덮지 않는다.\n\n## 면접용 답변 순서\n\n1. 후보 로딩: Boot가 버전에 맞는 auto configuration 후보를 가져온다.\n2. 조건 평가: classpath/property/existing bean/web type/exclusion 조건을 평가한다.\n3. 기본값 제공: 조건이 맞으면 bean definition을 등록한다.\n4. back-off: 사용자가 같은 역할의 bean을 제공하면 `@ConditionalOnMissingBean` 계열 조건으로 기본값이 물러날 수 있다.\n5. 증거 확인: `ConditionEvaluationReport`의 positive/negative match reason으로 어느 단계에서 갈렸는지 확인한다.\n\n## 흔한 오답 교정\n\n- \"starter가 bean을 자동 등록한다\"만 말하면 부족하다. 어떤 조건에서 등록되는지와 왜 등록되지 않을 수 있는지를 같이 말해야 한다.\n- `@ConditionalOnMissingBean`은 내 bean을 밀어내는 장치가 아니라, 사용자가 bean을 제공하면 Boot 기본값이 물러나는 확장 지점이다.\n- auto configuration 문제와 component scan 문제를 섞지 않는다. 전자는 조건 평가, 후자는 내 클래스가 스캔 대상인지의 문제다.\n- `@Primary`는 이미 여러 bean이 등록된 뒤 주입 후보를 고르는 장치다. bean이 아예 생성되지 않는 문제의 1차 해법이 아니다.\n- Boot 버전과 starter 구성에 따라 auto configuration 후보를 찾는 메커니즘은 다를 수 있지만, 디버깅 관점에서는 \"후보 로딩 -> 조건 평가 -> bean 등록/back-off -> 주입 후보 선택\" 순서로 나누면 과장 없이 설명할 수 있다.\n- source annotation만 보고 원인을 확정하지 않는다. 조건은 현재 Environment, classpath, bean definition registry, auto configuration ordering과 함께 평가된다.\n\n## 관련 playbook\n\nstarter 디버깅은 `starter-condition-report-starter-drill`로 이어진다.\n",
+  "aliases": [
+    "Spring Boot auto configuration interview",
+    "condition evaluation report router",
+    "자동설정 조건 면접",
+    "starter bean missing debugging",
+    "@Conditional",
+    "@DataJpaTest",
+    "@Primary"
+  ],
+  "expected_queries": [
+    "Spring Boot AutoConfiguration을 면접에서 어떻게 설명해?",
+    "starter를 추가했는데 bean이 안 생기는 이유를 어떻게 분석해?",
+    "ConditionEvaluationReport는 언제 봐?",
+    "positive matches와 negative matches를 어떻게 근거로 써?"
+  ],
+  "symptoms": [
+    "starter를 넣었는데 기대한 Bean이 없어요",
+    "내 Bean을 등록했더니 Boot 기본 Bean이 생기지 않아요",
+    "local과 test에서 auto configuration 결과가 달라요",
+    "조건 annotation만 보고 원인을 단정해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/boot-condition-evaluation-report-debugging"
+    ],
+    "next_docs": [
+      "spring/starter-condition-report-starter-drill"
+    ],
+    "confusable_with": [
+      "spring/boot-condition-evaluation-report-debugging",
+      "spring/starter-condition-report-starter-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/autoconfiguration-condition-interview-router.md",
+    "revision_history": []
+  }
+}

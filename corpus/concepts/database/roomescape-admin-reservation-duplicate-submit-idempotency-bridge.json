@@ -1,0 +1,55 @@
+{
+  "id": "database/roomescape-admin-reservation-duplicate-submit-idempotency-bridge",
+  "title": "roomescape 관리자 예약 중복 제출 ↔ 멱등성 키와 UNIQUE 브릿지",
+  "category": "database",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# roomescape 관리자 예약 중복 제출 ↔ 멱등성 키와 UNIQUE 브릿지\n\n## 한 줄 요약\n\n> roomescape에서 예약 생성 한 번은 \"같은 의미의 요청 하나\"여야 한다. 브라우저나 네트워크가 같은 POST를 다시 보내도 예약을 두 번 만들지 않으려면, controller의 `if`문보다 먼저 같은 request identity를 DB가 한 번만 통과시키는 멱등성 경계가 필요하다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"예약 추가 버튼을 두 번 누르면 같은 예약이 두 번 생길까 봐 불안해요\" | 같은 생성 POST가 더블클릭이나 timeout retry로 재전송되는 관리자 화면 | 같은 요청 identity를 한 번만 인정하는 idempotency key를 본다 |\n| \"PRG를 넣었는데도 중복 제출 방어를 따로 보라는 리뷰가 달렸어요\" | redirect는 됐지만 저장 요청 자체의 replay identity가 없는 구조 | 브라우저 새로고침 정리와 저장소 dedup을 다른 층위로 분리한다 |\n| \"서로 다른 관리자가 같은 슬롯을 잡는 문제랑 같은 건가요?\" | duplicate submit과 slot competition을 같은 unique 제약 하나로 설명하려는 코드 | 같은 요청 재전송과 다른 요청 간 자원 경쟁을 구분한다 |\n\n## 미션 시나리오\n\nroomescape 관리자 예약 화면은 예약자, 날짜, 시간 슬롯을 고르고 `POST\n/admin/reservations`를 보내는 흐름으로 자주 구현된다. 여기서 저장이 조금\n느리거나 브라우저가 응답을 못 받으면 학습자는 버튼을 다시 누르기 쉽고, 자동\n재시도나 새로고침까지 겹치면 \"같은 예약 생성 의도\"가 두 번 서버에 도착할 수 있다.\n\n이때 흔한 첫 구현은 \"`exists`로 먼저 확인하고 없으면 저장\"이다. 하지만 두 요청이\n거의 동시에 들어오면 둘 다 확인을 통과할 수 있고, 운이 나쁘면 예약이 두 번\n생기거나 하나는 뒤늦게 duplicate key 예외로 터진다. 리뷰에서 \"PRG는 새로고침\n경계를 정리하는 것이고, 중복 제출은 멱등성으로 닫아야 한다\", \"같은 생성 시도\n자체의 identity를 저장소가 먼저 인정하게 하라\"는 코멘트가 나오는 이유가 여기다.\n\n## CS concept 매핑\n\n여기서 닿는 개념은 idempotency key와 insert-first arbitration이다. 예를 들어\nroomescape 예약 생성 시도마다 `request_id`를 받고, `(request_id)` 또는\n`(member_id, request_id)`에 `UNIQUE`를 두면 같은 의미의 요청 재전송 경쟁에서 DB가\n한 번만 승자를 정한다.\n\n```sql\nINSERT INTO reservation_requests (request_id, reservation_date, reservation_time_id) VALUES (?, ?, ?);\n```\n\n이 insert가 성공한 요청만 실제 예약 row 생성까지 진행하고, 같은 `request_id`로\n다시 온 요청은 \"이미 처리 중이거나 이미 끝난 같은 시도\"로 해석해 기존 결과를\n재사용할 수 있다. 중요한 구분은 이것이 `roomescape-reservation-concurrency-bridge`\n에서 다루는 \"서로 다른 두 요청이 같은 슬롯을 다투는 문제\"와 다르다는 점이다.\n멱등성은 같은 요청을 한 번만 인정하는 계약이고, 슬롯 경쟁은 다른 요청들 사이의\n승자를 고르는 계약이다.\n\n| roomescape 장면 | 더 가까운 개념 | 왜 그 개념으로 읽나 |\n| --- | --- | --- |\n| 같은 관리자가 응답 timeout 뒤 같은 예약 생성 POST를 다시 보냄 | idempotency key | 같은 의미의 요청 재전송을 한 번만 인정해야 한다 |\n| 두 관리자가 우연히 같은 슬롯을 거의 동시에 예약함 | uniqueness, concurrency arbitration | 서로 다른 요청끼리 같은 자원을 두고 경쟁하는 문제다 |\n| redirect를 넣었는데도 더블클릭 중복이 남음 | PRG vs duplicate suppression 분리 | 브라우저 새로고침 주소 정리와 저장소 dedup은 다른 층위다 |\n| duplicate key 예외가 났는데 기존 성공 결과를 다시 주고 싶음 | replay-safe response | 이미 끝난 같은 시도를 다시 읽어 응답하는 정책이 필요하다 |\n\n## 미션 PR 코멘트 패턴\n\n- \"`exists` 확인 후 `save`만으로는 같은 요청 재전송 경쟁을 닫지 못합니다.\"라는 코멘트는 읽고 판단하는 단계보다 먼저 저장소 선점이 필요하다는 뜻이다.\n- \"PRG를 넣어도 더블클릭과 timeout retry는 남습니다.\"라는 코멘트는 브라우저 흐름 정리와 중복 제출 방어를 분리해 설명하라는 뜻이다.\n- \"`request_id`나 idempotency key 없이 `memberId + date + timeId`만으로 같은 시도를 다 설명하려 하면 의도가 섞입니다.\"라는 코멘트는 비즈니스 슬롯 식별자와 요청 식별자를 구분하라는 의미다.\n- \"duplicate key를 그냥 `500`으로 끝내지 말고 이미 처리된 요청인지, 다른 요청과 충돌한 것인지 응답 의미를 나눠 보세요.\"라는 코멘트는 dedup 신호와 business conflict 신호를 같은 예외로 뭉개지 말라는 뜻이다.\n\n## 다음 학습\n\n- 멱등성 키 저장소와 replay 응답 패턴을 일반화해서 보려면 `멱등성 키와 중복 방지`를 읽는다.\n- 같은 슬롯을 서로 다른 요청이 다툴 때 어떤 제약이나 락을 고를지 보려면 `같은 시간대 예약 동시 요청 — 락 vs 유니크 제약 vs 낙관적 락 결정`으로 이어간다.\n- 브라우저 새로고침과 redirect 경계부터 다시 정리하려면 `roomescape 관리자 예약 생성 POST 뒤 목록 새로고침 ↔ Spring PRG(Post/Redirect/Get) 브릿지`를 함께 본다.\n- duplicate key를 `409`나 replay 응답으로 어떻게 번역할지 보려면 `roomescape 중복 예약 충돌 ↔ Spring SQLException 번역 브릿지`를 다음 문서로 잡는다.\n",
+  "aliases": [
+    "roomescape 관리자 예약 중복 제출",
+    "roomescape 예약 더블클릭 중복 생성",
+    "roomescape 예약 생성 재전송 한 번만 처리",
+    "룸이스케이프 예약 요청 멱등성",
+    "roomescape reservation idempotency"
+  ],
+  "expected_queries": [
+    "roomescape 관리자 예약 API에서 같은 생성 요청이 재전송돼도 예약을 한 번만 만들게 하려면 DB에서 뭘 둬야 해?",
+    "예약 추가 버튼 더블클릭 때문에 같은 요청이 두 번 들어올 때 PRG 말고 멱등성 키가 왜 따로 필요해?",
+    "roomescape에서 같은 사용자의 같은 예약 생성 시도를 replay-safe 하게 처리하라는 리뷰는 무슨 뜻이야?",
+    "응답 timeout 뒤 예약 생성 POST를 다시 보내도 기존 결과를 돌려주려면 어떤 identity를 저장해야 해?",
+    "roomescape 중복 제출과 서로 다른 두 사용자의 슬롯 경쟁은 왜 다른 문제로 읽어야 해?"
+  ],
+  "symptoms": [
+    "roomescape 관리자 예약 추가 버튼을 두 번 눌렀더니 같은 예약이 두 번 잡힐까 불안해요",
+    "응답이 늦어서 예약 생성 요청을 다시 보냈는데 같은 요청을 한 번만 인정하려면 어떻게 해야 하나요",
+    "리뷰에서 PRG만으로는 부족하고 멱등성 키를 따로 보라고 했는데 왜인지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/roomescape-admin-reservation-post-redirect-get-bridge",
+      "software-engineering/roomescape-validation-vs-domain-rule-bridge",
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "database/idempotency-key-and-deduplication",
+      "database/roomescape-reservation-concurrency-bridge",
+      "spring/roomescape-admin-reservation-post-redirect-get-bridge",
+      "spring/roomescape-duplicate-reservation-sqlexception-translation-bridge"
+    ],
+    "confusable_with": [
+      "database/idempotency-key-and-deduplication",
+      "database/roomescape-reservation-concurrency-bridge",
+      "spring/roomescape-admin-reservation-post-redirect-get-bridge",
+      "spring/roomescape-duplicate-reservation-sqlexception-translation-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/roomescape-admin-reservation-duplicate-submit-idempotency-bridge.md",
+    "revision_history": []
+  }
+}

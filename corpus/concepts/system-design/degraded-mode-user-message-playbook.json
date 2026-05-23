@@ -1,0 +1,45 @@
+{
+  "id": "system-design/degraded-mode-user-message-playbook",
+  "title": "Degraded Mode User Message Playbook",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 playbook은 degraded mode에서 사용자에게 stale data, read-only, retry later 상태를 어떻게 보여줄지 다룬다. 빈 화면 500, 최신값처럼 보이는 stale data, fallback UX 질문을 다룬다.",
+  "body_markdown": "# Degraded Mode User Message Playbook\n\n## 재현 조건\n\n일부 의존성이 느리거나 실패해도 전체 기능을 완전히 멈추지 않고 제한된 응답을 제공하려 한다. 이때 시스템 상태를 사용자에게 숨기면 사용자는 저장 여부, 최신성, 재시도 필요성을 오해한다.\n\ndegraded mode는 보안 우회가 아니다. 결제, 권한 변경, 개인정보 수정처럼 정확성과 권한 검증이 중요한 작업은 fallback이 있어도 제한하거나 멈출 수 있다.\n\n## 관찰 증거\n\n- 어떤 dependency가 실패했는지보다 사용자가 지금 볼 수 있는 데이터와 수행할 수 있는 행동을 먼저 적는다.\n- 표시 데이터의 watermark, cache age, 마지막 동기화 시각을 확인한다.\n- write 요청이 실제로 commit됐는지, queue에 들어갔는지, 거부됐는지 분리한다.\n- API status code, UI 문구, retry button, support trace id가 같은 상태를 말하는지 본다.\n- fallback path가 오래된 값을 최신값처럼 노출하거나, 실패한 저장을 성공처럼 말하지 않는지 확인한다.\n\n## 확인 순서\n\n1. 사용자가 지금 할 수 있는 행동과 할 수 없는 행동을 나눈다.\n2. 표시하는 데이터가 최신인지 stale인지 표현한다.\n3. 재시도 가능 시간, 저장 여부, 문의 필요 여부를 명확히 한다.\n4. 내부 장애 원인을 과하게 노출하지 않으면서 사용자 행동 기준으로 문구를 정한다.\n5. 같은 상태가 API, UI, 로그, 고객지원 도구에서 같은 이름으로 보이는지 확인한다.\n\n## 10초 분기\n\n| 상태 | 사용자 메시지 초점 | 피해야 할 표현 |\n|---|---|---|\n| stale cache로 read 가능 | \"마지막 업데이트 시각\"과 \"일부 정보가 늦을 수 있음\" | 최신 데이터처럼 단정 |\n| write 불가, read 가능 | \"현재 조회만 가능\"과 \"저장은 나중에 다시 시도\" | 저장된 것처럼 완료 표시 |\n| write를 queue에 접수 | \"접수됨\"과 \"처리 완료 전까지 반영 지연\" | 즉시 반영된 것처럼 표시 |\n| partial result | \"일부 결과만 표시\"와 누락 영역 | 전체 결과처럼 count/summary 표시 |\n| correctness 위험 | 기능 제한 또는 중단 | fallback이 있으니 계속 진행 |\n\n## 실패 원인 matrix\n\nRead-only mode, stale cache fallback, partial result는 모두 degraded mode지만 사용자 행동이 다르다. 메시지도 각각 달라야 한다.\n\nstale data는 읽기 최신성 문제다. read-only는 쓰기 수락 여부 문제다. queued write는 저장 완료가 아니라 접수 상태다. partial result는 결과 완전성 문제다.\n\n이 네 가지를 한 문구로 \"일시적 오류\"라고 묶으면 사용자는 무엇을 다시 해야 하는지 알 수 없다.\n\n## 보장 의미와 운영 의미\n\n사용자 보장 의미는 \"이 화면의 정보가 얼마나 믿을 만한가\", \"내 행동이 처리됐는가\", \"지금 다시 시도해야 하는가\"이다. 메시지는 이 세 질문에 답해야 한다.\n\n운영 의미는 dependency failure, queue backlog, cache age, retry storm 방지, incident traceability다. 내부 원인을 그대로 노출할 필요는 없지만, support trace id와 상태 이름은 운영자가 추적할 수 있어야 한다.\n\n보안 의미를 운영 편의와 섞으면 안 된다. 인증/권한 확인이 불확실한 상태에서는 degraded mode로 우회 허용하지 말고 제한하는 쪽이 안전하다.\n\n## 메시지 패턴\n\n- stale read: \"현재 일부 정보는 10:32 기준입니다. 새로고침은 가능하지만 최신 변경이 늦게 보일 수 있습니다.\"\n- read-only: \"지금은 조회만 가능합니다. 변경 사항 저장은 잠시 후 다시 시도해 주세요.\"\n- queued write: \"요청을 접수했습니다. 처리 완료 전까지 화면 반영이 지연될 수 있습니다.\"\n- partial result: \"일부 결과만 표시 중입니다. 누락된 항목은 복구 후 다시 표시됩니다.\"\n- stop for correctness: \"정확한 처리가 필요한 기능이라 잠시 중단했습니다. 잠시 후 다시 시도해 주세요.\"\n\n## 운영/테스트 검증\n\n장애 주입 테스트에서 화면 문구, status code, retry button, support trace id가 함께 나오는지 확인한다.\n\n테스트는 dependency timeout만 보지 말고 stale watermark, read-only toggle, queue backlog, retry storm, support trace lookup까지 확인한다. 특히 \"저장 실패인데 성공 toast가 뜨는지\"와 \"stale data인데 최신 배지처럼 보이는지\"를 화면 단위로 본다.\n\n## 흔한 오해\n\n- fallback이 있으면 사용자에게 말하지 않아도 된다고 생각하면 안 된다. 사용자 행동이 달라지면 상태를 보여줘야 한다.\n- stale data를 보여주는 것이 항상 안전한 것은 아니다. 잔액, 권한, 예약 가능 수량처럼 최신성이 안전성과 직결되는 값은 제한이 필요할 수 있다.\n- retry button만 붙이면 복구 UX가 된다고 보면 안 된다. 재시도하면 중복 처리되는 요청인지, idempotency key가 있는지도 봐야 한다.\n- 모든 장애를 500으로 보내면 간단하다고 생각하면 안 된다. partial/read-only/stale 상태를 구분하지 못해 운영과 고객지원이 어려워진다.\n\n## Safe Next Docs\n\nread-only와 graceful degradation 패턴 자체를 설계하려면 `system-design/read-only-and-graceful-degradation-patterns`로 이어서 본다.\n\nstale watermark와 fallback UX를 더 좁혀야 하면 `system-design/watermark-mismatch-fallback-ux-primer`로 이동한다.\n",
+  "aliases": [
+    "degraded mode user message playbook",
+    "graceful degradation user facing status",
+    "degraded mode 사용자 메시지",
+    "장애 시 사용자 안내"
+  ],
+  "expected_queries": [
+    "기능 일부가 느리거나 막혔을 때 사용자에게 어떤 메시지를 보여줘야 해?",
+    "degraded mode에서 stale data를 보여줘도 되는 기준은 뭐야?",
+    "장애 대응 UX를 시스템 설계에서 어떻게 같이 봐?"
+  ],
+  "symptoms": [
+    "장애 때 빈 화면이나 500만 보여줘요",
+    "stale data를 최신값처럼 보여줘요",
+    "fallback은 있는데 사용자에게 상태를 설명하지 않아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/read-only-and-graceful-degradation-patterns"
+    ],
+    "next_docs": [
+      "system-design/watermark-mismatch-fallback-ux-primer"
+    ],
+    "confusable_with": [
+      "system-design/watermark-mismatch-fallback-ux-primer",
+      "system-design/read-after-write-tradeoff-matrix-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/degraded-mode-user-message-playbook.md",
+    "revision_history": []
+  }
+}

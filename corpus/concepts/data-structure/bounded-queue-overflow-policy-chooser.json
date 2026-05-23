@@ -1,0 +1,45 @@
+{
+  "id": "data-structure/bounded-queue-overflow-policy-chooser",
+  "title": "Bounded Queue Overflow Policy Chooser",
+  "category": "data-structure",
+  "level": "intermediate",
+  "summary": "이 chooser는 bounded queue overflow 정책을 drop, block, reject, shed load 기준으로 고른다. 큐 무한 증가, timeout, backpressure, thread pool saturation 같은 질문을 다룬다.",
+  "body_markdown": "# Bounded Queue Overflow Policy Chooser\n\n## 10초 chooser\n\n| 정책 | 쓸 때 | 위험 |\n|---|---|---|\n| block | 생산자가 기다릴 수 있고 backpressure가 안전함 | upstream thread 고갈, event loop 정지 |\n| reject/fail fast | caller가 실패를 처리할 수 있음 | retry storm, 사용자 오류 증가 |\n| drop newest | 오래된 작업 보존이 중요함 | 최신 요청 손실 |\n| drop oldest | 최신성, telemetry, sampling이 중요함 | 아직 처리 안 된 중요한 작업 손실 |\n| coalesce/deduplicate | 같은 key의 최신 상태만 필요함 | 중간 이벤트 의미가 사라짐 |\n\n## 문제 선택 기준\n\nBounded queue 설계는 \"가득 찼을 때 무엇을 희생할지\"를 정하는 일이다. 손실이 절대 안 되는 결제/정산 이벤트라면 drop은 위험하고, block이나 reject 후 재시도/내구성 있는 저장소를 봐야 한다. 최신 상태만 중요하면 drop oldest나 key별 coalesce가 더 낫다.\n\nQueue size는 단순 용량이 아니라 장애를 얼마나 늦게 드러낼지 정하는 정책이다. 무한 큐는 일시적인 안정감 대신 메모리 OOM과 긴 tail latency를 만든다. bounded queue는 시스템이 포화됐다는 사실을 빠르게 드러내기 위한 장치다.\n\n## 핵심 invariant\n\nBounded queue invariant는 \"메모리 사용량이 capacity에 의해 제한되고, overflow 시 동작이 명시적이다\"이다. enqueue는 성공, 대기, 거절, drop 중 하나로 관찰 가능해야 한다. 조용히 버리면 데이터 손실을 운영 지표로도 발견하지 못한다.\n\n정책 invariant도 필요하다. block은 생산 속도를 소비 속도에 맞춘다. reject는 caller에게 즉시 실패를 돌려준다. drop oldest는 최신성을 보존하고, drop newest는 이미 대기 중인 작업을 보존한다. 이 보장이 도메인 요구와 맞아야 한다.\n\n## Wrong-bucket neighbor\n\nOverflow 정책만 고쳐서 처리량 부족이 해결되지는 않는다. consumer 처리 시간, downstream 병목, retry 정책을 같이 봐야 한다.\n\nQueue가 꽉 찼을 때 reject를 선택했는데 caller가 즉시 무한 retry하면 부하가 더 커진다. reject에는 retry budget, backoff, idempotency key 같은 주변 정책이 같이 필요하다.\n\n## 반례로 확인\n\ndrop oldest 반례: 결제 승인 이벤트 queue에서 오래된 이벤트를 버리면 장부가 맞지 않는다. 최신성보다 정확성이 중요한 domain에서는 drop 정책이 invariant를 깨뜨린다.\n\nblock 반례: 단일 event loop thread에서 enqueue가 block되면 consumer도 같은 loop에서 실행되지 못해 교착에 가까운 정지가 생길 수 있다. 기다릴 수 있는 producer인지 먼저 확인해야 한다.\n\nunbounded 반례: consumer가 초당 100개 처리하고 producer가 초당 1000개 넣으면 큐 길이는 계속 증가한다. 에러는 늦게 나타나지만, 그때는 이미 latency와 메모리가 회복하기 어려울 수 있다.\n\n## 복잡도\n\n일반 circular bounded queue의 enqueue/dequeue는 `O(1)`이고 메모리는 `O(capacity)`다. drop oldest/newest도 보통 `O(1)`이다. priority 기반 overflow나 key별 coalesce를 넣으면 heap/hash map 때문에 `O(log n)` 또는 `O(1)` 평균 비용이 추가될 수 있다.\n\n## 흔한 실수\n\n- \"나중에 처리하면 된다\"며 unbounded queue를 둔다.\n- drop을 silent로 처리해 손실 개수, drop reason, queue depth metric이 없다.\n- 중요한 이벤트와 샘플링 가능한 이벤트를 같은 queue policy에 넣는다.\n- block이 thread pool 전체를 붙잡아 consumer 실행 기회까지 줄인다.\n- reject 후 caller retry 정책을 설계하지 않아 retry storm을 만든다.\n- capacity를 throughput 계산 없이 감으로 잡고 saturation test를 하지 않는다.\n\n## 최소 drill\n\n1. 최신 주가 tick 처리와 결제 이벤트 처리에 각각 drop oldest, block, reject 중 어떤 정책이 맞는지 고른다.\n2. `producer=1000/s`, `consumer=100/s`이면 unbounded queue 길이가 10초 뒤 얼마나 늘어나는지 계산한다.\n3. reject 정책을 고를 때 caller 쪽에 반드시 있어야 할 retry/backoff 조건을 한 문장으로 적는다.\n\n## Safe Next Docs\n\nthread pool backpressure saturation playbook으로 운영 지표를 연결한다.\n",
+  "aliases": [
+    "bounded queue overflow policy chooser",
+    "drop block reject queue policy",
+    "bounded queue overflow 정책",
+    "큐가 꽉 찼을 때 선택"
+  ],
+  "expected_queries": [
+    "bounded queue가 꽉 차면 drop block reject 중 뭘 골라야 해?",
+    "큐 크기를 무한으로 두면 왜 위험해?",
+    "backpressure를 자료구조 정책으로 어떻게 표현해?"
+  ],
+  "symptoms": [
+    "큐가 계속 커져서 메모리가 터져요",
+    "오래된 작업을 처리하느라 최신 요청이 timeout돼요",
+    "drop 정책을 넣었는데 중요한 이벤트가 사라져요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/bounded-queue-policy-primer"
+    ],
+    "next_docs": [
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "confusable_with": [
+      "data-structure/bounded-queue-policy-primer",
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/bounded-queue-overflow-policy-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "database/booking-guard-row-retry-card",
+  "title": "Booking Guard Row Retry Card",
+  "category": "database",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Booking Guard Row Retry Card\n\n> 한 줄 요약: booking guard row 충돌은 모두 같은 처리로 묶지 말고, **줄이 짧아 곧 끝날 장면은 잠깐 기다리고**, **이미 긴 혼잡은 빠르게 실패시키고**, **deadlock이나 짧은 lock timeout 뒤 재분류가 쉬운 경우만 제한적으로 재시도**하는 편이 초보자에게 가장 안전하다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Guard Row Booking Timeline Card](./guard-row-booking-timeline-card.md)\n- [MySQL Booking Error Wording Card](./booking-error-language-card.md)\n- [`busy`는 언제 즉시 실패하고, 언제 한 번만 짧게 재시도할까?](./busy-fail-fast-vs-one-short-retry-card.md)\n- [Deadlock vs Lock Wait Timeout 입문 프라이머](./deadlock-vs-lock-wait-timeout-primer.md)\n- [Spring Service Layer Transaction Boundary Patterns](../spring/spring-service-layer-transaction-boundary-patterns.md)\n- [database 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: booking guard row retry card, guard row retry booking, booking lock timeout deadlock retry, guard row wait fail fast retry, booking busy retry basics, lock timeout after guard row what is, deadlock retry booking beginner, 언제 기다려요 guard row, 왜 바로 실패해요 booking, guard row timeout retry once, booking conflict primer, what is guard row retry, beginner booking lock wait, room type day guard retry, 처음 booking guard row 충돌\n\n## 핵심 개념\n\nguard row를 쓰는 booking 흐름에서는 `(room_type_id, stay_day)` 같은 대표 key 앞에 **한 줄 queue**가 생긴다.\n\n처음에는 이 queue를 지하철 개찰구처럼 떠올리면 쉽다.\n\n- 앞사람이 곧 지나가면 잠깐 기다릴 수 있다\n- 이미 줄이 길면 새 사람을 더 세우지 않는 편이 낫다\n- 서로 반대 방향으로 끼어들다 막힌 장면이면 다시 줄을 서게 해야 한다\n\n다만 이 비유는 여기까지만 맞다. DB lock은 \"줄\"만 있는 것이 아니라 **rollback, deadlock victim, transaction boundary**가 함께 붙는다. 그래서 \"기다린다\"와 \"재시도한다\"를 같은 뜻으로 섞으면 안 된다.\n\n초보자용 첫 구분은 이것이면 충분하다.\n\n- `wait`: DB 안에서 **짧은 lock wait budget**을 허용한다\n- `fail fast`: lock을 오래 못 잡으면 바로 `busy`로 끝낸다\n- `retry`: 실패 후 **새 transaction attempt**를 제한적으로 다시 시작한다\n\n## 한눈에 보기\n\n| 지금 보이는 장면 | 먼저 고를 기본값 | 이유 |\n|---|---|---|\n| 같은 `room_type_id + stay_day` 요청이 순간적으로 몰렸지만, 앞선 booking이 곧 commit될 가능성이 크다 | 짧게 `wait` | 승자가 거의 확정될 타이밍이면 한 번의 짧은 대기가 결과를 또렷하게 만들 수 있다 |\n| 인기 날짜 하나에서 `lock timeout`이 반복되고 p95/p99가 이미 길다 | `fail fast` | 더 오래 기다리게 두면 queue만 길어지고 패배 요청도 시스템 비용을 계속 먹는다 |\n| old day guard -> new day guard, new day guard -> old day guard처럼 순서가 엇갈려 `deadlock`이 났다 | bounded `retry` | 보통 이번 시도만 희생된 것이므로 새 transaction attempt는 의미가 있다 |\n| 결제 API 호출, 외부 메시지 발행처럼 transaction 안에 긴 외부 I/O가 있다 | `fail fast` 후 구조 수정 | 기다림이나 retry보다 transaction을 짧게 줄이는 것이 먼저다 |\n| 같은 멱등 booking 요청이 `lock timeout` 직후 한 번 더 보면 `sold out` 또는 기존 성공으로 재분류될 가능성이 높다 | `fail fast` 또는 `1회 짧은 retry` | retry 목표가 성공률 상승이 아니라 결과 재분류라면 제한적으로 허용할 수 있다 |\n\n짧게 외우면:\n\n- **곧 끝날 줄**이면 잠깐 기다린다\n- **이미 긴 줄**이면 빠르게 실패시킨다\n- **deadlock victim**이면 bounded retry를 검토한다\n\n## 잘못 고르기 쉬운 bucket 비교\n\n이 chooser에서 헷갈리는 세 bucket은 기다림(wait), 실패(fail-fast), 재시도(retry)다.\n\n| 상황 | wrong bucket | 맞는 bucket | 이유 |\n|---|---|---|---|\n| 같은 방/날짜 guard row가 이미 긴 queue | 계속 retry | 짧게 기다리거나 fail-fast | retry는 queue를 더 길게 만들 수 있다 |\n| deadlock(`40P01`/deadlock victim) | 사용자 conflict | 제한된 whole-transaction retry | 같은 입력이 영구 충돌이라는 뜻은 아니다 |\n| lock wait timeout | 예약됨(already booked) | busy 또는 짧은 retry | timeout은 결론을 못 본 상태다 |\n| exclusion/unique conflict | retryable | product conflict | DB가 invariant 위반을 확인한 상태다 |\n| top1 key concentration red | pool 증설 | striping/scope/fail-fast | 병목은 connection 수보다 hot guard key일 수 있다 |\n\nDB 보장은 이렇게 끊어 말한다. guard row lock은 같은 guard row를 먼저 잡는 writer끼리 순서를 세워 주지만, 긴 대기열을 사라지게 하지는 않는다. retry는 serialization failure나 deadlock victim처럼 \"이번 interleaving만 실패\"한 경우에만 의미가 크고, 이미 확인된 conflict를 성공으로 바꾸지는 않는다.\n\n## 언제 잠깐 기다릴까\n\n`wait`가 맞는 장면은 생각보다 좁다.\n\n아래 조건이 함께 보이면 beginner 기준으로 허용할 만하다.\n\n1. guard row holder가 짧은 transaction일 가능성이 크다\n2. 사용자 요청이 즉시 재시도보다 **이번 응답 안에서 결과가 나는 것**이 더 낫다\n3. lock timeout budget을 아주 짧게 둘 수 있다\n\n예를 들어 같은 `room_type_id + stay_day`를 두 요청이 거의 동시에 잡았고, 앞선 요청이 남은 재고 확인 후 곧 commit되는 장면이라면 20~80ms 정도의 짧은 wait budget은 설명 가능하다.\n\n하지만 \"기다림\"을 길게 잡는 것은 다른 이야기다.\n\n- 수백 ms~수 초 대기는 보통 사용자 latency와 DB queue를 같이 망친다\n- long wait는 `sold out` 판정이 아니라 단지 **줄에 더 오래 서 있는 것**이다\n\n즉 초보자 기본값은 \"길게 기다린다\"가 아니라 **아주 짧게만 기다린다**다.\n\n## 언제 바로 실패시키는 편이 낫나\n\nguard row booking에서 가장 흔한 기본값은 사실 `fail fast`다.\n\n특히 아래 장면이면 더 그렇다.\n\n- 같은 인기 날짜 key에서 이미 timeout이 반복된다\n- 예약 생성, 취소, 만료 worker, 운영자 보정이 모두 같은 guard key를 두드린다\n- blocker가 외부 I/O나 긴 business logic를 포함한다\n- 사용자가 새로고침/재시도로 요청을 더 쌓기 쉬운 화면이다\n\n이때는 \"조금만 더 기다리면 되지 않을까?\"보다 **패배 요청을 빨리 `busy`로 돌려보내는 편이 전체 queue를 덜 망친다**.\n\n예시:\n\n| 장면 | 더 안전한 첫 처리 |\n|---|---|\n| `2026-08-15` 성수기 하루에 `lock timeout`이 연속 발생 | 바로 `busy` 응답 후 짧은 backoff 또는 다른 날짜 유도 |\n| cancel worker가 오래 잡은 guard 때문에 create path가 밀림 | create path는 fail fast, worker transaction을 더 짧게 분리 |\n| p99가 이미 목표의 3배인데 요청을 계속 hold | wait 확대보다 fast-fail과 queue shape 수정이 우선 |\n\n## 언제 재시도할까\n\n재시도는 두 갈래를 분리해서 봐야 한다.\n\n### 1. `deadlock` 뒤 retry\n\n`deadlock`은 보통 **이번 transaction attempt만 희생**된 경우라서 bounded retry가 자연스럽다.\n\n다만 caveat가 있다.\n\n- retry는 보통 **transaction 전체**를 다시 시작해야 한다\n- retry 횟수는 1~2회 같은 bounded 범위가 보통이다\n- deadlock이 자주 반복되면 retry보다 **lock ordering 통일**이 먼저다\n\n즉 `deadlock`은 \"retry해도 된다\"보다 **\"retry만으로 끝내면 안 되고 ordering도 같이 봐야 한다\"**가 더 정확하다.\n\n### 2. `lock timeout` 뒤 retry\n\n`lock timeout`은 기본적으로 `busy` 쪽이다. 그래서 무조건 retry하지 않는다.\n\n다만 아래처럼 **결과 재분류**가 쉬운 장면이면 1회 짧은 retry가 가능하다.\n\n- 같은 멱등 booking 요청이다\n- 바로 앞 winner가 commit되면 `sold out`이나 기존 성공으로 읽힐 수 있다\n- retry가 긴 business flow 재실행이 아니라 짧은 fresh read 또는 재확인 수준이다\n\n반대로 아래면 retry보다 fail fast가 낫다.\n\n- hot key 자체가 계속 막힌다\n- 외부 결제/알림 호출이 transaction 안에 있다\n- retry 한 번이 사실상 전체 booking flow fan-out 재실행이다\n\n## 실무에서 쓰는 모습\n\n숙박 예약 경로를 예로 들자.\n\n- guard key: `(room_type_id, stay_day)`\n- 같은 guard 아래에서 남은 재고와 active hold를 다시 확인\n\n| 상황 | 해석 | 초보자 기본 선택 |\n|---|---|---|\n| 요청 A가 guard를 잡고 남은 1개 객실을 차감 중, 요청 B가 30ms 정도 뒤에 도착 | A가 곧 끝날 가능성이 크다 | 짧은 `wait` 가능 |\n| 요청 A/B/C가 같은 성수기 날짜에 몰려 B, C가 연속 `1205`를 받는다 | 이미 hot key queue가 길다 | `fail fast` |\n| 예약 변경이 old day -> new day 순서, 취소 복구가 new day -> old day 순서로 잠근다 | lock ordering이 엇갈린다 | `deadlock` 시 bounded `retry`, 이후 ordering 통일 |\n| `lock timeout` 뒤 같은 `idempotency_key`로 한 번 더 winner read를 해 보니 이미 성공 row가 있다 | retry가 결과 재분류를 도왔다 | `1회 짧은 retry` 또는 fresh read |\n\n여기서 중요한 점은 retry의 목적이다.\n\n- `deadlock` retry의 목적: **희생된 attempt를 새로 시작**\n- `lock timeout` 뒤 짧은 retry의 목적: **최종 상태를 더 정확히 읽기**\n\n둘을 같은 while-loop로 묶으면 초보자 코드가 금방 흐려진다.\n\n## 흔한 오해와 함정\n\n- \"`lock timeout`이면 그냥 더 오래 기다리면 된다\"\n  - 보통 아니다. 긴 wait는 hot key queue만 키우기 쉽다.\n- \"`deadlock`도 timeout 비슷하니 같은 정책이면 된다\"\n  - 아니다. deadlock은 whole-transaction retry 쪽 의미가 더 강하다.\n- \"`retry`는 많을수록 사용자 성공률에 좋다\"\n  - 아니다. booking guard row에서는 blind retry가 혼잡을 더 키울 수 있다.\n- \"guard row를 쓰면 timeout 뒤엔 항상 `sold out`으로 바뀐다\"\n  - 아니다. winner가 commit되기 전이면 아직 최종 상태가 없을 수 있다.\n- \"MySQL `1205`, `1213`, PostgreSQL `55P03`, `40P01`은 제품 문장도 항상 같다\"\n  - 아니다. 엔진 신호는 다를 수 있고, 실제 문장은 slot-row/guard-row/멱등성 경로를 함께 보고 정해야 한다.\n\n## 더 깊이 가려면\n\n- guard row 자체가 예약에서 왜 등장하는지 먼저 보려면 [Guard Row Booking Timeline Card](./guard-row-booking-timeline-card.md)\n- booking 에러 문장을 `1062` / `1205` / `1213` 기준으로 나누려면 [MySQL Booking Error Wording Card](./booking-error-language-card.md)\n- `busy`를 언제 fail-fast, 언제 1회 짧은 retry로 둘지 일반 규칙부터 보려면 [`busy`는 언제 즉시 실패하고, 언제 한 번만 짧게 재시도할까?](./busy-fail-fast-vs-one-short-retry-card.md)\n- `deadlock`과 `lock wait timeout` 차이를 더 또렷하게 잡으려면 [Deadlock vs Lock Wait Timeout 입문 프라이머](./deadlock-vs-lock-wait-timeout-primer.md)\n- retry를 transaction boundary 바깥에서 감싸는 이유를 Spring 코드로 보려면 [Spring Service Layer Transaction Boundary Patterns](../spring/spring-service-layer-transaction-boundary-patterns.md)\n\n## 한 줄 정리\n\nbooking guard row 충돌에서는 **짧게 끝날 줄만 잠깐 기다리고**, **이미 긴 혼잡은 빠르게 실패시키며**, **deadlock이나 결과 재분류가 쉬운 lock timeout 뒤에만 bounded retry**를 붙이는 편이 beginner 기본값으로 가장 안전하다.\n",
+  "aliases": [
+    "booking guard row retry card",
+    "guard row retry booking",
+    "booking lock timeout deadlock retry",
+    "guard row wait fail fast retry",
+    "booking busy retry basics",
+    "lock timeout after guard row",
+    "deadlock retry booking beginner",
+    "guard row timeout retry once",
+    "booking guard row 충돌",
+    "예약 guard row 재시도"
+  ],
+  "expected_queries": [
+    "booking guard row 충돌에서 언제 짧게 기다리고 언제 fail fast하고 언제 bounded retry를 해야 해?",
+    "MySQL 1205 lock timeout과 1213 deadlock은 guard row booking retry 정책에서 어떻게 다르게 봐야 해?",
+    "guard row hot key queue가 길 때 retry를 늘리기보다 busy로 빠르게 실패시키는 이유가 뭐야?",
+    "deadlock은 whole transaction retry가 맞고 lock timeout은 보통 busy인 기준을 예약 예시로 설명해줘",
+    "같은 room_type stay_day guard row를 잡는 booking 요청에서 wait, fail fast, retry를 나누는 beginner 표가 필요해"
+  ],
+  "symptoms": [
+    "guard row lock wait, fail fast, retry를 같은 while-loop 정책으로 묶어 hot key queue를 더 키운다",
+    "lock timeout과 deadlock을 같은 재시도 의미로 보고 transaction boundary 바깥 retry가 필요한지 구분하지 못한다",
+    "예약 guard row holder가 긴 외부 I/O를 포함하는데 wait budget이나 retry만 늘려 해결하려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/guard-row-booking-timeline-card",
+      "database/booking-error-language-card",
+      "database/deadlock-vs-lock-wait-timeout-primer"
+    ],
+    "next_docs": [
+      "database/busy-fail-fast-vs-one-short-retry-card",
+      "spring/service-layer-transaction-boundary-patterns",
+      "database/idempotent-transaction-retry-envelopes"
+    ],
+    "confusable_with": [
+      "database/booking-error-language-card",
+      "database/busy-fail-fast-vs-one-short-retry-card",
+      "database/deadlock-vs-lock-wait-timeout-primer",
+      "database/guard-row-booking-timeline-card"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/booking-guard-row-retry-card.md",
+    "revision_history": []
+  }
+}

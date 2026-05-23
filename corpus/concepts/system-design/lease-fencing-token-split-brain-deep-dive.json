@@ -1,0 +1,62 @@
+{
+  "id": "system-design/lease-fencing-token-split-brain-deep-dive",
+  "title": "Lease Fencing Token Split Brain Deep Dive",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 deep dive는 lease 기반 소유권이 split brain이나 pause 이후 stale owner write를 막지 못하는 이유와, monotonically increasing fencing token을 storage guard에서 검증해 오래된 write를 거절하는 설계를 설명한다.",
+  "body_markdown": "# Lease Fencing Token Split Brain Deep Dive\n\n> 한 줄 요약: lease는 \"누가 지금 owner라고 믿는가\"를 줄여 주지만, split brain이나 긴 pause 뒤의 stale write를 실제로 막는 장치는 storage가 검증하는 단조 증가 fencing token이다.\n\n## 이 문서가 다루는 경계\n\n이 문서는 distributed lock 사용법 자체가 아니라, lease owner가 낡았을 때 write를 어떻게 거절할지에 집중한다. DB lease, token propagation, stale renewal failure의 세부 구현은 관련 문서로 넘기고, 여기서는 시스템 설계 답변의 safety invariant만 잡는다.\n\n핵심 invariant는 단순하다.\n\n```text\nprotected resource는 지금까지 받아들인 fencing token보다 낮은 token의 write를 거절한다.\n```\n\n즉 lock service가 \"A가 owner\"라고 말하는 순간보다, 최종 저장소가 token을 비교하는 순간이 더 중요하다.\n\n## Lease가 시간에 기대는 부분\n\nLease는 보통 TTL이나 session timeout을 둔다. Owner가 죽으면 영원히 lock이 남지 않아야 하므로 timeout은 필요하다. 하지만 timeout은 correctness 증명이 아니라 failure detector다. GC pause, scheduler stop, network delay, clock skew 때문에 owner는 lease가 끝난 줄 모르고 계속 실행될 수 있다. 반대로 coordinator는 새 owner에게 lease를 넘겼을 수 있다.\n\n이때 두 process가 동시에 \"내가 owner\"라고 믿는 시간이 생긴다. 이것이 애플리케이션 수준의 split brain이다. Lease만 있으면 중복 실행 가능성을 줄일 뿐, 오래된 owner가 마지막에 DB나 외부 저장소를 덮어쓰는 것을 자동으로 막지 못한다.\n\n## Fencing token의 조건\n\nFencing token은 lease 획득이나 owner epoch 전환 때마다 증가하는 숫자다. 안전 조건은 세 가지다.\n\n1. token은 성공한 ownership epoch마다 단조 증가해야 한다.\n2. 모든 protected write는 token을 함께 전달해야 한다.\n3. storage 또는 resource server가 낮은 token을 거절해야 한다.\n\nRandom UUID, owner id, Redis lock value는 release 검증에는 쓸 수 있어도 fencing token은 아니다. 새 owner가 항상 더 큰 값을 받는다는 보장이 없기 때문이다. ZooKeeper의 sequential znode 번호나 etcd의 revision처럼 consensus-backed ordering이 있는 값, 또는 DB row/sequence를 원자적으로 증가시켜 발급한 값이 token 후보가 된다. 그 값이 acquisition epoch와 연결되고 write path가 검증해야만 fencing이다.\n\n## Split brain write timeline\n\n| 시점 | 사건 | token | storage 판단 |\n|---|---:|---:|---|\n| t1 | worker A가 lease 획득 | 41 | 아직 write 가능 |\n| t2 | A가 긴 pause 또는 network delay에 빠짐 | 41 | storage는 모름 |\n| t3 | lease 만료 후 worker B가 획득 | 42 | 이후 최신 token은 42 |\n| t4 | B가 결과 write | 42 | accept, last_token=42 |\n| t5 | A가 깨어나 늦은 write 전송 | 41 | reject stale token |\n\n여기서 A는 악의적이지 않다. 자기 메모리 안에서는 정상 owner였고 write 요청도 정상 코드 경로로 나간다. Safety는 A의 판단이 아니라 storage guard가 만든다.\n\n## Storage guard 패턴\n\nDB라면 가장 단순한 guard는 conditional update다.\n\n```sql\nUPDATE job_result\nSET status = :status,\n    payload = :payload,\n    last_fencing_token = :incoming_token\nWHERE job_id = :job_id\n  AND last_fencing_token <= :incoming_token;\n```\n\n이 문장은 낮은 token을 거절한다. 같은 token으로 여러 step을 쓰는 long-running job이면 `<=` 허용이 필요할 수 있고, 같은 token 재시도 중복은 `operation_id` unique key나 idempotency key로 따로 닫아야 한다. Owner 전환 row라면 `WHERE current_token < :incoming_token`처럼 더 큰 token만 허용할 수 있다. 비교 연산은 업무 의미에 맞추되, stale token이 통과하면 안 된다는 규칙은 변하지 않는다.\n\netcd 같은 coordination store를 쓴다면 transaction compare로 revision/version을 확인하고 갱신한다. ZooKeeper recipe를 쓴다면 ephemeral sequential node로 순서를 만들 수 있다. 그러나 S3, 결제 provider, 외부 API처럼 token 비교를 지원하지 않는 resource에는 중간 adapter DB, outbox/ledger, provider idempotency key, reconciliation이 필요하다. \"token을 발급했다\"만으로 외부 side effect가 안전해지지 않는다.\n\n## 면접에서 자주 나오는 오해\n\n- \"lease TTL을 충분히 짧게 잡으면 안전하다\": 짧은 TTL은 복구를 빠르게 하지만 pause와 지연을 없애지 못한다. 오탐 takeover도 늘 수 있다.\n- \"write 직전에 expiry를 다시 확인하면 된다\": 확인 직후 pause되거나 request가 network에서 늦어질 수 있다.\n- \"lock owner id가 다르면 막을 수 있다\": owner id는 최신성 순서를 표현하지 못한다.\n- \"leader가 살아 있으니 write해도 된다\": quorum이나 coordinator 관점의 ownership이 사라졌다면 stale leader일 수 있다.\n- \"token은 로그에만 남기면 된다\": 로그는 분석에 좋지만, storage가 비교하지 않으면 방어선이 아니다.\n\n## 설계 답변 템플릿\n\n1. Lease는 liveness를 위한 timeout 기반 ownership이고, time assumption 때문에 stale owner가 생길 수 있다고 말한다.\n2. Ownership마다 단조 증가 fencing token을 발급한다고 말한다.\n3. 모든 write에 token을 포함하고, 최종 storage가 `incoming_token < last_seen_token`을 거절한다고 말한다.\n4. 같은 token 재시도는 idempotency key나 unique constraint로 따로 닫는다고 말한다.\n5. External side effect가 token check를 못 하면 adapter, outbox, reconciliation이 필요하다고 말한다.\n\n## 운영 신호\n\n- `fencing_token_issued_total`: owner epoch 발급 수.\n- `stale_token_rejected_total`: 낮은 token write 거절 수.\n- `lease_expired_owner_write_attempt_total`: lease lost 이후 write 시도.\n- `storage_guard_missing_path_count`: token 검증 없이 write 가능한 경로 수.\n\n## Source-aware references\n\n- [Martin Kleppmann, How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)는 stale write와 fencing token guard의 failure mode를 설명한다.\n- [ZooKeeper Recipes and Solutions](https://zookeeper.apache.org/doc/current/recipes.html)는 ephemeral sequential znode 기반 lock과 leader election recipe를 설명한다.\n- [etcd API documentation](https://etcd.io/docs/v3.7/learning/api/)는 revision metadata와 transaction compare를 설명한다.\n\n## 다음 학습\n\nDB를 coordinator로 쓰는 구체적 lease schema는 [DB Lease와 Fencing Token](../database/db-lease-fencing-coordination.md)을 보고, token이 API와 message 경계에서 빠지는 문제는 [Application-Level Fencing Token Propagation](../database/application-level-fencing-token-propagation.md)으로 이어가면 된다.\n",
+  "aliases": [
+    "lease fencing token",
+    "fencing token",
+    "stale owner",
+    "stale leader write",
+    "split brain write rejection",
+    "monotonically increasing token",
+    "storage guard",
+    "lease expiry",
+    "lease fencing",
+    "write fence",
+    "storage compare and set",
+    "epoch fencing"
+  ],
+  "expected_queries": [
+    "lease 기반 lock에서 stale owner write를 fencing token과 storage guard로 어떻게 거절해?",
+    "split brain 상황에서 old leader가 늦게 보낸 write를 단조 증가 token으로 막는 원리를 설명해줘",
+    "fencing token이 random owner token이나 lock value와 다른 이유가 뭐야?",
+    "storage compare-and-set guard가 없으면 lease fencing이 왜 안전하지 않아?",
+    "ZooKeeper sequential node나 etcd revision 같은 값을 fencing token으로 볼 때 어떤 조건을 확인해야 해?"
+  ],
+  "symptoms": [
+    "lease를 잡은 worker가 오래 멈췄다가 돌아와도 여전히 안전하게 write할 수 있다고 생각한다",
+    "random lock value나 owner id를 fencing token처럼 말하지만 단조 증가 조건을 빠뜨린다",
+    "storage가 token을 비교하지 않는데도 lock service만으로 stale write가 막힌다고 설명한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/distributed-lock-interview-drill",
+      "database/db-lease-fencing-coordination",
+      "database/compare-and-set-version-columns"
+    ],
+    "next_docs": [
+      "database/application-level-fencing-token-propagation",
+      "database/stale-lease-renewal-failure-fencing",
+      "database/primary-switch-write-fencing"
+    ],
+    "confusable_with": [
+      "system-design/distributed-lock-interview-drill",
+      "database/db-lease-fencing-coordination",
+      "database/application-level-fencing-token-propagation",
+      "database/replication-failover-split-brain",
+      "database/compare-and-set-version-columns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/lease-fencing-token-split-brain-deep-dive.md",
+    "revision_history": []
+  }
+}

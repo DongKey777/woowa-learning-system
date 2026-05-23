@@ -1,0 +1,53 @@
+{
+  "id": "operating-system/page-fault-minor-major-observability-primer",
+  "title": "Page Fault Minor Major Observability Primer",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Page Fault Minor/Major Observability Primer\n\n> 한 줄 요약: minor/major page fault는 \"얼마나 심각한가\"보다 \"디스크에서 페이지를 새로 읽어야 했는가\"를 먼저 가르는 관측 축이고, RSS, page cache, `mmap()`, `vmstat`, `perf`, `top`을 함께 봐야 한다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md)\n> - [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n> - [mmap vs read, Page Cache Behavior](./mmap-vs-read-page-cache-behavior.md)\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n> - [vmstat Counters, Runtime Pressure](./vmstat-counters-runtime-pressure.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n\n> retrieval-anchor-keywords: minor page fault, major page fault, pgfault, pgmajfault, page fault observability, mmap page cache fault, file-backed page fault, anonymous page fault, RSS page fault, smaps_rollup RSS, perf stat minor-faults major-faults, top nMin nMaj caveat, vmstat page fault caveat, mincore residency, page cache miss major fault, COW minor fault, copy-on-write page fault\n\n## 먼저 잡는 멘탈 모델\n\npage fault는 CPU가 접근한 가상 주소를 지금 바로 처리할 수 없어서 커널 경로로 들어간 사건이다. 여기서 중요한 1차 분기는 이렇다.\n\n- `minor fault`: 디스크에서 페이지를 새로 읽지 않고 처리되는 fault다\n- `major fault`: 필요한 페이지를 디스크에서 읽어 와야 하는 fault다\n\n따라서 minor는 \"무조건 싸다\", major는 \"무조건 swap이다\"가 아니다.\n\n- anonymous memory 첫 touch는 대개 minor fault다\n- `fork()` 이후 copy-on-write 첫 write도 대개 minor fault 쪽이다\n- file-backed `mmap()` 접근은 page cache에 이미 있으면 minor, 없어서 storage read가 필요하면 major다\n- swap-in은 major fault의 대표 원인이지만 major fault 전체가 swap만 뜻하지는 않는다\n\n## mmap, page cache, RSS를 같이 봐야 하는 이유\n\n`mmap()`은 파일 내용을 호출 시점에 전부 읽어 오는 API가 아니다. 주소 공간에 mapping을 만들고, 실제 페이지 준비는 접근 시점의 fault로 드러난다.\n\n```text\nmmap(file)\n  -> VMA 생성\n  -> 아직 모든 페이지가 RSS에 들어온 것은 아님\n  -> 첫 접근\n     -> page cache hit: minor fault\n     -> page cache miss: major fault + storage read\n```\n\nRSS는 \"지금 resident한 물리 페이지\"에 더 가깝다. 그래서 다음을 구분해야 한다.\n\n- `VmSize`가 크다: 주소 공간 예약이나 mapping이 크다는 뜻일 수 있다\n- `VmRSS`가 늘었다: 실제 resident page가 늘었다는 뜻에 가깝다\n- minor fault가 늘었다: RSS가 늘거나 page table/COW가 진행됐지만 디스크 read가 없을 수 있다\n- major fault가 늘었다: file-backed page cache miss나 swap-in 같은 storage wait 가능성이 커진다\n\n단, `/proc/<pid>/stat`의 RSS 필드는 man page도 부정확할 수 있다고 밝히므로, 원인 분석에는 `/proc/<pid>/smaps_rollup`과 mapping 구성을 같이 본다.\n\n## 관측 도구별로 무엇이 다르게 보이나\n\n| 도구/파일 | 무엇을 본다 | caveat |\n|------|------|------|\n| `/proc/<pid>/stat` | process 누적 `minflt`, `majflt`, RSS page 수 | 누적값이다. interval delta로 봐야 하고 RSS 필드는 근사로 본다 |\n| `/proc/vmstat` | system-wide `pgfault`, `pgmajfault`, reclaim/writeback 관련 counter | 전체 시스템 누적값이라 특정 process 원인으로 바로 단정하지 않는다 |\n| `perf stat -e minor-faults,major-faults` | 지정 process/command의 fault event delta | perf 권한, container perf policy, sampling 대상 범위를 확인한다 |\n| `top` | refresh 주기마다 process 상태와 fault 관련 컬럼을 빠르게 훑는다 | UI 도구라 짧은 spike와 원인 경로를 숨길 수 있다. 최종 근거로 쓰지 않는다 |\n| `vmstat 1` | `si/so`, `bi/bo`, `r/b`, CPU `wa`와 함께 압력 방향을 본다 | page fault 자체보다 swap/I/O/block wait의 동반 신호를 보는 도구다 |\n| `mincore()` | 특정 mapping page가 resident인지 본다 | resident 여부 힌트이지 COW, permission, future reclaim까지 보장하지 않는다 |\n\n## 빠른 분기표\n\n| 관찰 | 가까운 해석 | 다음 확인 |\n|------|------|------|\n| minor fault가 많고 `bi/bo`, `pgmajfault`는 조용하다 | zero-fill, page table setup, COW, page cache hit | `smaps_rollup`, fork/write path, allocation first-touch |\n| major fault와 block read가 같이 오른다 | file-backed page cache miss 가능성 | `iostat`, `pidstat -d`, mapping path, readahead |\n| major fault와 `si`가 같이 오른다 | swap-in 가능성 | `/proc/vmstat`의 `pswpin`, cgroup memory pressure, reclaim |\n| RSS가 계속 오르지만 major fault는 낮다 | anonymous first-touch 또는 COW로 resident set 증가 | `Anon`, `Private_Dirty`, allocation path |\n| load average와 `b`가 오르고 fault도 같이 뛴다 | fault 자체보다 reclaim/I/O stall이 사용자 지연으로 보일 수 있음 | PSI memory/io, `pgscan*`, `pgsteal*`, direct reclaim |\n\n## 실전 확인 순서\n\n### 1. process fault delta를 본다\n\n```bash\nperf stat -p <pid> -e minor-faults,major-faults,page-faults -- sleep 30\n```\n\n`page-faults` 총합만 보면 minor 중심인지 major 중심인지 숨겨진다. 반드시 minor/major를 분리한다.\n\n### 2. system-wide counter를 같은 시간축에 놓는다\n\n```bash\ngrep -E 'pgfault|pgmajfault|pswpin|pswpout|pgscan|pgsteal' /proc/vmstat\nvmstat 1\n```\n\n`/proc/vmstat`은 누적 counter이므로 한 번 찍은 절대값보다 전후 delta가 중요하다.\n\n### 3. RSS와 mapping을 확인한다\n\n```bash\ncat /proc/<pid>/status | grep -E 'VmRSS|VmSize|RssAnon|RssFile|RssShmem'\ncat /proc/<pid>/smaps_rollup | grep -E 'Rss|Pss|Shared_Clean|Private_Dirty|Anonymous'\n```\n\nfile-backed RSS가 늘었는지, anonymous/private dirty가 늘었는지, shared clean page가 늘었는지를 나눠야 한다.\n\n### 4. mmap/page cache 경로를 의심할 때\n\n```bash\ncat /proc/<pid>/maps\ngrep -E 'Cached|Dirty|Writeback' /proc/meminfo\n```\n\n큰 file mapping, random access, page cache eviction이 같이 보이면 [mmap vs read, Page Cache Behavior](./mmap-vs-read-page-cache-behavior.md)로 내려간다.\n\n## 흔한 오해\n\n### minor fault가 많으면 장애인가?\n\n아니다. lazy allocation, COW, page table setup처럼 정상 경로일 수 있다. 다만 요청 경로에서 너무 많이 반복되면 CPU time, lock, TLB/cache miss와 합쳐져 p99를 만들 수 있다.\n\n### major fault는 swap-in만 뜻하나?\n\n아니다. file-backed page가 page cache에 없어서 disk에서 읽히는 경우도 major fault다. swap 여부는 `si/so`, `pswpin/pswpout`, cgroup memory pressure를 같이 봐야 한다.\n\n### RSS가 낮으면 fault 문제가 없나?\n\n아니다. 아직 demand-loaded되지 않은 mapping이 많을 수 있고, 첫 요청이나 특정 access pattern에서 fault가 몰릴 수 있다. 반대로 RSS가 높아도 이미 resident라 fault가 낮을 수 있다.\n\n### `top`에 보이는 fault 숫자만 보면 충분한가?\n\n아니다. `top`은 빠른 힌트다. 최종 판단은 `perf stat`, `/proc/<pid>/stat`, `/proc/vmstat`, RSS/mapping, I/O 지표를 같은 interval로 맞춰서 한다.\n\n## 다음 문서로 넘기는 기준\n\n- page fault 자체의 runtime 진단이 필요하면 [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n- `mmap()` 전환, random access, page cache hit/miss가 중심이면 [mmap vs read, Page Cache Behavior](./mmap-vs-read-page-cache-behavior.md)\n- fault보다 reclaim stall이 중심이면 [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n- page cache writeback과 fsync가 중심이면 [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n\n## 한 줄 정리\n\nminor/major page fault는 fault의 \"이름\"보다 경로를 나누는 관측 축이다. RSS, `mmap()`, page cache, `/proc/vmstat`, `perf`, `top`을 같은 시간축에 놓아야 디스크 I/O, COW, lazy allocation, reclaim을 구분할 수 있다.\n",
+  "aliases": [
+    "page fault minor major observability",
+    "minor vs major page fault primer",
+    "page fault RSS mmap page cache",
+    "pgfault pgmajfault",
+    "perf minor-faults major-faults",
+    "top page fault caveat"
+  ],
+  "expected_queries": [
+    "minor page fault와 major page fault를 관측 지표 기준으로 구분해줘",
+    "mmap과 page cache 때문에 page fault가 어떻게 보이는지 설명해줘",
+    "RSS, pgfault, pgmajfault를 같이 볼 때 어떤 caveat가 있어?",
+    "perf stat, vmstat, top에서 page fault 숫자가 다르게 보이는 이유는?",
+    "page fault가 많을 때 디스크 I/O인지 COW인지 page table setup인지 어떻게 나눠?"
+  ],
+  "symptoms": [
+    "minor fault와 major fault를 단순히 심각도 차이로만 외우고 있어요",
+    "mmap으로 바꿨는데 page cache와 page fault가 어떻게 보이는지 헷갈려요",
+    "RSS가 늘었는데 이게 실제 디스크 I/O인지 resident set 변화인지 구분이 안 돼요",
+    "vmstat, perf, top에서 page fault 숫자를 어떻게 서로 맞춰 봐야 할지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/demand-paging-page-fault-primer"
+    ],
+    "next_docs": [
+      "operating-system/major-minor-page-faults-runtime-diagnostics",
+      "operating-system/mmap-vs-read-page-cache-behavior",
+      "operating-system/kswapd-vs-direct-reclaim-latency"
+    ],
+    "confusable_with": [
+      "operating-system/demand-paging-page-fault-primer",
+      "operating-system/major-minor-page-faults-runtime-diagnostics",
+      "operating-system/page-cache-dirty-writeback-fsync"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/page-fault-minor-major-observability-primer.md",
+    "revision_history": []
+  }
+}

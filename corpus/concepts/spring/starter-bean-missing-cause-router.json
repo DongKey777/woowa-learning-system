@@ -1,0 +1,58 @@
+{
+  "id": "spring/starter-bean-missing-cause-router",
+  "title": "Starter 넣었는데 Bean이 안 떠요 원인 라우터",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "'이 문서는 Spring Boot에서 \"starter를 넣었는데 bean이 안 떠요\",",
+  "body_markdown": "# Starter 넣었는데 Bean이 안 떠요 원인 라우터\n\n## 한 줄 요약\n\n> starter 추가는 \"auto-configuration 후보를 올렸다\"에 가깝고, 실제 Bean 생성은 dependency classpath, 조건 평가, scan/import 경계, `@ConfigurationProperties` binding, 기존 Bean back-off, test slice 경계가 모두 맞아야 일어난다.\n\n## 가능한 원인\n\n1. **dependency가 실제 runtime/test classpath에 없다.** `build.gradle`이나 `pom.xml`에는 starter가 보이지만 scope, optional, exclusion, testRuntime 누락 때문에 auto-configuration이 요구하는 class가 현재 실행 classpath에 없을 수 있다. 이 갈래는 [Spring `@ConditionalOnClass` classpath 함정 입문](./spring-conditionalonclass-classpath-scope-optional-test-slice-primer.md)으로 이어진다.\n2. **auto-configuration 조건이 맞지 않는다.** 필요한 class는 있지만 `@ConditionalOnProperty`, `@ConditionalOnWebApplication`, `@ConditionalOnBean`, active profile, property value가 맞지 않으면 negative match가 정상이다. 이때는 [Spring Boot Condition Evaluation Report 첫 디버그 체크리스트](./spring-boot-condition-evaluation-report-first-debug-checklist.md)로 condition 문구를 먼저 읽는다.\n3. **package scan 또는 import 경계 밖에 있다.** starter가 외부 auto-configuration을 켜는 것과 내 앱의 `@Configuration`, `@Component`, shared module bean을 scan하는 것은 별개다. `@SpringBootApplication` 기준 package 밖, `scanBasePackages` 누락, `@Import` 누락이면 starter 문제처럼 보여도 실제로는 scan/import 문제다. 이 경우 [Spring Component Scan 실패 패턴](./spring-component-scan-failure-patterns.md)으로 분기한다.\n4. **`@ConfigurationProperties`가 bind/register되지 않았다.** starter bean이 property object를 필요로 하는데 `@ConfigurationPropertiesScan`, `@EnableConfigurationProperties`, prefix, relaxed binding, validation classpath가 빠지면 Bean 생성 조건이나 binding 단계에서 빠질 수 있다. 이 갈래는 [Spring Boot `@ConfigurationProperties` Binding and Validation Playbook](./spring-boot-configuration-properties-binding-validation-playbook.md)을 본다.\n5. **내가 만든 Bean이 기본 Bean을 정상적으로 back-off시켰다.** `ObjectMapper`, `WebClient.Builder`, `DataSource`, `Clock`처럼 같은 역할 Bean을 직접 등록하면 Boot 기본값은 `@ConditionalOnMissingBean` 때문에 물러날 수 있다. 이런 장면은 [Spring `@ConditionalOnMissingBean` vs `@Primary` 오해 분리](./spring-conditionalonmissingbean-vs-primary-primer.md)에서 \"생성 실패\"가 아니라 \"기본값 철수\"로 읽어야 한다.\n6. **test slice를 full runtime으로 착각했다.** `@WebMvcTest`, `@DataJpaTest`, `@JsonTest`는 의도적으로 일부 auto-configuration과 component만 로드한다. 로컬 앱은 되는데 slice test나 CI에서만 Bean이 없으면 [Spring Test Slice Scan Boundary 오해](./spring-test-slice-scan-boundaries.md)를 먼저 본다.\n\n## 증거로 나누는 1차 분기표\n\n| 관찰 증거 | 더 가능성 높은 갈래 | 바로 할 다음 확인 |\n|---|---|---|\n| condition report에 `did not find required class` | dependency/classpath 누락 | runtimeClasspath/testRuntimeClasspath, exclusions, optional/provided scope |\n| report에 `@ConditionalOnProperty did not match` | property/profile 조건 불일치 | active profile, env var 이름, `havingValue`, `matchIfMissing` |\n| report에 `not a web application` 또는 web type 조건 실패 | auto-config 조건 불일치 | servlet/reactive dependency, test slice web environment |\n| auto-config는 positive인데 내 `@Configuration`/`@Component`만 없음 | package scan/import 경계 | main application package, `scanBasePackages`, `@Import` |\n| property object 값이 `null`이거나 validation이 안 걸림 | `@ConfigurationProperties` binding/registration | scan/enable properties, prefix, validation starter, relaxed binding |\n| report에 `@ConditionalOnMissingBean` miss, `found bean` | conditional back-off | 직접 만든 `@Bean`, test config, 다른 starter의 같은 타입 bean |\n| full app은 되는데 `@WebMvcTest`에서만 없음 | test slice 경계 | slice가 포함하는 auto-config, `@Import`, `@MockBean`, `@TestConfiguration` |\n\n## 빠른 자기 진단\n\n1. 먼저 `--debug` 또는 Actuator `conditions`로 target auto-configuration이 positive인지 negative인지 확인한다.\n2. `did not find required class`가 보이면 property보다 classpath 갈래를 먼저 본다. 특히 test에서만 실패하면 test classpath를 따로 확인한다.\n3. 환경마다 결과가 달라지고 report에 property 조건 문구가 보이면 env/profile 차이를 먼저 비교한다.\n4. auto-configuration은 positive인데 내 설정 클래스만 안 보이면 starter보다 package scan/import 경계를 본다.\n5. `@ConfigurationProperties`가 관여한다면 Bean 등록, prefix, relaxed binding, validation starter 유무를 따로 확인한다.\n6. 최근에 같은 타입의 `@Bean`을 직접 추가했다면 \"왜 안 생기지?\"보다 \"내 Bean 때문에 기본값이 물러났나?\"를 먼저 묻는다.\n7. 앱 실행은 되는데 특정 slice test에서만 Bean이 없으면 starter 자체 고장보다 테스트가 어떤 auto-configuration을 로드하는지 확인한다.\n8. Bean 자체가 아예 안 보이는지, 아니면 여러 개가 떠서 주입이 모호한지부터 나누면 `bean not found`와 `ambiguous bean`을 섞어 읽는 실수를 줄일 수 있다.\n\n## wrong bucket: 이렇게 묶으면 진단이 늦어진다\n\n| 잘못 묶은 표현 | 왜 위험한가 | 더 나은 분류 |\n|---|---|---|\n| \"starter 넣었으니 dependency 문제는 아니다\" | starter와 실제 runtime/test classpath는 다를 수 있다 | dependency present vs class actually loaded |\n| \"negative match면 Boot가 고장났다\" | 조건 불일치는 정상적인 자동 구성 동작이다 | 어떤 condition이 false인지 읽기 |\n| \"내 package scan 문제도 starter가 해결해 준다\" | auto-configuration 후보와 application component scan은 다른 경로다 | auto-config vs component scan 분리 |\n| \"`@ConfigurationProperties` 값이 null이니 Bean이 없다\" | Bean은 있지만 binding이 실패했거나 등록 경로가 다를 수 있다 | registration, prefix, binding, validation 분리 |\n| \"`@Primary`를 붙이면 기본 Bean이 다시 생긴다\" | `@Primary`는 주입 선택 규칙이지 `@ConditionalOnMissingBean` back-off를 되돌리지 않는다 | back-off와 ambiguous injection 분리 |\n| \"`@WebMvcTest`에서 없으니 운영도 없다\" | slice test는 full context가 아니다 | slice boundary와 runtime context 분리 |\n\n## 다음 확인 질문\n\n1. target auto-configuration class는 condition report에 positive인가, negative인가?\n2. negative라면 첫 실패 condition은 classpath, property, web type, bean presence 중 무엇인가?\n3. 그 class는 `runtimeClasspath`와 실패한 테스트의 `testRuntimeClasspath` 모두에 있는가?\n4. 기대한 Bean이 Boot auto-configuration Bean인가, 내 package의 `@Component`/`@Configuration` Bean인가?\n5. `@ConfigurationProperties`가 있다면 properties class가 등록됐고 prefix가 실제 key와 일치하는가?\n6. 같은 타입 또는 같은 이름의 사용자 Bean, test config Bean, 다른 starter Bean이 먼저 등록됐는가?\n7. 실패가 full `@SpringBootTest`에서도 재현되는가, 특정 slice annotation에서만 재현되는가?\n8. 예외가 `NoSuchBeanDefinitionException`인가, `NoUniqueBeanDefinitionException`인가, 아니면 binding/validation failure인가?\n\n## 다음 학습\n\n- 실제 첫 디버그 순서를 짧게 잡으려면 [Spring Boot Condition Evaluation Report 첫 디버그 체크리스트](./spring-boot-condition-evaluation-report-first-debug-checklist.md)로 간다.\n- starter와 classpath 관계가 헷갈리면 [Spring `@ConditionalOnClass` classpath 함정 입문](./spring-conditionalonclass-classpath-scope-optional-test-slice-primer.md)을 바로 잇는다.\n- property가 환경마다 다르게 먹는 장면이면 [Spring `@ConditionalOnProperty` 기본값 함정](./spring-conditionalonproperty-havingvalue-matchifmissing-pitfalls-primer.md)을 본다.\n- `@ConfigurationProperties` 등록, prefix, validation, relaxed binding이 의심되면 [Spring Boot `@ConfigurationProperties` Binding and Validation Playbook](./spring-boot-configuration-properties-binding-validation-playbook.md)을 본다.\n- starter 문제가 아니라 내 package scan/import 문제 같으면 [Spring Component Scan 실패 패턴](./spring-component-scan-failure-patterns.md)과 [Spring `scanBasePackages` vs `@Import` vs Boot Auto-configuration 선택 기준](./spring-scanbasepackages-vs-import-autoconfiguration-selection.md)을 본다.\n- slice test에서만 안 보이면 [Spring Test Slice Scan Boundary 오해](./spring-test-slice-scan-boundaries.md)로 이동한다.\n- 기본 Bean이 물러난 상황과 주입 우선순위를 구분하려면 [Spring `@ConditionalOnMissingBean` vs `@Primary` 오해 분리](./spring-conditionalonmissingbean-vs-primary-primer.md)로 이동한다.\n- 더 넓은 beginner FAQ 흐름이 필요하면 [Spring Starter 넣었는데 Bean이 안 뜰 때 FAQ](./spring-starter-added-but-bean-missing-faq.md)를 이어서 읽는다.\n",
+  "aliases": [
+    "starter 넣었는데 bean 안 뜸",
+    "spring starter bean missing",
+    "starter 추가했는데 bean 없음",
+    "auto configuration bean 안 생김",
+    "starter 넣었는데 빈 등록 안 됨",
+    "starter bean not created",
+    "@Bean",
+    "@Component",
+    "@Conditional"
+  ],
+  "expected_queries": [
+    "Spring Boot에서 starter를 넣었는데 왜 기본 Bean이 안 만들어져?",
+    "starter dependency는 추가했는데 특정 환경에서만 auto-configuration이 빠질 때 어디부터 봐야 해?",
+    "condition report에 negative match가 보이면 classpath 문제인지 property 문제인지 어떻게 나눠?",
+    "ObjectMapper를 조금 건드린 뒤 starter 기본 Bean이 사라진 것처럼 보일 때 먼저 무엇을 의심해?",
+    "@WebMvcTest나 CI에서만 starter Bean이 없으면 scan 문제랑 자동 구성 조건을 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "starter를 추가했는데 기대한 Bean이 생성되지 않아요",
+    "로컬에서는 되는데 test나 prod에서만 starter 기본 Bean이 안 보여요",
+    "ObjectMapper나 WebClient Builder 기본 Bean이 갑자기 사라진 것 같아요",
+    "starter dependency는 있는데 condition report를 보면 auto-configuration이 negative match예요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/boot-autoconfiguration-basics"
+    ],
+    "next_docs": [
+      "spring/boot-condition-evaluation-report-first-debug-checklist",
+      "spring/conditionalonclass-classpath-scope-optional-test-slice-primer",
+      "spring/conditionalonproperty-havingvalue-matchifmissing-pitfalls-primer",
+      "spring/spring-conditionalonmissingbean-vs-primary-primer"
+    ],
+    "confusable_with": [
+      "spring/bean-not-found-cause-router",
+      "spring/bean-registration-path-decision-guide",
+      "spring/spring-conditionalonmissingbean-vs-primary-primer",
+      "spring/config-value-not-changing-cause-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-starter-bean-missing-cause-router.md",
+    "revision_history": []
+  }
+}

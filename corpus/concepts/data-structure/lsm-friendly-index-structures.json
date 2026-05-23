@@ -1,0 +1,57 @@
+{
+  "id": "data-structure/lsm-friendly-index-structures",
+  "title": "LSM-Friendly Index Structures",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 LSM 계열 저장소에서 하나의 index가 아니라 memtable, SSTable",
+  "body_markdown": "# LSM-Friendly Index Structures\n\n> 한 줄 요약: LSM 계열 저장소는 하나의 거대한 트리보다 memtable, sparse block index, fence pointer, Bloom filter 같은 작은 구조를 조합해 write path와 read path를 나눈다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Skip List](./skip-list.md)\n> - [Bloom Filter](./bloom-filter.md)\n> - [Finite State Transducer](./finite-state-transducer.md)\n> - [Adaptive Radix Tree](./adaptive-radix-tree.md)\n\n> retrieval-anchor-keywords: lsm friendly index structures, memtable skip list, sstable block index, fence pointer, bloom filter per sstable, index summary, prefix compressed block, lsm read path, write optimized index, sparse index\n\n## 핵심 개념\n\nLSM 계열 저장소는 \"한 자료구조로 모든 걸 해결\"하지 않는다.  \n쓰기와 읽기의 위치가 다르기 때문에, 각 단계에 다른 구조를 붙인다.\n\n- memtable: 쓰기 흡수\n- SSTable data block: 정렬된 불변 블록\n- sparse block index / fence pointer: 블록 탐색\n- Bloom filter: negative lookup 절약\n\n즉 LSM-friendly index는 단일 트리 이름이 아니라  \n**write path와 read path에 맞는 작은 구조들의 조합**이다.\n\n여기서 static/dynamic 경계를 분리해야 한다.\n\n- memtable index는 mutable하다. 계속 insert되고 flush 전까지 최신 write를 받아야 한다\n- SSTable index는 immutable하다. 한번 만들어지면 compaction 전까지 block boundary와 filter가 고정된다\n- Bloom filter, fence pointer, FST는 대개 SSTable을 빠르게 건너뛰거나 좁히는 보조 read-path 구조다\n\n## 깊이 들어가기\n\n### 1. memtable은 mutable ordered structure가 필요하다\n\n쓰기 경로에서는 계속 insert가 일어난다.  \n그래서 memtable은 보통 mutable ordered structure를 쓴다.\n\n- Skip List\n- balanced tree\n- ART-like in-memory ordered index\n\n요구사항:\n\n- range scan 가능\n- flush 시 정렬 순서 유지\n- concurrent insert가 비교적 쉬울 것\n- 최근 write와 delete marker/tombstone을 함께 표현할 것\n\n즉 exact point lookup만이 아니라,  \n나중에 SSTable로 정렬 flush하기 쉬운 구조가 중요하다.\n\nHashMap만으로 memtable을 만들면 point lookup은 쉬워도 flush 순서와 range scan을 따로 해결해야 한다.\n그래서 LSM memtable에는 \"쓰기 가능한 ordered map\"이라는 요구가 먼저 온다.\n\n### 2. SSTable 내부는 sparse index가 더 중요하다\n\n불변 파일로 내려가면 모든 key를 메모리에 둘 필요가 없다.  \n대신 block 단위 탐색 포인트만 들고 있으면 된다.\n\n- fence pointer\n- sparse block index\n- restart point\n- prefix-compressed key block\n\n즉 read path는:\n\n1. 어떤 block에 key가 있을지 좁히고\n2. 그 block 안에서만 더 세밀히 찾는다\n\n이 단계형 탐색이 핵심이다.\n\nSSTable index는 보통 동적 update를 받지 않는다.\n새 write는 memtable과 새 SSTable로 흘러가고, 기존 SSTable의 sparse index는\ncompaction으로 새 파일을 만들 때 다시 생성된다.\n따라서 ART 같은 dynamic in-memory index와 같은 기준으로 비교하면 선택축이 흐려진다.\n\n### 3. Bloom filter는 read amplification 완화 장치다\n\nLSM은 여러 level / SSTable을 볼 수 있으므로 negative lookup이 비싸다.  \n그래서 파일별/level별 Bloom filter가 자주 붙는다.\n\n- 이 파일엔 아예 없음을 빨리 말함\n- disk/page read를 줄임\n\n즉 Bloom filter는 주 인덱스가 아니라  \n**read path 비용을 깎는 보조 구조**다.\n\npositive가 나와도 \"있다\"가 확정되는 것은 아니다.\nBloom은 false positive가 있으므로 sparse index와 data block 확인이 이어진다.\n반대로 negative는 해당 SSTable을 건너뛸 수 있게 해 read amplification을 줄인다.\n\n### 4. index summary와 page cache 관점이 중요하다\n\n아주 큰 SSTable에서는 sparse index조차 전부 메모리에 올리기 부담될 수 있다.  \n그래서 상위 요약(summary)을 한 층 더 두기도 한다.\n\n- top-level summary\n- sampled key directory\n- cache-aware block index\n\n즉 \"정확히 찾는 구조\"보다  \n\"어느 정도만 메모리에 두고 disk/page 접근을 줄일 것인가\"가 더 중요해진다.\n\n문자열 key가 많으면 FST나 prefix-compressed dictionary가 term/key directory 역할을 할 수 있다.\n하지만 이것도 mutable primary index라기보다 immutable segment를 작게 탐색하기 위한 read-path 부품에 가깝다.\n\n### 5. backend에서 어디에 맞나\n\nLSM-friendly index 구조는 write-heavy 저장소 전반에 적용되는 사고방식이다.\n\n- 로그성 이벤트 저장\n- 시계열 ingest\n- 대규모 key-value store\n- immutable segment 기반 analytics\n\n핵심은 point lookup뿐 아니라  \nflush, compaction, read amplification, cache residency를 함께 보는 것이다.\n\n## 실전 시나리오\n\n### 시나리오 1: write-heavy key-value store\n\nmemtable은 skip list로 삽입을 받고,  \nflush 후엔 sparse block index + Bloom filter로 read path를 줄이는 구성이 자연스럽다.\n\n### 시나리오 2: immutable analytics segment\n\nsegment는 prefix-compressed block과 fence pointer를 두고,  \nterm dictionary는 FST로 줄이는 식의 조합이 가능하다.\n\n### 시나리오 3: cache 예산이 타이트한 read path\n\nfull index 대신 summary + sparse index + Bloom filter 조합으로  \n메모리 예산 안에서 read amplification을 통제할 수 있다.\n\n### 시나리오 4: 부적합한 경우\n\nOLTP 한 건 업데이트와 즉시 in-place mutation이 핵심이면  \npage-oriented B-Tree 계열이 더 자연스러울 수 있다.\n\n## 선택 프레임\n\n| 단계 | 더 잘 맞는 구조 | 이유 |\n|---|---|---|\n| mutable write buffer | Skip List / ART / ordered map | flush를 위한 정렬 유지 |\n| immutable data file | prefix-compressed sorted block | 순차 저장과 압축 |\n| block location | sparse index / fence pointer | 메모리 적게 쓰는 탐색 포인트 |\n| negative lookup skip | Bloom Filter | 파일 접근을 빠르게 배제 |\n| term/key dictionary | FST 등 compressed dictionary | 대규모 문자열 key 압축 |\n\nwrong-bucket / 오선택:\n\n- LSM-friendly index는 \"B+Tree보다 좋은 새 tree\"가 아니다. write path와 immutable segment read path를 나눈 조합이다.\n- Bloom filter는 primary lookup index가 아니다. false positive 이후에는 block index/data block 확인이 필요하다.\n- ART는 memtable 후보일 수 있지만, SSTable block index나 compaction 정책까지 대신하지 않는다.\n\n## 꼬리질문\n\n> Q: LSM에서 왜 memtable과 SSTable이 다른 자료구조를 쓰나요?\n> 의도: write path와 read path 요구가 다르다는 점 이해 확인\n> 핵심: memtable은 mutation-friendly해야 하고, SSTable은 immutable/sparse index가 더 효율적이기 때문이다.\n\n> Q: Bloom filter는 주 인덱스인가요?\n> 의도: 보조 구조와 주 구조를 구분하는지 확인\n> 핵심: 아니다. negative lookup을 빠르게 줄이는 보조 구조다.\n\n> Q: fence pointer가 왜 중요한가요?\n> 의도: sparse index 설계 감각 확인\n> 핵심: 전체 key를 다 메모리에 두지 않고도 어떤 block을 열어야 할지 빠르게 좁힐 수 있기 때문이다.\n\n## 한 줄 정리\n\nLSM-friendly index 구조는 하나의 트리가 아니라, mutable memtable과 immutable sparse block index, Bloom filter, dictionary 압축을 조합해 write path와 read path를 분리 최적화하는 설계다.\n",
+  "aliases": [
+    "LSM-friendly index structures",
+    "memtable skip list",
+    "SSTable block index",
+    "fence pointer",
+    "Bloom filter per SSTable",
+    "sparse index",
+    "write optimized index"
+  ],
+  "expected_queries": [
+    "LSM storage에서 memtable sparse block index fence pointer Bloom filter는 각각 무슨 역할이야?",
+    "write path와 read path에 맞는 작은 index structures를 조합한다는 뜻은?",
+    "SSTable negative lookup에서 Bloom filter가 read amplification을 어떻게 줄여?",
+    "memtable은 왜 mutable ordered structure가 필요하고 skip list가 자주 쓰여?",
+    "LSM-friendly index structures를 B+Tree 같은 단일 index와 비교해줘"
+  ],
+  "symptoms": [
+    "LSM storage를 하나의 거대한 tree로만 이해해 memtable, SSTable block index, fence pointer, Bloom filter의 역할 분담을 놓친다",
+    "write path의 mutable ordered structure와 read path의 immutable sparse block index 요구를 같은 기준으로 비교한다",
+    "Bloom filter를 주 인덱스로 오해하고 negative lookup read amplification을 줄이는 보조 구조라는 역할을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/skip-list",
+      "data-structure/bloom-filter"
+    ],
+    "next_docs": [
+      "data-structure/finite-state-transducer",
+      "data-structure/adaptive-radix-tree",
+      "database/bptree-vs-lsm-tree"
+    ],
+    "confusable_with": [
+      "data-structure/skip-list",
+      "data-structure/bloom-filter",
+      "data-structure/finite-state-transducer",
+      "data-structure/adaptive-radix-tree",
+      "database/bptree-vs-lsm-tree",
+      "data-structure/hybrid-top-index-leaf-layouts"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/lsm-friendly-index-structures.md",
+    "revision_history": []
+  }
+}

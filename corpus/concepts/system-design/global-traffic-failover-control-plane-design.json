@@ -1,0 +1,57 @@
+{
+  "id": "system-design/global-traffic-failover-control-plane-design",
+  "title": "Global Traffic Failover Control Plane 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "'이 문서는 멀티리전 서비스를 운영하는 학습자가 한 리전 장애나 부분 장애 때",
+  "body_markdown": "# Global Traffic Failover Control Plane 설계\n\n> 한 줄 요약: global traffic failover control plane은 리전 간 트래픽 분산, 우선순위, failover, evacuation을 중앙에서 결정해 인터넷 진입 트래픽이 장애와 유지보수 중에도 안전한 경로로 흐르도록 만드는 제어 시스템이다.\n\nretrieval-anchor-keywords: global traffic failover, gslb, dns failover, geo routing, regional evacuation, failover policy, weighted region routing, health signal aggregation, edge steering, traffic control plane\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Service Discovery / Health Routing 설계](./service-discovery-health-routing-design.md)\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Backup, Restore, Disaster Recovery Drill 설계](./backup-restore-disaster-recovery-drill-design.md)\n> - [Failure Injection / Resilience Validation Platform 설계](./failure-injection-resilience-validation-platform-design.md)\n> - [Traffic Shadowing / Progressive Cutover 설계](./traffic-shadowing-progressive-cutover-design.md)\n\n## 핵심 개념\n\n여러 리전에 서비스를 운영할 때 \"어디로 보낼지\"는 단순 DNS 문제로 끝나지 않는다.\n실전에서는 다음을 같이 결정해야 한다.\n\n- 평소에는 어느 리전이 얼마나 받는가\n- 리전 또는 zone 건강 상태를 어떻게 판단하는가\n- partial outage일 때 완전 failover를 할지 일부만 줄일지\n- evacuation과 maintenance 때 어떤 순서로 비울지\n- stateful backend가 준비되기 전까지 얼마나 천천히 보낼지\n\n즉, global traffic failover는 DNS 레코드 변경이 아니라 **건강 신호, capacity, 정책을 묶어 리전 간 진입 트래픽을 제어하는 control plane**이다.\n\n## 흔한 오해\n\n- DNS failover만 바꾸면 리전 장애 대응이 끝난다고 보면 위험하다. TTL, client cache, edge convergence 때문에 traffic shift에는 시간이 걸린다.\n- healthy/unhealthy를 리전 단위 boolean으로만 보면 partial outage를 과하게 failover하거나 늦게 감지할 수 있다.\n- 남은 리전의 평균 CPU가 낮아도 checkout, cache, stateful backend headroom이 부족하면 evacuation이 안전하지 않다.\n- 복구된 리전은 바로 100% 재투입하기보다 warm-up과 cooldown을 거쳐야 재장애 위험을 줄일 수 있다.\n\n## 깊이 들어가기\n\n### 1. 왜 local discovery와 다른가\n\nservice discovery는 보통 이미 선택된 region 안에서 healthy endpoint를 고르는 문제다.\nglobal traffic failover는 그보다 한 단계 위에서 다음을 다룬다.\n\n- 어떤 region으로 갈지\n- 어떤 percentage를 보낼지\n- 어떤 region은 읽기만 허용할지\n- 어떤 region은 evacuation 중인지\n\n즉, locality의 범위가 다르다.\n\n### 2. Capacity Estimation\n\n예:\n\n- APAC 50%, US 30%, EU 20% 정상 분산\n- 한 region 손실 시 나머지 region이 1.7x까지 흡수 가능\n- DNS TTL 30초\n- health aggregation 지연 5초\n\n이때 봐야 할 숫자:\n\n- regional headroom\n- traffic shift convergence time\n- stale routing window\n- failover completion time\n- cold region warm-up duration\n\n글로벌 트래픽 제어는 라우팅 알고리즘보다 \"얼마나 빨리, 얼마나 안전하게 옮길 수 있는가\"가 중요하다.\n\n### 3. Health aggregation\n\n리전 health는 단일 비트가 아니다.\n보통 다음을 종합한다.\n\n- ingress error rate\n- p95/p99 latency\n- saturation\n- dependency reachability\n- stateful backend readiness\n- operator override\n\n특히 stateful 시스템은 프런트만 살아 있어도 backend가 따라오지 않으면 failover하면 안 된다.\n\n### 4. Routing policy\n\n대표 정책:\n\n- geo-local routing\n- weighted regional split\n- priority failover\n- region pinning\n- evacuation mode\n- degraded read-only mode\n\n중요한 것은 정책이 한 줄로 끝나지 않는다는 점이다.\n예를 들어 \"US 장애면 EU로\"가 아니라, \"EU가 stateful capacity를 얼마나 준비했는가\"까지 봐야 한다.\n\n### 5. Drain, warm-up, and re-entry\n\nregion failover는 옮기는 순간보다 옮긴 뒤가 더 어렵다.\n\n- 갑자기 0%에서 50%로 올리면 cache cold start가 난다\n- background queue와 replay job이 같이 몰릴 수 있다\n- 복구된 region을 다시 넣을 때도 조심해야 한다\n\n그래서 보통은 다음 단계를 둔다.\n\n1. warm-up traffic\n2. partial traffic\n3. full cutover\n4. controlled re-entry\n\n### 6. Manual override와 automation 균형\n\n완전 자동 failover는 매력적이지만 위험하다.\n\n필요한 장치:\n\n- auto failover threshold\n- human approval on large shift\n- forced evacuation switch\n- cooldown before re-entry\n\n즉, 일부는 자동화하고 일부는 운영자 승인 경계를 두는 편이 많다.\n\n### 7. Observability-rich control\n\n좋은 시스템은 다음 질문에 바로 답할 수 있어야 한다.\n\n- 지금 각 region에 몇 %가 가는가\n- 왜 이 shift가 일어났는가\n- health score는 어떤 신호로 계산되었는가\n- operator override가 있는가\n- failover 후 어떤 SLO가 degraded 되었는가\n\n트래픽 제어는 보이지 않으면 신뢰하기 어렵다.\n\n## mental model과 validation matrix\n\nglobal traffic failover는 \"DNS를 바꾸는 버튼\"이 아니라, 리전별 건강 상태와 수용 여력을 보고 인터넷 입구의 물길을 조절하는 control plane이다.\n\n| 상황 | 먼저 볼 것 | 실패하면 생기는 일 | validation 기준 |\n|---|---|---|---|\n| 한 region error rate 상승 | partial shift 가능 여부 | 전체 failover로 target region까지 과부하 | target headroom과 warm-up plan이 있다 |\n| health check는 정상인데 checkout만 실패 | dependency-specific health | healthy로 오판해 계속 트래픽 유입 | user journey별 health signal이 분리된다 |\n| 복구 region 재투입 | failback cooldown | cold cache와 backlog로 재장애 | 1%, 5%, 25% 같은 staged re-entry가 관측된다 |\n| DNS TTL이 길다 | convergence time | 사용자가 오래 old route에 남는다 | stale routing window가 SLO와 맞는다 |\n| auto policy가 shift를 시작했다 | decision log / override | 오탐이 대규모 이동으로 번진다 | human-gated threshold와 rollback switch가 있다 |\n\nmetric 해석은 두 단계다. regional error rate와 latency는 health degradation을 **suggest**한다. 그러나 evacuation이 안전하다는 판단은 target capacity, stateful readiness, convergence time, failback 계획까지 함께 확인해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 한 region partial outage\n\n문제:\n\n- APAC error rate만 올라가고 완전 다운은 아니다\n\n해결:\n\n- weighted shift로 APAC 비중을 점진적으로 줄인다\n- stateful backend readiness를 보며 US/EU를 늘린다\n- 정상화 후 re-entry도 점진적으로 수행한다\n\n### 시나리오 2: maintenance evacuation\n\n문제:\n\n- 특정 region을 계획적으로 비워야 한다\n\n해결:\n\n- evacuation mode를 활성화한다\n- 신규 session과 write-heavy traffic부터 다른 region으로 보낸다\n- region-local backlog와 cold cache를 고려해 단계적으로 이동한다\n\n### 시나리오 3: DR rehearsal\n\n문제:\n\n- failover runbook이 실제로 동작하는지 검증하고 싶다\n\n해결:\n\n- failure injection과 결합해 region shift 실험을 한다\n- convergence time과 SLO 변화를 기록한다\n- operator override와 auto policy가 충돌하지 않는지 검증한다\n\n## 코드로 보기\n\n```pseudo\nfunction decideGlobalRouting():\n  health = healthAggregator.current()\n  capacity = regionalCapacity.current()\n  policy = policyStore.current()\n  plan = planner.compute(health, capacity, policy)\n  publisher.publish(plan)\n\nfunction compute(health, capacity, policy):\n  if policy.evacuationRegion:\n    return drainRegion(policy.evacuationRegion, capacity)\n  if health.region(\"apac\").severe:\n    return weightedShift(from=\"apac\", to=[\"us\",\"eu\"])\n  return policy.normalPlan\n```\n\n```java\npublic TrafficPlan reconcile() {\n    RegionalState state = regionalStateService.current();\n    return failoverPlanner.compute(state, policySnapshot.current());\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| DNS priority failover | 단순하다 | partial outage 대응이 약하다 | 초기 multi-region |\n| Weighted global routing | 유연하다 | control plane이 복잡해진다 | 대부분의 대형 서비스 |\n| Full auto failover | 반응이 빠르다 | 오탐 시 위험하다 | 신뢰도 높은 health model |\n| Human-gated large shifts | 안전하다 | 반응이 느릴 수 있다 | stateful/high-risk backend |\n\n핵심은 global traffic failover control plane이 단순 DNS 운영이 아니라 **health, capacity, state readiness를 바탕으로 리전 간 진입 트래픽을 조정하는 운영 제어 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: service discovery와 global traffic failover는 어떻게 다른가요?\n> 의도: global vs regional routing 계층 구분 확인\n> 핵심: discovery는 보통 region 내 endpoint 선택, global failover는 region 간 트래픽 분배와 evacuation을 다룬다.\n\n> Q: region health가 나쁘면 무조건 다른 region으로 보내면 되나요?\n> 의도: state readiness와 capacity 고려 확인\n> 핵심: 아니다. target region의 backend readiness, headroom, cold start 비용을 같이 봐야 한다.\n\n> Q: auto failover가 왜 위험할 수 있나요?\n> 의도: false positive와 blast radius 이해 확인\n> 핵심: 잘못된 health signal이나 일시적 spike만으로 대규모 traffic shift가 일어나면 오히려 더 큰 장애를 만들 수 있다.\n\n> Q: failback은 왜 별도로 강조하나요?\n> 의도: re-entry 운영 감각 확인\n> 핵심: 복구된 region을 한 번에 다시 넣으면 cold start와 cache miss, state catch-up 문제로 재장애가 날 수 있다.\n\n## 한 줄 정리\n\nGlobal traffic failover control plane은 리전 health, capacity, state readiness를 종합해 인터넷 진입 트래픽의 분배와 failover, evacuation, re-entry를 조정하는 운영 제어 시스템이다.\n",
+  "aliases": [
+    "global traffic failover",
+    "gslb",
+    "dns failover",
+    "geo routing",
+    "regional evacuation",
+    "failover policy",
+    "weighted region routing",
+    "health signal aggregation",
+    "edge steering",
+    "traffic control plane"
+  ],
+  "expected_queries": [
+    "멀티리전에서 한 리전 장애가 나면 트래픽을 어떤 기준으로 다른 리전에 넘겨?",
+    "DNS failover 말고 global traffic control plane이 따로 필요한 이유가 뭐야?",
+    "regional evacuation할 때 headroom과 warm-up을 왜 같이 봐야 해?",
+    "partial outage면 전체 failover 대신 weighted shift를 어떻게 결정해?",
+    "복구된 리전을 다시 받게 할 때 failback을 천천히 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "리전 장애면 DNS만 바꾸면 끝나는 거 아닌지 헷갈려",
+    "partial outage일 때 어느 리전으로 얼마나 옮겨야 할지 감이 안 와",
+    "복구된 리전을 언제 다시 트래픽에 넣어야 안전한지 모르겠어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/availability-and-sla-basics",
+      "system-design/load-balancer-basics",
+      "system-design/multi-region-active-active-design"
+    ],
+    "next_docs": [
+      "system-design/service-discovery-health-routing-design",
+      "system-design/stateful-workload-placement-failover-control-plane-design",
+      "system-design/traffic-shadowing-progressive-cutover-design"
+    ],
+    "confusable_with": [
+      "system-design/stateful-workload-placement-failover-control-plane-design",
+      "system-design/multi-region-active-active-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/global-traffic-failover-control-plane-design.md",
+    "revision_history": []
+  }
+}

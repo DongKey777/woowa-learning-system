@@ -1,0 +1,46 @@
+{
+  "id": "database/failover-split-brain-fencing-playbook",
+  "title": "Failover Split Brain Fencing Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "이 playbook은 DB failover에서 split brain, old primary write, fencing, commit horizon 검증을 다룬다.",
+  "body_markdown": "# Failover Split Brain Fencing Playbook\n\n## 재현 조건\n\nPrimary 장애로 failover가 발생했고, 새 primary가 승격되었지만 일부 client나 옛 primary가 계속 write를 받을 수 있다. 특히 네트워크 partition, DNS/service discovery cache, connection pool 재사용, lease 만료 후 늦게 깨어난 process가 겹치면 두 writer가 동시에 살아 있는 split brain으로 번질 수 있다.\n\n## 관찰 증거\n\n- monitoring에는 새 primary가 보이지만 일부 application log는 옛 primary endpoint로 commit을 기록한다.\n- replication slot, GTID, LSN, WAL position 같은 commit horizon이 노드별로 갈라진다.\n- DNS TTL, service discovery cache, connection pool keepalive 때문에 old primary connection이 오래 살아 있다.\n- lock service나 lease owner는 바뀌었는데 storage write 권한은 아직 회수되지 않았다.\n- write request에 붙은 epoch/fencing token이 낮은데도 proxy, DB trigger, storage 계층이 거절하지 않는다.\n- old primary에 직접 붙는 배치, admin job, CDC/replay worker 같은 우회 write path가 남아 있다.\n\n## 확인 순서\n\n1. 새 primary가 단 하나인지 control plane과 DB 내부 상태를 모두 확인한다.\n2. 더 높은 epoch/fencing token을 단일 coordinator에서 발급하고, 새 writer만 그 token을 얻도록 한다.\n3. 옛 primary를 네트워크, storage, lease, proxy, DB read-only 같은 data-plane 장치로 write 불가능하게 만든다.\n4. 모든 write path가 fencing token을 검증하는지 확인한다. 낮은 token write는 application route가 맞아도 거절되어야 한다.\n5. Application connection pool과 DNS/service discovery cache가 옛 primary를 가리키지 않는지 본다.\n6. Commit horizon을 확인해 어떤 transaction까지 안전하게 반영되었는지 판단한다.\n7. Divergence가 있으면 자동 merge보다 정지, 증거 보존, 수동 복구 절차를 따른다.\n\n## 실패 원인 matrix\n\n| 증상 | 원인 | 대응 |\n|---|---|---|\n| 두 primary write | fencing 부재 | old primary 차단 |\n| 일부 app만 옛 primary | stale connection/DNS | pool drain과 endpoint refresh |\n| 데이터 불일치 | promotion 기준 불명확 | commit horizon 검증 |\n| 낮은 epoch write 성공 | token 검증 누락 또는 우회 write path | protected write 경계 차단 |\n| lease owner만 변경됨 | data plane fencing 미완료 | storage/proxy/DB 권한 회수 |\n\n## 운영/테스트 검증\n\nFailover는 \"새 primary를 세우는 것\"만이 아니라 \"옛 primary가 더 이상 쓰지 못하게 하는 것\"까지 포함한다.\n\n운영 검증은 네 단계로 나눈다. 첫째, promotion 시점의 commit horizon을 기록해 새 primary가 어디까지 안전하게 포함했는지 확인한다. 둘째, old primary에 대한 write probe가 실패해야 하며, 실패 원인이 단순 app routing이 아니라 fencing 권한 회수인지 확인한다. 셋째, 낮은 epoch/fencing token을 일부러 보낸 protected write가 거절되는지 검증한다. 넷째, application pool drain과 endpoint refresh 뒤 모든 write path가 새 primary만 바라보는지 request id와 DB session metadata로 확인한다.\n\nFencing token은 \"소유권을 주장하는 문자열\"이 아니라 단조 증가하는 epoch다. protected storage는 `request_token >= last_accepted_token` 같은 규칙으로 오래된 writer를 거절할 수 있어야 한다. token을 로그에만 남기고 실제 write 경계에서 검사하지 않으면 fencing이 아니다. 반대로 old primary가 storage volume에 직접 쓰거나, admin job이 token 검증을 우회하면 application-level token만으로 split brain을 막을 수 없다. 이때는 STONITH, volume detach, network ACL, DB read-only, proxy deny 같은 hard fencing이 필요하다.\n\n## 보장 범위와 한계\n\nFencing은 \"동시에 두 writer가 쓰지 못하게 한다\"는 안전성 장치다. 자동으로 데이터 divergence를 병합하거나, failover 직전 acknowledged transaction이 새 primary에 모두 존재한다고 보장하지는 않는다. 따라서 fencing과 commit horizon 검증은 분리해야 한다. RPO/RTO 목표도 replication mode, quorum policy, client retry semantics에 따라 달라진다.\n\nQuorum이나 lease를 쓰더라도 \"새 owner가 정해졌다\"와 \"옛 owner가 더 이상 쓸 수 없다\"는 별도 명제다. coordinator가 새 epoch를 발급했는데 old primary가 DB/storage write 권한을 유지하면 split brain은 여전히 가능하다. 반대로 old primary fencing이 확인되지 않으면 promotion을 지연하거나 write freeze 모드로 들어가야 한다.\n\n## 실패 반례\n\n- promotion은 성공했지만 old primary의 storage volume write 권한을 회수하지 않아 hidden writer가 남는다.\n- client retry가 stale DNS를 재사용해 새 primary 승격 이후에도 old primary에 write를 보낸다.\n- async replication에서 마지막 acknowledged commit이 replica에 도달하지 않았는데 \"primary가 바뀌었으니 안전하다\"고 판단한다.\n- split brain 후 양쪽 데이터를 자동 upsert merge하면 순서와 제약 조건이 깨질 수 있다.\n- fencing token을 발급했지만 일부 batch writer가 token 없이 DB에 직접 update해서 낮은 epoch 거절 규칙을 우회한다.\n- old primary를 read-only로 바꿨다고 믿었지만 superuser/admin connection이나 replication replay 경로가 write 가능하게 남아 있다.\n\n## 면접 답변 축\n\n면접에서는 failover를 availability만으로 설명하지 말고 safety까지 말한다. \"write freeze 또는 quorum 확인, 더 높은 fencing epoch 발급, old primary hard fencing, 새 primary promotion/route 전환, stale token reject 검증, commit horizon 검증\" 순서로 답하면 된다. 핵심은 primary가 하나임을 control plane과 data plane 양쪽에서 증명하고, 데이터가 갈라졌을 때는 자동 복구보다 write 정지와 증거 보존을 우선한다는 점이다.\n\n## Safe Next Docs\n\nWrite fencing은 `primary-switch-write-fencing`, failover 후 가시성 검증은 `commit-horizon-after-failover-verification`으로 이어진다.\n",
+  "aliases": [
+    "failover split brain fencing playbook",
+    "failover split brain fencing",
+    "primary promotion stale writer",
+    "데이터베이스 장애조치 split brain"
+  ],
+  "expected_queries": [
+    "DB failover에서 split brain을 어떻게 막아?",
+    "primary가 둘이 되는 상황에서 fencing은 왜 필요해?",
+    "failover 후 옛 primary write를 어떻게 차단해?"
+  ],
+  "symptoms": [
+    "failover 뒤 두 노드가 모두 primary처럼 동작합니다",
+    "application이 오래된 primary에 계속 write합니다",
+    "promotion 후 데이터가 갈라지거나 commit 순서가 의심됩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/replication-failover-split-brain"
+    ],
+    "next_docs": [
+      "database/primary-switch-write-fencing",
+      "database/commit-horizon-after-failover-verification"
+    ],
+    "confusable_with": [
+      "database/primary-switch-write-fencing",
+      "database/replica-lag-observability-routing-slo"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/failover-split-brain-fencing-playbook.md",
+    "revision_history": []
+  }
+}

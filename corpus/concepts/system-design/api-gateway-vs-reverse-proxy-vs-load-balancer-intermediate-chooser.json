@@ -1,0 +1,57 @@
+{
+  "id": "system-design/api-gateway-vs-reverse-proxy-vs-load-balancer-intermediate-chooser",
+  "title": "API Gateway vs Reverse Proxy vs Load Balancer — 무엇을 어디서 처리할까",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# API Gateway vs Reverse Proxy vs Load Balancer — 무엇을 어디서 처리할까\n\n> 한 줄 요약: 셋은 *역할 범위*가 다른 동심원. LB = 트래픽 분산, Reverse Proxy = 프로토콜 + 부수 기능, API Gateway = 횡단 관심사 + 비즈니스 로직 일부.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n세 도구가 같은 자리에 있을 수 있고 같은 도구가 여러 역할을 겸할 수 있다. 핵심 질문은 *역할 범위*다.\n\n```\n[Load Balancer]\n  역할: 트래픽을 여러 백엔드에 분산\n  특화: 분산 알고리즘, 헬스 체크, 페일오버\n\n[Reverse Proxy]\n  역할: 클라이언트와 백엔드 사이에 위치, HTTP/HTTPS 처리\n  특화: SSL termination, caching, compression, URL rewriting\n\n[API Gateway]\n  역할: API 진입점에서 횡단 관심사 처리\n  특화: 인증/인가, rate limiting, request 변환, aggregation, BFF 변환\n```\n\n세 역할이 *순서대로 더 깊이* 트래픽을 본다.\n\n## 한 장 정리\n\n| 항목 | Load Balancer | Reverse Proxy | API Gateway |\n|---|---|---|---|\n| 주 역할 | 트래픽 분산 | HTTP 처리 + 부수 기능 | API 횡단 관심사 |\n| 인증/인가 | ❌ (보통) | 일부 (예: TLS 클라이언트 인증) | ✓ (JWT 검증, API key) |\n| Rate Limiting | ❌ | 가능 (Nginx limit_req) | ✓ (per-user, per-API key) |\n| Request 변환 | ❌ | 일부 (URL rewrite) | ✓ (JSON → gRPC 등) |\n| Aggregation (여러 API 합치기) | ❌ | ❌ | ✓ |\n| SSL/TLS termination | ✓ (L7) | ✓ | ✓ |\n| 헬스 체크 | ✓ | ✓ | ✓ |\n| 대표 도구 | AWS NLB/ALB, HAProxy | Nginx, Envoy | Spring Cloud Gateway, Kong, AWS API Gateway |\n\n## \"왜 셋이 다 필요한가?\"\n\n실제 아키텍처:\n\n```\n[클라이언트]\n    │\n    ▼\n[Cloud LB / DNS] ← 글로벌 분산, DDoS 방어\n    │\n    ▼\n[Reverse Proxy / Edge] ← SSL termination, caching, compression\n    │\n    ▼\n[API Gateway] ← 인증, rate limit, 라우팅, 변환\n    │\n    ├─→ [Service A LB] → [Service A 인스턴스 1..N]\n    ├─→ [Service B LB] → [Service B 인스턴스 1..N]\n    └─→ [Service C LB] → [Service C 인스턴스 1..N]\n```\n\n큰 시스템에선 *각 역할이 분리*된 인스턴스를 가질 수 있다. 작은 시스템은 *Nginx 한 대*가 셋을 다 함.\n\n## \"어떤 도구를 골라?\" 결정 가이드\n\n### 작업 위치별\n\n```\n1. 단순 백엔드 부하 분산\n       → Load Balancer (L4면 NLB, L7이면 ALB)\n\n2. SSL termination + 정적 파일 + caching + URL rewrite\n       → Reverse Proxy (Nginx, Caddy)\n\n3. 마이크로서비스 + 인증 + rate limit + 라우팅\n       → API Gateway (Spring Cloud Gateway, Kong, AWS API Gateway)\n\n4. 매우 큰 시스템 + 서비스 간 통신 보안\n       → API Gateway + Service Mesh (Istio, Linkerd)\n```\n\n### 학습 단계별\n\n- 단일 서버: 아무것도 필요 없음. 직접 노출.\n- 2-3 대 + 트래픽 증가: Nginx (reverse proxy + LB 겸용).\n- 마이크로서비스 초입: API Gateway 도입 검토. 인증/rate limit을 *각 서비스마다 박지 않게*.\n- 대규모: 위 + service mesh.\n\n## \"인증을 어디서?\" — 횡단 관심사 배치\n\n학습자 자주 묻는 질문. 인증을 *Gateway*에서 처리 vs *각 service*에서 처리.\n\n| 위치 | 장점 | 단점 |\n|---|---|---|\n| API Gateway | 한 곳 관리, service 단순 | Gateway 단일 장애 + 복잡도 |\n| 각 Service | service가 자기 관리 | 중복 + 정책 불일치 위험 |\n| 둘 다 (defense in depth) | 안전 | 중복 |\n\n권장: **Gateway에서 *인증* (사용자 누구인지)**, **각 service에서 *인가* (이 사용자가 이 리소스 접근 OK인지)**.\n\n이유:\n- 인증은 *공통*: JWT 검증 알고리즘이 같음.\n- 인가는 *도메인 별*: \"이 회원이 이 예약 소유자인가\" 같은 비즈니스 결정.\n\n## \"Spring Cloud Gateway vs Nginx vs Envoy?\"\n\n| 도구 | 자리 | 강점 | 운영 |\n|---|---|---|---|\n| **Spring Cloud Gateway** | API Gateway | Spring 생태계, Java 환경 | Java 개발자 친숙 |\n| **Nginx** | Reverse Proxy + LB (+ 가벼운 API Gateway) | 매우 가볍고 빠름, 표준 | config 파일 운영 |\n| **Envoy** | LB + Reverse Proxy + Service Mesh data plane | 동적 config, observability | 학습 곡선 |\n| **Kong** | API Gateway | 플러그인 풍부, GUI | 추가 인프라 |\n\n학습 단계는 **Nginx + Spring Cloud Gateway** 조합이 일반.\n\n## BFF — Backend For Frontend\n\nAPI Gateway의 한 변형. 프론트엔드별로 *맞춤 API*를 제공.\n\n```\n[Mobile App] → [Mobile BFF] → [Service A, B, C aggregate]\n[Web App]    → [Web BFF]    → [Service A, B aggregate]\n```\n\n장점:\n- 프론트가 *원하는 모양*으로 응답 가공.\n- 모바일은 *작은 페이로드*, 웹은 *더 풍부* 같은 분기.\n\n단점:\n- BFF 자체 관리 필요.\n- 프론트 종류만큼 BFF.\n\n## 자주 헷갈리는 지점\n\n- **\"LB와 API Gateway는 같다\"** — LB는 *분산*만, Gateway는 *횡단 관심사*. 보통 다른 인스턴스.\n- **\"API Gateway = Nginx\"** — Nginx는 *reverse proxy + LB가 본업*. API Gateway 기능은 가능하지만 *제한적*. Spring Cloud Gateway, Kong이 본격.\n- **\"Service mesh가 있으면 API Gateway 불필요\"** — 다른 영역. Mesh는 *서비스 간 통신*, Gateway는 *외부 → 시스템 진입*.\n- **\"인증을 service에서만\"** — 마이크로서비스 N개면 N번 같은 코드. Gateway가 통합.\n- **\"BFF는 모든 시스템에 필요\"** — 프론트 종류가 *명확히 다른 요구*가 있을 때만. 단일 SPA + 모바일 비슷한 API면 굳이.\n\n## 학습자가 자주 만나는 시나리오\n\n- 학습 미션 단일 서버 → 셋 다 불필요. 직접 노출.\n- 운영 환경 단일 web app → Nginx (reverse proxy + LB).\n- 마이크로서비스 N개 + 통합 인증 → Spring Cloud Gateway (또는 Kong).\n- API rate limiting 추가 → Gateway에서 plugin / Spring filter로.\n- \"각 서비스에 JWT 검증 코드 중복\" → Gateway로 옮기고 service에서는 *user id 전달 trust*.\n\n## 빠른 확인 질문\n\n- LB와 API Gateway의 핵심 차이?\n  - LB는 *트래픽 분산*, Gateway는 *횡단 관심사 처리*.\n- 인증을 Gateway에 두고 인가는 service에 두는 이유?\n  - 인증은 *공통*, 인가는 *도메인 별*.\n- Nginx로 API Gateway 기능을 다 할 수 있는가?\n  - 제한적. 본격 API Gateway는 Spring Cloud Gateway / Kong / AWS API Gateway.\n\n## 한 줄 정리\n\nLB → Reverse Proxy → API Gateway는 *역할 범위*가 깊어지는 동심원. 단일 도구가 여러 역할 가능. *인증/rate limit*은 Gateway, *분산*은 LB, *SSL/caching*은 Reverse Proxy가 표준 배치.\n\nretrieval-anchor-keywords: API Gateway, Reverse Proxy, Load Balancer, Nginx, Envoy, Spring Cloud Gateway, Kong, AWS API Gateway, BFF Backend for Frontend, service mesh Istio Linkerd, edge proxy, SSL termination layer 7, rate limiting placement, authentication at gateway, authorization at service, microservice routing pattern\n",
+  "aliases": [
+    "API Gateway",
+    "Reverse Proxy",
+    "Load Balancer",
+    "역방향 프록시",
+    "게이트웨이",
+    "로드밸런서 차이",
+    "Nginx vs Spring Cloud Gateway",
+    "Envoy vs Kong",
+    "service mesh",
+    "edge proxy",
+    "BFF",
+    "Backend for Frontend"
+  ],
+  "expected_queries": [
+    "API Gateway와 Reverse Proxy 차이가 뭐야?",
+    "Load Balancer가 있는데 왜 API Gateway가 또 필요해?",
+    "인증/rate limiting을 어디서 처리해야 해?",
+    "Nginx와 Spring Cloud Gateway 차이는?",
+    "service mesh와 API Gateway 관계는?",
+    "BFF는 무엇이고 언제 써?"
+  ],
+  "symptoms": [
+    "API Gateway / Reverse Proxy / Load Balancer 역할 차이를 모름",
+    "인증/rate limiting을 어디에 둘지 헷갈림",
+    "\"왜 LB와 Gateway가 다 필요한지\" 모름",
+    "service mesh와의 관계가 모호함"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer",
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/api-gateway-vs-reverse-proxy-vs-load-balancer-intermediate-chooser.md",
+    "revision_history": []
+  }
+}

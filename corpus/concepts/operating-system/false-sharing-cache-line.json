@@ -1,0 +1,48 @@
+{
+  "id": "operating-system/false-sharing-cache-line",
+  "title": "False Sharing Cache Line",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 서로 다른 변수라도 같은 cache line에 있으면 여러 core가 같은 line ownership을",
+  "body_markdown": "# False Sharing, Cache Line\n\n> 한 줄 요약: 서로 다른 변수라도 같은 cache line에 있으면 코어 간 무효화 경쟁 때문에 성능이 급락한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [CPU 캐시, 코히어런시, 메모리 배리어](./cpu-cache-coherence-memory-barrier.md)\n> - [컨텍스트 스위칭, 데드락, lock-free](./context-switching-deadlock-lockfree.md)\n> - [Java 동시성 유틸리티](../language/java/java-concurrency-utilities.md)\n\nretrieval-anchor-keywords: false sharing, cache line bouncing, cache line contention, @Contended, padding to avoid false sharing, coherence traffic, hot counter cache line, ring buffer head tail contention, perf c2c, p99 latency from false sharing\n\n---\n\n## 핵심 개념\n\nCPU는 바이트 단위가 아니라 보통 `cache line` 단위로 메모리를 다룬다.  \n한 코어가 한 라인을 수정하면 다른 코어의 같은 라인은 무효화된다.\n\n`false sharing`은 **실제로는 공유하지 않는 변수들이 같은 cache line을 공유해서 생기는 성능 문제**다.\n\n즉 코드 상으로는 서로 다른 필드인데, 하드웨어 관점에서는 같은 줄을 두고 싸우는 상황이다.\n\n## 증상 라우터\n\n### 관찰 증거\n\n| 관찰 | false sharing 가능성 | 먼저 배제할 것 |\n|---|---|---|\n| CPU 사용률은 높은데 lock wait는 낮다 | 높음 | 실제 lock contention, GC pause |\n| worker별 counter를 나눴는데 throughput이 오히려 떨어진다 | 높음 | atomic hot spot, shared queue bottleneck |\n| padding 또는 `@Contended` 후 p99가 크게 내려간다 | 매우 높음 | benchmark warmup/affinity 차이 |\n| perf에서 cache-to-cache transfer가 많다 | 높음 | NUMA remote access, true sharing |\n\n### 1차 분기\n\n1. 같은 객체/배열 안의 hot field를 서로 다른 thread가 쓰는지 본다.\n2. `volatile`/atomic으로 가시성 문제를 해결했지만 line ownership 이동이 남았는지 나눈다.\n3. padding 적용 전후를 microbenchmark와 production-like 부하 양쪽에서 비교한다.\n\n### 다음 확인\n\n- `perf c2c`, cache miss, LLC load/store, run queue 지표를 함께 본다.\n- Java라면 `@Contended` 사용 가능 여부와 `-XX:-RestrictContended` 설정을 확인한다.\n- padding으로 해결된 것처럼 보여도 메모리 사용량 증가와 GC locality 악화를 같이 본다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 왜 느려지는가\n\n코어 A가 `x`를 쓰고, 코어 B가 `y`를 쓴다고 해도 둘이 같은 cache line에 있으면:\n\n- A의 쓰기로 라인이 수정됨\n- B의 쓰기로 다시 라인이 수정됨\n- 라인 소유권이 계속 오간다\n\n이 과정에서 cache coherence traffic이 폭증한다.\n\n### 2. 어디서 자주 터지는가\n\n- 카운터 배열\n- 스레드별 통계값\n- 링버퍼 head/tail\n- 객체 안의 자주 갱신되는 필드\n\n특히 멀티스레드 서버에서 `volatile long` 필드를 여러 개 나란히 두면 자주 보인다.\n\n### 3. Java에서의 감각\n\nHotSpot은 객체 필드 배치를 보장하지 않는다.  \n그래서 \"필드 사이에 빈 칸을 넣었다\"고 해서 항상 안전한 것은 아니다.\n\n보통은:\n\n- `@Contended` 사용\n- padding 필드 추가\n- 구조 자체를 분리\n\n같은 방식으로 대응한다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 카운터를 늘렸더니 더 느려짐\n\n워커별 요청 수를 각각 독립적으로 증가시켰는데, 배열이 한 줄에 몰려 있으면 무효화 비용이 커진다.\n\n진단:\n\n```bash\nperf stat -e cache-references,cache-misses <command>\nperf c2c record <command>\nperf c2c report\n```\n\n### 시나리오 2: p99 지연이 이상하게 튐\n\n애플리케이션 로직은 단순한데 CPU 사용률이 올라간다.  \n이때는 락 경쟁만 보지 말고 cache line bouncing도 의심해야 한다.\n\n### 시나리오 3: ThreadLocal 통계가 빠른 줄 알았는데 전체가 느림\n\n각 스레드가 자기 변수만 건드리는데도 같은 line에 있으면 서로를 방해한다.\n\n---\n\n## 코드로 보기\n\n### 문제 패턴\n\n```java\npublic class Metrics {\n    public volatile long requestCount;\n    public volatile long errorCount;\n}\n```\n\n두 값이 같은 cache line에 있으면 서로 다른 스레드가 갱신해도 라인 무효화가 반복될 수 있다.\n\n### 완화 예시\n\n```java\n@jdk.internal.vm.annotation.Contended\npublic class Counter {\n    public volatile long value;\n}\n```\n\n주의:\n\n- JDK 버전에 따라 제약이 있다\n- `-XX:-RestrictContended` 같은 설정이 필요할 수 있다\n- 메모리 사용량이 늘어난다\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| padding | 단순하고 효과적 | 메모리 낭비 | hot counter, ring buffer |\n| `@Contended` | JVM이 의도를 이해한다 | 설정 제약이 있다 | HotSpot에서 제어 가능할 때 |\n| 구조 분리 | 가장 명시적이다 | 코드가 늘어난다 | 설계 수정이 가능할 때 |\n| 그냥 둔다 | 추가 메모리 없음 | 성능이 흔들린다 | 거의 없음 |\n\n---\n\n## 꼬리질문\n\n> Q: false sharing이 왜 생기나요?\n> 의도: 캐시 라인 단위를 이해하는지 확인\n> 핵심: 서로 다른 변수라도 같은 라인에 있으면 coherence traffic이 생긴다.\n\n> Q: `volatile`을 쓰면 false sharing이 해결되나요?\n> 의도: 메모리 가시성과 캐시 경쟁을 구분하는지 확인\n> 핵심: `volatile`은 가시성을 돕지만 라인 경쟁 자체를 없애지 않는다.\n\n> Q: `@Contended`는 무조건 쓰면 되나요?\n> 의도: 도구를 만능으로 오해하지 않는지 확인\n> 핵심: 메모리 비용과 JVM 설정 제약이 있다.\n\n---\n\n## 한 줄 정리\n\nfalse sharing은 변수 공유가 아니라 cache line 공유의 문제다. 성능을 볼 때는 락만이 아니라 하드웨어 무효화 비용도 같이 봐야 한다.\n",
+  "aliases": [
+    "false sharing cache line",
+    "cache line bouncing",
+    "cache line contention",
+    "@Contended padding",
+    "hot counter contention",
+    "coherence traffic"
+  ],
+  "expected_queries": [
+    "false sharing은 서로 다른 변수인데 왜 cache line 때문에 성능이 급락해?",
+    "cache line bouncing과 coherence traffic을 어떻게 디버깅해?",
+    "Java @Contended나 padding으로 false sharing을 줄이는 기준은?",
+    "hot counter와 ring buffer head tail contention이 p99에 영향을 줄 수 있어?"
+  ],
+  "symptoms": [
+    "서로 다른 변수인데 같은 cache line에 있어 core 간 invalidation traffic이 폭증한다.",
+    "hot counter나 ring buffer head/tail 때문에 CPU 사용률 대비 throughput이 낮다.",
+    "padding이나 @Contended 적용 전후로 p99 latency가 크게 달라진다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/cpu-cache-coherence-memory-barrier"
+    ],
+    "next_docs": [
+      "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge"
+    ],
+    "confusable_with": [
+      "language/java-memory-model-happens-before-volatile-final",
+      "operating-system/cpu-cache-coherence-memory-barrier"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/false-sharing-cache-line.md",
+    "revision_history": []
+  }
+}

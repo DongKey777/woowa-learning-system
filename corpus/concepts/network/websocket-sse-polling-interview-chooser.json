@@ -1,0 +1,45 @@
+{
+  "id": "network/websocket-sse-polling-interview-chooser",
+  "title": "WebSocket SSE Polling Interview Chooser",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "이 chooser는 WebSocket, SSE, long polling을 면접 질문에서 구분한다. 양방향성, reconnect, replay를 다룬다.",
+  "body_markdown": "# WebSocket SSE Polling Interview Chooser\n\n## 10초 chooser\n\n| 요구 | 선택 | 이유 |\n|---|---|---|\n| 클라이언트와 서버가 계속 주고받는 양방향 저지연 메시지 | WebSocket | 하나의 장수 연결에서 양방향 frame |\n| 서버가 브라우저로 이벤트를 계속 보내고, 클라이언트 전송은 드묾 | SSE | HTTP response 기반 server-to-client stream |\n| 이벤트 빈도가 낮고 몇 초 지연이 허용됨 | Polling | 연결 수와 상태 관리가 단순 |\n| proxy 제약이 강하지만 서버 push처럼 보이고 싶음 | Long polling | 일반 HTTP request/response로 대기 후 응답 |\n\n## 헷갈리는 축\n\nWebSocket은 강력하지만 proxy, heartbeat, backpressure, reconnect 설계가 필요하다. SSE는 browser support와 HTTP 친화성이 좋지만 client-to-server stream은 별도 요청이 필요하다. Polling과 long polling은 \"실시간성이 약하다\"기보다 freshness, 비용, 구현 단순성의 trade-off다.\n\n## 네트워크 경계\n\nWebSocket은 보통 HTTP/1.1 Upgrade 이후 하나의 장수 연결에서 양방향 frame을 주고받는다. HTTP/2의 extended CONNECT 같은 변형도 있지만, 면접 답변에서는 \"인프라와 클라이언트 지원 여부를 확인해야 한다\"는 caveat를 붙이는 편이 안전하다.\n\nSSE는 클라이언트가 HTTP request를 열고, 서버가 response를 닫지 않은 채 `text/event-stream`으로 이벤트를 보내는 방식이다. 방향은 server-to-client다. 클라이언트가 명령을 보내야 하면 별도 POST/PUT 요청을 같이 쓴다.\n\nPolling은 클라이언트가 주기적으로 물어본다. Long polling은 클라이언트가 요청을 보내고 서버가 이벤트가 생기거나 timeout이 날 때까지 응답을 보류한다. 응답이 끝나면 클라이언트가 다시 연결하므로, 장수 stream 하나를 유지하는 SSE/WebSocket과 운영 표면이 다르다.\n\n따라서 선택 기준은 \"실시간\" 한 단어가 아니라 방향성, 메시지 빈도, latency 목표, infra compatibility, 재연결 후 복구 방식이다. 채팅, 협업 편집, 게임처럼 client와 server가 계속 주고받으면 WebSocket이 자연스럽고, 알림/주문 상태/배치 진행률처럼 server-to-client push가 중심이면 SSE가 단순할 수 있다. 빈도가 낮고 약간 늦어도 되면 polling이 운영상 더 낫다.\n\n## Directionality와 buffering\n\n| 방식 | 방향성 | buffering/backpressure 핵심 |\n|---|---|---|\n| WebSocket | full-duplex | per-client send buffer, slow consumer, heartbeat, application-level ack |\n| SSE | server-to-client stream | proxy buffering 비활성, chunk flush, heartbeat comment, replay id |\n| Long polling | request마다 server-to-client 응답 1회 | held request 수, timeout, cursor/etag, 빈 응답 비율 |\n| Polling | client-initiated request 반복 | polling interval, cache validator, thundering herd |\n\nSSE는 HTTP라서 proxy 친화적이라고 말할 수 있지만, 모든 proxy가 streaming-friendly라는 뜻은 아니다. Nginx/edge/CDN이 response buffering이나 compression buffering을 켜면 이벤트가 즉시 flush되지 않을 수 있다. `text/event-stream`, buffering disable 설정, heartbeat comment, idle timeout을 함께 확인해야 한다.\n\nWebSocket은 frame 단위 양방향성이 장점이지만, HTTP 캐시/일반 request 로그/일부 corporate proxy와 덜 맞을 수 있다. 연결을 오래 잡기 때문에 deploy drain, 인증 만료, sticky session 또는 pub/sub fan-out도 설계 대상이다.\n\n## 운영에서 확인할 증거\n\n- 연결 수, connection duration, reconnect rate, heartbeat timeout을 본다.\n- proxy/LB idle timeout과 application heartbeat 주기가 맞는지 확인한다.\n- message backlog, send buffer, slow consumer 비율로 backpressure를 관찰한다.\n- SSE는 `Last-Event-ID` 또는 application sequence로 재연결 후 누락 이벤트를 복구하는지 본다.\n- polling은 요청 QPS와 빈 응답 비율이 비용을 감당할 수준인지 본다.\n\n## Reconnect와 replay\n\n브라우저 `EventSource`는 연결이 끊기면 자동 재연결을 시도하고, 서버가 event `id`를 보냈다면 다음 요청에 `Last-Event-ID`가 실릴 수 있다. 하지만 이것은 \"마지막으로 받은 id를 알려주는 기능\"이지 \"서버가 누락 이벤트를 자동 보관한다\"는 뜻이 아니다. 서버 쪽 replay window, sequence 저장소, gap 처리 정책이 있어야 복구가 끝난다.\n\nWebSocket API는 기본적으로 자동 재연결과 replay를 제공하지 않는다. 재연결 backoff, resume token, last seen message id, idempotent command 처리를 애플리케이션이 정해야 한다.\n\nPolling/long polling도 cursor, ETag, `since_id` 같은 기준이 없으면 중복 또는 누락이 생긴다. Long polling은 timeout 응답이 정상 흐름이므로, timeout을 장애율로 세는지 빈 응답으로 세는지 관측 정의를 분리한다.\n\n## Wrong-bucket neighbor\n\n- \"서버 알림\"인데 client-to-server 입력이 거의 없으면 WebSocket부터 고르는 것은 과할 수 있다.\n- \"양방향\"이라고 해도 30초마다 한 번 보내는 admin 화면이면 REST polling이 더 단순할 수 있다.\n- SSE에 `Last-Event-ID`가 있다고 해서 replay 저장소가 자동으로 생긴다고 말하면 틀린다.\n- WebSocket을 쓰면 TCP 연결 하나라서 backpressure가 자동 해결된다고 말하면 틀린다. 느린 클라이언트의 send buffer 정책이 필요하다.\n- Long polling을 \"polling과 같아서 항상 느리다\"고 버리면 proxy 제약이 강한 환경의 안전한 선택지를 놓친다.\n\n## 흔한 오해\n\n\"양방향이면 WebSocket, 단방향이면 SSE\"는 출발점일 뿐이다. WebSocket도 인증 갱신, 배포 중 drain, sticky session 또는 pub/sub fan-out, per-message ordering을 설계해야 한다. SSE도 브라우저 자동 재연결이 있다고 해서 유실 복구가 자동으로 끝나지 않는다. event id와 replay window가 없으면 재연결 사이의 이벤트가 사라질 수 있다.\n\nLong polling은 낡은 기술이라 무조건 제외되는 선택지도 아니다. 조직의 proxy 제약이 강하고 이벤트 빈도가 낮으며 구현 단순성이 중요하면 충분히 안전한 선택일 수 있다.\n\n## 답변 안전장치와 확인 질문\n\n면접 답변은 요구사항을 먼저 물어보는 형태가 좋다.\n\n- 클라이언트도 자주 보내야 하나요, 아니면 서버 알림만 필요한가요?\n- 유실되면 안 되나요, 중복은 허용되나요?\n- 재연결 후 몇 분 또는 몇 개 이벤트까지 replay해야 하나요?\n- 모바일/사내망/proxy/CDN/LB idle timeout 제약이 있나요?\n- 연결 수가 많은가요, 메시지 수가 많은가요?\n- 배포 중 기존 연결을 drain하는 정책이 있나요?\n\n기술 이름보다 방향성, buffering, reconnect, replay, proxy failure mode를 같이 말해야 안전한 답변이 된다.\n\n## Safe Next Docs\n\n중간 비교는 `websocket-vs-sse-vs-long-polling-realtime-intermediate-primer`, replay는 `sse-last-event-id-replay-window`로 이어진다. broader API 선택 질문이면 `rest-websocket-sse-grpc-http2-http3-choice-primer`로 돌아가고, 유실 복구 질문이면 replay window를 다음 문서로 잡는다.\n",
+  "aliases": [
+    "WebSocket SSE Polling chooser",
+    "실시간 통신 면접 선택",
+    "WebSocket SSE Long polling 차이",
+    "realtime transport answer"
+  ],
+  "expected_queries": [
+    "WebSocket SSE polling 차이를 면접에서 어떻게 말해?",
+    "알림 기능은 SSE랑 WebSocket 중 뭐가 맞아?",
+    "서버에서 클라이언트로만 보내면 SSE가 충분해?"
+  ],
+  "symptoms": [
+    "실시간이면 무조건 WebSocket이라고 생각해요",
+    "양방향성과 단방향 push를 구분하지 못해요",
+    "reconnect와 replay window를 빼먹어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/rest-websocket-sse-grpc-http2-http3-choice-primer"
+    ],
+    "next_docs": [
+      "network/websocket-vs-sse-vs-long-polling-realtime-intermediate-primer"
+    ],
+    "confusable_with": [
+      "network/websocket-vs-sse-vs-long-polling-realtime-intermediate-primer",
+      "network/sse-websocket-polling"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/websocket-sse-polling-interview-chooser.md",
+    "revision_history": []
+  }
+}

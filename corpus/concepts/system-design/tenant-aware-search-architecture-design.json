@@ -1,0 +1,52 @@
+{
+  "id": "system-design/tenant-aware-search-architecture-design",
+  "title": "Tenant-aware Search Architecture 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Tenant-aware Search Architecture 설계를 다루는 deep_dive 문서다. tenant-aware search architecture는 테넌트별 데이터 경계, 권한 필터, 색인 분리, 랭킹 정책을 검색 계층에 반영하는 설계다. 검색 질의가 tenant-aware search, search isolation, permission filter, per-tenant index처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Tenant-aware Search Architecture 설계\n\n> 한 줄 요약: tenant-aware search architecture는 테넌트별 데이터 경계, 권한 필터, 색인 분리, 랭킹 정책을 검색 계층에 반영하는 설계다.\n\nretrieval-anchor-keywords: tenant-aware search, search isolation, permission filter, per-tenant index, ACL filtering, query routing, multi-tenant search, row-level security, ranking override, data residency\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Search 시스템 설계](./search-system-design.md)\n> - [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)\n> - [멀티 테넌트 SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)\n> - [API Gateway Control Plane 설계](./api-gateway-control-plane-design.md)\n\n## 핵심 개념\n\n테넌트 인식 검색은 단순한 `tenant_id` 필터가 아니다.  \n실전에서는 아래를 함께 보아야 한다.\n\n- tenant별 데이터 격리\n- document ACL\n- per-tenant index or shared index\n- ranking override\n- data residency\n- query routing\n\n즉, 검색은 조회 기능이 아니라 권한과 랭킹을 함께 집행하는 다층 시스템이다.\n\n## 깊이 들어가기\n\n### 1. 격리 모델\n\n대표적 선택지:\n\n| 방식 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Shared index + tenant filter | 운영이 쉽다 | 필터 실수 위험 | small tenants |\n| Per-tenant index | 격리가 강하다 | 운영 비용 증가 | enterprise tenants |\n| Hybrid | 균형이 좋다 | 라우팅 복잡 | 대규모 SaaS |\n\n실무에서는 크고 민감한 tenant만 분리하는 하이브리드가 흔하다.\n\n### 2. Capacity Estimation\n\n예:\n\n- tenant 10만 개\n- 상위 100개 tenant가 트래픽 대부분\n- 검색 QPS 5만\n\n이때 hot tenant는 독립 index나 캐시가 필요할 수 있다.  \n모든 tenant가 같은 shard를 쓰면 noisy neighbor가 생긴다.\n\n봐야 할 숫자:\n\n- tenant-specific QPS\n- index size per tenant\n- ACL filter latency\n- cache hit ratio\n- refresh lag\n\n### 3. Query routing\n\n검색 요청은 tenant context를 반드시 포함해야 한다.\n\n- tenant_id\n- user role\n- resource scope\n- region\n\nrouter는 적절한 index와 filter pipeline을 선택한다.\n\n### 4. Permission filtering\n\n검색은 결과가 빨라도 안 되면 의미가 없다.\n\n- doc-level ACL\n- field-level redaction\n- role-based visibility\n- row-level security\n\n권한 필터는 검색 후처리가 아니라 초기 후보 생성 단계에서도 고려해야 한다.\n\n### 5. Ranking override\n\ntenant별로 랭킹 정책이 다를 수 있다.\n\n- enterprise docs 우선\n- 최근성 우선\n- 민감 문서 downrank\n- pinned result\n\n공통 랭킹과 tenant override를 분리하면 운영이 쉬워진다.\n\n### 6. Indexing and deletion\n\ntenant 삭제는 까다롭다.\n\n- tenant purge\n- legal hold\n- soft delete\n- reindex on policy change\n\n이 부분은 [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)와 연결된다.\n\n### 7. Data residency\n\ntenant가 특정 리전에 묶이면 검색도 따라가야 한다.\n\n- EU tenant -> EU index\n- APAC tenant -> APAC index\n- metadata만 global control plane\n\n이 부분은 [멀티 테넌트 SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)와 같은 원리다.\n\n## 실전 시나리오\n\n### 시나리오 1: 고객사별 문서 검색\n\n문제:\n\n- 서로 다른 고객의 문서가 섞이면 안 된다\n\n해결:\n\n- tenant-aware routing\n- ACL filter\n- per-tenant override\n\n### 시나리오 2: 대형 tenant 폭주\n\n문제:\n\n- 한 고객의 검색 트래픽이 전체를 압박한다\n\n해결:\n\n- 독립 shard/index\n- tenant quota\n- cache partition\n\n### 시나리오 3: 문서 삭제 요청\n\n문제:\n\n- 고객사가 데이터 삭제를 요구한다\n\n해결:\n\n- tenant purge job\n- delete tombstone\n- index 재빌드\n\n## 코드로 보기\n\n```pseudo\nfunction search(tenantId, user, query):\n  index = router.pickIndex(tenantId)\n  candidates = index.lookup(query)\n  filtered = aclFilter(candidates, user)\n  return rank(filtered, tenantPolicy(tenantId))\n```\n\n```java\npublic SearchResult search(SearchRequest req) {\n    TenantSearchContext ctx = tenantResolver.resolve(req);\n    return searchService.search(ctx, req.query());\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Shared index | 단순하다 | 격리 위험 | 초기 SaaS |\n| Per-tenant index | 강한 격리 | 비용 증가 | enterprise |\n| ACL at query time | 유연하다 | latency 증가 | 문서 수준 권한 |\n| ACL at index time | 빠르다 | 재인덱싱 필요 | 민감 데이터 |\n| Hybrid routing | 균형이 좋다 | 운영 복잡 | 대부분의 실서비스 |\n\n핵심은 tenant-aware search가 단순 필터가 아니라 **검색, 권한, 격리, 랭킹을 함께 묶는 다중 정책 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: tenant filter만 붙이면 충분한가요?\n> 의도: 격리와 권한의 차이 이해 확인\n> 핵심: 필터 실수, ACL, residency까지 고려해야 한다.\n\n> Q: per-tenant index는 언제 필요한가요?\n> 의도: 격리 수준 선택 이해 확인\n> 핵심: 대형, 민감, 규제 tenant에 적합하다.\n\n> Q: 검색 랭킹도 tenant마다 다를 수 있나요?\n> 의도: 정책별 랭킹 이해 확인\n> 핵심: 문서 우선순위와 정책이 tenant별로 다를 수 있다.\n\n> Q: 데이터 residency는 검색에 왜 중요하나요?\n> 의도: 지역 제약 이해 확인\n> 핵심: index와 query path도 지역 경계를 따라야 하기 때문이다.\n\n## 한 줄 정리\n\nTenant-aware search architecture는 검색 결과의 정확성, 권한, 격리, 지역 규제를 함께 만족시키는 멀티테넌트 검색 시스템이다.\n\n",
+  "aliases": [
+    "tenant-aware search",
+    "search isolation",
+    "permission filter",
+    "per-tenant index",
+    "ACL filtering",
+    "query routing",
+    "multi-tenant search",
+    "row-level security",
+    "ranking override",
+    "data residency",
+    "Tenant-aware Search Architecture 설계",
+    "tenant aware search architecture design"
+  ],
+  "expected_queries": [
+    "Tenant-aware Search Architecture 설계 설계 핵심을 설명해줘",
+    "tenant-aware search가 왜 필요한지 알려줘",
+    "Tenant-aware Search Architecture 설계 실무 트레이드오프는 뭐야?",
+    "tenant-aware search 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Tenant-aware Search Architecture 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Tenant-aware Search Architecture 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Tenant-aware Search Architecture 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/tenant-partition-strategy-reassignment-design"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/tenant-aware-search-architecture-design.md",
+    "revision_history": []
+  }
+}

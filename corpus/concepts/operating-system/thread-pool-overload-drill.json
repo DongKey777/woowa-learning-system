@@ -1,0 +1,44 @@
+{
+  "id": "operating-system/thread-pool-overload-drill",
+  "title": "Thread Pool Overload Drill",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "이 drill은 executor queue depth, active thread, rejection, downstream latency를 보고 thread pool overload를 판단하는 연습이다. backpressure 약점 신호를 다룬다.",
+  "body_markdown": "# Thread Pool Overload Drill\n\n## 질문\n\nExecutor active thread는 항상 max이고, queue depth가 계속 증가하며, oldest task age가 사용자 timeout보다 길다. queue size를 더 늘리는 것이 좋은 1차 처방일까?\n\n```text\nmaxPoolSize = 32\nactiveThreads = 32\nqueueDepth = 8_000 and rising\noldestQueuedAge = 7s\ncallerTimeout = 3s\ndownstream p95 = 1.8s and rising\nrejectionCount = 0\n```\n\n## 기대 답변 축\n\n- queue 증가는 tail latency를 더 키울 수 있다고 말한다.\n- downstream 병목과 task execution time을 같이 본다.\n- bounded queue, rejection, rate limit/load shedding 후보를 말한다.\n- \"처리량 부족을 큐로 해결한다\"가 아니라 \"deadline 안에 처리할 수 있는 일만 받는다\"로 설명한다.\n\n## 분기 질문\n\n- Active thread가 max인 이유가 CPU-bound work인지, downstream I/O wait인지, lock wait인지 먼저 나눈다.\n- Queue depth만 보지 말고 oldest task age가 caller deadline과 어떤 관계인지 본다.\n- Thread를 늘릴 때 downstream connection pool, DB lock, remote API limit, container CPU quota가 같이 늘어나는지 확인한다.\n- Reject가 무조건 나쁜 것이 아니라, 오래 기다릴 요청을 빠르게 실패시키는 admission control일 수 있음을 설명한다.\n- Queue를 키워도 service rate가 arrival rate보다 낮은 상태가 계속되면 대기 시간과 stale work만 늘어난다는 점을 말한다.\n\n## 답변 예시\n\n좋은 1차 답변은 \"바로 queue를 늘리지 않는다\"이다. 이미 oldest task age가 사용자 timeout보다 길다면, 큐 안의 일부 작업은 실행되기도 전에 caller 관점에서 의미를 잃었을 가능성이 크다. queue capacity를 늘리면 reject 지표는 줄어 보일 수 있지만, 실제로는 더 오래 기다린 뒤 timeout되거나, timeout된 요청의 작업이 뒤늦게 실행되는 부작용을 만들 수 있다.\n\n다음 단계는 병목을 분리하는 것이다. CPU-bound 작업이면 thread를 더 늘리는 것이 context switching과 cgroup throttling을 악화시킬 수 있다. I/O wait이면 thread 증설 전에 downstream connection pool, remote timeout, DB lock, retry 폭주를 확인해야 한다. lock wait이면 pool 크기보다 critical section, convoy, head-of-line blocking이 문제일 수 있다.\n\n처방은 bounded queue와 명시적 overflow 정책으로 시작한다. deadline을 넘길 가능성이 큰 작업은 admission 단계에서 빠르게 reject하거나 shed하고, caller에는 retry budget, backoff, `Retry-After` 같은 계약을 맞춘다. 사용자 요청과 batch/best-effort 작업이 같은 executor를 공유한다면 bulkhead로 분리한다.\n\n## 미니 판단표\n\n| 관찰 | 성급한 처방 | 더 안전한 질문 |\n|---|---|---|\n| queue depth 증가, reject 0 | queue를 더 키운다 | oldest age가 timeout보다 짧은가? |\n| active=max, CPU 낮음 | thread를 크게 늘린다 | worker가 socket/DB/lock에서 기다리는가? |\n| active=max, CPU 높음 | thread를 크게 늘린다 | core budget 안에서 work를 줄이거나 shed해야 하는가? |\n| CallerRuns 적용 후 API p99 상승 | backpressure 성공으로만 본다 | caller thread를 막아도 되는 경로인가? |\n| 장애 해소 후 queue drain | 정상 복구로만 본다 | 오래된 작업이 뒤늦게 부작용을 만들지 않는가? |\n\n## 운영 관찰 기준\n\n- Executor active/max, queue depth, remaining capacity, completed task rate, task duration, rejection count를 함께 본다.\n- Oldest task age, 사용자 timeout, retry/backoff 정책을 같은 시간축에 놓고 본다.\n- Thread dump에서 worker가 `RUNNABLE`인지, socket/DB wait인지, lock `BLOCKED`인지 확인한다.\n- CPU utilization 평균만 보지 말고 run queue, cgroup throttling, GC pause, downstream latency spike와 timestamp를 맞춘다.\n- 조치 후에는 queue가 drain되는지, 오래된 작업이 뒤늦게 실행되어 부작용을 만들지 않는지 확인한다.\n- pool별로 서로 다른 workload가 섞였는지 본다. 느린 작업이 빠른 작업을 막으면 pool sizing보다 분리가 먼저일 수 있다.\n\n## 답변에서 피할 단정\n\n- \"queue를 키우면 요청을 더 안전하게 보존한다.\"\n- \"active=max면 무조건 thread를 늘린다.\"\n- \"reject는 항상 장애이므로 0으로 만들어야 한다.\"\n- \"CPU 평균이 낮으니 pool에는 문제가 없다.\"\n\nQueue 크기나 thread 수에 고정 정답은 없다. 처리량, deadline, downstream budget, 실패 정책을 같이 본 뒤 줄일지, 늘릴지, 분리할지, 거절할지를 결정한다.\n\n## 약점 태그\n\n`executor-saturation`, `queue-depth`, `backpressure`\n\n## 복습 연결 concept\n\n`operating-system/thread-pool-backpressure-saturation-playbook`\n",
+  "aliases": [
+    "thread pool overload drill",
+    "executor queue rejection backpressure practice",
+    "스레드풀 과부하 drill",
+    "executor queue rejection 연습"
+  ],
+  "expected_queries": [
+    "thread pool overload drill을 풀고 싶어",
+    "queue depth와 rejection을 보고 backpressure 판단하는 문제를 줘",
+    "thread를 늘릴지 queue를 줄일지 연습하고 싶어"
+  ],
+  "symptoms": [
+    "queue만 키워서 timeout이 늘어요",
+    "active thread와 downstream latency를 같이 보지 않아요",
+    "reject 정책 없이 무한 대기를 허용해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "next_docs": [
+      "system-design/rate-limit-vs-queue-load-shedding-chooser"
+    ],
+    "confusable_with": [
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/thread-pool-overload-drill.md",
+    "revision_history": []
+  }
+}

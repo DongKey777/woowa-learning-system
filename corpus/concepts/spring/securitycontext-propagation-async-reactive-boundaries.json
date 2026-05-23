@@ -1,0 +1,50 @@
+{
+  "id": "spring/securitycontext-propagation-async-reactive-boundaries",
+  "title": "Spring SecurityContext Propagation Across Async and Reactive Boundaries",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "'이 문서는 SecurityContext가 Servlet request thread에서는 ThreadLocal 기반으로 보이지만",
+  "body_markdown": "# Spring SecurityContext Propagation Across Async and Reactive Boundaries\n\n> 한 줄 요약: `SecurityContext`는 스레드와 리액티브 컨텍스트 사이에서 자동으로 보존되지 않으므로, async와 reactive boundary를 넘을 때는 별도 전파 전략이 필요하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Security 아키텍처](./spring-security-architecture.md)\n> - [Spring `@Async` Context Propagation and RestClient / HTTP Interface Clients](./spring-async-context-propagation-restclient-http-interface-clients.md)\n> - [Spring `RequestContextHolder`, `ThreadLocal`, and Request Context Leakage Across Async Pools](./spring-requestcontextholder-threadlocal-leakage-async-pools.md)\n> - [Spring Reactive-Blocking Bridge: `block()`, `boundedElastic`, and Boundary Traps](./spring-reactive-blocking-bridge-boundedelastic-block-traps.md)\n> - [Spring MVC vs WebFlux](./spring-webflux-vs-mvc.md)\n> - [Spring Request Scope Proxy Pitfalls](./spring-request-scope-proxy-pitfalls.md)\n> - [Spring Security Method Security Deep Dive](./spring-security-method-security-deep-dive.md)\n> - [Spring `SecurityContextRepository` and `SessionCreationPolicy` Boundaries](./spring-securitycontextrepository-sessioncreationpolicy-boundaries.md)\n> - [BFF Session Store Outage / Degradation Recovery](../security/bff-session-store-outage-degradation-recovery.md)\n\nretrieval-anchor-keywords: SecurityContext propagation, DelegatingSecurityContextAsyncTaskExecutor, ReactiveSecurityContextHolder, context propagation, thread local security, reactive context, async boundary, reactor context\n\n## 핵심 개념\n\nSpring Security의 인증 정보는 기본적으로 현재 실행 컨텍스트에 붙는다.\n\n- MVC/서블릿: thread-local 기반 SecurityContextHolder\n- Reactive: Reactor context 기반 ReactiveSecurityContextHolder\n- Async: executor thread로 넘어가며 별도 전파가 필요\n\n즉, SecurityContext는 \"전역 상태\"가 아니라 **실행 모델에 따라 다른 컨텍스트 계약**이다.\n\n## 깊이 들어가기\n\n### 1. 서블릿 모델은 thread-local에 익숙하다\n\nMVC에서는 요청당 스레드가 일정해서 `SecurityContextHolder`가 자연스럽다.\n\n하지만 `@Async`를 쓰면 다른 스레드에서 실행되므로 자동 전파가 깨질 수 있다.\n\n### 2. reactive 모델은 Reactor context를 쓴다\n\nWebFlux에서는 인증 정보가 리액티브 체인에 붙는다.\n\n```java\nReactiveSecurityContextHolder.getContext()\n```\n\n이건 thread-local이 아니라 context propagation 기반이다.\n\n### 3. async 경계에서는 데코레이터나 래퍼가 필요하다\n\n```java\n@Bean\npublic AsyncTaskExecutor applicationTaskExecutor() {\n    return new DelegatingSecurityContextAsyncTaskExecutor(new ThreadPoolTaskExecutor());\n}\n```\n\n이런 래퍼가 있어야 SecurityContext가 새 스레드로 복사된다.\n\n### 4. reactive와 blocking을 섞으면 더 복잡해진다\n\nWebFlux 안에서 blocking code를 호출하거나, MVC에서 reactive chain을 잘못 block하면 컨텍스트 전파와 스레드 경계가 꼬인다.\n\n이 문맥은 [Spring MVC vs WebFlux](./spring-webflux-vs-mvc.md)와 같이 봐야 한다.\n\n### 5. method security도 같은 문제를 공유한다\n\n보안 메서드 수준 검증은 proxy와 context에 의존한다.\n\n이건 [Spring Security Method Security Deep Dive](./spring-security-method-security-deep-dive.md)와 연결된다.\n\n## 1차 분기\n\nSecurityContext 전파 문제는 먼저 실행 모델을 고정한다.\n\n| 1차 분기 | 재현 조건 | 관찰 증거 | 먼저 볼 경계 |\n|---|---|---|---|\n| Servlet thread-local | 같은 request thread 안에서는 인증이 보인다 | controller/service에서 `SecurityContextHolder` 정상 | servlet filter chain과 thread-local cleanup |\n| `@Async` / executor | async method 안에서 authentication이 null | caller thread와 worker thread 이름이 다름 | `DelegatingSecurityContext*`, task decorator |\n| Reactive chain | WebFlux 일부 operator에서 인증이 사라진다 | thread-local 조회는 실패, Reactor context 경로만 성공 | `ReactiveSecurityContextHolder`와 context propagation |\n| Background job | 요청이 끝난 뒤 사용자 권한을 쓰려 한다 | request context 수명 밖에서 holder 조회 | 필요한 user id/authority를 명시 인자로 전달 |\n\n## 재현 조건과 관찰 증거\n\n전파 문제를 재현할 때는 thread name과 context source를 같이 찍는다.\n\n- 요청 thread에서 authentication name이 보이는지 확인한다.\n- async worker thread에서 같은 값을 holder로 읽을 수 있는지 확인한다.\n- reactive chain에서는 `SecurityContextHolder`가 아니라 `ReactiveSecurityContextHolder` 경로를 확인한다.\n- 작업 종료 후 thread pool에 이전 사용자의 context가 남지 않는지 cleanup을 확인한다.\n\n## failure matrix\n\n| failure mode | 흔한 증상 | wrong-bucket / 오선택 | 검증/validation |\n|---|---|---|---|\n| async context loss | `@Async` 안에서 anonymous/null | 인증 실패로만 판단 | executor wrapper 또는 task decorator 적용 후 재현 |\n| thread-local leakage | 다른 요청의 context가 보이는 듯함 | holder를 global state처럼 취급 | finally cleanup과 pool reuse 테스트 |\n| reactive/thread-local 혼용 | WebFlux에서 operator별 인증 가시성이 다름 | Reactor context를 ThreadLocal처럼 기대 | chain 안에서 context가 이어지는지 StepVerifier/통합 테스트 |\n| background overreach | 요청 이후 사용자 권한을 holder에서 읽음 | security context를 오래 살아야 하는 session data로 오해 | user id/authority snapshot을 명시 파라미터로 전달 |\n\n## 흔한 오해\n\n- `SecurityContextHolder`는 전역 인증 저장소가 아니라 현재 실행 경계의 holder다.\n- `@Async`가 같은 bean 안에서 실행된다고 같은 security context를 자동 보장하지 않는다.\n- reactive 코드에서 thread-local holder를 읽는 것은 대부분 wrong bucket이다.\n- context를 복사하는 것과 cleanup을 보장하는 것은 한 세트다.\n\n## 실전 시나리오\n\n### 시나리오 1: `@Async` 안에서 인증 정보가 사라진다\n\n원인은 실행 스레드가 바뀌었기 때문이다.\n\n### 시나리오 2: WebFlux에서 인증이 어떤 연산에서는 보이고 어떤 연산에서는 안 보인다\n\nReactor context가 체인에 제대로 전달되지 않았을 수 있다.\n\n### 시나리오 3: 배경 작업에서 사용자 권한이 필요하다\n\n요청 시점의 SecurityContext를 명시적으로 복사하거나, 아예 필요한 사용자 정보를 파라미터로 전달해야 한다.\n\n### 시나리오 4: thread-local 기반 코드를 reactive 경로에 그대로 옮겼다\n\n이건 보안 정보뿐 아니라 MDC, request scope, transaction context까지 연쇄적으로 깨질 수 있다.\n\n## 코드로 보기\n\n### async executor wrapper\n\n```java\n@Bean\npublic AsyncTaskExecutor asyncTaskExecutor() {\n    ThreadPoolTaskExecutor delegate = new ThreadPoolTaskExecutor();\n    delegate.initialize();\n    return new DelegatingSecurityContextAsyncTaskExecutor(delegate);\n}\n```\n\n### reactive context access\n\n```java\nMono<String> currentUser = ReactiveSecurityContextHolder.getContext()\n    .map(context -> context.getAuthentication().getName());\n```\n\n### manual propagation idea\n\n```java\nAuthentication authentication = SecurityContextHolder.getContext().getAuthentication();\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| thread-local holder | 단순하다 | async/reactive에 약하다 | MVC |\n| async security wrapper | 편리하다 | 래퍼 구성이 필요하다 | background task |\n| Reactor context | reactive에 맞다 | 학습 비용이 있다 | WebFlux |\n| 명시적 파라미터 전달 | 가장 분명하다 | 호출 체인이 길어진다 | 중요한 작업 |\n\n핵심은 SecurityContext를 \"자동으로 따라오는 것\"으로 보지 말고, **실행 모델마다 다른 전파 규칙이 있는 상태**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: `SecurityContextHolder`와 `ReactiveSecurityContextHolder`의 차이는 무엇인가?\n> 의도: 서블릿/리액티브 컨텍스트 구분 확인\n> 핵심: 전자는 thread-local, 후자는 Reactor context다.\n\n> Q: `@Async`에서 SecurityContext가 사라지는 이유는 무엇인가?\n> 의도: thread boundary 이해 확인\n> 핵심: 다른 스레드에서 실행되기 때문이다.\n\n> Q: WebFlux에서 인증 정보를 읽을 때 무엇을 써야 하는가?\n> 의도: reactive security 이해 확인\n> 핵심: `ReactiveSecurityContextHolder`를 쓴다.\n\n> Q: security context를 명시적으로 전달하는 것이 언제 더 나은가?\n> 의도: boundary 설계 이해 확인\n> 핵심: 중요한 배경 작업이나 복잡한 경로에서는 명시 전달이 안전하다.\n\n## 한 줄 정리\n\nSecurityContext는 async와 reactive boundary를 넘으며 자동 전파되지 않으므로, 실행 모델에 맞는 전파 전략을 명시해야 한다.\n",
+  "aliases": [
+    "SecurityContext propagation",
+    "async SecurityContext lost",
+    "reactive SecurityContext boundary",
+    "DelegatingSecurityContextAsyncTaskExecutor",
+    "Reactor context authentication",
+    "ThreadLocal security context",
+    "@Async",
+    "@Bean"
+  ],
+  "expected_queries": [
+    "Spring SecurityContext는 @Async나 reactive boundary에서 자동 전파돼?",
+    "DelegatingSecurityContextAsyncTaskExecutor는 어떤 문제를 해결해?",
+    "Reactor context와 ThreadLocal SecurityContext는 어떻게 달라?",
+    "SecurityContext propagation을 할 때 누수와 cleanup은 어디서 보장해야 해?"
+  ],
+  "symptoms": [
+    "@Async 작업 안에서 Authentication이 null로 보인다.",
+    "Reactor pipeline에서 SecurityContext가 ThreadLocal처럼 자동 보존될 거라 기대했다가 깨진다.",
+    "thread pool 재사용 뒤 이전 사용자의 security context가 남을까 봐 cleanup 경계가 불명확하다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-di-basics",
+      "spring/spring-security-basics"
+    ],
+    "next_docs": [
+      "spring/spring-async-completablefuture-restclient-non-blocking-intermediate-primer"
+    ],
+    "confusable_with": [
+      "spring/requestcontextholder-threadlocal-leakage-async-pools"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-securitycontext-propagation-async-reactive-boundaries.md",
+    "revision_history": []
+  }
+}

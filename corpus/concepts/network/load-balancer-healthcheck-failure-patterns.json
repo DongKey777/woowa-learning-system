@@ -1,0 +1,59 @@
+{
+  "id": "network/load-balancer-healthcheck-failure-patterns",
+  "title": "Load Balancer Health Check Failure Patterns",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 load balancer active/passive health check, readiness/liveness,",
+  "body_markdown": "# Load Balancer 헬스체크 실패 패턴\n\n> 한 줄 요약: 헬스체크는 죽은 서버를 거르는 장치지만, 너무 단순하거나 너무 공격적으로 만들면 오히려 장애를 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [Service Mesh, Sidecar Proxy](./service-mesh-sidecar-proxy.md)\n> - [Accept Queue, SYN Backlog, Listen Overflow](./accept-queue-syn-backlog-listen-overflow.md)\n> - [Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB](./request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md)\n> - [System Design](../system-design/README.md)\n\nretrieval-anchor-keywords: load balancer health check, readiness, liveness, flapping, slow start, false positive, false negative, warmup, fail_timeout, drain\n\n---\n\n## 핵심 개념\n\nLoad balancer의 헬스체크는 \"이 서버에게 트래픽을 보내도 되는가\"를 판단하는 장치다.\n\n하지만 \"프로세스가 살아 있다\"와 \"서비스가 건강하다\"는 다르다.\n\n헬스체크가 너무 약하면:\n\n- 죽은 서버로 트래픽이 간다\n- 장애 복구가 느려진다\n\n헬스체크가 너무 강하면:\n\n- 잠깐 느린 서버를 죽은 것으로 오인한다\n- 플래핑(flapping)이 생긴다\n- 정상 서버가 필요 이상으로 배제된다\n\n### Retrieval Anchors\n\n- `load balancer health check`\n- `readiness`\n- `liveness`\n- `flapping`\n- `slow start`\n- `false positive`\n- `false negative`\n- `warmup`\n\n---\n\n## 깊이 들어가기\n\n### 1. active vs passive\n\n- `active health check`: LB가 주기적으로 직접 확인한다\n- `passive health check`: 실제 트래픽 실패율을 보고 판단한다\n\n대부분은 둘을 섞는다.\n\n### 2. 무엇을 확인할 것인가\n\n헬스체크는 계층에 따라 다르다.\n\n- TCP check: 포트가 열려 있는지\n- HTTP check: `/health`가 200을 주는지\n- gRPC check: 서비스 상태 메시지를 주는지\n\n문제는 `200 OK`가 곧 서비스 정상은 아니라는 점이다.\n\n### 3. readiness와 liveness\n\nKubernetes나 LB에서 흔히 헷갈리는 지점이다.\n\n- `liveness`: 프로세스가 죽었으면 재시작해도 되는가\n- `readiness`: 지금 트래픽을 받아도 되는가\n\n초기화 중인 앱을 liveness만 보고 통과시키면, 아직 준비되지 않은 서버로 트래픽이 간다.\n\n### 4. false positive / false negative\n\nfalse positive:\n\n- 잠깐의 GC pause\n- cold start\n- 외부 DB 지연\n- 순간적인 네트워크 흔들림\n\nfalse negative:\n\n- `/health`가 DB를 안 보고 있다\n- 실제 비즈니스 기능은 죽었는데 health endpoint만 살아 있다\n- dependency 하나가 망가졌지만 종합 상태를 못 본다\n\n### 5. grace period와 slow start\n\n새로 올라온 서버는 바로 풀 트래픽을 받지 말아야 한다.\n\n- warmup 시간 필요\n- 캐시 채움 필요\n- connection pool 초기화 필요\n\n이때 slow start 없이 바로 넣으면 배포 직후 장애처럼 보인다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 배포 직후 502가 튄다\n\n원인:\n\n- readiness가 너무 빨리 true가 됨\n- 실제 초기화가 끝나지 않음\n- LB가 새 서버로 트래픽을 보냄\n\n### 시나리오 2: 헬스체크가 너무 자주 죽는다고 판단한다\n\n원인 후보:\n\n- timeout이 짧음\n- timeout과 retry를 헬스체크에 잘못 섞음\n- GC pause를 장애로 오인\n\n### 시나리오 3: DB가 느려져서 앱이 죽은 것으로 보인다\n\nhealth endpoint가 DB를 직접 확인하면, DB 지연이 곧바로 LB에서 서버 제외로 이어질 수 있다.\n\n이게 항상 좋은 건 아니다.\n\n- 일부 기능만 느릴 수 있다\n- 전체 서버를 빼면 오히려 용량이 부족해질 수 있다\n\n---\n\n## 코드로 보기\n\n### Kubernetes readiness/liveness 예시\n\n```yaml\nlivenessProbe:\n  httpGet:\n    path: /actuator/health/liveness\n    port: 8080\n  initialDelaySeconds: 10\n  periodSeconds: 10\n\nreadinessProbe:\n  httpGet:\n    path: /actuator/health/readiness\n    port: 8080\n  initialDelaySeconds: 5\n  periodSeconds: 5\n```\n\n### Nginx upstream 예시 감각\n\n```nginx\nupstream app {\n    server 10.0.0.1 max_fails=3 fail_timeout=10s;\n    server 10.0.0.2 max_fails=3 fail_timeout=10s;\n}\n```\n\n### 운영 체크 명령\n\n```bash\nkubectl describe pod order-service\nkubectl get endpoints\nkubectl logs deploy/order-service\n```\n\n---\n\n## playbook 역할 구조 체크\n\n| 축 | 이 문서에서의 기준 |\n|---|---|\n| wrong-bucket / 오선택 | readiness, liveness, dependency health, LB target health를 모두 \"서버가 죽었다\"로 묶는 것이다. |\n| 흔한 오해 | health endpoint가 green이면 사용자 요청도 모두 정상이고, DB가 느리면 전체 pod를 빼는 것이 항상 안전하다는 생각이다. |\n| 재현 조건 | 배포 직후 warm-up, GC pause, 짧은 timeout, 느린 DB/API dependency, rolling drain이 겹칠 때 재현된다. |\n| failure matrix | false positive 제외, false negative 방치, readiness 조기 true, liveness 오탐 재시작, dependency cascade를 나눈다. |\n| 검증/validation | probe history, endpoint membership, target deregistration time, app startup milestone, dependency latency를 함께 확인한다. |\n| 관찰 증거 | `kubectl describe pod`, endpoint 변화, LB access log, health endpoint latency, restart count, slow-start 설정을 본다. |\n| 1차 분기 | 준비 안 됨(readiness)인지, 죽음(liveness)인지, 의존성 지연인지, LB membership 전파 지연인지 먼저 자른다. |\n| 기대 답변 축 | 어떤 probe가 어떤 상태를 대표하는지, 실패 표면, 오탐 비용, 완화 설정, 확인 로그를 함께 말한다. |\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 단순 TCP health check | 빠르고 단순하다 | 앱 수준 장애를 못 본다 | 기본적인 포트 생존 확인 |\n| HTTP health check | 앱 상태를 더 잘 본다 | health endpoint 설계가 필요하다 | 일반적인 웹 서비스 |\n| readiness/liveness 분리 | 운영 의도가 선명하다 | 설정이 늘어난다 | Kubernetes 기반 |\n| dependency-aware health check | 실제 서비스 상태에 가깝다 | 외부 장애가 서비스 전체를 배제할 수 있다 | 신중하게 사용할 때 |\n\n핵심은 헬스체크가 **진실한 상태의 일부만** 보여준다는 점이다.\n\n---\n\n## 꼬리질문\n\n> Q: readiness와 liveness는 왜 나누나요?\n> 의도: 배포 시점과 재시작 시점의 의미를 구분하는지 확인\n> 핵심: 준비되지 않은 서버와 죽은 서버는 다르다\n\n> Q: health check가 너무 강하면 왜 문제인가요?\n> 의도: false negative가 운영에 미치는 영향을 아는지 확인\n> 핵심: 잠깐 느린 서버를 잘못 제거하면 전체 용량이 줄어든다\n\n## 한 줄 정리\n\n헬스체크는 죽은 서버를 거르는 필터가 아니라, 준비 상태와 생존 상태를 분리해서 판단하는 운영 장치다.\n",
+  "aliases": [
+    "load balancer health check",
+    "readiness vs liveness",
+    "health check flapping",
+    "active passive health check",
+    "slow start warmup",
+    "false positive false negative",
+    "fail_timeout drain"
+  ],
+  "expected_queries": [
+    "load balancer health check가 오히려 장애를 만드는 패턴은?",
+    "readiness와 liveness를 헬스체크에서 어떻게 구분해야 해?",
+    "배포 직후 502가 늘면 health check slow start warmup을 어떻게 확인해?",
+    "health check false positive false negative를 실무에서 어떻게 줄여?",
+    "DB 지연을 health endpoint에 넣으면 왜 capacity가 더 줄 수 있어?"
+  ],
+  "symptoms": [
+    "health endpoint 200 OK만 보고 서비스가 트래픽을 받아도 된다고 판단한다",
+    "readiness와 liveness를 섞어 cold start 서버에 바로 트래픽을 보낸다",
+    "헬스체크 timeout이 너무 짧아 GC pause나 warmup을 장애로 오인한다",
+    "DB 지연을 health check에 직접 반영해 전체 capacity를 더 줄인다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/connection-keepalive-loadbalancing-circuit-breaker",
+      "network/timeout-retry-backoff-practical"
+    ],
+    "next_docs": [
+      "network/lb-connection-draining-deployment-safe-close",
+      "network/accept-queue-syn-backlog-listen-overflow",
+      "network/request-timing-decomposition",
+      "network/service-mesh-sidecar-proxy"
+    ],
+    "confusable_with": [
+      "network/connection-keepalive-loadbalancing-circuit-breaker",
+      "network/lb-connection-draining-deployment-safe-close",
+      "network/service-mesh-sidecar-proxy",
+      "network/timeout-retry-backoff-practical",
+      "network/forwarded-x-forwarded-for-x-real-ip-trust-boundary",
+      "network/anycast-routing-tradeoffs-edge-failover"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/load-balancer-healthcheck-failure-patterns.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "id": "database/shopping-cart-order-item-snapshot-table-bridge",
+  "title": "Shopping Cart Order Item Snapshot Table Bridge",
+  "category": "database",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Shopping Cart Order Item Snapshot Table Bridge\n\n> 한 줄 요약: 주문은 \"현재 장바구니를 계속 참조하는 것\"이 아니라 checkout 순간의 상품, 수량, 가격을 주문 기록으로 복사해 보존하는 모델에 가깝다.\n\n**난이도: Beginner**\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"주문 완료 후 장바구니 상품이 바뀌면 과거 주문 금액도 바뀌어 보여요\" | order가 cart item/current product를 계속 참조하는 모델 | 주문 시점의 상품, 수량, 가격을 order item snapshot으로 복사한다 |\n| \"cart item과 order item을 같은 테이블처럼 다뤄도 되나요?\" | 장바구니 lifecycle과 주문 이력 lifecycle이 섞인 DB 설계 | 현재 구매 후보와 확정된 과거 사실을 다른 table/model로 본다 |\n| \"총액 재검증과 주문 snapshot 저장을 같은 책임으로 섞고 있어요\" | checkout command 처리와 order persistence 경계 | 서버 재계산 후 그 결과를 transaction 안에서 snapshot으로 굳힌다 |\n| \"상품명이 바뀌면 주문 상세도 새 이름으로 보여야 하나요?\" | product catalog 변경과 영수증/주문 이력 표시가 섞임 | 주문 상세는 구매 당시 표시명과 옵션명을 우선한다 |\n\n## CS concept 매핑\n\n| shopping-cart 장면 | DB 개념 |\n|---|---|\n| 장바구니 상품을 주문으로 확정 | state transition |\n| 주문 시점 상품명/가격/옵션 보존 | snapshot / denormalized immutable fact |\n| order와 order item 분리 | parent-child modeling |\n| cart item 삭제 후 주문 조회 | historical record |\n| 결제 직전 금액 재검증 | source of truth |\n| 결제/정산 금액 대조 | audit / reconciliation |\n| order/order_item 저장 | transaction boundary |\n\n## 왜 같은 row를 계속 참조하면 위험한가\n\n장바구니는 \"현재 구매 후보\"이고 주문은 \"확정된 과거 사실\"이다.\n상품 가격이나 수량이 checkout 후 바뀌어도 과거 주문의 금액과 항목은 바뀌면 안 된다.\n상품명이 \"치킨 버거\"에서 \"시그니처 버거\"로 바뀌거나 옵션명이 삭제되어도, 이미 결제한 사용자의 영수증은 구매 당시 문구와 금액을 보여줘야 한다.\n\n그래서 order item에는 보통 `product_id`만 두지 않고 다음 값을 함께 둔다.\n\n| snapshot column | 저장 이유 |\n|---|---|\n| `product_id` | catalog와 추적 연결을 남긴다. 단, 과거 주문 표시의 source of truth는 아니다 |\n| `product_name_snapshot` | 상품명이 바뀌어도 구매 당시 이름을 보존한다 |\n| `option_name_snapshot`, `option_value_snapshot` | 옵션 삭제/이름 변경 후에도 주문 상세와 환불 근거를 보존한다 |\n| `unit_price_snapshot`, `option_price_snapshot` | 현재 가격이 아니라 결제 당시 단가를 보존한다 |\n| `quantity`, `line_total_snapshot` | 수량과 라인 금액을 감사 가능한 형태로 남긴다 |\n\n그래서 checkout 시점에는 보통:\n\n1. cart item을 다시 읽고 가격/수량을 검증한다.\n2. order row를 만든다.\n3. order_item snapshot row를 만든다.\n4. cart를 비우거나 상태를 바꾼다.\n\n## Parent-Child 모델로 나누기\n\n`orders`는 주문 하나의 머리(parent)이고 `order_items`는 그 주문에 포함된 항목(child)이다.\n하나의 주문에는 여러 상품/옵션이 들어갈 수 있으므로 `orders 1 : N order_items`가 자연스럽다.\n\n```text\norders\n- id\n- member_id\n- status\n- ordered_at\n- total_amount_snapshot\n- payment_id\n\norder_items\n- id\n- order_id\n- product_id\n- product_name_snapshot\n- option_name_snapshot\n- unit_price_snapshot\n- quantity\n- line_total_snapshot\n```\n\n`cart_items`는 주문 전까지의 임시 선택이고, `order_items`는 결제 이후의 기록이다.\n장바구니를 비우거나 상품을 판매 중지해도 주문 상세가 사라지면 안 되므로 lifecycle을 분리한다.\n상품 catalog row는 나중에 수정될 수 있지만, 주문 child row는 \"그때 무엇을 얼마에 샀는가\"라는 사실을 담는다.\n\n## Immutable Facts vs Catalog Changes\n\n주문에 굳혀야 하는 값과 catalog에서 계속 바뀌는 값을 분리하면 리뷰 답변이 선명해진다.\n\n| 구매 시점 immutable fact | catalog mutable state |\n|---|---|\n| 구매 당시 상품명, 옵션명 | 현재 상품명, 현재 옵션 구성 |\n| 구매 당시 단가, 할인, 쿠폰 적용액 | 현재 판매가, 행사 가격 |\n| 주문 수량, 라인 합계, 주문 총액 | 현재 재고, 판매 상태 |\n| 주문 시각, 결제 승인 식별자 | 현재 상품 이미지, 노출 여부 |\n\n예를 들어 10,000원에 주문한 상품이 다음 날 12,000원으로 오르면 과거 주문 금액은 10,000원이어야 한다.\n옵션 \"라지 사이즈\"가 \"업사이즈\"로 이름이 바뀌어도 과거 주문 상세와 환불 화면은 구매 당시 옵션명을 보여주는 편이 안전하다.\n정정이 필요하면 기존 snapshot을 조용히 덮어쓰기보다 취소, 환불, 조정 row처럼 별도 사실을 추가한다.\n\n## Audit / Reconciliation 관점\n\n주문 snapshot은 화면 표시만을 위한 중복 저장이 아니다.\n결제 대행사 승인 금액, 주문 총액, order item 합계가 서로 맞는지 대조하는 감사 기준이다.\n\n- `sum(order_items.line_total_snapshot) == orders.total_amount_snapshot`인지 확인한다.\n- `orders.total_amount_snapshot == payment.approved_amount`인지 확인한다.\n- 환불/부분취소 때 어떤 상품과 옵션을 기준으로 금액을 계산했는지 남긴다.\n- 고객 문의, 영수증, 정산 리포트는 현재 catalog가 아니라 주문 snapshot을 기준으로 재현한다.\n\ncatalog를 join해서 현재 가격으로 정산하면 \"오늘 가격\"과 \"그날 결제한 가격\"이 섞인다.\nsnapshot은 일부러 비정규화한 데이터이고, 이 중복은 과거 사실을 보존하기 위한 비용이다.\n\n## 예시 시나리오\n\n```text\n월요일 10:00\n- 상품 A 이름: \"초코 쿠키\"\n- 옵션: \"선물 포장\"\n- 가격: 3,000원\n- 사용자가 2개 주문\n\n화요일 10:00\n- 상품 A 이름이 \"더블 초코 쿠키\"로 변경\n- 가격이 3,500원으로 변경\n- \"선물 포장\" 옵션 삭제\n```\n\n화요일에 주문 상세를 열어도 과거 주문 item은 `\"초코 쿠키\"`, `\"선물 포장\"`, `3,000원`, `수량 2`, `라인 합계 6,000원`을 보여줘야 한다.\n`product_id`는 \"이 상품에서 유래했다\"는 연결이지, 과거 주문 금액을 다시 계산하는 입력이 아니다.\n\n## Wrong Bucket\n\n| wrong bucket | 왜 위험한가 | 더 나은 판단 |\n|---|---|---|\n| \"정규화가 중요하니 order item에는 product_id만 저장한다\" | 현재 catalog 변경이 과거 주문 이력을 바꿔 보이게 한다 | 주문 표시/정산에 필요한 구매 시점 값을 snapshot으로 저장한다 |\n| \"cart_items row를 주문 후에도 그대로 쓴다\" | 장바구니 삭제, 수량 변경, 재사용 흐름이 주문 이력을 흔든다 | cart item과 order item을 다른 lifecycle의 table로 나눈다 |\n| \"주문 상세 조회 때마다 product 현재 가격으로 총액을 계산한다\" | 가격 인상/할인 종료가 과거 결제 금액을 바꿔 보이게 한다 | checkout transaction에서 서버 재계산 결과를 snapshot으로 굳힌다 |\n| \"catalog 변경 시 관련 order item도 같이 update한다\" | 감사 가능한 과거 사실을 잃고 환불/정산 기준이 흔들린다 | 변경 사실은 catalog에만 반영하고 주문 정정은 별도 취소/환불/조정으로 남긴다 |\n| \"client가 보낸 가격과 총액을 그대로 snapshot에 넣는다\" | 변조된 요청이나 stale 화면 가격이 주문 기록으로 굳을 수 있다 | 서버가 product/option source of truth로 재검증한 값을 저장한다 |\n\n## 검증 질문\n\n1. 상품명, 옵션명, 단가가 checkout 이후 바뀌어도 과거 주문 상세가 그대로 재현되는가?\n2. `orders.total_amount_snapshot`과 `sum(order_items.line_total_snapshot)`이 항상 맞는지 테스트가 있는가?\n3. 결제 승인 금액과 주문 snapshot 총액을 reconciliation할 수 있는 식별자와 금액이 남는가?\n4. cart item 삭제나 cart 비우기가 order item 삭제로 전파되지 않는가?\n5. 상품 판매 중지, 옵션 삭제, 가격 변경 후에도 환불/영수증 화면이 current catalog에 의존하지 않는가?\n6. 주문 정정이 필요할 때 기존 snapshot을 덮어쓰는 대신 취소/환불/조정 이력을 남기는가?\n\n## 흔한 리뷰 신호\n\n- \"주문 상세가 cart를 계속 따라가요\"는 snapshot 부재 신호다.\n- \"총액은 request 값으로 믿고 저장해요\"는 source of truth 문제가 있다.\n- \"cart 삭제하면 주문도 사라져요\"는 lifecycle이 다른 데이터를 같은 모델로 묶은 신호다.\n- \"상품 가격 변경 후 예전 주문 금액이 바뀌어요\"는 catalog mutable state와 order immutable fact가 섞인 신호다.\n",
+  "aliases": [
+    "shopping cart order item snapshot table",
+    "order snapshot table bridge",
+    "장바구니 주문 스냅샷 테이블",
+    "checkout order item modeling",
+    "cart item copy to order item"
+  ],
+  "expected_queries": [
+    "shopping-cart 주문 완료 시 cart item을 order item snapshot으로 왜 복사해야 해?",
+    "장바구니 상품이 바뀌어도 과거 주문 금액이 보존되려면 table을 어떻게 나눠?",
+    "checkout 총액 재검증과 order snapshot 저장을 DB 모델링으로 연결해줘",
+    "cart item과 order item을 같은 row로 쓰면 어떤 문제가 생겨?"
+  ],
+  "symptoms": [
+    "주문 완료 후 장바구니 상품이 바뀌면 과거 주문 금액도 바뀌어 보인다",
+    "cart item과 order item을 같은 테이블처럼 다뤄 checkout 시점 기록이 보존되지 않는다",
+    "결제 총액 재검증과 주문 snapshot 저장을 같은 책임으로 섞는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/sql-relational-modeling-basics",
+      "software-engineering/shopping-cart-order-snapshot-from-cart-bridge"
+    ],
+    "next_docs": [
+      "database/transaction-basics",
+      "spring/shopping-cart-payment-transaction-boundary-bridge",
+      "software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge"
+    ],
+    "confusable_with": [
+      "software-engineering/shopping-cart-order-snapshot-from-cart-bridge",
+      "software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge",
+      "spring/shopping-cart-payment-transaction-boundary-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/shopping-cart-order-item-snapshot-table-bridge.md",
+    "revision_history": []
+  }
+}

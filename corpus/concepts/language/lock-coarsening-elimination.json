@@ -1,0 +1,57 @@
+{
+  "id": "language/lock-coarsening-elimination",
+  "title": "Lock Coarsening and Lock Elimination",
+  "category": "language",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Lock Coarsening and Lock Elimination\n\n> 한 줄 요약: HotSpot은 escape analysis와 JIT 최적화를 통해 필요 없는 lock을 제거하거나 여러 lock을 더 큰 임계영역으로 합칠 수 있지만, 이 최적화는 코드 구조와 관찰 가능성에 크게 의존한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Escape Analysis and Scalar Replacement](./escape-analysis-scalar-replacement.md)\n> - [Biased Locking Removal and Lock States](./biased-locking-removal-lock-states.md)\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n\n> retrieval-anchor-keywords: lock coarsening, lock elimination, escape analysis, synchronized, uncontended lock, monitor optimization, JIT, lock elision, alias analysis, critical section, compilation optimization\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nJIT는 lock을 항상 그대로 두지 않는다.\n\n- lock elimination: 안전하다고 판단되면 lock 자체를 제거\n- lock coarsening: 작은 lock 여러 개를 더 큰 lock 하나로 묶음\n\n이런 최적화는 코드가 보기보다 더 빠르게 보이는 이유이기도 하다.\n\n## 깊이 들어가기\n\n### 1. lock elimination은 언제 일어나나\n\n객체가 thread 밖으로 새지 않고, lock이 의미상 보호 대상이 아닌 경우 JIT가 lock을 제거할 수 있다.  \n특히 escape analysis와 잘 연결된다.\n\n### 2. lock coarsening은 왜 하나\n\n작은 synchronized 블록이 반복되면 lock enter/exit 비용이 누적된다.  \nJIT는 여러 개의 lock을 합쳐 더 큰 임계영역으로 바꿀 수 있다.\n\n### 3. 관찰 가능성이 있으면 최적화가 줄어든다\n\n- synchronization 대상이 외부로 새는 경우\n- identityHashCode를 보는 경우\n- reflection/agent/monitor 관찰이 있는 경우\n\n이런 요소는 최적화를 더 보수적으로 만들 수 있다.\n\n### 4. coarsening은 항상 좋은 게 아니다\n\n합쳐진 lock이 길어지면 contention이 더 커질 수 있다.  \n그래서 JIT 최적화는 코드 구조와 워크로드에 따라 득실이 다르다.\n\n## 실전 시나리오\n\n### 시나리오 1: synchronized가 많은데 성능이 나쁘지 않다\n\nJIT가 lock elimination 또는 coarsening을 적용했을 가능성이 있다.  \n그래서 microbenchmark와 실제 워크로드는 다를 수 있다.\n\n### 시나리오 2: lock이 하나로 뭉쳐서 느려진다\n\ncoarsening이 과도하게 먹거나, 원래 설계가 너무 큰 shared monitor를 쓰는 경우를 의심한다.\n\n### 시나리오 3: 코드 변경 후 lock 패턴이 바뀐다\n\n작은 리팩터링도 escape 경로를 바꿔 최적화 결과를 달라지게 할 수 있다.  \nJIT 관점에서는 충분히 다른 코드다.\n\n## 코드로 보기\n\n### 1. 작은 synchronized가 반복되는 예\n\n```java\npublic class Builder {\n    private final StringBuilder sb = new StringBuilder();\n\n    public void appendLine(String line) {\n        synchronized (sb) {\n            sb.append(line).append('\\n');\n        }\n    }\n}\n```\n\n### 2. 제거 후보가 되는 예\n\n```java\npublic int localWork() {\n    Object lock = new Object();\n    synchronized (lock) {\n        return 1;\n    }\n}\n```\n\n### 3. coarsening을 떠올리게 하는 예\n\n```java\nfor (int i = 0; i < 100; i++) {\n    synchronized (lock) {\n        doStep(i);\n    }\n}\n```\n\n### 4. 관측은 JFR/JMH로\n\n```java\n// 실제로 lock elimination이 일어나는지는 JMH + JFR로 보는 편이 좋다.\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| lock elimination | 불필요한 lock 비용을 없앤다 | 코드 구조에 민감하다 |\n| lock coarsening | enter/exit overhead를 줄인다 | contention이 커질 수 있다 |\n| 명시적 lock 설계 | 의도가 분명하다 | 최적화 여지가 줄 수 있다 |\n| lock-free 구조 | 경합이 적을 수 있다 | 설계와 검증이 어렵다 |\n\n핵심은 JIT가 lock을 최적화할 수 있지만, 그 결과는 코드의 escape/alias 구조에 의해 결정된다는 점이다.\n\n## 꼬리질문\n\n> Q: lock elimination은 왜 가능한가요?\n> 핵심: 객체와 lock이 thread 밖으로 새지 않으면 실제로 보호할 경쟁 대상이 없다고 판단할 수 있기 때문이다.\n\n> Q: lock coarsening은 왜 생기나요?\n> 핵심: 작은 lock을 합쳐 enter/exit 비용을 줄이려는 최적화다.\n\n> Q: 왜 JIT 최적화를 믿기만 하면 안 되나요?\n> 핵심: 워크로드와 관찰 가능성에 따라 결과가 달라지기 때문이다.\n\n## 한 줄 정리\n\nlock elimination과 coarsening은 HotSpot의 중요한 최적화지만, escape 분석과 코드 구조에 따라 효과가 달라진다.\n",
+  "aliases": [
+    "Lock Coarsening and Lock Elimination",
+    "HotSpot lock elimination coarsening",
+    "synchronized JIT optimization",
+    "escape analysis lock elision",
+    "monitor optimization critical section",
+    "자바 락 제거 락 병합 최적화",
+    "Reflection",
+    "final",
+    "volatile"
+  ],
+  "expected_queries": [
+    "HotSpot lock elimination과 lock coarsening은 synchronized 성능에 어떤 영향을 줘?",
+    "escape analysis가 thread 밖으로 새지 않는 lock을 제거할 수 있는 이유를 설명해줘",
+    "작은 synchronized 블록 여러 개를 JIT가 하나로 합치는 lock coarsening의 장단점은 뭐야?",
+    "identityHashCode나 reflection agent 관측이 lock 최적화를 방해할 수 있어?",
+    "JMH와 JFR로 lock elimination이 실제 workload에서 먹는지 어떻게 확인해?"
+  ],
+  "symptoms": [
+    "synchronized가 코드에 보이면 항상 같은 비용으로 monitor enter/exit가 발생한다고 생각해 JIT lock elimination 가능성을 놓쳐",
+    "작은 synchronized 블록이 반복될 때 JIT가 coarsening으로 임계영역을 합칠 수 있다는 점과 contention tradeoff를 구분하지 못해",
+    "작은 리팩터링이나 identityHashCode, reflection, agent 관측이 escape/alias 분석을 바꿔 lock 최적화 결과가 달라지는 이유를 설명하지 못해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/escape-analysis-scalar-replacement",
+      "language/jit-warmup-deoptimization",
+      "language/java-memory-model-happens-before-volatile-final"
+    ],
+    "next_docs": [
+      "language/jmh-benchmarking-pitfalls",
+      "language/jfr-jmc-performance-playbook",
+      "language/java-biased-locking-removal-lock-states"
+    ],
+    "confusable_with": [
+      "language/escape-analysis-scalar-replacement",
+      "language/jit-warmup-deoptimization",
+      "language/java-biased-locking-removal-lock-states"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/lock-coarsening-elimination.md",
+    "revision_history": []
+  }
+}

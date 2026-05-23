@@ -1,0 +1,57 @@
+{
+  "id": "data-structure/work-stealing-deque",
+  "title": "Work-Stealing Deque",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 Work-Stealing Deque를 병렬 runtime과 fork-join scheduler의 owner-local",
+  "body_markdown": "# Work-Stealing Deque\n\n> 한 줄 요약: Work-Stealing Deque는 작업을 만든 owner thread는 한쪽 끝에서 빠르게 push/pop하고, idle worker는 반대쪽 끝에서 steal하도록 설계해 병렬 스케줄러의 load balancing 비용을 낮추는 자료구조다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Ring Buffer](./ring-buffer.md)\n> - [Lock-Free MPSC Queue](./lock-free-mpsc-queue.md)\n> - [Michael-Scott Lock-Free Queue](./michael-scott-lock-free-queue.md)\n> - [Heap Variants](./heap-variants.md)\n> - [Hierarchical Timing Wheel](./hierarchical-timing-wheel.md)\n\n> retrieval-anchor-keywords: work stealing deque, chase lev deque, fork join pool, task scheduler, owner push pop, steal from head, load balancing, parallel runtime, bounded deque, scheduler queue, fork join work queue\n\n## 핵심 개념\n\n병렬 실행기에서 가장 단순한 구조는 중앙 task queue 하나를 두는 것이다.  \n하지만 worker 수가 늘수록 병목은 \"어떤 task를 고르느냐\"보다 **모두가 같은 queue를 두드린다**는 데서 온다.\n\nWork-Stealing Deque는 이 문제를 다음처럼 푼다.\n\n- 각 worker가 자기 전용 deque를 가진다\n- owner는 보통 tail 쪽에서 push/pop 한다\n- 일이 없는 다른 worker는 head 쪽에서 steal 한다\n\n즉 fast path는 대부분 single-thread local이고,  \nload balancing이 필요할 때만 cross-thread synchronization을 쓴다.\n\n## 깊이 들어가기\n\n### 1. 왜 중앙 queue가 먼저 무너지나\n\n중앙 MPMC queue는 공정해 보이지만 contention이 금방 커진다.\n\n- 모든 producer가 enqueue 경쟁\n- 모든 worker가 dequeue 경쟁\n- cache line bouncing\n- lock 또는 CAS hotspot\n\ntask가 짧을수록 queue 병목이 더 두드러진다.  \n계산보다 scheduler가 비싸지기 때문이다.\n\n### 2. owner local fast path가 핵심이다\n\nwork-stealing deque에서 owner는 보통 자기 deque tail을 독점적으로 다룬다.\n\n- 새 task spawn: `pushBottom`\n- 바로 이어서 실행: `popBottom`\n- 남의 worker가 훔칠 때만 `stealTop`\n\n이 구조는 깊이 우선 실행 감각을 만든다.\n\n- spawn한 하위 task를 바로 이어서 처리하기 쉽다\n- cache locality가 좋아진다\n- steal은 상대적으로 오래된 큰 작업을 가져가기 쉽다\n\n즉 owner는 locality를, thief는 parallelism을 챙긴다.\n\n### 3. Chase-Lev 스타일 deque가 자주 언급되는 이유\n\n실무와 논문에서 자주 나오는 구현이 Chase-Lev 계열이다.\n\n- 배열 기반 bounded deque\n- `bottom`은 owner가 주로 갱신\n- `top`은 thief가 CAS로 갱신\n- 마지막 원소 하나를 두고 owner와 thief가 경합할 수 있다\n\n어려운 지점은 여기다.\n\n- empty/full 판정\n- resize 중 steal\n- memory ordering\n- ABA와 stale read\n\n즉 아이디어는 단순하지만, **정확한 lock-free 구현은 상당히 까다롭다**.\n\n### 4. 왜 scheduler에 잘 맞나\n\nfork-join, parallel DFS, recursive divide-and-conquer는 task가 계속 파생된다.  \n이런 워크로드에서 중앙 priority queue보다 각 worker local deque가 더 자연스럽다.\n\n대표 패턴:\n\n- owner는 자기 하위 문제를 계속 밀고 들어감\n- idle worker가 위쪽 task 하나를 훔쳐 병렬도를 늘림\n\n이때 steal 대상이 \"상대적으로 큰 미처리 작업\"이 되기 쉬워  \n세분화된 작은 task를 한꺼번에 뺏는 것보다 효율적이다.\n\n### 5. backend에서 주의할 점\n\nwork-stealing deque는 만능 queue가 아니다.\n\n- strict FIFO가 아니다\n- 우선순위 보장이 없다\n- delayed task 스케줄링에는 직접 맞지 않는다\n- starvation, pinning, long-running task가 있으면 균형이 깨질 수 있다\n\n또 CPU-bound fork-join에는 잘 맞지만, I/O blocking task가 섞이면  \nworker가 deque를 오래 점유해 steal만으로는 회복이 어려울 수 있다.\n\n그래서 실무 런타임은 보통 이것도 함께 둔다.\n\n- global fallback queue\n- external submit queue\n- blocking task 보상 스레드\n- steal 실패 시 backoff\n\n## 실전 시나리오\n\n### 시나리오 1: fork-join 계산\n\n정렬, 그래프 탐색, recursive batch 처리처럼 task가 계속 쪼개지는 워크로드는  \nwork stealing이 locality와 병렬도를 같이 챙기기 좋다.\n\n### 시나리오 2: 서버 내부 병렬 파이프라인\n\n한 요청에서 fan-out된 subtask를 로컬 worker가 먼저 처리하고,  \n남는 CPU가 있을 때만 다른 worker가 가져가게 하면 중앙 queue contention을 줄일 수 있다.\n\n### 시나리오 3: scheduler의 tail latency 문제\n\ntask가 매우 짧고 수가 많으면 중앙 queue lock보다 steal deque가 유리하다.  \n반대로 task가 길고 blocking이 많으면 queue보다 worker 관리가 병목이 된다.\n\n### 시나리오 4: 부적합한 경우\n\n엄격한 우선순위, deadline ordering, delayed job dispatch가 중요하면  \nheap이나 timing wheel이 더 맞다.\n\n## 코드로 보기\n\n```java\nimport java.util.concurrent.atomic.AtomicInteger;\nimport java.util.concurrent.atomic.AtomicReferenceArray;\n\npublic class WorkStealingDeque<T> {\n    private final AtomicReferenceArray<T> buffer;\n    private final AtomicInteger top = new AtomicInteger(0);\n    private int bottom = 0; // owner thread only\n\n    public WorkStealingDeque(int capacity) {\n        this.buffer = new AtomicReferenceArray<>(capacity);\n    }\n\n    public void pushBottom(T task) {\n        int b = bottom;\n        buffer.set(b % buffer.length(), task);\n        bottom = b + 1;\n    }\n\n    public T popBottom() {\n        int b = bottom - 1;\n        bottom = b;\n        int t = top.get();\n\n        if (t > b) {\n            bottom = t;\n            return null;\n        }\n\n        T task = buffer.get(b % buffer.length());\n        if (t == b) {\n            if (!top.compareAndSet(t, t + 1)) {\n                task = null;\n            }\n            bottom = t + 1;\n        }\n        return task;\n    }\n\n    public T stealTop() {\n        int t = top.get();\n        int b = bottom;\n        if (t >= b) {\n            return null;\n        }\n\n        T task = buffer.get(t % buffer.length());\n        if (top.compareAndSet(t, t + 1)) {\n            return task;\n        }\n        return null;\n    }\n}\n```\n\n이 코드는 개념 설명용 스케치다.  \n실전 구현은 resize, memory fence, stale slot clearing, false sharing까지 고려해야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Work-Stealing Deque | owner local fast path가 빠르고 load balancing이 자연스럽다 | 정확한 구현이 복잡하고 strict ordering이 없다 | fork-join, parallel runtime, CPU-bound scheduler |\n| 중앙 MPMC Queue | 모델이 단순하고 외부 submit이 쉽다 | contention hotspot이 생기기 쉽다 | worker 수가 작거나 공정성이 더 중요할 때 |\n| Ring Buffer | bounded queue로 예측 가능성이 좋다 | 다수 worker load balancing은 별도 설계가 필요하다 | 단순 producer/consumer 파이프라인 |\n| Priority Queue | deadline/priority가 명확하다 | 병렬 worker local fast path에는 약하다 | 우선순위와 earliest deadline이 중요할 때 |\n\n핵심 질문은 \"작업을 공평하게 나눌 것인가\"보다 \"대부분의 enqueue/dequeue를 local로 끝낼 수 있는가\"다.\n\n## 꼬리질문\n\n> Q: work-stealing deque에서 왜 owner와 thief가 반대쪽 끝을 쓰나요?\n> 의도: contention 회피와 locality 이해 확인\n> 핵심: owner의 빠른 local 연산을 보장하고, thief는 충돌을 최소화하며 남는 일을 가져가기 위해서다.\n\n> Q: 왜 중앙 queue 하나보다 빠를 수 있나요?\n> 의도: 스케줄링 병목을 자료구조 관점으로 보는지 확인\n> 핵심: 대부분의 연산이 worker 로컬에서 끝나고, cross-thread 동기화는 steal 시점에만 필요하기 때문이다.\n\n> Q: 언제 priority queue가 더 맞나요?\n> 의도: 스케줄링 요구사항을 구분하는지 확인\n> 핵심: deadline ordering이나 strict priority가 중요할 때다.\n\n## 한 줄 정리\n\nWork-Stealing Deque는 병렬 scheduler에서 대부분의 작업 조작을 worker 로컬로 처리하고, 유휴 worker만 반대쪽 끝에서 steal하게 해 contention과 load imbalance를 함께 줄이는 자료구조다.\n",
+  "aliases": [
+    "Work-Stealing Deque",
+    "Chase Lev deque",
+    "fork join work queue",
+    "owner push pop steal",
+    "parallel runtime scheduler",
+    "steal from head",
+    "local deque load balancing"
+  ],
+  "expected_queries": [
+    "Work-Stealing Deque는 owner push/pop과 thief steal을 왜 반대쪽 끝에서 나눠?",
+    "fork-join scheduler에서 중앙 queue보다 worker-local deque가 contention을 줄이는 이유는?",
+    "Chase-Lev deque에서 마지막 원소 하나를 owner와 thief가 동시에 두고 경쟁하는 문제는?",
+    "Work-Stealing Deque가 strict FIFO나 priority deadline scheduler로 맞지 않는 이유는?",
+    "CPU-bound divide-and-conquer workload와 blocking I/O task에서 work stealing 효과가 어떻게 달라?"
+  ],
+  "symptoms": [
+    "병렬 scheduler에서 중앙 MPMC queue contention만 보고 owner-local deque와 thief steal의 load balancing 패턴을 떠올리지 못한다",
+    "Work-Stealing Deque를 일반 FIFO queue나 priority queue처럼 이해해 strict ordering이나 deadline ordering을 기대한다",
+    "Chase-Lev style deque의 마지막 원소 경쟁, memory ordering, resize/ABA 난점을 무시하고 단순 deque처럼 구현하려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/ring-buffer",
+      "data-structure/lock-free-mpsc-queue"
+    ],
+    "next_docs": [
+      "data-structure/bounded-mpmc-queue",
+      "data-structure/michael-scott-lock-free-queue",
+      "data-structure/hazard-pointers-vs-epoch-based-reclamation"
+    ],
+    "confusable_with": [
+      "data-structure/lock-free-mpsc-queue",
+      "data-structure/bounded-mpmc-queue",
+      "data-structure/michael-scott-lock-free-queue",
+      "data-structure/heap-variants",
+      "data-structure/hierarchical-timing-wheel",
+      "data-structure/lock-free-spsc-ring-buffer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/work-stealing-deque.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "id": "database/roomescape-reservation-cancel-reschedule-active-predicate-bridge",
+  "title": "roomescape 예약 변경/취소 ↔ active predicate와 상태 전이 브릿지",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "'이 문서는 Woowa roomescape 미션에서 예약 변경과 취소를 구현하거나 리뷰받을 때",
+  "body_markdown": "# roomescape 예약 변경/취소 ↔ active predicate와 상태 전이 브릿지\n\n## 한 줄 요약\n\nroomescape에서 예약 변경과 취소는 \"row 상태만 바꾸는 작업\"이 아니라 기존에 막고 있던 슬롯을 어떤 기준으로 해제하고 새 슬롯을 어떤 기준으로 점유하는지에 대한 상태 전이다. 그래서 `CANCELED` 라벨, 실제 blocker 해제 시점, 새 슬롯 선점 순서를 따로 보면 drift가 난다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"예약 변경은 기존 예약 삭제하고 새로 만들면 안 되나요?\" | `delete -> insert`로 old slot을 먼저 풀고 new slot을 나중에 잡는 코드 | 변경을 release와 acquire 두 작업이 아니라 하나의 상태 전이로 본다 |\n| \"취소했는데 가능한 시간 목록에서는 아직 막힌 것처럼 보여요\" | `status='CANCELED'` 라벨과 실제 blocker 조건이 다르게 쓰이는 쿼리 | active predicate가 조회와 생성에서 같은 의미인지 확인한다 |\n| \"취소 요청과 시간 변경 요청이 같이 오면 마지막 요청만 이기면 되나요?\" | 같은 reservation에 대한 cancel/reschedule 경합을 last write로 덮는 구조 | reservation-local fence와 직렬화 기준을 먼저 잡는다 |\n\n## 미션 시나리오\n\nroomescape 미션이 예약 생성에서 끝나지 않고 변경이나 취소까지 붙기 시작하면, 학습자는 가장 먼저 \"기존 예약을 지우고 새 예약을 만들면 되지 않나?\"라는 생각을 하게 된다. 구현도 보통 `delete -> insert` 또는 `update status='CANCELED'` 뒤 새 시간으로 저장하는 식으로 흘러간다.\n\n문제는 이 흐름이 동시 요청 앞에서 쉽게 흔들린다는 점이다. 사용자가 예약 시간을 바꾸는 순간 다른 사용자가 같은 슬롯을 잡을 수 있고, 취소 요청과 변경 요청이 거의 동시에 들어오면 어느 요청이 마지막 진실인지 모호해진다. 리뷰에서 \"기존 슬롯을 먼저 풀면 중간 상태가 보인다\", \"cancel은 label 변경이 아니라 blocker 해제까지 같이 봐야 한다\"는 코멘트가 붙는 이유가 여기 있다.\n\n## CS concept 매핑\n\nroomescape 예약 변경을 CS 관점으로 번역하면 `old slot -> new slot` handoff다. 핵심은 기존 점유 범위와 목표 점유 범위를 한 전이로 다루는 것이지, release와 acquire를 서로 독립된 두 작업으로 보는 것이 아니다.\n\n| roomescape 장면 | CS 개념 | 왜 같이 봐야 하나 |\n| --- | --- | --- |\n| 기존 시간 18:00 예약을 19:00으로 변경 | state transition, union lock | old slot을 먼저 풀면 다른 요청이 끼어들 수 있다 |\n| 취소 요청이 들어와 `status='CANCELED'`로만 바꿈 | active predicate | 라벨이 끝났어도 blocker truth가 남아 있으면 슬롯은 계속 막힌다 |\n| 취소와 변경 요청이 동시에 도착 | mutation fence, serialization | 같은 reservation에 대해 마지막 반영 경로를 하나로 고정해야 한다 |\n| 만료/정리 worker가 뒤늦게 슬롯을 해제 | materialized release | `expires_at` 같은 후보 시각과 실제 해제 완료 시각을 구분해야 한다 |\n\n짧게 말하면, roomescape에서 \"예약이 존재한다\"는 사실과 \"지금 이 슬롯을 막고 있다\"는 사실은 같은 듯 보이지만 저장소에서는 다른 축일 수 있다. 그래서 상태 컬럼만 바꾸는 코드는 쉬워 보여도, 실제 예약 가능 여부를 결정하는 active predicate와 어긋나기 쉽다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`delete 후 insert`로 변경을 처리하면 중간에 빈 슬롯이 노출됩니다.\"라는 코멘트는 예약 변경을 두 작업이 아니라 한 전이로 보라는 뜻이다.\n- \"`status`만 `CANCELED`로 바꾸고 overlap 기준은 그대로면 blocker drift가 납니다.\"라는 코멘트는 라벨과 실제 점유 해제 조건을 분리해서 보라는 뜻이다.\n- \"취소와 변경이 동시에 오면 같은 reservation에 대한 직렬화 기준이 필요합니다.\"라는 코멘트는 reservation-local fence 없이 마지막 write winner에 맡기지 말라는 뜻이다.\n- \"기존 슬롯과 새 슬롯을 같이 잠그거나 같은 arbitration surface에서 다시 확인해 보세요.\"라는 코멘트는 old/new scope를 같은 트랜잭션에서 다루라는 뜻이다.\n\n## 다음 학습\n\n- 예약 변경과 취소를 더 일반화한 전이 계약으로 보려면 `Reservation Reschedule and Cancellation Transition Patterns`를 이어서 읽는다.\n- 상태 라벨과 실제 blocker 기준이 왜 어긋나는지 더 깊게 보려면 `Active Predicate Drift in Reservation Arbitration`으로 간다.\n- hold 만료와 cleanup 지연 때문에 취소된 것처럼 보여도 슬롯이 안 풀리는 경우를 보려면 `Hold Expiration Predicate Drift`를 본다.\n- roomescape의 첫 동시성 선택지 자체를 다시 정리하려면 `같은 시간대 예약 동시 요청 — 락 vs 유니크 제약 vs 낙관적 락 결정`을 함께 읽는다.\n",
+  "aliases": [
+    "roomescape 예약 변경 취소 동시성",
+    "roomescape 예약 상태 전이",
+    "roomescape cancel reschedule race",
+    "룸이스케이프 예약 변경 취소 경합",
+    "예약 변경에서 기존 슬롯 먼저 풀어도 되나요"
+  ],
+  "expected_queries": [
+    "roomescape 예약 변경은 기존 슬롯을 해제하고 새 슬롯을 다시 잡으면 왜 위험해?",
+    "예약 취소와 변경이 동시에 오면 DB에서는 어떤 상태 전이로 봐야 해?",
+    "cancel 처리했는데도 예약 가능 시간이 바로 안 풀리는 이유가 뭐야?",
+    "roomescape reschedule에서 old slot과 new slot을 같이 다뤄야 하는 이유를 설명해줘",
+    "예약 row status만 바꾸면 충분한가 아니면 blocker 기준이 따로 있어?"
+  ],
+  "symptoms": [
+    "roomescape에서 예약 변경할 때 기존 슬롯을 먼저 지워도 되는지 모르겠어요",
+    "예약 취소와 변경 요청이 같이 오면 어떤 게 먼저 반영돼야 하나요",
+    "예약 상태만 CANCELED로 바꿨는데 슬롯이 계속 막혀 있는 것 같아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics",
+      "database/roomescape-reservation-concurrency-bridge"
+    ],
+    "next_docs": [
+      "database/reservation-reschedule-cancellation-transition-patterns",
+      "database/active-predicate-drift-reservation-arbitration",
+      "database/hold-expiration-predicate-drift"
+    ],
+    "confusable_with": [
+      "database/roomescape-available-times-empty-cause-router",
+      "database/reservation-reschedule-cancellation-transition-patterns",
+      "software-engineering/roomescape-reservation-flow-service-layer-bridge",
+      "database/roomescape-available-times-active-predicate-antijoin-bridge",
+      "design-pattern/roomescape-reservation-status-state-pattern-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/roomescape-reservation-cancel-reschedule-active-predicate-bridge.md",
+    "revision_history": []
+  }
+}

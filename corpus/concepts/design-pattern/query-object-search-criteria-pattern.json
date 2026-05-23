@@ -1,0 +1,61 @@
+{
+  "id": "design-pattern/query-object-search-criteria-pattern",
+  "title": "Query Object and Search Criteria Pattern",
+  "category": "design-pattern",
+  "level": "advanced",
+  "summary": "'이 문서는 Query Object and Search Criteria Pattern playbook으로, 관리자 검색이나 list",
+  "body_markdown": "# Query Object and Search Criteria Pattern\n\n> 한 줄 요약: Query Object는 복잡한 조회 파라미터를 하나의 읽기 계약으로 모아 Query Service와 Read Repository 경계를 선명하게 하고, 화면별 검색 요구가 repository 메서드 폭발로 번지는 것을 막아 준다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Specification vs Query Service Boundary](./specification-vs-query-service-boundary.md)\n> - [Repository Boundary: Aggregate Persistence vs Read Model](./repository-boundary-aggregate-vs-read-model.md)\n> - [Search Normalization and Query Pattern](./search-normalization-query-pattern.md)\n> - [Cursor Pagination and Sort Stability Pattern](./cursor-pagination-sort-stability-pattern.md)\n> - [CQRS: Command와 Query를 분리하는 패턴 언어](./cqrs-command-query-separation-pattern-language.md)\n> - [Specification Pattern](./specification-pattern.md)\n> - [Command Handler Pattern](./command-handler-pattern.md)\n\n---\n\n## 핵심 개념\n\n관리자 검색이나 리스트 화면이 커지면 이런 시점이 온다.\n\n- 파라미터가 10개 넘게 늘어난다\n- repository 메서드 이름이 길어진다\n- controller마다 필터 조합이 조금씩 달라진다\n\n이때 자주 쓰는 읽기 패턴이 Query Object 또는 Search Criteria 객체다.\n\n- 날짜 범위\n- 상태 목록\n- 정렬 기준\n- 페이징\n- 키워드\n- 화면 전용 필터\n\n핵심은 이걸 도메인 엔티티가 아니라 **read contract**로 다룬다는 점이다.\n\n따라서 Query Object는 \"도메인 규칙을 판단하는 객체\"라기보다, 특정 조회 목적을 안전하게 전달하고 정규화하는 read-side 입력 계약에 가깝다.\n\n## failure matrix\n\n| 실패 모드 | 증상 증거 | 원인 | 복구 방향 |\n|---|---|---|---|\n| repository method explosion | `findByStatusAndDateAndKeywordAndSellerAndSort`류 메서드가 계속 늘어난다 | 조회 조건을 계약 객체로 묶지 않았다 | 화면 목적별 `SearchCriteria`를 만들고 `search(criteria)`로 고정 |\n| criteria god object | `AnythingSearchCriteria`에 주문, 정산, 대시보드 필드가 모두 있다 | 재사용을 목적 경계보다 우선했다 | read use case별 criteria 분리 |\n| write model contamination | command/entity에 page, sort, keyword가 들어간다 | read concern을 domain/write model에 섞었다 | Query Object를 read side에만 둔다 |\n| normalization drift | controller마다 blank keyword, size cap, default sort 처리가 다르다 | 정규화 위치가 흩어졌다 | criteria factory/normalizer로 계약 위생을 고정 |\n| unstable pagination | 같은 검색을 넘길 때 중복/누락 row가 생긴다 | sort tie-breaker와 cursor 기준이 없다 | stable sort key와 cursor pagination 규칙 추가 |\n\n## chooser table\n\n| 요구 | 선택 | 이유 |\n|---|---|---|\n| 파라미터 2-3개의 단순 조회 | 메서드 파라미터 유지 가능 | 계약 객체 비용이 아직 크다 |\n| 필터, keyword, sort, page가 함께 변한다 | Query Object / Search Criteria | read contract를 안정화한다 |\n| 도메인 규칙 재사용 조건 | Specification | 조회 표현보다 business predicate가 중심이다 |\n| DB where clause 최적화 | Query predicate builder | persistence query 생성 책임이다 |\n| 화면 응답 조합 | Query Service / Read Model | criteria는 입력 계약이고 조합은 별도 책임이다 |\n\n## wrong-bucket examples\n\n| 잘못된 분류 | 왜 틀렸나 | 더 나은 bucket |\n|---|---|---|\n| `OrderSearchCriteria`를 `Order.canCancel(criteria)`에 넘긴다 | 화면 검색 조건이 aggregate invariant로 들어간다 | 취소 가능 조건은 entity/specification |\n| `PlaceOrderCommand`에 `page`, `sortBy`를 재사용 필드로 둔다 | write intent와 read presentation이 섞인다 | command와 query object 분리 |\n| 모든 화면이 `CommonSearchCriteria`를 공유한다 | 필드 의미가 화면마다 달라져 null/ignored field가 늘어난다 | 목적별 criteria |\n| query object가 remote API까지 호출한다 | 입력 계약 객체가 orchestration을 수행한다 | query service가 criteria를 받아 source를 조합 |\n\n### Retrieval Anchors\n\n- `query object`\n- `search criteria pattern`\n- `read query contract`\n- `search condition object`\n- `query parameter object`\n- `admin search model`\n- `search normalization`\n- `cursor pagination`\n\n---\n\n## 깊이 들어가기\n\n### 1. Query Object는 write command의 반대편 읽기 계약에 가깝다\n\nCommand가 쓰기 유스케이스 입력을 캡슐화한다면, Query Object는 읽기 유스케이스 입력을 캡슐화한다.\n\n- `PlaceOrderCommand`\n- `OrderSearchCriteria`\n\n둘 다 입력을 모으지만 목적은 다르다.\n\n- command: 상태 변경\n- query object: 조회 조건과 표현 요구\n\n### 2. repository method explosion을 막는 데 효과적이다\n\n이런 구조는 금방 한계가 온다.\n\n- `findByStatusAndDateRange`\n- `findByStatusAndDateRangeAndKeyword`\n- `findByStatusAndDateRangeAndKeywordAndSeller`\n\nQuery Object로 바꾸면 공개 계약이 더 안정적이다.\n\n- `search(OrderSearchCriteria criteria)`\n\n### 3. Query Object는 domain specification과 섞이면 안 된다\n\n검색 조건 객체는 보통 화면/운영 요구를 반영한다.\n\n- 정렬\n- 페이지 크기\n- 탭 선택\n- 표시용 필터\n\n이걸 도메인 명세와 같은 계층으로 올리면 의미가 섞인다.  \nQuery Object는 read side 경계에 두는 편이 자연스럽다.\n\n### 4. criteria object는 validation과 normalization을 가질 수 있다\n\n아주 단순 DTO로 끝낼 수도 있지만, 다음 정도는 가질 수 있다.\n\n- 빈 문자열 -> null 정규화\n- 잘못된 페이지 크기 보정\n- 정렬 기본값 적용\n- 상호배타 필터 검증\n\n즉 읽기 계약의 위생을 유지하는 최소 책임을 줄 수 있다.\n\n### 5. Query Object가 너무 범용이면 다시 `AnythingSearchCriteria`가 된다\n\n반대로 모든 화면을 하나의 거대한 criteria object로 묶어도 smell이다.\n\n- 주문 검색용\n- 정산 검색용\n- 대시보드 집계용\n\n읽기 목적이 다르면 Query Object도 분리하는 편이 더 낫다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 관리자 주문 검색\n\n상태, 기간, 결제수단, 회원 등급, 정렬, 페이지 크기를 하나의 `OrderSearchCriteria`로 모아 Query Service에 넘길 수 있다.\n\n### 시나리오 2: 정산 대상 조회\n\n정산 대상은 주문 검색과 비슷해 보여도 기준이 다를 수 있다.  \n별도 `SettlementCandidateCriteria`가 더 자연스럽다.\n\n### 시나리오 3: 검색 API 계약 진화\n\n새 필터가 추가되어도 메서드 시그니처를 연쇄적으로 바꾸기보다 criteria 객체만 확장하면 된다.\n\n---\n\n## 코드로 보기\n\n### query object\n\n```java\npublic record OrderSearchCriteria(\n    List<OrderStatus> statuses,\n    LocalDate fromDate,\n    LocalDate toDate,\n    String keyword,\n    String sortBy,\n    int page,\n    int size\n) {\n    public OrderSearchCriteria normalized() {\n        return new OrderSearchCriteria(\n            statuses,\n            fromDate,\n            toDate,\n            keyword == null || keyword.isBlank() ? null : keyword.trim(),\n            sortBy == null ? \"createdAt\" : sortBy,\n            Math.max(page, 0),\n            Math.min(Math.max(size, 1), 100)\n        );\n    }\n}\n```\n\n### query service\n\n```java\npublic class OrderQueryService {\n    public Page<OrderSearchView> search(OrderSearchCriteria criteria) {\n        return orderReadRepository.search(criteria.normalized());\n    }\n}\n```\n\n### repository boundary\n\n```java\npublic interface OrderReadRepository {\n    Page<OrderSearchView> search(OrderSearchCriteria criteria);\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 긴 메서드 파라미터 목록 | 처음엔 단순하다 | 조건이 늘수록 유지보수가 어렵다 | 필터가 거의 없는 간단 조회 |\n| Query Object | 조회 계약이 선명하고 확장 가능하다 | 객체 수가 늘어난다 | 검색 조건과 정렬/페이지가 복잡할 때 |\n| 거대 범용 Criteria | 재사용이 많아 보인다 | 목적이 섞여 다시 비대해진다 | 보통 피하는 편이 좋다 |\n\n판단 기준은 다음과 같다.\n\n- 읽기 계약이 복잡해지면 Query Object\n- 도메인 규칙 조건과 화면 검색 조건은 분리\n- 목적이 다른 검색은 criteria도 분리\n\n---\n\n## 꼬리질문\n\n> Q: Query Object와 Specification은 같은 건가요?\n> 의도: 읽기 계약과 도메인 조건을 구분하는지 본다.\n> 핵심: 아니다. Query Object는 조회 계약, Specification은 도메인 조건 표현에 더 가깝다.\n\n> Q: Query Object는 그냥 DTO 아닌가요?\n> 의도: 얇은 계약 객체의 의미를 보는 질문이다.\n> 핵심: 맞다. 다만 읽기 경계에서 정규화와 계약 진화 지점을 제공하는 점이 중요하다.\n\n> Q: 화면마다 criteria를 따로 만들면 너무 많아지지 않나요?\n> 의도: 과분리와 과공유 사이 균형을 보는 질문이다.\n> 핵심: 목적이 크게 다르면 분리하고, 진짜 공유되는 read contract만 재사용하는 편이 낫다.\n\n## 한 줄 정리\n\nQuery Object는 복잡한 검색 파라미터를 읽기 계약으로 모아 Query Service와 Read Repository 경계를 선명하게 하고, repository 메서드 폭발을 줄여 주는 패턴이다.\n",
+  "aliases": [
+    "query object",
+    "search criteria pattern",
+    "read query contract",
+    "search condition object",
+    "query parameter object",
+    "admin search model",
+    "search normalization",
+    "cursor pagination",
+    "repository method explosion",
+    "search criteria DTO"
+  ],
+  "expected_queries": [
+    "Query Object와 Search Criteria는 복잡한 조회 파라미터를 read contract로 모으는 패턴이야?",
+    "repository method explosion이 생길 때 search(criteria) 형태로 공개 계약을 안정화하는 이유가 뭐야?",
+    "Query Object는 write command와 목적이 다르고 화면 조회 조건, 정렬, paging 요구를 담는 이유가 뭐야?",
+    "검색 조건 객체가 domain specification과 섞이면 화면 요구가 도메인 언어를 오염시키는 이유가 뭐야?",
+    "criteria object는 blank keyword, page size cap, default sort 같은 normalization 책임을 어디까지 가져도 돼?"
+  ],
+  "symptoms": [
+    "검색 파라미터가 늘어날수록 repository method 이름과 controller 시그니처가 폭발한다",
+    "화면별 필터, 정렬, 페이징, keyword 요구를 domain entity나 command model에 섞는다",
+    "하나의 AnythingSearchCriteria에 모든 화면 조건을 몰아넣어 read contract 목적이 흐려진다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/specification-vs-query-service-boundary",
+      "design-pattern/repository-boundary-aggregate-vs-read-model",
+      "design-pattern/cqrs-command-query-separation-pattern-language"
+    ],
+    "next_docs": [
+      "design-pattern/search-normalization-query-pattern",
+      "design-pattern/cursor-pagination-sort-stability-pattern",
+      "design-pattern/dual-read-pagination-parity-sample-packet-schema"
+    ],
+    "confusable_with": [
+      "design-pattern/specification-pattern",
+      "design-pattern/specification-vs-query-service-boundary",
+      "design-pattern/search-normalization-query-pattern",
+      "design-pattern/cursor-pagination-sort-stability-pattern",
+      "design-pattern/repository-pattern-vs-antipattern",
+      "design-pattern/repository-boundary-aggregate-vs-read-model"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/design-pattern/query-object-search-criteria-pattern.md",
+    "revision_history": []
+  }
+}

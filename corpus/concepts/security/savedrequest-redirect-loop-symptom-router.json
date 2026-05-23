@@ -1,0 +1,47 @@
+{
+  "id": "security/savedrequest-redirect-loop-symptom-router",
+  "title": "SavedRequest Redirect Loop Symptom Router",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 Spring Security SavedRequest와 로그인 성공 redirect loop 증상을 분기한다. 원래 URL 반복, 세션에 저장된 요청, success handler target 충돌 같은 표현을 다룬다.",
+  "body_markdown": "# SavedRequest Redirect Loop Symptom Router\n\n## 한 줄 판단\n\n로그인 후 redirect loop는 SavedRequest 하나로 단정하지 않는다. 먼저 다음 요청에 세션 쿠키가 붙고 인증 객체가 만들어지는지 확인한 뒤, SavedRequest 복원, success handler target, 보호 경로 설정을 나눈다.\n\n## 첫 분기\n\nredirect loop의 첫 분기는 \"로그인 상태가 유지되지 않는가\"와 \"로그인 후 목적지 선택이 꼬였는가\"다.\n\n| 첫 관찰 | 먼저 볼 축 | 의미 |\n|---|---|---|\n| 로그인 성공 응답 뒤 다음 요청에 cookie 없음 | cookie scope/SameSite/Secure | SavedRequest 이전의 session continuity 문제 |\n| cookie는 있는데 서버가 anonymous | session lookup/SecurityContext persistence | session store, cookie name, filter chain 문제 |\n| 인증 객체는 있는데 다시 login으로 302 | 보호 경로/authorization 설정 | role 부족, login/callback/static permitAll 누락 |\n| 인증 후 같은 원래 URL만 반복 | SavedRequest cleanup/priority | request cache와 success handler 정책 충돌 |\n| SPA route와 서버 redirect가 모두 동작 | client/server routing split | API login과 page login response contract 충돌 |\n\n## 관찰 증거\n\n브라우저 Network에서 redirect chain을 순서대로 본다. 특히 로그인 성공 응답 다음 `Location`, 그 다음 요청의 `Cookie` header, 서버의 authentication decision이 한 묶음이다.\n\n| 증거 | 판단 포인트 |\n|---|---|\n| 302 chain | `/login`과 보호 URL이 반복되는지, 다른 URL로 튀는지 |\n| 로그인 성공 response `Set-Cookie` | session id 발급 또는 rotation 여부 |\n| 다음 request `Cookie` header | 새 session cookie가 실제로 붙었는지 |\n| 서버 auth log | SecurityContext에 인증 객체가 생겼는지 |\n| request cache/SavedRequest log | 어떤 원래 URL이 저장/복원되는지 |\n| success handler log | default target과 saved target 중 무엇을 선택했는지 |\n| SecurityContext/session store log | 같은 session id에서 인증 객체가 저장/조회되는지 |\n\n## 10초 분기표\n\n| 관찰 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| 로그인 성공 뒤 다음 request에 cookie 없음 | cookie/CORS/SameSite 문제 | cookie visible router로 이동 |\n| cookie는 있는데 서버가 익명 처리 | session lookup 실패 | session store, cookie name, session fixation/rotation |\n| 인증은 됐는데 보호 URL에서 다시 403/302 | authorization 또는 보호 경로 문제 | role/resource policy, login page permitAll |\n| 로그인 성공 후 원래 URL이 계속 복원 | SavedRequest 잔존 또는 우선순위 | request cache cleanup, handler redirect rule |\n| custom success handler가 항상 특정 URL로 보냄 | handler target 충돌 | `alwaysUse`, default target, saved request 우선순위 |\n| `/login` 자체가 보호됨 | 설정 오류 | login page, static assets, callback path permitAll |\n\n## wrong-bucket 비교\n\n| 증상 | 잘못 가기 쉬운 결론 | 더 정확한 분기 |\n|---|---|---|\n| `/login` 왕복 | SavedRequest 문제 | 먼저 session cookie가 다음 요청에 붙는지 확인 |\n| 로그인 성공 handler 실행 | 인증 완료 | 다음 요청에서 SecurityContext가 복원되는지까지 확인 |\n| 302가 많음 | redirect 설정만 문제 | 401/403/302 status와 `Location`을 chain으로 본다 |\n| 원래 URL 복원 실패 | request cache 문제 | custom success handler가 saved target을 덮는지 본다 |\n\n## Spring Security mental model\n\n인증이 필요한 보호 URL에 익명 사용자가 접근하면 Spring Security는 현재 request를 SavedRequest로 session에 저장하고 로그인 페이지로 보낼 수 있다. 로그인 성공 후에는 SavedRequest가 있으면 원래 URL로 되돌리는 흐름이 기본으로 동작할 수 있다.\n\n이 흐름은 세션 쿠키가 유지된다는 전제 위에 있다. 세션 쿠키가 다음 request에 붙지 않으면 SavedRequest가 저장된 session을 찾을 수 없고, 사용자는 매번 새 익명 사용자처럼 보인다. 그래서 SavedRequest를 보기 전에 cookie continuity를 먼저 배제한다.\n\nCustom success handler, `defaultSuccessUrl`, `alwaysUse`, OAuth2 success handler, SPA redirect target이 동시에 있으면 \"어디로 보낼지\" 정책이 충돌할 수 있다. 이때는 어떤 handler가 최종 `Location`을 썼는지 로그로 남긴다.\n\n## 검증 순서\n\n1. redirect chain을 HAR 또는 Network screenshot으로 고정한다.\n2. 로그인 성공 직후 response의 `Set-Cookie`와 다음 request의 `Cookie` header를 비교한다.\n3. 서버에서 같은 session id로 SecurityContext가 만들어졌는지 확인한다.\n4. SavedRequest에 저장된 URL과 method가 무엇인지 확인한다. 로그인 페이지, callback, 정적 리소스가 저장되어 있으면 설정을 의심한다.\n5. success handler가 SavedRequest를 우선하는지, default target을 우선하는지 결정 규칙을 확인한다.\n6. 로그인 페이지와 OAuth callback, 정적 리소스가 `permitAll`인지 확인한다.\n7. 인증은 되었지만 다시 보호 URL에서 막히면 authorization 문제로 분기한다.\n\n검증 성공 기준은 한 번의 보호 URL 접근에서 SavedRequest가 저장되고, 로그인 성공 후 한 번만 소비되며, 다음 요청에서 같은 session id의 인증 객체가 복원되는 것이다. loop가 사라졌더라도 SavedRequest를 무조건 끄는 식으로 원래 URL 복원 요구사항을 깨뜨렸는지 확인한다.\n\n## 흔한 오해\n\n302가 반복되면 무조건 SavedRequest 문제라고 보면 안 된다. 가장 흔한 첫 원인은 다음 요청에 세션 쿠키가 안 붙는 것이다.\n\nSavedRequest는 인증 실패의 원인이 아니라 \"인증 후 어디로 돌아갈지\"를 기억하는 장치다. 인증 객체가 없는 상태에서 SavedRequest만 지우면 증상이 달라질 수는 있어도 원인은 남는다.\n\nSPA에서 로그인 성공 후 프론트 라우터가 이동하고 서버 success handler도 redirect하면 두 라우팅 정책이 충돌할 수 있다. API 로그인과 page login을 섞는 경우 response 형태를 명확히 분리한다.\n\n## 관련 playbook\n\n먼저 cookie failure를 배제하고, 그 다음 Spring Security login state routing 문서로 연결한다.\n",
+  "aliases": [
+    "savedrequest redirect loop router",
+    "spring security saved request login loop",
+    "SavedRequest 리다이렉트 루프",
+    "로그인 성공 후 원래 URL 반복"
+  ],
+  "expected_queries": [
+    "로그인 성공했는데 다시 로그인 페이지로 돌아가요 SavedRequest랑 JSESSIONID 때문인가요?",
+    "Spring Security SavedRequest 때문에 로그인 리다이렉트가 반복될 수 있어?",
+    "로그인 성공 후 원래 URL로 갔다가 다시 로그인으로 돌아와",
+    "세션에 저장된 요청이 redirect loop를 만들 때 어디를 봐?"
+  ],
+  "symptoms": [
+    "로그인 성공했는데 다시 로그인 페이지로 돌아가고 JSESSIONID와 SavedRequest가 의심돼요",
+    "로그인 성공 후 같은 URL을 계속 왕복해요",
+    "SavedRequest가 세션에 남아 있는 것 같아요",
+    "인증 성공 handler와 redirect target이 충돌해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/authentication-authorization-session-foundations"
+    ],
+    "next_docs": [
+      "spring/login-state-routing-decision-guide"
+    ],
+    "confusable_with": [
+      "spring/login-state-routing-decision-guide",
+      "security/session-cookie-jwt-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/savedrequest-redirect-loop-symptom-router.md",
+    "revision_history": []
+  }
+}

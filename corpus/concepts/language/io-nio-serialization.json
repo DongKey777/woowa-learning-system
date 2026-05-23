@@ -1,0 +1,60 @@
+{
+  "id": "language/io-nio-serialization",
+  "title": "Java IO, NIO, Serialization, JSON Mapping",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 Java IO, NIO, ByteBuffer, Channel, native serialization, JSON mapping을 운영 비용과 schema evolution 관점에서 연결하는 advanced deep dive다.",
+  "body_markdown": "# Java IO, NIO, Serialization, JSON Mapping\n\n**난이도: 🔴 Advanced**\n\n> 파일/네트워크 입출력과 객체 변환을 실전에서 읽고 판단하기 위한 정리\n\n> 관련 문서:\n> - [Serialization Compatibility and `serialVersionUID`](./serialization-compatibility-serial-version-uid.md)\n> - [`serialPersistentFields`, `readObjectNoData`, and Native Serialization Evolution Escape Hatches](./serialpersistentfields-readobjectnodata-evolution-escape-hatches.md)\n> - [Record Serialization Evolution](./record-serialization-evolution.md)\n> - [BigDecimal Money Equality, Rounding, and Serialization Pitfalls](./bigdecimal-money-equality-rounding-serialization-pitfalls.md)\n> - [BigDecimal `MathContext`, `stripTrailingZeros()`, and Canonicalization Traps](./bigdecimal-mathcontext-striptrailingzeros-canonicalization-traps.md)\n> - [Floating-Point Precision, `NaN`, `Infinity`, and Serialization Pitfalls](./floating-point-precision-nan-infinity-serialization-pitfalls.md)\n> - [Primitive vs Wrapper Fields in JSON Payload Semantics](./primitive-vs-wrapper-fields-json-payload-semantics.md)\n> - [Enum Persistence, JSON, and Unknown Value Evolution](./enum-persistence-json-unknown-value-evolution.md)\n> - [JSON `null`, Missing Field, Unknown Property, and Schema Evolution](./json-null-missing-unknown-field-schema-evolution.md)\n> - [`Instant`, `LocalDateTime`, `OffsetDateTime`, `ZonedDateTime` Boundary Design](./java-time-instant-localdatetime-boundaries.md)\n> - [`Locale.ROOT`, Case Mapping, and Unicode Normalization Pitfalls](./locale-root-case-mapping-unicode-normalization.md)\n> - [Charset, UTF-8 BOM, Malformed Input, and Decoder Policy](./charset-utf8-bom-malformed-input-decoder-policy.md)\n> - [Direct Buffer, Off-Heap, Native Memory Troubleshooting](./direct-buffer-offheap-memory-troubleshooting.md)\n\n> retrieval-anchor-keywords: Java IO, NIO, ByteBuffer, FileChannel, SocketChannel, blocking IO, non-blocking IO, serialization, native serialization, JSON mapping, Jackson, ObjectInputStream, ObjectOutputStream, BigDecimal JSON, canonical representation, precision loss, schema evolution, OffsetDateTime JSON, Unicode normalization, UTF-8 boundary, enum JSON mapping, unknown enum, NaN JSON, null vs missing field, primitive field default, serialPersistentFields, charset, BOM, malformed input\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 이 주제를 알아야 하는가](#왜-이-주제를-알아야-하는가)\n- [IO와 NIO의 차이](#io와-nio의-차이)\n- [버퍼와 채널](#버퍼와-채널)\n- [ByteBuffer를 읽는 감각](#bytebuffer를-읽는-감각)\n- [Blocking과 Non-blocking](#blocking과-non-blocking)\n- [Serialization의 의미와 위험](#serialization의-의미와-위험)\n- [Serialization 피해야 하는 이유](#serialization-피해야-하는-이유)\n- [JSON Mapping이 더 자주 쓰이는 이유](#json-mapping이-더-자주-쓰이는-이유)\n- [실전 선택 기준](#실전-선택-기준)\n- [면접에서 자주 나오는 질문](#면접에서-자주-나오는-질문)\n\n</details>\n\n## 왜 이 주제를 알아야 하는가\n\n백엔드에서는\n\n- 파일을 읽고 쓰고\n- 네트워크로 데이터를 주고받고\n- 객체를 직렬화하거나 JSON으로 바꾸는\n\n일이 반복된다.\n\n이때 중요한 것은 \"API 이름\"보다 **어떤 비용과 제약이 생기는가**다.\n\n---\n\n## IO와 NIO의 차이\n\n### IO\n\n- 전통적인 스트림 기반 API\n- 바이트 또는 문자 단위로 읽고 쓴다\n- 코드가 단순하다\n\n예:\n\n```java\nInputStream in = new FileInputStream(\"a.txt\");\nOutputStream out = new FileOutputStream(\"b.txt\");\n```\n\n### NIO\n\n- 버퍼, 채널, 선택자(selector) 중심\n- 더 많은 제어가 가능하다\n- 대규모 동시 연결이나 고성능 처리에서 자주 언급된다\n\n예:\n\n```java\nPath path = Path.of(\"a.txt\");\nbyte[] bytes = Files.readAllBytes(path);\n```\n\n### 감각적으로 보면\n\n- IO는 \"흐르는 물을 그대로 받는 느낌\"\n- NIO는 \"버퍼에 담아 효율적으로 처리하는 느낌\"\n\n---\n\n## 버퍼와 채널\n\n### Buffer\n\n- 데이터를 잠시 담아두는 저장 공간\n- 읽기/쓰기 단위를 관리하기 쉽다\n\n### Channel\n\n- 데이터가 오가는 통로\n- Stream보다 더 명시적으로 입출력을 다룬다\n\n### 중요한 차이\n\n- Stream은 보통 순차 처리 중심\n- Channel은 더 유연한 제어가 가능하다\n\n즉 큰 파일 처리나 네트워크 이벤트 처리에서 NIO가 자주 고려된다.\n\n### 자주 보는 채널\n\n- `FileChannel`\n- `SocketChannel`\n- `ServerSocketChannel`\n\n채널은 기본적으로 버퍼와 함께 사용한다.  \n즉 \"채널에서 바로 바이트를 하나씩 읽는 느낌\"이 아니라, **버퍼에 담아 옮기는 느낌**이 더 가깝다.\n\n---\n\n## ByteBuffer를 읽는 감각\n\n`ByteBuffer`는 NIO를 이해할 때 핵심이다.\n\n### 상태\n\n버퍼는 보통 아래 상태 전이를 기억하면 된다.\n\n- `clear()`: 쓰기 준비\n- `flip()`: 읽기 준비\n- `compact()`: 남은 데이터를 앞으로 당김\n\n### 핵심 필드\n\n- `position`\n- `limit`\n- `capacity`\n\n이 셋의 관계를 이해하면, 왜 읽고 쓴 뒤에 `flip()`이 필요한지 바로 보인다.\n\n### 예시 흐름\n\n```java\nByteBuffer buffer = ByteBuffer.allocate(1024);\nint read = channel.read(buffer);\nbuffer.flip();\nchannel.write(buffer);\n```\n\n`read()` 후에는 버퍼가 \"쓴 상태\"이므로, 그대로 쓰기 작업에 넘기려면 `flip()`이 필요하다.\n\n### 실전 포인트\n\n- 버퍼를 잘못 넘기면 읽은 데이터가 비어 보이거나, 쓰기 위치가 꼬인다\n- 대용량 처리에서는 버퍼 크기와 반복 횟수도 성능에 영향을 준다\n- direct buffer는 JVM 힙 밖 자원을 활용할 수 있어 상황에 따라 고려된다\n\n---\n\n## Blocking과 Non-blocking\n\n### Blocking\n\n- 작업이 끝날 때까지 호출 스레드가 기다린다\n\n### Non-blocking\n\n- 바로 반환하고, 나중에 다시 처리한다\n\n### 언제 중요한가\n\n- 연결 수가 많을 때\n- 한 스레드가 오래 대기하는 비용이 클 때\n- 서버 자원을 효율적으로 쓰고 싶을 때\n\n실전에서는 \"무조건 non-blocking이 더 좋다\"가 아니라,\n구조와 복잡도를 감당할 수 있는지까지 같이 봐야 한다.\n\n---\n\n## Serialization의 의미와 위험\n\nSerialization은 **객체 상태를 바이트 형태로 저장하거나 전송 가능한 형태로 바꾸는 것**이다.\n\n### 쓰는 이유\n\n- 캐시 저장\n- 파일 저장\n- 네트워크 전송\n\n### 위험\n\n- 클래스 구조가 바뀌면 호환성 문제가 생길 수 있다\n- 내부 구현이 노출되기 쉽다\n- 보안 이슈가 생길 수 있다\n\n### 실전 감각\n\n- Java native serialization은 편하지만 주의가 필요하다\n- 장기 저장 형식으로는 신중해야 한다\n\n---\n\n## Serialization 피해야 하는 이유\n\nJava native serialization은 \"작동은 쉽지만 운영 리스크가 큰 방식\"으로 보는 편이 안전하다.\n\n### 호환성 문제\n\n- 필드 추가/삭제가 잦으면 역직렬화가 깨질 수 있다\n- `serialVersionUID`를 의식해야 한다\n\n### 캡슐화 약화\n\n- 직렬화 대상이 곧 외부 포맷이 되므로 내부 설계를 바꾸기 어려워진다\n- private 구현 세부가 포맷 안정성에 영향을 준다\n\n### 보안 문제\n\n- 신뢰할 수 없는 입력을 역직렬화하는 것은 위험하다\n- 객체 생성 과정에서 예상치 못한 코드 실행 경로가 열릴 수 있다\n\n### 객체 생명주기 문제\n\n- `transient` 필드는 직렬화되지 않는다\n- `readObject`, `writeObject`를 쓰면 규칙을 더 세심하게 관리해야 한다\n\n즉 Java native serialization은 \"간단한 데모\"에는 편할 수 있지만, 장기 유지보수 포맷으로는 부담이 크다.\n\n---\n\n## JSON Mapping이 더 자주 쓰이는 이유\n\n실무에서는 객체를 그대로 바이트로 저장하기보다 JSON으로 바꾸는 경우가 많다.\n\n### 이유\n\n- 사람이 읽기 쉽다\n- 언어 간 호환이 좋다\n- API 응답/요청 형식으로 널리 쓰인다\n\n### Trade-off\n\n- 문자열 기반이라 바이트 직렬화보다 크기가 커질 수 있다\n- 파싱 비용이 있다\n- 스키마를 강하게 보장하지 않는다\n- 숫자/날짜/널 처리 규칙을 팀이 따로 합의해야 한다\n\n### 자주 보는 도구\n\n- Jackson\n- Gson\n- Spring에서의 HTTP message converter\n\n### 실전 감각\n\n- API 경계에서는 JSON이 디버깅과 운영에 유리한 경우가 많다\n- 내부 고속 통신이나 저장 포맷은 binary protocol을 별도로 설계하는 경우도 있다\n- \"JSON이 무조건 좋다\"가 아니라, 관찰 가능성과 호환성 측면에서 자주 선택된다고 보는 것이 정확하다\n\n---\n\n## 실전 선택 기준\n\n### 파일 처리\n\n- 단순한 순차 읽기/쓰기라면 IO로도 충분한 경우가 많다\n- 대용량 파일이나 더 세밀한 제어가 필요하면 NIO를 고려한다\n- 버퍼 상태 전이가 중요한 코드라면 `ByteBuffer`의 `position`, `limit`, `flip()` 동작을 먼저 확인한다\n\n### 서비스 간 통신\n\n- 대체로 JSON mapping이 더 흔하다\n- 디버깅과 운영 편의성이 좋기 때문이다\n\n### 저장 포맷\n\n- 빠른 내부 저장이 중요하면 binary serialization을 검토할 수 있다\n- 장기 유지보수와 호환성이 중요하면 JSON/명시적 포맷이 더 안전하다\n- 신뢰할 수 없는 입력을 받는다면 native serialization은 피하는 쪽이 낫다\n\n---\n\n## 면접에서 자주 나오는 질문\n\n### Q. IO와 NIO의 차이는 무엇인가요?\n\n- IO는 스트림 중심이고, NIO는 버퍼/채널 중심이다.\n\n### Q. Non-blocking이 항상 더 좋은가요?\n\n- 아니다. 복잡도와 운영 난이도가 올라간다.\n\n### Q. Java native serialization을 조심해야 하는 이유는 무엇인가요?\n\n- 호환성, 보안, 유지보수 측면에서 부담이 크기 때문이다.\n\n### Q. `ByteBuffer.flip()`은 왜 필요한가요?\n\n- 읽기와 쓰기의 기준점이 다르기 때문이다.\n- `flip()`은 \"방금 쓴 데이터를 읽기 위한 상태\"로 바꿔준다.\n\n### Q. 실무에서 JSON mapping을 많이 쓰는 이유는 무엇인가요?\n\n- 가독성, 호환성, 디버깅 편의성이 좋기 때문이다.\n",
+  "aliases": [
+    "Java IO NIO Serialization JSON Mapping",
+    "자바 IO NIO 직렬화 JSON 매핑",
+    "ByteBuffer FileChannel SocketChannel basics",
+    "Java native serialization risks",
+    "Jackson JSON mapping schema evolution",
+    "blocking IO non blocking NIO 차이",
+    "enum",
+    "record",
+    "transient"
+  ],
+  "expected_queries": [
+    "Java IO와 NIO의 차이를 stream buffer channel 관점에서 설명해줘",
+    "ByteBuffer에서 flip clear compact를 언제 쓰는지 예제로 알려줘",
+    "Java native serialization을 운영에서 조심해야 하는 이유가 뭐야?",
+    "JSON mapping과 native serialization을 schema evolution 관점에서 비교해줘",
+    "blocking IO와 non blocking NIO를 언제 선택해야 하는지 판단 기준을 알려줘"
+  ],
+  "symptoms": [
+    "IO와 NIO를 단순히 오래된 API와 새 API로만 구분해 buffer, channel, selector 비용 모델을 설명하지 못해",
+    "ByteBuffer flip clear compact 상태 전이를 놓쳐 읽은 데이터가 비어 보이거나 position limit이 꼬이는 문제를 추적하지 못해",
+    "Java native serialization을 장기 저장 포맷으로 쉽게 선택해 serialVersionUID, 보안, schema evolution 위험을 놓쳐"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/charset-utf8-bom-malformed-input-decoder-policy",
+      "language/serialization-compatibility-serial-version-uid",
+      "language/json-null-missing-unknown-field-schema-evolution"
+    ],
+    "next_docs": [
+      "language/direct-buffer-offheap-memory-troubleshooting",
+      "language/record-serialization-evolution",
+      "language/primitive-vs-wrapper-fields-json-payload-semantics"
+    ],
+    "confusable_with": [
+      "language/serialization-compatibility-serial-version-uid",
+      "language/json-null-missing-unknown-field-schema-evolution",
+      "language/direct-buffer-offheap-memory-troubleshooting",
+      "language/java-time-instant-localdatetime-boundaries",
+      "language/charset-utf8-bom-malformed-input-decoder-policy",
+      "language/biginteger-unsigned-parsing-boundaries"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/io-nio-serialization.md",
+    "revision_history": []
+  }
+}

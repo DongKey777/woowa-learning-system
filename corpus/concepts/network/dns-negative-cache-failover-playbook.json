@@ -1,0 +1,46 @@
+{
+  "id": "network/dns-negative-cache-failover-playbook",
+  "title": "DNS Negative Cache Failover Playbook",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "이 playbook은 DNS negative caching과 NXDOMAIN 캐시가 failover와 신규 레코드 전파에 미치는 영향을 다룬다.",
+  "body_markdown": "# DNS Negative Cache Failover Playbook\n\n## 재현 조건\n\n도메인 레코드를 새로 만들거나 failover했는데, 일부 client나 resolver가 계속 `NXDOMAIN`, `NODATA`, 이전 address, 또는 region별로 다른 결과를 본다. 이때 원인을 \"DNS 전파가 늦다\"로 단정하지 말고 authoritative DNS, recursive resolver, client/runtime cache를 나누어 본다.\n\n관찰 지표는 authoritative answer, recursive resolver answer, SOA의 negative caching 관련 값, resolver별 TTL 잔여 추정, query name이 실제 failover 대상과 같은지, split-horizon/region policy 여부, JVM/browser/OS local cache 정책이다.\n\nNegative cache는 \"없는 이름\"뿐 아니라 \"해당 타입의 답이 없음\"에도 영향을 줄 수 있다. 예를 들어 A는 있는데 AAAA가 없어서 NODATA가 캐시되면, 나중에 AAAA를 추가해도 일부 resolver나 runtime은 잠시 계속 없다고 믿을 수 있다.\n\n## 확인 순서\n\n1. Authoritative DNS에는 새 record가 있는지 확인한다.\n2. 같은 이름을 여러 recursive resolver에서 조회해 negative cache가 남았는지 본다.\n3. SOA negative TTL과 resolver별 cache 정책을 확인하되, 실제 보존 시간은 구현과 설정에 따라 달라질 수 있음을 전제로 둔다.\n4. Client local DNS cache, JVM DNS cache, browser cache를 분리해 본다.\n5. Split-horizon DNS, region steering, CNAME chain, delegation 변경이 있으면 어느 구간에서 다른 답을 주는지 나눈다.\n6. Failover runbook에는 \"없는 이름을 먼저 조회하지 않기\"와 사전 record 준비를 포함한다.\n\n중요한 함정은 failover 직전에 TTL을 낮춰도 이미 캐시된 negative answer에는 적용되지 않는다는 점이다. 낮은 TTL은 resolver가 새 답을 받은 뒤부터 의미가 있으므로, 사전 record와 사전 TTL 조정이 핵심이다.\n\n## 1차 분기\n\n| 관찰 | 더 가까운 후보 | 다음 확인 |\n|---|---|---|\n| authoritative도 NXDOMAIN | record 생성, zone publish, delegation 문제 | zone file/control plane 상태 |\n| authoritative는 정상, 일부 recursive만 NXDOMAIN | negative cache 잔존 | SOA negative TTL, resolver cache |\n| DNS는 정상인데 JVM만 이전 결과 | runtime cache | JVM DNS cache policy, process restart 가능성 |\n| 특정 지역 resolver만 실패 | split-horizon, regional failover, resolver path 차이 | resolver 위치와 authoritative routing |\n| CNAME 중간 이름이 NXDOMAIN | chain 중간 레코드 누락 | 전체 chain을 단계별 조회 |\n| 새 이름을 failover 시점에 처음 생성 | 사전 record 미준비 | placeholder record, 낮춘 TTL 적용 시점 |\n| A는 되는데 AAAA만 계속 없음 | NODATA negative cache 또는 DNS64/native AAAA 혼선 | RR type별 조회, SOA negative TTL |\n| DoH client만 결과가 다름 | system resolver 우회 | app/browser resolver 설정 |\n\n## 실패 원인 matrix\n\n| 증상 | 원인 | 대응 |\n|---|---|---|\n| 일부 client만 NXDOMAIN | recursive negative cache 후보 | TTL 만료 대기, resolver flush 가능성 확인 |\n| JVM만 오래 봄 | JVM DNS cache 후보 | runtime cache policy 확인 |\n| 새 record 지연 | 사전 record 미준비 | failover 전 placeholder record 운영 |\n| region별 결과 다름 | geo/split-horizon 정책 후보 | resolver vantage point별 조회 |\n| 이전 CNAME target 유지 | chain 일부 cache 후보 | 각 hop의 TTL과 negative cache 분리 |\n\n## 운영 대응 축\n\nFailover 이름은 가능하면 장애 시점에 처음 만들지 않는다. 미리 존재하는 record를 두고 낮은 TTL을 충분히 앞서 적용하면 positive cache와 negative cache 모두에서 예측 가능성이 커진다. 다만 TTL을 낮췄다고 이미 캐시된 negative answer가 즉시 사라지는 것은 아니므로, 변경 전 조회 이력과 resolver별 cache를 함께 본다.\n\n장애 중에는 \"모든 resolver flush\"를 전제로 삼기 어렵다. 그래서 우선 영향 resolver를 식별하고, application process의 DNS cache를 우회하거나 재시작할 수 있는지, 임시 대체 hostname을 쓸 수 있는지, traffic manager가 이미 존재하는 stable name을 가리키게 할 수 있는지 검토한다.\n\n운영 대응의 우선순위는 다음처럼 둔다.\n\n1. 새로 만든 이름 대신 이미 존재하고 positive cache가 있는 stable name을 사용할 수 있는지 본다.\n2. Resolver별로 negative TTL 만료 예상 시간을 계산하고 사용자 영향 범위를 줄인다.\n3. JVM/browser/mobile app처럼 자체 DNS cache가 긴 runtime은 재시작, config refresh, alternate endpoint 제공 가능성을 검토한다.\n4. Split-horizon이면 내부/외부 authoritative view가 동시에 publish됐는지 확인한다.\n5. CNAME chain 중간 이름이 없었던 이력이 있으면 각 hop을 직접 조회한다.\n\n### 사전 failover 설계\n\n- Failover 후보 hostname은 미리 만들고 placeholder target을 둔다.\n- A와 AAAA를 따로 운영한다면 두 RR type 모두 사전 조회 이력을 고려한다.\n- CNAME target도 failover 당일 처음 만들지 않는다.\n- Health check가 record 삭제로 장애를 표현하는 구조는 negative cache를 키울 수 있으므로, 가능하면 stable record의 target 전환으로 설계한다.\n- TTL을 낮추는 시점은 기존 긴 TTL이 만료될 만큼 앞서 잡는다.\n\n## 면접 답변 축\n\n면접에서는 negative caching을 \"없는 이름도 캐시한다\"에서 멈추지 말고, 왜 장애조치에 영향을 주는지까지 연결한다. 답변 골격은 \"recursive resolver는 NXDOMAIN 같은 부정 응답도 일정 기간 캐시할 수 있고, failover 시점에 새 이름을 처음 만들면 일부 client는 그 부정 응답을 계속 볼 수 있다. 그래서 사전 record 준비, TTL 계획, resolver와 runtime cache 분리가 필요하다\"가 된다.\n\n## 운영/테스트 검증\n\nDNS TTL은 positive answer만의 문제가 아니다. NXDOMAIN도 cache될 수 있으므로, failover 대상 이름은 미리 존재하게 만드는 편이 안전하다. 테스트는 authoritative 직접 조회와 recursive resolver 조회를 분리하고, JVM이나 browser처럼 자체 cache를 가진 runtime에서는 process 관찰도 함께 남긴다.\n\n테스트 명령은 RR type을 명시해 실행한다.\n\n```bash\ndig @<authoritative> service.example.com A +noall +answer\ndig @<authoritative> service.example.com AAAA +noall +answer\ndig @8.8.8.8 service.example.com A +noall +answer\ndig @8.8.8.8 service.example.com AAAA +noall +answer\ndig service.example.com SOA +noall +answer\n```\n\n응답이 `NOERROR`지만 answer가 비어 있는지, `NXDOMAIN`인지, CNAME 중간 hop에서 실패하는지 구분해야 한다.\n\n## Safe Next Docs\n\n일반 TTL 증상은 `dns-cache-ttl-interview-symptom-router`, global failover 설계는 `global-traffic-failover-control-plane-design`으로 이어진다.\n",
+  "aliases": [
+    "DNS negative cache failover playbook",
+    "DNS negative caching 장애조치",
+    "NXDOMAIN cache failover",
+    "일부 클라이언트만 도메인 못 찾음"
+  ],
+  "expected_queries": [
+    "DNS negative cache 때문에 failover가 늦어질 수 있어?",
+    "NXDOMAIN이 캐시되면 어떤 문제가 생겨?",
+    "일부 client만 새 DNS를 못 찾을 때 뭘 봐?"
+  ],
+  "symptoms": [
+    "새 레코드를 만들었는데 일부 client는 계속 NXDOMAIN을 봅니다",
+    "DNS failover 후 일부 지역만 접속이 안 됩니다",
+    "TTL을 낮췄는데도 음성 캐시가 남아 있습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/dns-negative-caching-nxdomain-behavior"
+    ],
+    "next_docs": [
+      "network/dns-cache-ttl-interview-symptom-router",
+      "system-design/global-traffic-failover-control-plane-design"
+    ],
+    "confusable_with": [
+      "network/dns-cache-ttl-interview-symptom-router",
+      "system-design/global-traffic-failover-control-plane-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/dns-negative-cache-failover-playbook.md",
+    "revision_history": []
+  }
+}

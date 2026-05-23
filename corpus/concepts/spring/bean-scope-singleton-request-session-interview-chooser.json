@@ -1,0 +1,46 @@
+{
+  "id": "spring/bean-scope-singleton-request-session-interview-chooser",
+  "title": "Bean Scope Singleton Request Session Interview Chooser",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 chooser는 Spring bean scope인 singleton, request, session을 면접 질문에서 구분한다.",
+  "body_markdown": "# Bean Scope Singleton Request Session Interview Chooser\n\n## 10초 chooser\n\n| Scope | 생명주기 | 주의 |\n|---|---|---|\n| singleton | ApplicationContext 안의 bean definition당 하나 | shared mutable request state 금지 |\n| request | HTTP request당 하나 | singleton 주입 시 scoped proxy/ObjectProvider 필요 |\n| session | HTTP session당 하나 | 동시 탭, 만료, 직렬화, cluster 정책 필요 |\n\n## 헷갈리는 축\n\nSpring singleton은 Java `static` singleton이나 JVM 전체 singleton이 아니라, Spring `ApplicationContext` 안에서 특정 bean definition에 대해 하나의 bean instance를 공유한다는 뜻이다. 같은 애플리케이션 안에서도 parent/child context, test context, 다른 bean definition이면 \"하나\"의 범위가 달라질 수 있다.\n\n그래도 웹 애플리케이션의 일반적인 controller/service/repository bean은 여러 요청이 같은 singleton instance를 공유한다. 사용자별 장바구니, 현재 로그인 사용자, request body 상태를 singleton field에 넣으면 요청 간 상태가 섞인다. singleton이라는 말은 thread-safe를 보장하지 않고, 오히려 stateless하게 설계해야 한다는 신호에 가깝다.\n\n`request scope`와 `session scope`는 HTTP 생명주기에 맞춰 bean instance를 새로 만들 수 있게 해 주지만, 대부분의 application service를 request/session scope로 만들라는 뜻은 아니다. service는 보통 stateless singleton으로 두고, 사용자별 값은 method argument, security context, session store, repository에서 읽어 오는 식으로 경계를 잡는다.\n\nrequest scope는 한 HTTP request 처리 동안만 살아 있는 target을 만든다. session scope는 HTTP session 단위로 target을 유지하므로 여러 request를 건넌다. 둘 다 web-aware context가 있어야 자연스럽고, scheduler, batch, plain unit test처럼 HTTP request/session이 없는 곳에서 그대로 꺼내면 scope context가 없다는 문제가 난다.\n\n## proxy 경계\n\nsingleton bean은 보통 애플리케이션 시작 시 만들어지지만 request-scoped bean은 실제 HTTP 요청이 있어야 target을 만들 수 있다. 그래서 singleton이 request-scoped bean target을 생성 시점에 직접 붙잡으려 하면 생명주기가 맞지 않는다. Spring은 scoped proxy를 주입해서 \"지금 요청의 실제 객체\"로 위임하게 만들 수 있고, `ObjectProvider`처럼 lookup 시점을 코드에서 늦추는 선택지도 있다.\n\n```text\nsingleton service\n  -> scoped proxy or ObjectProvider\n  -> current request/session scoped target\n```\n\n이 답변에서 중요한 점은 proxy가 상태 공유 문제를 마법처럼 해결하는 게 아니라는 것이다. proxy는 생명주기가 짧은 target을 늦게 찾아 주는 장치이고, target에 어떤 상태를 넣어도 되는지는 별도 설계 문제다. 특히 request scope proxy는 request context를 새 thread로 전파하지 않는다. `@Async`, executor, message listener로 넘어갈 값은 scoped bean 자체가 아니라 user id, request id 같은 immutable snapshot으로 복사하는 편이 안전하다.\n\nsession scope도 \"사용자별 전역 저장소\"가 아니다. 같은 session에서 여러 탭이 동시에 요청할 수 있고, session 만료/로그아웃/직렬화/cluster 복제 정책에 영향을 받는다. Spring Session이나 Redis-backed session은 HTTP session 저장 backend를 바꾸는 축이고, Spring bean session scope는 그 HTTP session에 맞춰 bean target을 유지하는 생명주기 축이다.\n\n## 면접 답변 축\n\n- singleton은 default scope이고, thread-safe하게 stateless로 설계하는 것이 기본이다.\n- request scope는 한 HTTP 요청 안에서 공유해야 하는 작은 context에 맞고, request가 끝나면 사라진다.\n- session scope는 사용자 session 단위로 유지되지만 메모리, 만료, 직렬화, cluster 복제 문제가 따른다.\n- singleton에서 request/session scoped bean을 쓰려면 scoped proxy나 provider처럼 lookup 시점을 늦추는 방식이 필요하다.\n- scope는 인증 저장소나 DB transaction 경계와 다르다. \"사용자별 데이터\"라는 이유만으로 session scope bean에 domain state를 넣으면 운영 경계가 흐려진다.\n- prototype/request/session target을 proxy로 주입해도 proxy 객체 자체는 singleton bean 안에 오래 남을 수 있다. 매 호출 때 현재 scope target을 찾아가는지가 핵심이다.\n- scope는 객체 생명주기이고, consistency/transaction/isolation 정책이 아니다. 주문, 결제, 예약 같은 domain state는 보통 DB나 명시적 store가 소유해야 한다.\n\n## Wrong-bucket neighbor\n\nHTTP session과 Spring session scope는 관련이 있지만 같은 설명으로 끝내면 부족하다. 저장 위치, 만료, serialization, cluster session 전략이 이어질 수 있다.\n\n## 오답 패턴\n\n| 오답 | 왜 위험한가 |\n|---|---|\n| singleton은 객체가 하나라서 모든 요청에서 값을 공유해도 된다 | 공유 mutable field는 동시 요청과 사용자별 상태를 섞는다 |\n| request scope를 쓰면 thread safety를 신경 쓰지 않아도 된다 | 요청 내부 병렬 처리, async dispatch, 외부 저장소 상태는 여전히 별도 문제다 |\n| session scope는 Redis session과 같다 | Spring bean scope와 session storage backend는 다른 축이다 |\n| scoped proxy를 붙이면 모든 주입 문제가 해결된다 | proxy는 lookup 경계이고, target state 설계와 cleanup 책임은 남는다 |\n| singleton은 JVM에 단 하나다 | Spring singleton은 ApplicationContext 안의 bean definition 기준이다 |\n| session scope면 사용자별 데이터 저장소로 충분하다 | 같은 session 동시 요청, 만료, 복제, logout 정책을 별도로 설계해야 한다 |\n\n## Safe Next Docs\n\nrequest scope proxy 함정은 `request-scope-proxy-pitfalls`로 이어진다.\n",
+  "aliases": [
+    "Spring bean scope interview",
+    "singleton request session scope",
+    "스프링 빈 스코프 면접",
+    "request scope proxy answer",
+    "@Async"
+  ],
+  "expected_queries": [
+    "Spring bean scope singleton request session 차이를 면접에서 어떻게 설명해?",
+    "singleton bean에 request state를 넣으면 왜 위험해?",
+    "request scope proxy는 왜 필요해?"
+  ],
+  "symptoms": [
+    "singleton bean에 사용자별 상태를 저장해요",
+    "request/session scope를 HTTP cookie session과 섞어요",
+    "singleton에서 request-scoped bean을 바로 주입하려 해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-lifecycle-basics"
+    ],
+    "next_docs": [
+      "spring/request-scope-proxy-pitfalls"
+    ],
+    "confusable_with": [
+      "spring/bean-lifecycle-basics",
+      "spring/request-scope-proxy-pitfalls"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/bean-scope-singleton-request-session-interview-chooser.md",
+    "revision_history": []
+  }
+}

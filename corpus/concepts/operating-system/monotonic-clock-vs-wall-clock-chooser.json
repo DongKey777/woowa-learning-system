@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/monotonic-clock-vs-wall-clock-chooser",
+  "title": "Monotonic Clock vs Wall Clock Chooser",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "이 chooser는 monotonic clock, wall clock, boottime 계열 clock을 경과 시간, 현재 시각, suspend 포함 timeout, 분산 deadline 전달 용도에 맞춰 고른다. currentTimeMillis, nanoTime, NTP 보정, clock skew, elapsed time 음수 같은 질문을 다룬다.",
+  "body_markdown": "# Monotonic Clock vs Wall Clock Chooser\n\n## 10초 chooser\n\n| 목적 | clock | 이유 |\n|---|---|---|\n| 경과 시간/로컬 timeout | monotonic clock | 뒤로 가지 않는 경과 시간 기준 |\n| suspend 시간까지 포함한 대기 | boottime 계열 또는 runtime별 명시 지원 | `CLOCK_MONOTONIC`은 Linux에서 suspend 시간을 포함하지 않음 |\n| 사용자에게 보일 현재 시각/audit timestamp | wall clock | 달력/시간대/외부 기록 의미 |\n| 예약된 실제 시각 | wall clock + timezone + calendar rule | DST, 휴일, 업무 규칙을 해석해야 함 |\n| 네트워크 경계의 deadline 전달 | 외부 timestamp 또는 duration budget + clock skew 처리 | monotonic 값은 host 간 비교 불가 |\n\n## 헷갈리는 축\n\nWall clock은 NTP step/slew, 운영자 조정, VM/host 시간 보정, timezone/DST 해석의 영향을 받는다. Duration 측정에 쓰면 시간이 뒤로 가거나 갑자기 커질 수 있다.\n\nMonotonic clock은 같은 프로세스/시스템 안에서 경과 시간을 재기 위한 기준이다. 날짜, 시간대, 사용자에게 보여줄 현재 시각을 표현하지 않고, 값 자체를 저장하거나 다른 host와 비교할 수 없다. Java의 `System.nanoTime()`도 arbitrary origin이 있는 로컬 경과 시간 소스라서 의미 있는 것은 두 값의 차이다.\n\n운영체제 clock도 하나로 뭉치면 안 된다. Linux 기준 `CLOCK_MONOTONIC`은 뒤로 가지 않지만 NTP slewing으로 속도 보정은 받을 수 있고 suspend 시간은 보통 포함하지 않는다. suspend 시간까지 timeout에 넣어야 하는 문제라면 `CLOCK_BOOTTIME` 계열이나 런타임의 명시적 지원을 확인한다. `CLOCK_REALTIME`은 사람이 보는 wall clock이라 step adjustment의 영향을 받을 수 있다.\n\n## 1차 분기\n\n1. Latency, duration, timeout, retry backoff 측정: monotonic clock을 쓴다. Java에서는 보통 `System.nanoTime()`의 차이를 사용하고, `nanoTime()` 절대값은 로그나 DB에 저장하지 않는다.\n2. 로그 timestamp, audit, 사용자 표시 시각: wall clock을 쓴다. Java에서는 저장은 `Instant`, 표시와 업무 해석은 명시적 timezone/locale을 둔다.\n3. 업무 예약 시각: wall clock과 timezone, calendar rule을 쓴다. 실행에 걸린 시간, handler timeout, retry delay는 별도로 monotonic clock으로 잰다.\n4. 분산 시스템 deadline 전달: host 간 monotonic clock은 공유할 수 없다. 외부 경계에는 wall-clock deadline 또는 duration budget을 전달하되 clock skew와 전송 지연을 고려하고, 수신 프로세스 내부에서는 즉시 local monotonic deadline으로 변환한다.\n5. suspend/resume 민감 timeout: 노트북/모바일/VM suspend 시간을 timeout에 포함해야 하는지 먼저 정한다. 포함해야 하면 boottime 성격의 clock을, 포함하지 않아야 하면 monotonic elapsed 기준을 선택한다.\n6. 테스트: wall clock은 `Clock` 주입으로 제어하고, duration 계산은 monotonic abstraction이나 fake ticker를 둔다. 하나의 fake clock으로 달력 시간과 경과 시간을 동시에 흉내 내면 버그가 숨어들 수 있다.\n\n## 운영 관찰 지표\n\n- NTP 보정, VM suspend/resume, container host 시간 변경 이후 latency가 음수이거나 비정상적으로 큰 값으로 기록되는지 본다.\n- timeout 만료 시간이 wall clock 변경과 함께 앞뒤로 흔들리는지 확인한다.\n- 로그의 event time과 처리 duration을 같은 필드처럼 섞어 쓰고 있지 않은지 본다.\n- 여러 host의 timestamp를 비교할 때 clock skew와 timezone 처리 방식을 확인한다.\n- suspend/resume 이후 \"잠든 시간도 timeout에 포함해야 하는가\"가 요구사항과 맞는지 확인한다.\n- deadline propagation에서는 전달된 deadline이 이미 만료됐는지, 수신 측 clock skew 때문에 남은 시간이 과소/과대 계산되는지 본다.\n\n## Wrong-bucket neighbor\n\n`nanoTime`은 현재 날짜를 알려주지 않는다. timeout과 latency 측정에는 좋지만 사용자에게 보여줄 시각으로 쓰면 안 된다.\n\n반대로 wall clock timestamp는 외부 감사와 사용자 표시에는 필요하지만, timeout loop의 진행 조건으로 쓰면 안 된다. \"언제 발생했나\"와 \"얼마나 걸렸나\"를 같은 숫자 체계로 합치지 않는다.\n\n## 잘못된 대응\n\n- `currentTimeMillis()` 차이로 latency와 timeout을 계산한다. wall clock이 조정되면 음수 duration이나 과도한 duration이 나올 수 있다.\n- `nanoTime()` 값을 저장소, 로그, 다른 프로세스와 비교 가능한 timestamp처럼 저장한다. 의미 있는 것은 같은 runtime 안의 차이고, 프로세스 재시작 뒤 값과도 비교하지 않는다.\n- `LocalDateTime`만으로 audit timestamp를 저장한다. timezone/offset이 없으면 운영자가 실제 시각을 재구성하기 어렵다.\n- cron/business schedule과 timeout을 같은 clock 정책으로 처리한다. 예약은 wall clock 문제이고 timeout은 elapsed time 문제다.\n- 분산 deadline에 한 host의 monotonic timestamp를 그대로 실어 보낸다. 다른 host는 그 origin을 모르므로 남은 시간을 해석할 수 없다.\n- 시간 문제가 보이면 무조건 NTP만 탓한다. clock 선택 오류, timezone 변환, serialization format, suspend 포함 여부, host skew가 함께 원인일 수 있다.\n\n## Safe Next Docs\n\nJava time Instant/LocalDateTime boundary에서 저장/표시/업무 시간의 경계를 이어서 본다. 분산 요청 timeout을 다룬다면 client timeout, retry, deadline propagation 문서와 함께 본다.\n",
+  "aliases": [
+    "monotonic clock vs wall clock chooser",
+    "elapsed time vs current time",
+    "monotonic clock wall clock 차이",
+    "경과 시간 현재 시간 선택"
+  ],
+  "expected_queries": [
+    "timeout 측정에는 currentTimeMillis와 nanoTime 중 뭘 써야 해?",
+    "wall clock이 바뀌면 scheduling이나 duration 계산이 왜 흔들려?",
+    "경과 시간과 현재 시각은 어떤 clock을 써야 해?"
+  ],
+  "symptoms": [
+    "NTP 보정 후 elapsed time이 음수가 됐어요",
+    "timeout 계산에 wall clock을 써요",
+    "예약 실행 시간과 처리 duration을 같은 clock으로 봐요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/operating-system-index"
+    ],
+    "next_docs": [
+      "language/java-time-instant-localdatetime-boundaries"
+    ],
+    "confusable_with": [
+      "language/java-time-instant-localdatetime-boundaries",
+      "language/java-localdatetime-vs-zoneddatetime-vs-instant-mission-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/monotonic-clock-vs-wall-clock-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "id": "data-structure/t-digest",
+  "title": "t-Digest",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# t-Digest\n\n> 한 줄 요약: t-Digest는 tail percentile 근처에서 더 세밀한 해상도를 남기도록 centroid를 압축하는 quantile sketch로, p99 같은 극단 분위수 관측에 특히 강하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [HDR Histogram](./hdr-histogram.md)\n> - [DDSketch](./ddsketch.md)\n> - [KLL Sketch](./kll-sketch.md)\n> - [Sketch and Filter Selection Playbook](./sketch-filter-selection-playbook.md)\n\n> retrieval-anchor-keywords: t-digest, tdigest, quantile sketch, tail percentile, p99 telemetry, centroid sketch, weighted quantile summary, mergeable percentile, latency tail analysis, approximate percentile\n\n## 핵심 개념\n\n모든 quantile sketch가 분포 전체를 동일하게 다루는 것은 아니다.\nt-Digest는 특히 분포 양 끝, 즉 **tail percentile** 근처를 더 정밀하게 남기려는 구조다.\n\n핵심 아이디어는 이렇다.\n\n- 값들을 centroid 묶음으로 압축한다\n- 중앙부는 더 크게 뭉칠 수 있다\n- 양 끝 tail은 더 잘게 남긴다\n\n즉 메모리를 일정하게 쓰면서도,\n평균이나 median보다 p99/p999 같은 극단 분위수에 더 민감한 요약을 만들려는 발상이다.\n\n## Mental Model\n\nt-Digest는 분포를 한 줄로 세워 놓고,\n중앙부는 큰 묶음으로 접고 양끝은 작은 묶음으로 남기는 구조로 생각하면 된다.\n\n- centroid는 \"이 구간의 대표 평균 + 몇 개를 대표하는지\"다\n- 중앙부 centroid는 더 많은 sample을 삼켜도 percentile 해석이 크게 덜 흔들린다\n- tail centroid는 작게 유지해야 p99/p999 근처 rank가 덜 뭉개진다\n- merge는 centroid 목록을 다시 섞어 압축하는 일이지, raw sample을 되살리는 일이 아니다\n\n따라서 t-Digest의 의미는 \"값을 bucket에 넣었다\"보다\n**rank 순서 위에서 centroid 크기를 tail 쪽에 더 엄격하게 제한한다**에 가깝다.\n\n## 깊이 들어가기\n\n### 1. 왜 tail percentile이 별도로 어렵나\n\nlatency observability에서는 흔히 평균보다 p99가 더 중요하다.\n문제는 tail은 샘플 수가 적고 변동성이 크다는 점이다.\n\n- 중앙부는 많은 샘플이 몰려 평균적 특성이 잘 보인다\n- tail은 드문 큰 값 몇 개가 의미를 크게 바꾼다\n\n그래서 전체를 균등하게 압축하면 tail 정보가 쉽게 뭉개진다.\nt-Digest는 이걸 완화하려고 tail에 더 많은 표현력을 할당한다.\n\n### 2. centroid와 compression 파라미터가 핵심이다\n\nt-Digest는 개별 raw sample을 전부 남기지 않고 centroid로 요약한다.\n\n- centroid는 평균값 근처 대표점\n- weight는 해당 centroid가 대표하는 샘플 수\n\n새 값이 들어오면 인접 centroid에 흡수되거나,\n압축 규칙에 따라 새로운 centroid가 만들어진다.\n\ncompression이 클수록:\n\n- centroid 수가 늘 수 있고\n- 메모리와 merge 비용이 커지지만\n- tail quantile이 더 안정적일 수 있다\n\n### 3. KLL / DDSketch와 어디서 갈리나\n\n셋 다 quantile을 다루지만 성격이 꽤 다르다.\n\n- KLL: rank-error 중심 compact summary\n- DDSketch: 상대 값 오차를 설명하기 쉬움\n- t-Digest: tail percentile 표현에 특히 민감\n\n즉 \"무엇을 잘 맞추고 싶은가\"에 따라 선택이 갈린다.\n\n- 전체 quantile rank 안정성\n- wide-range 상대 오차\n- 극단 tail percentile\n\n### 4. merge-friendly하지만 순서 민감성도 고려해야 한다\n\nt-Digest도 merge가 가능해서 분산 telemetry에 적합하다.\n다만 구현에 따라 입력 순서나 merge 전략이 결과에 영향을 줄 수 있다.\n\n즉 \"merge 가능\"과 \"항상 완전히 동일한 결과\"는 다르다.\n실무에서는 라이브러리의 merge 안정성과 empirical accuracy를 같이 봐야 한다.\n\nmerge 계약은 운영 metadata로 고정해야 한다. compression, scale function,\ncentroid serialization format, library version, flush interval이 다르면 같은\n\"t-Digest\"라도 결과 안정성이 달라질 수 있다. shard별 digest를 중앙에서 합칠 때는\nraw sample을 되살리는 것이 아니라 centroid summary를 다시 압축하는 것이므로,\nSLO 경계값 근처에서는 offline replay나 canary comparison으로 오차를 측정해야 한다.\n\n### 5. backend에서 어디에 맞나\n\ntail latency가 운영 목표와 직접 연결되는 시스템에서 매력적이다.\n\n- RPC p99/p999\n- storage tail wait\n- queue lag spike\n- batch completion tail analysis\n\n반대로 histogram 형태의 bucket 시각화가 중요하면\nHDR Histogram 쪽이 더 자연스럽다.\n\n## 실전 시나리오\n\n### 시나리오 1: API gateway p99\n\nroute별 p99를 강하게 보고 싶은데 raw sample을 다 중앙화하기 어렵다면\nt-Digest를 로컬에서 유지 후 merge하는 방식이 잘 맞을 수 있다.\n\n### 시나리오 2: tail-heavy storage latency\n\n평소엔 짧지만 가끔 크게 튀는 storage wait를 잡아야 하는 경우,\ntail 쪽 표현력이 중요한 sketch가 유리하다.\n\n### 시나리오 3: percentile-only observability\n\n버킷 histogram보다 p50/p95/p99/p999 값 자체가 중요하다면\nt-Digest는 compact summary로 실용적이다.\n\n### 시나리오 4: 부적합한 경우\n\n정확한 bucket distribution을 시각화해야 하거나\nrelative error 보장을 명시해야 하는 경우엔 다른 구조가 더 적합할 수 있다.\n\n### 시나리오 5: SLO 판정 전 검증\n\n`p99 < 200ms` 같은 경계가 실제 alert나 배포 gate에 쓰이면, t-Digest 값 하나만\n믿기보다 같은 샘플에서 raw percentile 또는 HDR Histogram과 비교해 error budget을\n잡는 편이 안전하다. sketch는 운영 센서이지, 원본 trace를 대체하는 감사 장부가\n아니다.\n\n## Chooser Table\n\n| 요구사항 | 먼저 볼 구조 | 이유 |\n|---|---|---|\n| p99/p999 값 자체가 중요하다 | t-Digest | tail 쪽 centroid를 작게 유지하는 설계와 맞다 |\n| rank error bound 설명이 중요하다 | KLL | compaction 기반 rank-summary로 설명하기 쉽다 |\n| 값 범위가 넓고 상대 값 오차가 중요하다 | DDSketch | relative value error를 전면에 둔다 |\n| bucket 분포와 percentile을 함께 보여야 한다 | HDR Histogram | merge 가능한 bucket count 형태가 UI/rollup에 맞다 |\n| raw trace 재분석이 필요하다 | Raw sample / trace store | sketch는 원본을 복원하지 못한다 |\n\n## Wrong-Bucket Notes\n\n- t-Digest는 **histogram UI 자체가 아니다**. percentile 값 추정에는 좋지만 bucket별 count chart가 목표면 HDR Histogram이나 explicit histogram이 더 자연스럽다.\n- t-Digest는 **average 개선판이 아니다**. 평균 문제를 해결하는 구조가 아니라 분위수, 특히 tail rank 근처를 요약하는 구조다.\n- t-Digest는 **merge하면 항상 bit-identical한 구조**가 아니다. 구현, 입력 순서, merge tree에 따라 centroid가 달라질 수 있다.\n- t-Digest는 **cardinality나 top-k 구조가 아니다**. unique count는 HyperLogLog, heavy hitter는 Space-Saving/CMS 조합으로 간다.\n- t-Digest는 **rank error와 value error를 동시에 명확히 보장하는 만능 sketch가 아니다**. 요구하는 오차 언어가 rank인지 상대 값인지 먼저 정해야 한다.\n\n## Validation Examples\n\n### 예시 1: tail spike 보존성 보기\n\n1ms 샘플 9900개와 500ms 샘플 100개가 섞인 데이터를 넣고 p99를 본다.\n평균은 크게 안 흔들릴 수 있지만 p99는 tail spike를 드러내야 한다.\n\n검증 질문:\n\n- compression 값을 바꿨을 때 p99/p999 안정성이 어떻게 변하는가?\n- p50보다 p99의 error budget을 더 엄격하게 보고 있는가?\n- shard별 digest를 merge한 결과와 단일 digest 결과 차이를 측정했는가?\n\n### 예시 2: merge tree 민감도 보기\n\n10개 shard digest를 `left-fold`로 merge한 결과와 pairwise tree merge한 결과를 비교한다.\n차이가 운영 SLO 판단을 바꿀 정도라면 compression, flush 주기, library merge 정책을 다시 잡아야 한다.\n\n## 코드로 보기\n\n아래 코드는 **실제 t-Digest 구현이 아니라 학습용 골격**이다.\nraw sample을 centroid로 줄이면 merge 후 원본을 복원할 수 없다는 감각만 보여준다.\n운영용 t-Digest는 scale function, quantile별 centroid size 제한, stable merge/compression,\ninterpolation, empirical error 검증이 필요하다.\n\n```java\nimport java.util.ArrayList;\nimport java.util.Comparator;\nimport java.util.List;\n\npublic class TDigestSketch {\n    private final List<Centroid> centroids = new ArrayList<>();\n    private final int maxCentroids;\n\n    public TDigestSketch(int maxCentroids) {\n        this.maxCentroids = maxCentroids;\n    }\n\n    public void add(double value) {\n        centroids.add(new Centroid(value, 1));\n        if (centroids.size() > maxCentroids) {\n            compress();\n        }\n    }\n\n    public void merge(TDigestSketch other) {\n        centroids.addAll(other.centroids);\n        if (centroids.size() > maxCentroids) {\n            compress();\n        }\n    }\n\n    private void compress() {\n        centroids.sort(Comparator.comparingDouble(c -> c.mean));\n        List<Centroid> merged = new ArrayList<>();\n        for (Centroid centroid : centroids) {\n            if (merged.isEmpty()) {\n                merged.add(centroid);\n                continue;\n            }\n            Centroid last = merged.get(merged.size() - 1);\n            if (merged.size() < maxCentroids) {\n                merged.add(centroid);\n                continue;\n            }\n            double totalWeight = last.weight + centroid.weight;\n            last.mean = (last.mean * last.weight + centroid.mean * centroid.weight) / totalWeight;\n            last.weight = totalWeight;\n        }\n        centroids.clear();\n        centroids.addAll(merged);\n    }\n\n    private static final class Centroid {\n        private double mean;\n        private double weight;\n\n        private Centroid(double mean, double weight) {\n            this.mean = mean;\n            this.weight = weight;\n        }\n    }\n}\n```\n\n이 예제처럼 \"마지막 centroid에 남은 값을 몰아넣는\" 방식은 tail-aware t-Digest가 아니다.\n실제 구현에서는 p99/p999 근처 centroid 크기 제한과 merge tree 안정성을 반드시 검증해야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| t-Digest | tail percentile 표현력이 좋고 merge가 가능하다 | 구현/merge 세부에 따라 정확도 차이가 날 수 있다 | p99/p999 중심 observability |\n| KLL Sketch | compact하고 rank-error 설명이 자연스럽다 | 극단 tail에 특화된 건 아니다 | 일반 percentile 요약 |\n| DDSketch | 상대 값 오차를 설명하기 쉽다 | tail 중심 해상도 제어 방식은 다르다 | wide-range latency telemetry |\n| HDR Histogram | bucket distribution을 함께 보기 좋다 | histogram layout 설정이 필요하다 | 분포와 percentile을 같이 보고 싶을 때 |\n\n중요한 질문은 \"어느 분위수 구간을 가장 잘 보고 싶은가\"다.\ntail이 핵심이면 t-Digest가 강한 선택지가 된다.\n\n## 꼬리질문\n\n> Q: t-Digest가 tail percentile에 강한 이유는 무엇인가요?\n> 의도: centroid 압축이 tail 표현력을 어떻게 바꾸는지 이해 확인\n> 핵심: 양 끝 분포에서 더 작은 centroid를 유지해 극단 분위수 근처 해상도를 높이기 때문이다.\n\n> Q: KLL과 가장 큰 차이는 무엇인가요?\n> 의도: quantile sketch 종류를 구분하는지 확인\n> 핵심: KLL은 compaction 기반 rank-summary이고, t-Digest는 centroid 기반 tail-aware summary다.\n\n> Q: histogram 대신 t-Digest를 고르는 상황은 언제인가요?\n> 의도: telemetry output 요구사항을 자료구조 선택과 연결하는지 확인\n> 핵심: bucket 시각화보다 p99/p999 같은 percentile 값 자체가 더 중요할 때다.\n\n## 한 줄 정리\n\nt-Digest는 centroid 압축으로 tail percentile 해상도를 더 많이 남기는 quantile sketch라서, p99/p999 중심의 latency observability에 특히 잘 맞는다.\n",
+  "aliases": [
+    "t-Digest",
+    "TDigest",
+    "tail percentile sketch",
+    "quantile sketch",
+    "centroid sketch",
+    "p99 telemetry",
+    "mergeable percentile summary"
+  ],
+  "expected_queries": [
+    "t-Digest는 p99 같은 tail percentile을 왜 더 잘 보존하려고 해?",
+    "t-Digest KLL DDSketch HDR Histogram은 latency quantile 관점에서 어떻게 골라?",
+    "t-Digest centroid와 compression parameter가 tail accuracy에 미치는 영향은?",
+    "분산 telemetry에서 t-Digest를 merge할 때 입력 순서와 merge strategy를 왜 봐야 해?",
+    "p99 latency 관측에 평균이나 histogram 대신 t-Digest를 검토하는 이유는?"
+  ],
+  "symptoms": [
+    "평균이나 p50 중심 요약으로 p99 p999 tail latency 변화를 설명하려 해 tail percentile 전용 sketch 필요성을 놓친다",
+    "t-Digest, KLL, DDSketch를 모두 quantile sketch로만 묶고 rank error, relative value error, tail resolution 차이를 구분하지 못한다",
+    "merge 가능하다는 이유만으로 입력 순서와 merge 전략이 결과 안정성에 미치는 영향을 검토하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/hdr-histogram",
+      "data-structure/ddsketch"
+    ],
+    "next_docs": [
+      "data-structure/kll-sketch",
+      "data-structure/sketch-filter-selection-playbook",
+      "data-structure/approximate-counting-rate-limiting-observability"
+    ],
+    "confusable_with": [
+      "data-structure/ddsketch",
+      "data-structure/kll-sketch",
+      "data-structure/hdr-histogram",
+      "data-structure/space-saving-heavy-hitters"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/t-digest.md",
+    "revision_history": []
+  }
+}

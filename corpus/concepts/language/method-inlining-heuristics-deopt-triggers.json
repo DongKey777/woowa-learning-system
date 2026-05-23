@@ -1,0 +1,55 @@
+{
+  "id": "language/method-inlining-heuristics-deopt-triggers",
+  "title": "Method Inlining Heuristics and Deoptimization Triggers",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 HotSpot method inlining heuristics와 uncommon trap, deoptimization trigger를 call profile과 code cache 관점에서 설명하는 advanced deep dive다.",
+  "body_markdown": "# Method Inlining Heuristics and Deoptimization Triggers\n\n> 한 줄 요약: HotSpot inlining은 call profile, method size, hotness, polymorphism, code cache pressure를 보고 결정되고, 그 가정이 깨지면 uncommon trap과 deoptimization이 이어질 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [Lock Coarsening and Lock Elimination](./lock-coarsening-elimination.md)\n> - [Escape Analysis and Scalar Replacement](./escape-analysis-scalar-replacement.md)\n> - [JFR Event Interpretation](./jfr-event-interpretation.md)\n\n> retrieval-anchor-keywords: inlining heuristics, method size, call profile, monomorphic, polymorphic, megamorphic, hot method, uncommon trap, deoptimization, code cache, compile threshold, HotSpot C2\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전 시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄 정리)\n\n</details>\n\n## 핵심 개념\n\nInlining은 메서드 호출을 호출 지점에 펼쳐 넣는 최적화다.  \nHotSpot은 무조건 펼치지 않고, 실행 프로파일과 코드 크기, 호출 패턴을 보고 선택한다.\n\nInlining이 잘 되면 다음 이득이 있다.\n\n- call overhead 감소\n- 상수 전파와 분기 최적화\n- escape analysis 기회 증가\n- lock elimination 기회 증가\n\n## 깊이 들어가기\n\n### 1. 어떤 메서드가 잘 inline되나\n\n대체로 다음이 유리하다.\n\n- 작다\n- 자주 호출된다\n- call target이 안정적이다\n- 너무 깊게 중첩되지 않는다\n\n### 2. polymorphism이 커지면 어려워진다\n\n호출 대상이 하나면 monomorphic, 몇 개면 polymorphic, 너무 많으면 megamorphic에 가까워진다.  \n대상이 흔들릴수록 inlining이 보수적으로 된다.\n\n### 3. method size는 중요한 신호다\n\n메서드가 너무 크면 code size explosion이 생길 수 있다.  \nJIT는 전체 성능을 위해 inline budget을 조절한다.\n\n### 4. deoptimization 트리거는 inlining 가정과 연결된다\n\ninline된 코드가 타입/분기 가정을 했는데 현실이 바뀌면 uncommon trap이 일어나고 deopt가 생길 수 있다.\n\n대표 원인:\n\n- call target 변화\n- class loading으로 새 구현 등장\n- branch profile 변화\n- speculation 실패\n\n### 5. code cache pressure도 영향을 준다\n\n좋은 inlining은 성능에 이롭지만, 너무 많으면 code cache가 커지고 컴파일 비용도 늘 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 작은 getter/setter가 많다\n\nInlining이 잘 되면 call overhead가 거의 사라질 수 있다.\n\n### 시나리오 2: 인터페이스 구현체가 자주 바뀐다\n\ncall profile이 흔들리면 inlining이 덜 공격적이거나 deopt가 생길 수 있다.\n\n### 시나리오 3: 배포 후 갑자기 느려진다\n\n새 클래스 로딩이나 profile 변화로 speculated inlining이 무효화됐을 수 있다.\n\n## 코드로 보기\n\n### 1. inline 후보 예\n\n```java\npublic int add(int a, int b) {\n    return a + b;\n}\n```\n\n### 2. polymorphic call\n\n```java\ninterface Formatter {\n    String format(Object value);\n}\n```\n\n### 3. deopt를 떠올리게 하는 예\n\n```java\n// call target이 갑자기 바뀌면 inline 가정이 깨질 수 있다.\n```\n\n### 4. 관측 명령\n\n```bash\njava -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -XX:+PrintInlining -jar app.jar\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| aggressive inlining | call overhead를 줄인다 | code cache와 deopt 리스크가 늘 수 있다 |\n| conservative inlining | 안정적이다 | 최적화 기회를 놓칠 수 있다 |\n| monomorphic 설계 | JIT가 잘 읽는다 | 구조가 경직될 수 있다 |\n| polymorphic 설계 | 확장하기 쉽다 | inlining이 어려워질 수 있다 |\n\n핵심은 inlining을 \"빠른 메서드\"가 아니라 \"JIT가 만든 call profile 기반 speculative optimization\"으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: 어떤 메서드가 inline되기 쉬운가요?\n> 핵심: 작고 hot하며 호출 대상이 안정적인 메서드다.\n\n> Q: deoptimization은 왜 생기나요?\n> 핵심: inlining 시점의 가정이 깨지면 uncommon trap을 통해 되돌아갈 수 있기 때문이다.\n\n> Q: inlining이 항상 좋은가요?\n> 핵심: 아니다. code cache와 compile 비용, deopt 위험도 같이 본다.\n\n## 한 줄 정리\n\nHotSpot inlining은 hot path와 call profile에 기반한 추측적 최적화이고, 그 추측이 깨지면 deoptimization이 따라올 수 있다.\n",
+  "aliases": [
+    "Method Inlining Heuristics and Deoptimization Triggers",
+    "HotSpot method inlining call profile",
+    "Java uncommon trap deoptimization trigger",
+    "monomorphic polymorphic megamorphic call site",
+    "code cache pressure inlining",
+    "자바 메서드 인라이닝 deopt"
+  ],
+  "expected_queries": [
+    "HotSpot method inlining은 method size hotness call profile을 어떻게 보고 결정해?",
+    "monomorphic polymorphic megamorphic call site가 inlining과 deoptimization에 어떤 영향을 줘?",
+    "uncommon trap과 deoptimization은 어떤 JIT 가정이 깨질 때 발생하는지 설명해줘",
+    "code cache pressure가 너무 aggressive한 inlining과 어떤 tradeoff를 만드는지 알려줘",
+    "배포 후 Java latency spike가 JIT inlining 가정 변화 때문인지 어떤 신호로 볼 수 있어?"
+  ],
+  "symptoms": [
+    "작은 메서드는 항상 inline되고 큰 메서드는 항상 inline되지 않는다고 단순화해 hotness, call profile, inline budget을 놓쳐",
+    "interface 호출이 느리다는 식으로만 해석해 monomorphic, polymorphic, megamorphic call site에 따른 JIT 판단 차이를 설명하지 못해",
+    "배포 후 latency spike를 GC로만 보고 class loading, branch profile 변화, uncommon trap, deoptimization 신호를 확인하지 않아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jit-warmup-deoptimization",
+      "language/code-cache-jit-profiling",
+      "language/escape-analysis-scalar-replacement"
+    ],
+    "next_docs": [
+      "language/jfr-event-interpretation",
+      "language/jmh-benchmarking-pitfalls",
+      "language/reflection-cost-and-alternatives"
+    ],
+    "confusable_with": [
+      "language/jit-warmup-deoptimization",
+      "language/code-cache-jit-profiling",
+      "language/jmh-benchmarking-pitfalls",
+      "language/reflection-cost-and-alternatives"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/method-inlining-heuristics-deopt-triggers.md",
+    "revision_history": []
+  }
+}

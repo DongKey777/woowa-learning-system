@@ -1,0 +1,62 @@
+{
+  "id": "operating-system/shell-job-control-command-bridge",
+  "title": "Shell Job-Control Command Bridge",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Shell Job-Control Command Bridge\n\n> 한 줄 요약: `jobs`, `fg`, `bg`는 shell의 job table과 terminal foreground를 다루는 명령이고, `nohup`, `disown`는 \"shell이 끝날 때 이 job을 어떻게 남길까\" 쪽을 건드린다. 초보자는 `PGID`, `SID`, `TPGID`, `TTY` 네 칸만 같이 보면 shell job-control이 magic처럼 보이지 않는다.\n>\n> 문서 역할: 이 문서는 operating-system `primer`에서 [Session vs Process Group Primer](./session-vs-process-group-primer.md) 바로 다음에 읽는 beginner follow-up이다. shell에서 자주 치는 `jobs`, `fg`, `bg`, `nohup`, `disown`를 `PGID` / `SID` / `TTY` 변화와 연결해 \"무엇이 shell bookkeeping이고, 무엇이 kernel-visible 구조인가\"를 분리해 준다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Session vs Process Group Primer](./session-vs-process-group-primer.md)\n- [signals, process supervision](./signals-process-supervision.md)\n- [Pseudo-TTY vs Pipe Behavior](./pseudo-tty-vs-pipe-behavior.md)\n- [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md)\n- [operating-system 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: operating-system-00061, shell job-control command bridge, shell job control commands, shell job control mental model, shell job table mental model, shell suspend-resume-hangup mental model, jobs builtin vs ps, jobs -l pgid, fg bg tpgid, foreground process group shell command, background job controlling terminal, nohup vs disown, nohup not setsid, disown not detach, shell job table basics\n\n## 먼저 잡는 멘탈 모델\n\n먼저 command 이름보다 층을 나누면 훨씬 덜 헷갈린다.\n\n| 층 | 대표 명령/필드 | 초보자용 질문 |\n|---|---|---|\n| shell job table | `jobs`, `fg`, `bg`, `disown` | \"내 shell이 이 job을 지금 어떻게 기억하나?\" |\n| kernel-visible 구조 | `PGID`, `SID`, `TPGID`, `TTY` | \"이 process는 어느 job/session/terminal에 붙어 있나?\" |\n| hangup 정책 | `nohup`, 일부 shell의 `disown -h` | \"shell이 끝날 때 `SIGHUP`을 어떻게 보낼까?\" |\n\n핵심 문장은 이것이다.\n\n> `jobs`에 보인다고 해서 커널 구조가 바뀐 것은 아니고, `nohup`을 쓴다고 해서 새 session이 생긴 것도 아니다.\n\n즉 shell job-control 명령은 모두 \"detach\"가 아니다. 어떤 것은 shell의 메모를 바꾸고, 어떤 것은 foreground ownership을 바꾸고, 어떤 것은 hangup 정책만 바꾼다.\n\n## 먼저 보는 네 칸\n\n초보자가 직접 확인할 때는 아래 한 줄이 가장 효율적이다.\n\n```bash\nps -o pid,ppid,pgid,sid,tpgid,tty,stat,cmd -p $$ -p <job-pid>\n```\n\n필드 감각은 이 정도면 충분하다.\n\n| 필드 | 무엇을 뜻하나 | 초보자용 해석 |\n|---|---|---|\n| `PGID` | process group ID | 같은 job인가 |\n| `SID` | session ID | 같은 terminal 작업판 안인가 |\n| `TPGID` | terminal foreground process group ID | 지금 keyboard 입력의 주인이 누구인가 |\n| `TTY` | 연결된 terminal | 아직 terminal에 붙어 있는가 |\n\n같이 보면 좋은 shell 쪽 관찰 도구는 이것이다.\n\n```bash\njobs -l\n```\n\n`jobs -l`은 shell의 job 번호와 PID를 보여 준다.\n반면 `ps`는 커널이 보는 `PGID` / `SID` / `TTY` 구조를 보여 준다.\n\n## 명령별로 무엇이 바뀌나\n\n| 명령 | shell이 하는 일 | 초보자가 `ps`/`jobs`에서 보게 되는 변화 | 보통 그대로인 것 |\n|---|---|---|---|\n| `jobs` | 현재 shell의 job table을 읽어 보여 준다 | `jobs -l` 출력만 생긴다 | `PGID`, `SID`, `TPGID`, `TTY`는 그대로다 |\n| `bg %1` | stopped job에 `SIGCONT`를 보내고 background로 둔다 | `STAT`가 `T`에서 `S`/`R` 쪽으로 바뀔 수 있다. `TPGID`는 보통 shell 쪽에 남는다 | 같은 `PGID`, 같은 `SID`, 같은 `TTY` |\n| `fg %1` | 그 job의 `PGID`를 foreground로 올리고 shell은 기다린다 | 실행 중에는 `TPGID == job의 PGID`가 된다 | 같은 `PGID`, 같은 `SID`, 같은 `TTY` |\n| `nohup cmd ...` | command가 `SIGHUP`을 무시하도록 시작하고, 필요하면 출력을 `nohup.out` 등으로 돌린다 | output redirection이 생길 수 있다. process가 shell 종료 후에도 남기 쉬워진다 | 새 `SID`가 생기지 않는 경우가 많고, `TTY`도 바로 `?`로 바뀌지 않는다 |\n| `disown %1` | shell job table에서 그 job을 지운다 | `jobs`에서는 사라지지만 `ps`에서는 process가 그대로 보인다 | 같은 `PGID`, 같은 `SID`, 같은 `TTY` |\n\n여기서 초보자가 꼭 기억할 포인트:\n\n- `fg` / `bg`의 핵심 변화는 대개 `TPGID`와 실행 상태(`STAT`)다.\n- `nohup`의 핵심 변화는 대개 `SIGHUP` 처리와 output redirection이다.\n- `disown`의 핵심 변화는 shell job table이다.\n- `PGID`와 `SID`는 위 명령들 때문에 자주 바뀌지 않는다.\n\n## 작은 그림으로 보면\n\n예를 들어 terminal 한 탭에서 shell이 아래 상태라고 하자.\n\n```text\nshell: PID=5000 PGID=5000 SID=5000 TTY=pts/3\njob  : PID=6200 PGID=6200 SID=5000 TTY=pts/3\n```\n\n여기서 중요한 감각은:\n\n- shell과 job은 **같은 `SID`**에 있다\n- job은 shell과 **다른 `PGID`**를 가질 수 있다\n- foreground owner는 `TPGID`가 가리킨다\n\n### 1. `Ctrl-Z` 후 `jobs`\n\nforeground에서 돌던 job을 `Ctrl-Z`로 멈추면 보통 이런 그림이 된다.\n\n```text\njob STAT  -> T (stopped)\nTPGID     -> shell의 PGID로 돌아감\njobs -l   -> [1]+ 6200 Stopped ...\n```\n\n이 시점의 핵심은 job이 \"없어진 것\"이 아니라, **같은 session / 같은 TTY 안에서 멈춘 background candidate**가 되었다는 점이다.\n\n### 2. `bg %1`\n\n`bg %1`는 그 stopped job을 다시 돌리지만 foreground로 올리지는 않는다.\n\n```text\njob STAT  -> T 에서 S/R 쪽으로 바뀔 수 있음\nTPGID     -> 여전히 shell의 PGID\nPGID/SID  -> 그대로\n```\n\n즉 `bg`는 \"새로운 job을 만드는 것\"보다 **기존 job을 다시 돌리되 keyboard ownership은 shell에 남겨 두는 것**에 가깝다.\n\n### 3. `fg %1`\n\n`fg %1`는 그 job을 다시 foreground owner로 만든다.\n\n```text\nTPGID -> job의 PGID\n```\n\n실행 중에는 terminal-generated signal인 `Ctrl-C`, `Ctrl-Z`가 다시 그 job의 process group으로 간다.\n즉 `fg`의 본질은 \"job을 새로 만드는 것\"이 아니라 **terminal foreground token을 job 쪽으로 넘기는 것**이다.\n\n### 4. `nohup cmd &`\n\n초보자가 가장 많이 오해하는 부분이다.\n\n```text\nnohup sleep 300 &\n```\n\n이 명령은 보통:\n\n- shell의 background job처럼 시작될 수 있고\n- `SIGHUP`에는 덜 민감해지며\n- stdout/stderr가 `nohup.out`으로 빠질 수 있다\n\n하지만 자주 **안 바뀌는 것**도 있다.\n\n- 새 `SID`가 생기지 않을 수 있다\n- `TTY`가 그대로일 수 있다\n- background job이 terminal input을 읽으려 하면 여전히 job-control signal을 만날 수 있다\n\n즉 `nohup`은 \"진짜 detach\"라기보다 **hangup survival 정책**에 더 가깝다.\n\n### 5. `disown %1`\n\n`disown`은 bash/zsh에서 자주 보는 shell builtin이다.\n\n## 작은 그림으로 보면 (계속 2)\n\n```text\ndisown %1\njobs      -> 그 job이 사라짐\nps        -> process는 여전히 존재\n```\n\n초보자 관점에서 가장 중요한 사실은 이것이다.\n\n> `disown`은 대개 shell이 그 job을 기억하는 방식을 바꾸고, 커널이 본 `PGID` / `SID` / `TTY`를 새로 만들지는 않는다.\n\n그래서 `disown` 뒤에 `jobs`만 보면 \"없어졌네?\"라고 느낄 수 있지만, `ps`로 보면 같은 process가 계속 살아 있다.\n\n## `nohup`과 `disown`을 헷갈리지 않는 법\n\n| 질문 | `nohup` | `disown` |\n|---|---|---|\n| 주 타깃 | process의 `SIGHUP` 반응 | shell의 job table |\n| `jobs` 출력 | 보일 수 있다 | 보통 사라진다 |\n| 새 session 생성 | 아니다 | 아니다 |\n| `TTY=?` 보장 | 아니다 | 아니다 |\n| \"shell 종료 후 남게 만들기\"에 도움 | 그렇다 | shell/옵션에 따라 일부 도움 |\n\n한 줄로 줄이면:\n\n- `nohup`은 \"죽지 말라\" 쪽\n- `disown`은 \"shell이 이 job을 놓아 주자\" 쪽\n\n둘 다 흔히 **`setsid()`의 대체제가 아니다**.\n\n## 자주 헷갈리는 포인트\n\n- \"`jobs`에 안 보이면 process도 끝난 것이다\" -> 아니다. `jobs`는 현재 shell의 job table이고, `ps`는 시스템의 process view다.\n- \"`nohup`을 쓰면 terminal과 완전히 끊긴다\" -> 보통 아니다. `SID`와 `TTY`가 그대로일 수 있다.\n- \"`disown`을 하면 새 session이 생긴다\" -> 아니다. shell bookkeeping이 주로 바뀐다.\n- \"`bg`는 process를 다른 group으로 옮긴다\" -> 보통 아니다. 같은 `PGID`를 background 상태로 다시 돌릴 뿐이다.\n- \"`fg`는 PID나 PGID를 새로 만든다\" -> 아니다. foreground ownership(`TPGID`)이 핵심이다.\n- \"`disown`은 모든 shell에서 같다\" -> 아니다. 특히 option 의미는 shell마다 다를 수 있다. beginner는 먼저 \"job table에서 지운다\"는 공통 감각부터 잡는 편이 안전하다.\n\n## Self-check (자가 점검 4문항)\n\n아래 질문은 시험이 아니라, 지금 이해한 축을 말로 꺼내 보고 다음 문서를 고르기 위한 점검이다. 먼저 짧게 답해 보고, 막히면 바로 아래 `힌트`만 확인해 보자.\n\n1. `jobs` 결과와 `ps` 결과가 왜 다를 수 있는지(shell job table vs 시스템 process view) 설명할 수 있는가?\n   힌트: `jobs`는 현재 shell이 추적하는 작업만 보여 주고, `ps`는 시스템 전체 프로세스 관점이라 범위가 다르다.\n2. `fg`/`bg`의 핵심 변화가 새 PID 생성이 아니라 foreground ownership(`TPGID`) 전환이라는 점을 말할 수 있는가?\n   힌트: `fg`/`bg`는 기존 작업을 앞이나 뒤로 보내는 것이지 새 프로세스를 만드는 명령이 아니다.\n3. `nohup`과 `disown`을 \"SIGHUP 반응 정책\"과 \"shell bookkeeping\"으로 분리해 설명할 수 있는가?\n   힌트: `nohup`은 종료 신호 반응을 바꾸고, `disown`은 shell이 그 작업을 목록에서 관리할지 말지를 바꾼다.\n4. terminal에서 완전히 분리된 실행이 필요할 때 `nohup`/`disown`만으로 충분하지 않을 수 있다는 점을 이해하고 `setsid()` 계열 후속 문서를 찾을 수 있는가?\n   힌트: hangup 처리만 바꿔도 controlling terminal 관계가 남을 수 있으니 session 분리까지 생각해야 할 때가 있다.\n\n## 여기까지 이해했으면 다음 deep-dive\n\n> **Beginner handoff box**\n>\n> - \"`jobs`/`fg`/`bg` 뒤의 `PGID`/`SID`/foreground process group 그림을 다시 고정하고 싶으면\": [Session vs Process Group Primer](./session-vs-process-group-primer.md)\n> - \"`setsid()`까지는 알겠는데 그다음 daemonization 체크리스트가 왜 붙는지 보고 싶으면\": [Daemonization Checklist Primer](./daemonization-checklist-primer.md)\n> - \"shell 명령 말고 launch 시점 `POSIX_SPAWN_SETPGROUP`/signal mask로 연결하고 싶으면\": [posix_spawn Attributes Primer](./posix-spawn-attributes-primer.md)\n> - \"`SIGHUP`/`SIGTERM`/supervisor까지 확장해서 보고 싶으면\": [signals, process supervision](./signals-process-supervision.md)\n> - \"`terminal에 붙어 있음`이 출력 모드와 prompt에 주는 차이를 알고 싶으면\": [Pseudo-TTY vs Pipe Behavior](./pseudo-tty-vs-pipe-behavior.md)\n> - 이 카테고리 안에서 다시 고르려면: [operating-system 카테고리 인덱스](./README.md)\n\n## 한 줄 정리\n\n`jobs` / `fg` / `bg` / `nohup` / `disown`를 한 덩어리로 외우지 말고, \"shell job table 변화인가, `TPGID` foreground 변화인가, `SIGHUP` survival 정책인가\"로 먼저 나누면 `PGID` / `SID` / `TTY` 그림이 훨씬 또렷해진다.\n",
+  "aliases": [
+    "operating-system-00061",
+    "shell job-control command bridge",
+    "shell job control commands",
+    "shell job control mental model",
+    "shell job table mental model",
+    "shell suspend-resume-hangup mental model",
+    "jobs builtin vs ps",
+    "jobs -l pgid",
+    "fg bg tpgid",
+    "foreground process group shell command",
+    "background job controlling terminal",
+    "nohup vs disown",
+    "nohup not setsid",
+    "disown not detach",
+    "shell job table basics"
+  ],
+  "expected_queries": [
+    "jobs fg bg nohup disown 차이가 뭐예요?",
+    "shell job control을 처음 배울 때 어떤 그림으로 봐야 해요?",
+    "nohup과 disown은 어떻게 달라요?",
+    "foreground process group과 shell job table은 뭐가 달라요?",
+    "jobs에서는 사라졌는데 ps에는 남아 있는 프로세스를 어떻게 이해해야 해?",
+    "Ctrl-C를 누를 때 fg/bg job과 shell 종료 영향 범위를 같이 설명해줘"
+  ],
+  "symptoms": [
+    "jobs, fg, bg, nohup, disown이 전부 \"백그라운드 실행\"처럼 보여서 차이를 모르겠어요",
+    "jobs에서는 사라졌는데 ps에는 남아 있어서 detach된 건지 헷갈려요",
+    "Ctrl-C, terminal 입력, shell 종료가 각각 누구에게 영향을 주는지 감이 안 와요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/session-vs-process-group-primer",
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "operating-system/signals-process-supervision",
+      "operating-system/pseudo-tty-vs-pipe-behavior",
+      "operating-system/daemonization-checklist-primer"
+    ],
+    "confusable_with": [
+      "operating-system/session-vs-process-group-primer",
+      "operating-system/daemonization-checklist-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/shell-job-control-command-bridge.md",
+    "revision_history": []
+  }
+}

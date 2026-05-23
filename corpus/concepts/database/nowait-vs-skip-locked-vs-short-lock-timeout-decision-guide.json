@@ -1,0 +1,62 @@
+{
+  "id": "database/nowait-vs-skip-locked-vs-short-lock-timeout-decision-guide",
+  "title": "NOWAIT vs SKIP LOCKED vs 짧은 lock timeout 결정 가이드",
+  "category": "database",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# NOWAIT vs SKIP LOCKED vs 짧은 lock timeout 결정 가이드\n\n## 한 줄 요약\n\n> 지금 보던 row를 포기하고 바로 실패할 거면 `NOWAIT`, 다른 후보 일을 계속 집어야 하면 `SKIP LOCKED`, 같은 row를 조금만 기다려 보고 포기할 거면 짧은 `lock timeout`을 먼저 본다.\n\n## 결정 매트릭스\n\n| 지금 먼저 지키려는 것 | 1차 선택 | 왜 이 선택이 맞나 |\n|---|---|---|\n| 현재 보고 있는 row가 잠겨 있으면 즉시 `busy`나 fail-fast로 닫기 | `NOWAIT` | 같은 row를 계속 보되 대기 시간을 0에 가깝게 두는 정책이다 |\n| queue에서 잠긴 작업을 건너뛰고 다른 `READY` row를 계속 처리 | `SKIP LOCKED` | 목표가 현재 row 보호보다 throughput 유지와 work stealing이기 때문이다 |\n| 같은 row가 곧 풀릴 수 있어서 아주 짧게만 기다려 볼 가치가 있음 | 짧은 `lock timeout` | 실패 전 대기 예산을 수 ms~수십 ms로 제한하는 bounded wait다 |\n| worker가 job을 선점한 뒤 오래 처리해야 함 | `SKIP LOCKED` + 별도 lease/상태 전이 | claim은 짧은 transaction에서 끝내고 장기 실행 ownership은 별도 규칙으로 관리해야 한다 |\n| FIFO 공정성이나 오래된 작업 보장이 핵심 요구임 | `SKIP LOCKED` 단독은 부족 | 잠긴 row를 건너뛰는 순간 strict ordering과 starvation 방지는 별도 설계 문제가 된다 |\n| 긴 작업 ownership이나 stale worker 차단까지 필요 | 셋 다 아님 | 이 셋은 row 대기 방식이고 lease/fencing 같은 장기 소유권 규칙이 따로 필요하다 |\n\n짧게 기억하면 `NOWAIT`는 fail-fast, `SKIP LOCKED`는 next-candidate 탐색, 짧은 `lock timeout`은 same-row bounded wait다.\n\n## transaction boundary로 다시 나누기\n\n`NOWAIT`는 보통 이미 대상이 정해진 row를 보호할 때 쓴다. transaction을 열고\n`FOR UPDATE NOWAIT`로 잠금을 시도한 뒤, 잠겨 있으면 그 시도는 바로 rollback하고\n`busy`나 409/429/503 같은 상위 결과로 번역한다. 실패한 transaction 안에서 오래\n기다리거나 내부 retry loop를 돌리면 fail-fast 정책을 스스로 무효화한다.\n\n짧은 `lock timeout`도 대상 row는 그대로다. 차이는 대기 시간이 0이 아니라 아주\n작은 예산이라는 점이다. 그래서 transaction 시작 직후 statement/local 설정으로\n짧은 timeout을 걸고, lock을 얻으면 같은 transaction 안에서 수정 후 commit한다.\ntimeout이 나면 rollback하고 `busy`로 닫는 것이 기본이다. 이 방식은 \"같은 row가\n곧 풀릴 수 있다\"는 가정이 있을 때만 의미가 있고, 다른 job을 찾아 주지는 않는다.\n\n`SKIP LOCKED`는 queue worker의 claim transaction에서 빛난다. 전형적인 흐름은\n짧다.\n\n```sql\nBEGIN;\n\nSELECT id\nFROM job_queue\nWHERE status = 'READY'\nORDER BY available_at, id\nLIMIT 1\nFOR UPDATE SKIP LOCKED;\n\nUPDATE job_queue\nSET status = 'CLAIMED',\n    claimed_by = :worker_id,\n    claimed_at = now()\nWHERE id = :id;\n\nCOMMIT;\n```\n\n핵심은 \"row를 찾는 select\"와 \"내가 잡았다는 상태 전이\"를 같은 transaction에\n묶는 것이다. 그래야 두 worker가 같은 job을 동시에 가져가지 않는다. 반면 실제\n외부 API 호출, 긴 계산, 파일 처리까지 같은 DB transaction 안에서 오래 붙잡으면\nlock 보유 시간과 장애 복구 비용이 커진다. 긴 job은 claim transaction을 짧게\n끝내고, 처리 ownership은 lease, heartbeat, fencing token, idempotent completion\ntransaction으로 따로 관리하는 편이 낫다.\n\n## fairness와 starvation 체크\n\n`SKIP LOCKED`는 queue worker throughput을 올리지만 FIFO 공정성을 보장하지 않는다.\n가장 오래된 `READY` row가 잠겨 있으면 worker는 그 row를 기다리지 않고 다음 후보를\n처리한다. 이 선택이 반복되면 특정 오래된 row가 계속 밀릴 수 있고, 재시도 job이나\n느린 partition에서는 starvation처럼 보일 수 있다.\n\n그래서 `SKIP LOCKED`를 고르면 SQL 문법만 볼 것이 아니라 운영 지표도 같이 둬야\n한다.\n\n- `oldest READY age`가 계속 증가하는가?\n- claim 1건당 스캔한 후보 row 수가 커지는가?\n- 특정 priority, shard, tenant, retry bucket만 뒤로 밀리는가?\n- 실패 job reaper, aging, priority bucket, partition 재분배가 있는가?\n\nstrict FIFO나 강한 공정성이 제품 요구라면 `SKIP LOCKED`만으로 해결하려 하지 말고\npartitioned queue, broker-native ordering, lease coordinator, 재시도 bucket 분리\n같은 구조를 같이 검토해야 한다.\n\n## 흔한 오선택\n\n가장 흔한 오선택은 `SKIP LOCKED`를 `NOWAIT`의 성능 좋은 버전으로 보는 것이다. 학습자 표현으로는 \"어차피 안 기다릴 거면 둘 다 같은 것 아닌가?\"에 가깝다. 하지만 `NOWAIT`는 지금 보던 row를 바로 포기하는 정책이고, `SKIP LOCKED`는 다른 row를 계속 집어 queue를 비우는 정책이라 목적이 다르다.\n\n짧은 `lock timeout`을 `SKIP LOCKED` 대체재로 두는 것도 자주 틀린다. `lock timeout`은 여전히 같은 row를 기다리는 모델이라 queue fairness와 claim ordering이 남고, `SKIP LOCKED`처럼 다른 후보로 넘어가 throughput을 올려 주지 않는다.\n\n반대로 기존 주문 row 수정처럼 보호 대상이 이미 뚜렷한데도 `SKIP LOCKED`를 먼저 찾는 것도 과하다. 이 장면은 queue claim보다 row 보호와 실패 언어가 더 중요해서 `NOWAIT`나 짧은 `lock timeout`, 또는 그냥 `FOR UPDATE` 자체를 먼저 봐야 한다.\n\n또 다른 오선택은 queue worker가 `SKIP LOCKED`로 잡은 뒤 작업 전체를 한 transaction\n안에서 처리하는 것이다. 아주 짧은 순수 DB 작업이면 가능하지만, 긴 비즈니스 처리나\n외부 I/O가 섞이면 claim lock을 오래 잡게 된다. 이때는 `CLAIMED` 상태를 commit하고\n별도 completion transaction에서 `DONE`으로 바꾸는 구조가 더 안전하다.\n\n## 다음 학습\n\n`NOWAIT`와 짧은 `lock timeout`을 둘 다 `busy` 축으로 읽는 이유를 더 짧게 붙잡으려면 [NOWAIT와 짧은 lock timeout은 왜 자동 retry보다 busy에 더 가깝게 볼까?](./nowait-vs-short-lock-timeout-busy-guide.md)를 보면 된다.\n\n`SKIP LOCKED`가 throughput은 올리지만 fairness와 starvation을 남기는 이유는 [Queue Claim with SKIP LOCKED, Fairness, and Starvation Trade-offs](./queue-claim-skip-locked-fairness.md)로 이어서 보면 된다.\n\nrow lock, 작업 진입 게이트, 긴 실행 ownership을 한 장에서 더 넓게 비교하려면 [FOR UPDATE Row Lock vs Advisory Lock vs Lease/Fencing 결정 가이드](./for-update-vs-advisory-lock-vs-lease-fencing-decision-guide.md)와 [Already Exists vs Busy vs Retryable 결정 가이드](./already-exists-vs-busy-vs-retryable-decision-guide.md)를 다음 문서로 잡으면 된다.\n",
+  "aliases": [
+    "nowait vs skip locked vs short lock timeout",
+    "skip locked or nowait",
+    "lock budget queue claim chooser",
+    "work stealing vs fail fast lock choice",
+    "행 잠금 대기 대신 건너뛰기 선택",
+    "busy로 끝낼지 다음 row를 집을지",
+    "queue claim 락 동작 선택",
+    "skip locked nowait timeout 차이",
+    "queue worker transaction boundary",
+    "skip locked fairness starvation",
+    "fail fast lock choice"
+  ],
+  "expected_queries": [
+    "잠겨 있으면 바로 실패해야 하는지 다른 row를 집어야 하는지 조금 기다렸다 포기해야 하는지 어떻게 고르지?",
+    "DB queue에서 SKIP LOCKED를 쓰는 상황과 NOWAIT를 쓰는 상황을 한 표로 비교해줘",
+    "같은 락 경쟁인데 fail-fast, work stealing, 짧은 대기 예산을 어떤 질문으로 먼저 나눠?",
+    "예약이나 job claim에서 막힌 row를 건너뛸지 바로 busy로 돌릴지 판단 기준이 뭐야?",
+    "FOR UPDATE 뒤에 NOWAIT를 붙이는 경우와 SKIP LOCKED로 다른 일을 찾는 경우는 왜 목적이 달라?",
+    "짧은 lock timeout을 SKIP LOCKED 대체재처럼 보면 어디서 틀어져?",
+    "queue worker에서 SKIP LOCKED로 잡은 row는 같은 transaction 안에서 어디까지 처리해야 해?",
+    "SKIP LOCKED가 FIFO fairness와 starvation을 자동으로 해결해 주지 않는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "잠긴 row를 만나면 바로 실패해야 하는지 다른 row를 집어야 하는지 조금 기다려야 하는지 기준이 흐린다",
+    "SKIP LOCKED와 NOWAIT를 둘 다 대기 안 하는 옵션 정도로만 외워서 queue 동작이 섞인다",
+    "짧은 lock timeout을 work stealing 대체재처럼 써도 되는지 리뷰에서 자꾸 막힌다",
+    "queue worker에서 claim 트랜잭션과 실제 처리 트랜잭션을 어디서 끊어야 하는지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/lock-basics",
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide",
+      "database/already-exists-vs-busy-vs-retryable-decision-guide",
+      "database/queue-claim-skip-locked-fairness"
+    ],
+    "confusable_with": [
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide",
+      "database/already-exists-vs-busy-vs-retryable-decision-guide",
+      "database/queue-claim-skip-locked-fairness"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/nowait-vs-skip-locked-vs-short-lock-timeout-decision-guide.md",
+    "revision_history": []
+  }
+}

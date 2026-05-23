@@ -1,0 +1,61 @@
+{
+  "id": "database/guard-row-scope-design-multi-day-bookings",
+  "title": "Guard-Row Scope Design for Multi-Day Bookings",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 multi-day, multi-resource booking에서 guard-key set, granularity, canonical lock ordering, bounded retry를 설계하는 advanced playbook이다.",
+  "body_markdown": "# Guard-Row Scope Design for Multi-Day Bookings\n\n> 한 줄 요약: multi-day 또는 multi-resource 예약에서 guard row는 \"락 하나를 쓴다\"가 아니라 어떤 guard-key 집합으로 경쟁을 직렬화할지 정하는 문제이며, granularity·canonical ordering·bounded retry를 함께 설계해야 deadlock 없이 운영된다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Guard Row Scope Quick Examples](./guard-row-scope-quick-examples.md)\n- [Hot-Path Slot Arbitration Choices](./hot-path-slot-arbitration-choices.md)\n- [Reservation Reschedule and Cancellation Transition Patterns](./reservation-reschedule-cancellation-transition-patterns.md)\n- [Engine Fallbacks for Overlap Enforcement](./engine-fallbacks-overlap-enforcement.md)\n- [Guard Row vs Serializable Retry vs Reconciliation for Set Invariants](./guard-row-vs-serializable-vs-reconciliation-set-invariants.md)\n- [Guard-Row Hot-Row Contention Mitigation](./hot-row-contention-counter-sharding.md)\n- [Shared-Pool Guard Design for Room-Type Inventory](./shared-pool-guard-design-room-type-inventory.md)\n- [Ordered Guard-Row Upsert Patterns Across PostgreSQL and MySQL](./ordered-guard-row-upsert-patterns-postgresql-mysql.md)\n- [MySQL Gap-Lock Blind Spots Under READ COMMITTED](./mysql-gap-lock-blind-spots-read-committed.md)\n- [Deadlock Case Study](./deadlock-case-study.md)\n- [Transaction Retry와 Serialization Failure 패턴](./transaction-retry-serialization-failure-patterns.md)\n- [Exclusion Constraint Case Studies for Overlap and Range Invariants](./exclusion-constraint-overlap-case-studies.md)\n\nretrieval-anchor-keywords: guard row scope, multi-day booking, booking deadlock, canonical lock ordering, guard-row granularity, room day guard, multi-resource reservation lock, reservation guard set, deadlock control booking, lock ordering by resource day, booking reschedule deadlock, guard row hot key, overlap guard serialization, stay-night inventory lock, striped guard row, inventory bucket guard, pre-seeded guard row, ordered guard row upsert, guard creation deadlock\n\n## 핵심 개념\n\nmulti-day booking에서 guard row를 도입한다는 말은 실제로는 **예약 하나를 guard-key 집합으로 펼친 뒤, 그 집합을 어떤 단위로 잠글지**를 정한다는 뜻이다.\n\n- guard scope가 너무 크면: 충돌하지 않는 예약도 같이 직렬화되어 hot row가 된다\n- guard scope가 너무 작으면: 잠가야 할 key 수가 늘고 deadlock surface가 커진다\n- guard scope가 잘못되면: 실제로 충돌하는 두 예약이 같은 guard key를 공유하지 않아 규칙이 샌다\n\n그래서 먼저 봐야 할 질문은 \"guard row가 있느냐\"가 아니라 이 두 가지다.\n\n1. 서로 충돌 가능한 두 예약이 반드시 만나는 guard key가 있는가\n2. 그 guard key 집합을 모든 write path가 같은 순서로 잠그는가\n\n## 먼저 고를 것: guard-row granularity\n\n핵심 규칙은 단순하다.\n\n> 충돌 가능한 두 예약은 최소 하나 이상의 동일 guard key를 공유해야 한다.\n\n아래는 multi-day booking에서 자주 쓰는 granularity다.\n\n| guard scope | 예시 key | 잘 맞는 상황 | 비용 / 함정 |\n|---|---|---|---|\n| resource-wide | `(room_id)` | 트래픽이 낮고, 임의 시간 구간 overlap을 단순하게 직렬화하고 싶을 때 | 같은 room의 비충돌 예약도 모두 직렬화되어 hot row가 되기 쉽다 |\n| resource-day | `(room_id, stay_day)` | 숙박, 일 단위 재고, overnight booking처럼 \"하루\"가 자연 단위일 때 | 예약 길이만큼 lock 수가 늘고, reschedule 시 deadlock 설계를 꼭 해야 한다 |\n| resource-slot | `(room_id, slot_start)` | 15분/30분 회의실처럼 discrete slot이 곧 business truth일 때 | row 수가 많고 slot expansion 비용이 커진다 |\n| shared-pool-day | `(property_id, room_type_id, stay_day)` | 특정 room이 아니라 타입/재고 pool을 day 단위로 막아야 할 때 | 나중에 개별 unit assignment가 붙으면 2차 guard 또는 ledger가 필요하다 |\n\n선택 기준은 \"가장 세밀한 것\"이 아니라 **비즈니스 충돌 단위와 운영 가능한 lock fan-out의 균형**이다.\n\n### resource-wide가 맞는 경우\n\n- 같은 resource의 동시 예약 시도가 많지 않다\n- 부분 시간 overlap이라 discrete bucket으로 자르기 어색하다\n- 구현을 가장 단순하게 두고 싶다\n\n예를 들어 고가 장비 대여처럼 예약량이 낮으면 `(device_id)` 한 row를 먼저 잠그고, 그 뒤 정확한 overlap recheck를 해도 충분하다.\n\n### resource-day가 맞는 경우\n\n- check-in/check-out, nightly inventory처럼 하루 단위 의미가 강하다\n- 같은 resource라도 날짜가 안 겹치면 동시에 처리하고 싶다\n- booking이 보통 2~7일 정도로 bounded 되어 있다\n\n숙박 예약에서는 `room_id` 하나로 직렬화하면 1박과 10박이 모두 같은 hot row를 두드리게 된다.\n이때 `(room_id, stay_day)`로 쪼개면 **겹치는 밤만 경쟁**하게 만들 수 있다.\n\n다만 주의할 점이 있다.\n`resource-day` guard는 \"그날의 경쟁\"을 직렬화할 뿐, sub-day overlap 자체를 표현하는 건 아니다.\n즉 business resolution이 day보다 더 세밀하면 guard lock 뒤에 **정확한 overlap predicate recheck**가 여전히 필요하다.\n\n### multi-resource reservation은 guard set으로 봐야 한다\n\n패키지 예약처럼 `room + parking + breakfast slot`을 함께 묶는 경우에는 guard row 하나가 아니라 **guard-key union**이 필요하다.\n\n- `room` guard만 잠그면 parking inventory는 샐 수 있다\n- resource별로 따로 잠그되 순서가 요청마다 다르면 deadlock이 난다\n\n이때 한 예약이 잠가야 할 것은 \"대표 row 하나\"가 아니라:\n\n- `(resource_kind, resource_id, day)`들의 합집합\n- 필요하면 `shared-pool-day` counter row\n\n이다.\n\n## Lock Ordering: 예약 순서가 아니라 canonical key order를 써야 한다\n\nguard row deadlock의 대부분은 \"어떤 순서로 잠그는지\"에서 나온다.\n\n- 예약 A: `2026-04-14 -> 2026-04-16` 순서로 잠금\n- 예약 B: 수정 요청이라 `2026-04-16 -> 2026-04-14` 순서로 잠금\n- 둘 다 같은 key 집합을 잡아야 하는데 순서가 반대라 circular wait 발생\n\n그래서 lock ordering은 사용자 요청 순서나 화면 입력 순서를 따르면 안 된다.\n항상 **정규화된 guard-key 집합**을 만들고, 그 집합을 **전역 canonical order**로 잠가야 한다.\n\n권장 프로토콜:\n\n1. 예약 범위를 half-open interval(`[check_in, check_out)`)로 정규화한다\n2. 예약이 닿는 모든 `resource x day` guard key를 생성한다\n3. 중복 제거 후 `(tenant_id, resource_kind, resource_id, day)` 같은 전역 정렬 규칙으로 정렬한다\n4. create, extend, shorten, cancel, move 모두 같은 정렬 규칙을 사용한다\n5. guard lock 획득 후에만 overlap/capacity를 재검사하고 실제 booking row를 변경한다\n\n중요한 함정도 있다.\n\n- 애플리케이션에서 리스트를 정렬했다고 해서 DB가 꼭 같은 순서로 lock을 잡는 건 아니다\n- `WHERE key IN (...) FOR UPDATE`는 실행 계획에 따라 lock 순서가 달라질 수 있다\n- guard row를 동적으로 생성하는 `INSERT` 자체도 deadlock 지점이 될 수 있다\n\n그래서 가장 안전한 방식은 아래 둘 중 하나다.\n\n- guard row를 미리 seed해 두고, PK/index 순서를 타는 locking query만 사용한다\n- 없으면 정렬된 순서로 `INSERT ... ON CONFLICT DO NOTHING` / `INSERT IGNORE` 후 다시 같은 정렬 규칙으로 lock을 잡는다\n\n## reschedule은 old/new scope의 합집합을 잠가야 한다\n\n예약 변경에서 흔한 실수는:\n\n1. 기존 예약 day를 먼저 해제하고\n2. 새 예약 day를 다시 잡는 것\n\n이렇게 하면 변경 도중 중간 상태가 보이고, 다른 요청과 교차하면서 deadlock이나 oversell이 난다.\n\n안전한 방식은 항상 이렇다.\n\n1. 기존 booking이 쓰던 guard key 집합 계산\n2. 새 booking이 쓰려는 guard key 집합 계산\n3. **두 집합의 합집합**을 canonical order로 모두 잠금\n4. 충돌 재검사 후 booking row와 guard/counter를 한 트랜잭션에서 갱신\n\n즉 reschedule은 \"old release 후 new acquire\"가 아니라 **union lock 후 state transition**으로 봐야 한다.\n\n## Deadlock Control은 retry보다 앞단 설계가 먼저다\n\nretry는 필요하지만, deadlock control의 핵심은 retry 이전에 **deadlock surface를 줄이는 것**이다.\n\n### 1. lock fan-out 상한을 정한다\n\n한 예약이 30일, 90일, 180일을 잠가야 한다면 `resource-day`는 곧바로 lock explosion이 된다.\n\n이 경우에는:\n\n- booking length hard cap을 둔다\n- 긴 예약은 coarse guard(`resource-wide`)나 별도 approval flow로 보낸다\n- shared pool이면 day-level counter ledger로 바꾼다\n\n즉 granularity는 concurrency만이 아니라 **한 트랜잭션이 잡아야 할 lock 수**로도 판단해야 한다.\n\n### 2. write path를 하나의 key generator로 통일한다\n\n다음 경로가 모두 같은 guard-key generator를 써야 한다.\n\n- 신규 예약\n- 연장 / 단축\n- resource 변경\n- 취소\n- expiry cleanup\n- 관리자 수동 조정\n\n한 경로라도 다른 day 계산, 다른 active predicate, 다른 정렬 규칙을 쓰면 guard row는 금방 drift 나거나 deadlock을 만든다.\n\n### 3. parent/child guard가 있으면 계층 순서를 고정한다\n\n예:\n\n- 먼저 `(room_type_id, day)` pool guard\n- 다음 `(room_id, day)` unit guard\n\n이 계층이 있다면 모든 경로가 같은 방향으로 잠가야 한다.\n어떤 경로는 pool -> unit, 다른 경로는 unit -> pool이면 deadlock이 거의 필연적이다.\n\n### 4. deadlock victim과 business conflict를 분리한다\n\n서로 다른 실패를 같은 정책으로 다루면 안 된다.\n\n- overlap/capacity 충돌: 사용자에게 \"이미 점유됨\"으로 돌려줄 business rejection\n- deadlock victim / serialization failure: bounded retry 후보\n- lock timeout: 시스템 경합 신호이며 retry 여부와 timeout 설정을 따로 본다\n\n즉 \"실패했으니 다 retry\"가 아니라, **retry 가능한 경쟁 실패와 규칙 위반을 분리**해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1. 호텔 5박 예약\n\n요구사항:\n\n- `room_id` 단위로 nightly inventory를 막아야 한다\n- check-in/check-out은 일 단위다\n\n권장:\n\n- guard scope: `(room_id, stay_day)`\n- lock set: 숙박하는 모든 night\n- after lock: 기존 active booking overlap recheck\n\n이 경우 `(room_id)` 하나로 막는 것도 안전하지만, 서로 날짜가 안 겹치는 예약까지 직렬화돼 throughput이 급격히 떨어질 수 있다.\n\n### 시나리오 2. 객실 + 주차를 함께 예약\n\n요구사항:\n\n- 하나의 checkout flow에서 room과 parking이 동시에 확보되어야 한다\n\n권장:\n\n- guard scope: `(resource_kind, resource_id, stay_day)`\n- lock order: `parking`과 `room` 중 무엇을 먼저 선택했는지와 무관하게 정렬 기준 고정\n- 실패 처리: 둘 중 하나라도 capacity/overlap conflict면 전체 rollback\n\n핵심은 \"화면에서 room을 먼저 골랐으니 room lock부터\"가 아니라, **request shape와 무관한 전역 order**다.\n\n### 시나리오 3. 3박 예약을 4박으로 연장\n\n요구사항:\n\n- 기존 nights와 새 night가 함께 고려되어야 한다\n\n권장:\n\n- old/new night union을 전부 잠금\n- guard row를 잡은 뒤 새 마지막 night의 availability를 재검사\n- 가능할 때만 booking row와 counter를 갱신\n\n이때 기존 3박을 먼저 unlock하고 마지막 1박을 새로 잡는 식으로 가면 중간 경쟁에 취약하다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE reservation_guard_day (\n  resource_kind VARCHAR(32) NOT NULL,\n  resource_id BIGINT NOT NULL,\n  stay_day DATE NOT NULL,\n  PRIMARY KEY (resource_kind, resource_id, stay_day)\n);\n```\n\n```text\ncanonical guard-row protocol\n1. request를 [start, end) interval과 resource list로 정규화\n2. touched (resource_kind, resource_id, stay_day) key 집합 생성\n3. old/new booking 수정이면 두 집합의 union 사용\n4. key를 전역 canonical order로 정렬\n5. guard row를 같은 order로 ensure + lock\n6. exact overlap / capacity를 같은 active predicate로 recheck\n7. booking row, guard counter, ledger를 한 트랜잭션에서 갱신\n8. deadlock victim / serialization failure만 bounded retry\n```\n\n## 결정 체크리스트\n\n- 충돌 가능한 두 예약이 반드시 같은 guard key를 하나 이상 공유하는가\n- booking 하나가 평균 몇 개의 guard row를 잠그는가\n- create / reschedule / cancel / expiry cleanup이 모두 같은 key generator를 쓰는가\n- multi-resource bundle에서 resource 종류와 무관한 전역 lock order가 있는가\n- guard row 생성 경로 자체가 deadlock을 만들지 않게 seed 또는 ordered upsert를 쓰는가\n- overlap/capacity business rejection과 deadlock retry를 분리했는가\n\n## 한 줄 정리\n\nmulti-day booking의 guard row 설계는 \"room 하나를 잠근다\"가 아니라, 충돌 단위를 guard-key 집합으로 모델링하고 그 집합을 모든 경로에서 같은 순서로 잠그는 일이다. granularity를 잘못 고르면 hot row가 되고, ordering을 빼먹으면 deadlock이 난다.\n",
+  "aliases": [
+    "guard row scope",
+    "multi-day booking guard row",
+    "canonical lock ordering",
+    "guard-row granularity",
+    "room day guard",
+    "multi-resource reservation lock",
+    "reservation guard set",
+    "booking reschedule deadlock",
+    "guard row scope design",
+    "multi-day 예약 guard row"
+  ],
+  "expected_queries": [
+    "multi-day booking에서 guard row scope를 resource, resource-day, pooled inventory 중 어떻게 정해?",
+    "guard-key 집합을 canonical order로 잠그지 않으면 reschedule deadlock이 왜 생겨?",
+    "서로 충돌 가능한 예약이 반드시 같은 guard key를 공유하게 하려면 어떤 granularity가 필요해?",
+    "resource-day guard row는 안전하지만 lock fan-out과 hot key 사이에서 어떤 tradeoff가 있어?",
+    "WHERE key IN (...) FOR UPDATE가 lock order를 보장한다고 믿으면 왜 위험해?"
+  ],
+  "symptoms": [
+    "multi-day 예약 하나가 여러 guard key를 잠글 때 deadlock 없이 어떤 순서로 잡을지 설계해야 해",
+    "guard scope가 너무 커서 hot row가 되거나 너무 작아서 실제 충돌 예약이 만나지 않는 문제가 있어",
+    "reschedule, extend, cancel에서 old scope와 new scope lock 순서가 달라 deadlock이 나고 있어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/guard-row-scope-quick-examples",
+      "database/guard-row-booking-timeline-card"
+    ],
+    "next_docs": [
+      "database/hot-path-slot-arbitration-choices",
+      "database/ordered-guard-row-upsert-patterns-postgresql-mysql",
+      "database/engine-fallbacks-overlap-enforcement",
+      "database/guard-row-vs-serializable-vs-reconciliation-set-invariants"
+    ],
+    "confusable_with": [
+      "database/guard-row-scope-quick-examples",
+      "database/guard-row-vs-serializable-vs-reconciliation-set-invariants",
+      "database/engine-fallbacks-overlap-enforcement",
+      "database/hot-path-slot-arbitration-choices",
+      "database/ordered-guard-row-upsert-patterns-postgresql-mysql",
+      "database/shared-pool-guard-design-room-type-inventory"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/guard-row-scope-design-multi-day-bookings.md",
+    "revision_history": []
+  }
+}

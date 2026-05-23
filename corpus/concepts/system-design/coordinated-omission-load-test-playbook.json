@@ -1,0 +1,46 @@
+{
+  "id": "system-design/coordinated-omission-load-test-playbook",
+  "title": "Coordinated Omission Load Test Playbook",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 playbook은 부하 테스트에서 coordinated omission으로 tail latency가 과소측정되는 문제를 다룬다.",
+  "body_markdown": "# Coordinated Omission Load Test Playbook\n\n## 재현 조건\n\nLoad test 결과는 p99가 양호한데 production에서는 timeout과 긴 대기열이 보인다. 특히 client가 응답을 받은 뒤 다음 요청을 보내는 closed-loop generator를 쓴다.\n\n관찰 증거는 generator와 server 양쪽에서 맞춰야 한다. 목표 arrival rate, 실제 send rate, scheduler lag, in-flight 수, timeout/cancel 수, server queue wait가 같은 시간축에서 맞아야 한다. Scheduled start time과 actual send time의 차이가 histogram 밖에 있으면 p99는 좋아 보이지만 사용자가 겪는 대기는 빠진다.\n\n## 확인 순서\n\n1. 요청 생성 방식이 closed-loop인지 open-loop인지 확인한다.\n2. Offered load와 achieved send rate를 분리해서 본다. 서버가 느려질 때 achieved rate가 같이 떨어지면 coordinated omission 가능성이 크다.\n3. Histogram이 service time만 담는지, scheduled time 기준 response time을 담는지 확인한다.\n4. Client deadline, timeout, cancel이 실제 production 정책과 같은지 맞춘다.\n5. 고정 arrival rate와 bounded outstanding limit을 두고 tail latency를 다시 측정한다.\n6. Warm-up, ramp-up, steady-state, overload 구간을 분리해서 percentile과 timeout rate를 비교한다.\n7. Production의 burstiness, think time, payload mix, dependency latency를 테스트 모델에 반영했는지 본다.\n\n## 실패 원인 matrix\n\n| 증상 | 원인 | 대응 |\n|---|---|---|\n| 테스트 p99가 너무 좋음 | 느릴 때 요청 생성도 느려짐 | open-loop 또는 corrected histogram 적용 |\n| achieved QPS가 목표 QPS보다 낮음 | generator thread, connection, scheduler가 병목 | generator saturation 분리 측정 |\n| production timeout 재현 안 됨 | burst, queue wait, deadline 누락 | arrival pattern과 timeout budget 재현 |\n| server queue는 긴데 client latency는 짧음 | client-side 대기/취소가 histogram 밖에 있음 | scheduled timestamp 기준 latency 기록 |\n| 평균 latency만 봄 | tail과 timeout 숨김 | p95/p99/p999, timeout 비율, dropped request 같이 확인 |\n\n## 운영/테스트 검증\n\nCoordinated omission은 시스템이 느릴 때 측정 도구도 같이 멈춰서 나쁜 구간을 덜 샘플링하는 편향이다. 실무에서는 \"처리된 요청의 latency\"만 보지 않고 \"보내기로 예정됐던 요청이 언제 관측됐는가\"를 같이 본다.\n\n테스트 리포트에는 최소한 목표 arrival rate, 실제 send rate, generator CPU/GC, scheduler lag, connection pool wait, in-flight, timeout/cancel, server queue depth가 들어가야 한다. Generator가 목표 rate를 유지하지 못하면 결과는 service capacity가 아니라 load generator capacity를 측정한 것일 수 있다.\n\nProduction 재현 테스트는 constant rate 하나로 끝내지 않는다. Baseline steady rate, burst window, dependency slowdown, partial failure를 나누고 각 구간의 p99와 timeout rate가 어떤 지점에서 꺾이는지 기록한다. Knee point가 보이면 그 앞 구간은 capacity estimate, 뒤 구간은 overload behavior 검증으로 분리한다.\n\n## Open/closed-loop 선택 기준\n\n| 모델 | 적합한 질문 | 주의점 |\n|---|---|---|\n| Closed-loop | 사용자가 응답을 보고 다음 행동을 하는 interaction flow | 서버가 느려질수록 offered load가 자동 감소해 tail을 숨김 |\n| Open-loop | 특정 arrival rate에서 시스템이 버티는지, queue가 언제 쌓이는지 | 무제한 in-flight면 production보다 과한 meltdown을 만들 수 있음 |\n| Corrected closed-loop | 기존 closed-loop 결과에서 누락된 대기 추정 | client deadline 이후 시간을 사용자 latency로 과장하지 않도록 timeout과 분리 |\n\nClosed-loop가 항상 틀린 것은 아니다. 실제 사용자가 think time을 갖고 순차 행동을 한다면 유효한 모델이다. 다만 capacity, overload, p99 SLO 검증에서는 open-loop 또는 scheduled timestamp correction 없이 \"p99 안전\"이라고 말하면 안 된다.\n\n## 측정 trade-off\n\nOpen-loop generator는 실제 도착률을 더 잘 재현하지만, 시스템을 의도보다 빠르게 overload로 밀 수 있다. Closed-loop generator는 사용자 interaction flow를 모델링하기 쉽지만, 서버가 느려질수록 요청 생성도 늦어져 tail을 과소측정할 수 있다.\n\nCorrection을 적용한 histogram은 숨은 대기 시간을 드러내지만, 실제 client timeout 이후의 대기까지 모두 사용자 latency로 해석하면 과장될 수 있다. 그래서 corrected p99, uncorrected p99, timeout count, dropped request, server queue depth를 같이 보고 테스트 목적을 명확히 둔다.\n\nOpen-loop 테스트에는 안전장치가 필요하다. Max in-flight, max queue time, test-wide error budget, dependency 보호용 rate cap을 정하고, deadline이 지난 요청은 계속 기다리게 두지 않는다. \"실제보다 나쁜 상황을 만드는 stress test\"와 \"production arrival를 재현하는 load test\"를 같은 결과표에서 섞으면 capacity 판단이 틀어진다.\n\n## 흔한 오해\n\n- 평균 QPS를 맞췄다고 coordinated omission이 사라지는 것은 아니다. 초 단위 평균이 같아도 느린 구간의 scheduled request가 빠졌을 수 있다.\n- 서버 처리 시간 histogram만으로 사용자 경험을 설명할 수 없다. Client queue, pool wait, retry wait, cancel까지 포함한 end-to-end deadline 관점이 필요하다.\n- Open-loop가 항상 더 현실적인 것도 아니다. Production이 user think time에 의해 self-throttle되는 서비스라면 closed-loop 결과도 별도 의미가 있다.\n- Corrected histogram 하나만 보고 SLO 위반을 단정하지 않는다. Timeout 이후의 synthetic wait는 사용자 latency와 capacity debt를 분리해 해석한다.\n\n## 안전한 stop condition\n\n부하 테스트는 목표 QPS를 달성하는 순간이 아니라 SLO와 overload behavior를 설명할 수 있을 때 멈춘다. 목표 arrival rate에서 p95/p99, timeout rate, queue depth, error rate가 안정적이고, generator가 scheduled rate를 유지했다는 증거가 있으면 해당 단계는 종료한다.\n\n반대로 error budget burn이 급격히 오르거나 queue가 회복 없이 증가하면 더 밀어붙이지 않는다. Stop 후에는 마지막 안정 구간, knee point, overload 진입 시점의 지표를 기록하고 capacity estimate로 넘긴다.\n\n## Safe Next Docs\n\nTail latency triage는 `tail-latency-p99-debugging-playbook`, queue wait 해석은 `upstream-queueing-connection-pool-wait-tail-latency`로 이어진다.\n",
+  "aliases": [
+    "coordinated omission load test playbook",
+    "coordinated omission 부하 테스트",
+    "load test latency bias",
+    "p99 latency measurement bias"
+  ],
+  "expected_queries": [
+    "coordinated omission이 부하 테스트에서 왜 문제야?",
+    "부하 테스트 p99가 실제보다 좋게 나오는 이유가 뭐야?",
+    "closed-loop load generator와 open-loop 차이를 설명해줘"
+  ],
+  "symptoms": [
+    "부하 테스트 p99는 괜찮은데 실제 사용자는 timeout을 겪습니다",
+    "서버가 느려질수록 load generator가 요청을 덜 보냅니다",
+    "latency histogram에서 긴 대기 시간이 누락됩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/littles-law-capacity-planning-primer"
+    ],
+    "next_docs": [
+      "system-design/tail-latency-p99-debugging-playbook",
+      "network/upstream-queueing-connection-pool-wait-tail-latency"
+    ],
+    "confusable_with": [
+      "system-design/littles-law-capacity-planning-primer",
+      "network/upstream-queueing-connection-pool-wait-tail-latency"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/coordinated-omission-load-test-playbook.md",
+    "revision_history": []
+  }
+}

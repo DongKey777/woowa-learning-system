@@ -1,0 +1,62 @@
+{
+  "id": "system-design/notification-preferences-graph-design",
+  "title": "Notification Preferences Graph 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Notification Preferences Graph 설계\n\n> 한 줄 요약: notification preferences graph는 사용자 설정, tenant 정책, quiet hours, 필수 알림 예외를 \"어느 규칙이 최종 승리하는가\"라는 precedence graph로 모델링하는 설계다.\n\nretrieval-anchor-keywords: notification preferences graph, notification preference precedence, quiet hours precedence, mandatory notification override, channel preference graph, tenant policy user override, notification opt in opt out, notification suppression graph, 알림 설정 그래프 뭐예요, quiet hours 왜 무시돼요, 왜 결제 알림은 밤에도 와요, channel override 언제 이기나요, preference policy graph design, notification policy explanation\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Notification 시스템 설계](./notification-system-design.md)\n- [Causal Consistency Notification Primer](./causal-consistency-notification-primer.md)\n- [Config Distribution System 설계](./config-distribution-system-design.md)\n- [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n- [Permission Model Drift / AuthZ Graph 설계](../security/permission-model-drift-authz-graph-design.md)\n- [Feature Flags Rollout / Dependency Management](../software-engineering/feature-flags-rollout-dependency-management.md)\n\n## 이 문서가 먼저 풀어주는 질문\n\n이 문서는 \"알림 설정 테이블을 넘어서 어떤 정책 충돌을 설명해야 하는가\"가 막힐 때 읽는 graph 설계 문서다.\n\n| learner query shape | 이 문서에서 먼저 고정하는 것 | 다음 문서 |\n|---|---|---|\n| `알림 설정 그래프가 뭐예요?` | preference를 key-value가 아니라 precedence graph로 본다 | [Notification 시스템 설계](./notification-system-design.md) |\n| `왜 결제 알림은 quiet hours인데도 와요?` | mandatory override와 quiet hours의 우선순위를 분리한다 | [Causal Consistency Notification Primer](./causal-consistency-notification-primer.md) |\n| `tenant 기본 정책과 사용자 설정이 충돌하면 누가 이겨요?` | policy layer 순서를 먼저 고정한다 | [Config Distribution System 설계](./config-distribution-system-design.md) |\n| `사용자에게 왜 이 알림이 갔는지 설명해야 해요` | explainability와 audit trail을 같이 설계해야 함을 묶어 준다 | [Audit Log Pipeline 설계](./audit-log-pipeline-design.md) |\n\n## 추천 학습 경로\n\n처음부터 모든 edge type을 늘리기보다, 먼저 \"누가 승리하는가\"와 \"변경이 얼마나 빨리 반영되는가\"를 나눠 보면 덜 헤맨다.\n\n1. precedence 순서가 아직 모호하다면 이 문서에서 `mandatory > tenant > user > channel > quiet hours` 같은 골격을 먼저 잡는다.\n2. 전달 지연이나 stale decision이 문제라면 [Causal Consistency Notification Primer](./causal-consistency-notification-primer.md)로 내려가 반영 지연을 본다.\n3. 정책 배포/버전 관리가 핵심이면 [Config Distribution System 설계](./config-distribution-system-design.md)로 이동한다.\n4. 권한 그래프와 비슷한 문제인지 비교하고 싶다면 [Permission Model Drift / AuthZ Graph 설계](../security/permission-model-drift-authz-graph-design.md)로 cross-category 비교를 한다.\n\n## 핵심 개념\n\n알림 선호도는 단순한 설정 테이블이 아니다.  \n실전에서는 다음 충돌을 풀어야 한다.\n\n- 채널별 opt-in/opt-out\n- 이벤트 타입별 우선순위\n- quiet hours\n- tenant 정책과 사용자 개인 설정\n- 법적/보안 필수 알림\n- 중복 suppression\n\n즉, preference system은 사용자 의도를 그래프로 모델링하는 정책 엔진이다.\n\n## 깊이 들어가기\n\n### 1. 왜 그래프인가\n\n설정이 단순 key-value면 쉬워 보이지만, 실제 정책은 계층적이다.\n\n- global default\n- tenant policy\n- user preference\n- channel override\n- event-specific exception\n\n이 관계를 그래프로 두면 precedence를 명확히 할 수 있다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 1,000만 사용자\n- 사용자당 20개 preference edge\n- 알림 평가 초당 10만 회\n\n그럼 읽기 경로가 핵심이다.  \npreference lookup은 매우 자주 일어나므로 cacheable해야 한다.\n\n봐야 할 숫자:\n\n- preference lookup QPS\n- cache hit ratio\n- policy evaluation latency\n- override write rate\n- invalidation lag\n\n### 3. 정책 우선순위\n\n권장 우선순위 예:\n\n1. legal / security mandatory\n2. tenant policy\n3. user preference\n4. channel availability\n5. quiet hours\n\n우선순위를 명시하지 않으면 어떤 설정이 이기는지 모호해진다.\n\n### 4. Quiet hours\n\n조용한 시간은 단순 시간대 설정이 아니다.\n\n- timezone aware\n- weekend rule\n- emergency exception\n- per channel exception\n\n예를 들어 마케팅은 조용한 시간에 막고, 결제/보안은 허용할 수 있다.\n\n### 5. Channel capability\n\n채널마다 지원하는 정책이 다르다.\n\n- email: quiet hours 적용 가능\n- push: OS 제한 고려\n- sms: 엄격한 opt-in 필요\n- in-app: 대부분 허용\n\n### 6. Change propagation\n\npreference 변경은 즉시 반영되어야 한다.\n\n- cache invalidation\n- event-driven sync\n- versioned snapshot\n\n이것은 [Config Distribution System 설계](./config-distribution-system-design.md)와 닮아 있다.\n\n### 7. Audit and explainability\n\n사용자는 왜 알림을 받았는지 알아야 한다.\n\n- 어떤 rule이 적용됐는지\n- 어떤 override가 승리했는지\n- quiet hours가 왜 무시/적용됐는지\n\n이력은 [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)로 남겨야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 마케팅 알림 차단\n\n문제:\n\n- 사용자가 광고성 알림을 끄고 싶다\n\n해결:\n\n- channel opt-out\n- event type suppression\n- tenant default override\n\n### 시나리오 2: 결제 알림은 항상 받아야 함\n\n문제:\n\n- 조용한 시간이어도 보안/결제 알림은 중요하다\n\n해결:\n\n- mandatory policy를 상위로 둔다\n- quiet hours보다 우선 적용\n\n### 시나리오 3: tenant별 기본 정책\n\n문제:\n\n- 어떤 고객사는 SMS를 금지한다\n\n해결:\n\n- tenant policy layer\n- user override는 tenant 범위 내에서만 허용\n\n## 코드로 보기\n\n```pseudo\nfunction shouldDeliver(user, event, channel, now):\n  policy = loadPolicyGraph(user.tenantId)\n  decision = evaluatePrecedence(policy, user, event, channel, now)\n  return decision.allow\n```\n\n```java\npublic boolean canSend(NotificationContext ctx) {\n    return policyEngine.evaluate(ctx).isAllowed();\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Flat settings table | 단순하다 | 우선순위 표현이 약하다 | 작은 앱 |\n| Graph-based policy | 유연하다 | 해석이 어렵다 | 복잡한 선호도 |\n| Cache-first evaluation | 빠르다 | stale risk | high-QPS notification |\n| Strong real-time sync | 반영이 빠르다 | fan-out cost | 중요한 변경 |\n| Mandatory override layer | 안전하다 | 사용자 통제 약화 | 법/보안 알림 |\n\n핵심은 선호도 시스템이 단순 설정이 아니라 **사용자 의도와 정책 예외를 함께 표현하는 그래프**라는 점이다.\n\n## 꼬리질문\n\n> Q: preferences를 그래프로 모델링하는 이유는 무엇인가요?\n> 의도: 정책 우선순위와 예외 처리 이해 확인\n> 핵심: global default, tenant policy, user override를 명확히 합성할 수 있다.\n\n> Q: quiet hours보다 중요한 알림은 어떻게 처리하나요?\n> 의도: mandatory policy 이해 확인\n> 핵심: 보안/결제 같은 필수 알림은 예외로 둔다.\n\n> Q: preference 변경은 얼마나 빨리 반영돼야 하나요?\n> 의도: consistency와 UX 균형 이해 확인\n> 핵심: 대부분 즉시 또는 매우 짧은 지연이 바람직하다.\n\n> Q: 사용자가 왜 알림을 받았는지 설명할 수 있나요?\n> 의도: explainability와 auditability 확인\n> 핵심: 정책 경로와 우선순위를 기록해야 한다.\n\n## 한 줄 정리\n\nNotification preferences graph는 채널, 이벤트, 시간대, tenant 정책을 우선순위 그래프로 합성해 알림 전달 여부를 결정하는 시스템이다.\n",
+  "aliases": [
+    "notification preferences graph",
+    "notification preference precedence",
+    "quiet hours precedence",
+    "mandatory notification override",
+    "channel preference graph",
+    "tenant policy user override",
+    "notification opt in opt out",
+    "notification suppression graph",
+    "알림 설정 그래프 뭐예요",
+    "quiet hours 왜 무시돼요",
+    "왜 결제 알림은 밤에도 와요",
+    "channel override 언제 이기나요",
+    "preference policy graph design",
+    "notification policy explanation"
+  ],
+  "expected_queries": [
+    "알림 설정 그래프가 뭐예요",
+    "quiet hours인데 왜 결제 알림은 밤에도 와",
+    "tenant 정책과 사용자 설정이 충돌하면 누가 이겨",
+    "notification preference를 key value가 아니라 graph로 설계해야 하는 이유를 설명해줘",
+    "사용자가 왜 이 알림을 받았는지 precedence와 audit로 설명하는 방법이 궁금해"
+  ],
+  "symptoms": [
+    "tenant 기본 정책과 사용자 알림 설정이 충돌할 때 설명 기준이 흔들려요",
+    "quiet hours를 무시한 필수 알림을 precedence 관점으로 설명하지 못하고 있어요",
+    "사용자에게 왜 이 알림이 갔는지 audit와 explainability까지 함께 설계해야 하는지 헷갈려요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/notification-system-design",
+      "system-design/causal-consistency-notification-primer",
+      "security/role-vs-scope-vs-ownership-primer"
+    ],
+    "next_docs": [
+      "system-design/config-distribution-system-design",
+      "system-design/audit-log-pipeline-design",
+      "system-design/causal-consistency-notification-primer"
+    ],
+    "confusable_with": [
+      "system-design/notification-system-design",
+      "system-design/causal-consistency-notification-primer",
+      "security/permission-model-drift-authz-graph-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/notification-preferences-graph-design.md",
+    "revision_history": []
+  }
+}

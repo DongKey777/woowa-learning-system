@@ -1,0 +1,52 @@
+{
+  "id": "system-design/metrics-pipeline-tsdb-design",
+  "title": "Metrics Pipeline / TSDB 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Metrics Pipeline / TSDB 설계를 다루는 deep_dive 문서다. metrics pipeline과 TSDB는 대규모 시계열 데이터를 수집, 집계, 보관, 조회해 운영 가시성을 제공하는 시스템이다. 검색 질의가 metrics pipeline, tsdb, time series, cardinality처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Metrics Pipeline / TSDB 설계\n\n> 한 줄 요약: metrics pipeline과 TSDB는 대규모 시계열 데이터를 수집, 집계, 보관, 조회해 운영 가시성을 제공하는 시스템이다.\n\nretrieval-anchor-keywords: metrics pipeline, tsdb, time series, cardinality, rollup, retention, scrape, ingest, downsampling, prometheus, observability, trace exemplar, service latency, canary metric, guardrail dashboard, alert reevaluation, restated metric\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Distributed Tracing Pipeline 설계](./distributed-tracing-pipeline-design.md)\n> - [Automated Canary Analysis / Rollback Platform 설계](./automated-canary-analysis-rollback-platform-design.md)\n> - [Alert Re-Evaluation / Correction 설계](./alert-reevaluation-correction-design.md)\n> - [Dashboard Restatement UX 설계](./dashboard-restatement-ux-design.md)\n\n## 핵심 개념\n\n메트릭 시스템은 로그를 예쁘게 그리는 도구가 아니다.  \n실전에서는 다음을 동시에 만족해야 한다.\n\n- 초당 수십만 샘플 수집\n- 높은 cardinality 제어\n- 빠른 최근 구간 조회\n- 롤업과 장기 보관\n- 알람과 대시보드\n- 장애 시에도 관측 가능성 유지\n\n즉, metrics pipeline은 운영의 신경계다.\n\n## 깊이 들어가기\n\n### 1. Metrics는 숫자보다 패턴이다\n\n대표 metric 유형:\n\n- counter\n- gauge\n- histogram\n- summary\n\n이때 중요한 건 \"무엇을 측정할지\"가 아니라, **어떤 질문에 답할지**다.\n\n- error rate가 올라가는가\n- p95 latency가 나빠지는가\n- 특정 tenant만 느린가\n- 리전 하나만 흔들리는가\n\n### 2. Capacity Estimation\n\n예:\n\n- 1,000개 서비스\n- 서비스당 500 metrics\n- 10초마다 scrape\n\n이러면 label 조합에 따라 폭발할 수 있다.  \ncardinality가 높아지면 저장보다 index와 query가 더 무거워진다.\n\n봐야 할 숫자:\n\n- samples/sec\n- unique series count\n- ingest lag\n- query latency\n- retention storage\n\n### 3. 파이프라인 구조\n\n```text\nApp / Exporter\n  -> Collector / Scraper\n  -> Buffer / Queue\n  -> Ingest\n  -> TSDB\n  -> Rollup / Downsample\n  -> Query API / Alerting\n```\n\ncollector는 수집, TSDB는 저장과 압축, query layer는 조회를 담당한다.\n\n### 4. Cardinality와 label 설계\n\n가장 큰 함정은 label explosion이다.\n\n나쁜 예:\n\n- user_id\n- request_id\n- trace_id\n\n좋은 예:\n\n- service\n- route\n- status\n- region\n- tenant tier\n\ncardinality가 너무 높으면 TSDB가 사실상 로그 저장소가 된다.\n\n### 5. Retention과 downsampling\n\n메트릭은 최근일수록 촘촘하게, 오래될수록 거칠게 보관한다.\n\n- raw 7일\n- 1분 rollup 30일\n- 1시간 rollup 1년\n\n이렇게 해야 운영성과 비용을 같이 잡을 수 있다.\n\n### 6. Query model\n\n자주 쓰는 질의:\n\n- 최근 5분 p95 latency\n- 지난 24시간 error rate\n- 특정 region의 1시간 트렌드\n\n문제를 더 빨리 좁히려면 metric에서 exemplar나 trace link를 통해 느린 요청의 trace로 점프할 수 있어야 한다.\nTSDB는 시계열 범위 질의에 최적화되어야 하며, arbitrary join은 피하는 편이 낫다.\n\n### 7. Alerting\n\n알람은 데이터가 아니라 정책이다.\n\n- threshold\n- anomaly detection\n- burn rate\n- multi-window alert\n\n알람이 너무 많으면 사람이 무시한다.  \n그래서 noisy metric을 줄이고, severity를 나눠야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: API latency 급증\n\n문제:\n\n- p95가 상승했는데 어느 지점인지 알아야 한다\n\n해결:\n\n- region, route, status label로 slice\n- 최근 구간 raw metric 조회\n\n### 시나리오 2: cardinality 폭발\n\n문제:\n\n- 새 label 추가 후 저장소가 급격히 커진다\n\n해결:\n\n- high-cardinality label 차단\n- sample / aggregate 정책 적용\n\n### 시나리오 3: 장기 추세 분석\n\n문제:\n\n- 1년치 패턴을 보고 싶다\n\n해결:\n\n- downsampled rollup 조회\n- raw와 rollup을 분리\n\n## 코드로 보기\n\n```pseudo\nfunction record(metricName, labels, value):\n  series = normalize(metricName, labels)\n  buffer.append(series, value, now())\n\nfunction query(range, selector):\n  return tsdb.select(range, selector)\n```\n\n```java\npublic void observe(String metric, Map<String, String> labels, double value) {\n    metricsClient.record(metric, sanitize(labels), value);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Pull-based scrape | 운영이 단순하다 | pull 대상 관리 필요 | Prometheus 스타일 |\n| Push-based ingest | edge/short-lived job에 좋다 | 신뢰성 관리 필요 | batch/ephemeral jobs |\n| Raw-only storage | 단순하다 | 비용이 크다 | 짧은 보관 |\n| Rollup-heavy storage | 저렴하다 | 세밀함이 줄어든다 | 장기 추세 |\n| High-cardinality labels | 디버깅이 쉽다 | 비용이 폭발한다 | 제한적으로만 |\n\n핵심은 metrics가 단순 저장이 아니라 **운영 판단을 위한 시간축 데이터 인프라**라는 점이다.\n\n## 꼬리질문\n\n> Q: metrics와 logs는 어떻게 다른가요?\n> 의도: 관측성 데이터의 역할 구분 확인\n> 핵심: metrics는 집계된 숫자, logs는 사건 기록이다.\n\n> Q: cardinality가 왜 문제인가요?\n> 의도: TSDB 비용 구조 이해 확인\n> 핵심: series 수가 늘수록 저장, 인덱스, 쿼리 비용이 함께 커진다.\n\n> Q: rollup을 왜 하나요?\n> 의도: 장기 보관과 비용 trade-off 이해 확인\n> 핵심: 오래된 데이터는 세밀함보다 추세가 중요하다.\n\n> Q: 알람이 너무 많을 때 어떻게 하나요?\n> 의도: 운영 노이즈 제어 이해 확인\n> 핵심: severity, burn rate, dedup, suppression이 필요하다.\n\n## 한 줄 정리\n\nMetrics pipeline / TSDB는 high-cardinality 시계열 데이터를 효율적으로 수집하고 rollup해, 운영 판단과 알람을 가능하게 하는 인프라다.\n",
+  "aliases": [
+    "metrics pipeline",
+    "tsdb",
+    "time series",
+    "cardinality",
+    "rollup",
+    "retention",
+    "scrape",
+    "ingest",
+    "downsampling",
+    "prometheus",
+    "observability",
+    "trace exemplar"
+  ],
+  "expected_queries": [
+    "Metrics Pipeline / TSDB 설계 설계 핵심을 설명해줘",
+    "metrics pipeline가 왜 필요한지 알려줘",
+    "Metrics Pipeline / TSDB 설계 실무 트레이드오프는 뭐야?",
+    "metrics pipeline 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Metrics Pipeline / TSDB 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Metrics Pipeline / TSDB 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Metrics Pipeline / TSDB 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/metrics-pipeline-tsdb-design.md",
+    "revision_history": []
+  }
+}

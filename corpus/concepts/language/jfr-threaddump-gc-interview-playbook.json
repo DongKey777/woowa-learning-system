@@ -1,0 +1,49 @@
+{
+  "id": "language/jfr-threaddump-gc-interview-playbook",
+  "title": "JFR Thread Dump GC Interview Playbook",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "이 playbook은 JVM 장애 분석에서 JFR, thread dump, GC signal을 면접/운영 답변으로 구분한다.",
+  "body_markdown": "# JFR Thread Dump GC Interview Playbook\n\n## 재현 조건\n\nJava API latency가 길거나 CPU가 높거나 memory pressure가 생겼지만 단일 로그 메시지로 원인을 알 수 없다.\n\n운영 first aid의 목표는 바로 튜닝값을 바꾸는 것이 아니라, 장애 시간대의 CPU, thread, allocation, GC, lock, I/O 신호를 같은 timeline에 남겨 원인 후보를 줄이는 것이다.\n\n## 확인 순서\n\n1. Metrics로 CPU, heap, GC pause, allocation rate, thread count를 본다.\n2. Thread dump를 여러 번 떠서 BLOCKED/WAITING/RUNNABLE thread와 반복 stack을 샘플링한다.\n3. JFR로 시간축 이벤트, allocation, lock, socket/file I/O, safepoint, method sample을 본다.\n4. GC log로 pause, allocation pressure, promotion, post-GC occupancy를 확인한다.\n5. 필요하면 async-profiler로 CPU/off-CPU flame graph를 확인한다.\n\n## 장애 직후 first aid\n\n- restart 전 가능하면 thread dump를 3회 이상, 짧은 간격으로 남긴다. 한 장은 우연한 snapshot일 수 있다.\n- CPU high면 OS thread id와 JVM thread dump의 `nid`를 맞춰 실제 CPU를 태우는 thread stack을 찾는다.\n- latency high인데 CPU가 낮으면 pool queue, lock contention, downstream I/O, GC pause, safepoint, connection pool 대기를 먼저 후보로 둔다.\n- JFR은 장애 구간을 포함하도록 짧게라도 기록한다. profile 설정은 유용하지만 고빈도 event를 장시간 켜면 overhead와 파일 크기를 관리해야 한다.\n- GC log/JFR/metrics/thread dump의 timestamp timezone과 clock skew를 맞춘다. timeline이 어긋나면 상관관계 결론을 약하게 말한다.\n- heap dump는 retention/OOM에는 강하지만 운영 영향과 개인정보/토큰 노출 위험이 있으므로 시점, 대상, 보관 정책을 확인한다.\n\n## 면접 답변 축\n\n- JVM 장애 분석은 단일 도구 이름을 말하는 문제가 아니라 time-series, snapshot, event recording, profiler를 어떤 순서로 엮는지의 문제다.\n- thread dump는 특정 순간의 stack snapshot이므로 lock 대기, deadlock, thread pool 고갈의 실마리에 강하지만 짧은 CPU spike나 allocation burst를 놓칠 수 있다.\n- JFR은 낮은 overhead로 JVM event를 시간축에 남기므로 allocation, GC, lock, socket, file I/O, method sample을 한 흐름으로 묶어 보기 좋다.\n- GC log는 memory pressure와 pause의 직접 근거지만, \"왜 객체가 생겼는지\"와 \"누가 잡고 있는지\"는 allocation profile이나 heap dump가 보완한다.\n- profiler는 CPU-bound와 off-CPU 대기를 구분하는 데 도움을 주며, 운영에서는 sampling overhead와 재현성을 같이 고려한다.\n- `RUNNABLE`은 곧 CPU burning이라는 뜻이 아니다. native I/O, safepoint 대기, 짧은 sampling bias일 수 있으므로 thread CPU sample과 같이 본다.\n- `WAITING/TIMED_WAITING`도 항상 장애가 아니다. pool worker idle, scheduler 대기, 정상 park와 starvation을 queue metric으로 구분한다.\n\n## 실패 원인 matrix\n\n| 신호 | 의심 | 다음 확인 |\n|---|---|---|\n| RUNNABLE hot thread | CPU-bound loop | profiler |\n| BLOCKED 많음 | lock contention | monitor enter, owner |\n| GC pause 증가 | allocation/retention | GC log, heap dump |\n| WAITING/TIMED_WAITING 다수 | pool 대기 또는 external I/O | pool queue, socket/DB latency |\n| thread count 지속 증가 | thread leak 또는 executor 생성 남발 | thread name pattern, creation stack |\n| allocation rate 급증 | request path 객체 churn | JFR allocation event, top allocating methods |\n| post-GC occupancy 상승 | live set 증가 또는 leak | heap dump retained path |\n| safepoint 시간이 김 | JVM stop coordination 지연 | safepoint log/JFR safepoint event |\n| CPU high와 GC thread hot | allocation pressure 또는 GC tuning 이슈 | allocation rate, GC cause, young/old 비율 |\n| latency high와 thread dump idle | 외부 dependency 또는 queue 앞단 | tracing, connection pool, load balancer metric |\n\n## 운영/테스트 검증\n\n면접에서는 thread dump 하나로 모든 것을 안다고 말하지 않는다. snapshot, time-series, event recording, profiler의 역할을 분리한다.\n\n검증은 \"가설 하나당 관측 신호 둘 이상\"으로 잡는다. 예를 들어 GC가 원인이라고 말하려면 pause timestamp가 사용자 latency spike와 겹치고, allocation rate나 post-GC occupancy가 그 구간에서 설명력을 가져야 한다.\n\n## 운영 관찰 증거\n\n- CPU high면 process CPU와 thread별 CPU를 먼저 맞춘 뒤 stack sample을 본다. RUNNABLE이라고 항상 CPU를 태우는 것은 아니므로 실제 CPU sample이 필요하다.\n- latency high인데 CPU가 낮으면 lock, pool starvation, downstream I/O, GC pause, safepoint 대기를 후보로 둔다.\n- GC 의심은 heap 그래프만 보지 말고 allocation rate, pause, promoted bytes, post-GC occupancy를 함께 본다.\n- thread dump는 여러 시점으로 반복 채집해야 우연한 snapshot을 일반화하지 않는다.\n- JFR 녹화 시점과 장애 시점이 어긋나면 결론을 약하게 말하고, 재현 조건 또는 지속 recording 전략을 제안한다.\n- deadlock은 thread dump의 deadlock detector가 직접 알려줄 수 있지만, lock contention은 owner thread와 waiter thread의 반복 stack을 함께 봐야 한다.\n- connection pool starvation은 thread dump에서 pool acquire 대기 stack으로 보일 수 있으나, 실제 원인은 downstream latency나 leaked connection일 수 있어 pool metric과 맞춘다.\n- allocation 문제는 \"heap이 큼\"보다 \"요청당 allocation rate가 높음\", \"old로 승격됨\", \"post-GC occupancy가 내려가지 않음\"을 구분해야 한다.\n\n## 안전한 대응 원칙\n\n- 장애 중에는 증거 채집과 영향 완화를 분리한다. restart, scale-out, traffic drain이 필요해도 가능한 증거를 먼저 남긴다.\n- GC option, heap size, pool size, timeout, retry를 한꺼번에 바꾸지 않는다. 여러 knob를 동시에 바꾸면 어떤 가설이 맞았는지 사후 검증이 불가능하다.\n- thread pool을 키우는 대응은 queue wait를 줄일 수 있지만 downstream이나 DB를 더 밀어붙일 수 있다. 포화 원인이 capacity인지 dependency latency인지 먼저 나눈다.\n- heap dump와 JFR 파일은 민감 데이터를 포함할 수 있으므로 접근 권한, 암호화, 보관 기간을 운영 정책에 맞춘다.\n\n## 흔한 오해\n\n- thread dump에 같은 stack이 많이 보인다고 곧바로 bug라고 단정하지 않는다. pool worker가 정상적으로 대기 중일 수 있다.\n- GC 로그가 보였다고 모든 latency의 원인을 GC로 돌리지 않는다. pause 시간과 사용자 지연 시간이 겹치는지 확인해야 한다.\n- JFR은 \"프로파일러보다 항상 안전하다\"가 아니라 목적이 다른 관측 도구다. 깊은 CPU 분석에는 별도 profiler가 더 적합할 수 있다.\n- heap dump는 강력하지만 운영 영향과 민감 정보 노출 가능성이 있어 시점과 보관 정책을 고려해야 한다.\n",
+  "aliases": [
+    "JFR thread dump GC interview",
+    "JVM 장애 분석 면접",
+    "thread dump GC log answer",
+    "Java performance first aid",
+    "native"
+  ],
+  "expected_queries": [
+    "JVM 장애에서 JFR thread dump GC를 어떻게 구분해서 봐?",
+    "CPU high와 latency high를 Java에서 어떻게 분석해?",
+    "thread dump만 보면 충분해?",
+    "Java 장애 first aid에서 무엇을 먼저 떠야 해?",
+    "GC log와 JFR allocation event를 어떻게 같이 봐?"
+  ],
+  "symptoms": [
+    "CPU가 높은데 어떤 thread가 바쁜지 몰라요",
+    "latency가 긴데 thread dump가 순간 스냅샷이라 원인을 놓쳐요",
+    "GC pause와 allocation rate를 구분하지 못해요",
+    "장애가 지나간 뒤 restart만 남고 분석할 증거가 없어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jfr-thread-dump-gc-first-aid-playbook"
+    ],
+    "next_docs": [
+      "language/async-profiler-vs-jfr-comparison"
+    ],
+    "confusable_with": [
+      "language/jfr-thread-dump-gc-first-aid-playbook",
+      "language/async-profiler-vs-jfr-comparison"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/jfr-threaddump-gc-interview-playbook.md",
+    "revision_history": []
+  }
+}

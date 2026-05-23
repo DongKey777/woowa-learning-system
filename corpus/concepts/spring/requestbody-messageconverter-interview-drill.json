@@ -1,0 +1,49 @@
+{
+  "id": "spring/requestbody-messageconverter-interview-drill",
+  "title": "RequestBody MessageConverter Interview Drill",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 drill은 @RequestBody, HttpMessageConverter, 400/415 차이를 면접 답변으로 구성한다.",
+  "body_markdown": "# RequestBody MessageConverter Interview Drill\n\n## 질문\n\n\"Spring MVC에서 `@RequestBody` JSON이 객체로 바뀌는 흐름을 설명해 주세요.\"\n\n## 기대 답변 축\n\n- HandlerAdapter가 controller method argument를 준비할 때 `HttpMessageConverter`가 request body를 읽어 DTO로 변환한다.\n- `Content-Type`이 지원되지 않으면 415 Unsupported Media Type이 날 수 있다.\n- JSON syntax나 type mismatch는 controller method 진입 전 400으로 흐를 수 있다.\n- 변환 후 `@Valid`가 붙으면 Bean Validation이 이어지고 validation error도 400으로 매핑될 수 있다.\n- converter 실패, JSON property binding/deserialization 실패, Bean Validation 실패는 같은 400처럼 보여도 실패 단계가 다르다.\n- `BindingResult`나 field error 응답은 DTO가 만들어진 뒤의 validation/binding result를 다루는 장치이지, 깨진 JSON을 controller 안에서 복구하는 장치가 아니다.\n\n## 실행 흐름\n\n요청이 handler mapping을 지나 controller method가 선택되면, `RequestMappingHandlerAdapter`가 method argument를 준비한다. `@RequestBody`가 붙은 파라미터는 `RequestResponseBodyMethodProcessor`가 처리하고, 이 과정에서 `HttpMessageConverter`가 request body를 읽어 target DTO 타입으로 변환한다. JSON 요청이라면 보통 Jackson 기반 converter가 `Content-Type: application/json`과 Java 타입을 보고 동작한다.\n\n이 변환은 controller method 본문 안에서 일어나지 않는다. argument 준비 단계에서 실패하면 method가 호출되지 않고 MVC 예외 처리 흐름으로 넘어간다. 따라서 \"controller에 break point를 걸었는데 안 들어온다\"는 증상은 message conversion, binding, validation 앞단을 먼저 의심해야 한다.\n\n여기서 \"binding\"이라는 말을 조심해서 써야 한다. `@ModelAttribute`의 query/form binding은 `WebDataBinder`가 request parameter를 객체에 채우는 흐름에 가깝다. `@RequestBody`의 JSON body는 `HttpMessageConverter`가 body stream을 읽고 Jackson 같은 JSON mapper가 property를 target DTO에 deserialization하는 흐름이다. 둘 다 결과적으로 DTO 필드가 채워질 수 있지만, 실패 위치와 예외 타입이 다르다.\n\n면접에서는 아래 순서로 경계를 잡으면 안전하다.\n\n1. **Converter selection**: `Content-Type`, target type, 등록된 converter를 보고 body를 읽을 수 있는지 결정한다.\n2. **Message conversion / JSON binding**: body bytes를 JSON으로 parse하고 DTO 타입, 필드 타입, 생성자/setter 규칙에 맞춰 객체를 만든다.\n3. **Bean Validation**: DTO가 만들어진 뒤 `@Valid` / `@Validated` 제약을 검사한다.\n4. **Business validation**: 이미 존재하는 예약, 소유자 불일치, 취소 불가능 상태처럼 현재 시스템 상태를 봐야 하는 규칙은 service/domain 경계에서 판단한다.\n\n## 400/415 경계\n\n| 상황 | 대표 결과 | 의미 |\n|---|---|---|\n| `Content-Type`이 없거나 지원되지 않음 | 415 | 이 media type을 읽을 converter를 고르지 못함 |\n| JSON syntax가 깨짐 | 400 | body를 JSON으로 파싱하지 못함 |\n| JSON 값이 DTO 타입과 맞지 않음 | 400 | 읽기는 시도했지만 target type 변환 실패 |\n| DTO 변환 후 `@Valid` 제약 위반 | 400 | message conversion 이후 Bean Validation 실패 |\n| DTO는 유효하지만 이미 존재하는 자원과 충돌 | 409 후보 | body 읽기 문제가 아니라 business/resource conflict |\n\n415는 \"요청 본문 형식을 처리할 수 있는가\"에 가깝고, 400은 \"처리 가능한 형식으로 읽으려 했지만 요청 내용이 잘못되었는가\"에 가깝다. validation 400은 converter의 parse 실패와 같은 status일 수 있지만, 실패 단계와 예외 타입이 다르다.\n\n## 경계 정리\n\n- `@RequestBody`는 HTTP body를 converter로 읽는 경로다.\n- query parameter, path variable, form binding은 같은 JSON message converter 경로가 아니다.\n- `Accept` header는 주로 response body를 어떤 media type으로 쓸지에 영향을 주며, request body의 415와 구분한다.\n- Bean Validation은 DTO 객체가 만들어진 뒤 수행된다.\n- business rule 위반은 request body를 읽는 문제와 다르며 service/domain 정책으로 분리한다.\n- `@RequestBody` 옆의 `BindingResult`가 모든 400을 잡아준다고 설명하면 위험하다. malformed JSON, 읽을 수 없는 enum/date/type mismatch는 DTO 생성 전 실패라 validation field error와 분리해서 봐야 한다.\n- custom converter나 `ObjectMapper` 설정을 바꾸면 입력 계약이 바뀔 수 있으므로, API 전체에 미치는 영향을 controller 한 곳의 문제처럼 좁히지 않는다.\n\n## 면접 답변 골격\n\n\"`@RequestBody` 파라미터는 controller method 호출 전에 HandlerAdapter가 준비합니다. Spring은 request의 Content-Type과 target 타입을 보고 적절한 HttpMessageConverter를 선택하고, JSON이면 Jackson converter가 body를 DTO로 읽습니다. 지원하지 않는 media type이면 415가 날 수 있고, JSON syntax나 타입 불일치처럼 읽기 실패가 나면 controller에 들어가기 전 400이 됩니다. DTO 생성 후 `@Valid`가 있으면 Bean Validation이 이어지므로, converter/binding 400과 validation 400을 예외 타입과 단계로 구분해야 합니다. 이미 존재하는 예약 같은 business conflict는 body parsing 문제가 아니어서 service/domain 정책과 status mapping으로 따로 설명합니다.\"\n\n## 약점 태그\n\n- `inside-controller`: body parsing이 controller 내부에서 일어난다고 생각함\n- `415-gap`: Content-Type 협상 실패를 놓침\n- `parse-vs-validation`: parse 400과 validation 400을 구분하지 못함\n- `binding-overload`: `@ModelAttribute` binding과 JSON deserialization을 같은 메커니즘으로 설명함\n- `business-as-validation`: 중복 생성 같은 상태 기반 규칙을 Bean Validation으로만 설명함\n\n## Drill follow-up\n\n- `Content-Type: text/plain`으로 JSON 문자열을 보내면 왜 415가 날 수 있는가?\n- `{ \"age\": \"abc\" }`처럼 타입이 맞지 않으면 controller method가 호출되는가?\n- `@Valid` 실패를 Jackson parse 실패와 같은 handler에서 같은 메시지로 내려도 되는가?\n\n## 검증 질문\n\n| 질문 | 확인하려는 경계 |\n|---|---|\n| `Content-Type`이 `application/json`이 아닌데 body가 JSON처럼 생겼다면 어디서 실패하는가? | converter selection / 415 |\n| JSON 문법은 맞지만 `LocalDate` 형식이 DTO 설정과 다르면 controller method에 들어오는가? | message conversion / type binding 400 |\n| `name`이 빈 문자열이라 `@NotBlank`가 실패하면 converter 문제인가 validation 문제인가? | Bean Validation 400 |\n| 이미 같은 예약 시간이 존재한다면 `@RequestBody` 문제인가 service/domain conflict인가? | business validation / 409 후보 |\n| `BindingResult`를 붙이면 malformed JSON도 field error로 받을 수 있다고 말해도 되는가? | DTO 생성 전 실패와 생성 후 validation 구분 |\n\n## 복습 연결\n\n400/409 분기는 `requestbody-400-vs-validation-400-vs-business-409-decision-guide`로 이어진다.\n",
+  "aliases": [
+    "RequestBody MessageConverter interview",
+    "HttpMessageConverter answer",
+    "@RequestBody 면접 답변",
+    "JSON binding conversion drill",
+    "@ModelAttribute",
+    "@Valid",
+    "@Validated"
+  ],
+  "expected_queries": [
+    "@RequestBody가 JSON을 객체로 바꾸는 흐름을 면접에서 설명해줘",
+    "HttpMessageConverter는 언제 동작해?",
+    "415와 400은 RequestBody에서 어떻게 달라?",
+    "RequestBody binding validation boundary를 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "JSON 변환이 Controller 안에서 일어난다고 생각해요",
+    "Content-Type이 없거나 틀릴 때 415를 놓쳐요",
+    "parse 실패 400과 validation 400을 섞어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/requestbody-400-before-controller-primer"
+    ],
+    "next_docs": [
+      "spring/requestbody-400-vs-validation-400-vs-business-409-decision-guide"
+    ],
+    "confusable_with": [
+      "spring/requestbody-400-before-controller-primer",
+      "spring/requestbody-400-vs-validation-400-vs-business-409-decision-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/requestbody-messageconverter-interview-drill.md",
+    "revision_history": []
+  }
+}

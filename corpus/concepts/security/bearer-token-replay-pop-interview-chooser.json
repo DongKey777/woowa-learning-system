@@ -1,0 +1,46 @@
+{
+  "id": "security/bearer-token-replay-pop-interview-chooser",
+  "title": "Bearer Token Replay PoP Interview Chooser",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 chooser는 bearer token replay 위험과 proof-of-possession token binding의 trade-off를 구분한다.",
+  "body_markdown": "# Bearer Token Replay PoP Interview Chooser\n\n## 보장 범위\n\n이 chooser는 access token을 \"가진 쪽이 쓰는\" bearer 모델과, token 사용자가 binding된 key나 certificate를 실제로 소유함을 증명하는 Proof-of-Possession(PoP) 모델을 비교한다. JWT issuer 검증, refresh token rotation, user authorization 정책, API key leak 대응은 별도 축이다.\n\nPoP는 token 문자열만 탈취된 경우의 replay 가능성을 줄인다. private key나 client certificate까지 탈취됐거나, 악성 client가 정상적으로 proof를 만들 수 있으면 보장이 약해진다.\n\n## 10초 chooser\n\n| 방식 | 의미 | 줄이는 위험 | trade-off |\n|---|---|---|---|\n| Bearer token | 가진 사람이 사용 가능 | token-binding 관점에서는 줄이지 못함. 노출 시 재사용 가능 | 단순하지만 저장/로그 노출에 취약 |\n| DPoP | 요청마다 client key로 proof 서명 | token string 단독 탈취 후 다른 presenter의 replay | proof 생성, `jti` replay cache, clock skew, URL canonicalization 관리 |\n| mTLS-bound token | certificate와 token을 묶음 | 다른 certificate를 든 client의 token 사용 | certificate 배포, rotation, TLS termination/proxy 설정 부담 |\n\n## 헷갈리는 축\n\nBearer token은 \"소지자 증명\"만 한다. 누가 원래 발급받았는지보다 현재 token을 가진 쪽이 요청할 수 있다는 모델이다. TLS는 전송 중 도청을 줄이지만, endpoint의 log, browser storage, crash dump, extension, device compromise에서 token이 노출된 뒤의 재사용까지 없애지는 못한다.\n\nProof-of-Possession(PoP)은 token 사용자가 특정 private key나 certificate를 가지고 있음을 token 사용 시점에 증명하게 만든다. 그래서 token 문자열만 훔쳐서는 다른 환경에서 사용하기 어렵다. 하지만 key/certificate가 함께 탈취됐거나, 공격자가 정상 client 안에서 proof 생성을 대행할 수 있으면 효과가 약해진다.\n\n면접 답변에서는 \"replay를 막는다\"보다 \"token 문자열 단독 replay 가능성을 줄인다\"가 더 정확하다.\n\n## 관찰 증거\n\n- Bearer 위험 증거: 같은 access token이 낯선 IP/region/user-agent에서 사용됨, token이 log/localStorage/crash dump에 노출됨, `aud`/scope가 넓음\n- DPoP 증거: access token의 `cnf` claim과 proof JWT의 public key thumbprint가 맞음, proof의 `htm`/`htu`/`iat`/`jti`를 resource server가 검증함\n- DPoP replay 증거: 같은 proof `jti` 재사용, clock skew 초과, 다른 HTTP method/URL에 같은 proof 사용\n- mTLS-bound 증거: token의 certificate binding과 실제 TLS client certificate fingerprint가 일치함\n- 운영 경계 증거: TLS termination/proxy 뒤에서도 resource server가 binding 정보를 신뢰 가능한 방식으로 전달받음\n\n## 보장 경계\n\n| 상황 | PoP가 줄이는가 | 이유 |\n|---|---|---|\n| access token 문자열만 log에 노출 | 줄인다 | binding된 key/certificate 없이는 token 사용이 어렵다 |\n| proof JWT 자체가 재전송됨 | 조건부로 줄인다 | `jti` cache와 짧은 `iat` window가 있어야 한다 |\n| private key나 client certificate까지 탈취 | 크게 줄이지 못함 | 공격자가 정상 proof를 만들 수 있다 |\n| XSS가 살아 있는 browser에서 요청을 대행 | 크게 줄이지 못할 수 있음 | key를 못 읽어도 client context 안에서 서명을 시킬 수 있다 |\n| resource server 일부가 binding을 검증하지 않음 | 줄이지 못함 | mixed rollout 경로가 bearer fallback처럼 동작한다 |\n\n## 운영 대응\n\n1. bearer token은 TLS, 짧은 TTL, audience/scope 제한, log redaction, 안전한 client storage를 기본 방어로 둔다.\n2. token string 단독 탈취가 현실적인 고위험 client라면 DPoP나 mTLS-bound token을 검토한다.\n3. DPoP는 proof `jti` replay cache, `iat` 허용 window, method/URL binding, key rotation UX를 함께 설계한다.\n4. mTLS-bound token은 authorization server와 resource server가 같은 binding 의미를 검증하게 하고, certificate 발급/폐기/rotation, proxy 전달 헤더 신뢰 경계, 장애 시 fail closed/open 정책을 정한다.\n5. 탐지에서는 \"token이 유효한가\"뿐 아니라 \"binding된 key/certificate와 함께 왔는가\"를 로그에 남긴다.\n\n## Wrong-bucket neighbor\n\nJWT signature 검증은 token이 issuer에 의해 발급되었는지 확인하는 것이다. PoP는 그 token을 들고 온 client가 binding된 key를 실제로 소유하는지 보는 추가 축이다.\n\n## 흔한 오해\n\n- HTTPS를 쓰면 token replay가 불가능하다고 말하면 부족하다. endpoint, client storage, log, browser extension, device compromise에서 token이 노출될 수 있다.\n- JWT가 서명돼 있으면 PoP라고 보는 것은 틀리다. 서명은 issuer의 발급 증명이고, PoP는 presenter의 key possession 증명이다.\n- DPoP는 private key까지 탈취된 경우를 해결하지 못한다. token string 단독 탈취의 replay를 줄이는 장치다.\n- mTLS client auth와 certificate-bound access token은 다르다. token이 certificate에 묶여 있어야 다른 client에서 재사용하기 어렵다.\n- sender-constrained token을 일부 API만 검사하면 전체 시스템이 안전해진다고 말하면 과장이다. 검증하지 않는 resource server는 사실상 bearer acceptance 지점이 된다.\n\n## Safe Next Docs\n\nBrowser/client proof는 `dpop-token-binding-basics`, service-to-service certificate binding은 `mtls-client-auth-vs-certificate-bound-access-token`으로 이어진다.\n",
+  "aliases": [
+    "bearer token replay proof of possession chooser",
+    "bearer token과 PoP token 차이",
+    "token replay defense interview",
+    "access token 탈취 재사용 방어"
+  ],
+  "expected_queries": [
+    "Bearer token은 왜 탈취되면 위험해?",
+    "Proof of Possession token은 무엇이 달라?",
+    "DPoP와 mTLS token binding은 어떤 문제를 줄여?"
+  ],
+  "symptoms": [
+    "HTTPS만 쓰면 token replay가 불가능하다고 생각합니다",
+    "access token 저장 위치와 replay 위험을 분리하지 못합니다",
+    "PoP를 단순 JWT 서명 검증과 혼동합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/proof-of-possession-vs-bearer-token-tradeoffs"
+    ],
+    "next_docs": [
+      "security/dpop-token-binding-basics",
+      "security/mtls-client-auth-vs-certificate-bound-access-token"
+    ],
+    "confusable_with": [
+      "security/dpop-token-binding-basics",
+      "security/mtls-client-auth-vs-certificate-bound-access-token"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/bearer-token-replay-pop-interview-chooser.md",
+    "revision_history": []
+  }
+}

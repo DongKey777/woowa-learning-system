@@ -1,0 +1,56 @@
+{
+  "id": "system-design/backpressure-and-load-shedding-design",
+  "title": "Backpressure and Load Shedding 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Backpressure and Load Shedding 설계를 다루는 deep_dive 문서다. backpressure and load shedding은 시스템이 감당할 수 있는 것만 받아들이고, 넘치는 부하는 우선순위에 따라 버리거나 늦추는 생존성 설계다. 검색 질의가 backpressure, load shedding, graceful degradation, brownout처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Backpressure and Load Shedding 설계\n\n> 한 줄 요약: backpressure and load shedding은 시스템이 감당할 수 있는 것만 받아들이고, 넘치는 부하는 우선순위에 따라 버리거나 늦추는 생존성 설계다.\n\nretrieval-anchor-keywords: backpressure, load shedding, graceful degradation, brownout, partial feature disablement, admission control, queue depth, saturation, bulkhead, overload protection, shed low priority, read-only mode, fail fast, retry amplification, overload telemetry, resilience experiment\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Read-Only and Graceful Degradation Patterns](./read-only-and-graceful-degradation-patterns.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Streaming Analytics Pipeline 설계](./streaming-analytics-pipeline-design.md)\n> - [Distributed Tracing Pipeline 설계](./distributed-tracing-pipeline-design.md)\n> - [Failure Injection / Resilience Validation Platform 설계](./failure-injection-resilience-validation-platform-design.md)\n> - [Cell-Based Architecture / Blast Radius Isolation 설계](./cell-based-architecture-blast-radius-isolation-design.md)\n\n## 핵심 개념\n\n부하 제어는 단순 rate limit이 아니다.  \n실전에서는 다음을 동시에 다뤄야 한다.\n\n- 시스템이 포화되기 전에 신호를 읽는다\n- 중요하지 않은 작업을 먼저 버린다\n- 핵심 경로는 유지한다\n- 큐와 워커의 backlog를 관리한다\n- 장애가 연쇄로 번지지 않게 막는다\n\n즉, backpressure는 downstream이 무너지기 전에 upstream이 스스로 속도를 조절하게 만드는 메커니즘이다.\n\n## 깊이 들어가기\n\n### 1. backpressure와 load shedding의 차이\n\n- backpressure: 더 넣지 말고 천천히 처리하라는 신호\n- load shedding: 이미 넘친 부하를 일부 버리는 정책\n\n둘은 같이 쓰는 경우가 많다.  \n백프레셔로 속도를 줄이고, 그래도 안 되면 low-priority를 버린다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 요청 20만\n- p95 latency가 2배로 상승\n- queue depth가 10배로 증가\n\n이 숫자가 보이면 이미 늦었을 수 있다.  \n핵심은 절대 수치보다 saturation signal이다.\n\n봐야 할 숫자:\n\n- queue depth\n- in-flight request\n- worker utilization\n- p95/p99 latency\n- retry rate\n\n### 3. admission control\n\n모든 요청을 받아서 처리할 필요는 없다.\n\n- low priority drop\n- bounded queue\n- request deadline\n- timeout budget\n\n문제가 되는 경로는 보통 부가 기능이다.\n\n- analytics\n- email/push\n- report export\n- thumbnail generation\n- expensive ranking\n\n### 4. shed strategy\n\n보통 다음 순서로 버린다.\n\n1. 가장 늦게 도착한 저우선 작업\n2. 재시도 가능한 작업\n3. 비용이 큰 보조 작업\n4. 사용자 체감이 낮은 작업\n\n핵심은 \"아무거나 버린다\"가 아니라, **무엇을 희생해 핵심 경로를 살릴지**다.\n\n### 5. bulkhead and isolation\n\n한 경로의 폭주가 전체를 무너뜨리지 않게 해야 한다.\n\n- tenant별 queue\n- endpoint별 worker pool\n- priority lane\n- circuit breaker\n\n이 부분은 [Job Queue 설계](./job-queue-design.md), [Rate Limit Config Service 설계](./rate-limit-config-service-design.md), [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)와 연결된다.\n\n### 6. fallback and degraded mode\n\n늘 완전한 기능을 줄 필요는 없다.\n\n- 검색 결과 일부만 제공\n- 오래된 cache를 잠깐 허용\n- 비핵심 telemetry를 드롭\n- preview와 export를 비동기로 전환\n\n### 7. observability\n\nload shedding은 은밀해야 하지만, 관측은 명확해야 한다.\n\n- shed rate\n- reject rate\n- queue lag\n- downstream saturation\n- circuit breaker open ratio\n\n이 데이터는 [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)와 [Streaming Analytics Pipeline 설계](./streaming-analytics-pipeline-design.md)로 흘러갈 수 있다.\nincident 때는 느린 hop을 빠르게 좁히기 위해 overload 신호와 trace exemplar를 연결해 보는 편이 유용하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 대량 export 폭주\n\n문제:\n\n- CSV export가 동시에 몰린다\n\n해결:\n\n- export queue를 분리\n- low-priority shed\n- deadline 설정\n\n### 시나리오 2: webhook/notification 적체\n\n문제:\n\n- 외부 연동이 느려져 backlog가 쌓인다\n\n해결:\n\n- provider별 bulkhead\n- fail-fast + retry budget\n- DLQ\n\n### 시나리오 3: 실시간 분석 폭주\n\n문제:\n\n- 집계 파이프라인이 메모리 압박을 받는다\n\n해결:\n\n- low-value event drop\n- sketch 기반 근사\n- priority window\n\n## 코드로 보기\n\n```pseudo\nfunction accept(request):\n  if isOverloaded():\n    if request.priority == LOW:\n      return 503\n    if queue.depth > HIGH_WATERMARK:\n      return 429\n  enqueue(request)\n  return 202\n```\n\n```java\npublic boolean shouldShed(Request req) {\n    return overloadDetector.isOverloaded() && req.priority() == Priority.LOW;\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Fail fast | 빠르게 회복한다 | 사용자는 실패를 본다 | 과부하 방어 |\n| Queue everything | 단순하다 | backlog 폭증 | 작은 시스템 |\n| Shed low priority | 핵심 경로를 살린다 | 기능 일부가 사라진다 | 실서비스 |\n| Bulkhead isolation | 연쇄 장애를 막는다 | 운영 복잡도 | 멀티테넌트/멀티워크로드 |\n| Degraded mode | UX를 유지한다 | 기능이 줄어든다 | 부분 장애 |\n\n핵심은 backpressure and load shedding이 단순 차단이 아니라 **시스템 생존성을 위한 우선순위 조절**이라는 점이다.\n\n## 꼬리질문\n\n> Q: backpressure와 rate limit은 어떻게 다른가요?\n> 의도: 보호 목적과 흐름 제어를 구분하는지 확인\n> 핵심: rate limit은 규칙, backpressure는 포화 상태 대응이다.\n\n> Q: load shedding에서 무엇을 먼저 버리나요?\n> 의도: 우선순위 감각 확인\n> 핵심: 재시도 가능하고 사용자 체감이 낮은 작업부터다.\n\n> Q: 왜 bulkhead가 중요한가요?\n> 의도: 연쇄 장애와 격리 이해 확인\n> 핵심: 한 경로의 폭주가 전체를 죽이지 않게 하기 위해서다.\n\n> Q: degraded mode는 언제 유용한가요?\n> 의도: 완전 장애 대신 부분 기능 유지 이해 확인\n> 핵심: 핵심 경로는 살리고 비핵심 기능만 줄일 때 좋다.\n\n## 한 줄 정리\n\nBackpressure and load shedding은 포화 신호를 읽고 저우선 부하를 줄여 핵심 경로와 시스템 생존성을 지키는 설계다.\n",
+  "aliases": [
+    "backpressure",
+    "load shedding",
+    "graceful degradation",
+    "brownout",
+    "partial feature disablement",
+    "admission control",
+    "queue depth",
+    "saturation",
+    "bulkhead",
+    "overload protection",
+    "shed low priority",
+    "read-only mode"
+  ],
+  "expected_queries": [
+    "Backpressure and Load Shedding 설계 설계 핵심을 설명해줘",
+    "backpressure가 왜 필요한지 알려줘",
+    "Backpressure and Load Shedding 설계 실무 트레이드오프는 뭐야?",
+    "backpressure 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Backpressure and Load Shedding 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Backpressure and Load Shedding 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Backpressure and Load Shedding 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [
+      "system-design/availability-and-sla-basics",
+      "system-design/request-path-failure-modes-primer",
+      "language/connection-budget-alignment-after-loom"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/backpressure-and-load-shedding-design.md",
+    "revision_history": []
+  }
+}

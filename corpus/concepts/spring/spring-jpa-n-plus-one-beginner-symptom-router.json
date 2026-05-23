@@ -1,0 +1,45 @@
+{
+  "id": "spring/spring-jpa-n-plus-one-beginner-symptom-router",
+  "title": "Spring JPA N Plus One Beginner Symptom Router",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "이 symptom_router는 Spring JPA N+1과 fetch plan 증상을 초보자 관점에서 분기한다. SQL 수십 번, fetch join, EntityGraph, DTO projection, paging 이상 같은 질문을 다룬다.",
+  "body_markdown": "# Spring JPA N Plus One Beginner Symptom Router\n\n## 관찰 증거\n\n하나의 목록 API에서 같은 패턴의 select가 반복되는지 SQL 로그를 본다. 응답 시간이 느리다는 사실만으로 N+1이라고 단정하지 않는다. N+1은 \"첫 query로 N개를 가져온 뒤, 각 row의 연관을 접근할 때 비슷한 select가 N번 더 나가는 패턴\"이다.\n\n대표 로그 감각은 아래와 같다.\n\n```text\nselect r.* from reservation r order by r.date\nselect m.* from member m where m.id=?  -- 1번째 예약의 member\nselect m.* from member m where m.id=?  -- 2번째 예약의 member\nselect m.* from member m where m.id=?  -- 3번째 예약의 member\n...\n```\n\n관찰할 때는 query count, row count, 같은 SQL pattern 반복 여부, 반복이 DTO 변환/JSON 직렬화 시점에 생기는지를 같이 본다.\n\n## 1차 분기\n\n| 10초 질문 | 그렇다면 | 먼저 볼 후보 |\n|---|---|---|\n| DTO에 `@ManyToOne`/`@OneToOne` 연관 필드가 필요하다 | 단건 연관 로딩 문제 | fetch join 또는 `@EntityGraph` |\n| 목록 응답에 필요한 필드가 정해져 있다 | read model 문제 | DTO projection |\n| `@OneToMany` collection을 page와 함께 fetch하려 한다 | row 증폭/page 경계 문제 | 별도 query, batch size, projection |\n| view rendering/JSON serialization 중 query가 난다 | DTO 변환 경계가 늦다 | service transaction 안에서 DTO 준비 |\n| 이미 query 자체가 느리다 | N+1이 아닐 수 있다 | execution plan/index/where 조건 |\n\n## 정확한 JPA/Spring Data 감각\n\n`fetch join`, `@EntityGraph`, DTO projection은 모두 \"이번 read에 필요한 데이터를 어떻게 준비할지\"의 선택지다.\n\n| 도구 | 잘 맞는 상황 | 주의점 |\n|---|---|---|\n| JPQL `join fetch` | query 의미와 fetch plan을 한 문장에 직접 쓰고 싶을 때 | to-many collection + paging에서 row 증폭/중복/page 문제가 생기기 쉽다 |\n| `@EntityGraph` | repository method에 연관 fetch plan을 선언적으로 붙이고 싶을 때 | collection paging 제약이 마법처럼 사라지지 않는다 |\n| DTO projection | 응답에 필요한 필드가 명확하고 entity graph 전체가 필요 없을 때 | update 목적 entity와 read-only DTO를 혼동하지 않는다 |\n| batch size | 여러 lazy 연관을 묶어서 줄이고 싶을 때 | query가 1번으로 줄지는 않으며 설정 영향 범위를 이해해야 한다 |\n\nSpring Data JPA의 `@EntityGraph`는 JPA fetch/load graph를 repository method에 적용하는 도구다. \"fetch join보다 약한 도구\"가 아니라 fetch plan을 선언하는 위치가 다른 도구로 먼저 이해하면 된다.\n\n## 다음 확인\n\n1. SQL log를 켜고 하나의 API call에서 query count를 센다.\n2. 반복되는 SQL의 where parameter만 바뀌는지 본다.\n3. 반복이 service method 안에서 나는지, controller/serializer에서 나는지 본다.\n4. response DTO에 실제 필요한 필드를 적는다. 필요 없는 연관까지 전부 fetch하지 않는다.\n5. 연관이 to-one인지 to-many인지 구분한다.\n6. paging이 있으면 collection fetch join/graph를 바로 적용하지 말고 row 증폭과 page boundary를 먼저 검토한다.\n7. fix 후 query count와 response row 수를 test나 log로 다시 고정한다.\n\nfetch plan은 \"한 번에 다 가져오기\"가 아니라 \"이번 read model에 필요한 만큼 transaction 안에서 준비하기\"다.\n\n## 관련 playbook\n\nfetch join vs EntityGraph DTO read mini card와 roomescape admin list fetch plan bridge로 이어진다.\n\n## 흔한 오해\n\n- \"`EAGER`로 바꾸면 N+1이 해결된다\"가 아니다. 전역 fetch 전략은 다른 조회까지 오염시키고, 여전히 query shape가 기대와 다를 수 있다.\n- \"N+1이면 무조건 fetch join\"이 아니다. DTO projection이 더 단순한 read도 많다.\n- \"`@EntityGraph`면 paging 문제가 사라진다\"가 아니다. to-many collection fetch의 row 증폭 문제는 별도로 봐야 한다.\n- \"SQL이 많으면 전부 N+1\"이 아니다. 여러 독립 query일 수도 있고, index 문제로 한 query가 느릴 수도 있다.\n- \"Open Session In View가 켜져 있으니 괜찮다\"가 아니다. view/serializer에서 lazy query가 나가면 symptom이 숨겨질 뿐 fetch plan 설계가 늦어진다.\n\n## beginner debug checklist\n\n| 체크 | 질문 |\n|---|---|\n| Query count | API 1회에 SQL이 몇 번 나가는가 |\n| Repeated pattern | 같은 select가 id만 바꿔 반복되는가 |\n| Association type | 반복 대상이 to-one인가 to-many인가 |\n| DTO need | 응답에 진짜 필요한 필드는 무엇인가 |\n| Paging | page/limit이 collection fetch와 충돌하지 않는가 |\n| Transaction boundary | DTO 변환이 transaction 안에서 끝나는가 |\n| Regression guard | fix 후 query count를 어떻게 다시 확인할 것인가 |\n",
+  "aliases": [
+    "spring jpa n plus one beginner router",
+    "fetch join entity graph dto projection",
+    "JPA N+1 증상",
+    "fetch plan 초보자 분기"
+  ],
+  "expected_queries": [
+    "JPA에서 N+1이 뭔지 로그로 어떻게 알아봐?",
+    "fetch join EntityGraph DTO projection 중 뭘 써야 해?",
+    "목록 조회가 느린데 쿼리가 너무 많이 나가"
+  ],
+  "symptoms": [
+    "목록 하나 조회했는데 SQL이 수십 번 나가요",
+    "지연 로딩 때문에 view rendering 중 쿼리가 나가요",
+    "fetch join을 붙였더니 paging이 이상해졌어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-fetch-join-vs-entitygraph-dto-read-mini-card"
+    ],
+    "next_docs": [
+      "spring/roomescape-admin-reservation-list-fetch-plan-bridge"
+    ],
+    "confusable_with": [
+      "spring/spring-fetch-join-vs-entitygraph-dto-read-mini-card",
+      "spring/lazy-loading-dto-mapping-checklist"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-jpa-n-plus-one-beginner-symptom-router.md",
+    "revision_history": []
+  }
+}

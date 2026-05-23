@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/ebpf-perf-strace-interview-chooser",
+  "title": "eBPF perf strace Interview Chooser",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "이 chooser는 eBPF, perf, strace를 exact syscall sequence, CPU sampling/counter, kernel/user event histogram의 관측 목적과 production risk 기준으로 구분한다.",
+  "body_markdown": "# eBPF perf strace Interview Chooser\n\n## 10초 chooser\n\n| 목적 | 도구 | 주의 |\n|---|---|---|\n| 특정 process syscall 흐름/errno 확인 | strace | ptrace stop/resume overhead와 timing side effect |\n| CPU sampling, hardware/software counter, flame graph | perf | symbol, unwind, JIT mapping, sample bias |\n| kernel/user event의 운영 집계와 latency histogram | eBPF | 권한, verifier, attach point 안정성, cardinality/drop |\n\n## 헷갈리는 축\n\n먼저 boundary를 나눈다. \"어떤 syscall을 어떤 인자로 호출했고 어떤 errno를 받았나\"는 `strace`, \"CPU sample이 어느 stack에 몰리나\"는 `perf`, \"운영 중 여러 event의 latency 분포와 wait 원인을 낮은 오버헤드로 집계하나\"는 eBPF가 더 자연스럽다.\n\nstrace는 syscall 단위 디버깅에 직관적이지만 production traffic에 붙이면 overhead와 timing 왜곡이 클 수 있다. eBPF는 낮은 overhead 관측에 강하지만 zero-overhead가 아니며, 프로그램과 metric 설계가 틀리면 cardinality 폭발이나 drop으로 잘못된 결론을 낸다.\n\n## OS 관측 경계\n\nstrace는 ptrace로 process의 syscall entry/exit를 따라가므로 \"이 process가 어떤 syscall에서 막히는가\", \"파일 open이 `ENOENT`인지 `EACCES`인지\", \"connect/read/write가 어떤 반환값을 내는가\"를 보는 데 강하다. 대신 syscall마다 stop/resume이 생겨 hot production path에 무심코 붙이면 지연과 부작용이 커질 수 있다. 짧은 재현, staging, 낮은 QPS 대상, `-c` 집계처럼 범위를 좁히는 선택이 안전하다.\n\nperf는 perf_events 기반 sampling과 counter 관측으로 CPU cycles, instructions, cache miss, context-switches, kernel/user stack을 본다. \"CPU를 어디서 쓰는가\"에 강하지만 every syscall의 인자/반환값을 그대로 보여주는 도구는 아니다. symbol, frame pointer, DWARF unwind, JIT symbol/perf-map 설정이 안 맞으면 stack 해석이 흐려진다. Java hotspot은 async-profiler/JFR이 더 직접적일 수 있다.\n\neBPF는 kernel tracepoint, kprobe/kretprobe, uprobes/uretprobes, socket event 등에 작은 검증된 프로그램을 붙여 event를 집계한다. tracepoint는 비교적 안정적인 ABI에 가깝고, kprobe는 kernel 내부 함수명/구조 변화에 더 취약하다. root 또는 CAP_BPF/CAP_PERFMON 같은 권한, kernel version/BTF, verifier 제한, map cardinality, ring buffer/perf buffer drop, PII 노출 위험을 설계해야 한다.\n\n## 운영에서 확인할 증거\n\n- latency가 syscall wait인지 CPU burning인지 먼저 구분한다.\n- `strace -c` 같은 집계는 짧은 재현 환경에서 쓰고, 운영 long attach는 피한다.\n- perf flame graph에서는 symbol 해석률, kernel/user stack 비율, sample 수를 확인한다.\n- eBPF 지표는 label cardinality, drop count, ring buffer overflow, sampling rate, attach 실패 로그를 함께 본다.\n- container 환경에서는 host PID namespace, cgroup filter, kernel capability 때문에 관측 범위가 달라질 수 있다.\n- syscall 중심 병목이면 strace/eBPF syscall latency histogram을 보고, user-space CPU loop면 perf/JFR/async-profiler로 넘어간다.\n- exact per-request timeline이 필요한지, fleet-wide aggregate histogram이 필요한지에 따라 도구를 나눈다.\n\n## Wrong-bucket neighbor\n\nJava CPU 분석은 async-profiler/JFR이 더 직접적일 수 있다. kernel syscall과 JVM method profile을 섞지 않는다.\n\n`perf`와 eBPF를 \"둘 다 빠른 tracing\"으로 합치지도 않는다. perf는 sampling/counter 중심이고, eBPF는 특정 attach point에서 프로그램이 집계하는 방식이다. 둘 다 stack을 볼 수 있지만 질문의 단위가 다르다.\n\n## 흔한 오해\n\n\"eBPF가 최신이니까 항상 정답\"은 위험하다. 특정 process가 어떤 파일을 열다 실패하는지 빠르게 확인하는 문제는 strace가 더 직접적일 수 있다. 반대로 운영 전체에서 TCP retransmit, run queue, syscall latency 분포를 낮은 overhead로 계속 보고 싶다면 eBPF가 맞다. CPU hotspot 분석은 perf나 언어별 profiler가 먼저다.\n\n\"perf는 kernel만 본다\"도 오해다. user stack도 볼 수 있지만 symbol과 unwind 준비가 필요하다. \"strace로 성능 병목을 찾는다\"는 말도 절반만 맞다. syscall 중심 병목에는 좋지만 user-space CPU loop는 strace에 잘 드러나지 않는다. \"eBPF는 안전하니 항상 운영에 붙여도 된다\"도 틀리다. verifier가 memory safety를 돕더라도 높은 이벤트율, 큰 map, 과한 label, stack capture 남발은 production blast radius가 된다.\n\n## 답변 안전장치\n\n면접에서는 \"관측하고 싶은 boundary와 단위가 무엇인가\"로 시작한다. 한 process의 exact syscall sequence면 strace, CPU sample과 counter면 perf 또는 언어별 profiler, kernel/user event의 저부하 운영 집계면 eBPF라고 답한다. 그 뒤에 overhead, 권한, symbol/unwind, attach point 안정성, cardinality/drop, production blast radius를 덧붙이면 도구 암기보다 운영 판단으로 들린다.\n\n## Safe Next Docs\n\n운영 tracing은 `ebpf-perf-strace-production-tracing`, JVM profiler 비교는 `async-profiler-vs-jfr-comparison`으로 이어진다. CPU가 아니라 lock, IO wait, scheduler 대기처럼 \"안 돌고 있는 시간\"이 핵심이면 `offcpu-debugging`을 다음 문서로 잡는다.\n",
+  "aliases": [
+    "eBPF perf strace chooser",
+    "Linux tracing tool interview",
+    "ebpf perf strace 차이",
+    "production tracing answer"
+  ],
+  "expected_queries": [
+    "eBPF perf strace를 면접에서 어떻게 구분해?",
+    "syscall을 보고 싶으면 strace를 써도 돼?",
+    "production에서 낮은 overhead tracing은 뭘 봐?"
+  ],
+  "symptoms": [
+    "strace를 운영 서버에 무조건 붙이려 해요",
+    "CPU profiler와 syscall tracer를 같은 도구로 봐요",
+    "kernel/user boundary 관측 목적을 분리하지 못해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/ebpf-perf-strace-production-tracing"
+    ],
+    "next_docs": [
+      "language/async-profiler-vs-jfr-comparison"
+    ],
+    "confusable_with": [
+      "operating-system/ebpf-perf-strace-production-tracing",
+      "language/async-profiler-vs-jfr-comparison"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/ebpf-perf-strace-interview-chooser.md",
+    "revision_history": []
+  }
+}

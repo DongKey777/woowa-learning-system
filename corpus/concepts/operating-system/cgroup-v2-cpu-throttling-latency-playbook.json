@@ -1,0 +1,54 @@
+{
+  "id": "operating-system/cgroup-v2-cpu-throttling-latency-playbook",
+  "title": "cgroup v2 CPU Throttling Latency Playbook",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# cgroup v2 CPU Throttling Latency Playbook\n\n> 한 줄 요약: CPU percent가 낮아 보여도 `cpu.stat`의 `nr_throttled`와 `throttled_usec`가 p99 spike 시간대에 같이 오르면, 워크로드는 \"CPU가 남는데도 quota 때문에 못 뛰는\" 상태일 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [cgroup CPU Throttling, Quota, Runtime Debugging](./cgroup-cpu-throttling-quota-runtime-debugging.md)\n- [Load Average Triage: CPU Saturation vs cgroup Throttling vs I/O Wait](./load-average-triage-cpu-saturation-cgroup-throttling-io-wait.md)\n- [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n- [Tail Latency P99 Debugging Playbook](../system-design/tail-latency-p99-debugging-playbook.md)\n\nretrieval-anchor-keywords: cgroup v2, cpu.max, cpu.stat, nr_throttled, throttled_usec, cpu.pressure, p99 latency, request queueing, CPU percent moderate, container CPU quota\n\n## 이 문서의 좁은 역할\n\n기존 [cgroup CPU Throttling, Quota, Runtime Debugging](./cgroup-cpu-throttling-quota-runtime-debugging.md)은 quota와 throttling의 전체 모델을 설명한다. 이 문서는 그중에서도 운영 장애에서 자주 나오는 한 장면에 집중한다.\n\n> \"Grafana의 CPU 사용률은 50% 정도인데 API p99만 주기적으로 튀고, timeout 직전 request queue가 쌓인다.\"\n\n이때 핵심은 평균 CPU percent를 반박하는 더 직접적인 증거를 만드는 것이다. cgroup v2에서 `cpu.max`는 `$MAX $PERIOD` 형식의 CPU bandwidth limit이고, `cpu.stat`는 누적 카운터다. controller가 켜져 있으면 `nr_periods`, `nr_throttled`, `throttled_usec`, `nr_bursts`, `burst_usec` 같은 throttling 관련 값을 볼 수 있다. 한 번의 스냅샷보다 장애 구간 전후의 증가율이 중요하다.\n\n## 왜 CPU percent가 moderate하게 보이나\n\nCPU 사용률은 분모가 무엇인지에 따라 다르게 보인다. 노드 전체 코어 기준이면 컨테이너가 자기 quota를 다 써도 100%처럼 보이지 않을 수 있다. 예를 들어 8코어 노드에서 어떤 서비스가 0.5코어 quota를 받았다면, 그 서비스가 quota를 계속 소진해도 노드 전체 그래프는 낮아 보인다. 반대로 애플리케이션 입장에서는 0.5코어가 전부이므로 request burst가 period 초반에 quota를 태우면 남은 period 동안 runnable thread가 대기한다.\n\n이 대기는 tail에 먼저 나타난다. p50 요청은 period 초반에 끝나지만, 뒤에 들어온 요청은 worker queue, event loop queue, servlet thread 대기열, downstream 호출 전 준비 단계에서 밀릴 수 있다. 그래서 \"평균 CPU가 낮다\"는 말은 원인 배제가 아니라 분모 확인이 필요한 신호다.\n\n## 1차 증거 수집\n\n장애가 진행 중이면 같은 시간창에서 아래를 잡는다. 컨테이너 런타임과 systemd slice에 따라 실제 cgroup 경로는 다를 수 있으므로, 먼저 문제 프로세스가 속한 cgroup을 확인한다.\n\n```bash\ncat /proc/<pid>/cgroup\ncat /sys/fs/cgroup/<resolved-path>/cpu.max\ncat /sys/fs/cgroup/<resolved-path>/cpu.stat\ncat /sys/fs/cgroup/<resolved-path>/cpu.pressure 2>/dev/null\n```\n\n애플리케이션 쪽에서는 같은 timestamp로 아래를 본다.\n\n```text\nendpoint p50/p95/p99/max\nrequest queue depth 또는 pending tasks\nworker active/idle, event loop lag, executor queue\ntimeout count, retry count, 5xx\ncontainer CPU usage rate와 node CPU usage rate\n```\n\n판정은 단일 값이 아니라 **동시성**이다. p99 spike 시간대에 `nr_throttled` delta가 증가하고, `throttled_usec` delta가 커지며, request queue가 같이 늘면 throttling이 tail latency의 강한 후보가 된다.\n\n## delta로 읽는 방법\n\n`cpu.stat`는 누적값이므로 숫자가 크다는 사실만으로 현재 장애라고 말하면 안 된다. 30초 또는 1분 간격으로 두 번 찍어 증가율을 본다.\n\n```bash\ndate\ncat /sys/fs/cgroup/<resolved-path>/cpu.stat\nsleep 60\ndate\ncat /sys/fs/cgroup/<resolved-path>/cpu.stat\n```\n\n읽는 순서는 이렇다.\n\n| 관찰 | 해석 | 다음 확인 |\n|---|---|---|\n| `nr_throttled` delta가 p99 spike와 같이 증가 | quota period마다 제한에 닿음 | `cpu.max`, worker 수, burst workload |\n| `throttled_usec` delta가 크고 request queue도 증가 | runnable work가 실제로 대기했을 가능성 | queue wait trace, `cpu.pressure` |\n| 노드 CPU는 낮고 cgroup CPU는 quota에 붙음 | node capacity가 아니라 cgroup policy 병목 | limit/requests, parent cgroup |\n| `nr_throttled`는 조용한데 p99만 튐 | 다른 tail 원인 가능 | GC, lock, downstream, I/O wait |\n\n`nr_throttled`는 몇 번 제한에 걸렸는지, `throttled_usec`는 제한 때문에 누적된 시간을 보는 데 유용하다. 다만 이 값은 request별 latency가 아니며, cgroup 전체의 누적 신호다. 따라서 trace의 queue wait나 executor 대기시간과 묶어야 한다.\n\n## request queueing으로 연결하기\n\nCPU throttling이 tail을 만드는 전형적인 흐름은 아래와 같다.\n\n1. period 초반에 여러 요청이 동시에 CPU-heavy path를 탄다.\n2. serialization, validation, compression, JSON parsing, 암호화, GC 보조 작업 등이 quota를 빠르게 소진한다.\n3. quota가 회복될 때까지 runnable thread가 실행되지 못한다.\n4. accept된 요청은 애플리케이션 queue나 worker queue에 남는다.\n5. timeout budget이 짧은 요청부터 p99와 error rate에 반영된다.\n\n그래서 \"요청이 느리다\"를 바로 downstream으로 넘기지 말고, latency breakdown에서 handler 진입 전 queue wait, executor pending, event loop lag를 분리한다. CPU가 moderate해 보이는 상태에서 이 값들이 `throttled_usec` delta와 같이 움직이면 원인 후보가 좁아진다.\n\n## 안전한 완화 순서\n\n첫 완화는 원인 증거를 보존하면서 tail을 줄이는 쪽이 좋다.\n\n| 완화 | 효과 | 주의점 |\n|---|---|---|\n| CPU limit 상향 또는 일시 제거 | throttling을 빠르게 줄임 | 노드 전체 saturation과 비용 증가 확인 |\n| API와 batch cgroup 분리 | batch burst가 API quota를 태우는 문제 완화 | 배포/운영 단위 변경 필요 |\n| worker 수를 quota에 맞게 조정 | queue 폭발과 context switching 감소 | 너무 줄이면 throughput 저하 |\n| CPU-heavy path 최적화 | quota 소모 자체 감소 | 코드 변경 검증 필요 |\n| admission control/load shedding | timeout으로 늦게 실패하는 요청 감소 | 정상 요청 일부를 빠르게 거절하는 trade-off |\n\nthread를 무작정 늘리는 것은 보통 좋은 완화가 아니다. quota가 그대로면 더 많은 runnable thread가 같은 작은 예산을 다투고, queueing과 context switching이 늘어 tail이 더 나빠질 수 있다.\n\n## 과잉 결론 방지\n\n- `throttled_usec`가 증가했다고 모든 p99가 throttling 때문은 아니다. 같은 시간대의 queue wait, endpoint p99, retry, downstream span이 필요하다.\n- parent cgroup이 throttle될 수도 있다. leaf cgroup의 `cpu.max`만 보지 말고 runtime/container/systemd 계층을 함께 확인한다.\n- `cpu.max`의 `max`는 quota 제한 없음에 가깝지만, host saturation이나 scheduler contention까지 사라진다는 뜻은 아니다.\n- `cpu.stat`의 시간 단위와 필드는 cgroup v2 문서 기준으로 microseconds이다. 오래된 cgroup v1 CFS 문서의 `throttled_time` nanoseconds와 섞지 않는다.\n- Kubernetes나 container metric은 가공된 이름을 쓸 수 있다. 최종 판정은 가능하면 실제 cgroup 파일과 애플리케이션 latency trace를 대조한다.\n\n## 검증 기준\n\n완화 뒤에는 \"CPU 그래프가 좋아짐\"보다 아래를 본다.\n\n- 같은 traffic에서 `nr_throttled`와 `throttled_usec` delta가 줄었는가.\n- endpoint p99와 timeout rate가 줄었는가.\n- request queue depth, executor pending, event loop lag가 같이 내려갔는가.\n- retry가 줄었고 downstream saturation이 새로 생기지 않았는가.\n- 비용 또는 노드 CPU saturation이 허용 범위에 남아 있는가.\n\n## Primary Sources\n\n- [Linux kernel cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)\n- [Linux kernel CFS Bandwidth Control documentation](https://docs.kernel.org/6.4/scheduler/sched-bwc.html)\n",
+  "aliases": [
+    "cgroup v2 cpu throttling latency playbook",
+    "cpu.stat throttled_usec p99",
+    "nr_throttled latency",
+    "cpu quota p99 spike",
+    "CPU percent moderate but slow",
+    "container cpu throttling evidence",
+    "cgroup v2 cpu.max runtime latency",
+    "request queueing from cgroup throttling",
+    "cpu throttling p99 playbook"
+  ],
+  "expected_queries": [
+    "CPU 사용률은 높지 않은데 cgroup v2 cpu.stat throttled_usec가 오르면 p99 latency 원인으로 봐도 돼?",
+    "container p99가 quota period마다 튈 때 cpu.max와 cpu.stat를 어떤 순서로 확인해?",
+    "nr_throttled 증가와 request queueing을 같은 장애 증거로 묶는 방법을 알려줘",
+    "노드 CPU는 여유 있는데 API timeout이 나고 throttled_usec가 증가하면 어떻게 완화해?"
+  ],
+  "symptoms": [
+    "CPU 사용률은 40~60%처럼 보이는데 p99 latency와 timeout이 튄다.",
+    "cgroup v2 cpu.stat의 nr_throttled와 throttled_usec가 요청 지연 구간에 같이 증가한다.",
+    "worker thread는 늘렸지만 quota period마다 request queue가 밀린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/cgroup-cpu-throttling-quota-runtime-debugging",
+      "operating-system/load-average-triage-cpu-saturation-cgroup-throttling-io-wait"
+    ],
+    "next_docs": [
+      "operating-system/psi-pressure-stall-information-runtime-debugging",
+      "system-design/tail-latency-p99-debugging-playbook"
+    ],
+    "confusable_with": [
+      "operating-system/cgroup-cpu-throttling-quota-runtime-debugging",
+      "operating-system/load-average-triage-cpu-saturation-cgroup-throttling-io-wait",
+      "system-design/tail-latency-p99-debugging-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/cgroup-v2-cpu-throttling-latency-playbook.md",
+    "revision_history": []
+  }
+}

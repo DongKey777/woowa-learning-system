@@ -1,0 +1,52 @@
+{
+  "id": "software-engineering/payment-gateway-outbound-port-mission-bridge",
+  "title": "Payment Gateway Outbound Port Mission Bridge",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# 결제 게이트웨이 바깥 호출 포트(Payment Gateway Outbound Port) 미션 브리지\n\n> 한 줄 요약: 결제 미션에서 PG 연동은 \"HTTP 클라이언트(HTTP client)를 어디에 둘까\"가 아니라, 안쪽 결제 유스케이스가 바깥 결제사 언어를 모르게 만드는 바깥 호출 포트(outbound port) 경계 문제다.\n\n**난이도: Intermediate**\n\n## 미션에서 보이는 증상\n\n| 학습자 표현 | 코드에서 보이는 모양 | 먼저 잡을 경계 |\n|---|---|---|\n| \"결제사 SDK 응답을 그대로 서비스(service)에서 써도 되나요?\" | `PaymentService`가 `TossConfirmResponse`, `PgErrorCode` 같은 타입을 직접 안다 | 결제사 언어를 우리 결제 결과로 번역하는 부패 방지 계층(anti-corruption layer) |\n| \"타임아웃(timeout)이면 승인 API를 다시 부르면 되나요?\" | 같은 주문에 `approve`를 새로 호출하거나 `catch`에서 즉시 재시도한다 | 같은 결제 시도인지 판단하는 멱등 키(idempotency key)와 상태 조회(status lookup) |\n| \"PG 에러 코드를 컨트롤러(controller)에서 상태 코드로 바꾸고 있어요\" | 컨트롤러가 `PROVIDER_TIMEOUT`, `INVALID_CARD` 같은 raw code를 분기한다 | 외부 실패를 우리 실패 타입으로 접는 어댑터(adapter) 책임 |\n| \"인터페이스(interface)를 `/v1/payments/confirm`처럼 만들었어요\" | 포트 메서드가 HTTP path, header, provider parameter를 그대로 노출한다 | 승인/취소/조회 같은 유스케이스 의도 중심 포트(port) |\n| \"결제 승인 성공 뒤 주문 저장이 실패했어요\" | PG 승인과 DB 반영이 한 흐름에 붙어 있는데 실패 처리 위치가 불명확하다 | 포트 경계와 보상(compensation), 대사(reconciliation), 멱등성(idempotency)의 분리 |\n\n## 경계 멘탈 모델\n\n결제 게이트웨이(payment gateway)는 내 서비스 밖에 있다. 그래서 안쪽 코드는 \"토스 결제 승인 API를 호출한다\"가 아니라 \"이 주문의 결제 승인을 요청한다\"라고 말해야 한다.\n\n```text\n컨트롤러(Controller)\n  -> 결제 유스케이스 서비스(Application Service)\n      -> 결제 도메인(Domain)\n      -> 결제 게이트웨이 포트(Outbound Port)\n          -> 결제사 어댑터(Outbound Adapter)\n              -> PG HTTP API / SDK\n```\n\n각 칸의 언어가 다르다.\n\n| 칸 | 써도 되는 언어 | 새면 위험한 언어 |\n|---|---|---|\n| 컨트롤러(Controller) | HTTP 요청, 인증 사용자, 응답 상태 | PG raw code별 비즈니스 판단 |\n| 애플리케이션 서비스(Application Service) | 주문 결제 승인, 취소, 상태 확인, 저장소 조합 | header, endpoint path, SDK 응답 DTO |\n| 도메인(Domain) | 결제 가능 상태, 이미 결제됨, 취소 가능 여부 | 외부 결제사 코드, HTTP status |\n| 바깥 호출 포트(Outbound Port) | `approve`, `cancel`, `findStatus` 같은 의도 | `postConfirm`, `putCancel`, `Map<String, String> headers` |\n| 바깥 어댑터(Outbound Adapter) | HTTP client, token, timeout, provider error mapping | 도메인 규칙 결정, 주문 DB transaction 소유 |\n\n포트(port)는 단순 wrapper가 아니다. 외부 결제사가 어떤 필드명과 에러 코드를 쓰든, 안쪽 서비스가 이해하는 계약으로 번역하는 문이다.\n\n## 포트 계약을 잡는 법\n\n먼저 안쪽 결제 유스케이스가 알고 싶은 말을 정한다. 결제사는 바깥 세부 사항이므로 이름도 request/response도 provider 기준으로 시작하지 않는다.\n\n```java\npublic interface PaymentGateway {\n    PaymentApproval approve(PaymentApprovalCommand command);\n\n    PaymentCancellation cancel(PaymentCancellationCommand command);\n\n    PaymentStatusView findStatus(PaymentStatusQuery query);\n}\n```\n\n이 계약에서 중요한 기준은 세 가지다.\n\n1. 승인/취소/조회라는 결제 의도(intent)가 먼저 보인다.\n2. 결제사 토큰, header, URL, SDK DTO는 계약에 나오지 않는다.\n3. 반환 타입은 결제사 응답이 아니라 우리 서비스가 다음 판단을 할 수 있는 결과다.\n\n예를 들어 결제사가 `ALREADY_PROCESSED`, `DUPLICATED_ORDER_ID`, `TIMEOUT`을 돌려준다면 어댑터(adapter)는 그대로 올리지 않는다. 우리 쪽에서는 `alreadyApproved`, `retryableFailure`, `unknownAfterTimeout`, `rejectedByProvider`처럼 다음 행동을 고를 수 있는 결과로 바꾼다.\n\n## 미션 코드에서의 책임 배치\n\n| 책임 | 넣을 곳 | 이유 |\n|---|---|---|\n| 요청 JSON 검증과 로그인 사용자 확인 | 컨트롤러(Controller) 또는 요청 DTO(Request DTO) | HTTP 입구의 모양 문제다 |\n| 주문이 결제 가능한 상태인지 확인 | 도메인(Domain) 또는 애플리케이션 서비스(Application Service) | 외부 결제사와 무관한 우리 규칙이다 |\n| 결제 시도 번호와 멱등 키 생성 | 애플리케이션 서비스(Application Service) | 같은 주문의 같은 시도를 식별해야 한다 |\n| 결제사 인증 header 구성 | 바깥 어댑터(Outbound Adapter) | provider 연동 세부다 |\n| 결제사 error code를 우리 실패 타입으로 변환 | 바깥 어댑터(Outbound Adapter) | 외부 언어를 안쪽 언어로 번역하는 지점이다 |\n| 승인 성공 뒤 주문 상태 저장 | 애플리케이션 서비스(Application Service)와 저장소(Repository) | 외부 호출 결과를 내부 상태로 반영하는 유스케이스다 |\n| 승인 성공 뒤 DB 실패 보상 | 보상/대사 흐름(Compensation/Reconciliation) | 포트 설계만으로 해결되지 않는 일관성 문제다 |\n\n결제 포트는 \"외부 호출을 숨기는 곳\"까지는 맞지만, 거기서 멈추면 부족하다. 리뷰에서 보는 핵심은 \"외부 실패 의미가 안쪽으로 어떤 형태로 들어오는가\"다.\n\n## 흔한 리뷰 냄새\n\n- 서비스(service) 테스트 fixture에 결제사 SDK 응답 JSON이 그대로 등장한다.\n- 포트(port) 메서드 인자가 `HttpHeaders`, `URI`, `Map<String, Object>`처럼 provider 호출 세부로 되어 있다.\n- 컨트롤러(controller)가 PG 에러 코드를 보고 `400`, `409`, `500`을 직접 고른다.\n- 어댑터(adapter)가 실패를 전부 `RuntimeException` 또는 `null`로 돌려준다.\n- 타임아웃(timeout)을 \"실패\"로만 보고 같은 승인 요청을 새로 보낸다.\n- 승인 요청과 DB 저장을 하나의 긴 transaction처럼 생각해서 네트워크 호출을 transaction 안에 넣는다.\n- 결제 취소(cancel)를 \"승인 API의 반대 호출\" 정도로만 보고 취소 가능 상태와 보상 시나리오를 분리하지 않는다.\n- 테스트가 가짜 포트(fake port) 대신 실제 PG client 설정, secret key, sandbox endpoint에 의존한다.\n\n이 냄새들은 대부분 \"바깥 호출 포트(outbound port)가 있다/없다\"보다 \"포트 언어가 안쪽 언어인가, 바깥 언어인가\"로 판단하면 빠르게 정리된다.\n\n## 잘못된 버킷에 넣기 쉬운 사례\n\n| 상황 | 잘못 넣은 버킷 | 더 맞는 버킷 |\n|---|---|---|\n| 카드 번호 형식이 틀렸다 | 결제사 어댑터에서 검증 | 요청 검증 또는 결제 command 생성 전 검증 |\n| 결제사가 `INVALID_CARD`를 줬다 | 도메인 규칙으로 직접 분기 | 어댑터가 provider 거절(provider rejection)로 번역 |\n| 승인 호출 응답을 못 받았다 | 바로 재승인 호출 | 멱등 키 기반 상태 조회(status lookup) 후 재시도 판단 |\n| 승인 성공 뒤 주문 저장 실패 | 포트 예외 처리에서 해결 | 보상(compensation), 취소(cancel), 대사(reconciliation) 흐름 |\n| PG API path가 바뀌었다 | 서비스 메서드명과 테스트를 수정 | 어댑터 mapping만 수정 |\n| 결제 금액이 주문 금액과 다르다 | PG error code로 처리 | 내부 주문/결제 불변식(invariant) 검증 |\n| 결제 취소 요청자가 주문 주인이 아니다 | 결제사 cancel 호출에서 막기 | 인증/인가(authorization)와 도메인 취소 가능 규칙 |\n\nwrong bucket을 줄이는 질문은 간단하다. \"이 판단은 우리 서비스가 외부 결제사 없이도 말할 수 있는가?\" 그렇다면 안쪽 규칙이다. \"이 판단은 결제사 응답 형식이나 네트워크 실패를 알아야만 가능한가?\" 그렇다면 어댑터 번역 책임이다.\n\n## 리뷰에서 방어 가능한 설명\n\n리뷰 코멘트에 답할 때는 클래스 이름보다 실패 의미를 먼저 말하면 좋다.\n\n```text\nPaymentService는 결제 승인이라는 유스케이스를 조합하고,\nPaymentGateway 포트는 approve/cancel/status 의도만 노출합니다.\nTossPaymentGatewayAdapter가 HTTP header, endpoint, timeout, provider error code를\n우리 쪽 PaymentApprovalResult와 PaymentFailure로 번역하게 두었습니다.\n그래서 결제사를 바꾸거나 raw code가 바뀌어도 service와 domain 규칙은 흔들리지 않습니다.\n```\n\n타임아웃(timeout)에 대한 설명은 더 구체적이어야 한다.\n\n```text\n승인 요청 타임아웃은 성공/실패를 확정할 수 없으므로 같은 멱등 키(idempotency key)로\n상태 조회를 먼저 하고, 그래도 모르면 unknown 상태로 남겨 대사(reconciliation) 대상에 둡니다.\n즉시 새 approve를 보내면 중복 승인 위험이 있습니다.\n```\n\n## 검증 질문\n\n1. 결제사를 바꿔도 `PaymentService` 테스트의 request/response fixture가 그대로 유지되는가?\n2. 포트(port) 인터페이스만 보고도 승인, 취소, 상태 조회라는 유스케이스 의도가 읽히는가?\n3. 결제사 raw error code가 컨트롤러(controller), 도메인(domain), 응답 DTO(response DTO)까지 새지 않는가?\n4. 타임아웃(timeout) 뒤 흐름이 재승인, 상태 조회, 보류(unknown), 보상(compensation) 중 무엇인지 코드로 구분되는가?\n5. 승인 성공 뒤 DB 저장 실패를 \"PG 호출 실패\"와 다른 문제로 테스트하고 있는가?\n6. 서비스 단위 테스트에서 실제 PG client 대신 가짜 포트(fake port)로 성공, 거절, 타임아웃, unknown을 만들 수 있는가?\n7. transaction 안에서 외부 네트워크 호출을 오래 붙잡고 있지 않은가?\n\n이 질문에 답할 수 있으면 결제 미션의 PG 연동 리뷰는 \"클라이언트 클래스를 어디에 둘까\"에서 벗어나, 바깥 호출 경계와 실패 의미를 설계하는 문제로 설명할 수 있다.\n",
+  "aliases": [
+    "payment gateway outbound port bridge",
+    "PG client outbound port mission bridge",
+    "결제 게이트웨이 포트 브리지",
+    "payment client anti corruption bridge",
+    "payment retry timeout port boundary"
+  ],
+  "expected_queries": [
+    "payment 미션에서 PG SDK를 service 안에 바로 쓰면 왜 outbound port가 필요해?",
+    "결제 gateway interface를 HTTP client 세부가 아니라 approve cancel 의도로 잡는 법을 알려줘",
+    "PG timeout retry 에러 코드를 우리 도메인 결과로 번역하는 bridge가 필요해",
+    "payment client anti corruption boundary를 미션 리뷰 문장으로 설명해줘",
+    "결제 API 연동에서 outbound adapter와 idempotency retry 경계가 어떻게 이어져?"
+  ],
+  "symptoms": [
+    "service가 PG SDK 응답 객체와 에러 코드를 그대로 안쪽으로 끌고 들어온다",
+    "결제 client timeout과 재시도를 controller 예외 처리처럼만 다룬다",
+    "paymentGateway 인터페이스가 approve, cancel 의도보다 HTTP 세부를 노출한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/ports-and-adapters-beginner-primer",
+      "software-engineering/api-design-error-handling"
+    ],
+    "next_docs": [
+      "spring/payment-approval-db-failure-compensation-idempotency-primer",
+      "software-engineering/idempotency-retry-consistency-boundaries",
+      "software-engineering/module-api-dto-patterns"
+    ],
+    "confusable_with": [
+      "software-engineering/ports-and-adapters-beginner-primer",
+      "software-engineering/api-design-error-handling",
+      "software-engineering/module-api-dto-patterns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/payment-gateway-outbound-port-mission-bridge.md",
+    "revision_history": []
+  }
+}

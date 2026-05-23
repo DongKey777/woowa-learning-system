@@ -1,0 +1,55 @@
+{
+  "id": "language/class-data-sharing-appcds",
+  "title": "Class Data Sharing and AppCDS",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 JVM Class Data Sharing과 AppCDS를 shared archive, class metadata, application class loading, startup time, footprint, archive generation 관점으로 설명하는 advanced deep dive다.",
+  "body_markdown": "# Class Data Sharing and AppCDS\n\n> 한 줄 요약: CDS/AppCDS는 미리 공유 아카이브를 만들어 class metadata와 일부 로딩 비용을 줄여 startup과 footprint를 개선하는 JVM 기능이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [Java Agent and Instrumentation Basics](./java-agent-instrumentation-basics.md)\n> - [JFR and JMC Performance Playbook](./jfr-jmc-performance-playbook.md)\n\n> retrieval-anchor-keywords: CDS, AppCDS, class data sharing, shared archive, startup time, memory-mapped archive, class loading, archive generation, bootstrap classes, application classes\n\n## 핵심 mental model\n\nCDS(Class Data Sharing)는 JVM이 자주 쓰는 class metadata와 일부 class loading 결과를 archive 파일에 담아, 실행 시 `mmap`으로 재사용하게 하는 HotSpot 기능이다. AppCDS는 bootstrap/platform class뿐 아니라 application class까지 archive 대상으로 넓히는 흐름이다.\n\n효과를 한 문장으로 줄이면 이렇다.\n\n```text\n매번 class metadata를 새로 만들고 검증하는 비용 일부를 archive 생성 단계로 옮긴다.\n```\n\n그래서 주된 이득은 startup time과 footprint다. 같은 archive를 여러 JVM process가 map하면 clean/shared page 비중이 늘 수 있고, cold start에서 class loading 경로가 줄어들 수 있다. 하지만 AppCDS는 JIT warmup, DB connection, TLS handshake, dependency call, 첫 요청 cache miss를 없애지 않는다.\n\n## CDS와 AppCDS 경계\n\n| 항목 | 범위 | 실무 감각 |\n|---|---|---|\n| Default CDS | JDK 쪽 class archive 중심 | 별도 작업 없이 켜져 있거나 JDK가 archive를 제공하는 경우가 많다 |\n| Dynamic CDS archive | 실행 중 로드된 class를 기반으로 archive 생성 | class list를 수집하는 부담을 줄일 수 있다 |\n| AppCDS | application/library class까지 archive | 서비스 classpath와 배포 artifact 변경에 archive lifecycle이 묶인다 |\n| JIT/AOT | machine code 생성 또는 최적화 | class metadata archive와 다른 성능 축이다 |\n\n예전 자료에는 `-XX:+UseAppCDS`가 자주 나오지만, JDK 버전에 따라 CDS/AppCDS 옵션과 기본값은 달라졌다. 최신 HotSpot에서는 CDS가 기본 활성인 경우가 많고, application archive 생성 방식도 static list와 dynamic archive가 함께 쓰인다. 문서나 runbook에는 반드시 JDK version을 적어야 한다.\n\n## Archive 생성과 사용 흐름\n\n전형적인 흐름은 세 단계다.\n\n1. 실제 classpath로 애플리케이션을 실행해 loaded class list를 만든다.\n2. 같은 classpath와 JDK 조건에서 archive를 dump한다.\n3. production startup에서 해당 archive를 지정한다.\n\n예시 감각은 다음과 같다. 실제 옵션은 JDK 버전과 배포 방식에 맞춰 확인해야 한다.\n\n```bash\njava -Xshare:off \\\n  -XX:DumpLoadedClassList=app.classlist \\\n  -cp \"app.jar:lib/*\" com.example.Main\n```\n\n```bash\njava -Xshare:dump \\\n  -XX:SharedClassListFile=app.classlist \\\n  -XX:SharedArchiveFile=app-cds.jsa \\\n  -cp \"app.jar:lib/*\"\n```\n\n```bash\njava -Xshare:on \\\n  -XX:SharedArchiveFile=app-cds.jsa \\\n  -cp \"app.jar:lib/*\" com.example.Main\n```\n\n운영에서는 실패 모드가 더 중요하다. Archive가 classpath와 맞지 않거나, JDK build가 다르거나, class가 instrumented 되어 layout이 달라지면 archive hit가 줄거나 startup이 실패할 수 있다. `-Xshare:on`은 archive를 못 쓰면 실패하는 쪽이고, `-Xshare:auto`는 fallback이 가능하므로 검증 단계와 production 정책을 구분한다.\n\n## 언제 도움이 되는가\n\n| 증상 | AppCDS 후보 여부 | 확인할 증거 |\n|---|---|---|\n| JVM cold start에서 class loading 시간이 크다 | 강한 후보 | `-Xlog:class+load`, JFR startup profile |\n| serverless/short-lived JVM이 많다 | 후보 | p50/p95 startup, readiness time |\n| 같은 host에 같은 JVM process를 여러 개 띄운다 | 후보 | PSS, shared clean pages, container density |\n| 첫 요청이 느리지만 class loading이 작은 비중이다 | 약한 후보 | trace에서 DB/TLS/cache/JIT가 병목인지 확인 |\n| steady-state CPU가 높다 | 보통 직접 해결 아님 | JIT, allocation, lock, GC profile을 따로 본다 |\n\nAppCDS는 \"startup latency bucket\"에 넣어야 한다. Readiness probe가 빨라져야 하는 서비스, CLI 도구, batch worker, serverless runtime처럼 process lifetime이 짧을수록 효과가 보일 가능성이 크다. 장시간 떠 있는 서버에서 steady-state throughput이 문제라면 우선순위가 낮다.\n\n## 운영 비용과 배포 결합\n\nAppCDS archive는 배포 artifact의 일부처럼 다뤄야 한다.\n\n- JDK version과 vendor가 바뀌면 archive를 다시 만든다.\n- application jar, library jar, classpath 순서가 바뀌면 archive 효율 또는 유효성이 바뀔 수 있다.\n- Java agent, bytecode instrumentation, framework proxy generation이 class shape에 영향을 줄 수 있다.\n- container image build 단계에서 archive를 만들면 runtime classpath와 image layer가 일치해야 한다.\n- archive 생성 시간이 build pipeline의 새로운 비용이 된다.\n\n즉 AppCDS는 \"한 번 켜면 끝\"이 아니라 release pipeline에 들어가는 artifact lifecycle 문제다. Archive를 생성한 commit, JDK digest, classpath hash, archive size, archive hit/miss 로그를 남겨야 장애 때 원인을 좁힐 수 있다.\n\n## JIT warmup과 구분하기\n\nStartup이 느릴 때 흔한 오해는 모든 초기 지연을 class loading으로 몰아가는 것이다.\n\n| 지연 bucket | AppCDS가 직접 줄이나 | 다른 확인 |\n|---|---|---|\n| class metadata loading/linking | 줄일 수 있음 | class loading log, CDS archive hit |\n| bytecode profiling/JIT compilation | 직접 해결 아님 | JIT compilation log, JFR compiler events |\n| first DB connection/TLS handshake | 해결 안 함 | network trace, pool warmup |\n| lazy bean initialization | 일부 class loading은 줄어도 framework init은 남음 | Spring startup step/JFR |\n| first request cache miss | 해결 안 함 | application trace/cache metric |\n| allocation pressure/GC | footprint에는 도움 가능, allocation path는 별도 | allocation profile/GC log |\n\n그래서 성능 실험은 `startup total`만 보지 말고 단계별로 쪼갠다. AppCDS 적용 후 class loading 시간이 줄었는데 readiness가 그대로라면 병목은 다른 bucket이다.\n\n## 검증 절차\n\n1. baseline startup profile을 잡는다: total startup, readiness time, class loading 시간, JIT compile 시간, first request latency.\n2. 같은 JDK와 같은 classpath로 archive를 만든다.\n3. `-Xlog:cds` 또는 관련 CDS logging으로 archive가 실제 사용되는지 확인한다.\n4. `-Xshare:on` 검증 환경에서 archive mismatch를 fail-fast로 잡는다.\n5. production은 fallback 정책을 정한다: archive 없으면 fail할지, 느리게라도 뜰지.\n6. p50뿐 아니라 p95/p99 startup과 memory PSS를 비교한다.\n7. JDK upgrade, dependency upgrade, agent 변경 시 archive 재생성을 release checklist에 넣는다.\n\n## 흔한 실패 모드\n\n| 실패 | 증상 | 확인 |\n|---|---|---|\n| classpath mismatch | archive 사용 실패 또는 hit 감소 | CDS log, classpath hash |\n| JDK mismatch | archive load 실패 | JDK vendor/build/version |\n| Java agent instrumentation | archive class와 runtime class shape 불일치 | agent 적용 순서, class transform 로그 |\n| dynamic proxy/generated class 과신 | archive에 담기 어렵거나 이득 작음 | 로드 시점과 class 생성 주체 |\n| startup 병목 오판 | AppCDS 후에도 readiness 개선 없음 | JFR startup breakdown |\n| container layer drift | build-time archive와 runtime jar가 다름 | image digest와 classpath 검증 |\n\n## 검증 질문\n\n- 이 서비스 startup에서 class loading이 실제로 몇 퍼센트인가?\n- AppCDS archive는 어떤 JDK version, classpath, commit에서 생성됐는가?\n- archive mismatch 때 production은 fail-fast인가 fallback인가?\n- Java agent나 framework instrumentation이 archive 대상 class를 바꾸지 않는가?\n- 개선 지표는 total startup, readiness, first request latency, PSS 중 무엇인가?\n- JIT warmup이나 downstream I/O 병목을 AppCDS 효과로 착각하지 않았는가?\n- dependency upgrade 때 archive 재생성이 자동으로 보장되는가?\n\n## Source-aware references\n\n- OpenJDK / HotSpot CDS documentation: https://docs.oracle.com/en/java/javase/\n- JEP 310, Application Class-Data Sharing\n- JEP 350, Dynamic CDS Archives\n- JEP 341, Default CDS Archives\n\n## 한 줄 정리\n\nCDS/AppCDS는 class loading과 metadata archive를 다루는 startup/footprint 최적화다. Archive lifecycle을 배포 artifact처럼 관리하고, JIT warmup이나 첫 요청 병목과 분리해서 측정해야 학습자에게 과장 없는 설명이 된다.\n",
+  "aliases": [
+    "Class Data Sharing",
+    "AppCDS",
+    "Java CDS",
+    "shared archive",
+    "JVM class loading startup",
+    "class metadata archive",
+    "AppCDS startup time",
+    "static"
+  ],
+  "expected_queries": [
+    "Java CDS와 AppCDS 차이를 application class archive 관점으로 설명해줘",
+    "AppCDS가 startup time과 memory footprint를 줄이는 이유가 뭐야?",
+    "AppCDS archive는 class set이 바뀌면 왜 다시 만들어야 해?",
+    "CDS는 JIT warmup이나 첫 요청 latency까지 해결하는지 구분해줘",
+    "JVM class loading 비용을 shared archive로 줄이는 흐름을 알려줘"
+  ],
+  "symptoms": [
+    "CDS/AppCDS를 JVM 성능 마법처럼 보고 class loading 비용을 archive로 선불 처리하는 도구라는 범위를 놓쳐",
+    "archive 생성과 class set 변경이 배포 프로세스에 연결된다는 운영 비용을 계산하지 않아",
+    "startup 개선과 JIT warmup, allocation path, downstream IO 병목을 같은 성능 문제로 섞어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/classloader-delegation-edge-cases"
+    ],
+    "next_docs": [
+      "language/cds-startup-profiling",
+      "language/jit-warmup-deoptimization",
+      "language/jfr-jmc-performance-playbook"
+    ],
+    "confusable_with": [
+      "language/cds-startup-profiling",
+      "language/jit-warmup-deoptimization",
+      "language/classloader-memory-leak-playbook",
+      "language/compressed-oops-class-pointers"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/class-data-sharing-appcds.md",
+    "revision_history": []
+  }
+}

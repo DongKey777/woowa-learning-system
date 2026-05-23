@@ -1,0 +1,54 @@
+{
+  "id": "database/roomescape-reschedule-old-slot-still-blocked-symptom-router",
+  "title": "roomescape 예약 변경 뒤 이전 시간이 안 풀려요 원인 라우터",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# roomescape 예약 변경 뒤 이전 시간이 안 풀려요 원인 라우터\n\n## 한 줄 요약\n\n> 예약 변경 뒤 이전 시간이 안 풀리는 증상은 `UPDATE reservation SET time_id = ?` 한 줄의 문제가 아니라, old slot release, new slot claim, rollback, constraint, read model, lock order 중 어느 단계의 truth가 어긋났는지 가르는 문제다.\n\n## 관찰 증거\n\n먼저 \"old slot이 정말 안 풀렸는가\"와 \"안 풀려 보이는가\"를 분리한다. 같은 화면 증상이라도 canonical DB, unique index, cache/read model, transaction log가 가리키는 원인이 다르다.\n\n| 관찰 지점 | 확인할 증거 | 1차 해석 |\n|---|---|---|\n| 예약 row | 변경 후 `reservation_id`의 현재 time/slot/status/version | 같은 예약 전이 자체가 commit됐는가 |\n| active blocker query | old slot을 막는 active reservation/claim row가 남아 있는가 | old release 실패 또는 active predicate drift |\n| new slot claim | new slot에 active reservation/claim row가 생겼는가 | new claim 성공/실패, 전체 rollback 여부 |\n| constraint error | duplicate key, exclusion violation, self-conflict 메시지 | unique constraint/index predicate 또는 자기 자신 제외 누락 |\n| transaction boundary | 성공 응답 전후 commit/rollback 로그, `rollback-only` | 중간 성공 로그 뒤 전체 rollback 가능성 |\n| read path | primary DB 직접 조회와 available-times API/cache/projection 응답 차이 | stale cache, replica lag, read model refresh 누락 |\n| lock diagnostics | deadlock, lock wait timeout, retry 로그 | old/new union lock 또는 canonical lock ordering 문제 |\n\n## 1차 분기\n\n| 보이는 증상 | 더 가까운 원인 후보 | 바로 다음 확인 |\n|---|---|---|\n| 변경 API는 성공했는데 old slot active row가 그대로다 | old slot release가 적용되지 않음 | release delta가 active predicate를 실제로 끄는지 확인 |\n| old slot도 new slot도 둘 다 막혀 보인다 | old release와 new claim을 서로 다른 truth/read path가 읽음 | canonical active row와 available-times query를 같은 조건으로 비교 |\n| new slot claim이 실패하고 old slot이 남아 있다 | transaction rollback 또는 business conflict | rollback 로그, duplicate key, conflict response가 성공으로 포장됐는지 확인 |\n| 같은 예약 수정인데 \"이미 예약됨\"이 난다 | 자기 자신 제외 누락, unique index predicate 부정확 | overlap query의 `reservation_id != current`와 partial unique 조건 확인 |\n| DB 직접 조회는 풀렸는데 화면/API만 막혀 있다 | stale cache/read model/replica | cache key, projection refresh, primary read 강제 비교 |\n| 동시 변경/취소에서만 간헐적으로 발생한다 | old/new union lock 누락 또는 lock ordering drift | touched scope 계산과 canonical lock order 확인 |\n\n## 가능한 원인\n\n### 1. old slot release가 active truth를 실제로 끄지 않는다\n\n`status='CHANGED'`, `status='CANCELED'`, `old_time_id = null` 같은 라벨만 바꾸고 available-times가 보는 blocker 조건을 끄지 않으면, 변경은 성공했는데 old slot은 계속 막힌다. slot claim table을 쓰는 구조라면 old claim delete/update 또는 tombstone 기록이 같은 transaction에서 끝났는지도 봐야 한다.\n\n다음 확인:\n\n- old slot을 막는 쿼리가 `status`, `released_at`, active claim row, valid interval 중 무엇을 truth로 쓰는가\n- reschedule path가 cancel/expire/cleanup과 같은 release protocol을 타는가\n- tombstone이 release evidence일 뿐 blocker로 다시 읽히지 않는가\n\n이 갈래는 [roomescape 예약 변경/취소 ↔ active predicate와 상태 전이 브릿지](./roomescape-reservation-cancel-reschedule-active-predicate-bridge.md)와 [Active Predicate Drift in Reservation Arbitration](./active-predicate-drift-reservation-arbitration.md)로 이어진다.\n\n### 2. new slot claim 실패가 전체 rollback을 만들었다\n\nreschedule은 안전하게 구현하면 old release와 new claim이 같은 transaction 안에서 함께 성공하거나 함께 실패한다. 그래서 new slot이 이미 점유되어 claim이 거절됐다면 old slot이 남는 것은 정상 rollback일 수 있다. 문제는 이 실패를 service 계층에서 성공처럼 응답하거나, 중간 로그만 보고 \"old가 안 풀렸다\"고 오해할 때 생긴다.\n\n다음 확인:\n\n- new slot conflict가 business rejection으로 반환됐는가, 예외가 삼켜졌는가\n- 성공 로그가 commit 전에 찍힌 로그인지, commit 이후 검증 로그인지\n- retry 후 같은 mutation key가 이전 실패/성공 결과를 재사용하는지\n\n이 갈래는 [Reservation Reschedule and Cancellation Transition Patterns](./reservation-reschedule-cancellation-transition-patterns.md)에서 transition fence와 mutation idempotency를 같이 본다.\n\n### 3. transaction rollback을 release 누락으로 착각했다\n\nSpring/JPA 테스트나 service 흐름에서는 `save()`가 호출되고 flush까지 지나도 마지막 commit 전에 예외가 나면 old/new 변경이 모두 되돌아간다. `UnexpectedRollbackException`, checked/unchecked rollback rule, 예외 catch 후 정상 응답 같은 흔한 패턴이 여기 섞인다.\n\n다음 확인:\n\n- DB에 commit된 최종 상태를 별도 transaction에서 다시 읽었는가\n- 예외를 catch한 뒤 transaction이 `rollback-only`가 됐는데도 성공 응답을 만들지 않았는가\n- 테스트가 같은 transaction 안에서만 조회해서 commit 후 상태를 검증하지 못하는가\n\n이 경우 \"old release 로직\"보다 transaction boundary와 rollback rule을 먼저 확인한다.\n\n### 4. unique constraint/index가 active predicate와 맞지 않는다\n\nDB constraint가 있는 것은 좋지만, 어떤 row를 \"active blocker\"로 볼지 index predicate가 코드와 같아야 한다. soft delete나 상태 컬럼을 쓰는데 unique index가 canceled/released row까지 포함하면 old row가 자기 자신 또는 과거 row와 계속 충돌한다. 반대로 constraint가 너무 약하면 새 slot claim이 경쟁 요청을 막지 못한다.\n\n다음 확인:\n\n- unique key가 `(theme_id, date, time_id)`처럼 old row와 self-conflict를 만들지 않는가\n- partial unique index 또는 generated active key가 `released_at IS NULL`, active status와 같은 조건을 쓰는가\n- overlap query가 현재 `reservation_id`를 제외하고 재검사하는가\n- DB constraint는 invariant 위반을 거절할 뿐 release/claim transition 의미를 대신 만들지 않는다는 점을 분리했는가\n\n이 갈래는 [Slot Delta Reschedule Semantics](./slot-delta-reschedule-semantics.md)와 soft-delete uniqueness 문서로 이어진다.\n\n### 5. stale cache/read model이 old slot을 계속 보여 준다\n\ncanonical DB에서는 old blocker가 사라졌는데 available-times API만 늦게 따라오면 write path보다 read path 문제다. 캐시 키가 `theme/date` 단위라 reschedule 후 old date만 evict하고 new date를 evict하지 않았거나, projection/replica가 아직 이전 active set을 보고 있을 수 있다.\n\n다음 확인:\n\n- primary DB에서 active blocker query를 직접 실행하면 old slot이 풀려 있는가\n- cache bypass/header 또는 admin endpoint로 읽으면 결과가 달라지는가\n- reschedule이 old slot date와 new slot date 양쪽 read model을 invalidate/refresh하는가\n- replica lag, materialized view refresh, search projection delay가 available-times 응답에 섞였는가\n\n이 경우 \"예약이 안 풀렸다\"가 아니라 \"예약 가능 목록이 stale하다\"로 bucket을 바꾼다.\n\n### 6. old/new union lock과 lock ordering이 흔들린다\n\n동시 요청에서만 재현되면 old slot release와 new slot claim을 한 surface에서 직렬화하지 못했을 가능성이 높다. old만 잠그고 release한 뒤 new를 확인하거나, new만 먼저 잡고 old를 나중에 풀면 cancel/reschedule/cleanup 경로와 순서가 엇갈린다.\n\n다음 확인:\n\n- `old_scope ∪ new_scope` 또는 `old_slots ∪ new_slots`를 계산해 모두 잠그는가\n- create, cancel, reschedule, cleanup이 같은 key generator와 같은 active predicate를 쓰는가\n- guard key를 전역 canonical order로 잠그는가\n- deadlock victim/serialization failure는 bounded retry하고, business conflict는 사용자 거절로 분리하는가\n\n이 갈래는 [Guard-Row Scope Design for Multi-Day Bookings](./guard-row-scope-design-multi-day-bookings.md)와 [Slot Delta Reschedule Semantics](./slot-delta-reschedule-semantics.md)를 먼저 본다.\n\n## Wrong-bucket neighbor\n\n| 지금 장면 | 이 문서가 아닌 쪽 | 이유 |\n|---|---|---|\n| 모든 시간대가 비어 있거나 전부 막힌다 | `roomescape-available-times-empty-cause-router` | 특정 reschedule의 old slot handoff가 아니라 available-times 전체 쿼리 문제일 수 있다 |\n| 서로 다른 두 예약이 같은 slot에 모두 성공했다 | `overlapping-bookings-both-succeed-symptom-router` | old slot stuck보다 admission invariant 누락이 먼저다 |\n| 10:00-11:00이 10:30 같은 경계에서만 충돌한다 | `slot-row-rounding-half-open-dst-junior-checklist` | release/claim 순서보다 slot expansion 규칙 문제다 |\n| DB는 맞는데 브라우저 local state만 예전 표시다 | frontend state/cache 문제 | RAG 라우팅은 canonical read path와 API cache까지 확인한 뒤에만 DB 쪽으로 보낸다 |\n| new slot이 이미 다른 예약으로 막혀 변경이 거절됐다 | 정상 business conflict | old slot이 남는 것은 atomic rollback 결과일 수 있다 |\n\n## 검증 질문\n\n1. reschedule commit 이후 primary DB에서 old slot을 막는 active blocker row가 0개인가?\n2. new slot claim 실패 시 old slot이 남는 것을 성공 응답으로 포장하지 않는가?\n3. available-times 쿼리와 unique/overlap constraint가 같은 active predicate를 쓰는가?\n4. 같은 예약 수정에서 overlap 검사나 unique key가 자기 자신을 충돌 후보로 잡지 않는가?\n5. cache/projection/replica를 우회해 읽으면 old slot이 풀려 보이는가?\n6. create, cancel, reschedule, cleanup이 `old ∪ new` touched scope를 같은 순서로 잠그는가?\n\n## 다음 학습\n\n- 예약 변경과 취소를 상태 전이로 묶어 보는 기본 그림은 [roomescape 예약 변경/취소 ↔ active predicate와 상태 전이 브릿지](./roomescape-reservation-cancel-reschedule-active-predicate-bridge.md)에서 잡는다.\n- old/new scope union lock과 mutation contract를 더 일반화해서 보려면 [Reservation Reschedule and Cancellation Transition Patterns](./reservation-reschedule-cancellation-transition-patterns.md)로 간다.\n- slot row 모델에서 old slot release와 new slot claim을 어떻게 한 번만 적용할지 보려면 [Slot Delta Reschedule Semantics](./slot-delta-reschedule-semantics.md)를 읽는다.\n- 멀티데이나 guard row 설계 때문에 변경 경로가 꼬인다면 [Guard-Row Scope Design for Multi-Day Bookings](./guard-row-scope-design-multi-day-bookings.md)을 이어서 본다.\n",
+  "aliases": [
+    "roomescape 예약 변경 뒤 이전 시간 안 풀림",
+    "reschedule 후 이전 슬롯이 계속 막힘",
+    "예약 옮겼는데 예전 시간이 비지 않음",
+    "self conflict after reschedule",
+    "old slot still blocked router"
+  ],
+  "expected_queries": [
+    "roomescape에서 예약 시간을 옮긴 뒤 예전 슬롯이 안 풀리면 어디부터 확인해야 해?",
+    "예약 변경은 성공했는데 이전 시간도 계속 막혀 보일 때 원인을 어떻게 나눠?",
+    "같은 예약 수정인데 자기 자신과 충돌했다고 나오면 reschedule 쪽에서 뭘 의심해야 해?",
+    "cancel 뒤 새 슬롯은 잡혔는데 old slot이 늦게 풀리는 상황은 어떤 문서로 가야 해?",
+    "roomescape reschedule 이후 available times가 이상할 때 active predicate랑 slot 계산 중 뭐가 더 먼저야?"
+  ],
+  "symptoms": [
+    "roomescape에서 예약 시간을 옮겼는데 예전 시간대가 계속 막혀 있어요",
+    "예약 변경은 성공했는데 available times에는 이전 슬롯도 새 슬롯도 둘 다 막힌 것처럼 보여요",
+    "같은 예약을 수정하는데 자기 자신과 충돌했다고 나와요",
+    "취소나 변경 직후에만 이전 시간이 늦게 풀리거나 다시 막혀 보여서 어디부터 봐야 할지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics",
+      "database/roomescape-reservation-concurrency-bridge"
+    ],
+    "next_docs": [
+      "database/roomescape-reservation-cancel-reschedule-active-predicate-bridge",
+      "database/reservation-reschedule-cancellation-transition-patterns",
+      "database/slot-delta-reschedule-semantics",
+      "database/guard-row-scope-design-multi-day-bookings"
+    ],
+    "confusable_with": [
+      "database/roomescape-available-times-empty-cause-router",
+      "database/overlapping-bookings-both-succeed-symptom-router",
+      "database/reservation-reschedule-cancellation-transition-patterns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/roomescape-reschedule-old-slot-still-blocked-symptom-router.md",
+    "revision_history": []
+  }
+}

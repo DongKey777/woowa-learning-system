@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/rlimit-nofile-nproc-governance",
+  "title": "RLIMIT NOFILE NPROC Governance",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 RLIMIT_NOFILE과 RLIMIT_NPROC를 fd와 process/thread count 폭주를 막는 governance로",
+  "body_markdown": "# RLIMIT NOFILE, NPROC Governance\n\n> 한 줄 요약: `RLIMIT_NOFILE`과 `RLIMIT_NPROC`는 서버가 열 수 있는 fd와 프로세스 수를 제한해 폭주를 막지만, 잘못 잡으면 정상 워크로드도 먼저 막는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [FD Exhaustion, ulimit, Diagnostics](./fd-exhaustion-ulimit-diagnostics.md)\n> - [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [signals, process supervision](./signals-process-supervision.md)\n> - [CFS Bandwidth, Burst Behavior](./cfs-bandwidth-burst-behavior.md)\n\n> retrieval-anchor-keywords: RLIMIT_NOFILE, RLIMIT_NPROC, ulimit -n, ulimit -u, nofile, nproc, soft limit, hard limit, PAM limits\n\n## 핵심 개념\n\nLinux `rlimit`은 프로세스가 사용할 수 있는 자원 상한을 정한다. backend 팀이 가장 자주 보는 건 fd와 process 수다.\n\n- `RLIMIT_NOFILE`: 열린 파일/소켓 수 상한이다\n- `RLIMIT_NPROC`: 보통 해당 real user ID가 만들 수 있는 process/thread 수 상한으로 작동한다\n- `soft limit`: 현재 적용되는 낮은 쪽 한도다\n- `hard limit`: soft limit의 상한이다\n\n왜 중요한가:\n\n- connection 많은 서버는 nofile이 낮으면 먼저 죽는다\n- worker를 많이 쓰는 서버는 nproc이 낮으면 fork/exec가 막힌다\n- 한도를 너무 낮추면 정상 트래픽도 장애로 보인다\n\n이 문서는 [FD Exhaustion, ulimit, Diagnostics](./fd-exhaustion-ulimit-diagnostics.md)와 [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)을 governance 관점에서 묶는다.\n\n## 깊이 들어가기\n\n### 1. rlimit은 프로세스와 사용자/서비스 경계가 섞인 governance다\n\n`RLIMIT_NOFILE`은 프로세스별 fd table 상한이고, `RLIMIT_NPROC`은 Linux에서 real user ID 기준의 task 생성 제한처럼 체감되는 경우가 많다. systemd, PAM, container runtime, cgroup pids controller가 함께 적용될 수 있으므로 한 값만 보면 안 된다.\n\n- 서비스별로 다르게 줄 수 있다\n- 컨테이너와 호스트에서 다르게 보일 수 있다\n- soft/hard 구성으로 단계적 제어가 가능하다\n\n### 2. nofile은 연결과 로그를 같이 잡는다\n\n- socket connection\n- open file\n- pipe\n- descriptor-based IPC\n\n모두 `nofile`에 포함된다.\n\n### 3. nproc은 fork/exec 경로를 막는다\n\n- worker spawn\n- shell execution\n- child process creation\n\n이 단계에서 막히면 회복 경로 자체가 어렵다.\n\n### 4. governance는 단순히 낮추는 일이 아니다\n\n- 너무 높으면 폭주를 허용한다\n- 너무 낮으면 정상 부하도 막는다\n- 서비스 특성과 재시작 전략이 필요하다\n\n## 실전 시나리오\n\n### 시나리오 1: 연결이 많아지면 `Too many open files`가 뜬다\n\n가능한 원인:\n\n- nofile soft limit이 낮다\n- fd leak이 있다\n- keep-alive와 worker pool이 커졌다\n\n진단:\n\n```bash\nulimit -n\ncat /proc/<pid>/limits | grep -i \"open files\"\n```\n\n### 시나리오 2: worker spawn이 실패한다\n\n가능한 원인:\n\n- nproc limit이 낮다\n- zombie가 쌓였다\n- container pids limit과 겹친다\n\n진단:\n\n```bash\nulimit -u\ncat /proc/<pid>/limits | grep -i processes\ncat /sys/fs/cgroup/pids.current 2>/dev/null\ncat /sys/fs/cgroup/pids.max 2>/dev/null\n```\n\n### 시나리오 3: 배치 노드와 API 노드의 limit이 같아서 둘 다 불편하다\n\n가능한 원인:\n\n- workloads가 다르다\n- 같은 limit이 적절하지 않다\n- governance가 분리되지 않았다\n\n## 운영 Playbook\n\n### 재현 조건\n\n- `EMFILE`, `Too many open files`, `EAGAIN`, `Resource temporarily unavailable`, thread creation failure가 부하와 함께 나타난다.\n- container 안 `ulimit`은 충분해 보이는데 cgroup `pids.max` 또는 systemd `TasksMax`에서 막힌다.\n- limit을 올리면 장애는 사라지지만 fd leak, zombie, thread leak 지표가 계속 증가한다.\n\n### 확인 순서\n\n1. 실패 errno를 분리한다: fd open 실패인지, thread/process 생성 실패인지, memory 부족인지.\n2. 대상 프로세스 기준 `cat /proc/<pid>/limits`를 보고 shell의 `ulimit`과 혼동하지 않는다.\n3. fd 문제는 `ls /proc/<pid>/fd | wc -l`, `lsof -p <pid>`로 현재 사용량과 leak 패턴을 본다.\n4. process/thread 문제는 `ps -eLf | wc -l`, `cat /sys/fs/cgroup/pids.{current,max}`를 같이 본다.\n5. systemd 서비스라면 `systemctl show <unit> -p LimitNOFILE -p LimitNPROC -p TasksMax`를 확인한다.\n\n### Failure Matrix\n\n| 증상 | wrong-bucket 방지 | 다음 확인 |\n|------|-------------------|-----------|\n| `EMFILE` | PID/OOM이 아니라 fd limit/leak | `/proc/<pid>/fd`, `RLIMIT_NOFILE` |\n| `pthread_create` 실패 | nofile이 아니라 nproc/pids/memory | `RLIMIT_NPROC`, `pids.max`, memory events |\n| fork 실패 + zombie 많음 | limit만 낮은 게 아니라 reaping 실패 | `ps stat Z`, parent PID |\n| shell `ulimit`은 높음 | 실행 중 서비스 limit과 다를 수 있음 | `/proc/<pid>/limits`, systemd unit |\n| limit 상향 후 정상화 | 근본 해결 아닐 수 있음 | fd/thread 증가율, backpressure |\n\n### 검증\n\nlimit 변경 후에는 현재 사용량이 상한에 붙지 않는지, peak 대비 headroom이 있는지, leak slope가 0에 가까운지 확인한다. governance 값은 정상 peak를 통과시키면서 폭주를 차단해야 하므로 \"크게 올림\"만으로 완료하지 않는다.\n\n## 코드로 보기\n\n### 현재 limit 확인\n\n```bash\nulimit -n\nulimit -u\ncat /proc/<pid>/limits\n```\n\n### 설정 감각\n\n```bash\nulimit -n 65535\nulimit -u 4096\n```\n\n### 단순 모델\n\n```text\nsoft limit reached\n  -> new fd/process creation blocked\nhard limit reached\n  -> cannot raise without privilege\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 낮은 nofile | 폭주를 막는다 | 정상 연결이 막힐 수 있다 | 소규모 서비스 |\n| 높은 nofile | 많은 연결을 수용 | leak 숨김 효과 | 대형 server |\n| 낮은 nproc | process explosion 방지 | worker 확장이 막힌다 | container runtime |\n| 높은 nproc | spawn 유연성 | 폭주 위험 | fan-out 작업 |\n\n## 꼬리질문\n\n> Q: nofile과 nproc은 무엇을 막나요?\n> 핵심: 각각 열린 fd 수와 프로세스 수를 제한한다.\n\n> Q: soft limit과 hard limit의 차이는?\n> 핵심: soft는 현재 적용, hard는 상한이다.\n\n> Q: rlimit만 올리면 끝인가요?\n> 핵심: 아니다. leak, pids, backpressure까지 봐야 한다.\n\n## 한 줄 정리\n\n`RLIMIT_NOFILE`과 `RLIMIT_NPROC`는 서비스 폭주를 제어하는 기본 장치지만, workload별로 다르게 설계하지 않으면 정상 트래픽도 먼저 막는다.\n",
+  "aliases": [
+    "RLIMIT_NOFILE RLIMIT_NPROC",
+    "nofile nproc governance",
+    "fd limit process limit",
+    "ulimit governance",
+    "too many open files",
+    "process spawn limit"
+  ],
+  "expected_queries": [
+    "RLIMIT_NOFILE과 RLIMIT_NPROC는 서버 폭주 방어와 정상 workload headroom을 어떻게 조절해?",
+    "too many open files와 process spawn failure를 limit governance로 어떻게 진단해?",
+    "ulimit, cgroup pids.max, fd exhaustion을 함께 보는 기준은?",
+    "nofile nproc 값을 크게 올리기만 하면 안전한가?"
+  ],
+  "symptoms": [
+    "RLIMIT_NOFILE이 낮아 정상 connection workload가 먼저 EMFILE로 막힌다.",
+    "RLIMIT_NPROC나 cgroup pids.max 때문에 worker/thread/process 생성이 실패한다.",
+    "limits를 폭주 방어로 쓰려다 정상 트래픽 headroom까지 잘라 버린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/rlimit-nofile-nproc-governance.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "data-structure/cache-eviction-policy-mission-bridge",
+  "title": "Cache Eviction Policy Mission Bridge",
+  "category": "data-structure",
+  "level": "intermediate",
+  "summary": "이 bridge는 LRU, LFU, TTL 같은 cache eviction 정책을 미션/자료구조 관점에서 연결한다. HashMap만 있는 캐시, 용량 제한, 인기 데이터 vs 최근 데이터, memory pressure 질문을 다룬다.",
+  "body_markdown": "# Cache Eviction Policy Mission Bridge\n\n## 미션 장면\n\n간단한 캐시는 key-value lookup만 있으면 끝나지 않는다. 용량 제한이 있으면 어떤 entry를 내보낼지 eviction policy가 필요하다.\n미션 코드에서는 \"빠르게 찾기\" 때문에 `Map`을 먼저 떠올리지만, 캐시는 조회 구조와 퇴출 구조가 함께 있어야 한다. 그래서 보통 `HashMap`은 entry 위치를 찾고, 별도 리스트/카운터/시간 구조가 어떤 entry를 내보낼지 결정한다.\n\n## 선택 기준\n\n| 상황 | 우선 후보 | 판단 이유 |\n|---|---|---|\n| 최근에 본 데이터를 다시 볼 가능성이 높음 | LRU | recency locality가 강하므로 마지막 접근 순서가 좋은 예측 신호다. |\n| 오래 인기 있는 데이터가 반복 조회됨 | LFU | access count가 안정적인 workload에서 인기 key를 더 오래 지킨다. |\n| 데이터 신선도 제한이 명확함 | TTL | \"몇 초 뒤 만료\" 같은 correctness 조건은 eviction보다 expiration으로 표현한다. |\n| 용량 제한과 신선도가 모두 필요함 | size bound + TTL | TTL은 오래된 entry를 막고, size bound는 memory pressure를 막는다. 둘은 대체 관계가 아니다. |\n| 미션에서 직접 구현하고 검증해야 함 | LRU | `HashMap + doubly linked list` invariant가 명확하고 테스트하기 쉽다. |\n\n선택 질문은 \"무엇을 남길까?\"와 \"무엇을 절대 반환하면 안 될까?\"를 분리해서 본다. 최근성이 중요하면 LRU, 빈도가 중요하면 LFU, 만료된 값을 반환하면 안 되면 TTL이 먼저다. 운영 캐시에서는 여러 정책을 조합하지만, 미션에서는 하나의 dominant invariant를 먼저 고르는 편이 리뷰 설명이 선명하다.\n\n## 리뷰에서 보이는 냄새\n\nHashMap에 무한히 쌓거나, TTL만 두고 memory pressure를 무시하거나, LRU가 항상 인기 데이터를 지킨다고 생각하면 운영 캐시와 멀어진다.\n\n## 핵심 invariant\n\n- 모든 cache key는 lookup 구조에 최대 한 번만 존재한다.\n- 저장된 entry 수는 capacity를 넘지 않는다. 넘는 순간 정확히 하나 이상의 victim을 제거한다.\n- `get`이 hit이면 policy state도 함께 갱신한다. LRU는 recency를 최신으로 옮기고, LFU는 frequency를 증가시킨다.\n- TTL이 있는 캐시는 expired entry를 hit으로 반환하지 않는다. 만료 정리는 eager일 수도 lazy일 수도 있지만 반환 결과는 같아야 한다.\n- tie-break 규칙이 고정되어야 한다. 예를 들어 LFU에서 count가 같으면 더 오래 안 쓴 entry를 제거한다고 정하면 테스트가 재현 가능하다.\n\nLRU 구현의 대표 invariant는 `map[key] -> linked-list node`가 항상 같은 node를 가리키는 것이다. node를 list에서 지웠으면 map에서도 지워야 하고, map에서 덮어썼으면 이전 node가 list에 남아 있으면 안 된다.\n\n## 실패 반례\n\n- 용량 3, 접근 `A B C D A`에서 단순 HashMap은 `A B C D`를 모두 들고 있어 capacity invariant를 깨뜨린다.\n- scan workload `A B C D E F`가 지나간 뒤 LRU는 원래 자주 쓰던 hot key를 밀어낼 수 있다. LRU는 \"최근\"을 지킬 뿐 \"인기\"를 보장하지 않는다.\n- `A`가 초반에 100번 조회된 뒤 더 이상 안 쓰이면 순수 LFU는 `A`를 오래 붙잡을 수 있다. 빈도 aging이나 window가 없으면 과거 인기가 현재 효용을 압도한다.\n- TTL만 있는 캐시는 만료 전까지 entry가 계속 쌓일 수 있다. TTL이 memory bound를 자동으로 보장하지 않는다.\n- lazy expiration만 구현하면 읽히지 않는 expired entry가 메모리에 남는다. 반환 correctness는 맞아도 운영 비용은 계속 증가할 수 있다.\n\n## 개념 handoff\n\nLRU는 최근에 쓰인 데이터를 남긴다. LFU는 자주 쓰인 데이터를 남긴다. TTL은 오래된 데이터를 시간 기준으로 제거한다. workload에 따라 맞는 정책이 다르다.\n\n## 복잡도와 운영 비용\n\n| 정책 | 일반 구현 | `get`/`put` | 운영 비용 |\n|---|---|---|---|\n| LRU | `HashMap + doubly linked list` | 평균 `O(1)` | node 이동과 동기화 비용, scan pollution에 약함 |\n| LFU | `HashMap + frequency buckets` | 평균 `O(1)` 가능 | count 관리, aging, tie-break가 복잡함 |\n| TTL | `HashMap + expireAt`, optional heap/wheel | lookup `O(1)`, 정리 비용 별도 | clock 의존성, lazy cleanup memory 잔존, time skew 고려 |\n| size + TTL | 위 구조 조합 | policy별 상이 | correctness와 memory bound를 동시에 테스트해야 함 |\n\n면접에서는 Big-O만 말하면 부족하다. 캐시는 lock contention, entry metadata 크기, clock read 비용, eviction burst, cold start hit rate 같은 운영 비용도 있다. 미션 설명에서는 \"이 정책이 어떤 workload 가정에서 맞는가\"를 같이 말해야 선택 근거가 된다.\n\n## 흔한 오해\n\n- \"HashMap이면 캐시다\"는 틀리다. HashMap은 lookup만 해결하고, capacity와 freshness 정책은 별도다.\n- \"LRU는 인기 데이터를 지킨다\"는 조건부로만 맞다. 인기 데이터가 최근에도 접근될 때만 지킨다.\n- \"TTL이 있으면 메모리가 안전하다\"는 틀리다. TTL은 만료 조건이지 용량 제한이 아니다.\n- \"LFU가 항상 LRU보다 좋다\"는 틀리다. workload가 변하면 오래된 빈도 기록이 오히려 방해된다.\n- \"eviction과 expiration은 같다\"는 틀리다. eviction은 주로 용량 압박 때문에 내보내는 것이고, expiration은 더 이상 유효하지 않은 값을 반환하지 않는 조건이다.\n\n## Drill 후보\n\n접근 순서 `A B C A D B A`와 용량 3에서 LRU와 LFU가 어떤 key를 남기는지 손으로 계산해 본다.\n\n## Safe Next Docs\n\n- `data-structure/lru-cache-basics`: 직접 구현할 때 `HashMap + linked list` invariant를 확인한다.\n- `data-structure/cache-eviction-lru-vs-lfu-vs-arc-intermediate-chooser`: workload별 정책 비교를 더 깊게 본다.\n- `system-design/cache-basics-primer`: 자료구조 선택을 운영 캐시 설계와 연결한다.\n",
+  "aliases": [
+    "cache eviction policy mission bridge",
+    "lru lfu ttl choice data structure",
+    "캐시 eviction 정책 선택",
+    "LRU LFU TTL 비교"
+  ],
+  "expected_queries": [
+    "캐시에서 LRU LFU TTL은 어떤 기준으로 골라?",
+    "자주 쓰는 데이터와 최근 쓰는 데이터가 다르면 eviction은 어떻게 해?",
+    "미션에서 간단한 캐시를 만들 때 어떤 자료구조를 쓰면 돼?"
+  ],
+  "symptoms": [
+    "모든 cache entry를 HashMap에만 넣고 용량 제한이 없어요",
+    "LRU가 인기 데이터를 잘 지킨다고 생각해요",
+    "TTL만 넣으면 memory pressure가 해결된다고 생각해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/lru-cache-basics"
+    ],
+    "next_docs": [
+      "data-structure/cache-eviction-lru-vs-lfu-vs-arc-intermediate-chooser"
+    ],
+    "confusable_with": [
+      "data-structure/cache-eviction-lru-vs-lfu-vs-arc-intermediate-chooser",
+      "system-design/cache-basics-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/cache-eviction-policy-mission-bridge.md",
+    "revision_history": []
+  }
+}

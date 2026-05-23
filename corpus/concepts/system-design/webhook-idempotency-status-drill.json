@@ -1,0 +1,44 @@
+{
+  "id": "system-design/webhook-idempotency-status-drill",
+  "title": "Webhook Idempotency Status Drill",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 drill은 webhook event id, idempotency status, duplicate delivery, DLQ replay를 연습한다. 같은 webhook 두 번 처리, processing/succeeded 상태 구분 같은 약점 신호를 다룬다.",
+  "body_markdown": "# Webhook Idempotency Status Drill\n\n## 질문\n\n같은 `eventId=E1` webhook이 두 번 도착했다. 첫 번째 처리는 `succeeded`이고 내부 주문 상태도 갱신됐다. 두 번째 요청은 어떻게 처리하는 것이 안전한가?\n\n반대로 첫 번째 요청이 아직 `processing`인 동안 같은 `eventId`가 다시 오거나, DLQ replay로 오래된 이벤트가 재전송되는 경우에는 어떤 status contract가 필요할까?\n\n## 관찰 증거 샘플\n\n다음 row와 log가 있다고 가정한다.\n\n- inbox table: `provider=stripe`, `event_id=E1`, `payload_hash=h1`, `status=succeeded`, `processed_at=10:03:12`, `attempt_count=1`.\n- side-effect table: `order_id=O7`, `payment_event_id=E1`, `ledger_entry_id=L9` unique.\n- duplicate 요청 log: `event_id=E1`, `signature_verified=true`, `dedup_status=succeeded_replay`, `side_effect_executed=false`.\n- provider retry log: 첫 요청 timeout 이후 같은 `event_id=E1`이 3분 뒤 재전송됨.\n- DLQ replay log: operator가 2일 전 payload를 재주입했고, 현재 주문 상태는 이미 `PAID` 또는 `CANCELED`.\n\n이 증거에서 핵심은 HTTP 응답 코드 하나가 아니라 \"같은 event가 같은 side effect를 다시 만들지 않았는가\"다.\n\n## 기대 답변 축\n\n- webhook provider의 retry와 duplicate delivery는 정상 시나리오로 본다. 같은 event id를 새 business command로 처리하지 않는다.\n- `eventId` 또는 provider event key에 unique constraint를 두고, inbox/idempotency table에 `processing`, `succeeded`, `failed` 같은 상태를 저장한다.\n- 이미 `succeeded`라면 이전 결과를 재사용하거나 \"already processed\" 계열의 성공 응답을 반환한다. 내부 주문 갱신, 포인트 지급, 알림 발송 같은 side effect는 다시 실행하지 않는다.\n- 아직 `processing`이면 동시에 두 worker가 side effect를 실행하지 못하게 lock/claim을 유지하고, provider에는 retry 가능한 응답 또는 처리 중 상태를 정책에 맞게 돌려준다.\n- terminal `failed`와 retryable `failed`를 구분한다. 영구 실패는 같은 이벤트를 계속 새 작업으로 만들지 않고, 재처리는 operator replay/reconciliation 경로로 제한한다.\n- DLQ replay는 \"처음 받은 이벤트처럼 재실행\"이 아니라 idempotency status를 먼저 조회하고, stale schema/payload/version도 확인한다.\n- HTTP 2xx/4xx/5xx 선택은 provider retry contract와 내부 durable handoff 여부에 맞춘다. 이미 durable하게 접수했고 worker가 계속 처리한다면 duplicate에는 2xx/202가 안전할 수 있고, 아직 durable claim이 없다면 retry를 유도해야 할 수 있다.\n\n## 디버깅 분기\n\n1. **이미 `succeeded`인 duplicate**: inbox row를 읽고 같은 결과를 반환한다. ledger, 포인트, 알림 같은 downstream side effect는 실행하지 않는다.\n2. **동시에 `processing`인 duplicate**: unique key + claim token으로 한 worker만 side effect를 실행한다. duplicate 요청은 provider 정책에 맞게 `202 processing`, cached response, 또는 retryable response를 반환한다.\n3. **`processing` stuck**: `updated_at`, heartbeat, lease timeout, fencing token으로 재claim 가능 여부를 판단한다. 단순히 row를 삭제하고 재시작하면 두 worker가 side effect를 중복 실행할 수 있다.\n4. **retryable `failed`**: 같은 event id의 attempt를 증가시키되 새 business command로 만들지 않는다. 원인, next_retry_at, last_error_class를 남긴다.\n5. **terminal `failed` 또는 stale DLQ replay**: operator 승인, payload/version 검증, 현재 aggregate 상태 비교, reconciliation report를 거친다.\n6. **서명 실패 duplicate**: idempotency table에 넣기 전에 reject한다. idempotency는 인증되지 않은 replay를 받아주는 장치가 아니다.\n\n## 흔한 오해\n\n- webhook provider가 같은 이벤트를 한 번만 보낸다고 가정한다.\n- DB unique key만 있으면 충분하다고 보고 `processing` stuck, 결과 재사용, 실패 상태를 설계하지 않는다.\n- 중복 요청에 무조건 409를 반환해서 provider retry storm을 키운다.\n- `succeeded` 이벤트 재수신 시 내부 side effect는 막지 않고 HTTP 응답만 성공으로 바꾼다.\n- DLQ replay를 운영자가 누르는 수동 재시도 정도로 보고, 중복과 순서 뒤집힘을 고려하지 않는다.\n\n## 운영/보안 증거\n\n- inbox/idempotency table에 event id unique key, payload fingerprint, status, first_seen_at, updated_at, processed_at, attempt_count가 남는다.\n- duplicate event count, succeeded replay count, processing age p95/max, stuck processing count, DLQ replay outcome을 지표로 본다.\n- 주문/결제/포인트 같은 downstream side effect에는 business key 중복 생성 방지와 reconciliation report가 있다.\n- worker crash 후 같은 event id를 다시 넣어도 side effect가 한 번만 발생하는 통합 테스트가 있다.\n- provider signature 검증, timestamp tolerance, replay window를 통과한 이벤트만 idempotency table에 진입시킨다. idempotency는 인증되지 않은 webhook을 받아들이는 방어가 아니다.\n- event id scope는 provider, account, environment까지 포함해서 잡는다. sandbox/prod 또는 여러 merchant account가 같은 id namespace를 공유한다고 가정하면 오탐 dedup이 생길 수 있다.\n- payload hash가 기존 row와 다르면 같은 event id라도 경고로 격상한다. provider 버그, 수동 replay 실수, schema 변환 오류를 분리해야 한다.\n- side effect별 unique key를 둔다. inbox dedup만 있고 ledger/notification/outbox가 중복 삽입 가능하면 \"HTTP는 멱등\"하지만 비즈니스 결과는 멱등하지 않다.\n\n## 주의할 caveat\n\n- provider event id가 항상 business idempotency key와 같지는 않다. 한 event가 여러 side effect를 만들면 각 side effect의 key도 따로 설계한다.\n- duplicate에 무조건 409를 주면 provider가 계속 retry해서 backlog를 키울 수 있다. 반대로 아직 durable하게 처리권을 확보하지 않았는데 2xx를 주면 provider가 재전송을 멈춰 유실될 수 있다.\n- 오래된 DLQ replay는 현재 상태 전이를 되돌릴 수 있다. `PAID -> CANCELED -> PAID`처럼 역전이를 허용할지 state machine guard로 판단한다.\n- idempotency row와 business side effect가 다른 transaction 경계에 있으면 crash window가 생긴다. outbox/inbox transaction, reconciliation, compensating job을 같이 본다.\n\n## 검증 질문\n\n- `succeeded` 상태의 같은 event가 다시 오면 HTTP 응답과 내부 side effect를 각각 어떻게 처리해야 하나?\n- `processing` row가 30분째 갱신되지 않았다면 그냥 삭제 후 재처리해도 되나? 어떤 증거가 더 필요한가?\n- provider signature 검증은 idempotency table insert 전과 후 중 어디에 있어야 하나?\n- DLQ replay payload의 event id는 같지만 payload hash가 다르면 어떤 운영 절차로 넘겨야 하나?\n\n## 약점 태그\n\n`webhook-dedup`, `idempotency-status`, `replay-safety`\n\n## Safe Next Docs\n\nwebhook retry, dedup, DLQ 흐름은 `system-design/webhook-retry-dedup-deadletter-playbook`을 다시 본다.\n\n상태별 응답 계약은 `system-design/idempotency-key-status-contract-beginner-primer`로 이어간다.\n\n결제 webhook처럼 정산과 복구가 얽히면 `system-design/payment-webhook-idempotency-reconciliation-drill`을 다음에 본다.\n",
+  "aliases": [
+    "webhook idempotency status drill",
+    "webhook duplicate processing practice",
+    "webhook 멱등성 상태 drill",
+    "웹훅 중복 처리 연습"
+  ],
+  "expected_queries": [
+    "webhook 중복 처리 idempotency drill을 풀고 싶어",
+    "같은 webhook이 두 번 왔을 때 status contract를 연습해줘",
+    "DLQ replay와 idempotency key를 문제로 확인하고 싶어"
+  ],
+  "symptoms": [
+    "webhook event id를 저장하지 않아요",
+    "processing 상태 재시도를 구분하지 않아요",
+    "replay가 중복 side effect를 만들어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/webhook-retry-dedup-deadletter-playbook"
+    ],
+    "next_docs": [
+      "system-design/idempotency-key-status-contract-beginner-primer"
+    ],
+    "confusable_with": [
+      "system-design/webhook-retry-dedup-deadletter-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/webhook-idempotency-status-drill.md",
+    "revision_history": []
+  }
+}

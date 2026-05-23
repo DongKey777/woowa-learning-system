@@ -1,0 +1,56 @@
+{
+  "id": "network/first-request-h2-next-request-h3-symptom-router",
+  "title": "첫 요청은 H2인데 다음은 H3 원인 라우터",
+  "category": "network",
+  "level": "beginner",
+  "summary": "'이 문서는 학습자가 첫 row는 h2인데 다음 row나 새 연결에서는 h3로 바뀌는",
+  "body_markdown": "# 첫 요청은 H2인데 다음은 H3 원인 라우터\n\n## 한 줄 요약\n\n> `first h2 -> next h3`는 대개 이상 징후보다 \"이번 응답에서 H3 힌트를 배우고, 다음 새 connection에서만 그 힌트를 썼다\"는 정상 흐름이다. 다만 같은 URL 두 줄이나 첫 줄 실패가 섞이면 recovery trace와 분리해서 읽어야 한다.\n\n## 관찰에서 첫 분기\n\n- 관찰: 첫 `h2` 응답에 `Alt-Svc: h3=...`가 있고 다음 새 요청부터 Protocol이 `h3`로 바뀐다. 첫 분기: downgrade나 장애가 아니라 브라우저가 힌트를 배운 뒤 다음 connection에 적용한 정상 흐름으로 본다. 다음 확인: 첫 row response headers, 둘째 row의 새 connection 생성 흔적, Alt-Svc cache 만료 시간을 확인한다.\n- 관찰: 첫 row가 `421`, `(failed)`, `canceled`이고 다음 row가 `h3`로 성공한다. 첫 분기: 정상 warm-up보다 retry/recovery trace로 갈라 본다. 다음 확인: 같은 URL 두 줄인지, status 변화, Protocol/Remote Address 변화, vendor 421 또는 fallback reason을 비교한다.\n- 관찰: 어떤 환경은 계속 `h2`이고 다른 브라우저나 네트워크만 `h3`로 간다. 첫 분기: 코드 배포 차이보다 UDP/QUIC 차단, 브라우저 설정, Alt-Svc/HTTPS RR 학습 차이로 둔다. 다음 확인: UDP 443 가능 여부, 브라우저 HTTP/3 설정, Secure DNS/HTTPS RR 결과, DevTools Protocol column을 네트워크별로 본다.\n\n## 가능한 원인\n\n1. 가장 흔한 경우는 이번 `h2` 응답에서 `Alt-Svc`나 HTTPS RR 단서를 배웠고, 그 힌트가 현재 row가 아니라 다음 새 connection에만 적용된 경우다. 즉 첫 줄 `h2`는 정상이고, 다음 줄 `h3`도 정상이다. 다음 문서: [브라우저의 HTTP 버전 선택: ALPN, Alt-Svc, Fallback 입문](./browser-http-version-selection-alpn-alt-svc-fallback.md), [H3 Discovery Observability Primer: Alt-Svc vs HTTPS RR 확인하기](./h3-discovery-observability-primer.md)\n2. 브라우저가 이미 열어 둔 `h2` keep-alive connection을 재사용하다가, 그 연결이 닫히거나 새 connection이 필요해진 시점에만 `h3`를 선택한 경우다. 같은 origin이어도 요청마다 새로 협상하는 것이 아니라 connection 단위로 바뀐다는 점을 놓치면 \"중간에 갑자기 protocol이 바뀌었다\"처럼 보인다. 다음 문서: [Browser DevTools Protocol Column Labels Primer](./browser-devtools-protocol-column-labels-primer.md), [Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB](./request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md)\n3. 같은 URL이 두 번 보이며 첫 줄이 `421`, `(failed)`, `canceled` 같은 종료로 끝난 뒤 둘째 줄이 `h3`로 다시 간 경우다. 이때는 정상 warm-up보다 wrong connection recovery, stale hint 교정, retry trace일 수 있다. 다음 문서: [같은 URL 요청이 두 번 보임 원인 라우터](./같은-url-요청이-두-번-보임-원인-라우터.md), [H3 Fallback Trace Bridge](./h3-fallback-trace-bridge.md)\n4. 반대로 학습자가 기대한 건 \"항상 H3여야 한다\"인데 실제로는 네트워크, 브라우저, UDP 경로, 실험 설정 차이 때문에 어떤 새 connection만 `h3`가 되는 경우다. 이때 질문은 \"왜 첫 줄이 h2였나\"보다 \"왜 어떤 새 connection은 여전히 h2로 남나\"로 바뀐다. 다음 문서: [HTTP/2, HTTP/3 Downgrade Attribution, Alt-Svc, UDP Block](./http2-http3-downgrade-attribution-alt-svc-udp-block.md), [Alt-Svc Cache Lifecycle Basics](./alt-svc-cache-lifecycle-basics.md)\n\n## 빠른 자기 진단\n\n1. 첫 `h2` row의 response headers에 `Alt-Svc`가 있었는지 먼저 본다. 있었다면 그 row 자체가 H3여야 한다고 기대하지 말고, 다음 새 connection 관찰로 넘어간다.\n2. 두 번째 `h3` row가 정말 새 connection인지 확인한다. `Connection ID`, `Remote Address`, waterfall의 `Connect` 흔적이 바뀌면 \"같은 연결에서 말만 바뀜\"이 아니라 새 연결 생성이다.\n3. 두 줄 사이에 `421`, `(failed)`, `canceled`, `h3 -> h2` fallback 같은 실패 흔적이 있는지 본다. 있으면 정상 warm-up보다 recovery trace 문맥을 먼저 읽는다.\n4. 같은 브라우저에서 새로고침, 새 탭, 잠시 idle 뒤 재요청처럼 \"새 connection이 필요해지는 순간\"에만 `h3`가 나타나는지 본다. 그렇다면 protocol 선택은 요청 단위보다 connection 단위라는 힌트다.\n5. `Disable cache`나 body cache 여부와 `Protocol` 변화를 섞어 읽지 않는다. cache 실험은 응답 재사용 질문이고, `h2`/`h3`는 transport 선택 질문이다.\n\n## 다음 학습\n\n- `Alt-Svc`를 왜 \"다음 연결용 힌트\"로 읽어야 하는지 보려면 [Alt-Svc Header Reading Micro-Note](./alt-svc-header-reading-micro-note.md)\n- `first h2 -> next h3`가 정상 선택 흐름인지 처음부터 다시 잡으려면 [브라우저의 HTTP 버전 선택: ALPN, Alt-Svc, Fallback 입문](./browser-http-version-selection-alpn-alt-svc-fallback.md)\n- 정말 같은 요청의 재시도였는지부터 가르려면 [같은 URL 요청이 두 번 보임 원인 라우터](./같은-url-요청이-두-번-보임-원인-라우터.md)\n- idle 뒤 첫 줄 실패와 새 connection 성공이 섞였는지 보려면 [idle 뒤 첫 요청만 실패하고 바로 다음은 성공 원인 라우터](./idle-first-fail-second-success-symptom-router.md)\n- `h3`가 붙지 않거나 다시 `h2`로 내려가는 운영 원인을 보려면 [HTTP/2, HTTP/3 Downgrade Attribution, Alt-Svc, UDP Block](./http2-http3-downgrade-attribution-alt-svc-udp-block.md)\n",
+  "aliases": [
+    "첫 요청은 h2인데 다음은 h3예요",
+    "왜 처음엔 h2고 다음엔 h3예요",
+    "새로고침하니 h3로 바뀌어요",
+    "같은 사이트인데 두번째는 h3예요",
+    "처음 요청은 h2 나중 요청은 h3",
+    "protocol이 h2였다가 h3로 바뀌어요",
+    "첫 방문 h2 두번째 h3"
+  ],
+  "expected_queries": [
+    "왜 첫 요청은 h2인데 다음 요청은 h3로 바뀌어?",
+    "Alt-Svc가 보이는데 현재 응답은 왜 아직 h2야?",
+    "새로고침 뒤 h3가 붙으면 브라우저가 실패했다가 복구한 거야?",
+    "첫 방문은 http2인데 두번째는 http3인 상황을 어떻게 읽어?",
+    "같은 사이트인데 어떤 row는 h2고 어떤 row는 h3면 어디부터 확인해?"
+  ],
+  "symptoms": [
+    "DevTools에서 같은 사이트를 봤는데 첫 요청 row는 `h2`이고 다음 요청이나 새로고침 뒤 row는 `h3`라서 downgrade인지 upgrade인지 헷갈린다",
+    "첫 방문에서는 HTTP/2로 보였는데 다시 요청하니 HTTP/3가 붙어서 브라우저가 방금 실패했다가 복구한 건지 정상 학습 패턴인지 모르겠다",
+    "응답 헤더에 `Alt-Svc`가 보이는데 왜 그 응답 자체는 `h2`인지, 왜 다음 요청부터만 `h3`인지 감이 안 잡힌다",
+    "어떤 환경에서는 계속 `h2`인데 어떤 브라우저나 새 연결에서는 `h3`로 바뀌어 cache 문제인지 protocol 선택 문제인지 섞여 보인다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/devtools-waterfall-primer"
+    ],
+    "next_docs": [
+      "network/request-timing-decomposition",
+      "network/same-url-request-twice-symptom-router",
+      "network/idle-first-fail-second-success-symptom-router"
+    ],
+    "confusable_with": [
+      "network/same-url-request-twice-symptom-router",
+      "network/idle-first-fail-second-success-symptom-router",
+      "network/browser-devtools-blocked-canceled-failed-symptom-router",
+      "network/dns-change-some-users-old-server-symptom-router",
+      "network/http-421-retry-path-fresh-h3-vs-h2-fallback"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/첫-요청은-h2인데-다음은-h3-원인-라우터.md",
+    "revision_history": []
+  }
+}

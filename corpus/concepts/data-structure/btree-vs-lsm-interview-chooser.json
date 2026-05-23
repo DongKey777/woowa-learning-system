@@ -1,0 +1,45 @@
+{
+  "id": "data-structure/btree-vs-lsm-interview-chooser",
+  "title": "B-Tree vs LSM Interview Chooser",
+  "category": "data-structure",
+  "level": "intermediate",
+  "summary": "이 chooser는 B-Tree와 LSM Tree를 storage engine 면접 질문에서 write/read amplification, compaction 기준으로 비교한다.",
+  "body_markdown": "# B-Tree vs LSM Interview Chooser\n\n## 10초 chooser\n\n| 구조 | 강점 | 비용 |\n|---|---|---|\n| B-Tree | point/range read, in-place update | random write, page split |\n| LSM Tree | sequential write, high write throughput | compaction, read amplification |\n| Hybrid/tuning | workload 맞춤 | 운영 복잡도 |\n\n이 표는 기본 방향만 준다. 실제 선택은 \"읽기/쓰기 중 무엇이 많다\" 하나로 끝나지 않고 key locality, range scan 폭, delete/TTL 비율, storage bandwidth, p99 latency budget까지 같이 본다.\n\n## 선택 기준\n\n- 읽기/쓰기 비율, range scan 비율, update/delete 빈도, tail latency 목표를 먼저 잡는다.\n- page cache에 working set이 들어오는지, storage가 random write에 약한지 확인한다.\n- 쓰기 burst를 흡수해야 하면 LSM이 유리할 수 있고, 안정적인 point/range read latency가 더 중요하면 B-Tree가 단순할 수 있다.\n- 삭제와 TTL이 많으면 tombstone과 compaction backlog를 운영 비용으로 넣는다.\n- 단일 구조 이름보다 bloom filter, cache, compaction policy, WAL, compression까지 포함한 storage engine 설계를 본다.\n- write-heavy라도 최신 데이터 point read가 많고 compaction budget이 작으면 LSM의 read amplification이 병목이 될 수 있다.\n- read-heavy라도 hot page latch 경합, random update, page split이 크면 B-Tree가 자동으로 안정적이라고 단정할 수 없다.\n\n## 헷갈리는 축\n\nLSM은 memtable과 sorted run/SSTable로 write를 순차화하지만, 나중에 compaction으로 정리해야 한다. 그래서 write path는 빠를 수 있어도 read path와 background I/O 비용이 생긴다.\n\n## 핵심 invariant\n\n- B-Tree 계열은 정렬된 key를 page/node에 보관하고 모든 leaf가 비슷한 깊이를 갖도록 balance를 유지한다.\n- B-Tree search는 root에서 leaf까지 key range를 좁혀 가며, range scan은 정렬된 leaf 흐름을 따라간다.\n- LSM은 최신 write가 memtable에 들어가고 flush 후 immutable sorted run/SSTable이 된다.\n- LSM read는 memtable과 여러 level/run 중 최신 sequence의 값을 찾아야 하며, tombstone은 \"삭제도 최신 기록\"이라는 의미를 가진다.\n- compaction은 여러 sorted run을 병합하면서 최신 값과 tombstone 의미를 보존해야 한다.\n\n## Complexity/운영 비용\n\n- B-Tree lookup은 fanout을 고려하면 `O(log_B N)`에 가깝고, range scan은 시작 지점 탐색 후 연속 leaf를 읽는다.\n- B-Tree write는 page split, random write, WAL flush, page latch 경합이 비용이 될 수 있다.\n- LSM write는 memtable append와 순차 flush로 빠르지만, 나중에 compaction이 write amplification과 background I/O를 만든다.\n- LSM read는 bloom filter/cache가 없거나 level이 많으면 read amplification이 커진다.\n- 운영 지표는 write amplification, read amplification, space amplification, compaction pending bytes, p99 latency를 같이 본다.\n- Bloom filter는 LSM의 negative lookup 비용을 줄일 수 있지만 false positive가 있으므로 디스크 접근을 0으로 보장하지 않는다.\n- Compression은 I/O를 줄일 수 있지만 CPU와 block 재작성 비용을 늘릴 수 있다. 압축률만 보고 선택하면 tail latency를 놓친다.\n\n## 실패 반례\n\n- read-heavy 서비스에서 LSM compaction이 밀리면 평소보다 훨씬 많은 SSTable을 확인해 tail latency가 튄다.\n- write-heavy ingestion을 B-Tree에 그대로 넣으면 random write와 page split이 병목이 될 수 있다.\n- TTL/delete가 많은 LSM에서 tombstone compaction이 늦으면 삭제된 데이터가 디스크와 read path에 오래 남는다.\n- 범위 조회가 많은데 key 설계가 locality를 깨면 B-Tree든 LSM이든 디스크 seek와 cache miss가 커진다.\n- LSM에서 snapshot/long-running transaction이 오래 살아 있으면 tombstone과 old version을 빨리 버리지 못해 space amplification이 커질 수 있다.\n- LSM compaction이 foreground write와 같은 disk bandwidth를 두고 경쟁하면 write stall 또는 p99 read spike가 생길 수 있다.\n- B-Tree에서 단조 증가 key가 특정 leaf/page를 계속 때리면 hot page latch와 split이 집중된다. fillfactor, page split policy, key design을 같이 봐야 한다.\n- B-Tree page fragmentation이나 vacuum/cleanup 지연이 크면 range scan이 leaf 순서를 따라도 실제 I/O locality가 나쁠 수 있다.\n\n## 흔한 오해\n\n- LSM은 write amplification이 없다는 말은 틀리다. 쓰기 path를 순차화하지만 compaction에서 증폭이 생긴다.\n- B-Tree가 항상 read에 최고라는 식의 단정도 위험하다. cache hit, compression, storage, concurrency가 함께 작동한다.\n- compaction은 배경 작업이라 공짜가 아니다. foreground latency와 storage bandwidth를 빼앗을 수 있다.\n- \"DB는 B-Tree\" 또는 \"NoSQL은 LSM\"처럼 제품군만으로 구조를 단정하면 면접 답변이 약해진다.\n\n## Wrong-bucket neighbor\n\nDB 전체 성능을 자료구조 하나로 단정하지 않는다. cache, bloom filter, compaction policy, workload distribution을 함께 봐야 한다.\n\n- B-Tree vs Hash index는 \"정렬/range scan이 필요한가\"의 bucket이다. LSM과 섞으면 storage engine write path 논점이 흐려진다.\n- B-Tree vs B+Tree 차이를 묻는 질문이면 leaf linkage와 range scan 구조를 말해야 한다. LSM compaction 답변으로 빠지면 wrong bucket이다.\n- Inverted index, bitmap index, columnar sort key는 검색/분석 access pattern bucket이다. OLTP primary index 선택 질문과 분리한다.\n- \"NoSQL이면 LSM, RDB면 B-Tree\"처럼 제품군으로 고정하지 않는다. 같은 제품군 안에서도 engine, workload, table option에 따라 다를 수 있다.\n\n## Safe Next Docs\n\nDB 인덱스 비교는 `btree-vs-hash-index-chooser`, LSM 친화 구조는 `lsm-friendly-index-structures`로 이어진다.\n",
+  "aliases": [
+    "BTree LSM interview chooser",
+    "B-Tree LSM Tree 차이",
+    "storage engine index structure answer",
+    "write amplification compaction comparison"
+  ],
+  "expected_queries": [
+    "B-Tree와 LSM Tree 차이를 면접에서 어떻게 설명해?",
+    "쓰기가 많은 DB에서 LSM이 유리한 이유가 뭐야?",
+    "compaction과 read amplification을 설명해줘"
+  ],
+  "symptoms": [
+    "DB index를 모두 B-Tree로만 설명해요",
+    "LSM이 write에 강한 대신 read/compaction 비용이 있다는 점을 놓쳐요",
+    "write amplification과 read amplification을 섞어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/lsm-friendly-index-structures"
+    ],
+    "next_docs": [
+      "database/btree-vs-hash-index-chooser"
+    ],
+    "confusable_with": [
+      "data-structure/lsm-friendly-index-structures",
+      "database/btree-vs-hash-index-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/btree-vs-lsm-interview-chooser.md",
+    "revision_history": []
+  }
+}

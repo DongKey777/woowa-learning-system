@@ -1,0 +1,56 @@
+{
+  "id": "database/cache-replica-split-read-inconsistency",
+  "title": "Cache와 Replica가 갈라질 때의 Read Inconsistency",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 문서는 database 카테고리에서 Cache와 Replica가 갈라질 때의 Read Inconsistency를 다루는 symptom_router 문서다. cache replica split, cache vs replica stale, mixed stale source, 캐시 미스 후 리플리카 옛값, 목록과 상세가 서로 다른 상태 같은 lexical 표현과 캐시랑 replica가 갈라져서 stale read가 나면 어디부터 봐?, cache miss 때만 옛값이 보이면 cache 문제야 replica 문제야? 같은 자연어 질문을 같은 개념으로 묶어, 학습자가 증상, 비교, 설계 판단, 코드리뷰 맥락 중 어디에서 들어오더라도 본문의 핵심 분기와 다음 문서로 안정적으로 이어지게 한다.",
+  "body_markdown": "# Cache와 Replica가 갈라질 때의 Read Inconsistency\n\n> 한 줄 요약: 캐시와 replica가 서로 다른 시점을 들고 있으면, 둘 중 어느 쪽을 읽어도 맞는 것 같지만 둘 다 틀릴 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md), [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md), [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md), [Read-Your-Writes와 Session Pinning 전략](./read-your-writes-session-pinning.md), [Caching vs Read Replica Primer](../system-design/caching-vs-read-replica-primer.md), [Read Repair와 Failover Reconciliation](./read-repair-reconciliation-after-failover.md)\nretrieval-anchor-keywords: cache replica split, cache vs replica stale, cache invalidation vs replica lag, mixed stale source, mixed stale read, stale source disambiguation, cache miss stale replica, cache miss then old replica, stale cache after write, updated but old value from cache or replica, list detail mismatch after write, cache and replica disagree, cache replica freshness routing, mixed source of truth, read inconsistency, cache invalidation, stale cache, old data after write cache or replica, save succeeded but old value via cache miss, 캐시 미스 후 리플리카 옛값, 캐시 무효화 vs 리플리카 지연, 캐시와 리플리카 값 다름, 목록과 상세가 서로 다른 상태, 방금 저장했는데 캐시인지 리플리카인지 모르겠음\n\n## 증상별 바로 가기\n\n- `cache hit 때는 최신인데 miss 때는 옛값`, `cache miss then old replica`, `목록과 상세가 서로 다른 상태`처럼 cache와 replica가 서로 다른 시점을 들고 있는지 먼저 가려야 하면 이 문서에서 stale source split부터 본다.\n- `write는 성공했는데 어디서 읽어도 바로 옛값`, `save succeeded but old value returned`처럼 write 직후 freshness budget 자체가 핵심이면 [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md)로 바로 간다.\n- `lag metric은 낮은데 일부 endpoint나 cache miss path에서만 옛값`, `freshness alert은 조용한데 사용자만 stale read를 본다`처럼 관측과 체감이 어긋나면 [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md)와 함께 읽는다.\n- `내가 방금 바꾼 값이 내 세션에서만 유지돼야 한다`처럼 세션 보장이 핵심이면 [Read-Your-Writes와 Session Pinning 전략](./read-your-writes-session-pinning.md)으로 먼저 이동한다.\n\n## 핵심 개념\n\n캐시는 빠르지만 오래된 값을 줄 수 있고, replica는 최신성이 더 좋을 수 있지만 lag가 있다.  \n둘이 동시에 쓰이면 사용자는 같은 화면에서 서로 다른 진실을 볼 수 있다.\n\n왜 중요한가:\n\n- 캐시와 DB replica가 서로 다른 시간축에 있을 수 있다\n- 어떤 요청은 캐시, 어떤 요청은 replica를 타면 결과가 뒤집힌다\n- invalidation만으로는 항상 해결되지 않는다\n\n즉 문제는 캐시가 있느냐가 아니라, **어느 소스가 최신인지 라우팅이 알고 있느냐**다.\n\n중요한 점은 `stale read`라는 같은 표면 증상 아래에 서로 다른 root cause가 숨어 있다는 것이다.\ncache invalidation이 늦어도 옛값이 보이고, replica lag가 있어도 옛값이 보인다.\n둘을 함께 쓰는 구조에서는 `cache miss 뒤 stale replica 재사용` 같은 혼합 incident가 생긴다.\n\n## 깊이 들어가기\n\n### 1. split source of truth가 생기는 이유\n\n전형적으로 다음 조합에서 생긴다.\n\n- write는 primary\n- read는 cache 또는 replica\n- 캐시 invalidation은 비동기\n- replica lag도 존재\n\n이때 cache와 replica가 서로 다른 최신값을 가리킨다.\n\n### 2. 왜 캐시만 보면 안 되는가\n\n캐시는 보통 TTL이나 eviction으로 인해 오래된 값을 남길 수 있다.  \nreplica도 lag 때문에 최신 값이 아닐 수 있다.\n\n둘 중 하나만 믿고 라우팅하면 오판이 생긴다.\n\n### 3. stale source를 먼저 가르는 질문\n\n| 먼저 확인할 질문 | cache stale 쪽 신호 | replica stale 쪽 신호 | mixed stale-source 쪽 신호 |\n|---|---|---|---|\n| cache hit과 miss 결과가 다른가 | hit일 때만 옛값이 남는다 | hit/miss와 무관하게 replica read가 늦다 | miss 뒤 replica가 더 옛값이라 결과가 뒤집힌다 |\n| lag metric이 실제로 높나 | 대체로 낮거나 무관하다 | 높다 | 낮거나 경계선인데 cache miss path에서만 증상이 커진다 |\n| 어떤 화면/endpoint가 특히 흔들리나 | 같은 entity라도 cache key 묶음이 다르다 | replica selection, read routing 정책 전체가 흔들린다 | 상세는 cache, 목록은 replica처럼 source가 화면별로 갈라진다 |\n| recent write 직후만 문제인가 | invalidation race가 있으면 그렇다 | read-after-write 경로에서 자주 터진다 | invalidate 후 replica fallback이 겹칠 때 특히 심해진다 |\n\n즉 `cache stale인지`, `replica stale인지`, `둘이 동시에 stale인지`를 먼저 나눠야 root cause가 빨리 좁혀진다.\n\n## observation -> branch -> next check\n\n| observation | branch | next check |\n|---|---|---|\n| cache hit은 최신인데 cache miss 후 DB fallback이 옛값을 준다 | replica stale behind cache | miss path가 replica로 가는지 확인하고, recent-write/min-version이 있으면 primary fallback으로 바꾼다 |\n| cache hit일 때만 옛값이고 cache bypass나 primary read는 최신이다 | stale cache | invalidate 순서, TTL, cache key version, write 후 delete/update 정책을 확인한다 |\n| 목록은 옛값, 상세는 최신이고 두 endpoint의 datasource/cache policy가 다르다 | source split by endpoint | endpoint별 read source map을 만들고 사용자-facing flow에서 같은 freshness contract를 쓰게 한다 |\n| lag metric은 낮은데 특정 key만 계속 옛값이다 | observability blind spot or cache key drift | replica global lag와 별개로 per-route source, cache key namespace, negative cache를 확인한다 |\n| failover나 primary switch 이후 cache와 replica 값이 오래 갈라진다 | split-brain recovery/read repair gap | primary epoch, cache namespace bump, read repair/reconciliation job이 있는지 확인한다 |\n\n### 4. 해결 방향\n\n- 최근 write는 primary fallback\n- cache miss 시 replica 직행이 아니라 freshness 확인\n- version token으로 cache와 DB 버전 비교\n- invalidate 후 바로 read가 필요한 경로는 primary pinning\n- lag metric이 낮아도 cache miss -> replica fallback 경로는 별도 추적\n\n핵심은 캐시와 replica를 **서로 다른 stale source**로 본다는 점이다.\n\n### 5. read repair와의 차이\n\nread repair는 읽은 뒤 고치는 것이고, 이 문서의 핵심은 읽기 전에 소스를 선택하는 것이다.  \n둘은 같이 써야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 캐시는 새 값, replica는 옛 값\n\n서로 다른 요청이 캐시와 replica를 각각 읽으면 페이지마다 값이 달라진다.\n\n### 시나리오 2: 캐시 만료 직후 replica lag가 심함\n\n캐시 miss가 나면 replica로 갔는데, 아직 최신 write가 적용되지 않았다.  \n사용자는 업데이트가 사라진 것처럼 느낀다.\n\n### 시나리오 3: invalidation 순서가 뒤집힘\n\nwrite 후 invalidation이 늦게 도착하면, 캐시가 옛 값을 다시 살아나게 보일 수 있다.\n\n## 코드로 보기\n\n```java\nif (ctx.hasRecentWrite()) {\n    return primaryDataSource;\n}\n\nUser cached = cache.get(userId);\nif (cached != null && cached.getVersion() >= minAcceptedVersion) {\n    return cached;\n}\n\nreturn replicaDataSource.query(userId);\n```\n\n```text\nbad:\n  cache -> stale\n  replica -> stale\n  app chooses randomly\n\ngood:\n  app chooses source by freshness rule\n```\n\n캐시와 replica는 둘 다 최종 진실원이 아니므로, **버전과 최근 write 신호로 같이 다뤄야 한다**.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| cache only | 빠르다 | stale 가능성 높다 | 읽기 우선 |\n| replica only | 캐시보다 신뢰적일 수 있다 | lag가 있다 | 정합성 중간 |\n| cache + replica with version check | 안전하다 | 복잡하다 | 중요한 조회 |\n| primary fallback | 가장 안전하다 | 부하가 늘어난다 | 최신성 민감 경로 |\n\n## 꼬리질문\n\n> Q: cache와 replica가 동시에 있으면 왜 더 위험한가요?\n> 의도: 서로 다른 stale source가 생기는 문제를 아는지 확인\n> 핵심: 둘 다 옛 값을 가질 수 있고, 서로 다른 시점이 섞인다\n\n> Q: invalidation만으로 충분한가요?\n> 의도: 비동기 invalidation과 lag의 한계를 아는지 확인\n> 핵심: 아니다, freshness 라우팅과 version 확인이 필요하다\n\n> Q: 캐시 miss면 무조건 replica로 가면 되나요?\n> 의도: miss를 최신성 보장으로 오해하지 않는지 확인\n> 핵심: 최근 write가 있으면 primary fallback이 더 안전하다\n\n## 한 줄 정리\n\nCache와 replica가 갈라지면 둘 다 stale source가 될 수 있어서, 최근 write와 version 기준으로 읽기 소스를 선택해야 한다.\n",
+  "aliases": [
+    "cache replica split",
+    "cache vs replica stale",
+    "mixed stale source",
+    "캐시 미스 후 리플리카 옛값",
+    "목록과 상세가 서로 다른 상태",
+    "방금 저장했는데 캐시인지 리플리카인지"
+  ],
+  "expected_queries": [
+    "캐시랑 replica가 갈라져서 stale read가 나면 어디부터 봐?",
+    "cache miss 때만 옛값이 보이면 cache 문제야 replica 문제야?",
+    "수정은 됐는데 목록 화면에는 옛날 데이터가 보일 때 원인 후보가 뭐야?",
+    "같은 사용자가 detail에선 새 값, list에선 옛값을 보면 어디로 가?"
+  ],
+  "symptoms": [
+    "수정은 됐는데 목록 화면에는 옛날 데이터가 보인다",
+    "방금 저장한 게 목록에는 안 보이고 새로고침해야 보인다",
+    "목록과 상세가 서로 다른 상태로 보인다",
+    "cache hit 때는 최신인데 miss 때는 옛값이다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "database/replica-lag-read-after-write-strategies",
+      "database/replica-read-routing-anomalies",
+      "database/read-your-writes-session-pinning",
+      "database/stale-list-after-update-symptom-router"
+    ],
+    "confusable_with": [
+      "database/replica-lag-read-after-write-strategies",
+      "database/replica-lag-observability-routing-slo",
+      "database/replica-read-routing-anomalies",
+      "database/read-your-writes-session-pinning",
+      "database/pagination-duplicates-missing-symptom-router",
+      "database/stale-list-after-update-symptom-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/cache-replica-split-read-inconsistency.md",
+    "revision_history": []
+  }
+}

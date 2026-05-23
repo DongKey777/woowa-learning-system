@@ -1,0 +1,63 @@
+{
+  "id": "operating-system/restartable-sequences-rseq-percpu-primer",
+  "title": "Linux rseq Restartable Sequences Per-CPU Fast Path Primer",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Linux rseq Restartable Sequences Per-CPU Fast Path Primer\n\n> 한 줄 요약: rseq는 user space가 \"현재 CPU의 작은 per-CPU 작업\"을 syscall이나 전역 atomic 없이 빠르게 끝내도록 돕고, 중간에 preemption이나 CPU migration이 끼면 커널이 abort handler로 돌려 다시 시도하게 만드는 Linux 메커니즘이다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [시스템 콜과 User-Kernel Boundary](./syscall-user-kernel-boundary.md)\n- [Atomic vs Lock](./atomic-vs-lock.md)\n- [CPU Migration, Load Balancing, Locality Debugging](./cpu-migration-load-balancing-locality-debugging.md)\n- [CPU Affinity, IRQ Affinity, Core Locality](./cpu-affinity-irq-affinity-core-locality.md)\n- [CPU Cache, Coherence, Memory Barrier](./cpu-cache-coherence-memory-barrier.md)\n- [VarHandle, Unsafe, Atomics](../language/java/varhandle-unsafe-atomics.md)\n- [Epoch Reclamation, Hazard Pointer, RCU Chooser](../data-structure/epoch-reclamation-hazard-pointer-rcu-chooser.md)\n- [operating-system 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: linux rseq, restartable sequences, per-cpu fast path, percpu counter, rseq critical section, rseq abort handler, preemption migration abort, sched_getcpu syscall wrong bucket, atomic fetch_add wrong bucket, current cpu id, commit instruction, correctness caveat, rseq primer, 처음 보는 rseq, 왜 rseq 쓰나요\n\n## 핵심 개념\n\nrseq(restartable sequences)는 user space thread가 아주 짧은 instruction sequence를 \"현재 CPU에서 끝까지 실행되면 성공, 중간에 CPU가 바뀌면 실패 후 재시도\"라는 규칙으로 실행하게 해 주는 Linux ABI다.\n\n대표 목적은 per-CPU 자료구조 fast path다. 예를 들어 request마다 통계 counter를 올릴 때, 매번 전역 atomic을 치면 cache line이 여러 CPU 사이를 오간다. 매번 `sched_getcpu()` 같은 syscall로 현재 CPU를 확인하면 user-kernel boundary 비용이 커진다. rseq는 thread-local rseq 영역에 커널이 현재 CPU 정보를 갱신해 두고, 작은 critical section이 migration 없이 끝났는지를 커널이 abort 경로로 보정한다.\n\n중요한 감각은 이것이다.\n\n- rseq는 \"빠른 per-CPU bucket 선택\" 도구다.\n- rseq는 \"전역 lock-free correctness\" 도구가 아니다.\n- abort는 rollback 마법이 아니라 \"안전하게 다시 시작하라\"는 제어 흐름이다.\n\n## 한눈에 보는 흐름\n\n```text\nthread starts\n  -> rseq area 등록\n  -> fast path 진입\n  -> 현재 CPU id 읽기\n  -> CPU별 bucket 선택\n  -> 아주 짧은 update 준비\n  -> commit instruction 실행\n  -> 성공\n\n중간에 preemption / migration / signal delivery가 끼면\n  -> kernel이 rseq critical section을 감지\n  -> instruction pointer를 abort handler로 돌림\n  -> scratch 상태를 버리고 다시 CPU id부터 읽음\n```\n\n여기서 commit instruction은 \"이 작업이 외부에 보이는 지점\"이다. 커널은 이미 수행된 일반 메모리 쓰기를 되돌리지 않는다. 그래서 rseq critical section 안에서는 commit 전 상태가 외부에 관찰되지 않도록 설계해야 한다.\n\n## per-CPU fast path가 빠른 이유\n\nper-CPU counter를 생각해 보자. 목표가 \"각 CPU가 자기 bucket을 빠르게 올리고, 나중에 합산한다\"라면 전역 total 하나를 모든 thread가 atomic으로 갱신할 필요가 없다.\n\n| 방식 | 장점 | 비용 / 오선택 신호 |\n|---|---|---|\n| 전역 atomic counter | 정합성 설명이 단순하다 | cache line bouncing, CAS retry, p99 증가 |\n| 매번 syscall로 CPU 확인 | API 의미가 직관적이다 | hot path마다 user-kernel boundary를 넘는다 |\n| rseq + per-CPU bucket | user space에서 CPU-local fast path를 탄다 | abort/retry와 fallback 설계가 필요하다 |\n\nrseq가 잘 맞는 곳은 \"정확한 전역 값을 매 순간 읽어야 하는 상태\"가 아니라 \"write path는 CPU별로 분산하고, read/flush 시점에 합산해도 되는 상태\"다. 통계 counter, allocator slab, per-CPU queue cursor 같은 후보가 여기에 가깝다.\n\n## preemption/migration abort를 어떻게 이해할까\n\nrseq critical section은 \"현재 CPU를 기준으로 선택한 bucket에 계속 머물렀다\"는 전제를 가진다. 그런데 scheduler가 thread를 선점하거나 다른 CPU로 옮기면, 처음 고른 bucket이 더 이상 현재 CPU bucket이 아닐 수 있다.\n\n이때 커널은 thread가 rseq critical section 안에 있었는지 확인하고 abort handler로 보낸다. abort handler는 실패한 fast path를 이어서 마무리하는 곳이 아니라, 임시 계산을 버리고 다시 시작하는 곳이다.\n\n안전한 mental model:\n\n1. CPU id를 읽는다.\n2. 그 CPU의 bucket 주소를 계산한다.\n3. 관찰되지 않는 임시 상태에서 update를 준비한다.\n4. 마지막 commit instruction으로 publish한다.\n5. commit 전에 migration되면 abort handler에서 1번으로 돌아간다.\n\n따라서 rseq 경로에는 blocking I/O, syscall, allocation, page fault가 날 수 있는 복잡한 작업을 넣지 않는 쪽이 안전하다. rseq는 작은 instruction sequence를 위한 도구이지, 임의의 함수를 \"자동 재시작 가능\"하게 만드는 도구가 아니다.\n\n## atomics/syscall wrong-bucket\n\nrseq를 배울 때 자주 새는 bucket이 두 개 있다.\n\n첫째, atomic wrong-bucket이다. \"원자성이 필요하니 모든 update를 atomic으로 하자\"는 판단은 correctness는 단순하게 만들 수 있지만, per-CPU로 쪼갤 수 있는 hot counter까지 하나의 cache line에 모은다. 이 경우 문제는 race보다 contention이다. [Atomic vs Lock](./atomic-vs-lock.md)의 질문처럼 먼저 불변식이 단일 전역 값인지, CPU별 shard를 합산해도 되는지 나눠야 한다.\n\n둘째, syscall wrong-bucket이다. \"현재 CPU를 알고 싶으니 매번 syscall을 부르자\"는 판단은 hot path 비용을 user-kernel boundary로 밀어 넣는다. rseq는 등록과 fallback에서는 kernel ABI를 쓰지만, 정상 fast path의 목표는 매 operation마다 syscall을 부르지 않는 것이다. 이 차이는 [시스템 콜과 User-Kernel Boundary](./syscall-user-kernel-boundary.md)를 성능 관점으로 보는 예다.\n\n## correctness caveat\n\nrseq가 보장하는 것은 좁다. \"이 짧은 sequence가 같은 CPU에서 commit 지점까지 도달했는지\"를 커널이 감시해 준다는 뜻이지, 모든 shared state를 안전하게 만들어 준다는 뜻이 아니다.\n\n조심할 점:\n\n- 전역 불변식은 여전히 별도 설계가 필요하다. `sum(all cpu buckets) <= limit` 같은 조건은 rseq 단독으로 즉시 보장되지 않는다.\n- commit 전 쓰기가 외부에 보이면 abort 후 중복/부분 반영이 생길 수 있다. commit을 한 지점으로 모아야 한다.\n- reader가 per-CPU bucket을 합산할 때는 동시 update, memory ordering, snapshot 일관성을 따로 생각해야 한다.\n- 같은 데이터가 rseq 경로와 non-rseq 경로에서 함께 바뀌면 authoritative writer가 누구인지 정해야 한다.\n- kernel, libc, architecture 지원이 없거나 등록이 실패하면 fallback이 필요하다.\n\n즉 rseq는 lock, transaction, memory reclamation, global atomic을 대체하는 만능 정합성 장치가 아니다. 성능을 위해 CPU-local write path를 짧게 만드는 도구이고, correctness boundary는 여전히 설계자가 그어야 한다.\n\n## 실무에서 검증하는 방법\n\nrseq를 적용했다면 \"빠른 것 같다\"보다 다음 네 가지를 확인한다.\n\n- 정상 fast path에서 syscall sample이 줄었는가\n- 전역 atomic hot line이나 cache line bouncing이 줄었는가\n- preemption/migration stress에서 abort/retry가 증가해도 값이 깨지지 않는가\n- fallback 경로에서도 같은 의미의 결과를 내는가\n\n관찰할 때는 `strace`로 per-operation syscall이 남는지, perf 계열 도구로 atomic/cache-line hot spot이 줄었는지, 합산 counter가 stress 전후로 기대 범위를 유지하는지 본다. abort가 발생하는 것은 실패가 아니라 rseq 설계의 일부다. 문제는 abort 뒤에 부분 commit이 남거나 retry가 unbounded하게 tail latency를 만드는 경우다.\n\n## 면접/리뷰 질문 미리보기\n\n> Q: rseq는 왜 전역 atomic counter보다 빠를 수 있나요?\n> 핵심: CPU별 bucket으로 write를 분산해 cache line 경쟁을 줄이고, 정상 fast path에서 syscall을 피하기 때문이다.\n\n> Q: preemption이나 migration이 발생하면 rseq는 무엇을 하나요?\n> 핵심: commit 전에 critical section을 벗어나야 하는 상황이면 커널이 abort handler로 보내고, user space는 CPU id 읽기부터 다시 시도한다.\n\n> Q: rseq를 쓰면 shared state correctness가 자동으로 해결되나요?\n> 핵심: 아니다. rseq는 작은 per-CPU fast path의 실행 위치를 보정할 뿐이고, 전역 불변식, reader snapshot, memory ordering, fallback 정합성은 따로 설계해야 한다.\n\n## 한 줄 정리\n\nrseq는 per-CPU hot path에서 atomic과 syscall 비용을 줄이는 도구지만, abort/retry와 commit 지점을 정확히 설계하지 않으면 성능 최적화가 정합성 착각으로 바뀐다.\n",
+  "aliases": [
+    "Linux rseq",
+    "restartable sequences",
+    "per-CPU fast path",
+    "percpu fast path",
+    "rseq critical section",
+    "rseq abort handler",
+    "preemption migration abort",
+    "userspace per cpu counter",
+    "current CPU id cache",
+    "rseq syscall registration"
+  ],
+  "expected_queries": [
+    "Linux rseq는 per-CPU counter fast path를 어떻게 빠르게 만들어?",
+    "rseq critical section은 preemption이나 CPU migration이 생기면 어떻게 abort돼?",
+    "per-CPU bucket 업데이트에서 atomic이나 sched_getcpu syscall을 매번 쓰면 왜 wrong-bucket일 수 있어?",
+    "rseq를 쓰면 lock-free correctness까지 보장된다고 봐도 돼?",
+    "rseq fast path에서 commit instruction과 abort handler를 어떻게 이해해야 해?"
+  ],
+  "symptoms": [
+    "per-CPU counter를 빠르게 올리고 싶은데 atomic fetch_add와 syscall 중 무엇이 병목인지 헷갈린다",
+    "현재 CPU bucket에 쓰다가 preemption이나 migration이 생기면 값이 잘못 들어갈까 봐 불안하다",
+    "rseq를 lock-free correctness 보장으로 오해해 전역 불변식까지 맡기려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/syscall-user-kernel-boundary",
+      "operating-system/atomic-vs-lock",
+      "operating-system/cpu-migration-load-balancing-locality-debugging",
+      "operating-system/cpu-cache-coherence-memory-barrier"
+    ],
+    "next_docs": [
+      "operating-system/cpu-affinity-irq-affinity-core-locality",
+      "operating-system/perf-c2c-cache-line-contention-false-sharing-playbook",
+      "data-structure/epoch-reclamation-hazard-pointer-rcu-chooser",
+      "language/varhandle-unsafe-atomics"
+    ],
+    "confusable_with": [
+      "operating-system/atomic-vs-lock",
+      "operating-system/syscall-user-kernel-boundary",
+      "operating-system/cpu-migration-load-balancing-locality-debugging",
+      "operating-system/cpu-affinity-irq-affinity-core-locality",
+      "operating-system/cpu-cache-coherence-memory-barrier",
+      "data-structure/epoch-reclamation-hazard-pointer-rcu-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/restartable-sequences-rseq-percpu-primer.md",
+    "revision_history": []
+  }
+}

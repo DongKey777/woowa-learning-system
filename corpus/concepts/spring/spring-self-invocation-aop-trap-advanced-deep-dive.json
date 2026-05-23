@@ -1,0 +1,64 @@
+{
+  "id": "spring/spring-self-invocation-aop-trap-advanced-deep-dive",
+  "title": "Spring Self-Invocation AOP 함정 advanced deep_dive",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Spring Self-Invocation AOP 함정 advanced deep_dive\n\n> 한 줄 요약: Spring AOP는 **proxy 기반**이라 `this.method()` 호출은 proxy를\n> 우회해 직접 원본 메서드 호출 → `@Transactional`, `@Async`, `@Cacheable` 등 모든\n> AOP 어노테이션이 작동 안 함.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [AOP와 프록시 메커니즘](./aop-proxy-mechanism.md)\n- [Spring @Transactional 기초](./spring-transactional-basics.md)\n- [Spring Self-Invocation 공통 오해 primer](./spring-self-invocation-transactional-only-misconception-primer.md)\n- [Bean Lifecycle Constructor vs Setter chooser](./spring-bean-lifecycle-constructor-vs-setter-chooser.md)\n- [Service Layer Transaction Scope chooser](../software-engineering/service-layer-transaction-scope-chooser.md)\n- [spring 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: spring self-invocation aop trap deep dive, CGLIB vs JDK Dynamic Proxy, AspectJ compile-time weaving, self-injection ApplicationContext, AopContext.currentProxy, proxy-target-class, this.method bypass, @Transactional @Async @Cacheable 함정\n\n## 먼저 멘탈모델 — Spring AOP의 본질\n\n```\n일반 코드:\n  client → service.method() → 실제 method 실행\n\nSpring AOP (Transactional 등):\n  client → service.method() → Proxy.method() → [tx begin] → 실제 method() → [tx commit]\n                              ↑\n                       Spring이 자동 생성한 proxy\n```\n\n**핵심**: Spring이 service bean을 직접 주입 안 함. **proxy 객체**를 주입.\n\n## Self-Invocation Trap\n\n```java\n@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(...) {\n        // ... DB 작업\n        this.sendEmail();  // ← AOP 우회!\n    }\n    \n    @Async  // 또는 @Transactional\n    public void sendEmail() {\n        // Async 또는 새 transaction 의도했지만 동작 X\n    }\n}\n```\n\n**왜 안 먹나**:\n\n```\nclient → OrderServiceProxy.createOrder()\n       → [tx begin]\n       → OrderService.createOrder() (실제 객체)\n            → this.sendEmail()  ← this는 OrderService (proxy 아님!)\n            → OrderService.sendEmail() 직접 실행 (no @Async)\n       → [tx commit]\n```\n\n`this`는 **실제 객체**, proxy 아님. proxy를 통하지 않으면 AOP 어노테이션 무시.\n\n## 모든 AOP-based 어노테이션 영향\n\n이 함정에 빠지는 모든 어노테이션:\n\n| 어노테이션 | 영향 |\n|---|---|\n| `@Transactional` | 새 transaction 안 시작 (또는 propagation 무시) |\n| `@Async` | 동기 실행 (다른 스레드 안 감) |\n| `@Cacheable` | 매번 실제 실행 (cache 무시) |\n| `@CacheEvict` | cache 안 비움 |\n| `@Retryable` | retry 안 함 |\n| `@PreAuthorize` / `@PostAuthorize` | 권한 체크 안 함 |\n| Custom Aspect | 적용 안 됨 |\n\n## CGLIB vs JDK Dynamic Proxy\n\nSpring이 proxy 만드는 두 방식.\n\n### JDK Dynamic Proxy\n\n```java\n// interface 기반\npublic interface OrderService {\n    void createOrder();\n}\n\n@Service\npublic class OrderServiceImpl implements OrderService {\n    @Transactional\n    public void createOrder() { ... }\n}\n```\n\nSpring이 `OrderService` interface를 implement한 proxy 동적 생성.\n\n**조건**: bean이 interface 가짐.\n\n### CGLIB\n\n```java\n// interface 없음\n@Service\npublic class OrderService {  // no interface\n    @Transactional\n    public void createOrder() { ... }\n}\n```\n\nSpring이 `OrderService`를 상속한 subclass proxy 생성.\n\n**조건**: interface 없거나 `proxy-target-class=true`.\n\n### Spring Boot 2.x+\n\ndefault가 `proxy-target-class=true` → 항상 CGLIB.\n\n```yaml\n# 명시적 설정 (보통 안 함)\nspring:\n  aop:\n    proxy-target-class: false  # interface 있으면 JDK proxy\n```\n\n### Self-invocation은 둘 다 영향\n\nCGLIB이든 JDK이든 **proxy를 우회하면 AOP 안 먹음**. method dispatch는 같은 메커니즘.\n\n## CGLIB의 한계 — final/private\n\nCGLIB은 subclass 상속이라:\n\n```java\n@Service\npublic class OrderService {\n    @Transactional\n    public final void createOrder() { ... }  // ← CGLIB이 override 불가\n}\n```\n\n`final` method는 proxy override 불가 → AOP 우회.\n\n같은 이유로:\n- `private` method: subclass에서 보이지 않음 → proxy 무시\n- `static` method: instance method 아님 → proxy 무시\n\n→ **@Transactional 등은 항상 public, non-final, non-static에만 적용**.\n\n## 해결 방법 4가지\n\n### Solution 1: 다른 빈으로 분리 (가장 권장)\n\n```java\n@Service\npublic class OrderService {\n    @Autowired private EmailService emailService;  // ← 다른 빈\n    \n    @Transactional\n    public void createOrder(...) {\n        // DB 작업\n        emailService.sendEmail(...);  // ← 다른 빈 호출 → proxy 통과\n    }\n}\n\n@Service\npublic class EmailService {\n    @Async\n    public void sendEmail(...) { ... }\n}\n```\n\n**장점**:\n- 설계상 옳음 (책임 분리)\n- AOP 자연 작동\n- 테스트 용이\n\n**단점**: 매번 별도 클래스 만들기 burden.\n\n### Solution 2: Self-Injection\n\n```java\n@Service\npublic class OrderService {\n    @Autowired private OrderService self;  // ← 자기 자신을 inject\n    \n    @Transactional\n    public void createOrder(...) {\n        // DB 작업\n        self.sendEmail(...);  // ← proxy를 통한 호출\n    }\n    \n    @Async\n    public void sendEmail(...) { ... }\n}\n```\n\nSpring이 `self` field에 proxy를 inject. proxy 호출하면 AOP 작동.\n\n**장점**: 단일 클래스 유지\n**단점**: \n- code smell (self-injection은 anti-pattern으로 평가)\n- testing 시 mock 복잡\n- 순환 참조 위험 (Spring 4.3+ 부분 해결)\n\n### Solution 3: AopContext.currentProxy()\n\n```java\n@EnableAspectJAutoProxy(exposeProxy = true)  // ← 명시 필요\n@Configuration\npublic class AppConfig { ... }\n\n@Service\npublic class OrderService {\n    @Transactional\n    public void createOrder(...) {\n        // DB 작업\n        ((OrderService) AopContext.currentProxy()).sendEmail(...);\n    }\n    \n    @Async\n    public void sendEmail(...) { ... }\n}\n```\n\n`AopContext.currentProxy()`는 현재 thread의 proxy 반환. casting 후 호출 → AOP 작동.\n\n**장점**: self-injection 회피\n**단점**:\n- ThreadLocal 기반 (overhead)\n- `exposeProxy=true` 명시 필요\n- casting 보기 안 좋음\n- 거의 안 씀\n\n### Solution 4: AspectJ Compile-Time/Load-Time Weaving\n\n```java\n// AspectJ는 byte code 자체에 AOP 코드 삽입\n// proxy 안 만들고 method bytecode 자체 modify\n```\n\n```xml\n<!-- pom.xml -->\n<dependency>\n    <groupId>org.aspectj</groupId>\n    <artifactId>aspectjweaver</artifactId>\n</dependency>\n```\n\n```java\n@EnableTransactionManagement(mode = AdviceMode.ASPECTJ)\n```\n\n**장점**:\n- self-invocation 자동 해결 (proxy 없음)\n- private/final method도 적용 가능\n- 가장 강력\n\n**단점**:\n- 설정 복잡\n- compile-time weaving은 build process 변경\n- debugging 어려움\n- 거의 안 씀 (Spring AOP로 대부분 OK)\n\n## 30초 결정 흐름\n\n```\nSelf-invocation 함정 만남:\n\nQ1: 정말 self-invocation 패턴이 필요한가?\n  No → 다른 빈으로 분리 (Solution 1, 가장 권장)\n  Yes → Q2\n\nQ2: AspectJ 도입 OK한가?\n  Yes → Solution 4 (compile-time weaving)\n  No → Q3\n\nQ3: Self-injection OK한가?\n  Yes → Solution 2 (간단하지만 code smell)\n  No → Solution 3 (AopContext, 거의 안 씀)\n```\n\n대부분의 경우: **Solution 1 (분리)** 또는 **Solution 2 (self-injection)**.\n\n## 디버깅 — Self-Invocation 의심 시\n\n### 1. 메서드가 진짜 transaction 안에 있나 확인\n\n```java\n@Transactional\npublic void method() {\n    boolean inTx = TransactionSynchronizationManager.isActualTransactionActive();\n    log.info(\"inTransaction: {}\", inTx);  // false → AOP 우회\n}\n```\n\n### 2. Proxy 객체인지 확인\n\n```java\n@Autowired private OrderService orderService;\n\n@PostConstruct\npublic void check() {\n    boolean isProxy = AopUtils.isAopProxy(orderService);\n    boolean isCglib = AopUtils.isCglibProxy(orderService);\n    boolean isJdk = AopUtils.isJdkDynamicProxy(orderService);\n    log.info(\"proxy: {}, cglib: {}, jdk: {}\", isProxy, isCglib, isJdk);\n}\n```\n\n### 3. Logging으로 흐름 추적\n\n```\n[Proxy] enter createOrder\n[Tx] begin\n[Real] createOrder()\n[Real] this.sendEmail()  ← Proxy 안 보임!\n[Real] sendEmail() (no @Async, 동기 실행)\n[Tx] commit\n[Proxy] exit createOrder\n```\n\n## 흔한 false-positive 패턴\n\n### \"@Transactional이 안 먹어\" → 사실은 다른 원인\n\n1. **RuntimeException 아니라 checked exception**: default rollback 안 됨. `rollbackFor=` 명시 필요.\n2. **try-catch로 예외 삼킴**: 예외 안 propagate되면 rollback 안 됨.\n3. **자기 transaction 안에서 다른 빈의 transaction을 새로 시작 못함 (REQUIRES_NEW 아님)**: propagation 잘못.\n\nself-invocation 의심 전에 위 3가지 확인.\n\n## CGLIB Constructor 호출 함정\n\n```java\n@Service\npublic class OrderService {\n    private final UserRepository repo;\n    \n    public OrderService(UserRepository repo) {\n        this.repo = repo;\n        log.info(\"constructor: {}\", this.hashCode());\n    }\n}\n```\n\nCGLIB proxy 생성 시:\n- subclass 만듦 → parent constructor 호출됨 (`OrderService(...)`)\n- proxy 객체와 실제 객체 **두 개 생성** (Spring 4+에서는 한 개로 줄임)\n\n→ constructor 안에서 `log.info(\"constructor...\")` 두 번 찍힐 수도. 정상.\n\n## Spring Bean Constructor + @Transactional\n\n```java\n@Service\npublic class OrderService {\n    @Transactional\n    public OrderService() {  // ← 의미 없음\n        // ...\n    }\n}\n```\n\n생성자에 `@Transactional` 효과 없음 (생성자는 AOP proxy 대상 아님). Bean 초기화 후 method-level에만.\n\n## 실전 — Roomescape Mission 예시\n\n```java\n// ❌ 잘못된 코드 — self-invocation\n@Service\npublic class ReservationService {\n    @Transactional\n    public Reservation create(...) {\n        Reservation r = ...;\n        repo.save(r);\n        this.sendNotification(r);  // ← @Async 안 먹음!\n        return r;\n    }\n    \n    @Async\n    public void sendNotification(...) { ... }\n}\n\n// ✓ 올바른 코드 — 분리\n@Service\npublic class ReservationService {\n    @Autowired NotificationService notification;\n    \n    @Transactional\n    public Reservation create(...) {\n        Reservation r = ...;\n        repo.save(r);\n        notification.send(r);  // ← 다른 빈 호출 → @Async 작동\n        return r;\n    }\n}\n\n@Service\npublic class NotificationService {\n    @Async\n    public void send(...) { ... }\n}\n```\n\n## 자주 헷갈리는 지점\n\n### \"private method도 @Transactional 작동\"\n\n❌ private method는 subclass override/interception이 불가능하므로 Spring proxy가 잡지 못한다.\n\n정확히는 \"Spring AOP는 public method만\"이 아니라 proxy 종류와 버전에 따라 범위가 달라진다. Spring 6+의 `@Transactional`은 class-based proxy에서 `protected`/package-visible method도 기본 지원할 수 있고, 일반 CGLIB proxy도 public/protected/package-visible method interception이 가능하다. 하지만 interface-based proxy는 interface의 public method가 기준이고, self-invocation은 method visibility와 무관하게 proxy를 우회한다.\n\n### \"this.method()는 모든 case에서 AOP 우회\"\n\nYES. proxy 우회는 self-invocation의 본질.\n\n### \"REQUIRES_NEW로 새 transaction 시작하면 self-invocation도 OK\"\n\n❌ propagation 옵션도 proxy 통해야 작동. self-invocation은 proxy 자체 안 거침.\n\n### \"@Async @Async 두 번 호출하면 두 thread\"\n\nself-invocation이면 0 thread (그냥 동기 실행).\n다른 빈을 두 번 호출하면 2 thread.\n\n### \"Spring Boot에서 @EnableTransactionManagement 명시 필요\"\n\nSpring Boot starter는 자동 활성화. 명시는 custom config 시만.\n\n### \"Lombok @Transactional 가능\"\n\nLombok 아님. Spring annotation. 단 `@RequiredArgsConstructor` 같은 Lombok과 함께 자주 사용.\n\n## 빠른 확인 질문\n\n- Spring AOP의 본질?  답: Proxy 기반. 직접 객체 호출은 AOP 우회\n- Self-invocation에서 @Transactional 안 먹는 이유?  답: this는 실제 객체 (proxy 아님), proxy 통과 안 함\n- CGLIB과 JDK Dynamic Proxy 차이?  답: CGLIB는 subclass, JDK는 interface 동적 구현\n- Spring Boot 2.x+의 default proxy?  답: CGLIB (proxy-target-class=true)\n- Self-invocation 최선 해결?  답: 다른 빈으로 분리 (Solution 1)\n- private/final method에 @Transactional?  답: 작동 안 함 (CGLIB override 불가)\n\n## 한 줄 정리\n\nSpring AOP self-invocation 함정은 \"**proxy-based AOP의 본질적 한계**\"이며, 신입은\n*다른 빈으로 분리 (Solution 1)*를 default로, 어쩔 수 없을 때만 *self-injection\n(Solution 2)*을 쓰고, *AspectJ 도입*은 매우 드문 case에서만 검토한다.\n",
+  "aliases": [
+    "spring self-invocation 함정",
+    "@Transactional self invocation",
+    "@Async self invocation",
+    "self call AOP bypass",
+    "proxy bypass",
+    "this call AOP",
+    "cglib vs jdk proxy",
+    "@EnableTransactionManagement(proxyTargetClass=true)",
+    "AspectJ vs Spring AOP",
+    "자기 자신 호출 transactional 안 먹음",
+    "Method 내부 호출 프록시 우회",
+    "self injection workaround",
+    "ApplicationContext self lookup",
+    "AopContext currentProxy",
+    "proxy mode vs aspectj mode"
+  ],
+  "expected_queries": [
+    "self-invocation에서 @Transactional이 안 먹는 정확한 이유는?",
+    "this.method() 호출과 외부 빈 호출의 AOP 처리 차이는?",
+    "CGLIB과 JDK Dynamic Proxy의 차이와 각각 적용 조건은?",
+    "self-invocation 해결의 4가지 방법은?",
+    "@Async도 같은 self-invocation 함정에 빠지나?",
+    "AspectJ compile-time weaving은 self-invocation을 어떻게 해결?"
+  ],
+  "symptoms": [
+    "@Transactional을 self-invocation에서 호출하면 transaction이 안 잡혀",
+    "같은 빈 안에서 다른 메서드 호출하면 AOP가 작동 안 함",
+    "@Async도 같은 함정?",
+    "CGLIB vs JDK Proxy 차이가 헷갈려",
+    "self-invocation 해결 방법이 여러 개인데 어느 게 좋아",
+    "private/final method에 @Transactional 붙이면 안 먹는 이유"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/aop-proxy-mechanism",
+      "spring/transactional-basics",
+      "spring/self-invocation-proxy-misconception"
+    ],
+    "next_docs": [
+      "software-engineering/service-layer-transaction-scope-chooser"
+    ],
+    "confusable_with": [
+      "spring/aop-proxy-mechanism",
+      "spring/self-invocation-proxy-misconception"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-self-invocation-aop-trap-advanced-deep-dive.md",
+    "revision_history": []
+  }
+}

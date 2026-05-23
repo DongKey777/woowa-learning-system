@@ -1,0 +1,45 @@
+{
+  "id": "system-design/redis-eviction-vs-replication-stale-cache-bridge",
+  "title": "Redis Eviction vs Replication Stale Cache Bridge",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 bridge는 Redis cache eviction, cache invalidation, replication lag로 인한 stale cache를 구분한다. cache miss, 옛값 조회, memory pressure, Redis replica lag 같은 운영 증상을 다룬다.",
+  "body_markdown": "# Redis Eviction vs Replication Stale Cache Bridge\n\n## 한 줄 요약\n\nEviction은 Redis가 메모리 한도(`maxmemory`)를 넘겼을 때 정책에 따라 key를 제거하거나 쓰기를 거절하는 문제다. Replication lag는 primary에는 최신 변경이 있지만 replica가 아직 그 명령 스트림을 따라오지 못해 옛 상태를 읽는 문제다.\n\n## 운영 증상\n\n| 증상 | eviction 쪽 신호 | replication/stale 쪽 신호 |\n|---|---|---|\n| cache miss가 급증 | `used_memory_dataset`이 `maxmemory` 근처, `evicted_keys` 증가 | lag만으로는 보통 miss가 아니라 낮은 version hit가 먼저 보임 |\n| 쓰기 명령이 실패 | `noeviction` 또는 evict 대상 부족으로 write command rejected | replica lag와 직접 원인은 다름 |\n| cache hit인데 옛값 | eviction 자체보다 stale fill/invalidation 누락 의심 | primary는 최신, replica offset이 뒤처짐 |\n| 특정 Redis node에서만 옛값 | node별 key 존재/TTL/eviction 통계가 다름 | replica read, 재동기화 중 old dataset serve 가능 |\n| TTL을 줄여도 write 직후 stale | TTL은 언젠가 사라지는 상한일 뿐 | required version/watermark 검증 없음 |\n\n일부 요청은 cache miss로 DB를 치고, 일부 요청은 cache hit인데 옛값을 본다. 이때 hit/miss만 보면 부족하다. 요청이 읽은 Redis node, key TTL, eviction counter, Redis replication offset, cache entry version을 같이 봐야 한다.\n\n## 핵심 mental model\n\nEviction은 capacity와 eviction policy의 결과다. Stale cache는 invalidation, write propagation, replica lag, stale refill의 결과다. 둘 다 \"캐시가 이상하다\"로 보이지만, 하나는 \"값이 없다/쓰기를 못 받는다\"에 가깝고 다른 하나는 \"값은 있는데 기준선보다 늦다\"에 가깝다.\n\nRedis는 보통 업무 source of truth가 아니다. DB, ledger, event log가 진실이고 Redis는 빠른 read path 또는 임시 상태 저장소인 경우가 많다. 따라서 Redis hit가 있다고 해서 correctness가 증명되지는 않는다. hit가 \"이번 요청의 required version/watermark를 만족하는가\"를 따로 검증해야 한다.\n\nRedis replication은 기본적으로 asynchronous replication이다. Primary는 replica가 매번 명령을 처리할 때까지 기다리지 않는다. `WAIT`나 min replica 설정은 손실 가능성을 줄이는 수단이지, Redis cluster 전체를 강한 일관성(CP) 시스템으로 바꾸는 보장이 아니다.\n\n## 원인 후보\n\n### 1. Eviction\n\nRedis는 `maxmemory`를 넘으면 새 데이터를 추가하는 명령 처리 중 memory usage를 확인하고, `maxmemory-policy`에 따라 key를 제거한다. 큰 값을 한 번에 추가하는 명령은 한도보다 크게 초과한 뒤 수습될 수 있다.\n\n정책을 잘못 이해하면 장애 해석이 틀어진다.\n\n- `allkeys-lru`/`allkeys-lfu`는 TTL 여부와 무관하게 전체 key에서 후보를 고른다.\n- `volatile-*` 정책은 TTL이 있는 key만 evict한다. TTL key가 없으면 사실상 `noeviction`처럼 동작할 수 있다.\n- `noeviction`은 key를 지우지 않고, 새 데이터를 만드는 쓰기 명령에 error를 돌려준다. 기존 key read는 계속 가능하다.\n- Redis의 LRU/LFU는 정확한 전수 계산이 아니라 sampling 기반 approximate policy다. \"가장 오래 안 쓴 key가 반드시 먼저 지워진다\"라고 말하면 과장이다.\n\n확인:\n\n- `used_memory`, `maxmemory`, `evicted_keys`\n- `used_memory_dataset`, `mem_not_counted_for_evict`\n- `keyspace_hits`, `keyspace_misses`, `expired_keys`\n- `commandstats`의 rejected command\n- key size/hot key 분포\n- eviction policy, TTL 분포\n- miss 후 DB latency와 DB QPS 증가\n\n처방은 capacity, key 설계, TTL, admission policy, hot key 분산 쪽이다. Replication 또는 AOF persistence를 쓰는 instance는 replication/AOF buffer가 eviction 판단의 `maxmemory` 비교에서 제외되는 영역을 만들 수 있으므로 `mem_not_counted_for_evict`를 보고 RAM headroom을 남긴다.\n\n### 2. Expiration/TTL\n\nTTL 만료(expiration)는 설정된 시간이 지나 key가 사라지는 것이다. Eviction처럼 miss를 만들 수 있지만 원인은 memory pressure가 아니라 시간이다.\n\nTTL을 짧게 하면 오래된 값이 더 빨리 사라질 수는 있다. 하지만 write 직후 이미 stale hit를 허용하는 문제는 해결하지 못한다. TTL은 freshness upper bound의 일부일 뿐, causal read 보장은 아니다.\n\nReplica에서 TTL을 볼 때도 주의한다. Redis는 master가 expire/evict한 사실을 `DEL` 명령처럼 replica에 전파한다. Replica는 논리적으로 만료된 key를 read에서 숨기려 하지만, write propagation lag 자체는 여전히 별도 문제다.\n\n### 3. Invalidation 누락\n\nsource of truth가 바뀌었는데 cache delete/update가 실패하면 Redis primary에도 옛값이 남을 수 있다. 이 경우 replication lag가 아니라 invalidation path 문제다.\n\n확인:\n\n- write transaction 후 cache invalidation 성공 여부\n- outbox 기반 invalidation event 누락 여부\n- cache entry version과 DB version 비교\n- stale hit가 Redis primary에서도 재현되는지\n\n### 4. Redis replication lag\n\nRedis primary에는 최신값이 있지만 replica가 아직 command stream을 적용하지 못하면 replica read에서 옛값을 볼 수 있다. 이 경우 key는 존재하고 hit도 나지만 version이 낮다.\n\n확인:\n\n- `INFO replication` 또는 `ROLE`의 primary/replica offset, lag\n- replication ID가 같은 history인지, offset gap이 얼마나 나는지\n- 요청이 읽은 Redis node\n- cache entry version/watermark\n- write 후 read가 replica로 갔는지, recent write 사용자는 primary로 보내는지\n\nRead-after-write 화면에서 Redis replica를 읽는다면 DB replica와 마찬가지로 recent-write routing, primary fallback, min-version check가 필요하다. Replica가 link down 또는 initial sync 중에도 old dataset으로 read를 받을 수 있게 설정되어 있다면, \"정상 응답\" 자체가 최신 응답이라는 뜻은 아니다.\n\nReplica의 `maxmemory`도 과신하지 않는다. 기본 설정에서 replica는 master가 보낸 eviction/expire 명령을 따라가는 쪽이고, replica 자체의 `maxmemory` eviction은 보통 무시된다. Replica memory는 별도로 모니터링해야 하지만, 일반적인 key 제거 판단은 master 쪽 정책에서 시작한다.\n\n### 5. Stale fill\n\ncache miss 뒤 오래된 DB replica나 projection에서 읽어와 Redis에 다시 채우면, 순간적인 replica lag가 cache TTL 동안 지속되는 stale cache로 바뀐다.\n\n안전한 refill은 아래를 확인한다.\n\n```text\nresponse.version >= required_version\nresponse.watermark >= required_watermark\nsource is allowed for this freshness requirement\n```\n\n못 맞추면 응답을 보류하거나 primary/source of truth로 fallback하고, cache에는 no-fill해야 한다.\n\n## Trade-off\n\n| 선택 | 얻는 것 | 비용/위험 |\n|---|---|---|\n| TTL 단축 | 오래된 값 유지 시간 감소 | miss 증가, DB 부하 증가, write 직후 stale은 별도 |\n| `allkeys-lru/lfu` | TTL 없는 cache key도 eviction 가능 | hot set 추정이 틀리면 hit rate 하락 |\n| `volatile-*` | TTL key만 제거해 non-TTL key 보호 | TTL key가 부족하면 write error/noeviction처럼 보일 수 있음 |\n| `noeviction` | key를 임의로 지우지 않음 | write reject가 user-facing error로 번질 수 있음 |\n| Redis primary read | replica stale 감소 | primary Redis 부하, failover/routing 복잡도 |\n| watermark-aware hit reject | stale hit 감소 | metadata 저장, latency 증가 |\n| cache bypass | freshness 디버깅 쉬움 | cache 효과 상실 |\n| no-fill on uncertain source | stale fill 방지 | hit rate 하락 |\n| memory 증설/eviction 튜닝 | miss storm 감소 | freshness 문제는 별도 |\n\n## 검증 지표\n\n- eviction/expiration: `evicted_keys`, `expired_keys`, memory usage ratio, `used_memory_dataset`, hit rate, miss rate\n- memory headroom: `mem_not_counted_for_evict`, replication/AOF buffer, rejected write command count\n- stale/cache correctness: stale hit count, `entry_version < required_version`, rejected hit count\n- replication: Redis replication offset gap, replica lag, read node별 served version\n- refill: refill source distribution, stale fill reject count, no-fill count\n- downstream impact: DB fallback QPS, DB read latency, user-visible stale rate, support ticket\n\n## 흔한 오해\n\n- \"cache miss와 stale cache는 같은 문제다\": miss는 값이 없는 것이고 stale hit는 값이 있지만 기준선보다 낮은 것이다.\n- \"TTL을 줄이면 read-after-write가 보장된다\": TTL은 언젠가 사라지는 시간이고, write 직후 기준선 검증은 별도다.\n- \"Redis primary가 최신이면 Redis replica도 즉시 최신이다\": Redis replication은 기본이 asynchronous라 replica read는 뒤처질 수 있다.\n- \"`WAIT`를 쓰면 강한 일관성이다\": replica acknowledgement 수를 기다릴 수는 있지만 failover/persistence 조건에 따라 acknowledged write도 잃을 수 있다.\n- \"`volatile-lru`면 안전하게 cache key만 지운다\": TTL 없는 key는 후보가 아니다. TTL 설계가 없으면 쓰기 실패로 보일 수 있다.\n- \"캐시를 지우면 replica stale도 해결된다\": cache miss 뒤 오래된 replica에서 refill하면 다시 stale cache가 된다.\n\n## 안전한 다음 문서\n\n- cache와 DB replica가 섞인 freshness 문제는 `mixed-cache-replica-freshness-bridge`로 이어진다.\n- invalidation 패턴은 `cache-invalidation-patterns-primer`를 본다.\n- read-after-write trade-off는 `read-after-write-tradeoff-matrix-chooser`와 함께 본다.\n- stale 증상 전체 분기는 `operational-symptom-to-consistency-cause-router`에서 시작한다.\n",
+  "aliases": [
+    "redis eviction replication stale cache bridge",
+    "cache eviction vs replica lag",
+    "Redis eviction 복제 stale cache",
+    "캐시 eviction replication 차이"
+  ],
+  "expected_queries": [
+    "Redis에서 값이 사라진 것과 replica lag로 옛값을 보는 건 어떻게 구분해?",
+    "cache eviction과 stale cache는 같은 문제야?",
+    "Redis replication lag가 read-after-write에 어떤 영향을 줘?"
+  ],
+  "symptoms": [
+    "어떤 요청은 cache miss고 어떤 요청은 옛값을 봐요",
+    "Redis memory pressure 후 hit rate가 급락했어요",
+    "replica에서 읽는 Redis 값이 늦게 바뀌어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/mixed-cache-replica-freshness-bridge"
+    ],
+    "confusable_with": [
+      "system-design/mixed-cache-replica-freshness-bridge",
+      "system-design/cache-invalidation-patterns-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/redis-eviction-vs-replication-stale-cache-bridge.md",
+    "revision_history": []
+  }
+}

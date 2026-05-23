@@ -1,0 +1,54 @@
+{
+  "id": "system-design/replay-repair-orchestration-control-plane-design",
+  "title": "Replay / Repair Orchestration Control Plane 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Replay / Repair Orchestration Control Plane 설계를 다루는 deep_dive 문서다. replay와 repair orchestration control plane은 재처리·보정 작업의 범위, 승인, 우선순위, 안전장치, 감사 흔적을 관리해 대규모 운영 복구 작업을 통제 가능한 workflow로 만드는 제어 시스템이다. 검색 질의가 replay orchestration, repair control plane, redrive governance, replay approval처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Replay / Repair Orchestration Control Plane 설계\n\n> 한 줄 요약: replay와 repair orchestration control plane은 재처리·보정 작업의 범위, 승인, 우선순위, 안전장치, 감사 흔적을 관리해 대규모 운영 복구 작업을 통제 가능한 workflow로 만드는 제어 시스템이다.\n\nretrieval-anchor-keywords: replay orchestration, repair control plane, redrive governance, replay approval, blast radius budget, repair workflow, dry run, execution guardrail, operational runbook, repair campaign\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)\n> - [Consistency Repair / Anti-Entropy Platform 설계](./consistency-repair-anti-entropy-platform-design.md)\n> - [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n> - [Distributed Scheduler 설계](./distributed-scheduler-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](../database/cdc-gap-repair-reconciliation-playbook.md)\n> - [Summary Drift Detection, Invalidation, and Bounded Rebuild](../database/summary-drift-detection-bounded-rebuild.md)\n\n## 핵심 개념\n\n실무에서 replay와 repair는 기술 문제이면서 운영 권한 문제다.\n같은 도구라도 누가 어떤 범위를 어떤 안전장치로 실행하느냐에 따라 결과가 달라진다.\n\n그래서 많은 팀이 결국 필요로 하는 것은 \"재처리 엔진\"이 아니라 다음을 관리하는 control plane이다.\n\n- 어떤 범위를 다시 돌릴지\n- dry-run인지 실제 적용인지\n- 자동 실행인지 승인 기반인지\n- live traffic 보호 한도는 얼마인지\n- 실패 시 중단/재개/롤백은 어떻게 할지\n\n즉, orchestration control plane은 replay/repair 작업을 **운영 가능한 workflow**로 만든다.\n\n## 깊이 들어가기\n\n### 1. 왜 execution engine만으로는 부족한가\n\nbackfill worker, replay consumer, repair script가 있어도 다음이 없으면 사고가 난다.\n\n- 대상 범위 정의\n- 영향 추정\n- 승인 절차\n- 우선순위와 리소스 budget\n- 진행률과 결과 보고\n\n운영자 입장에서는 \"스크립트를 돌릴 수 있다\"보다 \"이번 작업이 무엇을 얼마나 건드리는가\"가 더 중요하다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 동시에 진행 가능한 repair campaign 20개\n- 각 campaign은 수십 shard 또는 수백 tenant 대상\n- worker pool 공유\n- live traffic headroom 20%만 사용 가능\n\n이때 control plane이 보는 숫자:\n\n- concurrent campaign count\n- estimated rows/events touched\n- reserved worker capacity\n- pause / resume latency\n- approval lead time\n\n대규모 복구는 compute보다 governance와 capacity reservation이 병목이 되기 쉽다.\n\n### 3. Campaign과 run 단위 분리\n\n좋은 모델은 보통 두 층이 있다.\n\n- **campaign**: 왜 이 작업을 하는가, 어떤 범위를 대상으로 하는가\n- **run**: 실제 한 번 실행한 시도\n\n예:\n\n- campaign: \"2026-04-14 search index ACL drift repair\"\n- run 1: dry-run diff\n- run 2: limited tenant execution\n- run 3: full production execution\n\n이렇게 나눠야 dry-run, partial run, rollback run을 한 작업으로 추적할 수 있다.\n\n### 4. Planning 단계\n\ncontrol plane은 실행 전에 최소한 다음을 계산하는 편이 좋다.\n\n- scope cardinality\n- source and target systems\n- 예상 처리량\n- required approvals\n- rollback or compensating action 가능 여부\n- observability dashboard links\n\n이 planning 결과가 없으면 blast radius를 가늠할 수 없다.\n\n### 5. Execution guardrail\n\n실행 중에는 다음 guardrail이 필요하다.\n\n- max QPS / rows per sec\n- max concurrent tenant/shard\n- pause on elevated errors\n- pause on latency regression\n- stop on invariant breach\n\n즉, repair job도 \"작업이 돌아간다\"가 아니라 \"언제 멈춰야 하는가\"가 중요하다.\n\n### 6. Approval과 역할 분리\n\n모든 replay/repair가 같은 위험도를 갖지 않는다.\n\n- projection rebuild: 자동 승인 가능\n- billing correction: 재무/운영 승인 필요\n- authz repair: 보안 승인 필요\n- data delete / restore: break-glass 절차 필요\n\n실무에서는 requestor, approver, executor, observer를 분리하는 편이 안전하다.\n\n### 7. Auditability와 postmortem input\n\n작업이 끝난 뒤 남겨야 할 것:\n\n- 실제 처리 범위\n- pause / resume 이력\n- 실패한 shard/tenant 목록\n- guardrail 위반과 대응\n- generated correction artifact\n\n이 기록은 나중에 비슷한 사고가 났을 때 runbook과 policy를 개선하는 데이터가 된다.\n\n## 실전 시나리오\n\n### 시나리오 1: 검색 ACL drift repair\n\n문제:\n\n- 일부 tenant에서 ACL 필터가 잘못된 인덱스 문서가 발견되었다\n\n해결:\n\n- campaign을 만든다\n- dry-run으로 suspect 범위를 확정한다\n- tenant 일부만 limited execution 후 full run을 승인한다\n\n### 시나리오 2: billing correction replay\n\n문제:\n\n- 특정 기간 rating bug로 금액 계산이 틀어졌다\n\n해결:\n\n- finance approval이 필요한 campaign으로 분류한다\n- difference report를 먼저 생성한다\n- external invoice emission은 별도 hold 상태로 둔다\n\n### 시나리오 3: stream job checkpoint corruption 후 복구\n\n문제:\n\n- 특정 checkpoint artifact가 깨져 state restore가 안 된다\n\n해결:\n\n- recovery campaign에 fallback checkpoint와 replay 범위를 명시한다\n- restore run과 catch-up run을 분리한다\n- lag와 guardrail을 보고 단계적으로 승격한다\n\n## 코드로 보기\n\n```pseudo\nfunction createCampaign(request):\n  plan = planner.estimate(request.scope, request.mode)\n  approvals = policy.requiredApprovals(plan.riskClass)\n  campaign = repository.save(request, plan, approvals)\n  return campaign\n\nfunction executeRun(campaign):\n  if !approvalsSatisfied(campaign):\n    reject()\n  run = runRepository.start(campaign)\n  while run.hasMore():\n    chunk = run.nextChunk()\n    executor.apply(chunk, limits=campaign.guardrails)\n    if guardrailBreached():\n      run.pause()\n      alert()\n```\n\n```java\npublic CampaignRun startRun(CampaignId id) {\n    Campaign campaign = campaignRepository.load(id);\n    approvalService.ensureExecutable(campaign);\n    return runService.start(campaign);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Ad-hoc operational scripts | 빠르다 | 재현성과 감사가 약하다 | 작은 내부 시스템 |\n| Basic replay UI | 접근성이 좋다 | guardrail이 약할 수 있다 | 중간 규모 운영 |\n| Full orchestration control plane | 안전성과 추적성이 높다 | 구축 비용이 높다 | 재처리/보정이 잦은 플랫폼 |\n| Automatic campaign execution | 대응이 빠르다 | 오탐 시 위험하다 | low-risk rebuild |\n| Approval-gated execution | 안전하다 | 느리다 | 금전/권한/감사 데이터 |\n\n핵심은 replay/repair orchestration control plane이 worker 위에 얹는 UI가 아니라 **위험한 운영 복구 작업을 계획, 승인, 실행, 감사하는 governance layer**라는 점이다.\n\n## 꼬리질문\n\n> Q: replay platform이 있으면 control plane은 없어도 되지 않나요?\n> 의도: execution과 governance 차이 이해 확인\n> 핵심: 아니다. 무엇을, 누구 승인으로, 어떤 한도로 실행할지 관리하지 않으면 같은 엔진도 사고 도구가 될 수 있다.\n\n> Q: dry-run은 왜 중요한가요?\n> 의도: 영향 추정과 승인 근거 이해 확인\n> 핵심: 실제 적용 전에 범위, 차이, 비용, invariant 위험을 확인할 수 있기 때문이다.\n\n> Q: 모든 repair에 수동 승인이 필요한가요?\n> 의도: risk-based governance 감각 확인\n> 핵심: 아니다. low-risk projection rebuild는 자동화할 수 있지만, 금전/권한/감사 데이터는 승인 경계가 필요하다.\n\n> Q: campaign과 run을 왜 분리하나요?\n> 의도: 반복 시도와 추적 모델 이해 확인\n> 핵심: 같은 목적의 작업에 dry-run, partial run, retry run, rollback run이 여러 번 생길 수 있기 때문이다.\n\n## 한 줄 정리\n\nReplay와 repair orchestration control plane은 재처리·보정 작업을 승인 가능한 campaign과 guardrail 있는 run으로 관리해, 운영 복구를 통제 가능한 workflow로 만드는 governance system이다.\n",
+  "aliases": [
+    "replay orchestration",
+    "repair control plane",
+    "redrive governance",
+    "replay approval",
+    "blast radius budget",
+    "repair workflow",
+    "dry run",
+    "execution guardrail",
+    "operational runbook",
+    "repair campaign",
+    "Replay / Repair Orchestration Control Plane 설계",
+    "replay repair orchestration control plane design"
+  ],
+  "expected_queries": [
+    "Replay / Repair Orchestration Control Plane 설계 설계 핵심을 설명해줘",
+    "replay orchestration가 왜 필요한지 알려줘",
+    "Replay / Repair Orchestration Control Plane 설계 실무 트레이드오프는 뭐야?",
+    "replay orchestration 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Replay / Repair Orchestration Control Plane 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Replay / Repair Orchestration Control Plane 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Replay / Repair Orchestration Control Plane 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [
+      "database/cdc-replay-verification-idempotency-runbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/replay-repair-orchestration-control-plane-design.md",
+    "revision_history": []
+  }
+}

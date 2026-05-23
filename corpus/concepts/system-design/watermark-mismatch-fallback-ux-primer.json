@@ -1,0 +1,52 @@
+{
+  "id": "system-design/watermark-mismatch-fallback-ux-primer",
+  "title": "Watermark Mismatch Fallback UX Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "이 문서는 system-design 카테고리에서 Watermark Mismatch Fallback UX Primer를 다루는 primer 문서다. `required_watermark > applied_watermark`라는 mismatch는 \"틀린 값을 자신 있게 보여 주지 말라\"는 신호이고, 초보자용 첫 대응은 `stale hit reject`, `processing placeholder`, `primary fallback` 세 가지 UX 중 하나로 단순하게 고르는 것이다. 검색 질의가 watermark mismatch fallback ux primer, watermark mismatch ux, required watermark applied watermark fallback, stale hit rejection watermark처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Watermark Mismatch Fallback UX Primer\n\n> 한 줄 요약: `required_watermark > applied_watermark`라는 mismatch는 \"틀린 값을 자신 있게 보여 주지 말라\"는 신호이고, 초보자용 첫 대응은 `stale hit reject`, `processing placeholder`, `primary fallback` 세 가지 UX 중 하나로 단순하게 고르는 것이다.\n\nretrieval-anchor-keywords: watermark mismatch fallback ux primer, watermark mismatch ux, required watermark applied watermark fallback, stale hit rejection watermark, stale cache hit reject watermark, processing placeholder watermark mismatch, primary fallback watermark mismatch, watermark mismatch decision table, stale read placeholder beginner, read model lag user visible behavior, downstream read stale reject, required greater than applied, watermark mismatch user experience, watermark mismatch bridge beginner, consistency fallback ui primer\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Projection Applied Watermark Basics](./projection-applied-watermark-basics.md)\n- [Outbox Watermark Token Primer](./outbox-watermark-token-primer.md)\n- [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Notification Read to Min-Version Bridge](./notification-read-to-min-version-bridge.md)\n- [List-Detail Monotonicity Bridge](./list-detail-monotonicity-bridge.md)\n- [Post-Write Stale Dashboard Primer](./post-write-stale-dashboard-primer.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\n---\n\n## 먼저 잡을 mental model\n\nwatermark mismatch를 처음 보면 초보자는 보통 \"데이터가 없나?\" 또는 \"에러인가?\"부터 떠올린다.\n하지만 사용자 화면에서 더 먼저 맞는 해석은 아래에 가깝다.\n\n> \"값이 아예 없는 것\"보다 \"지금 가진 값이 아직 믿을 만큼 따라오지 못했다\"는 뜻이다.\n\n예를 들어 주문 결제 직후를 보자.\n\n- source write는 `required_watermark=9001`을 만들었다\n- read model row나 cache entry는 아직 `applied_watermark=8998`이다\n\n이때 시스템이 해야 할 첫 판단은 \"어떻게든 이 row를 보여 줄까?\"가 아니다.\n먼저 아래를 정해야 한다.\n\n- 오래된 hit를 그대로 버릴까\n- 잠깐 처리 중 placeholder를 보여 줄까\n- 더 신선한 source로 fallback할까\n\n즉 watermark mismatch는 **비교 로직의 끝**이 아니라,\n**사용자에게 무엇을 보여 줄지 고르는 시작점**이다.\n\n---\n\n## 세 가지 UX 선택지만 먼저 외우기\n\n| 선택지 | 사용자에게 보이는 것 | 언제 먼저 고르기 쉬운가 | 핵심 위험 |\n|---|---|---|---|\n| `stale hit reject` | 오래된 row를 그대로 채택하지 않음 | 후보가 cache/search/list hit일 때 | reject만 하고 대체 경로가 없으면 빈 화면처럼 느껴질 수 있다 |\n| `processing placeholder` | `처리 중`, `갱신 중`, skeleton, badge 표시 | projection이 곧 따라올 가능성이 높고 잠깐 기다릴 수 있을 때 | placeholder가 오래 지속되면 진짜 장애처럼 느껴진다 |\n| `primary fallback` | 더 느려도 최신성이 높은 결과를 바로 보여 줌 | 결제/권한/재고처럼 틀리면 안 되는 read일 때 | fallback 범위가 넓어지면 primary가 버티지 못할 수 있다 |\n\n짧게 기억하면 이렇다.\n\n- stale 후보면 **그대로 채택하지 않는다**\n- 곧 따라올 값이면 **placeholder**\n- 지금 정확해야 하면 **primary fallback**\n\n---\n\n## 왜 \"mismatch = stale 화면 그대로 노출\"이 아니어야 하나\n\n초보자가 가장 자주 하는 실수는 mismatch를 \"조금 늦었네\" 정도로 보고 기존 값을 그냥 렌더링하는 것이다.\n하지만 사용자 입장에서는 아래처럼 읽힌다.\n\n| 시스템 내부 상태 | 사용자가 느끼는 화면 |\n|---|---|\n| `required=9001`, `applied=8998`, 그래도 `PENDING` 렌더링 | \"결제가 안 됐나?\" |\n| `required=9001`, `applied=8998`, 그래도 재고 `available` 렌더링 | \"지금도 살 수 있나?\" |\n| `required=9001`, `applied=8998`, 그래도 권한 `admin` 렌더링 | \"권한이 아직 남아 있나?\" |\n\n그래서 mismatch는 보통 \"보여 줄 값이 있음\"보다 \"그 값을 그대로 믿으면 안 됨\"에 더 가깝다.\n\n---\n\n## 가장 단순한 흐름\n\n```text\nrequest comes with required_watermark=9001\n        |\n        v\ncandidate row/cache/search hit has applied_watermark=8998\n        |\n        v\n8998 < 9001 => mismatch\n        |\n        +-> reject stale hit\n        |\n        +-> choose next UX\n              - primary fallback\n              - processing placeholder\n              - suppress + retry/poll\n```\n\n핵심은 한 줄이다.\n\n> watermark compare는 \"accept?\"를 묻고, fallback UX는 \"accept가 아니면 무엇을 보여 줄까?\"를 정한다.\n\n---\n\n## 주문 결제 예시로 보면 더 쉽다\n\n### 상황\n\n```text\nPOST /orders/123/pay\n- commit success\n- required_watermark=9001\n\nGET /orders/123\n- cache row status=PENDING\n- cache applied_watermark=8998\n```\n\n### 잘못된 처리\n\n- cache hit이 있으니 그냥 `PENDING`을 보여 준다\n\n사용자는 \"결제가 실패했나?\"라고 오해할 수 있다.\n\n### 더 나은 처리\n\n| 판단 | 결과 |\n|---|---|\n| `8998 < 9001` | stale cache hit reject |\n| 주문 상세는 정확도가 중요함 | primary fallback 시도 |\n| primary가 `PAID`, `observed_watermark=9001` 반환 | 그 결과를 렌더링하고 cache metadata도 올림 |\n\n즉 여기서는 placeholder보다 primary fallback이 더 자연스럽다.\n결제 확인 화면은 \"잠깐 후 새로고침\"보다 \"바로 정확한 상태\"가 더 중요하기 때문이다.\n\n---\n\n## 반대로 placeholder가 더 맞는 경우도 있다\n\n대시보드 카드, 통계 위젯, 검색 색인 결과처럼 projection이 잠깐 늦을 수 있는 화면에서는\n\"오래된 값 강행\"보다 \"갱신 중 표시\"가 더 정직한 UX일 수 있다.\n\n예:\n\n```text\nrequired_watermark=5100\nwidget applied_watermark=5096\n```\n\n이때 beginner 단계의 쉬운 선택은 아래다.\n\n| 화면 종류 | mismatch 시 기본 선택 | 이유 |\n|---|---|---|\n| 결제 확인, 권한 검사, 재고 확정 | `primary fallback` | 틀린 값을 보여 주는 비용이 큼 |\n| 분석 위젯, 배지 수치, 검색 요약 | `processing placeholder` | 잠깐 늦는 것이 치명적이지 않음 |\n| 목록 row, cache hit, search hit | `stale hit reject` + 다른 source/overlay 선택 | 오래된 hit를 그대로 채택하는 것이 가장 눈에 띄는 UX 사고를 만든다 |\n\n---\n\n## downstream read에서 특히 중요한 규칙\n\nwatermark mismatch는 \"지금 이 한 번의 read\"로 끝나지 않는 경우가 많다.\n특히 목록, 검색, 알림 진입 뒤 후속 화면에서 stale hit를 다시 집어 들기 쉽다.\n\n그래서 downstream read는 아래 순서로 보는 편이 안전하다.\n\n1. 후보 hit의 `applied_watermark`를 먼저 본다\n2. `required_watermark`보다 낮으면 그 hit를 채택하지 않는다\n3. 더 신선한 source가 있으면 fallback한다\n4. 없으면 placeholder, suppress, overlay 중 하나를 고른다\n5. mismatch였던 값을 cache에 다시 refill하지 않는다\n\n이 다섯 번째가 자주 빠진다.\nstale 후보를 reject해 놓고도 그 값을 다시 cache에 넣으면 다음 요청도 같은 mismatch를 반복하게 된다.\n\n---\n\n## 작은 의사코드로 보면\n\n```pseudo\ncandidate = readFastPath(key)\n\nif candidate.appliedWatermark < requiredWatermark:\n  reject(candidate)\n\n  if endpoint.requiresFreshNow():\n    return readPrimary()\n\n  if endpoint.canShowProcessingState():\n    return processingPlaceholder()\n\n  return suppressOrOverlay()\n\nreturn candidate\n```\n\n초보자에게 중요한 점은 `fallback`이 \"무조건 primary\"가 아니라는 것이다.\n먼저 stale hit를 reject하고, 그다음 endpoint 성격에 맞는 UX를 고른다.\n\n---\n\n## 선택 기준을 한 표로 고정하기\n\n| 질문 | `yes`면 먼저 보기 | 이유 |\n|---|---|---|\n| 틀린 값을 보여 주면 금전/권한/재고 사고로 이어지나 | `primary fallback` | 정확도가 지연보다 중요하다 |\n| 몇 초 안에 projection이 따라오고, 사용자도 잠깐 기다릴 수 있나 | `processing placeholder` | 거짓 최신값보다 정직한 대기 화면이 낫다 |\n| 지금 후보가 cache/list/search의 오래된 hit인가 | `stale hit reject` | 오래된 hit를 그대로 채택하는 버그를 먼저 막아야 한다 |\n\n이 표는 \"정답이 하나\"라기보다 초보자용 기본 우선순위다.\n\n- 위험한 read는 primary fallback 쪽으로 기운다\n- 덜 위험한 read는 placeholder 쪽으로 기운다\n- 어떤 경우에도 stale hit는 무심코 accept하지 않는다\n\n---\n\n## observability도 UX 언어로 남겨야 한다\n\n운영에서 mismatch를 이해하려면 숫자만이 아니라 \"무슨 UX 선택이 실행됐는가\"도 같이 남겨야 한다.\n\n최소 필드는 아래 정도면 충분하다.\n\n- `required_watermark`\n- `applied_watermark`\n- `mismatch=true`\n- `rejected_hit_reason=watermark`\n- `fallback_reason=watermark` 또는 `ux_action=processing_placeholder`\n- `selected_source=cache|replica|primary|placeholder`\n\n예를 들면:\n\n```text\nevent=read_freshness_gate\nrequired_watermark=9001\napplied_watermark=8998\nrejected_hit_reason=watermark\nux_action=primary_fallback\nselected_source=primary\n```\n\n이렇게 남겨야 \"왜 사용자가 placeholder를 봤는지\", \"왜 primary 비율이 갑자기 늘었는지\"를 같이 설명할 수 있다.\n\n---\n\n## 자주 나오는 오해\n\n- `watermark mismatch면 무조건 에러 화면이다`\n  - 아니다. 많은 경우 에러보다 `placeholder`나 `fallback`이 맞다.\n- `candidate 값이 있으면 일단 보여 주고 background에서 고치면 된다`\n  - mismatch에서는 그 \"일단\"이 가장 큰 UX 사고가 된다.\n- `primary fallback`이 제일 안전하니 항상 쓰면 된다\n  - 안전하지만 비싸다. endpoint 중요도와 primary headroom을 같이 봐야 한다.\n- `placeholder`는 최신성 문제를 숨기는 꼼수다\n  - 틀린 확정값을 보여 주는 것보다 \"아직 반영 중\"을 정직하게 알리는 편이 나을 수 있다.\n- `stale hit reject`는 cache miss와 같은 뜻이다\n  - 다르다. hit는 있었지만 freshness contract를 못 맞춰서 의도적으로 버린 것이다.\n\n---\n\n## 30초 체크리스트\n\n- `required_watermark > applied_watermark`일 때 stale 후보를 그대로 렌더링하지 않는가\n- endpoint별 기본 UX가 정해져 있는가\n- 중요 read는 `primary fallback`, 덜 중요한 read는 `placeholder` 같은 기본 축이 있는가\n- reject된 stale 값을 cache에 다시 refill하지 않는가\n- 로그/메트릭에 `watermark mismatch`와 실제 `ux_action`이 같이 남는가\n\n---\n\n## 한 줄 정리\n\nwatermark mismatch는 \"비교 실패\"가 아니라 \"사용자에게 어떤 정직한 다음 행동을 보여 줄지 고르는 신호\"이고, beginner 단계에서는 `stale hit reject`, `processing placeholder`, `primary fallback` 세 선택지를 endpoint 위험도에 맞춰 일관되게 고르는 것부터 시작하면 된다.\n",
+  "aliases": [
+    "watermark mismatch fallback ux primer",
+    "watermark mismatch ux",
+    "required watermark applied watermark fallback",
+    "stale hit rejection watermark",
+    "stale cache hit reject watermark",
+    "processing placeholder watermark mismatch",
+    "primary fallback watermark mismatch",
+    "watermark mismatch decision table",
+    "stale read placeholder beginner",
+    "read model lag user visible behavior",
+    "downstream read stale reject",
+    "required greater than applied"
+  ],
+  "expected_queries": [
+    "Watermark Mismatch Fallback UX Primer 설계 핵심을 설명해줘",
+    "watermark mismatch fallback ux primer가 왜 필요한지 알려줘",
+    "Watermark Mismatch Fallback UX Primer 실무 트레이드오프는 뭐야?",
+    "watermark mismatch fallback ux primer 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Watermark Mismatch Fallback UX Primer`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`Watermark Mismatch Fallback UX Primer`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`Watermark Mismatch Fallback UX Primer`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/watermark-mismatch-fallback-ux-primer.md",
+    "revision_history": []
+  }
+}

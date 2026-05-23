@@ -1,0 +1,46 @@
+{
+  "id": "operating-system/sigchld-ignore-vs-waitpid-bridge",
+  "title": "SIGCHLD Ignore vs waitpid Bridge",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "'이 문서는 SIGCHLD default가 child exit status를 자동 회수한다는 뜻이 아니며, waitpid로 회수해야",
+  "body_markdown": "# SIGCHLD Ignore vs `waitpid()` Bridge\n\n> 한 줄 요약: `SIGCHLD`의 기본 상태는 \"자식 종료를 자동 회수한다\"가 아니고, 자식을 직접 `waitpid()`로 회수해야 zombie가 사라진다. 반대로 `SIG_IGN`이나 `SA_NOCLDWAIT`를 명시하면 \"나중에 `waitpid()`로 회수할 종료 상태\" 자체를 남기지 않는 쪽으로 읽는 편이 beginner에게 안전하다.\n>\n> 문서 역할: 이 문서는 operating-system `primer`에서 [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md), [Signal Mask vs Disposition Bridge: `fork()`, `exec()`, `posix_spawn()`](./signal-mask-vs-disposition-fork-exec-posix-spawn.md) 다음에 읽는 beginner bridge다. \"`SIGCHLD` 기본 동작이 ignore라는데 왜 zombie가 생기지?\"라는 혼란을 `default` vs `SIG_IGN` vs `SA_NOCLDWAIT` vs `waitpid()` 기대치로 한 장에서 정리한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md)\n- [Signal Mask vs Disposition Bridge: `fork()`, `exec()`, `posix_spawn()`](./signal-mask-vs-disposition-fork-exec-posix-spawn.md)\n- [Linux Process State Machine, Zombie, Orphan](./linux-process-state-zombie-orphan.md)\n- [signals, process supervision](./signals-process-supervision.md)\n- [PID 1, SIGTERM, and Container Reaping Basics](./container-pid-1-sigterm-zombie-reaping-basics.md)\n- [pidfd Basics: Race-Free Process Handles](./pidfd-basics-race-free-process-handles.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: sigchld ignore vs waitpid, sigchld default vs sig_ign, sigchld default behavior, sigchld zombie basics, sigchld ignore zombie, sa_nocldwait basics, waitpid expectation sigchld, explicit sig_ign vs default sigchld, child auto reap basics, child reap mental model, process supervision beginner, zombie reap beginner bridge, sigchld 기본 동작, sigchld 무시, sig_ign 좀비\n\n## 먼저 잡는 멘탈 모델\n\n초보자가 가장 먼저 분리해야 할 질문은 두 개다.\n\n1. 자식이 종료했을 때 **좀비 기록을 남길 것인가**\n2. 부모가 나중에 **`waitpid()`로 종료 상태를 읽을 수 있어야 하는가**\n\n이 기준으로 보면 `SIGCHLD` 주변 선택지가 정리된다.\n\n| 설정 | zombie가 잠깐 남을 수 있나 | 나중에 `waitpid()`로 종료 상태를 읽나 | beginner용 감각 |\n|---|---|---|---|\n| 기본 상태 (`SIG_DFL`) | 그렇다 | 그렇다 | \"자식 종료를 부모가 직접 수거해라\" |\n| `SIGCHLD = SIG_IGN` 명시 | 보통 남기지 않는다 | 보통 기대하면 안 된다 | \"종료 상태를 버리고 자동 정리 쪽으로 간다\" |\n| `SA_NOCLDWAIT` | 남기지 않는다 | 보통 기대하면 안 된다 | \"좀비를 만들지 말라\"를 명시한다 |\n| handler 설치 + `waitpid()` | 남을 수 있지만 곧 회수 | 그렇다 | \"알림은 signal, 실제 수거는 `waitpid()`\" |\n\n이 문서에서는 Linux/POSIX 실무 감각에 맞춰 다음처럼 기억하는 편을 권한다.\n\n- `SIGCHLD` 기본 상태는 \"아무것도 안 해도 자동 회수\"가 아니다.\n- `SIGCHLD`를 **명시적으로** `SIG_IGN`으로 두거나 `SA_NOCLDWAIT`를 쓰면 \"나중에 내가 회수할 종료 상태\"를 남기지 않는 쪽으로 동작한다고 보는 편이 안전하다.\n- 따라서 `waitpid()`를 써서 exit status를 읽고 싶다면 `SIG_IGN`/`SA_NOCLDWAIT`와 섞지 않는 편이 beginner에게 명확하다.\n\n## 왜 \"`SIGCHLD` 기본 동작은 ignore\"라는 말이 함정인가\n\n문서나 표를 읽다 보면 \"`SIGCHLD`의 default action은 ignore\"라는 표현을 자주 본다.\n그런데 초보자가 이 문장을 그대로 \"`명시적 `SIG_IGN``과 똑같다\"로 이해하면 거의 반드시 헷갈린다.\n\nbeginner용으로는 아래처럼 끊어 읽는 편이 낫다.\n\n- **기본 상태 (`SIG_DFL`)**: handler를 따로 설치하지 않은 상태\n- **명시적 `SIG_IGN`**: 프로그래머가 \"이 signal은 무시\"라고 직접 설정한 상태\n\n`SIGCHLD`에서는 이 둘을 같은 의미로 취급하면 안 된다.\n\n| 무엇을 비교하나 | 기본 상태 (`SIG_DFL`) | 명시적 `SIG_IGN` |\n|---|---|---|\n| 자식 종료 알림을 handler로 받나 | handler 없으면 직접 코드는 안 돈다 | handler도 안 돈다 |\n| zombie가 생길 수 있나 | 그렇다 | 보통 생기지 않게 한다 |\n| `waitpid()`로 나중에 회수할 수 있나 | 그렇다 | 보통 기대하지 않는다 |\n| 초보자용 해석 | \"부모가 직접 `waitpid()` 해야 한다\" | \"커널에 종료 상태를 버리라고 맡긴다\" |\n\n핵심은 이것이다.\n\n> `SIGCHLD`에서 \"default action이 ignore처럼 적혀 있다\"는 말과 \"내가 `SIG_IGN`을 명시했다\"는 말은 beginner 관점에서 같은 뜻이 아니다.\n\n## 타임라인으로 보면 더 덜 헷갈린다\n\n### 경우 1: 기본 상태 + 부모가 `waitpid()` 호출\n\n```text\nchild exits\n  -> child becomes zombie\n  -> parent calls waitpid()\n  -> exit status read\n  -> zombie removed\n```\n\n이게 가장 기본적인 그림이다.\n\n- zombie는 \"회수 전의 잠깐 남는 기록\"이다\n- 문제가 되는 것은 zombie가 생긴다는 사실 자체보다, **계속 안 치워지는 것**이다\n\n### 경우 2: `SIGCHLD = SIG_IGN`\n\n```text\nparent sets SIGCHLD to SIG_IGN\n  -> child exits\n  -> kernel does not keep a waitable zombie record\n  -> later waitpid() usually has nothing to reap\n```\n\n여기서는 beginner가 이렇게 기억하면 된다.\n\n- zombie를 없애는 대신\n- 나중에 부모가 \"`exit code`를 읽겠다\"는 선택지도 같이 약해진다\n\n### 경우 3: `SA_NOCLDWAIT`\n\n```text\nparent installs SIGCHLD disposition with SA_NOCLDWAIT\n  -> child exits\n  -> child is not left as a zombie\n  -> later waitpid() usually has no exited child to collect\n```\n\n`SA_NOCLDWAIT`는 이름 그대로 \"child가 죽어도 wait가 필요한 상태를 남기지 말라\"에 가깝다.\n\n## `waitpid()` 기대치는 언제 성립하나\n\n초보자 혼란의 대부분은 \"`자식이 죽었으니 나중에 `waitpid()` 하면 되겠지`\"라는 기대가 항상 맞는 줄 아는 데서 나온다.\n\n하지만 그 기대는 **종료 상태를 남겨 두는 정책**일 때만 성립한다.\n\n| 내가 원하는 것 | 추천 mental model | `waitpid()` 기대치 |\n|---|---|---|\n| 자식 종료 코드를 읽고 분기하고 싶다 | 기본 상태 또는 handler + `waitpid()` | 기대해도 된다 |\n| zombie를 직접 회수할 준비가 돼 있다 | `SIGCHLD` 알림 뒤 `waitpid(WNOHANG)` 루프 | 기대해도 된다 |\n| 종료 코드는 안 중요하고 zombie도 만들고 싶지 않다 | `SIG_IGN` 또는 `SA_NOCLDWAIT` | 나중 회수는 기대하지 말자 |\n| supervisor처럼 종료 여부와 code를 모두 관리해야 한다 | 명시적 reap 설계 | 반드시 `waitpid()` 경로를 가진다 |\n\n실무적으로는 이렇게 정리하면 안전하다.\n\n- `exit status`가 중요하다면 `waitpid()` 경로를 설계한다.\n- `waitpid()` 경로를 설계했다면 `SIGCHLD`를 `SIG_IGN`으로 두지 않는다.\n- `SIG_IGN`/`SA_NOCLDWAIT`는 \"코드를 단순화하는 마법\"이 아니라 \"`waitpid()` 기반 회수 모델을 포기하는 선택\"에 가깝다.\n\n## handler를 써도 `waitpid()`는 여전히 필요하다\n\n`SIGCHLD` handler를 설치한 뒤 beginner가 자주 하는 착각은 이것이다.\n\n- \"handler가 돌았으니 회수까지 끝났겠지\"\n\n하지만 signal은 알림일 뿐이다.\n\n```c\nstatic void on_sigchld(int signo) {\n    (void)signo;\n    while (waitpid(-1, NULL, WNOHANG) > 0) {\n        /* exited children reaped here */\n    }\n}\n```\n\n핵심은 handler 등록이 아니라 그 안의 `waitpid()`다.\n\n- signal은 \"자식이 끝났다\"를 알려 준다\n- `waitpid()`는 종료 상태를 읽고 zombie를 치운다\n\n그래서 \"`SIGCHLD`를 처리한다\"와 \"`자식을 회수한다`\"는 같은 말이 아니다.\n\n## 어떤 선택을 먼저 떠올리면 되나\n\n### 1. child exit code가 필요한가\n\n필요하면:\n\n- 기본 상태 또는 `SIGCHLD` handler\n- `waitpid()` 또는 `waitpid(WNOHANG)` 루프\n\n이 조합을 먼저 본다.\n\n### 2. exit code는 안 중요하고 zombie만 피하고 싶은가\n\n그렇다면:\n\n- `SIGCHLD = SIG_IGN`\n- 또는 `SA_NOCLDWAIT`\n\n이쪽이 후보가 된다.\n\n단, 이 경우에는 나중에 \"`그 child가 왜 죽었지? exit code는 몇이었지?`\"를 `waitpid()`로 수습하려 들면 이미 늦을 수 있다.\n\n## 자주 섞이는 오해\n\n- \"`SIGCHLD` 기본 동작이 ignore라니까 `waitpid()` 안 해도 된다\"가 아니다. 기본 상태에서는 zombie가 남을 수 있다.\n- \"`SIG_IGN`은 signal handler가 없는 기본 상태와 비슷하다\"가 아니다. `SIGCHLD`에서는 zombie/wait 의미가 달라질 수 있다.\n- \"`SIGCHLD` handler만 등록하면 회수까지 자동이다\"가 아니다. 보통 `waitpid()` 루프가 있어야 한다.\n- \"`SA_NOCLDWAIT`는 `waitpid()`를 더 편하게 만들어 준다\"가 아니다. 오히려 나중에 회수할 종료 상태를 남기지 않는 쪽으로 읽어야 한다.\n\n## 꼬리질문\n\n> Q: 왜 child가 끝났는데도 `ps`에 잠깐 남아 있나요?\n> 핵심: 부모가 `waitpid()`로 종료 상태를 읽기 전까지 zombie 기록이 남을 수 있기 때문이다.\n\n> Q: `SIGCHLD`를 `SIG_IGN`으로 두면 편한 것 아닌가요?\n> 핵심: zombie를 줄일 수는 있지만, 나중에 `waitpid()`로 exit status를 읽는 모델과는 잘 맞지 않는다.\n\n> Q: `SA_NOCLDWAIT`와 `SIG_IGN`은 무엇이 공통인가요?\n> 핵심: 둘 다 beginner 관점에서는 \"좀비를 남기지 않는 대신 나중 회수를 기대하지 않는 설정\"으로 보면 된다.\n\n## 여기까지 이해했으면 다음으로\n\n> **Beginner handoff box**\n>\n> - zombie/orphan 상태 자체를 더 넓게 보고 싶다면: [Linux Process State Machine, Zombie, Orphan](./linux-process-state-zombie-orphan.md)\n> - `fork()` / `exec()` / `waitpid()` 전체 흐름으로 다시 묶고 싶다면: [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md)\n> - blocked signal과 ignored signal 차이를 launch 경계에서 다시 보고 싶다면: [Signal Mask vs Disposition Bridge: `fork()`, `exec()`, `posix_spawn()`](./signal-mask-vs-disposition-fork-exec-posix-spawn.md)\n> - container PID 1이 왜 직접 reaping 책임을 지는지 잇고 싶다면: [PID 1, SIGTERM, and Container Reaping Basics](./container-pid-1-sigterm-zombie-reaping-basics.md)\n\n## 한 줄 정리\n\n`SIGCHLD`에서는 \"기본 상태\"와 \"명시적 `SIG_IGN`\"을 같은 뜻으로 읽지 않는 것이 핵심이다. exit status를 나중에 `waitpid()`로 읽고 싶다면 직접 회수 모델을 유지하고, zombie를 자동으로 남기지 않게 할 생각이라면 그만큼 `waitpid()` 기대치도 내려놓아야 한다.\n",
+  "aliases": [
+    "SIGCHLD ignore vs waitpid",
+    "SA_NOCLDWAIT",
+    "zombie child reaping",
+    "default SIGCHLD behavior",
+    "waitpid exit status",
+    "child process cleanup"
+  ],
+  "expected_queries": [
+    "SIGCHLD 기본 동작이 ignore라는데 왜 zombie가 생겨?",
+    "SIG_IGN이나 SA_NOCLDWAIT를 명시하면 waitpid로 회수할 종료 상태가 남지 않아?",
+    "child 종료 후 zombie를 없애려면 waitpid가 왜 필요해?",
+    "default SIGCHLD, SIG_IGN, SA_NOCLDWAIT 차이를 초급자에게 설명해줘"
+  ],
+  "symptoms": [
+    "`SIGCHLD Ignore vs waitpid Bridge`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`SIGCHLD Ignore vs waitpid Bridge`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`SIGCHLD Ignore vs waitpid Bridge`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "CPU, 메모리, 파일 디스크립터, 스레드 지표를 보면서 OS 원인과 애플리케이션 원인을 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/sigchld-ignore-vs-waitpid-bridge.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "system-design/projection-lag-user-facing-state-router",
+  "title": "Projection Lag User Facing State Router",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 projection/read model lag가 사용자 화면에 보이는 증상을 분기한다. 주문 성공 후 목록 미반영, pending 상태, consumer lag, watermark token 같은 표현을 다룬다.",
+  "body_markdown": "# Projection Lag User Facing State Router\n\n> 한 줄 요약: projection lag는 write 실패가 아니라 source of truth는 갱신됐지만 read model이 아직 따라오지 못한 상태일 수 있다. 사용자는 \"성공/실패\"가 아니라 \"원장 반영 완료, 조회 모델 반영 대기\"를 구분해서 보아야 한다.\n\n## 운영 증상\n\n| 증상 | 먼저 나눌 질문 | 확인할 증거 |\n|---|---|---|\n| 주문 생성 성공 후 목록에는 항목이 없음 | 목록이 projection/read model을 읽는가 | write version, projection watermark |\n| 상세는 보이는데 검색/통계에는 안 보임 | 화면별 source가 다른가 | endpoint별 read source |\n| 사용자가 실패로 오해해 다시 생성함 | pending UX가 없는가 | duplicate command, retry click |\n| consumer lag가 커지면 화면 전체가 오래됨 | backlog/poison message인가 | consumer lag, DLQ, oldest event age |\n| projection rebuild 중 결과가 흔들림 | cutover/watermark 조건이 있는가 | rebuild watermark, dual-read mismatch |\n\n## 관찰 timeline\n\nCommand write 성공 시간, outbox publish 시간, consumer 처리 시간, read model update 시간을 한 timeline으로 본다. 화면이 비어 있다는 사실만으로 write 실패라고 단정하면 안 된다.\n\n```text\nPOST /orders -> source_of_truth_version=42, event_id=9005\noutbox relay published event_id=9005\nconsumer applied_until=9001\nGET /orders -> projection_watermark=9001\n```\n\n위 상태에서는 주문 생성이 실패한 것이 아니라 목록 projection이 `9005`까지 따라오지 못한 것이다.\n\n## 원인 후보 1차 분기\n\n| 분기 | 원인 후보 | 사용자 응답 후보 |\n|---|---|---|\n| source of truth write 실패 | transaction rollback, validation failure | 실패 응답, 재시도 가능성 안내 |\n| source of truth write 성공 + projection lag | outbox/consumer/backlog 지연 | pending, polling, watermark 표시 |\n| event publish 누락 | dual-write gap, relay 장애 | outbox/reconciliation 복구 |\n| consumer 처리 실패 | poison message, schema mismatch | DLQ 처리, replay, partial degrade |\n| projection 결과 mismatch | mapping bug, late event ordering | dual-read 비교, reconciliation |\n\n## source of truth와 projection 분리\n\nProjection은 조회 최적화를 위해 만든 read model이지 항상 source of truth가 아니다. 주문 상태, 결제 원장, 재고 예약처럼 업무 판단이 중요한 경우에는 원장과 projection의 역할을 분리한다.\n\n- Source of truth: write가 성공했는지 판단하는 기준\n- Event id/watermark: projection이 어디까지 따라왔는지 나타내는 기준\n- User-facing state: 사용자가 지금 어떤 상태로 이해해야 하는지\n\n따라서 \"목록에 없으니 생성 실패\"라고 말하면 안 된다. source of truth 확인 결과와 projection watermark를 함께 봐야 한다.\n\n## 사용자 상태 선택\n\n| 상황 | 화면 상태 | 주의점 |\n|---|---|---|\n| source of truth commit 완료, projection 미반영 | 처리 중/pending | 실패처럼 보이지 않게 한다 |\n| projection watermark가 required event 이상 | 완료/정상 표시 | served watermark를 로그에 남긴다 |\n| lag SLO 초과 | 지연 안내 + 상태 조회/문의 | 무한 spinner 금지 |\n| source of truth도 확인 불가 | 불확실 상태 | 중복 command를 막기 위해 idempotency key 유지 |\n| consumer poison message | 일부 기능 지연/degraded | DLQ 복구 예정과 영향 범위를 분리 |\n\npending UX는 최신성 보장이 아니다. 사용자가 중복 행동을 하지 않도록 현재 시스템 상태를 정직하게 설명하는 장치다.\n\n## Trade-off\n\n| 선택 | 얻는 것 | 비용/위험 |\n|---|---|---|\n| 완료 화면에서 source of truth read | write 직후 확신 증가 | primary/source 부하 증가 |\n| 목록은 projection + pending 표시 | 확장성 유지 | UX 상태 모델과 polling 필요 |\n| watermark 기반 polling | \"언제 반영됐는지\" 판단 가능 | token 전파와 timeout 정책 필요 |\n| lag 숨김 | UI 단순함 | 실패 오해, 중복 생성, support 증가 |\n| projection rebuild/cutover | 모델 개선 가능 | mismatch와 partial freshness 관리 필요 |\n\n## 검증 지표\n\n- projection: consumer lag, applied watermark, watermark gap, oldest unprocessed event age\n- user-facing: pending duration p50/p95, polling count, pending timeout count, duplicate click/command rate\n- delivery: outbox pending age, relay retry count, DLQ count, replay success/failure\n- correctness: source of truth와 projection mismatch rate, reconciliation repair count, late event reorder count\n- SLO: projection freshness SLO 준수율, lag incident count, degraded mode duration\n\n## Wrong-bucket neighbor\n\nProjection lag를 read-after-write primary fallback만으로 해결하려 하면 비용이 커질 수 있다. 상세/확인 화면은 source of truth를 읽고, 목록/검색/통계는 projection watermark와 pending UX를 두는 식으로 화면별 source를 나누는 편이 안전하다.\n\n## 안전한 다음 문서\n\n- projection freshness 기본은 `projection-freshness-bridge`에서 본다.\n- watermark 불일치와 fallback UX는 `watermark-mismatch-fallback-ux-primer`로 이어진다.\n- outbox event 기준선은 `outbox-watermark-token-primer`를 확인한다.\n- read-after-write trade-off는 `read-after-write-tradeoff-matrix-chooser`와 함께 본다.\n",
+  "aliases": [
+    "projection lag user facing state router",
+    "read model lag pending state",
+    "projection lag 사용자 상태",
+    "read model 반영 지연"
+  ],
+  "expected_queries": [
+    "주문은 성공했는데 read model 화면에 아직 안 보이면 어떻게 안내해?",
+    "projection lag 때문에 pending 상태를 보여줘야 할까?",
+    "이벤트 기반 조회 모델 반영 지연을 사용자 UX에서 어떻게 다뤄?"
+  ],
+  "symptoms": [
+    "명령은 성공했는데 목록에는 항목이 없어요",
+    "이벤트 consumer lag가 있을 때 사용자가 실패로 오해해요",
+    "pending 상태 없이 바로 완료 화면을 보여줘요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/projection-freshness-bridge"
+    ],
+    "next_docs": [
+      "system-design/watermark-mismatch-fallback-ux-primer"
+    ],
+    "confusable_with": [
+      "database/projection-freshness-bridge",
+      "system-design/watermark-mismatch-fallback-ux-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/projection-lag-user-facing-state-router.md",
+    "revision_history": []
+  }
+}

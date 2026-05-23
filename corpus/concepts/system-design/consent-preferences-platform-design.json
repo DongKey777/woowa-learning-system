@@ -1,0 +1,52 @@
+{
+  "id": "system-design/consent-preferences-platform-design",
+  "title": "Consent / Preferences Platform 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Consent / Preferences Platform 설계를 다루는 deep_dive 문서다. consent and preferences platform은 마케팅 동의, 데이터 처리 동의, 채널 선호를 버전 관리하고 전파하는 정책 집행 시스템이다. 검색 질의가 consent platform, preferences, opt-in, opt-out처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Consent / Preferences Platform 설계\n\n> 한 줄 요약: consent and preferences platform은 마케팅 동의, 데이터 처리 동의, 채널 선호를 버전 관리하고 전파하는 정책 집행 시스템이다.\n\nretrieval-anchor-keywords: consent platform, preferences, opt-in, opt-out, privacy policy, consent version, data processing, channel preference, legal basis, preference propagation\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Notification Preferences Graph 설계](./notification-preferences-graph-design.md)\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n> - [Email Delivery Platform 설계](./email-delivery-platform-design.md)\n\n## 핵심 개념\n\nConsent는 단순한 체크박스가 아니다.  \n실전에서는 아래를 함께 다뤄야 한다.\n\n- 법적 동의\n- 마케팅 opt-in/opt-out\n- 채널별 선호\n- purpose limitation\n- versioned consent text\n- revocation and audit\n\n즉, consent platform은 정책과 증거를 함께 관리하는 데이터 시스템이다.\n\n## 깊이 들어가기\n\n### 1. consent와 preference는 다르다\n\n- consent: 법적/규제상의 허용 여부\n- preference: 사용자가 선호하는 전달 방식\n\n마케팅 email을 안 받는 것과, 필수 약관 동의 여부는 다르다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 1,000만 사용자\n- user마다 여러 목적/purpose\n- 초당 수만 policy check\n\n읽기 path가 매우 중요하고, 변경은 드물지만 민감하다.\n\n봐야 할 숫자:\n\n- consent lookup QPS\n- change propagation delay\n- audit append rate\n- revocation rate\n- cache invalidation latency\n\n### 3. 데이터 모델\n\n핵심 엔티티:\n\n- consent record\n- purpose\n- policy version\n- channel preference\n- audit event\n\n### 4. versioned text와 proof\n\n동의 문구는 바뀐다.\n\n- versioned legal text\n- locale\n- timestamp\n- source of capture\n- IP / device metadata\n\n이 기록이 없으면 \"어떤 문구에 동의했는지\" 증명할 수 없다.\n\n### 5. propagation\n\n동의 철회는 즉시 전파돼야 한다.\n\n- cache invalidation\n- downstream suppression\n- email/push stop\n- analytics masking\n\n이 부분은 [Notification Preferences Graph 설계](./notification-preferences-graph-design.md)와 [Email Delivery Platform 설계](./email-delivery-platform-design.md)와 연결된다.\n\n### 6. legal basis and jurisdiction\n\n지역마다 정책이 다를 수 있다.\n\n- EU consent\n- US opt-out\n- tenant-specific policy\n- age gate\n\n그래서 consent platform은 geo-aware여야 한다.\n\n### 7. auditability\n\n동의는 법적 증거가 된다.\n\n- 언제 동의했는가\n- 어떤 버전의 문구였는가\n- 누가 철회했는가\n\n이력은 [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)로 남겨야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 마케팅 동의 철회\n\n문제:\n\n- 사용자가 광고 이메일을 끊고 싶다\n\n해결:\n\n- preference 변경\n- downstream suppression\n- audit 기록\n\n### 시나리오 2: 동의 문구 변경\n\n문제:\n\n- 약관이 업데이트됐다\n\n해결:\n\n- versioned consent text\n- 재동의 필요 여부 판단\n\n### 시나리오 3: tenant별 정책 차이\n\n문제:\n\n- 어떤 고객사는 특정 채널 사용을 금지한다\n\n해결:\n\n- tenant policy override\n- user preference는 그 안에서만 유효\n\n## 코드로 보기\n\n```pseudo\nfunction canContact(user, channel, purpose):\n  consent = consentStore.get(user.id, purpose)\n  preference = preferenceStore.get(user.id, channel)\n  return consent.allowed && preference.allowed\n```\n\n```java\npublic boolean canProcess(UserId userId, Purpose purpose) {\n    return consentRepository.isAllowed(userId, purpose);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Flat consent table | 단순하다 | version 증거가 약하다 | 작은 서비스 |\n| Versioned consent ledger | 감사가 쉽다 | 저장이 늘어난다 | 규제 환경 |\n| Cache-first checks | 빠르다 | stale risk | high-QPS contact system |\n| Geo-aware policy | 규정 대응이 좋다 | 복잡하다 | 글로벌 서비스 |\n| Unified consent+preference | UX가 단순하다 | 법적 의미가 섞일 수 있다 | 저위험 경로 |\n\n핵심은 consent platform이 단순 설정이 아니라 **법적 증거와 전달 정책을 함께 관리하는 집행 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: consent와 preference의 차이는 무엇인가요?\n> 의도: 법적 허용과 사용자 선호를 구분하는지 확인\n> 핵심: consent는 규제, preference는 UX/전달 방식이다.\n\n> Q: 왜 versioned text가 필요한가요?\n> 의도: 증거성 이해 확인\n> 핵심: 어떤 문구에 동의했는지 나중에 증명해야 하기 때문이다.\n\n> Q: 철회는 얼마나 빨리 반영돼야 하나요?\n> 의도: downstream suppression과 최신성 이해 확인\n> 핵심: 가능한 즉시 전파되어야 한다.\n\n> Q: audit log 없이 consent를 운영할 수 있나요?\n> 의도: 법적 증거성 이해 확인\n> 핵심: 위험이 커서 운영하기 어렵다.\n\n## 한 줄 정리\n\nConsent / preferences platform은 동의와 선호를 버전, 지역, 정책 단위로 관리해 법적 증거와 전달 제어를 함께 제공하는 시스템이다.\n\n",
+  "aliases": [
+    "consent platform",
+    "preferences",
+    "opt-in",
+    "opt-out",
+    "privacy policy",
+    "consent version",
+    "data processing",
+    "channel preference",
+    "legal basis",
+    "preference propagation",
+    "Consent / Preferences Platform 설계",
+    "consent preferences platform design"
+  ],
+  "expected_queries": [
+    "Consent / Preferences Platform 설계 설계 핵심을 설명해줘",
+    "consent platform가 왜 필요한지 알려줘",
+    "Consent / Preferences Platform 설계 실무 트레이드오프는 뭐야?",
+    "consent platform 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Consent / Preferences Platform 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Consent / Preferences Platform 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Consent / Preferences Platform 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/consent-preferences-platform-design.md",
+    "revision_history": []
+  }
+}

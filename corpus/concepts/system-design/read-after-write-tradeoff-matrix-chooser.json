@@ -1,0 +1,45 @@
+{
+  "id": "system-design/read-after-write-tradeoff-matrix-chooser",
+  "title": "Read After Write Tradeoff Matrix Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 chooser는 read-after-write 보장 옵션을 freshness, latency, capacity trade-off로 비교한다. primary fallback, min-version floor, cache bypass, projection lag UX 같은 설계 질문을 다룬다.",
+  "body_markdown": "# Read After Write Tradeoff Matrix Chooser\n\n> 한 줄 요약: read-after-write 설계는 \"항상 최신값\"을 약속하는 기능이 아니라, 화면별로 source of truth, required version, fallback 범위, capacity budget을 정하는 trade-off 선택이다.\n\n## 운영 증상\n\n| 증상 | 흔한 오해 | 실제로 나눌 질문 |\n|---|---|---|\n| 저장 직후 상세 화면이 옛값을 보여줌 | DB 저장 실패다 | 후속 read가 cache/replica/projection 중 어디를 읽었나 |\n| 캐시를 끄니 해결되지만 latency가 커짐 | cache가 항상 문제다 | cache hit를 거절할 version/watermark가 없었나 |\n| 모든 read를 primary로 보내니 DB가 버거움 | 최신성은 primary read만 답이다 | recent writer, 중요 화면, 짧은 window로 좁힐 수 있나 |\n| projection lag를 숨기니 사용자가 실패로 오해함 | 완료 응답이면 모든 화면도 완료여야 한다 | command 성공과 read model 반영을 분리해 보여줄 수 있나 |\n\n## 보장 범위 먼저 정하기\n\n아래 네 가지를 분리하지 않으면 설계가 과장된다.\n\n- Source of truth: 실제 업무 상태를 판단할 기준이다. 주문 생성이면 primary DB row 또는 ledger가 기준일 수 있다.\n- Required version/watermark: 사용자가 이미 만든 write 또는 이미 본 상태 아래로 내려가지 않기 위한 기준선이다.\n- Read path: cache, replica, primary, projection 중 어떤 경로가 이 기준선을 증명할 수 있는지다.\n- User promise: \"방금 저장한 내 상세 화면은 보여준다\", \"관리자 통계는 최대 1분 지연될 수 있다\"처럼 화면 단위로 말해야 한다.\n\nRead-after-write는 전역 최신성 보장이 아니다. 같은 서비스에서도 결제 완료 화면은 강하게 보호하고, 대시보드 집계는 watermark와 지연 안내로 처리할 수 있다.\n\n## 10초 chooser\n\n| 목표 | 후보 | 얻는 것 | 비용/위험 |\n|---|---|---|---|\n| write 직후 같은 사용자의 상세 보호 | recent-write primary fallback | 단순하고 즉시 효과 | primary headroom 필요 |\n| 이미 본 값보다 후퇴 금지 | min-version floor | monotonic read 보호 | version 전파와 reject 처리 필요 |\n| cache를 유지하면서 stale hit 줄이기 | watermark-aware cache acceptance | cache hit와 freshness 균형 | metadata 저장, miss 증가 |\n| projection 반영 지연 설명 | pending/polling/watermark UX | 사용자가 실패로 오해하지 않음 | UX 상태 모델 증가 |\n| 넓은 read 부하 유지 | replica default + selective fallback | 확장성 유지 | 보호 범위 밖 stale 허용 |\n\n## 원인 후보와 처방\n\n### 1. Primary fallback\n\nwrite 직후 read를 primary로 보내면 committed source of truth를 직접 읽을 가능성이 높다. 하지만 이것은 \"모든 최신성 문제 해결\"이 아니다. application cache가 앞에 있거나, 화면이 projection을 읽거나, write transaction이 아직 commit되지 않았다면 primary fallback만으로 부족하다.\n\n적합한 경우:\n\n- 주문 생성 직후 주문 상세\n- 결제 완료 직후 영수증\n- 권한 변경 직후 접근 제어 확인\n\n주의할 점:\n\n- fallback QPS 상한을 둔다.\n- recent-write window를 짧게 둔다.\n- primary가 이미 포화면 fallback 확대 대신 pending/degraded UX를 고려한다.\n\n### 2. Min-version floor\n\n`min-version floor`는 \"방금 쓴 값이 반드시 보인다\"보다 \"이미 본 값보다 낮은 값을 다시 보여주지 않는다\"에 가깝다.\n\n예를 들어 상세에서 `PAID(v42)`를 본 뒤 목록이 `PENDING(v41)`을 돌려주면 화면이 역행한다. 이때 클라이언트나 BFF가 `required_version=42`를 전달하고 cache/replica/projection이 그 기준선 아래 응답을 거절하게 한다.\n\n비용은 version propagation이다. 모든 응답이 비교 가능한 version 또는 watermark를 가져야 하고, 낮은 응답을 거절했을 때 fallback 경로가 있어야 한다.\n\n### 3. Watermark-aware cache/projection\n\ncache hit는 \"값이 있다\"만으로 충분하지 않다. read-after-write 화면에서는 `entry.watermark >= required_watermark`를 확인해야 한다.\n\nprojection도 마찬가지다. read model이 `applied_event_id=9000`인데 write 응답이 `event_id=9005`를 돌려줬다면, 그 projection은 아직 사용자의 write를 반영했다고 말할 수 없다. 이 경우 source of truth 확인, primary/detail fallback, pending UX 중 하나를 선택한다.\n\n### 4. Pending UX\n\n비동기 projection을 쓰는 화면에서 모든 요청을 source of truth로 돌리면 확장성이 깨질 수 있다. 반대로 lag를 숨기면 사용자가 \"실패했다\"고 판단하고 중복 행동을 할 수 있다.\n\npending UX는 최신성 보장이 아니라 상태 설명이다.\n\n```text\ncommand accepted in source of truth\nprojection not yet caught up\nshow pending + poll with required_watermark\n```\n\n## Trade-off matrix\n\n| 축 | 강하게 잡으면 | 약하게 잡으면 |\n|---|---|---|\n| Freshness | 사용자 혼란과 중복 행동 감소 | stale 화면 허용 |\n| Latency | primary/cache bypass로 느려질 수 있음 | 빠르지만 옛값 가능 |\n| Capacity | fallback이 넓으면 primary 부하 증가 | replica/cache 효율 유지 |\n| Availability | fresher path 장애에 영향 | degraded 화면으로 버팀 |\n| Complexity | token, watermark, pending 상태 필요 | 구현은 단순하지만 운영 원인 파악 어려움 |\n\n## 검증 지표\n\n- request-level: `required_version`, `served_version`, `read_source`, `cache_hit_accept_reason`\n- freshness: stale read rate, rejected stale hit count, projection watermark gap, replica lag p95/p99\n- capacity: primary fallback QPS, fallback budget 사용률, primary CPU/IO headroom, DB read latency\n- UX: pending state duration, polling count, duplicate user action rate, support ticket count\n- correctness: source of truth와 read model mismatch sample, reconciliation repair count\n\n## Wrong-bucket neighbor\n\nCache를 무조건 끄는 것은 설계가 아니라 임시 우회다. 어느 사용자, 어느 화면, 어느 시간 window에서 강한 최신성이 필요한지 먼저 좁혀야 한다. 그 다음 cache hit를 version으로 거절할지, recent writer만 primary fallback할지, projection lag를 pending으로 노출할지 고른다.\n\n## 안전한 다음 문서\n\n- 운영 관찰 dashboard는 `post-write-stale-dashboard-primer`로 이어진다.\n- cache hit acceptance는 `cache-acceptance-rules-for-causal-reads`를 본다.\n- primary fallback을 어디까지 넓힐지는 `primary-fallback-safety-chooser`에서 capacity 조건을 확인한다.\n- projection lag UX는 `projection-lag-user-facing-state-router`로 내려간다.\n",
+  "aliases": [
+    "read after write tradeoff matrix chooser",
+    "freshness latency capacity tradeoff",
+    "read-after-write trade-off 선택",
+    "최신성 지연 용량 비교"
+  ],
+  "expected_queries": [
+    "read-after-write를 보장하려면 latency와 capacity trade-off를 어떻게 봐?",
+    "primary fallback min-version floor cache bypass 중 뭘 골라야 해?",
+    "방금 쓴 값 최신성을 화면마다 다르게 설계해도 돼?"
+  ],
+  "symptoms": [
+    "모든 화면에 강한 최신성을 주려다 비용이 커졌어요",
+    "cache bypass를 했더니 latency가 늘었어요",
+    "projection lag를 숨기려다 사용자 혼란이 커졌어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/read-after-write-routing-primer"
+    ],
+    "next_docs": [
+      "system-design/post-write-stale-dashboard-primer"
+    ],
+    "confusable_with": [
+      "system-design/read-after-write-routing-primer",
+      "system-design/cache-acceptance-rules-for-causal-reads"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/read-after-write-tradeoff-matrix-chooser.md",
+    "revision_history": []
+  }
+}

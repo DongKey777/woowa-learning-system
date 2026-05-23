@@ -1,0 +1,51 @@
+{
+  "id": "system-design/watermark-metadata-persistence-basics",
+  "title": "Watermark Metadata Persistence Basics",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "'이 문서는 학습자가 cache refill 때 payload만 저장하면 다음 cache hit에서",
+  "body_markdown": "# Watermark Metadata Persistence Basics\n\n> 한 줄 요약: outbox가 만든 `required_watermark`와 projection이 만든 `applied_watermark`는 cache refill 때 entry metadata로 같이 저장해야 하고, 그래야 다음 cache hit에서 \"이 값을 지금 바로 써도 되나?\"를 숫자 비교 한 번으로 판단할 수 있다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Outbox Watermark Token Primer](./outbox-watermark-token-primer.md)\n- [Projection Applied Watermark Basics](./projection-applied-watermark-basics.md)\n- [Cache Acceptance Rules for Causal Reads](./cache-acceptance-rules-for-causal-reads.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Shard-Aware Watermark Scope Primer](./shard-aware-watermark-scope-primer.md)\n- [system design 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: watermark metadata persistence basics, cache watermark metadata 뭐예요, cache refill에 watermark 왜 저장해요, cache hit에서 watermark 어떻게 비교해요, 처음 배우는데 cache freshness metadata, applied watermark cache entry, required watermark cache hit check, cache entry가 stale인지 어떻게 알아요, cache hit rejected 이유, outbox projection cache bridge, read-after-write cache metadata 기초, why cache hit can still be stale, what is cache watermark metadata, beginner watermark cache primer, cache metadata persistence primer\n\n---\n\n## 먼저 잡을 mental model\n\n초보자는 watermark 이야기를 듣고 outbox나 projection까지만 떠올리기 쉽다.\n하지만 운영에서 실제로 막히는 지점은 그다음이다.\n\n질문이 \"cache hit인데 왜 stale할 수 있죠?\", \"cache refill에 payload만 넣으면 안 되나요?\"라면 이 문서가 첫 문서다. `applied_watermark` 자체가 아직 낯설다면 [Projection Applied Watermark Basics](./projection-applied-watermark-basics.md)부터 먼저 잡고 돌아오면 된다.\n\n> fresh한 값을 한 번 읽어 왔다고 끝이 아니라, 그 fresh함을 다음 cache hit도 다시 증명할 수 있게 metadata로 남겨야 한다.\n\n즉 흐름은 이렇게 이어진다.\n\n1. source transaction이 `required_watermark`를 만든다\n2. projection/read model이 `applied_watermark`를 가진다\n3. read path가 안전한 값을 읽는다\n4. cache refill 때 그 값을 그냥 payload만 넣지 않고 watermark metadata도 같이 저장한다\n5. 다음 요청은 cache hit에서 그 metadata를 보고 causal hit 여부를 판단한다\n\n한 줄로 줄이면:\n\n- outbox는 \"어디까지 따라와야 하나\"를 만든다\n- projection은 \"지금 어디까지 따라왔나\"를 보여 준다\n- cache metadata persistence는 \"다음 hit도 그 사실을 다시 검사할 수 있게 남긴다\"\n\n## 왜 persistence가 빠지면 곧바로 약해지나\n\n주문 상세를 primary에서 fresh하게 읽어 왔다고 하자.\n응답 시점에는 `required_watermark=9001`을 만족했다.\n\n그런데 cache에 아래처럼 값만 저장하면 문제가 남는다.\n\n```text\ncache entry\n- status = PAID\n- total_price = 42000\n```\n\n다음 요청에서 시스템은 이런 질문에 답하지 못한다.\n\n- 이 값이 `9001` 이후 상태라는 증거가 cache 안에 남아 있나?\n- 아니면 우연히 값이 비슷해 보일 뿐인가?\n\n반대로 refill 때 metadata를 같이 넣으면 다음 hit 판단이 가능해진다.\n\n```text\ncache entry\n- status = PAID\n- total_price = 42000\n- applied_watermark = 9001\n- watermark_scope = orders-shard-a\n```\n\n이제 다음 요청이 `required_watermark=9001`을 들고 오면 읽기 경로는 아래 한 줄을 물을 수 있다.\n\n- `entry.applied_watermark >= required_watermark` 인가?\n\n즉 persistence의 목적은 \"디버깅용 장식\"이 아니라 **다음 cache hit 검사를 가능하게 만드는 것**이다.\n\n## 한눈에 보기\n\n| 단계 | 생기는 값 | 어디에 저장되나 | 다음 단계에서 왜 필요한가 |\n|---|---|---|---|\n| source commit | `required_watermark=9001` | event / request context | \"최소 어디까지 보여야 하나?\" |\n| projection apply | `applied_watermark=9001` | read model row 또는 checkpoint | \"이 읽기 값이 그 기준선을 만족하나?\" |\n| safe read 성공 | `value + applied_watermark=9001` | response metadata | \"지금 응답은 왜 안전한가?\" |\n| cache refill | `cache.applied_watermark=9001` | cache entry metadata | \"다음 hit도 안전한가?\" |\n| later cache hit | `entry.applied_watermark` vs `required_watermark` | cache lookup 시 비교 | \"hit를 바로 채택해도 되나?\" |\n\n```text\noutbox required_watermark\n  -> projection applied_watermark\n  -> safe read succeeds\n  -> cache refill persists applied_watermark\n  -> later cache hit checks required <= applied\n```\n\n## 어떤 metadata를 같이 저장하면 시작하기 쉬운가\n\nbeginner 단계에서는 \"완벽한 universal metadata\"보다 **나중에 비교에 꼭 필요한 최소 집합**부터 잡는 편이 낫다.\n\n| 필드 | 가장 단순한 역할 | 왜 필요한가 |\n|---|---|---|\n| `applied_watermark` | 이 값이 최소 어디까지 반영했는지 | 다음 hit accept/reject 비교의 핵심 |\n| `watermark_scope` | 이 숫자가 어느 shard/partition 범위 것인지 | 다른 범위 숫자와 잘못 비교하지 않기 위해 |\n| `entity_version` 또는 `row_version` | 단건 monotonicity 보조 기준선 | watermark만으로 부족한 화면에서 보조 판단 |\n| `read_source` | `primary`, `replica`, `projection-cache` 등 | 왜 이 값이 cache에 들어왔는지 추적하기 쉬움 |\n| `cached_at` | 언제 넣었는지 | TTL, triage, 최근 write와 함께 보기 쉬움 |\n\n초보자는 우선 아래 둘을 반드시 기억하면 된다.\n\n- `applied_watermark`\n- `watermark_scope`\n\nscope 없이 숫자만 저장하면 shard가 갈라진 순간 설명이 깨질 수 있다.\n이 범위 문제는 [Shard-Aware Watermark Scope Primer](./shard-aware-watermark-scope-primer.md)에서 더 자세히 다룬다.\n\n## 주문 결제 예시로 따라가기\n\n주문 `#123` 결제가 끝났다.\n\n```text\nsource tx commit\n- orders[123].status = PAID\n- outbox.id = 9001\n```\n\nevent에는 이 기준선이 실린다.\n\n```json\n{\n  \"event_type\": \"order_paid\",\n  \"order_id\": \"123\",\n  \"required_watermark\": 9001\n}\n```\n\n주문 상세 projection이 반영을 마친 뒤 row는 이렇게 된다.\n\n```text\norders_read[123]\n- status = PAID\n- applied_watermark = 9001\n```\n\n이제 알림 클릭 같은 요청이 들어와 primary나 fresh projection read로 안전한 값을 읽었다고 하자.\n여기서 refill을 아래처럼 해야 다음 요청이 쉬워진다.\n\n```text\ncache.put(\n  key = \"order:123\",\n  value = { status: \"PAID\" },\n  metadata = {\n    applied_watermark: 9001,\n    watermark_scope: \"orders-main\",\n    entity_version: 42\n  }\n)\n```\n\n다음 요청이 같은 주문 상세를 열 때:\n\n```pseudo\nentry = cache.get(\"order:123\")\n\nif entry.meta.watermark_scope == request.requiredScope\n   and entry.meta.applied_watermark >= request.requiredWatermark:\n  return entry.value\n\nreturn fallback_to_fresher_source()\n```\n\n중요한 점은 cache value 자체가 `PAID`라는 문자열을 담고 있다는 사실보다,\n그 값이 **왜 믿을 만한지**를 metadata가 계속 설명해 준다는 것이다.\n\n## refill 시점에 무엇을 같이 써야 하나\n\n이 주제의 핵심은 \"cache write를 할 때 무엇을 절대 빼먹지 말아야 하나\"다.\n\n| refill 상황 | 같이 저장해야 하는 것 | 빠지면 생기는 문제 |\n|---|---|---|\n| primary fallback 후 refill | `applied_watermark`, `watermark_scope` | 다음 hit가 fresh proof 없이 TTL만 믿게 된다 |\n| fresh projection row refill | projection row의 `applied_watermark` | read model은 안전했는데 cache는 그 사실을 잊는다 |\n| notification causal read 후 refill | 응답이 만족한 `required_watermark` 이상 metadata | click 직후는 맞았는데 다음 클릭에서 다시 stale 가능 |\n| replica read 후 refill | replica가 실제로 만족한 watermark metadata | lagging replica 값을 오래 cache할 위험이 있다 |\n\n짧게 말하면:\n\n- 안전한 read를 했다면, 그 안전성의 근거도 같이 cache에 저장해야 한다\n- 그렇지 않으면 다음 hit는 다시 \"증거 없는 빠른 길\"이 된다\n\n## 흔한 오해\n\n- `TTL이 짧으면 watermark metadata는 없어도 된다`\n  - TTL은 만료 규칙일 뿐이고, causal hit 검사의 근거는 아니다.\n- `cache에 value만 맞으면 된다`\n  - 다음 요청은 그 value가 어떤 기준선 이후 값인지 알 수 없다.\n- `required_watermark`를 cache entry에 그대로 저장하면 끝이다\n  - 보통 다음 hit에서는 \"이 entry가 실제로 어디까지 반영했나\"를 보여 주는 `applied_watermark`가 더 직접적인 기준이다.\n- `primary에서 읽어 왔으니 metadata 없이도 fresh하다`\n  - 그건 refill 순간의 사실일 뿐이다. 다음 hit 시점에는 persisted metadata가 없으면 다시 증명할 수 없다.\n- `scope는 advanced라서 나중에 붙이면 된다`\n  - 단일 shard가 아니면 처음부터 scope를 같이 저장하는 편이 beginner 문서 기준으로도 덜 위험하다.\n\n## 초보자용 최소 설계\n\n복잡한 캐시 프레임워크 없이도 아래 정도면 출발점이 된다.\n\n1. request context에 `required_watermark`를 들고 다닌다.\n2. read model이나 safe source가 `applied_watermark`를 응답 metadata로 준다.\n3. cache refill helper가 payload와 함께 `applied_watermark`, `watermark_scope`를 저장한다.\n4. cache hit helper는 TTL보다 먼저 `required <= applied`를 검사한다.\n5. mismatch면 rejected hit로 기록하고 fresher source로 내려간다.\n\n가장 작은 pseudo code는 이 정도다.\n\n```pseudo\nfunction refillCache(key, value, meta):\n  cache.put(key, value, {\n    applied_watermark: meta.appliedWatermark,\n    watermark_scope: meta.watermarkScope,\n    entity_version: meta.entityVersion\n  })\n\nfunction canAcceptHit(entry, required):\n  return entry.meta != null\n    and entry.meta.watermark_scope == required.scope\n    and entry.meta.applied_watermark >= required.watermark\n```\n\n## 어디까지 이 문서에서 다루고, 어디서 멈추나\n\n이 문서는 beginner를 위해 아래 질문까지만 다룬다.\n\n- outbox watermark가 cache metadata와 왜 이어지나\n- refill metadata가 왜 다음 causal hit 검사를 가능하게 하나\n- cache entry에 최소 무엇을 남겨야 하나\n\n반대로 아래는 연결 문서로 넘긴다.\n\n- shard별 비교 범위 상세 규칙: [Shard-Aware Watermark Scope Primer](./shard-aware-watermark-scope-primer.md)\n- hit/miss/refill 전체 read path 정책: [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- rejected hit 로그와 메트릭 설계: [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- causal read accept helper 설계: [Cache Acceptance Rules for Causal Reads](./cache-acceptance-rules-for-causal-reads.md)\n\n## 한 줄 정리\n\nwatermark metadata persistence의 본질은 \"fresh한 값을 한 번 읽었다\"를 cache에 남기는 것이 아니라, 그 값이 **어느 watermark까지 반영된 결과인지**를 같이 저장해 다음 cache hit에서도 causal accept 여부를 다시 증명할 수 있게 만드는 데 있다.\n",
+  "aliases": [
+    "cache watermark metadata",
+    "applied watermark cache entry",
+    "required watermark cache hit check",
+    "cache metadata persistence primer",
+    "watermark metadata persistence basics"
+  ],
+  "expected_queries": [
+    "cache refill에 watermark metadata를 왜 같이 저장해?",
+    "applied watermark와 required watermark는 cache hit에서 어떻게 비교해?",
+    "cache entry가 stale인지 숫자 비교 한 번으로 판정하려면 뭐가 필요해?",
+    "payload만 cache에 저장하면 다음 요청에서 freshness를 왜 다시 증명 못 해?",
+    "cache hit acceptance check에 watermark metadata가 없으면 어떤 문제가 생겨?"
+  ],
+  "symptoms": [
+    "cache hit인데 왜 stale인지 증명할 수 없어",
+    "cache refill에 payload만 넣으면 안 되는지 헷갈려",
+    "applied watermark와 required watermark를 어디에 저장할지 모르겠어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/projection-applied-watermark-basics",
+      "system-design/mixed-cache-replica-freshness-bridge"
+    ],
+    "next_docs": [
+      "system-design/rejected-hit-observability-primer",
+      "system-design/shard-aware-watermark-scope-primer"
+    ],
+    "confusable_with": [
+      "system-design/outbox-watermark-token-primer",
+      "system-design/cache-acceptance-rules-for-causal-reads",
+      "system-design/rejected-hit-observability-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/watermark-metadata-persistence-basics.md",
+    "revision_history": []
+  }
+}

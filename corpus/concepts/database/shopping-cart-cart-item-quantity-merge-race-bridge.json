@@ -1,0 +1,46 @@
+{
+  "id": "database/shopping-cart-cart-item-quantity-merge-race-bridge",
+  "title": "Shopping Cart Cart Item Quantity Merge Race Bridge",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 mission_bridge는 shopping-cart 장바구니 같은 상품 추가 시 수량 병합, lost update, unique upsert 학습을 연결한다.",
+  "body_markdown": "# Shopping Cart Cart Item Quantity Merge Race Bridge\n\n## 미션 장면\n\n쇼핑카트에서 학습자가 \"같은 상품을 두 번 담으면 row를 합쳐야 하나요?\"라고 묻는 순간, 정책과 동시성(concurrency)을 같이 봐야 한다. 보통 장바구니(cart) 안에서 같은 상품(product)은 하나의 cart item으로 유지하고 수량(quantity)을 증가시킨다. 이때 불변식(invariant)은 `(cart_id, product_id)` 조합이 활성 장바구니 안에서 하나만 존재한다는 점이다. 이 불변식이 DB에 없고 service에서 `find` 후 `insert`만 하면, 동시에 들어온 두 요청이 모두 \"없다\"고 판단해 중복 row를 만들 수 있다.\n\n## 리뷰에서 보이는 냄새\n\n- 같은 cart와 product로 두 row가 보인다.\n- 빠르게 두 번 클릭했을 때 기대 수량 2가 아니라 1만 남는다.\n- 코드가 `select -> if null insert -> else quantity++ -> save` 흐름인데 unique constraint나 lock이 없다.\n- 테스트가 단일 thread happy path만 검증한다.\n- unique constraint는 있지만 duplicate key 예외를 사용자 에러로만 처리하고, 기존 row에 수량을 merge하는 경로가 없다.\n- optimistic lock retry가 객체 snapshot을 그대로 재저장해서 최신 quantity를 다시 덮어쓴다.\n\n여기서 실패 모드(failure mode)는 두 가지다. 첫째, 중복 생성(duplicate row)은 uniqueness 문제다. 둘째, 수량 덮어쓰기(lost update)는 같은 row를 두 transaction이 읽고 마지막 write가 이기는 문제다. 둘을 뭉개면 해결책도 흐려진다.\n\n## Merge race 타임라인\n\n대표 race는 다음 순서로 재현된다.\n\n1. T1과 T2가 동시에 `(cart_id=1, product_id=7)` cart item을 조회한다.\n2. 둘 다 row가 없다고 판단한다.\n3. unique constraint가 없으면 둘 다 insert에 성공해서 중복 row가 생긴다.\n4. unique constraint가 있으면 하나는 insert에 성공하고 하나는 duplicate key로 실패한다.\n5. 실패한 요청이 기존 row를 다시 읽어 `quantity = quantity + delta`로 merge하지 않으면 사용자가 기대한 두 번째 추가가 사라진다.\n\n이미 row가 있는 경우도 다르지 않다. T1과 T2가 quantity 1을 읽고 각각 2로 저장하면 최종 값은 2가 되어야 할 상황에서 2가 되지만, 두 번의 증가가 모두 반영되어야 한다면 기대 값은 3이다. 이 경우에는 unique constraint만으로 부족하고 lost update guard가 필요하다.\n\n## 개념 문서 handoff\n\n중복 row 방지는 DB unique constraint가 최종 방어선이다. 애플리케이션 pre-check는 사용자 메시지를 좋게 만들 수 있지만, 동시 요청을 완전히 막는 보장은 아니다. 수량 증가는 낙관적 락(optimistic lock) version CAS, 비관적 락(pessimistic lock), `update quantity = quantity + ? where ...` 같은 원자적 갱신(atomic update), DB별 upsert 중 하나로 설계한다. Upsert는 insert와 merge를 한 경계로 묶을 수 있지만, DB 문법과 충돌 시 응답 계약이 달라진다.\n\nTradeoff는 명확하다. Optimistic lock은 충돌이 드문 경우 처리량이 좋지만 retry UX가 필요하다. Pessimistic lock은 직렬화에 가깝게 만들지만 대기와 deadlock 위험이 있다. Atomic update는 단순 증가에는 강하지만 복잡한 검증 조건을 함께 넣기 어려울 수 있다.\n\n동시성 guard는 최소 두 층으로 잡는다.\n\n- DB invariant: 활성 cart item에 `(cart_id, product_id)` unique constraint를 둔다. soft delete가 있으면 `deleted_at is null` 같은 active predicate와 unique 조건이 일치해야 한다.\n- Merge guard: insert 충돌 시 기존 row를 다시 읽고 수량 delta를 적용하거나, DB upsert로 `quantity = quantity + excluded.quantity` 같은 증가 merge를 수행한다.\n- Lost update guard: 기존 row 업데이트는 version predicate, `select for update`, atomic increment 중 하나로 보호한다.\n- Retry guard: optimistic conflict나 deadlock retry는 최대 횟수와 backoff를 두고, 같은 add command가 두 번 기록되지 않도록 idempotency key나 request token을 검토한다.\n- Test guard: barrier/latch로 두 transaction을 동시에 진입시켜 duplicate row와 lost update를 각각 검증한다.\n\n리뷰 답변에서는 \"service pre-check는 UX이고, DB unique가 최종 방어선이며, quantity merge는 별도 동시성 문제\"라고 분리해서 말하면 좋다.\n\n## Drill 후보\n\n\"같은 상품 row가 두 개 생기는 문제와 수량이 1만 증가하는 문제는 같은 원인인가?\"로 복습한다. 기대 답변은 \"아니다. 하나는 `(cart_id, product_id)` 유일성(uniqueness) 불변식이 DB에 없는 문제이고, 다른 하나는 같은 row의 quantity 갱신 충돌(lost update) 문제다\"이다. 다음에는 `shopping-cart-cart-item-merge-unique-upsert-bridge`와 `shopping-cart-cart-item-quantity-lost-update-version-cas-bridge`를 이어 본다.\n",
+  "aliases": [
+    "shopping cart item quantity merge race",
+    "장바구니 수량 병합 동시성",
+    "cart item duplicate add lost update",
+    "same product add quantity race bridge"
+  ],
+  "expected_queries": [
+    "shopping-cart에서 같은 상품을 동시에 담으면 수량이 틀어질 수 있어?",
+    "cart item quantity 증가를 lost update 없이 처리하려면?",
+    "장바구니 상품 중복 row를 unique constraint로 막아야 해?"
+  ],
+  "symptoms": [
+    "같은 상품을 빠르게 두 번 담으면 row가 두 개 생깁니다",
+    "수량 증가가 마지막 write로 덮여 일부가 사라집니다",
+    "service에서 조회 후 저장만 하고 unique key가 없습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/shopping-cart-cart-item-quantity-lost-update-version-cas-bridge"
+    ],
+    "next_docs": [
+      "database/shopping-cart-cart-item-merge-unique-upsert-bridge",
+      "database/optimistic-pessimistic-lock-interview-drill"
+    ],
+    "confusable_with": [
+      "database/shopping-cart-cart-item-quantity-lost-update-version-cas-bridge",
+      "database/shopping-cart-cart-item-merge-unique-upsert-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/shopping-cart-cart-item-quantity-merge-race-bridge.md",
+    "revision_history": []
+  }
+}

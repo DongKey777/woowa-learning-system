@@ -1,0 +1,46 @@
+{
+  "id": "security/session-fixation-csrf-clickjacking-interview-chooser",
+  "title": "Session Fixation CSRF Clickjacking Interview Chooser",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 chooser는 session fixation, CSRF, clickjacking을 브라우저 세션 공격 면접에서 구분한다.",
+  "body_markdown": "# Session Fixation CSRF Clickjacking Interview Chooser\n\n## 보장 범위\n\n이 chooser는 browser session 주변의 세 가지 공격을 구분한다. Session fixation은 session identifier를 공격자가 통제하는 문제, CSRF는 browser가 인증 cookie를 자동 전송하는 특성을 이용한 cross-site 요청 문제, clickjacking은 frame/overlay를 통한 UI deception 문제다.\n\n이 문서는 \"어떤 방어 하나를 켜면 브라우저 세션 공격이 전부 해결된다\"는 보장을 하지 않는다. 방어는 공격 bucket별로 달라진다. API key leak, OAuth `state`/`nonce`/PKCE, JWT revocation, access token replay와 섞지 않는다. 같은 브라우저 보안 영역처럼 보이지만 관찰 증거와 방어 헤더가 다르다.\n\n## 10초 chooser\n\n| 공격 | 핵심 | 대표 방어 | 방어하지 않는 것 |\n|---|---|---|---|\n| Session fixation | 공격자가 정한 session id를 피해자가 로그인에 사용 | login 후 session id rotation | cross-site form submit, frame overlay |\n| CSRF | 피해자 브라우저가 인증 쿠키를 자동 전송 | CSRF token, SameSite, Origin check | session id 선점, clickjacking |\n| Clickjacking | 투명 iframe 등으로 사용자를 속여 클릭 | `frame-ancestors`, X-Frame-Options | CSRF token 누락, XSS |\n\n선택 질문은 \"공격자가 무엇을 통제하나\"로 시작한다. session id를 통제하면 fixation, authenticated request를 유도하면 CSRF, 사용자의 실제 클릭 대상을 속이면 clickjacking이다.\n\n## 헷갈리는 축\n\nCSRF는 요청이 자동으로 인증되는 브라우저 쿠키 특성을 이용한다. 사용자가 의도하지 않은 요청을 보내게 만드는 문제다.\n\nSession fixation은 로그인 전후 session identifier가 바뀌지 않을 때 위험하다. 공격자가 알고 있는 session id로 피해자가 로그인하면 세션을 탈취할 수 있다.\n\nClickjacking은 UI deception이다. 사용자가 보이는 화면과 실제 클릭 대상이 다르다.\n\n방어도 같은 축으로 분리한다. session id rotation은 CSRF 요청을 막지 않고, CSRF token은 framing 자체를 막지 않는다. `frame-ancestors`는 clickjacking 표면을 줄이지만 token 탈취나 서버 측 권한 검증 실패를 해결하지 않는다.\n\n## 관찰 증거\n\n- Session fixation: 로그인 전 session id와 로그인 후 session id가 같음, URL/path/header로 session id를 주입할 수 있음, 공격자가 알고 있는 id가 인증 후에도 유지됨\n- CSRF: state-changing endpoint가 cross-site form/image/fetch-like 요청을 token 없이 받음, SameSite가 없거나 느슨함, Origin/Referer 검증이 없음\n- Clickjacking: 페이지가 외부 iframe에 로드됨, `Content-Security-Policy: frame-ancestors` 또는 `X-Frame-Options`가 없음, 투명 overlay POC로 버튼 클릭이 가능함\n- 공통 운영 증거: 실패 로그, security header scan, browser devtools/network capture, regression test가 공격별로 분리되어 있음\n\n## 운영 대응\n\n1. Session fixation은 인증 성공과 privilege escalation 시 session id를 재발급하고, old id를 invalidate한다.\n2. Session cookie에는 Secure, HttpOnly, SameSite, 적절한 Domain/Path를 둔다. 단, cookie flag만으로 fixation이 해결되는 것은 아니다.\n3. CSRF는 non-idempotent 요청에 synchronizer token 또는 double-submit token, Origin/Referer 검증, SameSite 정책을 조합한다.\n4. GET 요청이 상태를 바꾸지 않게 만들고, token 검증 실패는 audit 가능한 4xx로 남긴다.\n5. Clickjacking은 `frame-ancestors 'none'` 또는 허용 origin allowlist를 적용하고, legacy browser가 필요하면 `X-Frame-Options`도 고려한다.\n6. iframe 허용이 필요한 결제/관리 화면은 route별 allowlist와 UI 테스트를 따로 둔다.\n\n## 실패 모드와 caveat\n\n- Session fixation: login 후 새 id를 발급해도 old id가 session store에 살아 있으면 탈취 창이 남는다. 분산 session store에서는 old id invalidation 전파 지연도 확인한다.\n- Session fixation: URL rewriting, query parameter, custom header로 session id를 받는 legacy 경로가 남아 있으면 cookie flag만 보고 안전하다고 판단하기 어렵다.\n- CSRF: SameSite `Lax`는 많은 top-level navigation 요청을 줄이지만 모든 state-changing flow를 보장하지 않는다. OAuth, SSO, 결제처럼 cross-site redirect가 필요한 route는 예외 설계와 token 검증을 따로 봐야 한다.\n- CSRF: XSS가 있으면 CSRF token을 읽거나 피해자 origin에서 요청을 만들 수 있다. token이 있으니 XSS 영향이 없다고 말하면 wrong bucket이다.\n- Clickjacking: JavaScript frame-busting은 우회되거나 CSP/XFO보다 일관성이 낮을 수 있다. 보안 판단의 기준은 response header와 실제 iframe 로드 가능 여부다.\n- Clickjacking: `frame-ancestors` allowlist가 너무 넓으면 협력사/서브도메인 compromise가 클릭 유도 표면이 된다. \"우리 도메인 전체 허용\"도 운영상 위험할 수 있다.\n\n## Wrong-bucket neighbor\n\nXSS는 공격자가 page 안에서 script를 실행하는 문제이고, clickjacking은 보통 외부 frame으로 사용자의 클릭을 속이는 문제다. CSP가 둘 다에 관여할 수 있지만 directive가 다르다.\n\nCORS는 \"다른 origin의 script가 response를 읽을 수 있는가\"에 가깝고, CSRF는 \"브라우저가 인증 정보를 붙인 state-changing 요청을 보낼 수 있는가\"에 가깝다. CORS allowlist를 좁혔다고 해서 form 기반 CSRF가 자동으로 사라지는 것은 아니다.\n\nOAuth `state`는 login CSRF/authorization response mix-up을 줄이는 장치지만, 일반 업무 endpoint의 CSRF token을 대체하지 않는다. JWT access token replay나 refresh token 탈취는 session fixation bucket이 아니라 token lifecycle과 storage bucket에서 다룬다.\n\n## 흔한 오해\n\n- SameSite가 있으면 session fixation이 해결된다고 말하면 안 된다. fixation은 login 후 id rotation이 핵심이다.\n- CSRF token이 clickjacking을 막는다고 보면 부족하다. clickjacking은 사용자가 실제로 클릭하게 만드는 UI 문제다.\n- Clickjacking을 XSS로 설명하면 관찰 증거가 달라진다. script 실행 여부가 아니라 framing 가능 여부를 본다.\n- CORS 설정은 CSRF의 주 방어가 아니다. browser가 cookie를 붙여 보내는 form submit류 요청을 별도로 봐야 한다.\n\n## Safe Next Docs\n\nCSRF 방어 비교는 `csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge`, CSP/XSS는 `csp-xss-defense-interview-primer`로 이어진다.\n",
+  "aliases": [
+    "session fixation csrf clickjacking chooser",
+    "세션 고정 CSRF 클릭재킹 차이",
+    "browser session attack comparison",
+    "로그인 후 세션 공격 면접"
+  ],
+  "expected_queries": [
+    "Session fixation과 CSRF와 clickjacking 차이가 뭐야?",
+    "로그인 보안 면접에서 브라우저 공격을 어떻게 구분해?",
+    "SameSite와 frame-ancestors는 각각 어떤 공격을 줄여?"
+  ],
+  "symptoms": [
+    "모든 브라우저 공격을 CSRF라고 부릅니다",
+    "로그인 후 session id rotate 필요성을 놓칩니다",
+    "clickjacking을 XSS 방어로 설명합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/session-fixation-clickjacking-csp"
+    ],
+    "next_docs": [
+      "security/csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge",
+      "security/csp-xss-defense-interview-primer"
+    ],
+    "confusable_with": [
+      "security/csrf-vs-samesite-session-cookie-chooser",
+      "security/csp-xss-defense-interview-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/session-fixation-csrf-clickjacking-interview-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "spring/webflux-vs-mvc",
+  "title": "Spring MVC vs WebFlux",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "'이 문서는 Spring MVC의 servlet thread-per-request model과 WebFlux의 reactive event-loop,",
+  "body_markdown": "# Spring MVC vs WebFlux\n\n> 한 줄 요약: Spring MVC는 요청마다 스레드를 쓰는 단순한 모델이고, WebFlux는 적은 수의 이벤트 루프 스레드로 많은 연결을 다루기 위해 backpressure까지 포함한 비동기 모델이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring MVC 요청 생명주기](./spring-mvc-request-lifecycle.md)\n> - [Spring Security 아키텍처](./spring-security-architecture.md)\n> - [Spring MVC `SseEmitter` vs WebFlux SSE Timeout Behavior](./spring-mvc-sseemitter-vs-webflux-sse-timeout-behavior.md)\n> - [Spring Reactive-Blocking Bridge: `block()`, `boundedElastic`, and Boundary Traps](./spring-reactive-blocking-bridge-boundedelastic-block-traps.md)\n> - [I/O 모델과 이벤트 루프](../operating-system/io-models-and-event-loop.md)\n> - [컨텍스트 스위칭, 데드락, lock-free](../operating-system/context-switching-deadlock-lockfree.md)\n> - [HTTP의 무상태성과 쿠키, 세션, 캐시](../network/http-state-session-cache.md)\n\nretrieval-anchor-keywords: Spring MVC vs WebFlux, thread per request, event loop model, reactive backpressure, blocking call in WebFlux, ThreadLocal in WebFlux, servlet vs reactive stack, Reactor context propagation, WebFlux event loop blocked, when to choose WebFlux, WebFlux SSE, SseEmitter vs WebFlux SSE, Flux<ServerSentEvent>, reactive cancellation, servlet async timeout vs reactive stream lifetime\n\n---\n\n## 핵심 개념\n\nSpring MVC와 WebFlux의 차이는 단순히 \"동기 vs 비동기\"가 아니다. 더 정확히는 **서버가 요청을 처리하기 위해 스레드를 어떻게 쓰는가**의 차이다.\n\nSpring MVC는 전형적인 `thread-per-request` 모델이다.\n\n- 요청 하나가 들어오면 보통 스레드 하나가 그 요청을 끝까지 처리한다.\n- 서블릿 기반이라 기존 Spring 생태계와 궁합이 좋다.\n- 블로킹 I/O와 JDBC 같은 전통적인 기술과 자연스럽게 맞는다.\n\nWebFlux는 Reactor 기반의 리액티브 스택이다.\n\n- 적은 수의 event-loop 스레드가 많은 연결을 multiplexing한다.\n- 데이터가 준비되는 대로 비동기적으로 흘려보낸다.\n- `Publisher`/`Subscriber` 사이의 backpressure로 소비 속도를 제어한다.\n\n중요한 점은 WebFlux가 항상 더 빠른 게 아니라는 것이다.\n대기 시간이 긴 외부 I/O가 많고, 동시 연결 수가 크고, 블로킹을 피할 수 있을 때 의미가 커진다.\n\n---\n\n## 깊이 들어가기\n\n### 1. MVC는 스레드를 점유한다\n\nSpring MVC의 기본 모델은 이해하기 쉽다.\n\n1. 요청이 들어온다.\n2. 스레드 하나가 컨트롤러를 호출한다.\n3. JDBC, REST 호출, 파일 I/O 같은 작업을 끝까지 기다린다.\n4. 응답을 만든다.\n\n이 구조의 장점은 단순성이다.\n\n- 디버깅이 쉽다\n- Java 스택 트레이스를 읽기 쉽다\n- `ThreadLocal`, `SecurityContext`, `MDC` 같은 기존 패턴이 잘 맞는다\n- 동기 코드와 레거시 라이브러리 재사용이 쉽다\n\n단점은 요청 수가 많아질수록 스레드가 병목이 된다는 점이다.\n스레드는 공짜가 아니고, 너무 많이 늘리면 컨텍스트 스위칭과 메모리 사용이 커진다.\n\n### 2. WebFlux는 event-loop 위에서 동작한다\n\nWebFlux의 대표 실행 모델은 Netty 기반 event-loop다.\n\n- 소수의 이벤트 루프 스레드가 소켓 이벤트를 감시한다.\n- 논블로킹 I/O가 준비되면 콜백 체인으로 이어진다.\n- 스레드를 오래 점유하는 작업이 있으면 전체 루프가 막힌다.\n\n이 구조를 제대로 쓰려면 \"빨리 끝나는 코드\"가 아니라 \"잠기지 않는 코드\"를 써야 한다.\n\n여기서 관련되는 OS 개념이 [I/O 모델과 이벤트 루프](../operating-system/io-models-and-event-loop.md)다.\nWebFlux를 쓰면서 내부에서 블로킹 호출을 해버리면 이벤트 루프 모델의 장점이 사라진다.\n\n### 3. backpressure는 느린 소비자를 보호한다\n\n리액티브 스트림의 핵심은 생산 속도와 소비 속도를 맞추는 것이다.\n\n예를 들어 DB에서 데이터를 읽어와서 HTTP로 흘려보내는 상황을 생각해보자.\n\n- 생산자가 너무 빠르면 버퍼가 터진다.\n- 소비자가 너무 느리면 지연이 쌓인다.\n- backpressure는 \"이만큼만 더 보내라\"는 신호로 이를 조절한다.\n\nReactor에서는 대략 이런 흐름으로 이해하면 된다.\n\n```text\nPublisher -> Subscriber\n             ^       |\n             | request(n)\n```\n\n이 개념은 대용량 스트리밍, SSE, 이벤트 전파 같은 상황에서 특히 중요하다.\n\n### 4. ThreadLocal이 항상 통하지 않는다\n\nMVC에서는 요청당 스레드가 상대적으로 고정적이라 `ThreadLocal`과 `SecurityContextHolder`가 잘 맞는다.\nWebFlux에서는 스레드가 바뀌기 쉬워서 같은 방식이 기대대로 동작하지 않을 수 있다.\n\n그래서 다음 같은 습관이 위험해진다.\n\n- 비즈니스 정보를 `ThreadLocal`에 숨겨두는 방식\n- 블로킹 라이브러리를 몰래 섞는 방식\n- MDC 로깅이 자동으로 유지된다고 가정하는 방식\n\nWebFlux에서는 context 전파와 비동기 체인에 맞는 설계가 필요하다.\n\n### 5. MVC와 WebFlux는 데이터 접근 방식도 다르게 봐야 한다\n\nWebFlux는 풀 리액티브 스택을 쓸 때 가장 의미가 있다.\n\n- `WebClient`\n- reactive database driver\n- reactive repository\n- non-blocking HTTP client/server\n\n반대로 WebFlux 컨트롤러 안에서 JDBC를 호출하면, 결국 블로킹 호출을 event-loop 위에 얹는 셈이다.\n그건 스레드 모델만 복잡하게 만들고 이점을 깎는다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 블로킹 호출 때문에 WebFlux가 느려진다\n\n```java\n@RestController\npublic class FeedController {\n    private final LegacyFeedRepository repository;\n\n    public FeedController(LegacyFeedRepository repository) {\n        this.repository = repository;\n    }\n\n    @GetMapping(\"/feed\")\n    public Mono<List<FeedItem>> feed() {\n        return Mono.fromSupplier(repository::findLatestFeed); // 내부가 JDBC면 블로킹\n    }\n}\n```\n\n이 코드는 겉으로는 reactive지만, 내부가 블로킹이면 event-loop를 잡아먹을 수 있다.\n이 경우 WebFlux를 쓴 이유가 약해진다.\n\n### 시나리오 2: 동시 연결이 많고 응답이 대기 시간에 묶인다\n\n예를 들어 SSE나 외부 API fan-out이 많은 대시보드, 알림 서버, proxy형 API에서는 WebFlux가 이득이 될 수 있다.\n\n이때 중요한 것은 처리량만이 아니라 다음이다.\n\n- 연결 유지 비용\n- 느린 클라이언트에 대한 버퍼링\n- timeout과 backpressure 정책\n- 외부 서비스 지연에 대한 격리\n\n### 시나리오 3: 디버깅이 어려워진다\n\n리액티브 체인은 스택이 한 줄로 쭉 보이지 않는 경우가 많다.\n\n- 에러가 다른 스레드와 시점에서 전파된다\n- 로그 순서가 코드 순서와 다를 수 있다\n- `block()`을 어디선가 호출하면 병목을 찾기 어렵다\n\n운영에서 이건 실제 비용이다. \"코드가 멋있다\"와 \"장애 때 빨리 원인을 찾는다\"는 다르다.\n\n---\n\n## 코드로 보기\n\n### MVC 예시\n\n```java\n@RestController\npublic class OrderController {\n    private final OrderService orderService;\n\n    public OrderController(OrderService orderService) {\n        this.orderService = orderService;\n    }\n\n    @GetMapping(\"/orders/{id}\")\n    public OrderResponse get(@PathVariable Long id) {\n        Order order = orderService.findById(id); // 스레드가 여기서 기다린다\n        return new OrderResponse(order.getId(), order.getStatus());\n    }\n}\n```\n\n### WebFlux 예시\n\n```java\n@RestController\npublic class ReactiveOrderController {\n    private final ReactiveOrderService orderService;\n\n    public ReactiveOrderController(ReactiveOrderService orderService) {\n        this.orderService = orderService;\n    }\n\n    @GetMapping(\"/orders/{id}\")\n    public Mono<OrderResponse> get(@PathVariable Long id) {\n        return orderService.findById(id)\n                .map(order -> new OrderResponse(order.getId(), order.getStatus()));\n    }\n}\n```\n\n### backpressure 감각 예시\n\n```java\nFlux.range(1, 100)\n    .onBackpressureBuffer(10)\n    .publishOn(Schedulers.boundedElastic())\n    .subscribe(System.out::println);\n```\n\n이런 코드는 단순 예시지만, 핵심은 \"무한정 밀어 넣지 않는다\"는 점이다.\n실서비스에서는 버퍼 정책, drop 정책, timeout을 함께 정해야 한다.\n\n---\n\n## 잘못된 선택 신호\n\n| 상황 | MVC가 더 자연스러운 경우 | WebFlux가 더 자연스러운 경우 |\n|---|---|---|\n| JDBC/JPA 중심 CRUD | 대부분 여기에 해당한다 | reactive adapter만 얹으면 이득이 작다 |\n| 긴 polling/SSE/streaming 연결 | servlet async로도 가능하지만 thread/timeout을 따져야 한다 | 연결 수가 많고 backpressure가 중요하면 후보 |\n| 외부 API fan-out이 많다 | 동시성이 낮으면 단순한 MVC + timeout으로 충분 | 비동기 조합과 cancellation이 중요하면 후보 |\n| 팀 디버깅 역량 | thread dump/MDC 중심 운영에 맞다 | Reactor context와 operator chain 관측이 가능해야 한다 |\n| 성능 목표 | latency가 DB 쿼리와 lock에 묶이면 MVC부터 고친다 | wait-heavy I/O에서 thread 효율이 목표일 때 본다 |\n\n## 실패 매트릭스\n\n| 증상 | 보통 원인 | 고치는 방향 |\n|---|---|---|\n| WebFlux 도입 후 오히려 느려졌다 | event-loop 안의 blocking call | `boundedElastic` 격리보다 blocking dependency 제거를 먼저 본다 |\n| 로그의 request id가 사라진다 | ThreadLocal/MDC 의존 | Reactor context propagation으로 옮긴다 |\n| backpressure 설정 후 데이터가 누락된다 | drop/buffer 정책 의미를 제품 계약과 맞추지 않았다 | drop 가능한 이벤트와 보존해야 할 이벤트를 나눈다 |\n| MVC에서 SSE가 자주 끊긴다 | async timeout/proxy idle timeout 계약 부재 | heartbeat, idle timeout, reconnect 정책을 명시한다 |\n| reactive chain 테스트가 읽기 어렵다 | operator가 유스케이스 의미를 가린다 | step verifier와 service boundary를 작게 유지한다 |\n\n면접 답변에서는 \"WebFlux가 더 최신이라 선택\"이 아니라, \"대기 시간이 긴 I/O와 많은 동시 연결을 적은 스레드로 다루기 위해 선택하지만 blocking 의존성이 있으면 이점이 사라진다\"고 말해야 한다.\n\n---\n\n## chooser 역할 구조 체크\n\n| 축 | 이 문서에서의 기준 |\n|---|---|\n| wrong-bucket / 오선택 | \"비동기니까 WebFlux\" 또는 \"JPA가 있으니 무조건 MVC\"처럼 병목과 운영 역량을 보지 않는 선택이다. |\n| 흔한 오해 | WebFlux는 항상 더 빠르고, MVC는 streaming을 못 하고, backpressure는 옵션 이름만 켜면 된다는 생각이다. |\n| 재현 조건 | JDBC/JPA, 외부 fan-out, SSE, proxy idle timeout, 많은 동시 연결, 느린 consumer가 함께 있는 서비스에서 재현된다. |\n| failure matrix | event-loop blocking, ThreadLocal 소실, buffer 폭증, SSE timeout, reactive test 난독화를 따로 본다. |\n| 검증/validation | blockhound/thread dump, operator chain trace, connection 수, buffer/drop metric, async timeout 설정을 확인한다. |\n| 관찰 증거 | DB driver 종류, `block()` 호출, Reactor scheduler 사용, MDC 전파 방식, proxy/SSE timeout 로그를 본다. |\n| 1차 분기 | CRUD/JDBC 중심인지, wait-heavy I/O와 streaming이 핵심인지, 팀이 reactive 운영을 감당할 수 있는지부터 나눈다. |\n| 기대 답변 축 | 병목, 실행 모델, 데이터 접근 방식, 운영 관측, 실패 시 fallback 비용을 순서대로 설명한다. |\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Spring MVC | 단순, 안정적, 디버깅 쉬움 | 대량 동시 연결에서 스레드 비용이 커짐 | 일반 CRUD, 레거시 통합, JDBC 중심 서비스 |\n| WebFlux | 적은 스레드로 많은 연결 처리, 스트리밍에 유리 | 학습 곡선, 디버깅 비용, 블로킹 호환성 문제 | SSE, proxy, fan-out, 높은 동시성 I/O |\n| MVC + 일부 비동기 | 점진적 도입 쉬움 | 모델이 섞여 복잡해질 수 있음 | 기존 시스템을 점진적으로 개선할 때 |\n| 완전 reactive stack | 일관성 있는 비동기 흐름 | 전면 교체 비용이 큼 | 새로 시작하거나 비동기 경로가 핵심일 때 |\n\n선택 기준은 보통 이렇다.\n\n- 데이터 접근이 대부분 JDBC와 동기 라이브러리인가\n- 동시 연결 수가 정말 많고 대기가 긴가\n- 팀이 reactive 디버깅을 감당할 수 있는가\n- 운영에서 thread dump보다 reactive chain 관찰이 더 중요한가\n\n---\n\n## 꼬리질문\n\n> Q: WebFlux를 쓰면 무조건 더 빠른가?\n> 의도: 성능을 \"스레드 수\" 하나로만 보지 않는지 확인\n> 핵심: 블로킹 호출이 섞이면 이점이 사라지고, 팀 생산성까지 포함해서 봐야 한다\n\n> Q: event-loop에서 블로킹 호출을 하면 왜 위험한가?\n> 의도: event-loop의 공유성 이해 여부 확인\n> 핵심: 적은 수의 스레드가 많은 연결을 처리하므로 하나가 막히면 전체 처리량이 흔들린다\n\n> Q: backpressure는 왜 필요한가?\n> 의도: 단순 비동기가 아니라 흐름 제어를 이해하는지 확인\n> 핵심: 생산자와 소비자의 속도 차이를 제어하지 않으면 버퍼 폭증이나 지연 누적이 생긴다\n\n> Q: WebFlux에서 `ThreadLocal`이 덜 잘 맞는 이유는?\n> 의도: 기존 Spring 관성에서 벗어났는지 확인\n> 핵심: 요청 처리 중 스레드가 바뀔 수 있어 전통적인 스레드 바인딩이 기대대로 유지되지 않는다\n\n## 한 줄 정리\n\nSpring MVC는 단순하고 운영이 쉽다. WebFlux는 동시 연결과 스트리밍에 강하지만, 블로킹 I/O와 섞이면 장점이 사라지고 디버깅 비용이 커진다.\n",
+  "aliases": [
+    "Spring MVC vs WebFlux",
+    "servlet thread per request",
+    "reactive event loop backpressure",
+    "WebFlux nonblocking model",
+    "MVC blocking model",
+    "boundedElastic blocking bridge",
+    "@GetMapping",
+    "@PathVariable",
+    "@RestController"
+  ],
+  "expected_queries": [
+    "Spring MVC와 WebFlux는 thread model과 backpressure가 어떻게 달라?",
+    "WebFlux를 쓰면 blocking DB나 external API 호출이 자동으로 빨라져?",
+    "servlet thread per request와 reactive event loop 모델을 비교해줘",
+    "SSE streaming에서 MVC SseEmitter와 WebFlux는 timeout 해석이 어떻게 달라?"
+  ],
+  "symptoms": [
+    "`Spring MVC vs WebFlux`에서 선택 기준을 기술명이나 익숙함으로만 정하고 요구사항 축을 세우지 못한다",
+    "`Spring MVC vs WebFlux`와 가까운 선택지를 같은 문제로 보고 잘못된 문서나 해법으로 이동한다",
+    "`Spring MVC vs WebFlux`를 적용한 뒤 확인해야 할 운영 지표, 반례, 실패 조건을 놓친다",
+    "JDBC나 blocking client를 WebFlux event loop에 올려도 자동으로 빨라진다고 생각해 `boundedElastic`, backpressure, thread model 검증을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-di-basics"
+    ],
+    "next_docs": [
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer"
+    ],
+    "confusable_with": [
+      "spring/webclient-vs-resttemplate",
+      "spring/reactive-blocking-bridge-boundedelastic-block-traps",
+      "spring/mvc-sseemitter-vs-webflux-sse-timeout-behavior",
+      "spring/mockmvc-vs-webtestclient-beginner-bridge",
+      "operating-system/sync-async-blocking-nonblocking-basics",
+      "language/virtual-thread-reactive-db"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-webflux-vs-mvc.md",
+    "revision_history": []
+  }
+}

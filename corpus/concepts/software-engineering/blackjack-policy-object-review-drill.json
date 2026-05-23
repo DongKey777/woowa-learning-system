@@ -1,0 +1,46 @@
+{
+  "id": "software-engineering/blackjack-policy-object-review-drill",
+  "title": "Blackjack Policy Object Review Drill",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "이 drill은 blackjack dealer rule을 policy object로 분리하는 책임 배치 감각을 복습한다.",
+  "body_markdown": "# Blackjack Policy Object Review Drill\n\n## 한 줄 요약\n\n> 이 drill은 \"`dealer score <= 16`을 service에 둬도 되는가?\"를 묻는 문제가 아니라, raw score 조건이 application flow에 새는지 보고 `DealerDrawingPolicy`가 맡을 순수 판단과 service에 남길 orchestration을 구분하는 연습이다.\n\n## 미션 장면\n\nBlackjack 미션에서 `GameService`가 라운드 진행, 딜러 카드 뽑기, 승패 판정까지 한 method 안에서 처리한다고 하자. 그 안에 \"dealer score가 16 이하이면 hit, 17 이상이면 stand\"라는 규칙이 직접 들어 있다.\n\n```java\npublic void playDealerTurn(Round round) {\n    Dealer dealer = round.dealer();\n\n    while (dealer.score() <= 16) {\n        dealer.receive(deck.draw());\n    }\n\n    for (Player player : round.players()) {\n        Result result = decideWinner(player.score(), dealer.score());\n        results.add(result);\n    }\n}\n```\n\n이 장면은 정책 객체(policy object) 분리 여부를 묻기 좋다. 규칙이 단순해 보여도, 테스트가 전체 게임 흐름을 요구한다면 책임이 붙어 있는 신호다. 특히 `score() <= 16`처럼 primitive 조건이 service에 직접 노출되면, service는 흐름 조합자와 규칙 판정자 역할을 동시에 하게 된다.\n\n## 리뷰 냄새\n\n리뷰 냄새는 딜러 점수 조건, deck draw, bust 처리, winner decision이 같은 branch에 있는 것이다. 이러면 딜러 기준을 확인하려고 player fixture, shuffled deck, round end state까지 준비해야 한다. Player decision과 Dealer rule이 같은 method에 있으면 \"사용자가 선택한 행동\"과 \"게임이 자동으로 수행하는 규칙\"도 섞인다.\n\n기준 점수만 상수로 빼고 service if가 그대로 남아 있으면 분리 효과는 작다.\n\n```java\nprivate static final int DEALER_DRAW_LIMIT = 16;\n\nwhile (dealer.score() <= DEALER_DRAW_LIMIT) {\n    dealer.receive(deck.draw());\n}\n```\n\n이 코드는 magic number만 줄였을 뿐, service가 여전히 raw score를 읽고 비교 연산을 수행한다. 리뷰에서 말하는 핵심은 숫자 이름이 아니라 \"딜러가 더 뽑아야 하는가\"라는 도메인 질문이 service에 새어 있다는 점이다.\n\n## 질문\n\n`GameService` 안의 딜러 hit/stand 규칙을 `DealerDrawingPolicy`로 분리할 때 얻는 이점을 말해봐. 그리고 policy가 맡지 말아야 할 책임도 하나 말해봐.\n\n추가로 아래 세 줄을 어디에 두는지 분류해봐.\n\n| 코드 조각 | service에 남길까, policy/domain으로 보낼까? |\n|---|---|\n| `dealer.score() <= 16` | ? |\n| `dealer.receive(deck.draw())` | ? |\n| `decideWinner(player.score(), dealer.score())` | ? |\n\n## 기대 답변 축\n\n기대 답변은 딜러 판단 기준을 이름 있는 객체로 분리하면 service가 게임 흐름 orchestration에 집중하고, 딜러 손패만으로 독립 테스트할 수 있다는 것이다.\n\n좋은 답변은 네 축을 포함한다.\n\n| 축 | 포함되어야 할 내용 |\n|---|---|\n| policy 책임 | `shouldDraw(Hand dealerHand)` 또는 `shouldHit(Hand dealerHand)`처럼 딜러 손패를 보고 hit/stand만 판단한다 |\n| service 책임 | policy가 true인 동안 deck에서 카드를 뽑아 dealer에게 주는 흐름을 조합한다 |\n| primitive leakage | `score <= 16` 비교가 service에 남으면 threshold와 비교 연산이 application layer에 샌 것이다 |\n| 분리된 결과 판정 | winner decision은 draw policy와 다른 변경 이유이므로 `WinnerPolicy`나 result policy 후보로 둔다 |\n\n예시 답변:\n\n```text\nDealerDrawingPolicy는 딜러 손패를 보고 더 뽑을지 판단한다.\nGameService는 그 판단을 사용해서 카드를 지급하는 반복 흐름만 진행한다.\n정책 객체가 deck을 직접 draw하거나 round state를 바꾸면 service 책임을 다시 먹는 것이므로 피한다.\n승패 판정은 dealer draw 기준과 다른 규칙이므로 별도 WinnerPolicy로 나누는 편이 좋다.\n```\n\n세 줄 분류는 이렇게 본다.\n\n| 코드 조각 | 위치 | 이유 |\n|---|---|---|\n| `dealer.score() <= 16` | policy/domain rule | 딜러 자동 draw 기준이라는 도메인 판정이다 |\n| `dealer.receive(deck.draw())` | service/use case flow | 카드 지급이라는 상태 변화와 deck 진행을 조합한다 |\n| `decideWinner(player.score(), dealer.score())` | 별도 winner/result policy 후보 | draw 여부와 다른 결과 해석 규칙이다 |\n\n## 채점 루브릭\n\n| 수준 | 답변 신호 |\n|---|---|\n| 약함 | \"if문이 길어져서 객체로 뺀다\" 정도로만 말한다 |\n| 보통 | service는 흐름, policy는 판단이라고 구분한다 |\n| 좋음 | raw score와 threshold 비교가 service에 새는 primitive conditional leakage를 짚는다 |\n| 매우 좋음 | dealer draw policy, score/domain invariant, winner policy, application orchestration을 서로 다른 변경 이유로 나눈다 |\n\n## 흔한 실수와 복습 연결\n\n흔한 실수는 policy object를 만들었지만 내부에서 deck을 직접 조작하게 하는 것이다. 그러면 `DealerDrawingPolicy`가 판단 객체가 아니라 또 다른 domain service처럼 커진다. 또 strategy와 policy 이름 맞히기에만 집중하고 테스트 준비가 줄었는지 확인하지 않는 것도 약점이다.\n\n답이 약하면 `blackjack-dealer-policy-object-bridge`와 `policy-object-vs-strategy-map-beginner-bridge`를 다시 본다. 약점 태그는 `policy-object`, `service-bloat`, `rule-placement`, `primitive-conditional-leakage`다.\n\n## 후속 질문\n\n1. `DealerDrawingPolicy`가 `int dealerScore`를 받는 것과 `Hand dealerHand`를 받는 것 중 어떤 쪽이 leakage를 덜 만들까?\n2. soft 17 규칙이 추가되면 어떤 테스트가 깨져야 하고, 어떤 service 테스트는 그대로여야 할까?\n3. `WinnerPolicy`와 `DealerDrawingPolicy`를 한 객체로 합치면 어떤 변경 이유가 섞일까?\n",
+  "aliases": [
+    "blackjack policy object review drill",
+    "블랙잭 policy object 드릴",
+    "dealer rule placement review drill",
+    "딜러 규칙 책임 복습"
+  ],
+  "expected_queries": [
+    "blackjack dealer rule policy object 드릴 내줘",
+    "딜러 16 hit 17 stand 규칙을 어디에 둘지 복습하고 싶어",
+    "Blackjack policy object 질문 풀어볼래"
+  ],
+  "symptoms": [
+    "GameService에 hit/stand if문이 커집니다",
+    "Player와 Dealer 규칙이 같은 method에 있습니다",
+    "winner decision과 dealer decision이 섞입니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/blackjack-dealer-policy-object-bridge"
+    ],
+    "next_docs": [
+      "design-pattern/policy-object-vs-strategy-map-beginner-bridge",
+      "software-engineering/service-usecase-vs-domain-rule-placement-drill"
+    ],
+    "confusable_with": [
+      "software-engineering/blackjack-dealer-policy-object-bridge",
+      "design-pattern/policy-object-vs-strategy-map-beginner-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/blackjack-policy-object-review-drill.md",
+    "revision_history": []
+  }
+}

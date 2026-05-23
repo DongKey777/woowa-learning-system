@@ -1,0 +1,51 @@
+{
+  "id": "system-design/payment-webhook-idempotency-reconciliation-drill",
+  "title": "Payment Webhook Idempotency Reconciliation Drill",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Payment Webhook Idempotency Reconciliation Drill\n\n> 한 줄 요약: webhook은 \"한 번 온 HTTP 요청\"이 아니라 \"같은 사실이 다시 배달될 수 있는 외부 이벤트\"다.\n\n**난이도: Intermediate**\n\n## 관찰 기준\n\n학습자가 \"PG webhook을 두 번 받으면 주문도 두 번 바뀌나요?\"라고 묻는다면 HTTP handler보다 delivery semantics를 먼저 본다.\n대부분의 결제 webhook은 at-least-once delivery에 가깝다.\n같은 event가 재전송될 수 있고, 승인/취소/환불 event가 기대한 순서로 오지 않을 수도 있다.\n\n관찰 증거는 provider event id, payment key, merchant order id, idempotency key, raw payload hash, signature verification 결과, 내부 inbox/ledger 상태, order/payment state transition log다.\n핵심 불변식은 둘이다.\n첫째, 같은 provider event가 내부 side effect를 두 번 만들지 않는다.\n둘째, 외부에서 성공한 결제를 내부가 놓쳤다면 reconciliation으로 결국 찾아 보정할 수 있다.\n\n## 문제 1: 중복 webhook\n\n상황:\n\n```text\nT1: providerEventId=evt_100, paymentKey=pay_10, type=PAYMENT_CAPTURED webhook 도착\nT2: 내부 order.confirm() 성공, 200 OK 응답\nT3: 네트워크 문제로 PG가 같은 evt_100을 다시 전송\n```\n\n틀린 답:\n\n\"이미 주문이 PAID니까 그냥 200 OK를 보내면 된다\"는 답은 절반만 맞다.\n주문 상태만 보고 무시하면 같은 provider event를 실제로 처리했는지, payload가 같은지, replay인지 변조인지 확인할 근거가 약하다.\n\n기대 답:\n\n`providerEventId`나 provider가 보장하는 delivery id를 inbox/ledger unique key로 저장한다.\n처음 온 event는 raw payload hash와 함께 durable하게 저장하고, 상태 전이 guard를 통과할 때만 주문 확정 side effect를 만든다.\n두 번째 evt_100은 dedup hit로 기록하고, 주문 확정/재고 차감/영수증 발행은 다시 실행하지 않는다.\n응답은 replay-safe하게 200 OK를 줄 수 있지만, \"중복 수신\" metric과 ledger 조회 가능성이 남아야 한다.\n\n확인 질문:\n\n- 같은 `providerEventId`가 다시 오면 어떤 unique constraint가 막는가?\n- 첫 처리와 중복 처리의 응답 body/status는 같아야 하는가?\n- provider event id가 없거나 재사용될 수 있다면 대체 dedup key를 무엇으로 잡을 것인가?\n\n## 문제 2: 200 OK와 durable acceptance\n\n상황:\n\n```text\nWebhook handler가 signature 검증을 통과한 뒤 바로 200 OK를 보낸다.\n그 다음 inbox insert를 시도했지만 DB timeout으로 실패했다.\nPG는 200 OK를 받았으므로 더 이상 retry하지 않는다.\n```\n\n틀린 답:\n\n\"어차피 reconciliation job이 있으니 괜찮다\"는 답은 위험하다.\nReconciliation은 누락을 줄이는 안전망이지, 정상 수신 경로에서 증거를 잃어도 된다는 허가가 아니다.\n\n기대 답:\n\n200 OK는 최소한 raw payload, provider event id, payment key, signature verification result, received_at이 inbox나 ledger에 commit된 뒤 보내야 한다.\n이 경계를 durable acceptance라고 본다.\n이후 주문 반영 worker가 실패하더라도 inbox row가 남아 있으므로 retry, DLQ, manual review로 이어질 수 있다.\n반대로 durable write 전에 200 OK를 보내면 provider retry도 내부 재처리 근거도 잃을 수 있다.\n\n확인 질문:\n\n- 200 OK 전에 반드시 commit돼야 하는 최소 row는 무엇인가?\n- Inbox insert는 성공했지만 order projection이 실패하면 handler는 어떤 상태를 남기는가?\n- DB timeout이 나면 provider에게 5xx를 보내 retry를 유도할 것인가, 아니면 별도 recover path가 있는가?\n\n## 문제 3: Out-of-order webhook과 state machine\n\n상황:\n\n```text\nT1: PAYMENT_REFUNDED webhook이 먼저 도착했다.\nT2: 내부 order는 아직 PENDING이고, PAYMENT_CAPTURED webhook은 지연 중이다.\nT3: 잠시 뒤 PAYMENT_CAPTURED webhook이 도착했다.\n```\n\n틀린 답:\n\n\"마지막으로 온 webhook 상태가 최신이니 order를 PAID로 바꾼다\"는 답은 out-of-order delivery를 무시한다.\n도착 순서와 provider에서의 발생 순서는 다를 수 있다.\n\n기대 답:\n\nProvider event의 발생 시각, sequence, provider transaction state, payment key를 보고 상태 전이를 검증한다.\n내부 state machine은 `PENDING -> PAID -> REFUNDED` 같은 허용 경로와 `REFUNDED -> PAID` 같은 금지 경로를 명시해야 한다.\n먼저 온 refund가 내부에서 아직 적용 불가능하면 ledger에는 저장하되 `WAITING_FOR_CAPTURE_FACT`나 manual review 상태로 둔다.\n나중에 capture fact가 도착하면 같은 payment key의 ledger를 재평가해 capture와 refund를 순서대로 projection한다.\n\n확인 질문:\n\n- Webhook 도착 시각과 provider event 발생 시각 중 무엇을 전이 기준으로 삼는가?\n- 이미 `REFUNDED`인 결제에 늦은 `CAPTURED`가 오면 side effect를 만들 수 있는가?\n- 처리 불가능한 event를 버릴 것인가, pending ledger로 남길 것인가?\n\n## 문제 4: 승인 API timeout과 provider retry\n\n```text\nClient가 결제 승인 API를 호출했다.\n우리 서버가 PG approve API를 호출했고, 응답을 받기 전에 timeout이 났다.\n사용자는 다시 결제 버튼을 눌렀고, 같은 orderId와 idempotency key로 재시도했다.\nPG dashboard에는 첫 approve가 CAPTURED로 보인다.\n```\n\n틀린 답:\n\n\"Timeout이면 실패니까 PG approve를 다시 호출한다\"는 답은 중복 승인 위험이 있다.\nTimeout은 외부 결제가 실패했다는 뜻이 아니라, 결과를 모른다는 뜻이다.\n\n기대 답:\n\n재시도 요청은 먼저 idempotency record를 조회한다.\n기존 operation이 `PROCESSING`이나 `UNKNOWN`이면 provider payment key/order id로 PG 상태 조회를 하거나 기존 결과 확정까지 대기한다.\nPG가 `CAPTURED`라고 말하면 새 approve 호출을 만들지 않고 ledger에 provider state를 기록한 뒤 내부 주문 확정을 idempotent하게 재개한다.\nPG에 거래가 없거나 명확히 실패일 때만 같은 idempotency envelope 안에서 retry 정책을 적용한다.\n\n확인 질문:\n\n- `timeout`을 `FAILED`로 저장할 것인가, `UNKNOWN/PROCESSING`으로 저장할 것인가?\n- 같은 idempotency key 재시도에서 외부 approve API를 다시 호출하기 전 어떤 조회를 해야 하는가?\n- 사용자에게 \"결제 중\", \"결제 완료\", \"다시 시도 가능\"을 어떤 상태 계약으로 보여 줄 것인가?\n\n## 문제 5: Reconciliation window와 audit trail\n\n상황:\n\n```text\n매일 03:00 PG 정산 파일을 받는다.\n정산 파일에는 paymentKey=pay_77 CAPTURED 29000원이 있는데 내부 order는 PENDING이다.\nLedger에는 webhook 수신 기록이 없고, approve timeout 기록만 있다.\n```\n\n틀린 답:\n\n\"정산 파일이 맞으니 order.status만 PAID로 update한다\"는 답은 audit trail을 끊는다.\n운영자는 나중에 왜 보정됐는지, 어떤 외부 근거로 바뀌었는지 설명할 수 없다.\n\n기대 답:\n\nReconciliation job은 mismatch row를 만들고, provider snapshot과 정산 파일 근거를 ledger에 append한다.\n금액, 통화, order id, payment key가 내부 주문과 일치하는지 확인한 뒤 자동 보정 가능하면 state machine을 통해 `PENDING -> PAID`를 실행한다.\n금액 불일치나 order mapping 불명확 같은 위험이 있으면 manual review queue로 보낸다.\n보정 결과에는 job id, provider file id, detected_at, resolved_at, actor, before/after state를 남긴다.\n\n확인 질문:\n\n- 자동 보정과 수동 검토의 기준은 무엇인가?\n- 정산 파일 기반 보정도 provider event와 같은 ledger에 남기는가?\n- 보정 후 사용자 알림, 매출 집계, 재고/쿠폰 side effect는 idempotent하게 재실행되는가?\n\n## 빠른 체크\n\n| 질문 | 좋은 답의 축 |\n|---|---|\n| 같은 event인지 어떻게 아는가 | provider event id, payment key, payload hash, unique constraint |\n| 200 OK 전에 무엇이 durable해야 하나 | signature 검증 결과, raw payload/inbox row, received_at |\n| 중복 webhook이 오면 무엇을 다시 하지 않는가 | 주문 확정, 재고 차감, 쿠폰 사용, 영수증 발행 같은 side effect |\n| Out-of-order 이벤트는 어떻게 막는가 | provider event time/sequence, state machine, version/CAS |\n| Timeout 뒤 재시도는 어떻게 처리하는가 | idempotency record 조회, provider state 조회, UNKNOWN 상태 보존 |\n| 내부와 PG가 어긋나면 어떻게 찾나 | reconciliation job, mismatch table, provider snapshot 비교 |\n| 보정이 끝난 뒤 무엇이 남아야 하나 | ledger event, job id, before/after state, actor, audit trail |\n\n## Expected answer axes\n\n좋은 답은 특정 기술 이름보다 판단 축이 분명하다.\n\n- Delivery: provider webhook은 at-least-once이며 중복과 순서 뒤바뀜을 전제로 둔다.\n- Durability: 200 OK 전에 inbox/ledger 저장이 완료돼야 한다.\n- Dedup: provider event id와 payment key를 구분하고, unique key로 side effect 중복을 막는다.\n- State machine: 마지막 도착 이벤트가 아니라 허용된 상태 전이만 반영한다.\n- Idempotency: 같은 승인 요청 재시도는 기존 operation 결과를 재사용하거나 UNKNOWN을 해소한다.\n- Reconciliation: webhook/approve 경로가 놓친 mismatch를 정기적으로 찾아 보정한다.\n- Audit: 자동/수동 보정 모두 append-only ledger와 operator/job 근거를 남긴다.\n\n## 검증 질문\n\n1. 같은 `PAYMENT_CAPTURED` webhook이 3번 오면 DB에는 어떤 row가 몇 개 생기고, side effect는 몇 번 실행되는가?\n2. Handler가 200 OK를 보낸 직후 worker가 죽어도 나중에 재처리할 수 있는 근거는 어디에 있는가?\n3. `REFUNDED`가 먼저 오고 `CAPTURED`가 나중에 오면 상태를 어떻게 계산하는가?\n4. 승인 API timeout 뒤 같은 idempotency key로 재시도하면 외부 approve를 다시 호출하기 전에 무엇을 조회하는가?\n5. PG 정산 파일과 내부 주문 상태가 다르면 자동 보정과 manual review를 어떤 기준으로 나누는가?\n6. 운영자가 한 달 뒤 \"왜 이 주문이 PAID가 됐나요?\"라고 물으면 어떤 audit trail을 보여 줄 수 있는가?\n\n## Tradeoff\n\nWebhook handler 안에서 모든 처리를 동기 완료하면 흐름은 단순하지만 timeout과 provider retry에 취약하다.\nInbox 저장 후 비동기 처리하면 수락 경계가 선명해지지만, 처리 지연 상태, DLQ, reconciliation metric, 운영 알림이 필요하다.\n금융 일관성에서는 \"한 번에 끝나는 handler\"보다 \"중복, 지연, 순서 뒤바뀜, 정산 불일치가 와도 같은 결론으로 수렴하는 기록\"이 더 중요하다.\n\n다음 문서는 `system-design/webhook-consumer-platform-design`, `system-design/reconciliation-window-cutoff-control-design`, `database/idempotency-key-and-deduplication`이다.\n",
+  "aliases": [
+    "payment webhook idempotency drill",
+    "결제 webhook reconciliation drill",
+    "PG callback duplicate event drill",
+    "provider event dedup reconciliation",
+    "payment webhook 200 OK timing exercise"
+  ],
+  "expected_queries": [
+    "payment webhook idempotency와 reconciliation을 문제로 연습하고 싶어",
+    "결제사 callback을 두 번 받았을 때 200 OK를 언제 보내야 해?",
+    "PG 상태와 내부 주문 상태가 다를 때 reconciliation drill을 줘",
+    "shopping-cart 결제 webhook 중복 이벤트를 system design으로 판단해줘"
+  ],
+  "symptoms": [
+    "같은 결제 webhook이 두 번 오면 주문 상태가 두 번 바뀔까 봐 불안하다",
+    "200 OK를 언제 보내야 결제사가 재전송을 멈춰도 안전한지 모르겠다",
+    "내부 주문 상태와 PG 상태가 어긋났을 때 reconciliation이 왜 필요한지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design",
+      "software-engineering/shopping-cart-payment-webhook-idempotency-bridge"
+    ],
+    "next_docs": [
+      "system-design/webhook-consumer-platform-design",
+      "system-design/reconciliation-window-cutoff-control-design",
+      "database/idempotency-key-and-deduplication"
+    ],
+    "confusable_with": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design",
+      "software-engineering/shopping-cart-payment-webhook-idempotency-bridge",
+      "system-design/webhook-consumer-platform-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/payment-webhook-idempotency-reconciliation-drill.md",
+    "revision_history": []
+  }
+}

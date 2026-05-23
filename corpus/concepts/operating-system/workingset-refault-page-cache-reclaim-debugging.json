@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/workingset-refault-page-cache-reclaim-debugging",
+  "title": "Workingset Refault Page Cache Reclaim Debugging",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 memory pressure에서 중요한 질문이 얼마나 많이 지웠는가보다 방금 지운 hot page를",
+  "body_markdown": "# Workingset Refault, Page Cache Reclaim, Runtime Debugging\n\n> 한 줄 요약: 메모리 압박에서 진짜 중요한 질문은 \"얼마나 많이 지웠는가\"보다 \"방금 지운 hot page를 곧바로 다시 읽고 있나\"이며, workingset refault는 그 힌트를 준다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Swap-In, Reclaim, and Major Fault Path Primer](./swap-in-reclaim-fault-path-primer.md)\n> - [Page Cache Thrash vs Direct I/O](./page-cache-thrash-vs-direct-io.md)\n> - [Page Cache Active/Inactive Reclaim, Hot-Page Debugging](./page-cache-active-inactive-reclaim-debugging.md)\n> - [posix_fadvise, madvise, Page Cache Hints](./posix-fadvise-madvise-page-cache-hints.md)\n> - [memory.reclaim, Cgroup v2 Proactive Reclaim](./memory-reclaim-cgroup-v2-proactive-reclaim.md)\n> - [memory.high vs memory.max, Cgroup Behavior](./memory-high-vs-memory-max-cgroup-behavior.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n> - [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n> - [readahead tuning, page cache](./readahead-tuning-page-cache.md)\n\n> retrieval-anchor-keywords: workingset, refault, workingset_refault_file, workingset_activate_file, page cache reclaim, refault distance, cold-page refault, hot cache churn, reclaim-induced major fault, pgscan, pgsteal, file cache pressure\n\n## 핵심 개념\n\n메모리 reclaim은 페이지를 얼마나 많이 치웠는지만으로 평가하면 부족하다. 중요한 것은 치운 페이지가 실제로 차갑게 식은 데이터였는지, 아니면 잠깐 밀려났다가 곧바로 다시 필요한 hot data였는지다. workingset refault는 이 두 경우를 구분하는 데 도움을 준다.\n\n- `reclaim`: 메모리 압박 시 page cache나 익명 메모리를 회수하는 경로다\n- `refault`: 한 번 밀려난 페이지가 다시 필요해져 fault로 돌아오는 상황이다\n- `workingset`: 최근 실제로 쓰이는 hot page 집합이라는 감각적 모델이다\n- `pgscan` / `pgsteal`: 얼마나 적극적으로 스캔하고 회수했는지 보는 지표다\n\n왜 중요한가:\n\n- OOM은 없는데 p99가 나빠지는 \"느린 장애\"를 설명할 수 있다\n- nightly batch, backup, large scan이 API hot cache를 밀어내는지 판단할 수 있다\n- `memory.high`가 너무 공격적이거나 page cache working set이 limit보다 작은지 큰지 감이 생긴다\n\n## 깊이 들어가기\n\n### 1. page fault가 많다고 다 나쁜 것은 아니다\n\ncold start나 순차 스캔은 page fault가 많아도 꼭 문제는 아니다. 문제는 방금 밀어낸 hot page를 곧바로 다시 읽어야 하는 상황이다.\n\n- 처음 읽는 파일은 cold miss일 수 있다\n- 대용량 순차 스캔은 의도적인 cache bypass에 가깝게 해석할 수 있다\n- 반면 refault가 빠르게 반복되면 hot working set이 보호되지 못한다는 뜻일 수 있다\n\n그래서 `pgfault` 숫자만으로는 부족하고 reclaim과 refault를 같이 봐야 한다.\n\n### 2. refault는 \"이 페이지를 지우면 안 됐을지도 모른다\"는 신호다\n\n커널은 최근에 밀어낸 페이지에 대한 흔적을 남겨 두고, 그것이 짧은 시간 안에 다시 돌아오면 workingset 후보로 본다. 이 지점이 운영에서 유용한 이유는 reclaim의 질을 보여 주기 때문이다.\n\n- 스캔은 많지만 refault가 낮다: 차가운 페이지를 잘 밀고 있을 가능성\n- 스캔과 refault가 같이 높다: hot cache churn 가능성\n- refault 뒤 activation도 높다: 다시 돌아온 페이지가 실제로 hot했다는 힌트\n\n즉 refault는 \"메모리가 부족하다\"를 넘어서 \"어떤 종류의 부족인가\"를 설명하는 도구다.\n\n### 3. cgroup memory pressure는 refault를 더 교묘하게 만든다\n\n노드 전체는 여유가 있어도 특정 cgroup이 `memory.high`나 `memory.max` 근처면 그 그룹의 file cache만 먼저 흔들릴 수 있다.\n\n- 호스트 전체 free memory만 보면 멀쩡해 보인다\n- 하지만 해당 cgroup 안에서는 working set 보존이 깨진다\n- 결과적으로 특정 서비스만 page cache miss와 refault를 반복한다\n\n이 패턴은 \"노드는 괜찮은데 이 컨테이너만 느린\" 상황에서 특히 중요하다.\n\n### 4. tmpfs와 page cache도 서로 무관하지 않다\n\ntmpfs/shmem usage가 커지면 같은 cgroup 안의 page cache 보호 여지가 줄어든다.\n\n- 임시 렌더 파일이나 `/dev/shm` 사용량이 증가한다\n- file cache가 밀리고 hot page refault가 늘 수 있다\n- 겉으로는 \"메모리 많이 썼다\"인데 실제 체감은 \"파일 읽기 p99가 나빠졌다\"로 나타난다\n\n즉 refault는 파일 I/O 문제와 메모리 문제를 연결하는 중간 언어다.\n\n## Playbook 역할\n\n### 재현 조건\n\n- OOM은 없지만 batch나 memory.high 초과 시간대에 file read p99가 오른다\n- `pgscan`/`pgsteal`과 `workingset_refault*`가 함께 증가한다\n- cold start가 아닌 steady state에서도 같은 hot file을 반복해서 다시 읽는다\n\n### 확인 순서\n\n1. 노드 `/proc/vmstat`에서 scan/steal/refault를 짧은 간격 delta로 본다.\n2. cgroup `memory.stat`으로 특정 서비스의 file/shmem/workingset 변화를 좁힌다.\n3. PSI memory pressure와 storage read latency가 같은 시간축에서 오르는지 확인한다.\n4. batch scan, tmpfs growth, `memory.high`, proactive reclaim 중 무엇이 refault를 만든 계기인지 분리한다.\n\n### Failure Matrix\n\n| 관찰 | 더 가까운 원인 | 다음 확인 |\n|------|----------------|-----------|\n| scan/steal은 높고 refault는 낮음 | cold page reclaim | p99 영향, cache miss pattern |\n| scan/steal과 refault가 함께 높음 | hot working set churn | active/inactive file, API read p99 |\n| cgroup refault만 높음 | container-local pressure | `memory.high`, `memory.low`, shmem |\n| deploy 초기에만 fault가 높고 안정됨 | cold start/prefault 이슈 | steady-state refault 여부 |\n\n### 검증\n\n완화 후에는 fault 총량보다 refault delta와 사용자 p99가 같이 줄었는지 본다. refault는 줄었지만 storage queue가 그대로 길면 cache churn 외의 I/O 병목이 남아 있는 것이다.\n\n## 실전 시나리오\n\n### 시나리오 1: 배치가 도는 시간만 API 읽기 p99가 튄다\n\n가능한 원인:\n\n- 대용량 스캔이 hot page cache를 밀어낸다\n- `workingset*` 계열 counter가 같이 증가한다\n- refault 때문에 같은 파일을 다시 storage에서 읽는다\n\n진단:\n\n```bash\ngrep -E 'workingset|pgscan|pgsteal|pgfault|pgmajfault' /proc/vmstat\ncat /proc/pressure/memory\niostat -x 1\n```\n\n판단 포인트:\n\n- 배치 시간대에 `workingset` 계열과 `pgscan`이 같이 오르는가\n- 메모리 pressure와 storage read가 동시에 오르는가\n- 순차 batch가 API hot file과 같은 volume/cache를 공유하는가\n\n### 시나리오 2: OOM은 없는데 `memory.high`를 넘는 동안만 계속 느리다\n\n가능한 원인:\n\n- reclaim이 반복되며 hot file page를 지운다\n- file cache가 살아남지 못하고 refault가 누적된다\n- PSI memory pressure가 느린 장애로 먼저 나타난다\n\n진단:\n\n```bash\ncat /sys/fs/cgroup/memory.current\ncat /sys/fs/cgroup/memory.high\ncat /sys/fs/cgroup/memory.events\ncat /sys/fs/cgroup/memory.stat | rg 'workingset|pgscan|pgsteal|file|shmem'\ncat /sys/fs/cgroup/memory.pressure\n```\n\n### 시나리오 3: deploy 직후 fault가 많아도 잠시 후 안정된다\n\n이 경우는 꼭 문제라고 볼 수 없다.\n\n- cold start로 한 번 읽고 끝나는 패턴일 수 있다\n- refault보다 초기 fault가 크고 시간이 지나며 안정된다\n- steady state에서도 refault가 계속 높을 때가 진짜 위험 신호다\n\n즉 \"fault가 많다\"와 \"cache churn이 심하다\"를 구분해야 한다.\n\n## 코드로 보기\n\n### 노드 단위 counter 보기\n\n```bash\nwatch -n 1 \"grep -E 'workingset|pgscan|pgsteal|pgfault|pgmajfault' /proc/vmstat\"\n```\n\n### cgroup 단위로 좁히기\n\n```bash\nwatch -n 1 \"cat /sys/fs/cgroup/memory.stat | rg 'workingset|pgscan|pgsteal|file|shmem'; echo; cat /sys/fs/cgroup/memory.pressure\"\n```\n\n### 해석 감각\n\n```text\nscan/steal rises\n  + refault stays low\n    -> 상대적으로 차가운 페이지를 회수 중일 가능성\n  + refault rises\n    -> hot working set churn 가능성\n  + PSI memory pressure rises\n    -> 느린 장애가 사용자 지연으로 번지는 중\n```\n\n주의:\n\n- counter 이름은 커널 버전에 따라 조금 다를 수 있다\n- 절대값보다 workload 시간축과 함께 보는 것이 중요하다\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 메모리 여유 확대 | refault churn을 직접 줄인다 | 비용이 든다 | hot cache가 분명히 큰 경우 |\n| `memory.low`/`memory.min` 보호 | 중요한 cgroup의 cache를 지키기 쉽다 | 다른 workload 압박이 커질 수 있다 | API 보호 우선 |\n| batch 스케줄 분리 | 간섭 원인을 줄인다 | 운영 조율이 필요하다 | mixed workload |\n| direct I/O 또는 캐시 우회 | cache pollution을 줄일 수 있다 | 앱 복잡도와 latency 특성이 바뀐다 | 큰 순차 스캔 |\n\n## 꼬리질문\n\n> Q: page fault가 많으면 곧바로 문제라고 봐야 하나요?\n> 핵심: 아니다. cold start나 순차 스캔은 정상일 수 있고, reclaim과 refault 패턴이 더 중요하다.\n\n> Q: workingset refault가 높다는 것은 무엇을 뜻하나요?\n> 핵심: 방금 밀어낸 페이지가 다시 필요해졌다는 뜻이라 hot cache churn 가능성을 시사한다.\n\n> Q: 노드 메모리는 남는데 특정 서비스만 느릴 수 있나요?\n> 핵심: 그렇다. cgroup memory pressure가 그 서비스의 file cache만 먼저 흔들 수 있다.\n\n## 한 줄 정리\n\nworkingset refault는 메모리 압박을 단순 용량 문제가 아니라 \"hot page를 잘못 밀어내고 있는가\"의 문제로 읽게 해 주는 운영 지표다.\n",
+  "aliases": [
+    "workingset refault",
+    "page cache refault",
+    "hot page reclaimed",
+    "refault distance",
+    "cache thrash debugging",
+    "page cache reclaim signal"
+  ],
+  "expected_queries": [
+    "workingset refault는 방금 지운 hot page를 곧바로 다시 읽고 있다는 신호야?",
+    "page cache reclaim debugging에서 refault를 왜 중요하게 봐?",
+    "cache thrash와 direct I/O 선택 전 workingset refault를 어떻게 확인해?",
+    "memory.reclaim 후 refault가 늘면 workload impact를 어떻게 해석해?"
+  ],
+  "symptoms": [
+    "memory pressure에서 많이 reclaimed 된 것보다 hot page를 곧바로 다시 읽는 refault가 문제다.",
+    "page cache가 부족한지 access pattern이 cache와 맞지 않는지 구분해야 한다.",
+    "workingset refault가 증가하며 disk I/O와 p99 latency가 함께 오른다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/demand-paging-page-fault-primer"
+    ],
+    "next_docs": [
+      "operating-system/tlb-page-table-walk-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/workingset-refault-page-cache-reclaim-debugging.md",
+    "revision_history": []
+  }
+}

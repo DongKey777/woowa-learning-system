@@ -1,0 +1,67 @@
+{
+  "id": "data-structure/learned-index-rmi-pgm-range-search-primer",
+  "title": "Learned Index, RMI, PGM-Index Range Search Primer",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Learned Index, RMI, PGM-Index Range Search Primer\n\n> 한 줄 요약: learned index는 정렬된 key 배열에서 `key -> 대략적인 position(rank)`을 모델로 예측한 뒤, 예측 오차만큼 좁은 구간에서 다시 `lower_bound`를 수행하는 정적 검색 인덱스 계열이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Ordered Search Workload Matrix](./ordered-search-workload-matrix.md)\n> - [Hybrid Top-Index / Leaf Layouts](./hybrid-top-index-leaf-layouts.md)\n> - [Cache-Aware Data Structure Layouts](./cache-aware-data-structure-layouts.md)\n> - [Eytzinger Layout and Cache-Friendly Search](./eytzinger-layout-and-cache-friendly-search.md)\n> - [Cache-Oblivious B-Tree / Leaf-Packed Variants vs Plain vEB Layout](./cache-oblivious-b-tree-vs-plain-veb-layout.md)\n> - [LSM-Friendly Index Structures](./lsm-friendly-index-structures.md)\n> - [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)\n\n> retrieval-anchor-keywords: learned index, learned indexes, recursive model index, RMI, PGM-index, piecewise geometric model index, key to position model, key rank prediction, CDF mental model, empirical CDF index, model prediction bounded local search, learned index lower_bound, learned index range search, learned index vs B-tree, learned index vs binary search, learned index vs interpolation search, sorted static array index, learned index update drift, learned index static segment, model plus local search, epsilon error bound, piecewise linear rank model, RMI hierarchy, LSM fence pointer vs learned index, Bloom filter vs learned index\n\n## 핵심 개념\n\nlearned index를 처음 볼 때는 \"ML이 인덱스를 대체한다\"보다  \n**정렬 배열의 CDF를 근사한다**고 잡는 편이 안전하다.\n\n정렬된 key 배열 `A`가 있다고 하자.\n\n- `rank(x)`: `x`보다 작은 key가 몇 개인가\n- `position(x)`: `x`가 있을 법한 배열 인덱스\n- `CDF(x)`: 전체 key 중 `x` 이하가 차지하는 누적 비율\n\n정렬 배열에서는 `rank(x) ~= CDF(x) * n`으로 볼 수 있다.  \nlearned index는 이 관계를 작은 모델로 근사한다.\n\n```text\nkey x\n  -> model predicts approximate position p\n  -> search near p\n  -> verify with real sorted keys\n  -> return lower_bound / exact match / range boundary\n```\n\n즉 모델은 답을 확정하는 장치가 아니라  \n**binary search가 볼 구간을 좁혀 주는 guide**다.\n\n## 먼저 못 박는 가정\n\nlearned index 논의는 보통 아래 가정 위에서 가장 깨끗하다.\n\n- key들이 정렬된 static 또는 read-mostly 배열에 있다\n- position은 key order의 rank를 뜻한다\n- 모델 예측 뒤 실제 배열에서 검증 검색을 한다\n- 데이터 분포가 학습 시점과 크게 달라지지 않는다\n- update가 잦으면 delta structure, periodic rebuild, fallback index가 필요하다\n\n이 가정이 깨지면 learned index가 틀린다는 뜻은 아니다.  \n다만 장점보다 보정 비용, rebuild 비용, drift 관리가 먼저 보일 수 있다.\n\n## Range Search는 어떻게 처리하나\n\nrange query `[lo, hi]`는 보통 두 boundary를 찾는 문제로 쪼갠다.\n\n1. `lo`의 `lower_bound` 위치를 찾는다.\n2. `hi`의 `upper_bound` 또는 다음 boundary를 찾는다.\n3. 두 위치 사이를 정렬 배열에서 순차 scan한다.\n\nlearned index가 맡는 것은 1번과 2번의 boundary search다.  \n그 뒤 `k`개 결과를 읽는 비용은 여전히 `O(k)`이고, leaf/payload가 실제로 연속 배치되어 있어야 scan locality가 좋아진다.\n\n그래서 range search에서 중요한 질문은 두 개다.\n\n- boundary를 빨리 찾는가\n- 찾은 뒤 payload를 순차적으로 잘 읽는가\n\nlearned index는 첫 번째를 도와줄 수 있지만, 두 번째는 배열/leaf/block layout이 결정한다.  \n이 지점에서 [Hybrid Top-Index / Leaf Layouts](./hybrid-top-index-leaf-layouts.md)와 바로 연결된다.\n\n## Model Prediction + Bounded Local Search\n\n모델이 `x -> p`를 예측해도 `A[p] == x`라고 믿으면 안 된다.  \n분포 근사에는 오차가 있으므로 실제 배열에서 보정해야 한다.\n\n전형적인 흐름은 이렇다.\n\n```text\np = predict(x)\nwindow = [p - error, p + error]\nanswer = lower_bound(A[window], x)\n```\n\n여기서 `error`가 작고 잘 통제되면 검색 비용이 줄어든다.  \n반대로 error bound가 없거나 분포가 밀려서 error가 커지면, 결국 넓은 구간을 다시 binary search해야 한다.\n\n핵심은 이 문장이다.\n\n> learned index의 성능은 \"모델 추론이 빠른가\"보다 \"예측 오차를 얼마나 작고 안정적으로 묶는가\"에 자주 달려 있다.\n\n## RMI: Hierarchy로 어느 모델을 쓸지 고른다\n\nRMI(Recursive Model Index)는 모델을 여러 층으로 둔다.\n\n```text\nroot model\n  -> child model id 예측\n  -> leaf model\n  -> position 예측\n  -> local search\n```\n\n멘탈 모델은 \"트리의 내부 노드가 비교 key를 들고 있다\"가 아니라  \n**상위 모델이 하위 모델을 routing하고, leaf 모델이 rank를 예측한다**에 가깝다.\n\nRMI의 장점:\n\n- 분포가 한 개 직선으로 설명되지 않아도 여러 leaf model로 나눌 수 있다\n- 각 구간마다 다른 선형/비선형 모델을 쓸 수 있다\n- static read-heavy lookup에서 top-down comparison tree보다 작은 guide가 될 수 있다\n\nRMI의 caveat:\n\n- 일반적인 RMI 설명만으로는 deterministic error bound가 자동으로 생기지 않는다\n- leaf model별 최대 오차를 따로 측정하거나 fallback search 폭을 관리해야 한다\n- update나 분포 drift가 생기면 routing과 leaf prediction 둘 다 낡을 수 있다\n- 모델 계층, 학습, 배포, rebuild가 운영 복잡도를 만든다\n\n즉 RMI는 learned index family의 대표적인 \"hierarchical learned guide\"이지,  \n모든 ordered index를 단순히 이기는 범용 대체재는 아니다.\n\n## PGM-Index: Piecewise Linear Segment와 Error Bound\n\nPGM-index(Piecewise Geometric Model index)는 sorted key의 rank 함수를  \n여러 개의 piecewise linear segment로 근사한다.\n\n각 segment는 대략 이런 역할을 한다.\n\n```text\nkey range in segment\n  -> linear function predicts rank\n  -> actual rank is within +/- epsilon\n```\n\nPGM의 핵심은 **오차를 epsilon 안에 묶는 segment를 만든다**는 점이다.  \n따라서 어떤 key가 어느 segment에 속하는지만 찾으면, 예측 위치 주변 `2 * epsilon + 1` 정도의 좁은 구간에서 `lower_bound`를 수행할 수 있다.\n\n이 점이 RMI와 가장 크게 다르다.\n\n| 축 | RMI | PGM-index |\n|---|---|---|\n| 기본 모양 | 모델 hierarchy | piecewise linear segment set |\n| routing | 상위 모델이 하위 모델을 고름 | segment directory에서 해당 segment를 찾음 |\n| 예측 | leaf model이 position/rank 예측 | segment의 직선이 rank 예측 |\n| 오차 관리 | 보통 empirical max error 또는 fallback 필요 | construction 단계에서 epsilon error bound를 목표로 함 |\n| 잘 맞는 감각 | 분포를 여러 모델로 학습해 route | rank 함수를 bounded piecewise linear로 압축 |\n\nPGM도 마법은 아니다.\n\n- static sorted data에 특히 잘 맞는다\n- update가 잦으면 dynamic variant나 rebuild 전략이 필요하다\n- segment directory를 찾는 비용과 local search 비용을 함께 봐야 한다\n- duplicate key, variable-length key, payload indirection은 별도 설계가 필요하다\n\n## B-Tree, Binary Search, Interpolation Search와 비교\n\nlearned index는 비교 대상에 따라 의미가 달라진다.\n\n| 비교 대상 | 차이 |\n|---|---|\n| Binary search | binary search는 key 분포를 몰라도 `O(log n)` 비교로 안전하다. learned index는 분포를 이용해 시작 위치를 더 가깝게 찍고 주변만 검색하려 한다. |\n| Interpolation search | interpolation search도 key 값을 position으로 추정하지만 보통 단일 선형 가정에 가깝다. learned index는 RMI나 PGM처럼 여러 구간/모델로 empirical CDF를 더 유연하게 근사한다. |\n| B-Tree / B+Tree | B-Tree는 page fan-out, update, range scan, concurrency, storage locality까지 포함한 범용 운영 구조다. learned index는 read-mostly sorted array의 boundary search guide에 더 가깝다. |\n| Eytzinger / blocked array | 이들은 같은 key set을 어떻게 배치해 CPU/cache locality를 얻을지에 가깝다. learned index는 position을 어떻게 예측해 search 구간을 줄일지에 가깝다. |\n\n중요한 금지 문장은 이것이다.\n\n> learned index가 B-tree를 보편적으로 이긴다고 말하면 안 된다.\n\n가능한 정확한 표현은 이쪽이다.\n\n- static/read-mostly, distribution이 안정적이고, model error가 작으면 learned index가 lookup boundary search를 줄일 수 있다\n- update가 잦거나 range scan이 길거나 page concurrency가 중요한 DB index에서는 B+Tree가 더 운영하기 쉽다\n- 분포가 거의 균등하면 interpolation search나 단순 sampled index도 충분할 수 있다\n- 데이터가 작으면 plain binary search나 Eytzinger layout이 더 단순하고 빠를 수 있다\n\n## LSM, Bloom Filter, Fence Pointer와의 역할 차이\n\nLSM read path와 비교하면 learned index의 위치가 더 선명해진다.\n\n| 구조 | 주 역할 | learned index와의 차이 |\n|---|---|---|\n| Bloom filter | \"이 SSTable에는 key가 없다\"를 빠르게 배제 | position을 찾지 않는다. false positive가 가능하고 negative lookup 절약 장치다. |\n| Fence pointer / sparse block index | 어떤 block을 열지 좁힌다 | sampled boundary 기반 guide다. 모델보다 단순하고 explain하기 쉽다. |\n| LSM memtable | mutable write buffer | update-friendly ordered structure가 필요하다. learned static array와 요구가 다르다. |\n| Learned index | sorted array 내부 position/rank를 예측 | block 또는 element boundary search를 모델로 줄이려 한다. |\n\n즉 learned index는 Bloom filter를 대체하지 않는다.  \nBloom filter는 \"없음\"을 거르는 장치이고, learned index는 \"있을 법한 위치\"를 찍는 장치다.\n\n또 fence pointer를 대체한다고 단정하기도 어렵다.  \n작고 단순한 sparse index가 충분하면 fence pointer가 더 운영하기 쉽고,  \nrank 함수가 잘 근사되는 큰 static segment에서는 learned guide가 후보가 될 수 있다.\n\n## Update와 Drift Caveat\n\nlearned index의 약점은 대부분 \"데이터가 변한다\"에서 나온다.\n\n### 1. Insert/Delete\n\n정렬 배열 중간에 key가 들어오면 rank가 뒤로 밀린다.  \n모델이 예측한 position도 같이 낡는다.\n\n대응은 보통 셋 중 하나다.\n\n- immutable segment로 유지하고 batch rebuild\n- 작은 delta buffer를 따로 두고 merge\n- dynamic learned index variant를 쓴다\n\n### 2. Distribution Drift\n\n처음 학습한 key 분포와 운영 중 key 분포가 달라지면 error가 커진다.  \n예측 window가 넓어지면 learned index의 이점이 줄어든다.\n\n운영에서는 최소한 아래 지표를 봐야 한다.\n\n- prediction error p50/p95/p99\n- local search window 크기\n- fallback binary search 빈도\n- rebuild 후 error 회복 여부\n\n### 3. Range Scan\n\nboundary search가 빨라도 range 결과가 크면 전체 비용은 scan이 지배한다.  \npayload가 랜덤 위치에 흩어져 있거나 leaf continuation이 나쁘면 learned index만으로 해결되지 않는다.\n\n## 언제 후보로 볼까\n\nlearned index를 후보로 올려도 되는 조건:\n\n- 데이터가 static 또는 read-mostly다\n- key distribution이 비교적 안정적이다\n- lookup 또는 short range boundary search가 hot path다\n- 모델 크기와 추론 비용이 cache miss를 줄이는 이득보다 작다\n- 잘못 예측해도 bounded local search로 correctness를 보장한다\n\n조심해야 하는 조건:\n\n- OLTP update와 concurrent write가 많다\n- long range scan이 대부분이다\n- key distribution이 계속 바뀐다\n- page split, latch, WAL, recovery 같은 storage engine concern이 중심이다\n- 단순 B+Tree, binary search, sparse fence pointer로 이미 충분하다\n\n## 검증 질문\n\n> Q: learned index가 예측한 position을 바로 답으로 반환하면 왜 위험한가요?  \n> 의도: 모델 prediction과 correctness verification을 분리하는지 확인  \n> 핵심: 모델은 rank를 근사할 뿐이고 오차가 있으므로, 실제 sorted array에서 bounded local search로 `lower_bound`를 검증해야 한다.\n\n> Q: RMI와 PGM-index의 가장 중요한 차이는 무엇인가요?  \n> 의도: hierarchy와 piecewise error bound를 구분하는지 확인  \n> 핵심: RMI는 상위 모델이 하위 모델을 route하는 hierarchy이고, PGM-index는 rank 함수를 piecewise linear segment로 근사하면서 epsilon error bound를 중심에 둔다.\n\n> Q: learned index가 range query 전체를 빠르게 만든다고만 말하면 왜 부정확한가요?  \n> 의도: boundary search와 result scan 비용을 분리하는지 확인  \n> 핵심: learned index는 주로 lower/upper boundary search를 줄이고, 결과 `k`개를 읽는 비용과 payload locality는 별도 layout 문제가 된다.\n\n> Q: Bloom filter와 learned index는 read path에서 무엇이 다른가요?  \n> 의도: membership negative filter와 position guide를 구분하는지 확인  \n> 핵심: Bloom filter는 \"없을 가능성\"을 빠르게 배제하고, learned index는 sorted array 안의 rank/position을 예측한다.\n\n## 안전한 다음 문서\n\n- search layout 자체를 먼저 고르고 싶으면 [Ordered Search Workload Matrix](./ordered-search-workload-matrix.md)를 본다.\n- boundary search 뒤 scan continuation을 분리하고 싶으면 [Hybrid Top-Index / Leaf Layouts](./hybrid-top-index-leaf-layouts.md)로 간다.\n- LSM에서 Bloom filter, fence pointer, sparse index의 역할 분담이 헷갈리면 [LSM-Friendly Index Structures](./lsm-friendly-index-structures.md)를 본다.\n- DB storage index로 B+Tree와 LSM을 비교해야 하면 [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)를 본다.\n\n## 한 줄 정리\n\nlearned index는 sorted static array 위에서 key 분포의 CDF를 배워 position을 가깝게 찍고, RMI는 그 예측을 hierarchy로 나누며, PGM-index는 piecewise linear segment와 epsilon error bound로 local search 폭을 묶는 접근이다.\n",
+  "aliases": [
+    "learned index",
+    "learned indexes",
+    "learned index range search",
+    "recursive model index",
+    "RMI learned index",
+    "PGM-index",
+    "piecewise geometric model index",
+    "key to position model",
+    "key rank prediction",
+    "CDF index mental model",
+    "model plus local search",
+    "learned index vs B-tree",
+    "learned index vs binary search",
+    "interpolation search vs learned index"
+  ],
+  "expected_queries": [
+    "learned index는 key를 position으로 예측한다는 CDF 멘탈 모델이 뭐야?",
+    "RMI와 PGM-index는 range search에서 어떻게 다르고 오차 보정은 어떻게 해?",
+    "learned index가 예측한 위치 주변에서 bounded local search를 해야 하는 이유를 설명해줘",
+    "learned index와 B-tree binary search interpolation search를 어떤 workload 기준으로 비교해야 해?",
+    "static sorted array 가정, update drift caveat 때문에 learned index를 조심해야 하는 경우는?",
+    "LSM Bloom filter fence pointer와 learned index는 read path에서 어떤 역할 차이가 있어?"
+  ],
+  "symptoms": [
+    "learned index를 \"AI가 DB 인덱스를 대체한다\"로만 이해해 정렬 static array와 rank 예측 가정을 놓친다",
+    "모델이 예측한 위치를 그대로 믿고 끝낸다고 생각해 bounded local search와 lower_bound 보정 단계를 빠뜨린다",
+    "RMI와 PGM-index를 모두 같은 learned index로 뭉뚱그려 hierarchy와 deterministic error bound 차이를 구분하지 못한다",
+    "learned index가 항상 B-tree보다 빠르다고 일반화해 update, drift, skew, range scan, 운영 복잡도 caveat을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/ordered-search-workload-matrix",
+      "data-structure/hybrid-top-index-leaf-layouts"
+    ],
+    "next_docs": [
+      "data-structure/ordered-search-workload-matrix",
+      "data-structure/hybrid-top-index-leaf-layouts",
+      "data-structure/lsm-friendly-index-structures",
+      "database/bptree-vs-lsm-tree"
+    ],
+    "confusable_with": [
+      "data-structure/ordered-search-workload-matrix",
+      "data-structure/hybrid-top-index-leaf-layouts",
+      "data-structure/eytzinger-layout-and-cache-friendly-search",
+      "data-structure/cache-oblivious-b-tree-vs-plain-veb-layout",
+      "data-structure/lsm-friendly-index-structures",
+      "database/bptree-vs-lsm-tree"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/learned-index-rmi-pgm-range-search-primer.md",
+    "revision_history": []
+  }
+}

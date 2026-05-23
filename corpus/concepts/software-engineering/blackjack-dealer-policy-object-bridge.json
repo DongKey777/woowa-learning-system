@@ -1,0 +1,46 @@
+{
+  "id": "software-engineering/blackjack-dealer-policy-object-bridge",
+  "title": "Blackjack Dealer Policy Object Bridge",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "이 mission_bridge는 blackjack 딜러 hit/stand 규칙을 policy object와 responsibility placement 학습으로 연결한다.",
+  "body_markdown": "# Blackjack Dealer Policy Object Bridge\n\n## 한 줄 요약\n\n> Blackjack 딜러의 \"`16 이하이면 hit, 17 이상이면 stand`\"는 카드 지급 흐름이 아니라 판단 규칙이다. `GameService`가 raw score와 magic number를 직접 비교하기 시작하면 primitive conditional leakage가 생긴 것이고, `DealerDrawingPolicy` 같은 policy object로 이름을 붙일 후보가 된다.\n\n## 미션 장면\n\nBlackjack 미션에서 Dealer는 보통 특정 점수 이하에서는 카드를 더 받고(hit), 기준 이상이면 멈춘다(stand). 처음에는 `GameService`나 `RoundService` 안에 아래처럼 한 줄로 들어가기 쉽다.\n\n```java\nwhile (dealer.score() <= 16) {\n    dealer.receive(deck.draw());\n}\n```\n\n문제는 조건이 짧다는 데 있지 않다. 이 줄이 들어간 순간 service는 라운드 흐름 orchestration뿐 아니라 \"딜러가 언제 멈추는가\"라는 게임 규칙까지 안다. 나중에 soft 17 규칙, casino variant, test fixture, winner decision이 붙으면 service는 점점 raw primitive 조건을 조립하는 절차 코드가 된다.\n\n정책 객체(policy object)는 이 조건에 이름을 붙여 \"카드를 더 줄지 판단하는 규칙\"으로 분리한다. Service는 여전히 deck에서 카드를 뽑아 dealer에게 주는 흐름을 진행하지만, hit/stand 판단 자체는 domain rule로 격리된다.\n\n## 리뷰에서 보이는 냄새\n\n리뷰 냄새는 `GameService.playDealerTurn()` 안에 `if (dealerScore <= 16)`과 카드 뽑기, bust 처리, winner decision이 함께 있는 코드에서 나온다. 특히 다음 신호가 보이면 rule placement를 다시 본다.\n\n| 냄새 | 왜 문제인가 | 먼저 떼어낼 질문 |\n|---|---|---|\n| `dealer.getScore() <= 16`이 service, result mapper, test helper에 반복된다 | score라는 primitive와 threshold가 여러 층으로 샌다 | \"딜러가 더 뽑아야 하나?\" |\n| 딜러 규칙 테스트가 player, shuffled deck, full round result를 모두 요구한다 | 판단 규칙 하나가 application flow fixture에 묶였다 | \"손패만으로 판단할 수 없나?\" |\n| Player input `hit/stand`와 Dealer auto-draw가 같은 branch에 있다 | 사용자 선택과 시스템 규칙이 같은 책임처럼 보인다 | \"입력 해석인가, 도메인 규칙인가?\" |\n| dealer draw 뒤 곧바로 winner decision `if-else`가 이어진다 | 진행 규칙과 결과 판정 규칙이 한 절차에 묻힌다 | \"draw policy와 winner policy를 나눌 수 있나?\" |\n\n이 냄새를 \"if가 있으니 무조건 패턴을 써야 한다\"로 읽으면 과하다. 기준은 테스트와 변경 이유다. 딜러 기준만 바꿨는데 service 흐름 테스트가 깨지거나, 흐름을 읽으려는데 `16`, `17`, `bust`, `push` 같은 판정 숫자와 용어가 계속 끼어들면 분리 이득이 생긴다.\n\n## 책임 경계\n\n`DealerHitPolicy`, `DealerDrawingPolicy`, `DealerDrawingRule` 같은 이름은 모두 가능하다. 중요한 것은 policy가 \"판단\"까지만 맡는다는 점이다.\n\n```java\npublic final class DealerDrawingPolicy {\n    public boolean shouldDraw(Hand dealerHand) {\n        return dealerHand.score().isLessThanOrEqualTo(16);\n    }\n}\n```\n\nService는 아래 정도의 흐름만 남긴다.\n\n```java\nwhile (dealerDrawingPolicy.shouldDraw(dealer.hand())) {\n    dealer.receive(deck.draw());\n}\n```\n\n역할을 더 선명하게 나누면 다음과 같다.\n\n| 책임 | 좋은 위치 | 이유 |\n|---|---|---|\n| Ace를 1 또는 11로 계산하고 bust 여부를 닫기 | `Hand`, `Score` 같은 domain object | 같은 카드 조합이면 어디서 호출해도 같은 값 규칙이다 |\n| 딜러가 한 장 더 뽑아야 하는지 판단하기 | `DealerDrawingPolicy` | 현재 dealer hand를 보고 hit/stand를 결정하는 도메인 정책이다 |\n| deck에서 실제 카드를 뽑아 dealer에게 주기 | application service/use case flow | repository, input, deck progression 같은 흐름 조합에 가깝다 |\n| 최종 승패, push, payout 결과 해석하기 | `WinnerPolicy`, `ResultPolicy` | draw rule과 다른 결과 판정 규칙이다 |\n\n이 분리는 domain-service vs application-service 경계와도 이어진다. `GameService`가 유스케이스 흐름을 조합하는 application service라면 raw score 비교를 직접 들고 있지 않는 편이 좋다. 반대로 여러 domain 객체를 함께 보아야 하는 순수 규칙이라면 별도 domain service나 policy object로 둘 수 있다. 핵심은 DB, input, output, deck mutation을 몰라도 판단할 수 있어야 한다는 것이다.\n\n## Primitive conditional leakage\n\n이 문서의 핵심 신호는 primitive conditional leakage다. 도메인 언어로는 \"딜러가 더 뽑아야 하는가\"인데 코드가 `int score`, `<=`, `16` 조합으로 여러 층에 퍼지는 상태를 말한다.\n\n약한 개선:\n\n```java\nprivate static final int DEALER_HIT_LIMIT = 16;\n\nif (dealerScore <= DEALER_HIT_LIMIT) {\n    ...\n}\n```\n\n상수 추출은 magic number를 줄이지만, service가 여전히 raw score와 비교 연산을 알고 있다. 더 나은 개선은 조건문에 이름을 붙여 service가 규칙의 세부 숫자를 몰라도 되게 하는 것이다.\n\n```java\nif (dealerDrawingPolicy.shouldDraw(dealer.hand())) {\n    ...\n}\n```\n\n여기서 policy가 꼭 거창할 필요는 없다. 한 줄짜리 객체라도 테스트 이름이 `dealer_draws_until_16_and_stands_on_17`처럼 바로 쓰이고, service 테스트에서 dealer threshold fixture가 사라진다면 충분한 값이 있다.\n\n## 테스트 기준\n\n분리 효과는 테스트에서 가장 빨리 확인된다.\n\n1. `DealerDrawingPolicyTest`는 dealer hand 또는 score fixture만으로 `16 -> draw`, `17 -> stand`, `bust -> stand`를 검증한다.\n2. `GameServiceTest`는 policy를 fake로 두고 \"policy가 true인 동안 카드를 지급한다\", \"false가 되면 지급을 멈춘다\"는 흐름만 검증한다.\n3. Winner decision 테스트는 dealer draw threshold를 다시 만들지 않는다. 이미 끝난 손패를 입력으로 받아 결과만 검증한다.\n\n이렇게 테스트가 갈라지면 \"딜러 규칙 변경\"과 \"라운드 진행 흐름 변경\"의 실패 지점도 달라진다. 리뷰에서 책임 분리를 요구하는 이유가 바로 이 관찰 가능성이다.\n\n## Drill 후보\n\n\"Dealer rule은 strategy인가 policy인가?\"를 묻는다. 기대 답변은 런타임 교체가 핵심이면 strategy, 도메인 판단 기준에 이름을 붙이는 것이 핵심이면 policy object에 가깝다는 것이다. Blackjack 딜러 규칙에서는 보통 \"여러 알고리즘 중 하나를 선택\"보다 \"게임 규칙을 판정\"하는 축이 더 강하다.\n\n흔한 실수는 policy 안에서 deck에서 카드를 직접 뽑거나 game state를 저장하게 하는 것이다. 그러면 policy가 순수 판단 객체가 아니라 또 다른 service가 된다. 또 딜러 기준 점수를 상수로만 빼고 service if는 그대로 두는 것도 약하다. raw score 비교가 service에 남아 있다면 primitive conditional leakage가 아직 닫히지 않은 것이다.\n\n복습 질문은 이렇게 낼 수 있다.\n\n- `DealerDrawingPolicy.shouldDraw(Hand dealerHand)`가 맡아야 하는 책임은 어디까지인가?\n- `GameService`에 남겨도 되는 책임은 무엇인가?\n- `dealer.score() <= 16`을 상수로만 뺀 개선이 왜 충분하지 않을 수 있는가?\n- Winner decision policy와 dealer drawing policy를 같은 객체로 묶으면 어떤 변경 이유가 충돌하는가?\n",
+  "aliases": [
+    "blackjack dealer policy object bridge",
+    "블랙잭 딜러 규칙 policy object",
+    "dealer hit stand rule mission bridge",
+    "blackjack rule placement bridge"
+  ],
+  "expected_queries": [
+    "blackjack dealer가 16이면 hit 17이면 stand 규칙은 어디에 둬?",
+    "딜러 규칙을 if문으로 service에 넣으면 왜 냄새야?",
+    "Blackjack에서 policy object는 언제 필요해?"
+  ],
+  "symptoms": [
+    "GameService에 dealer hit/stand if문이 계속 늘어납니다",
+    "Player 규칙과 Dealer 규칙이 같은 method에 섞입니다",
+    "규칙 변경 테스트가 service 전체 fixture를 요구합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/policy-object-vs-strategy-map-beginner-bridge"
+    ],
+    "next_docs": [
+      "design-pattern/blackjack-winner-decision-policy-object-bridge",
+      "software-engineering/service-usecase-vs-domain-rule-placement-drill"
+    ],
+    "confusable_with": [
+      "design-pattern/policy-object-vs-strategy-map-beginner-bridge",
+      "software-engineering/blackjack-ace-rule-vs-turn-state-vs-result-policy-decision-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/blackjack-dealer-policy-object-bridge.md",
+    "revision_history": []
+  }
+}

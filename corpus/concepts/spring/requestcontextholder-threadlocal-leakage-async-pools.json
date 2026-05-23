@@ -1,0 +1,51 @@
+{
+  "id": "spring/requestcontextholder-threadlocal-leakage-async-pools",
+  "title": "Spring RequestContextHolder ThreadLocal Leakage Across Async Pools",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "'이 문서는 RequestContextHolder와 ThreadLocal request context가 thread pool, @Async,",
+  "body_markdown": "# Spring `RequestContextHolder`, `ThreadLocal`, and Request Context Leakage Across Async Pools\n\n> 한 줄 요약: 요청 컨텍스트는 요청 스레드에 붙어 있다는 가정 위에서 안전한데, thread pool과 async 경계를 넘기며 `ThreadLocal`이나 `RequestContextHolder`를 잘못 복사하면 \"사라짐\"보다 더 위험한 \"다른 요청 정보가 남아 있음\" 문제가 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Request Scope Proxy Pitfalls](./spring-request-scope-proxy-pitfalls.md)\n> - [Spring `@Async` Context Propagation and RestClient / HTTP Interface Clients](./spring-async-context-propagation-restclient-http-interface-clients.md)\n> - [Spring SecurityContext Propagation Across Async and Reactive Boundaries](./spring-securitycontext-propagation-async-reactive-boundaries.md)\n> - [Spring MVC Async Dispatch with `Callable` / `DeferredResult`](./spring-mvc-async-deferredresult-callable-dispatch.md)\n> - [Spring `TaskExecutor` / `TaskScheduler` Overload, Queue, and Rejection Semantics](./spring-taskexecutor-taskscheduler-overload-rejection-semantics.md)\n\nretrieval-anchor-keywords: RequestContextHolder, RequestAttributes, ThreadLocal leak, inheritable thread local, request context leakage, async pool contamination, stale request context, request-scoped data leak\n\n## 핵심 개념\n\n요청 컨텍스트를 다룰 때 많은 문서는 \"async로 넘기면 사라진다\"까지는 말해 준다.\n\n하지만 운영에서 더 위험한 문제는 반대다.\n\n- 사라지는 것보다\n- 이전 요청의 컨텍스트가 남아 있는 것\n\n즉 request context 문제의 핵심은 단순 null이 아니라, **thread pool 재사용으로 다른 요청의 `ThreadLocal` 상태가 새 요청에 섞이는 오염**이다.\n\n이 문맥에서 중요한 것은 다음이다.\n\n- `RequestContextHolder`\n- custom `ThreadLocal`\n- `LocaleContextHolder`\n- MDC\n- SecurityContext\n\n이들은 모두 \"현재 실행 컨텍스트\"를 가정하지만, thread pool은 그 가정을 쉽게 깨뜨린다.\n\n## 관찰 증거\n\n이 증상은 \"context가 없다\"와 \"남의 context가 보인다\"를 먼저 갈라야 한다.\n\n- 같은 pool thread 이름에서 서로 다른 request id, user id, tenant id가 이어서 찍힌다.\n- `RequestContextHolder.getRequestAttributes()`가 async 경로에서는 `null`이거나, 더 위험하게 이전 요청 값을 가리킨다.\n- MDC, `LocaleContextHolder`, custom `ThreadLocal`, `SecurityContextHolder` 중 어떤 값만 남는지 서로 다르다.\n- `TaskDecorator`나 wrapper executor에 `finally` cleanup이 없거나, nested task에서 restore 기준이 없다.\n- request-scoped bean/proxy를 background 작업에 넘긴 뒤 요청 종료 후 접근 예외가 난다.\n\n## 1차 분기\n\n| 1차 분기 | 관찰 증거 | 먼저 볼 경계 | 첫 조치 |\n|---|---|---|---|\n| context missing | async 작업에서 request attributes가 `null` | request thread -> worker thread | 필요한 값만 DTO/argument로 명시 전달 |\n| stale context leakage | 다른 요청의 request id/user id가 보임 | pool thread 재사용 + cleanup 누락 | `try/finally` clear, 이전 값 restore, decorator 점검 |\n| partial propagation | MDC는 있는데 request/security context는 없음 | context별 holder와 decorator 범위 | 전파해야 할 context와 금지할 context를 분리 |\n| inheritable 착시 | thread 생성 시점에 따라 값이 가끔 보임 | `InheritableThreadLocal` + pool | request context 전파 해법에서 제외 |\n| request-scoped escape | 요청 종료 후 proxy 접근 실패 | request scope -> background lifetime | 최소 immutable 값으로 변환 후 전달 |\n\n## 깊이 들어가기\n\n### 1. `ThreadLocal`은 요청 수명 주기가 아니라 스레드 수명 주기를 따른다\n\n이게 출발점이다.\n\n웹 요청은 짧지만, pool thread는 오래 산다.\n\n그래서 `ThreadLocal` 값을 넣고 확실히 비우지 않으면 다음이 가능하다.\n\n- 요청 A가 thread-1에서 실행\n- `ThreadLocal` 값 설정\n- cleanup 누락\n- 나중에 요청 B도 thread-1 재사용\n- 요청 A의 컨텍스트가 요청 B에 보임\n\n즉 leak는 메모리 누수만이 아니라, **논리적 데이터 오염**이다.\n\n### 2. `RequestContextHolder`도 안전지대가 아니다\n\nSpring은 request 처리 중 `RequestContextHolder`에 현재 request attributes를 묶는다.\n\n이걸 직접 읽거나 복사해서 async로 넘기기 시작하면 위험해진다.\n\n- lifecycle이 끝난 request를 나중에 참조할 수 있다\n- 잘못 복사된 attributes가 다른 작업에 남을 수 있다\n- pool thread 재사용으로 stale context가 보일 수 있다\n\n즉 \"request context를 async에서도 계속 쓰고 싶다\"는 생각 자체가 종종 잘못된 설계 신호다.\n\n### 3. `InheritableThreadLocal`은 새 thread엔 편해 보여도 pool과는 잘 안 맞는다\n\n가끔 `InheritableThreadLocal`로 해결하려는 시도가 있다.\n\n하지만 thread pool 환경에선 새로 thread를 매번 만들지 않으므로 직관과 다르게 동작하기 쉽다.\n\n- 한 번 상속된 값이 오래 남을 수 있다\n- pool 재사용과 섞이면 누가 누구 값을 물려받았는지 추적이 어렵다\n\n즉 request context 전파를 위해 `InheritableThreadLocal`을 기본 해법으로 택하는 건 보통 위험하다.\n\n### 4. 복사보다 \"필요한 값만 명시적으로 추출\"하는 편이 안전하다\n\n요청 컨텍스트 전체를 들고 가려 하지 말고,\n정말 필요한 데이터만 추출해서 immutable 값으로 넘기는 편이 좋다.\n\n예:\n\n- request ID\n- user ID\n- locale code\n- tenant ID\n\n이 방식의 장점:\n\n- 요청 수명 주기와 분리된다\n- stale request reference를 막기 쉽다\n- 테스트와 디버깅이 쉬워진다\n\n핵심은 context object 전파보다, **업무에 필요한 최소 식별자만 명시적으로 전달**하는 것이다.\n\n### 5. 복사가 필요하다면 반드시 try/finally cleanup이 있어야 한다\n\nMDC나 SecurityContext처럼 복사가 필요한 경우도 있다.\n\n그럴 때는 다음이 중요하다.\n\n- 실행 전 설정\n- 실행 후 무조건 clear\n- nested task일 때 restore 기준 명확화\n\n즉 context propagation의 본질은 복사가 아니라, **설정과 정리를 쌍으로 갖는 것**이다.\n\n### 6. request-scoped bean을 background 작업에 직접 넘기면 더 빨리 꼬인다\n\nrequest-scoped proxy를 async 작업에 넘기면 다음 문제가 생긴다.\n\n- 현재 request가 끝난 뒤 접근 실패\n- proxy 뒤 실제 request object가 이미 사라짐\n- 디버깅 시 proxy class만 보여 더 헷갈림\n\n이 경우는 전파 기술이 부족한 것이 아니라, **요청 전용 상태를 요청 밖으로 가져간 설계** 자체가 문제일 가능성이 높다.\n\n## 실전 시나리오\n\n### 시나리오 1: 간헐적으로 다른 사용자의 request ID가 로그에 찍힌다\n\nMDC/ThreadLocal cleanup 누락을 의심해야 한다.\n\n이건 null보다 훨씬 위험한 오염 신호다.\n\n### 시나리오 2: async 작업에서 RequestContextHolder가 어떤 때는 보이고 어떤 때는 null이다\n\nworker thread 재사용 시점과 복사/cleanup 누락 여부가 섞였을 수 있다.\n\n### 시나리오 3: request-scoped bean을 비동기 알림 작업에 넘겼다\n\n요청이 끝난 뒤 접근하거나, stale proxy reference 때문에 예측하기 어려운 오류가 날 수 있다.\n\n### 시나리오 4: `InheritableThreadLocal`로 해결했더니 더 재현이 어려워졌다\n\npool thread 재사용과 상속 시점이 섞이면서 문제를 더 은폐했을 수 있다.\n\n## 코드로 보기\n\n### 위험한 custom ThreadLocal\n\n```java\npublic final class RequestTenantHolder {\n    private static final ThreadLocal<String> TENANT = new ThreadLocal<>();\n\n    public static void set(String tenantId) {\n        TENANT.set(tenantId);\n    }\n\n    public static String get() {\n        return TENANT.get();\n    }\n\n    public static void clear() {\n        TENANT.remove();\n    }\n}\n```\n\n### 최소 값만 추출해서 넘기기\n\n```java\nString requestId = request.getHeader(\"X-Request-Id\");\nLong userId = currentUser.id();\nexecutor.execute(() -> notificationService.send(userId, requestId));\n```\n\n### 복사 + 정리 패턴\n\n```java\nMap<String, String> contextMap = MDC.getCopyOfContextMap();\nexecutor.execute(() -> {\n    try {\n        if (contextMap != null) {\n            MDC.setContextMap(contextMap);\n        }\n        task.run();\n    } finally {\n        MDC.clear();\n    }\n});\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| request context 직접 참조 | 구현이 편해 보인다 | async/pool 경계에서 쉽게 깨진다 | 요청 스레드 안에서만 |\n| context 전체 복사 | 일부 연속성은 유지된다 | cleanup 누락 시 오염 위험이 크다 | MDC/Security 등 제한적 컨텍스트 |\n| 최소 값 명시 전달 | 가장 안전하고 명확하다 | 코드가 조금 더 길어진다 | background/async 작업 |\n| `InheritableThreadLocal` | 새 thread엔 편해 보인다 | pool 환경에선 매우 헷갈린다 | 가급적 피함 |\n\n핵심은 request context를 \"계속 유지할 상태\"가 아니라, **요청 스레드 안에서만 유효한 임시 상태**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: request context 문제에서 null보다 더 위험한 것은 무엇인가?\n> 의도: stale context 오염 인식 확인\n> 핵심: 이전 요청의 컨텍스트가 남아 다른 요청에 섞이는 것이다.\n\n> Q: `ThreadLocal` cleanup 누락이 왜 thread pool에서 특히 위험한가?\n> 의도: 스레드 수명 주기 이해 확인\n> 핵심: pool thread가 재사용되기 때문에 오래된 값이 다음 요청으로 넘어갈 수 있기 때문이다.\n\n> Q: `InheritableThreadLocal`이 왜 request context 전파의 기본 해법이 아닌가?\n> 의도: pool과 상속 모델 차이 확인\n> 핵심: thread pool 재사용 환경에서는 직관과 다르게 stale 값이 남기 쉽기 때문이다.\n\n> Q: 가장 안전한 전파 방식은 무엇인가?\n> 의도: 설계 원칙 확인\n> 핵심: context object 전체가 아니라 필요한 최소 식별자만 명시적으로 전달하는 것이다.\n\n## 한 줄 정리\n\n요청 컨텍스트 문제의 본질은 \"async에서 사라진다\"보다, thread pool 재사용 속에서 예전 요청 정보가 남아 새 요청에 섞일 수 있다는 데 있다.\n",
+  "aliases": [
+    "RequestContextHolder ThreadLocal leakage",
+    "request context async pool",
+    "ThreadLocal stale request",
+    "TaskDecorator request attributes",
+    "context propagation cleanup",
+    "async request information leak",
+    "@Async"
+  ],
+  "expected_queries": [
+    "RequestContextHolder를 @Async thread pool에서 그대로 써도 돼?",
+    "ThreadLocal request context 누수는 왜 사라짐보다 더 위험해?",
+    "TaskDecorator로 request attributes를 복사할 때 cleanup은 어떻게 해야 해?",
+    "SecurityContext와 request context propagation은 어떤 위험이 달라?"
+  ],
+  "symptoms": [
+    "async 작업에서 RequestContextHolder가 비어 있거나 엉뚱한 요청 값을 본다.",
+    "ThreadLocal을 복사한 뒤 cleanup하지 않아 다음 요청 정보가 남는다.",
+    "MDC나 request id가 thread pool 경계를 넘어 섞여 보인다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-di-basics"
+    ],
+    "next_docs": [
+      "spring/spring-async-completablefuture-restclient-non-blocking-intermediate-primer"
+    ],
+    "confusable_with": [
+      "spring/request-scope-proxy-pitfalls",
+      "spring/async-context-propagation-restclient-http-interface-clients",
+      "spring/securitycontext-propagation-async-reactive-boundaries",
+      "spring/mvc-async-deferredresult-callable-dispatch"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-requestcontextholder-threadlocal-leakage-async-pools.md",
+    "revision_history": []
+  }
+}

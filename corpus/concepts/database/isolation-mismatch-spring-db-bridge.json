@@ -1,0 +1,46 @@
+{
+  "id": "database/isolation-mismatch-spring-db-bridge",
+  "title": "Isolation Mismatch Spring DB Bridge",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 bridge는 Spring @Transactional isolation 설정과 실제 DB 기본 격리 수준 차이를 연결한다. MySQL PostgreSQL 결과 차이, DB session isolation, 로컬/운영 동시성 테스트 차이 같은 질문을 다룬다.",
+  "body_markdown": "# Isolation Mismatch Spring DB Bridge\n\n## 한 줄 요약\n\nSpring에서 isolation을 명시하지 않으면 보통 DB connection의 기본 격리 수준을 따른다. 그래서 같은 `@Transactional` 코드라도 MySQL, PostgreSQL, H2, Testcontainers 설정에 따라 읽기 관찰과 lock 동작이 달라질 수 있다.\n\n## 미션 진입 증상\n\n동시성 테스트가 로컬 H2에서는 재현되지 않고 MySQL에서는 재현되거나, PostgreSQL에서는 매 statement마다 최신 commit을 보는 것처럼 보일 수 있다. 이때 바로 \"Spring 트랜잭션이 깨졌다\"고 판단하지 말고 실제 DB session isolation, read query 종류, ORM flush 시점을 같이 확인한다.\n\n대표 증거는 다음이다.\n\n- transaction 시작 직후의 session isolation 값\n- 테스트와 운영이 같은 DB engine인지, 같은 version인지\n- `SELECT`인지 `SELECT ... FOR UPDATE` 같은 locking read인지\n- JPA persistence context가 1차 cache에서 반환한 값인지, 실제 SQL을 다시 보낸 값인지\n- connection pool이 read/write datasource를 다르게 라우팅하는지\n\n## 핵심 mental model\n\n`@Transactional(isolation = DEFAULT)`는 명확한 격리 수준을 선언한 것이 아니다. Spring은 transaction boundary를 만들지만, anomaly가 보이는 방식은 DB의 MVCC 구현, locking read, index access path, constraint 동작이 결정한다.\n\n예를 들어 MySQL InnoDB의 기본 isolation은 흔히 `REPEATABLE READ`이고, PostgreSQL 기본은 흔히 `READ COMMITTED`다. 이름이 같거나 비슷해도 snapshot 생성 시점과 lock 충돌 방식은 DB마다 다르다. H2의 동작을 운영 DB의 동시성 증거로 과신하면 안 된다.\n\n## 확인 지점\n\n| 확인할 것 | 예시 | 이유 |\n|---|---|---|\n| 실제 session isolation | MySQL `SELECT @@transaction_isolation`, PostgreSQL `SHOW transaction_isolation` | Spring annotation과 DB reality를 맞춤 |\n| explicit isolation 사용 여부 | `@Transactional(isolation = Isolation.READ_COMMITTED)` | 의도를 코드에 남김 |\n| read mode | plain select, locking read, native query | 같은 isolation에서도 관찰 결과가 달라짐 |\n| ORM flush/cache | FlushMode, persistence context clear 여부 | DB가 아니라 1차 cache를 보고 있을 수 있음 |\n| datasource routing | primary/replica, read-only transaction | 최신성 문제와 isolation 문제를 분리 |\n\nIsolation을 올리면 항상 더 안전하다고 말할 수 없다. `SERIALIZABLE`은 anomaly를 줄일 수 있지만 abort/retry가 늘 수 있고, DB별 구현 차이가 크다. `REPEATABLE READ`도 모든 business invariant를 자동으로 지키지는 않는다. 중복 예약, 유니크한 닉네임, 음수 재고 같은 불변식은 unique constraint, conditional update, lock 범위를 별도로 설계해야 한다.\n\n## Spring에서 자주 섞이는 문제\n\n`@Transactional`이 적용되지 않은 self-invocation, 테스트의 rollback transaction, `readOnly = true` 오해, repository method마다 다른 transaction boundary가 isolation mismatch처럼 보일 수 있다. 이 문서의 핵심은 \"Spring 설정명만 보지 말고 실제 DB session과 SQL 관찰을 확인하라\"는 것이다.\n\n`readOnly = true`는 읽기 의도를 전달하는 힌트에 가깝고, 모든 DB에서 같은 snapshot 보장을 제공한다고 보면 안 된다. 또한 connection pool과 transaction manager가 isolation을 변경한 뒤 원복하는지는 구성에 따라 확인해야 한다.\n\n## 흔한 오해\n\n격리 수준 이름이 같으면 모든 DB에서 같은 anomaly가 보인다고 생각하면 안 된다. 표준 이름은 시작점이고, 각 DB의 read view와 lock 동작을 같이 봐야 한다. 또 isolation은 \"읽기 관찰\"을 다루는 도구이지, 도메인 불변식 전체를 대신 검증하는 계층이 아니다.\n\n## 검증 절차\n\n- Testcontainers 등으로 운영 DB와 같은 engine에서 동시성 테스트를 돌린다.\n- 두 transaction을 latch로 멈춰 두고 각 시점의 SQL, isolation, commit 순서를 로그로 남긴다.\n- plain select와 locking read를 나눠 테스트한다.\n- 같은 테스트를 `READ_COMMITTED`, `REPEATABLE_READ` 등 명시 isolation으로 한 번씩 실행해 차이를 기록한다.\n- 실패 케이스를 \"어떤 anomaly가 관찰됐는가\"로 적고, unique constraint나 lock이 필요한 문제와 분리한다.\n\n## Safe Next Docs\n\nMVCC snapshot vs locking read portability note와 DB별 isolation 문서를 이어서 본다.\n",
+  "aliases": [
+    "isolation mismatch spring database",
+    "spring transaction isolation db default",
+    "격리 수준 불일치",
+    "Spring DB isolation 차이",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "Spring에서 isolation을 안 적으면 DB 기본값 때문에 동작이 달라져?",
+    "MySQL과 PostgreSQL에서 같은 트랜잭션 테스트가 다르게 보여",
+    "isolation mismatch는 어디서 확인해야 해?"
+  ],
+  "symptoms": [
+    "로컬 DB와 운영 DB에서 동시성 테스트 결과가 달라요",
+    "READ_COMMITTED라고 생각했는데 repeatable read처럼 보여요",
+    "Spring annotation과 DB session isolation이 맞는지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-isolation-basics"
+    ],
+    "next_docs": [
+      "database/mvcc-snapshot-vs-locking-read-portability"
+    ],
+    "confusable_with": [
+      "database/transaction-isolation-basics",
+      "spring/transaction-isolation-readonly-pitfalls"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/isolation-mismatch-spring-db-bridge.md",
+    "revision_history": []
+  }
+}

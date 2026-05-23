@@ -1,0 +1,57 @@
+{
+  "id": "database/vacuum-purge-freeze-risk-runbook-routing",
+  "title": "Vacuum / Purge / Freeze Risk Triage and Runbook Routing",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Vacuum / Purge / Freeze Risk Triage and Runbook Routing\n\n> 한 줄 요약: vacuum debt, purge debt, freeze debt는 모두 cleanup backlog 계열이지만, 성능 저하를 다루는 사고와 wraparound 안전성 사고는 같은 런북으로 다루면 안 된다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md)\n- [Autovacuum Freeze Debt, XID Age, and Wraparound Playbook](./autovacuum-freeze-debt-wraparound-playbook.md)\n- [Purge Backlog Remediation, Throttling, and Recovery Playbook](./purge-backlog-remediation-throttle-playbook.md)\n- [Purge Thread Scheduling and Lag Control](./purge-thread-scheduling-lag-control.md)\n- [Undo Tablespace Truncation and Purge Debt](./undo-tablespace-truncation-purge-debt.md)\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n- [Replication Lag Forensics and Root-Cause Playbook](./replication-lag-forensics-root-cause-playbook.md)\n\nretrieval-anchor-keywords: vacuum purge freeze risk, cleanup debt triage, autovacuum routing, wraparound risk playbook, history list length incident, purge backlog routing, index only scan vacuum debt, freeze debt escalation, backend db maintenance runbook\n\n## 핵심 개념\n\n운영에서 cleanup debt 계열 신호를 보면 먼저 \"청소가 밀렸다\"라고 묶기 쉽다.  \n하지만 실제 대응은 다음 셋으로 갈라서 봐야 한다.\n\n- PostgreSQL vacuum debt\n  - dead tuple, bloat, visibility map 지연, index-only scan 회귀 같은 **성능 중심 문제**\n- PostgreSQL freeze debt\n  - XID age 상승, anti-wraparound 압박 같은 **가용성 안전 문제**\n- InnoDB purge debt\n  - history list length, undo growth, purge lag 같은 **write-path backlog 문제**\n\n즉 첫 질문은 \"얼마나 밀렸나\"보다, **지금 다루는 것이 성능 debt인지 safety debt인지**다.\n\n## 깊이 들어가기\n\n### 1. 첫 분류를 잘못하면 런북이 틀어진다\n\n대표적인 오진:\n\n- PostgreSQL heap fetch 증가를 보고 인덱스만 고친다\n- freeze age 경고를 bloat 청소 문제로 취급한다\n- InnoDB undo growth를 디스크 증설 문제로만 본다\n\n하지만 실제로는:\n\n- 성능 회귀면 vacuum/purge debt forensic과 slow query 흐름이 필요하고\n- wraparound 위험이면 autovacuum freeze 대응이 먼저이며\n- history backlog면 purge blocker 제거와 throttling 순서가 중요하다\n\n즉 cleanup debt는 하나의 개념이지만, **운영 의사결정은 다른 런북으로 분기**된다.\n\n### 2. 첫 5분 triage는 엔진별로 따로 잡아야 한다\n\nPostgreSQL에서 먼저 볼 것:\n\n- age가 가장 큰 database / relation\n- 최근 autovacuum와 freeze 관련 activity\n- dead tuple과 heap fetch 증가 여부\n- 오래 열린 transaction / snapshot 존재\n\nInnoDB에서 먼저 볼 것:\n\n- `Innodb_history_list_length` 추세\n- undo tablespace growth\n- 오래 열린 transaction 존재\n- purge throttling / purge thread 설정과 현재 backlog\n\n공통으로 중요한 건 절대값 하나가 아니라:\n\n- backlog가 지금도 증가 중인가\n- blocker가 명확한가\n- worker가 못 도는가, 아니면 돌아도 못 따라가는가\n\n### 3. 관측된 신호를 바로 런북으로 연결해야 한다\n\n| 관측된 신호 | 먼저 물어볼 질문 | 1차 런북 | 다음 연결 |\n|------|------|------|------|\n| `Heap Fetches` 증가, dead tuple 증가, index-only scan 회귀 | 성능 debt가 visibility와 bloat를 흔드는가 | [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md) | [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md), [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md) |\n| age 경고, anti-wraparound 압박, 큰 low-churn relation age 상승 | 지금은 성능보다 safety가 우선인가 | [Autovacuum Freeze Debt, XID Age, and Wraparound Playbook](./autovacuum-freeze-debt-wraparound-playbook.md) | [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md) |\n| `Innodb_history_list_length` 증가, undo growth, purge lag | purge가 막혔나, 아니면 못 따라가나 | [Purge Backlog Remediation, Throttling, and Recovery Playbook](./purge-backlog-remediation-throttle-playbook.md) | [Purge Thread Scheduling and Lag Control](./purge-thread-scheduling-lag-control.md), [Undo Tablespace Truncation and Purge Debt](./undo-tablespace-truncation-purge-debt.md) |\n| replica apply가 밀리는데 purge/vacuum debt 신호도 같이 보임 | 복제 지연의 root cause가 cleanup backlog인가 | [Replication Lag Forensics and Root-Cause Playbook](./replication-lag-forensics-root-cause-playbook.md) | 엔진에 따라 [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md) 또는 [Purge Backlog Remediation, Throttling, and Recovery Playbook](./purge-backlog-remediation-throttle-playbook.md) |\n\n### 4. freeze debt는 항상 별도 escalation lane으로 봐야 한다\n\nvacuum debt와 freeze debt는 둘 다 PostgreSQL autovacuum 문맥에 있지만, 운영 우선순위는 다르다.\n\n- vacuum debt\n  - bloat, scan cost, visibility map, heap fetch 같은 성능 신호\n- freeze debt\n  - XID age, anti-wraparound pressure, 강제 vacuum window 확보 같은 안전 신호\n\n그래서 둘이 동시에 보여도:\n\n1. relation age와 wraparound 위험을 먼저 확인하고\n2. 긴 transaction을 끊거나 maintenance window를 확보한 뒤\n3. 그다음 bloat와 plan regression을 정리하는 편이 안전하다\n\n즉 freeze debt는 cleanup debt의 하위 케이스가 아니라, **우선순위가 더 높은 운영 이벤트**다.\n\n### 5. purge debt는 worker tuning보다 backlog 생성기 차단이 먼저다\n\nInnoDB incident에서 흔한 실수는 다음이다.\n\n- `innodb_purge_threads`만 올린다\n- undo tablespace만 본다\n- history list length 절대값만 보고 추세를 놓친다\n\n보통 더 효과적인 순서는:\n\n1. long transaction / snapshot 제거\n2. batch pause 또는 chunk 축소\n3. 필요 시 throttling\n4. purge capacity 조정\n5. 추세 반전 확인\n\n즉 purge debt 대응은 worker 숫자보다, **누가 backlog를 만들고 있는지 먼저 끊는 운영 런북**이다.\n\n### 6. 후속 운영은 dashboard와 handoff 기준까지 포함해야 한다\n\ncleanup debt 문서를 읽고 끝내면 재발한다.  \n운영 런북으로 연결하려면 최소한 다음 handoff가 있어야 한다.\n\n- PostgreSQL\n  - worst relation age dashboard\n  - dead tuple / heap fetch / autovacuum lag 관찰\n  - long transaction alert\n- InnoDB\n  - history list length trend\n  - undo growth and long transaction count\n  - purge throttling 발동 여부\n\n핵심은 \"느려졌다\"는 티켓을 받았을 때 곧바로 SQL 튜닝으로 가지 않고,  \n**cleanup debt 전용 관측 신호를 먼저 거쳐 적절한 런북으로 라우팅**하는 것이다.\n\n## 실전 시나리오\n\n### 시나리오 1. PostgreSQL 목록 API에서 index-only scan 효과가 사라짐\n\n증상:\n\n- `Index Only Scan`인데 `Heap Fetches`가 계속 높다\n- dead tuple과 autovacuum lag가 같이 보인다\n\n우선 라우팅:\n\n- [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md)\n\n다음 확인:\n\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n\n### 시나리오 2. 잘 안 바뀌는 archive table이 갑자기 위험 relation이 됨\n\n증상:\n\n- low churn table인데 age 경고가 뜬다\n- 일반 vacuum debt보다 freeze debt가 더 의심된다\n\n우선 라우팅:\n\n- [Autovacuum Freeze Debt, XID Age, and Wraparound Playbook](./autovacuum-freeze-debt-wraparound-playbook.md)\n\n교훈:\n\n- \"잘 안 바뀌니 안전하다\"는 가정은 freeze debt에선 틀릴 수 있다\n\n### 시나리오 3. 야간 delete batch 뒤 InnoDB가 점점 무거워짐\n\n증상:\n\n- `Innodb_history_list_length` 상승\n- undo growth 지속\n- write latency와 replica apply가 같이 나빠진다\n\n우선 라우팅:\n\n- [Purge Backlog Remediation, Throttling, and Recovery Playbook](./purge-backlog-remediation-throttle-playbook.md)\n\n다음 연결:\n\n- [Purge Thread Scheduling and Lag Control](./purge-thread-scheduling-lag-control.md)\n- [Replication Lag Forensics and Root-Cause Playbook](./replication-lag-forensics-root-cause-playbook.md)\n\n## 코드로 보기\n\n```text\nrunbook routing order\n1. identify engine\n2. split performance debt vs safety debt\n3. find blocker or backlog generator\n4. open engine-specific playbook\n5. only then tune worker count or maintenance parameters\n```\n\n```sql\n-- PostgreSQL 감각\nSELECT datname, age(datfrozenxid)\nFROM pg_database\nORDER BY age(datfrozenxid) DESC;\n\nSELECT relname, age(relfrozenxid)\nFROM pg_class\nWHERE relkind IN ('r', 'm', 't')\nORDER BY age(relfrozenxid) DESC\nLIMIT 20;\n\nSELECT pid, xact_start, state, query\nFROM pg_stat_activity\nWHERE xact_start IS NOT NULL\nORDER BY xact_start;\n```\n\n```sql\n-- InnoDB 감각\nSHOW STATUS LIKE 'Innodb_history_list_length';\nSHOW ENGINE INNODB STATUS\\G\n\nSELECT trx_id, trx_started, trx_state, trx_query\nFROM information_schema.innodb_trx\nORDER BY trx_started;\n```\n\n핵심은 특정 명령어보다, **어떤 위험 축으로 분류하고 어떤 런북으로 넘길지**를 먼저 정하는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 느린 쿼리처럼 바로 접근 | 단순하다 | freeze/purge root cause를 놓칠 수 있다 | cleanup debt 신호가 약할 때만 |\n| cleanup debt triage 먼저 수행 | 적절한 런북으로 빨리 갈 수 있다 | 엔진별 지표 이해가 필요하다 | bloat, age, undo incident 전반 |\n| worker 수부터 조정 | 즉시 시도하기 쉽다 | blocker가 남으면 실패한다 | blocker 부재가 확인된 뒤 |\n| 수동 freeze/purge 개입 | 위험을 빠르게 낮춘다 | maintenance 비용과 부하가 있다 | safety risk 또는 backlog 급증 시 |\n\n## 꼬리질문\n\n> Q: freeze debt를 일반 vacuum debt와 같은 런북으로 처리하면 왜 위험한가요?\n> 의도: 성능 문제와 가용성 안전 문제를 분리하는지 확인\n> 핵심: freeze debt는 wraparound 방지가 우선이라 성능 최적화보다 선제 개입이 먼저다\n\n> Q: `Innodb_history_list_length`가 오를 때 가장 먼저 확인할 것은 무엇인가요?\n> 의도: purge capacity보다 blocker를 먼저 보는지 확인\n> 핵심: long transaction이나 giant batch가 purge를 막거나 backlog를 만들고 있는지 본다\n\n> Q: index-only scan 회귀가 왜 vacuum debt 런북으로 이어질 수 있나요?\n> 의도: 인덱스 설계와 cleanup 상태를 연결하는지 확인\n> 핵심: visibility map과 dead tuple 상태가 heap fetch를 다시 늘릴 수 있기 때문이다\n\n## 한 줄 정리\n\nvacuum/purge/freeze incident는 모두 cleanup debt 계열이지만, 성능 debt인지 safety debt인지 먼저 가른 뒤 엔진별 런북으로 넘겨야 대응 순서가 흔들리지 않는다.\n",
+  "aliases": [
+    "vacuum purge freeze risk",
+    "cleanup debt triage",
+    "autovacuum routing",
+    "wraparound risk playbook",
+    "history list length incident",
+    "purge backlog routing",
+    "index only scan vacuum debt",
+    "freeze debt escalation",
+    "vacuum debt vs freeze debt",
+    "purge debt runbook"
+  ],
+  "expected_queries": [
+    "vacuum debt, freeze debt, InnoDB purge debt는 모두 cleanup backlog지만 왜 서로 다른 런북으로 라우팅해야 해?",
+    "PostgreSQL heap fetch 증가와 dead tuple은 performance debt이고 XID wraparound는 safety debt라는 차이를 설명해줘",
+    "InnoDB history list length와 undo growth가 보이면 purge backlog remediation으로 어떻게 내려가?",
+    "autovacuum freeze age 경고를 단순 bloat 청소 문제로 보면 왜 위험해?",
+    "cleanup debt triage에서 첫 5분에 엔진별로 어떤 신호를 봐야 해?"
+  ],
+  "symptoms": [
+    "PostgreSQL vacuum debt, freeze debt, InnoDB purge debt를 cleanup backlog로만 묶어 같은 런북을 보려 해",
+    "heap fetch 증가와 dead tuple은 성능 debt이고 XID age wraparound는 safety debt라는 분기를 해야 해",
+    "InnoDB history list length, undo growth, purge lag가 보일 때 purge blocker와 throttling 런북으로 연결해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/vacuum-purge-debt-forensics-symptom-map",
+      "database/undo-tablespace-truncation-purge-debt"
+    ],
+    "next_docs": [
+      "database/autovacuum-freeze-debt-wraparound-playbook",
+      "database/purge-backlog-remediation-throttle-playbook",
+      "database/replication-lag-forensics-root-cause-playbook"
+    ],
+    "confusable_with": [
+      "database/vacuum-purge-debt-forensics-symptom-map",
+      "database/autovacuum-freeze-debt-wraparound-playbook",
+      "database/undo-tablespace-truncation-purge-debt"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/vacuum-purge-freeze-risk-runbook-routing.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "security/oauth-state-nonce-pkce-interview-chooser",
+  "title": "OAuth State Nonce PKCE Interview Chooser",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 chooser는 OAuth/OIDC 면접에서 state, nonce, PKCE의 방어 목적을 구분한다.",
+  "body_markdown": "# OAuth State Nonce PKCE Interview Chooser\n\n## 보장 범위\n\n이 chooser는 OAuth/OIDC 로그인 흐름에서 `state`, `nonce`, `PKCE`가 각각 어떤 공격면을 줄이는지 구분한다. API access token 폐기, refresh token rotation, session fixation, 일반 CSRF 방어 전체를 한 문서로 섞지 않는다.\n\n세 값의 검증 위치는 다르다. `state`는 authorization request와 callback의 browser/session correlation을 본다. `nonce`는 OIDC ID Token이 해당 인증 요청에 대응하는지 확인한다. `PKCE`는 authorization code를 탈취하거나 주입해도 code verifier 없이는 token exchange를 못 하게 한다.\n\n최신 OAuth Security BCP 기준으로는 authorization server가 PKCE를 확실히 지원하고 검증한다는 전제가 있으면 authorization code flow의 redirect endpoint CSRF/code injection 방어를 PKCE에 의존할 수 있다. 그래도 면접 답변에서는 \"PKCE가 state의 모든 쓰임을 대체한다\"가 아니라, `state`는 callback correlation과 앱 return-state 보관, `nonce`는 ID Token 검증, `PKCE`는 code-to-client-instance binding이라고 나눠 말하는 편이 안전하다.\n\n## 10초 chooser\n\n| 값 | 주된 목적 | 어디서 확인 | 단독으로 기대하지 않을 것 |\n|---|---|---|---|\n| `state` | OAuth request/callback correlation, legacy CSRF token, app return-state 연결 | callback parameter와 client/session 저장값 | ID Token replay, code interception |\n| `nonce` | OIDC request와 ID Token 연결, ID Token replay 완화 | ID Token `nonce` claim | OAuth-only flow, access token replay |\n| `PKCE` | authorization code를 client instance/verifier에 binding | token endpoint의 `code_verifier` 검증 | ID Token replay, 앱 return-state 보관, provider mix-up 방어 |\n\n## 헷갈리는 축\n\n`state`는 authorization request와 callback이 같은 browser/session에서 이어졌는지 확인하는 값이다. 공격자가 자기 계정으로 만든 callback을 피해자 세션에 꽂는 login CSRF를 줄인다.\n\n`nonce`는 OIDC에서 ID Token 안에 들어와, client가 요청한 nonce와 token의 nonce가 맞는지 확인한다. ID Token replay와 인증 응답 correlation에 가깝고, OAuth-only authorization code flow에서 ID Token이 없다면 검증할 `nonce` claim도 없다.\n\nPKCE는 client가 만든 `code_verifier`에서 `code_challenge`를 파생해 authorization request에 보내고, token endpoint에서 원래 verifier를 대조하는 장치다. public client의 code interception뿐 아니라, 다른 transaction에서 얻은 code를 callback에 주입하는 공격도 verifier mismatch로 줄일 수 있다.\n\n따라서 최신 답변은 이렇게 정리한다.\n\n- authorization server가 PKCE를 지원/강제하고 authorization code flow만 본다면 PKCE는 redirect endpoint CSRF 방어 축이 될 수 있다.\n- authorization server 지원을 확신할 수 없거나 OAuth-only/legacy provider라면 one-time `state`를 CSRF/correlation guard로 둔다.\n- OIDC라면 `nonce`를 ID Token claim으로 검증한다. `nonce`를 보냈다면 signature/issuer/audience/expiry와 함께 반드시 비교한다.\n- `state`에 return URL을 담는 경우에도 원문 URL을 그대로 믿지 말고 server-side 저장 또는 allowlist 검증을 둔다.\n\n## 관찰 증거\n\n- Authorization request에 예측 불가능한 `state`가 있고, callback에서 저장된 값과 일치해야 하며, 성공/실패 후 일회성으로 정리된다.\n- OIDC 요청에 `nonce`가 있고, ID Token 검증 시 signature, issuer, audience, expiry와 함께 `nonce` claim을 비교한다.\n- Authorization request에 `code_challenge`와 `code_challenge_method=S256`이 있고, token endpoint가 `code_verifier` 불일치를 거부한다.\n- authorization server metadata, client 설정, 실패 로그에서 PKCE가 실제로 지원/검증되는지 확인한다. `plain` downgrade나 verifier 없는 token exchange 성공은 위험 신호다.\n- 로그에는 `invalid_state`, `nonce_mismatch`, `pkce_verifier_mismatch` 같은 실패 사유가 남되, 원문 state/nonce/verifier 값은 노출하지 않는다.\n- callback cookie나 server-side state store는 짧은 TTL, Secure, HttpOnly, SameSite 같은 저장소 방어를 갖춘다. 이건 state 보관 방식의 증거이지, session 공격 전체의 대체 방어는 아니다.\n\n## 운영 대응\n\n1. 로그인 시작 시 `state`, OIDC면 `nonce`, PKCE면 `code_verifier`를 요청마다 새로 만든다.\n2. callback에서는 먼저 `state`를 검증해 요청 상관관계를 확인한 뒤 code exchange를 진행한다.\n3. PKCE를 CSRF/code-injection 방어 축으로 삼으려면 authorization server가 PKCE를 지원하고 token endpoint에서 verifier 불일치를 거부한다는 것을 확인한다.\n4. token exchange에는 원래 생성한 `code_verifier`를 사용하고, `plain` 대신 `S256`을 기본으로 둔다.\n5. ID Token을 받으면 issuer/audience/expiry/signature와 함께 `nonce`를 검증한다.\n6. 성공과 실패 모두 저장된 one-time 값들을 정리한다. 누락되면 replay window가 길어진다.\n\n## Wrong-bucket neighbor\n\n세 값은 함께 쓰일 수 있지만 검증 지점이 다르다. 면접에서는 \"callback/session correlation, ID Token correlation/replay, authorization code binding\" 세 축으로 나눠 답하면 명확하다.\n\n## 흔한 오해\n\n- `state`와 `nonce`를 같은 값으로 설명하면 부족하다. 저장 위치와 검증 대상이 다르다.\n- PKCE를 무조건 CSRF와 무관하다고 말해도 부족하다. 최신 BCP에서는 authorization server가 PKCE를 확실히 지원하면 CSRF/code injection 방어 축으로 볼 수 있지만, 주된 mental model은 code verifier binding이다.\n- PKCE가 있으니 `nonce` 검증이 필요 없다고 말하면 안 된다. OIDC ID Token replay/correlation 검증은 ID Token claim에서 따로 한다.\n- `state`가 있으니 PKCE가 불필요하다고 단정하면 안 된다. state는 token endpoint에서 탈취 code 교환을 막지 못한다.\n- HTTPS를 쓰면 PKCE가 불필요하다고 단정하면 안 된다. redirect URI, browser history, app link, malicious app 같은 interception 경로를 고려한다.\n- OIDC `nonce`는 access token replay 방어가 아니다. ID Token이 해당 인증 요청에서 온 것인지 보는 값이다.\n\n## Safe Next Docs\n\nCallback cookie/state 정리는 `oauth-state-cookie-csrf-router`, cleanup 실패는 `oauth-login-state-cookie-cleanup`으로 이어진다.\n",
+  "aliases": [
+    "OAuth state nonce PKCE chooser",
+    "OAuth state nonce PKCE 차이",
+    "OIDC nonce PKCE interview",
+    "social login csrf replay defense"
+  ],
+  "expected_queries": [
+    "OAuth에서 state nonce PKCE는 각각 뭐가 달라?",
+    "소셜 로그인 CSRF와 code interception을 어떻게 막아?",
+    "OIDC nonce는 OAuth state와 같은 거야?"
+  ],
+  "symptoms": [
+    "state와 nonce를 같은 값처럼 설명합니다",
+    "PKCE를 CSRF 방어로만 이해합니다",
+    "Authorization Code 탈취 위협을 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/oauth2-oidc-social-login-primer"
+    ],
+    "next_docs": [
+      "security/oauth-state-cookie-csrf-router",
+      "security/oauth-login-state-cookie-cleanup"
+    ],
+    "confusable_with": [
+      "security/oauth-state-cookie-csrf-router",
+      "security/oauth-login-state-cookie-cleanup"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/oauth-state-nonce-pkce-interview-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "database/postgresql-create-index-concurrently-invalid-index-recovery-playbook",
+  "title": "PostgreSQL CREATE INDEX CONCURRENTLY Invalid Index Recovery Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# PostgreSQL CREATE INDEX CONCURRENTLY Invalid Index Recovery Playbook\n\n> 한 줄 요약: `CREATE INDEX CONCURRENTLY`는 write 차단을 줄여 주지만 실패하면 invalid index가 남을 수 있으므로, catalog 상태를 확인하고 사용 가능성·write overhead·unique caveat를 분리한 뒤 `DROP INDEX CONCURRENTLY`/재시도 절차를 밟아야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Index Maintenance Window, Rollout, and Fallback Playbook](./index-maintenance-window-rollout-playbook.md)\n- [온라인 스키마 변경 전략](./online-schema-change-strategies.md)\n- [Metadata Lock / DDL Blocking](./metadata-lock-ddl-blocking.md)\n- [Secondary Index Maintenance Cost and ANALYZE Statistics Skew](./secondary-index-maintenance-cost-analyze-skew.md)\n- [PostgreSQL HOT Update, Fillfactor, and Bloat Playbook](./postgresql-hot-update-bloat-fillfactor-playbook.md)\n- [PostgreSQL NOT VALID / VALIDATE CONSTRAINT Rollout Playbook](./postgresql-not-valid-constraint-validate-rollout-playbook.md)\n\nretrieval-anchor-keywords: CREATE INDEX CONCURRENTLY recovery, PostgreSQL invalid index, invalid concurrent index, DROP INDEX CONCURRENTLY, pg_index indisvalid, pg_index indisready, concurrent index build failed, online index build failed, unique index concurrently caveat\n\n## 10초 판단표\n\n| 증상 | 먼저 볼 것 | 이유 |\n|---|---|---|\n| index 이름은 있는데 planner가 안 쓴다 | `pg_index.indisvalid` | invalid index는 query plan 후보가 아닐 수 있다 |\n| build가 오래 대기한다 | long transaction, old snapshot, lock wait | concurrent build는 여러 단계에서 기존 transaction을 기다릴 수 있다 |\n| 실패 후 write latency가 늘었다 | `indisready`, index maintenance 여부 | query에는 안 쓰여도 DML maintenance 비용이 남을 수 있다 |\n| unique concurrent index 실패 후 insert가 막힌다 | unique enforcement caveat | 실패 단계에 따라 invalid unique index가 write에 영향을 줄 수 있다 |\n| migration tool에서 바로 실패한다 | transaction wrapping | `CREATE INDEX CONCURRENTLY`는 transaction block 안에서 실행하면 안 된다 |\n\n## 핵심 mental model\n\n일반 `CREATE INDEX`는 빠르고 단순하지만, 테이블 write를 더 크게 막을 수 있다. `CREATE INDEX CONCURRENTLY`는 write 차단을 줄이기 위해 index catalog entry를 먼저 만들고, 여러 scan과 대기 단계를 거쳐 index를 usable 상태로 승격한다.\n\n이 구조 때문에 실패 상태가 생긴다. migration이 중간에 실패하거나, deadlock/lock timeout/duplicate key/old snapshot 대기 문제가 생기면 \"index object는 있는데 완성품은 아닌\" 상태가 남을 수 있다. 이때 초보자가 가장 많이 하는 실수는 `\\d`나 index 목록에 이름이 보인다는 이유만으로 \"index가 만들어졌다\"고 판단하는 것이다.\n\n운영 판단은 세 축으로 나눠야 한다.\n\n- query planner가 이 index를 쓸 수 있는가\n- insert/update/delete가 이 index maintenance 비용을 내고 있는가\n- unique index라면 실패한 invalid 상태가 쓰기를 막고 있지는 않은가\n\n공식 PostgreSQL 문서 기준으로도 concurrent index build는 table scan을 두 번 수행하고, 기존 transaction과 오래된 snapshot을 기다리며, 완료 직후에도 오래된 transaction이 남아 있으면 query에서 바로 쓰이지 못할 수 있다. 따라서 \"DDL이 끝났다\"와 \"모든 query가 새 index를 쓴다\"를 같은 상태로 보면 안 된다.\n\n## 첫 확인 쿼리\n\ninvalid index 후보는 catalog에서 확인한다.\n\n```sql\nSELECT\n  c.relname AS index_name,\n  t.relname AS table_name,\n  i.indisvalid,\n  i.indisready,\n  i.indislive,\n  i.indisunique\nFROM pg_class c\nJOIN pg_index i ON i.indexrelid = c.oid\nJOIN pg_class t ON i.indrelid = t.oid\nWHERE c.relkind = 'i'\n  AND (NOT i.indisvalid OR NOT i.indisready);\n```\n\n초점은 `indisvalid=false`다. 이 index는 완전히 신뢰 가능한 query plan 후보라고 보면 안 된다. `indisready=true`인데 `indisvalid=false`라면 query에는 못 쓰이면서 write maintenance 비용은 남을 수 있으므로 방치하면 운영 비용이 누적된다.\n\nbuild 진행 중이면 PostgreSQL 버전에 따라 progress view로 현재 phase를 본다.\n\n```sql\nSELECT *\nFROM pg_stat_progress_create_index;\n```\n\n여기서 오래 멈춰 있으면 단순히 \"인덱스 생성이 느림\"이 아니라 long transaction, old snapshot, lock wait, autovacuum/DDL 경쟁을 같이 봐야 한다.\n\n## 복구 playbook\n\n1. 실패한 index가 실제로 invalid인지 catalog로 확인한다.\n2. 같은 이름으로 재시도하기 전에 invalid index가 query/write에 미치는 영향을 확인한다.\n3. unique index라면 새 insert/update가 이상하게 막히는지 먼저 본다.\n4. 보통은 실패한 index를 `DROP INDEX CONCURRENTLY`로 제거하고 다시 build한다.\n5. 재시도 전에는 long transaction, migration transaction wrapping, duplicate row, maintenance window guardrail을 정리한다.\n\n예시:\n\n```sql\nDROP INDEX CONCURRENTLY IF EXISTS idx_orders_created_at_failed;\n```\n\n주의할 점은 `DROP INDEX CONCURRENTLY`도 일반 DDL과 제약이 다르다는 것이다. 보통 transaction block 안에서 실행하지 않는 별도 migration step으로 둔다. migration 도구가 모든 migration을 자동 transaction으로 감싼다면 이 단계는 transaction 비활성 옵션을 써야 한다.\n\n또한 `DROP INDEX CONCURRENTLY`는 한 번에 하나의 index만 다루고, `CASCADE`를 지원하지 않으며, `UNIQUE`/`PRIMARY KEY` constraint를 backing하는 index나 partitioned index에는 그대로 적용할 수 없다. 실패한 concurrent build에서 남은 독립 invalid index를 지우는 상황과, constraint가 의존하는 production index를 제거하는 상황을 섞으면 안 된다.\n\n복구 선택지는 보통 두 갈래다.\n\n- 실패한 신규 index라면 drop 후 `CREATE INDEX CONCURRENTLY` 재시도\n- 이미 쓰던 index를 concurrent reindex하다가 실패했다면 `REINDEX INDEX CONCURRENTLY`의 임시 index 상태와 `_ccnew` suffix를 보고 별도 복구\n\n초보자에게는 첫 번째 경로가 더 흔하다. 중요한 것은 invalid artifact를 방치하지 않고, 왜 실패했는지 제거한 뒤 재시도하는 것이다.\n\n## 실패 원인 matrix\n\n| 실패 원인 | 관찰 증거 | 대응 |\n|---|---|---|\n| transaction block 안에서 실행 | `CREATE INDEX CONCURRENTLY cannot run inside a transaction block` 류 에러 | migration step transaction wrapper 해제 |\n| long transaction / old snapshot | progress phase 대기, 오래된 `xact_start` | report/batch/idle transaction 종료 또는 window 재조정 |\n| duplicate key | unique concurrent build 실패 | duplicate cleanup 후 재시도 |\n| lock timeout / DDL 경쟁 | lock wait, blocking PID | 다른 DDL과 분리하고 lock budget 조정 |\n| statement timeout / 운영 중단 | timeout 로그, incomplete invalid index | invalid index drop 후 낮은 트래픽 window에서 재시도 |\n| partitioned table parent에 바로 concurrent build | parent partitioned index 제약 | partition별 concurrent build 후 metadata attach 전략 검토 |\n\n## Unique concurrent index caveat\n\nunique index를 concurrent로 만들 때는 더 조심해야 한다. 일반 index가 실패하면 \"planner가 못 쓰는 쓰레기 index\" 정도로 보이기 쉽지만, unique index는 실패 단계에 따라 이미 uniqueness check가 쓰기 경로에 영향을 줄 수 있다.\n\n그래서 unique build 실패 후에는 다음을 바로 확인한다.\n\n- invalid unique index가 남아 있는가\n- insert/update가 duplicate 관련 에러를 내는가\n- 실제 중복 데이터가 있었는가\n- application이 retry하면서 같은 실패를 키우고 있지는 않은가\n\n이 caveat 때문에 unique concurrent index rollout은 시작 전에 duplicate precheck, 실패 시 drop 절차, 재시도 window를 문서화해야 한다.\n\n## NOT VALID rollout과 헷갈리지 않기\n\n`CREATE INDEX CONCURRENTLY`와 `ADD CONSTRAINT ... NOT VALID`는 둘 다 큰 테이블 변경을 단계화한다는 점에서 비슷해 보인다. 하지만 문제 축이 다르다.\n\n- `CREATE INDEX CONCURRENTLY`: index structure를 write와 병행해 만든 뒤 planner가 쓸 수 있게 만든다.\n- `NOT VALID`: FK/CHECK constraint의 기존 row validation을 뒤로 미루고 새 write부터 constraint를 적용한다.\n\n따라서 \"기존 row가 constraint를 만족하는지 아직 증명되지 않았다\"는 질문은 NOT VALID 문서로 가고, \"index object가 남았는데 planner가 쓰지 않는다\"는 질문은 이 문서로 와야 한다.\n\n## 운영 중단 기준\n\nconcurrent index build는 무중단이라는 이름 때문에 끝까지 밀어붙이기 쉽다. 하지만 운영에서는 중단 기준이 있어야 한다.\n\n- replica lag가 임계치를 넘는다\n- write p95/p99가 maintenance window 예산을 넘는다\n- lock wait나 blocker가 늘어난다\n- progress phase가 예상보다 오래 고착된다\n- invalid index가 남았는데 후속 retry가 계속 실패한다\n\n이 중 하나가 보이면 \"조금만 더\"가 아니라 drop/retry/window 재설계를 선택할 수 있어야 한다.\n\n## 흔한 오해\n\n- \"`CONCURRENTLY`면 lock이 없다\"\n  - 아니다. write를 막는 큰 lock을 피하려는 도구이지, lock wait와 transaction 대기가 사라지는 것은 아니다.\n- \"명령이 성공하면 즉시 모든 query가 새 index를 쓴다\"\n  - 오래된 transaction과 planner/statistics, query shape 때문에 관찰 기간이 필요하다.\n- \"invalid index는 query에 안 쓰이니 비용도 없다\"\n  - query에는 무시돼도 update overhead나 unique enforcement caveat가 남을 수 있다.\n- \"`DROP INDEX CONCURRENTLY`는 항상 안전한 cleanup이다\"\n  - transaction block, constraint-backed index, partitioned index, `CASCADE` 제약을 먼저 확인해야 한다.\n\n## 검증 질문\n\n1. `CREATE INDEX CONCURRENTLY` 실패 후 index 이름이 보인다는 사실만으로 query가 그 index를 쓴다고 말할 수 있는가?\n2. `indisvalid=false`, `indisready=true` 조합이면 어떤 운영 비용을 의심해야 하는가?\n3. migration tool이 모든 DDL을 transaction으로 감싸면 왜 concurrent index build가 실패할 수 있는가?\n4. unique index concurrently 실패 후 일반 index 실패보다 더 조심해야 하는 이유는 무엇인가?\n5. `NOT VALID` constraint rollout과 concurrent index build의 검증 지연 축은 어떻게 다른가?\n6. `DROP INDEX CONCURRENTLY`를 쓰기 전에 constraint-backed index인지 확인해야 하는 이유는 무엇인가?\n\n## 한 줄 정리\n\n`CREATE INDEX CONCURRENTLY`는 write blocking을 줄이는 강력한 운영 도구지만, 실패 후 invalid index를 catalog·planner·write overhead·unique caveat로 나눠 복구하지 않으면 조용한 비용과 재시도 장애를 남긴다.\n",
+  "aliases": [
+    "CREATE INDEX CONCURRENTLY recovery",
+    "PostgreSQL invalid index",
+    "invalid concurrent index",
+    "DROP INDEX CONCURRENTLY",
+    "pg_index indisvalid",
+    "pg_index indisready",
+    "concurrent index build failed",
+    "Postgres online index failure"
+  ],
+  "expected_queries": [
+    "PostgreSQL CREATE INDEX CONCURRENTLY가 실패해서 invalid index가 남았을 때 어떻게 복구해?",
+    "pg_index의 indisvalid와 indisready는 concurrent index build 실패에서 어떻게 읽어야 해?",
+    "DROP INDEX CONCURRENTLY로 invalid index를 지워도 되는지 운영 절차를 알려줘",
+    "CREATE INDEX CONCURRENTLY는 왜 transaction block 안에서 실행하면 안 돼?",
+    "unique index concurrently가 실패했는데 invalid index가 write나 uniqueness check에 영향을 줄 수 있어?"
+  ],
+  "symptoms": [
+    "CREATE INDEX CONCURRENTLY가 실패한 뒤 index 이름은 남아 있는데 query plan은 그 index를 쓰지 않아",
+    "invalid index가 남아 write overhead나 unique check에 영향을 줄 수 있는지 판단해야 해",
+    "migration tool이 transaction으로 감싸서 CREATE INDEX CONCURRENTLY가 실패했어",
+    "concurrent index build가 long transaction이나 old snapshot 때문에 끝나지 않고 대기해",
+    "online index build를 무중단이라고만 보고 실패 후 DROP/RETRY 절차를 정하지 않았어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/index-maintenance-window-rollout-playbook",
+      "database/online-schema-change-strategies",
+      "database/metadata-lock-ddl-blocking"
+    ],
+    "next_docs": [
+      "database/postgresql-hot-update-bloat-fillfactor-playbook",
+      "database/secondary-index-maintenance-statistics-skew",
+      "database/query-tuning-checklist",
+      "database/postgresql-not-valid-constraint-validate-rollout-playbook"
+    ],
+    "confusable_with": [
+      "database/index-maintenance-window-rollout-playbook",
+      "database/metadata-lock-ddl-blocking",
+      "database/postgresql-not-valid-constraint-validate-rollout-playbook",
+      "database/secondary-index-maintenance-statistics-skew"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/postgresql-create-index-concurrently-invalid-index-recovery-playbook.md",
+    "revision_history": []
+  }
+}

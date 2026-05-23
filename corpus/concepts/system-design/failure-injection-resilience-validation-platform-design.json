@@ -1,0 +1,52 @@
+{
+  "id": "system-design/failure-injection-resilience-validation-platform-design",
+  "title": "Failure Injection / Resilience Validation Platform 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Failure Injection / Resilience Validation Platform 설계를 다루는 deep_dive 문서다. failure injection과 resilience validation 플랫폼은 timeout, partial outage, dependency slowness, zone loss 같은 장애 조건을 통제된 방식으로 주입하고, 시스템의 복원력과 runbook의 실제 유효성을 검증하는 운영 검증 시스템이다. 검색 질의가 failure injection, resilience validation, chaos engineering platform, fault injection처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Failure Injection / Resilience Validation Platform 설계\n\n> 한 줄 요약: failure injection과 resilience validation 플랫폼은 timeout, partial outage, dependency slowness, zone loss 같은 장애 조건을 통제된 방식으로 주입하고, 시스템의 복원력과 runbook의 실제 유효성을 검증하는 운영 검증 시스템이다.\n\nretrieval-anchor-keywords: failure injection, resilience validation, chaos engineering platform, fault injection, dependency latency, zonal outage simulation, steady state hypothesis, blast radius budget, resilience experiment, recovery validation, global failover drill\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Backup, Restore, Disaster Recovery Drill 설계](./backup-restore-disaster-recovery-drill-design.md)\n> - [Automated Canary Analysis / Rollback Platform 설계](./automated-canary-analysis-rollback-platform-design.md)\n> - [Backpressure and Load Shedding 설계](./backpressure-and-load-shedding-design.md)\n> - [Service Discovery / Health Routing 설계](./service-discovery-health-routing-design.md)\n> - [Distributed Tracing Pipeline 설계](./distributed-tracing-pipeline-design.md)\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Global Traffic Failover Control Plane 설계](./global-traffic-failover-control-plane-design.md)\n\n## 핵심 개념\n\n장애 복원력은 설계 문서만으로 증명되지 않는다.\n실제로 다음이 통제된 환경에서 검증되어야 한다.\n\n- timeout budget이 맞는가\n- failover가 실제로 동작하는가\n- queue backlog와 shedding 정책이 견디는가\n- runbook을 운영자가 따라 할 수 있는가\n- observability가 원인을 충분히 보여 주는가\n\nfailure injection 플랫폼은 시스템을 일부러 망가뜨리는 도구가 아니라 **복원력 가설을 안전하게 검증하는 실험 제어 시스템**이다.\n\n## 깊이 들어가기\n\n### 1. 왜 필요한가\n\n실전 장애는 보통 완전한 다운보다 애매한 부분 장애다.\n\n- dependency p99만 급증\n- 한 zone만 packet loss 발생\n- 특정 shard만 lag 증가\n- control plane push 지연\n- retry amplification\n\n이런 실패는 테스트 환경에서 잘 재현되지 않기 때문에, 운영에 가까운 조건에서 주입해 봐야 한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 동시에 활성화 가능한 experiment 수 10개 이하\n- 각 experiment는 1개 서비스 또는 1개 zone만 영향\n- steady-state metric 100개 추적\n- auto abort window 수 초~수 분\n\n이때 봐야 할 숫자:\n\n- experiment scope size\n- blast radius budget\n- abort reaction time\n- metric convergence time\n- false alarm rate\n\n실험 플랫폼은 production에서 동작할 수 있어야 하지만, 그 자체가 production 위험이 되면 안 된다.\n\n### 3. Experiment control plane\n\n보통 구조는 다음과 같다.\n\n```text\nExperiment Authoring\n  -> Policy / Approval\n  -> Target Selector\n  -> Fault Injector\n  -> Metric / Trace Guardrail\n  -> Auto Abort / Report Generator\n```\n\n이 control plane이 관리하는 것은 단순 \"fault on/off\"가 아니다.\n\n- steady-state hypothesis\n- allowed scope\n- inject duration\n- guardrail metric\n- abort condition\n- required approvals\n\n### 4. Fault model library\n\n대표 주입 유형:\n\n- latency injection\n- error injection\n- packet loss / connection reset\n- CPU / memory pressure\n- zone or node cordon\n- stale config / delayed propagation\n\n모든 실패를 다 지원할 필요는 없지만, 가장 자주 겪는 failure mode를 먼저 모델링해야 한다.\n\n### 5. Steady-state와 guardrail\n\n좋은 실험은 \"무엇이 정상인지\"를 먼저 정의한다.\n\n예:\n\n- API success rate 99.9% 이상\n- queue lag 30초 미만\n- checkout conversion drop 1% 이내\n- failover completion 60초 이내\n\nsteady-state가 없으면 실험이 \"재밌는 파괴 활동\"으로 끝나 버린다.\n\n### 6. Auto abort와 human override\n\n실험은 실패를 유도하지만, 무제한으로 두면 안 된다.\n\n필요한 장치:\n\n- hard blast radius limit\n- metric-based auto abort\n- time-based auto stop\n- break-glass manual abort\n- post-abort cooldown\n\n즉, 안전한 혼란만 허용해야 한다.\n\n### 7. Observability-rich reporting\n\n실험이 끝난 뒤 중요한 것은 기록이다.\n\n- 어떤 fault를 어디에 주입했는가\n- 어떤 metric / trace가 변했는가\n- guardrail이 언제 발동했는가\n- runbook은 실제로 유효했는가\n- 기대와 다른 결과는 무엇이었는가\n\n좋은 플랫폼은 실험 결과를 postmortem과 runbook 개선 입력으로 남긴다.\n\n## 실전 시나리오\n\n### 시나리오 1: dependency latency spike 검증\n\n문제:\n\n- 외부 결제 provider가 느려질 때 timeout과 retry 정책이 맞는지 불확실하다\n\n해결:\n\n- latency injection을 특정 dependency 호출에만 적용한다\n- retry amplification과 queue backlog를 같이 본다\n- guardrail 위반 시 즉시 abort한다\n\n### 시나리오 2: zone evacuation rehearsal\n\n문제:\n\n- 한 zone이 사라졌을 때 routing과 placement가 버틸지 확인하고 싶다\n\n해결:\n\n- zone 대상 experiment를 계획한다\n- service discovery, stateful placement, load shedding metric을 함께 관찰한다\n- failover completion time을 steady-state 가설로 둔다\n\n### 시나리오 3: control plane staleness 실험\n\n문제:\n\n- config propagation이 늦어질 때 data plane이 버티는지 확인이 안 된다\n\n해결:\n\n- control push 지연 fault를 주입한다\n- last-known-good snapshot으로 처리 지속 여부를 검증한다\n- stale window를 넘는 경우만 경고하도록 조정한다\n\n## 코드로 보기\n\n```pseudo\nfunction runExperiment(spec):\n  ensureApproved(spec)\n  guard = guardrail.start(spec)\n  injector.apply(spec.target, spec.fault)\n  while spec.active:\n    if guard.violated() or timeoutExceeded():\n      injector.abort(spec.target)\n      break\n  report.store(collector.collect(spec))\n\nfunction violated():\n  return metric(\"error_rate\") > threshold ||\n         metric(\"queue_lag\") > threshold ||\n         metric(\"conversion_drop\") > threshold\n```\n\n```java\npublic ExperimentResult execute(ExperimentSpec spec) {\n    approvalService.ensureApproved(spec);\n    faultInjector.apply(spec);\n    return monitorService.observeUntilComplete(spec);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Ad-hoc chaos test | 시작이 빠르다 | 재현성과 안전장치가 약하다 | 초기 학습 |\n| Guardrail-based experiment platform | 안전성과 학습 효과가 높다 | 구축 비용이 든다 | mature 운영 조직 |\n| Staging-only validation | 안전하다 | 실제 failure mode를 놓치기 쉽다 | 초기 검증 |\n| Limited production experiments | 현실성이 높다 | 운영 리스크 관리가 필요하다 | 중요한 복원력 검증 |\n\n핵심은 failure injection 플랫폼이 파괴 도구가 아니라 **복원력 가설, guardrail, abort, 실험 기록을 함께 가진 운영 검증 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: staging에서 충분히 테스트하면 production fault injection은 불필요하지 않나요?\n> 의도: 환경 차이와 현실적 failure mode 이해 확인\n> 핵심: 실제 traffic mix, dependency behavior, capacity pressure는 staging과 다르기 때문에 production과 유사한 환경 검증이 여전히 필요하다.\n\n> Q: chaos engineering과 DR drill은 같은 건가요?\n> 의도: 실험 범위 차이 이해 확인\n> 핵심: 겹치지만 chaos는 fault hypothesis 검증, DR drill은 복구 절차 검증 성격이 더 강하다.\n\n> Q: auto abort가 꼭 필요한가요?\n> 의도: 실험 안전장치 이해 확인\n> 핵심: production 실험에서 blast radius를 강하게 제한하려면 필수에 가깝다.\n\n> Q: 좋은 resilience experiment의 시작점은 무엇인가요?\n> 의도: steady-state 사고방식 확인\n> 핵심: 어떤 정상 상태를 유지해야 하는지와, 어떤 조건에서 중단해야 하는지부터 명확히 정의하는 것이다.\n\n## 한 줄 정리\n\nFailure injection / resilience validation 플랫폼은 통제된 fault 주입과 guardrail 기반 관찰로 시스템의 복원력과 runbook 유효성을 실제로 검증하는 운영 실험 시스템이다.\n",
+  "aliases": [
+    "failure injection",
+    "resilience validation",
+    "chaos engineering platform",
+    "fault injection",
+    "dependency latency",
+    "zonal outage simulation",
+    "steady state hypothesis",
+    "blast radius budget",
+    "resilience experiment",
+    "recovery validation",
+    "global failover drill",
+    "Failure Injection / Resilience Validation Platform 설계"
+  ],
+  "expected_queries": [
+    "Failure Injection / Resilience Validation Platform 설계 설계 핵심을 설명해줘",
+    "failure injection가 왜 필요한지 알려줘",
+    "Failure Injection / Resilience Validation Platform 설계 실무 트레이드오프는 뭐야?",
+    "failure injection 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Failure Injection / Resilience Validation Platform 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Failure Injection / Resilience Validation Platform 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Failure Injection / Resilience Validation Platform 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/backend-resilience-timeout-retry-mission-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/failure-injection-resilience-validation-platform-design.md",
+    "revision_history": []
+  }
+}

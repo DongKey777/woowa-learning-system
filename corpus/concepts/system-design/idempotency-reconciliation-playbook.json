@@ -1,0 +1,45 @@
+{
+  "id": "system-design/idempotency-reconciliation-playbook",
+  "title": "Idempotency Reconciliation Playbook",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 playbook은 idempotency key로 중복 처리를 막는 설계와 reconciliation으로 이미 어긋난 상태를 맞추는 설계를 연결한다. 결제 웹훅 중복, 외부/내부 상태 불일치, 재시도 안전성 질문을 다룬다.",
+  "body_markdown": "# Idempotency Reconciliation Playbook\n\n## 재현 조건\n\n같은 의미의 요청이 여러 번 들어오거나, 외부 시스템 상태와 내부 DB 상태가 나중에 어긋날 수 있는 workflow다. 결제, 주문, 웹훅, 포인트 적립에서 자주 보인다.\n\n## Topic-specific invariant\n\nIdempotency와 reconciliation은 서로 다른 시간대의 안전장치다. Idempotency는 요청 처리 순간에 중복 실행을 막고, reconciliation은 이미 어긋난 내부/외부 상태를 나중에 찾아 맞춘다.\n\n이 playbook의 불변식은 \"source of truth를 정하고, cutoff window 안에서 모든 불일치를 관측 가능한 상태로 만든다\"이다. reconciliation이 없는 시스템은 중복을 막아도 외부 성공/내부 실패, 이벤트 누락, webhook 유실 같은 상태를 오래 놓칠 수 있다.\n\n## 확인 순서\n\n1. 요청이 같은 작업인지 식별할 idempotency key가 있는지 본다.\n2. 처리 결과를 재사용할 status contract가 있는지 확인한다.\n3. 업무별 source of truth를 정한다. 결제 승인 상태는 PG/ledger, 주문 표시 상태는 내부 order DB처럼 나눌 수 있다.\n4. 이미 틀어진 데이터는 어떤 window로 대조할지 정한다.\n5. 자동 repair, 수동 review, 보류 상태를 구분한다.\n6. repair action도 idempotent하게 만든다.\n\n## 실패 원인 matrix\n\nIdempotency는 중복 실행을 줄인다. Reconciliation은 누락/중복/외부 상태 차이를 나중에 찾아 맞춘다. 둘 중 하나만으로 전체 reliability를 설명하면 빈틈이 남는다.\n\n| 증상 | 가능한 원인 | reconciliation 확인 | repair 방향 |\n|---|---|---|---|\n| 결제는 성공했는데 주문은 미결제 | 내부 DB commit 실패, webhook 유실 | PG 승인 내역과 order 상태 대조 | 주문 결제 완료 반영, 이벤트 재발행 |\n| 주문은 결제 완료인데 PG는 실패/취소 | 내부 선반영, 외부 API timeout 오판 | PG 최종 상태 조회 | 주문 보류/취소, 환불/알림 |\n| 포인트가 두 번 적립 | webhook 중복, consumer 재처리 | eventId와 ledger entry 대조 | 중복 ledger reversal |\n| projection/read model 누락 | outbox relay/CDC lag, DLQ | source table과 projection count/hash 비교 | backfill, DLQ replay |\n| idempotency row가 processing에 멈춤 | worker crash, timeout 후 상태 미갱신 | processing age와 외부 side effect 조회 | succeeded/failed 확정 또는 재처리 |\n\n## Reconciliation chooser\n\n| 기준 | 짧은 window | 긴 window |\n|---|---|---|\n| 목적 | 사용자 영향 빠른 복구 | 회계/정산 정확성 보장 |\n| 예시 | 최근 30분 결제 pending 재조회 | 전일 전체 거래 PG 대사 |\n| 장점 | 빠른 자동 repair | 누락/중복 최종 확인 |\n| 위험 | 외부 최종 상태가 아직 흔들릴 수 있음 | 발견이 늦음 |\n| 운영 팁 | cutoff 이전 데이터만 확정 처리 | report, audit trail, manual approval |\n\n## 흔한 오개념\n\n- \"idempotency가 있으면 reconciliation은 필요 없다\": idempotency는 중복 방어이고, 외부/내부 불일치나 유실 이벤트를 자동으로 찾지는 못한다.\n- \"reconciliation은 배치로 덮어쓰면 된다\": source of truth, cutoff, audit trail 없이 덮어쓰면 더 큰 데이터 손상이 생긴다.\n- \"외부 상태가 항상 정답이다\": 결제, 주문, 포인트처럼 도메인별 authoritative source가 다를 수 있다.\n- \"repair는 한 번만 실행된다\": repair job도 재시도될 수 있으므로 idempotent해야 한다.\n- \"실시간 webhook만 믿으면 된다\": webhook은 중복/지연/유실될 수 있어 polling 또는 settlement file 대사가 필요할 수 있다.\n\n## 실무 지표와 증거\n\n중복 요청, timeout 후 재시도, 외부 성공/내부 실패, 내부 성공/외부 실패 케이스를 fixture로 만든다.\n\n추가로 다음 증거를 운영 지표로 둔다.\n\n- mismatch count by type: external_success_internal_pending, duplicate_ledger, missing_projection 등\n- reconciliation lag: 불일치 발생부터 발견까지 걸린 시간\n- repair success/failure count: 자동 복구 성공률과 수동 검토 전환 수\n- stuck processing age: idempotency status가 처리 중에 머문 시간\n- replay/backfill count: 이벤트 재발행과 projection 복구 빈도\n- audit trail: 누가 어떤 근거로 어떤 상태를 바꿨는지\n\n## 면접 답변 축\n\n1. Idempotency는 요청 시점 중복 실행 방지, reconciliation은 사후 불일치 탐지/복구라고 분리한다.\n2. source of truth와 cutoff window를 먼저 정한다고 말한다.\n3. 외부 성공/내부 실패, 내부 성공/외부 실패, 중복 side effect, 이벤트 누락 케이스를 나눠 확인한다.\n4. repair action 자체도 idempotent하게 만들고 audit trail을 남긴다.\n5. 운영 지표는 mismatch count, reconciliation lag, repair result, stuck processing으로 검증한다고 답한다.\n",
+  "aliases": [
+    "idempotency reconciliation playbook",
+    "duplicate request repair reconciliation",
+    "멱등성 재정산 플레이북",
+    "중복 처리 복구 대조"
+  ],
+  "expected_queries": [
+    "중복 요청은 idempotency key로 막고 이미 틀어진 데이터는 어떻게 맞춰?",
+    "결제 웹훅이 두 번 왔을 때 reconciliation은 무엇을 확인해?",
+    "idempotency와 reconciliation은 언제 같이 설계해?"
+  ],
+  "symptoms": [
+    "중복 요청 방어 전에 이미 데이터가 두 번 처리됐어요",
+    "외부 결제 상태와 내부 주문 상태가 달라요",
+    "재시도는 안전한데 누락된 이벤트를 나중에 맞춰야 해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/consistency-idempotency-async-workflow-foundations"
+    ],
+    "next_docs": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design"
+    ],
+    "confusable_with": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design",
+      "database/idempotency-key-and-deduplication"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/idempotency-reconciliation-playbook.md",
+    "revision_history": []
+  }
+}

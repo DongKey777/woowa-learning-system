@@ -1,0 +1,44 @@
+{
+  "id": "system-design/read-after-write-dashboard-drill",
+  "title": "Read After Write Dashboard Drill",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 drill은 read-after-write stale dashboard의 stale rate, read source distribution, primary fallback headroom 해석을 연습한다. 운영 지표 해석 약점 신호를 다룬다.",
+  "body_markdown": "# Read After Write Dashboard Drill\n\n## 질문\n\n저장 직후 stale rate가 baseline 대비 8배로 올랐고, stale 요청 대부분이 replica에서 왔다. Primary fallback headroom은 1.2x다. 바로 모든 요청을 primary로 보내도 될까?\n\n대시보드에서 stale rate, read source distribution, replica lag, fallback hit rate를 함께 본다면 어떤 순서로 원인을 좁힐 수 있을까?\n\n## 구체 시나리오\n\n예약 변경 API가 `write_version=18420`으로 성공했다. 사용자는 3초 안에 \"내 예약\" 화면을 다시 열었다.\n\n| 지표 | 현재 값 | 읽는 법 |\n|---|---:|---|\n| stale rate | baseline 0.3% -> 2.4% | 실제 version 비교로 오른 값인지 먼저 확인한다. |\n| stale source | replica 72%, cache 21%, primary 7% | replica만의 문제인지, cache invalidation도 섞였는지 나눈다. |\n| replica lag | p95 4.8s, max 28s | 저장 직후 UX에는 p95뿐 아니라 max와 tail도 중요하다. |\n| fallback hit rate | recent-write 요청의 18% | fallback이 넓어지는 중인지, 필요한 화면에만 쓰이는지 본다. |\n| primary fallback headroom | 1.2x | broad primary routing을 걸면 primary가 쉽게 포화될 수 있다. |\n\n이 상황에서 \"모든 read를 primary로 보낸다\"는 빠른 해결처럼 보이지만, write latency와 connection pool을 같이 밀어 올릴 수 있다. 우선 recent-write 사용자, 방금 수정한 resource, 결제/예약 완료 화면처럼 read-your-writes 요구가 강한 요청에만 제한 fallback을 건다.\n\n## 기대 답변 축\n\n- stale 요청 대부분이 replica에서 왔다면 원인 후보는 replica lag, read routing, cache invalidation 누락 쪽으로 좁힌다. stale rate 하나만 보고 결론내리지 않는다.\n- primary fallback headroom이 1.2x라면 모든 요청을 primary로 보내는 broad fallback은 위험하다. primary saturation, write latency, 장애 전파 가능성을 같이 봐야 한다.\n- fallback은 recent-write 사용자, 방금 수정한 resource, 결제/예약 완료 같은 핵심 화면에만 좁혀 적용한다.\n- read-your-writes token, session stickiness, version check, short TTL cache bypass 같은 선택지를 비용과 범위로 비교한다.\n- 대시보드는 stale rate뿐 아니라 read source distribution, replica lag p95/max, cache hit/miss, fallback hit/deny, primary CPU/connection/latency를 함께 보여야 한다.\n\n## 원인 좁히는 순서\n\n1. stale 판정 정의를 확인한다. 사용자 신고가 아니라 `required_version > served_version` 같은 version evidence로 계산됐는지 본다.\n2. route와 화면을 나눈다. 저장 직후 확인 화면, 목록, 검색, 관리자 통계는 consistency 요구가 다르다.\n3. read source를 나눈다. primary, replica, cache, search index 중 어디에서 오래된 응답이 나오는지 본다.\n4. replica lag와 cache age를 분리한다. replica lag가 높아도 cache key invalidation 누락이 동시에 있을 수 있다.\n5. fallback hit/deny와 primary headroom을 본다. fallback을 늘리기 전에 primary CPU, connection, p95 latency, lock wait가 버틸 수 있는지 확인한다.\n6. mitigation은 좁게 건다. recent-write token, session stickiness, version-aware retry, cache bypass를 화면별로 적용하고, stale 감소와 primary 부하 증가를 같이 본다.\n\n## Consistency invariant\n\n- \"write 성공\"의 기준은 primary/source of truth commit과 version 발급이다.\n- \"stale\"의 기준은 요청이 요구하는 version보다 낮은 version을 응답한 경우다.\n- read source는 로그와 지표에 반드시 남아야 한다. source를 모르면 fallback 효과도 검증할 수 없다.\n- primary fallback은 무한한 안전망이 아니다. fallback budget과 deny/timeout 정책이 있어야 한다.\n- 모든 화면이 같은 read-after-write 보장을 요구하지 않는다. 결제 완료 확인과 일반 인기 목록은 다르게 취급한다.\n\n## 흔한 오해\n\n- stale rate가 올랐다는 사실만 보고 replica lag가 원인이라고 단정한다.\n- stale을 없애기 위해 모든 읽기를 primary로 보내면 항상 안전하다고 생각한다.\n- cache stale과 replica stale을 같은 증상으로 묶고 source별 분포를 보지 않는다.\n- fallback이 많아질수록 일관성이 좋아지니 좋은 지표라고 본다.\n- 사용자가 \"저장 직후\"에 보는 화면과 일반 목록 조회를 같은 consistency 요구로 취급한다.\n- primary headroom 1.2x를 \"아직 20% 남았다\"로만 해석한다. tail latency, connection pool, write lock 경합이 먼저 한계가 될 수 있다.\n\n## 답안 체크\n\n좋은 답은 다음 결론을 포함한다.\n\n- broad primary fallback은 보류하고, recent-write/read-your-writes 범위로 제한한다.\n- stale source distribution을 replica/cache/primary로 나눠 원인을 좁힌다.\n- replica lag p95/max와 cache invalidation evidence를 함께 본다.\n- fallback hit rate를 성공 지표로만 보지 않고 primary saturation 위험과 같이 본다.\n- mitigation 이후 stale rate 감소와 primary latency/connection/lock wait 증가를 동시에 비교한다.\n\n답안이 \"replica가 문제니까 primary로 다 보내자\"에서 끝나면 system-design 관점에서는 비용과 failure amplification을 빠뜨린 것이다.\n\n## 운영/보안 증거\n\n- stale 판정은 `write_version` 또는 `updated_at`과 read response version을 비교해 계산한다. 단순 사용자 신고만으로 stale rate를 만들지 않는다.\n- stale event에는 read source(primary/replica/cache), replica lag, cache key, user/session의 recent-write 여부, route 이름이 붙어야 한다.\n- primary fallback headroom은 CPU만이 아니라 connection pool, p95 latency, lock wait, replication impact까지 본다.\n- fallback rule 변경 전후로 stale rate 감소와 primary saturation 증가를 같이 비교한다.\n- security 관점에서는 stale 화면이 권한 변경, 취소된 예약, 결제 상태처럼 민감한 결정을 오래 노출하지 않는지 별도 alert를 둔다.\n\n## 약점 태그\n\n`stale-dashboard`, `read-source-distribution`, `primary-fallback-headroom`\n\n## Safe Next Docs\n\npost-write stale 지표 기본기는 `system-design/post-write-stale-dashboard-primer`를 다시 본다.\n\nfallback 범위와 위험도 선택은 `system-design/primary-fallback-safety-chooser`로 이어간다.\n\nconsistency 선택지를 더 넓게 비교하려면 `system-design/read-after-write-tradeoff-matrix-chooser`를 다음에 본다.\n",
+  "aliases": [
+    "read after write dashboard drill",
+    "stale dashboard source distribution practice",
+    "read-after-write 대시보드 drill",
+    "stale dashboard 지표 연습"
+  ],
+  "expected_queries": [
+    "read-after-write dashboard 지표를 해석하는 drill을 풀고 싶어",
+    "stale rate와 read source distribution을 같이 보는 연습해줘",
+    "primary fallback headroom을 어떻게 읽는지 문제로 보고 싶어"
+  ],
+  "symptoms": [
+    "stale rate만 보고 원인을 단정해요",
+    "cache와 replica source를 구분하지 않아요",
+    "primary fallback headroom 없이 fallback을 늘려요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/post-write-stale-dashboard-primer"
+    ],
+    "next_docs": [
+      "system-design/primary-fallback-safety-chooser"
+    ],
+    "confusable_with": [
+      "system-design/post-write-stale-dashboard-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/read-after-write-dashboard-drill.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "id": "spring/stateless-jsessionid-hidden-session-cause-router",
+  "title": "`STATELESS`인데 `JSESSIONID`가 생겨요 원인 라우터",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# `STATELESS`인데 `JSESSIONID`가 생겨요 원인 라우터\n\n## 한 줄 요약\n\n> `SessionCreationPolicy.STATELESS`는 SecurityContext를 세션에 저장하지 않겠다는 정책에 가깝다. `JSESSIONID`가 보인다는 사실만으로 \"JWT가 stateful이 됐다\"거나 \"STATELESS가 무시됐다\"고 결론내리면 원인 버킷을 잘못 고른다.\n\n## 먼저 볼 증거\n\n| 관찰 증거 | 더 가까운 원인 버킷 | 첫 확인 |\n|---|---|---|\n| 응답에 새 `Set-Cookie: JSESSIONID=...`가 찍혔다 | hidden session creation | 어느 필터/컨트롤러/저장소가 `HttpSession`을 만들었는지 본다 |\n| 보호 URL 접근 뒤 `302 /login`, 로그인 후 원래 URL 복귀가 있다 | `RequestCache` / `SavedRequest` | 브라우저 복귀 UX가 API 체인에 섞였는지 본다 |\n| `403`에서 CSRF token/session 관련 로그가 있다 | CSRF 저장소 | CSRF token repository가 session 기반인지, API에는 비활성/분리됐는지 본다 |\n| 실패 응답이 `401` JSON이 아니라 login HTML 또는 `302`다 | browser chain mixing | `/api/**`와 browser/admin 경로의 `SecurityFilterChain` 및 entry point를 분리한다 |\n| 다음 요청마다 JWT로 인증되고 서버 저장 조회가 없다 | per-request JWT auth | `JSESSIONID` 존재와 인증 상태 저장을 분리한다 |\n| Application 탭에는 쿠키가 보이지만 request `Cookie` header가 비어 있다 | cookie presence vs server-side state | cookie 저장/전송과 서버 session 복원을 따로 본다 |\n\n## 원인 버킷\n\n1. **숨은 session 생성 지점이 있다.** `request.getSession()`, MVC `@SessionAttributes`, session 기반 CSRF token repository, OAuth2 authorization request 저장소, form login, remember-me, custom success handler가 세션을 만들 수 있다. `STATELESS`는 이런 모든 앱 기능의 `HttpSession` 생성을 전역으로 금지하는 스위치가 아니다.\n2. **`SessionCreationPolicy`를 인증 저장소 금지와 혼동했다.** API 체인에서 `STATELESS`를 쓰면 SecurityContext를 세션에 저장하거나 세션에서 읽는 흐름을 피하려는 뜻이다. 하지만 같은 요청에서 다른 컴포넌트가 세션을 만들 수 있고, 다른 browser 체인은 의도적으로 세션을 쓸 수 있다. 정확한 경계는 [Spring `SecurityContextRepository` and `SessionCreationPolicy` Boundaries](./spring-securitycontextrepository-sessioncreationpolicy-boundaries.md)에서 본다.\n3. **`RequestCache` / `SavedRequest`가 browser UX를 위해 세션을 만들었다.** 보호 URL로 갔다가 `/login`으로 튄 뒤 로그인 성공 후 원래 URL로 돌아오면, \"주소 메모\"를 저장한 것이다. API는 보통 이 UX가 필요 없으므로 request cache를 끄거나 API chain을 따로 둔다. 자세한 분기는 [Spring Security `RequestCache` / `SavedRequest` Boundaries](./spring-security-requestcache-savedrequest-boundaries.md)로 보낸다.\n4. **CSRF나 anonymous 흐름을 세션 유지와 섞어 봤다.** CSRF는 브라우저가 자동으로 보내는 cookie 기반 요청을 방어하는 축이다. token을 session에 저장하는 설정이면 `JSESSIONID`가 생길 수 있다. 반대로 anonymous authentication은 \"인증되지 않은 사용자도 anonymous principal로 표현\"하는 기능이지, 그 자체가 로그인 세션을 만든다는 뜻은 아니다.\n5. **JWT per-request 인증과 쿠키 존재를 같은 말로 봤다.** JWT API는 요청마다 bearer token을 검증해 `SecurityContext`를 만든 뒤 요청이 끝나면 버리는 구조가 자연스럽다. 이때 브라우저에 `JSESSIONID` 쿠키가 남아 있어도 서버가 그 쿠키로 인증을 복원하지 않으면 인증 상태는 여전히 stateless다.\n6. **쿠키 존재와 서버-side state를 구분하지 않았다.** DevTools Application 탭에 쿠키가 보이는 것은 저장 증거다. Network request의 `Cookie` header는 전송 증거다. 서버에서 같은 session id로 `SecurityContext`나 `SavedRequest`를 찾는 것은 서버 상태 사용 증거다. 셋 중 어느 단계인지 분리해야 한다.\n\n## wrong-bucket / 오선택\n\n| 고른 버킷 | 빠진 증거 | 왜 wrong bucket인가 |\n|---|---|---|\n| \"`STATELESS`가 안 먹었다\" | `Set-Cookie`는 CSRF나 `SavedRequest` 요청에서만 나온다 | SecurityContext 저장 정책 문제가 아니라 다른 세션 생성 주체일 수 있다 |\n| \"JWT가 서버 세션을 쓰고 있다\" | 매 요청이 `Authorization: Bearer ...`로 인증되고 session lookup이 없다 | 쿠키 존재만으로 JWT 인증이 stateful이라고 볼 수 없다 |\n| \"CORS/cookie 문제다\" | request `Cookie` header는 정상이고 서버가 anonymous다 | 전송 이후의 `SecurityContextRepository` save/load 문제일 수 있다 |\n| \"`RequestCache` 문제다\" | `302 /login`이나 원래 URL 복귀가 없다 | 주소 메모 증거가 없으면 CSRF, MVC session, custom code부터 봐야 한다 |\n| \"anonymous가 세션을 만든다\" | session 생성 stack이 CSRF/request cache/custom code다 | anonymous principal은 비로그인 표현이고 세션 생성 주체와 다르다 |\n| \"API도 form login을 쓰면 편하다\" | `/api/**`가 login HTML이나 `302`를 받는다 | API 계약은 보통 `401/403`이고 browser redirect와 분리해야 한다 |\n\n## 다음 확인 순서\n\n1. `Set-Cookie: JSESSIONID`가 새로 내려온 정확한 응답을 찾는다. 기존 쿠키가 보이는 장면과 새로 생성된 장면을 분리한다.\n2. 그 응답의 경로가 `/api/**`인지 `/admin/**`, `/login`, `/oauth2/**` 같은 browser flow인지 확인한다.\n3. 같은 요청의 status와 `Location`을 본다. `302 /login`이나 login HTML이면 [Browser `401` vs `302` Login Redirect Guide](../security/browser-401-vs-302-login-redirect-guide.md)를 먼저 탄다.\n4. API chain에는 `STATELESS`, bearer/JWT filter, request cache 비활성, API용 entry point가 있는지 본다. browser/admin chain에는 form login, CSRF, request cache를 의도적으로 허용할 수 있다.\n5. CSRF가 켜져 있다면 token repository가 session 기반인지 cookie 기반인지, API mutation에 어떤 방어가 필요한지 확인한다.\n6. 서버 로그나 breakpoint로 `getSession(true)`, `HttpSessionRequestCache`, `HttpSessionSecurityContextRepository`, CSRF token repository, OAuth2 authorization request repository 중 누가 session을 열었는지 찾는다.\n7. 최종적으로 request `Cookie` header와 서버-side lookup을 분리한다. 쿠키가 있어도 SecurityContext를 세션에서 복원하지 않으면 로그인 유지 증거가 아니다.\n\n## 검증 질문\n\n- `JSESSIONID`가 \"브라우저에 있다\"는 말인가, \"이번 응답에서 새로 내려왔다\"는 말인가?\n- `Set-Cookie`가 나온 경로는 API chain인가, browser/admin/login chain인가?\n- 같은 요청에서 `302 /login`, `SavedRequest`, 원래 URL 복귀 증거가 있는가?\n- CSRF token 저장소가 session을 쓰는가, 그리고 그 설정이 API에도 적용되는가?\n- JWT 인증은 다음 요청에서 서버 session lookup 없이 bearer token만으로 다시 인증되는가?\n- anonymous principal을 보고 \"세션 생성\"으로 오해한 것은 아닌가?\n- request `Cookie` header가 있고도 서버가 anonymous라면 `SecurityContextRepository` save/load 증거는 무엇인가?\n\n## 다음 학습\n\n- login redirect와 hidden session이 같이 보이면 [Browser `401` vs `302` Login Redirect Guide](../security/browser-401-vs-302-login-redirect-guide.md)부터 본다.\n- `SavedRequest`와 원래 URL 복귀가 핵심이면 [Spring Security `RequestCache` / `SavedRequest` Boundaries](./spring-security-requestcache-savedrequest-boundaries.md)를 잇는다.\n- 쿠키 저장/전송/서버 복원 경계를 다시 잡으려면 [Spring 관리자 인증에서 쿠키와 세션이 어떻게 이어지는가: 초급 primer](./spring-admin-session-cookie-flow-primer.md)와 [Login Redirect, Hidden `JSESSIONID`, `SavedRequest` 입문](../network/login-redirect-hidden-jsessionid-savedrequest-primer.md)을 본다.\n- `STATELESS`와 repository 책임을 정확히 나누고 싶으면 [Spring `SecurityContextRepository` and `SessionCreationPolicy` Boundaries](./spring-securitycontextrepository-sessioncreationpolicy-boundaries.md)를 본다.\n- cross-origin 요청에서 쿠키가 안 붙는 문제면 [Cookie Scope Mismatch Guide](../security/cookie-scope-mismatch-guide.md)와 [Fetch Credentials vs Cookie Scope](../security/fetch-credentials-vs-cookie-scope.md)로 분기한다.\n",
+  "aliases": [
+    "stateless인데 jsessionid 생김",
+    "hidden session spring security",
+    "api인데 세션 쿠키가 생김",
+    "request cache 때문에 세션 생김",
+    "spring security hidden jsessionid",
+    "sessioncreationpolicy stateless cookie"
+  ],
+  "expected_queries": [
+    "Spring Security에서 STATELESS로 뒀는데 왜 JSESSIONID 쿠키가 생겨?",
+    "API 체인이라고 생각했는데 401 대신 로그인 redirect와 세션이 같이 보이면 어디부터 봐야 해?",
+    "RequestCache나 SavedRequest 때문에 hidden session이 생기는 장면을 초급 기준으로 어떻게 가를까?",
+    "formLogin이나 oauth2Login을 붙인 뒤 API 요청에도 세션이 숨어드는 이유를 설명해 줄 수 있어?",
+    "SessionCreationPolicy.STATELESS인데도 로그인 전 URL 복귀가 보이면 무엇이 세션을 만든 거야?"
+  ],
+  "symptoms": [
+    "SessionCreationPolicy.STATELESS로 설정했는데도 응답에 JSESSIONID가 생겨요",
+    "REST API라고 생각했는데 401 대신 login redirect와 세션 쿠키가 같이 보여요",
+    "SavedRequest를 안 쓴 줄 알았는데 로그인 전 URL이 기억되고 세션이 생겨요",
+    "form login이나 oauth2Login을 붙인 뒤부터 API 요청에도 hidden session이 숨어든 것 같아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/session-cookie-jwt-basics"
+    ],
+    "next_docs": [
+      "security/browser-401-vs-302-login-redirect-guide",
+      "spring/spring-admin-session-cookie-flow-primer",
+      "security/cookie-scope-mismatch-guide",
+      "security/fetch-credentials-vs-cookie-scope"
+    ],
+    "confusable_with": [
+      "spring/login-state-not-persisted-cause-router",
+      "spring/spring-admin-session-cookie-flow-primer",
+      "security/browser-401-vs-302-login-redirect-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-stateless-jsessionid-hidden-session-cause-router.md",
+    "revision_history": []
+  }
+}

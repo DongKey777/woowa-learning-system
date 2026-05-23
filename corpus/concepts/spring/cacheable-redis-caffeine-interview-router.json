@@ -1,0 +1,47 @@
+{
+  "id": "spring/cacheable-redis-caffeine-interview-router",
+  "title": "Cacheable Redis Caffeine Interview Router",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 Spring @Cacheable, Redis, Caffeine, cache key generation 문제를 면접/디버깅 질문에서 분기한다.",
+  "body_markdown": "# Cacheable Redis Caffeine Interview Router\n\n## 관찰 증거\n\n- `@Cacheable`은 기본적으로 method argument로 key를 만들고 cache manager/cache resolver가 실제 backend를 결정한다.\n- Redis는 외부 shared cache로 쓰기 쉽고, Caffeine은 process-local cache로 쓰기 쉽다.\n- key에 user/tenant/locale/version이 빠지면 데이터가 섞일 수 있다.\n- Spring Cache는 method proxy 경계에서 동작하므로 self-invocation이면 annotation이 적용되지 않을 수 있다.\n- 캐시는 DB 정합성 장치가 아니라 읽기 경로 최적화 장치다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| 사용자 데이터 섞임 | key 구성 누락 | SpEL key, tenant/user 포함 |\n| instance별 값 다름 | local cache | invalidation/freshness |\n| stale data | TTL/invalidation 정책 | write path와 eviction |\n| annotation이 안 먹음 | proxy 우회 | self-invocation, bean method visibility |\n| 캐시 폭증 | key cardinality 과다 | user별 key, pagination key, TTL |\n\n## 요청 흐름으로 보기\n\n`@Cacheable`은 \"Redis를 직접 호출하는 annotation\"이 아니다. Spring bean method 호출이 proxy를\n통과하면 cache interceptor가 먼저 key를 계산하고, cache manager가 지정한 cache 저장소에서 값을\n찾는다. hit면 method body를 실행하지 않고, miss면 method를 실행한 뒤 반환값을 cache에 넣는다.\n\n```java\n@Cacheable(cacheNames = \"productDetail\", key = \"#tenantId + ':' + #productId\")\npublic ProductDetailResponse findDetail(String tenantId, long productId) {\n    return productRepository.findDetail(productId);\n}\n```\n\n이 예시에서 `productId`만 key로 쓰면 tenant별 가격/권한/노출 상태가 섞일 수 있다. 반대로\n사용자마다 항상 다른 결과가 아니라면 user id를 무조건 넣어 cache hit ratio를 망칠 수도 있다.\nkey 설계는 \"같은 결과로 재사용해도 되는 조건\"을 문장으로 먼저 정의한 뒤 SpEL이나 custom\n`KeyGenerator`로 옮기는 순서가 안전하다.\n\n## 면접 답변 골격\n\nSpring Cache abstraction은 편하지만 cache consistency를 자동으로 해결하지 않는다. key design, TTL, invalidation, backend 선택이 핵심이다.\n\n면접에서는 `@Cacheable`을 \"메서드 결과를 저장한다\"에서 끝내지 말고 네 경계를 같이 설명해야 한다.\n\n| 경계 | 질문 | 답변 포인트 |\n|---|---|---|\n| proxy 경계 | annotation이 언제 적용되나 | Spring bean 외부에서 proxy를 통과한 method call이어야 한다 |\n| key 경계 | 무엇을 같은 결과로 볼 것인가 | user, tenant, locale, version, paging 조건을 key에 포함한다 |\n| backend 경계 | Redis와 Caffeine 중 무엇을 쓰나 | process-local cache와 shared external cache를 구분한다 |\n| invalidation 경계 | 언제 버릴 것인가 | write path, TTL, explicit evict, transaction rollback 영향을 정한다 |\n\n## Redis vs Caffeine 선택\n\n| 선택 | 적합한 경우 | 주의 |\n|---|---|---|\n| Caffeine | 한 instance 안에서 반복 조회가 많고 짧은 TTL이면 충분한 경우 | instance마다 값이 다르고 재시작 시 사라진다 |\n| Redis | 여러 instance가 같은 cache 저장소를 봐야 하거나 session/API 결과 공유가 필요한 경우 | network hop, serialization, 운영 장애 처리가 필요하다 |\n| 둘 다 사용 | local near-cache + shared cache가 필요한 경우 | invalidation 순서와 stale window를 설명할 수 있어야 한다 |\n\n## 쓰기 경로와 트랜잭션 타이밍\n\n캐시 사고는 조회 annotation보다 쓰기 경로에서 자주 생긴다. DB update와 cache evict/put이 같은\n원자적 저장소가 아니기 때문이다.\n\n| 상황 | 위험 | 확인할 것 |\n|---|---|---|\n| DB commit 전 cache evict | rollback되면 불필요하게 cache가 비거나 stampede가 생긴다 | transaction-aware 설정, after-commit hook |\n| DB commit 후 evict 실패 | cache가 오래된 값을 계속 반환한다 | retry, TTL, outbox/event 기반 evict |\n| `@CachePut`으로 write-through처럼 사용 | 반환 객체와 DB 최종 상태가 다르면 cache가 틀릴 수 있다 | flush/commit 이후 관찰값 |\n| local Caffeine만 evict | 다른 instance local cache는 그대로다 | pub/sub invalidation, 짧은 TTL, shared cache |\n\n정합성이 매우 중요한 데이터라면 \"캐시를 맞춘다\"보다 \"캐시 miss 시 DB가 authoritative source\"라는\n경계를 명확히 둔다. 결제 상태, 권한, 재고처럼 틀리면 안 되는 응답은 TTL을 짧게 하거나 캐시 대상에서\n제외하고, 성능 병목은 query/index/aggregation 구조로 먼저 확인한다.\n\n## 흐름 답변 예시\n\n\"조회 메서드가 proxy를 통해 호출되면 Spring Cache interceptor가 key를 계산하고 cache manager에 조회합니다. hit면 메서드를 실행하지 않고 반환하고, miss면 실제 메서드를 실행한 뒤 결과를 backend에 저장합니다. Redis/Caffeine은 저장 위치와 운영 특성의 선택일 뿐이고, 어떤 key로 저장하고 언제 무효화할지는 애플리케이션이 결정해야 합니다.\"\n\n## 디버깅 체크리스트\n\n| 확인 | 질문 |\n|---|---|\n| proxy 통과 | 호출이 같은 클래스 내부 `this.method()`가 아닌가 |\n| key 로그 | 실제 생성된 key에 user/tenant/version/paging 조건이 들어갔나 |\n| cache name | 환경별 prefix와 cache name이 충돌하지 않나 |\n| serialization | Redis 값 schema 변경 후 옛 값 deserialize가 실패하지 않나 |\n| hit ratio | hit ratio는 높은데 stale complaint가 늘지 않나 |\n| eviction | write path rollback/commit 시점과 evict 시점이 일치하나 |\n\n## 오답 패턴\n\n- \"Redis를 쓰면 분산 환경 정합성이 해결된다\"는 말은 과하다. 같은 cache를 볼 뿐 stale data와 invalidation 문제는 남는다.\n- `@Cacheable`을 private method나 같은 클래스 내부 호출에 붙이면 일반적인 proxy 기반 AOP에서는 적용되지 않을 수 있다.\n- 사용자별 응답에서 key가 `productId`뿐이면 다른 사용자의 할인/권한/언어 결과가 섞일 수 있다.\n- `@CacheEvict`를 write method에 붙였다고 끝이 아니다. transaction rollback, cache advice 순서, transaction-aware cache manager 사용 여부에 따라 evict/put 시점을 같이 봐야 한다.\n\n## 관련 playbook\n\nkey 함정은 `spring-cache-key-generation-pitfalls`로 이어진다.\n",
+  "aliases": [
+    "Spring Cacheable Redis Caffeine interview",
+    "@Cacheable 캐시 면접",
+    "Redis Caffeine cache router",
+    "cache key generation pitfall answer",
+    "@CacheEvict",
+    "@CachePut"
+  ],
+  "expected_queries": [
+    "Spring @Cacheable이 Redis나 Caffeine과 어떻게 연결돼?",
+    "cache key를 잘못 만들면 어떤 문제가 생겨?",
+    "local cache와 distributed cache는 언제 골라?"
+  ],
+  "symptoms": [
+    "@Cacheable을 붙였는데 사용자별 데이터가 섞여요",
+    "cache hit가 되는데 stale data가 보입니다",
+    "local cache를 여러 instance에 두고 일관성을 기대해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer"
+    ],
+    "next_docs": [
+      "spring/cache-key-generation-pitfalls"
+    ],
+    "confusable_with": [
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/cacheable-redis-caffeine-interview-router.md",
+    "revision_history": []
+  }
+}

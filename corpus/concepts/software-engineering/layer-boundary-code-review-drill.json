@@ -1,0 +1,45 @@
+{
+  "id": "software-engineering/layer-boundary-code-review-drill",
+  "title": "Layer Boundary Code Review Drill",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "이 drill은 Controller, Service, Repository 책임 분리를 코드 리뷰 관점에서 연습한다. 뚱뚱한 Controller, Repository 정책 결정, Service 유스케이스 경계 같은 약점 신호를 다룬다.",
+  "body_markdown": "# Layer Boundary Code Review Drill\n\n## 질문\n\nController가 request DTO를 받고, 날짜/시간 형식을 해석하고, 중복 예약을 조회하고, 예약 가능 여부를 판단하고, JDBC로 insert까지 수행한다. 리뷰에서 어떤 책임 경계 문제를 지적할 수 있을까?\n\n## 기대 답변 축\n\n- **관찰 축**: 한 method 안에 HTTP 입출력, 예약 정책, persistence detail이 함께 있다.\n- **이동 축**: Controller는 binding/status mapping, Service는 use case orchestration, domain은 불변식, Repository는 조회/저장 contract로 나눈다.\n- **경계 축**: request DTO 검증과 domain rule 검증을 구분한다. `startAt` 누락은 web input 문제이고, 같은 시간대 중복 예약 금지는 예약 정책이다.\n- **caveat 축**: `exists` 후 `insert`는 race가 날 수 있으므로 Service transaction과 DB unique constraint/예외 변환까지 함께 언급한다.\n- **리뷰 문장 축**: \"SRP 지켜주세요\"가 아니라 변경 이유, 실패 증상, 옮길 위치를 같이 말한다.\n\n## 리뷰 답변 골격\n\n1. 먼저 한 method 안에 HTTP concern, business rule, persistence detail이 섞였다고 관찰한다.\n2. Controller는 request DTO 검증 결과를 받아 Service를 호출하고, 성공/실패를 HTTP response로 바꾸는 역할에 집중해야 한다고 말한다.\n3. \"중복 예약이면 거절한다\"는 domain/application rule이므로 Service use case 또는 domain model 쪽에서 표현한다.\n4. JDBC insert와 select는 Repository 구현 세부로 숨기고, Service는 `reservationRepository.exists(...)`, `reservationRepository.save(...)` 같은 contract에 의존하게 한다.\n5. 중복 확인과 저장이 분리되면 동시 요청에서 둘 다 통과할 수 있으므로 transaction boundary와 DB constraint를 같이 설계한다고 덧붙인다.\n6. 단순히 파일을 나누는 것이 아니라 변경 이유가 다른 책임을 분리하는 것이라고 정리한다.\n\n## Boundary 판단표\n\n| 코드 냄새 | 어느 경계 문제인가 | 리뷰 문장 |\n|---|---|---|\n| Controller에서 SQL 실행 | web layer가 persistence detail을 앎 | Repository contract 뒤로 숨기자. |\n| Controller에서 예약 가능 여부 판단 | HTTP 처리와 business rule 혼재 | Service/use case로 옮기자. |\n| Repository가 \"가능하면 저장, 아니면 예외\" 결정 | 저장소가 정책을 결정 | 정책은 Service/domain, 저장소는 조회/저장. |\n| Service가 Controller DTO를 그대로 받음 | web DTO가 application boundary 침투 | command/request model 변환 위치를 정하자. |\n| Service가 단순 pass-through만 함 | 계층이 역할 없이 추가됨 | use case가 없으면 경계를 재검토하자. |\n\n## 경계/반례 예시\n\n| 상황 | 어디에 두나 | caveat |\n|---|---|---|\n| `@RequestBody` 누락, 날짜 문자열 format 오류 | Controller/web validation | HTTP 400으로 매핑해도 domain rule이라고 부르지 않는다. |\n| \"같은 방, 같은 시간에는 예약 불가\" | Service use case 또는 domain policy | DB unique constraint와 함께 두어 동시성 race를 막는다. |\n| `SELECT COUNT(*) FROM reservation ...` | Repository 구현 | Repository method 이름은 의도를 드러내되 거절 메시지는 만들지 않는다. |\n| `DuplicateKeyException`을 예약 중복 예외로 변환 | Service 또는 persistence adapter 경계 | DB constraint는 마지막 방어선이고 사용자 메시지는 application 쪽에서 정한다. |\n| Service가 `save()`만 호출 | 상황에 따라 유지/삭제 판단 | transaction, authorization, 외부 호출 조율 같은 역할이 없으면 layer만 늘어난다. |\n\n좋은 리뷰는 \"Controller가 뚱뚱하다\"에서 멈추지 않는다. 예를 들어 \"이 method는 HTTP 요청 해석, 중복 예약 정책, JDBC 저장 실패 처리를 한 번에 바꿔야 해서 테스트와 변경 영향 범위가 커집니다. Controller는 `CreateReservationCommand`로 변환해 Service를 호출하고, Service가 예약 가능성 판단과 저장 흐름을 transaction 안에서 조율하게 분리하면 좋겠습니다.\"처럼 실패 이유와 이동 위치가 같이 보여야 한다.\n\n## 답변에서 피할 말\n\n- \"3계층이 정석이라 나눠야 합니다\"처럼 구조 이름만 말하지 않는다.\n- \"Repository에서 알아서 중복을 막으면 됩니다\"라고만 말하지 않는다. DB constraint는 필요하지만 정책 판단과 사용자-facing 예외는 별도 경계가 있다.\n- \"모든 validation은 Service로\"라고 단정하지 않는다. 형식/필수값은 web input 검증, business invariant는 Service/domain 쪽이다.\n\n## 면접 연결\n\n면접에서는 \"Controller-Service-Repository를 왜 나누나요?\"라는 질문에 \"테스트하기 위해서\"만 답하면 얕다. 더 나은 답은 변경 이유와 의존 방향이다. HTTP status나 JSON schema가 바뀌는 이유, 예약 가능 정책이 바뀌는 이유, DB schema나 query가 바뀌는 이유는 서로 다르다. 이 변경 이유를 분리하면 코드 리뷰에서 어느 계층을 고쳐야 하는지 명확해진다.\n\n## 짧은 모범 답변\n\n이 코드는 Controller가 요청 binding뿐 아니라 중복 예약 정책 판단과 JDBC 저장까지 맡고 있어서 layer boundary가 무너져 있습니다. Controller는 HTTP 요청을 command로 바꿔 Service use case를 호출하고 응답으로 변환하는 역할에 집중시키는 편이 좋습니다. 중복 예약 판단과 저장 흐름은 Service 또는 domain 규칙으로 옮기고, Repository는 SQL 세부를 감춘 조회/저장 contract만 제공하게 합니다. 특히 중복 확인 후 저장은 동시 요청 race가 날 수 있으므로 Service transaction과 DB unique constraint, 예외 변환 경계까지 같이 리뷰해야 합니다.\n\n## 약점 태그\n\n`fat-controller`, `service-boundary`, `repository-contract`\n\n## 복습 연결 concept\n\n`software-engineering/controller-service-repository-boundary-primer`\n",
+  "aliases": [
+    "layer boundary code review drill",
+    "controller service repository responsibility practice",
+    "레이어 경계 코드리뷰 drill",
+    "Controller Service Repository 책임 연습",
+    "@RequestBody"
+  ],
+  "expected_queries": [
+    "Controller Service Repository 책임 분리 drill을 풀고 싶어",
+    "코드 리뷰에서 레이어 경계를 어떻게 지적하는지 연습해줘",
+    "Controller가 뚱뚱한지 판단하는 문제를 풀고 싶어"
+  ],
+  "symptoms": [
+    "HTTP와 도메인 규칙이 같은 메서드에 섞여요",
+    "Repository가 정책을 결정해요",
+    "Service가 단순 pass-through인지 유스케이스인지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/controller-service-repository-boundary-primer"
+    ],
+    "next_docs": [
+      "spring/roomescape-controller-service-repository-flow-bridge"
+    ],
+    "confusable_with": [
+      "software-engineering/controller-service-repository-boundary-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/layer-boundary-code-review-drill.md",
+    "revision_history": []
+  }
+}

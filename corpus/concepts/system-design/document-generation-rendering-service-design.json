@@ -1,0 +1,52 @@
+{
+  "id": "system-design/document-generation-rendering-service-design",
+  "title": "Document Generation / Rendering Service 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Document Generation / Rendering Service 설계를 다루는 deep_dive 문서다. document generation and rendering service는 템플릿과 데이터를 받아 PDF, DOCX, 이미지, HTML 같은 문서를 안정적으로 생성하는 비동기 렌더링 시스템이다. 검색 질의가 document generation, rendering service, pdf generation, docx처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Document Generation / Rendering Service 설계\n\n> 한 줄 요약: document generation and rendering service는 템플릿과 데이터를 받아 PDF, DOCX, 이미지, HTML 같은 문서를 안정적으로 생성하는 비동기 렌더링 시스템이다.\n\nretrieval-anchor-keywords: document generation, rendering service, pdf generation, docx, template rendering, html to pdf, async render, page break, watermark, snapshot, queue\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Storage Presigned URL + CDN 설계](./file-storage-presigned-url-cdn-design.md)\n> - [Object Metadata Service 설계](./object-metadata-service-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [CDN Image Transformation Pipeline 설계](./cdn-image-transformation-pipeline-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n\n## 핵심 개념\n\n문서 생성은 단순 문자열 치환이 아니다.  \n실전에서는 아래를 동시에 만족해야 한다.\n\n- 템플릿 버전 관리\n- 데이터 바인딩\n- PDF/DOCX rendering\n- 페이지 나눔과 레이아웃\n- 비동기 생성과 재시도\n- 다운로드/보관 경로 분리\n\n즉, document service는 템플릿과 데이터를 안정적으로 결합해 출력물을 만드는 렌더링 파이프라인이다.\n\n## 깊이 들어가기\n\n### 1. 어떤 문서를 생성하는가\n\n대표 대상:\n\n- invoice\n- contract\n- report\n- certificate\n- shipping label\n- letter/pdf export\n\n문서 유형에 따라 정확도, 레이아웃, 속도가 다르다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 일 100만 문서\n- 평균 생성 3초\n- 피크 batch 1만 건\n\n실시간과 배치가 섞이면 rendering pool과 queue 설계가 중요하다.\n\n봐야 할 숫자:\n\n- render latency\n- queue depth\n- 실패율\n- output size\n- retry count\n\n### 3. 파이프라인\n\n```text\nTemplate\n  + Data\n  -> Validate\n  -> Render\n  -> Post-process\n  -> Store\n  -> Deliver\n```\n\n### 4. template versioning\n\n문서 출력은 재현 가능해야 한다.\n\n- 템플릿 버전\n- 데이터 스냅샷\n- 렌더 엔진 버전\n- locale/format version\n\n계약서와 invoice는 나중에 동일하게 재생성 가능해야 한다.\n\n### 5. Layout and pagination\n\n문서 렌더링의 어려움은 페이지다.\n\n- page break\n- orphan/widow line\n- table overflow\n- font fallback\n\nHTML to PDF는 편하지만 레이아웃이 예상과 다를 수 있다.\n\n### 6. Asynchronous rendering\n\n무거운 렌더는 요청 경로에서 분리한다.\n\n- job queue\n- worker pool\n- status callback\n- download URL\n\n이 부분은 [Job Queue 설계](./job-queue-design.md)와 연결된다.\n\n### 7. Storage and delivery\n\n생성된 문서는 object storage에 저장하는 편이 일반적이다.\n\n- private bucket\n- signed download URL\n- retention policy\n- audit trail\n\n이 부분은 [File Storage Presigned URL + CDN 설계](./file-storage-presigned-url-cdn-design.md)와 [Object Metadata Service 설계](./object-metadata-service-design.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1: invoice PDF\n\n문제:\n\n- 월말 invoice를 대량 생성해야 한다\n\n해결:\n\n- batch job\n- template snapshot\n- object storage 저장\n\n### 시나리오 2: 계약서 생성\n\n문제:\n\n- 템플릿 버전이 바뀌면 재현이 어려워진다\n\n해결:\n\n- template version pinning\n- data snapshot 저장\n\n### 시나리오 3: 한국어/영문 혼합 보고서\n\n문제:\n\n- 폰트와 줄바꿈이 깨진다\n\n해결:\n\n- locale-aware font bundle\n- rendering engine fixed version\n\n## 코드로 보기\n\n```pseudo\nfunction renderDocument(templateId, data):\n  template = templateRepo.loadVersioned(templateId)\n  validate(data, template.schema)\n  output = renderer.render(template, data)\n  objectKey = storage.put(output)\n  return objectKey\n```\n\n```java\npublic DocumentJob submit(DocumentRequest req) {\n    return jobQueue.enqueue(req);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Sync render | 단순하다 | 느리다 | 작은 문서 |\n| Async render | 요청이 빠르다 | 상태 추적 필요 | 대부분의 실서비스 |\n| HTML to PDF | 구현이 빠르다 | 레이아웃 이슈 | 일반 보고서 |\n| Native PDF engine | 제어가 좋다 | 운영 난이도 | 정교한 출력 |\n| Versioned templates | 재현 가능하다 | 관리가 늘어난다 | 계약/청구 문서 |\n\n핵심은 문서 생성이 단순 출력이 아니라 **템플릿, 렌더링, 보관, 재현성을 함께 관리하는 파이프라인**이라는 점이다.\n\n## 꼬리질문\n\n> Q: 왜 템플릿 버전이 중요한가요?\n> 의도: 재현성과 감사 이해 확인\n> 핵심: 나중에 같은 문서를 다시 만들어야 할 수 있기 때문이다.\n\n> Q: HTML to PDF가 항상 좋은가요?\n> 의도: 렌더링 엔진 trade-off 이해 확인\n> 핵심: 빠르지만 페이지 레이아웃이 깨질 수 있다.\n\n> Q: 문서 생성이 느리면 어떻게 하나요?\n> 의도: 비동기 처리 이해 확인\n> 핵심: queue와 worker pool로 요청 path와 분리한다.\n\n> Q: 생성 결과는 어디에 저장하나요?\n> 의도: 보관과 배포 분리 이해 확인\n> 핵심: object storage와 signed URL이 일반적이다.\n\n## 한 줄 정리\n\nDocument generation / rendering service는 템플릿과 데이터를 버전화해 렌더링하고, 생성된 산출물을 안전하게 저장·배포하는 시스템이다.\n\n",
+  "aliases": [
+    "document generation",
+    "rendering service",
+    "pdf generation",
+    "docx",
+    "template rendering",
+    "html to pdf",
+    "async render",
+    "page break",
+    "watermark",
+    "snapshot",
+    "queue",
+    "Document Generation / Rendering Service 설계"
+  ],
+  "expected_queries": [
+    "Document Generation / Rendering Service 설계 설계 핵심을 설명해줘",
+    "document generation가 왜 필요한지 알려줘",
+    "Document Generation / Rendering Service 설계 실무 트레이드오프는 뭐야?",
+    "document generation 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Document Generation / Rendering Service 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Document Generation / Rendering Service 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Document Generation / Rendering Service 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/document-generation-rendering-service-design.md",
+    "revision_history": []
+  }
+}

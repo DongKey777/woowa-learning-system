@@ -1,0 +1,65 @@
+{
+  "id": "language/structured-concurrency-scopedvalue-interview-primer",
+  "title": "Structured Concurrency and ScopedValue Interview Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Structured Concurrency and `ScopedValue` Interview Primer\n\n> 한 줄 요약: structured concurrency는 관련 task의 수명, 실패, 취소를 하나의 lexical scope 안에 묶는 모델이고, `ScopedValue`는 그 scope 동안 읽기 전용 context를 안전하게 전달하는 API다. 단, 2026년 JDK 26 기준 `StructuredTaskScope`는 여전히 preview API이고 `ScopedValue`는 JDK 25에서 final이 됐다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Structured Concurrency and `ScopedValue`](./structured-concurrency-scopedvalue.md)\n> - [Structured Fan-out With `HttpClient`](./structured-fanout-httpclient.md)\n> - [`InheritableThreadLocal` vs `ScopedValue` Context Propagation Boundaries](./inheritablethreadlocal-vs-scopedvalue-context-propagation.md)\n> - [Virtual Threads(Project Loom)](./virtual-threads-project-loom.md)\n> - [ThreadLocal Leaks and Context Propagation](./threadlocal-leaks-context-propagation.md)\n> - [Thread Interruption and Cooperative Cancellation Playbook](./thread-interruption-cooperative-cancellation-playbook.md)\n\n> 공식 확인 기준: OpenJDK [JEP 525](https://openjdk.org/jeps/525), [JEP 506](https://openjdk.org/jeps/506), JDK 26 API docs의 [`StructuredTaskScope`](https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/concurrent/StructuredTaskScope.html), [`ScopedValue`](https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/lang/ScopedValue.html)를 기준으로 작성했다.\n\n> retrieval-anchor-keywords: StructuredTaskScope, structured concurrency, Java structured concurrency interview, JDK 26 preview API, JEP 525, ScopedValue final JDK 25, JEP 506, scope-bound context, ThreadLocal vs ScopedValue, virtual threads, child task lifetime, failure propagation, cancellation propagation, enable preview\n\n<details>\n<summary>Table of Contents</summary>\n\n- [면접용 30초 답변](#면접용-30초-답변)\n- [버전 상태를 먼저 말한다](#버전-상태를-먼저-말한다)\n- [structured concurrency가 푸는 문제](#structured-concurrency가-푸는-문제)\n- [`ScopedValue`가 푸는 문제](#scopedvalue가-푸는-문제)\n- [virtual thread와의 관계](#virtual-thread와의-관계)\n- [답변 템플릿](#답변-템플릿)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 면접용 30초 답변\n\nstructured concurrency는 여러 하위 task를 fire-and-forget으로 흩뿌리지 않고, 부모 작업의 코드 블록 안에서 시작하고, 기다리고, 실패와 취소를 정리하는 모델입니다. Java에서는 `StructuredTaskScope`가 이 역할을 하지만 JDK 26 기준 preview API라서 운영 적용 여부는 팀의 preview feature 정책을 봐야 합니다.\n\n`ScopedValue`는 `ThreadLocal`처럼 보일 수 있지만 mutable thread storage가 아니라 bounded dynamic scope 동안 읽는 context에 가깝습니다. JDK 25에서 final API가 되었고, request id나 tenant id처럼 한 방향으로 전달되는 immutable context에 잘 맞습니다.\n\n## 버전 상태를 먼저 말한다\n\n| API | JDK 26 기준 상태 | 답변할 때 주의 |\n|---|---|---|\n| Virtual Threads | JDK 21에서 final | 많은 blocking task를 싸게 만들지만 task 수명 구조를 자동으로 설계하지는 않는다 |\n| `ScopedValue` | JDK 25에서 final, JDK 26 regular API | JDK 21-24 자료는 preview/incubator 시절 문법일 수 있다 |\n| `StructuredTaskScope` | JDK 26에서도 preview, JEP 525 Sixth Preview | 사용하려면 preview feature를 켜야 하고 API 변경 가능성을 감수해야 한다 |\n\n특히 `StructuredTaskScope`는 오래된 글의 `new StructuredTaskScope.ShutdownOnFailure()` 예제를 그대로 복사하면 JDK 25/26 API와 맞지 않을 수 있다. JDK 25 이후 문서는 `StructuredTaskScope.open(...)`과 `Joiner` 중심으로 확인하는 편이 안전하다.\n\n## structured concurrency가 푸는 문제\n\n문제는 \"비동기를 쓴다\"가 아니다. 문제는 task 관계가 코드 구조에 남아 있지 않은 것이다.\n\n```java\nFuture<User> user = executor.submit(this::findUser);\nFuture<Order> order = executor.submit(this::fetchOrder);\n\nreturn new Response(user.get(), order.get());\n```\n\n이 코드는 겉보기에는 단순하지만 실패 시 해석이 어렵다.\n\n- `findUser()`가 실패했을 때 `fetchOrder()`는 계속 돌 수 있다.\n- parent thread가 interrupt되어도 child task로 자동 전파되지 않을 수 있다.\n- timeout 뒤에도 orphan work가 남을 수 있다.\n- thread dump에서 어떤 task가 어떤 요청의 자식인지 보기 어렵다.\n\nstructured concurrency는 관련 subtask를 하나의 scope에서 fork하고 join하게 해서 이 관계를 명시한다.\n\nJDK 26 `StructuredTaskScope`의 기본 설정은 unnamed virtual thread를 만들어 subtask를 실행한다. scope는 try-with-resources로 닫히며, owner thread가 fork/join/close를 담당한다. timeout을 설정하면 scope가 cancel되고 subtask 실행 thread에 interrupt가 전달된다. 다만 interrupt는 cooperative signal이므로 blocking I/O가 실제로 얼마나 빨리 멈추는지는 client timeout/abort 지원도 함께 봐야 한다.\n\n## `ScopedValue`가 푸는 문제\n\n`ScopedValue`는 \"멀리 있는 callee에 context를 넘기고 싶은데 모든 메서드 시그니처에 파라미터를 추가하기 어렵다\"는 문제를 푼다.\n\n```java\nprivate static final ScopedValue<String> TRACE_ID = ScopedValue.newInstance();\n\nScopedValue.where(TRACE_ID, traceId).run(() -> {\n    service.handle();\n});\n```\n\n이 scope 안에서 `TRACE_ID.get()`은 값을 읽을 수 있다. scope가 끝나면 binding은 사라진다.\n\n면접에서는 `ThreadLocal`과 이렇게 나누면 된다.\n\n| 축 | `ThreadLocal` | `ScopedValue` |\n|---|---|---|\n| 모델 | thread-bound mutable storage | bounded scope의 implicit parameter |\n| 값 변경 | `set/remove` 중심 | binding 후 read 중심, nested rebinding 가능 |\n| 수명 | thread lifetime과 섞이기 쉽다 | code scope 종료와 함께 정리된다 |\n| 적합 | legacy MDC, per-thread cache, 호환성 | request id, tenant id 같은 immutable context |\n| 주의 | pool reuse leak, remove 누락 | final API지만 target JDK 25+ 필요 |\n\n`ScopedValue`가 thread-local 변수를 전부 대체하는 것은 아니다. OpenJDK JEP 506도 thread-local migration을 강제하지 않는다. 양방향 mutable 전달, thread별 cache, 기존 logging framework 호환 같은 경우에는 `ThreadLocal`이나 adapter가 남을 수 있다.\n\n## virtual thread와의 관계\n\nvirtual thread는 실행 비용 문제를 줄인다. structured concurrency는 ownership 문제를 줄인다. 둘은 같은 답이 아니다.\n\n- virtual thread: blocking I/O를 thread-per-task 스타일로 작성하기 쉽게 한다.\n- structured concurrency: parent request가 child task를 어떻게 기다리고 취소할지 구조화한다.\n- `ScopedValue`: 그 구조 안에서 immutable context를 안전하게 읽게 한다.\n\n따라서 \"virtual thread가 있으면 structured concurrency는 필요 없다\"가 아니라 \"virtual thread로 subtask를 많이 만들기 쉬워졌기 때문에, 그 subtask의 수명과 실패를 더 명시적으로 묶어야 한다\"가 더 좋은 답변이다.\n\n## 답변 템플릿\n\n### 질문: structured concurrency가 뭔가요?\n\n```\n관련 있는 동시 작업을 하나의 lexical scope 안에서 시작하고 join하고 실패/취소를 정리하는 모델입니다.\n기존 Future/ExecutorService 코드는 child task가 parent 요청보다 오래 살아남는 orphan work가 생기기 쉬운데,\nStructuredTaskScope는 그런 child task lifetime을 scope 안에 가둡니다.\n다만 Java에서는 JDK 26 기준 preview API라서 운영 사용은 preview feature 정책을 확인해야 합니다.\n```\n\n### 질문: `ScopedValue`와 `ThreadLocal` 차이는 뭔가요?\n\n```\nThreadLocal은 thread에 붙는 mutable storage에 가깝고,\nScopedValue는 bounded dynamic scope 동안 읽히는 implicit parameter에 가깝습니다.\nrequest id처럼 한 방향으로 전달되는 immutable context는 ScopedValue가 더 명확하고,\nMDC나 per-thread cache처럼 기존 library가 mutable ThreadLocal을 기대하는 곳은 별도 adapter가 필요할 수 있습니다.\n```\n\n### 질문: 실패 전파는 어떻게 보나요?\n\n```\nStructuredTaskScope는 Joiner 정책에 따라 subtask completion을 모으고,\nfail-fast나 timeout 같은 조건에서 scope를 cancel할 수 있습니다.\ncancel은 새 subtask 시작을 막고 아직 끝나지 않은 subtask thread에 interrupt를 주는 방향이지만,\n네트워크/JDBC 같은 경계에서는 interruption만 믿지 말고 timeout과 abort API도 같이 설계해야 합니다.\n```\n\n## 오해와 wrong bucket\n\n| 오해 | 더 정확한 설명 |\n|---|---|\n| `StructuredTaskScope`는 JDK 21부터 final이다 | JDK 21부터 preview 계열로 들어왔고 JDK 26에서도 preview다 |\n| `ScopedValue`도 아직 preview다 | JDK 25에서 final이 되었고 JDK 26에는 regular API로 있다 |\n| virtual thread가 child task cleanup을 자동 해결한다 | 실행 비용을 낮출 뿐 parent-child lifetime은 별도 설계가 필요하다 |\n| `ScopedValue`는 `ThreadLocal.set`의 새 이름이다 | mutable storage가 아니라 bounded scope의 read 중심 context 모델이다 |\n| structured concurrency는 `CompletableFuture`를 완전히 대체한다 | 모든 async 조합을 대체하는 목표가 아니다. request-scoped task lifetime에 특히 잘 맞는다 |\n| scope cancel이면 모든 I/O가 즉시 중단된다 | interrupt는 signal이다. client timeout, socket close, JDBC cancel 등 실제 경계 처리가 필요하다 |\n\n## 한 줄 정리\n\n면접에서는 먼저 버전을 말한다. JDK 26 기준 `StructuredTaskScope`는 preview, `ScopedValue`는 JDK 25+ final이다. 그 다음 structured concurrency는 task lifetime/failure/cancellation 구조화, `ScopedValue`는 scope-bound immutable context 전달이라고 나누면 된다.\n",
+  "aliases": [
+    "StructuredTaskScope interview primer",
+    "Java structured concurrency primer",
+    "ScopedValue interview primer",
+    "StructuredTaskScope preview status",
+    "ScopedValue final status",
+    "scope-bound context",
+    "task lifetime scope",
+    "virtual thread task scope",
+    "Java Loom structured concurrency",
+    "자바 구조화된 동시성",
+    "자바 ScopedValue",
+    "CompletableFuture"
+  ],
+  "expected_queries": [
+    "StructuredTaskScope는 Java 몇 버전에서 쓸 수 있고 preview야 final이야?",
+    "ScopedValue는 현재 JDK에서 final API인지 알려줘",
+    "structured concurrency를 면접에서 어떻게 설명하면 돼?",
+    "ScopedValue와 ThreadLocal 차이를 interview 답변으로 정리해줘",
+    "virtual thread와 structured concurrency는 어떤 관계야?",
+    "StructuredTaskScope 실패 전파와 cancellation을 짧게 설명해줘"
+  ],
+  "symptoms": [
+    "StructuredTaskScope가 현재 Java에서 final API인지 preview API인지 헷갈림",
+    "ScopedValue를 ThreadLocal의 mutable 대체재로 설명함",
+    "virtual thread가 있으면 structured concurrency가 필요 없다고 오해함",
+    "StructuredTaskScope 예제를 JDK 버전별 API 변화 없이 복사하려 함",
+    "하위 task 실패 시 sibling cancellation과 parent lifetime을 설명하지 못함"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-thread-basics",
+      "language/virtual-threads-project-loom",
+      "language/threadlocal-leaks-context-propagation"
+    ],
+    "next_docs": [
+      "language/structured-concurrency-scopedvalue",
+      "language/structured-fanout-httpclient",
+      "language/inheritablethreadlocal-vs-scopedvalue-context-propagation",
+      "language/thread-interruption-cooperative-cancellation-playbook"
+    ],
+    "confusable_with": [
+      "language/structured-concurrency-scopedvalue",
+      "language/inheritablethreadlocal-vs-scopedvalue-context-propagation",
+      "language/threadlocal-leaks-context-propagation",
+      "language/completablefuture-cancellation-semantics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/structured-concurrency-scopedvalue-interview-primer.md",
+    "revision_history": []
+  }
+}

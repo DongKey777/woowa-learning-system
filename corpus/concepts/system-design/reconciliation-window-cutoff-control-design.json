@@ -1,0 +1,52 @@
+{
+  "id": "system-design/reconciliation-window-cutoff-control-design",
+  "title": "Reconciliation Window / Cutoff Control 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Reconciliation Window / Cutoff Control 설계를 다루는 deep_dive 문서다. reconciliation window와 cutoff control 설계는 late arrival, settlement delay, correction 허용 범위를 고려해 어떤 시점을 기준으로 정산·집계·청구 창을 닫고 다시 여는지 명시하는 운영 제어 설계다. 검색 질의가 reconciliation window, cutoff control, late arrival, settlement window처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Reconciliation Window / Cutoff Control 설계\n\n> 한 줄 요약: reconciliation window와 cutoff control 설계는 late arrival, settlement delay, correction 허용 범위를 고려해 어떤 시점을 기준으로 정산·집계·청구 창을 닫고 다시 여는지 명시하는 운영 제어 설계다.\n\nretrieval-anchor-keywords: reconciliation window, cutoff control, late arrival, settlement window, close period, reopen correction, watermark cutoff, posting window, financial close, correction after close, analytics restatement\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Billing Usage Metering System 설계](./billing-usage-metering-system-design.md)\n> - [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)\n> - [Replay / Repair Orchestration Control Plane 설계](./replay-repair-orchestration-control-plane-design.md)\n> - [Streaming Analytics Pipeline 설계](./streaming-analytics-pipeline-design.md)\n> - [Consistency Repair / Anti-Entropy Platform 설계](./consistency-repair-anti-entropy-platform-design.md)\n> - [Analytics Late Data Reconciliation 설계](./analytics-late-data-reconciliation-design.md)\n> - [Dashboard Restatement UX 설계](./dashboard-restatement-ux-design.md)\n\n## 핵심 개념\n\nreconciliation에서 가장 어려운 질문 중 하나는 \"언제 창을 닫을 것인가\"다.\n\n- provider 정산 파일은 늦게 올 수 있다\n- 이벤트는 late arrival로 도착할 수 있다\n- 내부 배치가 지연될 수 있다\n- correction은 언제까지 허용할지 정해야 한다\n\n즉, reconciliation은 단순 diff가 아니라 **시간 경계와 보정 정책을 가진 windowed 운영 루프**다.\n\n## 깊이 들어가기\n\n### 1. 왜 cutoff가 필요한가\n\n창을 영원히 열어 두면 다음 문제가 생긴다.\n\n- 청구서와 정산 리포트가 계속 바뀜\n- 운영자가 어떤 숫자가 확정인지 모름\n- 회계/정산 승인과 시스템 집계가 어긋남\n\n반대로 너무 일찍 닫으면:\n\n- late arrival가 빠짐\n- correction이 과도하게 다음 기간으로 밀림\n- 고객 이의 제기가 늘어남\n\n그래서 cutoff는 성능이 아니라 **업무적 확정 시점**을 정하는 문제다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 하루 거래 5천만 건\n- provider statement는 최대 6시간 지연\n- internal event lag p99 20분\n- correction reopen은 월 2회 이하 허용\n\n이때 봐야 할 숫자:\n\n- arrival lag distribution\n- close delay\n- reopen frequency\n- correction volume after close\n- window-finalization time\n\ncutoff 설계는 평균 arrival time보다 tail 지연이 더 중요하다.\n\n### 3. Window 상태 모델\n\n보통은 다음 같은 상태를 가진다.\n\n```text\nOPEN\n -> SOFT_CLOSE\n -> HARD_CLOSE\n -> CORRECTION_ONLY\n -> FINALIZED\n```\n\n핵심은 close를 한 번에 하지 않는 것이다.\n\n- soft close: 기본 집계는 잠그지만 늦은 건을 제한적으로 허용\n- hard close: 일반 입력 금지\n- correction only: 보정 entry만 허용\n\n### 4. Watermark와 business cutoff는 다르다\n\nstreaming watermark는 기술적 lateness 경계다.\n하지만 reconciliation cutoff는 business policy가 더 강하다.\n\n예:\n\n- 기술적으로는 2시간 늦은 이벤트도 처리 가능\n- 하지만 청구 마감은 KST 자정 + 30분까지만 허용\n\n즉, watermark와 business close는 연결되지만 동일 개념은 아니다.\n\n### 5. Reopen과 correction policy\n\n창을 닫았다고 모든 오류가 끝나는 것은 아니다.\n\n대표 선택지:\n\n- closed window를 reopen\n- next window에 correction entry 반영\n- 별도 dispute / adjustment workflow 사용\n\n금전/청구 영역에서는 원본 기간을 조용히 덮어쓰기보다, correction record를 append하는 편이 더 안전하다.\n\n### 6. Dependency-aware close\n\nreconciliation window는 한 시스템만 보고 닫으면 안 된다.\n\n봐야 할 것:\n\n- provider statement 도착 여부\n- internal ledger completeness\n- replay / repair campaign 존재 여부\n- anti-entropy 결과\n- approval workflow 완료 여부\n\n즉, close는 단일 cron이 아니라 여러 선행 조건을 모아 판단하는 control plane 문제다.\n\n### 7. Observability와 operator ergonomics\n\n운영자는 다음을 즉시 알아야 한다.\n\n- 지금 어떤 window가 open/soft-close/hard-close 상태인가\n- close가 지연되는 이유가 무엇인가\n- late arrival가 얼마나 쌓였는가\n- correction이 어느 기간에 반영될 예정인가\n\n숫자 자체보다 경계와 이유가 잘 보여야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 일일 결제 정산 close\n\n문제:\n\n- provider statement가 일부 늦고, 우리 callback도 tail 지연이 있다\n\n해결:\n\n- 자정 이후 soft close를 먼저 적용한다\n- provider completeness 확인 뒤 hard close를 진행한다\n- 누락분은 correction ledger로 다음 날 반영한다\n\n### 시나리오 2: usage billing invoice finalize\n\n문제:\n\n- 월말 사용량은 아직 일부 ingestion lag가 남아 있다\n\n해결:\n\n- invoice window의 watermark를 따로 둔다\n- lag가 임계치를 넘으면 finalize를 지연한다\n- 강제 마감 시 correction-only window를 함께 연다\n\n### 시나리오 3: 큰 replay 이후 close 재검토\n\n문제:\n\n- 과거 usage bug를 replay로 바로잡는 캠페인이 끝났다\n\n해결:\n\n- 영향받은 windows만 correction review 대상으로 올린다\n- 전체 reopen 대신 adjustment entry를 별도로 남긴다\n- approval 후 finalization state를 갱신한다\n\n## 코드로 보기\n\n```pseudo\nfunction evaluateClose(window):\n  if providerStatementIncomplete(window):\n    return HOLD\n  if internalLag(window) > threshold:\n    return SOFT_CLOSE\n  if repairCampaignActive(window):\n    return CORRECTION_ONLY\n  return HARD_CLOSE\n\nfunction applyLateEvent(event):\n  window = resolveWindow(event)\n  if window.state == OPEN:\n    post(window, event)\n  elif window.state == CORRECTION_ONLY:\n    appendCorrection(window, event)\n  else:\n    routeToAdjustmentWorkflow(event)\n```\n\n```java\npublic CloseDecision decide(ReconciliationWindow window) {\n    return cutoffPolicy.evaluate(window, dependencySnapshot.current());\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Always-open window | 단순하다 | 확정성이 없다 | 내부 분석용 |\n| Aggressive hard close | 숫자가 빨리 확정된다 | late arrival 손실이 커진다 | 지연 허용이 낮을 때 |\n| Soft close + correction | 현실적이다 | 운영 정책이 복잡해진다 | 결제, 청구, 정산 |\n| Full reopen | 원본 기간 수정이 쉽다 | 감사와 설명이 어렵다 | 드문 대형 사고 |\n| Append correction only | 추적이 쉽다 | 사용자 설명이 더 필요할 수 있다 | 금융/감사 중요 도메인 |\n\n핵심은 reconciliation window / cutoff control이 배치 스케줄이 아니라 **숫자를 언제 확정하고 언제 correction으로 넘길지 정하는 시간 경계 운영 설계**라는 점이다.\n\n## 꼬리질문\n\n> Q: watermark만 있으면 reconciliation close도 자동으로 되나요?\n> 의도: 기술 경계와 비즈니스 경계 구분 확인\n> 핵심: 아니다. watermark는 기술적 지연 경계이고, close는 provider completeness와 승인 같은 business 조건까지 함께 본다.\n\n> Q: closed window를 바로 reopen하면 안 되나요?\n> 의도: auditability와 correction semantics 이해 확인\n> 핵심: 가능은 하지만 금융/청구 영역에서는 correction entry를 append하는 편이 추적과 설명이 더 쉽다.\n\n> Q: cutoff를 너무 늦게 잡으면 왜 문제인가요?\n> 의도: 확정성 비용 이해 확인\n> 핵심: 청구/정산/리포트 숫자가 계속 바뀌어 운영과 고객 커뮤니케이션이 흔들리기 때문이다.\n\n> Q: close decision을 cron 하나로 하면 왜 부족한가요?\n> 의도: dependency-aware close 이해 확인\n> 핵심: provider 파일, internal lag, repair campaign, approval 상태처럼 여러 선행 조건을 함께 봐야 하기 때문이다.\n\n## 한 줄 정리\n\nReconciliation window / cutoff control 설계는 late arrival와 correction을 고려해 어떤 시점에 숫자를 확정하고 언제 adjustment로 넘길지 정하는 시간 경계 운영 설계다.\n",
+  "aliases": [
+    "reconciliation window",
+    "cutoff control",
+    "late arrival",
+    "settlement window",
+    "close period",
+    "reopen correction",
+    "watermark cutoff",
+    "posting window",
+    "financial close",
+    "correction after close",
+    "analytics restatement",
+    "Reconciliation Window / Cutoff Control 설계"
+  ],
+  "expected_queries": [
+    "Reconciliation Window / Cutoff Control 설계 설계 핵심을 설명해줘",
+    "reconciliation window가 왜 필요한지 알려줘",
+    "Reconciliation Window / Cutoff Control 설계 실무 트레이드오프는 뭐야?",
+    "reconciliation window 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Reconciliation Window / Cutoff Control 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Reconciliation Window / Cutoff Control 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Reconciliation Window / Cutoff Control 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/reconciliation-window-cutoff-control-design.md",
+    "revision_history": []
+  }
+}

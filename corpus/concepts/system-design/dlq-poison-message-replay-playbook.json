@@ -1,0 +1,46 @@
+{
+  "id": "system-design/dlq-poison-message-replay-playbook",
+  "title": "DLQ Poison Message Replay Playbook",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 playbook은 DLQ, poison message, replay, idempotency를 실무 메시징 운영 관점으로 다룬다.",
+  "body_markdown": "# DLQ Poison Message Replay Playbook\n\n## 핵심 invariant\n\nDLQ는 \"나중에 무조건 다시 넣을 메시지 보관함\"이 아니다. DLQ의 핵심 invariant는 \"실패 메시지를 원인별로 격리하고, 원인이 제거된 메시지만 제한된 budget 안에서 idempotent하게 replay한다\"이다.\n\n- retry exhausted 메시지는 즉시 replay하지 않고 failure class를 붙인다.\n- poison message는 정상 consumer traffic과 분리한다.\n- replay는 새 traffic과 같은 consumer path를 통과하되, idempotency guard와 replay marker를 남긴다.\n- fix-forward 없이는 poison message를 다시 넣지 않는다.\n- replay budget은 처리량, downstream 여유, error budget, DLQ re-entry rate로 제한한다.\n\n## Poison 분류 기준\n\n| 분류 | 대표 신호 | 먼저 할 일 | replay 조건 |\n|---|---|---|---|\n| transient dependency failure | timeout, 5xx, rate limit, 짧은 시간대 집중 | dependency 회복 확인, retry policy 점검 | dependency SLI 회복 후 소량 replay |\n| consumer bug | 같은 stack trace, 특정 코드 경로에서 재현 | 코드 수정, regression test 추가 | fix-forward 배포 후 canary replay |\n| schema incompatibility | unknown enum, missing field, old version event | upcaster, backward compatible reader 적용 | old/new schema fixture 통과 후 replay |\n| invalid business state | 참조 row 없음, 상태 전이 불가 | 원천 데이터 보정 또는 manual decision | 보정 evidence와 idempotent transition 확인 후 replay |\n| permanent poison | 의미 없는 payload, 계약 위반, 악성 입력 | quarantine, provider/producer에 피드백 | 자동 replay 금지 |\n\n## 흔한 오개념\n\n| 오개념 | 왜 위험한가 | 더 안전한 판단 |\n|---|---|---|\n| \"DLQ가 쌓였으니 비우는 게 목표다\" | 원인 제거 전 replay는 실패를 반복하고 consumer를 다시 막는다 | DLQ depth보다 failure class와 re-entry rate를 먼저 본다 |\n| \"replay는 읽기 작업이라 안전하다\" | consumer가 결제, 알림, 재고 차감 같은 side effect를 만들 수 있다 | replay 전 idempotency key와 상태 전이 guard를 검증한다 |\n| \"retry 횟수만 늘리면 poison도 언젠가 성공한다\" | deterministic bug와 schema mismatch는 반복 실패한다 | retryable과 terminal을 분리한다 |\n| \"전체 DLQ를 한 번에 replay하면 빠르다\" | backlog와 retry storm으로 정상 traffic을 밀어낸다 | canary, batch, rate limit, stop condition을 둔다 |\n\n## Chooser table\n\n| 목표 | 선택 | 조건 | 관측해야 할 지표 |\n|---|---|---|---|\n| 일시 장애 복구 후 따라잡기 | controlled replay | downstream error rate가 정상화됨 | replay throughput, consumer lag, dependency saturation |\n| 코드 버그로 실패한 메시지 복구 | fix-forward replay | 수정 버전 배포와 regression test 통과 | same exception recurrence, DLQ re-entry rate |\n| 잘못된 payload 격리 | quarantine | payload 자체가 계약을 위반함 | poison count by producer, manual decision age |\n| 중복 side effect 방지 | idempotent replay | business key 또는 event id가 있음 | dedup hit ratio, duplicate side effect count |\n| 운영 영향 제한 | replay budget | 정상 traffic 보호가 우선 | p95/p99 latency, queue depth, error budget burn |\n\n## 실무 지표와 증거\n\n- DLQ depth보다 `oldest_message_age`, `failure_class_count`, `producer/service별 분포`가 더 중요하다.\n- `replay_attempt_total`, `replay_success_total`, `replay_failed_total`, `replay_reentered_dlq_total`\n- consumer lag, processing latency, thread/connection pool saturation, downstream 429/5xx\n- exception fingerprint, schema version, message key, partition/offset, original enqueue time\n- idempotency evidence: dedup store hit, business ledger transition, processed event table\n- replay impact evidence: 정상 traffic p99, queue depth, retry rate, circuit breaker open count\n\n## 재현 조건\n\nConsumer가 특정 메시지에서 deterministic하게 실패하고 retry exhausted 후 DLQ로 이동한다. 같은 메시지를 원인 제거 없이 replay하면 다시 DLQ로 돌아와야 하며, 원인 제거 후 replay하면 side effect가 한 번만 발생해야 한다.\n\n## 검증 순서\n\n1. DLQ 샘플을 failure class별로 나눈다. stack trace, schema version, producer, business key를 함께 본다.\n2. 같은 메시지를 staging 또는 shadow consumer에서 재현해 transient인지 deterministic poison인지 확인한다.\n3. consumer bug라면 fix-forward 후 regression test에 DLQ sample payload를 추가한다.\n4. schema 문제라면 upcaster나 backward compatible parser를 적용하고 old event fixture를 통과시킨다.\n5. replay 전에 idempotency key, processed-event table, business 상태 전이 guard를 확인한다.\n6. 전체 replay 전에 1개, 10개, 1분치처럼 작은 batch로 canary replay한다.\n7. replay 중 `DLQ re-entry rate`, `duplicate side effect`, `normal traffic p99`, `dependency saturation`이 중단 기준을 넘으면 멈춘다.\n8. 완료 후 남은 DLQ를 \"재시도 가능\", \"수동 보정 필요\", \"폐기/계약 위반\"으로 다시 라벨링한다.\n\n## Safe Next Docs\n\n중복 안전성은 `idempotency-key-store-dedup-window-replay-safe-retry-design`, projection replay 실패는 `projection-rebuild-poison-event-replay-failure-handling`으로 이어진다.\n",
+  "aliases": [
+    "DLQ poison message replay playbook",
+    "dead letter queue poison message",
+    "메시지 재처리 DLQ 운영",
+    "poison event replay runbook"
+  ],
+  "expected_queries": [
+    "DLQ에 쌓인 메시지는 어떻게 재처리해?",
+    "poison message와 일시 장애 메시지를 어떻게 구분해?",
+    "메시지 replay가 중복 처리를 만들지 않게 하려면?"
+  ],
+  "symptoms": [
+    "같은 메시지가 계속 실패하며 consumer를 막습니다",
+    "DLQ를 비우려고 무조건 replay합니다",
+    "schema 변경 뒤 옛 메시지가 처리되지 않습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "next_docs": [
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "design-pattern/projection-rebuild-poison-event-replay-failure-handling"
+    ],
+    "confusable_with": [
+      "system-design/webhook-retry-dedup-deadletter-playbook",
+      "design-pattern/projection-rebuild-poison-event-replay-failure-handling"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/dlq-poison-message-replay-playbook.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "data-structure/delayqueue-cancel-while-running-primer",
+  "title": "DelayQueue Cancel-While-Running Primer",
+  "category": "data-structure",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# DelayQueue Cancel-While-Running Primer\n\n> 한 줄 요약: `DelayQueue` 반복 작업은 \"실행이 끝난 뒤 다음 ticket을 다시 넣는 구조\"라서, 실행 도중 `cancel`이나 설정 변경이 들어오면 **실행 후 재등록 직전에 최신 state를 다시 확인**해야 post-run re-enqueue race를 막을 수 있다.\n\n**난이도: 🟢 Beginner**\n\n> 관련 문서:\n> - [DelayQueue Repeating Task Primer](./delayqueue-repeating-task-primer.md)\n> - [Periodic Task Cancellation Bridge](./periodic-task-cancellation-bridge.md)\n> - [Timer Cancellation and Reschedule Stale Entry Primer](./timer-cancellation-reschedule-stale-entry-primer.md)\n> - [ScheduledFuture Cancellation Bridge](./scheduledfuture-cancel-stale-entries.md)\n> - [DelayQueue Handle Vs Equality Cancel Guide](./delayqueue-handle-vs-equality-cancel-guide.md)\n> - [DelayQueue Queue Size vs Live Timers Primer](./delayqueue-queue-size-vs-live-timers-primer.md)\n>\n> retrieval-anchor-keywords: delayqueue cancel while running, delayqueue reenqueue race, delayqueue running task cancel, delayqueue repeating job cancel reconfigure, post run re enqueue race, self rescheduling cancel while running, self rescheduling reconfigure while running, generation guard delayqueue, delayqueue active flag, delayqueue latest state check, repeating task cancel while executing, repeating task reconfigure while executing, fixed rate cancel race, fixed delay cancel race, stale reenqueue delayqueue, beginner delayqueue cancel primer, delayqueue repeating task safe pattern, java delayqueue periodic cancel, java delayqueue reschedule while running, cancel during run beginner, 실행 중 취소 delayqueue, 실행 중 재설정 delayqueue, 재등록 race, 반복 작업 최신성 검사\n\n## 먼저 멘탈모델부터\n\n`DelayQueue` 반복 작업은 \"queue 안에 영원히 살아 있는 작업 하나\"가 아니다.\n\n> worker가 이번 ticket을 꺼내 실행하고, 끝난 뒤 다음 ticket을 다시 넣는 흐름이다.\n\n그래서 실행 도중 `cancel()`이나 \"주기를 30초로 바꿔라\" 같은 요청이 들어오면,\n진짜 위험한 지점은 **현재 실행 중인 코드가 끝난 뒤 예전 생각으로 다음 ticket을 다시 넣는 순간**이다.\n\n## 문제를 한 줄로 말하면\n\n초보자용으로 줄이면 이 문제다.\n\n| 상황 | 사고 지점 |\n|---|---|\n| 실행 중 `cancel()` | 이미 돌던 코드가 끝나고 예전 정책으로 다시 `offer()`함 |\n| 실행 중 interval 변경 | 새 설정이 들어왔는데, 오래된 실행이 옛 interval로 다음 ticket을 만듦 |\n| 실행 중 mode 변경 (`fixed-rate` -> `fixed-delay`) | 재등록 계산식이 바뀌었는데 실행 중이던 라운드는 그 사실을 모를 수 있음 |\n\n즉 `DelayQueue` 쪽 오류라기보다 **self-rescheduling correctness** 문제다.\n\n## 가장 흔한 나쁜 패턴\n\n아래 코드는 얼핏 자연스럽지만 race에 약하다.\n\n```java\nwhile (true) {\n    RepeatTicket ticket = queue.take();\n    ticket.job().run();\n\n    long nextDeadline = ticket.deadlineNanos() + ticket.periodNanos();\n    queue.offer(ticket.next(nextDeadline));\n}\n```\n\n왜 위험한가?\n\n1. `run()`이 도는 동안 누군가 cancel할 수 있다.\n2. `run()`이 도는 동안 주기나 mode를 바꿀 수 있다.\n3. 그런데 실행 후 코드는 그 사실을 다시 확인하지 않고 무조건 재등록한다.\n\n그러면 사람은 \"취소했다\" 또는 \"설정을 바꿨다\"고 생각하지만,\nqueue에는 예전 정책 ticket이 한 장 더 생긴다.\n\n## timeline으로 보면 더 쉽다\n\n처음에는 10초 주기 반복 작업 `A`가 있다고 하자.\n\n| 시각 | 무슨 일 |\n|---|---|\n| `t=0` | `A#g1@10` 등록 |\n| `t=10` | worker가 `A#g1@10` 실행 시작 |\n| `t=12` | 운영자가 `cancel(A)` 또는 \"이제 30초 간격으로 다시 등록\" 요청 |\n| `t=13` | 실행이 끝남 |\n| 나쁜 코드 | `A#g1@20`을 다시 넣음 |\n| 의도한 결과 | 아무 것도 넣지 않거나, 새 설정의 ticket만 살아 있어야 함 |\n\n핵심은 이것이다.\n\n> 실행 중 요청은 \"지금 돌고 있는 라운드를 과거로 되돌리는 것\"이 아니라, **끝난 뒤 다음 라운드를 만들 자격을 바꾸는 것**이다.\n\n## beginner 기본값: `job state`를 따로 둔다\n\n가장 안전한 입문 패턴은 queue ticket과 논리 작업 state를 분리하는 것이다.\n\n| 구성 요소 | 의미 |\n|---|---|\n| `RepeatTicket` | \"이번 차례 실행 snapshot\" |\n| `JobState.active` | 이 작업이 아직 살아 있나 |\n| `JobState.generation` | 지금 ticket이 최신 설정과 같은 세대인가 |\n| `JobState.mode / interval` | 다음 ticket을 어떤 규칙으로 다시 찍어야 하나 |\n\n이 구조를 쓰면 worker는 \"꺼낸 ticket\"보다 \"`states`에 있는 최신 state\"를 더 신뢰하게 된다.\n\n## 안전 패턴은 검사 지점이 두 번이다\n\n초보자가 가장 놓치기 쉬운 포인트는 stale 확인을 한 번만 하면 부족할 수 있다는 점이다.\n\n| 검사 시점 | 왜 필요한가 |\n|---|---|\n| 실행 전 | queue 안 오래된 ticket을 시작 전에 버리기 위해 |\n| 실행 후 재등록 전 | 실행 도중 들어온 cancel / reconfigure를 반영하기 위해 |\n\n이중 검사 없이 실행 후 무조건 재등록하면 post-run re-enqueue race가 남는다.\n\n```java\nwhile (true) {\n    RepeatTicket ticket = queue.take();\n    JobState beforeRun = states.get(ticket.jobId());\n\n    if (beforeRun == null\n            || !beforeRun.active()\n            || ticket.generation() != beforeRun.generation()) {\n        continue; // started too late or stale before execution\n    }\n\n    ticket.job().run();\n    long finishedAt = System.nanoTime();\n\n    JobState afterRun = states.get(ticket.jobId());\n    if (afterRun == null\n            || !afterRun.active()\n            || ticket.generation() != afterRun.generation()) {\n        continue; // cancelled or reconfigured while running\n    }\n\n    long nextDeadline = switch (afterRun.mode()) {\n        case FIXED_RATE -> ticket.deadlineNanos() + afterRun.intervalNanos();\n        case FIXED_DELAY -> finishedAt + afterRun.intervalNanos();\n    };\n\n    queue.offer(new RepeatTicket(\n            ticket.jobId(),\n            afterRun.generation(),\n            nextDeadline,\n            ticket.job()));\n}\n```\n\n여기서 두 줄이 핵심이다.\n\n- 실행 전: \"이 ticket 아직 유효한가?\"\n- 실행 후: \"실행하는 동안에도 아직 유효했나?\"\n\n## `cancel`과 `reconfigure`를 같은 규칙으로 다루기\n\nbeginner 관점에서는 두 요청을 따로 생각하면 오히려 헷갈린다.\n\n| 요청 | 상태 쪽에서 하는 일 | worker가 보는 결과 |\n|---|---|---|\n| `cancel(jobId)` | `active=false`, `generation++` | 지금 실행이 끝나도 다음 ticket을 넣지 않음 |\n| interval 변경 | `interval` 변경, `generation++`, 새 ticket 등록 | 예전 실행은 재등록 자격을 잃음 |\n| mode 변경 | `mode` 변경, `generation++`, 새 ticket 등록 | 다음 deadline 계산을 최신 mode로만 허용 |\n\n중요한 점은 `generation++`이다.\n\n> \"예전 실행 흐름은 이제 더 이상 미래 ticket을 만들 수 없다\"를 숫자로 표현하는 장치가 `generation`이다.\n\n## 빠른 선택표\n\n| 상황 | beginner 기본값 |\n|---|---|\n| 반복 작업을 실행 중 취소해야 함 | `active` + `generation`을 두고 실행 후 재등록 전에 다시 확인 |\n| 실행 중 주기만 바꾸고 싶음 | 기존 ticket 수정 대신 `generation++` 후 새 ticket 추가 |\n| cancel이 자주 일어나 queue 안 stale가 남아도 correctness가 더 중요함 | lazy stale skip을 기본값으로 둠 |\n| \"지금 돌고 있는 코드도 즉시 멈춰야 함\" | queue 재등록 문제와 별개로 interrupt/cooperative stop 정책을 따로 설계 |\n\n마지막 줄이 중요하다.\n\n`cancel while running`에는 보통 두 층이 있다.\n\n1. 현재 라운드를 멈출 것인가\n2. 다음 라운드를 다시 만들 것인가\n\n이 문서는 2번, 즉 **post-run re-enqueue race 방지**가 중심이다.\n\n## 자주 하는 오해\n\n1. 실행 전에 stale 검사 한 번만 하면 충분하다고 생각한다.\n2. `cancel()`이 호출됐으면 실행 후 재등록도 자동으로 막힐 것이라고 생각한다.\n3. queue 안 ticket의 interval 필드만 바꾸면 재설정이 끝난다고 생각한다.\n4. `active=false`만 두면 reschedule과 old/new 구분까지 자동으로 해결된다고 생각한다.\n5. \"현재 라운드 중단\"과 \"다음 라운드 재등록 차단\"을 같은 문제로 본다.\n\n특히 1번이 가장 흔하다.\n실행 전 검사만으로는 **실행 중간에 바뀐 상태**를 놓친다.\n\n## 간단한 구현 체크리스트\n\n1. ticket은 immutable snapshot으로 둔다.\n2. 논리 작업 state는 queue 밖 map에 둔다.\n3. `cancel`과 `reconfigure`는 `generation`을 올린다.\n4. worker는 실행 전과 실행 후에 둘 다 generation을 확인한다.\n5. 재등록 계산은 ticket의 옛 설정이 아니라 최신 `JobState` 기준으로 한다.\n\n## 다음 문서로 이어가기\n\n- 반복 작업의 fixed-rate / fixed-delay ticket 흐름 자체를 먼저 잡으려면 [DelayQueue Repeating Task Primer](./delayqueue-repeating-task-primer.md)\n- cancel/reschedule stale ticket 패턴을 더 넓게 보려면 [Timer Cancellation and Reschedule Stale Entry Primer](./timer-cancellation-reschedule-stale-entry-primer.md)\n- `ScheduledFuture.cancel()`의 API 감각으로 옮겨 가려면 [Periodic Task Cancellation Bridge](./periodic-task-cancellation-bridge.md)\n- stale ticket이 모니터링 숫자를 어떻게 흐리는지 보려면 [DelayQueue Queue Size vs Live Timers Primer](./delayqueue-queue-size-vs-live-timers-primer.md)\n\n## 한 줄 정리\n\n`DelayQueue` 반복 작업을 실행 중 취소하거나 재설정할 때는 \"실행이 끝나면 무조건 다시 넣기\"를 버리고, **실행 후 재등록 직전에 최신 `active/generation/config`를 다시 확인**해야 post-run re-enqueue race를 막을 수 있다.\n",
+  "aliases": [
+    "DelayQueue cancel while running",
+    "post run re-enqueue race",
+    "self rescheduling cancel race",
+    "repeating task cancel while executing",
+    "generation guard DelayQueue",
+    "stale reenqueue DelayQueue",
+    "실행 중 취소 재등록 race"
+  ],
+  "expected_queries": [
+    "DelayQueue 반복 작업 실행 중 cancel되면 왜 실행 후 재등록 race가 생겨?",
+    "self-rescheduling task에서 post-run re-enqueue 전에 generation을 다시 확인해야 하는 이유는?",
+    "fixed-rate 작업 실행 중 interval 변경이 들어오면 stale ticket을 어떻게 막아?",
+    "DelayQueue cancel while running 문제를 beginner 기준으로 timeline으로 설명해줘",
+    "실행 전 검사만으로는 반복 task cancel race를 막지 못하는 이유는?"
+  ],
+  "symptoms": [
+    "반복 작업 실행 중 cancel이나 interval 변경이 들어왔는데 실행이 끝난 뒤 오래된 정책으로 다음 ticket을 다시 offer한다",
+    "DelayQueue 문제가 아니라 self-rescheduling correctness 문제인데 queue remove 비용만 먼저 보려 한다",
+    "실행 전 최신성 검사만 하고 실행 후 재등록 직전 최신 state 또는 generation을 다시 확인하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/delayqueue-repeating-task-primer",
+      "data-structure/timer-cancellation-reschedule-stale-entry-primer"
+    ],
+    "next_docs": [
+      "data-structure/delayqueue-repeating-task-primer",
+      "data-structure/periodic-task-cancellation-bridge",
+      "data-structure/timer-cancellation-reschedule-stale-entry-primer",
+      "data-structure/delayqueue-handle-vs-equality-cancel-guide"
+    ],
+    "confusable_with": [
+      "data-structure/delayqueue-repeating-task-primer",
+      "data-structure/periodic-task-cancellation-bridge",
+      "data-structure/timer-cancellation-reschedule-stale-entry-primer",
+      "data-structure/delayqueue-handle-vs-equality-cancel-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/delayqueue-cancel-while-running-primer.md",
+    "revision_history": []
+  }
+}

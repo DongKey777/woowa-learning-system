@@ -1,0 +1,51 @@
+{
+  "id": "database/roomescape-member-reservation-fk-delete-policy-bridge",
+  "title": "Roomescape Member / Reservation FK Delete Policy Bridge",
+  "category": "database",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Roomescape Member / Reservation FK Delete Policy Bridge\n\n> 한 줄 요약: roomescape에서 회원 삭제는 \"row를 지울 수 있나\"보다 \"기존 예약 기록을 어떤 의미로 보존할 것인가\"를 먼저 결정해야 한다.\n\n**난이도: Beginner**\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"회원을 삭제할 때 기존 예약을 어떻게 처리해야 할지 모르겠어요\" | member와 reservation FK가 있는 roomescape 모델 | row 삭제보다 예약 기록 보존 의미를 먼저 정한다 |\n| \"FK 때문에 삭제가 실패하거나 cascade로 예약까지 사라져요\" | restrict/cascade 정책을 처음 고르는 단계 | 참조 무결성과 product history requirement를 함께 본다 |\n| \"soft delete, restrict, cascade 중 무엇을 골라야 하나요?\" | 탈퇴 회원, 과거 예약, 활성 예약 정책 분리 | 물리 삭제 요구, snapshot 필요, active predicate를 나눠 결정한다 |\n| \"JPA orphanRemoval을 켜면 DB cascade랑 같은 거죠?\" | Member와 Reservation 관계를 aggregate처럼 매핑한 상태 | 애플리케이션 aggregate lifecycle과 DB 참조 정책을 분리한다 |\n\n## CS concept 매핑\n\n| roomescape 장면 | DB 개념 |\n|---|---|\n| 예약이 있는 회원 삭제가 실패 | FK restrict / referential integrity |\n| 회원 삭제와 함께 예약도 사라짐 | cascade delete |\n| 예약은 남기되 회원 참조를 끊음 | `ON DELETE SET NULL` / nullable reference |\n| 회원은 탈퇴했지만 예약 기록은 남겨야 함 | soft delete 또는 anonymized snapshot |\n| 예약 목록에서 탈퇴 회원 이름을 보여줘야 함 | snapshot column 또는 nullable reference policy |\n| 취소 예약은 남기고 활성 예약만 막아야 함 | active predicate / lifecycle state |\n| 컬렉션에서 reservation을 제거했더니 delete SQL이 나감 | JPA orphan removal |\n| 직접 SQL 삭제에서도 자식 row가 같이 삭제됨 | DB-level cascade |\n\n## 리뷰 신호\n\n- \"`ON DELETE CASCADE`를 붙이면 편하지 않나요?\"는 데이터 보존 의미를 먼저 물어야 하는 신호다.\n- \"예약 이력이 사라져도 되나요?\"는 참조 무결성보다 product history requirement를 먼저 확인하라는 말이다.\n- \"회원 삭제와 예약 취소를 같은 의미로 보지 마세요\"는 entity lifecycle이 다르다는 지적이다.\n- \"soft delete를 쓰면 unique constraint도 다시 봐야 합니다\"는 삭제 정책이 조회/제약 조건까지 번진다는 뜻이다.\n- \"`orphanRemoval = true`면 해결 아닌가요?\"는 ORM cascade와 DB FK action을 섞어 보고 있다는 신호다.\n- \"탈퇴 회원의 개인정보는 지워야 하지만 예약 이력은 남겨야 합니다\"는 anonymization과 audit retention을 함께 설계하라는 신호다.\n\n## 판단 순서\n\n1. reservation row가 감사, CS 대응, 결제, 통계, 리뷰 이력에 필요한지 확인한다.\n2. 회원 탈퇴가 \"로그인 불가 상태\"인지, \"개인정보 삭제\"인지, \"member row 물리 삭제\"인지 구분한다.\n3. active reservation이 있으면 탈퇴를 거부할지, 예약을 취소할지, 탈퇴 상태만 바꿀지 정책을 먼저 정한다.\n4. 과거 reservation은 member FK를 유지할지, nullable로 끊을지, 예약 당시 표시 이름을 snapshot으로 남길지 결정한다.\n5. 개인정보 보존이 문제라면 member row 삭제보다 email/name/phone anonymization과 audit event 보존을 분리한다.\n6. soft delete를 고르면 모든 조회의 active predicate, unique 재사용, index 조건을 같이 설계한다.\n7. FK action을 바꾸는 migration은 기존 orphan row, 대량 cascade, lock, rollback 계획을 먼저 검증한다.\n\n## 삭제 정책 선택지\n\n| 정책 | 맞는 경우 | Roomescape에서 조심할 점 |\n|---|---|---|\n| `RESTRICT` / `NO ACTION` | 자식 row가 독립 이력이고 부모 삭제를 막아야 할 때 | 예약이 있는 member hard delete를 막는 기본 방어선이 된다. 탈퇴는 별도 상태 변경으로 풀 수 있다 |\n| `CASCADE` | 자식 row가 부모 없이 의미가 없고, 지워져도 감사/CS/정산에 영향이 없을 때 | reservation, payment, audit history에는 보통 위험하다. 한 member 삭제가 예약 이력을 대량 삭제할 수 있다 |\n| `SET NULL` | reservation은 남아야 하지만 member와의 현재 참조는 끊어도 될 때 | `member_id`가 null이어도 화면/통계가 필요한 값을 snapshot column으로 보존해야 한다 |\n| `SOFT DELETE` | member row 식별자는 유지하되 탈퇴/삭제 상태만 표현할 때 | 모든 로그인/조회/중복검사에 `deleted_at is null` 같은 active predicate가 필요하다 |\n| anonymization | 개인정보는 제거해야 하지만 예약 이력과 감사 trail은 남겨야 할 때 | 이름/전화/email은 익명화하고, 예약 당시 필요한 표시값은 최소 정보로 snapshot 처리한다 |\n\n## Orphan Removal vs DB Cascade\n\n`orphanRemoval = true`는 JPA persistence context 안에서 부모 aggregate 컬렉션에서 빠진 자식 entity를 삭제 대상으로 보는 ORM 규칙이다. 애플리케이션 코드가 `member.getReservations().remove(reservation)` 같은 변경을 만들 때 delete SQL이 나갈 수 있다.\n\nDB cascade는 FK에 붙은 데이터베이스 규칙이다. 애플리케이션, 배치 SQL, 운영자 SQL처럼 어떤 경로로 부모 row가 삭제되더라도 DB가 자식 row 삭제를 전파한다.\n\nRoomescape 예약은 보통 \"member 내부 부품\"이 아니라 예약 이력 자체가 의미를 가진다. 그래서 `Member` aggregate 컬렉션 정리 편의를 위해 reservation을 orphan으로 취급하면, 탈퇴/수정 코드가 과거 예약 이력을 지우는 설계가 될 수 있다.\n\n## 회원 삭제와 예약 이력\n\n활성 예약이 있는 회원 탈퇴는 하나의 transaction에서 다음을 함께 보아야 한다.\n\n1. member row를 잠그거나 재조회해서 이미 탈퇴 처리됐는지 확인한다.\n2. future active reservation이 있으면 탈퇴를 거부하거나 예약 취소 정책을 먼저 실행한다.\n3. 탈퇴가 허용되면 member를 soft delete 또는 withdrawn 상태로 바꾼다.\n4. 개인정보 삭제 요구가 있으면 name, phone, email을 익명화하되 reservation history key와 audit event는 남긴다.\n5. 과거 reservation 화면이 필요하면 member current name을 읽지 말고 reservation snapshot 값을 읽는다.\n\n이 흐름에서 hard delete는 마지막 선택지다. hard delete가 필요하다면 `SET NULL + snapshot`, anonymized member row, 별도 archived member table 중 어떤 방식으로 history를 살릴지 먼저 정해야 한다.\n\n## Transaction / Migration Safety\n\n- FK action 변경 전에 기존 orphan reservation이 있는지 dry-run query로 세고 정리한다.\n- `ON DELETE CASCADE` 추가 전에는 한 parent 삭제가 몇 row를 지우는지 count와 lock 범위를 확인한다.\n- `SET NULL`로 바꿀 때는 `member_id` nullable 변경, snapshot backfill, application null handling을 같은 release 계획에 넣는다.\n- soft delete 도입 시 `deleted_at`, `status`, active unique index, 기본 조회 predicate를 함께 배포한다.\n- 대량 backfill은 작은 batch로 나누고, migration script는 재실행해도 안전하게 만든다.\n- constraint 추가는 가능하면 backfill 후 validate 단계로 나누고, 실패 시 기존 FK policy로 돌아갈 rollback 절차를 둔다.\n\n## Wrong Buckets\n\n| 잘못 넣는 버킷 | 왜 틀렸는가 |\n|---|---|\n| \"FK 오류니까 cascade 추가\" | DB 오류는 증상이고, 예약 이력을 지워도 되는지는 별도 요구사항이다 |\n| \"restrict면 삭제 기능 불가\" | 회원 탈퇴는 member hard delete가 아니라 상태 변경/익명화로 구현할 수 있다 |\n| \"`SET NULL`이면 history 보존 완료\" | nullable FK만으로는 예약 당시 회원 표시값, 감사 trail, CS 검색 조건이 사라질 수 있다 |\n| \"soft delete면 안전\" | active predicate와 unique/index 정책이 빠지면 삭제된 회원이 다시 조회되거나 재가입이 막힌다 |\n| \"orphanRemoval과 DB cascade는 같다\" | 하나는 ORM aggregate lifecycle, 하나는 DB constraint action이다 |\n| \"개인정보 삭제와 이력 삭제는 같다\" | PII anonymization과 reservation audit retention은 분리해서 설계해야 한다 |\n\n## 검증 질문\n\n- 이 reservation은 회원 탈퇴 후에도 CS, 환불, 감사, 통계에 필요한가?\n- active reservation이 남아 있을 때 탈퇴 요청은 거부, 예약 취소, 탈퇴 보류 중 무엇인가?\n- 과거 예약 화면은 current member table을 읽어도 되는가, reservation snapshot을 읽어야 하는가?\n- `member_id`가 null이어도 도메인 규칙과 쿼리가 깨지지 않는가?\n- soft-deleted member의 email/login id는 재사용 가능한가, unique index는 이를 표현하는가?\n- 삭제/탈퇴 transaction 도중 새 reservation이 생기는 경합을 어떻게 막는가?\n- migration 전후 orphan row count, cascade 영향 row count, rollback 경로를 확인했는가?\n\n처음 미션에서는 cascade를 기본값처럼 쓰기보다, 예약 이력 보존 의미가 있으면 `RESTRICT + 탈퇴 상태`, `SOFT DELETE + anonymization`, 또는 `SET NULL + snapshot` 중 하나를 요구사항에 맞게 설명하는 편이 리뷰 설득력이 높다.\n",
+  "aliases": [
+    "roomescape member reservation foreign key delete policy",
+    "룸이스케이프 회원 예약 FK 삭제 정책",
+    "reservation member FK restrict cascade",
+    "예약 회원 삭제 참조 무결성",
+    "Roomescape FK delete bridge"
+  ],
+  "expected_queries": [
+    "roomescape 회원 삭제 시 예약 FK를 어떻게 처리해야 해?",
+    "예약이 있는 member를 삭제하면 restrict cascade soft delete 중 뭘 봐야 해?",
+    "룸이스케이프 member reservation FK 리뷰를 DB 모델링으로 설명해줘",
+    "기존 예약을 보존해야 할 때 foreign key delete policy를 어떻게 잡아?"
+  ],
+  "symptoms": [
+    "roomescape에서 회원을 삭제할 때 기존 예약을 어떻게 처리해야 할지 모르겠다",
+    "FK 때문에 member 삭제가 실패하거나 cascade로 예약까지 사라져 당황한다",
+    "soft delete, restrict, cascade 중 무엇을 골라야 하는지 리뷰에서 막혔다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/primary-foreign-key-basics",
+      "database/sql-relational-modeling-basics"
+    ],
+    "next_docs": [
+      "database/foreign-key-cascade-lock-surprises",
+      "database/soft-delete-uniqueness-indexing-lifecycle",
+      "database/roomescape-reservation-cancel-reschedule-active-predicate-bridge"
+    ],
+    "confusable_with": [
+      "database/primary-foreign-key-basics",
+      "database/foreign-key-cascade-lock-surprises",
+      "database/soft-delete-uniqueness-indexing-lifecycle"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/roomescape-member-reservation-fk-delete-policy-bridge.md",
+    "revision_history": []
+  }
+}

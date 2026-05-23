@@ -1,0 +1,46 @@
+{
+  "id": "system-design/newsfeed-fanout-interview-chooser",
+  "title": "Newsfeed Fanout Interview Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 newsfeed 설계에서 fanout on write, fanout on read, hybrid 전략을 구분한다.",
+  "body_markdown": "# Newsfeed Fanout Interview Chooser\n\n## 10초 chooser\n\n| 조건 | 전략 | 이유 |\n|---|---|---|\n| 보통 사용자의 follower 수가 제한적 | Fanout on write | 읽기 지연이 낮음 |\n| 팔로워가 매우 많은 celebrity | Fanout on read | write 폭발 방지 |\n| 둘 다 섞인 서비스 | Hybrid | account tier별 전략 분리 |\n\n## 헷갈리는 축\n\nFanout on write는 게시물이 생성될 때 follower timeline에 미리 넣는다. 읽기는 빠르지만 follower가 많은 계정의 write 비용이 폭발한다.\n\nFanout on read는 사용자가 feed를 열 때 followee의 게시물을 모아 ranking한다. write 비용은 낮지만 read path가 무거워지고 latency budget 관리가 중요해진다.\n\nHybrid는 일반 계정은 write fanout, celebrity는 read-time merge로 처리한다. 면접에서는 이 예외 처리가 핵심 trade-off다.\n\n## 결정 축\n\n| 축 | 물어볼 질문 | 선택에 주는 영향 |\n|---|---|---|\n| Follower fanout 크기 | 한 post가 몇 개 timeline write로 증폭되는가 | 작은 계정은 write fanout, celebrity는 read-time merge나 partial fanout |\n| Feed read latency | 앱 첫 화면 p95/p99 예산이 얼마나 빡빡한가 | 낮은 read latency가 핵심이면 materialized inbox를 우선 검토 |\n| Freshness 허용치 | 새 글이 몇 초 늦게 보여도 되는가 | freshness가 느슨하면 queue 기반 비동기 fanout과 repair가 쉬워짐 |\n| Ranking 비용 | 후보 수집과 ranking feature 계산을 같은 path에서 해도 되는가 | ranking이 비싸면 후보 materialization과 scoring layer를 분리 |\n| Visibility 변경 빈도 | 삭제, block, privacy 변경이 얼마나 자주 발생하는가 | negative update가 많으면 read-time visibility filter와 projection repair가 중요 |\n| 계정 tier 변동 | celebrity/normal 분류가 고정인가 동적으로 바뀌는가 | tier promotion/demotion 시 timeline 재계산 또는 hybrid merge 정책 필요 |\n\n## Wrong-bucket neighbor\n\nTimeline materialization은 후보를 어디에 저장할지의 문제고, ranking은 후보를 어떤 순서로 보여줄지의 문제다. 두 축을 분리해 말해야 설계가 선명해진다.\n\n## 핵심 요구사항\n\n- 사용자가 앱을 열었을 때 첫 화면 feed를 낮은 latency로 반환한다.\n- 게시물 작성, 삭제, privacy 변경, block 관계 변경이 feed에 반영되어야 한다.\n- 일반 사용자와 celebrity 계정의 follower 규모 차이를 같은 write path로 밀어붙이지 않는다.\n- 최신성, ranking 품질, fanout 비용 중 어떤 축을 우선할지 product SLA로 정한다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `User`, `FollowEdge`, `Post`, `TimelineItem`, `FeedCandidate`다. `Post`는 원본 source of truth이고, `TimelineItem`은 follower별 materialized inbox에 가까운 projection이다. Ranking feature는 별도 feature store나 online scoring layer로 분리할 수 있다.\n\n트래픽은 write보다 read가 훨씬 많은 편이지만, celebrity write 하나가 수백만 fanout job으로 증폭될 수 있다. 따라서 follower count, engagement tier, region에 따라 fanout job을 partition하고, hot account는 read-time merge 또는 partial fanout으로 다룬다.\n\n## Consistency/Latency Trade-off\n\nFanout on write는 read latency를 낮추는 대신 write amplification과 projection lag를 만든다. 삭제나 block 같은 negative update는 이미 materialized된 timeline item을 제거하거나 read path에서 visibility filter를 다시 적용해야 한다.\n\nFanout on read는 최신 follow graph를 반영하기 쉽지만 query-time merge와 ranking 비용이 커진다. Hybrid는 보통 계정의 빠른 read와 celebrity 계정의 write 폭발 방지를 동시에 노리지만, 두 후보 소스를 합칠 때 중복 제거와 순서 안정성이 필요하다.\n\n## 일관성 Caveat\n\nNewsfeed의 source of truth는 보통 `Post`와 `FollowEdge`이고, timeline은 projection이다. 따라서 \"글을 썼는데 바로 안 보임\"은 원본 write 실패가 아니라 fanout queue lag, region replication lag, ranking candidate cutoff, visibility filter 차이일 수 있다.\n\n삭제, 비공개 전환, 차단은 positive fanout보다 더 민감하다. 이미 materialized된 item을 늦게 지우면 stale exposure가 되고, read-time filter만 믿으면 비용과 누락 위험이 커진다. 면접 답변에서는 \"삭제/block 이벤트는 projection repair와 read visibility filter를 둘 다 둔다\"라고 말해야 안전하다.\n\nHybrid feed는 normal inbox 후보와 celebrity read-time 후보가 동시에 들어온다. 같은 post가 두 경로에서 들어오면 stable key로 dedupe하고, ranking score가 같을 때도 deterministic tie-breaker를 둬야 스크롤 pagination에서 중복/누락이 줄어든다.\n\n## 운영 증거\n\n| 증거 | 무엇을 확인하나 | 해석 |\n|---|---|---|\n| fanout queue lag / oldest age | projection freshness | lag가 길면 read path는 성공해도 새 글이 늦게 보임 |\n| fanout job throughput by account tier | celebrity write 증폭 | 특정 tier에서 backlog가 쌓이면 tier rule이나 partial fanout 재검토 |\n| feed p95/p99 latency by candidate source | read-time merge 비용 | celebrity 후보 merge가 tail latency를 밀면 cache/window 제한 필요 |\n| stale exposure / hidden item rate | 삭제, block, privacy 반영 | 보안/신뢰 이슈라 단순 freshness보다 우선순위가 높음 |\n| duplicate candidate rate | hybrid dedupe 품질 | inbox와 read-time 후보 합성 규칙이 흔들리는지 확인 |\n| ranking feature miss/fallback rate | scoring 안정성 | feature store 지연이 feed 품질과 latency를 동시에 흔들 수 있음 |\n\n## 실패 반례\n\n- 모든 post를 모든 follower timeline에 동기 삽입해서 celebrity write가 API timeout을 유발한다.\n- 삭제/차단 이벤트를 fanout projection에 반영하지 않아 이미 제거되어야 할 글이 계속 노출된다.\n- ranking feature 계산을 read path에서 모두 수행해 p99 latency가 예측 불가능해진다.\n- queue lag가 늘어도 feed freshness metric을 보지 않아 \"글이 안 뜬다\"는 장애를 늦게 감지한다.\n\n## 검증 질문\n\n- celebrity 기준을 follower 수, engagement, region, write rate 중 무엇으로 잡았고 자동 승격/강등되는가?\n- 새 post, 삭제, block, privacy 변경 각각의 propagation SLA가 다른가?\n- feed read path가 원본 `Post` unavailable, feature store timeout, fanout backlog 상황에서 어떤 fallback을 쓰는가?\n- cursor pagination에서 hybrid 후보 dedupe와 tie-breaker가 재시도/새로고침 후에도 안정적인가?\n- \"글이 안 뜬다\" 신고가 들어오면 post write, fanout job, timeline projection, ranking filter 중 어디를 먼저 볼 metric이 있는가?\n\n## 면접 답변 Skeleton\n\n1. \"Feed는 read-heavy이지만 write fanout 증폭이 핵심 병목이라 사용자 tier를 먼저 나눕니다.\"\n2. \"일반 계정은 fanout on write로 follower timeline을 materialize하고, celebrity는 read-time merge나 partial fanout으로 처리합니다.\"\n3. \"Post 원본, follow graph, timeline projection, ranking feature를 분리하고 queue worker로 projection lag를 관리합니다.\"\n4. \"삭제/차단/privacy 변경은 read visibility filter와 projection repair를 같이 둡니다.\"\n5. \"핵심 metric은 feed p95/p99 latency, fanout queue lag, stale exposure, duplicate candidate rate입니다.\"\n\n## Safe Next Docs\n\nRanking pipeline은 `recommendation-feed-ranking-architecture`, hot celebrity 문제는 `hot-key-skew-mitigation-interview-playbook`으로 이어진다.\n",
+  "aliases": [
+    "newsfeed fanout chooser",
+    "뉴스피드 fanout 설계 면접",
+    "fanout on write read hybrid feed",
+    "feed ranking delivery design"
+  ],
+  "expected_queries": [
+    "Newsfeed 설계에서 fanout on write와 read 차이가 뭐야?",
+    "팔로워 많은 사용자의 피드는 어떻게 처리해?",
+    "feed ranking과 timeline 저장을 어떻게 나눠?"
+  ],
+  "symptoms": [
+    "모든 사용자를 같은 fanout 전략으로 처리합니다",
+    "timeline materialization과 ranking을 섞어 말합니다",
+    "celebrity account hot fanout 문제를 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/newsfeed-system-design"
+    ],
+    "next_docs": [
+      "system-design/recommendation-feed-ranking-architecture",
+      "system-design/hot-key-skew-mitigation-interview-playbook"
+    ],
+    "confusable_with": [
+      "system-design/recommendation-feed-ranking-architecture",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/newsfeed-fanout-interview-chooser.md",
+    "revision_history": []
+  }
+}

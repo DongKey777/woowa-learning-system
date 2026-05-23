@@ -1,0 +1,55 @@
+{
+  "id": "system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser",
+  "title": "Rendezvous Hashing vs Consistent Hashing Shard Placement Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 shard placement에서 consistent hash ring, rendezvous hashing(HRW), jump consistent hash를 비교한다. 핵심은 노드 변경 시 움직이는 key의 범위, weighted node 처리, virtual node metadata, candidate scan 비용, 운영 지표를 함께 보고 고르는 것이다.",
+  "body_markdown": "# Rendezvous Hashing vs Consistent Hashing Shard Placement Chooser\n\n> 한 줄 요약: ring, HRW, jump는 모두 node churn 때 key movement를 줄이려는 배치 함수지만, membership 모양, weight 처리, metadata 비용, 임의 노드 제거 지원 범위가 다르다.\n\nretrieval-anchor-keywords: rendezvous hashing, HRW hashing, highest random weight, consistent hash ring, virtual node, jump consistent hash, shard placement, weighted node, key movement invariant, minimal disruption\n\n## 이 문서의 역할\n\n이 문서는 \"consistent hashing을 쓰면 된다\"에서 멈추지 않고, 실제 shard placement 함수를 고르는 문서다. 면접이나 설계 리뷰에서 중요한 질문은 알고리즘 이름이 아니라 다음 네 가지다.\n\n1. membership이 자주 바뀌는가, 아니면 bucket 수만 append 되는가.\n2. node capacity가 같은가, weight가 필요한가.\n3. client가 routing metadata를 들고 있어도 되는가.\n4. top-k replica order나 fallback owner가 필요한가.\n\n이 질문에 따라 consistent hash ring, rendezvous hashing, jump consistent hash의 답이 달라진다.\n\n## Key movement invariant\n\n세 방식의 공통 목표는 **membership 변경과 무관한 key는 같은 owner에 남긴다**는 것이다. 단순 `hash(key) % N`은 `N`이 바뀌면 대부분의 key가 다른 bucket으로 간다. 반대로 minimal movement 계열은 변경된 node와 관련된 key만 주로 움직이게 한다.\n\n- Consistent hash ring: node 추가 시 새 node가 ring에서 끼어든 구간의 key만 새 node로 이동한다. node 제거 시 제거된 node가 맡던 구간이 successor 쪽으로 이동한다.\n- Rendezvous hashing, HRW: key마다 모든 candidate node의 score를 계산하고 가장 높은 node를 고른다. 새 node 추가 시 그 node가 기존 winner보다 높은 score를 받은 key만 이동한다. node 제거 시 그 node가 winner였던 key만 다음 높은 score node로 이동한다.\n- Jump consistent hash: `bucketCount`가 `N`에서 `N+1`로 늘 때 움직이는 key는 새 bucket `N`으로 갈 key뿐이다. 기대 이동 비율은 대략 `1/(N+1)`이다.\n\n이 invariant는 \"이동이 0\"이라는 뜻이 아니다. 평균 이동 비율은 줄지만 hot key, 큰 value, replica rebuild, cache warm-up 비용은 여전히 운영 문제로 남는다.\n\n## 1차 chooser\n\n| 상황 | 더 먼저 볼 후보 | 이유 |\n|---|---|---|\n| client가 작은 node set을 알고 있고 임의 node 추가/제거가 잦음 | Rendezvous hashing | 별도 ring table 없이 candidate set만 있으면 결정 가능 |\n| 많은 client가 같은 routing table을 쓰고 vnode, replica, range ownership을 운영해야 함 | Consistent hash ring | vnode metadata로 분포와 ownership을 명시적으로 관리하기 좋음 |\n| bucket id가 `0..N-1`로 조밀하고 bucket 수가 append 중심으로 변함 | Jump consistent hash | 메모리 없는 deterministic placement와 낮은 계산 비용 |\n| top-2, top-3 fallback replica 순서가 자연스럽게 필요함 | Rendezvous hashing | score 정렬로 replica preference order를 만들기 쉬움 |\n| capacity weight가 크고 운영자가 점진적으로 weight를 조정해야 함 | Ring with vnodes 또는 weighted HRW | 둘 다 가능하지만 검증 방식이 다름 |\n| 임의 bucket 제거, non-contiguous id, weight 변경이 자주 있음 | Jump hash 단독은 피함 | dense bucket count 가정이 깨지면 이동이 커질 수 있음 |\n\n## Virtual node vs HRW vs Jump trade-off\n\nConsistent hash ring은 물리 node를 여러 virtual node로 흩뿌려 분포 편차를 낮춘다. 장점은 운영자가 owner map, vnode별 key count, migration task를 눈으로 볼 수 있다는 점이다. 단점은 ring metadata 배포, routing cache invalidation, vnode 수 튜닝이 필요하다는 점이다. 대규모 client-side routing에서는 version mismatch도 관리해야 한다.\n\nRendezvous hashing은 ring을 만들지 않는다. `hash(key, nodeId)` 점수를 모든 candidate에 대해 계산하고 winner를 고른다. candidate 수가 수십, 수백 정도면 단순하고 튼튼하다. node 제거 때도 그 node가 winner였던 key만 영향을 받는다. 단점은 request마다 candidate scan 비용이 생기고, candidate set이 client마다 다르면 owner가 갈라진다는 점이다. top-k replica를 만들려면 score 정렬이 편하지만, candidate 수가 크면 CPU 비용을 budget으로 봐야 한다.\n\nJump consistent hash는 routing table이 거의 필요 없다. key와 bucket count만 있으면 owner bucket을 계산한다. bucket 수가 append 되는 로그성 shard, 고정된 logical bucket layer, metadata를 극도로 줄이고 싶은 cache partition에 잘 맞는다. 하지만 임의 node 제거에는 약하다. bucket `7`을 삭제하려고 bucket id를 다시 압축하면 많은 key가 움직인다. 보통은 jump로 logical bucket을 고르고, 별도 mapping table로 bucket을 physical node에 배치한다.\n\n## Weighted node caveats\n\nweight는 \"이 node가 더 세다\"라는 라벨이 아니라 placement 확률을 바꾸는 계약이다. 같은 key count라도 value size, QPS, write ratio, hot key 분포가 다르면 실제 부하는 달라진다.\n\nRing에서는 weight가 큰 node에 vnode를 더 많이 준다. 단순하고 관측하기 쉽지만, vnode 수가 너무 적으면 weight가 거칠게 반영되고 너무 많으면 metadata와 migration task가 늘어난다. HRW에서는 weighted rendezvous 공식을 써야 한다. 예를 들어 균등 난수 `U`에서 `-ln(U) / weight`가 가장 작은 node를 고르는 식처럼 확률론적으로 검증된 방식을 써야 한다. 점수에 weight를 대충 곱하면 hash 분포가 찌그러지고 높은 weight node가 예상보다 더 많이 먹을 수 있다.\n\nJump hash는 weight를 직접 다루지 않는다. 흔한 우회는 많은 logical bucket을 만들고 weighted mapping으로 physical node에 배정하는 것이다. 이때 weight 변경은 logical bucket 재배치 문제로 바뀐다. 즉 jump 자체의 minimal movement와 mapping layer의 movement를 따로 측정해야 한다.\n\n## Operational metrics\n\n선택 후에는 알고리즘 이름보다 metric이 중요하다.\n\n- moved key ratio, moved bytes, moved QPS\n- node별 key count, byte count, QPS, CPU, memory, network\n- vnode 또는 bucket load의 p50/p95/p99, max/mean ratio, Gini coefficient\n- route version mismatch, owner mismatch, stale client 비율\n- cache hit ratio drop, backend QPS surge, warm-up completion time\n- hot key top-N과 hot vnode/top bucket overlap\n- rebalance backlog, migration MB/s, donor/receiver saturation\n- fallback owner 사용률, retry rate, wrong owner redirect rate\n\n특히 \"움직인 key 수가 적다\"는 지표만 보면 안 된다. 이동한 key가 cold cache 작은 key인지, QPS가 큰 hot key인지에 따라 사용자 영향이 완전히 달라진다.\n\n## Wrong-bucket neighbors\n\n| 헷갈린 개념 | 왜 wrong bucket인가 | 더 정확한 분기 |\n|---|---|---|\n| shard key selection | 어떤 key로 나눌지 정하는 문제다 | 이 문서는 선택된 key를 어떤 node에 놓을지 다룬다 |\n| consistent hashing ring 자료구조 | ring의 mechanics 자체를 설명한다 | ring, HRW, jump 중 운영 선택을 비교하려면 이 문서가 맞다 |\n| shard rebalancing | 실제 data copy, catch-up, cutover 절차다 | placement 함수는 move plan의 입력일 뿐 relocation 전체가 아니다 |\n| load balancing | 요청 단위로 endpoint를 고르는 문제에 가깝다 | shard placement는 같은 key가 같은 owner로 가야 하는 stateful routing이다 |\n| distributed lock | owner 충돌을 막는 coordination 문제다 | hash placement는 owner 후보를 계산하고 fencing은 별도다 |\n\n## Safe Next Docs\n\nring mechanics와 vnode 기본은 `data-structure/consistent-hashing-ring`, movement 비용 산정은 `data-structure/consistent-hashing-rebalancing-cost-model`로 이어진다. Jump 방식의 append-only invariant는 `system-design/jump-consistent-hash-minimal-movement-primer`, 실제 상태 이전 절차는 `system-design/shard-rebalancing-partition-relocation-design`, hot key 대응은 `system-design/consistent-hashing-hot-key-strategies`를 보면 된다.\n",
+  "aliases": [
+    "rendezvous hashing vs consistent hashing",
+    "HRW hashing shard placement",
+    "highest random weight hashing",
+    "consistent hash ring vs rendezvous",
+    "shard placement hash chooser",
+    "virtual node HRW jump hash 비교",
+    "최소 이동 해시 배치 선택"
+  ],
+  "expected_queries": [
+    "Rendezvous hashing과 consistent hashing ring은 shard placement에서 어떻게 골라?",
+    "HRW hashing은 virtual node consistent hashing보다 뭐가 좋아?",
+    "weighted node가 있는 cache cluster에서 어떤 hash placement를 써야 해?",
+    "Jump consistent hash는 언제 쓰고 언제 피해야 해?",
+    "노드 추가 삭제 때 key movement invariant를 면접에서 어떻게 설명해?"
+  ],
+  "symptoms": [
+    "노드를 추가할 때 key movement가 줄어든다는 말은 아는데 ring, HRW, jump 중 무엇을 골라야 할지 모른다",
+    "weighted node를 그냥 hash 점수에 곱하면 된다고 생각한다",
+    "jump consistent hash를 임의 노드 제거에도 그대로 쓸 수 있다고 착각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/consistent-hashing-ring",
+      "data-structure/consistent-hashing-rebalancing-cost-model"
+    ],
+    "next_docs": [
+      "system-design/jump-consistent-hash-minimal-movement-primer",
+      "system-design/shard-rebalancing-partition-relocation-design",
+      "system-design/consistent-hashing-hot-key-strategies"
+    ],
+    "confusable_with": [
+      "data-structure/consistent-hashing-ring",
+      "data-structure/consistent-hashing-rebalancing-cost-model",
+      "system-design/shard-key-selection-basics",
+      "system-design/shard-rebalancing-partition-relocation-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser.md",
+    "revision_history": []
+  }
+}

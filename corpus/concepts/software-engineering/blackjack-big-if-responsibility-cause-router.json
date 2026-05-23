@@ -1,0 +1,54 @@
+{
+  "id": "software-engineering/blackjack-big-if-responsibility-cause-router",
+  "title": "blackjack 긴 if 문 비대화 원인 라우터",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "'이 문서는 Woowa blackjack 미션에서 hit/stand 입력 처리, Ace 점수 계산,",
+  "body_markdown": "# blackjack 긴 if 문 비대화 원인 라우터\n\n## 한 줄 요약\n\n> blackjack의 긴 `if` 문은 입력 행동, 점수 계산, 딜러 규칙, payout, 게임 단계, UI 포맷이 한 줄기 절차로 붙을 때 커진다. 먼저 \"이 조건이 어떤 책임 질문에 답하는가\"를 분리해야 한다.\n\n## 먼저 볼 증거\n\n조건이 길다는 이유만으로 패턴을 고르면 자주 wrong-bucket이 된다. `if`가 한 가지 규칙을 이름 붙인 객체 안에서 순수하게 판단한다면 도메인 규칙일 수 있다. 하지만 `H/S` 입력, Ace 보정, dealer 16, push/payout, `dealerTurn`, hidden card 출력이 같은 사슬에 있다면 책임 누수다.\n\n| 코드 증거 | 실제 질문 | 우선 라우팅 |\n|---|---|---|\n| `if (input.equals(\"H\"))`, `else if (\"S\")`, action별 실행이 controller나 loop에 붙는다 | 사용자가 어떤 행동을 요청했는가? | action command / action policy |\n| `hasAce`, `sum > 21`, `isBust`, `isBlackjack` 계산이 여러 계층에 반복된다 | 이 손패의 점수와 파생 상태는 무엇인가? | score calculation / domain invariant |\n| `dealer.score() <= 16`, `soft 17`, dealer auto draw가 service 흐름에 박힌다 | 딜러는 더 뽑아야 하는가? | dealer rule policy |\n| `win`, `lose`, `push`, blackjack 배율, 수익 정산 조건이 winner 비교와 섞인다 | 종료 결과를 돈/점수로 어떻게 정산할까? | payout/result policy |\n| `dealerTurn`, `finished`, `playerBust`, `standCount` 조합으로 허용 행동을 계속 묻는다 | 지금 라운드는 어떤 단계인가? | game phase / state machine |\n| 첫 카드 숨김, 최종 공개, 참가자별 라벨, 출력 문구 조건이 도메인 계산과 붙는다 | 결과를 어떻게 보여 줄까? | UI formatting / view template |\n\n## 원인별 라우팅\n\n### 1. Action command와 action policy\n\n`H`, `S` 같은 입력 문자열이 service까지 내려가거나, controller가 `hit`이면 카드 추가, `stand`면 턴 종료를 직접 실행한다면 입력 해석과 행동 실행이 섞인 것이다. 이 갈래는 [blackjack 행동 선택 입력 ↔ Command 패턴 브릿지](../design-pattern/blackjack-action-input-command-bridge.md)로 보낸다.\n\n다음 확인:\n- 입력 문자열을 `Hit`, `Stand` 같은 실행 요청으로 바꾼 뒤 service에 넘길 수 있는가?\n- command는 \"무엇을 실행할지\"만 말하고, 현재 가능한지는 state가 판단하는가?\n- action 분기 테스트가 점수 계산이나 payout fixture를 요구하지 않는가?\n\n### 2. Score calculation과 도메인 불변식\n\nAce를 1 또는 11로 계산하는 분기, `bust`, `blackjack` 여부는 손패가 스스로 보장해야 하는 값 규칙이다. 이 조건이 controller, service, view에 반복되면 긴 `if`의 원인은 상태 패턴 부족이 아니라 점수 규칙 누수다. 이 경우는 [blackjack Ace 점수 계산 ↔ 도메인 불변식 브릿지](./blackjack-ace-scoring-domain-invariant-bridge.md)로 보낸다.\n\n다음 확인:\n- `A, 9, 9` 같은 손패 점수를 게임 전체 실행 없이 검증할 수 있는가?\n- `isBust()`와 `score()`가 서로 다른 저장값을 맞추는 방식이 아니라 같은 카드 목록에서 파생되는가?\n- OutputView가 화면에 보여 주기 위해 Ace 보정을 다시 계산하고 있지 않은가?\n\n### 3. Dealer rule policy\n\n딜러의 \"`16 이하이면 hit, 17 이상이면 stand`\"는 딜러 차례라는 상태와 다른 질문이다. 상태는 딜러가 행동할 구간을 열고, dealer policy는 현재 손패를 보고 더 뽑을지 판단한다. `dealer.score() <= 16`이 service 여러 곳에 퍼지면 [Blackjack Dealer Policy Object Bridge](./blackjack-dealer-policy-object-bridge.md) 또는 [blackjack 승패 판정 ↔ Policy Object 브릿지](../design-pattern/blackjack-winner-decision-policy-object-bridge.md)를 본다.\n\n다음 확인:\n- `DealerDrawingPolicy.shouldDraw(hand)`를 손패만으로 테스트할 수 있는가?\n- service는 policy가 `true`인 동안 deck에서 카드를 지급하는 흐름만 맡는가?\n- dealer draw 기준 변경이 state 전이 테스트와 winner 비교 테스트를 동시에 깨뜨리지 않는가?\n\n### 4. Payout과 결과 정산\n\n`push`, `blackjack payout`, `dealer bust`, 플레이어별 수익 정산이 한 `if-else`에 붙으면 승패 판정과 정산 규칙이 뒤섞인다. winner만 고르는 규칙과 money/payout을 계산하는 규칙은 함께 있을 수 있지만, 출력 문구나 턴 진행과는 분리되어야 한다. 이 갈래는 [blackjack 승패 판정 ↔ Policy Object 브릿지](../design-pattern/blackjack-winner-decision-policy-object-bridge.md)와 결과 객체 경계로 보낸다.\n\n다음 확인:\n- 종료된 player/dealer hand snapshot만으로 `win/lose/push/payout`을 표 테스트할 수 있는가?\n- payout 계산이 `hit/stand` action 처리 중간에 끼어 있지 않은가?\n- 결과 정산 객체가 UI 문구 `\"수익은 ...\"`를 직접 만들고 있지 않은가?\n\n### 5. Game phase와 state machine\n\n`dealerTurn && !finished`, `standCount == players.size()`, `playerBust` 같은 조건 조합으로 지금 가능한 행동을 판단한다면 사실상 상태 전이표가 코드에 숨어 있다. 이 분기는 [blackjack 카드 뽑기/정지 흐름 ↔ 상태 패턴 브릿지](../design-pattern/blackjack-turn-flow-state-pattern-bridge.md)로 보내서 `PlayerTurn`, `DealerTurn`, `RoundFinished` 같은 단계 모델을 먼저 본다.\n\n다음 확인:\n- bust 이후 hit이 명확히 거부되고 다음 단계가 한 곳에서 결정되는가?\n- enum 이름만 생기고 `switch(state)`가 service에서 더 커진 것은 아닌가?\n- 상태 객체가 Ace 계산이나 payout까지 알기 시작하지 않았는가?\n\n### 6. UI formatting과 출력 skeleton\n\n딜러 첫 카드 숨김, 최종 공개, 플레이어/딜러 라벨, 결과 문구 조합이 도메인 계산과 붙어 있으면 긴 `if`의 중심은 UI 포맷이다. 특히 `if (participant.isDealer())`가 OutputView 곳곳에 반복되면 [blackjack 플레이어/딜러 결과 출력 ↔ Template Method 브릿지](../design-pattern/blackjack-player-dealer-result-view-template-method-bridge.md)를 본다. 한 턴 결과 의미와 응답 필드가 섞였다면 [blackjack 한 턴 결과 ↔ 결과 객체와 Response DTO 경계 브릿지](./blackjack-turn-result-response-boundary-bridge.md)로 보낸다.\n\n다음 확인:\n- 첫 카드 숨김은 view/presenter의 공개 범위 규칙이고, 점수 계산은 `Hand`가 맡는가?\n- 문구나 JSON 필드명이 바뀌어도 `WinnerPolicy`, `Score`, `TurnState`가 흔들리지 않는가?\n- 출력 테스트가 승패 규칙이나 Ace 계산을 대신 검증하고 있지 않은가?\n\n## 도메인 규칙 vs 책임 누수\n\n도메인 규칙인 `if`는 소유자가 분명하다. `Score`가 Ace를 낮추고, `DealerDrawingPolicy`가 dealer hand를 보고 draw 여부를 판단하고, `ResultPolicy`가 종료 snapshot으로 승패와 payout을 정한다면 조건 자체는 나쁜 냄새가 아니다.\n\n책임 누수인 `if`는 여러 변경 이유를 동시에 안다. 예를 들어 한 메서드가 `H/S` 입력을 해석하고, 카드 한 장을 뽑고, Ace 점수를 다시 계산하고, dealer 16 규칙을 적용하고, 결과 문구와 수익 문자열까지 만든다면 그 `if`는 도메인 규칙이 아니라 bucket 붕괴다.\n\n## Wrong-bucket 이웃\n\n| 헷갈리는 선택 | 왜 wrong-bucket인가 | 더 가까운 bucket |\n|---|---|---|\n| Ace 계산을 state class로 옮긴다 | 점수는 현재 단계가 아니라 손패 조합의 불변식이다 | score calculation |\n| dealer 16 규칙을 `DealerTurn` state가 전부 맡는다 | 딜러 차례와 draw 판단 기준은 다른 책임이다 | dealer rule policy |\n| `H/S` command가 bust 이후 허용 여부까지 결정한다 | command는 요청이고, 가능 여부는 현재 phase의 guard다 | game phase/state |\n| payout을 OutputView에서 문구와 함께 계산한다 | 정산 규칙과 표현 포맷이 결합된다 | payout/result policy + UI formatting |\n| hidden card 분기를 winner policy에 넣는다 | 카드 공개 범위는 결과 해석이 아니라 화면 표현 규칙이다 | UI formatting |\n| 모든 규칙을 `GameService` private method로만 쪼갠다 | 메서드만 나뉘고 service가 여전히 모든 도메인 판단의 주인이다 | Score, State, DealerPolicy, ResultPolicy로 재분류 |\n\n## 검증 질문\n\n1. 이 조건은 입력 요청, 손패 점수, 딜러 draw, payout, 현재 phase, UI 표현 중 어느 질문에 답하는가?\n2. 그 질문 하나만 테스트하려고 할 때 deck shuffle, console input, output string, 전체 라운드 fixture가 필요하다면 어떤 책임이 새고 있는가?\n3. dealer rule을 바꿨을 때 깨지는 테스트가 dealer policy 쪽인가, 아니면 state와 winner와 view 테스트가 함께 깨지는가?\n4. `Score`, `TurnState`, `DealerDrawingPolicy`, `WinnerPolicy`, `PayoutPolicy`, `ResultView` 중 이름 붙지 않은 책임이 service 안에 숨어 있지 않은가?\n5. 지금의 `if`는 도메인 언어로 읽히는가, 아니면 `int score`, `boolean finished`, `String action`, 출력 문구가 한 조건 사슬에 섞여 있는가?\n\n## 다음 학습\n\n- 전체 축을 먼저 고르려면 [blackjack 점수 규칙 vs 턴 상태 vs 결과 판정 결정 가이드](./blackjack-ace-rule-vs-turn-state-vs-result-policy-decision-guide.md)를 본다.\n- 입력 문자열과 행동 실행의 경계는 [blackjack 행동 선택 입력 ↔ Command 패턴 브릿지](../design-pattern/blackjack-action-input-command-bridge.md)로 잇는다.\n- Ace 계산과 `bust` 판단이 흩어졌다면 [blackjack Ace 점수 계산 ↔ 도메인 불변식 브릿지](./blackjack-ace-scoring-domain-invariant-bridge.md)로 간다.\n- `hit/stand/dealer turn` 단계는 [blackjack 카드 뽑기/정지 흐름 ↔ 상태 패턴 브릿지](../design-pattern/blackjack-turn-flow-state-pattern-bridge.md), 딜러 draw와 승패/payout은 [blackjack 승패 판정 ↔ Policy Object 브릿지](../design-pattern/blackjack-winner-decision-policy-object-bridge.md)로 나눠 읽는다.\n",
+  "aliases": [
+    "blackjack 긴 if 문 원인",
+    "블랙잭 책임 분리 안 됨",
+    "블랙잭 서비스 분기 폭발",
+    "blackjack 분기 로직 어디서 쪼개",
+    "블랙잭 패턴 코멘트 경계"
+  ],
+  "expected_queries": [
+    "블랙잭 미션 코드가 긴 if 문 하나인데 어떤 줄은 커맨드고 어떤 줄은 상태인지 어떻게 가려?",
+    "플레이어 입력 처리와 딜러 승패 비교가 한 메서드에 있을 때 먼저 어디부터 쪼개야 해?",
+    "blackjack 리뷰에서 점수 규칙, 턴 흐름, 결과 판정을 분리하라는 말이 정확히 무슨 뜻이야?",
+    "딜러 16 규칙하고 bust 계산이 같이 있으면 어떤 책임 누수가 섞인 거야?",
+    "블랙잭에서 패턴 이름은 많이 들었는데 지금 코드 증상으로는 어느 문서부터 봐야 해?"
+  ],
+  "symptoms": [
+    "blackjack 서비스 if 문이 계속 길어져요",
+    "hit stand 처리, 점수 계산, 승패 판정이 한 메서드에 다 붙어 있어요",
+    "리뷰에서 상태 패턴, 커맨드, 정책 객체 얘기가 같이 나와서 어디부터 고쳐야 할지 모르겠어요",
+    "dealer 규칙과 bust 계산을 분리하라는 말이 추상적으로 들려요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/blackjack-ace-rule-vs-turn-state-vs-result-policy-decision-guide"
+    ],
+    "next_docs": [
+      "design-pattern/blackjack-action-input-command-bridge",
+      "software-engineering/blackjack-ace-scoring-domain-invariant-bridge",
+      "design-pattern/blackjack-turn-flow-state-pattern-bridge",
+      "design-pattern/blackjack-winner-decision-policy-object-bridge"
+    ],
+    "confusable_with": [
+      "software-engineering/blackjack-ace-rule-vs-turn-state-vs-result-policy-decision-guide",
+      "design-pattern/blackjack-turn-flow-state-pattern-bridge",
+      "design-pattern/blackjack-winner-decision-policy-object-bridge",
+      "software-engineering/blackjack-testability-cause-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/blackjack-big-if-responsibility-cause-router.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "system-design/url-shortener-interview-drill",
+  "title": "URL Shortener Interview Drill",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 drill은 URL shortener 시스템 설계 면접에서 key generation, redirect read path, collision, cache를 답변하는 구조를 제공한다.",
+  "body_markdown": "# URL Shortener Interview Drill\n\n## 질문\n\n\"URL shortener를 설계해 보세요.\"\n\n## 기대 답변 축\n\n먼저 API를 나눈다. `POST /short-links`는 긴 URL을 받아 short code를 만들고, `GET /{code}`는 code로 원본 URL을 조회해 301/302 redirect한다.\n\n키 생성은 random base62, sequence 기반 ID 인코딩, distributed ID generation 중 하나를 고른다. Random이면 충돌 retry와 unique constraint가 필요하고, sequence면 예측 가능성과 shard 전략을 같이 말한다. 생성 API 재시도까지 고려해 idempotency key 또는 canonical long URL policy를 정해야 한다.\n\nRead path는 매우 read-heavy다. code to long URL mapping은 cache-aside로 cache하고, DB는 source of truth로 둔다. Hot key와 cache stampede, TTL 정책도 언급한다. Redirect metric과 click analytics는 비동기로 분리하되, redirect 성공률과 abuse block propagation은 운영 핵심 metric으로 본다.\n\n## 약점 태그\n\n`key-generation`, `collision-retry`, `redirect-cache`, `abuse-detection`\n\n## 흔한 오답\n\n\"hash(URL)을 잘라 쓰면 된다\"로 끝내면 부족하다. 같은 긴 URL을 같은 short code로 만들지, 사용자별 alias를 허용할지, 충돌 시 재시도할지, 악성 URL 신고/차단을 어디서 처리할지까지 설계 경계가 필요하다.\n\n## Short Code 생성 선택\n\n면접에서는 code 생성 알고리즘을 하나 고르고 trade-off를 말한다.\n\n- Random base62: 예측이 어렵고 shard와 독립적이다. 충돌 가능성이 있으므로 충분한 길이, unique constraint, retry limit, collision metric이 필요하다.\n- Sequence ID base62 encoding: 충돌이 거의 없고 구현이 쉽다. 하지만 생성량 추정과 enumeration이 쉬우므로 salt, permutation, non-sequential allocator, abuse detection을 함께 설명한다.\n- Distributed ID generation: Snowflake 같은 ID를 base62로 인코딩한다. 중앙 sequence 병목을 줄이지만 bit layout, clock rollback, region/worker id 관리가 필요하다.\n- Hash prefix: 같은 URL을 같은 code로 만들기 쉽지만 짧게 자르면 충돌과 의도적 collision에 취약하다. 단독 기본 선택보다는 dedupe key나 fallback 후보로 둔다.\n\n일반 답변은 \"예측을 줄이고 생성 노드 확장을 쉽게 하기 위해 random base62 7-10자를 기본으로 두고, DB unique constraint 충돌 시 재시도한다. Custom alias는 별도 namespace와 예약어 검사를 둔다\"처럼 정리할 수 있다.\n\n## 핵심 요구사항\n\n- 긴 URL을 짧은 code로 생성하고, code 조회 시 빠르게 원본 URL로 redirect한다.\n- short code는 충돌 없이 생성되어야 하며 custom alias와 만료 시간을 선택적으로 지원한다.\n- read-heavy redirect path는 낮은 p99 latency와 높은 availability를 가져야 한다.\n- phishing, malware, spam, abuse 신고/차단 경로를 포함한다.\n- 생성 API 재시도에서 같은 요청이 중복 short link를 만들지 않도록 idempotency 정책을 둔다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `ShortLink`, `ShortCode`, `User`, `ClickEvent`, `AbuseDecision`이다. `ShortLink`는 code, long URL, owner, created_at, expires_at, status를 갖고 DB가 source of truth가 된다. `ClickEvent`는 analytics pipeline으로 비동기 적재한다.\n\n트래픽은 생성보다 redirect read가 압도적으로 많다. Hot code는 CDN/edge cache 또는 Redis cache에 올라가고, 생성 path는 unique constraint와 retry로 충돌을 처리한다. Analytics는 redirect latency를 막지 않도록 queue로 분리한다.\n\nIdempotency model도 데이터에 포함한다. `CreateRequest`는 owner, long URL, custom alias, expires_at, idempotency key를 갖고, 같은 owner와 key가 재전송되면 기존 `ShortLink`를 반환한다. \"같은 long URL은 항상 같은 code인가?\"는 product 정책이다. 전역 dedupe를 켜면 privacy와 ownership 문제가 생길 수 있고, 사용자별 dedupe는 관리 화면과 analytics가 자연스럽다.\n\n## Consistency/Latency Trade-off\n\nRedirect path는 빠르게 응답해야 하므로 cache-aside가 적합하다. 다만 URL 차단, 만료, owner 삭제 같은 상태 변경은 cache invalidation 또는 짧은 TTL이 필요하다.\n\n301은 client와 intermediary cache에 오래 남을 수 있어 변경/차단 반영이 어렵고, 302/307은 제어가 쉽지만 매번 lookup 비용이 커질 수 있다. 면접에서는 redirect code 선택도 product 요구사항과 연결해야 한다.\n\n## Collision/Idempotency Caveat\n\nRandom code 충돌은 \"낮은 확률\"이어도 반드시 처리한다. DB에 `code` unique constraint를 두고 insert 실패 시 새 code로 제한 횟수만큼 재시도한다. Retry가 계속 실패하면 code length를 늘리거나 allocator 상태를 점검한다. Collision retry rate가 갑자기 오르면 난수 품질, 공격성 custom alias, namespace 고갈을 의심한다.\n\nCustom alias는 더 까다롭다. 예약어, 금칙어, 브랜드 보호어, 대소문자 normalization, Unicode confusable, trailing slash policy를 정해야 한다. 이미 점유된 alias는 409로 반환하고, 소유자 재시도는 idempotency key가 있으면 기존 결과를 반환한다.\n\n생성 API가 timeout되면 client가 재시도할 수 있다. Idempotency key 없이 매번 random code를 만들면 같은 long URL에 여러 short link가 생긴다. 이것이 허용되는 product도 있지만, 결제 링크나 캠페인 링크처럼 하나의 관리 단위가 필요하면 idempotency key 또는 user-scoped canonical dedupe가 필요하다.\n\n## Redirect/Abuse Caveat\n\nRedirect path는 cache hit만 생각하면 위험하다. `status=ACTIVE/BLOCKED/EXPIRED/DELETED`를 확인해야 하고, abuse 차단이나 만료가 cache에 반영되지 않으면 악성 링크가 계속 살아 있다. Block event는 cache purge를 시도하고, 실패를 대비해 짧은 TTL이나 deny overlay를 둔다.\n\n301은 영구 이동이라 브라우저와 CDN이 오래 기억할 수 있다. 캠페인 목적지가 바뀌거나 abuse block을 빠르게 반영해야 하면 302 또는 307이 안전하다. 영구적인 공개 short link라면 301로 cache 효율을 높일 수 있지만, 차단 반영 caveat를 같이 말한다.\n\nClick analytics는 redirect critical path 밖으로 뺀다. Redirect 응답 전에 DB에 click row를 동기 insert하면 hot link에서 p99가 크게 오른다. 대신 event queue에 best-effort publish하고, 실패 시 sampling이나 local buffer를 쓴다. Fraud/abuse 탐지에 필요한 최소 signal은 비동기로도 잃지 않게 retry 가능한 log pipeline을 둔다.\n\n## Redirect Metric\n\n핵심 metric은 redirect p50/p95/p99, redirect success/error rate, cache hit ratio, DB fallback rate, hot code top N, expired/blocked redirect count, abuse block propagation delay, collision retry rate, idempotency replay count, analytics queue lag다.\n\nProduct metric도 분리한다. Unique click, bot-filtered click, referrer, geo, device, campaign conversion은 분석 pipeline에서 계산하고 redirect SLA와 섞지 않는다. 운영 대시보드는 \"redirect가 빠르고 안전한가\"와 \"캠페인이 잘 동작하는가\"를 따로 보여야 한다.\n\n## 실패 반례\n\n- URL hash prefix만 code로 써서 충돌이나 의도적 collision을 처리하지 못한다.\n- DB 조회 후 analytics insert까지 동기 처리해 redirect p99가 click volume에 끌려 올라간다.\n- 악성 URL 차단 후에도 cache에 남은 mapping이 계속 redirect된다.\n- sequence ID를 그대로 노출해 생성량 추정과 scraping이 쉬워진다.\n- 생성 API timeout 재시도 때 같은 요청이 여러 short code를 만들어 캠페인 관리와 analytics가 갈라진다.\n- custom alias 정규화와 예약어 검사를 하지 않아 `/admin`, 대소문자 충돌, Unicode 혼동 문제가 생긴다.\n\n## 면접 답변 Skeleton\n\n1. \"API를 생성 path와 redirect path로 분리하고, redirect는 read-heavy low-latency path로 봅니다.\"\n2. \"Code 생성은 random base62를 기본으로 선택하고 unique constraint, collision retry, code length 확장 기준을 둡니다.\"\n3. \"생성 재시도는 idempotency key나 user-scoped dedupe로 중복 short link 생성을 제어합니다.\"\n4. \"DB를 source of truth로 두고 hot mapping은 Redis/edge cache로 조회합니다.\"\n5. \"Click analytics와 abuse scanning은 비동기로 분리하되, 차단 상태는 redirect path에서 확인합니다.\"\n6. \"metric은 redirect p99, cache hit ratio, collision retry rate, idempotency replay count, abuse block propagation delay입니다.\"\n\n## 복습 연결\n\nID 생성은 `distributed-id-generation-design`, cache 전략은 `caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser`로 이어진다.\n",
+  "aliases": [
+    "URL shortener interview drill",
+    "URL 단축기 설계 면접",
+    "tinyurl system design answer",
+    "short link redirect design"
+  ],
+  "expected_queries": [
+    "URL shortener 설계 면접은 어떻게 답해?",
+    "단축 URL 키는 어떻게 만들고 충돌은 어떻게 처리해?",
+    "redirect가 많은 시스템에서 어떤 저장소와 cache를 써?"
+  ],
+  "symptoms": [
+    "키 생성만 말하고 redirect read path를 설명하지 못합니다",
+    "충돌과 악성 URL abuse 처리를 놓칩니다",
+    "read heavy workload와 cache 전략을 빼먹습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/url-shortener-design"
+    ],
+    "next_docs": [
+      "system-design/distributed-id-generation-design",
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser"
+    ],
+    "confusable_with": [
+      "system-design/distributed-id-generation-design",
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/url-shortener-interview-drill.md",
+    "revision_history": []
+  }
+}

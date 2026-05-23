@@ -1,0 +1,56 @@
+{
+  "id": "operating-system/file-lock-flock-fcntl-ofd-locks-chooser",
+  "title": "File Lock flock fcntl OFD Locks Chooser",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# File Lock: `flock`, `fcntl`, OFD Locks Chooser\n\n> 한 줄 요약: 파일 잠금은 \"같은 파일을 막는다\"가 아니라 lock scope, owner, lifetime, fork/dup/close semantics가 다른 세 도구를 고르는 문제다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Descriptor Basics](./file-descriptor-basics.md)\n> - [Open File Description, dup, fork, Shared Offsets](./open-file-description-dup-fork-shared-offsets.md)\n> - [FD, Socket, Pipe, Open File Description Classification Drill](./fd-socket-pipe-open-file-description-classification-practice-drill.md)\n> - [Lock Contention, Futex, Off-CPU Debugging](./lock-contention-futex-offcpu-debugging.md)\n> - [futex, mutex, semaphore, spinlock](./futex-mutex-semaphore-spinlock.md)\n> - [deleted-but-open files, log rotation, space leak debugging](./deleted-open-file-space-leak-log-rotation.md)\n> - [Advisory Locks vs Row Locks](../database/advisory-locks-vs-row-locks.md)\n\n> retrieval-anchor-keywords: flock, fcntl record lock, F_SETLK, F_SETLKW, F_GETLK, F_OFD_SETLK, F_OFD_SETLKW, open file description lock, POSIX byte range lock, advisory lock, NFS file lock, CIFS flock mandatory behavior, proc locks\n\n## 10-second chooser\n\n| 상황 | 먼저 고를 lock | 왜 이 bucket인가 |\n|---|---|---|\n| 단일 host에서 \"이 파일 전체를 한 번에 한 writer만\" 같은 coarse guard가 필요하다 | `flock` | whole-file advisory lock이고 API가 단순하다 |\n| 파일 일부 구간만 잠그거나 POSIX portable byte-range lock이 필요하다 | `fcntl` record lock | `l_start`, `l_len`으로 region을 표현한다 |\n| `dup`, `fork`, thread handoff 뒤에도 open file description 기준 lifetime을 원한다 | OFD lock | lock owner가 process가 아니라 open file description이다 |\n| thread마다 같은 path를 따로 `open()`해서 region lock으로 조율하고 싶다 | OFD lock | process-wide record lock의 thread 공유 문제를 피한다 |\n| DB row, distributed lease, Redis lock 문제다 | file lock 아님 | file inode와 cooperating process 문제로 축소되지 않는다 |\n\n첫 질문은 \"exclusive냐 shared냐\"가 아니다. 먼저 \"무엇을 owner로 볼 것인가\"를 정해야 한다. `flock`은 Linux에서 open file description에 결합된 whole-file lock이다. 같은 open description을 가리키는 `dup()` fd나 `fork()` 후 fd는 같은 lock을 다루고, 모든 duplicate fd가 닫히거나 unlock할 때 수명이 끝난다. 반대로 같은 path를 다시 `open()`해서 얻은 별도 open description은 독립적으로 취급된다.\n\nPOSIX `fcntl` record lock은 byte-range를 표현하지만 owner가 process에 가깝다. 이 특성 때문에 한 process 안의 thread들이 서로를 막는 도구로 쓰기 어렵고, 더 위험하게는 그 process가 같은 파일을 가리키는 아무 fd나 닫아도 해당 파일에 대한 process lock이 함께 풀릴 수 있다. 라이브러리가 내부에서 같은 파일을 열고 닫는 경우에 lock이 갑자기 사라지는 식의 장애가 나온다.\n\nOFD lock은 `fcntl` 계열의 byte-range lock이지만 owner를 open file description으로 옮긴 Linux 계열 semantics다. `F_OFD_SETLK`, `F_OFD_SETLKW`, `F_OFD_GETLK`를 쓰고, 설정할 때 `struct flock.l_pid`는 0이어야 한다. 같은 open description을 공유하는 fd끼리는 같은 lock을 변환하지만, 각 thread가 별도 `open()`으로 얻은 fd에 OFD lock을 걸면 서로 충돌할 수 있다. 그래서 \"process 안 thread도 region 단위로 조율하고 싶다\"면 traditional record lock보다 OFD lock이 더 맞다.\n\n## Kernel semantics caveats\n\n대부분의 file lock은 advisory다. 즉 cooperating process가 같은 locking protocol을 지킬 때만 의미가 있다. 권한이 있는 다른 process가 lock을 무시하고 `read()`나 `write()`를 하면 일반 local filesystem에서는 커널이 자동으로 막아 주지 않는다. Linux mandatory locking은 오래된 예외였고 modern kernel에서는 신뢰할 수 있는 운영 선택지로 보지 않는 편이 안전하다.\n\n`flock`과 `fcntl` record lock은 local Linux에서는 서로 독립적인 lock class다. 한쪽으로 잠근 파일이 다른 쪽 API에는 안 잠긴 것처럼 보일 수 있다. 다만 NFS와 CIFS/SMB에서는 emulation 때문에 둘이 상호작용하거나, CIFS에서는 별도 fd I/O가 `EACCES`로 실패하는 mandatory-like 현상까지 보일 수 있다. 그래서 local ext4 테스트 결과를 network filesystem contract로 옮기면 안 된다.\n\nBlocking variant도 차이가 있다. `F_SETLKW`는 process-associated record lock의 deadlock을 일부 감지해서 `EDEADLK`를 돌려줄 수 있지만, OFD lock은 deadlock detection을 기대하면 안 된다. `flock`도 deadlock detection이 없다. `F_GETLK`로 얻은 blocker 정보는 이미 stale일 수 있고, OFD conflict는 PID가 `-1`처럼 보일 수 있어 \"누가 잡았나\"를 user-visible owner로 단정하면 안 된다.\n\n`execve()` 뒤 유지 여부도 cleanup 설계에 중요하다. `flock`은 exec를 지나 보존되고, POSIX record lock도 process가 살아 있으면 exec 뒤 유지된다. `fork()`는 갈린다. `flock`과 OFD lock은 shared open description 관점으로 이어질 수 있지만, POSIX record lock은 child에 상속되지 않는다. subprocess를 띄우기 전에는 `O_CLOEXEC` hygiene와 lock lifetime을 같이 본다.\n\n## Observable failure modes\n\n| 증상 | 가까운 원인 | 확인 포인트 |\n|---|---|---|\n| nonblocking lock이 바로 실패한다 | incompatible lock 존재 | `EAGAIN`, `EACCES`, `EWOULDBLOCK` 처리를 구분 |\n| 기다리던 lock call이 signal 뒤 실패한다 | blocking wait interrupted | `EINTR` retry policy와 timeout budget 확인 |\n| record lock이 갑자기 풀렸다 | process가 같은 파일의 다른 fd를 닫음 | `/proc/<pid>/fd`, library open/close 경로 확인 |\n| network filesystem에서 I/O가 `EIO`로 바뀐다 | lost advisory lock 가능성 | NFS lease, server failover, remount event 확인 |\n| `lslocks` owner가 애매하다 | OFD lock 또는 stale query | `/proc/locks`, open description, fd graph 함께 확인 |\n\n운영에서는 `lslocks`, `/proc/locks`, `/proc/<pid>/fd`, `strace -e fcntl,flock,openat,close`를 한 묶음으로 본다. 단, 관찰 도구도 순간 snapshot이다. \"지금 holder가 없다\"가 \"방금 race가 없었다\"를 증명하지 않는다.\n\n## Wrong-bucket neighbors\n\n`futex`, `mutex`, `synchronized`는 process memory 안의 concurrency primitive다. 파일 inode나 network filesystem protocol을 조율하지 않는다. 반대로 file lock은 thread scheduling fairness나 critical section 비용을 해결하지 않는다.\n\nDB advisory lock과 row lock은 transaction, connection, session lifetime을 따른다. file lock으로 예약 중복, 주문 idempotency, distributed leader election을 해결하려 하면 crash recovery와 fencing token 문제가 남는다.\n\n`O_APPEND`, `fsync`, atomic rename은 file update pattern이지 mutual exclusion 자체가 아니다. append ordering, durability, replace atomicity를 file lock과 섞어 설명하면 장애 bucket이 흐려진다.\n\n## Safe Next Docs\n\nopen file description lifetime이 헷갈리면 [Open File Description, dup, fork, Shared Offsets](./open-file-description-dup-fork-shared-offsets.md)를 먼저 읽는다. lock wait가 CPU 문제가 아니라 off-CPU 대기인지 보고 싶으면 [Lock Contention, Futex, Off-CPU Debugging](./lock-contention-futex-offcpu-debugging.md)으로 간다. 애플리케이션 동시성이나 DB 중복 방지와 비교하려면 [Advisory Locks vs Row Locks](../database/advisory-locks-vs-row-locks.md)가 안전한 다음 문서다.\n",
+  "aliases": [
+    "Linux file lock chooser",
+    "flock versus fcntl record lock",
+    "OFD lock",
+    "open file description lock",
+    "POSIX byte range lock",
+    "advisory file locking",
+    "lockf fcntl flock",
+    "proc locks debugging"
+  ],
+  "expected_queries": [
+    "파일 전체 잠금과 byte range 잠금은 flock, fcntl, OFD 중 무엇을 골라야 해?",
+    "fork나 dup 이후에도 lock lifetime을 안전하게 가져가려면 어떤 file lock이 맞아?",
+    "POSIX record lock이 close할 때 예상보다 풀리는 이유를 설명해줘",
+    "NFS나 CIFS에서 flock과 fcntl lock을 섞으면 어떤 caveat가 있어?",
+    "thread별 file region synchronization에는 OFD lock이 왜 더 나은 선택일 수 있어?"
+  ],
+  "symptoms": [
+    "프로세스가 lock을 잡았는데 같은 파일을 다시 열거나 fork한 뒤 예상보다 빨리 풀려요",
+    "flock과 fcntl을 섞었더니 로컬과 NFS/CIFS에서 동작이 다르게 보여요",
+    "thread마다 파일 구간을 잠그려는데 POSIX record lock이 thread isolation을 해주지 않아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/file-descriptor-basics",
+      "operating-system/open-file-description-dup-fork-shared-offsets"
+    ],
+    "next_docs": [
+      "operating-system/open-file-description-dup-fork-shared-offsets",
+      "operating-system/lock-contention-futex-offcpu-debugging",
+      "database/advisory-locks-vs-row-locks"
+    ],
+    "confusable_with": [
+      "operating-system/open-file-description-dup-fork-shared-offsets",
+      "operating-system/futex-mutex-semaphore-spinlock",
+      "operating-system/lock-contention-futex-offcpu-debugging",
+      "database/advisory-locks-vs-row-locks"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/file-lock-flock-fcntl-ofd-locks-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "id": "database/partial-index-vs-expression-index-chooser",
+  "title": "Partial Index vs Expression Index Chooser",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Partial Index vs Expression Index Chooser\n\n> 한 줄 요약: partial index는 \"어떤 row subset만 인덱싱할까\"의 문제이고, expression index는 \"어떤 계산 결과를 인덱싱할까\"의 문제다. 둘 다 planner가 쿼리와 인덱스 정의를 매칭할 수 있어야 효과가 난다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [B-Tree vs Hash Index chooser](./btree-vs-hash-index-chooser.md)\n- [Generated Columns, Functional Indexes, and Query-Safe Migration](./generated-columns-functional-index-migration.md)\n- [Functional Index vs LOWER Duplicate Check Bridge](./functional-index-vs-lower-duplicate-check-bridge.md)\n- [Soft Delete, Uniqueness, and Data Lifecycle Design](./soft-delete-uniqueness-indexing-lifecycle.md)\n- [커버링 인덱스와 복합 인덱스 컬럼 순서](./covering-index-composite-ordering.md)\n- [쿼리 튜닝 체크리스트](./query-tuning-checklist.md)\n\nretrieval-anchor-keywords: partial index expression index functional index filtered index predicate match planner implication deterministic expression partial unique index lower email generated column write overhead unique normalized value active row uniqueness\n\n## 핵심 개념\n\n두 인덱스는 서로 대체재처럼 보이지만 질문이 다르다.\n\n- Partial index: 전체 table 중 조건을 만족하는 row만 인덱스에 넣는다.\n- Expression index: 원본 column이 아니라 계산된 expression 결과를 인덱스에 넣는다.\n\n예를 들어 `deleted_at IS NULL`인 active user만 찾고 싶다면 subset 문제가 강하다. 반면 `LOWER(email) = ?`처럼 계산된 값을 찾고 싶다면 expression 문제가 강하다.\n\n둘을 합칠 수도 있다.\n\n```sql\nCREATE UNIQUE INDEX users_active_lower_email_uk\nON users (lower(email))\nWHERE deleted_at IS NULL;\n```\n\n이 예시는 active row subset에 대해 normalized email uniqueness를 강제한다.\n\n## 30초 선택표\n\n| 질문 | 더 가까운 선택 |\n|---|---|\n| \"항상 active row만 조회한다\" | partial index |\n| \"전체 row 중 드문 상태만 자주 조회한다\" | partial index |\n| \"`LOWER(email)`로 검색한다\" | expression index 또는 generated column |\n| \"`DATE(created_at)` 때문에 기존 인덱스를 못 탄다\" | query rewrite 먼저, 안 되면 expression/generated column |\n| \"삭제된 row는 unique 판단에서 빼고 싶다\" | partial unique index 또는 engine별 generated active key |\n| \"대소문자 무시 email unique가 필요하다\" | expression unique index 또는 normalized column unique |\n| \"표현식이 여러 쿼리/서비스에서 재사용된다\" | generated column plus index |\n\n## 비교 축\n\n### 1. Predicate match\n\nPartial index는 index predicate와 query predicate가 맞아야 한다.\n\n```sql\nCREATE INDEX orders_unpaid_idx\nON orders (created_at)\nWHERE paid_at IS NULL;\n```\n\n이 인덱스가 잘 맞는 쿼리:\n\n```sql\nSELECT *\nFROM orders\nWHERE paid_at IS NULL\nORDER BY created_at\nLIMIT 100;\n```\n\n잘 안 맞는 쿼리:\n\n```sql\nSELECT *\nFROM orders\nWHERE paid_at = $1;\n```\n\n런타임에 `$1`이 `NULL`일 수 있어도 planner는 모든 가능한 값에 대해 partial predicate가 항상 성립한다고 보기 어렵다. 즉 partial index는 \"값이 들어오면 알겠지\"가 아니라 planning time에 조건 함의를 알아볼 수 있어야 한다.\n\n### 2. Expression determinism\n\nExpression index는 계산 결과를 인덱스에 저장한다.\n\n```sql\nCREATE INDEX users_lower_email_idx\nON users (lower(email));\n```\n\n좋은 후보:\n\n- `lower(email)`\n- stable normalization rule\n- JSON field에서 자주 조회하는 typed value\n- 날짜 bucket이 명확한 generated key\n\n나쁜 후보:\n\n- 현재 시간에 따라 결과가 달라지는 함수\n- session timezone, locale, collation에 따라 의미가 흔들리는 표현식\n- 외부 table이나 비결정적 상태를 읽는 함수\n- 비즈니스 규칙이 자주 바뀌는 normalization\n\nDB마다 용어는 다르지만 실무 원칙은 같다. 인덱스에 저장할 expression은 같은 입력에 같은 결과를 내야 하고, query expression과 같은 의미로 매칭되어야 한다.\n\n### 3. Write overhead\n\n인덱스는 읽기 최적화 대신 쓰기 비용을 낸다.\n\n| 인덱스 | write 비용 감각 |\n|---|---|\n| Partial index | predicate를 만족하는 row에만 index maintenance가 필요하다 |\n| Expression index | insert/update 때 expression 계산과 index maintenance가 필요하다 |\n| Partial expression index | predicate 검사와 expression 계산을 모두 고려한다 |\n| Generated column plus index | column 계산, 저장 방식, backfill, index maintenance를 같이 본다 |\n\nPartial index는 subset이 작을수록 쓰기/저장 비용이 줄어든다. Expression index는 search 때 계산을 줄이는 대신 write 때 계산한다. write-heavy OLTP에서는 이 비용이 p99 latency와 lock duration에 영향을 줄 수 있다.\n\n### 4. Planner matching\n\n인덱스가 있어도 planner가 \"이 쿼리에 쓸 수 있다\"고 판단해야 한다.\n\nPartial index matching이 깨지는 예:\n\n- query에 partial predicate가 빠짐\n- `active = true`와 `status IN (...)`처럼 의미는 비슷하지만 식이 다름\n- prepared parameter 때문에 planning time에 predicate 함의를 증명할 수 없음\n- data distribution이 바뀌어 subset이 더 이상 작지 않음\n\nExpression index matching이 깨지는 예:\n\n- `lower(email)` index인데 query는 `email_lower` generated column을 봄\n- `substring(col, 1, 10)` index인데 query는 `substring(col, 1, 9)`를 봄\n- cast, collation, timezone conversion이 index expression과 다름\n- ORM이 expression을 다른 SQL 함수로 렌더링함\n\n따라서 새 인덱스를 만들 때는 `CREATE INDEX`만 보는 게 아니라 대표 쿼리의 `EXPLAIN`까지 확인해야 한다.\n\n### 5. Uniqueness use case\n\nPartial index와 expression index는 uniqueness에도 쓸 수 있다.\n\n| 요구사항 | 적합한 형태 |\n|---|---|\n| active user email만 unique | partial unique index |\n| email 대소문자만 무시해 unique | expression unique index on `lower(email)` |\n| active row이면서 normalized email unique | partial expression unique index |\n| DB가 partial index를 직접 지원하지 않음 | generated active key 또는 active/history split |\n\n예:\n\n```sql\n-- PostgreSQL: active row만 email unique\nCREATE UNIQUE INDEX users_active_email_uk\nON users (email)\nWHERE deleted_at IS NULL;\n```\n\n```sql\n-- PostgreSQL: 대소문자 무시 email unique\nCREATE UNIQUE INDEX users_lower_email_uk\nON users (lower(email));\n```\n\n```sql\n-- PostgreSQL: active row + normalized email\nCREATE UNIQUE INDEX users_active_lower_email_uk\nON users (lower(email))\nWHERE deleted_at IS NULL;\n```\n\nMySQL에서는 partial index를 같은 방식으로 직접 표현하지 못하는 경우가 많다. 이때는 generated column으로 active key를 만들거나 active/history table을 분리하는 설계를 검토한다.\n\n## 실전 시나리오\n\n### 시나리오 1. Soft delete 후 같은 email 재가입 허용\n\n요구사항:\n\n- deleted row는 audit 때문에 남긴다.\n- active row 사이에서는 email이 unique여야 한다.\n- deleted row의 email은 새 가입을 막으면 안 된다.\n\nPostgreSQL이면 partial unique index가 명확하다.\n\n```sql\nCREATE UNIQUE INDEX users_active_email_uk\nON users (email)\nWHERE deleted_at IS NULL;\n```\n\n하지만 로그인 조회가 `WHERE email = ? AND deleted_at IS NULL` 형태로 항상 predicate를 포함해야 한다. 일부 query가 `deleted_at IS NULL`을 빼먹으면 성능뿐 아니라 의미도 흔들린다.\n\n### 시나리오 2. 대소문자 무시 email 검색\n\n요구사항:\n\n- `Kim@Example.com`과 `kim@example.com`을 같은 email로 본다.\n- login query는 `LOWER(email) = LOWER(?)` 형태다.\n\n선택지:\n\n- expression index on `lower(email)`\n- `email_normalized` generated/stored column plus index\n- write path에서 normalized email을 별도 column으로 저장\n- case-insensitive collation/citext 등 DB 기능\n\n팀이 query expression과 collation을 안정적으로 관리할 수 있으면 expression index가 간결하다. 여러 서비스와 제약조건에서 재사용한다면 generated/normalized column이 더 읽기 쉽다.\n\n### 시나리오 3. 최근 미결제 주문만 자주 본다\n\n`paid_at IS NULL`인 row가 전체의 1%이고 운영 화면이 그 subset만 자주 본다면 partial index가 좋다.\n\n```sql\nCREATE INDEX orders_unpaid_created_idx\nON orders (created_at)\nWHERE paid_at IS NULL;\n```\n\n하지만 시간이 지나 unpaid row가 40%가 되면 장점이 줄어든다. Partial index는 데이터 분포가 안정적일 때 빛난다.\n\n## 안티패턴\n\n| 안티패턴 | 왜 위험한가 | 더 나은 방향 |\n|---|---|---|\n| partial index를 partition 대체재로 씀 | predicate별 인덱스가 계속 늘고 planner 선택이 복잡해짐 | partition 또는 active/history split 검토 |\n| 함수 조건마다 expression index 생성 | write 비용과 schema 이해 비용 증가 | query rewrite, generated column, 핵심 route 선별 |\n| ORM query가 expression을 숨김 | 인덱스 정의와 query expression이 어긋날 수 있음 | SQL 렌더링 contract test |\n| uniqueness 요구를 앱에서만 처리 | race condition에 취약 | DB unique 구조로 표현 |\n| `EXPLAIN` 없이 인덱스 추가 | planner matching 실패를 늦게 발견 | 대표 bind 값으로 plan 검증 |\n\n## 추천 공식 자료\n\n- PostgreSQL Partial Indexes:\n  - https://www.postgresql.org/docs/current/indexes-partial.html\n- PostgreSQL Indexes on Expressions:\n  - https://www.postgresql.org/docs/current/indexes-expressional.html\n- MySQL CREATE INDEX, functional key parts:\n  - https://dev.mysql.com/doc/refman/8.4/en/create-index.html\n- MySQL Generated Columns:\n  - https://dev.mysql.com/doc/refman/8.4/en/create-table-generated-columns.html\n\n## 꼬리질문\n\n> Q: partial index와 expression index의 가장 큰 차이는?\n> 의도: subset 문제와 derived value 문제를 구분하는지 확인\n> 핵심: partial index는 row subset을 줄이고, expression index는 계산된 값을 인덱싱한다.\n\n> Q: partial index를 만들었는데 왜 prepared parameter query에서 안 쓰이나요?\n> 의도: planning time predicate implication 이해 확인\n> 핵심: planner가 모든 parameter 값에 대해 query predicate가 partial predicate를 만족한다고 증명할 수 없으면 쓰기 어렵다.\n\n> Q: active row unique와 normalized email unique를 동시에 만족하려면?\n> 의도: uniqueness use case를 구조로 표현하는지 확인\n> 핵심: 지원하는 DB라면 partial expression unique index, 아니면 generated active normalized key나 active/history split을 검토한다.\n\n## 한 줄 정리\n\nPartial index는 \"필요한 row만 담아도 되는가\"를 묻고, expression index는 \"검색 기준이 원본 값이 아니라 계산 결과인가\"를 묻는다. 좋은 선택은 predicate match, expression determinism, write overhead, planner matching, uniqueness 요구를 함께 만족해야 한다.\n",
+  "aliases": [
+    "partial index",
+    "expression index",
+    "functional index",
+    "filtered index",
+    "partial unique index",
+    "expression unique index",
+    "predicate index",
+    "lower email index",
+    "active row unique index",
+    "generated column vs functional index",
+    "deterministic expression index"
+  ],
+  "expected_queries": [
+    "partial index와 expression index는 predicate match와 함수 계산 관점에서 어떻게 골라?",
+    "deleted_at IS NULL active row uniqueness는 partial unique index와 functional index 중 무엇이 맞아?",
+    "LOWER(email) 검색은 expression index, generated column, query rewrite 중 어떻게 선택해야 해?",
+    "partial index를 만들었는데 prepared parameter 조건에서는 planner가 못 쓰는 이유가 뭐야?",
+    "expression index와 partial index의 write overhead, planner matching, uniqueness use case를 비교해줘"
+  ],
+  "symptoms": [
+    "deleted_at IS NULL 같은 active row 조건과 LOWER(email) 같은 함수 조건을 같은 인덱스 문제로 뭉뚱그린다",
+    "partial index를 만들었는데 query predicate가 맞지 않아 planner가 쓰지 않는 이유를 설명하지 못한다",
+    "expression index를 만들면 모든 비슷한 함수 조건이 자동으로 매칭된다고 생각한다",
+    "unique 제약을 active subset에 걸지 normalized value에 걸지 구분하지 못한다",
+    "write overhead와 planner matching 비용을 보지 않고 인덱스를 추가한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/index-and-explain",
+      "database/btree-vs-hash-index-chooser",
+      "database/generated-columns-functional-index-migration"
+    ],
+    "next_docs": [
+      "database/functional-index-vs-lower-duplicate-check-bridge",
+      "database/soft-delete-uniqueness-indexing-lifecycle",
+      "database/covering-index-composite-ordering",
+      "database/secondary-index-maintenance-statistics-skew",
+      "database/online-schema-change-strategies"
+    ],
+    "confusable_with": [
+      "database/generated-columns-functional-index-migration",
+      "database/functional-index-vs-lower-duplicate-check-bridge",
+      "database/soft-delete-uniqueness-indexing-lifecycle",
+      "database/btree-vs-hash-index-chooser",
+      "database/covering-index-composite-ordering"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/partial-index-vs-expression-index-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "design-pattern/anti-corruption-translation-map-pattern",
+  "title": "Anti-Corruption Translation Map Pattern",
+  "category": "design-pattern",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Anti-Corruption Translation Map Pattern: 외부 코드값을 도메인 언어로 매핑하기\n\n> 한 줄 요약: Translation Map은 외부 시스템의 코드와 상태값을 내부 도메인 언어로 고정 매핑해 모델 오염을 막는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Bounded Context Relationship Patterns](./bounded-context-relationship-patterns.md)\n> - [Anti-Corruption Layer Operational Pattern](./anti-corruption-layer-operational-pattern.md)\n> - [Anti-Corruption Contract Test Pattern](./anti-corruption-contract-test-pattern.md)\n> - [Facade as Anti-Corruption Seam](./facade-anti-corruption-seam.md)\n> - [Anti-Corruption Adapter Layering](./anti-corruption-adapter-layering.md)\n> - [Adapter (어댑터) 패턴](./adapter.md)\n> - [Bridge Pattern: 저장소와 제공자를 분리하는 추상화](./bridge-storage-provider-abstractions.md)\n\n---\n\n## 핵심 개념\n\n외부 API는 종종 우리 도메인과 다른 코드값을 쓴다.  \nTranslation Map은 그 코드들을 내부 언어로 한 번만 번역하는 표를 둔다.\n\n- 외부 status code\n- 내부 enum\n- 에러 코드\n- 공급자별 상태값\n\n## 재현 조건\n\n다음 증상이 있으면 Translation Map을 먼저 만든다.\n\n- `providerStatus`, `externalCode`, `AUTH_OK` 같은 외부 용어가 service나 aggregate까지 들어온다.\n- provider별 상태 switch가 adapter, service, batch job에 반복된다.\n- 새 외부 코드가 들어왔을 때 기본값으로 조용히 바뀌어 장애가 늦게 드러난다.\n- 내부 상태 전이는 안정적인데 provider별 이름과 세부 상태만 계속 달라진다.\n\n단순 field rename만 필요하면 DTO mapper로 충분하다. Translation Map은 **의미가 다른 코드값을 내부 언어로 고정하는 경계**다.\n\n## 확인 순서\n\n1. **외부 코드 원천을 모은다**: status, error, reason, sub-code를 provider 문서와 실제 payload에서 수집한다.\n2. **내부 domain vocabulary를 먼저 정한다**: 내부 enum이 provider 코드 사본이 되지 않게 한다.\n3. **unknown 정책을 정한다**: `UNKNOWN`, quarantine, fail-fast exception, manual review 중 하나를 명시한다.\n4. **방향을 나눈다**: inbound provider->domain translator와 outbound domain->provider translator를 섞지 않는다.\n5. **계약 테스트를 둔다**: provider sample payload와 새 코드 감지 테스트를 adapter boundary에 둔다.\n\n### Retrieval Anchors\n\n- `translation map`\n- `anti corruption map`\n- `external code mapping`\n- `status code translation`\n- `domain enum mapping`\n- `published language`\n- `unknown code mapping`\n\n---\n\n## 깊이 들어가기\n\n### 1. switch문보다 map이 낫다\n\n코드값 번역을 `switch`로만 두면 흩어지기 쉽다.  \n고정된 map 또는 dedicated translator로 두면 더 선명하다.\n\n### 2. 외부 상태와 내부 상태를 섞지 않는다\n\n외부 provider의 `PENDING_AUTH`, `AUTH_OK`, `AUTHORIZED`를 내부에서 그대로 쓰면 도메인이 오염된다.\n\n내부에는 `PAYMENT_PENDING`, `AUTHORIZED`, `CAPTURED`처럼 우리 언어를 써야 한다.\n\n### 3. 단방향 번역이 좋다\n\n외부 -> 내부는 명시적으로, 내부 -> 외부는 다른 translator로 분리하는 편이 안전하다.\n\n### 4. failure matrix\n\n| 실패 모드 | 관찰 증거 | 수정 방향 |\n|---|---|---|\n| 외부 용어 침투 | domain enum 값이 provider 코드와 같은 이름이다 | 내부 상태 이름을 도메인 의미로 다시 정하고 translator에서만 provider 코드를 안다 |\n| inline switch drift | 같은 코드 매핑이 여러 class에 있다 | dedicated translator/map으로 합치고 adapter에서만 호출한다 |\n| unknown silent default | 모르는 코드가 `PENDING` 같은 정상 상태로 바뀐다 | unknown metric/log와 fail/quarantine 정책을 추가한다 |\n| 양방향 map 오용 | inbound/outbound 변환이 같은 map을 뒤집어 쓴다 | 방향별 translator를 분리하고 비대칭 상태를 명시한다 |\n\n## 검증\n\n- provider sample code가 모두 내부 상태로 매핑되는가?\n- unknown code 테스트가 관측 가능한 실패를 만들고 metric/log를 남기는가?\n- domain/service layer에서 provider code 문자열을 검색했을 때 adapter/translator 밖에 없는가?\n- 매핑 변경 시 계약 테스트가 깨지는가?\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 결제 상태 매핑\n\nPG 상태값을 내부 결제 상태로 번역한다.\n\n### 시나리오 2: 배송 상태 매핑\n\n물류 업체별 코드값을 내부 상태로 통일한다.\n\n### 시나리오 3: 오류 코드 매핑\n\n외부 에러를 내부 예외 타입으로 바꾼다.\n\n---\n\n## 코드로 보기\n\n### Translation map\n\n```java\npublic class PaymentStatusTranslator {\n    private static final Map<String, PaymentStatus> MAP = Map.of(\n        \"PENDING_AUTH\", PaymentStatus.PENDING,\n        \"AUTH_OK\", PaymentStatus.AUTHORIZED,\n        \"CAPTURED\", PaymentStatus.CAPTURED\n    );\n\n    public PaymentStatus translate(String externalCode) {\n        return MAP.getOrDefault(externalCode, PaymentStatus.UNKNOWN);\n    }\n}\n```\n\n### Using it in adapter\n\n```java\npublic class PgPaymentAdapter implements PaymentPort {\n    private final PaymentStatusTranslator translator;\n\n    public PaymentResult pay(PaymentRequest request) {\n        String externalCode = \"AUTH_OK\";\n        return new PaymentResult(translator.translate(externalCode));\n    }\n}\n```\n\n### Boundary rule\n\n```java\n// 외부 코드를 domain enum으로 바로 노출하지 않는다.\n```\n\nTranslation map은 anti-corruption layer의 가장 작은 단위다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| inline switch | 빠르다 | 분산되기 쉽다 | 잠깐의 대응 |\n| Translation Map | 단방향 번역이 쉽다 | 매핑 관리가 필요하다 | 외부 코드값이 고정될 때 |\n| full translator layer | 책임 분리가 좋다 | 코드가 늘어난다 | 외부 모델이 복잡할 때 |\n\n판단 기준은 다음과 같다.\n\n- 코드값이 여러 곳에서 반복되면 map으로 모은다\n- 도메인 언어를 지키는 게 핵심이다\n- 외부 상태를 그대로 노출하지 않는다\n\n---\n\n## 꼬리질문\n\n> Q: translation map과 adapter는 어떻게 다른가요?\n> 의도: 작은 번역 표와 객체 수준 연결을 구분하는지 확인한다.\n> 핵심: map은 번역 데이터, adapter는 연결 책임이다.\n\n> Q: 왜 외부 코드값을 그대로 쓰면 안 되나요?\n> 의도: 도메인 오염의 위험을 아는지 확인한다.\n> 핵심: provider 변경이 내부로 바로 전파된다.\n\n> Q: unknown 값을 어떻게 다루나요?\n> 의도: 안전한 디폴트와 실패 정책을 아는지 확인한다.\n> 핵심: UNKNOWN 또는 예외 정책을 명시해야 한다.\n\n## 한 줄 정리\n\nAnti-corruption Translation Map은 외부 코드값을 내부 도메인 언어로 고정 번역해 모델 오염을 막는다.\n",
+  "aliases": [
+    "anti corruption translation map",
+    "translation map",
+    "external code mapping",
+    "status code translation",
+    "domain enum mapping",
+    "unknown code mapping",
+    "provider status mapping",
+    "published language mapping",
+    "외부 코드값 매핑",
+    "도메인 enum 번역"
+  ],
+  "expected_queries": [
+    "Translation Map은 외부 provider code를 내부 domain enum으로 어떻게 안전하게 번역해?",
+    "외부 status code를 내부 모델에서 그대로 쓰면 anti-corruption boundary가 왜 깨져?",
+    "inline switch 대신 dedicated translation map이나 translator를 두는 기준은 뭐야?",
+    "unknown external code는 UNKNOWN, quarantine, exception 중 어떤 정책으로 처리해야 해?",
+    "payment provider별 AUTH_OK, CAPTURED 같은 상태값을 내부 payment language로 매핑하려면 어떻게 설계해?"
+  ],
+  "symptoms": [
+    "provider status code를 내부 domain enum처럼 그대로 노출해 외부 용어가 모델에 침투한다",
+    "외부 코드값 번역 switch가 여러 adapter와 service에 흩어져 drift 대응 위치가 불명확하다",
+    "unknown external code를 조용히 기본값으로 바꿔 silent degradation을 만든다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/anti-corruption-layer-operational-pattern",
+      "design-pattern/anti-corruption-adapter-layering",
+      "design-pattern/adapter"
+    ],
+    "next_docs": [
+      "design-pattern/anti-corruption-contract-test-pattern",
+      "design-pattern/facade-anti-corruption-seam",
+      "design-pattern/bounded-context-relationship-patterns"
+    ],
+    "confusable_with": [
+      "design-pattern/anti-corruption-adapter-layering",
+      "design-pattern/anti-corruption-layer-operational-pattern",
+      "design-pattern/adapter",
+      "design-pattern/facade-anti-corruption-seam"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/design-pattern/anti-corruption-translation-map-pattern.md",
+    "revision_history": []
+  }
+}

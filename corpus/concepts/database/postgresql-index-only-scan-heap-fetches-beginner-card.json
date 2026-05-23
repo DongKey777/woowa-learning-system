@@ -1,0 +1,64 @@
+{
+  "id": "database/postgresql-index-only-scan-heap-fetches-beginner-card",
+  "title": "PostgreSQL Index Only Scan Heap Fetches Beginner Card",
+  "category": "database",
+  "level": "beginner",
+  "summary": "'이 문서는 PostgreSQL Index Only Scan에서 Heap Fetches가 남는 이유를 visibility map, all-visible page, MVCC visibility recheck, VACUUM/autovacuum 관점으로 설명하는 beginner symptom router다.",
+  "body_markdown": "# PostgreSQL `Index Only Scan`인데 왜 `Heap Fetches`가 남아요?\n\n> 한 줄 요약: PostgreSQL에서 `Index Only Scan`인데도 `Heap Fetches`가 남는 건 이상 동작이 아니라, visibility map이 \"이 page는 모두 보여도 된다\"를 아직 보증하지 못하면 heap에서 MVCC visibility를 다시 확인하기 때문이다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [PostgreSQL `visibility map`과 `all-visible`은 뭐예요?](./postgresql-visibility-map-all-visible-beginner-card.md)\n- [MySQL clustered index와 PostgreSQL heap + index 저장 구조 브리지](./mysql-postgresql-index-storage-bridge.md)\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [MVCC, Replication, Sharding](./mvcc-replication-sharding.md)\n- [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md)\n- [Hybrid Top-Index / Leaf Layouts](../data-structure/hybrid-top-index-leaf-layouts.md)\n- [database 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: postgresql index only scan heap fetches, why heap fetches remain, heap fetches beginner, index only scan basics, mvcc visibility basics, visibility map what is, visibility map beginner, postgresql heap table basics, why index only scan still reads heap, 처음 보는 heap fetches, heap fetches 뭐예요, autovacuum why index only scan got slower, vacuum after explain got faster, heap fetches 늘었는데 왜 안 느려져요\n\n## 핵심 개념\n\n초보자는 `Index Only Scan`을 보면 \"이제 heap은 절대 안 읽겠네\"라고 받아들이기 쉽다.\n하지만 PostgreSQL에서 이 이름은 **인덱스만으로 끝낼 수 있으면 그렇게 하겠다**는 경로에 가깝다.\n실행 중에는 \"이 row가 지금 내 스냅샷에서 보여도 되나?\"를 다시 확인해야 해서, 그 확인이 남아 있으면 heap 방문이 붙는다.\n\n먼저 한 줄만 고정하면 된다.\n\n- index: 값을 빨리 찾는 안내판\n- heap: row 본문이 있는 테이블 페이지\n- `visibility map`: \"이 heap page는 지금 모든 tuple이 모두에게 보여도 된다\"에 가까운 빠른 메모\n- `Heap Fetches`: 안내판만으로 끝내지 못해 row 본문 쪽을 다시 확인한 횟수\n\n즉 `Heap Fetches`가 보인다는 건 \"플랜이 틀렸다\"보다 **visibility map만으로 확신할 수 없어 heap까지 내려갔다**에 가깝다.\n\n## 한눈에 보기\n\n| plan에서 보인 것 | 초보자용 첫 해석 | 바로 결론 내리면 안 되는 말 |\n| --- | --- | --- |\n| `Index Only Scan` | \"가능하면 인덱스만 읽고 끝내려는 경로를 탔다\" | \"heap을 100% 안 읽었다\" |\n| `Heap Fetches: 0` | \"이번에는 heap 확인이 거의 필요 없었다\" | \"항상 이렇게 나온다\" |\n| `Heap Fetches: 42` | \"몇 row/page는 heap 확인이 다시 필요했다\" | \"index가 아예 소용없다\" |\n| visibility map이 잘 유지됨 | \"page 단위로 '대체로 안전' 표식이 붙어 있다\" | \"MVCC를 완전히 안 본다\" |\n\n```text\n안전한 멘탈모델\n1. index가 후보 row를 찾는다\n2. visibility map이 heap 확인을 생략할 수 있는지 먼저 본다\n3. 확신이 서지 않으면 postgres가 heap에서 visibility를 다시 확인한다\n```\n\n## visibility map을 어떻게 이해하면 되나요?\n\nvisibility map은 초급에서는 \"heap page 옆에 붙어 있는 체크 스티커\" 정도로 이해하면 충분하다.\n\"이 페이지는 지금 있는 tuple들이 다 visible하니, index만 보고 지나가도 될 가능성이 높다\"는 빠른 힌트를 주는 장치다.\n\n`visibility map`과 `all-visible` 용어 자체가 아직 헷갈리면 [PostgreSQL `visibility map`과 `all-visible`은 뭐예요?](./postgresql-visibility-map-all-visible-beginner-card.md)부터 짧게 보고 다시 이 문단으로 돌아오면 된다.\n\n중요한 건 이 메모가 **row별 메모가 아니라 page 단위 메모**라는 점이다.\n그래서 index에 필요한 컬럼이 다 있어도, 해당 page가 all-visible로 보증되지 않으면 PostgreSQL은 heap을 다시 본다.\n\n| visibility map 관점 | 초보자용 해석 | `Heap Fetches`에 주는 영향 |\n| --- | --- | --- |\n| page가 `all-visible` | \"이 page는 heap 재확인 없이 지나갈 가능성이 크다\" | 줄기 쉽다 |\n| page가 아직 `all-visible` 아님 | \"누가 지금 보이는지 heap에서 다시 확인해야 한다\" | 남기 쉽다 |\n\n초급에서는 내부 비트 구조를 외울 필요는 없다.\n`Heap Fetches`를 볼 때는 아래 한 문장만 붙잡으면 된다.\n\n> \"index가 row를 찾는 일\"과 \"이 page를 heap까지 안 내려가도 되는지 확인하는 일\"은 다른 단계다.\n\n## 왜 all-visible이 깨지나요?\n\n`Heap Fetches`가 남는 흔한 이유를 초급용으로 줄이면 둘이다.\n\n- 최근 `UPDATE`/`DELETE`가 많아서 page의 visible 보증이 다시 흔들렸다\n- `VACUUM`/autovacuum가 아직 그 변화를 정리해 visibility map을 갱신하지 못했다\n\n여기서 포인트는 \"인덱스가 나빠서\"보다 **쓰기 흔적과 정리 상태 때문에 heap 재확인이 남을 수 있다**는 것이다.\n그래서 `Index Only Scan` follow-up에서는 인덱스 컬럼만 보지 말고 visibility map과 vacuum 문맥을 같이 봐야 한다.\n\n## 작은 예시로 읽기\n\n예를 들어 아래처럼 plan이 나왔다고 하자.\n\n```text\nIndex Only Scan using idx_orders_status_created_at on orders\nHeap Fetches: 37\n```\n\n초보자용 해석은 이렇게 끊는 편이 안전하다.\n\n| 보인 숫자 | 첫 해석 | 다음 질문 |\n| --- | --- | --- |\n| `Index Only Scan` | 인덱스만으로 끝내는 경로를 우선 시도했다 | 필요한 컬럼은 인덱스에 다 있었나? |\n| `Heap Fetches: 37` | 37번은 heap 확인이 다시 필요했다 | 왜 visibility map만으로 못 끝냈지? 최근 쓰기나 vacuum 상태가 어떤가? |\n\n즉 이 plan은 \"이름은 index only였는데 실패\"가 아니라,\n\"대부분 인덱스로 가되, visibility map이 확신하지 못한 일부 page는 heap 검증이 붙었다\"로 읽는 편이 맞다.\n\n## 왜 시간이 지나면 빨라지거나 다시 느려지나요?\n\n초급자 입장에서는 여기서 vacuum과 autovacuum를 \"청소\"보다\n\"index only scan이 heap을 얼마나 덜 다시 보게 만들지에 영향을 주는 정리 작업\"으로 연결하면 된다.\n\n아주 단순하게 보면 흐름은 이렇다.\n\n| 시점 | heap page 쪽에서 일어나는 일 | `Index Only Scan` 체감 |\n| --- | --- | --- |\n| `UPDATE`/`DELETE`가 많이 일어난 직후 | page의 `all-visible` 보증이 깨지기 쉽다 | `Heap Fetches`가 다시 늘 수 있다 |\n| autovacuum/VACUUM가 지나간 뒤 | dead tuple 정리와 visibility map 갱신이 따라온다 | heap 재확인이 줄어 더 빨라질 수 있다 |\n| 다시 쓰기 churn이 커진 뒤 | 새 변경이 쌓여 page 상태가 다시 흔들린다 | 예전보다 느려졌다고 느낄 수 있다 |\n\n즉 \"어제는 `Heap Fetches: 0`에 가까웠는데 오늘은 늘었다\"가 꼭 인덱스 설계가 망가졌다는 뜻은 아니다.\n최근 쓰기 흔적이 많아졌거나, autovacuum가 아직 그 변화를 정리하지 못했을 수 있다.\n\n반대로 `VACUUM (ANALYZE)` 뒤에 plan이 좋아졌다면\n\"인덱스를 새로 만들었기 때문\"이 아니라 **visibility map이 다시 정리돼 heap 재확인이 줄었기 때문**일 가능성이 크다.\n\n## `Heap Fetches`가 늘었는데 왜 `buffers`나 시간이 같이 안 오르죠?\n\n초보자가 여기서 가장 자주 하는 오해는 \"`Heap Fetches`가 늘었으니 무조건 느려져야 한다\"는 단정이다.\n하지만 `Heap Fetches`는 heap 재확인 횟수이고, 실제 체감 속도는 그 재확인이 어떤 page에서 일어났는지와 cache 상태까지 같이 봐야 한다.\n\n| 관찰 | 안전한 첫 해석 |\n| --- | --- |\n| `Heap Fetches` 증가 + `Buffers`도 증가 + 시간도 증가 | heap 재확인이 실제 page touch와 지연으로 이어졌을 가능성이 크다 |\n| `Heap Fetches` 증가 + `Buffers`는 비슷 | 같은 heap page를 메모리에서 다시 확인해 횟수는 늘어도 page touch 증가는 작을 수 있다 |\n| `Heap Fetches` 증가 + 시간은 거의 그대로 | 재확인이 shared hit 위주라 추가 disk read가 없었을 수 있다 |\n\n즉 `Heap Fetches`는 원인 단서이고, `Buffers`와 실행 시간은 결과 신호다.\n셋이 자주 같이 움직이지만, PostgreSQL `EXPLAIN ANALYZE`에서는 항상 같은 비율로 오르지는 않는다.\n\n이 연결을 한 장으로 다시 보고 싶으면 [PostgreSQL `EXPLAIN ANALYZE`에서 `actual rows`, `buffers`, `heap fetches`를 같이 읽는 법](./postgresql-explain-analyze-terms-mini-bridge.md)을 같이 보면 된다.\n\n## 흔한 오해와 함정\n\n- \"`Index Only Scan`이면 heap fetch가 0이어야 정상이다\" -> 아니다. 이름과 실제 heap 재확인 횟수는 분리해서 본다.\n- \"`Heap Fetches`가 있으면 인덱스를 새로 만들어야 한다\" -> 꼭 그렇지 않다. storage layout과 MVCC visibility 문제가 먼저일 수 있다.\n- \"`VACUUM`은 디스크 청소라서 plan 성능과는 별개다\" -> 초급 단계에서는 아니다. vacuum/autovacuum가 visibility map을 갱신하면 index-only scan의 heap 재확인이 줄 수 있다.\n- \"heap이니까 자바 heap 메모리 얘기다\" -> 아니다. 여기서 heap은 PostgreSQL table body 쪽을 가리킨다.\n- \"커버링 인덱스를 만들었는데 왜 또 읽지?\" -> PostgreSQL에서는 커버링 설계와 visibility 확인이 같은 층이 아니다.\n- \"visibility map이 있으면 heap을 영원히 안 본다\" -> 아니다. 최근 쓰기나 vacuum 상태에 따라 다시 heap 확인이 생긴다.\n- \"`Heap Fetches`가 조금이라도 있으면 plan이 완전히 나쁘다\" -> 아니다. 0이 아니어도 여전히 index path가 유리할 수 있다.\n- \"`Heap Fetches`가 늘면 `Buffers`와 시간도 반드시 같이 오른다\" -> 아니다. 같은 page 재확인인지, cache hit인지에 따라 같이 안 움직일 수 있다.\n\n## 다음에 무엇을 보면 되나요?\n\n처음엔 원인을 너무 많이 열지 말고 아래 순서로 보면 된다.\n\n1. 정말 `Index Only Scan`인지와 `Heap Fetches` 숫자를 같이 본다.\n2. 최근 쓰기 churn이 많았는지, vacuum/autovacuum가 따라오고 있는지 확인한다.\n3. \"인덱스 shape 문제\"인지 \"visibility 문제\"인지 분리한다.\n\n문서 연결은 이렇게 가져가면 안전하다.\n\n- 저장 구조 감각이 약하면 [MySQL clustered index와 PostgreSQL heap + index 저장 구조 브리지](./mysql-postgresql-index-storage-bridge.md)\n- `visibility map`, `all-visible` 용어가 아직 추상적으로 들리면 [PostgreSQL `visibility map`과 `all-visible`은 뭐예요?](./postgresql-visibility-map-all-visible-beginner-card.md)\n- 커버링 인덱스와 `Index Only Scan`을 같은 말로 읽고 있었다면 [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- `vacuum`, dead tuple, cleanup debt가 같이 보여서 운영 신호까지 이어지면 [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md)\n\n## 한 줄 정리\n\nPostgreSQL에서 `Index Only Scan`인데도 `Heap Fetches`가 남는 이유는 index가 row를 찾는 일과 MVCC visibility를 확인하는 일이 분리돼 있어서, 일부 row는 heap에서 다시 검증해야 하기 때문이다.\n",
+  "aliases": [
+    "postgresql index only scan heap fetches",
+    "why heap fetches remain",
+    "heap fetches beginner",
+    "index only scan basics",
+    "mvcc visibility basics",
+    "visibility map what is",
+    "why index only scan still reads heap",
+    "heap fetches 뭐예요",
+    "Index Only Scan인데 heap을 읽어요",
+    "vacuum after explain got faster"
+  ],
+  "expected_queries": [
+    "PostgreSQL Index Only Scan인데 Heap Fetches가 남는 이유가 visibility map 때문인지 설명해줘",
+    "heap fetches가 있으면 index only scan이 실패한 것인지 아니면 MVCC 확인이 남은 것인지 알려줘",
+    "VACUUM 이후 heap fetches가 줄어드는 이유를 all-visible page와 연결해줘",
+    "covering index와 PostgreSQL Index Only Scan은 왜 같은 말이 아니야?",
+    "Heap Fetches가 늘었는데 buffers나 latency가 항상 같이 늘지 않는 이유를 설명해줘",
+    "postgresql autovacuum 때문에 index only scan이 왜 빨라지거나 느려지나요",
+    "postgresql index only scan인데 heap fetches가 왜 남아요?",
+    "postgresql index only scan인데 heap fetches가 왜 남아요? mvcc visibility map도 같이 설명해줘",
+    "PostgreSQL Index Only Scan인데 Heap Fetches가 왜 남아요? visibility map이 뭐예요?"
+  ],
+  "symptoms": [
+    "PostgreSQL Index Only Scan이면 heap 접근이 반드시 0이어야 한다고 생각하고 Heap Fetches를 plan 실패로 해석하고 있어",
+    "visibility map과 all-visible 상태가 부족해 MVCC visibility 확인을 heap에서 다시 하는 상황을 이해해야 해",
+    "VACUUM/autovacuum 이후 Heap Fetches가 줄고 plan latency가 달라지는 이유를 index shape가 아니라 visibility로 봐야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/postgresql-visibility-map-all-visible-beginner-card",
+      "database/mysql-postgresql-index-storage-bridge"
+    ],
+    "next_docs": [
+      "database/postgresql-buffers-hit-read-dirtied-written-mini-card",
+      "database/vacuum-purge-debt-forensics-symptom-map",
+      "database/covering-index-vs-index-only-scan"
+    ],
+    "confusable_with": [
+      "database/postgresql-visibility-map-all-visible-beginner-card",
+      "database/postgresql-buffers-hit-read-dirtied-written-mini-card",
+      "database/covering-index-vs-index-only-scan",
+      "database/postgresql-hot-update-beginner-bridge",
+      "database/postgresql-plan-node-mini-card",
+      "database/postgresql-explain-analyze-terms-mini-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/postgresql-index-only-scan-heap-fetches-beginner-card.md",
+    "revision_history": []
+  }
+}

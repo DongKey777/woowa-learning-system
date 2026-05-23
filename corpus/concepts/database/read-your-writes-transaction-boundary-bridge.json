@@ -1,0 +1,45 @@
+{
+  "id": "database/read-your-writes-transaction-boundary-bridge",
+  "title": "Read Your Writes Transaction Boundary Bridge",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 bridge는 같은 요청 안의 write 후 read와 운영 read-after-write 최신성 문제를 연결한다. 방금 저장한 값이 목록에 안 보임, connection/read path 차이, transaction boundary 최신성 질문을 다룬다.",
+  "body_markdown": "# Read Your Writes Transaction Boundary Bridge\n\n## 한 줄 요약\n\n같은 transaction 안에서 다시 읽는 것과, commit 후 별도 read path에서 다시 읽는 것은 다르다. \"방금 쓴 값이 보이는가\"는 transaction boundary, connection, ORM cache, replica/projection/cache 경로를 함께 봐야 한다.\n\n## 미션 진입 증상\n\n저장 직후 redirect된 목록 화면에서 옛값이 보이면 DB commit 자체가 실패했다고 단정하기보다 목록 조회가 cache, replica, 검색 인덱스, projection table, 다른 datasource를 타는지 확인해야 한다. 반대로 같은 service method 안에서 저장 후 조회했는데 안 보인다면 flush, persistence context, transaction propagation을 먼저 본다.\n\n## 핵심 mental model\n\nTransaction 내부의 read-your-writes는 같은 connection 또는 같은 persistence context 안에서의 관찰이다. 운영 화면의 read-after-write는 commit 이후 사용자 경험의 최신성 보장이다. 두 문제는 증상이 비슷하지만 해결책이 다르다.\n\n| 상황 | 주로 확인할 것 | 가능한 대응 |\n|---|---|---|\n| 같은 transaction 안에서 저장 후 조회 | flush, 1차 cache, query 종류 | flush 시점 확인, repository 경계 정리 |\n| commit 직후 primary 조회 | transaction commit 완료 여부 | after-commit 이후 조회, 응답에 저장 결과 포함 |\n| commit 직후 replica 조회 | replication lag, read routing | 일정 시간 primary read, session stickiness |\n| commit 후 projection 조회 | event 처리 지연, offset | version floor, pending 표시, 재시도 조회 |\n| cache 조회 | invalidation 순서, TTL | write-through, explicit evict, cache bypass |\n\nJPA에서는 entity를 저장한 뒤 같은 persistence context에서 다시 찾으면 DB round trip 없이 1차 cache의 객체를 볼 수 있다. JPQL query는 flush mode에 따라 실행 전에 flush될 수 있지만, 모든 native query나 별도 connection read가 같은 방식으로 동작한다고 일반화하면 안 된다. 따라서 \"테스트에서는 보인다\"는 사실만으로 운영 read path의 최신성을 보장할 수 없다.\n\n## 설계 경계\n\n같은 HTTP 요청 안에서 command와 query를 연속 실행한다면 transaction boundary를 명확히 해야 한다. 저장 transaction이 아직 commit되지 않았는데 다른 transaction이나 replica가 읽으면 당연히 보이지 않을 수 있다. `REQUIRES_NEW`, async event, domain event listener의 phase도 관찰 결과를 바꾼다.\n\n사용자 경험 관점에서는 긴 transaction으로 모든 read를 묶는 것이 항상 답이 아니다. lock 보유 시간이 늘고 외부 API나 view rendering까지 DB transaction에 들어갈 수 있다. 대신 저장 성공 응답에 새 값을 포함하거나, redirect 직후 일정 시간 primary로 읽거나, read model에 최소 version을 요구하는 방식이 더 운영 친화적일 수 있다.\n\n## 관찰 증거\n\n- write transaction commit 로그와 read query 시각\n- read가 primary인지 replica인지, 어떤 datasource key로 라우팅됐는지\n- cache hit/miss와 invalidation 로그\n- projection/event consumer lag, 마지막 처리 offset\n- JPA SQL 로그에서 flush가 실제로 일어났는지\n- 같은 request id로 write와 read trace가 연결되는지\n\n## 흔한 오해\n\n트랜잭션을 길게 잡으면 항상 해결된다고 생각하면 안 된다. 사용자 화면 최신성은 primary fallback, min-version floor, projection freshness, cache invalidation 같은 별도 설계가 필요할 수 있다. 반대로 모든 stale read를 isolation 문제로 몰아가면 replica lag나 projection 지연을 놓친다.\n\n## 검증 절차\n\n- 저장 직후 같은 transaction 조회, commit 후 primary 조회, commit 후 replica/projection 조회를 분리해 테스트한다.\n- read datasource를 로그에 남기고 운영에서 stale 화면이 primary인지 replica인지 확인한다.\n- event 기반 projection이면 write event id와 projection applied id를 비교한다.\n- cache가 있다면 저장 직후 cache evict가 commit 전인지 후인지 확인한다.\n- 사용자가 저장 후 보는 화면에 대해 \"항상 최신\", \"몇 초 내 반영\", \"pending 표시\" 중 어떤 계약인지 명시한다.\n\n## Safe Next Docs\n\nread-after-write routing과 post-write stale dashboard로 이어서 본다.\n",
+  "aliases": [
+    "read your writes transaction boundary",
+    "write then read same request consistency",
+    "방금 쓴 값 다시 읽기",
+    "트랜잭션 경계 최신성"
+  ],
+  "expected_queries": [
+    "같은 요청에서 저장하고 다시 조회하면 항상 방금 쓴 값이 보여?",
+    "write 후 read가 다른 connection으로 가면 뭐가 달라져?",
+    "방금 저장한 값이 목록 조회에 안 보이면 트랜잭션 문제야?"
+  ],
+  "symptoms": [
+    "저장 직후 같은 화면에서 옛값이 보여요",
+    "테스트에서는 보이는데 운영 read path에서는 안 보여요",
+    "write와 read가 같은 트랜잭션인지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "system-design/read-after-write-routing-primer"
+    ],
+    "confusable_with": [
+      "database/transaction-case-studies",
+      "system-design/read-after-write-routing-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/read-your-writes-transaction-boundary-bridge.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "id": "language/varargs-heap-pollution-type-erasure-primer",
+  "title": "Java Varargs Heap Pollution and Type Erasure Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Java Varargs Heap Pollution and Type Erasure Primer\n\n> 한 줄 요약: `List<String>...` 같은 generic varargs는 호출 편의 문법처럼 보이지만, 내부에서는 배열을 만들고 Java 제네릭은 런타임 타입 인자를 잃기 때문에 heap pollution 경계가 생긴다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Java 제네릭 입문](./java-generics-basics.md)\n- [Generic Type Erasure Workarounds](./generic-type-erasure-workarounds.md)\n- [Java Generic: Erasure 동작과 Reflection 회피](./java-generics-erasure-vs-reflection-intermediate-bridge.md)\n- [Reflection, Generics, Annotations](./reflection-generics-annotations.md)\n- [Java 배열 입문 공통 confusion 체크리스트](./java-array-common-confusion-checklist.md)\n\nretrieval-anchor-keywords: java varargs heap pollution, parameterized vararg type warning, possible heap pollution from parameterized vararg type, java non reifiable type, java type erasure varargs, List<String>... warning, @SafeVarargs conditions, generic array creation, arrays covariance generics invariance, unchecked warning 기준, 제네릭 varargs 경고, 타입 소거 heap pollution, non-reifiable varargs primer\n\n## 먼저 잡을 mental model\n\n`String... names`는 호출하는 쪽에서는 여러 인자를 편하게 넘기는 문법이지만, 받는 쪽에서는 사실상 `String[] names`다.\n\n```java\nstatic void printAll(String... names) {\n    for (String name : names) {\n        System.out.println(name);\n    }\n}\n\nprintAll(\"a\", \"b\", \"c\");\n```\n\n컴파일러는 호출 지점에서 인자를 담을 배열을 만든다. `String`은 런타임에도 배열 원소 타입을 확인할 수 있는 reifiable type이라 큰 문제가 없다.\n\n문제는 `List<String>...`처럼 원소 타입이 parameterized type일 때 시작된다. Java 제네릭은 type erasure 때문에 런타임에 `List<String>`과 `List<Integer>`를 완전히 구분하지 못한다. 둘 다 대체로 `List` 수준으로 남는다.\n\n즉 varargs는 배열을 만들고, 제네릭은 타입 인자를 지운다. 이 두 선택이 만나는 곳이 generic varargs warning이다.\n\n## Type erasure와 non-reifiable type\n\nJava 제네릭은 컴파일 타임 타입 검사를 돕지만, 런타임에는 많은 타입 인자 정보가 소거된다.\n\n```java\nList<String> names = List.of(\"a\");\nList<Integer> numbers = List.of(1);\n\nSystem.out.println(names.getClass() == numbers.getClass()); // true\n```\n\n`List<String>`은 \"문자열 리스트\"라는 컴파일 타임 약속을 갖지만, 런타임 객체의 클래스는 `List<String>` 전용 클래스가 아니다. 그래서 `List<String>`은 non-reifiable type이다. 런타임에 그 타입 정보가 완전하게 남아 있지 않다는 뜻이다.\n\n반대로 `String`, `Integer`, `String[]`, raw `List` 같은 타입은 런타임 확인이 가능하거나 타입 인자 자체가 없어서 reifiable로 다룰 수 있다.\n\n## 왜 varargs가 배열을 만들면서 위험해지나\n\n다음 메서드는 자주 보이는 형태다.\n\n```java\nstatic void printFirst(List<String>... groups) {\n    for (List<String> group : groups) {\n        System.out.println(group.get(0));\n    }\n}\n```\n\n호출자는 이렇게 쓸 수 있다.\n\n```java\nprintFirst(List.of(\"a\"), List.of(\"b\"));\n```\n\n문제는 `groups`가 메서드 안에서 배열이라는 점이다. 이상적으로는 `List<String>[]`가 있으면 좋겠지만, `List<String>`은 non-reifiable type이라 런타임 배열 원소 타입으로 정확히 보존할 수 없다. 컴파일러는 `List[]` 수준의 배열을 만들 수밖에 없고, 그래서 \"parameterized vararg type 때문에 heap pollution 가능성이 있다\"는 unchecked warning을 낸다.\n\n## Heap pollution은 무엇인가\n\nHeap pollution은 parameterized type 변수가 그 선언 타입과 맞지 않는 객체를 참조하게 되는 상태다.\n\n아래 예시는 generic varargs에서 왜 이 상태가 생길 수 있는지 보여준다.\n\n```java\nstatic void broken(List<String>... stringLists) {\n    Object[] asArray = stringLists;\n    asArray[0] = List.of(42);\n\n    String value = stringLists[0].get(0); // 런타임에 ClassCastException 가능\n}\n```\n\n겉보기에는 `stringLists`가 `List<String>[]`처럼 보인다. 하지만 런타임 배열은 `List[]`에 가깝다. `List.of(42)`도 런타임 배열 관점에서는 `List`이므로 배열 저장 검사에 걸리지 않는다. 이후 컴파일러는 `stringLists[0].get(0)` 결과를 `String`이라고 믿고 캐스팅 코드를 넣는데, 실제 값은 `Integer`라 `ClassCastException`이 날 수 있다.\n\n이것이 heap pollution의 핵심이다. \"컴파일 타임 타입 약속\"과 \"실제 heap에 들어 있는 객체\"가 어긋난다.\n\n## 배열 covariance와 제네릭 invariance의 경계\n\nJava 배열은 covariant다.\n\n```java\nString[] strings = new String[1];\nObject[] objects = strings;\nobjects[0] = 1; // ArrayStoreException\n```\n\n`String[]`을 `Object[]`로 볼 수는 있지만, 배열은 런타임에 자기 원소 타입을 알고 있어서 잘못된 저장을 `ArrayStoreException`으로 막는다.\n\nJava 제네릭은 invariant다.\n\n```java\nList<String> strings = new ArrayList<>();\n// List<Object> objects = strings; // compile error\n```\n\n이 불공변성은 `List<String>`에 `Integer`를 넣는 일을 컴파일 타임에 막기 위한 선택이다.\n\ngeneric varargs는 이 두 세계가 어색하게 만나는 지점이다. varargs 파라미터는 배열이므로 `Object[]` alias가 가능하고, 원소인 `List<String>`은 type erasure 때문에 런타임에 `List<Integer>`와 충분히 구분되지 않는다. 배열의 런타임 검사는 `List`인지 정도만 볼 수 있고, `List<String>`인지까지는 보지 못한다.\n\n## @SafeVarargs를 붙여도 되는 조건\n\n`@SafeVarargs`는 \"이 메서드의 non-reifiable varargs 사용이 안전하다고 작성자가 보증한다\"는 선언이다. 경고를 숨기는 스티커가 아니라, 메서드 구현을 검토한 뒤 붙이는 계약이다.\n\n붙일 수 있는 선언 형태는 제한된다.\n\n- `static` 메서드\n- `final` 메서드\n- `private` 메서드\n- 생성자\n\n이 제한은 override된 메서드가 안전 계약을 깨는 구현으로 바뀌는 일을 막기 위한 것이다.\n\n의미상 안전하려면 다음 조건을 만족해야 한다.\n\n- varargs 배열에 새 값을 저장하지 않는다.\n- varargs 배열을 `Object[]`나 raw type으로 노출하지 않는다.\n- varargs 배열 자체를 외부에 반환하거나 저장해서 나중에 오염될 가능성을 만들지 않는다.\n- 각 원소를 읽기 전용으로만 다루거나, 원소 내부의 타입 계약을 깨는 unchecked cast를 하지 않는다.\n\n안전한 예시는 보통 읽기 전용 소비다.\n\n```java\n@SafeVarargs\nstatic <T> List<T> concat(List<? extends T>... lists) {\n    List<T> result = new ArrayList<>();\n    for (List<? extends T> list : lists) {\n        result.addAll(list);\n    }\n    return result;\n}\n```\n\n이 메서드는 `lists` 배열에 새 리스트를 대입하지 않고, 배열을 밖으로 내보내지도 않는다. 각 리스트의 원소를 읽어 새 결과 리스트에 복사할 뿐이다.\n\n반대로 아래 메서드는 `@SafeVarargs`를 붙이면 안 된다.\n\n```java\n@SafeVarargs\nstatic void unsafe(List<String>... lists) {\n    Object[] array = lists;\n    array[0] = List.of(1);\n}\n```\n\n컴파일러가 어노테이션 자체를 허용하더라도, 이 구현은 안전하지 않다. `@SafeVarargs`는 모든 논리적 안전성을 자동 증명하지 않는다.\n\n## unchecked warning을 무시하지 않는 기준\n\ngeneric varargs warning을 봤을 때 기준은 단순하다.\n\n1. varargs가 꼭 필요한 API인가?\n   `List<List<String>>`처럼 컬렉션 하나로 받으면 배열 생성 경계를 피할 수 있다.\n\n2. 파라미터 타입이 non-reifiable인가?\n   `String...`보다 `List<String>...`, `T...`, `Map<K, V>...`가 더 위험한 신호다.\n\n3. 메서드 안에서 varargs 배열에 쓰기 작업을 하는가?\n   `args[0] = ...` 또는 `Object[] alias = args` 뒤 대입이 있으면 강한 위험 신호다.\n\n4. varargs 배열을 밖으로 노출하는가?\n   배열을 반환하거나 필드에 저장하거나 다른 메서드에 넘겨 오염 가능성을 외부로 확장하면 위험하다.\n\n5. warning을 `@SuppressWarnings`로 숨기려는가?\n   먼저 API 모양을 바꿀 수 있는지 보고, 정말 읽기 전용 소비라면 `@SafeVarargs`가 더 명확한 계약이다.\n\n실무 기준으로는 \"경고가 귀찮다\"가 아니라 \"오염 경로가 없다는 설명을 코드 리뷰에서 말할 수 있다\"가 통과선이다.\n\n## API 설계 선택지\n\ngeneric varargs가 애매하면 다음 순서로 바꿔 본다.\n\n```java\n// 경고 경계가 생길 수 있음\nstatic void addAll(List<String>... groups) { }\n\n// 호출이 조금 길어져도 타입 경계가 선명함\nstatic void addAll(Collection<List<String>> groups) { }\n\n// 제네릭 복사가 목적이면 원소 타입과 생산자 경계를 분리\nstatic <T> void addAllTo(List<T> target, Collection<? extends T> source) { }\n```\n\nvarargs는 호출 편의성이 좋지만, public API에서 non-reifiable type과 결합하면 설명 비용이 생긴다. 내부 private helper에서 읽기 전용으로만 쓰고 `@SafeVarargs` 계약을 붙이는 정도가 가장 다루기 쉽다.\n\n## Oracle / JLS references\n\n- JLS 4.6 Type Erasure: https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.6\n- JLS 4.7 Reifiable Types: https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.7\n- JLS 4.12.2 Variables of Reference Type: https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.12.2\n- JLS 8.4.1 Formal Parameters: https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.4.1\n- JLS 15.12.4.2 Evaluate Arguments: https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html#jls-15.12.4.2\n- Oracle Java Tutorials, Non-Reifiable Types: https://docs.oracle.com/javase/tutorial/java/generics/nonReifiableVarargsType.html\n- `java.lang.SafeVarargs` API: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/SafeVarargs.html\n\n## 검증 질문\n\n1. `List<String>`이 non-reifiable type인 이유를 `names.getClass() == numbers.getClass()` 예시로 설명할 수 있는가?\n2. `List<String>...` 파라미터가 내부에서 배열이라는 점이 왜 heap pollution 위험을 만드는가?\n3. `Object[] array = stringLists; array[0] = List.of(42);`가 왜 `ArrayStoreException`이 아니라 나중의 `ClassCastException`으로 이어질 수 있는가?\n4. `@SafeVarargs`를 붙이기 전에 \"배열에 쓰지 않는다\", \"배열을 노출하지 않는다\", \"읽기 전용으로 소비한다\"를 코드에서 확인했는가?\n5. public API에서 `List<T>...` 대신 `Collection<List<T>>` 또는 `List<List<T>>`를 받는 편이 더 나은 상황을 설명할 수 있는가?\n\n## 한 줄 정리\n\ngeneric varargs warning은 컴파일러가 예민해서 생기는 소음이 아니라, 배열은 런타임 원소 타입을 검사하고 제네릭은 런타임 타입 인자를 잃는다는 두 규칙이 충돌하는 지점이다. `@SafeVarargs`는 그 충돌이 실제 오염 경로로 이어지지 않는다는 작성자의 검증된 선언일 때만 붙인다.\n",
+  "aliases": [
+    "Java varargs heap pollution",
+    "varargs heap pollution type erasure",
+    "non reifiable varargs",
+    "parameterized vararg type warning",
+    "Possible heap pollution from parameterized vararg type",
+    "@SafeVarargs 조건",
+    "List<String>... 위험",
+    "제네릭 varargs 경고",
+    "타입 소거와 heap pollution",
+    "non-reifiable type Java",
+    "Generic",
+    "Reflection"
+  ],
+  "expected_queries": [
+    "Java에서 List<String>... varargs가 왜 heap pollution warning을 만들까?",
+    "type erasure와 non-reifiable type 때문에 generic varargs가 위험한 이유를 설명해줘",
+    "@SafeVarargs를 붙여도 되는 조건과 붙이면 안 되는 조건을 예제로 알려줘",
+    "List<String>... 파라미터에서 Object[]로 바꿔 담으면 왜 ClassCastException이 날 수 있어?",
+    "배열 covariance와 제네릭 invariance가 varargs heap pollution에서 어떻게 만나는지 알려줘"
+  ],
+  "symptoms": [
+    "List<String>... 파라미터에 왜 unchecked warning이 뜨는지 type erasure와 배열 생성 경계로 설명하지 못해",
+    "@SafeVarargs를 경고 제거용 어노테이션으로만 보고 실제로 안전한 메서드인지 검증하지 않는다",
+    "배열은 공변이고 제네릭은 불공변이라는 차이를 알지만 varargs에서 둘이 섞일 때 heap pollution이 왜 생기는지 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-generics-basics",
+      "language/generic-type-erasure-workarounds",
+      "language/java-array-common-confusion-checklist"
+    ],
+    "next_docs": [
+      "language/generic-type-erasure-workarounds",
+      "language/reflection-generics-annotations",
+      "language/java-array-equality-basics",
+      "language/java-generics-erasure-vs-reflection-intermediate-bridge"
+    ],
+    "confusable_with": [
+      "language/java-generics-basics",
+      "language/generic-type-erasure-workarounds",
+      "language/java-generics-erasure-vs-reflection-intermediate-bridge",
+      "language/java-array-common-confusion-checklist",
+      "language/java-array-equality-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/varargs-heap-pollution-type-erasure-primer.md",
+    "revision_history": []
+  }
+}

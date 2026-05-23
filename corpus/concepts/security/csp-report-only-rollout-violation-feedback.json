@@ -1,0 +1,51 @@
+{
+  "id": "security/csp-report-only-rollout-violation-feedback",
+  "title": "CSP Report-Only Rollout / Violation Feedback",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 CSP Report-Only Rollout / Violation Feedback를 다루는 deep_dive 문서다. CSP는 처음부터 강제하면 깨질 수 있으므로, report-only로 위반을 관찰하고 점진적으로 정책을 강화하는 rollout이 실무적이다. 검색 질의가 CSP report-only, Content-Security-Policy-Report-Only, violation report, rollout처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# CSP Report-Only Rollout / Violation Feedback\n\n> 한 줄 요약: CSP는 처음부터 강제하면 깨질 수 있으므로, report-only로 위반을 관찰하고 점진적으로 정책을 강화하는 rollout이 실무적이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [CSP Nonces / Hashes / Script Policy](./csp-nonces-vs-hashes-script-policy.md)\n> - [Session Fixation, Clickjacking, CSP](./session-fixation-clickjacking-csp.md)\n> - [XSS / CSRF / Spring Security](./xss-csrf-spring-security.md)\n> - [Browser Storage Threat Model for Tokens](./browser-storage-threat-model-for-tokens.md)\n> - [HTTPS / HSTS / MITM](./https-hsts-mitm.md)\n\nretrieval-anchor-keywords: CSP report-only, Content-Security-Policy-Report-Only, violation report, rollout, script-src, frame-ancestors, strict CSP, browser telemetry, policy hardening\n\n---\n\n## 핵심 개념\n\nCSP(Content-Security-Policy)는 브라우저가 어떤 리소스를 허용할지 정하는 정책이다.  \n하지만 보안 정책을 한 번에 강제하면 레거시가 깨질 수 있다. 그래서 `report-only`가 중요하다.\n\n`report-only`의 역할:\n\n- 위반을 실제 차단하지 않고 관찰한다\n- 어떤 script/style/frame가 문제인지 찾는다\n- rollout 전에 깨질 지점을 미리 발견한다\n\n즉 CSP rollout은 \"정책을 더한다\"가 아니라 \"정책을 관찰하며 강화한다\"다.\n\n---\n\n## 깊이 들어가기\n\n### 1. report-only의 목적\n\n처음부터 강제하면 다음 문제가 생긴다.\n\n- inline script가 많아 앱이 깨진다\n- 서드파티 widget이 작동하지 않는다\n- 스타일이나 iframe이 사라진다\n\nreport-only는 이런 영향 범위를 먼저 본다.\n\n### 2. violation report는 운영 신호다\n\n브라우저가 위반을 보고하면 다음을 알 수 있다.\n\n- 어떤 page가 위반했는가\n- 어떤 directive가 깨졌는가\n- 어떤 resource URL이 문제였는가\n\n이 데이터를 모으면 정책을 수축시킬 수 있다.\n\n### 3. rollout은 단계적으로 해야 한다\n\n권장 순서:\n\n1. report-only로 시작\n2. 위반 빈도가 높은 경로를 정리\n3. `script-src`, `frame-ancestors`, `object-src`부터 강화\n4. 일부 페이지에만 enforce\n5. 전체 enforce\n\n### 4. report endpoint도 안전해야 한다\n\nviolation report는 외부에서 들어오는 입력이다.\n\n- 크기가 클 수 있다\n- 빈도가 많을 수 있다\n- 스팸성 데이터가 들어올 수 있다\n\n따라서 rate limit과 저장 한도를 둬야 한다.\n\n### 5. 정책이 너무 느슨하면 report-only만 남는다\n\n운영 편의 때문에 영원히 report-only에 머무르면 안 된다.\n\n- 경고만 쌓인다\n- 실제 방어는 생기지 않는다\n\n그래서 rollout deadline을 정해야 한다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 레거시 앱이 inline script를 너무 많이 씀\n\n대응:\n\n- report-only로 위반을 먼저 수집한다\n- nonce 또는 hash로 전환한다\n- inline script를 줄인다\n\n### 시나리오 2: CSP를 enforce했더니 third-party widget이 깨짐\n\n대응:\n\n- 필요한 host만 allowlist에 넣는다\n- widget을 isolated iframe으로 분리한다\n- 예외를 최소화한다\n\n### 시나리오 3: violation report가 너무 많이 들어옴\n\n대응:\n\n- report endpoint에 rate limit을 둔다\n- 샘플링을 적용한다\n- 중복 위반을 집계한다\n\n---\n\n## 코드로 보기\n\n### 1. report-only header\n\n```http\nContent-Security-Policy-Report-Only: default-src 'self'; script-src 'self' 'nonce-abc'; report-uri /csp-report\n```\n\n### 2. enforce로 전환\n\n```http\nContent-Security-Policy: default-src 'self'; script-src 'self' 'nonce-abc'; object-src 'none'; frame-ancestors 'none'\n```\n\n### 3. report 수집 개념\n\n```java\npublic void handleCspReport(CspReport report) {\n    rateLimiter.assertAllowed(\"csp-report:\" + report.page(), 100, Duration.ofMinutes(1));\n    cspViolationStore.save(report.sanitized());\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| report-only | 안전하게 관찰한다 | 실제 방어는 안 된다 | 초기 rollout |\n| partial enforce | 일부 경로부터 적용 가능 | 정책 일관성이 떨어질 수 있다 | 전환기 |\n| full enforce | 방어력이 높다 | 레거시가 깨질 수 있다 | 충분히 정리된 앱 |\n| overly loose policy | 쉽다 | 방어력이 약하다 | 피해야 함 |\n\n판단 기준은 이렇다.\n\n- inline script가 얼마나 남아 있는가\n- report endpoint를 운영할 수 있는가\n- 언제 enforce로 바꿀 것인가\n- 위반 데이터를 실제로 정리할 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: CSP report-only는 왜 필요한가요?\n> 의도: 안전한 rollout의 목적을 아는지 확인\n> 핵심: 실제 차단 전에 위반과 영향 범위를 관찰하기 위해서다.\n\n> Q: violation report는 무엇을 알려주나요?\n> 의도: 관측 신호를 이해하는지 확인\n> 핵심: 어떤 directive와 resource가 위반됐는지 보여준다.\n\n> Q: report-only만 계속 두면 안 되는 이유는 무엇인가요?\n> 의도: 경고와 방어의 차이를 아는지 확인\n> 핵심: 실제 보안 방어가 생기지 않기 때문이다.\n\n> Q: report endpoint도 왜 보호해야 하나요?\n> 의도: 브라우저 telemetry도 공격면이라는 점을 아는지 확인\n> 핵심: 대량 spam과 abuse가 가능하기 때문이다.\n\n## 한 줄 정리\n\nCSP report-only는 정책을 안전하게 관찰하는 전환 단계이고, 위반 데이터는 최종 enforce를 위한 운영 신호다.\n",
+  "aliases": [
+    "CSP report-only",
+    "Content-Security-Policy-Report-Only",
+    "violation report",
+    "rollout",
+    "script-src",
+    "frame-ancestors",
+    "strict CSP",
+    "browser telemetry",
+    "policy hardening",
+    "CSP Report-Only Rollout / Violation Feedback",
+    "csp report only rollout violation feedback"
+  ],
+  "expected_queries": [
+    "CSP Report-Only Rollout / Violation Feedback 핵심 개념을 설명해줘",
+    "CSP report-only가 왜 필요한지 알려줘",
+    "CSP Report-Only Rollout / Violation Feedback 실무 설계 포인트는 뭐야?",
+    "CSP report-only에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`CSP Report-Only Rollout / Violation Feedback`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
+    "`CSP Report-Only Rollout / Violation Feedback` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`CSP Report-Only Rollout / Violation Feedback`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/xss-csrf-basics"
+    ],
+    "next_docs": [
+      "security/csp-nonces-vs-hashes-script-policy"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/csp-report-only-rollout-violation-feedback.md",
+    "revision_history": []
+  }
+}

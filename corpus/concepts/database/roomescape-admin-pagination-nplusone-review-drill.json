@@ -1,0 +1,46 @@
+{
+  "id": "database/roomescape-admin-pagination-nplusone-review-drill",
+  "title": "Roomescape Admin Pagination N Plus One Review Drill",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 drill은 roomescape-admin 목록 API의 N+1과 pagination fetch plan을 복습한다.",
+  "body_markdown": "# Roomescape Admin Pagination N Plus One Review Drill\n\n## 질문\n\n관리자 예약 목록 20개를 조회했더니 SQL이 21번 나간다. 바로 fetch join을 붙이기 전에 어떤 증거를 확인해야 할까?\n\n## 기대 답변 축\n\n먼저 SQL 로그(SQL log)에서 요청 하나에 실제 query가 몇 번 나가는지 확인한다. 단순히 \"21번\"이라는 숫자보다 중요한 증거는 반복 패턴이다. 예를 들어 reservation page query 1번 뒤에 `member where id = ?`, `theme where id = ?`, `time where id = ?`가 행마다 반복되면 지연 로딩(lazy loading)으로 인한 N+1 후보가 된다. 반대로 count query, 권한 조회, session 조회가 섞여 있을 수도 있으니 같은 연관 조회가 page size에 비례하는지 봐야 한다.\n\n그 다음 \"페이지 기준 row가 무엇인가\"를 말한다. 관리자 예약 목록의 기준은 reservation이다. fetch join을 붙였을 때 reservation 한 건이 child row 수만큼 늘어나면 offset/limit과 count가 흔들릴 수 있다. 특히 collection fetch join과 pagination 조합은 중복 row, 잘못된 count, 메모리 페이지네이션을 만들 수 있다. To-one 연관 fetch는 상대적으로 단순하지만, 그래도 실행 SQL과 count query를 확인해야 한다.\n\n해결책은 화면 요구에 맞춘다. 목록에서 필요한 값이 예약 날짜, 회원 이름, 테마 이름, 시간 문자열 정도라면 DTO projection이 명확하다. Entity graph나 fetch join은 도메인 entity를 실제로 사용해야 할 때 검토한다. Batch size는 query 수를 줄이는 완화책이지 필요한 column만 읽는다는 보장은 없다.\n\n## 채점 기준\n\n좋은 답변은 query 수만 줄이는 이야기가 아니라 \"목록의 정확성\"을 같이 지킨다.\n\n- SQL 로그를 요청 단위로 묶고, content query, count query, 인증/session query, lazy association query를 분리한다.\n- 반복 SQL이 page size에 비례하는지 확인한다. 20건에서 21번, 50건에서 51번처럼 늘면 N+1 신호가 강하다.\n- `Reservation`이 page의 기준 row라는 불변식(invariant)을 먼저 둔다. 조인 때문에 같은 reservation이 여러 row로 불어나면 `totalElements`, offset, limit, 응답 중복이 깨질 수 있다.\n- to-one fetch join과 collection fetch join을 구분한다. `Reservation -> Member/Theme/Time` 같은 to-one은 row 수를 늘리지 않는 경우가 많지만, count query에는 fetch join을 섞지 않고 실제 SQL을 확인해야 한다.\n- `@OneToMany` collection fetch join에 `Pageable`을 붙이는 선택은 조심한다. Hibernate가 in-memory pagination 경고를 내거나, DB가 반환한 row가 커지고 `distinct`가 ORM de-duplication 비용만 숨길 수 있다.\n- 목록 전용이면 DTO projection 또는 query model을 우선 검토한다. entity graph/fetch join은 entity 상태와 도메인 로직이 필요한 경우에만 선택한다.\n\n## 검증 질문\n\n리뷰 답변 뒤에는 다음 질문까지 이어져야 한다.\n\n1. \"현재 query log에서 반복되는 FK 조회는 어느 연관인가?\"\n2. \"content query와 count query의 where 조건은 같은가, fetch join은 count에서 빠져 있는가?\"\n3. \"page size를 바꿔도 query 수가 상수에 가깝게 유지되는가?\"\n4. \"응답의 reservation id가 중복되지 않고, `totalElements`가 실제 필터 결과와 맞는가?\"\n5. \"Hibernate in-memory pagination 경고나 불필요한 wide row 전송이 없는가?\"\n\n## 흔한 오답\n\n- \"N+1이면 무조건 fetch join\"이라고 답한다.\n- count query가 content query와 같은 fetch join을 써도 된다고 본다.\n- `distinct`를 붙이면 pagination row explosion이 완전히 해결된다고 말한다.\n- query count만 줄이고 응답 row 중복, total count, 필요한 column 범위를 검증하지 않는다.\n- 관리자 목록처럼 읽기 전용 화면인데 entity 전체 로딩을 기본값으로 둔다.\n\n## 짧은 모범 답변\n\n\"먼저 SQL 로그를 요청 단위로 묶어서 count query와 인증 query를 제외하고, reservation 20건 뒤에 member/theme/time 조회가 행마다 반복되는지 봅니다. 그다음 page의 기준 row가 reservation이라는 걸 지켜야 하므로 collection fetch join을 pagination에 바로 붙이면 중복 row, 잘못된 count, in-memory pagination 위험이 있습니다. 목록에 필요한 필드가 고정이면 DTO projection으로 content query와 count query를 분리하고, to-one fetch join이나 entity graph는 실제 SQL과 count query를 확인하면서 선택하겠습니다.\"\n\n## 약점 태그\n\n`sql-log`, `n-plus-one`, `pagination-fetch-plan`\n\n## 복습 연결 concept\n\n약하면 `roomescape-admin-pagination-n-plus-one-triage-bridge`와 `join-n-plus-one-interview-router`로 돌아간다. 답변이 \"fetch join 쓰면 됩니다\"에서 멈추면 아직 부족하다. 좋은 답은 관찰 증거, 기준 row 불변식(invariant), fetch plan tradeoff를 순서대로 말한다.\n",
+  "aliases": [
+    "roomescape admin pagination n plus one drill",
+    "룸이스케이프 관리자 N+1 드릴",
+    "reservation list SQL log review drill",
+    "pagination fetch plan 복습"
+  ],
+  "expected_queries": [
+    "roomescape 관리자 목록 N+1 드릴 내줘",
+    "SQL 21번 나가는 목록 조회를 어떻게 분석할지 복습하고 싶어",
+    "pagination fetch plan 질문 풀어볼래"
+  ],
+  "symptoms": [
+    "목록 20건 조회에 SQL이 21번 나갑니다",
+    "fetch join 뒤 count query가 이상합니다",
+    "DTO projection과 entity graph 기준이 없습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/roomescape-admin-pagination-n-plus-one-triage-bridge"
+    ],
+    "next_docs": [
+      "database/join-n-plus-one-interview-router",
+      "spring/roomescape-admin-search-pagination-query-model-bridge"
+    ],
+    "confusable_with": [
+      "database/roomescape-admin-pagination-n-plus-one-triage-bridge",
+      "spring/roomescape-admin-search-pagination-query-model-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/roomescape-admin-pagination-nplusone-review-drill.md",
+    "revision_history": []
+  }
+}

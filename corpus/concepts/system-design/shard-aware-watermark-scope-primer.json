@@ -1,0 +1,52 @@
+{
+  "id": "system-design/shard-aware-watermark-scope-primer",
+  "title": "Shard-Aware Watermark Scope Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "이 문서는 system-design 카테고리에서 Shard-Aware Watermark Scope Primer를 다루는 primer 문서다. shard가 나뉘면 outbox id나 commit position은 더 이상 \"전체 시스템 공용 번호표\"가 아니므로, beginner 단계에서는 **같은 shard 안에서만 비교되는 watermark scope**를 먼저 고르고 그 scope를 event와 projection 양쪽에 같이 적는 편이 가장 안전하다. 검색 질의가 shard aware watermark scope primer, outbox id not comparable across shards, commit lsn not globally comparable, per shard watermark beginner처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Shard-Aware Watermark Scope Primer\n\n> 한 줄 요약: shard가 나뉘면 outbox id나 commit position은 더 이상 \"전체 시스템 공용 번호표\"가 아니므로, beginner 단계에서는 **같은 shard 안에서만 비교되는 watermark scope**를 먼저 고르고 그 scope를 event와 projection 양쪽에 같이 적는 편이 가장 안전하다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Outbox Watermark Token Primer](./outbox-watermark-token-primer.md)\n- [Projection Applied Watermark Basics](./projection-applied-watermark-basics.md)\n- [Change Data Capture / Outbox Relay](./change-data-capture-outbox-relay-design.md)\n- [Database Scaling Primer](./database-scaling-primer.md)\n- [Shard Rebalancing / Partition Relocation 설계](./shard-rebalancing-partition-relocation-design.md)\n- [Tenant Partition Strategy / Reassignment 설계](./tenant-partition-strategy-reassignment-design.md)\n- [system design 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: shard aware watermark scope primer, outbox id not comparable across shards, commit lsn not globally comparable, per shard watermark beginner, watermark scope beginner, shard watermark ordering scope, outbox id across shards, cdc position across shards, safe watermark scope choice, projection checkpoint per shard, shard local ordering, watermark scope vs global order, beginner sharding consistency primer, system-design-00077, shard aware watermark scope primer basics\n\n---\n\n## 먼저 잡을 mental model\n\n초보자에게 가장 쉬운 비유는 \"지점마다 따로 뽑는 대기표\"다.\n\n- 강남점 대기표 `101`\n- 종로점 대기표 `101`\n\n둘 다 `101`이어도 어느 쪽이 더 먼저인지 알 수는 없다.\n번호가 같아도 **같은 창구에서 뽑힌 표가 아니기 때문**이다.\n\nshard 환경의 outbox id나 commit position도 비슷하다.\n\n> 숫자 자체보다 먼저 봐야 하는 것은 \"이 숫자가 어느 shard의 번호인가?\"다.\n\n그래서 beginner 단계에서는 이렇게 생각하면 된다.\n\n- `watermark`는 숫자만으로 완성되지 않는다\n- `scope`까지 붙어야 비교가 된다\n- 가장 안전한 scope는 보통 `same shard` 또는 `same partition`\n\n## 왜 shard가 생기면 직접 비교가 깨지나\n\n단일 DB일 때는 아래 가정이 자주 성립한다.\n\n- outbox table이 하나다\n- auto-increment id가 하나다\n- commit log도 한 줄로 흐른다\n\n그래서 `9002 > 9001`이면 대체로 \"뒤에 일어난 변경\"처럼 설명할 수 있다.\n\n하지만 shard가 나뉘면 상황이 달라진다.\n\n| 환경 | 값 예시 | 왜 쉬웠나 / 왜 깨지나 |\n|---|---|---|\n| 단일 DB | `outbox.id=9001 -> 9002` | 같은 카운터라서 비교가 단순하다 |\n| shard A | `outbox.id=9001` | shard A 안에서는 의미가 있다 |\n| shard B | `outbox.id=9001` | shard B 안에서는 의미가 있지만 shard A와는 직접 비교 불가 |\n| shard A LSN | `16/B374` | A 안에서는 commit 순서를 설명할 수 있다 |\n| shard B LSN | `16/B400` | 숫자가 커 보여도 A보다 \"나중\"이라고 단정 불가 |\n\n핵심은 이것이다.\n\n- auto-increment는 보통 shard마다 따로 돈다\n- commit position도 보통 shard마다 따로 생긴다\n- shard마다 clock, failover, relay 진행 속도도 다르다\n\n즉 `id=9001`이나 `lsn=16/B374`만 들고 와서\n\"그러면 다른 shard의 `8999`보다 최신이네요?\"라고 말하면 위험하다.\n\n## 가장 흔한 오해\n\n초보자는 다음 문장을 자주 섞는다.\n\n- \"숫자가 더 크면 더 최신이다\"\n- \"commit position이니까 전역 순서다\"\n- \"outbox id는 결국 순번이니 전체 비교 가능하다\"\n\n하지만 shard가 둘 이상이면 보통 아래처럼 바뀐다.\n\n| 문장 | 실제로 안전한 해석 |\n|---|---|\n| 숫자가 더 크면 더 최신이다 | **같은 shard 안에서만** 대체로 맞다 |\n| commit position이면 전역 순서다 | 보통은 **해당 DB 로그 안에서만** 순서다 |\n| outbox id는 전체 비교 가능하다 | 보통은 **같은 outbox table 범위에서만** 비교 가능하다 |\n| watermark 하나만 들고 다니면 된다 | 보통은 `scope + value`가 같이 필요하다 |\n\n짧게 줄이면:\n\n> shard가 생기면 `9001`은 숫자가 아니라 `(scope, 9001)`로 읽어야 한다.\n\n## beginner에게 가장 안전한 ordering scope\n\n처음부터 글로벌 총순서를 만들려 하지 않는 편이 낫다.\nbeginner 단계에서는 아래 우선순위가 안전하다.\n\n1. **같은 aggregate**\n2. **같은 shard 또는 같은 partition**\n3. 정말 필요할 때만 더 넓은 scope\n\n이유는 간단하다.\n\n- 실제 사용자 질문은 대부분 \"이 주문\", \"이 계정\", \"이 tenant\" 단위다\n- 그 단위는 대개 한 shard에 라우팅된다\n- 그러면 같은 shard 안의 monotonic sequence로도 설명이 충분하다\n\n가장 쉬운 기본 규칙은 이것이다.\n\n> \"이 read가 참조하는 source row들이 같은 shard에 모여 있다면, watermark scope도 그 shard로 잡는다.\"\n\n## 어떤 scope를 고르면 쉬운가\n\n| scope 후보 | beginner 적합도 | 언제 안전한가 | 주의할 점 |\n|---|---|---|---|\n| per-aggregate sequence | 높음 | 한 aggregate의 write 순서만 보면 될 때 | aggregate끼리 직접 비교 불가 |\n| per-shard outbox id | 높음 | 한 shard가 단일 monotonic counter를 가질 때 | shard id를 같이 들고 다녀야 한다 |\n| per-partition commit position | 중간 | CDC/stream partition 기준 처리일 때 | partition 이동 시 scope metadata 보강 필요 |\n| global timestamp | 낮음 | 로그 참고용으로만 쓸 때 | ordering 기준으로는 약하다 |\n| synthetic global sequencer | 낮음 | 정말 전역 순서가 제품 요구일 때 | beginner 단계에는 과하다 |\n\n보통 beginner-friendly 선택은 둘 중 하나다.\n\n- `required_watermark = { shard_id, outbox_id }`\n- `required_watermark = { partition_key, commit_position }`\n\n즉 숫자 하나가 아니라 **작은 튜플**로 들고 가는 쪽이 안전하다.\n\n## 주문 예시로 보기\n\n주문 시스템이 shard A, shard B로 나뉘어 있다고 하자.\n\n```text\nshard A\n- order 101\n- outbox.id = 9001\n\nshard B\n- order 202\n- outbox.id = 9001\n```\n\n둘 다 `9001`이 나올 수 있다.\n하지만 아래 질문에는 답할 수 없다.\n\n- \"A의 9001이 B의 9001보다 먼저인가?\"\n\n대신 아래 질문은 답할 수 있다.\n\n- \"주문 101의 read model이 shard A의 9001까지 따라왔는가?\"\n- \"주문 202의 read model이 shard B의 9001까지 따라왔는가?\"\n\n그래서 event도 이렇게 적는 편이 낫다.\n\n```json\n{\n  \"order_id\": \"101\",\n  \"watermark_scope\": \"orders-shard-A\",\n  \"required_watermark\": 9001\n}\n```\n\nprojection도 같은 scope로 checkpoint를 남긴다.\n\n```text\nprojection checkpoint\n- scope=orders-shard-A, applied_watermark=8998\n- scope=orders-shard-B, applied_watermark=9010\n```\n\n그러면 read path는 이렇게 본다.\n\n```pseudo\nif projection.scope != event.watermarkScope:\n  return fallback(\"scope mismatch\")\n\nif projection.appliedWatermark < event.requiredWatermark:\n  return fallback(\"not caught up\")\n\nreturn serveProjection()\n```\n\n여기서 중요한 점은 `8998 < 9010` 같은 cross-shard 비교가 아니다.\n항상 **같은 scope 안에서만** 비교한다는 점이다.\n\n## projection 쪽 checkpoint도 scope를 따라가야 한다\n\nsource event만 scope-aware라고 끝나지 않는다.\nprojection이 저장하는 `applied_watermark`도 같은 scope 규칙을 따라야 한다.\n\n나쁜 예:\n\n- event는 `orders-shard-A:9001`\n- projection checkpoint는 그냥 `9005`\n\n이러면 `9005`가 어느 shard 기준인지 몰라서 비교가 무너진다.\n\n좋은 예:\n\n- event는 `scope=orders-shard-A, required=9001`\n- projection checkpoint도 `scope=orders-shard-A, applied=9005`\n\nbeginner 체크 문장으로 줄이면 이렇다.\n\n- event가 scope를 말하면\n- projection도 같은 scope를 말해야 하고\n- read path는 scope가 같을 때만 숫자를 비교한다\n\n## \"글로벌 순서가 꼭 필요해 보이는\" 상황은 어떻게 보나\n\n초보자는 종종 이렇게 묻는다.\n\n- \"전체 주문 목록이면 shard 여러 개를 한 화면에 섞는데요?\"\n- \"그러면 결국 전역 순서가 필요한 것 아닌가요?\"\n\n항상 그런 것은 아니다.\n\n먼저 나눠 보면 된다.\n\n| 질문 | beginner 기본 답 |\n|---|---|\n| 단건 상세가 최신이어야 하나 | per-shard scope로 충분한 경우가 많다 |\n| 한 사용자가 방금 본 같은 주문이 뒤로 가면 안 되나 | 그 주문 key 기준 scope면 충분할 때가 많다 |\n| 여러 shard 데이터를 정확한 전역 사건 순서로 정렬해야 하나 | 이때는 별도 설계가 필요할 수 있다 |\n\n즉, 제품 요구가 \"전역 총순서\"인지,\n아니면 \"같은 엔티티에 대한 안전한 최신선\"인지를 먼저 나눠야 한다.\n\n대부분의 beginner 문제는 두 번째다.\n\n## 안전한 기본 선택 규칙\n\n아래 규칙이면 처음 설계에서 크게 틀리지 않는다.\n\n1. 사용자가 실제로 확인하려는 최신성이 어느 엔티티 범위인지 적는다\n2. 그 엔티티가 항상 같은 shard/partition으로 가는지 확인한다\n3. 그렇다면 그 shard/partition을 watermark scope로 잡는다\n4. event와 projection 양쪽에 같은 scope를 저장한다\n5. read에서는 scope가 같을 때만 watermark 숫자를 비교한다\n\n짧은 결정표로 보면:\n\n| 상황 | safe default scope |\n|---|---|\n| 주문 상세 | `order shard` 또는 `order aggregate` |\n| 계정 프로필 | `account shard` |\n| tenant별 대시보드 | `tenant shard` 또는 `tenant partition` |\n| 여러 tenant를 한 번에 합친 운영 보고서 | beginner 범위를 넘을 수 있으므로 별도 설계 검토 |\n\n## 자주 나오는 실수\n\n- shard id 없이 outbox id만 event에 넣는다\n  - 나중에 같은 숫자가 다른 shard에도 나와 비교가 흐려진다.\n- projection checkpoint를 전역 숫자 하나로 저장한다\n  - 실제로는 shard별 따라온 정도가 다른데 한 숫자로 뭉개진다.\n- partition relocation 후에도 예전 scope 이름을 그대로 믿는다\n  - scope 정의가 \"논리 shard\"인지 \"물리 DB\"인지 구분해야 한다.\n- timestamp를 global order 대용으로 쓴다\n  - clock skew와 동시 commit 때문에 beginner 설명이 오히려 더 어려워진다.\n- cross-shard compare 결과를 제품 로직에 바로 쓴다\n  - \"더 큰 숫자니까 더 최신\"이라는 잘못된 가정이 들어간다.\n\n## 운영에서 최소한 보고 싶은 신호\n\n운영도 복잡하게 시작할 필요는 없다.\n아래 다섯 개면 초반 진단이 쉬워진다.\n\n- `watermark_scope`\n- `required_watermark`\n- `applied_watermark`\n- `fallback_reason=scope_mismatch|watermark_lag`\n- `source_shard` 또는 `partition_key`\n\n이렇게 남기면 \"왜 fresh read로 우회했나\"를 숫자와 scope로 같이 설명할 수 있다.\n\n## common confusion\n\n- `commit_lsn`이면 무조건 전역적으로 비교된다\n  - 보통은 아니다. 같은 로그 스트림 안에서만 안전하다.\n- shard가 있어도 outbox id는 계속 증가하니 전체 정렬 가능하다\n  - shard별 카운터면 안 된다.\n- scope가 붙으면 복잡해 보인다\n  - 반대로 scope를 빼면 나중에 숫자의 의미를 설명할 수 없다.\n- 전역 화면이 하나라도 있으면 처음부터 global sequencer가 필요하다\n  - 단건 최신성 문제와 전역 정렬 문제를 먼저 분리해야 한다.\n\n## 30초 체크리스트\n\n- 이 watermark가 어느 shard/partition 범위의 숫자인지 이름이 붙어 있는가\n- event와 projection이 같은 scope를 쓰는가\n- read path가 scope mismatch를 따로 처리하는가\n- 숫자 비교를 cross-shard로 하지 않는가\n- 정말 전역 총순서가 필요한 요구인지 먼저 확인했는가\n\n## 한 줄 정리\n\nshard가 나뉘면 outbox id나 commit position은 숫자 alone으로는 의미가 약해지고, beginner 단계에서는 `same shard / same partition`처럼 비교 가능한 ordering scope를 먼저 고른 뒤 `scope + watermark`를 event와 projection 양쪽에 같이 저장하는 쪽이 가장 안전하다.\n",
+  "aliases": [
+    "shard aware watermark scope primer",
+    "outbox id not comparable across shards",
+    "commit lsn not globally comparable",
+    "per shard watermark beginner",
+    "watermark scope beginner",
+    "shard watermark ordering scope",
+    "outbox id across shards",
+    "cdc position across shards",
+    "safe watermark scope choice",
+    "projection checkpoint per shard",
+    "shard local ordering",
+    "watermark scope vs global order"
+  ],
+  "expected_queries": [
+    "Shard-Aware Watermark Scope Primer 설계 핵심을 설명해줘",
+    "shard aware watermark scope primer가 왜 필요한지 알려줘",
+    "Shard-Aware Watermark Scope Primer 실무 트레이드오프는 뭐야?",
+    "shard aware watermark scope primer 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Shard-Aware Watermark Scope Primer`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`Shard-Aware Watermark Scope Primer`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`Shard-Aware Watermark Scope Primer`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/db-read-replica-write-primary-routing-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/shard-aware-watermark-scope-primer.md",
+    "revision_history": []
+  }
+}

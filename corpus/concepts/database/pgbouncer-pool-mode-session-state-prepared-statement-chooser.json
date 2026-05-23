@@ -1,0 +1,60 @@
+{
+  "id": "database/pgbouncer-pool-mode-session-state-prepared-statement-chooser",
+  "title": "PgBouncer Pool Mode, Session State, and Prepared Statement Chooser",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# PgBouncer Pool Mode, Session State, and Prepared Statement Chooser\n\n> 한 줄 요약: PgBouncer의 `transaction` pooling은 DB backend 수를 줄이는 강력한 도구지만, application이 PostgreSQL session state에 기대고 있으면 prepared statement, temp table, `SET`, advisory lock, cursor 사용이 깨질 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Connection Pool Saturation Interview Router](./connection-pool-saturation-interview-router.md)\n- [Prepared Statement / Plan Cache / Parameter Sniffing Router](./prepared-statement-plan-cache-parameter-sniffing-router.md)\n- [Hikari Connection Pool Tuning](./hikari-connection-pool-tuning.md)\n- [Connection Pool, Transaction Propagation, Bulk Write](./connection-pool-transaction-propagation-bulk-write.md)\n- [PostgreSQL Idle in Transaction, Vacuum Horizon, Lock, and Pool Playbook](./postgresql-idle-in-transaction-vacuum-lock-pool-playbook.md)\n- [Transaction Timeout과 Lock Timeout](./transaction-timeout-vs-lock-timeout.md)\n\nretrieval-anchor-keywords: PgBouncer transaction pooling, PgBouncer session pooling, PgBouncer statement pooling, PgBouncer prepared statements, max_prepared_statements, transaction pool session state, SET LOCAL pgbouncer, temporary table transaction pooling, advisory lock transaction pooling, HikariCP PgBouncer pool sizing\n\n## 10초 선택표\n\n| pool mode | backend 점유 단위 | 잘 맞는 경우 | 위험한 session state |\n|---|---|---|---|\n| `session` | client connection 전체 | session state를 많이 쓰는 앱, 호환성 우선 | DB backend 절감 효과가 작다 |\n| `transaction` | transaction 하나 | 짧은 transaction이 많고 session state가 적은 앱 | prepared statement, temp table, session `SET`, session advisory lock |\n| `statement` | statement 하나 | 아주 제한적인 read/query proxy | multi-statement transaction 자체가 맞지 않는다 |\n\n기억법은 간단하다. PgBouncer가 DB backend를 더 자주 돌려 쓸수록 connection 수는 줄이기 쉽지만, **client가 같은 backend session을 계속 본다는 가정**은 약해진다.\n\n## 핵심 mental model\n\nJDBC/HikariCP 관점에서 connection 하나를 잡았다고 해도, PgBouncer `transaction` pool 뒤에서는 매 transaction마다 실제 PostgreSQL backend가 달라질 수 있다. application이 \"이 connection은 같은 DB session이다\"라고 생각하고 저장한 상태가 다음 transaction에서 사라지거나 다른 backend에 남아 있을 수 있다.\n\n그래서 PgBouncer 도입 질문은 \"pool을 하나 더 둬도 되나?\"가 아니다.\n\n- app pool: application thread가 DB 작업을 위해 connection을 빌리는 입구\n- PgBouncer pool: client connection을 실제 PostgreSQL backend connection에 매핑하는 proxy\n- PostgreSQL backend: session state, prepared statement, temp object, advisory lock이 실제로 붙는 위치\n\n이 세 층을 섞으면 Hikari timeout을 PgBouncer 설정으로 고치려 하거나, PgBouncer pool exhaustion을 application pool size 문제로 오해하게 된다.\n\n## Session state compatibility table\n\n| 기능 | session pooling | transaction pooling | 판단 |\n|---|---|---|---|\n| plain SQL query | 대체로 안전 | 대체로 안전 | transaction이 짧고 독립적이면 적합 |\n| `SET LOCAL` | transaction 안에서 안전 | transaction 안에서 안전 | transaction 종료와 함께 사라지는 상태라 맞다 |\n| session-level `SET` | 같은 session에 유지 | 다음 transaction에서 보장 약함 | `server_reset_query`와 app 가정 확인 |\n| temporary table | 같은 session에 유지 | backend 교체로 깨질 수 있음 | transaction pool과 잘 안 맞는다 |\n| cursor / named portal | session/transaction 경계 의존 | 위험 | driver fetch size, streaming query 확인 |\n| session advisory lock | 같은 backend session에 묶임 | 위험 | transaction-level advisory lock과 구분 |\n| transaction advisory lock | transaction 종료와 함께 해제 | 상대적으로 안전 | transaction boundary가 짧아야 한다 |\n| `LISTEN/NOTIFY` listener | session이 유지되어야 함 | 위험 | dedicated session 또는 다른 channel 필요 |\n\n이 표에서 핵심은 `SET LOCAL`과 `SET`을 구분하는 것이다. `SET LOCAL`은 transaction scope라 transaction pooling과 맞는 편이다. 반대로 session-level `SET search_path`, role, timezone, application-specific GUC, temp table은 같은 backend session이 유지된다는 가정을 만들기 쉽다.\n\n## Prepared statement caveat\n\n오래된 설명에서는 \"transaction pooling에서는 prepared statement가 안 된다\"라고 단정하는 경우가 많다. 이 문장은 너무 거칠다.\n\nPgBouncer 공식 기능 문서 기준으로도 prepared statement 지원은 mode와 설정에 따라 달라진다. 특히 최신 PgBouncer는 `max_prepared_statements`를 통해 protocol-level named prepared statement를 transaction/statement pooling에서도 추적할 수 있는 경로가 있다. 하지만 그렇다고 모든 driver/ORM prepared statement 사용이 자동으로 안전해지는 것은 아니다.\n\n확인할 것:\n\n- driver가 unnamed statement를 쓰는가, named prepared statement를 쓰는가\n- server-side prepare threshold가 켜져 있는가\n- PgBouncer `max_prepared_statements`가 0인지 아닌지\n- SQL text가 자주 바뀌어 prepared statement cache가 폭발하지 않는가\n- migration/DDL 후 cached plan invalidation을 어떻게 처리하는가\n\n즉 \"PgBouncer면 prepared statement 금지\"도 오개념이고, \"최신 PgBouncer면 다 안전\"도 오개념이다. 실제 driver protocol, PgBouncer 설정, pool mode, query shape를 같이 봐야 한다.\n\n## 장애 증상 router\n\n### 1. Transaction pooling 전환 후 prepared statement 에러\n\n증상:\n\n- prepared statement does not exist\n- duplicate prepared statement name\n- 특정 endpoint만 간헐적으로 실패\n\n분기:\n\n1. driver의 server-side prepare 설정을 확인한다.\n2. PgBouncer `max_prepared_statements`와 version을 확인한다.\n3. transaction pooling에서 session-level prepared statement 이름을 재사용하는지 본다.\n4. 임시 완화로 server-side prepare를 끄거나 session pooling으로 되돌리는 rollback path를 둔다.\n\n### 2. `search_path`, timezone, role이 간헐적으로 이상함\n\n증상:\n\n- 같은 application 코드인데 schema를 못 찾는다.\n- timezone/date formatting이 요청마다 달라진다.\n- tenant별 `SET` 상태가 섞인 것처럼 보인다.\n\n분기:\n\n- transaction 내부에서 `SET LOCAL`을 쓰면 transaction pooling과 맞는 편이다.\n- session-level `SET`에 기대면 backend 교체나 reset query 때문에 깨질 수 있다.\n- connection checkout마다 session state를 세팅하는 방식도 PgBouncer 뒤에서는 실제 backend session 보장을 다시 확인해야 한다.\n\n### 3. Pool을 늘렸는데 timeout이 그대로임\n\nHikari pool, PgBouncer pool, PostgreSQL `max_connections`는 같은 숫자가 아니다.\n\n봐야 할 지표:\n\n- application Hikari active/idle/pending\n- PgBouncer `SHOW POOLS`, `SHOW CLIENTS`, `SHOW SERVERS`\n- PostgreSQL `pg_stat_activity`\n- query latency, transaction duration, wait_event\n\nHikari pending이 높은데 PgBouncer server pool이 한가하면 application pool/transaction hold time을 먼저 본다. 반대로 Hikari는 여유가 있는데 PgBouncer `cl_waiting`이 늘면 PgBouncer pool이나 DB backend limit 쪽을 본다.\n\n## Migration checklist\n\nPgBouncer `transaction` pooling으로 바꾸기 전에는 아래를 확인한다.\n\n1. application이 temp table, session advisory lock, `LISTEN/NOTIFY`, session-level `SET`에 기대는가\n2. driver/ORM이 server-side prepared statement를 쓰는가\n3. 긴 streaming query나 cursor가 있는가\n4. transaction 안에 외부 I/O가 있어 backend를 오래 잡는가\n5. app pool size, PgBouncer pool size, PostgreSQL `max_connections`가 한꺼번에 과다 설정돼 있지 않은가\n6. rollback path로 session pooling 전환 또는 server-side prepare 비활성화가 준비돼 있는가\n\n## 흔한 오해\n\n- \"PgBouncer를 넣으면 DB connection 문제는 끝난다\"\n  - 아니다. transaction이 길면 backend도 오래 점유하고, app pool timeout도 여전히 난다.\n- \"transaction pooling은 모든 PostgreSQL 기능과 호환된다\"\n  - 아니다. session state에 기대는 기능은 별도 검증이 필요하다.\n- \"prepared statement는 PgBouncer에서 항상 불가능하다\"\n  - 아니다. 공식 기능은 설정과 버전에 따라 다르지만, driver/ORM과 query shape까지 검증해야 한다.\n- \"Hikari pool size와 PgBouncer pool size는 같은 기준으로 잡는다\"\n  - 아니다. 하나는 app thread 입구, 하나는 DB backend multiplexing layer다.\n\n## 검증 질문\n\n1. transaction pooling에서 `SET LOCAL`은 왜 비교적 안전하고 session-level `SET`은 왜 위험한가?\n2. temporary table과 `LISTEN/NOTIFY`가 transaction pooling과 잘 맞지 않는 이유는 무엇인가?\n3. `max_prepared_statements`가 있다고 해서 모든 prepared statement 문제가 사라지지 않는 이유는 무엇인가?\n4. Hikari pending과 PgBouncer `cl_waiting` 중 어느 지표가 먼저 증가했는지 왜 중요한가?\n5. PgBouncer transaction pooling 전환의 rollback path는 무엇이어야 하는가?\n\n## 한 줄 정리\n\nPgBouncer transaction pooling은 connection 절감 도구이지 session semantics 보존 도구가 아니므로, session state 사용 여부와 driver prepared statement 동작을 먼저 감사해야 안전하게 쓸 수 있다.\n",
+  "aliases": [
+    "PgBouncer transaction pooling",
+    "PgBouncer session pooling",
+    "PgBouncer statement pooling",
+    "PgBouncer prepared statements",
+    "transaction pool session state",
+    "pgbouncer SET LOCAL",
+    "pgbouncer temp table advisory lock",
+    "server-side prepared statement pgbouncer"
+  ],
+  "expected_queries": [
+    "PgBouncer transaction pooling에서 prepared statement와 session state가 왜 깨질 수 있어?",
+    "session pooling, transaction pooling, statement pooling 차이를 Spring/JDBC 관점으로 설명해줘",
+    "PgBouncer transaction pool에서 SET LOCAL과 SET, temp table, advisory lock은 어떻게 달라?",
+    "server-side prepared statement는 PgBouncer에서 항상 금지인지 max_prepared_statements 조건을 알려줘",
+    "HikariCP와 PgBouncer를 같이 쓰면 pool size와 timeout을 어디서부터 봐야 해?"
+  ],
+  "symptoms": [
+    "PgBouncer transaction pooling으로 바꾼 뒤 prepared statement, temporary table, SET session variable, advisory lock 동작이 이상해졌어",
+    "connection 수를 줄이려고 transaction pooling을 켰는데 application이 session state에 기대고 있었는지 확인해야 해",
+    "server-side prepared statement가 PgBouncer에서 완전히 안 된다고 배웠는데 버전과 max_prepared_statements 조건을 구분해야 해",
+    "Hikari pool과 PgBouncer pool을 둘 다 키워 두고 실제 병목이 app pool인지 proxy pool인지 DB backend인지 헷갈려",
+    "SET LOCAL, transaction-level advisory lock, session-level advisory lock을 pool mode별로 나눠 설명해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/connection-pool-saturation-interview-router",
+      "database/prepared-statement-plan-cache-parameter-sniffing-router",
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "database/hikari-connection-pool-tuning",
+      "database/connection-pool-transaction-propagation-bulk-write",
+      "database/postgresql-idle-in-transaction-vacuum-lock-pool-playbook",
+      "database/transaction-timeout-vs-lock-timeout"
+    ],
+    "confusable_with": [
+      "database/connection-pool-saturation-interview-router",
+      "database/prepared-statement-plan-cache-parameter-sniffing-router",
+      "database/hikari-connection-pool-tuning",
+      "database/postgresql-idle-in-transaction-vacuum-lock-pool-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/pgbouncer-pool-mode-session-state-prepared-statement-chooser.md",
+    "revision_history": []
+  }
+}

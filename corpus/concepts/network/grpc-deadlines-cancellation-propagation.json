@@ -1,0 +1,57 @@
+{
+  "id": "network/grpc-deadlines-cancellation-propagation",
+  "title": "gRPC Deadlines, Cancellation Propagation",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 gRPC deadline, grpc-timeout metadata, Context cancellation,",
+  "body_markdown": "# gRPC Deadlines, Cancellation Propagation\n\n> 한 줄 요약: gRPC에서 deadline은 전체 요청 예산이고 cancellation은 그 예산이 끝났다는 신호이므로, downstream까지 전파되지 않으면 느린 작업이 계속 돈다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [gRPC vs REST](./grpc-vs-rest.md)\n> - [Timeout 타입: connect, read, write](./timeout-types-connect-read-write.md)\n> - [Timeout Budget Propagation Across Proxy, Gateway, Service Hops](./timeout-budget-propagation-proxy-gateway-service-hop-chain.md)\n> - [monotonic clock, wall clock, timeout, deadline](../operating-system/monotonic-clock-wall-clock-timeout-deadline.md)\n> - [HTTP/2 멀티플렉싱과 HOL blocking](./http2-multiplexing-hol-blocking.md)\n> - [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)\n> - [gRPC Keepalive, GOAWAY, Max Connection Age](./grpc-keepalive-goaway-max-connection-age.md)\n> - [Client Disconnect, 499, Broken Pipe, Cancellation in Proxy Chains](./client-disconnect-499-broken-pipe-cancellation-proxy-chain.md)\n> - [gRPC Status, Trailers, Transport Error Mapping](./grpc-status-trailers-transport-error-mapping.md)\n> - [Spring MVC Async Dispatch with `Callable` / `DeferredResult`](../spring/spring-mvc-async-deferredresult-callable-dispatch.md)\n\nretrieval-anchor-keywords: gRPC deadline, cancellation propagation, grpc-timeout, Context, DEADLINE_EXCEEDED, CANCELLED, deadline budget, client disconnect, interceptor\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [운영 플레이북](#운영-플레이북reprotriagefailure-matrixvalidation)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\ngRPC는 단순한 RPC가 아니라, **호출 예산과 취소 신호를 명시적으로 전달하는 프로토콜**이다.\n\n- `deadline`: 요청 전체를 언제까지 끝내야 하는지\n- `timeout`: 개별 대기 구간에서 얼마나 기다릴지\n- `cancellation`: 이미 끝난 요청이나 사용자가 끊은 요청을 더 이상 진행하지 말라는 신호\n\n이 문서의 핵심은 deadline을 한 서비스에서만 보는 것이 아니라, **연쇄 호출 전체에 전파해야 한다**는 점이다.\n\n### Retrieval Anchors\n\n- `gRPC deadline`\n- `cancellation propagation`\n- `grpc-timeout`\n- `Context`\n- `DEADLINE_EXCEEDED`\n- `CANCELLED`\n- `deadline budget`\n- `interceptor`\n\n## 깊이 들어가기\n\n### 1. timeout과 deadline은 다르다\n\ntimeout은 보통 \"얼마나 더 기다릴까\"이고, deadline은 \"언제까지 끝나야 하나\"다.\n\n- timeout은 단계별 대기에 좋다\n- deadline은 전체 작업 예산 관리에 좋다\n\ngRPC에서는 deadline이 더 자연스럽다.\n\n- 클라이언트는 전체 요청 예산을 하나 잡는다\n- 각 hop은 남은 시간만 보고 진행한다\n- 시간이 다 되면 같은 예산 안에서 더 시도하지 않는다\n\n### 2. gRPC는 deadline을 어떻게 전달하나\n\ngRPC는 deadline 정보를 메타데이터로 전달한다.\n\n- 내부적으로 `grpc-timeout` 같은 값이 쓰인다\n- 서버와 클라이언트는 남은 시간을 기준으로 동작한다\n- interceptor나 middleware에서 이 값을 읽고 조정할 수 있다\n\n중요한 점은 이 값이 단순 로그가 아니라 **제어 신호**라는 것이다.\n\n### 3. cancellation propagation이 왜 중요한가\n\n클라이언트가 연결을 끊거나 deadline이 지나면, 서버는 그 사실을 빨리 알아야 한다.\n\n전파가 없으면 이런 일이 벌어진다.\n\n- 클라이언트는 이미 떠났는데 DB 쿼리는 계속 돈다\n- upstream은 응답할 곳이 없는데 CPU를 계속 쓴다\n- retry가 붙으면 같은 작업이 또 시작된다\n\n즉 cancellation은 \"친절한 종료\"가 아니라 **낭비를 멈추는 장치**다.\n\n### 4. context를 무시하면 무엇이 망가지나\n\ngRPC 서버 코드가 `Context`나 cancellation token을 무시하면:\n\n- 느린 downstream 호출을 중단하지 못한다\n- 작업 큐가 쌓인다\n- 이미 취소된 요청에 자원을 쓴다\n\n이 문제는 Java, Go, Kotlin, Python 어디서든 비슷하다.\n\n핵심은 \"지금 이 작업이 아직 살아 있는가?\"를 주기적으로 확인하는 것이다.\n\n### 5. deadline propagation은 retry와 같이 설계해야 한다\n\ndeadline이 있는데 retry가 마음대로 돌아가면 예산을 금방 초과한다.\n\n- 첫 호출이 늦었다\n- retry가 남은 시간을 거의 다 써 버린다\n- 마지막 hop은 이미 deadline 직전이다\n\n그래서 retry는 남은 budget을 본 뒤에 해야 한다.\ndeadline이 지나면 새 시도를 시작하지 않는 편이 맞다.\n\n## 실전 시나리오\n\n### 시나리오 1: 클라이언트는 취소했는데 서버는 계속 일한다\n\n전형적인 cancellation propagation 누락이다.\n\n- front-end는 페이지를 떠났다\n- gateway는 요청 종료를 받았다\n- downstream service는 아직도 DB 조회와 join을 하고 있다\n\n이때는 서버 코드의 context check와 interceptor를 먼저 본다.\n\n### 시나리오 2: gRPC 호출은 되었는데 DEADLINE_EXCEEDED가 많다\n\n원인이 단순히 \"timeout이 짧다\"가 아닐 수 있다.\n\n- HTTP/2 HOL blocking\n- DB lock\n- downstream retry\n- proxy timeout mismatch\n\n이런 것들이 남은 deadline을 갉아먹는다.\n\n### 시나리오 3: streaming RPC에서 중간에 끊긴다\n\nserver streaming, bidi streaming에서는 cancellation이 더 중요하다.\n\n- 클라이언트가 더 이상 받지 않으면 서버도 멈춰야 한다\n- 반대편이 죽었는데 계속 send하면 자원만 낭비한다\n\n### 시나리오 4: 배치성 호출에 deadline이 없다\n\ndeadline 없이 RPC를 보내면 장애 시 오래 붙잡히기 쉽다.\n\n- connection pool 고갈\n- worker thread 점유\n- retry 폭풍\n\n이 패턴은 [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)과 직접 연결된다.\n\n## 코드로 보기\n\n### Java client에서 deadline을 거는 예시\n\n```java\nUserServiceGrpc.UserServiceBlockingStub stub =\n    UserServiceGrpc.newBlockingStub(channel)\n        .withDeadlineAfter(500, TimeUnit.MILLISECONDS);\n\nUserResponse response = stub.getUser(request);\n```\n\n### Java server에서 cancellation을 확인하는 감각\n\n```java\nContext ctx = Context.current();\nif (ctx.isCancelled()) {\n    throw Status.CANCELLED.asRuntimeException();\n}\n```\n\n### interceptor로 deadline을 읽는 예시\n\n```java\npublic class DeadlineLoggingInterceptor implements ServerInterceptor {\n    @Override\n    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(\n            ServerCall<ReqT, RespT> call,\n            Metadata headers,\n            ServerCallHandler<ReqT, RespT> next) {\n\n        Deadline deadline = Context.current().getDeadline();\n        if (deadline != null) {\n            log.info(\"deadline remaining={}ms\", deadline.timeRemaining(TimeUnit.MILLISECONDS));\n        }\n        return next.startCall(call, headers);\n    }\n}\n```\n\n### 남은 시간을 downstream에 넘기는 감각\n\n```text\nremaining_budget = deadline - now\nnext_call_timeout = min(remaining_budget, per-hop_cap)\n```\n\n핵심은 각 hop이 자기 맘대로 새 timeout을 만드는 것이 아니라, **남은 예산을 나눠 쓰는 것**이다.\n\n## 운영 플레이북(Repro/Triage/Failure Matrix/Validation)\n\n### 재현(Repro)\n\n학습자가 \"DEADLINE_EXCEEDED인데 어디 timeout인지 모르겠어요\"라고 하면, deadline budget을 hop마다 보이게 만든다.\n\n1. caller deadline을 짧게 두고 `grpc-timeout` metadata가 downstream으로 전달되는지 본다.\n2. client cancel, caller deadline 초과, server-side policy timeout을 각각 따로 만든다.\n3. server interceptor에서 remaining budget, `Context` cancellation, downstream DB/RPC cancel 시각을 남긴다.\n4. retry가 새 budget을 만드는지, 남은 budget을 이어받는지 비교한다.\n\n### 분류(Triage)\n\n- client가 `DEADLINE_EXCEEDED`를 봤다는 것은 caller budget 초과의 증거(evidence)일 수 있지만, 특정 server handler가 느렸다는 증명(proof)은 아니다.\n- `CANCELLED`는 사용자 취소, upstream caller 취소, proxy reset mapping이 모두 될 수 있어 source를 따로 본다.\n- downstream 작업이 계속 돈다면 deadline 전달은 됐어도 cancellation propagation이 닿지 않았을 수 있다.\n\n### 실패 매트릭스(Failure matrix)\n\n| 학습자 관찰 | 우선 bucket | 잘못된 처방 |\n|---|---|---|\n| `grpc-timeout`이 downstream에 없다 | deadline propagation gap | 각 서비스 timeout만 늘린다 |\n| caller는 `DEADLINE_EXCEEDED`, server는 성공 로그 | late success after caller gave up | server 성공을 사용자 성공으로 본다 |\n| cancel 후 DB/RPC가 계속 돈다 | zombie work | gRPC Context cancel이 외부 call cancel까지 보장한다고 믿는다 |\n| retry가 새 deadline으로 다시 시작 | budget reset retry | retry 횟수를 늘려 성공률만 본다 |\n\n### 검증(Validation)\n\n- every-hop log에 remaining budget이 감소하는 방향으로 남아야 한다.\n- caller cancel 뒤 downstream DB/RPC가 중단되거나 짧은 timeout으로 수렴해야 한다.\n- retry는 남은 budget 안에서만 실행되고, deadline 초과 후 새 작업을 만들지 않아야 한다.\n- status code는 evidence이고, proof는 metadata, context cancellation, downstream stop event가 같은 timeline에 맞을 때만 말한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| hop별 timeout만 사용 | 구현이 단순하다 | 전체 예산이 흐려진다 | 아주 단순한 내부 호출 |\n| deadline propagation | 전체 요청 예산을 지킨다 | 구현과 관찰 포인트가 늘어난다 | 다단계 RPC |\n| cancellation 무시 | 코드가 쉬워 보인다 | 자원 낭비와 tail latency가 커진다 | 피해야 함 |\n\n핵심은 \"끝까지 기다리기\"가 아니라 **끝나야 할 요청을 빨리 정리하는 것**이다.\n\n## 꼬리질문\n\n> Q: deadline과 timeout의 차이는 무엇인가요?\n> 핵심: timeout은 기다리는 길이, deadline은 끝나야 하는 시각이다.\n\n> Q: cancellation propagation이 왜 중요한가요?\n> 핵심: 클라이언트가 떠난 요청에 자원을 계속 쓰면 latency와 비용이 함께 커진다.\n\n> Q: gRPC에서 deadline이 어디로 전달되나요?\n> 핵심: 메타데이터를 통해 전파되고, server/client interceptor에서 읽을 수 있다.\n\n## 한 줄 정리\n\ngRPC deadline은 전체 요청 예산이고 cancellation은 그 예산이 끝났다는 신호라서, downstream까지 전파해야 불필요한 작업과 retry 폭증을 막을 수 있다.\n",
+  "aliases": [
+    "gRPC deadline",
+    "cancellation propagation",
+    "grpc-timeout",
+    "DEADLINE_EXCEEDED CANCELLED",
+    "deadline budget",
+    "grpc Context interceptor"
+  ],
+  "expected_queries": [
+    "gRPC deadline과 timeout은 어떻게 다르고 cancellation propagation은 왜 중요해?",
+    "grpc-timeout과 Context를 downstream으로 전파하지 않으면 어떤 zombie work가 남아?",
+    "DEADLINE_EXCEEDED와 CANCELLED를 요청 예산과 사용자 취소 관점으로 구분해줘",
+    "retry가 deadline budget을 보지 않으면 gRPC 장애가 왜 증폭돼?",
+    "client disconnect를 gRPC cancellation으로 backend 작업 중단까지 연결하는 법을 알려줘"
+  ],
+  "symptoms": [
+    "DEADLINE_EXCEEDED를 한 서비스의 timeout 설정 문제로만 보고 전체 요청 예산 전파를 놓친다",
+    "client가 이미 취소했는데 downstream DB/RPC 작업이 계속 돌아 zombie work가 남는다",
+    "retry가 남은 deadline budget을 보지 않고 새 호출을 시작해 overload를 키운다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/grpc-vs-rest",
+      "network/timeout-budget-propagation-proxy-gateway-service-hop-chain"
+    ],
+    "next_docs": [
+      "network/grpc-deadline-exceeded-first-triage-card",
+      "network/grpc-status-trailers-transport-error-mapping",
+      "network/grpc-keepalive-goaway-max-connection-age",
+      "network/client-disconnect-499-broken-pipe-cancellation-proxy-chain"
+    ],
+    "confusable_with": [
+      "network/grpc-deadline-exceeded-first-triage-card",
+      "network/grpc-status-trailers-transport-error-mapping",
+      "network/timeout-budget-propagation-proxy-gateway-service-hop-chain",
+      "network/client-disconnect-499-broken-pipe-cancellation-proxy-chain",
+      "network/timeout-retry-backoff-practical",
+      "network/grpc-keepalive-vs-http2-ping-vs-tcp-keepalive-beginner-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/grpc-deadlines-cancellation-propagation.md",
+    "revision_history": []
+  }
+}

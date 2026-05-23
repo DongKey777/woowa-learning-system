@@ -1,0 +1,58 @@
+{
+  "id": "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer",
+  "title": "Spring Cache Abstraction — @Cacheable / @CacheEvict + Redis/Caffeine",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "'Spring Cache Abstraction은 *어노테이션 기반*으로 메서드 결과를 캐시한다.",
+  "body_markdown": "# Spring Cache Abstraction — @Cacheable / @CacheEvict + Redis/Caffeine\n\n> 한 줄 요약: `@Cacheable` + `CacheManager` Bean으로 *메서드 결과 자동 캐시*. Caffeine(JVM 내) / Redis(분산) 둘 다 swap 가능. Cache-Aside 패턴이 기본.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n```java\n@Service\nclass MemberService {\n    @Cacheable(value = \"members\", key = \"#id\")\n    public Member findById(Long id) {\n        return repository.findById(id).orElseThrow();\n    }\n\n    @CacheEvict(value = \"members\", key = \"#m.id\")\n    public void update(Member m) {\n        repository.save(m);\n    }\n}\n```\n\n`@Cacheable`이 *AOP proxy*로 작동:\n1. 호출 시 cache에 key 있나 확인\n2. 있으면 *반환* (메서드 미호출)\n3. 없으면 메서드 실행 후 결과 cache 저장\n\n`@CacheEvict`는 *update 시 cache 삭제* — 다음 read에 fresh.\n\n## 한 장 정리 — 핵심 어노테이션\n\n| 어노테이션 | 동작 | 사용 |\n|---|---|---|\n| `@Cacheable(value, key)` | 캐시 hit → 반환, miss → 메서드 호출 + 저장 | 조회 메서드 |\n| `@CacheEvict(value, key)` | 캐시 키 삭제 | 변경 메서드 |\n| `@CacheEvict(value, allEntries=true)` | 캐시 전체 비움 | 대량 변경 |\n| `@CachePut(value, key)` | 메서드 *호출 후 결과 저장* (캐시 hit 무시) | 변경 + 캐시 갱신 동시 |\n| `@Caching(...)` | 여러 어노테이션 묶음 | 복합 |\n| `@EnableCaching` | Application config에 한 번 | 활성화 |\n\n## CacheManager Bean — 구현 결정\n\n```java\n// 1. ConcurrentMapCacheManager (학습/테스트)\n@Bean\nCacheManager cacheManager() {\n    return new ConcurrentMapCacheManager(\"members\", \"themes\");\n}\n\n// 2. CaffeineCacheManager (JVM 내 고성능)\n@Bean\nCacheManager cacheManager() {\n    CaffeineCacheManager mgr = new CaffeineCacheManager(\"members\");\n    mgr.setCaffeine(Caffeine.newBuilder()\n        .maximumSize(10_000)\n        .expireAfterWrite(Duration.ofMinutes(10)));\n    return mgr;\n}\n\n// 3. RedisCacheManager (분산)\n@Bean\nCacheManager cacheManager(RedisConnectionFactory cf) {\n    return RedisCacheManager.builder(cf)\n        .cacheDefaults(RedisCacheConfiguration.defaultCacheConfig()\n            .entryTtl(Duration.ofMinutes(10)))\n        .build();\n}\n```\n\n**같은 `@Cacheable` 코드가** *CacheManager 교체로* in-memory ↔ Redis swap. 이게 Spring Cache 추상화 가치.\n\n## \"Cache Key 생성\" — SpEL 표현\n\n```java\n@Cacheable(value = \"members\", key = \"#id\")   // 명시 key\n@Cacheable(value = \"members\", key = \"#user.id\")   // 객체 필드\n@Cacheable(value = \"members\", key = \"#root.method.name + '-' + #id\")   // SpEL\n@Cacheable(value = \"members\")   // 기본 key generator (SimpleKeyGenerator)\n```\n\n기본 key generator는 *모든 인자*를 key로 사용. *복잡 객체*면 `equals/hashCode` 의존 — 함정 (인접 doc 참고).\n\n권장: **명시적 `key = \"#id\"`**. 의도 명확.\n\n## 함정 1 — Self-Invocation\n\n```java\n@Service\nclass MemberService {\n    @Cacheable(\"members\")\n    public Member findById(Long id) { ... }\n\n    public void useMember(Long id) {\n        Member m = findById(id);   // ❌ 같은 클래스 내 호출 → AOP 우회 → 캐시 안 됨\n    }\n}\n```\n\nSpring AOP는 *proxy* 기반. 같은 객체의 *다른 메서드 호출*은 proxy 통과 안 함.\n\n해결: 다른 Bean에서 호출 또는 `@CacheableSelf` 패턴.\n\n## 함정 2 — Cache Stampede\n\n```\nTTL = 10분, 인기 user 동시 100 요청\nTTL 만료 직후: 100 요청 모두 cache miss → DB 100번 호출\n```\n\nSpring Cache 기본은 *방어 X*. 운영 환경에선 *probabilistic early refresh* 또는 *short locking* 필요. 또는 Caffeine `refreshAfterWrite` (async refresh).\n\n## \"@Cacheable vs 직접 Redis 호출\"\n\n| | Spring Cache | 직접 Redis |\n|---|---|---|\n| 코드 단순함 | 매우 단순 | 직접 호출 추가 |\n| 추상화 | CacheManager swap 가능 | Redis lock-in |\n| 조건부 캐시 | `condition`, `unless` SpEL | 코드로 직접 |\n| 복잡 데이터 (해시, sorted set) | 표현 어려움 | 자유 |\n| TTL per-key | 어려움 (default TTL) | 자유 |\n\n**일반 패턴**: 단순 read-through는 `@Cacheable`, 복잡한 cache pattern은 직접 RedisTemplate.\n\n## Cache 무효화 시점 — Cache-Aside 패턴\n\n```java\n@Cacheable(\"members\")\npublic Member findById(Long id) { ... }\n\n@CacheEvict(\"members\")\npublic void update(Member m) {\n    repository.save(m);   // DB 먼저\n    // @CacheEvict가 메서드 종료 후 evict\n}\n```\n\n⚠️ `@CacheEvict`는 *메서드 종료 후* evict. DB write가 성공해도 *evict 실패*면 stale cache 남음.\n\n해결책:\n- `@CacheEvict(beforeInvocation = true)` — 실행 전 evict (rollback 시 stale 다시)\n- Transaction sync — commit 후 evict\n- 또는 짧은 TTL로 *최종 정합성* 인정\n\n## Cache TTL — 정합성과 부담의 균형\n\n```java\nRedisCacheConfiguration.defaultCacheConfig()\n    .entryTtl(Duration.ofMinutes(10))\n    .entryTtl(Duration.ofMinutes(1))   // hot, 변경 잦음\n    .entryTtl(Duration.ofHours(1))    // cold, 변경 드뭄\n```\n\n도메인별 TTL 다르게:\n- 회원 기본 정보: 10분-1시간\n- 재고/가격: 1초-1분\n- 카탈로그: 1시간-1일\n\n## 자주 헷갈리는 지점\n\n- **\"`@Cacheable` 만 붙이면 끝\"** — `@EnableCaching` + `CacheManager` Bean 필요.\n- **\"`null` 결과도 캐시됨\"** — 기본은 `null`도 캐시 (cache stampede 방어). 안 원하면 `unless = \"#result == null\"`.\n- **\"Self-invocation도 캐시\"** — AOP proxy 우회. 별도 Bean에서 호출.\n- **\"@CacheEvict가 transaction 안에서 즉시 evict\"** — 메서드 종료 후 evict. transaction rollback이면 evict 후 DB 미저장 가능. `beforeInvocation` 또는 transaction sync.\n- **\"분산 환경에서 ConcurrentMapCacheManager\"** — JVM 내부만. 여러 인스턴스가 *각자 자기 캐시*. Redis 필요.\n\n## 학습자가 자주 만나는 시나리오\n\n- 회원 정보 자주 조회 → `@Cacheable(\"members\", key = \"#id\")` + TTL 10분.\n- 변경 시 무효화 → `@CacheEvict`.\n- \"캐시 적용했는데 안 빨라짐\" → cache miss rate 측정. key 생성 함정 또는 self-invocation 의심.\n- 분산 환경 도입 → CacheManager만 Redis로 교체. 코드 변경 없음.\n- \"캐시가 만료된 뒤 갑자기 느려짐\" → cache stampede. Caffeine refreshAfterWrite 또는 locking.\n\n## 빠른 확인 질문\n\n- `@Cacheable`이 작동 안 하는 흔한 원인 2가지?\n  - `@EnableCaching` 누락 / self-invocation (AOP 우회).\n- Caffeine vs Redis CacheManager 차이?\n  - Caffeine = JVM 내(빠름, 분산 ❌), Redis = 분산 가능(느림, 운영 부담).\n- `@CacheEvict`와 `@CachePut` 차이?\n  - Evict = 캐시 삭제 (다음 read 시 fresh), Put = 메서드 결과 무조건 저장 (cache hit 무시).\n\n## 한 줄 정리\n\nSpring Cache Abstraction = *어노테이션 기반 cache-aside*. CacheManager swap으로 in-memory ↔ Redis. self-invocation / null cache / eviction timing 함정 인지.\n\nretrieval-anchor-keywords: Spring Cache Abstraction, @Cacheable @CacheEvict @CachePut @Caching, @EnableCaching, CacheManager ConcurrentMapCacheManager CaffeineCacheManager RedisCacheManager, SpEL cache key, SimpleKeyGenerator, cache self-invocation AOP, cache stampede thundering herd, beforeInvocation eviction, unless condition cache, TTL per cache, Caffeine refreshAfterWrite, Cache-Aside Spring pattern\n",
+  "aliases": [
+    "Spring Cache",
+    "@Cacheable",
+    "@CacheEvict",
+    "@CachePut",
+    "CacheManager",
+    "Redis Cache",
+    "Caffeine",
+    "스프링 캐시",
+    "@EnableCaching",
+    "cache annotation",
+    "key generation",
+    "@Bean"
+  ],
+  "expected_queries": [
+    "Spring Cache 어떻게 시작해?",
+    "@Cacheable / @CacheEvict / @CachePut 차이가 뭐야?",
+    "CacheManager로 Redis와 Caffeine 어떻게 다뤄?",
+    "cache key를 어떻게 생성해?",
+    "Spring Cache vs 직접 Redis 호출 차이는?",
+    "캐시 무효화를 어떻게 자동화해?"
+  ],
+  "symptoms": [
+    "@Cacheable을 어떻게 시작할지 모름",
+    "CacheManager로 Redis와 Caffeine 어떻게 다루는지 모름",
+    "cache key가 어떻게 생성되는지 헷갈림",
+    "eviction 시점을 어떻게 정하는지 모름"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer"
+    ],
+    "next_docs": [
+      "spring/cache-abstraction-traps",
+      "spring/cache-key-generation-pitfalls"
+    ],
+    "confusable_with": [
+      "spring/cache-abstraction-traps",
+      "spring/cache-key-generation-pitfalls"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer.md",
+    "revision_history": []
+  }
+}

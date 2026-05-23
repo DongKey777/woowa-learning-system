@@ -1,0 +1,59 @@
+{
+  "id": "database/race-condition-service-level-primer",
+  "title": "Service-Level Race Condition 입문서",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "'이 문서는 학습자가 Service 계층에서 \"조회 후 없으면 INSERT\" 흐름을",
+  "body_markdown": "# Service-Level Race Condition 입문서\n\n> 한 줄 요약: Service 계층의 \"조회 후 없으면 INSERT\" 흐름은 두 요청 사이의 시간 갭에서 같은 데이터를 동시에 통과시키므로, DB 제약이나 락 같은 별도 중재 장치가 필요하다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n- [constraint-first-booking-primer](constraint-first-booking-primer.md) — race condition을 막는 첫 갈래\n- [transaction-isolation-basics](transaction-isolation-basics.md) — 격리 수준이 어디까지 막아주는지\n- [phantom-safe-booking-patterns-primer](phantom-safe-booking-patterns-primer.md) — phantom-safe 예약 패턴\n\nretrieval-anchor-keywords: Service 사전 조회 race, check-then-act, TOCTOU, UNIQUE constraint vs 비관 락\n\n## 처음 보는 3개 질문\n\n- **Q1**. `if (repository.existsBy(...)) throw new DuplicateException(); else repository.save(...)` 가 왜 안전하지 않은가?\n- **Q2**. `@Transactional`을 붙이면 동시 요청이 직렬화되지 않나?\n- **Q3**. 격리 수준을 SERIALIZABLE로 올리면 사전 조회 race를 막을 수 있나?\n\n## 멘탈 모델 — \"사전 조회\" 와 \"쓰기\" 사이의 시간 갭\n\n```\nT1: SELECT count(*) FROM reservation WHERE date=X AND time=Y  → 0\nT2: SELECT count(*) FROM reservation WHERE date=X AND time=Y  → 0\nT1: INSERT INTO reservation (date, time, ...) VALUES (X, Y, ...)\nT2: INSERT INTO reservation (date, time, ...) VALUES (X, Y, ...)  ← 둘 다 통과\n```\n\nT1과 T2 사이의 시간 갭이 곧 race window. 사전 조회는 \"그 순간의 스냅샷\" 만 보여주므로 그 사이에 다른 트랜잭션이 같은 결정을 내릴 수 있다. 이걸 **TOCTOU** (Time-of-Check to Time-of-Use) 라고 부른다.\n\n## 흔한 오해 정리\n\n| 오해 | 실제 |\n|---|---|\n| `@Transactional` 이 동시 요청을 직렬화한다 | 트랜잭션 경계만 만든다. 다른 트랜잭션이 같은 SELECT를 동시에 실행할 수 있다 |\n| READ_COMMITTED 격리 수준이 사전 조회를 보호한다 | 다른 트랜잭션의 commit된 row만 보지 못하게 할 뿐, 사전 조회와 INSERT 사이에 다른 트랜잭션 INSERT가 끼어드는 걸 막지 않는다 |\n| REPEATABLE_READ 면 안전하다 | 같은 row 반복 조회를 보호하지만, 새 row INSERT (phantom) 는 별도 메커니즘이 필요하다 |\n| SERIALIZABLE 로 올리면 모든 race 사라진다 | 맞지만 모든 트랜잭션을 직렬화하는 비용이 매우 크다 — production에서 거의 안 씀 |\n\n## 무엇이 실제로 막아주나\n\n1. **UNIQUE constraint** (가장 단순) — DB가 같은 키 두 번 INSERT를 reject. application 코드 race window 무관. → `constraint-first-booking-primer.md`\n2. **비관 락** (`SELECT ... FOR UPDATE`) — 사전 조회 시 row 잠금. 첫 트랜잭션이 commit/rollback 전까지 두 번째 트랜잭션 대기. 단 빈 row에는 락이 안 걸려 phantom INSERT가 따로 들어오면 못 막음.\n3. **낙관 락** — version 컬럼으로 commit 시점에 충돌 감지. 충돌 시 retry. UPDATE 흐름에는 효율적이지만 INSERT race에는 적용 어려움.\n4. **분산 락 / 외부 mutex** — Redis 또는 DB advisory lock. application 레벨에서 mutex처럼 동작. 추가 인프라.\n\n## 학습자 실제 코드와 매핑 (spring-roomescape 미션)\n\n```java\n@Service\npublic class ReservationService {\n    @Transactional\n    public Reservation create(LocalDate date, Long timeId, Long themeId) {\n        if (reservationRepository.existsByDateAndTimeAndTheme(date, timeId, themeId)) {\n            throw new DuplicateReservationException();\n        }\n        return reservationRepository.save(new Reservation(date, timeId, themeId));\n    }\n}\n```\n\n이 코드의 race window: `existsBy` 와 `save` 사이. 동시 요청 둘이 같이 `existsBy=false` 를 본 후 둘 다 `save` 한다.\n\n**가장 단순한 해결**: schema.sql 에 UNIQUE constraint 추가.\n\n```sql\nALTER TABLE reservation ADD CONSTRAINT uk_reservation_slot\n  UNIQUE (date, time_id, theme_id);\n```\n\n이제 두 번째 INSERT 는 DB가 거절. application 코드는 `DataIntegrityViolationException` 을 catch 해서 `DuplicateReservationException` 으로 변환.\n\n## 한 줄 정리\n\nService 계층의 \"조회 후 INSERT\" 는 트랜잭션이나 격리 수준만으로 race 를 막지 못한다. DB 제약(UNIQUE) 이나 명시적 락이 필요하며, 가장 단순한 정답은 UNIQUE constraint 다.\n",
+  "aliases": [
+    "service level race condition",
+    "check then act anomaly",
+    "read then insert race",
+    "duplicate insert race",
+    "사전 조회 후 INSERT",
+    "중복 검증 race condition",
+    "동시 요청 중복 insert",
+    "service 조회-검증-쓰기",
+    "사전 조회 race",
+    "동시성 검증 실패",
+    "TOCTOU",
+    "@Service"
+  ],
+  "expected_queries": [
+    "Service에서 사전 조회 후 INSERT 하면 동시 요청에 안전한가?",
+    "두 요청이 동시에 들어오면 중복이 생기는데 왜 그래?",
+    "@Transactional만 붙이면 동시성 보호 되는 것 아니야?",
+    "격리 수준을 올리면 사전 조회 race를 막을 수 있어?"
+  ],
+  "symptoms": [
+    "Service에서 존재 여부 조회 후 없으면 insert 하는데 동시 요청 두 개가 같이 통과해서 중복 row가 생긴다",
+    "@Transactional만 붙이면 동시 요청이 차단될 거라 믿었는데 실제로는 둘 다 commit 된다",
+    "READ_COMMITTED 격리 수준에서도 사전 조회 race condition을 막지 못한다는 사실을 처음 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics",
+      "database/transaction-isolation-basics"
+    ],
+    "next_docs": [
+      "database/constraint-first-booking-primer",
+      "database/phantom-safe-booking-patterns-primer",
+      "database/unique-vs-slot-row-vs-guard-row-quick-chooser"
+    ],
+    "confusable_with": [
+      "database/constraint-first-booking-primer",
+      "database/phantom-safe-booking-patterns-primer",
+      "software-engineering/concurrency-fix-strategy-synchronized-vs-db-lock-vs-unique-chooser",
+      "spring/reservation-create-transactional-integrity-mission-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/race-condition-service-level-primer.md",
+    "revision_history": []
+  }
+}

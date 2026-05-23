@@ -1,0 +1,47 @@
+{
+  "id": "database/deadlock-case-study",
+  "title": "Deadlock Case Study",
+  "category": "database",
+  "level": "advanced",
+  "summary": "이 문서는 database 카테고리에서 Deadlock Case Study를 다루는 playbook 문서다. deadlock case study, deadlock log lock ordering, mysql deadlock log fix, deadlock 처음 incident, 인덱스 추가 직후 deadlock 같은 lexical 표현과 mysql deadlock log를 어떻게 읽고 lock ordering을 어떻게 고쳐?, 인덱스 변경 직후 deadlock이 늘어나는 이유는 뭐야? 같은 자연어 질문을 같은 개념으로 묶어, 학습자가 증상, 비교, 설계 판단, 코드리뷰 맥락 중 어디에서 들어오더라도 본문의 핵심 분기와 다음 문서로 안정적으로 이어지게 한다.",
+  "body_markdown": "# Deadlock Case Study\n\n**난이도: 🔴 Advanced**\n\n> 데드락을 개념 정의가 아니라 실제 발생 원인과 대응 전략으로 보는 문서\n\n관련 문서: [Deadlock vs Lock Wait Timeout 입문 프라이머](./deadlock-vs-lock-wait-timeout-primer.md), [Lock Wait, Deadlock, and Latch Contention Triage Playbook](./lock-wait-deadlock-latch-triage-playbook.md), [트랜잭션 격리수준과 락](./transaction-isolation-locking.md), [Transaction Timeout vs Lock Timeout](./transaction-timeout-vs-lock-timeout.md), [Guard-Row Scope Design for Multi-Day Bookings](./guard-row-scope-design-multi-day-bookings.md)\nretrieval-anchor-keywords: deadlock case study, deadlock lock timeout difference, deadlock beginner bridge, deadlock 처음 읽기, deadlock case study 어디서부터, lock ordering, mysql deadlock log 보고 lock ordering 어떻게 고쳐, mysql deadlock log lock ordering 고치는 법, mysql deadlock log, mysql deadlock log lock ordering fix, deadlock log 보고 lock ordering 고치는 법, mysql deadlock 고치는 법, deadlock retry, lock wait, wait graph, backend db incident, transaction deadlock, circular wait, innodb deadlock log, retryable database error, booking deadlock, multi-day booking deadlock, guard row canonical order\n\n<details>\n<summary>Table of Contents</summary>\n\n- [먼저 이 문서를 어떻게 읽으면 좋은가](#먼저-이-문서를-어떻게-읽으면-좋은가)\n- [왜 중요한가](#왜-중요한가)\n- [데드락이 생기는 이유](#데드락이-생기는-이유)\n- [대표 사례](#대표-사례)\n- [탐지와 해소](#탐지와-해소)\n- [예방 전략](#예방-전략)\n- [실무 체크리스트](#실무-체크리스트)\n- [시니어 관점 질문](#시니어-관점-질문)\n\n</details>\n\n## 먼저 이 문서를 어떻게 읽으면 좋은가\n\n이 문서는 Advanced 문서지만, 데드락을 처음 incident 관점으로 읽는 학습자도 진입할 수 있게 짧은 브리지를 둔다.\n\n- 먼저 `deadlock`을 \"서로가 서로의 락을 기다리는 원형 대기\"로만 잡는다.\n- 다음으로 \"`lock wait timeout`과 같은 말인가?\"를 분리한다.\n- 그 다음에야 아래 사례에서 **어떤 순서로 락을 잡았는지** 본다.\n\n즉 이 문서의 초반 목표는 \"왜 실패했나\"를 완벽히 증명하는 것이 아니라, **deadlock인지 timeout인지 먼저 말로 구분할 수 있게 만드는 것**이다.\n\n비유하자면 `lock wait timeout`은 줄이 길어서 이번 차례를 놓친 상황에 가깝고, `deadlock`은 두 줄이 서로 교차해서 아무도 앞으로 못 가는 상황에 가깝다. 다만 실제 DB는 단순 줄서기보다 복잡해서, 최종 판단은 DB 로그와 락 순서까지 봐야 한다.\n\n## 왜 중요한가\n\n데드락은 “락을 썼으니 안전하다”에서 끝나지 않는다.\n\n- 특정 요청이 오래 멈춘다\n- DB가 트랜잭션 하나를 희생시킨다\n- 재시도 설계가 없으면 사용자 장애로 이어진다\n\n따라서 데드락은 락의 부작용이 아니라 **락을 쓸 때 반드시 다뤄야 하는 운영 이슈**다.\n\n---\n\n## 데드락이 생기는 이유\n\n데드락은 서로가 가진 자원을 상대가 풀어주기만 기다리는 상태다.\n\n전형적인 조건은 이렇다.\n\n- 트랜잭션 A가 `row 1`을 잡고 `row 2`를 기다림\n- 트랜잭션 B가 `row 2`를 잡고 `row 1`을 기다림\n\n둘 다 계속 기다리면 진행이 멈춘다.\n\n핵심은 **락 자체가 나쁜 게 아니라, 락 획득 순서가 일관되지 않을 때** 문제가 커진다는 점이다.\n\n---\n\n## 대표 사례\n\n### 사례 1. 계좌 이체\n\n송금과 입금이 같은 테이블의 서로 다른 row를 건드릴 수 있다.\n\n예:\n\n1. A 계좌 차감\n2. B 계좌 증가\n\n다른 요청은 반대 순서로 접근하면 데드락이 발생할 수 있다.\n\n### 사례 2. 주문과 재고 갱신\n\n주문 상태와 재고 row를 같이 업데이트하는 흐름에서,\n\n- 요청 1은 주문 먼저, 재고 나중\n- 요청 2는 재고 먼저, 주문 나중\n\n처럼 경로가 갈리면 데드락 가능성이 높아진다.\n\n### 사례 3. 배치 작업과 실시간 요청 충돌\n\n배치가 대량 row를 잠그는 동안 실시간 API가 같은 row를 잡으려 하면 대기가 늘어난다.\n\n이건 순환 대기까지 가지 않더라도 체감 장애를 만든다.\n\n---\n\n## 탐지와 해소\n\nDB는 보통 데드락을 자동 탐지하고, 한쪽 트랜잭션을 희생시켜 풀어낸다.\n\n즉 운영에서 보이는 현상은 보통 다음 중 하나다.\n\n- 한 요청이 deadlock error로 실패\n- 오래 기다리다가 timeout\n\n중요한 건 “에러가 났다”보다 **재시도 가능한 실패인지**를 판단하는 것이다.\n\n### deadlock과 lock timeout 경계 빠르게 나누기\n\n| 질문 | deadlock | lock wait timeout |\n|---|---|---|\n| 핵심 장면 | 서로가 서로의 락을 기다리는 cycle이 생김 | 한쪽이 락을 오래 쥐고 있어 기다리다 limit를 넘김 |\n| DB의 즉시 반응 | 보통 희생자 하나를 골라 transaction을 abort함 | 보통 기다리던 쪽이 timeout으로 끝남 |\n| beginner가 처음 붙일 말 | \"순서가 엇갈려 서로 물렸다\" | \"막혀서 오래 기다렸는데 안 풀렸다\" |\n| 첫 대응 포인트 | lock ordering, whole-transaction retry | blocker, 긴 트랜잭션, timeout budget |\n| 같은 대응으로 묶어도 되나 | 보통 아니다. retry 후보로 자주 본다 | 상황 의존적이다. 원인 없이 retry만 늘리면 반복될 수 있다 |\n\n이 표는 **첫 분류용 브리지**다. MySQL/InnoDB처럼 deadlock detector가 있는 엔진에서는 위 구분이 잘 맞지만, 실제 예외 이름과 timeout 정책은 DB 제품과 설정에 따라 달라질 수 있다.\n\n### 애플리케이션 관점\n\n- deadlock error는 보통 재시도 후보다\n- 재시도는 즉시 무한 반복이 아니라 backoff를 둬야 한다\n- 외부 API와 함께 묶인 경우 중복 실행 가능성도 같이 점검해야 한다\n\n---\n\n## 예방 전략\n\n### 1. 락 획득 순서를 통일한다\n\n가장 효과적인 방법은 항상 같은 순서로 row를 잡는 것이다.\n\n예:\n\n- 항상 `user_id` 오름차순\n- 항상 `order -> stock` 순서\n\n순서가 흔들리면 데드락 가능성이 급격히 올라간다.\n\n### 2. 트랜잭션을 짧게 유지한다\n\n트랜잭션이 길수록 락 점유 시간이 늘어난다.\n\n특히 다음은 피해야 한다.\n\n- 트랜잭션 안에서 외부 API 호출\n- 불필요한 대기\n- 큰 범위의 scan 후 update\n\n### 3. 잠금 범위를 줄인다\n\n불필요하게 넓은 범위를 잠그면 충돌 면적이 커진다.\n\n예:\n\n- 전체 테이블 잠금 대신 row-level lock 사용\n- 범위 조건이 큰 쿼리를 최소화\n\n### 4. 재시도 정책을 둔다\n\n완벽한 예방은 어렵다.\n\n그래서 실제 운영에서는\n\n- 재시도 횟수 제한\n- 지수 백오프\n- 멱등 처리\n\n가 같이 가야 한다.\n\n---\n\n## 실무 체크리스트\n\n- 락을 잡는 SQL 순서가 서비스 전반에서 일관적인가\n- 트랜잭션 안에 외부 호출이 들어가 있지 않은가\n- deadlock/timeout 에러가 재시도 가능한 유형으로 처리되는가\n- 배치와 실시간 요청의 충돌 구간이 분리되어 있는가\n- 같은 요청이 재시도돼도 결과가 안전한가\n\n---\n\n## 시니어 관점 질문\n\n- 데드락이 발생했을 때 시스템은 자동 재시도할 것인가, 사용자에게 실패를 노출할 것인가?\n- 락 순서를 통일하는 설계가 가능한가, 아니면 구조적으로 충돌을 받아들여야 하는가?\n- deadlock과 lock timeout을 같은 실패로 취급해도 되는가?\n- 트랜잭션을 짧게 만들기 위해 비동기로 빼야 하는 경계는 어디인가?\n",
+  "aliases": [
+    "deadlock case study",
+    "deadlock log lock ordering",
+    "mysql deadlock log fix",
+    "deadlock 처음 incident",
+    "인덱스 추가 직후 deadlock",
+    "데드락 원인 분석"
+  ],
+  "expected_queries": [
+    "mysql deadlock log를 어떻게 읽고 lock ordering을 어떻게 고쳐?",
+    "인덱스 변경 직후 deadlock이 늘어나는 이유는 뭐야?",
+    "deadlock case study 어디서부터 읽어야 해?",
+    "circular wait를 어떻게 끊어?"
+  ],
+  "symptoms": [
+    "인덱스 추가 직후 deadlock이 자주 난다",
+    "mysql deadlock log를 보고 lock ordering을 어떻게 고쳐야 할지 모르겠다",
+    "동시 booking 요청이 서로 막혀 deadlock으로 돌아간다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics"
+    ],
+    "next_docs": [
+      "database/isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer"
+    ],
+    "confusable_with": [
+      "database/ordered-guard-row-upsert-patterns-postgresql-mysql"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/deadlock-case-study.md",
+    "revision_history": []
+  }
+}

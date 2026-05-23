@@ -1,0 +1,52 @@
+{
+  "id": "software-engineering/backend-webhook-broker-idempotency-drill",
+  "title": "Backend Webhook Broker Idempotency Drill",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Backend Webhook Broker Idempotency Drill\n\n> 한 줄 요약: webhook과 broker consumer는 둘 다 중복 배달될 수 있는 inbound adapter이고, acknowledgment를 언제 보내느냐가 안정성의 핵심이다.\n\n**난이도: Intermediate**\n\n## 드릴 사용법\n\n아래 문제는 \"webhook이냐 broker냐\"를 맞히는 퀴즈가 아니라 at-least-once delivery에서 side effect를 안전하게 닫는 연습이다. 답안을 쓸 때는 항상 다섯 축을 같이 적는다.\n\n1. 성공 신호: HTTP 2xx, ack, offset commit 중 무엇인가\n2. durable handoff: inbox row, raw payload, state change, outbox row 중 무엇이 먼저 commit되는가\n3. dedup key: provider event id, source topic + event id, business id + version 중 무엇이 stable identity인가\n4. idempotent handler: 중복 요청이 같은 결과로 닫히는가, 외부 side effect가 반복되지 않는가\n5. 실패 경로: retry, backoff, DLQ, replay, ordering 보정이 설계됐는가\n\n## 문제 1: webhook 2xx와 durable inbox\n\n상황:\n\n```text\n결제 webhook payload를 메모리에서 파싱한 뒤 바로 200 OK를 보낸다.\ninbox row나 providerEventId 저장은 비동기 작업이 나중에 한다.\n```\n\n기대 답안 축:\n\n- 위험하다. provider는 2xx를 재전송 중단 신호로 볼 수 있는데, durable handoff가 아직 없다.\n- 최소한 provider event id, received timestamp, raw payload 또는 canonical payload를 inbox table에 저장하고 commit한 뒤 2xx를 보내는 쪽이 안전하다.\n- 저장 전 장애가 나면 provider retry로 복구할 수 있어야 한다. 저장 후 처리 실패는 내부 retry worker가 담당할 수 있다.\n- signature 검증 실패처럼 영구적으로 잘못된 요청은 2xx와 다른 정책이 필요하다. 재시도해도 성공하지 않을 입력을 무한 retry시키면 안 된다.\n\n## 문제 2: broker ack/offset commit 순서\n\n상황:\n\n```text\nKafka consumer가 메시지를 받자마자 offset을 commit하고, 그 뒤 DB에 주문 상태를 반영한다.\nDB commit 중 장애가 나면 메시지는 다시 오지 않는다.\n```\n\n기대 답안 축:\n\n- ack/offset commit이 너무 이르다. broker 관점 성공 신호는 DB commit과 dedup 기록 이후에 맞추는 편이 안전하다.\n- at-least-once delivery에서는 같은 message가 다시 올 수 있다고 보고 handler를 idempotent하게 만든다.\n- DB commit 후 ack 전에 장애가 나면 message는 다시 오지만 dedup record나 state transition guard로 같은 side effect를 반복하지 않아야 한다.\n- consumer offset과 application DB가 같은 transaction으로 묶이지 않는다면 \"먼저 commit하면 어떤 중복/유실이 생기는가\"를 명시한다.\n\n## 문제 3: dedup key 고르기\n\n상황:\n\n```text\nwebhook에는 X-Provider-Event-Id가 있고, broker 메시지에는 messageId와 paymentId가 있다.\n둘 다 결제 상태 변경을 전달한다.\n```\n\n기대 답안 축:\n\n- dedup key는 채널별 stable external identity를 기준으로 잡는다.\n- webhook은 provider event id가 1차 후보이고, broker는 source topic + event id 또는 aggregate id + event version이 후보가 된다.\n- 단순히 `paymentId`만 쓰면 승인, 취소, 환불처럼 서로 다른 상태 변경을 하나로 뭉갤 수 있다.\n- producer가 messageId를 retry마다 새로 만들면 dedup key로 약하다. 같은 business event를 retry해도 보존되는 id인지 확인한다.\n\n## 문제 4: idempotent handler 설계\n\n상황:\n\n```text\n결제 완료 이벤트를 받으면 주문 상태를 PAID로 바꾸고 포인트를 적립하고 알림을 보낸다.\n같은 이벤트가 3번 들어오면 포인트와 알림도 3번 나간다.\n```\n\n기대 답안 축:\n\n- idempotency는 \"중복을 무시한다\"가 아니라 \"같은 event를 여러 번 처리해도 같은 최종 결과와 side effect가 되게 한다\"는 뜻이다.\n- inbox/dedup table에 `(source, event_id)` unique key를 두고 처리 상태를 `RECEIVED`, `PROCESSING`, `DONE`, `FAILED`처럼 기록한다.\n- 주문 상태 변경은 current state와 event version을 확인해 단조롭게 전이한다. 이미 `PAID`인 주문에 같은 payment completed event가 오면 같은 성공 결과로 닫는다.\n- 포인트 적립, 알림, 외부 호출은 outbox나 side-effect ledger를 둬 한 번만 발행되게 한다.\n\n## 문제 5: inbox와 outbox 경계\n\n상황:\n\n```text\n외부 webhook을 받은 뒤 주문 DB를 바꾸고 내부 \"OrderPaid\" event를 broker로 발행한다.\n개발자는 inbox만 있으면 outbox는 필요 없다고 생각한다.\n```\n\n기대 답안 축:\n\n- inbox는 inbound 중복과 재처리를 위한 기록이다. 외부에서 들어온 event를 잃지 않고 idempotent하게 처리하는 경계다.\n- outbox는 DB state change와 내부 event publish를 같은 transaction에 묶어 발행 유실을 막는 경계다.\n- \"webhook 수신 성공\"과 \"내부 event 발행 성공\"은 다른 성공 신호다. 둘을 한 table로 설명하면 유실 지점이 숨는다.\n- 주문 상태 변경 transaction 안에 outbox row를 함께 저장하고, relay가 outbox를 broker로 publish한 뒤 published mark를 남기는 식으로 설명한다.\n\n## 문제 6: ordering과 version\n\n상황:\n\n```text\n환불 완료 이벤트가 먼저 도착하고, 결제 완료 이벤트가 늦게 도착했다.\nconsumer는 도착 순서대로 주문 상태를 덮어쓴다.\n```\n\n기대 답안 축:\n\n- at-least-once는 중복뿐 아니라 out-of-order 가능성도 같이 본다.\n- aggregate별 ordering이 필요하면 partition key를 orderId/paymentId로 맞추거나, handler에서 event version/status precedence를 검증한다.\n- global ordering은 비싸고 대개 필요하지 않다. 같은 주문/결제 aggregate 안에서 필요한 순서만 정의한다.\n- 늦게 온 오래된 event는 무조건 실패가 아니라 no-op, compensate, reconciliation queue 중 정책으로 닫는다.\n\n## 문제 7: retry와 DLQ\n\n상황:\n\n```text\nconsumer가 외부 포인트 API timeout을 만나면 즉시 무한 retry한다.\nschema가 깨진 poison message도 같은 방식으로 계속 재시도한다.\n```\n\n기대 답안 축:\n\n- transient failure와 permanent failure를 나눈다. timeout, 5xx는 backoff retry 후보이고, schema/signature/business invariant 위반은 DLQ나 reject 후보가 된다.\n- retry는 exponential backoff, max attempts, jitter, visibility timeout 또는 consumer retry policy를 포함해야 한다.\n- DLQ에는 원본 payload, headers, error reason, attempt count, first/last failure time, replay key가 남아야 한다.\n- replay해도 idempotent해야 하므로 dedup retention window와 handler side effect ledger가 DLQ보다 먼저 설계돼야 한다.\n\n## 빠른 체크\n\n| 질문 | webhook | broker consumer |\n|---|---|---|\n| 성공 신호 | HTTP 2xx | ack/nack 또는 offset commit |\n| retry owner | provider/sender | broker/listener policy |\n| dedup 후보 | provider event id | event id + topic/source |\n| 먼저 durable해야 할 것 | inbox/raw payload | state change + dedup record |\n| 중복 전제 | provider retry 때문에 중복 가능 | at-least-once redelivery 때문에 중복 가능 |\n| 발행 유실 방지 | 처리 후 internal publish는 outbox 후보 | DB change 후 publish도 outbox 후보 |\n\n## 드릴 질문과 답안 축\n\n| 드릴 질문 | 기대 답안 축 | 약점 태그 |\n|---|---|---|\n| webhook 2xx를 언제 보내야 하는가? | signature 검증과 durable inbox commit 이후를 기준으로 말한다 | `webhook-ack-before-durable-handoff` |\n| broker offset commit은 언제 안전한가? | DB state change와 dedup 기록 이후 ack를 맞춘다 | `broker-ack-before-db-commit` |\n| dedup key는 무엇인가? | retry마다 바뀌지 않는 provider/source event identity를 고른다 | `dedup-key-business-id-collapse` |\n| idempotent handler는 무엇을 보장하는가? | 중복 처리 시 최종 상태와 side effect가 반복되지 않음을 말한다 | `idempotent-handler-side-effect` |\n| inbox와 outbox는 어떻게 다른가? | inbound 저장/중복 방지와 outbound publish 유실 방지를 분리한다 | `inbox-outbox-role-confusion` |\n| ordering이 필요한 범위는 어디인가? | global order가 아니라 aggregate별 order/version을 본다 | `ordering-global-overreach` |\n| retry와 DLQ는 어떻게 나누는가? | transient retry, poison DLQ, replay idempotency를 같이 말한다 | `retry-dlq-poison-message` |\n\n## Wrong-bucket cases\n\n| 오답 | 왜 약한가 | 더 나은 답 |\n|---|---|---|\n| \"200 OK를 보냈으니 처리는 끝났다\" | provider 재전송 중단 신호일 뿐 application durable 처리 완료와 다를 수 있다 | inbox commit 이후 2xx, 이후 내부 처리는 retry worker로 분리한다 |\n| \"Kafka가 exactly-once라 중복 처리는 필요 없다\" | application DB side effect와 외부 호출까지 자동으로 exactly-once가 되지는 않는다 | at-least-once를 전제로 dedup key와 idempotent handler를 둔다 |\n| \"`paymentId`로 dedup하면 된다\" | 같은 결제의 여러 상태 변경을 하나로 합칠 수 있다 | source event id, event type, version을 포함한 stable key를 검토한다 |\n| \"DLQ에 보내면 장애 처리는 끝이다\" | DLQ는 격리일 뿐 재처리와 원인 수정 계약이 필요하다 | payload/error/attempt metadata와 replay 절차를 둔다 |\n| \"ordering이 필요하니 모든 메시지를 한 partition으로 보낸다\" | throughput과 availability를 과하게 희생한다 | aggregate별 partition key와 version guard로 필요한 순서만 보장한다 |\n| \"중복이면 그냥 return\" | 이미 시작된 side effect, partially done 상태, failed retry가 숨을 수 있다 | 처리 상태 machine과 side-effect ledger를 보고 같은 결과로 닫는다 |\n\n## 검증 질문\n\n1. HTTP 2xx, broker ack, offset commit이 각각 어떤 주체에게 주는 성공 신호인가?\n2. 성공 신호를 보내기 전에 durable하게 저장된 최소 정보는 무엇인가?\n3. dedup key는 retry마다 보존되는가, 아니면 매 delivery마다 새로 만들어지는가?\n4. 같은 event가 DB commit 후 ack 전에 다시 오면 handler가 같은 결과로 닫히는가?\n5. side effect인 포인트 적립, 알림, 외부 API 호출은 중복 발행을 어떻게 막는가?\n6. inbox와 outbox가 각각 inbound와 outbound 어느 유실 지점을 막는가?\n7. ordering은 global로 필요한가, aggregate별 version/preference로 충분한가?\n8. retry 가능한 오류와 DLQ로 보내야 하는 poison message를 어떻게 구분하는가?\n9. DLQ replay 시 dedup retention과 handler idempotency가 유지되는가?\n\n## 약점 태그\n\n`webhook-ack-before-durable-handoff`, `broker-ack-before-db-commit`, `dedup-key-business-id-collapse`, `idempotent-handler-side-effect`, `inbox-outbox-role-confusion`, `ordering-global-overreach`, `retry-dlq-poison-message`\n\n## 짧은 모범 답변\n\nwebhook과 broker consumer는 둘 다 at-least-once delivery를 전제로 둔다. webhook은 provider event id와 payload를 inbox에 durable하게 저장한 뒤 2xx를 보내고, broker consumer는 DB state change와 dedup 기록 이후 ack 또는 offset commit을 맞춘다. dedup key는 retry마다 보존되는 source event identity여야 하며, handler는 같은 event가 다시 와도 상태와 side effect가 한 번 처리된 것처럼 닫혀야 한다. 내부 event 발행 유실은 outbox로 분리하고, ordering은 aggregate별 version guard와 retry/DLQ 정책으로 검증한다.\n\n## 한 줄 정리\n\nbackend inbound adapter는 protocol 이름보다 at-least-once delivery, acknowledgment, dedup key, inbox/outbox, ordering, retry/DLQ 경계를 먼저 읽어야 한다.\n",
+  "aliases": [
+    "backend webhook broker idempotency drill",
+    "webhook broker ack idempotency exercise",
+    "HTTP 2xx ack offset drill",
+    "durable handoff idempotency drill",
+    "webhook broker 중복 처리 드릴"
+  ],
+  "expected_queries": [
+    "backend webhook 200 OK와 broker ack 차이를 idempotency 문제로 연습하고 싶어",
+    "webhook durable handoff 전에 2xx를 보내면 왜 위험한지 드릴해줘",
+    "broker consumer offset commit과 DB commit 순서를 어떻게 판단해?",
+    "provider event id와 message id를 dedup key로 고르는 문제를 풀어줘",
+    "backend inbound adapter 중복 처리 테스트를 어떻게 나눠?"
+  ],
+  "symptoms": [
+    "webhook 200 OK와 broker ack/offset commit을 같은 성공 신호로 취급한다",
+    "durable handoff 전에 acknowledgment를 보내도 되는지 판단하지 못한다",
+    "provider event id와 message id 중 무엇을 dedup key로 삼을지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/webhook-broker-boundary-primer",
+      "software-engineering/idempotency-retry-consistency-boundaries"
+    ],
+    "next_docs": [
+      "software-engineering/outbox-inbox-domain-events",
+      "system-design/message-queue-basics",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design"
+    ],
+    "confusable_with": [
+      "software-engineering/webhook-broker-boundary-primer",
+      "software-engineering/idempotency-retry-consistency-boundaries",
+      "software-engineering/outbox-inbox-domain-events"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/backend-webhook-broker-idempotency-drill.md",
+    "revision_history": []
+  }
+}

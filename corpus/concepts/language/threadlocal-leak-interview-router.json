@@ -1,0 +1,49 @@
+{
+  "id": "language/threadlocal-leak-interview-router",
+  "title": "ThreadLocal Leak Interview Router",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 ThreadLocal leak와 request context propagation 문제를 면접/운영 증상으로 설명한다.",
+  "body_markdown": "# ThreadLocal Leak Interview Router\n\n## 관찰 증거\n\n- WAS thread pool은 thread를 재사용한다.\n- ThreadLocal value를 요청 종료 시 제거하지 않으면 다음 요청에서 같은 thread가 값을 볼 수 있다.\n- async executor로 넘어가면 context가 사라지거나 잘못 전파될 수 있다.\n- heap dump에서 오래 살아 있는 worker thread가 `ThreadLocalMap` value를 붙잡고 있고, value 쪽 classloader나 request object graph가 같이 유지될 수 있다.\n- `ThreadLocalMap`의 key는 약한 참조지만 value는 entry가 expunge되기 전까지 강하게 남을 수 있으므로, key가 GC되면 자동 cleanup된다고 말하면 위험하다.\n- `set(null)`은 null value entry를 남길 수 있고 `remove()`는 entry 자체를 제거하는 의도라, 요청 cleanup에서는 보통 `remove()` 또는 이전 값 restore가 기준이다.\n- executor decorator가 submit 시점 context를 capture하고 실행 후 worker의 이전 context를 restore하지 않으면, wrapper 자체가 새 leak boundary가 된다.\n- 로그 MDC, security context, tenant id, locale 같은 값이 요청 간 섞이면 데이터 오염 문제로도 드러난다.\n- virtual thread는 pool worker 재사용 leak 가능성을 줄일 수 있지만, async hop이나 long-lived task에서는 여전히 context lifetime을 명시해야 한다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| 이전 사용자 context 노출 | remove 누락 | filter finally cleanup |\n| memory leak | ThreadLocalMap value retention | heap dump retained size |\n| async context 손실 | thread hop | explicit context propagation |\n| 재배포 후 metaspace 증가 | value가 old classloader 참조 | classloader reference chain |\n| 로그 trace id 뒤섞임 | MDC cleanup/propagation 누락 | request boundary와 executor wrapper |\n| cleanup했는데 heap에 남음 | `set(null)` 또는 stale entry | `remove()` 호출 위치와 retained path |\n| decorator 도입 후 더 섞임 | 이전 worker context 복원 누락 | capture/restore/finally 대칭성 |\n\n## 면접 답변 골격\n\nThreadLocal은 thread-bound storage라 request-bound storage가 아니다. thread pool 환경에서는 worker thread가 요청보다 오래 살기 때문에 `set`만 하고 끝내면 이전 요청 값, request object graph, classloader reference가 다음 작업까지 남을 수 있다.\n\n그래서 면접 답변은 \"ThreadLocal이 나쁘다\"보다 \"수명 경계를 request/filter/interceptor/executor wrapper의 `try/finally`로 닫고, thread hop에서는 capture/restore 정책을 따로 둔다\"가 안전하다.\n\n## 답변 확장 축\n\n- ThreadLocal은 key를 통해 thread 내부 map에 값을 저장한다. 문제는 thread가 요청보다 오래 살 때 value의 수명도 요청보다 길어질 수 있다는 점이다.\n- `remove()`는 정상 흐름뿐 아니라 예외 흐름에서도 실행되어야 하므로 filter/interceptor의 `finally` 경계가 중요하다.\n- weak key 이야기를 하더라도 value가 자동으로 사라진다고 단정하지 않는다. thread가 살아 있고 map entry가 정리되지 않으면 retention이 남을 수 있다.\n- nested 호출이나 기존 worker context가 있을 수 있으면 무조건 clear만 하지 말고 이전 값을 저장했다가 restore할지, 해당 request boundary에서는 remove할지 소유권을 정해야 한다.\n- 비동기 경계에서는 \"값이 안 보임\"과 \"잘못된 값이 보임\"이 모두 가능하다. 복사, 래핑, 명시적 parameter 전달, scope 기반 API 중 무엇을 쓸지 선택해야 한다.\n- `InheritableThreadLocal`은 새 thread 생성 시점 복사 모델이라 이미 만들어진 pool worker나 `CompletableFuture` stage hop의 전파 해법으로 설명하면 안 된다.\n- 면접에서는 ThreadLocal 자체를 금지한다고 답하기보다 lifecycle과 cleanup 책임을 설계해야 한다고 말하는 편이 안전하다.\n\n## 코드 리뷰 체크포인트\n\n- request entry filter/interceptor는 `set` 이후 모든 성공/예외/timeout 경로에서 `finally` cleanup을 가진다.\n- MDC, security context, tenant id처럼 framework가 관리하는 context는 `clear`보다 snapshot restore가 맞는지 확인한다. 같은 worker에서 바깥 scope가 이미 값을 갖고 있을 수 있다.\n- executor wrapper는 submit 시점 context를 capture하고, run 시점에 worker의 이전 context를 보관한 뒤, 작업 종료 후 원래 상태로 복원한다.\n- request 객체, session, entity graph처럼 큰 object를 ThreadLocal에 직접 넣지 않는다. 필요한 immutable id나 작은 context 값으로 줄인다.\n- 재배포 가능한 서버에서는 custom ThreadLocal value가 application classloader를 붙잡는지 본다. static ThreadLocal, third-party library ThreadLocal, JDBC driver/thread도 같이 확인한다.\n\n## 운영에서 보는 신호\n\n- heap dump의 dominator tree에서 worker thread, ThreadLocalMap, request/session/security object가 이어지는지 확인한다.\n- trace id나 사용자 id가 섞이면 access log와 application log의 thread name, request id, executor hop을 맞춰 본다.\n- thread pool 크기와 누수 재현 빈도가 함께 움직이면 thread reuse와 request cleanup 경계를 의심한다.\n- async executor로 넘어가는 코드에 MDC/security context decorator가 있는지, 작업 종료 후 clear하는지 본다.\n- redeploy 뒤 metaspace나 old generation이 내려가지 않으면 old webapp classloader로 이어지는 retained path에 ThreadLocal value가 있는지 본다.\n- thread dump에서 같은 worker가 여러 요청을 처리하는 이름 패턴과 heap dump retained path를 함께 맞춰야, 단순 heap 증가와 request-context leak를 구분할 수 있다.\n\n## 운영 대응 순서\n\n1. 증상을 둘로 나눈다. \"이전 요청 값이 보임\"은 기능 오염이고, \"객체가 안 내려감\"은 retention 문제다.\n2. thread name, request id, executor name을 로그에 맞춰 같은 worker 재사용이 있는지 확인한다.\n3. heap dump에서는 `Thread -> ThreadLocalMap -> Entry -> value` 경로와 value가 붙잡는 object graph를 본다.\n4. 코드에서는 request boundary, async submission boundary, callback boundary의 `set/capture -> try -> finally remove/restore` 대칭성을 확인한다.\n5. 임시 대응은 재시작이나 pool recycle일 수 있지만, 근본 수정은 cleanup 누락과 context propagation 소유권을 고치는 것이다.\n\n## 흔한 오해\n\n- ThreadLocal은 \"전역 변수보다 안전한 요청 저장소\"가 아니다. thread 수명에 묶인 저장소다.\n- 요청이 끝나면 JVM이 알아서 값을 지운다고 보면 안 된다. thread pool에서는 thread가 계속 살아 있다.\n- weak reference key 때문에 leak가 없다고 단정할 수 없다. value retention과 stale entry cleanup은 별도 문제다.\n- context propagation 라이브러리를 쓰면 cleanup 책임이 사라지는 것이 아니라 boundary가 바뀐다.\n- virtual thread로 바꾸면 모든 ThreadLocal 문제가 끝난다고 말하면 과장이다. pool reuse leak는 줄 수 있어도 context hop, 큰 값 보관, framework 호환 문제는 남는다.\n\n## 관련 playbook\n\n전파와 누수는 `threadlocal-leaks-context-propagation`으로 이어진다.\n",
+  "aliases": [
+    "ThreadLocal leak interview",
+    "ThreadLocal memory leak router",
+    "ThreadLocal 면접 디버깅",
+    "request context leak answer",
+    "CompletableFuture",
+    "static"
+  ],
+  "expected_queries": [
+    "ThreadLocal memory leak를 면접에서 어떻게 설명해?",
+    "웹 요청에서 ThreadLocal 값을 remove하지 않으면 왜 위험해?",
+    "thread pool과 ThreadLocal leak를 연결해줘",
+    "ThreadLocal set null과 remove 차이는 뭐야?"
+  ],
+  "symptoms": [
+    "이전 요청의 사용자 정보가 다음 요청에 남아요",
+    "heap dump에서 ThreadLocalMap value가 오래 살아 있어요",
+    "thread pool을 쓰는 서버에서 요청 context가 섞입니다",
+    "MDC나 SecurityContext가 async executor 이후 이상하게 남아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/threadlocal-leak-web-request-router"
+    ],
+    "next_docs": [
+      "language/threadlocal-leaks-context-propagation"
+    ],
+    "confusable_with": [
+      "language/threadlocal-leak-web-request-router",
+      "language/threadlocal-leaks-context-propagation"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/threadlocal-leak-interview-router.md",
+    "revision_history": []
+  }
+}

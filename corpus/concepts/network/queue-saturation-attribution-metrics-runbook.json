@@ -1,0 +1,64 @@
+{
+  "id": "network/queue-saturation-attribution-metrics-runbook",
+  "title": "Queue Saturation Attribution, Metrics, Runbook",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 운영자가 응답 지연을 upstream 처리 시간 증가와 처리 시작 전",
+  "body_markdown": "# Queue Saturation Attribution, Metrics, Runbook\n\n> 한 줄 요약: queue saturation은 \"upstream이 느리다\"와 다른 문제다. 실제 네트워크 I/O 전에 worker queue, pending acquire, stream queue, sidecar dispatch 대기에서 timeout budget이 먼저 타는지를 분리해서 봐야 한다.\n>\n> 문서 역할: 이 문서는 network 운영 cluster 안에서 **queue wait attribution과 현장 triage 순서**를 맡는 runbook이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Upstream Queueing, Connection Pool Wait, Tail Latency](./upstream-queueing-connection-pool-wait-tail-latency.md)\n> - [Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB](./request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md)\n> - [Connection Pool Starvation, Stale Idle Reuse, Debugging](./connection-pool-starvation-stale-idle-reuse-debugging.md)\n> - [HTTP/2 MAX_CONCURRENT_STREAMS, Pending Queue, Saturation](./http2-max-concurrent-streams-pending-queue-saturation.md)\n> - [Retry Storm Containment, Concurrency Limiter, Load Shedding](./retry-storm-containment-concurrency-limiter-load-shedding.md)\n> - [Adaptive Concurrency Limiter, Latency Signal, Gateway/Mesh](./adaptive-concurrency-limiter-latency-signal-gateway-mesh.md)\n> - [Mesh Adaptive Concurrency, Local Reply, Metrics Tuning](./mesh-adaptive-concurrency-local-reply-metrics-tuning.md)\n> - [Proxy Local Reply vs Upstream Error Attribution](./proxy-local-reply-vs-upstream-error-attribution.md)\n> - [Timeout Budget Propagation Across Proxy, Gateway, Service Hops](./timeout-budget-propagation-proxy-gateway-service-hop-chain.md)\n\nretrieval-anchor-keywords: queue saturation, queue wait attribution, pending acquire, worker queue, dispatch latency, backlog, queue depth, timeout before dispatch, connection pool wait, stream queue, local overload, inflight limit, overload runbook\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nqueue saturation은 \"응답 시간이 길다\"는 현상을 **실제 처리 시간 증가**와 **처리 시작 전 대기 증가**로 분리하는 문제다.\n\n- worker queue가 길어져 dispatch가 늦다\n- connection pool pending acquire가 길다\n- H2/H3 stream slot queue가 쌓인다\n- sidecar/gateway inflight limit에 막혀 local reply가 먼저 난다\n- socket write backlog나 event loop backlog가 누적된다\n\n중요한 점은 이 현상들이 사용자에게는 전부 비슷하게 보인다는 것이다.\n\n- `connect timeout`\n- `504`\n- mesh/gateway `503`\n- p95/p99 tail latency 급등\n- app은 평균 service time이 크게 안 오른 것처럼 보임\n\n그래서 queue saturation runbook의 목표는 \"느리다\"를 넘어 **어디서 아직 시작도 못 했는지**를 찾는 것이다.\n\n### Retrieval Anchors\n\n- `queue saturation`\n- `queue wait attribution`\n- `pending acquire`\n- `dispatch latency`\n- `timeout before dispatch`\n- `worker queue backlog`\n- `stream queue`\n- `local overload`\n\n## 깊이 들어가기\n\n### 1. queue는 한 종류가 아니다\n\n실전에서 자주 섞이는 queue는 다음과 같다.\n\n- app thread pool / worker queue\n- client connection pool pending acquire\n- HTTP/2 `MAX_CONCURRENT_STREAMS` pending queue\n- gateway / sidecar inflight queue\n- async executor / event loop task queue\n- socket write backlog\n\nrunbook 첫 단계는 \"queue가 있다\"가 아니라 **어느 계층 queue인지 이름을 붙이는 것**이다.\n\n### 2. 봐야 할 메트릭은 depth보다 wait time이 먼저다\n\nqueue depth만 보면 오해하기 쉽다.\n\n- depth는 짧아도 대기 시간이 길 수 있다\n- burst 순간에는 sampling 주기 때문에 depth가 안 잡힐 수 있다\n- autoscale 직후 drain/retry 때문에 depth보다 timeout이 먼저 튈 수 있다\n\n우선순위는 보통 이렇다.\n\n1. queue wait / pending duration\n2. timeout-before-dispatch 비율\n3. local reject / local reply reason\n4. queue depth / inflight\n5. downstream service time\n\n즉 \"몇 개가 쌓였나\"보다 **얼마나 오래 못 나갔나**가 더 직접적인 증거다.\n\n### 3. attribution 순서는 upstream blame보다 앞단 대기부터다\n\n다음 순서로 보면 헷갈림이 줄어든다.\n\n1. 요청이 upstream connect를 시작했는가\n2. connect 이전에 pool/worker queue에서 기다렸는가\n3. proxy가 local timeout/local reject를 냈는가\n4. upstream service time이 실제로 늘었는가\n\n판단 예시:\n\n- queue wait 급등 + upstream connect 수 정체\n  - local saturation 가능성이 높다\n- pending acquire 급등 + app CPU 평이\n  - pool/stream slot 병목 가능성이 높다\n- local reply `503` 급등 + app access log 공백\n  - gateway/mesh 보호 계층이 먼저 잘랐을 수 있다\n- TTFB만 증가하고 queue wait은 안정\n  - upstream think time이나 lock/contention 쪽을 더 의심한다\n\n### 4. timeout ladder를 같이 봐야 한다\n\nqueue saturation은 timeout budget을 조용히 태운다.\n\n예:\n\n- end-to-end timeout 2s\n- gateway timeout 1.5s\n- pool acquire timeout 800ms\n- upstream connect timeout 300ms\n\n이때 pending acquire에서 900ms를 쓰면:\n\n- connect는 아직 시작도 못 했는데\n- gateway 기준으로는 이미 절반 이상을 잃는다\n- retry까지 겹치면 사실상 성공 확률이 급락한다\n\n그래서 runbook에는 항상 **timeout-before-dispatch** 관점이 들어가야 한다.\n\n### 5. 증폭기는 queue를 더 오래 숨긴다\n\nqueue saturation을 키우는 전형적인 증폭기:\n\n- 무제한 retry\n- long-lived stream과 short RPC 공유 pool\n- fan-out 경로에서 느린 shard 하나\n- stale idle reuse로 borrow 실패 후 재시도\n- route class 분리 없는 adaptive limiter\n\n이런 경우 queue 자체보다 **queue를 만드는 구조**를 같이 적어야 한다.\n\n### 6. 현장 triage는 \"더 많은 queue를 허용\"이 아니라 \"어느 queue를 줄일지\"다\n\n자주 쓰는 triage 선택지는 다음과 같다.\n\n- fail-fast로 pending queue cap 축소\n- hot route와 background route 분리\n- long-lived traffic 전용 pool 분리\n- retry budget 축소\n- inflight limiter / concurrency limiter 조정\n- timeout hierarchy 재정렬\n\n핵심은 queue를 키워 숨기는 게 아니라, **중요 경로의 대기 시간을 먼저 끊는 것**이다.\n\n## 실전 시나리오\n\n### 시나리오 1: p99만 급등하고 upstream 평균 latency는 안정적이다\n\n우선 확인:\n\n- pending acquire time\n- worker queue wait\n- timeout-before-dispatch 비율\n- retry count\n\n이 패턴은 service time보다 queue wait가 먼저 무너지는 경우가 많다.\n\n### 시나리오 2: mesh 503이 늘었는데 app 로그는 비어 있다\n\n가능한 해석:\n\n- sidecar local reply\n- route-level inflight cap 초과\n- adaptive concurrency 과민 반응\n\n이때 app 오류율보다 local reply reason과 queue pressure를 먼저 본다.\n\n### 시나리오 3: `connect timeout`이 늘었는데 실제 connect latency는 평이하다\n\n자주 놓치는 경우:\n\n- request가 connect 호출 전 pool에서 기다렸다\n- H2 stream slot을 못 얻어 socket I/O가 늦었다\n- event loop backlog로 dispatch가 밀렸다\n\n즉 connect timeout surface가 곧 connect phase 원인이라는 뜻은 아니다.\n\n### 시나리오 4: queue depth는 낮은데 사용자 timeout은 많다\n\n가능한 원인:\n\n- sampling interval이 길다\n- 대기 시간이 짧게 폭증했다가 사라진다\n- local reject가 queue를 길게 만들기 전에 잘라 버린다\n\n그래서 depth 한 장으로 판단하면 놓친다.\n\n## 코드로 보기\n\n### 메트릭 매핑\n\n```text\nqueue layer                 primary signal                     supporting signal\nworker queue                dispatch wait, queue wait p95      active workers, reject count\nconnection pool            pending acquire time               active/idle conn, borrow timeout\nH2/H3 stream queue         pending stream wait                active streams per conn\ngateway/mesh               local reply reason, inflight       route class, upstream selected 여부\nretry path                 retry attempt count                timeout ladder, duplicated work\n```\n\n### 현장 질문\n\n```text\n- 이 요청은 upstream connect를 실제로 시작했는가\n- timeout이 dispatch 전에 났는가, upstream 처리 중에 났는가\n- pending acquire와 service time 중 무엇이 먼저 올랐는가\n- local reply/source tag가 있는가\n- queue를 키운 증폭기(retry, long-lived stream, mixed route)가 있는가\n```\n\n### 짧은 triage 흐름\n\n```text\n1. queue wait / pending duration 확인\n2. local reply / reject source 확인\n3. upstream connect/TTFB/service time과 비교\n4. retry, stream mix, route class 혼합 여부 확인\n5. 중요한 경로부터 queue cap / isolation / limiter 조정\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|---|---|---|---|\n| 큰 queue 유지 | burst 흡수력이 있다 | tail latency와 zombie work를 숨긴다 | 짧은 순간 버스트 위주 |\n| 작은 queue + fail-fast | overload를 빨리 드러낸다 | 에러율이 더 빨리 보인다 | 보호가 더 중요한 경로 |\n| route/pool 분리 | 중요한 경로 격리가 좋다 | 운영 복잡도가 늘어난다 | mixed traffic |\n| adaptive limiter | 자동 보호가 가능하다 | 튜닝이 어렵고 false positive가 있다 | mesh/gateway |\n| retry 축소 | 증폭을 줄인다 | 순간 성공률이 내려갈 수 있다 | queue 증폭이 심할 때 |\n\n핵심은 queue saturation 대응이 단순 capacity 확장이 아니라 **대기 시간의 위치를 찾고 보호 경계를 다시 그리는 작업**이라는 점이다.\n\n## 꼬리질문\n\n> Q: queue saturation과 upstream slowness는 어떻게 구분하나요?\n> 핵심: upstream service time보다 queue wait, pending acquire, local reply source가 먼저 오르면 queue saturation 쪽 증거가 더 강하다.\n\n> Q: 가장 먼저 볼 메트릭은 무엇인가요?\n> 핵심: depth보다 wait time과 timeout-before-dispatch가 먼저다.\n\n> Q: 왜 queue를 그냥 크게 두면 안 되나요?\n> 핵심: burst 흡수는 되지만 tail latency와 retry 증폭을 더 오래 숨길 수 있다.\n\n> Q: app 로그가 비어 있는데 503이 많으면 무엇을 의심하나요?\n> 핵심: gateway/mesh local reply, inflight limiter, queue-based fail-fast를 먼저 본다.\n\n## 한 줄 정리\n\nqueue saturation runbook의 핵심은 느린 요청을 \"upstream이 늦다\"로 뭉개지 않고, 실제 I/O 전에 어디서 얼마를 기다렸는지와 누가 먼저 잘랐는지를 분해해 보는 것이다.\n",
+  "aliases": [
+    "queue saturation",
+    "queue wait attribution",
+    "pending acquire",
+    "worker queue",
+    "dispatch latency",
+    "backlog",
+    "queue depth",
+    "timeout before dispatch",
+    "connection pool wait",
+    "stream queue",
+    "local overload",
+    "inflight limit",
+    "overload runbook"
+  ],
+  "expected_queries": [
+    "응답이 느린데 upstream이 아니라 앞단 queue 대기인지 어떻게 구분해?",
+    "pending acquire랑 worker queue 중 어디가 병목인지 보는 순서를 알려줘",
+    "timeout이 dispatch 전에 타는지 확인하는 runbook이 필요해",
+    "queue wait attribution을 운영에서 어떻게 잡아?",
+    "connection pool wait와 stream queue를 한 번에 분리해서 보고 싶어",
+    "local overload 때문에 503이 나는지 upstream이 느린지 헷갈려",
+    "backlog depth보다 wait time을 먼저 봐야 하는 이유가 뭐야?",
+    "요청이 아직 시작도 못 했는데 latency가 커질 수 있어?"
+  ],
+  "symptoms": [
+    "upstream이 느린 줄 알았는데 요청이 시작도 못 하고 대기해요",
+    "pending acquire나 worker queue 중 어디서 밀리는지 모르겠어요",
+    "timeout이 처리 전에 먼저 나가서 원인 위치를 못 잡겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/latency-bandwidth-throughput-basics",
+      "network/devtools-waterfall-primer",
+      "network/request-timing-decomposition"
+    ],
+    "next_docs": [
+      "network/http2-max-concurrent-streams-pending-queue-saturation",
+      "network/retry-storm-containment-concurrency-limiter-load-shedding",
+      "network/adaptive-concurrency-limiter-latency-signal-gateway-mesh"
+    ],
+    "confusable_with": [
+      "network/request-timing-decomposition",
+      "network/http2-max-concurrent-streams-pending-queue-saturation",
+      "network/mesh-adaptive-concurrency-local-reply-metrics-tuning"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/queue-saturation-attribution-metrics-runbook.md",
+    "revision_history": []
+  }
+}

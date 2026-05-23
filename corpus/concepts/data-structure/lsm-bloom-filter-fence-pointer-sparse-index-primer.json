@@ -1,0 +1,77 @@
+{
+  "id": "data-structure/lsm-bloom-filter-fence-pointer-sparse-index-primer",
+  "title": "LSM SSTable Lookup Primer: Bloom Filter, Fence Pointer, Sparse Index",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "이 문서는 LSM SSTable lookup primer로, memtable 확인 뒤 level/run의 SSTable을 탐색할 때 Bloom filter, fence pointer, sparse index, block index, data block scan이 어떤 순서로 read amplification을 줄이는지 설명한다. Bloom false positive/no false negative, compaction, point lookup vs range scan, B+Tree page search, hash index, learned index 비교 질문이 본 문서에 매핑된다.",
+  "body_markdown": "# LSM SSTable Lookup Primer: Bloom Filter, Fence Pointer, Sparse Index\n\n> 한 줄 요약: LSM의 SSTable 조회는 `memtable -> Bloom filter -> sparse index/fence pointer -> block index -> data block` 순서로 \"볼 필요 없는 파일과 블록\"을 줄이는 단계형 read path다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [LSM-Friendly Index Structures](./lsm-friendly-index-structures.md)\n> - [Bloom Filter](./bloom-filter.md)\n> - [Bloom Filter vs Cuckoo Filter](./bloom-filter-vs-cuckoo-filter.md)\n> - [Cache-Oblivious B-Tree / Leaf-Packed Variants vs Plain vEB Layout](./cache-oblivious-b-tree-vs-plain-veb-layout.md)\n> - [Ordered Search Workload Matrix](./ordered-search-workload-matrix.md)\n> - [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)\n> - [B-Tree vs Hash Index chooser](../database/btree-vs-hash-index-chooser.md)\n\n## 먼저 mental model\n\nLSM-tree를 \"디스크에 있는 하나의 큰 트리\"로 보면 SSTable 조회가 헷갈린다.  \n더 정확한 모델은 **여러 개의 정렬된 불변 run을 최신 순서대로 확인하는 구조**다.\n\n```text\nwrite\n  -> memtable에 먼저 반영\n  -> flush되면 immutable SSTable 생성\n  -> compaction이 여러 SSTable을 합쳐 level/run을 정리\n\nread(key)\n  -> memtable / immutable memtable 확인\n  -> 후보 SSTable마다 Bloom filter로 \"없음\" 빠르게 배제\n  -> key range에 걸리면 sparse index / fence pointer로 block 후보 축소\n  -> block index 또는 restart point로 data block 내부 탐색\n  -> tombstone / sequence number / 최신 버전 규칙 적용\n```\n\n여기서 중요한 감각은 \"Bloom filter가 key를 찾는다\"가 아니다.  \nBloom filter는 **이 SSTable을 열 필요가 없는지** 먼저 묻는 장치이고, 실제 위치 좁히기는 sparse index와 block index가 맡는다.\n\n## 조회 경로 한눈에 보기\n\n| 단계 | 보는 대상 | 답하는 질문 | 실패하면 |\n|---|---|---|---|\n| memtable | 메모리의 최신 쓰기 | 최신 값이나 tombstone이 이미 있는가 | 디스크 SSTable 후보로 이동 |\n| SSTable key range | 파일 metadata의 min/max key | 이 파일 범위에 key가 들어갈 수 있는가 | 해당 파일 skip |\n| Bloom filter | SSTable 또는 partition별 membership filter | 이 파일에 key가 없다고 말할 수 있는가 | `false`면 skip, `true`면 다음 단계 |\n| sparse index / fence pointer | block별 시작 key 또는 대표 key | 어느 data block 근처를 열어야 하는가 | 후보 block 범위를 좁힘 |\n| block index / restart point | data block 내부 index | block 안에서 어디부터 비교할 것인가 | block 내부 binary search 또는 짧은 scan |\n| data block | 실제 정렬 key-value entry | 최신 값, 삭제 표시, 버전이 무엇인가 | 다음 후보 run/level 확인 |\n\n이 표를 보면 역할이 분명해진다.\n\n- Bloom filter: 파일 접근 자체를 줄인다.\n- fence pointer / sparse index: 파일 안에서 볼 block을 줄인다.\n- block index: block 안에서 비교 범위를 줄인다.\n- compaction: 앞으로 확인해야 할 run 수와 중복 버전 수를 줄인다.\n\n## 핵심 개념\n\n### 1. Memtable은 항상 먼저 본다\n\nLSM은 write를 먼저 memtable에 받는다. 그래서 point lookup은 보통 다음 순서로 최신성을 확인한다.\n\n1. active memtable\n2. immutable memtable\n3. Level 0의 최신 SSTable들\n4. 더 낮은 level의 SSTable들\n\nmemtable이 먼저인 이유는 간단하다. 아직 flush되지 않은 최신 값이 디스크에는 없을 수 있고, 삭제도 tombstone으로 memtable에만 남아 있을 수 있기 때문이다.\n\n### 2. Bloom filter는 negative lookup을 줄인다\n\nBloom filter는 \"이 key가 이 SSTable에 없을 가능성\"을 빠르게 판단한다.\n\n| Bloom 결과 | 의미 | SSTable lookup 행동 |\n|---|---|---|\n| `false` | 확실히 없다 | 이 SSTable의 index/data block을 읽지 않는다 |\n| `true` | 있을 수도 있다 | sparse index와 data block 확인으로 넘어간다 |\n\n중요한 구분:\n\n- **false positive**: 실제로 없는데 Bloom filter가 `true`라고 말한다. 가능하다. 비용은 불필요한 index/block read다.\n- **false negative**: 실제로 있는데 Bloom filter가 `false`라고 말한다. 정상적인 Bloom filter에서는 없어야 한다. 발생하면 데이터 손실처럼 보이는 심각한 버그다.\n\n따라서 Bloom filter의 `true`는 \"찾았다\"가 아니라 **\"확인하러 가도 된다\"** 이다.\n\n### 3. Fence pointer는 \"정답 위치\"가 아니라 \"블록 경계 표지판\"이다\n\nSSTable은 key 순서로 정렬된 data block들의 묶음이다. 모든 key를 메모리 index에 올리면 빠르지만 비싸다. 그래서 보통 block마다 대표 key를 둔다.\n\n```text\nSSTable\n\ndata block 0: [apple ... carrot]\ndata block 1: [cat   ... mango]\ndata block 2: [map   ... zebra]\n\nsparse index / fence pointers\n  apple -> block 0\n  cat   -> block 1\n  map   -> block 2\n```\n\n`key = \"kiwi\"`를 찾을 때 sparse index는 `\"cat\" <= kiwi < \"map\"` 같은 식으로 block 1을 가리킨다.  \n즉 fence pointer는 key 존재를 증명하지 않는다. **열어 볼 data block의 범위를 좁힐 뿐**이다.\n\n### 4. Block index는 block 내부 탐색을 줄인다\n\ndata block은 다시 prefix compression, restart point, 작은 offset table 같은 내부 구조를 가질 수 있다.\n\n- sparse index/fence pointer: 어느 block인가\n- block index/restart point: block 안에서 어느 구간인가\n- data entry scan: 실제 key 비교와 value/tombstone 확인\n\n학습자가 자주 섞는 지점이 여기다. sparse index와 block index는 둘 다 \"index\"지만 층위가 다르다.\n\n| 이름 | 범위 | 보통 담는 것 | 목적 |\n|---|---|---|---|\n| sparse index | SSTable 전체 | block별 첫 key, block offset | 읽을 block 선택 |\n| fence pointer | block 경계 | min key 또는 separator key | key range 좁히기 |\n| block index | data block 내부 | restart point, local offset | block 내부 비교량 감소 |\n\n### 5. Level과 run 수가 read amplification을 만든다\n\nLSM은 같은 key의 여러 버전이 여러 run에 남아 있을 수 있다. 그래서 읽기는 한 파일만 보면 끝나지 않을 수 있다.\n\n| 구조 상태 | point lookup 비용 감각 | range scan 비용 감각 |\n|---|---|---|\n| Level 0에 overlap SSTable이 많음 | 여러 run을 최신순으로 확인해야 한다 | 겹치는 run들을 merge해야 해서 비싸다 |\n| leveled compaction으로 L1+ key range가 non-overlap | level마다 후보 SSTable이 줄어든다 | level별 sorted run merge가 필요하지만 중복은 줄어든다 |\n| size-tiered compaction으로 run이 많이 남음 | Bloom filter가 있어도 여러 filter를 확인한다 | 여러 sorted run을 동시에 merge한다 |\n| compaction 직후 중복 버전과 tombstone이 줄어듦 | 확인할 후보와 stale entry가 줄어든다 | scan 중 skip해야 할 항목이 줄어든다 |\n\nread amplification은 \"논리적으로 key 하나를 읽는데 내부적으로 몇 개의 memtable, SSTable, filter, index block, data block을 건드렸는가\"다.  \nBloom filter는 이 중 일부를 줄이고, compaction은 후보 run 자체를 줄인다.\n\n## Point lookup vs range scan\n\nBloom filter는 point lookup에서 특히 강하다. key 하나가 없을 때 대부분의 SSTable을 빠르게 skip할 수 있기 때문이다.\n\n반대로 range scan은 `key 하나가 있나?`가 아니라 `이 구간의 key들을 순서대로 내놔`에 가깝다. Bloom filter는 범위 전체에 대한 답을 주지 못한다.\n\n| 조회 유형 | Bloom filter 효과 | sparse index/fence pointer 효과 | 핵심 비용 |\n|---|---|---|---|\n| point lookup existing key | 후보 SSTable 일부만 줄인다 | 특정 block으로 바로 좁힌다 | 최신 버전 찾기, tombstone 확인 |\n| point lookup missing key | 매우 크다 | Bloom이 `true`인 false positive 파일에서만 사용 | negative lookup read amplification |\n| short range scan | 낮다 | 시작 block을 찾는 데 도움 | block 연속 읽기와 merge |\n| long range scan | 거의 낮다 | 시작/끝 경계 찾기만 도움 | 여러 run/level의 sorted merge, stale entry skip |\n\n따라서 \"Bloom filter를 붙였으니 range scan도 빨라진다\"는 말은 대체로 틀린 추론이다.  \nrange scan은 block layout, compaction 상태, iterator merge, prefetch, tombstone 밀도가 더 크게 작용한다.\n\n## Compaction이 바꾸는 것\n\nCompaction은 단순한 청소 작업이 아니다. read path의 모양을 바꾼다.\n\n| compaction 효과 | read path 영향 |\n|---|---|\n| 여러 SSTable을 합쳐 run 수 감소 | point lookup이 확인할 후보가 줄어든다 |\n| 같은 key의 오래된 버전 제거 | 최신 버전을 찾기까지의 비교가 줄어든다 |\n| tombstone 정리 | 없는 key나 삭제된 key 확인 비용이 줄어든다 |\n| level range를 non-overlap에 가깝게 유지 | level마다 후보 파일 수가 제한된다 |\n| 새 SSTable 생성 | Bloom filter와 sparse index가 새 key set 기준으로 재작성된다 |\n\n하지만 compaction은 write amplification과 background I/O를 만든다.  \n즉 LSM은 write를 빠르게 받는 대신, 나중에 compaction으로 read amplification과 space amplification을 갚는 구조다.\n\n## B+Tree, Hash Index, Learned Index와 비교\n\n### 1. B+Tree page search와의 차이\n\nB+Tree는 하나의 page-oriented tree를 root에서 leaf까지 내려간다.  \nLSM은 여러 sorted run을 확인하면서 각 run 내부에서 sparse/block index를 쓴다.\n\n| 축 | B+Tree page search | LSM SSTable lookup |\n|---|---|---|\n| 기본 구조 | mutable page tree | immutable sorted run들의 집합 |\n| point lookup | root -> internal page -> leaf page | memtable -> 여러 SSTable 후보 -> block |\n| range scan | leaf page를 순서대로 따라가기 좋다 | 여러 run/level iterator를 merge해야 한다 |\n| write | page split/latch/random write 부담 | memtable append/flush 후 compaction |\n| read amplification | 보통 tree depth 중심 | level/run 수, Bloom false positive, block read 중심 |\n\n그래서 OLTP의 안정적인 range scan은 B+Tree가 단순하고, write-heavy ingest는 LSM이 매력적이다.\n\n### 2. Hash index와의 차이\n\nHash index는 equality lookup에 맞다. 정렬 순서가 없기 때문에 range scan이나 ordered iterator에는 약하다.\n\nLSM SSTable은 내부가 정렬되어 있으므로 range scan 자체는 가능하다. 다만 여러 run을 merge해야 해서 비용이 커질 수 있다.\n\n| 축 | Hash index | LSM SSTable lookup |\n|---|---|---|\n| 잘하는 것 | `key = x` | write-heavy + point lookup + ordered scan의 절충 |\n| range scan | 부적합 | 가능하지만 merge 비용 존재 |\n| false positive | 일반 exact hash table은 없음 | Bloom filter 단계에서 가능 |\n| storage 역할 | 보조 index 또는 in-memory map | storage engine의 파일 구조 일부 |\n\n### 3. Learned index와의 차이\n\nLearned index는 key 분포를 모델이 학습해 \"이 key가 대략 어느 위치에 있을지\" 예측하는 접근이다.  \nSSTable의 fence pointer도 위치를 좁힌다는 점에서는 비슷해 보이지만, 성격이 다르다.\n\n| 축 | Fence pointer / sparse index | Learned index |\n|---|---|---|\n| 위치 추정 방식 | 실제 block 경계 key를 저장 | key 분포 모델로 position 예측 |\n| 오차 처리 | 인접 block 또는 block 내부 탐색 | 예측 오차 범위 안에서 local search |\n| 업데이트 | SSTable 생성 시 함께 고정 | 모델 재학습/보정 필요 |\n| 실무 기본값 | 널리 쓰이는 단순한 구조 | workload와 분포 안정성이 맞을 때 검토 |\n\n학습 단계에서는 learned index를 \"sparse index의 상위호환\"으로 외우지 않는 편이 안전하다.  \n운영에서는 분포 변화, tail error, 재학습 비용, fallback search가 더 중요해진다.\n\n## 자주 틀리는 함정\n\n| 함정 | 왜 틀렸나 | 올바른 해석 |\n|---|---|---|\n| Bloom filter `true`면 key가 있다 | false positive가 가능하다 | `true`는 block 확인으로 넘어가라는 신호다 |\n| Bloom filter `false`도 가끔 틀릴 수 있다 | 정상 Bloom filter는 false negative가 없어야 한다 | `false`면 해당 SSTable은 skip해도 된다 |\n| fence pointer가 key 위치를 정확히 알려 준다 | block 경계를 알려 줄 뿐이다 | block 안에서 다시 비교해야 한다 |\n| sparse index가 촘촘할수록 무조건 좋다 | 메모리와 cache 비용이 늘어난다 | block 크기, index residency, workload를 같이 본다 |\n| compaction은 write path 문제다 | read 후보 run과 stale version을 줄인다 | read/write/space amplification을 함께 조절한다 |\n| range scan도 Bloom filter로 빨라진다 | Bloom은 point membership 질문에 맞다 | range는 iterator merge와 block locality가 핵심이다 |\n\n## 운영 감각으로 보는 튜닝 질문\n\n| 관측된 증상 | 먼저 의심할 것 | 확인 질문 |\n|---|---|---|\n| 없는 key 조회 p99가 높다 | Bloom filter miss율, false positive율, L0 run 수 | missing lookup이 몇 개 SSTable을 열고 있는가 |\n| 특정 시간대 range scan이 느리다 | compaction backlog, tombstone 밀도, run overlap | scan 중 몇 개 iterator를 merge하는가 |\n| point lookup이 가끔 튄다 | Level 0 overlap, block cache miss | 후보 SSTable과 data block read 수가 튀는가 |\n| write는 빠른데 disk I/O가 계속 높다 | compaction write amplification | compaction이 read 비용을 줄이는 대신 I/O를 밀어내는가 |\n| Bloom 메모리가 너무 크다 | bits-per-key, filter granularity | false positive 비용과 메모리 예산 균형이 맞는가 |\n\n## Verification questions\n\n> Q1. SSTable point lookup에서 Bloom filter가 `false`를 반환하면 어떤 일이 일어나야 하나요?\n> 의도: false negative가 없어야 한다는 전제를 이해하는지 확인\n> 핵심: 해당 SSTable에는 key가 없다고 보고 index/data block을 읽지 않고 skip한다.\n\n> Q2. Bloom filter가 `true`를 반환했는데 data block에서 key가 없을 수 있나요?\n> 의도: false positive를 비용 문제로 이해하는지 확인\n> 핵심: 가능하다. 이 경우 불필요한 sparse index/block read가 발생했을 뿐, 정답은 data block 비교가 확정한다.\n\n> Q3. fence pointer와 block index는 무엇이 다른가요?\n> 의도: SSTable 전체 경계와 block 내부 탐색 층위를 구분하는지 확인\n> 핵심: fence pointer/sparse index는 어느 data block을 볼지 좁히고, block index는 그 block 안에서 비교 시작점을 줄인다.\n\n> Q4. compaction이 point lookup read amplification을 줄이는 이유는 무엇인가요?\n> 의도: compaction을 단순 청소가 아니라 read path 재구성으로 보는지 확인\n> 핵심: 중복 버전, tombstone, overlap run을 줄여 확인해야 할 SSTable과 entry 수를 줄이기 때문이다.\n\n> Q5. range scan에서 Bloom filter보다 중요한 비용은 무엇인가요?\n> 의도: point membership과 ordered iterator workload를 분리하는지 확인\n> 핵심: 여러 run/level의 sorted iterator merge, block locality, tombstone skip, compaction 상태가 더 중요하다.\n\n## Safe next docs\n\n1. 전체 LSM 보조 구조 조합을 더 넓게 보려면 [LSM-Friendly Index Structures](./lsm-friendly-index-structures.md)를 본다.\n2. Bloom filter 자체의 false positive/no false negative 의미가 헷갈리면 [Bloom Filter](./bloom-filter.md)로 돌아간다.\n3. B+Tree와 LSM의 저장 엔진 trade-off를 비교하려면 [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)를 본다.\n4. range scan 중심의 ordered index layout이 궁금하면 [Cache-Oblivious B-Tree / Leaf-Packed Variants vs Plain vEB Layout](./cache-oblivious-b-tree-vs-plain-veb-layout.md)을 본다.\n5. equality-only index와 range-capable index를 DB 관점에서 고르려면 [B-Tree vs Hash Index chooser](../database/btree-vs-hash-index-chooser.md)를 본다.\n\n## 한 줄 정리\n\nLSM SSTable lookup은 Bloom filter 하나로 해결되는 조회가 아니라, memtable 최신성 확인, level/run 후보 축소, Bloom negative skip, fence pointer range narrowing, block 내부 탐색, compaction으로 만든 run 정리 효과가 함께 작동하는 read path다.\n",
+  "aliases": [
+    "lsm sstable lookup",
+    "sstable read path",
+    "lsm bloom filter",
+    "sstable bloom filter",
+    "fence pointer",
+    "sparse index",
+    "sstable sparse index",
+    "block index",
+    "data block index",
+    "memtable sstable lookup",
+    "lsm levels runs",
+    "lsm read amplification",
+    "point lookup range scan lsm",
+    "compaction read amplification",
+    "bloom false positive no false negative",
+    "lsm tree lookup internals",
+    "RocksDB LevelDB SSTable lookup",
+    "LSM 조회 경로",
+    "SSTable 조회",
+    "블룸 필터 SSTable",
+    "펜스 포인터",
+    "희소 인덱스"
+  ],
+  "expected_queries": [
+    "LSM SSTable에서 key 하나를 찾을 때 Bloom filter, sparse index, block index가 어떤 순서로 쓰여?",
+    "Bloom filter의 false positive와 false negative를 SSTable lookup 관점에서 구분해줘",
+    "fence pointer가 SSTable 조회에서 범위를 좁힌다는 말은 정확히 무슨 뜻이야?",
+    "compaction이 level과 run 수를 바꾸면 read amplification은 어떻게 달라져?",
+    "LSM의 point lookup과 range scan은 왜 Bloom filter 효과가 다르게 나타나?"
+  ],
+  "symptoms": [
+    "LSM에서 Bloom filter가 true를 반환하면 key가 실제로 존재한다고 확정해 버린다",
+    "fence pointer, sparse index, block index를 모두 같은 인덱스 층으로 섞어 어느 단계에서 범위를 좁히는지 설명하지 못한다",
+    "point lookup에는 Bloom filter가 큰 도움이 되지만 range scan에는 거의 도움이 되지 않는 이유를 놓친다",
+    "compaction이 write 비용만 만든다고 보고 level/run 수 변화가 read amplification을 어떻게 바꾸는지 보지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/bloom-filter",
+      "data-structure/hash-table-basics",
+      "data-structure/ordered-search-workload-matrix",
+      "database/bptree-vs-lsm-tree"
+    ],
+    "next_docs": [
+      "data-structure/lsm-friendly-index-structures",
+      "data-structure/bloom-filter",
+      "data-structure/cache-oblivious-b-tree-vs-plain-veb-layout",
+      "database/bptree-vs-lsm-tree",
+      "database/btree-vs-hash-index-chooser"
+    ],
+    "confusable_with": [
+      "data-structure/lsm-friendly-index-structures",
+      "data-structure/bloom-filter",
+      "data-structure/cache-oblivious-b-tree-vs-plain-veb-layout",
+      "database/bptree-vs-lsm-tree",
+      "database/btree-vs-hash-index-chooser",
+      "data-structure/hash-table-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/lsm-bloom-filter-fence-pointer-sparse-index-primer.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "id": "spring/transaction-debugging-playbook",
+  "title": "Spring Transaction Debugging Playbook",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "'이 문서는 Spring transaction 장애를 안 된다로 뭉뚱그리지 않고 proxy 적용,",
+  "body_markdown": "# Spring Transaction Debugging Playbook\n\n> 한 줄 요약: 트랜잭션 문제는 \"안 된다\"가 아니라, 프록시, 전파, 롤백, 커밋 시점 중 어디서 어긋났는지 찾아야 해결된다.\n>\n> 문서 역할: 이 문서는 spring 카테고리 안에서 **트랜잭션 장애 분석과 debugging 진입점**을 담당하는 deep dive다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [30초 진단 카드: Spring Self-Invocation 공통 오해 1페이지 카드](./spring-self-invocation-transactional-only-misconception-primer.md)\n> - [@Transactional 기초](./spring-transactional-basics.md)\n> - [Mini Debugging Card for `UnexpectedRollbackException`](./spring-unexpectedrollbackexception-mini-debugging-card.md)\n> - [@Transactional 깊이 파기](./transactional-deep-dive.md)\n> - [Spring Service-Layer Transaction Boundary Patterns](./spring-service-layer-transaction-boundary-patterns.md)\n> - [DB Lock Wait / Deadlock vs Spring Proxy / Rollback 빠른 분기표](./spring-db-lock-deadlock-vs-proxy-rollback-decision-matrix.md)\n> - [AOP와 프록시 메커니즘](./aop-proxy-mechanism.md)\n> - [Bean 생명주기와 스코프 함정](./spring-bean-lifecycle-scope-traps.md)\n> - [Spring `UnexpectedRollbackException` and Rollback-Only Marker Traps](./spring-unexpectedrollback-rollbackonly-marker-traps.md)\n> - [Spring Persistence Context Flush / Clear / Detach Boundaries](./spring-persistence-context-flush-clear-detach-boundaries.md)\n> - [Spring `@Transactional` and `@Async` Composition Traps](./spring-transactional-async-composition-traps.md)\n> - [Spring OAuth2 + JWT 통합](./spring-oauth2-jwt-integration.md)\n> - [Slow Query Analysis Playbook](../database/slow-query-analysis-playbook.md)\n\nretrieval-anchor-keywords: transaction debugging, transactional not applied, proxy transaction, self invocation, private method transaction, checked exception commit, rollbackFor, requires new partial commit, long transaction, lock wait, service layer transaction boundary, transaction debugging first check, propagation before proxy no, transactional propagation first mistake, proxy bypass first check, 30초 트랜잭션 진단 카드, transactional 먼저 볼 것, why transactional not applied first step, beginner transaction debugging route, self invocation before propagation, propagation 보다 프록시 먼저, this method transactional playbook route\n\n## 이 문서 다음에 보면 좋은 문서\n\n- 초급자라면 이 문서에 오래 머무르기 전에 [30초 진단 카드: Spring Self-Invocation 공통 오해 1페이지 카드](./spring-self-invocation-transactional-only-misconception-primer.md)로 먼저 내려가도 된다.\n- `@Transactional` 용어가 아직 낯설면 [@Transactional 기초](./spring-transactional-basics.md)로 한 번 돌아가서 `begin/commit/rollback`과 프록시 경계를 먼저 맞춘다.\n- 트랜잭션 기본 의미는 [@Transactional 깊이 파기](./transactional-deep-dive.md)로 되돌아가면 좋다.\n- service 경계와 ownership은 [Spring Service-Layer Transaction Boundary Patterns](./spring-service-layer-transaction-boundary-patterns.md)로 이어진다.\n- persistence context 증상은 [Spring Persistence Context Flush / Clear / Detach Boundaries](./spring-persistence-context-flush-clear-detach-boundaries.md)에서 더 깊게 다룬다.\n\n---\n\n## 핵심 개념\n\n트랜잭션 디버깅은 아래 네 가지를 분리해서 보는 작업이다.\n\n1. 트랜잭션이 시작됐는가\n2. 같은 트랜잭션 안에서 실행됐는가\n3. 예외가 롤백 조건에 해당하는가\n4. 커밋 시점에 다른 부작용이 끼어들지 않았는가\n\n이걸 못 분리하면, “DB가 이상하다”, “Spring이 이상하다”, “프록시가 이상하다”가 한 덩어리로 보인다.\n\n실무에서 가장 자주 터지는 것은 대개 다음이다.\n\n- self-invocation으로 `@Transactional`이 안 먹음\n- `RuntimeException`이 아닌 예외를 던져 커밋됨\n- `REQUIRES_NEW`로 기대와 다른 분리 커밋이 발생함\n- 락 대기 때문에 트랜잭션이 길어지고 p99가 튐\n\n`UnexpectedRollbackException`, `transaction marked as rollback-only`, `catch 했는데 마지막에 터짐`처럼 rollback-only 신호가 핵심이면 먼저 [Mini Debugging Card for `UnexpectedRollbackException`](./spring-unexpectedrollbackexception-mini-debugging-card.md)로 짧게 분기한 뒤 이 문서의 TRACE/로그 체크로 내려오면 된다.\n\n## 0. propagation 열기 전에 30초 먼저 확인\n\n초급자가 가장 자주 새는 지점은 `REQUIRES_NEW`, `NESTED`, rollback 옵션부터 파고드는 것이다.\n그 전에 먼저 확인할 질문은 하나다.\n\n`이 호출이 정말 프록시를 지나 `@Transactional`까지 도달했는가?`\n\n전파 옵션은 **트랜잭션 interception이 시작된 뒤**에야 의미가 있다. 프록시를 우회했다면 propagation을 아무리 바꿔도 출발점이 없다.\n\n| 코드/증상 단서 | 첫 판단 | 지금 바로 갈 문서 |\n|---|---|---|\n| `this.saveOrder()` 같은 내부 호출 | 프록시 우회 가능성이 가장 크다 | [30초 진단 카드](./spring-self-invocation-transactional-only-misconception-primer.md) |\n| `@Transactional private void save()` | propagation보다 메서드 경계가 먼저 문제다 | [@Transactional 기초](./spring-transactional-basics.md#private와-내부-호출은-구분만-하고-원리-설명은-다른-문서로-넘긴다) |\n| `new OrderService()`로 직접 만든 객체 | Bean이 아니라 프록시 자체가 없다 | [AOP 기초](./spring-aop-basics.md#checklist-direct-new) |\n| 위 세 가지는 아닌데도 롤백/분리 커밋이 이상하다 | 그때 propagation, rollback, lock 대기로 내려간다 | 이 playbook 계속 읽기 |\n\n짧게 외우면 이 순서다.\n\n1. 프록시를 탔나\n2. 트랜잭션이 실제로 시작됐나\n3. 그다음에야 propagation과 rollback 규칙을 본다\n\n---\n\n## 증상별 첫 분기\n\n이 playbook이 직접 받는 질문은 보통 아래 네 묶음이다.\n\n| 보이는 질문/증상 | 첫 분기 | 먼저 볼 문서 또는 섹션 |\n|---|---|---|\n| \"`@Transactional`이 안 먹어요\", \"왜 같은 클래스에서는 안 돼요?\" | 프록시를 탔는지부터 확인 | 위 `30초 먼저 확인`, [30초 진단 카드](./spring-self-invocation-transactional-only-misconception-primer.md) |\n| \"예외가 났는데 왜 커밋됐어요?\" | rollback 규칙과 예외 전파를 분리 | 아래 `실전 시나리오 1`, [Mini Debugging Card for `UnexpectedRollbackException`](./spring-unexpectedrollbackexception-mini-debugging-card.md) |\n| \"`REQUIRES_NEW` 때문에 일부만 남아요\" | 분리 커밋이 의도인지 사고인지 판단 | 아래 `실전 시나리오 3` |\n| \"트랜잭션이 길어지고 락 대기가 보여요\" | propagation보다 외부 호출/쿼리/락을 먼저 본다 | 아래 `깊이 들어가기 4`, [Slow Query Analysis Playbook](../database/slow-query-analysis-playbook.md) |\n\n즉 \"트랜잭션이 이상하다\"를 그대로 붙잡지 말고, **안 걸림 / 커밋됨 / 부분 커밋 / 장기화** 중 어느 증상인지 먼저 이름 붙이는 게 이 문서의 입구다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 먼저 프록시부터 의심한다\n\n`@Transactional`은 AOP 프록시를 통해 동작한다.\n따라서 첫 질문은 \"이 메서드가 프록시를 거쳤는가?\"다.\n\n체크 포인트:\n\n- 같은 클래스 내부 호출인가\n- private/final 메서드인가\n- 빈이 아닌 객체를 `new`로 생성했는가\n- 테스트에서 프록시가 아닌 직접 객체를 호출했는가\n\n### 2. 로그로 시작한다\n\n트랜잭션 문제는 로그가 없다면 거의 감으로만 보게 된다.\n\n실무에서 유용한 설정:\n\n```properties\nlogging.level.org.springframework.transaction=TRACE\nlogging.level.org.springframework.orm.jpa=DEBUG\nlogging.level.org.hibernate.SQL=DEBUG\nlogging.level.org.hibernate.type.descriptor.sql=TRACE\n```\n\n필요하면 SQL 파라미터 추적을 위해 p6spy나 datasource proxy를 붙인다.\n\n### 3. 전파와 롤백 규칙을 분리해서 본다\n\n전파는 \"이미 트랜잭션이 있으면 합류할지\"의 문제다.\n롤백은 \"예외를 만났을 때 실제로 커밋할지\"의 문제다.\n\n문제는 이 둘이 섞여 보인다는 점이다.\n\n예를 들어 바깥 트랜잭션이 있고 안쪽이 `REQUIRES_NEW`이면, 바깥이 실패해도 안쪽은 이미 커밋됐을 수 있다.\n\n### 4. DB lock 대기와 트랜잭션 시간을 같이 본다\n\n트랜잭션이 길어지는 흔한 이유:\n\n- 느린 쿼리\n- 인덱스 미사용\n- 외부 API 호출을 트랜잭션 안에서 함\n- 락 경합\n- 같은 row에 update가 몰림\n\n이 주제는 [Slow Query Analysis Playbook](../database/slow-query-analysis-playbook.md)와 같이 봐야 한다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 예외가 났는데 DB가 커밋됐다\n\n원인 후보:\n\n- 체크 예외를 던졌는데 rollbackFor를 안 줌\n- try/catch로 예외를 삼킴\n- 다른 스레드에서 일어난 예외라 트랜잭션이 못 봄\n\n### 시나리오 2: 트랜잭션이 걸린 줄 알았는데 안 걸렸다\n\n원인 후보:\n\n- 내부 메서드 호출\n- private 메서드\n- `new`로 생성한 객체\n- 테스트에서 프록시 바깥 객체를 직접 호출\n\n### 시나리오 3: `REQUIRES_NEW` 때문에 감사 로그는 남았는데 주문은 롤백됐다\n\n이건 버그일 수도 있고 의도일 수도 있다.\n핵심은 **같이 실패해야 하는지, 분리 커밋이 필요한지**를 먼저 판단하는 것이다.\n\n### 시나리오 4: 결제 트랜잭션이 길어져 락 대기가 폭증했다\n\n대응 순서:\n\n1. 트랜잭션 안에서 외부 호출이 있는지 본다\n2. 쿼리 실행 계획과 인덱스를 본다\n3. 락 잡는 순서와 범위를 본다\n4. 필요하면 트랜잭션 범위를 줄인다\n\n---\n\n## 코드로 보기\n\n### 롤백 규칙\n\n```java\n@Transactional(rollbackFor = Exception.class)\npublic void pay() throws Exception {\n    paymentRepository.save(new Payment());\n    throw new Exception(\"checked exception\");\n}\n```\n\n### self-invocation 문제\n\n```java\n@Service\npublic class OrderService {\n\n    public void placeOrder() {\n        saveOrder(); // 프록시를 안 탈 수 있다\n    }\n\n    @Transactional\n    public void saveOrder() {\n    }\n}\n```\n\n### 전파 분리\n\n```java\n@Service\npublic class AuditService {\n\n    @Transactional(propagation = Propagation.REQUIRES_NEW)\n    public void record(String message) {\n        auditRepository.save(new AuditLog(message));\n    }\n}\n```\n\n### 트랜잭션 상태 확인\n\n```java\nif (TransactionSynchronizationManager.isActualTransactionActive()) {\n    log.info(\"transaction active\");\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|---|---|---|---|\n| 큰 트랜잭션 | 단순하다 | 락과 실패 범위가 커진다 | 작은 유스케이스 |\n| 작은 트랜잭션 | 빠르게 끝난다 | 정합성 설계가 어려워진다 | 독립 작업 |\n| `REQUIRES_NEW` | 분리 커밋이 된다 | 추적이 어려워진다 | 감사 로그, 보조 기록 |\n| `rollbackFor` 명시 | 의도가 분명하다 | 규칙을 매번 적어야 한다 | 체크 예외가 중요한 경우 |\n\n---\n\n## 꼬리질문\n\n> Q: `@Transactional`이 안 먹는지 어떻게 가장 먼저 확인할 것인가?\n> 의도: 프록시/호출 경로 이해 확인\n> 핵심: self-invocation과 빈 프록시 여부부터 본다\n\n> Q: 체크 예외가 커밋되는 이유는 무엇인가?\n> 의도: rollback 규칙 이해 확인\n> 핵심: 기본 롤백 규칙이 런타임 예외 중심이다\n\n> Q: `REQUIRES_NEW`를 남용하면 왜 문제인가?\n> 의도: 전파 분리의 의미 이해 확인\n> 핵심: 커밋 경계가 쪼개져 추적이 어려워진다\n\n> Q: 트랜잭션이 길어지면 왜 장애가 되기 쉬운가?\n> 의도: DB lock과 운영 영향 이해 확인\n> 핵심: 락 점유와 대기열이 커진다\n\n---\n\n## 한 줄 정리\n\n트랜잭션 문제는 프록시, 전파, 롤백, 락 대기를 분리해서 보면 원인이 보인다.\n",
+  "aliases": [
+    "Spring transaction debugging",
+    "@Transactional not working",
+    "transaction proxy propagation rollback commit",
+    "rollback only debugging",
+    "transaction boundary troubleshooting",
+    "commit timing problem",
+    "@Async",
+    "@Service"
+  ],
+  "expected_queries": [
+    "Spring transaction 문제가 있을 때 proxy propagation rollback commit 중 어디부터 봐야 해?",
+    "@Transactional이 안 먹는 것처럼 보이는 원인을 디버깅 playbook으로 정리해줘",
+    "rollback-only와 checked exception rollback rule을 한 흐름에서 구분하고 싶어",
+    "transaction boundary가 service layer에서 어긋났는지 어떻게 확인해?"
+  ],
+  "symptoms": [
+    "@Transactional이 붙어 있는데 commit rollback이 기대와 다르게 동작한다.",
+    "self invocation, propagation, rollback rule, commit timing 중 어디가 문제인지 모른다.",
+    "UnexpectedRollbackException이나 checked exception commit surprise가 섞여 보인다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transactional-basics"
+    ],
+    "next_docs": [
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer"
+    ],
+    "confusable_with": [
+      "spring/self-invocation-proxy-misconception",
+      "spring/transactional-basics",
+      "spring/unexpectedrollbackexception-mini-debugging-card",
+      "spring/transaction-propagation-required-requires-new-rollbackonly-primer",
+      "spring/service-layer-transaction-boundary-patterns",
+      "spring/transaction-isolation-readonly-pitfalls"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-transaction-debugging-playbook.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "spring/aop-proxy-mechanism",
+  "title": "AOP와 프록시 메커니즘",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "'이 문서는 학습자가 스프링이 메서드 호출 앞뒤에 중간 레이어를 끼워 넣어",
+  "body_markdown": "# AOP와 프록시 메커니즘\n\n> 한 줄 요약: Spring AOP는 \"마법\"이 아니라, 빈 앞뒤에 프록시를 끼워 넣어 호출을 가로채는 구조다.\n\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../database/transaction-basics.md)\n\n> 관련 문서:\n> - [AOP 기초: 관점 지향 프로그래밍이 왜 필요한가](./spring-aop-basics.md)\n> - [Spring Self-Invocation 공통 오해 1페이지 카드: \"`@Transactional`만 문제\"가 아니다](./spring-self-invocation-transactional-only-misconception-primer.md)\n> - [Spring Bean과 DI 기초: Component Scan, Configuration, Proxy 감각 잡기](./spring-bean-di-basics.md)\n> - [IoC 컨테이너와 DI](./ioc-di-container.md)\n> - [Spring `@Configuration`, `proxyBeanMethods`, and BeanPostProcessor Chain](./spring-configuration-proxybeanmethods-beanpostprocessor-chain.md)\n> - [Spring Early Bean References and Circular Proxy Traps](./spring-early-bean-reference-circular-proxy-traps.md)\n> - [Spring Self-Invocation Proxy Trap Matrix: `@Transactional`, `@Async`, `@Cacheable`, `@Validated`, `@PreAuthorize`](./spring-self-invocation-proxy-annotation-matrix.md)\n> - [@Transactional 깊이 파기](./transactional-deep-dive.md)\n> - [Spring Cache 추상화 함정](./spring-cache-abstraction-traps.md)\n> - [Spring Method Validation Proxy Pitfalls](./spring-method-validation-proxy-pitfalls.md)\n> - [Spring Security Method Security Deep Dive](./spring-security-method-security-deep-dive.md)\n\nretrieval-anchor-keywords: proxy, advisor, pointcut, advice, target source, jdk dynamic proxy, jdk proxy, dynamic proxy, interface based proxy, cglib, self invocation proxy bypass, 메서드 호출 중간 가로채기, 어노테이션 왜 안 먹지 프록시, 왜 transactional 안 먹지 프록시, aop proxy mechanism basics\n\n---\n\n## 핵심 개념\n\nSpring AOP의 핵심은 **실제 객체(target)** 를 직접 호출하는 대신, **프록시(proxy)** 를 통해 메서드 호출을 한 번 거쳐 가게 만드는 것이다.\n\n즉, 호출 흐름은 대략 이렇게 바뀐다.\n\n```text\nClient -> Proxy -> Advice(부가기능) -> Target\n```\n\n여기서 프록시는 다음 역할을 한다.\n\n- 메서드 호출 전후에 공통 기능을 끼워 넣는다\n- 조건에 따라 다른 로직을 실행한다\n- 실제 객체를 감싸서 책임을 분리한다\n\nSpring AOP가 자주 쓰이는 대표 사례는 다음과 같다.\n\n- `@Transactional`\n- 로깅\n- 성능 측정\n- 보안 검사\n- 예외 변환\n\n이 문서는 [IoC 컨테이너와 DI](./ioc-di-container.md)에서 이어지는 내용이다.\nBean이 어떻게 생성되고, 그 Bean이 왜 프록시로 바뀔 수 있는지 이해해야 AOP가 보인다.\n\n## 검색어 브리지: primer 표현을 deep-dive 용어로 연결\n\n초급 문서에서 보던 말을 여기 용어로 바꾸면 이렇게 대응된다.\n\n| primer에서 들어온 말 | 이 문서에서 보는 정확한 말 | 먼저 볼 구간 |\n|---|---|---|\n| `프록시 안 지나면 annotation 안 먹음` | 프록시 기반 interception / self-invocation | [3. 왜 self-invocation이 문제인가](#3-왜-self-invocation이-문제인가) |\n| `this.method transactional 안됨` | 내부 호출이 target으로 직행해서 proxy bypass 발생 | [3. 왜 self-invocation이 문제인가](#3-왜-self-invocation이-문제인가) |\n| `JDK proxy`, `인터페이스 프록시` | JDK Dynamic Proxy | [2. JDK Dynamic Proxy와 CGLIB 차이](#2-jdk-dynamic-proxy와-cglib-차이) |\n| `CGLIB`, `클래스 프록시`, `proxyTargetClass` | 클래스 기반 subclass proxy | [2. JDK Dynamic Proxy와 CGLIB 차이](#2-jdk-dynamic-proxy와-cglib-차이) |\n| `final 메서드 프록시 왜 안 됨` | CGLIB가 상속/오버라이드 기반이라 final 제약 발생 | [시나리오 3](#시나리오-3-final-클래스메서드-때문에-cglib가-실패한다) |\n\n한 줄 mental model:\n\n- JDK proxy는 \"인터페이스 앞에 대리인\"을 세우는 느낌이다.\n- CGLIB는 \"원래 클래스를 상속한 대리 클래스\"를 만드는 느낌이다.\n- 둘 다 핵심은 같고, **호출이 프록시를 지나야 annotation 기능이 끼어든다**.\n\n---\n\n## 깊이 들어가기\n\n### 1. Spring AOP는 언제 프록시를 만들까\n\nSpring은 Bean 생성 후 `BeanPostProcessor` 단계에서 프록시를 만들 수 있다.\n즉, 실제 객체가 완성된 뒤에 감싸는 방식이다.\n\n대략적인 흐름은 다음과 같다.\n\n```text\nBean 생성 -> 의존성 주입 -> 초기화 -> BeanPostProcessor -> 프록시 생성 -> 컨테이너 등록\n```\n\n이 말은 곧, AOP는 객체 생성 그 자체를 바꾸는 게 아니라 **객체를 꺼내주는 시점과 호출 시점**을 바꾸는 것이다.\n\nSpring 내부에서는 이 과정에 `Advisor`와 `Pointcut`이 함께 엮인다.\n\n- Pointcut: 어디에 적용할지\n- Advice: 무엇을 할지\n- Advisor: 둘을 묶은 실행 단위\n\n즉, 프록시는 단순 래퍼가 아니라 \"적용 대상과 부가기능을 연결하는 실행 껍질\"이다.\n\n### 2. JDK Dynamic Proxy와 CGLIB 차이\n\nSpring은 상황에 따라 두 가지 방식 중 하나를 쓴다.\n\n| 방식 | 대상 | 장점 | 단점 |\n|------|------|------|------|\n| JDK Dynamic Proxy | 인터페이스 기반 | 표준 JDK 기능, 가볍다 | 인터페이스가 없으면 못 쓴다 |\n| CGLIB | 클래스 기반 | 인터페이스 없이도 가능 | final 클래스/메서드 제약, 생성 비용이 더 크다 |\n\n정리하면:\n\n- 인터페이스가 있으면 보통 JDK Dynamic Proxy를 먼저 고려한다\n- 인터페이스가 없으면 CGLIB가 필요하다\n- Spring Boot에서는 설정과 상황에 따라 둘 중 하나가 자동 선택된다\n\n초급자 관점에서는 아래 한 표만 먼저 기억해도 길을 잃지 않는다.\n\n| 지금 코드 모양 | Spring이 기대하는 프록시 방식 | 바로 떠올릴 질문 |\n|---|---|---|\n| 인터페이스를 통해 서비스 계약을 노출함 | JDK Dynamic Proxy 가능성이 큼 | \"호출이 인터페이스 경계로 들어오나?\" |\n| 구현 클래스만 있고 인터페이스가 없음 | CGLIB 가능성이 큼 | \"final 제약이 있나?\" |\n| `final class` 또는 `final method`가 보임 | CGLIB에 제약이 생김 | \"상속/오버라이드 기반 프록시가 막히지 않나?\" |\n\n### 3. 왜 self-invocation이 문제인가\n\n프록시는 **외부에서 프록시 객체를 통해 들어오는 호출**만 가로챈다.\n\n그런데 같은 클래스 내부에서 `this.someMethod()`처럼 호출하면, 그건 프록시를 거치지 않고 **실제 target 내부 호출**이 된다.\n\n그래서 다음과 같은 일이 발생한다.\n\n- 외부 호출에서는 `@Transactional`이 적용된다\n- 내부 자기 호출에서는 트랜잭션이 적용되지 않는다\n\n이게 self-invocation 문제다.\n\n같은 이유로 다음도 자주 헷갈린다.\n\n## 깊이 들어가기 (계속 2)\n\n- `@Transactional`\n- `@Cacheable`\n- `@Async`\n- `@Validated`\n- `@PreAuthorize`\n\n이들 모두 프록시 경계 밖의 내부 호출에서는 기대와 다를 수 있다.\n\n### 4. \"마법\"처럼 보이는 이유\n\n마법처럼 보이지만 실제로는 단순하다.\n\n- 컨테이너가 Bean을 만들고\n- 프록시가 그 Bean을 감싸고\n- 호출을 프록시가 먼저 받아\n- 필요하면 부가기능을 실행한 뒤 target으로 넘긴다\n\n즉, 핵심은 **호출을 가로채는 래퍼 객체**다.\n이 구조를 이해하지 못하면 `@Transactional`이나 `@Cacheable`이 왜 어떤 때는 되고 어떤 때는 안 되는지 설명할 수 없다.\n\n### 5. `AopContext`와 `exposeProxy`는 최후의 수단이다\n\n가끔 현재 프록시를 직접 가져와 내부 호출을 우회하려는 시도가 있다.\n\n```java\n((OrderService) AopContext.currentProxy()).saveOrder();\n```\n\n이 방식은 동작할 수 있지만, 설계를 숨기기 쉽다.\n\n- 설정이 필요하다\n- 테스트가 불편하다\n- 구조가 프록시 의존적으로 굳을 수 있다\n\n보통은 메서드를 분리하거나 책임을 나누는 편이 더 낫다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: `@Transactional`이 내부 호출에서 안 먹는다\n\n```java\n@Service\npublic class OrderService {\n\n    public void placeOrder() {\n        validate();\n        saveOrder(); // 같은 클래스 내부 호출\n    }\n\n    @Transactional\n    public void saveOrder() {\n        // DB insert\n    }\n}\n```\n\n`placeOrder()`에서 `saveOrder()`를 직접 부르면 프록시를 거치지 않는다.\n그래서 `saveOrder()`에 붙은 `@Transactional`은 기대대로 동작하지 않을 수 있다.\n\n이 문제는 [@Transactional 깊이 파기](./transactional-deep-dive.md)에서 더 자세히 이어진다.\n\n### 시나리오 2: 인터페이스 없이 AOP를 적용하려다 예상과 다르게 동작한다\n\n인터페이스가 없는 클래스에 JDK Proxy를 기대하면 적용이 안 된다.\n이 경우 CGLIB가 필요하다.\n\n### 시나리오 3: final 클래스/메서드 때문에 CGLIB가 실패한다\n\n```java\npublic final class PaymentService {\n    public final void pay() {\n        // CGLIB가 오버라이드할 수 없음\n    }\n}\n```\n\nCGLIB는 상속과 오버라이드를 기반으로 동작하므로 final 제약에 걸린다.\n\n### 시나리오 4: `@Configuration(proxyBeanMethods = true)`가 왜 같은 계열 문제를 푸는가\n\n설정 클래스 내부의 `@Bean` 메서드 호출도 결국 프록시 경계를 활용한다.\n\n이 문맥은 [Spring `@Configuration`, `proxyBeanMethods`, and BeanPostProcessor Chain](./spring-configuration-proxybeanmethods-beanpostprocessor-chain.md)와 같이 보면 자연스럽다.\n\n---\n\n## 코드로 보기\n\n### 1. 프록시가 호출을 가로채는 최소 예시\n\n```java\npublic interface Service {\n    void work();\n}\n\npublic class RealService implements Service {\n    @Override\n    public void work() {\n        System.out.println(\"target work\");\n    }\n}\n\npublic class LoggingHandler implements java.lang.reflect.InvocationHandler {\n    private final Object target;\n\n    public LoggingHandler(Object target) {\n        this.target = target;\n    }\n\n    @Override\n    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) throws Throwable {\n        System.out.println(\"before\");\n        Object result = method.invoke(target, args);\n        System.out.println(\"after\");\n        return result;\n    }\n}\n\nService proxy = (Service) java.lang.reflect.Proxy.newProxyInstance(\n    Service.class.getClassLoader(),\n    new Class<?>[] { Service.class },\n    new LoggingHandler(new RealService())\n);\n\nproxy.work();\n```\n\n이 코드는 Spring AOP의 원리를 아주 작게 축약한 것이다.\nSpring은 여기에 포인트컷, 어드바이스, 인터셉터 체인을 더 얹는다.\n\n### 2. self-invocation 우회 예시\n\n```java\n@Service\npublic class OrderService {\n    private final OrderService self;\n\n    public OrderService(@Lazy OrderService self) {\n        this.self = self;\n    }\n\n    public void placeOrder() {\n        self.saveOrder(); // 프록시를 통해 호출\n    }\n\n    @Transactional\n    public void saveOrder() {\n        // transactional boundary\n    }\n}\n```\n\n이 패턴은 동작은 하지만, 너무 쉽게 남용하면 구조가 지저분해진다.\n보통은 메서드를 분리하거나 책임을 나누는 편이 더 낫다.\n\n### 3. advisor chain을 이해하기 위한 관점\n\n프록시는 최종적으로 여러 어드바이스를 순서대로 태울 수 있다.\n\n## 코드로 보기 (계속 2)\n\n- transaction advisor\n- cache advisor\n- validation advisor\n- security advisor\n\n순서와 조합이 중요하므로, \"프록시가 있다\"보다 \"어떤 advisor가 붙었는가\"를 보는 게 더 실전적이다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| JDK Dynamic Proxy | 표준, 단순, 인터페이스 기반 설계에 잘 맞음 | 인터페이스 필요 | 서비스 계약이 명확할 때 |\n| CGLIB | 인터페이스 없이도 적용 가능 | final 제약, 상속 기반 한계 | 레거시 클래스에 AOP를 붙여야 할 때 |\n| 프록시 기반 AOP | 비침투적, 기존 코드 수정이 적음 | self-invocation 같은 함정이 있음 | Spring의 일반적인 공통 관심사 처리 |\n| 직접 호출/수동 래핑 | 구조가 명시적이고 이해하기 쉬움 | 반복 코드가 늘어남 | 아주 단순한 코드나 특수한 성능 요구가 있을 때 |\n\n핵심 판단 기준은 이렇다.\n\n- 공통 기능이 많고 반복되면 AOP가 유리하다\n- 호출 경로를 엄밀하게 추적해야 하면 프록시 함정을 경계해야 한다\n- 내부 호출이 많고 트랜잭션 경계가 복잡하면 설계를 먼저 나눠야 한다\n\n---\n\n## 꼬리질문\n\n> Q: `@Transactional`이 붙었는데 왜 어떤 메서드는 트랜잭션이 안 걸리나요?\n> 의도: 프록시 기반 AOP와 self-invocation 이해 여부 확인\n> 핵심: 외부 호출은 프록시를 거치지만 내부 `this` 호출은 거치지 않는다\n\n> Q: JDK Dynamic Proxy와 CGLIB의 차이를 단순히 \"인터페이스 유무\"로만 설명해도 되나요?\n> 의도: 구현 방식과 제약까지 아는지 확인\n> 핵심: JDK는 인터페이스 기반, CGLIB는 상속 기반이라 final 제약과 생성 비용 차이가 있다\n\n> Q: 프록시 기반 AOP가 왜 마법이 아닌가요?\n> 의도: Spring 내부 메커니즘을 추상화가 아니라 호출 흐름으로 이해하는지 확인\n> 핵심: Bean을 감싼 프록시가 메서드 호출을 가로채서 부가기능을 넣는 구조다\n\n> Q: `AopContext.currentProxy()`는 왜 최후의 수단인가?\n> 의도: 프록시 노출에 대한 설계 감각 확인\n> 핵심: 구조를 프록시 API에 묶어 버릴 수 있기 때문이다.\n\n---\n\n## 한 줄 정리\n\nSpring AOP는 target 객체를 직접 바꾸는 게 아니라, 프록시를 통해 호출을 가로채 공통 기능을 끼워 넣는 구조이며, 내부 자기 호출은 이 경로를 우회하기 때문에 주의해야 한다.\n",
+  "aliases": [
+    "AOP proxy",
+    "Spring proxy",
+    "JDK dynamic proxy",
+    "CGLIB",
+    "interception",
+    "self invocation",
+    "AOP 개념 vs proxy 메커니즘",
+    "aspect와 proxy 동작 차이",
+    "AOP proxy mechanism 구분",
+    "Spring 프록시는 항상 만들어지나",
+    "프록시 필요한 어노테이션이 있을 때만",
+    "@Async"
+  ],
+  "expected_queries": [
+    "Spring 프록시는 어떻게 동작해?",
+    "AOP랑 프록시는 무슨 관계야?",
+    "AOP 개념이랑 그게 어떻게 동작하는 proxy 메커니즘은 같은 문서에서 다뤄?",
+    "JDK proxy랑 CGLIB 차이가 뭐야?",
+    "Transactional은 왜 프록시가 필요해?",
+    "어노테이션 붙였는데 중간에서 가로채는 구조가 뭐야?",
+    "Spring은 모든 Bean을 proxy로 바꾸는 거야, 아니면 AOP 적용 대상만 proxy가 돼?"
+  ],
+  "symptoms": [
+    "`AOP와 프록시 메커니즘`를 정의 수준으로만 알고 실제 요청 처리, Bean lifecycle, 프록시, 트랜잭션 동작와 연결하지 못한다",
+    "`AOP와 프록시 메커니즘` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`AOP와 프록시 메커니즘`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "Spring 요청 처리, Bean, 프록시, 트랜잭션 로그가 섞여 어느 레이어 문제인지 분리하지 못한다",
+    "모든 Spring Bean이 proxy인지, advisor/pointcut에 걸리는 Bean만 proxy로 감싸지는지 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-di-basics"
+    ],
+    "next_docs": [
+      "spring/ioc-container-internals"
+    ],
+    "confusable_with": [
+      "design-pattern/facade-vs-adapter-vs-proxy-decision-guide",
+      "design-pattern/decorator-vs-proxy",
+      "design-pattern/decorator-proxy-basics",
+      "design-pattern/decorator-vs-proxy-decision-guide",
+      "spring/spring-self-invocation-aop-trap-advanced-deep-dive"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/aop-proxy-mechanism.md",
+    "revision_history": []
+  }
+}

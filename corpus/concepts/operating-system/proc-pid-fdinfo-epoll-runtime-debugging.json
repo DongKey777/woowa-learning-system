@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/proc-pid-fdinfo-epoll-runtime-debugging",
+  "title": "proc pid fdinfo Epoll Runtime Debugging",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 /proc/<pid>/fdinfo를 단순 fd 목록이 아니라 file offset, flags, epoll watch state 같은",
+  "body_markdown": "# /proc/<pid>/fdinfo, Epoll Runtime Debugging\n\n> 한 줄 요약: `/proc/<pid>/fdinfo`는 \"이 프로세스가 무슨 fd를 열었나\"를 넘어서, file offset, flags, epoll watch 상태 같은 런타임 fd 메타데이터를 보여 주는 저비용 현장 디버깅 도구다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [Open File Description, dup, fork, Shared Offsets](./open-file-description-dup-fork-shared-offsets.md)\n> - [epoll Level-Triggered, Edge-Triggered, ONESHOT Wakeup Semantics](./epoll-level-edge-oneshot-wakeup-semantics.md)\n> - [deleted-but-open files, log rotation, space leak debugging](./deleted-open-file-space-leak-log-rotation.md)\n> - [eventfd, signalfd, Epoll Control-Plane Integration](./eventfd-signalfd-epoll-control-plane-integration.md)\n\n> retrieval-anchor-keywords: /proc/pid/fdinfo, fdinfo, epoll fdinfo, file offset debug, fd flags debug, mount id, epoll watched fds, proc fd runtime state, pos flags\n\n## 핵심 개념\n\n`/proc/<pid>/fd`가 \"어떤 경로/객체를 열고 있는가\"를 보여 준다면, `/proc/<pid>/fdinfo/<fd>`는 그 fd의 런타임 상태를 더 자세히 보여 준다. 이 정보는 숨은 offset 공유, epoll 등록 상태, deleted-open file, descriptor flags 문제를 실제 프로세스 상태로 확인할 때 유용하다.\n\n- `/proc/<pid>/fd/<fd>`: 해당 fd가 가리키는 객체 링크다\n- `/proc/<pid>/fdinfo/<fd>`: 해당 fd의 offset, flags, mount id, 일부 객체별 추가 정보를 보여 준다\n- `epoll fdinfo`: 어떤 target fd들이 어떤 event mask로 등록됐는지 힌트를 줄 수 있다\n\n왜 중요한가:\n\n- 코드 없이도 \"이 프로세스가 지금 어떤 fd 상태인가\"를 좁힐 수 있다\n- shared offset 문제를 런타임에 검증할 수 있다\n- event loop가 어떤 fd를 어떻게 감시 중인지 확인하는 현장 디버깅이 가능하다\n\n## 깊이 들어가기\n\n### 1. `fdinfo`는 pathname보다 상태를 보여 준다\n\n같은 파일 path를 열고 있어도 상태는 다를 수 있다.\n\n- 현재 file offset\n- flags\n- mount id\n- 객체 종류별 추가 메타데이터\n\n그래서 `readlink /proc/<pid>/fd/<fd>`만으로는 안 보이는 문제가 `fdinfo`에는 드러난다.\n\n### 2. shared offset 디버깅에 특히 유용하다\n\n`dup()` 또는 `fork()` 공유 때문에 cursor가 꼬인다고 의심될 때, `fdinfo`의 offset 변화는 좋은 힌트가 된다.\n\n- 두 fd가 같은 path를 가리킨다\n- offset이 같이 움직이는 것처럼 보인다\n- 예상과 달리 read cursor가 분리되어 있지 않다\n\n이때 `fdinfo`는 \"정말 같은 열린 객체를 공유 중인지\"를 추론하는 단서가 된다.\n\n### 3. epoll fd도 런타임 관측이 가능하다\n\nevent loop 장애에서는 \"지금 이 epoll fd가 무엇을 감시하고 있는가\"가 궁금할 때가 있다. `fdinfo`는 epoll target과 event mask 정보를 보여 주는 힌트를 제공할 수 있다.\n\n- `tfd`: epoll interest list에 들어간 target fd 번호\n- `events`: 감시 중인 event mask와 input flag를 담은 hexadecimal mask\n- `data`: `epoll_ctl()` 등록 시 저장한 user data 값\n- rearm 누락처럼 보이는 문제를 간접 확인할 수 있다\n\n단, epoll `fdinfo`는 **interest list**를 보여 주는 도구이지 \"현재 ready queue에 이벤트가 쌓였는가\"를 직접 보여 주는 도구는 아니다. target fd가 있고 mask가 맞다는 것은 등록 상태의 증거이고, 실제 readiness 처리 여부는 `epoll_wait()` 반환, handler 로그, drain-to-`EAGAIN` 경로와 같이 봐야 한다.\n\n### 4. deleted-open과 log rotation도 같이 본다\n\ndeleted-open file 문제는 path만 보면 숨는다. 하지만 `fd` 링크와 `fdinfo`를 함께 보면 다음이 보인다.\n\n- `(deleted)` target\n- 여전히 살아 있는 fd 번호\n- offset이 계속 증가하는지 여부\n\n그래서 \"누가 계속 쓰고 있나\"를 매우 빠르게 잡을 수 있다.\n\n## 증상 router\n\n### 관찰 증거\n\n먼저 \"fd가 무엇을 가리키는가\"와 \"그 fd가 어떤 상태인가\"를 분리해서 본다.\n\n```bash\nls -l /proc/<pid>/fd\ncat /proc/<pid>/fdinfo/<fd>\n```\n\n추가로 epoll fd라면 같은 파일이 target fd 목록과 event mask를 보여 줄 수 있다. 일반 fd의 `flags`는 octal로 표시되고, epoll `events`는 hexadecimal mask로 표시된다. 출력 형식과 항목은 커널/객체 종류에 따라 달라질 수 있으므로, 없는 필드를 근거로 단정하지 않는다.\n\n### 1차 분기\n\n| 증상 | 먼저 볼 증거 | 다음 확인 |\n|------|--------------|-----------|\n| read cursor가 서로 꼬인다 | `fdinfo`의 `pos` 변화 | `dup()`/`fork()`로 open file description을 공유했는지 코드 경로를 본다 |\n| nonblocking이 기대와 다르다 | `fdinfo`의 `flags` | `fcntl(F_SETFL)` 적용 지점과 library wrapper를 본다 |\n| epoll event가 오지 않는다 | epoll fd의 `tfd`, `events`, `data` | fd가 등록됐는지, mask가 의도와 맞는지, `EPOLLONESHOT` rearm이 빠졌는지 본다 |\n| disk usage가 안 줄어든다 | `/proc/<pid>/fd`의 `(deleted)` 링크와 `pos` | 어떤 프로세스가 old inode를 계속 잡는지 본다 |\n| lsof 결과와 앱 로그가 다르다 | `/proc`의 현재 fd 상태 | 로그 시점과 현재 시점 차이를 분리한다 |\n\n### 다음 확인\n\n`fdinfo`는 원인을 확정하는 도구라기보다 runtime state를 좁히는 도구다. 다음 단계는 관찰한 축에 맞춘다.\n\n- offset/flags 문제: `strace -p <pid> -e trace=read,write,lseek,fcntl`처럼 최소 syscall 범위로 본다.\n- epoll 문제: event loop 등록/해제 로그, `EPOLL_CTL_MOD`, `EPOLLONESHOT` rearm 경로를 본다.\n- deleted-open 문제: fd를 가진 프로세스 재시작/close 가능성과 log rotation 정책을 본다.\n- shared fd 문제: parent/child fork 시점, `dup2`, socket/file descriptor handoff 경로를 본다.\n\n### 검증\n\n- offset 문제라면 같은 workload에서 `pos`가 의도한 fd에서만 움직인다.\n- epoll 문제라면 target fd 등록, event mask, rearm 시점이 event loop state와 맞는다.\n- deleted-open 문제라면 fd close/restart 후 `(deleted)` 링크와 disk usage가 함께 줄어든다.\n- flags 문제라면 `fdinfo`의 flags와 애플리케이션이 기대한 nonblocking/append 설정이 일치한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 두 worker의 file read cursor가 이상하게 꼬인다\n\n진단:\n\n```bash\nls -l /proc/<pid>/fd\ncat /proc/<pid>/fdinfo/<fd>\n```\n\n판단 포인트:\n\n- 두 fd의 path는 같지만 offset도 함께 움직이는가\n- `dup`/`fork` 공유 경로인지 의심할 만한가\n\n### 시나리오 2: epoll loop가 뭔가 등록을 놓친 것 같다\n\n진단:\n\n```bash\nls -l /proc/<pid>/fd\ncat /proc/<pid>/fdinfo/<epoll-fd>\n```\n\n판단 포인트:\n\n- target fd가 실제로 epoll에 들어가 있는가\n- 기대한 event mask가 보이는가\n- `EPOLLONESHOT` 재arm bug처럼 보이는가\n\n### 시나리오 3: disk usage가 안 줄어드는데 누가 deleted file을 잡고 있는지 모르겠다\n\n진단:\n\n```bash\nlsof +L1\nls -l /proc/<pid>/fd | rg deleted\ncat /proc/<pid>/fdinfo/<fd>\n```\n\n## 코드로 보기\n\n### 가장 기본 확인\n\n```bash\nls -l /proc/<pid>/fd\ncat /proc/<pid>/fdinfo/<fd>\n```\n\n### mental model\n\n```text\n/proc/<pid>/fd\n  -> what object/path does this fd point to?\n\n/proc/<pid>/fdinfo\n  -> what runtime state does this fd currently have?\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| `fd` 링크만 보기 | 빠르다 | 상태는 잘 안 보인다 | 1차 확인 |\n| `fdinfo`까지 보기 | offset/flags/epoll 상태를 더 본다 | 해석에 객체별 차이가 있다 | 런타임 fd 디버깅 |\n| `strace` 사용 | syscall 경로를 직접 본다 | 붙이는 비용이 있다 | 행동 원인 추적 |\n| 코드 로그 추가 | 맥락이 풍부하다 | 장애 이후엔 늦을 수 있다 | 재현 가능한 버그 |\n\n## 꼬리질문\n\n> Q: `/proc/<pid>/fd`와 `/proc/<pid>/fdinfo`의 차이는?\n> 핵심: 전자는 대상 객체 링크, 후자는 해당 fd의 런타임 상태 정보다.\n\n> Q: `fdinfo`로 epoll 상태도 볼 수 있나요?\n> 핵심: 객체 유형에 따라 추가 정보가 보일 수 있어서 event loop 디버깅에 유용하다.\n\n> Q: deleted-open file 문제에도 도움이 되나요?\n> 핵심: 그렇다. 어떤 fd가 숨은 inode를 잡고 있고 offset이 계속 움직이는지 볼 때 유용하다.\n\n## 한 줄 정리\n\n`/proc/<pid>/fdinfo`는 fd 문제를 \"무엇을 열었나\"에서 \"지금 어떤 상태로 열려 있나\"로 바꿔 보는 현장용 디버깅 도구다.\n",
+  "aliases": [
+    "/proc pid fdinfo",
+    "epoll fdinfo debugging",
+    "fd metadata runtime",
+    "file offset flags fdinfo",
+    "epoll watch state",
+    "low overhead fd debugging"
+  ],
+  "expected_queries": [
+    "/proc/<pid>/fdinfo는 file offset, flags, epoll watch state를 어떻게 보여줘?",
+    "epoll runtime debugging에서 fdinfo를 언제 확인해야 해?",
+    "fdinfo는 lsof보다 어떤 저비용 현장 메타데이터를 더 제공해?",
+    "shared open file description이나 nonblocking flag를 fdinfo로 확인할 수 있어?"
+  ],
+  "symptoms": [
+    "process가 어떤 fd를 열었는지만이 아니라 offset, flags, epoll watch state를 현장에서 확인해야 한다.",
+    "epoll 등록 상태와 user-space event loop state가 맞는지 낮은 overhead로 확인하고 싶다.",
+    "shared offset이나 nonblocking flag가 fdinfo에서 어떻게 보이는지 모른다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/epoll-kqueue-io-uring"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/proc-pid-fdinfo-epoll-runtime-debugging.md",
+    "revision_history": []
+  }
+}

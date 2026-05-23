@@ -1,0 +1,46 @@
+{
+  "id": "database/deadlock-lock-wait-timeout-interview-router",
+  "title": "Deadlock Lock Wait Timeout Interview Router",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 DB deadlock과 lock wait timeout을 면접/운영 증상으로 구분한다. blocker, wait graph, retry/idempotency를 다룬다.",
+  "body_markdown": "# Deadlock Lock Wait Timeout Interview Router\n\n## 관찰 증거\n\n- deadlock 에러는 DB가 cycle을 감지하고 victim transaction을 중단한 결과다.\n- lock wait timeout은 일정 시간 lock을 기다리다 포기한 결과다.\n- 둘 다 retry로 회복될 수 있지만 원인 분석과 정책은 다르다.\n- MySQL/InnoDB에서는 deadlock이 보통 `1213`, lock wait timeout이 `1205`로 갈라진다. PostgreSQL에서는 deadlock `40P01`, lock timeout `55P03`, statement timeout `57014`, serialization failure `40001`을 분리해서 본다.\n- 기다린 SQL이 항상 원인은 아니다. timeout에서 실패한 SQL은 피해자일 수 있으므로 blocker transaction을 먼저 찾아야 한다.\n\n## 보장 범위\n\n- deadlock 감지는 \"서로가 가진 lock을 기다리는 cycle\"을 DB가 발견했다는 뜻이다. DB가 victim transaction 하나를 rollback해 cycle을 끊지만, 어떤 business operation이 안전하게 재시도 가능한지는 애플리케이션의 idempotency가 보장해야 한다.\n- lock wait timeout은 cycle이 증명됐다는 뜻이 아니다. 어떤 transaction이 오래 lock을 잡고 있거나, lock wait timeout 값보다 작업이 늦었거나, 같은 row range에 contention이 몰렸다는 운영 증상이다. 단, timeout이 \"cycle이 절대 없었다\"를 증명하지는 않는다. detector가 보기 전에 wait budget이 먼저 끝났거나, metadata lock/engine별 대기 경로가 섞였을 수 있다.\n- retry는 일시적인 충돌을 흡수하는 수단이지 원인 제거가 아니다. 같은 순서의 deadlock이 반복되면 lock 획득 순서, transaction 범위, index access path를 바꿔야 한다.\n- 두 에러 모두 \"DB가 느렸다\"로 뭉개면 안 된다. deadlock은 wait graph의 구조 문제, timeout은 blocker와 대기 시간의 운영 문제로 먼저 나눈다.\n- transaction 상태도 DB별로 다르다. PostgreSQL은 오류가 나면 보통 현재 transaction이 aborted 상태가 되어 rollback 또는 savepoint 복구가 필요하다. InnoDB lock wait timeout은 기본적으로 statement rollback에 가깝지만, application 일관성을 위해 whole-transaction rollback/retry로 단순화하는 편이 안전한 경우가 많다.\n\n## 1차 분기\n\n| 에러 | 먼저 볼 것 | 다음 문서 |\n|---|---|---|\n| deadlock detected | transaction 순서, lock 획득 순서 | `deadlock-retry-idempotency-bridge` |\n| lock wait timeout | blocker query, long transaction | `lock-wait-deadlock-latch-triage-playbook` |\n| 간헐 실패 | idempotency와 retry boundary | `deadlock-retry-idempotency-bridge` |\n| statement/query timeout | slow query인지 lock wait인지 선행 에러 | `lock-wait-deadlock-latch-triage-playbook` |\n\n## 진단 증거 분리\n\n| 분류 | 핵심 증거 | 자주 보는 명령/뷰 |\n|---|---|---|\n| deadlock | deadlock report, victim, held lock과 waiting lock, 두 transaction의 SQL 순서 | MySQL `SHOW ENGINE INNODB STATUS`, `performance_schema.data_locks`; PostgreSQL `40P01` 로그 |\n| lock wait timeout | blocking transaction, waiting query, transaction age, 같은 key/range 반복 | MySQL `performance_schema.data_lock_waits`, `sys.innodb_lock_waits`; PostgreSQL `pg_blocking_pids()`, `pg_locks`, `pg_stat_activity` |\n| statement timeout | lock 신호 없이 query runtime이 budget 초과 | PostgreSQL `57014`, slow query log, execution plan |\n| metadata lock | DDL 또는 schema 접근이 row lock 없이 대기 | MySQL metadata lock instrumentation, PostgreSQL locktype/relation lock 확인 |\n\n## 운영 검증 체크리스트\n\n- 같은 시각의 application request id, SQL log, transaction 시작 시각을 묶어 어떤 business flow가 lock을 오래 잡았는지 확인한다.\n- MySQL/InnoDB 기준으로는 deadlock report, current lock waits, blocking transaction, waiting query를 확인한다. PostgreSQL이면 `pg_locks`, `pg_stat_activity`, blocked/blocking pid를 함께 본다.\n- timeout만 보고 장애 SQL을 단정하지 않는다. 기다린 SQL은 피해자일 수 있으므로 blocker의 query, transaction age, open transaction owner를 먼저 찾는다.\n- deadlock이면 victim SQL만 보지 말고 상대 transaction이 이미 잡은 lock과 기다리던 lock, 두 code path의 row touch 순서를 비교한다.\n- index가 없어 range scan이 넓어지면 더 많은 row 또는 gap을 잠글 수 있다. 실행 계획과 lock wait 증상을 같이 본다.\n- `SELECT ... FOR UPDATE`, foreign key check, unique index insert, gap/next-key lock, DDL metadata lock처럼 표면 SQL보다 넓은 lock surface를 만든 지점을 찾는다.\n- retry를 넣었다면 retry 횟수, backoff, duplicate side effect 방지, 사용자 응답 정책을 로그와 metric으로 검증한다.\n- lock wait timeout을 무한 retry하지 않는다. blocker가 남아 있으면 retry가 같은 queue를 더 길게 만들 수 있다.\n\n## 면접 답변 골격\n\ndeadlock은 cycle이고 timeout은 오래 기다린 것이다. 둘 다 \"락 문제\"지만 deadlock은 victim rollback 후 transaction 전체 bounded retry가 자연스럽고, timeout은 blocker 제거와 transaction 축소가 우선일 수 있다. 운영에서는 에러 메시지만 보지 않고 wait graph, blocker transaction, 실제 SQL, request id를 함께 묶어서 원인을 확인한다.\n\n면접에서는 다음 순서가 선명하다.\n\n1. deadlock과 timeout을 정의로 분리한다.\n2. deadlock은 transaction 순서와 lock 획득 순서, timeout은 blocker와 long transaction을 본다고 말한다.\n3. MySQL/PostgreSQL의 root error code를 확인해 Spring/JPA 표면 예외만으로 판단하지 않는다고 덧붙인다.\n4. 재시도는 idempotent한 경계에서만 안전하다고 제한한다.\n5. 재발 방지는 transaction 축소, 일관된 lock 순서, 필요한 index, timeout/backoff 정책, 관측 지표로 검증한다고 마무리한다.\n\n## 관련 playbook\n\n운영에서는 SQL log, transaction age, lock wait graph, request id를 함께 본다.\n",
+  "aliases": [
+    "deadlock lock wait timeout router",
+    "DB deadlock interview answer",
+    "lock wait timeout 면접",
+    "락 대기 교착상태 구분"
+  ],
+  "expected_queries": [
+    "DB deadlock과 lock wait timeout을 어떻게 구분해?",
+    "lock wait timeout이 나면 어떤 순서로 봐야 해?",
+    "deadlock은 왜 retry가 필요해?",
+    "deadlock 처음 배우는데 lock timeout playbook 어디로 이어서 봐야 해?"
+  ],
+  "symptoms": [
+    "Deadlock found when trying to get lock",
+    "Lock wait timeout exceeded",
+    "같은 요청이 가끔만 실패하고 재시도하면 성공해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/deadlock-vs-lock-wait-timeout-primer"
+    ],
+    "next_docs": [
+      "database/lock-wait-deadlock-latch-triage-playbook"
+    ],
+    "confusable_with": [
+      "database/deadlock-vs-lock-wait-timeout-primer",
+      "database/lock-wait-deadlock-latch-triage-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/deadlock-lock-wait-timeout-interview-router.md",
+    "revision_history": []
+  }
+}

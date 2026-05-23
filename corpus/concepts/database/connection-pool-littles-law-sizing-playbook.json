@@ -1,0 +1,47 @@
+{
+  "id": "database/connection-pool-littles-law-sizing-playbook",
+  "title": "Connection Pool Little's Law Sizing Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "이 playbook은 DB connection pool size를 Little's Law, DB capacity, queue wait 관점으로 조정한다.",
+  "body_markdown": "# Connection Pool Little's Law Sizing Playbook\n\n## 재현 조건\n\nDB connection acquisition timeout이 나거나, pool wait가 늘고, pool size를 감으로 키우는 상황이다. 목표는 \"더 큰 pool\"이 아니라 같은 경계에서 필요한 평균 동시 connection을 추정하고, DB가 견디는 동시 쿼리 상한과 application deadline 안에 맞추는 것이다.\n\n## 관찰 증거\n\n- `connection_acquire_seconds` p95/p99가 증가하지만 query execution time은 그대로일 수 있다.\n- active connection은 pool max에 붙고 idle connection은 거의 없으며 application thread가 acquisition에서 대기한다.\n- pool size를 키운 뒤 DB CPU, lock wait, buffer miss, IO wait가 함께 올라가면 병목이 DB 내부로 이동한 것이다.\n- throughput은 거의 증가하지 않는데 response time만 늘면 Little's Law의 `L = lambda * W`에서 W가 커진 상태다.\n- transaction hold time이 query execution time보다 길면 `@Transactional` 범위, ORM lazy load, 외부 API 호출이 connection을 오래 붙잡는지 봐야 한다.\n- app replica 수를 늘린 뒤 전체 DB connection 수가 `replica_count * max_pool_size`로 불어나 DB `max_connections`나 worker/thread 상한에 가까워진다.\n\n## 확인 순서\n\n1. 측정 경계를 정한다. API 전체가 아니라 DB connection borrow-to-return 구간인지 먼저 고정한다.\n2. 실제 DB query service time, transaction hold time, pool wait time을 분리해 측정한다.\n3. 목표 완료 throughput과 평균 connection 점유 시간을 곱해 필요한 평균 동시 connection을 추정한다.\n4. p95/p99, burst, retry 증폭을 보고 headroom과 connection acquisition timeout을 따로 정한다.\n5. DB가 감당할 수 있는 active query 수와 전체 connection budget을 확인한다.\n6. app instance별 pool 합계가 DB 상한을 넘지 않도록 per-node cap을 나눈다.\n7. pool을 키운 뒤 DB CPU, lock wait, IO wait가 악화되는지 본다.\n\n## 실패 원인 matrix\n\n| 증상 | 원인 | 대응 |\n|---|---|---|\n| pool wait 증가 | connection 부족 또는 query 지연 | slow query와 pool 점유 시간 분리 |\n| pool 확장 후 DB 지연 증가 | DB concurrency 과다 | pool 상한과 query 개선 |\n| timeout만 늘림 | 대기열만 길어짐 | deadline과 backpressure 재설계 |\n| 계산값보다 timeout이 잦음 | tail hold time 또는 burst 누락 | p95/p99 hold time과 queue length 확인 |\n| replica 증설 후 DB 불안정 | global connection budget 초과 | instance별 pool 재분배 |\n\n## 운영/테스트 검증\n\nPool size는 \"크면 안전\"이 아니다. DB가 처리할 수 있는 동시 쿼리보다 크게 잡으면 application queue가 DB 내부 queue로 이동할 뿐이다.\n\n운영 검증은 pool metric과 DB metric을 같은 시간축에 맞추는 것에서 시작한다. 평균 점유 시간만 보지 말고 p95 점유 시간, transaction hold time, slow query 비율, timeout 직전 queue length를 함께 본다. 변경 후에는 acquire timeout 감소뿐 아니라 DB saturation 지표가 악화되지 않았는지 확인해야 한다.\n\nLittle's Law를 pool에 적용할 때 `W`는 SQL 실행 시간 하나가 아니라 connection을 빌린 뒤 반납하기까지의 평균 점유 시간이다. transaction 안에서 외부 API를 호출하거나, ORM flush/lazy load가 늦게 발생하거나, result streaming이 오래 지속되면 connection hold time이 query time보다 훨씬 길어진다. `lambda`도 과부하 때 들어오는 arrival rate가 아니라 해당 경계에서 실제로 완료되는 throughput으로 봐야 한다. arrival가 completion보다 크면 queue가 계속 쌓이므로 안정 상태 가정이 깨진다.\n\nSizing은 보통 다음 식을 출발점으로 삼는다.\n\n`required_avg_connections = completed_tps_per_instance * avg_connection_hold_seconds`\n\n여기에 burst/headroom을 붙이되, 최종 pool은 `DB가 견디는 active query 수`, `DB max_connections에서 운영/admin/replication 여유를 뺀 값`, `app instance 수`, `read/write pool 분리 여부`로 다시 자른다. 예를 들어 DB 전체 예산이 120 connection이고 app instance가 6개라면 instance별 pool 40은 계산상 맞아 보여도 global budget 240으로 과하다.\n\n## 보장 범위와 한계\n\nLittle's Law는 안정 상태의 평균 관계를 설명한다. 필요한 평균 동시성 추정에는 유용하지만 burst, lock convoy, long transaction, GC pause, connection leak 같은 tail 현상까지 자동으로 보장하지 않는다. 그래서 계산값은 시작점이고, 실제 상한은 DB가 견디는 active query 수와 application deadline으로 검증해야 한다.\n\n평균 동시성 계산은 p99 장애를 직접 예측하지 못한다. tail hold time이 길면 순간적으로 pool이 꽉 차고, utilization이 100%에 가까워질수록 queue wait는 비선형으로 커진다. 따라서 \"평균 계산값 + 약간의 여유\"를 무조건 target으로 삼기보다 정상 시간대에는 idle 여유가 남고, 과부하 시간대에는 timeout/backpressure/load shedding이 빨리 작동하는지까지 같이 봐야 한다.\n\n## 실패 반례\n\n- 평균 query가 20ms라서 pool 20이면 충분하다고 계산했지만 p99 query가 2초라 burst 때 acquisition timeout이 난다.\n- pool을 50에서 200으로 키워 timeout은 줄었지만 DB lock wait가 폭증해 전체 latency가 나빠진다.\n- read/write workload를 합쳐 계산해 writer pool이 reader traffic에 잠식된다.\n- transaction 안에서 외부 API를 호출해 connection hold time이 query time보다 훨씬 길어진다.\n- 10개 app instance 각각 pool 30으로 배포해 DB 전체 connection 300개를 만들고, DB worker/CPU가 먼저 포화된다.\n- retry storm 동안 arrival RPS로 계산해 pool을 키웠지만 completion throughput은 늘지 않아 backlog와 lock wait만 커진다.\n\n## 면접 답변 축\n\n면접에서는 \"pool은 크게 잡으면 좋다\"가 아니라 \"목표 완료 처리량과 connection borrow-to-return 점유 시간으로 필요한 평균 동시성을 추정하고, DB가 감당할 상한과 deadline으로 제한한다\"고 답한다. 이어서 acquire wait, active/idle connection, query time, transaction hold time, lock/IO wait를 분리해 보고, 부족하면 query 개선, transaction 범위 축소, backpressure, read/write pool 분리를 함께 검토한다고 말하면 된다.\n\n## Safe Next Docs\n\n증상 분기는 `connection-pool-saturation-interview-router`, 전체 capacity 관계는 `littles-law-capacity-planning-primer`로 이어진다.\n",
+  "aliases": [
+    "connection pool Little's Law sizing",
+    "커넥션 풀 Little 법칙 튜닝",
+    "Hikari pool sizing queue wait",
+    "DB pool capacity planning",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "DB connection pool size를 어떻게 정해?",
+    "Hikari pool을 크게 하면 latency가 줄어?",
+    "connection pool wait가 늘 때 Little's Law로 어떻게 봐?"
+  ],
+  "symptoms": [
+    "pool size를 늘렸는데 DB CPU만 더 올라갑니다",
+    "connection acquisition timeout이 간헐적으로 납니다",
+    "application thread는 많은데 DB connection이 병목입니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/connection-pool-sizing-timeout-tuning-intermediate-primer"
+    ],
+    "next_docs": [
+      "system-design/littles-law-capacity-planning-primer",
+      "database/connection-pool-saturation-interview-router"
+    ],
+    "confusable_with": [
+      "database/connection-pool-saturation-interview-router",
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/connection-pool-littles-law-sizing-playbook.md",
+    "revision_history": []
+  }
+}

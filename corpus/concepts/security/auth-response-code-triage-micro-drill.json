@@ -1,0 +1,47 @@
+{
+  "id": "security/auth-response-code-triage-micro-drill",
+  "title": "401 / 403 / 404 / CORS 응답 분기 마이크로 드릴",
+  "category": "security",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# 401 / 403 / 404 / CORS 응답 분기 마이크로 드릴\n\n> 한 줄 요약: 401은 \"누구인지 모름\", 403은 \"누구인지는 알지만 허용 안 됨\", concealment 404는 \"존재 자체를 숨김\", CORS는 브라우저가 응답을 JS에 못 넘기는 전송 정책 문제다.\n\n**난이도: 🟢 Beginner**\n\n## 풀이 기준\n\n이 드릴은 \"브라우저에 보이는 메시지\"보다 \"서버가 어떤 요청을 받았고 어떤 결정을 했는가\"를 먼저 나눈다. Network 탭에서 OPTIONS preflight와 actual request를 분리하고, actual request가 없으면 CORS preflight 문제로 본다. actual request가 있다면 그 status가 인증(authentication), 인가(authorization), 리소스 존재 정책, validation, CSRF 중 어느 축인지 분류한다.\n\n## 기대 답변 축\n\n- **Unauthenticated**: 세션/토큰/credential이 없거나 만료되어 사용자를 식별하지 못하면 `401` 후보가 자연스럽다.\n- **Unauthorized**: 사용자는 식별됐지만 role, permission, scope, ownership이 부족하면 `403` 후보가 자연스럽다.\n- **Resource not found**: 실제로 없는 리소스는 `404`다. 다른 사용자의 비공개 리소스처럼 존재 노출 자체가 위험하면 정책상 concealment `404`를 쓸 수 있다.\n- **Validation failure**: JSON parsing, 타입 변환, 필수값, field validation 실패는 보통 `400` 또는 팀 컨벤션상 `422` 후보이며 auth failure와 섞지 않는다.\n- **CSRF failure**: 인증 cookie는 있어도 unsafe method에서 CSRF token이 없거나 불일치하면 `403`이 날 수 있다. 이것은 role 부족 `403`과 관찰 지점이 다르다.\n- **CORS preflight**: OPTIONS가 CORS header 없이 막혀 actual request가 나가지 않으면 서버 auth 판단 전의 browser policy 문제다. actual request의 `401/403/404`와 분리한다.\n\n## 문제 1\n\n상황:\n\n```text\nAuthorization 헤더가 없다.\nAPI는 로그인 필요 endpoint다.\n```\n\n답:\n\n`401 Unauthorized`가 자연스럽다. 인증이 없다.\n\n틀린 답:\n\n```text\n권한이 없으니 403이다.\n```\n\n권한을 따지려면 먼저 \"누구인지\" 알아야 한다. credential이 없으면 authentication 부재 쪽이다.\n\n## 문제 2\n\n상황:\n\n```text\n로그인은 되어 있다.\nUSER role인데 ADMIN API를 호출했다.\n```\n\n답:\n\n`403 Forbidden`이 자연스럽다. 인증은 됐지만 권한이 없다.\n\n확인할 축은 role뿐만 아니라 resource ownership도 포함한다. USER role이어도 본인 주문이면 허용될 수 있고, ADMIN role이어도 tenant 경계가 다르면 거부될 수 있다.\n\n## 문제 3\n\n상황:\n\n```text\n다른 사용자의 비공개 주문 id를 추측해서 호출했다.\n서비스 정책상 존재 여부를 숨기고 싶다.\n```\n\n답:\n\n`404 Not Found` concealment를 고려한다. 단, 내부 audit log에는 deny reason을 남겨야 한다.\n\n실제로 없는 주문 id의 `404`와 남의 주문 id를 숨기는 concealment `404`는 외부 status가 같을 수 있다. 내부 로그와 테스트 이름에서는 \"not found\"와 \"access denied but concealed\"을 구분해야 한다.\n\n## 문제 4\n\n상황:\n\n```text\n서버는 401을 보냈지만 브라우저 콘솔에는 CORS error만 보인다.\n```\n\n답:\n\n서버 auth 실패와 브라우저 CORS 노출 실패를 분리한다. Network 탭에서 실제 status, preflight, CORS response headers를 확인한다.\n\n## 문제 5\n\n상황:\n\n```text\nPOST /reservations 요청 body에서 date 형식이 틀렸다.\n사용자는 로그인되어 있고 endpoint 접근 권한도 있다.\n```\n\n답:\n\nvalidation failure다. 보통 `400 Bad Request` 또는 팀 컨벤션상 `422 Unprocessable Entity` 후보가 자연스럽다. 인증/인가가 이미 통과된 뒤 request shape가 틀린 것이므로 `401`이나 `403`으로 내리면 클라이언트가 로그인 문제로 오해한다.\n\n## 문제 6\n\n상황:\n\n```text\n로그인 cookie는 있고 USER role도 맞다.\nPOST 요청에서 CSRF token header가 빠졌다.\n서버는 403을 반환한다.\n```\n\n답:\n\nCSRF failure다. status는 `403`일 수 있지만 \"권한 role 부족\"과 다르다. unsafe method인지, CSRF token repository가 session/cookie/header 중 어디를 쓰는지, response body나 server log가 CSRF deny reason을 구분하는지 확인한다.\n\n## 문제 7\n\n상황:\n\n```text\n브라우저가 DELETE 요청 전에 OPTIONS preflight를 보냈다.\nOPTIONS 응답에 Access-Control-Allow-Methods: DELETE가 없어서 actual DELETE가 나가지 않는다.\n```\n\n답:\n\nCORS preflight failure다. actual DELETE가 서버 application handler까지 도달하지 않았으므로 `401/403/404` auth 판단을 말할 수 없다. 이때는 OPTIONS status와 `Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, credentials 필요 여부를 본다.\n\n## 문제 8\n\n상황:\n\n```text\nGET /orders/9999 는 DB에 없는 id다.\nGET /orders/1234 는 존재하지만 다른 사용자의 비공개 주문이다.\n```\n\n답:\n\n첫 번째는 일반 `404 Not Found`다. 두 번째는 정책 선택이다. 존재 노출이 위험하지 않고 사용자에게 권한 부족을 알려도 되는 내부/admin API라면 `403` 후보가 자연스럽다. 공개 API나 추측 가능한 id에서 존재 여부를 숨기고 싶다면 concealment `404`를 고려한다. 어떤 쪽이든 감사 로그에는 실제 deny reason을 남긴다.\n\n## 분류표\n\n| 관찰 | 우선 분기 | status 후보 | 추가 확인 |\n|---|---|---|---|\n| credential 없음, 세션 만료 | unauthenticated | 401 | `WWW-Authenticate` 또는 로그인 필요 body |\n| 로그인됨, role/scope 부족 | unauthorized | 403 | authority mapping, matcher 순서 |\n| 로그인됨, 남의 리소스 | ownership unauthorized | 403 또는 concealment 404 | 존재 노출 정책, audit log |\n| 실제로 id 없음 | resource not found | 404 | 내부 key/SQL 과노출 금지 |\n| field/type/JSON 오류 | validation/binding | 400 또는 422 | field error shape |\n| cookie 인증은 됐지만 CSRF token 없음 | CSRF failure | 403 | unsafe method, token repository/header |\n| OPTIONS에서 멈춤 | CORS preflight | browser CORS failure | allow-origin/method/header/credentials |\n| actual request가 401/403인데 JS가 못 읽음 | CORS exposure + server auth status | 실제 status 유지 | Network actual status와 CORS headers 분리 |\n\n## 빠른 체크\n\n```text\n1. Network 탭에 실제 HTTP status가 보이는가\n2. preflight OPTIONS가 실패했는가 actual request가 실패했는가\n3. credential/cookie가 필요한 요청인가\n4. 인증 없음인가 권한 없음인가 존재 숨김인가\n5. validation 실패나 CSRF 실패를 authz 실패로 섞고 있지 않은가\n6. 외부 404가 실제 not found인지 concealment 404인지 내부 근거가 있는가\n```\n\n## 흔한 오답\n\n| 오답 | 왜 틀렸나 |\n|---|---|\n| 로그인 안 됐으니 403 | unauthenticated는 보통 401 후보가 먼저다 |\n| 권한이 없으면 항상 401 | 인증은 됐고 권한만 부족하면 403 후보다 |\n| 남의 리소스는 항상 403 | 존재 노출을 숨겨야 하는 API는 concealment 404를 쓸 수 있다 |\n| 404면 DB에 없는 것이다 | 보안 정책상 숨긴 404일 수 있다 |\n| validation도 접근 실패니까 403 | request shape 오류와 authorization 실패를 섞었다 |\n| CSRF 403은 role 부족이다 | token 누락/불일치가 원인인 별도 403일 수 있다 |\n| CORS error면 서버 status는 없다 | actual request가 있었다면 서버 `401/403/404`가 이미 있을 수 있다 |\n| OPTIONS 403이면 사용자의 role이 부족하다 | preflight는 보통 user authz 판단 전 브라우저 정책 협상이다 |\n\n## 검증 질문\n\n- credential이 없는 요청과 credential은 있지만 role이 부족한 요청을 각각 어떤 status 후보로 나눌 수 있나?\n- 다른 사용자의 주문 id를 추측한 요청에서 `403` 대신 concealment `404`를 쓰는 이유는 무엇인가?\n- 실제로 없는 id의 `404`와 숨김 정책의 `404`를 운영 로그와 테스트에서 어떻게 구분할 것인가?\n- JSON field validation 실패를 `401`이나 `403`으로 내리면 클라이언트가 무엇을 오해하나?\n- cookie가 있는데 POST만 `403`이면 role mapping 전에 어떤 CSRF 증거를 봐야 하나?\n- OPTIONS preflight가 실패해 actual request가 없을 때 \"서버가 인증 거부했다\"고 말할 수 있나?\n- 브라우저 콘솔에는 CORS error만 보이지만 Network actual status가 `401`이면 어떤 두 문제를 분리해야 하나?\n- API와 browser form login이 섞여 `302 /login`이 보이면 이 드릴의 `401` 분기와 어떻게 연결되는가?\n\n## 약점 태그\n\n- `401-vs-403`: unauthenticated와 unauthorized를 섞음\n- `concealment-404`: not found와 존재 숨김 정책을 구분하지 못함\n- `validation-auth-mix`: validation failure를 auth failure로 설명함\n- `csrf-role-mix`: CSRF 403과 role/permission 403을 섞음\n- `preflight-actual-mix`: OPTIONS preflight와 actual request status를 섞음\n- `browser-message-overread`: Console CORS 메시지만 보고 서버 status를 보지 않음\n\n## 한 줄 정리\n\n브라우저 메시지만 보지 말고 preflight와 actual request를 나눈 뒤, 인증 없음, 권한 없음, 존재 숨김, validation, CSRF를 각각 다른 축으로 봐야 401, 403, 404, 400/422, CORS가 갈린다.\n",
+  "aliases": [
+    "401 403 404 CORS drill",
+    "인증 인가 응답 코드 분기",
+    "CORS인지 401인지",
+    "forbidden not found concealment",
+    "auth failure micro drill"
+  ],
+  "expected_queries": [
+    "401 403 404 CORS를 짧은 문제로 구분 연습하고 싶어",
+    "브라우저에는 CORS라고 뜨는데 실제 auth 실패인지 어떻게 봐?",
+    "권한 없는 리소스를 403으로 줄지 404로 숨길지 판단하는 연습이 필요해",
+    "로그인 안 됨과 권한 없음 응답을 초급자 관점에서 드릴로 풀어줘"
+  ],
+  "symptoms": [
+    "브라우저 콘솔에는 CORS가 보이는데 실제 서버 응답은 401인지 403인지 모르겠다",
+    "로그인 안 됨과 권한 없음과 존재 숨김 404를 구분하지 못한다",
+    "API 에러 코드를 보안 정책과 사용자 메시지로 연결하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/auth-failure-response-401-403-404",
+      "security/cors-basics"
+    ],
+    "next_docs": [
+      "security/cookie-cors-auth-anonymous-symptom-router",
+      "security/browser-401-vs-302-login-redirect-guide",
+      "security/concealment-404-entry-cues"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/auth-response-code-triage-micro-drill.md",
+    "revision_history": []
+  }
+}

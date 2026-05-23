@@ -1,0 +1,52 @@
+{
+  "id": "system-design/entitlement-quota-design",
+  "title": "Entitlement / Quota 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Entitlement / Quota 설계를 다루는 deep_dive 문서다. entitlement와 quota는 사용자, tenant, plan별로 무엇을 허용할지와 얼마나 사용할지를 제어하는 정책 집행 시스템이다. 검색 질의가 entitlement, quota, plan limits, usage metering처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Entitlement / Quota 설계\n\n> 한 줄 요약: entitlement와 quota는 사용자, tenant, plan별로 무엇을 허용할지와 얼마나 사용할지를 제어하는 정책 집행 시스템이다.\n\nretrieval-anchor-keywords: entitlement, quota, plan limits, usage metering, feature flags, soft limit, hard limit, tenant limits, credit budget, policy enforcement, usage accounting\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [멀티 테넌트 SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [분산 캐시 설계](./distributed-cache-design.md)\n> - [Distributed Scheduler 설계](./distributed-scheduler-design.md)\n> - [Webhook Delivery Platform 설계](./webhook-delivery-platform-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n\n## 핵심 개념\n\nEntitlement는 \"무엇을 쓸 수 있는가\"이고, quota는 \"얼마나 쓸 수 있는가\"다.  \n둘을 섞으면 정책이 망가진다.\n\n- entitlement: 기능 접근 권한\n- quota: 사용량 상한\n- metering: 사용량 측정\n- enforcement: 실제 차단\n\n즉, 이 설계는 권한 시스템, 과금 시스템, 보호 장치를 동시에 만족해야 한다.\n\n## 깊이 들어가기\n\n### 1. 정책 모델을 분리한다\n\n보통 아래 세 층으로 나눠 생각한다.\n\n1. plan entitlement\n2. usage quota\n3. runtime enforcement\n\n예:\n\n- free plan: SSO 없음, API 1,000 req/day\n- pro plan: SSO 있음, API 100,000 req/day\n- enterprise: custom limits, dedicated support\n\n### 2. Capacity Estimation\n\n정책 시스템은 QPS보다 lookup 빈도가 높다.\n\n예:\n\n- 요청 50,000 req/sec\n- 요청마다 3개의 policy check\n- cache hit 99%\n\n그래도 cache miss가 몰리면 policy store가 병목이 된다.  \n따라서 읽기 path와 쓰기 path를 분리해야 한다.\n\n봐야 할 숫자:\n\n- entitlement lookup QPS\n- quota update QPS\n- metering lag\n- cache invalidation rate\n- policy evaluation latency\n\n### 3. 데이터 모델\n\n핵심 엔티티:\n\n- plan\n- entitlement\n- usage_meter\n- quota_bucket\n- policy_override\n- billing_period\n\n정책은 대개 테넌트와 기간에 묶인다.\n\n### 4. hard limit과 soft limit\n\n제어 방식은 두 가지다.\n\n- hard limit: 즉시 거부\n- soft limit: 경고 후 허용, 또는 degraded mode\n\n실무에서는 중요도에 따라 다르게 둔다.\n\n- 보안/비용 방어: hard limit\n- 리포트/보조 기능: soft limit\n\n### 5. Metering과 enforcement를 분리한다\n\n사용량 측정은 종종 지연된다.\n\n- 실시간 카운트\n- 비동기 집계\n- 일별 정산\n- 월별 청구\n\n그래서 \"현재 사용량\"과 \"최종 청구 사용량\"이 다를 수 있다.  \n이 차이를 정책에 명시해야 한다.\n\n### 6. 캐시와 일관성\n\nEntitlement는 읽기가 많다.\n\n- plan config cache\n- quota snapshot cache\n- per-tenant usage cache\n\n하지만 캐시만 믿으면 초과 사용을 늦게 막는다.  \n따라서 critical path는 캐시 + 원장 + fallback의 조합이 필요하다.\n\n### 7. 정책 변경과 versioning\n\n정책은 자주 바뀐다.\n\n- 플랜 업그레이드\n- 기능 공개/비공개\n- quota 증감\n- trial 정책\n\n필요한 것:\n\n- effective_from\n- policy version\n- audit trail\n- rollback path\n\n이 부분은 [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1: API quota 초과\n\n문제:\n\n- 한 tenant가 API를 과도하게 사용한다\n\n해결:\n\n- soft warning 이후 hard limit 적용\n- quota snapshot을 캐시하고 원장과 동기화한다\n\n### 시나리오 2: 플랜 업그레이드 직후\n\n문제:\n\n- 사용자가 결제 후 바로 더 높은 기능을 써야 한다\n\n해결:\n\n- entitlement cache를 invalidate한다\n- billing event를 기준으로 policy version을 전환한다\n\n### 시나리오 3: 월말 메터링 정산\n\n문제:\n\n- usage 집계와 실제 청구가 다를 수 있다\n\n해결:\n\n- daily metering job을 돌린다\n- audit log와 usage ledger를 대사한다\n\n## 코드로 보기\n\n```pseudo\nfunction authorize(tenant, action):\n  policy = policyCache.get(tenant.plan)\n  if !policy.allows(action):\n    return DENY\n  quota = usageCache.get(tenant.id)\n  if quota.exceeded(action):\n    return DENY\n  return ALLOW\n```\n\n```java\npublic Decision decide(TenantId tenantId, Action action) {\n    Plan plan = entitlementRepository.findPlan(tenantId);\n    if (!plan.allows(action)) return Decision.deny();\n    return quotaService.canConsume(tenantId, action) ? Decision.allow() : Decision.deny();\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Hard limit | 비용 방어가 확실하다 | 사용자 경험이 거칠다 | 보안/과금 경로 |\n| Soft limit | 경험이 부드럽다 | 비용이 새기 쉽다 | 보조 기능 |\n| Real-time metering | 정확하다 | 비용이 높다 | 고가 서비스 |\n| Batch metering | 단순하다 | 지연이 있다 | 청구/리포트 |\n| Cache-first policy check | 빠르다 | stale risk | high-QPS service |\n\n핵심은 entitlement와 quota를 같은 \"권한\"으로 뭉개지 않고, **정책, 측정, 집행을 각각 설계**하는 것이다.\n\n## 꼬리질문\n\n> Q: entitlement와 quota는 왜 분리해야 하나요?\n> 의도: 기능 접근과 사용량 제어의 차이 이해 확인\n> 핵심: 하나는 허용 여부, 다른 하나는 사용량 상한이다.\n\n> Q: usage는 실시간으로 꼭 맞아야 하나요?\n> 의도: metering과 enforcement의 차이 이해 확인\n> 핵심: 보통은 약간의 지연을 허용하지만 critical limit은 더 엄격해야 한다.\n\n> Q: 캐시를 쓰면 quota 초과가 생기지 않나요?\n> 의도: stale data risk 이해 확인\n> 핵심: 그래서 cache, snapshot, fallback을 같이 둔다.\n\n> Q: 정책 변경을 안전하게 하려면 무엇이 필요하나요?\n> 의도: versioning과 audit 이해 확인\n> 핵심: policy version, effective time, audit trail이 필요하다.\n\n## 한 줄 정리\n\nEntitlement / quota 설계는 기능 허용과 사용량 제한을 정책, metering, enforcement로 분리해 안전하게 집행하는 시스템이다.\n\n",
+  "aliases": [
+    "entitlement",
+    "quota",
+    "plan limits",
+    "usage metering",
+    "feature flags",
+    "soft limit",
+    "hard limit",
+    "tenant limits",
+    "credit budget",
+    "policy enforcement",
+    "usage accounting",
+    "Entitlement / Quota 설계"
+  ],
+  "expected_queries": [
+    "Entitlement / Quota 설계 설계 핵심을 설명해줘",
+    "entitlement가 왜 필요한지 알려줘",
+    "Entitlement / Quota 설계 실무 트레이드오프는 뭐야?",
+    "entitlement 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Entitlement / Quota 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Entitlement / Quota 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Entitlement / Quota 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/entitlement-quota-design.md",
+    "revision_history": []
+  }
+}

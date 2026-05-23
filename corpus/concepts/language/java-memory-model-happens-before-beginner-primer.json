@@ -1,0 +1,47 @@
+{
+  "id": "language/java-memory-model-happens-before-beginner-primer",
+  "title": "Java Memory Model Happens-Before Beginner Primer",
+  "category": "language",
+  "level": "beginner",
+  "summary": "이 primer는 Java Memory Model과 happens-before를 초보자 관점에서 설명한다. volatile, synchronized, visibility, ordering, sleep 넣으면 통과하는 동시성 테스트 같은 표현을 다룬다.",
+  "body_markdown": "# Java Memory Model Happens-Before Beginner Primer\n\n기준 명세:\n\n- [JLS 17: Threads and Locks](https://docs.oracle.com/javase/specs/jls/se17/html/jls-17.html)\n\n## 한 줄 요약\n\nHappens-before는 \"A가 B보다 실제로 먼저 실행됐다\"가 아니라, Java Memory Model이 **A의 write가 B에서 어떻게 관찰될 수 있는지 제한하는 순서 관계**다. 시간상 먼저 실행된 것처럼 보여도 happens-before edge가 없으면 다른 스레드가 그 write를 본다고 보장할 수 없고, 컴파일러/JIT/CPU는 단일 스레드 결과를 깨지 않는 범위에서 재정렬할 수 있다.\n\n## 미션 진입 증상\n\n공유 `boolean flag`를 한 스레드에서 `true`로 바꿨는데 다른 스레드의 loop가 멈추지 않는다.\n\n```java\nclass StopFlag {\n    private boolean stop;\n\n    void requestStop() {\n        stop = true;\n    }\n\n    void runLoop() {\n        while (!stop) {\n            doWork();\n        }\n    }\n}\n```\n\n테스트에 `Thread.sleep(10)`을 넣으면 통과할 때가 있지만, `sleep`은 메모리 가시성 보장이 아니다. 스케줄링 타이밍이 바뀌어 우연히 관찰됐을 뿐이고, JMM 관점의 happens-before edge는 생기지 않는다.\n\n## 핵심 mental model\n\n멀티스레드 버그를 볼 때는 세 축을 분리한다.\n\n| 축 | 질문 | happens-before와의 관계 |\n|---|---|---|\n| Visibility | 다른 스레드가 내가 쓴 값을 볼 수 있는가? | happens-before가 있으면 뒤 read가 볼 수 있는 write 후보가 제한된다. |\n| Ordering | write/read 순서가 관찰 가능하게 보존되는가? | happens-before는 재정렬이 관찰 결과를 깨지 못하게 한다. |\n| Atomicity | 여러 단계 연산이 중간에 끼어들 수 없는가? | happens-before만으로 `count++` 같은 복합 연산은 원자화되지 않는다. |\n\nJMM은 \"모든 스레드가 매 순간 같은 메모리를 본다\"를 보장하지 않는다. 대신 프로그램이 의존할 수 있는 몇 가지 동기화 규칙을 정의하고, 그 규칙들이 이어지면 happens-before 관계가 만들어진다. lock/unlock, volatile read/write, thread start/join 같은 synchronization action은 하나의 synchronization order 안에서 정렬된다.\n\n대표 edge는 다음과 같다.\n\n| 규칙 | 보장되는 방향 | 실전 해석 |\n|---|---|---|\n| Program order | 한 스레드 안에서 앞 action -> 뒤 action | 같은 스레드 안의 순서는 기본 재료다. |\n| Monitor unlock/lock | 같은 monitor의 `unlock` -> 이후 `lock` | 같은 monitor로 보호한 쓰기는 이후 진입자가 볼 수 있도록 edge가 생긴다. |\n| Volatile write/read | 같은 volatile 변수의 write -> 이후 read | `volatile flag = true` 이전 write들이 flag를 읽은 thread의 후속 action에 이어질 수 있다. |\n| Thread start | `Thread.start()` 호출 전 action -> 새 thread의 action | 시작 전에 세팅한 값은 새 스레드가 볼 수 있다. |\n| Thread join | 종료한 thread의 action -> `join()` 반환 뒤 action | worker가 쓴 결과를 join 이후 읽을 수 있다. |\n| Transitivity | A -> B, B -> C이면 A -> C | queue, latch, lock 조합도 edge가 이어지면 보장이 이어진다. |\n\n## 흔한 오해\n\n- Happens-before는 벽시계 시간 순서가 아니다. 실제로 먼저 실행됐어도 동기화 edge가 없으면 다른 스레드 관찰에는 보장되지 않는다.\n- `sleep`, 로그 출력, 디버거 break point는 동기화 설계가 아니다. 실행 타이밍을 바꿔 증상을 숨길 수는 있어도 JMM 보장을 만들지 않는다.\n- `volatile`은 visibility/order에는 도움을 주지만, `x++`의 읽기-수정-쓰기 전체를 atomic하게 만들지 않는다.\n- `synchronized`는 mutual exclusion만이 아니라 unlock/lock을 통한 visibility도 제공한다. 그래서 같은 monitor를 일관되게 써야 한다.\n- data race는 같은 변수에 대한 conflicting access, 즉 적어도 하나가 write인 read/write가 happens-before로 정렬되지 않은 상태다.\n- \"내 PC에서는 항상 됐다\"는 증거가 아니다. data race는 CPU 수, JIT 최적화, 부하, 테스트 반복 횟수에 따라 드러난다.\n\n## Visibility 예시: volatile flag\n\n```java\nclass StopFlag {\n    private volatile boolean stop;\n\n    void requestStop() {\n        stop = true;      // volatile write\n    }\n\n    void runLoop() {\n        while (!stop) {   // volatile read\n            doWork();\n        }\n    }\n}\n```\n\n`stop = true`는 synchronization order상 같은 volatile 변수 `stop`의 이후 read와 synchronizes-with 관계를 만든다. 그 결과 write thread에서 volatile write 이전에 수행한 일반 write들도, read thread가 `stop == true`를 본 뒤의 action으로 이어진다.\n\n단, 이 예시는 \"flag 전파\"에는 맞지만 \"공유 객체 전체의 복합 불변식\"을 자동으로 보호하지 않는다. 여러 필드를 함께 읽고 써야 하면 lock이나 concurrent abstraction을 먼저 검토한다.\n\n## Reordering 예시: ready/data 패턴\n\n```java\nclass Holder {\n    int data;\n    boolean ready;\n\n    void writer() {\n        data = 42;\n        ready = true;\n    }\n\n    int reader() {\n        if (ready) {\n            return data;\n        }\n        return -1;\n    }\n}\n```\n\n`ready`가 일반 필드이면 reader가 `ready == true`를 보더라도 `data == 42`를 보장할 수 없다. 컴파일러와 CPU가 단일 스레드 의미를 유지하는 범위에서 write/read를 재정렬하거나, 각 스레드가 다른 시점의 값을 볼 수 있기 때문이다.\n\n`ready`를 `volatile`로 바꾸면 `data = 42`가 `ready = true`보다 program order상 앞에 있고, `ready` volatile write/read가 edge를 만들며, transitivity로 reader의 후속 `data` read까지 happens-before가 이어진다. 이 패턴에서 핵심은 \"data도 volatile이어야 한다\"가 아니라 \"출판 신호가 되는 volatile write/read가 앞선 write의 가시성을 이어준다\"는 점이다.\n\n## synchronized를 visibility로 읽는 법\n\n```java\nclass Box {\n    private int value;\n\n    synchronized void set(int value) {\n        this.value = value;\n    }\n\n    synchronized int get() {\n        return value;\n    }\n}\n```\n\n같은 객체 monitor를 기준으로 `set()` 종료 시 unlock이 일어나고, 이후 `get()` 진입 시 lock이 일어난다. 이 unlock -> lock 관계가 happens-before edge를 만들기 때문에 같은 monitor로 보호한 write/read는 visibility 규칙으로 이어진다.\n\n주의할 점은 **같은 lock을 써야 한다**는 것이다. write는 `synchronized(lockA)`로 하고 read는 lock 없이 하거나 `lockB`로 하면 mutual exclusion도 visibility도 같은 규칙으로 이어지지 않는다.\n\n## 1차 분기표\n\n| 증상 | 먼저 의심 | 첫 대응 |\n|---|---|---|\n| flag 변경이 loop에 안 보임 | visibility edge 없음 | `volatile`, `AtomicBoolean`, interrupt, lock, concurrent queue 중 의도에 맞게 선택 |\n| `count++` 결과가 누락됨 | atomicity 부족 | `AtomicInteger`, `LongAdder`, lock으로 분기 |\n| 여러 필드가 서로 안 맞음 | 복합 불변식 보호 부족 | 같은 lock으로 읽기/쓰기를 묶거나 불변 snapshot 출판 |\n| `sleep` 넣으면 테스트 통과 | race timing masking | 반복 테스트보다 happens-before 설계부터 확인 |\n| 로그 추가 후 버그 사라짐 | 관찰자가 타이밍을 바꿈 | 로그를 증거로 단정하지 말고 JFR/thread dump/JCStress 등으로 재현 |\n\n## 잘못된 대응\n\n- 공유 mutable field를 그대로 두고 테스트에 `sleep`만 추가한다.\n- `volatile`을 모든 필드에 붙여 복합 상태 정합성까지 해결됐다고 생각한다.\n- write path만 `synchronized`로 감싸고 read path는 lock 없이 읽는다.\n- `ConcurrentHashMap`을 썼다는 이유로 map 안 value 객체의 내부 변경까지 안전하다고 가정한다.\n- data race를 \"낮은 확률의 테스트 flake\"로만 취급하고 코드의 happens-before edge를 확인하지 않는다.\n\n## Safe Next Docs\n\nOS의 memory barrier는 구현 intuition을 주지만, Java 코드의 정답은 JMM 규칙으로 판단해야 한다. 다음에는 volatile counter atomicity router에서 visibility와 atomicity를 분리하고, CPU cache coherence/memory barrier 문서에서 하드웨어 intuition을 보완한다.\n",
+  "aliases": [
+    "java memory model happens before beginner",
+    "jmm visibility ordering basics",
+    "자바 메모리 모델 happens-before",
+    "스레드 가시성 순서 보장",
+    "synchronized",
+    "volatile"
+  ],
+  "expected_queries": [
+    "Java Memory Model에서 happens-before는 무슨 뜻이야?",
+    "volatile을 붙이면 다른 스레드에서 값이 보이는 이유가 뭐야?",
+    "synchronized가 visibility도 보장한다는 말을 어떻게 이해해?"
+  ],
+  "symptoms": [
+    "한 스레드에서 바꾼 값이 다른 스레드에서 안 보여요",
+    "sleep을 넣으면 테스트가 통과해서 헷갈려요",
+    "volatile과 synchronized 차이를 순서 보장 관점에서 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-thread-basics"
+    ],
+    "next_docs": [
+      "operating-system/cpu-cache-coherence-memory-barrier"
+    ],
+    "confusable_with": [
+      "language/jvm-gc-jmm-overview",
+      "operating-system/cpu-cache-coherence-memory-barrier"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/java-memory-model-happens-before-beginner-primer.md",
+    "revision_history": []
+  }
+}

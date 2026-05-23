@@ -1,0 +1,54 @@
+{
+  "id": "security/mtls-client-auth-vs-certificate-bound-access-token",
+  "title": "mTLS Client Auth vs Certificate-Bound Access Token",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 mTLS Client Auth vs Certificate-Bound Access Token를 다루는 bridge 문서다. mTLS client authentication은 \"누가 토큰을 받아 가는가\"를 강하게 만들고, certificate-bound access token은 \"받아 간 토큰을 누가 실제로 쓰는가\"까지 묶으므로, 둘은 비슷해 보여도 보호하는 경계가 다르다. 검색 질의가 mTLS client auth, certificate-bound token, sender-constrained access token, cert bound access token처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# mTLS Client Auth vs Certificate-Bound Access Token\n\n> 한 줄 요약: mTLS client authentication은 \"누가 토큰을 받아 가는가\"를 강하게 만들고, certificate-bound access token은 \"받아 간 토큰을 누가 실제로 쓰는가\"까지 묶으므로, 둘은 비슷해 보여도 보호하는 경계가 다르다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Service-to-Service Auth: mTLS, JWT, SPIFFE](./service-to-service-auth-mtls-jwt-spiffe.md)\n> - [OAuth Client Authentication: `client_secret_basic`, `private_key_jwt`, mTLS](./oauth-client-authentication-private-key-jwt-mtls.md)\n> - [Proof-of-Possession vs Bearer Token Trade-offs](./proof-of-possession-vs-bearer-token-tradeoffs.md)\n> - [DPoP / Token Binding Basics](./dpop-token-binding-basics.md)\n> - [mTLS Certificate Rotation / Trust Bundle Rollout](./mtls-certificate-rotation-trust-bundle-rollout.md)\n> - [Token Misuse Detection / Replay Containment](./token-misuse-detection-replay-containment.md)\n\nretrieval-anchor-keywords: mTLS client auth, certificate-bound token, sender-constrained access token, cert bound access token, mutual TLS token binding, OAuth mTLS, PoP token, client certificate binding, token replay resistance, mixed rollout, tls termination metadata, cert rotation tail, AS RS support mismatch, sender-constrained rollout\n\n---\n\n## 핵심 개념\n\nmTLS와 certificate-bound token은 자주 한 덩어리로 설명되지만, 실제로는 다른 질문에 답한다.\n\n- mTLS client auth: token endpoint나 API가 \"지금 연결한 client가 누구인가\"를 확인\n- certificate-bound access token: \"이 access token은 어떤 client certificate와 함께 써야 하는가\"를 확인\n\n즉 전자는 인증, 후자는 토큰 재사용 방어까지 확장된 바인딩이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. mTLS client auth만으로는 토큰 재사용까지 막지 못할 수 있다\n\n예:\n\n- token endpoint에서 mTLS로 client를 인증\n- access token은 일반 bearer로 발급\n\n이 경우:\n\n- 토큰을 누가 받아 갔는지는 강하게 확인\n- 하지만 받아 간 토큰이 다른 경로에서 재사용되는지는 별도 문제\n\n### 2. certificate-bound token은 token use 시점까지 바인딩을 유지한다\n\nresource server는:\n\n- access token의 binding 정보\n- 현재 TLS client certificate\n\n를 함께 봐서 일치하는지 확인한다.\n\n즉 토큰 탈취 후 다른 certificate로의 재사용을 줄인다.\n\n### 3. load balancer와 TLS termination ownership이 중요하다\n\n이 구조에서 가장 중요한 운영 질문:\n\n- 누가 client certificate를 실제로 검증하는가\n- upstream에 어떤 증거를 전달하는가\n- 그 전달 자체는 또 어떻게 신뢰하는가\n\ntermination ownership이 흐리면 cert-bound token도 약해진다.\n\n### 4. 브라우저에는 보통 맞지 않는다\n\ncertificate-bound token은 대개:\n\n- B2B client\n- native client\n- service-to-service\n\n에 더 잘 맞는다.\n\n브라우저에서는 certificate lifecycle과 UX가 너무 무겁다.\n\n### 5. DPoP와 비교하면 채널 바인딩 vs 앱 레벨 proof 차이가 있다\n\n- cert-bound token: TLS channel과 certificate에 강하게 묶임\n- DPoP: 애플리케이션 레벨 proof와 key에 묶임\n\n둘 다 sender-constrained이지만 운영 층이 다르다.\n\n### 6. rollout 순서를 잘못 잡으면 부분적으로만 안전해진다\n\n가장 흔한 잘못된 전개:\n\n1. authorization server가 cert-bound token 발급을 먼저 켠다\n2. 일부 resource server는 아직 binding 검증을 지원하지 않는다\n3. gateway는 검증하지만 backend는 전달된 토큰을 bearer처럼 다시 쓴다\n\n이 경우 생기는 문제:\n\n- 어떤 경로는 sender-constrained, 어떤 경로는 사실상 bearer\n- 장애 시 운영자가 \"일단 검증 끄자\"며 fallback regression을 넣기 쉬움\n- 로그에는 mTLS가 보이므로 안전하다고 착각하기 쉬움\n\n그래서 rollout 단위는 보통 \"전체 플랫폼\"이 아니라 `audience`, `resource server class`, `gateway path` 단위로 쪼개야 한다.\n\n### 7. rotation과 recovery도 다르다\n\n- mTLS client auth: cert rotation, trust bundle rollout\n- cert-bound token: cert rotation + 기존 token binding tail 처리\n\n즉 certificate-bound token은 token lifecycle까지 포함해 더 복잡하다.\n\n특히 cert rotation 시에는 다음을 같이 봐야 한다.\n\n- old cert에 묶인 token TTL이 얼마나 남았는가\n- old/new cert overlap 동안 어느 thumbprint를 허용할 것인가\n- client가 새 cert를 받자마자 token도 재발급받는가\n- resource server가 rotated cert metadata를 일관되게 보는가\n\n### 8. failure policy를 미리 정하지 않으면 rollback이 bearer downgrade가 된다\n\nsender-constrained route에서 실패했을 때 선택지는 보통 세 가지다.\n\n- fail closed: high-risk API는 즉시 거부\n- limited degrade: 읽기 전용이나 낮은 위험 audience만 임시 우회\n- hard rollback: bound token 발급 자체를 중단하고 새 bearer 정책으로 명시 전환\n\n여기서 가장 나쁜 선택은 \"검증기가 에러 나면 그냥 bearer처럼 통과\"다.  \n이렇게 되면 장애 복구가 아니라 보안 경계 제거가 된다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: token endpoint는 mTLS인데 resource server는 bearer처럼 받는다\n\n문제:\n\n- issuance는 보호되지만 token replay는 열려 있다\n\n대응:\n\n- certificate-bound token 도입 여부를 검토한다\n- 최소한 high-risk audience만 sender-constrained로 좁힌다\n\n### 시나리오 2: load balancer 뒤에서 client cert identity가 누락된다\n\n문제:\n\n- binding check 근거가 흔들린다\n\n대응:\n\n- TLS termination ownership을 명확히 한다\n- trusted metadata 전달 경로를 점검한다\n\n### 시나리오 3: authorization server는 cert-bound token을 발급하지만 일부 API는 아직 bearer만 안다\n\n문제:\n\n- client는 같은 access token을 들고 다니는데\n- API별로 검증 수준이 다르다\n\n대응:\n\n- audience별로 발급 정책을 나눈다\n- bound token을 받는 API와 bearer API를 분리한다\n- mixed support 기간에는 acceptance 로그를 따로 본다\n\n### 시나리오 4: certificate rotation 직후 기존 access token이 대량 실패한다\n\n문제:\n\n- 새 cert로 mTLS는 붙지만 old cert thumbprint에 묶인 token이 남아 있다\n\n대응:\n\n- cert rotation 직후 token re-issue를 강제한다\n- token TTL을 cert overlap 창보다 길게 두지 않는다\n- rotation 전후 thumbprint mismatch 지표를 별도 경보로 둔다\n\n### 시나리오 5: browser에도 동일 패턴을 억지로 적용하려 한다\n\n문제:\n\n- certificate UX와 lifecycle이 과도하다\n\n대응:\n\n- 브라우저는 BFF + server-side token이나 DPoP 적합성을 다시 본다\n\n---\n\n## 코드로 보기\n\n### 1. 개념 비교\n\n```text\nmTLS client auth = issuance/auth path 강화\ncert-bound access token = token use path까지 바인딩 강화\n```\n\n### 2. 운영 체크리스트\n\n```text\n1. client certificate를 누가 검증하는가\n2. resource server가 binding check를 어디서 하는가\n3. authorization server와 resource server가 같은 binding semantics를 공유하는가\n4. TLS termination metadata를 upstream이 신뢰 가능한가\n5. cert rotation과 token tail을 함께 운영할 수 있는가\n6. 장애 시 fail-closed / limited-degrade / rollback 기준이 있는가\n7. 브라우저가 아닌 환경에만 제한하는가\n```\n\n### 3. rollout 순서 개념\n\n```text\n1. mTLS client auth 경로를 안정화한다\n2. resource server가 certificate binding 검증을 이해하는지 확인한다\n3. 특정 audience에만 cert-bound token 발급을 켠다\n4. cert rotation과 token re-issue 경로를 함께 검증한다\n5. acceptance mismatch가 없을 때 범위를 넓힌다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| mTLS client auth only | issuance 신원이 강하다 | token replay까지는 못 막을 수 있다 | token endpoint 보호 |\n| certificate-bound token | replay 저항성이 더 강하다 | TLS/control plane, cert rotation tail, partial rollout 복잡도 높다 | B2B, service-to-service |\n| DPoP | 앱 레벨에서 유연하다 | proof store/key lifecycle이 필요하다 | public/native client |\n| bearer token | 단순하다 | 탈취 후 재사용이 쉽다 | 저위험/단순 환경 |\n\n### 4. rollout failure 매트릭스\n\n| 실패 유형 | 실제로 깨지는 지점 | 위험 |\n|-----------|--------------------|------|\n| AS/RS 지원 불일치 | AS는 bound token 발급, RS는 bearer처럼 수용 | sender-constrained 공백 |\n| TLS metadata 손실 | LB/ingress 뒤에서 cert thumbprint 전달 실패 | 정상 요청 거부 또는 잘못된 우회 |\n| cert rotation tail | old cert bound token이 새 cert와 충돌 | 대량 401/403 |\n| emergency fallback | 검증 실패 시 bearer 허용 | 보안 경계 붕괴 |\n\n## 한 줄 정리\n\nmTLS client auth는 client identity를 강하게 만들고, certificate-bound token은 token 재사용까지 줄이는 장치다. 둘의 차이는 개념 설명보다 mixed rollout, TLS metadata, cert rotation tail에서 더 선명하게 드러난다.\n",
+  "aliases": [
+    "mTLS client auth",
+    "certificate-bound token",
+    "sender-constrained access token",
+    "cert bound access token",
+    "mutual TLS token binding",
+    "OAuth mTLS",
+    "PoP token",
+    "client certificate binding",
+    "token replay resistance",
+    "mixed rollout",
+    "tls termination metadata",
+    "cert rotation tail"
+  ],
+  "expected_queries": [
+    "mTLS Client Auth vs Certificate-Bound Access Token 차이를 실무 기준으로 설명해줘",
+    "mTLS client auth를 언제 선택해야 해?",
+    "mTLS Client Auth vs Certificate-Bound Access Token를 헷갈리지 않게 비교해줘",
+    "mTLS client auth 설계에서 자주 틀리는 지점은?"
+  ],
+  "symptoms": [
+    "리뷰나 미션 증상을 `mTLS Client Auth vs Certificate-Bound Access Token` 개념으로 연결하지 못한다",
+    "`mTLS Client Auth vs Certificate-Bound Access Token`가 코드 책임, 저장소, 런타임, 운영 경계 중 어디 문제인지 헷갈린다",
+    "익숙한 패턴 이름만 보고 `mTLS Client Auth vs Certificate-Bound Access Token`의 실제 trade-off를 놓친다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/authentication-vs-authorization",
+      "security/https-tls-beginner"
+    ],
+    "next_docs": [
+      "security/authority-transfer-vs-revoke-lag-primer-bridge",
+      "security/tls-https-handshake-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/mtls-client-auth-vs-certificate-bound-access-token.md",
+    "revision_history": []
+  }
+}

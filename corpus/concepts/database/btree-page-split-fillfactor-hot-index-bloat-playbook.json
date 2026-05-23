@@ -1,0 +1,61 @@
+{
+  "id": "database/btree-page-split-fillfactor-hot-index-bloat-playbook",
+  "title": "B-tree Page Split, Fillfactor, Hot Index, and Bloat Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# B-tree Page Split, Fillfactor, Hot Index, and Bloat Playbook\n\n> 한 줄 요약: B-tree bloat는 \"인덱스가 커졌다\"가 아니라 page split, update churn, dead entry cleanup, fillfactor 선택이 쓰기 p99와 읽기 locality를 함께 흔드는 운영 신호다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Page Split, Merge, and Fill Factor](./page-split-merge-fill-factor.md)\n- [B-Tree Latch Contention and Hot Pages](./btree-latch-contention-hot-pages.md)\n- [Hot Updates, Secondary Index Churn, and Write-Path Contention](./hot-update-secondary-index-churn.md)\n- [Secondary Index Maintenance Cost and ANALYZE Statistics Skew](./secondary-index-maintenance-cost-analyze-skew.md)\n\n## 핵심 상황\n\nB-tree index는 읽기 경로를 안정적으로 만들지만, page가 무한히 깔끔하게 유지되는 구조는 아니다. insert는 leaf page에 자리를 찾아 들어가고, 빈자리가 부족하면 page split을 만든다. update와 delete는 엔진별 MVCC, purge, vacuum, page reuse 정책을 거치며 dead entry나 빈 공간을 남길 수 있다. 시간이 지나면 index file은 커지고, cache locality는 흐려지고, 쓰기 경로는 더 많은 page를 만진다.\n\n이 문서는 \"page split이 무엇인가\"를 다시 설명하는 문서가 아니다. random key, volatile secondary index, fillfactor, HOT update, index rebuild를 운영에서 어떻게 분리해 볼지 정리하는 playbook이다.\n\n## page split mental model\n\nB-tree leaf page는 정렬된 key를 담는다. 새 key가 들어갈 page에 공간이 없으면 DB는 page를 나누고 parent pointer를 갱신한다. 이 과정은 redo/WAL, latch, buffer pool, cache churn을 동반한다.\n\nfillfactor는 page를 처음부터 얼마나 꽉 채울지에 대한 선택이다. 낮게 잡으면 나중 insert/update 여유가 생길 수 있지만, 같은 row 수를 담기 위해 더 많은 page가 필요하다. 높게 잡으면 읽기 밀도는 좋아질 수 있지만 random insert나 update churn에서 split이 빨리 온다.\n\nPostgreSQL의 HOT update는 indexed column이 바뀌지 않고 같은 heap page에 새 tuple version을 둘 공간이 있을 때 secondary index 갱신을 피할 수 있는 경로다. 그래서 fillfactor와 함께 자주 언급된다. 단, HOT는 \"index bloat를 자동으로 없애는 기능\"이 아니라 특정 조건에서 secondary index churn을 줄이는 경로다.\n\n## observable metrics\n\n| 관측 신호 | 의미 | 먼저 볼 질문 |\n|---|---|---|\n| index size / table size 비율 증가 | index가 data보다 빠르게 커짐 | 특정 index만 커졌나, 전체가 커졌나 |\n| dead tuple/dead entry 증가 | cleanup이 update/delete 속도를 못 따라감 | vacuum/purge가 막히는 이유가 있나 |\n| HOT update ratio 하락 | secondary index churn 회피 실패 | indexed column이 자주 바뀌나, page 여유가 없나 |\n| page split counter 또는 leaf page churn 증가 | insert/update가 공간 부족을 자주 만남 | key가 random인가, fillfactor가 높은가 |\n| WAL/redo bytes per write 증가 | 한 row 변경이 더 많은 page를 흔듦 | secondary index 폭과 개수가 늘었나 |\n| buffer cache hit ratio 하락 | index working set이 커짐 | bloat 때문에 cache residency가 깨졌나 |\n| write p95/p99 증가 | split, cleanup, latch가 write path에 섞임 | row lock이 아니라 page/index 경합인가 |\n| EXPLAIN rows는 낮은데 runtime 증가 | plan은 맞지만 physical locality가 나쁨 | heap fetch, random I/O, index depth를 같이 봤나 |\n\n## failure matrix\n\n| 증상 | 가능 원인 | 먼저 볼 것 | 위험한 대응 |\n|---|---|---|---|\n| index file만 계속 커짐 | dead entry 재사용 실패, delete churn | bloat estimate, dead tuples, index별 size | 무조건 인덱스 추가 |\n| update 후 write p99 증가 | volatile indexed column churn | HOT ratio, WAL/redo bytes, leaf contention | row lock만 튜닝 |\n| UUID PK 도입 후 insert 비용 증가 | random insert page split | page split 지표, cache miss, index depth | sequential key로 즉시 회귀 |\n| fillfactor 낮췄는데 read가 느려짐 | page 수 증가와 cache residency 악화 | index pages, buffer hit ratio | fillfactor를 더 낮춤 |\n| VACUUM 후 파일 크기 그대로 | space reuse와 physical shrink 혼동 | reusable free space, REINDEX 필요성 | 장애 중 full rebuild |\n\n## bloat caveats\n\n- bloat estimate는 근사치다. 한 지표가 아니라 index별 size, dead tuple, workload timeline을 같이 본다.\n- cleanup은 공간을 재사용 가능하게 만들 수 있지만 파일 크기를 즉시 줄이지 않을 수 있다.\n- `REINDEX`, `OPTIMIZE TABLE`, online rebuild는 bloat를 줄일 수 있지만 maintenance window, replica lag, lock, write amplification 위험을 만든다.\n- random UUID는 last page hotspot을 줄일 수 있지만 page split과 cache locality 비용을 늘릴 수 있다.\n- 낮은 fillfactor는 update 여유를 만들 수 있지만, read-heavy index에서는 더 넓은 working set을 만든다.\n- covering index를 넓히면 leaf fanout이 줄고 split과 cache pressure가 증가한다.\n\n## verification steps\n\n1. 엔진을 먼저 분리한다. InnoDB clustered index와 PostgreSQL heap plus index는 같은 단어를 써도 관측 지표가 다르다.\n2. `SHOW INDEX`, catalog view, index size report로 어떤 index가 커졌는지 좁힌다.\n3. workload timeline에서 random insert, status update, backfill, delete batch, new covering index 추가 시점을 표시한다.\n4. PostgreSQL이면 HOT update ratio, dead tuple, autovacuum 지연, `REINDEX CONCURRENTLY` 필요성을 본다.\n5. MySQL/InnoDB이면 page split 직접 지표가 제한적일 수 있으므로 redo bytes, buffer pool churn, InnoDB status, secondary index maintenance cost를 함께 본다.\n6. rebuild나 fillfactor 변경은 representative canary table/index에서 p99, index size, buffer hit ratio, replica lag를 비교한 뒤 maintenance window로 옮긴다.\n\n## wrong-bucket neighbors\n\n| 헷갈리는 bucket | 왜 다르게 봐야 하나 | 더 맞는 문서 |\n|---|---|---|\n| row lock/deadlock | bloat와 split은 물리 index 유지 비용이고 transaction 충돌과 다르다 | [B-Tree Latch Contention and Hot Pages](./btree-latch-contention-hot-pages.md) |\n| 느린 SQL 튜닝 | plan이 맞아도 index physical state가 나쁘면 runtime이 느릴 수 있다 | [쿼리 튜닝 체크리스트](./query-tuning-checklist.md) |\n| volatile secondary index | column churn 자체가 원인이면 hot update 문서가 더 직접적이다 | [Hot Updates, Secondary Index Churn](./hot-update-secondary-index-churn.md) |\n| LSM tombstone backlog | LSM compaction debt와 B-tree page reuse/bloat는 cleanup 모델이 다르다 | [LSM Compaction Tombstone Playbook](./lsm-compaction-tombstone-read-amplification-playbook.md) |\n| MySQL vs PostgreSQL 저장구조 | fillfactor/HOT를 InnoDB clustered locality처럼 해석하면 틀린다 | [MySQL/PostgreSQL Index Storage Bridge](./mysql-postgresql-index-storage-bridge.md) |\n\n## safe next docs\n\npage split 기본 원리를 먼저 고정하려면 [Page Split, Merge, and Fill Factor](./page-split-merge-fill-factor.md)로 돌아간다. write-heavy secondary index가 중심이면 [Hot Updates, Secondary Index Churn](./hot-update-secondary-index-churn.md)이 더 안전하다. 실제 운영 rebuild나 index rollout을 하려면 [Index Maintenance Window, Rollout, and Fallback Playbook](./index-maintenance-window-rollout-playbook.md)을 먼저 읽고 guardrail을 잡는다.\n\n## 한 줄 정리\n\nB-tree bloat 대응은 \"인덱스를 다시 만들자\"가 아니라, page split, fillfactor, HOT 가능성, dead entry cleanup, rebuild 위험을 분리해서 가장 작은 운영 조치부터 검증하는 절차다.\n",
+  "aliases": [
+    "B-tree page split fillfactor bloat",
+    "hot index bloat",
+    "fillfactor HOT update",
+    "B-tree index bloat",
+    "page split write amplification",
+    "index page fragmentation",
+    "PostgreSQL HOT update bloat",
+    "random UUID page split",
+    "인덱스 bloat",
+    "fill factor tuning"
+  ],
+  "expected_queries": [
+    "B-tree page split과 fillfactor, index bloat를 운영 지표로 어떻게 구분해?",
+    "PostgreSQL HOT update와 fillfactor가 secondary index bloat를 줄이는 조건은 뭐야?",
+    "random UUID나 volatile status index가 page split, dead tuple, write amplification을 키우는 이유가 뭐야?",
+    "index size가 계속 커지는데 VACUUM, REINDEX, OPTIMIZE 중 무엇을 검증해야 해?",
+    "hot index bloat를 row lock, latch contention, slow query 튜닝과 구분하는 체크리스트를 알려줘"
+  ],
+  "symptoms": [
+    "random insert, volatile secondary index, delete-heavy workload 뒤에 index size와 write p99가 같이 커진다",
+    "fillfactor나 HOT update를 숫자 튜닝으로만 보고 page split, dead tuple, secondary index churn을 분리하지 못한다",
+    "B-tree index bloat를 느린 쿼리 하나나 row lock 문제로 오해해 구조적 유지 비용을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/page-split-merge-fill-factor",
+      "database/btree-latch-contention-hot-pages",
+      "database/hot-update-secondary-index-churn"
+    ],
+    "next_docs": [
+      "database/secondary-index-maintenance-statistics-skew",
+      "database/index-maintenance-window-rollout-playbook",
+      "database/vacuum-purge-debt-forensics-symptom-map",
+      "database/mysql-postgresql-index-storage-bridge"
+    ],
+    "confusable_with": [
+      "database/page-split-merge-fill-factor",
+      "database/btree-latch-contention-hot-pages",
+      "database/hot-update-secondary-index-churn",
+      "database/query-tuning-checklist",
+      "database/lsm-compaction-tombstone-read-amplification-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/btree-page-split-fillfactor-hot-index-bloat-playbook.md",
+    "revision_history": []
+  }
+}

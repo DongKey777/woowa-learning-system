@@ -1,0 +1,48 @@
+{
+  "id": "spring/mvc-request-response-flow-interview-primer",
+  "title": "MVC Request Response Flow Interview Primer",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "이 primer는 Spring MVC 요청-응답 흐름을 면접 답변으로 설명한다. DispatcherServlet, Controller, Service, Repository, SQL 흐름을 다룬다.",
+  "body_markdown": "# MVC Request Response Flow Interview Primer\n\n## 한 줄 요약\n\nSpring MVC 요청은 servlet container에서 filter를 거쳐 `DispatcherServlet`으로 들어오고, handler mapping/adapter, binding/message conversion, Controller, Service, Repository, return value handling, exception resolver를 지나 HTTP response로 바뀐다.\n\n## 미션 진입 증상\n\n브라우저 요청이 Controller로 바로 들어온다고 이해하면 인증 filter, validation `400`, message conversion 실패, transaction boundary, SQL 실행 위치를 한 덩어리로 디버깅하게 된다. 이 문서는 \"웹 요청 처리\"와 \"비즈니스 상태 변경\"을 한 흐름으로 연결하되, 각 단계의 책임은 분리해서 말하는 primer다.\n\n## 핵심 mental model\n\n요청은 `Filter` -> `DispatcherServlet` -> `HandlerMapping`/`HandlerAdapter` -> argument resolver/message converter -> Controller -> Service -> Repository -> DB -> return value handler/message converter -> exception resolver 순서로 흐를 수 있다.\n\n```text\nHTTP request\n  -> Servlet Filter chain\n  -> DispatcherServlet\n  -> HandlerMapping\n  -> HandlerAdapter\n  -> argument resolver / HttpMessageConverter\n  -> Controller method\n  -> Service use case / transaction boundary\n  -> Repository / SQL or ORM\n  -> return value handler / HttpMessageConverter\n  -> ExceptionResolver or @ControllerAdvice on failure\n  -> HTTP response\n```\n\n이 흐름에서 Controller는 \"처음 요청을 받는 모든 것\"이 아니라 MVC가 handler를 찾고 값을 채운 뒤 호출하는 endpoint method다. Service와 Repository는 MVC 구성요소가 아니지만, 면접에서는 요청이 실제 상태 변경/조회로 이어지는 지점을 설명하기 위해 함께 연결해 말할 수 있다.\n\n## 면접 답변 골격\n\n1. 요청은 먼저 servlet container에 도착하고, Spring MVC 바깥의 servlet filter chain을 지난다.\n2. `DispatcherServlet`이 front controller로 요청을 받아 적절한 handler를 찾는다.\n3. `HandlerMapping`이 어떤 Controller method가 처리할지 결정하고, `HandlerAdapter`가 실제 호출 방식을 맞춘다.\n4. argument resolver와 message converter가 path variable, query parameter, request body를 method parameter로 변환한다.\n5. Controller는 HTTP 요청을 application use case로 연결하고, Service는 business 흐름과 transaction boundary를 담당한다.\n6. Repository는 persistence contract를 통해 DB 조회/저장을 수행한다.\n7. 반환값은 return value handler와 message converter를 거쳐 HTTP response body/status로 변환된다.\n8. 중간에 예외가 발생하면 exception resolver나 `@ControllerAdvice`가 응답으로 매핑한다.\n\n## 단계별 실패 증거\n\n| 관찰 | Controller 도달 여부 | 먼저 볼 단계 |\n|---|---|---|\n| CORS/preflight, 인증 토큰 추출에서 막힘 | 보통 도달 전 | Filter 또는 Spring Security filter chain |\n| URL은 있는데 `404`/`405` | 도달 전 | HandlerMapping route/method mapping |\n| `415 Unsupported Media Type` | 도달 전 | `Content-Type`, consumes, message converter 선택 |\n| JSON parse/type mismatch `400` | 도달 전 | `HttpMessageConverter`, binding |\n| `@Valid` validation `400` | method parameter 생성 중 또는 직후 | binding/validation pipeline |\n| Service 예외가 `409`/`404`로 변환됨 | 도달 후 | Service rule + ExceptionResolver/Advice |\n| SQL이 너무 많이 나감 | 도달 후 | Repository/ORM fetch plan, transaction boundary |\n\n이 표의 핵심은 \"HTTP status만 보고 Controller 문제라고 단정하지 않는다\"는 것이다. Controller breakpoint가 찍히지 않는 `400`/`415`와 Controller 내부에서 던진 도메인 예외의 `400`/`409`는 원인 층이 다르다.\n\n## Filter, Interceptor, Resolver 위치\n\n| 구성요소 | 위치 | 주로 맡는 일 | 흔한 오해 |\n|---|---|---|---|\n| Filter | `DispatcherServlet` 앞 | 인증 토큰 추출, CORS, request wrapping처럼 servlet 레벨 처리 | MVC handler context가 있다고 가정함 |\n| HandlerInterceptor | handler 선택 이후, Controller 호출 전후 | 인증/인가 체크, logging, locale 등 Spring MVC handler context 활용 | Filter와 같은 위치라고 봄 |\n| ArgumentResolver | Controller 호출 직전 | method parameter를 만들어 넣음 | Controller가 직접 request에서 모두 꺼낸다고 봄 |\n| MessageConverter | request/response body 변환 | JSON을 객체로, 객체를 JSON으로 변환 | JSON 변환 실패가 Controller 내부에서 난다고 봄 |\n| ExceptionResolver | 예외 발생 후 | 예외를 ModelAndView 또는 response로 변환 | `@ControllerAdvice`가 요청 전처리라고 생각함 |\n\n## Layer Boundary 연결\n\nController는 HTTP status, header, request/response DTO 같은 web concern에 집중한다. Service는 \"예약을 생성한다\", \"결제를 승인한다\" 같은 use case를 표현하고 transaction boundary를 잡기 좋다. Repository는 SQL이나 ORM 세부를 감추고 저장소와의 계약을 제공한다.\n\n이 경계를 지키면 MVC 요청 흐름을 설명할 때도 \"웹 요청 처리\"와 \"비즈니스 상태 변경\"을 분리해서 말할 수 있다. 예를 들어 request body JSON이 깨져 있으면 Service transaction이 시작되기 전에 실패할 수 있고, 중복 예약 같은 business rule 위반은 Controller가 호출된 뒤 Service에서 감지되어 `@ControllerAdvice`를 통해 HTTP response로 번역될 수 있다.\n\n## 운영/디버깅 확인 포인트\n\n- Controller breakpoint가 찍히는지 먼저 확인한다. 찍히지 않으면 route mapping, filter, binding, message conversion 쪽이다.\n- request/response access log에는 method, path, status, latency, request id를 남겨 어느 단계까지 갔는지 연결한다.\n- Spring MVC mapping 로그 또는 actuator mappings로 URL과 HTTP method가 어떤 handler에 매핑되는지 확인한다.\n- `400`/`415`는 request body, `Content-Type`, DTO field type, validation message를 함께 본다.\n- Service 진입 이후 문제는 transaction log, SQL log, repository 호출 횟수, domain exception type을 같이 본다.\n- 예외 응답은 `@ControllerAdvice`가 변환한 status/body와 실제 예외 type이 일치하는지 확인한다.\n\n## 짧은 모범 답변\n\nSpring MVC 요청은 servlet filter chain을 거쳐 `DispatcherServlet`에 들어오고, `HandlerMapping`과 `HandlerAdapter`를 통해 Controller method로 연결됩니다. 이때 argument resolver와 `HttpMessageConverter`가 path/query/body 값을 Java parameter로 바꾸고, Controller는 Service use case를 호출합니다. Service는 보통 transaction boundary 안에서 business 흐름을 처리하고 Repository를 통해 DB에 접근합니다. 반환값이나 예외는 return value handler, message converter, exception resolver, `@ControllerAdvice` 등을 거쳐 HTTP response로 변환됩니다.\n\n## 흔한 오해\n\n- Controller method가 browser request를 제일 먼저 받는 것은 아니다. filter chain과 `DispatcherServlet`이 앞에 있다.\n- `@RequestBody` JSON parse 실패나 media type 불일치는 Controller method body에 들어오기 전에 날 수 있다.\n- Service는 MVC 구성요소가 아니라 application/business flow를 담는 계층이다.\n- transaction boundary는 보통 Service method에 두고, Repository는 persistence contract를 담당한다.\n- `@ControllerAdvice`는 모든 예외를 없애는 장치가 아니라 예외를 HTTP response contract로 번역하는 장치다.\n\n## Safe Next Docs\n\n백엔드 전체 흐름은 `backend-request-to-sql-flow-primer`, Spring 내부 흐름은 `spring-mvc-request-lifecycle`로 이어진다.\n",
+  "aliases": [
+    "Spring MVC request flow interview",
+    "MVC 요청 응답 흐름 면접",
+    "DispatcherServlet answer",
+    "Controller Service Repository flow",
+    "@Controller",
+    "@ControllerAdvice",
+    "@RequestBody"
+  ],
+  "expected_queries": [
+    "Spring MVC 요청 흐름을 면접에서 어떻게 설명해?",
+    "DispatcherServlet부터 Controller까지 흐름을 알려줘",
+    "Controller Service Repository SQL 흐름을 한 번에 말하고 싶어"
+  ],
+  "symptoms": [
+    "Controller method가 바로 브라우저 요청을 받는다고만 생각해요",
+    "filter, interceptor, argument resolver 위치를 섞어요",
+    "Service/Repository/transaction boundary를 request flow와 연결하지 못해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-mvc-request-lifecycle-basics"
+    ],
+    "next_docs": [
+      "software-engineering/backend-request-to-sql-flow-primer"
+    ],
+    "confusable_with": [
+      "spring/spring-mvc-request-lifecycle-basics",
+      "software-engineering/backend-request-to-sql-flow-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/mvc-request-response-flow-interview-primer.md",
+    "revision_history": []
+  }
+}

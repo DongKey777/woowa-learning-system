@@ -1,0 +1,54 @@
+{
+  "id": "security/audit-log-hash-chain-tamper-evidence-primer",
+  "title": "Audit Log Hash Chain Tamper Evidence Primer",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Audit Log Hash Chain Tamper Evidence Primer\n\n> 한 줄 요약: audit log hash chain은 로그를 못 바꾸게 만드는 장치가 아니라, 바꾸거나 지운 흔적이 나중에 검증에서 드러나게 만드는 무결성 증거다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n- [Audit Log Pipeline 설계](../system-design/audit-log-pipeline-design.md)\n- [Audit Evidence Vault 설계](../system-design/audit-evidence-vault-design.md)\n- [Canonical Security Timeline Event Schema](./canonical-security-timeline-event-schema.md)\n- [AuthZ Decision Logging Design](./authz-decision-logging-design.md)\n\nretrieval-anchor-keywords: audit log hash chain, tamper evidence, append-only log integrity, prev hash current hash, sequence gap, checkpoint signature, hash manifest, WORM storage, chain of custody, forensic audit trail\n\n## 핵심 개념\n\n감사 로그에서 \"immutable\"이라고 말해도 실제 시스템에서는 운영자 권한, 저장소 버그, migration, retention job 때문에 row가 수정되거나 누락될 위험이 남는다. hash chain은 이 위험을 0으로 만들지는 못하지만, 나중에 verifier가 \"이 row와 이전 row가 원래 연결돼 있었는가\"를 확인할 수 있게 한다.\n\n기본 구조는 단순하다.\n\n```text\nevent_001 -> hash(event_001)\nevent_002 -> hash(prev_hash + canonical(event_002))\nevent_003 -> hash(prev_hash + canonical(event_003))\n```\n\n각 event는 `sequence`, `prev_hash`, `current_hash`를 가진다. `current_hash`는 canonical encoding된 event 핵심 필드와 `prev_hash`를 함께 hash한 값이다. 중간 row를 수정하면 그 row의 hash가 달라지고, 삭제하면 다음 row의 `prev_hash`가 맞지 않는다. 순서를 바꿔도 chain verification이 깨진다.\n\n중요한 표현은 \"tamper-proof\"가 아니라 **tamper-evident**다. 누군가 저장소를 바꿀 수 있더라도, 검증하면 바뀐 흔적이 드러나게 만드는 설계다.\n\n## Mental Model\n\nhash chain은 기차의 연결고리처럼 보면 된다. 각 칸은 자기 내용과 앞 칸의 fingerprint를 함께 들고 있다. 중간 칸을 바꾸거나 빼면 뒤 칸들이 들고 있는 fingerprint와 맞지 않는다.\n\n하지만 tail truncation은 별도 문제다. 공격자가 마지막 1시간 로그 전체를 지우고 chain 끝도 함께 지웠다면, 내부 chain만으로는 \"원래 더 있었다\"를 증명하기 어렵다. 그래서 일정 주기마다 외부 checkpoint가 필요하다.\n\n좋은 checkpoint 예:\n\n- batch root hash를 KMS/HSM key로 서명\n- 일 단위 manifest를 WORM/object-lock storage에 저장\n- SIEM, evidence vault, 다른 계정의 archive에 digest 복제\n- `producer_id`, `stream_id`, `start_sequence`, `end_sequence`, `record_count`, `root_hash`를 함께 봉인\n\n## Integrity Invariant\n\n최소 invariant는 아래 네 가지다.\n\n| invariant | 의미 | 깨질 때 보이는 신호 |\n|---|---|---|\n| sequence monotonicity | 같은 stream에서 sequence가 증가한다 | sequence gap, duplicate sequence |\n| hash continuity | `event_n.prev_hash == event_n-1.current_hash` | chain break |\n| canonical encoding | 같은 event는 항상 같은 bytes로 hash된다 | verifier마다 hash 결과 불일치 |\n| external checkpoint | 특정 시각의 chain head가 외부에 봉인된다 | tail truncation 검출 불가 |\n\n이 invariant가 없으면 \"로그가 많다\"는 말은 가능해도 \"이 구간이 그대로 남아 있다\"는 증거는 약하다.\n\n## Operational Signals\n\n운영 지표는 단순 ingest QPS보다 verification 가능성을 봐야 한다.\n\n- `audit_chain_verification_failed_total{stream,reason}`\n- `audit_sequence_gap_total{producer,stream}`\n- checkpoint 생성 지연과 서명 실패\n- producer restart 후 `prev_hash` reset 발생 여부\n- verifier가 본 `end_sequence`와 ingest pipeline이 본 `end_sequence` 차이\n- export manifest의 `record_count`, `root_hash`, source window mismatch\n- WORM retention 또는 object-lock policy 변경 시도\n\n사고 중에는 \"로그가 있다\"보다 \"검증 가능한 구간이 어디까지인가\"를 먼저 말해야 한다. verification이 마지막 성공 checkpoint 이후 실패한다면, 그 뒤 구간은 증거 강도가 낮다.\n\n## Failure Matrix\n\n| 증상 | 가까운 원인 | 확인할 것 | 대응 |\n|---|---|---|---|\n| 중간 sequence가 비어 있음 | 삭제, ingest loss, partition reorder | producer offset, queue ack, verifier gap | gap window를 incident evidence로 표시 |\n| `prev_hash` 불일치 | row 수정 또는 chain 계산 버그 | canonical schema version, serializer 변화 | 해당 version verifier 재현 |\n| 마지막 구간이 통째로 없음 | tail truncation 또는 retention job | external checkpoint head, WORM manifest | checkpoint 이후 구간 신뢰도 낮춤 |\n| export CSV는 정상인데 manifest 불일치 | export 중 필터/정렬/누락 | export query, record count, root hash | export package 재생성 |\n| producer 재시작 뒤 chain reset | stream identity 관리 실패 | producer_id, stream_id, epoch | epoch boundary를 명시적으로 기록 |\n\n## Wrong-Bucket Neighbors\n\n- encryption: 암호화는 내용을 숨긴다. hash chain은 내용이 바뀌었는지 검출한다.\n- password hashing: 비밀번호 검증용 one-way hash와 감사 로그 sequence integrity는 목적이 다르다.\n- digital signature: signature는 checkpoint나 batch manifest를 봉인하는 데 유용하지만, 각 row의 순서 연결은 hash chain이 맡는다.\n- generic application log: debug log는 장애 분석용이다. audit hash chain은 사고 후 증거 재현성을 목표로 한다.\n- evidence vault: vault는 제출용 패키지 보관 계층이다. hash chain은 원천 audit stream의 무결성 구조다.\n\n## Safe Next Docs\n\n무엇을 audit event로 남길지부터 잡아야 하면 `security/audit-logging-auth-authz-traceability`, 파이프라인과 archive 설계는 `system-design/audit-log-pipeline-design`, 제출용 증거 패키지와 chain of custody는 `system-design/audit-evidence-vault-design`으로 이어진다. 권한 판단 이벤트의 reason code와 policy version은 `security/authz-decision-logging-design`에서 함께 본다.\n\n## 한 줄 정리\n\nAudit log hash chain은 sequence, previous hash, canonical event hash, external checkpoint를 묶어 수정, 삭제, 재정렬, tail truncation을 검증 가능한 증거 문제로 바꾸는 기본 무결성 패턴이다.\n",
+  "aliases": [
+    "audit log hash chain",
+    "tamper evidence audit log",
+    "append-only log integrity",
+    "hash chained log",
+    "log tamper detection",
+    "forensic audit trail"
+  ],
+  "expected_queries": [
+    "audit log hash chain은 변조를 어떻게 발견하게 해?",
+    "append-only audit log에서 row 삭제나 순서 변경을 검출하려면 어떤 invariant가 필요해?",
+    "tamper-evident log와 encrypted log는 어떤 점이 달라?",
+    "감사 로그 export가 원본과 같은지 hash manifest로 검증하는 방법을 설명해줘",
+    "log integrity checkpoint와 external signature가 왜 필요한지 알려줘"
+  ],
+  "symptoms": [
+    "audit log row가 수정되거나 삭제돼도 나중에 검출할 방법이 없습니다",
+    "로그 export는 있는데 어떤 구간이 빠졌는지 증명하지 못합니다",
+    "사고 조사에서 원본 audit stream과 제출용 CSV의 무결성 관계가 흐립니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/audit-logging-auth-authz-traceability",
+      "system-design/audit-log-pipeline-design"
+    ],
+    "next_docs": [
+      "system-design/audit-evidence-vault-design",
+      "security/canonical-security-timeline-event-schema",
+      "security/authz-decision-logging-design"
+    ],
+    "confusable_with": [
+      "security/audit-logging-auth-authz-traceability",
+      "system-design/audit-evidence-vault-design",
+      "security/hashing-vs-encryption-vs-encoding-primer",
+      "security/public-key-digital-signature-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/audit-log-hash-chain-tamper-evidence-primer.md",
+    "revision_history": []
+  }
+}

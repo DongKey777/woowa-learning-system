@@ -1,0 +1,60 @@
+{
+  "id": "network/tls-ech-encrypted-client-hello-sni-privacy-primer",
+  "title": "TLS ECH, Encrypted ClientHello, and SNI Privacy Primer",
+  "category": "network",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# TLS ECH, Encrypted ClientHello, and SNI Privacy Primer\n\n> 한 줄 요약: TLS ECH는 HTTPS의 본문 암호화 문제가 아니라, **TLS handshake 초기에 노출되던 ClientHello 안의 실제 SNI를 inner ClientHello로 숨기고 outer ClientHello에는 공개 이름(public name)을 남기는 privacy 기능**이다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [TLS Loadbalancing Proxy](./tls-loadbalancing-proxy.md)\n- [SNI Routing Mismatch Hostname Failure](./sni-routing-mismatch-hostname-failure.md)\n- [DoH, DoT, Split Horizon Enterprise DNS Chooser](./doh-dot-split-horizon-enterprise-dns-chooser.md)\n- [TLS Session Resumption Ticket Rotation Chooser](./tls-session-resumption-ticket-rotation-chooser.md)\n\nretrieval-anchor-keywords: TLS ECH, Encrypted ClientHello, SNI privacy, outer ClientHello, inner ClientHello, public name, ECHConfig, DNS HTTPS RR, encrypted SNI, CDN routing fallback\n\n## 먼저 오해부터 정리\n\nHTTPS를 쓰면 HTTP method, path, header, body는 TLS로 보호된다. 하지만 전통적인 TLS handshake에서는 ClientHello의 여러 정보가 암호화되기 전에 보인다.\n\n대표적으로 SNI(Server Name Indication)는 클라이언트가 접속하려는 hostname을 서버에게 알려주는 확장이다. SNI가 있어야 한 IP에서 여러 인증서/가상 호스트를 서비스할 수 있다.\n\n문제는 관찰자도 SNI를 볼 수 있다는 점이다.\n\n```text\nIP 주소는 CDN 공용 IP\nSNI는 actual.example.com\n```\n\nECH는 이 실제 SNI를 포함한 민감한 ClientHello 일부를 암호화해서 관찰자가 어느 origin hostname에 접속하는지 덜 알 수 있게 한다.\n\n## outer ClientHello와 inner ClientHello\n\nECH의 핵심 mental model은 ClientHello가 두 겹이라는 것이다.\n\n| 층 | 보이는 정도 | 역할 |\n|---|---|---|\n| outer ClientHello | 네트워크 관찰자와 서버 front가 볼 수 있음 | public name, ECH 사용 시도, 기본 라우팅 힌트 |\n| inner ClientHello | ECH private key를 가진 endpoint만 복호화 | 실제 SNI와 민감한 TLS extension |\n\n클라이언트는 실제 접속하려는 이름을 inner ClientHello에 넣고 암호화한다. outer ClientHello에는 공개적으로 드러나도 되는 public name을 넣는다.\n\n이 public name은 보통 같은 provider/CDN의 대표 이름처럼 동작한다. 관찰자는 \"이 provider 쪽으로 간다\" 정도는 알 수 있지만, inner name까지는 모르게 만드는 것이 목표다.\n\n## ECHConfig가 왜 먼저 필요할까\n\n클라이언트가 inner ClientHello를 암호화하려면 서버 쪽 ECH public key와 설정을 알아야 한다. 이 정보를 보통 ECHConfig라고 부른다.\n\n흐름을 단순화하면:\n\n```text\n1. DNS HTTPS/SVCB 계열 record에서 ECHConfig를 얻는다\n2. 클라이언트가 inner ClientHello를 ECHConfig로 암호화한다\n3. outer ClientHello와 암호화된 inner ClientHello를 보낸다\n4. 서버/CDN front가 private key로 inner를 복호화한다\n```\n\n그래서 ECH는 DNS privacy와도 엮인다. DNS query가 평문으로 나가면 hostname이 다른 경로에서 노출될 수 있다. DoH/DoT 같은 DNS transport privacy와 ECH는 서로 다른 계층이지만, privacy 목표를 같이 생각해야 한다.\n\n## SNI 라우팅과 충돌하지 않는가\n\n전통적인 TLS termination/load balancer는 SNI를 보고 인증서와 backend를 고른다. ECH는 실제 SNI를 숨기므로 운영 구조가 바뀐다.\n\n가능한 모델은:\n\n- ECH를 처리할 수 있는 edge/CDN이 먼저 outer ClientHello를 받는다.\n- edge가 inner ClientHello를 복호화한다.\n- 복호화된 실제 SNI 기준으로 certificate/backend를 고른다.\n- 실패하면 public name 기준 fallback 정책을 따른다.\n\n즉 ECH는 \"라우팅 정보가 필요 없다\"가 아니라, 실제 라우팅 정보를 **볼 수 있는 주체를 ECH endpoint로 제한**한다.\n\n## 10초 chooser\n\n| 질문 신호 | 먼저 볼 주제 | 이유 |\n|---|---|---|\n| HTTPS인데 접속 hostname이 노출되는가 | SNI / ClientHello | handshake metadata 문제다 |\n| 실제 SNI를 숨기고 싶다 | TLS ECH | inner ClientHello 암호화가 목적이다 |\n| 재접속 handshake latency를 줄이고 싶다 | TLS resumption | 성능/상태 재사용 문제다 |\n| 0-RTT replay 위험이 걱정된다 | TLS 1.3 0-RTT | early data replay 문제다 |\n| 인증서가 hostname과 맞지 않는다 | SNI/certificate mismatch | privacy가 아니라 인증서/라우팅 문제다 |\n| HTTP/3 endpoint discovery가 필요하다 | HTTPS RR / Alt-Svc | protocol discovery와 cache freshness 문제다 |\n\nECH는 privacy 기능이다. session resumption, ALPN, HTTP/3 discovery와 같은 handshake 주변 주제와 같이 나오지만 목적이 다르다.\n\n## 운영에서 보는 failure mode\n\nECH는 클라이언트, DNS, edge, certificate, fallback 정책이 맞아야 한다.\n\n| 증상 | 가능한 원인 |\n|---|---|\n| ECH가 켜진 줄 알았는데 SNI가 계속 보인다 | 클라이언트 미지원, ECHConfig 미수신, fallback |\n| 일부 네트워크에서 접속 실패 | middlebox가 unknown extension 또는 HTTPS RR을 방해 |\n| 인증서 오류 | public name/inner name certificate routing이 어긋남 |\n| CDN tenant 간 privacy 기대가 다르다 | public name grouping과 anonymity set 설계 문제 |\n| 기업망에서 정책 충돌 | TLS inspection, split-horizon DNS, DoH/DoT 정책 충돌 |\n\nECH 도입은 단일 서버 플래그가 아니라 client capability, DNS 배포, edge key rotation, fallback observability를 함께 봐야 한다.\n\n## privacy 한계\n\nECH가 숨기는 것은 주로 ClientHello의 실제 SNI와 일부 extension이다. 모든 정보를 지우는 것은 아니다.\n\n여전히 관찰 가능한 것:\n\n- 접속 IP\n- timing과 traffic volume\n- outer ClientHello의 public name\n- DNS가 보호되지 않으면 DNS query\n- CDN/provider 단위의 grouping\n\n따라서 ECH는 \"완전 익명화\"가 아니라 TLS metadata exposure를 줄이는 기술로 이해해야 한다.\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| HTTPS면 SNI도 항상 암호화된다 | 전통적인 TLS에서는 ClientHello SNI가 노출될 수 있다 |\n| ECH는 TLS 성능 최적화다 | 핵심은 privacy다 |\n| ECH를 쓰면 DNS privacy는 상관없다 | hostname은 DNS 경로에서 다시 노출될 수 있다 |\n| SNI routing이 필요 없어진다 | 실제 SNI를 볼 수 있는 edge가 라우팅한다 |\n| outer public name이 실제 hostname이다 | public name은 fallback/cover name 성격이다 |\n\n## 검증 질문\n\n1. ECH에서 outer ClientHello와 inner ClientHello에는 각각 어떤 정보가 들어가는가?\n2. 클라이언트가 ECHConfig를 handshake 전에 알아야 하는 이유는 무엇인가?\n3. ECH와 DoH/DoT가 서로 다른 계층인데도 함께 언급되는 이유는 무엇인가?\n4. ECH가 session resumption이나 0-RTT와 다른 목적을 갖는 이유는 무엇인가?\n5. CDN에서 ECH를 도입할 때 fallback과 observability를 봐야 하는 이유는 무엇인가?\n\n## 안전한 다음 문서\n\n- SNI 기반 라우팅 자체가 약하면 [SNI Routing Mismatch Hostname Failure](./sni-routing-mismatch-hostname-failure.md)\n- DNS discovery와 HTTPS RR은 [Alt-Svc HTTPS RR H3 Discovery Coalescing Bridge](./alt-svc-https-rr-h3-discovery-coalescing-bridge.md)\n- handshake 재사용은 [TLS Session Resumption Ticket Rotation Chooser](./tls-session-resumption-ticket-rotation-chooser.md)\n\nECH를 설명할 때는 \"무엇을 숨기는가\"와 \"누가 복호화할 수 있는가\"를 분리해야 한다. 이 구분이 잡히면 SNI privacy, DNS privacy, CDN routing, TLS resumption을 같은 bucket에 넣는 실수를 줄일 수 있다.\n",
+  "aliases": [
+    "TLS ECH",
+    "Encrypted ClientHello",
+    "encrypted SNI",
+    "SNI privacy",
+    "ECHConfig",
+    "public name",
+    "outer ClientHello",
+    "inner ClientHello",
+    "TLS ClientHello encryption",
+    "암호화된 ClientHello"
+  ],
+  "expected_queries": [
+    "TLS ECH가 SNI를 숨기는 구조를 outer ClientHello와 inner ClientHello로 설명해줘",
+    "HTTPS인데도 접속 도메인이 보일 수 있다는 말과 Encrypted ClientHello의 관계가 궁금해",
+    "ECHConfig와 DNS HTTPS record가 TLS handshake 전에 필요한 이유가 뭐야",
+    "SNI 라우팅을 쓰는 CDN에서 ECH를 도입하면 어떤 fallback과 운영 이슈가 생겨?",
+    "TLS ECH와 session resumption, 0-RTT는 어떤 점이 다른 주제야?"
+  ],
+  "symptoms": [
+    "HTTPS를 쓰면 도메인 이름도 모두 숨겨진다고 착각한다",
+    "SNI 기반 라우팅과 SNI privacy 요구를 동시에 만족시키는 구조를 설명하지 못한다",
+    "ECH를 TLS session resumption이나 0-RTT와 같은 성능 기능으로 오해한다",
+    "DNS HTTPS record, ECHConfig, fallback public name의 관계를 모른다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/tls-loadbalancing-proxy",
+      "network/sni-routing-mismatch-hostname-failure",
+      "network/doh-dot-split-horizon-enterprise-dns-chooser"
+    ],
+    "next_docs": [
+      "network/alt-svc-https-rr-h3-discovery-coalescing-bridge",
+      "network/tls-session-resumption-ticket-rotation-chooser",
+      "network/tls-certificate-chain-ocsp-stapling-failure-modes"
+    ],
+    "confusable_with": [
+      "network/sni-routing-mismatch-hostname-failure",
+      "network/tls-session-resumption-ticket-rotation-chooser",
+      "network/tls13-resumption-zero-rtt-replay-risk-primer",
+      "network/alt-svc-https-rr-h3-discovery-coalescing-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/tls-ech-encrypted-client-hello-sni-privacy-primer.md",
+    "revision_history": []
+  }
+}

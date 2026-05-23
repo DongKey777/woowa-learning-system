@@ -1,0 +1,58 @@
+{
+  "id": "database/covering-index-width-fanout-write-amplification",
+  "title": "Covering Index Width, Leaf Fanout, and Write Amplification",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 covering index 폭이 leaf fanout, page split, cache residency, secondary index maintenance, write amplification에 주는 비용을 설명하는 advanced deep dive다.",
+  "body_markdown": "# Covering Index Width, Leaf Fanout, and Write Amplification\n\n> 한 줄 요약: 커버링 인덱스로 heap/table lookup을 줄일 수는 있지만, 인덱스 폭이 커질수록 leaf fanout이 줄고 write path의 split·cache miss·maintenance 비용은 빠르게 커진다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [커버링 인덱스와 복합 인덱스 컬럼 순서](./covering-index-composite-ordering.md)\n- [Secondary Index Change Propagation Path](./secondary-index-change-propagation-path.md)\n- [Secondary Index Maintenance Cost and ANALYZE Statistics Skew](./secondary-index-maintenance-cost-analyze-skew.md)\n- [Page Split, Merge, and Fill Factor](./page-split-merge-fill-factor.md)\n- [Hot Updates, Secondary Index Churn, and Write-Path Contention](./hot-update-secondary-index-churn.md)\n\nretrieval-anchor-keywords: covering index width, leaf fanout, secondary index size, write amplification, page split frequency, cache residency, index payload cost, backend index tradeoff, using index but still slow, wide covering index, covering index write penalty, covering index write amplification, index too wide, buffer pool miss after covering index, page split after adding columns, covering index p99 regression, covering index cache pressure, 커버링 인덱스 너무 넓음, using index인데도 느림\n\n## 증상별 바로 가기\n\n- `Using index`와 `Index Only Scan`의 차이, `Heap Fetches`가 왜 남는지, PostgreSQL visibility map이 왜 끼어드는지가 궁금하면 [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)으로 먼저 간다.\n- `Using index`는 보이는데도 쿼리가 아주 빠르지 않거나, covering을 위해 컬럼을 늘린 뒤 write latency, buffer pool miss, page split이 늘었다면 이 문서가 맡는 범위다.\n- `ORDER BY ... LIMIT` 때문에 어떤 복합 인덱스 순서가 필요한지, `Using filesort`를 어떻게 없앨지가 먼저면 [커버링 인덱스와 복합 인덱스 컬럼 순서](./covering-index-composite-ordering.md)로 돌아간다.\n\n## 핵심 개념\n\n커버링 인덱스는 보통 읽기 최적화 문맥에서만 이야기된다.\n\n- 테이블 본문 접근 감소\n- 목록 조회 응답 시간 개선\n- index-only execution 가능성 증가\n\n하지만 storage-engine 관점에서는 반대편 비용도 분명하다.\n\n- 인덱스 entry가 두꺼워진다\n- page 하나에 담기는 key 수(fanout)가 줄어든다\n- tree height, split 빈도, cache 압박이 커진다\n- INSERT/UPDATE/DELETE마다 더 큰 payload를 유지해야 한다\n\n즉 \"컬럼 몇 개 더 넣어서 커버링시키자\"는 결정은 단순 read optimization이 아니라, **leaf page density와 write amplification을 바꾸는 엔진 레벨 결정**이다.\n이 문서는 `Using index`라는 신호의 의미를 해석하기보다, **lookup을 줄이려고 인덱스를 넓혔더니 왜 전체 비용이 더 커졌는가**를 설명하는 쪽에 초점을 둔다.\n\n## 깊이 들어가기\n\n### 1. 커버링 인덱스의 숨은 비용은 key width다\n\n복합 인덱스에 조회용 컬럼을 더 넣으면 실행 계획은 좋아질 수 있다.  \n하지만 leaf entry 하나가 커지면 같은 page에 담을 수 있는 entry 수가 줄어든다.\n\n그 결과:\n\n- 더 많은 page가 필요하다\n- buffer pool이나 shared buffer에서 index residency가 떨어진다\n- range scan 시 더 많은 leaf page를 건드린다\n- split/merge 비용이 빨리 나타난다\n\n즉 커버링 인덱스는 lookup을 줄이는 대신, **인덱스 자체를 더 자주 메모리와 디스크에 올리게 만든다**.\n\n### 2. fanout이 줄면 tree depth와 split 빈도가 같이 변한다\n\nB-Tree 계열 구조에서 fanout은 page 하나가 다음 레벨을 얼마나 넓게 가리킬 수 있는지와 연결된다.\n\n- key가 좁을수록 fanout이 높다\n- key가 넓을수록 fanout이 낮다\n\nfanout이 줄면:\n\n- 같은 row 수를 담기 위해 더 많은 leaf page가 필요하고\n- 내부 page도 더 빨리 커지며\n- 최종적으로 탐색과 maintenance에 필요한 pointer hop이 늘 수 있다\n\n대부분의 OLTP에서는 tree height 1 증가만으로도 dramatic한 차이가 나지는 않을 수 있다.  \n하지만 hot range에 대한 split 빈도와 cache miss가 함께 오르면 p99는 민감하게 흔들린다.\n\n### 3. covering column이 자주 바뀌면 cost가 더 커진다\n\n커버링 인덱스에 넣은 컬럼이 자주 update되는 값이면 비용은 더 직접적이다.\n\n예:\n\n- `status`\n- `updated_at`\n- `last_seen_at`\n- `retry_count`\n\n이런 컬럼이 secondary index key/payload 일부가 되면:\n\n- UPDATE마다 secondary entry rewrite가 생기고\n- old/new key 정리가 필요하며\n- hot row나 hot range에서 latch 경합이 커질 수 있다\n\n즉 커버링 인덱스에 \"읽을 때 편한 컬럼\"을 넣기 전에, 그 컬럼이 **얼마나 자주 변하는가**를 먼저 봐야 한다.\n\n### 4. narrow index + bookmark lookup이 더 나은 경우도 많다\n\n모든 조회를 커버링으로 만들 필요는 없다.\n\n오히려 다음 경우엔 narrow index가 더 건강하다.\n\n- 결과 row 수가 적다\n- LIMIT이 작다\n- lookup 대상 row가 clustered/localized 되어 있다\n- 쓰기 TPS가 높다\n\n이때는 \"약간의 row lookup\"보다 \"항상 비대한 secondary index 유지\"가 더 비쌀 수 있다.\n\n### 5. 테넌트별/상태별 skew가 있으면 폭 넓은 인덱스의 비용이 더 빨리 온다\n\n멀티테넌트나 상태값 편향이 큰 테이블에서는 hot range가 좁다.\n\n- 특정 tenant의 최근 주문\n- `PENDING` 상태만 몰린 큐 테이블\n- 최신 `created_at` 기준 append-heavy 목록\n\n여기에 폭 넓은 covering index를 얹으면:\n\n- hot range의 page density가 더 낮아지고\n- split 빈도가 빨라지며\n- buffer pool에서 같은 hot set을 유지하는 데 더 큰 메모리가 든다\n\n즉 skew가 큰 workload일수록 covering index의 \"조금 더 큰 폭\"이 실제 운영에서는 꽤 크게 작용할 수 있다.\n\n### 6. 읽기 최적화는 index width 말고도 다른 방법이 있다\n\n커버링 인덱스 대신 검토할 수 있는 선택지:\n\n- 필요한 컬럼만 줄여 narrow index 유지\n- 목록 전용 summary/read model\n- cache나 projection으로 일부 컬럼 분리\n- 자주 바뀌는 컬럼을 읽기 테이블로 분리\n\n핵심은 \"lookup을 없애는 것\"만이 아니라, **lookup 제거에 드는 구조 비용이 얼마나 되는지**를 비교하는 것이다.\n\n## 실전 시나리오\n\n### 시나리오 1. 목록 API를 위해 인덱스에 컬럼을 계속 추가\n\n처음엔 `(tenant_id, status, created_at)`이면 충분했는데 DTO가 커지며 `amount`, `currency`, `channel`까지 넣고 싶어진다.\n\n문제:\n\n- read query는 빨라질 수 있다\n- index size가 급격히 커진다\n- write path가 무거워진다\n\n이 경우는 \"정말 항상 필요한 컬럼인지\", \"일부는 lookup으로 남겨도 되는지\"를 다시 잘라야 한다.\n\n### 시나리오 2. `status`가 자주 바뀌는 작업 큐\n\n큐 polling을 빠르게 하려고 `(status, available_at, payload_hint)` 같은 covering index를 만들었다.\n\n하지만 `status` 전이가 매우 잦다면:\n\n- claim/ack마다 index rewrite가 일어난다\n- hot status range에서 leaf page churn이 커진다\n\n이 경우는 payload를 줄이거나 queue read model을 따로 두는 편이 낫다.\n\n### 시나리오 3. 읽기는 빨라졌는데 buffer pool miss가 증가\n\n폭 넓은 covering index를 추가했더니 read latency는 일부 좋아졌지만 전체 메모리 압박이 커졌다.\n\n이때는:\n\n- 실제 index size 증가량\n- hot set residency\n- lookup 감소 효과와 비교한 p95/p99\n\n를 함께 봐야 한다.\n\n## 코드로 보기\n\n```sql\n-- narrow index\nCREATE INDEX idx_orders_tenant_status_created\nON orders (tenant_id, status, created_at);\n```\n\n```sql\n-- wider covering index\nCREATE INDEX idx_orders_tenant_status_created_amount_channel\nON orders (tenant_id, status, created_at, amount, channel);\n```\n\n```sql\nEXPLAIN\nSELECT tenant_id, status, created_at, amount, channel\nFROM orders\nWHERE tenant_id = ?\n  AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n위 두 인덱스 중 후자가 lookup을 줄여 줄 수는 있다.  \n하지만 update-heavy 테이블이라면 그 차이는 곧 더 큰 leaf entry, 더 많은 page, 더 비싼 maintenance로 돌아온다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| narrow secondary index | fanout과 cache 효율이 좋다 | lookup이 남는다 | 쓰기가 많고 결과 row 수가 적을 때 |\n| wide covering index | lookup을 크게 줄일 수 있다 | index size, split, maintenance 비용이 크다 | 반복 목록 조회가 매우 중요할 때 |\n| summary/read model 분리 | OLTP index를 가볍게 유지한다 | 동기화 비용이 생긴다 | DTO가 크고 조회 패턴이 고정적일 때 |\n| 자주 바뀌는 컬럼 제외 | update churn을 줄인다 | 완전한 covering이 안 된다 | status/heartbeat 계열 컬럼이 자주 변할 때 |\n\n## 꼬리질문\n\n> Q: 커버링 인덱스는 왜 쓰기 비용을 늘리나요?\n> 의도: lookup 감소와 key width 비용을 연결하는지 확인\n> 핵심: 더 큰 leaf entry를 INSERT/UPDATE/DELETE마다 유지해야 하기 때문이다\n\n> Q: fanout이 줄면 무엇이 문제인가요?\n> 의도: storage-engine 관점 이해 확인\n> 핵심: 같은 row 수를 담기 위해 더 많은 page와 더 큰 tree/메모리 압박이 필요해진다\n\n> Q: 모든 목록 조회를 커버링 인덱스로 만들면 좋은가요?\n> 의도: read-only 최적화를 경계하는지 확인\n> 핵심: narrow index + lookup이나 summary model이 전체 비용면에서 더 나을 수 있다\n\n## 한 줄 정리\n\n커버링 인덱스의 진짜 가격표는 추가 컬럼 수가 아니라 key width가 줄이는 leaf fanout과 그로 인해 커지는 write amplification·cache pressure·split 빈도다.\n",
+  "aliases": [
+    "covering index width",
+    "wide covering index",
+    "leaf fanout",
+    "index write amplification",
+    "index payload cost",
+    "using index but still slow",
+    "covering index write penalty",
+    "커버링 인덱스 너무 넓음",
+    "인덱스 폭과 쓰기 비용"
+  ],
+  "expected_queries": [
+    "커버링 인덱스를 넓히면 왜 leaf fanout과 write amplification 비용이 커져?",
+    "Using index가 보이는데도 인덱스가 너무 넓어서 느릴 수 있어?",
+    "SELECT 컬럼을 다 넣은 covering index가 write path에 주는 비용을 설명해줘",
+    "커버링 인덱스 추가 후 page split이나 buffer pool miss가 늘면 무엇을 봐야 해?",
+    "read 최적화를 위해 인덱스를 넓힐 때 어떤 기준으로 멈춰야 해?"
+  ],
+  "symptoms": [
+    "커버링 인덱스를 넓힌 뒤 read는 조금 나아졌지만 write latency와 page split이 늘었어",
+    "Using index가 보여도 range scan과 cache miss 때문에 p99가 여전히 나빠",
+    "조회 컬럼을 전부 인덱스에 넣어도 되는지 write amplification 관점에서 판단하고 싶어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/covering-index-vs-index-only-scan",
+      "database/covering-index-composite-ordering"
+    ],
+    "next_docs": [
+      "database/secondary-index-change-propagation",
+      "database/secondary-index-maintenance-statistics-skew",
+      "database/page-split-merge-fill-factor",
+      "database/hot-update-secondary-index-churn"
+    ],
+    "confusable_with": [
+      "database/covering-index-composite-ordering",
+      "database/covering-index-vs-index-only-scan",
+      "database/secondary-index-maintenance-statistics-skew",
+      "database/hot-update-secondary-index-churn"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/covering-index-width-fanout-write-amplification.md",
+    "revision_history": []
+  }
+}

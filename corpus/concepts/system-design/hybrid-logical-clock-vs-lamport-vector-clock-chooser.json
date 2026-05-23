@@ -1,0 +1,57 @@
+{
+  "id": "system-design/hybrid-logical-clock-vs-lamport-vector-clock-chooser",
+  "title": "Hybrid Logical Clock vs Lamport/Vector Clock Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 chooser는 Hybrid Logical Clock을 Lamport clock, vector clock, physical timestamp와 비교한다. HLC physical plus logical mental model, clock skew caveat, MVCC timestamp, bounded staleness, conflict detection 한계 질문이 본 문서에 매핑된다.",
+  "body_markdown": "# Hybrid Logical Clock vs Lamport/Vector Clock Chooser\n\n> 한 줄 요약: HLC는 physical time에 가까운 timestamp에 logical counter를 붙여 causal order를 보존하려는 scalar metadata이고, vector clock은 concurrency를 감지하는 map metadata다. HLC는 \"언제쯤 일어났나\"가 중요할 때 좋지만, \"두 write가 concurrent인가\"를 증명하지는 못한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Vector Clock vs Lamport Clock Conflict Detection Chooser](./vector-clock-vs-lamport-clock-conflict-detection-chooser.md)\n- [Leader Lease Clock Skew Linearizable Read Playbook](./leader-lease-clock-skew-linearizable-read-playbook.md)\n- [Multi-Region Active-Active Conflict Resolution Chooser](./multi-region-active-active-conflict-resolution-chooser.md)\n- [Causal Consistency Notification Primer](./causal-consistency-notification-primer.md)\n- [Quorum Write와 Read Intuition](../database/quorum-write-read-intuition.md)\n\nretrieval-anchor-keywords: hybrid logical clock, hlc, lamport clock, vector clock, physical logical timestamp, clock skew, causal ordering, mvcc timestamp, bounded staleness, conflict detection, distributed clock chooser\n\n## 먼저 고르는 기준\n\nClock metadata를 고를 때 첫 질문은 \"순서를 만들고 싶은가, 동시성을 찾고 싶은가, 실제 시간과 가까운 값을 원하나\"다.\n\n| 원하는 것 | 우선 후보 | 이유 |\n|---|---|---|\n| cheap causal ordering hint | Lamport clock | scalar counter라 구현이 작고 physical clock에 기대지 않는다. |\n| physical time에 가까운 ordered timestamp | Hybrid Logical Clock | wall-clock component와 logical counter를 함께 보관한다. |\n| concurrent write detection | Vector clock/version vector | component-wise 비교로 before/after/concurrent를 구분한다. |\n| strict global order with failover safety | Consensus/Raft timestamp service | clock metadata만으로 leader split brain을 닫을 수 없다. |\n| human audit timeline plus causal-ish order | HLC + clock health evidence | timestamp가 읽기 쉽고, logical counter가 역전 일부를 흡수한다. |\n\nHLC는 Lamport clock과 vector clock의 중간처럼 보이지만 목적은 다르다. Lamport는 \"메시지를 받은 뒤 counter가 커진다\"는 logical rule에 집중한다. Vector는 actor별 counter map으로 concurrency를 드러낸다. HLC는 physical clock을 버리지 않고, 같은 physical time 또는 clock rollback 상황을 logical counter로 보정한다.\n\n## HLC mental model\n\nHLC timestamp는 보통 `(physical, logical)` 쌍으로 생각한다. `physical`은 node의 현재 wall-clock에 가까운 값이고, `logical`은 같은 physical tick 안에서 causal order를 밀어 주는 counter다.\n\n로컬 이벤트는 대략 이렇게 움직인다.\n\n```text\nphysical = max(local_wall_clock, last.physical)\nif physical == last.physical:\n  logical = last.logical + 1\nelse:\n  logical = 0\n```\n\n메시지를 받을 때는 remote timestamp도 함께 본다.\n\n```text\nphysical = max(local_wall_clock, local_last.physical, remote.physical)\nlogical = tie_break_with_local_and_remote_counters()\n```\n\n정확한 구현은 시스템마다 다를 수 있지만 mental model은 같다. Physical component는 timestamp를 실제 시간 근처에 붙잡아 두고, logical component는 message receive나 local clock backward jump 때문에 causal order가 깨지는 일을 줄인다. 그래서 HLC는 \"Lamport처럼 happens-before를 보존하려고 하면서도, 값 자체는 대략 wall-clock과 비교 가능한 timestamp\"라고 설명하면 안전하다.\n\n## HLC가 주는 것과 주지 않는 것\n\nHLC의 안전한 문장은 Lamport와 비슷하다.\n\n```text\nif event a happens-before event b, then HLC(a) < HLC(b)\n```\n\n하지만 역은 성립하지 않는다.\n\n```text\nHLC(a) < HLC(b) does not prove a happens-before b\n```\n\n두 region이 서로 보지 못한 채 동시에 write하면 HLC 값은 결국 `(physical, logical, node_id)` 같은 tie-breaker로 한 줄 순서를 만들 수 있다. 이것은 deterministic order이지 concurrency proof가 아니다. Active-active profile edit에서 \"큰 HLC wins\"를 쓰면 vector clock 없이 LWW를 더 세련되게 한 것에 가깝다. conflict를 보존해야 하는 데이터라면 HLC만으로는 부족하고, version vector, sibling state, merge policy가 필요하다.\n\n반대로 HLC가 유용한 곳도 분명하다. MVCC snapshot timestamp, audit event ordering, bounded staleness check, CDC event watermark, \"이 read가 최소한 이 timestamp 이후 상태를 보았는가\" 같은 질문에서는 physical component가 운영자에게 읽히는 값이라 좋다. Lamport counter만 있으면 `924881`이 어느 시점인지 알기 어렵지만, HLC는 대략적인 시간과 causal bump를 함께 준다.\n\n## Clock-skew caveats\n\nHLC가 clock skew를 마법처럼 제거하지는 않는다. Local wall-clock이 뒤로 가도 last physical을 유지하고 logical counter를 올릴 수 있지만, node의 clock이 너무 앞서 있으면 future timestamp가 퍼진다. 그 timestamp를 받은 다른 node는 physical component를 따라잡거나 logical counter를 크게 올려야 하고, bounded staleness나 timestamp wait latency가 튈 수 있다.\n\n따라서 HLC를 correctness path에 넣는 시스템은 보통 clock health policy를 둔다.\n\n- NTP/PTP offset이 허용 범위를 넘으면 node를 read/write serving에서 제외한다.\n- timestamp uncertainty window 또는 max offset을 SLO로 둔다.\n- local clock step, VM suspend, long GC pause 이후 lease/read path를 보수적으로 닫는다.\n- external consistency나 linearizable read를 주장하려면 quorum, lease, read index 같은 별도 protocol로 leadership을 확인한다.\n\n즉 HLC는 physical clock보다 안전한 timestamp metadata지만, clock skew bound를 운영하지 않으면 real-time claim이 약해진다.\n\n## wrong-bucket neighbors\n\n| 헷갈리는 대상 | 왜 다른가 |\n|---|---|\n| Wall-clock LWW | HLC는 logical counter로 causal order 일부를 보존하지만, LWW policy는 여전히 silent overwrite일 수 있다. |\n| Lamport clock | Lamport는 physical time과 무관한 scalar counter다. HLC는 physical component를 유지한다. |\n| Vector clock | vector는 concurrent 여부를 감지한다. HLC scalar order는 concurrent write를 한 줄로 세울 뿐이다. |\n| Quorum | quorum은 몇 replica의 응답을 받을지 정한다. HLC는 version/timestamp metadata다. |\n| Leader lease | lease read safety는 bounded clock skew와 quorum leadership protocol 문제다. HLC만으로 stale leader read를 막지 못한다. |\n| TrueTime-style API | clock uncertainty를 API 계약으로 노출하고 commit wait를 강제하는 시스템은 HLC보다 더 강한 운영 가정을 포함한다. |\n\n## operational evidence\n\nHLC 도입 리뷰에서는 clock 이름보다 증거를 먼저 본다.\n\n- node별 max clock offset, offset source, drift alarm이 있는가?\n- logical counter가 비정상적으로 계속 증가하는 node가 있는가?\n- future timestamp rejection, timestamp wait, uncertainty wait latency가 보이는가?\n- HLC를 API, event, CDC, cache metadata 경계에서 잃지 않는가?\n- conflict-sensitive 데이터가 HLC LWW로 조용히 덮이지 않는가?\n- read path가 `served_hlc >= required_hlc` 같은 freshness check를 기록하는가?\n- clock step, VM resume, process pause 뒤에 lease/read mode가 safe fallback으로 내려가는가?\n\n예를 들어 projection read가 \"최신\"이라고 말하려면 response의 applied HLC와 command commit HLC를 비교할 수 있어야 한다. 하지만 그 값이 conflict resolution까지 보장한다는 뜻은 아니다. HLC freshness와 merge correctness를 로그와 metric에서 따로 봐야 한다.\n\n## chooser answer template\n\n\"Lamport clock은 cheap logical ordering, vector clock은 concurrency detection, HLC는 physical time에 가까운 causal-ish timestamp가 필요할 때 선택한다. HLC는 `(physical, logical)`로 생각하면 되고, local clock이 멈추거나 뒤로 가는 일부 상황을 logical counter로 흡수한다. 하지만 HLC 값이 더 크다는 사실은 causal proof가 아니며, concurrent write 감지는 vector clock이나 version vector가 담당한다. HLC를 read freshness나 MVCC timestamp에 쓰려면 max clock offset, future timestamp, timestamp wait 같은 운영 증거와 quorum/lease protocol을 함께 둬야 한다.\"\n\n## Safe Next Docs\n\nLinearizable read와 clock bound가 궁금하면 [Leader Lease Clock Skew Linearizable Read Playbook](./leader-lease-clock-skew-linearizable-read-playbook.md)으로 이어 간다. Concurrent write를 실제로 보존해야 하면 [Vector Clock vs Lamport Clock Conflict Detection Chooser](./vector-clock-vs-lamport-clock-conflict-detection-chooser.md)와 [Multi-Region Active-Active Conflict Resolution Chooser](./multi-region-active-active-conflict-resolution-chooser.md)를 먼저 보는 편이 안전하다.\n",
+  "aliases": [
+    "hybrid logical clock",
+    "HLC",
+    "HLC vs Lamport clock",
+    "HLC vs vector clock",
+    "physical logical timestamp",
+    "causality timestamp chooser",
+    "bounded clock skew timestamp",
+    "logical physical clock ordering"
+  ],
+  "expected_queries": [
+    "Hybrid Logical Clock은 Lamport clock과 vector clock 사이에서 언제 선택해야 해?",
+    "HLC가 physical time과 logical counter를 함께 쓰는 mental model을 예로 설명해줘",
+    "HLC timestamp가 더 크면 causal하게 최신이라고 말해도 되는지 알려줘",
+    "clock skew가 있는 multi-region MVCC나 audit log에서 HLC를 쓸 때 caveat가 뭐야?",
+    "vector clock 대신 HLC를 쓰면 active-active conflict detection을 잃는 이유를 비교해줘"
+  ],
+  "symptoms": [
+    "HLC가 vector clock처럼 concurrent write를 찾아 준다고 착각한다",
+    "Lamport clock과 HLC가 둘 다 scalar라서 같은 용도라고 설명한다",
+    "physical timestamp를 쓰면 clock skew 때문에 위험한데 HLC는 왜 쓰는지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/vector-clock-vs-lamport-clock-conflict-detection-chooser",
+      "operating-system/monotonic-clock-vs-wall-clock-chooser",
+      "database/quorum-write-read-intuition"
+    ],
+    "next_docs": [
+      "system-design/leader-lease-clock-skew-linearizable-read-playbook",
+      "system-design/multi-region-active-active-conflict-resolution-chooser",
+      "system-design/causal-consistency-notification-primer"
+    ],
+    "confusable_with": [
+      "system-design/vector-clock-vs-lamport-clock-conflict-detection-chooser",
+      "system-design/multi-region-active-active-conflict-resolution-chooser",
+      "database/quorum-write-read-intuition",
+      "system-design/leader-lease-clock-skew-linearizable-read-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/hybrid-logical-clock-vs-lamport-vector-clock-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "database/cdc-backpressure-binlog-retention-replay",
+  "title": "CDC Backpressure, Binlog/WAL Retention, and Replay Safety",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 CDC Backpressure, Binlog/WAL Retention, and Replay Safety playbook으로,",
+  "body_markdown": "# CDC Backpressure, Binlog/WAL Retention, and Replay Safety\n\n> 한 줄 요약: CDC 소비가 느려지면 문제는 단순 지연이 아니라, binlog/WAL 보존 기간과 replay 가능 시간이 같이 줄어드는 운영 사고로 번진다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [CDC, Debezium, Outbox, Binlog](./cdc-debezium-outbox-binlog.md)\n- [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](./cdc-gap-repair-reconciliation-playbook.md)\n- [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md)\n- [Group Commit, Binlog, fsync, Durability](./group-commit-binlog-fsync-durability.md)\n- [Online Backfill Consistency와 워터마크 전략](./online-backfill-consistency.md)\n- [Idempotent Transaction Retry Envelope](./idempotent-transaction-retry-envelopes.md)\n- [Historical Backfill / Replay Platform 설계](../system-design/historical-backfill-replay-platform-design.md)\n\nretrieval-anchor-keywords: cdc backpressure, binlog retention, wal retention, replication slot lag, debezium lag, replay window, log retention pressure, cdc recovery, gap repair, projection reconciliation\n\n## 핵심 개념\n\nCDC 파이프라인을 운영할 때 가장 흔한 오해는 \"consumer가 느리면 downstream 반영만 늦어진다\"는 생각이다.\n\n실제로는 더 큰 문제가 따라온다.\n\n- DB 로그 보존량이 늘어난다\n- 디스크 압박이 커진다\n- retention window를 넘기면 재시작 시 snapshot 재구축이 필요해진다\n- 복구 가능한 시간 범위(replay window)가 줄어든다\n\n즉 CDC backpressure는 단순한 지연이 아니라, **원본 DB의 로그 lifecycle을 잠식하는 문제**다.\n\n## 깊이 들어가기\n\n### 1. CDC는 로그를 읽는 시스템이므로 \"얼마나 늦었는가\"보다 \"얼마나 남겨둬야 하는가\"가 중요하다\n\nDebezium, logical replication, binlog reader 모두 결국 DB 변경 로그를 순서대로 소비한다.\n\n이때 consumer가 느려지면:\n\n- MySQL은 binlog purge를 늦출 수 있다\n- PostgreSQL은 replication slot이 오래된 WAL 제거를 막을 수 있다\n- downstream은 stale하지만, upstream은 storage pressure를 받는다\n\n그래서 CDC lag metric은 메시지 지연이 아니라 **log retention 압력**과 같이 봐야 한다.\n\n### 2. retention window를 숫자로 관리해야 한다\n\n중요한 질문:\n\n- 지금 consumer가 마지막으로 처리한 offset은 어디인가\n- 현재 로그 생성 속도로 몇 시간 뒤면 retention을 넘는가\n- snapshot 없이 재시작 가능한 replay window가 얼마나 남았는가\n\n이 답이 없으면 \"조금 느리다\"와 \"곧 복구 불가능해진다\"를 구분할 수 없다.\n\n운영에서는 보통 다음을 같이 본다.\n\n- current source position\n- connector committed offset\n- lag bytes / lag seconds\n- retained log bytes\n- estimated hours to log loss\n\n### 3. heartbeat와 low-traffic partition이 중요하다\n\nCDC 지연은 write가 많을 때만 보이는 문제가 아니다.  \n오히려 low traffic 테이블이나 파티션은 offset 진전이 드물어서 상태 판단이 어려울 수 있다.\n\n이때 heartbeat record가 유용하다.\n\n- connector가 여전히 살아 있는지 확인\n- 실제 지연과 \"조용해서 안 움직이는 것\"을 구분\n- recovery checkpoint를 더 자주 남김\n\nheartbeat가 없으면 \"정말 멈췄는지, 그냥 변경이 없는지\" 판단하기 어렵다.\n\n### 4. snapshot fallback은 쉽지 않다\n\nlog retention을 놓쳐 replay가 끊기면 \"그냥 다시 snapshot 뜨면 되지\"라고 생각하기 쉽다.  \n하지만 운영에서는 snapshot이 더 큰 작업일 수 있다.\n\n- 원본 DB에 큰 read 부하\n- 대형 테이블 초기 적재 시간 증가\n- snapshot 이후 catch-up 정합성 설계 필요\n- downstream dedup/reconciliation 비용 증가\n\n즉 snapshot fallback은 복구 수단이지만, 공짜 안전망은 아니다.\n\n### 5. backpressure 완화는 connector만이 아니라 downstream 병목을 같이 봐야 한다\n\nCDC lag가 커지는 이유는 다양하다.\n\n- connector fetch/commit 설정 문제\n- Kafka/브로커 지연\n- sink database backpressure\n- schema registry 또는 serialization 병목\n- 소비자 측 idempotency table 경합\n\n원인은 downstream인데 증상은 source log retention 압박으로 나타날 수 있다.  \n그래서 source position만 보는 모니터링은 반쪽짜리다.\n\n### 6. replay-safe consumer가 있어야 공격적으로 복구할 수 있다\n\nconnector 재시작, offset rewind, 부분 재처리를 하려면 sink 쪽이 replay-safe 해야 한다.\n\n필요한 장치:\n\n- event id dedup\n- upsert 또는 merge semantics\n- checkpoint와 watermark 관리\n- dead letter와 replay tool\n\nconsumer가 replay-safe 하지 않으면, retention 압박 상황에서 \"빨리 따라잡기\" 자체가 더 위험해진다.\n\n## 실전 시나리오\n\n### 시나리오 1. Debezium lag가 2시간으로 증가\n\n검색 인덱스 반영이 늦어지는 것만 문제가 아니다.  \nbinlog 생성량이 높은 시간대라면 몇 시간 안에 purge window를 따라잡지 못할 수 있다.\n\n필요 대응:\n\n- estimated time-to-log-loss 계산\n- 불필요한 sink 부하 제거\n- 중요하지 않은 connector 일시 중지\n- replay-safe 범위 안에서 offset catch-up 가속\n\n### 시나리오 2. PostgreSQL replication slot이 WAL 삭제를 막음\n\nlogical slot consumer가 오래 멈추면 WAL이 쌓여 디스크 압박이 커진다.\n\n핵심 판단:\n\n- slot을 살리기 위해 storage를 늘릴지\n- slot을 버리고 snapshot 재구축할지\n- 어떤 downstream을 우선 복구할지\n\n### 시나리오 3. 장애 후 offset rewind 재처리\n\nconsumer 버그 수정 뒤 최근 30분 데이터를 다시 흘리고 싶다.\n\n이때 sink가 event id dedup을 갖고 있으면 replay가 가능하지만, 그렇지 않으면 중복 side effect가 생긴다.\n\n## 재현 조건\n\n학습용 재현은 source DB의 실제 retention을 위험하게 줄이지 않고, 작은 테이블과 짧은 window로 만든다.\n\n1. CDC source position, connector committed offset, sink checkpoint를 따로 기록한다.\n2. sink consumer를 의도적으로 느리게 하거나 멈춰 lag가 증가하게 한다.\n3. heartbeat가 있는 stream과 write가 거의 없는 stream을 나눠 \"조용함\"과 \"멈춤\"을 구분한다.\n4. retained log bytes, WAL/slot lag 또는 binlog purge 가능 시점을 같이 기록한다.\n5. replay 테스트는 dedup table과 side effect 억제가 준비된 sink에서만 수행한다.\n\n## 확인 순서\n\n1. source log가 아직 replay 가능한지 확인한다. PostgreSQL logical slot이면 retained WAL/slot lag를, MySQL이면 binlog file/position과 purge window를 본다.\n2. connector가 마지막으로 commit한 offset과 sink가 실제 반영한 checkpoint가 같은지 비교한다.\n3. lag가 source 생성량 때문인지, connector 처리량 때문인지, sink write 병목 때문인지 분리한다.\n4. heartbeat로 connector liveness와 low-traffic 구간을 구분한다.\n5. replay-safe 조건(event id dedup, idempotent upsert, checkpoint order, DLQ)을 확인한 뒤 catch-up 또는 rewind 범위를 정한다.\n\n## failure matrix\n\n| 증상 | 가능 원인 | 먼저 볼 것 | 위험한 대응 |\n|---|---|---|---|\n| connector lag만 증가 | sink write 병목 또는 broker 지연 | sink write latency, consumer throughput | source DB만 튜닝 |\n| WAL/binlog 저장량 증가 | consumer offset이 오래된 log를 붙잡음 | slot/binlog retention window | lag를 단순 UI 지연으로 취급 |\n| low-traffic table offset 정체 | 변경 없음 또는 heartbeat 없음 | heartbeat topic/table | 무조건 connector restart |\n| replay 후 중복 반영 | sink dedup 부재 | event id table, output unique key | offset rewind만 실행 |\n| retention window 초과 | 필요한 log가 삭제됨 | last processed position vs available log | snapshot fallback을 가볍게 단정 |\n\n## 검증\n\n복구 완료는 \"connector가 다시 running\"이 아니라 source와 sink가 정한 범위에서 맞는지로 본다.\n\n- lower/upper source offset 또는 timestamp fence가 남아 있다.\n- replay 범위의 event count, checksum, sample diff가 통과한다.\n- duplicate event 수와 skipped event 수가 설명 가능하다.\n- sink checkpoint가 dedup table보다 앞서가지 않는다.\n- source storage pressure가 감소하고, estimated time-to-log-loss가 정상 범위로 돌아온다.\n\nCDC 엔진과 connector마다 metric 이름은 다르다. 답변에서는 특정 제품 동작을 일반화하지 말고, \"source log 보존\", \"connector offset\", \"sink checkpoint\", \"idempotent replay\" 네 축으로 증거를 나눠 설명한다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE cdc_consumer_checkpoint (\n  consumer_name VARCHAR(100) PRIMARY KEY,\n  source_position VARCHAR(255) NOT NULL,\n  updated_at TIMESTAMP NOT NULL\n);\n```\n\n```sql\nCREATE TABLE processed_cdc_event (\n  event_id VARCHAR(100) PRIMARY KEY,\n  processed_at TIMESTAMP NOT NULL\n);\n```\n\n```java\nif (processedEventRepository.exists(eventId)) {\n    return;\n}\n\napplyChange(event);\nprocessedEventRepository.insert(eventId, now());\ncheckpointRepository.update(consumerName, sourcePosition, now());\n```\n\n이 구조의 핵심은 \"offset만 저장\"이 아니라, **재처리 가능성을 dedup과 함께 확보**하는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 짧은 retention + 빠른 복구 기대 | 저장 비용이 적다 | 장애 시 snapshot 가능성이 커진다 | 작은 데이터, 낮은 중요도 |\n| 넉넉한 retention | 복구 여유가 크다 | 로그 저장 비용이 든다 | 중요한 CDC 파이프라인 |\n| heartbeat + lag 예측 | 상태 판단이 쉬워진다 | 운영 metric 설계가 필요하다 | 장기 운영 파이프라인 |\n| replay-safe sink | 공격적 복구가 가능하다 | dedup/storage 비용이 든다 | 검색, 분석, read model 반영 |\n\n## 꼬리질문\n\n> Q: CDC lag가 왜 source DB 문제로 번지나요?\n> 의도: 로그 기반 추출의 비용 전가를 이해하는지 확인\n> 핵심: binlog/WAL 보존이 길어져 storage 압박과 replay window 축소가 생기기 때문이다\n\n> Q: retention window를 넘기면 무엇이 문제인가요?\n> 의도: 단순 지연과 복구 불능의 차이를 아는지 확인\n> 핵심: 필요한 로그가 사라져 snapshot 재구축 없이는 따라잡을 수 없게 된다\n\n> Q: heartbeat가 왜 필요한가요?\n> 의도: low traffic 구간의 관측 문제를 아는지 확인\n> 핵심: 변경이 없어서 조용한 것과 실제 멈춘 것을 구분하고 checkpoint를 전진시키기 위해 필요하다\n\n## 한 줄 정리\n\nCDC 운영의 핵심은 이벤트를 얼마나 빨리 보내느냐보다, backpressure가 생겨도 binlog/WAL retention과 replay window를 잃지 않도록 관측·복구·dedup 경로를 갖추는 것이다.\n",
+  "aliases": [
+    "cdc backpressure",
+    "binlog retention",
+    "wal retention",
+    "replication slot lag",
+    "debezium lag",
+    "replay window",
+    "log retention pressure",
+    "cdc recovery",
+    "gap repair",
+    "CDC lag retention"
+  ],
+  "expected_queries": [
+    "CDC lag가 커지면 downstream 지연뿐 아니라 binlog WAL retention pressure와 replay window 축소가 생기는 이유가 뭐야?",
+    "Debezium consumer가 늦을 때 estimated time-to-log-loss와 log retention window를 어떻게 봐야 해?",
+    "PostgreSQL replication slot lag가 WAL 삭제를 막아 source DB storage pressure로 번지는 현상을 설명해줘",
+    "CDC backpressure 상황에서 heartbeat, connector offset, sink idempotency를 같이 봐야 하는 이유가 뭐야?",
+    "binlog retention을 놓치면 snapshot fallback이나 rebuild가 필요한 이유와 replay-safe consumer 조건을 알려줘"
+  ],
+  "symptoms": [
+    "CDC consumer가 느려져 downstream 반영만 늦는다고 봤지만 source DB binlog/WAL retention pressure가 커진다",
+    "replication slot lag나 binlog purge window 때문에 replay 가능한 시간이 줄어들고 snapshot fallback 위험이 커진다",
+    "connector lag만 보고 sink idempotency, heartbeat, replay-safe consumer, estimated time-to-log-loss를 같이 보지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/cdc-debezium-outbox-binlog",
+      "database/idempotent-transaction-retry-envelopes"
+    ],
+    "next_docs": [
+      "database/cdc-gap-repair-reconciliation-playbook",
+      "database/cdc-replay-verification-idempotency-runbook",
+      "system-design/historical-backfill-replay-platform-design"
+    ],
+    "confusable_with": [
+      "database/cdc-gap-repair-reconciliation-playbook",
+      "database/cdc-replay-verification-idempotency-runbook",
+      "database/replica-lag-observability-routing-slo",
+      "system-design/change-data-capture-outbox-relay-design",
+      "database/cdc-debezium-outbox-binlog"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/cdc-backpressure-binlog-retention-replay.md",
+    "revision_history": []
+  }
+}

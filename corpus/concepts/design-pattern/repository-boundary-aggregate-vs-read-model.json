@@ -1,0 +1,62 @@
+{
+  "id": "design-pattern/repository-boundary-aggregate-vs-read-model",
+  "title": "Repository Boundary: Aggregate Persistence vs Read Model",
+  "category": "design-pattern",
+  "level": "advanced",
+  "summary": "'이 문서는 Repository Boundary chooser로, command side repository는 aggregate",
+  "body_markdown": "# Repository Boundary: Aggregate Persistence vs Read Model\n\n> 한 줄 요약: Repository boundary를 aggregate persistence에 맞춰 두면 도메인 경계가 선명해지고, 검색/조인/원격 조회는 query model이나 application orchestration으로 분리할 수 있다.\n\n**난이도: 🔴 Expert**\n\n> 관련 문서:\n> - [Repository Pattern vs Anti-Pattern](./repository-pattern-vs-antipattern.md)\n> - [Aggregate Root vs Unit of Work](./aggregate-root-vs-unit-of-work.md)\n> - [Reference Other Aggregates by ID](./aggregate-reference-by-id.md)\n> - [CQRS: Command와 Query를 분리하는 패턴 언어](./cqrs-command-query-separation-pattern-language.md)\n> - [Read Model Staleness and Read-Your-Writes](./read-model-staleness-read-your-writes.md)\n> - [Specification vs Query Service Boundary](./specification-vs-query-service-boundary.md)\n> - [Query Object and Search Criteria Pattern](./query-object-search-criteria-pattern.md)\n> - [Transaction Script vs Rich Domain Model](./transaction-script-vs-rich-domain-model.md)\n> - [Database: Transaction Boundary, Isolation, and Locking Decision Framework](../database/transaction-boundary-isolation-locking-decision-framework.md)\n> - [System Design: Dual-Read Comparison / Verification Platform](../system-design/dual-read-comparison-verification-platform-design.md)\n\n---\n\n## 핵심 개념\n\nRepository를 쓰기 시작하면 많은 팀이 곧 이런 질문으로 간다.\n\n- 여기서 다른 aggregate까지 join해서 읽어도 되나\n- 외부 서비스 조회도 repository 안에 넣어도 되나\n- 화면용 DTO를 repository가 바로 만들어도 되나\n\n이 질문의 핵심은 \"Repository가 무엇을 저장하는가\"가 아니라 **Repository가 어디까지 책임지는가**다.\n\nDDD 기준에서 repository의 기본 경계는 보통 다음에 가깝다.\n\n- aggregate를 로드한다\n- aggregate를 저장한다\n- aggregate 식별자와 도메인 언어를 중심으로 말한다\n\n반대로 다음은 repository 바깥 책임인 경우가 많다.\n\n- 복잡한 검색과 화면 조합\n- 다른 bounded context의 원격 조회\n- cross-aggregate orchestration\n\n## chooser table\n\n| 요구 | 선택 bucket | 이유 | 예시 이름 |\n|---|---|---|---|\n| aggregate id로 root를 복원하고 변경 후 저장 | Aggregate Repository | command side invariant를 지키기 위한 persistence 계약 | `OrderRepository.findById`, `save` |\n| 관리자 화면 검색, 목록, 집계, 정렬, paging | Read Repository / Query Service | read contract와 표현 요구가 중심 | `OrderReadRepository.search(criteria)` |\n| 여러 aggregate와 외부 API를 조합해 화면 응답 생성 | Application Orchestration | persistence보다 source coordination이 중심 | `OrderDetailQueryService.getDetail` |\n| 다른 aggregate 존재 여부만 command에서 확인 | Domain/Application Policy + port | invariant 입력을 얻는 조회이지 root 저장 계약이 아니다 | `CouponAvailabilityPort` |\n| report, dashboard, export | Projection / Reporting Query | aggregate load/save 언어와 거리가 멀다 | `SalesReportQuery` |\n\n## wrong-bucket examples\n\n| 잘못된 repository 메서드 | 문제 | 더 나은 위치 |\n|---|---|---|\n| `OrderRepository.loadOrderScreen(orderId)` | 화면 DTO 조립이 aggregate persistence 계약에 들어왔다 | `OrderDetailQueryService` 또는 read model |\n| `OrderRepository.fetchRemotePayment(orderId)` | repository 실패가 DB인지 network인지 흐려진다 | `PaymentQueryPort`를 application/query service가 호출 |\n| `OrderRepository.findByStatusAndDateAndKeywordAndSort...` | 검색 조건 증가가 메서드 폭발로 이어진다 | `OrderSearchCriteria` 기반 read repository |\n| `MemberRepository.findVipMembersForPromotionDashboard()` | bounded context/report 목적이 domain repository를 끌고 간다 | promotion/reporting query model |\n\n### 증거로 보는 boundary drift\n\n- repository interface가 command method와 화면 response method를 함께 노출한다.\n- repository test가 DB fixture뿐 아니라 HTTP client stub, mapper, serializer를 함께 준비한다.\n- method 이름이 aggregate 언어보다 screen/report/usecase 이름에 가까워진다.\n- 조회 최적화를 위해 추가한 join 결과를 command handler가 그대로 믿고 aggregate guard를 우회한다.\n\n### Retrieval Anchors\n\n- `repository boundary`\n- `aggregate persistence boundary`\n- `read model boundary`\n- `cross aggregate query`\n- `repository remote call anti pattern`\n- `application orchestration`\n- `read your writes`\n- `projection lag`\n- `specification vs query service`\n\n---\n\n## 깊이 들어가기\n\n### 1. Repository는 aggregate 경계를 반영해야 한다\n\nRepository가 aggregate보다 더 넓게 생각되면 곧 경계가 흐려진다.\n\n- `OrderRepository`가 주문뿐 아니라 결제, 회원, 배송 join을 모두 떠안는다\n- `MemberRepository`가 추천 점수, CRM 상태, 외부 등급 API까지 섞어 읽는다\n\n이런 구조에서는 \"무엇이 한 번에 일관되게 바뀌는가\"보다 \"어떤 화면에 뭐가 필요한가\"가 저장 모델을 끌고 가기 시작한다.\n\nRepository는 보통 aggregate root 단위로 생각하는 편이 안전하다.\n\n### 2. 읽기 최적화는 Repository boundary를 넓히라는 뜻이 아니다\n\n실무에서 가장 흔한 혼동은 이거다.\n\n- 읽기 요구가 복잡해짐\n- repository 메서드가 급격히 늘어남\n- 결국 저장소가 화면 조립기처럼 변함\n\n하지만 읽기 요구가 복잡해졌다는 건 보통 두 가능성 중 하나다.\n\n- query model이 필요하다\n- application service가 여러 소스를 조율해야 한다\n\n즉 읽기 복잡도는 CQRS/read model 분리 신호이지, repository 비대화 허가증이 아니다.\n\n### 3. 원격 호출을 repository에 넣으면 persistence와 orchestration이 섞인다\n\n`OrderRepository.loadRichOrder()`가 DB 조회 후 원격 결제 상태와 물류 상태를 합쳐 반환한다면 겉보기에는 편해 보일 수 있다.\n\n하지만 실제로는 다음 문제가 생긴다.\n\n- repository 실패 원인이 DB인지 네트워크인지 불명확하다\n- transaction boundary와 원격 호출 boundary가 섞인다\n- 테스트에서 repository 더블이 지나치게 복잡해진다\n\nRepository는 persistence abstraction이고, 원격 연동은 port/adapter나 application service orchestration에 더 가깝다.\n\n### 4. 저장용 repository와 조회용 read repository를 구분하면 말이 선명해진다\n\n보통 다음 식의 구분이 도움이 된다.\n\n- `OrderRepository`: aggregate 저장/복원\n- `OrderReadRepository` 또는 `OrderQueryService`: 검색/목록/집계/화면 조합\n\n이 구분은 구현 기술이 달라도 유지할 수 있다.\n\n- 같은 DB를 써도 된다\n- 같은 스키마를 조회해도 된다\n- 중요한 건 계약과 책임 분리다\n\n### 5. repository 메서드가 business sentence를 잃기 시작하면 경계를 다시 봐야 한다\n\n경계가 흐려지는 신호는 보통 이름에서 먼저 드러난다.\n\n- `findDashboardDataByPeriodAndStatusAndTeam`\n- `loadOrderWithPaymentShippingCouponMember`\n- `findSomethingAndTransformToResponse`\n\n이쯤 되면 repository가 aggregate persistence보다 query/report/orchestration 쪽 책임을 빨아들이고 있을 가능성이 크다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 상세 화면\n\n화면에는 주문, 결제, 배송, 쿠폰 정보가 모두 필요할 수 있다.  \n그렇다고 `OrderRepository`가 모든 join과 외부 조회를 떠안는 건 좋은 기본값이 아니다.\n\n더 안전한 선택지는 다음 중 하나다.\n\n- `OrderQueryService`가 여러 read source를 조합\n- projection/read model을 미리 구성\n\n### 시나리오 2: 주문 취소 유스케이스\n\n취소 command는 보통 `Order` aggregate만 로드하면 된다.  \n환불 가능 여부 판단에 추가 정보가 필요하면 application service가 별도 port를 통해 조회하거나 policy 입력으로 전달한다.\n\n### 시나리오 3: 관리자 검색\n\n관리자 검색은 상태, 기간, 회원 등급, 결제 수단별로 필터링될 수 있다.  \n이건 aggregate repository보다 검색 전용 read repository가 더 자연스럽다.\n\n---\n\n## 코드로 보기\n\n### aggregate repository\n\n```java\npublic interface OrderRepository {\n    Optional<Order> findById(OrderId orderId);\n    void save(Order order);\n}\n```\n\n### read model repository\n\n```java\npublic interface OrderReadRepository {\n    List<OrderDetailView> search(OrderSearchCondition condition);\n}\n```\n\n### application orchestration\n\n```java\npublic void cancel(CancelOrderCommand command) {\n    PaymentSnapshot payment = paymentQueryPort.findByOrderId(command.orderId());\n    cancelWithSnapshot(command, payment);\n}\n\n@Transactional\nvoid cancelWithSnapshot(CancelOrderCommand command, PaymentSnapshot payment) {\n    Order order = orderRepository.findById(command.orderId()).orElseThrow();\n\n    order.cancel(command.reason(), refundPolicy.forPayment(payment));\n    orderRepository.save(order);\n}\n```\n\n`paymentQueryPort`가 원격 호출이라면 DB transaction을 열기 전에 snapshot을 얻거나, 로컬 read model을 통해 조회한다. 핵심은 repository에 원격 호출을 숨기지 않는 것뿐 아니라, DB lock을 잡은 채 네트워크 왕복을 기다리지 않는 것이다.\n\n### boundary smell\n\n```java\npublic interface OrderRepository {\n    OrderScreenResponse loadOrderScreen(Long orderId);\n    PaymentProviderStatus fetchRemotePayment(Long orderId);\n    ShippingTrackingResponse trackShipment(Long orderId);\n}\n```\n\n이건 persistence abstraction보다 화면 조립과 원격 orchestration에 가깝다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Aggregate repository | 도메인 경계가 선명하다 | 복잡한 조회는 별도 구조가 필요하다 | command side 저장/복원 |\n| Repository에 조회까지 몰기 | 처음엔 빠르다 | 경계가 흐려지고 메서드가 폭증한다 | 짧은 수명 프로토타입 정도 |\n| Read repository / query service 분리 | 화면/검색 요구를 잘 수용한다 | 구조가 늘어난다 | 조회 조건과 조합이 복잡할 때 |\n\n판단 기준은 다음과 같다.\n\n- aggregate를 복원/저장하는 책임이면 repository\n- 화면 조합, 검색, 집계가 중심이면 read model\n- 원격 조회가 섞이면 repository boundary를 다시 본다\n\n---\n\n## 꼬리질문\n\n> Q: 같은 DB를 쓰면 repository와 read repository를 굳이 나눠야 하나요?\n> 의도: 물리 저장소와 책임 경계를 구분하는지 본다.\n> 핵심: 나눌 수 있다. 핵심은 DB 개수가 아니라 계약의 의도다.\n\n> Q: aggregate 조회 시 join을 전혀 하면 안 되나요?\n> 의도: 구현 디테일과 설계 경계를 교조적으로 보지 않는지 확인한다.\n> 핵심: 구현상 join은 가능하지만, 계약이 aggregate persistence인지 화면 조립인지가 더 중요하다.\n\n> Q: repository 안에서 외부 API를 부르면 왜 안 좋나요?\n> 의도: persistence와 orchestration 혼합 문제를 이해하는지 본다.\n> 핵심: 실패 원인, 트랜잭션 경계, 테스트 복잡도가 한 번에 섞이기 때문이다.\n\n## 한 줄 정리\n\nRepository boundary를 aggregate persistence에 고정하면 저장 모델과 조회 모델, 원격 orchestration을 더 건강하게 분리할 수 있다.\n",
+  "aliases": [
+    "repository boundary",
+    "aggregate persistence boundary",
+    "read model boundary",
+    "cross aggregate query",
+    "repository remote call anti pattern",
+    "application orchestration",
+    "read repository",
+    "query service boundary",
+    "aggregate 저장소 경계",
+    "조회 모델 분리",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "Repository boundary는 aggregate persistence와 read model/query service를 어떻게 나눠야 해?",
+    "OrderRepository가 화면 DTO와 결제 배송 원격 조회까지 맡으면 왜 anti-pattern이 돼?",
+    "같은 DB를 써도 command repository와 read repository를 계약상 분리할 수 있는 이유가 뭐야?",
+    "복잡한 검색 조건이 늘어나면 repository를 키우지 말고 query service로 빼야 하는 신호는 뭐야?",
+    "aggregate repository에서 join을 전혀 하지 말라는 뜻이 아니라 계약 의도가 중요하다는 말은 무슨 뜻이야?"
+  ],
+  "symptoms": [
+    "aggregate repository가 화면 DTO, 원격 결제 상태, 배송 추적까지 조합해 persistence와 orchestration 책임이 섞인다",
+    "읽기 요구가 복잡해졌다는 이유로 repository 메서드가 dashboard/search/report 형태로 폭증한다",
+    "command side aggregate persistence와 read model/query service 계약을 같은 repository에 모두 밀어 넣는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/repository-pattern-vs-antipattern",
+      "design-pattern/aggregate-root-vs-unit-of-work",
+      "design-pattern/aggregate-reference-by-id"
+    ],
+    "next_docs": [
+      "design-pattern/cqrs-command-query-separation-pattern-language",
+      "design-pattern/read-model-staleness-read-your-writes",
+      "design-pattern/specification-vs-query-service-boundary"
+    ],
+    "confusable_with": [
+      "design-pattern/repository-pattern-vs-antipattern",
+      "design-pattern/specification-vs-query-service-boundary",
+      "design-pattern/cqrs-command-query-separation-pattern-language",
+      "design-pattern/query-object-search-criteria-pattern",
+      "software-engineering/query-model-vs-domain-repository-drill",
+      "software-engineering/repository-dao-entity"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/design-pattern/repository-boundary-aggregate-vs-read-model.md",
+    "revision_history": []
+  }
+}

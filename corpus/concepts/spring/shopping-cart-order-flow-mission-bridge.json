@@ -1,0 +1,45 @@
+{
+  "id": "spring/shopping-cart-order-flow-mission-bridge",
+  "title": "Shopping Cart Order Flow Mission Bridge",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "이 mission_bridge는 shopping-cart 주문 완료 흐름에서 Controller Service Repository와 트랜잭션 경계를 잡는다. 주문 생성, 장바구니 비우기, 외부 결제 호출, after commit outbox 같은 표현을 연결한다.",
+  "body_markdown": "# Shopping Cart Order Flow Mission Bridge\n\n## 미션 장면\n\n장바구니 checkout은 주문 생성, 주문 항목 저장, 장바구니 비우기, 결제 또는 알림 후속 작업이 이어진다. 초보자는 이 모든 일을 한 메서드나 한 트랜잭션에 넣기 쉽다.\n\n이 흐름은 작은 미션에서도 실무적인 경계가 많이 드러난다. 주문 데이터는 DB 정합성이 중요하고, 결제나 알림은 외부 side effect이며, 장바구니 비우기는 사용자 경험과 주문 상태에 연결된다. \"한 번에 처리\"가 아니라 \"무엇이 반드시 함께 성공해야 하는가\"를 먼저 나누는 것이 핵심이다.\n\n## 리뷰에서 보이는 냄새\n\nController가 주문 생성과 cart 삭제를 직접 호출하면 유스케이스 경계가 보이지 않는다. 외부 결제 호출을 DB 트랜잭션 안에 오래 붙잡으면 락과 장애 전파 위험이 커진다.\n\n또 다른 냄새는 주문 row는 저장됐는데 cart item이 남아 있거나, cart는 비웠는데 주문 item 저장이 일부 실패하는 상태다. 이것은 transaction 경계가 유스케이스의 원자성 요구와 맞지 않는 신호다.\n\n## 개념 handoff\n\nDB 안에서 반드시 원자적으로 맞아야 하는 부분은 같은 트랜잭션으로 묶고, 외부 side effect는 after-commit 또는 outbox로 분리할 후보인지 본다.\n\n레이어 흐름은 다음처럼 잡을 수 있다.\n\n- Controller: checkout request를 받고 인증된 사용자, 요청 DTO, response status를 다룬다.\n- Service: checkout 유스케이스를 실행한다. cart item 조회, 가격/재고 정책 확인, order와 order line 생성, cart 비우기를 transaction으로 묶을지 결정한다.\n- Repository: cart, order, product 저장소 계약을 제공한다. business decision은 repository method 이름 안에 과하게 숨기지 않는다.\n- Domain: `Order`, `OrderLine`, `Cart`가 금액 계산, 수량 검증, 상태 전이를 표현한다.\n\n미션에서 결제가 실제 외부 API가 아니라 단순 stub이라도 사고방식은 같다. DB transaction은 가능하면 짧게 유지한다. 외부 network 호출을 transaction 안에서 오래 기다리면 DB lock이 길어지고, 외부 장애가 내부 write 정합성에 직접 전파된다.\n\n## 트랜잭션 경계 예시\n\n주문 생성과 장바구니 비우기가 같은 유스케이스의 원자성 요구라면 한 transaction에 둘 수 있다.\n\n1. 사용자 cart item을 조회한다.\n2. 주문과 주문 항목을 저장한다.\n3. 주문으로 전환된 cart item을 삭제하거나 상태 변경한다.\n4. Commit 이후 알림 또는 주문 완료 이벤트를 처리한다.\n\n이때 \"주문 생성 성공, 알림 발송 실패\"는 DB transaction rollback 사유가 아닐 수 있다. 알림은 재시도 가능한 후속 작업으로 빼고, 사용자에게는 주문 완료 상태를 보여주는 설계가 자연스럽다. 반대로 \"주문 생성 성공, cart 비우기 실패\"는 사용자가 같은 cart를 다시 주문할 수 있으므로 같은 transaction에서 같이 실패시키는 편이 안전할 수 있다.\n\n실제 결제가 있다면 선택지가 더 많다. 결제 승인 후 주문을 확정할지, 주문을 `PENDING_PAYMENT`로 만들고 결제 성공 이벤트로 `PAID` 전환할지, 결제 실패 시 주문을 취소 상태로 남길지 결정해야 한다. 이 결정은 기술보다 상태 모델의 문제다.\n\n## event/outbox 연결\n\nCheckout 성공 후 이메일, 쿠폰, 배송 준비 같은 후속 작업이 붙으면 `after commit`이나 outbox를 고려한다. 단순 best-effort 알림이면 after-commit listener만으로 충분할 수 있다. 하지만 \"반드시 언젠가 전달되어야 하는 주문 완료 이벤트\"라면 outbox row를 주문 저장 transaction 안에 함께 남기는 것이 더 안전하다.\n\n이때 domain event와 integration event를 섞지 않는다. `OrderCompleted`라는 도메인 사실을 기록하고, application layer가 outbox payload로 변환해 relay가 전송한다. 실패 재시도와 중복 처리까지 필요하면 event id와 idempotency key를 포함한다.\n\n## Drill 후보\n\n\"주문 생성 성공, 알림 발송 실패\" 상황에서 사용자에게 어떤 상태를 보여줄지 먼저 정하고 트랜잭션 경계를 그려 본다.\n\n추가로 \"주문 생성 성공, 장바구니 비우기 실패\"와 \"결제 성공, 주문 저장 실패\"를 각각 어떻게 다르게 다룰지 써 본다. 두 상황을 나누면 DB 원자성과 외부 side effect의 차이가 분명해진다.\n",
+  "aliases": [
+    "shopping cart order flow bridge",
+    "cart checkout service transaction",
+    "장바구니 주문 흐름",
+    "shopping cart controller service repository"
+  ],
+  "expected_queries": [
+    "장바구니에서 주문 완료까지 Service 트랜잭션은 어떻게 잡아?",
+    "cart checkout 요청은 Controller Service Repository로 어떻게 나눠?",
+    "주문 완료 후 장바구니 비우기는 같은 트랜잭션이야?"
+  ],
+  "symptoms": [
+    "주문은 생성됐는데 장바구니가 남아 있어요",
+    "Controller가 주문 생성과 cart 삭제를 모두 처리해요",
+    "결제 외부 호출과 DB 트랜잭션을 한데 묶으려 해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/backend-request-to-sql-flow-primer"
+    ],
+    "next_docs": [
+      "spring/shopping-cart-order-complete-after-commit-outbox-bridge"
+    ],
+    "confusable_with": [
+      "spring/shopping-cart-order-complete-after-commit-outbox-bridge",
+      "database/transaction-case-studies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/shopping-cart-order-flow-mission-bridge.md",
+    "revision_history": []
+  }
+}

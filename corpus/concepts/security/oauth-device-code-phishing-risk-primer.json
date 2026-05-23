@@ -1,0 +1,52 @@
+{
+  "id": "security/oauth-device-code-phishing-risk-primer",
+  "title": "OAuth Device Code Phishing Risk Primer",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 문서는 security 카테고리에서 OAuth Device Code Flow의 user_code phishing risk를 다루는 primer다. `verification_uri`, `user_code`, `device_code`, token endpoint polling, `authorization_pending`, `slow_down`, enterprise controls를 authorization code callback과 분리해서 설명한다. 검색 질의가 cli login user code, device code phishing, verification uri social engineering, browserless oauth polling처럼 들어오면 OAuth/OIDC 보안 설계와 운영 통제 관점으로 연결한다.",
+  "body_markdown": "# OAuth Device Code Phishing Risk Primer\n\n> 한 줄 요약: Device Code Flow는 브라우저가 부족한 기기에서 `verification_uri`와 `user_code`를 보여 주고, 사용자가 다른 브라우저에서 승인하는 흐름이다. 위험은 callback 탈취보다 `user_code`를 엉뚱한 verification page에 입력하게 만드는 피싱과 과도한 polling에 더 가깝다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [OAuth Device Code Flow / Security Model](./oauth-device-code-flow-security.md)\n- [OAuth2 Authorization Code Grant](./oauth2-authorization-code-grant.md)\n- [OAuth State Nonce PKCE Interview Chooser](./oauth-state-nonce-pkce-interview-chooser.md)\n- [Browser Storage Threat Model for Tokens](./browser-storage-threat-model-for-tokens.md)\n- [Rate Limiting vs Brute Force Defense](./rate-limiting-vs-brute-force-defense.md)\n- [System Design: Rate Limit vs Queue vs Load Shedding](../system-design/rate-limit-vs-queue-load-shedding-chooser.md)\n\nretrieval-anchor-keywords: oauth device code phishing, user code verification uri, cli login code risk, tv login oauth risk, device flow polling, authorization_pending slow_down, browserless login phishing, device authorization basics, verification uri origin check, enterprise device code controls, device code vs auth code, user_code social engineering\n\n## 핵심 개념\n\nDevice Code Flow는 사용자가 현재 기기에서 로그인 화면과 callback을 끝까지 처리하기 어려울 때 쓰는 OAuth 흐름이다. TV, CLI, 콘솔처럼 입력이 제한된 기기는 먼저 `device_code`, 사람이 읽는 `user_code`, 사용자가 방문할 `verification_uri`를 받는다.\n\n그 뒤 사용자는 휴대폰이나 PC 브라우저로 verification page에 들어가 `user_code`를 입력하고 승인한다. 원래 기기는 redirect callback을 받지 않고, token endpoint를 polling하면서 승인이 끝났는지 기다린다.\n\n따라서 이 흐름의 중심 질문은 `redirect_uri가 맞나`가 아니라 다음 두 가지다.\n\n- 사용자가 정확한 `verification_uri` origin에 `user_code`를 입력했나\n- 기기가 서버가 정한 interval과 `slow_down` 신호를 지키며 polling하나\n\n## Authorization Code Flow와 섞지 않기\n\n| 축 | Authorization Code Flow | Device Code Flow |\n|---|---|---|\n| 사용자가 로그인하는 곳 | 같은 브라우저 redirect 흐름 | 다른 브라우저 가능 기기 |\n| 연결 artifact | `code`, `state`, `redirect_uri`, 보통 PKCE | `device_code`, `user_code`, `verification_uri` |\n| client가 기다리는 방식 | callback endpoint가 요청을 받음 | token endpoint polling |\n| 주된 UX 위험 | redirect URI, callback state, PKCE verifier 혼선 | user_code phishing, wrong verification URI, over-polling |\n| 흔한 로그 | `invalid_state`, `invalid_grant`, PKCE mismatch | `authorization_pending`, `slow_down`, `expired_token`, `access_denied` |\n\nDevice Code Flow를 \"authorization code flow인데 callback URL만 없는 것\"이라고만 설명하면 부족하다. 사용자가 직접 입력하는 `user_code`가 있기 때문에 사회공학 위험이 커지고, client가 반복 요청을 보내기 때문에 polling 통제가 별도 설계가 된다.\n\n## phishing risk가 생기는 지점\n\n공격자는 사용자가 `user_code`를 입력할 곳을 헷갈리게 만들 수 있다.\n\n- 검색 결과나 메신저 링크로 비슷한 verification page를 열게 한다.\n- CLI가 보여준 URL과 다른 origin에 code를 넣게 만든다.\n- 공격자 자신의 device authorization session에 사용자를 승인시키려 한다.\n\n그래서 UI는 `verification_uri`를 작게 숨기면 안 된다. 사용자는 \"코드를 입력한다\"보다 먼저 \"어느 origin에 입력하는가\"를 확인해야 한다.\n\n안전한 안내는 보통 이렇게 생긴다.\n\n```text\nGo to https://login.example.com/device\nEnter code: WDJB-MJHT\nApprove only if this page shows client=example-cli and device=MacBook CLI.\n```\n\n여기서 `verification_uri_complete`가 있더라도, 사용자가 클릭한 최종 주소의 origin과 승인 화면의 client/device/scope 표시가 맞는지 확인하게 만들어야 한다.\n\n## polling과 code lifetime\n\n기기는 사용자가 승인할 때까지 token endpoint를 polling한다. 서버가 `interval`을 주면 client는 그 간격 이상 기다려야 하고, `slow_down`을 받으면 이후 polling 간격을 더 늘려야 한다. `authorization_pending`은 실패가 아니라 \"아직 사용자가 끝내지 않았다\"는 상태다.\n\npolling 설계에서 볼 것:\n\n- `device_code`와 `user_code`에 짧은 만료 시간을 둔다.\n- `expired_token`이면 같은 code를 재사용하지 않고 새 flow를 시작한다.\n- `access_denied`나 그 밖의 terminal error를 받으면 polling을 멈춘다.\n- user_code 추측과 token endpoint 폭주를 막기 위해 rate limit과 abuse signal을 남긴다.\n\n이 지점은 UX만의 문제가 아니다. 너무 공격적인 polling은 auth server 부하와 abuse 탐지 회피 문제로 이어진다.\n\n## enterprise controls\n\n기업 환경에서는 Device Code Flow를 전부 허용하는 것보다 \"어떤 client와 사용자 집단에 허용할지\"를 먼저 정한다.\n\n| 통제 | 목적 | evidence |\n|---|---|---|\n| client allowlist | 승인된 CLI/TV/device client만 flow 시작 | client_id, app owner, 등록 시각 |\n| tenant/user policy | 고위험 그룹이나 관리자 계정 제한 | user, group, tenant, policy_version |\n| conditional access / step-up | 낯선 위치, 새 기기, 고권한 scope 승인 보강 | risk score, MFA/step-up 결과 |\n| short TTL and one-time code | user_code 재사용과 추측 window 축소 | code issued_at, expires_at, consumed_at |\n| polling rate limit | auth server 부하와 brute force 완화 | interval, slow_down count, throttle event |\n| approval screen details | 사용자가 잘못된 device/client를 승인하지 않게 함 | client name, device name, scope, issuer |\n| audit log | 사후에 \"누가 어떤 기기를 승인했나\" 추적 | actor, client, device, scope, ip, user_agent |\n\n운영적으로는 \"코드 입력 성공\"만 로그로 남기면 부족하다. device authorization request, user interaction, approval/deny, token polling result를 같은 correlation id로 묶어야 사고 때 흐름을 복원할 수 있다.\n\n## source-aware guardrails\n\n- RFC 8628 기준 Device Authorization Response에는 `device_code`, `user_code`, `verification_uri`, `expires_in`이 핵심이고, `verification_uri_complete`와 `interval`은 조건부/선택 필드다.\n- RFC 8628의 token polling error인 `authorization_pending`은 계속 기다릴 수 있는 상태이고, `slow_down`은 이후 polling interval을 늘리라는 신호다.\n- OAuth 2.0 Authorization Code Flow의 `code`와 Device Code Flow의 `user_code`는 같은 artifact가 아니다. `user_code`는 사람이 verification page에 입력하는 값이고, token exchange에는 기기가 가진 `device_code`가 쓰인다.\n- OIDC ID Token, `nonce`, browser local session cookie는 이 문서의 중심 artifact가 아니다. Device Code Flow 뒤에 OIDC token을 받을 수는 있지만, phishing risk 분석은 user verification 단계에서 먼저 시작한다.\n\n표준 원문:\n\n- [RFC 8628: OAuth 2.0 Device Authorization Grant](https://www.rfc-editor.org/rfc/rfc8628)\n- [RFC 6749: The OAuth 2.0 Authorization Framework](https://www.rfc-editor.org/rfc/rfc6749)\n\n## 흔한 오해\n\n- \"`verification_uri_complete`가 있으면 phishing 걱정이 끝난다\"는 말은 위험하다. 최종 origin, client name, device name, scope 확인이 여전히 필요하다.\n- \"`authorization_pending`이 계속 나오니 로그인 실패다\"는 말도 성급하다. 사용자가 아직 승인하지 않은 정상 대기 상태일 수 있다.\n- \"`slow_down`은 그냥 retry 에러다\"가 아니다. 이후 polling 간격을 늘리라는 서버의 abuse-control 신호다.\n- \"Device Code Flow도 callback만 만들면 된다\"가 아니다. 현재 기기는 callback receiver가 아니라 polling client다.\n- \"`user_code`를 비밀처럼 영구 저장하면 안전하다\"도 아니다. 사람이 입력하는 짧은 code라서 짧은 TTL, 일회성 소비, origin 확인이 더 중요하다.\n\n## 한 줄 정리\n\nDevice Code Flow는 callback 문제보다 `verification_uri` origin, `user_code` 사회공학, polling interval, enterprise allowlist/audit를 함께 보는 흐름이다.\n",
+  "aliases": [
+    "oauth device code phishing risk",
+    "device code user code phishing",
+    "verification uri social engineering",
+    "browserless oauth polling risk",
+    "cli login user code risk",
+    "tv login verification uri risk",
+    "device authorization phishing primer",
+    "oauth device flow enterprise controls"
+  ],
+  "expected_queries": [
+    "OAuth device code flow에서 user_code 피싱 위험은 뭐야?",
+    "CLI 로그인에서 verification_uri와 user_code를 어떻게 확인해?",
+    "device code flow polling은 authorization code callback과 뭐가 달라?",
+    "기업에서 device code flow를 어떻게 통제해야 해?"
+  ],
+  "symptoms": [
+    "cli가 보여준 코드를 어디에 입력해야 하는지 헷갈린다",
+    "device code flow를 authorization code callback처럼 설명한다",
+    "user_code를 피싱 페이지에 입력해도 되는지 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/oauth2-basics",
+      "security/authentication-vs-authorization"
+    ],
+    "next_docs": [
+      "security/oauth-device-code-flow-security",
+      "security/rate-limiting-vs-brute-force-defense"
+    ],
+    "confusable_with": [
+      "security/oauth-device-code-flow-security",
+      "security/oauth2-authorization-code-grant"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/oauth-device-code-phishing-risk-primer.md",
+    "revision_history": []
+  }
+}

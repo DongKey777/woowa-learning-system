@@ -1,0 +1,84 @@
+{
+  "id": "database/vacuum-purge-debt-forensics-symptom-map",
+  "title": "Vacuum / Purge Debt Forensics and Symptom Map",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 운영 중인 데이터베이스에서 vacuum debt와 purge debt가 어떤 증상으로",
+  "body_markdown": "# Vacuum / Purge Debt Forensics and Symptom Map\n\n> 한 줄 요약: vacuum debt와 purge debt는 \"청소가 밀렸다\"는 같은 문제의 엔진별 표현이며, 증상은 디스크 증가보다 먼저 query plan 왜곡·bloat·history backlog·write amplification으로 드러난다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Vacuum / Purge / Freeze Risk Triage and Runbook Routing](./vacuum-purge-freeze-risk-runbook-routing.md)\n- [MVCC History List Growth와 Snapshot Too Old](./mvcc-history-list-snapshot-too-old.md)\n- [Undo Tablespace Truncation and Purge Debt](./undo-tablespace-truncation-purge-debt.md)\n- [Change Buffer, Purge, History List Length](./change-buffer-purge-history-length.md)\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n- [Autovacuum Freeze Debt, XID Age, and Wraparound Playbook](./autovacuum-freeze-debt-wraparound-playbook.md)\n- [Purge Backlog Remediation, Throttling, and Recovery Playbook](./purge-backlog-remediation-throttle-playbook.md)\n\nretrieval-anchor-keywords: vacuum debt, purge debt, mvcc cleanup lag, bloat forensics, history list length, autovacuum lag, dead tuple growth, index only scan regression, backend db cleanup debt, freeze debt, xid age, cleanup debt triage, runbook routing, PostgreSQL autovacuum 동작, VACUUM vs VACUUM FULL 차이, table bloat 진단 방법, dead tuple 누적 원인, xid wraparound 의미와 방어, freeze threshold 튜닝, pg_stat_progress_vacuum, InnoDB history list length, index only scan 후퇴 원인\n\n## 핵심 개념\n\nMVCC 엔진은 과거 버전을 남기고 나중에 치운다.\n이 청소가 밀리면 엔진마다 이름은 달라도 같은 부채가 쌓인다.\n\n- PostgreSQL 계열\n  - dead tuple 증가\n  - autovacuum lag\n  - table/index bloat\n- InnoDB 계열\n  - history list length 증가\n  - purge lag\n  - undo debt / purge backlog\n\n즉 vacuum/purge debt는 스토리지 housekeeping이 아니라, **현재 쿼리와 쓰기 성능을 직접 흔드는 운영 지표**다.\n\n## 깊이 들어가기\n\n### 1. debt는 \"공간\"보다 \"정리되지 않은 과거\"를 뜻한다\n\n겉으로는 디스크 증가처럼 보여도 본질은:\n\n- 아직 참조 가능한 old version이 남아 있거나\n- dead row/index entry가 정리되지 않았거나\n- cleanup worker가 현재 변경 속도를 못 따라간다\n\n는 의미다.\n\n그래서 증상은 디스크 사용량보다 먼저:\n\n- rows scanned 증가\n- heap fetch 증가\n- index-only 효과 저하\n- background IO 증가\n\n로 나타날 수 있다.\n\n### 2. PostgreSQL의 vacuum debt와 InnoDB의 purge debt는 증상 지도가 다르다\n\n비슷하지만 관찰 포인트가 다르다.\n\n- PostgreSQL 쪽에서 보기 쉬운 것\n  - dead tuples\n  - bloat\n  - autovacuum freeze pressure\n  - index-only scan heap fetch 회귀\n- InnoDB 쪽에서 보기 쉬운 것\n  - history list length\n  - undo tablespace bloat\n  - purge threads backlog\n  - change buffer / purge 상호 간섭\n\n즉 \"vacuum/purge debt\"는 공통 개념이고, **진단 신호는 엔진별로 달라진다**.\n\n### 3. debt가 쌓이는 root cause는 대부분 세 가지다\n\n- 오래 열린 transaction/snapshot\n- update/delete churn이 너무 높음\n- cleanup worker capacity 부족 또는 scheduling 부적절\n\n특히 긴 snapshot은 두 엔진 모두에서 강력한 blocker다.\n\n### 4. index 성능 회귀가 사실은 cleanup debt일 수 있다\n\n대표 오진:\n\n- \"인덱스가 갑자기 안 좋다\"\n- \"커버링 인덱스인데 heap fetch가 많다\"\n- \"rows examined가 계속 늘어난다\"\n\n실제 원인:\n\n- dead tuple/dead version이 늘어남\n- cleanup이 밀려 page density가 나빠짐\n- visibility/cleanup 상태가 index-only path를 방해함\n\n즉 plan regression처럼 보여도 사실은 **cleanup debt가 cost model과 physical locality를 동시에 악화**시킬 수 있다.\n\n### 5. forensic 흐름은 debt 증상 -> blocker -> cleanup capacity 순서가 좋다\n\n권장 순서:\n\n1. debt가 실제로 증가 중인가\n2. 어떤 long transaction/snapshot이 cleanup을 막는가\n3. update/delete churn이 어떤 테이블에 몰리는가\n4. cleanup worker/autovacuum/purge가 못 따라가는가\n\n이 순서를 건너뛰고 vacuum/purge thread 수만 올리면, root cause는 남아 있을 수 있다.\n\n### 6. debt를 줄이는 최선책은 cleanup tuning보다 workload shape 수정인 경우가 많다\n\n실무에서 효과가 큰 것:\n\n- 긴 transaction 제거\n- batch chunk 축소\n- soft delete 후 대량 정리 전략 재설계\n- hot update churn 완화\n- report/read path 분리\n\n즉 tuning은 중요하지만, **cleanup debt를 만드는 write/read shape를 바꾸는 것**이 더 근본적일 때가 많다.\n\n## 오해 방지 guard\n\n입문자가 가장 많이 틀리는 지점은 \"공간이 커졌다\"와 \"정리 debt가 쌓였다\"를 같은 말로 보는 것이다.\n\n| 오해 | 더 정확한 말 |\n|---|---|\n| vacuum은 항상 파일 크기를 줄인다 | PostgreSQL autovacuum은 주로 dead tuple을 재사용 가능하게 만들며, 파일 축소는 별도 조건/작업이 필요하다 |\n| purge lag는 단순 디스크 부족 문제다 | InnoDB purge debt는 undo history를 오래 들고 있는 reader/transaction 때문에 커질 수 있다 |\n| index가 느리면 index만 새로 만들면 된다 | visibility map, dead tuple, buffer churn 때문에 index-only scan이 heap fetch로 바뀐 것일 수 있다 |\n| cleanup을 세게 돌리면 원인이 해결된다 | long transaction, 대량 delete shape, replica lag 같은 생성 원인을 같이 줄여야 한다 |\n| vacuum/purge가 느리면 DB 정합성이 깨진다 | 보통 정합성보다 bloat, latency, undo/old version retention 문제가 먼저 나타난다 |\n\nDB 보장은 보수적으로 말해야 한다. MVCC는 reader에게 필요한 과거 version을 보존하지만, 그 과거가 오래 붙잡히면 cleanup은 미뤄진다. cleanup debt를 줄이는 작업은 \"데이터를 더 맞게 만드는 일\"이 아니라 **이미 불필요해진 version을 안전하게 치우는 일**에 가깝다.\n\n## 실전 시나리오\n\n### 시나리오 1. PostgreSQL index-only scan이 갑자기 약해짐\n\n증상:\n\n- 같은 인덱스인데 heap fetch 증가\n- autovacuum가 뒤처짐\n\n의심:\n\n- dead tuple 증가\n- visibility map 갱신 지연\n\n### 시나리오 2. InnoDB undo tablespace가 계속 커짐\n\n증상:\n\n- history list length 증가\n- purge debt 지속\n\n의심:\n\n- 오래 열린 snapshot\n- 대량 update/delete batch\n\n### 시나리오 3. 느린 쿼리처럼 보였지만 cleanup debt가 원인\n\n증상:\n\n- rows examined 증가\n- write latency와 read latency가 같이 나빠짐\n\n의심:\n\n- cleanup backlog가 physical locality와 background IO를 망침\n\n## 코드로 보기\n\n```text\nforensic map\n1. debt signal\n   - dead tuples / bloat\n   - history list length / undo growth\n2. blocker\n   - long snapshot\n   - long transaction\n3. churn source\n   - heavy update/delete tables\n4. cleanup path\n   - autovacuum / purge progress\n```\n\n```sql\n-- InnoDB 감각\nSHOW STATUS LIKE 'Innodb_history_list_length';\nSHOW ENGINE INNODB STATUS\\G\n```\n\n```sql\n-- PostgreSQL 감각\nVACUUM (ANALYZE) orders;\nEXPLAIN (ANALYZE, BUFFERS) SELECT ...;\n```\n\n핵심은 도구 이름보다, \"정리되어야 할 과거가 얼마나 남았고 누가 그 정리를 막는가\"를 찾는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| cleanup worker 증설 | backlog를 줄일 수 있다 | IO/CPU를 더 쓴다 | root cause가 capacity 부족일 때 |\n| 긴 transaction 제거 | debt root cause를 직접 줄인다 | 코드/배치 수정이 필요하다 | 대부분의 운영 사고 |\n| batch chunk 축소 | cleanup pressure를 분산한다 | 총 시간이 늘 수 있다 | 대량 update/delete |\n| report/read path 분리 | snapshot debt를 줄인다 | 구조가 복잡해진다 | 긴 분석성 조회 |\n\n## 꼬리질문\n\n> Q: vacuum debt와 purge debt는 같은 문제인가요?\n> 의도: 엔진별 용어와 공통 원리를 연결하는지 확인\n> 핵심: 이름은 다르지만 MVCC cleanup backlog라는 공통 원리를 가진다\n\n> Q: cleanup debt가 왜 index-only scan이나 plan까지 흔들 수 있나요?\n> 의도: 물리 정리 상태와 실행 경로를 연결하는지 확인\n> 핵심: dead version/bloat가 scan 비용과 visibility/heap access를 바꾸기 때문이다\n\n> Q: worker 수만 늘리면 항상 해결되나요?\n> 의도: tuning과 root cause를 구분하는지 확인\n> 핵심: 아니다. 긴 transaction이나 churn 구조가 그대로면 debt는 다시 쌓인다\n\n## 한 줄 정리\n\nvacuum/purge debt는 엔진이 아직 못 치운 과거의 양이고, 그 부채는 공간 사용량보다 먼저 query path와 write path를 동시에 무겁게 만드는 형태로 드러난다.\n",
+  "aliases": [
+    "vacuum debt",
+    "purge debt",
+    "mvcc cleanup lag",
+    "bloat forensics",
+    "history list length",
+    "autovacuum lag",
+    "dead tuple growth",
+    "index only scan regression",
+    "backend db cleanup debt",
+    "freeze debt",
+    "xid age",
+    "cleanup debt triage",
+    "runbook routing",
+    "autovacuum",
+    "VACUUM",
+    "VACUUM ANALYZE",
+    "VACUUM FULL",
+    "table bloat",
+    "테이블 bloat",
+    "dead tuple",
+    "죽은 튜플",
+    "xmin xmax",
+    "transaction id wraparound",
+    "xid wraparound",
+    "freeze",
+    "freeze threshold",
+    "vacuum_freeze_min_age",
+    "vacuum_freeze_table_age",
+    "pg_stat_user_tables",
+    "pg_stat_progress_vacuum",
+    "InnoDB undo",
+    "InnoDB history list length",
+    "HLL undo tablespace"
+  ],
+  "expected_queries": [
+    "vacuum debt가 뭐야",
+    "purge debt가 쌓이면 어디부터 봐야 해",
+    "dead tuple 늘고 autovacuum이 못 따라오면 무슨 문제야",
+    "history list length가 계속 커질 때 원인 후보가 뭐야",
+    "index only scan이 갑자기 느려졌는데 cleanup debt 때문일 수 있어",
+    "undo tablespace가 줄지 않을 때 purge backlog를 의심해야 하나"
+  ],
+  "symptoms": [
+    "autovacuum이 못 따라오고 dead tuple이 계속 늘어난다",
+    "history list length가 줄지 않고 undo tablespace가 계속 커진다",
+    "index only scan이 갑자기 약해지고 heap fetch가 늘어난다",
+    "purge backlog와 bloat가 같이 보여서 어디부터 봐야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-isolation-locking",
+      "database/redo-undo-checkpoint-crash-recovery"
+    ],
+    "next_docs": [
+      "database/vacuum-purge-freeze-risk-runbook-routing",
+      "database/mvcc-history-list-snapshot-too-old",
+      "database/purge-backlog-remediation-throttle-playbook"
+    ],
+    "confusable_with": [
+      "database/vacuum-purge-freeze-risk-runbook-routing",
+      "database/mvcc-history-list-snapshot-too-old",
+      "database/change-buffer-purge-history-length",
+      "database/purge-backlog-remediation-throttle-playbook",
+      "database/postgresql-visibility-map-all-visible-beginner-card"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/vacuum-purge-debt-forensics-symptom-map.md",
+    "revision_history": []
+  }
+}

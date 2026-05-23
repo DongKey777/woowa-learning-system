@@ -1,0 +1,46 @@
+{
+  "id": "language/volatile-synchronized-atomic-visibility-chooser",
+  "title": "Volatile Synchronized Atomic Visibility Chooser",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "이 chooser는 volatile, synchronized, AtomicInteger를 visibility, atomicity, mutual exclusion 기준으로 비교한다. volatile counter, ++ race, lock 선택 같은 Java 동시성 질문을 다룬다.",
+  "body_markdown": "# Volatile Synchronized Atomic Visibility Chooser\n\n## 10초 chooser\n\n| 필요한 것 | 후보 | 이유 |\n|---|---|---|\n| 최신 값 출판/관찰 | `volatile`, `AtomicBoolean`, immutable snapshot reference | visibility와 ordering이 핵심이고 복합 갱신은 없다. |\n| 복합 상태 보호 | `synchronized`, `ReentrantLock` | mutual exclusion으로 여러 read/write를 하나의 critical section에 묶고 unlock/lock visibility도 얻는다. |\n| 단일 변수 원자 갱신 | `AtomicInteger`, `AtomicLong`, `AtomicReference` | CAS 기반 read-modify-write를 제공한다. |\n| 고경합 통계 counter | `LongAdder` | 정확한 순간값보다 write throughput이 중요할 때 경합을 분산한다. |\n\n## 헷갈리는 축\n\n세 단어를 같은 뜻으로 쓰면 선택이 꼬인다.\n\n| 축 | 의미 | `volatile` | `synchronized` | atomic classes |\n|---|---|---:|---:|---:|\n| Visibility | 한 스레드의 write가 다른 스레드 read에 보이는가 | 예 | 예 | 예 |\n| Ordering | 관련 read/write가 재정렬되어 관찰을 깨지 않는가 | 예 | 예 | 메서드별 volatile/CAS semantics |\n| Atomicity | 한 연산이 쪼개지지 않는가 | 단일 volatile read/write만 | critical section 전체 | 제공된 단일 변수 연산 |\n| Mutual exclusion | 동시에 한 스레드만 들어오는가 | 아니오 | 예 | 아니오 |\n\n`volatile`은 읽기/쓰기 가시성을 보장하지만 `count++` 같은 read-modify-write 전체를 원자적으로 만들지 않는다. `synchronized`는 critical section을 만들고, atomic class는 제한된 단일 변수 원자 연산을 제공한다.\n\n## 선택 기준을 증상으로 바꾸기\n\n### 최신 flag만 필요하면 volatile\n\n```java\nclass Shutdown {\n    private volatile boolean stop;\n\n    void requestStop() {\n        stop = true;\n    }\n\n    boolean shouldStop() {\n        return stop;\n    }\n}\n```\n\n이 코드는 \"다른 스레드가 stop 요청을 보게 한다\"가 요구사항이다. 두 값을 함께 맞추거나 증가 연산을 합치는 요구가 없으므로 `volatile`이 자연스럽다.\n\n### counter 증가면 AtomicInteger\n\n```java\nclass Counter {\n    private final AtomicInteger value = new AtomicInteger();\n\n    int increment() {\n        return value.incrementAndGet();\n    }\n}\n```\n\n`volatile int value; value++;`는 `read -> +1 -> write` 사이에 다른 스레드가 끼어들 수 있다. 단일 숫자의 정확한 증가가 요구사항이면 atomic class의 `incrementAndGet()`처럼 read-modify-write 전체가 원자 연산인 API를 쓴다.\n\n### 여러 필드 불변식이면 lock\n\n```java\nclass ReservationState {\n    private int capacity;\n    private int reserved;\n\n    synchronized boolean reserveOne() {\n        if (reserved >= capacity) {\n            return false;\n        }\n        reserved++;\n        return true;\n    }\n\n    synchronized int remaining() {\n        return capacity - reserved;\n    }\n}\n```\n\n`reserved`만 `AtomicInteger`로 바꾸면 `capacity`와 함께 지켜야 하는 불변식이 여전히 분리될 수 있다. 여러 필드를 같은 판단 단위로 읽고 써야 하면 lock으로 그 범위를 명시한다.\n\n### 참조 교체로 snapshot을 출판하면 volatile reference\n\n```java\nfinal class Config {\n    final int timeoutMillis;\n    final boolean featureEnabled;\n\n    Config(int timeoutMillis, boolean featureEnabled) {\n        this.timeoutMillis = timeoutMillis;\n        this.featureEnabled = featureEnabled;\n    }\n}\n\nclass ConfigHolder {\n    private volatile Config current = new Config(1000, false);\n\n    void reload(Config next) {\n        current = next;\n    }\n\n    Config current() {\n        return current;\n    }\n}\n```\n\n불변 객체를 통째로 갈아끼우는 구조라면 `volatile` reference가 좋은 선택이 될 수 있다. 내부 필드를 mutable하게 바꾸는 구조가 아니라 \"새 snapshot을 안전하게 출판\"하는 구조이기 때문이다.\n\n## Wrong-bucket neighbor\n\n성능 걱정만으로 lock을 피하기 전에 필요한 정합성 단위를 먼저 정한다. 여러 필드를 함께 맞춰야 하면 atomic 변수 하나로는 부족하다.\n\n| 잘못 넣은 bucket | 왜 위험한가 | 더 나은 질문 |\n|---|---|---|\n| `volatile`로 counter를 해결 | visibility는 생겨도 lost update는 남는다 | \"read-modify-write가 필요한가?\" |\n| `AtomicInteger`로 복합 도메인 상태 해결 | 단일 변수만 원자적이고 여러 필드 불변식은 깨질 수 있다 | \"같은 critical section에 묶을 상태는 무엇인가?\" |\n| `synchronized`를 무조건 제거 | visibility와 mutual exclusion을 잃을 수 있다 | \"경합이 실제 병목인지 측정했는가?\" |\n| `LongAdder`를 도메인 판정에 사용 | `sum()`은 고경합 중 순간 선형화된 값으로 보기 어렵다 | \"정확한 순간값이 필요한가, 통계량이면 되는가?\" |\n\n## 관찰 지표와 테스트 힌트\n\n- lost update 의심: 기대 counter 값보다 작고, 부하/반복 횟수를 늘리면 오차가 커진다.\n- visibility 의심: writer는 값을 바꿨는데 reader loop가 계속 돈다.\n- lock 필요 신호: 두 필드 이상을 함께 읽고 쓰며, 중간 상태를 외부가 보면 안 된다.\n- atomic hot spot 의심: `AtomicLong` CAS retry가 늘고 CPU가 오르며 metrics counter가 병목처럼 보인다.\n\n간단한 단위 테스트 한 번으로 동시성 보장을 증명하기 어렵다. 중요한 concurrency primitive라면 JCStress, 반복 부하 테스트, JFR lock/CAS/CPU 관찰을 함께 본다.\n\n## 잘못된 대응\n\n- `volatile`을 붙였으니 `++`, `check-then-act`, `put-if-absent 직접 구현`도 안전하다고 생각한다.\n- read method는 빠르게 하려고 lock을 빼고 write method만 lock으로 감싼다.\n- `AtomicReference<MutableObject>`를 쓰면서 내부 mutable field는 동기화 없이 바꾼다.\n- lock contention 측정 없이 코드 전반을 CAS loop로 바꾼다.\n- concurrency bug를 \"테스트가 가끔 실패\"로만 보고 요구 semantics를 먼저 쓰지 않는다.\n\n## Safe Next Docs\n\nvolatile counter atomicity cause router에서 `count++` lost update를 더 좁혀 보고, JMM happens-before primer에서 visibility/order의 근거를 다시 확인한다.\n",
+  "aliases": [
+    "volatile synchronized atomic visibility chooser",
+    "java visibility atomicity lock choice",
+    "volatile synchronized AtomicInteger 선택",
+    "가시성 원자성 락 비교",
+    "final"
+  ],
+  "expected_queries": [
+    "volatile synchronized AtomicInteger는 언제 각각 써야 해?",
+    "volatile은 원자성도 보장해?",
+    "counter 증가에는 volatile과 AtomicInteger 중 뭐가 맞아?"
+  ],
+  "symptoms": [
+    "volatile int를 ++ 했는데 값이 틀려요",
+    "synchronized가 너무 무거울까 봐 AtomicInteger로 바꾸고 싶어요",
+    "visibility와 atomicity를 같은 말로 쓰고 있어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-memory-model-happens-before-beginner-primer"
+    ],
+    "next_docs": [
+      "language/java-volatile-counter-atomicity-cause-router"
+    ],
+    "confusable_with": [
+      "language/java-volatile-counter-atomicity-cause-router",
+      "language/java-concurrency-utilities"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/volatile-synchronized-atomic-visibility-chooser.md",
+    "revision_history": []
+  }
+}

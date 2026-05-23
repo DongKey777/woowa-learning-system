@@ -1,0 +1,49 @@
+{
+  "id": "operating-system/signals-process-supervision",
+  "title": "Signals Process Supervision",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "'이 문서는 process가 스스로 잘 죽고 잘 회수되도록 signal handling, SIGTERM/SIGKILL,",
+  "body_markdown": "# Signals, Process Supervision\n\n> 한 줄 요약: 프로세스는 스스로 잘 죽고 잘 회수돼야 하며, signals와 supervisor를 모르면 운영 중 좀비와 유실이 늘어난다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md)\n> - [Session vs Process Group Primer](./session-vs-process-group-primer.md)\n> - [Signal Mask vs Disposition Bridge: `fork()`, `exec()`, `posix_spawn()`](./signal-mask-vs-disposition-fork-exec-posix-spawn.md)\n> - [/proc/<pid>/status Signal Fields Debugging Primer](./proc-pid-status-signal-fields-debugging-primer.md)\n> - [Linux 프로세스 상태 머신, Zombie, Orphan](./linux-process-state-zombie-orphan.md)\n> - [PID 1, SIGTERM, and Container Reaping Basics](./container-pid-1-sigterm-zombie-reaping-basics.md)\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [eventfd, signalfd, Epoll Control-Plane Integration](./eventfd-signalfd-epoll-control-plane-integration.md)\n> - [O_CLOEXEC, FD Inheritance, Exec-Time Leaks](./o-cloexec-fd-inheritance-exec-leaks.md)\n\n> retrieval-anchor-keywords: signals, SIGTERM, SIGKILL, SIGCHLD, graceful shutdown, process supervision, PID 1, zombie reaping, signalfd, supervisor, process group signal, foreground process group signal, controlling terminal signal, Ctrl-C SIGINT process group, signal mask vs disposition, blocked signal vs ignored signal\n\n## 핵심 개념\n\n`signal`은 프로세스에 전달되는 비동기 알림이다.\n`process supervision`은 프로세스가 죽었을 때 다시 띄우거나, 정상 종료를 감시하는 운영 방식이다.\n\n왜 중요한가:\n\n- 장애가 났을 때 프로세스가 멈추지 않고 \"조용히 죽는\" 경우가 많다.\n- PID 1이 signals를 제대로 처리하지 못하면 container 안에서 문제가 누적된다.\n- graceful shutdown을 안 하면 요청 유실과 자원 누수가 생긴다.\n\n## 깊이 들어가기\n\n### 1. signal의 의미\n\n대표적인 signal:\n\n- `SIGTERM`: 정상 종료 요청\n- `SIGKILL`: 강제 종료\n- `SIGINT`: 인터럽트\n- `SIGHUP`: 설정 재읽기/세션 종료 신호\n- `SIGCHLD`: 자식 프로세스 종료 알림\n\nsignal은 즉시 실행이 아니라, 적절한 시점에 handler가 호출되는 비동기 이벤트다.\nevent loop 기반 서버에서는 이런 signal을 `signalfd`로 루프 안에서 처리하는 설계도 가능하다.\n\n### 2. graceful shutdown\n\n서버는 보통 `SIGTERM`을 받으면 아래를 해야 한다.\n\n- 새 요청 수락 중단\n- 기존 요청 마무리\n- 커넥션 닫기\n- 자식 프로세스 회수\n\n이걸 안 하면 load balancer에서 빼기 전까지 새 요청이 계속 들어오거나, 종료 중 요청이 끊길 수 있다.\n\n### 3. supervisor가 필요한 이유\n\n단일 프로세스가 죽으면 서비스도 같이 죽는다.\n그래서 시스템은 보통 supervisor가 필요하다.\n\n- `systemd`\n- `s6`\n- `supervisord`\n- `Kubernetes`의 restart policy\n\nsupervisor는 프로세스 생명주기를 외부에서 통제한다.\n\n### 4. PID 1 문제\n\ncontainer 내부의 PID 1은 특별하다.\n\n- signal을 제대로 전달받아야 한다\n- zombie를 reap해야 한다\n- 일반 init처럼 child process 정리를 해야 한다\n\n앱 프로세스를 PID 1로 직접 올리면 이 책임을 놓치기 쉽다.\n\n## 실전 시나리오\n\n### 시나리오 1: deployment 중 요청이 유실된다\n\n`SIGTERM`을 받고 바로 종료하면 in-flight request가 끊긴다.\n해결은 graceful shutdown timeout과 readiness drain이다.\n\n### 시나리오 2: container 안에 zombie가 쌓인다\n\n자식 프로세스가 종료됐는데 부모가 `wait()`를 안 하면 zombie가 남는다.\nPID 1이 이를 회수하지 못하면 zombie가 누적된다.\n\n진단:\n\n```bash\nps -eo pid,ppid,stat,cmd | grep Z\npstree -ap <pid>\ncat /proc/<pid>/status | grep -E 'State|PPid'\n```\n\n### 시나리오 3: supervisor가 재시작을 반복한다\n\n프로세스가 에러를 내고 죽는데, supervisor가 무한 재시작하면 원인보다 증상이 더 커진다.\n이때는 backoff, exit code 정책, crash loop 제한이 필요하다.\n\n## 코드로 보기\n\n### Java 스타일 graceful shutdown\n\n```java\nRuntime.getRuntime().addShutdownHook(new Thread(() -> {\n    // stop accepting new work\n    // finish in-flight requests\n    // flush metrics / logs\n}));\n```\n\n### Shell에서 signal 보내기\n\n```bash\nkill -TERM <pid>\nkill -KILL <pid>\n```\n\n### zombie 관찰\n\n```bash\nps -eo pid,ppid,stat,cmd | awk '$3 ~ /Z/ { print }'\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 직접 프로세스 운영 | 단순 | 재시작/회수가 약함 | 아주 작은 배치 |\n| supervisor 사용 | 재시작/모니터링 쉬움 | 운영 요소 증가 | 서버/daemon |\n| container + orchestrator | 표준화 | signal/healthcheck 이해 필요 | 현대 서버 운영 |\n| PID 1 직접 앱 실행 | 이미지 단순 | zombie/reaping 문제 | 거의 피하는 편이 좋음 |\n\n## 꼬리질문\n\n> Q: SIGTERM과 SIGKILL의 차이는 무엇인가?\n> 의도: graceful shutdown과 강제 종료 차이 이해 여부 확인\n> 핵심: SIGTERM은 협상, SIGKILL은 즉시 종료다.\n\n> Q: zombie 프로세스는 왜 생기나?\n> 의도: wait/reap 의미 이해 여부 확인\n> 핵심: 자식 종료를 부모가 회수하지 않았기 때문이다.\n\n> Q: PID 1이 특별한 이유는 무엇인가?\n> 의도: container init 역할 이해 여부 확인\n> 핵심: signal 처리와 child reaping 책임이 있다.\n\n## 한 줄 정리\n\n프로세스 운영은 실행만이 아니라 종료와 회수가 반이고, signals와 supervisor를 제대로 다뤄야 container와 서버가 깔끔하게 살아남는다.\n",
+  "aliases": [
+    "signals process supervision",
+    "SIGTERM SIGKILL supervision",
+    "graceful shutdown signal",
+    "zombie reaping supervisor",
+    "process restart supervision",
+    "child lifecycle signal"
+  ],
+  "expected_queries": [
+    "process supervision에서 signals를 모르면 zombie와 shutdown 문제가 왜 늘어?",
+    "SIGTERM, SIGKILL, SIGCHLD를 graceful shutdown과 restart supervision에서 어떻게 봐?",
+    "supervisor는 child process를 어떻게 감시하고 회수해야 해?",
+    "container PID 1과 signal handling은 process supervision과 어떻게 연결돼?"
+  ],
+  "symptoms": [
+    "`Signals Process Supervision`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`Signals Process Supervision`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`Signals Process Supervision`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "CPU, 메모리, 파일 디스크립터, 스레드 지표를 보면서 OS 원인과 애플리케이션 원인을 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/linux-process-state-zombie-orphan",
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/container-pid-1-sigterm-zombie-reaping-basics"
+    ],
+    "confusable_with": [
+      "operating-system/killed-oomkilled-memory-events-beginner-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/signals-process-supervision.md",
+    "revision_history": []
+  }
+}

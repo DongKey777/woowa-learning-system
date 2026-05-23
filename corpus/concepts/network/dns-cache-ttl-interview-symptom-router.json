@@ -1,0 +1,45 @@
+{
+  "id": "network/dns-cache-ttl-interview-symptom-router",
+  "title": "DNS Cache TTL Interview Symptom Router",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 DNS 변경 후 일부 사용자만 예전 서버로 가는 증상을 TTL, recursive resolver cache, browser/OS cache로 분기한다.",
+  "body_markdown": "# DNS Cache TTL Interview Symptom Router\n\n## 한 줄 판단\n\nDNS 변경 후 \"일부 사용자만 예전 서버로 간다\"는 증상은 전파 지연이라는 한 단어로 끝내지 말고, authoritative record, recursive resolver cache, OS/browser cache, application runtime cache, 기존 connection reuse 중 어느 층이 옛 값을 들고 있는지 나눠 본다.\n\n## 관찰 증거\n\n| 관찰 | 강한 신호 | 먼저 의심할 층 |\n|---|---|---|\n| authoritative 직접 질의는 새 IP인데 특정 public resolver는 옛 IP를 준다 | answer value와 remaining TTL이 resolver별로 다르다 | recursive resolver cache |\n| 같은 사무실/ISP 사용자만 옛 IP를 본다 | affected network의 resolver만 다른 답을 준다 | 사내 DNS, ISP resolver, split-horizon, geo steering |\n| `dig`는 새 IP인데 애플리케이션만 옛 endpoint로 붙는다 | connection pool destination, JVM DNS cache, HTTP client channel이 옛 주소다 | process cache 또는 connection reuse |\n| 브라우저만 다르고 터미널 조회는 정상이다 | browser DNS cache, HTTP cache, Alt-Svc, 기존 HTTP/2 connection이 남아 있다 | browser/cache/connection layer |\n| 새로 만든 이름이 계속 NXDOMAIN이다 | authority section의 SOA와 negative TTL이 보인다 | negative caching |\n| rollback 직후 old/new target이 섞인다 | 일부 resolver는 rollback 전 값을, 일부 resolver는 rollback 후 값을 반환한다 | TTL 동안 mixed fleet |\n\n브라우저 캐시 삭제로 증상이 사라지지 않으면 \"브라우저 문제 아님\"까지만 알 수 있다. recursive resolver, OS stub resolver, language runtime, connection pool은 여전히 별도 증거로 확인해야 한다.\n\n## 1차 분기\n\n| 증상 | 먼저 확인 | 다음 문서 |\n|---|---|---|\n| 일부 지역만 예전 IP | resolver별 answer와 remaining TTL | `dns-ttl-cache-failure-patterns` |\n| 없는 도메인으로 캐시됨 | NXDOMAIN/NODATA, SOA negative TTL | `dns-negative-caching-nxdomain-behavior` |\n| 브라우저만 다름 | browser/OS DNS cache, Alt-Svc, 기존 connection | `dns-basics` |\n| 앱만 예전 endpoint | JVM/HTTP client DNS cache, connection pool lifetime | client resolver/cache 설정 |\n| rollback 후 일부 실패 | old/new target 혼재, old target health | old target 유지와 health check |\n| authoritative는 정상 | 특정 recursive resolver stale cache | resolver별 `dig` 비교 |\n\n## 면접 답변 골격\n\nDNS 전파는 모든 서버가 동시에 업데이트되는 push 이벤트가 아니라 cache TTL이 만료되며 관찰되는 과정이다. authoritative DNS가 새 값을 갖고 있어도, 사용자가 실제로 질의하는 recursive resolver나 client runtime이 이전 응답을 TTL 동안 재사용하면 같은 시점에 서로 다른 IP가 보일 수 있다. 그래서 장애 분석은 \"DNS가 안 바뀐다\"가 아니라 \"어느 resolver가 어떤 record를 어떤 TTL로 응답하고, 실제 연결은 어느 endpoint로 가는가\"를 비교하는 일이다.\n\n## TTL/cache/capacity caveats\n\n- TTL은 \"이 시간 안에 반드시 전환된다\"가 아니라 cache가 응답을 재사용할 수 있는 수명이다. resolver 구현에 따라 최소/최대 TTL clamp, serve-stale, negative cache 정책이 붙을 수 있다.\n- 전환 직전에 TTL을 낮춰도 이미 긴 TTL로 캐시된 응답은 즉시 짧아지지 않는다. 계획된 cutover라면 기존 긴 TTL이 만료될 만큼 앞서 낮춰야 한다.\n- TTL을 너무 짧게 두면 recursive resolver와 authoritative DNS의 QPS가 늘고, DNS lookup latency가 p99에 섞이며, authoritative 장애나 rate limit의 영향 범위가 커질 수 있다.\n- DNS 응답이 새 IP를 반환해도 기존 TCP/TLS/HTTP/2/gRPC connection, keep-alive pool, Alt-Svc, proxy cache가 old endpoint traffic을 계속 만들 수 있다.\n- DNS 기반 rollback도 즉시 복구가 아니다. rollback 값 역시 resolver별 TTL tail을 만들기 때문에 old/new endpoint를 동시에 감당할 capacity와 health check가 필요하다.\n\n## 운영 검증 순서\n\n1. authoritative server에 직접 질의해 zone이 의도한 값으로 바뀌었는지 확인한다.\n2. 여러 recursive resolver와 affected client network에서 같은 record의 answer, CNAME chain, remaining TTL을 기록한다.\n3. client host 안에서 OS resolver 결과와 browser/application runtime 결과를 비교한다.\n4. 애플리케이션 로그, connection pool metric, load balancer access log로 실제 연결 대상이 DNS 응답과 일치하는지 확인한다.\n5. old endpoint의 error rate, connection count, capacity를 TTL tail 동안 계속 본다.\n6. 전환 완료 판정은 \"authoritative 변경 완료\"가 아니라 resolver 표본의 stale answer 감소, old endpoint traffic drain, error budget 안정까지 묶어 판단한다.\n\n```bash\n# authoritative 직접 확인: zone source of truth\ndig @ns1.example-dns.net app.example.com A +noall +answer\n\n# recursive resolver별 answer와 남은 TTL 비교\ndig @1.1.1.1 app.example.com A +noall +answer\ndig @8.8.8.8 app.example.com A +noall +answer\ndig @<affected-resolver-ip> app.example.com A +noall +answer\n\n# CNAME chain과 negative cache 단서 확인\ndig app.example.com CNAME +noall +answer\ndig missing.example.com A +noall +answer +authority\n```\n\n## 좋은 답변 확장 축\n\n- DNS 질의 흐름은 stub resolver, recursive resolver, authoritative server로 나눠 설명한다.\n- 사용자가 직접 authoritative를 묻는 경우와 평소 사용하는 recursive resolver를 묻는 경우의 결과가 다를 수 있다고 말한다.\n- \"TTL을 낮추면 빨라집니다\"에서 멈추지 않고, 기존 TTL tail과 너무 낮은 TTL의 capacity 비용을 같이 말한다.\n- 장애 대응에서는 DNS만 보지 말고 connection reuse, proxy cache, client-side service discovery도 함께 본다.\n- 면접에서는 \"전파가 느립니다\" 대신 \"authoritative와 resolver별 응답 값/TTL, 실제 연결 endpoint를 분리해 검증합니다\"라고 답한다.\n\n## 흔한 오해\n\n- DNS 변경은 전 세계 서버에 push되는 이벤트가 아니다. 캐시된 응답이 각자 만료되며 달라진다.\n- 브라우저 캐시 삭제가 모든 DNS cache를 지우는 것은 아니다.\n- TTL을 낮췄다고 이미 배포된 이전 TTL까지 즉시 줄어드는 것은 아니다.\n- 일부 사용자만 실패한다고 항상 CDN 문제로 단정하지 않는다. resolver, cache, client connection reuse를 분리해야 한다.\n- `dig` 한 번의 성공은 운영 전환 완료 증거가 아니다. 어느 resolver에서, 어떤 TTL로, 실제 traffic이 어디로 갔는지가 함께 필요하다.\n\n## 관련 playbook\n\n계획된 변경은 TTL을 충분히 앞서 낮추고, authoritative 응답과 recursive 응답을 따로 확인하며, old/rollback endpoint도 TTL tail과 connection drain이 끝날 때까지 안전하게 유지한다.\n",
+  "aliases": [
+    "DNS TTL interview router",
+    "DNS cache symptom router",
+    "DNS 캐시 면접 라우터",
+    "일부 사용자만 예전 IP"
+  ],
+  "expected_queries": [
+    "DNS TTL 때문에 일부 사용자만 예전 서버로 가는 이유를 설명해줘",
+    "DNS 캐시와 recursive resolver를 면접에서 어떻게 말하지?",
+    "도메인 변경 후 전파가 느린 증상을 어떻게 분석해?"
+  ],
+  "symptoms": [
+    "어떤 사용자는 새 서버로 가고 어떤 사용자는 예전 서버로 가요",
+    "DNS record를 바꿨는데 바로 반영되지 않아요",
+    "브라우저 캐시를 지워도 IP가 그대로예요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/dns-basics"
+    ],
+    "next_docs": [
+      "network/dns-ttl-cache-failure-patterns"
+    ],
+    "confusable_with": [
+      "network/dns-basics",
+      "network/dns-ttl-cache-failure-patterns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/dns-cache-ttl-interview-symptom-router.md",
+    "revision_history": []
+  }
+}

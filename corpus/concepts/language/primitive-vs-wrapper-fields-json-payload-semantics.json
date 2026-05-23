@@ -1,0 +1,58 @@
+{
+  "id": "language/primitive-vs-wrapper-fields-json-payload-semantics",
+  "title": "Primitive vs Wrapper Fields in JSON Payload Semantics",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 JSON payload DTO에서 primitive vs wrapper field 선택이 missing, explicit null, default value, PATCH tri-state, API compatibility에 미치는 의미를 점검하는 advanced playbook이다.",
+  "body_markdown": "# Primitive vs Wrapper Fields in JSON Payload Semantics\n\n> 한 줄 요약: API DTO에서 `int`/`Integer`, `boolean`/`Boolean` 선택은 취향이 아니라 payload contract다. primitive를 쓰면 missing과 explicit `null`이 기본값으로 뭉개질 수 있고, wrapper를 쓰면 tri-state가 생기므로 PATCH, defaulting, backward compatibility가 달라진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Autoboxing, `IntegerCache`, `==`, and Null Unboxing Pitfalls](./autoboxing-integercache-null-unboxing-pitfalls.md)\n> - [JSON `null`, Missing Field, Unknown Property, and Schema Evolution](./json-null-missing-unknown-field-schema-evolution.md)\n> - [Empty String, Blank, `null`, and Missing Payload Semantics](./empty-string-blank-null-missing-payload-semantics.md)\n> - [Value Object Invariants, Canonicalization, and Boundary Design](./value-object-invariants-canonicalization-boundary-design.md)\n> - [Java IO, NIO, Serialization, JSON Mapping](./io-nio-serialization.md)\n\n> retrieval-anchor-keywords: primitive vs wrapper field, JSON payload semantics, int vs Integer, boolean vs Boolean, default value binding, absent field, explicit null, DTO defaulting, PATCH semantics, tri-state boolean, API compatibility, payload binding, empty string, blank string\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nJSON payload를 Java DTO로 받을 때 field 타입은 곧 의미 선택이다.\n\n- primitive field: null이 없고 기본값이 있다\n- wrapper field: null이 가능하고 \"값 없음\"을 담을 수 있다\n\n그래서 다음 세 상태를 구분할 수 있는지가 달라진다.\n\n- 값이 명시적으로 왔다\n- 필드가 아예 안 왔다\n- 필드가 `null`로 왔다\n\n이 차이는 PATCH, create API, event replay, old client compatibility에서 크게 드러난다.\n\n## 깊이 들어가기\n\n### 1. primitive는 바인딩 후 의미를 잃기 쉽다\n\n`int`, `long`, `boolean`은 바인딩이 끝난 시점에 항상 값이 있다.  \n문제는 그 값이 \"실제 payload 값\"인지 \"기본값\"인지 분간하기 어려워진다는 점이다.\n\n예:\n\n- `boolean enabled`는 `false`가 왔는지\n- 아예 안 왔는데 default `false`가 들어간 건지\n\n를 DTO만 보고 구분하기 어렵다.\n\n즉 primitive field는 create command처럼 \"필수이며 항상 값이 있어야 하는\" 경우엔 잘 맞지만,  \npartial update나 backward compatibility 경계엔 쉽게 위험해진다.\n\n### 2. wrapper는 tri-state를 만들지만, 그 자체로 정책은 아니다\n\n`Integer`, `Boolean`, `Long`을 쓰면 `null`을 담을 수 있다.  \n그래서 다음이 가능해진다.\n\n- `true`\n- `false`\n- `null`\n\n하지만 `null`이 무엇을 뜻하는지는 여전히 따로 정해야 한다.\n\n- missing과 같은가\n- explicit null과 같은가\n- \"아직 모름\"인가\n\n즉 wrapper는 표현 공간을 열어줄 뿐, 의미를 자동으로 정해주지는 않는다.\n\n### 3. create API와 PATCH API는 다른 모델이 필요할 수 있다\n\ncreate command에서는 다음이 자연스럽다.\n\n- 필수 필드: primitive 또는 non-null value object\n- 선택 필드: wrapper/value object nullable\n\n반면 PATCH는 보통 tri-state가 필요하다.\n\n- 바꾸지 않음\n- 명시적으로 비움\n- 새 값으로 바꿈\n\n이때 primitive field는 표현력이 부족할 수 있다.\n\n### 4. Boolean flag는 특히 오해가 많다\n\n`boolean active`는 간단해 보이지만 payload semantics가 붙으면 복잡해진다.\n\n- 가입 시 기본값이 `true`인가\n- 요청에서 안 보내면 서버 default를 넣는가\n- PATCH에서 `false`와 missing을 구분해야 하는가\n\n즉 boolean은 binary value지만, API contract는 종종 binary가 아니다.\n\n### 5. DTO 기본값과 도메인 기본값은 다를 수 있다\n\n바인딩 단계에서 기본값을 일찍 넣어버리면 \"클라이언트가 안 보냈다\"는 정보가 사라진다.  \n그래서 서버가 진짜 default policy를 적용할 기회를 잃는다.\n\n이 때문에 많은 시스템은:\n\n- DTO는 raw intent를 보존\n- domain command 변환 시 default 정책 적용\n\n방식을 택한다.\n\n## 재현 조건\n\nprimitive/wrapper 차이는 payload가 같은 모양으로 보이지만 \"보낸 의도\"가 다른 경우에 드러난다.\n\n- `{\"marketingOptIn\": false}`와 `{}`를 같은 PATCH endpoint에 보낸다\n- `{\"retryLimit\": 0}`, `{\"retryLimit\": null}`, `{}`를 새 필드 rollout 직후 old/new client로 나눠 보낸다\n- `Boolean enabled`를 domain 코드에서 곧바로 `if (enabled)`로 unboxing한다\n- record DTO compact constructor에서 이미 primitive default가 들어온 뒤 validation을 시도한다\n\n재현은 serializer 설정에 따라 달라질 수 있으므로, 사용하는 JSON mapper의 null/missing 처리 옵션까지 함께 고정해야 한다.\n\n## failure matrix\n\n| payload/상황 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| PATCH `{}`가 기존 `true`를 `false`로 덮음 | 서비스 로직 버그 | primitive defaulting으로 인한 intent 손실 | raw payload에는 field 없음 |\n| `{\"enabled\": null}`에서 NPE | wrapper가 나쁘다 | null semantics 미정의 + unboxing | DTO 변환 없이 domain 진입 |\n| old client가 새 primitive field를 안 보냄 | old client 오류 | backward compatibility default 정책 부재 | 새 필드 absent와 explicit zero 구분 실패 |\n| create 필수 값이 wrapper null로 들어옴 | mapper 문제 | boundary validation 누락 | validation layer에서 required check 부재 |\n| PATCH에 `Optional<T>` field 사용 | optional이 안전하다 | tri-state 모델 혼동 | unchanged/clear/set 표현이 애매함 |\n\n## 검증/validation\n\n- 같은 endpoint에 explicit value, explicit null, missing field 세 입력을 모두 넣어 결과가 의도대로 갈리는지 테스트한다.\n- DTO -> command 변환 테스트에서 default 적용 위치를 확인한다. DTO 생성 직후가 아니라 domain command 변환 지점에서 적용하는지 보는 것이 핵심이다.\n- PATCH는 unchanged, clear, set을 별도 fixture로 검증한다.\n- backward compatibility 테스트에서는 old client payload fixture를 남겨 새 primitive field 추가가 의미를 바꾸지 않는지 확인한다.\n\n## 오해와 wrong bucket\n\n- primitive를 쓰면 null 문제가 사라진다는 설명은 절반만 맞다. null은 사라져도 missing/default 의도가 사라질 수 있다.\n- wrapper를 쓰면 tri-state가 자동으로 해결된다는 설명은 wrong bucket이다. wrapper는 표현 공간만 열고, null과 missing의 의미는 별도 정책이다.\n- create DTO와 PATCH DTO를 같은 타입으로 재사용하면 단순해 보이지만, 필수/부분수정 계약이 섞여 실패 원인 분석이 어려워질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: PATCH 요청이 의도치 않게 `false`를 넣는다\n\nDTO에 `boolean marketingOptIn`이 있다.  \n클라이언트가 필드를 안 보냈는데 바인딩 후 `false`가 들어가서 기존 동의값을 덮어쓴다.\n\n### 시나리오 2: old client가 새 필드를 안 보내도 의미가 바뀐다\n\n새 필드 `int retryLimit`을 추가했는데 primitive default `0`이 들어간다.  \nold client는 그냥 모르는 필드를 안 보낸 것뿐인데, 서버는 이를 명시적 0으로 해석한다.\n\n### 시나리오 3: `Boolean`을 썼더니 서비스 내부 NPE가 생긴다\n\npayload 단계에선 tri-state가 유용했지만,  \n도메인 코드에서 곧바로 `if (enabled)` 같은 unboxing을 해버리면 runtime bug가 난다.\n\n### 시나리오 4: record DTO가 너무 단순해 보여 함정이 숨어든다\n\nrecord component에 primitive를 쓰면 compact constructor에 들어왔을 때 이미 기본값이 들어가 있을 수 있다.  \n즉 \"payload에 없었다\"는 정보를 record constructor가 알기 어렵다.\n\n## 코드로 보기\n\n### 1. create command 감각\n\n```java\npublic record CreateUserRequest(\n    String email,\n    boolean marketingOptIn\n) {}\n```\n\n이 모델은 `marketingOptIn`이 항상 payload에 있어야 하는 계약일 때만 자연스럽다.\n\n### 2. PATCH 모델 감각\n\n```java\npublic record UpdateUserRequest(\n    FieldPatch<Boolean> marketingOptIn\n) {}\n```\n\npartial update라면 primitive보다 tri-state 모델이 더 잘 맞을 수 있다.\n\n### 3. wrapper를 domain으로 바로 넘기지 않기\n\n```java\npublic record RetryPolicy(Integer retryLimit) {\n    public int normalizedRetryLimit() {\n        return retryLimit == null ? 3 : retryLimit;\n    }\n}\n```\n\ndefault 정책 적용 지점을 명시하는 편이 안전하다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| primitive field | 단순하고 null이 없다 | missing과 default를 구분하기 어렵다 |\n| wrapper field | payload intent를 더 많이 보존한다 | tri-state 의미와 null 처리 정책이 필요하다 |\n| tri-state patch model | PATCH semantics가 명확하다 | DTO와 변환 코드가 늘어난다 |\n| domain default later | 클라이언트 intent를 덜 잃는다 | 변환 계층 설계가 필요하다 |\n\n핵심은 DTO field 타입이 구현 편의가 아니라 payload meaning을 결정한다는 점이다.\n\n## 꼬리질문\n\n> Q: DTO에서 primitive를 쓰면 왜 위험할 수 있나요?\n> 핵심: 바인딩 후 default 값이 들어가며 missing과 explicit value를 구분하기 어려워질 수 있기 때문이다.\n\n> Q: wrapper를 쓰면 항상 더 좋은가요?\n> 핵심: 아니다. tri-state를 열어주지만 null semantics를 따로 설계해야 한다.\n\n> Q: PATCH에 boolean field 하나만 있으면 충분한가요?\n> 핵심: 보통은 부족하다. unchanged, clear, set을 구분해야 할 수 있다.\n\n> Q: DTO default와 domain default를 왜 나누나요?\n> 핵심: 너무 이른 defaulting은 클라이언트가 실제로 보낸 intent를 잃게 만들 수 있기 때문이다.\n\n## 한 줄 정리\n\nAPI DTO에서 primitive와 wrapper 선택은 단순 타입 선택이 아니라 missing, null, default, partial update 의미를 어디까지 보존할지 정하는 계약이다.\n",
+  "aliases": [
+    "Primitive vs Wrapper Fields in JSON Payload Semantics",
+    "int vs Integer JSON payload semantics",
+    "boolean vs Boolean missing explicit null",
+    "primitive wrapper DTO defaulting",
+    "API payload binding tri-state",
+    "자바 DTO primitive wrapper JSON 의미",
+    "Optional",
+    "record"
+  ],
+  "expected_queries": [
+    "JSON DTO에서 int와 Integer, boolean과 Boolean 선택은 payload contract로 어떻게 달라?",
+    "primitive field를 쓰면 missing과 explicit null이 default value로 뭉개질 수 있다는 뜻을 설명해줘",
+    "wrapper field는 tri-state를 열어주지만 null 의미를 자동으로 정하지 않는다는 게 무슨 말이야?",
+    "create API와 PATCH API에서 primitive wrapper 선택 기준이 왜 달라질 수 있어?",
+    "backward compatibility와 event replay에서 DTO defaulting이 위험해지는 사례를 알려줘"
+  ],
+  "symptoms": [
+    "DTO primitive field를 쓰면서 missing field와 explicit null이 default false나 0으로 뭉개질 수 있는 payload contract 차이를 놓쳐",
+    "Integer Boolean wrapper를 쓰면 tri-state 표현 공간은 생기지만 null 의미가 자동으로 정해지는 것은 아니라는 점을 문서화하지 않아",
+    "create API, PATCH API, event replay, backward compatibility 경계에서 primitive와 wrapper 선택을 취향이나 style 문제로만 처리해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-autoboxing-integercache-null-unboxing-pitfalls",
+      "language/json-null-missing-unknown-field-schema-evolution",
+      "language/empty-string-blank-null-missing-payload-semantics"
+    ],
+    "next_docs": [
+      "language/patch-tri-state-field-primer",
+      "language/optional-vs-fieldpatch-patch-tri-state-bridge",
+      "software-engineering/validation-boundary-input-vs-domain-invariant-mini-bridge"
+    ],
+    "confusable_with": [
+      "language/json-null-missing-unknown-field-schema-evolution",
+      "language/patch-tri-state-field-primer",
+      "language/optional-vs-fieldpatch-patch-tri-state-bridge",
+      "language/primitive-wrapper-choice-primer",
+      "language/empty-string-blank-null-missing-payload-semantics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/primitive-vs-wrapper-fields-json-payload-semantics.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "database/striped-guard-row-budgeting",
+  "title": "Striped Guard Row Budgeting Primer",
+  "category": "database",
+  "level": "beginner",
+  "summary": "'이 문서는 striped guard row budgeting을 bucket local budget, stable bucket selection, release bookkeeping으로 설명하는 beginner primer다.",
+  "body_markdown": "# Striped Guard Row Budgeting Primer\n\n> 한 줄 요약: 단일 guard row를 여러 stripe로 나눌 때 초보자가 먼저 지켜야 할 규칙은 \"`총량`이 아니라 `bucket별 예산`으로 승인하고, `같은 claim`은 항상 같은 bucket으로 보내고, `반납`은 원래 bucket에서 한 번만 처리한다\"이다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Guard Row Hot-Row Symptoms Primer](./guard-row-hot-row-symptoms-primer.md)\n- [Guard-Row Hot-Row Contention Mitigation](./hot-row-contention-counter-sharding.md)\n- [Shared-Pool Guard Design for Room-Type Inventory](./shared-pool-guard-design-room-type-inventory.md)\n- [Guard-Row Scope Design for Multi-Day Bookings](./guard-row-scope-design-multi-day-bookings.md)\n- [Transaction Retry와 Serialization Failure 패턴](./transaction-retry-serialization-failure-patterns.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: striped guard row budgeting primer, striped guard row beginner, bucket local budget, local bucket budget, stable bucket selection, stable bucket id, release bookkeeping, guard row striping basics, move from single guard row, striped guard release, bucket allocation record, bucket headroom beginner, claim bucket mapping, room_type_day bucket budget, campaign bucket budget\n\n## 핵심 개념\n\n단일 guard row는 \"창구 하나\"다.\n\n- `room_type_day_guard(room_type_id, stay_day)`\n- `campaign_guard(campaign_id)`\n- `tenant_quota_guard(tenant_id)`\n\nstriped guard row는 이 창구를 여러 줄로 나눈 모습이다.\n\n- `room_type_day_guard_bucket(room_type_id, stay_day, bucket_id)`\n- `campaign_guard_bucket(campaign_id, bucket_id)`\n\n하지만 중요한 점은 **줄만 여러 개로 만들면 끝이 아니라는 것**이다.\n초보자가 가장 많이 틀리는 부분은 세 가지다.\n\n1. 승인할 때 여전히 전체 합을 다시 계산한다\n2. acquire와 release가 다른 bucket을 만진다\n3. cancel, expire, retry가 같은 점유를 두 번 반납한다\n\n그래서 striped guard row는 \"row 수 늘리기\"보다 **세 가지 bookkeeping 규칙을 고정하는 일**에 가깝다.\n\n## 먼저 그림으로 이해하기\n\n| 모델 | 승인 기준 | acquire/release가 만지는 곳 | 병목 모양 |\n|---|---|---|---|\n| 단일 guard row | 전체 headroom 1개 | 같은 row 1개 | 한 줄 대기열 |\n| striped guard row | bucket별 headroom N개 | 보통 bucket 1개, 많아도 작은 상수 | 여러 줄 대기열 |\n\n예를 들어 총 capacity가 `12`이고 bucket이 `4`개라면, 가장 단순한 시작점은 이렇게 보는 것이다.\n\n| bucket_id | local budget | reserved_qty | 남은 자리 |\n|---|---:|---:|---:|\n| `0` | `3` | `2` | `1` |\n| `1` | `3` | `1` | `2` |\n| `2` | `3` | `3` | `0` |\n| `3` | `3` | `0` | `3` |\n\n핵심은 요청 하나가 \"전체 합이 아직 12 미만인가?\"를 매번 다시 보는 게 아니라,\n**자기 bucket의 남은 자리로만 먼저 판단**한다는 점이다.\n\n## 규칙 1. local bucket budget으로 승인한다\n\nstriping으로 옮겼는데 hot path에서 여전히 `SUM(reserved_qty)`를 다시 읽으면, queue를 나눠 놓고 다시 중앙 심판을 부르는 셈이다.\n\n초보자용 기본 규칙:\n\n- 각 bucket은 자기 `budget_qty`를 가진다\n- 승인 시에는 `reserved_qty + qty <= budget_qty`만 본다\n- global total 확인, bucket rebalance, refill은 낮은 빈도의 별도 경로로 둔다\n\n가장 단순한 형태:\n\n```sql\nUPDATE room_type_day_guard_bucket\nSET reserved_qty = reserved_qty + :qty\nWHERE room_type_id = :room_type_id\n  AND stay_day = :stay_day\n  AND bucket_id = :bucket_id\n  AND reserved_qty + :qty <= budget_qty;\n```\n\n이 규칙이 중요한 이유:\n\n- 승인 경로가 다시 전 bucket fan-in으로 돌아가지 않는다\n- \"왜 이 요청이 졌나?\"를 bucket-local headroom으로 설명할 수 있다\n- lock wait가 여러 bucket으로 분산될 여지가 생긴다\n\n초기 설계에서는 **균등 분배**가 가장 안전하다.\n\n- 총량 `12`, bucket `4`개면 `3/3/3/3`\n- 총량 `10`, bucket `4`개면 `3/3/2/2`\n\n처음부터 복잡한 동적 rebalance를 넣기보다,\n작은 stranded headroom을 감수하고 규칙을 단순하게 두는 편이 초보자에게 더 안전하다.\n\n## 규칙 2. bucket 선택은 stable해야 한다\n\nacquire는 bucket `2`에 적어 놓고, cancel 때 bucket `0`에서 빼면 바로 drift가 난다.\n그래서 striped guard row에서는 \"어디에서 뺐는지\"만큼 \"어디에 넣었는지\" 기억이 중요하다.\n\n초보자용 기본 규칙:\n\n- bucket 선택은 **불변 key**에서 계산한다\n- 시간, 스레드, 재시도 횟수 같은 변하는 값으로 고르지 않는다\n- 계산한 `bucket_id`를 detail row나 ledger에 같이 저장한다\n\n안전한 예:\n\n- `bucket_id = hash(reservation_id) % 16`\n- `bucket_id = hash(idempotency_key) % 16`\n- `bucket_id = hash(booking_id, stay_day) % 16`\n\n불안한 예:\n\n- 현재 서버 인스턴스 번호로 bucket 선택\n- retry attempt 수로 bucket 변경\n- \"비어 보이는 bucket\"을 매번 탐색해 즉석 선택\n\n기억할 기준은 단순하다.\n\n> 같은 claim을 다시 만났을 때, 아무 힌트 없이도 같은 bucket을 재현할 수 있거나 이미 저장된 bucket_id를 읽어 올 수 있어야 한다.\n\n### 어떤 key를 hash해야 하나\n\n보통은 **점유의 정체성**을 가장 잘 대표하는 key를 쓴다.\n\n| 상황 | beginner 기본값 |\n|---|---|\n| reservation hold / booking claim | `reservation_id` 또는 `booking_id` |\n| API 중복 방지 + claim 생성 | `idempotency_key` |\n| 숙박 inventory의 day claim | `booking_id + stay_day` |\n| 쿠폰/쿼터 claim | `user_id + campaign_id` 또는 생성된 `claim_id` |\n\n핵심은 \"누가 요청했는가\"보다 **무슨 점유를 기록하는가**에 더 가깝게 잡는 것이다.\n\n## 규칙 3. release bookkeeping은 원래 bucket에서 정확히 한 번\n\nstriping 전에는 \"guard row 1개에서 감소\"만 맞으면 됐다.\nstriping 후에는 \"어느 bucket에서 감소했는가\"와 \"이미 한 번 감소했는가\"가 추가된다.\n\n초보자용 기본 규칙:\n\n- acquire 때 `bucket_id`를 저장한다\n- release/cancel/expire는 저장된 `bucket_id`를 읽어 그 bucket만 감소한다\n- release 이벤트는 idempotent해야 한다\n- 같은 claim에 대한 중복 release를 막을 key나 상태 전이가 있어야 한다\n\n가장 단순한 bookkeeping 예:\n\n```text\nreservation_hold\n  - reservation_id\n  - room_type_id\n  - stay_day\n  - bucket_id\n  - qty\n  - state = HELD | CONFIRMED | RELEASED\n```\n\nrelease path는 보통 이렇게 생각하면 된다.\n\n1. `reservation_hold`를 읽는다\n2. 이미 `RELEASED`면 감소하지 않는다\n3. 저장된 `bucket_id` bucket만 감소한다\n4. hold 상태를 `RELEASED`로 바꾸거나 release ledger를 append한다\n\n이때 중요한 것은 **감소와 상태 기록을 같은 트랜잭션 안에 묶는 것**이다.\n\n### 왜 \"정확히 한 번\"이 중요한가\n\n아래 경로가 쉽게 겹친다.\n\n- 사용자 취소\n- 만료 worker\n- 결제 실패 rollback\n- 같은 요청의 retry\n\n이 경로들이 모두 \"남아 있으면 빼자\" 식으로 움직이면, 한 번 잡았던 용량을 두 번 반납하기 쉽다.\n그래서 striped guard row에서는 release SQL보다 **release ownership 기록**이 먼저다.\n\n## 초보자용 시작 규칙\n\n처음 striped guard row로 옮길 때는 아래처럼 단순하게 출발하는 편이 안전하다.\n\n1. bucket은 `8` 또는 `16`처럼 작은 고정 개수로 시작한다\n2. 요청 하나는 기본적으로 bucket `1개`만 만진다\n3. local budget은 정적으로 나눈다\n4. `bucket_id`를 detail row에 저장한다\n5. cancel/expire/retry는 같은 release 함수 하나를 타게 만든다\n\n특히 초반에는 \"spill bucket 2개까지 허용\", \"실시간 rebalance\", \"가장 여유 있는 bucket 탐색\" 같은 최적화를 늦추는 편이 낫다.\n이 기능들은 성능을 조금 늘릴 수 있지만 bookkeeping 난도도 같이 올린다.\n\n## 자주 하는 오해\n\n| 자주 하는 말 | 왜 위험한가 | 더 안전한 첫 대응 |\n|---|---|---|\n| \"bucket만 늘리면 throughput이 바로 오른다\" | 승인 경로가 여전히 global sum을 다시 보면 병목이 중앙에 남아 있다 | local budget 승인으로 먼저 단순화한다 |\n| \"release는 아무 bucket에서나 빼도 총합만 맞으면 된다\" | bucket별 headroom이 깨져 다음 승인 결과가 달라진다 | acquire bucket을 저장하고 그 bucket에서만 반납한다 |\n| \"retry 때 다른 bucket으로 다시 시도하면 더 잘 들어간다\" | 같은 claim이 여러 bucket에 흔적을 남기기 쉽다 | 같은 claim은 같은 bucket을 고정한다 |\n| \"cancel worker와 expire worker가 둘 다 빼도 결국 음수만 안 나면 된다\" | 이중 반납은 잠깐 안 보이다가 capacity drift로 번진다 | 상태 전이 또는 idempotency key로 정확히 한 번만 release한다 |\n\n## 작은 예시\n\n총 capacity `6`, bucket `2`개, 각 bucket budget `3`이라고 하자.\n\n- 예약 A: `reservation_id = 101` -> bucket `0`\n- 예약 B: `reservation_id = 102` -> bucket `1`\n- 예약 C: `reservation_id = 103` -> bucket `0`\n\n이때 bucket 상태는 이렇게 된다.\n\n| bucket_id | budget | reserved |\n|---|---:|---:|\n| `0` | `3` | `2` |\n| `1` | `3` | `1` |\n\n이후 예약 A가 취소되면:\n\n- `reservation_hold.bucket_id = 0`을 읽고\n- bucket `0`만 `reserved - 1`\n- hold 상태를 `RELEASED`\n\n하면 된다.\n\n여기서 잘못된 경로는 이렇다.\n\n- 취소 시점에 \"지금 더 비어 있는 bucket은 1번이네\"라고 판단\n- bucket `1`에서 `-1`\n\n그러면 총합은 우연히 맞더라도 bucket `0`은 실제보다 꽉 차 보이고 bucket `1`은 실제보다 여유 있어 보여, 다음 승인 결과가 왜곡된다.\n\n## 어디까지가 beginner 기본값인가\n\n아래까지는 beginner 기본값으로 가져가도 된다.\n\n- 작은 고정 bucket 수\n- 정적 local budget\n- stable hash bucket\n- acquire 시 bucket 저장\n- release idempotency\n\n아래부터는 다음 문서로 넘기는 편이 낫다.\n\n- bucket rebalance worker\n- 요청 하나가 여러 bucket을 만지는 spill 정책\n- stripe와 ledger projection의 복합 모델\n- multi-day old/new union lock ordering\n\n## 다음에 이어 볼 문서\n\n- \"언제 단일 guard row가 hotspot으로 뒤집히는가\"부터 보고 싶으면 → [Guard Row Hot-Row Symptoms Primer](./guard-row-hot-row-symptoms-primer.md)\n- striped guard row, counter shard, ledger를 더 넓게 비교하려면 → [Guard-Row Hot-Row Contention Mitigation](./hot-row-contention-counter-sharding.md)\n- shared inventory에서 day guard와 ledger를 함께 잡으려면 → [Shared-Pool Guard Design for Room-Type Inventory](./shared-pool-guard-design-room-type-inventory.md)\n- multi-day booking에서 canonical lock ordering까지 이어 가려면 → [Guard-Row Scope Design for Multi-Day Bookings](./guard-row-scope-design-multi-day-bookings.md)\n\n## 한 줄 정리\n\nstriped guard row의 beginner 핵심은 \"guard row를 여러 개 만든다\"가 아니다. `bucket-local budget`, `stable bucket_id`, `exactly-once release bookkeeping` 이 세 가지를 같이 고정해야 단일 guard row를 여러 줄 queue로 안전하게 바꿀 수 있다.\n",
+  "aliases": [
+    "striped guard row budgeting",
+    "bucket local budget",
+    "stable bucket selection",
+    "stable bucket id",
+    "release bookkeeping",
+    "guard row striping basics",
+    "local bucket budget",
+    "bucket allocation record",
+    "room type day bucket budget",
+    "striped guard release"
+  ],
+  "expected_queries": [
+    "striped guard row에서 total capacity가 아니라 bucket local budget으로 승인해야 하는 이유가 뭐야?",
+    "acquire와 release가 같은 bucket을 만지도록 stable bucket id를 어떻게 저장해야 해?",
+    "guard row striping을 했는데 매 요청마다 global SUM을 다시 읽으면 왜 hot path 병목이 돌아와?",
+    "cancel, expire, retry가 같은 reservation을 두 번 release하지 않게 bookkeeping을 어떻게 해야 해?",
+    "room_type_day inventory를 bucket별 budget으로 나눌 때 초보자가 지킬 규칙을 알려줘"
+  ],
+  "symptoms": [
+    "단일 guard row hot row를 여러 bucket으로 나눌 때 승인 기준을 global sum으로 다시 봐서 병목을 되살리고 있어",
+    "acquire와 release가 다른 bucket을 만져 reserved_qty drift가 생길 수 있어",
+    "cancel, expire, retry가 같은 점유를 두 번 반납하지 않게 bucket_id bookkeeping이 필요해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/guard-row-hot-row-symptoms-primer",
+      "database/hot-row-contention-counter-sharding"
+    ],
+    "next_docs": [
+      "database/striped-guard-row-rebalance",
+      "database/shared-pool-guard-design-room-type-inventory",
+      "database/guard-row-scope-design-multi-day-bookings"
+    ],
+    "confusable_with": [
+      "database/striped-guard-row-rebalance",
+      "database/shared-pool-guard-design-room-type-inventory",
+      "database/guard-row-hot-row-symptoms-primer",
+      "database/hot-row-contention-counter-sharding",
+      "database/guard-row-dashboard-starter-card"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/striped-guard-row-budgeting-primer.md",
+    "revision_history": []
+  }
+}

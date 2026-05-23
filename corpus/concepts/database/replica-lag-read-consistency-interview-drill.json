@@ -1,0 +1,45 @@
+{
+  "id": "database/replica-lag-read-consistency-interview-drill",
+  "title": "Replica Lag Read Consistency Interview Drill",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 drill은 replica lag와 read-your-writes 문제를 면접 답변으로 설명한다. primary fallback, session pinning, stale 허용 UX를 다룬다.",
+  "body_markdown": "# Replica Lag Read Consistency Interview Drill\n\n## 질문\n\n\"Read replica를 쓰는 시스템에서 사용자가 방금 쓴 데이터가 바로 보이지 않는다면 어떻게 설명하고 해결하나요?\"\n\n## Topic-specific invariant\n\nprimary/replica 구조의 불변식은 다음이다.\n\n> write가 primary에서 commit됐다는 사실과, 어떤 read replica가 그 write를 이미 적용했다는 사실은 다르다. read-your-writes가 필요한 경로는 replica freshness를 증명하거나 primary로 우회해야 한다.\n\n이 문제는 DB 격리 수준만으로 해결되지 않는다. transaction 안에서 primary에 쓴 직후 같은 connection으로 읽는 문제와, commit 후 다음 HTTP 요청이 load-balanced replica로 가는 문제는 다른 계층이다.\n\n## 기대 답변 축\n\n- write는 primary에 commit되지만 replica는 비동기로 따라오면 lag가 생긴다.\n- 사용자가 자신의 write를 바로 읽어야 하는 경로는 read-your-writes 보장이 필요하다.\n- 해결은 일정 시간 primary read, session pinning, version gate, replica lag threshold 기반 routing, UI pending state 등이 있다.\n- 모든 read를 primary로 보내면 일관성은 좋아지지만 scale-out 이점과 비용이 줄어든다.\n\n## 답변 chooser\n\n| 요구사항 | 우선 전략 | 장점 | 비용/주의 |\n|---|---|---|---|\n| 내 write 직후 상세/목록은 반드시 보여야 함 | recent-write window 동안 primary read | 단순하고 강함 | primary read 부하 증가 |\n| 사용자 세션 단위로만 최신성 필요 | session pinning | 구현이 비교적 쉽다 | sticky 기간 산정 필요 |\n| 모든 request가 stateless해야 함 | version/LSN token gate | replica가 특정 위치까지 따라왔는지 판단 가능 | token 저장/전달/대기 로직 필요 |\n| stale을 UX로 허용 가능 | pending state, optimistic UI | primary 부하를 줄인다 | 사용자에게 상태를 명확히 보여야 함 |\n| 관리자/정산/권한 경로 | primary only 또는 strong read | 안전하다 | scale-out 이점 감소 |\n| read 대부분은 stale 허용 | lag threshold routing | 장애/지연 replica 회피 | 관측 지표가 정확해야 함 |\n\n## 실무 지표와 증거\n\n| 증거 | 무엇을 가르나 |\n|---|---|\n| primary commit timestamp / replica apply timestamp | 실제 lag 크기 |\n| binlog/LSN position, replication slot lag | replica가 어느 위치까지 따라왔는지 |\n| read request routing log | stale read가 어느 replica에서 발생했는지 |\n| cache hit/miss log | cache stale인지 replica stale인지 분리 |\n| post-write read path trace | write 후 첫 read가 primary로 갔는지 replica로 갔는지 |\n| `Seconds_Behind_Source`, replay lag, apply queue | 엔진별 lag 관측 |\n| user/session recent-write marker | read-your-writes 정책이 적용됐는지 |\n\n면접에서 좋은 답은 \"lag가 원인입니다\"에서 멈추지 않는다. 어떤 read path가 stale source를 탔는지, stale 허용 SLO가 얼마인지, 정책이 적용됐는지까지 확인한다고 말해야 한다.\n\n## 흔한 오개념\n\n| 오개념 | 왜 위험한가 | 더 정확한 답 |\n|---|---|---|\n| primary에 commit됐으니 모든 replica에서도 바로 보인다 | async replication은 전파/apply 지연이 있다 | commit visibility와 replica visibility를 분리한다 |\n| `READ COMMITTED`면 read-after-write가 보장된다 | 다른 node로 라우팅되면 DB transaction isolation 밖의 문제다 | routing/session guarantee를 설계한다 |\n| 모든 read를 primary로 보내면 끝이다 | 부하와 장애 blast radius가 커진다 | 경로별 freshness requirement를 나눈다 |\n| cache만 지우면 해결된다 | cache miss 후 stale replica에서 다시 채울 수 있다 | cache와 replica stale source를 분리한다 |\n| lag metric 하나만 보면 된다 | 평균 lag는 tail이나 특정 replica 지연을 숨긴다 | per-replica, p95/p99, routing 로그를 본다 |\n\n## drill follow-up\n\n> Q: 주문 생성 직후 주문 목록에 방금 주문이 안 보입니다. 어떻게 말하겠습니까?\n\n좋은 답변:\n\n1. write는 primary에 성공했지만 목록 read가 lagging replica로 갔을 수 있다고 가정한다.\n2. trace에서 write commit 시각, read replica, replica apply position, cache hit 여부를 확인한다.\n3. 주문 생성 직후 일정 시간은 primary로 읽거나 session pinning/version token을 적용한다.\n4. stale을 허용하는 목록이면 pending state로 UX를 설계할 수 있지만 결제/권한/정산 경로는 더 강한 read를 쓴다.\n\n약한 답변:\n\n- \"replica를 쓰지 않으면 됩니다.\"\n- \"cache를 삭제하면 됩니다.\"\n- \"transaction isolation을 올리면 됩니다.\"\n\n## 약점 태그\n\n- `replica-lag-cause`: 비동기 복제와 lag 원인을 설명하지 못함\n- `primary-fallback-tradeoff`: fallback 비용을 말하지 않음\n- `cache-replica-confusion`: cache stale과 replica stale을 구분하지 못함\n- `session-guarantee-missing`: 사용자 세션의 read-your-writes 요구를 분리하지 못함\n- `lag-observability-missing`: LSN/lag/routing 증거 없이 추측으로 답함\n\n## 복습 연결\n\ntrade-off 비교는 `read-after-write-tradeoff-matrix-chooser`로 이어진다.\n",
+  "aliases": [
+    "replica lag interview drill",
+    "read your writes answer",
+    "복제 지연 면접 답변",
+    "쓰고 읽기 일관성 설명"
+  ],
+  "expected_queries": [
+    "replica lag를 면접에서 어떻게 설명해?",
+    "write 후 read가 stale할 때 어떻게 해결해?",
+    "read replica를 쓰면 어떤 consistency 문제가 생겨?"
+  ],
+  "symptoms": [
+    "저장 성공 후 목록에는 바로 안 보여요",
+    "primary에는 있는데 replica 조회 API에는 없어요",
+    "cache와 replica 중 어디가 stale인지 구분하지 못해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/replica-lag-read-after-write-strategies"
+    ],
+    "next_docs": [
+      "system-design/read-after-write-tradeoff-matrix-chooser"
+    ],
+    "confusable_with": [
+      "database/replica-lag-read-after-write-strategies",
+      "system-design/read-after-write-tradeoff-matrix-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/replica-lag-read-consistency-interview-drill.md",
+    "revision_history": []
+  }
+}

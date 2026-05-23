@@ -1,0 +1,59 @@
+{
+  "id": "spring/blackjack-web-state-mixing-cause-router",
+  "title": "blackjack 웹 전환 후 게임 상태 혼선 원인 라우터",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "'이 문서는 Woowa blackjack 미션을 웹 요청 모델로 옮길 때 게임 상태가",
+  "body_markdown": "# blackjack 웹 전환 후 게임 상태 혼선 원인 라우터\n\n## 한 줄 요약\n\n> blackjack을 콘솔에서 웹으로 옮긴 뒤 상태가 꼬이는 장면은 \"Spring이 상태를 잃어버렸다\"보다 `request`, `session`, `DB`, `gameId 소유권`, `DTO/domain`, `탭 동시성`, `브라우저 stale state`를 한 bucket에 넣었을 때 더 자주 생긴다.\n\n## 1차 분기\n\n| 10초 질문 | 그렇다면 | 먼저 볼 후보 |\n|---|---|---|\n| `@Controller`/`@Service` 필드에 `Game`, `Deck`, `Dealer`가 있나? | singleton mutable state 공유 | Bean scope, stateless service |\n| 새 요청마다 상태가 사라지나? | request state를 게임 상태로 착각 | request lifecycle, 저장소 부재 |\n| 같은 로그인/session에서 여러 요청 동안만 유지되나? | session state 후보 | session key, 만료, 탭 동시성 |\n| 새로고침/서버 재시작 후에도 이어야 하나? | DB state 후보 | `gameId`, owner, transaction |\n| `/hit` 요청에 `gameId`가 없나? | game id ownership 불명확 | URL/form/hidden input/session mapping |\n| 응답 DTO를 다시 domain처럼 보내나? | DTO/domain 경계 혼선 | command DTO, server-side domain reload |\n| 탭 두 개에서 서로 덮어쓰나? | same session concurrency | version, status check, idempotency |\n| 브라우저 화면만 예전 상태인가? | stale browser state | cache, back button, duplicate submit |\n\n## 원인 bucket\n\n1. **singleton Bean state**: `@Service`나 `@RestController`는 기본 singleton이다. `currentGame`, `deck`, `dealer`, `players` 같은 가변 필드를 두면 모든 요청이 같은 객체를 공유한다. 이 갈래는 [baseball 게임 진행 상태 보관 ↔ Spring singleton Bean 상태 경계 브릿지](./baseball-game-state-singleton-bean-scope-bridge.md)로 이어서 \"웹에서는 왜 Game 하나를 오래 쥐면 안 되는가\"를 먼저 본다.\n2. **request state**: 한 HTTP 요청 안에서 계산한 값은 다음 요청으로 자동 이동하지 않는다. `POST /games`에서 만든 객체 참조를 `POST /games/{id}/hit`에서 그대로 들고 있을 거라고 기대하면 새로고침이나 다음 action에서 상태가 사라진다.\n3. **session state**: session은 사용자별로 이어지는 상태를 담을 수 있지만, 같은 session의 탭 두 개가 동시에 요청할 수 있고 만료/로그아웃/서버 확장/직렬화 문제가 따른다. \"사용자별이면 session이면 끝\"이 아니다.\n4. **DB state**: 여러 요청, 재시작, 복수 서버, 검증 가능한 history가 필요하면 서버 쪽 저장소가 진실 원천이어야 한다. 이때 `gameId`와 owner를 함께 검증해야 다른 사용자의 게임을 조작하지 않는다.\n5. **game id ownership**: `gameId`가 URL, form, session mapping, DB row 중 어디에서 오고 누가 소유하는지 불명확하면 \"방금 만든 게임\"을 전역에서 찾거나 마지막 게임을 덮어쓴다.\n6. **DTO vs domain**: 화면 DTO나 form DTO는 현재 domain 객체가 아니다. 클라이언트가 보낸 점수, 카드 목록, 상태 문자열을 그대로 domain 상태로 믿으면 stale/위조/중복 submit에 취약하다.\n7. **concurrency between tabs**: 같은 session이라도 탭 A와 탭 B가 같은 game에 hit/stand를 동시에 보낼 수 있다. status transition, optimistic version, idempotent command 없이 마지막 요청이 이긴다.\n8. **stale browser state**: 뒤로가기, 새로고침, cache된 HTML, 중복 submit 때문에 서버 상태는 끝났는데 브라우저가 이전 action 버튼을 다시 보여줄 수 있다. 이 경우는 서버 저장소보다 response/cache/redirect 계약을 먼저 본다.\n\n## 관측 증거\n\n| evidence | 해석 | 다음 확인 |\n|---|---|---|\n| 다른 사용자에게 같은 카드/덱이 보임 | singleton mutable state 가능성 높음 | controller/service field, static field, shared fixture |\n| 다음 요청에서 `Game`이 null 또는 새 deck | request state 착각 | 요청별 객체 생성 위치, 저장소/write 유무 |\n| 같은 사용자 새 탭에서 이전 게임이 덮임 | session key가 단일 current game | session map 구조, `gameId`별 저장 여부 |\n| `POST /games/{id}/hit`가 owner 확인 없이 동작 | game id ownership 누락 | authenticated user/session owner check |\n| hidden input의 카드 목록을 서버가 믿음 | DTO를 domain source로 사용 | server-side reload, command DTO 최소화 |\n| hit 두 번 빠르게 누르면 카드가 2장/상태 충돌 | 탭/중복 submit 동시성 | game status guard, version, one-shot command |\n| 서버 DB는 정상인데 화면만 이전 상태 | stale browser state | redirect-after-post, cache header, back button behavior |\n| 서버 재시작 후 모든 게임 소실 | 메모리/session-only 저장 | persistence requirement, DB state 여부 |\n\n## 다음 확인\n\n1. controller/service/static field에 mutable game state가 있는지 찾는다. 있으면 먼저 제거하거나 stateless service로 바꿀 후보로 표시한다.\n2. 게임 상태를 `request`, `session`, `DB` 중 어디가 소유하는지 한 문장으로 쓴다. \"일단 서버 어딘가\"는 설계가 아니다.\n3. `POST /games` 응답이 어떤 `gameId`를 돌려주고, 이후 action이 그 id를 어떻게 전달하는지 확인한다.\n4. `gameId`가 현재 사용자/session의 것인지 서버에서 검증하는지 본다.\n5. command DTO에는 action과 식별자만 두고, 카드/점수/승패 같은 domain state는 서버 저장소에서 다시 읽는지 확인한다.\n6. 탭 두 개, 빠른 더블클릭, 뒤로가기 후 재전송을 수동으로 재현한다.\n7. 이미 종료된 게임에 `hit`가 들어오면 400/409/redirect 중 어떤 계약으로 막을지 정한다.\n8. HTML 응답이라면 redirect-after-post와 cache header를 확인하고, API 응답이라면 client state를 server response로 덮어쓰는지 본다.\n\n## wrong-bucket / 오선택\n\n| 오선택 | 왜 위험한가 | 더 먼저 볼 bucket |\n|---|---|---|\n| singleton service field를 \"사용자별 현재 게임\"으로 사용 | 모든 요청과 사용자가 같은 객체를 공유한다 | singleton Bean state |\n| request attribute에 게임을 넣고 다음 요청에서도 있길 기대 | request는 한 번 끝나면 사라진다 | request state |\n| session이면 탭 동시성도 자동 해결된다고 봄 | 같은 session의 탭은 동시에 같은 값을 바꿀 수 있다 | session state, tab concurrency |\n| `gameId`만 있으면 안전하다고 봄 | 소유자 검증 없이는 다른 게임 id를 조작할 수 있다 | game id ownership |\n| 화면 DTO의 카드/점수를 domain truth로 믿음 | stale/위조/중복 submit이 domain을 오염시킨다 | DTO vs domain |\n| stale 화면 문제를 DB 저장소 문제로만 봄 | 서버 상태는 맞고 브라우저 cache/back action만 낡았을 수 있다 | stale browser state |\n| DB에 저장하면 모든 상태 혼선이 사라진다고 봄 | owner, transition, version, duplicate command가 남는다 | DB state plus concurrency |\n\n## 검증 질문\n\n1. 현재 게임 상태의 진실 원천은 request, session, DB 중 어디인가?\n2. 이후 action은 어떤 `gameId`를 들고 오며, 서버는 그 id의 owner를 어떻게 확인하는가?\n3. controller/service에 요청 사이에 남는 mutable field가 있는가?\n4. 클라이언트가 보낸 DTO 중 domain truth로 믿는 값은 무엇이고, 서버에서 다시 읽어야 할 값은 무엇인가?\n5. 같은 session에서 탭 두 개가 동시에 hit/stand를 보내면 최종 상태가 deterministic한가?\n6. 뒤로가기/새로고침/중복 submit에서 이미 끝난 게임 action이 다시 들어오면 어떤 응답 계약으로 막는가?\n\n## 다음 학습\n\n- singleton Bean 필드가 왜 요청 간 오염을 만드는지 미션 맥락으로 다시 보려면 [baseball 게임 진행 상태 보관 ↔ Spring singleton Bean 상태 경계 브릿지](./baseball-game-state-singleton-bean-scope-bridge.md)를 본다.\n- Bean 수명과 scope 큰 그림을 먼저 다시 잡으려면 [Spring Bean 생명주기 기초](./spring-bean-lifecycle-basics.md)로 간다.\n- request scope를 써도 되는 장면과 proxy 함정을 분리하려면 [Spring Request Scope Proxy Pitfalls](./spring-request-scope-proxy-pitfalls.md)를 잇는다.\n- 요청이 끊길 때 객체 수명도 함께 끊긴다는 점을 다시 확인하려면 [Spring MVC 요청 생명주기 기초](./spring-mvc-request-lifecycle-basics.md)를 읽는다.\n",
+  "aliases": [
+    "blackjack 웹 상태 혼선",
+    "블랙잭 게임 상태 섞임",
+    "블랙잭 singleton 서비스 상태",
+    "blackjack controller 필드 game",
+    "블랙잭 웹 상태 저장 위치",
+    "@Controller",
+    "@RestController",
+    "@Service"
+  ],
+  "expected_queries": [
+    "블랙잭 콘솔 코드를 스프링으로 옮겼더니 게임 진행 상태가 왜 사용자끼리 섞여?",
+    "현재 게임을 service 멤버 변수로 들고 있으면 뭐가 문제야?",
+    "블랙잭 웹 버전에서 요청이 바뀔 때마다 덱이 초기화되거나 남아 있는 이유를 어디서 봐야 해?",
+    "controller 필드에 Game을 넣었는데 탭 두 개에서 테스트하면 꼬이는 이유가 뭐야?",
+    "request scope, session, DB 중 어디에 블랙잭 게임 상태를 둬야 할지 헷갈릴 때 먼저 뭘 구분해?"
+  ],
+  "symptoms": [
+    "blackjack을 웹으로 옮겼더니 다른 요청의 카드 상태가 같이 보여요",
+    "새 게임을 시작했는데 이전 라운드 점수나 덱이 남아 있어요",
+    "controller나 service 필드에 Game을 넣었더니 탭을 두 개 열면 진행이 헷갈려요",
+    "요청마다 게임 상태가 사라지거나 반대로 사용자끼리 섞여요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-lifecycle-basics",
+      "spring/spring-mvc-request-lifecycle-basics"
+    ],
+    "next_docs": [
+      "spring/baseball-game-state-singleton-bean-scope-bridge",
+      "spring/bean-lifecycle-basics",
+      "spring/request-scope-proxy-pitfalls",
+      "spring/spring-mvc-request-lifecycle-basics"
+    ],
+    "confusable_with": [
+      "spring/baseball-game-state-singleton-bean-scope-bridge",
+      "spring/request-scope-proxy-pitfalls",
+      "spring/bean-lifecycle-basics",
+      "design-pattern/blackjack-round-reset-factory-boundary-bridge",
+      "spring/blackjack-game-state-singleton-bean-scope-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/blackjack-web-state-mixing-cause-router.md",
+    "revision_history": []
+  }
+}

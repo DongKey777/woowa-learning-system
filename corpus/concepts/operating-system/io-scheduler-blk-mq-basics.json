@@ -1,0 +1,47 @@
+{
+  "id": "operating-system/io-scheduler-blk-mq-basics",
+  "title": "IO Scheduler blk-mq Basics",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 modern Linux storage path가 단순 FIFO가 아니라 blk-mq multi-queue block layer와",
+  "body_markdown": "# I/O Scheduler, blk-mq Basics\n\n> 한 줄 요약: modern Linux storage는 단순한 FIFO가 아니라 blk-mq와 I/O scheduler의 조합으로 동작하며, 장치 큐와 요청 특성이 성능을 좌우한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n> - [Page Cache Thrash vs Direct I/O](./page-cache-thrash-vs-direct-io.md)\n> - [blk-mq, cgroup IO, Writeback Timeline Debugging](./blk-mq-cgroup-io-writeback-timeline-debugging.md)\n> - [OOM Killer, cgroup Memory Pressure](./oom-killer-cgroup-memory-pressure.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n\n> retrieval-anchor-keywords: blk-mq, mq-deadline, BFQ, none, io scheduler, request queue, hardware queue, queue depth, latency class, I/O completion\n\n## 핵심 개념\n\nLinux block layer는 요청을 디스크로 보내기 전에 여러 큐와 스케줄링 계층을 거친다. modern storage에서는 `blk-mq`가 중심이고, 그 위에서 I/O scheduler가 요청을 정렬하거나 공정성을 조정한다.\n\n- `blk-mq`: 멀티 큐 block layer다\n- `hardware queue`: 실제 장치에 붙는 큐다\n- `software queue`: 커널 내부에서 요청을 정리하는 큐다\n- `mq-deadline`: deadline 기반 정렬 스케줄러다\n- `BFQ`: 공정성에 더 중점을 둔 스케줄러다\n\n왜 중요한가:\n\n- 같은 디스크라도 큐잉 정책에 따라 지연이 크게 달라질 수 있다\n- 순차 대량 I/O와 짧은 랜덤 I/O는 같은 장치에서도 서로 다르게 취급되어야 한다\n- page cache, writeback, reclaim과 결합하면 latency 폭주가 생긴다\n- 보이는 scheduler 목록은 커널, 장치 드라이버, 가상화 계층에 따라 달라진다\n\n이 문서는 [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)와 [Page Cache Thrash vs Direct I/O](./page-cache-thrash-vs-direct-io.md)를 저장장치 스케줄링 관점으로 잇는다.\n\n## 깊이 들어가기\n\n### 1. blk-mq는 큐를 단순화하는 것이 아니라 분산한다\n\n장치가 하나의 줄에 모두 서는 대신, 여러 hardware queue로 분산해 병렬성을 높인다.\n\n- 큐 분산은 처리량에 유리하다\n- 하지만 잘못 섞이면 작은 요청이 큰 요청에 밀릴 수 있다\n- 장치 특성과 workload가 맞아야 한다\n\n### 2. scheduler는 공정성과 순서를 조정한다\n\n대체로 다음 질문에 답한다.\n\n- 어떤 요청을 먼저 보낼까\n- 어떤 요청을 잠시 미룰까\n- latency-sensitive 요청을 보호할까\n\n이 때문에 scheduler는 throughput만이 아니라 latency와 fairness를 같이 본다.\n\n### 3. queue depth는 숫자 하나로 끝나지 않는다\n\nqueue depth가 높으면 디바이스를 잘 채울 수 있지만, 지나치면 기다림이 길어진다.\n\n- 낮으면 장치를 충분히 활용하지 못한다\n- 높으면 queueing delay가 쌓인다\n- direct reclaim과 writeback이 섞이면 더 복잡해진다\n\n### 4. \"디스크가 느리다\"는 말은 불충분하다\n\n실제 병목은 다음 중 하나일 수 있다.\n\n- scheduler가 작은 요청을 보호하지 못함\n- hardware queue가 포화됨\n- writeback burst가 몰림\n- reclaim과 겹침\n\n### 5. scheduler 선택은 장치/계층 caveat를 가진다\n\n`mq-deadline`, `BFQ`, `kyber`, `none` 같은 선택지는 모든 장치에서 같은 의미로 보이지 않는다.\n\n- NVMe나 cloud block device는 장치/하이퍼바이저 내부 큐잉이 이미 크다\n- `none`은 \"스케줄링이 전혀 없다\"보다 kernel 쪽 재정렬을 최소화한다는 뜻에 가깝다\n- filesystem, page cache, dirty writeback이 앞단에서 이미 요청 모양을 바꿀 수 있다\n- cgroup I/O controller를 쓰면 per-cgroup weight/throttle과 block scheduler를 같이 봐야 한다\n\n## 실전 시나리오\n\n### 시나리오 1: I/O는 적어 보이는데 p99가 튄다\n\n가능한 원인:\n\n- 작은 요청이 queue depth 뒤에 밀린다\n- scheduler가 순서를 잘못 잡는다\n- hardware queue가 burst로 포화된다\n\n진단:\n\n```bash\niostat -x 1\ncat /proc/diskstats\ncat /sys/block/<dev>/queue/scheduler\n```\n\n### 시나리오 2: 순차 배치가 OLTP를 망친다\n\n가능한 원인:\n\n- 대량 sequential read/write가 queue를 점유한다\n- 공정성보다 throughput에 치우친 설정이다\n- page cache writeback이 같이 몰린다\n\n### 시나리오 3: 디바이스 교체 후에 성능이 오히려 흔들린다\n\n가능한 원인:\n\n- 새 장치의 queue depth와 scheduler가 워크로드와 안 맞는다\n- blk-mq 분산 전략이 이전 장치와 다르다\n- I/O class 구분이 없다\n\n이때는 [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)로 io pressure도 같이 본다.\n\n## 코드로 보기\n\n### 현재 scheduler 확인\n\n```bash\ncat /sys/block/<dev>/queue/scheduler\n```\n\n### device 큐 감각 보기\n\n```bash\ncat /sys/block/<dev>/queue/nr_requests\ncat /sys/block/<dev>/queue/read_ahead_kb\n```\n\n### disk stats 확인\n\n```bash\ncat /proc/diskstats | grep <dev>\n```\n\n### scheduler 경로의 단순화\n\n```text\napp IO request\n  -> block layer\n  -> blk-mq software queue\n  -> scheduler decision\n  -> hardware queue\n  -> device\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| mq-deadline | latency를 잘 다룬다 | 복잡한 mixed workload에서 한계 | 일반 SSD |\n| BFQ | 공정성이 좋다 | throughput이 손해일 수 있다 | interactivity 중요 |\n| none | kernel scheduler 오버헤드가 적다 | fairness/latency 보호를 장치/상위 계층에 더 맡긴다 | 자체 큐잉이 강한 장치 |\n| queue depth 증가 | 장치 활용이 좋아진다 | wait time이 늘 수 있다 | throughput 우선 |\n\n## 꼬리질문\n\n> Q: blk-mq가 왜 필요한가요?\n> 핵심: 현대 장치는 병렬 큐를 활용해 높은 처리량을 내기 때문이다.\n\n> Q: I/O scheduler는 무엇을 결정하나요?\n> 핵심: 요청 순서, 공정성, 지연 보호를 조정한다.\n\n> Q: queue depth를 키우면 항상 좋은가요?\n> 핵심: 아니다. 장치 활용과 지연 사이의 균형이 필요하다.\n\n## 한 줄 정리\n\nblk-mq와 I/O scheduler는 storage 요청의 순서와 병렬성을 조정하므로, 디스크 성능은 장치 자체보다 큐잉 정책과 workload 적합성에 크게 좌우된다.\n",
+  "aliases": [
+    "IO scheduler blk-mq",
+    "Linux block multi queue",
+    "storage request queue",
+    "mq-deadline none kyber",
+    "block layer basics",
+    "device queue depth"
+  ],
+  "expected_queries": [
+    "Linux blk-mq와 I/O scheduler는 storage request를 어떻게 처리해?",
+    "modern Linux storage가 단순 FIFO가 아니라는 말은 무슨 뜻이야?",
+    "device queue depth와 request characteristic이 latency에 어떤 영향을 줘?",
+    "page cache dirty writeback과 block layer queue를 함께 봐야 하는 이유는?"
+  ],
+  "symptoms": [
+    "`IO Scheduler blk-mq Basics`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`IO Scheduler blk-mq Basics`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`IO Scheduler blk-mq Basics`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "storage latency를 disk busy 하나로만 보고 blk-mq software queue, hardware queue depth, I/O scheduler policy를 나눠 보지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/cfs-scheduler-nice-cpu-fairness",
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/scheduler-classes-nice-rt-tradeoffs"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/io-scheduler-blk-mq-basics.md",
+    "revision_history": []
+  }
+}

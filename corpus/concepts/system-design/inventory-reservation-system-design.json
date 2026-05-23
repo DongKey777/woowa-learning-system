@@ -1,0 +1,52 @@
+{
+  "id": "system-design/inventory-reservation-system-design",
+  "title": "Inventory Reservation System 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Inventory Reservation System 설계를 다루는 deep_dive 문서다. 재고를 즉시 차감하지 않고 예약 상태로 관리해 oversell을 막고, 결제와 재고 해제를 함께 조율하는 설계다. 검색 질의가 inventory reservation, stock hold, oversell prevention, reservation TTL처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Inventory Reservation System 설계\n\n> 한 줄 요약: 재고를 즉시 차감하지 않고 예약 상태로 관리해 oversell을 막고, 결제와 재고 해제를 함께 조율하는 설계다.\n\nretrieval-anchor-keywords: inventory reservation, stock hold, oversell prevention, reservation TTL, flash sale, atomic decrement, release reservation, compensation, saga, hot sku\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n> - [Distributed Lock 설계](./distributed-lock-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n\n## 핵심 개념\n\n재고 시스템은 \"수량을 빼는 DB 업데이트\"가 아니다.  \n실제 요구는 아래를 함께 만족하는 것이다.\n\n- oversell 방지\n- 예약 TTL 관리\n- 결제 실패 시 release\n- 주문 취소 시 restock\n- 핫 SKU 폭주 대응\n- 여러 창고/리전 동시 반영\n\n핵심은 `available`, `reserved`, `sold` 상태를 분리하는 것이다.\n\n## 깊이 들어가기\n\n### 1. 상태 모델부터 고정한다\n\n가장 단순한 모델은 다음과 같다.\n\n```text\nAVAILABLE -> RESERVED -> SOLD\n                 \\-> EXPIRED\n                 \\-> RELEASED\n```\n\n이 상태가 있어야 예약과 결제, 취소의 의미가 분리된다.\n\n### 2. Capacity Estimation\n\nflash sale은 재고 시스템의 진짜 스트레스 테스트다.\n\n예:\n\n- 인기 상품 1개\n- 재고 1,000개\n- 동시 시도 50,000 req/min\n- 그중 2,000 req/sec가 reservation API로 몰림\n\n이때 필요한 것은 단순한 DB 용량이 아니라, hot SKU를 어떻게 직렬화하거나 분산할지다.\n\n### 3. 예약 전략\n\n대표적인 방법은 다음과 같다.\n\n| 방식 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| DB row lock | 정합성이 강하다 | 경합이 심해진다 | 소규모, 단일 지역 |\n| Optimistic CAS | 처리량이 좋다 | 충돌 재시도가 필요하다 | 일반적인 재고 차감 |\n| Distributed lock | 여러 인스턴스에 적용 가능 | 락 운영이 복잡하다 | 단일 SKU 직렬화 |\n| Reservation table | 예약과 판매를 분리한다 | 데이터 모델이 늘어난다 | 실서비스 기본형 |\n| Queue per SKU | oversell 방지에 강하다 | 대기시간이 늘 수 있다 | flash sale, 초고경합 |\n\n실무에서는 단일 `stock` row를 계속 깎기보다, 예약 테이블과 TTL을 두는 쪽이 운영에 유리하다.\n\n### 4. TTL과 만료 처리\n\n예약은 시간이 지나면 자동 해제돼야 한다.\n\n- reservation created_at + TTL\n- 만료 sweeper job\n- delayed queue 기반 release\n- checkout 중이면 grace period 부여\n\nTTL 해제가 없으면 장바구니 이탈만으로 재고가 영구히 묶인다.\n\n### 5. 결제와의 조율\n\n재고 예약과 결제는 같은 트랜잭션이 아닐 수 있다.  \n그래서 Saga 스타일이 적합하다.\n\n흐름 예시:\n\n1. 예약 생성\n2. 결제 승인\n3. 예약 확정\n4. 실패 시 예약 해제 또는 결제 취소\n\n이 부분은 [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)와 바로 연결된다.\n\n### 6. 핫 SKU와 분산\n\n인기 상품 하나가 전체 시스템을 망가뜨릴 수 있다.\n\n대응책:\n\n- SKU 단위 partition\n- warehouse 단위 분리\n- reservation queue 직렬화\n- rate limit\n- waitlist 또는 virtual queue\n\n이 관점은 [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)와 닮아 있다.\n\n### 7. 복구와 재조정\n\n실패는 흔하다.\n\n- 결제는 성공했는데 재고 확정이 안 됨\n- 예약은 됐는데 사용자가 결제를 안 함\n- 창고 재고와 서비스 재고가 어긋남\n\n그래서 다음이 필요하다.\n\n- reservation ledger\n- release/reconcile job\n- idempotency key\n- inventory audit batch\n\n## 실전 시나리오\n\n### 시나리오 1: flash sale\n\n문제:\n\n- 한 상품에 트래픽이 집중된다\n- oversell이 나면 환불과 CS 비용이 커진다\n\n해결:\n\n- SKU 단위로 예약 직렬화\n- TTL 짧게 설정\n- 대기열이나 rate limit으로 폭주를 완화\n\n### 시나리오 2: 결제 timeout\n\n문제:\n\n- 결제는 성공했는데 재고 확정 응답이 늦다\n\n해결:\n\n- 결제와 재고 확정을 분리한다\n- reservation state를 재조회한다\n- idempotent release/confirm API를 제공한다\n\n### 시나리오 3: 주문 취소\n\n문제:\n\n- 결제 후 즉시 취소가 들어온다\n\n해결:\n\n- sold item을 release하지 말고 restock 이벤트로 반영한다\n- 원장과 재고를 함께 대사한다\n\n## 코드로 보기\n\n```pseudo\nfunction reserve(sku, qty, requestId):\n  if existsReservation(requestId):\n    return existingResult\n  begin transaction\n    stock = getStockForUpdate(sku)\n    if stock.available < qty:\n      rollback\n      return SOLD_OUT\n    stock.available -= qty\n    stock.reserved += qty\n    createReservation(requestId, sku, qty, expireAt)\n  commit\n```\n\n```java\npublic void releaseExpiredReservation(Reservation r) {\n    if (r.isExpired()) {\n        inventoryRepository.release(r.sku(), r.quantity());\n    }\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 단순 원자 차감 | 단순하다 | oversell과 복구가 어렵다 | 매우 작은 시스템 |\n| Reservation table | 의미가 분명하다 | 상태 관리가 늘어난다 | 대부분의 커머스 |\n| SKU 직렬화 큐 | 경합을 줄인다 | 지연이 생긴다 | flash sale |\n| Distributed lock | 여러 노드에 적용 가능 | 운영이 복잡하다 | 고경합 hot SKU |\n| 강한 실시간 일관성 | 안전하다 | 확장이 어렵다 | 제한된 지역/소규모 |\n\n핵심은 \"재고를 얼마나 빨리 줄일 수 있나\"보다 **oversell을 어떤 비용으로 막을 것인가**다.\n\n## 꼬리질문\n\n> Q: 왜 단순히 `stock -= 1`로 끝내면 안 되나요?\n> 의도: 경합과 복구 문제 이해 확인\n> 핵심: 동시성, 결제 실패, 예약 만료를 함께 다루지 못한다.\n\n> Q: 예약 TTL이 왜 필요한가요?\n> 의도: 장바구니 이탈과 재고 묶임 문제 이해 확인\n> 핵심: 사용자가 결제를 완료하지 않으면 재고를 자동으로 풀어야 한다.\n\n> Q: oversell을 완전히 0으로 만들 수 있나요?\n> 의도: 강한 일관성과 운영 현실 이해 확인\n> 핵심: 특정 전략으로 거의 막을 수는 있지만, 분산과 복구 비용을 같이 봐야 한다.\n\n> Q: flash sale에서 가장 먼저 보는 지표는 무엇인가요?\n> 의도: 용량과 운영 감각 확인\n> 핵심: p95 reservation latency, sold-out rate, backlog, retry rate를 본다.\n\n## 한 줄 정리\n\nInventory reservation은 주문과 결제 사이에서 재고의 의미를 분리해 oversell을 막고, TTL과 보상으로 상태를 회복하는 설계다.\n\n",
+  "aliases": [
+    "inventory reservation",
+    "stock hold",
+    "oversell prevention",
+    "reservation TTL",
+    "flash sale",
+    "atomic decrement",
+    "release reservation",
+    "compensation",
+    "saga",
+    "hot sku",
+    "Inventory Reservation System 설계",
+    "inventory reservation system design"
+  ],
+  "expected_queries": [
+    "Inventory Reservation System 설계 설계 핵심을 설명해줘",
+    "inventory reservation가 왜 필요한지 알려줘",
+    "Inventory Reservation System 설계 실무 트레이드오프는 뭐야?",
+    "inventory reservation 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Inventory Reservation System 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Inventory Reservation System 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Inventory Reservation System 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/inventory-reservation-system-design.md",
+    "revision_history": []
+  }
+}

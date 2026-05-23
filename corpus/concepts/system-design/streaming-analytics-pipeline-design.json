@@ -1,0 +1,52 @@
+{
+  "id": "system-design/streaming-analytics-pipeline-design",
+  "title": "Streaming Analytics Pipeline 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Streaming Analytics Pipeline 설계를 다루는 deep_dive 문서다. streaming analytics pipeline은 이벤트를 실시간으로 흡수해 윈도우 집계, 세션화, 이상 탐지, 근사 통계를 만드는 데이터 처리 시스템이다. 검색 질의가 streaming analytics, event time, watermark, window aggregation처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Streaming Analytics Pipeline 설계\n\n> 한 줄 요약: streaming analytics pipeline은 이벤트를 실시간으로 흡수해 윈도우 집계, 세션화, 이상 탐지, 근사 통계를 만드는 데이터 처리 시스템이다.\n\nretrieval-anchor-keywords: streaming analytics, event time, watermark, window aggregation, sessionization, approximate count, heavy hitters, count min sketch, hyperloglog, stream processor, state store, checkpoint recovery, analytics late data reconciliation\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)\n> - [Top-k Streaming and Heavy Hitters](../algorithm/top-k-streaming-heavy-hitters.md)\n> - [Count-Min Sketch](../data-structure/count-min-sketch.md)\n> - [HyperLogLog](../data-structure/hyperloglog.md)\n> - [Event Bus Control Plane 설계](./event-bus-control-plane-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Stateful Stream Processor State Store / Checkpoint Recovery 설계](./stateful-stream-processor-state-store-checkpoint-recovery-design.md)\n> - [Analytics Late Data Reconciliation 설계](./analytics-late-data-reconciliation-design.md)\n\n## 핵심 개념\n\nStreaming analytics는 로그를 저장하는 것이 아니라,  \n흐르는 이벤트에서 바로 의미를 추출하는 시스템이다.\n\n- 실시간 지표 계산\n- 윈도우 기반 집계\n- 세션화\n- 근사 통계\n- 이상치 탐지\n- 대시보드/알림 데이터 생성\n\n즉, streaming analytics는 분석용 data plane이다.\n\n## 깊이 들어가기\n\n### 1. event time과 processing time\n\n스트림은 늦게 도착한다.\n\n- event time: 사건이 실제로 일어난 시각\n- processing time: 시스템이 받은 시각\n\n이 둘을 구분하지 않으면 집계가 흔들린다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 100만 이벤트\n- 이벤트당 200 bytes\n- 5분 tumbling window\n\n이 경우 처리량뿐 아니라 late arrival와 backpressure가 핵심이다.\n\n봐야 할 숫자:\n\n- ingest QPS\n- watermark lag\n- window latency\n- late event ratio\n- checkpoint duration\n\n### 3. 파이프라인\n\n```text\nEvent Source\n  -> Ingest\n  -> Parse / Normalize\n  -> Key By\n  -> Window / Session\n  -> Aggregate\n  -> Sink\n```\n\n### 4. 윈도우와 세션\n\n일반적인 윈도우:\n\n- tumbling window\n- sliding window\n- session window\n\n세션화는 사용자 행동 분석에서 중요하다.\n\n### 5. 근사 통계\n\n정확한 집계를 항상 할 필요는 없다.\n\n- Count-Min Sketch: 빈도 근사\n- HyperLogLog: distinct count\n- Heavy hitter: 상위 항목 추적\n\n이 부분은 [Count-Min Sketch](../data-structure/count-min-sketch.md), [HyperLogLog](../data-structure/hyperloglog.md), [Top-k Streaming and Heavy Hitters](../algorithm/top-k-streaming-heavy-hitters.md)와 연결된다.\n\n### 6. exactly-once와 checkpoints\n\n스트림 처리에서 중복은 흔하다.\n\n- at-least-once + idempotent sink\n- checkpoints\n- replay\n- offset management\n\n완전한 exactly-once는 비용이 크다.  \n실무에서는 재처리 가능성과 idempotency를 같이 설계한다.\n특히 window, join, dedup이 많은 job은 checkpoint 비용과 restore 시간을 별도 state store 관점에서 봐야 한다.\n\n### 7. sinks and serving\n\n스트림 결과는 보통 여러 곳으로 간다.\n\n- real-time dashboard\n- alerting\n- OLAP warehouse\n- feature store\n\n## 실전 시나리오\n\n### 시나리오 1: 실시간 전환율 대시보드\n\n문제:\n\n- 1분 단위 전환율이 필요하다\n\n해결:\n\n- window aggregation\n- late event correction\n\n### 시나리오 2: 인기 상품/검색어 탐지\n\n문제:\n\n- 상위 항목이 빨리 바뀐다\n\n해결:\n\n- heavy hitter 추적\n- approximate frequency\n\n### 시나리오 3: session 기반 분석\n\n문제:\n\n- 사용자 행동 세션을 끊어야 한다\n\n해결:\n\n- inactivity gap sessionization\n- watermark and late event handling\n\n## 코드로 보기\n\n```pseudo\nfunction process(event):\n  key = extractKey(event)\n  state = stateStore.load(key)\n  window = assignWindow(event.time)\n  aggregate = update(state, event, window)\n  sink.write(aggregate)\n```\n\n```java\npublic void onEvent(StreamEvent event) {\n    analyticsEngine.process(event);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Batch analytics | 단순하다 | 지연이 크다 | 오프라인 리포트 |\n| Streaming analytics | 반응이 빠르다 | 운영이 복잡하다 | 실시간 대시보드 |\n| Exact counting | 정확하다 | 비용이 높다 | 재무/정산 |\n| Sketch-based analytics | 메모리 효율적이다 | 근사다 | 고QPS telemetry |\n| Stateful processing | 표현력이 높다 | state 관리가 어렵다 | 세션/전환 분석 |\n\n핵심은 streaming analytics가 로그 저장소가 아니라 **이벤트에서 실시간 의미를 계산하는 처리 파이프라인**이라는 점이다.\n\n## 꼬리질문\n\n> Q: event time과 processing time을 왜 구분하나요?\n> 의도: late event와 window 정확성 이해 확인\n> 핵심: 도착 지연이 있더라도 실제 사건 시간 기준 집계가 필요하기 때문이다.\n\n> Q: checkpoint는 왜 필요한가요?\n> 의도: 재처리와 장애 복구 이해 확인\n> 핵심: 스트림 장애 후 이어서 처리하기 위해서다.\n\n> Q: 왜 sketch를 쓰나요?\n> 의도: 근사 통계의 실무적 가치를 이해하는지 확인\n> 핵심: 정확도보다 메모리/처리량이 중요할 때가 많다.\n\n> Q: streaming analytics와 metrics pipeline의 차이는?\n> 의도: 분석과 관측성의 차이 이해 확인\n> 핵심: metrics는 운영 지표, analytics는 비즈니스/행동 분석이다.\n\n## 한 줄 정리\n\nStreaming analytics pipeline은 실시간 이벤트에서 윈도우 집계와 근사 통계를 계산해 대시보드, 알림, 분석 싱크로 흘려보내는 시스템이다.\n",
+  "aliases": [
+    "streaming analytics",
+    "event time",
+    "watermark",
+    "window aggregation",
+    "sessionization",
+    "approximate count",
+    "heavy hitters",
+    "count min sketch",
+    "hyperloglog",
+    "stream processor",
+    "state store",
+    "checkpoint recovery"
+  ],
+  "expected_queries": [
+    "Streaming Analytics Pipeline 설계 설계 핵심을 설명해줘",
+    "streaming analytics가 왜 필요한지 알려줘",
+    "Streaming Analytics Pipeline 설계 실무 트레이드오프는 뭐야?",
+    "streaming analytics 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Streaming Analytics Pipeline 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Streaming Analytics Pipeline 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Streaming Analytics Pipeline 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/streaming-analytics-pipeline-design.md",
+    "revision_history": []
+  }
+}

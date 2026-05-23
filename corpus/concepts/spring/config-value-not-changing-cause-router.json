@@ -1,0 +1,56 @@
+{
+  "id": "spring/config-value-not-changing-cause-router",
+  "title": "설정값이 안 바뀌어요 원인 라우터",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "'이 문서는 학습자가 Spring에서 \"설정값이 안 바뀌어요\", \"application.yml을",
+  "body_markdown": "# 설정값이 안 바뀌어요 원인 라우터\n\n## 한 줄 요약\n\n> 설정값이 안 바뀐다는 말은 하나의 원인이 아니다. 먼저 \"어떤 source가 이겼는가\", \"프로세스가 새 값을 다시 읽을 기회가 있었는가\", \"바인딩 대상이 그 값을 다시 반영하는 구조인가\"를 분리해야 한다.\n\n## 먼저 볼 증거\n\n| 관찰 증거 | 더 가까운 원인 버킷 | 첫 확인 |\n|---|---|---|\n| `application.yml`을 고쳤지만 실행값은 env var나 실행 인자 값이다 | property source precedence | 같은 key를 command-line, env var, `SPRING_APPLICATION_JSON`, test property가 덮는지 본다 |\n| 파일이나 ConfigMap은 바뀌었지만 실행 중인 앱 PID가 그대로다 | refresh/restart boundary | Spring Boot 기본 동작인지, Spring Cloud refresh/restart/redeploy가 있는지 확인한다 |\n| `@Value` 값 하나는 바뀌는데 설정 묶음 객체는 다르거나 반대다 | `@Value` vs `@ConfigurationProperties` binding | placeholder 이름, prefix, relaxed binding, 생성자 binding, validation 실패를 나눈다 |\n| 로컬은 맞는데 테스트에서만 다르다 | profile/test override | `@ActiveProfiles`, `@TestPropertySource`, `@SpringBootTest(properties)`, `@DynamicPropertySource` 우선순위를 본다 |\n| Kubernetes ConfigMap/Secret은 수정했는데 Pod 값은 예전이다 | container/K8s rollout | env var 주입인지 volume mount인지, Pod 재시작/rollout이 있었는지 확인한다 |\n| 설정을 바꿨는데 이미 만든 client, cache, static 값만 그대로다 | cache/static final misconception | 설정 읽기 지점과 객체 생성 시점을 찾는다 |\n\n## 원인 버킷\n\n1. **env/property source precedence 문제다.** Spring은 같은 key가 여러 source에 있으면 더 높은 source를 사용한다. 그래서 `application.yml` 수정이 실패한 게 아니라 env var, command-line option, test property, `SPRING_APPLICATION_JSON`, external config가 이미 이겼을 수 있다. 이때는 [Spring Property Source 우선순위 빠른 판별](./spring-property-source-precedence-quick-guide.md)에서 \"최종값\"과 \"그 값을 제공한 source\"를 같이 본다.\n2. **refresh/restart 경계를 착각했다.** 대부분의 Boot 앱은 시작할 때 config를 읽고 Bean을 만든다. 실행 중에 파일을 고쳐도 이미 생성된 singleton, `DataSource`, `RestClient`, scheduler 설정은 자동으로 다시 만들어지지 않는다. `@RefreshScope`나 config reload 장치가 없는 환경이라면 restart/redeploy가 검증 단계다.\n3. **`@Value`와 `@ConfigurationProperties`의 binding 경계가 다르다.** `@Value(\"${app.payment.base-url}\")`는 placeholder key를 직접 본다. `@ConfigurationProperties(prefix = \"app.payment\")`는 prefix 아래 필드를 type-safe하게 bind하고 relaxed binding, nested object, list/map, validation까지 관여한다. 설정 묶음이 커졌는데 `@Value`가 여러 곳에 흩어졌다면 원인 추적도 흩어진다. 선택 기준은 [Spring `@Value` vs `@ConfigurationProperties` Env Guide](./spring-value-vs-configurationproperties-env-guide.md)로 넘긴다.\n4. **profile 선택과 test override를 섞었다.** `application-test.yml`은 `test` profile이 active일 때 후보가 된다. 반면 `@TestPropertySource`, `@SpringBootTest(properties = ...)`, `@DynamicPropertySource`는 profile 파일보다 더 직접적으로 값을 덮을 수 있다. \"`@ActiveProfiles`를 붙였는데 왜 안 바뀌지?`\"는 profile 문제가 아니라 test property가 이긴 문제일 수 있다.\n5. **container/K8s 설정 rollout이 완료되지 않았다.** Kubernetes env var는 Pod 시작 시 process environment로 들어간다. ConfigMap/Secret object를 수정해도 기존 Pod의 env var가 자동으로 바뀌지는 않는다. volume mount 파일은 갱신될 수 있지만, 앱이 그 파일을 다시 bind하지 않으면 runtime 값은 그대로다. Docker Compose도 `.env` interpolation과 container environment 주입을 분리해야 한다.\n6. **cache나 static final을 설정값으로 오해했다.** `static final` compile-time constant, `static` field에 넣은 `@Value`, 초기화 시점에 한 번 만든 client option, `@PostConstruct`에서 만든 lookup table은 property source가 바뀌어도 자동 갱신되지 않는다. 바뀐 설정이 `Environment`에는 보이는데 실제 동작만 그대로라면 이 버킷을 먼저 의심한다.\n\n## wrong-bucket / 오선택\n\n| 고른 버킷 | 빠진 증거 | 왜 wrong bucket인가 |\n|---|---|---|\n| \"Spring이 `application.yml`을 안 읽었다\" | 같은 key가 env var나 실행 인자에 있다 | 파일은 읽혔지만 더 높은 source가 최종값을 덮었을 수 있다 |\n| \"env var 이름이 틀렸다\" | 컨테이너 안 `printenv`에는 기대 이름과 값이 있다 | 이름 문제가 아니라 우선순위, profile, 또는 binding 대상 문제일 수 있다 |\n| \"profile이 안 켜졌다\" | `activeProfiles`는 맞고 test annotation property가 있다 | profile 파일보다 test override가 더 직접적으로 값을 덮는다 |\n| \"K8s ConfigMap을 바꾸면 바로 반영된다\" | 기존 Pod가 재시작되지 않았다 | env var 주입은 Pod 시작 시점 값이고, 앱 rebind도 별도다 |\n| \"`@ConfigurationProperties`가 버그다\" | prefix는 맞지만 Bean이 아닌 객체를 직접 `new` 한다 | Spring Binder가 관리하지 않는 객체는 자동 binding 대상이 아니다 |\n| \"cache를 비우면 된다\" | 값이 `static final`이거나 client 생성자에 복사됐다 | cache가 아니라 객체 생성/상수화 시점 문제다 |\n\n## 다음 확인 순서\n\n1. 바꾼 canonical key를 한 줄로 적는다. 예: `app.payment.base-url`.\n2. 같은 실행에서 그 key를 제공할 수 있는 source를 모두 적는다. `application.yml`, profile yml, env var, command-line, test annotation, `SPRING_APPLICATION_JSON`, external file을 분리한다.\n3. env var라면 [Spring Relaxed Binding Env Var Cheatsheet](./spring-relaxed-binding-env-var-cheatsheet.md) 기준으로 이름을 다시 변환하고, container 안 실제 process environment에 들어왔는지 본다.\n4. 테스트라면 [Spring `@ActiveProfiles` vs test override primer](./spring-activeprofiles-vs-test-overrides-primer.md)로 active profile과 override source를 분리한다.\n5. 배포 환경이라면 ConfigMap/Secret 변경 시각, Deployment rollout revision, Pod start time, 앱 start log를 같은 타임라인에 놓는다.\n6. 최종값은 맞는데 동작만 그대로라면 설정을 읽는 Bean 생성 시점, `@PostConstruct`, static field, client builder, local cache를 추적한다.\n\n## 검증 질문\n\n- 지금 틀린 값은 \"최종 property 값\"인가, 아니면 그 값을 복사해 만든 객체의 내부 상태인가?\n- 같은 key를 더 높은 source가 덮는다는 증거를 하나라도 확인했는가?\n- `application-test.yml`이 실제 active profile 후보인지, test annotation property가 더 위에서 덮는지 설명할 수 있는가?\n- env var 이름이 Spring binding 규칙에도 맞고 container process environment에도 실제 존재하는가?\n- ConfigMap/Secret을 수정한 뒤 새 Pod가 떴는가, 아니면 기존 Pod가 예전 env var를 들고 있는가?\n- `@Value` 여러 개로 흩어진 설정을 `@ConfigurationProperties`로 묶으면 원인 추적이 더 쉬워지는가?\n- `static final`, static field, `@PostConstruct` cache, client builder 중 어느 곳이 예전 값을 붙잡고 있는가?\n\n## 다음 학습\n\n- 우선순위가 먼저 의심되면 [Spring Property Source 우선순위 빠른 판별](./spring-property-source-precedence-quick-guide.md)을 본다.\n- 테스트에서만 다르면 [Spring `@ActiveProfiles` vs test override primer](./spring-activeprofiles-vs-test-overrides-primer.md)와 [Spring 테스트 설정 입력 결정 가이드](./spring-test-profile-vs-property-override-decision-guide.md)를 같이 본다.\n- env var 이름과 플랫폼 주입을 나누려면 [Spring Relaxed Binding Env Var Cheatsheet](./spring-relaxed-binding-env-var-cheatsheet.md)와 [Spring Docker Compose and Kubernetes Env Injection Basics](./spring-docker-compose-k8s-env-injection-basics-primer.md)로 내려간다.\n- external config 경로가 의심되면 [Spring `spring.config.additional-location` Primer](./spring-config-additional-location-primer.md)와 [Spring `SPRING_APPLICATION_JSON` Primer](./spring-spring-application-json-primer.md)를 잇는다.\n",
+  "aliases": [
+    "스프링 설정값이 안 바뀌어요",
+    "application yml 바꿨는데 값이 그대로예요",
+    "환경변수 넣었는데 설정 반영이 안 돼요",
+    "test에서만 프로퍼티가 이상해요",
+    "spring config 값이 왜 안 먹어요",
+    "@Configuration",
+    "@PostConstruct",
+    "@SpringBootTest"
+  ],
+  "expected_queries": [
+    "Spring Boot에서 application.yml 값을 바꿨는데 왜 실행 결과는 예전 값처럼 보여?",
+    "prod에서만 설정이 다르게 먹을 때 우선순위 문제인지 profile 선택 문제인지 어디부터 나눠 봐야 해?",
+    "APP_PAYMENT_BASE_URL 같은 env var를 넣었는데 바인딩이 안 되면 이름 규칙을 어떻게 확인해?",
+    "@ActiveProfiles(\\\"test\\\")를 붙였는데도 테스트 값이 안 바뀌면 어떤 문서부터 보는 게 맞아?",
+    "spring.config.additional-location이나 external file 때문에 기본 설정이 가려졌는지 빠르게 확인하는 방법이 있을까?"
+  ],
+  "symptoms": [
+    "application.yml 값을 바꿨는데 실행하면 예전 값이 그대로 보여요",
+    "로컬에서는 되는데 test나 prod에서는 같은 설정 key가 다르게 읽혀요",
+    "환경변수로 값을 넣었다고 생각했는데 Spring이 기본값만 보는 것 같아요",
+    "application-test.yml이나 profile 파일을 만들었는데 기대한 값으로 안 바뀌어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-di-basics"
+    ],
+    "next_docs": [
+      "spring/property-source-precedence-quick-guide",
+      "spring/spring-activeprofiles-vs-test-overrides-primer",
+      "spring/relaxed-binding-env-var-cheatsheet",
+      "spring/config-additional-location-primer"
+    ],
+    "confusable_with": [
+      "spring/starter-bean-missing-cause-router",
+      "spring/bean-not-found-cause-router",
+      "spring/test-profile-vs-property-override-decision-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-config-value-not-changing-cause-router.md",
+    "revision_history": []
+  }
+}

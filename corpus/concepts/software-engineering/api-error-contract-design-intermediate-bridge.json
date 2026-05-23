@@ -1,0 +1,59 @@
+{
+  "id": "software-engineering/api-error-contract-design-intermediate-bridge",
+  "title": "API 에러 응답 계약 설계 — Status Code · 본문 · 클라이언트 처리",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "'API 에러 응답 계약은 *서버가 어떤 모양의 본문을 어떤 status code와 함께",
+  "body_markdown": "# API 에러 응답 계약 설계 — Status Code · 본문 · 클라이언트 처리\n\n> 한 줄 요약: HTTP status code는 *에러 카테고리*, 본문은 *구체적 분기 정보*. RFC 7807 ProblemDetail이 표준 envelope이고, error code는 클라이언트가 메시지 텍스트가 아니라 *코드*로 분기하게 만드는 핵심이다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n학습자가 자주 만드는 첫 에러 응답.\n\n```json\n{ \"message\": \"예약 시간이 이미 지났습니다\" }\n```\n\n문제 1 — 클라이언트가 *메시지 텍스트로 분기*해야 한다. 다국어 처리 시 깨진다.\n문제 2 — error code가 없다. 같은 422가 여러 이유로 나는데 구분이 안 된다.\n문제 3 — `trace_id` 같은 디버깅 정보가 없다. 운영 시 추적 어렵다.\n\n개선:\n\n```json\n{\n  \"type\": \"https://api.example.com/problems/reservation-time-in-past\",\n  \"title\": \"Reservation time cannot be in the past\",\n  \"status\": 400,\n  \"detail\": \"Reservation time 2025-01-01T10:00 is before now\",\n  \"instance\": \"/reservations\",\n  \"code\": \"RESERVATION_TIME_IN_PAST\",\n  \"trace_id\": \"0a1b2c3d4e5f\"\n}\n```\n\n이 모양이 *클라이언트가 안정적으로 분기 가능*하면서 *운영자가 추적 가능*한 envelope이다.\n\n## 한 장 정리\n\n### HTTP Status Code = 에러 카테고리\n\n| 5xx | 서버 책임 — 500 (예상 못한 예외), 502/503/504 (인프라) |\n| 4xx | 클라이언트 책임 — 400 (형식 잘못), 401 (인증), 403 (권한), 404 (없음), 409 (충돌), 422 (검증 실패) |\n| 2xx | 성공 — 에러가 아님 |\n\n본문 envelope을 잘 만들어도 status code가 틀리면 클라이언트의 *기본 분기*가 깨진다. 카테고리는 status, *세부 코드*는 본문.\n\n### 본문 Envelope = 분기 정보\n\nRFC 7807 ProblemDetail 표준 필드:\n\n| 필드 | 의미 | 예시 |\n|---|---|---|\n| `type` | 문제 종류를 식별하는 URI | `https://api.example.com/problems/...` |\n| `title` | 사람이 읽는 짧은 요약 | `\"Reservation time cannot be in the past\"` |\n| `status` | HTTP status code 복사 | `400` |\n| `detail` | 이번 발생 상세 | `\"Reservation time 2025-01-01T10:00 is before now\"` |\n| `instance` | 어떤 요청 대상에서 발생했는지 | `\"/reservations\"` |\n\n확장 필드 (커스텀):\n\n| 필드 | 의미 | 예시 |\n|---|---|---|\n| `code` | 안정적 분기용 코드 | `\"RESERVATION_TIME_IN_PAST\"` |\n| `trace_id` | 분산 추적 ID | `\"0a1b2c3d4e5f\"` |\n| `field_errors` | 검증 실패한 필드 목록 | `[{\"field\": \"memberId\", \"code\": \"REQUIRED\"}]` |\n\n## \"Status code만 vs Error code도\"\n\n학습자 자주: \"status code로 충분하지 않나?\"\n\n대답: 충분하지 않다. 같은 status code 안에서 *여러 비즈니스 이유*가 섞이기 때문.\n\n```\n422 — 검증 실패\n  ├─ \"예약 시간이 과거\"\n  ├─ \"테마가 닫혀 있음\"\n  └─ \"회원이 정지 상태\"\n\n→ status로는 \"422\" 하나만 보임\n→ 본문 code로 분기: RESERVATION_TIME_IN_PAST / THEME_CLOSED / MEMBER_SUSPENDED\n```\n\n클라이언트는 이 코드를 받아서 *다른 UX*로 분기한다. (다시 시간 선택 vs 다른 테마 추천 vs 회원 지원 안내.)\n\n## Error Code 명명 가이드\n\n학습자 자주 헷갈리는 패턴.\n\n| 좋은 패턴 | 나쁜 패턴 |\n|---|---|\n| 안정적, 변경 안 됨 | 매번 reword되는 메시지로 분기 |\n| 도메인 + 상태 표현 (`RESERVATION_TIME_IN_PAST`) | 숫자만 (`ERR_001`) |\n| `_` 또는 `:` 구분의 일관 형식 | 일관 없음 (`reservation.error.timeInPast`, `RES-100`, ...) |\n| 5xx 시스템 에러는 별도 prefix (`SYSTEM_*`) | 비즈니스 에러와 섞임 |\n| 외부 노출 가능 (PII 미포함) | 내부 stacktrace나 SQL 노출 |\n\n권장 형식: `{DOMAIN}_{STATE_DESCRIPTION}` (대문자 + underscore, 동사 없이 상태 명사형). 예: `MEMBER_ALREADY_EXISTS`, `RESERVATION_TIME_IN_PAST`, `PAYMENT_AMOUNT_NEGATIVE`.\n\n## \"ProblemDetail vs 커스텀 DTO\"\n\nSpring 6+에서 ProblemDetail이 1급 지원이라 *대부분의 새 프로젝트는 ProblemDetail*이 맞다.\n\n| 선택 | 적합 |\n|---|---|\n| ProblemDetail | 새 프로젝트, 표준 따르기, OpenAPI/Swagger 자동 생성 |\n| 커스텀 Error DTO | 레거시 호환, 이미 정의된 envelope이 있음, 특수 필드 다수 |\n\nProblemDetail 위에 확장 필드(code, trace_id)를 얹는 게 일반적. RFC 7807이 *확장 허용*이라 표준성을 유지한다.\n\n자세한 Spring 측 구현은 `spring/problemdetail-error-response-design`에서.\n\n## 클라이언트 측 처리 — 안정적 분기\n\n```typescript\n// 좋은 패턴 — 코드로 분기\nif (error.status === 422) {\n    switch (error.body.code) {\n        case 'RESERVATION_TIME_IN_PAST':\n            return showTimeReselectModal();\n        case 'THEME_CLOSED':\n            return suggestOtherThemes();\n        case 'MEMBER_SUSPENDED':\n            return redirectToSupport();\n    }\n}\n\n// 나쁜 패턴 — 메시지 텍스트로 분기\nif (error.body.message.includes('과거')) { ... }  // 다국어/문구 변경에 깨짐\n```\n\n서버는 *코드의 안정성*을 약속하고, 메시지는 *사람이 읽는 보조*로 둔다.\n\n## 자주 헷갈리는 지점\n\n- **모든 비즈니스 에러를 500으로 — 또는 모두 400으로** — status code를 카테고리 기준으로 분리. 인증은 401, 권한은 403, 검증은 422, 충돌은 409, 형식 오류는 400, 시스템 에러는 500.\n- **`message`만 두고 `code` 안 둠** — 클라이언트가 메시지로 분기하게 되어 다국어/리워드 시 깨진다.\n- **`stack_trace` 본문에 포함** — 운영 환경에서는 절대 안 됨. trace_id로 갈음하고 stack은 서버 로그에만.\n- **error code를 매번 새로 만듦** — 코드 사전을 관리해야 한다. `enum` 또는 별도 카탈로그 yaml로.\n- **ProblemDetail을 멋대로 변형** — `type`/`title`/`status`/`detail` 같은 표준 필드 의미를 바꾸면 RFC 호환이 깨진다. 확장은 *추가 필드*로만.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"Validation 실패 시 응답 모양?\"\n  - status 400 또는 422 (Spring 기본: `MethodArgumentNotValidException` → 400). 본문에 `field_errors` 배열 (필드별 code).\n- \"@ExceptionHandler 위치는?\"\n  - `@RestControllerAdvice` 클래스에 모아 도메인 예외 → ProblemDetail 변환. Spring 6+에서는 `ResponseEntityExceptionHandler`가 ProblemDetail로 통일.\n- \"재시도 가능 여부를 어떻게 알려줘?\"\n  - 확장 필드 `retryable: true/false` + `retry_after_seconds`. 또는 HTTP 헤더 `Retry-After`.\n- \"trace_id를 어디서 만들어?\"\n  - 분산 추적 시스템(Sleuth/Micrometer Tracing)이 자동 생성. MDC에 담아 응답 본문에 surface.\n\n## 빠른 확인 질문\n\n- HTTP status code와 error code의 역할 분담?\n  - status는 카테고리(인증/검증/충돌/시스템), code는 구체적 분기 정보.\n- 클라이언트가 메시지 텍스트로 분기하면 안 되는 이유?\n  - 다국어/문구 변경 시 분기가 깨진다.\n- RFC 7807 ProblemDetail의 핵심 5개 필드는?\n  - type, title, status, detail, instance.\n\n## 한 줄 정리\n\nAPI 에러 응답 계약은 *status code(카테고리) + 본문 envelope(분기 정보)* 두 축으로 구성한다. ProblemDetail이 표준 envelope이고, error code는 클라이언트 안정 분기의 핵심이다. 메시지 텍스트는 사람용 보조일 뿐.\n\nretrieval-anchor-keywords: API error contract, error response design, RFC 7807, ProblemDetail, error code naming, error envelope, structured error response, HTTP status error mapping, business error vs system error, trace_id propagation, retryable error flag, field_errors array, error catalog, @RestControllerAdvice ProblemDetail, ResponseEntityExceptionHandler\n",
+  "aliases": [
+    "API 에러 응답 계약",
+    "error response contract",
+    "error response body design",
+    "error code design",
+    "RFC 7807 ProblemDetail 설계",
+    "structured error response",
+    "HTTP error mapping",
+    "business error vs system error response",
+    "API error envelope",
+    "error envelope design",
+    "error type discriminator",
+    "@ExceptionHandler"
+  ],
+  "expected_queries": [
+    "API 에러 응답 본문을 어떻게 설계해?",
+    "HTTP status code랑 error code를 같이 써야 해?",
+    "ProblemDetail을 그대로 쓸까 커스텀 DTO를 만들까?",
+    "클라이언트가 에러를 어떻게 분기하게 만들어?",
+    "RFC 7807 ProblemDetail이 왜 표준이야?",
+    "error envelope 모양을 어떻게 잡아?"
+  ],
+  "symptoms": [
+    "에러 응답 본문 모양을 어떻게 통일할지 모름",
+    "HTTP status code만으로 에러 종류 분기가 어려움",
+    "error code와 message를 어디서 만들어야 할지 헷갈림",
+    "ProblemDetail을 쓸지 직접 만들지 결정 못 함"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/http-status-error-response-design-bridge"
+    ],
+    "next_docs": [
+      "spring/problemdetail-error-response-design"
+    ],
+    "confusable_with": [
+      "software-engineering/http-status-error-response-design-bridge",
+      "spring/problemdetail-error-response-design",
+      "software-engineering/error-handling-fail-fast-vs-defensive-vs-graceful-degradation-chooser",
+      "language/java-exception-design-checked-vs-unchecked-vs-runtime-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/api-error-contract-design-intermediate-bridge.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "database/busy-fail-fast-vs-one-short-retry-card",
+  "title": "Busy Fail Fast vs One Short Retry Card",
+  "category": "database",
+  "level": "beginner",
+  "summary": "'이 문서는 Busy Fail Fast vs One Short Retry Card beginner chooser로, busy bucket은 기본적으로",
+  "body_markdown": "# `busy`는 언제 즉시 실패하고, 언제 한 번만 짧게 재시도할까?\n\n> 한 줄 요약: `busy`의 기본값은 무한 retry가 아니라 **빠른 실패**이고, \"곧 풀릴 가능성이 높고 같은 요청을 한 번 더 확인하는 비용이 작다\"는 조건일 때만 **짧은 1회 재시도**를 붙인다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [3버킷 공통 용어 카드](./three-bucket-terms-common-card.md)\n- [`lock timeout` != `already exists` 공통 오해 카드](./lock-timeout-not-already-exists-common-confusion-card.md)\n- [`NOWAIT`와 짧은 `lock timeout`은 왜 자동 retry보다 `busy`에 더 가깝게 볼까?](./nowait-vs-short-lock-timeout-busy-guide.md)\n- [Connection Timeout vs Lock Timeout 비교 카드](./connection-timeout-vs-lock-timeout-card.md)\n- [Insert-if-Absent Retry Outcome Guide](./insert-if-absent-retry-outcome-guide.md)\n- [Idempotent Transaction Retry Envelopes](./idempotent-transaction-retry-envelopes.md)\n- [Spring Service Layer Transaction Boundary Patterns](../spring/spring-service-layer-transaction-boundary-patterns.md)\n- [database 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: busy fail fast vs short retry, busy one short retry card, busy bucket retry policy beginner, lock timeout fail fast retry once, connection timeout busy retry once, busy should fail fast, busy short bounded retry, busy 즉시 실패 짧은 재시도, 락 타임아웃 한 번 재시도, beginner busy bucket checklist, busy fast fail primer, 왜 busy면 바로 실패해요, busy retry what is basics, 처음 busy 재시도 기준\n\n## 먼저 멘탈모델\n\n`busy`는 \"지금 줄이 막혀 있다\"는 뜻이지, \"조금만 더 하면 반드시 성공한다\"는 뜻이 아니다.\n\n그래서 초보자는 이렇게 먼저 잡으면 된다.\n\n- 기본값: **fail fast**\n- 예외: **한 번만 짧게 retry**\n\n핵심 질문은 1개다.\n\n> \"이 실패가 잠깐 줄이 막힌 정도라서, 같은 요청을 한 번만 더 확인해도 해석이 더 좋아질까?\"\n\n## 이런 질문이면 먼저 이 카드로 온다\n\n아래 질문은 `retryable` playbook보다 이 카드가 먼저다.\n\n- \"`busy`면 몇 번 재시도해야 하나요?\"\n- \"lock timeout이 떴는데 바로 실패해야 하나요?\"\n- \"한 번만 다시 보면 `already exists`로 바뀔 수도 있나요?\"\n\n핵심은 \"성공률을 높이기 위한 무한 retry\"가 아니라 \"서비스 결과를 더 정확히 번역하기 위한 짧은 확인 1회\"인지 구분하는 것이다.\n\n## 한 장 비교표\n\n| 질문 | `fail fast`가 기본인 경우 | `1회 짧은 retry`를 허용해도 되는 경우 |\n|---|---|---|\n| 막힌 이유가 뚜렷한가 | pool 고갈, hot row, 긴 트랜잭션이 이미 보여서 바로 혼잡 신호로 읽는 편이 낫다 | 같은 key 경쟁처럼 \"바로 앞 요청이 곧 끝날\" 가능성이 크다 |\n| retry가 결과 해석을 바꾸는가 | 다시 해도 여전히 `busy`일 가능성이 높다 | 한 번 더 보면 `already exists`나 성공으로 재분류될 수 있다 |\n| 요청 비용이 작은가 | 외부 I/O, 긴 트랜잭션, fan-out이 다시 걸린다 | 같은 멱등 요청을 짧게 한 번 더 확인하는 수준이다 |\n| 초보자 기본 선택 | 즉시 `busy` 응답 | 20~100ms 정도 짧게 기다린 뒤 1회만 다시 확인 |\n\n짧게 외우면:\n\n- `busy`는 원칙적으로 장애 복구용 retry가 아니라 **혼잡 신호**\n- 다만 winner가 거의 곧 확정될 장면이면 **1회 짧은 확인성 retry**는 가능\n\n## 가장 작은 예시\n\n쿠폰 발급에서 `(event_id, user_id)`가 유일하다고 하자.\n\n1. 요청 A가 insert를 거의 끝내기 직전이다.\n2. 요청 B는 같은 key로 들어와 lock wait 끝에 `busy`로 분류됐다.\n3. 이때 B가 30ms 정도 쉬고 **딱 한 번** fresh read 또는 동일 멱등 경로를 다시 보면:\n4. 결과가 `busy`에서 `already exists`로 바뀔 수 있다.\n\n반대로 pool 고갈 때문에 `Connection is not available`이 난 경우는 다르다.\n\n- 다시 때리면 같은 풀 입구에서 또 막힐 가능성이 높다.\n- 이 경우 `busy`는 곧바로 fail fast 하는 편이 보통 더 낫다.\n\n처음 판단할 때는 \"재시도로 성공률을 올리나?\"보다 \"재시도로 결과 해석이 더 또렷해지나?\"를 먼저 묻는 편이 안전하다.\n\n## 초보자용 4문항 체크리스트\n\n아래 4개 중 **3개 이상이 예**면 `1회 짧은 retry`를 고려할 수 있다.\n\n1. 같은 key/같은 멱등 요청의 바로 직전 경쟁처럼 보이는가?\n2. retry가 새 트랜잭션 폭증이 아니라 짧은 확인 1회 수준인가?\n3. 한 번 더 보면 성공 또는 `already exists`로 해석이 더 또렷해질 가능성이 큰가?\n4. retry 횟수를 `1회`로 고정하고, 실패 시 바로 `busy`로 끝낼 수 있는가?\n\n하나라도 강하게 아니오가 나오면, 초보자 기본값은 그냥 fail fast다.\n\n## 자주 쓰는 판단 요약\n\n| 신호 | beginner 기본 선택 | 이유 |\n|---|---|---|\n| `Connection is not available`, `threads awaiting connection` | fail fast | 풀 혼잡은 한 번 더 때려도 같은 입구에서 막히기 쉽다 |\n| `lock timeout` on same key, winner가 거의 끝날 것 같음 | 1회 짧은 retry 가능 | 재시도 후 `already exists`나 성공으로 바뀔 여지가 있다 |\n| `deadlock`, `40001` | 이 카드의 대상 아님 | 이것은 `busy`보다 `retryable` 규칙으로 본다 |\n| blocker 원인이 긴 외부 I/O / 장기 트랜잭션 | fail fast | 한 번 더 시도해도 줄이 금방 풀릴 가능성이 낮다 |\n\n`NOWAIT`나 아주 짧은 `lock timeout`처럼 애초에 \"오래 기다리지 않겠다\"는 lock budget이 들어간 경로를 따로 떼어 보고 싶으면 [`NOWAIT`와 짧은 `lock timeout`은 왜 자동 retry보다 `busy`에 더 가깝게 볼까?](./nowait-vs-short-lock-timeout-busy-guide.md)를 같이 보면 된다.\n\n## 흔한 오해\n\n- \"`busy`면 일단 여러 번 재시도해도 된다\"\n  - 아니다. 초보자 기본값은 `0회` 또는 많아야 `1회`다.\n- \"`busy` 재시도는 `retryable`과 같다\"\n  - 아니다. `retryable`은 보통 새 트랜잭션 전체 재시도이고, 여기서 말하는 것은 짧은 확인성 retry다.\n- \"`lock timeout`이면 무조건 재시도 이득이 있다\"\n  - 아니다. hot row가 길게 막힌 상황이면 한 번 더 해도 똑같이 막힐 수 있다.\n- \"응답을 부드럽게 만들려면 retry를 많이 넣는 편이 낫다\"\n  - 아니다. 혼잡 구간에서 blind retry는 큐를 더 길게 만들 수 있다.\n\n- \"`busy`와 `40001`은 어차피 둘 다 다시 해보면 되는 것 아닌가요?\"\n  - 아니다. `busy`는 보통 fail-fast 또는 1회 짧은 확인이고, `40001`은 새 트랜잭션 whole retry 쪽 규칙이다.\n\n## 검증용 로그 축\n\n`busy` 정책은 코드만 보고 맞다 틀리다 하기 어렵다.\n운영 로그에는 아래 필드가 있어야 재시도 판단이 흔들리지 않는다.\n\n| 필드 | 왜 필요한가 |\n|---|---|\n| failure bucket | `busy`, `retryable`, `already_exists`를 섞지 않기 위해 |\n| blocker hint | pool 대기인지, lock wait인지, 같은 key 경쟁인지 구분하기 위해 |\n| retry count | `1회` 계약이 실제로 지켜지는지 보기 위해 |\n| sleep budget | 20~100ms 같은 짧은 확인성 대기인지 확인하기 위해 |\n| final outcome | retry 뒤 `already exists`, success, busy 중 무엇으로 끝났는지 보기 위해 |\n\n잘못된 버킷(wrong bucket)은 두 가지다.\n\n- pool 고갈을 같은 key 경쟁처럼 보고 retry를 붙이는 것\n- serialization failure나 deadlock을 `busy` 카드로 처리하는 것\n\n첫 번째는 혼잡을 키우고, 두 번째는 retry envelope와 transaction boundary 설계를 놓치게 만든다.\n\n## 한 줄 가이드\n\n- 같은 요청의 winner가 **곧 확정될 가능성**이 높으면: 짧은 `1회` retry\n- 그 외 대부분의 `busy`는: 바로 `busy`로 fail fast\n\n## 다음에 이어서 볼 문서\n\n- `busy` / `retryable` / `already exists` 전체 번역표는 [Insert-if-Absent Retry Outcome Guide](./insert-if-absent-retry-outcome-guide.md)\n- `busy`를 pool 대기와 lock 대기로 다시 나누려면 [Connection Timeout vs Lock Timeout 비교 카드](./connection-timeout-vs-lock-timeout-card.md)\n- retry를 메서드 안 while문이 아니라 바깥 envelope로 거는 이유는 [Idempotent Transaction Retry Envelopes](./idempotent-transaction-retry-envelopes.md)\n- retry를 트랜잭션 boundary 바깥에서 감싸는 이유를 Spring 코드로 보면 [Spring Service Layer Transaction Boundary Patterns](../spring/spring-service-layer-transaction-boundary-patterns.md)\n\n## 한 줄 정리\n\n`busy`의 기본값은 무한 retry가 아니라 **빠른 실패**이고, \"곧 풀릴 가능성이 높고 같은 요청을 한 번 더 확인하는 비용이 작다\"는 조건일 때만 **짧은 1회 재시도**를 붙인다.\n",
+  "aliases": [
+    "busy fail fast vs short retry",
+    "busy one short retry card",
+    "busy bucket retry policy beginner",
+    "lock timeout fail fast retry once",
+    "connection timeout busy retry once",
+    "busy should fail fast",
+    "busy short bounded retry",
+    "busy 즉시 실패 짧은 재시도",
+    "락 타임아웃 한 번 재시도",
+    "busy retry 기준"
+  ],
+  "expected_queries": [
+    "busy는 기본 fail fast이고 언제만 한 번 짧게 retry해도 되는지 기준을 알려줘",
+    "lock timeout이 busy로 분류됐을 때 무한 retry가 아니라 1회 확인성 retry만 허용하는 이유가 뭐야?",
+    "같은 idempotency key 경쟁에서 한 번 더 보면 already exists로 재분류될 수 있는 경우를 설명해줘",
+    "connection pool timeout이나 hot row contention에서는 왜 retry보다 빠른 busy 응답이 기본이야?",
+    "busy와 retryable, already exists를 beginner가 구분하는 체크리스트를 보여줘"
+  ],
+  "symptoms": [
+    "busy를 retryable과 같은 뜻으로 보고 lock timeout이나 pool contention에서 blind retry를 여러 번 건다",
+    "hot row나 connection pool 혼잡이 보이는데 fail fast 대신 wait와 retry를 늘려 queue를 더 길게 만든다",
+    "같은 idempotent key 경쟁처럼 한 번만 더 보면 already exists로 재분류될 수 있는 경우와 그렇지 않은 busy를 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/three-bucket-terms-common",
+      "database/lock-timeout-not-already-exists-common-confusion-card"
+    ],
+    "next_docs": [
+      "database/insert-if-absent-retry-outcome-guide",
+      "database/idempotent-transaction-retry-envelopes",
+      "database/connection-timeout-vs-lock-timeout-card"
+    ],
+    "confusable_with": [
+      "database/booking-guard-row-retry-card",
+      "database/insert-if-absent-retry-outcome-guide",
+      "database/idempotent-transaction-retry-envelopes",
+      "database/connection-timeout-vs-lock-timeout-card",
+      "database/duplicate-key-vs-busy-response-mapping"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/busy-fail-fast-vs-one-short-retry-card.md",
+    "revision_history": []
+  }
+}

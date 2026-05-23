@@ -1,0 +1,58 @@
+{
+  "id": "spring/spring-async-completablefuture-restclient-non-blocking-intermediate-primer",
+  "title": "Spring 비동기 — @Async · CompletableFuture · 외부 호출 non-blocking",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "'Spring 비동기는 *AOP 기반 @Async + CompletableFuture* 조합으로 작동.",
+  "body_markdown": "# Spring 비동기 — @Async · CompletableFuture · 외부 호출 non-blocking\n\n> 한 줄 요약: `@EnableAsync` + `@Async` + `CompletableFuture` = Spring 비동기 기본. self-invocation / TaskExecutor / 예외 처리 3 함정이 핵심.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n```java\n@Configuration\n@EnableAsync\nclass AsyncConfig {\n    @Bean(name = \"taskExecutor\")\n    Executor taskExecutor() {\n        ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();\n        exec.setCorePoolSize(4);\n        exec.setMaxPoolSize(8);\n        exec.setQueueCapacity(100);\n        exec.setThreadNamePrefix(\"async-\");\n        exec.initialize();\n        return exec;\n    }\n}\n\n@Service\nclass NotificationService {\n    @Async\n    public CompletableFuture<Void> send(String msg) {\n        // 별도 thread에서 실행\n        externalSmsApi.send(msg);\n        return CompletableFuture.completedFuture(null);\n    }\n}\n\n// 호출자\nnotificationService.send(\"hello\");   // 즉시 반환, 백그라운드에서 실행\n```\n\n핵심 흐름:\n1. `@EnableAsync` 활성화 → AOP proxy 생성.\n2. `@Async` 메서드 호출 → proxy가 *TaskExecutor에 submit*, 호출자는 즉시 반환.\n3. 반환 type = `void` / `Future<T>` / `CompletableFuture<T>`.\n\n## 한 장 정리\n\n| 어노테이션 / 클래스 | 역할 |\n|---|---|\n| `@EnableAsync` | Application config에 한 번 |\n| `@Async` | 메서드를 별도 thread에서 |\n| `@Async(\"customExecutor\")` | 특정 TaskExecutor 지정 |\n| `TaskExecutor` (Bean) | thread pool 정의 |\n| `CompletableFuture<T>` | 비동기 결과 + 조합 (`thenApply`, `thenCombine`, `allOf`) |\n| `@AsyncConfigurer` | 전역 TaskExecutor + ExceptionHandler |\n\n## 함정 1 — Self-Invocation\n\n```java\n@Service\nclass Service {\n    @Async\n    public void asyncMethod() { /* ... */ }\n\n    public void useAsync() {\n        asyncMethod();   // ❌ 같은 객체 내 호출 → AOP 우회 → 동기 실행\n    }\n}\n```\n\nAOP proxy 기반이라 *같은 클래스 내 호출은 proxy 안 거침*. 동기로 실행돼 *비동기 안 됨*.\n\n해결:\n- 다른 Bean에서 호출\n- `ApplicationContext.getBean(Service.class).asyncMethod()` (proxy 거침)\n- `SelfReferenceService` 패턴 (자기 자신을 inject)\n\n## 함정 2 — TaskExecutor 미설정 default\n\n`@EnableAsync`만 켰는데 *TaskExecutor Bean 미정의* → Spring이 *`SimpleAsyncTaskExecutor`* 사용. 이건:\n\n- **매번 새 thread 생성** — pool 없음.\n- 트래픽 ↑ 시 *thread 폭증*.\n- OutOfMemoryError 위험.\n\n**반드시 `ThreadPoolTaskExecutor` Bean 정의 + `@Async(\"name\")` 또는 default Bean name 사용**.\n\n## 함정 3 — 예외 전파\n\n```java\n@Async\npublic CompletableFuture<String> fetch() {\n    throw new RuntimeException(\"oops\");   // 호출자가 어떻게 알지?\n}\n\n// 호출자\nCompletableFuture<String> f = service.fetch();\n// 여기선 예외 안 던짐 (비동기라 즉시 반환)\nf.get();   // 여기서 ExecutionException 던짐 (필요시 잡음)\n// 또는\nf.exceptionally(e -> {\n    log.error(\"failed\", e);\n    return \"default\";\n});\n```\n\n`@Async` 메서드 안 예외는 *호출자에 즉시 전파 안 됨*. `Future.get()` 또는 `exceptionally` 호출 시점에 만남.\n\n`void` 반환 `@Async`면 예외가 *완전히 사라짐* (AsyncUncaughtExceptionHandler로 잡아야).\n\n```java\n@Configuration\n@EnableAsync\nclass Config implements AsyncConfigurer {\n    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {\n        return (ex, method, params) -> log.error(\"async failure\", ex);\n    }\n}\n```\n\n## CompletableFuture — 결과 조합\n\n```java\n// 외부 API 3개 병렬 호출 + 결과 조합\nCompletableFuture<User> userF = CompletableFuture.supplyAsync(\n    () -> userClient.fetch(userId), executor);\nCompletableFuture<List<Order>> ordersF = CompletableFuture.supplyAsync(\n    () -> orderClient.list(userId), executor);\nCompletableFuture<Wallet> walletF = CompletableFuture.supplyAsync(\n    () -> walletClient.get(userId), executor);\n\n// 모두 끝날 때까지 wait, 결과 조합\nCompletableFuture<DashboardData> result = CompletableFuture.allOf(userF, ordersF, walletF)\n    .thenApply(v -> new DashboardData(userF.join(), ordersF.join(), walletF.join()));\n```\n\n직렬 호출(3 API × 100ms = 300ms) → 병렬(max(100ms) = 100ms).\n\n### `thenApply` vs `thenApplyAsync`\n\n```java\nfuture.thenApply(x -> transform(x))        // 이전 stage thread 또는 호출 thread에서\nfuture.thenApplyAsync(x -> transform(x))   // ForkJoinPool.commonPool (또는 명시 executor)\n```\n\n차이: *어디 thread에서 실행되는가*. 보통 *명시 executor* 권장 (`thenApplyAsync(fn, executor)`).\n\n## TaskExecutor 설정 — Sizing\n\n```java\n@Bean(name = \"taskExecutor\")\nExecutor taskExecutor() {\n    ThreadPoolTaskExecutor e = new ThreadPoolTaskExecutor();\n    e.setCorePoolSize(4);        // 기본 유지 thread 수\n    e.setMaxPoolSize(8);         // 최대 thread 수\n    e.setQueueCapacity(100);     // queue가 차면 maxPool까지 확장\n    e.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());   // queue full 시\n    e.setThreadNamePrefix(\"async-\");\n    e.initialize();\n    return e;\n}\n```\n\n### Queue + MaxPool 동작\n1. 첫 corePoolSize까지 thread 생성.\n2. corePool 다 차면 queue에 쌓음.\n3. queue 가득 차면 maxPool까지 확장.\n4. maxPool도 차면 rejected (RejectedExecutionHandler).\n\n⚠️ 함정: queueCapacity 너무 크면 *maxPool 무의미*. queue 작거나 unbounded 양극단.\n\n## \"@Async + Transaction\"\n\n```java\n@Transactional\npublic void process() {\n    asyncService.notifyAsync();  // ❌ async는 다른 thread → 다른 transaction\n}\n```\n\n비동기 메서드는 *호출자 transaction과 무관*. 자기만의 transaction을 시작하려면 `@Transactional` 별도 명시.\n\n## Virtual Thread (Java 21) 대안\n\n```yaml\nspring:\n  threads:\n    virtual:\n      enabled: true   # Spring Boot 3.2+\n```\n\n이거 켜면 *Tomcat thread pool*이 Virtual Thread로. *@Async도 자동 transition* 가능. blocking I/O 메서드면 효율 ↑.\n\n## 자주 헷갈리는 지점\n\n- **\"`@Async` 만 붙이면 끝\"** — `@EnableAsync` 필수.\n- **\"`@Async` self-invocation 작동\"** — AOP 우회. 동기로 실행.\n- **\"TaskExecutor 없어도 OK\"** — SimpleAsyncTaskExecutor가 *thread 폭증*. ThreadPoolTaskExecutor 필수.\n- **\"`return void` `@Async` 예외가 보임\"** — log에만. AsyncUncaughtExceptionHandler 명시.\n- **\"`CompletableFuture.get()` 호출이 동기 차단\"** — 맞다. `thenApply`나 `exceptionally`로 chain.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"이메일 발송을 비동기로\" → `@Async` + ThreadPoolTaskExecutor.\n- \"외부 API 3개 병렬 호출\" → CompletableFuture.allOf + supplyAsync.\n- \"비동기 메서드 예외가 안 나옴\" → Future.get() / exceptionally 또는 AsyncUncaughtExceptionHandler.\n- \"@Async가 동기처럼 동작\" → self-invocation 또는 @EnableAsync 누락 확인.\n- \"thread 폭증 OOM\" → SimpleAsyncTaskExecutor가 default. Pool 명시 필요.\n\n## 빠른 확인 질문\n\n- @Async가 *동기처럼* 보이는 흔한 원인 2가지?\n  - @EnableAsync 누락 / self-invocation.\n- TaskExecutor 미설정 시 default는?\n  - SimpleAsyncTaskExecutor — 매번 새 thread (thread 폭증 위험).\n- `void` 반환 `@Async` 메서드의 예외 처리?\n  - AsyncUncaughtExceptionHandler 명시 (그렇지 않으면 사라짐).\n\n## 한 줄 정리\n\nSpring 비동기 = `@EnableAsync` + `@Async` + `ThreadPoolTaskExecutor` + `CompletableFuture`. 3 함정 — self-invocation, TaskExecutor default, 예외 전파 — 매번 챙기기.\n\nretrieval-anchor-keywords: Spring @Async, @EnableAsync, CompletableFuture, ThreadPoolTaskExecutor, TaskExecutor sizing, AsyncUncaughtExceptionHandler, AsyncConfigurer, self-invocation AOP, SimpleAsyncTaskExecutor pitfall, CompletableFuture allOf thenCombine, supplyAsync executor, RejectedExecutionHandler CallerRunsPolicy, spring.threads.virtual.enabled, virtual thread async transition\n",
+  "aliases": [
+    "@Async",
+    "CompletableFuture",
+    "@EnableAsync",
+    "TaskExecutor",
+    "ThreadPoolTaskExecutor",
+    "Spring 비동기",
+    "비동기 호출",
+    "async method",
+    "non-blocking",
+    "외부 API 병렬 호출",
+    "@Bean",
+    "@Configuration"
+  ],
+  "expected_queries": [
+    "@Async가 어떻게 동작해?",
+    "CompletableFuture로 외부 API 병렬 호출 어떻게?",
+    "TaskExecutor 설정 어떻게 해?",
+    "@Async가 동기처럼 보이는 이유는?",
+    "비동기 예외를 어떻게 잡아?",
+    "@Async self-invocation 함정이 뭐야?"
+  ],
+  "symptoms": [
+    "@Async가 동기처럼 동작 — 비동기 안 됨",
+    "CompletableFuture에서 예외가 사라짐",
+    "Thread Pool 설정을 어떻게 해야 할지 모름",
+    "외부 API 호출 병렬화를 어떻게 할지 모름"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-async-non-blocking-primer"
+    ],
+    "next_docs": [
+      "spring/async-looks-synchronous-cause-router",
+      "spring/async-self-invocation-same-thread-symptom-card"
+    ],
+    "confusable_with": [
+      "spring/spring-async-non-blocking-primer",
+      "spring/async-looks-synchronous-cause-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-async-completablefuture-restclient-non-blocking-intermediate-primer.md",
+    "revision_history": []
+  }
+}

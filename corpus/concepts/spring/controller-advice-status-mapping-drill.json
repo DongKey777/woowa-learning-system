@@ -1,0 +1,47 @@
+{
+  "id": "spring/controller-advice-status-mapping-drill",
+  "title": "ControllerAdvice Status Mapping Drill",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "이 drill은 @ControllerAdvice에서 예외 의미를 HTTP status로 매핑하는 연습이다. validation error, business conflict, 400/404/409/500 구분 같은 약점 신호를 다룬다.",
+  "body_markdown": "# ControllerAdvice Status Mapping Drill\n\n## 질문\n\n예약 생성 요청에서 이미 같은 시간 예약이 존재한다. JSON 형식은 맞고, 사용자가 요청한 행위가 현재 상태와 충돌한다. 어떤 status 후보가 자연스러운가?\n\n## 기대 답변 축\n\n- 단순 형식 오류가 아니므로 400만으로 뭉개지 않는다.\n- 현재 리소스 상태와 충돌하므로 409 후보를 설명한다.\n- 응답 body에는 사용자가 다음 행동을 고를 수 있는 메시지가 있어야 한다.\n\n## 면접 답변 골격\n\n1. 먼저 예외를 \"요청 형식 문제\", \"검증 실패\", \"인증/인가 문제\", \"리소스 없음\", \"현재 상태와의 충돌\", \"서버 내부 오류\"로 분류한다.\n2. `@ControllerAdvice`는 여러 Controller에서 발생하는 예외를 한곳에서 HTTP 응답으로 변환하는 경계라고 설명한다.\n3. 같은 예외라도 사용자 책임인지, 리소스 상태 문제인지, 서버 결함인지에 따라 status가 달라진다.\n4. status와 response body schema를 함께 고정해 클라이언트가 일관되게 처리하게 한다.\n5. domain exception을 그대로 노출하지 않고, 외부 계약에 맞는 error code/message/detail로 변환한다.\n\n## 예시: 예약 API status 분기\n\n| 요청/실패 | 예외 후보 | 자연스러운 status | 이유 |\n|---|---|---|---|\n| `{ \"date\": \"abc\" }`처럼 JSON 값 변환 실패 | `HttpMessageNotReadableException`, `MethodArgumentTypeMismatchException` | 400 | 서버 상태를 보기 전 요청 형식이 깨졌다 |\n| 날짜가 과거이거나 이름이 비어 있음 | `MethodArgumentNotValidException` | 400 또는 422 | 필드 검증 실패다. 팀 계약에 맞춰 field error를 구조화한다 |\n| 같은 날짜/시간/테마가 이미 예약됨 | `DuplicateReservationException` | 409 | 형식은 맞지만 현재 리소스 상태와 충돌한다 |\n| `reservationId=999`가 없음 | `ReservationNotFoundException` | 404 | 식별한 리소스를 찾을 수 없다 |\n| 관리자 예약 목록 접근인데 로그인 안 됨 | Spring Security authentication exception | 401 | 인증 주체가 없다 |\n| 일반 사용자가 관리자 API 접근 | Spring Security access denied | 403 | 인증은 됐지만 권한이 없다 |\n\n짧은 handler는 다음처럼 실패 의미를 HTTP 계약으로 번역한다.\n\n```java\n@ExceptionHandler(DuplicateReservationException.class)\nResponseEntity<ErrorResponse> handleDuplicate(DuplicateReservationException e) {\n    return ResponseEntity.status(HttpStatus.CONFLICT)\n        .body(ErrorResponse.of(\"RESERVATION_CONFLICT\", \"이미 예약된 시간입니다.\"));\n}\n```\n\n핵심은 domain exception class 이름을 외부에 그대로 노출하지 않는 것이다. 클라이언트에는 status, 안정적인 `code`, 사용자 행동을 돕는 message를 준다.\n\n## Status Mapping 기준\n\n| 상황 | 후보 status | 답변 포인트 |\n|---|---|---|\n| JSON syntax 오류, 타입 변환 실패 | 400 | 요청 형식 자체가 잘못됐다. |\n| Bean Validation 실패 | 400 또는 422 | 팀 계약에 따라 다르지만 field error를 구조화한다. |\n| 인증 누락 | 401 | 누구인지 증명되지 않았다. |\n| 권한 부족 | 403 | 인증은 됐지만 수행 권한이 없다. |\n| 대상 리소스 없음 | 404 | 식별한 리소스를 찾을 수 없다. |\n| 이미 예약됨, 상태 전이 충돌 | 409 | 요청 형식은 맞지만 현재 서버 상태와 충돌한다. |\n| 예상하지 못한 예외 | 500 | 내부 결함이며 세부 구현을 노출하지 않는다. |\n\n## 코드 리뷰 포인트\n\n- 모든 business exception을 400으로 보내면 클라이언트가 재입력 문제와 상태 충돌을 구분하기 어렵다.\n- handler마다 body 모양이 달라지면 프론트엔드와 API 사용자에게 예외 처리가 분산된다.\n- `Exception.class` handler는 최후 방어선으로 두되, domain에서 예상 가능한 실패는 더 구체적인 handler로 먼저 매핑한다.\n- log level도 구분한다. 사용자 입력 오류를 서버 장애처럼 error log로 쌓으면 운영 신호가 흐려진다.\n\n## Caveat\n\n- 422는 HTTP 의미상 validation 실패에 잘 맞을 수 있지만, 팀/미션 API 계약이 400을 요구하면 400으로 맞추고 error code로 세분화한다.\n- 같은 \"중복\"이라도 idempotency key가 있는 생성 요청은 409가 아니라 기존 결과 반환, 200/201 재응답, 303 redirect 같은 계약이 더 맞을 수 있다.\n- DB unique constraint 예외를 그대로 409로 바꾸면 안 된다. 어떤 비즈니스 충돌인지 식별 가능한 domain exception으로 변환한 뒤 매핑한다.\n- `@ControllerAdvice`가 인증/인가 예외까지 모두 잡는다고 가정하지 않는다. Spring Security filter chain에서 먼저 처리되는 예외는 `AuthenticationEntryPoint`, `AccessDeniedHandler` 경계를 같이 봐야 한다.\n- 500 응답 body에는 stack trace, SQL, entity class name, 내부 enum 값을 노출하지 않는다.\n\n## 역할별 검증\n\n| 역할 | 확인 질문 | 통과 기준 |\n|---|---|---|\n| API 설계자 | 같은 실패 의미가 같은 status/code/body 모양으로 나가는가 | OpenAPI 또는 REST Docs 예제가 400/404/409/500을 구분해 보여준다 |\n| 백엔드 구현자 | handler 우선순위가 구체 예외에서 일반 예외 순서인가 | duplicate/not-found/validation 테스트가 각각 기대 status와 body를 검증한다 |\n| 프론트엔드/클라이언트 | status만 보고도 다음 행동을 고를 수 있는가 | field error는 입력 강조, 409는 새로고침/다른 시간 선택, 500은 재시도 안내로 분기된다 |\n| 운영 담당 | 사용자 오류와 서버 장애 로그가 섞이지 않는가 | 4xx는 낮은 log level 또는 요약 지표, 5xx는 trace id와 stack trace로 추적 가능하다 |\n\n## 짧은 모범 답변\n\n이 상황은 JSON 형식이나 필드 타입 문제가 아니라, 이미 존재하는 예약과 새 요청이 서버의 현재 상태에서 충돌하는 경우입니다. 그래서 400으로만 처리하기보다 409 Conflict 후보를 검토하고, `@ControllerAdvice`에서 일관된 error body로 \"다른 시간 선택\" 같은 다음 행동을 알려주는 응답을 만드는 것이 자연스럽습니다.\n\n## 약점 태그\n\n`http-status-mapping`, `business-conflict`, `controller-advice`\n\n## 복습 연결 concept\n\n`spring/spring-controller-advice-error-taxonomy-bridge`\n",
+  "aliases": [
+    "controlleradvice status mapping drill",
+    "exception to http status practice",
+    "ControllerAdvice status drill",
+    "예외 상태 코드 매핑 연습",
+    "@Controller",
+    "@ControllerAdvice",
+    "@ExceptionHandler"
+  ],
+  "expected_queries": [
+    "예외를 HTTP status로 매핑하는 drill을 풀고 싶어",
+    "validation 실패와 business conflict status를 구분하는 연습해줘",
+    "ControllerAdvice handler 설계를 문제로 확인하고 싶어"
+  ],
+  "symptoms": [
+    "모든 예외를 400으로 보내요",
+    "domain conflict와 request format error를 구분하지 못해요",
+    "handler마다 response body가 달라요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-controller-advice-error-taxonomy-bridge"
+    ],
+    "next_docs": [
+      "spring/problemdetail-error-response-design"
+    ],
+    "confusable_with": [
+      "spring/spring-controller-advice-error-taxonomy-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/controller-advice-status-mapping-drill.md",
+    "revision_history": []
+  }
+}

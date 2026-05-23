@@ -1,0 +1,54 @@
+{
+  "id": "system-design/notification-system-design",
+  "title": "Notification 시스템 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Notification 시스템 설계를 다루는 deep_dive 문서다. 알림 시스템은 이벤트를 여러 채널로 전달하면서 중복, 순서, 우선순위, 재시도를 함께 다루는 분산 메시징 설계다. 검색 질의가 notification system design, notification architecture, 알림 시스템 설계, 알림 시스템 뭐예요처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Notification 시스템 설계\n\n> 한 줄 요약: 알림 시스템은 이벤트를 여러 채널로 전달하면서 중복, 순서, 우선순위, 재시도를 함께 다루는 분산 메시징 설계다.\n\nretrieval-anchor-keywords: notification system design, notification architecture, 알림 시스템 설계, 알림 시스템 뭐예요, notification system basics, 처음 배우는데 알림 시스템, 알림 큰 그림, push email sms in-app 차이, 알림 채널 언제 나누나요, notification queue, notification retry backoff, 알림 중복 왜 생기나요, idempotency dedup, user notification preference, delivery status read status, notification routing\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [메시지 큐 기초](./message-queue-basics.md)\n> - [Consistency, Idempotency, and Async Workflow Foundations](./consistency-idempotency-async-workflow-foundations.md)\n> - [Email Delivery Platform 설계](./email-delivery-platform-design.md)\n> - [Webhook Delivery Platform 설계](./webhook-delivery-platform-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Timeout, Retry, Backoff 실전](../network/timeout-retry-backoff-practical.md)\n> - [Duplicate Suppression Windows](../database/duplicate-suppression-windows.md)\n> - [Domain Events vs Integration Events](../design-pattern/domain-events-vs-integration-events.md)\n\n---\n\n## 핵심 개념\n\n알림 시스템은 \"이벤트를 보여주는 UI\"가 아니라, **사용자에게 전달 가능한 상태로 바꾸는 파이프라인**이다.\n처음 배우는데 헷갈리면 \"알림함 화면\"보다 \"이벤트를 큐에 넣고 채널별로 배달하는 흐름\"으로 먼저 잡는 편이 이해가 빠르다.\n\n여기서 다뤄야 하는 문제:\n\n- in-app, email, push, SMS를 어떻게 나눌 것인가\n- 실패한 전달을 어떻게 재시도할 것인가\n- 중복 알림을 어떻게 막을 것인가\n- 사용자 선호도와 채널 우선순위를 어떻게 반영할 것인가\n- 대규모 burst를 어떻게 흡수할 것인가\n\n알림 시스템은 보통 push와 pull을 같이 쓴다.\n\n- push: 즉시 보내기\n- pull: 앱 열었을 때 재확인\n\n---\n\n## 깊이 들어가기\n\n### 1. 요구사항 분리\n\n먼저 확인해야 할 질문:\n\n- 실시간성이 중요한가\n- 유실이 허용되는가\n- 읽음/확인 상태가 필요한가\n- 사용자별 채널 설정이 있는가\n- 마케팅 알림과 시스템 알림을 분리해야 하는가\n\n알림은 대부분 \"즉시성\"보다 \"신뢰성\"이 중요하다.  \n따라서 순서와 재시도 정책을 먼저 정해야 한다.\n\n### 2. 채널 분리\n\n채널별로 실패 양상이 다르다.\n\n| 채널 | 장점 | 단점 | 특징 |\n|------|------|------|------|\n| In-app | 즉시 표시 | 앱이 떠 있어야 함 | 상태 관리가 쉽다 |\n| Push | 모바일 친화적 | 토큰 만료/OS 제약 | 운영 복잡도가 높다 |\n| Email | 범용적 | 지연이 크다 | 비동기 처리에 적합 |\n| SMS | 전달률이 높다 | 비용이 크다 | 중요 알림에 사용 |\n\n알림은 채널별 어댑터를 따로 두는 편이 안전하다.\n\n### 3. 이벤트와 중복 제거\n\n알림은 같은 이벤트가 여러 번 들어올 수 있다.  \n그래서 idempotency key가 필요하다.\n\n흐름:\n\n1. 도메인 이벤트 생성\n2. notification job에 적재\n3. idempotency key로 중복 제거\n4. 채널별 전송\n5. 성공/실패 상태 기록\n\n### 4. 우선순위와 라우팅\n\n모든 알림이 같은 급은 아니다.\n\n- 보안/로그인: 높은 우선순위\n- 주문/결제: 높은 우선순위\n- 마케팅: 낮은 우선순위\n\n우선순위가 있는 경우 queue를 분리해야 한다.  \n하나의 큐에 섞으면 중요한 알림이 밀린다.\n\n### 5. 재시도와 백오프\n\n외부 전송은 실패가 기본이다.\n\n필요한 정책:\n\n- timeout\n- retry\n- exponential backoff\n- dead-letter queue\n- circuit breaker\n\n이 부분은 [Timeout, Retry, Backoff 실전](../network/timeout-retry-backoff-practical.md)과 강하게 연결된다.\n\n### 6. 상태 모델\n\n알림 상태는 보통 이렇게 간다.\n\n```text\ncreated -> queued -> sent -> delivered -> read\n                    \\-> failed -> retrying\n```\n\n상태가 많아질수록 운영은 쉬워지지만, 제품과 분석 복잡도도 같이 올라간다.\n\n### 7. 데이터 모델\n\n핵심 테이블 예시:\n\n- notification_event\n- user_notification_setting\n- notification_delivery\n- notification_template\n\n조회 패턴은 보통 \"내 알림함 최신순\"이므로 정렬 인덱스와 pagination cursor가 중요하다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 완료 알림\n\n주문 완료는 시스템 핵심 알림이다.\n\n설계:\n\n- 이벤트 발행\n- in-app + push 동시 처리\n- 중복 제거\n- 실패 시 재시도\n\n### 시나리오 2: 마케팅 대량 발송\n\n수백만 사용자에게 동시에 보내면 burst가 생긴다.\n\n대응:\n\n- rate limit\n- queue 분리\n- 발송 창 분산\n- 사용자별 opt-out 확인\n\n### 시나리오 3: 모바일 토큰 만료\n\n푸시 토큰이 만료되면 실패가 연속 발생한다.\n\n대응:\n\n- 실패 토큰 격리\n- 토큰 refresh job\n- 실패율 메트릭\n\n---\n\n## 코드로 보기\n\n```pseudo\nfunction publishNotification(event):\n    if dedup.exists(event.id):\n        return\n\n    dedup.save(event.id, ttl=24h)\n    queue.publish(event)\n```\n\n```java\npublic void handle(NotificationEvent event) {\n    if (dedupRepository.exists(event.id())) {\n        return;\n    }\n\n    dedupRepository.save(event.id(), Duration.ofHours(24));\n    notificationQueue.publish(event);\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|-------------|\n| Sync send | 구현이 단순 | 지연과 실패가 사용자에게 직접 전파 | 아주 작은 서비스 |\n| Async queue | 탄력적이다 | 상태 추적이 복잡하다 | 대부분의 실서비스 |\n| Push 우선 | 즉시성 좋다 | OS/토큰 관리가 필요 | 모바일 중심 |\n| Pull 우선 | 단순하고 안정적 | 즉시성이 떨어진다 | 조회형 알림 |\n\n알림은 빠르게 보내는 것보다, **중복 없이 적절한 채널로 보내는 것**이 더 중요하다.\n\n## 꼬리질문\n\n> Q: 같은 알림을 여러 번 보내지 않으려면 어떻게 하나요?\n> 의도: idempotency와 dedup 설계 이해 여부 확인\n> 핵심: 이벤트 id 기반 중복 제거가 필요하다\n\n> Q: 마케팅과 시스템 알림을 같은 큐에 넣으면 왜 안 되나요?\n> 의도: 우선순위와 장애 격리 이해 여부 확인\n> 핵심: 중요한 알림이 밀리고 운영상 격리가 안 된다\n\n## 한 줄 정리\n\n알림 시스템은 채널 전송이 아니라 중복, 우선순위, 재시도를 다루는 이벤트 파이프라인이다.\n",
+  "aliases": [
+    "notification system design",
+    "notification architecture",
+    "알림 시스템 설계",
+    "알림 시스템 뭐예요",
+    "notification system basics",
+    "처음 배우는데 알림 시스템",
+    "알림 큰 그림",
+    "push email sms in-app 차이",
+    "알림 채널 언제 나누나요",
+    "notification queue",
+    "notification retry backoff",
+    "알림 중복 왜 생기나요"
+  ],
+  "expected_queries": [
+    "Notification 시스템 설계 설계 핵심을 설명해줘",
+    "notification system design가 왜 필요한지 알려줘",
+    "Notification 시스템 설계 실무 트레이드오프는 뭐야?",
+    "notification system design 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Notification 시스템 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Notification 시스템 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Notification 시스템 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [
+      "system-design/notification-preferences-graph-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/notification-system-design.md",
+    "revision_history": []
+  }
+}

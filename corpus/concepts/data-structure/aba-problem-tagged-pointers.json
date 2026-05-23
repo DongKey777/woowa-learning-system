@@ -1,0 +1,57 @@
+{
+  "id": "data-structure/aba-problem-tagged-pointers",
+  "title": "ABA Problem and Tagged Pointers",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# ABA Problem and Tagged Pointers\n\n> 한 줄 요약: ABA 문제는 lock-free CAS가 \"값이 다시 같아졌으니 안전하다\"고 오판하는 상황이며, tagged pointer나 sequence number는 세대 정보를 붙여 이런 재사용 착시를 줄이는 대표 기법이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Bounded MPMC Queue](./bounded-mpmc-queue.md)\n> - [Sequencer-Based Ring Buffer Coordination](./sequencer-based-ring-buffer-coordination.md)\n> - [Michael-Scott Lock-Free Queue](./michael-scott-lock-free-queue.md)\n> - [Hazard Pointers vs Epoch-Based Reclamation](./hazard-pointers-vs-epoch-based-reclamation.md)\n> - [Reclamation Cost Trade-offs](./reclamation-cost-tradeoffs.md)\n\n> retrieval-anchor-keywords: aba problem, tagged pointer, versioned pointer, versioned index, sequence number as tag, lock-free cas bug, pointer reuse race, lock-free memory safety, compare and swap aba, stamped reference, concurrent pointer versioning, slot generation counter, ring buffer wraparound bug, nonblocking algorithm pitfall\n\n## 핵심 개념\n\nCAS는 \"지금 읽은 값과 메모리 값이 같으면 안전하다\"는 가정 위에 선다.  \nABA 문제는 이 가정이 깨지는 순간이다.\n\n- thread A가 포인터 값을 읽음: `A`\n- 다른 thread가 `A -> B -> A`로 바꿈\n- thread A는 여전히 `A`를 보므로 안전하다고 착각\n\n즉 값이 다시 같아졌다고 해서,  \n**그 사이에 아무 일도 없었다는 뜻은 아니다**.\n\n## 깊이 들어가기\n\n### 1. 왜 lock-free 구조에서 치명적인가\n\nlinked stack, queue, free list는 포인터를 CAS로 많이 갱신한다.  \n이때 node가 제거됐다가 재사용되면 pointer 값만 보고는 변화를 놓칠 수 있다.\n\n대표 위험:\n\n- stale next pointer\n- double unlink\n- reclaimed node reuse\n- broken logical ordering\n\n즉 ABA는 correctness bug이면서 memory safety bug로 이어질 수 있다.\n\n핵심은 \"같은 값\"이 아니라  \n**같은 identity와 같은 시점이 맞는가**다.\n\n### 2. tagged pointer는 세대(version)를 같이 비교한다\n\n가장 대표적인 완화책은 pointer에 version/stamp를 붙이는 것이다.\n\n- `(ptr, version)`을 함께 CAS\n- pointer 값이 같아도 version이 다르면 실패\n\n그래서 `A -> B -> A`가 일어나도\n\n- pointer는 `A`\n- version은 증가\n\n하게 만들어 \"같아 보이는 착시\"를 줄인다.\n\n배열 기반 구조에선 꼭 pointer가 아니어도 된다.\n\n- `(index, lap)` 조합\n- slot sequence\n- publish version\n\n같이 **세대가 붙은 위치 정보**도 같은 역할을 한다.\n\n### 3. bounded ring도 ABA 모양의 문제를 겪는다\n\n\"ABA는 linked list 전용 문제\"라고 생각하면 위험하다.\n\nbounded ring에서도 raw index만 보면 비슷한 착시가 생긴다.\n\n- producer가 index `5`를 봄\n- ring이 한 바퀴 돌아 다시 index `5`를 재사용\n- 값은 같은 index `5`지만 slot의 의미는 이전 회차와 다름\n\n그래서 bounded MPMC queue가 slot마다 sequence를 두는 것이다.\n\n- `5`라는 index만 비교하지 않고\n- `5`의 몇 번째 reuse 세대인지까지 본다\n\n즉 per-slot sequence는 anti-ABA 성격의 generation tag다.  \nsequencer cursor 역시 단순 배열 위치가 아니라 진행 세대를 표현한다.\n\n### 4. tagged pointer가 만능은 아니다\n\nABA를 완화한다고 memory reclamation이 해결되진 않는다.\n\n- tagged pointer: 재사용 착시 감지\n- hazard pointer / EBR: 언제 free해도 안전한지 관리\n\n즉 tagged pointer는 reclamation 대체재가 아니라  \n**다른 종류의 문제를 줄이는 보조 기법**이다.\n\n실전에서는 세 가지를 분리해서 말해야 한다.\n\n- ABA 감지: pointer/index에 version을 붙여 중간 변화를 보이게 한다.\n- lifetime safety: Hazard Pointer, EBR, reference counting 등으로 아직 보는 node를 free/reuse하지 않는다.\n- visibility/order: publish된 payload와 next pointer를 올바른 memory ordering으로 보이게 한다.\n\n하나가 있다고 나머지가 자동으로 따라오지 않는다.\n\n### 5. reclamation이 섞이면 더 위험해진다\n\nABA가 특히 위험해지는 순간은 object reuse가 빨라질 때다.\n\n- freelist에서 방금 제거한 node를 즉시 재할당\n- queue payload가 pooled descriptor를 재사용\n- off-heap/native node를 짧은 주기로 돌려씀\n\n이 경우 값이 다시 같아질 확률이 커지고,  \n잘못 성공한 CAS는 stale pointer를 구조 내부로 되돌려놓을 수 있다.\n\n그래서 실전 lock-free 구조는 보통 둘을 같이 본다.\n\n- version tag로 \"같아 보이는 착시\"를 줄임\n- safe reclamation으로 \"아직 보면 안 되는 객체\"를 늦게 회수\n\n### 6. GC 언어에서도 개념은 중요하다\n\nGC가 있으면 free/use-after-free 리스크는 줄지만,  \nCAS linearization bug 자체가 사라지는 것은 아니다.\n\n특히:\n\n- stamped reference\n- versioned index\n- sequence number\n\n같은 패턴은 JVM에서도 여전히 의미가 있다.\n\n### 7. backend에서 어디에 맞나\n\nABA는 락프리 자료구조와 freelist/reuse path에 특히 민감하다.\n\n- lock-free stack/list\n- node pool 재사용\n- intrusive queue\n- bounded ring의 slot generation\n- native runtime scheduler\n\n즉 \"값이 같으니 괜찮다\"는 CAS 감각을 경계하게 만드는 기본 문서에 가깝다.\n\n## 실전 시나리오\n\n### 시나리오 1: freelist 재사용\n\nnode를 반환 후 곧바로 다시 할당하는 패턴이 있으면  \npointer reuse 때문에 ABA 위험이 커진다.\n\n### 시나리오 2: lock-free stack\n\ntop pointer CAS 기반 구조는  \nABA 예시로 가장 자주 등장하는 고전 케이스다.\n\n### 시나리오 3: queue next pointer race\n\nMS Queue류 구조에서 reclamation과 재사용이 섞이면  \nABA와 safe reclamation을 동시에 봐야 한다.\n\n### 시나리오 4: bounded ring slot reuse\n\n배열 index만 보면 같은 slot처럼 보여도  \n실제로는 몇 바퀴를 돌았는지에 따라 의미가 달라진다.  \n이때 sequence/lap counter가 없으면 stale 판단이 들어오기 쉽다.\n\n### 시나리오 5: 부적합한 이해\n\n\"GC 있으니 ABA는 없다\"는 식의 이해가 가장 위험하다.  \nfree 문제와 CAS 선형화 문제는 층위가 다르다.\n\n## 재현 절차\n\nABA는 운 좋게 드러나는 race라서, 재현은 \"같은 값이 다시 나타나는 순서\"를 강제로 만들어야 한다.\n\n1. thread A가 `head = A`와 `A.next`를 읽은 뒤 CAS 직전에 멈춘다.\n2. thread B가 `A`를 pop하고, 다른 node를 push/pop해 head를 바꾼다.\n3. allocator나 freelist가 같은 주소의 `A`를 다시 head로 올리게 만든다.\n4. thread A를 재개해 CAS가 성공하는지 본다.\n5. CAS 성공 후 연결 관계가 A가 처음 읽은 `next`와 여전히 일관적인지 검사한다.\n\nbounded ring에서는 주소 대신 slot index로 같은 모양을 만든다.\nraw index가 한 바퀴 돌아 같은 값이 되었을 때, per-slot sequence가 없으면 이전 세대의 관찰과 현재 세대의 slot을 혼동할 수 있다.\n\n## 점검 체크리스트\n\n| 체크 | 의미 |\n|---|---|\n| CAS 비교 대상이 pointer/index만인가 | 중간 변화를 놓칠 수 있다 |\n| version/tag/sequence가 wrap될 수 있는가 | tag 폭이 작으면 ABA가 늦게 다시 열린다 |\n| tag 증가와 pointer 변경이 같은 원자 연산으로 비교되는가 | 따로 갱신하면 stamp 자체가 race가 될 수 있다 |\n| node reuse가 즉시 일어나는가 | ABA 재현 확률이 커진다 |\n| reclamation grace period가 있는가 | 아직 보는 node가 재사용되는지 확인한다 |\n| GC 언어라도 logical version을 비교하는가 | use-after-free와 linearization bug를 구분한다 |\n\n## 실패 모드 매트릭스\n\n| 증상 | 흔한 원인 | 확인 |\n|---|---|---|\n| CAS는 성공했는데 list/stack 연결이 깨짐 | pointer가 A-B-A를 거침 | CAS 전후 version/stamp 로그 |\n| ring buffer에서 stale slot을 읽음 | index만 보고 wrap-around 세대를 놓침 | per-slot sequence와 cursor lap |\n| tagged pointer가 있는데도 장애 | tag wrap 또는 reclamation 부재 | tag bit width, reuse interval |\n| version 로그는 맞는데 stale payload를 봄 | ABA가 아니라 publication ordering 문제 | release/acquire, volatile/CAS ordering |\n| GC 환경에서 순서가 꼬임 | memory free가 아니라 logical ABA | AtomicStampedReference/sequence 사용 여부 |\n| native 구조에서 드문 crash | freed node가 같은 주소로 재사용 | hazard/epoch 보호 구간 |\n\n## 검증 기준\n\ntagged pointer 검증은 \"CAS 실패율이 낮다\"가 아니다.\n\n- 같은 pointer/index라도 세대가 다르면 CAS가 실패해야 한다.\n- tag 폭은 실제 reuse 속도와 시스템 수명을 고려해 wrap 위험이 작아야 한다.\n- tagged pointer는 free 시점 보호가 아니므로 Hazard Pointer, EBR, reference counting 같은 reclamation 계약이 별도로 있어야 한다.\n- ring buffer의 sequence는 empty/full 판정뿐 아니라 slot reuse 세대 구분까지 설명할 수 있어야 한다.\n- stamp와 pointer는 같은 linearization point에서 비교되어야 한다. 둘을 따로 읽고 따로 갱신하면 ABA 완화가 약해진다.\n\n즉 tagged pointer는 ABA 착시를 줄이는 장치이고, memory reclamation은 \"언제 다시 써도 되는가\"를 정하는 장치다.\n\n## 코드로 보기\n\n```java\nimport java.util.concurrent.atomic.AtomicStampedReference;\n\npublic class TaggedPointerSketch<E> {\n    private final AtomicStampedReference<Node<E>> head =\n            new AtomicStampedReference<>(null, 0);\n\n    public void push(Node<E> node) {\n        while (true) {\n            int[] stampHolder = new int[1];\n            Node<E> current = head.get(stampHolder);\n            node.next = current;\n            int stamp = stampHolder[0];\n            if (head.compareAndSet(current, node, stamp, stamp + 1)) {\n                return;\n            }\n        }\n    }\n\n    static final class Node<E> {\n        E value;\n        Node<E> next;\n    }\n}\n```\n\n이 코드는 stamped pointer 감각만 보여준다.  \n실전 native 구조에선 wider CAS, tagged pointer packing, ring slot sequence, reclamation 전략까지 같이 봐야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Tagged Pointer / Stamped Reference | ABA 착시를 줄일 수 있다 | pointer 외 메타데이터 관리가 필요하다 | CAS 기반 pointer update |\n| Sequence Number / Versioned Index | 배열 slot 재사용과 wraparound를 세대 단위로 구분할 수 있다 | sequence protocol 설계가 복잡하다 | bounded ring, sequencer |\n| Hazard Pointer / EBR | safe free 시점을 관리한다 | ABA 자체를 직접 해결하진 않는다 | memory reclamation 문제 |\n| Lock 기반 구조 | reasoning이 단순해진다 | contention 비용이 커질 수 있다 | correctness가 더 중요할 때 |\n\n중요한 질문은 \"CAS가 같은 값을 봤다\"가 아니라  \n\"그 사이에 값이 다른 상태를 거쳤는가\", \"같은 index/pointer가 몇 번째 세대인가\"다.\n\n## 꼬리질문\n\n> Q: ABA가 왜 단순히 값 비교 문제를 넘어서 위험한가요?\n> 의도: pointer reuse와 stale state 문제를 이해하는지 확인\n> 핵심: 값이 다시 같아져도 그 사이 구조가 바뀌었을 수 있어 CAS가 잘못 성공할 수 있기 때문이다.\n\n> Q: bounded ring의 slot sequence도 tagged pointer와 같은 계열인가요?\n> 의도: pointer ABA와 generation counter를 연결하는지 확인\n> 핵심: 그렇다. pointer 대신 slot index에 세대 정보를 붙여 wraparound 재사용을 구분하는 anti-ABA 기법으로 볼 수 있다.\n\n> Q: tagged pointer가 reclamation을 대체하나요?\n> 의도: ABA 방지와 safe free를 구분하는지 확인\n> 핵심: 아니다. tagged pointer는 재사용 착시를 줄이고, reclamation은 free 시점을 관리한다.\n\n> Q: GC 언어에서도 왜 stamped reference가 나오나요?\n> 의도: memory safety와 linearization bug를 구분하는지 확인\n> 핵심: free는 막아줘도 CAS의 중간 상태 착각은 막아주지 않기 때문이다.\n\n## 한 줄 정리\n\nABA 문제는 CAS가 값의 동일성만 보고 구조적 변화를 놓치는 현상이고, tagged pointer나 sequence number는 그 착시를 줄이는 대표적인 세대 표식 기법이다.\n",
+  "aliases": [
+    "ABA problem",
+    "tagged pointer",
+    "versioned pointer",
+    "stamped reference",
+    "CAS ABA bug",
+    "sequence number as tag",
+    "lock-free pointer reuse",
+    "ring buffer generation counter"
+  ],
+  "expected_queries": [
+    "ABA 문제는 CAS에서 왜 생기고 tagged pointer는 무엇을 막아?",
+    "lock-free queue에서 pointer 값이 다시 같아지는 게 왜 위험한지 설명해줘",
+    "ring buffer의 sequence number가 ABA 문제와 어떤 관련이 있어?",
+    "tagged pointer와 hazard pointer는 각각 무엇을 해결하는지 비교해줘",
+    "CAS 성공이 항상 안전하지 않은 예시를 lock-free 자료구조 기준으로 알려줘"
+  ],
+  "symptoms": [
+    "CAS가 같은 포인터 값을 다시 보고 성공했지만 그 사이에 node가 제거됐다가 재사용됐을 가능성이 있다",
+    "bounded ring buffer에서 raw index만 비교해 wrap-around 이후 같은 slot을 이전 세대와 구분하지 못한다",
+    "tagged pointer를 memory reclamation 자체로 오해해 hazard pointer나 epoch 기반 회수와 역할이 섞인다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/bounded-mpmc-queue",
+      "operating-system/atomic-vs-lock"
+    ],
+    "next_docs": [
+      "data-structure/bounded-mpmc-queue",
+      "data-structure/michael-scott-lock-free-queue",
+      "data-structure/hazard-pointers-vs-epoch-based-reclamation",
+      "data-structure/reclamation-cost-tradeoffs"
+    ],
+    "confusable_with": [
+      "data-structure/hazard-pointers-vs-epoch-based-reclamation",
+      "data-structure/reclamation-cost-tradeoffs",
+      "data-structure/bounded-mpmc-queue",
+      "data-structure/michael-scott-lock-free-queue"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/aba-problem-and-tagged-pointers.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "id": "data-structure/backend-worker-queue-handoff-mission-bridge",
+  "title": "Backend Worker Queue Handoff Mission Bridge",
+  "category": "data-structure",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Backend Worker Queue Handoff Mission Bridge\n\n> 한 줄 요약: backend worker queue는 FIFO 자료구조 하나가 아니라 buffer, ownership, durability, retry, ordering, idempotency를 함께 정하는 handoff 계약이다.\n\n**난이도: Beginner**\n\n## CS 중심 mental model\n\nqueue handoff를 볼 때는 \"어떤 queue 클래스인가\"보다 아래 4가지를 먼저 고른다.\n\n| 축 | 질문 | 빠지면 생기는 사고 |\n|---|---|\n| Buffer | 어디에 쌓이는가 | process crash, DB 병목, broker lag를 구분하지 못함 |\n| Ownership | 누가 지금 처리권을 갖는가 | 두 worker가 같은 작업을 동시에 처리함 |\n| Failure | 실패하면 재시도, 격리, 폐기 중 무엇인가 | 무한 retry나 조용한 유실이 생김 |\n| Side effect | 같은 작업이 다시 와도 안전한가 | 결제, 주문, 알림이 중복 실행됨 |\n\n즉 queue는 \"줄 세우기\"만이 아니다. producer가 넣는 순간부터 consumer가 ack하거나 완료 상태를 저장하는 순간까지의 계약이다.\n\n## In-memory queue vs DB table queue vs broker\n\n| 선택지 | 잘 맞는 상황 | 강점 | 반드시 확인할 약점 |\n|---|---|---|---|\n| In-memory queue (`BlockingQueue`, bounded ring buffer) | 같은 process 안에서 요청 thread와 worker thread를 짧게 분리 | 빠르고 단순, thread-safe handoff 가능 | process crash 때 작업 유실, 재시작 복구 없음, 여러 instance 공유 어려움 |\n| DB table queue | 업무 DB transaction과 job 생성을 함께 묶고 싶음 | durable row, fresh read, 상태/attempt/lease를 SQL로 관찰 가능 | polling 비용, hot row/index, `SKIP LOCKED` fairness, cleanup과 vacuum/purge 비용 |\n| Broker queue/stream | 여러 service/instance가 처리하고 lag, replay, fanout이 필요함 | ack/nack, consumer group, DLQ, partition, retention 같은 운영 기능 | broker 운영 복잡도, 중복 전달 가능성, ordering scope, consumer idempotency 필요 |\n\n초급 미션에서는 이렇게 물으면 된다.\n\n- \"서버가 죽어도 이 작업이 남아야 하나?\"\n- \"여러 서버가 같은 queue를 같이 봐야 하나?\"\n- \"실패한 작업을 운영자가 찾아 재처리해야 하나?\"\n- \"업무 DB commit과 enqueue를 같은 원자성으로 묶어야 하나?\"\n\n하나라도 예이면 단순 in-memory queue만으로는 부족하다. DB table queue, outbox, broker, 또는 둘의 조합을 검토한다.\n\n## Bounded queue와 backpressure\n\nWorker queue는 unbounded로 두면 장애가 늦게 터진다. 메모리 queue든 DB queue든 broker든 capacity를 정하고 full 상태의 계약을 써야 한다.\n\n| Full 정책 | 의미 | backend에서의 주의점 |\n|---|---|---|\n| Reject | 지금은 받지 않음 | HTTP라면 `429`/`503`, retry-after, 사용자 메시지까지 계약해야 함 |\n| Block | producer가 기다림 | 요청 thread를 오래 잡으면 thread pool 고갈과 장애 전파가 생김 |\n| Drop | 버림 | telemetry나 best-effort 알림 정도에만 제한적으로 사용 |\n| Spill/durable handoff | 더 durable한 저장소로 넘김 | DB/outbox/broker와 중복 처리 정책이 같이 필요 |\n\n`blocking`은 local producer thread가 기다리는 동작이고, `backpressure`는 상류가 덜 만들게 하는 시스템 계약이다. 좋은 답변은 queue depth만 말하지 않고 oldest age, reject count, producer latency, consumer lag, retry rate를 함께 본다.\n\n## Retry, DLQ, poison message\n\n재시도는 \"실패하면 다시 한다\"가 아니라 budget이 있는 상태 전이다.\n\n- retryable failure: timeout, 일시적 5xx, rate limit처럼 시간이 지나면 성공할 수 있는 오류다. backoff, jitter, max attempts가 필요하다.\n- terminal failure: payload schema 오류, 없는 참조 row, 잘못된 상태 전이처럼 그대로 다시 돌려도 실패하는 오류다.\n- poison message: 특정 메시지가 deterministic하게 consumer를 계속 실패시키는 경우다. 정상 traffic과 격리하지 않으면 queue 전체가 막힌다.\n- DLQ: 실패 메시지를 버리는 쓰레기통이 아니라 원인, attempt, payload/version, producer, replay 조건을 붙여 격리하는 저장소다.\n\nDLQ로 보낸 뒤에도 끝이 아니다. 원인을 고친 뒤 canary replay를 하고, replay 중 idempotency guard가 작동하는지 확인해야 한다.\n\n## Visibility timeout과 lease\n\nBroker의 visibility timeout이나 DB table queue의 lease는 같은 문제를 푼다. worker가 작업을 claim하면 일정 시간 동안 다른 worker에게 보이지 않게 하거나 `PROCESSING` 상태로 소유권을 준다. 시간 안에 ack/complete/renew를 못 하면 다시 보이게 한다.\n\n이 장치는 \"정확히 한 번 실행\" 보장이 아니다.\n\n- timeout이 너무 짧으면 느린 worker와 새 worker가 같은 작업을 동시에 처리할 수 있다.\n- timeout이 너무 길면 죽은 worker가 잡은 작업 복구가 늦다.\n- 오래 걸리는 작업은 heartbeat/renew가 필요하다.\n- stale worker가 늦게 완료 write를 시도할 수 있으므로 output unique key, fencing token, 상태 전이 조건이 필요하다.\n\nDB table queue라면 흔히 `status`, `attempts`, `locked_by`, `lease_until`, `last_error`, `available_at`, `idempotency_key` 같은 필드가 등장한다. Broker라면 message id, delivery attempt, ack deadline, partition/offset, DLQ topic을 본다.\n\n## Ordering\n\nQueue라는 이름이 전체 순서를 보장한다는 뜻은 아니다.\n\n- local FIFO는 같은 process, 같은 queue 안에서 poll 순서를 기대한다.\n- DB table queue는 `ORDER BY created_at`을 써도 병렬 claim, lock skip, retry 재삽입 때문에 완료 순서가 달라질 수 있다.\n- broker는 보통 partition/key 단위 순서를 제공하고, 전체 순서를 요구하면 처리량과 가용성이 크게 줄어든다.\n- retry와 DLQ는 순서를 깨는 대표 경로다. 오래 실패한 메시지를 앞에 계속 두면 head-of-line blocking이 생긴다.\n\nbackend 답변에서는 \"무엇의 순서인가\"를 먼저 좁힌다. 주문별, 사용자별, aggregate별 순서가 필요한지, 아니면 전체 이벤트 순서를 착각한 것인지 분리한다.\n\n## Idempotency\n\nAt-least-once handoff를 선택하면 duplicate는 정상 가능성이다. 그래서 consumer는 재전달을 견뎌야 한다.\n\n좋은 기본값:\n\n- message id나 business key를 processed table/unique constraint로 기록한다.\n- 결제 승인, 포인트 적립, 쿠폰 사용 같은 side effect는 상태 전이 조건으로 막는다.\n- `commit -> ack` 순서를 기본으로 두고, ack 전 crash 후 재전달을 idempotency로 닫는다.\n- replay와 retry는 같은 handler path를 타되 replay marker와 attempt 정보를 남긴다.\n\n\"큐를 쓰면 중복 처리가 사라진다\"는 틀린 문장이다. 큐는 중복을 없애는 장치가 아니라 중복 가능성을 관찰하고 제어할 수 있는 경계다.\n\n## 리뷰 신호\n\n- \"일단 queue에 넣겠습니다\": 어떤 저장 위치와 failure semantics인지 다시 묻는다.\n- \"비동기로 빼면 빠릅니다\": 응답 latency와 후속 작업 보장의 trade-off를 설명해야 한다.\n- \"메모리 queue면 충분하죠?\": process crash, scale-out, 재처리 필요성을 확인한다.\n- \"가득 차면 기다리면 됩니다\": 요청 thread 고갈과 backpressure propagation을 본다.\n- \"실패하면 재시도하면 됩니다\": max attempts, backoff, DLQ, poison 분류가 있는지 본다.\n- \"순서 보장 queue니까 괜찮습니다\": ordering scope가 전체인지 key/partition 단위인지 확인한다.\n\n## Wrong buckets\n\n| 말한 답 | wrong bucket | 더 정확한 버킷 |\n|---|---|---|\n| 결제 후속 작업을 `ArrayDeque`에 넣으면 안전하다 | local FIFO | durable handoff, outbox, DB queue/broker 검토 |\n| `BlockingQueue`를 쓰면 backpressure가 된다 | local blocking | upstream admission control과 full response contract |\n| DB table queue면 broker가 필요 없다 | storage choice | lease, retry, DLQ, lag 관측, cleanup 비용까지 포함한 job queue |\n| visibility timeout이 있으면 중복 실행이 없다 | lease를 lock으로 오해 | timeout 후 redelivery와 stale worker write를 idempotency/fencing으로 방어 |\n| DLQ로 보내면 해결됐다 | 격리를 해결로 오해 | failure class, fix-forward, canary replay, 재유입률 확인 |\n\n## 검증 질문\n\n1. process가 enqueue 직후 죽으면 작업은 남는가, 사라져도 되는가?\n2. queue가 full이면 caller는 어떤 status, retry-after, 또는 degraded response를 받는가?\n3. worker가 side effect 성공 후 ack 전에 죽으면 같은 메시지가 다시 와도 안전한가?\n4. worker가 lease 만료 뒤 늦게 완료 write를 하면 저장소가 거부하는가?\n5. retry가 같은 poison message를 정상 traffic 앞에서 계속 막지 않는가?\n6. ordering 보장은 전체인가, business key/partition 단위인가?\n7. DLQ 메시지를 replay하기 전에 어떤 fix와 idempotency 증거를 확인하는가?\n\n## Review Links\n\n- [ArrayDeque vs BlockingQueue Service Handoff Primer](./arraydeque-vs-blockingqueue-service-handoff-primer.md)\n- [Bounded Queue Policy Primer](./bounded-queue-policy-primer.md)\n- [Queue Consumer Transaction Boundaries](../database/queue-consumer-transaction-boundaries.md)\n- [Transactional Claim-Check and Job Leasing](../database/transactional-claim-check-job-leasing.md)\n- [Queue Delivery Semantics Beginner Primer](../system-design/queue-delivery-semantics-beginner-primer.md)\n- [DLQ Poison Message Replay Playbook](../system-design/dlq-poison-message-replay-playbook.md)\n",
+  "aliases": [
+    "backend worker queue handoff bridge",
+    "worker queue mission bridge",
+    "BlockingQueue backend bridge",
+    "queue handoff backpressure bridge",
+    "백엔드 worker queue 브리지"
+  ],
+  "expected_queries": [
+    "backend worker queue handoff를 mission bridge로 설명해줘",
+    "queue에 넣으면 결제 후속 작업이 안전해지는지 판단 기준이 뭐야?",
+    "ArrayDeque BlockingQueue durable job queue를 백엔드 미션 장면으로 연결해줘",
+    "bounded queue가 가득 차면 어떤 backpressure 계약을 정해야 해?",
+    "worker crash duplicate processing까지 고려하면 queue 문서를 어디로 이어가?"
+  ],
+  "symptoms": [
+    "결제 후속 작업이나 알림 작업을 queue에 넣으면 자동으로 안전해진다고 생각한다",
+    "ArrayDeque, BlockingQueue, durable job queue의 책임 차이를 설명하지 못한다",
+    "queue full, worker crash, duplicate processing 정책을 정하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/arraydeque-vs-blockingqueue-service-handoff-primer",
+      "data-structure/bounded-queue-policy-primer"
+    ],
+    "next_docs": [
+      "data-structure/backend-queue-handoff-selection-drill",
+      "software-engineering/message-driven-adapter",
+      "system-design/retry-amplification-and-backpressure-primer"
+    ],
+    "confusable_with": [
+      "data-structure/arraydeque-vs-blockingqueue-service-handoff-primer",
+      "data-structure/bounded-queue-policy-primer",
+      "software-engineering/message-driven-adapter"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/backend-worker-queue-handoff-mission-bridge.md",
+    "revision_history": []
+  }
+}

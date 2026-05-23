@@ -1,0 +1,74 @@
+{
+  "id": "software-engineering/service-layer-transaction-scope-chooser",
+  "title": "Service Layer Transaction Scope chooser — @Transactional 어디에 둘까",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# Service Layer Transaction Scope chooser — @Transactional 어디에 둘까\n\n> 한 줄 요약: `@Transactional`은 **usecase 한 단위(보통 service method)** 에 두고\n> propagation REQUIRED 기본 + readOnly 최적화 + 외부 API/긴 작업은 트랜잭션 바깥으로\n> 빼는 게 default다. NESTED/REQUIRES_NEW는 specific scenario에서만.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Spring @Transactional 기초](../spring/spring-transactional-basics.md)\n- [트랜잭션 기초](../database/transaction-basics.md)\n- [트랜잭션 격리수준과 락](../database/transaction-isolation-locking.md)\n- [트랜잭션 실전 시나리오](../database/transaction-case-studies.md)\n- [Business vs Technical Exception primer](./business-vs-technical-exception-primer.md)\n- [software-engineering 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: service layer transaction scope chooser, @Transactional 위치, propagation REQUIRED REQUIRES_NEW NESTED, readOnly 최적화, transaction boundary usecase, 외부 API 트랜잭션 분리, rollback rules custom, transaction self-invocation, long-running transaction 위험\n\n## 먼저 멘탈모델 — Transaction Boundary\n\n\"트랜잭션 경계\"는 **하나의 ACID 단위**. 그 안의 모든 SQL은 commit 또는 rollback 한 묶음.\n\n```\n[Begin Tx] SQL1 SQL2 SQL3 [Commit]\n또는\n[Begin Tx] SQL1 SQL2 ERROR [Rollback]\n```\n\n이 boundary를 어디에 두는지가 핵심 design 결정. 보통은:\n- **Service method 한 개 = 트랜잭션 한 개** (가장 흔함)\n- **Usecase 단위** = \"사용자가 주문하기\" 같은 비즈니스 단위\n\n## 30초 분기표\n\n| 결정 | 권장 |\n|---|---|\n| @Transactional 위치 | **Service method** (controller/repository 아님) |\n| 기본 propagation | REQUIRED (default) |\n| 조회만 하는 메서드 | `@Transactional(readOnly = true)` |\n| 분리된 secondary 작업 | REQUIRES_NEW |\n| 부분 rollback이 필요한 nested | NESTED (DB 지원 필요) |\n| 외부 API 호출 (slow) | 트랜잭션 바깥으로 분리 |\n| 비동기 처리 | `@Async` + 별도 트랜잭션 |\n| Distributed transaction | Saga 패턴 (XA보다) |\n\n## @Transactional 위치 — 3 layer 비교\n\n### Controller에 두기 — ❌\n\n```java\n@RestController\npublic class OrderController {\n    @PostMapping(\"/orders\")\n    @Transactional  // ← controller에 두면 안 됨\n    public OrderResponse createOrder(...) { ... }\n}\n```\n\n**왜 안 좋은가**:\n- HTTP 요청 처리 전체가 트랜잭션 → request parsing, JSON 직렬화도 포함\n- HTTP 시간 = 트랜잭션 시간 → 의도치 않게 long-running tx\n- Service가 다른 곳(scheduler 등)에서 호출될 때 트랜잭션 누락\n\n### Service에 두기 — ✅ (default)\n\n```java\n@Service\npublic class OrderService {\n    @Transactional\n    public Order createOrder(CreateOrderCmd cmd) {\n        Order order = ...;\n        repo.save(order);\n        inventoryService.decrement(...);\n        return order;\n    }\n}\n```\n\n**왜 좋은가**:\n- 비즈니스 단위 = 트랜잭션 단위 자연스러움\n- Controller가 얇아짐 (HTTP만)\n- Reusable: scheduler/batch에서도 같은 method 호출 가능\n\n### Repository에 두기 — ❌ (또는 비추)\n\nSpring Data JPA는 default로 method 단위 트랜잭션을 자동 적용. Repository에 직접\n`@Transactional` 추가는 보통 의미 X.\n\n**문제**: Service에서 여러 repository 호출 → 각각 다른 트랜잭션 → 일관성 깨짐.\n\n## Propagation 7가지\n\n| Propagation | 동작 | 언제 |\n|---|---|---|\n| **REQUIRED** (default) | 있으면 합류, 없으면 새 트랜잭션 | 거의 모든 경우 |\n| REQUIRES_NEW | 새 트랜잭션, 기존은 일시 정지 | 독립적인 secondary 작업 |\n| NESTED | savepoint 기반 nested 트랜잭션 | 부분 rollback 필요 |\n| SUPPORTS | 있으면 합류, 없으면 non-transactional | 트랜잭션 안 필요 |\n| NOT_SUPPORTED | 기존 트랜잭션 정지, non-transactional | DB 호출 안 함 |\n| NEVER | 있으면 예외 | 트랜잭션 안 되어야만 |\n| MANDATORY | 없으면 예외 | 반드시 트랜잭션 안에서 |\n\n### REQUIRED — Default, 가장 흔함\n\n```java\n@Transactional  // REQUIRED 기본\npublic void doA() {\n    repo.save(...);\n    doB();  // 이 호출도 같은 트랜잭션\n}\n\n@Transactional\npublic void doB() {\n    repo.save(...);  // doA와 같은 트랜잭션\n}\n```\n\n`doA` 호출에서 `doB`는 합류. 둘 중 하나 실패 시 둘 다 rollback.\n\n### REQUIRES_NEW — 독립적 트랜잭션\n\n```java\n@Transactional\npublic void doA() {\n    repo.save(orderA);\n    logService.logEvent(...);  // 이 호출은 별도 트랜잭션\n    // logEvent 실패해도 orderA는 commit\n}\n\n@Service\npublic class LogService {\n    @Transactional(propagation = REQUIRES_NEW)\n    public void logEvent(...) { ... }\n}\n```\n\n**언제**:\n- 메인 트랜잭션과 무관하게 commit해야 하는 작업 (감사 로그, 별도 알림)\n- 메인이 rollback돼도 secondary는 commit 유지\n\n### NESTED — Savepoint\n\n```java\n@Transactional\npublic void doA() {\n    repo.save(...);\n    try {\n        doB();  // NESTED: savepoint 만들고 진행\n    } catch (Exception e) {\n        // doB만 rollback, doA는 계속\n    }\n}\n\n@Transactional(propagation = NESTED)\npublic void doB() { ... }\n```\n\n**DB 지원**: PostgreSQL, MySQL InnoDB OK. 일부 DB 제한.\n\n**언제**:\n- 메인 안에서 일부만 rollback해야 할 때\n- ex: 여러 상품 처리 중 일부 실패해도 나머지는 commit\n\n### SUPPORTS / NOT_SUPPORTED / NEVER\n\n거의 안 쓰임. 매우 특수한 경우.\n\n### MANDATORY\n\n```java\n@Transactional(propagation = MANDATORY)\npublic void doSomething() {\n    // 트랜잭션 없이 호출하면 IllegalTransactionStateException\n}\n```\n\n**언제**: 호출자가 반드시 트랜잭션 시작했음을 강제하고 싶을 때.\n\n## readOnly 최적화\n\n```java\n@Transactional(readOnly = true)\npublic List<User> findAll() { ... }\n```\n\n**무엇이 최적화되나**:\n- Hibernate: dirty checking 스킵 (변경 감지 비용 ↓)\n- DB driver: 일부 DB에서 read-only mode 활용 (예: PostgreSQL `SET TRANSACTION READ ONLY`)\n- Spring: replica DB 라우팅 가능 (custom config)\n\n**언제**: SELECT만 하는 모든 메서드.\n\n**주의**:\n```java\n@Transactional(readOnly = true)\npublic void doStuff() {\n    repo.save(...);  // ← SELECT 외 작업이 들어가도 컴파일 OK\n                     // DB가 fail (DB 지원 시) 또는 silent fail (Hibernate)\n}\n```\n\nreadOnly = true는 hint이지 강제 X. 일부 환경에서만 실제 enforcement.\n\n## Rollback Rules\n\n### Default: RuntimeException과 Error만 rollback\n\n```java\n@Transactional\npublic void doStuff() throws IOException {\n    repo.save(...);\n    throw new IOException(...);  // ← checked → rollback 안 됨!\n}\n```\n\n**Spring의 default**:\n- Unchecked (RuntimeException) → rollback\n- Checked (IOException 등) → **rollback 안 됨**\n\n### Custom rollback\n\n```java\n@Transactional(rollbackFor = IOException.class)\npublic void doStuff() throws IOException { ... }\n```\n\n또는 모든 Throwable:\n\n```java\n@Transactional(rollbackFor = Throwable.class)\n```\n\n### 신입 권장\n\n거의 모든 도메인 예외를 RuntimeException으로 만들면 default 동작 충분 (이전 doc\n\"Business vs Technical Exception primer\" 참고).\n\n## Self-Invocation 함정\n\n```java\n@Service\npublic class OrderService {\n    public void createOrder(CreateCmd cmd) {\n        this.saveOrder(cmd);  // ← @Transactional 안 먹음! 프록시 우회\n    }\n\n    @Transactional\n    public void saveOrder(CreateCmd cmd) {\n        repo.save(...);\n    }\n}\n```\n\n같은 빈 안에서 `this.method()` 호출은 Spring 프록시 우회 → AOP 안 적용 → `@Transactional` 무시.\n\n**해결**:\n1. 다른 빈으로 분리 (가장 권장)\n2. `ApplicationContext.getBean(OrderService.class).saveOrder(cmd)` (anti-pattern)\n3. `@PostConstruct`로 self-reference 주입 (anti-pattern)\n\n상세: [Spring Self-Invocation 트랩](../spring/spring-self-invocation-transactional-only-misconception-primer.md)\n\n## 트랜잭션 안에 두면 안 되는 것\n\n### 1. 외부 API 호출\n\n```java\n@Transactional\npublic void processOrder(...) {\n    repo.save(order);\n    paymentApi.charge(...);  // ← 위험! 외부 API 1초 걸리면 트랜잭션 1초 lock\n    repo.save(payment);\n}\n```\n\n**문제**:\n- 외부 API 시간이 트랜잭션 시간 → DB connection 점유 길어짐 → connection pool 부족\n- 외부 API 실패 시 rollback인데 외부 시스템은 이미 처리 (consistency 깨짐)\n\n**해결**: 트랜잭션 안에서 결과 commit → 외부 API는 별도 (또는 Outbox 패턴).\n\n### 2. 파일 I/O / 네트워크\n\n```java\n@Transactional\npublic void uploadAndSave(...) {\n    s3Client.upload(file);  // ← 외부 I/O\n    repo.save(metadata);\n}\n```\n\n같은 이유. S3 업로드 30초 동안 트랜잭션 lock.\n\n**해결**: 업로드 후 metadata만 트랜잭션 안에서 저장. 업로드 실패 시 cleanup.\n\n### 3. 시간 오래 걸리는 계산\n\n```java\n@Transactional\npublic Result heavyCompute(...) {\n    repo.save(...);\n    expensiveComputation();  // ← 10초 걸리는 계산\n    repo.save(result);\n}\n```\n\n**해결**: 계산 분리, 트랜잭션 짧게.\n\n## 분기 패턴 — 외부 API + 트랜잭션\n\n### Pattern 1: API 후 DB\n\n```java\npublic void processOrder(...) {\n    PaymentResult paymentResult = paymentApi.charge(...);  // 외부\n    saveOrderAndPayment(paymentResult);                     // 트랜잭션\n}\n\n@Transactional\npublic void saveOrderAndPayment(...) {\n    repo.save(order);\n    repo.save(payment);\n}\n```\n\n**장점**: 트랜잭션 짧음.\n**위험**: 외부 결제 성공 후 DB 저장 실패 → 결제는 됐는데 주문 없음 (refund 필요).\n\n### Pattern 2: Outbox 패턴\n\n```java\n@Transactional\npublic void processOrder(...) {\n    repo.save(order);\n    outboxRepo.save(new OutboxEvent(\"CHARGE_PAYMENT\", ...));  // ← 같은 트랜잭션\n}\n\n// 별도 worker\n@Scheduled(fixedRate = 1000)\npublic void processOutbox() {\n    List<OutboxEvent> events = outboxRepo.findUnprocessed();\n    for (Event e : events) {\n        paymentApi.charge(...);  // 외부 API\n        outboxRepo.markProcessed(e);\n    }\n}\n```\n\n**장점**: DB와 외부 API 사이 atomic 보장 (eventually).\n**단점**: 약간 복잡, 약간의 지연.\n\n### Pattern 3: Saga (분산 트랜잭션)\n\n여러 서비스에 걸친 트랜잭션. 각 단계 commit + 실패 시 compensating action.\n\n상세는 별도 doc.\n\n## Long-Running Transaction 위험\n\n```\n[Begin Tx] SELECT FOR UPDATE ... 외부 API (10초) ... UPDATE ... [Commit]\n```\n\n문제:\n- 10초 동안 row lock → 다른 트랜잭션 block\n- DB connection 10초 점유 → connection pool 고갈\n- Replica lag 발생 가능\n- Deadlock 위험 ↑\n\n**해결**:\n- 트랜잭션 짧게 (1초 이내 권장)\n- 외부 호출은 트랜잭션 밖\n- lock도 필요한 만큼만\n\n## 자주 헷갈리는 지점\n\n### \"@Transactional을 Controller에 두면 편리한데\"\n\n편리하지만 위험. HTTP 처리 전체가 트랜잭션 = 너무 큰 범위.\n\n### \"REQUIRES_NEW가 더 안전한 것 같다\"\n\n새 트랜잭션 = 새 connection 필요 → connection pool 부담 ↑. 또한 두 트랜잭션 간\n일관성 깨짐 위험. 명확한 이유 없으면 default REQUIRED.\n\n### \"@Transactional(readOnly = true)면 성능 50% 향상\"\n\n극적 향상은 아님. Hibernate dirty checking + 일부 DB 최적화. 그래도 SELECT 메서드에\n붙이면 좋음.\n\n### \"checked exception이면 rollback 안 됨?\"\n\ndefault. `rollbackFor`로 override 가능.\n\n### \"saveOrder().updateStock() 다른 트랜잭션\"\n\n`@Service` 안에서 method chain은 같은 트랜잭션 (REQUIRED). 단 self-invocation\n주의 (`this.updateStock()`).\n\n### \"분산 시스템에서 @Transactional\"\n\n`@Transactional`은 단일 DB. 여러 시스템에 걸친 트랜잭션은 XA 또는 Saga 패턴.\nXA는 복잡 + 성능 ↓ → 현대 시스템은 보통 Saga.\n\n## 빠른 확인 질문\n\n- @Transactional의 default 위치?  답: Service method (controller/repository 아님)\n- REQUIRES_NEW와 NESTED 차이?  답: 새 connection 별도 트랜잭션 vs savepoint 같은 트랜잭션 내\n- readOnly = true가 최적화하는 것?  답: Hibernate dirty checking 스킵 + 일부 DB read-only mode\n- 외부 API 호출을 트랜잭션 안에 두면 안 좋은 이유?  답: 외부 API 시간 = 트랜잭션 시간, lock 길어짐, 실패 시 일관성 깨짐\n- Self-invocation 함정 해결?  답: 다른 빈으로 분리 (또는 anti-pattern 회피)\n- Checked exception rollback 여부?  답: default 안 됨. rollbackFor로 명시 필요\n\n## 한 줄 정리\n\n`@Transactional`은 **service method에 두고 REQUIRED 기본 + readOnly로 SELECT 최적화 +\n외부 API/긴 작업은 분리 + self-invocation 함정 회피**가 default 패턴이며,\nREQUIRES_NEW/NESTED는 명확한 이유가 있을 때만 사용한다.\n",
+  "aliases": [
+    "service layer transaction scope",
+    "@Transactional 위치",
+    "트랜잭션 경계 chooser",
+    "transaction scope chooser",
+    "transaction boundary",
+    "transactional method vs usecase",
+    "propagation REQUIRED",
+    "propagation REQUIRES_NEW",
+    "propagation NESTED",
+    "propagation SUPPORTS",
+    "propagation NOT_SUPPORTED",
+    "propagation NEVER",
+    "propagation MANDATORY",
+    "transactional read-only",
+    "@Transactional readOnly",
+    "트랜잭션 readOnly 최적화",
+    "transaction outbox",
+    "saga pattern 분기",
+    "너무 큰 트랜잭션",
+    "long-running transaction",
+    "transactional rollback rules",
+    "transactional rollback for",
+    "비동기 안 함 트랜잭션",
+    "외부 API 트랜잭션"
+  ],
+  "expected_queries": [
+    "@Transactional을 controller / service / repository 중 어디에 두는 게 맞아?",
+    "propagation REQUIRED와 REQUIRES_NEW의 차이는 뭐고 언제 어느 걸 써?",
+    "propagation NESTED는 어떤 경우에 의미가 있어?",
+    "readOnly = true 트랜잭션은 실제로 무엇을 최적화해?",
+    "외부 API 호출을 트랜잭션 안에 두면 왜 안 좋아?",
+    "usecase 단위 트랜잭션과 method 단위 중 어느 게 일반적?"
+  ],
+  "symptoms": [
+    "@Transactional을 controller / service / repository 중 어디에 붙여야 할지 모르겠어",
+    "propagation 옵션이 7가지인데 차이를 모르겠어",
+    "readOnly = true가 정확히 뭘 최적화하는지 헷갈려",
+    "트랜잭션을 너무 크게 잡았다가 lock 문제가 생기는 것 같아",
+    "외부 API 호출을 트랜잭션 안에 두면 안 좋다는데 왜?",
+    "saga vs distributed transaction 어떻게 결정해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transactional-basics",
+      "database/transaction-basics",
+      "database/transaction-isolation-locking"
+    ],
+    "next_docs": [
+      "database/transaction-case-studies",
+      "software-engineering/business-vs-technical-exception-primer"
+    ],
+    "confusable_with": [
+      "spring/transactional-basics",
+      "database/transaction-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/service-layer-transaction-scope-chooser.md",
+    "revision_history": []
+  }
+}

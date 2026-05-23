@@ -1,0 +1,54 @@
+{
+  "id": "software-engineering/bulk-idempotency-keys",
+  "title": "Bulk Idempotency Keys For Named Contracts",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Bulk Idempotency Keys For Named Contracts\n\n> 한 줄 요약: bulk를 `run`, `file`, `chunk`, `item` 같은 이름 있는 계약으로 나눴다면, idempotency key도 \"같은 일을 다시 하는가\"라는 질문을 그 네 경계로 따로 답하게 만들어야 안전하다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Software Engineering README: Bulk Idempotency Keys For Named Contracts](./README.md#bulk-idempotency-keys-for-named-contracts)\n- [True Bulk Contracts and Partial Failure Results](./true-bulk-contracts-partial-failure-results.md)\n- [Batch Idempotency Key Boundaries](./batch-idempotency-key-boundaries.md)\n- [Batch Run Result Modeling Examples](./batch-run-result-modeling-examples.md)\n- [Batch Recovery Runbook Bridge](./batch-recovery-runbook-bridge.md)\n- [HTTP Coalescing Failure Mapping](./http-coalescing-failure-mapping.md)\n- [HTTP 메서드와 REST 멱등성 입문](../network/http-methods-rest-idempotency-basics.md)\n- [Job Queue 설계](../system-design/job-queue-design.md)\n\nretrieval-anchor-keywords: bulk idempotency keys for named contracts, named contract idempotency scope, run file chunk item idempotency, file-level idempotency key, batch file dedup beginner, same file uploaded twice, import file key vs run key, chunk retry idempotency scope, item side effect dedup key, named bulk contract beginner, what idempotency scope to choose, batch resume key primer, logical file contract idempotency, reupload vs rerun idempotency, bulk idempotency keys for named contracts basics\n\n## 핵심 개념\n\n먼저 가장 쉬운 그림부터 잡자.\nidempotency key는 \"같은 상자를 다시 들고 왔는지\" 확인하는 이름표다.\n\nbulk를 설계할 때 상자는 보통 네 개다.\n\n- `run`: 이번 실행 전체\n- `file`: 이번 실행 안에서 다루는 문서나 논리 파일\n- `chunk`: file이나 run을 쪼갠 작은 묶음\n- `item`: 실제 부작용이 걸리는 한 건\n\n초심자가 자주 헷갈리는 이유는 key를 먼저 만들려고 하기 때문이다.\n하지만 더 안전한 순서는 반대다.\n\n1. 먼저 \"우리 시스템이 무엇을 하나의 이름 있는 계약으로 다루는가\"를 정한다.\n2. 그다음 \"같은 계약을 retry/replay/re-upload할 때 무엇이 그대로여야 하는가\"를 key로 정한다.\n\n즉 `runKey`, `fileKey`, `chunkKey`, `itemKey`는 계층형 장식이 아니라 서로 다른 질문의 답이다.\n\n## 한눈에 보기\n\n| 계약 | 쉬운 질문 | 같은 key를 재사용해야 하는 장면 | 새 key가 필요한 장면 |\n|---|---|---|---|\n| `run` | \"같은 실행을 이어 가는가?\" | 같은 snapshot/backfill run을 resume하거나 중복 시작을 막을 때 | 기준 시각, 범위, 운영 의도가 달라진 새 run |\n| `file` | \"같은 문서를 다시 들여오는가?\" | 같은 CSV/PDF/정산 파일을 재등록하거나 파싱만 다시 할 때 | 수정본 파일, 새 버전 파일, 다른 문서 |\n| `chunk` | \"같은 묶음을 다시 제출하는가?\" | 3번 chunk timeout 후 같은 묶음을 다시 보낼 때 | chunk 경계나 cursor 범위를 새로 짰을 때 |\n| `item` | \"같은 한 건의 부작용인가?\" | 같은 line/item을 같은 의도로 재시도할 때 | item revision, operation, snapshot intent가 달라졌을 때 |\n\n핵심은 상위 key가 하위 key를 자동으로 대신하지 않는다는 점이다.\n`runKey`가 같아도 같은 file이 두 번 등록될 수 있고, `fileKey`가 같아도 item 한 건의 외부 write 중복까지 자동으로 막아 주지는 않는다.\n\n## 먼저 네 계약을 구분하기\n\n이 문서는 named contract 관점에서 key를 고르는 입문 브리지다.\n그래서 먼저 네 계약이 무슨 뜻인지 짧게 고정해 두는 편이 좋다.\n\n| 계약 | 보통 누가 이 이름을 쓰는가 | 이 계약이 없으면 생기는 빈칸 |\n|---|---|---|\n| `run contract` | scheduler, operator, run summary | \"이번 오전 9시 실행\"을 추적하기 어렵다 |\n| `file contract` | import/export adapter, 업로더, 외부 파트너 | \"같은 파일을 다시 올린 것인지\" 구분하기 어렵다 |\n| `chunk contract` | batch service, checkpoint, retry loop | \"어디까지 보냈고 어디서 다시 보낼지\" 흐려진다 |\n| `item contract` | domain use case, external receipt, retry queue | 실제 중복 부작용을 막기 어렵다 |\n\n여기서 `file`은 물리 파일만 뜻하지 않는다.\n외부가 `statement-2026-04.csv`, `catalog-v17.json`, `settlement-report-42`처럼 하나의 문서 단위로 이해한다면 그건 논리 파일이어도 file contract가 될 수 있다.\n\n## scope를 고르는 빠른 기준\n\n빠르게 고를 때는 \"누가 같은 일이라고 말하는가\"를 보면 된다.\n\n| 운영자가 하는 말 | 먼저 봐야 할 계약 | 보통 그대로 유지할 key |\n|---|---|---|\n| \"같은 오전 9시 run을 이어서 돌려요\" | `run` | `runKey` |\n| \"같은 파일을 다시 업로드했어요\" | `file` | `fileKey` |\n| \"8번째 chunk만 다시 보내요\" | `chunk` | `chunkKey` |\n| \"491번 line만 retry queue에서 다시 처리해요\" | `item` | `itemKey` |\n\n조금 더 실무적으로 바꾸면 아래 기준이 유용하다.\n\n| 기준 질문 | 같은 key여야 하는 경우 | 다른 key여야 하는 경우 |\n|---|---|---|\n| snapshot/run 기준이 같은가 | 같은 `runKey`를 본다 | 새 cutoff time, 새 backfill 범위면 새 `runKey` |\n| 외부 문서 자체가 같은가 | 같은 `fileKey`를 본다 | 수정본, 재생성본, 버전 변경이면 새 `fileKey` |\n| 재전송하려는 묶음 범위가 같은가 | 같은 `chunkKey`를 본다 | chunk size나 cursor 구간이 달라졌으면 새 `chunkKey` |\n| 실제 business side effect가 같은가 | 같은 `itemKey`를 본다 | item version, operation, revision이 다르면 새 `itemKey` |\n\n초심자에게 가장 안전한 규칙은 이것이다.\n**retry는 같은 key를 재사용하고, 새 business intent는 새 key를 쓴다.**\n\n## 예시: 정산 파일 import\n\n상황을 하나로 고정해 보자.\n\n- partner A의 정산 파일을 매일 import한다.\n- 오전 9시 snapshot 기준으로 run을 시작한다.\n- 파일 하나를 500줄씩 chunk로 나눈다.\n- 각 line은 정산 item 한 건이다.\n\n이때 key는 아래처럼 나눌 수 있다.\n\n```text\nrunKey\n- settlement-import:partner-a:2026-04-24T09:00Z\n\nfileKey\n- settlement-import:partner-a:file:statement-2026-04-24.csv:sha256-abcd\n\nchunkKey\n- settlement-import:partner-a:file:sha256-abcd:chunk:03\n\nitemKey\n- settlement-import:partner-a:invoice:INV-491:line:17:revision:2\n```\n\n이 예시에서 중요한 장면은 네 가지다.\n\n| 장면 | 어떤 key를 그대로 쓰나 | 이유 |\n|---|---|---|\n| 서버가 죽어 같은 run을 resume한다 | `runKey` | 같은 실행을 이어 가는 중이기 때문이다 |\n| 업로더가 같은 파일을 다시 올렸다 | `fileKey` | 같은 문서 중복 등록을 막아야 한다 |\n| 3번 chunk가 timeout되어 다시 제출된다 | `chunkKey` | 같은 묶음 재전송인지 판단해야 한다 |\n| 17번째 line만 retry queue에서 다시 돈다 | `itemKey` | 같은 부작용인지 확인해야 한다 |\n\n반대로 수정본 `statement-2026-04-24-v2.csv`가 오면 보통 `fileKey`는 새로 만들어야 한다.\nfile이 바뀌면 그 file을 기준으로 만든 `chunkKey`도 대개 새로 잡힌다.\n그리고 새 보정 작업을 별도 운영 run으로 취급한다면 `runKey`도 새로 바뀐다.\n\n즉 같은 physical retry인지, 같은 logical document 재처리인지, 새 correction run인지에 따라 바뀌는 key 층위가 다르다.\n\n## 흔한 오해와 함정\n\n| 오해 | 더 안전한 첫 판단 |\n|---|---|\n| `runKey` 하나면 나머지 중복도 다 막힌다 | run 중복 시작과 item 부작용 중복은 다른 문제다 |\n| file hash가 곧 `runKey`다 | 같은 file을 다른 run에서 처리할 수도 있으니 file과 run은 분리한다 |\n| chunk 번호만 있으면 `chunkKey`가 된다 | 같은 file/run을 가리키는 부모 정보 없이 `chunk:03`만 있으면 너무 약하다 |\n| item id만 같으면 늘 같은 일이다 | revision, operation, snapshot intent가 다르면 새 일일 수 있다 |\n| retry마다 UUID를 새로 만들면 더 안전하다 | 새 UUID는 같은 retry를 새 일처럼 보이게 만들어 dedup을 깨뜨린다 |\n| file contract는 실제 업로드 API에서만 필요하다 | 논리 문서 단위 import/export에도 file contract가 있을 수 있다 |\n\n## 더 깊이 가려면\n\n이 문서는 \"어느 경계에 어떤 key를 둘까\"를 고르는 입문 primer다.\nnamed contract 자체를 먼저 잡고 싶다면 [True Bulk Contracts and Partial Failure Results](./true-bulk-contracts-partial-failure-results.md)를 본다.\nrun/chunk/item 관점의 더 좁은 기본형은 [Batch Idempotency Key Boundaries](./batch-idempotency-key-boundaries.md)에서 이어진다.\nretry 후보, chunk 영수증, checkpoint 같은 결과 이름은 [Batch Run Result Modeling Examples](./batch-run-result-modeling-examples.md)와 함께 보면 더 선명해진다.\n운영 절차와 rerun checklist로 번역하는 단계는 [Batch Recovery Runbook Bridge](./batch-recovery-runbook-bridge.md)로 넘기면 된다.\nqueue worker나 업로더 파이프라인으로 확장하면 [Job Queue 설계](../system-design/job-queue-design.md), [HTTP Coalescing Failure Mapping](./http-coalescing-failure-mapping.md)를 같이 보면 handoff 경계가 보인다.\n\n## 면접/시니어 질문 미리보기\n\n- file key와 run key를 왜 분리하나? 같은 file 재업로드와 새 운영 run을 서로 다른 의도로 설명해야 하기 때문이다.\n- corrected file이 오면 어떤 key를 바꾸나? 보통 file/chunk는 새로 바꾸고, 운영 의미가 달라졌다면 run도 새로 잡는다.\n- item key만 잘 두면 충분하지 않나? item side effect dedup은 되지만 file 중복 등록, chunk 재전송, run resume 판단은 약해진다.\n\n## 한 줄 정리\n\nbulk idempotency는 key 문자열을 예쁘게 만드는 문제가 아니라, `run`, `file`, `chunk`, `item` 중 무엇을 \"같은 일\"로 볼지 먼저 이름 붙이는 문제다.\n",
+  "aliases": [
+    "Bulk Idempotency Keys For Named Contracts",
+    "named contract idempotency scope",
+    "run file chunk item idempotency",
+    "file-level idempotency key",
+    "same file uploaded twice",
+    "bulk idempotency scope"
+  ],
+  "expected_queries": [
+    "bulk named contract에서 run file chunk item idempotency key를 각각 왜 나눠야 해?",
+    "같은 file을 다시 업로드한 것과 새 수정본 file을 올린 것을 fileKey로 어떻게 구분해?",
+    "runKey가 있어도 file 중복 등록, chunk 재전송, item side effect 중복을 자동으로 막지 못하는 이유가 뭐야?",
+    "retry는 같은 key를 재사용하고 새 business intent는 새 key를 써야 한다는 기준을 설명해줘",
+    "chunkKey에 chunk 번호만 넣으면 왜 너무 약하고 file/run 부모 scope가 필요한가?"
+  ],
+  "symptoms": [
+    "bulk를 run, file, chunk, item 같은 named contract로 나눴는데 idempotency key는 하나로만 두어 중복 시작, 파일 재업로드, chunk 재전송, item side effect를 구분하지 못해",
+    "file hash를 run key처럼 쓰거나 chunk 번호만으로 chunk key를 만들어 부모 scope가 빠진 약한 dedup key를 만들어",
+    "retry와 새 business intent를 구분하지 못해 같은 의도 재시도에는 새 UUID를 만들고, 수정본 파일에는 기존 key를 재사용하는 실수를 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/true-bulk-contracts-partial-failure-results",
+      "software-engineering/batch-idempotency-keys"
+    ],
+    "next_docs": [
+      "software-engineering/batch-result-modeling",
+      "software-engineering/backend-webhook-broker-idempotency-drill",
+      "software-engineering/batch-recovery-runbook",
+      "system-design/job-queue-design"
+    ],
+    "confusable_with": [
+      "software-engineering/batch-idempotency-keys",
+      "software-engineering/true-bulk-contracts-partial-failure-results",
+      "software-engineering/http-coalescing-failure-mapping"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/bulk-idempotency-keys-for-named-contracts.md",
+    "revision_history": []
+  }
+}

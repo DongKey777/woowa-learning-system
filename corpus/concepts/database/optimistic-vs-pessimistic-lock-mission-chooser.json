@@ -1,0 +1,45 @@
+{
+  "id": "database/optimistic-vs-pessimistic-lock-mission-chooser",
+  "title": "Optimistic vs Pessimistic Lock Mission Chooser",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 chooser는 optimistic lock과 pessimistic lock을 미션 동시성 시나리오에 맞춰 고른다. 재고 차감, version lock, select for update, 충돌 후 재시도 UX 같은 질문을 다룬다.",
+  "body_markdown": "# Optimistic vs Pessimistic Lock Mission Chooser\n\n## 10초 chooser\n\n| 상황 | 후보 | 비용 |\n|---|---|---|\n| 충돌이 드묾 | optimistic lock/version | 실패 감지 후 재시도/사용자 안내 필요 |\n| 충돌이 잦고 critical section이 짧음 | pessimistic lock | 대기, deadlock, timeout 관리 필요 |\n| 단순 수량 차감 | atomic conditional update | affected rows 확인 |\n| 유일한 슬롯 선점 | unique constraint | constraint violation 번역 필요 |\n\n## 헷갈리는 축\n\nOptimistic lock은 충돌을 막는 것이 아니라 commit 또는 flush 시점에 충돌을 감지한다. Pessimistic lock은 먼저 row를 잠가서 다른 transaction을 기다리게 만들지만, 대기와 deadlock 비용을 만든다. 둘 다 \"도메인 불변식이 자동으로 안전해진다\"는 뜻은 아니다.\n\n## 선택 기준\n\n| 질문 | optimistic lock 신호 | pessimistic lock 신호 |\n|---|---|---|\n| 같은 row를 동시에 바꿀 확률 | 낮음 | 높음 |\n| 실패 시 UX | 다시 시도, 새로고침, sold out 안내 가능 | 기다리더라도 순차 처리 선호 |\n| critical section 길이 | 짧고 계산이 단순 | 짧지만 반드시 한 번에 판정해야 함 |\n| 외부 API 포함 여부 | transaction 밖으로 분리 필요 | lock 잡고 외부 API 대기 금지 |\n| 충돌 원인 | lost update 감지 | write 순서 자체를 직렬화 |\n\n재고 차감이 단순히 수량 하나를 줄이는 문제라면 version entity를 읽고 저장하는 방식보다 조건부 update가 더 명확할 때가 많다. `stock >= qty` 조건을 DB update에 넣고 affected rows를 확인하면, read-then-write 사이 race를 줄일 수 있다. 좌석 예약처럼 \"같은 좌석은 한 번만\"인 문제는 unique constraint가 더 직접적인 최종 방어선이다.\n\n## optimistic lock 경계\n\nVersion 기반 낙관적 락은 두 transaction이 같은 version을 읽은 뒤 둘 다 수정하려 할 때 한쪽 update를 실패시킨다. 하지만 두 사용자가 동시에 \"가능해 보이는 상태\"를 읽는 것 자체를 막지는 않는다. 실패가 발생하면 transaction은 보통 rollback 대상이므로, 서비스는 다음 중 하나를 정해야 한다.\n\n- 사용자에게 최신 상태를 다시 보여준다.\n- 짧은 bounded retry를 한다.\n- 같은 command idempotency key로 기존 결과를 조회한다.\n\n무조건 retry하면 사용자 의도와 달라질 수 있다. 예를 들어 마지막 좌석이 이미 팔렸는데 retry가 다른 좌석을 잡아서는 안 된다.\n\n## pessimistic lock 경계\n\n`SELECT ... FOR UPDATE`나 JPA pessimistic lock은 대상 row에 대한 경쟁을 줄인다. 그러나 존재하지 않는 row, range 조건, index가 부적절한 query까지 항상 같은 방식으로 보호한다고 단정하면 안 된다. DB engine, isolation, index, lock mode에 따라 gap/range lock 동작이 다르다.\n\n비관적 락은 transaction을 짧게 유지할 때 효과가 있다. lock을 잡고 결제 API, 긴 계산, 네트워크 호출을 기다리면 대기열이 길어지고 timeout이 늘어난다. lock wait timeout과 deadlock은 실패 경로로 설계해야 한다.\n\n## 관찰 증거\n\n- optimistic lock exception 또는 update count 0 발생률\n- lock wait time, deadlock count, timeout count\n- transaction duration과 lock 보유 구간\n- sold out/duplicate 응답이 409/400 등 의미 있는 응답으로 번역되는지\n- retry 후 최종 성공률보다 중복 side effect가 없는지\n\n## Wrong-bucket neighbor\n\n모든 조회에 locking read를 붙이면 throughput이 급격히 떨어질 수 있다. 반대로 optimistic lock만 붙여 놓고 충돌 실패 UX를 정하지 않으면 사용자는 500을 보게 된다. \"읽고 판단하고 쓰는 구간\" 중 실제로 보호할 불변식이 무엇인지 먼저 좁힌다.\n\n## 검증 절차\n\n- 병렬 요청으로 같은 재고/좌석을 동시에 차감하고 최종 수량과 성공 응답 수를 비교한다.\n- optimistic lock 실패가 service boundary에서 의미 있는 예외로 번역되는지 확인한다.\n- pessimistic lock 테스트에서는 lock timeout을 짧게 두고 대기/timeout 경로를 관찰한다.\n- 외부 호출이 lock 보유 구간 밖에 있는지 transaction 로그나 tracing으로 확인한다.\n- unique constraint나 conditional update가 필요한 불변식은 락 선택과 별도로 테스트한다.\n\n## Safe Next Docs\n\ntransaction case studies와 retry/serialization failure patterns를 이어서 본다.\n",
+  "aliases": [
+    "optimistic pessimistic lock mission chooser",
+    "version lock vs select for update",
+    "낙관적 락 비관적 락 선택",
+    "동시성 제어 락 선택"
+  ],
+  "expected_queries": [
+    "낙관적 락과 비관적 락은 언제 각각 써?",
+    "재고 차감에서 version lock과 select for update 중 뭘 고르지?",
+    "충돌이 적으면 optimistic lock이 좋은 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "동시 재고 차감에서 둘 다 성공해요",
+    "select for update를 모든 조회에 붙이려 해요",
+    "version 충돌 후 재시도 UX를 정하지 않았어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-case-studies"
+    ],
+    "next_docs": [
+      "database/transaction-retry-serialization-failure-patterns"
+    ],
+    "confusable_with": [
+      "database/transaction-isolation-locking",
+      "database/transaction-retry-serialization-failure-patterns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/optimistic-vs-pessimistic-lock-mission-chooser.md",
+    "revision_history": []
+  }
+}

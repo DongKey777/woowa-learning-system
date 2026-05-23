@@ -1,0 +1,85 @@
+{
+  "id": "network/http-caching-conditional-request-basics",
+  "title": "HTTP 캐싱과 조건부 요청 기초",
+  "category": "network",
+  "level": "beginner",
+  "summary": "'이 문서는 HTTP cache beginner primer로, Cache-Control freshness와 ETag/Last-Modified validator, If-None-Match/If-Modified-Since 조건부 요청, 304 Not Modified revalidation을 분리한다.",
+  "body_markdown": "# HTTP 캐싱과 조건부 요청 기초: Cache-Control, ETag, Last-Modified, 304\n\n**난이도: 🟢 Beginner**\n\n> 한 줄 요약: 브라우저가 응답을 저장하고 서버에 \"다시 받아야 하나?\"를 묻는 흐름을 Cache-Control, ETag, Last-Modified, 304를 중심으로 정리한 입문 primer\n\n관련 문서:\n\n- [HTTP 요청-응답 기본 흐름: URL, DNS, TCP/TLS, 상태 코드, Keep-Alive](./http-request-response-basics-url-dns-tcp-tls-keepalive.md)\n- [HTTP의 무상태성과 쿠키, 세션, 캐시](./http-state-session-cache.md)\n- [HTTP 캐시 재사용 vs 연결 재사용 vs 세션 유지 입문](./http-cache-reuse-vs-connection-reuse-vs-session-persistence-primer.md)\n- [Service Worker 혼선 1분 분기표: `from ServiceWorker` vs HTTP cache](./service-worker-vs-http-cache-devtools-primer.md)\n- [Browser DevTools Cache Trace Primer: memory cache, disk cache, revalidation, 304 읽기](./browser-devtools-cache-trace-primer.md)\n- [Strong vs Weak ETag: validator 정밀도와 cache correctness](./strong-vs-weak-etag-validator-precision-cache-correctness.md)\n- [CDN 기초](../system-design/cdn-basics.md)\n- [CORS 기초](../security/cors-basics.md)\n\nretrieval-anchor-keywords: http caching basics, conditional request basics, cache-control 뭐예요, etag 뭐예요, last-modified 뭐예요, 304 뭐예요, 처음 배우는데 http 캐시, http 캐시 큰 그림, 캐시가 왜 다시 요청해요, 브라우저 캐시랑 304 차이, from disk cache 304 차이, cache-control 언제 쓰는지, etag last-modified 헷갈려요, if-none-match, cache revalidation, HTTP 캐시 기초, Cache-Control ETag 같이 쓰는 이유, 304 Not Modified 의미, from disk cache vs 304 차이, If-None-Match If-Modified-Since 흐름, stale-while-revalidate 의미, 캐시 재검증 흐름, Cache-Control max-age vs s-maxage, weak vs strong etag\n\n이 문서는 이런 첫 질문을 바로 받는 primer다: \"`304 Not Modified`가 뭐예요?\", \"`Cache-Control`이랑 `ETag`가 왜 같이 나와요?\", \"`from disk cache`와 `304`가 왜 달라요?\"\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 중요한가](#왜-중요한가)\n- [한 번에 보는 전체 흐름](#한-번에-보는-전체-흐름)\n- [왜 첫 실험은 HTML보다 `app.js`/`main.css`가 쉬운가](#왜-첫-실험은-html보다-appjsmaincss가-쉬운가)\n- [Cache-Control은 무엇을 정하나](#cache-control은-무엇을-정하나)\n- [ETag와 Last-Modified는 무엇을 하나](#etag와-last-modified는-무엇을-하나)\n- [조건부 요청은 어떻게 오가나](#조건부-요청은-어떻게-오가나)\n- [304 Not Modified는 무엇을 의미하나](#304-not-modified는-무엇을-의미하나)\n- [브라우저와 서버는 각자 무엇을 하나](#브라우저와-서버는-각자-무엇을-하나)\n- [자주 헷갈리는 포인트](#자주-헷갈리는-포인트)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 왜 중요한가\n\nHTTP 캐시는 단순히 \"응답을 저장한다\"로 끝나지 않는다.\n\n브라우저는 매 요청마다 다음 두 질문을 판단한다.\n\n- 지금 캐시된 응답을 바로 써도 되는가\n- 서버에 다시 확인해야 한다면 무엇을 기준으로 비교할 것인가\n\n이 질문에 답하는 조합이 `Cache-Control`, `ETag`, `Last-Modified`, `304 Not Modified`다.\n\n---\n\n## 한 번에 보는 전체 흐름\n\n브라우저와 서버 사이 흐름을 가장 단순하게 그리면 아래와 같다.\n\n```text\n1. 브라우저가 GET /articles/10 요청\n2. 서버가 200 OK + Cache-Control + ETag + Last-Modified 응답\n3. 브라우저가 body와 메타데이터를 함께 저장\n4. 응답이 fresh하면 브라우저가 바로 캐시를 재사용\n5. 응답이 stale하거나 no-cache면 브라우저가 조건부 요청 전송\n6. 서버가 안 바뀌었으면 304 Not Modified\n7. 브라우저가 기존 body를 다시 사용\n8. 서버가 바뀌었으면 200 OK + 새 body + 새 validator\n```\n\n핵심은 역할이 나뉜다는 점이다.\n\n- `Cache-Control`: 이 응답을 얼마나 오래 그냥 써도 되는지\n- `ETag`, `Last-Modified`: 다시 확인할 때 무엇을 비교할지\n- `304 Not Modified`: 서버가 \"기존 사본 그대로 써도 된다\"고 답하는 방식\n\n처음 읽을 때 가장 헷갈리는 `from disk cache`와 `304`는 이 두 칸만 먼저 나눠도 된다.\n\n| 장면 | 서버 왕복 | validator 사용 | body는 어디서 옴 |\n|---|---|---|---|\n| `from memory cache` / `from disk cache` | 보통 없음 | 보통 없음 | 브라우저가 저장해 둔 사본 |\n| `304 Not Modified` | 있음 | 있음 (`If-None-Match`, `If-Modified-Since`) | 브라우저가 저장해 둔 사본 |\n\n같은 URL 재방문에서 초급자가 바로 써먹을 첫 구분은 이것이다.\n\n- `from memory cache` / `from disk cache`는 \"안 물어보고 바로 쓴다\"\n- `304 Not Modified`는 \"서버에 물어보고 그대로 쓴다\"\n\nDevTools에서 실제 row를 읽을 때는:\n\n- waterfall에 네트워크 왕복 흔적이 거의 없고 validator request도 안 보이면 local cache reuse 쪽\n- request header에 `If-None-Match` 또는 `If-Modified-Since`가 있고 status가 `304`면 revalidation 쪽\n\n이 판독을 Network 탭 기준으로 더 짧게 연습하려면 [Browser DevTools Cache Trace Primer: memory cache, disk cache, revalidation, 304 읽기](./browser-devtools-cache-trace-primer.md)를 이어서 보면 된다.\n\n---\n\n## 왜 첫 실험은 HTML보다 `app.js`/`main.css`가 쉬운가\n\n초급자 첫 캐시 실험은 \"같은 URL을 반복 요청했을 때 뭐가 바뀌는지\"를 보는 일이다. 이때는 로그인 상태, 개인화, 서버 템플릿 변화가 섞이기 쉬운 HTML보다 정적 파일이 더 단순하다.\n\n| 첫 실험 대상 | 초급자에게 어떻게 보이나 | 첫 실험용 적합도 |\n|---|---|---|\n| `index.html` 같은 HTML | redirect, cookie, 로그인 상태, SSR 템플릿 변화가 섞여 `200`/`304` 이유가 여러 갈래로 보일 수 있다 | 보통 |\n| `app.js`, `main.css` 같은 정적 리소스 | 같은 URL을 반복 호출하기 쉽고, body 변화 유무가 단순해서 `from disk cache`나 `304`를 읽기 쉽다 | 높음 |\n\n즉 \"HTML은 캐시가 안 된다\"가 아니라, **첫 관찰 대상을 더 조용한 정적 파일로 고르자**는 뜻이다.\n\n가장 쉬운 순서는 이렇다.\n\n1. DevTools `Network`를 열고 `Disable cache`를 끈다.\n2. `app.js` 또는 `main.css` 한 개를 고른다.\n3. `normal reload`를 두세 번 하며 `200 -> from disk cache` 또는 `200 -> 304` 변화를 본다.\n\nHTML은 그다음 단계에서 \"문서도 같은 원리로 캐시되지만 주변 조건이 더 많다\"는 비교 대상으로 보면 된다.\n\n---\n\n## Cache-Control은 무엇을 정하나\n\n`Cache-Control`은 캐시 정책 헤더다.\n\n브라우저 입장에서는 주로 \"이 응답이 아직 fresh한가\"를 판단하는 기준이 된다.\n\n### 자주 보는 값\n\n### `max-age=60`\n\n- 60초 동안은 fresh하다고 본다\n- 브라우저는 그동안 서버에 다시 묻지 않고 재사용할 수 있다\n\n### `no-cache`\n\n- 저장은 가능하다\n- 다만 재사용하기 전에 서버에 반드시 재검증해야 한다\n- 이름 때문에 \"캐시 금지\"로 오해하기 쉽다\n\n### `no-store`\n\n- 저장 자체를 하지 말라는 뜻이다\n- 민감한 응답이나 매번 완전히 새로 받아야 하는 응답에 쓴다\n\n### `private`\n\n- 브라우저 같은 개인 캐시에 저장하는 것은 괜찮다\n- 공유 캐시에는 보수적으로 접근해야 한다\n\n### `public`\n\n- 공유 캐시도 저장 가능하다는 뜻이다\n- CDN이나 프록시까지 함께 고려할 때 자주 본다\n\n입문 감각으로 정리하면:\n\n- `Cache-Control`은 \"지금 바로 써도 되나?\"를 정한다\n- `ETag`, `Last-Modified`는 \"다시 확인할 때 뭘 들고 갈까?\"를 정한다\n\n---\n\n## ETag와 Last-Modified는 무엇을 하나\n\n둘 다 **validator**다.\n\n즉 브라우저가 서버에 \"내가 가진 사본이 아직 최신인가?\"를 물을 때 비교 기준으로 쓴다.\n\n### `ETag`\n\n- 서버가 응답 버전을 식별하기 위해 붙이는 값이다\n- 예: `\"article-10-v3\"`\n- 브라우저는 나중에 `If-None-Match`로 다시 보낸다\n\n쉽게 말하면 `ETag`는 \"이 응답의 버전표\"에 가깝다.\n\n### `Last-Modified`\n\n- 서버가 이 리소스가 마지막으로 바뀐 시각을 알려준다\n- 예: `Tue, 14 Apr 2026 09:00:00 GMT`\n- 브라우저는 나중에 `If-Modified-Since`로 다시 보낸다\n\n쉽게 말하면 `Last-Modified`는 \"마지막 수정 시각\"이다.\n\n### 둘의 차이\n\n- `ETag`는 보통 더 정밀하다\n- `Last-Modified`는 시간 기반이라 이해하기 쉽다\n- 같은 초 안에 여러 번 바뀌는 경우에는 `Last-Modified`만으로는 부족할 수 있다\n\n실무에서는 둘을 함께 보내기도 하고, 비교는 `ETag`가 더 우선적인 validator로 쓰이는 경우가 많다.\n\nbeginner 단계에서는 여기서 \"`ETag`는 버전표다\"까지만 먼저 잡으면 충분하다. strong/weak 차이처럼 validator 정밀도까지 들어가면 첫 캐시 mental model보다 범위가 커진다. 그 차이는 [Strong vs Weak ETag: validator 정밀도와 cache correctness](./strong-vs-weak-etag-validator-precision-cache-correctness.md)에서 이어서 본다.\n\n---\n\n## 조건부 요청은 어떻게 오가나\n\n조건부 요청은 브라우저가 기존 사본을 들고 서버에 재확인하는 요청이다.\n\n### 1. 첫 요청: 서버가 사본과 validator를 내려준다\n\n```http\nGET /articles/10 HTTP/1.1\nHost: example.com\n```\n\n```http\nHTTP/1.1 200 OK\nCache-Control: max-age=60\nETag: \"article-10-v3\"\nLast-Modified: Tue, 14 Apr 2026 09:00:00 GMT\nContent-Type: text/html; charset=UTF-8\n\n<html>...</html>\n```\n\n이 시점에 브라우저는:\n\n- 응답 body\n- `Cache-Control`\n- `ETag`\n- `Last-Modified`\n\n를 함께 저장한다.\n\n### 2. fresh 기간 안이라면 브라우저가 그대로 재사용한다\n\n`max-age=60` 안쪽이라면 브라우저는 같은 리소스를 다시 요청할 때 서버에 바로 가지 않을 수 있다.\n\n즉:\n\n- 네트워크 왕복이 줄어든다\n- 서버 부하가 줄어든다\n- 브라우저 입장에서는 더 빠르게 렌더링할 수 있다\n\n### 3. stale해지면 브라우저가 validator를 들고 다시 묻는다\n\n60초가 지났거나, 응답이 `no-cache`였다면 브라우저는 조건부 요청을 보낼 수 있다.\n\n```http\nGET /articles/10 HTTP/1.1\nHost: example.com\nIf-None-Match: \"article-10-v3\"\nIf-Modified-Since: Tue, 14 Apr 2026 09:00:00 GMT\n```\n\n브라우저가 서버에 묻는 뜻은 이렇다.\n\n- 내가 가진 `ETag`가 아직 최신인가\n- 내가 가진 수정 시각 이후로 바뀐 적이 없는가\n\n### 4-A. 서버가 안 바뀌었다고 판단하면 304를 돌려준다\n\n```http\nHTTP/1.1 304 Not Modified\nCache-Control: max-age=60\nETag: \"article-10-v3\"\nLast-Modified: Tue, 14 Apr 2026 09:00:00 GMT\n```\n\n이 응답에는 보통 body가 없다.\n\n브라우저는:\n\n- 기존에 저장해 둔 body를 다시 사용하고\n- freshness 메타데이터를 갱신한다\n\n### 4-B. 서버가 바뀌었다고 판단하면 새 200 응답을 준다\n\n```http\nHTTP/1.1 200 OK\nCache-Control: max-age=60\nETag: \"article-10-v4\"\nLast-Modified: Tue, 14 Apr 2026 09:05:00 GMT\nContent-Type: text/html; charset=UTF-8\n\n<html>...new...</html>\n```\n\n브라우저는 새 body와 새 validator를 저장하고, 그다음부터는 새 사본 기준으로 움직인다.\n\n---\n\n## 304 Not Modified는 무엇을 의미하나\n\n`304 Not Modified`는 서버가 \"네가 이미 가진 사본을 계속 써도 된다\"고 답한 것이다.\n\n입문 단계에서 꼭 기억할 점:\n\n- `304`는 리다이렉트가 아니다\n- `304`는 캐시 재검증 결과이지, HTTP 버전 fallback/downgrade 신호가 아니다\n- 보통 response body가 없다\n- 브라우저가 이미 갖고 있던 body를 재사용한다\n- 네트워크 왕복은 있었지만, body 전체를 다시 받지는 않는다\n\n즉 `304`의 핵심 가치는 \"다시 다운로드하지 않아도 되는지\"를 확인하는 데 있다.\n\n---\n\n## 브라우저와 서버는 각자 무엇을 하나\n\n### 브라우저\n\n- 응답의 `Cache-Control`을 보고 fresh/stale를 판단한다\n- 저장된 `ETag`, `Last-Modified`를 기억한다\n- stale하거나 재검증이 필요하면 `If-None-Match`, `If-Modified-Since`를 보낸다\n- `304`를 받으면 기존 body를 꺼내 쓴다\n\n### 서버\n\n- 응답에 `Cache-Control`, `ETag`, `Last-Modified`를 넣어 준다\n- 요청에 들어온 `If-None-Match`, `If-Modified-Since`를 현재 상태와 비교한다\n- 안 바뀌었으면 `304`\n- 바뀌었으면 `200`과 새 body를 보낸다\n\n이 역할 분담을 이해하면 \"왜 어떤 때는 서버 로그가 안 찍히고\", \"왜 어떤 때는 304만 찍히는지\"를 해석하기 쉬워진다.\n\n---\n\n## 자주 헷갈리는 포인트\n\n### `no-cache`는 캐시 금지가 아니다\n\n- 저장은 가능하다\n- 다만 재사용 전에 검증해야 한다\n\n### `Cache-Control`과 `ETag`는 역할이 다르다\n\n- `Cache-Control`: fresh 기간과 저장 정책\n- `ETag`, `Last-Modified`: 재검증용 비교 기준\n\n### `304`는 body를 나중에 보내겠다는 뜻이 아니다\n\n- body는 브라우저가 자기 캐시에서 꺼낸다\n- `304` 응답 자체는 보통 매우 작다\n\n### `from disk cache`와 `304`는 같은 말이 아니다\n\n- 둘 다 최종 body는 브라우저 캐시에서 꺼내 쓸 수 있다\n- 하지만 `from disk cache`는 보통 서버에 안 간다\n- `304`는 validator를 들고 서버에 다시 확인한 뒤 기존 body를 재사용한다\n\n### `304`와 HTTP 버전은 같은 질문이 아니다\n\n- `304`는 cache 재검증 결과다\n- `h2`/`h3` 표시는 연결 방식이다\n- 둘이 같이 보여도 원인은 따로 읽는다\n\n### `Last-Modified`만으로는 세밀한 변경을 놓칠 수 있다\n\n- 시간 단위 비교라 정밀도 한계가 있다\n- 더 정교한 비교가 필요하면 `ETag`가 유리하다\n\n### shared cache/CDN 문제는 follow-up으로 넘긴다\n\n브라우저 단일 캐시를 넘어서 `Vary`, compression variant, CDN key가 섞이면 beginner 범위를 넘기기 쉽다. 이 문서에서는 \"`브라우저가 바로 재사용했는가`\"와 \"`서버에 다시 물었는가`\"까지만 고정하고, shared cache는 [Compression, Cache, Vary, Accept-Encoding, Personalization](./compression-cache-vary-accept-encoding-personalization.md)로 넘긴다.\n\n---\n\n## 한 줄 정리\n\n`Cache-Control`로 fresh 기간을 정하고, `ETag`·`Last-Modified`로 재검증 기준을 제공하며, 서버가 변경이 없으면 `304 Not Modified`로 body 없이 응답해 브라우저가 기존 사본을 재사용하게 하는 것이 HTTP 캐싱의 핵심 흐름이다.\n",
+  "aliases": [
+    "http caching conditional request",
+    "HTTP 캐싱 조건부 요청",
+    "Cache-Control ETag Last-Modified 304",
+    "304 Not Modified",
+    "브라우저 캐시 재검증",
+    "from disk cache 304 차이",
+    "If-None-Match",
+    "If-Modified-Since",
+    "HTTP cache",
+    "HTTP 캐시",
+    "캐시 기초",
+    "conditional request",
+    "조건부 요청",
+    "Cache-Control",
+    "ETag",
+    "Last-Modified",
+    "max-age",
+    "no-cache",
+    "no-store",
+    "private public cache",
+    "s-maxage",
+    "must-revalidate",
+    "stale-while-revalidate",
+    "revalidation",
+    "재검증",
+    "캐시 재검증",
+    "weak etag strong etag",
+    "weak validator",
+    "304 vs 200",
+    "200 vs 304 캐시",
+    "from memory cache",
+    "from disk cache",
+    "캐시 hit miss",
+    "브라우저 캐시 기초"
+  ],
+  "expected_queries": [
+    "304 Not Modified는 body를 다시 받는 거야 아니면 캐시를 쓰는 거야?",
+    "Cache-Control과 ETag, Last-Modified가 각각 어떤 역할을 해?",
+    "from disk cache와 304 Not Modified를 DevTools에서 어떻게 구분해?",
+    "If-None-Match와 If-Modified-Since는 언제 요청에 붙어?",
+    "no-cache와 no-store는 왜 이름과 의미가 다르게 느껴져?"
+  ],
+  "symptoms": [
+    "DevTools에서 from disk cache와 304 Not Modified를 같은 뜻으로 읽고 있어",
+    "Cache-Control과 ETag가 왜 같이 필요한지 헷갈려",
+    "같은 URL 새로고침인데 어떤 때는 서버를 안 가고 어떤 때는 304가 나와"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/http-request-response-basics-url-dns-tcp-tls-keepalive",
+      "network/http-request-response-headers-basics"
+    ],
+    "next_docs": [
+      "network/browser-devtools-cache-trace-primer",
+      "network/strong-vs-weak-etag-validator-precision-cache-correctness",
+      "network/browser-302-304-401-reload-decision-table-primer",
+      "system-design/cdn-basics"
+    ],
+    "confusable_with": [
+      "network/browser-302-304-401-reload-decision-table-primer",
+      "network/post-redirect-get-prg-beginner-primer",
+      "network/http-cache-reuse-vs-connection-reuse-vs-session-persistence-primer",
+      "network/http-state-session-cache",
+      "network/browser-devtools-cache-trace-primer",
+      "network/cache-control-practical"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/http-caching-conditional-request-basics.md",
+    "revision_history": []
+  }
+}

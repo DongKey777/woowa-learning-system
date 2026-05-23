@@ -1,0 +1,56 @@
+{
+  "id": "data-structure/chunk-boundary-pathologies-in-roaring",
+  "title": "Chunk-Boundary Pathologies In Roaring",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 Roaring Bitmap이 16-bit high key container 단위로 압축을",
+  "body_markdown": "# Chunk-Boundary Pathologies In Roaring\n\n> 한 줄 요약: Roaring은 16-bit container 경계마다 압축이 다시 시작되므로, 전역적으로는 몇 개 안 되는 interval이나 긴 run도 경계를 많이 가로지르면 interval list나 whole-bitmap run codec보다 header와 run 수가 훨씬 빨리 늘 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Roaring Bitmap](./roaring-bitmap.md)\n> - [Roaring Container Transition Heuristics](./roaring-container-transition-heuristics.md)\n> - [Roaring Run Formation and Row Ordering](./roaring-run-formation-and-row-ordering.md)\n> - [Compressed Bitmap Families: WAH, EWAH, CONCISE](./compressed-bitmap-families-wah-ewah-concise.md)\n> - [Disjoint Interval Set](./disjoint-interval-set.md)\n> - [Row-Ordering and Bitmap Compression Playbook](./row-ordering-and-bitmap-compression-playbook.md)\n> - [Roaring Bitmap Selection Playbook](./roaring-bitmap-selection-playbook.md)\n\n> retrieval-anchor-keywords: chunk boundary roaring, 16-bit container boundary, high key header overhead, cross-chunk run split, interval list vs roaring, disjoint interval set vs roaring, whole bitmap run codec vs roaring, WAH EWAH vs roaring boundary, global interval split, boundary pressure roaring, straddling range roaring, active chunk header cost, run restart per container, run container boundary pathology, long range bitmap footprint, container seam overhead, full chunk tail pathology, cross-chunk interval explosion\n\n## 핵심 개념\n\nRoaring은 `0..65535` 단위 chunk마다 container를 하나씩 붙인다.  \n이 구조 덕분에 mixed-density workload에서는 유연하지만, **논리적으로는 하나의 긴 구간**이라도 16-bit 경계를 넘는 순간 여러 개의 local object로 쪼개진다.\n\n그래서 footprint를 볼 때는 global cardinality나 global interval 수만 보면 자주 틀린다.  \n숨은 변수는 아래 두 개다.\n\n- 몇 개의 `high key`를 건드리는가\n- 각 chunk에서 run이 몇 번 다시 시작되는가\n\n비교 감각을 식으로 적으면 다음이 더 가깝다.\n\n- interval list: `O(global intervals)`\n- whole-bitmap run codec: `O(global runs)`\n- Roaring: `O(active chunks)` header/index + `Σ container_cost(i)`\n- runOptimize 이후 Roaring run 수: `Σ runs_i ~= global runs + boundary crossings`\n\n즉 Roaring에서는 `interval이 몇 개인가`보다 `interval이 65536 경계를 몇 번 넘는가`가 더 직접적인 비용 신호가 된다.\n\n## 깊이 들어가기\n\n### 1. 왜 같은 exact set인데 interval list나 WAH/EWAH와 모양이 달라지나\n\n세 표현은 모두 exact semantics를 줄 수 있지만, 압축 단위가 다르다.\n\n| 표현 | 기본 압축 단위 | 경계가 만드는 비용 |\n|---|---|---|\n| Disjoint Interval Set / interval list | 전역 interval | interval이 경계를 넘어도 레코드 수는 그대로일 수 있다 |\n| WAH/EWAH/CONCISE | bitmap 전체 word stream의 global run | chunk seam이 없어서 긴 clean run을 그대로 유지할 수 있다 |\n| Roaring | 16-bit chunk별 container | 경계를 넘을 때마다 새 high-key entry와 새 container가 필요하다 |\n\n핵심은 Roaring의 container heuristic이 `chunk 내부`에서만 최적화된다는 점이다.  \n각 chunk가 locally는 array/run/bitmap 중 최선일 수 있어도, 전역적으로는 \"같은 구간이 너무 많은 chunk로 잘렸다\"는 병목을 막아주지 못한다.\n\n### 2. pathology A: 아주 짧은 interval도 seam 하나만 넘으면 container가 둘이 된다\n\n예를 들어 전역 구간이 `[65530, 65540]`이라면 논리적으로는 interval 하나다.  \n하지만 Roaring은 아래처럼 나눠 저장해야 한다.\n\n| 표현 | 저장 조각 수 | 감각 |\n|---|---|---|\n| interval list | interval 1개 | 경계 자체는 보이지 않는다 |\n| Roaring array | container 2개 | `65530..65535`, `65536..65540`가 다른 high key에 들어간다 |\n| Roaring run | 1-run container 2개 | `runOptimize()`를 해도 seam을 넘어 run을 합칠 수 없다 |\n| WAH/EWAH/CONCISE | 16-bit container split은 없음 | word boundary의 literal/fill 비용은 남지만 high-key container 두 개로 갈라지지는 않는다 |\n| interval/whole-run codec | global interval/run 1개 | range 자체를 전역 단위로 표현할 수 있다 |\n\n중요한 점은 cardinality가 겨우 `11`이어도 Roaring은 이미 active chunk가 `2`라는 것이다.  \n이 경우 surprise는 \"값 수가 너무 적은데 왜 metadata가 벌써 두 배로 붙지?\"라는 형태로 나타난다.\n\n### 3. pathology B: 하나의 긴 band가 여러 chunk를 가로지르면 run도 chunk마다 다시 시작된다\n\n전역 interval `[100, 1_000_000]`을 생각해 보자.  \ninterval list 관점에서는 여전히 interval 1개고, whole-bitmap run codec도 전역 run 1개에 가깝게 본다.\n\n하지만 Roaring은 대략 `16`개의 active chunk를 만든다.  \n여기서 `runOptimize()`가 도와줄 수 있는 것은 각 chunk를 \"1 run\"이나 \"full bitmap\"으로 줄이는 것뿐이다.  \n**16개의 chunk를 1개의 전역 run으로 합치는 일은 하지 못한다.**\n\n그래서 긴 연속 band에서는 다음 비용이 같이 붙는다.\n\n- high-key header/index가 chunk 수만큼 증가\n- run metadata도 chunk마다 다시 시작\n- full chunk가 길게 이어져도 per-container object 수는 줄지 않음\n\n이것이 [Compressed Bitmap Families: WAH, EWAH, CONCISE](./compressed-bitmap-families-wah-ewah-concise.md)가 전역 clean run에서 더 가파르게 유리해지는 이유다.\n\n### 4. pathology C: full chunk가 길게 이어져도 \"tiny tail 둘 + full middle\"이 공짜가 아니다\n\n사람은 `[65000, 400000]` 같은 범위를 보면 보통 \"거의 하나의 range\"로 인식한다.  \ninterval list도 실제로는 interval 1개면 끝난다.\n\nRoaring에서는 다르다.\n\n- 앞쪽 partial chunk 1개\n- 뒤쪽 partial chunk 1개\n- 그 사이의 full chunk 여러 개\n\n중간 chunk가 전부 꽉 차 있어도 chunk 수만큼 container가 계속 필요하다.  \n즉 \"head/tail만 조금 있고 중간은 전부 full\"인 모양은 Roaring에선 작아지긴 해도 **전역 range 한 개처럼 작아지지는 않는다.**\n\n이 패턴은 range mask를 질의 중간 결과로 materialize하거나, 정렬된 row ID band를 cache/serialize할 때 footprint surprise로 자주 보인다.\n\n### 5. pathology D: local heuristic은 맞는데 global footprint는 틀릴 수 있다\n\n`4096` 기준과 run-size 비교식은 모두 chunk 내부의 로컬 의사결정이다.  \n그래서 아래 상황이 생긴다.\n\n- 각 chunk tail은 `300`개 값뿐이라 array가 local optimum\n- 그런데 interval `200`개가 전부 boundary를 한 번씩 넘음\n- 결과적으로 Roaring에는 작은 array container가 `400`개 생김\n\ninterval list는 여전히 interval `200`개면 끝난다.  \n즉 **local optimum container choice != global minimum footprint**다.\n\n같은 현상은 run container에도 생긴다.\n\n- 전역적으로는 run `10`개뿐인 workload\n- 하지만 각 run이 chunk seam을 여러 번 넘어서 `Σ runs_i`가 `10`보다 훨씬 커짐\n\n이때 `runOptimize()`는 각 chunk 안에서는 최선이어도, seam 때문에 늘어난 run restart 자체는 없애지 못한다.\n\n### 6. 언제 interval list나 whole-bitmap run codec 쪽이 더 자연스러워지나\n\n아래 신호가 강하면 Roaring의 적응성보다 boundary tax가 더 중요해진다.\n\n| 관찰 신호 | 더 자연스러운 후보 |\n|---|---|\n| 구간 수는 적은데 거의 모두 긴 range다 | [Disjoint Interval Set](./disjoint-interval-set.md) 같은 interval 표현 |\n| read-mostly이며 global clean run이 길다 | [Compressed Bitmap Families: WAH, EWAH, CONCISE](./compressed-bitmap-families-wah-ewah-concise.md) |\n| 정렬이 좋아 full chunk streak가 길지만 update는 드물다 | whole-bitmap run codec 쪽 break-even 검토 |\n| sparse/dense/random set-op가 섞여 있다 | Roaring 유지가 대개 더 실용적 |\n\n중요한 건 \"Roaring이 나쁘다\"가 아니다.  \nRoaring은 mixed-density set algebra에 강하다.  \n다만 workload가 사실상 **global interval algebra**에 더 가까우면, 16-bit seam은 구조적인 tax가 된다.\n\n## 빠른 판단표\n\n| 신호 | 해석 |\n|---|---|\n| global interval 수는 작은데 active chunk 수가 비정상적으로 크다 | boundary crossing이 footprint를 지배하고 있다 |\n| runOptimize 이후에도 container 수가 거의 안 줄어든다 | 문제는 run body보다 high-key seam 수일 가능성이 높다 |\n| full chunk가 길게 이어지는데 serialized size가 기대보다 크다 | whole-bitmap run codec이 더 잘 맞을 수 있다 |\n| range mask/ACL band/materialized shard band가 많다 | interval 표현과의 비교를 먼저 해야 한다 |\n\n## 재현 절차\n\nboundary pathology는 작은 synthetic set으로 먼저 확인하는 편이 가장 빠르다.\n\n1. `65530..65540`처럼 16-bit 경계를 하나만 넘는 짧은 interval을 만든다.\n2. 같은 cardinality의 경계 내부 interval과 serialized size, active container 수를 비교한다.\n3. `100..1_000_000`처럼 긴 band를 만들고 `runOptimize()` 전후 container 수를 본다.\n4. interval list 또는 WAH/EWAH 표현과 `global interval count`, `active high key count`, `run count`를 나란히 둔다.\n5. 실제 workload에서 row ordering을 바꿨을 때 active high key 수가 줄어드는지 확인한다.\n\n## 검증 체크\n\n| 체크 | 기대하는 관찰 |\n|---|---|\n| active high key 수 | 경계를 많이 넘는 range일수록 증가한다 |\n| container type 분포 | array/run/bitmap 선택이 chunk 내부에서만 바뀐다 |\n| runOptimize 전후 serialized size | run body는 줄어도 high-key entry 수는 유지된다 |\n| global interval 수 대비 `Σ runs_i` | boundary crossing이 많으면 크게 벌어진다 |\n| exact set equality | 표현을 바꿔도 membership 결과는 같아야 한다 |\n\n## 실패 모드 매트릭스\n\n| 증상 | 원인 | 대응 |\n|---|---|---|\n| cardinality는 작은데 size가 큼 | 작은 interval이 여러 chunk를 straddle | interval 표현과 비교 |\n| runOptimize 효과가 작음 | 문제는 run 내부가 아니라 active chunk 수 | row ordering/segmenting 재검토 |\n| long range mask cache가 큼 | full chunk도 container/header를 계속 가짐 | whole-bitmap run codec 검토 |\n| local benchmark는 좋은데 운영 size가 큼 | 실제 range가 segment/chunk 경계에 걸림 | active high key histogram 추가 |\n\n## 검증 기준\n\nRoaring을 유지하려면 \"혼합 sparse/dense set algebra에서 전체 비용이 낫다\"는 근거가 있어야 한다.\n반대로 workload가 적은 수의 긴 global interval을 반복 materialize한다면, Roaring의 chunk-local 장점보다 boundary tax가 더 큰지 별도로 검증해야 한다.\n\n## wrong-bucket neighbor\n\n| 이웃 개념 | 왜 다른가 | 오판 |\n|---|---|---|\n| `4096` array/bitmap threshold | chunk 내부 container 선택 기준이다 | active high-key 수가 많은 문제를 threshold 튜닝으로 고치려 한다 |\n| runOptimize timing | chunk 내부 run 표현을 언제 굳힐지의 문제다 | seam을 넘는 global run merge로 착각한다 |\n| row-group pruning | scan 대상을 줄이는 저장 단위 정책이다 | materialized range bitmap footprint를 설명하지 못할 수 있다 |\n| cardinality-only sizing | set bit 개수만 본다 | 적은 값이 많은 chunk를 straddle하는 비용을 놓친다 |\n\n## 꼬리질문\n\n> Q: `runOptimize()`를 하면 긴 전역 interval도 결국 하나의 run으로 합쳐지나요?\n> 의도: chunk-local 최적화와 global run codec을 구분하는지 확인\n> 핵심: 아니다. `runOptimize()`는 chunk 안에서만 run container를 만들 뿐, 16-bit 경계를 넘어 run을 합치지 못한다.\n\n> Q: 왜 cardinality가 작아도 Roaring이 의외로 커질 수 있나요?\n> 의도: 값 개수와 active chunk 수를 분리해 보는지 확인\n> 핵심: 값이 적어도 boundary를 많이 straddle하면 작은 container와 header가 여러 개 생기기 때문이다.\n\n> Q: interval list와 Roaring의 가장 큰 차이는 무엇인가요?\n> 의도: exact set semantics가 같아도 압축 단위가 다름을 설명할 수 있는지 확인\n> 핵심: interval list는 전역 range 자체를 저장하고, Roaring은 16-bit chunk별 local representation을 저장한다.\n\n## 한 줄 정리\n\nRoaring의 16-bit chunking은 mixed-density workload엔 강점이지만, 긴 range나 적은 global interval이 chunk seam을 많이 넘는 workload에서는 extra header와 extra run restart 때문에 interval list나 whole-bitmap run codec보다 훨씬 비싸게 보일 수 있다.\n",
+  "aliases": [
+    "chunk boundary roaring",
+    "Roaring 16-bit container boundary",
+    "high key header overhead",
+    "cross chunk run split",
+    "interval list vs roaring",
+    "run container boundary pathology",
+    "active chunk header cost"
+  ],
+  "expected_queries": [
+    "Roaring Bitmap에서 16-bit container boundary가 footprint를 키우는 경우는?",
+    "하나의 긴 interval이 여러 chunk를 넘으면 왜 run 수와 header 비용이 늘어?",
+    "interval list나 WAH EWAH와 Roaring은 cross-chunk run을 어떻게 다르게 저장해?",
+    "runOptimize를 해도 chunk boundary를 넘는 global run이 합쳐지지 않는 이유는?",
+    "active high key 수를 bitmap locality 지표로 봐야 하는 이유를 알려줘"
+  ],
+  "symptoms": [
+    "전역 interval 수와 cardinality만 보고 Roaring footprint를 예측하다가 16-bit container boundary 비용을 놓친다",
+    "짧은 interval이 65536 경계를 넘는 순간 container와 header가 둘로 늘어나는 현상을 설명하지 못한다",
+    "runOptimize가 chunk 내부 run은 줄여도 여러 high key를 하나의 global run으로 합치지는 못한다는 한계를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/roaring-bitmap"
+    ],
+    "next_docs": [
+      "data-structure/roaring-container-transition-heuristics",
+      "data-structure/roaring-run-formation-and-row-ordering",
+      "data-structure/disjoint-interval-set",
+      "data-structure/row-ordering-and-bitmap-compression-playbook"
+    ],
+    "confusable_with": [
+      "data-structure/roaring-bitmap",
+      "data-structure/disjoint-interval-set",
+      "data-structure/compressed-bitmap-families-wah-ewah-concise",
+      "data-structure/roaring-container-transition-heuristics",
+      "data-structure/roaring-run-formation-and-row-ordering"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/chunk-boundary-pathologies-in-roaring.md",
+    "revision_history": []
+  }
+}

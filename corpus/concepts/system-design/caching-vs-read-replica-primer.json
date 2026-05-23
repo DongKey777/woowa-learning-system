@@ -1,0 +1,86 @@
+{
+  "id": "system-design/caching-vs-read-replica-primer",
+  "title": "Caching vs Read Replica Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "'이 문서는 시스템 설계 입문 학습자가 cache와 read replica를 둘 다 읽기 확장으로만 묶지 않고, 반복 조회를 줄이는 선택과 DB 읽기 처리량을 나누는 선택을 왜 따로 봐야 하는지 처음 잡는 primer다.",
+  "body_markdown": "# Caching vs Read Replica Primer\n\n> 한 줄 요약: cache는 같은 읽기를 아예 줄이는 전략이고 read replica는 DB 읽기 처리량을 늘리는 전략이며, 둘 다 stale 문제가 있지만 원인과 대응이 다르다는 점을 설명하는 입문 문서다.\n\n> 이 문서는 \"cache랑 replica 차이가 뭐예요?\", \"DB가 느릴 때 cache를 먼저 봐요, replica를 먼저 봐요?\", \"처음 배우는데 둘 다 stale이면 왜 따로 구분해요?\" 같은 첫 질문이 deep dive보다 먼저 이 primer로 오도록 맞춘 entrypoint다.\n\nretrieval-anchor-keywords: caching vs read replica, cache vs replica, cache랑 replica 차이 뭐예요, 캐시와 레플리카 차이, 처음 cache replica 배우는데, cache replica 큰 그림, 왜 cache와 replica가 둘 다 stale해요, 언제 cache 쓰고 언제 replica 쓰나요, db 느릴 때 cache 먼저예요 replica 먼저예요, cache invalidation basics, read replica basics, read-after-write basics, replica lag basics, primary fallback, what is cache vs replica, cache vs replica 차이, 어디서 stale read 발생, read-your-writes 보장 방법, cache miss → replica fallback, replica lag vs cache invalidation, read fan-out 의미, session affinity primary read, cache-aside vs read-through, hot read cache 활용\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [System Design Foundations](./system-design-foundations.md)\n- [Queue vs Cache vs DB Decision Drill](./queue-vs-cache-vs-db-decision-drill.md)\n- [Database Scaling Primer](./database-scaling-primer.md)\n- [Read-After-Write Consistency Basics](./read-after-write-consistency-basics.md)\n- [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Mixed Cache+Replica Read Path Pitfalls](./mixed-cache-replica-read-path-pitfalls.md)\n- [Read-Only and Graceful Degradation Patterns](./read-only-and-graceful-degradation-patterns.md)\n- [분산 캐시 설계](./distributed-cache-design.md)\n- [Read / Write Quorum & Staleness Budget](./read-write-quorum-staleness-budget-design.md)\n- [Replica Lag and Read-after-write Strategies](../database/replica-lag-read-after-write-strategies.md)\n- [Cache와 Replica가 갈라질 때의 Read Inconsistency](../database/cache-replica-split-read-inconsistency.md)\n- [Read-Your-Writes와 Session Pinning 전략](../database/read-your-writes-session-pinning.md)\n\n---\n\n## 핵심 개념\n\n초보자가 cache와 read replica를 자주 헷갈리는 이유는 둘 다 겉으로는 \"DB 읽기를 줄여 준다\"처럼 보이기 때문이다.\n하지만 실제로 하는 일은 다르다.\n\n- cache는 **같은 읽기를 재사용**해서 DB 요청 자체를 줄인다\n- read replica는 **DB 서버를 더 두어 읽기를 분산**한다\n\n즉, cache는 \"읽기 일을 없애는\" 쪽에 가깝고, replica는 \"읽기 일을 더 많은 DB가 나눠 받는\" 쪽에 가깝다.\n\n아주 단순하게 그리면 아래처럼 볼 수 있다.\n\n```text\n1) Cache-first\nClient -> App -> Cache hit -> 응답\n              -> Cache miss -> DB\n\n2) Read replica\nClient -> App -> Replica\nWrite  -> App -> Primary -> replicate -> Replica\n```\n\n핵심 차이 하나만 먼저 잡자.\n\n| 질문 | Cache | Read replica |\n|---|---|---|\n| 무엇을 줄이나 | DB로 가는 요청 수 | 한 DB가 받는 읽기 부하 |\n| stale 원인은 무엇인가 | invalidation 지연, TTL, race | replication lag, read routing |\n| 느린 쿼리를 없애 주나 | 일부 반복 조회는 숨길 수 있음 | 아니다. 비싼 쿼리는 replica에서도 비쌈 |\n| 잘 맞는 패턴 | 같은 key를 자주 읽는 hot read | 다양한 read query가 많아 DB read capacity가 부족한 경우 |\n\n---\n\n## 깊이 들어가기\n\n### 1. 둘 다 읽기 확장이지만 푸는 문제는 다르다\n\n예를 들어 상품 상세 페이지처럼 같은 `product:123`을 수없이 읽는 상황을 보자.\n이때는 cache가 특히 잘 맞는다.\n\n- 같은 결과를 반복 재사용할 수 있다\n- DB에 가지 않아도 되는 요청이 많아진다\n- hot key를 잘 흡수하면 latency도 크게 줄어든다\n\n반대로 검색 목록, 관리자 조회, 리포트처럼 요청마다 조건이 꽤 다르면 cache hit율이 낮을 수 있다.\n이런 경우에는 replica가 더 자연스러울 수 있다.\n\n- 다양한 SELECT를 replica 여러 대가 나눠 받는다\n- app 입장에서는 \"읽을 DB 풀\"이 넓어진다\n- 단, query 비용 자체가 사라지는 것은 아니다\n\n즉, cache는 **재사용 가능한 읽기**에 강하고, replica는 **DB가 직접 처리해야 하는 읽기량**을 분산하는 데 강하다.\n\n### 2. Cache의 핵심 문제는 invalidation이다\n\ncache를 붙이면 가장 먼저 따라오는 질문은 \"언제 지우거나 갱신할 것인가\"다.\n\n대표 방식:\n\n- TTL로 자연 만료시킨다\n- write 직후 해당 key를 삭제한다\n- 새 값을 cache에도 같이 쓴다\n- version key를 올려서 옛 값을 우회한다\n\n여기서 stale read가 생기는 전형적인 이유:\n\n- write는 성공했지만 cache 삭제가 늦었다\n- TTL이 남아 있어 예전 값이 계속 응답된다\n- 삭제 후 첫 read가 DB에서 옛 값을 다시 채웠다\n- 여러 related key를 다 지우지 못해 화면마다 값이 달라진다\n\n즉, cache stale 문제는 보통 \"복제가 늦다\"보다 **app이 캐시 수명을 어떻게 관리했는가**의 문제다.\n\n### 3. Read replica의 핵심 문제는 lag와 routing이다\n\nread replica 구조에서는 write는 primary가 받고, replica는 나중에 그 변경을 따라간다.\n\n```text\nwrite -> primary commit\n      -> replicate\n      -> replica apply\n      -> replica read sees new value\n```\n\n그래서 아래 같은 일이 생긴다.\n\n- 방금 저장했는데 replica 조회에는 아직 안 보인다\n- 새로고침할 때마다 어떤 replica를 읽느냐에 따라 값이 달라진다\n- failover 직후 topology cache가 늦어 엉뚱한 노드로 읽는다\n\n이때 stale read는 cache invalidation 문제가 아니라 **replica가 아직 해당 write를 따라오지 못한 것**이다.\n\n대표 대응:\n\n- 최근 write가 있었던 요청은 잠시 primary로 보낸다\n- 사용자 세션을 짧게 primary에 pinning한다\n- 최신성이 중요한 화면만 primary fallback을 둔다\n- stale 허용 범위를 제품 요구사항으로 명시한다\n\n### 4. 둘 다 stale read가 있지만 질문이 다르다\n\n겉보기 증상은 비슷하다.\n\n## 깊이 들어가기 (계속 2)\n\n- 저장 직후 예전 값이 보인다\n- 새로고침할 때 값이 뒤집힌다\n- 목록과 상세가 서로 다른 상태를 보여 준다\n\n하지만 진단 질문은 다르다.\n\n| 증상 확인 질문 | Cache 쪽 질문 | Replica 쪽 질문 |\n|---|---|---|\n| 왜 옛 값이 보였나 | invalidation이 늦었나? TTL이 남았나? | replication lag가 있었나? |\n| 왜 요청마다 값이 달랐나 | 서로 다른 key가 섞였나? local cache가 남았나? | 다른 replica로 라우팅됐나? |\n| write 직후 왜 안 보였나 | delete/update cache 순서가 꼬였나? | read-after-write를 replica로 보냈나? |\n\n그래서 stale read는 한 단어로 끝내면 안 되고,\n\"**cache stale인지 replica stale인지**\"를 먼저 가르는 게 중요하다.\n\n### 5. 언제 cache-first를 먼저 보고, 언제 replica를 먼저 보나\n\n아래처럼 생각하면 초보자 기준에서 덜 헷갈린다.\n\n| 상황 | 먼저 보는 선택지 | 이유 |\n|---|---|---|\n| 같은 상세 조회가 너무 많다 | cache | 같은 결과를 반복 재사용할 수 있다 |\n| 읽기 QPS가 높고 query 종류도 다양하다 | read replica | 여러 DB가 SELECT를 나눠 받을 수 있다 |\n| 특정 쿼리 하나가 너무 느리다 | index / query tuning | replica를 붙여도 비싼 쿼리는 계속 비싸다 |\n| write 직후 최신값이 꼭 보여야 한다 | primary fallback | cache와 replica 둘 다 stale 가능성이 있다 |\n| 목록은 약간 stale해도 되지만 상세는 최신이어야 한다 | 혼합 전략 | 경로별 freshness 요구가 다르다 |\n\n중요한 실전 감각은 이것이다.\n\n- \"반복 read\" 문제면 cache를 먼저 본다\n- \"DB read capacity\" 문제면 replica를 먼저 본다\n- \"느린 query\" 문제면 둘 다 전에 query/index를 먼저 본다\n\n### 6. 같이 쓰는 경우가 많지만, 비용도 같이 따라온다\n\n실무에서는 cache와 replica를 같이 쓰는 경우가 많다.\n하지만 이때는 단순히 성능이 두 배 좋아지는 게 아니라 stale source가 두 개가 된다.\n\n```text\nread path:\n  App -> Cache\n      -> miss면 Replica\n      -> recent write면 Primary fallback\n```\n\n이 구조의 장점:\n\n- hot read는 cache가 대부분 흡수한다\n- cache miss나 다양한 조회는 replica가 분산한다\n\n이 구조의 단점:\n\n- cache invalidation도 봐야 한다\n- replica lag도 봐야 한다\n- source selection 규칙이 없으면 화면마다 값이 갈라질 수 있다\n\n## 깊이 들어가기 (계속 3)\n\n그래서 둘을 같이 둘수록 \"무엇을 어디서 읽을지\"를 더 엄격히 정해야 한다.\n이 mixed read path의 request-carried freshness context, hit/miss/refill bridge는 [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)에서, rejected hit/fallback/no-fill 관측성은 [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)에서, dual stale source와 source-selection/observability pitfall은 [Mixed Cache+Replica Read Path Pitfalls](./mixed-cache-replica-read-path-pitfalls.md)에서 이어서 본다.\n\n### 7. 초보자가 자주 하는 오해\n\n`read replica를 붙이면 stale read는 없어지고 invalidation도 신경 안 써도 된다`\n\n- 아니다. invalidation 문제는 줄지만 replication lag 문제가 생긴다\n\n`cache를 붙이면 replica가 필요 없다`\n\n- 아니다. hot read는 cache로 줄여도, 다양한 ad-hoc read는 여전히 DB가 처리해야 할 수 있다\n\n`replica를 붙이면 느린 query가 해결된다`\n\n- 아니다. 비싼 query를 여러 대에 복제할 뿐이다\n\n`TTL을 짧게 두면 최신성 문제는 거의 해결된다`\n\n- 아니다. 짧은 TTL도 stale window를 없애지 못하고 miss storm만 늘릴 수 있다\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 상품 상세 페이지\n\n- 같은 상품 상세를 매우 자주 읽는다\n- 상품 수정은 상대적으로 적다\n\n이때는 cache-first가 잘 맞는다.\n다만 가격 변경 직후에는 invalidation이 제대로 되었는지 확인해야 한다.\n\n### 시나리오 2: 관리자 목록 / 검색 / 리포트\n\n- 조회 조건이 자주 바뀐다\n- 캐시 key가 잘게 쪼개져 hit율이 낮다\n\n이때는 read replica가 더 자연스럽다.\n다만 정산 상태나 주문 상태처럼 최신성이 중요한 칼럼은 replica lag를 조심해야 한다.\n\n### 시나리오 3: 결제 직후 주문 상세\n\n- 사용자는 \"방금 결제한 주문\"을 바로 본다\n- stale read가 UX와 CS 이슈로 직결된다\n\n이 경로는 cache나 replica보다 primary fallback이 더 중요하다.\n초보자가 가장 많이 하는 실수는 \"읽기 확장 구조를 넣었으니 모든 GET이 replica여도 된다\"고 생각하는 것이다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 잘 맞는 경우 |\n|---|---|---|---|\n| Cache-first | DB 요청 수와 latency를 크게 줄일 수 있다 | invalidation, stampede, hot key 대응이 필요하다 | 같은 데이터를 반복 조회할 때 |\n| Read replica | DB read capacity를 비교적 직관적으로 늘릴 수 있다 | lag, failover, read-after-write routing이 필요하다 | 다양한 read query가 많을 때 |\n| Cache + replica | hot read와 broad read를 함께 분산할 수 있다 | stale source가 둘이 되어 운영 규칙이 더 복잡해진다 | 규모가 커지고 경로별 정책이 분리될 때 |\n| Primary fallback 포함 | 최신성이 중요한 경로를 보호할 수 있다 | primary 부하가 늘 수 있다 | write 직후 확인, 금전/상태 변경 직후 조회 |\n\n## 면접 답변 골격\n\n짧게 답하면 이렇게 정리할 수 있다.\n\n> cache와 read replica는 둘 다 읽기 확장 수단이지만, cache는 같은 읽기를 재사용해 DB 요청 자체를 줄이고, read replica는 DB 복제본을 늘려 읽기 부하를 분산합니다.\n> cache의 핵심 문제는 invalidation이고, read replica의 핵심 문제는 replication lag와 read-after-write입니다.\n> 그래서 hot read에는 cache가, 다양한 조회량 분산에는 replica가 잘 맞고, 최신성이 중요한 경로는 둘 다 맹신하지 말고 primary fallback을 둬야 합니다.\n\n## 꼬리질문\n\n> Q: cache와 read replica는 둘 다 stale read를 만들 수 있는데 뭐가 다른가요?\n> 의도: 같은 증상이라도 원인과 대응이 다름을 구분하는지 확인\n> 핵심: cache는 invalidation 문제, replica는 lag와 routing 문제다.\n\n> Q: read replica를 붙이면 캐시가 필요 없나요?\n> 의도: read capacity와 repeated read elimination을 구분하는지 확인\n> 핵심: 아니다. hot read를 없애는 데는 cache가 더 직접적일 수 있다.\n\n> Q: cache miss면 replica로 바로 보내면 되나요?\n> 의도: miss를 최신성 보장으로 오해하지 않는지 확인\n> 핵심: 최근 write 경로라면 primary fallback이 더 안전할 수 있다.\n\n> Q: 느린 SELECT가 많으면 cache와 replica 중 무엇부터 보나요?\n> 의도: read scaling과 query tuning의 순서를 아는지 확인\n> 핵심: 먼저 query/index를 보고, 그다음 반복 read면 cache, broad read capacity면 replica를 본다.\n\n## 한 줄 정리\n\nCache는 읽기를 재사용해서 DB 일을 줄이고, read replica는 DB 읽기 일을 여러 대가 나눠 받게 하며, stale 문제는 둘 다 있지만 cache는 invalidation, replica는 lag가 본질이다.\n",
+  "aliases": [
+    "caching vs read replica",
+    "cache vs replica",
+    "cache replica primer",
+    "캐시와 레플리카 차이",
+    "cache replica 큰 그림",
+    "cache invalidation vs replica lag",
+    "cache stale vs replica stale",
+    "hot read cache",
+    "read scaling replica",
+    "cache-first read path",
+    "replica fallback path",
+    "cache invalidation basics",
+    "read replica basics",
+    "read-after-write basics",
+    "replica lag basics",
+    "primary fallback",
+    "cache replica decision",
+    "cache vs replica",
+    "캐시 vs 레플리카",
+    "캐시 vs 복제본",
+    "read replica",
+    "읽기 복제본",
+    "replica routing",
+    "cache routing",
+    "read your writes",
+    "자기 쓰기 읽기",
+    "write-through cache",
+    "cache invalidation vs replication",
+    "stale cache vs replica lag 비교",
+    "read fan-out"
+  ],
+  "expected_queries": [
+    "cache랑 replica 차이가 뭐예요?",
+    "처음 cache와 replica를 배우는데 큰 그림부터 설명해 줘",
+    "왜 cache와 replica가 둘 다 stale할 수 있어?",
+    "언제 cache를 쓰고 언제 replica를 쓰나요?",
+    "DB가 느릴 때 cache를 먼저 봐야 해, replica를 먼저 봐야 해?",
+    "캐시랑 read replica가 해결하는 문제가 어떻게 다른지 처음부터 알고 싶어",
+    "DB 읽기 부하가 클 때 캐시를 먼저 붙여야 할지 replica를 늘려야 할지 판단 기준이 뭐야",
+    "둘 다 stale가 난다는데 invalidation이랑 replica lag를 어떻게 구분해?",
+    "상품 상세 조회 같은 hot read에서는 왜 cache가 더 잘 맞아?",
+    "방금 저장한 값이 안 보일 때 cache 문제인지 replica 문제인지 큰 그림이 필요해",
+    "같은 읽기 확장인데 cache와 replica를 따로 배우는 이유가 궁금해"
+  ],
+  "symptoms": [
+    "캐시를 붙였는데도 방금 저장한 값이 안 보여",
+    "DB가 느릴 때 캐시를 볼지 replica를 볼지 헷갈려",
+    "둘 다 stale하다는데 원인 구분이 안 돼"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/caching-basics",
+      "system-design/database-scaling-primer"
+    ],
+    "next_docs": [
+      "system-design/mixed-cache-replica-freshness-bridge",
+      "system-design/read-after-write-routing-primer",
+      "system-design/read-after-write-tradeoff-matrix-chooser",
+      "database/replica-lag-read-after-write-strategies"
+    ],
+    "confusable_with": [
+      "system-design/read-after-write-routing-primer",
+      "system-design/mixed-cache-replica-freshness-bridge",
+      "database/read-your-writes-session-pinning",
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser",
+      "system-design/caching-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/caching-vs-read-replica-primer.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "id": "database/lob-off-page-storage-behavior",
+  "title": "LOB and Off-Page Storage Behavior",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# LOB and Off-Page Storage Behavior\n\n> 한 줄 요약: 큰 문자열과 BLOB/TEXT는 row 안에 다 들어가지 않고 off-page로 밀려날 수 있어서, 조회 비용과 page locality를 따로 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: LOB, off-page storage, BLOB, TEXT, overflow page, pointer storage, row size, page locality\n\n## 핵심 개념\n\n- 관련 문서:\n  - [Clustered Index Locality](./clustered-index-locality.md)\n  - [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n  - [Page Directory and Record Layout Intuition](./page-directory-and-record-layout-intuition.md)\n\nLOB는 큰 문자열이나 바이너리 데이터를 의미한다.  \nInnoDB에서는 이런 값이 row 안에 전부 들어가지 않고, 일부는 off-page로 저장될 수 있다.\n\n핵심은 다음이다.\n\n- row가 길어지면 page 하나에 담기는 row 수가 줄 수 있다\n- 큰 값은 overflow/off-page에 밀릴 수 있다\n- 본문 조회는 pointer를 따라 추가 page를 읽어야 할 수 있다\n\n## 깊이 들어가기\n\n### 1. 왜 off-page storage가 필요한가\n\n한 page에 너무 큰 row를 넣으면 page 효율이 떨어진다.  \n그래서 긴 TEXT/BLOB는 일부만 row에 두고 나머지는 별도 page로 빼는 방식이 쓰인다.\n\n이 구조가 해결하는 문제:\n\n- page 하나가 너무 빨리 꽉 차는 문제\n- 작은 row와 큰 row가 같은 page를 망치는 문제\n\n### 2. pointer 기반 접근의 비용\n\noff-page 값은 보통 바로 값이 아니라 pointer를 통해 접근한다.\n\n그 결과:\n\n- 작은 컬럼 조회는 빠를 수 있다\n- 큰 컬럼까지 읽으면 추가 I/O가 생긴다\n- 커버링 인덱스가 있어도 large column을 읽으면 본문 접근이 필요할 수 있다\n\n### 3. 왜 locality가 깨질 수 있나\n\n큰 값이 다른 page로 밀리면, row 본문과 큰 payload가 분리된다.  \n즉 한 row를 읽기 위해 여러 page를 만질 수 있다.\n\n### 4. 어디서 특히 문제되나\n\n- 상세 화면에서 긴 본문을 자주 읽는 서비스\n- 이미지/문서 메타데이터를 한 테이블에 같이 둔 경우\n- 작은 목록 조회와 큰 본문 조회가 같은 테이블에 섞인 경우\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `LOB`\n- `off-page storage`\n- `overflow page`\n- `pointer storage`\n- `row size`\n- `page locality`\n\n## 실전 시나리오\n\n### 시나리오 1. 목록은 빠른데 상세만 느리다\n\n목록에서는 큰 payload를 안 읽지만, 상세 화면에서 TEXT/BLOB를 가져오면 추가 page 접근이 생긴다.  \n이때는 row layout과 off-page storage를 같이 봐야 한다.\n\n### 시나리오 2. 인덱스는 맞는데 row가 너무 크다\n\n인덱스가 좋아도 row 자체가 크면 page density가 낮아지고 locality가 떨어진다.  \n큰 컬럼을 별도 테이블로 분리해야 할 수도 있다.\n\n### 시나리오 3. 커버링 인덱스인데도 완전히 안 빨라진다\n\n조회에 large column이 포함되면, 인덱스만으로 끝나지 않을 수 있다.  \noff-page payload가 있으면 추가 page fetch가 발생할 수 있다.\n\n## 코드로 보기\n\n### 큰 텍스트 컬럼 예시\n\n```sql\nCREATE TABLE posts (\n  id BIGINT PRIMARY KEY,\n  title VARCHAR(200) NOT NULL,\n  body TEXT NOT NULL,\n  created_at DATETIME NOT NULL,\n  INDEX idx_posts_created_at (created_at)\n);\n```\n\n### 조회 패턴 분리\n\n```sql\nSELECT id, title, created_at\nFROM posts\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n```sql\nSELECT body\nFROM posts\nWHERE id = 1001;\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| off-page storage 허용 | row 폭을 줄인다 | 추가 page fetch가 생긴다 | LOB/TEXT/BLOB가 클 때 |\n| 컬럼 분리 | 목록/상세 locality를 분리한다 | 조인/애플리케이션 복잡도가 늘어난다 | 상세 payload가 무거울 때 |\n\n핵심은 큰 컬럼을 \"그냥 한 칸 더\"로 보지 말고, **page locality와 추가 I/O를 바꾸는 구조**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: LOB가 왜 off-page로 가나요?\n> 의도: 큰 값의 page 효율 문제를 아는지 확인\n> 핵심: 한 page에 너무 큰 row를 넣지 않기 위해서다\n\n> Q: off-page storage가 왜 느릴 수 있나요?\n> 의도: pointer 기반 추가 I/O를 아는지 확인\n> 핵심: payload를 읽기 위해 추가 page를 따라가야 하기 때문이다\n\n> Q: 큰 컬럼은 어떻게 다루는 게 좋나요?\n> 의도: 테이블 분리와 locality 감각을 아는지 확인\n> 핵심: 목록/상세를 분리하거나 별도 테이블로 나눈다\n\n## 한 줄 정리\n\nLOB/off-page storage는 큰 payload를 row 밖으로 빼 page 효율을 지키지만, 조회 시 추가 I/O와 locality 저하를 감수해야 한다.\n",
+  "aliases": [
+    "LOB",
+    "off-page storage",
+    "BLOB",
+    "TEXT",
+    "overflow page",
+    "pointer storage",
+    "row size",
+    "page locality",
+    "large column storage",
+    "LOB off-page"
+  ],
+  "expected_queries": [
+    "InnoDB에서 TEXT나 BLOB 같은 LOB는 왜 row 안에 다 들어가지 않고 off-page로 나갈 수 있어?",
+    "목록 조회는 빠른데 상세에서 큰 body를 읽을 때 추가 page fetch가 생기는 이유는 뭐야?",
+    "off-page storage와 overflow page가 page locality와 row size에 주는 영향을 설명해줘",
+    "covering index가 있어도 large column을 읽으면 왜 본문 접근이 필요할 수 있어?",
+    "큰 payload 컬럼을 별도 table로 분리해야 하는 기준을 알려줘"
+  ],
+  "symptoms": [
+    "TEXT/BLOB 같은 큰 컬럼을 읽을 때 목록은 빠른데 상세 조회만 page fetch가 늘어 느려져",
+    "row가 너무 커져 page density와 locality가 떨어지는 문제를 인덱스만으로 설명하려 하고 있어",
+    "covering index가 있어도 large column/off-page payload를 읽으면 본문 접근이 필요할 수 있다는 점을 놓치고 있어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/innodb-buffer-pool-internals",
+      "database/page-directory-and-record-layout-intuition"
+    ],
+    "next_docs": [
+      "database/clustered-index-locality",
+      "database/covering-index-width-fanout-write-amplification",
+      "database/page-directory-and-record-layout-intuition"
+    ],
+    "confusable_with": [
+      "database/covering-index-vs-index-only-scan",
+      "database/clustered-index-locality",
+      "database/page-directory-and-record-layout-intuition"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/lob-off-page-storage-behavior.md",
+    "revision_history": []
+  }
+}

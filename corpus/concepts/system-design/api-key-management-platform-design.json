@@ -1,0 +1,52 @@
+{
+  "id": "system-design/api-key-management-platform-design",
+  "title": "API Key Management Platform 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 API Key Management Platform 설계를 다루는 deep_dive 문서다. API key management platform은 키 발급, 권한, 회전, 폐기, 사용량 추적을 중앙에서 관리하는 개발자 보안 인프라다. 검색 질의가 api key management, key issuance, secret rotation, key revocation처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# API Key Management Platform 설계\n\n> 한 줄 요약: API key management platform은 키 발급, 권한, 회전, 폐기, 사용량 추적을 중앙에서 관리하는 개발자 보안 인프라다.\n\nretrieval-anchor-keywords: api key management, key issuance, secret rotation, key revocation, scope, usage analytics, client credentials, hmac, key inventory, developer portal\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [API Key, HMAC Signed Request, Replay Protection](../security/api-key-hmac-signature-replay-protection.md)\n> - [Secrets Distribution System 설계](./secrets-distribution-system-design.md)\n> - [Rate Limit Config Service 설계](./rate-limit-config-service-design.md)\n> - [Audit Logging for Auth / AuthZ Traceability](../security/audit-logging-auth-authz-traceability.md)\n> - [Edge Authorization Service 설계](./edge-authorization-service-design.md)\n> - [Workload Identity / Long-Lived Service Account Keys](../security/workload-identity-vs-long-lived-service-account-keys.md)\n\n## 핵심 개념\n\nAPI key는 단순 문자열이 아니다.  \n실전에서는 아래를 함께 관리해야 한다.\n\n- key issuance\n- scopes and roles\n- secret material\n- rotation and revocation\n- usage telemetry\n- abuse detection\n\n즉, API key management는 개발자 인증 수단을 운영하는 보안 플랫폼이다.\n\n## 깊이 들어가기\n\n### 1. key와 secret을 분리한다\n\n- API key: 식별자\n- API secret: 서명용 비밀\n- scope: 허용 범위\n\n이 구조가 있어야 rotation과 revoke가 가능하다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 10만 개발자 계정\n- 수십만 active key\n- 초당 수만 auth check\n\n조회는 많고 발급은 적다.  \n그래서 key lookup과 usage telemetry가 핵심이다.\n\n봐야 할 숫자:\n\n- key lookup QPS\n- issuance rate\n- revoke propagation delay\n- usage report lag\n- invalid request rate\n\n### 3. portal and lifecycle\n\n```text\nDeveloper Portal\n  -> Create Key\n  -> Assign Scope\n  -> Show Secret Once\n  -> Rotate\n  -> Revoke\n  -> Audit\n```\n\n### 4. secret handling\n\nsecret은 평문으로 다시 보여주면 안 된다.\n\n- 생성 시 1회 표시\n- 이후에는 hash only\n- rotation window\n- emergency revoke\n\n이 부분은 [Secrets Distribution System 설계](./secrets-distribution-system-design.md)와 연결된다.\n\n### 5. usage and abuse\n\nAPI key는 사용량과 abuse를 추적해야 한다.\n\n- per key rate\n- per tenant quota\n- anomaly detection\n- geo / ASN signal\n\n이 부분은 [Rate Limit Config Service 설계](./rate-limit-config-service-design.md)와 [Edge Authorization Service 설계](./edge-authorization-service-design.md)와 연결된다.\n\n### 6. scope model\n\nScope는 너무 넓으면 안 되고 너무 좁아도 불편하다.\n\n- read/write/admin\n- resource specific\n- environment specific\n- webhook send / receive\n\n### 7. key rotation and revocation\n\n키는 언젠가 교체해야 한다.\n\n- scheduled rotation\n- dual key overlap\n- grace period\n- forced revoke\n\n이력은 [Audit Logging for Auth / AuthZ Traceability](../security/audit-logging-auth-authz-traceability.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1: 고객이 키를 유출함\n\n문제:\n\n- GitHub에 실수로 노출됐다\n\n해결:\n\n- 즉시 revoke\n- usage anomaly 확인\n- 새 key 발급\n\n### 시나리오 2: 키를 무중단 회전해야 함\n\n문제:\n\n- 외부 파트너가 새 키로 전환해야 한다\n\n해결:\n\n- old/new overlap\n- dual validation\n\n### 시나리오 3: 특정 key가 악용됨\n\n문제:\n\n- 과도한 호출과 실패가 보인다\n\n해결:\n\n- rate limit 강화\n- scope 축소\n- alert 발송\n\n## 코드로 보기\n\n```pseudo\nfunction issueKey(app, scopes):\n  secret = generateSecret()\n  key = generatePublicKey()\n  store(key, hash(secret), scopes)\n  return {key, secretOnce}\n\nfunction authenticate(key, signature):\n  record = keyStore.get(key)\n  verifySignature(record.secretHash, signature)\n```\n\n```java\npublic ApiCredential create(CredentialRequest req) {\n    return keyService.issue(req.owner(), req.scopes());\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Long-lived API key | 단순하다 | 유출 위험이 크다 | 레거시 |\n| Rotating key + secret | 실무적이다 | 운영 절차 필요 | 일반적인 B2B API |\n| Short-lived client credential | 안전하다 | 구현이 복잡 | 민감한 플랫폼 |\n| Scope-per-key | 제어가 세밀하다 | 관리가 늘어난다 | 대규모 플랫폼 |\n| Portal-driven lifecycle | 사용자 경험이 좋다 | backend 복잡도 | developer platform |\n\n핵심은 API key management가 단순 식별자가 아니라 **발급, 회전, 사용량, 폐기를 함께 다루는 개발자 보안 플랫폼**이라는 점이다.\n\n## 꼬리질문\n\n> Q: API key와 API secret의 차이는 무엇인가요?\n> 의도: 식별과 서명의 차이를 아는지 확인\n> 핵심: key는 식별자, secret은 증명 수단이다.\n\n> Q: secret을 다시 보여주면 안 되는 이유는?\n> 의도: 민감정보 안전성 이해 확인\n> 핵심: 재노출은 유출과 같다.\n\n> Q: rotation을 무중단으로 하려면?\n> 의도: dual validation과 grace window 이해 확인\n> 핵심: 새/옛 키가 함께 유효한 기간이 필요하다.\n\n> Q: abuse 탐지는 어디서 하나요?\n> 의도: key telemetry와 policy 연결 이해 확인\n> 핵심: 사용량, 실패율, geo, ASN 신호를 함께 본다.\n\n## 한 줄 정리\n\nAPI key management platform은 개발자용 키의 발급, scope, 회전, 폐기, 사용량 추적을 중앙에서 운영하는 보안 인프라다.\n\n",
+  "aliases": [
+    "api key management",
+    "key issuance",
+    "secret rotation",
+    "key revocation",
+    "scope",
+    "usage analytics",
+    "client credentials",
+    "hmac",
+    "key inventory",
+    "developer portal",
+    "API Key Management Platform 설계",
+    "api key management platform design"
+  ],
+  "expected_queries": [
+    "API Key Management Platform 설계 설계 핵심을 설명해줘",
+    "api key management가 왜 필요한지 알려줘",
+    "API Key Management Platform 설계 실무 트레이드오프는 뭐야?",
+    "api key management 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`API Key Management Platform 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`API Key Management Platform 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`API Key Management Platform 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/api-key-management-platform-design.md",
+    "revision_history": []
+  }
+}

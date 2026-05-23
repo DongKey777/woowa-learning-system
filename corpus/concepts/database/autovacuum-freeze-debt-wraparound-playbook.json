@@ -1,0 +1,58 @@
+{
+  "id": "database/autovacuum-freeze-debt-wraparound-playbook",
+  "title": "Autovacuum Freeze Debt, XID Age, and Wraparound Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 PostgreSQL autovacuum freeze debt, XID age, relfrozenxid, anti-wraparound vacuum 위험을 운영 runbook으로 분리하는 advanced playbook이다.",
+  "body_markdown": "# Autovacuum Freeze Debt, XID Age, and Wraparound Playbook\n\n> 한 줄 요약: autovacuum freeze debt는 단순 청소 지연이 아니라 transaction ID age가 임계치로 다가오는 문제이며, 늦게 보면 bloat 문제가 아니라 가용성 사고로 번질 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Vacuum / Purge / Freeze Risk Triage and Runbook Routing](./vacuum-purge-freeze-risk-runbook-routing.md)\n- [Vacuum / Purge Debt Forensics and Symptom Map](./vacuum-purge-debt-forensics-symptom-map.md)\n- [MVCC History List Growth와 Snapshot Too Old](./mvcc-history-list-snapshot-too-old.md)\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n\nretrieval-anchor-keywords: autovacuum freeze debt, xid age, wraparound prevention, freeze vacuum, vacuum freeze backlog, pg freeze debt, backend postgres operations, relfrozenxid age, anti-wraparound vacuum, freeze risk routing\n\n## 핵심 개념\n\n일반 vacuum debt가 dead tuple과 bloat 중심이라면, freeze debt는 더 직접적으로 안전 문제와 연결된다.\n\n- 오래된 tuple의 XID age 증가\n- autovacuum freeze 미진행\n- wraparound 방지 압력 증가\n\n즉 freeze debt는 \"좀 느려짐\"이 아니라, 방치하면 **강한 운영 개입이 필요한 보호 모드**로 갈 수 있는 부채다.\n\n## 깊이 들어가기\n\n### 1. freeze debt는 왜 일반 vacuum debt와 다르게 봐야 하나\n\ndead tuple 정리가 덜 된 것과, XID age가 위험 수준까지 간 것은 의미가 다르다.\n\n- dead tuple 문제\n  - 성능, bloat, scan 비용\n- freeze debt 문제\n  - transaction ID wraparound 회피\n  - 테이블 단위 긴급 vacuum 압력\n\n즉 freeze debt는 성능 이슈이면서 **안전 보존 장치**다.\n\n### 2. 큰 테이블과 낮은 churn 테이블이 의외로 freeze debt를 만들 수 있다\n\n오해:\n\n- 많이 바뀌는 테이블만 vacuum이 중요하다\n\n실제로는:\n\n- 매우 큰데 잘 안 바뀌는 테이블\n- rarely touched archive-like table\n\n이 freeze age 누적으로 위험해질 수 있다.\n\n왜냐하면 autovacuum가 충분히 자주 지나가지 않거나, freeze 작업이 뒤로 밀릴 수 있기 때문이다.\n\n### 3. 긴 transaction과 maintenance window 충돌이 freeze debt를 악화시킨다\n\n대표 원인:\n\n- 긴 snapshot\n- 대형 batch\n- autovacuum worker starvation\n- IO budget 부족\n\n즉 freeze debt도 결국 workload와 maintenance scheduling의 상호작용이다.\n\n### 4. forensic 질문은 \"어느 relation이 위험 age에 가까운가\"다\n\n보통 필요한 질문:\n\n- 가장 age가 큰 relation은 무엇인가\n- autovacuum가 최근 제대로 돌았는가\n- freeze vacuum이 밀리는 이유는 무엇인가\n- 지금 성능 저하를 감수하고라도 선제 개입해야 하는가\n\n즉 전체 평균보다 **가장 위험한 relation age(worst relation age)**가 더 중요할 때가 많다.\n\n### 5. remediation은 성능과 safety의 타협이다\n\n선택지는 보통:\n\n- autovacuum tuning\n- 수동 vacuum freeze\n- 긴 transaction 제거\n- maintenance window 확보\n\nfreeze debt가 높을수록 \"성능 최적화\"보다 \"wraparound 방지\"가 우선순위가 된다.\n\n### 6. freeze debt는 미리 보는 습관이 중요하다\n\nwraparound 압박이 임박한 뒤엔 선택지가 줄어든다.\n\n그래서 운영적으로는:\n\n- age trend\n- autovacuum lag\n- big cold table 목록\n\n을 평소에 보고, \"위험 relation\"을 미리 추적하는 편이 낫다.\n\n## 실전 시나리오\n\n### 시나리오 1. 평소 조용한 큰 테이블이 갑자기 문제\n\narchive 성격이라 거의 안 바뀌던 큰 테이블이 freeze debt로 위험 relation이 된다.\n\n교훈:\n\n- change volume이 적다고 안전한 건 아니다\n\n### 시나리오 2. autovacuum는 돌고 있는데 age가 안 줄어듦\n\n원인:\n\n- freeze 목적 작업이 충분히 못 돌고 있거나\n- 긴 snapshot이 방해\n\n### 시나리오 3. 운영자는 bloat만 보고 있었음\n\n실제 위험은 wraparound age였다.\n\n이 경우는 성능보다 먼저 보호성 vacuum이 필요하다.\n\n## 코드로 보기\n\n```text\nfreeze debt checklist\n1. highest relation age\n2. recent autovacuum activity\n3. long-running transaction presence\n4. manual freeze window availability\n```\n\n```sql\nVACUUM (ANALYZE) orders;\n```\n\n핵심은 특정 SQL보다, freeze debt를 \"cleanup debt의 특수형\"이 아니라 별도 가용성 위험으로 다루는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| autovacuum 기본값 유지 | 단순하다 | 큰 relation age를 놓칠 수 있다 | 작은 시스템 |\n| freeze debt 별도 관측 | 위험 relation을 빨리 찾는다 | 운영 metric이 늘어난다 | 중요한 PostgreSQL 운영 |\n| 수동 vacuum freeze | 위험을 빠르게 낮춘다 | maintenance 비용이 든다 | 위험 age 접근 시 |\n| 긴 transaction 억제 | root cause를 줄인다 | 앱/배치 설계 수정이 필요하다 | 대부분의 안정화 |\n\n## wrong-bucket / 오선택\n\nfreeze debt는 일반적인 bloat cleanup bucket에만 넣으면 위험하다.\n이 문서는 PostgreSQL XID age와 wraparound safety를 다루는 운영 위험 bucket이다.\n\n- table bloat나 dead tuple 정리만 묻는다면 vacuum tuning 문서와 연결한다.\n- query latency만 튄다면 lock wait, IO saturation, plan regression을 먼저 배제한다.\n- MySQL purge/history list 문제와 증상이 비슷해도 XID wraparound 개념을 그대로 옮기지 않는다.\n- autovacuum 로그가 있다는 사실만으로 freeze safety가 확보됐다고 보지 않는다.\n\n## 흔한 오해\n\n- bloat가 작으면 freeze debt도 안전하다고 본다.\n- autovacuum가 돌고 있으면 위험 relation age가 반드시 줄어든다고 단정한다.\n- `VACUUM (ANALYZE)` 한 번으로 wraparound 위험까지 해결된다고 생각한다.\n- 긴 snapshot을 없애지 않고 vacuum tuning만 올리면 충분하다고 본다.\n\n답변에서는 \"청소가 덜 됐다\"보다 \"XID age 안전 여유가 줄고 있다\"는 표현이 더 정확하다.\n\n## 재현 조건\n\n학습용 재현은 production wraparound 임계에 접근시키지 않는다.\n\n1. 큰 relation과 낮은 churn relation을 구분해 age를 관찰한다.\n2. 긴 transaction 또는 오래 열린 snapshot이 vacuum에 미치는 영향을 따로 본다.\n3. autovacuum 설정, table size, IO 여유를 기록한다.\n4. age가 감소하는지와 dead tuple/bloat가 감소하는지를 별도 metric으로 둔다.\n5. wraparound 경고 실험은 격리된 disposable DB에서만 한다.\n\n## failure matrix\n\n| 증상 | 가능 원인 | 먼저 볼 것 |\n|---|---|---|\n| age가 계속 증가 | freeze 작업이 relation을 충분히 통과하지 못함 | `age(relfrozenxid)` worst relation |\n| autovacuum는 보이는데 age가 안 줄어듦 | 긴 transaction/snapshot이 horizon을 잡음 | `pg_stat_activity.xact_start` |\n| bloat는 낮은데 위험 경고 | dead tuple보다 XID age가 문제 | freeze age, table size |\n| 수동 vacuum이 서비스에 영향 | IO/lock/maintenance window 과소 산정 | vacuum progress, IO headroom |\n\n## 검증/validation\n\nPostgreSQL 계열에서 freeze debt를 볼 때는 평균보다 가장 위험한 relation(worst relation)을 먼저 본다.\n\n```sql\nSELECT\n  nspname,\n  relname,\n  age(relfrozenxid) AS xid_age\nFROM pg_class c\nJOIN pg_namespace n ON n.oid = c.relnamespace\nWHERE relkind IN ('r', 'm')\nORDER BY age(relfrozenxid) DESC\nLIMIT 20;\n```\n\n긴 트랜잭션(transaction)도 같이 본다.\n\n```sql\nSELECT pid, state, xact_start, query\nFROM pg_stat_activity\nWHERE xact_start IS NOT NULL\nORDER BY xact_start ASC\nLIMIT 20;\n```\n\n이 쿼리들은 \"지금 무엇이 가장 오래됐는가\"를 보는 출발점이다.\n실제 조치는 DB 버전, autovacuum 설정, 테이블 크기, IO 여유, 서비스 시간대를 같이 보고 정한다.\n\n## 꼬리질문\n\n> Q: freeze debt는 일반 vacuum debt와 무엇이 다른가요?\n> 의도: bloat와 wraparound 압박을 구분하는지 확인\n> 핵심: freeze debt는 XID age 안전성과 직결되는 더 강한 운영 위험이다\n\n> Q: 잘 안 바뀌는 큰 테이블도 위험할 수 있나요?\n> 의도: low churn relation의 freeze 위험을 아는지 확인\n> 핵심: 그렇다. autovacuum가 충분히 지나지 않으면 age가 쌓일 수 있다\n\n> Q: freeze debt는 언제 성능보다 safety가 우선인가요?\n> 의도: 운영 우선순위를 이해하는지 확인\n> 핵심: wraparound 방지 임계에 가까울수록 성능보다 선제 개입이 우선된다\n\n## 한 줄 정리\n\nautovacuum freeze debt는 dead tuple 정리 문제가 아니라 XID age 안전성 문제이므로, 큰 relation age와 긴 transaction을 미리 관찰하고 wraparound 전에 개입해야 한다.\n",
+  "aliases": [
+    "autovacuum freeze debt",
+    "xid age",
+    "wraparound prevention",
+    "anti-wraparound vacuum",
+    "freeze vacuum backlog",
+    "relfrozenxid age",
+    "vacuum freeze risk",
+    "pg freeze debt",
+    "wraparound 방지",
+    "autovacuum freeze 부채"
+  ],
+  "expected_queries": [
+    "autovacuum freeze debt와 일반 vacuum debt는 운영 위험이 어떻게 달라?",
+    "PostgreSQL XID age가 wraparound 위험에 가까워질 때 무엇을 먼저 확인해야 해?",
+    "relfrozenxid age가 높은 큰 테이블은 어떤 순서로 triage해야 해?",
+    "anti-wraparound vacuum이 가용성 사고로 번지기 전에 어떤 runbook을 따라야 해?",
+    "freeze debt가 높을 때 성능보다 safety를 우선해야 하는 기준을 알려줘"
+  ],
+  "symptoms": [
+    "PostgreSQL XID age가 계속 커지는데 일반 vacuum debt와 같은 문제로 봐도 되는지 모르겠어",
+    "autovacuum freeze가 밀려 wraparound 위험이 가용성 사고로 번질까 걱정돼",
+    "큰 cold table의 relfrozenxid age가 높아졌을 때 수동 vacuum freeze가 필요한지 판단해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/vacuum-purge-debt-forensics-symptom-map",
+      "database/mvcc-replication-sharding"
+    ],
+    "next_docs": [
+      "database/vacuum-purge-freeze-risk-runbook-routing",
+      "database/mvcc-history-list-snapshot-too-old",
+      "database/slow-query-analysis-playbook"
+    ],
+    "confusable_with": [
+      "database/vacuum-purge-debt-forensics-symptom-map",
+      "database/mvcc-history-list-snapshot-too-old",
+      "database/slow-query-analysis-playbook",
+      "database/vacuum-purge-freeze-risk-runbook-routing"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/autovacuum-freeze-debt-wraparound-playbook.md",
+    "revision_history": []
+  }
+}

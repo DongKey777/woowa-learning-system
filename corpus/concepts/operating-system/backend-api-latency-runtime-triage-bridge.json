@@ -1,0 +1,52 @@
+{
+  "id": "operating-system/backend-api-latency-runtime-triage-bridge",
+  "title": "Backend API Latency Runtime Triage Bridge",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "'이 문서는 backend API latency runtime triage mission_bridge다. API slow,",
+  "body_markdown": "# Backend API Latency Runtime Triage Bridge\n\n> 한 줄 요약: API가 느릴 때 바로 코드나 DB 탓으로 단정하지 말고 CPU saturation, blocking I/O, GC pause, thread pool queue, DB pool, fd leak, cgroup memory/OOM을 같은 시간축에서 먼저 나눠야 한다.\n\n**난이도: Beginner**\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"API가 느린데 코드 문제인지 DB 문제인지 OS 문제인지 모르겠어요\" | 예약 목록, checkout, 결제 승인 API latency triage | 애플리케이션 로그만 보지 말고 CPU 사용, waiting, queueing, limit hit를 먼저 나눈다 |\n| \"가끔만 timeout이 나서 쿼리부터 튜닝해야 할지 모르겠어요\" | 특정 시간대 장바구니/예약 요청 지연 | DB wait, thread blocking, GC pause, iowait, throttling 신호를 분리한다 |\n| \"컨테이너에서만 느린데 로컬에서는 빨라요\" | 배포 환경에서만 재현되는 미션 장애 | host 전체 부하와 cgroup CPU/memory 제한을 따로 본다 |\n| \"재시작하면 잠깐 괜찮아져요\" | 결제/주문 API가 시간이 지나며 느려짐 | fd, memory, connection, thread 같은 누적 resource slope를 본다 |\n\n## CS concept 매핑\n\n| 미션 장면 | OS/runtime 질문 |\n|---|---|\n| reservation 목록 API가 갑자기 느림 | CPU saturation인지 blocking I/O/GC pause인지 |\n| checkout 요청이 timeout | DB wait, thread pool wait, external I/O wait, retry 증폭 분리 |\n| 로그 파일 삭제 후 디스크가 안 비워짐 | deleted-open-file / fd leak |\n| container에서만 느림 | cgroup CPU throttling / cgroup memory pressure |\n| connection pool timeout | DB 문제인지 thread blocking인지 long transaction인지 first split |\n| 전체 요청이 순간 멈춤 | GC pause/safepoint인지 host scheduler pressure인지 |\n| `Too many open files`와 5xx 증가 | process fd limit인지 host file table pressure인지 |\n\n## 리뷰 신호\n\n- \"API가 느려요\"만으로 쿼리 튜닝부터 시작하면 관측 축이 부족하다.\n- \"load average가 높으니 CPU 문제\"라고 바로 말하면 I/O wait를 놓칠 수 있다.\n- \"로그를 삭제했는데 용량이 그대로\"는 애플리케이션 로그 설정보다 open fd를 봐야 한다.\n- \"container만 느립니다\"는 host 전체가 아니라 cgroup 제한을 확인해야 한다.\n- \"GC가 있었지만 짧았으니 무시해도 되죠?\"는 pause timestamp와 p99 spike를 맞춰 보라는 신호다.\n- \"thread를 늘렸는데도 timeout이 나요\"는 downstream pool, DB lock, cgroup CPU/memory 예산을 함께 보라는 신호다.\n\n## 판단 순서\n\n1. 요청 latency를 `handler 실행 시간`, `queue 대기`, `downstream 대기`, `pause/stop`으로 나눌 수 있는지 본다.\n2. `top -H`, `pidstat`, `vmstat`으로 CPU saturation과 runnable 대기를 확인한다.\n3. `cpu.stat`, `memory.events`, PSI로 container/cgroup 제한에 걸렸는지 확인한다.\n4. thread dump와 JFR로 blocking I/O, lock, GC pause, safepoint, pool queue를 확인한다.\n5. DB pool metric과 DB wait event를 함께 보며 connection borrow wait와 query/lock wait를 분리한다.\n6. fd/socket/error log를 보며 `EMFILE`, `ENFILE`, deleted-open-file, connection leak을 확인한다.\n7. 한 가지 counter만으로 결론내지 말고, 같은 시간대의 request latency와 함께 움직이는지를 본다.\n\n## 5분 evidence checklist\n\n| 확인 축 | 수집할 증거 | 짧은 해석 |\n|---|---|---|\n| API latency | p50/p95/p99, timeout, error rate, endpoint/tag별 latency | 전 구간 지연인지 특정 endpoint인지 먼저 분리한다 |\n| CPU saturation | `top -H -p <pid>`, `pidstat -t -p <pid> 1`, `vmstat 1`, `cpu.pressure` | thread가 CPU를 실제로 쓰는지, runnable 대기인지 본다 |\n| cgroup CPU throttling | `cat /sys/fs/cgroup/cpu.max`, `cat /sys/fs/cgroup/cpu.stat` | host CPU가 남아도 `nr_throttled`/`throttled_usec`가 늘면 policy 병목일 수 있다 |\n| blocking I/O | downstream p95/p99, socket/read timeout log, repeated thread dump stack | CPU가 낮고 worker가 점유되면 waiting time을 의심한다 |\n| GC pause / JVM stop | GC log, JFR GC Pause/Safepoint/Allocation, heap/off-heap 추이 | pause 시간과 API spike timestamp가 맞는지 본다 |\n| thread pool queue | active/max, queue depth, oldest queued age, rejection count | queue가 timeout보다 오래 기다리게 만드는지 본다 |\n| DB pool | Hikari active/idle/pending, borrow wait, usage time, leak log | connection을 기다리는지, 빌린 뒤 오래 들고 있는지 나눈다 |\n| DB 내부 | slow query log, lock wait, active sessions, DB CPU/IO | pool 문제가 DB query/lock 때문에 생겼는지 확인한다 |\n| fd/socket | `EMFILE`/`ENFILE`, `/proc/<pid>/fd`, `lsof -p <pid>`, `ss -tanp`, `file-nr` | process limit과 host file table을 섞지 않는다 |\n| cgroup memory/OOM | `memory.current`, `memory.events`, restart reason, exit code, RSS/native/heap trend | Java heap OOM과 cgroup OOM을 분리한다 |\n\n## 명령 예시\n\n```bash\n# CPU / scheduler / I/O first split\ntop -H -p <pid>\npidstat -t -p <pid> 1\nvmstat 1\niostat -xz 1\n\n# cgroup scope\ncat /sys/fs/cgroup/cpu.stat 2>/dev/null\ncat /sys/fs/cgroup/cpu.pressure 2>/dev/null\ncat /sys/fs/cgroup/memory.current 2>/dev/null\ncat /sys/fs/cgroup/memory.events 2>/dev/null\n\n# JVM snapshot, 너무 자주 뜨지는 않는다\njcmd <pid> Thread.print -l\njcmd <pid> JFR.start name=latency settings=profile duration=60s filename=/tmp/latency.jfr\n\n# fd / socket\ncat /proc/<pid>/limits | grep -i \"open files\"\nls /proc/<pid>/fd | wc -l\nlsof -p <pid> | awk 'NR>1 {count[$5]++} END {for (t in count) print count[t], t}' | sort -nr\nss -tanp | grep <pid>\ncat /proc/sys/fs/file-nr\n```\n\nthread dump는 순간 스냅샷이고 짧은 stop을 만들 수 있으므로 지연 구간에 2~3회 정도만 시간차로 보고, JFR/metrics/log와 교차 확인한다.\n\n## Wrong-bucket table\n\n| 관찰 | 잘못된 결론 | 더 안전한 분기 |\n|---|---|---|\n| CPU 사용률이 낮다 | OS/runtime 문제는 아니다 | blocking I/O, pool wait, GC pause, throttling, fd/memory limit을 본다 |\n| load average가 높다 | CPU만 늘리면 된다 | `vmstat r/b/wa`, `cpu.stat`, PSI로 CPU saturation/cgroup/I/O wait를 나눈다 |\n| thread dump에 `RUNNABLE`이 많다 | CPU를 태우는 중이다 | stack top과 per-thread CPU/JFR sample이 맞는지 본다 |\n| DB pool pending이 많다 | pool size가 작다 | hold time, slow query, lock wait, long transaction, leak detection을 먼저 본다 |\n| queue depth가 크다 | queue를 키우면 된다 | oldest queued age와 user timeout을 비교하고 backpressure/reject를 본다 |\n| `OOMKilled`가 보인다 | Java heap만 부족하다 | cgroup limit, RSS, direct/off-heap/native/thread memory budget을 같이 본다 |\n| `ulimit -n`이 낮다 | 한도만 올리면 된다 | fd count slope, `CLOSE_WAIT`, `(deleted)`, host `file-nr`를 같이 본다 |\n\n## 검증 질문\n\n- 내가 본 counter가 누적값인지 순간값인지, 지연 시간창 전후 차이를 비교했는가?\n- p99 spike와 GC pause, throttling, queue oldest age, DB borrow wait가 같은 timestamp에 겹치는가?\n- thread dump에서 같은 stack이 반복되는가, 아니면 한 번의 우연한 snapshot인가?\n- CPU-bound라면 thread를 늘렸을 때 처리량이 오르는가, 아니면 context switch/throttling만 늘어나는가?\n- I/O-bound라면 downstream latency와 worker 점유 시간이 같이 줄어야 한다는 검증 기준을 세웠는가?\n- DB pool 조정 후 DB max connection, instance 수, query latency, transaction hold time 예산이 맞는가?\n- fd/memory 문제라면 한도 상향이 아니라 slope가 줄었는지 확인했는가?\n\n이 bridge는 운영 명령 자체를 외우게 하려는 문서가 아니라, 코칭 답변이 \"느림\"을 한 덩어리로 설명하지 않도록 첫 분기 언어를 제공한다.\n",
+  "aliases": [
+    "backend api latency runtime triage",
+    "API 느림 OS triage bridge",
+    "서버가 느린데 CPU memory IO 구분",
+    "roomescape shopping-cart runtime latency",
+    "top vmstat iostat backend bridge"
+  ],
+  "expected_queries": [
+    "API가 느릴 때 OS 관점 CPU memory IO를 어떻게 먼저 나눠?",
+    "roomescape reservation API latency를 runtime triage로 연결해줘",
+    "shopping-cart checkout timeout이 DB인지 OS인지 첫 신호를 어떻게 봐?",
+    "top vmstat iostat를 백엔드 미션 리뷰 질문으로 어떻게 써?"
+  ],
+  "symptoms": [
+    "API가 느린데 애플리케이션 로그만 보고 CPU, 메모리, I/O를 나누지 못한다",
+    "checkout이나 reservation API가 가끔 느려질 때 DB 문제인지 OS 문제인지 바로 단정한다",
+    "container CPU throttling, memory pressure, iowait 같은 런타임 신호를 코칭 질문으로 연결하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/cpu-memory-io-first-triage-command-drill",
+      "operating-system/runtime-symptom-to-os-signal-router-beginner"
+    ],
+    "next_docs": [
+      "operating-system/load-average-triage-cpu-saturation-cgroup-throttling-io-wait",
+      "operating-system/fd-space-leak-log-rotation-drill",
+      "operating-system/blocking-io-thread-pool-backpressure-primer"
+    ],
+    "confusable_with": [
+      "operating-system/runtime-symptom-to-os-signal-router-beginner",
+      "operating-system/cpu-memory-io-first-triage-command-drill",
+      "database/connection-pool-starvation-symptom-router",
+      "operating-system/backend-runtime-resource-symptom-mission-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/backend-api-latency-runtime-triage-bridge.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "id": "operating-system/blocking-io-vs-non-blocking-io-vs-async-io-intermediate-chooser",
+  "title": "I/O 모델 선택 — Blocking vs Non-Blocking vs Async I/O",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# I/O 모델 선택 — Blocking vs Non-Blocking vs Async I/O\n\n> 한 줄 요약: 단순 = Blocking, 한 thread로 다수 connection = Non-Blocking + epoll, 더 효율 = io_uring (Async). 각 단계는 *이전 한계*가 명확해질 때 진입한다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\nI/O 호출 시 *thread*가 어떻게 처신하느냐.\n\n```\n[Blocking I/O]                — read()가 데이터 올 때까지 멈춤\n  요청 → read() ──── 대기 ────→ 데이터 ←─── 반환\n  thread 1개 = 동시 connection 1개. 다수 thread로 늘리려면 stack 비용 ↑\n\n[Non-Blocking I/O]            — read()가 즉시 반환 (EAGAIN 또는 데이터)\n  read() → EAGAIN → 다른 일 → read() → EAGAIN → ...\n  thread 1개가 N 개 작업. 단 직접 polling은 CPU 낭비\n\n[I/O Multiplexing]            — epoll이 *데이터 준비된 fd*를 알려줌\n  epoll_wait() → [fd 3, fd 7 준비됨] → 그것들만 read()\n  thread 1개가 수만 connection 처리 가능\n\n[Async I/O]                   — 완료 알림 중심 모델\n  submit() → 다른 일 → completion queue/callback → \"fd 3 read 완료\"\n  io_uring은 Linux kernel interface지만, POSIX AIO/언어 runtime은 helper thread일 수도 있음\n```\n\n## 한 장 정리\n\n| 모델 | thread 행동 | 동시성 한계 | 적합 |\n|---|---|---|---|\n| Blocking | 데이터 올 때까지 대기 | 1 thread = 1 connection | 단순 client, 학습 |\n| Non-Blocking (busy poll) | 즉시 반환, 직접 polling | CPU 낭비 | 거의 안 씀 (multiplexing과 결합) |\n| **I/O Multiplexing (select/poll/epoll/kqueue)** | 한 thread가 N fd 감시 | ready fd 중심 확장성 | 고성능 서버 (Nginx, Redis) |\n| **Async I/O (io_uring, AIO)** | 제출/완료 큐 또는 callback 중심 | 구현에 따라 다름 | 매우 큰 throughput |\n\n## \"어떤 걸 골라야 해?\" 진척\n\n```\n1. 학습 / 단순 client?\n       → Blocking I/O (Java BufferedReader)\n\n2. 동시 connection 수 ↑ + 다수 thread 만들기 부담?\n       → Non-Blocking + epoll (Java NIO)\n       또는 Virtual Thread — 동기 코드 모양을 유지하되 pinning/file I/O/driver blocking을 확인\n\n3. 매우 큰 throughput + 시스템 콜 비용 줄이고 싶음?\n       → io_uring (Linux 5.1+)\n\n4. 사용자 단일 thread + UI 응답성?\n       → Async I/O (Node.js, Java CompletableFuture/Reactor)\n```\n\n## Blocking I/O — 단순함의 가치\n\n```java\n// Blocking — 데이터 올 때까지 thread 멈춤\nSocket socket = serverSocket.accept();\nInputStream in = socket.getInputStream();\nint b = in.read();          // 데이터 없으면 thread 대기\n```\n\n장점: 코드가 *순차적*이라 읽기 쉬움. 디버깅 단순.\n단점: thread 한 개당 connection 한 개. C10K (1만 동시 connection) 한계.\n\n**해결책**: thread pool로 *thread per request*. 하지만 thread 수가 connection 수만큼 늘면 OS/JVM stack 예약, 커널 스케줄링, context switching 비용이 함께 커진다. stack 크기는 플랫폼과 JVM 옵션에 따라 달라지므로 고정 숫자보다 \"thread 수에 비례한 메모리/스케줄러 예산\"으로 보는 편이 안전하다.\n\n## Non-Blocking I/O + I/O Multiplexing\n\n```c\nint flags = fcntl(fd, F_GETFL, 0);\nfcntl(fd, F_SETFL, flags | O_NONBLOCK);   // 기존 flag를 보존하며 non-blocking 추가\n\nwhile (1) {\n    epoll_wait(epfd, events, MAX_EVENTS, -1);   // 이벤트 대기\n    for (int i = 0; i < n; i++) {\n        if (events[i].events & EPOLLIN) {\n            read(events[i].data.fd, buf, ...);   // 데이터 있는 것만 read\n        }\n    }\n}\n```\n\n한 thread가 *수만 fd*를 감시. Nginx/Redis가 이 모델로 1프로세스가 수십만 connection.\n\n### select / poll / epoll 진화\n\n| API | fd 수 한계 | 시간 복잡도 | OS |\n|---|---|---|---|\n| `select` | 1024 (FD_SETSIZE) | O(N) | 모든 Unix |\n| `poll` | 무제한 | O(N) | 모든 Unix |\n| `epoll` | 무제한 | ready list 중심으로 큰 N에 강함 | Linux |\n| `kqueue` | epoll과 비슷 | readiness/change list 중심 | BSD, macOS |\n\nepoll은 매번 전체 fd set을 복사/스캔하는 모델이 아니라 *준비된 fd 중심*으로 반환하므로 N이 커도 select/poll보다 확장성이 좋다. 다만 등록/수정 비용, ready list 크기, user-space 처리량까지 포함해 \"무조건 O(1)\"처럼 외우면 운영 해석이 거칠어진다.\n\n## Async I/O — io_uring\n\n```c\n// io_uring (Linux 5.1+)\nio_uring_queue_init(...);\nio_uring_prep_read(sqe, fd, buf, len, offset);\nio_uring_submit(...);   // 제출\nio_uring_wait_cqe(...);  // 완료 대기 (또는 polling)\n```\n\nepoll은 *준비됐을 때* 통보 → 그 다음 read 호출 필요. io_uring은 read/write 같은 작업을 제출하고 completion queue로 결과를 받는 Linux kernel interface다. 일부 작업은 내부적으로 worker 경로를 탈 수 있으므로, \"항상 순수 커널 비동기\"보다 \"완료 큐 중심 API\"로 이해하는 편이 안전하다.\n\n장점: 시스템 콜 횟수 ↓. throughput ↑.\n단점: 학습 곡선. Linux 5.1+ 전용. 다른 OS 호환 ❌.\n\n## Java I/O 모델 매핑\n\n| Java API | OS 모델 |\n|---|---|\n| `InputStream` / `Socket` | Blocking I/O |\n| `java.nio` (Channel, Selector) | Non-Blocking + epoll/kqueue |\n| `AsynchronousChannelGroup` (NIO.2) | Java async channel abstraction (OS/JDK별로 poller나 thread pool 구현 가능) |\n| `CompletableFuture` / Reactor | 사용자 수준 async (위에 채널은 NIO) |\n| **Virtual Thread (Java 21)** | Blocking *코드* + carrier(OS thread) 효율 |\n\nVirtual Thread가 흥미로운 이유: 코드는 *blocking 형태*로 짜되, JVM이 많은 대기 작업을 적은 carrier thread 위에 올릴 수 있다. 네트워크 I/O는 효율이 좋아질 수 있지만, pinning, blocking native call, file I/O, JDBC driver 동작은 별도로 확인해야 한다.\n\n## Reactor vs Proactor 패턴\n\n| 패턴 | 본체 |\n|---|---|\n| **Reactor** | I/O 준비 통보 받음, 그 다음 직접 처리 (epoll 기반 Netty) |\n| **Proactor** | I/O 완료 통보 받음, 결과 콜백/완료 큐 (Windows IOCP, io_uring) |\n\n학습자 자주 혼동. epoll은 *Reactor*에 가깝고, io_uring은 completion queue를 쓰므로 *Proactor*식으로 모델링하기 쉽다. 단 실제 서버는 readiness와 completion API를 섞어 쓰기도 한다.\n\n## 자주 헷갈리는 지점\n\n- **\"Non-Blocking = Async I/O\"** — 아니다. Non-Blocking은 *호출만 즉시 반환*, Async는 *완료 알림/완료 큐* 중심 모델이다.\n- **\"epoll이면 무조건 빠름\"** — 작은 N(수십)에선 select와 큰 차이 없음. 수천 이상에서 빛남.\n- **\"Java NIO가 무조건 빠름\"** — 단순 client에선 Blocking I/O가 *코드도 단순 + 충분히 빠름*.\n- **\"Virtual Thread = Async I/O\"** — 코드 모양 *동기*. carrier가 OS thread를 효율 사용할 뿐.\n- **\"select 1024 한계는 옛이야기\"** — Linux는 epoll, BSD는 kqueue로 해결. 그래도 학습 가치 있는 history.\n\n## 학습자가 자주 만나는 시나리오\n\n- 단일 서버 + 동시 ~100 connection → Blocking I/O + Thread Pool (Tomcat 기본).\n- 수만 동시 connection (chat, push) → NIO Selector (Netty) 또는 Virtual Thread.\n- 매우 큰 throughput (DB, 파일 서버) → io_uring 또는 OS 최적화 도구.\n- \"C10K 문제\" → 1프로세스 1만 connection. epoll/kqueue가 답.\n\n## 빠른 확인 질문\n\n- Blocking과 Non-Blocking의 본질 차이?\n  - 호출 시 thread *대기 여부*.\n- epoll이 select보다 효율적인 이유?\n  - 준비된 fd 중심으로 반환해 매번 전체 fd set 복사/스캔을 피한다.\n- Virtual Thread가 Async I/O와 다른 점?\n  - 코드가 *blocking 형태*. carrier가 효율을 가져옴.\n\n## 한 줄 정리\n\nI/O 모델은 *Blocking → Multiplexing → Async* 진척. 단순함의 가치 vs 동시성 효율의 trade-off. Virtual Thread가 *코드 단순함 + 효율* 두 가치를 같이 추구.\n\nretrieval-anchor-keywords: Blocking I/O, Non-Blocking I/O, Async I/O, I/O multiplexing, select poll epoll, kqueue, io_uring, POSIX AIO, Reactor pattern, Proactor pattern, Java NIO Selector, AsynchronousChannel, C10K problem, EAGAIN EWOULDBLOCK, busy polling, Virtual Thread blocking syntax\n",
+  "aliases": [
+    "Blocking I/O",
+    "Non-Blocking I/O",
+    "Async I/O",
+    "비동기 I/O",
+    "동기 I/O",
+    "I/O multiplexing",
+    "select poll epoll",
+    "io_uring",
+    "AIO",
+    "Reactor pattern",
+    "Proactor pattern",
+    "I/O 모델"
+  ],
+  "expected_queries": [
+    "Blocking I/O와 Non-Blocking I/O 차이가 뭐야?",
+    "Async I/O는 어떻게 동작해?",
+    "select / poll / epoll 진화 흐름은?",
+    "Reactor 패턴이 뭐야?",
+    "어떤 I/O 모델을 골라야 해?",
+    "Java NIO와 traditional IO 차이는?"
+  ],
+  "symptoms": [
+    "Blocking과 Non-Blocking I/O 차이를 잘 모름",
+    "\"Async I/O\"가 epoll과 같은 건지 헷갈림",
+    "select/poll/epoll 진화 흐름이 모호",
+    "Reactor와 Proactor 차이가 헷갈림"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/epoll-kqueue-io-uring"
+    ],
+    "confusable_with": [
+      "operating-system/epoll-kqueue-io-uring",
+      "operating-system/blocking-io-thread-pool-backpressure-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/blocking-io-vs-non-blocking-io-vs-async-io-intermediate-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "id": "operating-system/linux-process-state-zombie-orphan",
+  "title": "Linux Process State Machine, Zombie, Orphan",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "'이 문서는 Linux process state beginner primer로, R, S, D, Z 상태와",
+  "body_markdown": "# Linux Process State Machine, Zombie, Orphan\n\n> 한 줄 요약: 리눅스에서 프로세스가 어떻게 종료되고 회수되는지 알아야 좀비 프로세스, 고아 프로세스, 자식 회수 누락 장애를 설명할 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Process Lifecycle and IPC Basics](./process-lifecycle-and-ipc-basics.md)\n> - [프로세스와 스레드](./README.md#프로세스와-스레드)\n> - [프로세스 스케줄링](./README.md#프로세스-스케줄링)\n> - [컨텍스트 스위칭, 데드락, Lock-free](./context-switching-deadlock-lockfree.md)\n> - [시스템 콜과 User-Kernel Boundary](./syscall-user-kernel-boundary.md)\n\n## 핵심 개념\n\n리눅스 프로세스는 실행 중에 여러 상태를 오간다.\n\n- `R` running or runnable\n- `S` interruptible sleep\n- `D` uninterruptible sleep\n- `T` stopped or traced\n- `Z` zombie\n\n이 중 실무에서 자주 헷갈리는 것이 `zombie`와 `orphan`이다.\n\n그 전에 beginner 문서에서 더 자주 섞이는 축을 먼저 분리하자.\n\n## 용어 먼저 정리: `ready` vs `runnable` vs `sleeping`\n\n운영체제 입문 자료를 읽다 보면 어떤 문서는 `ready`, 어떤 문서는 `runnable`, 또 어떤 문서는 `sleeping`이라고 써서 같은 상태처럼 보일 수 있다. 완전히 같은 말은 아니지만, beginner 단계에서는 아래처럼 정리하면 대부분의 질문이 풀린다.\n\n| 용어 | beginner에서 먼저 읽는 뜻 | Linux 관찰에서 붙는 주의점 |\n|------|--------------------------|----------------------------|\n| `running` | 지금 CPU에서 실제로 실행 중 | `ps`의 `R`은 running만이 아니라 runnable까지 넓게 묶어 보일 수 있다 |\n| `ready` | 실행 준비는 끝났고 CPU만 기다리는 상태 | beginner 설명용 표현이다 |\n| `runnable` | `ready`와 거의 같은 뜻으로 많이 쓴다 | Linux에서는 \"실행 중이거나 곧 실행 가능\"처럼 더 넓게 읽힐 수 있다 |\n| `sleeping` | CPU를 기다리는 게 아니라 외부 이벤트를 기다리는 상태 | Linux에서는 보통 `S`(interruptible sleep), `D`(uninterruptible sleep)처럼 다시 나뉜다 |\n\n짧게 말하면 이렇다.\n\n- 입문 문서에서는 `ready`와 `runnable`을 거의 동의어로 봐도 된다.\n- `sleeping`은 대개 `blocked`/`waiting` 쪽이지, ready queue에 서 있는 상태가 아니다.\n- Linux 상태 문자를 읽을 때는 `R`, `S`, `D`, `Z`처럼 좀 더 운영체제 관찰 친화적인 표기를 만난다.\n\n예를 들어 웹 요청 worker가 DB 응답을 기다리면 beginner 설명으로는 `blocked` 또는 `sleeping` 쪽이고, DB 응답을 받은 뒤 CPU 차례만 기다리면 `ready/runnable` 쪽이다. \"`sleeping`이면 그냥 쉬는 거예요?\"라는 질문에는 \"아니고, 보통은 I/O나 락이 풀리길 기다리는 중\"이라고 답하는 편이 안전하다.\n\n- `Zombie`는 **이미 종료됐지만 부모가 `wait()` 계열 호출로 회수하지 않은 자식 프로세스**\n- `Orphan`은 **부모가 먼저 종료되어 부모를 잃은 자식 프로세스**\n\n둘은 다르다.\n\n- 좀비는 죽었는데 기록이 남아 있다\n- 고아는 살아 있는데 보호자가 바뀐다\n\n리눅스에서는 프로세스가 종료될 때 커널이 즉시 흔적을 완전히 지우지 않는다.\n부모 프로세스가 자식의 종료 상태를 읽을 기회를 주기 위해, 최소한의 종료 정보는 잠시 남겨 둔다. 그게 좀비다.\n\n고아 프로세스는 보통 `init` 또는 `systemd` 같은 1번 프로세스가 입양한다.\n그래서 고아 자체는 보통 문제라기보다, 부모 종료 타이밍과 정리 책임이 꼬였다는 신호로 본다.\n\n## 깊이 들어가기\n\n### 1. 프로세스 상태 전이\n\n전형적인 흐름은 이렇다.\n\n```text\nfork() -> ready/runnable -> running -> sleeping(blocked) <-> ready/runnable -> exit() -> zombie -> wait() -> fully reaped\n```\n\n여기서 `sleeping(blocked)`는 \"CPU를 못 받아서 기다리는 상태\"가 아니라 \"외부 이벤트가 끝나야 다시 runnable이 될 수 있는 상태\"다.\n\n부모와 자식의 관계는 커널이 추적한다.\n\n- 자식이 종료하면 커널은 `exit status`, `resource usage` 같은 최소 정보를 남긴다\n- 부모는 `wait()`, `waitpid()`로 이를 회수한다\n- 부모가 회수하지 않으면 자식은 좀비로 남는다\n\n### 2. 왜 좀비가 생기는가\n\n좀비는 메모리를 계속 차지하는 프로세스가 아니다.\n대신 커널의 프로세스 테이블 엔트리와 PID를 점유한다.\n\n즉 좀비가 많아지면 생기는 문제는 다음과 같다.\n\n- PID 고갈 위험\n- 프로세스 목록 오염\n- 부모 프로세스가 자식 종료를 제대로 처리하지 못한다는 신호\n\n좀비는 \"CPU를 먹는 프로세스\"가 아니라 \"수거되지 않은 종료 기록\"에 가깝다.\n\n### 3. 왜 고아가 생기는가\n\n부모가 먼저 종료되면 자식은 고아가 된다.\n\n이때 커널은 고아를 방치하지 않고 1번 프로세스에게 재부모(reparent)한다.\n\n```text\nparent exits\n  -> child becomes orphan\n  -> init/systemd adopts child\n```\n\n그래서 고아 자체는 정상적인 커널 동작이다.\n문제는 고아가 의도치 않게 생기는 구조, 즉 부모-자식 생명주기 설계가 불안정하다는 점이다.\n\n### 4. backend 개발자가 알아야 하는 이유\n\n실무에서 이 주제가 터지는 지점은 대개 다음과 같다.\n\n- 웹 서버가 자식 프로세스를 띄우고 `wait()`를 안 해서 좀비가 쌓임\n- 배치가 외부 명령을 실행하고 종료 회수 로직을 빠뜨림\n- 컨테이너 안에서 PID 1이 시그널과 자식 회수를 제대로 처리하지 않음\n- 프로세스 풀을 직접 관리하다가 종료 누락이 발생함\n\n특히 Java/Spring 백엔드에서는 직접 `fork()`를 자주 쓰지 않아도,\n빌드 툴, 이미지 처리, ffmpeg, Python helper, shell script 같은 외부 프로세스를 띄우는 순간 같은 문제가 생길 수 있다.\n\n### 5. wait/reaping의 역할\n\n부모는 자식이 종료되면 `wait()` 또는 `waitpid()`로 종료 상태를 읽어야 한다.\n\n이 과정을 `reaping`이라고 부른다.\n\n```c\npid_t pid = fork();\nif (pid == 0) {\n    _exit(0);\n}\n\nint status;\nwaitpid(pid, &status, 0);\n```\n\n`wait()`를 호출하지 않으면 자식은 좀비로 남는다.\n반대로 부모가 비정상 종료하면 자식은 고아가 되고, 커널이 재부모한다.\n\n### 6. PID 1의 의미\n\n컨테이너 환경에서 특히 중요한 점은 PID 1이다.\n\n## 깊이 들어가기 (계속 2)\n\n- PID 1은 자식 회수 책임이 더 크다\n- PID 1이 시그널 처리를 제대로 안 하면 종료가 비정상적으로 느려질 수 있다\n- shell wrapper가 PID 1이 되면 `SIGTERM` 전달과 reaping이 꼬일 수 있다\n\n그래서 경량 컨테이너에는 `tini`, `dumb-init` 같은 init 역할 도구를 두기도 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 좀비 프로세스가 쌓인다\n\n증상:\n\n- `ps`에서 `Z` 상태가 계속 보임\n- PID 수가 예상보다 빠르게 증가함\n- 프로세스는 죽었는데 목록에서 안 사라짐\n\n진단:\n\n```bash\nps -eo pid,ppid,stat,cmd | grep ' Z '\n```\n\n```bash\ncat /proc/<pid>/status | grep -E 'State|PPid|Pid'\n```\n\n의심 포인트:\n\n- 부모 프로세스가 `wait()`를 호출하지 않는다\n- `SIGCHLD`를 무시하거나 잘못 처리한다\n- 자식 종료 후에 수거 루프가 없다\n\n### 시나리오 2: 부모가 죽고 자식만 남는다\n\n증상:\n\n- 부모 프로세스가 재시작되거나 종료됨\n- 자식 프로세스는 계속 동작함\n- 로그상으로는 부모-자식 관계가 끊겨 보임\n\n확인:\n\n```bash\npstree -ap <pid>\nps -o pid,ppid,stat,cmd -p <child_pid>\n```\n\n해석:\n\n- `PPid`가 `1` 또는 `systemd` PID로 바뀌면 고아가 재부모된 것이다\n- 의도된 백그라운드 워커일 수도 있지만, 보통은 종료 정책을 다시 봐야 한다\n\n### 시나리오 3: 컨테이너가 종료되지 않는다\n\n원인 중 하나는 PID 1이 자식 프로세스를 회수하지 않는 경우다.\n\n```text\napp shell(pid 1)\n  -> worker child\n  -> worker exits\n  -> parent never wait()\n  -> zombie remains\n```\n\n이 경우 `docker stop`이나 `SIGTERM` 이후에도 프로세스가 깔끔하게 안 끝날 수 있다.\n\n## 코드로 보기\n\n### 자식 회수 예시\n\n```c\n#include <sys/wait.h>\n#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\n\nint main(void) {\n    pid_t pid = fork();\n\n    if (pid == 0) {\n        printf(\"child exits\\n\");\n        _exit(42);\n    }\n\n    int status = 0;\n    pid_t waited = waitpid(pid, &status, 0);\n    if (waited < 0) {\n        perror(\"waitpid\");\n        return 1;\n    }\n\n    if (WIFEXITED(status)) {\n        printf(\"child exit code = %d\\n\", WEXITSTATUS(status));\n    }\n\n    return 0;\n}\n```\n\n핵심은 부모가 종료 상태를 읽는다는 점이다.\n\n### `SIGCHLD` 처리 예시\n\n```c\n#include <signal.h>\n#include <sys/wait.h>\n\nvoid on_sigchld(int signo) {\n    (void)signo;\n    while (waitpid(-1, NULL, WNOHANG) > 0) {\n        // 종료된 자식을 모두 회수\n    }\n}\n```\n\n이 패턴은 자식이 여러 개인 서버나 데몬에서 자주 쓴다.\n\n### 관찰 명령\n\n```bash\n# 상태와 부모 확인\nps -eo pid,ppid,stat,cmd | head\n\n# 프로세스 트리 확인\npstree -ap <pid>\n\n# 특정 프로세스 세부 상태 확인\ncat /proc/<pid>/status\n\n# 열린 파일과 현재 작업 디렉토리 확인\nls -l /proc/<pid>/fd\nreadlink /proc/<pid>/cwd\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 부모가 `wait()`로 직접 회수 | 명시적이고 안전하다 | 구현 누락 시 좀비 발생 | 일반적인 fork/worker 구조 |\n| `SIGCHLD` 기반 비동기 회수 | 부모가 다른 일을 해도 된다 | 시그널 처리 난이도가 높다 | 데몬, 멀티 자식 서버 |\n| reaper 프로세스 사용 | 책임 분리가 된다 | 구조가 복잡해진다 | 장기 실행 워커 풀 |\n| PID 1 init 도구 사용 | 컨테이너 종료와 회수가 안정적이다 | 추가 바이너리/레이어 필요 | 컨테이너 환경 |\n\n판단 기준은 단순하다.\n\n- 자식 수가 적고 구조가 단순하면 `wait()`로 충분하다\n- 자식 수가 많거나 오래 실행되면 `SIGCHLD`/reaper가 필요하다\n- 컨테이너라면 PID 1 문제를 반드시 고려해야 한다\n\n## 꼬리질문\n\n### 🟢 Basic\n\n**Q. 좀비 프로세스는 왜 메모리를 계속 먹지 않나요?**\n- 의도: 좀비의 본질을 이해하는지 확인\n- 핵심: 실행 코드는 끝났고, 커널이 PID와 종료 정보를 잠깐만 보관한다\n\n**Q. 고아 프로세스는 무조건 문제인가요?**\n- 의도: orphan과 zombie를 구분하는지 확인\n- 핵심: 고아는 커널이 재부모하므로 정상 동작일 수 있다\n\n### 🟡 Intermediate\n\n**Q. 부모 프로세스가 `wait()`를 안 하면 왜 문제가 되나요?**\n- 의도: reaping의 필요성 이해\n- 핵심: 종료한 자식이 좀비로 남아 PID와 커널 엔트리를 점유한다\n\n**Q. `ps`와 `/proc`로 어떤 정보를 먼저 봐야 하나요?**\n- 의도: 실전 진단 순서 확인\n- 핵심: `STAT`, `PPid`, `cmd`, `status`의 `State`와 `PPid`를 먼저 본다\n\n### 🔴 Advanced\n\n**Q. 컨테이너에서 PID 1이 특별한 이유는 무엇인가요?**\n- 의도: 운영 환경에서 process lifecycle을 이해하는지 확인\n- 핵심: 시그널 전달과 자식 회수 책임이 크고, init 역할이 없으면 좀비와 종료 지연이 생긴다\n\n**Q. `SIGCHLD`를 쓰는 것과 주기적으로 `waitpid(WNOHANG)`를 도는 것의 차이는?**\n- 의도: 종료 회수 전략의 trade-off 이해\n- 핵심: 시그널은 즉시성, 폴링은 단순성이 있다. 다만 시그널 핸들러는 재진입성과 구현 복잡도가 문제다\n\n## 한 줄 정리\n\n리눅스에서 좀비는 \"죽었지만 부모가 수거하지 않은 자식\"이고, 고아는 \"부모가 먼저 죽어 재부모된 자식\"이다. 백엔드에서는 `wait()`/`SIGCHLD`/PID 1 처리 누락이 운영 장애로 이어질 수 있으니 `ps`, `/proc`, `pstree`로 빠르게 확인해야 한다.\n",
+  "aliases": [
+    "linux process state zombie orphan",
+    "process state R S D Z",
+    "zombie process basics",
+    "orphan process basics",
+    "ready runnable sleeping difference",
+    "waitpid reap child process",
+    "ps state z meaning",
+    "좀비 프로세스와 고아 프로세스 차이",
+    "zombie process",
+    "orphan process",
+    "좀비 프로세스",
+    "고아 프로세스",
+    "defunct process",
+    "defunct",
+    "ps aux state Z",
+    "R state runnable",
+    "S state sleeping",
+    "D state uninterruptible",
+    "T state stopped",
+    "Z state zombie",
+    "wait",
+    "waitpid",
+    "SIGCHLD",
+    "init pid 1",
+    "container pid 1",
+    "reap zombie",
+    "좀비 reaping",
+    "fork exec"
+  ],
+  "expected_queries": [
+    "zombie process와 orphan process는 무엇이 달라?",
+    "ps에서 R S D Z 상태 문자는 어떤 의미야?",
+    "ready runnable sleeping blocked를 입문자 기준으로 어떻게 구분해?",
+    "자식 프로세스가 종료됐는데 왜 부모가 wait하지 않으면 좀비가 남아?",
+    "컨테이너 PID 1이 child process를 reap하지 않으면 어떤 문제가 생겨?"
+  ],
+  "symptoms": [
+    "zombie를 CPU를 먹는 살아 있는 프로세스로 오해해 부모의 wait 누락을 보지 못한다",
+    "orphan과 zombie를 모두 죽은 프로세스라고 섞어 설명한다",
+    "ready runnable sleeping blocked 차이를 몰라 ps 상태 문자 R S D Z를 잘못 해석한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-lifecycle-and-ipc-basics",
+      "operating-system/container-pid-1-sigterm-zombie-reaping-basics",
+      "operating-system/fork-exec-copy-on-write-behavior",
+      "operating-system/pid-limit-process-table-exhaustion"
+    ],
+    "confusable_with": [
+      "operating-system/container-pid-1-sigterm-zombie-reaping-basics",
+      "operating-system/fork-exec-copy-on-write-behavior",
+      "operating-system/process-lifecycle-and-ipc-basics",
+      "operating-system/pid-limit-process-table-exhaustion",
+      "operating-system/process-thread-memory-state-classification-practice-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/linux-process-state-zombie-orphan.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "id": "database/idempotency-key-and-deduplication",
+  "title": "멱등성 키와 중복 방지",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 idempotency key와 deduplication deep dive로, 네트워크 retry,",
+  "body_markdown": "# 멱등성 키와 중복 방지\n\n**난이도: 🔴 Advanced**\n\n> 네트워크는 한 번만 보내도, 서버는 두 번 받을 수 있다. 이 문서는 그 차이를 다루기 위한 정리다.\n\n관련 문서: [PENDING Row Recovery Primer](./pending-row-recovery-primer.md), [Upsert Contention, Unique Index Arbitration, and Locking](./upsert-contention-unique-index-locking.md), [MySQL `ON DUPLICATE KEY UPDATE` Safety Primer](./mysql-on-duplicate-key-update-safety-primer.md), [Transactional Inbox와 Dedup 설계](./transactional-inbox-dedup-design.md), [Exactly-Once Myths in DB Queue](./exactly-once-myths-db-queue.md), [CDC Replay Verification, Idempotency, and Acceptance Runbook](./cdc-replay-verification-idempotency-runbook.md), [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](./cdc-gap-repair-reconciliation-playbook.md), [Idempotency Key Store / Dedup Window / Replay-Safe Retry](../system-design/idempotency-key-store-dedup-window-replay-safe-retry-design.md), [Replay / Repair Orchestration Control Plane 설계](../system-design/replay-repair-orchestration-control-plane-design.md), [Token Misuse Detection / Replay Containment](../security/token-misuse-detection-replay-containment.md), [Replay Store Outage / Degradation Recovery](../security/replay-store-outage-degradation-recovery.md), [Timeout, Retry, Backoff 실전](../network/timeout-retry-backoff-practical.md), [Proxy Retry Budget Discipline](../network/proxy-retry-budget-discipline.md)\nretrieval-anchor-keywords: idempotency key, duplicate suppression, request hash, upsert, unique key arbitration, processed event table, retry safe API, cdc replay dedup, replay-safe consumer, repair window, pending row recovery, processing row takeover, idempotency lease heartbeat\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 이 문서가 필요한가](#왜-이-문서가-필요한가)\n- [멱등성이란](#멱등성이란)\n- [중복이 생기는 지점](#중복이-생기는-지점)\n- [멱등성 키 설계](#멱등성-키-설계)\n- [중복 방지 구현 패턴](#중복-방지-구현-패턴)\n- [실무에서 자주 놓치는 것](#실무에서-자주-놓치는-것)\n- [체크리스트](#체크리스트)\n- [시니어 관점 질문](#시니어-관점-질문)\n\n</details>\n\n## 왜 이 문서가 필요한가\n\n중복 요청은 생각보다 자주 발생한다.\n\n- 클라이언트 재시도\n- 네트워크 timeout\n- 응답은 실패했지만 서버는 성공한 경우\n- 메시지 소비 재시도\n\n문제는 같은 요청이 두 번 들어와도 비즈니스적으로는 한 번만 반영돼야 하는 경우가 많다는 점이다. 결제, 적립, 쿠폰 발급, 주문 생성은 대표적이다.\n\n트랜잭션은 DB 내부의 원자성을 보장하지만, 요청 재전송 자체를 없애주지는 못한다. 그래서 **멱등성 키**와 **중복 방지 저장소**를 같이 설계해야 한다.\n\n---\n\n## 멱등성이란\n\n멱등성은 같은 요청을 여러 번 적용해도 서버가 의도한 최종 효과가 한 번 적용한 것과 같아야 한다는 뜻이다.\nHTTP에서는 safe method와 `PUT`, `DELETE`처럼 메서드 자체가 멱등으로 정의되는 경우가 있지만, `POST /payments`나 `POST /orders`는 보통 그렇지 않다. 이런 create/process API를 retry-safe하게 만들려면 애플리케이션이 별도의 idempotency key 계약을 붙여야 한다.\n\n예를 들어:\n\n- 같은 idempotency key와 같은 요청 fingerprint로 `POST /payments`를 재시도하면 결제 승인은 한 번의 operation으로 수렴해야 한다\n- 같은 idempotency key와 같은 요청 fingerprint로 `POST /orders`를 재시도하면 새 주문을 또 만들지 않고 기존 결과를 replay해야 한다\n\n이때 중요한 것은 \"키가 있으니 정확히 한 번 실행된다\"가 아니다. DB unique 제약, 상태 전이, 응답 replay, 외부 side effect 복구를 묶어서 **정해 둔 scope와 보존 window 안에서 중복 효과를 흡수**하는 것이다.\n\n---\n\n## 중복이 생기는 지점\n\n중복은 보통 아래 지점에서 생긴다.\n\n1. 클라이언트가 응답을 못 받아 재시도한다.\n2. API Gateway나 LB가 타임아웃 후 재전송을 유도한다.\n3. 메시지 브로커가 at-least-once delivery를 제공한다.\n4. 배치나 스케줄러가 같은 작업을 중복 실행한다.\n\n즉 중복은 예외가 아니라 기본값에 가깝다.\n\n---\n\n## 멱등성 키 설계\n\n멱등성 키는 “같은 의미의 요청”을 식별하는 값이다.\n\n보통 다음 방식 중 하나를 쓴다.\n\n- 클라이언트가 UUID를 생성해서 보낸다\n- 서버가 요청의 의미를 해석해 고유 키를 만든다\n- 외부 연동에서는 `provider_request_id` 같은 외부 키를 저장한다\n\n설계할 때는 다음을 구분해야 한다.\n\n- 요청 식별자: 재시도 구분용\n- 비즈니스 식별자: 주문 번호, 결제 번호 같은 실제 도메인 키\n\n둘이 항상 같은 것은 아니다. 같은 주문에 대해 여러 결제 시도가 있을 수 있고, 반대로 같은 결제 시도는 여러 번 재전송될 수 있다.\n\nkey의 scope도 반드시 정해야 한다.\n\n- tenant 또는 merchant\n- caller 또는 client application\n- operation name\n- idempotency key\n\n`idem_key` 하나만 전역 unique로 두면 서로 다른 tenant나 `create-order`/`refund-order`가 같은 key space에서 충돌할 수 있다. 반대로 scope가 너무 넓으면 공격자가 다른 사용자의 replay 결과를 유추할 여지도 생긴다.\n\nrequest fingerprint는 key 재사용이 같은 요청인지 확인하는 안전장치다.\n\n- HTTP method와 normalized path template\n- canonicalized body, 예를 들면 JSON key 순서와 숫자 표현을 정규화한 값\n- 의미 있는 query/header subset\n\ntrace id, timestamp, user-agent처럼 매번 바뀌는 값은 fingerprint에 넣지 않는 편이 보통 안전하다. 같은 scope + key인데 fingerprint가 다르면 중복 흡수가 아니라 `409 Conflict` 같은 명시적 충돌로 다루어야 한다.\n\n## 상태 이름을 먼저 고정하자\n\n초보자 문서에서 가장 자주 섞이는 단어가 `PENDING`, `PROCESSING`, `SUCCESS`/`SUCCEEDED`다.\n\n이 저장소에서는 beginner 기준으로 아래처럼 읽으면 헷갈림이 줄어든다.\n\n| 이름 | 어디에서 쓰나 | 초보자 해석 |\n|---|---|---|\n| `PENDING` | idempotency row 저장 상태 | 선점은 끝났지만 최종 성공 결과는 아직 저장 전 |\n| `PROCESSING` | 중복 요청에 대한 API 응답 표현 | 기존 `PENDING` row가 아직 살아 있어서 새 실행을 막는 안내 |\n| `SUCCEEDED` | idempotency row 저장 상태 | 같은 key의 최종 성공 결과가 이미 저장됨 |\n| `FAILED_FINAL` | idempotency row 저장 상태 | 유효성 오류처럼 같은 요청이 반복돼도 같은 최종 실패로 끝남 |\n| `UNKNOWN` | idempotency row 저장 상태 | timeout/crash 뒤 외부 side effect나 commit 결과를 확신할 수 없음 |\n\n짧은 흐름은 이렇다.\n\n- 첫 winner는 보통 row를 `PENDING`으로 만든다\n- 뒤 요청은 그 `PENDING` row를 보고 `PROCESSING` 또는 `in-progress` 응답을 받을 수 있다\n- 최종 성공이 저장되면 row는 `SUCCEEDED`가 되고, 같은 요청 재전송에는 replay 응답을 준다\n- 애매한 timeout은 곧바로 실패나 재실행으로 바꾸지 않고 `UNKNOWN` 또는 recovery 후보로 남긴다\n\n아래 예시도 이 용어에 맞춰 읽는 편이 beginner에게 가장 덜 헷갈린다.\n\n---\n\n## 중복 방지 구현 패턴\n\n### 1. 멱등성 키 테이블\n\n가장 흔한 방식은 별도 테이블에 요청을 선점하는 것이다.\n\n예:\n\n```sql\nCREATE TABLE idempotency_keys (\n    id BIGINT PRIMARY KEY AUTO_INCREMENT,\n    tenant_id BIGINT NOT NULL,\n    operation VARCHAR(80) NOT NULL,\n    idem_key VARCHAR(100) NOT NULL,\n    request_hash VARCHAR(64) NOT NULL,\n    status VARCHAR(20) NOT NULL,\n    operation_id VARCHAR(80) NOT NULL,\n    lease_owner VARCHAR(80) NULL,\n    lease_until DATETIME NULL,\n    response_code INT NULL,\n    response_body TEXT NULL,\n    created_at DATETIME NOT NULL,\n    updated_at DATETIME NOT NULL,\n    dedup_until DATETIME NOT NULL,\n    UNIQUE KEY uk_idem_scope (tenant_id, operation, idem_key)\n);\n```\n\n흐름은 보통 이렇다.\n\n1. scope + `idem_key`로 `PENDING` row insert를 먼저 시도한다.\n2. insert가 성공한 요청만 winner로 보고 domain logic을 실행한다.\n3. duplicate key가 나면 기존 row를 fresh read한다.\n4. 기존 row의 `request_hash`가 다르면 conflict로 거부한다.\n5. 기존 row가 `SUCCEEDED` 또는 `FAILED_FINAL`이면 저장된 최종 응답을 replay한다.\n6. 기존 row가 아직 유효한 `PENDING`이면 `PROCESSING`/`202 Accepted`/waiter 합류 중 하나를 반환한다.\n7. lease가 만료됐거나 `UNKNOWN`이면 바로 재실행하지 말고 recovery 기준으로 분기한다.\n\n핵심은 `SELECT` 후 `INSERT`가 아니라 **unique constraint가 winner를 정하게 하고, duplicate 뒤 fresh read로 상태를 재분류**하는 것이다.\n\n### 2. 유니크 제약으로 선점\n\n비즈니스 테이블에 직접 유니크 제약을 두는 방식도 있다.\n\n예:\n\n- `orders.external_order_id UNIQUE`\n- `payments.idempotency_key UNIQUE`\n\n이 방식은 단순하다. 같은 키가 다시 들어오면 insert가 실패하므로 DB row winner를 하나로 정할 수 있다.\n\n다만 실패했을 때 어떤 응답을 줄지, 이미 성공한 요청인지 어떻게 판별할지 정책이 필요하다.\n구현을 `upsert`로 단순화하더라도, \"최초 값을 보존할지\", \"다른 payload면 충돌로 볼지\" 같은 병합 규칙은 별도로 정해야 한다.\n유니크 제약은 저장 경합의 arbitration 지점이지, 외부 결제 승인이나 메시지 발행까지 정확히 한 번만 일어나게 해 주는 장치는 아니다.\n\n### 3. 상태 전이 기반 중복 방지\n\n상태값을 두고 허용되는 전이만 인정하는 방식도 있다.\n\n예:\n\n- `PENDING -> SUCCEEDED`\n- `PENDING -> FAILED_FINAL`\n- `PENDING -> UNKNOWN`\n- `UNKNOWN -> RECOVERING -> SUCCEEDED`\n\n이미 `SUCCEEDED`인 요청은 다시 성공 처리하지 않는다.\n\n이 방식은 단순한 중복 방지 이상으로, 도메인 상태를 명확히 관리할 때 유용하다.\n`PENDING` takeover가 필요하다면 `lease_until`, heartbeat, attempt version 같은 기준을 두고 compare-and-swap 형태로 소유권을 바꿔야 한다. 오래 걸리는 worker와 죽은 worker를 구분하지 못하면 둘이 동시에 side effect를 실행할 수 있다.\n\n---\n\n## 실무에서 자주 놓치는 것\n\n### 1. 요청 본문이 달라졌는데 키만 같다\n\n같은 `idem_key`로 다른 금액이나 다른 주문을 보내면 위험하다.\n그래서 보통 `request_hash`를 함께 저장하고, 같은 키인데 본문이 달라지면 거절한다.\n\n### 2. 성공 응답만 캐시하고 실패는 무시한다\n\n실패도 의미가 있다. 예를 들어 외부 결제사 timeout 후 내부는 성공했을 수 있다. 그래서 단순 성공/실패보다 `PENDING`, `SUCCEEDED`, `FAILED_FINAL`, `UNKNOWN` 같은 저장 상태와, 필요하면 호출자에게 보여 주는 `PROCESSING` 응답 표현을 함께 설계해야 한다.\n다만 모든 실패를 replay하면 안 된다. 잘못된 금액, 재고 없음, 유효성 오류처럼 같은 요청을 반복해도 같은 결론이 나는 final business error는 저장할 수 있지만, DB deadlock, upstream timeout, store outage 같은 transient failure는 `FAILED_FINAL`이 아니라 retry/recovery 경로로 분리해야 한다.\n\n### 3. TTL이 없다\n\n멱등성 키를 영원히 저장하면 테이블이 불필요하게 커진다. 반대로 너무 빨리 지우면 재시도 구간을 못 막는다.\n\n보통은 비즈니스 특성에 맞게 보존 기간을 정한다.\nTTL 만료 뒤 같은 key가 다시 오면 어떻게 볼지도 계약해야 한다.\n\n- 완전히 새 요청으로 허용할 것인가\n- 만료됐으니 재시도를 거부할 것인가\n- 가벼운 tombstone이나 audit archive로 payload mismatch만 계속 탐지할 것인가\n\n결제, 포인트, 쿠폰처럼 되돌리기 어려운 effect는 단순 TTL 삭제만으로 끝내기보다 reconciliation과 감사 조회 경로를 같이 둔다.\n\n### 4. 트랜잭션 범위가 너무 넓다\n\n멱등성 키 선점, 도메인 저장, 외부 호출, 응답 저장을 하나의 긴 트랜잭션에 넣으면 락과 커넥션 점유가 길어진다.\n\n외부 호출은 가급적 트랜잭션 밖으로 빼고, DB에는 짧은 transaction으로 상태 전이만 남기는 편이 안전하다.\n대신 외부 호출에는 `operation_id`나 provider 쪽 idempotency key를 전달해, timeout 뒤에도 같은 operation의 결과를 조회할 수 있게 해야 한다. DB rollback은 외부 시스템의 side effect를 되돌려 주지 않는다.\n\n### 5. replay는 API retry보다 훨씬 늦게 다시 온다\n\nHTTP 재시도는 보통 수초~수분 안에 끝나지만, CDC replay나 queue redrive는 몇 시간 또는 며칠 뒤에도 같은 작업을 다시 밀어 넣을 수 있다.\n\n그래서 replay-safe idempotency는 단순히 \"중복 요청을 잠깐 막는다\"보다 더 넓게 봐야 한다.\n\n- dedup 보존 기간이 binlog/WAL retention 및 repair window보다 짧지 않아야 한다\n- `processed_event`와 consumer checkpoint가 서로 어긋나지 않아야 한다\n- 같은 `event_id`라도 다른 repair run에서 재평가 중인지 알 수 있도록 `operation_id`나 `repair_run_id`를 남기는 편이 좋다\n- 외부 side effect는 API idempotency와 별도 key space를 가져야 한다\n\n즉 replay를 운영하는 시스템에서는 멱등성 저장소가 API middleware 부품이 아니라, **재처리와 복구를 견디는 운영 계약**이 된다.\n\n---\n\n## 체크리스트\n\n- 이 API는 재시도될 수 있는가?\n- 같은 요청을 여러 번 받아도 결과가 같아야 하는가?\n- 중복 판별 scope는 tenant/caller/operation/key 중 무엇인가?\n- request fingerprint에서 의미 있는 필드와 제외할 volatile 필드는 무엇인가?\n- 요청 본문이 다르지만 키가 같은 경우를 어떻게 처리할 것인가?\n- 성공, 실패, 처리 중 상태를 구분할 것인가?\n- transient failure와 final business error를 구분하는가?\n- duplicate key 뒤 fresh read로 `SUCCEEDED`, `PENDING`, `UNKNOWN`, conflict를 재분류하는가?\n- 멱등성 키 보존 기간은 얼마인가?\n- TTL 만료 뒤 같은 key 재사용 정책은 무엇인가?\n- CDC replay나 DLQ redrive가 늦게 들어와도 dedup window가 충분한가?\n- 외부 시스템 호출을 트랜잭션 안에 넣고 있지 않은가?\n\n---\n\n## 시니어 관점 질문\n\n- 멱등성은 DB 제약으로 해결할 수 있는가, 아니면 애플리케이션 상태 관리가 필요한가?\n- 중복 요청과 진짜 재처리를 어떻게 구분할 것인가?\n- 실패 응답도 저장해야 하는가?\n- 멱등성 키를 어디까지 보존할 것인가?\n- 이 설계가 보장하는 것은 exactly-once인가, 아니면 bounded window 안의 duplicate suppression과 response replay인가?\n- replay-safe consumer라면 dedup 기록과 checkpoint를 어떤 단위로 함께 검증할 것인가?\n- 외부 호출 실패 후 재시도 시 정합성을 어떻게 유지할 것인가?\n",
+  "aliases": [
+    "idempotency key and deduplication",
+    "idempotency key",
+    "duplicate suppression",
+    "retry safe API",
+    "processed event table",
+    "request fingerprint",
+    "unique key arbitration",
+    "pending row recovery",
+    "멱등성 키",
+    "중복 요청 방지"
+  ],
+  "expected_queries": [
+    "idempotency key는 retry safe API에서 어떤 중복 요청을 막아?",
+    "멱등성 키와 business unique key는 왜 항상 같은 값이 아니야?",
+    "같은 key 같은 payload와 같은 key 다른 payload는 각각 어떻게 처리해야 해?",
+    "PENDING row가 남은 뒤 timeout이 나면 재실행보다 recovery를 먼저 봐야 하는 이유가 뭐야?",
+    "트랜잭션은 원자성을 보장하지만 요청 재전송 중복을 왜 없애주지 못해?"
+  ],
+  "symptoms": [
+    "네트워크 재시도나 메시지 redelivery가 생기면 트랜잭션만으로 중복 side effect가 막힌다고 오해한다",
+    "idempotency key와 business unique key를 같은 값으로 취급해 재시도 식별자와 도메인 식별자를 구분하지 못한다",
+    "PENDING PROCESSING SUCCESS 상태 계약 없이 insert-if-absent만 두고 timeout 이후 복구 흐름을 설계하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics",
+      "database/unique-vs-idempotency-key-vs-pending-row-recovery-decision-guide"
+    ],
+    "next_docs": [
+      "database/pending-row-recovery-primer",
+      "database/duplicate-suppression-windows",
+      "database/idempotent-transaction-retry-envelopes",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design"
+    ],
+    "confusable_with": [
+      "database/duplicate-suppression-windows",
+      "database/pending-row-recovery-primer",
+      "database/transactional-inbox-dedup-design",
+      "database/exactly-once-myths-db-queue",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "database/baseball-restart-duplicate-submit-idempotency-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/idempotency-key-and-deduplication.md",
+    "revision_history": []
+  }
+}

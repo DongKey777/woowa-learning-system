@@ -1,0 +1,63 @@
+{
+  "id": "data-structure/hashmap-internals",
+  "title": "HashMap 내부 구조",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 Java HashMap 내부의 bucket index 계산, hash spreading, collision handling, linked list to red-black tree treeify threshold, load factor, resize, rehash, equals/hashCode contract, mutable key bug를 설명하는 advanced deep dive다.",
+  "body_markdown": "# HashMap 내부 구조\n\n> 한 줄 요약: `HashMap`은 평균적으로 빠르지만, 키 설계와 충돌 처리, 리사이즈 비용을 모르면 쉽게 느려지고 심지어 값을 잃은 것처럼 보일 수 있는 자료구조다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [자료구조 정리](./README.md)\n> - [응용 자료 구조](./applied-data-structures-overview.md)\n> - [Robin Hood Hashing](./robin-hood-hashing.md)\n> - [Cache-Aware Data Structure Layouts](./cache-aware-data-structure-layouts.md)\n> - [Java Collections 성능 감각](../language/java/collections-performance.md)\n\nretrieval-anchor-keywords: HashMap internals, hash collision handling, resize rehash cost, treeify threshold, equals hashCode contract, mutable key bug, bucket index calculation, Java HashMap performance, hash spread function, load factor threshold\n\n---\n\n## 핵심 개념\n\n`HashMap`은 `key -> value`를 저장하는 해시 테이블이다. 핵심은 **키를 바로 찾는 것**이 아니라, 키를 해시값으로 바꿔 **버킷(bucket)** 을 빠르게 찾는 데 있다.\n\nJava 8+ `HashMap`은 기본적으로 다음 흐름으로 동작한다.\n\n1. `key.hashCode()`로 해시값을 구한다.\n2. 해시를 한 번 섞어 분포를 고르게 만든다.\n3. 현재 테이블 크기에 맞춰 버킷 인덱스를 계산한다.\n4. 해당 버킷에서 충돌을 처리한다.\n\n중요한 사실은 `HashMap`의 성능이 단순히 \"해시를 쓰니까 빠르다\"로 끝나지 않는다는 점이다.\n\n- 키의 `hashCode()`가 잘 분산되어야 한다.\n- `equals()`와 `hashCode()` 계약이 맞아야 한다.\n- 테이블이 너무 작으면 리사이즈가 자주 발생한다.\n- 충돌이 많으면 버킷 내부 구조가 길어진다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 버킷 인덱스는 어떻게 정해지나\n\n`HashMap`은 보통 배열 기반이다. 해시값을 그대로 인덱스로 쓰지 않고, 배열 크기 `n`에 맞춰 다음처럼 위치를 계산한다.\n\n```text\nindex = (n - 1) & hash\n```\n\n배열 크기가 2의 거듭제곱이기 때문에 `%` 연산보다 빠르고, 비트 마스킹으로 인덱스를 구할 수 있다.\n\n또 `HashMap`은 해시 분포를 조금 더 고르게 만들기 위해 상위 비트를 아래로 섞는 과정을 거친다.\n\n```java\nstatic final int spread(int h) {\n    return h ^ (h >>> 16);\n}\n```\n\n이 단계는 같은 하위 비트만 반복되는 해시를 어느 정도 완화한다.\n\n### 2. 충돌은 어떻게 처리하나\n\n다른 키가 같은 버킷으로 들어오면 충돌이 발생한다. `HashMap`은 충돌을 다음 방식으로 다룬다.\n\n- 기본적으로 버킷 내부를 연결 리스트처럼 이어 붙인다.\n- 충돌이 너무 많아지면 레드-블랙 트리로 바꾼다.\n\nJDK 8 기준 대표 임계값은 다음과 같다.\n\n| 항목 | 값 | 의미 |\n|------|----|------|\n| `TREEIFY_THRESHOLD` | 8 | 버킷 내 노드 수가 이 이상이면 트리화를 고려 |\n| `UNTREEIFY_THRESHOLD` | 6 | 트리 노드 수가 이 이하로 줄면 다시 리스트화 |\n| `MIN_TREEIFY_CAPACITY` | 64 | 테이블이 이보다 작으면 트리화 대신 resize 우선 |\n\n즉, 충돌이 많다고 무조건 트리로 바뀌는 건 아니다. 테이블이 너무 작으면 먼저 크게 늘린다.\n\n### 3. resize는 왜 비싼가\n\n`HashMap`은 원소 수가 임계치를 넘으면 테이블 크기를 보통 2배로 늘린다.\n\n```text\nthreshold = capacity x loadFactor\n```\n\n기본 `loadFactor`는 `0.75`다.  \n예를 들어 capacity가 16이면 threshold는 12이고, 13번째 삽입에서 resize가 발생한다.\n\nresize는 단순히 배열만 키우는 게 아니다.\n\n- 새 배열을 할당한다.\n- 기존 노드들을 새 인덱스로 옮긴다.\n- 충돌 체인을 다시 배치한다.\n\nJDK 8의 구현은 모든 키를 다시 해시하는 대신, 기존 해시의 특정 비트를 보고 `기존 인덱스` 또는 `기존 인덱스 + oldCapacity`로 나눈다.  \n이 최적화 덕분에 불필요한 계산을 줄인다.\n\n### 4. 평균 O(1), 최악 O(n), 트리화 후 O(log n)\n\n`HashMap`은 평균적으로 `get`, `put`이 `O(1)`에 가깝다.  \n하지만 이것은 해시 분포가 좋고 충돌이 적다는 가정이 깔려 있다.\n\n상황별로 보면:\n\n- 평균적인 경우: `O(1)`\n- 충돌이 심한 연결 리스트 버킷: `O(n)`\n- 트리화된 버킷: `O(log n)`\n\n그래서 `HashMap`은 예전보다 최악 케이스가 완화되었지만, 키 설계를 잘못하면 여전히 느려질 수 있다.\n\n### 5. `equals()`와 `hashCode()`가 맞지 않으면\n\n`HashMap`은 먼저 해시로 후보 버킷을 찾고, 그 다음 `equals()`로 실제 같은 키인지 판정한다.\n\n따라서 다음 원칙이 깨지면 문제가 생긴다.\n\n- `equals()`가 같으면 `hashCode()`도 같아야 한다.\n- 키는 가능한 한 불변이어야 한다.\n- `equals()` 비교 기준이 도메인 의미와 일치해야 한다.\n\n이 계약이 깨지면, 같은 객체를 넣었는데 못 찾거나 중복 키처럼 보일 수 있다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: mutable key 때문에 값이 사라진 것처럼 보임\n\n```java\nclass UserKey {\n    private String email;\n\n    UserKey(String email) {\n        this.email = email;\n    }\n\n    public void changeEmail(String email) {\n        this.email = email;\n    }\n\n    @Override\n    public int hashCode() {\n        return email.hashCode();\n    }\n\n    @Override\n    public boolean equals(Object o) {\n        if (this == o) return true;\n        if (!(o instanceof UserKey)) return false;\n        UserKey userKey = (UserKey) o;\n        return email.equals(userKey.email);\n    }\n}\n\nMap<UserKey, String> map = new HashMap<>();\nUserKey key = new UserKey(\"a@site.com\");\nmap.put(key, \"member\");\n\nkey.changeEmail(\"b@site.com\");\nSystem.out.println(map.get(key)); // null처럼 보일 수 있다\n```\n\n문제는 `HashMap`이 아니라 **키를 바꿔버린 설계**다.  \n해시값이 바뀌면 이전 버킷에서 더 이상 같은 키를 찾지 못한다.\n\n### 시나리오 2: 해시 분포가 나빠서 충돌이 몰림\n\n```java\nclass BadKey {\n    private final int id;\n\n    BadKey(int id) {\n        this.id = id;\n    }\n\n    @Override\n    public int hashCode() {\n        return 1; // 일부러 최악의 충돌을 만든다\n    }\n\n    @Override\n    public boolean equals(Object o) {\n        if (this == o) return true;\n        if (!(o instanceof BadKey)) return false;\n        return id == ((BadKey) o).id;\n    }\n}\n```\n\n이런 키가 많아지면 버킷 하나에 데이터가 몰리고, 결국 조회 성능이 급격히 떨어진다.\n\n### 시나리오 3: 초기 용량을 너무 작게 잡아 resize 폭탄이 남\n\n```java\nMap<Long, String> map = new HashMap<>();\nfor (long i = 0; i < 1_000_000; i++) {\n    map.put(i, \"v\" + i);\n}\n```\n\n원소 수를 대략 알고 있다면 초기 용량을 미리 잡는 편이 낫다.  \n아무 생각 없이 기본 생성자를 쓰면 여러 번 resize가 발생할 수 있다.\n\n### 시나리오 4: 멀티스레드에서 HashMap을 공유함\n\n`HashMap`은 thread-safe가 아니다.  \n읽기만 하는 구간이 아니라면 외부 동기화나 `ConcurrentHashMap`을 검토해야 한다.\n\n### 시나리오 5: HashMap의 순서를 믿고 로직을 작성함\n\n```java\nMap<String, Integer> map = new HashMap<>();\nmap.put(\"a\", 1);\nmap.put(\"b\", 2);\nmap.put(\"c\", 3);\n```\n\n`HashMap`은 삽입 순서도, 정렬 순서도 보장하지 않는다.  \n테이블이 리사이즈되거나 충돌 구조가 바뀌면 순회 결과가 달라질 수 있다.\n\n순서가 필요하면 `LinkedHashMap`, 정렬이 필요하면 `TreeMap`을 봐야 한다.\n\n---\n\n## 코드로 보기\n\n### 예상 크기를 기준으로 초기 용량 계산\n\n`HashMap`은 load factor를 감안해 미리 넉넉하게 잡는 게 좋다.\n\n```java\nstatic int tableSizeFor(int expectedSize, float loadFactor) {\n    int target = (int) Math.ceil(expectedSize / loadFactor);\n    int n = 1;\n    while (n < target) {\n        n <<= 1;\n    }\n    return n;\n}\n\nint capacity = tableSizeFor(1_000_000, 0.75f);\nMap<Long, String> map = new HashMap<>(capacity);\n```\n\n### 안전한 키 설계 예시\n\n```java\nfinal class UserId {\n    private final long value;\n\n    UserId(long value) {\n        this.value = value;\n    }\n\n    @Override\n    public int hashCode() {\n        return Long.hashCode(value);\n    }\n\n    @Override\n    public boolean equals(Object o) {\n        if (this == o) return true;\n        if (!(o instanceof UserId)) return false;\n        return value == ((UserId) o).value;\n    }\n}\n```\n\n불변 키를 쓰면 버킷 위치가 실행 중에 바뀌지 않는다.\n\n### 조회와 삽입에서 자주 쓰는 API\n\n```java\nMap<String, Integer> counts = new HashMap<>();\n\ncounts.put(\"java\", 1);\ncounts.putIfAbsent(\"java\", 10);\ncounts.computeIfAbsent(\"kotlin\", key -> 0);\ncounts.merge(\"java\", 1, Integer::sum);\n```\n\n중복 체크와 누적은 `containsKey()` 후 `put()`보다 이런 메서드가 더 명시적이다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| 기본 `HashMap` | 단순하고 빠르다 | 크기 추정이 없으면 resize 비용이 늘 수 있다 | 일반적인 단건 조회/저장 |\n| 초기 용량을 미리 잡은 `HashMap` | resize를 줄일 수 있다 | 예상 크기를 알아야 한다 | 대량 적재, 배치성 처리 |\n| `LinkedHashMap` | 삽입/접근 순서 보장 | 약간의 메모리 오버헤드 | 캐시, 순서가 중요한 경우 |\n| `TreeMap` | 정렬과 범위 탐색이 된다 | `O(log n)`이고 해시보다 느리다 | 정렬된 순회, 범위 질의 |\n| `ConcurrentHashMap` | 멀티스레드에 안전하다 | 단일 스레드보다 무거울 수 있다 | 공유 캐시, 병렬 업데이트 |\n\n핵심 판단은 다음과 같다.\n\n- 순서가 필요하면 `HashMap`보다 다른 맵을 봐야 한다.\n- 크기가 크고 미리 알 수 있으면 초기 용량을 잡아야 한다.\n- 키가 변하면 안 된다.\n- 동시에 여러 스레드가 접근하면 `HashMap`은 피해야 한다.\n\n---\n\n## 꼬리질문\n\n> Q: `HashMap`은 왜 평균적으로 O(1)인가요?  \n> 의도: 해시 분포, 버킷 구조, 충돌 처리 이해 여부 확인  \n> 핵심: 인덱스를 바로 계산하고 대부분의 버킷이 짧기 때문이다.\n\n> Q: 충돌이 많아지면 무조건 트리로 바뀌나요?  \n> 의도: JDK 8 treeification 조건 이해 여부 확인  \n> 핵심: 버킷이 8개를 넘고, 테이블 크기가 64 이상일 때 트리화를 고려한다.\n\n> Q: `loadFactor`를 왜 0.75로 두나요?  \n> 의도: 메모리와 성능의 균형 감각 확인  \n> 핵심: 너무 높으면 충돌이 늘고, 너무 낮으면 메모리 낭비가 커진다.\n\n> Q: 키 객체의 필드를 바꾸면 왜 문제가 되나요?  \n> 의도: mutable key 버그 인지 여부 확인  \n> 핵심: `hashCode()`가 바뀌면 버킷 위치가 달라져 기존 값을 찾지 못한다.\n\n---\n\n## 한 줄 정리\n\n`HashMap`은 해시 분포와 충돌 처리 위에서 평균 O(1)을 제공하지만, 키를 불변으로 설계하고 크기와 용도를 맞춰 써야 실제로 빠르다.\n",
+  "aliases": [
+    "HashMap internals",
+    "Java HashMap internals",
+    "hash collision handling",
+    "resize rehash cost",
+    "treeify threshold",
+    "equals hashCode contract",
+    "mutable key bug",
+    "bucket index calculation",
+    "hash spread function",
+    "load factor threshold",
+    "HashMap 값이 사라진 것처럼 보여요",
+    "hashCode equals HashMap lookup"
+  ],
+  "expected_queries": [
+    "Java HashMap은 hashCode로 bucket index를 어떻게 계산하고 충돌을 어떻게 처리해?",
+    "HashMap bucket이 길어지면 treeify threshold와 resize가 어떻게 갈려?",
+    "mutable key를 HashMap에 넣으면 왜 값을 잃은 것처럼 보일 수 있어?",
+    "HashMap 평균 O(1)과 최악 O(n), treeified bucket O(log n)을 비교해줘",
+    "loadFactor 0.75와 resize rehash 비용이 실제 성능에 어떤 영향을 줘?"
+  ],
+  "symptoms": [
+    "HashMap에 넣은 key를 수정했더니 get이 null처럼 보여",
+    "hash collision이 많으면 Java HashMap 내부가 어떻게 바뀌는지 궁금해",
+    "resize와 rehash 비용이 언제 발생하는지 모르겠어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/hash-table-basics",
+      "language/java-equals-hashcode-comparable-contracts"
+    ],
+    "next_docs": [
+      "data-structure/treemap-vs-hashmap-vs-linkedhashmap",
+      "data-structure/robin-hood-hashing",
+      "language/java-equals-hashcode-comparable-contracts",
+      "language/collections-performance"
+    ],
+    "confusable_with": [
+      "data-structure/hash-table-basics",
+      "data-structure/treemap-vs-hashmap-vs-linkedhashmap",
+      "language/java-equals-hashcode-comparable-contracts",
+      "data-structure/radix-tree",
+      "data-structure/cuckoo-hashing",
+      "data-structure/lru-cache-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/hashmap-internals.md",
+    "revision_history": []
+  }
+}

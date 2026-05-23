@@ -1,0 +1,55 @@
+{
+  "id": "data-structure/finite-state-transducer",
+  "title": "Finite State Transducer",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Finite State Transducer\n\n> 한 줄 요약: Finite State Transducer(FST)는 공통 prefix와 suffix를 압축하면서 key에 값을 연결하는 정적 인덱스 구조로, 대용량 문자열 사전과 autocomplete 인덱스를 매우 작게 들고 가는 데 강하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Trie Prefix Search / Autocomplete](./trie-prefix-search-autocomplete.md)\n> - [Radix Tree](./radix-tree.md)\n> - [Adaptive Radix Tree](./adaptive-radix-tree.md)\n> - [LSM-Friendly Index Structures](./lsm-friendly-index-structures.md)\n\n> retrieval-anchor-keywords: finite state transducer, fst, compressed dictionary, automaton index, autocomplete index, minimal fst, static string index, prefix compression, term dictionary, memory efficient autocomplete\n\n## 핵심 개념\n\nTrie와 Radix Tree는 prefix 검색에 강하지만,  \n대규모 사전을 메모리에 오래 들고 있으면 노드와 포인터 오버헤드가 커진다.\n\nFST는 정렬된 문자열 집합을 기반으로  \n공통 prefix뿐 아니라 공통 suffix 상태도 합쳐 압축한다.\n\n게다가 단순 membership만이 아니라,  \n문자열에 대응하는 값이나 출력(output)까지 엣지/상태에 매달 수 있다.\n\n즉 FST는 **정적 문자열 사전용 compressed index**라고 보면 감이 빠르다.\n\n## 깊이 들어가기\n\n### 1. 왜 Trie보다 더 작을 수 있나\n\nTrie는 prefix 공유는 잘하지만, suffix 쪽 상태 중복은 많이 남는다.  \n예를 들어 비슷한 끝 구조를 가진 단어가 많아도 노드가 반복될 수 있다.\n\nFST는 결정적 유한 오토마톤을 최소화하는 방향으로  \n동일한 미래를 가진 상태를 합칠 수 있다.\n\n즉:\n\n- prefix 공유\n- state minimization\n- 필요시 output compression\n\n이 세 가지가 같이 작동해 정적 사전을 매우 작게 만들 수 있다.\n\n### 2. \"정적\"이라는 조건이 중요하다\n\nFST는 보통 build 단계가 무겁고, lookup 단계가 가볍다.\n\n- key 집합을 정렬한다\n- automaton을 최소화한다\n- output encoding을 붙인다\n\n따라서 online insert/delete가 많은 구조보다  \nread-mostly dictionary, segment term index, autocomplete lexicon에 더 맞는다.\n\n### 3. output을 싣는다는 점이 Trie와 다르다\n\nFSA는 membership만 본다면, FST는 transition과 state에 output을 붙일 수 있다.\n\n예:\n\n- term -> term ordinal\n- prefix -> completion metadata offset\n- string key -> value id\n\n그래서 단순 사전 여부를 넘어서  \n**compressed key-value dictionary**로 쓰이기 좋다.\n\n### 4. backend에서 어디에 맞나\n\n문자열 키 공간이 크고 read-heavy일수록 가치가 크다.\n\n- 검색엔진 term dictionary\n- autocomplete lexicon\n- spell-check dictionary\n- static route / config key dictionary\n\nHashMap으로도 exact lookup은 되지만,  \nprefix 탐색과 메모리 압축을 함께 노리기는 어렵다.\n\n### 5. 함정과 한계\n\nFST는 강력하지만 동적 구조가 아니다.\n\n- 빌드 파이프라인이 필요하다\n- update가 잦으면 재생성이 부담된다\n- 구현 난이도가 Trie보다 훨씬 높다\n\n즉 mutable in-memory index보다  \nimmutable snapshot dictionary에 더 적합하다.\n\n## 실전 시나리오\n\n### 시나리오 1: autocomplete dictionary\n\n대량 검색어 사전을 메모리에 상주시켜야 하는데  \nTrie 포인터 오버헤드가 너무 크다면 FST가 강한 대안이 된다.\n\n### 시나리오 2: 검색 term dictionary\n\nterm -> posting list offset 매핑처럼  \n정적 문자열 사전에 작은 값을 붙여 lookup할 때 잘 맞는다.\n\n### 시나리오 3: static config / route dictionary\n\n배포 시 만들어지는 읽기 전용 문자열 키 인덱스를  \ncompact하게 들고 가야 한다면 효과적이다.\n\n### 시나리오 4: 부적합한 경우\n\n키가 수시로 추가/삭제되거나 mutation latency가 중요하면  \nTrie, Radix Tree, HashMap 쪽이 더 현실적이다.\n\n## 코드로 보기\n\n```java\nimport java.util.HashMap;\nimport java.util.Map;\n\npublic class FstSketch {\n    private static final class State {\n        private final Map<Character, State> transitions = new HashMap<>();\n        private boolean terminal;\n        private int output;\n    }\n\n    private final State root = new State();\n\n    public void insertSorted(String key, int output) {\n        State current = root;\n        for (char c : key.toCharArray()) {\n            current = current.transitions.computeIfAbsent(c, ignored -> new State());\n        }\n        current.terminal = true;\n        current.output = output;\n    }\n\n    public Integer lookup(String key) {\n        State current = root;\n        for (char c : key.toCharArray()) {\n            current = current.transitions.get(c);\n            if (current == null) {\n                return null;\n            }\n        }\n        return current.terminal ? current.output : null;\n    }\n}\n```\n\n이 코드는 FST가 아니라 trie-like sketch에 가깝다.  \n실제 FST의 핵심은 state minimization과 output factoring으로, build 단계가 lookup보다 훨씬 중요하다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Finite State Transducer | 정적 문자열 사전을 매우 작게 압축하면서 lookup과 prefix 탐색을 지원할 수 있다 | build와 구현이 복잡하고 동적 업데이트에 약하다 | term dictionary, autocomplete lexicon, static key index |\n| Trie | prefix 검색이 직관적이다 | 포인터/노드 오버헤드가 크다 | 동적 prefix 구조 |\n| Radix Tree / ART | path compression과 in-memory lookup이 좋다 | 정적 최소화 수준 압축은 아니다 | mutable ordered prefix index |\n| HashMap | exact lookup이 단순하다 | prefix 탐색과 압축이 약하다 | exact key lookup만 중요할 때 |\n\n중요한 질문은 \"문자열 인덱스가 정적 snapshot인가\"다.  \n그 답이 yes면 FST가 매우 강력해진다.\n\n## 꼬리질문\n\n> Q: FST가 Trie보다 더 작은 이유는 무엇인가요?\n> 의도: prefix 공유를 넘어서 state minimization을 이해하는지 확인\n> 핵심: 공통 prefix뿐 아니라 동일한 미래를 가진 상태를 합쳐 더 많이 압축할 수 있기 때문이다.\n\n> Q: 왜 read-mostly dictionary에 잘 맞나요?\n> 의도: build-heavy / lookup-light 구조를 구분하는지 확인\n> 핵심: build 단계는 무겁지만 완성 후 lookup은 작고 빠르게 만들 수 있기 때문이다.\n\n> Q: term dictionary에서 왜 유용한가요?\n> 의도: 문자열 key와 payload 연결 감각 확인\n> 핵심: 문자열을 compact하게 저장하면서 posting list offset 같은 값을 붙여 lookup할 수 있기 때문이다.\n\n## 한 줄 정리\n\nFinite State Transducer는 정적 문자열 사전을 최소화된 오토마톤과 output encoding으로 압축해, 대규모 dictionary와 autocomplete 인덱스를 메모리 효율적으로 다루는 구조다.\n",
+  "aliases": [
+    "Finite State Transducer",
+    "FST",
+    "compressed dictionary",
+    "automaton index",
+    "autocomplete index",
+    "minimal FST",
+    "static string index"
+  ],
+  "expected_queries": [
+    "Finite State Transducer는 Trie나 Radix Tree보다 왜 더 작을 수 있어?",
+    "FST가 prefix와 suffix 상태를 압축해 static dictionary를 만든다는 뜻은?",
+    "autocomplete index에서 minimal FST를 쓰는 이유를 알려줘",
+    "FSA와 FST는 membership만 보느냐 output value를 싣느냐로 어떻게 달라?",
+    "read-heavy term dictionary에서 FST가 맞는 조건은?"
+  ],
+  "symptoms": [
+    "대규모 문자열 사전에서 Trie나 Radix Tree의 pointer/node overhead만 늘리고 정적 dictionary 압축 구조를 고려하지 않는다",
+    "FST가 prefix뿐 아니라 동일한 suffix 상태도 합쳐 state minimization을 한다는 점을 놓친다",
+    "membership automaton과 key-value output을 싣는 transducer 차이를 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/trie-prefix-search-autocomplete",
+      "data-structure/radix-tree"
+    ],
+    "next_docs": [
+      "data-structure/adaptive-radix-tree",
+      "data-structure/lsm-friendly-index-structures",
+      "data-structure/trie-prefix-search-autocomplete"
+    ],
+    "confusable_with": [
+      "data-structure/trie-prefix-search-autocomplete",
+      "data-structure/radix-tree",
+      "data-structure/adaptive-radix-tree",
+      "data-structure/lsm-friendly-index-structures"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/finite-state-transducer.md",
+    "revision_history": []
+  }
+}

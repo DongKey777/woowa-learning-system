@@ -1,0 +1,55 @@
+{
+  "id": "software-engineering/api-versioning-compatibility-contract-chooser",
+  "title": "API Versioning Compatibility Contract Chooser",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# API Versioning Compatibility Contract Chooser\n\n> 한 줄 요약: API versioning의 첫 질문은 `/v2`를 붙일지가 아니라, 지금 변경이 기존 consumer를 깨뜨리는지와 그 깨짐을 contract로 검증할 수 있는지다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [API Versioning, Contract Testing, Anti-Corruption Layer](./api-versioning-contract-testing-anti-corruption-layer.md)\n> - [Schema Contract Evolution Across Services](./schema-contract-evolution-cross-service.md)\n> - [Backward Compatibility Test Gates](./backward-compatibility-test-gates.md)\n> - [API Contract Testing, Consumer-Driven](./api-contract-testing-consumer-driven.md)\n> - [Consumer Migration Playbook and Contract Adoption](./consumer-migration-playbook-contract-adoption.md)\n> - [Event Schema Versioning and Compatibility](./event-schema-versioning-compatibility.md)\n\n> retrieval-anchor-keywords:\n> - API versioning\n> - backward compatibility\n> - additive field\n> - enum expansion\n> - nullability\n> - field removal\n> - path versioning\n> - header versioning\n> - media type versioning\n> - consumer contract\n\n## 먼저 고를 질문\n\nAPI 변경을 보면 바로 버전 번호부터 붙이지 말고 아래 순서로 자른다.\n\n1. old consumer가 새 응답을 받아도 깨지지 않는가?\n2. new consumer가 old 응답을 받아도 fallback 할 수 있는가?\n3. strict parser, enum exhaustive switch, null 불변식이 있는 consumer가 있는가?\n4. contract test나 canary log로 실제 consumer 기대를 확인했는가?\n5. 호환 불가능하면 path/header/media type 중 어떤 versioning이 운영 비용을 가장 적게 만드는가?\n\n버전은 깨지는 변경을 숨기는 장식이 아니다. 깨지는 consumer를 동시에 살려 두기 위한 운영 경계다.\n\n## 변경 유형별 compatibility 표\n\n| 변경 | 보통 판단 | 왜 위험할 수 있나 | 안전한 첫 움직임 |\n|---|---|---|---|\n| 응답 필드 추가 | 대체로 compatible | strict JSON parser가 unknown field를 거부할 수 있음 | consumer parser tolerance 확인 |\n| optional 요청 필드 추가 | 대체로 compatible | old server가 먼저 받으면 거부할 수 있음 | server 먼저 배포, default 정의 |\n| required 요청 필드 추가 | breaking | old client가 값을 보낼 수 없음 | 새 endpoint/version 또는 expand 단계 |\n| enum 값 추가 | 자주 breaking | exhaustive switch, DB enum, UI label mapping이 깨짐 | unknown value policy 먼저 배포 |\n| null 허용 입력 | 서버에는 compatible일 수 있음 | domain invariant가 약해질 수 있음 | null 의미와 validation boundary 명시 |\n| null 반환 시작 | breaking 가능성 큼 | consumer가 non-null로 가정했을 수 있음 | 새 필드 또는 default value 유지 |\n| 필드 제거 | breaking | old consumer가 읽던 값이 사라짐 | deprecate, telemetry, 제거 window |\n| rename | breaking | remove+add와 같음 | 새 필드 추가 후 dual-read/dual-write |\n| 타입 변경 | breaking | parser와 semantic 둘 다 깨짐 | 새 필드 또는 새 version |\n| 의미 변경 | 가장 위험 | parse는 되지만 consumer가 오해함 | 새 이름/새 필드/새 version |\n\n핵심 기준은 \"파싱되는가\"가 아니라 **기존 consumer가 같은 의미로 안전하게 해석하는가**다.\n\n## enum expansion은 필드 추가보다 더 보수적으로 본다\n\n`status`에 `PAYMENT_FAILED`를 추가하는 변경은 작은 확장처럼 보인다. 하지만 consumer 코드가 아래처럼 닫힌 세계로 작성되어 있으면 장애가 된다.\n\n```java\nString label(OrderStatus status) {\n    return switch (status) {\n        case CREATED -> \"주문 생성\";\n        case PAID -> \"결제 완료\";\n        case SHIPPED -> \"배송 중\";\n    };\n}\n```\n\n새 enum 값을 내보내기 전에 아래를 먼저 확인한다.\n\n- consumer가 unknown enum을 저장/표시/무시할 수 있는가?\n- SDK generated enum이 새 값을 받으면 역직렬화에 실패하지 않는가?\n- DB enum/check constraint가 새 값을 받을 수 있는가?\n- metric, alert, dashboard label mapping이 default branch를 갖는가?\n\nenum expansion은 schema상 \"값 하나 추가\"지만, consumer 입장에서는 closed world가 열린다.\n\n## nullability는 방향을 나눠야 한다\n\nnullability 변경은 \"nullable로 바꿨다\" 한 문장으로 끝나지 않는다.\n\n| 방향 | 위험 |\n|---|---|\n| request에서 null을 추가로 허용 | 서버 호환성은 좋아질 수 있지만 domain rule이 흐려질 수 있음 |\n| request에 non-null 필수 추가 | old client가 깨짐 |\n| response에서 null을 더 이상 주지 않음 | 대체로 안전하지만 old consumer fallback 경로를 확인 |\n| response에서 null을 새로 줄 수 있음 | old consumer NPE, required UI field 깨짐 |\n\n응답 nullability를 약하게 만드는 변경은 특히 조심한다. consumer가 \"항상 온다\"고 믿고 검증을 생략했을 가능성이 크다.\n\n## versioning 방식 선택\n\n| 방식 | 장점 | 단점 | 잘 맞는 경우 |\n|---|---|---|---|\n| no new version, compatible change | 운영 단순 | consumer tolerance가 전제 | additive field, 새 endpoint |\n| path version `/v2/orders` | 발견 쉽고 문서화 쉬움 | 라우트/코드 중복, version proliferation | 큰 breaking change, 외부 공개 API |\n| header version | URI 유지, gateway routing에 유연 | 클라이언트/문서에서 덜 보임 | 파트너/internal API, 점진 전환 |\n| media type version `Accept: application/vnd.example.v2+json` | representation version을 명확히 표현 | 도구/캐시/테스트 설정 복잡 | 같은 resource의 표현 계약이 바뀔 때 |\n| query param version | 테스트와 수동 호출이 쉬움 | 캐시/정책이 흐려질 수 있음 | 임시 migration, 내부 도구성 API |\n\n팀 입장에서는 path version이 가장 이해하기 쉽다. 하지만 API gateway, client SDK, cache key, observability tag, 문서화 방식까지 같이 바뀌므로 단순히 \"URL이 예뻐서\" 고르면 안 된다.\n\n## consumer contract가 필요한 지점\n\n버전 번호만으로는 \"누가 무엇을 기대하는지\"를 알 수 없다. 그래서 다음 변경은 contract test나 consumer matrix가 있어야 한다.\n\n- enum 값 추가\n- nullable response 변경\n- field rename/remove\n- error format 변경\n- pagination/sorting 의미 변경\n- money/date/timezone 의미 변경\n\nconsumer contract에는 최소한 아래가 있어야 한다.\n\n| 항목 | 이유 |\n|---|---|\n| consumer 이름과 버전 | 누가 아직 old contract를 쓰는지 알기 위해 |\n| parser strictness | unknown field/unknown enum 처리 확인 |\n| required field 목록 | removal/nullability 위험 판단 |\n| semantic expectation | 필드 의미 변경 감지 |\n| last verified time | 오래된 계약인지 판단 |\n\n## 안전한 rollout 순서\n\n### compatible field add\n\n1. provider가 optional field를 추가한다.\n2. old consumer가 unknown field를 무시하는지 확인한다.\n3. new consumer가 field 없을 때도 동작하게 만든다.\n4. usage telemetry를 보고 필수화 여부를 다시 판단한다.\n\n### enum expansion\n\n1. consumer에 unknown enum fallback을 먼저 배포한다.\n2. contract test에 새 enum 값을 추가한다.\n3. provider가 새 값을 canary로 내보낸다.\n4. parse error, default branch, metric cardinality를 확인한다.\n\n### field removal/rename\n\n1. 새 필드를 추가한다.\n2. producer가 old/new를 함께 제공한다.\n3. consumer가 새 필드로 전환한다.\n4. old field 사용량을 계측한다.\n5. deprecation window 이후 제거한다.\n\n## 코드 리뷰에서 바로 쓰는 질문\n\n- 이 변경은 old consumer/new consumer 조합에서 각각 안전한가?\n- unknown field와 unknown enum을 consumer가 어떻게 처리하는가?\n- null이 새로 들어오거나 새로 나가는 방향인가?\n- versioning 방식이 cache key, gateway route, SDK 생성에 반영됐는가?\n- contract test가 형식뿐 아니라 의미를 잡는가?\n- 제거라면 deprecation, telemetry, sunset date가 있는가?\n\n## 한 줄 정리\n\nAPI versioning 선택은 경로 표기 문제가 아니라, additive change와 breaking change를 구분하고 consumer contract로 실제 호환성을 검증하는 의사결정이다.\n",
+  "aliases": [
+    "API Versioning Compatibility Contract Chooser",
+    "API compatibility change chooser",
+    "path header media type versioning",
+    "additive field enum expansion nullability removal",
+    "consumer contract API versioning",
+    "API 호환성 버전 선택표"
+  ],
+  "expected_queries": [
+    "API 변경에서 additive field, enum expansion, nullability, removal이 각각 backward compatibility에 어떤 영향을 주는지 비교해줘",
+    "API v2를 path로 만들지 header나 media type version으로 만들지 선택하는 기준을 알려줘",
+    "enum 값을 추가할 때 old consumer의 exhaustive switch와 unknown value 처리를 왜 먼저 확인해야 해?",
+    "nullable field를 새로 허용하거나 null을 반환하기 시작하는 변경은 왜 호환성 위험이 다른가?",
+    "consumer contract test 없이 API versioning만 하면 어떤 변경이 조용히 깨질 수 있어?"
+  ],
+  "symptoms": [
+    "새 필드 추가와 enum 값 추가를 둘 다 안전한 변경으로 보고 old consumer의 strict parser나 exhaustive switch를 깨뜨려",
+    "nullability 변경, 필드 제거, 의미 변경을 URL v2만 만들면 해결된다고 보고 consumer migration과 contract test를 빼먹어",
+    "path version, header version, media type version 중 형식만 비교하고 캐시, 라우팅, 문서화, 클라이언트 발견 가능성을 함께 보지 않아"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/api-versioning-contracts-acl",
+      "software-engineering/schema-contract-evolution-cross-service"
+    ],
+    "next_docs": [
+      "software-engineering/backward-compatibility-gates",
+      "software-engineering/api-contract-testing",
+      "software-engineering/consumer-migration-playbook"
+    ],
+    "confusable_with": [
+      "software-engineering/api-versioning-contracts-acl",
+      "software-engineering/schema-contract-evolution-cross-service",
+      "software-engineering/backward-compatibility-gates",
+      "software-engineering/api-contract-testing",
+      "software-engineering/event-schema-versioning"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/api-versioning-compatibility-contract-chooser.md",
+    "revision_history": []
+  }
+}

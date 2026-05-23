@@ -1,0 +1,45 @@
+{
+  "id": "system-design/operational-symptom-to-consistency-cause-router",
+  "title": "Operational Symptom to Consistency Cause Router",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 운영 증상을 consistency 원인 후보로 분기한다. stale read, duplicate delivery, missing event, read model lag 같은 표현을 read-after-write, idempotency, outbox/reconciliation 문서로 연결한다.",
+  "body_markdown": "# Operational Symptom to Consistency Cause Router\n\n> 한 줄 요약: 운영에서 \"값이 늦다\", \"두 번 처리됐다\", \"이벤트가 사라졌다\"는 모두 consistency 증상처럼 보이지만 원인은 read path freshness, retry/idempotency, outbox/consumer lag, reconciliation 누락으로 나누어야 한다.\n\n## 운영 증상\n\n먼저 사용자 증상을 한 문장으로 고정한다.\n\n| 사용자/운영 증상 | 먼저 의심할 축 | 빠르게 확인할 증거 |\n|---|---|---|\n| 저장 성공 후 화면에는 옛값이 보임 | read-after-write freshness | `read_source`, `served_version`, `required_version` |\n| 최신값과 옛값이 새로고침마다 번갈아 보임 | cache/replica/projection 경로 혼재 | 요청별 node, cache hit, replica lag |\n| 같은 주문/결제가 두 번 처리됨 | retry + idempotency 누락 | `idempotency_key`, unique constraint, retry log |\n| 이벤트는 발행된 것 같은데 read model이 비어 있음 | outbox/CDC/consumer lag 또는 poison message | event id, offset, consumer ack, DLQ |\n| 목록은 최신인데 상세는 옛값, 또는 반대 | source of truth와 read model 경계 혼동 | 화면별 source, projection watermark |\n\n핵심은 \"일관성 문제\"라는 이름으로 묶지 않는 것이다. 읽기 최신성 문제와 중복 side effect 문제는 처방이 다르다.\n\n## 관찰 timeline\n\n증상이 발생한 한 건을 아래 순서로 놓는다.\n\n```text\nclient_action_at\nwrite_request_id / command_id / idempotency_key\nsource_of_truth_commit_at / committed_version\nevent_created_at / event_id\nevent_published_at / broker_offset\nconsumer_started_at / acked_at / retry_count\nprojection_watermark / applied_version\nread_request_at / read_source / served_version\n```\n\n이 timeline 없이 \"가끔 stale\"이라고만 말하면 cache, replica, projection, frontend store가 모두 후보가 되어 원인 범위가 너무 넓어진다.\n\n## 원인 후보 router\n\n| 증상 bucket | 가능한 원인 | 확인 질문 | 대표 처방 |\n|---|---|---|---|\n| stale read | cache hit가 version/watermark 없이 허용됨 | cache entry가 `required_version` 이상인지 증명 가능한가 | cache acceptance rule, stale hit reject |\n| stale read | replica lag 중인데 recent writer도 replica를 읽음 | write 직후 read routing 규칙이 있는가 | recent-write pinning, narrow primary fallback |\n| stale read | projection/read model이 source of truth보다 늦음 | projection watermark가 write event 뒤까지 왔는가 | pending UX, polling, watermark-aware read |\n| 화면 역행 | 이미 본 version보다 낮은 응답을 허용함 | 클라이언트가 min-version floor를 전달하는가 | monotonic read guard |\n| 중복 처리 | timeout 후 retry가 같은 command를 다시 실행함 | idempotency key가 저장되고 재사용되는가 | idempotency store, unique constraint |\n| 중복 처리 | queue가 at-least-once로 재전달함 | consumer side effect가 event id로 dedup되는가 | idempotent consumer, dedup window |\n| missing event | DB commit과 publish가 분리된 dual-write gap | outbox row 또는 CDC log에 이벤트가 남았는가 | transactional outbox, relay retry |\n| missing projection | consumer가 poison message에서 멈춤 | DLQ, retry count, oldest lag가 증가하는가 | DLQ 처리, replay, reconciliation |\n\n## 보장 범위 분리\n\n- Source of truth: 업무 상태의 최종 판단 기준이다. 보통 primary DB의 committed row, ledger, event log처럼 복구 가능한 원장이다.\n- Watermark/version: read path가 source of truth를 어디까지 따라왔는지 설명하는 증거다. 최신성을 \"느낌\"이 아니라 비교 가능한 숫자로 바꾼다.\n- Idempotency: 같은 command나 event가 여러 번 들어와도 같은 결과가 되게 하는 장치다. read freshness를 해결하지 않는다.\n- Replay/dedup: 누락 복구와 중복 억제를 위한 운영 장치다. replay는 중복을 만들 수 있으므로 dedup과 함께 설계한다.\n- Fallback safety: primary fallback, cache bypass, degraded UX가 시스템 capacity와 business safety를 깨지 않는 조건이다.\n\n## Trade-off\n\n| 선택 | 얻는 것 | 비용/위험 |\n|---|---|---|\n| 모든 read를 primary로 보냄 | stale read 감소 | primary capacity 소진, 장애 격리 약화 |\n| recent writer만 primary fallback | 중요한 read-after-write 보호 | write hint 전파와 fallback budget 필요 |\n| cache hit를 watermark로 거절 | causal stale 감소 | metadata 저장, miss 증가, latency 상승 |\n| pending UX로 projection lag 노출 | 사용자가 실패로 오해하는 상황 감소 | UX 상태 모델 복잡도 증가 |\n| retry를 공격적으로 늘림 | transient failure 흡수 | 중복 side effect, retry storm 위험 |\n| replay/reconciliation 강화 | missing event 복구 | idempotent handler 없으면 중복 처리 위험 |\n\n## 검증 지표\n\n- freshness: stale read rate, `served_version < required_version` count, rejected cache hit count, replica lag p95/p99, projection watermark gap\n- idempotency: duplicate command count, idempotency hit rate, unique constraint conflict count, replay dedup hit rate\n- delivery: outbox pending age, relay retry count, consumer lag, DLQ count, poison message age\n- fallback safety: primary fallback QPS, primary CPU/IO headroom, fallback timeout/error rate, degraded response count\n- correctness: source of truth와 read model mismatch sample, reconciliation repair count, user-visible incident count\n\n## 안전한 다음 문서\n\n- 방금 쓴 값이 옛값으로 보이면 `read-after-write-routing-primer`와 `read-after-write-tradeoff-matrix-chooser`로 내려간다.\n- cache/replica/projection이 섞인 stale 증상은 `stale-after-write-cache-replica-symptom-router`와 `redis-eviction-vs-replication-stale-cache-bridge`를 본다.\n- 중복 처리와 retry 문제는 `queue-delivery-semantics-beginner-primer`, `outbox-cdc-delivery-semantic-chooser`, idempotency/reconciliation 문서로 이어진다.\n- read model 반영 지연은 `projection-lag-user-facing-state-router`에서 사용자 상태와 watermark를 분리해 본다.\n",
+  "aliases": [
+    "operational symptom consistency cause router",
+    "stale duplicate missing event cause triage",
+    "운영 증상 정합성 원인 분기",
+    "stale read duplicate delivery router"
+  ],
+  "expected_queries": [
+    "운영에서 값이 늦게 보이거나 중복 처리되면 원인 후보를 어떻게 나눠?",
+    "stale read와 duplicate event를 같은 정합성 문제로 봐도 돼?",
+    "사용자 증상에서 consistency 원인 후보로 내려가는 순서가 궁금해"
+  ],
+  "symptoms": [
+    "방금 저장한 값이 화면에 늦게 보여요",
+    "같은 요청이 두 번 처리된 것처럼 보여요",
+    "이벤트는 발행됐는데 read model이 비어 있어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/consistency-idempotency-async-workflow-foundations"
+    ],
+    "next_docs": [
+      "system-design/read-after-write-routing-primer"
+    ],
+    "confusable_with": [
+      "system-design/stale-after-write-cache-replica-symptom-router",
+      "system-design/consistency-idempotency-async-workflow-foundations"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/operational-symptom-to-consistency-cause-router.md",
+    "revision_history": []
+  }
+}

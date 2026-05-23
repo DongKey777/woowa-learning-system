@@ -1,0 +1,60 @@
+{
+  "id": "database/compare-and-set-version-columns",
+  "title": "Compare-and-Set and Version Columns",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 Compare-and-Set and Version Columns deep dive로, DB version column을 WHERE version 조건과",
+  "body_markdown": "# Compare-and-Set와 Version Columns\n\n> 한 줄 요약: version column은 DB에서 가장 실용적인 compare-and-set 도구이고, 읽기-수정-쓰기의 마지막 경합을 저장 시점에 잡아준다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Lost Update Detection Patterns](./lost-update-detection-patterns.md), [트랜잭션 격리수준과 락](./transaction-isolation-locking.md), [Version Column Retry Walkthrough](./version-column-retry-walkthrough.md), [Transaction Retry와 Serialization Failure 패턴](./transaction-retry-serialization-failure-patterns.md), [Spring/JPA 락킹 예제 가이드](./spring-jpa-locking-example-guide.md)\nretrieval-anchor-keywords: compare and set, version column, optimistic lock, conditional update, write conflict, optimistic lock failure, update count 0, version mismatch\n\n## 핵심 개념\n\nCompare-and-set(CAS)는 “내가 읽은 값이 아직 그 값일 때만 바꾸겠다”는 원자적 갱신 방식이다.  \nDB에서는 보통 version column으로 구현한다.\n\n왜 중요한가:\n\n- lost update를 막는 가장 흔한 패턴이다\n- 락을 오래 잡지 않고도 충돌을 감지할 수 있다\n- 재시도와 잘 결합되며 분산 시스템에서 매우 실용적이다\n\nversion column은 단순 카운터가 아니라, **동시 수정의 합의 표식**이다.\n\n## 깊이 들어가기\n\n### 1. CAS가 왜 필요한가\n\n읽고 나서 계산한 다음 저장하는 구조는 항상 경합에 노출된다.\n\n- 누군가 먼저 바꿀 수 있다\n- 내가 읽은 상태가 더 이상 최신이 아닐 수 있다\n- 저장 시점에 충돌을 알아야 한다\n\nCAS는 이 충돌을 저장 문장 하나로 밀어 넣는다.\n\n### 2. version column 설계\n\n보통 다음처럼 둔다.\n\n- `version BIGINT NOT NULL`\n- update 시 `version = version + 1`\n- where 절에 `version = ?`를 넣음\n\n이 구조의 핵심은 row count다.\n\n- 1이면 성공\n- 0이면 누군가 먼저 바꿨다\n\n### 3. 낙관적 락과의 관계\n\n낙관적 락은 개념이고, version column CAS는 구현이다.  \n실무에서는 둘을 거의 같은 뜻으로 쓰지만, 엄밀히는 version check가 구체적 방식이다.\n\n### 4. 언제 실패를 재시도할까\n\nCAS 실패는 대개 재시도 가능한 실패다.\n\n- 다른 사용자가 먼저 저장했다\n- 최신 값을 다시 읽어야 한다\n- 다시 계산해서 저장해야 한다\n\n하지만 재시도 전에, 같은 요청이 중복 부작용을 만들지 않도록 멱등성도 함께 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 프로필 닉네임 변경 충돌\n\n두 화면이 같은 프로필을 열어둔 채 각각 수정하면, 뒤늦은 저장이 덮어쓸 수 있다.  \nversion CAS로 이를 막고 재시도한다.\n\n### 시나리오 2: 재고 차감이 경합함\n\n`stock > 0` 조건과 version CAS를 같이 쓰면 안전하다.  \n단순 조회 후 저장보다 훨씬 낫다.\n\n### 시나리오 3: 설정값이 원복됨\n\n배치와 운영자가 같은 설정을 동시에 바꾸는 경우, CAS가 없으면 마지막 저장이 이긴다.\n\n## 코드로 보기\n\n```sql\nUPDATE profile\nSET nickname = 'new-name',\n    version = version + 1\nWHERE id = 10\n  AND version = 7;\n```\n\n```java\nint updated = jdbcTemplate.update(\n    \"\"\"\n    UPDATE inventory\n    SET stock = stock - 1, version = version + 1\n    WHERE sku = ? AND version = ? AND stock > 0\n    \"\"\",\n    sku, version\n);\nif (updated == 0) {\n    throw new ConcurrentModificationException();\n}\n```\n\nCAS는 읽기와 쓰기를 분리하되, **저장 시점에만 충돌을 원자적으로 판정**한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| version CAS | 빠르고 단순하다 | 재시도 코드가 필요하다 | 대부분의 업데이트 |\n| 비관적 락 | 즉시 충돌을 막는다 | 경합이 크다 | 충돌이 잦을 때 |\n| 원자적 수식 업데이트 | 짧고 강하다 | SQL로 로직을 옮겨야 한다 | 카운터/재고 |\n| DB constraint | 가장 강하다 | 모델링이 필요하다 | 불변식이 명확할 때 |\n\n## 꼬리질문\n\n> Q: version column이 왜 CAS 역할을 하나요?\n> 의도: 저장 시점 조건부 갱신의 원리를 아는지 확인\n> 핵심: 내가 읽은 version이 아직 맞을 때만 업데이트되기 때문이다\n\n> Q: CAS 실패 시 무조건 retry하면 되나요?\n> 의도: 재시도와 멱등성의 결합을 아는지 확인\n> 핵심: 재시도는 가능하지만 중복 부작용을 막아야 한다\n\n> Q: version을 int로 두면 충분한가요?\n> 의도: 오버플로와 운영 수명을 생각하는지 확인\n> 핵심: 장수 테이블은 bigint가 더 안전하다\n\n## 한 줄 정리\n\nVersion column CAS는 저장 시점에 충돌을 판정하는 가장 실용적인 방식이고, lost update 방지와 재시도의 출발점이다.\n",
+  "aliases": [
+    "compare and set",
+    "version column",
+    "optimistic lock",
+    "conditional update",
+    "write conflict",
+    "optimistic lock failure",
+    "update count 0",
+    "version mismatch",
+    "CAS version column",
+    "버전 컬럼 낙관적 락"
+  ],
+  "expected_queries": [
+    "version column은 DB에서 compare-and-set 역할을 해서 내가 읽은 version일 때만 update하는 방식이야?",
+    "update count 0이 나오면 누군가 먼저 바꾼 optimistic lock conflict로 보고 어떻게 재시도해야 해?",
+    "CAS와 version column으로 lost update를 막는 SQL where version 조건 예시를 설명해줘",
+    "CAS 실패를 무조건 retry하기 전에 idempotency와 중복 side effect를 같이 봐야 하는 이유가 뭐야?",
+    "낙관적 락은 개념이고 version column compare-and-set은 구현이라는 차이를 알려줘"
+  ],
+  "symptoms": [
+    "읽고 계산한 뒤 저장하는 흐름에서 version check 없이 마지막 write가 앞선 변경을 덮어쓴다",
+    "update count 0이나 optimistic lock failure를 실패로만 보고 최신 값 재조회 후 재계산하는 retry 경계를 잡지 못한다",
+    "version column을 단순 카운터로만 보고 lost update detection 합의 표식이라는 역할을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/lost-update-detection-patterns",
+      "database/transaction-isolation-locking"
+    ],
+    "next_docs": [
+      "database/version-column-retry-walkthrough",
+      "database/transaction-retry-serialization-failure-patterns",
+      "database/spring-jpa-locking-example-guide"
+    ],
+    "confusable_with": [
+      "database/compare-and-swap-vs-pessimistic-locks",
+      "database/lost-update-detection-patterns",
+      "database/transaction-retry-serialization-failure-patterns",
+      "database/spring-jpa-locking-example-guide",
+      "database/expiry-worker-race-patterns",
+      "database/application-level-fencing-token-propagation"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/compare-and-set-version-columns.md",
+    "revision_history": []
+  }
+}

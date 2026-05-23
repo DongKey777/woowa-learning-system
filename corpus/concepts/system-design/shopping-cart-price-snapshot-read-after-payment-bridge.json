@@ -1,0 +1,46 @@
+{
+  "id": "system-design/shopping-cart-price-snapshot-read-after-payment-bridge",
+  "title": "Shopping Cart Price Snapshot Read After Payment Bridge",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 mission_bridge는 shopping-cart 결제 완료 후 주문 금액 snapshot, confirmation read path, read-after-write consistency를 연결한다.",
+  "body_markdown": "# Shopping Cart Price Snapshot Read After Payment Bridge\n\n## 미션 장면\n\n쇼핑카트에서 결제 완료 후 사용자는 주문 확인(confirmation) 화면을 본다. 학습자가 \"상품 가격을 다시 읽어서 총액을 보여주면 되나요?\"라고 묻는다면 현재 가격(current product price)과 주문 스냅샷(order price snapshot)을 분리해야 한다. 결제 시점에 확정된 거래 금액은 order/order_item snapshot에 남아야 한다. 상품 테이블의 현재 가격은 프로모션, 품절, 가격 변경으로 바뀔 수 있으므로 과거 결제 금액의 source of truth가 되면 안 된다.\n\n한 줄 원칙은 \"결제 이후 금액은 불변 snapshot을 읽고, 현재 상품 가격으로 재계산하지 않는다\"이다. 주문 생성 전 장바구니 total은 견적이고, 결제 승인과 함께 확정된 `OrderItem.unit_price`, `quantity`, `discount_snapshot`, `shipping_fee`, `tax`, `payment_amount`가 거래 기록이다.\n\n## 리뷰에서 보이는 냄새\n\n- 결제 성공 응답 직후 주문 상세가 404거나 빈 화면이다.\n- 주문 상세 금액이 장바구니 계산 금액 또는 현재 상품 가격과 다르다.\n- Payment webhook은 성공했는데 내부 order 상태는 아직 `PENDING`이다.\n- 주문 완료 화면이 replica/cache를 읽어 방금 commit된 row를 못 본다.\n\n관찰 증거는 order row, order_item snapshot, payment ledger, webhook inbox, read path가 primary인지 replica/cache인지다. 불변식은 \"결제 완료 후 보여주는 금액은 확정된 주문 snapshot과 결제 승인 금액이 일치해야 한다\"는 점이다.\n\n## Price Immutability 불변식\n\n주문이 `PAID` 또는 `CONFIRMED`가 되면 금액 필드는 append-only에 가깝게 다룬다. 환불, 취소, 추가 결제, 포인트 재적립 같은 후속 변화는 원래 order item price를 수정하지 않고 별도 ledger entry나 adjustment row로 남긴다. 그래야 영수증, 정산, 고객 문의, PG reconciliation이 같은 숫자를 본다.\n\n필수 snapshot은 상품명, 옵션명, unit price, quantity, discount/coupon 적용액, 배송비, 세금, currency, 결제 승인 금액, 가격 정책 version이다. 상품명은 표시용으로 바뀔 수 있지만 \"결제 당시 사용자가 본 이름\"이 필요하면 snapshot에 저장한다. 가격 정책이 복잡하면 `price_calculation_id`나 calculation breakdown도 남긴다.\n\n검증 불변식은 다음처럼 잡는다.\n\n- `sum(order_items.snapshot_amount) + shipping_fee + tax - discounts == order.total_amount`\n- `order.total_amount == payment_ledger.approved_amount`\n- 같은 idempotency key의 재시도는 같은 order/payment 결과를 반환한다.\n- `PAID` 이후 상품 현재 가격 변경은 기존 order snapshot을 바꾸지 않는다.\n\n## 개념 문서 handoff\n\nPayment는 ledger와 idempotency로 중복 승인을 줄이고, Order는 확정된 price snapshot을 보존한다. Confirmation read path는 read-after-write 보장을 검토한다. 예를 들어 결제 승인 transaction 안에서 order snapshot을 commit하고 바로 confirmation으로 이동한다면, 그 사용자의 직후 조회는 primary read나 recent-write routing을 쓰는 편이 안전하다. Projection이나 search index로 주문 화면을 구성한다면 eventual consistency가 생기므로 \"처리 중\" 상태와 재조회 UX가 필요하다.\n\n보장과 완화도 구분한다. Snapshot은 과거 금액이 현재 상품 가격 변경에 흔들리지 않게 보장한다. Idempotency는 같은 요청의 중복 side effect를 줄이지만 외부 PG와 내부 DB 상태 불일치를 완전히 제거하지 않는다. Read-after-write routing은 직후 stale read 위험을 낮추지만 모든 경로의 최신성을 자동 보장하지 않는다.\n\n## Read-after-payment 경로\n\n결제 완료 후 확인 화면은 \"방금 쓴 주문을 읽는 경로\"다. 같은 request transaction에서 order snapshot과 payment ledger가 commit된 뒤 redirect한다면 confirmation API는 primary DB를 읽거나 session stickiness/recent-write token으로 replica stale read를 피한다. Replica lag가 허용되는 일반 주문 목록과 결제 직후 확인 화면은 freshness 요구가 다르다.\n\nWebhook 기반 확정이라면 결제 승인 응답과 내부 order 확정 사이에 간격이 생긴다. 이때 사용자를 404로 보내면 장애처럼 보인다. `PAYMENT_PROCESSING`, `CONFIRMING`, `PAID` 같은 상태를 두고, confirmation 화면은 order id/payment id로 조회해 \"결제 확인 중\"을 보여준 뒤 polling이나 server push로 갱신한다.\n\nProjection이나 cache를 쓰는 경우 원장성 데이터와 표시용 read model을 분리한다. Confirmation의 source of truth는 `orders`, `order_items_snapshot`, `payment_ledger`이고, search index나 order summary projection은 늦을 수 있다. Projection lag 때문에 summary가 비어도 원장 조회로 확인 화면은 구성할 수 있어야 한다.\n\n## 장애/동시성 Caveat\n\n결제 요청은 재시도가 정상이다. Client timeout 후 사용자가 다시 결제를 누르거나 PG webhook이 중복 도착할 수 있다. Idempotency key를 order attempt 또는 checkout session에 묶고, 같은 key는 같은 payment ledger row와 order snapshot을 반환한다. 단, idempotency는 \"중복 처리 방지\"이지 \"외부 PG와 내부 DB가 항상 동시에 성공\"을 보장하지 않는다.\n\n재고/쿠폰/가격 검증은 결제 승인 전 마지막으로 수행한다. 장바구니에 담을 때의 가격이 만료되었으면 사용자에게 재확인을 요구하거나 quote 만료 정책을 적용한다. 하지만 결제 승인이 끝난 뒤에는 현재 상품 가격으로 기존 주문을 고치지 않는다. 차액 처리는 취소/환불/adjustment 정책으로 다룬다.\n\n관측 metric은 payment approved but order not paid count, confirmation 404 rate, replica lag on confirmation, order total/payment amount mismatch, duplicate idempotency replay count, webhook duplicate/out-of-order count, projection lag다.\n\n## Drill 후보\n\n\"결제 성공 응답에서 cart total을 다시 계산해 보여줘도 되는가?\"로 복습한다. 기대 답변은 \"아니다. 확정 거래는 order snapshot과 payment ledger를 기준으로 보여주고, cart나 product 현재값은 재계산 근거가 아니다\"이다. 다음에는 `system-design/read-after-write-routing-primer`와 `system-design/payment-ledger-idempotency-interview-drill`을 이어 본다.\n\n추가 drill은 \"결제 승인 직후 confirmation이 404라면 어떤 순서로 볼까?\"다. 기대 답변은 \"payment ledger, order snapshot commit 여부, webhook inbox, read path가 primary인지 replica/cache인지, projection lag를 순서대로 본다\"이다.\n",
+  "aliases": [
+    "shopping cart price snapshot read after payment",
+    "결제 후 주문 금액 스냅샷 조회",
+    "order confirmation stale price bridge",
+    "payment complete order not visible price mismatch"
+  ],
+  "expected_queries": [
+    "결제 성공 후 주문 상세 금액이 장바구니와 다르면 뭘 봐?",
+    "payment complete 뒤 주문 confirmation은 어떤 데이터를 읽어야 해?",
+    "주문 가격 snapshot과 read-after-write consistency를 어떻게 연결해?"
+  ],
+  "symptoms": [
+    "결제 성공 후 주문 상세가 예전 장바구니 총액을 보여줍니다",
+    "payment webhook은 성공했는데 주문 confirmation이 아직 안 보입니다",
+    "상품 현재 가격을 읽어 과거 주문 금액이 흔들립니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/shopping-cart-price-snapshot-policy-bridge"
+    ],
+    "next_docs": [
+      "system-design/read-after-write-routing-primer",
+      "system-design/payment-ledger-idempotency-interview-drill"
+    ],
+    "confusable_with": [
+      "system-design/read-after-write-routing-primer",
+      "system-design/payment-ledger-idempotency-interview-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/shopping-cart-price-snapshot-read-after-payment-bridge.md",
+    "revision_history": []
+  }
+}

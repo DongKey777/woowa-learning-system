@@ -1,0 +1,56 @@
+{
+  "id": "language/jcstress-concurrency-testing",
+  "title": "JCStress Concurrency Testing",
+  "category": "language",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# JCStress Concurrency Testing\n\n> 한 줄 요약: JCStress는 \"동시성 버그가 있는지\"를 묻는 테스트가 아니라, **JMM과 실제 스케줄링 아래에서 가능한 결과를 열거**하는 테스트 도구다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JVM, GC, JMM](./jvm-gc-jmm-overview.md)\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n> - [VarHandle, Unsafe, Atomics](./varhandle-unsafe-atomics.md)\n> - [Virtual Threads(Project Loom)](./virtual-threads-project-loom.md)\n\nretrieval-anchor-keywords: JCStress, concurrency testing harness, JMM outcome testing, race condition test, publication safety test, acceptable interesting forbidden outcome, atomicity visibility ordering, lost update concurrency test, OpenJDK jcstress, stress test memory model\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [왜 일반 테스트로는 부족한가](#왜-일반-테스트로는-부족한가)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nJCStress는 OpenJDK의 stress-testing harness다.  \n주 목적은 다음을 검증하는 것이다.\n\n- 원자성이 깨지는가\n- 가시성 문제가 있는가\n- 순서 보장이 무너지는가\n- 특정 구현이 JMM 하에서 허용되지 않는 결과를 내는가\n\n일반 단위 테스트는 보통 \"한 번 실행해서 통과했는가\"만 본다.  \nJCStress는 **수십만 번의 경쟁 실행에서 어떤 결과가 가능한지** 본다.\n\n---\n\n## 왜 일반 테스트로는 부족한가\n\n동시성 버그는 재현이 어렵다.\n\n- 실행 순서가 매번 다르다\n- JIT 최적화가 결과를 바꿀 수 있다\n- CPU 코어 수와 부하에 따라 관찰 결과가 달라진다\n- 테스트가 지나치게 결정론적이면 문제가 숨어 버린다\n\n즉, \"한 번 통과\"는 아무 의미가 없다.  \n특히 `volatile`, `synchronized`, atomics, publication, reordering 같은 문제는 일반 JUnit으로는 놓치기 쉽다.\n\n---\n\n## 깊이 들어가기\n\n### 1. JCStress가 보는 단위\n\nJCStress 테스트는 보통 다음 구성으로 만든다.\n\n- `@State`: 공유 객체 상태\n- `@Actor`: 경쟁하는 실행 경로\n- `@Arbiter`: 마지막 관찰\n- `@Outcome`: 허용/금지 결과 정의\n\n핵심은 \"정답 하나\"를 적는 게 아니라 **허용 가능한 결과 집합**을 선언하는 점이다.\n\n### 2. 무엇을 증명하는가\n\nJCStress는 구현이 다음을 만족하는지 확인하는 데 강하다.\n\n- atomic increment가 진짜 원자적인가\n- double-checked locking이 안전한가\n- publication이 안전한가\n- memory barrier가 기대대로 작동하는가\n\n이건 기능 테스트라기보다 **메모리 모델 테스트**다.\n\n### 3. 왜 JMM 문맥이 필요한가\n\nJMM(Java Memory Model)을 모르면 결과 해석이 흔들린다.  \n예를 들어 \"한 스레드가 쓴 값이 다른 스레드에 왜 안 보이지?\"는 버그일 수도 있고, **허용된 reordering 결과**일 수도 있다.\n\n따라서 JCStress는 [JVM, GC, JMM](./jvm-gc-jmm-overview.md)와 같이 봐야 한다.\n\n### 4. 관측 가능한 결과를 정의한다\n\n테스트는 \"이 결과만 나오면 성공\"이 아니다.  \n오히려 다음처럼 나눠 적는다.\n\n- `ACCEPTABLE`\n- `ACCEPTABLE_INTERESTING`\n- `FORBIDDEN`\n\n이렇게 하면 스케줄링 편차가 있어도 의미 있는 결과 해석이 가능하다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: `volatile` 없이도 되는 줄 알았다\n\n어떤 값이 한 번만 초기화되면 된다고 해서 `volatile`을 빼면, 다른 스레드가 부분적으로 초기화된 상태를 볼 수 있다.  \nJCStress는 이런 publication 오류를 드러내기 좋다.\n\n### 시나리오 2: `AtomicInteger`와 `int++` 차이를 증명하고 싶다\n\n단순 증분은 읽기-수정-쓰기라 경쟁 상태가 생긴다.  \nJCStress는 lost update를 반복 실행으로 잡아낸다.\n\n### 시나리오 3: lock-free 코드가 정말 lock-free인지 확인하고 싶다\n\nVarHandle이나 CAS 기반 코드는 한 번 성공한다고 끝이 아니다.  \n경쟁이 강한 상황에서 금지된 결과가 나오는지 봐야 한다.\n\n---\n\n## 코드로 보기\n\n### 1. 두 스레드가 같은 값을 만지는 가장 단순한 예\n\n```java\nimport org.openjdk.jcstress.annotations.Actor;\nimport org.openjdk.jcstress.annotations.Arbiter;\nimport org.openjdk.jcstress.annotations.Expect;\nimport org.openjdk.jcstress.annotations.JCStressTest;\nimport org.openjdk.jcstress.annotations.Outcome;\nimport org.openjdk.jcstress.annotations.State;\nimport org.openjdk.jcstress.infra.results.I_Result;\n\n@JCStressTest\n@Outcome(id = \"1\", expect = Expect.ACCEPTABLE, desc = \"One update observed\")\n@Outcome(id = \"2\", expect = Expect.ACCEPTABLE, desc = \"Both updates observed\")\n@Outcome(expect = Expect.FORBIDDEN, desc = \"Lost update or broken synchronization\")\n@State\npublic class CounterTest {\n    int value;\n\n    @Actor\n    public void actor1() {\n        value++;\n    }\n\n    @Actor\n    public void actor2() {\n        value++;\n    }\n\n    @Arbiter\n    public void arbiter(I_Result r) {\n        r.r1 = value;\n    }\n}\n```\n\n이 예시는 의도적으로 단순하다.  \n실무에서는 결과의 허용 범위를 더 정교하게 나눠서 본다.\n\n### 2. `volatile` publication 확인\n\n```java\nimport org.openjdk.jcstress.annotations.*;\nimport org.openjdk.jcstress.infra.results.I_Result;\n\n@JCStressTest\n@Outcome(id = \"1\", expect = Expect.ACCEPTABLE, desc = \"Published value is visible\")\n@Outcome(id = \"0\", expect = Expect.FORBIDDEN, desc = \"Stale read\")\n@State\npublic class PublicationTest {\n    volatile int ready;\n    int data;\n\n    @Actor\n    public void writer() {\n        data = 1;\n        ready = 1;\n    }\n\n    @Actor\n    public void reader(I_Result r) {\n        if (ready == 1) {\n            r.r1 = data;\n        }\n    }\n}\n```\n\n이런 테스트는 \"보이는 순서\"가 왜 중요한지 보여준다.\n\n### 3. 실행 예시\n\n보통은 빌드 도구와 함께 돌린다.\n\n```bash\n./gradlew jcstress\n```\n\n또는 프로젝트에 맞는 task로 실행한다.  \n결과는 통과/실패만 보는 게 아니라, 어떤 outcome이 얼마나 자주 나왔는지까지 본다.\n\n---\n\n## 트레이드오프\n\n| 관점 | 장점 | 단점 | 언제 쓰는가 |\n|---|---|---|---|\n| JCStress | 경쟁 조건을 재현하기 좋다 | 작성/해석 비용이 높다 | JMM, atomics, lock-free 검증 |\n| JUnit | 빠르고 익숙하다 | 스케줄링 버그를 놓치기 쉽다 | 일반 기능 검증 |\n| 반복 stress test | 간단하다 | 결과 해석이 약하다 | 임시 확인 |\n\nJCStress는 모든 테스트를 대체하지 않는다.  \n하지만 동시성 API를 설계하거나 수정할 때는 가장 신뢰할 만한 도구 중 하나다.\n\n---\n\n## 꼬리질문\n\n> Q: JCStress는 왜 결과를 여러 개 허용하나요?\n> 의도: JMM의 허용 결과를 이해하는지 확인\n> 핵심: 동시성 코드는 하나의 실행 결과만 존재하지 않을 수 있다.\n\n> Q: JUnit으로는 왜 안 되나요?\n> 의도: 스케줄링 비결정성을 이해하는지 확인\n> 핵심: 일반 테스트는 race를 충분히 압박하지 못한다.\n\n> Q: 무엇을 먼저 의심해야 하나요?\n> 의도: 동시성 버그의 전형을 아는지 확인\n> 핵심: 안전한 publication, atomicity, visibility, ordering 순으로 본다.\n\n## 한 줄 정리\n\nJCStress는 동시성 코드가 실제 경쟁 환경에서 어떤 결과를 낼 수 있는지 JMM 관점으로 검증하는 도구다.\n",
+  "aliases": [
+    "JCStress Concurrency Testing",
+    "OpenJDK jcstress concurrency harness",
+    "JMM outcome testing",
+    "acceptable interesting forbidden outcome",
+    "Java race condition stress test",
+    "자바 동시성 JCStress 테스트",
+    "synchronized",
+    "volatile"
+  ],
+  "expected_queries": [
+    "JCStress는 일반 JUnit 동시성 테스트와 무엇이 다르고 어떤 결과를 보여줘?",
+    "acceptable interesting forbidden outcome을 JMM 테스트에서 어떻게 해석해야 해?",
+    "volatile publication이나 lost update를 JCStress로 검증하는 기본 구조를 설명해줘",
+    "AtomicInteger와 int++ 차이를 동시성 outcome으로 보여주려면 어떻게 테스트해?",
+    "Java lock-free 코드가 JMM에서 금지된 결과를 내는지 확인하는 방법을 알려줘"
+  ],
+  "symptoms": [
+    "일반 JUnit을 여러 번 돌리면 publication, visibility, ordering 문제가 충분히 검증된다고 생각해 동시성 outcome 모델을 놓쳐",
+    "JCStress를 통과/실패 하나만 보는 테스트로 이해해 acceptable, interesting, forbidden 결과 집합을 해석하지 못해",
+    "volatile, synchronized, AtomicInteger, VarHandle 변경이 JMM 아래 어떤 결과를 허용하는지 실험 설계로 표현하지 못해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jvm-gc-jmm-overview",
+      "language/java-concurrency-utilities",
+      "language/varhandle-unsafe-atomics"
+    ],
+    "next_docs": [
+      "language/memory-barriers-varhandle-fences",
+      "language/locksupport-park-unpark-permit-semantics",
+      "language/jmh-benchmarking-pitfalls"
+    ],
+    "confusable_with": [
+      "language/java-concurrency-utilities",
+      "language/varhandle-unsafe-atomics",
+      "language/jmh-benchmarking-pitfalls"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/jcstress-concurrency-testing.md",
+    "revision_history": []
+  }
+}

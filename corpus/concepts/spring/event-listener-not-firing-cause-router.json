@@ -1,0 +1,57 @@
+{
+  "id": "spring/event-listener-not-firing-cause-router",
+  "title": "이벤트는 발행됐는데 리스너가 안 돌아요 원인 라우터",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# 이벤트는 발행됐는데 리스너가 안 돌아요 원인 라우터\n\n## 한 줄 요약\n\n> 이 증상은 \"Spring 이벤트가 안 된다\"보다 `발행 자체`, `리스너 등록`, `트랜잭션 phase`, `비동기 실행`, `예외 관측`, `테스트 transaction`을 한 bucket에 넣었을 때 더 자주 생긴다.\n\n## 1차 분기\n\n| 10초 질문 | 그렇다면 | 먼저 볼 후보 |\n|---|---|---|\n| `publishEvent` 호출 로그가 실제 요청 trace에 없나? | 이벤트가 발행되지 않은 문제 | 분기 조건, early return, mock publisher, 실패 전 return |\n| publisher 로그는 있는데 listener bean 이름이 context에 없나? | 리스너 bean 미등록 | component scan, profile, conditional, test slice |\n| `@TransactionalEventListener(AFTER_COMMIT)`이고 commit 로그가 없나? | transaction phase 문제 | tx 경계, rollback, transaction 없는 발행 |\n| `@Async`나 custom `ApplicationEventMulticaster`를 쓰나? | executor 뒤 지연/실패 가능 | executor queue, rejected task, async exception handler |\n| listener 시작 로그는 있는데 후속 결과가 없나? | listener 내부 예외가 삼켜졌거나 로그만 남음 | try-catch, error log, retry/outbox 유무 |\n| 운영에서는 되는데 테스트에서만 안 되나? | test transaction masking 가능 | rollback 기본값, `@DataJpaTest`, `TestTransaction` |\n\n## 원인 bucket\n\n1. **event not published**: 리스너가 안 도는 게 아니라 이벤트가 실제 경로에서 발행되지 않았다. 조건문, validation 실패, 조기 반환, 테스트 mock, 분리된 service method 때문에 `publishEvent` 호출까지 도달하지 않을 수 있다.\n2. **listener bean not registered**: `@EventListener` method가 있는 객체가 Spring bean이 아니거나, test slice/profile/conditional 때문에 context에 없다. 이때는 이벤트 발행 로그만 보고 transaction을 의심하면 늦다.\n3. **transaction phase mismatch**: `@TransactionalEventListener`는 transaction synchronization에 붙는다. 트랜잭션 밖에서 발행했거나 commit 대신 rollback되면 `AFTER_COMMIT`은 기대한 시점에 실행되지 않는다. 이 갈래는 [Spring `@TransactionalEventListener` Outside Transactions and `fallbackExecution`](./spring-transactionaleventlistener-fallbackexecution-no-transaction-boundaries.md)로 이어진다.\n4. **async executor boundary**: `@Async` listener나 async multicaster 뒤에서는 호출 thread 성공과 listener 성공이 다르다. executor queue 지연, `TaskRejectedException`, `AsyncUncaughtExceptionHandler` 누락, MDC/trace 단절 때문에 \"안 돈다\"처럼 보일 수 있다. 이때는 [Spring `@EventListener` Ordering and Async Traps](./spring-eventlistener-ordering-async-traps.md)와 [비동기가 동기처럼 보여요 원인 라우터](./spring-async-looks-synchronous-cause-router.md)를 같이 본다.\n5. **exception swallowed/logged**: listener는 시작했지만 내부에서 예외를 catch하고 error log만 남긴 뒤 반환했을 수 있다. 호출자는 성공으로 끝나고 후속 DB write, 알림, cache evict만 누락되는 패턴이다.\n6. **test transaction masking**: `flush()`는 commit이 아니다. rollback 기본 테스트, `@DataJpaTest`, `@Transactional` test method에서는 `AFTER_COMMIT` listener를 운영 commit 경로처럼 검증하지 못할 수 있다. 이 경우는 [Spring Mini Card: 왜 rollback 기반 slice test만으로 `AFTER_COMMIT`를 끝까지 믿기 어려운가](./spring-after-commit-rollback-slice-test-mini-card.md)로 분기한다.\n\n## 관측 증거\n\n| evidence | 해석 | 다음 확인 |\n|---|---|---|\n| request trace 안에 publisher 직전/직후 로그가 없다 | 발행 전 분기에서 빠짐 | 조건문, validation, early return, mock 호출 여부 |\n| `ApplicationContext`에 listener bean이 없다 | listener 미등록 | component scan root, active profile, `@Conditional`, test slice |\n| `No transaction is active` 또는 transaction 로그가 없다 | phase를 붙일 transaction이 없음 | service method `@Transactional`, self-invocation, scheduler/controller 직접 발행 |\n| `Initiating transaction rollback` 뒤 listener 로그 없음 | `AFTER_COMMIT`이 실행될 commit이 없음 | 최초 rollback 원인, rollback-only marker |\n| executor queue/rejection/error log가 보임 | async 실행 문제 | executor 설정, `AsyncUncaughtExceptionHandler`, await/timeout |\n| listener 시작 로그 뒤 catch log만 있음 | listener 내부 실패 은닉 | catch 후 재던짐 여부, retry/outbox/alert |\n| 테스트에서만 미실행, 운영 수동 호출은 실행 | test transaction masking | rollback test 제거, `TestTransaction.end()`, commit 기반 integration test |\n\n## 다음 확인\n\n1. publisher 직전, publisher 직후, listener 시작, listener 성공/실패를 같은 correlation id로 남긴다.\n2. 리스너 method annotation이 `@EventListener`인지 `@TransactionalEventListener`인지 적고, phase가 `BEFORE_COMMIT`, `AFTER_COMMIT`, `AFTER_ROLLBACK`, `AFTER_COMPLETION` 중 무엇인지 확인한다.\n3. listener class가 Spring bean으로 등록됐는지 context나 test log에서 확인한다. `new Listener()`로 만든 객체는 listener가 아니다.\n4. event type이 listener parameter와 실제로 매칭되는지 본다. wrapper event, generic event, 상속 타입이 바뀌면 등록은 돼도 원하는 method가 안 받을 수 있다.\n5. 발행 위치가 service transaction 내부인지, controller/scheduler/test helper/async worker인지 call path를 그린다.\n6. transaction DEBUG 로그에서 commit/rollback과 listener 실행 순서를 같은 요청 단위로 비교한다.\n7. async라면 executor thread 이름, queue depth, rejection log, uncaught exception handler를 확인하고 test에서는 await 조건을 둔다.\n8. listener 내부 catch가 실패를 성공처럼 바꾸지 않는지 확인한다. 중요한 후속 작업이면 outbox나 재처리 경계를 따로 둔다.\n\n## wrong-bucket / 오선택\n\n| 오선택 | 왜 위험한가 | 더 먼저 볼 bucket |\n|---|---|---|\n| publisher 로그 하나로 \"이벤트는 발행됐다\"고 확정 | 실제 요청 path의 publish 호출이 아닐 수 있다 | event not published |\n| `@TransactionalEventListener` 미실행을 bean scan 문제로만 봄 | transaction/commit이 없으면 bean이 있어도 `AFTER_COMMIT`은 안 돈다 | transaction phase |\n| test에서 `flush()`가 됐으니 commit listener도 검증됐다고 봄 | flush는 DB 반영 시도고 commit callback은 별도다 | test transaction masking |\n| async listener 실패를 caller 실패와 같은 것으로 봄 | 호출자 성공과 worker 실패가 분리된다 | async executor, exception swallowed |\n| listener 내부 try-catch로 로그만 남기고 성공 처리 | 후속 작업 유실을 정상 응답으로 숨긴다 | exception swallowed/logged |\n| event listener로 반드시 신뢰성 있는 외부 전달을 보장하려 함 | process crash나 broker 실패에 취약하다 | outbox, retry, idempotency |\n\n## 검증 질문\n\n1. 지금 \"안 돈다\"는 말은 publisher 호출이 없는 것인가, listener bean이 없는 것인가, listener method가 실행되지 않은 것인가?\n2. 리스너는 즉시 `@EventListener`인가, commit/rollback phase에 묶인 `@TransactionalEventListener`인가?\n3. 이벤트 발행 thread에 실제 transaction이 열려 있고 commit까지 도달했는가?\n4. 테스트라면 rollback 기본 transaction 안에서 검증하고 있지 않은가?\n5. async라면 worker thread의 실패와 지연을 어디에서 관측하는가?\n6. listener 내부 예외가 호출자에게 드러나야 하는가, 재시도 가능한 후속 작업으로 남아야 하는가?\n\n## 다음 학습\n\n- 트랜잭션이 없는 경로에서 `@TransactionalEventListener`를 기대한 것인지 확인하려면 [Spring `@TransactionalEventListener` Outside Transactions and `fallbackExecution`](./spring-transactionaleventlistener-fallbackexecution-no-transaction-boundaries.md)를 먼저 본다.\n- 테스트에서만 안 도는 증상이 핵심이면 [Spring Mini Card: 왜 rollback 기반 slice test만으로 `AFTER_COMMIT`를 끝까지 믿기 어려운가](./spring-after-commit-rollback-slice-test-mini-card.md)로 간다.\n- 호출자는 성공인데 실제 후속 작업이 새는 비동기 축을 보려면 [Spring `@EventListener` Ordering and Async Traps](./spring-eventlistener-ordering-async-traps.md)와 [비동기가 동기처럼 보여요 원인 라우터](./spring-async-looks-synchronous-cause-router.md)를 잇는다.\n- 주문 완료 후속 작업처럼 \"phase를 어디에 둘지\" 자체가 문제라면 [Spring 커밋 후 후속 작업 경계 결정 가이드](./spring-post-commit-side-effect-routing-decision-guide.md)와 [shopping-cart 주문 완료 후속 작업 누락 원인 라우터](./shopping-cart-order-complete-follow-up-missing-cause-router.md)로 내려간다.\n",
+  "aliases": [
+    "이벤트 발행했는데 리스너 안 돎",
+    "스프링 이벤트 리스너 안 타요",
+    "transactionaleventlistener 안 도는 증상",
+    "after commit 리스너 미실행",
+    "발행은 됐는데 listener 반응 없음",
+    "eventlistener가 조용히 안 뜸",
+    "@Async",
+    "@Conditional",
+    "@DataJpaTest"
+  ],
+  "expected_queries": [
+    "Spring에서 publishEvent는 탔는데 왜 이벤트 리스너 로그가 하나도 안 찍히는지 어디부터 나눠 봐야 해?",
+    "@TransactionalEventListener(AFTER_COMMIT)를 붙였는데 테스트에서는 안 도는 이유를 증상 기준으로 설명해줘",
+    "스케줄러나 비동기 경로에서만 listener가 조용히 안 실행될 때 무엇을 먼저 의심해야 해?",
+    "이벤트 발행 호출은 성공인데 후속 작업이 실제로 빠졌다면 트랜잭션 phase 문제와 async 실패를 어떻게 가를까?",
+    "어떤 요청에서는 이벤트 리스너가 돌고 어떤 요청에서는 안 도는 현상을 Spring에서 어떻게 분기해서 봐야 해?"
+  ],
+  "symptoms": [
+    "publishEvent는 호출됐는데 @EventListener나 @TransactionalEventListener 로그가 전혀 안 보여요",
+    "AFTER_COMMIT 리스너를 붙였는데 테스트나 스케줄러 경로에서는 반응하지 않아요",
+    "비동기 이벤트로 바꾼 뒤 호출자는 성공처럼 끝나는데 실제 후속 작업은 실행되지 않은 것 같아요",
+    "이벤트는 발행된 것 같은데 어떤 요청에서는 리스너가 돌고 어떤 요청에서는 조용히 빠져요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transactional-basics",
+      "software-engineering/service-layer-basics"
+    ],
+    "next_docs": [
+      "spring/post-commit-side-effect-routing-decision-guide",
+      "spring/async-looks-synchronous-cause-router",
+      "spring/shopping-cart-order-complete-follow-up-missing-cause-router"
+    ],
+    "confusable_with": [
+      "spring/post-commit-side-effect-routing-decision-guide",
+      "spring/async-looks-synchronous-cause-router",
+      "spring/shopping-cart-order-complete-follow-up-missing-cause-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-event-listener-not-firing-cause-router.md",
+    "revision_history": []
+  }
+}

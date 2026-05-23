@@ -1,0 +1,45 @@
+{
+  "id": "security/samesite-cross-site-login-loop-primer",
+  "title": "SameSite Cross-Site Login Loop Primer",
+  "category": "security",
+  "level": "beginner",
+  "summary": "이 primer는 SameSite, Secure, cross-site fetch 조건 때문에 로그인 후 다시 로그인 페이지로 튀는 증상을 설명한다. 프론트 백엔드 도메인 다름, 세션 쿠키 빠짐, SameSite=None Secure 같은 질문을 다룬다.",
+  "body_markdown": "# SameSite Cross-Site Login Loop Primer\n\n## 한 줄 요약\n\nSameSite는 \"이 쿠키를 cross-site 요청에 보낼 수 있는가\"를 정하는 브라우저 정책이다. 프론트와 백엔드 origin이 다르면 로그인 성공 응답, 쿠키 저장, 다음 API 인증이 서로 다른 단계로 분리되어 보인다.\n\n## 미션 진입 증상\n\n로그인 응답에서 `Set-Cookie`는 보이는데 다음 fetch 요청에는 쿠키가 없다. 또는 페이지 이동은 되는 듯하지만 API는 계속 401/302로 로그인 페이지를 돌려준다.\n\n## 핵심 mental model\n\nCross-site 요청에서 세션 쿠키를 보내려면 cookie의 SameSite/Secure 조건, CORS credentials 허용, fetch credentials 옵션이 같이 맞아야 한다. 하나라도 빠지면 \"로그인은 성공했는데 다음 요청은 익명\"처럼 보인다.\n\nSameSite의 site는 origin과 다르다. origin은 scheme, host, port까지 보지만, site는 scheme과 registrable domain 중심으로 판단한다. 그래서 `https://app.example.com`과 `https://api.example.com`은 cross-origin이라 CORS 대상이지만 같은 site일 수 있다. 반대로 `http://localhost:3000`과 `https://localhost:8443`처럼 scheme이 다르면 schemeful same-site 판단에서 달라질 수 있다.\n\n## 정확한 SameSite 규칙\n\n| 설정 | 전송되는 대표 상황 | 로그인 루프에서 보는 포인트 |\n|---|---|---|\n| `SameSite=Strict` | same-site 요청 | 외부 OAuth/provider callback이나 다른 site에서 시작한 흐름에 너무 엄격할 수 있음 |\n| `SameSite=Lax` | same-site 요청, top-level safe-method navigation 중심 | cross-site fetch/XHR API 호출에는 보통 붙지 않는다고 보고 확인 |\n| `SameSite=None; Secure` | cross-site context 허용 | HTTPS가 필요하며, `Secure` 없이 `None`만 쓰면 저장/전송이 막힐 수 있음 |\n| attribute 생략 | 최신 브라우저에서 기본 Lax 계열로 취급될 수 있음 | \"명시 안 했으니 아무 데나 붙는다\"는 가정 금지 |\n\nTop-level navigation과 fetch/XHR을 구분한다. 브라우저 주소가 callback URL로 이동하는 흐름은 navigation이고, SPA가 API를 호출하는 흐름은 fetch/XHR이다. `SameSite=Lax`에서 navigation은 되는 듯하지만 다음 cross-site fetch API에는 세션 쿠키가 안 붙어 루프가 생길 수 있다.\n\n## 10초 분기표\n\n| 관찰 | 가능한 원인 | 바로 볼 증거 |\n|---|---|---|\n| 로그인 응답에 `Set-Cookie` 없음 | 서버가 쿠키를 안 발급 | response header, auth success handler |\n| `Set-Cookie`는 있는데 Application에 없음 | 저장 거부 | Secure/Domain/SameSite=None, Expires/Max-Age, DevTools blocked reason |\n| Application에는 있는데 다음 API request에 없음 | 전송 조건 불일치 | SameSite, fetch credentials, Domain/Path, Secure |\n| request에 cookie는 있는데 401 | 서버 session 해석 실패 | session store, cookie name, session id rotation |\n| 302가 로그인 페이지와 API를 반복 | 쿠키 미전송 또는 SavedRequest/handler 충돌 | redirect chain, saved request, success target |\n| OAuth callback은 성공, SPA API만 실패 | navigation과 fetch 조건 차이 | callback request와 API request의 Cookie header 비교 |\n\n## 검증 순서\n\n1. 로그인 시작, callback 또는 login response, 다음 API request를 Network timeline에서 순서대로 잡는다.\n2. login response의 `Set-Cookie`가 저장됐는지 Application 탭에서 확인한다.\n3. 다음 API request의 `Cookie` header를 본다. 이 request가 cross-origin인지, cross-site인지 따로 판단한다.\n4. cross-origin fetch/XHR이면 client `credentials: \"include\"`와 서버의 구체 `Access-Control-Allow-Origin`, `Access-Control-Allow-Credentials: true`를 확인한다.\n5. cookie row의 Domain/Path가 다음 API URL에 match되는지 본다.\n6. `SameSite=None`이 필요하다면 `Secure`와 HTTPS를 같이 확인한다.\n7. 서버 로그에서 받은 cookie와 인증 객체 생성 여부를 확인한다.\n\n## 흔한 오해\n\nCORS 설정만 고치면 쿠키가 붙는다고 생각하기 쉽다. CORS는 브라우저가 응답을 노출할지와 credentials 허용을 다루고, cookie scope/SameSite는 쿠키 자체의 전송 조건을 다룬다.\n\n`SameSite=None`은 \"보안 없음\"이 아니다. cross-site로 쿠키를 보내야 하는 흐름을 명시하는 설정이고, `Secure`와 HTTPS가 붙어야 한다. 대신 CSRF 위험은 커질 수 있으므로 민감한 상태 변경 요청은 CSRF token, Origin 검증, re-auth 같은 별도 방어와 함께 봐야 한다.\n\n`localhost`에서 동작했다고 운영 도메인에서도 같다고 보면 안 된다. 로컬은 scheme, Secure 예외, proxy path, domain suffix가 운영과 다르기 때문에 반드시 운영과 같은 origin/site 구조로 재현한다.\n\n## Safe Next Docs\n\n쿠키가 저장됐는지부터 확실하지 않으면 cookie visible router로 돌아가고, 전송 조건 비교는 fetch credentials vs cookie scope를 본다.\n",
+  "aliases": [
+    "samesite cross site login loop",
+    "cookie samesite none secure login redirect",
+    "SameSite 로그인 루프",
+    "cross-site 쿠키 전송 조건"
+  ],
+  "expected_queries": [
+    "SameSite 때문에 로그인 후 다시 로그인 페이지로 갈 수 있어?",
+    "프론트와 백엔드 도메인이 다르면 세션 쿠키 설정을 어떻게 봐?",
+    "SameSite=None이랑 Secure는 왜 같이 봐야 해?"
+  ],
+  "symptoms": [
+    "로그인 성공 응답은 오는데 다음 API는 익명으로 처리돼요",
+    "크로스 사이트 요청에서 세션 쿠키가 빠져요",
+    "SameSite=Lax로 두면 fetch 요청에 안 붙는 것 같아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/cookie-visible-but-not-sent-symptom-router"
+    ],
+    "next_docs": [
+      "security/cors-credential-pitfalls-allowlist"
+    ],
+    "confusable_with": [
+      "security/cors-samesite-preflight",
+      "security/cookie-devtools-field-checklist-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/samesite-cross-site-login-loop-primer.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/file-descriptor-ulimit-interview-router",
+  "title": "File Descriptor Ulimit Interview Router",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 file descriptor, ulimit, EMFILE/ENFILE, deleted open file 문제를 면접/운영 증상으로 분기한다.",
+  "body_markdown": "# File Descriptor Ulimit Interview Router\n\n## 관찰 증거\n\n- file, socket, pipe, eventfd 모두 file descriptor를 사용할 수 있다.\n- process limit을 넘으면 EMFILE, system-wide limit이면 ENFILE 류 문제가 생길 수 있다.\n- 삭제된 파일을 process가 계속 열고 있으면 disk 공간이 회수되지 않을 수 있다.\n- FD 증가는 파일 leak뿐 아니라 outbound connection pool, accepted socket, log file, file watcher/inotify instance, pipe/subprocess 처리에서도 발생한다.\n- limit을 올린 직후 증상이 줄어도 증가 추세가 계속되면 leak나 lifecycle close 누락은 남아 있을 수 있다.\n- container 환경에서는 host limit, service manager limit, container runtime 설정, process soft/hard limit이 서로 다를 수 있다.\n\n## 보장 범위와 아닌 것\n\n`ulimit -n`은 한 프로세스가 동시에 열 수 있는 fd 개수의 soft limit이다. 값을 올리면 더 많은 fd를 받을 여지는 생기지만, close 누락, connection pool 반납 실패, deleted open file, host 전체 file table 압력을 고치지는 않는다.\n\n| 장치 | 의미 | 보장하지 않는 것 |\n|---|---|---|\n| file descriptor | process가 kernel object를 참조하는 handle | 파일만 의미한다는 보장, 자동 close |\n| process `RLIMIT_NOFILE` | process별 fd 상한 | host 전체 여유, leak 부재 |\n| system-wide file table | host가 유지하는 열린 file object 압력 | 특정 process 하나가 원인이라는 보장 |\n| container limit | container/process가 보는 제한 | host `fs.file-max`, systemd unit limit과 동일하다는 보장 |\n\n면접에서는 \"ulimit을 올리면 해결\"이 아니라 \"어느 limit에 닿았는지와 어떤 fd type이 증가하는지 분리해 완화와 원인 제거를 따로 한다\"라고 답해야 한다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| Too many open files | fd leak/limit | `/proc/<pid>/fd`, ulimit |\n| accept 실패 | socket fd 고갈 | listener metrics |\n| disk 공간 미회수 | deleted open file | lsof deleted |\n| outbound 호출 실패 | client connection leak/pool 고갈 | connection pool active/idle |\n| 특정 배포 후 급증 | resource close 누락 | fd type diff, recent code path |\n| process는 정상, host만 고갈 | system-wide file table pressure | ENFILE, host fd metrics |\n\n## 실패 모드별 판독\n\n| 관찰 | 더 가까운 실패 모드 | 바로 볼 증거 |\n|---|---|---|\n| `/proc/<pid>/fd` 개수가 `Max open files`에 붙음 | process-level EMFILE | `/proc/<pid>/limits`, fd type 분포 |\n| 여러 process가 동시에 open/accept 실패 | host-level ENFILE 후보 | `/proc/sys/fs/file-nr`, top fd holder |\n| `IPv4/IPv6` fd가 단조 증가 | socket leak 또는 keep-alive 적체 | `ss -tanp`, pool active/idle, timeout 설정 |\n| `REG` 또는 `(deleted)`가 많음 | file close 누락, log rotation 문제 | `lsof +L1`, log handler reopen |\n| 배포 후에만 증가 | 새 code path의 close 누락 | diff, exception path, streaming response close |\n| container 안 limit만 낮음 | runtime/systemd/container limit mismatch | process limit, unit file, pod/container spec |\n\n이 표의 목적은 원인을 하나로 단정하는 것이 아니라 관측 범위를 정하는 것이다. `EMFILE`은 process 쪽 증거가 우선이고, `ENFILE`은 host 전체 분포와 다른 서비스 영향이 우선이다.\n\n## 면접 답변 골격\n\nulimit을 올리는 것은 임시 완화일 수 있지만 leak를 해결하지 않는다. 어떤 fd type이 늘어나는지와 lifecycle close가 있는지 확인해야 한다. 답변은 보통 다음 순서가 안전하다.\n\n1. \"`Too many open files`가 process limit인지 host-wide limit인지 `EMFILE`/`ENFILE`과 실제 limit으로 나눕니다.\"\n2. \"`/proc/<pid>/fd`와 `lsof`로 socket/file/pipe/deleted 중 무엇이 늘어나는지 봅니다.\"\n3. \"limit 상향은 완화책이고, close path, pool 반환, response body 종료, log rotation reopen을 고쳐야 합니다.\"\n4. \"수정 후 fd count slope가 plateau를 만드는지와 traffic 종료 후 fd type 분포가 회복되는지 검증합니다.\"\n\n## 답변 확장 축\n\n- file descriptor는 kernel object를 process가 참조하는 handle이므로 일반 파일뿐 아니라 socket, pipe, epoll, eventfd 같은 자원도 포함한다.\n- `EMFILE`은 보통 process가 자신의 limit에 닿은 신호이고, `ENFILE`은 system-wide resource 압력 후보라 관측 범위가 다르다.\n- close 책임은 언어 런타임의 GC에만 맡기지 않는다. try-with-resources, connection pool 반환, response body drain/close, subprocess pipe 정리가 중요하다.\n- accept 실패와 outbound connection 실패는 둘 다 fd 문제일 수 있지만 원인 자원과 피해 방향이 다르므로 fd 목록을 type별로 본다.\n- log rotation 후 disk가 비지 않는 문제는 파일명이 삭제되어도 열린 file description이 남아 data block을 붙잡는 경우로 설명한다.\n- `select()`를 쓰는 오래된 코드에서는 fd 숫자 자체가 높은 것도 문제가 될 수 있지만, 현대 서버는 보통 epoll/kqueue와 process limit, pool lifecycle을 먼저 본다.\n\n## 운영 관찰 증거\n\n- `/proc/<pid>/fd` 또는 `lsof`로 fd type, target, deleted marker, socket state를 표본이 아니라 시간 변화로 본다.\n- application metric에서 open connection, pool active/idle, accepted connection, file handle count가 배포나 traffic과 같이 움직이는지 확인한다.\n- limit 확인은 shell의 `ulimit`만 보지 말고 실제 process의 `/proc/<pid>/limits`, systemd unit, container spec을 함께 확인한다.\n- fd leak 의심 시 heap dump보다 먼저 resource lifecycle과 close path, exception path, streaming response 종료 path를 점검한다.\n- host 압력은 `/proc/sys/fs/file-nr`, node exporter filefd metric, process별 fd 상위 목록으로 본다.\n- 검증은 \"에러가 사라짐\"에서 끝내지 않고 fd count slope, fd type 비율, restart/logrotate 이후 deleted fd 잔존 여부를 본다.\n\n## 흔한 오해\n\n- \"파일 디스크립터\"라는 이름 때문에 파일만 센다고 보면 socket 서버 장애를 놓친다.\n- ulimit을 크게 올리면 근본 해결이라고 단정하지 않는다. leak가 있으면 장애 시점만 늦춰진다.\n- process limit과 system-wide limit, host와 container limit을 섞으면 잘못된 위치를 고치게 된다.\n- 삭제된 로그 파일은 `ls`에 안 보여도 열린 fd가 있으면 공간을 계속 차지할 수 있다.\n- fd count가 높다는 사실만으로 leak라고 단정하지 않는다. 정상 traffic spike, keep-alive, slow client, backpressure도 비슷한 모양을 만들 수 있다.\n\n## 관련 playbook\n\n진단은 `fd-exhaustion-ulimit-diagnostics`로 이어진다.\n",
+  "aliases": [
+    "file descriptor ulimit interview",
+    "EMFILE ENFILE router",
+    "파일 디스크립터 고갈 면접",
+    "too many open files answer"
+  ],
+  "expected_queries": [
+    "Too many open files를 면접에서 어떻게 분석해?",
+    "file descriptor는 파일만 세는 거야?",
+    "ulimit을 올리면 해결되는 문제야?"
+  ],
+  "symptoms": [
+    "Too many open files 에러가 납니다",
+    "socket accept가 실패하고 새 연결을 못 받아요",
+    "log rotation 후 disk가 비워지지 않아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/file-descriptor-basics"
+    ],
+    "next_docs": [
+      "operating-system/fd-exhaustion-ulimit-diagnostics"
+    ],
+    "confusable_with": [
+      "operating-system/file-descriptor-basics",
+      "operating-system/fd-exhaustion-ulimit-diagnostics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/file-descriptor-ulimit-interview-router.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "id": "security/scim-deprovisioning-session-authz-consistency",
+  "title": "SCIM Deprovisioning / Session / AuthZ Consistency",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 SCIM Deprovisioning / Session / AuthZ Consistency를 다루는 deep_dive 문서다. SCIM deprovisioning은 계정 상태만 바꾸는 이벤트가 아니라, 세션 revoke, tenant membership 제거, authz cache invalidation까지 이어져야 의미가 있으며, 이 연결이 끊기면 퇴사자/탈퇴자 access tail이 남는다. 검색 질의가 SCIM deprovisioning, deprovision session revoke, SCIM authz consistency, identity lifecycle consistency처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# SCIM Deprovisioning / Session / AuthZ Consistency\n\n> 한 줄 요약: SCIM deprovisioning은 계정 상태만 바꾸는 이벤트가 아니라, 세션 revoke, tenant membership 제거, authz cache invalidation까지 이어져야 의미가 있으며, 이 연결이 끊기면 퇴사자/탈퇴자 access tail이 남는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [SCIM Provisioning Security](./scim-provisioning-security.md)\n> - [SCIM Drift / Reconciliation](./scim-drift-reconciliation.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n> - [Revocation Propagation Lag / Debugging](./revocation-propagation-lag-debugging.md)\n> - [Authorization Caching / Staleness](./authorization-caching-staleness.md)\n> - [AuthZ Cache Inconsistency / Runtime Debugging](./authz-cache-inconsistency-runtime-debugging.md)\n> - [Authorization Runtime Signals / Shadow Evaluation](./authorization-runtime-signals-shadow-evaluation.md)\n> - [Database: Online Backfill Verification, Drift Checks, and Cutover Gates](../database/online-backfill-verification-cutover-gates.md)\n> - [System Design: Database / Security Identity Bridge Cutover 설계](../system-design/database-security-identity-bridge-cutover-design.md)\n> - [System Design: Session Store / Claim-Version Cutover 설계](../system-design/session-store-claim-version-cutover-design.md)\n\nretrieval-anchor-keywords: SCIM deprovisioning, deprovision session revoke, SCIM authz consistency, identity lifecycle consistency, deprovisioning lag, orphan session, directory drift authz, SCIM membership revoke, access shutdown, deprovision tail, directory backfill, auth shadow evaluation, authority transfer\n\n---\n\n## 핵심 개념\n\nSCIM deprovisioning이 성공했다고 해서 보안이 끝난 것은 아니다.\n\n실제 질문:\n\n- 기존 세션은 끊겼는가\n- refresh family는 회수됐는가\n- tenant membership cache는 갱신됐는가\n- authz deny가 모든 route에 반영됐는가\n\n즉 deprovisioning은 user row 업데이트가 아니라, identity lifecycle을 세션과 인가까지 일관되게 정리하는 문제다.\n\n---\n\n## 깊이 들어가기\n\n### 1. deprovisioning tail은 세 곳에 남기 쉽다\n\n- active session / refresh family\n- stale authz cache\n- orphan delegated/admin grant\n\n그래서 account disabled와 access denied 사이에 긴 tail이 생긴다.\n\n### 2. group removal도 사실상 deprovisioning일 수 있다\n\n특히 group-to-role 매핑이 강한 시스템에서는:\n\n- 특정 group 제거\n- tenant membership 제거\n\n가 곧 권한 철회다.\n\n### 3. SCIM event와 local revoke는 같은 파이프라인에 묶는 편이 낫다\n\n좋은 패턴:\n\n- deprovision event 수신\n- local account state 갱신\n- session/family revoke\n- authz cache invalidation\n- propagation lag 추적\n\n### 4. drift reconciliation도 session tail을 같이 봐야 한다\n\n과거 drift를 정리할 때:\n\n- 계정 상태만 맞추고\n- 남아 있는 session을 안 끊으면\n\n복구가 반쪽이다.\n\n### 5. directory backfill 완료와 access shutdown 검증은 다른 질문이다\n\nSCIM event replay나 reconciliation backfill이 끝났다고 access shutdown이 끝난 것은 아니다.\n\n- source/local row diff는 0인데 refresh family가 아직 살아 있다\n- membership row는 제거됐는데 authz cache와 shadow decision은 old allow를 낸다\n- support override나 delegated grant cleanup이 늦어 DB 상태와 실제 권한이 어긋난다\n\n그래서 identity lifecycle authority transfer에서는\n[Database: Online Backfill Verification, Drift Checks, and Cutover Gates](../database/online-backfill-verification-cutover-gates.md)의 data parity gate와\n[Authorization Runtime Signals / Shadow Evaluation](./authorization-runtime-signals-shadow-evaluation.md)의 decision parity gate를 함께 봐야 한다.\n\n### 6. observability는 lifecycle-to-access lag를 봐야 한다\n\n유용한 지표:\n\n- deprovision requested at\n- last accepted after deprovision\n- stale membership cache hit\n- orphan session count\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 퇴사자 계정은 disabled인데 모바일 앱은 계속 동작한다\n\n문제:\n\n- session/family revoke가 분리돼 있다\n\n대응:\n\n- SCIM deprovision event에서 revoke fan-out을 같이 실행한다\n- last accepted after deprovision을 측정한다\n\n### 시나리오 2: tenant membership이 제거됐는데 일부 화면만 계속 보인다\n\n문제:\n\n- authz cache/negative cache tail\n\n대응:\n\n- tenant membership invalidate를 authz cache invalidation과 연결한다\n- route class별 stale hit를 본다\n\n### 시나리오 3: drift reconciliation 후에도 support grant가 남아 있다\n\n문제:\n\n- delegated/admin override cleanup이 lifecycle과 연결되지 않았다\n\n대응:\n\n- deprovision flow에 override/grant cleanup을 포함한다\n\n## 한 줄 정리\n\nSCIM deprovisioning을 운영 가능하게 만드는 핵심은 계정 상태 변경을 세션 revoke, authz cache invalidation, override cleanup까지 이어지는 일관된 access shutdown 파이프라인으로 보는 것이다.\n",
+  "aliases": [
+    "SCIM deprovisioning",
+    "deprovision session revoke",
+    "SCIM authz consistency",
+    "identity lifecycle consistency",
+    "deprovisioning lag",
+    "orphan session",
+    "directory drift authz",
+    "SCIM membership revoke",
+    "access shutdown",
+    "deprovision tail",
+    "directory backfill",
+    "auth shadow evaluation"
+  ],
+  "expected_queries": [
+    "SCIM Deprovisioning / Session / AuthZ Consistency 핵심 개념을 설명해줘",
+    "SCIM deprovisioning가 왜 필요한지 알려줘",
+    "SCIM Deprovisioning / Session / AuthZ Consistency 실무 설계 포인트는 뭐야?",
+    "SCIM deprovisioning에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`SCIM Deprovisioning / Session / AuthZ Consistency`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
+    "`SCIM Deprovisioning / Session / AuthZ Consistency` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`SCIM Deprovisioning / Session / AuthZ Consistency`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/authentication-vs-authorization",
+      "security/session-cookie-jwt-basics"
+    ],
+    "next_docs": [
+      "security/authority-transfer-vs-revoke-lag-primer-bridge",
+      "security/session-fixation-clickjacking-csp"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/scim-deprovisioning-session-authz-consistency.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "network/nagle-delayed-ack-small-packet-latency",
+  "title": "Nagle Algorithm and Delayed ACK Small Packet Latency",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 Nagle algorithm, delayed ACK, TCP_NODELAY, small packet latency,",
+  "body_markdown": "# Nagle 알고리즘과 Delayed ACK\n\n> 한 줄 요약: 작은 패킷을 아끼려는 Nagle과 ACK를 늦추는 Delayed ACK가 만나면, 대역폭은 안 써도 지연은 크게 늘 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TCP 혼잡 제어](./tcp-congestion-control.md)\n> - [HTTP/2 멀티플렉싱과 HOL blocking](./http2-multiplexing-hol-blocking.md)\n> - [Timeout 타입: connect, read, write](./timeout-types-connect-read-write.md)\n> - [MTU, Fragmentation, MSS, Blackhole](./mtu-fragmentation-mss-blackhole.md)\n> - [FIN, RST, Half-Close, EOF](./fin-rst-half-close-eof-semantics.md)\n> - [Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB](./request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md)\n> - [TLS Record Sizing, Flush, Streaming Latency](./tls-record-sizing-flush-streaming-latency.md)\n> - [HTTP Response Compression, Buffering, Streaming Trade-offs](./http-response-compression-buffering-streaming-tradeoffs.md)\n\nretrieval-anchor-keywords: Nagle algorithm, delayed ACK, TCP_NODELAY, small packet latency, coalescing, interactive traffic, request-response stall, TCP corking\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [운영 플레이북](#운영-플레이북)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nTCP는 무작정 작은 세그먼트를 계속 보내면 비효율적이기 때문에, 소량의 데이터를 묶어서 보내려는 장치를 둔다.\n\n- `Nagle algorithm`: 작은 보내기 요청을 합쳐서 더 큰 세그먼트로 만든다\n- `Delayed ACK`: 수신 측이 ACK를 바로 보내지 않고 잠깐 기다린다\n- `TCP_NODELAY`: Nagle을 끄고 바로 보내게 만든다\n\n문제는 이 둘이 같이 있을 때다.\n\n작은 요청-응답이 반복되는 패턴에서 sender는 \"ACK 오면 보내자\"고 기다리고, receiver는 \"데이터가 조금 더 올지 보자\"고 기다리면서, **서로를 기다리는 잠복 시간**이 생긴다.\n\n### Retrieval Anchors\n\n- `Nagle algorithm`\n- `delayed ACK`\n- `TCP_NODELAY`\n- `small packet latency`\n- `coalescing`\n- `interactive traffic`\n- `request-response stall`\n- `TCP corking`\n\n## 깊이 들어가기\n\n### 1. Nagle이 왜 생겼나\n\n작은 패킷을 너무 자주 보내면 아래 비용이 생긴다.\n\n- 헤더 오버헤드가 커진다\n- 네트워크가 잡음처럼 바빠진다\n- 커널과 NIC 처리량이 불필요하게 늘어난다\n\n그래서 Nagle은 기본적으로 이런 규칙으로 동작한다.\n\n- 아직 ACK를 못 받은 미확인 데이터가 있으면\n- 새로 생긴 작은 쓰기 데이터를 잠시 모은다\n- 어느 정도 묶이거나 ACK가 오면 보낸다\n\n대역폭 효율은 좋아지지만, 지연 민감 트래픽에는 불리해질 수 있다.\n\n### 2. Delayed ACK가 왜 생겼나\n\n수신 측도 매 세그먼트마다 ACK를 보내면 부담이 크다.\n\n- ACK를 하나씩 즉시 보내지 않아도 된다\n- 곧바로 보낼 데이터가 있으면 데이터와 ACK를 함께 보낼 수 있다\n- 짧은 지연을 두면 불필요한 ACK 트래픽을 줄일 수 있다\n\n하지만 이 \"조금 기다리기\"가 Nagle과 만나면 문제가 된다.\n\n### 3. 왜 둘이 만나면 stall이 생기나\n\n전형적인 흐름은 이렇다.\n\n1. 클라이언트가 작은 request를 보낸다\n2. 서버는 응답을 조금만 만들었다\n3. 서버는 Nagle 때문에 더 쌓이길 기다린다\n4. 클라이언트는 delayed ACK 때문에 ACK를 늦춘다\n5. 양쪽이 서로를 기다린다\n\n이게 바로 작은 RPC, 채팅, 제어 메시지, 폼 제출처럼 **짧고 자주 왕복하는 통신**에서 체감 지연을 만드는 원인이다.\n\n### 4. TCP_NODELAY가 만능은 아니다\n\n`TCP_NODELAY`를 켜면 Nagle은 끌 수 있다.\n\n- 작은 패킷을 더 빨리 보낼 수 있다\n- interactive latency가 줄 수 있다\n\n하지만 이것만으로는 끝이 아니다.\n\n- delayed ACK는 여전히 존재할 수 있다\n- 애플리케이션이 너무 자주 write하면 packet burst가 생길 수 있다\n- 프록시와 TLS 레코드가 다른 곳에서 다시 묶을 수 있다\n\n즉, `TCP_NODELAY`는 \"지연을 줄일 가능성\"이지 \"무조건 빨라짐\"이 아니다.\n\n### 5. 언제 좋은가, 언제 나쁜가\n\n좋은 경우:\n\n- CLI 상호작용\n- 채팅/메신저\n- 짧은 control plane 메시지\n- 낮은 지연이 중요한 RPC\n\n나쁜 경우:\n\n- 대용량 전송\n- throughput이 더 중요한 배치\n- 이미 상위 계층에서 충분히 배치하는 경우\n\n패킷을 덜 보내는 게 항상 좋은 것이 아니라, **어느 레벨에서 묶을지**가 중요하다.\n특히 TLS record coalescing이나 응답 압축이 함께 있으면 작은 write의 체감은 [TLS Record Sizing, Flush, Streaming Latency](./tls-record-sizing-flush-streaming-latency.md), [HTTP Response Compression, Buffering, Streaming Trade-offs](./http-response-compression-buffering-streaming-tradeoffs.md)와 같이 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 작은 REST 호출이 이상하게 느리다\n\nJSON 자체는 작고 서버도 빨리 끝났는데, 왕복 지연이 자꾸 튄다.\n\n가능한 원인:\n\n- 작은 write가 여러 번 나뉘어 전송된다\n- Nagle과 delayed ACK가 겹친다\n- proxy buffering이 응답을 더 늦게 푼다\n\n### 시나리오 2: gRPC unary 호출은 빠른데 특정 환경에서만 튄다\n\n동일한 코드인데 모바일, VPN, 원격망에서만 지연이 보이면, small packet latency를 의심해 볼 수 있다.\n\n### 시나리오 3: 서버는 빠른데 첫 글자/첫 바이트가 늦다\n\n`time_starttransfer`는 늦고, `time_total`은 그럭저럭일 수 있다.\n\n이 경우는 TCP나 proxy 레벨에서 첫 바이트가 지연되는 패턴을 본다.\n\n## 운영 플레이북\n\n### 재현 조건\n\nNagle/delayed ACK 문제는 대역폭 포화보다 **작은 write가 짧게 왕복하는 패턴**에서 재현한다.\n\n- 작은 request/response를 반복하고 payload 크기를 고정한다\n- `TCP_NODELAY` on/off 또는 애플리케이션 batching 전후를 비교한다\n- TLS record flush, compression buffering, proxy buffering을 가능한 한 분리한다\n- packet loss/retransmission이 없는 상태에서도 지연이 튀는지 본다\n\nDelayed ACK 동작과 TCP option 기본값은 OS와 라이브러리마다 다를 수 있으므로, 특정 지연 시간을 고정값처럼 말하지 않는다.\n\n### 확인 순서\n\n1. 애플리케이션이 작은 `write()`를 여러 번 호출하는지 확인한다.\n2. packet capture에서 작은 segment와 ACK 지연 패턴을 본다.\n3. retransmission이나 congestion window 축소가 없는지 먼저 배제한다.\n4. `TCP_NODELAY`, flush 정책, 앱 batching 중 하나씩만 바꿔 차이를 본다.\n5. throughput 악화나 packet rate 증가가 허용 가능한지 확인한다.\n\n### failure matrix\n\n| 관찰 | 가능성 | 다음 확인 |\n|---|---|---|\n| 작은 RPC만 p95가 튐 | Nagle/delayed ACK 상호 대기 | packet size, ACK timing |\n| `TCP_NODELAY` 후에도 느림 | TLS/proxy/compression buffering | record flush, proxy buffer 설정 |\n| 대용량 전송이 느림 | congestion/throughput 병목 | cwnd, retransmission, bandwidth |\n| 패킷 수가 급증하고 CPU 상승 | 과도한 small write | 앱 batching, write coalescing |\n| TTFB만 늦고 TTLB는 짧음 | 첫 바이트 flush 지연 | server flush, TCP/TLS boundary |\n\n### 검증\n\n튜닝 후에는 latency와 packet cost를 같이 본다.\n\n- p50보다 p95/p99와 small request bucket을 따로 본다\n- retransmission 없이 지연이 줄었는지 확인한다\n- packet rate, CPU, NIC interrupt가 과도하게 늘지 않았는지 본다\n- TLS/compression/proxy 계층에서 다시 buffering하지 않는지 end-to-end로 확인한다.\n\n## 코드로 보기\n\n### 소켓 옵션 예시\n\n```java\nSocket socket = new Socket();\nsocket.setTcpNoDelay(true);\n```\n\n```go\nconn, _ := net.Dial(\"tcp\", \"api.example.com:443\")\ntcpConn := conn.(*net.TCPConn)\n_ = tcpConn.SetNoDelay(true)\n```\n\n### 지연을 관찰하는 방법\n\n```bash\nss -ti dst api.example.com\ntcpdump -i eth0 host api.example.com and tcp\n```\n\n관찰 포인트:\n\n- 아주 작은 세그먼트가 자주 나가는지\n- ACK 지연이 반복되는지\n- retransmission은 없는데 체감만 느린지\n\n### 애플리케이션 레벨에서 묶는 예시\n\n```text\n나쁜 방식:\n- write() 1바이트\n- write() 1바이트\n- write() 1바이트\n\n좋은 방식:\n- 충분히 모아서 한 번에 write()\n```\n\n핵심은 커널에 맡기기 전에 **애플리케이션에서 의미 있는 단위로 묶는 것**이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| Nagle on | 작은 패킷을 줄인다 | interactive latency가 늘 수 있다 | bulk transfer |\n| Nagle off (`TCP_NODELAY`) | 작은 응답이 빨라진다 | 패킷 수가 늘 수 있다 | RPC, 채팅, 제어 메시지 |\n| 앱에서 batching | 의미 단위로 묶을 수 있다 | 구현이 복잡하다 | 성능과 지연을 같이 볼 때 |\n\n핵심은 \"작게 보내지 말자\"가 아니라 **언제 묶고 언제 즉시 보낼지**를 정하는 것이다.\n\n## 꼬리질문\n\n> Q: Nagle을 끄면 무조건 빨라지나요?\n> 핵심: 아니다. 패킷 수와 지연의 trade-off가 있고, delayed ACK나 상위 버퍼링은 남을 수 있다.\n\n> Q: delayed ACK는 왜 문제가 되나요?\n> 핵심: 작은 request-response에서 ACK가 늦어지면 sender도 다음 데이터를 못 보내며 대기할 수 있다.\n\n> Q: throughput과 latency 중 무엇을 우선해야 하나요?\n> 핵심: 상호작용이 중요하면 latency, 대용량이면 throughput을 더 본다.\n\n## 한 줄 정리\n\nNagle과 delayed ACK는 네트워크 효율을 위해 만든 장치지만, 작은 왕복이 많은 실전 서비스에서는 서로를 기다리며 체감 지연을 키울 수 있다.\n",
+  "aliases": [
+    "Nagle algorithm",
+    "delayed ACK",
+    "TCP_NODELAY",
+    "small packet latency",
+    "request response stall",
+    "TCP corking",
+    "interactive traffic latency"
+  ],
+  "expected_queries": [
+    "Nagle 알고리즘과 delayed ACK가 만나면 왜 작은 요청이 느려져?",
+    "TCP_NODELAY를 켜면 small packet latency가 항상 해결돼?",
+    "작은 RPC가 대역폭은 안 쓰는데 RTT가 늘어나는 이유를 설명해줘",
+    "Nagle delayed ACK stall과 TCP congestion control은 어떻게 달라?",
+    "TLS record flush와 HTTP compression buffering까지 같이 봐야 하는 이유는?"
+  ],
+  "symptoms": [
+    "작은 RPC나 제어 메시지가 대역폭은 낮은데 왕복 지연만 크게 늘어난다",
+    "Nagle과 delayed ACK가 서로 기다리는 stall을 네트워크 혼잡으로 오해한다",
+    "TCP_NODELAY를 켜면 항상 빨라진다고 단정한다",
+    "TLS record나 response compression buffering과 TCP small write 문제를 분리하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/tcp-congestion-control",
+      "network/request-timing-decomposition"
+    ],
+    "next_docs": [
+      "network/tls-record-sizing-flush-streaming-latency",
+      "network/http-response-compression-buffering-streaming-tradeoffs",
+      "network/http2-multiplexing-hol-blocking",
+      "network/timeout-types-connect-read-write"
+    ],
+    "confusable_with": [
+      "network/tcp-congestion-control",
+      "network/http2-multiplexing-hol-blocking",
+      "network/tls-record-sizing-flush-streaming-latency",
+      "network/http-response-compression-buffering-streaming-tradeoffs",
+      "network/websocket-fragmentation-frame-sizing"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/nagle-delayed-ack-small-packet-latency.md",
+    "revision_history": []
+  }
+}

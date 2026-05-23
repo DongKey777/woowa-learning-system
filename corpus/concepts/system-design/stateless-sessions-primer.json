@@ -1,0 +1,55 @@
+{
+  "id": "system-design/stateless-sessions-primer",
+  "title": "Stateless Sessions Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "이 문서는 system-design 카테고리에서 Stateless Sessions Primer를 다루는 primer 문서다. sticky session, external session store, token-based auth를 비교해 왜 stateless app tier가 load balancer, autoscaling, failover에 더 잘 맞는지 설명하는 입문 문서다. 검색 질의가 stateless sessions primer, what is stateless session, stateless session beginner, stateless 큰 그림처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Stateless Sessions Primer\n\n> 한 줄 요약: sticky session, external session store, token-based auth를 비교해 왜 stateless app tier가 load balancer, autoscaling, failover에 더 잘 맞는지 설명하는 입문 문서다.\n\nretrieval-anchor-keywords: stateless sessions primer, what is stateless session, stateless session beginner, stateless 큰 그림, stateless 처음 배우는데, 세션이 뭐예요, 로그인 상태 어디 저장, 왜 stateless를 써요, sticky session, sticky session 왜 문제, external session store, token-based auth, jwt랑 session 차이, sticky vs stateless, session scaling\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [System Design Foundations](./system-design-foundations.md)\n- [Read-After-Write Consistency Basics](./read-after-write-consistency-basics.md)\n- [Browser BFF Session Boundary Primer](./browser-bff-session-boundary-primer.md)\n- [Session Revocation Basics](./session-revocation-basics.md)\n- [Session Store Design at Scale](./session-store-design-at-scale.md)\n- [Load Balancer Drain and Affinity Primer](./load-balancer-drain-and-affinity-primer.md)\n- [Service Discovery / Health Routing](./service-discovery-health-routing-design.md)\n- [Global Traffic Failover Control Plane](./global-traffic-failover-control-plane-design.md)\n- [Signed Cookies / Server Sessions / JWT Tradeoffs](../security/signed-cookies-server-sessions-jwt-tradeoffs.md)\n- [Browser / BFF Token Boundary / Session Translation](../security/browser-bff-token-boundary-session-translation.md)\n- [Read-Your-Writes와 Session Pinning 전략](../database/read-your-writes-session-pinning.md)\n\n---\n\n## 핵심 개념\n\n`stateless`는 \"상태가 아예 없다\"는 뜻이 아니다.\n정확히는 **중요한 사용자 상태가 특정 앱 인스턴스 메모리에만 묶여 있지 않다**는 뜻이다.\n\n세션을 이해할 때 초보자가 먼저 구분해야 할 선택지는 보통 세 가지다.\n\n- sticky session: 세션을 앱 메모리에 두고, load balancer가 같은 사용자 요청을 같은 인스턴스로 붙인다\n- external session store: 세션 ID만 클라이언트에 두고 실제 상태는 Redis/DB 같은 공용 저장소에 둔다\n- token-based auth: access token 자체에 필요한 claim을 담아 app이 저장소 조회 없이 검증한다\n\n핵심 차이는 \"요청이 반드시 같은 앱 인스턴스로 가야 하는가\"다.\n이 제약이 없어질수록 app tier는 scale-out, drain, failover가 쉬워진다.\n\n여기서 말하는 `sticky session`은 app 인스턴스 affinity이고, read-after-write를 위해 DB 읽기를 잠깐 fresher path에 붙이는 `session stickiness`와는 다른 개념이다.\n이 차이는 [Read-After-Write Consistency Basics](./read-after-write-consistency-basics.md)에서 따로 정리한다.\n\n아주 단순하게 그리면 아래처럼 보인다.\n\n```text\n1) Sticky session\nClient -> Load Balancer -(session affinity)-> App A (session in memory)\n\n2) External session store\nClient -> Load Balancer -> Any App -> Session Store\n\n3) Token-based auth\nClient -> Load Balancer -> Any App -> token signature/expiry check\n                                  -> optional refresh/session backend\n```\n\n## 깊이 들어가기\n\n### 1. Sticky session은 왜 간단하지만 금방 제약이 생기나\n\nsticky session은 load balancer가 \"이 사용자는 계속 App A로 보낸다\"라고 정해 주는 방식이다.\n\n초기에는 간단하다.\n\n- 앱 메모리에 바로 세션을 둘 수 있다\n- 별도 session store가 없어도 된다\n- 구현 난이도가 낮다\n\n하지만 scale-out 관점에서는 제약이 빠르게 생긴다.\n\n- 특정 인스턴스에 사용자가 몰리면 load가 고르게 퍼지지 않는다\n- 배포 중 drain할 때 기존 세션을 어떻게 넘길지 고민해야 한다\n- 인스턴스가 죽으면 그 인스턴스 메모리의 세션도 같이 사라진다\n- auto scaling으로 새 인스턴스를 늘려도 기존 활성 사용자는 잘 옮겨 타지 않는다\n- AZ/region failover에서 affinity 정보와 세션 메모리를 같이 잃기 쉽다\n\n즉, sticky session은 **load balancer가 자유롭게 분산하지 못하게 만드는 구조적 제약**이다.\n이 제약이 health check, drain, keep-alive, affinity tail 관점에서 실제로 어떻게 드러나는지는 [Load Balancer Drain and Affinity Primer](./load-balancer-drain-and-affinity-primer.md)에서 따로 이어진다.\n\n### 2. External session store는 무엇을 바꾸나\n\nexternal session store 방식에서는 브라우저나 클라이언트가 보통 `session_id`만 들고 있고, 실제 세션 상태는 Redis나 DB 같은 공용 저장소에 둔다.\n\n흐름은 대략 이렇다.\n\n1. 사용자가 로그인한다\n2. app이 session store에 세션을 만든다\n3. 클라이언트는 session ID cookie나 header를 들고 다닌다\n4. 다음 요청은 어느 app 인스턴스로 가도 session store에서 상태를 읽을 수 있다\n\n이 구조가 주는 장점:\n\n- 어떤 app 인스턴스가 요청을 받아도 처리할 수 있다\n- 배포 중 인스턴스를 순차 교체하기 쉽다\n- 장애 난 인스턴스를 버리고 새 인스턴스를 띄우기 쉽다\n- load balancer가 session affinity 없이도 분산할 수 있다\n\n대신 state가 사라진 것은 아니다.\n**상태가 app 메모리에서 session store로 이동한 것**이다.\n\n그래서 새로 생기는 고민도 있다.\n\n- session store 자체의 가용성과 latency를 관리해야 한다\n- TTL, eviction, read-your-writes를 설계해야 한다\n- logout, revoke, device inventory를 어떤 key 모델로 관리할지 정해야 한다\n\n초보자 기준으로는 \"sticky session의 제약을 줄이는 가장 흔한 실무 해법\" 정도로 이해하면 충분하다.\n\n### 3. Token-based auth는 무엇이 더 stateless한가\n\n## 깊이 들어가기 (계속 2)\n\ntoken-based auth에서는 access token 안에 사용자 ID, 권한, 만료시각 같은 claim을 담고, app은 서명과 만료만 검증해 요청을 처리한다.\n\n이 방식이 매력적인 이유:\n\n- 매 요청마다 중앙 session store 조회가 없어도 된다\n- public API나 mobile API에서 scale-out이 자연스럽다\n- edge나 gateway에서도 검증을 나눠 하기 쉽다\n\n하지만 이것도 \"완전한 무상태\"라고 단순화하면 틀린다.\n\n- 강제 로그아웃\n- 권한 변경 직후 즉시 반영\n- refresh token rotation\n- 토큰 탈취 후 revoke\n\n이런 요구가 들어오면 결국 어딘가에는 상태가 다시 필요하다.\n\n그래서 실무에서는 보통 이렇게 섞는다.\n\n- 짧은 수명의 access token\n- 더 긴 수명의 refresh token\n- 필요 시 revocation list, token family store, session version store\n\n즉, token-based auth는 **read path를 더 stateless하게 만들지만, lifecycle과 revoke까지 모두 공짜로 해결해 주지는 않는다**.\nlogout, revoke propagation, short-lived token의 역할을 입문 난도로 따로 정리한 문서는 [Session Revocation Basics](./session-revocation-basics.md)다.\n\n### 4. 세 가지 방식을 한 번에 비교하면\n\n| 방식 | 어디에 상태가 있나 | 장점 | 단점 | 잘 맞는 경우 |\n|---|---|---|---|---|\n| Sticky session | 특정 app 인스턴스 메모리 | 가장 단순하다 | scale-out, drain, failover가 불편하다 | 작은 내부 도구, 임시 구조 |\n| External session store | 공용 session store | 어떤 app 인스턴스도 요청 처리 가능 | store 운영 복잡도가 생긴다 | 일반적인 웹앱, BFF |\n| Token-based auth | access token + 일부 backend state | API scale-out이 쉽다 | revoke, refresh, 권한 변경 반영이 더 까다롭다 | mobile/public API, edge 검증 |\n\n면접에서는 보통 \"sticky -> external store -> token\"이 진화 순서처럼 들리지만, 실전은 혼합형이 더 많다.\n\n- 브라우저는 cookie + server session/BFF를 쓸 수 있다\n- 모바일 API는 bearer token을 쓸 수 있다\n- refresh와 revoke는 별도 auth backend가 관리할 수 있다\n\n## 깊이 들어가기 (계속 3)\n\n브라우저 쪽 cookie session과 BFF translation path를 모바일/API bearer flow와 비교해서 먼저 잡고 싶다면\n[Browser BFF Session Boundary Primer](./browser-bff-session-boundary-primer.md)부터 이어서 보면 좋다.\n\n### 5. 왜 stateless app tier가 더 잘 스케일하나\n\nstateless app tier의 핵심 이점은 \"상태가 없어서\"가 아니라 **특정 인스턴스를 고집하지 않아도 된다**는 점이다.\n\n그래서 아래 운영 동작이 훨씬 깔끔해진다.\n\n- scale-out: 새 app 인스턴스를 추가하면 바로 요청을 보낼 수 있다\n- 배포: 기존 인스턴스를 drain하고 새 인스턴스로 순차 교체하기 쉽다\n- failover: 한 인스턴스가 죽어도 다른 인스턴스가 이어받기 쉽다\n- load balancing: hot instance를 줄이고 비교적 균등하게 분산하기 쉽다\n- multi-AZ 운영: 특정 노드 메모리에 묶인 상태가 적을수록 복구가 단순해진다\n\n반대로 app 메모리에 중요한 상태가 남아 있으면 app tier는 겉으로는 여러 대여도 실제로는 stateful workload처럼 운영해야 한다.\n\n### 6. 그렇다고 모든 것을 token으로 밀면 되나\n\n그렇지는 않다.\n질문은 \"세션을 없앨까?\"보다 보통 아래에 가깝다.\n\n- 브라우저/BFF 경계에서 server session이 더 단순한가\n- public API에서는 token 검증이 더 자연스러운가\n- revoke를 즉시 반영해야 하는 고위험 경로인가\n- read-your-writes가 중요한 최신성 경로인가\n\n예를 들면:\n\n- 사내 admin 웹: external session store가 단순한 경우가 많다\n- consumer mobile API: short-lived access token + refresh token이 자연스럽다\n- 민감한 권한 변경 경로: token만 믿지 않고 introspection이나 version check를 붙이기도 한다\n\n즉, 좋은 설계는 \"한 가지 방식만 고집\"하기보다 **경로별로 필요한 상태 일관성과 운영 단순성을 맞추는 것**에 가깝다.\n\n### 7. 초보자가 자주 하는 오해\n\n`JWT를 쓰면 완전히 stateless다`\n\n- 아니다. logout, revoke, refresh, 권한 변경은 여전히 상태를 요구한다\n\n`external session store를 쓰면 stateful 시스템이 아니다`\n\n- app tier는 stateless해질 수 있지만, session store 자체는 stateful tier다\n\n`sticky session은 무조건 나쁘다`\n\n- 아니다. 작은 시스템에서는 구현 비용이 낮아 실용적일 수 있다\n\n`stateless면 cache도 쓰면 안 된다`\n\n- 아니다. stateless app은 cache, DB, object storage 같은 외부 상태 저장소를 적극적으로 쓴다\n\n## 면접 답변 골격\n\n짧게 답하면 이렇게 정리할 수 있다.\n\n> sticky session은 세션을 특정 app 인스턴스에 묶어 load balancing, 배포, failover를 어렵게 만든다.\n> 그래서 보통은 세션을 external store로 빼거나, access token 기반으로 요청 처리 경로를 stateless하게 만든다.\n> 다만 token 기반이어도 revoke와 refresh까지 생각하면 완전한 무상태는 아니고, 중요한 점은 상태를 app 인스턴스에서 떼어내 app tier를 더 쉽게 scale-out할 수 있게 만드는 것이다.\n\n## 꼬리질문\n\n> Q: sticky session이 autoscaling에 왜 불리한가요?\n> 의도: session affinity가 load distribution과 drain을 어떻게 꼬이게 만드는지 확인\n> 핵심: 새 인스턴스를 늘려도 기존 활성 세션이 옮겨 가지 않아 균등 분산이 어렵다.\n\n> Q: external session store를 쓰면 완전히 stateless한가요?\n> 의도: app tier stateless와 system-wide stateless를 구분하는지 확인\n> 핵심: app tier는 stateless해지지만 session store는 여전히 stateful tier다.\n\n> Q: JWT를 쓰면 session store가 필요 없나요?\n> 의도: token verification과 lifecycle management를 구분하는지 확인\n> 핵심: 단순 검증은 store 없이도 가능하지만 revoke, refresh, 강제 로그아웃에는 추가 상태가 필요하다.\n\n> Q: 왜 브라우저와 모바일이 같은 방식을 쓰지 않을 수 있나요?\n> 의도: client boundary에 따라 인증 전달 방식이 달라지는 이유 확인\n> 핵심: 브라우저는 cookie/BFF가 자연스럽고, 모바일/API는 bearer token이 자연스러운 경우가 많다.\n\n## 한 줄 정리\n\n세션을 없애는 것이 아니라 **세션을 app 인스턴스에서 떼어내는 것**이 stateless scaling의 핵심이다.\n",
+  "aliases": [
+    "stateless sessions primer",
+    "what is stateless session",
+    "stateless session beginner",
+    "stateless 큰 그림",
+    "stateless 처음 배우는데",
+    "세션이 뭐예요",
+    "로그인 상태 어디 저장",
+    "왜 stateless를 써요",
+    "sticky session",
+    "sticky session 왜 문제",
+    "external session store",
+    "token-based auth"
+  ],
+  "expected_queries": [
+    "Stateless Sessions Primer 설계 핵심을 설명해줘",
+    "stateless sessions primer가 왜 필요한지 알려줘",
+    "Stateless Sessions Primer 실무 트레이드오프는 뭐야?",
+    "stateless sessions primer 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Stateless Sessions Primer`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
+    "`Stateless Sessions Primer`를 한 문장으로는 설명하지만 작은 예시나 반례로 확인하지 못한다",
+    "`Stateless Sessions Primer`와 인접 개념을 같은 말로 써서 처음 읽을 문서 선택이 흔들린다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [
+      "system-design/stateless-vs-stateful-basics",
+      "system-design/load-balancer-drain-and-affinity-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/stateless-sessions-primer.md",
+    "revision_history": []
+  }
+}

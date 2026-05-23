@@ -1,0 +1,48 @@
+{
+  "id": "operating-system/runtime-saturation-layer-router",
+  "title": "Runtime Saturation Layer Router",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "이 symptom_router는 runtime saturation을 CPU run queue, cgroup throttling, GC, lock contention, memory pressure, IO wait 계층으로 나누어 진단한다.",
+  "body_markdown": "# Runtime Saturation Layer Router\n\n## 이 문서가 가르는 질문\n\nRuntime saturation은 \"서버가 바쁘다\"가 아니라 **어느 계층에서 시간이 소비되거나 대기되는가**를 찾는 문제다. CPU usage 하나로는 부족하다. run queue, cgroup throttle, GC/safepoint, lock contention, pool queue, memory pressure, page fault, I/O wait, downstream timeout이 같은 latency spike 안에서 동시에 보일 수 있다.\n\n첫 질문은 셋이다.\n\n1. CPU를 쓰며 실행 중인가?\n2. 실행 가능한데 scheduler/quota 앞에서 기다리는가?\n3. 애플리케이션, JVM, 커널, dependency 중 어디에서 기다리는가?\n\n## 관찰 증거\n\n관찰 지표는 latency percentile, throughput, run queue/load average, CPU steal/throttle, context switch 추세, GC pause와 allocation rate, thread state, pool queue depth, lock wait, cgroup memory event, major page fault, disk/network wait, dependency timeout을 한 timeline에 묶는다.\n\n```bash\n# Linux host/container에서 첫 스냅샷. 배포 환경에 따라 일부 도구는 없을 수 있다.\nuptime\nvmstat 1\npidstat -u -w -p <pid> 1\niostat -xz 1\n\n# cgroup v2 예시. v1은 cpu.stat/memory.stat 경로와 필드가 다르다.\ncat /sys/fs/cgroup/cpu.max\ncat /sys/fs/cgroup/cpu.stat\ncat /sys/fs/cgroup/memory.current\ncat /sys/fs/cgroup/memory.events\n\n# JVM process가 있을 때\njcmd <pid> Thread.print\njcmd <pid> JFR.start name=runtime settings=profile filename=/tmp/runtime.jfr duration=60s\n```\n\nLinux PSI(`/proc/pressure/*`)가 켜진 kernel에서는 CPU, memory, I/O pressure를 추가로 본다. PSI가 없거나 container에서 제한적으로만 보일 수 있으므로 없는 환경을 이상으로 해석하지 않는다.\n\n## 1차 분기 규칙\n\n| 관찰 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| CPU utilization 높고 run queue도 높음 | runnable CPU saturation | flame graph, GC CPU, retry storm, busy loop |\n| CPU utilization 낮지만 load average 높음 | I/O wait, uninterruptible sleep, blocked storage/network | `iostat`, `pidstat -d`, kernel stack, dependency wait |\n| latency spike와 `nr_throttled`/`throttled_usec` delta가 겹침 | cgroup CPU quota 또는 limit | quota/period, runnable thread 수, pod/container limit |\n| stop-the-world 또는 safepoint 구간과 spike가 겹침 | JVM GC/safepoint | GC log, JFR safepoint, allocation rate |\n| `BLOCKED`, long park, pool wait가 같은 stack에 반복 | lock contention 또는 bounded pool exhaustion | thread dump 여러 장, lock owner, pool active/waiting |\n| heap은 낮은데 OOMKilled 또는 RSS limit 접근 | native/cgroup memory pressure | direct buffer, thread stack, mmap, metaspace, memory.events |\n| queue depth와 timeout만 증가 | downstream 지연 또는 backpressure 부재 | DB/HTTP client p95, pool acquire time, retry/error rate |\n| major fault, swap, reclaim 지표 증가 | memory pressure | RSS, page fault delta, swap, file cache reclaim |\n\n## 계층별 판별 포인트\n\n### CPU 실행 계층\n\nCPU가 높고 처리량이 정체되면 \"일이 많다\"와 \"쓸데없는 일이 많다\"를 나눈다. 정상 traffic 증가, expensive endpoint, serialization/compression, crypto, regex, GC worker CPU, retry storm, busy loop가 모두 CPU를 쓴다. JFR/flame graph에서 hot method가 업무 로직인지 runtime/GC인지 먼저 본다.\n\nCPU percent는 quota 기준으로 해석해야 한다. 1 core quota container에서 100%는 host 32 core의 3%처럼 보일 수 있다. Kubernetes/node dashboard와 process 내부 관찰이 다르게 보이면 cgroup 기준 값을 우선 확인한다.\n\n### Scheduler와 cgroup 계층\n\nRunnable thread가 많은데 quota가 작으면 실제 CPU가 남아 보여도 container는 throttle된다. cgroup v2에서는 `cpu.max`와 `cpu.stat` delta를 본다. v1은 경로와 필드명이 다르므로 런북의 환경별 경로를 확인한다.\n\n`throttled_usec`는 누적 시간이다. 값이 늘었다고 곧바로 \"요청 latency의 전부가 throttle\"이라고 말하지 않는다. 같은 창에서 runnable queue, request p99, GC pause, lock wait와 겹치는지 확인한다.\n\n### JVM pause와 lock 계층\n\nGC/safepoint는 application thread가 멈추는 구간을 만들 수 있다. 하지만 GC log가 보인다는 사실만으로 원인을 확정하지 않는다. pause timestamp가 latency spike와 겹치고, duration이 spike 크기를 설명하며, allocation/heap 지표가 같은 방향이어야 한다.\n\nLock contention은 CPU가 낮아 보일 수 있다. thread dump 한 장의 `BLOCKED`만으로는 부족하고, 짧은 간격의 여러 dump에서 같은 monitor, semaphore, connection pool, queue가 반복되는지 본다. Virtual thread를 쓰는 Java 런타임에서는 carrier pinning, synchronized block, native call, blocking I/O 지원 상태 같은 런타임 버전 caveat도 함께 확인한다.\n\n### Memory와 I/O 계층\n\nHeap이 낮아도 RSS가 limit에 닿으면 container는 OOMKilled될 수 있다. direct buffer, thread stack, metaspace, mmap, native library, file cache가 heap 바깥에 있다. major page fault나 reclaim이 늘면 CPU가 낮은데 latency가 높아지는 형태가 가능하다.\n\nLinux의 load average는 runnable task뿐 아니라 uninterruptible sleep도 포함한다. 그래서 load가 높다는 말은 \"CPU가 부족하다\"가 아니라 \"실행 또는 깨지지 않는 대기가 많다\"에 가깝다. I/O wait 역시 평균 CPU breakdown의 한 항목이므로, storage queue, network wait, application pool metric과 같이 해석한다.\n\n## 운영 진단 순서\n\n1. 장애 창을 정한다. 예: `10:31:00-10:36:00`, 배포 직후 5분, batch 시작 직후 2분.\n2. 같은 창에서 request rate, throughput, p95/p99 latency, error/retry를 고정한다.\n3. OS/cgroup: CPU quota, throttle delta, load/run queue, context switch, PSI, page fault, disk/network wait를 본다.\n4. JVM/runtime: GC pause, safepoint, allocation rate, thread state, lock event를 본다.\n5. Application: thread/connection pool active-waiting, queue depth/age, dependency timeout, retry attempt rate를 본다.\n6. 가장 큰 설명력을 가진 layer 하나를 먼저 고치고, 나머지 신호가 따라 줄었는지 검증한다.\n\n## 조치 선택 규칙\n\n| 원인 layer | 조치 예 | 검증 지표 |\n|---|---|---|\n| cgroup CPU throttle | quota/limit 조정, concurrency cap, CPU-heavy path 최적화 | throttle delta, runnable queue, p99 |\n| GC/allocation | allocation hot path 감소, heap/collector 검토 | allocation rate, pause p99, after-GC heap |\n| lock/pool wait | critical section 축소, pool timeout/size 재검토, remote call 분리 | blocked/park time, pool wait, throughput |\n| downstream wait | timeout budget, circuit breaker, bulkhead, load shedding | dependency p95, timeout, queue age |\n| memory pressure | native memory 분석, direct buffer cap, thread 수, mmap/page cache 확인 | RSS, memory.events, major fault |\n| I/O saturation | queue depth 제한, batch throttle, storage/network 병목 개선 | iowait, disk await, retransmit, app wait |\n\n## 피해야 할 단정\n\n- CPU usage만 보고 thread pool을 늘리거나 줄이지 않는다.\n- GC pause만 보고 memory leak으로 단정하지 않는다.\n- OOMKilled를 Java heap 부족으로만 해석하지 않는다.\n- load average를 CPU 포화와 같은 말로 쓰지 않는다.\n- cgroup throttle이 보였다는 이유만으로 모든 latency를 quota 탓으로 돌리지 않는다.\n- thread dump 한 장에서 보인 상태를 전체 장애 상태로 일반화하지 않는다.\n\n## 버전/런타임 caveat\n\n- 이 문서는 주로 Linux host/container를 기준으로 한다. macOS, BSD, Windows, managed PaaS에서는 명령과 지표 이름이 다르다.\n- cgroup v1과 v2는 파일 경로와 필드가 다르다. Kubernetes runtime, containerd/Docker 설정, JVM container awareness 옵션에 따라 JVM이 인식하는 CPU/memory도 달라질 수 있다.\n- JDK 버전에 따라 default GC, JFR event, virtual thread 동작, safepoint 로그 옵션이 다르다. 런타임 claim은 반드시 실제 `java -version`, JVM flags, container limit과 함께 말한다.\n- Virtualization 환경에서는 steal time, noisy neighbor, host overcommit이 관찰에 섞일 수 있다. 애플리케이션 내부 지표만으로 host scheduling 문제를 확정하지 않는다.\n- Load average, iowait, thread state는 모두 간접 신호다. 원인 확정에는 timestamp correlation과 layer별 counter delta가 필요하다.\n\n## 검증 질문\n\n- 같은 spike window에서 p99, throttle delta, GC pause, lock wait, dependency timeout 중 무엇이 가장 강하게 겹치는가?\n- CPU percent를 host 기준으로 봤는가, cgroup quota 기준으로 봤는가?\n- thread dump를 여러 장 떠서 같은 대기 stack이 반복되는지 확인했는가?\n- heap graph만 보고 OOM을 판단하지 않고 RSS/cgroup memory event를 봤는가?\n- 조치 후 평균 latency뿐 아니라 p99, queue age, retry rate, error rate가 같이 줄었는가?\n- 한 layer를 고친 뒤 다른 layer가 새 병목으로 드러났는가?\n\n## 면접 답변 뼈대\n\n\"CPU가 낮은데 느립니다\"라고 하면 CPU 병목을 제외하지 않습니다. 먼저 runtime saturation을 CPU 실행, scheduler/cgroup 대기, JVM GC/safepoint, lock/pool wait, memory pressure, I/O/downstream wait로 나눕니다. 같은 시간 창에서 p99 latency와 throttle, GC pause, thread state, queue depth, dependency timeout을 맞춰 보고, 가장 설명력이 큰 layer를 하나씩 검증합니다. load average나 CPU usage 같은 평균값 하나로 결론내리지 않는 것이 핵심입니다.\n\n## 관련 playbook\n\n- [CPU Memory IO First Triage Command Drill](./cpu-memory-io-first-triage-command-drill.md)\n- [Load Average Triage CPU Saturation Cgroup Throttling IO Wait](./load-average-triage-cpu-saturation-cgroup-throttling-io-wait.md)\n- [CPU Throttling GC Lock Contention Router](./cpu-throttling-gc-lock-contention-router.md)\n- [JFR Thread Dump GC First Aid Playbook](../language/java/jfr-thread-dump-gc-first-aid-playbook.md)\n- [Cgroup Memory Limit OOM Router](./cgroup-memory-limit-oom-router.md)\n",
+  "aliases": [
+    "runtime saturation layer router",
+    "CPU GC lock memory saturation triage",
+    "런타임 포화 분기",
+    "서버 자원 병목 계층 라우터"
+  ],
+  "expected_queries": [
+    "CPU가 낮은데 서버가 느릴 때 OS와 JVM에서 무엇을 봐?",
+    "load average가 높은데 CPU 포화인지 IO wait인지 어떻게 구분해?",
+    "GC lock cgroup throttling 중 무엇이 latency 원인인지 어떻게 좁혀?"
+  ],
+  "symptoms": [
+    "CPU 사용률은 낮은데 request latency가 높습니다",
+    "load average가 높고 thread dump에는 WAITING이 많습니다",
+    "container에서는 OOMKilled가 나지만 heap은 충분해 보입니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/cpu-memory-io-first-triage-command-drill"
+    ],
+    "next_docs": [
+      "operating-system/load-average-triage-cpu-saturation-cgroup-throttling-io-wait",
+      "operating-system/cpu-throttling-gc-lock-contention-router",
+      "language/jfr-thread-dump-gc-first-aid-playbook",
+      "operating-system/cgroup-memory-limit-oom-router"
+    ],
+    "confusable_with": [
+      "operating-system/cpu-throttling-gc-lock-contention-router",
+      "language/jfr-thread-dump-gc-first-aid-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/runtime-saturation-layer-router.md",
+    "revision_history": []
+  }
+}

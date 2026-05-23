@@ -1,0 +1,48 @@
+{
+  "id": "software-engineering/observability-evidence-hierarchy-router",
+  "title": "Observability Evidence Hierarchy Router",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 logs, metrics, traces, profiles, dumps를 장애 증거 계층으로 묶어 어떤 질문에 어떤 증거를 먼저 볼지 안내한다.",
+  "body_markdown": "# Observability Evidence Hierarchy Router\n\n## 관찰 증거\n\n증거는 서로 대체재가 아니다. Metrics는 \"얼마나 넓게 나쁜가\", trace는 \"어떤 경로가 느린가\", log는 \"어떤 사건이 일어났나\", profile/JFR/thread dump는 \"runtime이 어디서 시간을 쓰나\"에 강하다.\n\n- 사용자 신고와 SLO burn이 맞으면 영향도 판단을 metric에서 시작한다.\n- 특정 endpoint p99만 나쁘면 trace와 access log correlation으로 request path를 좁힌다.\n- log에 예외가 없어도 queue wait, saturation, GC pause는 metric/profile에서 먼저 보일 수 있다.\n- trace sample이 없을 때는 exemplar, tail sampling, request id 기반 log join으로 증거 공백을 줄인다.\n\n## 증거 계층 mental model\n\n장애 대응에서 \"가장 자세한 증거\"가 항상 먼저가 아니다. 먼저 넓은 증거로 영향 범위를 고정하고, 그다음 좁은 증거로 원인을 좁힌다.\n\n| 계층 | 주 질문 | 강한 증거 | 약한 점 |\n|---|---|---|---|\n| 1. 영향도 | 사용자가 실제로 아픈가 | SLO burn, RED, synthetic check | 원인 설명은 약함 |\n| 2. 범위 | 어느 route/tenant/region인가 | endpoint/tenant/region별 metric, access log | code path 내부는 흐림 |\n| 3. 경로 | 어느 hop/span이 느린가 | distributed trace, exemplar | sampling bias 가능 |\n| 4. 사건 | 어떤 상태 전이가 있었나 | structured log, audit/event log | 안 찍힌 사건은 보이지 않음 |\n| 5. runtime | CPU/GC/lock/thread가 막혔나 | profile, JFR, thread dump, OS counter | business invariant는 직접 설명 못 함 |\n| 6. 변경 이력 | 배포/설정/데이터 변경과 겹치나 | deploy log, config audit, migration timeline | 상관관계와 원인을 혼동하기 쉬움 |\n\n## 1차 분기\n\n| 질문 | 먼저 볼 증거 | 보강 증거 |\n|---|---|---|\n| 전체 영향도는? | metric | SLO burn, RED/USE |\n| 특정 요청 경로는? | trace/span | access log correlation |\n| 예외나 상태 전이는? | structured log | event id, mutation id |\n| CPU/GC/lock 의심은? | profile/JFR/thread dump | OS counter |\n| 배포 직후만 나쁜가? | deploy/config audit | canary cohort metric, error class |\n| 특정 tenant만 나쁜가? | tenant/region label metric | access log, sampled trace, data skew check |\n\n## 증거 충돌 판정표\n\n| 충돌 상황 | 성급한 결론 | 더 안전한 판정 |\n|---|---|---|\n| metric은 나쁜데 trace sample은 정상 | 장애가 아니다 | sampling 밖 tail, queue wait, dropped span 가능성을 확인 |\n| error log는 없는데 5xx가 증가 | app 문제가 아니다 | gateway/LB/downstream timeout, logging gap, async failure 확인 |\n| CPU는 낮은데 latency가 증가 | resource 문제는 아니다 | connection pool, lock, disk/network queue, downstream wait 확인 |\n| thread dump는 blocked가 많지만 RED는 정상 | 즉시 장애다 | 사용자 영향, queue depth, blocked thread 역할을 같이 본다 |\n| 배포 직후 metric이 흔들림 | 배포가 원인이다 | cohort, config/data migration, traffic shift timeline을 분리 |\n\n## 다음 확인\n\nTrace sample이 없다고 장애가 없는 것은 아니다. Head sampling은 rare tail을 놓칠 수 있고, log는 code path 밖의 queue wait를 못 볼 수 있다. 증거가 충돌하면 시간축과 request id를 먼저 맞춘다.\n\nRequest id가 없으면 join key를 새로 만들기보다 가능한 축부터 맞춘다. 같은 incident window, 같은 route, 같은 tenant, 같은 upstream/downstream pair, 같은 deployment version 순서로 좁히면 \"비슷한 시간에 같이 나빠진 것\"과 \"같은 요청에서 이어진 것\"을 분리할 수 있다.\n\n## 운영 검증\n\n운영 검증은 같은 incident window 안에서 증거를 정렬하는 작업이다. 배포 시각, alert firing 시각, 첫 사용자 영향, mitigation 시각을 기준점으로 두고 metric, trace, log, profile을 겹쳐 본다. 한 증거가 원인을 말해주는 것이 아니라 여러 증거가 같은 방향을 가리킬 때 가설의 신뢰도가 올라간다.\n\n검증 순서는 보통 `영향도 고정 -> 범위 축소 -> 경로/사건 연결 -> runtime 또는 변경 이력으로 가설 확인 -> 완화 후 같은 metric 회복 확인`이다. 완화 후에만 좋아지는 metric을 미리 정해두지 않으면 우연한 회복을 fix로 오해하기 쉽다.\n\n## 보장 범위와 한계\n\nMetrics는 전체 영향과 추세를 보장하지만 개별 요청의 원인은 약하다. Trace는 경로와 span timing을 보여주지만 sampling 밖 요청을 대표하지 못할 수 있다. Log는 사건과 상태 전이에 강하지만 빠진 log는 증거가 아니다. Profile/JFR/thread dump는 runtime 원인을 좁히지만 business invariant 위반을 직접 설명하지 못한다.\n\n따라서 \"없다\"는 증거로 쓰려면 관측 경로의 누락 가능성을 먼저 말해야 한다. 예를 들어 error log가 없다는 말은 \"해당 code path에서 structured error log가 반드시 찍힌다\"는 전제가 있을 때만 의미가 있다. Trace에 느린 span이 없다는 말도 sampling 정책, span drop, async boundary가 확인되어야 강한 증거가 된다.\n\n## 실패 반례\n\n- \"에러 로그가 없으니 장애가 아니다\"라고 판단했지만 thread pool queue가 꽉 차서 요청이 timeout된다.\n- head sampling trace 몇 건이 정상이라 tail latency 장애를 부정한다.\n- CPU profile만 보고 hot method를 최적화했지만 실제 원인은 DB lock wait다.\n- metric label cardinality가 너무 높아 장애 순간 중요한 series가 drop된다.\n- 배포 로그만 보고 rollback했지만 실제 원인은 같은 시간대의 config 전파 오류라 rollback 후에도 장애가 지속된다.\n\n## 면접 답변 축\n\n면접에서는 관측 도구를 나열하지 말고 질문별로 고른다고 답한다. 영향도는 metric, 요청 경로는 trace, 사건의 문맥은 structured log, runtime 병목은 profile/JFR/thread dump를 본다. 그리고 증거가 충돌하면 시간축, request id, 배포/설정 변경 이력을 먼저 맞춘다고 설명한다.\n\n## 관련 playbook\n\nSampling 선택은 `tracing-sampling-head-tail-exemplar-chooser`, JVM first aid는 `jfr-thread-dump-gc-first-aid-playbook`, access log 연결은 `access-log-correlation-recipes-tomcat-jetty-undertow`로 이어진다.\n",
+  "aliases": [
+    "observability evidence hierarchy",
+    "logs metrics traces profiles dumps router",
+    "관측 증거 우선순위",
+    "운영 디버깅 증거 계층"
+  ],
+  "expected_queries": [
+    "장애 때 로그 메트릭 트레이스 프로파일 중 뭘 먼저 봐야 해?",
+    "로그에는 없는데 사용자는 장애라고 하면 어떤 증거를 봐야 해?",
+    "thread dump와 trace와 metric을 어떻게 연결해서 판단해?"
+  ],
+  "symptoms": [
+    "로그 한 줄만 보고 원인을 단정합니다",
+    "metric은 나쁜데 trace sample에는 재현이 없습니다",
+    "thread dump나 JFR을 봐야 하는 시점을 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/red-use-metrics-observability-chooser"
+    ],
+    "next_docs": [
+      "system-design/tracing-sampling-head-tail-exemplar-chooser",
+      "language/jfr-thread-dump-gc-first-aid-playbook",
+      "network/access-log-correlation-recipes-tomcat-jetty-undertow",
+      "software-engineering/runbook-playbook-automation-boundaries"
+    ],
+    "confusable_with": [
+      "system-design/observability-logs-metrics-traces-interview-chooser",
+      "system-design/tracing-sampling-head-tail-exemplar-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/observability-evidence-hierarchy-router.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "database/cdc-schema-evolution-compatibility-playbook",
+  "title": "CDC Schema Evolution, Event Compatibility, and Expand-Contract Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 CDC Schema Evolution, Event Compatibility, and Expand-Contract Playbook으로,",
+  "body_markdown": "# CDC Schema Evolution, Event Compatibility, and Expand-Contract Playbook\n\n> 한 줄 요약: CDC schema evolution의 핵심은 컬럼을 추가하는 DDL이 아니라, old producer·new connector·old consumer가 한동안 동시에 살아도 이벤트 계약이 깨지지 않게 만드는 expand-contract 절차다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [CDC, Debezium, Outbox, Binlog](./cdc-debezium-outbox-binlog.md)\n- [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](./cdc-gap-repair-reconciliation-playbook.md)\n- [Destructive Schema Cleanup, Column Retirement, and Contract-Phase Safety](./destructive-schema-cleanup-column-retirement.md)\n- [온라인 스키마 변경 전략](./online-schema-change-strategies.md)\n- [Generated Columns, Functional Indexes, and Query-Safe Migration](./generated-columns-functional-index-migration.md)\n- [Schema Migration, Partitioning, CDC, CQRS](./schema-migration-partitioning-cdc-cqrs.md)\n- [Zero-Downtime Schema Migration Platform 설계](../system-design/zero-downtime-schema-migration-platform-design.md)\n\nretrieval-anchor-keywords: cdc schema evolution, event compatibility, expand contract migration, backward compatible event, forward compatible consumer, versioned payload, debezium schema change, contract-safe rollout\n\n## 핵심 개념\n\nCDC를 쓰는 순간 DB 스키마 변경은 로컬 DDL이 아니라 이벤트 계약 변경이 된다.\n\n문제는 보통 다음처럼 생긴다.\n\n- producer는 새 컬럼을 쓰기 시작했다\n- connector는 새 schema를 내보낸다\n- 일부 consumer는 아직 옛 payload를 기대한다\n\n이때 \"DDL은 성공했다\"와 \"시스템은 안전하다\"는 전혀 다른 말이다.  \nCDC schema evolution의 본질은 **expand-contract를 데이터 계약 관점에서 운영하는 것**이다.\n\n핵심 질문:\n\n- old consumer가 new event를 받아도 깨지지 않는가\n- new consumer가 old event를 받아도 동작하는가\n- replay 시 과거 schema와 현재 code가 충돌하지 않는가\n- cutover 중 어떤 버전을 source of truth로 볼 것인가\n\n## 역할별로 먼저 볼 것\n\n| 역할 | 먼저 확인할 질문 | 산출물 |\n|---|---|---|\n| API/도메인 개발자 | producer가 old+new를 함께 쓸 수 있는가 | dual-write 또는 adapter 계획 |\n| consumer owner | 새 필드가 없거나 unknown enum이 와도 처리되는가 | optional/default/unknown 처리 테스트 |\n| 데이터/플랫폼 담당 | connector와 registry가 어느 schema를 내보내는가 | schema compatibility matrix |\n| 운영 담당 | DLQ/replay가 과거 이벤트를 다시 처리할 수 있는가 | replay window와 rollback 절차 |\n\n이 문서는 \"DDL을 어떻게 실행하나\"보다 **schema change가 event contract에 어떤 순서로 전파되는가**를 보는 문서다.\n\n## 깊이 들어가기\n\n### 1. schema change는 DB change와 event change가 동시에 일어난다\n\n일반적인 DB 마이그레이션은 다음만 보면 될 수 있다.\n\n- 컬럼 추가\n- nullable 여부\n- backfill\n- cutover\n\n하지만 CDC가 붙으면 추가로 봐야 한다.\n\n- connector가 schema metadata를 어떻게 표현하는가\n- sink의 serializer/registry가 바뀌는가\n- consumer가 새로운 필드를 optional로 처리하는가\n- replay 중 과거 이벤트를 현재 consumer가 읽을 수 있는가\n\n즉 CDC 환경에서는 DDL이 곧 **계약 변경 이벤트**다.\n\n### 2. expand-contract가 기본 전략이다\n\n안전한 순서는 대체로 이렇다.\n\n1. DB에 새 컬럼/새 표현을 추가한다\n2. producer는 old+new를 함께 쓸 수 있게 한다\n3. consumer는 new field를 optional하게 이해하도록 먼저 배포한다\n4. backfill/catch-up을 수행한다\n5. 읽기/처리를 new field 기준으로 전환한다\n6. old field 제거는 가장 나중에 한다\n\n이 순서를 거꾸로 하면, connector나 consumer 한 군데라도 늦게 배포될 때 즉시 호환성 문제가 난다.\n그리고 old field를 실제로 제거하는 contract phase는 별도의 retirement 증거와 cleanup 절차가 필요하다.\n\n### 3. backward/forward compatibility를 따로 봐야 한다\n\n실무에서 자주 헷갈리는 점:\n\n- backward compatible\n  - new consumer가 old event를 읽을 수 있는가\n- forward compatible\n  - old consumer가 new event를 받아도 무너지지 않는가\n\nCDC replay와 staged rollout이 있는 시스템은 둘 다 중요하다.\n\n예를 들어 컬럼 추가는 보통 비교적 안전하지만:\n\n- 필수 필드로 바꾸기\n- enum 값 추가\n- 의미 변경된 rename\n\n은 forward compatibility를 쉽게 깨뜨린다.\n\n### 4. rename은 추가/복사/전환/제거로 봐야 한다\n\n컬럼 rename이나 payload field rename을 한 번에 처리하면 위험하다.\n\n더 안전한 흐름:\n\n- 새 이름의 필드 추가\n- old -> new 복사 또는 dual publish\n- consumer를 새 필드 우선 읽기로 전환\n- 충분한 검증 후 old 필드 제거\n\n즉 rename은 명령 하나가 아니라, 사실상 **새 필드 도입 후 old 필드 퇴역** 절차다.\n\n### 5. replay 가능성이 있으면 schema registry만으로 끝나지 않는다\n\nAvro/Protobuf/schema registry가 있어도 끝이 아니다.\n\n여전히 필요한 것:\n\n- consumer code의 optional/default handling\n- old event version을 읽는 테스트\n- repair/replay 시 어떤 decoder를 쓸지\n- DLQ에 쌓인 과거 메시지 재처리 전략\n\nregistry는 선언이고, 실제 안전성은 consumer behavior에서 완성된다.\n\n또한 connector가 내보내는 event shape 자체도 봐야 한다. Debezium 계열에서는 row payload만이 아니라 `before`/`after`, operation code, schema metadata, delete tombstone, snapshot event 여부가 consumer 계약이 된다. 컬럼 하나 추가는 안전해 보여도 consumer가 unknown field를 거부하거나 delete tombstone을 일반 update처럼 처리하면 replay와 DLQ 재처리에서 깨진다.\n\n따라서 compatibility matrix는 \"DB column old/new\"만이 아니라 다음 조합을 포함해야 한다.\n\n| 축 | 확인할 것 |\n|---|---|\n| old producer -> new consumer | 새 consumer가 old field 없음/default를 처리하는가 |\n| new producer -> old consumer | old consumer가 unknown field/enum을 무시하거나 안전하게 degrade하는가 |\n| connector snapshot/replay | snapshot, update, delete, tombstone shape를 모두 읽는가 |\n| DLQ replay | 과거 schema version을 현재 decoder/upcaster가 처리하는가 |\n| contract cleanup | old field 제거 전에 replay window와 downstream 사용량이 닫혔는가 |\n\n### 6. backfill과 CDC를 함께 쓸 때는 dual meaning 기간을 최소화해야 한다\n\n새 필드를 backfill하는 동안 old/new 값이 함께 존재할 수 있다.\n\n이때 위험:\n\n- 일부 row는 old만 채워짐\n- 일부 row는 new만 채워짐\n- 일부 consumer는 둘 중 하나만 읽음\n\n그래서 전환 기간에는 보통 다음 중 하나를 정한다.\n\n- read path는 old 우선, new는 shadow verify만 함\n- write path는 old+new 동시 기록\n- verification 완료 후 read path를 new로 스위치\n\n핵심은 \"두 필드가 섞여 있는 기간\"을 명시적으로 운영하는 것이다.\n\n## wrong-bucket 신호\n\n아래 질문은 이 문서가 아니라 다른 버킷으로 보내는 편이 정확하다.\n\n| 질문 | 더 맞는 문서/버킷 | 이유 |\n|---|---|---|\n| \"DDL lock을 줄이는 방법이 뭐야?\" | online schema change | event compatibility보다 DDL 실행 방식이 핵심이다 |\n| \"이 컬럼을 이제 삭제해도 되나?\" | destructive schema cleanup | contract phase와 retirement 증거가 핵심이다 |\n| \"CDC gap을 어떻게 메우나?\" | CDC gap repair/reconciliation | schema evolution보다 누락 이벤트 복구가 핵심이다 |\n| \"outbox 자체를 왜 쓰나?\" | CDC/Debezium/Outbox primer | 패턴 선택 질문이다 |\n\n특히 `rename column`을 단순 DDL 작업으로만 라우팅하면 위험하다. CDC 환경의 rename은 `add -> dual publish/copy -> consumer switch -> remove`로 나누어 검증해야 한다.\n\n## validation checklist\n\n배포 전에는 최소한 아래를 확인한다.\n\n1. old consumer가 new event를 받아도 실패하지 않는다.\n2. new consumer가 old event와 DLQ replay event를 읽을 수 있다.\n3. 새 필드는 처음부터 required로 강제하지 않고 optional/default 경로가 있다.\n4. enum 추가는 unknown value 정책이 정해져 있다.\n5. schema registry 통과만으로 완료 처리하지 않고 consumer behavior test를 통과시킨다.\n6. old field 제거는 replay window, DLQ 처리, downstream 사용량이 끝났다는 증거가 있을 때만 한다.\n7. Debezium/connector의 snapshot, update, delete, tombstone event shape를 compatibility test에 포함한다.\n\n## 실전 시나리오\n\n### 시나리오 1. outbox payload에 새 필드 추가\n\n`order_created` 이벤트에 `tenant_id`를 추가하고 싶다.\n\n안전한 방식:\n\n- consumer가 `tenant_id` 없을 때도 동작하도록 먼저 수정\n- producer가 새 필드 포함 시작\n- 이후 downstream에서 새 필드를 활용\n\n### 시나리오 2. status enum 값 추가\n\nconsumer가 `READY|DONE`만 알고 있는데 `RETRYING`이 추가되면 old consumer가 깨질 수 있다.\n\n대응:\n\n- unknown enum 처리 기본값 제공\n- fail-closed가 맞는지, fail-open이 맞는지 정책화\n- replay 테스트로 과거/미래 값 동작 확인\n\n### 시나리오 3. old field 제거 후 replay 실패\n\n현재 코드는 새 필드만 읽는데, 장애 복구 중 과거 DLQ를 replay하니 old schema 메시지가 들어온다.\n\n이 경우는:\n\n- decoder 호환성 유지\n- replay window 동안 old version 지원\n- old event adapter layer\n\n가 필요하다.\n\n## 코드로 보기\n\n```java\nrecord OrderCreatedEventV2(\n    long orderId,\n    String status,\n    Long tenantId\n) {}\n```\n\n```java\nString tenantScope(OrderCreatedEnvelope event) {\n    if (event.tenantId() != null) {\n        return \"tenant:\" + event.tenantId();\n    }\n    return \"tenant:unknown\";\n}\n```\n\n```sql\nALTER TABLE outbox_event\n  ADD COLUMN tenant_id BIGINT NULL;\n```\n\n핵심은 코드 조각보다, old/new schema가 동시에 흐르는 기간에도 consumer가 무너지지 않도록 optional handling과 rollout order를 맞추는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| one-shot breaking change | 빨라 보인다 | consumer 장애와 replay 실패 위험이 크다 | 거의 피해야 한다 |\n| expand-contract | staged rollout이 안전하다 | 전환 기간이 길어진다 | 대부분의 CDC schema 변화 |\n| dual publish | 검증이 쉽다 | write path와 consumer 로직이 복잡하다 | rename/semantic migration |\n| adapter layer 유지 | replay 안전성이 높다 | 레거시 처리 비용이 남는다 | 긴 replay window가 필요한 시스템 |\n\n## 꼬리질문\n\n> Q: CDC 환경에서 컬럼 추가가 왜 이벤트 계약 변경이 되나요?\n> 의도: 로컬 DDL과 downstream 계약을 연결하는지 확인\n> 핵심: connector와 consumer가 그 변경을 외부 이벤트 형태로 보게 되기 때문이다\n\n> Q: backward compatibility와 forward compatibility 중 무엇이 더 중요하나요?\n> 의도: staged rollout과 replay 문맥을 함께 보는지 확인\n> 핵심: 둘 다 중요하고, replay와 점진 배포가 있으면 어느 한쪽만 맞아도 부족하다\n\n> Q: rename을 왜 add/switch/remove 절차로 봐야 하나요?\n> 의도: breaking change를 피하는 expand-contract 감각 확인\n> 핵심: old/new consumer가 함께 살아 있는 기간을 안전하게 통과해야 하기 때문이다\n\n## 한 줄 정리\n\nCDC schema evolution의 정답은 DDL 성공이 아니라, old/new producer·connector·consumer가 함께 살아 있는 기간을 expand-contract로 통과하며 replay 호환성까지 보장하는 것이다.\n",
+  "aliases": [
+    "cdc schema evolution",
+    "event compatibility",
+    "expand contract migration",
+    "backward compatible event",
+    "forward compatible consumer",
+    "versioned payload",
+    "debezium schema change",
+    "contract-safe rollout",
+    "CDC schema compatibility",
+    "expand contract CDC"
+  ],
+  "expected_queries": [
+    "CDC schema evolution에서 DDL 성공보다 old producer new connector old consumer compatibility가 중요한 이유가 뭐야?",
+    "outbox payload에 새 field를 추가할 때 expand-contract 순서와 optional consumer 배포 순서를 알려줘",
+    "backward compatibility와 forward compatibility를 CDC replay와 staged rollout 관점에서 어떻게 구분해?",
+    "CDC event field rename은 rename 한 번이 아니라 add dual publish switch remove 절차로 봐야 하는 이유가 뭐야?",
+    "schema registry가 있어도 old event replay와 consumer default handling 테스트가 필요한 이유를 설명해줘",
+    "Debezium CDC schema 변경에서 before/after, tombstone, enum unknown value까지 consumer compatibility matrix에 넣어야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "DB DDL은 성공했지만 old producer, new connector, old consumer가 동시에 살아 있는 기간의 event compatibility를 검증하지 않는다",
+    "field rename이나 enum 추가를 한 번에 처리해 replay, DLQ 재처리, old consumer forward compatibility가 깨진다",
+    "schema registry 선언만 믿고 consumer optional/default handling과 old event replay 테스트를 빠뜨린다",
+    "Debezium delete/tombstone, before/after payload, unknown enum 같은 connector-specific event shape를 consumer 테스트에서 빠뜨린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/cdc-debezium-outbox-binlog",
+      "database/schema-migration-partitioning-cdc-cqrs",
+      "database/online-schema-change-strategies"
+    ],
+    "next_docs": [
+      "database/destructive-schema-cleanup-column-retirement",
+      "database/generated-columns-functional-index-migration",
+      "system-design/zero-downtime-schema-migration-platform-design"
+    ],
+    "confusable_with": [
+      "database/destructive-schema-cleanup-column-retirement",
+      "database/online-schema-change-strategies",
+      "database/generated-columns-functional-index-migration",
+      "design-pattern/event-upcaster-compatibility-patterns",
+      "database/large-scale-data-migration-deep-dive"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/cdc-schema-evolution-compatibility-playbook.md",
+    "revision_history": []
+  }
+}

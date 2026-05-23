@@ -1,0 +1,60 @@
+{
+  "id": "language/volatile-long-double-atomicity-memory-visibility",
+  "title": "volatile long/double Atomicity and Memory Visibility",
+  "category": "language",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# `volatile` `long`/`double` Atomicity and Memory Visibility\n\n> 한 줄 요약: non-`volatile` `long`/`double`의 원자성은 역사적으로 구현 의존이었지만, 현재 JMM에서는 `volatile long`/`volatile double`의 읽기와 쓰기가 항상 atomic이고, 진짜 문제는 atomicity와 visibility를 섞어 생각하는 데 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n> - [VarHandle, Unsafe, Atomics](./varhandle-unsafe-atomics.md)\n> - [Memory Barriers and VarHandle Fences](./memory-barriers-varhandle-fences.md)\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n\n> retrieval-anchor-keywords: volatile long, volatile double, atomicity, torn read, torn write, 64-bit atomic, JMM, visibility, ordering, data race, word tearing, happens-before\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n`long`과 `double`은 64비트 값이다.  \n역사적으로 일부 JVM/플랫폼에서는 non-`volatile` 64비트 값을 두 번에 나눠 읽고 쓸 수 있었다.\n\n중요한 점은 두 가지다.\n\n- atomicity는 \"한 번에 읽히는가/써지는가\"의 문제다\n- visibility는 \"다른 thread가 그 값을 볼 수 있는가\"의 문제다\n\n이 둘은 다르다.  \n`volatile`은 둘 다와 관련 있지만, 같은 뜻은 아니다.\n\n## 깊이 들어가기\n\n### 1. 64비트 값의 역사적 배경\n\n옛 JVM 규격에서는 non-`volatile` `long`/`double`이 32비트 단위로 쪼개져 보일 수 있었다.  \n그래서 다른 thread가 value의 절반씩 다른 시점의 값을 보는 torn read가 가능했다.\n\n현재 JLS에서는 `volatile long`과 `volatile double`의 읽기와 쓰기가 atomic이라고 명시한다.  \n즉 shared 64-bit state를 다룰 때는 `volatile` 또는 다른 동기화 수단을 쓰는 것이 기본 안전선이다.\n\n### 2. atomicity와 visibility를 혼동하면 생기는 버그\n\n예를 들어 다음 두 문제는 다르다.\n\n- 한 thread가 쓴 값을 다른 thread가 아직 못 본다\n- 다른 thread가 값을 보긴 했지만 값이 반쯤 찢겨 있다\n\n첫 번째는 visibility/ordering 문제이고, 두 번째는 atomicity 문제다.  \n둘을 섞어서 \"아마 volatile이면 되겠지\"라고 생각하면 진단이 틀어진다.\n\n### 3. 64비트 숫자를 volatile로 둘 때의 의미\n\n`volatile long` 또는 `volatile double`은 다음을 도와준다.\n\n- torn read/write 방지\n- 최신 값 관찰 가능성 증가\n- happens-before 연결\n\n하지만 복합 연산은 여전히 원자적이지 않다.\n\n```java\nvalue++;\n```\n\n이런 연산은 여전히 read-modify-write라서 경쟁 조건이 생길 수 있다.\n\n### 4. float/double은 비트 표현도 함께 봐야 한다\n\n`double`은 부동소수점 값이라 비교와 누적이 수치 오차의 영향을 받는다.  \n그래서 concurrency 버그를 볼 때는 atomicity만이 아니라 \"같은 값처럼 보이는가\"도 같이 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 상태 플래그와 숫자 카운터를 같은 방식으로 다룬다\n\n`volatile boolean`과 `volatile long`은 둘 다 visibility에 도움을 주지만, 숫자 카운터는 증감 연산이 추가된다.  \n즉 플래그처럼 써서는 안 된다.\n\n### 시나리오 2: 64비트 값을 읽는데 가끔 이상한 값이 나온다\n\n이론적으로는 torn read를 의심할 수 있지만, 실무에서는 대부분 다른 이유가 많다.\n\n- race condition\n- 잘못된 publication\n- 가시성 부족\n- 잘못된 캐시\n\n그래도 64비트 값은 애초에 `volatile`, `AtomicLong`, lock으로 다루는 편이 낫다.\n\n### 시나리오 3: 숫자 값을 여러 thread가 갱신한다\n\n이 경우 `volatile`만으로는 부족하다.  \n증가 자체가 원자적이지 않기 때문이다.\n\n## 코드로 보기\n\n### 1. 안전한 64비트 상태 읽기\n\n```java\npublic class Metrics {\n    private volatile long requests;\n\n    public void increment() {\n        requests++;\n    }\n\n    public long getRequests() {\n        return requests;\n    }\n}\n```\n\n읽기 가시성에는 도움이 되지만, `increment()`는 여전히 경쟁에서 깨질 수 있다.\n\n### 2. 원자적 증가가 필요할 때\n\n```java\nimport java.util.concurrent.atomic.AtomicLong;\n\npublic class SafeMetrics {\n    private final AtomicLong requests = new AtomicLong();\n\n    public long increment() {\n        return requests.incrementAndGet();\n    }\n}\n```\n\n### 3. 64비트 값을 비트 단위로 볼 때\n\n```java\nlong bits = Double.doubleToRawLongBits(123.45);\ndouble value = Double.longBitsToDouble(bits);\n```\n\n비트 패턴이 중요할 때는 숫자 의미와 저장 의미를 분리해서 봐야 한다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| plain `long`/`double` | 단순하다 | race와 visibility 문제가 생길 수 있다 |\n| `volatile long`/`volatile double` | atomic read/write와 visibility를 돕는다 | 복합 연산은 해결 못 한다 |\n| `AtomicLong` | 원자적 갱신이 가능하다 | 더 무겁고 복잡하다 |\n| lock | 복합 상태를 함께 보호한다 | 경합이 생길 수 있다 |\n\n핵심은 64비트 값을 \"크니까 안전하겠지\"가 아니라 \"어떤 동기화 의미가 필요한가\"로 보는 것이다.\n\n## 꼬리질문\n\n> Q: `volatile long`은 왜 특별한가요?\n> 핵심: 64비트 값의 atomic read/write와 visibility를 함께 다루기 때문이다.\n\n> Q: `volatile`이면 `value++`도 안전한가요?\n> 핵심: 아니다. read-modify-write는 여전히 경쟁 조건이 있다.\n\n> Q: torn read는 지금도 걱정해야 하나요?\n> 핵심: 구현과 플랫폼에 의존하지만, 실무에서는 아예 atomic/volatile/lock으로 명확하게 막는 편이 낫다.\n\n## 한 줄 정리\n\n`volatile long`/`volatile double`은 64비트 값의 atomic read/write와 visibility를 돕지만, 증가 같은 복합 연산은 여전히 별도 원자화가 필요하다.\n",
+  "aliases": [
+    "volatile long",
+    "volatile double",
+    "atomicity vs visibility",
+    "torn read",
+    "torn write",
+    "64-bit atomic",
+    "JMM visibility",
+    "happens-before volatile",
+    "AtomicLong vs volatile",
+    "volatile value++",
+    "원자성 가시성 차이",
+    "volatile long double"
+  ],
+  "expected_queries": [
+    "volatile long과 volatile double은 어떤 atomic read write 보장을 주고 visibility와는 어떻게 다른지 알려줘",
+    "volatile이면 value++도 thread safe하다고 보면 안 되는 이유를 read modify write 기준으로 설명해줘",
+    "atomicity와 visibility, happens-before를 JMM에서 각각 어떻게 구분해야 해?",
+    "torn read와 torn write는 64비트 long double에서 어떤 문제이고 실무에서는 왜 volatile이나 AtomicLong을 쓰는 게 안전해?",
+    "AtomicLong과 volatile long 중 카운터 증가에는 왜 AtomicLong이 필요하고 단순 상태 관찰에는 무엇이 다른지 비교해줘"
+  ],
+  "symptoms": [
+    "volatile이면 value++ 같은 read-modify-write 복합 연산도 안전하다고 오해한다",
+    "atomicity와 visibility를 모두 스레드 안전이라는 말로 뭉개서 torn read와 최신 값 관찰 문제를 구분하지 못한다",
+    "64비트 long/double의 원자적 읽기 쓰기와 AtomicLong이 필요한 증가 연산을 같은 문제로 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-memory-model-happens-before-volatile-final",
+      "language/java-concurrency-utilities"
+    ],
+    "next_docs": [
+      "language/varhandle-unsafe-atomics",
+      "language/memory-barriers-varhandle-fences",
+      "language/java-volatile-counter-atomicity-cause-router",
+      "operating-system/runtime-symptom-to-os-signal-router-beginner"
+    ],
+    "confusable_with": [
+      "language/java-memory-model-happens-before-volatile-final",
+      "language/varhandle-unsafe-atomics",
+      "language/java-volatile-counter-atomicity-cause-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/volatile-long-double-atomicity-memory-visibility.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "security/rbac-abac-resource-ownership-interview-chooser",
+  "title": "RBAC ABAC Resource Ownership Interview Chooser",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 chooser는 RBAC, ABAC, resource ownership authorization을 면접 질문에서 구분한다.",
+  "body_markdown": "# RBAC ABAC Resource Ownership Interview Chooser\n\n## 10초 chooser\n\n| 먼저 묻는 질문 | 모델 | 맞는 이유 | 주의할 점 |\n|---|---|---|---|\n| \"이 역할이 이 action을 해도 되나?\" | RBAC | role-permission 매핑이 단순하다 | 특정 객체 접근 허용까지 끝난 것은 아니다 |\n| \"이 객체가 이 사용자 범위 안인가?\" | ownership/resource policy | owner, tenant, relationship을 직접 본다 | `USER` role 이름에 숨기면 IDOR/BOLA가 생긴다 |\n| \"여러 속성 조건을 조합해야 하나?\" | ABAC | subject/resource/action/environment attribute를 정책으로 표현한다 | 정책 위치, 로그, 테스트가 없으면 디버깅이 어렵다 |\n\n## 헷갈리는 축\n\nRBAC는 \"관리자냐 사용자냐\", \"운영자 메뉴를 볼 수 있냐\"처럼 기능 단위 접근 제어에 강하다. 그러나 같은 `USER` role을 가진 두 회원이 서로의 예약을 수정하면 안 되는 요구는 role 이름만으로 표현되지 않는다. 이때는 resource의 owner, tenant, membership 같은 resource-level 조건을 확인해야 한다.\n\nABAC는 subject, resource, action, environment attribute를 조합한다. 예를 들어 \"같은 지점의 매니저가 영업시간 안에만 환불 승인 가능\"처럼 role 하나로 표현하기 어려운 조건을 정책으로 모델링할 수 있다. 대신 정책이 controller, repository, template helper에 흩어지면 디버깅이 어려우므로 policy object, decision log, 테스트 matrix가 필요하다.\n\nOwnership check는 ABAC의 단순한 특수 사례처럼 볼 수 있지만, 면접에서는 별도로 분리해 말하는 편이 안전하다. `memberId == reservation.memberId` 같은 조건은 role 이름에 숨기면 안 되고, 조회 조건이나 authorization policy에 명시되어야 한다. 다만 \"내 것\"만으로 충분하지 않은 서비스도 많다. 매장 관리자, 고객센터 위임, tenant membership처럼 relationship 기반 허용이 붙으면 ownership보다 resource policy라는 말이 더 정확하다.\n\n## 경계 정리\n\n- authentication은 \"너는 누구인가\"를 확인한다.\n- RBAC는 \"그 role이 이 기능/action을 할 수 있는가\"를 본다.\n- ownership authorization은 \"이 특정 resource가 너의 것인가\"를 본다.\n- ABAC는 \"subject/resource/action/context 속성을 조합한 정책을 만족하는가\"를 본다.\n- XSS/CSP는 브라우저 script 실행 방어이므로 이 문서의 권한 모델 선택과 분리한다.\n\n## 안전한 판단 순서\n\n1. 요청을 action과 resource로 이름 붙인다. 예: `PATCH /reservations/{id}`는 `reservation:update`.\n2. role이나 permission으로 action gate를 확인한다.\n3. 서버가 조회한 resource 기준으로 owner, tenant, membership, delegated scope를 확인한다.\n4. 시간, 위치, resource 상태, 위험도 같은 attribute가 늘어나면 ABAC나 policy object로 끌어올린다.\n5. allow/deny 이유와 policy version을 로그와 테스트에서 확인 가능하게 둔다.\n\n이 순서는 보안을 자동으로 보장하지 않는다. 핵심은 \"role 통과\"와 \"이 id를 열어도 됨\"을 같은 판단으로 합치지 않는 것이다.\n\n## Wrong-bucket neighbor\n\nrole 이름에 모든 조건을 붙이면 role explosion이 생긴다. `premium_admin_night_shift_tenant_a` 같은 role이 늘면 ABAC나 policy engine을 검토한다. 반대로 단순한 \"내 예약만 취소\" 요구에 거대한 정책 엔진을 먼저 도입하면 구현 비용이 과하다. 이 경우에는 repository query나 domain service 정책에서 owner 조건을 누락 없이 강제하는 편이 더 명확하다.\n\n또 하나의 wrong bucket은 \"ABAC를 쓰면 resource ownership 문제가 자동으로 해결된다\"는 말이다. ABAC는 표현 방식일 뿐이다. 어떤 attribute를 신뢰할지, 누가 최신 resource를 조회할지, policy가 실패하면 어떻게 닫을지까지 정해야 한다.\n\n## 면접 답변 골격\n\n\"권한 모델은 요구의 축으로 고릅니다. 기능 접근이 role 중심이면 RBAC가 단순하고, 특정 resource의 소유자 여부가 핵심이면 ownership check를 별도 정책으로 둡니다. 시간, tenant, resource 상태, 요청 위치처럼 여러 attribute가 결합되면 ABAC가 맞습니다. 어떤 모델이든 deny by default, 중앙화된 정책 위치, decision test, audit log가 있어야 운영 중 정책 drift를 줄일 수 있습니다.\"\n\n## 테스트 matrix\n\n| 케이스 | 기대 |\n|---|---|\n| `USER`가 자기 예약 조회 | 허용 |\n| `USER`가 다른 회원 예약 조회 | 거부. concealment가 필요한 API라면 일관된 404 정책 적용 |\n| `ADMIN`이 운영 목적 조회 | 별도 admin permission과 감사 로그 확인 |\n| 매장 관리자 A가 다른 매장 예약 수정 | tenant/shop scope 불일치로 거부 |\n| 같은 role이지만 다른 tenant resource 접근 | tenant attribute 조건 확인 |\n| 정책에 없는 action | deny by default |\n\n## 구현 냄새\n\n- controller마다 `if (user.role == ...)`가 반복된다.\n- role enum 이름이 business 조건을 계속 흡수한다.\n- repository가 `findById(id)`만 제공하고 owner 조건이 호출자 기억에 의존한다.\n- 권한 실패가 403인지 404인지 정책 없이 handler마다 다르다.\n- 테스트가 \"role 있음\"만 확인하고 \"다른 사람 resource\"를 확인하지 않는다.\n- decision log에 subject/action/resource/reason이 없어 운영 중 오판을 재현하지 못한다.\n\n## Safe Next Docs\n\n실전 판단은 `resource-level-authz-decision-practice`, drift 관리는 `permission-model-drift-authz-graph-design`로 이어진다.\n",
+  "aliases": [
+    "RBAC ABAC ownership chooser",
+    "RBAC ABAC 면접 답변",
+    "role permission ownership 비교",
+    "resource authorization choice"
+  ],
+  "expected_queries": [
+    "RBAC ABAC 차이를 면접에서 어떻게 설명해?",
+    "role만 보면 왜 resource ownership이 빠질 수 있어?",
+    "권한 모델을 어떻게 고르면 돼?"
+  ],
+  "symptoms": [
+    "admin/user role만 체크하면 충분하다고 생각해요",
+    "같은 user role이어도 자기 예약만 수정해야 하는 조건을 놓쳐요",
+    "attribute 기반 정책을 복잡한 if문으로 흩뿌려요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/role-permission-resource-authz-chooser"
+    ],
+    "next_docs": [
+      "security/resource-level-authz-decision-practice"
+    ],
+    "confusable_with": [
+      "security/role-permission-resource-authz-chooser",
+      "security/resource-level-authz-decision-practice"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/rbac-abac-resource-ownership-interview-chooser.md",
+    "revision_history": []
+  }
+}

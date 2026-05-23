@@ -1,0 +1,45 @@
+{
+  "id": "language/jmm-volatile-counter-drill",
+  "title": "JMM Volatile Counter Drill",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "이 drill은 Java Memory Model에서 volatile visibility와 counter atomicity 차이를 연습한다. count++, AtomicInteger, synchronized, happens-before 약점 신호를 다룬다.",
+  "body_markdown": "# JMM Volatile Counter Drill\n\n## 질문\n\n여러 스레드가 `volatile int count`에 대해 `count++`를 수행한다. `volatile`이면 최종 count가 항상 정확할까?\n\n```java\nclass HitCounter {\n    private volatile int count;\n\n    void hit() {\n        count++;\n    }\n\n    int count() {\n        return count;\n    }\n}\n```\n\n## 기대 답변 축\n\n- `volatile`은 visibility를 보장하지만 `++` 전체 원자성을 보장하지 않는다고 말한다.\n- `count++`는 read-modify-write 복합 연산이라고 설명한다.\n- `AtomicInteger.incrementAndGet()` 또는 synchronized critical section을 후보로 든다.\n- 단일 counter, 고경합 metrics, 여러 필드 invariant를 구분해 도구를 고른다.\n\n## 면접 답변 확장\n\n좋은 답변은 `volatile`을 \"최신 값을 보게 하는 장치\"로만 좁히지 않고, Java Memory Model의 happens-before와 ordering 제약을 조심스럽게 연결한다. 같은 volatile 변수에 대한 write는 이후 read와 synchronizes-with 관계를 만들 수 있고, volatile read/write는 일반 필드 접근보다 강한 visibility/order 의미를 가진다. 하지만 이 보장은 한 번의 volatile read와 한 번의 volatile write에 대한 것이지, 그 사이의 계산까지 하나의 임계영역으로 묶어 주지는 않는다.\n\n`count++`는 대략 `volatile read -> local add -> volatile write`로 나뉜다. 두 스레드가 같은 old value를 읽고 각각 1을 더한 뒤 같은 next value를 쓰면 호출은 두 번이었는데 증가분은 한 번만 남는다. 이 lost update는 stale read만의 문제가 아니라 read-modify-write 전체가 원자적이지 않기 때문에 생긴다.\n\n대안도 한 줄로 고정하지 않는다. 단일 counter의 정확한 증가가 필요하면 `AtomicInteger`/`AtomicLong`이 자연스럽고, 경합이 큰 통계성 counter는 `LongAdder`가 후보가 될 수 있다. 여러 필드의 invariant를 함께 지켜야 하거나 \"값을 보고 조건부로 여러 상태를 바꾸는\" 코드라면 `synchronized`나 명시적 lock처럼 더 큰 critical section이 필요할 수 있다.\n\n## 미니 분기 drill\n\n| 상황 | 1차 답변 | 조심할 점 |\n|---|---|---|\n| 요청 수를 정확히 1씩 증가시키고 즉시 읽는다 | `AtomicInteger.incrementAndGet()` | 단일 변수 연산일 때 가장 단순하다. |\n| `capacity`, `reserved`, `closed`를 함께 보고 예약 여부를 바꾼다 | `synchronized` 또는 lock | atomic counter 하나로 여러 필드 불변식을 보호하지 못한다. |\n| 초당 요청 수 metrics를 높은 경합에서 누적한다 | `LongAdder` | `sum()`은 동시 업데이트 중 strict linearizable snapshot으로 보지 않는다. |\n| 종료 플래그를 다른 thread에 알린다 | `volatile boolean` | 복합 갱신이 아니라 상태 출판/관찰 문제일 때 적합하다. |\n\n## 짧은 반례 타임라인\n\n```text\n초기 count = 41\nT1: volatile read count -> 41\nT2: volatile read count -> 41\nT1: local add -> 42\nT2: local add -> 42\nT1: volatile write count = 42\nT2: volatile write count = 42\n```\n\n각 volatile 접근 자체가 사라진 것은 아니다. 문제는 두 접근 사이의 계산을 다른 thread가 끼어들 수 없는 하나의 연산으로 만들지 못한다는 점이다.\n\n## 운영 관찰 기준\n\n- 테스트가 한 번 통과했다고 안전하다고 보지 말고, 반복 stress test와 동시성 시나리오에서 counter mismatch를 확인한다.\n- 운영에서는 요청 수, 성공/실패 집계, queue 처리 수처럼 서로 맞아야 하는 metric 간 불일치를 본다.\n- JFR lock event, thread dump, CPU 사용률을 함께 보며 Atomic 경합이 병목인지 lock 경합이 병목인지 분리한다.\n- `LongAdder`는 높은 경합에서 유리할 수 있지만 순간 합계 관찰이 정확한 선형화 지점을 뜻하지는 않는다는 점을 구분한다.\n- 도메인 정합성 counter라면 \"최종 합계만 맞으면 되는가, 각 증가가 선형화되어야 하는가\"를 먼저 문장으로 고정한다.\n\n## 답변에서 피할 단정\n\n- \"`volatile`은 항상 최신값이므로 `++`도 안전하다.\"\n- \"`volatile`은 아무 의미가 없으니 무조건 제거해야 한다.\"\n- \"`AtomicInteger`만 쓰면 모든 공유 상태 문제가 해결된다.\"\n- \"`LongAdder`가 더 빠르므로 정확한 도메인 판정에도 항상 맞다.\"\n\n`volatile`은 틀리고 `AtomicInteger`만 정답이라고 외우면 부족하다. visibility, atomicity, contention, invariant 범위를 나눠서 선택해야 한다.\n\n## 약점 태그\n\n`volatile-visibility`, `atomicity`, `read-modify-write`\n\n## 복습 연결 concept\n\n`language/volatile-synchronized-atomic-visibility-chooser`\n",
+  "aliases": [
+    "jmm volatile counter drill",
+    "volatile atomicity visibility practice",
+    "volatile counter drill",
+    "JMM 가시성 원자성 연습",
+    "synchronized"
+  ],
+  "expected_queries": [
+    "volatile counter가 왜 틀리는지 drill로 확인하고 싶어",
+    "visibility와 atomicity 차이를 문제로 풀어줘",
+    "volatile synchronized AtomicInteger 선택을 연습해줘"
+  ],
+  "symptoms": [
+    "volatile이면 count++가 안전하다고 생각해요",
+    "visibility와 atomicity를 구분하지 못해요",
+    "AtomicInteger와 synchronized 선택 기준이 없어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/volatile-synchronized-atomic-visibility-chooser"
+    ],
+    "next_docs": [
+      "language/java-volatile-counter-atomicity-cause-router"
+    ],
+    "confusable_with": [
+      "language/volatile-synchronized-atomic-visibility-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/jmm-volatile-counter-drill.md",
+    "revision_history": []
+  }
+}

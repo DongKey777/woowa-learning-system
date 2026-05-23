@@ -1,0 +1,45 @@
+{
+  "id": "database/index-selectivity-cardinality-interview-primer",
+  "title": "Index Selectivity Cardinality Interview Primer",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 primer는 index selectivity, cardinality, composite index order를 면접 답변으로 설명한다.",
+  "body_markdown": "# Index Selectivity Cardinality Interview Primer\n\n## 한 줄 요약\n\n인덱스는 적은 row를 빠르게 좁힐수록 효과가 크고, selectivity와 cardinality는 그 좁히는 힘을 판단하는 핵심 신호다.\n\n## 미션 진입 증상\n\n모든 검색 조건에 인덱스를 붙이면 write 비용, 저장 공간, optimizer 선택 혼란이 늘어난다. 먼저 query pattern과 결과 row 비율을 봐야 한다.\n\n## 핵심 mental model\n\ncardinality는 서로 다른 값의 개수이고, selectivity는 특정 predicate가 전체 중 얼마나 적은 row를 남기는지다. 인덱스가 주는 구조적 이득은 \"정렬된 key 공간에서 후보 범위를 줄인다\"는 것이고, 실제 성능 이득은 그 후보가 충분히 작고 table lookup, sort, write cost까지 감당될 때 나온다.\n\n`status`처럼 값 종류가 적은 컬럼은 단독 인덱스 효과가 작을 수 있다. 하지만 `tenant_id + status + created_at`처럼 다른 조건과 묶여 scan 범위를 줄이거나, partial/filtered index, covering index, 정렬 제거에 기여하면 낮은 cardinality 컬럼도 의미가 생긴다.\n\n## 정확한 보장과 optimizer caveat\n\n- B-Tree 계열 복합 인덱스는 key 순서대로 정렬되어 있으므로 왼쪽 prefix의 equality 조건과 그다음 range 조건으로 탐색 범위를 줄일 수 있다. 이것은 구조적 보장에 가깝다.\n- 그 인덱스를 optimizer가 실제로 선택한다는 보장은 없다. 통계, histogram, row width, buffer 상태, table lookup 비용, 정렬 비용, LIMIT, join order에 따라 full scan이나 다른 index가 더 싸다고 판단할 수 있다.\n- `EXPLAIN`의 `rows`, `filtered`, cardinality estimate는 실제 row 수가 아니라 통계 기반 추정이다. 데이터 skew, stale statistics, bind 값 편향이 있으면 estimate와 actual이 크게 갈라진다.\n- cardinality가 높아도 hot value에 데이터가 몰리면 해당 query의 selectivity는 낮다. 반대로 cardinality가 낮아도 다른 prefix와 결합하거나 covering/sort 제거 효과가 있으면 성능상 유효할 수 있다.\n- 복합 인덱스에서 range 조건 뒤의 컬럼은 탐색 범위를 더 좁히는 데 제한이 생길 수 있다. 다만 엔진에 따라 filtering, index condition, covering에는 여전히 쓰일 수 있으므로 \"range 뒤는 완전히 무시\"라고 단정하지 않는다.\n- index-only/covering 효과도 조건부다. 필요한 컬럼이 인덱스에 있어야 하고, 엔진별 MVCC visibility나 heap fetch 조건 때문에 table 접근이 완전히 0이 되지 않을 수 있다.\n\n## 운영 검증 신호\n\n1. 실제 query fingerprint를 먼저 모은다. 자주 실행되는 WHERE, JOIN, ORDER BY, GROUP BY, LIMIT 조합과 bind 값 분포가 index 후보의 입력이다.\n2. `EXPLAIN`만 보지 말고 가능한 환경에서는 `EXPLAIN ANALYZE`나 engine별 runtime metric으로 estimate rows와 actual rows, loops, rows examined, returned rows를 비교한다.\n3. chosen key/access type뿐 아니라 sort/temp table 발생, buffer read, heap fetch/table lookup, index condition 적용 여부를 같이 본다.\n4. 평균 bind 하나로 검증하지 않는다. hot value, cold value, 최근 날짜 range, 큰 tenant와 작은 tenant처럼 분포가 다른 값을 나눠 본다.\n5. index 추가 전후의 read latency p95/p99뿐 아니라 insert/update/delete latency, index size, buffer/cache hit ratio, replication lag 가능성을 같이 본다.\n6. 통계가 오래되었으면 `ANALYZE`/histogram 갱신 전후 plan을 비교한다. plan이 통계 갱신마다 흔들리면 selectivity 판단이 취약하다는 신호다.\n7. rollback 신호를 정한다. index가 선택되지 않음, actual rows가 여전히 큼, sort가 사라지지 않음, write 비용이 급증함, hot value에서 latency가 그대로면 설계를 다시 본다.\n\n## 면접 예시 답변\n\n성별 컬럼처럼 값이 두세 개인 컬럼은 cardinality가 낮고 많은 row를 남기므로 단독 인덱스 효과가 작을 수 있다. 반대로 사용자 id나 주문 번호처럼 조건이 소수 row로 좁혀지면 selectivity가 높아 인덱스 효과가 크다.\n\n다만 \"낮은 cardinality는 무조건 쓸모없다\"가 아니라, 복합 인덱스의 prefix, partial/filtered 조건, covering, 정렬 제거 효과까지 같이 본다. 최종 판단은 optimizer estimate가 아니라 실제 데이터 분포, `EXPLAIN ANALYZE`, rows examined/returned, write cost metric으로 검증해야 한다.\n\n## 흔한 오해\n\n복합 인덱스는 컬럼을 그냥 많이 넣는다고 좋은 게 아니다. equality 조건, range 조건, sort/group by, covering 여부를 함께 보고 왼쪽 prefix 활용을 고려한다.\n\n| 오해 | 왜 위험한가 | 교정 포인트 |\n|---|---|---|\n| WHERE에 있으면 무조건 index | write cost와 plan 혼란 증가 | query 빈도와 선택도부터 확인 |\n| cardinality 높음 = 항상 빠름 | hot value skew를 놓침 | bind 값별 selectivity 확인 |\n| low cardinality = 항상 불필요 | 복합/partial/covering 효과를 놓침 | query pattern 안에서 역할 확인 |\n| 복합 인덱스는 컬럼 수가 많을수록 좋음 | prefix 활용과 write cost 악화 | 접근 패턴별 최소 조합 설계 |\n| index 추가 후 key만 보면 끝 | 실제 scan/latency 회귀를 놓침 | EXPLAIN과 운영 metric 동시 확인 |\n\n## Safe Next Docs\n\n실행 계획 확인은 `index-and-explain`, 인덱스 종류 선택은 `index-type-selection-clustered-secondary-covering-intermediate-chooser`로 이어진다.\n",
+  "aliases": [
+    "index selectivity interview",
+    "cardinality index answer",
+    "인덱스 선택도 면접",
+    "카디널리티 설명"
+  ],
+  "expected_queries": [
+    "인덱스 selectivity와 cardinality를 면접에서 어떻게 설명해?",
+    "성별 컬럼에 인덱스를 걸면 왜 효과가 작을 수 있어?",
+    "복합 인덱스 컬럼 순서는 어떻게 정해?"
+  ],
+  "symptoms": [
+    "WHERE에 쓰이면 무조건 인덱스를 만들면 된다고 생각해요",
+    "cardinality와 selectivity를 구분하지 못해요",
+    "복합 인덱스 왼쪽 prefix 규칙을 놓쳐요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/index-basics"
+    ],
+    "next_docs": [
+      "database/index-type-selection-clustered-secondary-covering-intermediate-chooser"
+    ],
+    "confusable_with": [
+      "database/index-basics",
+      "database/index-type-selection-clustered-secondary-covering-intermediate-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/index-selectivity-cardinality-interview-primer.md",
+    "revision_history": []
+  }
+}

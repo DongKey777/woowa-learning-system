@@ -1,0 +1,67 @@
+{
+  "id": "network/bgp-path-selection-local-pref-as-path-med-chooser",
+  "title": "BGP Path Selection Local Pref AS Path MED Chooser",
+  "category": "network",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# BGP Path Selection Local Pref AS Path MED Chooser\n\n> 한 줄 요약: BGP best path는 \"가장 지리적으로 가까운 길\"이나 \"ping이 가장 낮은 길\"이 아니라, AS 안팎의 **route policy가 만든 속성 우선순위**로 고른다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Anycast Routing Trade-offs, Edge Failover](./anycast-routing-tradeoffs-edge-failover.md)\n- [BGP Anycast Route Flap Latency Playbook](./bgp-anycast-route-flap-latency-playbook.md)\n- [RPKI ROA BGP Route Leak Origin Validation Primer](./rpki-roa-bgp-route-leak-origin-validation-primer.md)\n- [Packet Loss, Jitter, Reordering Diagnostics](./packet-loss-jitter-reordering-diagnostics.md)\n- [Global Traffic Failover Control Plane 설계](../system-design/global-traffic-failover-control-plane-design.md)\n\n## 먼저 잡는 mental model\n\nBGP 경로 선택은 최단 거리 탐색 문제가 아니다. 한 router가 같은 prefix로 가는 여러 candidate route를 받으면, 각 route의 속성과 local policy를 비교해 하나의 best path를 고른다.\n\n초보자가 자주 틀리는 문장은 이것이다.\n\n> AS_PATH가 짧으면 무조건 더 좋은 경로다.\n\n실무에서는 보통 아니다. AS_PATH는 중요한 신호지만, 그보다 앞에서 local preference와 import policy가 이미 결론을 내릴 수 있다. 예를 들어 회사 AS가 \"paid transit보다 private peering을 선호한다\"는 policy로 peering route에 높은 local-pref를 주면, AS_PATH가 조금 더 길어도 그 경로가 이길 수 있다.\n\n간단히 보면 흐름은 이렇다.\n\n```text\ncandidate BGP routes\n  -> import route policy가 attribute를 붙이거나 바꿈\n  -> local-pref 같은 내부 선호가 먼저 작동\n  -> AS_PATH, origin, MED 같은 BGP attribute를 비교\n  -> eBGP/iBGP, next-hop IGP metric 같은 tie-breaker로 좁힘\n  -> selected best path가 RIB/FIB로 내려감\n```\n\n이 문서는 vendor별 세부 tie-breaker 전체를 외우게 하려는 문서가 아니다. 장애를 볼 때 \"어느 속성이 더 강한 설명인가\"를 고르는 chooser다.\n\n## 선택 순서 감각\n\n| 질문 | 먼저 보는 속성 | 왜 먼저인가 | 흔한 오해 |\n|---|---|---|---|\n| \"우리 AS 밖으로 나가는 egress가 왜 이쪽이지?\" | `local-pref`, import policy | AS 내부 정책으로 outbound path를 강하게 고른다 | AS_PATH 짧은 쪽이 항상 이긴다 |\n| \"특정 upstream만 트래픽을 더 받게 하고 싶다\" | route policy, community, AS_PATH prepend | 상대 AS가 실제로 어떤 policy를 쓰는지에 의존한다 | 내 MED 하나로 인터넷 전체가 따른다 |\n| \"같은 neighbor AS의 여러 접점 중 어디로 들어오게 할까?\" | `MED` | 낮은 MED가 선호될 수 있지만 보통 같은 neighboring AS 경로끼리만 비교된다 | MED가 global latency knob이다 |\n| \"route leak인지 hijack인지 의심된다\" | RPKI/ROA와 AS_PATH 관찰 | BGP origin attribute와 RPKI origin validation은 다른 축이다 | origin이라는 단어를 하나로 묶는다 |\n| \"anycast가 먼 POP로 갔다\" | source ASN별 selected path, POP ingress | BGP policy가 latency bucket을 바꿀 수 있다 | DNS TTL 또는 app latency부터 본다 |\n\n운영 사고에서는 \"몇 번째 tie-breaker냐\"보다 \"앞단 policy가 이미 답을 정했는가\"가 중요하다. local-pref가 다르면 뒤의 AS_PATH, origin, MED 비교까지 가지 않는다.\n\n## Local Preference\n\n`local-pref`는 한 AS 내부에서 경로 선호도를 정하는 속성이다. 값이 높을수록 선호된다. 보통 iBGP로 AS 내부에 전파되지만 eBGP neighbor에게 그대로 광고되는 속성은 아니다.\n\n이 속성은 outbound traffic에 강하다.\n\n```text\nRoute A: local-pref 200, AS_PATH 64510 64520 64530\nRoute B: local-pref 100, AS_PATH 64540\n\n선택: Route A\n이유: local-pref가 먼저 이겼다.\n```\n\n그래서 \"AS_PATH가 긴데 왜 그쪽으로 나가?\"라는 질문은 local-pref부터 봐야 한다. business relationship, customer route, private peering, paid transit cost, security filtering, maintenance drain 같은 policy가 local-pref를 바꾼다.\n\nAnycast에서도 이 점이 중요하다. 사용자가 물리적으로 가까운 POP로 갈 것 같아도, 사용자의 ISP가 특정 transit이나 peering route에 더 높은 local-pref를 주면 먼 POP prefix가 이길 수 있다. 이때는 앱 서버가 느려진 것이 아니라 사용자가 다른 latency bucket으로 들어간 것이다.\n\n## AS_PATH\n\n`AS_PATH`는 route announcement가 거쳐 온 AS 목록이다. BGP는 자기 AS가 AS_PATH에 있으면 loop로 보고 버린다. 경로 선택에서는 일반적으로 AS_PATH가 짧은 쪽을 선호한다.\n\n하지만 AS_PATH는 local-pref 뒤에 온다는 감각이 필요하다.\n\n```text\nlocal-pref가 같을 때:\n  AS_PATH \"64500 64501\"      -> 길이 2\n  AS_PATH \"64510 64511 64512\" -> 길이 3\n  보통 길이 2가 선호된다.\n\nlocal-pref가 다를 때:\n  높은 local-pref가 먼저 이긴다.\n```\n\nAS path prepending은 일부러 자기 AS 번호를 여러 번 넣어 경로를 길어 보이게 하는 기법이다. 목적은 상대가 다른 경로를 고르게 유도하는 것이다. 그러나 상대가 local-pref나 community policy를 더 강하게 쓰면 prepending은 기대만큼 먹히지 않는다.\n\n따라서 AS_PATH는 \"인터넷 전체의 지연 시간\"이 아니라 \"정책이 같은 후보 사이에서 비교되는 경로 길이 힌트\"로 읽어야 한다.\n\n## Origin Attribute\n\nBGP의 `origin` attribute는 route가 BGP에 어떻게 들어왔는지를 나타낸다. 일반적인 선호는 `IGP`가 `EGP`보다, `EGP`가 `incomplete`보다 앞선다.\n\n여기서 `origin`이라는 이름 때문에 세 가지를 섞기 쉽다.\n\n- BGP origin attribute: route source type을 나타내는 BGP 속성\n- RPKI Route Origin Validation: prefix를 특정 origin AS가 광고해도 되는지 검증\n- HTTP origin server: CDN이나 proxy 뒤의 원본 애플리케이션 서버\n\n이 문서의 origin attribute는 첫 번째다. RPKI/ROA의 origin validation은 [RPKI ROA BGP Route Leak Origin Validation Primer](./rpki-roa-bgp-route-leak-origin-validation-primer.md)에서 다룬다.\n\n장애 분석에서는 origin attribute가 주원인인 경우보다, local-pref나 AS_PATH, route policy가 더 앞에서 결론을 만든 경우가 많다. 그래도 같은 local-pref, 같은 AS_PATH 길이처럼 후보가 비슷할 때는 tie-breaker로 의미가 있다.\n\n## MED\n\n`MED`(Multi Exit Discriminator)는 \"우리 AS로 들어올 때 이 입구를 더 선호해 달라\"는 힌트다. 값이 낮을수록 선호된다.\n\n중요한 제약은 세 가지다.\n\n- 보통 같은 neighboring AS에서 온 route끼리만 비교된다.\n- optional non-transitive 속성이라 인터넷 전체에 끝까지 전달되는 global policy가 아니다.\n- 받는 쪽 AS의 local policy가 MED보다 앞서면 무시되거나 약해진다.\n\n예를 들어 한 CDN AS가 같은 prefix를 서울과 도쿄 POP에서 광고하고, 같은 upstream에게 서울 MED를 낮게 줬다면 그 upstream 안에서는 서울을 선호할 수 있다. 하지만 다른 ISP나 transit은 이 MED를 보지 않거나, local-pref로 다른 결정을 할 수 있다.\n\n그래서 MED는 \"내가 전 세계 사용자 latency를 직접 조정하는 스위치\"가 아니다. 같은 neighbor와 여러 interconnect를 가진 상황에서 상대에게 입구 선호를 제안하는 약한 신호로 보는 편이 안전하다.\n\n## eBGP vs iBGP\n\n`eBGP`는 다른 AS와 주고받는 BGP이고, `iBGP`는 같은 AS 내부에서 route를 전파하는 BGP다. 경로 후보가 거의 비슷하게 남았을 때는 eBGP route를 iBGP route보다 선호하는 tie-breaker가 작동할 수 있다. 이후에는 next-hop까지의 IGP metric, 즉 내부망에서 어느 border router가 더 가까운지도 중요해진다.\n\n이 부분이 \"hot potato routing\"으로 보이는 경우가 있다. AS는 외부 목적지까지의 end-to-end latency보다, 자기 AS 내부에서 가장 빨리 traffic을 내보낼 수 있는 exit을 고를 수 있다. 사용자는 전체 지연이 늘었는데 해당 AS 관점에서는 내부 비용이 낮은 선택일 수 있다.\n\n따라서 anycast wrong-bucket 증상에서는 \"사용자와 POP의 물리 거리\"보다 \"사용자 ASN 내부의 exit 선택과 upstream policy\"를 봐야 한다.\n\n## Route Policy가 실제 주인공이다\n\n운영자가 직접 만지는 것은 대부분 raw attribute가 아니라 route policy다.\n\n- 특정 neighbor에서 받은 route에 local-pref를 높인다.\n- community를 보고 customer, peer, transit route를 분류한다.\n- prefix-list, AS-path filter, RPKI validation 결과로 route를 reject하거나 낮춘다.\n- maintenance 중인 POP advertisement를 withdraw하거나 prepending한다.\n- DDoS, blackhole, traffic engineering community로 경로를 우회시킨다.\n\n그래서 \"BGP는 정해진 알고리즘으로 하나를 고른다\"보다 \"policy가 attribute를 만들고, 그 attribute가 best path 알고리즘에 들어간다\"가 더 정확하다.\n\n문제 재현도 이 관점이어야 한다.\n\n```text\nwrong POP symptom\n  -> affected source ASN을 나눈다\n  -> looking glass / route collector에서 prefix별 selected route를 본다\n  -> local-pref는 외부에서 직접 안 보일 수 있으니 provider policy, community, route change 시각을 함께 본다\n  -> POP ingress와 RTT/TTFB timeline을 맞춘다\n```\n\n## Anycast latency wrong-bucket 분리법\n\nAnycast에서 특정 지역이나 ISP만 느려졌을 때 바로 \"DNS가 예전 IP를 줬다\" 또는 \"origin server가 느리다\"로 가면 자주 틀린다. 같은 IP라도 BGP path selection이 달라지면 다른 POP로 들어갈 수 있다.\n\n분리 기준은 다음과 같다.\n\n| 관찰 | BGP path selection 후보 | 다른 후보 |\n|---|---|---|\n| destination IP는 같고 POP code만 달라짐 | anycast path가 다른 POP로 수렴 | DNS traffic steering이면 IP 자체가 다를 수 있다 |\n| 특정 ASN에서만 RTT/TTFB가 계단식 증가 | 해당 ASN의 local-pref, AS_PATH, peering 변경 | 전체 지역 공통이면 POP capacity나 origin latency |\n| route collector에서 AS_PATH 또는 next-hop visibility가 바뀜 | BGP policy/change 후보 강함 | route는 같은데 loss만 늘면 transport 품질 |\n| MED 변경 후 일부 upstream만 반응 | MED 영향 범위에 맞음 | 모든 ISP가 따를 거라는 가정은 위험 |\n| 앱 로그와 origin CPU는 정상인데 edge ingress가 이동 | wrong POP/wrong latency bucket 후보 | cache MISS, origin fetch burst는 별도 확인 |\n\n증거 단위는 국가보다 source ASN, resolver, POP code, prefix, timestamp가 좋다. \"한국 사용자가 느림\"보다 \"AS12345 사용자가 서울 대신 도쿄 POP로 들어가고, 그 시각 AS_PATH가 바뀜\"이 훨씬 강한 설명이다.\n\n## 빠른 진단 체크리스트\n\n1. DNS 응답이 바뀐 문제인지, 같은 anycast IP의 BGP 경로가 바뀐 문제인지 먼저 나눈다.\n2. affected user를 country보다 source ASN과 POP code로 묶는다.\n3. looking glass, route collector, provider telemetry에서 prefix의 selected route와 AS_PATH 변화를 본다.\n4. local-pref는 외부에서 잘 안 보이므로 neighbor type, route community, provider policy, 최근 maintenance를 함께 확인한다.\n5. MED 변경만으로 global steering이 됐다고 가정하지 않는다. 같은 neighboring AS 안에서만 반응했는지 본다.\n6. RPKI invalid/not-found 문제인지, BGP origin attribute tie-breaker인지 용어를 분리한다.\n7. POP ingress, RTT, TCP connect, TLS handshake, TTFB를 같은 timeline에 놓는다.\n\n## 한 줄 정리\n\nBGP path selection을 읽을 때는 AS_PATH부터 외우지 말고, **route policy와 local-pref가 먼저 경로 후보를 굳히고, AS_PATH/origin/MED/eBGP-iBGP는 그 뒤의 비교 신호**라는 순서로 봐야 한다.\n",
+  "aliases": [
+    "BGP path selection",
+    "BGP best path",
+    "local preference",
+    "BGP local-pref",
+    "AS path length",
+    "AS path prepend",
+    "BGP origin attribute",
+    "MED metric",
+    "multi exit discriminator",
+    "eBGP vs iBGP",
+    "route policy",
+    "anycast wrong POP",
+    "wrong latency bucket",
+    "BGP latency wrong-bucket"
+  ],
+  "expected_queries": [
+    "BGP path selection에서 local-pref, AS path, origin, MED는 어떤 순서로 봐야 해?",
+    "local preference가 높으면 AS_PATH가 더 긴데도 선택될 수 있는 이유를 설명해줘",
+    "MED는 왜 글로벌 anycast latency steering에 믿고 쓰기 어려워?",
+    "eBGP와 iBGP 경로가 같이 있을 때 BGP best path 선택을 어떻게 읽어야 해?",
+    "anycast 사용자가 wrong POP로 가는 문제를 DNS TTL이나 origin latency와 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "anycast IP는 같은데 일부 ASN 사용자만 먼 POP나 wrong latency bucket으로 들어간다",
+    "AS_PATH가 더 짧은 경로가 항상 선택된다고 생각해 local-pref와 route policy를 놓친다",
+    "MED를 글로벌 트래픽 조정 장치처럼 기대하지만 upstream이 무시하거나 같은 neighboring AS 안에서만 비교한다",
+    "BGP origin attribute를 RPKI origin validation이나 HTTP origin server와 섞어 해석한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/anycast-routing-tradeoffs-edge-failover",
+      "network/bgp-anycast-route-flap-latency-playbook",
+      "network/rpki-roa-bgp-route-leak-origin-validation-primer"
+    ],
+    "next_docs": [
+      "network/bgp-anycast-route-flap-latency-playbook",
+      "network/anycast-routing-tradeoffs-edge-failover",
+      "network/rpki-roa-bgp-route-leak-origin-validation-primer",
+      "network/packet-loss-jitter-reordering-diagnostics",
+      "system-design/global-traffic-failover-control-plane-design"
+    ],
+    "confusable_with": [
+      "network/bgp-anycast-route-flap-latency-playbook",
+      "network/anycast-routing-tradeoffs-edge-failover",
+      "network/rpki-roa-bgp-route-leak-origin-validation-primer",
+      "network/dns-ttl-cache-failure-patterns",
+      "network/packet-loss-jitter-reordering-diagnostics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/bgp-path-selection-local-pref-as-path-med-chooser.md",
+    "revision_history": []
+  }
+}

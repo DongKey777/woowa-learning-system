@@ -1,0 +1,54 @@
+{
+  "id": "database/connection-pool-transaction-interaction-intermediate-bridge",
+  "title": "Connection Pool ↔ Transaction 상호작용 — Pool exhaustion과 Long Tx",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "'Connection Pool과 Transaction은 *얽혀 있다*. `@Transactional` 메서드 진입",
+  "body_markdown": "# Connection Pool ↔ Transaction 상호작용 — Pool exhaustion과 Long Tx\n\n> 한 줄 요약: `@Transactional` 메서드 = *connection 1개 borrow + transaction begin*. 길면 pool starvation. *외부 IO는 transaction 밖으로*가 원칙.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n```\n[Request 1] @Transactional method 시작\n    → connection-pool.getConnection()      ← borrow\n    → BEGIN TRANSACTION\n    → repository.save()                    ← SQL 1\n    → externalApi.call()                   ← ❌ 100ms blocking, connection 잡고 있음\n    → repository.update()                  ← SQL 2\n    → COMMIT\n    → connection 반환\n\n이 동안 다른 Request도 connection 필요한데 *pool 다 borrow됨* → pool starvation\n```\n\n## 한 장 정리\n\n| 시점 | 동작 | Connection |\n|---|---|---|\n| `@Transactional` 진입 | TransactionInterceptor가 connection borrow + BEGIN | 1개 점유 시작 |\n| 메서드 실행 | 모든 query가 같은 connection 사용 | 점유 유지 |\n| 외부 API 호출 | 같은 thread에서 blocking | **여전히 점유** |\n| 메서드 종료 | COMMIT or ROLLBACK | 1개 반환 |\n\n## 함정 1 — 외부 IO in Transaction\n\n```java\n@Transactional\npublic void processOrder(Long orderId) {\n    Order order = orderRepository.findById(orderId).orElseThrow();\n    order.markProcessing();\n    orderRepository.save(order);\n    \n    // ❌ 외부 API 100~500ms — connection 계속 잡고 있음\n    paymentClient.charge(order.amount());\n    \n    order.markCompleted();\n    orderRepository.save(order);\n}\n```\n\n**문제**:\n- Pool size 10, 외부 API 평균 500ms.\n- 동시 20 요청 → 10 connection 다 점유 + 10개는 대기.\n- DB는 *아무것도 하지 않으면서* connection만 잡힘.\n\n**해결**:\n```java\npublic void processOrder(Long orderId) {\n    // Transaction 1 — 짧게\n    transactionTemplate.execute(s -> {\n        Order order = orderRepository.findById(orderId).orElseThrow();\n        order.markProcessing();\n        orderRepository.save(order);\n        return null;\n    });\n    \n    // 외부 호출 — transaction 밖\n    paymentClient.charge(...);\n    \n    // Transaction 2 — 짧게\n    transactionTemplate.execute(s -> {\n        Order order = orderRepository.findById(orderId).orElseThrow();\n        order.markCompleted();\n        orderRepository.save(order);\n        return null;\n    });\n}\n```\n\n⚠️ Trade-off: *원자성 깨짐*. 외부 호출 후 두 번째 transaction 실패 시 *부분 상태*. **idempotency + retry로 보강 필수**.\n\n## 함정 2 — Transaction Propagation\n\n```java\n@Transactional\npublic void outer() {\n    inner();                           // REQUIRED — 같은 transaction 재사용\n}\n\n@Transactional(propagation = REQUIRES_NEW)\npublic void inner() {\n    // 새 transaction → 새 connection borrow!\n}\n```\n\n**REQUIRES_NEW 함정**: *기존 connection 보유 + 새 connection 추가 borrow*. 동시 N개 outer가 inner 호출하면 *2N connection 필요*. pool size 충분한지 확인.\n\n| Propagation | 동작 | Connection |\n|---|---|---|\n| REQUIRED | 기존 transaction 재사용 | 1개 (기존 재사용) |\n| REQUIRES_NEW | 기존 정지 + 새 transaction | 2개 (기존 + 새) |\n| NESTED | savepoint | 1개 (기존) |\n| MANDATORY | 기존 필수, 없으면 예외 | 1개 (기존) |\n| NEVER | transaction 없을 때만 | 0개 |\n| SUPPORTS | 있으면 join, 없으면 transaction 없음 | 0 or 1 |\n| NOT_SUPPORTED | 기존 정지, transaction 없이 실행 | 0개 (정지된 connection 잡고 있을 수도) |\n\n## readOnly Transaction — 가치\n\n```java\n@Transactional(readOnly = true)\npublic List<Order> findAllOrders() { ... }\n```\n\n효과:\n- **commit 비용 ↓** — flush 안 함, transaction log 안 씀.\n- **JPA flush mode = MANUAL** — dirty checking skip, 불필요 query 절감.\n- **일부 DB driver는 read replica로 routing** (Spring + AbstractRoutingDataSource).\n- Connection 점유는 *동일* — pool 부담은 같음.\n\n→ 조회 메서드에는 *항상 readOnly* 권장.\n\n## 함정 3 — Connection Leak\n\n```java\n@Transactional\npublic void process() {\n    Thread.sleep(60_000);   // ❌ 1분 sleep\n    repository.save(...);\n}\n```\n\n또는 *Spring Bean이 아닌 곳에서 DataSource 직접 사용 + close 안 함*. 결과:\n- Connection이 pool에 안 돌아옴.\n- Pool이 점점 비어 갑자기 starvation.\n\n**진단**: HikariCP `leak-detection-threshold` 켜기 → 60s 이상 보유 시 stack trace 로그.\n\n```yaml\nspring:\n  datasource:\n    hikari:\n      leak-detection-threshold: 60000\n```\n\n운영 환경에서 이거 켜고 *어떤 thread / stack*이 connection 길게 잡고 있는지 추적.\n\n## \"Transaction과 Connection은 1:1?\"\n\n기본은 *1:1* — 한 transaction = 한 connection.\n\n예외:\n- Spring `JpaTransactionManager`: 한 transaction에 한 EntityManager + 한 connection.\n- 분산 transaction (XA, JTA): 여러 connection (다른 resource).\n\n학습 단계는 *1:1 가정*.\n\n## \"Pool 사이즈를 늘리면 됨?\"\n\n```yaml\nspring.datasource.hikari.maximum-pool-size: 100   # 단순 증가\n```\n\n**한계**:\n- DB *connection 한계* (`max_connections` PostgreSQL default 100, MySQL default 151).\n- DB 측 *동시 connection 처리 부하* — context switch, memory.\n- *Little's Law*: 처리량 = pool / 평균 query 시간. DB가 처리할 수 있는 양보다 더 큰 pool은 의미 없음.\n\n**진짜 해결**: transaction 길이 단축 + *외부 IO 분리* + idempotent retry 패턴.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"Spring 외부 API 호출 시 timeout 발생\" → @Transactional 안인지 확인. 밖으로 빼기.\n- \"트래픽 ↑ 시 응답 느림 + DB 부하는 낮음\" → pool starvation. transaction 길이 측정.\n- \"스케줄러 job이 모든 pool 점유\" → @Transactional with long-running query. batch로 분할.\n- \"테스트는 빠른데 운영은 느림\" → connection 부족. 외부 호출 분리.\n\n## 자주 헷갈리는 지점\n\n- **\"DB가 안 바쁘니 pool size 늘리면 됨\"** — pool 늘려도 DB가 *받을 수 있는 한계*에 묶임. transaction 길이가 진짜 원인.\n- **\"REQUIRES_NEW는 명확하니 안전\"** — *기존 connection 잡고 있는 채* 추가 borrow. starvation 위험 ↑.\n- **\"readOnly = read replica로 자동\"** — DB driver / 설정 따라 다름. 기본은 같은 datasource.\n- **\"@Transactional 안에서 외부 호출은 보통 OK\"** — *짧으면* OK, *길면* 위험. 100ms 이상은 의심.\n- **\"Connection leak = 코드 버그\"** — 대부분 *transaction 의도치 않게 길어진 케이스*.\n\n## 빠른 확인 질문\n\n- @Transactional 안 외부 API 호출이 *왜* 위험?\n  - Connection을 *외부 API 시간만큼* 점유. Pool starvation 위험.\n- REQUIRES_NEW의 pool 부담?\n  - 기존 connection 잡고 *새로 추가 borrow*. 2 connections per outer.\n- readOnly transaction의 *connection 점유*?\n  - *동일* (1개). 절약은 commit 비용 / JPA flush 등.\n\n## 한 줄 정리\n\n@Transactional = *connection borrow + begin*. 길면 pool starvation. *외부 IO는 transaction 밖으로*가 원칙. REQUIRES_NEW는 *추가 connection*. readOnly는 connection 절약 ❌ but commit/flush 절약 ✓.\n\nretrieval-anchor-keywords: Spring @Transactional connection borrow, connection pool exhaustion, long transaction pool starvation, external API in transaction antipattern, REQUIRES_NEW connection cost, transaction propagation pool impact, readOnly transaction Spring, HikariCP leak-detection-threshold, TransactionInterceptor connection lifecycle, idempotent retry pattern, AbstractRoutingDataSource readOnly, max_connections DB limit\n",
+  "aliases": [
+    "Connection Pool과 Transaction",
+    "long transaction",
+    "pool exhaustion",
+    "@Transactional connection borrow",
+    "external IO in transaction",
+    "transaction propagation pool",
+    "트랜잭션 풀 고갈",
+    "트랜잭션과 커넥션 풀"
+  ],
+  "expected_queries": [
+    "Connection Pool과 Transaction이 어떻게 상호작용해?",
+    "Long transaction이 왜 pool starvation을 만들어?",
+    "Transaction 안 외부 API 호출 왜 위험해?",
+    "REQUIRES_NEW가 pool에 어떤 영향 주나?",
+    "readOnly Transaction이 뭘 절약해?",
+    "Transaction 길이를 어떻게 줄여?"
+  ],
+  "symptoms": [
+    "Transaction이 길어지면 pool starvation 발생",
+    "@Transactional 안 외부 API 호출 시 connection 잡고 있는 것 모름",
+    "REQUIRES_NEW가 pool에 어떤 영향 주는지 헷갈림",
+    "readOnly transaction이 무엇을 절약하는지 모름"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/connection-pool-sizing-timeout-tuning-intermediate-primer"
+    ],
+    "next_docs": [
+      "database/connection-pool-starvation-symptom-router",
+      "database/transaction-locking-connection-pool-primer"
+    ],
+    "confusable_with": [
+      "database/connection-pool-sizing-timeout-tuning-intermediate-primer",
+      "database/transaction-locking-connection-pool-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/connection-pool-transaction-interaction-intermediate-bridge.md",
+    "revision_history": []
+  }
+}

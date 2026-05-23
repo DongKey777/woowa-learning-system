@@ -1,0 +1,46 @@
+{
+  "id": "operating-system/sparse-file-fallocate-hole-punching",
+  "title": "Sparse Files fallocate Hole Punching",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 file logical size와 allocated block size가 다를 수 있으며 sparse file, fallocate",
+  "body_markdown": "# Sparse Files, fallocate, Hole Punching\n\n> 한 줄 요약: 파일의 논리 크기와 실제 할당 블록은 다를 수 있고, sparse file·preallocation·hole punching의 차이를 모르면 WAL, snapshot, backup, disk alarm을 잘못 해석하기 쉽다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n> - [Fsync Batching Semantics](./fsync-batching-semantics.md)\n> - [mmap vs read, Page Cache Behavior](./mmap-vs-read-page-cache-behavior.md)\n> - [mmap, msync, Hole Punching, File Replace Update Patterns](./mmap-msync-hole-punching-file-replace-update-patterns.md)\n> - [OverlayFS Copy-up, Container Layering, Runtime Debugging](./overlayfs-copy-up-container-layering-debugging.md)\n> - [VFS, Dentry, Inode Cache Pressure](./vfs-dentry-inode-cache-pressure.md)\n\n> retrieval-anchor-keywords: sparse file, fallocate, hole punching, preallocation, file apparent size, allocated blocks, du vs ls, SEEK_HOLE, WAL segment, delayed ENOSPC\n\n## 핵심 개념\n\n리눅스 파일은 \"보이는 크기\"와 \"실제로 디스크 블록이 잡힌 양\"이 다를 수 있다. 이 차이를 만드는 대표적인 기법이 sparse file, `fallocate()` 기반 preallocation, hole punching이다.\n\n- `sparse file`: 중간에 hole이 있어도 논리적으로는 큰 파일처럼 보이는 파일이다\n- `apparent size`: `ls -lh`에서 보이는 논리 크기다\n- `allocated blocks`: 실제로 블록이 잡힌 양으로 `du`나 `stat`의 block 수로 본다\n- `fallocate`: 파일시스템 지원이 있을 때 공간을 미리 확보하거나 hole을 다루는 시스템 콜이다\n- `hole punching`: 파일 크기는 유지하면서 일부 블록을 다시 비워 두는 기법이다\n\n왜 중요한가:\n\n- WAL segment를 미리 만들 때 disk usage와 failure mode가 달라진다\n- backup/copy 도구가 sparse를 보존하느냐에 따라 실제 사용량이 급증할 수 있다\n- \"파일이 100GB인데 왜 디스크는 안 찼지?\" 또는 반대로 \"왜 생성 순간 디스크가 바로 찼지?\"를 설명할 수 있다\n\n## 깊이 들어가기\n\n### 1. 큰 파일이 항상 큰 디스크 사용량을 뜻하지는 않는다\n\n`sparse file`은 hole 구간을 실제 블록 없이 표현하므로, 논리 크기는 커도 물리 사용량은 작을 수 있다.\n\n- `truncate`로 크게 늘린 파일\n- 일부 구간만 실제로 쓴 이미지 파일\n- snapshot/segment 파일에서 비어 있는 영역\n\n이때 `ls -lh`만 보면 과장된 위기감을 느끼고, `du -h`만 보면 반대로 미래 위험을 과소평가할 수 있다.\n\n### 2. sparse와 preallocation은 비슷해 보여도 운영 의미가 다르다\n\n둘 다 \"미래에 커질 파일\"을 다루지만 의도와 failure mode가 다르다.\n\n- sparse: 지금은 블록을 덜 쓰지만, 나중에 실제 write 시점에 공간이 필요하다\n- preallocation: 지금 미리 공간을 확보해 later ENOSPC 위험과 fragmentation을 줄인다\n- `FALLOC_FL_KEEP_SIZE` 같은 방식은 visible size와 reserved blocks를 분리할 수 있다\n\n즉 sparse는 낙관적 예약이고, preallocation은 비용을 앞당겨 확정하는 선택에 가깝다.\n\n### 3. hole punching은 \"지웠다\"와 \"크기가 줄었다\"를 분리한다\n\nhole punching은 특정 범위의 블록을 다시 hole로 바꿔 실제 사용량을 줄일 수 있지만, 파일의 논리 크기 자체는 그대로일 수 있다.\n\n- `ls -lh`는 거의 안 바뀔 수 있다\n- `du -h`는 줄 수 있다\n- 일부 파일시스템/마운트 옵션에서 지원과 성능 특성이 다르다\n\n그래서 디스크 사용률 알람과 파일 크기 알람을 같은 의미로 보면 판단이 흔들린다.\n\n### 4. copy/backup/snapshot 도구가 sparse 의미를 깨뜨릴 수 있다\n\n파일을 옮길 때 hole 정보를 보존하지 않으면 빈 공간이 실제 zero block으로 확장될 수 있다.\n\n- 원본은 sparse라서 디스크를 적게 썼다\n- 복사본은 sparse를 보존하지 않아 실제 블록이 커졌다\n- backup 저장소나 restore 시간에서 뜻밖의 비용이 나타난다\n\n즉 sparse file은 생성 전략뿐 아니라 이동 전략까지 함께 설계해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: WAL segment가 엄청 커 보여서 디스크가 곧 찰 것 같다\n\n확인할 점:\n\n- 논리 크기만 큰 sparse file인지\n- `fallocate()`로 이미 블록을 예약한 것인지\n- WAL rotation과 archive 도구가 sparse를 어떻게 다루는지\n\n진단:\n\n```bash\nls -lh wal.segment\ndu -h wal.segment\ndu -h --apparent-size wal.segment\nstat -c '%n size=%s blocks=%b blksize=%B' wal.segment\n```\n\n### 시나리오 2: 백업을 복사했더니 대상 볼륨이 갑자기 가득 찼다\n\n가능한 원인:\n\n- 원본은 sparse였지만 복사 도구가 hole을 보존하지 않았다\n- restore 과정에서 zero 영역이 실제 블록으로 할당됐다\n- snapshot 레이어나 overlay 환경이 블록 의미를 바꿨다\n\n### 시나리오 3: compaction 후 디스크 사용량은 줄었는데 파일 크기는 그대로다\n\n가능한 원인:\n\n- hole punching으로 블록만 반납했다\n- 논리 크기 기준 모니터링과 물리 사용량 기준 모니터링이 다르다\n- 앱은 size를 보고, 운영자는 block usage를 봐야 하는 상황이다\n\n## 코드로 보기\n\n### sparse file 만들기\n\n```bash\ntruncate -s 10G sparse.img\nls -lh sparse.img\ndu -h sparse.img\ndu -h --apparent-size sparse.img\n```\n\n### preallocation 예시\n\n```bash\nfallocate -l 10G wal.segment\nstat -c '%n size=%s blocks=%b blksize=%B' wal.segment\n```\n\n### 해석 감각\n\n```text\nlogical size grows\n  != physical blocks necessarily grow\n\nfuture write into hole\n  -> may allocate blocks later\n\npreallocation now\n  -> pays space cost early to reduce later allocation surprise\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| sparse file | 초기 공간 사용이 적다 | 나중에 ENOSPC나 copy inflation이 터질 수 있다 | 이미지, 일부 snapshot |\n| preallocation | late allocation surprise를 줄인다 | 생성 시 디스크 비용이 바로 든다 | WAL, 대형 segment |\n| hole punching | 물리 사용량을 줄일 수 있다 | 파일 크기와 usage 해석이 복잡해진다 | compaction, reclaim |\n| 단순 zero-write | 직관적이다 | 느리고 fragmentation이 생길 수 있다 | 작은 파일 또는 단순 구현 |\n\n## 꼬리질문\n\n> Q: `ls -lh`와 `du -h`가 왜 다르게 보이나요?\n> 핵심: 전자는 논리 크기, 후자는 실제 할당 블록 기준이라 sparse/hole 여부에 따라 달라진다.\n\n> Q: sparse file이 항상 좋은가요?\n> 핵심: 아니다. 초기 공간은 아끼지만 later write 시점 ENOSPC나 복사 비용을 뒤로 미룰 수 있다.\n\n> Q: hole punching을 했는데 파일 크기가 왜 그대로인가요?\n> 핵심: 블록만 반납하고 논리 크기는 유지하는 방식이기 때문이다.\n\n## 한 줄 정리\n\nsparse file과 `fallocate()` 전략은 디스크를 \"지금 쓸지 나중에 쓸지\"를 결정하는 선택이며, 파일 크기와 실제 블록 사용량을 분리해서 읽는 습관이 핵심이다.\n",
+  "aliases": [
+    "sparse file fallocate hole punching",
+    "logical size allocated blocks",
+    "file hole punching",
+    "preallocation",
+    "disk usage mismatch",
+    "WAL snapshot backup sparse"
+  ],
+  "expected_queries": [
+    "sparse file의 logical size와 실제 allocated blocks는 왜 다를 수 있어?",
+    "fallocate preallocation과 hole punching은 disk usage와 crash consistency에 어떤 영향을 줘?",
+    "WAL, snapshot, backup에서 sparse file을 잘못 해석하면 어떤 문제가 생겨?",
+    "mmap live mapping과 hole punching을 함께 쓰면 왜 위험할 수 있어?"
+  ],
+  "symptoms": [
+    "sparse file의 logical size와 실제 allocated blocks를 같은 크기로 보고 disk usage, backup size, quota를 잘못 해석한다",
+    "`fallocate` preallocation과 hole punching을 모두 공간 확보 기능으로만 보고 crash consistency와 extent state 차이를 놓친다",
+    "WAL, snapshot, backup에서 sparse hole을 실제 zero block이나 누락 데이터로 잘못 분류한다",
+    "live `mmap` mapping과 hole punching이 같이 쓰일 때 SIGBUS, stale view, coherency 위험을 확인하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/sparse-file-fallocate-hole-punching.md",
+    "revision_history": []
+  }
+}

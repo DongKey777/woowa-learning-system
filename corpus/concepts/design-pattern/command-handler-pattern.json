@@ -1,0 +1,62 @@
+{
+  "id": "design-pattern/command-handler-pattern",
+  "title": "Command Handler Pattern",
+  "category": "design-pattern",
+  "level": "beginner",
+  "summary": "'이 문서는 Command Handler Pattern playbook으로, command side usecase에서",
+  "body_markdown": "# Command Handler Pattern: 검증을 어디에 두는가\n\n> 한 줄 요약: Command Handler는 검증을 한곳에 몰아넣는 클래스가 아니라, request validator, policy object, aggregate invariant를 순서대로 연결하는 유스케이스 흐름이다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n- [Layered Validation Pattern](./layered-validation-pattern.md)\n- [Aggregate Invariant Guard Pattern](./aggregate-invariant-guard-pattern.md)\n- [Policy Object Pattern](./policy-object-pattern.md)\n- [Invariant-Preserving Command Model](./invariant-preserving-command-model.md)\n- [객체지향 핵심 원리](../language/java/object-oriented-core-principles.md)\n\nretrieval-anchor-keywords: command handler validation flow, request validator in command handler, aggregate invariant in command handler, policy object in command handler, command handler validation placement, layered validation command handler, where to put validation in handler, command handler beginner, handler validation order, request validator aggregate invariant policy object, 처음 배우는데 command handler, command handler 뭐예요, command handler pattern basics, command handler pattern beginner, command handler pattern intro\n\n---\n\n## 처음 읽는다면 20초 멘탈 모델\n\nCommand Handler를 \"검증을 다 하는 큰 서비스\"로 보면 금방 헷갈린다.\n더 쉬운 그림은 **세 문을 순서대로 지나가는 안내자**다.\n\n| 문 | 맡는 질문 | 보통 두는 곳 |\n|---|---|---|\n| 입력 문 | 요청 모양이 맞는가 | request validator |\n| 정책 문 | 지금 이 상황에서 허용되는가 | policy object |\n| 도메인 문 | 이 상태 변화가 정말 가능한가 | aggregate 내부 invariant |\n\n핵심은 \"검증이 몇 개냐\"가 아니라 **실패 의미가 다른 문을 섞지 않는 것**이다.\n\n## 1페이지 배치 카드\n\n| handler 흐름 | 여기 두는 것 | 이유 | 여기 두지 않는 것 |\n|---|---|---|---|\n| 1. command 받기 | request validator | 비어 있는 값, 형식, 범위 같은 입력 오류를 빨리 막는다 | 주문 상태 전이 규칙 |\n| 2. aggregate 조회 | repository load | 정책 판단이나 상태 전이에 필요한 현재 상태를 가져온다 | dto 형식 검사 |\n| 3. 실행 가능성 판단 | policy object | 회원 등급, 시간대, 한도처럼 외부 조건이 섞인 판정을 분리한다 | aggregate 내부 컬렉션 변경 |\n| 4. 상태 변경 실행 | aggregate method + invariant guard | \"이미 배송된 주문은 취소 불가\" 같은 즉시 일관성을 aggregate가 직접 지킨다 | 외부 api 조회 로직 |\n| 5. 저장/반환 | repository save, result mapping | 유스케이스를 마무리한다 | 새 비즈니스 규칙 추가 |\n\n짧게 외우면 이 순서다.\n\n`request validator -> policy object -> aggregate invariant`\n\n## 1분 예시\n\n```java\npublic record CancelOrderCommand(Long orderId, Long actorId, String reason) {}\n\npublic final class CancelOrderHandler {\n    private final CancelOrderValidator validator;\n    private final OrderRepository orderRepository;\n    private final CancellationPolicy cancellationPolicy;\n\n    public void handle(CancelOrderCommand command) {\n        validator.validate(command);\n\n        Order order = orderRepository.get(command.orderId());\n        CancellationDecision decision =\n            cancellationPolicy.evaluate(order, command.actorId());\n\n        order.cancel(decision, command.reason());\n        orderRepository.save(order);\n    }\n}\n```\n\n```java\npublic final class Order {\n    public void cancel(CancellationDecision decision, String reason) {\n        if (status == OrderStatus.SHIPPED) {\n            throw new IllegalStateException(\"already shipped\");\n        }\n        if (!decision.allowed()) {\n            throw new PolicyViolationException(decision.reasonCode());\n        }\n        status = OrderStatus.CANCELLED;\n        cancelReason = reason;\n    }\n}\n```\n\n여기서 역할은 이렇게 나뉜다.\n\n- `validator`: `orderId`가 비었는지, `reason` 길이가 맞는지 본다.\n- `cancellationPolicy`: 취소 가능 시간, 권한, 수수료 같은 운영 규칙을 계산한다.\n- `order.cancel(...)`: 현재 주문 상태가 정말 취소 가능한지 마지막으로 지킨다.\n\n## 실패 매트릭스\n\nCommand Handler는 \"검증을 어디에 둘까\"의 답을 한 클래스에 몰아넣지 않기 위한 이름이다.\n다음 신호가 보이면 어떤 문이 섞였는지부터 나눠야 한다.\n\n| 실패 신호 | 섞인 책임 | 고치는 방향 |\n|---|---|---|\n| handler가 `if (request.reason().isBlank())`와 `if (order.isShipped())`를 같은 블록에서 처리한다 | 입력 검증과 상태 불변식 | request validator와 aggregate method로 나눈다 |\n| policy가 command DTO 필드 형식까지 검사한다 | request validation이 policy로 샜다 | policy에는 도메인 객체/스냅샷을 넘긴다 |\n| aggregate가 외부 API로 회원 등급을 조회한다 | 정책 판단과 aggregate invariant | handler가 외부 사실을 조회하고 policy가 판정한다 |\n| repository 저장 전후 side effect가 뒤섞인다 | 유스케이스와 부작용 경계 | outbox/event/after-commit으로 분리한다 |\n| 실패 예외가 모두 `IllegalArgumentException`이다 | 실패 의미가 사라졌다 | validation, policy violation, invariant violation을 분리한다 |\n\n## 면접 답변 프레임\n\n질문이 \"handler 안에 검증을 둬도 되나요?\"라면 이렇게 답할 수 있다.\n\n1. \"handler는 순서를 조립하지만 모든 검증 책임을 소유하지 않습니다.\"\n2. \"입력 모양은 request validator, 상황 판단은 policy object, 상태 전이는 aggregate invariant로 나눕니다.\"\n3. \"handler에 남는 코드는 조회, 판정 호출, 상태 변경, 저장 같은 use case orchestration입니다.\"\n4. \"테스트는 각 실패가 어느 단계에서 나는지 분리해 읽히는지가 기준입니다.\"\n\n## 자주 헷갈리는 포인트\n\n- request validator가 있다고 aggregate invariant가 없어지는 것은 아니다. 입력이 정상이어도 현재 상태 전이는 실패할 수 있다.\n- policy object가 있다고 handler가 비어야 하는 것은 아니다. handler는 여전히 순서를 조립한다.\n- aggregate가 정책 객체 없이 모든 규칙을 다 알 필요는 없다. 외부 정보가 필요한 판정은 policy object 쪽이 더 자연스럽다.\n- handler에서 `if`를 몇 줄 썼다는 이유만으로 나쁜 것은 아니다. **형식 검증, 정책 판정, 상태 전이 규칙이 한 덩어리로 섞일 때**가 더 위험하다.\n\n## 한 줄 정리\n\nCommand Handler 안의 검증 배치는 \"입력은 validator, 상황 판정은 policy, 상태 일관성은 aggregate\"로 나누면 가장 덜 헷갈린다.\n",
+  "aliases": [
+    "command handler pattern",
+    "command handler validation flow",
+    "request validator in command handler",
+    "aggregate invariant in command handler",
+    "policy object in command handler",
+    "layered validation command handler",
+    "handler validation order",
+    "커맨드 핸들러",
+    "검증 위치"
+  ],
+  "expected_queries": [
+    "Command Handler에서 request validator, policy object, aggregate invariant는 어떤 순서로 책임을 나눠?",
+    "입력 validation이 있는데 aggregate invariant guard가 또 필요한 이유가 뭐야?",
+    "Command Handler를 큰 서비스로 만들지 않고 usecase 흐름을 조립하는 방식은 어떻게 설계해?",
+    "정책 판단은 policy object에 두고 현재 상태 전이 규칙은 aggregate에 두는 기준이 뭐야?",
+    "command handler에서 validation placement를 어디에 둘지 초보자 기준으로 설명해줘"
+  ],
+  "symptoms": [
+    "Command Handler를 모든 검증과 비즈니스 규칙을 몰아넣는 큰 service class로 만든다",
+    "request validator, policy object, aggregate invariant가 맡는 실패 의미를 구분하지 못한다",
+    "입력 형식은 정상인데 현재 aggregate 상태에서 금지된 전이를 validator에서 잡으려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/layered-validation-pattern",
+      "design-pattern/aggregate-invariant-guard-pattern",
+      "design-pattern/policy-object-pattern"
+    ],
+    "next_docs": [
+      "design-pattern/command-vs-strategy-quick-bridge",
+      "design-pattern/command-pattern-undo-queue",
+      "design-pattern/invariant-preserving-command-model",
+      "design-pattern/command-bus-pattern",
+      "design-pattern/cqrs-command-query-separation-pattern-language"
+    ],
+    "confusable_with": [
+      "design-pattern/layered-validation-pattern",
+      "design-pattern/policy-object-pattern",
+      "design-pattern/aggregate-invariant-guard-pattern",
+      "design-pattern/command-bus-pattern",
+      "design-pattern/invariant-preserving-command-model",
+      "design-pattern/command-pattern-undo-queue"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/design-pattern/command-handler-pattern.md",
+    "revision_history": []
+  }
+}

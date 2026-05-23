@@ -1,0 +1,55 @@
+{
+  "id": "system-design/event-time-processing-watermark-late-data-chooser",
+  "title": "Event-Time Processing Watermark Late Data Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Event-Time Processing Watermark Late Data Chooser\n\n> 한 줄 요약: 이벤트 시간(event time)은 \"사실이 언제 일어났는가\"를, 처리 시간(processing time)은 \"시스템이 언제 봤는가\"를 말한다. 워터마크(watermark)는 window를 언제 닫을지에 대한 운영 약속이고, late data 정책은 닫힌 뒤 현실이 도착했을 때 어떻게 수정할지 정한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Streaming Analytics Pipeline Design](./streaming-analytics-pipeline-design.md)\n- [Analytics Late Data Reconciliation Design](./analytics-late-data-reconciliation-design.md)\n- [Read Model Rebuild Backfill Playbook](./read-model-rebuild-backfill-playbook.md)\n- [Projection Lag User-Facing State Router](./projection-lag-user-facing-state-router.md)\n- [DLQ Poison Message Replay Playbook](./dlq-poison-message-replay-playbook.md)\n\nretrieval-anchor-keywords: event time, processing time, watermark, allowed lateness, late data, streaming window, retraction, correction, restatement, finality status, watermark lag\n\n## 먼저 나눌 세 질문\n\nStream processing에서 자주 섞이는 질문은 세 가지다.\n\n1. 이 event를 어느 window에 넣을 것인가.\n2. 그 window를 언제 \"거의 끝났다\"고 볼 것인가.\n3. 끝났다고 발표한 뒤 늦은 event가 오면 어떻게 할 것인가.\n\nEvent time은 사용자가 행동한 시각, 결제가 승인된 시각, 센서가 측정한 시각처럼 business fact의 시간이다. Processing time은 pipeline이 그 event를 읽고 처리한 시각이다. Watermark는 processor가 \"이 event time 이전 데이터는 대부분 봤다고 간주하겠다\"고 내는 frontier다. Allowed lateness는 watermark가 window end를 지나간 뒤에도 얼마 동안 update를 허용할지 정하는 grace period다.\n\n## 10초 chooser\n\n| 질문 | 선택 | 이유 |\n|---|---|---|\n| 매출, 활동, 배송 scan을 실제 발생 시간 기준으로 집계한다 | event time | offline upload나 webhook delay에도 business day/window가 맞다 |\n| worker throughput, ingestion QPS, 현재 overload를 본다 | processing time | 시스템이 지금 처리한 일을 보는 질문이다 |\n| dashboard를 빨리 보여주되 조금 수정 가능하다 | event time + watermark + allowed lateness | latency와 완성도 사이를 조절한다 |\n| 숫자가 절대 바뀌면 안 된다고 표시했다 | final 이후 correction/restatement | silent overwrite를 피하고 이력을 남긴다 |\n| replay/backfill을 운영한다 | event time contract 재사용 | replay 전용 clock을 만들면 숫자 의미가 흔들린다 |\n\n## Event time vs processing time\n\n예를 들어 택시 주행이 10:03에 끝났지만 운전자 휴대폰이 10:17에 업로드했다고 하자. 일별/시간별 이용 통계는 10:03 window에 넣는 것이 자연스럽다. 결제가 23:59에 승인됐지만 webhook이 00:02에 왔다면 business day 매출은 23:59 기준으로 들어가야 할 수 있다. 이것이 event time이다.\n\n반대로 \"마지막 1분 동안 worker가 몇 개 message를 처리했나\", \"queue lag가 지금 늘고 있나\", \"API가 현재 과부하인가\"는 processing time이 맞다. Replayed yesterday event를 event time으로만 보면 어제 장애처럼 보일 수 있지만, processing capacity 관점에서는 오늘 처리한 load다.\n\n## Watermark는 완전한 증명이 아니다\n\nWatermark `12:00`은 \"12:00 이전 event가 절대 오지 않는다\"는 증명이 아니다. Window를 닫기 위한 운영 약속이다. Conservative watermark는 늦게 닫히고 correction이 적지만 state retention과 결과 latency가 커진다. Aggressive watermark는 빨리 결과를 내지만 late data와 correction이 늘어난다.\n\nPartition이 여러 개인 stream에서는 가장 느린 partition이 global watermark를 잡아끌 수 있다. 한 partition이 멈췄는데 idleness detection이 없으면 모든 window가 닫히지 않는다. 반대로 partition을 너무 쉽게 idle로 보면 실제 late event를 버릴 수 있다. 그래서 watermark 정책은 source SLA, partition skew, idleness detection, state retention budget과 함께 봐야 한다.\n\n## Allowed lateness와 finality\n\n5분 window가 `10:00~10:05`이고 allowed lateness가 10분이라고 하자. Watermark가 10:05를 지나면 첫 결과를 emit할 수 있다. 그 뒤 10:15까지는 늦은 event가 오면 window state를 update한다. 10:15 이후에는 state를 버리거나 final로 전환하고, 그 뒤 도착한 event는 별도 correction path로 보내야 한다.\n\n중요한 것은 finality label이다. 사용자가 본 숫자가 `provisional`인지, `within_lateness`인지, `final`인지 알 수 있어야 한다. Final이라고 표시해 놓고 late event가 조용히 숫자를 바꾸면 데이터 신뢰가 무너진다.\n\n## Retraction과 correction\n\nAllowed lateness 안의 late data는 upsert나 versioned aggregate로 처리할 수 있다. 예를 들어 hourly revenue가 처음 `100000`으로 publish됐고 늦은 결제 event가 들어와 `100350`이 되면 version 2로 update한다. Sink는 같은 window key를 idempotent하게 갱신할 수 있어야 한다.\n\nAllowed lateness 밖이면 silent overwrite가 아니라 correction을 낸다.\n\n```text\nwindow=10:00\nold_version=final-v1\ndelta=-500\nreason=late_refund\nsource_event_id=...\ncorrection_id=...\n```\n\n이 correction은 idempotent해야 한다. Replay가 같은 correction을 두 번 적용하지 않도록 correction id, source event id, affected window를 함께 둔다. Dashboard나 export는 \"이 기간은 재작성됨(restated)\" 표시와 diff를 제공해야 한다.\n\n## Wrong-bucket neighbors\n\nSchema compatibility는 event가 깨지지 않게 읽는 문제다. Late data finality를 정하지 않는다. CDC delivery semantics는 duplicate나 at-least-once를 다루지만, event가 어느 window에 속하는지는 별도다. Projection lag는 read model이 committed event를 따라잡는 속도이고, watermark lag는 event-time frontier가 어디까지 왔는지다. Backfill/replay는 과거 상태를 복구하지만, 같은 event-time/correction contract를 따라야 한다.\n\n## 운영 metric\n\n| Metric | 의미 |\n|---|---|\n| event-time lag | event 발생 시각과 처리 시각의 차이 |\n| watermark lag | watermark가 현재 event stream에 비해 얼마나 뒤처졌는가 |\n| partition skew | 특정 partition이 전체 watermark를 잡고 있는가 |\n| late-event rate by band | 1분/5분/1시간 늦은 event 분포 |\n| dropped-too-late count | allowed lateness 이후 버린 event 수 |\n| retained state bytes | lateness 정책 때문에 유지하는 state 비용 |\n| correction/retraction count | final 이후 수정 빈도 |\n| finality status in output | 사용자가 숫자의 확정성을 구분할 수 있는가 |\n\n## 한 줄 정리\n\nBusiness fact는 event time으로, pipeline load는 processing time으로 본다. Watermark는 window finality의 운영 약속이고, allowed lateness 이후 late data는 조용히 덮어쓰지 말고 correction/restatement로 남겨야 한다.\n",
+  "aliases": [
+    "event time processing time watermark chooser",
+    "watermark allowed lateness late data",
+    "event time vs processing time windowing",
+    "stream processing late event correction",
+    "retractions corrections streaming analytics",
+    "operational evidence for watermarks",
+    "이벤트 시간 워터마크",
+    "늦게 도착한 데이터 처리"
+  ],
+  "expected_queries": [
+    "stream processing에서 event time과 processing time은 언제 각각 써?",
+    "watermark와 allowed lateness가 window final 여부를 어떻게 결정해?",
+    "allowed lateness 이후에 late data가 오면 correction이나 restatement를 어떻게 해야 해?",
+    "watermark lag와 correction rate가 정상인지 어떤 metric으로 검증해?"
+  ],
+  "symptoms": [
+    "dashboard window가 끝난 것처럼 보였는데 늦게 온 event 때문에 숫자가 다시 바뀐다",
+    "processing time 집계를 써서 모바일 offline event가 실제 발생 시간이 아니라 업로드 시간에 잡힌다",
+    "watermark lag가 커지고 state retention이 늘지만 allowed lateness 정책이 없다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/streaming-analytics-pipeline-design",
+      "system-design/analytics-late-data-reconciliation-design"
+    ],
+    "next_docs": [
+      "system-design/read-model-rebuild-backfill-playbook",
+      "system-design/projection-lag-user-facing-state-router",
+      "system-design/alert-reevaluation-correction-design"
+    ],
+    "confusable_with": [
+      "system-design/streaming-analytics-pipeline-design",
+      "system-design/analytics-late-data-reconciliation-design",
+      "system-design/projection-lag-user-facing-state-router",
+      "system-design/read-model-rebuild-backfill-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/event-time-processing-watermark-late-data-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "id": "system-design/write-freeze-rollback-window-design",
+  "title": "Write-Freeze Rollback Window 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Write-Freeze Rollback Window 설계\n\n> 한 줄 요약: write-freeze rollback window 설계는 최종 handoff를 위해 잠깐 쓰기를 동결한 뒤 얼마나 오랫동안 빠른 rollback을 허용할지, donor/receiver를 어떤 상태로 유지할지 정하는 stateful cutover 운영 설계다.\n\nretrieval-anchor-keywords: write freeze rollback window, fenced rollback window, handoff rollback, donor drain window, reversible cutover, freeze rollback boundary, stateful rollback soak, short freeze safety, cutover reversibility, donor tombstone delay\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Receiver Warmup / Cache Prefill / Write Freeze Cutover 설계](./receiver-warmup-cache-prefill-write-freeze-cutover-design.md)\n> - [Shard Rebalancing / Partition Relocation 설계](./shard-rebalancing-partition-relocation-design.md)\n> - [Cleanup Point-of-No-Return 설계](./cleanup-point-of-no-return-design.md)\n> - [Deploy Rollback Safety / Compatibility Envelope 설계](./deploy-rollback-safety-compatibility-envelope-design.md)\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Traffic Shadowing / Progressive Cutover 설계](./traffic-shadowing-progressive-cutover-design.md)\n> - [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)\n> - [Transaction Basics](../database/transaction-basics.md)\n\n## 핵심 개념\n\n짧은 write freeze로 handoff를 끝냈다고 해서 바로 완전히 안전한 것은 아니다.\n전환 직후에도 다음 문제가 남는다.\n\n- stale route가 늦게 도착\n- receiver hit ratio가 아직 불안정\n- donor drain 중 늦은 write가 발견\n- rollback 필요 여부가 몇 분 뒤에 보임\n\n그래서 실전에서는 freeze 자체보다 **freeze 이후 얼마 동안 reversible 상태를 유지할 것인가**가 중요하다.\n\n여기서 말하는 rollback window는 **DB transaction의 `commit/rollback` 버튼**이 아니다.\n이 문서는 이미 끝난 cutover를 운영적으로 얼마나 오래 되돌릴 수 있게 둘지 다루며,\nDB 안의 트랜잭션 경계가 헷갈리면 [Transaction Basics](../database/transaction-basics.md)를 먼저 보는 편이 맞다.\n또 \"방금 쓴 값이 왜 안 보여?\"처럼 read path 신선도 문제가 핵심이면\n[Read-After-Write Routing Primer](./read-after-write-routing-primer.md)로 내려가는 편이 빠르다.\n\n## 깊이 들어가기\n\n### 1. 왜 rollback window가 필요한가\n\n최종 handoff 직후 바로 donor를 제거하면 다음 상황에서 곤란하다.\n\n- receiver latency spike\n- hidden consistency bug\n- cache prefill miss\n- routing version drift\n\n즉, final switch는 성공했더라도 \"짧은 되돌릴 시간\"이 필요하다.\n\n### 2. Capacity Estimation\n\n예:\n\n- final write freeze 300ms\n- rollback window 15분\n- donor read-only drain 30분\n- stale route tail 2분\n\n이때 봐야 할 숫자:\n\n- rollback decision latency\n- stale route miss tail\n- donor retention cost\n- receiver error burst duration\n- reversible window success rate\n\nfreeze는 짧아야 하지만 rollback window는 너무 짧아도 운영상 무의미할 수 있다.\n\n### 3. Freeze 이후 상태 모델\n\n보통 다음처럼 나눈다.\n\n```text\nFREEZE\n -> CUTOVER\n -> REVERSIBLE_SOAK\n -> DONOR_DRAIN\n -> IRREVERSIBLE_CLEANUP\n```\n\n핵심은 switch와 irreversible cleanup을 분리하는 것이다.\n\n### 4. Donor state 유지 정책\n\nrollback window 동안 donor를 어떻게 둘지 정해야 한다.\n\n선택지:\n\n- read-only donor\n- hidden standby donor\n- tombstoned but restorable\n- immediate delete 금지\n\n이 정책이 있어야 fast rollback이 가능하다.\n\n### 5. Rollback trigger\n\n대표 trigger:\n\n- receiver error rate spike\n- hit ratio collapse\n- write verification mismatch\n- stale route miss burst\n- operator manual abort\n\n즉, rollback window는 시간만의 문제가 아니라 어떤 신호가 오면 되돌릴지의 정책이 필요하다.\n\n### 6. Scope granularity\n\nrollback은 항상 전체일 필요가 없다.\n\n- shard 단위\n- tenant 단위\n- cell 단위\n- region 단위\n\nscope를 좁힐 수 있을수록 donor 유지 비용과 blast radius를 줄일 수 있다.\n\n### 7. Observability\n\n운영자는 다음을 즉시 알아야 한다.\n\n- 지금 reversible soak 구간인가\n- rollback window가 몇 분 남았는가\n- donor가 어떤 상태로 살아 있는가\n- 어떤 trigger가 rollback 후보를 만들고 있는가\n- irreversible cleanup이 아직 막혀 있는가\n\nrollback window는 시간보다도 상태를 명확히 보여 주는 것이 중요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: shard handoff 직후 receiver p99 급등\n\n문제:\n\n- write freeze는 성공했지만 receiver가 cold path를 제대로 흡수하지 못한다\n\n해결:\n\n- rollback window 안에서 donor로 되돌린다\n- receiver는 debug mode로 격리한다\n- prefill / warmup 정책을 보정한 뒤 재시도한다\n\n### 시나리오 2: tenant reassignment 후 hidden stale route\n\n문제:\n\n- 일부 client가 아직 old partition으로 요청을 보낸다\n\n해결:\n\n- donor read-only drain을 유지한다\n- stale route miss를 metric으로 본다\n- rollback window 중이면 빠르게 되돌릴 수 있게 둔다\n\n### 시나리오 3: cleanup 직전 late inconsistency 발견\n\n문제:\n\n- soak는 지나갔지만 donor purge 직전에 verification mismatch가 보인다\n\n해결:\n\n- irreversible cleanup을 즉시 멈춘다\n- rollback boundary가 아직 남아 있으면 donor state를 다시 활성화한다\n- 아니면 correction plan으로 전환한다\n\n## 코드로 보기\n\n```pseudo\nfunction afterCutover(scope):\n  state.mark(scope, \"REVERSIBLE_SOAK\")\n  donor.setReadOnly(scope)\n  startTimer(scope.rollbackWindow)\n\nfunction maybeRollback(scope):\n  if state.isReversible(scope) and rollbackTriggersFired(scope):\n    switchBack(scope, donor)\n    state.mark(scope, \"ROLLED_BACK\")\n```\n\n```java\npublic boolean canRollback(ScopeId scopeId) {\n    return cutoverState.current(scopeId).isReversible()\n        && donorStateRepository.available(scopeId);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| No rollback window | 단순하다 | hidden defect에 취약하다 | very low-risk move |\n| Short reversible soak | 안전하다 | donor 비용이 남는다 | 대부분의 stateful cutover |\n| Long donor retention | rollback이 쉽다 | 운영 비용과 ambiguity가 커진다 | high-value state |\n| Scoped rollback window | 효율이 좋다 | scope metadata가 필요하다 | tenant/shard-aware platform |\n\n핵심은 write-freeze rollback window 설계가 freeze의 부가물 아니라 **final handoff 이후 짧은 되돌림 가능성을 운영적으로 보존하는 상태 전이 설계**라는 점이다.\n\n## 꼬리질문\n\n> Q: freeze가 성공했으면 rollback window는 불필요한가요?\n> 의도: handoff와 post-cutover risk 차이 이해 확인\n> 핵심: 아니다. final race는 끝났더라도 cold path, stale routing, hidden mismatch는 전환 직후에야 보일 수 있다.\n\n> Q: donor를 read-only로 남기는 이유는?\n> 의도: reversible state 유지 확인\n> 핵심: 늦은 read와 빠른 rollback 가능성을 보존하면서 new write 오염은 막기 위해서다.\n\n> Q: rollback window를 너무 길게 두면 왜 문제인가요?\n> 의도: safety vs ambiguity 균형 확인\n> 핵심: donor 비용과 운영 복잡도, old/new ambiguity가 계속 남기 때문이다.\n\n> Q: irreversible cleanup과 어떤 관계가 있나요?\n> 의도: rollback boundary와 cleanup 연결 확인\n> 핵심: rollback window가 끝나는 순간 cleanup gate를 열 수 있지만, 그 전에는 donor purge와 destructive cleanup을 막아야 한다.\n\n## 한 줄 정리\n\nWrite-freeze rollback window 설계는 최종 handoff 후에도 잠시 donor와 rollback trigger를 유지해, stateful cutover의 마지막 숨은 위험을 흡수하는 운영 설계다.\n",
+  "aliases": [
+    "write freeze rollback window",
+    "reversible soak window",
+    "donor read only drain",
+    "cutover rollback window",
+    "stateful cutover rollback soak",
+    "freeze handoff rollback",
+    "rollback window vs transaction rollback"
+  ],
+  "expected_queries": [
+    "write freeze rollback window은 무엇이고 cutover 뒤에 왜 따로 필요해?",
+    "rollback window와 transaction rollback은 무엇이 다른가?",
+    "donor를 read-only로 남기는 reversible soak은 언제 끝내야 해?",
+    "stateful cutover 뒤 fast rollback trigger를 어떻게 정하나?"
+  ],
+  "symptoms": [
+    "migration cutover 뒤에 rollback window를 얼마나 열어 둬야 할지 감이 안 온다",
+    "rollback window와 DB transaction rollback을 같은 뜻으로 이해해서 문서를 잘못 찾고 있다",
+    "donor를 언제 read-only로 남기고 언제 cleanup으로 넘겨도 되는지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/receiver-warmup-cache-prefill-write-freeze-cutover-design",
+      "system-design/traffic-shadowing-progressive-cutover-design",
+      "system-design/cleanup-point-of-no-return-design"
+    ],
+    "next_docs": [
+      "system-design/dedicated-cell-drain-retirement-design",
+      "system-design/config-rollback-safety-design"
+    ],
+    "confusable_with": [
+      "database/transaction-basics",
+      "system-design/read-after-write-routing-primer",
+      "system-design/cleanup-point-of-no-return-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/write-freeze-rollback-window-design.md",
+    "revision_history": []
+  }
+}

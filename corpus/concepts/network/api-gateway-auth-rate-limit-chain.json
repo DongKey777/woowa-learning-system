@@ -1,0 +1,56 @@
+{
+  "id": "network/api-gateway-auth-rate-limit-chain",
+  "title": "API Gateway Auth Rate Limit Chain",
+  "category": "network",
+  "level": "advanced",
+  "summary": "'이 문서는 API Gateway의 auth, authorization, rate limit, logging, routing을 정책 체인으로",
+  "body_markdown": "# API Gateway Auth Rate Limit Chain\n\n> 한 줄 요약: API Gateway의 인증과 rate limit은 따로 붙이는 기능이 아니라, 어떤 순서로 검사하고 어떤 실패를 돌려줄지까지 포함한 운영 체인이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [API Gateway, Reverse Proxy 운영 포인트](./api-gateway-reverse-proxy-operational-points.md)\n> - [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)\n> - [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n> - [Service Mesh, Sidecar Proxy](./service-mesh-sidecar-proxy.md)\n> - [Expect 100-continue, Proxy Request Buffering](./expect-100-continue-proxy-request-buffering.md)\n> - [Gateway Buffering vs Spring Early Reject](./gateway-buffering-vs-spring-early-reject.md)\n> - [HTTP Request Body Drain, Early Reject, Keep-Alive Reuse](./http-request-body-drain-early-reject-keepalive-reuse.md)\n\nretrieval-anchor-keywords: API gateway auth, rate limit chain, early reject, JWT validation, token bucket, tenant quota, request buffering, 401 vs 403 vs 429, gateway policy, auth before body, upload auth before body, spring early reject bridge\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 이 주제가 중요한가](#왜-이-주제가-중요한가)\n- [체인의 기본 순서](#체인의-기본-순서)\n- [Auth 설계 포인트](#auth-설계-포인트)\n- [Rate Limit 설계 포인트](#rate-limit-설계-포인트)\n- [실전 장애 패턴](#실전-장애-패턴)\n- [코드로 보기](#코드로-보기)\n- [면접에서 자주 나오는 질문](#면접에서-자주-나오는-질문)\n\n</details>\n\n## 왜 이 주제가 중요한가\n\n게이트웨이에서 인증과 rate limit은 자주 같은 요청 흐름에 붙는다.\n\n- 누가 보냈는지 먼저 확인한다\n- 그 사용자가 얼마만큼 쓸 수 있는지 본다\n- 이상하면 바로 막는다\n- 통과한 요청만 백엔드로 넘긴다\n\n이때 순서가 어긋나면:\n\n- 인증 안 된 요청이 rate limit 자원을 소모한다\n- 인증된 사용자도 잘못 차단된다\n- 에러 코드가 모호해져서 운영이 어려워진다\n\n즉 이건 단순한 미들웨어 조합이 아니라 **정책 체인**이다.\n\n### Retrieval Anchors\n\n- `API gateway auth`\n- `rate limit chain`\n- `early reject`\n- `JWT validation`\n- `token bucket`\n- `tenant quota`\n- `request buffering`\n- `401 vs 403 vs 429`\n\n---\n\n## 체인의 기본 순서\n\n실무에서 자주 쓰는 흐름은 대체로 이렇다.\n\n1. TLS 종료와 기본 헤더 정리\n2. 인증 정보 추출\n3. 토큰/키 검증\n4. 권한과 scope 확인\n5. rate limit 확인\n6. 로깅과 추적 ID 부여\n7. upstream 라우팅\n\n### 왜 이 순서인가\n\n- 먼저 누구인지 알아야 개별 quota를 적용할 수 있다\n- 인증이 실패한 요청에 비싼 rate limit 카운터를 쓰면 낭비다\n- 반대로 rate limit을 먼저 두면 익명 트래픽 폭주를 먼저 막을 수 있다\n\n그래서 실제 순서는 시스템 목적에 따라 조금 달라진다.\n대용량 업로드 API라면 auth를 빨리 끝내는 것만큼 [HTTP Request Body Drain, Early Reject, Keep-Alive Reuse](./http-request-body-drain-early-reject-keepalive-reuse.md)처럼 남은 body를 어떻게 정리할지도 중요하다.\n\n### 중요한 건 일관성이다\n\n- 인증 실패는 보통 `401`\n- 권한 부족은 보통 `403`\n- 제한 초과는 보통 `429`\n\n이 구분이 흔들리면 클라이언트도, 운영자도 헷갈린다.\n\n---\n\n## Auth 설계 포인트\n\n### 어떤 인증 수단을 지원할지 정해야 한다\n\n- JWT\n- API key\n- OAuth access token\n- mTLS\n\n게이트웨이가 너무 많은 인증 방식을 다 떠안으면 정책이 복잡해진다.\n\n### 토큰 검증의 현실\n\n- 서명 검증은 로컬에서 가능하다\n- 공개키 회전은 별도 캐시가 필요하다\n- exp, aud, iss, scope를 꼼꼼히 봐야 한다\n\n토큰이 \"형식상 유효\"한 것과 \"이 API를 호출해도 되는 것\"은 다르다.\n\n### 헤더 신뢰 문제\n\n프록시 뒤에서는 클라이언트가 `X-Forwarded-*`를 임의로 넣을 수 있다.\n\n- 신뢰 가능한 프록시 체인인지 확인해야 한다\n- 인증 정보는 외부 헤더보다 검증된 토큰을 우선해야 한다\n- 내부 서비스용 헤더는 게이트웨이에서 재작성하는 편이 안전하다\n\n### 인증 실패 응답\n\n- `401 Unauthorized`는 인증 자체가 실패한 경우에 쓴다\n- `403 Forbidden`은 인증은 됐지만 권한이 없는 경우에 쓴다\n\n이 차이는 클라이언트 구현과 장애 분석에 직접 영향을 준다.\n\n---\n\n## Rate Limit 설계 포인트\n\n### 무엇을 기준으로 제한할지\n\n- IP 기준\n- 사용자 기준\n- API key 기준\n- 조직/테넌트 기준\n- 엔드포인트 기준\n\n실무에서는 하나만 쓰기보다 여러 키를 섞는다.\n\n### 어떤 알고리즘을 쓸지\n\n- Fixed window: 단순하다\n- Sliding window: 더 부드럽다\n- Token bucket: burst를 허용하면서 평균 속도를 제한한다\n- Leaky bucket: 일정한 배출을 강제한다\n\n운영에서는 token bucket이 자주 보인다.\n\n### 분산 환경에서 어려운 점\n\n게이트웨이가 여러 대면 카운터를 어떻게 공유할지 정해야 한다.\n\n- Redis 같은 외부 저장소를 쓴다\n- 로컬 캐시는 짧게만 쓴다\n- eventual consistency를 받아들일지 정한다\n\n여기서 중요한 건 정확도와 지연의 균형이다.\n\n### 429를 어떻게 다룰지\n\n- `Retry-After`를 줄지\n- 사용자별로 다른 한도를 줄지\n- burst와 steady-state를 분리할지\n\nrate limit은 단순 차단이 아니라 **사용량 제어 인터페이스**다.\n\n---\n\n## 실전 장애 패턴\n\n### 1. 인증 서버가 느려서 전체 API가 막힌다\n\n원인:\n\n- 게이트웨이가 매 요청마다 원격 introspection을 한다\n- auth 서비스가 병목이 된다\n- timeout이 길어져 대기열이 늘어난다\n\n대응:\n\n- 서명 검증 가능한 토큰은 로컬 검증으로 바꾼다\n- auth 결과를 짧게 캐시한다\n- auth timeout을 백엔드 timeout보다 짧게 둔다\n\n### 2. rate limit이 로그인 직후부터 이상하다\n\n원인:\n\n- 사용자 식별자가 아직 확정되지 않았다\n- 익명 구간과 로그인 구간의 키가 다르다\n- 여러 프록시가 client IP를 잘못 전달한다\n\n이 경우 IP 기준과 사용자 기준 한도를 분리해야 한다.\n\n### 3. 프록시 여러 단을 거치면 차단이 흔들린다\n\n원인:\n\n- trust proxy 설정이 잘못됐다\n- `X-Forwarded-For` 체인을 잘못 해석한다\n- 내부망 IP를 클라이언트 IP로 착각한다\n\n이 문제는 rate limit만이 아니라 감사 로그, 보안 정책까지 망가뜨린다.\n\n### 4. retry가 rate limit을 더 악화시킨다\n\n원인:\n\n- 클라이언트가 429나 401에도 재시도한다\n- 게이트웨이와 앱이 둘 다 retry한다\n- 한 번 막힌 요청이 폭발적으로 반복된다\n\n이건 [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)과 바로 연결된다.\n\n---\n\n## 코드로 보기\n\n### 게이트웨이 체인 감각\n\n```text\nrequest ->\n  tls terminate ->\n  auth check ->\n  quota / rate limit ->\n  route upstream ->\n  log / trace\n```\n\n### Nginx 감각 예시\n\n```nginx\nlocation /api/ {\n    limit_req zone=api burst=20 nodelay;\n    proxy_set_header X-Request-Id $request_id;\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n    proxy_pass http://backend;\n}\n```\n\n### 운영에서 확인할 것\n\n```bash\ncurl -i https://api.example.com/v1/me\ncurl -i -H \"Authorization: Bearer <token>\" https://api.example.com/v1/me\nkubectl logs deploy/api-gateway\n```\n\n중요한 관찰 포인트:\n\n- 401, 403, 429 비율\n- auth latency\n- rate limit hit ratio\n- 특정 사용자나 IP에 편중되는지\n\n### 토큰 캐시 감각\n\n```text\n검증 비용이 큰 auth는 짧게 캐시하고,\n권한이 자주 바뀌는 구간은 캐시를 짧게 둔다.\n```\n\n캐시를 길게 두면 성능은 좋아지지만, 권한 회수 반영이 늦어진다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 인증 먼저, rate limit 나중 | 사용자별 정책이 명확하다 | 익명 트래픽 차단이 늦을 수 있다 | 로그인 기반 API |\n| rate limit 먼저, 인증 나중 | 공격 트래픽을 빨리 줄인다 | 사용자별 정확도가 낮다 | 공개 API |\n| 원격 auth introspection | 중앙 정책 관리가 쉽다 | 지연과 병목이 생긴다 | 보안 중심 시스템 |\n| 로컬 JWT 검증 | 빠르고 독립적이다 | 키 회전과 폐기 처리가 필요하다 | 일반적인 게이트웨이 |\n\n핵심은 \"기능을 붙이는 것\"이 아니라 **어떤 실패를 먼저 차단할지 정하는 것**이다.\n\n---\n\n## 면접에서 자주 나오는 질문\n\n### Q. 인증과 인가는 무엇이 다른가요?\n\n- 인증은 누구인지 확인하는 것이고, 인가는 그 사용자가 무엇을 할 수 있는지 확인하는 것이다.\n\n### Q. rate limit은 왜 게이트웨이에 두나요?\n\n- 백엔드로 들어가기 전에 트래픽을 제어해 비용과 장애 확산을 줄이기 위해서다.\n\n### Q. 왜 401, 403, 429를 구분하나요?\n\n- 실패 이유가 다르기 때문이다. 인증 실패, 권한 부족, 요청 제한 초과를 구분해야 클라이언트와 운영이 올바르게 대응할 수 있다.\n\n### Q. rate limit을 인증보다 먼저 두면 안 되나요?\n\n- 가능은 하지만, 사용자별 quota가 필요한 경우엔 부정확해진다. 공개 API처럼 익명 트래픽 방어가 중요한 경우에 더 적합하다.\n\n---\n\n## 한 줄 정리\n\nAPI Gateway의 auth와 rate limit은 개별 기능이 아니라, **검증 순서와 실패 응답까지 설계해야 하는 운영 체인**이다.\n",
+  "aliases": [
+    "API gateway auth rate limit chain",
+    "gateway auth before rate limit",
+    "JWT validation token bucket",
+    "tenant quota gateway",
+    "401 vs 403 vs 429",
+    "upload auth before body",
+    "gateway policy chain"
+  ],
+  "expected_queries": [
+    "API Gateway에서 auth와 rate limit은 어떤 순서로 검사하고 401 403 429를 어떻게 나눠야 해?",
+    "JWT 검증과 tenant quota token bucket을 gateway policy chain으로 설계하는 기준은?",
+    "인증 안 된 요청이 rate limit 자원을 소모하지 않게 하려면 어떤 순서를 봐야 해?",
+    "대용량 upload API에서 auth early reject와 body drain keep-alive reuse를 같이 보는 이유는?",
+    "gateway auth rate limit chain에서 익명 폭주 차단과 사용자별 quota를 어떻게 균형 잡아?"
+  ],
+  "symptoms": [
+    "API Gateway 인증과 rate limit을 독립 middleware로만 보고 검사 순서와 실패 코드 계약을 운영 정책 체인으로 설계하지 않는다",
+    "인증되지 않은 요청이 rate limit 자원을 소모하거나, 익명 폭주 차단을 못 하는 순서 tradeoff를 고려하지 않는다",
+    "대용량 upload에서 early reject 뒤 request body drain과 keep-alive reuse를 함께 설계하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/api-gateway-reverse-proxy-operational-points",
+      "network/http-status-codes-basics"
+    ],
+    "next_docs": [
+      "network/gateway-buffering-vs-spring-early-reject",
+      "network/http-request-body-drain-early-reject-keepalive-reuse",
+      "network/expect-100-continue-proxy-request-buffering"
+    ],
+    "confusable_with": [
+      "network/api-gateway-reverse-proxy-operational-points",
+      "network/expect-100-continue-proxy-request-buffering",
+      "network/gateway-buffering-vs-spring-early-reject",
+      "network/http-request-body-drain-early-reject-keepalive-reuse",
+      "network/forwarded-x-forwarded-for-x-real-ip-trust-boundary"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/api-gateway-auth-rate-limit-chain.md",
+    "revision_history": []
+  }
+}

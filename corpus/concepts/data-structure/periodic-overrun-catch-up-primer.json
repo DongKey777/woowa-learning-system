@@ -1,0 +1,55 @@
+{
+  "id": "data-structure/periodic-overrun-catch-up-primer",
+  "title": "Periodic Overrun Catch-Up Primer",
+  "category": "data-structure",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Periodic Overrun Catch-Up Primer\n\n> 한 줄 요약: 반복 작업이 주기보다 오래 걸리면 scheduler는 보통 네 가지 중 하나를 택한다. **원래 박자를 따라잡으려 하거나(catch-up), 점점 늦어지거나(drift), 늦은 회차를 건너뛰거나(skip), 여러 번 밀린 일을 한 번으로 합치기도(coalesce)** 한다.\n\n**난이도: 🟢 Beginner**\n\n> 관련 문서:\n> - [Fixed Rate vs Fixed Delay Overrun Primer](./fixed-rate-vs-fixed-delay-overrun-primer.md)\n> - [Periodic Scheduling Drift vs Backlog Primer](./periodic-scheduling-drift-vs-backlog-primer.md)\n> - [Slow Periodic Task Primer](./slow-periodic-task-primer.md)\n> - [DelayQueue Repeating Task Primer](./delayqueue-repeating-task-primer.md)\n> - [ScheduledExecutorService vs DelayQueue Bridge](./scheduledexecutorservice-vs-delayqueue-bridge.md)\n> - [Bounded Queue Policy Primer](./bounded-queue-policy-primer.md)\n>\n> retrieval-anchor-keywords: periodic overrun catch up primer, periodic overrun beginner, fixed rate catch up primer, repeating task catch up policy, scheduler catch up drift skip coalesce, periodic task runtime longer than period, scheduled task overrun policy, delayqueue repeating task catch up, scheduleatfixedrate catch up, schedulewithfixeddelay drift, skip missed ticks, coalesce missed periods, timer overrun policy table, java repeating task overrun beginner, periodic backlog drift skip coalesce, 주기 작업 오버런, catch-up drift skip coalesce, 밀린 주기 작업 처리, 늦은 틱 건너뛰기, 주기 작업 드리프트\n\n## 먼저 감각부터\n\n초보자에게는 반복 작업을 이렇게 보면 쉽다.\n\n> scheduler queue에는 \"이 작업의 다음 실행 ticket 한 장\"이 들어 있다.\n\n작업이 `period = 5초`인데 실제 실행이 `8초` 걸리면,\n다음 ticket이 나와야 할 시각보다 항상 늦게 끝난다. 이 상태를 여기서는 **overrun**이라고 부른다.\n\n그러면 scheduler는 \"늦은 작업을 어떻게 처리할지\" 정책을 골라야 한다.\n\n## 한눈에 보는 네 가지 반응\n\n가정:\n\n- 원래 주기: `5초`\n- 실제 실행 시간: `8초`\n- worker: 1개\n\n| 정책 감각 | 초보자용 한 줄 | 보이는 결과 |\n|---|---|---|\n| catch-up | 놓친 박자를 따라잡으려 함 | 끝나자마자 다시 실행될 수 있음 |\n| drift | 이번 실행이 끝난 시각에서 다시 출발 | 전체 스케줄이 점점 뒤로 밀림 |\n| skip | 늦은 회차를 일부 버리고 최신 박자로 점프 | 실행 횟수는 줄지만 원래 cadence를 다시 맞추기 쉬움 |\n| coalesce | 여러 번 밀린 일을 한 번 처리로 합침 | 중복 일은 줄이지만 \"몇 회차를 합쳤는지\" 의미를 설계해야 함 |\n\n이 문서에서는 이 네 단어를 먼저 분리하는 것이 목표다.\n\n## Chooser 결정 축\n\noverrun이 보이면 API 이름보다 \"밀린 회차의 의미\"를 먼저 고른다.\n\n| 결정 축 | 먼저 물을 질문 | 가까운 정책 |\n|---|---|---|\n| 회차 보존 | 모든 tick이 비즈니스적으로 한 번씩 의미 있나 | catch-up 또는 drift |\n| 원래 cadence | 벽시계 박자에 복귀해야 하나 | catch-up 또는 skip |\n| 휴식/안정성 | 작업 사이 쉬는 간격이 중요한가 | drift |\n| 최신성 | 중간 회차보다 최신 상태만 중요한가 | skip 또는 coalesce |\n| 중복 비용 | 밀린 여러 회차를 한 번으로 대표 처리해도 되나 | coalesce |\n\n## Wrong-bucket 이웃\n\n| 증상 | 잘못 들어간 bucket | 더 맞는 분리 |\n|---|---|---|\n| 끝나자마자 다시 실행됨 | 무조건 버그 | fixed-rate catch-up일 수 있다 |\n| 실행이 점점 늦어짐 | scheduler가 tick을 잃어버림 | fixed-delay drift일 수 있다 |\n| skip과 coalesce를 같은 말로 씀 | missed tick 처리 혼동 | skip은 버림, coalesce는 대표 처리 |\n| 모든 회차를 반드시 실행해야 함 | skip/coalesce 선택 | 회차 보존이면 catch-up/drift 축을 먼저 본다 |\n\n## 1. catch-up: \"밀린 박자 따라잡기\"\n\n가장 흔한 예는 `scheduleAtFixedRate` 같은 fixed-rate 쪽이다.\n\n> 다음 ticket을 \"이전 예정 시각 + period\"로 계산한다.\n\n그래서 실행이 늦으면 다음 ticket deadline이 이미 과거가 될 수 있다.\n\n| 시각 | 무슨 일이 보이나 |\n|---|---|\n| `t=0` | 1회차 시작 |\n| `t=8` | 1회차 종료 |\n| `t=8` | 원래 2회차는 `t=5`였으므로 이미 늦음 |\n| `t=8` | worker가 거의 바로 2회차를 시작할 수 있음 |\n| `t=16` | 2회차 종료. 원래 3회차는 `t=10`, 4회차는 `t=15`였음 |\n\n```text\nplanned tick:  0 --- 5 --- 10 --- 15 --- 20\nactual start:  0 ------- 8 ------- 16 -------\n```\n\n초보자 감각으로는 이렇다.\n\n- \"실행 후 5초 쉰다\"가 아니다.\n- 이미 늦은 tick이 있으면 바로 다음 실행으로 이어질 수 있다.\n- 원래 벽시계 박자를 중요하게 볼 때 이런 정책이 쓰인다.\n\n## 2. drift: \"이번 실행 기준으로 다시 시작\"\n\n대표 예는 `scheduleWithFixedDelay` 같은 fixed-delay 쪽이다.\n\n> 다음 ticket을 \"이번 실행 종료 시각 + delay\"로 계산한다.\n\n이 방식은 놓친 회차를 따라잡으려 하지 않는다.\n\n| 시각 | 무슨 일이 보이나 |\n|---|---|\n| `t=0` | 1회차 시작 |\n| `t=8` | 1회차 종료 |\n| `t=13` | 5초 쉬고 2회차 시작 |\n| `t=21` | 2회차 종료 |\n| `t=26` | 다시 5초 쉬고 3회차 시작 |\n\n```text\nideal beat:    0 --- 5 --- 10 --- 15 --- 20\nactual start:  0 ------- 13 ------- 26 -------\n```\n\n여기서는 catch-up 대신 **drift**가 커진다.\n\n- 작업 사이 쉬는 간격은 읽기 쉽다.\n- 하지만 \"매 5초 정각\" 같은 원래 cadence는 점점 멀어진다.\n\n## 3. skip: \"놓친 회차를 버리고 최신 박자로 점프\"\n\n어떤 작업은 모든 회차를 꼭 다 실행할 필요가 없다.\n\n예:\n\n- \"현재 캐시 상태를 5초마다 다시 계산\"\n- \"최신 메트릭을 주기적으로 집계\"\n\n이런 일은 `t=5`, `t=10` 회차를 둘 다 따로 실행하기보다,\n이미 늦었다면 **가장 최근 박자 하나만 남기고 건너뛰는 정책**이 더 자연스러울 수 있다.\n\n| 질문 | skip 정책의 답 |\n|---|---|\n| 늦은 회차를 모두 다시 실행하나 | 아니오 |\n| 원래 cadence로 복귀하려 하나 | 예, 자주 그렇다 |\n| 적합한 일 | \"최신 상태만 중요\"한 주기 작업 |\n| 부적합한 일 | 각 회차가 반드시 한 번씩 실행되어야 하는 작업 |\n\n초보자 체크 문장:\n\n> \"빠진 회차 하나하나가 비즈니스적으로 의미가 있나?\"\n\n의미가 없다면 skip을 검토할 수 있다.\n\n## 4. coalesce: \"밀린 여러 번을 한 번으로 합치기\"\n\nskip과 비슷해 보이지만 질문이 조금 다르다.\n\n- skip: 아예 몇 회차를 버린다.\n- coalesce: 여러 회차를 **한 번의 실행에서 대표 처리**한다.\n\n예:\n\n- 변경 이벤트가 20번 밀렸지만 \"다시 전체 스캔 1번\"이면 충분한 작업\n- UI 갱신 요청이 여러 번 왔지만 마지막 상태만 그리면 되는 작업\n\n| 상황 | coalesce가 잘 맞는 이유 |\n|---|---|\n| 최신 상태만 맞으면 된다 | 마지막 상태 1번 반영으로 충분 |\n| 중간 변화 하나하나는 중요하지 않다 | 중복 작업을 줄일 수 있다 |\n| 비싼 계산이라 반복 catch-up이 더 위험하다 | 한 번 합쳐 처리하는 편이 안전하다 |\n\n하지만 주의할 점도 있다.\n\n- \"몇 회차가 밀렸는지\"를 버려도 되는지 먼저 확인해야 한다.\n- 회차 수 자체가 의미 있는 작업이면 coalesce가 의미를 깨뜨릴 수 있다.\n\n## 5. 네 정책을 같은 표로 고르기\n\n| 질문 | catch-up | drift | skip | coalesce |\n|---|---|---|---|---|\n| 원래 박자가 중요한가 | 가장 적합 | 덜 적합 | 적합할 수 있음 | 경우에 따라 다름 |\n| 작업 사이 휴식이 중요한가 | 약함 | 강함 | 중간 | 중간 |\n| 모든 회차를 꼭 실행해야 하나 | 가장 잘 맞음 | 실행 수는 유지되지만 늦어짐 | 맞지 않음 | 맞지 않을 수 있음 |\n| 최신 상태만 중요하나 | 과한 경우가 많음 | 가능 | 잘 맞음 | 매우 잘 맞음 |\n| 과부하 때 중복 실행을 줄이나 | 아니오 | 일부 | 예 | 예 |\n\nbeginner 기준에서는 먼저 이렇게 보면 된다.\n\n1. 모든 회차가 의미 있으면 `catch-up` 또는 `drift` 쪽을 본다.\n2. 최신 상태만 중요하면 `skip` 또는 `coalesce`를 본다.\n3. 원래 cadence가 더 중요하면 `catch-up/skip`, 휴식과 안정성이 더 중요하면 `drift/coalesce`를 우선 본다.\n\n## 6. Java에서 흔히 만나는 모습\n\n| Java 감각 | 초보자용 해석 |\n|---|---|\n| `scheduleAtFixedRate` | 기본적으로 catch-up 성향 |\n| `scheduleWithFixedDelay` | 기본적으로 drift 성향 |\n| 직접 self-rescheduling 구현 | skip / coalesce 같은 커스텀 정책을 넣기 쉬움 |\n| `DelayQueue` 기반 scheduler 설계 | 다음 ticket 계산 정책을 코드로 드러내기 좋음 |\n\n즉 Java API 이름보다 더 중요한 질문은 이것이다.\n\n> \"다음 ticket을 어떤 시각으로 다시 넣을 것인가, 그리고 늦은 회차를 모두 살릴 것인가?\"\n\n## 7. 자주 하는 오해\n\n1. overrun이면 무조건 버그라고 생각한다.\n2. catch-up이면 queue 안에 같은 task 복사본이 무한히 쌓인다고 상상한다.\n3. drift는 그냥 \"느리다\" 정도의 말이라고 생각한다.\n4. skip과 coalesce를 같은 말로 취급한다.\n5. 모든 주기 작업은 회차를 하나도 빼먹으면 안 된다고 생각한다.\n\n특히 4번은 꼭 분리해 두는 편이 좋다.\n\n- skip은 \"몇 회차를 그냥 버림\"\n- coalesce는 \"여러 회차의 목적을 한 번으로 합침\"\n\n## 다음 문서로 이어가기\n\n- fixed-rate와 fixed-delay의 기본 timeline 차이를 먼저 익히려면 [Fixed Rate vs Fixed Delay Overrun Primer](./fixed-rate-vs-fixed-delay-overrun-primer.md)\n- drift와 backlog 느낌을 더 또렷하게 나누려면 [Periodic Scheduling Drift vs Backlog Primer](./periodic-scheduling-drift-vs-backlog-primer.md)\n- repeating task를 ticket 재등록 관점으로 보고 싶다면 [DelayQueue Repeating Task Primer](./delayqueue-repeating-task-primer.md)\n- scheduled executor를 delay-aware queue mental model로 연결하려면 [ScheduledExecutorService vs DelayQueue Bridge](./scheduledexecutorservice-vs-delayqueue-bridge.md)\n- 주기 작업이 아니라 일반 queue overload에서 drop/keep 정책을 비교하고 싶다면 [Bounded Queue Policy Primer](./bounded-queue-policy-primer.md)\n\n## 한 줄 정리\n\n반복 작업이 주기보다 느릴 때 핵심은 \"느려졌다\" 자체보다 **밀린 회차를 어떻게 해석할지**다. 원래 박자를 따라잡을지, 점점 늦어질지, 늦은 회차를 건너뛸지, 여러 번을 한 번으로 합칠지에 따라 catch-up, drift, skip, coalesce라는 서로 다른 정책이 갈린다.\n",
+  "aliases": [
+    "periodic overrun catch up",
+    "fixed rate catch up",
+    "scheduler catch up drift skip coalesce",
+    "skip missed ticks",
+    "coalesce missed periods",
+    "periodic task runtime longer than period",
+    "주기 작업 오버런"
+  ],
+  "expected_queries": [
+    "주기 작업이 period보다 오래 걸릴 때 catch-up drift skip coalesce 정책은 어떻게 달라?",
+    "fixed-rate overrun에서 끝나자마자 다시 실행되는 현상을 어떻게 이해해야 해?",
+    "missed ticks를 건너뛸지 합칠지 따라잡을지 scheduler policy를 고르는 기준은?",
+    "periodic task runtime이 period보다 길 때 backlog와 drift를 beginner 기준으로 설명해줘",
+    "DelayQueue repeating task ticket model로 overrun catch-up을 이해하고 싶어"
+  ],
+  "symptoms": [
+    "반복 작업 실행 시간이 주기보다 길어졌을 때 catch-up, drift, skip, coalesce 정책을 구분하지 않고 fixed-rate/fixed-delay 이름만 본다",
+    "overdue deadline이 생긴 fixed-rate 작업이 끝나자마자 다시 실행되는 현상을 무조건 버그로만 판단한다",
+    "missed tick을 모두 처리해야 하는지, 건너뛰어야 하는지, 합쳐야 하는지를 업무 의미와 연결하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/fixed-rate-vs-fixed-delay-overrun-primer"
+    ],
+    "next_docs": [
+      "data-structure/periodic-scheduling-drift-vs-backlog-primer",
+      "data-structure/slow-periodic-task-primer",
+      "data-structure/delayqueue-repeating-task-primer",
+      "data-structure/bounded-queue-policy-primer"
+    ],
+    "confusable_with": [
+      "data-structure/fixed-rate-vs-fixed-delay-overrun-primer",
+      "data-structure/periodic-scheduling-drift-vs-backlog-primer",
+      "data-structure/slow-periodic-task-primer",
+      "data-structure/delayqueue-repeating-task-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/periodic-overrun-catch-up-primer.md",
+    "revision_history": []
+  }
+}

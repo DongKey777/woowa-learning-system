@@ -1,0 +1,48 @@
+{
+  "id": "system-design/dependency-failure-containment-chooser",
+  "title": "Dependency Failure Containment Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 chooser는 dependency failure를 timeout, retry budget, circuit breaker, bulkhead, fallback, load shedding 중 어떤 제어로 격리할지 고르는 실무 문서다.",
+  "body_markdown": "# Dependency Failure Containment Chooser\n\n## 이 문서의 역할\n\n이 문서는 외부 API, DB, message broker, 내부 service 같은 dependency가 느리거나 실패할 때 timeout, retry, circuit breaker, bulkhead, fallback, load shedding 중 무엇을 먼저 고를지 정하는 chooser다. 목표는 dependency 자체를 고치는 것이 아니라 장애 전파와 자원 잠식을 제한하는 것이다.\n\n## 10초 chooser table\n\n| 문제 | 먼저 고를 장치 | 이유 |\n|---|---|---|\n| 응답이 무한히 늦다 | timeout/deadline | 기다림의 상한을 만든다 |\n| 일시적 실패가 작다 | bounded retry + jitter | 짧은 흔들림만 흡수한다 |\n| 실패율이 계속 높다 | circuit breaker | 실패 dependency로 계속 보내지 않는다 |\n| 특정 dependency가 pool을 잠식한다 | bulkhead | 자원 격리를 만든다 |\n| 전체 부하가 capacity를 넘는다 | load shedding | 받아서는 안 되는 요청을 빨리 거절한다 |\n\n## Symptom -> cause -> trade-off -> next doc\n\n| 운영 symptom | 가능한 cause | 선택 trade-off | 다음 문서 |\n|---|---|---|---|\n| downstream latency가 늘자 우리 thread pool도 가득 참 | timeout/deadline 부재 | 짧게 끊으면 long-tail success를 포기하지만 자원 점유를 줄임 | `retry-timeout-circuit-breaker-beginner-chooser` |\n| retry 추가 후 QPS와 timeout이 더 증가 | retry amplification | retry budget을 줄이면 transient recovery 기회가 줄지만 overload를 낮춤 | `network/proxy-retry-budget-discipline` |\n| 실패율이 계속 높은 dependency로 요청이 계속 감 | circuit breaker 부재 | breaker open은 빠른 실패를 만들지만 회복 감지가 필요 | `spring/resilience4j-retry-circuit-breaker-bulkhead` |\n| 한 dependency 장애가 unrelated endpoint까지 느리게 함 | shared pool/bulkhead 부재 | 격리는 남는 capacity 공유를 줄이지만 blast radius를 제한 | `backpressure-and-load-shedding-design` |\n| fallback도 같이 느려짐 | fallback dependency 또는 cache도 같은 병목 공유 | degraded UX를 허용할지 제품 계약 확인 필요 | `brownout-load-shedding-graceful-degradation-playbook` |\n\n## 헷갈리는 축\n\nRetry는 availability를 올릴 수 있지만 부하도 증폭한다. Circuit breaker는 실패를 숨기는 장치가 아니라 실패 경로를 빠르게 닫는 장치다. Bulkhead는 장애 원인을 고치는 것이 아니라 blast radius를 줄이는 격리다.\n\n## 운영 관찰 증거\n\nDependency failure는 \"느리다\"보다 먼저 어느 자원이 묶였는지를 봐야 한다. Dependency별 request rate, error rate, timeout rate, connection acquire wait, thread pool active/queue, retry attempt 수, circuit breaker state 전이를 같은 시간축에 올린다.\n\n관찰 포인트는 세 가지다. 첫째, upstream QPS가 그대로인데 downstream latency와 timeout만 늘면 dependency saturation 가능성이 크다. 둘째, retry attempt가 원 요청보다 빠르게 증가하면 retry storm이 장애를 키우고 있을 수 있다. 셋째, 특정 dependency pool이 꽉 찬 뒤 unrelated endpoint까지 느려지면 bulkhead 부재로 blast radius가 넓어진 것이다.\n\n## 선택 trade-off\n\nTimeout은 자원 점유 시간을 제한하지만 너무 짧으면 정상적인 느린 요청도 실패시킨다. Retry는 짧은 packet loss나 leader failover에는 도움이 되지만, 이미 포화된 dependency에는 추가 부하다. Circuit breaker는 빠른 실패로 전체 생존성을 높이지만, 임계값이 거칠면 회복 중인 dependency로 트래픽이 돌아가지 못한다.\n\nBulkhead는 장애 전파를 줄이는 대신 남는 capacity를 공유하지 못한다. Fallback은 사용자 기능을 유지할 수 있지만 stale data, partial response, degraded behavior를 제품적으로 허용할 수 있을 때만 안전하다. Load shedding은 전체 시스템을 살리지만 일부 요청을 의도적으로 버리는 결정이므로 SLO와 우선순위가 필요하다.\n\n## 안전한 stop condition\n\n장애 대응 중에는 새 장치를 계속 추가하기보다 중단 기준을 먼저 둔다. Dependency별 timeout rate가 안정화되고, retry amplification ratio가 1에 가깝게 내려오며, pool queue가 줄고, unrelated endpoint의 p95/p99가 회복되면 containment는 일단 멈춘다.\n\n추가 완화는 breaker open 비율, fallback hit rate, load-shed rate가 더 악화되지 않는다는 증거가 있을 때만 진행한다. 반대로 breaker를 열었는데 error budget burn이 계속 빨라지거나 fallback 경로 latency가 같이 오른다면 그 조치는 stop하고 traffic cut, feature disable, dependency owner escalation로 전환한다.\n\n## 잘못 고르기 쉬운 이웃 개념\n\n모든 느린 요청을 retry로 처리하면 오분류다. 느린 downstream에 retry를 추가하면 성공률보다 부하 증폭이 먼저 커질 수 있다. 먼저 timeout budget과 retry budget을 맞추고, dependency별 bulkhead와 breaker 지표가 남는지 확인한다.\n\n## Overclaim control\n\n- Circuit breaker는 장애를 고치는 장치가 아니라 실패 dependency로 보내는 시도를 줄이는 장치다.\n- Fallback은 무조건 좋은 UX가 아니다. stale data, partial response, incorrect decision을 제품적으로 허용할 수 있어야 한다.\n- Retry 성공률만 보고 판단하지 않는다. retry amplification ratio, downstream saturation, end-to-end latency를 함께 본다.\n- Bulkhead는 capacity를 늘리지 않는다. 특정 장애가 전체 자원을 잡아먹지 못하게 나누는 비용 있는 격리다.\n- Timeout은 계층별로 독립 설정하면 충돌한다. caller deadline, gateway timeout, downstream timeout 순서가 맞아야 한다.\n\n## Safe Next Docs\n\nProxy까지 포함한 retry 예산은 `proxy-retry-budget-discipline`, overload 제어는 `backpressure-and-load-shedding-design`, Spring 구현은 `spring-resilience4j-retry-circuit-breaker-bulkhead`로 이어진다.\n",
+  "aliases": [
+    "dependency failure containment chooser",
+    "dependency 장애 격리",
+    "timeout retry circuit breaker bulkhead 선택",
+    "downstream 장애 전파 차단"
+  ],
+  "expected_queries": [
+    "외부 API가 느릴 때 timeout retry circuit breaker bulkhead 중 뭘 써야 해?",
+    "downstream 장애가 우리 서비스까지 터뜨리지 않으려면 어떤 장치를 둬야 해?",
+    "retry와 circuit breaker는 언제 같이 쓰고 언제 위험해?"
+  ],
+  "symptoms": [
+    "한 dependency 장애가 전체 thread pool과 connection pool을 잡아먹습니다",
+    "retry를 넣었더니 성공률보다 부하가 더 늘었습니다",
+    "fallback은 있는데 fallback 경로도 같이 터집니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser"
+    ],
+    "next_docs": [
+      "network/proxy-retry-budget-discipline",
+      "system-design/backpressure-and-load-shedding-design",
+      "spring/resilience4j-retry-circuit-breaker-bulkhead",
+      "system-design/brownout-load-shedding-graceful-degradation-playbook"
+    ],
+    "confusable_with": [
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser",
+      "system-design/backpressure-and-load-shedding-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/dependency-failure-containment-chooser.md",
+    "revision_history": []
+  }
+}

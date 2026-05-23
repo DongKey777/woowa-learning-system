@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/process-signal-graceful-shutdown-primer",
+  "title": "Process Signal Graceful Shutdown Primer",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "이 primer는 process signal과 graceful shutdown을 설명한다. SIGTERM, SIGKILL, shutdown hook, 요청 drain, queue consumer ack 같은 운영 질문을 다룬다.",
+  "body_markdown": "# Process Signal Graceful Shutdown Primer\n\n## 한 줄 요약\n\nGraceful shutdown은 새 작업을 받지 않고, 진행 중 작업을 정해진 시간 안에 끝내거나 안전하게 중단한 뒤 프로세스를 종료하는 절차다.\n\n## 미션 진입 증상\n\n배포 때 요청이 끊기거나 consumer가 메시지를 처리 중 잃는다. SIGTERM을 받았는데 바로 프로세스가 내려가면 drain 시간이 없다.\n\n## 핵심 mental model\n\nSIGTERM은 종료 준비 기회이고, SIGKILL은 정리 기회를 주지 않는 강제 종료다. 서버, thread pool, DB transaction, queue ack 순서를 함께 본다.\n\n운영 환경마다 신호 전달 경로와 grace period는 다르다. systemd, container runtime, Kubernetes, shell entrypoint, process supervisor가 어떤 신호를 보내고 얼마나 기다리는지 실제 설정으로 확인한다. `SIGKILL`은 handler로 잡을 수 없으므로 SIGTERM 단계에서 필요한 정리를 끝내야 한다.\n\n## 운영 관찰 지표\n\n- SIGTERM 수신 로그, shutdown hook 시작/종료 로그, 프로세스 종료 code, orchestrator termination reason을 본다.\n- readiness/liveness 상태 변화와 LB에서 제외되는 시점, 새 요청 유입 차단 시점을 확인한다.\n- in-flight HTTP request 수, queue consumer lag, unacked message, DB transaction, executor active/queued task를 shutdown timeline에 맞춘다.\n- grace period 만료 전에 완료됐는지, 만료 후 SIGKILL로 강제 종료됐는지 구분한다.\n- PID 1 entrypoint나 wrapper script가 signal을 실제 애플리케이션 프로세스로 전달하는지 확인한다.\n\n## 1차 분기\n\n1. HTTP server: readiness를 먼저 내리고 새 요청을 받지 않게 한 뒤, keep-alive와 in-flight 요청을 drain한다.\n2. Queue consumer: 새 poll/fetch를 멈추고 처리 중 메시지를 완료 후 ack하거나, 실패 시 재전달 가능하도록 rollback/nack 정책을 따른다.\n3. Batch/worker: checkpoint와 idempotency를 확인하고, 중단 가능한 단위에서 멈춘다.\n4. Thread pool: 새 submit을 막고 active task 완료를 기다리며, deadline을 넘으면 안전한 cancel/interrupt 가능성을 확인한다.\n5. Signal delivery 문제: 애플리케이션이 SIGTERM을 못 받거나 shell wrapper가 삼키면 graceful path 자체가 실행되지 않는다.\n\n## 운영 대응 순서\n\n첫 단계는 \"새 작업 차단\"이다. readiness 제거, listener stop, consumer pause, scheduler stop처럼 유입을 먼저 막는다.\n\n두 번째는 \"진행 중 작업 추적\"이다. request, message, transaction, background task를 in-flight로 세고 완료/실패/재시도 경로를 남긴다.\n\n세 번째는 \"제한 시간 안의 정리\"다. shutdown hook에서 무한 대기하지 말고, 운영 grace period보다 짧은 내부 deadline을 두며, deadline 초과 시 데이터 일관성을 깨지 않는 방식으로 중단한다.\n\n## 흔한 오해\n\nShutdown hook만 등록하면 모든 작업이 안전하게 끝나는 것은 아니다. timeout, readiness 제거, consumer pause, in-flight tracking이 필요하다.\n\n## 잘못된 대응\n\n- SIGKILL을 graceful shutdown 신호처럼 다루려 한다. SIGKILL은 정리 기회를 주지 않는다.\n- fixed sleep만 넣고 readiness, in-flight, ack 상태를 보지 않는다.\n- queue message를 처리 전에 ack한다. 종료 중 실패하면 메시지를 잃을 수 있다.\n- shutdown hook에서 새 비동기 작업을 시작하고 기다리지 않는다.\n- LB에서 제외되기 전에 process를 바로 종료한다. 배포 중 일부 요청이 중간에 끊길 수 있다.\n- 종료가 느리다고 무조건 grace period만 늘린다. 유입 차단, task drain, 외부 timeout이 맞지 않으면 지연만 길어진다.\n\n## Safe Next Docs\n\nqueue delivery semantics에서 ack/retry/idempotency를 확인하고, thread pool backpressure playbook에서 active task drain과 rejection 정책을 이어서 본다. HTTP 서버라면 readiness, keep-alive, connection drain 관련 문서도 함께 본다.\n",
+  "aliases": [
+    "process signal graceful shutdown primer",
+    "sigterm shutdown hook drain request",
+    "SIGTERM graceful shutdown",
+    "프로세스 종료 신호 drain"
+  ],
+  "expected_queries": [
+    "SIGTERM을 받으면 서버는 어떻게 graceful shutdown 해야 해?",
+    "배포 중 요청이 끊기지 않게 하려면 shutdown에서 뭘 봐야 해?",
+    "shutdown hook만 있으면 안전한 종료가 되는 거야?"
+  ],
+  "symptoms": [
+    "배포 때 진행 중 요청이 중간에 끊겨요",
+    "SIGKILL과 SIGTERM 차이를 모르고 있어요",
+    "queue consumer가 처리 중 메시지를 ack 전에 잃어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-lifecycle-and-ipc-basics"
+    ],
+    "next_docs": [
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "confusable_with": [
+      "system-design/queue-delivery-semantics-beginner-primer",
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/process-signal-graceful-shutdown-primer.md",
+    "revision_history": []
+  }
+}

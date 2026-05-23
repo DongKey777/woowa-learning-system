@@ -1,0 +1,52 @@
+{
+  "id": "system-design/fraud-case-management-workflow-design",
+  "title": "Fraud Case Management Workflow 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Fraud Case Management Workflow 설계를 다루는 deep_dive 문서다. fraud case management workflow는 의심 거래를 케이스로 전환해 조사, 증거 수집, 판정, 보상을 체계화하는 운영 워크플로우다. 검색 질의가 fraud case management, investigation workflow, review queue, evidence collection처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Fraud Case Management Workflow 설계\n\n> 한 줄 요약: fraud case management workflow는 의심 거래를 케이스로 전환해 조사, 증거 수집, 판정, 보상을 체계화하는 운영 워크플로우다.\n\nretrieval-anchor-keywords: fraud case management, investigation workflow, review queue, evidence collection, analyst dashboard, dispute, chargeback, case SLA, hold, escalation, workflow orchestration\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Fraud / Risk Scoring Pipeline 설계](./fraud-risk-scoring-pipeline-design.md)\n> - [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)\n\n## 핵심 개념\n\nfraud case management는 자동 차단만으로 끝나지 않는다.  \n실전에서는 아래를 함께 다룬다.\n\n- risk pipeline의 고위험 결과를 케이스로 전환\n- analyst review queue\n- 증거 수집과 타임라인\n- case SLA\n- hold / release decision\n- chargeback / dispute 후속\n\n즉, 케이스 관리 워크플로우는 자동 탐지와 인간 판단을 연결하는 운영 시스템이다.\n\n## 깊이 들어가기\n\n### 1. 왜 케이스가 필요한가\n\n모든 fraud 신호를 자동 차단하면 오탐 비용이 커진다.  \n그래서 불확실한 경우는 케이스로 넘긴다.\n\n- block\n- allow\n- review\n\n### 2. Capacity Estimation\n\n예:\n\n- 하루 100만 거래\n- 0.2%가 review 필요\n- 하루 2,000 cases\n\n케이스 수는 적어 보여도, 각 케이스에 필요한 증거와 SLA가 중요하다.\n\n봐야 할 숫자:\n\n- case creation rate\n- review queue depth\n- SLA breach rate\n- hold duration\n- analyst throughput\n\n### 3. Workflow 상태\n\n```text\nNEW -> TRIAGED -> INVESTIGATING -> DECIDED -> RESOLVED\n            \\-> ESCALATED -> HOLD -> RELEASED\n```\n\n각 상태는 누가 책임지는지 명확해야 한다.\n\n### 4. Evidence collection\n\n케이스에는 판단 근거가 필요하다.\n\n- transaction history\n- device fingerprint\n- IP reputation\n- login timeline\n- risk score snapshot\n- audit log reference\n\n증거가 없으면 reviewer는 같은 질문을 반복한다.\n\n### 5. Human-in-the-loop\n\n자동화가 완벽하지 않기 때문에 운영자가 개입한다.\n\n- analyst queue\n- supervisor override\n- escalation path\n- SLA timer\n\n이 구조는 [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)와 닮아 있다.\n\n### 6. Hold와 release\n\n케이스는 거래나 계정을 잠시 멈출 수 있다.\n\n- payment hold\n- account freeze\n- limit reduction\n- release after review\n\nhold는 최소화해야 하지만, 너무 약하면 손실이 커진다.\n\n### 7. Feedback loop\n\n케이스 결과는 fraud 모델에 다시 들어가야 한다.\n\n- confirmed fraud\n- false positive\n- uncertain\n\n이 피드백이 없으면 탐지와 운영이 분리된 채로 망가진다.\n\n## 실전 시나리오\n\n### 시나리오 1: 고위험 결제\n\n문제:\n\n- risk score가 높지만 확실하지 않다\n\n해결:\n\n- 케이스 생성\n- 거래 hold\n- analyst review\n\n### 시나리오 2: 사용자 dispute\n\n문제:\n\n- 사용자가 부정 사용을 신고한다\n\n해결:\n\n- 증거 수집\n- chargeback 처리\n- 결과를 모델 학습에 반영\n\n### 시나리오 3: SLA breach\n\n문제:\n\n- 케이스가 너무 오래 쌓인다\n\n해결:\n\n- priority queue\n- auto-escalation\n- analyst workload balancing\n\n## 코드로 보기\n\n```pseudo\nfunction createCase(txn, risk):\n  if risk.score < threshold:\n    return allow\n  caseId = caseStore.create(txn, risk.snapshot)\n  queue.publish(caseId)\n  return hold(caseId)\n\nfunction resolveCase(caseId, decision):\n  caseStore.update(caseId, decision)\n  applyDecision(decision)\n```\n\n```java\npublic CaseDecision review(CaseId caseId, AnalystDecision decision) {\n    return caseService.resolve(caseId, decision);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Auto block only | 단순하다 | 오탐 비용 큼 | 매우 확실한 사기 |\n| Review queue | 유연하다 | 운영 비용 증가 | 불확실 케이스 |\n| Hold then release | 손실을 줄인다 | UX 마찰 | 고가치 거래 |\n| Strict SLA workflow | 운영이 명확하다 | 유연성 낮다 | 대규모 팀 |\n| Evidence-rich cases | 설명 가능하다 | 저장/수집 비용 | 컴플라이언스 |\n\n핵심은 fraud case management가 단순 큐가 아니라 **자동 탐지 결과를 사람의 판단과 증거로 연결하는 운영 워크플로우**라는 점이다.\n\n## 꼬리질문\n\n> Q: risk scoring과 case management는 어떻게 다른가요?\n> 의도: 자동 판단과 운영 판단 구분 확인\n> 핵심: scoring은 점수 산출, case management는 조사와 결정을 맡는다.\n\n> Q: hold를 왜 쓰나요?\n> 의도: 손실 방어와 UX 균형 이해 확인\n> 핵심: 확실하지 않은 경우 임시로 위험을 멈추기 위해서다.\n\n> Q: 케이스에 어떤 증거가 필요하나요?\n> 의도: 조사 가능성 이해 확인\n> 핵심: 트랜잭션, 디바이스, IP, risk snapshot, audit reference가 필요하다.\n\n> Q: SLA breach는 어떻게 막나요?\n> 의도: 운영 scaling 이해 확인\n> 핵심: priority queue, auto escalation, workload balancing이 필요하다.\n\n## 한 줄 정리\n\nFraud case management workflow는 자동 탐지의 불확실성을 케이스와 증거, 인간 검토로 연결해 손실과 오탐을 함께 관리하는 시스템이다.\n\n",
+  "aliases": [
+    "fraud case management",
+    "investigation workflow",
+    "review queue",
+    "evidence collection",
+    "analyst dashboard",
+    "dispute",
+    "chargeback",
+    "case SLA",
+    "hold",
+    "escalation",
+    "workflow orchestration",
+    "Fraud Case Management Workflow 설계"
+  ],
+  "expected_queries": [
+    "Fraud Case Management Workflow 설계 설계 핵심을 설명해줘",
+    "fraud case management가 왜 필요한지 알려줘",
+    "Fraud Case Management Workflow 설계 실무 트레이드오프는 뭐야?",
+    "fraud case management 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Fraud Case Management Workflow 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Fraud Case Management Workflow 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Fraud Case Management Workflow 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/fraud-case-management-workflow-design.md",
+    "revision_history": []
+  }
+}

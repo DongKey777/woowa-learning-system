@@ -1,0 +1,52 @@
+{
+  "id": "system-design/cdn-image-transformation-pipeline-design",
+  "title": "CDN Image Transformation Pipeline 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 CDN Image Transformation Pipeline 설계를 다루는 deep_dive 문서다. CDN image transformation pipeline은 원본 이미지를 edge 가까이에서 리사이즈, 포맷 변환, 최적화해 빠르고 저렴하게 서빙하는 시스템이다. 검색 질의가 cdn image transformation, resize, format conversion, webp avif처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# CDN Image Transformation Pipeline 설계\n\n> 한 줄 요약: CDN image transformation pipeline은 원본 이미지를 edge 가까이에서 리사이즈, 포맷 변환, 최적화해 빠르고 저렴하게 서빙하는 시스템이다.\n\nretrieval-anchor-keywords: cdn image transformation, resize, format conversion, webp avif, edge compute, image cache, variant key, origin fetch, optimization pipeline, thumbnail\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Storage Presigned URL + CDN 설계](./file-storage-presigned-url-cdn-design.md)\n> - [Object Metadata Service 설계](./object-metadata-service-design.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)\n> - [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n\n## 핵심 개념\n\n이미지 변환 파이프라인은 단순 썸네일 생성기가 아니다.  \n실전에서는 아래를 함께 다룬다.\n\n- resize\n- crop\n- format conversion\n- quality tuning\n- cache key versioning\n- origin protection\n- variant explosion control\n\n즉, CDN 변환은 저장과 배포 사이에서 이미지 파생물을 만드는 edge 최적화 시스템이다.\n\n## 깊이 들어가기\n\n### 1. 왜 변환을 edge에 두는가\n\n원본 서버가 이미지 파생을 직접 처리하면 병목이 생긴다.\n\n- CPU 비용 증가\n- 업로드/서빙 경로 혼합\n- 캐시 적중률 저하\n\n그래서 변환은 CDN이나 edge worker로 옮긴다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 하루 1,000만 이미지 요청\n- 변형 조합 10개\n- 평균 이미지 300KB\n\nvariant explosion이 핵심 문제다.  \n무조건 많은 변형을 만들면 캐시가 깨진다.\n\n봐야 할 숫자:\n\n- variant count\n- cache hit ratio\n- origin fetch rate\n- transform latency\n- egress cost\n\n### 3. 변환 키 설계\n\n캐시 키는 파생 파라미터를 포함해야 한다.\n\n```text\nimage:{objectKey}:w=300:h=300:fit=cover:fmt=webp:q=80\n```\n\n키가 부정확하면 잘못된 이미지가 캐시된다.  \n너무 세밀하면 variant가 폭발한다.\n\n### 4. 원본 보호\n\n원본 저장소가 CDN 변환의 직접 폭주를 맞지 않도록 해야 한다.\n\n- origin shield\n- request collapsing\n- signed URL\n- rate limit\n\n특히 인기 이미지 하나가 origin을 죽이는 hot object 문제가 자주 생긴다.\n\n### 5. 포맷과 품질\n\n보통 다음을 고려한다.\n\n- JPEG\n- PNG\n- WebP\n- AVIF\n\n채널과 브라우저에 따라 최적 포맷이 다르므로 content negotiation 또는 user-agent rule이 필요하다.\n\n### 6. 캐시 무효화\n\n이미지는 수정되면 무효화가 어렵다.\n\n권장:\n\n- versioned object key\n- immutable cache\n- new variant path\n\nCDN 캐시를 지우는 것보다 URL을 바꾸는 편이 더 안정적이다.\n\n### 7. 안전한 변환\n\n이미지 변환도 보안 이슈가 있다.\n\n- decompression bomb\n- oversized input\n- malformed image\n\n그래서 transform worker는 input validation이 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 프로필 이미지 썸네일\n\n문제:\n\n- 다양한 크기의 썸네일이 필요하다\n\n해결:\n\n- width/height 기반 variant\n- cacheable path\n- immutable URL\n\n### 시나리오 2: 원본 바이럴\n\n문제:\n\n- 하나의 이미지가 폭발적으로 조회된다\n\n해결:\n\n- edge cache hit 우선\n- origin shield\n- request coalescing\n\n### 시나리오 3: 포맷 최적화\n\n문제:\n\n- 브라우저별 최적 포맷이 다르다\n\n해결:\n\n- WebP/AVIF 우선\n- fallback to JPEG\n\n## 코드로 보기\n\n```pseudo\nfunction transform(url, spec):\n  key = makeVariantKey(url, spec)\n  if cache.exists(key):\n    return cache.get(key)\n  original = fetchOrigin(url)\n  image = resizeAndConvert(original, spec)\n  cache.put(key, image)\n  return image\n```\n\n```java\npublic ImageVariant serve(String objectKey, TransformSpec spec) {\n    return transformCache.getOrLoad(makeKey(objectKey, spec), () -> pipeline.transform(objectKey, spec));\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Origin-side transform | 제어가 쉽다 | CPU/latency 부담 | 작은 서비스 |\n| Edge transform | 빠르고 확장성 좋다 | 운영 복잡도 | 대규모 CDN |\n| Pre-generated variants | 조회가 매우 빠르다 | 저장 비용 증가 | 인기 콘텐츠 |\n| On-demand transform | 저장 효율적이다 | 첫 요청이 느리다 | 긴 꼬리 변형 |\n| Immutable URL | 무효화가 쉽다 | 새 URL 관리 필요 | 대부분의 이미지 서빙 |\n\n핵심은 이미지 변환이 단순 미디어 기능이 아니라 **variant 관리와 원본 보호를 포함한 서빙 파이프라인**이라는 점이다.\n\n## 꼬리질문\n\n> Q: 왜 캐시 키에 transform spec을 넣어야 하나요?\n> 의도: variant 분리 이해 확인\n> 핵심: 서로 다른 크기/포맷 결과를 구분해야 하기 때문이다.\n\n> Q: origin shield는 왜 필요한가요?\n> 의도: hot object와 origin 보호 이해 확인\n> 핵심: 인기 이미지의 폭주가 원본 저장소를 죽이지 않게 한다.\n\n> Q: 변환을 미리 생성하는 것과 on-demand의 차이는 무엇인가요?\n> 의도: 저장과 latency trade-off 이해 확인\n> 핵심: 미리 생성은 빠르지만 저장이 늘고, on-demand는 절약되지만 첫 요청이 느리다.\n\n> Q: 이미지 변환에서 보안 문제는 무엇인가요?\n> 의도: 비정상 input 방어 이해 확인\n> 핵심: malformed file과 압축 폭탄을 막아야 한다.\n\n## 한 줄 정리\n\nCDN image transformation pipeline은 변형 캐시와 원본 보호를 통해 이미지 서빙을 빠르게 하고, 파생물 폭발을 통제하는 시스템이다.\n\n",
+  "aliases": [
+    "cdn image transformation",
+    "resize",
+    "format conversion",
+    "webp avif",
+    "edge compute",
+    "image cache",
+    "variant key",
+    "origin fetch",
+    "optimization pipeline",
+    "thumbnail",
+    "CDN Image Transformation Pipeline 설계",
+    "cdn image transformation pipeline design"
+  ],
+  "expected_queries": [
+    "CDN Image Transformation Pipeline 설계 설계 핵심을 설명해줘",
+    "cdn image transformation가 왜 필요한지 알려줘",
+    "CDN Image Transformation Pipeline 설계 실무 트레이드오프는 뭐야?",
+    "cdn image transformation 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`CDN Image Transformation Pipeline 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`CDN Image Transformation Pipeline 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`CDN Image Transformation Pipeline 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/cdn-image-transformation-pipeline-design.md",
+    "revision_history": []
+  }
+}

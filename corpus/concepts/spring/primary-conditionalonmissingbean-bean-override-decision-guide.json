@@ -1,0 +1,61 @@
+{
+  "id": "spring/primary-conditionalonmissingbean-bean-override-decision-guide",
+  "title": "Spring `@Primary` vs `@ConditionalOnMissingBean` vs Bean Override 결정 가이드",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "'이 문서는 Spring 학습자가 bean 문제를 만났을 때 @Primary와",
+  "body_markdown": "# Spring `@Primary` vs `@ConditionalOnMissingBean` vs Bean Override 결정 가이드\n\n## 한 줄 요약\n\n> `@Primary`는 이미 등록된 후보 중 기본 주입 대상을 고르는 규칙이고, `@ConditionalOnMissingBean`은 Boot 기본 bean을 등록할지 말지 결정하며, bean override는 같은 이름 충돌을 등록 단계에서 다루는 스위치다.\n\n## 결정 매트릭스\n\n| 지금 보이는 신호 | 먼저 볼 축 | 왜 이쪽부터 보나 |\n| --- | --- | --- |\n| `expected single matching bean but found 2`가 뜬다 | `@Primary` / `@Qualifier` 같은 후보 선택 | bean은 이미 등록됐고, 지금 실패는 \"하나로 못 고름\"에 가깝다 |\n| starter를 넣었는데 기본 bean이 아예 안 뜬다 | `@ConditionalOnMissingBean` back-off | user bean이나 다른 조건 때문에 Boot가 기본 bean 등록을 멈췄을 수 있다 |\n| `The bean 'x' could not be registered`처럼 같은 이름 충돌이 난다 | bean override / 이름 충돌 | 주입 전에 bean definition 등록 단계에서 먼저 막힌다 |\n| 내 bean을 만들었더니 Boot 기본 bean이 사라졌다 | `@ConditionalOnMissingBean`과 조건 평가 로그 | `@Primary`가 아니라 \"이미 bean이 있으니 기본값을 만들지 않음\"일 가능성이 크다 |\n| 테스트에서만 fake bean이 같은 이름으로 들어간다 | bean override 경계와 테스트 전용 설정 | 운영 구조와 테스트 대체 전략을 섞으면 원인을 잘못 분류하기 쉽다 |\n\n## 증거 먼저 보기\n\n세 선택지를 고르기 전에 로그가 어느 단계의 증거인지 먼저 분리한다.\n\n| 증거 | 읽는 뜻 | 다음 행동 |\n| --- | --- | --- |\n| `NoUniqueBeanDefinitionException`, `expected single matching bean but found 2`, 후보 bean 이름 목록 | 등록은 끝났고 단일 주입 지점에서 후보를 못 고른다 | 기본 후보면 `@Primary`, 특정 자리만 다르면 `@Qualifier`, 전부 필요하면 `List<T>`/`Map<String,T>`로 간다 |\n| `ConditionEvaluationReport`, `/actuator/conditions`, `@ConditionalOnMissingBean did not match`, `found bean ...` | auto-configuration이 기존 bean을 보고 back off했다 | Boot 기본 bean을 되살릴 문제가 아니라 누가 같은 역할 bean을 먼저 만들었는지 찾는다 |\n| `BeanDefinitionOverrideException`, `The bean 'x' could not be registered`, 같은 bean name | 같은 이름의 bean definition 등록이 충돌했다 | 이름을 바꾸거나 설정 경계를 나누고, 테스트 fake 교체인지 운영 충돌인지 분리한다 |\n| `/actuator/beans` 또는 startup bean 목록에는 둘 다 있는데 특정 주입만 틀린다 | 등록/조건보다 주입 지점 선택 규칙 문제다 | injection point의 타입, 이름, qualifier, primary를 함께 본다 |\n\n특히 `@ConditionalOnMissingBean`은 auto-configuration 쪽의 \"없으면 만든다\" 계약이다. 사용자가 같은 역할의 bean을 직접 등록하면 Boot 기본 bean이 **정상적으로 물러날 수 있다**. 이때 `spring.main.allow-bean-definition-overriding=true`를 켜는 것은 back-off를 되돌리는 스위치가 아니며, 같은 이름 충돌을 통과시키는 별도 위험한 설정이다. 운영 기본값 문제를 숨기기보다 조건 평가 report와 bean 목록으로 \"누가 먼저 등록됐는가\"를 확인해야 한다.\n\n## 흔한 오선택\n\n### 1. `found 2 beans`를 보고 overriding부터 켠다\n\n학습자 표현으로는 \"같은 타입 bean이 두 개니까 하나를 덮어쓰면 되지 않나요?\"가 자주 나온다.  \n하지만 이 경우는 이름 충돌이 아니라 후보 선택 문제다. 예외 메시지에 후보 bean 이름이 둘 이상 찍힌다면 이미 둘 다 살아 있다는 뜻이므로, bean 두 개를 등록한 채 기본값 하나를 정할지, 특정 주입 지점만 고를지부터 봐야 한다.\n\n### 2. starter bean이 안 보여서 `@Primary`를 붙인다\n\n\"기본 bean이 안 뜨는데 primary를 붙이면 살아나나요?\"라는 질문이 여기에 해당한다.  \n`@Primary`는 이미 존재하는 후보의 우선순위만 바꾼다. Boot 기본 bean이 아예 등록되지 않았다면 `@ConditionalOnMissingBean`이나 다른 조건이 먼저 원인이다. `ConditionEvaluationReport`에 `existing bean`이나 `did not match`가 보이면 \"선택 실패\"가 아니라 \"기본값 등록 생략\"으로 읽는다.\n\n### 3. 이름 충돌 메시지를 `@ConditionalOnMissingBean`으로 푼다\n\n\"같은 이름 bean이 겹치니까 missing bean 조건을 더 넣어야 하나요?\"처럼 읽는 경우다.  \n이때는 auto-configuration back-off보다 bean definition 이름 충돌을 먼저 봐야 한다. 등록 자체가 막힌 상태라면 주입 우선순위나 기본 bean 선택 규칙으로는 해결되지 않는다. overriding 허용은 테스트에서 의도한 fake 교체처럼 범위가 좁을 때만 검토하고, 운영에서는 중복 이름의 출처를 제거하는 쪽이 우선이다.\n\n### 4. 세 개를 한꺼번에 붙여서 우연히 되기만 기다린다\n\n\"일단 `@Primary`도 붙이고 overriding도 켜고 조건도 바꾸면 되겠지\"는 학습 비용이 가장 크다.  \n문제를 `후보 선택 / 기본 bean 등록 / 이름 충돌` 셋 중 하나로 먼저 자르면 다음에도 같은 로그를 더 빨리 읽을 수 있다.\n\n## 다음 학습\n\n- `found 2` 계열처럼 같은 타입 후보 선택이 핵심이면 [Spring `@Primary` vs `@Qualifier` vs 컬렉션 주입 결정 가이드](./spring-primary-qualifier-collection-injection-decision-guide.md)로 간다.\n- \"내 bean 때문에 Boot 기본 bean이 왜 사라졌지?\"가 핵심이면 [Spring `@ConditionalOnMissingBean` vs `@Primary` 오해 분리](./spring-conditionalonmissingbean-vs-primary-primer.md)를 바로 잇는다.\n- 조건 평가 report를 처음 열어야 한다면 [Spring Boot Condition Evaluation Report 첫 디버그 체크리스트](./spring-boot-condition-evaluation-report-first-debug-checklist.md)에서 `existing bean`과 negative match를 먼저 확인한다.\n- \"같은 이름 bean이 왜 등록조차 안 되지?\"가 핵심이면 [Spring `@Primary` vs Bean Override Primer](./spring-primary-vs-bean-override-primer.md)와 [BeanDefinitionOverrideException Quick Triage](./spring-beandefinitionoverrideexception-quick-triage.md)로 내려간다.\n",
+  "aliases": [
+    "@Primary vs @ConditionalOnMissingBean",
+    "@Primary vs bean override",
+    "conditionalonmissingbean vs bean override",
+    "기본 bean 사라졌는데 primary 붙이면 되나",
+    "found 2 beans라서 overriding 켜야 하나",
+    "user bean 만들었더니 boot bean 없어짐",
+    "ConditionEvaluationReport existing bean",
+    "NoUniqueBeanDefinitionException vs BeanDefinitionOverrideException",
+    "@Qualifier"
+  ],
+  "expected_queries": [
+    "starter가 만든 bean이 안 보일 때 primary를 먼저 봐야 해?",
+    "같은 타입 bean이 두 개일 때 overriding을 켜는 문제랑 뭐가 달라?",
+    "내 bean을 등록했더니 기본 bean이 사라졌는데 conditional on missing bean 때문이야?",
+    "bean 이름 충돌이랑 후보 선택이랑 auto-configuration back off를 어떻게 구분해?",
+    "primary를 붙이면 boot 기본 bean이 다시 생겨?",
+    "ConditionEvaluationReport의 existing bean, NoUniqueBeanDefinitionException, BeanDefinitionOverrideException 중 어떤 증거를 먼저 봐야 해?"
+  ],
+  "symptoms": [
+    "starter bean이 안 떠서 @Primary를 붙여야 하나 헷갈려요",
+    "같은 타입 bean이 두 개인데 overriding을 켜면 되는지 모르겠어요",
+    "내 bean을 추가했더니 Boot 기본 bean이 사라진 것 같아요",
+    "ConditionEvaluationReport에는 existing bean이 보이는데 startup 예외는 found 2라 어느 쪽을 봐야 할지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/ioc-di-basics",
+      "spring/bean-di-basics"
+    ],
+    "next_docs": [
+      "spring/primary-qualifier-collection-injection",
+      "spring/spring-primary-vs-bean-override-primer",
+      "spring/spring-conditionalonmissingbean-vs-primary-primer",
+      "spring/boot-condition-evaluation-report-first-debug-checklist"
+    ],
+    "confusable_with": [
+      "spring/primary-qualifier-collection-injection",
+      "spring/spring-primary-vs-bean-override-primer",
+      "spring/spring-conditionalonmissingbean-vs-primary-primer",
+      "spring/conditional-activation-annotation-decision-guide",
+      "spring/wrong-bean-injected-cause-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-primary-conditionalonmissingbean-bean-override-decision-guide.md",
+    "revision_history": []
+  }
+}

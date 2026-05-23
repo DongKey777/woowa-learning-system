@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/futex-requeue-priority-inheritance-convoy-debugging",
+  "title": "Futex Requeue Priority Inheritance Convoy Debugging",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "'이 문서는 futex contention을 FUTEX_WAIT 횟수만으로 보지 않고 condvar requeue,",
+  "body_markdown": "# Futex Requeue, Priority Inheritance, Convoy Debugging\n\n> 한 줄 요약: futex 경합은 단순 `FUTEX_WAIT` 횟수만으로 끝나지 않고, condvar requeue, priority inheritance, lock owner scheduling 지연이 섞이면 \"락이 길다\"보다 훨씬 더 교묘한 convoy를 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Lock Contention, Futex Wait, Off-CPU Debugging](./lock-contention-futex-offcpu-debugging.md)\n> - [Futex, Mutex, Semaphore, Spinlock](./futex-mutex-semaphore-spinlock.md)\n> - [Scheduler Wakeup Latency, runqlat, Queueing Debugging](./scheduler-wakeup-latency-runqlat-debugging.md)\n> - [CPU Cache, Coherence, Memory Barrier](./cpu-cache-coherence-memory-barrier.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n\n> retrieval-anchor-keywords: futex requeue, priority inheritance, PI futex, futex convoy, condition variable futex, futex_wait_requeue_pi, lock owner preemption, priority inversion, futex debugging\n\n## 핵심 개념\n\n운영에서 보이는 futex 문제는 단순히 \"스레드가 많이 잔다\"로 끝나지 않는다. condition variable 경로의 requeue, priority inversion, lock owner가 CPU를 늦게 받는 상황이 겹치면, 락 hold time보다 훨씬 큰 wait tail이 생길 수 있다.\n\n- `futex requeue`: waiters를 한 futex에서 다른 futex로 옮기는 패턴이다\n- `priority inheritance (PI)`: 높은 우선순위 waiter 때문에 owner 우선순위를 끌어올리는 메커니즘이다\n- `convoy`: unlock 후에도 next owner가 늦어 전체 대기열이 길어지는 현상이다\n- `priority inversion`: 낮은 우선순위 owner 때문에 높은 우선순위 waiter가 막히는 상황이다\n\n왜 중요한가:\n\n- condvar나 런타임 락 구현은 표면상 mutex 하나보다 더 복잡한 futex 흐름을 가진다\n- 스레드 덤프엔 단순 blocked로 보이지만 실제 병목은 owner scheduling일 수 있다\n- 잘못 보면 \"락 최적화\"를 하는데 root cause는 scheduler/priority 정책인 경우가 많다\n\n## 깊이 들어가기\n\n### 1. condvar 경로는 단순 lock/unlock보다 복잡하다\n\n조건 변수는 대기와 락 ownership handoff를 분리한다. 이때 runtime은 futex requeue 계열 패턴을 써서 waiter를 다른 synchronization point로 옮길 수 있다.\n\n- signal/broadcast 후 waiter가 깬다\n- 하지만 바로 critical section owner가 되는 것은 아니다\n- requeue/handoff/scheduler delay가 추가된다\n\n그래서 condvar 경로는 \"깼다 = 바로 실행\"이 아니다.\n\n### 2. priority inversion은 backend에서도 현실 문제다\n\nRT 시스템만의 얘기처럼 보이지만, 실제 운영에서도 우선순위 차와 cgroup/affinity가 결합되면 유사 현상이 나타난다.\n\n- 낮은 우선순위 owner가 lock을 쥔다\n- 높은 우선순위 또는 latency-sensitive waiter가 기다린다\n- owner는 CPU도 늦게 받아 unlock도 늦어진다\n\nPI는 이런 상황을 완화하려는 메커니즘이지만, PI가 있다고 해서 scheduler/placement 문제까지 사라지는 것은 아니다.\n\n### 3. convoy는 hold time보다 handoff time에서 더 자주 커진다\n\n실무에서 자주 틀리는 판단이 이것이다.\n\n- \"critical section이 짧으니 락은 문제 아니다\"\n\n하지만 실제 tail은 다음 경로에서 커진다.\n\n- owner unlock\n- waiter wake\n- waiter run queue 지연\n- cache/locality 손실\n\n즉 futex convoy는 lock code와 scheduler code의 합성 결과다.\n\n### 4. 관측은 futex + off-CPU + sched를 붙여야 한다\n\n`strace -e futex`만 보면 wait/wake 호출은 보이지만 충분하지 않다.\n\n- futex syscall은 보인다\n- 어떤 waiter가 얼마나 잤는지는 off-CPU가 더 잘 보여 준다\n- next owner가 왜 늦었는지는 runqlat/schedstat이 더 잘 보여 준다\n\n그래서 futex 디버깅은 락 도구와 scheduler 도구를 같이 써야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: condvar broadcast 이후 요청 tail이 길게 늘어진다\n\n가능한 원인:\n\n- waiters가 많이 깨며 convoy가 생긴다\n- requeue 이후 owner handoff가 매끄럽지 않다\n- 실제 병목은 broadcast 이후 scheduler churn이다\n\n진단:\n\n```bash\nsudo strace -ff -ttT -p <pid> -e trace=futex\nsudo offcputime-bpfcc -p <pid> 20\nsudo runqlat-bpfcc -p <pid> 20\n```\n\n### 시나리오 2: high-priority 작업이 lock 하나 때문에 비정상적으로 늦다\n\n가능한 원인:\n\n- 낮은 우선순위 owner가 CPU를 늦게 받는다\n- priority inversion 성격이 있다\n- PI가 없거나, 있어도 전체 scheduling placement가 나쁘다\n\n이 경우는 락 구현과 scheduling policy를 같이 봐야 한다.\n\n### 시나리오 3: 락 hold time 측정은 짧은데 user-visible latency는 길다\n\n가능한 원인:\n\n- hold time보다 handoff/wakeup delay가 길다\n- owner가 migration/queueing을 맞는다\n- same hot lock이 여러 node/core에서 bouncing 된다\n\n## 코드로 보기\n\n### 관측 조합\n\n```bash\nsudo strace -ff -ttT -p <pid> -e trace=futex\nsudo offcputime-bpfcc -p <pid> 20\nsudo perf sched timehist -p <pid> -- sleep 10\n```\n\n### mental model\n\n```text\nwaiter sleeps on futex\n  -> owner eventually unlocks\n  -> waiter is requeued/woken\n  -> waiter still needs CPU\n  -> convoy tail can exceed actual lock hold time\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| simple mutex path | 구현이 단순하다 | hotspot에서 convoy가 커질 수 있다 | default locks |\n| condvar/requeue path | wait 구조를 나눌 수 있다 | wakeup/handoff가 더 복잡해진다 | bounded queues, runtimes |\n| PI support | inversion 완화에 도움 | 운영 해석이 더 어려워질 수 있다 | latency-critical lock chains |\n| lock sharding | convoy를 줄일 수 있다 | 데이터 분할 비용이 든다 | key-local contention |\n\n## 꼬리질문\n\n> Q: futex wait가 길면 항상 lock hold time이 긴 건가요?\n> 핵심: 아니다. requeue, owner preemption, run queue delay가 실제 tail을 더 길게 만들 수 있다.\n\n> Q: priority inheritance는 lock 문제를 다 해결하나요?\n> 핵심: 아니다. inversion을 완화할 수는 있지만 scheduling placement와 convoy까지 자동으로 해결해 주지는 않는다.\n\n> Q: condvar broadcast 이후 tail이 커지는 이유는?\n> 핵심: waiter를 깨우는 순간부터 owner handoff와 scheduler churn이 한꺼번에 커질 수 있기 때문이다.\n\n## 한 줄 정리\n\nfutex contention의 어려움은 락 자체보다, wakeup과 ownership handoff가 scheduler 지연과 합쳐져 convoy tail을 키운다는 데 있다.\n",
+  "aliases": [
+    "futex requeue priority inheritance",
+    "PI futex",
+    "futex convoy debugging",
+    "condition variable requeue",
+    "lock owner preemption",
+    "priority inversion futex"
+  ],
+  "expected_queries": [
+    "futex requeue와 priority inheritance가 lock convoy debugging에서 왜 중요해?",
+    "condition variable futex requeue는 단순 FUTEX_WAIT 카운트만으로 안 보일 수 있어?",
+    "priority inversion과 PI futex를 production tracing으로 어떻게 확인해?",
+    "lock owner preemption과 scheduler wakeup latency가 futex convoy를 만들 수 있어?"
+  ],
+  "symptoms": [
+    "FUTEX_WAIT 횟수만 봐서는 짧은 lock처럼 보이지만 condvar requeue와 owner scheduling 지연이 convoy를 만든다.",
+    "priority inheritance가 필요한 lock owner preemption이나 priority inversion이 의심된다.",
+    "off-CPU profile에서 lock wait와 scheduler wakeup latency가 섞여 보인다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/syscall-basics"
+    ],
+    "next_docs": [
+      "operating-system/process-vs-thread-vs-virtual-thread-intermediate-bridge"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/futex-requeue-priority-inheritance-convoy-debugging.md",
+    "revision_history": []
+  }
+}

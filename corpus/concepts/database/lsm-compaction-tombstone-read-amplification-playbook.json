@@ -1,0 +1,59 @@
+{
+  "id": "database/lsm-compaction-tombstone-read-amplification-playbook",
+  "title": "LSM Compaction, Tombstone, and Read Amplification Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# LSM Compaction, Tombstone, and Read Amplification Playbook\n\n> 한 줄 요약: LSM에서 delete는 즉시 사라지는 행위가 아니라 tombstone을 쓰는 행위이고, 그 표식이 compaction으로 정리되지 않으면 읽기 경로와 디스크 공간에 계속 비용을 남긴다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [B+Tree vs LSM-Tree](./bptree-vs-lsm-tree.md)\n- [LSM-Friendly Index Structures](../data-structure/lsm-friendly-index-structures.md)\n- [Checkpoint Age and Flush Storms](./checkpoint-age-flush-storms.md)\n- [Data Retention, Deletion, Tombstone, and GDPR Playbook](../system-design/data-retention-deletion-tombstone-gdpr-playbook.md)\n\n## 핵심 상황\n\n이 문서는 \"LSM이 쓰기에 강하다\"는 비교 문서가 아니다. 운영에서 `delete`, TTL, upsert가 많은 저장소가 시간이 지날수록 point read, negative lookup, range scan tail latency를 잃는 상황을 다룬다.\n\nLSM 계열은 write를 memtable과 WAL에 먼저 받고, flush된 SSTable을 compaction으로 다시 정리한다. delete도 같은 방식이다. 행을 즉시 지우는 대신 \"이 key는 이 시점 이후 삭제됨\"이라는 tombstone record를 쓴다. 최신 값을 판단하려면 read path가 memtable, immutable memtable, 여러 SSTable, 여러 level을 보며 가장 최신 sequence를 찾아야 한다.\n\n그래서 tombstone이 많아지는 문제는 단순 공간 문제가 아니다. tombstone이 오래 남으면 삭제된 key도 계속 탐색 대상이 되고, range scan은 살아 있는 row와 죽은 marker를 함께 merge해야 한다.\n\n## compaction mental model\n\n안전한 mental model은 네 단계다.\n\n1. write path는 빠르게 받는다. 최신 값과 tombstone은 먼저 위쪽 level에 쌓인다.\n2. read path는 최신 sequence를 찾는다. Bloom filter와 block cache가 있어도 여러 run을 확인할 수 있다.\n3. compaction은 중복 version과 tombstone을 아래 level로 병합한다.\n4. tombstone은 더 오래된 version과 살아 있는 snapshot, replica, retention rule이 모두 안전해질 때만 물리적으로 버려진다.\n\n즉 compaction은 청소 작업이면서 correctness boundary다. 너무 늦으면 read amplification과 space amplification이 커지고, 너무 공격적으로 밀면 foreground read/write와 disk bandwidth를 두고 경쟁한다.\n\n## observable metrics\n\n| 관측 신호 | 의미 | 먼저 볼 질문 |\n|---|---|---|\n| p95/p99 point read 증가 | 여러 SSTable/level 확인 비용 증가 | 특정 key range나 delete-heavy shard에 몰렸나 |\n| negative lookup latency 증가 | 없는 key를 증명하기 위해 많은 file을 확인 | Bloom false positive, filter miss, L0 fanout이 큰가 |\n| range scan bytes/read rows 비율 증가 | tombstone과 old version을 함께 merge | TTL/delete가 range 내부에 몰렸나 |\n| L0 file count 증가 | compaction이 ingest 속도를 못 따라감 | write stall 직전인가 |\n| compaction pending bytes/score 증가 | 정리해야 할 SSTable debt 누적 | 특정 level에 backlog가 쌓였나 |\n| write stall/slowdown count | background 정리 실패가 foreground 쓰기를 막음 | compaction thread, disk bandwidth가 부족한가 |\n| space amplification 증가 | 중복 version과 tombstone이 디스크에 남음 | 오래된 snapshot, retention, replica lag가 막고 있나 |\n| block cache hit ratio 하락 | read path가 더 넓은 file set을 건드림 | working set이 compaction debt 때문에 넓어졌나 |\n| compaction read/write bytes 급증 | 정리 작업 자체가 I/O를 지배 | 사용자 latency spike와 시간대가 겹치나 |\n\n## failure matrix\n\n| 증상 | 가능 원인 | 먼저 볼 것 | 위험한 대응 |\n|---|---|---|---|\n| delete 후 disk 사용량이 줄지 않음 | tombstone retention, compaction 지연 | space amplification, oldest snapshot | 수동 삭제를 반복 |\n| 없는 key 조회가 느려짐 | L0 fanout, Bloom false positive, tombstone scan | negative lookup p99, files checked/read | 쿼리 인덱스만 추가 |\n| TTL 많은 range scan이 느려짐 | range 내부 tombstone density 증가 | scan bytes vs returned rows | LIMIT만 낮춤 |\n| write stall 발생 | compaction backlog가 ingest를 압박 | L0 count, pending bytes, stall counter | compaction thread만 무조건 증가 |\n| compaction 중 전체 p99 spike | background I/O가 foreground와 경쟁 | disk util, queue depth, compaction bytes | compaction을 완전히 중지 |\n\n## tombstone caveats\n\n- tombstone은 \"삭제 완료\"가 아니라 \"삭제 사실을 보존하는 최신 record\"다.\n- TTL workload는 write-heavy가 아니라 delete-heavy workload이기도 하다.\n- Bloom filter는 negative lookup 비용을 줄이지만, false positive와 level fanout을 없애지는 못한다.\n- 오래 열린 snapshot, backup, replica lag, repair window는 tombstone drop을 늦출 수 있다.\n- manual compaction은 증상을 줄일 수 있지만, 동시에 cache churn과 I/O spike를 만들 수 있다.\n\n## verification steps\n\n1. 느린 read를 point lookup, negative lookup, short range, wide range로 나눈다.\n2. 같은 query에서 returned rows보다 scanned bytes나 touched files가 빠르게 늘었는지 본다.\n3. L0 file count, compaction pending bytes, compaction score, stall counter를 latency timeline과 맞춘다.\n4. delete/TTL rate와 tombstone density를 key range 또는 partition별로 샘플링한다.\n5. 오래 살아 있는 snapshot, backup, replica, repair job이 tombstone cleanup을 막는지 확인한다.\n6. canary range에서 bounded compaction을 실행하고 p99, disk util, cache hit ratio가 어떻게 움직이는지 비교한다.\n\n## wrong-bucket neighbors\n\n| 헷갈리는 bucket | 왜 다르게 봐야 하나 | 더 맞는 문서 |\n|---|---|---|\n| B+Tree vs LSM 선택 | 구조 비교는 원인 후보일 뿐 운영 debt 진단이 아니다 | [B+Tree vs LSM-Tree](./bptree-vs-lsm-tree.md) |\n| 느린 SQL 튜닝 | EXPLAIN만으로 SSTable fanout과 tombstone density를 못 본다 | [쿼리 튜닝 체크리스트](./query-tuning-checklist.md) |\n| checkpoint flush storm | checkpoint pressure는 page flush/redo 압박이고 LSM compaction debt와 관측축이 다르다 | [Checkpoint Age and Flush Storms](./checkpoint-age-flush-storms.md) |\n| 개인정보 삭제 정책 | 법적 삭제 의미와 storage tombstone cleanup은 다른 층이다 | [Data Retention, Deletion, Tombstone, and GDPR Playbook](../system-design/data-retention-deletion-tombstone-gdpr-playbook.md) |\n\n## safe next docs\n\nLSM 내부 구조를 더 보고 싶으면 [LSM-Friendly Index Structures](../data-structure/lsm-friendly-index-structures.md)로 간다. B+Tree와 LSM의 workload trade-off로 돌아가려면 [B+Tree vs LSM-Tree](./bptree-vs-lsm-tree.md)가 맞다. delete semantics와 retention 정책이 질문의 중심이면 system-design의 tombstone 문서로 넘기고, 단순 latency spike라면 checkpoint/flush storm과 replication lag도 함께 분리한다.\n\n## 한 줄 정리\n\nLSM compaction 문제는 \"삭제했는데 왜 남아 있나\"가 아니라, tombstone을 correctness 정보로 보존한 채 read path, space, I/O budget이 어디까지 debt를 감당하는지 검증하는 문제다.\n",
+  "aliases": [
+    "LSM compaction tombstone read amplification",
+    "compaction debt",
+    "tombstone read amplification",
+    "tombstone compaction backlog",
+    "SSTable read amplification",
+    "L0 file count",
+    "write stall compaction",
+    "LSM 삭제가 느려요",
+    "TTL tombstone backlog",
+    "range scan compaction p99"
+  ],
+  "expected_queries": [
+    "LSM에서 tombstone이 많아지면 read amplification과 p99 latency가 왜 커져?",
+    "compaction pending bytes와 L0 file count를 보고 tombstone backlog를 어떻게 의심해?",
+    "delete나 TTL이 많은 RocksDB Cassandra 계열에서 space amplification과 negative lookup latency를 어떻게 검증해?",
+    "Bloom filter가 있어도 LSM read amplification이 완전히 사라지지 않는 이유가 뭐야?",
+    "LSM compaction debt를 query tuning이나 checkpoint flush storm과 구분하는 체크리스트를 알려줘"
+  ],
+  "symptoms": [
+    "LSM 계열 저장소에서 delete나 TTL 이후 point read, negative lookup, range scan p95/p99가 서서히 나빠진다",
+    "compaction pending bytes, L0 file count, write stall이 늘지만 쿼리 모양만 보고 원인을 찾고 있다",
+    "tombstone을 즉시 물리 삭제로 오해해 space amplification과 read amplification 관측을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/bptree-vs-lsm-tree",
+      "data-structure/lsm-friendly-index-structures"
+    ],
+    "next_docs": [
+      "database/checkpoint-age-flush-storms",
+      "system-design/data-retention-deletion-tombstone-gdpr-playbook",
+      "database/replication-lag-forensics-root-cause-playbook"
+    ],
+    "confusable_with": [
+      "database/bptree-vs-lsm-tree",
+      "data-structure/lsm-friendly-index-structures",
+      "database/checkpoint-age-flush-storms",
+      "system-design/data-retention-deletion-tombstone-gdpr-playbook",
+      "database/query-tuning-checklist"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/lsm-compaction-tombstone-read-amplification-playbook.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "security/jwt-algorithm-confusion-kid-lookup-playbook",
+  "title": "JWT Algorithm Confusion / kid Lookup Playbook",
+  "category": "security",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# JWT Algorithm Confusion / kid Lookup Playbook\n\n> 한 줄 요약: JWT header의 `alg`와 `kid`는 policy가 아니라 untrusted selector다. verifier는 issuer별 allowlist와 trusted key source를 먼저 고정하고, 그 안에서만 `kid`를 매칭해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n> - [JWT Signature Verification Failure Playbook](./jwt-signature-verification-failure-playbook.md)\n> - [JWT 서명 알고리즘 — HS256 vs RS256 vs ES256 어떻게 고를까](./jwt-signing-algorithm-hs256-vs-rs256-vs-es256-intermediate-bridge.md)\n> - [JWK Rotation / Cache Invalidation / `kid` Rollover](./jwk-rotation-cache-invalidation-kid-rollover.md)\n> - [JWT JWKS Outage Playbook](./jwt-jwks-outage-playbook.md)\n> - [JWT / JWKS Outage Recovery / Failover Drills](./jwt-jwks-outage-recovery-failover-drills.md)\n> - [Token Introspection vs Self-Contained JWT](./token-introspection-vs-self-contained-jwt.md)\n> - [Public Key / Digital Signature Primer](./public-key-digital-signature-primer.md)\n\nretrieval-anchor-keywords: JWT algorithm confusion, alg none attack, HS256 RS256 confusion, public key as HMAC secret, kid lookup allowlist, JWKS cache poisoning, jku x5u SSRF, issuer audience key source binding, duplicate kid, unknown kid fail closed\n\n## 먼저 보는 mental model\n\nJWT 검증은 \"토큰이 말한 알고리즘으로 검증\"이 아니다.\n\n안전한 순서는 아래다.\n\n1. API route, tenant, issuer policy로 허용 issuer 후보를 정한다.\n2. 그 issuer에 대해 허용된 algorithm set을 정한다.\n3. 그 issuer의 trusted key source를 정한다.\n4. token header의 `kid`는 그 trusted key set 안에서 후보 key를 좁히는 데만 쓴다.\n5. signature가 통과한 뒤 `iss`, `aud`, `exp`, `nbf`, `typ` 같은 claim을 검증한다.\n\n즉 `alg`와 `kid`는 검증자가 이미 가진 정책 안에서만 의미가 있다.\n\n## 10초 reject table\n\n| 입력/상황 | 처리 |\n|---|---|\n| `alg=none` | auth token에서는 reject. unsecured JWS는 별도 명시 context 없이는 받지 않는다 |\n| issuer policy가 `RS256`인데 token header가 `HS256` | reject. public key를 HMAC secret처럼 쓰지 않는다 |\n| `kid`가 issuer JWKS에 없음 | bounded refresh 1회 후에도 없으면 fail-closed |\n| 같은 issuer key set 안에 duplicate `kid`가 있음 | reject 또는 config incident로 처리 |\n| token header의 `jku`/`x5u`가 새 URL을 가리킴 | 기본 reject. 미리 pin/allowlist된 URL이 아니면 따라가지 않는다 |\n| `iss`/`aud`가 기대값과 다름 | signature가 맞아도 reject |\n\n## `alg=none`은 왜 위험한가\n\nJWS에는 integrity protection이 없는 unsecured JWS가 있고, 이때 `alg` 값은 `none`이다. 이것은 spec에 존재하는 표현이지만, 일반 인증/인가용 access token을 \"서명 없어도 통과\"시키라는 뜻이 아니다.\n\n안전한 verifier 원칙:\n\n- library가 `none`을 기본 허용하지 않게 한다.\n- 테스트나 특수 내부 context에서만 명시적으로 허용한다.\n- production auth path에서는 `none`을 allowlist에 넣지 않는다.\n- payload decode 결과를 인증 성공으로 쓰지 않는다.\n\n## HS/RS confusion 방지\n\n대표 사고는 이렇다.\n\n1. 정상 issuer는 `RS256` private key로 token을 서명한다.\n2. verifier는 RSA public key로 검증해야 한다.\n3. 공격자가 header를 `HS256`으로 바꾸고, verifier가 RSA public key bytes를 HMAC secret처럼 쓰게 만든다.\n4. verifier가 token header의 `alg`를 policy처럼 믿으면 조작 token이 통과할 수 있다.\n\n방어는 단순하다.\n\n| 방어 | 이유 |\n|---|---|\n| issuer별 algorithm allowlist를 config로 고정 | token header가 verifier 정책을 바꾸지 못하게 한다 |\n| key 하나를 정확히 한 algorithm family에만 묶는다 | RFC 8725의 algorithm verification 요구와 맞다 |\n| JWK `kty`, `use`/`key_ops`, `alg` metadata를 policy와 비교한다 | RSA/EC/public key를 HMAC secret으로 쓰는 혼동을 막는다 |\n| HS verifier와 RS/ES verifier code path를 분리한다 | 같은 API에 key object를 섞어 넣는 실수를 줄인다 |\n\n## issuer / audience / key source binding\n\nmulti-issuer 환경에서는 아래 셋을 한 단위로 묶는다.\n\n```text\nissuer policy = {\n  issuer: \"https://auth.example.com\",\n  audience: \"orders-api\",\n  allowed_algs: [\"RS256\"],\n  jwks_uri: \"https://auth.example.com/.well-known/jwks.json\"\n}\n```\n\n검증자는 이 policy 밖으로 나가면 안 된다.\n\n- token의 unverified `iss`는 candidate selection 힌트일 수 있지만, signature 후 exact match를 다시 해야 한다.\n- token의 `aud`가 API 자신을 포함하지 않으면 reject한다.\n- issuer A token을 issuer B JWKS로 검증하지 않는다.\n- cache key는 최소 `(issuer, jwks_uri, tenant/environment)`를 포함한다.\n\n## `kid` lookup allowlist\n\nRFC 7517에서 `kid`는 JWK Set 안에서 특정 key를 매칭하기 위한 key id다. 구조는 application-specific이고, key rollover 때 후보를 좁히는 힌트다.\n\n안전한 lookup은 아래처럼 제한한다.\n\n1. issuer policy로 trusted JWKS URI 또는 pinned key set을 고른다.\n2. 그 key set 안에서만 exact `kid` match를 한다.\n3. `kid`가 없으면 issuer 단위 single-flight refresh를 한 번 시도한다.\n4. refresh 후에도 없으면 reject한다.\n5. duplicate `kid`, unexpected `kty`, unexpected `alg`는 config/security incident로 본다.\n\n`kid`를 파일 경로, SQL 조건, Redis key prefix, 외부 URL처럼 직접 이어 붙이면 안 된다. 길이 제한, 문자 allowlist, exact map lookup을 둔다.\n\n## JWKS cache poisoning caveats\n\nJWKS cache는 availability를 위해 필요하지만, 잘못 설계하면 trust boundary가 깨진다.\n\n| 위험한 fallback | 안전한 대안 |\n|---|---|\n| token header의 `jku`를 따라가 새 JWKS를 fetch | issuer config에 pin된 JWKS URI만 사용 |\n| cache key를 `kid` 하나로 둠 | `(issuer, jwks_uri, kid)`로 scope 분리 |\n| unknown `kid`를 stale cache의 아무 key로 검증 시도 | unknown `kid` fail-closed |\n| JWKS fetch 실패 때 모든 token을 allow | known-good key와 known `kid`만 짧은 stale-if-error |\n| duplicate `kid`면 순서대로 아무 key나 시도 | reject하고 key publish incident로 처리 |\n| negative cache를 길게 둬 rotation 복구를 막음 | 짧은 negative TTL + bounded refresh |\n\nstale-if-error를 쓰더라도 \"이미 신뢰한 issuer의 이미 보았던 `kid`\"에만 제한한다. 처음 보는 `kid`를 장애라는 이유로 받아들이면 key discovery가 인증 우회 경로가 된다.\n\n## 검증 pipeline 예시\n\n```text\nparse compact JWT\n  -> reject malformed\nresolve expected issuer policy from route/tenant\n  -> no policy: reject\nread header as untrusted selector\n  -> alg not in policy.allowed_algs: reject\n  -> typ policy mismatch: reject or warn by policy\nresolve key from policy.jwks by kid\n  -> kid miss: single-flight refresh once\n  -> still miss or duplicate: reject\ncheck key metadata\n  -> kty/use/key_ops/alg inconsistent: reject\nverify JWS signature with the selected algorithm/key\n  -> invalid: reject\nvalidate claims\n  -> iss exact, aud expected, exp/nbf with bounded clock skew\naccept\n```\n\n운영 로그는 token 원문을 남기지 말고 아래 bucket을 남긴다.\n\n- `malformed`\n- `alg_not_allowed`\n- `kid_not_found`\n- `duplicate_kid`\n- `jwks_fetch_failed`\n- `signature_invalid`\n- `issuer_mismatch`\n- `audience_mismatch`\n- `expired`\n\n## incident triage\n\n| 관찰 | 먼저 볼 것 | 보수적 대응 |\n|---|---|---|\n| `alg_not_allowed` 급증 | signer 배포가 algorithm을 바꿨는가, 공격 시도인가 | allowlist 유지, signer rollback/정정 |\n| 새 `kid`만 실패 | JWKS publish와 verifier cache propagation | old token은 유지, unknown new kid는 fail-closed |\n| 모든 `kid` 실패 | issuer config, JWKS endpoint, clock, library upgrade | fail-open 금지, known-good cache만 제한 사용 |\n| duplicate `kid` 발견 | JWKS publish pipeline | availability보다 integrity 우선, ambiguous key reject |\n| `audience_mismatch` | 잘못된 token reuse, API audience 설정 | 다른 API용 token 수락 금지 |\n\n## Primary references\n\n- RFC 8725 JSON Web Token Best Current Practices: https://www.rfc-editor.org/rfc/rfc8725.html\n- RFC 7519 JSON Web Token: https://www.rfc-editor.org/rfc/rfc7519.html\n- RFC 7517 JSON Web Key: https://www.rfc-editor.org/rfc/rfc7517.html\n- OWASP JSON Web Token Cheat Sheet for Java: https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html\n\n## 한 줄 정리\n\nJWT 검증의 안전한 기본값은 \"header를 믿지 말고, issuer별 정책과 key source를 먼저 고정한 뒤, 그 안에서만 `alg`와 `kid`를 확인한다\"다.\n",
+  "aliases": [
+    "JWT algorithm confusion",
+    "JWT alg none",
+    "HS256 RS256 confusion",
+    "kid lookup playbook",
+    "JWKS cache poisoning",
+    "JWT key lookup allowlist",
+    "JWT verifier allowlist",
+    "JWT none algorithm",
+    "JWT public key as HMAC secret",
+    "issuer audience key source binding",
+    "jwt 알고리즘 혼동",
+    "kid lookup allowlist"
+  ],
+  "expected_queries": [
+    "JWT algorithm confusion은 어떻게 막아?",
+    "JWT alg none 공격과 HS RS confusion 차이를 설명해줘",
+    "kid lookup을 allowlist로 해야 하는 이유가 뭐야?",
+    "JWKS cache poisoning을 어떻게 방지해?",
+    "issuer audience key source를 JWT 검증에서 어떻게 묶어?"
+  ],
+  "symptoms": [
+    "JWT header alg를 바꾸면 검증 경로가 바뀌는지 걱정돼요",
+    "RS256 토큰을 HS256으로 바꾸는 공격을 어떻게 막는지 모르겠어요",
+    "kid 값으로 아무 JWKS나 찾아가도 되는지 헷갈려요",
+    "unknown kid가 많을 때 cache refresh를 어떻게 해야 할지 모르겠어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/session-cookie-jwt-basics",
+      "security/public-key-digital-signature-primer"
+    ],
+    "next_docs": [
+      "security/jwt-signature-verification-failure-playbook",
+      "security/jwk-rotation-cache-invalidation-kid-rollover"
+    ],
+    "confusable_with": [
+      "security/jwt-signature-verification-failure-playbook",
+      "security/jwt-jwks-outage-playbook",
+      "security/jwt-signing-algorithm-hs256-vs-rs256-vs-es256-intermediate-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/jwt-algorithm-confusion-kid-lookup-playbook.md",
+    "revision_history": []
+  }
+}

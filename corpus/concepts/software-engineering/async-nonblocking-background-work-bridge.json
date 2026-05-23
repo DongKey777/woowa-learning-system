@@ -1,0 +1,58 @@
+{
+  "id": "software-engineering/async-nonblocking-background-work-bridge",
+  "title": "Async, Nonblocking, and Background Work Bridge",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Async, Nonblocking, and Background Work Bridge\n\n> 한 줄 요약: async는 \"완료 시점을 분리한다\"는 말이고, nonblocking은 \"기다리는 동안 실행 자원을 붙잡지 않는다\"는 말이며, background work는 \"응답 경계 밖의 작업으로 운영 책임을 넘긴다\"는 말이다.\n\n**난이도: Beginner**\n\n## 세 단어를 먼저 분리하기\n\n| 단어 | 핵심 질문 | 예시 |\n|---|---|---|\n| async | 결과를 지금 받을 필요가 있는가 | 알림 발송을 주문 응답 뒤로 보냄 |\n| nonblocking | 기다리는 동안 thread를 붙잡는가 | socket IO를 event loop로 처리 |\n| background work | 실패, 재시도, 관측을 별도 작업으로 관리할 것인가 | outbox relay, email worker, batch job |\n\n`async`라고 해서 자동으로 빠르고 안전해지는 것은 아니다.\n응답 뒤로 넘긴 순간부터는 \"실패하면 누가 다시 하나\", \"중복 실행되면 안전한가\", \"사용자는 완료 상태를 어디서 보나\"가 설계 질문이 된다.\n\n세 단어는 서로 대체 관계가 아니라 축이 다르다.\n\n- `async`: 호출자와 완료 시점을 분리한다. 내부 구현은 blocking thread pool일 수도 있다.\n- `nonblocking`: I/O 대기 동안 실행 자원을 붙잡지 않는다. 응답 전에 결과를 기다리면 여전히 request-response 흐름일 수 있다.\n- `background work`: 요청 경계 밖에서 완료 책임을 관리한다. 내부 worker는 blocking 방식일 수도, nonblocking 방식일 수도 있다.\n\n예를 들어 `@Async`로 메일 발송을 다른 executor에 넘기면 async/background에 가까워지지만,\n메일 서버 호출 자체가 blocking이면 nonblocking은 아니다. 반대로 event loop 기반 HTTP client로\n외부 API를 nonblocking 호출하더라도, 그 결과가 주문 응답 전에 필요하면 background job은 아니다.\n\n## 선택 순서\n\n1. 사용자 응답 전에 반드시 끝나야 하는 일인지 확인한다.\n2. 외부 I/O 대기인지 CPU 계산인지 나눈다.\n3. 응답 뒤로 넘겨도 되면 idempotency와 retry key를 먼저 붙인다.\n4. 대기 시간이 문제라면 thread pool 격리, nonblocking IO, queue 중 병목 위치에 맞춰 고른다.\n5. 생산 속도가 소비 속도를 넘을 때의 backpressure 정책을 정한다.\n6. 요청 취소, timeout, shutdown 때 작업을 취소할지 끝까지 보장할지 정한다.\n\n## backpressure와 cancellation caveat\n\n### backpressure\n\nbackground queue나 coroutine channel을 추가해도 작업량이 사라지는 것은 아니다.\n응답 thread에서 worker queue로 병목 위치가 이동할 뿐이다.\n\n따라서 다음 중 하나가 반드시 있어야 한다.\n\n- bounded queue와 rejection/admission control\n- producer rate limit 또는 load shedding\n- retry delay, DLQ, poison message 격리\n- queue depth, age, worker saturation, retry count 관측\n\nunbounded queue는 장애를 늦게 보이게 만들 뿐이다. p99가 늘고 메모리가 차며,\n결국 worker가 처리할 수 없는 속도로 실패를 적립한다.\n\n### cancellation\n\n취소 의미도 경계마다 다르다.\n\n- HTTP client disconnect: 요청 안에서 계산하던 coroutine은 취소해도 될 수 있다.\n- 결제 승인 후 outbox 발행: 사용자가 브라우저를 닫아도 완료 책임을 버리면 안 된다.\n- `Future.cancel(true)`: interrupt에 협력하지 않는 blocking I/O나 라이브러리는 즉시 멈추지 않을 수 있다.\n- shutdown: in-flight 작업을 drain할지, 재큐잉할지, 중복 실행을 idempotency로 흡수할지 정해야 한다.\n\n즉 \"취소 가능\"은 구현 API가 아니라 business invariant와 delivery guarantee의 문제다.\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| `@Async`를 붙이면 nonblocking이 된다 | 별도 thread에서 blocking할 수 있다 |\n| coroutine이면 background job이 필요 없다 | 완료 책임과 retry가 남으면 queue나 outbox가 필요할 수 있다 |\n| 응답 뒤 작업은 실패해도 사용자와 무관하다 | 사용자에게 보이는 상태나 보상 경로가 필요하다 |\n| 오래 걸리면 전부 비동기 처리한다 | 지금 완료되어야 하는 invariant는 동기로 남겨야 한다 |\n| queue에 넣으면 부하가 해결된다 | bounded queue, backpressure, admission control이 없으면 병목이 뒤로 밀린다 |\n| timeout을 걸면 작업이 사라진다 | 외부 side effect나 worker 작업은 별도 취소/보상/멱등 처리가 필요하다 |\n\n## wrong-bucket / 오선택\n\n| 상황 | wrong-bucket | 더 맞는 질문 |\n|---|---|---|\n| 외부 API가 느려서 request thread가 고갈된다 | 무조건 background job으로 넘긴다 | 응답 전에 필요한 결과인가, blocking I/O를 격리하거나 nonblocking client로 바꿀 수 있는가 |\n| 이메일/알림이 실패해도 주문은 성공해야 한다 | nonblocking I/O만 적용한다 | outbox, retry, idempotency, 상태 관측이 필요한가 |\n| CPU 계산이 오래 걸린다 | event loop/nonblocking으로 해결한다 | worker pool 분리, batch, cache, admission control이 필요한가 |\n| 요청 취소 시 결제/예약 side effect도 취소한다고 본다 | coroutine cancellation만 믿는다 | 이미 시작한 side effect의 완료/보상/중복 실행 계약은 무엇인가 |\n| queue depth가 계속 늘어난다 | worker 수만 늘린다 | producer를 늦추거나 거절하는 backpressure 정책이 있는가 |\n\n## 다음 문서\n\n- API 응답과 job 분리는 [Sync API vs Async Job](../system-design/sync-api-vs-async-job-decision-chooser.md)에서 고른다.\n- thread pool 경합은 [Blocking I/O, 스레드 풀, 백프레셔 입문](../operating-system/blocking-io-thread-pool-backpressure-primer.md)으로 본다.\n- 언어 수준 coroutine은 [Coroutine](../language/coroutine.md)으로 내려간다.\n",
+  "aliases": [
+    "async nonblocking background work",
+    "비동기 논블로킹 백그라운드 작업",
+    "background job vs nonblocking",
+    "응답 후 처리",
+    "coroutine background work bridge",
+    "async vs nonblocking",
+    "async vs background job",
+    "backpressure cancellation async work",
+    "@Async"
+  ],
+  "expected_queries": [
+    "async와 nonblocking과 background job은 어떻게 달라?",
+    "오래 걸리는 작업을 응답 뒤로 넘기는 것과 nonblocking IO는 같은 말이야?",
+    "coroutine을 쓰면 background queue가 필요 없어지는지 설명해줘",
+    "HTTP 요청에서 꼭 지금 끝내야 하는 일과 나중에 처리할 일을 어떻게 나눠?",
+    "비동기 작업으로 빼면 retry와 idempotency를 왜 같이 봐야 해?",
+    "async 작업에서 backpressure와 cancellation은 어디까지 설계해야 해?"
+  ],
+  "symptoms": [
+    "오래 걸리는 일을 비동기로 빼야 한다는 말과 nonblocking으로 바꿔야 한다는 말을 섞어 쓰고 있다",
+    "HTTP 응답 전에 끝나야 하는 일과 응답 후 처리해도 되는 일을 구분하지 못한다",
+    "coroutine, thread pool, queue, scheduler 중 무엇을 골라야 할지 모르겠다",
+    "queue에 넣으면 backpressure와 cancellation 문제가 사라진다고 오해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/sync-async-blocking-nonblocking-basics",
+      "software-engineering/software-engineering-index"
+    ],
+    "next_docs": [
+      "system-design/sync-api-vs-async-job-decision-chooser",
+      "operating-system/blocking-io-thread-pool-backpressure-primer",
+      "language/coroutine-basics"
+    ],
+    "confusable_with": [
+      "operating-system/sync-async-blocking-nonblocking-basics",
+      "system-design/sync-api-vs-async-job-decision-chooser",
+      "language/coroutine-basics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/async-nonblocking-background-work-bridge.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "id": "database/serializable-snapshot-isolation-write-skew-playbook",
+  "title": "Serializable Snapshot Isolation Write Skew Playbook",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Serializable Snapshot Isolation Write Skew Playbook\n\n> 한 줄 요약: Snapshot Isolation은 안정된 스냅샷을 주지만 write skew를 허용할 수 있고, Serializable Snapshot Isolation은 그 위험한 동시성 구조를 commit 시점에 끊어 내므로 서비스는 **불변식 읽기 + 전체 트랜잭션 retry + 재현 테스트**까지 같이 가져야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [MVCC와 Snapshot Isolation 입문서](./mvcc-snapshot-isolation-primer.md)\n- [Read Committed와 Repeatable Read의 이상 현상 비교](./read-committed-vs-repeatable-read-anomalies.md)\n- [Range Invariant Enforcement for Write Skew and Phantom Anomalies](./range-invariant-enforcement-write-skew-phantom.md)\n- [Write Skew and Phantom Read Case Studies](./write-skew-phantom-read-case-studies.md)\n- [PostgreSQL SERIALIZABLE Retry Playbook for Beginners](./postgresql-serializable-retry-playbook.md)\n- [Serializable Retry Telemetry for Set Invariants](./serializable-retry-telemetry-set-invariants.md)\n- [Guard Row vs Serializable Retry vs Reconciliation for Set Invariants](./guard-row-vs-serializable-vs-reconciliation-set-invariants.md)\n\nretrieval-anchor-keywords: Serializable Snapshot Isolation, SSI, snapshot isolation write skew, PostgreSQL SERIALIZABLE, SQLSTATE 40001, serialization failure, dangerous structure, predicate read dependency, write skew reproduction, range invariant under serializable\n\n## 먼저 분리할 말\n\n| 용어 | 정확한 뜻 | write skew와의 관계 |\n|---|---|---|\n| Snapshot Isolation | 트랜잭션이 일정 시점의 committed snapshot을 읽는다 | 같은 snapshot을 본 두 트랜잭션이 서로 다른 row를 바꾸면 set invariant가 깨질 수 있다 |\n| Serializable | concurrent 실행 결과가 어떤 serial order와 같아야 한다는 보장 | write skew가 serial order로 설명되지 않으면 한쪽이 실패해야 한다 |\n| Serializable Snapshot Isolation | snapshot read 위에 read-write dependency 검사를 붙여 serializable을 구현하는 방식 | 위험한 dependency cycle을 감지해 `40001` 같은 serialization failure로 끊는다 |\n| Predicate / range invariant | \"이 조건을 만족하는 row 집합\"에 걸린 규칙 | 같은 row 충돌이 없어도 predicate를 믿고 판단하면 write skew나 phantom이 난다 |\n| Serialization failure | DB가 \"이번 시도는 serializable하게 설명할 수 없다\"고 abort한 신호 | 정상적인 안전장치이며, transaction attempt 전체를 다시 시작해야 한다 |\n\n이 문서는 [Range Invariant Enforcement](./range-invariant-enforcement-write-skew-phantom.md)처럼 어떤 저장 규칙을 고를지 넓게 비교하지 않는다. 초점은 **SSI를 선택했을 때 무엇을 읽고, 무엇을 retry하고, 어떻게 테스트할지**다.\n\n## 핵심 개념\n\nSnapshot Isolation은 \"내 트랜잭션 동안 읽기가 안정적\"이라는 장점이 있다. 하지만 안정된 그림이 항상 안전한 결정을 뜻하지는 않는다.\n\n예를 들어 당직 의사가 A와 B 두 명 있고, 규칙은 \"항상 최소 1명은 on call이어야 한다\"라고 하자.\n\n1. T1은 A를 off로 바꾸기 전에 on-call 수가 2명이라고 읽는다.\n2. T2도 같은 snapshot에서 on-call 수가 2명이라고 읽는다.\n3. T1은 A만 off로 update한다.\n4. T2는 B만 off로 update한다.\n5. 두 트랜잭션은 같은 row를 쓰지 않았으므로 Snapshot Isolation에서는 둘 다 commit될 수 있다.\n\n각 transaction 내부의 판단은 그 snapshot 안에서는 맞았다. 그러나 최종 상태는 on-call 0명이다. 이것이 write skew다.\n\nSerializable은 이 결과를 허용하면 안 된다. PostgreSQL `SERIALIZABLE`은 Snapshot Isolation 위에 SSI 검사를 얹어, 두 트랜잭션 사이의 read-write dependency가 serial order로 설명되지 않는 위험한 구조를 만들면 한쪽을 `SQLSTATE 40001`로 abort한다. 그래서 \"SERIALIZABLE을 켜면 에러가 없어야 한다\"가 아니라, **에러가 날 수 있도록 두고 안전하게 다시 시도해야 한다**가 맞다.\n\n## SSI playbook\n\n### 1. 보호할 invariant를 문장으로 먼저 쓴다\n\n코드보다 먼저 규칙을 써야 한다.\n\n- `shift_id = 10`에는 on-call doctor가 최소 1명 남아야 한다.\n- `room_id = 3`에는 겹치는 예약 시간이 없어야 한다.\n- `campaign_id = 7`의 active claim 합계는 quota를 넘으면 안 된다.\n\n이 문장이 없으면 테스트가 \"동시 요청이 성공했다/실패했다\"만 보고 끝난다. SSI가 막아야 하는 것은 SQL 문장이 아니라 도메인 invariant다.\n\n### 2. predicate read를 같은 transaction 안에 둔다\n\nSSI는 트랜잭션이 무엇을 읽고 그 판단으로 무엇을 썼는지 봐야 한다.\n\n위험한 패턴:\n\n- transaction 밖에서 count를 읽고 transaction 안에서는 update만 한다\n- cache나 read replica에서 absence check를 하고 primary transaction에는 insert만 한다\n- 이전 retry attempt에서 계산한 boolean을 다음 attempt에 재사용한다\n\n이러면 DB가 predicate dependency를 볼 기회가 줄어든다. PostgreSQL SSI의 predicate/range 보호는 트랜잭션 안에서 실제로 읽은 영속 테이블 접근을 바탕으로 충돌을 추적하므로, 애플리케이션이 판단 근거를 transaction 밖으로 빼면 `SERIALIZABLE`만으로 그 판단을 검증했다고 말할 수 없다.\n\n권장 패턴:\n\n```text\nbegin serializable transaction\n  read predicate / aggregate needed for invariant\n  decide based on that read\n  write the state transition\ncommit\n\nif serialization failure:\n  discard the whole attempt\n  start again from the read\n```\n\n### 3. constraint나 guard row가 더 직접적이면 먼저 검토한다\n\nSSI는 강한 도구지만 항상 첫 선택은 아니다.\n\n| invariant 모양 | 더 직접적인 선택 | SSI가 잘 맞는 경우 |\n|---|---|---|\n| exact key uniqueness | `UNIQUE`, `PRIMARY KEY`, upsert arbitration | 복합 판단이 key 하나로 줄지 않을 때 |\n| discrete slot overlap | slot row + unique key | slot으로 쪼개기 어렵거나 predicate가 복잡할 때 |\n| count/sum capacity | guard row, conditional aggregate update | guard row가 hot spot이 되거나 규칙이 여러 predicate에 걸칠 때 |\n| cross-row write skew | guard row 또는 serializable | invariant가 DB transaction 안에서 읽고 쓸 수 있을 때 |\n\n즉 \"Serializable이면 끝\"이 아니라, 불변식이 저장 규칙으로 더 명확히 표현되면 그쪽이 더 단순하다. SSI는 predicate가 복잡하거나 guard row 모델이 과도할 때 좋은 안전망이 된다.\n\n### 4. `40001`은 whole-transaction retry로 처리한다\n\n`SQLSTATE 40001`은 보통 \"이번 serializable attempt는 버려라\"는 뜻이다. 같은 transaction 안에서 실패한 SQL 한 줄만 다시 실행하면 안 된다. PostgreSQL이 애플리케이션의 판단 로직까지 자동으로 다시 실행할 수는 없으므로, retry는 SQL이 아니라 **어떤 SQL과 값을 고를지 결정하는 로직을 포함한 전체 transaction attempt** 단위여야 한다.\n\n서비스 계층 규칙:\n\n- retry loop는 `@Transactional` 안쪽이 아니라 바깥 facade에 둔다.\n- attempt마다 새 transaction, 새 snapshot, 새 predicate read를 만든다.\n- max attempt와 jitter backoff를 둔다.\n- retry는 성공 보장이 아니다. 경합이 높으면 여러 번 실패할 수 있고, budget을 넘기면 명시적인 재시도 실패 결과로 처리한다.\n- 외부 API, 메일 발송, 메시지 publish는 retry attempt 안에 직접 넣지 않는다.\n- duplicate key, exclusion violation, lock timeout, connection failure를 모두 `40001`과 같은 bucket에 넣지 않는다.\n\n분류 예시:\n\n| surface | 기본 처리 |\n|---|---|\n| `40001` serialization failure | whole-transaction retry |\n| `40P01` deadlock | retry 가능하지만 별도 telemetry |\n| `23505`, `23P01` constraint violation | 보통 domain reject 또는 winner read |\n| statement timeout / lock timeout | blocking, budget, lock order 문제로 분리 |\n| connection lost / unknown commit | idempotency key나 결과 조회로 복구 |\n\n### 5. 성공 후에도 실제 invariant를 검증한다\n\nSSI retry가 있다고 해서 운영 검증이 필요 없어지는 것은 아니다.\n\n- bypass write가 있었는가\n- 일부 경로만 `SERIALIZABLE`을 안 쓰는가\n- retry exhausted가 늘어나 availability가 무너지는가\n- 실제 `on_call_count = 0`, `reserved > capacity` 같은 breach가 있는가\n\n안전 검증과 retry 관측은 [Serializable Retry Telemetry](./serializable-retry-telemetry-set-invariants.md)로 이어진다.\n\n## 재현 테스트 패턴\n\nsleep만으로 동시성 테스트를 만들면 불안정하다. 두 transaction이 같은 snapshot에서 같은 predicate를 읽은 뒤 동시에 write로 넘어가게 barrier를 둔다.\n\n### 테스트 fixture\n\n```sql\nCREATE TABLE on_call (\n    shift_id BIGINT NOT NULL,\n    doctor_id BIGINT NOT NULL,\n    on_call BOOLEAN NOT NULL,\n    PRIMARY KEY (shift_id, doctor_id)\n);\n\nINSERT INTO on_call (shift_id, doctor_id, on_call)\nVALUES (10, 1, true), (10, 2, true);\n```\n\n### Snapshot Isolation에서 write skew를 보여 주는 흐름\n\nPostgreSQL에서는 `REPEATABLE READ`가 snapshot isolation에 가깝다. 엔진마다 이름과 동작은 다르므로 이 테스트는 PostgreSQL 기준으로 읽는다.\n\n```text\nT1: BEGIN ISOLATION LEVEL REPEATABLE READ;\nT2: BEGIN ISOLATION LEVEL REPEATABLE READ;\n\nT1: SELECT count(*) FROM on_call WHERE shift_id = 10 AND on_call = true; -- 2\nT2: SELECT count(*) FROM on_call WHERE shift_id = 10 AND on_call = true; -- 2\n\nbarrier: both transactions have read the same predicate\n\nT1: UPDATE on_call SET on_call = false WHERE shift_id = 10 AND doctor_id = 1;\nT2: UPDATE on_call SET on_call = false WHERE shift_id = 10 AND doctor_id = 2;\n\nT1: COMMIT;\nT2: COMMIT;\n```\n\n기대 결과:\n\n- 두 transaction이 모두 commit될 수 있다.\n- 최종 `count(on_call=true)`가 0이면 invariant가 깨진 것이다.\n- 이 실패를 \"row lock이 없어서\"로만 보면 부족하다. 서로 다른 row를 썼기 때문에 row-level write conflict가 없었다.\n\n### Serializable에서 abort를 검증하는 흐름\n\n같은 테스트를 `SERIALIZABLE`로 바꾼다.\n\n```text\nT1: BEGIN ISOLATION LEVEL SERIALIZABLE;\nT2: BEGIN ISOLATION LEVEL SERIALIZABLE;\n\nT1/T2: same predicate read\nbarrier\nT1/T2: each updates a different doctor row\nT1/T2: commit race\n```\n\n기대 결과:\n\n- 둘 중 하나는 commit된다.\n- 다른 하나는 `SQLSTATE 40001` serialization failure로 실패할 수 있다.\n- 실패한 attempt를 새 transaction으로 다시 실행하면 on-call count가 1명으로 보이므로 domain rule상 off 전환을 거절해야 한다.\n\n테스트 assertion은 \"첫 commit race에서는 한쪽이 `40001`로 밀리고, retry envelope가 새 snapshot에서 다시 판단해 성공하거나 domain reject로 끝난다\"처럼 invariant 중심으로 잡는다. `40001`이 한 번도 안 나야 한다고 쓰면 serializable의 정상 동작을 오히려 실패로 보는 셈이고, retry 없이 자동으로 최종 성공한다고 기대해도 안 된다.\n\n## Range invariant에서의 주의점\n\n시간대 예약처럼 `WHERE room_id = ? AND start_at < :end AND end_at > :start` predicate를 믿고 insert하는 문제도 비슷하다.\n\nSSI가 효과를 가지려면:\n\n- overlap check predicate가 같은 serializable transaction 안에 있어야 한다.\n- insert가 그 판단 바로 뒤에 같은 transaction에서 일어나야 한다.\n- retry attempt가 처음부터 overlap check를 다시 해야 한다.\n\n하지만 overlap 금지가 핵심 도메인 규칙이면 PostgreSQL exclusion constraint나 slotization이 더 직접적일 수 있다. Serializable retry는 \"규칙을 표현하지 않아도 된다\"가 아니라, \"predicate 판단 경쟁을 안전하게 abort할 수 있다\"에 가깝다.\n\n## 자주 틀리는 구현\n\n| 구현 | 왜 위험한가 | 수정 방향 |\n|---|---|---|\n| `SERIALIZABLE`만 켜고 retry 없음 | 정상적인 serialization failure가 사용자 오류가 된다 | facade에 bounded whole-transaction retry를 둔다 |\n| count를 transaction 밖에서 읽음 | SSI가 판단 근거를 transaction dependency로 보기 어렵다 | predicate read부터 write까지 한 transaction으로 묶는다 |\n| retry 때 이전 count를 재사용 | 새 snapshot에서 다시 판단하지 않는다 | attempt state를 전부 버린다 |\n| `40001`, duplicate key, timeout을 같은 retry로 처리 | 정상 domain reject와 경합, 장애를 섞는다 | SQLSTATE/errno별 bucket을 분리한다 |\n| 동시성 테스트가 `Thread.sleep`에만 의존 | race가 우연히만 재현된다 | latch/barrier로 read point와 commit race를 고정한다 |\n| replica/cache에서 precheck 후 primary에 insert | primary transaction이 predicate를 읽지 않는다 | precheck는 UX 힌트로만 쓰고 최종 판정은 primary transaction에서 한다 |\n\n## 운영 체크리스트\n\n- invariant 이름과 scope가 로그에 남는가\n- 해당 invariant를 판단하는 predicate read가 serializable transaction 안에 있는가\n- `40001` retry attempt 수, exhausted 수, success-after-retry 수를 분리해 보는가\n- retry loop 안에 외부 side effect가 없는가\n- test가 Snapshot Isolation 실패와 Serializable abort를 모두 보여 주는가\n- fallback으로 constraint, guard row, reconciliation 중 무엇을 선택할지 문서화했는가\n\n## 꼬리질문\n\n> Q: Snapshot Isolation과 Serializable은 뭐가 다른가요?\n> 의도: 안정된 읽기와 serial order 보장을 구분하는지 확인\n> 핵심: Snapshot Isolation은 같은 snapshot을 주지만 write skew를 허용할 수 있고, Serializable은 결과가 어떤 직렬 순서와 같아야 한다.\n\n> Q: `40001`이 나면 SQL 한 줄만 다시 실행하면 되나요?\n> 의도: retry 단위를 아는지 확인\n> 핵심: 아니다. 실패한 transaction attempt 전체를 버리고 새 snapshot에서 read부터 다시 해야 한다.\n\n> Q: Serializable이면 range invariant를 항상 모델링하지 않아도 되나요?\n> 의도: isolation과 domain constraint를 구분하는지 확인\n> 핵심: 아니다. overlap/slot/capacity가 constraint나 guard row로 명확히 표현되면 그쪽이 더 직접적이고, SSI는 predicate 판단 경쟁을 abort하는 안전망이다.\n\n## 한 줄 정리\n\nSSI로 write skew를 다룰 때의 핵심은 `SERIALIZABLE`이라는 이름이 아니라, predicate invariant를 같은 transaction 안에서 읽고, `40001`을 전체 transaction retry로 처리하며, 테스트가 Snapshot Isolation의 실패와 Serializable의 abort를 모두 증명하게 만드는 것이다.\n",
+  "aliases": [
+    "serializable snapshot isolation playbook",
+    "SSI write skew",
+    "PostgreSQL SSI",
+    "serialization failure retry",
+    "SQLSTATE 40001",
+    "dangerous structure",
+    "predicate invariant",
+    "range invariant under serializable",
+    "snapshot isolation write skew",
+    "repeatable read write skew",
+    "serializable retry test",
+    "write skew reproduction",
+    "SSI 재시도",
+    "직렬화 실패 재시도",
+    "스냅샷 격리 write skew",
+    "predicate read dependency"
+  ],
+  "expected_queries": [
+    "Snapshot Isolation에서는 왜 각자 다른 row를 update하는 write skew가 commit될 수 있어?",
+    "Serializable Snapshot Isolation이 write skew를 막을 때 40001 retry를 어떻게 설계해야 해?",
+    "range나 predicate invariant를 SERIALIZABLE로 보호하려면 transaction 안에서 어떤 read를 반드시 남겨야 해?",
+    "당직자 최소 1명 같은 write skew를 테스트로 재현하고 serializable abort를 검증하는 방법을 알려줘",
+    "serializable retry를 SQL 한 줄이 아니라 transaction 전체로 다시 해야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "Snapshot Isolation을 Serializable과 같은 뜻으로 보고 write skew가 왜 남는지 설명하지 못해",
+    "PostgreSQL SERIALIZABLE에서 SQLSTATE 40001을 버그로 보고 retry envelope 없이 사용자 오류로 노출하고 있어",
+    "range나 set invariant를 조회한 predicate와 실제 write가 같은 transaction 안에 묶이지 않아 SSI가 보호할 기회를 잃고 있어",
+    "동시성 테스트가 sleep 기반이라 write skew 재현과 serialization failure 검증이 불안정해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/mvcc-snapshot-isolation-primer",
+      "database/read-committed-repeatable-read-anomalies",
+      "database/range-invariant-enforcement-write-skew-phantom"
+    ],
+    "next_docs": [
+      "database/postgresql-serializable-retry-playbook",
+      "database/serializable-retry-telemetry-set-invariants",
+      "database/guard-row-vs-serializable-vs-reconciliation-set-invariants"
+    ],
+    "confusable_with": [
+      "database/mvcc-snapshot-isolation-primer",
+      "database/read-committed-repeatable-read-anomalies",
+      "database/range-invariant-enforcement-write-skew-phantom",
+      "database/postgresql-serializable-retry-playbook",
+      "database/serializable-retry-telemetry-set-invariants"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/serializable-snapshot-isolation-write-skew-playbook.md",
+    "revision_history": []
+  }
+}

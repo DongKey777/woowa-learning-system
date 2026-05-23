@@ -1,0 +1,46 @@
+{
+  "id": "system-design/search-indexing-ranking-interview-drill",
+  "title": "Search Indexing Ranking Interview Drill",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 drill은 검색 시스템 설계 면접에서 indexing pipeline, inverted index, retrieval/ranking 분리를 답변한다.",
+  "body_markdown": "# Search Indexing Ranking Interview Drill\n\n## 질문\n\n\"검색 시스템을 설계해 보세요.\"\n\n## 기대 답변 축\n\nWrite path와 read path를 분리한다. 원본 데이터 변경은 ingestion pipeline을 통해 indexer로 들어가고, indexer는 inverted index를 갱신한다. Query path는 검색어 분석, candidate retrieval, ranking, snippet/highlight 단계를 거친다.\n\nInverted index는 term에서 document posting list로 가는 구조다. Retrieval은 후보 문서를 빠르게 줄이는 단계이고, ranking은 후보의 순서를 정하는 단계다. 기본 알고리즘은 analyzer plus inverted index plus BM25 후보 검색으로 시작하고, 의미 검색이 필요할 때 vector retrieval이나 hybrid retrieval을 추가한다고 말하면 균형이 좋다.\n\nFreshness는 별도 요구사항이다. 실시간 검색이 필요한지, 몇 초 또는 몇 분 지연을 허용하는지에 따라 CDC, queue, batch indexing 전략이 달라진다. 권한 필터는 ranking 뒤 장식이 아니라 retrieval/count/snippet 노출 전에 적용되어야 한다.\n\n## 약점 태그\n\n`inverted-index`, `index-freshness`, `retrieval-vs-ranking`, `query-serving`\n\n## 흔한 오답\n\nDB full scan이나 `%keyword%` LIKE만으로 대규모 검색을 설명하면 확장성이 약하다. 반대로 처음부터 ML ranking만 말하고 index freshness, analyzer, shard routing을 빼먹어도 설계가 비어 보인다.\n\n## 알고리즘/아키텍처 선택\n\n검색 설계의 기본 선택지는 inverted index다. Document를 analyzer로 tokenizing/normalizing하고, term마다 posting list를 만든다. Posting에는 doc id, term frequency, position, field weight를 담아 phrase query, field boost, snippet 계산에 활용한다.\n\nRanking의 1단계 baseline은 BM25 같은 lexical scoring이다. BM25는 term frequency와 document length normalization을 반영하므로 단순 keyword count보다 안정적이다. 이후 product 요구에 따라 recency, popularity, inventory, click signal, personalization feature를 더한다. 대규모에서는 전체 문서를 ML model로 직접 정렬하지 않고 `retrieve top N -> lightweight rank -> expensive rerank top K`처럼 단계화한다.\n\nVector search는 synonym이나 semantic match가 중요한 경우 후보 recall을 보강한다. 다만 vector만 쓰면 exact term, permission filter, boolean filter, explainability가 약해질 수 있어 hybrid retrieval로 lexical 후보와 vector 후보를 합친 뒤 ranking한다.\n\nShard는 tenant, language, category, doc id hash 중 하나를 고른다. Tenant isolation과 permission filter가 중요하면 tenant-aware shard가 유리하고, 균등 분산이 중요하면 hash shard가 쉽다. Hot query는 query result cache를 쓰되 permission, personalization, freshness 때문에 cache key가 커질 수 있음을 말한다.\n\n## 핵심 요구사항\n\n- 사용자가 입력한 query에 대해 관련 문서를 낮은 latency로 반환한다.\n- 원본 데이터 변경이 검색 index에 일정 freshness SLA 안에 반영되어야 한다.\n- retrieval, ranking, filtering, snippet/highlight를 분리해 확장한다.\n- query 품질, abuse, typo, synonym, permission filtering 같은 product 요구를 수용한다.\n- 삭제, 비공개 전환, 권한 변경은 검색 결과와 snippet/count에서 빠르게 사라져야 한다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `Document`, `IndexDocument`, `TermPosting`, `Query`, `RankedResult`, `ClickSignal`이다. 원본 DB는 canonical document를 보관하고, search cluster는 검색에 최적화된 denormalized index document를 가진다.\n\n트래픽은 read-heavy이며 인기 query는 cache hit가 크지만 tail query도 많다. Write path는 CDC, queue, batch importer를 통해 indexer로 들어가고, shard는 document id나 tenant/category 기준으로 나눈다. Click/log signal은 offline ranking 학습과 online feature 갱신에 쓰인다.\n\n## Consistency/Latency Trade-off\n\nIndex freshness를 초 단위로 낮추려면 ingestion queue, near-real-time segment refresh, partial update 비용이 커진다. 분 단위 지연을 허용하면 batch indexing과 merge 효율을 얻지만, 새 문서가 검색에 늦게 뜬다.\n\nQuery latency를 낮추려면 retrieval 단계에서 후보를 강하게 줄이고 ranking feature를 제한해야 한다. 반대로 ranking 품질을 높이려고 많은 candidate와 feature를 쓰면 p99가 올라가므로 two-stage ranking이나 async enrichment가 필요하다.\n\n## Freshness Caveat\n\nFreshness는 \"문서 생성 후 검색 가능\"만 뜻하지 않는다. update, delete, permission revoke, inventory 품절, 가격 변경처럼 결과에서 빠져야 하는 이벤트도 포함한다. 삭제와 권한 회수는 tombstone이나 deny overlay를 두어 segment merge를 기다리지 않고 query path에서 즉시 제외할 수 있어야 한다.\n\nCDC 기반 near-real-time indexing은 초 단위 freshness를 줄 수 있지만 운영 포인트가 늘어난다. Queue lag, poison event, out-of-order update, duplicate event, partial update 실패를 처리해야 한다. Batch indexing은 단순하고 throughput이 좋지만 \"방금 생성한 문서가 검색되지 않음\" UX를 설명해야 한다.\n\nFreshness SLA는 metric으로 드러나야 한다. `source_updated_at`과 `indexed_at` 차이를 index lag로 보고, queue lag, failed indexing count, tombstone 적용 지연, stale result 신고를 추적한다. Admin이나 작성자 본인 화면은 primary DB를 함께 읽는 read-after-write path를 제공할 수 있다.\n\n## Ranking Caveat\n\nRanking은 관련성만이 아니다. 면접에서는 baseline score, business rule, personalization, quality guard를 분리한다. 예를 들어 `final_score = lexical_score + recency_boost + popularity_boost + availability_guard`처럼 설명하되, 광고/프로모션 boost가 검색 품질을 망치지 않도록 별도 label이나 cap을 둔다.\n\nClick signal은 유용하지만 feedback loop가 생긴다. 이미 상위에 노출된 문서가 더 많은 click을 얻고 다시 상위에 고정될 수 있다. Exploration bucket, position bias correction, offline evaluation, A/B test, no-result query 분석을 함께 말하면 ranking 운영 답변이 된다.\n\nExpensive ranking feature는 p99를 올린다. User embedding, real-time inventory, remote feature call을 query path에서 매번 부르면 tail latency가 커진다. Online feature store, cache, timeout fallback, degraded ranker를 둔다.\n\n## Permission/Privacy Caveat\n\n권한 필터는 결과 반환 직전 한 번 거는 것으로 충분하지 않다. 사용자가 볼 수 없는 문서가 total count, facet count, autocomplete, snippet, highlight에 섞이면 정보가 새어 나간다. 가능한 경우 retrieval 전에 tenant/visibility/ACL filter를 적용하고, 복잡한 ACL은 candidate 단계에서 coarse filter 후 rank 전 또는 snippet 전 최종 filter를 다시 건다.\n\n권한 변경은 freshness보다 더 엄격할 수 있다. 문서가 비공개로 바뀌거나 사용자가 workspace에서 제거되면 cached result와 index segment가 stale해도 노출되면 안 된다. 짧은 TTL, cache invalidation, deny list overlay, query-time authorization check 중 요구사항에 맞는 조합을 선택한다.\n\nMulti-tenant 검색에서는 shard routing과 permission model이 연결된다. Tenant를 query에 명시하지 않으면 cross-tenant leakage 위험이 있고, shared index를 쓰면 모든 query에 tenant filter가 강제되어야 한다.\n\n## 실패 반례\n\n- 모든 query를 DB `LIKE`로 처리해 데이터 증가와 함께 latency가 선형 악화된다.\n- 권한 필터를 ranking 뒤에만 적용해 사용자가 보면 안 되는 문서가 snippet이나 count에 노출된다.\n- indexer lag를 관측하지 않아 \"생성했는데 검색 안 됨\" 장애를 설명하지 못한다.\n- ranking 모델만 강조하고 analyzer, synonym, shard routing, fallback을 빠뜨린다.\n- 삭제/비공개 이벤트를 segment merge에만 맡겨 stale result가 오래 노출된다.\n- vector search만 강조하고 exact term, filter, explainability 요구를 놓친다.\n\n## 면접 답변 Skeleton\n\n1. \"검색은 write-side indexing pipeline과 read-side query serving을 먼저 분리합니다.\"\n2. \"기본 알고리즘은 analyzer plus inverted index plus BM25 retrieval이고, semantic 요구가 있으면 hybrid vector retrieval을 추가합니다.\"\n3. \"Indexer는 원본 변경을 받아 denormalized index document, posting list, tombstone/deny overlay를 갱신합니다.\"\n4. \"Query path는 analyze, retrieve, permission filter, rank, highlight 순서로 설명합니다.\"\n5. \"Freshness SLA에 따라 CDC/queue/batch를 고르고, 삭제와 권한 회수는 더 빠른 guard를 둡니다.\"\n6. \"metric은 no-result rate, click-through, index lag, query p99, permission leak incident, shard error rate입니다.\"\n\n## 복습 연결\n\nIndexing pipeline은 `search-indexing-pipeline-design`, inverted index 기본은 `search-inverted-index-interview-primer`로 이어진다.\n",
+  "aliases": [
+    "search indexing ranking interview drill",
+    "검색 시스템 설계 면접",
+    "inverted index ranking pipeline",
+    "검색 색인 랭킹 설계"
+  ],
+  "expected_queries": [
+    "Search system design 면접은 어떻게 답해?",
+    "indexing pipeline과 query serving을 어떻게 나눠?",
+    "inverted index와 ranking은 어떤 관계야?"
+  ],
+  "symptoms": [
+    "검색을 DB LIKE query로만 설명합니다",
+    "indexing freshness와 query latency를 분리하지 못합니다",
+    "retrieval과 ranking을 같은 단계로 봅니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/search-system-design"
+    ],
+    "next_docs": [
+      "system-design/search-indexing-pipeline-design",
+      "system-design/search-inverted-index-interview-primer"
+    ],
+    "confusable_with": [
+      "system-design/search-indexing-pipeline-design",
+      "system-design/document-search-ranking-platform-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/search-indexing-ranking-interview-drill.md",
+    "revision_history": []
+  }
+}

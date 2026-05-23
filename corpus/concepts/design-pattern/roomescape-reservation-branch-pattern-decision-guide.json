@@ -1,0 +1,58 @@
+{
+  "id": "design-pattern/roomescape-reservation-branch-pattern-decision-guide",
+  "title": "roomescape 예약 분기 패턴 결정 가이드",
+  "category": "design-pattern",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# roomescape 예약 분기 패턴 결정 가이드\n\n## 한 줄 요약\n\n> roomescape에서 같은 `if` 문처럼 보여도 \"구현을 고르나\", \"객체를 만드나\", \"허용 여부를 판정하나\", \"현재 상태가 행동을 바꾸나\", \"저장소 invariant를 닫나\"에 따라 책임과 패턴 이름이 달라진다.\n\n## 결정 매트릭스\n\n| roomescape에서 지금 답하는 질문 | 더 가까운 패턴 | 먼저 볼 문서 |\n| --- | --- | --- |\n| 어떤 검증기나 구현을 골라 같은 요청을 처리할까 | Strategy | `roomescape에서 예약 검증/시간 슬롯 결정에 Strategy vs Factory 어떤 게 맞나` |\n| 어떤 종류의 시간 슬롯이나 객체를 만들까 | Factory | `roomescape에서 예약 검증/시간 슬롯 결정에 Strategy vs Factory 어떤 게 맞나` |\n| 이 날짜와 시간에 지금 예약을 받아도 되는가 | Policy Object | `roomescape 예약 가능 여부 판단 ↔ Policy Object 브릿지` |\n| 이미 확정되거나 취소된 예약이 지금 변경·취소될 수 있는가 | State | `roomescape 예약 상태 전이 ↔ 상태 패턴 브릿지` |\n| 같은 테마·날짜·시간에 중복 예약이 절대 생기면 안 되는가 | DB constraint / transaction 경계부터 확인 | `Plain SELECT vs Locking Read vs SERIALIZABLE 결정 가이드` |\n| 패턴보다 controller, service, repository 책임이 먼저 엉켜 있는가 | 책임 배치부터 분리 | `roomescape 예약 생성 책임 배치 결정 가이드` |\n\n짧게 외우면, 구현 선택은 strategy, 생성 분기는 factory, 규칙 판정은 policy object, 현재 단계에 따라 허용 행동이 달라지면 state다. 동시성에서 \"없음\"을 믿는 invariant는 패턴 이름이 아니라 DB 제약과 transaction/retry 계약으로 닫는다.\n\n## 분기 책임을 먼저 가른다\n\nroomescape 예약 생성 흐름은 보통 한 서비스 메서드 안에 들어오지만, 분기 책임은 최소한 다섯 갈래로 나뉜다.\n\n| 분기 책임 | 코드 냄새 | 보수적 배치 |\n| --- | --- | --- |\n| 요청 해석과 입력 정규화 | controller가 날짜 파싱, 회원 권한, 예약 가능 판단을 모두 함 | controller는 입력 계약까지만 맡기고 service로 넘긴다 |\n| 예약 가능 여부 판단 | service if 문이 휴무일, 과거 시간, 회원 제한, capacity를 모두 직접 판단 | business rule은 policy object나 domain service로 이름을 준다 |\n| 객체 생성 | policy object가 DTO, `Reservation`, `ReservationTime` 생성까지 맡음 | 생성 분기는 factory/mapper/builder 쪽으로 분리한다 |\n| 상태별 행동 | `CONFIRMED`, `CANCELED`, `WAITING`별 취소 가능 여부가 validator 이름으로 섞임 | 상태가 행동을 바꾸면 state 또는 상태 전이 정책으로 설명한다 |\n| 저장소 invariant | `existsByDateAndTime()`이 false면 안전하다고 믿고 insert함 | DB constraint, locking/serializable, retry 결과 번역을 repository/service transaction 경계에서 다룬다 |\n\n핵심은 \"분기 제거\"가 목적이 아니라 **분기 이유를 한 축으로 고정**하는 것이다. policy object는 \"이 요청을 받아도 되는가\"라는 business rule을 잘 설명하지만, 두 transaction이 동시에 같은 `absence`를 본 상황까지 자동으로 직렬화하지는 않는다.\n\n## 예약 없음 invariant는 패턴으로 닫지 않는다\n\nroomescape에서 자주 나오는 invariant는 \"같은 테마·날짜·시간에 예약이 없어야 한다\", \"회원이 같은 슬롯을 중복 예약하면 안 된다\", \"정원이 넘으면 안 된다\" 같은 `absence` 또는 capacity 조건이다. 이 조건은 애플리케이션 if 문이나 policy object로 표현할 수는 있지만, 최종 안전성은 저장소 경계에서 다시 닫아야 한다.\n\n보수적인 순서는 다음과 같다.\n\n1. exact duplicate라면 `(theme_id, date, time_id)` 또는 `(member_id, slot_id)` 같은 business key를 `UNIQUE`로 표현할 수 있는지 먼저 본다.\n2. 겹치는 시간 구간이나 capacity처럼 key 하나로 닫히지 않으면 slot row, guard row, exclusion constraint, 별도 capacity row처럼 경쟁 surface를 모델링한다.\n3. `SERIALIZABLE`을 쓰는 경우에도 \"더 센 lock\"으로 설명하지 말고 serialization failure를 whole-transaction retry로 처리할 수 있는지 확인한다.\n4. 중복 key, serialization failure, deadlock, lock timeout을 모두 같은 \"재시도\"로 뭉개지 말고 `already exists`, `retryable`, `busy`처럼 결과를 나눠 도메인 응답으로 번역한다.\n\nDB별 caveat도 보수적으로 말해야 한다. PostgreSQL의 `SELECT ... FOR UPDATE`는 보통 반환된 row를 잠그며, 없는 예약을 조회한 `0 row` 결과는 absence lock이 아니다. MySQL InnoDB `REPEATABLE READ`의 gap/next-key lock은 특정 index range와 접근 경로에 묶인 엔진 동작이라 portable한 설계 계약으로 두기 어렵다. H2 같은 테스트 DB에서 통과한 동시성 테스트도 production DB의 lock/isolation 의미를 증명하지 않는다.\n\n## 흔한 오선택\n\n검증 규칙이 많다는 이유만으로 전부 strategy라고 부르는 경우가 많다.\n하지만 \"가능한가, 왜 안 되는가\"가 중심이면 실행 방식 교체보다 policy object 쪽 설명력이 더 크다.\n\n반대로 `ReservationTime`이나 응답 객체를 만드는 분기를 policy object로 부르면 생성 축과 판정 축이 섞인다.\n이 장면은 허용 여부보다 어떤 인스턴스를 반환할지가 핵심이라 factory 질문에 가깝다.\n\n또 취소 가능 여부와 변경 허용을 validator 체인으로만 밀어 넣는 경우도 흔하다.\n이미 확정된 예약과 취소된 예약이 같은 메서드를 타되 허용 행동이 달라진다면, 현재 상태가 행동을 설명하는 state 질문이 먼저다.\n\n마지막으로 패턴 이름을 붙이기 전에 책임 배치가 섞여 있는 경우도 있다.\ncontroller, service, repository 경계가 먼저 흐리면 패턴 선택보다 책임 분리가 선행되어야 한다.\n\n또 다른 오선택은 \"중복 예약 방지도 예약 가능 여부 판단이니까 policy object로 충분하다\"는 결론이다.\npolicy object는 실패 이유와 business rule을 선명하게 만들 수 있지만, 동시에 들어온 두 요청 중 한쪽만 성공시킨다는 보장은 DB 제약, transaction 경계, retry/재조회 계약이 맡아야 한다.\n그래서 reservation branch 리팩터링 리뷰에서는 패턴 이름과 저장소 안전성을 분리해 설명하는 편이 안전하다.\n\n## 다음 학습\n\n- 검증기 선택과 객체 생성을 두 축으로 먼저 가르려면 [roomescape에서 예약 검증/시간 슬롯 결정에 Strategy vs Factory 어떤 게 맞나](./roomescape-strategy-vs-factory-bridge.md)를 본다.\n- 예약 가능 여부 판정을 규칙 객체로 올리는 기준은 [roomescape 예약 가능 여부 판단 ↔ Policy Object 브릿지](./roomescape-reservation-booking-policy-object-bridge.md)에서 잇는다.\n- 취소와 변경 허용이 현재 단계에 묶이는 순간은 [roomescape 예약 상태 전이 ↔ 상태 패턴 브릿지](./roomescape-reservation-status-state-pattern-bridge.md)로 이어서 본다.\n- 중복 예약, `0 row FOR UPDATE`, `SERIALIZABLE` retry처럼 저장소 invariant가 섞이면 [Plain SELECT vs Locking Read vs SERIALIZABLE 결정 가이드](../database/plain-select-vs-locking-read-vs-serializable-decision-guide.md)로 내려간다.\n- 아직 패턴보다 계층 책임이 더 흐리다면 [roomescape 예약 생성 책임 배치 결정 가이드](../software-engineering/roomescape-reservation-responsibility-placement-decision-guide.md)로 먼저 내려간다.\n",
+  "aliases": [
+    "roomescape 예약 분기 패턴 선택",
+    "roomescape strategy factory policy state chooser",
+    "룸이스케이프 패턴 경계 분기표",
+    "예약 검증 생성 상태 전이 패턴 구분",
+    "roomescape 패턴 이름 헷갈림"
+  ],
+  "expected_queries": [
+    "roomescape에서 예약 검증기를 나누는 일과 시간 슬롯 객체를 만드는 일을 왜 같은 패턴으로 보면 안 돼?",
+    "예약 가능 여부 판정, 구현 선택, 상태 전이를 한 표에서 빠르게 구분하는 기준이 필요해",
+    "roomescape 미션 리뷰에서 분기 축이 섞였다는 말은 strategy와 policy object와 state를 어떻게 다르게 보라는 뜻이야?",
+    "예약 생성 코드가 길어질 때 factory를 쓸지 policy object를 쓸지 state로 올릴지 판단 순서가 있어?",
+    "슬롯 생성 분기와 예약 취소 가능 여부를 같은 리팩터링으로 풀면 왜 자꾸 이름이 어색해져?",
+    "예약 없음 중복 방지는 policy object/factory가 아니라 DB unique constraint와 retry 경계로 봐야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "roomescape에서 예약 코드를 나누려는데 strategy, factory, policy object, state 중 이름을 뭘 붙여야 할지 모르겠어요",
+    "리뷰에서 분기 축이 섞였다고 하는데 예약 검증, 슬롯 생성, 상태 변경을 같은 패턴으로 설명하고 있어요",
+    "ReservationService if 문을 쪼개고 싶은데 무엇이 규칙이고 무엇이 생성이고 무엇이 상태인지 헷갈려요",
+    "예약 없음 검증을 policy object로 빼면 동시 중복 예약까지 막힌다고 착각해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/strategy-state-policy-object-decision-guide",
+      "software-engineering/roomescape-reservation-responsibility-placement-decision-guide"
+    ],
+    "next_docs": [
+      "design-pattern/roomescape-strategy-vs-factory-bridge",
+      "design-pattern/roomescape-reservation-booking-policy-object-bridge",
+      "design-pattern/roomescape-reservation-status-state-pattern-bridge",
+      "database/plain-select-vs-locking-read-vs-serializable-decision-guide",
+      "software-engineering/roomescape-reservation-responsibility-placement-decision-guide"
+    ],
+    "confusable_with": [
+      "design-pattern/roomescape-strategy-vs-factory-bridge",
+      "design-pattern/roomescape-reservation-booking-policy-object-bridge",
+      "design-pattern/roomescape-reservation-status-state-pattern-bridge",
+      "database/plain-select-vs-locking-read-vs-serializable-decision-guide",
+      "software-engineering/roomescape-reservation-responsibility-placement-decision-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/design-pattern/roomescape-reservation-branch-pattern-decision-guide.md",
+    "revision_history": []
+  }
+}

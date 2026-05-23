@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/virtual-memory-page-fault-interview-drill",
+  "title": "Virtual Memory Page Fault Interview Drill",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "이 drill은 virtual memory와 page fault를 면접 답변으로 구성한다. page fault를 오류가 아니라 주소 변환과 lazy loading 이벤트로 설명하게 한다.",
+  "body_markdown": "# Virtual Memory Page Fault Interview Drill\n\n## 질문\n\n\"가상 메모리(virtual memory)는 무엇이고, page fault가 발생하면 어떤 일이 일어나나요?\"\n\n## 기대 답변 축\n\n- 프로세스는 연속된 가상 주소 공간을 보는 것처럼 실행되고, OS와 MMU가 물리 메모리 매핑을 관리한다.\n- page table은 가상 페이지와 물리 프레임의 매핑을 담고, TLB는 그 변환 캐시다.\n- page fault는 매핑이 없거나 권한이 맞지 않을 때 발생한다. demand paging에서는 디스크에서 페이지를 읽어오고 매핑한 뒤 재시도할 수 있다.\n- 모든 page fault가 crash는 아니다. major/minor page fault와 protection fault를 구분한다.\n\n## 답변을 풍부하게 만드는 축\n\n- 주소 변환 축: CPU가 가상 주소를 내고, TLB miss가 나면 page table walk를 통해 물리 프레임을 찾는다.\n- Lazy loading 축: 실행 파일, shared library, mmap 파일, anonymous memory는 실제 접근 시점에 page가 준비될 수 있다.\n- Fault 종류 축: minor fault는 이미 메모리에 있는 page 매핑을 정리하는 경우가 많고, major fault는 storage I/O가 동반될 수 있다. Protection fault는 권한 위반이라 정상 복구가 어려울 수 있다.\n- Working set 축: 필요한 page 집합이 메모리 budget보다 커지면 page reclaim, swap, cache pressure가 latency에 영향을 줄 수 있다.\n\n## 예시: page fault 네 가지를 한 번에 구분하기\n\n| 장면 | 가까운 분류 | 설명 |\n|---|---|---|\n| `malloc()` 후 처음 쓰는 anonymous page | minor fault 후보 | 커널이 zero-filled page를 연결하고 RSS가 늘 수 있다 |\n| `mmap()`한 큰 파일을 처음 random read | major fault 후보 | page cache에 없으면 storage read가 필요하다 |\n| `fork()` 후 부모/자식 중 하나가 공유 page에 write | minor fault 후보 | copy-on-write로 새 physical page를 만들 수 있다 |\n| read-only page에 write하거나 unmapped address 접근 | protection/invalid fault | 권한 또는 주소가 잘못돼 signal/exception으로 종료될 수 있다 |\n\n면접에서는 \"page fault가 났다\"에서 멈추지 말고, 커널이 복구 가능한 fault인지, 디스크 I/O가 필요한지, 권한 위반인지까지 나눠야 한다.\n\n## 흐름 예시\n\n```text\nCPU issues virtual address\n  -> TLB hit: physical frame으로 바로 접근\n  -> TLB miss: page table walk\n      -> valid mapping exists: TLB 채우고 재시도\n      -> mapping absent or permission mismatch: page fault trap\n          -> recoverable: page 준비, page table 갱신, instruction 재시도\n          -> not recoverable: SIGSEGV 같은 fault로 process에 알림\n```\n\nTLB miss와 page fault는 같은 말이 아니다. TLB miss는 변환 캐시에 없다는 뜻이고, page table에 valid mapping이 있으면 fault 없이 끝날 수 있다.\n\n## 운영 관찰 기준\n\n- Major/minor fault rate, RSS, virtual size, page cache, swap in/out, cgroup memory pressure를 같이 본다.\n- Fault가 warm-up, mmap lazy load, class loading, file cache miss, memory pressure 중 어느 흐름과 맞물리는지 timestamp로 확인한다.\n- JVM 서비스라면 GC allocation rate, heap/off-heap/direct buffer, native memory tracking, container memory limit을 함께 본다.\n- Page fault 증가만으로 장애라고 단정하지 말고 p99 latency, disk I/O, reclaim, OOM kill, CPU steal/throttling과 같이 본다.\n\n## 답변에서 피할 단정\n\nPage fault는 항상 에러도 아니고 항상 디스크 I/O도 아니다. 어떤 fault인지, 복구 가능한지, 반복되는지, 사용자 latency와 상관관계가 있는지를 구분해야 한다.\n\n## Caveat\n\n- minor fault가 많아도 warm-up, lazy allocation, COW처럼 정상 경로일 수 있다. 다만 요청 경로에서 반복되면 CPU time과 tail latency를 만들 수 있다.\n- major fault가 항상 swap-in은 아니다. file-backed page cache miss도 major fault로 보일 수 있다.\n- virtual memory는 swap의 다른 이름이 아니다. isolation, protection, sparse address space, memory mapped file, shared library mapping까지 포함한다.\n- RSS가 낮다고 fault 비용이 없다는 뜻은 아니다. 아직 접근하지 않은 mapping이 첫 요청에서 몰릴 수 있다.\n- container에서는 host 전체 메모리보다 cgroup limit, memory pressure, OOM kill 정책이 더 직접적인 경계일 수 있다.\n\n## 역할별 검증\n\n| 역할 | 확인 질문 | 통과 기준 |\n|---|---|---|\n| 면접 답변자 | virtual address, page table, TLB, page fault trap 순서를 말했는가 | TLB miss와 page fault를 분리하고 minor/major/protection fault를 예로 든다 |\n| 백엔드 운영자 | fault 증가가 latency와 같은 시간축에서 움직이는가 | `perf stat`, `/proc/vmstat`, `vmstat 1`, disk I/O, p99 latency delta를 같은 interval로 본다 |\n| JVM 담당자 | heap 문제인지 native/off-heap 문제인지 나눴는가 | heap, direct buffer, metaspace, NMT, cgroup limit, GC allocation rate를 같이 확인한다 |\n| 성능 분석자 | working set이 memory budget을 넘는지 확인했는가 | RSS/PSS, page cache, reclaim, swap in/out, access pattern을 함께 본다 |\n\n## 약점 태그\n\n- `fault-is-error`: page fault를 항상 프로그램 오류로 설명함\n- `address-translation`: page table/TLB 변환 축이 없음\n- `demand-paging`: lazy loading과 working set 설명이 없음\n\n## 복습 연결\n\n정의는 `virtual-memory-basics`, 성능 꼬리 질문은 `tlb-page-table-walk-bridge`로 이어간다.\n",
+  "aliases": [
+    "virtual memory interview drill",
+    "page fault answer practice",
+    "가상 메모리 면접 답변",
+    "페이지 폴트 설명 연습"
+  ],
+  "expected_queries": [
+    "가상 메모리와 페이지 폴트를 면접에서 어떻게 설명하지?",
+    "page fault가 항상 에러는 아니라는 말을 어떻게 해?",
+    "demand paging 답변 연습하고 싶어"
+  ],
+  "symptoms": [
+    "page fault를 항상 장애나 crash로 생각해요",
+    "virtual memory를 swap과 같은 말로만 설명해요",
+    "TLB와 page table 관계를 빠뜨려요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/virtual-memory-basics"
+    ],
+    "next_docs": [
+      "operating-system/demand-paging-page-fault-primer"
+    ],
+    "confusable_with": [
+      "operating-system/virtual-memory-basics",
+      "operating-system/demand-paging-page-fault-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/virtual-memory-page-fault-interview-drill.md",
+    "revision_history": []
+  }
+}

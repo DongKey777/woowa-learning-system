@@ -1,0 +1,54 @@
+{
+  "id": "data-structure/reclamation-cost-tradeoffs",
+  "title": "Reclamation Cost Trade-offs",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Reclamation Cost Trade-offs\n\n> 한 줄 요약: lock-free 구조의 실전 비용은 CAS 알고리즘 자체보다 retire queue, scan, stalled thread, 메모리 회수 지연 같은 reclamation 비용에서 크게 갈린다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Hazard Pointers vs Epoch-Based Reclamation](./hazard-pointers-vs-epoch-based-reclamation.md)\n> - [Michael-Scott Lock-Free Queue](./michael-scott-lock-free-queue.md)\n> - [ABA Problem and Tagged Pointers](./aba-problem-and-tagged-pointers.md)\n> - [Concurrent Skip List Internals](./concurrent-skiplist-internals.md)\n\n> retrieval-anchor-keywords: reclamation cost tradeoffs, hazard pointer cost, epoch reclamation cost, retire list growth, stalled thread memory retention, lock-free reclamation overhead, memory reclamation performance, concurrent memory management cost, scan overhead, reclamation latency\n\n## 핵심 개념\n\nsafe reclamation은 correctness 문제이면서 동시에 성능 문제다.  \n실무에서는 \"무엇이 안전한가\" 다음으로 \"무엇이 얼마나 비싼가\"가 중요하다.\n\n대표 비용 축:\n\n- fast path publish 비용\n- retire list 길이\n- global scan 비용\n- stalled thread가 잡고 있는 메모리\n- batch free latency\n- retired node rate와 실제 freed node rate의 차이\n\n즉 reclamation 전략은 correctness addon이 아니라  \n**lock-free 자료구조의 총비용 모델** 일부다.\n\n## 깊이 들어가기\n\n### 1. Hazard Pointer 비용\n\nHazard Pointer는 정밀하지만 비용이 눈에 잘 보인다.\n\n- 읽기 전에 pointer publish\n- recheck/retry\n- retire 시 hazard slot scan\n\n즉 read-heavy path에서는 publish/retry 오버헤드가 체감될 수 있다.  \n대신 stalled thread 하나가 전체 메모리 회수를 오래 막는 문제는 상대적으로 덜하다.\n다만 멈춘 thread가 hazard slot을 계속 잡고 있으면 그 slot이 가리키는 node와\n그 node에 의존하는 재사용 경계는 해제되지 않는다. \"전체 epoch를 막지 않는다\"와\n\"아무 메모리도 잡지 않는다\"는 다른 말이다.\n\n### 2. EBR 비용\n\nEBR은 fast path가 가볍지만 비용이 다른 곳으로 간다.\n\n- 오래된 epoch retire list 누적\n- 느린 thread 때문에 free 지연\n- burst retire 시 메모리 사용량 급증\n\n즉 throughput은 잘 나올 수 있지만,  \n메모리 footprint와 tail reclaim latency는 더 나빠질 수 있다.\n특히 EBR은 thread가 read-side critical section에 들어오고 나가는 지점이\n명확해야 한다. 등록만 해두고 quiescent state를 보고하지 않는 thread는\n실제 장애처럼 retire backlog를 붙잡을 수 있다.\n\n### 3. 비용은 queue/list마다 다르게 체감된다\n\n같은 reclamation 전략도 구조마다 체감 포인트가 다르다.\n\n- queue: node retire 폭이 일정할 수 있음\n- skip list: level별 node/link 구조 때문에 retire 복잡도가 큼\n- stack/list: ABA와 reuse 패턴이 더 민감할 수 있음\n\n즉 reclamation 비용은 알고리즘과 독립된 숫자가 아니다.\n\n### 4. 운영에서는 메모리 지연이 장애로 보일 수 있다\n\nreclaim가 늦어지면 correctness는 멀쩡해도 다음처럼 보일 수 있다.\n\n- RSS가 계속 증가\n- allocator pressure\n- page cache 잠식\n- GC/native fragmentation 증가\n\n즉 \"안전하니까 괜찮다\"가 아니라,  \n회수 지연 자체가 운영 장애 모드가 될 수 있다.\n\n### 5. 선택 기준은 throughput 하나가 아니다\n\n다음을 같이 봐야 한다.\n\n- fast path latency\n- reclaim burst latency\n- worst-case memory retention\n- thread lifecycle 제어 가능성\n- native vs GC runtime\n\n실무에선 이 다섯 가지가 종종 trade-off를 만든다.\n\n## 실전 시나리오\n\n### 시나리오 1: high-throughput fixed worker queue\n\nworker 수가 고정되고 thread가 안정적이면  \nEBR이 throughput 면에서 매력적일 수 있다.\n\n### 시나리오 2: long-lived reader / preemption-heavy runtime\n\n느린 thread 하나가 계속 epoch를 붙잡을 수 있다면  \nEBR은 memory retention이 심해질 수 있다.\n\n### 시나리오 3: memory budget tight service\n\nfast path가 조금 느려도 reclaim 지연을 더 작게 통제해야 한다면  \nHazard Pointer 쪽이 더 안전할 수 있다.\n\n### 시나리오 4: 부적합한 이해\n\n\"CAS가 빠르니 전체 구조도 빠르다\"는 판단이 가장 위험하다.  \nretire/free 비용을 빼고 보면 production 성능을 놓치기 쉽다.\n\n## 재현 절차\n\nreclamation 비용은 microbenchmark에서 잘 숨는다.\n그래서 아래처럼 \"정상 fast path\"와 \"회수 지연 path\"를 분리해서 재현해야 한다.\n\n1. producer/consumer thread 수를 고정하고 lock-free queue/list 처리량 baseline을 잡는다.\n2. retire rate와 free rate를 같이 기록한다. `operation count`가 아니라 `retired node/sec`, `freed node/sec`, 두 값의 lag가 필요하다.\n3. 한 reader를 의도적으로 오래 멈추거나 preemption을 유도한다.\n4. RSS, allocator allocation/free rate, retire list length, reclaim batch latency를 같이 본다.\n5. 멈춘 reader를 풀었을 때 reclaim burst가 tail latency를 만드는지 확인한다.\n\n핵심은 \"정상 처리량이 높다\"와 \"안전하게 메모리를 제때 돌려준다\"가 다른 관측값이라는 점이다.\n\n## 점검 체크리스트\n\n| 체크 | 의미 |\n|---|---|\n| retire list length가 thread별/epoch별로 노출되는가 | 회수 지연이 어디에 쌓이는지 볼 수 있다 |\n| stalled reader를 식별할 수 있는가 | EBR 계열의 memory retention 원인을 찾는다 |\n| hazard slot scan 시간이 p95/p99로 잡히는가 | HP scan 비용이 tail에 섞이는지 본다 |\n| free batch 크기와 latency가 보이는가 | delayed free가 allocator burst로 바뀌는지 확인한다 |\n| node pool reuse 주기가 짧은가 | ABA와 reclamation 위험이 같이 커질 수 있다 |\n| quiescent state / epoch exit가 누락되지 않는가 | EBR backlog가 \"알고리즘 비용\"이 아니라 lifecycle bug인지 가른다 |\n\n## 실패 모드 매트릭스\n\n| 증상 | 흔한 원인 | 확인 |\n|---|---|---|\n| throughput은 좋은데 RSS가 계속 증가 | EBR epoch가 오래 갇힘 | active epoch, stalled thread, retire backlog |\n| retired는 늘지만 freed가 거의 없음 | grace period가 전진하지 않음 | retired-vs-freed lag, quiescent report |\n| 짧은 pause 후 latency spike | 밀린 retire list를 한 번에 free | reclaim batch size, allocator latency |\n| read path latency가 예상보다 높음 | Hazard Pointer publish/recheck/scan 비용 | hazard publish count, scan interval |\n| 드물게 use-after-free 의심 | reclamation grace period가 부족함 | retired node 재사용 시점, reader 보호 구간 |\n| ABA류 이상 동작 | node reuse가 너무 빠르고 version/tag가 없음 | tagged pointer/sequence/reclamation 조합 |\n\n## 검증 기준\n\nsafe reclamation을 선택했다면 다음을 같이 만족해야 한다.\n\n- correctness: reader가 볼 수 있는 node는 free/reuse되지 않는다.\n- latency: reclaim scan이나 batch free가 서비스 p99를 깨지 않는다.\n- memory: stalled thread가 있어도 worst-case retention이 예산 안에 있다.\n- observability: backlog가 쌓일 때 어떤 thread/epoch/hazard 때문에 쌓이는지 알 수 있다.\n\n이 네 조건 중 하나라도 비어 있으면 \"락프리 알고리즘은 맞다\"는 설명만으로는 운영 검증이 끝나지 않는다.\n\n## 비교 질문\n\n| 질문 | 더 민감한 구조 |\n|---|---|\n| stalled thread가 회수를 오래 막아도 되는가 | EBR |\n| fast path publish 비용을 감수할 수 있는가 | Hazard Pointer |\n| 메모리 footprint 증가가 더 위험한가 | EBR 쪽 위험 증가 |\n| reader retry 비용이 더 위험한가 | Hazard Pointer 쪽 비용 증가 |\n\n## 꼬리질문\n\n> Q: 왜 reclamation 비용을 알고리즘 밖 문제로 보면 안 되나요?\n> 의도: correctness와 performance가 분리되지 않는다는 점 이해 확인\n> 핵심: safe reclamation 방식에 따라 fast path latency와 memory retention이 크게 달라지기 때문이다.\n\n> Q: EBR이 throughput이 좋아 보여도 운영 리스크가 생기는 이유는 무엇인가요?\n> 의도: 메모리 회수 지연을 성능 문제로 이해하는지 확인\n> 핵심: 느린 thread 하나가 오래된 retire list 해제를 막아 메모리 사용량과 reclaim tail을 키울 수 있기 때문이다.\n\n> Q: Hazard Pointer가 더 정밀한 대신 치르는 대표 비용은 무엇인가요?\n> 의도: precision과 overhead trade-off 이해 확인\n> 핵심: hazard publish/retry와 retire scan 비용이다.\n\n## 한 줄 정리\n\nlock-free 구조의 실전 비용은 CAS 성공률만으로 설명되지 않고, 어떤 reclamation 전략이 retire latency와 memory retention을 어떻게 만드는지까지 함께 봐야 한다.\n",
+  "aliases": [
+    "reclamation cost tradeoffs",
+    "hazard pointer cost",
+    "epoch reclamation cost",
+    "retire list growth",
+    "stalled thread memory retention",
+    "reclamation latency",
+    "lock-free reclamation overhead"
+  ],
+  "expected_queries": [
+    "Lock-free 구조에서 reclamation cost가 CAS 알고리즘보다 더 크게 보일 수 있는 이유는?",
+    "Hazard Pointer와 EBR의 비용을 publish scan stalled thread retire list로 비교해줘",
+    "retire list growth와 delayed free가 운영 장애처럼 보이는 경우는?",
+    "safe reclamation을 correctness addon이 아니라 총비용 모델로 봐야 하는 이유는?",
+    "lock-free queue skip list에서 memory reclamation overhead를 어떻게 관측해?"
+  ],
+  "symptoms": [
+    "lock-free 알고리즘의 CAS 횟수만 보고 retire queue, scan, stalled thread, delayed free 비용을 성능 모델에서 빼먹는다",
+    "Hazard Pointer는 fast path publish/scan 비용, EBR은 stalled thread와 retire list growth 비용이 크다는 trade-off를 구분하지 못한다",
+    "correctness는 안전하지만 reclamation delay 때문에 RSS 증가, allocator pressure, fragmentation 같은 운영 문제가 생기는 모드를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/hazard-pointers-vs-epoch-based-reclamation"
+    ],
+    "next_docs": [
+      "data-structure/michael-scott-lock-free-queue",
+      "data-structure/aba-problem-tagged-pointers",
+      "data-structure/concurrent-skiplist-internals"
+    ],
+    "confusable_with": [
+      "data-structure/hazard-pointers-vs-epoch-based-reclamation",
+      "data-structure/aba-problem-tagged-pointers",
+      "data-structure/michael-scott-lock-free-queue",
+      "data-structure/concurrent-skiplist-internals"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/reclamation-cost-tradeoffs.md",
+    "revision_history": []
+  }
+}

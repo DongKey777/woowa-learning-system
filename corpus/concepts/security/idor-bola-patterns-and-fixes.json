@@ -1,0 +1,54 @@
+{
+  "id": "security/idor-bola-patterns-and-fixes",
+  "title": "IDOR / BOLA Patterns and Fixes",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 IDOR / BOLA Patterns and Fixes를 다루는 deep_dive 문서다. IDOR/BOLA는 \"ID를 안다고 다른 사람 데이터까지 접근되는\" broken access control이다. 인증이 아니라 객체 수준 인가와 소유권 검증이 핵심이다. 검색 질의가 idor basics, bola basics, broken object level authorization, object ownership check처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# IDOR / BOLA Patterns and Fixes\n\n> 한 줄 요약: IDOR/BOLA는 \"ID를 안다고 다른 사람 데이터까지 접근되는\" broken access control이다. 인증이 아니라 객체 수준 인가와 소유권 검증이 핵심이다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [인증과 인가의 차이](./authentication-vs-authorization.md)\n- [Beginner Guide to Auth Failure Responses: `401` / `403` / `404`](./auth-failure-response-401-403-404.md)\n- [Concealment `404` Entry Cues](./concealment-404-entry-cues.md)\n- [Permission Model Bridge: AuthN에서 Role/Scope/Ownership로 넘어가기](./permission-model-bridge-authn-to-role-scope-ownership.md)\n- [Role vs Scope vs Ownership Primer](./role-vs-scope-vs-ownership-primer.md)\n- [Tenant Membership Change vs Session Scope Basics](./tenant-membership-change-session-scope-basics.md)\n- [Multi-tenant SaaS Isolation Design](../system-design/multi-tenant-saas-isolation-design.md)\n\nretrieval-anchor-keywords: idor basics, bola basics, broken object level authorization, object ownership check, tenant isolation authz, same user different tenant, 같은 사용자 다른 tenant, 왜 403 이 아니라 404, 없는 줄 알았는데 남의 리소스, scope is not ownership, own resource wrong tenant, concealment 404\n\n---\n\n## 1분 브리지: Ownership 누락이 왜 바로 취약점인가\n\n먼저 이렇게 생각하면 쉽다.\n\n- `role`은 \"무슨 종류의 사용자냐\"\n- `scope`는 \"토큰에 어떤 API 작업 권한이 있냐\"\n- `ownership`은 \"지금 이 객체가 정말 네 것이냐\"\n\nIDOR/BOLA는 보통 앞의 두 칸은 통과했는데, 마지막 ownership 확인이 빠져서 터진다.\n\n| 체크 항목 | 통과해도 남는 빈칸 |\n|--------|----------------|\n| role 확인 (`USER`, `ADMIN`) | `USER`끼리 서로 남의 주문을 볼 수 있는지 못 막음 |\n| scope 확인 (`orders.read`) | \"주문 읽기 가능\"일 뿐 \"아무 주문이나 가능\"은 아님 |\n| ownership 확인 (`order.owner_id == me`) | 이 검사가 있어야 객체 단위 접근이 닫힘 |\n\n짧은 예시:\n\n- `/orders/1001`은 내 주문, `/orders/1002`는 남의 주문\n- 내 토큰에 `orders.read`가 있어도 `1002.owner_id != myUserId`면 거부해야 한다\n- 이 한 줄 검증이 빠지면 \"ID만 바꿔 남의 데이터 조회\"가 바로 IDOR다\n\n같은 사용자라도 tenant가 다르면 같은 실수가 난다. 예를 들어 사용자 A가 tenant A와 tenant B 둘 다 속해 있을 때, tenant A 화면에서 tenant B의 자기 주문 ID를 넣으면 `owner_id == me`만으로는 통과시키면 안 된다. beginner 관점에서 이 감각이 아직 약하면 먼저 [Role vs Scope vs Ownership Primer](./role-vs-scope-vs-ownership-primer.md)의 `같은 사용자, 다른 tenant` 미니 케이스로 ownership과 tenant를 같이 묶어 보고, 다시 이 문서의 `30초 분기표`로 돌아와 `403`과 concealment `404`를 고정하면 된다.\n\n헷갈리기 쉬운 포인트:\n\n- \"로그인됨\"은 신원 확인이지 객체 소유 증명이 아니다\n- \"scope 있음\"은 기능 권한이지 리소스 소유권 증명이 아니다\n- 따라서 ownership 누락은 부가 위험이 아니라 직접 취약점이다\n\n## 초보자 출발 문장: `없는 줄 알았는데 남의 리소스였다`\n\n이 문서로 들어오는 초보자 표현은 보통 전문 용어보다 먼저 이렇게 나온다.\n\n- `404라서 없는 줄 알았는데 다른 사람 계정으로는 열려요`\n- `내 계정에서는 없는데 owner는 보인대요`\n- `없는 줄 알았는데 사실 남의 주문이었어요`\n\n이 문장을 IDOR/BOLA 관점으로 바꾸면 뜻은 단순하다.\n\n| 초보자 표현 | 실제로 의심해야 하는 것 |\n|---|---|\n| `없는 줄 알았는데 owner는 연다` | 객체는 존재하고, 내 요청만 ownership/tenant 정책에서 막혔을 수 있다 |\n| `없다고 나오는데 관리자/운영 문맥에서는 보인다` | 외부에는 concealment `404`, 내부 판단은 ownership mismatch일 수 있다 |\n| `scope도 있고 로그인도 됐다` | authn/scope를 통과해도 ownership 누락 또는 ownership deny는 별개다 |\n\n즉 `없는 줄 알았는데 남의 리소스였다`는 보통 \"정말 없는 객체\"가 아니라 \"객체는 있는데 내 문맥에서는 숨겨졌거나 거부됐다\"는 쪽 단서다.\n\n- 아직 `진짜 없음 / 숨김 404 / stale deny` 세 갈래를 못 가르겠다면 이 문서로 바로 깊게 내려가기 전에 `[primer bridge]` [Concealment `404` Entry Cues](./concealment-404-entry-cues.md)에서 먼저 beginner용 분기를 고정하는 편이 안전하다.\n\n---\n\n## 30초 분기표: IDOR에서 `403` vs 의도적 `404`\n\n먼저 mental model을 아주 짧게 고정한다.\n\n- `검사는 항상 ownership/tenant 정책으로 한다`\n- `응답코드 선택은 정보 노출 정책으로 한다`\n\n즉 `404`를 고른다고 ownership 검사가 사라지는 것이 아니다. 내부적으로는 \"남의 리소스라 deny\"를 이미 알아낸 뒤, 바깥에 그 존재를 숨길지 결정하는 것이다.\n\n| 질문 | `예`면 더 가까운 기본값 | 이유 |\n|---|---|---|\n| 사용자가 그 리소스의 존재를 알아도 되는가 | `403` | 이미 존재를 아는 협업/관리 화면이면 \"권한은 없지만 대상은 존재\"를 알려도 정책상 문제가 적다 |\n| 리소스 존재 자체가 민감한가 | 의도적 `404` | `내 주문`, `내 메시지`, `내 파일`처럼 user-owned/private 리소스는 존재 노출이 곧 정보 누출이 될 수 있다 |\n| 클라이언트가 \"존재함 vs 권한없음\"을 구분해야 다음 행동이 가능한가 | `403` | 권한 요청, 관리자 문의, 승인 흐름으로 이어져야 하면 `403`이 더 실용적이다 |\n| 외부에는 숨기되 내부 운영자는 정확한 deny 이유를 알아야 하는가 | 의도적 `404` + 내부 로그는 실제 deny reason 기록 | 외부 응답과 내부 감사/디버깅 정보는 분리할 수 있다 |\n\n초보자용 한 줄 결정:\n\n- `협업/관리/공유 자원`이면 기본 `403`\n- `내 것만 보여야 하는 private 자원`이면 기본 `404`\n\n짧은 예시:\n\n| 요청 상황 | 내부 판단 | 외부 응답 권장 |\n|---|---|---|\n| 내가 속한 팀 문서인데 `edit` 권한만 없음 | 대상 존재를 이미 알아도 됨 | `403` |\n| `/orders/1002`가 남의 개인 주문 | 존재 자체를 숨기는 편이 안전 | 의도적 `404` |\n| tenant A 사용자가 tenant B invoice를 조회 | cross-tenant 존재 노출을 막고 싶음 | 의도적 `404` |\n\n헷갈리기 쉬운 포인트:\n\n- `404`는 \"정말 없음\"과 \"있지만 숨김\"이 외부에서 같게 보이도록 만드는 선택일 수 있다.\n- `403`을 쓴다고 IDOR가 해결되는 것은 아니다. 핵심은 먼저 ownership/tenant 검사를 실제로 하는 것이다.\n- `404` concealment를 쓰더라도 내부 로그에는 `ownership_mismatch`, `tenant_mismatch` 같은 실제 deny reason을 남겨야 운영이 가능하다.\n\n---\n\n## 핵심 개념\n\nIDOR(Insecure Direct Object Reference)와 BOLA(Broken Object Level Authorization)는 거의 같은 문제를 다른 관점에서 부른다.\n\n- 사용자가 객체 ID를 조작한다\n- 서버가 그 객체에 대한 권한을 충분히 확인하지 않는다\n- 다른 사람의 데이터가 노출되거나 변경된다\n\n이 취약점은 인증이 성공했다고 해서 안전하지 않다는 사실을 보여준다.\n\n- 로그인 여부는 확인했다\n- 그러나 그 객체에 접근할 권한은 확인하지 않았다\n\n즉 IDOR/BOLA의 해결책은 더 강한 인증이 아니라, 더 정확한 객체 수준 인가다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 흔한 패턴\n\n대표적인 취약한 형태:\n\n- `/users/1234`\n- `/orders/9999`\n- `/files/abc`\n- `/tenants/42/invoices/7`\n\n문제는 ID가 추측 가능하거나 순차적일 때 더 쉽게 드러난다.\n\n### 2. 인증과 객체 권한은 다르다\n\n좋지 않은 생각:\n\n- 로그인했으니 내 데이터라고 가정\n- role만 확인하고 소유권은 안 봄\n- \"관리자 화면이 아니니 괜찮겠지\"라고 넘김\n\n좋은 생각:\n\n- user id와 resource owner를 비교한다\n- tenant id를 함께 검증한다\n- 객체별 policy를 적용한다\n\n### 3. BOLA는 API 설계와 직결된다\n\n모바일이나 SPA에서는 resource id가 요청에 직접 드러난다.\n\n- client가 id를 바꿀 수 있다\n- BFF가 있어도 내부 API가 취약하면 끝이다\n- list API와 detail API의 권한 기준이 다를 수 있다\n\n### 4. multi-tenant에서는 더 위험하다\n\ntenant 경계를 잘못 잡으면 horizontal privilege escalation이 된다.\n\n- 같은 user라도 tenant가 다르면 권한이 달라진다\n- cache key에 tenant가 빠지면 권한이 섞인다\n- soft-delete된 tenant나 이전 멤버십도 고려해야 한다\n\n### 5. indirect reference가 안전하다는 오해\n\n난수 같은 opaque ID를 쓰면 안전해 보이지만, 완전한 방어는 아니다.\n\n- 추측은 어려워지지만 권한 확인이 사라지면 여전히 취약하다\n- 결국 서버에서 \"이 사용자가 이 객체를 볼 수 있는가\"를 확인해야 한다\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 남의 주문 상세를 조회함\n\n문제:\n\n- `/orders/{orderId}`만 보고 조회한다\n- 주문 소유자 검증이 없다\n\n대응:\n\n- order owner와 principal을 비교한다\n- tenant 경계까지 확인한다\n- 관리자와 owner의 정책을 분리한다\n\n### 시나리오 2: 파일 다운로드 URL을 바꿔서 남의 파일을 봄\n\n문제:\n\n- storage key만 알면 다운로드 가능하다\n\n대응:\n\n- signed URL 또는 authorization check를 추가한다\n- public/private object를 분리한다\n- object metadata에 owner를 둔다\n\n### 시나리오 3: 관리자 기능이 아니라고 방심함\n\n문제:\n\n- 일반 사용자용 API에도 소유권 검사가 빠졌다\n\n대응:\n\n- 모든 object endpoint에 ownership policy를 둔다\n- list와 detail, update, delete의 기준을 분리한다\n- 단위 테스트와 security test를 같이 둔다\n\n---\n\n## 코드로 보기\n\n### 1. 객체 수준 인가\n\n```java\npublic Order getOrder(UserPrincipal user, Long orderId) {\n    Order order = orderRepository.findById(orderId)\n        .orElseThrow(() -> new NotFoundException(\"order not found\"));\n\n    if (!order.ownerId().equals(user.id()) && !user.roles().contains(\"ADMIN\")) {\n        throw new AccessDeniedException(\"forbidden\");\n    }\n\n    return order;\n}\n```\n\n### 2. tenant 검증\n\n```java\npublic Invoice getInvoice(UserPrincipal user, Long tenantId, Long invoiceId) {\n    if (!user.tenantIds().contains(tenantId)) {\n        throw new AccessDeniedException(\"tenant mismatch\");\n    }\n    return invoiceRepository.findByTenantIdAndId(tenantId, invoiceId)\n        .orElseThrow(() -> new NotFoundException(\"invoice not found\"));\n}\n```\n\n### 3. path parameter만 믿지 않는 규칙\n\n```text\n1. path id는 입력값일 뿐 신원 증명이 아니다\n2. 객체 조회 후 owner/tenant/policy를 검증한다\n3. 권한 없으면 403 또는 의도적 404를 선택한다\n4. 모든 변경 요청에 동일한 객체 수준 규칙을 적용한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| role-only check | 쉽다 | IDOR를 막지 못할 수 있다 | 단순 admin 화면 |\n| ownership check | 정확하다 | 코드가 더 필요하다 | 대부분의 객체 API |\n| tenant-aware policy | multi-tenant에 맞다 | 경계 정의가 복잡하다 | SaaS |\n| opaque ID | 추측을 어렵게 한다 | 권한 검증 대체가 아니다 | 보조 수단 |\n\n판단 기준은 이렇다.\n\n- 객체 ID를 사용자가 바꿀 수 있는가\n- owner와 requester가 항상 같은가\n- tenant가 여러 개인가\n- 404로 숨겨야 할지 403으로 드러내야 할지 정책이 있는가\n\n---\n\n## 꼬리질문\n\n> Q: IDOR과 BOLA의 차이는 무엇인가요?\n> 의도: 같은 문제를 다른 관점으로 설명할 수 있는지 확인\n> 핵심: 둘 다 객체 수준 인가 실패를 뜻한다.\n\n> Q: 로그인했는데도 왜 취약할 수 있나요?\n> 의도: 인증과 객체 인가를 구분하는지 확인\n> 핵심: 로그인은 신원을 확인할 뿐 객체 권한은 별도다.\n\n> Q: opaque ID만 쓰면 안전한가요?\n> 의도: 추측 불가능성과 인가 검증의 차이를 아는지 확인\n> 핵심: 아니다. 서버 검증이 여전히 필요하다.\n\n> Q: multi-tenant에서 더 위험한 이유는 무엇인가요?\n> 의도: tenant 경계 이해를 확인\n> 핵심: 같은 사용자라도 tenant별 권한이 달라지기 때문이다.\n\n## 한 줄 정리\n\nIDOR/BOLA는 path ID를 신분증처럼 취급한 순간 생기는 객체 수준 인가 실패다.\n",
+  "aliases": [
+    "idor basics",
+    "bola basics",
+    "broken object level authorization",
+    "object ownership check",
+    "tenant isolation authz",
+    "same user different tenant",
+    "같은 사용자 다른 tenant",
+    "왜 403 이 아니라 404",
+    "없는 줄 알았는데 남의 리소스",
+    "scope is not ownership",
+    "own resource wrong tenant",
+    "concealment 404"
+  ],
+  "expected_queries": [
+    "IDOR / BOLA Patterns and Fixes 핵심 개념을 설명해줘",
+    "idor basics가 왜 필요한지 알려줘",
+    "IDOR / BOLA Patterns and Fixes 실무 설계 포인트는 뭐야?",
+    "idor basics에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`IDOR / BOLA Patterns and Fixes`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
+    "`IDOR / BOLA Patterns and Fixes` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`IDOR / BOLA Patterns and Fixes`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/owasp-top10-basics"
+    ],
+    "next_docs": [
+      "security/authentication-form-login-vs-jwt-vs-session-cookie-chooser"
+    ],
+    "confusable_with": [
+      "security/shopping-cart-order-ownership-authorization-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/idor-bola-patterns-and-fixes.md",
+    "revision_history": []
+  }
+}

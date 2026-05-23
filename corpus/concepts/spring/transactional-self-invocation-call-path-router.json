@@ -1,0 +1,48 @@
+{
+  "id": "spring/transactional-self-invocation-call-path-router",
+  "title": "Transactional Self Invocation Call Path Router",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 같은 클래스 내부 호출 때문에 @Transactional proxy가 적용되지 않는 증상을 분기한다. self invocation, proxy 우회, transaction begin 로그 부재, rollback 안 됨 같은 표현을 다룬다.",
+  "body_markdown": "# Transactional Self Invocation Call Path Router\n\n## 관찰 증거\n\n먼저 \"어떤 메서드에 annotation이 붙었나\"보다 \"그 메서드가 proxy를 통과해서 호출됐나\"를 본다. 외부 Bean이 Spring Bean reference를 통해 `@Transactional` 메서드를 호출하면 proxy를 통과할 수 있다. 반대로 같은 객체 안에서 `this.inner()` 또는 생략된 `inner()` 형태로 부르면 proxy 바깥에서 target object가 자기 자신을 직접 부른다.\n\n대표 증거는 아래처럼 모인다.\n\n- `org.springframework.transaction` DEBUG 로그에 기대한 메서드의 transaction begin/commit이 없다.\n- 외부에서 `service.inner()`를 직접 호출하면 rollback되는데, `service.outer()` 내부의 `inner()` 호출에서는 rollback되지 않는다.\n- `AopUtils.isAopProxy(service)`는 `true`인데도 내부 호출만 transaction advice를 타지 않는다.\n- `TransactionSynchronizationManager.isActualTransactionActive()`를 찍었을 때, outer 자체에 transaction이 없으면 inner에서 `false`가 나온다.\n\n주의할 점은 \"이미 outer transaction이 있어서 inner에서 `true`가 보인다\"와 \"inner의 `@Transactional` 설정이 새로 적용됐다\"는 다른 말이라는 것이다. self-invocation 상황에서도 바깥 transaction이 이미 열려 있으면 inner 코드에서 active transaction이 보일 수 있다. 이때 `REQUIRES_NEW`, timeout, readOnly, rollback rule 같은 inner annotation 설정이 실제로 적용됐는지 따로 확인해야 한다.\n\n## 정확한 Spring proxy 규칙\n\nSpring의 기본 transaction advice mode는 proxy mode다. proxy mode에서는 proxy를 통해 들어오는 외부 method call만 intercept된다. 같은 target object 안의 self-invocation은 호출 대상 메서드에 `@Transactional`이 있어도 runtime transaction advice를 새로 적용하지 않는다.\n\nSpring 6+ visibility 규칙과 self-invocation은 분리해서 봐야 한다.\n\n| 축 | 정확한 규칙 | 오해하기 쉬운 지점 |\n|---|---|---|\n| class-based proxy | Spring 6부터 `protected` 또는 package-visible 메서드도 기본적으로 transaction 대상이 될 수 있다 | \"public이 아니어서 안 됐다\"가 항상 정답은 아니다 |\n| interface-based proxy | proxied interface에 정의된 `public` method가 기준이다 | 구현체의 package-visible 메서드에 붙인 annotation은 interface proxy 경로에서 기대대로 타지 않는다 |\n| self-invocation | visibility와 무관하게 proxy를 통과하지 않는다 | Spring 6 class-based proxy 지원이 self-call 문제를 해결해 주지는 않는다 |\n| private/final | private method는 proxy advice 대상이 아니고, class-based proxy에서 final method도 override 기반 interception이 어렵다 | annotation이 붙어 있어도 proxy가 끼어들 수 있는 호출 지점이 없다 |\n\n즉 `protected @Transactional`이 class-based proxy에서 외부 호출로 들어오면 적용될 수 있지만, 같은 클래스의 `this.protectedTxMethod()`는 여전히 self-invocation이다.\n\n## 1차 분기\n\n| 10초 질문 | 그렇다면 | 다음 문서/확인 |\n|---|---|---|\n| 호출자가 다른 Spring Bean인가? | 예 | proxy를 통과했는지, method visibility가 proxy 방식과 맞는지 본다 |\n| 같은 클래스에서 `this.method()`로 부르는가? | 예 | self-invocation 가능성이 1순위다 |\n| transaction은 시작됐는데 rollback만 기대와 다른가? | 예 | checked exception, rollback rule, rollback-only를 본다 |\n| `REQUIRES_NEW`를 붙였는데 새 tx가 안 열린다? | 예 | self-invocation 또는 같은 proxy 우회 호출인지 먼저 본다 |\n| 순수 unit test에서 annotation만 붙여 놓고 기대하는가? | 예 | Spring context와 proxy가 없는 테스트라서 annotation이 동작하지 않는다 |\n\n증상이 \"`@Transactional` 자체가 안 먹는다\"면 call path가 먼저다. 증상이 \"트랜잭션은 열렸는데 왜 commit/rollback 결과가 다르지\"라면 rollback rule이나 propagation 문제다.\n\n## 다음 확인\n\n1. test나 로그에서 실제 entry method를 하나 정한다. \"outer가 호출됐는가, inner가 호출됐는가\"를 섞지 않는다.\n2. 호출자가 Spring이 주입한 Bean reference인지 확인한다. `new Service()`로 만든 객체에는 proxy가 없다.\n3. `AopUtils.isAopProxy(bean)`와 bean class name을 찍어 proxy 존재를 확인한다.\n4. `org.springframework.transaction.interceptor` 또는 `org.springframework.transaction` DEBUG 로그로 transaction advice 진입 메서드를 확인한다.\n5. inner method에 `REQUIRES_NEW`, `timeout`, `readOnly`처럼 눈에 보이는 설정을 잠깐 붙여 외부 호출과 내부 호출 결과가 다른지 검증한다.\n6. class-based proxy인지 interface-based proxy인지 확인한다. interface proxy라면 interface public method 경로로 들어오는지 본다.\n7. private/final method, `@PostConstruct` 초기화 시점 호출, 같은 클래스 내부 helper 호출을 분리한다.\n\n## 흔한 오해\n\n- \"Spring 6부터 protected도 된다고 했으니 self-invocation도 된다\"가 아니다. visibility 지원은 proxy가 받을 수 있는 외부 호출의 범위를 넓힌 것이고, self-call은 여전히 proxy를 통과하지 않는다.\n- \"`public`인데 왜 안 되지?\"라고 visibility만 보면 놓친다. `public`이어도 같은 객체 내부 호출이면 advice를 타지 않는다.\n- \"`@Transactional`을 private helper에 붙이면 안전하다\"가 아니다. private helper는 proxy advice 지점으로 설계하기 어렵다.\n- \"`AopContext.currentProxy()`로 자기 proxy를 꺼내 부르면 해결\"은 학습 초반 기본 처방이 아니다. 코드가 Spring AOP에 강하게 묶이고, exposeProxy 설정까지 필요하다.\n- AspectJ weaving은 self-invocation도 처리할 수 있지만, 빌드/런타임 복잡도가 커서 보통 미션 단계의 첫 처방은 아니다.\n\n## 관련 playbook\n\n구조를 바꾸려면 transaction boundary를 유스케이스의 외부 entry method로 올리거나, 내부 작업을 별도 Spring Bean collaborator로 분리한다.\n\n```java\n@Service\nclass ReservationFacade {\n    private final ReservationWriter writer;\n\n    public void reserve() {\n        writer.writeInTransaction();\n    }\n}\n\n@Service\nclass ReservationWriter {\n    @Transactional\n    public void writeInTransaction() {\n        // DB write\n    }\n}\n```\n\n이 구조에서는 `ReservationFacade -> ReservationWriter`가 Bean 사이 호출이므로 proxy가 끼어들 수 있다. 단, 실제로는 facade entry에 transaction을 둘지, writer에 둘지, 둘 다 필요한지까지 유스케이스 경계로 다시 판단해야 한다.\n",
+  "aliases": [
+    "transactional self invocation call path",
+    "same class transactional not applied",
+    "자기 호출 트랜잭션 라우터",
+    "같은 클래스 메서드 호출 프록시 우회",
+    "@PostConstruct",
+    "@Service",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "같은 클래스 안에서 @Transactional 메서드를 호출하면 왜 트랜잭션이 안 걸려?",
+    "self invocation 때문에 transactional이 적용됐는지 어떻게 확인해?",
+    "내부 메서드에 붙인 Transactional이 무시되는 것 같아"
+  ],
+  "symptoms": [
+    "같은 클래스 내부 호출에서는 rollback이 안 돼요",
+    "로그상 transaction begin이 안 보여요",
+    "public 메서드인데도 proxy를 안 탄 것 같아요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/self-invocation-proxy-misconception"
+    ],
+    "next_docs": [
+      "spring/transactional-self-invocation-practice-drill"
+    ],
+    "confusable_with": [
+      "spring/self-invocation-proxy-misconception",
+      "spring/transactional-self-invocation-practice-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/transactional-self-invocation-call-path-router.md",
+    "revision_history": []
+  }
+}

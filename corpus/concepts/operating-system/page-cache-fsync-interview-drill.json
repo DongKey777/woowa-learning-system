@@ -1,0 +1,45 @@
+{
+  "id": "operating-system/page-cache-fsync-interview-drill",
+  "title": "Page Cache fsync Interview Drill",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "이 drill은 OS page cache, dirty page writeback, fsync durability를 면접 답변으로 구성한다.",
+  "body_markdown": "# Page Cache fsync Interview Drill\n\n## 질문\n\n\"파일 write가 성공하면 데이터가 바로 디스크에 durable하게 저장된 건가요? page cache와 fsync를 설명해 주세요.\"\n\n아래 관찰이 같이 주어졌다고 생각하고 답해보자.\n\n- 애플리케이션 로그에는 `write()` 성공이 찍혔지만 전원 장애 후 마지막 몇 초의 파일 내용이 사라졌다.\n- DB commit latency p99가 튀는 시간대에 `fsync` 호출 시간이 같이 늘었다.\n- container에서 dirty page가 쌓이고 writeback이 밀리면서 평소 빠르던 write가 갑자기 block된다.\n- 파일 rename으로 설정을 교체했는데 crash 후 새 파일 내용은 있으나 directory entry 상태가 기대와 다르다.\n\n## 기대 답변 축\n\n- 일반 write는 kernel page cache에 데이터를 복사하고 return할 수 있다.\n- dirty page는 나중에 writeback되어 storage로 내려간다.\n- crash durability가 필요하면 fsync/fdatasync 같은 호출로 flush와 ordering을 요구해야 한다.\n- fsync는 storage와 filesystem 상태에 따라 latency spike가 생길 수 있다.\n- durability는 application, filesystem, block layer, storage cache, device flush 지원의 합작이다. `write()` 성공만으로 power loss 이후 보존을 단정하지 않는다.\n- DB WAL은 변경 내용을 먼저 append하고 fsync해 crash 후 replay 가능한 지점을 만드는 대표 사례다. group commit은 durability 경계를 유지하면서 fsync 비용을 묶는 전략이다.\n\n## OS 경계\n\npage cache는 application heap cache가 아니라 kernel이 file data block을 메모리에 캐시하는 영역이다. `write()`가 성공했다는 것은 보통 user buffer의 내용이 kernel 쪽으로 전달됐다는 뜻이지, 전원이 꺼져도 storage에 남는다는 뜻은 아니다. dirty page는 kernel writeback 정책에 따라 나중에 내려가며, crash가 나면 아직 durable하지 않은 dirty data는 사라질 수 있다.\n\n`fsync()`는 file data와 필요한 metadata를 storage에 durable하게 만들도록 요청한다. `fdatasync()`는 metadata 범위를 줄일 수 있지만, file size 변경처럼 data 접근에 필요한 metadata는 여전히 필요할 수 있다. directory entry의 durability가 필요하면 file fsync뿐 아니라 parent directory fsync까지 고려해야 하는 경우가 있다.\n\nfilesystem journaling은 metadata consistency를 돕지만, 모든 file data가 원하는 순서로 durable해졌다는 뜻은 아니다. mount option, write barrier, storage controller cache, cloud disk flush semantics에 따라 실제 보장과 latency가 달라질 수 있으므로 운영 답변에서는 환경 caveat를 붙인다.\n\n## 운영에서 확인할 증거\n\n- latency spike가 application logic이 아니라 `fsync`, writeback, storage flush에서 나는지 trace/profile로 확인한다.\n- dirty page 양, writeback rate, blocked write, disk utilization, queue depth를 함께 본다.\n- DB WAL 설정에서는 commit마다 fsync하는지, group commit이 되는지, sync mode가 무엇인지 확인한다.\n- container나 VM에서는 host filesystem, volume driver, cloud disk의 flush semantics가 영향을 줄 수 있다.\n- crash consistency 테스트는 \"프로세스 kill\"이 아니라 \"OS crash/power loss에 가까운 실패\"를 구분해야 한다.\n- Linux에서는 dirty ratio/bytes, writeback time, PSI I/O pressure, block device latency, flush/FUA 지원, filesystem error log를 같은 시간축에 놓는다.\n- `write()` latency가 갑자기 길어졌다면 application lock뿐 아니라 dirty throttling, balance dirty pages, cgroup I/O pressure, storage queue saturation을 후보로 둔다.\n- WAL 기반 시스템에서는 commit latency, fsync duration, WAL segment switch, checkpoint, background flush, group commit batch size를 함께 본다.\n- `rename()` 기반 atomic replace를 쓸 때는 file data fsync, rename, parent directory fsync 순서가 필요한지 확인한다. 플랫폼과 filesystem별 caveat가 있으므로 라이브러리 문서와 운영 환경을 같이 본다.\n- benchmark는 page cache hit write와 실제 durable write를 분리해야 한다. `dd`나 단순 microbenchmark 결과를 DB commit durability 성능으로 바로 일반화하지 않는다.\n\n## 면접 답변 안전장치\n\n좋은 답변은 \"write는 page cache에 쓰고 fsync는 디스크에 쓴다\"에서 한 번 더 들어간다. storage controller cache, filesystem journaling, metadata ordering 때문에 정확한 durability 경계는 filesystem과 mount option, device flush 지원에 좌우된다고 말해야 한다. 다만 면접 기본 답변에서는 `write()` 성공과 durable commit을 분리하는 것이 핵심이다.\n\nDB와 연결할 때는 WAL을 예로 들면 좋다. transaction commit 전에 변경 내용을 WAL에 append하고 fsync해서 crash 후 재생 가능한 지점을 만든다. 매 commit마다 fsync하면 안전하지만 느릴 수 있어 group commit, batching, durability level trade-off가 나온다.\n\n## 디버깅 분기\n\n1. **write 성공 후 crash에서 데이터가 사라졌다**: fsync/fdatasync 호출 여부, 호출 대상 fd, error 처리, storage flush 지원, VM/volume 계층을 확인한다.\n2. **fsync p99가 튄다**: dirty page backlog, checkpoint, storage queue depth, flush latency, noisy neighbor, cloud disk burst credit을 본다.\n3. **write 자체가 block된다**: dirty throttling, cgroup I/O limit, writeback congestion, filesystem journal pressure, sync write 옵션을 확인한다.\n4. **파일 내용은 있는데 이름/rename 상태가 이상하다**: file fsync와 directory fsync를 구분하고, atomic replace 순서가 맞는지 본다.\n5. **DB commit은 빠른데 장애 후 유실이 있다**: DB sync mode, WAL fsync 설정, storage cache write-through 여부, replica ack와 local durable commit의 차이를 확인한다.\n6. **container/VM에서만 재현된다**: overlay filesystem, volume driver, host page cache, cloud disk flush semantics, cgroup I/O pressure를 분리한다.\n\n## 검증 질문\n\n- `write()` 성공, `fsync()` 성공, DB transaction commit은 각각 어떤 durability 의미를 갖고 어디까지 단정할 수 있나?\n- `fsync` latency가 튈 때 dirty page, writeback, block device queue, checkpoint 중 어떤 지표를 같은 시간축에 놓을 것인가?\n- `fdatasync()`가 `fsync()`보다 적게 보장할 수 있는 metadata는 무엇이고, file size 변경에는 왜 주의해야 하나?\n- `rename()`으로 파일을 교체할 때 crash 후 directory entry까지 기대하려면 어떤 fsync 순서를 검토할 것인가?\n- 프로세스 kill 테스트와 power loss 테스트는 page cache 관점에서 왜 다른가?\n- WAL group commit은 fsync 비용과 commit latency, durability trade-off를 어떻게 바꾸는가?\n\n## 약점 태그\n\n- `write-is-durable`: write 성공을 durable commit으로 오해함\n- `cache-confusion`: OS page cache와 app cache를 섞음\n- `fsync-cost`: flush latency와 batch/group commit trade-off를 놓침\n- `metadata-ordering`: file data와 directory metadata durability를 구분하지 못함\n- `kill-vs-crash`: process kill과 power loss를 같은 장애로 취급함\n\n## 복습 연결\n\nDB WAL은 `write-ahead-log-durability-interview-primer`로 이어진다. writeback stall이나 dirty page throttling으로 질문이 확장되면 `dirty-throttling-balance-dirty-pages-writeback-stalls`를 다음 문서로 본다.\n",
+  "aliases": [
+    "page cache fsync interview",
+    "OS page cache durability answer",
+    "페이지 캐시 fsync 면접",
+    "dirty page writeback 설명"
+  ],
+  "expected_queries": [
+    "OS page cache와 fsync를 면접에서 어떻게 설명해?",
+    "write가 return되면 디스크에 저장된 거야?",
+    "DB WAL fsync와 OS page cache를 연결해줘"
+  ],
+  "symptoms": [
+    "write 성공을 디스크 durable과 같은 뜻으로 말해요",
+    "page cache와 application cache를 섞어요",
+    "fsync latency spike를 이해하지 못해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/page-cache-dirty-writeback-fsync"
+    ],
+    "next_docs": [
+      "database/write-ahead-log-durability-interview-primer"
+    ],
+    "confusable_with": [
+      "operating-system/page-cache-dirty-writeback-fsync",
+      "database/write-ahead-log-durability-interview-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/page-cache-fsync-interview-drill.md",
+    "revision_history": []
+  }
+}

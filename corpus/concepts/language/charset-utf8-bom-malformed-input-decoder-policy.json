@@ -1,0 +1,53 @@
+{
+  "id": "language/charset-utf8-bom-malformed-input-decoder-policy",
+  "title": "Charset, UTF-8 BOM, Malformed Input, and Decoder Policy",
+  "category": "language",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Charset, UTF-8 BOM, Malformed Input, and Decoder Policy\n\n> 한 줄 요약: 문자열은 `String`으로 다 같아 보여도, 경계에서는 bytes와 charset policy가 먼저다. UTF-8 BOM, 잘못된 decoder 기본값, replacement 문자 허용, default charset 의존을 놓치면 로그, CSV, 메시지, 서명, payload parsing이 환경마다 다르게 깨진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java IO, NIO, Serialization, JSON Mapping](./io-nio-serialization.md)\n> - [`Locale.ROOT`, Case Mapping, and Unicode Normalization Pitfalls](./locale-root-case-mapping-unicode-normalization.md)\n> - [Empty String, Blank, `null`, and Missing Payload Semantics](./empty-string-blank-null-missing-payload-semantics.md)\n> - [Primitive vs Wrapper Fields in JSON Payload Semantics](./primitive-vs-wrapper-fields-json-payload-semantics.md)\n\n> retrieval-anchor-keywords: charset, UTF-8, BOM, Byte Order Mark, malformed input, unmappable character, CharsetDecoder, CodingErrorAction, replacement character, default charset, mojibake, byte to string, string to byte, signature mismatch, CSV encoding\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n문자열 경계의 첫 질문은 \"무슨 문자셋인가\"다.\n\n- 바이트를 어떤 charset으로 해석할 것인가\n- 잘못된 입력을 예외로 볼지 replacement로 볼지\n- BOM을 허용할지 제거할지\n- 시스템 default charset에 기대도 되는가\n\n이걸 명시하지 않으면 \"가끔 깨지는 문자열\"이 생긴다.\n\n## 깊이 들어가기\n\n### 1. default charset은 운영 계약이 아니다\n\n`new String(bytes)`나 `string.getBytes()`는 기본 charset에 기대는 코드가 될 수 있다.  \n이 값은 OS, locale, JVM 설정에 따라 달라질 수 있다.\n\n즉 개발환경에서 맞던 코드가:\n\n- 배포 환경\n- 배치 서버\n- CSV import worker\n\n에서 다르게 동작할 수 있다.\n\n### 2. malformed input을 replacement로 삼킬지 예외로 볼지 결정해야 한다\n\ndecoder는 잘못된 입력을 만났을 때 대개 둘 중 하나를 택한다.\n\n- 예외로 실패\n- replacement character로 대체\n\n문제는 replacement가 조용한 데이터 손실을 만들 수 있다는 점이다.\n\n- 사용자 이름 일부가 `�`로 바뀐다\n- 서명/해시 원문이 달라진다\n- CSV key가 깨진 채 저장된다\n\n즉 편의 fallback이 correctness bug를 숨길 수 있다.\n\n### 3. UTF-8 BOM은 \"문자 하나\"처럼 끼어들 수 있다\n\nUTF-8 BOM은 파일/stream 시작에 붙을 수 있다.  \n지원 라이브러리나 파서가 이를 자동 제거하지 않으면:\n\n- 첫 컬럼 이름 앞에 숨은 문자\n- 헤더 mismatch\n- JSON/CSV parsing 이상\n\n같은 문제가 생긴다.\n\n즉 BOM은 encoding metadata처럼 보이지만 payload 일부로 읽힐 수 있다.\n\n### 4. boundary마다 policy가 다를 수 있다\n\n모든 문자열 경계가 같은 정책을 쓰는 것은 아니다.\n\n- user-facing import: 에러 위치를 자세히 보여주며 fail-fast\n- tolerant log ingest: replacement 허용 가능\n- signature/verification path: byte-for-byte strict\n\n즉 charset policy는 기능이 아니라 boundary contract다.\n\n### 5. canonicalization보다 먼저 decode correctness가 필요하다\n\n`Locale.ROOT`, NFC normalization 같은 정책도 중요하지만,  \n그 전에 바이트가 올바르게 문자열로 해석되어야 한다.\n\n잘못 decode한 문자열은 그 다음 정규화로도 복구되지 않는다.\n\n## 실전 시나리오\n\n### 시나리오 1: CSV 첫 헤더가 매번 안 맞는다\n\n파일 앞 BOM이 헤더 이름 앞에 숨어 있었다.  \n사람 눈에는 같아 보여도 첫 컬럼 키가 달랐다.\n\n### 시나리오 2: 운영에서만 한글이 깨진다\n\n로컬은 UTF-8 기본 charset, 운영은 다른 default charset이었다.  \n코드가 charset을 명시하지 않아 mojibake가 생겼다.\n\n### 시나리오 3: webhook 서명 검증이 가끔 실패한다\n\n원문 bytes를 검증해야 하는데 먼저 `String`으로 decode한 뒤 재인코딩했다.  \ncharset이나 malformed input handling 차이로 원문이 바뀌었다.\n\n### 시나리오 4: 잘못된 입력이 조용히 저장된다\n\ndecoder가 replacement를 허용해 `�`를 넣고 넘어갔다.  \n장애는 안 났지만 데이터 정합성이 깨졌다.\n\n## 코드로 보기\n\n### 1. charset 명시\n\n```java\nbyte[] bytes = payload.getBytes(java.nio.charset.StandardCharsets.UTF_8);\nString text = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);\n```\n\n### 2. strict decoder 정책\n\n```java\njava.nio.charset.CharsetDecoder decoder =\n    java.nio.charset.StandardCharsets.UTF_8\n        .newDecoder()\n        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)\n        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);\n```\n\n### 3. BOM 감각\n\n```java\n// parser 진입 전 BOM 존재 여부를 의식해야 한다.\n```\n\n### 4. 서명 경계는 bytes 기준\n\n```java\nbyte[] raw = requestBodyBytes;\n```\n\n이 경계는 decode 후 재인코딩보다 raw byte 보존이 더 중요할 수 있다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| default charset 의존 | 코드가 짧다 | 환경 차이로 조용히 깨질 수 있다 |\n| UTF-8 명시 | 예측 가능성이 높다 | 외부 입력의 실제 charset mismatch를 따로 처리해야 한다 |\n| replacement 허용 | ingestion이 덜 자주 실패한다 | 데이터 손실과 서명 mismatch를 숨길 수 있다 |\n| strict decoder | 데이터 품질이 높다 | 잘못된 입력을 명시적으로 처리해야 한다 |\n\n핵심은 charset을 I/O 세부가 아니라 payload correctness의 일부로 보는 것이다.\n\n## 꼬리질문\n\n> Q: 왜 charset을 항상 명시하나요?\n> 핵심: default charset은 환경 의존적이라 운영 계약으로 보기 어렵기 때문이다.\n\n> Q: replacement character를 허용하면 안 되나요?\n> 핵심: 상황에 따라 가능하지만, 조용한 데이터 손실을 만들 수 있어 boundary별 정책이 필요하다.\n\n> Q: UTF-8 BOM은 왜 문제인가요?\n> 핵심: 자동 제거되지 않으면 payload 앞의 숨은 문자처럼 동작해 헤더나 첫 필드를 깨뜨릴 수 있다.\n\n> Q: 서명 검증은 왜 문자열보다 bytes가 중요하나요?\n> 핵심: decode/encode 과정에서 원문이 바뀌면 서명 대상 자체가 달라지기 때문이다.\n\n## 한 줄 정리\n\n문자열 boundary의 correctness는 `String` API보다 charset/decoder policy가 먼저이며, UTF-8 명시와 malformed input 처리 전략을 계약으로 가져가야 한다.\n",
+  "aliases": [
+    "Charset UTF-8 BOM decoder policy",
+    "malformed input CodingErrorAction",
+    "default charset mojibake",
+    "Byte Order Mark CSV header",
+    "replacement character",
+    "Java charset boundary",
+    "UTF-8 BOM 문제"
+  ],
+  "expected_queries": [
+    "Java에서 UTF-8 BOM 때문에 CSV 첫 헤더가 안 맞는 문제를 어떻게 진단해?",
+    "new String(bytes) default charset 의존이 운영에서 한글 mojibake를 만드는 이유가 뭐야?",
+    "CharsetDecoder malformed input을 replacement로 삼킬지 exception으로 실패할지 어떻게 정해야 해?",
+    "webhook signature 검증에서 bytes를 String으로 decode했다가 다시 encode하면 왜 mismatch가 날 수 있어?",
+    "Java charset policy를 boundary contract로 설계하는 기준을 알려줘"
+  ],
+  "symptoms": [
+    "new String(bytes)나 getBytes()가 default charset에 기대어 환경마다 로그 CSV 메시지 parsing이 다르게 깨져",
+    "malformed input을 replacement 문자로 조용히 삼켜 signature hash payload key가 달라지는 문제를 놓쳐",
+    "UTF-8 BOM이 첫 컬럼명이나 payload 앞 문자로 들어와 header mismatch를 만드는 상황을 인코딩 문제로 보지 못해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/io-nio-serialization"
+    ],
+    "next_docs": [
+      "language/locale-root-case-mapping-unicode-normalization",
+      "language/empty-string-blank-null-missing-payload-semantics",
+      "language/io-nio-serialization"
+    ],
+    "confusable_with": [
+      "language/locale-root-case-mapping-unicode-normalization",
+      "language/empty-string-blank-null-missing-payload-semantics",
+      "language/io-nio-serialization"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/charset-utf8-bom-malformed-input-decoder-policy.md",
+    "revision_history": []
+  }
+}

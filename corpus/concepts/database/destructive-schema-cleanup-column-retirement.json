@@ -1,0 +1,59 @@
+{
+  "id": "database/destructive-schema-cleanup-column-retirement",
+  "title": "Destructive Schema Cleanup, Column Retirement, and Contract-Phase Safety",
+  "category": "database",
+  "level": "advanced",
+  "summary": "'이 문서는 expand-contract migration의 contract phase에서 old column과 old field를 제거하기 전 의존성 제거, replay window, DDL 위험, rollback 상실을 검증하는 advanced playbook이다.",
+  "body_markdown": "# Destructive Schema Cleanup, Column Retirement, and Contract-Phase Safety\n\n> 한 줄 요약: 컬럼 추가보다 더 위험한 순간은 old field를 실제로 제거하는 contract phase이며, 이때는 \"아무도 더 이상 읽지 않는다\"는 사실을 증명하는 절차가 필요하다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [CDC Schema Evolution, Event Compatibility, and Expand-Contract Playbook](./cdc-schema-evolution-compatibility-playbook.md)\n- [온라인 스키마 변경 전략](./online-schema-change-strategies.md)\n- [Instant DDL vs Inplace vs Copy Algorithms](./instant-ddl-vs-copy-inplace-algorithms.md)\n- [Instant ADD COLUMN Metadata Semantics](./instant-add-column-metadata-semantics.md)\n- [Online Backfill Consistency와 워터마크 전략](./online-backfill-consistency.md)\n- [Index Maintenance Window, Rollout, and Fallback Playbook](./index-maintenance-window-rollout-playbook.md)\n\nretrieval-anchor-keywords: column retirement, destructive migration, contract phase, drop column safety, schema cleanup, expand contract, backward compatibility window, field removal runbook\n\n## 핵심 개념\n\nexpand-contract migration에서 expand 단계는 보통 눈에 잘 띈다.\n\n- 새 컬럼 추가\n- dual write\n- backfill\n- read path 전환\n\n하지만 실제 사고는 contract 단계에서 자주 난다.\n\n- old code가 아직 old field를 읽고 있다\n- replay/DLQ가 과거 schema를 다시 보낸다\n- 운영 스크립트가 퇴역 컬럼을 계속 쓴다\n- analytics/export 경로가 늦게 따라온다\n\n즉 destructive cleanup은 DDL 실행보다, **의존성 제거를 증명하는 운영 절차**다.\n\n## 깊이 들어가기\n\n### 1. \"코드에서 안 쓴다\"와 \"시스템에서 안 쓴다\"는 다르다\n\n애플리케이션 main path에서 old field를 제거해도 다음이 남아 있을 수 있다.\n\n- 배치/운영 스크립트\n- BI/데이터 추출 쿼리\n- CDC consumer와 replay tool\n- DLQ 재처리 코드\n- 관리자 화면\n\n그래서 contract phase 전 체크리스트는 코드 grep보다 넓어야 한다.\n\n### 2. column retirement의 실제 순서는 read-off -> write-off -> drop이다\n\n안전한 흐름:\n\n1. new field read path 전환\n2. old field shadow read 제거\n3. old field write 중단\n4. old field 접근 로그/메트릭 관찰\n5. retention/replay window 경과 확인\n6. 그 뒤에 drop/cleanup\n\n특히 replay window가 긴 시스템은 \"배포 끝남\"보다 \"과거 이벤트가 다시 안 들어옴\"이 더 중요하다.\n\n### 3. observability 없이는 contract phase를 자신 있게 못 한다\n\n권장 신호:\n\n- old column access query count\n- old field 포함 이벤트/쿼리 로그\n- shadow read fallback hit rate\n- old field null/non-null ratio\n- rollout version coverage\n\n이런 계측이 없으면 contract phase는 감으로 하는 정리 작업이 된다.\n\n### 4. rename migration에서는 old field drop이 마지막 cutover다\n\nrename을 add/copy/switch/remove로 처리했다면, 마지막 remove가 사실상 최종 cutover다.\n\n위험 신호:\n\n- 일부 인스턴스만 아직 old field 기준 write\n- 외부 파트너/consumer가 old payload에 의존\n- rollback 문서가 old field 복구를 전제\n\n이 상태에서 drop을 하면 rollback 옵션도 같이 사라질 수 있다.\n\n### 5. DDL 자체의 비용도 contract phase에서 다시 봐야 한다\n\nold column을 drop하는 순간은 논리 의존성만의 문제가 아니다.\n\n- 실제 DDL 알고리즘이 instant인지\n- metadata lock risk가 있는지\n- replica/app compatibility가 맞는지\n\n도 같이 본다.\n\n즉 \"이제 안 쓰니 지우자\"가 아니라, **지우는 DDL 경로도 운영 변경**으로 다뤄야 한다.\n\n### 6. cleanup은 삭제보다 tombstone 기간이 유용할 때가 있다\n\n일부 시스템에서는 즉시 제거보다:\n\n- old field deprecated 표시\n- 접근 시 경고 로그\n- 일정 기간 shadow value 유지\n\n같은 tombstone 기간이 더 안전하다.\n\n특히 외부 consumer가 많은 CDC 환경에서는 \"deprecated but present\" 기간이 사고를 줄인다.\n\n## 실전 시나리오\n\n### 시나리오 1. API는 새 필드를 읽는데 배치가 옛 컬럼을 계속 사용\n\nmain path는 정상이지만 야간 배치 실패가 난다.\n\n교훈:\n\n- contract phase 대상은 application code만이 아니다\n- 운영/분석 경로까지 전수 확인이 필요하다\n\n### 시나리오 2. old field를 drop했더니 DLQ replay 실패\n\n현재 코드는 새 schema만 알지만, 장애 복구 중 과거 payload가 다시 들어온다.\n\n이 경우:\n\n- replay window 종료 전 old compatibility 유지\n- adapter layer 또는 replay 전용 변환기\n\n가 필요하다.\n\n### 시나리오 3. 컬럼 제거 DDL이 예상보다 오래 걸림\n\n논리적으로는 cleanup이지만 물리적으로는 non-instant 경로일 수 있다.\n\n그래서 contract phase도 여전히 online DDL 판단과 MDL 점검이 필요하다.\n\n## 코드로 보기\n\n```sql\n-- drop 직전 사용 여부 점검 예시\nSELECT COUNT(*)\nFROM information_schema.columns\nWHERE table_schema = 'mydb'\n  AND table_name = 'orders'\n  AND column_name = 'legacy_status';\n```\n\n```text\ncontract phase checklist\n1. app read path old-field off\n2. app write path old-field off\n3. background jobs updated\n4. CDC/replay compatibility window cleared\n5. old-field access metrics flat\n6. DDL algorithm + MDL risk checked\n```\n\n```sql\nALTER TABLE orders\nDROP COLUMN legacy_status;\n```\n\n핵심은 마지막 SQL이 아니라, 그 SQL을 눌러도 되는지에 대한 증거를 먼저 모으는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 빠른 drop | 정리가 빨리 끝난다 | 숨어 있던 의존성이 터질 수 있다 | 거의 신중해야 한다 |\n| deprecate 기간 유지 | 안전하다 | 레거시가 오래 남는다 | replay/외부 consumer가 많을 때 |\n| access metric 기반 계약 종료 | 근거가 명확하다 | 관측 설계가 필요하다 | 중요한 schema retirement |\n| adapter layer 유지 | 복구에 강하다 | 코드 복잡도가 남는다 | 긴 호환성 창이 필요할 때 |\n\n## 삭제 전 증거 패킷\n\ncontract phase에서 좋은 답변은 \"이제 안 쓰니까 지운다\"가 아니라, 삭제 근거를 묶어서 제시한다.\n\n| 증거 | 확인 질문 |\n|---|---|\n| read-off evidence | app, batch, admin, BI 쿼리가 old field를 더 이상 읽지 않는가 |\n| write-off evidence | 모든 writer가 new field만 쓰고 old field write가 0인가 |\n| replay evidence | DLQ/replay/CDC consumer가 old schema를 다시 요구하지 않는가 |\n| rollout evidence | 모든 app version이 contract-compatible한가 |\n| DDL evidence | drop algorithm, metadata lock, replica 영향이 확인됐는가 |\n| rollback evidence | drop 뒤에도 복구 가능한 대안이 남아 있는가 |\n\n운영에서는 이 증거를 한 번에 확인하기 어렵다.\n그래서 deprecate 기간 동안 old-field 접근 로그와 shadow metric을 남기고, retention window가 지난 뒤 drop을 결정하는 편이 안전하다.\n\n## 잘못된 버킷 비교\n\n- 새 컬럼 추가(expand)는 호환성 확보 작업이고, old 컬럼 삭제(contract)는 호환성 제거 작업이다.\n- \"코드 grep 결과 없음\"은 충분조건이 아니다. 배치, 운영 SQL, CDC, BI, replay가 남을 수 있다.\n- `DROP COLUMN`이 빠른 DB/버전도 있지만, metadata lock과 replication 영향 검증은 여전히 필요하다.\n\n학습자 답변에서는 destructive cleanup을 단순 정리 작업이 아니라 **호환성 창을 닫는 의사결정**으로 표현해야 한다.\n\n## 꼬리질문\n\n> Q: contract phase가 왜 expand phase보다 위험할 수 있나요?\n> 의도: add보다 remove가 더 파괴적임을 아는지 확인\n> 핵심: 숨어 있는 old-field 의존성을 제거해야 하고 rollback 옵션도 줄어들기 때문이다\n\n> Q: old column을 drop하기 전에 무엇을 증명해야 하나요?\n> 의도: 사용 중단의 증거 기반 운영을 이해하는지 확인\n> 핵심: main path뿐 아니라 배치, CDC, replay, 운영 도구가 더 이상 그 필드를 쓰지 않음을 보여야 한다\n\n> Q: cleanup인데도 왜 online DDL 판단이 필요한가요?\n> 의도: 논리 cleanup과 물리 변경을 구분하는지 확인\n> 핵심: column drop도 실제로는 metadata lock과 알고리즘 차이를 갖는 DDL이기 때문이다\n\n## 한 줄 정리\n\nschema cleanup의 안전성은 `DROP COLUMN` 자체보다, old-field 의존성이 truly zero인지와 replay/DDL window까지 포함한 contract-phase 증거를 갖췄는지에 달려 있다.\n",
+  "aliases": [
+    "destructive schema cleanup",
+    "column retirement",
+    "contract phase safety",
+    "drop column safety",
+    "field removal runbook",
+    "expand contract cleanup",
+    "backward compatibility window",
+    "destructive migration",
+    "컬럼 제거 안전 절차",
+    "contract phase"
+  ],
+  "expected_queries": [
+    "old column을 drop하기 전에 어떤 접근 로그와 replay window를 확인해야 해?",
+    "expand-contract migration에서 contract phase가 add column보다 위험한 이유는 뭐야?",
+    "코드에서 안 쓰는 컬럼도 배치나 CDC consumer가 쓰는지 어떻게 증명해?",
+    "destructive schema cleanup을 rollback 가능성까지 고려해서 어떤 순서로 해야 해?",
+    "column retirement 전에 read-off, write-off, retention window를 어떻게 검증해?"
+  ],
+  "symptoms": [
+    "새 컬럼 전환은 끝났지만 old column을 실제로 drop해도 되는지 증명하지 못하고 있어",
+    "코드에서는 안 쓰는 것 같은데 배치, CDC, DLQ replay, analytics 경로가 old field를 계속 볼까 걱정돼",
+    "contract phase에서 rollback 옵션까지 같이 사라지는 위험을 체크해야 해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/online-schema-change-strategies",
+      "database/cdc-schema-evolution-compatibility-playbook"
+    ],
+    "next_docs": [
+      "database/instant-ddl-vs-copy-inplace-algorithms",
+      "database/online-backfill-consistency",
+      "database/index-maintenance-window-rollout-playbook"
+    ],
+    "confusable_with": [
+      "database/online-schema-change-strategies",
+      "database/instant-ddl-vs-copy-inplace-algorithms",
+      "database/cdc-schema-evolution-compatibility-playbook",
+      "database/partition-pruning-hot-cold-data",
+      "database/online-backfill-verification-cutover-gates"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/destructive-schema-cleanup-column-retirement.md",
+    "revision_history": []
+  }
+}

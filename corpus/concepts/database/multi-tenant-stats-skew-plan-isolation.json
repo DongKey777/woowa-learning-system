@@ -1,0 +1,56 @@
+{
+  "id": "database/multi-tenant-stats-skew-plan-isolation",
+  "title": "Multi-Tenant Statistics Skew, Plan Drift, and Query Isolation",
+  "category": "database",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Multi-Tenant Statistics Skew, Plan Drift, and Query Isolation\n\n> 한 줄 요약: shared-table 멀티테넌시에서는 큰 tenant 하나의 데이터 분포가 전체 테이블 통계를 왜곡해, 작은 tenant 쿼리 계획까지 흔들 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Multi-Tenant Table Design, Tenant-First Indexing, and Hotspot Control](./multi-tenant-tenant-id-index-topology.md)\n- [Secondary Index Maintenance Cost and ANALYZE Statistics Skew](./secondary-index-maintenance-cost-analyze-skew.md)\n- [Statistics, Histograms, and Cardinality Estimation](./statistics-histograms-cardinality-estimation.md)\n- [Histogram Drift와 Auto Analyze Threshold](./histogram-drift-auto-analyze-thresholds.md)\n- [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n\nretrieval-anchor-keywords: multi tenant statistics skew, tenant plan drift, shared table cardinality, tenant histogram skew, noisy neighbor query plan, plan isolation, backend saas query tuning\n\n## 핵심 개념\n\nshared-table 멀티테넌시의 통계 문제는 단순한 row 수 불균형이 아니다.\n\n큰 tenant 하나가:\n\n- status 분포\n- created_at 최신성\n- 특정 prefix cardinality\n\n를 바꿔 버리면, optimizer는 전체 테이블 평균으로 계획을 짠다.  \n그 결과 작은 tenant의 쿼리도 \"큰 tenant 기준 현실\"에 끌려갈 수 있다.\n\n즉 멀티테넌트에서는 noisy neighbor가 CPU나 IO뿐 아니라 **optimizer statistics**에도 존재한다.\n\n## 깊이 들어가기\n\n### 1. shared-table 통계는 tenant별 현실을 평균내 버린다\n\n예를 들어 `orders(tenant_id, status, created_at)`에서:\n\n- tenant A는 `PAID` 95%\n- tenant B는 `PAID` 5%\n\n일 수 있다.\n\n하지만 global histogram/cardinality는 이 둘을 섞어 본다.  \n그래서 특정 tenant의 query shape에서는 실제 selectivity와 optimizer 추정이 크게 어긋날 수 있다.\n\n### 2. tenant-first index가 있어도 통계 문제는 남을 수 있다\n\n`(tenant_id, status, created_at)` 인덱스를 잡으면 scan 범위는 좋아진다.  \n하지만 여전히 planner가 보는 것은 전체 인덱스 통계다.\n\n문제가 드러나는 경우:\n\n- 일부 tenant만 최근 데이터가 폭증\n- 특정 tenant만 특정 status 값 쏠림\n- 특정 tenant query만 LIMIT/ORDER 패턴이 다름\n\n즉 index topology는 기본이고, 그 위에 **tenant-specific distribution drift**를 추가로 봐야 한다.\n\n### 3. hot tenant는 작은 tenant 쿼리의 plan까지 흔들 수 있다\n\n운영에서 흔한 현상:\n\n- VIP tenant 데이터가 급증\n- auto analyze가 global 분포 기준으로 통계 갱신\n- small tenant 목록 조회가 갑자기 다른 plan을 탐\n\n사용자는 \"왜 우리 고객 쿼리가 느려졌지?\"라고 보지만, 원인은 다른 tenant의 분포 변화일 수 있다.\n\n### 4. 해결은 단순 ANALYZE만이 아니다\n\n가능한 대응:\n\n- tenant-first composite index 재설계\n- skew 컬럼 histogram 조정\n- query shape 분리\n- hot tenant split-out\n- summary/read model 분리\n\n핵심은 optimizer misestimate를 \"인덱스가 없다\"가 아니라, **분포가 tenant별로 다르다**는 문제로 보는 것이다.\n\n### 5. query isolation이 필요할 때가 있다\n\n같은 논리 API라도 tenant 규모가 크게 다르면 같은 SQL이 최선이 아닐 수 있다.\n\n예:\n\n- small tenant는 index nested path가 적합\n- huge tenant는 summary/read model이나 다른 access path가 적합\n\n이 경우는 query isolation을 검토할 수 있다.\n\n- tenant tier별 query path\n- dedicated read model\n- heavy tenant 전용 cluster/routing\n\n즉 멀티테넌트에서는 SQL 한 줄보다 **tenant class별 접근 전략**이 더 현실적일 수 있다.\n\n### 6. slow query debugging 때 tenant dimension을 빼면 원인을 놓친다\n\n같은 endpoint라도 다음을 같이 봐야 한다.\n\n- tenant_id\n- tenant 규모 tier\n- 해당 tenant의 status 분포\n- 최근 growth rate\n\ntenant dimension이 없으면 \"가끔 느리다\"로 보이던 현상이 사실은 \"큰 tenant에서만 재현\"되는 경우를 놓친다.\n\n## 실전 시나리오\n\n### 시나리오 1. 소형 고객 목록 조회가 어느 날 느려짐\n\n원인:\n\n- 대형 tenant 데이터 증가로 global stats 변화\n- optimizer가 다른 plan 선택\n\n대응:\n\n- tenant-aware slow query grouping\n- histogram/ANALYZE 점검\n- heavy tenant 분리 여부 검토\n\n### 시나리오 2. 특정 tenant만 LIMIT 쿼리가 유독 느림\n\n그 tenant에서는 `status='READY'` 비율이 매우 높아, 일반 tenant와 완전히 다른 selectivity를 가진다.\n\n이 경우는:\n\n- dedicated query path\n- queue/read model 분리\n\n가 더 낫다.\n\n### 시나리오 3. 운영자는 인덱스를 추가했는데도 일부 tenant 성능이 계속 흔들림\n\n문제는 인덱스 부재가 아니라 distribution mismatch일 수 있다.\n\n이때는 stats skew와 hot tenant isolation을 같이 봐야 한다.\n\n## 코드로 보기\n\n```sql\nEXPLAIN ANALYZE\nSELECT id, status, created_at\nFROM orders\nWHERE tenant_id = ?\n  AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n```text\n같이 저장할 디버깅 차원\n- tenant_id\n- tenant tier\n- rows examined\n- chosen index\n- actual rows vs estimated rows\n```\n\n```sql\nANALYZE TABLE orders;\n```\n\nANALYZE는 시작점이 될 수 있지만, 큰 tenant가 shared-table 통계를 계속 흔드는 구조라면 query isolation이나 split-out이 더 근본적인 해결책일 수 있다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| global stats에만 의존 | 단순하다 | tenant skew를 숨긴다 | tenant 규모가 비슷할 때 |\n| tenant-first index | 기본 locality를 준다 | 분포 차이까지 해결하진 못한다 | shared-table 기본 설계 |\n| tenant-aware query isolation | 큰 tenant 대응이 좋다 | 코드/운영 경로가 늘어난다 | tenant 규모 편차가 클 때 |\n| hot tenant split-out | 근본적 격리가 가능하다 | migration 비용이 크다 | 일부 tenant가 압도적으로 클 때 |\n\n## 꼬리질문\n\n> Q: shared-table에서 왜 큰 tenant 하나가 작은 tenant 쿼리 계획까지 흔들 수 있나요?\n> 의도: global statistics의 평균화 문제를 이해하는지 확인\n> 핵심: optimizer가 tenant별이 아니라 전체 분포 기준으로 추정하기 때문이다\n\n> Q: tenant-first index만으로 충분하지 않은 이유는 무엇인가요?\n> 의도: topology와 statistics를 구분하는지 확인\n> 핵심: scan 범위는 좋아져도 tenant별 selectivity 차이와 global stats 왜곡은 남을 수 있다\n\n> Q: 언제 query isolation이나 split-out을 검토하나요?\n> 의도: tuning과 architecture의 경계를 아는지 확인\n> 핵심: 일부 tenant만 분포와 workload가 완전히 달라 shared-table 평균으로 감당이 안 될 때다\n\n## 한 줄 정리\n\nshared-table 멀티테넌시의 plan 문제는 인덱스 부족만이 아니라, 큰 tenant가 전체 통계를 왜곡해 다른 tenant query까지 흔드는 statistics skew에 있다.\n",
+  "aliases": [
+    "multi tenant statistics skew",
+    "tenant plan drift",
+    "shared table cardinality",
+    "tenant histogram skew",
+    "noisy neighbor query plan",
+    "tenant-aware query isolation",
+    "global stats skew",
+    "특정 테넌트만 느린 쿼리",
+    "큰 tenant가 plan을 흔들어요"
+  ],
+  "expected_queries": [
+    "shared table에서 큰 tenant 하나가 작은 tenant 쿼리 plan까지 흔드는 이유를 설명해줘",
+    "tenant-first index가 있어도 statistics skew 때문에 특정 tenant만 느릴 수 있어?",
+    "multi tenant slow query를 볼 때 tenant_id, tier, estimated rows를 왜 같이 저장해야 해?",
+    "global histogram과 tenant별 selectivity 차이가 plan drift를 만드는 과정을 알려줘",
+    "언제 tenant-aware query isolation이나 hot tenant split out을 검토해야 해?"
+  ],
+  "symptoms": [
+    "shared table에서 큰 tenant의 분포 변화 뒤 작은 tenant 쿼리까지 다른 plan을 타고 있어",
+    "같은 endpoint가 특정 tenant tier에서만 느리고 estimated rows와 actual rows가 크게 어긋나",
+    "tenant-first index가 있는데도 global histogram이나 auto analyze 이후 plan drift가 반복돼"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/multi-tenant-tenant-id-index-topology",
+      "database/statistics-histograms-cardinality-estimation"
+    ],
+    "next_docs": [
+      "database/histogram-drift-auto-analyze-thresholds",
+      "database/tenant-split-out-routing-cutover",
+      "database/query-tuning-checklist"
+    ],
+    "confusable_with": [
+      "database/statistics-histograms-cardinality-estimation",
+      "database/histogram-drift-auto-analyze-thresholds",
+      "database/multi-tenant-tenant-id-index-topology"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/multi-tenant-stats-skew-plan-isolation.md",
+    "revision_history": []
+  }
+}

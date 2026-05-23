@@ -1,0 +1,56 @@
+{
+  "id": "data-structure/xor-filter",
+  "title": "Xor Filter",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Xor Filter\n\n> 한 줄 요약: Xor Filter는 정적 key 집합에 대해 매우 작은 메모리로 approximate membership을 제공하는 구조로, Bloom/Cuckoo보다 더 압축적인 읽기 중심 prefilter가 필요할 때 강력한 선택지다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Bloom Filter](./bloom-filter.md)\n> - [Cuckoo Filter](./cuckoo-filter.md)\n> - [Bloom Filter vs Cuckoo Filter](./bloom-filter-vs-cuckoo-filter.md)\n> - [Sketch and Filter Selection Playbook](./sketch-filter-selection-playbook.md)\n\n> retrieval-anchor-keywords: xor filter, approximate membership, static set filter, fingerprint filter, xor-based filter, read-mostly filter, compact prefilter, bloom alternative, cuckoo alternative, negative lookup filter\n\n## 핵심 개념\n\nXor Filter도 \"있을 수도 있다 / 없다\"를 빠르게 말하는 approximate membership 구조다.  \n하지만 Bloom Filter처럼 비트 배열을 여러 번 찍는 방식도, Cuckoo Filter처럼 relocation bucket을 유지하는 방식도 아니다.\n\n핵심 발상은 이렇다.\n\n- 각 key는 몇 개의 후보 위치를 가진다\n- 각 위치에는 fingerprint 하나가 저장된다\n- 후보 위치들의 fingerprint xor를 이용해 membership을 검사한다\n\n즉 정적 집합에 대해 매우 작은 공간으로 membership prefilter를 만드는 구조다.\n\n## 깊이 들어가기\n\n### 1. 왜 \"정적 집합\"이라는 조건이 중요한가\n\nXor Filter는 보통 한 번 집합을 만들고, 그다음엔 주로 조회만 하는 상황에 맞는다.\n\n- 배포 시 로드되는 blacklist\n- 읽기 전용 dictionary prefilter\n- immutable segment별 key prefilter\n\n삽입/삭제를 실시간으로 자유롭게 지원하는 구조가 아니라,  \n**빌드 비용을 먼저 치르고 조회 효율을 얻는 구조**라고 보는 편이 맞다.\n\n### 2. build가 lookup보다 훨씬 복잡하다\n\nlookup은 간단한 편이다.\n\n- key에서 후보 위치를 계산한다\n- 그 위치들의 fingerprint xor와 대상 fingerprint를 비교한다\n\n하지만 build 과정은 더 어렵다.\n\n- hypergraph peeling처럼 key를 배치해야 한다\n- 순환이 심하면 다시 시도해야 한다\n- seed를 바꿔 재생성할 수 있다\n\n즉 runtime lookup은 매우 가볍지만, construction은 오프라인 성격이 강하다.\n\n### 3. Bloom / Cuckoo와 어디서 갈리나\n\n대략적인 감각은 이렇다.\n\n- Bloom: 단순하고 삽입이 쉬움\n- Cuckoo: 삭제 가능, 동적 운영 가능\n- Xor: 정적 집합에서 더 작은 메모리와 빠른 조회를 노림\n\n따라서 선택 기준은 \"누가 더 최신인가\"가 아니라  \n**집합이 얼마나 자주 바뀌는가**에 가깝다.\n\n### 4. backend에서 왜 매력적인가\n\nbackend에서는 immutable/append-segment 기반 구조가 많다.\n\n- SSTable / segment file\n- 읽기 전용 룰셋\n- 배포 단위 dictionary\n\n이 경우 segment별 Xor Filter를 만들면 negative lookup을 매우 싸게 걸러낼 수 있다.  \n특히 hot path에서 메모리 사용량이 작은 것이 장점이 된다.\n\n### 5. 부작용과 한계\n\nXor Filter는 정적 집합에서 매우 좋지만, 그만큼 제약이 뚜렷하다.\n\n- 동적 삽입/삭제가 불편하다\n- 빌드 실패 시 재시도가 필요할 수 있다\n- construction pipeline이 필요하다\n\n즉 online mutable cache admission filter보다  \nimmutable snapshot prefilter에 더 잘 맞는다.\n\nXor Filter는 merge 관점에서도 정적 구조에 가깝다. 두 필터를 xor하거나 이어 붙여\n집합 union을 만들 수 있는 구조가 아니다. segment A와 segment B를 합친 하나의\n필터가 필요하면 원본 key 목록 또는 build 입력을 기준으로 새 필터를 rebuild해야\n한다. 이 점이 Bloom Filter의 bitwise OR union과 가장 크게 다른 운영 경계다.\n\n## 실전 시나리오\n\n### 시나리오 1: immutable segment prefilter\n\n읽기 전용 세그먼트 파일마다 Xor Filter를 두면  \n없는 key를 빠르게 배제해 disk lookup을 줄일 수 있다.\n\n### 시나리오 2: 배포 단위 blacklist / allowlist\n\n룰셋이 배포 시점마다 통째로 바뀌는 구조라면  \n동적 업데이트보다 compact lookup이 더 중요할 수 있다.\n\n### 시나리오 3: edge negative lookup filter\n\n메모리 예산이 빡빡한 edge/node process에서  \n정적 key set membership precheck를 아주 작게 들고 가기 좋다.\n\n### 시나리오 4: 부적합한 경우\n\n실시간 삽입/삭제가 중요한 idempotency key window나 rolling membership에는  \nCuckoo Filter나 다른 구조가 더 자연스럽다.\n\n## 안전한 선택 기준\n\n| 요구사항 | 먼저 볼 구조 | 이유 |\n|---|---|---|\n| immutable key set의 negative lookup을 작게 거르고 싶은가 | Xor Filter | build 후 lookup이 작고 빠르다 |\n| online insert가 계속 들어오는가 | Bloom Filter | 추가 전용 prefilter가 단순하다 |\n| deletion/expiration이 자주 필요한가 | Cuckoo Filter / Counting Bloom Filter | mutable membership에 맞다 |\n| segment union filter를 cheap하게 만들고 싶은가 | Bloom Filter 계열 | Xor Filter는 일반적으로 union을 rebuild해야 한다 |\n| false positive도 치명적인가 | HashSet / DB index | approximate filter 단독으로 쓰면 안 된다 |\n\nsafe path는 `mightContain=false`일 때만 negative shortcut을 쓰는 것이다.\n`mightContain=true`는 \"후보\"이므로 권한, 결제, 중복 차단처럼 비용이 큰 결정은\nexact path로 확인해야 한다.\n\n## 정신 모델\n\nXor Filter는 \"각 key가 세 칸의 fingerprint xor 방정식을 만족하도록 미리 풀어 둔 정적 퍼즐\"에 가깝다.\nlookup은 퍼즐을 다시 푸는 것이 아니라, key가 가리키는 몇 칸을 xor해 fingerprint가 맞는지만 본다.\n\n그래서 빠른 이유와 제약이 같은 곳에서 나온다.\n\n- lookup은 몇 번의 hash, array read, xor 비교로 끝난다.\n- build는 모든 key가 동시에 만족하는 fingerprint 배열을 찾아야 한다.\n- key 집합이 바뀌면 기존 방정식 전체의 균형이 깨질 수 있다.\n\n즉 Xor Filter의 장점은 mutable update가 아니라 immutable snapshot에서 나온다.\n\n## 자주 하는 오해\n\n| 오해 | 교정 |\n|---|---|\n| Bloom Filter의 더 빠른 대체재라 항상 바꾸면 된다 | 정적 집합이라는 조건이 맞을 때 강하다 |\n| lookup이 단순하니 insert도 단순하다 | build는 hypergraph peeling과 seed retry가 필요할 수 있다 |\n| false negative가 있어도 된다 | 정상 build된 approximate membership filter는 저장한 key에 false negative가 없어야 한다 |\n| 삭제가 필요한 cache에도 자연스럽다 | rolling window나 idempotency cache는 Cuckoo/Quotient/정확 set을 검토한다 |\n| fingerprint bit 수는 아무렇게나 정한다 | false positive rate와 메모리 예산을 같이 결정한다 |\n| Bloom처럼 두 필터를 OR해서 union하면 된다 | Xor Filter union은 보통 원본 key 기준 rebuild가 필요하다 |\n\n## 코드로 보기\n\n아래 코드는 lookup 모양만 보여준다. 운영 구현에서 중요한 부분은 build pipeline,\nseed retry, 실패 시 fallback, fingerprint size, artifact metadata, exact path\n연결이다.\n\n```java\npublic class XorFilterSketch {\n    private final short[] fingerprints;\n\n    public XorFilterSketch(short[] fingerprints) {\n        this.fingerprints = fingerprints;\n    }\n\n    public boolean mightContain(String key) {\n        short fp = fingerprint(key);\n        int h1 = index(key, 0);\n        int h2 = index(key, 1);\n        int h3 = index(key, 2);\n\n        short combined = (short) (fingerprints[h1] ^ fingerprints[h2] ^ fingerprints[h3]);\n        return combined == fp;\n    }\n\n    private short fingerprint(String key) {\n        short fp = (short) (key.hashCode() & 0xFFFF);\n        return fp == 0 ? 1 : fp;\n    }\n\n    private int index(String key, int seed) {\n        return Math.floorMod((key.hashCode() * 0x9e3779b9) ^ seed, fingerprints.length);\n    }\n}\n```\n\n이 코드는 lookup 감각만 보여준다.  \n실제 Xor Filter의 핵심은 fingerprint 배열을 어떻게 생성하느냐는 build 알고리즘 쪽이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Xor Filter | 정적 집합에서 메모리 효율이 매우 좋고 lookup이 가볍다 | 동적 업데이트가 불편하고 build 단계가 복잡하다 | immutable segment prefilter, read-mostly membership |\n| Bloom Filter | 단순하고 삽입이 쉽다 | 공간 효율이 상대적으로 떨어질 수 있다 | 동적 추가가 있는 일반 prefilter |\n| Cuckoo Filter | 삭제와 동적 운영이 가능하다 | 삽입 실패/relocation 관리가 필요하다 | mutable membership filter |\n| HashSet | 정확하다 | 메모리를 더 쓴다 | 정확 membership이 절대적일 때 |\n\n중요한 질문은 \"필터가 정적 집합용인가\"다.  \n그 답이 yes면 Xor Filter가 매우 강력해진다.\n\n## 꼬리질문\n\n> Q: Xor Filter가 Bloom보다 더 잘 맞는 경우는 언제인가요?\n> 의도: 동적/정적 membership filter 구분 이해 확인\n> 핵심: 집합이 빌드 후 거의 변하지 않고, 메모리 효율이 특히 중요할 때다.\n\n> Q: 왜 build가 lookup보다 어렵나요?\n> 의도: runtime fast path와 construction cost를 분리해 보는지 확인\n> 핵심: key들을 xor 제약을 만족하도록 배치하는 오프라인 구성 과정이 필요하기 때문이다.\n\n> Q: rolling window membership에는 왜 부적합한가요?\n> 의도: 자료구조의 적용 경계를 보는지 확인\n> 핵심: 삽입/삭제를 온라인으로 자연스럽게 처리하는 구조가 아니기 때문이다.\n\n## 한 줄 정리\n\nXor Filter는 읽기 중심의 정적 key 집합에 대해 매우 작은 메모리로 negative lookup prefilter를 제공하는 approximate membership 구조다.\n",
+  "aliases": [
+    "Xor Filter",
+    "xor filter approximate membership",
+    "static set filter",
+    "fingerprint filter",
+    "compact prefilter",
+    "Bloom alternative",
+    "negative lookup filter"
+  ],
+  "expected_queries": [
+    "Xor Filter는 정적 key 집합에서 Bloom Filter보다 어떤 장점이 있어?",
+    "Xor Filter lookup은 간단하지만 build가 hypergraph peeling 때문에 어려운 이유는?",
+    "immutable segment prefilter에는 Xor Filter가 좋고 rolling window membership에는 조심해야 하는 이유는?",
+    "Bloom Cuckoo Xor Filter를 deletion 필요 여부와 static set 조건으로 비교해줘",
+    "negative lookup을 작은 메모리로 거르는 read-mostly approximate membership 구조는?"
+  ],
+  "symptoms": [
+    "Xor Filter를 Bloom Filter나 Cuckoo Filter처럼 online insert/delete가 쉬운 mutable membership filter로 오해한다",
+    "lookup은 가볍지만 build는 hypergraph peeling과 seed retry가 필요한 오프라인 construction이라는 점을 놓친다",
+    "정적 immutable segment prefilter에 맞는 구조를 rolling window membership이나 idempotency key cache에 적용하려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/sketch-filter-selection-playbook",
+      "data-structure/bloom-filter-vs-cuckoo-filter"
+    ],
+    "next_docs": [
+      "data-structure/bloom-filter",
+      "data-structure/cuckoo-filter",
+      "data-structure/quotient-filter"
+    ],
+    "confusable_with": [
+      "data-structure/bloom-filter",
+      "data-structure/cuckoo-filter",
+      "data-structure/bloom-filter-vs-cuckoo-filter",
+      "data-structure/quotient-filter",
+      "data-structure/sketch-filter-selection-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/xor-filter.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "security/roomescape-reservation-ownership-review-drill",
+  "title": "Roomescape Reservation Ownership Review Drill",
+  "category": "security",
+  "level": "beginner",
+  "summary": "이 drill은 roomescape member reservation ownership authorization과 IDOR 방어를 복습한다.",
+  "body_markdown": "# Roomescape Reservation Ownership Review Drill\n\n## 미션 장면\n\nRoomescape 회원 기능에서 예약 상세 조회나 예약 취소 API가 `reservationId`를 path variable로 받는다. 로그인한 회원 A가 자기 예약을 취소하는 것은 정상이다. 하지만 회원 B가 A의 예약 id를 알아내거나 추측해서 `DELETE /reservations/{id}`를 호출했을 때 같은 로직이 실행되면 object-level authorization이 빠진 것이다.\n\n이 드릴은 \"로그인 여부\"를 묻는 문제가 아니다. 이미 로그인된 사용자가 직접 객체 참조(direct object reference)로 다른 회원의 예약을 조작할 수 있는지, 즉 IDOR/BOLA 위험을 리뷰하는 연습이다.\n\n## 리뷰 냄새\n\n가장 큰 냄새는 service나 repository가 `reservationId`만 입력으로 받고 현재 로그인한 `memberId`를 모르는 구조다. Controller에서 `@AuthenticationPrincipal`을 받더라도 service 호출이 `cancel(reservationId)`라면 권한 판단 재료가 application boundary에 전달되지 않는다.\n\n다음 패턴도 같이 의심한다.\n\n- `hasRole(\"MEMBER\")` 또는 로그인 필터 통과만으로 예약 취소를 허용한다.\n- 내 예약 목록에는 `memberId` 조건이 있지만 상세 조회, 취소, 결제 취소 endpoint에는 없다.\n- \"예약이 없습니다\" 테스트만 있고 \"다른 회원의 예약입니다\" negative test가 없다.\n- 남의 예약 거절 후에도 취소 상태, 결제 상태, audit log가 바뀌는지 확인하지 않는다.\n\n## 질문\n\n`DELETE /reservations/{id}`에서 로그인은 되어 있지만 `{id}`가 다른 회원의 예약이다. 이 케이스를 막는 설계, 상태 코드(status code), 테스트를 말해봐.\n\n## 기대 답변 축\n\n현재 회원 id(current member id)를 use case 입력에 포함한다. 컨트롤러(controller)는 인증 주체(principal)에서 member id를 꺼내고, 서비스(service)는 `reservationId`만 믿지 않는다. 저장소 조회를 `reservationId + memberId` 조건으로 제한하면 남의 예약은 조회 자체가 안 된다. 또는 예약을 조회한 뒤 owner id를 비교할 수도 있지만, 그 경우 거절 정책을 더 명확히 드러내야 한다.\n\nrole이 `MEMBER`인지 확인하는 것은 충분하지 않다. 그것은 기능 접근 권한(role authorization)이고, \"이 예약이 이 회원의 것인가\"는 객체 소유권(ownership authorization)이다. URL id를 바꿔 남의 예약을 취소하거나 조회할 수 있으면 IDOR/BOLA 계열 취약점으로 볼 수 있다.\n\n상태 코드는 정책으로 정한다. 로그인하지 않았으면 `401` 또는 browser login redirect가 자연스럽다. 로그인은 됐지만 남의 예약이면 `403 Forbidden`으로 거절할 수 있다. 리소스 존재 자체를 숨기고 싶다면 `404 Not Found` 은닉(concealment)을 선택할 수도 있다. 다만 `403`과 은닉형 `404`를 엔드포인트마다 섞으면 클라이언트와 테스트가 혼란스러우므로 기준을 문서화한다.\n\n트랜잭션(transaction)은 소유권 확인, 취소 가능 상태 확인, 취소 상태 저장이 하나의 유스케이스로 보이는 범위에 둔다. 소유자는 맞지만 이미 취소됐거나 시간이 지나 취소 불가능하면 보통 `409 Conflict`처럼 상태 충돌로 나눈다.\n\n테스트는 최소 네 가지를 둔다. 내 예약 취소 성공, 남의 예약 취소 거절, 없는 예약 id, 내 예약이지만 취소 불가 상태다. repository method에 memberId 조건이 들어가는지도 service test나 integration test에서 확인한다. 특히 남의 예약 거절 테스트는 status만 보지 말고 예약 row가 취소되지 않았는지, 후속 이벤트나 결제 취소가 발생하지 않았는지까지 확인한다.\n\n## 판정 순서\n\n| 장면 | 우선 분류 | 흔한 status 후보 | 리뷰 포인트 |\n|---|---|---|---|\n| 로그인하지 않은 요청 | authentication 없음 | 401 또는 login redirect | 현재 사용자를 식별하지 못한다. |\n| 로그인했지만 남의 예약 | ownership authorization 실패 | 403 또는 은닉형 404 | role과 owner check를 분리한다. |\n| 존재하지 않는 예약 id | resource 없음 | 404 | 남의 예약과 합칠지 정책으로 정한다. |\n| 내 예약이지만 이미 취소됨 | 상태 전이 충돌 | 409 | 권한은 통과했고 business state가 막는다. |\n| admin이 회원 예약을 취소 | 별도 권한 모델 | 200/204 또는 403 | member ownership 흐름과 admin override를 분리한다. |\n\n중요한 순서는 \"인증 주체 확보 -> object ownership 확인 -> business rule 확인 -> 상태 변경\"이다. business rule을 먼저 평가하면 남의 예약의 존재 여부나 상태를 응답 메시지로 새게 만들 수 있다.\n\n## 코드 리뷰 체크리스트\n\n```java\nreservationRepository.findById(reservationId); // 위험 신호\nreservationRepository.findByIdAndMemberId(reservationId, currentMemberId); // 권한 경계가 query에 드러남\n```\n\n`findByIdAndMemberId`를 쓰면 없는 예약과 남의 예약이 모두 \"조회 실패\"로 보일 수 있다. 이는 외부 응답을 404로 숨기는 정책과 잘 맞지만, 운영 로그에는 actor member id, target reservation id, decision을 남겨야 나중에 공격 시도와 단순 오입력을 구분할 수 있다. 단, 예약 상세나 개인정보를 로그에 그대로 남기면 안 된다.\n\n조회 후 owner를 비교하는 방식도 가능하다. 다만 이 경우에는 비교 누락을 막기 위해 service method 안에서 바로 검사하고, 검사 전에는 response DTO 변환이나 side effect를 만들지 않는다.\n\n## 테스트 골격\n\n| 테스트 | given | when | then |\n|---|---|---|---|\n| 내 예약 취소 | 회원 A의 예약 | A가 삭제 요청 | 성공 status, 예약 취소됨 |\n| 남의 예약 거절 | 회원 A의 예약 | B가 같은 id로 삭제 요청 | 403 또는 404, 예약 변경 없음 |\n| 없는 예약 | 존재하지 않는 id | A가 삭제 요청 | 404, 내부 오류 아님 |\n| 취소 불가 상태 | A의 지난 예약 | A가 삭제 요청 | 409, ownership 실패와 구분 |\n| 목록/상세 일관성 | A/B 예약이 섞여 있음 | B가 목록과 상세 조회 | B의 예약만 노출 |\n\nMockMvc/API 테스트는 외부 계약(status와 body)을 고정하고, service 또는 repository 통합 테스트는 `memberId` 조건이 실제 조회 조건에 들어가는지 확인한다. \"응답 body에 남의 예약 제목, 시간, 결제 정보가 섞이지 않는다\"도 security assertion이다.\n\n## 짧은 모범 답변\n\n\"`reservationId`는 클라이언트가 바꿀 수 있으므로 service 입력에 현재 `memberId`를 함께 넘기고, 가능하면 `findByIdAndMemberId`처럼 owner 조건이 포함된 조회로 시작하겠습니다. 로그인하지 않은 요청은 401, 로그인했지만 남의 예약이면 정책에 따라 403 또는 은닉형 404로 고정합니다. 내 예약이지만 이미 취소됐거나 시간이 지나 취소할 수 없는 경우는 ownership 실패가 아니라 상태 충돌이므로 409로 분리하고, 테스트는 남의 예약 요청 후 row와 side effect가 그대로인지까지 확인하겠습니다.\"\n\n## 약점 태그\n\n`idor`, `object-ownership`, `403-vs-404`, `transaction-boundary`\n\n## 복습 연결 concept\n\n약하면 `roomescape-member-reservation-idor-bridge`와 `idor-object-ownership-router`를 다시 본다. 답변에서 \"로그인했으니 가능\"이라고 말하면 role과 ownership을 섞은 것이다.\n",
+  "aliases": [
+    "roomescape reservation ownership drill",
+    "룸이스케이프 예약 소유권 드릴",
+    "IDOR ownership review drill",
+    "다른 사람 예약 접근 복습"
+  ],
+  "expected_queries": [
+    "roomescape IDOR 권한 체크 드릴 내줘",
+    "다른 사람 예약 조회 버그를 어떻게 테스트할지 복습하고 싶어",
+    "ownership authorization 질문 풀어볼래"
+  ],
+  "symptoms": [
+    "member role만 확인하고 예약 소유자는 확인하지 않습니다",
+    "URL id를 바꾸면 다른 회원 예약이 보입니다",
+    "repository method에 memberId 조건이 없습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/roomescape-member-reservation-idor-bridge"
+    ],
+    "next_docs": [
+      "security/idor-object-ownership-router",
+      "spring/roomescape-member-cancel-auth-transaction-bridge"
+    ],
+    "confusable_with": [
+      "security/roomescape-member-reservation-idor-bridge",
+      "security/rbac-abac-resource-ownership-interview-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/roomescape-reservation-ownership-review-drill.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "system-design/adaptive-concurrency-limit-aimd-gradient-chooser",
+  "title": "Adaptive Concurrency Limit AIMD Gradient Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 fixed concurrency limit, AIMD limiter, gradient/latency-based limiter, queue length signal, load shedding, Little's Law를 비교해 overload 상황에서 어떤 admission control 방식을 고를지 설명한다.",
+  "body_markdown": "# Adaptive Concurrency Limit AIMD Gradient Chooser\n\n> 한 줄 요약: adaptive concurrency limit은 \"요청 수를 제한한다\"가 아니라, 처리 가능한 inflight work를 지키기 위해 latency, queue, 성공률, rejection 신호를 보고 입장권을 계속 재조정하는 overload control이다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Little's Law Capacity Planning Primer](./littles-law-capacity-planning-primer.md)\n- [Overload Control Admission Queue Load Shedding Router](./overload-control-admission-queue-load-shedding-router.md)\n- [Backpressure vs Load Shedding vs Rate Limit Interview Chooser](./backpressure-vs-load-shedding-vs-rate-limit-interview-chooser.md)\n- [Rate Limit vs Queue Load Shedding Chooser](./rate-limit-vs-queue-load-shedding-chooser.md)\n- [Retry Amplification and Backpressure Primer](./retry-amplification-and-backpressure-primer.md)\n- [Adaptive Concurrency Limiter Latency Signal Gateway Mesh](../network/adaptive-concurrency-limiter-latency-signal-gateway-mesh.md)\n- [Bounded Queue Overflow Policy Chooser](../data-structure/bounded-queue-overflow-policy-chooser.md)\n- [Executor Sizing, Queue, Rejection Policy](../language/java/executor-sizing-queue-rejection-policy.md)\n\n---\n\n## 먼저 고정할 invariant\n\nConcurrency limit의 invariant는 \"한 경계 안에 동시에 머무는 work를 downstream이 건강하게 처리할 수 있는 범위로 제한한다\"이다. 이때 limit은 QPS quota가 아니라 inflight admission cap이다. QPS가 낮아도 service time이 길면 Little's Law의 `L = lambda * W` 때문에 inflight가 커질 수 있고, QPS가 높아도 service time이 짧으면 같은 cap 안에서 버틸 수 있다. 그래서 limiter를 고를 때는 먼저 경계를 정한다. API handler 전체인지, DB pool 앞인지, 외부 API client인지, worker queue 앞인지가 달라지면 신호와 실패 응답도 달라진다.\n\n고정 limit은 시작점으로 좋다. load test에서 healthy p95, downstream saturation, queue wait budget을 보고 \"이 route는 평균 120 inflight, burst headroom 포함 180\"처럼 상한을 잡을 수 있다. 문제는 현실의 service time과 capacity가 계속 변한다는 점이다. 배포 직후 cold cache, DB failover, noisy neighbor, GC pause, 특정 tenant burst가 오면 fixed limit은 너무 높거나 너무 낮아진다. 너무 높으면 queue wait와 p99가 먼저 무너지고, 너무 낮으면 가능한 throughput을 버린다.\n\n## Chooser table\n\n| 방식 | 신호 | 장점 | 위험 | 잘 맞는 상황 |\n|---|---|---|---|---|\n| Fixed limit | 사전 측정한 capacity | 단순하고 예측 가능 | workload 변화에 둔감 | 안정적 단일 workload, 초기 safety cap |\n| AIMD | 성공이면 additive increase, overload면 multiplicative decrease | 구현이 쉽고 collapse를 빠르게 줄임 | 회복이 느리거나 sawtooth가 큼 | 명확한 reject/timeout 신호가 있는 경계 |\n| Gradient / latency-based | 현재 latency와 최소/기준 latency의 기울기 | queue가 길어지기 전 조기 반응 | baseline drift, noisy latency에 민감 | gateway, mesh, mixed traffic route |\n| Queue length control | queue depth, oldest age | backlog를 직접 본다 | 이미 늦은 신호일 수 있음 | worker queue, bounded buffer |\n| Load shedding | priority, deadline, overload state | core SLO 보호 | 사용자-visible failure 증가 | 지속 과부하, low-value work 분리 |\n\nFixed limit은 \"얼마까지 받을 것인가\"의 바닥 정책이다. AIMD와 gradient limiter는 그 바닥 위에서 \"지금은 더 받을 수 있는가\"를 움직인다. Queue length는 기다리는 일이 이미 생겼다는 증거이고, load shedding은 기다려도 성공 가능성이 낮은 일을 빠르게 실패시키는 정책이다.\n\n## Fixed limit에서 시작하는 이유\n\nAdaptive limiter를 바로 붙이면 magic처럼 보이지만, 기준이 없으면 흔들리는 자동화가 된다. 먼저 Little's Law로 평균 inflight를 계산한다. 예를 들어 한 downstream route가 800 RPS를 처리하고 healthy 평균 체류 시간이 50ms라면 평균 inflight는 40이다. 여기에 p95, burst, retry, 배포 중 capacity 감소를 반영해 초기 cap을 둔다. 이 cap은 \"절대 최적값\"이 아니라 failure blast radius를 제한하는 guardrail이다.\n\nFixed limit의 오선택은 metric에서 드러난다. limit에 자주 걸리는데 downstream CPU와 pool wait가 낮고 latency도 안정적이면 너무 낮을 수 있다. 반대로 limit에 걸리지 않는데 p99, queue wait, pending acquire, timeout-before-start가 증가하면 limit이 너무 높거나 경계가 잘못 잡힌 것이다. 특히 큰 queue를 뒤에 두고 fixed limit을 높이면 처리량이 늘어난 것처럼 보이다가 oldest age와 timeout이 늦게 폭발한다.\n\n## AIMD는 collapse 대응이 빠른 단순 controller다\n\nAIMD는 TCP 혼잡 제어의 직관을 admission limit에 가져온 방식이다. 성공 구간에서는 limit을 조금씩 올리고, timeout, reject, queue age 초과, high latency 같은 overload 신호가 오면 limit을 비율로 크게 낮춘다. 장점은 단순함이다. overload가 명확하면 multiplicative decrease가 빠르게 inflight를 줄여 downstream을 쉬게 한다.\n\n하지만 AIMD는 신호 설계가 거칠면 흔들린다. 500 error가 모두 capacity overload는 아니다. 인증 실패, validation error, business conflict를 overload로 보면 limit을 잘못 낮춘다. 반대로 timeout만 overload로 보면 queue wait가 이미 사용자의 deadline을 태운 뒤 반응한다. 운영에서는 `limit`, `inflight`, `accepted`, `rejected`, `timeout`, `sample latency`, `decrease reason`을 함께 태깅해야 한다. AIMD가 sawtooth를 크게 만들면 additive step, decrease ratio, minimum limit, probe interval을 조정한다.\n\n## Gradient / latency-based limiter는 queue를 늦게 보지 않으려는 선택이다\n\nGradient limiter는 latency가 healthy baseline에서 얼마나 멀어지는지 보고 limit을 조절한다. 핵심 감각은 queue length가 쌓인 뒤가 아니라 service time이 늘기 시작하는 순간에 반응하는 것이다. 현재 sample RTT가 최소 RTT나 long-term baseline보다 빠르게 나빠지면 실제 queue가 길어지기 전에도 \"이 cap은 너무 높다\"는 신호로 볼 수 있다.\n\n이 방식은 gateway나 service mesh처럼 route별 latency를 잘 관측할 수 있고, local reply로 admission reject를 빠르게 줄 수 있을 때 효과적이다. 단점은 기준 latency가 움직인다는 점이다. cold cache, partial deploy, downstream maintenance 때문에 baseline 자체가 달라지면 controller가 capacity와 transient latency를 혼동할 수 있다. 그래서 minimum baseline window, percentile 선택, outlier filtering, traffic class 분리, warm-up bypass가 필요하다.\n\n## Queue length와 load shedding의 위치\n\nQueue length는 좋은 지표지만 좋은 유일 신호는 아니다. Queue depth 100은 task service time이 1ms인 시스템과 1초인 시스템에서 의미가 다르다. 그래서 oldest age, queue wait histogram, deadline remaining을 같이 봐야 한다. Queue가 deadline보다 오래 기다리면 그 요청은 처리해도 사용자가 이미 떠났을 가능성이 높다. 이때는 limit 조절보다 bounded queue overflow, deadline-aware drop, load shedding이 먼저다.\n\nLoad shedding은 adaptive limiter의 실패가 아니라 같은 control plane의 마지막 보호 계층이다. Limiter가 inflight를 줄여도 arrival가 계속 크면 일부 요청은 들어올 수 없다. 이때 low-priority, optional enrichment, stale-tolerant read, expensive report 같은 work를 먼저 shed하고 core write path는 살린다. Retry-After, retry budget, rejection reason을 같이 주지 않으면 caller가 즉시 재시도해 limiter 효과를 지운다.\n\n## 운영 검증 checklist\n\n1. 경계별로 `arrival`, `accepted`, `inflight`, `completed`, `rejected`를 분리한다.\n2. latency를 queue wait, service time, downstream wait로 나눠 본다.\n3. Little's Law로 fixed safety cap을 만들고 adaptive controller의 min/max를 제한한다.\n4. AIMD decrease reason과 gradient latency sample을 route, tenant, priority별로 태깅한다.\n5. Queue depth만 보지 말고 oldest age와 deadline exceeded before start를 본다.\n6. Load shedding은 priority rule, response code, Retry-After, retry budget과 함께 검증한다.\n7. 변경 전후에 p99만 보지 말고 throughput, reject rate, downstream saturation, core path success rate를 같이 비교한다.\n\n면접 답변에서는 \"fixed limit으로 기준 cap을 잡고, AIMD는 명확한 overload 신호에 단순하게 반응하며, gradient limiter는 latency 상승을 조기 감지한다. Queue length는 늦은 backlog 신호일 수 있으니 oldest age와 deadline을 같이 보고, 지속 과부하에서는 load shedding으로 core SLO를 보호한다\"라고 정리하면 된다.\n",
+  "aliases": [
+    "adaptive concurrency limit chooser",
+    "AIMD concurrency limiter",
+    "gradient latency based limiter",
+    "fixed concurrency limit comparison",
+    "queue length overload control",
+    "Little's Law limiter tuning",
+    "admission control concurrency cap",
+    "latency gradient limiter"
+  ],
+  "expected_queries": [
+    "트래픽이 계속 바뀌는 서비스에서 고정 동시성 제한과 AIMD limiter 중 무엇을 골라야 해?",
+    "latency 기반 gradient limiter는 queue length 기반 조절보다 왜 빨리 반응할 수 있어?",
+    "Little's Law로 concurrency cap을 잡은 뒤 adaptive limiter를 어떻게 운영해?",
+    "p99가 올라갈 때 limit을 낮출지 queue를 줄일지 load shedding을 켤지 판단 기준은 뭐야?",
+    "AIMD와 gradient 방식의 concurrency limiter 장단점을 비교해줘",
+    "admission control에서 fixed limit이 위험해지는 증거는 어떤 metric으로 봐?",
+    "adaptive concurrency limiter가 rate limiter나 circuit breaker와 다른 점은 뭐야?"
+  ],
+  "symptoms": [
+    "고정 동시성 limit을 올리면 throughput은 잠깐 늘지만 p99가 무너진다",
+    "queue length만 보고 limit을 조절해도 이미 timeout이 폭발한 뒤에 반응한다",
+    "AIMD와 gradient limiter를 모두 adaptive라고 부르지만 어떤 신호가 다른지 설명하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/littles-law-capacity-planning-primer",
+      "system-design/overload-control-admission-queue-load-shedding-router"
+    ],
+    "next_docs": [
+      "network/adaptive-concurrency-limiter-latency-signal-gateway-mesh",
+      "network/retry-storm-containment-concurrency-limiter-load-shedding",
+      "system-design/brownout-load-shedding-graceful-degradation-playbook"
+    ],
+    "confusable_with": [
+      "system-design/rate-limit-vs-queue-load-shedding-chooser",
+      "system-design/backpressure-vs-load-shedding-vs-rate-limit-interview-chooser",
+      "network/adaptive-concurrency-limiter-latency-signal-gateway-mesh",
+      "data-structure/bounded-queue-overflow-policy-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/adaptive-concurrency-limit-aimd-gradient-chooser.md",
+    "revision_history": []
+  }
+}

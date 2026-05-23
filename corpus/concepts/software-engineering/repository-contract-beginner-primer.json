@@ -1,0 +1,45 @@
+{
+  "id": "software-engineering/repository-contract-beginner-primer",
+  "title": "Repository Contract Beginner Primer",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "이 문서는 Repository contract를 처음 설명하는 primer다. SQL을 숨긴다, 저장소 인터페이스 책임, DAO와 Repository 차이, Service가 DB 구조를 너무 많이 안다 같은 표현을 매핑한다.",
+  "body_markdown": "# Repository Contract Beginner Primer\n\n## 한 줄 요약\n\nRepository contract는 \"도메인/유스케이스가 저장소에 기대하는 행동\"을 약속한다. 내부가 JDBC인지 JPA인지, SQL이 어떤 모양인지는 contract 밖의 구현 세부다.\n\n## 10초 chooser\n\n| 고민 | contract에 드러낼 것 | 숨길 것 |\n|---|---|---|\n| 예약 시간이 비었는지 확인 | `existsByDateAndTimeId(...)` 같은 조회 의도 | join, index, deleted flag 세부 |\n| aggregate 저장 | `save(reservation)` | insert/update 분기 방식, ORM flush timing |\n| 식별자로 찾기 | `findById(ReservationId)` / `findByMemberId(...)` | PK column name, fetch strategy |\n| 주문 목록 화면 조회 | read model/query 전용 repository 가능 | write domain aggregate 규칙 |\n| unique 제약 확인 | 존재 여부 contract + DB constraint | SQL 예외 메시지 그대로 Service에 노출 |\n\n## 경계 판단 기준\n\nRepository interface는 Service가 저장소에 기대하는 행동을 말한다. 구현은 SQL, JDBC, JPA, in-memory fake 중 무엇이어도 같은 contract를 만족해야 한다.\n\n좋은 contract는 table 구조보다 도메인/유스케이스 언어에 가깝다. `findReservationsByMember(memberId)`는 Service가 이해할 수 있지만, `selectRsvByMbrIdAndDelYnOrderByRegDt`는 DB 구현이 Service 언어로 새어 나온다.\n\n복잡한 검색 화면처럼 조회 조건 자체가 화면 요구사항이면 write Repository에 억지로 넣지 않는다. query repository, read model, projection으로 분리하면 \"상태 변경용 저장소 계약\"과 \"화면 조회 최적화\"가 섞이지 않는다.\n\n## contract가 약속하는 것\n\nRepository contract는 \"SQL을 숨긴다\"보다 좁고 구체적인 약속이다.\n\n| 약속 | 예시 | 왜 중요한가 |\n|---|---|---|\n| 저장 대상 | `Reservation`을 저장한다 | Service가 row가 아니라 domain 대상으로 말한다 |\n| 조회 의미 | 특정 회원의 예약 목록을 찾는다 | table/join보다 use case 질문이 먼저 보인다 |\n| 실패 의미 | 없으면 `Optional.empty()` 또는 domain exception으로 처리한다 | SQL exception message가 application contract가 되지 않는다 |\n| 일관성 기대 | 중복 확인 후 저장은 같은 transaction에서 실행된다 | Service가 race condition과 rollback 범위를 판단할 수 있다 |\n| 대체 가능성 | fake와 실제 구현이 같은 행동을 보인다 | 테스트가 구현 우연에 묶이지 않는다 |\n\n반대로 contract에 굳이 약속하지 않아도 되는 것이 있다.\n\n- 어떤 index를 타는지\n- fetch join을 쓰는지 lazy loading을 쓰는지\n- `deleted=false`를 어떤 컬럼으로 표현하는지\n- insert와 update를 어떤 SQL로 나누는지\n- Spring Data query method 이름이 내부에서 얼마나 긴지\n\n이 세부가 Service 표면으로 올라오면 contract가 아니라 구현 설명서가 된다.\n\n## before / after로 보기\n\n### before: Service가 DB 모양을 안다\n\n```java\nif (reservationDao.countByReservationDateAndTimeIdAndDeletedYn(date, timeId, \"N\") > 0) {\n    throw new DuplicateReservationException();\n}\nreservationDao.insertReservationRow(memberId, themeId, timeId, date);\n```\n\n이름만 봐도 Service가 row, deleted flag, insert 같은 저장 기술 언어를 읽고 있다. SQL을 바꾸면 use case 코드도 같이 흔들리기 쉽다.\n\n### after: Repository가 use case 질문을 받는다\n\n```java\nif (reservationRepository.existsByDateAndTimeId(date, timeId)) {\n    throw new DuplicateReservationException();\n}\nreservationRepository.save(reservation);\n```\n\n이제 Service가 읽는 문장은 \"이 시간에 예약이 있는가\"와 \"예약을 저장한다\"다. `deleted=false`, unique index, JPA flush는 repository 구현과 DB constraint에서 처리한다.\n\n## Repository, DAO, Query Repository 구분\n\n세 이름은 모두 저장소 근처에 있지만 드러내는 언어가 다르다.\n\n| 이름 | 중심 언어 | 어울리는 예 |\n|---|---|---|\n| Domain Repository | 유스케이스/domain 저장 계약 | `ReservationRepository.save`, `findById`, `existsByDateAndTimeId` |\n| DAO | table/SQL 접근 도구 | `insertReservationRow`, `selectReservationRowsByDate` |\n| Query Repository / Read Model | 조회 API와 화면 요구 | `ReservationAdminQueryRepository.findRows(condition)` |\n\nDAO가 나쁘다는 뜻이 아니다. DAO는 adapter 내부에서 SQL을 명확히 표현할 때 유용하다. 문제는 DAO 말투가 Service가 의존하는 Repository contract로 그대로 올라오는 경우다.\n\n조회 조건이 많은 admin 목록 API도 마찬가지다. `ReservationRepository`에 `findByDateBetweenAndThemeIdAndMemberNameContainingOrderByStartAtDesc(...)`를 계속 붙이기보다, 조회 전용 `ReservationAdminQueryRepository`나 `ReservationAdminRowView`로 분리하면 write domain contract를 지킬 수 있다.\n\n## 코드 리뷰 냄새\n\nService가 테이블명, 조인 조건, 정렬 기준을 자세히 알고 있으면 저장소 구현이 바뀔 때 Service까지 흔들린다. Repository 이름이 전부 SQL where clause처럼 늘어지는 것도 경고 신호다.\n\n- Service가 `jdbcTemplate`이나 `EntityManager`를 직접 사용한다.\n- Repository 메서드명이 컬럼명, 삭제 플래그, 정렬 구현을 길게 노출한다.\n- Repository가 할인, 예약 가능, 우승자 계산 같은 도메인 결정을 한다.\n- fake repository와 실제 repository가 서로 다른 contract를 갖는다.\n- 테스트가 SQL 문자열에만 붙고 Service가 기대하는 저장소 행동을 검증하지 못한다.\n- Repository가 `Response DTO`나 controller 전용 view를 반환한다.\n- Repository 구현의 `NoResultException`, SQLState, constraint name이 Service 분기 조건이 된다.\n- write repository가 admin 검색/통계/projection 요구까지 모두 떠안는다.\n- `findAll()`을 열어 두고 Service가 stream/filter/sort로 DB 역할을 대신한다.\n\n## fake와 contract test\n\n초보자는 fake repository를 만들면 contract가 생겼다고 생각하기 쉽다. 실제로 중요한 것은 fake와 real이 같은 약속을 지키는지다.\n\n예를 들어 `existsByDateAndTimeId(date, timeId)` contract가 \"취소되지 않은 예약만 센다\"는 의미라면, in-memory fake도 취소 예약을 제외해야 한다. fake가 단순히 모든 예약을 세면 Service test는 초록이어도 실제 DB 구현과 다른 세계를 검증한다.\n\n간단한 contract test는 이런 질문을 확인한다.\n\n- 저장한 객체를 같은 id로 다시 찾을 수 있는가?\n- 없는 id는 어떤 방식으로 표현하는가?\n- 중복/unique 조건은 fake와 real에서 같은 의미인가?\n- 삭제/취소/비활성 상태를 조회 contract가 어떻게 다루는가?\n- 정렬이 contract인지, 구현 우연인지 명시되어 있는가?\n\n## 미션 예시\n\n예약 미션에서 Service가 필요한 질문은 \"이 시간에 이미 예약이 있는가\"이지 \"reservation table에서 date와 time_id가 같고 deleted=false인 행이 있는가\"가 아니다. interface는 `existsByDateAndTimeId(date, timeId)` 정도로 말하고, `deleted=false`나 index 선택은 구현으로 숨길 수 있다.\n\n장바구니 미션에서 Service가 필요한 질문은 \"이 회원의 장바구니에 이 상품이 이미 있는가\"와 \"항목을 저장한다\"다. Repository contract는 `findByMemberIdAndProductId(memberId, productId)`처럼 유스케이스 언어로 말할 수 있다. 반면 상품명, 가격, 재고를 함께 뿌리는 목록 화면은 query repository가 더 자연스러울 수 있다.\n\n로또 미션처럼 DB가 없는 단계에서는 Repository가 필요 없을 수 있다. 저장소가 없는 문제에 관성적으로 Repository를 만들면 contract가 아니라 계층 이름만 늘어난다.\n\n## 흔한 오해\n\nRepository가 모든 쿼리를 아름답게 숨겨야 한다는 뜻은 아니다. 검색 조건이 많고 화면 전용 정렬이 필요한 API는 query repository로 명시적으로 분리하는 편이 더 솔직하다.\n\nRepository가 도메인 객체를 반환한다고 해서 도메인 규칙의 주인이 되는 것도 아니다. Repository는 저장된 객체를 찾아오고 저장할 뿐, \"이 예약을 받을 수 있는가\" 같은 결정은 Service와 Domain 협력으로 판단한다.\n\nJPA Repository 메서드명이 길어지는 것 자체가 항상 나쁜 것은 아니다. 문제는 그 이름이 application layer의 언어가 되어 Service까지 DB 구조에 묶이는 경우다.\n\nRepository interface를 두면 무조건 기술 교체가 쉬워지는 것도 아니다. contract가 JPA entity, lazy loading, transaction side effect를 그대로 노출하면 JDBC로 바꿔도 Service는 여전히 JPA식 사고에 묶여 있다.\n\n## 빠른 점검 질문\n\n- Service 코드가 DB table/column 이름 없이 읽히는가?\n- Repository method 이름이 \"무엇을 원하는가\"를 말하는가, \"어떻게 조회하는가\"를 말하는가?\n- fake repository와 실제 repository가 같은 edge case를 처리하는가?\n- 화면 목록/검색 요구가 write domain repository를 비대하게 만들고 있지 않은가?\n- DB constraint violation을 application 의미로 번역하는 위치가 분명한가?\n\n## Safe Next Docs\n\nDAO와 Repository 차이가 계속 헷갈리면 `software-engineering/repository-dao-entity`로 간다. contract가 과하게 새는 사례를 더 보려면 `design-pattern/repository-pattern-vs-antipattern`이 안전한 다음 문서다.\n",
+  "aliases": [
+    "repository contract beginner",
+    "persistence boundary repository",
+    "리포지토리 계약",
+    "저장소 인터페이스 책임"
+  ],
+  "expected_queries": [
+    "Repository contract는 뭘 약속해야 해?",
+    "Repository가 SQL을 숨긴다는 게 무슨 뜻이야?",
+    "DAO랑 다르게 Repository를 설계하려면 뭘 봐야 해?"
+  ],
+  "symptoms": [
+    "Repository 메서드 이름이 SQL 조건을 그대로 말해요",
+    "Service가 DB 테이블 구조를 너무 많이 알아요",
+    "테스트에서 저장소 구현을 바꾸기 어려워요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/controller-service-repository-boundary-primer"
+    ],
+    "next_docs": [
+      "software-engineering/repository-dao-entity"
+    ],
+    "confusable_with": [
+      "software-engineering/repository-dao-entity",
+      "design-pattern/repository-pattern-vs-antipattern"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/repository-contract-beginner-primer.md",
+    "revision_history": []
+  }
+}

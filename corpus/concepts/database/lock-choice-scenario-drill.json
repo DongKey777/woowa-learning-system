@@ -1,0 +1,44 @@
+{
+  "id": "database/lock-choice-scenario-drill",
+  "title": "Lock Choice Scenario Drill",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 drill은 재고 차감/중복 예약 같은 시나리오에서 optimistic lock, pessimistic lock, atomic update를 고르는 연습이다. 충돌 빈도와 UX 약점 신호를 다룬다.",
+  "body_markdown": "# Lock Choice Scenario Drill\n\n## 질문\n\n재고가 1개 남았고 동시에 두 사용자가 구매한다. `UPDATE item SET stock = stock - 1 WHERE id = ? AND stock > 0` 후 affected row를 확인하는 방식은 어떤 장점이 있을까?\n\n## 기대 답변 축\n\n- 읽고 판단하고 쓰는 race를 줄인다고 말한다.\n- DB가 조건부 update를 원자적으로 처리한다.\n- affected row가 0이면 품절/충돌 응답으로 매핑해야 한다.\n- 충돌 빈도, 대기 시간, 재시도 UX에 따라 optimistic lock, pessimistic lock, atomic update를 고른다고 말한다.\n- 조건부 update도 비즈니스 전체를 자동 보장하는 것이 아니라, 해당 row와 predicate에 대한 write invariant를 좁게 지키는 방식이라고 설명한다.\n\n## Invariant\n\n- 재고는 0 미만이 되면 안 된다는 invariant를 SQL predicate `stock > 0`와 affected row 확인으로 표현한다.\n- 성공 조건과 상태 변경은 같은 statement 또는 같은 transaction 경계 안에 있어야 한다.\n- optimistic lock은 version mismatch를 실패로 감지하고 retry/reject 정책이 있어야 완성된다.\n- pessimistic lock은 경쟁 구간을 직렬화하지만 lock 대기, deadlock, timeout 비용을 만든다.\n- atomic update는 단일 row/단순 predicate에 강하지만, 여러 row를 묶는 invariant는 추가 constraint나 transaction 설계가 필요하다.\n\n## 보장 범위와 DB별 caveat\n\n| 선택지 | 보장하는 것 | 보장하지 않는 것 | DB별 caveat |\n|---|---|---|---|\n| Atomic conditional update | 한 statement 안에서 predicate 확인과 write를 함께 처리한다. affected row로 성공/실패를 판정할 수 있다 | 여러 row 합계, 시간 구간 overlap, 외부 결제 중복을 자동으로 막지 않는다 | 대부분 DB에서 단일 row 재고 차감에는 강하지만, predicate가 index/constraint로 표현되지 않으면 범위 invariant는 별도 설계가 필요하다 |\n| Optimistic lock/version CAS | 내가 읽은 version이 아직 최신인지 update count로 감지한다 | 충돌을 예방하지 않는다. 실패 후 UX, retry budget, idempotency가 없으면 미완성이다 | JPA `@Version`, SQL `WHERE version=?` 모두 update count/exception 처리와 재조회가 핵심이다 |\n| Pessimistic lock/locking read | 읽은 row를 기반으로 이어지는 write 경쟁을 줄이거나 직렬화한다 | 아직 존재하지 않는 row, logical predicate 전체, 외부 side effect를 자동 보호하지 않는다 | MySQL InnoDB는 unique lookup과 range scan의 lock 범위가 다르고 `READ COMMITTED`에서는 gap 보호가 약하다. PostgreSQL `FOR UPDATE`는 기본적으로 존재 tuple을 잠그며 absence/range invariant는 unique/exclusion/serializable 같은 별도 장치가 필요하다 |\n| Unique/exclusion/guard constraint | DB가 commit 경계에서 invariant 위반을 거부한다 | 사용자 친화적 실패 응답과 retry 흐름은 자동으로 생기지 않는다 | PostgreSQL exclusion constraint, MySQL unique/slotization/guard row처럼 제품별 모델링 선택지가 다르다 |\n\n## Evidence로 확인할 것\n\n- affected row evidence: 조건부 update 결과가 `1`이면 성공, `0`이면 품절/충돌로 매핑되는가.\n- constraint evidence: 중복 예약, idempotency key, cart item identity처럼 최종 방어선이 DB constraint로 표현되는가.\n- plan evidence: locking read/conditional update의 predicate가 어떤 index path를 타는가.\n- contention evidence: lock wait, deadlock, optimistic conflict rate, retry success rate, p95/p99 지연.\n- side-effect evidence: 결제 승인, 주문 생성, 메시지 발행이 성공 판정 이후 idempotent하게 이어지는가.\n\n## 작은 시나리오\n\n재고 1개에 두 transaction이 동시에 도착한다.\n\n```sql\nUPDATE item\nSET stock = stock - 1\nWHERE id = 10\n  AND stock > 0;\n```\n\n- T1의 affected row가 `1`이면 재고 차감 성공이다.\n- T2는 같은 statement를 실행해도 이미 stock이 0이면 affected row가 `0`이다.\n- 애플리케이션은 `0`을 \"DB 오류\"가 아니라 \"품절/충돌\"이라는 도메인 실패로 번역해야 한다.\n\n이 방식의 핵심은 `SELECT stock`과 `UPDATE stock` 사이의 판단 틈을 줄이는 것이다. 하지만 \"주문 row 생성 + 결제 승인 + 재고 차감\" 전체가 섞이면 단일 update만으로는 부족하다. 결제 idempotency, 주문 상태 전이, 실패 보상이 별도로 필요하다.\n\n## 실패 반례\n\n- `SELECT stock`으로 1을 읽은 뒤 애플리케이션에서 판단하고 `UPDATE stock = 0`을 하면 두 요청이 모두 성공했다고 착각할 수 있다.\n- 조건부 update를 했지만 affected row를 보지 않으면 품절 실패를 성공 응답으로 바꿀 수 있다.\n- `SELECT ... FOR UPDATE`를 넓은 범위나 인덱스 없는 조건에 붙이면 필요 이상으로 많은 row/range가 잠길 수 있다.\n- optimistic lock 실패 후 무조건 즉시 retry하면 hot item에서 retry storm이 생길 수 있다.\n- lock을 잡은 transaction 안에서 외부 API 호출이나 긴 계산을 하면 대기 시간이 길어지고 deadlock 가능성이 커진다.\n- 중복 예약 방지는 lock만으로 설명하지 말고 unique constraint나 idempotency key 같은 최종 방어선을 함께 봐야 한다.\n\n## 선택 기준\n\n- 충돌이 드물고 사용자에게 재시도 안내가 가능하면 optimistic lock이 단순하다.\n- 충돌이 잦고 실패보다 대기가 낫고 critical section이 짧으면 pessimistic lock을 고려한다.\n- \"재고가 있으면 하나 줄인다\"처럼 조건과 변경이 한 row에 모이면 atomic update가 실용적이다.\n- 여러 row 합계, 좌석 인접성, 쿠폰 중복 사용처럼 predicate가 복합이면 constraint, isolation level, locking 범위를 같이 설계한다.\n\n## wrong-bucket / 오선택\n\n| wrong-bucket | 왜 위험한가 | 더 나은 판단 |\n|---|---|---|\n| \"모든 동시성 문제에는 `SELECT ... FOR UPDATE`\" | 불필요한 대기, deadlock, 넓은 range lock을 만들 수 있다 | 충돌 빈도, critical section 길이, predicate/index 폭을 먼저 본다 |\n| \"Atomic update면 모든 예약 문제가 끝난다\" | 단일 row 조건에는 강하지만 overlap/range/set invariant는 새기 쉽다 | slot row, guard row, exclusion/unique constraint, serializable retry를 같이 검토한다 |\n| \"Optimistic lock은 실패하면 그냥 무한 retry\" | hot key에서 retry storm과 tail latency를 만든다 | retry budget, backoff, 사용자 실패 응답을 설계한다 |\n| \"affected row 0은 예외 상황\" | 정상적인 품절/충돌 결과일 수 있다 | domain failure로 매핑하고 side effect를 중복시키지 않는다 |\n| \"락을 잡았으니 외부 API를 안에서 호출해도 된다\" | lock 보유 시간이 길어져 대기와 deadlock surface가 커진다 | DB critical section과 외부 side effect를 분리한다 |\n\n## 검증 질문\n\n1. 동시에 N개 요청을 보냈을 때 성공 수가 재고/좌석 수를 넘지 않는가?\n2. affected row 0, duplicate key, optimistic conflict, lock timeout, deadlock을 각각 어떤 응답으로 번역하는가?\n3. locking read나 update predicate가 intended index를 타는지 EXPLAIN으로 확인했는가?\n4. MySQL/PostgreSQL의 isolation level과 locking read semantics 차이를 전제로 테스트했는가?\n5. retry가 idempotent한가, 결제/주문/메시지 side effect가 중복되지 않는가?\n6. 여러 row 합계나 overlap invariant라면 단일 row update로 충분하다는 증거가 있는가?\n\n## 검증 포인트\n\n- 동시에 2개 요청을 보내도 성공 수가 재고 수를 넘지 않는지 테스트한다.\n- affected row 0을 도메인 실패로 매핑하는 코드 경로가 있는지 확인한다.\n- deadlock/serialization failure가 발생했을 때 retry 가능한 작업과 불가능한 작업을 구분했는지 확인한다.\n- lock 대상 predicate에 적절한 index가 있는지 실행 계획으로 확인한다.\n- 실패 응답, retry, idempotency가 사용자 경험과 결제/주문 side effect를 중복시키지 않는지 확인한다.\n\n## 약점 태그\n\n`atomic-update`, `inventory-race`, `lock-choice`\n\n## 복습 연결 concept\n\n`database/optimistic-vs-pessimistic-lock-mission-chooser`\n",
+  "aliases": [
+    "lock choice scenario drill",
+    "optimistic pessimistic atomic update practice",
+    "락 선택 시나리오 drill",
+    "낙관적 비관적 락 연습"
+  ],
+  "expected_queries": [
+    "재고 차감에서 optimistic pessimistic lock 선택 drill을 풀고 싶어",
+    "atomic update와 select for update를 비교하는 문제를 줘",
+    "충돌이 잦은 시나리오에서 어떤 lock을 고를지 연습해줘"
+  ],
+  "symptoms": [
+    "모든 동시성 문제에 select for update를 붙여요",
+    "optimistic lock 실패 후 UX를 정하지 않아요",
+    "atomic update 결과 row count 확인을 놓쳐요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/optimistic-vs-pessimistic-lock-mission-chooser"
+    ],
+    "next_docs": [
+      "database/transaction-case-studies"
+    ],
+    "confusable_with": [
+      "database/optimistic-vs-pessimistic-lock-mission-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/lock-choice-scenario-drill.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "software-engineering/shopping-cart-price-snapshot-review-drill",
+  "title": "Shopping Cart Price Snapshot Review Drill",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "이 drill은 shopping-cart checkout 가격 재검증, order item price snapshot, 결제 직후 read-after-write evidence를 함께 묻는 review drill이다.",
+  "body_markdown": "# Shopping Cart Price Snapshot Review Drill\n\n## 미션 장면\n\nShopping-cart 미션에서 사용자가 장바구니를 보고 checkout을 눌렀다. 그 사이 운영자가 상품 가격을 바꾸거나 쿠폰 정책이 바뀔 수 있고, 결제 승인 뒤에는 주문 상세 화면으로 바로 이동할 수 있다. 이 드릴은 세 값을 분리하는 연습이다.\n\n- 상품 페이지의 현재 가격(current product price)\n- 장바구니 화면에서 사용자가 방금 본 예상 총액(cart estimate)\n- 주문/결제에서 확정한 거래 금액(order item price snapshot, payment amount)\n\n주문 상세 화면은 과거 거래 기록이고, 상품 페이지는 다음 구매를 위한 현재 상태다. Checkout은 그 둘 사이에서 현재 상품 정보와 정책을 다시 읽어 최종 금액을 만들고, 그 값을 주문 항목 snapshot과 결제 요청 금액의 공통 source of truth로 고정해야 한다.\n\n## 리뷰 냄새\n\n리뷰 냄새는 주문 상세가 `Product.price`를 join해서 보여주는 구조다. 가격 변경 후 과거 주문 금액이 바뀌어 보이면 결제 정합성과 감사 기록이 깨진다. 반대로 cart에 저장된 예전 가격만 믿고 checkout을 끝내면 주문 직전 가격 변경, 판매 중지, 할인 정책 변경을 반영하지 못한다.\n\n더 깊은 냄새는 저장 순서와 조회 경로가 섞이는 것이다. `order_item.unit_price`를 저장하기 전에 PG 승인을 요청하거나, 주문 snapshot과 payment ledger를 다른 기준 금액으로 만들거나, commit 직후 confirmation 화면이 replica/cache를 읽으면 \"결제는 성공했는데 주문 상세 금액이 다르다\"는 증상이 난다. 그래서 리뷰에서는 가격 필드 하나보다 checkout transaction 안에서 무엇을 읽고, 무엇을 쓰고, 첫 조회가 무엇을 읽는지까지 본다.\n\n## 질문\n\n다음 상황을 보고 답해 보자.\n\n1. 사용자가 cart 화면에서 A 상품 2개, 예상 총액 20,000원을 봤다.\n2. Checkout 직전에 A 상품 단가가 12,000원으로 바뀌었다.\n3. 서버가 결제를 승인하고 order row와 order item row를 저장했다.\n4. 이후 운영자가 A 상품 단가를 15,000원으로 다시 바꿨다.\n\n질문:\n\n- 주문 상세 화면은 `Product.currentPrice`를 다시 읽어야 할까, `OrderItem.unitPriceSnapshot`을 읽어야 할까?\n- Checkout 직전에는 cart에 담긴 예전 금액을 믿어도 될까, 서버가 현재 상품/할인/재고 상태를 다시 검증해야 할까?\n- 결제 승인, order snapshot 저장, cart 비우기, confirmation 조회는 어떤 transaction/read-after-write 증거로 확인해야 할까?\n\n## 기대 답변 축\n\n좋은 답은 네 축을 모두 포함한다.\n\n1. **확정 후 조회 축**: 주문 상세는 거래 기록이므로 `order_item.unit_price_snapshot`, `quantity`, `discount_snapshot`, `line_total_snapshot`처럼 주문 시점에 고정한 값을 읽는다. `Product.currentPrice`는 다음 구매나 상품 페이지의 기준이지 과거 결제 금액의 source of truth가 아니다.\n2. **확정 전 재검증 축**: cart 화면 총액은 estimate다. Checkout service는 서버에서 현재 상품 가격, 판매 가능 상태, 수량, 쿠폰/할인 정책을 다시 계산하고, 사용자가 본 금액과 달라졌다면 재확인 또는 실패 응답을 선택해야 한다. \"snapshot을 저장한다\"는 말만으로는 checkout 직전 stale cart 문제를 막지 못한다.\n3. **트랜잭션 축**: 최종 계산 금액, order/order_item snapshot, payment request amount, payment ledger의 approved amount가 같은 기준에서 만들어져야 한다. 가능한 한 checkout 유스케이스의 원자적 경계 안에서 order snapshot을 먼저 확정하거나, 외부 PG 호출 때문에 경계가 나뉜다면 `PENDING -> PAID/FAILED` 상태와 idempotency key로 중복/부분 실패를 복구할 수 있어야 한다.\n4. **Read-after-write 축**: 결제 성공 직후 confirmation 화면은 방금 commit한 order snapshot을 읽어야 한다. 첫 조회가 replica/cache/projection을 타서 stale이면 primary read, recent-write routing, session pinning, 처리 중 상태 같은 완화가 필요하다. 이 문제는 snapshot 설계와 별개로 \"방금 쓴 주문을 바로 읽는가\"의 증거를 본다.\n\n한 문장으로 줄이면, checkout은 현재 정책으로 최종 금액을 다시 계산해 거래 snapshot으로 고정하고, 주문 조회/결제 확인은 그 snapshot과 ledger를 같은 거래 사실로 읽어야 한다.\n\n## 증거로 확인할 것\n\n리뷰에서 답을 코드로 확인할 때는 다음 증거를 찾는다.\n\n- `OrderItem` 또는 주문 금액 테이블에 `unitPriceSnapshot`, `productNameSnapshot`, `discountSnapshot`, `lineTotal`처럼 과거 거래를 재현할 필드가 있는가.\n- 주문 상세 query/DTO가 `Product.price`를 금액 source로 join하지 않고 order snapshot 필드를 읽는가. 상품명 링크나 현재 판매 상태 표시를 위해 product를 보조로 읽는 것은 별도다.\n- Checkout command handler/service가 cart row의 저장 금액만 복사하지 않고 현재 상품 가격, 판매 가능 여부, 수량 제한, 쿠폰 정책을 서버에서 다시 평가하는가.\n- 최종 계산 결과가 order snapshot, payment request amount, payment ledger/receipt amount에 같은 값으로 전달되는가. 서로 다른 메서드에서 각자 총액을 재계산하면 rounding, 할인 순서, 동시 가격 변경으로 어긋날 수 있다.\n- 주문 생성과 item snapshot 저장, cart 비우기, 상태 전이가 transaction 경계와 실패 복구 정책으로 설명되는가. 외부 결제 호출이 끼면 한 DB transaction으로 모두 묶을 수 없으므로 idempotency key, 상태 전이, 보상/재시도 로그가 필요하다.\n- 결제 성공 redirect 직후 `GET /orders/{id}`가 방금 commit된 snapshot을 읽는 경로인가. replica/cache/projection이면 read-after-write 보장 또는 \"처리 중\" UX가 있는가.\n\n## 약한 답변 패턴\n\n아래 답은 부분적으로 맞지만 리뷰 드릴에서는 보완이 필요하다.\n\n| 약한 답 | 빠진 축 | 보완 질문 |\n|---|---|---|\n| \"주문은 snapshot을 저장하면 돼요.\" | checkout 재검증 | \"그 snapshot은 cart에 있던 오래된 금액인가, 서버가 현재 정책으로 다시 계산한 금액인가?\" |\n| \"현재 상품 가격을 읽으면 안 돼요.\" | 읽기 목적 구분 | \"상품 페이지/다음 구매 가격을 보여줄 때도 현재 가격을 읽으면 안 되는가?\" |\n| \"결제 금액은 PG가 알려줘요.\" | source of truth | \"PG 승인 금액은 서버가 요청한 최종 금액과 order snapshot이 일치하는지 검증했는가?\" |\n| \"트랜잭션으로 묶으면 돼요.\" | 외부 결제 경계 | \"DB transaction 밖의 PG 호출, webhook 재시도, 중복 checkout은 어떤 상태/idempotency로 복구하는가?\" |\n| \"저장했는데 바로 안 보이면 새로고침하면 돼요.\" | read-after-write | \"첫 confirmation 화면이 replica/cache를 읽는지, primary/recent-write로 보호해야 하는지 확인했는가?\" |\n\n## 흔한 실수와 복습 연결\n\n흔한 실수는 snapshot을 보존한다는 말만 하고 checkout 재검증(revalidation)을 빼먹는 것이다. 또 현재 가격을 읽는 모든 코드를 나쁘다고 말하는 것도 부정확하다. 현재 가격은 상품 페이지와 다음 구매에는 맞고, 과거 주문 상세의 금액 source로 쓰면 틀린다.\n\n답이 약하면 아래로 연결한다.\n\n- 가격 snapshot 정책 자체가 약하면 `software-engineering/shopping-cart-price-snapshot-policy-bridge`\n- checkout 직전 총액 재검증과 source of truth가 약하면 `software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge`\n- 결제 성공 뒤 주문 상세/ledger/read path가 약하면 `system-design/shopping-cart-price-snapshot-read-after-payment-bridge`\n- \"저장했는데 바로 안 보임\"을 transaction commit과 직후 조회로 설명하지 못하면 `database/shopping-cart-order-complete-read-your-writes-bridge`\n\n약점 태그는 `price-snapshot`, `source-of-truth`, `checkout-revalidation`, `transaction-boundary`, `read-after-write`, `order-history`다.\n",
+  "aliases": [
+    "shopping cart price snapshot drill",
+    "쇼핑카트 가격 스냅샷 드릴",
+    "order item price review drill",
+    "결제 금액 source of truth 복습",
+    "checkout price revalidation drill",
+    "주문 상세 현재 가격 조인 리뷰 드릴"
+  ],
+  "expected_queries": [
+    "shopping-cart 가격 snapshot 드릴 내줘",
+    "주문 금액을 현재 상품 가격으로 읽으면 왜 문제인지 복습하고 싶어",
+    "결제 가격 source of truth 질문 풀어볼래",
+    "checkout 직전에 가격을 다시 검증해야 하는지 드릴로 확인하고 싶어",
+    "결제 후 주문 상세가 다른 금액을 보여주는 리뷰 질문 풀어줘"
+  ],
+  "symptoms": [
+    "과거 주문 금액이 상품 가격 변경에 따라 바뀝니다",
+    "cart total과 payment amount가 다릅니다",
+    "order item에 unit price snapshot이 없습니다",
+    "checkout 중 가격 변경이 반영되지 않습니다",
+    "결제 성공 직후 주문 상세가 방금 확정한 금액을 못 읽습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/shopping-cart-price-snapshot-policy-bridge",
+      "software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge"
+    ],
+    "next_docs": [
+      "system-design/shopping-cart-price-snapshot-read-after-payment-bridge",
+      "software-engineering/shopping-cart-order-snapshot-from-cart-bridge",
+      "database/shopping-cart-order-complete-read-your-writes-bridge"
+    ],
+    "confusable_with": [
+      "software-engineering/shopping-cart-price-snapshot-policy-bridge",
+      "software-engineering/shopping-cart-checkout-total-revalidation-source-of-truth-bridge",
+      "system-design/shopping-cart-price-snapshot-read-after-payment-bridge",
+      "database/shopping-cart-order-complete-read-your-writes-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/shopping-cart-price-snapshot-review-drill.md",
+    "revision_history": []
+  }
+}

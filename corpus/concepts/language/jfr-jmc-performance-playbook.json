@@ -1,0 +1,60 @@
+{
+  "id": "language/jfr-jmc-performance-playbook",
+  "title": "JFR and JMC Performance Playbook",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 Java 운영 환경에서 지연 급등이나 병목 조짐이 보일 때 JFR로",
+  "body_markdown": "# JFR and JMC Performance Playbook\n\n> 한 줄 요약: JFR은 JVM 내부에서 무슨 일이 일어나는지 기록하는 장치이고, JMC는 그 기록을 읽어 병목을 찾는 도구다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JVM, GC, JMM](./jvm-gc-jmm-overview.md)\n> - [G1 GC vs ZGC](./g1-vs-zgc.md)\n> - [Reflection 비용과 대안](./reflection-cost-and-alternatives.md)\n> - [`LockSupport.park`/`unpark` Permit Semantics and Coordination Pitfalls](./locksupport-park-unpark-permit-semantics.md)\n> - [Virtual Threads(Project Loom)](./virtual-threads-project-loom.md)\n> - [OOM Heap Dump Playbook](./oom-heap-dump-playbook.md)\n\n> retrieval-anchor-keywords: JFR, JMC, Java Flight Recorder, Mission Control, lock contention, allocation rate, thread parking, park, blocker, socket read, GC pause, profiling, runtime event\n\n## 핵심 개념\n\nJFR(Java Flight Recorder)은 JVM 이벤트를 저비용으로 기록하는 기능이다.  \nJMC(Java Mission Control)는 그 기록을 분석하는 GUI 도구다.\n\n이 조합이 중요한 이유는 성능 문제의 대부분이 \"느리다\"가 아니라 다음 중 하나이기 때문이다.\n\n- GC pause\n- lock contention\n- allocation burst\n- thread scheduling\n- I/O 대기\n- class loading\n\nJFR은 이런 현상을 시간 축으로 남기고, JMC는 그 패턴을 읽어 병목을 좁힌다.\n\n## 깊이 들어가기\n\n### 1. JFR이 좋은 이유\n\n프로파일러는 많이 있지만 JFR은 운영 친화적이다.\n\n| 항목 | 의미 |\n|---|---|\n| 저오버헤드 | 상시 켜도 되는 수준으로 설계됨 |\n| 이벤트 기반 | GC, lock, allocation, thread, socket 등을 기록 |\n| 시간 축 | \"언제\" 느려졌는지 본다 |\n| JVM 내부 | 애플리케이션 코드만이 아니라 런타임도 본다 |\n\n### 2. JMC로 보는 것\n\nJMC에서는 보통 다음을 본다.\n\n- latency spike 구간\n- allocation rate\n- thread dump와 lock graph\n- GC pause와 heap pressure\n- hot methods\n\n### 3. 어디서 시작하나\n\n운영 환경에서 시작은 보통 간단하다.\n\n```bash\njcmd <pid> JFR.start name=profile settings=profile duration=5m filename=/tmp/app.jfr\n```\n\n그 다음 JMC에서 열어 본다.\n\n성능 문제는 \"코드만\" 보지 말고, JFR로 JVM 레벨 증상을 먼저 잡는 편이 빠르다.\n\n## 실전 시나리오\n\n### 시나리오 1: p99가 튀는데 CPU는 한가하다\n\n이 경우는 흔히 다음 중 하나다.\n\n- GC pause\n- lock contention\n- socket wait\n- thread parking\n\nJFR의 장점은 이들을 분리해서 보여준다는 점이다.\n\n### 시나리오 2: 배포 후만 느려진다\n\n이때는 warmup, class loading, JIT deopt, cache miss가 얽혀 있을 수 있다.  \nJFR은 \"배포 직후와 안정화 후\"를 비교하는 데 유용하다.\n\n### 시나리오 3: Virtual Threads를 넣고도 병목이 그대로다\n\n스레드 모델이 바뀌어도 allocation이나 DB wait가 해결되는 것은 아니다.  \nJFR로 보면 virtual thread count보다 `socket read`, `park`, `pinning`, `allocation pressure`를 봐야 한다.\n\n## 코드로 보기\n\n### 1. JFR 이벤트를 켠 채 실행\n\n```bash\njava \\\n  -XX:StartFlightRecording=name=app,settings=profile,filename=/tmp/app.jfr \\\n  -jar app.jar\n```\n\n### 2. 프로그램적으로 JFR 시작\n\n```java\nimport jdk.jfr.Recording;\n\ntry (Recording recording = new Recording()) {\n    recording.start();\n    // workload\n    recording.stop();\n    recording.dump(java.nio.file.Path.of(\"/tmp/app.jfr\"));\n}\n```\n\n### 3. 간단한 핫스팟 코드\n\n```java\npublic class AllocationService {\n    public String build(int n) {\n        StringBuilder sb = new StringBuilder();\n        for (int i = 0; i < n; i++) {\n            sb.append(i).append(',');\n        }\n        return sb.toString();\n    }\n}\n```\n\n이런 코드는 JFR에서 allocation burst나 hot method로 잡히기 쉽다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| JFR 상시 | 운영 친화적 | GUI 분석이 필요하다 | 지속 관찰 |\n| JMC 중심 | 원인 파악이 빠르다 | 파일 분석 숙련이 필요하다 | 장애 후 분석 |\n| async-profiler | CPU/alloc에 강하다 | JVM 이벤트 전반은 약하다 | 핫스팟 추적 |\n| VisualVM | 가볍고 익숙하다 | 심층 분석은 제한적 | 개발/간단 점검 |\n\n## 꼬리질문\n\n> Q: JFR을 왜 프로파일링에 유리하다고 보나요?\n> 의도: 저비용 관측과 런타임 이벤트 이해 여부 확인\n> 핵심: JVM 내부 이벤트를 저오버헤드로 시간 축에 남길 수 있다.\n\n> Q: JMC에서 제일 먼저 봐야 할 것은 무엇인가요?\n> 의도: 문제를 무작정 코드로만 보지 않는지 확인\n> 핵심: GC pause, allocation, lock contention, thread state부터 본다.\n\n> Q: JFR이 있어도 heap dump가 필요한가요?\n> 의도: 도구의 역할 분리를 아는지 확인\n> 핵심: JFR은 증상, heap dump는 잔존 객체와 참조 경로 분석에 강하다.\n\n## 한 줄 정리\n\nJFR은 JVM의 증상을 기록하고, JMC는 그 기록을 읽어 병목의 원인을 좁히는 운영용 프로파일링 도구다.\n",
+  "aliases": [
+    "jfr jmc playbook",
+    "java flight recorder mission control",
+    "jfr latency investigation",
+    "jmc 병목 분석",
+    "jfr 운영 프로파일링",
+    "jfr gc lock allocation timeline",
+    "jfr thread parking analysis",
+    "자바 jfr jmc 정리",
+    "자바 성능 분석 jfr",
+    "Reflection"
+  ],
+  "expected_queries": [
+    "Java 서비스에서 느려질 때 JFR과 JMC로 초동 분석을 어떤 순서로 시작해야 하는지 알려줘",
+    "p99 지연이 튈 때 GC인지 lock인지 allocation인지 JFR로 먼저 가르는 실전 절차가 필요해",
+    "JMC를 열었는데 latency spike 구간에서 무엇부터 확인해야 하는지 정리한 자바 문서를 찾고 있어",
+    "CPU profiler만 보지 말고 JVM 이벤트 타임라인까지 같이 보는 운영용 플레이북이 필요해",
+    "Java Flight Recorder와 Mission Control을 현업 장애 대응 관점에서 묶어 설명한 글이 있어?"
+  ],
+  "symptoms": [
+    "p99가 튀는데 CPU만 봐서는 원인이 안 보여서 어떤 관측부터 해야 할지 모르겠어",
+    "JFR 파일은 뽑았는데 JMC에서 무엇부터 읽어야 병목을 좁힐 수 있는지 막막해",
+    "GC, lock, allocation, thread state가 한꺼번에 얽혀 보여서 초동 분석 순서를 잡고 싶어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jvm-gc-jmm-overview",
+      "language/jfr-event-interpretation",
+      "language/safepoint-stop-the-world-diagnostics"
+    ],
+    "next_docs": [
+      "language/async-profiler-vs-jfr-comparison",
+      "language/oom-heap-dump-playbook",
+      "language/jfr-loom-incident-signal-map"
+    ],
+    "confusable_with": [
+      "language/jfr-event-interpretation",
+      "language/oom-heap-dump-playbook",
+      "language/g1-vs-zgc",
+      "language/cds-startup-profiling",
+      "language/safepoint-stop-the-world-diagnostics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/jfr-jmc-performance-playbook.md",
+    "revision_history": []
+  }
+}

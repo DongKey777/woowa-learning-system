@@ -1,0 +1,46 @@
+{
+  "id": "system-design/chat-presence-delivery-interview-drill",
+  "title": "Chat Presence Delivery Interview Drill",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 drill은 채팅 시스템 설계 면접에서 realtime transport, persistence, ordering, presence를 답변하는 구조를 제공한다.",
+  "body_markdown": "# Chat Presence Delivery Interview Drill\n\n## 질문\n\n\"1:1 또는 group chat 시스템을 설계해 보세요.\"\n\n## 기대 답변 축\n\n먼저 transport를 잡는다. 실시간 양방향 통신은 WebSocket이 자연스럽지만, 연결 서버는 stateless API 서버와 다른 scaling 특성을 가진다. connection registry와 load balancing을 분리해 말한다.\n\n메시지는 먼저 durable store에 기록하고, delivery pipeline을 통해 online user에게 push한다. Offline user는 나중에 unread cursor나 last seen sequence 이후 메시지를 pull한다.\n\n순서는 conversation 단위 sequence로 설명한다. 전역 순서가 아니라 room/channel 단위 ordering이면 충분한 경우가 많다.\n\nPresence는 heartbeat와 TTL 기반으로 관리하되, 네트워크 흔들림 때문에 online/offline을 너무 즉시 바꾸지 않는다.\n\n## 약점 태그\n\n`websocket-connection`, `durable-message-store`, `per-room-ordering`, `presence-ttl`, `delivery-status-contract`, `wrong-bucket`\n\n## 흔한 오답\n\n메시지를 WebSocket으로만 보내고 DB 저장을 나중에 하면 장애 시 유실될 수 있다. 반대로 모든 delivery ack를 강한 트랜잭션으로 묶으면 latency와 scale이 무너진다.\n\n## 핵심 요구사항\n\n- 사용자가 online이면 낮은 latency로 메시지를 전달하고, offline이면 나중에 누락 없이 읽게 한다.\n- conversation 단위 ordering, dedup, unread count, delivery/read receipt를 지원한다.\n- presence는 빠르게 변하지만 네트워크 흔들림으로 인한 false offline을 줄인다.\n- WebSocket connection 서버 장애와 reconnect를 견딘다.\n- 같은 client message retry가 같은 server message로 수렴하고, reconnect 후 cursor 기반 gap repair가 가능해야 한다.\n\n## 정확한 보장 범위\n\nWebSocket 연결 자체는 durable delivery 보장 장치가 아니다. 실무 답변에서는 \"서버가 메시지를 accept했다\"의 기준을 durable store append 성공과 conversation sequence 발급으로 둔다. 그 이후 online push는 at-least-once로 보고, client는 `message_id` 또는 `(conversation_id, client_message_id)`로 dedup한다.\n\nOrdering은 전역이 아니라 conversation 단위 monotonic sequence를 보장한다고 제한한다. 여러 device에서 동시에 보낸 메시지는 server append 순서가 canonical order가 된다. Delivery receipt는 \"상대가 읽었다\"가 아니라 특정 recipient/device 또는 account에 push/ack가 도달했다는 별도 상태이고, read receipt는 read cursor가 올라갔다는 의미다.\n\nPresence는 soft state다. `online`은 \"최근 heartbeat가 있고 connection registry에 active session이 있다\"는 추정이지 권한, 과금, 메시지 유실 판단의 근거가 아니다. 면접에서는 presence 정확도보다 false offline/false online을 어떻게 완화하고 사용자에게 어떻게 표현할지까지 말해야 한다.\n\n## Status/Idempotency Contract\n\nSend API는 `client_message_id`를 받아 같은 sender가 같은 conversation에 같은 id로 재시도하면 기존 `message_id`, `sequence`, `status`를 반환한다. Request body hash가 다르면 `409 conflict` 또는 별도 validation error로 막아 같은 key가 다른 메시지로 재사용되지 않게 한다.\n\nMessage status는 `accepted`, `delivering`, `delivered`, `read`, `failed`처럼 단조롭게 진행시킨다. `accepted`는 durable append 성공, `delivered`는 recipient 측 delivery ack 또는 device ack, `read`는 read cursor advance다. Ack가 유실되면 push가 중복될 수 있으므로 client rendering은 idempotent해야 한다.\n\nReconnect contract는 `last_seen_sequence` 이후 메시지를 pull sync하는 것이다. Server는 gap을 감지하면 \"push만 기다려라\"가 아니라 missed range를 재전송하거나 client가 sync endpoint를 호출하게 한다. Offline user에게는 push 실패를 메시지 실패로 보지 않고 unread cursor와 notification pipeline으로 분리한다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `Conversation`, `Message`, `Membership`, `DeliveryReceipt`, `ReadCursor`, `PresenceSession`이다. `Message`는 durable store에 append되고 conversation별 sequence를 갖는다. `ReadCursor`는 사용자별 마지막 읽은 sequence를 저장한다.\n\n트래픽은 active room에 skew가 크고, fanout 대상은 1:1과 group chat에서 크게 다르다. Connection server는 connection registry와 pub/sub subscription을 관리하고, message worker는 online recipient에게 push하며 offline recipient는 pull sync로 보완한다.\n\n## Consistency/Latency Trade-off\n\n메시지를 durable store에 먼저 쓰면 유실 위험은 줄지만 send latency가 store p99에 묶인다. 반대로 먼저 push하고 나중에 저장하면 장애 시 message gap이 생긴다. 일반적으로 store-first 후 async delivery가 안전한 기본값이다.\n\nPresence는 강한 일관성이 어렵다. TTL heartbeat는 단순하지만 mobile sleep, network handoff 때문에 오탐이 생긴다. 따라서 \"최근 활동\", \"접속 중일 가능성\"처럼 soft state로 표현하고 중요한 권한 판단에는 쓰지 않는다.\n\n## 실패 반례\n\n- connection server 메모리에만 메시지를 두어 server crash 시 메시지가 사라진다.\n- 전역 sequence를 요구해 모든 room write가 하나의 병목으로 모인다.\n- heartbeat 한 번 누락을 즉시 offline으로 바꿔 presence가 계속 깜빡인다.\n- ack를 받지 못한 retry 메시지를 dedup하지 않아 같은 메시지가 두 번 보인다.\n- store append는 성공했지만 push worker가 죽은 메시지를 gap repair 없이 방치한다.\n- mobile reconnect가 다른 connection server로 붙었는데 이전 subscription 정리가 늦어 같은 device가 중복 push를 받는다.\n\n## 운영 지표\n\n- `send_to_accept_p95`: client send부터 durable append/sequence 발급까지의 지연.\n- `accept_to_deliver_p95`: append 이후 online recipient ack까지의 지연.\n- `message_gap_repair_count`: reconnect sync에서 발견된 누락 sequence 수.\n- `duplicate_delivery_rate`: dedup으로 제거된 중복 push 비율.\n- `presence_churn_rate`: 짧은 시간 안에 online/offline이 반복되는 비율.\n- `delivery_backlog_age`: push worker queue에서 가장 오래 대기 중인 메시지 age.\n\n## Wrong Bucket\n\n- WebSocket 선택 문제로만 답하면 wrong bucket이다. Transport는 낮은 latency를 주지만 durable delivery, ordering, dedup은 storage와 protocol contract 문제다.\n- Presence를 정합성 문제로 과하게 풀면 wrong bucket이다. Presence는 soft state로 두고 중요한 비즈니스 판단은 message store, membership, cursor에서 해야 한다.\n- Exactly-once delivery를 목표로 잡으면 wrong bucket이다. 실무 기본값은 durable append + at-least-once push + idempotent client rendering이다.\n- Group chat fanout을 DB transaction 하나로 묶으면 wrong bucket이다. Room sequence append와 per-recipient delivery/read 상태를 분리해야 scale이 난다.\n\n## 면접 답변 Skeleton\n\n1. \"Transport는 WebSocket을 쓰되, delivery와 persistence를 WebSocket 자체에 맡기지 않습니다.\"\n2. \"Message는 conversation별 sequence로 durable store에 먼저 append하고 online user에게 비동기 push합니다.\"\n3. \"Send retry는 client_message_id로 dedup하고, 같은 요청에는 같은 message_id와 sequence를 반환합니다.\"\n4. \"Offline user와 reconnect user는 last_seen_sequence 이후를 pull해서 gap을 repair합니다.\"\n5. \"Presence는 heartbeat TTL 기반 soft state로 두고 false offline 완화를 위한 grace period를 둡니다.\"\n6. \"metric은 send-to-accept, accept-to-deliver, gap repair, duplicate delivery, presence churn, backlog age입니다.\"\n\n## 복습 연결\n\nTransport 선택은 `websocket-sse-polling-interview-chooser`, queue semantics는 `message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser`로 이어진다.\n",
+  "aliases": [
+    "chat system delivery presence drill",
+    "채팅 시스템 설계 면접",
+    "websocket chat delivery ordering",
+    "presence online offline chat design"
+  ],
+  "expected_queries": [
+    "Chat system design 면접에서 어떤 순서로 답해?",
+    "WebSocket 채팅에서 메시지 순서와 delivery를 어떻게 보장해?",
+    "online presence는 어떻게 설계해?"
+  ],
+  "symptoms": [
+    "WebSocket만 말하고 저장과 재전송을 빼먹습니다",
+    "message ordering과 delivery receipt를 같은 문제로 봅니다",
+    "presence heartbeat의 false offline 처리를 놓칩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/chat-system-design"
+    ],
+    "next_docs": [
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+      "system-design/webhook-retry-dedup-deadletter-playbook"
+    ],
+    "confusable_with": [
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+      "network/websocket-sse-polling-interview-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/chat-presence-delivery-interview-drill.md",
+    "revision_history": []
+  }
+}

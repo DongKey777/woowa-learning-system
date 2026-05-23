@@ -1,0 +1,53 @@
+{
+  "id": "security/jwks-rotation-cutover-failure-recovery",
+  "title": "JWKS Rotation Cutover Failure / Recovery",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 JWKS Rotation Cutover Failure / Recovery를 다루는 playbook 문서다. JWKS rotation 실패는 단순 `kid` miss가 아니라 signer cutover, verifier cache age, old key removal timing, region skew가 엇갈리는 운영 사고이며, 새 키 추가와 old key 제거를 별도 단계로 분리한 recovery runbook이 필요하다. 검색 질의가 JWKS rotation failure, JWKS cutover failure, kid miss after rotation, old key removal failure처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# JWKS Rotation Cutover Failure / Recovery\n\n> 한 줄 요약: JWKS rotation 실패는 단순 `kid` miss가 아니라 signer cutover, verifier cache age, old key removal timing, region skew가 엇갈리는 운영 사고이며, 새 키 추가와 old key 제거를 별도 단계로 분리한 recovery runbook이 필요하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JWK Rotation / Cache Invalidation / `kid` Rollover](./jwk-rotation-cache-invalidation-kid-rollover.md)\n> - [JWT Signature Verification Failure Playbook](./jwt-signature-verification-failure-playbook.md)\n> - [JWT / JWKS Outage Recovery / Failover Drills](./jwt-jwks-outage-recovery-failover-drills.md)\n> - [Key Rotation Runbook](./key-rotation-runbook.md)\n> - [Signing Key Compromise Recovery Playbook](./signing-key-compromise-recovery-playbook.md)\n\nretrieval-anchor-keywords: JWKS rotation failure, JWKS cutover failure, kid miss after rotation, old key removal failure, signer cutover rollback, verifier cache skew, dual-publish window, key overlap failure, JWKS recovery, compromised kid recovery, old key republish safety\n\n---\n\n## 핵심 개념\n\nJWKS rotation에서 실제 장애는 \"키를 돌린다\"는 한 문장보다 훨씬 더 구체적이다.\n\n- signer는 새 `kid`로 전환했다\n- 일부 verifier는 아직 old JWKS를 본다\n- 다른 일부는 새 key는 보지만 old key를 잃었다\n- 모바일/edge/CDN 경로는 더 늦다\n\n즉 회전 실패의 본질은 `key publish`, `signer cutover`, `verifier refresh`, `old key removal` 네 단계를 같은 순간으로 착각하는 데서 나온다.\n\n## 재현 조건\n\n다음 조건에서 rotation cutover failure를 재현할 수 있다.\n\n- 새 public key가 모든 verifier cache에 도달하기 전에 signer가 새 `kid`로 토큰을 발급한다\n- access token TTL이 남아 있는데 old key를 JWKS에서 제거한다\n- 일부 region/pod만 JWKS cache refresh에 실패하거나 stale cache를 유지한다\n- CDN, edge, mobile path가 다른 cache age를 가진다\n\n재현 중에는 private key material을 노출하거나 duplicate `kid`를 임의로 만들어 verifier가 추측하게 하면 안 된다. duplicate `kid`, wrong key publish, compromise 의심은 가용성 drill이 아니라 integrity incident로 분리한다.\n\n## 확인 순서\n\n1. 실패 토큰이 새 `kid`인지 old `kid`인지 먼저 나눈다.\n2. signer cutover 시각, JWKS publish 시각, old key removal 시각을 timeline으로 맞춘다.\n3. verifier별 JWKS cache age, refresh reason, region, version을 본다.\n4. 새 토큰만 실패하는지, 기존 유효 토큰도 실패하는지 분리한다.\n5. old key가 단순 제거된 것인지 compromise 의심이 있는지 확인한다.\n6. refresh storm을 만들기 전에 issuer 단위 single-flight refresh 또는 bounded retry가 가능한지 본다.\n7. rollback 후보를 signer rollback과 old key republish로 분리해 선택한다.\n\n## failure matrix\n\n| 관찰 | 더 가능성 높은 원인 | 보수적 대응 |\n|---|---|---|\n| 새 로그인/새 토큰만 실패 | 새 key가 verifier에 전파되지 않음 | signer rollback 또는 overlap 복구 |\n| 기존 로그인 세션만 튕김 | old key를 access token TTL보다 빨리 제거 | old key가 신뢰 가능할 때만 republish |\n| 일부 region만 `kid` miss | verifier cache skew, egress/DNS 문제 | region별 cache age 비교, bounded refresh |\n| `kid`는 있지만 signature invalid | wrong issuer key, alg mismatch, token 변조 | fetch 반복보다 검증 입력과 issuer를 확인 |\n| old key compromise 정황 존재 | cutover failure가 아니라 trust loss | old key republish 금지, compromise playbook handoff |\n\n## wrong-bucket 비교\n\n| 잘못된 결론 | 더 정확한 비교 |\n|---|---|\n| \"JWKS cache를 전부 비우면 빨리 낫는다\" | 전면 eviction은 refresh storm을 만들 수 있다. cache age와 region skew를 먼저 본다 |\n| \"old key를 다시 올리면 항상 안전하다\" | old key가 여전히 신뢰 가능할 때만 republish한다 |\n| \"새 `kid` 실패는 사용자 재로그인 문제\" | signer cutover와 verifier adoption 순서 문제일 수 있다 |\n| \"duplicate `kid`도 rotation 장애\" | key ambiguity는 integrity incident이며 verifier가 추측하면 안 된다 |\n| \"signer rollback이면 기존 세션도 복구된다\" | signer rollback은 future token 발급 경로이고 old-token 검증 복구와 다르다 |\n\n## 검증\n\n1. old `kid`로 이미 발급된 정상 토큰이 overlap window 동안 모든 verifier에서 통과한다.\n2. 새 `kid` 토큰은 JWKS publish와 verifier adoption 이후 통과한다.\n3. unknown `kid`와 duplicate/wrong key 상황은 fail-closed reason으로 남는다.\n4. old key removal은 max token lifetime, verifier lag, edge/mobile cache tail 이후에만 성공한다.\n5. rollback 또는 republish를 썼다면 issuer, `kid`, 허용 시간, operator action이 audit log에 남는다.\n\n---\n\n## 깊이 들어가기\n\n### 1. rotation 실패는 보통 두 종류다\n\n- new-key failure: 새 토큰만 깨짐\n- old-key removal failure: 기존 유효 토큰이 깨짐\n\n이 둘은 복구 방향이 다르다.\n\n- new-key failure는 signer rollback 또는 overlap 복구가 핵심\n- old-key removal failure는 old key republish가 핵심\n\n### 2. dual-publish와 signer cutover는 별도 이벤트여야 한다\n\n안전한 순서:\n\n1. 새 key를 JWKS에 먼저 publish\n2. verifier fleet가 새 key를 받을 시간을 기다림\n3. signer를 새 key로 cutover\n4. 충분한 overlap 후 old key 제거\n\n문제는 1-4를 한 번에 해 버릴 때 생긴다.\n\n### 3. region skew와 cache age를 먼저 봐야 한다\n\n실패 시 가장 먼저 볼 것:\n\n- 어떤 issuer인가\n- 어떤 `kid`가 문제인가\n- 어떤 region/pod/version이 실패하는가\n- cache age 분포가 어떻게 되는가\n\n이걸 보기 전 cache 전면 eviction은 오히려 refresh storm을 만들 수 있다.\n\n### 4. old key 제거는 access token TTL보다 더 늦어야 한다\n\n고려할 값:\n\n- max token lifetime\n- verifier rollout lag\n- edge/CDN/mobile cache\n- clock skew\n\nold key 제거를 너무 빨리 하면 \"기존 세션만 깨지는\" 조용한 장애가 난다.\n\n### 5. cutover rollback과 key republish는 다른 레버다\n\n- signer rollback: 앞으로 발급할 토큰을 old key로 다시 전환\n- old key republish: 이미 발급된 old-token 검증 경로 복구\n\n둘 중 하나만 해서는 복구가 반쪽일 수 있다.\n\n### 6. old key republish는 \"old key가 여전히 신뢰 가능한 경우\"에만 쓴다\n\n이 문서의 레버들은 cutover failure를 다룰 때 유효하다.\n\n- old key가 단순히 너무 빨리 제거된 경우\n- signer cutover 순서가 어긋난 경우\n- verifier cache skew가 큰 경우\n\n하지만 old key compromise가 의심되면:\n\n- old key republish 금지\n- compromised `kid` reject\n- new key publish + session/token revoke로 전환\n\n즉 증상이 비슷해 보여도 `trust loss`가 시작된 순간부터는 [Signing Key Compromise Recovery Playbook](./signing-key-compromise-recovery-playbook.md)로 handoff해야 한다.\n\n### 7. duplicate `kid`나 wrong key publish는 availability보다 integrity incident다\n\n이 경우:\n\n- 추측 금지\n- 다른 key brute-force 금지\n- 명시적 reject + incident 승격\n\n회전 실패와 key ambiguity는 같은 사고가 아니다.\n\n### 8. observability는 `kid`/cache age/region skew 중심이어야 한다\n\n유용한 필드:\n\n- issuer\n- `kid`\n- cache age\n- refresh reason\n- verifier version\n- region\n- bucket: `kid_miss_new_key`, `old_key_removed_too_early`\n\n### 9. drill은 overlap 실패를 일부러 만들어 봐야 한다\n\n훈련 예:\n\n- signer cutover를 먼저 해서 새 토큰만 깨짐\n- old key를 너무 빨리 제거해 기존 세션 깨짐\n- 특정 region만 stale cache\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 새 로그인만 실패한다\n\n문제:\n\n- 새 `kid`가 verifier에 안 퍼졌다\n\n대응:\n\n- signer rollback 검토\n- overlap window 복구\n- region별 cache age 확인\n\n### 시나리오 2: 이미 로그인한 사용자만 갑자기 튕긴다\n\n문제:\n\n- old key를 너무 빨리 제거했다\n\n대응:\n\n- old key republish\n- removal policy 재계산\n- mobile/edge 경로를 포함한 tail을 본다\n\n### 시나리오 3: 일부 pod만 `kid` miss가 난다\n\n문제:\n\n- stale cache skew 또는 rollout skew\n\n대응:\n\n- verifier version별 분포 확인\n- issuer 단위 single-flight refresh\n- region별 skew가 해소되는지 모니터링\n\n### 시나리오 4: 기존 유효 토큰이 깨져 old key republish를 고민하지만 compromise 정황도 함께 있다\n\n문제:\n\n- 단순 cutover failure처럼 보이지만 old key 자체가 유출됐을 가능성이 있다\n\n대응:\n\n- old key republish를 보류한다\n- forged token 가능성을 먼저 분류한다\n- compromise suspected면 JWKS cutover 복구가 아니라 compromise playbook으로 승격한다\n\n---\n\n## 코드로 보기\n\n### 1. overlap-aware rotation checklist\n\n```text\n1. new key publish\n2. verifier adoption 확인\n3. signer cutover\n4. old key overlap 유지\n5. old key remove\n```\n\n### 2. 운영 체크리스트\n\n```text\n1. new-key failure와 old-key removal failure를 구분하는가\n2. signer rollback과 old key republish를 별도 레버로 갖는가\n3. old key republish가 \"still trusted key\"일 때만 허용되는가\n4. cache age/region skew를 본 뒤 refresh를 하는가\n5. duplicate kid를 availability 문제가 아니라 integrity 문제로 보는가\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| 짧은 overlap | old key 제거가 빠르다 | tail failure 위험이 크다 | verifier fleet가 매우 단순할 때만 |\n| 긴 overlap | cutover가 안정적이다 | old key 노출 기간이 길어진다 | mobile/edge path가 긴 환경 |\n| signer rollback | 새 로그인 장애를 빨리 줄인다 | old-key 복구와는 별개다 | new-key failure |\n| old key republish | 기존 세션 복구가 빠르다 | 제거 정책이 느슨해질 수 있다 | old-key removal failure |\n\n판단 기준은 이렇다.\n\n- 새 토큰이 깨졌는지 기존 토큰이 깨졌는지\n- verifier cache skew가 큰지\n- edge/mobile path가 긴지\n- ambiguity incident가 섞였는지\n\n---\n\n## 꼬리질문\n\n> Q: JWKS rotation 실패에서 가장 먼저 구분해야 할 것은 무엇인가요?\n> 의도: new-key failure와 old-key removal failure를 구분하는지 확인\n> 핵심: 새 토큰만 깨졌는지, 기존 유효 토큰도 깨졌는지다.\n\n> Q: signer rollback과 old key republish는 왜 다른가요?\n> 의도: 발급 경로와 검증 경로를 구분하는지 확인\n> 핵심: 하나는 앞으로 발급할 토큰을 바꾸고, 다른 하나는 과거 토큰 검증을 복구한다.\n\n> Q: cache 전면 eviction이 왜 위험할 수 있나요?\n> 의도: refresh storm를 이해하는지 확인\n> 핵심: verifier fleet가 동시에 JWKS를 두드려 outage를 증폭시킬 수 있기 때문이다.\n\n> Q: old key republish는 언제 금지해야 하나요?\n> 의도: cutover failure와 compromise handoff 조건을 구분하는지 확인\n> 핵심: old key compromise가 의심되면 republish가 아니라 compromised `kid` reject와 compromise playbook 승격이 맞다.\n\n> Q: duplicate `kid`는 왜 바로 incident인가요?\n> 의도: ambiguity와 availability를 구분하는지 확인\n> 핵심: verifier가 추측하기 시작하면 trust boundary가 무너지기 때문이다.\n\n## 한 줄 정리\n\nJWKS rotation failure를 잘 다루려면 new key publish, signer cutover, verifier adoption, old key removal을 분리해 보고, old key republish는 \"여전히 신뢰 가능한 key\"일 때만 쓰며 compromise 신호가 보이면 즉시 다른 playbook으로 넘겨야 한다.\n",
+  "aliases": [
+    "JWKS rotation failure",
+    "JWKS cutover failure",
+    "kid miss after rotation",
+    "old key removal failure",
+    "signer cutover rollback",
+    "verifier cache skew",
+    "dual-publish window",
+    "key overlap failure",
+    "JWKS recovery",
+    "compromised kid recovery",
+    "old key republish safety",
+    "JWKS Rotation Cutover Failure / Recovery"
+  ],
+  "expected_queries": [
+    "JWKS rotation 후 새 kid 토큰만 실패하면 signer rollback과 overlap 복구 중 뭘 봐야 해?",
+    "old key를 너무 빨리 제거해서 기존 세션이 튕길 때 republish해도 되는 조건은?",
+    "unknown kid가 늘 때 JWKS cache를 전부 비우면 왜 위험할 수 있어?",
+    "JWKS rotation 사고에서 signer cutover, publish, verifier cache age를 어떻게 타임라인으로 맞춰?"
+  ],
+  "symptoms": [
+    "signer는 새 kid로 토큰을 발급했지만 일부 verifier가 아직 old JWKS cache를 보고 새 로그인만 실패한다",
+    "access token TTL이 남아 있는데 old key를 제거해 기존 세션만 갑자기 튕긴다",
+    "unknown kid를 전면 cache eviction으로 복구하려다 verifier refresh storm과 인증 장애가 커진다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/owasp-top10-basics"
+    ],
+    "next_docs": [
+      "security/authentication-form-login-vs-jwt-vs-session-cookie-chooser"
+    ],
+    "confusable_with": [
+      "security/jwt-jwks-outage-recovery-failover-drills"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/jwks-rotation-cutover-failure-recovery.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "id": "system-design/feature-flag-control-plane-design",
+  "title": "Feature Flag Control Plane 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Feature Flag Control Plane 설계를 다루는 deep_dive 문서다. feature flag control plane은 기능 노출을 동적으로 제어하고, 점진 배포와 실험, 장애 격리를 안전하게 운영하는 정책 시스템이다. 검색 질의가 feature flag control plane, rollout, kill switch, targeting처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Feature Flag Control Plane 설계\n\n> 한 줄 요약: feature flag control plane은 기능 노출을 동적으로 제어하고, 점진 배포와 실험, 장애 격리를 안전하게 운영하는 정책 시스템이다.\n\nretrieval-anchor-keywords: feature flag control plane, rollout, kill switch, targeting, evaluation, bucketing, experimentation, flag cache, approval workflow, config sync, progressive delivery, canary guardrail, automated canary\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Traffic Shadowing / Progressive Cutover 설계](./traffic-shadowing-progressive-cutover-design.md)\n> - [Automated Canary Analysis / Rollback Platform 설계](./automated-canary-analysis-rollback-platform-design.md)\n> - [Control Plane / Data Plane Separation 설계](./control-plane-data-plane-separation-design.md)\n\n## 핵심 개념\n\nfeature flag는 단순한 `if` 문이 아니다.  \n실전에서는 다음을 동시에 제어해야 한다.\n\n- 점진적 롤아웃\n- kill switch\n- 실험 버킷 분배\n- tenant/user/region targeting\n- 승격 승인과 감사 로그\n- SDK와 서버의 일관된 평가\n\n즉, control plane은 정책을 관리하고, data plane은 정책을 빠르게 평가한다.\n\n## 깊이 들어가기\n\n### 1. 무엇을 제어할 것인가\n\nflag는 보통 아래 용도로 나뉜다.\n\n- release flag\n- experiment flag\n- ops flag\n- permission flag\n\n각 flag는 수명과 위험도가 다르다.  \nrelease flag는 짧고, permission flag는 오래 가며, ops flag는 즉시 꺼져야 한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 10만 DAU\n- 요청당 flag 20개 평가\n- 초당 5만 evaluation\n\n이때 control plane의 쓰기보다 evaluation path가 훨씬 중요하다.  \n그래서 대부분은 local cache와 snapshot 기반 평가를 쓴다.\n\n봐야 할 숫자:\n\n- evaluation QPS\n- config sync latency\n- cache hit ratio\n- rollout propagation delay\n- override rate\n\n### 3. Control plane / data plane 분리\n\n```text\nAdmin UI / API\n  -> Flag Store\n  -> Audit Log\n  -> Config Publisher\n  -> CDN / Snapshot Store\n  -> SDK / Gateway Evaluator\n```\n\ncontrol plane은 변경, 승인, 이력, 롤백을 담당한다.  \ndata plane은 현재 시점의 flag를 빠르게 판정한다.\n\n### 4. Targeting과 bucketing\n\n대부분의 롤아웃은 아래 조건을 조합한다.\n\n- userId\n- tenantId\n- region\n- device\n- plan\n- percentage\n\nstable bucketing이 중요하다.  \n같은 사용자는 항상 같은 bucket에 들어가야 실험이 흔들리지 않는다.\n\n### 5. Rollout 전략\n\n일반적인 단계:\n\n1. internal only\n2. 1%\n3. 10%\n4. 50%\n5. 100%\n\n롤아웃을 할 때는 오류율, latency, business metric을 같이 본다.  \n기능 자체가 좋아 보여도 p95가 망가지면 바로 되돌릴 수 있어야 한다.\n즉, flag는 \"누구를 새 경로로 보낼지\"를 정하는 도구이고, 실제 승격 안전성은 shadowing, tracing, canary guardrail과 함께 봐야 한다.\n\n### 6. 승인과 감사\n\nflag는 제품 기능이자 운영 권한이다.\n\n- 누가 켰는지\n- 어떤 범위로 켰는지\n- 언제 롤백했는지\n- 승인자가 누구인지\n\n이력은 [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)와 연결된다.\n\n### 7. Failure mode\n\nflag 시스템이 죽으면 두 가지 위험이 있다.\n\n- 새 기능을 켤 수 없다\n- 이미 켜진 기능의 평가가 느려진다\n\n대응:\n\n- last-known-good snapshot\n- safe default\n- local fallback evaluator\n\n## 실전 시나리오\n\n### 시나리오 1: 점진 배포\n\n문제:\n\n- 새 API를 전체 사용자에게 바로 열 수 없다\n\n해결:\n\n- 내부 사용자부터 시작\n- 퍼센트 롤아웃\n- 에러율 기준 자동 rollback\n\n### 시나리오 2: 장애 차단\n\n문제:\n\n- 특정 백엔드 기능이 장애를 일으킨다\n\n해결:\n\n- kill switch를 즉시 전파\n- evaluator는 local fallback으로 안전하게 off를 유지\n\n### 시나리오 3: A/B 테스트\n\n문제:\n\n- 실험군과 대조군을 안정적으로 나눠야 한다\n\n해결:\n\n- stable bucketing\n- experiment versioning\n- metric guardrail\n\n## 코드로 보기\n\n```pseudo\nfunction evaluateFlag(user, flag):\n  snapshot = cache.get(\"flags:snapshot\")\n  if snapshot == null:\n    snapshot = loadLastKnownGood()\n  return snapshot.evaluate(user, flag)\n```\n\n```java\npublic boolean isEnabled(UserContext ctx, String flagKey) {\n    FlagSnapshot snapshot = snapshotCache.current();\n    return snapshot.evaluate(ctx, flagKey);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Client-side evaluation | 빠르다 | 정책 노출 가능 | 단순 실험 |\n| Server-side evaluation | 통제가 쉽다 | 서버 비용 증가 | 보안/정책 중요 |\n| Snapshot cache | 안정적이다 | propagation 지연 | 대부분의 서비스 |\n| Push-based sync | 반영이 빠르다 | 운영 복잡도 | 빠른 롤아웃 |\n| Pull-based refresh | 단순하다 | stale 가능성 | 초기 시스템 |\n\n핵심은 flag가 설정값이 아니라 **운영 정책과 실험 계약**이라는 점이다.\n\n## 꼬리질문\n\n> Q: feature flag와 config는 어떻게 다른가요?\n> 의도: 동적 정책과 정적 설정 구분 확인\n> 핵심: flag는 의사결정과 실험이 중심이고, config는 시스템 동작 파라미터가 중심이다.\n\n> Q: stable bucketing이 왜 중요한가요?\n> 의도: 실험 일관성 이해 확인\n> 핵심: 사용자가 매 요청마다 다른 그룹에 들어가면 실험이 깨진다.\n\n> Q: flag 시스템이 장애나면 어떻게 하나요?\n> 의도: control plane 실패 대응 확인\n> 핵심: last-known-good snapshot과 safe default가 필요하다.\n\n> Q: kill switch는 왜 별도로 강조하나요?\n> 의도: 운영 대응 감각 확인\n> 핵심: 장애 확산을 빠르게 끊는 최후 방어선이기 때문이다.\n\n## 한 줄 정리\n\nFeature flag control plane은 변경 가능한 정책을 안전하게 배포하고 빠르게 평가해, 롤아웃과 실험, 장애 대응을 통합하는 시스템이다.\n",
+  "aliases": [
+    "feature flag control plane",
+    "rollout",
+    "kill switch",
+    "targeting",
+    "evaluation",
+    "bucketing",
+    "experimentation",
+    "flag cache",
+    "approval workflow",
+    "config sync",
+    "progressive delivery",
+    "canary guardrail"
+  ],
+  "expected_queries": [
+    "Feature Flag Control Plane 설계 설계 핵심을 설명해줘",
+    "feature flag control plane가 왜 필요한지 알려줘",
+    "Feature Flag Control Plane 설계 실무 트레이드오프는 뭐야?",
+    "feature flag control plane 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Feature Flag Control Plane 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Feature Flag Control Plane 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Feature Flag Control Plane 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/feature-flag-control-plane-design.md",
+    "revision_history": []
+  }
+}

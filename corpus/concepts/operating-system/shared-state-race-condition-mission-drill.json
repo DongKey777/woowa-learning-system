@@ -1,0 +1,51 @@
+{
+  "id": "operating-system/shared-state-race-condition-mission-drill",
+  "title": "Shared State Race Condition Mission Drill",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "|",
+  "body_markdown": "# Shared State Race Condition Mission Drill\n\n> 한 줄 요약: 여러 요청이 같은 변경 가능한 값을 공유하면, 코드 안 race인지 DB 안 lost update인지 먼저 분리해야 한다.\n\n**난이도: Beginner**\n\n## 관찰 기준\n\n학습자가 \"동시에 요청하면 값이 꼬이는데 thread 문제인가요?\"라고 묻는다면 공유 상태(shared state)의 위치를 먼저 찾는다. Java object field인지, static 변수인지, Spring singleton bean의 mutable field인지, DB row인지에 따라 원인이 다르다. OS 관점의 race condition은 여러 thread가 같은 memory location을 읽고 쓰면서 실행 순서에 따라 결과가 달라지는 현상이다.\n\n관찰 증거는 네 가지다.\n\n- 같은 instance field나 static field가 요청 사이에 재사용되는가.\n- 연산이 `read -> compute -> write`처럼 쪼개지는가.\n- visibility 보장(`volatile`, safe publication)과 atomicity 보장(lock, CAS, atomic method)을 구분했는가.\n- 문제가 DB row 갱신 로그에서 보이는가, JVM heap 안 객체 변경에서 보이는가.\n\n## 문제 1\n\n상황:\n\n```text\nSpring singleton service 필드에 currentCart를 저장하고 요청마다 갱신한다.\n```\n\n답:\n\nThread safety 문제가 맞다. 여러 요청 thread가 같은 service instance의 mutable field를 공유하므로 사용자 간 상태가 섞일 수 있다. 이때 불변식은 \"요청별 상태는 요청 scope, session, DB, method local variable처럼 사용자 경계가 있는 곳에 있어야 한다\"는 점이다. Singleton bean 자체가 나쁜 것이 아니라 singleton에 변경 가능한 사용자별 상태를 두는 것이 위험하다.\n\n작은 interleaving은 이렇게 설명할 수 있다.\n\n| 순서 | Thread A | Thread B | 공유 field |\n|---|---|---|---|\n| 1 | `currentCart = cartA` |  | `cartA` |\n| 2 |  | `currentCart = cartB` | `cartB` |\n| 3 | `currentCart.add(itemA)` |  | `cartB`에 A의 상품이 들어갈 수 있음 |\n\n좋은 답변은 \"singleton이라서 문제\"가 아니라 \"singleton instance에 사용자별 mutable field를 둔 것이 문제\"라고 말한다. 해결은 `synchronized`로 전체 service를 잠그는 것보다 상태 위치를 바꾸는 것이 먼저다. method local variable, request/session scope, DB row, immutable command object처럼 요청 경계를 갖는 곳으로 옮긴다.\n\n## 문제 2\n\n상황:\n\n```text\ncounter 필드가 `int count`이고 두 thread가 동시에 `count++`를 실행한다.\n```\n\n답:\n\n코드 안 race다. `count++`는 한 명령처럼 보여도 실제로는 읽기, 더하기, 쓰기의 read-modify-write다. 두 thread가 모두 `10`을 읽고 각각 `11`을 쓰면 최종 값은 `12`가 아니라 `11`이 될 수 있다.\n\n| 순서 | Thread A | Thread B | count |\n|---|---|---|---|\n| 1 | read `10` |  | 10 |\n| 2 |  | read `10` | 10 |\n| 3 | write `11` |  | 11 |\n| 4 |  | write `11` | 11 |\n\n단일 counter라면 `AtomicInteger.incrementAndGet()`이나 lock이 후보가 된다. 하지만 여러 field를 함께 지켜야 한다면 atomic counter 하나로는 부족하고, 같은 critical section 안에서 invariant 전체를 보호해야 한다.\n\n## 문제 3\n\n상황:\n\n```text\nreservation 생성 가능 여부를 메모리 Set으로만 확인하고 DB unique constraint가 없다.\n```\n\n답:\n\n둘 다 위험하다. 메모리 Set은 multi-thread/multi-instance에서 안전하지 않고, 최종 중복 방지는 DB constraint나 lock 같은 저장소 경계가 필요하다. Concurrent collection은 한 JVM 안 자료구조 race를 줄일 수 있지만, 여러 서버 instance와 재시작 이후의 영속성(persistence)을 보장하지 않는다. 예약 중복처럼 저장소 불변식은 DB가 이해할 수 있게 표현해야 한다.\n\n`ConcurrentHashMap`이나 concurrent collection을 쓰면 개별 `put`, `get`의 자료구조 손상은 줄어든다. 그러나 `if (!set.contains(slot)) { set.add(slot); }`처럼 check-then-act를 두 연산으로 나누면 compound action race가 남는다. 한 JVM 안에서도 `putIfAbsent`, `compute`, lock 같은 단일 arbitration이 필요하고, 여러 서버가 있으면 DB unique constraint나 transaction 경계가 최종 방어선이어야 한다.\n\n## 문제 4\n\n상황:\n\n```text\nconfig 캐시를 필드에 저장하고 reload thread가 새 Map으로 교체한다. 요청 thread는 가끔 예전 값이나 반쯤 바뀐 값을 본다.\n```\n\n답:\n\nvisibility와 publication 문제를 의심한다. race condition은 항상 lost increment처럼 보이지 않는다. 한 thread가 쓴 값이 다른 thread에 언제 보이는지, 객체가 완성된 뒤 안전하게 공개됐는지가 핵심일 수 있다.\n\n안전한 방향은 immutable snapshot을 만든 뒤 한 번에 교체하는 것이다. 예를 들어 새 `Map`을 local variable에서 완성하고 불변 view로 감싼 다음 `volatile` reference나 lock 안에서 교체한다. `volatile` reference는 \"새 snapshot 참조를 보게 한다\"에는 도움을 주지만, 이미 공유된 mutable Map 내부를 여러 thread가 동시에 바꾸는 문제를 자동으로 해결하지 않는다.\n\n## 문제 5\n\n상황:\n\n```text\ncart_item row의 quantity를 두 요청이 동시에 읽고 각각 +1 저장해 하나만 반영된다.\n```\n\n답:\n\nDB lost update 쪽이 더 가깝다. Java shared field 문제가 아니라 같은 row를 읽고 쓰는 transaction concurrency 문제다. 해결도 `AtomicInteger`가 아니라 optimistic lock, atomic update, pessimistic lock, unique/upsert 같은 DB 경계에서 찾아야 한다. Thread lock으로 한 JVM 안 요청만 직렬화해도 다중 인스턴스 배포에서는 다른 서버 요청을 막지 못한다.\n\nshared-state race drill에서 이 문제를 넣는 이유는 \"동시에 요청\"이라는 말이 항상 JVM thread race를 뜻하지 않기 때문이다. 증거가 heap field에 있으면 thread safety를 보고, 증거가 SQL read/write와 row version에 있으면 transaction lost update를 본다.\n\n## 기대 답변 축\n\n- 공유 상태의 위치를 먼저 말한다. JVM field/static인지, request local인지, DB row인지 분리한다.\n- thread interleaving으로 결과가 달라지는 지점을 짚는다. `read -> compute -> write`, check-then-act, lazy init, cache reload 같은 형태를 찾는다.\n- atomicity와 visibility를 구분한다. `volatile`은 최신 값 관찰과 ordering 일부를 돕지만 복합 연산을 원자화하지 않는다.\n- synchronization 선택을 invariant 기준으로 설명한다. 단일 값이면 Atomic, 여러 값이면 lock/critical section, 상태 위치 문제면 immutable/request scoped 설계가 더 낫다.\n- concurrent collection의 한계를 말한다. 개별 연산 안전과 compound action 안전, 단일 JVM과 다중 instance 보장은 다르다.\n- 테스트 한계를 덧붙인다. 동시성 테스트가 한 번 통과해도 race가 없다는 증거는 아니며, stress test와 코드 구조 검토가 함께 필요하다.\n\n## 약한 답변 신호\n\n| 약점 태그 | 흔한 답변 | 보정 포인트 |\n|---|---|---|\n| `state-location-blur` | \"동시성이니까 thread 문제입니다\" | 공유 값이 heap field인지 DB row인지 먼저 확인한다 |\n| `volatile-atomicity` | \"`volatile` 붙이면 `count++`도 안전합니다\" | visibility와 read-modify-write atomicity를 분리한다 |\n| `compound-action` | \"`ConcurrentHashMap`이면 contains 후 put도 안전합니다\" | 개별 연산과 check-then-act 전체는 다르다 |\n| `singleton-state` | \"singleton bean은 쓰면 안 됩니다\" | singleton 자체보다 사용자별 mutable field가 문제다 |\n| `test-flakiness` | \"동시성 테스트가 통과했으니 안전합니다\" | 통과는 미검출일 수 있고, happens-before와 invariant를 검토한다 |\n\n## 빠른 체크\n\n| 신호 | 먼저 볼 개념 |\n|---|---|\n| service field가 요청 사이에 변함 | thread safety |\n| 같은 DB row 수량이 덮어써짐 | lost update |\n| 같은 slot reservation이 두 개 생김 | uniqueness / transaction |\n| counter 한 값만 안전하게 올림 | atomic 후보 |\n| cache snapshot이 가끔 예전 값처럼 보임 | visibility / safe publication |\n| concurrent collection인데 중복 판단이 샘 | compound action |\n\n## 검증 질문\n\n1. 문제가 되는 값은 method local인가, singleton instance field인가, static인가, DB row인가?\n2. 실패 interleaving을 두 thread 표로 쓸 수 있는가?\n3. 보호해야 하는 invariant가 단일 변수인가, 여러 field나 여러 row를 묶는 조건인가?\n4. visibility만 필요해서 `volatile` reference publish가 충분한가, 복합 update atomicity가 필요한가?\n5. concurrent collection을 쓴다면 `putIfAbsent`, `compute`, lock처럼 check와 write가 한 arbitration으로 묶였는가?\n6. 단일 JVM lock으로 충분한 배포 구조인가, 여러 instance라서 DB/외부 저장소 경계가 필요한가?\n7. 테스트가 실패를 재현하는가뿐 아니라 race를 놓칠 수 있다는 한계를 설명했는가?\n\n## Safe Next Docs\n\n코드 안 race 기본은 `operating-system/thread-safety-and-race-condition`, atomic과 lock 비교는 `operating-system/atomic-vs-lock`, DB 수량 충돌은 `database/shopping-cart-cart-item-quantity-lost-update-version-cas-bridge`로 이어진다.\n",
+  "aliases": [
+    "shared state race condition mission drill",
+    "공유 상태 race condition 드릴",
+    "singleton bean mutable state race",
+    "reservation counter lost update",
+    "shopping cart quantity race drill"
+  ],
+  "expected_queries": [
+    "singleton bean mutable state race condition을 문제로 연습하고 싶어",
+    "장바구니 수량 동시 수정이 thread race인지 DB lost update인지 어떻게 구분해?",
+    "roomescape 예약 동시 생성과 shared state race를 비교해줘",
+    "thread safety와 database concurrency를 미션 예제로 드릴해줘"
+  ],
+  "symptoms": [
+    "singleton Bean이나 service 필드에 mutable state를 두고 요청마다 값이 꼬인다",
+    "동시에 장바구니 수량을 바꾸면 업데이트가 사라지는 것처럼 보인다",
+    "race condition과 DB lost update, thread safety를 한 번에 섞어 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/thread-safety-and-race-condition",
+      "operating-system/atomic-vs-lock"
+    ],
+    "next_docs": [
+      "database/roomescape-reservation-concurrency-bridge",
+      "database/shopping-cart-cart-item-quantity-lost-update-version-cas-bridge",
+      "spring/shopping-cart-current-cart-singleton-bean-scope-bridge"
+    ],
+    "confusable_with": [
+      "operating-system/thread-safety-and-race-condition",
+      "operating-system/atomic-vs-lock",
+      "database/shopping-cart-cart-item-quantity-lost-update-version-cas-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/shared-state-race-condition-mission-drill.md",
+    "revision_history": []
+  }
+}

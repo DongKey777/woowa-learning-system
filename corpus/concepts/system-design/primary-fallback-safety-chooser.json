@@ -1,0 +1,45 @@
+{
+  "id": "system-design/primary-fallback-safety-chooser",
+  "title": "Primary Fallback Safety Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 chooser는 replica lag 상황에서 primary fallback을 언제 켤지 판단한다. recent-write 사용자, stale read 감소, primary headroom, fallback safety 같은 운영 설계 질문을 다룬다.",
+  "body_markdown": "# Primary Fallback Safety Chooser\n\n> 한 줄 요약: primary fallback은 replica/cache/projection이 따라오지 못할 때 더 신선한 source를 읽는 선택지지만, 최신성 보장을 과장하면 primary capacity와 장애 격리를 잃는다. 범위, 시간, headroom, fallback 실패 응답을 함께 정해야 안전하다.\n\n## 운영 증상\n\n| 증상 | 원인 후보 | 바로 볼 증거 |\n|---|---|---|\n| write 직후 같은 사용자가 옛값을 봄 | recent-write read가 replica/cache로 감 | write hint, read source, served version |\n| primary fallback을 늘렸더니 DB latency가 튐 | fallback 범위가 너무 넓음 | fallback QPS, primary CPU/IO, read latency |\n| 특정 화면만 stale에 민감함 | 화면별 freshness requirement가 다름 | endpoint별 stale impact, user action |\n| primary가 포화인데 fallback이 계속 켜짐 | safety gate가 없음 | headroom threshold, breaker/degraded state |\n| fallback했는데도 옛값이 보임 | 앞단 cache/projection 또는 commit 경계 문제 | cache hit, source of truth version, projection watermark |\n\n## 원인 후보\n\nPrimary fallback을 켰는데도 증상이 남는다면 fallback 자체보다 read path의 어느 경계가 최신성 증거를 잃는지 본다.\n\n| 원인 후보 | 왜 fallback만으로 부족한가 | 필요한 추가 장치 |\n|---|---|---|\n| 앞단 cache가 먼저 응답 | primary까지 요청이 내려가지 않음 | cache hit version 검증, stale hit reject |\n| projection 화면을 읽음 | primary DB가 최신이어도 read model은 늦을 수 있음 | watermark, pending UX, source of truth 확인 |\n| required version 미전달 | 응답이 최신인지 비교할 기준이 없음 | write response version, min-version floor |\n| primary capacity 부족 | fallback 확대가 장애를 키움 | fallback budget, degraded mode |\n| write 성공 여부 불확실 | timeout 후 commit 여부가 모호함 | idempotency key, status lookup, reconciliation |\n\n## 10초 chooser\n\n| 상황 | fallback 범위 | 먼저 볼 지표 |\n|---|---|---|\n| 방금 쓴 사용자만 옛값을 보면 안 됨 | recent-write 사용자 | fallback QPS와 primary headroom |\n| 전체 replica lag가 커짐 | 일부 핵심 화면 | stale rate와 error budget |\n| primary가 이미 포화 | fallback 확대 금지 | read-only degraded UX |\n| projection 화면이 뒤처짐 | source of truth 확인 또는 pending | projection watermark gap |\n| cache가 stale hit를 줌 | stale hit reject 후 fallback | rejected hit rate와 latency |\n\n## fallback이 보장하지 않는 것\n\nprimary fallback은 보통 committed source of truth에 더 가까운 read path를 선택한다. 하지만 아래를 자동으로 해결하지 않는다.\n\n- 아직 commit되지 않은 write\n- application/frontend cache가 이미 옛값을 반환한 경우\n- read model/projection을 반드시 읽어야 하는 화면\n- 외부 side effect 성공 여부가 불명확한 command\n- version/watermark가 없어 최신성을 비교할 수 없는 응답\n\n따라서 \"primary로 보내면 최신성 보장\"이 아니라 \"이 화면의 required version을 primary read가 만족할 가능성이 높고, 그 비용을 감당할 수 있다\"라고 말하는 편이 정확하다.\n\n## 안전 조건\n\n### 1. 범위가 좁다\n\nfallback 대상은 보통 아래처럼 좁힌다.\n\n- 최근 write한 사용자\n- write한 entity id와 같은 entity read\n- 결제/권한/재고처럼 stale이 위험한 endpoint\n- 짧은 window, 예: 1-5초 또는 observed lag p99 기반 window\n\n전체 read traffic을 primary로 보내는 것은 fallback이 아니라 topology 변경에 가깝다.\n\n### 2. 기준선이 있다\n\nwrite 응답에서 version, updated_at, event id, watermark 중 하나를 돌려주고 후속 read가 `required_version`으로 전달해야 한다.\n\n```text\nPOST /orders -> committed_version=42\nGET /orders/123 -> required_version=42\n```\n\nfallback 후 응답이 `served_version < required_version`이면 성공한 fallback이 아니다. 이때는 retry, pending, error, source of truth 재확인 중 하나로 처리한다.\n\n### 3. capacity budget이 있다\n\nfallback은 primary capacity를 소비한다. 운영 정책은 아래처럼 숫자로 둔다.\n\n- fallback QPS 상한\n- primary CPU/IO/connection headroom\n- fallback latency SLO\n- error budget burn rate\n- fallback breaker open 조건\n\n### 4. 실패 응답이 안전하다\n\nprimary가 이미 위험하면 fallback을 더 넓히면 안 된다. 이때는 화면별로 degrade해야 한다.\n\n| 기능 | 안전한 degrade | 위험한 degrade |\n|---|---|---|\n| 주문 상세 | 처리 중/잠시 후 갱신 | 없는 주문처럼 표시 |\n| 결제 상태 | 상태 확인 중 | 결제 성공/실패 임의 확정 |\n| 관리자 통계 | watermark와 지연 표시 | 최신 통계라고 표시 |\n| 추천/랭킹 | stale 허용 표시 | 실시간 순위라고 과장 |\n\n## Trade-off\n\n| 선택 | 얻는 것 | 비용/위험 |\n|---|---|---|\n| recent-write fallback | 중요한 read-after-write 보호 | write hint 저장/전파 필요 |\n| endpoint allowlist | business risk 높은 곳만 보호 | 누락 endpoint에서 stale 지속 |\n| min-version floor | 화면 역행 방지 | version 없는 source는 사용 어려움 |\n| fallback budget | primary 보호 | budget 초과 시 stale/degrade 허용 |\n| primary only | freshness 단순화 | read scale-out, 장애 격리 손실 |\n\n## 검증 지표\n\n- freshness: `served_version < required_version` count, stale read rate, replica lag p95/p99\n- routing: fallback QPS, fallback 대상 endpoint 비율, recent-write hint hit rate\n- capacity: primary CPU/IO, connection pool saturation, primary read p95/p99, lock wait\n- safety: fallback rejected due to headroom, degraded response count, breaker open time\n- correctness: fallback 후 source of truth와 응답 mismatch sample, support ticket, duplicate action rate\n\n## Wrong-bucket neighbor\n\n모든 read를 primary로 보내면 stale read는 줄지만 확장성과 장애 격리가 무너진다. primary fallback은 replica lag를 무시하는 스위치가 아니라, `recent-write hint + min-version floor + fallback budget + degraded UX`가 함께 있는 보호 장치다.\n\n## 안전한 다음 문서\n\n- dashboard 설계는 `post-write-stale-dashboard-primer`로 이어진다.\n- DB 관찰은 `replica-lag-observability-routing-slo`에서 lag와 routing SLO를 본다.\n- read-after-write 선택지 비교는 `read-after-write-tradeoff-matrix-chooser`를 참고한다.\n- projection이 source라면 `projection-lag-user-facing-state-router`에서 pending/watermark UX를 분리한다.\n",
+  "aliases": [
+    "primary fallback safety chooser",
+    "replica stale primary fallback headroom",
+    "primary fallback 안전 기준",
+    "복제본 stale primary 우회"
+  ],
+  "expected_queries": [
+    "replica lag가 있을 때 primary fallback을 언제 켜야 안전해?",
+    "stale read를 줄이려고 primary로 보내면 어떤 headroom을 봐야 해?",
+    "방금 쓴 사용자만 primary로 보내는 기준은 뭐야?"
+  ],
+  "symptoms": [
+    "replica lag 때문에 primary fallback을 늘렸더니 primary가 버거워요",
+    "모든 read를 primary로 보내면 되는지 모르겠어요",
+    "recent-write 사용자만 최신성을 보장하고 싶어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/read-after-write-routing-primer"
+    ],
+    "next_docs": [
+      "system-design/post-write-stale-dashboard-primer"
+    ],
+    "confusable_with": [
+      "system-design/read-after-write-routing-primer",
+      "system-design/post-write-stale-dashboard-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/primary-fallback-safety-chooser.md",
+    "revision_history": []
+  }
+}

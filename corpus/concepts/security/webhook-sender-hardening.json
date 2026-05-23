@@ -1,0 +1,52 @@
+{
+  "id": "security/webhook-sender-hardening",
+  "title": "Webhook Sender Hardening",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 Webhook Sender Hardening를 다루는 deep_dive 문서다. webhook sender는 \"보내면 끝\"이 아니라, 재시도, 서명, 타임아웃, 대상 검증, 순서 보장을 포함한 outbound 보안 경계를 운영해야 한다. 검색 질의가 webhook sender, outbound webhook, retry policy, delivery id처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# Webhook Sender Hardening\n\n> 한 줄 요약: webhook sender는 \"보내면 끝\"이 아니라, 재시도, 서명, 타임아웃, 대상 검증, 순서 보장을 포함한 outbound 보안 경계를 운영해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Webhook Signature Verification / Replay Defense](./webhook-signature-verification-replay-defense.md)\n> - [API Key, HMAC Signed Request, Replay Protection](./api-key-hmac-signature-replay-protection.md)\n> - [Secret Management, Rotation, Leak Patterns](./secret-management-rotation-leak-patterns.md)\n> - [SSRF / Egress Control](./ssrf-egress-control.md)\n> - [Rate Limiting vs Brute Force Defense](./rate-limiting-vs-brute-force-defense.md)\n\nretrieval-anchor-keywords: webhook sender, outbound webhook, retry policy, delivery id, signing secret, timeout, backoff, dead letter, endpoint validation, delivery ordering, circuit breaker\n\n---\n\n## 핵심 개념\n\nwebhook sender는 외부 시스템으로 이벤트를 전달하는 outbound 컴포넌트다.  \n받는 쪽만 안전하게 해서는 부족하고, 보내는 쪽도 오작동이나 악용에 강해야 한다.\n\n핵심 책임:\n\n- 대상 endpoint 검증\n- signing\n- 타임아웃과 retry 정책\n- 순서와 중복 처리 전략\n- dead letter 처리\n- secret 보호\n\n즉 sender hardening은 \"외부로 나가는 메시지의 품질과 안전성\"을 통제하는 일이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. sender는 retry storm을 만들 수 있다\n\nsend 실패에 대해 무작정 재시도하면 문제가 커진다.\n\n- 대상 시스템이 이미 죽어 있다\n- 지연이 누적된다\n- 큐가 쌓인다\n- 같은 이벤트가 반복 전송된다\n\n그래서 exponential backoff와 max retry, dead letter queue가 필요하다.\n\n### 2. 대상 endpoint는 입력값이다\n\n사용자나 설정 화면이 webhook destination을 정하면, 그 URL 자체가 위험하다.\n\n- internal 주소를 넣을 수 있다\n- 비정상 redirect가 섞일 수 있다\n- 잘못된 프로토콜을 넣을 수 있다\n\n즉 sender는 outbound SSRF 방어와 비슷한 검증을 가져야 한다.\n\n### 3. signed delivery가 중요하다\n\n받는 쪽이 우리를 신뢰하려면:\n\n- event id\n- timestamp\n- signature\n- delivery id\n\n가 필요하다. sender는 이 값들을 일관되게 생성해야 한다.\n\n### 4. ordering과 dedup은 sender 책임이기도 하다\n\nevent가 순서 민감하면 sender가 더 신경 써야 한다.\n\n- 어떤 이벤트는 순서대로 보내야 한다\n- 어떤 이벤트는 최신 상태만 중요하다\n- duplicate delivery가 발생해도 receiver가 감당 가능해야 한다\n\n### 5. secret rotation이 쉬워야 한다\n\nsender secret이 길게 유지되면 전체 outbound가 위험해진다.\n\n- versioned secret을 둔다\n- old/new를 짧게 중복 허용한다\n- endpoint별로 서명 버전을 기록한다\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 실패한 webhook을 무한 재시도함\n\n대응:\n\n- max retry를 둔다\n- backoff를 적용한다\n- 일정 횟수 후 DLQ로 보낸다\n\n### 시나리오 2: 사용자 설정에 악성 destination이 들어감\n\n대응:\n\n- scheme과 host allowlist를 검사한다\n- private IP와 localhost를 차단한다\n- redirect chain을 다시 검증한다\n\n### 시나리오 3: outbound 서명 secret이 오래 유지됨\n\n대응:\n\n- secret version을 관리한다\n- 회전 중 dual signing/dual verify 기간을 둔다\n- 실패한 delivery를 다시 보내기 전에 version을 확인한다\n\n---\n\n## 코드로 보기\n\n### 1. sender retry 개념\n\n```java\npublic void deliver(WebhookMessage message) {\n    for (int attempt = 1; attempt <= 5; attempt++) {\n        try {\n            httpClient.post(message.targetUrl(), sign(message)).send();\n            return;\n        } catch (Exception ex) {\n            sleep(backoff(attempt));\n        }\n    }\n    deadLetterQueue.publish(message);\n}\n```\n\n### 2. 대상 검증 개념\n\n```java\npublic void validateTarget(URI uri) {\n    if (!Set.of(\"https\").contains(uri.getScheme())) {\n        throw new IllegalArgumentException(\"invalid webhook target\");\n    }\n    if (isPrivateAddress(resolve(uri.getHost()))) {\n        throw new SecurityException(\"blocked webhook destination\");\n    }\n}\n```\n\n### 3. delivery metadata\n\n```text\n1. delivery_id를 발급한다\n2. timestamp와 signature를 붙인다\n3. retries는 동일 delivery_id를 유지한다\n4. receiver가 dedup할 수 있게 한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| fire-and-forget | 단순하다 | 실패 추적이 어렵다 | 낮은 중요도 알림 |\n| retry with backoff | 안정적이다 | 중복 전송이 생긴다 | 일반 webhook |\n| DLQ + alert | 운영이 강하다 | 처리 체계가 필요하다 | 중요한 integration |\n| per-target signing | 보안이 좋다 | secret 관리가 늘어난다 | 파트너 연동 |\n\n판단 기준은 이렇다.\n\n- delivery 실패를 어디까지 자동 재시도할 것인가\n- 대상 URL을 누가 설정하는가\n- duplicate delivery를 수용할 수 있는가\n- secret versioning과 rotation을 할 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: webhook sender도 왜 hardening이 필요한가요?\n> 의도: outbound도 공격면이라는 점을 아는지 확인\n> 핵심: 잘못된 대상 전송과 retry storm이 위험하기 때문이다.\n\n> Q: dead letter queue가 왜 필요한가요?\n> 의도: 무한 재시도와 운영 안정성을 이해하는지 확인\n> 핵심: 실패한 delivery를 분리해 운영자가 다룰 수 있게 하기 위해서다.\n\n> Q: 대상 URL 검증이 왜 중요한가요?\n> 의도: outbound SSRF 경계를 아는지 확인\n> 핵심: 내부 주소나 악성 프로토콜로 보내는 사고를 막기 위해서다.\n\n> Q: delivery_id와 signature는 왜 함께 써야 하나요?\n> 의도: 재전송과 위조 방어를 구분하는지 확인\n> 핵심: 하나는 중복 추적, 다른 하나는 무결성 보장이다.\n\n## 한 줄 정리\n\nwebhook sender hardening은 외부 시스템에 메시지를 보낼 때도 대상 검증, 재시도, 서명, 비밀 관리까지 포함해야 한다는 뜻이다.\n",
+  "aliases": [
+    "webhook sender",
+    "outbound webhook",
+    "retry policy",
+    "delivery id",
+    "signing secret",
+    "timeout",
+    "backoff",
+    "dead letter",
+    "endpoint validation",
+    "delivery ordering",
+    "circuit breaker",
+    "Webhook Sender Hardening"
+  ],
+  "expected_queries": [
+    "Webhook Sender Hardening 핵심 개념을 설명해줘",
+    "webhook sender가 왜 필요한지 알려줘",
+    "Webhook Sender Hardening 실무 설계 포인트는 뭐야?",
+    "webhook sender에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Webhook Sender Hardening`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
+    "`Webhook Sender Hardening` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Webhook Sender Hardening`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/owasp-top10-basics"
+    ],
+    "next_docs": [
+      "security/authentication-form-login-vs-jwt-vs-session-cookie-chooser"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/webhook-sender-hardening.md",
+    "revision_history": []
+  }
+}

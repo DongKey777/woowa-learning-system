@@ -1,0 +1,45 @@
+{
+  "id": "database/write-ahead-log-durability-interview-primer",
+  "title": "Write Ahead Log Durability Interview Primer",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 primer는 Write-Ahead Logging과 durability를 면접 답변으로 설명한다. log flush, dirty page, recovery를 구분한다.",
+  "body_markdown": "# Write Ahead Log Durability Interview Primer\n\n## 한 줄 요약\n\nWAL(Write-Ahead Log)은 변경된 data page를 나중에 flush하더라도, 그 page를 복구할 수 있는 log record를 먼저 안정 저장소에 남겨 crash 후 committed change를 redo할 수 있게 하는 durability 기법이다.\n\n## Topic-specific invariant\n\nWAL의 핵심 불변식은 두 층으로 나뉜다.\n\n1. **write-ahead invariant**: 어떤 data page 버전을 디스크에 flush하기 전에, 그 변경을 설명하는 log record가 먼저 durable해야 한다.\n2. **commit durability invariant**: DB가 commit 성공을 응답했다면, 설정된 durability 정책 기준으로 그 transaction의 commit/redo log record가 crash 후 recovery 가능한 위치까지 기록되어야 한다.\n\n이 말은 \"commit 순간에 data page가 전부 디스크에 써졌다\"가 아니다. data page flush와 commit log flush는 분리된다.\n\n## 네 가지 로그/flush를 분리하기\n\n| 용어 | 주된 목적 | commit durable과의 관계 | 면접에서의 주의점 |\n|---|---|---|---|\n| WAL / redo log / transaction log | crash recovery, redo | commit 성공의 durability 근거가 되는 핵심 로그 | data page 자체가 아니라 변경 기록이다 |\n| data page flush | 실제 table/index page를 디스크에 반영 | 보통 commit보다 늦어도 된다 | checkpoint와 dirty page 관리 대상이다 |\n| binlog / logical log | replication, point-in-time recovery, auditing | 엔진 redo log와 별도일 수 있다 | MySQL에서는 redo와 binlog commit ordering/2PC가 중요하다 |\n| replication log shipping/apply | 다른 node로 전파 | async replication이면 primary commit과 별개다 | replica에 보였는지는 durability와 다른 질문이다 |\n\n이 구분이 중요하다. \"commit은 binlog에 쓰는 것이다\" 또는 \"commit은 data page flush다\"라고 말하면 DB 엔진 내부 durability, replication, recovery 목적이 섞인다.\n\n## commit이 durable하다는 뜻\n\n일반적인 WAL 기반 DB에서 commit 흐름은 다음 mental model로 잡는다.\n\n```text\ntransaction modifies pages in memory\n  -> append redo/WAL records\n  -> commit record is written\n  -> WAL is flushed/fsync'd according to durability setting\n  -> client receives commit success\n  -> dirty data pages are flushed later by checkpoint/background writer\n```\n\n`fsync`를 매 commit마다 강하게 호출하면 crash safety는 강하지만 latency가 커진다. 그래서 DB는 group commit으로 여러 transaction의 log flush를 묶어 처리한다. 반대로 `fsync`를 느슨하게 설정하면 latency는 줄지만 OS crash나 power loss 시 최근 commit이 사라질 수 있다.\n\n주의할 점은 \"durable\"이 제품 설정과 storage 계층의 정직성에 의존한다는 것이다. MySQL의 `innodb_flush_log_at_trx_commit`, `sync_binlog`, PostgreSQL의 `synchronous_commit`, 디스크 write cache/배터리 백업 여부에 따라 commit 성공 후 보존 범위가 달라진다.\n\n## crash recovery에서 무슨 일이 일어나나\n\ncrash 후 DB는 마지막 checkpoint 이후의 WAL을 읽는다.\n\n- committed transaction의 log record는 redo해서 반영한다.\n- uncommitted transaction의 영향은 undo하거나 무시한다.\n- dirty page가 crash 전에 flush되지 않았어도 redo log가 있으면 복구할 수 있다.\n- data page가 일부만 써지는 torn page 문제는 checksum, doublewrite buffer, full page write 같은 별도 장치가 필요할 수 있다.\n\n여기서 WAL은 \"page flush를 없애는 장치\"가 아니라 \"page flush를 늦춰도 crash recovery가 가능하게 하는 장치\"다.\n\n## 실무에서 볼 증거\n\n| 지표/증거 | 의미 | 의심할 문제 |\n|---|---|---|\n| log flush/fsync latency | commit path에서 stable storage 대기 시간 | storage latency, fsync storm |\n| group commit batch size | 한 번 flush에 묶인 transaction 수 | throughput/latency trade-off |\n| redo/WAL generation rate | 초당 log 생성량 | checkpoint 압박, I/O 포화 |\n| checkpoint age / dirty page ratio | 아직 page flush가 따라잡지 못한 정도 | recovery time 증가, burst flush |\n| binlog fsync setting | logical log durable 정책 | PITR/replication gap 위험 |\n| replica apply lag | replication log 적용 지연 | read-after-write와 failover risk |\n\n운영 질문에서는 \"commit latency가 늘었다\"와 \"replica lag가 늘었다\"를 분리해야 한다. 전자는 WAL flush path 문제일 수 있고, 후자는 binlog shipping/apply나 replica 처리량 문제일 수 있다.\n\n## 흔한 오개념\n\n| 오개념 | 왜 틀리기 쉬운가 | 더 정확한 답 |\n|---|---|---|\n| commit하면 data page가 즉시 디스크에 써진다 | dirty page는 background flush/checkpoint로 늦게 써질 수 있다 | 강한 durability 설정에서 commit durable의 근거는 WAL flush다 |\n| WAL과 binlog는 같은 것이다 | redo는 physical recovery, binlog는 logical replication/PITR 성격이 강하다 | 목적과 commit ordering을 나눠 말한다 |\n| replica에 전달됐으니 primary commit도 안전하다 | async replication은 primary durability와 replica visibility가 다르다 | synchronous/semi-sync 여부를 확인한다 |\n| fsync를 끄면 성능만 좋아진다 | crash 시 최근 commit loss 가능성이 커진다 | durability policy와 RPO를 같이 말한다 |\n| WAL만 있으면 torn page도 자동 해결된다 | page가 일부만 써진 손상은 별도 방어가 필요할 수 있다 | doublewrite/full-page-write/checksum을 구분한다 |\n| sync replication이면 무조건 commit loss가 없다 | remote flush/apply 기준과 quorum 설정에 따라 보장 범위가 다르다 | primary local durability와 replication durability를 각각 확인한다 |\n\n## 면접 답변 축\n\n1. WAL은 data page보다 변경 로그를 먼저 durable하게 남기는 write-ahead 원칙이다.\n2. commit 성공은 보통 data page flush 완료가 아니라 commit/redo log가 recovery 가능한 상태가 됐다는 뜻이다.\n3. dirty page는 checkpoint/background flush로 나중에 내려가고, crash 시 WAL replay로 복구한다.\n4. binlog/replication log는 redo log와 목적이 다르므로 replication/PITR/HA 이야기는 따로 분리한다.\n5. 성능 trade-off는 fsync latency와 group commit, durability setting, checkpoint pressure로 설명한다.\n\n## 짧은 예시 답변\n\n\"WAL은 변경된 page를 바로 디스크에 쓰지 않아도, 그 변경을 재현할 수 있는 log를 먼저 안정 저장소에 남기는 방식입니다. commit이 durable하다는 말은 보통 data page가 전부 flush됐다는 뜻이 아니라 commit record가 redo 가능한 로그에 flush됐다는 뜻입니다. binlog나 replication log는 replication/PITR 목적이 섞인 별도 로그일 수 있으니 redo log와 구분하고, 운영에서는 fsync latency, group commit, checkpoint age, replica lag를 나눠 보겠습니다.\"\n\n## Safe Next Docs\n\npage 손상 방어는 `doublewrite-buffer-torn-page-protection`, dirty page flush는 `adaptive-flushing-heuristics-dirty-page-feedback`로 이어진다.\n",
+  "aliases": [
+    "WAL durability interview",
+    "write ahead log answer",
+    "트랜잭션 로그 내구성 면접",
+    "commit fsync 설명"
+  ],
+  "expected_queries": [
+    "WAL은 왜 필요한지 면접에서 설명해줘",
+    "commit이 durable하다는 건 디스크에 뭘 쓴다는 뜻이야?",
+    "redo log와 data page flush는 왜 분리돼?"
+  ],
+  "symptoms": [
+    "commit하면 data page가 바로 디스크에 쓰인다고 생각해요",
+    "WAL과 binlog/replication log를 모두 같은 말로 써요",
+    "fsync 지연과 group commit trade-off를 놓쳐요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-isolation-basics"
+    ],
+    "next_docs": [
+      "database/doublewrite-buffer-torn-page-protection"
+    ],
+    "confusable_with": [
+      "database/doublewrite-buffer-torn-page-protection",
+      "database/adaptive-flushing-heuristics-dirty-page-feedback"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/write-ahead-log-durability-interview-primer.md",
+    "revision_history": []
+  }
+}

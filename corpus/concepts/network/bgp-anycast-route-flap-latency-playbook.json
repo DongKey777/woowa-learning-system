@@ -1,0 +1,55 @@
+{
+  "id": "network/bgp-anycast-route-flap-latency-playbook",
+  "title": "BGP Anycast Route Flap Latency Playbook",
+  "category": "network",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# BGP Anycast Route Flap Latency Playbook\n\n> 한 줄 요약: anycast latency 사고는 \"같은 IP가 느려졌다\"가 아니라, BGP 경로 선택 변화로 어떤 사용자 집합이 어느 POP로 들어왔는지 재구성하는 문제다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [CDN 기초](../system-design/cdn-basics.md)\n- [Global Traffic Failover Control Plane 설계](../system-design/global-traffic-failover-control-plane-design.md)\n- [CDN Vendor Header Crosswalk Mini Card](./cdn-vendor-header-crosswalk-cloudfront-cloudflare-mini-card.md)\n- [DNS Negative Cache Failover Playbook](./dns-negative-cache-failover-playbook.md)\n- [Packet Loss, Jitter, Reordering Diagnostics](./packet-loss-jitter-reordering-diagnostics.md)\n\nretrieval-anchor-keywords: bgp anycast route flap, anycast latency spike, bgp withdraw announce, edge pop failover, route convergence, internet routing latency, anycast pop oscillation, cdn anycast failover, bgp local preference, as path change\n\n## 이 문서가 맞는 상황\n\n사용자는 같은 hostname이나 같은 anycast IP를 계속 호출하는데, 특정 ISP/국가/도시에서만 RTT, TLS handshake, TTFB가 갑자기 늘어난다. 애플리케이션 로그에는 5xx가 없고, origin CPU도 안정적인데 edge POP별 ingress traffic이 급하게 이동한다. 이때 \"CDN이 느리다\"나 \"DNS 전파 문제\"로 바로 묶으면 틀리기 쉽다.\n\nAnycast는 여러 POP가 같은 prefix를 BGP로 광고하고, 인터넷 라우팅 정책이 각 client 경로를 하나의 POP로 끌고 가는 구조다. 사용자가 어느 POP에 닿는지는 HTTP header가 아니라 BGP control plane, ISP policy, AS path, local preference, communities, withdrawal/announce timing의 결과다.\n\n## Mental Model\n\nanycast의 핵심 문장은 이렇다.\n\n```text\nsame destination IP\n  -> many POPs advertise the prefix\n  -> each network chooses a best route\n  -> traffic moves when route visibility or policy changes\n```\n\nroute flap은 같은 prefix가 짧은 시간에 announce, withdraw, preference change를 반복하는 상태다. POP health automation이 불안정하거나, upstream link가 흔들리거나, maintenance drain과 auto re-advertise가 충돌하면 발생한다. BGP는 application latency를 직접 보지 않는다. BGP가 보는 것은 경로의 존재와 정책이고, 사용자가 느끼는 것은 바뀐 POP까지의 네트워크 거리, 해당 POP의 cache warmness, origin fetch path, queueing이다.\n\n따라서 invariant는 다음이다.\n\n> anycast route-flap으로 판정하려면 같은 시간대에 route visibility 변화와 POP별 traffic redistribution이 함께 보여야 한다. RTT/TTFB 상승만으로는 route flap이 아니다.\n\n## Operational Signals\n\n가장 먼저 같은 timeline에 아래 신호를 붙인다.\n\n- BGP update: prefix announce/withdraw, AS path 변화, route collector에서 보이는 visibility 변화\n- POP ingress: region/POP별 request rate, active connection, connection accept rate\n- user-facing latency: client RTT, TCP connect, TLS handshake, TTFB, TTLB를 국가/ASN별로 분리\n- edge response context: `Server`, `Via`, `CF-Ray`, `X-Cache`, POP code 같은 vendor header\n- origin pressure: cache MISS rate, origin fetch latency, origin egress, upstream 5xx\n- automation state: health check flapping, drain switch, maintenance window, manual override\n\n이 신호들이 같은 방향을 가리켜야 한다. 예를 들어 APAC 사용자의 RTT가 늘고, route collector에서 APAC ISP가 서울 POP 경로를 잃었고, 도쿄/싱가포르 POP ingress가 동시에 늘었다면 anycast 경로 이동 후보가 강하다. 반대로 edge POP는 그대로인데 TTFB만 늘면 origin, cache MISS, connection pool, upstream queue를 먼저 본다.\n\n## Failure Matrix\n\n| 증상 | 가까운 후보 | 확인 신호 | 피해야 할 오판 |\n|---|---|---|---|\n| 특정 ASN만 먼 POP로 이동 | ISP policy 또는 upstream route change | 해당 ASN traceroute/MTR, route collector AS path | 전체 CDN 장애로 확대 |\n| POP traffic이 빠졌다가 반복 복귀 | health automation flap | withdraw/announce 반복, health check boundary oscillation | origin latency만 추적 |\n| withdraw 후 latency는 내려갔지만 MISS가 폭증 | cold POP 또는 origin fetch shift | cache hit ratio 하락, origin request burst | BGP convergence 완료로 incident 종료 |\n| DNS 응답은 그대로인데 지역별 경로만 다름 | anycast path selection | same IP, different POP code | DNS failover 지연으로 분류 |\n| 모든 POP에서 RTT가 비슷하게 상승 | transit congestion or packet loss | loss/jitter, retransmit, multiple prefixes 영향 | anycast flap으로 단정 |\n| 한 POP만 5xx 증가 | edge/app local failure | POP-local 5xx, route는 안정 | BGP routing 문제로 전가 |\n\n## Triage Playbook\n\n1. 사용자 신고를 국가보다 ASN, resolver, POP code, timestamp로 묶는다. anycast 사고에서는 \"한국\"보다 \"특정 ISP\"가 더 정확한 단위일 때가 많다.\n2. hostname이 DNS로 다른 IP를 받은 것인지, 같은 anycast IP인데 route가 달라진 것인지 분리한다. 같은 IP라면 DNS TTL보다 BGP visibility를 먼저 본다.\n3. route collector, looking glass, provider route telemetry에서 prefix announce/withdraw와 AS path 변화를 찾는다. 내부 BGP state만 보지 말고 외부 vantage point도 확인한다.\n4. POP별 ingress와 latency를 같은 그래프에 놓는다. traffic이 줄어든 POP, 늘어난 POP, 사용자가 체감한 POP가 맞아야 한다.\n5. 자동 drain, health check, upstream maintenance, DDoS mitigation, RPKI/ROA 변경, community policy 변경이 같은 시각에 있었는지 확인한다.\n6. 안정화는 한 번에 복귀시키지 않는다. POP를 다시 광고할 때 cache warm-up, connection ramp, origin headroom을 보고 staged re-entry를 둔다.\n\n운영 중에는 route flap dampening을 만능 복구책으로 기대하면 안 된다. 네트워크마다 dampening 정책이 다르고, 과도한 flap은 일부 경로에서 더 오래 suppress될 수 있다. 안전한 대응은 흔들리는 POP 광고를 명시적으로 고정하거나 빼고, target POP의 capacity와 origin path를 검증한 뒤 천천히 re-advertise하는 것이다.\n\n## Wrong-Bucket Neighbors\n\n- DNS negative cache: hostname이 `NXDOMAIN` 또는 다른 address로 보이는 문제다. anycast flap은 보통 같은 destination IP에서 route가 바뀐다.\n- CDN cache key/invalidation: 응답 body가 섞이거나 오래된 객체가 남는 문제다. anycast flap은 어느 edge에 도착했는지가 먼저다.\n- packet loss/jitter: 모든 경로에서 손실이 늘면 transport 문제다. anycast는 POP/ASN별 traffic redistribution이 핵심 증거다.\n- global traffic control plane: region traffic percentage를 정책적으로 바꾸는 설계다. anycast BGP flap은 인터넷 경로 수렴과 POP advertisement 안정성이 중심이다.\n\n## Safe Next Docs\n\nDNS와 섞이는 증상은 `network/dns-negative-cache-failover-playbook`, edge header 읽기는 `network/cdn-vendor-header-crosswalk-cloudfront-cloudflare-mini-card`, 더 넓은 리전 제어 설계는 `system-design/global-traffic-failover-control-plane-design`으로 이어진다.\n\n## 한 줄 정리\n\nBGP anycast route flap은 \"edge가 느림\"이 아니라 prefix 광고와 인터넷 경로 수렴이 POP별 traffic, cache warmness, client latency를 어떻게 재배치했는지 증거로 맞추는 운영 사고다.\n",
+  "aliases": [
+    "BGP anycast route flap",
+    "anycast latency spike",
+    "BGP withdrawal convergence",
+    "route flap latency",
+    "edge POP oscillation",
+    "anycast failover playbook"
+  ],
+  "expected_queries": [
+    "Anycast IP를 쓰는데 특정 지역만 갑자기 멀어진 원인을 어떻게 봐?",
+    "BGP route flap이 edge latency spike로 보일 때 어떤 증거를 모아야 해?",
+    "CDN POP 장애조치 후 트래픽이 되돌아왔다가 다시 빠지는 현상을 설명해줘",
+    "Anycast failover와 DNS failover를 운영 지표로 어떻게 구분해?",
+    "BGP withdraw announce가 사용자 TTFB에 영향을 주는 과정을 playbook으로 정리해줘"
+  ],
+  "symptoms": [
+    "같은 anycast IP인데 일부 지역 사용자만 갑자기 먼 POP로 붙고 RTT가 튑니다",
+    "CDN/edge 5xx는 없는데 TTFB와 first-byte latency가 지역별로 계단식 상승합니다",
+    "POP 장애 조치 후 트래픽이 빠졌다가 다시 돌아오는 oscillation이 반복됩니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cdn-basics",
+      "system-design/global-traffic-failover-control-plane-design",
+      "network/cdn-vendor-header-crosswalk-cloudfront-cloudflare-mini-card"
+    ],
+    "next_docs": [
+      "network/dns-negative-cache-failover-playbook",
+      "network/packet-loss-jitter-reordering-diagnostics",
+      "system-design/global-traffic-failover-control-plane-design"
+    ],
+    "confusable_with": [
+      "network/dns-negative-cache-failover-playbook",
+      "network/cdn-vendor-header-crosswalk-cloudfront-cloudflare-mini-card",
+      "network/packet-loss-jitter-reordering-diagnostics",
+      "system-design/global-traffic-failover-control-plane-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/network/bgp-anycast-route-flap-latency-playbook.md",
+    "revision_history": []
+  }
+}

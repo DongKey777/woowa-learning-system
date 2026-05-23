@@ -1,0 +1,54 @@
+{
+  "id": "system-design/shard-rebalancing-partition-relocation-design",
+  "title": "Shard Rebalancing / Partition Relocation 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Shard Rebalancing / Partition Relocation 설계를 다루는 deep_dive 문서다. shard rebalancing과 partition relocation은 상태를 가진 파티션을 노드 사이에서 점진적으로 옮겨, hot shard 완화와 노드 증설·축소를 서비스 중단 없이 처리하는 stateful platform 운영 기술이다. 검색 질의가 shard rebalancing, partition relocation, hot shard, partition migration처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Shard Rebalancing / Partition Relocation 설계\n\n> 한 줄 요약: shard rebalancing과 partition relocation은 상태를 가진 파티션을 노드 사이에서 점진적으로 옮겨, hot shard 완화와 노드 증설·축소를 서비스 중단 없이 처리하는 stateful platform 운영 기술이다.\n\nretrieval-anchor-keywords: shard rebalancing, partition relocation, hot shard, partition migration, ownership transfer, copy catchup cutover, shard split, rebalance planner, drain warmup, placement control plane, failover policy, tenant reassignment, receiver warmup, write freeze\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Session Store 설계 at Scale](./session-store-design-at-scale.md)\n> - [Service Discovery / Health Routing 설계](./service-discovery-health-routing-design.md)\n> - [Zero-Downtime Schema Migration Platform 설계](./zero-downtime-schema-migration-platform-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Consensus Membership Reconfiguration 설계](./consensus-membership-reconfiguration-design.md)\n> - [Tenant Partition Strategy / Reassignment 설계](./tenant-partition-strategy-reassignment-design.md)\n> - [Receiver Warmup / Cache Prefill / Write Freeze Cutover 설계](./receiver-warmup-cache-prefill-write-freeze-cutover-design.md)\n\n## 핵심 개념\n\nstateful 시스템은 노드를 늘리는 것만으로 자동 확장되지 않는다.\n데이터와 ownership도 같이 옮겨야 한다.\n\n실전에서 relocation은 다음 문제를 동시에 가진다.\n\n- 현재 트래픽을 받는 shard를 끊지 않고 옮겨야 한다\n- 복사 중에도 새 write가 계속 들어온다\n- routing metadata가 늦게 퍼지면 dual owner가 생길 수 있다\n- hot shard는 단순 이동만으로는 해결되지 않을 수 있다\n\n즉, shard relocation은 단순 copy 작업이 아니라 **copy, catch-up, fencing, cutover를 포함한 상태 이전 절차**다.\n\n## 깊이 들어가기\n\n### 1. 왜 rebalance가 필요한가\n\n대표적인 트리거:\n\n- 노드 추가/제거\n- 용량 불균형\n- 특정 tenant 또는 key의 hot shard\n- 리전 evacuation\n- 하드웨어 교체\n\n평균 분산이 좋아 보여도, 실제 운영에서는 상위 몇 개 shard가 대부분의 문제를 만든다.\n\n### 2. Capacity Estimation\n\n예:\n\n- shard 총 2만 개\n- shard당 평균 30 GB\n- hot shard는 평시 write QPS의 8배\n- relocation 동시 실행 50개\n\n이때 봐야 할 숫자:\n\n- bytes to move\n- catch-up lag\n- ownership handoff latency\n- donor / receiver saturation\n- rebalance completion time\n\n재배치는 background 작업이지만, 잘못하면 사용자 경로의 p99를 직접 흔든다.\n\n### 3. Placement control plane\n\n좋은 시스템은 placement를 명시적으로 관리한다.\n\n- shard -> node mapping\n- desired state\n- current state\n- move plan\n- fencing token\n- drain / warm-up state\n\n이 정보가 없으면 운영자는 \"이 shard가 지금 누구 것인지\"조차 확신하기 어렵다.\n\n### 4. Copy, catch-up, cutover\n\n가장 흔한 이전 절차:\n\n1. receiver에 snapshot copy\n2. donor의 새 write를 log tailing으로 따라잡기\n3. lag가 충분히 줄어들면 short freeze 또는 fenced handoff\n4. routing metadata cutover\n5. donor drain 및 cleanup\n\n즉, 장시간 전체 중단 대신 짧은 최종 handoff 구간만 만드는 것이 목표다.\n\n### 5. Fencing과 dual owner 방지\n\n가장 위험한 상태는 donor와 receiver가 동시에 owner라고 믿는 것이다.\n\n대응:\n\n- monotonically increasing fencing token\n- lease expiration\n- routing version\n- write freeze window\n\n특히 client-side routing이나 local cache가 있으면 stale metadata가 오래 남을 수 있어 더 조심해야 한다.\n\n### 6. Hot shard는 split이 필요할 수 있다\n\nhot shard를 다른 노드로 옮겨도, 여전히 한 shard 자체가 뜨거우면 문제는 남는다.\n\n그래서 선택지가 나뉜다.\n\n- relocate only\n- logical split\n- key remap\n- read replica / follower offload\n\n즉, rebalance는 placement 문제와 key design 문제를 구분해서 봐야 한다.\n특히 multi-tenant 시스템에서는 shard 이동이 곧 tenant reassignment로 이어질 수 있으므로, tenant directory와 placement class를 같이 관리하는 편이 좋다.\n\n### 7. Warm-up과 관측성\n\n새 receiver는 데이터만 있다고 바로 준비되는 것이 아니다.\n\n- cache warm-up\n- connection pool 안정화\n- compaction / index build\n- query latency soak period\n\n운영자는 다음을 봐야 한다.\n\n- relocation lag\n- handoff retry count\n- per-shard latency\n- stale route miss\n- donor/receiver CPU and IO\n\n## 실전 시나리오\n\n### 시나리오 1: 캐시 cluster 증설\n\n문제:\n\n- 새 노드를 추가했더니 key 이동이 많아 cache miss가 폭증한다\n\n해결:\n\n- virtual node를 점진적으로 추가한다\n- hot shard부터 우선 이전한다\n- receiver warm-up 동안 traffic weight를 제한한다\n\n### 시나리오 2: session store 노드 장애 전 drain\n\n문제:\n\n- 특정 노드를 내리기 전에 세션 shard를 옮겨야 한다\n\n해결:\n\n- node를 donor-only 상태로 둔다\n- shard snapshot과 delta catch-up을 수행한다\n- cutover 후 donor를 read-only drain으로 유지한다\n\n### 시나리오 3: multi-region evacuation\n\n문제:\n\n- 한 region의 상태 shard를 다른 region으로 옮겨야 한다\n\n해결:\n\n- routing version과 fencing token을 region 단위로 관리한다\n- replication lag와 write locality 정책을 함께 본다\n- cross-region copy는 hot path보다 낮은 우선순위로 제한한다\n\n## 코드로 보기\n\n```pseudo\nfunction relocate(shard, donor, receiver):\n  snapshot = donor.snapshot(shard)\n  receiver.restore(snapshot)\n  while lag(shard, donor, receiver) > threshold:\n    delta = donor.readChanges(shard)\n    receiver.apply(delta)\n  token = placement.issueFence(shard)\n  donor.freezeWrites(shard, token)\n  receiver.promote(shard, token)\n  placement.updateOwner(shard, receiver, token)\n```\n\n```java\npublic void moveShard(ShardId shardId, NodeId target) {\n    RelocationPlan plan = planner.plan(shardId, target);\n    relocationExecutor.execute(plan);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Stop-the-world move | 단순하다 | downtime이 크다 | 내부 배치, 작은 상태 |\n| Copy + catch-up + cutover | 무중단에 가깝다 | 운영 복잡도 증가 | 대부분의 stateful 플랫폼 |\n| Consistent hashing only | 자동성이 좋다 | hot shard와 drain 제어가 약하다 | 단순 캐시 |\n| Manual placement | 제어력이 높다 | 운영 부담이 크다 | 고가치 shard, special tenant |\n| Logical shard split | 근본 해결이 된다 | 애플리케이션 영향이 크다 | hot shard가 구조적일 때 |\n\n핵심은 shard rebalancing이 노드 운영이 아니라 **상태 ownership을 안전하게 이전하는 stateful platform 절차**라는 점이다.\n\n## 꼬리질문\n\n> Q: consistent hashing이 있으면 rebalancing 문제는 끝나지 않나요?\n> 의도: 평균 분산과 state move 차이 이해 확인\n> 핵심: 아니다. 실제 state copy, catch-up, warm-up, fencing은 별도 운영 문제가 된다.\n\n> Q: 왜 routing metadata version이 중요한가요?\n> 의도: stale route와 dual owner 이해 확인\n> 핵심: 일부 클라이언트가 늦게 갱신되더라도 누가 최신 owner인지 판별해야 하기 때문이다.\n\n> Q: hot shard를 옮기기만 하면 되나요?\n> 의도: hot shard의 구조적 원인 이해 확인\n> 핵심: key 자체가 뜨거우면 split이나 read offload가 필요할 수 있다.\n\n> Q: donor를 바로 지우지 않고 drain 기간을 두는 이유는?\n> 의도: cutover 안전장치 이해 확인\n> 핵심: stale route, 늦은 ack, rollback 가능성을 흡수하기 위해서다.\n\n## 한 줄 정리\n\nShard rebalancing과 partition relocation은 상태를 가진 파티션의 ownership을 copy, catch-up, fencing, cutover 절차로 안전하게 옮겨 stateful 플랫폼의 증설과 장애 대응을 가능하게 하는 운영 기술이다.\n",
+  "aliases": [
+    "shard rebalancing",
+    "partition relocation",
+    "hot shard",
+    "partition migration",
+    "ownership transfer",
+    "copy catchup cutover",
+    "shard split",
+    "rebalance planner",
+    "drain warmup",
+    "placement control plane",
+    "failover policy",
+    "tenant reassignment"
+  ],
+  "expected_queries": [
+    "Shard Rebalancing / Partition Relocation 설계 설계 핵심을 설명해줘",
+    "shard rebalancing가 왜 필요한지 알려줘",
+    "Shard Rebalancing / Partition Relocation 설계 실무 트레이드오프는 뭐야?",
+    "shard rebalancing 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Shard Rebalancing / Partition Relocation 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Shard Rebalancing / Partition Relocation 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Shard Rebalancing / Partition Relocation 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/database-scaling-primer"
+    ],
+    "next_docs": [
+      "system-design/tenant-partition-strategy-reassignment-design"
+    ],
+    "confusable_with": [
+      "system-design/stateful-workload-placement-failover-control-plane-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/shard-rebalancing-partition-relocation-design.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "id": "security/workload-identity-user-context-propagation-boundaries",
+  "title": "Workload Identity / User Context Propagation Boundaries",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 문서는 security 카테고리에서 Workload Identity / User Context Propagation Boundaries를 다루는 deep_dive 문서다. 서비스 간 신뢰에서 가장 중요한 분리는 \"누가 호출한 workload인가\"와 \"그 요청이 어떤 사용자 맥락을 대리하는가\"를 섞지 않는 것이며, 둘을 분리해야 on-behalf-of, audit, downscoping, confused deputy 방어가 가능해진다. 검색 질의가 workload identity, user context propagation, end-user context, service identity처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
+  "body_markdown": "# Workload Identity / User Context Propagation Boundaries\n\n> 한 줄 요약: 서비스 간 신뢰에서 가장 중요한 분리는 \"누가 호출한 workload인가\"와 \"그 요청이 어떤 사용자 맥락을 대리하는가\"를 섞지 않는 것이며, 둘을 분리해야 on-behalf-of, audit, downscoping, confused deputy 방어가 가능해진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Service-to-Service Auth: mTLS, JWT, SPIFFE](./service-to-service-auth-mtls-jwt-spiffe.md)\n> - [Gateway Auth Context Headers / Trust Boundary](./gateway-auth-context-header-trust-boundary.md)\n> - [Token Exchange / Impersonation Risks](./token-exchange-impersonation-risks.md)\n> - [Workload Identity / Long-Lived Service Account Keys](./workload-identity-vs-long-lived-service-account-keys.md)\n> - [Support Operator / Acting-on-Behalf-Of Controls](./support-operator-acting-on-behalf-of-controls.md)\n> - [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n> - [Background Job Auth Context / Revalidation](./background-job-auth-context-revalidation.md)\n\nretrieval-anchor-keywords: workload identity, user context propagation, end-user context, service identity, caller identity, on-behalf-of, actor subject separation, delegated user context, zero trust service boundary, confused deputy, support operator\n\n---\n\n## 핵심 개념\n\n마이크로서비스에서 흔히 일어나는 혼선은 이 두 질문을 하나로 취급하는 것이다.\n\n- 이 요청을 보낸 네트워크 주체는 누구인가\n- 이 요청이 대신하고 있는 최종 사용자는 누구인가\n\n첫 번째는 workload identity 문제다.  \n두 번째는 user context propagation 문제다.\n\n둘을 섞으면 다음 사고가 난다.\n\n- 서비스가 자기 권한과 사용자 권한을 구분하지 못한다\n- downstream이 caller service를 안 보고 user claim만 믿는다\n- acting-on-behalf-of audit가 사라진다\n- token exchange가 권한 확대 통로가 된다\n\n즉 service-to-service trust boundary의 핵심은 workload identity와 user context를 동시에 보되, 같은 것으로 취급하지 않는 것이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. workload identity는 \"어떤 서비스인가\"를 말한다\n\n보통 다음으로 표현된다.\n\n- mTLS client certificate\n- SPIFFE ID\n- workload token\n- service account federation\n\n이 정보는 caller service 자체를 증명한다.\n\n예:\n\n- `payments-api`\n- `report-worker`\n- `admin-bff`\n\n### 2. user context는 \"누구를 대신해 무엇을 하려는가\"를 말한다\n\n이건 별도 축이다.\n\n- user id\n- tenant id\n- delegated scope\n- actor / subject 관계\n- session or assurance context\n\n즉 같은 `admin-bff`라도:\n\n- 자기 시스템 작업인지\n- 특정 사용자를 대신한 호출인지\n- support operator가 acting-on-behalf-of인지\n\n가 다를 수 있다.\n\n### 3. downstream은 user context보다 caller workload identity를 먼저 확인해야 한다\n\n많이 하는 실수:\n\n- user claim만 있으면 downstream이 호출을 받아 준다\n\n안전한 순서:\n\n1. trusted workload인가 확인\n2. 이 workload가 user context를 대리할 자격이 있는가 확인\n3. user context의 audience와 scope가 좁혀졌는가 확인\n4. actor와 subject를 audit에 남긴다\n\n즉 \"이 사용자라서 허용\" 전에 \"이 서비스를 통해 와도 되는가\"를 먼저 봐야 한다.\n\n### 4. raw end-user token pass-through는 경계를 흐리기 쉽다\n\nedge에서 받은 user JWT를 내부 서비스 hop마다 그대로 넘기면 편해 보인다.  \n하지만 장기적으로는 다음 문제가 쌓인다.\n\n- audience가 내부 서비스 전체로 넓어진다\n- 한 서비스가 받은 user token으로 다른 서비스까지 호출한다\n- caller workload identity와 end-user context가 로그에서 구분되지 않는다\n- 내부 hop에서 최소 권한이 어려워진다\n\n그래서 보통은 token exchange나 internal auth context translation이 필요하다.\n\n### 5. token exchange의 핵심은 actor/subject 분리다\n\ninternal exchanged token에는 최소한 이런 관점이 있어야 한다.\n\n- subject: 최종 사용자는 누구인가\n- actor: 지금 이 호출을 대리 수행하는 서비스는 누구인가\n- audience: 어디까지 쓸 수 있는가\n- scope: 무엇까지 할 수 있는가\n\n이렇게 해야 downstream이:\n\n- user id만 보지 않고\n- caller service와 delegated scope를 같이 판단할 수 있다\n\n### 6. background job와 scheduled task는 user context 전파보다 service-owned identity가 나은 경우가 많다\n\n모든 비동기 작업이 사용자를 직접 대리할 필요는 없다.\n\n오히려 더 안전한 패턴:\n\n- 요청 당시 사용자와 승인 사실은 기록\n- 실제 worker 실행은 service-owned identity로 수행\n- tenant, report, object scope만 명시적으로 제한\n\n이렇게 하면 stale user token을 queue로 옮기는 문제를 줄일 수 있다.\n\n### 7. audit는 caller와 subject를 둘 다 남겨야 한다\n\n필요한 필드:\n\n- authenticated workload identity\n- actor service id\n- end-user subject\n- tenant\n- delegated scope\n- route/action\n\n이게 없으면 나중에 \"사용자가 직접 한 행동인지, BFF가 대신한 건지, support operator가 acting-on-behalf-of 한 건지\"를 구분하지 못한다.\n\n### 8. trust boundary는 경로별로 다를 수 있다\n\n예를 들어:\n\n- edge -> BFF: user login context가 강함\n- BFF -> domain API: workload identity + delegated user context\n- scheduler -> batch worker: service identity 우선\n- admin tool -> internal API: operator identity + acting-on-behalf-of\n\n모든 경로에 같은 propagation 규칙을 강제하면 오히려 혼란이 생긴다.  \nroute class별 contract가 필요하다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 내부 서비스가 user JWT만 믿고 caller service 검증을 안 한다\n\n문제:\n\n- 어느 서비스든 그 token만 들고 호출하면 같은 권한처럼 보인다\n\n대응:\n\n- workload identity 검증을 먼저 둔다\n- internal audience token 또는 exchanged token을 사용한다\n- raw user token pass-through 범위를 줄인다\n\n### 시나리오 2: support tool이 고객 대신 작업했는데 audit에는 user id만 남는다\n\n문제:\n\n- actor와 subject가 구분되지 않는다\n\n대응:\n\n- `actor=support-operator`, `subject=end-user`, `workload=admin-tool`를 모두 남긴다\n- acting-on-behalf-of를 명시적 필드로 둔다\n\n### 시나리오 3: batch worker가 오래된 사용자 권한으로 계속 실행된다\n\n문제:\n\n- queue에 user token을 그대로 실었다\n\n대응:\n\n- worker는 service-owned identity로 실행한다\n- user context는 audit와 explicit scope 입력으로만 유지한다\n- 실행 시 tenant/object scope를 재검증한다\n\n---\n\n## 코드로 보기\n\n### 1. caller identity와 user context를 분리한 예시\n\n```java\npublic record InternalCallContext(\n        String workloadIdentity,\n        String actorService,\n        String subjectUserId,\n        String tenantId,\n        String delegatedScope,\n        String audience\n) {\n}\n```\n\n### 2. downstream 검사 개념\n\n```java\npublic void verify(CallContext context) {\n    workloadPolicy.requireTrustedCaller(context.workloadIdentity());\n    delegationPolicy.requireAllowedActor(context.actorService(), context.delegatedScope());\n    audiencePolicy.requireAllowedAudience(context.audience());\n}\n```\n\n### 3. 운영 체크리스트\n\n```text\n1. caller workload identity와 end-user subject를 별도 필드로 다루는가\n2. raw user token pass-through 대신 downscoped internal token을 쓰는가\n3. actor, subject, workload를 audit에 함께 남기는가\n4. async job는 user token보다 service-owned identity를 우선 검토하는가\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| raw user token pass-through | 단순하다 | audience 확장과 confused deputy 위험이 크다 | 짧은 과도기 |\n| workload identity만 사용 | 경계가 단순하다 | end-user delegated context 표현이 약하다 | pure internal system tasks |\n| workload identity + exchanged user context | 가장 명확하다 | token exchange와 audit 설계가 필요하다 | 대부분의 사용자 대리 호출 |\n| service-owned async identity | stale user credential 위험이 줄어든다 | 요청자 의미를 별도 기록해야 한다 | batch, export, scheduled jobs |\n\n판단 기준은 이렇다.\n\n- downstream이 최종 사용자를 알아야 하는가\n- caller workload를 신뢰 기준으로 먼저 검증할 수 있는가\n- actor/subject 분리를 audit에 남길 수 있는가\n- queue나 long-running path에서 stale user context가 문제되는가\n\n---\n\n## 꼬리질문\n\n> Q: workload identity와 user context propagation의 차이는 무엇인가요?\n> 의도: caller service와 end-user를 구분하는지 확인\n> 핵심: workload identity는 어떤 서비스가 호출했는지, user context는 누구를 대신한 호출인지 나타낸다.\n\n> Q: 왜 downstream은 user context보다 caller workload를 먼저 봐야 하나요?\n> 의도: trust ordering을 이해하는지 확인\n> 핵심: trusted service를 통하지 않은 user claim은 쉽게 confused deputy나 권한 확대 문제로 이어질 수 있기 때문이다.\n\n> Q: raw user token pass-through가 왜 위험한가요?\n> 의도: audience와 최소 권한 문제를 아는지 확인\n> 핵심: 내부 hop 전체로 bearer 범위를 넓혀 caller/service 경계가 흐려지기 때문이다.\n\n> Q: async job에서도 user context를 그대로 들고 가야 하나요?\n> 의도: service-owned identity 패턴을 이해하는지 확인\n> 핵심: 아니다. 많은 경우 service identity + explicit scope 입력이 더 안전하다.\n\n## 한 줄 정리\n\n서비스 간 신뢰를 운영 가능하게 만드는 핵심은 workload identity로 \"누가 호출했는가\"를 먼저 고정하고, end-user context는 별도의 delegated 정보로 downscope해서 전달하는 것이다.\n",
+  "aliases": [
+    "workload identity",
+    "user context propagation",
+    "end-user context",
+    "service identity",
+    "caller identity",
+    "on-behalf-of",
+    "actor subject separation",
+    "delegated user context",
+    "zero trust service boundary",
+    "confused deputy",
+    "support operator",
+    "Workload Identity / User Context Propagation Boundaries"
+  ],
+  "expected_queries": [
+    "Workload Identity / User Context Propagation Boundaries 핵심 개념을 설명해줘",
+    "workload identity가 왜 필요한지 알려줘",
+    "Workload Identity / User Context Propagation Boundaries 실무 설계 포인트는 뭐야?",
+    "workload identity에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Workload Identity / User Context Propagation Boundaries`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
+    "`Workload Identity / User Context Propagation Boundaries` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Workload Identity / User Context Propagation Boundaries`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "보안 로그와 브라우저 증상을 보면서 인증, 인가, 세션, 토큰 중 어느 경계부터 확인해야 할지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/owasp-top10-basics"
+    ],
+    "next_docs": [
+      "security/authentication-form-login-vs-jwt-vs-session-cookie-chooser"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/workload-identity-user-context-propagation-boundaries.md",
+    "revision_history": []
+  }
+}

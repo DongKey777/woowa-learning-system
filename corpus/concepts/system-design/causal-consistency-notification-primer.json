@@ -1,0 +1,71 @@
+{
+  "id": "system-design/causal-consistency-notification-primer",
+  "title": "Causal Consistency Notification Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "'이 문서는 학습자가 notification을 이미 본 뒤 source 데이터가 이어서",
+  "body_markdown": "# Causal Consistency Notification Primer\n\n> 한 줄 요약: 알림을 먼저 봤다면 그 알림이 가리키는 댓글, 주문, 승인 같은 source 데이터도 이어서 보여야 하고, 이 \"결과를 봤으면 원인도 보여야 한다\"는 문제가 causal consistency다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Monotonic Reads and Session Guarantees Primer](./monotonic-reads-and-session-guarantees-primer.md)\n- [Read-After-Write Consistency Basics](./read-after-write-consistency-basics.md)\n- [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Notification Badge vs Source Freshness Primer](./notification-badge-vs-source-freshness-primer.md)\n- [Post-Write Stale Dashboard Primer](./post-write-stale-dashboard-primer.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Notification 시스템 설계](./notification-system-design.md)\n- [Mobile Push Notification Pipeline Design](./mobile-push-notification-pipeline-design.md)\n- [Causal Consistency Intuition](../database/causal-consistency-intuition.md)\n- [system design 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: causal consistency notification primer, notification to source flow, notification click source missing, notification click watermark check, notification causal consistency basics, 알림 눌렀는데 본문 없음, effect before cause notification, cause before effect notification, causal consistency vs stale read, causal token notification, required watermark notification, comment notification source read, payment notification order detail, causal consistency 뭐예요, notification stale headroom, 알림 원인 데이터 일관성 보장, causal consistency 의미, causal token 사용, vector clock 의미, effect before cause 시나리오, notification read gap 방어, read-after-write vs causal consistency, 알림 도착 vs 원본 가시화 차이, watermark read minimum version\n\n---\n\n## 핵심 개념\n\n초보자가 이 주제를 stale read와 자주 헷갈리는 이유는 겉보기 증상이 비슷하기 때문이다.\n둘 다 \"기대한 데이터가 안 보인다\"처럼 보인다.\n처음 배우는데 `왜 알림을 눌렀는데 댓글이 없어요?`, `뭐예요, 조금 stale한 거랑 다른 건가요?` 같은 질문이 바로 여기서 나온다.\n\n하지만 질문이 다르다.\n\n- 단순 stale read: \"값이 조금 옛날인가?\"\n- causal consistency: \"내가 이미 본 결과를 설명하는 원인도 같이 보이나?\"\n\n알림 흐름으로 보면 차이가 더 선명하다.\n\n1. 사용자가 `새 댓글이 달렸습니다` 알림을 본다\n2. 알림을 눌러 댓글 화면으로 들어간다\n3. 댓글이 안 보인다\n\n이건 단순히 \"조금 stale하다\"보다, **결과를 먼저 봤는데 원인이 안 보이는 상태**다.\n그래서 causal consistency는 notification-to-source 흐름에서 특히 중요하다.\n\n---\n\n## 한눈에 보기\n\n| 상황 | 사용자가 먼저 본 것 | 이어서 안 보이는 것 | 먼저 떠올릴 이름 | 가장 단순한 첫 대응 |\n|---|---|---|---|---|\n| 프로필 저장 후 내 프로필 확인 | 내가 방금 성공시킨 write | 새 닉네임 | read-after-write | recent-write flag, short primary fallback |\n| 주문 상세에서 `PAID`를 본 뒤 목록 이동 | 내가 이미 본 최신 상태 | 더 최신인 줄 알았던 상태가 뒤로 감 | monotonic reads | `min_version` 이하 경로 차단 |\n| `새 댓글`, `결제 완료`, `승인 완료` 알림을 누름 | 결과를 알려 주는 notification | 그 결과의 source 데이터 | causal consistency | notification payload의 causal token, watermark-aware routing |\n\n짧게 줄이면 이렇다.\n\n- read-after-write는 \"내 write가 보이느냐\"를 본다\n- monotonic reads는 \"내가 본 선보다 뒤로 가느냐\"를 본다\n- causal consistency는 \"결과를 봤다면 그 원인도 이어서 보이느냐\"를 본다\n\n---\n\n## 상세 분해\n\n### 1. 알림은 보통 source의 \"결과 신호\"다\n\n알림은 대개 source write가 끝난 뒤 만들어진다.\n댓글 생성, 주문 상태 변경, 승인 완료 같은 source 이벤트가 먼저 있고, notification은 그 뒤에 나온다.\n\n```text\nsource write -> event/outbox -> notification delivered\n            -> replica/read model catch-up\n```\n\n문제는 notification delivery path와 source read path가 같지 않다는 점이다.\npush 시스템은 빠르게 도착했는데, 댓글 화면이나 주문 상세 화면은 아직 lagging replica/read model을 읽을 수 있다.\n\n### 2. 그래서 notification-to-source 흐름은 causal 질문이 된다\n\n사용자는 알림을 보는 순간 이미 \"어떤 일이 일어났다\"는 결과를 받아들인다.\n그 상태에서 source 화면에 들어갔는데 원인이 안 보이면, 사용자 입장에서는 시간보다 **의미 순서**가 깨진다.\n\n대표 예시는 아래 셋이다.\n\n- `새 댓글` 알림을 눌렀는데 댓글 본문이 없다\n- `결제 완료` 알림을 눌렀는데 주문 상세는 아직 `PENDING`이다\n- `승인 완료` 알림을 눌렀는데 권한 화면은 아직 바뀌지 않았다\n\n이때의 핵심 질문은 \"조금 기다리면 최신이 되나?\"가 아니라, **알림이 가리키는 dependency를 이 읽기 경로가 만족하나?**다.\n\n### 3. 단순 stale-read handling과 다른 이유\n\nread-after-write 문제는 대개 사용자가 직접 write한 뒤 곧바로 읽는 흐름이다.\n그래서 `recent_write=true`나 짧은 primary fallback으로 시작해도 된다.\n\n하지만 notification-to-source 흐름에서는 사용자가 write하지 않았을 수 있다.\n알림이 dependency를 대신 들고 와야 한다.\n\n즉 차이는 아래와 같다.\n\n- read-after-write: \"내가 방금 쓴 값\"\n- causal notification flow: \"내가 방금 본 결과가 의존하는 원인\"\n\n그래서 `500ms 뒤 재시도`는 현상을 가릴 수는 있어도, causal consistency를 보장했다고 말하기는 어렵다.\n\n---\n\n## 흔한 오해와 함정\n\n- `알림 delivery를 조금 늦추면 causal 문제가 사라진다`는 오해가 많다. 경로별 지연이 계속 달라질 수 있어서 근본 해결이 아니다.\n- `causal consistency면 모든 source read를 primary로 보내야 한다`는 뜻은 아니다. 필요한 token이나 watermark를 만족하는 경로만 고르면 된다.\n- `monotonic reads와 causal consistency는 거의 같은 말이다`라고 섞어 쓰면 안 된다. 전자는 내가 본 시간선의 하한을 지키는 것이고, 후자는 결과와 원인의 dependency를 지키는 것이다.\n- `알림 본문에 일부 내용을 넣었으니 source가 늦어도 괜찮다`고 생각하기 쉽다. 하지만 deep link 뒤 액션, 상세 조회, 후속 버튼은 결국 source-of-truth를 읽어야 한다.\n- `retry 한 번 넣었으니 해결됐다`고 보면 안 된다. 사용자가 이미 결과를 본 뒤이므로, 운 좋게 맞는 경우와 보장된 경우를 구분해야 한다.\n\n---\n\n## 실무에서 쓰는 모습\n\nbeginner 단계에서는 \"알림에 dependency 힌트를 싣고, source read가 그 힌트를 만족하는지 확인한다\" 정도로 이해하면 충분하다.\n\n| 단계 | 요청/데이터에 싣는 것 | 왜 필요한가 |\n|---|---|---|\n| source write 완료 | `entity_version`, `commit_lsn`, `watermark` | 어떤 원인이 이미 확정됐는지 표현 |\n| notification 생성 | `causal_token`, `required_watermark`, `entity_id` | 알림이 어떤 source 상태를 전제로 하는지 표현 |\n| notification open | deep link + token 전달 | 알림이 본 dependency를 source read path로 넘김 |\n| source read | cache/replica가 token 충족 여부 확인 | 못 맞추면 fallback해서 effect-before-cause를 막음 |\n\n아주 단순한 라우팅 예시는 아래처럼 생각할 수 있다.\n\n```pseudo\nfunction openFromNotification(key, causalToken):\n  cached = cache.get(key)\n  if cached != null and cached.watermark >= causalToken.requiredWatermark:\n    return cached\n\n  if replica.visibleWatermark(key) >= causalToken.requiredWatermark:\n    return replica.read(key)\n\n  return primary.read(key)\n```\n\n중요한 점은 notification service가 모든 replica가 따라올 때까지 delivery를 무조건 멈춰야 한다는 뜻이 아니라, **알림이 의존하는 기준선을 source read까지 함께 가져가야 한다**는 점이다.\n\n---\n\n## 숫자 언어도 같은 카드로 읽는다\n\ncausal notification primer도 숫자 해석은 따로 만들지 않는 편이 좋다.\n초보자는 `정말 stale가 튀었나`와 `그 대응을 primary가 버티나`를 같은 카드 언어로 반복해서 보는 편이 덜 헷갈린다.\n\n| 숫자 질문 | 여기서의 뜻 | 같은 카드로 이어 읽을 문서 |\n|---|---|---|\n| `stale peak multiplier`가 큰가 | 알림 click 뒤 source stale이 baseline보다 얼마나 튀었는가 | [Post-Write Stale Dashboard Primer](./post-write-stale-dashboard-primer.md) |\n| `fallback headroom ratio`가 충분한가 | causal fallback을 더 밀어도 primary가 버틸 여유가 남았는가 | [Read-After-Write Routing Primer](./read-after-write-routing-primer.md) |\n| 같은 stale 급증인데 왜 대응이 달라지나 | reject/fallback reason과 primary 보호를 같이 봐야 하는가 | [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md) |\n\n빠른 연결:\n\n- Green 카드부터 보려면 [Post-Write Stale Dashboard Primer](./post-write-stale-dashboard-primer.md)의 `fallback headroom band`와 `공통 미니 예시 카드`를 먼저 본다.\n- 같은 숫자를 notification routing 판단으로 옮기려면 [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)의 `headroom 2.0x (Yellow) 중간 카드`를 붙여 읽는다.\n- 같은 stale 급증이어도 headroom이 `1.4x (Red)`면 해석이 바뀐다는 반례는 [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)의 `공통 반례 카드`가 가장 직접적이다.\n\n초보자용 한 줄:\n\n> 알림 click에서 원인이 안 보이는지 보는 언어는 `stale`, 그 보호를 계속 밀 수 있는지 보는 언어는 `headroom`이다. 같은 숫자 카드를 반복해서 읽어야 notification cluster 안에서 판단 말이 흔들리지 않는다.\n\n---\n\n## 더 깊이 가려면\n\n- [Monotonic Reads and Session Guarantees Primer](./monotonic-reads-and-session-guarantees-primer.md)\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Read-After-Write Routing Primer](./read-after-write-routing-primer.md)\n- [Notification Badge vs Source Freshness Primer](./notification-badge-vs-source-freshness-primer.md)\n- [Mixed Cache+Replica Freshness Bridge](./mixed-cache-replica-freshness-bridge.md)\n- [Rejected-Hit Observability Primer](./rejected-hit-observability-primer.md)\n- [Notification 시스템 설계](./notification-system-design.md)\n- [Causal Consistency Intuition](../database/causal-consistency-intuition.md)\n\n---\n\n## 면접/시니어 질문 미리보기\n\n> Q: notification-to-source 문제를 왜 read-after-write 하나로 설명하면 부족한가요?\n> 의도: 직접 write한 사용자의 최신성 문제와 dependency visibility 문제를 구분하는지 확인\n> 핵심: notification flow에서는 사용자가 write하지 않았어도 결과를 먼저 볼 수 있으므로, request가 causal dependency를 전달해야 한다.\n\n> Q: 가장 단순한 시작 설계는 무엇인가요?\n> 의도: over-engineering 없이도 causal contract를 잡는 법을 아는지 확인\n> 핵심: notification payload에 token/watermark를 싣고, source read path에서 그 기준선을 만족하는 cache/replica만 허용한다.\n\n> Q: `retry after 300ms`는 왜 보장이 아니죠?\n> 의도: 확률적 완화와 계약 기반 consistency를 구분하는지 확인\n> 핵심: 지연 편차가 계속 바뀌므로 재시도는 성공 확률을 높일 뿐, effect-before-cause를 막는 명시적 contract가 아니다.\n\n---\n\n## 한 줄 정리\n\nnotification-to-source 흐름에서 causal consistency는 \"알림이라는 결과를 봤다면 그 결과의 원인 source도 이어서 읽혀야 한다\"는 보장이고, 그래서 단순 stale-read handling과 구분해서 봐야 한다.\n",
+  "aliases": [
+    "causal consistency notification primer",
+    "notification to source flow",
+    "effect before cause notification",
+    "cause before effect notification",
+    "causal token notification",
+    "required watermark notification",
+    "notification source read gap",
+    "알림 원인 데이터 일관성",
+    "causal consistency",
+    "인과 일관성",
+    "causal token",
+    "인과 토큰",
+    "vector clock",
+    "벡터 시계",
+    "happens-before relation",
+    "인과 관계",
+    "notification read gap",
+    "알림 읽기 갭",
+    "watermark notification",
+    "read-your-writes notification",
+    "effect before cause",
+    "결과가 원인보다 먼저",
+    "stale source after fresh notification"
+  ],
+  "expected_queries": [
+    "알림을 먼저 봤는데 댓글 원문이 안 보이면 이게 stale read랑 뭐가 달라?",
+    "notification에서 effect before cause를 막으려면 어떤 보장을 써야 해?",
+    "결제 완료 알림을 눌렀는데 주문 상세가 아직 예전 상태면 causal consistency로 봐야 해?",
+    "read-after-write랑 causal consistency를 알림 흐름에서 어떻게 구분해?",
+    "알림 source missing 문제를 causal token 관점에서 처음 설명해줘"
+  ],
+  "symptoms": [
+    "알림은 왔는데 눌러 보면 댓글이나 주문 원문이 안 보여",
+    "결과는 먼저 봤는데 원인 데이터가 아직 안 따라와",
+    "stale read랑 causal consistency를 같은 문제로 보고 있어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/read-after-write-consistency-basics",
+      "system-design/monotonic-reads-and-session-guarantees-primer"
+    ],
+    "next_docs": [
+      "system-design/notification-causal-token-walkthrough",
+      "system-design/notification-read-to-min-version-bridge",
+      "system-design/notification-badge-vs-source-freshness-primer"
+    ],
+    "confusable_with": [
+      "system-design/notification-badge-vs-source-freshness-primer",
+      "database/causal-consistency-intuition",
+      "system-design/notification-preferences-graph-design",
+      "system-design/notification-source-missing-decision-table"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/causal-consistency-notification-primer.md",
+    "revision_history": []
+  }
+}

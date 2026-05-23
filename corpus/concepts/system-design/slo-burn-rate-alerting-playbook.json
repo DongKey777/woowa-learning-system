@@ -1,0 +1,46 @@
+{
+  "id": "system-design/slo-burn-rate-alerting-playbook",
+  "title": "SLO Burn Rate Alerting Playbook",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 playbook은 SLO error budget burn rate 기반 alerting을 multi-window 관점으로 설명한다.",
+  "body_markdown": "# SLO Burn Rate Alerting Playbook\n\n## 이 문서의 역할\n\n이 문서는 임의 threshold alert를 SLO error budget과 연결하는 playbook이다. \"에러율이 높다\"가 아니라 \"사용자 약속을 얼마나 빠르게 태우고 있으며 사람을 깨울 만큼 지속되는가\"를 판단한다.\n\n## 재현 조건\n\n서비스에 availability나 latency SLO가 있고, 단순 threshold alert가 너무 시끄럽거나 너무 늦게 울린다.\n\n## Topic-specific invariant\n\nSLO alert의 불변식은 \"사용자 약속을 의미 있게 태우는 증상만 사람을 깨운다\"이다. CPU 90%, 에러율 1%, p99 1초 같은 숫자만으로는 부족하다. 그 숫자가 정해진 기간의 error budget을 얼마나 빨리 소진하는지로 바꿔야 paging 기준이 된다.\n\nSLO burn-rate를 설계할 때는 네 개를 분리한다.\n\n- good event: SLI 조건을 만족한 이벤트다. 예: HTTP 2xx/3xx, 500ms 이하 응답, 성공적으로 처리된 결제 요청.\n- bad event: good event가 아닌 이벤트다. SLO 위반을 계산하는 분자다.\n- error budget: 일정 기간 동안 허용하는 bad event 비율이다. 30일 99.9% SLO면 budget은 0.1%다.\n- burn rate: 현재 bad event 비율을 budget 비율로 나눈 값이다. 99.9% SLO에서 현재 bad event가 1%면 burn rate는 `1% / 0.1% = 10`이다.\n\nBurn rate 10은 지금 속도가 계속되면 30일 budget을 3일 만에 태운다는 뜻이다. 단순 에러율 1%보다 \"얼마나 빨리 약속을 잃는가\"를 직접 말한다.\n\n## 확인 순서\n\n1. SLI를 정한다. 예를 들어 \"성공한 요청 비율\" 또는 \"500ms 이하 응답 비율\"이다.\n2. SLO 목표와 기간을 정한다. 예: 30일 99.9%.\n3. good event와 total event의 집계 기준을 정한다. health check, bot traffic, retry 요청을 denominator에 넣을지 명시한다.\n4. 현재 오류율이 error budget을 얼마나 빠르게 태우는지 burn rate로 계산한다.\n5. 짧은 window와 긴 window를 함께 둔다. 짧은 window는 급격한 장애를, 긴 window는 지속적 열화를 잡는다.\n6. page, ticket, dashboard-only를 분리한다. 모든 SLO 위반 가능성이 즉시 호출 대상은 아니다.\n\n## Good event 설계 예시\n\n| SLO 종류 | 좋은 이벤트 예시 | 나쁜 이벤트 예시 | 주의점 |\n|---|---|---|---|\n| availability | `status < 500`인 사용자 요청 | 5xx, timeout, dependency failure로 실패한 요청 | 4xx를 사용자/제품 오류로 제외할지 정책 필요 |\n| latency | 95% 요청이 300ms 이하 | threshold 초과 응답 | 평균 latency가 아니라 이벤트별 성공/실패로 계산 |\n| async processing | 99% 이벤트가 5분 안에 반영 | projection lag가 threshold 초과 | queue backlog와 consumer 처리 지연을 함께 봄 |\n| correctness | 결제 승인 결과가 ledger와 일치 | mismatch, duplicate, missing record | error event 정의가 관측 가능해야 함 |\n\n## Multi-window alerting\n\n짧은 window 하나만 보면 작은 spike에도 자주 깨우고, 긴 window 하나만 보면 큰 장애를 늦게 본다. 그래서 \"짧은 window와 긴 window가 동시에 높은 burn을 보일 때\" page를 건다.\n\n| 목적 | 예시 조건 | 의미 | 조치 |\n|---|---|---|---|\n| 빠른 page | 5분과 1시간 burn rate가 모두 높음 | 급격한 장애가 실제 budget을 빠르게 태움 | 즉시 on-call 호출 |\n| 느린 page | 30분과 6시간 burn rate가 모두 높음 | 완만하지만 지속적인 열화 | 근무시간/준긴급 대응 |\n| ticket | 2시간과 1일 burn rate가 중간 이상 | 장기 품질 저하 | backlog 또는 개선 작업 |\n| 관찰만 | 짧은 spike만 높음 | 일시적 흔들림 가능 | dashboard, auto-remediation 확인 |\n\n정확한 multiplier는 조직의 SLO 기간, 대응 시간, page 정책에 맞춘다. 중요한 것은 \"budget을 많이 태우는 속도\"와 \"충분히 지속되는 증거\"를 함께 요구하는 것이다.\n\n## 실패 원인 matrix\n\n| 증상 | 원인 | 조정 |\n|---|---|---|\n| 작은 spike마다 호출 | 짧은 window만 사용 | 긴 window 조건과 함께 묶음 |\n| 장애 감지가 늦음 | 긴 window만 사용 | 짧은 high burn alert 추가 |\n| alert가 SLO와 무관 | 임의 threshold | error budget burn 기준으로 재정의 |\n| latency SLO가 평균으로 계산됨 | good event를 이벤트 단위로 정의하지 않음 | threshold 이하 요청 비율로 SLI 재정의 |\n| budget이 갑자기 사라짐 | retry/bot/internal traffic이 denominator를 왜곡 | 사용자 영향 기준으로 필터링 |\n| page가 많지만 action이 없음 | warning과 paging이 섞임 | page 조건은 즉시 행동 가능한 증상으로 제한 |\n\n## Symptom -> cause -> trade-off -> next doc\n\n| 운영 symptom | 가능한 cause | trade-off | 다음 문서 |\n|---|---|---|---|\n| 작은 spike마다 on-call이 깨움 | 짧은 window 단독 alert | 긴 window AND는 noise를 줄이지만 아주 짧은 장애 감지는 늦출 수 있음 | `red-use-metrics-observability-chooser` |\n| 긴 장애를 너무 늦게 감지 | 긴 window 단독 alert | 짧은 high-burn page는 빠르지만 actionability 기준이 필요 | `incident-review-learning-loop` |\n| latency SLO가 평균으로만 계산됨 | event-level good/bad 정의 부재 | threshold 이하 비율은 사용자 영향에 가깝지만 쿼리가 복잡해짐 | `tail-latency-p99-debugging-playbook` |\n| error budget이 release 직후 빠르게 감소 | release regression 또는 traffic mix 변화 | rollback gate는 빠르지만 false positive를 줄이려면 SLI 필터 검증 필요 | `red-use-metrics-observability-chooser` |\n| page는 많은데 조치가 없음 | alert severity와 action이 불일치 | ticket/dashboard-only로 낮추면 noise는 줄지만 ownership이 느슨해질 수 있음 | `incident-review-learning-loop` |\n\n## 흔한 오개념\n\n- \"에러율 1%면 항상 심각하다\": 99% SLO에서는 budget 비율이 1%라 burn rate 1이지만, 99.9% SLO에서는 burn rate 10이다.\n- \"SLO는 dashboard 숫자다\": SLO는 alert, release gate, incident review의 기준으로 연결되어야 한다.\n- \"latency SLO는 평균 latency로 보면 된다\": 평균은 tail 사용자 영향을 숨긴다. threshold 이하 이벤트 비율이나 percentile 기반으로 정의한다.\n- \"multi-window는 alert를 두 배로 만든다\": 보통 AND 조건으로 noise를 줄이기 위한 장치다.\n- \"error budget이 남아 있으면 장애가 아니다\": 빠른 burn은 budget이 남아 있어도 지금 대응해야 할 수 있다.\n\n## 운영/테스트 검증\n\nBurn-rate alert는 \"지금 속도로 가면 error budget을 얼마나 빨리 소진하는가\"를 묻는다. 그래서 단순 에러율보다 사용자 약속과 운영 우선순위를 연결하기 쉽다.\n\n검증할 증거는 다음과 같다.\n\n- SLI numerator/denominator 쿼리: good, bad, total event가 정책대로 집계되는지\n- budget remaining 그래프: release나 incident 후 budget이 어떻게 변했는지\n- burn-rate panel: 5분/1시간/6시간/1일 window가 같은 incident를 어떻게 보였는지\n- alert history: page가 실제 조치로 이어졌는지, ticket으로 충분했던 이벤트가 page로 올라오지 않았는지\n- incident replay: 과거 장애의 로그를 새 rule에 대입했을 때 너무 늦거나 너무 시끄럽지 않은지\n\n## Overclaim control\n\n- SLO burn-rate alert는 모든 장애를 잡는 만능 rule이 아니다. SLI에 포함되지 않은 correctness, data loss, security incident는 별도 alert가 필요하다.\n- Error budget이 남았다고 지금 대응하지 않아도 된다는 뜻은 아니다. 높은 burn rate는 남은 budget을 빠르게 없앨 수 있다.\n- Multi-window는 alert를 늘리는 기술이 아니라 page 조건을 더 증거 기반으로 만드는 기술이다.\n- Good event 정의가 틀리면 burn rate도 틀린다. bot, health check, internal retry, synthetic traffic 포함 여부를 명시해야 한다.\n- Page rule은 \"누군가 즉시 할 행동\"과 연결되어야 한다. 행동이 없으면 ticket이나 dashboard로 낮춘다.\n\n## 면접 답변 축\n\nSLO burn-rate 질문에는 다음 축으로 답하면 좋다.\n\n1. 먼저 good event를 정의해 SLI를 만든다.\n2. SLO 목표와 기간에서 error budget을 계산한다.\n3. 현재 bad event 비율을 budget 비율로 나눠 burn rate를 만든다.\n4. 짧은 window와 긴 window를 AND로 묶어 빠른 장애와 지속 열화를 모두 잡는다.\n5. page/ticket/dashboard를 분리하고, 실제 incident replay로 noise와 detection delay를 검증한다.\n\n## Safe Next Docs\n\n측정 프레임은 `red-use-metrics-observability-chooser`, incident 후 학습 루프는 `incident-review-learning-loop`로 이어진다.\n",
+  "aliases": [
+    "SLO burn rate alerting playbook",
+    "SLO burn rate 경보",
+    "error budget burn alert",
+    "multi window alerting"
+  ],
+  "expected_queries": [
+    "SLO burn rate alert는 어떻게 잡아?",
+    "에러 버짓을 너무 빨리 태우는지 어떻게 감지해?",
+    "짧은 장애와 긴 장애를 alert에서 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "에러율 1% 같은 고정 threshold alert만 씁니다",
+    "짧은 spike마다 깨우거나 긴 장애를 늦게 감지합니다",
+    "SLO와 alert rule이 연결되지 않습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/slo-error-budget-interview-primer"
+    ],
+    "next_docs": [
+      "system-design/red-use-metrics-observability-chooser",
+      "software-engineering/incident-review-learning-loop"
+    ],
+    "confusable_with": [
+      "system-design/slo-error-budget-interview-primer",
+      "system-design/red-use-metrics-observability-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/slo-burn-rate-alerting-playbook.md",
+    "revision_history": []
+  }
+}

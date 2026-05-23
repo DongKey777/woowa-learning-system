@@ -1,0 +1,53 @@
+{
+  "id": "operating-system/file-descriptor-ephemeral-port-exhaustion-chooser",
+  "title": "File Descriptor vs Ephemeral Port Exhaustion Chooser",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "이 chooser는 Too many open files, EMFILE, ENFILE, TIME_WAIT, EADDRNOTAVAIL, ephemeral port exhaustion, connection pool churn을 lsof와 ss 증거로 분리한다. fd limit 문제와 local port range 문제를 섞지 않는 운영 판단을 다룬다.",
+  "body_markdown": "# File Descriptor vs Ephemeral Port Exhaustion Chooser\n\n> 한 줄 요약: `EMFILE`/`ENFILE`은 file descriptor 한도 문제이고, `TIME_WAIT`/`EADDRNOTAVAIL`은 짧은 outbound 연결과 ephemeral port 압력일 수 있으므로 `lsof`와 `ss` 증거를 분리해서 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Descriptor Leak Symptom Router](./file-descriptor-leak-symptom-router.md)\n> - [File Descriptor Ulimit Interview Router](./file-descriptor-ulimit-interview-router.md)\n> - [Ephemeral Ports, TIME_WAIT, Reuse Recovery](./ephemeral-ports-time-wait-reuse-recovery.md)\n> - [TIME_WAIT Connection Churn Router](../network/time-wait-connection-churn-router.md)\n> - [NAT, Conntrack, Ephemeral Port Exhaustion](../network/nat-conntrack-ephemeral-port-exhaustion.md)\n> - [Connection Pool Starvation, Stale Idle Reuse, Debugging](../network/connection-pool-starvation-stale-idle-reuse-debugging.md)\n\n> retrieval-anchor-keywords: file descriptor exhaustion, ephemeral port exhaustion, emfile, enfile, eaddrnotavail, time_wait, ip_local_port_range, lsof, ss, connection pool churn, too many open files\n\n## 1차 선택\n\n첫 질문은 \"socket이 많다\"가 아니라 **어떤 namespace의 어떤 자원이 바닥났는가**다.\n\n| 증상 | 더 가까운 자원 | 대표 증거 | 먼저 볼 것 |\n|---|---|---|---|\n| `EMFILE`, `Too many open files` | 프로세스 fd 한도 | `/proc/<pid>/limits`, `/proc/<pid>/fd` 증가 | `lsof -p <pid>`, close path |\n| `ENFILE`, system-wide open file pressure | host file table | `/proc/sys/fs/file-nr`, 여러 프로세스 동시 실패 | host top fd users, file-max |\n| `EADDRNOTAVAIL`, `Cannot assign requested address` | local ephemeral port | `ip_local_port_range`, destination별 port 사용 | `ss`, retry, outbound fan-out |\n| `TIME_WAIT` 급증 | connection churn 또는 active close | `ss -tan state time-wait` | pool reuse, keep-alive, retry storm |\n| `CLOSE_WAIT` 급증 | local application close 누락 | `ss -tan state close-wait -p` | response body, stream close |\n\nFd exhaustion은 \"프로세스가 kernel object를 참조할 handle을 더 못 만든다\"에 가깝다. Ephemeral port exhaustion은 \"새 outbound 4-tuple을 만들 local port 공간이 부족하다\"에 가깝다. 둘 다 socket 장애처럼 보이지만 관찰 지점이 다르다.\n\n중요한 차이: 이미 닫힌 TCP 연결의 `TIME_WAIT`는 보통 해당 프로세스의 열린 fd로 남아 있지 않다. 그래서 `/proc/<pid>/fd`가 낮은데 `TIME_WAIT`만 많은 경우를 fd leak로 단정하면 wrong bucket이다.\n\n## 증거 수집\n\nFd 쪽은 프로세스 관찰이 강하다.\n\n```bash\ncat /proc/<pid>/limits | grep -i \"open files\"\nls /proc/<pid>/fd | wc -l\nlsof -p <pid> | awk 'NR>1 {count[$5]++} END {for (t in count) print count[t], t}' | sort -nr\ncat /proc/sys/fs/file-nr\ncat /proc/sys/fs/file-max\n```\n\nPort와 TCP state 쪽은 socket table 관찰이 강하다.\n\n```bash\ncat /proc/sys/net/ipv4/ip_local_port_range\nss -tan state time-wait | wc -l\nss -tan state time-wait | awk 'NR>1 {print $4, $5}' | sort | uniq -c | sort -nr | head\nss -tanp | grep '<pid>'\n```\n\nApplication metric도 같이 본다.\n\n- HTTP/DB pool active, idle, pending acquire, acquire timeout\n- connection create/close rate와 request rate의 비율\n- TLS handshake 비율과 connect latency\n- retry count, retry backoff, timeout budget\n- destination endpoint별 outbound connection 수\n\n`lsof`는 \"프로세스가 지금 붙잡은 fd\"를 잘 보여 주고, `ss`는 \"커널 TCP state가 어느 endpoint에 얼마나 쌓였는지\"를 잘 보여 준다. 둘 중 하나만 보면 fd leak과 port churn을 쉽게 섞는다.\n\n## EMFILE과 ENFILE\n\n`EMFILE`은 보통 프로세스별 fd limit에 닿은 신호다. 같은 프로세스의 `/proc/<pid>/fd` 개수가 `Max open files`에 가까워지고, `lsof -p <pid>`에서 특정 유형이 단조 증가한다.\n\n`ENFILE`은 host 전체 file table pressure에 가깝다. 단일 프로세스만 보지 말고 `/proc/sys/fs/file-nr`, host의 다른 프로세스 fd 사용량, container runtime과 systemd limit을 함께 본다.\n\n| 관찰 | 해석 |\n|---|---|\n| `/proc/<pid>/fd`가 계속 증가 | fd leak, pool 반환 누락, file/socket close 누락 |\n| `REG (deleted)`가 많음 | log rotation 후 열린 파일을 프로세스가 붙잡음 |\n| `CLOSE_WAIT`가 많음 | peer가 닫았는데 local app이 close하지 않음 |\n| host `file-nr`가 높고 여러 프로세스가 실패 | system-wide file table pressure |\n\nfd 문제의 완화는 한도 상향일 수 있지만, 검증은 slope가 줄었는지다. 한도를 올렸는데 fd count 증가율이 그대로면 장애 시간만 늦춘 것이다.\n\n## TIME_WAIT과 Local Port Range\n\n`TIME_WAIT`는 정상 TCP 종료 후 안전을 위한 상태다. 많다는 사실만으로 leak가 아니다. 문제는 짧은 outbound connection churn과 retry가 `ip_local_port_range` 안의 port를 빠르게 돌려 쓰게 만들 때다.\n\n```bash\ncat /proc/sys/net/ipv4/ip_local_port_range\nss -tan state time-wait | awk 'NR>1 {print $5}' | sort | uniq -c | sort -nr | head\nss -tan state syn-sent | wc -l\n```\n\n다음이면 port pressure 가능성이 커진다.\n\n- `EADDRNOTAVAIL` 또는 `Cannot assign requested address`가 connect 시점에 난다.\n- 같은 source host에서 같은 destination으로 짧은 연결이 대량 생성된다.\n- `TIME_WAIT`, `SYN-SENT`, connect latency, retry가 같은 시간대에 증가한다.\n- NAT 뒤에서만 실패하고 conntrack/NAT gateway metric이 같이 흔들린다.\n\nPort range를 넓히는 것은 burst를 흡수하는 단기 완화다. connection reuse 실패나 retry storm이 원인이면 다시 찬다.\n\n## Connection Pool Churn\n\nConnection pool churn은 fd와 port 양쪽을 동시에 압박할 수 있다. 연결이 살아 있는 동안에는 fd를 쓰고, 닫힌 뒤에는 `TIME_WAIT`가 port 재사용을 늦춘다.\n\n먼저 이 비율을 본다.\n\n```text\nconnection_create_rate / request_rate\n```\n\n요청마다 새 TCP/TLS connection을 만들면 pool이 있어도 사실상 재사용이 깨진 것이다. 원인은 여러 가지다.\n\n- HTTP keep-alive가 꺼져 있거나 client pool이 요청마다 새로 만들어진다.\n- idle timeout mismatch로 pool의 idle socket이 stale 상태가 된다.\n- pool max lifetime이 너무 짧아 정상 연결도 빨리 버린다.\n- retry가 같은 upstream으로 새 연결을 계속 만든다.\n- HTTP/2 stream slot이 찼는데 socket 수만 보고 여유라고 착각한다.\n\n이때 `maxConnections`만 키우면 fd와 port 사용량이 더 늘 수 있다. 먼저 pool hit ratio, pending acquire, stale idle reuse, retry budget을 확인한다.\n\n## Wrong Fixes\n\n| 잘못된 대응 | 왜 위험한가 |\n|---|---|\n| `ulimit -n`만 올린다 | fd leak이면 장애 시점만 늦어진다. |\n| `TIME_WAIT`를 fd leak로 단정한다 | 닫힌 socket state와 열린 fd를 섞는다. |\n| `ip_local_port_range`만 넓힌다 | connection churn, retry storm, NAT pressure가 남는다. |\n| keep-alive를 무조건 끈다 | handshake 비용과 port churn을 키운다. |\n| pool size를 무제한에 가깝게 늘린다 | fd, port, upstream, thread pool 압박을 함께 키운다. |\n| `tcp_tw_reuse` 같은 sysctl을 보편 처방으로 쓴다 | 커널 버전, NAT, 4-tuple reuse 안전성에 따라 위험이 다르다. |\n| `CLOSE_WAIT`를 커널 튜닝으로 해결하려 한다 | 보통 local process의 close 누락이다. |\n| legacy `tcp_tw_recycle` 류 지식을 그대로 적용한다 | 최신 Linux에서는 제거됐고 NAT 환경에서도 위험한 접근이었다. |\n\n운영 대응은 보통 순서가 있다. fd leak이면 close path와 pool 반환을 고친다. Port pressure면 connection reuse, timeout alignment, retry budget, outbound concurrency cap을 먼저 본다. 한도와 range 조정은 원인 제거가 아니라 안전판에 가깝다.\n\n## 검증\n\n조치 후에는 \"에러가 줄었다\"만 보지 말고 자원별 지표가 기대한 방향으로 움직였는지 본다.\n\n- `EMFILE` 대응: `/proc/<pid>/fd` slope가 줄고 `lsof` 유형 분포가 안정됐는가.\n- `ENFILE` 대응: host `file-nr`와 top fd user가 정상 범위로 돌아왔는가.\n- Port 대응: `EADDRNOTAVAIL`, connect latency, `TIME_WAIT` destination 집중도가 줄었는가.\n- Pool 대응: connection create/request 비율, pool hit ratio, pending acquire, retry가 같이 개선됐는가.\n- NAT 대응: conntrack insert failure, NAT port pressure, gateway timeout이 줄었는가.\n\n## 한 줄 정리\n\nFd exhaustion은 열린 handle의 문제이고 ephemeral port exhaustion은 outbound 4-tuple 재사용 공간의 문제다. `lsof`로 열린 fd를, `ss`로 TCP state와 endpoint 분포를 나눠 본 뒤 한도 상향과 port range 조정이 원인 해결인지 임시 완화인지 구분한다.\n",
+  "aliases": [
+    "fd versus ephemeral port exhaustion",
+    "EMFILE ENFILE EADDRNOTAVAIL chooser",
+    "TIME_WAIT port pressure diagnosis",
+    "lsof ss socket evidence",
+    "connection pool churn wrong fixes"
+  ],
+  "expected_queries": [
+    "Too many open files와 ephemeral port exhaustion을 어떻게 구분해?",
+    "EMFILE ENFILE TIME_WAIT EADDRNOTAVAIL 증거를 어떻게 나눠 봐?",
+    "lsof와 ss로 FD 고갈인지 port 고갈인지 확인하는 순서를 알려줘",
+    "connection pool churn 때문에 TIME_WAIT가 늘 때 잘못된 해결책은 뭐야?"
+  ],
+  "symptoms": [
+    "Too many open files와 Cannot assign requested address가 섞여 보여 원인 분기가 어렵다.",
+    "TIME_WAIT가 많다는 이유만으로 file descriptor leak이라고 단정한다.",
+    "ulimit, ip_local_port_range, connection pool 크기를 한꺼번에 바꿔서 어떤 자원이 병목인지 모른다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/file-descriptor-basics",
+      "network/tcp-three-way-handshake-basics"
+    ],
+    "next_docs": [
+      "operating-system/file-descriptor-leak-symptom-router",
+      "operating-system/ephemeral-ports-time-wait-reuse-recovery",
+      "network/time-wait-connection-churn-router"
+    ],
+    "confusable_with": [
+      "operating-system/file-descriptor-leak-symptom-router",
+      "operating-system/ephemeral-ports-time-wait-reuse-recovery",
+      "network/time-wait-connection-churn-router",
+      "network/nat-conntrack-ephemeral-port-exhaustion",
+      "network/connection-pool-starvation-stale-idle-reuse-debugging"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/operating-system/file-descriptor-ephemeral-port-exhaustion-chooser.md",
+    "revision_history": []
+  }
+}

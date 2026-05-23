@@ -1,0 +1,45 @@
+{
+  "id": "data-structure/bitmap-bitset-roaring-interview-chooser",
+  "title": "Bitmap BitSet Roaring Interview Chooser",
+  "category": "data-structure",
+  "level": "intermediate",
+  "summary": "이 chooser는 Bitmap, BitSet, Roaring Bitmap을 dense/sparse integer set과 set operation 요구로 구분한다.",
+  "body_markdown": "# Bitmap BitSet Roaring Interview Chooser\n\n## 10초 chooser\n\n| 요구 | 선택 | 이유 |\n|---|---|---|\n| dense하고 최대 id가 작음 | BitSet/plain bitmap | id 하나를 bit 하나로 표현해 locality가 좋다 |\n| sparse하고 id 공간이 큼 | Roaring/compressed bitmap | 빈 구간을 container 단위로 압축한다 |\n| 대량 union/intersection/difference | Roaring Bitmap | 정렬된 container끼리 병합해 set operation이 빠르다 |\n| 문자열/object key | HashSet/Map | integer id로 안정적으로 매핑해야 bitmap이 유리하다 |\n\n## 선택 기준\n\n1. key가 정수 id이거나 정수 id로 손실 없이 매핑되는지 먼저 본다.\n2. `maxId - minId` 범위와 실제 원소 수의 density를 비교한다.\n3. membership만 필요한지, `AND/OR/XOR/AND NOT` 같은 set operation이 핵심인지 구분한다.\n4. 대부분 읽기인지, 실시간 insert/delete가 많은지, 직렬화/전송이 많은지 확인한다.\n5. 결과를 다른 시스템과 교환해야 하면 표준 포맷과 라이브러리 지원을 함께 본다.\n\n## 헷갈리는 축\n\nBitmap은 HashSet보다 메모리와 locality가 좋을 수 있지만 id 범위가 크고 sparse하면 plain bitset은 낭비가 크다. Roaring은 sparse/dense 구간을 container로 나눠 압축한다. 다만 압축은 approximation이 아니다. stable integer id mapping이 유지되면 BitSet과 Roaring은 둘 다 exact set을 표현하며 Bloom Filter처럼 false positive를 허용하지 않는다.\n\n## 정확한 보장과 compressed caveat\n\n- Plain bitset은 `bit[i] == 1`이면 id `i`가 존재한다는 뜻이다. 동적 `BitSet` 구현은 highest set bit까지 확장될 수 있으므로, 실제 원소 수보다 max id가 메모리 비용을 좌우한다.\n- 같은 id는 같은 bit 위치에만 매핑되어야 하며, id mapping이 바뀌면 저장된 bitmap 전체 의미가 깨진다.\n- Roaring Bitmap은 보통 상위 16-bit key 기준으로 container를 나누고, 각 container 안에서 정렬/중복 제거된 하위 값을 유지한다. container는 density와 run 특성에 따라 array, bitmap, run 표현을 쓸 수 있다.\n- compressed bitmap의 보장은 \"압축된 표현에서도 membership과 `AND/OR/XOR/AND NOT` 결과가 plain set과 동일하다\"는 exact invariant다. 압축은 저장/연산 표현을 바꾸는 것이지 확률적 생략이 아니다.\n- 압축 이득은 보장되지 않는다. 아주 dense하고 작은 universe에서는 plain bitset이 더 단순하고 빠를 수 있고, update가 container threshold를 자주 넘으면 재구성 비용이 커진다.\n- serialized format, signed/unsigned id 해석, 32-bit/64-bit 지원, 라이브러리 버전 호환이 깨지면 exact 구조라도 시스템 간 의미가 달라질 수 있다.\n\n## Complexity/운영 비용\n\n- Plain bitset 메모리는 대략 universe size `U / 8` bytes다. 원소가 10개여도 max id가 10억이면 plain bitset은 비싸다.\n- Bitset set operation은 word 단위로 처리되어 `O(U / wordSize)`이고 CPU cache/SIMD 이점을 받기 쉽다.\n- HashSet membership은 평균 `O(1)`이지만 객체/버킷 overhead와 pointer chasing이 크다.\n- Roaring은 container 수와 container 내부 표현에 따라 메모리와 연산 비용이 달라진다. dense 구간은 bitmap container, sparse 구간은 array container가 유리하다.\n- 운영에서는 serialization 크기, GC pressure, off-heap/on-heap 배치, 라이브러리 버전 호환, update batch size가 성능을 크게 바꾼다.\n- repeated set operation이 핵심이면 단건 membership latency보다 `cardinality`, `intersect cardinality`, materialization 비용을 같이 본다.\n\n## 검증 신호\n\n- source of truth의 count와 bitmap `cardinality()`가 일치하는가?\n- 샘플 id membership을 양성/음성 모두 대조했는가? dictionary 기반 mapping이면 dictionary version도 같이 고정했는가?\n- `A AND B`, `A OR B`, `A AND NOT B` 결과를 HashSet baseline이나 SQL baseline과 비교했는가?\n- plain bitset 대비 Roaring의 serialized size, resident memory, GC time, union/intersection latency를 실제 dataset density별로 비교했는가?\n- container 통계(array/bitmap/run container 수, 평균 cardinality, run 수)를 볼 수 있는가? 특정 container가 churn하면 batch update나 rebuild 전략이 필요하다.\n- wire format과 라이브러리 버전이 producer/consumer 사이에서 호환되는가?\n\n## 실패 반례\n\n- `userId`가 64-bit이고 실제 active user가 1만 명뿐인데 max id가 매우 크면 plain bitset은 메모리 폭탄이 된다.\n- 문자열 이메일 membership을 bitmap으로 풀려면 별도 dictionary가 필요하다. dictionary가 불안정하면 bit 위치 의미가 바뀐다.\n- 아주 dense한 작은 id 범위에 Roaring을 쓰면 압축 metadata 때문에 plain bitset보다 단순하지 않을 수 있다.\n- 실시간으로 단건 update가 매우 많고 set operation은 거의 없다면 compressed bitmap의 container 재구성 비용이 이득을 상쇄할 수 있다.\n- id를 shard-local index로 바꿨는데 shard id를 함께 저장하지 않으면 서로 다른 사용자/문서가 같은 bit 위치로 충돌한다. 이건 Bloom Filter식 false positive가 아니라 mapping 설계 오류다.\n\n## 흔한 오해\n\n- Bitmap은 probabilistic 구조가 아니다. Bloom Filter와 달리 false positive가 없어야 한다.\n- compressed bitmap은 항상 더 작지 않다. density와 container 분포가 맞아야 한다.\n- Roaring Bitmap은 HashSet의 일반 대체재가 아니다. integer set과 set algebra가 강한 영역에서 빛난다.\n- `BitSet`을 쓰면 자동으로 메모리가 적게 든다는 말은 틀리다. id universe가 선택의 핵심이다.\n- Roaring이 \"압축\"한다는 말은 정확도를 낮춘다는 뜻이 아니다. 결과가 원본 set algebra와 달라지면 자료구조 선택 문제가 아니라 mapping, serialization, 동기화 검증 실패다.\n\n## Wrong-bucket neighbor\n\n문자열 key나 arbitrary object membership은 hash 기반 구조가 더 단순할 수 있다. integer id로 mapping 가능한지 확인한다.\n\n## Safe Next Docs\n\n실전 선택은 `roaring-bitmap-selection-playbook`으로 이어진다.\n",
+  "aliases": [
+    "Bitmap BitSet Roaring chooser",
+    "비트맵 BitSet Roaring 면접",
+    "dense sparse integer set choice",
+    "compressed bitmap answer"
+  ],
+  "expected_queries": [
+    "Bitmap BitSet Roaring Bitmap 차이를 면접에서 어떻게 설명해?",
+    "dense integer id set에는 왜 bitmap이 좋아?",
+    "Roaring Bitmap은 언제 쓰는 거야?"
+  ],
+  "symptoms": [
+    "모든 Set 문제에 HashSet만 떠올려요",
+    "sparse한 id 공간에 plain bitset을 써서 메모리가 커져요",
+    "compressed bitmap의 set operation 장점을 모릅니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/bitmap-vs-set-dense-integer-id-beginner-bridge"
+    ],
+    "next_docs": [
+      "data-structure/roaring-bitmap-selection-playbook"
+    ],
+    "confusable_with": [
+      "data-structure/plain-bitset-vs-compressed-bitmap-decision-card",
+      "data-structure/roaring-bitmap-selection-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/bitmap-bitset-roaring-interview-chooser.md",
+    "revision_history": []
+  }
+}

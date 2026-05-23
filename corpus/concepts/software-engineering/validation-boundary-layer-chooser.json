@@ -1,0 +1,48 @@
+{
+  "id": "software-engineering/validation-boundary-layer-chooser",
+  "title": "Validation Boundary Layer Chooser",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "이 chooser는 학습자가 검증을 Controller DTO Service Domain 중 어디에 둘지 고르는 데 쓰인다. 입력 검증, 도메인 불변식, 생성자 검증, DTO validation 중복 같은 질문을 분기한다.",
+  "body_markdown": "# Validation Boundary Layer Chooser\n\n## 10초 chooser\n\n| 질문 | 먼저 둘 위치 | 이유 | 피해야 할 위치 |\n|---|---|---|\n| JSON 형식, 필수 필드, 타입 오류인가? | Request DTO / Controller | HTTP 요청 모양의 문제다 | Domain 생성자 |\n| 값 객체가 언제나 지켜야 하는 규칙인가? | Domain 생성자 / 정적 팩토리 | 어떤 경로로 만들어져도 깨지면 안 된다 | Controller 전용 검증 |\n| 여러 저장소 상태를 봐야 판단 가능한가? | Application Service | 유스케이스와 트랜잭션 경계가 필요하다 | Value Object |\n| DB 제약 때문에 최종 방어가 필요한가? | Repository 구현 / DB constraint | 동시성, unique constraint는 저장소가 마지막 방어선이다 | Controller 메시지 검증 |\n\n## 경계 판단 기준\n\n검증 위치는 \"누가 이 사실을 알아야 하는가\"로 고른다.\n\n- Request DTO 검증은 외부 입력의 모양을 빠르게 거른다. 예: `date`가 비어 있음, 숫자 필드가 문자열로 옴, 필수 필드 누락.\n- Controller는 HTTP status와 error response로 번역한다. 검증 규칙을 직접 많이 갖기보다 DTO validation 결과와 예외를 응답으로 바꾼다.\n- Domain은 객체가 살아 있는 동안 항상 참이어야 하는 규칙을 지킨다. 예: 로또 번호는 1-45, 예약 시간은 영업 시간 안, 주문 수량은 1 이상.\n- Application Service는 현재 시스템 상태를 봐야 하는 규칙을 다룬다. 예: 이미 예약된 시간인지, 회원이 주문 가능한 상태인지, 재고가 충분한지.\n- Repository와 DB constraint는 저장소 일관성의 최종 방어선이다. 이 위치를 사용자 친화적 메시지 검증의 주인으로 삼지는 않는다.\n\n## 코드 리뷰 냄새\n\n- Controller에서 `if (price < 0)` 같은 도메인 규칙을 직접 던진다.\n- Request DTO의 `@Min`, `@Pattern`만 믿고 Domain 생성자 검증을 제거한다.\n- Service 메서드마다 같은 null, 범위, 포맷 검사가 반복된다.\n- Repository 예외 메시지를 그대로 사용자 응답으로 노출한다.\n- 테스트가 Controller 검증만 통과하면 Domain 객체도 안전하다고 가정한다.\n\n## wrong-bucket/confusable 비교\n\n검증 위치 선택은 \"어디서 예외를 던지면 편한가\"가 아니라 \"그 규칙이 어느 세계의 말인가\"로 가른다.\n\n| 규칙 | 맞는 버킷 | wrong bucket | 왜 틀렸나 |\n|---|---|---|---|\n| JSON 필드가 없거나 타입이 안 맞는다 | Request DTO / message conversion | Domain 생성자 | 도메인은 아직 만들어지지 않았고, 요청 모양 해석 단계의 실패다 |\n| 로또 번호는 항상 1-45여야 한다 | Domain value object | Controller `@Valid`만 사용 | 테스트, batch, 다른 service 경로에서는 Controller를 지나지 않을 수 있다 |\n| 같은 시간대 예약이 이미 있는지 봐야 한다 | Application Service | Value Object | 현재 저장소 상태와 트랜잭션 경계가 필요한 유스케이스 규칙이다 |\n| 이메일 unique 제약을 최종 보장한다 | DB constraint / Repository | DTO 정규식 | 정규식은 모양만 보고, 동시성 아래 중복 최종 방어는 저장소가 한다 |\n| `400` 응답 메시지를 예쁘게 만든다 | ControllerAdvice / web adapter | Domain exception message 그대로 노출 | 사용자 응답 표현은 HTTP adapter 책임이고 domain 문구와 1대1일 필요가 없다 |\n\n테스트도 버킷별로 달라야 한다. Controller 테스트가 `400`을 확인하면 요청 해석과 응답 매핑은 확인된다. 하지만 Domain 생성자 테스트가 없으면 객체가 다른 경로로 만들어질 때 불변식이 유지된다고 증명하지 못한다.\n\n## 흔한 오해\n\n`@Valid`는 HTTP 입력을 걸러 주는 도구이지 도메인 불변식을 대신하지 않는다. 테스트, batch, fixture, 다른 Service에서 Domain을 만들 때는 Controller를 지나지 않을 수 있다.\n\n반대로 모든 검증을 Domain에 몰아넣는 것도 안전하지 않다. JSON 필드 누락, enum 파싱 실패, message conversion 실패는 Domain이 아니라 웹 어댑터의 책임이다. Domain은 \"생성 가능한 의미 있는 값인가\"를 판단하고, Controller/DTO는 \"요청이 해석 가능한 모양인가\"를 판단한다.\n\n## 미션 예시\n\n예약 미션에서 `ReservationRequest`는 `date`, `timeId`, `themeId`가 요청에 있는지 확인한다. `Reservation` 또는 `ReservationTime`은 과거 시간 예약 금지, 시작 시간이 영업 범위 안인지 같은 불변식을 지킨다. `ReservationService`는 같은 시간대가 이미 예약됐는지 Repository로 조회한 뒤 생성 여부를 결정한다.\n\n로또 미션에서는 `LottoPurchaseRequest`가 금액 필드 누락과 숫자 파싱을 다루고, `Money`가 1000원 단위인지 보장한다. `LottoMachine`이나 Service가 \"금액으로 몇 장을 발행할지\"라는 유스케이스 흐름을 담당한다.\n\n## Safe Next Docs\n\n검증 위치를 고른 뒤에는 `software-engineering/domain-invariants-as-contracts`로 내려가 Domain 불변식의 계약성을 확인한다. 로또 생성자 검증과 static factory 비교가 필요하면 `software-engineering/lotto-domain-invariant-bridge`가 안전한 다음 문서다.\n",
+  "aliases": [
+    "validation boundary chooser",
+    "where to validate input invariant",
+    "검증 위치 선택",
+    "입력 검증 도메인 검증 구분",
+    "@Valid"
+  ],
+  "expected_queries": [
+    "검증은 Controller DTO Service Domain 중 어디에 둬야 해?",
+    "입력값 검증이랑 도메인 불변식 검증은 뭐가 달라?",
+    "생성자 검증과 요청 검증을 어떻게 나눠야 해?"
+  ],
+  "symptoms": [
+    "Controller에서 모든 예외를 던지고 있어요",
+    "Domain 생성자 검증과 DTO validation이 중복돼요",
+    "Service에서 null과 범위 검사를 계속 반복해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/dto-domain-entity-boundary-primer"
+    ],
+    "next_docs": [
+      "software-engineering/domain-model-anemic-vs-rich-interview-chooser",
+      "software-engineering/domain-invariants-as-contracts",
+      "software-engineering/lotto-domain-invariant-bridge"
+    ],
+    "confusable_with": [
+      "software-engineering/domain-invariants-as-contracts",
+      "spring/valid-400-vs-message-conversion-400-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/software-engineering/validation-boundary-layer-chooser.md",
+    "revision_history": []
+  }
+}

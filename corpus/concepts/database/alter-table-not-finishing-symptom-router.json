@@ -1,0 +1,55 @@
+{
+  "id": "database/alter-table-not-finishing-symptom-router",
+  "title": "ALTER TABLE이 안 끝나요 원인 라우터",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "|",
+  "body_markdown": "# ALTER TABLE이 안 끝나요 원인 라우터\n\n## 한 줄 요약\n\n> `ALTER TABLE`이 안 끝날 때는 \"DDL이 느린가?\"가 아니라, metadata lock 대기인지, 긴 트랜잭션이 blocker인지, 실제 table rewrite가 오래 걸리는지, 쓰기 트래픽/replication/cancel 위험이 얽힌 운영 사고인지 먼저 갈라야 한다.\n\n## 범위 메모\n\n이 라우터는 MySQL/InnoDB의 `Waiting for table metadata lock`, `gh-ost`, `pt-online-schema-change` 장면을 중심으로 설명한다. PostgreSQL이나 다른 DBMS도 catalog/schema lock, table rewrite, replica lag 문제는 비슷하게 겪지만, 관찰 뷰와 DDL 옵션 이름은 다르다. 따라서 여기서의 핵심은 명령어 암기가 아니라 **대기 종류를 증거로 나누는 순서**다.\n\n## 가능한 원인\n\n1. **metadata lock이 DDL 진입 자체를 막고 있다.** DDL 세션이 `Waiting for table metadata lock` 또는 `PENDING` MDL로 보이면 데이터 복사 속도보다 먼저 blocker를 찾아야 한다. 이 갈래는 [Metadata Lock and DDL Blocking](./metadata-lock-ddl-blocking.md)으로 가서 MDL과 row lock의 층을 분리한다.\n2. **장기 트랜잭션이 blocker다.** `SELECT`만 했어도 트랜잭션이 열린 채 같은 테이블을 참조했다면 DDL이 필요한 metadata lock을 못 받을 수 있다. evidence는 idle-in-transaction, 긴 trx age, report/batch 세션, autocommit off다.\n3. **metadata lock이 아니라 table rewrite 또는 copy가 오래 걸린다.** 상태가 실제로 실행 중이고 disk IO, temp space, progress view, row copy가 움직인다면 \"막힘\"이 아니라 대형 테이블 재작성일 수 있다. 컬럼 타입 변경, nullable/default 변경, 인덱스 생성, DB 버전별 online DDL 지원 범위가 핵심이다.\n4. **동시 DML과 row lock/write load가 DDL 진행을 흔든다.** online DDL이라도 쓰기 부하가 큰 테이블에서는 row lock wait, purge/history list, change buffer, IO saturation, deadlock retry가 커질 수 있다. 이 경우는 [Lock Wait, Deadlock, and Latch Contention Triage Playbook](./lock-wait-deadlock-latch-triage-playbook.md)으로 대기 유형을 다시 나눈다.\n5. **online DDL 옵션이 기대한 방식으로 적용되지 않았다.** `ALGORITHM=INSTANT`, `INPLACE`, `COPY`, `LOCK=NONE` 같은 옵션은 DB 버전, 엔진, 변경 종류에 따라 fallback되거나 거절된다. \"online 옵션을 줬다\"보다 실제 chosen algorithm과 lock mode를 확인해야 한다. 큰 전략은 [온라인 스키마 변경 전략](./online-schema-change-strategies.md)으로 이어진다.\n6. **`gh-ost`나 `pt-online-schema-change`의 cutover만 막혔다.** 복사와 sync는 끝났는데 rename/cutover에서 멈추면 데이터량이 아니라 마지막 metadata lock window 문제다. 이 경우 [gh-ost / pt-online-schema-change Cutover Precheck Runbook](./gh-ost-pt-osc-cutover-precheck-runbook.md)을 먼저 본다.\n7. **replication lag 또는 cancel/rollback 위험이 더 큰 문제다.** primary의 DDL은 끝나도 replica SQL thread가 lag를 만들 수 있고, 진행 중인 DDL을 취소하면 DBMS/algorithm에 따라 즉시 중단이 아니라 rollback, cleanup, metadata 상태 확인이 필요할 수 있다. 이미 앱 요청까지 밀리면 [Metadata Lock Outage Triage, Cancel, and Recovery Runbook](./metadata-lock-outage-triage-cancel-recovery.md)으로 간다.\n\n## 증거로 나누는 1차 분기표\n\n| 관찰 증거 | 더 가능성 높은 갈래 | 바로 할 다음 확인 |\n|---|---|---|\n| DDL session state가 `Waiting for table metadata lock` | MDL 대기 | `performance_schema.metadata_locks`, `SHOW FULL PROCESSLIST`, blocker thread의 trx age |\n| blocker가 `Sleep`인데 trx가 오래 열려 있음 | 장기 트랜잭션 blocker | autocommit off, report/query 세션, batch session owner |\n| DDL은 running이고 rows copied/progress/IO가 계속 증가 | table rewrite/copy | chosen algorithm, table size, temp space, disk IO, progress view |\n| 앱 write latency와 row lock wait가 같이 증가 | concurrent DML/write load | row lock wait, deadlock, lock timeout, hot row/index contention |\n| online DDL을 기대했는데 lock이 강하거나 copy가 발생 | option fallback | DB version, engine, DDL type, `ALGORITHM`/`LOCK` 실제 적용 결과 |\n| tool copy는 끝났고 rename/cutover에서만 pending | OSC cutover blocker | cutover precheck, idle transaction, foreign key/trigger/tool-specific guard |\n| primary는 끝났지만 replica lag가 커짐 | replication apply lag | replica delay, SQL thread state, read traffic routing, app release order |\n| cancel 후에도 즉시 정상화되지 않음 | rollback/cleanup risk | DDL phase, rollback progress, pending MDL queue drain, retry safety |\n\n## 빠른 자기 진단\n\n1. DDL 세션 상태에 `Waiting for table metadata lock`이 보이는지 확인한다. 보인다면 row lock 화면만 보고 있지 말고 MDL 분기로 간다.\n2. 같은 테이블을 읽거나 만지는 장기 트랜잭션, 리포트 쿼리, 배치 세션이 maintenance window와 겹쳤는지 본다. 있다면 blocker 후보가 가장 강하다.\n3. DDL이 실제로 실행 중인지, 아니면 lock을 기다리는지 분리한다. progress가 움직이고 IO가 높으면 table rewrite/copy 분기를 본다.\n4. `gh-ost`나 `pt-online-schema-change`를 썼다면 복사 단계가 아니라 cutover 단계에서 멈췄는지 확인한다. 그렇다면 데이터량보다 precheck와 blocker hygiene가 핵심이다.\n5. online DDL 옵션을 줬다면 \"옵션을 적었다\"가 아니라 실제 algorithm/lock mode가 무엇으로 결정됐는지 확인한다.\n6. replica read를 쓰는 서비스라면 primary 완료 시각만 보지 말고 replica lag와 app release order를 같이 본다.\n7. 이미 앱 요청 지연이 같이 커졌다면 DDL 하나의 느림이 아니라 outage 분기다. 이 경우 즉시 blocker 탐색과 cancel/continue 기준부터 잡아야 한다.\n\n## wrong bucket: 이렇게 묶으면 진단이 늦어진다\n\n| 잘못 묶은 표현 | 왜 위험한가 | 더 나은 분류 |\n|---|---|---|\n| \"row lock은 안 보이니 lock 문제는 아니다\" | MDL은 row lock 화면과 다른 층에서 보인다 | metadata lock vs row lock을 먼저 분리 |\n| \"대형 테이블이라 원래 오래 걸린다\" | 실제로는 긴 idle transaction 하나가 DDL 진입을 막을 수 있다 | running rewrite인지 pending MDL인지 확인 |\n| \"online DDL이면 서비스 영향이 없다\" | cutover 순간과 fallback algorithm은 여전히 lock과 lag를 만든다 | chosen algorithm, cutover precheck, cancel threshold 확인 |\n| \"primary에서 끝났으니 배포 완료\" | replica lag가 읽기 경로를 깨뜨릴 수 있다 | replica apply 상태와 read routing 확인 |\n| \"일단 kill/cancel하면 끝난다\" | rollback/cleanup과 pending queue drain이 남을 수 있다 | cancel 후 verification까지 포함 |\n\n## 다음 확인 질문\n\n1. DDL 세션은 lock을 기다리는가, 실제 table rewrite/copy를 수행 중인가?\n2. blocker 후보의 transaction age, session owner, query text, autocommit 상태는 무엇인가?\n3. 변경 종류가 현재 DB 버전에서 `INSTANT`/`INPLACE`/`LOCK=NONE`으로 가능한가, 아니면 copy fallback인가?\n4. 같은 테이블의 DML QPS, row lock wait, deadlock, app p95가 DDL 시각과 같이 움직였는가?\n5. replica lag가 커졌고, 애플리케이션이 replica에서 새/옛 스키마를 섞어 읽을 가능성이 있는가?\n6. 지금 cancel하면 즉시 중단되는 phase인가, rollback/cleanup이 필요한 phase인가?\n7. 재시도 전에 blocker-free window, cutover precheck, stop-loss threshold가 문서화됐는가?\n\n## 다음 학습\n\n- MDL이 row lock과 왜 다르고 `ALTER TABLE`을 어떻게 막는지 보려면 [Metadata Lock and DDL Blocking](./metadata-lock-ddl-blocking.md)을 먼저 읽는다.\n- 장애 대응 관점에서 cancel/continue 판단과 blast radius를 보려면 [Metadata Lock Outage Triage, Cancel, and Recovery Runbook](./metadata-lock-outage-triage-cancel-recovery.md)으로 이어간다.\n- `gh-ost`나 `pt-online-schema-change` cutover 전 점검 항목이 필요하면 [gh-ost / pt-online-schema-change Cutover Precheck Runbook](./gh-ost-pt-osc-cutover-precheck-runbook.md)을 본다.\n- table rewrite, online DDL option, replica lag까지 포함해 큰 배포 전략을 잡고 싶으면 [온라인 스키마 변경 전략](./online-schema-change-strategies.md)을 본다.\n- MDL인지 row lock/deadlock/latch contention인지 큰 분기부터 다시 잡고 싶다면 [Lock Wait, Deadlock, and Latch Contention Triage Playbook](./lock-wait-deadlock-latch-triage-playbook.md)을 함께 본다.\n",
+  "aliases": [
+    "alter table 안 끝남",
+    "ddl 배포가 멈춤",
+    "waiting for table metadata lock",
+    "schema change stuck",
+    "online ddl cutover hang",
+    "alter table pending 상태"
+  ],
+  "expected_queries": [
+    "ALTER TABLE 이 계속 안 끝날 때 row lock 말고 무엇부터 의심해야 해?",
+    "Waiting for table metadata lock 이 보이면 원인을 어떤 갈래로 나눠 봐야 해?",
+    "online schema change 가 cutover 단계에서만 멈추는 이유를 빠르게 진단하고 싶어",
+    "DDL 배포를 걸자마자 서비스 요청까지 같이 느려질 때 어디부터 확인해야 해?",
+    "metadata lock 장애인지 단순 lock timeout 인지 초반에 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "ALTER TABLE 이 몇 분째 끝나지 않고 Waiting for table metadata lock 상태로 남아 있다",
+    "배포 직후부터 특정 테이블 관련 요청이 줄줄이 느려지고 DDL 세션만 계속 pending 으로 보인다",
+    "gh-ost 나 pt-online-schema-change 는 거의 끝났는데 cutover 단계에서만 멈춘다",
+    "row lock 화면에서는 안 보이는데 schema change 를 거는 순간 서비스가 같이 버벅인다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-basics",
+      "database/lock-basics"
+    ],
+    "next_docs": [
+      "database/metadata-lock-ddl-blocking",
+      "database/metadata-lock-outage-triage-cancel-recovery",
+      "database/gh-ost-pt-osc-cutover-precheck-runbook",
+      "database/online-schema-change-strategies"
+    ],
+    "confusable_with": [
+      "database/lock-wait-deadlock-latch-triage-playbook",
+      "database/transaction-timeout-vs-lock-timeout",
+      "database/online-schema-change-strategies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/alter-table-not-finishing-symptom-router.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "id": "spring/security-csrf-cookie-session-spa-router",
+  "title": "Spring Security CSRF Cookie Session SPA Router",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "'이 문서는 Spring Security의 session cookie auth, CSRF token, SameSite cookie,",
+  "body_markdown": "# Spring Security CSRF Cookie Session SPA Router\n\n> 한 줄 요약: SPA의 403/CORS/cookie 문제는 세션 쿠키 인증, SameSite 전송 조건, CSRF token 검증, fetch credentials, CORS preflight를 순서대로 분리해야 한다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Spring Security 아키텍처](./spring-security-architecture.md)\n> - [Spring CORS: Security vs MVC Ownership](./spring-cors-security-vs-mvc-ownership.md)\n> - [HTTP의 무상태성과 쿠키, 세션, 캐시](../network/http-state-session-cache.md)\n> - [Cross-Origin Cookie fetch credentials CORS 입문](../network/cross-origin-cookie-credentials-cors-primer.md)\n> - [CSRF 방어 — Synchronizer Token vs SameSite Cookie vs Double Submit](../security/csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge.md)\n> - [XSS / CSRF / Spring Security](../security/xss-csrf-spring-security.md)\n> - [CORS 기초](../security/cors-basics.md)\n\nretrieval-anchor-keywords: spring security csrf spa, session cookie csrf token, JSESSIONID 403, XSRF-TOKEN, X-XSRF-TOKEN, CookieCsrfTokenRepository, SameSite CSRF, fetch credentials include, withCredentials, CORS preflight no cookies, csrf token missing, spa post 403, cookie는 있는데 안 붙음\n\n## 핵심 개념\n\nSPA에서 Spring Security 403을 보면 아래 다섯 축을 섞지 말아야 한다.\n\n- Session cookie auth: `JSESSIONID` 같은 쿠키가 서버 세션을 찾고 `SecurityContext`를 복원한다.\n- SameSite: 브라우저가 cross-site 요청에 쿠키를 보낼지 정하는 cookie attribute다.\n- CSRF token: 사용자가 의도한 unsafe request인지 검증하는 별도 token이다.\n- SPA credentials: `fetch(..., { credentials: \"include\" })` 또는 axios `withCredentials`가 있어야 cross-origin 요청에 쿠키를 보낼 수 있다.\n- CORS: 브라우저가 cross-origin script 요청을 허용할지 정하는 정책이다. CORS는 CSRF token을 대체하지 않는다.\n\n즉 \"쿠키가 있다\", \"CORS를 열었다\", \"SameSite=Lax다\", \"CSRF token을 쿠키로 받았다\"는 각각 다른 증거다.\n\n## 1차 라우팅\n\n| 증상 | 먼저 볼 것 | 이유 |\n|---|---|---|\n| GET은 되는데 POST만 403 | CSRF token header/parameter | Spring Security는 unsafe method에 CSRF 보호를 적용한다 |\n| 로그인 직후 첫 POST가 403 | fresh CSRF token 재발급/노출 | 인증 성공 후 기존 token cookie가 지워지거나 새 token이 필요할 수 있다 |\n| Application 탭에는 쿠키가 있는데 Request Cookie가 없음 | SameSite, Secure, Domain, Path, credentials | 저장과 전송은 다른 단계다 |\n| OPTIONS preflight가 401/403 | CORS가 Security보다 먼저 처리되는지 | preflight에는 `JSESSIONID`가 없어서 인증 필터가 먼저 보면 막을 수 있다 |\n| 브라우저는 CORS error, 서버 로그는 403 | actual response header와 CSRF reject | 브라우저가 403 본문을 숨겨 CORS처럼 보일 수 있다 |\n\n이 표로 먼저 갈라야 \"CSRF 설정을 꺼야 하나?\" 같은 위험한 결론으로 바로 가지 않는다.\n\n## Session Cookie Auth와 CSRF\n\n세션 쿠키 인증에서 CSRF가 문제가 되는 이유는 브라우저가 대상 사이트 쿠키를 자동으로 붙일 수 있기 때문이다.\n\n```text\nattacker.com page\n  -> browser sends unsafe request to app.example.com\n  -> browser may attach app.example.com cookies\n  -> server sees existing session unless CSRF token check blocks it\n```\n\nCSRF token은 \"이 요청이 우리 화면이나 우리 JS가 만든 요청인가\"를 확인하는 증거다. session cookie는 \"누구인가\"를 나타내고, CSRF token은 \"그 사용자가 의도한 unsafe 요청인가\"를 보강한다.\n\n## SameSite는 CSRF Token과 다르다\n\n`SameSite=Lax`나 `Strict`는 cross-site cookie 자동 전송을 줄인다. 하지만 SameSite는 token 검증이 아니다.\n\n- same-site이지만 cross-origin인 환경에서는 CORS와 credentials 문제가 여전히 남는다.\n- `SameSite=None; Secure`가 필요한 구조라면 cross-site cookie 전송을 허용하므로 CSRF token 중요도가 올라간다.\n- GET으로 상태 변경을 만들면 Lax가 일부 top-level navigation을 허용하는 경로와 충돌할 수 있다.\n\n따라서 SameSite는 좋은 완충 장치지만, session cookie 기반 unsafe API에서는 CSRF token 설계를 함께 둔다.\n\n## SPA Credentials와 Token Header\n\nSPA가 session cookie를 쓰면 요청은 보통 두 증거를 같이 가져야 한다.\n\n```http\nCookie: JSESSIONID=...\nX-XSRF-TOKEN: <token from XSRF-TOKEN cookie or bootstrap endpoint>\n```\n\n`CookieCsrfTokenRepository`를 쓰면 token을 쿠키(`XSRF-TOKEN`)에 저장하고, SPA는 그 값을 읽어 header(`X-XSRF-TOKEN`)로 다시 보낸다. 이때 token cookie는 session cookie와 역할이 다르다.\n\n```js\nawait fetch(\"/api/reservations\", {\n  method: \"POST\",\n  credentials: \"include\",\n  headers: {\n    \"Content-Type\": \"application/json\",\n    \"X-XSRF-TOKEN\": readCookie(\"XSRF-TOKEN\")\n  },\n  body: JSON.stringify(payload)\n});\n```\n\n`credentials: \"include\"`는 cookie 전송 조건이고, `X-XSRF-TOKEN`은 CSRF 검증 조건이다. 둘 중 하나만 맞아도 unsafe request는 실패할 수 있다.\n\n## CORS와 Security Filter 순서\n\nSpring Security 공식 문서는 CORS가 Security보다 먼저 처리되어야 한다고 설명한다. preflight 요청에는 cookie가 없기 때문이다.\n\n따라서 아래를 분리해서 본다.\n\n1. `OPTIONS` preflight가 인증 없이 CORS 응답을 받는가\n2. actual request에 `Cookie`가 붙는가\n3. actual request에 CSRF header가 붙는가\n4. actual response가 credentialed CORS 응답으로 브라우저에 노출되는가\n\npreflight가 막히면 CSRF token을 아무리 맞춰도 actual request까지 가지 못한다. 반대로 preflight가 통과해도 token header가 빠지면 Spring Security CSRF filter에서 403이 난다.\n\n## 근거로 확인할 것\n\nNetwork 탭에서 로그인 응답과 실패한 unsafe 요청을 나란히 본다.\n\n- 로그인 응답: `Set-Cookie: JSESSIONID=...`, `Set-Cookie: XSRF-TOKEN=...`가 있는가\n- 브라우저 저장소: 두 cookie의 Domain, Path, SameSite, Secure가 현재 origin/site와 맞는가\n- preflight 요청: `OPTIONS`가 200/204로 끝나고 CORS header가 붙는가\n- actual 요청: `Cookie: JSESSIONID=...`와 `X-XSRF-TOKEN`이 동시에 있는가\n- actual 응답: 403이면 Spring Security CSRF reject인지, 인증 실패인지, CORS header 누락으로 브라우저가 가린 것인지 서버 로그와 대조한다\n\n## 중단 조건\n\n아래 조건이 맞으면 SPA CSRF/cookie 디버깅을 멈춰도 된다.\n\n- preflight가 Security 인증 필터에 막히지 않고 CORS 정책을 통과한다.\n- session cookie 저장 조건과 전송 조건을 둘 다 Network 탭으로 확인했다.\n- unsafe method 요청에 CSRF token header가 붙고, bad token regression test가 403을 반환한다.\n- 로그인 성공, logout 성공, token 만료 후 fresh token을 다시 받는 경로가 있다.\n- SameSite 값을 architecture에 맞게 골랐고, `None`을 쓴다면 `Secure`와 CSRF token 요구가 함께 검증되어 있다.\n\n## 공식 근거\n\n- [Spring Security CSRF](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html): Spring Security는 unsafe HTTP method에 CSRF 보호를 기본 적용하고, SPA 통합과 `CookieCsrfTokenRepository` 고려사항을 설명한다.\n- [Spring Security CORS](https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html): preflight에는 cookie가 없으므로 CORS가 Spring Security보다 먼저 처리되어야 한다고 설명한다.\n\n## 꼬리질문\n\n> Q: session cookie와 CSRF token은 무엇이 다른가?\n> 의도: 인증 상태와 요청 의도 증거 분리 확인\n> 핵심: session cookie는 사용자 세션을 찾고, CSRF token은 unsafe 요청이 정상 UI/JS에서 온 것인지 검증한다.\n\n> Q: SameSite=Lax면 CSRF token을 항상 빼도 되는가?\n> 의도: browser cookie policy와 server-side token 검증 분리 확인\n> 핵심: SameSite는 cookie 전송 완화책이지 token 검증이 아니며, 구조에 따라 token이 여전히 필요하다.\n\n> Q: CORS error와 CSRF 403을 어떻게 구분하는가?\n> 의도: preflight, actual request, browser rendering 구분 확인\n> 핵심: Network 탭에서 OPTIONS와 actual 요청을 나누고, 서버 로그의 Security reject 원인을 같이 봐야 한다.\n\n## 한 줄 정리\n\nSPA의 Spring Security 403은 `JSESSIONID` 전송, `XSRF-TOKEN` 발급, `X-XSRF-TOKEN` header, CORS preflight 순서를 분리해서 보면 원인이 선명해진다.\n",
+  "aliases": [
+    "Spring Security CSRF SPA",
+    "session cookie CSRF token",
+    "CookieCsrfTokenRepository",
+    "XSRF-TOKEN X-XSRF-TOKEN",
+    "SameSite CSRF CORS credentials",
+    "JSESSIONID SPA 403",
+    "preflight no cookies"
+  ],
+  "expected_queries": [
+    "Spring Security SPA에서 CSRF 403이 나면 어디부터 봐야 해?",
+    "SameSite cookie와 CSRF token과 CORS credentials는 어떻게 달라?",
+    "CookieCsrfTokenRepository를 쓰는데 XSRF-TOKEN header가 왜 필요해?",
+    "fetch credentials include를 넣었는데도 세션 쿠키가 안 붙는 이유는?"
+  ],
+  "symptoms": [
+    "SPA 로그인은 성공했는데 POST/PUT/DELETE가 Spring Security에서 403으로 막힌다.",
+    "JSESSIONID는 있는데 cross-origin fetch에 쿠키나 CSRF header가 빠진다.",
+    "CORS 에러, SameSite, CSRF token 누락, 세션 만료 중 무엇이 원인인지 헷갈린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/security-architecture",
+      "network/cross-origin-cookie-credentials-cors-primer"
+    ],
+    "next_docs": [
+      "security/csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge"
+    ],
+    "confusable_with": [
+      "spring/cors-security-vs-mvc-ownership",
+      "security/csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-security-csrf-cookie-session-spa-router.md",
+    "revision_history": []
+  }
+}

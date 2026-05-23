@@ -1,0 +1,46 @@
+{
+  "id": "data-structure/priorityqueue-lazy-deletion-playbook",
+  "title": "PriorityQueue Lazy Deletion Playbook",
+  "category": "data-structure",
+  "level": "intermediate",
+  "summary": "이 playbook은 heap에서 임의 삭제나 priority update가 어려울 때 lazy deletion으로 stale entry를 제거하는 방법을 설명한다.",
+  "body_markdown": "# PriorityQueue Lazy Deletion Playbook\n\n## 재현 조건\n\n힙(heap)이나 우선순위 큐(PriorityQueue)는 top 원소를 꺼내는 데 강하지만, 중간에 있는 임의 원소를 찾아 삭제하거나 priority를 갱신하는 데 약하다. Java `PriorityQueue.remove(Object)`를 반복하면 내부 탐색 때문에 `O(N)` 비용이 누적될 수 있다. 이때 lazy deletion은 \"힙에서 즉시 지우지 말고, top에 올라왔을 때 최신성만 확인한다\"는 전략이다.\n\nJava `PriorityQueue`에는 decrease-key나 indexed delete가 없다. `offer`/`poll`은 `O(log N)`, `peek`은 `O(1)`이지만, `remove(Object)`와 `contains(Object)`는 내부 배열을 선형 탐색하므로 `O(N)`이다. priority가 바뀐 객체를 heap 안에서 직접 수정하는 것도 위험하다. comparator 기준 값이 바뀌어도 heap property를 자동으로 복구하지 않기 때문이다.\n\n## 확인 순서\n\n1. 원소의 최신 상태를 별도 Map이나 version으로 저장한다.\n2. Heap에는 새 후보를 push하고, 오래된 후보는 즉시 지우지 않는다.\n3. `peek` 또는 `poll` 시점에 해당 후보가 최신 상태인지 확인한다.\n4. 낡았으면 버리고 다음 후보를 본다.\n\n## 핵심 불변식\n\n정확성은 heap 내부 상태가 아니라 외부의 최신 상태 저장소가 보장한다. heap은 \"답이 될 수도 있는 후보를 priority 순서로 꺼내는 장치\"일 뿐이다. 예를 들어 Dijkstra에서는 `(distance, node)`를 여러 번 넣을 수 있고, 꺼낸 distance가 현재 `dist[node]`와 다르면 stale entry로 버린다.\n\n실무형 불변식은 더 구체적이어야 한다.\n\n- heap entry는 삽입 시점의 immutable snapshot이어야 한다. 예: `(priority, id, version, sequence)`.\n- authoritative state는 별도 map이 가진다. 예: `bestPriorityById`, `versionById`, `deletedIds`.\n- top을 답으로 쓰기 전에는 반드시 stale 여부를 확인한다. `peek`만 하는 API도 내부적으로 clean loop를 거쳐야 한다.\n- stale entry는 언젠가 `poll`되어 버려진다는 전제가 있어야 amortized 비용 설명이 성립한다.\n\n## 대표 패턴\n\npriority update는 기존 entry를 찾아 바꾸지 않고 새 version을 push한다. 나중에 top으로 나온 entry의 `version`이 현재 `versionById[id]`와 다르면 버린다. 삭제는 `deletedIds`나 `active[id] = false`를 기록하고, top으로 나온 entry가 삭제 상태면 버린다.\n\n```java\nwhile (!pq.isEmpty()) {\n    Entry e = pq.peek();\n    if (deleted.contains(e.id())) {\n        pq.poll();\n        continue;\n    }\n    if (e.version() != versionById.get(e.id())) {\n        pq.poll();\n        continue;\n    }\n    return e;\n}\nreturn null;\n```\n\n동일 priority가 많으면 `sequence` 같은 tie-breaker를 entry에 넣어 처리 순서를 안정화할 수 있다. comparator는 mutable 객체의 현재 필드를 보지 말고 entry snapshot 필드만 봐야 한다.\n\n## Complexity and amortization\n\n새 후보 삽입은 `O(log H)`이고, 유효한 top을 꺼내는 과정은 그때 poll한 stale 개수만큼 `O(log H)`가 추가된다. 하지만 각 stale entry는 한 번만 버려지므로, push된 후보 수 전체에 대해 보면 stale skip 비용은 누적 `O(totalEntries log H)` 안에 들어간다. 문제는 개별 요청 latency다. 한 번의 `peekValid()`가 오래 쌓인 stale entry를 몰아서 치우면 p99가 튈 수 있다.\n\n## 실패 원인 matrix\n\n| 증상 | 원인 | 수정 |\n|---|---|---|\n| top이 이미 삭제된 원소 | heap 내부 삭제를 미룸 | poll 시 deleted set 확인 |\n| Dijkstra에서 같은 node가 여러 번 나옴 | 더 짧은 후보가 나중에 push됨 | dist와 비교해 stale skip |\n| memory가 계속 증가 | stale entry가 소비되지 않음 | query 빈도와 cleanup 정책 점검 |\n| priority를 바꿨는데 순서가 이상함 | heap 안 객체를 mutate함 | immutable entry를 새로 offer |\n| peek 결과가 stale임 | peek 전에 clean loop가 없음 | `peekValid`/`pollValid` 래퍼 강제 |\n\n## 운영/테스트 검증\n\nLazy deletion은 top 조회나 poll이 충분히 자주 일어나 stale 후보가 자연스럽게 청소될 때 잘 맞는다. 삭제만 많이 하고 poll이 거의 없으면 메모리가 계속 쌓일 수 있어 주기적 rebuild나 다른 자료구조를 검토해야 한다. 테스트에서는 \"갱신 전 후보가 나중에 top으로 올라오는 케이스\", \"삭제된 원소가 top에 있는 케이스\", \"동일 priority tie\"를 포함한다.\n\n메모리 cleanup은 authoritative state 기준으로 해야 한다. 예를 들어 `pq.size() > liveCount * 2` 또는 stale skip count가 임계치를 넘으면 현재 live map에서 새 PriorityQueue를 다시 만드는 식이다. rebuild는 `O(liveCount)` 또는 heapify 비용을 쓰지만, stale entry가 너무 많아지는 장기 실행 서비스에서는 예측 가능한 비용으로 바꿀 수 있다. 삭제 tombstone도 영원히 보관하면 다른 형태의 leak이 되므로, entry가 소비되었거나 generation이 넘어간 뒤 정리할 조건이 필요하다.\n\n삭제/갱신이 매우 잦고 top 조회가 드물다면 lazy deletion보다 indexed heap, `TreeMap<priority, Set<id>>`, balanced tree, bucket queue 같은 대안이 더 맞을 수 있다. Dijkstra처럼 \"더 좋은 후보가 나오면 push하고, 나쁜 후보는 나중에 skip\"하는 알고리즘에는 lazy deletion이 자연스럽다.\n\n## 흔한 오해\n\nlazy deletion은 heap의 priority update를 지원하게 만드는 마법이 아니다. update 연산을 \"새 후보 삽입 + old 후보 skip\"으로 바꾸는 방식이다. 따라서 후보 객체의 identity, version, deleted flag 중 무엇으로 최신성을 판단할지 명확해야 한다.\n\n또한 lazy deletion은 \"삭제 비용이 0\"이 아니다. 비용을 삭제 시점에서 poll/peek 시점으로 미루는 것이다. 평균 처리량은 좋아질 수 있지만 stale이 몰리는 순간 latency와 memory peak를 관리해야 한다.\n\n## 테스트 체크리스트\n\n- 같은 id를 세 번 update한 뒤 가장 오래된 entry가 top으로 올라와도 skip되는가?\n- 삭제된 id가 가장 높은 우선순위여도 답으로 반환되지 않는가?\n- `peek` 반복만 하는 코드에서도 stale cleanup이 일어나는가?\n- comparator가 mutable external map을 직접 읽지 않는가?\n- heap size와 live count 차이가 커질 때 rebuild 정책이 동작하는가?\n\n## Safe Next Docs\n\n최단거리 구현의 stale skip은 `dijkstra-stale-priorityqueue-playbook`, top-k 선택은 `heap-priorityqueue-topk-interview-drill`로 이어진다.\n",
+  "aliases": [
+    "priority queue lazy deletion playbook",
+    "우선순위큐 lazy deletion 면접",
+    "heap stale entry removal",
+    "삭제 지원 안 하는 heap 처리"
+  ],
+  "expected_queries": [
+    "Java PriorityQueue에서 임의 원소 삭제가 느리면 어떻게 해?",
+    "heap에 stale entry가 남는 문제를 어떻게 처리해?",
+    "lazy deletion은 어떤 상황에서 써?"
+  ],
+  "symptoms": [
+    "PriorityQueue에서 remove(Object)를 반복해 O(N)이 됩니다",
+    "갱신된 값과 오래된 값이 heap에 같이 남아 답이 틀립니다",
+    "삭제할 원소를 즉시 heap 내부에서 찾으려 합니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/priority-queue-heap-primer"
+    ],
+    "next_docs": [
+      "algorithm/dijkstra-stale-priorityqueue-playbook",
+      "data-structure/heap-priorityqueue-topk-interview-drill"
+    ],
+    "confusable_with": [
+      "algorithm/dijkstra-stale-priorityqueue-playbook",
+      "data-structure/heap-priorityqueue-topk-interview-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/priorityqueue-lazy-deletion-playbook.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "system-design/littles-law-capacity-planning-primer",
+  "title": "Little's Law Capacity Planning Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 primer는 Little's Law를 처리량, latency, 동시성, queue wait의 실무 capacity planning 관점으로 설명한다.",
+  "body_markdown": "# Little's Law Capacity Planning Primer\n\n## 한 줄 요약\n\nLittle's Law는 안정 상태에서 `동시성 L = 처리량 λ * 평균 체류 시간 W`로 본다. 요청이 오래 머물수록 같은 QPS에서도 시스템 안에 동시에 쌓인 요청 수가 늘어난다.\n\n## Topic-specific invariant\n\nLittle's Law를 쓸 때는 같은 경계를 잡아야 한다. API 서버 전체를 볼 것인지, DB connection pool을 볼 것인지, 특정 downstream 호출 구간을 볼 것인지 먼저 정한다. 같은 경계 안에서 안정 상태라면 다음 관계가 성립한다.\n\n`average in-flight work L = effective throughput λ * average time in system W`\n\n여기서 λ는 \"들어온 요청 수\"가 아니라 해당 경계에서 완료되는 유효 처리량에 가깝다. 시스템이 이미 과부하라 arrival rate가 completion rate보다 크면 queue가 계속 자라므로 안정 상태 가정이 깨진다.\n\n## 실무 진입 증상\n\n\"초당 100개 요청이면 worker 100개면 되나요?\"라는 질문은 부족하다. 각 요청이 평균 200ms 머물면 평균 동시성은 약 20이고, tail latency와 burst를 고려하면 headroom이 필요하다.\n\n예를 들어 200 RPS를 처리하고 요청이 서버 안에서 평균 250ms 머문다면 평균 동시성은 `200 * 0.25 = 50`이다. p95가 1초로 튀면 그 시간대에는 같은 200 RPS에서도 in-flight가 훨씬 늘고, thread, connection, queue slot을 더 오래 붙잡는다.\n\n## 핵심 mental model\n\nW는 순수 실행 시간만이 아니라 queue wait, connection pool wait, downstream wait를 포함한 체류 시간이다. Latency가 2배가 되면 같은 처리량에서도 동시에 붙잡힌 request, thread, connection이 늘어난다.\n\nCapacity planning에서 중요한 분해는 다음과 같다.\n\n- service time: 실제로 CPU/DB/downstream이 일을 하는 시간\n- queue wait: worker, connection, rate limit slot을 기다리는 시간\n- timeout budget: 기다릴 수 있는 최대 시간\n- headroom: burst, retry, GC, 배포 중 capacity 감소를 견디는 여유\n\nQueue wait가 커지면 W가 커지고, W가 커지면 L이 커지고, L이 커지면 더 많은 요청이 자원을 붙잡아 다시 queue wait가 커진다. 이 양의 피드백이 tail latency와 장애 전파의 핵심이다.\n\n## Chooser table\n\n| 질문 | Little's Law로 먼저 보는 값 | 추가로 봐야 할 값 | 잘못된 결론 |\n|---|---|---|---|\n| worker 몇 개가 필요해? | `RPS * 평균 체류 시간` | p95/p99, CPU bound 여부, blocking 비율 | 평균 동시성만큼만 worker를 둠 |\n| DB connection pool 크기는? | DB 구간의 throughput과 DB 체류 시간 | DB CPU, lock wait, query p99, max connections | pool을 키우면 처리량도 무한히 늘어남 |\n| queue backlog가 왜 늘어? | arrival rate와 completion rate 차이 | consumer 처리 시간, retry rate, batch size | queue 길이만 보고 원인을 단정 |\n| timeout을 줄이면 좋아져? | W 상한과 자원 점유 시간 | 재시도 증폭, 사용자 성공률 | timeout 감소가 항상 capacity 증가라고 봄 |\n\n## 흔한 오개념\n\nLittle's Law는 용량을 정확히 맞히는 마법 공식이 아니다. 평균 관계를 보여주는 출발점이고, p95/p99 tail, burst, timeout, retry 증폭을 별도로 반영해야 한다.\n\n- \"QPS가 100이면 worker 100개\": 요청 시간이 10ms면 평균 동시성은 1이고, 1초면 100이다.\n- \"latency는 사용자 경험 지표일 뿐 capacity와 별개\": latency가 길어지면 in-flight가 늘어 자원 점유와 queue를 키운다.\n- \"pool을 크게 하면 timeout이 사라진다\": downstream 처리량이 병목이면 더 큰 pool은 더 많은 동시 부하와 lock wait를 만들 수 있다.\n- \"평균 W만 보면 된다\": tail latency가 자원을 오래 붙잡아 burst 구간의 장애를 만든다.\n- \"arrival RPS로 항상 계산한다\": 과부하 상태에서는 완료 throughput과 도착량이 달라지고 queue가 무한히 증가할 수 있다.\n\n## 실무 지표와 증거\n\nLittle's Law를 실제 시스템에 적용하려면 경계별로 지표를 나눠 본다.\n\n- API 경계: request rate, in-flight requests, response latency p50/p95/p99, timeout 수\n- worker 경계: active worker, queue depth, queue age, task processing time\n- DB 경계: active connections, pool wait time, query latency, lock wait, transaction duration\n- downstream 경계: outbound concurrency, retry count, circuit breaker open count, deadline exceeded\n- 안정 상태 확인: arrival rate와 completion rate가 장기간 비슷한지, backlog slope가 0에 가까운지\n\nLoad test에서는 coordinated omission도 조심해야 한다. 클라이언트가 서버 응답을 기다리느라 새 요청을 못 보내면 실제 과부하 때의 queue wait가 측정에서 빠진다.\n\n## 면접 답변 축\n\n1. 먼저 측정 경계를 정한다. API 전체인지 DB pool인지 queue consumer인지 말한다.\n2. `L = λW`로 평균 in-flight를 계산한다.\n3. W에는 service time뿐 아니라 queue wait와 downstream wait가 들어간다고 설명한다.\n4. 평균값은 출발점이고 p95/p99, burst, retry, timeout, headroom을 붙인다.\n5. pool/worker를 늘리기 전에 병목 자원의 saturation과 backlog slope를 본다고 마무리한다.\n\n## Safe Next Docs\n\nDB connection pool sizing은 `connection-pool-littles-law-sizing-playbook`, load test 왜곡은 `coordinated-omission-load-test-playbook`으로 이어진다.\n",
+  "aliases": [
+    "Little's Law capacity planning",
+    "Little 법칙 처리량 동시성 지연",
+    "concurrency throughput latency formula",
+    "큐잉 이론 실무 입문"
+  ],
+  "expected_queries": [
+    "Little's Law로 동시성 수를 어떻게 계산해?",
+    "처리량 latency concurrency 관계를 실무적으로 설명해줘",
+    "커넥션 풀 크기를 감으로 정하지 않으려면 뭘 봐야 해?"
+  ],
+  "symptoms": [
+    "QPS만 보고 필요한 worker 수를 정합니다",
+    "latency가 늘면 동시 처리 수가 왜 늘어나는지 설명하지 못합니다",
+    "queue wait와 service time을 구분하지 않습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/upstream-queueing-connection-pool-wait-tail-latency"
+    ],
+    "next_docs": [
+      "database/connection-pool-littles-law-sizing-playbook",
+      "system-design/coordinated-omission-load-test-playbook"
+    ],
+    "confusable_with": [
+      "network/upstream-queueing-connection-pool-wait-tail-latency",
+      "database/connection-pool-sizing-timeout-tuning-intermediate-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/littles-law-capacity-planning-primer.md",
+    "revision_history": []
+  }
+}

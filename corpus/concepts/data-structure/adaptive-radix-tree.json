@@ -1,0 +1,58 @@
+{
+  "id": "data-structure/adaptive-radix-tree",
+  "title": "Adaptive Radix Tree",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "'이 문서는 Adaptive Radix Tree를 radix tree의 prefix compression과",
+  "body_markdown": "# Adaptive Radix Tree\n\n> 한 줄 요약: Adaptive Radix Tree(ART)는 radix tree의 prefix 압축에 노드 크기 적응 전략을 결합해, in-memory ordered index를 cache-friendly하게 만들려는 자료구조다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Radix Tree (Compressed Trie)](./radix-tree.md)\n> - [Trie Prefix Search / Autocomplete](./trie-prefix-search-autocomplete.md)\n> - [Cache-Aware Data Structure Layouts](./cache-aware-data-structure-layouts.md)\n> - [LSM-Friendly Index Structures](./lsm-friendly-index-structures.md)\n> - [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)\n\n> retrieval-anchor-keywords: adaptive radix tree, ART, compressed trie, node4 node16 node48 node256, prefix compression, in-memory index, point lookup, range scan, cache-friendly tree, ordered key-value index\n\n## 핵심 개념\n\nART는 \"문자 단위 Trie\"보다 메모리를 아끼고, \"일반 Radix Tree\"보다 CPU cache 친화적으로 만들려는 ordered index 구조다.\n\n핵심 아이디어는 세 가지다.\n\n- prefix compression으로 긴 공통 경로를 줄인다\n- fan-out 크기에 따라 node representation을 바꾼다\n- key 순서를 유지해 range scan도 가능하게 한다\n\n즉 `HashMap`처럼 exact lookup만 빠른 구조가 아니라,  \n**정렬 순서가 있는 in-memory index**를 더 촘촘하게 구현하려는 발상이다.\n\n비교 층위를 잘못 잡으면 오판하기 쉽다.\n\n- ART는 보통 memory-resident, dynamic ordered index다\n- B+Tree/LSM은 page, WAL, flush, compaction 같은 storage-engine 경계까지 포함하는 선택지다\n- SSTable 내부의 immutable sparse index와 ART memtable-like mutable index는 같은 \"index\"라는 이름이어도 운영 요구가 다르다\n\n## 깊이 들어가기\n\n### 1. 왜 일반 Radix Tree에서 한 걸음 더 가나\n\nRadix Tree만으로도 prefix 압축은 가능하지만, 각 노드가 자식 포인터를 넉넉하게 들고 있으면  \nfan-out이 작은 구간에서 메모리 낭비가 커진다.\n\nART는 자식 수에 따라 노드 타입을 바꾼다.\n\n- Node4: 자식이 아주 적을 때\n- Node16: 조금 더 많을 때\n- Node48: key index table로 중간 fan-out 처리\n- Node256: 거의 꽉 찬 fan-out일 때 direct indexing\n\n즉 sparse 구간에서는 compact하게, dense 구간에서는 lookup 친화적으로 행동한다.\n\n### 2. node 적응이 cache locality를 만든다\n\n일반 trie는 null 포인터가 많은 넓은 배열을 들고 있기 쉽다.  \nART는 작은 노드에서는 key 배열과 child 배열을 촘촘히 들고 있어 cache line 낭비를 줄인다.\n\n이 차이가 중요한 이유는 in-memory index 병목이 종종 알고리즘 차수보다  \n**pointer chasing과 cache miss**에서 오기 때문이다.\n\n### 3. prefix compression과 lazy expansion\n\nART는 긴 단일 경로를 node마다 다 펼치지 않고, prefix를 압축해 저장한다.  \n조회 시에는 압축 prefix를 한 번에 비교하고, 분기가 생길 때만 노드를 펼친다.\n\n이 방식은 다음에 유리하다.\n\n- 긴 문자열 키\n- 공통 prefix가 많은 키\n- sparse한 중간 단계\n\n다만 삭제와 split 로직은 더 복잡해진다.  \n압축된 prefix를 다시 나누고, node 타입 승격/강등도 고려해야 한다.\n\n### 4. ordered index라는 점이 중요하다\n\nART는 해시 기반 구조가 아니므로 key 순서를 잃지 않는다.\n\n- exact lookup\n- prefix 탐색\n- lexicographic range scan\n\n이 세 가지를 한 구조에서 다루기 쉽다.  \n그래서 메모리 내 key-value store, secondary index, router table 같은 곳에서 매력적이다.\n\n단, range scan의 순서는 byte encoding 정책에 묶인다.\n정수, timestamp, 문자열을 섞어 key로 만들 때는 lexicographic byte order가\n도메인 order와 일치하도록 big-endian encoding, length/sentinel, collation 정책을 정해야 한다.\n\n### 5. backend에서의 함정\n\nART를 실전에 넣을 때는 자료구조 그 자체보다 운영 세부가 어렵다.\n\n- 문자열/바이너리 키를 어떤 바이트 순서로 normalize할지\n- 가변 길이 key의 종료 sentinel을 어떻게 표현할지\n- concurrent update 시 memory reclamation을 어떻게 할지\n- path compression과 range scan을 함께 어떻게 유지할지\n\n즉 ART는 \"빠른 Trie\"라기보다 **고성능 in-memory ordered index 엔진 부품**에 가깝다.\n\n정적 snapshot이나 disk block을 위한 index라면 ART가 항상 맞는 것도 아니다.\nimmutable segment에서는 FST, sparse block index, quotient/Bloom filter 같은 보조 구조가\n더 작은 메모리로 충분할 수 있고, write-heavy 저장소에서는 LSM의 memtable/SSTable 분리를 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 메모리 기반 키-값 인덱스\n\n정렬 순서와 prefix scan이 모두 필요하지만, B+Tree page 구조까지 가기엔 너무 무거운 in-memory index에서 잘 맞는다.\n\n### 시나리오 2: 설정 키 / feature flag prefix 탐색\n\n`payment.retry.*`, `feature.checkout.*` 같은 계층형 키를 exact lookup과 prefix enumerate 둘 다 해야 할 때 유용하다.\n\n### 시나리오 3: 라우팅 / longest-prefix-near lookup\n\n압축 trie 계열이 필요한 라우팅 문제에서, fan-out 분포가 고르지 않다면 adaptive node 전략이 도움이 된다.\n\n### 시나리오 4: 부적합한 경우\n\n정렬 순서가 필요 없고 단순 key lookup만 중요하면 `HashMap`이 더 단순하다.  \n디스크 page 관리가 핵심이면 B+Tree 같은 storage-aware 구조가 더 적합하다.\n\n## 코드로 보기\n\n```java\nimport java.util.Arrays;\n\nabstract class ArtNode {\n    byte[] compressedPrefix = new byte[0];\n    int childCount;\n\n    abstract ArtNode findChild(byte keyByte);\n    abstract ArtNode addChild(byte keyByte, ArtNode child);\n}\n\nfinal class Node4 extends ArtNode {\n    private final byte[] keys = new byte[4];\n    private final ArtNode[] children = new ArtNode[4];\n\n    @Override\n    ArtNode findChild(byte keyByte) {\n        for (int i = 0; i < childCount; i++) {\n            if (keys[i] == keyByte) {\n                return children[i];\n            }\n        }\n        return null;\n    }\n\n    @Override\n    ArtNode addChild(byte keyByte, ArtNode child) {\n        if (childCount < 4) {\n            keys[childCount] = keyByte;\n            children[childCount] = child;\n            childCount++;\n            return this;\n        }\n\n        Node16 upgraded = new Node16();\n        upgraded.compressedPrefix = Arrays.copyOf(compressedPrefix, compressedPrefix.length);\n        for (int i = 0; i < childCount; i++) {\n            upgraded.addChild(keys[i], children[i]);\n        }\n        upgraded.addChild(keyByte, child);\n        return upgraded;\n    }\n}\n\nfinal class Node16 extends ArtNode {\n    private final byte[] keys = new byte[16];\n    private final ArtNode[] children = new ArtNode[16];\n\n    @Override\n    ArtNode findChild(byte keyByte) {\n        for (int i = 0; i < childCount; i++) {\n            if (keys[i] == keyByte) {\n                return children[i];\n            }\n        }\n        return null;\n    }\n\n    @Override\n    ArtNode addChild(byte keyByte, ArtNode child) {\n        keys[childCount] = keyByte;\n        children[childCount] = child;\n        childCount++;\n        return this;\n    }\n}\n\nfinal class LeafNode extends ArtNode {\n    final byte[] fullKey;\n    final String value;\n\n    LeafNode(byte[] fullKey, String value) {\n        this.fullKey = fullKey;\n        this.value = value;\n    }\n\n    @Override\n    ArtNode findChild(byte keyByte) {\n        return null;\n    }\n\n    @Override\n    ArtNode addChild(byte keyByte, ArtNode child) {\n        throw new UnsupportedOperationException(\"leaf node\");\n    }\n}\n```\n\n이 코드는 node 적응 아이디어만 보여준다.  \n실제 ART는 Node48/Node256 upgrade, Node16 overflow 처리, prefix split,\nleaf shortcut, delete 후 node shrink, range iteration까지 포함한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Adaptive Radix Tree | ordered lookup, prefix scan, cache locality를 함께 노릴 수 있다 | 구현과 동시성, 메모리 회수가 복잡하다 | in-memory ordered index가 필요할 때 |\n| 일반 Radix Tree | prefix 압축 개념이 단순하다 | fan-out 밀도 변화에 덜 적응적이다 | prefix 구조는 필요하지만 구현 단순성이 더 중요할 때 |\n| HashMap | exact lookup이 빠르고 단순하다 | 정렬 순서와 range scan이 약하다 | 단건 조회 중심일 때 |\n| B+Tree | disk/page 친화적이고 범위 조회에 강하다 | in-memory pointer cost와 page 관리가 더 무겁다 | storage engine이나 page 기반 인덱스일 때 |\n\n핵심은 ART가 \"Trie 대체재\"라기보다 \"메모리 안의 ordered index\"라는 점이다.\n\n## 꼬리질문\n\n> Q: ART가 일반 Trie보다 나은 가장 큰 이유는 무엇인가?\n> 의도: 압축과 adaptive node 전략을 함께 이해하는지 확인\n> 핵심: prefix compression과 node size 적응으로 메모리와 cache miss를 줄이기 때문이다.\n\n> Q: 왜 `Node4`, `Node16`, `Node48`, `Node256`처럼 여러 노드 타입이 필요한가?\n> 의도: fan-out 분포에 대한 감각 확인\n> 핵심: 자식 수가 적은 노드와 많은 노드의 최적 표현이 다르기 때문이다.\n\n> Q: HashMap 대신 ART를 고르는 상황은 언제인가?\n> 의도: ordered index의 의미 이해 확인\n> 핵심: prefix 탐색, range scan, 정렬 순서 유지가 함께 필요할 때다.\n\n## 한 줄 정리\n\nAdaptive Radix Tree는 prefix 압축과 fan-out 적응을 결합해, 메모리 안에서 정렬된 키 인덱스를 효율적으로 다루려는 고성능 radix 계열 자료구조다.\n",
+  "aliases": [
+    "adaptive radix tree",
+    "ART index",
+    "Node4 Node16 Node48 Node256",
+    "compressed trie adaptive nodes",
+    "in-memory ordered index",
+    "radix tree vs ART",
+    "ART vs HashMap BTree Trie"
+  ],
+  "expected_queries": [
+    "Adaptive Radix Tree는 Trie나 Radix Tree와 무엇이 달라?",
+    "ART의 Node4 Node16 Node48 Node256은 왜 필요한가?",
+    "HashMap 대신 ART를 쓰는 경우는 exact lookup 말고 어떤 요구 때문이야?",
+    "in-memory ordered index에서 cache locality가 왜 중요한지 설명해줘",
+    "ART와 B+Tree LSM Tree를 어떤 기준으로 비교해야 해?"
+  ],
+  "symptoms": [
+    "exact lookup만 빠른 HashMap과 prefix 또는 range scan이 필요한 ordered index 요구를 섞어 판단한다",
+    "일반 trie나 radix tree가 prefix compression만 하면 충분하다고 보고 node fan-out별 cache locality 차이를 놓친다",
+    "ART를 B+Tree나 LSM-tree 같은 storage index와 같은 운영 층위로 비교해 선택 기준이 흐려진다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/radix-tree",
+      "data-structure/trie-prefix-search-autocomplete"
+    ],
+    "next_docs": [
+      "data-structure/radix-tree",
+      "data-structure/trie-prefix-search-autocomplete",
+      "data-structure/cache-aware-data-structure-layouts",
+      "database/bptree-vs-lsm-tree"
+    ],
+    "confusable_with": [
+      "data-structure/radix-tree",
+      "data-structure/trie-prefix-search-autocomplete",
+      "data-structure/hashmap-internals",
+      "database/bptree-vs-lsm-tree",
+      "data-structure/lsm-friendly-index-structures",
+      "data-structure/finite-state-transducer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/data-structure/adaptive-radix-tree.md",
+    "revision_history": []
+  }
+}

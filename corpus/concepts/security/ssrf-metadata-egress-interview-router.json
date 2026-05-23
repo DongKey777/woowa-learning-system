@@ -1,0 +1,46 @@
+{
+  "id": "security/ssrf-metadata-egress-interview-router",
+  "title": "SSRF Metadata Egress Interview Router",
+  "category": "security",
+  "level": "advanced",
+  "summary": "이 router는 SSRF 증상에서 URL validation, redirect 재검증, egress allowlist, metadata service 보호로 분기한다.",
+  "body_markdown": "# SSRF Metadata Egress Interview Router\n\n## 관찰 증거\n\n서버가 사용자 입력 URL을 대신 요청하는 기능이 있고, 내부 관리자 주소나 cloud metadata endpoint에 접근할 수 있다면 SSRF(Server-Side Request Forgery)를 의심한다.\n\n대표 증거는 application log의 outbound request destination이 사용자가 입력한 URL과 다르거나, `169.254.169.254`, localhost, private IP, link-local, internal DNS 이름으로 향하는 요청이 보이는 경우다. 이미지 미리보기, webhook test, URL import, PDF capture, OpenGraph fetch 기능이 자주 출발점이 된다.\n\n## 1차 분기\n\nURL string validation만으로는 부족하다. URL을 canonical parser로 해석하고, 허용 scheme/port를 제한한 뒤 DNS resolve 후 IP range를 확인한다. redirect가 발생하면 최종 목적지만이 아니라 매 hop을 다시 검증한다. 가능하면 denylist보다 allowlist가 안전하다.\n\n외부 fetch 기능은 별도 egress proxy나 sandboxed worker로 분리하고, metadata service 접근은 네트워크 정책과 IMDS 설정으로 막는다. IMDSv2, hop limit 같은 cloud 설정은 좋은 방어층이지만 애플리케이션 SSRF 검증과 egress 차단을 대체하지 않는다.\n\n## 방어를 나누는 기준\n\n| 방어층 | 막는 것 | 놓치기 쉬운 부분 |\n|---|---|---|\n| URL parser validation | scheme/userinfo/port 이상값 | parser mismatch, encoded host |\n| DNS/IP 검증 | private/link-local/internal IP 접근 | DNS rebinding, IPv6, 모든 A/AAAA record |\n| Redirect 재검증 | 정상 URL에서 내부 URL로 이동 | 자동 redirect, hop limit, scheme downgrade |\n| Egress allowlist/proxy | 허용된 외부 대상만 접근 | wildcard allowlist, CONNECT 터널, proxy env |\n| Metadata hardening | cloud credential 탈취 | IMDSv1 허용, hop limit 미설정 |\n| Timeout/size 제한 | 내부 scan과 resource exhaustion | slow response, huge body |\n\nSSRF 방어는 인증/인가와 다른 축이다. 사용자가 로그인했는지보다, 서버가 대신 요청할 수 있는 네트워크 목적지를 제한하는 문제다. 로그인한 관리자만 쓰는 URL fetch 기능도 내부망을 대신 호출할 수 있으면 취약할 수 있다.\n\n## 다음 확인\n\nSSRF는 인증 우회와 결합되기 쉽다. 서버가 내부망에서 신뢰받는 위치에 있기 때문에, 공격자는 서버를 proxy처럼 사용해 내부 API나 metadata credential을 읽으려 한다.\n\nredirect chain도 반드시 관찰한다. 최초 URL은 `https://example.com/image`처럼 정상이어도 302가 `http://169.254.169.254/latest/meta-data/`로 이어지면 최종 목적지 검증 없이는 우회된다. DNS도 request 직전에 resolve하고, connect 대상 IP가 검증한 IP와 같은지 확인해야 한다.\n\nDNS rebinding 방어는 \"한 번 resolve해서 private IP가 아니었다\"로 끝나지 않는다. HTTP client가 connect 시점에 다시 DNS를 조회할 수 있고, 하나의 host가 여러 A/AAAA record를 돌려줄 수 있다. 검증한 IP로 실제 socket을 연결하도록 resolver/transport를 통제하거나, egress proxy가 최종 peer address를 다시 차단해야 한다.\n\n차단 범위에는 localhost, loopback, private, link-local, multicast, unspecified, IPv6 local range, provider metadata 이름과 주소를 포함한다. `169.254.169.254` 같은 IPv4 metadata 주소만 막고 내부 DNS 이름, IPv6, encoded host, userinfo trick, non-http scheme을 놓치면 우회될 수 있다.\n\n## 면접 답변 구조\n\n1. SSRF를 \"서버가 공격자 대신 내부/외부 요청을 보내게 만드는 취약점\"으로 정의한다.\n2. 문자열 필터보다 canonical parsing, DNS resolve, IP range check, redirect 재검증이 필요하다고 설명한다.\n3. 가능하면 arbitrary URL fetch를 없애고, 필요하면 allowlist 기반 egress proxy/sandbox로 격리한다고 답한다.\n4. cloud metadata credential은 link-local 차단, network policy, IMDS 설정, 최소 권한으로 별도 보호한다고 붙인다.\n\n## 운영 탐지 신호\n\nOutbound log에 private range, link-local, localhost, unusual port, 짧은 시간 안의 많은 destination scan이 보이면 조사한다. DNS log와 application request id를 연결하면 어떤 사용자 입력이 어떤 outbound destination으로 이어졌는지 추적할 수 있다.\n\n사고 범위는 fetch 기능 하나에서 끝나지 않는다. 탈취된 credential로 cloud API 호출이 있었는지, 내부 admin API response가 외부 response body로 노출됐는지, cache나 log에 민감 response가 저장됐는지 확인한다.\n\n로그에는 original URL, canonical host, resolved IP, redirect chain, final peer IP, deny reason을 남기면 좋다. 단, response body나 credential처럼 민감한 값을 그대로 저장하면 2차 유출 경로가 된다.\n\n## 관련 playbook\n\n사고가 의심되면 요청 URL, resolved IP, redirect chain, outbound destination, credential access log를 함께 확인한다.\n",
+  "aliases": [
+    "SSRF metadata egress router",
+    "SSRF 메타데이터 서비스 면접",
+    "server side request forgery defense",
+    "내부망 URL 호출 보안"
+  ],
+  "expected_queries": [
+    "SSRF는 무엇이고 어떻게 막아?",
+    "URL fetch 기능에서 내부망 접근을 어떻게 차단해?",
+    "metadata service 탈취를 왜 조심해야 해?"
+  ],
+  "symptoms": [
+    "사용자 입력 URL을 서버가 그대로 fetch합니다",
+    "allowlist 없이 IP denylist만 믿습니다",
+    "redirect 후 목적지 재검증을 하지 않습니다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/ssrf-egress-control"
+    ],
+    "next_docs": [
+      "security/gateway-auth-context-header-trust-boundary",
+      "security/auth-incident-triage-blast-radius-recovery-matrix"
+    ],
+    "confusable_with": [
+      "security/gateway-auth-context-header-trust-boundary",
+      "network/api-gateway-auth-failure-surface-map"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/security/ssrf-metadata-egress-interview-router.md",
+    "revision_history": []
+  }
+}

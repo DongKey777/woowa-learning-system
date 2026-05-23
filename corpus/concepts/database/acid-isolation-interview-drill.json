@@ -1,0 +1,46 @@
+{
+  "id": "database/acid-isolation-interview-drill",
+  "title": "ACID Isolation Interview Drill",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "이 drill은 ACID와 isolation level을 면접 답변으로 구성한다. 단어 암기보다 transaction 경계, anomaly, 비즈니스 invariant를 연결한다.",
+  "body_markdown": "# ACID Isolation Interview Drill\n\n## 질문\n\n\"트랜잭션의 ACID를 설명하고, isolation level과 어떤 관계가 있는지 말해 주세요.\"\n\n## 기대 답변 축\n\n- Atomicity는 전부 성공하거나 전부 롤백되는 성질이다.\n- Consistency는 DB constraint와 애플리케이션 invariant가 transaction 전후에 깨지지 않아야 한다는 목표다.\n- Isolation은 동시에 실행되는 transaction이 서로 어떤 중간 상태를 볼 수 있는지 제한한다.\n- Durability는 commit된 결과가 장애 후에도 보존되는 성질이다.\n- isolation level은 dirty read, non-repeatable read, phantom 같은 anomaly를 어디까지 허용할지 정하는 구체적 정책이다.\n\n## Invariant\n\n- ACID는 \"transaction 경계 안의 DB 상태 전이\"에 대한 성질이다.\n- Atomicity는 DB 변경을 commit 또는 rollback 단위로 묶지만, 이미 나간 email, HTTP 호출 같은 외부 side effect까지 자동으로 되돌리지 않는다.\n- Consistency는 선언된 constraint와 애플리케이션이 지켜야 하는 invariant를 transaction 전후에 만족시키는 목표다. DB가 모든 비즈니스 규칙을 알아서 증명하지는 않는다.\n- Isolation은 동시 transaction의 관찰 가능성을 제한한다. 실제 허용 anomaly는 DB 제품과 isolation level마다 다를 수 있다.\n- Durability는 commit 이후 저장 장치 장애에 대한 보존 약속이지만, 설정, replication 방식, fsync 정책에 따라 운영상 위험이 달라질 수 있다.\n\n## 보장 범위와 DB별 caveat\n\n| 항목 | 보수적으로 말할 범위 | DB별 caveat |\n|---|---|---|\n| Atomicity | 하나의 DB transaction 안에서 DB 변경을 commit/rollback 단위로 묶는다 | 외부 API, message publish, email, file write는 DB rollback 대상이 아니다. outbox, idempotency, compensation이 별도로 필요하다 |\n| Consistency | 선언된 constraint와 애플리케이션이 transaction 안에서 지키도록 작성한 invariant가 깨지지 않아야 한다는 목표다 | DB는 `UNIQUE`, `FK`, `CHECK`처럼 알려 준 constraint만 직접 강제한다. \"예약 총합 <= capacity\" 같은 규칙은 모델링과 locking/isolation 설계가 필요하다 |\n| Isolation | 동시 transaction이 중간 상태나 서로의 변경을 어떻게 관찰하는지 제한한다 | 같은 `REPEATABLE READ`, `SERIALIZABLE` 이름이어도 MySQL InnoDB와 PostgreSQL의 snapshot, gap/predicate lock, retry surface가 다르다 |\n| Durability | commit 성공 뒤 장애가 나도 결과가 남아야 한다는 저장 보장이다 | fsync/flush 설정, storage cache, replication async 여부, commit 응답 시점에 따라 운영상 손실 위험이 달라진다 |\n\n특히 isolation level 표는 \"최소 금지 현상\"을 설명하는 출발점이지, 제품별 구현을 대신하지 않는다. PostgreSQL은 `READ UNCOMMITTED`를 사실상 `READ COMMITTED`처럼 다루고, `SERIALIZABLE`은 SSI로 serialization failure retry가 필요할 수 있다. MySQL InnoDB는 `REPEATABLE READ`의 consistent read snapshot과 locking read/current-state path를 섞어 쓰면 같은 transaction 안에서도 다른 table state처럼 보일 수 있다.\n\n## Evidence로 확인할 것\n\n- transaction boundary: 어느 service method/SQL 묶음이 하나의 commit 단위인지.\n- DB constraint evidence: `UNIQUE`, `FK`, `CHECK`, exclusion/partial index, guard row 같은 최종 방어선이 있는지.\n- isolation evidence: 실제 DB 제품, isolation level, plain read인지 locking read인지, retry 가능한 에러 코드가 무엇인지.\n- side-effect evidence: 결제 승인, 메시지 발행, 알림 전송이 DB commit 전후 어디에서 일어나는지.\n- failure evidence: deadlock, lock wait timeout, serialization failure, duplicate key가 성공/실패 응답으로 어떻게 매핑되는지.\n\n## 작은 시나리오\n\n재고 1개짜리 상품에 두 주문이 동시에 들어온다.\n\n1. 두 transaction이 `SELECT stock FROM item WHERE id=1`로 `1`을 본다.\n2. 애플리케이션에서 `stock > 0`을 확인한 뒤 둘 다 주문 row를 만든다.\n3. 마지막에 각각 `UPDATE item SET stock=0 WHERE id=1`을 실행하면 둘 다 성공한 것처럼 보일 수 있다.\n\n여기서 ACID를 답할 때 \"transaction이라 안전하다\"라고 말하면 부족하다. 지켜야 할 invariant는 \"성공 주문 수가 재고 수를 넘지 않는다\"이고, 이것은 조건부 update, version CAS, row lock, unique/guard row, serializable + retry 같은 구체적 장치로 닫아야 한다.\n\n## 실패 반례\n\n- 주문 transaction 안에서 결제 승인 API를 먼저 호출하고 DB 저장이 rollback되면, DB atomicity만으로 외부 결제 상태는 되돌아가지 않는다.\n- `READ COMMITTED`에서 같은 row를 두 번 읽는 동안 다른 transaction이 commit하면 non-repeatable read가 보일 수 있다.\n- 좌석 예약에서 \"같은 시간대 예약 수 <= N\" 같은 조건을 애플리케이션 read 후 insert로만 처리하면 isolation level에 따라 write skew나 phantom 문제가 생길 수 있다.\n- `SERIALIZABLE`을 쓰면 모든 문제가 조용히 해결된다고 말하면 과장이다. DB는 serialization failure를 내고 retry를 요구할 수 있다.\n- foreign key와 unique constraint가 있어도 \"주문 총액은 주문 항목 합과 같아야 한다\" 같은 derived invariant는 갱신 경로 설계가 필요하다.\n\n## wrong-bucket / 오선택\n\n| 말한 답 | 왜 위험한가 | 더 정확한 버킷 |\n|---|---|---|\n| \"ACID의 Consistency가 비즈니스 규칙을 자동 보장한다\" | DB가 모르는 invariant는 강제하지 못한다 | constraint + application invariant enforcement |\n| \"`@Transactional`이면 동시성 문제는 해결된다\" | transaction 경계만 생길 뿐 isolation/lock/constraint 선택이 빠져 있다 | transaction boundary + isolation/locking decision |\n| \"`SERIALIZABLE`이면 재시도 없이 항상 성공한다\" | PostgreSQL SSI나 여러 DB의 serializable 구현은 abort/retry가 정상 경로일 수 있다 | serializable + retry/idempotency |\n| \"Atomicity가 외부 결제도 롤백한다\" | DB rollback은 외부 시스템 상태를 되돌리지 않는다 | outbox/saga/compensation |\n| \"Durability는 commit만 되면 어떤 장애에도 절대 손실이 없다\" | flush 설정, storage, replication lag 같은 운영 조건이 남는다 | durability setting + replication/backup evidence |\n\n## 면접 답변 skeleton\n\n1. ACID 네 단어를 말한 뒤, transaction 경계와 예시를 붙인다.\n2. Consistency는 \"DB가 비즈니스 전체를 자동 보장\"이 아니라 constraint와 application invariant를 함께 지키는 목표라고 선을 긋는다.\n3. Isolation은 추상 속성이고 isolation level은 anomaly 허용 범위를 정하는 구현 정책이라고 연결한다.\n4. 강한 isolation은 동시성 비용, lock 대기, abort/retry 비용이 생길 수 있어 invariant 위험도에 맞춰 선택한다고 말한다.\n\n## 검증 질문\n\n1. 이 transaction이 닫으려는 invariant를 한 문장으로 말할 수 있는가?\n2. 그 invariant가 DB constraint, conditional update, lock, serializable retry, application validation 중 어디에서 실제로 강제되는가?\n3. 지금 쓰는 DB와 isolation level에서 dirty read, non-repeatable read, phantom, write skew 중 무엇을 허용하거나 retry로 바꾸는가?\n4. 외부 side effect가 DB commit 전에 나가면 rollback 실패 시 어떤 보상/정합화 경로가 있는가?\n5. deadlock, duplicate key, serialization failure를 사용자 응답과 재시도 정책으로 번역했는가?\n\n## 검증 포인트\n\n- transaction 범위가 너무 넓거나 너무 좁지 않은지 확인한다.\n- 비즈니스 invariant가 DB constraint, conditional update, lock, application validation 중 어디에 의해 지켜지는지 말할 수 있는가?\n- isolation level별로 dirty read, non-repeatable read, phantom, write skew 가능성을 테스트나 문서로 확인했는가?\n- deadlock이나 serialization failure를 retry할 수 있는 idempotent 흐름이 있는가?\n- 외부 side effect는 outbox, saga, compensation처럼 DB transaction과 별도로 다루는가?\n\n## 약점 태그\n\n- `word-list-only`: ACID 단어만 나열하고 사례가 없음\n- `consistency-overclaim`: 비즈니스 규칙까지 DB가 자동 보장한다고 말함\n- `isolation-level-gap`: isolation 속성과 isolation level을 연결하지 못함\n\n## 복습 연결\n\n격리 수준 비교는 `isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer`로 이어간다.\n",
+  "aliases": [
+    "ACID interview drill",
+    "transaction isolation answer",
+    "ACID 면접 답변",
+    "트랜잭션 격리성 설명",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "ACID를 면접에서 어떻게 설명해야 해?",
+    "isolation level과 ACID의 isolation은 어떻게 연결돼?",
+    "transaction consistency를 DB가 다 보장한다는 말이 맞아?"
+  ],
+  "symptoms": [
+    "ACID를 단어 뜻만 외우고 예시를 못 들어요",
+    "consistency를 비즈니스 규칙까지 DB가 자동 보장한다고 말해요",
+    "isolation level을 isolation 속성과 구분하지 못해요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/transaction-isolation-basics"
+    ],
+    "next_docs": [
+      "database/isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer"
+    ],
+    "confusable_with": [
+      "database/transaction-isolation-basics",
+      "database/isolation-anomaly-cheat-sheet"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/database/acid-isolation-interview-drill.md",
+    "revision_history": []
+  }
+}

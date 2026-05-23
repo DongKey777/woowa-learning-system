@@ -1,0 +1,46 @@
+{
+  "id": "spring/rollback-only-unexpectedrollback-symptom-router",
+  "title": "Rollback Only UnexpectedRollback Symptom Router",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "이 symptom_router는 rollback-only와 UnexpectedRollbackException 증상을 분기한다. 예외를 catch했는데 커밋 실패, silently rolled back, REQUIRES_NEW 분리 여부 같은 Spring transaction 질문을 다룬다.",
+  "body_markdown": "# Rollback Only UnexpectedRollback Symptom Router\n\n## 관찰 증거\n\n로그에 `rollback-only`, `Global transaction is marked as rollback-only`, `Transaction silently rolled back`, `UnexpectedRollbackException`이 나오면 \"예외를 catch 했으니 정상 commit으로 돌아왔다\"는 가정을 버려야 한다. 같은 물리 트랜잭션 안 어딘가에서 이미 rollback-only marker가 찍혔을 수 있다.\n\n대표 장면은 이렇다.\n\n```java\n@Transactional\npublic void placeOrder() {\n    try {\n        paymentService.charge(); // REQUIRED로 같은 physical transaction 참여\n    } catch (RuntimeException ex) {\n        log.warn(\"결제 실패는 무시하고 주문 기록만 남긴다\", ex);\n    }\n\n    orderRepository.save(new Order());\n}\n```\n\n`paymentService.charge()`가 같은 `REQUIRED` transaction 안에서 runtime exception을 만나 rollback-only를 표시했다면, catch는 Java control flow만 이어 줄 뿐 transaction 상태를 \"commit 가능\"으로 되돌리지 못한다. 바깥 method는 끝까지 가서 commit을 시도하지만, Spring은 실제로 rollback을 수행하고 호출자에게 `UnexpectedRollbackException`을 던진다. 호출자가 commit됐다고 오해하지 않게 하기 위한 정상 동작이다.\n\n## 정확한 Spring transaction 규칙\n\n`PROPAGATION_REQUIRED`는 method마다 logical transaction scope를 만들 수 있지만, 이미 transaction이 있으면 같은 physical transaction에 참여한다. 안쪽 logical scope가 rollback-only를 표시하면 같은 physical transaction을 공유하는 바깥 scope의 commit 가능성도 사라진다.\n\n| 규칙 | 의미 |\n|---|---|\n| `REQUIRED` inner call | 바깥 tx가 있으면 같은 physical transaction에 참여한다 |\n| runtime exception/Error | 기본 rollback 대상이라 rollback-only로 이어질 수 있다 |\n| catch 후 정상 반환 | exception 전달은 멈췄지만 rollback-only marker가 자동 해제되지는 않는다 |\n| outer commit 시도 | 이미 rollback-only면 commit 대신 rollback되고 `UnexpectedRollbackException`이 드러난다 |\n| checked exception 기본값 | 기본 rollback 대상이 아니므로 별도 `rollbackFor` 없이는 이 문제와 다를 수 있다 |\n\n## 1차 분기\n\n| 10초 질문 | 그렇다면 | 먼저 볼 것 |\n|---|---|---|\n| 예외를 catch 했는데 method 끝에서 `UnexpectedRollbackException`인가? | rollback-only 지연 폭발 가능성 높음 | 최초 runtime exception 발생 지점 |\n| 내부 service가 기본 `REQUIRED`인가? | 같은 physical tx 공유 가능 | inner method의 propagation |\n| 실패가 `DataIntegrityViolationException`, JPA flush/runtime exception인가? | rollback-only 가능성 높음 | DB/JPA 예외가 처음 난 위치 |\n| 예외 타입이 checked exception이고 DB가 남았나? | rollback-only보다 checked exception commit 문제 | rollback rule, `rollbackFor` |\n| `REQUIRES_NEW`를 붙였는데 변화가 없나? | self-invocation으로 proxy 우회 가능 | call path router |\n\n## 다음 확인\n\n1. stack trace에서 가장 바깥 `UnexpectedRollbackException`보다 앞에 있는 최초 원인 exception을 찾는다.\n2. 그 exception이 같은 transaction 안에서 발생했는지 본다. 특히 같은 service call graph의 `REQUIRED` method인지 확인한다.\n3. catch 위치를 찾는다. `catch (Exception)`으로 실패를 숨긴 뒤 계속 진행하는 코드가 있으면 rollback-only 후보가 강하다.\n4. transaction DEBUG 로그에서 \"Participating in existing transaction\", \"Setting rollback-only\", \"Initiating transaction rollback\" 흐름을 찾는다.\n5. 마지막 `save()`나 `commit()`만 탓하지 않는다. 마지막 지점은 실패가 드러난 곳일 뿐, 원인은 앞선 rollback-only marker일 수 있다.\n6. 독립적으로 남아야 하는 기록인지, 본 작업과 같이 실패해야 하는 작업인지 유스케이스 의미를 다시 쓴다.\n\n## 관련 playbook\n\nrollback-only와 checked exception commit 차이를 같이 보면 \"예외 타입\", \"propagation\", \"catch 위치\"를 분리해서 판단할 수 있다.\n\n## Router evidence / branch / next\n\n| evidence | branch | next |\n|---|---|---|\n| `UnexpectedRollbackException`가 method 종료/commit 시점에 발생 | rollback-only 지연 표면화 | stack trace 앞쪽 최초 runtime exception |\n| `Participating in existing transaction` 뒤 내부 예외 발생 | `REQUIRED` shared physical transaction | inner service propagation과 catch 위치 |\n| `Setting rollback-only` 또는 `Global transaction is marked as rollback-only` | 이미 commit 불가 상태 | 누가 marker를 찍었는지 transaction DEBUG 로그 |\n| checked exception 후 DB가 남음 | rollback-only가 아니라 rollback rule 문제 | `rollbackFor`, 예외 설계 |\n| `REQUIRES_NEW`를 붙였는데 동일 | propagation 적용 안 됨 가능성 | self-invocation, 같은 bean 내부 호출, proxy 경로 |\n\n## Router branch details\n\n- rollback-only branch: runtime exception, JPA flush 실패, DB constraint 실패가 같은 physical transaction 안에서 발생했고, 이후 catch로 숨겨졌다. 다음은 최초 실패 지점과 catch 위치다.\n- checked-exception branch: Spring 기본 규칙상 checked exception은 rollback 대상이 아니다. 다음은 `rollbackFor`나 domain exception 설계다.\n- propagation branch: 독립 commit이 필요한 audit/log/outbox 작업이면 별도 bean의 `REQUIRES_NEW`가 후보가 될 수 있다. 단, 본 작업과 같이 실패해야 하는 업무를 억지로 분리하면 정합성이 깨진다.\n- proxy branch: `REQUIRES_NEW`나 `@Transactional`을 붙였는데 변화가 없으면 옵션보다 호출 경로가 프록시를 통과했는지 먼저 본다.\n\n## 흔한 오해\n\n- \"`catch` 했으니 transaction도 정상으로 복구됐다\"가 아니다. catch는 Java 예외 전파를 멈출 뿐, rollback-only marker를 지우지 않는다.\n- \"`UnexpectedRollbackException`이 마지막 repository 호출 때문에 생겼다\"가 아니다. commit 시점에 드러났을 뿐, 최초 실패는 앞쪽일 수 있다.\n- \"`REQUIRES_NEW`를 붙이면 rollback-only가 사라진다\"가 아니다. 독립적으로 commit해야 하는 side effect에만 써야 한다.\n- \"checked exception도 항상 rollback-only를 만든다\"가 아니다. Spring 기본 규칙은 runtime exception/Error rollback, checked exception commit 쪽이다. `rollbackFor`가 있거나 내부에서 다른 runtime 예외가 먼저 났는지 분리해야 한다.\n- \"로그만 남기려고 예외를 삼키는 것은 안전하다\"가 아니다. 실패를 삼키면 호출자는 성공으로 오해하고, transaction은 rollback-only라 마지막에 터질 수 있다.\n\n## 처방 선택\n\n| 원하는 의미 | 권장 방향 |\n|---|---|\n| 안쪽 실패면 전체 작업도 실패해야 한다 | catch로 숨기지 말고 예외를 다시 던지거나 domain result로 명확히 실패 처리 |\n| 실패 기록만 본 작업 rollback과 독립적으로 남겨야 한다 | 별도 Bean의 `REQUIRES_NEW` audit method 검토 |\n| commit 후에만 알림/외부 전송을 해야 한다 | `AFTER_COMMIT` 또는 outbox 검토 |\n| checked exception도 rollback해야 한다 | `rollbackFor` 또는 예외 설계 재검토 |\n| self-invocation 때문에 propagation이 안 먹는다 | call path를 별도 Bean 외부 호출로 바꿈 |\n",
+  "aliases": [
+    "rollback only unexpectedrollback router",
+    "transaction marked rollback only",
+    "rollback-only 증상 분기",
+    "UnexpectedRollbackException 원인",
+    "@Transactional"
+  ],
+  "expected_queries": [
+    "내부에서 예외를 잡았는데 왜 UnexpectedRollbackException이 나와?",
+    "rollback-only가 찍히면 어디부터 봐야 해?",
+    "트랜잭션은 커밋하려는데 이미 rollback only라고 해"
+  ],
+  "symptoms": [
+    "예외를 catch 했는데 최종 커밋이 실패해요",
+    "Transaction silently rolled back 메시지가 보여요",
+    "REQUIRES_NEW로 분리해야 하는지 헷갈려요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transaction-propagation-required-requires-new-rollbackonly-primer"
+    ],
+    "next_docs": [
+      "spring/rollbackonly-vs-checked-exception-commit-surprise-card"
+    ],
+    "confusable_with": [
+      "spring/rollbackonly-vs-checked-exception-commit-surprise-card",
+      "spring/transaction-propagation-required-requires-new-rollbackonly-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/rollback-only-unexpectedrollback-symptom-router.md",
+    "revision_history": []
+  }
+}

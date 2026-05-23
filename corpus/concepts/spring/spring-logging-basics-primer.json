@@ -1,0 +1,76 @@
+{
+  "id": "spring/spring-logging-basics-primer",
+  "title": "Spring Logging primer — println에서 SLF4J/Logback까지",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "'이 문서는 신입 백엔드가 System.out.println에서 벗어나 SLF4J/Logback 기반 로깅으로",
+  "body_markdown": "# Spring Logging primer — println에서 SLF4J/Logback까지\n\n> 한 줄 요약: 운영 시스템 로깅은 \"라이브러리 facade(SLF4J) + 구현체(Logback)를 분리하고,\n> 레벨 / appender / pattern / MDC / 민감 정보 마스킹을 한 곳(`application.yml` 또는\n> `logback-spring.xml`)에서 통제\"하는 것이다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Spring MVC 요청 생명주기](./spring-mvc-request-lifecycle.md)\n- [Spring Boot 자동 구성](./spring-boot-autoconfiguration.md)\n- [Spring Bean과 DI 기초](./spring-bean-di-basics.md)\n- [Java 언어 기초](../language/java/java-language-basics.md)\n- [spring 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: spring logging primer, slf4j logback, log4j2 vs logback, 로그 레벨 DEBUG INFO WARN ERROR, System.out.println 대체, MDC correlation ID, 민감 정보 마스킹 PII redaction, structured logging JSON, 로그 회전 rotation, application.yml logging, 동적 로그 레벨, console appender file appender\n\n## 먼저 멘탈모델\n\n`System.out.println(\"hello\")`는 학습 시 편하지만 운영에 들어가면 다음과 같은\n문제가 생긴다.\n\n1. **레벨이 없음** — 진단용 로그와 에러 로그가 같은 stdout으로 섞임\n2. **filter 불가** — 운영에서 DEBUG는 끄고 ERROR만 보고 싶은데 끌 방법이 없음\n3. **출력 위치 고정** — stdout만, 파일/원격 syslog/Elasticsearch 같은 곳으로 못 보냄\n4. **포맷 고정** — timestamp, 스레드 ID, MDC 같은 metadata 자동 추가 안 됨\n5. **성능** — 매 호출 String concatenation, 비동기 출력 불가\n6. **민감 정보** — `println(user.toString())`이 비밀번호 그대로 노출\n\n이걸 다 해결하는 게 **로깅 라이브러리**다. Spring Boot는 default로\n**SLF4J + Logback** 조합을 쓴다.\n\n## SLF4J + Logback 관계\n\n```\n[Application code]\n       ↓ (logger.info(\"...\"))\n[SLF4J API]          ← facade (인터페이스만 정의)\n       ↓\n[Logback]            ← 실제 구현체 (Log4j2로 교체 가능)\n       ↓\n[Console] [File] [Elasticsearch] ...\n```\n\n**SLF4J**: 로깅 facade. 코드는 SLF4J 인터페이스만 의존.\n**Logback**: SLF4J의 한 구현체. 실제 로그를 어디로 어떻게 보낼지 결정.\n**대안**: Log4j2, java.util.logging — Logback과 facade는 같지만 구현 다름.\n\n이 분리의 이점: 코드 수정 없이 구현체 교체 가능.\n\n## 로그 레벨 4단계\n\n| 레벨 | 의미 | 운영 노출 | 예시 |\n|---|---|---|---|\n| **DEBUG** | 개발 진단용 | 보통 끔 (`logging.level.root=INFO`) | \"DB 쿼리: SELECT ...\", \"request body: ...\" |\n| **INFO** | 정상 흐름의 핵심 marker | 켬 | \"user 123 logged in\", \"scheduled job started\" |\n| **WARN** | 비정상이지만 처리 가능 | 켬 | \"API rate limit 80% 도달\", \"deprecated method 호출\" |\n| **ERROR** | 처리 실패, 사람 조치 필요 | 켬 (alert 트리거 대상) | \"DB connection failed\", \"exception in handler\" |\n\n**자주 헷갈리는 분기**:\n- \"성공했지만 약간 이상함\" → INFO 또는 WARN\n- \"기대 동작은 했지만 예전 경로로 fallback함\" → WARN\n- \"exception 잡았는데 무시함\" → WARN (그러나 무시 이유 같이 로깅)\n- \"exception이 사용자에게 영향\" → ERROR\n\n### 레벨 선택 가이드\n\n```\n요청 한 번에 ERROR 로그가 발생했다 → 운영자에게 알림이 가야 하는가?\n  예 → ERROR 사용\n  아니오 → WARN 또는 INFO로 강등\n\n운영자가 매일 매 분 봐야 할 정보인가?\n  예 → INFO\n  아니오 (가끔 보면 됨) → DEBUG\n\n이 정보가 보통은 noise지만 디버깅 시엔 필요한가?\n  예 → DEBUG (운영에서는 꺼져 있음)\n```\n\n## 코드 패턴\n\n### Logger 선언\n\n```java\nimport org.slf4j.Logger;\nimport org.slf4j.LoggerFactory;\n\npublic class UserService {\n    private static final Logger log = LoggerFactory.getLogger(UserService.class);\n\n    public User findUser(long id) {\n        log.debug(\"findUser called with id={}\", id);  // ← {} 자리표시자\n        // ...\n        if (notFound) {\n            log.warn(\"user not found: id={}\", id);\n        }\n        return user;\n    }\n}\n```\n\n**중요**:\n- `LoggerFactory.getLogger(ThisClass.class)` 패턴 사용\n- 메시지에 `{}` 자리표시자 + 인자 분리 (String concatenation 안 함)\n- 이유: 레벨이 꺼져 있으면 toString()도 안 호출됨 → 성능\n\n### Lombok `@Slf4j`\n\n```java\n@Slf4j\npublic class UserService {\n    public User findUser(long id) {\n        log.debug(\"findUser called with id={}\", id);  // Lombok이 log 변수 자동 생성\n    }\n}\n```\n\n### Exception 로깅 — 예외 객체를 인자로\n\n```java\ntry {\n    // ...\n} catch (Exception e) {\n    log.error(\"payment failed for orderId={}\", orderId, e);  // ← exception 마지막 인자\n}\n```\n\n`{}` 개수보다 인자가 하나 더 많으면 마지막은 Throwable로 처리 → stack trace 출력.\n\n## Spring Boot 로깅 설정\n\n### application.yml 기본 설정\n\n```yaml\nlogging:\n  level:\n    root: INFO                          # 전체 default\n    org.springframework: WARN           # Spring 내부 로그는 WARN+만\n    com.example.myapp: DEBUG            # 우리 패키지는 DEBUG도\n  pattern:\n    console: '%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n'\n  file:\n    name: logs/myapp.log\n```\n\n### Profile별 다른 설정\n\n```yaml\nspring:\n  config:\n    activate:\n      on-profile: prod\nlogging:\n  level:\n    root: WARN\n    com.example.myapp: INFO   # 운영은 더 조용히\n\n---\nspring:\n  config:\n    activate:\n      on-profile: dev\nlogging:\n  level:\n    root: INFO\n    com.example.myapp: DEBUG  # 개발은 자세히\n```\n\n### 더 정밀한 제어: logback-spring.xml\n\n```xml\n<configuration>\n  <appender name=\"CONSOLE\" class=\"ch.qos.logback.core.ConsoleAppender\">\n    <encoder>\n      <pattern>%d{HH:mm:ss} %-5level [%thread] %logger{36} - %msg%n</pattern>\n    </encoder>\n  </appender>\n\n  <appender name=\"FILE\" class=\"ch.qos.logback.core.rolling.RollingFileAppender\">\n    <file>logs/myapp.log</file>\n    <rollingPolicy class=\"ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy\">\n      <fileNamePattern>logs/myapp-%d{yyyy-MM-dd}.%i.log</fileNamePattern>\n      <maxFileSize>100MB</maxFileSize>\n      <maxHistory>30</maxHistory>\n    </rollingPolicy>\n    <encoder>\n      <pattern>%d{ISO8601} %-5level [%thread] %logger{36} - %msg%n</pattern>\n    </encoder>\n  </appender>\n\n  <root level=\"INFO\">\n    <appender-ref ref=\"CONSOLE\"/>\n    <appender-ref ref=\"FILE\"/>\n  </root>\n</configuration>\n```\n\n## MDC (Mapped Diagnostic Context) — 요청 추적 ID\n\n한 요청이 여러 메서드/클래스를 거치며 로그 라인을 남길 때 **공통 ID**로 묶기.\n\n```java\nimport org.slf4j.MDC;\n\n// Filter 또는 Interceptor에서\nString requestId = UUID.randomUUID().toString();\nMDC.put(\"requestId\", requestId);\ntry {\n    chain.doFilter(req, res);\n} finally {\n    MDC.clear();  // ← 반드시 정리. 안 하면 다른 요청이 같은 ID로 보임\n}\n```\n\nlogback pattern에 `%X{requestId}` 추가하면 매 로그 라인에 자동 포함.\n\n```\n10:01:23 INFO  [http-nio-8080-exec-1] UserService [reqId=a7f3e1c2] - findUser id=123\n10:01:23 INFO  [http-nio-8080-exec-1] UserDao     [reqId=a7f3e1c2] - SELECT ...\n10:01:23 WARN  [http-nio-8080-exec-1] UserService [reqId=a7f3e1c2] - user not found\n```\n\n이렇게 묶으면 grep `reqId=a7f3e1c2` 한 번으로 그 요청의 모든 로그가 보임.\n\n**주의**: ThreadLocal 기반이라 async/CompletableFuture에서는 안 따라옴. spring-boot의\n`@Async`나 reactive에서는 별도 propagation 필요.\n\n## 민감 정보 마스킹\n\n```java\n// 잘못된 코드\nlog.info(\"user logged in: {}\", user);\n// → \"user logged in: User{id=1, password='secret123', card='1234-5678-9012-3456'}\"\n```\n\n해결:\n- `toString()` override해서 민감 필드 제외\n- 또는 별도 DTO/LogDto에서 마스킹 후 로깅\n- 또는 logback `PatternLayout`의 마스킹 처리기 사용\n\n```java\n@Override\npublic String toString() {\n    return \"User{id=\" + id + \", email=\" + email + \"}\";  // password 제외\n}\n```\n\n또는 Jackson:\n```java\n@JsonIgnore  // 직렬화 + toString에서 무시\nprivate String password;\n```\n\n## Structured Logging (JSON 로그)\n\n운영 환경에서 로그를 ELK, Loki, CloudWatch 같은 시스템에 보낼 때 JSON\n포맷이 유리하다.\n\n```json\n{\"ts\":\"2026-05-11T10:01:23Z\",\"level\":\"INFO\",\"logger\":\"UserService\",\n \"reqId\":\"a7f3e1c2\",\"msg\":\"findUser\",\"userId\":123,\"latency_ms\":42}\n```\n\n로그 시스템에서 `level=ERROR AND service=user-service` 같은 query가 가능.\n\nSpring Boot에서: `logstash-logback-encoder` 라이브러리 추가 + `LogstashEncoder` 사용.\n\n## 운영 단계별 로그 관리\n\n### 1. 개발 단계\n- 로그 레벨 DEBUG, console만\n- println도 OK (단 commit 전 제거)\n\n### 2. 스테이징\n- DEBUG + console + file\n- MDC 추가\n- 민감 정보 마스킹\n\n### 3. 운영\n- INFO 이상, file + 중앙 수집 (Elasticsearch 등)\n- structured (JSON)\n- rotation 30일 보존\n- alert: ERROR 발생 시 Slack/PagerDuty\n\n### 4. 운영 디버깅\n- 특정 패키지만 임시 DEBUG로 (Spring Boot Actuator `loggers` endpoint)\n- 진단 끝나면 원복\n\n## 자주 헷갈리는 지점\n\n### \"DEBUG와 TRACE 차이\"\n\n표준은 5단계 (TRACE, DEBUG, INFO, WARN, ERROR). 신입은 4단계 (DEBUG, INFO, WARN, ERROR)로\n시작해도 OK. TRACE는 매우 상세(loop iteration마다 등)이라 거의 안 씀.\n\n### \"Println도 logger의 INFO 같은 거 아닌가\"\n\nprintln은:\n- stdout 고정\n- 동기 (성능 영향)\n- 레벨 없음\n- 포맷 없음\n\nlogger.info()는:\n- 다중 appender (console + file + remote)\n- 비동기 가능\n- 레벨로 동적 제어\n- pattern 통일 (timestamp, thread, MDC)\n\nprintln은 production never.\n\n### \"ERROR 로그는 모두 alert로 보내야 한다\"\n\nERROR 빈도가 많으면 alert fatigue. 분류:\n- 즉시 조치 필요한 ERROR → alert\n- 사용자 실수성 ERROR (잘못된 입력 등) → 별도 채널 또는 INFO 강등 고려\n- transient ERROR (외부 API 일시 timeout) → 1회 발생은 logging만, 빈도 임계 초과 시 alert\n\n### \"로그를 많이 남기면 안전하다\"\n\n너무 많은 로그는:\n- 디스크 비용 ↑\n- 진짜 중요한 로그 찾기 어려움\n- 로그 처리 자체가 성능 영향\n\nINFO 이상은 운영에서 매 요청 당 5-10줄 이내가 적정.\n\n## 빠른 확인 질문\n\n- SLF4J와 Logback의 관계?  답: SLF4J는 facade(인터페이스), Logback은 구현체\n- 운영에서 DEBUG 로그를 끄는 이유?  답: 노이즈 + 디스크/네트워크 비용\n- MDC의 목적?  답: 한 요청의 모든 로그를 공통 ID로 묶기 (ThreadLocal 기반)\n- 로그에 password가 찍히면 어떻게 해결?  답: `toString()` override 또는 `@JsonIgnore`\n- `logger.info(\"user={}\", user)`가 `logger.info(\"user=\" + user)`보다 좋은 이유?  답: 레벨이 꺼졌을 때 toString()이 호출되지 않음 (성능)\n\n## 한 줄 정리\n\n운영 로깅은 **SLF4J facade + Logback 구현체 + 4단계 레벨 + MDC 추적 ID + 민감 정보 마스킹 +\nappender 분리 (console/file/원격) + rotation**의 조합이며, 신입은 `System.out.println`을\n즉시 끄고 `LoggerFactory.getLogger(ThisClass.class)`로 시작하면 안전하다.\n",
+  "aliases": [
+    "spring logging primer",
+    "spring 로깅 기초",
+    "spring logging basics",
+    "logging primer",
+    "로깅 입문",
+    "slf4j logback",
+    "log4j2",
+    "logback configuration",
+    "로그 레벨",
+    "log level",
+    "DEBUG INFO WARN ERROR",
+    "system.out.println 안 좋은 이유",
+    "println vs logger",
+    "log appender",
+    "console appender",
+    "file appender",
+    "log rotation",
+    "로그 로테이션",
+    "민감 정보 마스킹",
+    "log masking",
+    "PII redaction",
+    "structured logging",
+    "구조화 로깅",
+    "JSON 로그",
+    "MDC mapped diagnostic context",
+    "요청 추적 ID",
+    "correlation ID",
+    "log level 동적 변경"
+  ],
+  "expected_queries": [
+    "System.out.println 대신 로깅 라이브러리를 써야 하는 이유가 뭐야?",
+    "SLF4J와 Logback의 차이는? 둘이 어떤 관계야?",
+    "로그 레벨 DEBUG INFO WARN ERROR는 각각 언제 써?",
+    "민감 정보(비밀번호, 카드번호)가 로그에 안 찍히게 하려면 어떻게 해?",
+    "한 요청을 여러 메서드/스레드를 거치며 추적하려면 MDC를 어떻게 써?",
+    "운영 환경에서 로그 파일이 너무 커지면 rotation을 어떻게 설정해?"
+  ],
+  "symptoms": [
+    "System.out.println을 그냥 써왔는데 운영에선 왜 안 좋은지 모르겠어",
+    "SLF4J / Logback / Log4j2 관계가 헷갈려",
+    "로그 레벨 DEBUG / INFO / WARN / ERROR 어디서 어느 걸 써야 할지 모르겠어",
+    "운영에서 비밀번호나 카드번호 같은 민감 정보가 로그에 그대로 찍히고 있어",
+    "요청을 끝까지 추적하려면 어떻게 ID를 심어야 할지 모르겠어",
+    "로그가 너무 많아서 디스크가 차고 있어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/mvc-request-lifecycle",
+      "language/java-language-basics"
+    ],
+    "next_docs": [
+      "spring/boot-autoconfiguration-internals"
+    ],
+    "confusable_with": [
+      "spring/boot-autoconfiguration-internals",
+      "spring/spring-boot-actuator-observability-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/spring/spring-logging-basics-primer.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "language/escape-analysis-scalar-replacement",
+  "title": "Escape Analysis and Scalar Replacement",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 HotSpot escape analysis를 NoEscape, ArgEscape, GlobalEscape, allocation elimination, scalar replacement, lock elision 관점으로 설명하는 advanced deep dive다.",
+  "body_markdown": "# Escape Analysis and Scalar Replacement\n\n> 한 줄 요약: escape analysis는 객체가 method/thread 밖으로 새는지 판단하고, no-escape로 판정되면 HotSpot은 allocation과 일부 lock을 없애거나 scalar replacement로 바꿀 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [JFR and JMC Performance Playbook](./jfr-jmc-performance-playbook.md)\n> - [Escape Analysis, Stack Allocation, Benchmarking, and Object Reuse Misconceptions](./escape-analysis-stack-allocation-benchmark-misconceptions.md)\n> - [Reflection 비용과 대안](./reflection-cost-and-alternatives.md)\n> - [VarHandle, Unsafe, Atomics](./varhandle-unsafe-atomics.md)\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n\n> retrieval-anchor-keywords: escape analysis, scalar replacement, object allocation elimination, lock elision, NoEscape, ArgEscape, GlobalEscape, HotSpot, JIT, allocation pressure, GC pressure, defensive copy, stack allocation myth, object reuse misconception\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nEscape analysis(EA)는 새로 만든 객체가 어디까지 도달하는지 분석한다.  \n핵심 질문은 두 가지다.\n\n- 객체가 method 밖으로 나가는가\n- 객체가 현재 thread 밖으로 나가는가\n\nHotSpot은 이 결과를 바탕으로 다음 최적화를 할 수 있다.\n\n- allocation 제거\n- lock 제거\n- scalar replacement\n\n중요한 점은 \"no escape = 무조건 stack allocation\"이 아니라는 것이다.  \nOracle 문서도 HotSpot이 heap allocation을 stack allocation으로 항상 바꾸는 것은 아니라고 설명한다.\n\n## 깊이 들어가기\n\n### 1. escape state를 어떻게 이해할까\n\n실무에서 볼 만한 상태는 이렇다.\n\n- GlobalEscape: static field, 반환값, 공유 객체를 통해 밖으로 퍼진다\n- ArgEscape: 호출 인자로 전달되지만 그 호출 안에서만 쓰인다\n- NoEscape: method/thread를 벗어나지 않는다\n\n이 구분이 중요한 이유는 EA가 보수적으로 동작하기 때문이다.  \n한 경로라도 밖으로 새면 그 객체는 더 이상 \"안전하게 지워도 되는 대상\"이 아니라고 본다.\n\n### 2. scalar replacement는 무엇을 바꾸나\n\nscalar replacement는 객체를 통째로 다루지 않고 필드를 독립적인 local value처럼 다루는 최적화다.  \n예를 들어 `Point(x, y)`가 사실상 `x`와 `y`만 필요하면, JIT는 객체 자체를 만들지 않을 수 있다.\n\n즉, 코드에서는 객체를 만들었지만 실행 시점에는 그 객체가 사라질 수 있다.\n\n### 3. 어떤 코드가 EA를 막나\n\nEA가 잘 안 먹는 흔한 패턴:\n\n- 객체를 반환한다\n- static field에 넣는다\n- 다른 thread로 넘긴다\n- 복잡한 control flow에서 한 경로라도 escape한다\n- reflection/JVMTI 같은 관찰 경로가 강하다\n- 예외와 재할당이 섞여 분석이 복잡해진다\n\n### 4. 왜 microbenchmark가 헷갈리나\n\nEA는 warmup 이후에 더 잘 드러난다.  \n그래서 allocation 카운트나 GC 횟수만 보고 \"이 코드는 항상 무할당이다\"라고 말하면 위험하다.\n\n또한 JIT 버전, 분기 구조, 호출 형태가 조금만 바뀌어도 결과가 달라질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 작은 객체를 많이 만드는 코드가 생각보다 빠르다\n\n이는 allocation이 실제로 남아도 비용이 매우 작거나, EA가 일부를 제거했기 때문일 수 있다.  \n즉 \"객체 생성 = 무조건 느림\"은 아니다.\n\n### 시나리오 2: `StringBuilder`나 DTO가 많아 보이는데 GC가 적다\n\nHotSpot이 중간 객체를 제거했을 가능성이 있다.  \n특히 계산용 임시 객체, copy-on-write 스타일의 중간값, defensive copy 일부에서 흔하다.\n\n### 시나리오 3: synchronized 블록이 생각보다 싸다\n\n그 락 객체가 method 밖으로 새지 않으면 lock elision이 가능하다.  \n그래서 \"락이 들어갔으니 무조건 비용이 있다\"는 직관도 항상 맞지 않는다.\n\n## 코드로 보기\n\n### 1. 임시 객체가 사라질 수 있는 예\n\n```java\npublic final class PointCalc {\n    public int sum(int x, int y) {\n        Point p = new Point(x, y);\n        return p.x() + p.y();\n    }\n\n    record Point(int x, int y) {}\n}\n```\n\n코드상으로는 `Point` 객체를 만들지만, JIT는 필드를 쪼개서 다룰 수 있다.\n\n### 2. EA가 잘 깨지는 예\n\n```java\npublic class EscapingBox {\n    private Object value;\n\n    public Object publish(Object input) {\n        this.value = input;\n        return input;\n    }\n}\n```\n\n여기서는 객체가 외부로 새기 쉬워서 최적화 여지가 줄어든다.\n\n### 3. defensive copy도 최적화될 수 있다\n\n```java\npublic final class NameHolder {\n    private final String first;\n    private final String last;\n\n    public NameHolder(String first, String last) {\n        this.first = first;\n        this.last = last;\n    }\n\n    public String fullName() {\n        return new StringBuilder()\n            .append(first)\n            .append(' ')\n            .append(last)\n            .toString();\n    }\n}\n```\n\n이런 코드는 JIT가 중간 `StringBuilder`를 더 공격적으로 최적화할 수 있다.\n\n### 4. 관측 커맨드\n\n```bash\njava \\\n  -XX:+UnlockDiagnosticVMOptions \\\n  -XX:+PrintCompilation \\\n  -XX:+PrintInlining \\\n  -jar app.jar\n```\n\n```bash\njcmd <pid> JFR.start name=alloc settings=profile duration=60s filename=/tmp/alloc.jfr\n```\n\nJFR에서 allocation burst와 hot method를 같이 보면 EA 효과를 간접적으로 읽기 좋다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| 임시 객체를 분리해서 쓰기 | 코드가 읽기 쉽다 | JIT 최적화에 의존할 수 있다 |\n| 객체 재사용 | allocation을 줄인다 | 상태 오염과 동시성 문제가 생길 수 있다 |\n| 명시적 primitive 계산 | 빠를 수 있다 | 도메인 표현력이 떨어질 수 있다 |\n| EA에 맡기기 | 코드는 자연스럽다 | JIT 버전과 패턴에 따라 결과가 달라진다 |\n\n핵심은 \"할당을 없애려고 코드를 먼저 망치지 말고, 먼저 읽기 쉬운 코드를 쓰고 JIT가 지우도록 허용하는 것\"이다.\n\n## 꼬리질문\n\n> Q: escape analysis는 stack allocation과 같은 말인가요?\n> 핵심: 아니다. EA는 escape 여부를 판단하는 분석이고, HotSpot은 그 결과로 allocation 제거와 scalar replacement를 할 수 있지만 항상 stack allocation을 하는 것은 아니다.\n\n> Q: scalar replacement가 왜 성능에 도움이 되나요?\n> 핵심: 객체 전체를 만들지 않고 필드값만 다루면 allocation, GC pressure, 일부 lock 비용이 줄어든다.\n\n> Q: 왜 `final`이나 불변 설계가 EA에도 도움되나요?\n> 핵심: 상태가 단순하면 escape 경로와 alias가 줄어들어 JIT가 추론하기 쉬워진다.\n\n## 한 줄 정리\n\nescape analysis는 객체가 밖으로 새는지 판단해 HotSpot이 allocation과 lock을 줄일 기회를 주고, scalar replacement는 그 결과를 실제 코드에서 드러내는 대표적인 최적화다.\n",
+  "aliases": [
+    "escape analysis",
+    "scalar replacement",
+    "allocation elimination",
+    "lock elision",
+    "HotSpot escape analysis",
+    "NoEscape ArgEscape GlobalEscape",
+    "stack allocation myth",
+    "Reflection",
+    "final",
+    "record"
+  ],
+  "expected_queries": [
+    "HotSpot escape analysis와 scalar replacement가 객체 allocation을 없앨 수 있다는 뜻을 설명해줘",
+    "NoEscape ArgEscape GlobalEscape를 Java JIT 최적화 관점으로 비교해줘",
+    "escape analysis가 lock elision까지 가능하게 하는 이유가 뭐야?",
+    "작은 객체 생성이 항상 느린 것이 아닌 이유를 JIT allocation elimination으로 알려줘",
+    "escape analysis를 stack allocation으로만 이해하면 왜 오해가 생겨?"
+  ],
+  "symptoms": [
+    "no escape이면 무조건 stack allocation이 된다고 단순화하고 allocation elimination, scalar replacement, lock elision의 실제 의미를 놓쳐",
+    "작은 객체를 많이 만들면 항상 느리다고 생각해 HotSpot EA와 JIT 최적화 가능성을 고려하지 않아",
+    "benchmark에서 사라진 allocation을 production에서도 항상 사라지는 설계 보장으로 오해해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jit-warmup-deoptimization"
+    ],
+    "next_docs": [
+      "language/escape-analysis-stack-allocation-benchmark-misconceptions",
+      "language/jmh-benchmarking-pitfalls",
+      "language/object-layout-jol-intuition"
+    ],
+    "confusable_with": [
+      "language/escape-analysis-stack-allocation-benchmark-misconceptions",
+      "language/jit-warmup-deoptimization",
+      "language/jmh-benchmarking-pitfalls",
+      "language/stack-vs-heap-escape-intuition",
+      "language/object-pooling-myths-modern-jvm",
+      "language/lock-coarsening-elimination"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/escape-analysis-scalar-replacement.md",
+    "revision_history": []
+  }
+}

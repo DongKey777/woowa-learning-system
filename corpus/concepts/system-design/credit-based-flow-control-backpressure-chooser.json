@@ -1,0 +1,63 @@
+{
+  "id": "system-design/credit-based-flow-control-backpressure-chooser",
+  "title": "Credit-Based Flow Control Backpressure Chooser",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 chooser는 credit-based flow control, demand signal, queue backpressure, TCP receive window, HTTP/2 WINDOW_UPDATE, Reactive Streams request(n), Kafka fetch/poll 같은 pull model을 하나의 mental model로 묶고 rate limit/load shedding과의 경계, slow consumer와 head-of-line caveat를 비교한다.",
+  "body_markdown": "# Credit-Based Flow Control Backpressure Chooser\n\n> 한 줄 요약: credit-based flow control은 \"consumer가 지금 더 받을 수 있는 양\"을 credit, window, request, fetch 같은 demand signal로 표현하고, producer가 그 예산 안에서만 보내게 만드는 backpressure 계약이다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Backpressure vs Load Shedding vs Rate Limit Interview Chooser](./backpressure-vs-load-shedding-vs-rate-limit-interview-chooser.md)\n- [Little's Law Capacity Planning Primer](./littles-law-capacity-planning-primer.md)\n- [Rate Limit vs Queue Load Shedding Chooser](./rate-limit-vs-queue-load-shedding-chooser.md)\n- [HTTP/2 HOL Blocking vs Flow-Control Stall Quick Decision Table](../network/http2-hol-blocking-vs-flow-control-stall-quick-decision-table.md)\n- [TCP Zero Window, Persist Probe, Receiver Backpressure](../network/tcp-zero-window-persist-probe-receiver-backpressure.md)\n- [HTTP/2 Flow Control, WINDOW_UPDATE, Stall](../network/http2-flow-control-window-update-stalls.md)\n- [Bounded Queue Overflow Policy Chooser](../data-structure/bounded-queue-overflow-policy-chooser.md)\n\nretrieval-anchor-keywords: credit-based flow control, demand signal, backpressure, queue backpressure, TCP receive window, rwnd, HTTP/2 WINDOW_UPDATE, stream window, connection window, Reactive Streams request n, Kafka fetch, consumer poll, pull model, slow consumer, head-of-line blocking, flow-control stall\n\n## 먼저 고정할 mental model\n\nCredit은 \"받는 쪽이 지금 추가로 감당할 수 있다고 광고한 예산\"이다. 단위는 bytes, messages, records, in-flight work, queue slots처럼 경계마다 달라진다. Producer는 credit이 있을 때만 보내고, consumer가 읽고 처리하거나 buffer를 비우면 credit을 다시 돌려준다.\n\n이 관점으로 보면 TCP receive window, HTTP/2 `WINDOW_UPDATE`, Reactive Streams `request(n)`, Kafka consumer의 fetch/poll 조절은 모두 같은 질문에 답한다.\n\n- 누가 demand를 선언하는가?\n- credit 단위는 byte인가 item인가 in-flight인가?\n- credit이 0이 되면 producer는 block, pause, reject, drop 중 무엇을 하는가?\n- consumer가 다시 여유를 만들었다는 신호는 언제 전파되는가?\n\nQueue backpressure도 같은 모델에 들어간다. Bounded queue의 남은 slot이 credit이고, `offer` 실패, `put` block, pause/resume, high-watermark/low-watermark가 demand signal이다. 단, queue만 bounded여도 upstream이 그 신호를 무시하고 즉시 retry loop를 돌면 backpressure가 아니라 retry amplification이다.\n\n## 공통 모델 매핑\n\n| 경계 | credit/demand signal | credit을 쓰는 순간 | credit이 돌아오는 순간 | 주의점 |\n|---|---|---|---|---|\n| TCP | receiver window(`rwnd`) | sender가 bytes를 전송 | receiver 앱이 socket buffer를 읽음 | `rwnd=0`은 congestion이 아니라 receiver-side stall일 수 있다 |\n| HTTP/2 | stream/connection window, `WINDOW_UPDATE` | DATA frame 전송 | peer가 DATA를 소비하고 window update | connection window가 막히면 작은 stream도 같이 늦어질 수 있다 |\n| Reactive Streams | subscriber의 `request(n)` | publisher가 `onNext` emit | subscriber가 다음 `request(n)` 호출 | `request(Long.MAX_VALUE)`는 사실상 unbounded demand다 |\n| Kafka pull model | consumer poll/fetch cadence, `max.poll.records`, `fetch.max.bytes`, pause/resume | broker가 fetched records 반환 | 앱이 처리하고 다시 poll/fetch | local processing queue와 partition lag를 따로 봐야 한다 |\n| Worker queue | remaining capacity, permit, high watermark | enqueue 또는 worker acquire | worker completion, queue drain | queue age가 SLO를 넘으면 credit보다 shedding 판단이 필요하다 |\n\n핵심은 \"밀어 넣는 쪽이 빠르다\"가 아니라 \"받는 쪽이 여유를 표현할 수 있는가\"다. Demand signal이 없으면 producer는 평균 처리율을 추측해서 rate limit처럼 동작해야 하고, 추측이 틀리면 queue나 downstream이 먼저 망가진다.\n\n## 10초 chooser\n\n| 질문 | 먼저 고를 모델 | 이유 |\n|---|---|---|\n| consumer가 \"N개/bytes 더 받을 수 있다\"를 정확히 말할 수 있나 | credit-based flow control | 실제 수용량을 upstream에 직접 전달할 수 있다 |\n| consumer가 읽는 속도를 스스로 정하나 | pull model / demand signal | `poll`, `fetch`, `request(n)`로 생산 속도를 간접 제어한다 |\n| 짧은 burst를 SLO 안에서만 흡수하면 되나 | bounded queue backpressure | queue slot과 wait budget이 credit 역할을 한다 |\n| 특정 caller가 공정성 quota를 넘나 | rate limit | receiver 상태보다 caller identity와 계약이 핵심이다 |\n| 처리해도 timeout될 만큼 지속 과부하인가 | admission control / load shedding | credit을 기다리기보다 빠른 실패로 자원을 보호해야 한다 |\n| 한 slow consumer가 다른 흐름까지 막나 | isolation + smaller shared windows | shared connection, shared queue, ordered partition의 HOL 위험을 줄여야 한다 |\n\n짧게 말하면, credit-based flow control은 \"받는 쪽 여유\"를 기반으로 생산량을 맞춘다. Rate limit은 \"누가 얼마나 호출할 권리가 있는가\"를 제한한다. Load shedding은 \"지금 받으면 성공 가능성이 낮다\"는 요청을 버린다.\n\n## Rate limit / load shedding과의 경계\n\nCredit signal은 capacity feedback이다. 수신자 buffer, worker queue, stream window, subscriber demand처럼 실제 소비 여유가 줄면 producer에게 덜 보내라고 말한다. 같은 사용자라도 consumer가 건강하면 credit이 늘고, consumer가 막히면 credit이 줄어든다.\n\nRate limit은 fairness와 quota policy다. receiver가 아직 건강해도 특정 API key가 계약량을 넘으면 429가 맞다. 반대로 모든 caller가 quota 안에 있어도 downstream이 느려져 credit이 0에 가까워질 수 있다.\n\nLoad shedding은 overload survival policy다. queue oldest age가 deadline을 넘고, consumer lag가 계속 증가하고, credit 회복 속도가 arrival rate보다 낮으면 \"기다리면 성공\"이라는 전제가 깨진다. 이때는 credit을 기다리는 대신 low-priority work를 drop하거나 admission을 닫고 503/fast-fail을 반환해야 한다.\n\n세 가지는 함께 쓸 수 있다. 예를 들어 streaming gateway는 per-tenant rate limit으로 공정성을 지키고, HTTP/2 window로 receiver backpressure를 전달하고, connection window starvation이 오래 지속되면 low-priority stream을 cancel하거나 shed할 수 있다.\n\n## Head-of-line / slow consumer caveat\n\nCredit-based flow control은 memory 폭발을 막지만, 느린 consumer가 만든 stall을 자동으로 격리하지는 않는다.\n\n- TCP는 byte stream이라 receiver가 읽지 않으면 sender write가 막힌다. 이 stall은 packet loss나 congestion과 증상이 비슷해 보일 수 있지만 원인은 receiver backpressure다.\n- HTTP/2는 stream별 window가 있어도 connection window는 공유된다. 큰 streaming response 하나가 connection window를 오래 점유하면 같은 connection의 작은 RPC도 늦어질 수 있다.\n- Reactive Streams fan-out에서 subscriber 하나가 느리면 shared publisher가 전체 속도를 낮추거나 subscriber별 buffer/drop 정책을 요구한다.\n- Kafka는 pull이라 consumer가 fetch 속도를 줄일 수 있지만, partition order와 offset commit 때문에 한 partition의 느린 record가 뒤 record를 막을 수 있다. `max.poll.records`를 줄여도 처리율이 arrival rate보다 낮으면 consumer lag는 계속 오른다.\n\n따라서 slow consumer를 보면 credit 크기만 늘리지 않는다. per-stream/per-partition isolation, priority queue, bounded subscriber buffer, pause/resume, deadline-aware cancel, batch size 조정, consumer scale-out 가능 여부를 같이 본다.\n\n## 설계 체크리스트\n\n1. Credit 단위를 정한다: bytes, records, messages, queue slots, in-flight work 중 무엇인가?\n2. Credit 발행 주체를 정한다: receiver socket, HTTP/2 peer, subscriber, consumer app, worker pool 중 누구인가?\n3. Credit 회복 조건을 정한다: read 완료, ack, processing 완료, offset commit, queue drain 중 어느 시점인가?\n4. 0 credit 동작을 정한다: block, async pause, reject, drop, cancel, shed 중 무엇인가?\n5. Hysteresis를 둔다: high watermark에서 pause하고 low watermark에서 resume해야 flap이 줄어든다.\n6. 관측 지표를 분리한다: available credit, requested vs emitted, queue depth, oldest age, write blocked time, `WINDOW_UPDATE` delay, consumer lag, poll interval, shed/drop count를 함께 본다.\n\n## 검증 질문\n\n- Bounded queue의 `offer`가 실패했는데 producer가 즉시 무한 재시도한다면, 이것을 backpressure라고 부를 수 있는가?\n- HTTP/2에서 stream window는 남아 있지만 connection window가 0에 가깝다면 어떤 요청까지 영향을 받을 수 있는가?\n- Reactive Streams에서 subscriber가 항상 `request(Long.MAX_VALUE)`를 호출하면 어떤 backpressure 보장이 약해지는가?\n- Kafka consumer가 `max.poll.records`를 낮췄는데 consumer lag와 oldest lag가 계속 증가한다면 다음 선택지는 queue 확대인가, 처리율/partition/isolation/load shedding 검토인가?\n- Slow consumer 문제가 caller별 quota 초과가 아닌데 rate limit만 강화하면 어떤 신호를 놓치게 되는가?\n\n답이 흔들리면 \"누가 credit을 만들고, 누가 credit을 쓰고, credit이 0일 때 어떤 계약으로 멈추는가\"로 다시 돌아가면 된다.\n",
+  "aliases": [
+    "credit-based flow control",
+    "credit based backpressure",
+    "demand signal backpressure",
+    "queue backpressure chooser",
+    "TCP receive window mental model",
+    "HTTP/2 WINDOW_UPDATE mental model",
+    "Reactive Streams request n backpressure",
+    "Kafka fetch pull model backpressure",
+    "slow consumer head of line caveat",
+    "pull based flow control"
+  ],
+  "expected_queries": [
+    "credit-based flow control이 backpressure와 무슨 관계야?",
+    "TCP receive window, HTTP/2 WINDOW_UPDATE, Reactive Streams request(n), Kafka fetch/poll을 같은 mental model로 설명해줘",
+    "queue backpressure와 rate limit, load shedding은 어떻게 구분해?",
+    "slow consumer가 있을 때 head-of-line 문제까지 포함해서 backpressure 설계를 골라줘",
+    "pull model에서 demand signal을 어디에 두고 어떤 metric으로 검증해?"
+  ],
+  "symptoms": [
+    "backpressure를 queue가 꽉 찼을 때 버리는 정책으로만 설명한다",
+    "TCP window, HTTP/2 window, Reactive Streams request, Kafka fetch/poll을 서로 다른 개념으로만 본다",
+    "demand signal과 rate limit, load shedding의 경계를 구분하지 못한다",
+    "slow consumer가 있을 때 head-of-line blocking이나 shared window starvation을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/backpressure-vs-load-shedding-vs-rate-limit-interview-chooser",
+      "system-design/littles-law-capacity-planning-primer",
+      "network/http2-hol-blocking-vs-flow-control-stall-quick-decision-table"
+    ],
+    "next_docs": [
+      "network/tcp-zero-window-persist-probe-receiver-backpressure",
+      "network/http2-flow-control-window-update-stalls",
+      "system-design/backpressure-and-load-shedding-design",
+      "data-structure/bounded-queue-overflow-policy-chooser"
+    ],
+    "confusable_with": [
+      "system-design/backpressure-vs-load-shedding-vs-rate-limit-interview-chooser",
+      "system-design/rate-limit-vs-queue-load-shedding-chooser",
+      "system-design/adaptive-concurrency-limit-aimd-gradient-chooser",
+      "network/tcp-zero-window-persist-probe-receiver-backpressure",
+      "network/http2-flow-control-window-update-stalls",
+      "data-structure/bounded-queue-overflow-policy-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/credit-based-flow-control-backpressure-chooser.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "design-pattern/saga-compensation-idempotency-pattern",
+  "title": "Saga Compensation Idempotency Pattern",
+  "category": "design-pattern",
+  "level": "advanced",
+  "summary": "|",
+  "body_markdown": "# Saga Compensation Idempotency Pattern\n\n> 한 줄 요약: Saga의 보상은 과거 DB 상태로 시간을 되돌리는 rollback이 아니라, 이미 일어난 일을 안전하게 상쇄하는 새로운 비즈니스 작업이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Saga / Coordinator Pattern Language](./saga-coordinator-pattern-language.md)\n> - [Compensation vs Reconciliation Pattern](./compensation-vs-reconciliation-pattern.md)\n> - [Idempotent Consumer and Projection Dedup Pattern](./idempotent-consumer-projection-dedup-pattern.md)\n> - [Spring 결제 승인 DB 실패 보상 멱등성 프라이머](../spring/spring-payment-approval-db-failure-compensation-idempotency-primer.md)\n\n---\n\n## 핵심 경계\n\nSaga에서 각 step은 보통 자기 local transaction을 commit한다. 그래서 뒤 step이 실패해도 앞 step의 DB transaction을 자동 rollback할 수 없다. 대신 다음 중 하나를 선택한다.\n\n| 상태 | 선택 | 예시 |\n|---|---|---|\n| 실패가 명확하고 되돌리는 비즈니스 동작이 있음 | compensation | 재고 예약 취소, 쿠폰 사용 취소 |\n| 외부 side effect 성공 여부가 불명확함 | reconciliation 먼저 | 결제 승인 timeout 후 PG 승인 상태 재조회 |\n| 되돌리면 더 위험함 | manual review/correction | 배송 출고 이후 환불/회수 판단 |\n| 아직 pivot 전이라 내부 상태만 있음 | local rollback 또는 pending 정리 | 주문 생성 전 validation 실패 |\n\n중요한 말은 \"보상으로 rollback한다\"가 아니라 **보상 명령을 실행해 반대 의미의 business event를 만든다**다.\n\n## Idempotency가 필요한 이유\n\n보상도 실패할 수 있고 retry될 수 있다.\n\n```text\n1. payment approved\n2. order save failed\n3. refund command sent\n4. network timeout while refund response is lost\n5. worker retries refund command\n```\n\n이때 refund가 두 번 실행되면 compensation이 또 다른 장애가 된다. 그래서 보상 명령도 일반 command처럼 idempotency를 가져야 한다.\n\n| 대상 | idempotency key 후보 | 저장해야 하는 상태 |\n|---|---|---|\n| 결제 취소/환불 | originalPaymentId + compensationType | REQUESTED, SUCCEEDED, FAILED, UNKNOWN |\n| 재고 예약 취소 | reservationHoldId | RELEASED 여부와 releasedAt |\n| 쿠폰 사용 취소 | couponUseId | CANCELLED 여부와 reason |\n| 알림 취소 | notificationIntentId | 취소 가능 여부, 이미 발송됨 여부 |\n\n## 설계 골격\n\n```text\nSagaStep\n  forwardCommandId\n  forwardStatus\n  compensationCommandId\n  compensationStatus\n  externalReference\n  lastObservedExternalStatus\n```\n\n이 상태를 남기면 같은 보상 요청이 다시 들어와도 다음처럼 처리할 수 있다.\n\n- 이미 `SUCCEEDED`면 같은 결과를 반환한다.\n- `REQUESTED`에서 timeout이면 외부 상태를 재조회한다.\n- 외부 상태가 성공이면 내부 상태를 `SUCCEEDED`로 맞춘다.\n- 외부 상태가 없으면 retry 또는 manual review로 보낸다.\n\n## 보상 vs retry vs reconciliation\n\n| 질문 | retry | compensation | reconciliation |\n|---|---|---|---|\n| 같은 작업을 다시 해도 안전한가 | idempotent하면 가능 | 보상 자체도 idempotent해야 함 | 재조회/대조가 중심 |\n| 목적 | 일시 실패 흡수 | 이미 성공한 앞 step 상쇄 | 내부와 외부 truth 차이 해소 |\n| 대표 위험 | retry storm, 중복 side effect | 중복 환불, 잘못된 취소 | 오래 열린 pending 상태 |\n| 필요한 기록 | attempt, backoff, final failure | compensation command id/status | external reference, observed state |\n\ntimeout은 특히 주의한다. timeout은 \"실패했다\"가 아니라 \"응답을 못 봤다\"일 수 있다. 결제 승인 요청이 timeout됐는데 실제 PG에서는 승인됐을 수 있다면, 즉시 환불을 보내기보다 승인 상태 재조회와 reconciliation이 먼저다.\n\n## 리뷰에서 볼 신호\n\n- \"실패하면 이전 단계 rollback\"이라고 적혀 있지만 실제로는 여러 DB/외부 시스템에 commit된 상태다.\n- compensation command에 unique key나 status table이 없어 retry 시 중복 실행된다.\n- coordinator가 보상 순서만 알고 있고, 각 participant의 idempotency contract는 없다.\n- unknown state를 실패로 단정해 cancel/refund를 바로 호출한다.\n- 보상 실패가 다시 실패했을 때 manual review나 DLQ가 없다.\n\n## 한 줄 정리\n\nSaga compensation은 rollback이 아니라 새로운 비즈니스 command다. 따라서 forward command처럼 idempotency key, status 저장, 재조회, manual repair 경로가 있어야 retry와 partial failure 속에서도 안전하다.\n",
+  "aliases": [
+    "saga compensation idempotency",
+    "compensating transaction idempotency",
+    "saga rollback vs compensation",
+    "idempotent compensation command",
+    "business rollback limit",
+    "보상 트랜잭션 멱등성",
+    "saga 보상과 rollback 차이"
+  ],
+  "expected_queries": [
+    "Saga compensation은 DB rollback이 아니라 이미 commit된 일을 비즈니스적으로 상쇄하는 작업이라는 뜻이야?",
+    "보상 트랜잭션을 retry해도 중복 환불이 나지 않게 idempotency key와 status를 어떻게 설계해?",
+    "timeout으로 결제 승인 여부가 unknown일 때 바로 cancel하지 않고 reconciliation을 먼저 봐야 하는 이유가 뭐야?",
+    "Saga step마다 forward command, compensation command, idempotency key를 어떻게 짝지어야 해?",
+    "주문 결제 재고 workflow에서 compensation과 rollback, retry, reconciliation을 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "Saga 보상을 이미 commit된 DB transaction rollback과 같은 것으로 설명한다",
+    "compensation command가 retry될 때 중복 환불, 중복 재고 복구, 중복 알림을 만든다",
+    "timeout이나 unknown external state를 명확한 실패로 단정해 즉시 보상 처리한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "design-pattern/saga-coordinator-pattern-language",
+      "design-pattern/compensation-vs-reconciliation-pattern",
+      "design-pattern/idempotent-consumer-projection-dedup-pattern"
+    ],
+    "next_docs": [
+      "design-pattern/process-manager-state-store-recovery",
+      "design-pattern/orchestration-vs-choreography-failure-handling",
+      "software-engineering/saga-compensation-failure-handling"
+    ],
+    "confusable_with": [
+      "design-pattern/saga-coordinator-pattern-language",
+      "design-pattern/compensation-vs-reconciliation-pattern",
+      "design-pattern/process-manager-state-store-recovery",
+      "design-pattern/idempotent-consumer-projection-dedup-pattern"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/design-pattern/saga-compensation-idempotency-pattern.md",
+    "revision_history": []
+  }
+}

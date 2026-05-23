@@ -1,0 +1,52 @@
+{
+  "id": "system-design/rate-limit-config-service-design",
+  "title": "Rate Limit Config Service 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Rate Limit Config Service 설계를 다루는 deep_dive 문서다. rate limit config service는 endpoint, tenant, user, key별 제한 정책을 중앙에서 관리하고, edge와 app에 안전하게 배포하는 제어 평면이다. 검색 질의가 rate limit config, quota policy, limit rollout, token bucket config처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Rate Limit Config Service 설계\n\n> 한 줄 요약: rate limit config service는 endpoint, tenant, user, key별 제한 정책을 중앙에서 관리하고, edge와 app에 안전하게 배포하는 제어 평면이다.\n\nretrieval-anchor-keywords: rate limit config, quota policy, limit rollout, token bucket config, tenant limit, endpoint limit, dynamic throttling, policy snapshot, propagation, safety guard\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [API Gateway Control Plane 설계](./api-gateway-control-plane-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n\n## 핵심 개념\n\nRate limit config는 enforcement가 아니다.  \n실전에서는 아래를 설계해야 한다.\n\n- 어떤 키로 제한할지\n- 어느 계층에서 적용할지\n- 언제 변경을 반영할지\n- 급한 정책을 어떻게 롤백할지\n- tenant별 공정성을 어떻게 보장할지\n\n즉, config service는 limiter 정책을 운영하는 중앙 제어 계층이다.\n\n## 깊이 들어가기\n\n### 1. 정책 모델\n\n정책은 보통 여러 축을 가진다.\n\n- global\n- tenant\n- user\n- IP\n- API key\n- endpoint\n\n각 축의 우선순위를 명확히 해야 한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 수천 정책 변경/일\n- 초당 수만 검사 요청\n\n정책 읽기는 많고 쓰기는 적다.  \n그래서 snapshot 기반 배포가 효율적이다.\n\n봐야 할 숫자:\n\n- policy lookup QPS\n- propagation delay\n- stale policy rate\n- rollback time\n- conflict rate\n\n### 3. publish flow\n\n```text\nAdmin / Automation\n  -> Validate\n  -> Version\n  -> Snapshot\n  -> Publish\n  -> Edge / App Refresh\n```\n\n### 4. guard rails\n\nrate limit 정책은 잘못 바꾸면 장애를 만든다.\n\n- 상한선\n- 최소 허용치\n- canary rollout\n- automatic rollback\n\n### 5. tenant-aware fairness\n\n멀티테넌트 환경에서는 한 tenant가 다른 tenant를 잠식하지 않아야 한다.\n\n- tenant quota\n- burst budget\n- emergency override\n\n이 부분은 [Entitlement / Quota 설계](./entitlement-quota-design.md)와 연결된다.\n\n### 6. edge sync\n\n정책은 edge와 app에 빠르게 전파돼야 한다.\n\n- push notification\n- pull snapshot\n- version pinning\n\n이 부분은 [Config Distribution System 설계](./config-distribution-system-design.md)와 같다.\n\n### 7. observability\n\n정책 변경 후를 봐야 한다.\n\n- allow/reject ratio\n- error spikes\n- latency shifts\n- policy version adoption\n\n## 실전 시나리오\n\n### 시나리오 1: 로그인 공격 대응\n\n문제:\n\n- `/login` limit을 빠르게 낮춰야 한다\n\n해결:\n\n- endpoint policy update\n- canary rollout\n- revert path 확보\n\n### 시나리오 2: 특정 tenant 과다 사용\n\n문제:\n\n- 한 tenant가 API를 과하게 사용한다\n\n해결:\n\n- tenant quota 축소\n- user-level carve-out\n\n### 시나리오 3: 잘못된 제한 배포\n\n문제:\n\n- 전역 limit을 너무 낮게 걸어버렸다\n\n해결:\n\n- last-known-good snapshot\n- emergency override\n\n## 코드로 보기\n\n```pseudo\nfunction publishLimit(policy):\n  validate(policy)\n  version = store.save(policy)\n  snapshot = buildSnapshot(version)\n  distributor.broadcast(snapshot)\n```\n\n```java\npublic LimitPolicy current(String tenantId, String endpoint) {\n    return policyCache.load(tenantId, endpoint);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Static config | 단순하다 | 대응이 느리다 | 작은 서비스 |\n| Dynamic config service | 반영이 빠르다 | 운영 복잡도 | 실서비스 |\n| Snapshot-based rollout | 안정적이다 | propagation 지연 | 대부분의 시스템 |\n| Per-tenant override | 유연하다 | 정책 폭증 | SaaS |\n| Hard guard rails | 안전하다 | 유연성이 낮다 | 민감한 경로 |\n\n핵심은 rate limit config service가 단순 저장소가 아니라 **방어 정책을 안전하게 배포하는 운영 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: limiter와 config service는 왜 분리하나요?\n> 의도: 실행과 정책 관리 분리 이해 확인\n> 핵심: 정책 변경과 요청 경로를 분리해야 한다.\n\n> Q: canary rollout은 왜 필요한가요?\n> 의도: 정책 변경의 위험 제어 이해 확인\n> 핵심: 잘못된 제한은 즉시 장애를 만들 수 있기 때문이다.\n\n> Q: tenant quota와 endpoint limit은 어떻게 다른가요?\n> 의도: 정책 축 분리 이해 확인\n> 핵심: 공정성과 보호 대상이 다르다.\n\n> Q: 정책 롤백은 어떻게 빠르게 하나요?\n> 의도: last-known-good와 version pin 이해 확인\n> 핵심: snapshot version을 즉시 되돌린다.\n\n## 한 줄 정리\n\nRate limit config service는 limiter 정책을 버전, 롤아웃, 롤백, tenant fairness까지 포함해 중앙에서 관리하는 제어 평면이다.\n\n",
+  "aliases": [
+    "rate limit config",
+    "quota policy",
+    "limit rollout",
+    "token bucket config",
+    "tenant limit",
+    "endpoint limit",
+    "dynamic throttling",
+    "policy snapshot",
+    "propagation",
+    "safety guard",
+    "Rate Limit Config Service 설계",
+    "rate limit config service design"
+  ],
+  "expected_queries": [
+    "Rate Limit Config Service 설계 설계 핵심을 설명해줘",
+    "rate limit config가 왜 필요한지 알려줘",
+    "Rate Limit Config Service 설계 실무 트레이드오프는 뭐야?",
+    "rate limit config 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Rate Limit Config Service 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Rate Limit Config Service 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Rate Limit Config Service 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/rate-limiting-basics"
+    ],
+    "next_docs": [
+      "system-design/rate-limiter-design"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/rate-limit-config-service-design.md",
+    "revision_history": []
+  }
+}

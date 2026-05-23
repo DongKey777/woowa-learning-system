@@ -1,0 +1,62 @@
+{
+  "id": "language/thread-interruption-cooperative-cancellation-playbook",
+  "title": "Thread Interruption and Cooperative Cancellation Playbook",
+  "category": "language",
+  "level": "advanced",
+  "summary": "'이 문서는 Java interrupt와 cooperative cancellation을 shutdown protocol로 다루는 playbook이다.",
+  "body_markdown": "# Thread Interruption and Cooperative Cancellation Playbook\n\n> 한 줄 요약: Java의 interrupt는 스레드를 강제로 죽이는 기능이 아니라 협력적 취소 신호다. `InterruptedException`을 삼키거나 interrupt status를 잃어버리면 shutdown, timeout, request cancel이 조용히 망가진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [CompletableFuture Cancellation Semantics](./completablefuture-cancellation-semantics.md)\n> - [Executor Sizing, Queue, Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n> - [Servlet Container Timeout and Cancellation Boundaries: Spring MVC and Virtual Threads](./servlet-container-timeout-cancellation-boundaries-spring-mvc-virtual-threads.md)\n> - [Structured Concurrency and `ScopedValue`](./structured-concurrency-scopedvalue.md)\n> - [Virtual Threads(Project Loom)](./virtual-threads-project-loom.md)\n> - [ForkJoinPool Work-Stealing](./forkjoinpool-work-stealing.md)\n\n> retrieval-anchor-keywords: interrupt, InterruptedException, interruption status, Thread.interrupt, Thread.interrupted, isInterrupted, cooperative cancellation, graceful shutdown, shutdownNow, Future.cancel, blocking call, sleep, join, lockInterruptibly, virtual thread, cancellation token, servlet request cancel, servlet async timeout, client disconnect, request timeout, virtual thread request interrupt\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [재현과 검증 루프](#재현과-검증-루프)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\ninterrupt는 \"지금 당장 멈춰\"가 아니라 \"멈출 수 있으면 멈춰 달라\"는 요청이다.\n\n이 요청은 보통 두 형태로 나타난다.\n\n- interrupt flag를 세운다\n- 일부 blocking API가 `InterruptedException`으로 깨어난다\n\n그래서 취소가 제대로 동작하려면 호출자와 작업 코드가 같은 규칙을 지켜야 한다.\n\n- blocking 지점은 interrupt를 존중한다\n- catch한 쪽은 신호를 잃어버리지 않는다\n- CPU loop는 `isInterrupted()`나 별도 token을 확인한다\n\n핵심 오해는 interrupt를 예외 처리 세부사항으로 보는 것이다.\n실무에서는 interrupt가 곧 shutdown protocol이다.\n\n## 깊이 들어가기\n\n### 1. interrupt는 상태이자 협력 신호다\n\n`Thread#interrupt()`는 대상 스레드의 interrupt status를 세운다.\n스레드가 `sleep`, `wait`, `join`, `BlockingQueue#take`, `lockInterruptibly()` 같은 interruptible blocking call에 있으면 깨어날 수 있다.\n\n하지만 모든 blocking call이 즉시 멈추는 것은 아니다.\n\n- 일부 I/O는 resource close나 driver-specific cancel이 더 중요하다\n- native call이나 외부 라이브러리는 interrupt를 느리게 반영할 수 있다\n- 이미 CPU loop 안에 있으면 코드가 flag를 직접 확인해야 한다\n\n즉 interrupt는 kill signal이 아니라 cooperation contract다.\n\n### 2. `InterruptedException`을 잡으면 status가 지워질 수 있다\n\n많은 interruptible API는 `InterruptedException`을 던지면서 현재 스레드의 interrupt status를 clear한다.\n그래서 catch 후 그냥 로그만 남기고 계속 가면, 상위 호출자는 취소 신호가 있었는지 모르게 된다.\n\n규칙은 단순하다.\n\n- 가능하면 `InterruptedException`을 그대로 다시 던진다\n- 못 던지면 `Thread.currentThread().interrupt()`로 status를 복구한다\n- 취소를 정상 종료로 볼지, 예외로 볼지 boundary에서 일관되게 정한다\n\n### 3. `Thread.interrupted()`와 `isInterrupted()`는 다르다\n\n- `Thread.currentThread().isInterrupted()`: 상태를 읽기만 한다\n- `Thread.interrupted()`: 현재 스레드 상태를 읽고 clear한다\n\n`Thread.interrupted()`를 무심코 쓰면 cancellation signal을 소비해버릴 수 있다.\nretry loop, polling loop, batch worker에서 특히 조심해야 한다.\n\n### 4. interrupt만으로 충분하지 않은 경우가 있다\n\ninterrupt는 강력한 기본 신호지만, 다음 경우엔 추가 설계가 필요하다.\n\n- 긴 CPU loop: 주기적으로 flag 체크 필요\n- 외부 API 호출: 소켓 timeout, JDBC cancel, HTTP client cancel도 같이 설계\n- async graph 전체 취소: interrupt 외에 cancellation token이나 parent scope 필요\n\n즉 interrupt는 바닥 신호이고, 상위 수준 취소 모델은 별도로 있을 수 있다.\n\n특히 servlet request timeout이나 client disconnect는 \"thread를 interrupt한다\"보다 \"response/request lifetime이 끝났다\"에 가깝다.\n그래서 Spring MVC나 virtual-thread request handling에서는 timeout/disconnect를 interrupt로 착각하지 말고, app task cancel과 downstream timeout을 별도로 연결해야 한다.\n\n### 5. executor, future, virtual thread와의 관계\n\n`ExecutorService#shutdownNow()`는 대기 중 task 반환과 worker interrupt를 시도한다.\n`Future#cancel(true)`도 interrupt를 기대하게 만들지만, 실제 작업이 interrupt를 존중해야 효과가 있다.\n\nvirtual thread에서도 원칙은 같다.\n\n- blocking 자체는 저렴해질 수 있다\n- 하지만 취소 협약은 여전히 필요하다\n- `InterruptedException`을 삼키면 structured cancellation도 흐려진다\n\n즉 Loom이 interrupt discipline을 없애주지는 않는다.\n\n## 실전 시나리오\n\n### 시나리오 1: 서버 종료가 오래 걸린다\n\nworker가 queue에서 `take()` 하다 interrupt를 받았는데 catch 후 무시하고 다시 loop를 돌면,\n`shutdownNow()`는 성공한 것처럼 보여도 스레드는 계속 살아남는다.\n\n이때 문제는 executor가 아니라 worker contract다.\n\n### 시나리오 2: timeout은 지났는데 DB 작업이 계속 돈다\n\n상위 future는 timeout으로 실패했지만, 실제 JDBC 호출은 계속 진행될 수 있다.\ninterrupt만 걸고 끝내면 부족할 수 있다.\n\n확인할 것:\n\n- driver가 interrupt를 어떻게 다루는가\n- statement timeout이 있는가\n- connection close나 cancel API가 있는가\n\n### 시나리오 3: 배치 루프가 취소되지 않는다\n\nCPU-bound loop가 interruptible blocking point 없이 오래 돌면,\ninterrupt status를 주기적으로 확인하지 않는 한 끝나지 않는다.\n\n### 시나리오 4: 취소 신호가 중간 계층에서 사라진다\n\nlibrary code가 `InterruptedException`을 catch해서 로그만 남기고 빈 값을 반환하면,\n호출자는 \"정상 종료\"와 \"취소\"를 구분할 수 없게 된다.\n\n이 패턴은 request cancel, graceful shutdown, 배치 stop을 모두 어렵게 만든다.\n\n## 재현과 검증 루프\n\ninterrupt bug는 \"안 멈춘다\"로만 보이기 쉬우므로, 작은 재현에서 신호가 어디서 사라지는지 확인한다.\n\n| 재현 | 실패 신호 | 검증 기준 |\n|---|---|---|\n| worker가 `BlockingQueue.take()` 중일 때 `shutdownNow()` 호출 | catch 후 loop가 계속 돌고 executor가 종료되지 않음 | catch에서 rethrow하거나 `Thread.currentThread().interrupt()` 후 return한다 |\n| CPU loop 중 `future.cancel(true)` 호출 | thread는 interrupted인데 loop가 끝나지 않음 | loop가 주기적으로 `isInterrupted()`나 stop token을 확인한다 |\n| JDBC/HTTP 호출 중 request timeout 발생 | caller는 timeout 처리됐지만 downstream 작업이 계속 돈다 | interrupt 외에 statement cancel, HTTP request cancel, socket timeout을 따로 검증한다 |\n| library boundary에서 `InterruptedException`을 삼킴 | 상위 계층이 취소와 정상 empty result를 구분하지 못함 | API contract에 cancellation result/exception을 남긴다 |\n\n검증할 때 `Future.cancel(true)`의 반환값만으로 \"작업이 멈췄다\"고 쓰면 안 된다. 반환값은 cancel 요청 수락에 가깝고, 실제 작업 중단은 worker가 취소 신호를 관측했는지로 확인해야 한다.\n\n## 코드로 보기\n\n### 1. `InterruptedException`을 복구하며 빠져나오기\n\n```java\npublic void runWorker() {\n    try {\n        queue.take();\n        processNext();\n    } catch (InterruptedException e) {\n        Thread.currentThread().interrupt();\n        return;\n    }\n}\n```\n\n### 2. CPU loop에서 interrupt 확인하기\n\n```java\npublic void indexAll(List<Job> jobs) {\n    for (Job job : jobs) {\n        if (Thread.currentThread().isInterrupted()) {\n            return;\n        }\n        index(job);\n    }\n}\n```\n\n### 3. interrupt와 별도 stop token 함께 쓰기\n\n```java\nimport java.util.concurrent.atomic.AtomicBoolean;\n\npublic final class Worker {\n    private final AtomicBoolean stop = new AtomicBoolean();\n\n    public void requestStop() {\n        stop.set(true);\n    }\n\n    public void run() {\n        while (!stop.get() && !Thread.currentThread().isInterrupted()) {\n            doUnitOfWork();\n        }\n    }\n}\n```\n\n### 4. executor 종료 절차\n\n```java\nexecutor.shutdown();\nif (!executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {\n    executor.shutdownNow();\n}\n```\n\n이 패턴도 worker가 interrupt를 존중하지 않으면 의미가 약해진다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| interrupt 중심 취소 | JDK 유틸리티와 자연스럽게 맞물린다 | 코드가 협력하지 않으면 효과가 약하다 |\n| 별도 stop flag | CPU loop 제어가 단순하다 | blocking call을 깨우지 못한다 |\n| cancellation token 객체 | async graph에 의도를 명시적으로 전달한다 | plumbing 코드가 늘어난다 |\n| `shutdownNow()` 의존 | 중앙에서 멈추기 쉽다 | best-effort일 뿐 실제 중단을 보장하지 않는다 |\n\n핵심은 \"무엇으로 신호를 보낼지\"보다 \"누가 그 신호를 존중하는지\"다.\n\n## 꼬리질문\n\n> Q: interrupt는 스레드를 강제로 종료하나요?\n> 핵심: 아니다. 협력적 취소 신호이며 코드와 API가 이를 존중해야 멈춘다.\n\n> Q: `InterruptedException`을 catch하면 무엇을 가장 조심해야 하나요?\n> 핵심: interrupt status를 잃어버리지 않는 것이다. 못 던지면 다시 `interrupt()` 해야 한다.\n\n> Q: `Thread.interrupted()`와 `isInterrupted()` 차이는 무엇인가요?\n> 핵심: 전자는 읽으면서 clear하고, 후자는 읽기만 한다.\n\n> Q: interrupt만 걸면 외부 API 호출도 같이 멈추나요?\n> 핵심: 항상 그렇지 않다. timeout, cancel, close 같은 별도 메커니즘을 함께 봐야 한다.\n\n## 한 줄 정리\n\ninterrupt는 Java 취소 모델의 공용 언어이므로, `InterruptedException`을 삼키지 않고 status를 보존하는 습관이 shutdown과 timeout 설계의 기본이다.\n",
+  "aliases": [
+    "thread interruption playbook",
+    "cooperative cancellation",
+    "InterruptedException",
+    "interrupt status",
+    "Thread.interrupt",
+    "Future cancel true",
+    "shutdownNow",
+    "graceful shutdown",
+    "virtual thread cancellation",
+    "Java interrupt",
+    "협력적 취소",
+    "인터럽트 상태 복구"
+  ],
+  "expected_queries": [
+    "Java interrupt는 스레드를 강제로 죽이는 기능이 아니라 협력적 취소 신호라는 뜻을 설명해줘",
+    "InterruptedException을 catch한 뒤 Thread.currentThread().interrupt로 상태를 복구해야 하는 이유가 뭐야?",
+    "Thread.interrupted와 isInterrupted 차이가 취소 신호를 잃어버리는 버그와 어떻게 연결돼?",
+    "Executor shutdownNow나 Future cancel true가 실제 작업 중단을 보장하지 않는 이유를 worker contract 기준으로 알려줘",
+    "request timeout이나 client disconnect, JDBC cancel은 interrupt와 어떤 경계가 다르고 무엇을 같이 설계해야 해?"
+  ],
+  "symptoms": [
+    "InterruptedException을 catch하고 로그만 남겨 interrupt status를 잃어버린다",
+    "interrupt를 스레드 강제 종료로 오해해서 worker loop나 blocking call이 실제로 멈추는 조건을 설계하지 않는다",
+    "servlet timeout, Future timeout, JDBC cancel, client disconnect를 모두 thread interrupt 하나로 해결하려고 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-concurrency-utilities",
+      "language/executor-sizing-queue-rejection-policy"
+    ],
+    "next_docs": [
+      "language/completablefuture-cancellation-semantics",
+      "language/servlet-container-timeout-cancellation-boundaries-spring-mvc-virtual-threads",
+      "language/structured-concurrency-scopedvalue",
+      "language/virtual-threads-project-loom"
+    ],
+    "confusable_with": [
+      "language/completablefuture-cancellation-semantics",
+      "language/servlet-container-timeout-cancellation-boundaries-spring-mvc-virtual-threads",
+      "language/structured-concurrency-scopedvalue",
+      "language/java-concurrency-utilities",
+      "language/locksupport-park-unpark-permit-semantics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/language/java/thread-interruption-cooperative-cancellation-playbook.md",
+    "revision_history": []
+  }
+}

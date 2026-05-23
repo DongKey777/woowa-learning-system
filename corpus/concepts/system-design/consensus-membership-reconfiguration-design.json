@@ -1,0 +1,52 @@
+{
+  "id": "system-design/consensus-membership-reconfiguration-design",
+  "title": "Consensus Membership Reconfiguration 설계",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "이 문서는 system-design 카테고리에서 Consensus Membership Reconfiguration 설계를 다루는 deep_dive 문서다. consensus membership reconfiguration은 quorum 시스템의 노드 추가·제거·교체를 split brain 없이 안전하게 수행하기 위해, joint consensus와 learner 단계, 승격 조건을 관리하는 상태 변경 절차다. 검색 질의가 consensus membership reconfiguration, quorum, joint consensus, raft membership change처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "body_markdown": "# Consensus Membership Reconfiguration 설계\n\n> 한 줄 요약: consensus membership reconfiguration은 quorum 시스템의 노드 추가·제거·교체를 split brain 없이 안전하게 수행하기 위해, joint consensus와 learner 단계, 승격 조건을 관리하는 상태 변경 절차다.\n\nretrieval-anchor-keywords: consensus membership reconfiguration, quorum, joint consensus, raft membership change, learner replica, majority, leader transfer, split brain avoidance, cluster reconfig, voter promotion\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Shard Rebalancing / Partition Relocation 설계](./shard-rebalancing-partition-relocation-design.md)\n> - [Distributed Lock 설계](./distributed-lock-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Backup, Restore, Disaster Recovery Drill 설계](./backup-restore-disaster-recovery-drill-design.md)\n> - [Control Plane / Data Plane Separation 설계](./control-plane-data-plane-separation-design.md)\n\n## 핵심 개념\n\nquorum 기반 시스템에서 가장 위험한 작업 중 하나는 membership 변경이다.\n\n- 새 노드를 추가하고 싶다\n- 오래된 노드를 제거하고 싶다\n- 리전이나 zone을 교체하고 싶다\n- leader를 옮기고 싶다\n\n겉으로는 단순해 보여도 잘못하면 quorum 계산이 바뀌면서 split brain이나 availability loss가 생긴다.\n\n즉, membership reconfiguration은 \"서버 교체\"가 아니라 **합의 집합 자체를 안전하게 바꾸는 상태 전이**다.\n\n## 깊이 들어가기\n\n### 1. 왜 위험한가\n\nquorum 시스템은 누가 투표권(voter)을 가지는지에 따라 안전성이 결정된다.\n\n단순히 old config를 지우고 new config를 넣으면 다음 문제가 생길 수 있다.\n\n- 과거 leader가 여전히 자신이 합법적이라고 믿음\n- old/new 다수 집합이 서로 겹치지 않음\n- 노드 제거 중 failure가 나서 quorum 상실\n\n그래서 membership 변경은 보통 두 단계 이상으로 한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 5-node quorum cluster\n- 하루 membership change 수십 회\n- node bootstrap에 수십 GB log catch-up 필요\n- promotion 허용 lag 수 초 이하\n\n이때 봐야 할 숫자:\n\n- learner catch-up lag\n- leader transfer time\n- reconfiguration completion time\n- unavailability window\n- log replication backlog\n\nmembership 변경은 빈도는 낮지만, 한 번 실패하면 blast radius가 매우 크다.\n\n### 3. Joint consensus 또는 overlapping quorum\n\n안전한 접근의 핵심은 old와 new config가 일정 기간 겹치도록 만드는 것이다.\n\n대표 아이디어:\n\n- old config와 new config가 동시에 유효한 transition state\n- 과반수 판단이 두 집합을 모두 만족하도록 함\n- transition이 끝난 뒤에만 old config 제거\n\n이렇게 해야 old/new world가 완전히 분리되는 시점을 피할 수 있다.\n\n### 4. Learner / non-voting replica\n\n새 노드를 바로 voter로 넣으면 위험하다.\n보통은 다음 단계를 둔다.\n\n1. learner로 추가\n2. log catch-up\n3. health / lag / snapshot 검증\n4. voter로 승격\n\n즉, \"복제 준비가 된 노드\"와 \"투표권이 있는 노드\"는 다르다.\n\n### 5. Leader transfer와 write disruption\n\nmembership 변경 중 leader가 가장 바쁜 역할을 할 수 있다.\n따라서 다음을 고려한다.\n\n- low-latency follower로 leader transfer\n- catch-up이 늦은 follower는 승격 금지\n- write-heavy 시점엔 reconfiguration 연기\n\n실전에서는 membership change가 가능하더라도 트래픽 상황상 \"지금은 하면 안 되는\" 경우가 많다.\n\n### 6. Removal sequencing\n\n노드 제거 순서도 중요하다.\n\n- dead node를 먼저 뺄지\n- lagging replica를 먼저 교체할지\n- zone diversity를 유지할지\n- maintenance drain과 묶을지\n\n특히 quorum 크기를 줄이는 작업은 capacity와 안전성을 함께 떨어뜨릴 수 있으므로, replacement를 먼저 붙이고 removal을 나중에 하는 편이 많다.\n\n### 7. Observability와 runbook\n\nmembership 변경 중 꼭 봐야 할 것:\n\n- current voters / learners\n- replication lag\n- commit latency\n- leader stability\n- joint-config duration\n- pending snapshot transfer\n\n운영자는 \"지금 누가 합의 집합에 들어가 있는가\"를 즉시 답할 수 있어야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 오래된 storage node 교체\n\n문제:\n\n- 노드를 빼고 새 노드를 넣어야 한다\n\n해결:\n\n- 새 노드를 learner로 붙인다\n- snapshot과 log를 따라잡게 한다\n- health 검증 후 joint consensus로 voter 승격한다\n- old node는 마지막에 제거한다\n\n### 시나리오 2: zone maintenance\n\n문제:\n\n- 특정 zone의 voter가 일시적으로 내려갈 예정이다\n\n해결:\n\n- 다른 zone에 replacement voter를 먼저 확보한다\n- leader가 maintenance zone에 있으면 먼저 transfer한다\n- quorum-safe 상태가 확인된 뒤 drain을 시작한다\n\n### 시나리오 3: 리전 evacuation rehearsal\n\n문제:\n\n- 한 리전을 비우되 합의 안정성은 유지해야 한다\n\n해결:\n\n- learner를 타 리전에 먼저 준비한다\n- reconfiguration을 shard/cluster 단위로 점진 실행한다\n- joint config 상태를 길게 끌지 않도록 batch sizing을 조절한다\n\n## 코드로 보기\n\n```pseudo\nfunction replaceNode(oldNode, newNode):\n  addLearner(newNode)\n  waitUntil(catchupLag(newNode) < threshold)\n  enterJointConfig(oldVoters + newNode)\n  promoteToVoter(newNode)\n  removeVoter(oldNode)\n\nfunction safeToPromote(node):\n  return node.healthy &&\n         node.catchupLag < promoteLagThreshold &&\n         snapshotApplied(node)\n```\n\n```java\npublic void reconfigure(ReconfigPlan plan) {\n    membershipService.addLearner(plan.newNode());\n    membershipService.awaitCatchup(plan.newNode());\n    membershipService.enterJointConsensus(plan);\n    membershipService.finalizeConfig(plan);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Direct replace | 빠르다 | split brain / quorum risk가 크다 | 거의 권장되지 않음 |\n| Learner then promote | 안전하다 | 시간이 더 걸린다 | 대부분의 quorum 시스템 |\n| Joint consensus | 수학적으로 안전하다 | 구현 복잡도가 높다 | 성숙한 consensus cluster |\n| Maintenance freeze during reconfig | 단순하다 | 운영 유연성이 떨어진다 | 작은 클러스터 |\n\n핵심은 membership reconfiguration이 인프라 교체 작업이 아니라 **합의 집합의 안전성을 유지한 채 quorum 경계를 바꾸는 상태 머신**이라는 점이다.\n\n## 꼬리질문\n\n> Q: 새 노드를 바로 voter로 넣으면 왜 위험한가요?\n> 의도: learner 단계 필요성 이해 확인\n> 핵심: 아직 log를 충분히 따라오지 못한 노드가 quorum 판단에 들어오면 commit과 failover가 흔들릴 수 있다.\n\n> Q: joint consensus의 핵심 아이디어는 무엇인가요?\n> 의도: overlapping quorum 이해 확인\n> 핵심: old와 new config가 잠시 동시에 유효해, 어느 쪽도 고립된 다수를 만들지 못하게 하는 것이다.\n\n> Q: membership 변경 중 leader transfer는 왜 중요하나요?\n> 의도: 운영 중단 최소화 이해 확인\n> 핵심: 바쁜 leader가 reconfiguration과 heavy writes를 동시에 처리하면 latency와 안정성이 모두 악화될 수 있다.\n\n> Q: dead node를 먼저 빼는 게 항상 맞나요?\n> 의도: removal sequencing 감각 확인\n> 핵심: 상황에 따라 replacement voter를 먼저 준비하는 편이 availability와 diversity 면에서 더 안전하다.\n\n## 한 줄 정리\n\nConsensus membership reconfiguration은 learner 준비, joint consensus, 안전한 removal sequencing을 통해 quorum 시스템의 노드 구성을 split brain 없이 바꾸는 상태 전이 설계다.\n",
+  "aliases": [
+    "consensus membership reconfiguration",
+    "quorum",
+    "joint consensus",
+    "raft membership change",
+    "learner replica",
+    "majority",
+    "leader transfer",
+    "split brain avoidance",
+    "cluster reconfig",
+    "voter promotion",
+    "Consensus Membership Reconfiguration 설계",
+    "consensus membership reconfiguration design"
+  ],
+  "expected_queries": [
+    "Consensus Membership Reconfiguration 설계 설계 핵심을 설명해줘",
+    "consensus membership reconfiguration가 왜 필요한지 알려줘",
+    "Consensus Membership Reconfiguration 설계 실무 트레이드오프는 뭐야?",
+    "consensus membership reconfiguration 설계에서 흔한 실수는 무엇이야?"
+  ],
+  "symptoms": [
+    "`Consensus Membership Reconfiguration 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
+    "`Consensus Membership Reconfiguration 설계` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
+    "`Consensus Membership Reconfiguration 설계`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
+    "운영 증상을 보면서 지연, 일관성, 용량, 장애 격리 중 어떤 설계 축을 먼저 봐야 할지 좁히지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-24",
+    "last_modified": "2026-05-24",
+    "legacy_path": "knowledge/cs/contents/system-design/consensus-membership-reconfiguration-design.md",
+    "revision_history": []
+  }
+}
