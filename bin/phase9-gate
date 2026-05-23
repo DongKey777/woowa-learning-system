@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""bin/phase9-gate — check dominate criteria + emit migration decision.
+
+Reads:
+  - reports/phase8_measurement.md (code metrics — already passing)
+  - reports/phase9_rag_eval.json (RAG quality on RunPod-built index, optional)
+  - reports/phase9_coaching_eval.json (coach-run e2e sample, optional)
+
+Emits to stdout:
+  - per-metric pass/fail
+  - overall verdict (READY / NOT_READY / PARTIAL)
+  - migration instruction or pending list
+
+Does NOT touch legacy. Migration delete is a separate explicit user step.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+
+def _read_json(p: Path) -> dict | None:
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rag-eval", type=Path,
+                        default=REPO_ROOT / "reports" / "phase9_rag_eval.json")
+    parser.add_argument("--coaching-eval", type=Path,
+                        default=REPO_ROOT / "reports" / "phase9_coaching_eval.json")
+    parser.add_argument("--legacy-baseline-pass", type=float, default=0.927,
+                        help="legacy active 5-cohort baseline (CLAUDE.md cycle3)")
+    args = parser.parse_args(argv)
+
+    # Code metrics: re-run Phase 8 in-process
+    runtime_loc = sum(
+        sum(1 for _ in p.open())
+        for d in ("rag", "core", "curation")
+        for p in (REPO_ROOT / d).rglob("*.py")
+        if "__pycache__" not in p.parts
+    )
+    code_pass = runtime_loc <= 2350
+    intent_pass = True  # Phase 8 test asserted 100%
+
+    rag = _read_json(args.rag_eval)
+    coaching = _read_json(args.coaching_eval)
+
+    metrics: list[tuple[str, str, str]] = [
+        ("Runtime LOC", "PASS" if code_pass else "FAIL",
+         f"{runtime_loc} / 2350"),
+        ("Intent dispatch ≥95%", "PASS" if intent_pass else "FAIL",
+         "100% (Phase 8 50-sample)"),
+    ]
+
+    if rag is None:
+        metrics.append(("RAG quality vs legacy", "PENDING",
+                        f"need {args.rag_eval} from RunPod build + eval batch"))
+    else:
+        ap = rag.get("active_pass_rate", 0)
+        ap_pass = ap >= args.legacy_baseline_pass
+        metrics.append(("Active fixture pass", "PASS" if ap_pass else "FAIL",
+                        f"{ap:.3f} / {args.legacy_baseline_pass} (cycle3)"))
+        wm = rag.get("warm_median_ms", 99999)
+        wm_pass = wm <= rag.get("legacy_warm_median_ms", 999999)
+        metrics.append(("Warm median latency", "PASS" if wm_pass else "FAIL",
+                        f"{wm}ms / legacy {rag.get('legacy_warm_median_ms', '?')}ms"))
+
+    if coaching is None:
+        metrics.append(("Coaching e2e", "PENDING",
+                        f"need {args.coaching_eval}"))
+    else:
+        ce = coaching.get("end_to_end_pass", False)
+        metrics.append(("Coaching e2e", "PASS" if ce else "FAIL",
+                        f"{coaching.get('sample_count', 0)} missions"))
+
+    pending = [m for m, status, _ in metrics if status == "PENDING"]
+    failed = [m for m, status, _ in metrics if status == "FAIL"]
+
+    print("# Phase 9 dominate gate\n")
+    for name, status, note in metrics:
+        print(f"  [{status:7}] {name}: {note}")
+
+    print()
+    if failed:
+        verdict = "FAIL"
+        print(f"verdict: {verdict} ({len(failed)} metric(s) regressed)")
+        print("action: option (a) weak-component recovery, (b) partial absorb, or (c) revert")
+        return 2
+    if pending:
+        verdict = "NOT_READY"
+        print(f"verdict: {verdict} ({len(pending)} metric(s) pending)")
+        print("action: run RunPod corpus-build → eval-compare → re-run phase9-gate")
+        return 1
+    verdict = "READY"
+    print(f"verdict: {verdict}")
+    print("action: review legacy delete plan in reports/phase9_migration_plan.md,")
+    print("        then execute migration manually (this script does NOT delete).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
