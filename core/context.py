@@ -36,11 +36,20 @@ def collect_cs_qa_context(
     prompt: str,
     learner_id: str,
     state_root: Path = DEFAULT_STATE_ROOT,
+    rerank: bool = True,
     **search_kwargs: Any,
 ) -> dict[str, Any]:
-    """Pure CS question — RAG search + personalization adjust."""
+    """Pure CS question — RAG search → rerank → personalization adjust."""
     profile = load_profile(learner_id, state_root=state_root)
-    hits = search(prompt, **search_kwargs)
+    rerank_fn = None
+    corpus = None
+    if rerank:
+        from rag.corpus_loader import load_corpus
+        from rag.reranker import make_rerank_fn
+
+        corpus = load_corpus(strict=True)
+        rerank_fn = make_rerank_fn(corpus)
+    hits = search(prompt, corpus=corpus, rerank_fn=rerank_fn, **search_kwargs)
     adjusted = adjust(
         hits,
         mastered_concepts=profile.mastered_concepts,
