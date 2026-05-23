@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""bin/corpus-curate — orchestrate AI session corpus curation loop.
+
+Pipeline:
+  1. mine_history.mine(history_path)         → MinedSignal list
+  2. propose_changes.build_proposal_prompt() → markdown prompt for AI session
+  3. AI session emits JSON proposals
+  4. parse_proposals(json_text)              → ProposedChange list
+  5. apply(proposals)                        → mutate corpus + report
+
+Default operation produces (1) and (2) only — AI session reads the prompt,
+then re-invokes bin/corpus-curate --apply <proposals.json> for step 5.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from curation.apply_changes import apply  # noqa: E402
+from curation.mine_history import mine  # noqa: E402
+from curation.propose_changes import build_proposal_prompt, parse_proposals  # noqa: E402
+from rag.corpus_loader import DEFAULT_CORPUS_DIR, load_corpus  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--history", type=Path, default=Path("state/learner/history.jsonl"))
+    parser.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR)
+    parser.add_argument("--out", type=Path, default=Path("state/curation/round.md"),
+                        help="output markdown prompt path")
+    parser.add_argument("--apply", type=Path, default=None,
+                        help="apply proposals JSON instead of mining")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.apply:
+        text = args.apply.read_text(encoding="utf-8")
+        proposals = parse_proposals(text)
+        result = apply(proposals, corpus_dir=args.corpus_dir, dry_run=args.dry_run)
+        print(f"Applied: {len(result.applied)}")
+        print(f"Skipped: {len(result.skipped)}")
+        for ch, reason in result.skipped[:10]:
+            print(f"  skip {ch.target_concept_id} ({ch.operation}): {reason}")
+        return 0 if not result.skipped else 1
+
+    signals = mine(args.history)
+    print(f"Mined {len(signals)} signals from {args.history}")
+    if not signals:
+        print("No signals — corpus is healthy or history is too thin.")
+        return 0
+
+    corpus = load_corpus(corpus_dir=args.corpus_dir, strict=False)
+    snippets = {
+        s.target_concept_id: corpus.concepts[s.target_concept_id]
+        for s in signals if s.target_concept_id in corpus.concepts
+    }
+    prompt = build_proposal_prompt(signals, snippets)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(prompt, encoding="utf-8")
+    print(f"Wrote prompt: {args.out}")
+    print("AI session: read prompt, emit JSON proposals to a file, then:")
+    print(f"  bin/corpus-curate --apply <proposals.json>")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
