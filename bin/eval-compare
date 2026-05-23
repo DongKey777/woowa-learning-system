@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""bin/eval-compare — generate side-by-side judge prompts for legacy vs new.
+
+Pipeline:
+  1. Read eval queries from --query-set JSONL ([{query, expected_concept_ids?}])
+  2. For each query: run bin/ask (new) and optionally `legacy-hub/bin/rag-ask`
+  3. Capture retrieved top-K + answer reference for each
+  4. Build EvalSample + judge prompt batches → write JudgmentBatch
+  5. AI session in a follow-up turn opens the batch, emits judgments
+
+Run after Phase 8: AI session reads the batch file, judges each sample,
+appends results, recomputes 3-round majority.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from rag.eval import EvalSample, JudgmentBatch, build_judge_prompt  # noqa: E402
+
+DEFAULT_LEGACY_HUB = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
+
+
+def _run_new_ask(query: str, learner_id: str, repo: str | None) -> dict:
+    """Capture bin/ask prompt block for `next` system."""
+    cmd = [sys.executable, str(REPO_ROOT / "bin" / "ask"),
+           query, "--learner-id", learner_id, "--json-decision"]
+    if repo:
+        cmd.extend(["--repo", repo])
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                          env={"PYTHONPATH": str(REPO_ROOT)})
+    return {"stdout": proc.stdout, "stderr": proc.stderr, "returncode": proc.returncode}
+
+
+def _run_legacy_rag_ask(query: str, legacy_hub: Path) -> dict:
+    """Capture legacy bin/rag-ask JSON output."""
+    legacy_cmd = legacy_hub / "bin" / "rag-ask"
+    if not legacy_cmd.exists():
+        return {"stdout": "", "stderr": f"legacy bin/rag-ask not found at {legacy_cmd}", "returncode": -1}
+    proc = subprocess.run([str(legacy_cmd), query], capture_output=True, text=True, timeout=120)
+    return {"stdout": proc.stdout, "stderr": proc.stderr, "returncode": proc.returncode}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--query-set", type=Path, required=True,
+                        help="JSONL with {query, expected_concept_ids?}")
+    parser.add_argument("--learner-id", default="default")
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--legacy-hub", type=Path, default=DEFAULT_LEGACY_HUB)
+    parser.add_argument("--skip-legacy", action="store_true",
+                        help="skip legacy comparison (next-only baseline)")
+    parser.add_argument("--out", type=Path, required=True,
+                        help="output path for JudgmentBatch JSON")
+    args = parser.parse_args(argv)
+
+    samples: list[EvalSample] = []
+    raw_runs: list[dict] = []
+    queries = [json.loads(l) for l in args.query_set.read_text().splitlines() if l.strip()]
+    for i, q in enumerate(queries):
+        query = q["query"]
+        expected = q.get("expected_concept_ids", [])
+        next_run = _run_new_ask(query, args.learner_id, args.repo)
+        legacy_run = (None if args.skip_legacy
+                      else _run_legacy_rag_ask(query, args.legacy_hub))
+        sid_next = f"eval-{i:04d}-next"
+        sid_legacy = f"eval-{i:04d}-legacy"
+        samples.append(EvalSample(
+            sample_id=sid_next,
+            query=query,
+            expected_concept_ids=expected,
+            retrieved_hits=[],  # AI judge fills from stdout if needed
+            answer_text=next_run["stdout"],
+        ))
+        if legacy_run:
+            samples.append(EvalSample(
+                sample_id=sid_legacy,
+                query=query,
+                expected_concept_ids=expected,
+                retrieved_hits=[],
+                answer_text=legacy_run["stdout"],
+            ))
+        raw_runs.append({"query": query, "next": next_run, "legacy": legacy_run})
+
+    batch = JudgmentBatch(samples=samples, judgments=[])
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    batch.write(args.out)
+    judge_prompts = [build_judge_prompt(s) for s in samples]
+    args.out.with_suffix(".prompts.md").write_text(
+        "\n\n---\n\n".join(judge_prompts), encoding="utf-8"
+    )
+    args.out.with_suffix(".runs.json").write_text(
+        json.dumps(raw_runs, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"wrote batch: {args.out} (samples={len(samples)})")
+    print(f"wrote prompts: {args.out.with_suffix('.prompts.md')}")
+    print(f"wrote raw runs: {args.out.with_suffix('.runs.json')}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
