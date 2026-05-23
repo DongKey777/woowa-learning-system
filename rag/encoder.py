@@ -19,13 +19,28 @@ MODEL_ID = "BAAI/bge-m3"
 EMBED_DIM = 1024
 
 
+def _resolve_device() -> str:
+    """Pick device: explicit env override → cuda → mps → cpu."""
+    override = os.environ.get("WOOWA_ENCODER_DEVICE")
+    if override:
+        return override
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 @lru_cache(maxsize=1)
 def _get_model():
     """Module-level lazy singleton — first call downloads + loads BGE-M3."""
     from sentence_transformers import SentenceTransformer
 
-    device = os.environ.get("WOOWA_ENCODER_DEVICE", "mps")
-    return SentenceTransformer(MODEL_ID, device=device)
+    return SentenceTransformer(MODEL_ID, device=_resolve_device())
 
 
 def encode(texts: list[str], batch_size: int = 16, normalize: bool = True) -> "np.ndarray":
