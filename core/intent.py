@@ -22,12 +22,18 @@ from dataclasses import dataclass
 # D6: ONLY tool tokens kept (legacy CS_DOMAIN/LEARNING/DEPTH lexicons removed)
 TOOL_TOKENS = (
     "gradle", "maven", "git ", "github actions", "intellij", "vscode",
-    "homebrew", "brew install", "npm install", "pip install",
-    "docker run", "docker-compose", "kubectl",
+    "homebrew", "brew install", "brew ", "npm install", "npm ", "pip install", "pip ",
+    "docker run", "docker-compose", "docker ", "kubectl",
 )
 
-RETRO_KEYWORDS = ("회고", "반복", "내 pr", "정밀", "내가 놓친", "pr 흐름", "내 흐름", "pr 타임라인")
-COACHING_KEYWORDS = ("코칭", "리뷰", "어떻게 해야", "내 코드", "내 작업", "리팩토링", "고치", "PR", "어떻게 짜")
+RETRO_KEYWORDS = (
+    "회고", "반복", "내 pr", "정밀", "내가 놓친", "pr 흐름", "내 흐름", "pr 타임라인",
+    "사이클", "이전 pr", "내가 받은", "pr 시리즈", "활동 요약", "history",
+)
+COACHING_KEYWORDS = (
+    "코칭", "리뷰", "어떻게 해야", "내 코드", "내 작업", "리팩토링", "고치",
+    "어떻게 짜",
+)
 
 SCORE_LIKE_PATTERN = re.compile(r"^\s*(\d{1,2})\s*점\s*$|^\s*잘\s*몰라|^\s*모르겠어|^\s*([0-9]\s*/\s*10)\s*$")
 DRILL_ANSWER_HINT_PATTERN = re.compile(r"(은|는|이|가)\s.{6,}", re.MULTILINE)

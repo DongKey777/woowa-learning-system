@@ -19,7 +19,7 @@ from core.intent import IntentDecision, detect_mode
 
 # F11 explicit triggers — line-level cross-crew/reviewer analysis intent
 F11_KEYWORDS = (
-    "정밀 비교", "정밀비교", "review thread", "리뷰 의견", "리뷰어 의견",
+    "정밀 비교", "정밀비교", "정밀", "review thread", "리뷰 의견", "리뷰어 의견",
     "다른 크루 리뷰", "다른 크루 의견", "다른 크루는", "다른 사람들은",
     "cross-crew", "anchor", "앵커", "비교 의견", "다른 reviewer",
     "다양한 시각", "여러 의견",
