@@ -22,6 +22,18 @@ RELATIONS_DECAY = 0.7
 DEFAULT_TOP_K = 5
 DEFAULT_RELATIONS_EXPAND = 5
 
+# Module-level Lance table cache (daemon side hot path; 0.6ms/call → 0)
+_TABLE_CACHE: dict[str, object] = {}
+
+
+def _cached_open_index(index_dir: Path):
+    """Module-level cache — Lance table handle reused across searches.
+    LanceDB connection is lightweight + thread-safe for reads."""
+    key = str(index_dir)
+    if key not in _TABLE_CACHE:
+        _TABLE_CACHE[key] = open_index(index_dir=index_dir)
+    return _TABLE_CACHE[key]
+
 
 @dataclass(frozen=True)
 class SearchHit:
@@ -53,7 +65,7 @@ def search(
         encode_fn = encode_query
     q_vec = np.asarray(encode_fn(query), dtype=np.float32)
 
-    table = open_index(index_dir=index_dir)
+    table = _cached_open_index(index_dir)
     raw = table.search(q_vec).metric("cosine").limit(top_k).to_pandas()
 
     dense_hits: list[SearchHit] = []
