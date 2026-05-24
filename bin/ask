@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""bin/ask — single learner/AI entry point (D13 unified).
+"""bin/ask — single learner entry point (paradigm-v2).
 
-Pipeline:
-  args → intent.detect_mode → context.collect_*() → prompt.build() → stdout
+Pipeline (D-A hybrid paradigm):
+  args → router.route → lazy_loader.load → coach.compose → stdout
 
-The AI session reads the printed markdown prompt, writes the learner-facing
-answer, then optionally calls `bin/learn-event` to record the turn.
+The AI session reads the printed multi-agent prompt and writes the
+learner-facing answer in the same turn, then optionally records via
+`bin/learn-event` for the Bloom mastery autoloop.
 """
 from __future__ import annotations
 
@@ -17,60 +18,47 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from core import context as ctx_mod  # noqa: E402
-from core.intent import detect_mode  # noqa: E402
-from core.prompt import build  # noqa: E402
-from core.state import DEFAULT_STATE_ROOT, load_profile, load_repo_state  # noqa: E402
+from core.coach import compose  # noqa: E402
+from core.lazy_loader import load  # noqa: E402
+from core.router import route  # noqa: E402
+from core.state import DEFAULT_STATE_ROOT, load_profile, read_history  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prompt", type=str, help="learner natural-language prompt")
+    parser.add_argument("prompt", type=str)
     parser.add_argument("--repo", type=str, default=None)
     parser.add_argument("--learner-id", type=str, default="default")
-    parser.add_argument("--peer-pr", action="append", type=int, default=None)
-    parser.add_argument("--json-decision", action="store_true",
-                        help="emit IntentDecision as first line for AI session inspection")
+    parser.add_argument("--json-route", action="store_true",
+                        help="emit RouteDecision JSON as first line")
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     args = parser.parse_args(argv)
 
     profile = load_profile(args.learner_id, state_root=args.state_root)
-    repo_state = load_repo_state(args.repo, state_root=args.state_root) if args.repo else None
-
-    decision = detect_mode(
+    decision = route(
         args.prompt,
         repo=args.repo,
         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
-        pending_drill=(repo_state.threads if repo_state else None) and profile.pending_triggers.get("review_drill"),
+        pending_drill=profile.pending_triggers.get("review_drill"),
     )
 
-    if decision.mode == "cs_qa":
-        context = ctx_mod.collect_cs_qa_context(args.prompt, learner_id=args.learner_id, state_root=args.state_root)
-    elif decision.mode == "coaching":
-        context = ctx_mod.collect_coaching_context(
-            args.prompt, repo=args.repo, learner_id=args.learner_id,
-            peer_pr_numbers=args.peer_pr, state_root=args.state_root,
-        )
-    elif decision.mode == "drill":
-        context = ctx_mod.collect_drill_context(args.learner_id, state_root=args.state_root)
-    elif decision.mode == "retro":
-        if not args.repo:
-            print("ERROR: --repo required for retro mode", file=sys.stderr)
-            return 2
-        context = ctx_mod.collect_retro_context(args.repo, args.learner_id, state_root=args.state_root)
-    elif decision.mode == "self_assess":
-        context = ctx_mod.collect_self_assess_context(args.learner_id, state_root=args.state_root)
-    elif decision.mode == "tool_only":
-        context = {"prompt": args.prompt}
-    else:
-        print(f"ERROR: unhandled mode {decision.mode}", file=sys.stderr)
+    if decision.mode == "retro" and not args.repo:
+        print("ERROR: --repo required for retro mode", file=sys.stderr)
         return 2
 
-    if args.json_decision:
-        print("# IntentDecision: " + json.dumps({
-            "mode": decision.mode, "reason": decision.reason, "confidence": decision.confidence,
+    artifacts = load(decision, repo=args.repo, state_root=args.state_root)
+    recent = read_history(args.state_root)[-20:]
+
+    if args.json_route:
+        print("# RouteDecision: " + json.dumps({
+            "mode": decision.mode,
+            "personas": decision.personas,
+            "budget_tokens": decision.budget_tokens,
+            "lazy_artifacts": decision.lazy_artifacts,
+            "reason": decision.reason,
         }, ensure_ascii=False))
-    print(build(decision.mode, context))
+    print(compose(decision, artifacts, args.prompt, repo=args.repo,
+                  learner_id=args.learner_id, recent_history=recent))
     return 0
 
 

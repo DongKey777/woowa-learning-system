@@ -1,16 +1,17 @@
-"""Phase 8 code-metrics gate — runtime LOC + entry-point count + corpus storage.
+"""Phase 8 code-metrics gate (paradigm-v2 updated budgets).
 
-Compares the new system against plan targets (`misty-giggling-valley.md`):
-- Total runtime LOC ≤ 2350 (legacy ~80K)
-- Single learner entry point (`bin/ask`) + 3 maintenance entries
-- Corpus size baseline measured (no ceiling yet)
+Plan misty-giggling-valley.md §D-I — 사용자 동의 자유 확장. paradigm-v2 added:
+- mission/ (F10 forward + graph)
+- anchors/ (F11 4-stage)
+- core/{router,lazy_loader,coach,feedback,mastery}.py
+Per-feature ≤500 LOC; total runtime ≤4000 (vs legacy 80K = -95%).
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNTIME_DIRS = ("rag", "core", "curation")
+RUNTIME_DIRS = ("rag", "core", "curation", "mission", "anchors")
 ENTRY_DIR = REPO_ROOT / "bin"
 CORPUS_DIR = REPO_ROOT / "corpus" / "concepts"
 
@@ -25,31 +26,31 @@ def _count_python_loc(root: Path) -> int:
     return total
 
 
-def test_runtime_loc_under_plan_target() -> None:
+def test_runtime_loc_under_paradigm_v2_budget() -> None:
     total = sum(_count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS)
-    assert total <= 2350, f"runtime LOC {total} exceeds plan target 2350"
+    assert total <= 4000, f"runtime LOC {total} exceeds paradigm-v2 budget 4000"
 
 
 def test_per_module_loc_breakdown_within_plan() -> None:
-    """Report (and assert reasonable) per-module LOC for plan accounting."""
+    """Plan §D-I — per-module budget after paradigm-v2 expansion."""
     breakdown = {d: _count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS}
-    # Plan targets: rag ≤400, core ≤1500, curation ≤250
-    assert breakdown["rag"] <= 800, f"rag {breakdown['rag']} > 800 (eval+search bloat)"
-    assert breakdown["core"] <= 1500, f"core {breakdown['core']} > 1500"
+    assert breakdown["rag"] <= 800, f"rag {breakdown['rag']} > 800"
+    assert breakdown["core"] <= 2000, f"core {breakdown['core']} > 2000 (paradigm-v2 added 5 modules)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
+    assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
+    assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"
 
 
 def test_entry_point_count() -> None:
-    """Plan D13: 1 learner entry (`ask`) + maintenance (`corpus-build`,
-    `corpus-curate`, `eval-compare`, `learn-event`)."""
+    """Plan D13: 1 learner entry (`ask`) + maintenance entries."""
     entries = sorted(p.name for p in ENTRY_DIR.iterdir() if p.is_file() and not p.name.startswith("."))
     learner_facing = {"ask"}
-    maintenance = {"corpus-build", "corpus-curate", "eval-compare", "learn-event"}
+    maintenance = {"corpus-build", "corpus-curate", "eval-compare", "learn-event",
+                   "graph-build", "phase9-gate"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)
     assert not missing, f"missing entries: {missing}"
-    # extras allowed (e.g. future bootstrap-repo) but flag if surprising
     assert len(extras) <= 2, f"too many extras: {extras}"
 
 
