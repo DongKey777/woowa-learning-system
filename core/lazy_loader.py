@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -100,7 +101,14 @@ def _load_mastery(state_root: Path) -> dict:
 def _load_concept_graph(path: Path) -> dict:
     if not path.exists():
         return {"version": "missing", "nodes": {}, "edges": {}}
-    return json.loads(path.read_text(encoding="utf-8"))
+    mtime = path.stat().st_mtime
+    return _load_concept_graph_cached(str(path), mtime)
+
+
+@lru_cache(maxsize=2)
+def _load_concept_graph_cached(path_str: str, mtime: float) -> dict:
+    """mtime as cache key — auto-invalidates when concept_graph rebuilt."""
+    return json.loads(Path(path_str).read_text(encoding="utf-8"))
 
 
 def _load_mission_patterns(repo: str | None, state_root: Path) -> dict:

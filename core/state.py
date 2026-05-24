@@ -110,12 +110,41 @@ def append_history_event(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> 
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def read_history(state_root: Path = DEFAULT_STATE_ROOT) -> list[dict]:
+def read_history(
+    state_root: Path = DEFAULT_STATE_ROOT,
+    tail: int | None = None,
+) -> list[dict]:
+    """Read events from history.jsonl.
+
+    When tail=N, seek from end and parse only the last N events
+    (avoids parsing the full file — 9999 lines parse ~77ms → ~5ms).
+    """
     p = _history_path(state_root)
     if not p.exists():
         return []
+    if tail is None:
+        # Full read (back-compat)
+        out: list[dict] = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+    # Tail mode — seek-from-end, read last chunk (~500 bytes per event)
+    size = p.stat().st_size
+    chunk = min(size, max(tail * 500, 4096))
+    with p.open("rb") as f:
+        f.seek(max(0, size - chunk))
+        data = f.read()
+    raw_lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > chunk and raw_lines:
+        # First line may be partial — drop it
+        raw_lines = raw_lines[1:]
     out: list[dict] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
+    for line in raw_lines[-tail:]:
         if not line.strip():
             continue
         try:
