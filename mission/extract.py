@@ -117,19 +117,19 @@ IMPORT_PATTERN = re.compile(r"^\s*import\s+([\w.]+)\s*;")
 IMPORT_TRIGGERED_METHODS: dict[str, list[tuple[re.Pattern, str]]] = {
     "JdbcTemplate": [
         (re.compile(r"\.\s*(query|queryForObject|queryForList|update|batchUpdate)\s*\("),
-         "database/jdbc-basics"),
+         "database/jdbc-jpa-mybatis-basics"),
     ],
     "NamedParameterJdbcTemplate": [
         (re.compile(r"\.\s*(query|queryForObject|update|batchUpdate)\s*\("),
-         "database/jdbc-basics"),
+         "database/jdbc-jpa-mybatis-basics"),
     ],
     "EntityManager": [
         (re.compile(r"\.\s*(persist|merge|remove|find|createQuery)\s*\("),
-         "database/jpa-basics"),
+         "database/jdbc-jpa-mybatis-basics"),
     ],
     "Stream": [
         (re.compile(r"\.\s*(filter|map|collect|reduce|sorted)\s*\("),
-         "language/stream-api-basics"),
+         "language/stream-filter-vs-map-decision-mini-card"),
     ],
 }
 
