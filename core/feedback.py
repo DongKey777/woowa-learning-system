@@ -1,0 +1,133 @@
+"""Per-turn evidence write → auto mastery promotion (D-C, fixes mastered=0).
+
+Mapping: learner event → mastery evidence source.
+
+Called automatically at the end of every learner turn (via bin/learn-event or
+inline from bin/ask). Also offers `replay_history` to backfill the broken
+`mastered=0` profile from the existing 9992 history.jsonl events.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable
+
+from core.mastery import DEFAULT_STATE_ROOT, promote, record_evidence
+from core.state import read_history
+
+EVENT_TO_SOURCE: dict[str, str] = {
+    "code_attempt": "mission_use",
+    "rag_ask": "mission_use",
+    "coach_run": "mission_use",
+    "drill_answer": "drill_score",
+    "self_assessment": "self_assess",
+}
+
+
+def record_turn(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> list[tuple[str, str]]:
+    """Convert one event → evidence + auto-promote affected concepts.
+
+    Returns list of (concept_id, new_bloom_level) for the concepts touched.
+    """
+    et = event.get("event_type")
+    if et not in EVENT_TO_SOURCE:
+        return []
+    payload = event.get("payload") or {}
+    source = EVENT_TO_SOURCE[et]
+    ts = event.get("ts")
+
+    concepts = _extract_concepts(payload)
+    score = _extract_score(payload, source)
+
+    promoted: list[tuple[str, str]] = []
+    for cid in concepts:
+        if not cid:
+            continue
+        record_evidence(cid, source=source, score=score, payload=payload, state_root=state_root, ts=ts)
+        new_level = promote(cid, state_root=state_root, now=ts)
+        promoted.append((cid, new_level))
+    return promoted
+
+
+def ingest_pr_merge(
+    concept_ids: Iterable[str],
+    state_root: Path = DEFAULT_STATE_ROOT,
+    ts: float | None = None,
+) -> list[tuple[str, str]]:
+    """Trigger pr_merge evidence (highest weight). Called after PR merged + mentor approved."""
+    out: list[tuple[str, str]] = []
+    for cid in concept_ids:
+        if not cid:
+            continue
+        record_evidence(cid, source="pr_merge", state_root=state_root, ts=ts)
+        out.append((cid, promote(cid, state_root=state_root, now=ts)))
+    return out
+
+
+def ingest_mentor_accept(
+    concept_ids: Iterable[str],
+    state_root: Path = DEFAULT_STATE_ROOT,
+    ts: float | None = None,
+) -> list[tuple[str, str]]:
+    """Trigger mentor_accept evidence (resolved review thread)."""
+    out: list[tuple[str, str]] = []
+    for cid in concept_ids:
+        if not cid:
+            continue
+        record_evidence(cid, source="mentor_accept", state_root=state_root, ts=ts)
+        out.append((cid, promote(cid, state_root=state_root, now=ts)))
+    return out
+
+
+def replay_history(state_root: Path = DEFAULT_STATE_ROOT, mode_filter: str = "learning") -> int:
+    """Backfill mastery_graph from existing history.jsonl events.
+
+    Returns count of evidence records inserted. Fixes the broken mastered=0
+    by replaying all past learning events through the new Bloom evidence model.
+    """
+    events = read_history(state_root)
+    count = 0
+    for ev in events:
+        mode = ev.get("mode")
+        if mode_filter and mode not in (mode_filter, None):
+            continue
+        if record_turn(ev, state_root=state_root):
+            count += 1
+    return count
+
+
+def _extract_concepts(payload: dict) -> list[str]:
+    """Pull concept_ids from various event payload shapes."""
+    candidates: list = []
+    candidates.extend(payload.get("cited_concepts") or [])
+    candidates.extend(payload.get("citations") or [])
+    candidates.extend(payload.get("used_concepts") or [])
+    candidates.extend(payload.get("concept_ids") or [])
+    if payload.get("concept_id"):
+        candidates.append(payload["concept_id"])
+    # normalize: strip concept: prefix, drop empties
+    out: list[str] = []
+    for c in candidates:
+        if not c:
+            continue
+        c = str(c).strip()
+        if c.startswith("concept:"):
+            c = c[len("concept:") :]
+        if c:
+            out.append(c)
+    return list(dict.fromkeys(out))  # dedupe, preserve order
+
+
+def _extract_score(payload: dict, source: str) -> float:
+    """Normalize score to 0..1 for record_evidence weight scaling."""
+    if source != "drill_score":
+        return 1.0
+    raw = payload.get("score")
+    if raw is None:
+        return 1.0
+    try:
+        s = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if s > 1.0:  # legacy 10-point scale
+        s = s / 10.0
+    return max(0.0, min(1.0, s))
