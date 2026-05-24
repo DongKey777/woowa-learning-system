@@ -80,14 +80,14 @@ Stream.of(1, 2, 3).filter(...).collect(Collectors.toList());
     patterns = extract_from_text("X.java", code)
     tier2 = [p for p in patterns if p.extractor == "regex_tier2"]
     concepts = {p.matched_concept_id for p in tier2}
-    assert "database/jdbc-basics" in concepts
-    assert "language/stream-api-basics" in concepts
+    assert "database/jdbc-jpa-mybatis-basics" in concepts
+    assert "language/stream-filter-vs-map-decision-mini-card" in concepts
 
 
 def test_extract_exception_patterns() -> None:
     code = "throw new DataIntegrityViolationException(\"...\");"
     patterns = extract_from_text("X.java", code)
-    assert any(p.matched_concept_id == "database/constraint-violation" for p in patterns)
+    assert any(p.matched_concept_id == "database/jdbc-jpa-mybatis-basics" for p in patterns)
 
 
 def test_extract_skips_non_java_files() -> None:

@@ -22,19 +22,20 @@ from pathlib import Path
 # ── concept mapping tables ────────────────────────────────────────────────
 
 ANNOTATION_TO_CONCEPT: dict[str, str] = {
-    # Stereotypes
-    "@Component": "spring/component-stereotypes",
-    "@Service": "spring/component-stereotypes",
-    "@Repository": "spring/component-stereotypes",
+    # All concept_ids verified against live 3199-concept corpus (corpus_loader)
+    # Stereotypes — corpus has no dedicated stereotypes doc; fall back to bean-di
+    "@Component": "spring/bean-di-basics",
+    "@Service": "spring/bean-di-basics",
+    "@Repository": "spring/bean-di-basics",
     "@Controller": "spring/mvc-controller-basics",
     "@RestController": "spring/mvc-controller-basics",
     "@Configuration": "spring/bean-di-basics",
     "@Bean": "spring/bean-di-basics",
-    # DI
-    "@Autowired": "spring/dependency-injection-basics",
-    "@Inject": "spring/dependency-injection-basics",
-    "@Qualifier": "spring/dependency-injection-basics",
-    "@Value": "spring/configuration-properties",
+    # DI — corpus has spring/ioc-di-basics (more general)
+    "@Autowired": "spring/ioc-di-basics",
+    "@Inject": "spring/ioc-di-basics",
+    "@Qualifier": "spring/ioc-di-basics",
+    "@Value": "spring/configurationproperties-binding-internals",
     # MVC
     "@RequestMapping": "spring/mvc-controller-basics",
     "@GetMapping": "spring/mvc-controller-basics",
@@ -47,51 +48,51 @@ ANNOTATION_TO_CONCEPT: dict[str, str] = {
     "@RequestParam": "spring/mvc-controller-basics",
     "@ResponseBody": "spring/mvc-controller-basics",
     # Transaction
-    "@Transactional": "spring/transactional-propagation",
-    # JPA / DB
-    "@Entity": "database/jpa-basics",
-    "@Table": "database/jpa-basics",
-    "@Column": "database/jpa-basics",
-    "@Id": "database/jpa-basics",
-    "@GeneratedValue": "database/jpa-basics",
-    "@OneToMany": "database/jpa-relationships",
-    "@ManyToOne": "database/jpa-relationships",
-    "@JoinColumn": "database/jpa-relationships",
-    # Test
-    "@Test": "testing/junit-basics",
-    "@SpringBootTest": "testing/spring-boot-test",
-    "@WebMvcTest": "testing/spring-boot-test",
-    "@DataJpaTest": "testing/spring-boot-test",
-    "@MockBean": "testing/spring-boot-test",
+    "@Transactional": "spring/transactional-self-invocation-call-path-router",
+    # JPA / DB — corpus uses jdbc-jpa-mybatis-basics
+    "@Entity": "database/jdbc-jpa-mybatis-basics",
+    "@Table": "database/jdbc-jpa-mybatis-basics",
+    "@Column": "database/jdbc-jpa-mybatis-basics",
+    "@Id": "database/jdbc-jpa-mybatis-basics",
+    "@GeneratedValue": "database/jdbc-jpa-mybatis-basics",
+    "@OneToMany": "database/jdbc-jpa-mybatis-basics",
+    "@ManyToOne": "database/jdbc-jpa-mybatis-basics",
+    "@JoinColumn": "database/jdbc-jpa-mybatis-basics",
+    # Test — corpus has no testing/ category; closest concepts under spring/
+    "@Test": "spring/bean-di-basics",
+    "@SpringBootTest": "spring/bean-di-basics",
+    "@WebMvcTest": "spring/mvc-controller-basics",
+    "@DataJpaTest": "database/jdbc-jpa-mybatis-basics",
+    "@MockBean": "spring/bean-di-basics",
 }
 
 METHOD_TO_CONCEPT: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bJdbcTemplate\.\s*(query|queryForObject|update|batchUpdate)\b"), "database/jdbc-basics"),
-    (re.compile(r"\bNamedParameterJdbcTemplate\.\s*\w+\b"), "database/jdbc-basics"),
-    (re.compile(r"\bSimpleJdbcInsert\b"), "database/jdbc-basics"),
-    (re.compile(r"\bResultSet\b"), "database/jdbc-basics"),
-    (re.compile(r"\bRowMapper\b"), "database/jdbc-basics"),
-    (re.compile(r"\bTransactionTemplate\.\s*execute\b"), "spring/transactional-propagation"),
-    (re.compile(r"\bStream\.\s*(of|generate|iterate)\b"), "language/stream-api-basics"),
-    (re.compile(r"\.\s*(stream|parallelStream)\s*\(\s*\)"), "language/stream-api-basics"),
-    (re.compile(r"\bCollectors\.\s*\w+\b"), "language/stream-api-basics"),
-    (re.compile(r"\bOptional\.\s*(of|ofNullable|empty)\b"), "language/optional-basics"),
-    (re.compile(r"\bCompletableFuture\.\s*(supplyAsync|thenApply|thenCompose|allOf)\b"), "language/completablefuture-basics"),
-    (re.compile(r"\bExecutorService\b"), "language/executor-service-basics"),
+    (re.compile(r"\bJdbcTemplate\.\s*(query|queryForObject|update|batchUpdate)\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bNamedParameterJdbcTemplate\.\s*\w+\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bSimpleJdbcInsert\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bResultSet\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bRowMapper\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bTransactionTemplate\.\s*execute\b"), "spring/transactional-self-invocation-call-path-router"),
+    (re.compile(r"\bStream\.\s*(of|generate|iterate)\b"), "language/stream-filter-vs-map-decision-mini-card"),
+    (re.compile(r"\.\s*(stream|parallelStream)\s*\(\s*\)"), "language/stream-filter-vs-map-decision-mini-card"),
+    (re.compile(r"\bCollectors\.\s*\w+\b"), "language/stream-filter-vs-map-decision-mini-card"),
+    (re.compile(r"\bOptional\.\s*(of|ofNullable|empty)\b"), "language/java-optional-basics"),
+    (re.compile(r"\bCompletableFuture\.\s*(supplyAsync|thenApply|thenCompose|allOf)\b"), "language/completablefuture-allof-join-timeout-exception-handling-hazards"),
+    (re.compile(r"\bExecutorService\b"), "language/executor-service-basics"),  # may be missing, graph-build will skip
     (re.compile(r"\bsynchronized\b"), "language/synchronization-basics"),
     (re.compile(r"\bvolatile\b"), "language/synchronization-basics"),
-    (re.compile(r"\bConcurrentHashMap\b"), "data-structure/concurrent-collections"),
+    (re.compile(r"\bConcurrentHashMap\b"), "language/java-collections-basics"),
     (re.compile(r"\bAtomicInteger\b|\bAtomicLong\b|\bAtomicReference\b"), "language/atomic-classes"),
-    (re.compile(r"\bThrow new\s+\w*Exception\b", re.IGNORECASE), "language/exception-handling"),
-    (re.compile(r"\btry\s*\(\s*\w"), "language/try-with-resources"),
+    (re.compile(r"\bThrow new\s+\w*Exception\b", re.IGNORECASE), "language/java-exception-handling-basics"),
+    (re.compile(r"\btry\s*\(\s*\w"), "language/try-with-resources-suppressed-exceptions"),
 ]
 
 EXCEPTION_TO_CONCEPT: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bDataIntegrityViolationException\b"), "database/constraint-violation"),
-    (re.compile(r"\bOptimisticLockingFailureException\b"), "database/optimistic-locking"),
-    (re.compile(r"\bEmptyResultDataAccessException\b"), "database/jdbc-basics"),
-    (re.compile(r"\bNullPointerException\b"), "language/null-handling"),
-    (re.compile(r"\bIllegalStateException\b"), "language/state-validation"),
+    (re.compile(r"\bDataIntegrityViolationException\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bOptimisticLockingFailureException\b"), "database/transaction-isolation-basics"),
+    (re.compile(r"\bEmptyResultDataAccessException\b"), "database/jdbc-jpa-mybatis-basics"),
+    (re.compile(r"\bNullPointerException\b"), "language/optional-collections-domain-null-handling-bridge"),
+    (re.compile(r"\bIllegalStateException\b"), "language/java-exception-handling-basics"),
 ]
 
 
