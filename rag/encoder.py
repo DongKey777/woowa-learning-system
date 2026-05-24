@@ -63,7 +63,16 @@ def encode(texts: list[str], batch_size: int = 16, normalize: bool = True) -> "n
     )
 
 
-def encode_query(text: str) -> "np.ndarray":
-    """Single-query convenience wrapper → [1024] float32 vector."""
+@lru_cache(maxsize=200)
+def _encode_query_cached(text: str) -> tuple:
+    """Tuple cache key — numpy array not hashable. Returns tuple, caller converts."""
     arr = encode([text], batch_size=1)
-    return arr[0]
+    return tuple(arr[0].tolist())
+
+
+def encode_query(text: str) -> "np.ndarray":
+    """Single-query convenience wrapper → [1024] float32 vector.
+    LRU-cached (200 entries) — repeat learner queries become instant."""
+    import numpy as np
+    vec_tuple = _encode_query_cached(text)
+    return np.asarray(vec_tuple, dtype="float32")
