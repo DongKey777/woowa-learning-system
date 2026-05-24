@@ -32,7 +32,7 @@ RETRO_KEYWORDS = (
 )
 COACHING_KEYWORDS = (
     "코칭", "리뷰", "어떻게 해야", "내 코드", "내 작업", "리팩토링", "고치",
-    "어떻게 짜",
+    "어떻게 짜", "이 코드", "쓰는 게", "써야", "어떻게 써", "사용해야",
 )
 
 SCORE_LIKE_PATTERN = re.compile(r"^\s*(\d{1,2})\s*점\s*$|^\s*잘\s*몰라|^\s*모르겠어|^\s*([0-9]\s*/\s*10)\s*$")
@@ -53,6 +53,11 @@ def detect_mode(
     pending_drill: dict | None = None,
 ) -> IntentDecision:
     pl = prompt.lower()
+
+    # Short greeting / acknowledgement → tool_only (no RAG, no coaching)
+    if len(prompt.strip()) <= 3 and not any(c.isalnum() for c in prompt[-1:]) or \
+       prompt.strip() in {"안녕", "ㅋㅋ", "ㅎㅎ", "ok", "OK", "응", "넵", "넹", "ㅇㅇ"}:
+        return IntentDecision("tool_only", "short greeting / ack — no retrieval", 0.7)
 
     if pending_self_assessment and SCORE_LIKE_PATTERN.search(prompt):
         return IntentDecision("self_assess", "pending self_assessment + score-like reply", 0.95)
