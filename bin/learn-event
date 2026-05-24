@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.state import DEFAULT_STATE_ROOT, append_history_event, load_profile, save_profile  # noqa: E402
+from core.feedback import record_turn  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,24 +40,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quality-flag", action="append", default=None)
     parser.add_argument("--add-mastered", action="append", default=None)
     parser.add_argument("--add-uncertain", action="append", default=None)
+    parser.add_argument("--drill-concept", default=None,
+                        help="concept_id graded by drill (with --drill-score)")
+    parser.add_argument("--drill-score", type=float, default=None,
+                        help="0..1 (or 0..10 — auto-normalized)")
+    parser.add_argument("--self-assess-concept", default=None)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     args = parser.parse_args(argv)
 
     event_id = f"{args.event_type}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+    payload = {
+        "prompt": args.prompt,
+        "answer": args.answer,
+        "citations": args.citation or [],
+        "quality_flags": args.quality_flag or [],
+    }
+    if args.drill_concept is not None:
+        payload["concept_id"] = args.drill_concept
+        if args.drill_score is not None:
+            payload["score"] = args.drill_score
+    if args.self_assess_concept is not None:
+        payload["concept_id"] = args.self_assess_concept
+
     event = {
         "event_id": event_id,
         "event_type": args.event_type,
         "mode": args.mode,
         "learner_id": args.learner_id,
         "repo": args.repo,
-        "payload": {
-            "prompt": args.prompt,
-            "answer": args.answer,
-            "citations": args.citation or [],
-            "quality_flags": args.quality_flag or [],
-        },
+        "payload": payload,
     }
     append_history_event(event, state_root=args.state_root)
+
+    # Mastery autoloop (D-C): drill_score / self_assess / mission_use evidence
+    if args.mode == "learning":
+        promoted = record_turn(event, state_root=args.state_root)
+        if promoted:
+            for cid, level in promoted:
+                print(f"  → {cid}: {level}", flush=True)
 
     if args.mode == "learning" and (args.add_mastered or args.add_uncertain):
         profile = load_profile(args.learner_id, state_root=args.state_root)

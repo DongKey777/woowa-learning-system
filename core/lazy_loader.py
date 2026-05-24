@@ -57,7 +57,15 @@ def load(
 
 
 def _load_rag_hits(query: str, top_k: int = 5) -> list[dict]:
-    """Invoke rag.search (BGE-M3 + relations walk). Graceful empty on failure."""
+    """Invoke rag.search via daemon first (warm <2s); fall back in-process
+    (cold 7-8s BGE-M3 load) when daemon unavailable."""
+    try:
+        from core import daemon as rag_daemon
+        hits = rag_daemon.search(query, top_k=top_k, relations_expand=3)
+        if hits is not None:
+            return hits   # daemon path — warm
+    except Exception:
+        pass
     try:
         from rag.search import search
         hits = search(query, top_k=top_k, relations_expand=3)

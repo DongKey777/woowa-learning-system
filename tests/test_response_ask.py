@@ -120,7 +120,7 @@ def test_learn_event_appends_history_and_updates_profile(tmp_path: Path) -> None
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    event_id = proc.stdout.strip()
+    event_id = proc.stdout.strip().splitlines()[-1]
     assert event_id.startswith("rag_ask-")
 
     hist_lines = (tmp_path / "learner" / "history.jsonl").read_text().splitlines()
