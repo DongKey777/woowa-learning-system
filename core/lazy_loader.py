@@ -33,12 +33,12 @@ def load(
     state_root: Path = DEFAULT_STATE_ROOT,
     concept_graph_path: Path = DEFAULT_CONCEPT_GRAPH,
     query: str | None = None,
+    corpus=None,
 ) -> dict[str, Any]:
     """Return dict {artifact_name: artifact_content_or_summary}.
 
-    Each loader is graceful — missing artifact → empty/None placeholder, never
-    raise. When route.need_rag and query is supplied, also invokes
-    rag.search → "rag_hits" key (F1 retrieval gap fix).
+    When corpus is supplied (daemon ask path), uses in-process rag.search
+    instead of daemon socket — avoids daemon self-recursion deadlock.
     """
     out: dict[str, Any] = {}
     for name in route.lazy_artifacts:
@@ -53,18 +53,32 @@ def load(
         elif name == ARTIFACT_CROSS_CREW:
             out[name] = _load_cross_crew(repo, state_root)
     if route.need_rag and query:
-        out["rag_hits"] = _load_rag_hits(query)
+        out["rag_hits"] = _load_rag_hits(query, corpus=corpus)
     return out
 
 
-def _load_rag_hits(query: str, top_k: int = 5) -> list[dict]:
-    """Invoke rag.search via daemon first (warm <2s); fall back in-process
-    (cold 7-8s BGE-M3 load) when daemon unavailable."""
+def _load_rag_hits(query: str, top_k: int = 5, corpus=None) -> list[dict]:
+    """Invoke rag.search.
+
+    Priority: (1) in-process if corpus injected (daemon ask path — avoids
+    self-recursion), (2) daemon socket (bin/ask fallback warm path),
+    (3) in-process cold (daemon unavailable).
+    """
+    if corpus is not None:
+        # In-process path (daemon ask handler injects corpus)
+        try:
+            from rag.search import search
+            hits = search(query, top_k=top_k, relations_expand=3, corpus=corpus)
+            return [{"concept_id": h.concept_id, "score": round(h.score, 4),
+                     "category": h.category, "title": h.title, "source": h.source}
+                    for h in hits]
+        except Exception as exc:
+            return [{"error": f"rag.search failed: {exc!s}"}]
     try:
         from core import daemon as rag_daemon
         hits = rag_daemon.search(query, top_k=top_k, relations_expand=3)
         if hits is not None:
-            return hits   # daemon path — warm
+            return hits
     except Exception:
         pass
     try:

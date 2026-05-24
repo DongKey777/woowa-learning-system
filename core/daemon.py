@@ -55,16 +55,50 @@ def search(
         req = json.dumps({"action": "search", "query": query, "top_k": top_k,
                           "relations_expand": relations_expand}) + "\n"
         sock.sendall(req.encode("utf-8"))
-        # read until newline
+        sock.shutdown(socket.SHUT_WR)
         data = b""
-        while b"\n" not in data:
-            chunk = sock.recv(8192)
+        while True:
+            chunk = sock.recv(65536)
             if not chunk:
                 break
             data += chunk
         sock.close()
         resp = json.loads(data.decode("utf-8").strip())
         return resp.get("hits", [])
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def ask(
+    prompt: str,
+    repo: str | None = None,
+    learner_id: str = "default",
+    state_root: Path = DEFAULT_STATE_ROOT,
+) -> dict | None:
+    """Full ask pipeline via daemon. Returns None if daemon unavailable.
+
+    Reads until socket close (server closes after sendall) — JSON contains
+    raw \\n in escaped form, so newline-delimited not safe for large payloads.
+    """
+    sp = _socket_path(state_root)
+    if not sp.exists():
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(DAEMON_TIMEOUT)
+        sock.connect(str(sp))
+        req = json.dumps({"action": "ask", "query": prompt, "repo": repo,
+                          "learner_id": learner_id}) + "\n"
+        sock.sendall(req.encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)  # signal "done writing" so server can detect end
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        return json.loads(data.decode("utf-8").strip())
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -104,7 +138,7 @@ def stop(state_root: Path = DEFAULT_STATE_ROOT) -> bool:
 
 
 def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
-    """Daemon main loop. Loads BGE-M3 once, serves search requests forever."""
+    """Daemon main loop. Loads BGE-M3 once, serves search + ask requests forever."""
     sp = _socket_path(state_root)
     pid_p = _pid_path(state_root)
     sp.parent.mkdir(parents=True, exist_ok=True)
@@ -112,12 +146,15 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
 
     pid_p.write_text(str(os.getpid()))
 
-    # Pre-load encoder + corpus
+    # Pre-load encoder + corpus + ask pipeline
     from rag.search import search as rag_search
     from rag.corpus_loader import load_corpus
-    corpus = load_corpus(strict=True)
-    # warm encoder
     from rag.encoder import encode_query
+    from core.coach import compose
+    from core.lazy_loader import load as lazy_load
+    from core.router import route
+    from core.state import load_profile, read_history
+    corpus = load_corpus(strict=True)
     _ = encode_query("warm-up")
     print(f"[daemon] ready (pid={os.getpid()}, socket={sp})", flush=True)
 
@@ -152,6 +189,26 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         "concept_id": h.concept_id, "score": round(h.score, 4),
                         "category": h.category, "title": h.title, "source": h.source,
                     } for h in hits]}
+                    conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
+                elif action == "ask":
+                    # Full ask pipeline in daemon — bin/ask becomes thin socket client
+                    prompt = req["query"]
+                    repo = req.get("repo")
+                    learner_id = req.get("learner_id", "default")
+                    profile = load_profile(learner_id, state_root=state_root)
+                    decision = route(
+                        prompt, repo=repo,
+                        pending_self_assessment=profile.pending_triggers.get("self_assessment"),
+                        pending_drill=profile.pending_triggers.get("review_drill"),
+                    )
+                    artifacts = lazy_load(decision, repo=repo, state_root=state_root,
+                                          query=prompt, corpus=corpus)
+                    recent = read_history(state_root=state_root, tail=20)
+                    markdown = compose(decision, artifacts, prompt, repo=repo,
+                                       learner_id=learner_id, recent_history=recent)
+                    payload = {"markdown": markdown, "mode": decision.mode,
+                               "budget": decision.budget_tokens, "personas": decision.personas,
+                               "reason": decision.reason}
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 else:
                     conn.sendall(json.dumps({"error": f"unknown action {action}"}).encode() + b"\n")
