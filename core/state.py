@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
@@ -60,16 +61,23 @@ def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> Lear
     p = _profile_path(state_root)
     if not p.exists():
         return LearnerProfile.empty(learner_id)
-    data = json.loads(p.read_text(encoding="utf-8"))
+    mtime = p.stat().st_mtime
+    data = _profile_json_cached(str(p), mtime)
     return LearnerProfile(
         learner_id=data.get("learner_id", learner_id),
-        mastered_concepts=data.get("mastered_concepts", []),
-        uncertain_concepts=data.get("uncertain_concepts", []),
-        drill_due=data.get("drill_due", []),
-        pending_triggers=data.get("pending_triggers", {}),
+        mastered_concepts=list(data.get("mastered_concepts", [])),
+        uncertain_concepts=list(data.get("uncertain_concepts", [])),
+        drill_due=list(data.get("drill_due", [])),
+        pending_triggers=dict(data.get("pending_triggers", {})),
         total_events=data.get("total_events", 0),
         last_updated=data.get("last_updated", 0.0),
     )
+
+
+@lru_cache(maxsize=4)
+def _profile_json_cached(path_str: str, mtime: float) -> dict:
+    """mtime-keyed cache — auto-invalidates on profile write."""
+    return json.loads(Path(path_str).read_text(encoding="utf-8"))
 
 
 def save_profile(profile: LearnerProfile, state_root: Path = DEFAULT_STATE_ROOT) -> None:
