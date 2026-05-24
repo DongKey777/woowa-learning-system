@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""bin/graph-build — build concept_graph.json (+ cross_crew_review_graph in Phase C).
+
+concept_graph.json structure:
+  {
+    "version": "v3",
+    "built_at": "...",
+    "nodes": {<concept_id>: {category, level, summary, body_ref, code_signals}},
+    "edges": {prerequisite: [[src, dst], ...], next_docs: [...], confusable_with: [...]}
+  }
+
+code_signals are derived from mission/extract.py ANNOTATION_TO_CONCEPT and
+METHOD_TO_CONCEPT inverse maps (no AI session pass needed for v1; AI pass
+deferred to a later cycle if precision <70%).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from datetime import date
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from rag.corpus_loader import DEFAULT_CORPUS_DIR, load_corpus  # noqa: E402
+from mission.extract import (  # noqa: E402
+    ANNOTATION_TO_CONCEPT,
+    EXCEPTION_TO_CONCEPT,
+    IMPORT_TRIGGERED_METHODS,
+    METHOD_TO_CONCEPT,
+)
+
+DEFAULT_OUT = REPO_ROOT / "corpus" / "concept_graph.json"
+
+
+def _inverse_signals() -> dict[str, dict]:
+    """Build concept_id → {annotations, methods, exceptions, import_triggers}."""
+    sig: dict[str, dict] = defaultdict(lambda: {"annotations": [], "methods": [], "exceptions": [], "import_triggers": []})
+    for ann, cid in ANNOTATION_TO_CONCEPT.items():
+        sig[cid]["annotations"].append(ann)
+    for pat, cid in METHOD_TO_CONCEPT:
+        sig[cid]["methods"].append(pat.pattern)
+    for pat, cid in EXCEPTION_TO_CONCEPT:
+        sig[cid]["exceptions"].append(pat.pattern)
+    for imp_type, methods in IMPORT_TRIGGERED_METHODS.items():
+        for pat, cid in methods:
+            sig[cid]["import_triggers"].append({"import": imp_type, "method_pattern": pat.pattern})
+    return dict(sig)
+
+
+def build_concept_graph(corpus_dir: Path = DEFAULT_CORPUS_DIR) -> dict:
+    loaded = load_corpus(corpus_dir=corpus_dir, strict=True)
+    signals_by_concept = _inverse_signals()
+
+    nodes: dict[str, dict] = {}
+    prereq_edges: list[list[str]] = []
+    next_doc_edges: list[list[str]] = []
+    confusable_edges: list[list[str]] = []
+
+    for cid, c in loaded.concepts.items():
+        nodes[cid] = {
+            "category": c["category"],
+            "level": c.get("level", "intermediate"),
+            "summary": (c.get("summary") or "")[:240],
+            "body_ref": f"concepts/{cid}.json",
+            "code_signals": signals_by_concept.get(cid, {
+                "annotations": [], "methods": [], "exceptions": [], "import_triggers": []
+            }),
+        }
+        rels = c.get("relations", {})
+        for prereq in rels.get("prerequisites", []) or []:
+            prereq_edges.append([cid, prereq])
+        for nd in rels.get("next_docs", []) or []:
+            next_doc_edges.append([cid, nd])
+        for cw in rels.get("confusable_with", []) or []:
+            confusable_edges.append([cid, cw])
+
+    return {
+        "version": "v3",
+        "built_at": str(date.today()),
+        "nodes": nodes,
+        "edges": {
+            "prerequisite": prereq_edges,
+            "next_docs": next_doc_edges,
+            "confusable_with": confusable_edges,
+        },
+        "stats": {
+            "node_count": len(nodes),
+            "prereq_edge_count": len(prereq_edges),
+            "concepts_with_signals": sum(1 for s in signals_by_concept.values() if any(s.values())),
+        },
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", choices=("concept", "cross_crew", "all"), default="concept")
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR)
+    args = parser.parse_args(argv)
+
+    if args.target in ("concept", "all"):
+        graph = build_concept_graph(corpus_dir=args.corpus_dir)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8")
+        s = graph["stats"]
+        print(f"concept_graph: {s['node_count']} nodes, {s['prereq_edge_count']} prereq edges, "
+              f"{s['concepts_with_signals']} with code_signals")
+        print(f"  written to {args.out} ({args.out.stat().st_size / 1024:.0f} KB)")
+
+    if args.target in ("cross_crew", "all"):
+        # Phase C: cross_crew_review_graph builder will be added here
+        print("cross_crew_review_graph: deferred to Phase C")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
