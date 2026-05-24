@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""bin/mission-patterns-build — extract F10 patterns from learner own PR
+Java files in legacy archive → save to state/repos/<repo>/mission_patterns.json.
+
+Activates F10 forward (mission→CS) in coaching mode:
+- 学습자가 own PR 코드에서 사용한 patterns surface
+- F10 gap detect (missing prereqs) auto-trigger
+
+Usage:
+  bin/mission-patterns-build --repo spring-roomescape-member [--learner-login DongKey777]
+"""
+from __future__ import annotations
+
+import argparse
+import sqlite3
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from mission.extract import extract_from_text, save_patterns  # noqa: E402
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+DEFAULT_LEGACY = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
+
+
+def build_for_repo(
+    repo: str,
+    learner_login: str,
+    legacy_hub: Path,
+    state_root: Path,
+) -> dict:
+    db = legacy_hub / "state" / "repos" / repo / "archive" / "prs.sqlite3"
+    if not db.exists():
+        return {"repo": repo, "error": f"archive not found: {db}"}
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    own_prs = conn.execute(
+        "SELECT id, number, head_sha FROM pull_requests_current WHERE author_login = ?",
+        (learner_login,),
+    ).fetchall()
+
+    patterns = []
+    files_scanned = 0
+    latest_sha = None
+    for pr in own_prs:
+        files = conn.execute(
+            "SELECT path, patch_text FROM pull_request_files_current "
+            "WHERE pull_request_id = ? AND path LIKE '%.java'",
+            (pr["id"],),
+        ).fetchall()
+        for f in files:
+            files_scanned += 1
+            if f["patch_text"]:
+                patterns.extend(extract_from_text(f["path"], f["patch_text"]))
+        if pr["head_sha"]:
+            latest_sha = pr["head_sha"]
+    conn.close()
+
+    out_path = save_patterns(patterns, repo, state_root=state_root, last_built_commit=latest_sha)
+    distinct = len({p.matched_concept_id for p in patterns})
+    return {
+        "repo": repo,
+        "own_prs": len(own_prs),
+        "files_scanned": files_scanned,
+        "patterns": len(patterns),
+        "distinct_concepts": distinct,
+        "out_path": str(out_path),
+        "last_built_commit": latest_sha,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True, help="repo name (e.g. spring-roomescape-member)")
+    parser.add_argument("--learner-login", default="DongKey777")
+    parser.add_argument("--legacy-hub", type=Path, default=DEFAULT_LEGACY)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    report = build_for_repo(args.repo, args.learner_login, args.legacy_hub, args.state_root)
+    if "error" in report:
+        print(f"ERROR: {report['error']}", file=sys.stderr)
+        return 2
+    print(f"repo={report['repo']} learner={args.learner_login}")
+    print(f"  own_prs:           {report['own_prs']}")
+    print(f"  files_scanned:     {report['files_scanned']}")
+    print(f"  patterns:          {report['patterns']}")
+    print(f"  distinct_concepts: {report['distinct_concepts']}")
+    print(f"  last_built_commit: {report['last_built_commit']}")
+    print(f"  wrote:             {report['out_path']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

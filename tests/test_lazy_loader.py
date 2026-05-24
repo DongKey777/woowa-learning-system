@@ -90,13 +90,31 @@ def test_cross_crew_missing(tmp_path: Path) -> None:
 
 
 def test_cross_crew_ready_when_file_present(tmp_path: Path) -> None:
+    """Build a real parquet (3 rows) — _load_cross_crew now reads top-N matches."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
     p = tmp_path / "repos" / "myrepo" / "cross_crew_review_graph.parquet"
     p.parent.mkdir(parents=True)
-    p.write_bytes(b"x" * 100)
+    table = pa.table({
+        "anchor_thread_id": ["t1", "t2", "t3"],
+        "anchor_pr": [10, 11, 12],
+        "anchor_path": ["A.java", "B.java", "C.java"],
+        "anchor_mentor": ["m1", "m2", "m3"],
+        "candidate_pr": [20, 21, 22],
+        "crew_login": ["alice", "bob", "carol"],
+        "candidate_reviewer": ["rev1", "rev2", "rev3"],
+        "jaccard": [0.5, 0.6, 0.7],
+        "embed_cosine": [0.8, 0.9, 0.85],
+        "candidate_comment": ["c1", "c2", "c3"],
+    })
+    pq.write_table(table, str(p))
     r = _make_route([ARTIFACT_CROSS_CREW])
     out = load(r, repo="myrepo", state_root=tmp_path)
-    assert out[ARTIFACT_CROSS_CREW]["ready"] is True
-    assert out[ARTIFACT_CROSS_CREW]["size_bytes"] == 100
+    cc = out[ARTIFACT_CROSS_CREW]
+    assert cc["ready"] is True
+    assert cc["total_rows"] == 3
+    assert cc["top_matches"][0]["embed_cosine"] == 0.9
+    assert cc["top_matches"][0]["crew_login"] == "bob"
 
 
 def test_end_to_end_with_router_decision(tmp_path: Path) -> None:

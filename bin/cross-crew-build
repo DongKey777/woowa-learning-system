@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""bin/cross-crew-build — pre-compute F11 cross-crew/reviewer matching
+graph and persist as parquet for instant F11 query at runtime.
+
+Pipeline (per anchor):
+  Stage 1 path filter → SQL
+  Stage 2 jaccard ≥ 0.4 → in-memory filter
+  Stage 3 BGE-M3 cosine top-10 rerank → embedding search
+  (Stage 4 AI veto stays at query-time, not pre-build)
+
+Output schema:
+  anchor_thread_id, anchor_repo, anchor_pr, anchor_path, anchor_line,
+  anchor_mentor, candidate_repo, candidate_pr, candidate_comment_id,
+  candidate_path, candidate_line, candidate_reviewer, crew_login,
+  jaccard, embed_cosine, candidate_diff_hunk, candidate_comment
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+from anchors.extract import ReviewAnchor, load_anchors  # noqa: E402
+from anchors.match import (  # noqa: E402
+    stage_1_path_filter,
+    stage_2_jaccard_filter,
+    stage_3_embed_rank,
+)
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+DEFAULT_LEGACY = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
+
+
+def build(
+    repo: str,
+    legacy_hub: Path,
+    state_root: Path,
+    stage3_top_k: int = 10,
+) -> dict:
+    anchors = [a for a in load_anchors(state_root) if a.repo == repo]
+    if not anchors:
+        return {"repo": repo, "rows": 0, "elapsed_s": 0,
+                "note": "no anchors for this repo (run anchor extraction first)"}
+
+    rows = []
+    t0 = time.perf_counter()
+    for i, a in enumerate(anchors, start=1):
+        s1 = stage_1_path_filter(a, legacy_hub=legacy_hub)
+        s2 = stage_2_jaccard_filter(a, s1, threshold=0.4)
+        s3 = stage_3_embed_rank(a, s2, top_k=stage3_top_k)
+        for cand, j, cos in s3:
+            rows.append({
+                "anchor_thread_id": a.thread_id,
+                "anchor_repo": a.repo,
+                "anchor_pr": a.pr_number,
+                "anchor_path": a.path,
+                "anchor_line": a.line if a.line is not None else -1,
+                "anchor_mentor": a.mentor_login,
+                "candidate_repo": a.repo,
+                "candidate_pr": cand.get("pr_number", 0) or 0,
+                "candidate_comment_id": cand.get("comment_id", 0) or 0,
+                "candidate_path": cand.get("path") or "",
+                "candidate_line": cand.get("line") if cand.get("line") is not None else -1,
+                "candidate_reviewer": cand.get("reviewer") or "",
+                "crew_login": cand.get("crew_login") or "",
+                "jaccard": float(j),
+                "embed_cosine": float(cos),
+                "candidate_diff_hunk": (cand.get("diff_hunk") or "")[:1000],
+                "candidate_comment": (cand.get("body") or "")[:1000],
+            })
+        if i % 5 == 0:
+            print(f"  ...processed {i}/{len(anchors)} anchors ({len(rows)} rows so far)", flush=True)
+    elapsed = time.perf_counter() - t0
+
+    out_path = state_root / "repos" / repo / "cross_crew_review_graph.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    table = pa.table({k: [r[k] for r in rows] for k in rows[0]}) if rows else pa.table({})
+    pq.write_table(table, str(out_path), compression="zstd")
+
+    size_bytes = out_path.stat().st_size
+    return {
+        "repo": repo,
+        "anchors": len(anchors),
+        "rows": len(rows),
+        "elapsed_s": round(elapsed, 1),
+        "size_bytes": size_bytes,
+        "out_path": str(out_path),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--legacy-hub", type=Path, default=DEFAULT_LEGACY)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--stage3-top-k", type=int, default=10)
+    args = parser.parse_args(argv)
+
+    report = build(args.repo, args.legacy_hub, args.state_root, args.stage3_top_k)
+    print(f"repo={report['repo']}")
+    for k, v in report.items():
+        if k == "repo":
+            continue
+        print(f"  {k}: {v}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -149,13 +149,50 @@ def _load_anchors(state_root: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def _load_cross_crew(repo: str | None, state_root: Path) -> dict:
-    """Parquet file — returns metadata + row count. Full query stays in anchors/match.py."""
+def _load_cross_crew(repo: str | None, state_root: Path, top_n: int = 3) -> dict:
+    """Parquet file — returns top-N matches by embed_cosine for prompt evidence.
+
+    Pre-built parquet (`bin/cross-crew-build`) holds all anchor×candidate scored
+    rows; surfacing the top-N here keeps the F11 prompt under 1500 tokens while
+    giving real cross-crew evidence (crew_login + reviewer + comment snippet).
+    """
     if not repo:
         return {"repo": None, "rows": 0}
     p = state_root / "repos" / repo / "cross_crew_review_graph.parquet"
     if not p.exists():
         return {"repo": repo, "rows": 0, "missing": True, "path": str(p)}
-    # Avoid loading the full parquet here — return only path + size for the prompt.
-    # Phase C anchors/match.py opens the parquet on demand.
-    return {"repo": repo, "path": str(p), "size_bytes": p.stat().st_size, "ready": True}
+    return _load_cross_crew_cached(str(p), p.stat().st_mtime, top_n)
+
+
+@lru_cache(maxsize=4)
+def _load_cross_crew_cached(path_str: str, mtime: float, top_n: int) -> dict:
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path_str)
+    df = table.to_pandas()
+    total = len(df)
+    if total == 0:
+        return {"path": path_str, "size_bytes": Path(path_str).stat().st_size,
+                "ready": True, "total_rows": 0, "top_matches": []}
+    top = df.nlargest(top_n, "embed_cosine")
+    matches = []
+    for _, r in top.iterrows():
+        matches.append({
+            "anchor_pr": int(r["anchor_pr"]),
+            "anchor_thread_id": r["anchor_thread_id"],
+            "anchor_path": r["anchor_path"],
+            "anchor_mentor": r["anchor_mentor"],
+            "candidate_pr": int(r["candidate_pr"]),
+            "crew_login": r["crew_login"],
+            "candidate_reviewer": r["candidate_reviewer"],
+            "jaccard": round(float(r["jaccard"]), 3),
+            "embed_cosine": round(float(r["embed_cosine"]), 3),
+            "comment_snippet": (r["candidate_comment"] or "")[:240],
+        })
+    return {
+        "path": path_str,
+        "size_bytes": Path(path_str).stat().st_size,
+        "ready": True,
+        "total_rows": total,
+        "top_matches": matches,
+    }

@@ -46,7 +46,8 @@ def test_entry_point_count() -> None:
     entries = sorted(p.name for p in ENTRY_DIR.iterdir() if p.is_file() and not p.name.startswith("."))
     learner_facing = {"ask"}
     maintenance = {"corpus-build", "corpus-curate", "eval-compare", "learn-event",
-                   "graph-build", "phase9-gate"}
+                   "graph-build", "phase9-gate",
+                   "mission-patterns-build", "cross-crew-build"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)

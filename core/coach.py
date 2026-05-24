@@ -112,7 +112,17 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
     if "cross_crew_review_graph" in artifacts:
         cc = artifacts["cross_crew_review_graph"]
         if cc.get("ready"):
-            parts.append(f"### cross_crew_review_graph (parquet at {cc.get('path')}, {cc.get('size_bytes', 0)} bytes)")
+            total = cc.get("total_rows", 0)
+            parts.append(f"### cross_crew_review_graph (total={total}, top-{len(cc.get('top_matches', []))} by embed_cosine)")
+            for m in cc.get("top_matches", []):
+                parts.append(
+                    f"  - PR#{m['anchor_pr']} {m['anchor_path']} (mentor={m['anchor_mentor']}) "
+                    f"↔ PR#{m['candidate_pr']} crew={m['crew_login']} reviewer={m['candidate_reviewer']} "
+                    f"jaccard={m['jaccard']} cos={m['embed_cosine']}"
+                )
+                snip = m.get("comment_snippet", "").replace("\n", " ")[:160]
+                if snip:
+                    parts.append(f"    ↳ {snip}")
         else:
             parts.append("### cross_crew_review_graph (NOT YET BUILT — Phase C pending)")
     if "rag_hits" in artifacts:
