@@ -48,33 +48,39 @@ def _db_path(state_root: Path) -> Path:
     return state_root / "learner" / "mastery_graph.sqlite"
 
 
+_SCHEMA_INITIALIZED: set[str] = set()
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS mastery (
+  concept_id TEXT PRIMARY KEY,
+  bloom_level TEXT NOT NULL DEFAULT 'attempted',
+  evidence_count INTEGER NOT NULL DEFAULT 0,
+  last_seen_at REAL NOT NULL,
+  promotion_trace TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  concept_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  weight REAL NOT NULL,
+  ts REAL NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_concept ON evidence(concept_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_ts ON evidence(ts);
+"""
+
+
 @contextmanager
 def _connect(state_root: Path = DEFAULT_STATE_ROOT):
     p = _db_path(state_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p))
     conn.row_factory = sqlite3.Row
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS mastery (
-          concept_id TEXT PRIMARY KEY,
-          bloom_level TEXT NOT NULL DEFAULT 'attempted',
-          evidence_count INTEGER NOT NULL DEFAULT 0,
-          last_seen_at REAL NOT NULL,
-          promotion_trace TEXT NOT NULL DEFAULT '[]'
-        );
-        CREATE TABLE IF NOT EXISTS evidence (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          concept_id TEXT NOT NULL,
-          source TEXT NOT NULL,
-          weight REAL NOT NULL,
-          ts REAL NOT NULL,
-          payload_json TEXT NOT NULL DEFAULT '{}'
-        );
-        CREATE INDEX IF NOT EXISTS idx_evidence_concept ON evidence(concept_id);
-        CREATE INDEX IF NOT EXISTS idx_evidence_ts ON evidence(ts);
-        """
-    )
+    key = str(p)
+    if key not in _SCHEMA_INITIALIZED:
+        conn.executescript(_SCHEMA_SQL)
+        _SCHEMA_INITIALIZED.add(key)
     try:
         yield conn
         conn.commit()

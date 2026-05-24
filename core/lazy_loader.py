@@ -78,15 +78,22 @@ def _load_rag_hits(query: str, top_k: int = 5) -> list[dict]:
 
 
 def _load_mastery(state_root: Path) -> dict:
-    """Lightweight summary + top-10 mastered/familiar concepts. Full SQLite stays."""
-    s = mastery_summary(state_root=state_root)
+    """Lightweight summary + top-10 mastered/familiar concepts.
+    Single sqlite connection (summary + by_level in one open)."""
     db = state_root / "learner" / "mastery_graph.sqlite"
     if not db.exists():
-        return {"summary": s, "by_level": {}}
+        return {"summary": {"counts": {l: 0 for l in ("attempted", "familiar", "proficient", "mastered")},
+                            "total_tracked": 0},
+                "by_level": {}}
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
-    by_level: dict[str, list[str]] = {}
     try:
+        # summary
+        counts = {l: 0 for l in ("attempted", "familiar", "proficient", "mastered")}
+        for row in conn.execute("SELECT bloom_level, COUNT(*) c FROM mastery GROUP BY bloom_level"):
+            counts[row["bloom_level"]] = row["c"]
+        # by_level
+        by_level: dict[str, list[str]] = {}
         rows = conn.execute(
             "SELECT concept_id, bloom_level FROM mastery "
             "ORDER BY last_seen_at DESC LIMIT 50"
@@ -95,7 +102,8 @@ def _load_mastery(state_root: Path) -> dict:
             by_level.setdefault(r["bloom_level"], []).append(r["concept_id"])
     finally:
         conn.close()
-    return {"summary": s, "by_level": by_level}
+    return {"summary": {"counts": counts, "total_tracked": sum(counts.values())},
+            "by_level": by_level}
 
 
 def _load_concept_graph(path: Path) -> dict:
