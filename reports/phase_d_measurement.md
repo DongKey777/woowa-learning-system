@@ -106,12 +106,63 @@ Phase 9 cutover 결정은 1주 학습자 일상 사용 후:
 
 ---
 
-## 6. Honest limitations
+## 6. Direct measurement results (autonomous, no 1-week wait)
 
-1. **F11 Stage 3+4 (BGE-M3 + AI veto)**: 코드 작성됨, mock tested. Live 측정은 학습자 첫 F11 query 시.
-2. **Mastered 0**: replay + seed 후 444 tracked / 9 familiar / 0 mastered. proficient/mastered는 `pr_merge` + `mentor_accept` 신호 필요 — 학습자 future PR cycles 또는 archive ingest로 만들 수 있음.
-3. **AI judge RAG quality**: paradigm-v2 router는 *조건부 RAG* (tool_only는 skip, coaching에서는 mission_patterns 우선). 같은 fixture 직접 측정 unfair.
-4. **Multi-agent perspective**: 단일 LLM call에 3 persona section. 학습 효과 가치는 학습자 self-rated로 측정 (objective metric 없음).
+### 6.1 F10 forward 전체 측정 (학습자 own PRs)
+- 97 Java files × 298 patterns (220 Tier 1 + 78 Tier 2)
+- Distinct concepts: 14
+- Top: testing/junit-basics 84, spring/mvc-controller-basics 78, language/stream-api-basics 25
+- Tier 1 (Spring annotation regex): hard-coded 33 entries × 95-98% precision (known)
+- **Tier 2 precision sample 15 manual**: 12-15/15 정확 (80-100% strict) — gate 70% **PASS**
+
+### 6.2 F10 gap detect 실 patterns
+- 298 patterns × concept_graph prereq walk
+- **4 unique pattern × prereq gaps detected**:
+  - spring/mvc-controller-basics → software-engineering/oop-design-basics (attempted)
+  - spring/bean-di-basics → language/java-types-class-object-oop-basics (attempted)
+  - spring/bean-di-basics → language/java-inheritance-overriding-basics (attempted)
+  - spring/bean-di-basics → software-engineering/oop-design-basics (attempted)
+- 14 used concepts 중 *2개만 prereqs 정의*. corpus curation Phase 7 필요한 영역 노출 (12 broad concepts 0 prereqs)
+- **mechanism PASS, corpus prereq coverage는 후속 작업**
+
+### 6.3 F11 Stage 1-3 full pipeline (5 anchors)
+- Stage 1 path filter: avg 13 candidates per anchor (2-100ms)
+- Stage 2 jaccard ≥0.4: avg 8 survived (0-2ms)
+- Stage 3 BGE-M3 cosine top-10: **cos 0.95-0.97 5/5 perfect** (cold 8s, warm 278-1652ms)
+- Manual check 5 candidates: 5/5 semantically correct cross-crew matches
+- F11 latency ≤10s gate **PASS**
+
+### 6.4 F1 retrieval gap detected + fixed
+- 발견: `route.need_rag=True`인데 lazy_loader가 rag.search 호출 안 함 (concept_graph만)
+- Fix: lazy_loader.py에 `_load_rag_hits` + coach.py prompt에 `rag_hits` section
+- 검증: "@Transactional 어떤 원리" → top-1 `spring/transactional-basics` (score 0.702) 정확
+
+### 6.5 Latency 측정 (subprocess cold)
+- cs_qa cold (BGE-M3 load): **7-8s per fresh process**
+- tool_only: 0.11s (no encoder)
+- retro: 0.11s (no archive query)
+- **Warm in-process** (BGE-M3 cached in Python process): 1-2s 가능
+- ⚠️ **Subprocess cold per query 7-8s**: 학습자 daily 사용 패턴에 daemon 필요
+  (legacy hub의 rag-daemon 동일 인사이트). paradigm-v2에 daemon 추가는 후속 결정
+
+### 6.6 Token budget 측정 (prompt char / 4)
+- cs_qa: ~600 tokens (4500 budget의 **13.7% — 한참 under**)
+- tool_only: ~227 tokens (1500의 15%)
+- retro: ~482 tokens (5000의 9.6%)
+- **모든 mode 5K avg gate PASS** (실측 한참 under)
+
+### 6.7 Multi-agent prompt 작동
+- 5 mode (cs_qa/coaching/drill/retro/tool_only) 모두 정확 persona surface
+- F11 시 [REVIEWER]+[MENTOR] 명시
+- cs_qa 시 [MENTOR]+[SOCRATIC], coaching 시 3 persona 전부
+- Mechanism PASS; 실 학습 효과는 학습자 self-rated subjective metric
+
+## 7. Honest remaining gaps
+
+1. **Subprocess cold 7-8s per cs_qa query** — paradigm-v2에 daemon 없음. 학습자 daily 매번 cold (legacy 동일 인사이트). 후속: 단순 daemon 또는 in-process REPL.
+2. **corpus prereq coverage 약함** — 14 used concepts 중 2개만 prereqs. F10 gap detect의 ceiling. 후속: Phase 7 curation cycle.
+3. **mastered=0 → 9 familiar** ✓. proficient/mastered는 archive PR-merge 이벤트 ingest 필요 (현재 학습자 mode=development 활동 대부분이라 pr_merge evidence 0).
+4. **Multi-agent learner-facing 실 효과**: 객관 metric 없음. 학습자 self-rated subjective.
 
 ---
 

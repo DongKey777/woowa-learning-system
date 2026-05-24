@@ -115,6 +115,15 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
             parts.append(f"### cross_crew_review_graph (parquet at {cc.get('path')}, {cc.get('size_bytes', 0)} bytes)")
         else:
             parts.append("### cross_crew_review_graph (NOT YET BUILT — Phase C pending)")
+    if "rag_hits" in artifacts:
+        hits = artifacts["rag_hits"]
+        parts.append("### rag_hits (BGE-M3 dense + relations walk, top-5)")
+        for h in hits[:5]:
+            if "error" in h:
+                parts.append(f"  ⚠ {h['error']}")
+            else:
+                parts.append(f"  - [{h.get('category')}] `{h.get('concept_id')}` — {h.get('title')} "
+                             f"(score {h.get('score'):.3f}, src={h.get('source')})")
     return "\n".join(parts)
 
 

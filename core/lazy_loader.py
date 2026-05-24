@@ -31,11 +31,13 @@ def load(
     repo: str | None = None,
     state_root: Path = DEFAULT_STATE_ROOT,
     concept_graph_path: Path = DEFAULT_CONCEPT_GRAPH,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """Return dict {artifact_name: artifact_content_or_summary}.
 
     Each loader is graceful — missing artifact → empty/None placeholder, never
-    raise. This lets Phase A integrate with future Phase B/C artifacts.
+    raise. When route.need_rag and query is supplied, also invokes
+    rag.search → "rag_hits" key (F1 retrieval gap fix).
     """
     out: dict[str, Any] = {}
     for name in route.lazy_artifacts:
@@ -49,7 +51,21 @@ def load(
             out[name] = _load_anchors(state_root)
         elif name == ARTIFACT_CROSS_CREW:
             out[name] = _load_cross_crew(repo, state_root)
+    if route.need_rag and query:
+        out["rag_hits"] = _load_rag_hits(query)
     return out
+
+
+def _load_rag_hits(query: str, top_k: int = 5) -> list[dict]:
+    """Invoke rag.search (BGE-M3 + relations walk). Graceful empty on failure."""
+    try:
+        from rag.search import search
+        hits = search(query, top_k=top_k, relations_expand=3)
+        return [{"concept_id": h.concept_id, "score": round(h.score, 4),
+                 "category": h.category, "title": h.title, "source": h.source}
+                for h in hits]
+    except Exception as exc:
+        return [{"error": f"rag.search unavailable: {exc!s}"}]
 
 
 def _load_mastery(state_root: Path) -> dict:
