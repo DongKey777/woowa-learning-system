@@ -1,77 +1,121 @@
 #!/usr/bin/env python3
-"""bin/ask — single learner entry point (paradigm-v2 with daemon fast-path).
-
-Pipeline:
-  args → daemon.ask() (full pipeline in-daemon) → stdout
-  fallback: in-process router → lazy_loader → coach.compose
-
-Daemon path: ~25-35ms (socket-only). Fallback: ~65ms (full Python startup).
+"""bin/ask — thin socket client for daemon ask. Inline argv parse (no argparse)
+for sub-25ms cold-start. Falls back to in-process pipeline when daemon down.
 """
-from __future__ import annotations
-
-import argparse
 import json
+import os
+import socket
 import sys
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_SOCK = os.path.join(REPO_ROOT, "state", "rag-daemon.sock")
+TIMEOUT_S = 30
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prompt", type=str)
-    parser.add_argument("--repo", type=str, default=None)
-    parser.add_argument("--learner-id", type=str, default="default")
-    parser.add_argument("--json-route", action="store_true",
-                        help="emit RouteDecision JSON as first line")
-    parser.add_argument("--no-daemon", action="store_true",
-                        help="skip daemon, force in-process")
-    parser.add_argument("--state-root", type=Path, default=None)
-    args = parser.parse_args(argv)
+def parse_argv(argv):
+    """Minimal argv parser — faster than argparse for hot path."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: bin/ask <prompt> [--repo R] [--learner-id L] [--json-route] [--no-daemon]",
+              file=sys.stderr)
+        return None
+    out = {"prompt": argv[0], "repo": None, "learner_id": "default",
+           "json_route": False, "no_daemon": False, "state_root": None}
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--repo" and i + 1 < len(argv):
+            out["repo"] = argv[i + 1]; i += 2
+        elif a == "--learner-id" and i + 1 < len(argv):
+            out["learner_id"] = argv[i + 1]; i += 2
+        elif a == "--state-root" and i + 1 < len(argv):
+            out["state_root"] = argv[i + 1]; i += 2
+        elif a == "--json-route":
+            out["json_route"] = True; i += 1
+        elif a == "--no-daemon":
+            out["no_daemon"] = True; i += 1
+        else:
+            i += 1
+    return out
 
-    # Try daemon first
-    if not args.no_daemon:
-        from core.daemon import ask as daemon_ask, DEFAULT_STATE_ROOT
-        sr = args.state_root or DEFAULT_STATE_ROOT
-        resp = daemon_ask(args.prompt, repo=args.repo, learner_id=args.learner_id, state_root=sr)
+
+def daemon_ask(args):
+    sock_path = (os.path.join(args["state_root"], "rag-daemon.sock")
+                 if args["state_root"] else DEFAULT_SOCK)
+    if not os.path.exists(sock_path):
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT_S)
+        sock.connect(sock_path)
+        req = json.dumps({"action": "ask", "query": args["prompt"],
+                          "repo": args["repo"], "learner_id": args["learner_id"]}) + "\n"
+        sock.sendall(req.encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        return json.loads(data.decode("utf-8").strip())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def render(resp, json_route):
+    if json_route:
+        print("# RouteDecision: " + json.dumps({
+            "mode": resp.get("mode"),
+            "personas": resp.get("personas", []),
+            "budget_tokens": resp.get("budget"),
+            "reason": resp.get("reason"),
+        }, ensure_ascii=False))
+    print(resp["markdown"])
+
+
+def main(argv=None):
+    args = parse_argv(argv if argv is not None else sys.argv[1:])
+    if args is None:
+        return 2
+
+    # Daemon fast-path
+    if not args["no_daemon"]:
+        resp = daemon_ask(args)
         if resp is not None and "markdown" in resp:
-            if args.json_route:
-                print("# RouteDecision: " + json.dumps({
-                    "mode": resp.get("mode"), "personas": resp.get("personas", []),
-                    "budget_tokens": resp.get("budget"), "reason": resp.get("reason"),
-                }, ensure_ascii=False))
-            print(resp["markdown"])
+            render(resp, args["json_route"])
             return 0
 
-    # Fallback: in-process (cold path)
-    from core.coach import compose
-    from core.lazy_loader import load
-    from core.router import route
-    from core.state import DEFAULT_STATE_ROOT, load_profile, read_history
-    sr = args.state_root or DEFAULT_STATE_ROOT
+    # Fallback: in-process (cold path, heavy imports)
+    sys.path.insert(0, REPO_ROOT)
+    from pathlib import Path  # noqa: E402
+    from core.coach import compose  # noqa: E402
+    from core.lazy_loader import load  # noqa: E402
+    from core.router import route  # noqa: E402
+    from core.state import DEFAULT_STATE_ROOT, load_profile, read_history  # noqa: E402
+    sr = Path(args["state_root"]) if args["state_root"] else DEFAULT_STATE_ROOT
 
-    profile = load_profile(args.learner_id, state_root=sr)
+    profile = load_profile(args["learner_id"], state_root=sr)
     decision = route(
-        args.prompt, repo=args.repo,
+        args["prompt"], repo=args["repo"],
         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
         pending_drill=profile.pending_triggers.get("review_drill"),
     )
 
-    if decision.mode == "retro" and not args.repo:
+    if decision.mode == "retro" and not args["repo"]:
         print("ERROR: --repo required for retro mode", file=sys.stderr)
         return 2
 
-    artifacts = load(decision, repo=args.repo, state_root=sr, query=args.prompt)
+    artifacts = load(decision, repo=args["repo"], state_root=sr, query=args["prompt"])
     recent = read_history(sr, tail=20)
 
-    if args.json_route:
+    if args["json_route"]:
         print("# RouteDecision: " + json.dumps({
             "mode": decision.mode, "personas": decision.personas,
             "budget_tokens": decision.budget_tokens, "reason": decision.reason,
         }, ensure_ascii=False))
-    print(compose(decision, artifacts, args.prompt, repo=args.repo,
-                  learner_id=args.learner_id, recent_history=recent))
+    print(compose(decision, artifacts, args["prompt"], repo=args["repo"],
+                  learner_id=args["learner_id"], recent_history=recent))
     return 0
 
 
