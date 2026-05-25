@@ -1,0 +1,185 @@
+# Architecture — paradigm-v2
+
+## 1. 한 페이지 view
+
+```
+학습자 자연어 prompt
+       ↓
+bin/ask (socket client, 22ms cold-start floor)
+       ↓
+core/daemon.py (AF_UNIX, single-thread, BGE-M3 warm in-process)
+   1. core/router.py        → mode (cs_qa / coaching / tool_only / retro / drill / self_assess / f11_anchor)
+   2. core/lazy_loader.py   → only artifacts the router asked for
+   3. core/coach.py         → multi-agent labeled-section prompt
+       ↓
+state/learner/history.jsonl ← append rag_ask event (mode/router_mode/top_concept_ids)
+       ↓
+prompt markdown (avg 2.4KB, F11 up to 12KB)
+       ↓
+AI session (Claude / Codex / Gemini) → 학습자에게 한국어 답변
+       ↓
+bin/learn-event (학습자 code/drill/self-assess 이벤트) → core/feedback.py → core/mastery.py
+       ↓
+state/learner/mastery_graph.sqlite : attempted → familiar → proficient → mastered
+```
+
+## 2. 7-mode router (core/router.py)
+
+| Mode | Trigger | Personas | Artifacts | Budget |
+|---|---|---|---|---|
+| `tool_only` | TOOL_TOKENS (gradle/git/docker/etc.) OR short greeting | — | — | 1500 |
+| `cs_qa` | default — concept/CS question | MENTOR + SOCRATIC | concept_graph + mastery + rag_hits | 4500 |
+| `coaching` | repo + coaching keyword (리뷰/리팩토링/내 코드/이 코드/쓰는 게/…) | MENTOR + REVIEWER + SOCRATIC | concept_graph + mission_patterns + mastery + rag_hits | 5500 |
+| `retro` | 회고/반복/내 PR/정밀/사이클 키워드 | MENTOR + REVIEWER | mission_patterns + mastery | 5000 |
+| `drill` | pending_drill + answer-shaped reply | SOCRATIC | mastery + drill_offer | 3000 |
+| `self_assess` | pending_self_assessment + pure `^N점$` reply | — | mastery | 2000 |
+| `f11_anchor` | F11_KEYWORDS (정밀 비교/다른 크루는/cross-crew/…) OR `PR N line` regex | REVIEWER + MENTOR | review_anchors + cross_crew_review_graph + mission_patterns | 12000 |
+
+Phase J 측정 결과: **14/14 시나리오 mode dispatch 100% correct**.
+
+## 3. Multi-agent (single-call, labeled section)
+
+3 persona를 **하나의 prompt**에 labeled section으로 composition (cost ×1, perspective ×3):
+- **[MENTOR]**: 원칙/best-practice. SOLID, IoC, Spring 컨테이너 의도. `mission_patterns + concept_graph`로 학습자가 사용 중인 패턴의 prereq 누락 지적.
+- **[REVIEWER]**: 실제 reviewer 시각. `cross_crew_review_graph + review_anchors`로 비슷한 코드에 다른 reviewer 의견 비교.
+- **[SOCRATIC]**: 답 직접 X, leading question으로 학습자 자가 사고 유도.
+
+AI 세션이 mode에 따라 적합한 persona section만 활성. mode별 persona는 router 표 참조.
+
+Phase N9 측정: coaching mode markdown에 3 persona 모두 surface (MENTOR + REVIEWER + SOCRATIC).
+
+## 4. Bloom mastery autoloop (core/feedback.py + core/mastery.py)
+
+### Evidence sources (weight)
+- `pr_merge`: 1.0 (가장 강함)
+- `mentor_accept`: 0.9
+- `drill_score`: 0.7 × score
+- `mission_use`: 0.3 (rag_ask/code_attempt/coach_run)
+- `self_assess`: 0.2 (calibration only, mastery 직접 promote X)
+
+### Promotion rules
+- **attempted**: 1+ evidence
+- **familiar**: ≥3 evidence + ≥2 distinct sources + 14일 internal
+- **proficient**: `pr_merge` AND `mentor_accept` (strong source pair)
+- **mastered**: `proficient` AND (`drill_score` ≥0.55 OR `self_assess` + 30일 retention)
+- **demotion**: 없음 (monotonic — 한 번 promoted 후 weak drill 받아도 demote X, 설계상)
+
+### Daemon integration (Phase K 핵심 fix)
+- 매 `bin/ask` turn → daemon이 `rag_ask` event를 `history.jsonl`에 append (mode/router_mode/top_concept_ids 포함)
+- 학습자 코드 작성/수정 turn → AI 세션이 `bin/learn-event --event-type code_attempt --silent` 호출
+- drill answer turn → `bin/learn-event --event-type drill_answer --score s --silent` 호출
+- 모든 이벤트가 `core/feedback.record_turn` → `core/mastery.promote` 자동 trigger
+
+### 현재 상태
+- 5 mastered + 2 proficient (Spring core: bean-di, ioc-di, mvc-controller, configurationproperties, transactional-self-invocation, jdbc-jpa-mybatis, transaction-isolation)
+- Legacy hub는 mastered = 0 (broken). paradigm-v2가 즉시 fix.
+
+## 5. F10 forward — mission code → concept (paradigm-v2 unique)
+
+### Tier 1 (annotation regex, deterministic)
+`mission/extract.py` `ANNOTATION_TO_CONCEPT` 35 매핑:
+- `@Transactional` → `spring/transactional-basics`
+- `@RestController` → `spring/mvc-controller-basics`
+- `@Service` → `spring/ioc-di-basics`
+- ... (전체 35개)
+
+Phase L 측정: **35/35 (100%) corpus 매핑 정확 + 35/35 (100%) round-trip extract**.
+
+### Tier 2 (method + exception + import-triggered)
+`METHOD_TO_CONCEPT` (18) + `EXCEPTION_TO_CONCEPT` (5) + `IMPORT_TRIGGERED_METHODS` (4 import × N method):
+- `JdbcTemplate.query` → `database/jdbc-jpa-mybatis-basics`
+- `DataIntegrityViolationException` → `database/jdbc-jpa-mybatis-basics`
+- ...
+
+Phase L 측정: **23/27 (85.2%)** corpus 매핑 정확.
+
+### 사용
+```bash
+bin/mission-patterns-build --repo <repo>
+# → state/repos/<repo>/mission_patterns.json
+```
+- learner own PR Java patch_text → 자동 추출
+- coaching mode 시 prompt에 surface
+
+## 6. F11 cross-crew (paradigm-v2 unique)
+
+### 4-stage filter (`anchors/match.py`)
+1. **Stage 1 path**: anchor.path와 동일 filename을 가진 cross-crew review_comments fetch (SQL LIKE)
+2. **Stage 2 jaccard**: code hunk normalized-token Jaccard ≥0.4
+3. **Stage 3 embedding**: BGE-M3 cosine → top-10
+4. **Stage 4 AI veto** (runtime, query time): top-5만 LLM 검증
+
+### 사전 빌드
+```bash
+bin/cross-crew-build --repo <repo>
+# → state/repos/<repo>/cross_crew_review_graph.parquet
+```
+
+Phase L 측정:
+- **AI judge precision 85%** (10 sample = 5 high + 5 low conf)
+- Plan §D-E target (88-92%)는 Stage 4 runtime AI veto로 도달 가능
+
+## 7. Daemon (core/daemon.py)
+
+- **AF_UNIX socket** + line-delimited JSON protocol
+- **Single-thread** — single-learner design choice (concurrency 의도적 X)
+- **BGE-M3 + corpus + lazy_loader 모두 메모리에 keep** (cold 105ms → warm 4.5ms)
+- Phase N1: SQLite mastery 등 모든 state daemon restart 후 survive 검증
+- Phase N12: 5 ask sequential = 5 well-formed event append (atomic)
+
+### Actions
+- `ping`: alive check
+- `search`: low-level rag.search (debug/benchmark용)
+- `ask`: full pipeline (router → lazy_load → coach → history append → return markdown)
+
+### State files
+- `state/rag-daemon.sock` — socket
+- `state/rag-daemon.pid` — pid
+- 시작: `nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &`
+
+## 8. Performance (warm)
+
+| 지표 | paradigm-v2 | Legacy hub | Δ |
+|---|---|---|---|
+| p50 latency | **27.2ms** | 120.0ms | **4.4× faster** |
+| p95 latency | **30.7ms** | 423.7ms | **13.8× faster** |
+| Cold start | 105ms | ~20-25s | **~200× faster** |
+| LLM payload | 2.4KB | 48.6KB | **20× cheaper** |
+| Memory (warm) | ~6.5GB | ~7-8GB | parity |
+
+100 query stress (Phase M S8): p50 3.5ms / p95 32.8ms / p99 57.2ms, 0 error.
+
+## 9. Storage decision tree
+
+- **Append-heavy + queryable** → SQLite (`mastery_graph.sqlite`)
+- **Read-mostly small** → JSON (`review_anchors.json`, `mission_patterns.json`, `drill_pending.json`, `drill_due.json`)
+- **Large columnar** → Parquet (`cross_crew_review_graph.parquet`)
+- **Immutable corpus** → JSON adjacency (`concept_graph.json` 3199 nodes / 5764 prereq edges / 5MB)
+- **Dense embed index** → Lance (`state/index/concept.lance` ~12MB, 3199 × 1024-d float32)
+- **Append-only event log** → JSONL (`history.jsonl`)
+
+## 10. LOC budget (plan §D-I)
+
+총 4416 LOC (목표 ≤4300, plan §D-I 자유 확장 동의):
+- `core/`: 2473 (router + intent + lazy_loader + coach + daemon + mastery + feedback + drill + state + …)
+- `rag/`: 733 (encoder + search + index + corpus_loader + personalization + reranker)
+- `mission/`: 344 (extract.py + graph.py)
+- `anchors/`: 319 (extract.py + match.py)
+- `curation/`: 297
+
+Legacy hub ~80K LOC 대비 **-94.5%**.
+
+## 11. Development principles (4 원칙, commit 자체점검)
+
+1. **Hypothesis-Driven Autonomy** — 모호 시 가설+측정+직접 판단. ask는 scope/policy 결정에만.
+2. **Simplicity First** — 최소 코드. 추측 abstraction / 사용 안 하는 flexibility 금지.
+3. **Surgical Changes** — 요청 범위만. adjacent code 개선 / 리팩토링 금지.
+4. **Goal-Driven Execution** — verifiable success criteria 명시 후 loop. "make it work" 같은 weak criteria 금지.
+
+Commit message에 self-check 4 항목 포함.
+
+## 12. 참고
+
+- Plan: `/Users/idonghun/.claude/plans/misty-giggling-valley.md`
+- Verification: [`verification-results.md`](verification-results.md)
+- Testing: [`testing-guide.md`](testing-guide.md)

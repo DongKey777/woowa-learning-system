@@ -1,0 +1,219 @@
+# Artifact catalog — `state/` `reports/` `corpus/` 구조
+
+## 1. `corpus/` (committed, read-only at runtime)
+
+```
+corpus/
+├── concepts/                      # 3199 JSON entities (1 concept = 1 file)
+│   ├── algorithm/*.json
+│   ├── data-structure/*.json
+│   ├── database/*.json
+│   ├── design-pattern/*.json
+│   ├── language/*.json
+│   ├── network/*.json
+│   ├── operating-system/*.json
+│   ├── security/*.json
+│   ├── software-engineering/*.json
+│   ├── spring/*.json
+│   └── system-design/*.json
+├── concept_graph.json             # 5MB — nodes (3199) + edges (prerequisite 5764, confusable_with N)
+└── schemas/
+    └── concept.schema.json        # JSON schema (validation)
+```
+
+### Concept JSON schema
+```json
+{
+  "id": "spring/bean-di-basics",
+  "title": "Spring Bean DI 기초",
+  "category": "spring",
+  "level": "beginner|intermediate|advanced",
+  "summary": "...",
+  "body_markdown": "...",
+  "aliases": ["Bean DI", "Dependency Injection in Spring"],
+  "expected_queries": [
+    "Spring Bean이 뭐야?",
+    "Bean이랑 DI는 뭐가 달라?"
+  ],
+  "symptoms": [...],
+  "relations": {
+    "prerequisites": ["software-engineering/dependency-injection-basics"],
+    "confusable_with": ["spring/ioc-di-basics"]
+  },
+  "learner_query_patterns": [...],
+  "metadata": {...}
+}
+```
+
+### `concept_graph.json` shape
+```json
+{
+  "version": "v3",
+  "built_at": "2026-05-...",
+  "nodes": {
+    "<concept_id>": {
+      "category": "spring",
+      "level": "beginner",
+      "summary": "...",
+      "body_ref": "concepts/spring/bean-di-basics.json",
+      "code_signals": {
+        "annotations": ["@Bean", "@Component"],
+        "methods": [],
+        "exceptions": [],
+        "import_triggers": []
+      }
+    },
+    ...
+  },
+  "edges": {
+    "prerequisite": [["from_id", "to_id"], ...],   # 5764 pairs
+    "confusable_with": [...],
+    "extends": [...]
+  },
+  "stats": {...}
+}
+```
+
+---
+
+## 2. `state/` (gitignored, per-machine runtime)
+
+```
+state/
+├── index/
+│   ├── concept.lance/             # Lance vector table (3199 × 1024-d float32, ~12MB)
+│   │   ├── _versions/
+│   │   ├── data/
+│   │   └── _transactions/
+│   └── manifest.json              # build metadata (corpus_hash, built_at, etc.)
+├── learner/
+│   ├── profile.json               # mastered/uncertain/drill_due/pending_triggers
+│   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)
+│   ├── mastery_graph.sqlite       # Bloom autoloop state (mastery table + evidence table)
+│   ├── drill_pending.json         # 1 open drill offer (or absent)
+│   ├── drill_due.json             # spaced repetition due list
+│   ├── pending_triggers.json      # pending self_assessment / review_drill triggers
+│   └── review_anchors.json        # 31 thread anchors extracted from mission repos
+├── repos/                          # per-repo derived artifacts
+│   └── <repo>/
+│       ├── mission_patterns.json   # F10 forward — Tier 1+2 extracted patterns
+│       └── cross_crew_review_graph.parquet  # F11 — 4-stage filter result
+├── rag-daemon.sock                 # AF_UNIX daemon socket
+└── rag-daemon.pid                  # daemon pid
+```
+
+### `mastery_graph.sqlite` schema
+```sql
+CREATE TABLE mastery (
+  concept_id TEXT PRIMARY KEY,
+  bloom_level TEXT,           -- attempted/familiar/proficient/mastered
+  evidence_count INTEGER,
+  last_seen_at REAL,
+  promotion_trace TEXT        -- JSON [{from, to, ts}, ...]
+);
+CREATE TABLE evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  concept_id TEXT,
+  source TEXT,                -- pr_merge/mentor_accept/drill_score/mission_use/self_assess
+  weight REAL,
+  payload TEXT                -- JSON
+);
+```
+
+### `history.jsonl` event types
+| event_type | mode | payload 필드 |
+|---|---|---|
+| `rag_ask` | learning/development | prompt, repo, router_mode, router_reason, top_concept_ids |
+| `code_attempt` | learning | file_path, concept_ids, lines_added, lines_removed, summary, linked_test |
+| `drill_answer` | learning | drill_session_id, concept_ids, score, level, dimensions, answer_preview |
+| `self_assessment` | learning | trigger_session_id, score, concept_ids |
+| `test_result` | learning | test_class, test_method, status |
+| `coach_run` | learning | prompt, repo, mode, evidence_summary |
+
+### `profile.json` shape
+```json
+{
+  "learner_id": "default",
+  "mastered_concepts": ["spring/bean-di-basics", ...],
+  "uncertain_concepts": ["language/java-optional-basics", ...],
+  "drill_due": [{"concept_id": "...", "next_due_ts": ..., "level": "weak"}, ...],
+  "pending_triggers": {
+    "self_assessment": {"trigger_session_id": "...", "issued_at": ...},
+    "review_drill": {"trigger_session_id": "...", "concept_id": "..."}
+  },
+  "total_events": 10000+,
+  "last_updated": 1779697427.0
+}
+```
+
+### `mission_patterns.json` shape
+```json
+{
+  "repo": "spring-roomescape-member",
+  "last_built_commit": "<sha>",
+  "patterns": [
+    {
+      "file": "src/main/java/.../AdminReservationTimeController.java",
+      "line": 17,
+      "kind": "annotation",
+      "value": "@RestController",
+      "matched_concept_id": "spring/mvc-controller-basics",
+      "confidence": 0.97,
+      "extractor": "regex_tier1"
+    },
+    ...
+  ]
+}
+```
+
+### `cross_crew_review_graph.parquet` columns
+- `anchor_thread_id`, `anchor_repo`, `anchor_pr`, `anchor_path`, `anchor_line`, `anchor_mentor`
+- `candidate_pr`, `candidate_comment_id`, `candidate_path`, `candidate_line`,
+  `candidate_reviewer`, `candidate_diff_hunk`, `candidate_comment`
+- `crew_login`
+- `jaccard` (float, ≥0.4 after Stage 2)
+- `embed_cosine` (float, ranked by Stage 3)
+
+---
+
+## 3. `reports/` (committed, append-only measurement results)
+
+```
+reports/
+├── PARADIGM_V2_VS_LEGACY_FINAL.md           # Phase J narrative
+├── PHASE_K_VERIFICATION.md                   # F1 + F5 critical gates
+├── PHASE_L_ALL_GATES_FINAL.md                # 9 plan gates
+├── PHASE_M_UNCOVERED_FINAL.md                # 12 uncovered scenarios
+├── PHASE_N_UNCOVERED2_FINAL.md               # 12 second-wave + read_history fix
+├── PHASE_P_DEEP_FINAL.md                     # 10 deep scenarios + drill cycle
+├── phase_l_gates.json                        # raw JSON per gate
+├── phase_m_uncovered.json
+├── phase_n_uncovered2.json
+├── phase_p_deep.json
+├── rag_quality_regression.json               # F1 200-query measurement
+├── v2_vs_legacy_full_comparison.json/.md     # 14-scenario benchmark
+├── v2_vs_legacy_deepdive.json                # 4 sidebyside samples
+├── coaching_eval.json
+├── phase_g_v2_eval.json                      # corpus enrichment cycle
+├── phase9_rag_eval.json
+└── ... (older reports retained for history)
+```
+
+각 `PHASE_*.md`는 narrative + table + reproduction 명령 포함. `*.json`은 raw structured output.
+
+---
+
+## 4. Lifecycle 요약
+
+| Artifact | 생성 시점 | 소비자 | 갱신 트리거 |
+|---|---|---|---|
+| corpus/concepts/*.json | Mode B (corpus 작업) | RAG search + drill builder | corpus 신규 추가 |
+| corpus/concept_graph.json | `bin/graph-build` | RAG + F8 prereq walk | corpus 변경 후 |
+| state/index/concept.lance/ | `bin/corpus-build` 또는 release fetch | daemon search | corpus 변경 후 |
+| state/learner/history.jsonl | daemon ask 매 turn | recent_history + profile recompute | append-only |
+| state/learner/mastery_graph.sqlite | `core/feedback.record_turn` | profile.json compute | 매 evidence event |
+| state/learner/profile.json | profile recompute (현재 수동) | router pending_triggers + 학습자 surface | history 누적 후 |
+| state/learner/review_anchors.json | `anchors/extract.py` | F11 매칭 source | 학습자 신규 PR review 후 |
+| state/repos/<repo>/mission_patterns.json | `bin/mission-patterns-build` | coaching prompt | 학습자 신규 PR 후 |
+| state/repos/<repo>/cross_crew_review_graph.parquet | `bin/cross-crew-build` | F11 prompt | anchors 갱신 후 |
+| reports/*.json/.md | 측정 script 실행 (Mode B) | 회귀 분석 + commit message | 측정 cycle |
