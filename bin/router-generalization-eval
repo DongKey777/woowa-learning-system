@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""bin/router-generalization-eval — 14-scenario set (Phase J fixture) +
+holdout phrases (Phase W11).
+
+Tests router dispatch accuracy on diverse prompts; reports per-mode
+accuracy + confusion.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.router import route  # noqa: E402
+
+FIXTURES = [
+    # Phase J 14-scenario set
+    ("DI가 뭐야", "cs_qa"),
+    ("트랜잭션 isolation level", "cs_qa"),
+    ("Spring Bean 생명주기", "cs_qa"),
+    ("내 ReservationController 리팩토링", "coaching"),
+    ("이 코드 어떻게 쓰는 게 맞아", "coaching"),
+    ("@Transactional 어디에 붙여", "cs_qa"),
+    ("git rebase -i 사용법", "tool_only"),
+    ("내 PR 흐름 보여줘", "retro"),
+    ("반복 멘토 지적", "retro"),
+    ("확인 질문 하나 줘", "cs_qa"),  # no pending → cs_qa fallback
+    ("DI 8점", "cs_qa"),              # no pending self-assess
+    ("다른 크루는 어떻게 작성", "f11_anchor"),
+    ("PR 390 line 정밀", "f11_anchor"),
+    ("안녕", "tool_only"),
+    # Holdout (additional)
+    ("JdbcTemplate 어떻게 써", "coaching"),
+    ("Spring Security OAuth 설정", "cs_qa"),
+    ("docker compose up 명령어", "tool_only"),
+    ("3 사이클 mentor 지적 패턴", "retro"),
+    ("크루 비교해줘", "f11_anchor"),
+    ("응", "tool_only"),
+]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    args = parser.parse_args(argv)
+
+    # Use repo-context for coaching-relevant prompts
+    repo_keywords = {"내", "이 코드", "JdbcTemplate", "리팩토링"}
+    correct = 0
+    by_mode_correct: Counter = Counter()
+    by_mode_total: Counter = Counter()
+    failures = []
+    confusion: dict[tuple, int] = defaultdict(int)
+    for prompt, expected in FIXTURES:
+        repo = "spring-roomescape-member" if any(k in prompt for k in repo_keywords) else None
+        decision = route(prompt, repo=repo)
+        got = decision.mode
+        by_mode_total[expected] += 1
+        if got == expected:
+            correct += 1
+            by_mode_correct[expected] += 1
+        else:
+            failures.append({"prompt": prompt, "expected": expected, "got": got,
+                              "reason": decision.reason})
+            confusion[(expected, got)] += 1
+
+    print(json.dumps({
+        "total": len(FIXTURES),
+        "passed": correct,
+        "accuracy": round(correct / len(FIXTURES), 3),
+        "per_mode_accuracy": {mode: f"{by_mode_correct[mode]}/{by_mode_total[mode]}"
+                               for mode in by_mode_total},
+        "failures": failures,
+        "confusion_pairs": [{"expected": e, "got": g, "n": n}
+                             for (e, g), n in sorted(confusion.items(), key=lambda x: -x[1])],
+    }, ensure_ascii=False, indent=2))
+    return 0 if correct == len(FIXTURES) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

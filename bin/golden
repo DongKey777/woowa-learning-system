@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""bin/golden — golden fixture regression test (Phase W9).
+
+CLI: bin/golden verify [--golden-file F]
+    bin/golden update [--golden-file F]
+Golden format: [{"prompt": "...", "expected_top1_concept": "spring/bean-di-basics"}, ...]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+DEFAULT_GOLDEN = REPO_ROOT / "tests" / "fixtures" / "golden_queries.json"
+
+
+def _daemon_search(query, state_root):
+    sp = state_root / "rag-daemon.sock"
+    if not sp.exists():
+        return []
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    s.connect(str(sp))
+    s.sendall((json.dumps({"action": "search", "query": query, "top_k": 5}) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        c = s.recv(65536)
+        if not c:
+            break
+        data += c
+    s.close()
+    return json.loads(data.decode().strip()).get("hits", [])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("verify", "update"))
+    parser.add_argument("--golden-file", type=Path, default=DEFAULT_GOLDEN)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    if args.action == "update":
+        # Seed minimal golden if missing
+        if not args.golden_file.exists():
+            args.golden_file.parent.mkdir(parents=True, exist_ok=True)
+            seed = [
+                {"prompt": "Bean DI가 뭐야", "expected_top1_concept": "spring/bean-di-basics"},
+                {"prompt": "트랜잭션 isolation level", "expected_top1_concept": "database/transaction-isolation-basics"},
+            ]
+            args.golden_file.write_text(json.dumps(seed, ensure_ascii=False, indent=2),
+                                          encoding="utf-8")
+            print(json.dumps({"updated": True, "seeded_n": len(seed),
+                                "path": str(args.golden_file)},
+                              ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps({"updated": False, "exists": True,
+                               "path": str(args.golden_file)}, ensure_ascii=False, indent=2))
+        return 0
+
+    # verify
+    if not args.golden_file.exists():
+        print(f"ERROR: golden file missing: {args.golden_file}", file=sys.stderr)
+        return 2
+    goldens = json.loads(args.golden_file.read_text(encoding="utf-8"))
+    pass_n = 0
+    failures = []
+    for g in goldens:
+        hits = _daemon_search(g["prompt"], args.state_root)
+        got = hits[0].get("concept_id") if hits else None
+        if got == g.get("expected_top1_concept"):
+            pass_n += 1
+        else:
+            failures.append({"prompt": g["prompt"], "expected": g.get("expected_top1_concept"),
+                              "got": got})
+    payload = {
+        "total": len(goldens),
+        "passed": pass_n,
+        "failed_n": len(failures),
+        "failures": failures[:10],
+        "pass": pass_n == len(goldens),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if payload["pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

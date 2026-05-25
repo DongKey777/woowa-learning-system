@@ -69,7 +69,13 @@ def test_entry_point_count() -> None:
                    "coach-run", "coach", "my-pr", "next-action", "topic",
                    "reviewer", "compare", "compose-response", "mission-map",
                    "rag-rewrite-prepare", "rag-route-fallback",
-                   "chunk-context-prepare"}
+                   "chunk-context-prepare",
+                   # Phase W new wrappers (mining/analytics)
+                   "feedback-mine", "response-quality-mine", "routing-analyze",
+                   "learning-turn-audit", "learning-path-graph-audit",
+                   "reclassify-history", "cohort-eval", "cohort-compare",
+                   "golden", "rag-eval", "router-generalization-eval",
+                   "learner-log-rag-eval"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""bin/cohort-eval — run query cohort through bin/ask + aggregate metrics
+(Phase W7).
+
+CLI: bin/cohort-eval --cohort-file C.json [--out reports/cohort_X.json]
+Cohort format: [{"prompt": "...", "expected_mode": "cs_qa", "repo": ...}, ...]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import statistics
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _daemon_ask(prompt, repo, state_root):
+    sp = state_root / "rag-daemon.sock"
+    if not sp.exists():
+        return None
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    s.connect(str(sp))
+    req = {"action": "ask", "query": prompt, "learner_id": "default"}
+    if repo:
+        req["repo"] = repo
+    s.sendall((json.dumps(req) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        c = s.recv(65536)
+        if not c:
+            break
+        data += c
+    s.close()
+    return json.loads(data.decode().strip())
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cohort-file", type=Path, required=True)
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    if not args.cohort_file.exists():
+        print(f"ERROR: cohort missing: {args.cohort_file}", file=sys.stderr)
+        return 2
+    cohort = json.loads(args.cohort_file.read_text(encoding="utf-8"))
+
+    results = []
+    latencies = []
+    mode_correct = 0
+    mode_total = 0
+    for q in cohort:
+        prompt = q["prompt"]
+        expected = q.get("expected_mode")
+        repo = q.get("repo")
+        t0 = time.perf_counter()
+        try:
+            resp = _daemon_ask(prompt, repo, args.state_root)
+            ms = (time.perf_counter() - t0) * 1000
+        except Exception as e:
+            results.append({"prompt": prompt[:60], "error": str(e)[:100]})
+            continue
+        if resp is None:
+            results.append({"prompt": prompt[:60], "error": "daemon down"})
+            continue
+        got = resp.get("mode")
+        is_correct = None
+        if expected:
+            mode_total += 1
+            is_correct = (got == expected)
+            if is_correct:
+                mode_correct += 1
+        latencies.append(ms)
+        results.append({
+            "prompt": prompt[:60],
+            "expected_mode": expected,
+            "got_mode": got,
+            "correct": is_correct,
+            "ms": round(ms, 1),
+        })
+
+    summary = {
+        "cohort_size": len(cohort),
+        "latency_p50_ms": round(statistics.median(latencies), 1) if latencies else None,
+        "latency_p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)], 1)
+                           if latencies else None,
+        "mode_dispatch_correct": f"{mode_correct}/{mode_total}",
+        "mode_accuracy": round(mode_correct / mode_total, 3) if mode_total else None,
+    }
+    payload = {"summary": summary, "results": results}
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

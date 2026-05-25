@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""bin/reclassify-history — re-run current router against past rag_ask prompts
+(Phase W6). Reports dispatch drift (mode flips between old and new router).
+--dry-run by default — no rewrite.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.router import route  # noqa: E402
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+from scripts.mining.jsonl_iter import iter_jsonl  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", default=True,
+                        help="default ON — never writes")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--last", type=int, default=1000)
+    args = parser.parse_args(argv)
+
+    path = args.state_root / "learner" / "history.jsonl"
+    events = [ev for ev in iter_jsonl(path, event_type="rag_ask")][-args.last:]
+
+    drift_n = 0
+    transitions: Counter = Counter()
+    examples: list[dict] = []
+    for ev in events:
+        payload = ev.get("payload") or {}
+        prompt = payload.get("prompt") or ""
+        if not prompt:
+            continue
+        old_mode = payload.get("router_mode") or "?"
+        new_decision = route(prompt, repo=payload.get("repo"))
+        new_mode = new_decision.mode
+        if old_mode != new_mode:
+            drift_n += 1
+            transitions[f"{old_mode} → {new_mode}"] += 1
+            if len(examples) < 10:
+                examples.append({
+                    "event_id": ev.get("event_id"),
+                    "prompt": prompt[:80],
+                    "old_mode": old_mode,
+                    "new_mode": new_mode,
+                    "new_reason": new_decision.reason,
+                })
+
+    print(json.dumps({
+        "history_path": str(path),
+        "events_audited": len(events),
+        "drift_n": drift_n,
+        "drift_pct": round(drift_n / max(1, len(events)) * 100, 1),
+        "transitions": dict(transitions.most_common(10)),
+        "examples": examples,
+        "rewrite_applied": False,  # always dry-run by default
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

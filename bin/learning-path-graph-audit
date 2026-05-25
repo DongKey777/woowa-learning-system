@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""bin/learning-path-graph-audit — concept_graph.json structural audit (Phase W5).
+
+Checks:
+- broken prerequisite edges (to_id not in nodes)
+- cycles in prerequisite graph
+- orphans (no inbound nor outbound prereq edges + no extends)
+- level inversions (prereq.level > concept.level)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GRAPH = REPO_ROOT / "corpus" / "concept_graph.json"
+
+LEVEL_RANK = {"beginner": 1, "intermediate": 2, "advanced": 3}
+
+
+def _cycles(adj: dict[str, list[str]]) -> list[list[str]]:
+    """Tarjan-style cycle detect (limited to first 10 cycles)."""
+    found: list[list[str]] = []
+    visited: dict[str, int] = {}  # 0=unvisited, 1=stack, 2=done
+    stack: list[str] = []
+
+    def dfs(node: str) -> None:
+        if len(found) >= 10:
+            return
+        visited[node] = 1
+        stack.append(node)
+        for n in adj.get(node, []):
+            v = visited.get(n, 0)
+            if v == 0:
+                dfs(n)
+            elif v == 1:
+                idx = stack.index(n) if n in stack else -1
+                if idx >= 0:
+                    found.append(list(stack[idx:]) + [n])
+        stack.pop()
+        visited[node] = 2
+
+    for n in list(adj.keys()):
+        if visited.get(n, 0) == 0:
+            dfs(n)
+    return found
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--graph", type=Path, default=GRAPH)
+    args = parser.parse_args(argv)
+
+    if not args.graph.exists():
+        print(f"ERROR: graph not found: {args.graph}", file=sys.stderr)
+        return 2
+    g = json.loads(args.graph.read_text(encoding="utf-8"))
+    nodes: dict[str, dict] = g.get("nodes", {})
+    prereq_edges = g.get("edges", {}).get("prerequisite", [])
+
+    broken: list[list[str]] = [[fr, to] for fr, to in prereq_edges
+                                if to not in nodes]
+    inversions: list[dict] = []
+    adj: dict[str, list[str]] = defaultdict(list)
+    for fr, to in prereq_edges:
+        adj[fr].append(to)
+        if fr in nodes and to in nodes:
+            fr_lvl = LEVEL_RANK.get(nodes[fr].get("level", "beginner"), 1)
+            to_lvl = LEVEL_RANK.get(nodes[to].get("level", "beginner"), 1)
+            if to_lvl > fr_lvl:
+                inversions.append({"concept": fr, "level": nodes[fr].get("level"),
+                                    "prereq": to, "prereq_level": nodes[to].get("level")})
+
+    cycles = _cycles(adj)
+    orphans = []
+    has_inbound = set(to for _, to in prereq_edges)
+    has_outbound = set(fr for fr, _ in prereq_edges)
+    for n in nodes:
+        if n not in has_inbound and n not in has_outbound:
+            orphans.append(n)
+
+    report = {
+        "graph_path": str(args.graph),
+        "nodes_n": len(nodes),
+        "prereq_edges_n": len(prereq_edges),
+        "broken_edges_n": len(broken),
+        "broken_sample": broken[:10],
+        "level_inversions_n": len(inversions),
+        "inversions_sample": inversions[:10],
+        "cycles_n": len(cycles),
+        "cycles_sample": [c[:5] for c in cycles[:3]],
+        "orphans_n": len(orphans),
+        "orphans_sample": orphans[:10],
+        "clean": not (broken or cycles or inversions),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["clean"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

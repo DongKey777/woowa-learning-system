@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""bin/learning-turn-audit — verify history.jsonl turn integrity (Phase W4).
+
+For each rag_ask event in the last N turns, check:
+- payload has prompt + router_mode
+- ts is non-zero
+- if response_quality.jsonl has matching source_event_id (telemetry joined)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+from scripts.mining.jsonl_iter import iter_jsonl  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--last", type=int, default=100)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    history = args.state_root / "learner" / "history.jsonl"
+    quality = args.state_root / "learner" / "response-quality.jsonl"
+
+    # Build response-quality index by source_event_id
+    quality_index = {r.get("source_event_id"): r for r in iter_jsonl(quality)
+                      if r.get("source_event_id")}
+
+    all_rag = [ev for ev in iter_jsonl(history, event_type="rag_ask")]
+    sample = all_rag[-args.last:]
+
+    issues: list[dict] = []
+    for ev in sample:
+        eid = ev.get("event_id")
+        payload = ev.get("payload") or {}
+        evt_issues = []
+        if not payload.get("prompt"):
+            evt_issues.append("missing_prompt")
+        if not payload.get("router_mode"):
+            evt_issues.append("missing_router_mode")
+        if not ev.get("ts"):
+            evt_issues.append("missing_ts")
+        # response-quality join optional (only some turns have it)
+        if evt_issues:
+            issues.append({"event_id": eid, "issues": evt_issues})
+
+    joined_n = sum(1 for ev in sample if ev.get("event_id") in quality_index)
+
+    print(json.dumps({
+        "history_path": str(history),
+        "rag_ask_total": len(all_rag),
+        "audited_last_n": len(sample),
+        "issues_n": len(issues),
+        "issues_sample": issues[:10],
+        "response_quality_joined": joined_n,
+        "join_rate_pct": round(joined_n / max(1, len(sample)) * 100, 1),
+    }, ensure_ascii=False, indent=2))
+    return 0 if not issues else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
