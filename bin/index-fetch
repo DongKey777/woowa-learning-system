@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""bin/index-fetch — download pre-built Lance index from GitHub Releases.
+
+학습자 기기에서 로컬 인덱스 빌드는 절대 금지 (M4 15-30분 + 4-6GB RAM).
+Maintainer가 RunPod 등에서 빌드 후 publish한 release artifact만 사용.
+
+Default tag: paradigm-v2-index-v1.0.0
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TAG = "paradigm-v2-index-v1.0.0"
+DEFAULT_PATTERN = "paradigm-v2-index-v1.0.0.tar.zst"
+EXPECTED_SHA256 = "400ea282e2f03f6c69c1e907940ab0a57f6b4f0cc7301abc8edb02f3639a4934"
+STATE_DIR = REPO_ROOT / "state"
+
+
+def _sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tag", default=DEFAULT_TAG)
+    parser.add_argument("--pattern", default=DEFAULT_PATTERN)
+    parser.add_argument("--expected-sha256", default=EXPECTED_SHA256,
+                        help="if set, abort on hash mismatch")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite state/index/ if already present")
+    args = parser.parse_args(argv)
+
+    target = STATE_DIR / "index"
+    if target.exists() and not args.force:
+        print(f"[index-fetch] state/index/ already exists ({target}). "
+              f"Use --force to overwrite.", file=sys.stderr)
+        return 0
+
+    # Verify gh CLI present
+    try:
+        subprocess.run(["gh", "--version"], check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("[index-fetch] ERROR: gh CLI 미설치. macOS: brew install gh, "
+              "Ubuntu: sudo apt install gh, Windows: winget install GitHub.cli",
+              file=sys.stderr)
+        return 2
+
+    # Download to temp
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_archive = Path(tmp) / args.pattern
+        print(f"[index-fetch] downloading {args.tag}/{args.pattern}...", flush=True)
+        res = subprocess.run(
+            ["gh", "release", "download", args.tag,
+             "--repo", "DongKey777/woowa-learning-system",
+             "--pattern", args.pattern,
+             "--output", str(tmp_archive)],
+            capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            print(f"[index-fetch] gh release download failed:\n{res.stderr}",
+                  file=sys.stderr)
+            return 2
+
+        if args.expected_sha256:
+            got = _sha256(tmp_archive)
+            if got != args.expected_sha256:
+                print(f"[index-fetch] SHA256 mismatch — expected "
+                      f"{args.expected_sha256}, got {got}", file=sys.stderr)
+                return 3
+            print(f"[index-fetch] SHA256 verified: {got[:16]}…", flush=True)
+
+        # Extract
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            import shutil
+            shutil.rmtree(target)
+        print(f"[index-fetch] extracting to {STATE_DIR}/index ...", flush=True)
+        # zstd -d | tar -xf -  (portable on BSD tar / GNU tar both)
+        zstd_proc = subprocess.Popen(
+            ["zstd", "-d", "-c", str(tmp_archive)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        tar_proc = subprocess.Popen(
+            ["tar", "-xf", "-", "-C", str(STATE_DIR)],
+            stdin=zstd_proc.stdout, stderr=subprocess.PIPE,
+        )
+        zstd_proc.stdout.close()  # let SIGPIPE propagate cleanly
+        tar_stderr = tar_proc.communicate()[1]
+        zstd_stderr = zstd_proc.communicate()[1]
+        if tar_proc.returncode != 0 or zstd_proc.returncode != 0:
+            print(f"[index-fetch] extract failed:\n"
+                  f"  zstd: {zstd_stderr.decode(errors='replace')[:200]}\n"
+                  f"  tar:  {tar_stderr.decode(errors='replace')[:200]}",
+                  file=sys.stderr)
+            return 4
+
+    if not (target / "concepts.lance").exists():
+        print(f"[index-fetch] post-extract verification failed — "
+              f"{target}/concepts.lance not found", file=sys.stderr)
+        return 5
+
+    print(f"[index-fetch] ✓ {target}/concepts.lance ready", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

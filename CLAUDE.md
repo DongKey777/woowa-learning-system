@@ -41,19 +41,15 @@ pip install -e .
 - 첫 daemon 시작 시 `BAAI/bge-m3` (~3GB) 자동 다운로드.
 - offline 환경: `export HF_HUB_OFFLINE=1` 후 사전 캐시된 모델 사용.
 
-### Step 3. Lance 인덱스 준비
-두 경로 중 하나:
-
-**(a) 사전 빌드된 release 다운로드** (권장, 빠름)
-- GitHub Releases에서 `paradigm-v2-index-vX.Y.Z` artifact (~12MB) 다운로드 → `state/index/` 추출.
-- 명령: 별도 release-fetch 스크립트 없을 시 `gh release download paradigm-v2-index-vX.Y.Z --pattern 'state-index.tar.zst' && tar -I zstd -xf state-index.tar.zst -C state/`.
-
-**(b) 로컬 빌드** (release 없으면 fallback)
+### Step 3. Lance 인덱스 다운로드 (release fetch only)
 ```bash
-bin/corpus-build
+bin/index-fetch
 ```
-- M4 16GB warm BGE-M3: 15-30분, peak RAM 4-6GB.
-- 결과: `state/index/concept.lance/` (~12MB).
+- GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.0` (12.7MB, SHA256 검증) → `state/index/`
+- 소요: ~15초
+- `gh` CLI 미설치면 한국어로 OS별 설치 안내 후 재시도
+
+**🚫 학습자 기기 `bin/corpus-build` 금지** — 15-30분 + 4-6GB peak RAM이라 학습 흐름 차단. 새 버전 필요 시 maintainer가 RunPod에서 빌드 후 `gh release create`, 학습자는 `bin/index-fetch --tag <new>` 로 업데이트.
 
 ### Step 4. Daemon 백그라운드 시작
 ```bash

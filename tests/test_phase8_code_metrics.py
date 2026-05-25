@@ -51,7 +51,8 @@ def test_entry_point_count() -> None:
     learner_facing = {"ask"}
     maintenance = {"corpus-build", "corpus-curate", "eval-compare", "learn-event",
                    "graph-build", "phase9-gate",
-                   "mission-patterns-build", "cross-crew-build"}
+                   "mission-patterns-build", "cross-crew-build",
+                   "index-fetch"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)

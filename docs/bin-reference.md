@@ -4,10 +4,11 @@
 |---|---|---|
 | [`bin/ask`](#binask) | A | 학습자 자연어 query → daemon ask (학습자 외울 명령 X) |
 | [`bin/rag-daemon`](#binrag-daemon) | A/B | BGE-M3 warm daemon start/stop/ping/status |
+| [`bin/index-fetch`](#binindex-fetch) | A | GitHub Releases에서 pre-built Lance 인덱스 다운로드 |
 | [`bin/learn-event`](#binlearn-event) | A | code_attempt/drill_answer/self_assess 등 이벤트 기록 |
 | [`bin/mission-patterns-build`](#binmission-patterns-build) | A/B | F10 forward — 학습자 PR Java → mission_patterns.json |
 | [`bin/cross-crew-build`](#bincross-crew-build) | A/B | F11 cross-crew parquet 사전 빌드 |
-| [`bin/corpus-build`](#bincorpus-build) | B | Lance dense 인덱스 빌드 (RunPod / 로컬) |
+| [`bin/corpus-build`](#bincorpus-build) | B (maintainer only) | Lance dense 인덱스 빌드 — **학습자 기기 금지** |
 | [`bin/corpus-curate`](#bincorpus-curate) | B | corpus JSON validation + lint |
 | [`bin/graph-build`](#bingraph-build) | B | concept_graph.json 재빌드 (prereq 등) |
 | [`bin/eval-compare`](#bineval-compare) | B | 두 eval 결과 비교 |
@@ -117,19 +118,45 @@ trigger: 학습자가 *"다른 크루는"*, *"정밀 비교"*, *"cross-crew"* �
 
 ---
 
-## `bin/corpus-build`
+## `bin/index-fetch`
 
-Lance dense 인덱스 빌드 (3199 concept × BGE-M3 1024-d → ~12MB).
+GitHub Releases에서 pre-built Lance 인덱스 다운로드. SHA256 검증 후 `state/index/`로 추출.
 
+```bash
+bin/index-fetch [--tag paradigm-v2-index-v1.0.0] [--force] [--expected-sha256 <hex>]
+```
+
+옵션:
+- `--tag <tag>`: 다른 release version 지정
+- `--force`: 기존 `state/index/`를 덮어쓰기 (default는 존재 시 건너뜀)
+- `--expected-sha256 <hex>`: 무결성 검증 (default는 v1.0.0의 hash hardcoded)
+
+의존: `gh` CLI + GitHub 인증 (`gh auth login`)
+
+학습자 onboarding의 Step 3에 해당. 소요 ~15초 (12.7MB).
+
+---
+
+## `bin/corpus-build` (maintainer only)
+
+🚫 **학습자 기기에서는 절대 실행 금지**. M4 15-30분 + 4-6GB peak RAM. 학습자는 `bin/index-fetch`만 사용.
+
+Maintainer가 RunPod 또는 강한 머신에서 새 인덱스 빌드 시:
 ```bash
 bin/corpus-build [--corpus-dir corpus/concepts] [--index-dir state/index]
 ```
 
-- M4 16GB warm BGE-M3: 15-30분, peak RAM 4-6GB
+- M4 16GB: 15-30분
 - RunPod H100: ~5분
-- 결과: `state/index/concept.lance/` + `state/index/manifest.json`
+- 결과: `state/index/concepts.lance/` + `state/index/manifest.json`
 
-대안: GitHub Releases의 사전 빌드 fetch (권장, 10초). [`onboarding.md`](onboarding.md) Step 3 참조.
+Build 후 publish 흐름:
+```bash
+tar --use-compress-program='zstd -19' -cf /tmp/paradigm-v2-index-vX.Y.Z.tar.zst -C state index
+gh release create paradigm-v2-index-vX.Y.Z /tmp/paradigm-v2-index-vX.Y.Z.tar.zst \
+    --title "paradigm-v2 Lance index vX.Y.Z" --notes "..."
+# 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-vX.Y.Z 로 업데이트
+```
 
 ---
 

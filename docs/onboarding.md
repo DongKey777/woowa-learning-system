@@ -72,32 +72,26 @@ offline 환경: 사전에 모델 폴더 복사 후 `export HF_HUB_OFFLINE=1`.
 
 학습자 디스크 ≥ 4GB 여유 권장. 부족하면 한국어로 안내 후 대기 (silent abort X).
 
-### Step 3 — Lance 인덱스 준비
-
-두 경로 중 하나:
-
-#### (a) 사전 빌드 release fetch (권장)
-GitHub Releases에 `paradigm-v2-index-vX.Y.Z` artifact (~12MB) 업로드되어 있으면:
+### Step 3 — Lance 인덱스 다운로드 (release fetch only)
 
 ```bash
-gh release download paradigm-v2-index-vX.Y.Z --pattern 'state-index.tar.zst' -O /tmp/state-index.tar.zst
-mkdir -p state
-tar -I zstd -xf /tmp/state-index.tar.zst -C state/
+bin/index-fetch
 ```
 
-소요: ~10초.
+GitHub Releases (`DongKey777/woowa-learning-system`)에 publish된 사전 빌드 인덱스 (12.7MB zstd compressed)를 다운로드해서 `state/index/`로 추출. SHA256 자동 검증.
 
-#### (b) 로컬 빌드 fallback
+- 소요: 10-20초 (네트워크 광대역)
+- 의존: `gh` CLI (미설치면 한국어로 OS별 설치 안내)
+- 기본 tag: `paradigm-v2-index-v1.0.0`
 
-```bash
-bin/corpus-build
-```
+#### 🚫 학습자 기기 로컬 빌드 절대 금지
 
-- M4 16GB warm BGE-M3: **15-30분** (3199 concept × 1024-d 인코딩)
-- peak RAM: 4-6GB
-- 결과: `state/index/concept.lance/` (~12MB)
+`bin/corpus-build`는 **maintainer 전용** (RunPod / 강한 머신). 학습자 M4 기기에서 직접 빌드하면:
+- 15-30분 소요 (BGE-M3 인코딩 dominates)
+- peak RAM 4-6GB (8GB 기기 swap)
+- 학습 흐름 차단
 
-진행 중 한국어로 1분마다 진척 보고 (예: *"인덱스 빌드 중… 500/3199*).
+학습자 onboarding에서는 **`bin/index-fetch`만 사용**. 새 인덱스 버전이 필요하면 maintainer가 RunPod에서 빌드 → `gh release create` → 학습자는 `bin/index-fetch --tag <new>` 로 업데이트.
 
 ### Step 4 — Daemon 시작
 
@@ -150,9 +144,11 @@ python3 bin/ask "테스트 query"
 - HF rate limit. `HF_TOKEN` 환경변수 설정 권장 (학습자에게 한국어로 anonymous → token 권고).
 - 또는 다시 시도 (resume 됨).
 
-### `bin/corpus-build` 중 OOM
-- M4 8GB 모델에서 발생 가능. peak RAM 4-6GB라 8GB 머신은 swap 발생.
-- 권장: 16GB 이상 머신 / release fetch 경로 사용.
+### `bin/index-fetch` 실패
+- `gh` CLI 미설치: macOS `brew install gh`, Ubuntu `sudo apt install gh`, Windows `winget install GitHub.cli`
+- GitHub 인증 실패: `gh auth login` 으로 브라우저 인증
+- SHA256 mismatch: release artifact가 손상됐을 가능성. maintainer에게 보고.
+- 학습자 기기에서 `bin/corpus-build` 시도는 금지 (위 §Step 3 참조).
 
 ### Daemon 시작 후 ping 응답 없음
 - `cat /tmp/daemon.log` 로 에러 확인.
@@ -186,10 +182,10 @@ python3 bin/ask "테스트 query"
 |---|---|
 | `pip install -e .` | ~30초 (캐시 hit) ~ 2분 (cold) |
 | BGE-M3 다운로드 | ~5분 (3GB) |
-| 인덱스 빌드 (a) release | ~10초 |
-| 인덱스 빌드 (b) local | ~20분 |
+| `bin/index-fetch` (release) | ~15초 (12.7MB) |
 | Daemon prewarm | ~10초 |
-| **합계 (release path)** | **~6분** |
-| **합계 (local build)** | **~28분** |
+| **합계 (학습자 path)** | **~6분** |
 
 두 번째 이후 세션은 daemon 살아있으면 즉시. daemon 죽었으면 step 4부터 (~10초).
+
+학습자 path는 **항상 release fetch**. 로컬 인덱스 빌드는 학습 흐름 차단하므로 maintainer 전용.

@@ -35,8 +35,13 @@ deps: `sentence-transformers`, `FlagEmbedding`, `lancedb`, `numpy`, `pyarrow`, `
 ### Step 2. HF 모델 캐시
 - 첫 daemon 시작 때 `BAAI/bge-m3` (~3GB) 자동 fetch. offline = `export HF_HUB_OFFLINE=1`.
 
-### Step 3. Lance 인덱스
-- 사전 빌드 release fetch (권장, 12MB) OR `bin/corpus-build` 로컬 빌드 (M4 15-30분).
+### Step 3. Lance 인덱스 (release fetch only)
+```bash
+bin/index-fetch
+```
+GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.0` (12.7MB, SHA256 검증) → `state/index/`. 소요 ~15초.
+
+**🚫 학습자 기기 로컬 빌드 금지** — `bin/corpus-build`는 maintainer 전용 (15-30분 + 4-6GB peak RAM). 학습자는 `bin/index-fetch`만 사용.
 
 ### Step 4. Daemon 시작
 ```bash

@@ -25,12 +25,14 @@
    ```
 2. AI 세션 열기 — Claude Code / Codex CLI / Gemini CLI 중 아무거나.
 3. AI에게 한국어로 한 문장: *"세팅하고 학습 시작하자"*
-4. AI가 [First-Run Protocol](docs/onboarding.md)을 자동 수행:
+4. AI가 [First-Run Protocol](docs/onboarding.md)을 자동 수행 (~6분):
    - Python 3.10+ 확인 + `pip install -e .`
    - BGE-M3 모델 캐시 다운로드 (~3GB, 첫 실행만)
-   - Lance 인덱스 빌드 또는 release 다운로드 (~12MB)
-   - daemon 백그라운드 시작
+   - `bin/index-fetch` — GitHub Releases에서 사전 빌드된 Lance 인덱스 다운로드 (12.7MB, ~15초)
+   - `bin/rag-daemon start` 백그라운드
 5. 학습자는 한국어로 질문만 던지면 됨. *"Bean DI가 뭐야"*, *"내 ReservationController 어떻게 리팩토링"*, *"다른 크루는 어떻게 작성했어"*, *"확인 질문 줘"* 등.
+
+> **🚫 학습자 기기에서 인덱스 빌드 금지** — `bin/corpus-build`는 15-30분 + 4-6GB peak RAM이라 학습 흐름 차단. 새 인덱스 버전은 maintainer가 RunPod에서 빌드 후 GitHub Releases에 publish, 학습자는 `bin/index-fetch --tag <new>` 로만 업데이트.
 
 ## AI 세션 진입 문서
 
