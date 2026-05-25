@@ -58,7 +58,8 @@ def test_entry_point_count() -> None:
                    "mission-patterns-build", "cross-crew-build",
                    "index-fetch",
                    # Phase T-X new wrappers
-                   "learn-pr-retro", "learn-record-code", "learn-test"}
+                   "learn-pr-retro", "learn-record-code", "learn-test",
+                   "learn-response-quality"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)
