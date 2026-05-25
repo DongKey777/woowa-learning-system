@@ -28,14 +28,18 @@ def _count_python_loc(root: Path) -> int:
 
 def test_runtime_loc_under_paradigm_v2_budget() -> None:
     total = sum(_count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS)
-    assert total <= 4000, f"runtime LOC {total} exceeds paradigm-v2 budget 4000"
+    # Plan §D-I justified expansion: F6 drill (core/drill.py ~250 LOC) closes
+    # the offer-gen gap so paradigm-v2 owns the full Bloom autoloop end-to-end.
+    assert total <= 4300, f"runtime LOC {total} exceeds paradigm-v2 budget 4300"
 
 
 def test_per_module_loc_breakdown_within_plan() -> None:
     """Plan §D-I — per-module budget after paradigm-v2 expansion."""
     breakdown = {d: _count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS}
     assert breakdown["rag"] <= 800, f"rag {breakdown['rag']} > 800"
-    assert breakdown["core"] <= 2200, f"core {breakdown['core']} > 2200 (paradigm-v2 + Phase H daemon ask action)"
+    # core bumped from 2200 → 2500 after Phase O (core/drill.py + daemon
+    # drill wiring + coach drill_offer render).
+    assert breakdown["core"] <= 2500, f"core {breakdown['core']} > 2500 (paradigm-v2 + Phase H/O)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"

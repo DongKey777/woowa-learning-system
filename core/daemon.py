@@ -203,6 +203,24 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     )
                     artifacts = lazy_load(decision, repo=repo, state_root=state_root,
                                           query=prompt, corpus=corpus)
+                    # Drill mode integration: if router dispatched drill and
+                    # there's no pending offer yet, try to build one from the
+                    # learner's uncertain concepts so the AI session has a
+                    # concrete question to present.
+                    if decision.mode == "drill":
+                        from core.drill import build_offer_if_due
+                        uncertain = profile.uncertain_concepts or []
+                        offer = build_offer_if_due(
+                            learner_id=learner_id, state_root=state_root,
+                            uncertain_concept_ids=uncertain,
+                        )
+                        if offer:
+                            artifacts["drill_offer"] = {
+                                "concept_id": offer.concept_id,
+                                "question": offer.question,
+                                "expected_terms": offer.expected_terms,
+                                "source": offer.source,
+                            }
                     recent = read_history(state_root=state_root, tail=20)
                     markdown = compose(decision, artifacts, prompt, repo=repo,
                                        learner_id=learner_id, recent_history=recent)

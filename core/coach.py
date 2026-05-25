@@ -125,6 +125,12 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
                     parts.append(f"    ↳ {snip}")
         else:
             parts.append("### cross_crew_review_graph (NOT YET BUILT — Phase C pending)")
+    if "drill_offer" in artifacts:
+        do = artifacts["drill_offer"]
+        parts.append(f"### drill_offer (concept={do.get('concept_id')})")
+        parts.append(f"  question: {do.get('question')}")
+        if do.get("expected_terms"):
+            parts.append(f"  expected_terms: {do['expected_terms'][:5]}")
     if "rag_hits" in artifacts:
         hits = artifacts["rag_hits"]
         parts.append("### rag_hits (BGE-M3 dense + relations walk, top-5)")
