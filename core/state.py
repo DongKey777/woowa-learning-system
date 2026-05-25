@@ -141,20 +141,25 @@ def read_history(
             except json.JSONDecodeError:
                 continue
         return out
-    # Tail mode — seek-from-end, read last chunk (~500 bytes per event)
+    # Tail mode — seek-from-end, retry with larger chunk if we don't get
+    # `tail` complete events back (event sizes vary 277-2274 bytes empirically).
     size = p.stat().st_size
-    chunk = min(size, max(tail * 500, 4096))
-    with p.open("rb") as f:
-        f.seek(max(0, size - chunk))
-        data = f.read()
-    raw_lines = data.decode("utf-8", errors="replace").splitlines()
-    if size > chunk and raw_lines:
-        # First line may be partial — drop it
-        raw_lines = raw_lines[1:]
+    bytes_per_event = 1500  # safe upper-band estimate
+    for attempt in range(4):  # 1500 → 3000 → 6000 → 12000 bytes/event
+        chunk = min(size, max(tail * bytes_per_event, 4096))
+        with p.open("rb") as f:
+            f.seek(max(0, size - chunk))
+            data = f.read()
+        raw_lines = data.decode("utf-8", errors="replace").splitlines()
+        if size > chunk and raw_lines:
+            # First line may be partial — drop it
+            raw_lines = raw_lines[1:]
+        valid_lines = [L for L in raw_lines if L.strip()]
+        if len(valid_lines) >= tail or chunk >= size:
+            break
+        bytes_per_event *= 2
     out: list[dict] = []
-    for line in raw_lines[-tail:]:
-        if not line.strip():
-            continue
+    for line in valid_lines[-tail:]:
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
