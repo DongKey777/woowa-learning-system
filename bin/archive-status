@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""bin/archive-status — per-repo PR archive status (Phase U).
+
+Reports SQLite archive freshness + stats. Lightweight (no gh call).
+
+CLI: bin/archive-status [--repo R] [--json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _repo_status(repo_dir: Path, freshness_hours: float = 24.0) -> dict:
+    name = repo_dir.name
+    db = repo_dir / "archive" / "prs.sqlite3"
+    if not db.exists():
+        return {"repo": name, "archive_present": False,
+                "bootstrap_state": "uninitialized"}
+    out: dict = {"repo": name, "archive_present": True,
+                  "db_path": str(db), "db_size_bytes": db.stat().st_size}
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM pull_requests_current").fetchone()[0]
+        open_n = conn.execute(
+            "SELECT COUNT(*) FROM pull_requests_current WHERE state='open'"
+        ).fetchone()[0]
+        merged_n = conn.execute(
+            "SELECT COUNT(*) FROM pull_requests_current WHERE merged_at IS NOT NULL"
+        ).fetchone()[0]
+        rc_n = conn.execute(
+            "SELECT COUNT(*) FROM pull_request_review_comments_current"
+        ).fetchone()[0]
+        # Schema-tolerant: paradigm-v2 schema uses `status` TEXT; legacy
+        # schema uses `success` INTEGER. Detect at runtime.
+        cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(collection_runs)").fetchall()}
+        status_col = "status" if "status" in cols else \
+                     "(CASE WHEN success=1 THEN 'succeeded' ELSE 'failed' END) AS status"
+        latest = conn.execute(
+            f"SELECT mode, started_at, finished_at, {status_col} FROM collection_runs "
+            f"ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        out.update({
+            "prs_total": total, "prs_open": open_n, "prs_merged": merged_n,
+            "review_comments_total": rc_n,
+            "latest_run": dict(latest) if latest else None,
+        })
+        # Freshness
+        if latest and latest["finished_at"]:
+            try:
+                import datetime as dt
+                ft = dt.datetime.fromisoformat(latest["finished_at"].replace("Z", "+00:00"))
+                age_h = (dt.datetime.now(dt.timezone.utc) - ft).total_seconds() / 3600
+                out["age_hours_since_last_run"] = round(age_h, 1)
+                out["freshness"] = "fresh" if age_h <= freshness_hours else "stale"
+            except Exception:
+                out["freshness"] = "unknown"
+        if total >= 20 and rc_n >= 10:
+            out["bootstrap_state"] = "ready"
+        elif total > 0:
+            out["bootstrap_state"] = "partial"
+        else:
+            out["bootstrap_state"] = "empty"
+    except sqlite3.OperationalError as e:
+        out["error"] = str(e)
+        out["bootstrap_state"] = "schema_missing"
+    finally:
+        conn.close()
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", default=None,
+                        help="single repo (default: all under state/repos/)")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--freshness-hours", type=float, default=24.0)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    repos_dir = args.state_root / "repos"
+    if args.repo:
+        target_dirs = [repos_dir / args.repo]
+        if not target_dirs[0].exists():
+            print(f"ERROR: no such repo dir: {target_dirs[0]}", file=sys.stderr)
+            return 2
+    else:
+        target_dirs = sorted([d for d in repos_dir.iterdir() if d.is_dir()]
+                              if repos_dir.exists() else [])
+
+    out = [_repo_status(d, freshness_hours=args.freshness_hours) for d in target_dirs]
+    payload = {"repos_n": len(out), "results": out}
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

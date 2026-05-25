@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""bin/registry-audit — paradigm-v2 repos registry consistency check (Phase U).
+
+Looks for:
+- repos in state/repos/ that have no missions/<name> clone (orphan archive)
+- missions/<name> directories with no archive (uninitialized)
+- archive sqlite present but schema corrupt (no pull_requests_current table)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def audit(state_root: Path, missions_root: Path) -> dict:
+    state_repos = state_root / "repos"
+    state_names = set(d.name for d in state_repos.iterdir()
+                       if d.is_dir()) if state_repos.exists() else set()
+    mission_names = set(d.name for d in missions_root.iterdir()
+                         if d.is_dir() and (d / ".git").exists()) if missions_root.exists() else set()
+
+    orphans_state = sorted(state_names - mission_names)
+    uninit_missions = sorted(mission_names - state_names)
+    corrupt = []
+    for name in sorted(state_names & mission_names):
+        db = state_repos / name / "archive" / "prs.sqlite3"
+        if not db.exists():
+            corrupt.append({"repo": name, "reason": "no archive"})
+            continue
+        try:
+            conn = sqlite3.connect(str(db))
+            conn.execute("SELECT 1 FROM pull_requests_current LIMIT 1").fetchone()
+            conn.close()
+        except sqlite3.OperationalError as e:
+            corrupt.append({"repo": name, "reason": str(e)[:200]})
+
+    return {
+        "state_repos_n": len(state_names),
+        "mission_clones_n": len(mission_names),
+        "orphans_state_without_clone": orphans_state,
+        "uninitialized_clones": uninit_missions,
+        "corrupt_archives": corrupt,
+        "clean": not (orphans_state or uninit_missions or corrupt),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--missions-root", type=Path,
+                        default=Path(__file__).resolve().parent.parent / "missions")
+    args = parser.parse_args(argv)
+
+    report = audit(args.state_root, args.missions_root)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["clean"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

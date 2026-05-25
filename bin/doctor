@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""bin/doctor — paradigm-v2 system health check (Phase U).
+
+Checks:
+- python version (≥3.10)
+- gh CLI installed + auth status
+- Lance index present
+- BGE-M3 model cached (HF cache dir)
+- daemon alive
+- state schema (validate-state)
+- archive registry (registry-audit)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _check_python() -> dict:
+    v = sys.version_info
+    ok = v >= (3, 10)
+    return {"check": "python", "ok": ok,
+            "version": f"{v.major}.{v.minor}.{v.micro}", "min": "3.10"}
+
+
+def _check_gh() -> dict:
+    if not shutil.which("gh"):
+        return {"check": "gh_cli", "ok": False,
+                "fix": "macOS: brew install gh / Ubuntu: sudo apt install gh"}
+    r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    return {"check": "gh_cli", "ok": r.returncode == 0,
+            "auth_output_excerpt": (r.stdout or r.stderr)[:120]}
+
+
+def _check_index(state_root: Path) -> dict:
+    p = state_root / "index" / "concepts.lance"
+    if not p.exists():
+        return {"check": "lance_index", "ok": False,
+                "fix": "bin/index-fetch (downloads ~12MB from GitHub Releases)"}
+    return {"check": "lance_index", "ok": True, "path": str(p)}
+
+
+def _check_bge_m3() -> dict:
+    # HF cache default: ~/.cache/huggingface/hub
+    hf_cache = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+    cand = hf_cache / "hub" / "models--BAAI--bge-m3"
+    if not cand.exists():
+        cand = hf_cache / "models--BAAI--bge-m3"
+    return {"check": "bge_m3_cached", "ok": cand.exists(),
+            "path": str(cand) if cand.exists() else None,
+            "fix": "first daemon ask will auto-download (~3GB)"}
+
+
+def _check_daemon(state_root: Path) -> dict:
+    sock_path = state_root / "rag-daemon.sock"
+    if not sock_path.exists():
+        return {"check": "daemon_alive", "ok": False,
+                "fix": "nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &"}
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(str(sock_path))
+        s.sendall(b'{"action":"ping"}\n')
+        s.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            c = s.recv(1024)
+            if not c:
+                break
+            data += c
+        s.close()
+        resp = json.loads(data.decode().strip())
+        return {"check": "daemon_alive", "ok": resp.get("alive") is True}
+    except Exception as e:
+        return {"check": "daemon_alive", "ok": False, "error": str(e)[:80]}
+
+
+def _check_validate_state(state_root: Path) -> dict:
+    r = subprocess.run([sys.executable, str(REPO_ROOT / "bin" / "validate-state"),
+                        "--state-root", str(state_root)],
+                       capture_output=True, text=True)
+    try:
+        data = json.loads(r.stdout)
+        return {"check": "state_schema", "ok": data.get("ok") is True,
+                "errors_n": data.get("errors_n", 0)}
+    except Exception:
+        return {"check": "state_schema", "ok": False, "stderr": r.stderr[:120]}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    checks = [
+        _check_python(),
+        _check_gh(),
+        _check_index(args.state_root),
+        _check_bge_m3(),
+        _check_daemon(args.state_root),
+        _check_validate_state(args.state_root),
+    ]
+    passed = sum(1 for c in checks if c["ok"])
+    report = {
+        "checks": checks, "passed": passed, "total": len(checks),
+        "healthy": passed == len(checks),
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["healthy"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

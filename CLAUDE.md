@@ -123,6 +123,24 @@ python3 bin/ask "테스트"
 - 인공적 표현 회피 (계약/깨뜨리다/부담/같은 결/비대칭 등 AI-stylized 단어 X).
 - 답변 마지막 1줄 요약 1-2 문장. 길게 설명하지 않음.
 
+### 4.7 Phase U onboarding/collection auto-call (2026-05-25 신설)
+
+학습자가 새 미션 시작 의도 표현 시 (예: *"새 미션 step5 시작"*, *"<repo> 추가"*):
+
+```
+bin/onboard-repo --repo <r> --owner <o> [--path missions/<r>] [--learner-login DongKey777]
+  → 1. gh repo clone (if missing)
+  → 2. bin/bootstrap-repo (full archive collection from GitHub)
+  → 3. bin/mission-patterns-build (F10 forward)
+  → 4. bin/cross-crew-build (F11 — 5-10분 BGE-M3)
+```
+
+학습자가 *"PR 동기화"*, *"새 리뷰"* 표현 시: `bin/sync-prs --repo <r> --owner <o>` (incremental).
+
+학습자가 *"오류"*, *"안 돼"* 표현 시 또는 정기 health check: `bin/doctor` (5/6+ healthy 확인).
+
+학습자가 직접 명령 외울 필요 0. paradigm-v2 self-contained (legacy hub 의존 0). 의존: `gh` CLI 설치 + `gh auth login`.
+
 ### 4.6 Phase T learner-automation auto-call (2026-05-25 신설)
 
 학습자 의도에 따라 다음 wrapper 자동 호출:

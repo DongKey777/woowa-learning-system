@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""bin/validate-state — schema check for paradigm-v2 state files (Phase U).
+
+Validates JSON/SQLite files under state/learner/ and state/repos/<r>/
+against known shapes (paradigm-v2 v3 profile + history.jsonl + mastery
+sqlite + drill pending/due).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+PROFILE_REQUIRED = {"schema_version", "learner_id", "experience_level",
+                     "concepts", "activity", "computed_at"}
+PROFILE_CONCEPTS_REQUIRED = {"mastered", "proficient", "uncertain", "underexplored"}
+
+
+def validate(state_root: Path) -> dict:
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    checked = 0
+
+    # 1. profile.json
+    p = state_root / "learner" / "profile.json"
+    if p.exists():
+        checked += 1
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            missing = PROFILE_REQUIRED - set(data.keys())
+            if missing:
+                errors.append({"file": "profile.json", "error": f"missing keys: {sorted(missing)}"})
+            elif data.get("schema_version") != "v3":
+                warnings.append({"file": "profile.json",
+                                  "warning": f"schema_version={data.get('schema_version')} (expected v3)"})
+            concept_missing = PROFILE_CONCEPTS_REQUIRED - set(data.get("concepts", {}).keys())
+            if concept_missing:
+                errors.append({"file": "profile.json",
+                                "error": f"missing concepts.*: {sorted(concept_missing)}"})
+        except json.JSONDecodeError as e:
+            errors.append({"file": "profile.json", "error": f"JSONDecodeError: {e}"})
+
+    # 2. history.jsonl
+    h = state_root / "learner" / "history.jsonl"
+    if h.exists():
+        checked += 1
+        bad_lines = 0
+        with h.open(encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if not line.strip():
+                    continue
+                try:
+                    ev = json.loads(line)
+                    if "event_type" not in ev:
+                        bad_lines += 1
+                except json.JSONDecodeError:
+                    bad_lines += 1
+        if bad_lines > 0:
+            warnings.append({"file": "history.jsonl",
+                              "warning": f"{bad_lines} malformed lines"})
+
+    # 3. mastery_graph.sqlite
+    db = state_root / "learner" / "mastery_graph.sqlite"
+    if db.exists():
+        checked += 1
+        try:
+            conn = sqlite3.connect(str(db))
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "mastery" not in tables:
+                errors.append({"file": "mastery_graph.sqlite",
+                                "error": "missing table: mastery"})
+            if "evidence" not in tables:
+                errors.append({"file": "mastery_graph.sqlite",
+                                "error": "missing table: evidence"})
+            conn.close()
+        except sqlite3.OperationalError as e:
+            errors.append({"file": "mastery_graph.sqlite", "error": str(e)})
+
+    # 4. drill_pending.json / drill_due.json (optional)
+    for nm in ("drill_pending.json", "drill_due.json"):
+        p = state_root / "learner" / nm
+        if p.exists():
+            checked += 1
+            try:
+                json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                errors.append({"file": nm, "error": f"JSONDecodeError: {e}"})
+
+    return {
+        "checked_files": checked,
+        "errors_n": len(errors),
+        "warnings_n": len(warnings),
+        "errors": errors,
+        "warnings": warnings,
+        "ok": len(errors) == 0,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 1 if any warning")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    report = validate(args.state_root)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["ok"]:
+        return 1
+    if args.strict and report["warnings_n"] > 0:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

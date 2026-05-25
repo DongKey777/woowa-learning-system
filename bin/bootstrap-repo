@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""bin/bootstrap-repo — full PR archive collection from GitHub (Phase U).
+
+Builds state/repos/<repo>/archive/prs.sqlite3 from gh API.
+
+CLI: bin/bootstrap-repo --repo R --owner O [--since ISO] [--limit N]
+                       [--title-contains S] [--max-gh-calls N] [--silent]
+
+Real ~50 PR repo: ~60-90s. gh CLI + auth required.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+from scripts.collection.collect_prs import collect  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True, help="local repo name (state/repos/<r>/)")
+    parser.add_argument("--owner", required=True, help="GitHub owner (e.g. woowacourse)")
+    parser.add_argument("--gh-repo", default=None,
+                        help="GitHub repo name (default: --repo)")
+    parser.add_argument("--since", default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--title-contains", default=None)
+    parser.add_argument("--max-gh-calls", type=int, default=500)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--silent", action="store_true")
+    args = parser.parse_args(argv)
+
+    db_path = args.state_root / "repos" / args.repo / "archive" / "prs.sqlite3"
+    gh_repo = args.gh_repo or args.repo
+
+    try:
+        report = collect(
+            owner=args.owner, repo=gh_repo, db_path=db_path,
+            mode="full", since=args.since, limit=args.limit,
+            title_contains=args.title_contains, max_calls=args.max_gh_calls,
+        )
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+    if not args.silent:
+        print(json.dumps({
+            "repo": args.repo,
+            "owner": args.owner,
+            "status": report.finished_status,
+            "prs_seen": report.prs_seen,
+            "prs_processed": report.prs_processed,
+            "prs_skipped": report.prs_skipped,
+            "files_upserted": report.files_upserted,
+            "review_comments_upserted": report.review_comments_upserted,
+            "issue_comments_upserted": report.issue_comments_upserted,
+            "gh_calls_used": report.gh_calls_used,
+            "failures": len(report.failures),
+            "db_path": str(db_path),
+        }, ensure_ascii=False, indent=2))
+    return 0 if report.finished_status == "succeeded" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

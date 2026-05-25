@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""bin/onboard-repo — onboard a new mission repo end-to-end (Phase U).
+
+Orchestrates:
+  1. (optional) gh repo clone if --upstream + path doesn't exist
+  2. bin/bootstrap-repo (full archive collection)
+  3. bin/mission-patterns-build
+  4. bin/cross-crew-build
+
+CLI: bin/onboard-repo --repo R --owner O [--path missions/<r>]
+                     [--limit N] [--silent]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _run(cmd: list[str], cwd: Path = REPO_ROOT, timeout: float = 600) -> dict:
+    t0 = time.perf_counter()
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                            timeout=timeout)
+        return {"cmd": cmd, "rc": r.returncode, "ms": round((time.perf_counter() - t0) * 1000, 1),
+                "stdout_tail": r.stdout[-500:] if r.stdout else "",
+                "stderr_tail": r.stderr[-500:] if r.stderr else ""}
+    except subprocess.TimeoutExpired:
+        return {"cmd": cmd, "rc": 124, "ms": -1, "error": "timeout"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--owner", required=True)
+    parser.add_argument("--gh-repo", default=None)
+    parser.add_argument("--path", type=Path, default=None,
+                        help="missions/<r>/ — if missing, gh repo clone")
+    parser.add_argument("--learner-login", default="DongKey777")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="cap PRs collected (for fast onboard)")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--silent", action="store_true")
+    args = parser.parse_args(argv)
+
+    mission_path = args.path or (REPO_ROOT / "missions" / args.repo)
+    gh_repo = args.gh_repo or args.repo
+    steps = []
+
+    # 1. clone if needed
+    if not mission_path.exists():
+        steps.append({"step": "clone"} | _run(
+            ["gh", "repo", "clone", f"{args.owner}/{gh_repo}", str(mission_path)],
+            timeout=120,
+        ))
+        if steps[-1]["rc"] != 0:
+            print(json.dumps({"error": "clone_failed", "steps": steps},
+                              ensure_ascii=False, indent=2))
+            return 2
+    else:
+        steps.append({"step": "clone", "rc": 0, "ms": 0, "skipped": "exists"})
+
+    # 2. bootstrap-repo
+    cmd = [sys.executable, str(REPO_ROOT / "bin" / "bootstrap-repo"),
+            "--repo", args.repo, "--owner", args.owner,
+            "--gh-repo", gh_repo, "--silent"]
+    if args.limit:
+        cmd.extend(["--limit", str(args.limit)])
+    steps.append({"step": "bootstrap-repo"} | _run(cmd, timeout=600))
+
+    # 3. mission-patterns-build
+    steps.append({"step": "mission-patterns-build"} | _run(
+        [sys.executable, str(REPO_ROOT / "bin" / "mission-patterns-build"),
+         "--repo", args.repo, "--learner-login", args.learner_login], timeout=60,
+    ))
+
+    # 4. cross-crew-build (lazy — slow, BGE-M3 invocation)
+    steps.append({"step": "cross-crew-build"} | _run(
+        [sys.executable, str(REPO_ROOT / "bin" / "cross-crew-build"),
+         "--repo", args.repo], timeout=900,
+    ))
+
+    success_n = sum(1 for s in steps if s.get("rc") == 0)
+    payload = {
+        "repo": args.repo, "owner": args.owner,
+        "mission_path": str(mission_path),
+        "steps_n": len(steps), "steps_success": success_n,
+        "steps": steps if not args.silent else
+                  [{k: s[k] for k in ("step", "rc", "ms")} for s in steps],
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if success_n == len(steps) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

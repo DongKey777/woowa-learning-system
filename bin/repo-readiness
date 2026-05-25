@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""bin/repo-readiness — per-repo capability readiness check (Phase U).
+
+Checks 4 sub-systems for a given repo:
+  archive (sqlite present + ready), mission_patterns, cross_crew (parquet),
+  learner-state.json recency.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def assess_readiness(repo: str, state_root: Path,
+                     learner_state_max_hours: float = 24) -> dict:
+    base = state_root / "repos" / repo
+    archive = base / "archive" / "prs.sqlite3"
+    mission_patterns = base / "mission_patterns.json"
+    cross_crew = base / "cross_crew_review_graph.parquet"
+    learner_state = base / "contexts" / "learner-state.json"
+    checks = {
+        "archive_present": archive.exists() and archive.stat().st_size > 0,
+        "mission_patterns_built": mission_patterns.exists(),
+        "cross_crew_built": cross_crew.exists(),
+        "learner_state_fresh": False,
+    }
+    if learner_state.exists():
+        try:
+            data = json.loads(learner_state.read_text(encoding="utf-8"))
+            age_h = (time.time() - float(data.get("computed_at", 0))) / 3600
+            checks["learner_state_fresh"] = age_h <= learner_state_max_hours
+        except Exception:
+            pass
+    passed = sum(1 for v in checks.values() if v)
+    return {
+        "repo": repo, "checks": checks, "passed": passed, "total": len(checks),
+        "ready": passed == len(checks),
+        "missing": [k for k, v in checks.items() if not v],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    r = assess_readiness(args.repo, args.state_root)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0 if r["ready"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

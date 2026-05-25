@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""bin/bootstrap — paradigm-v2 system-level bootstrap (Phase U).
+
+Runs First-Run Protocol step 1-6:
+  1. pip install -e . (if dev deps missing)
+  2. (HF model warm-up happens on first daemon ask)
+  3. bin/index-fetch (release artifact)
+  4. bin/rag-daemon start
+  5. (optional) doctor + validate-state
+
+CLI: bin/bootstrap [--skip-pip] [--skip-index] [--skip-daemon]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+
+def _run(cmd: list[str], cwd: Path = REPO_ROOT, timeout: float = 600) -> dict:
+    t0 = time.perf_counter()
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                            timeout=timeout)
+        return {"cmd": " ".join(cmd), "rc": r.returncode,
+                "ms": round((time.perf_counter() - t0) * 1000, 1),
+                "stderr_tail": (r.stderr or "")[-300:]}
+    except subprocess.TimeoutExpired:
+        return {"cmd": " ".join(cmd), "rc": 124, "ms": -1, "error": "timeout"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--skip-pip", action="store_true")
+    parser.add_argument("--skip-index", action="store_true")
+    parser.add_argument("--skip-daemon", action="store_true")
+    args = parser.parse_args(argv)
+
+    steps: list[dict] = []
+
+    # 1. pip install (idempotent)
+    if not args.skip_pip:
+        try:
+            import sentence_transformers  # noqa: F401
+            steps.append({"step": "pip", "rc": 0, "ms": 0, "skipped": "deps present"})
+        except ImportError:
+            steps.append({"step": "pip"} | _run(
+                [sys.executable, "-m", "pip", "install", "-e", "."], timeout=600
+            ))
+
+    # 2. index fetch
+    if not args.skip_index:
+        index_dir = REPO_ROOT / "state" / "index" / "concepts.lance"
+        if index_dir.exists():
+            steps.append({"step": "index-fetch", "rc": 0, "ms": 0, "skipped": "present"})
+        else:
+            steps.append({"step": "index-fetch"} | _run(
+                [sys.executable, str(REPO_ROOT / "bin" / "index-fetch")], timeout=120
+            ))
+
+    # 3. daemon start (background)
+    if not args.skip_daemon:
+        sock = REPO_ROOT / "state" / "rag-daemon.sock"
+        if sock.exists():
+            steps.append({"step": "rag-daemon", "rc": 0, "ms": 0, "skipped": "alive"})
+        else:
+            # Start in background, wait briefly for socket
+            log = Path("/tmp/paradigm-v2-daemon-bootstrap.log")
+            with log.open("w") as f:
+                subprocess.Popen([sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"),
+                                   "start"], stdout=f, stderr=subprocess.STDOUT)
+            t0 = time.perf_counter()
+            while time.perf_counter() - t0 < 30:
+                if sock.exists():
+                    break
+                time.sleep(0.5)
+            steps.append({"step": "rag-daemon",
+                           "rc": 0 if sock.exists() else 1,
+                           "ms": round((time.perf_counter() - t0) * 1000, 1)})
+
+    success = all(s.get("rc") == 0 for s in steps)
+    print(json.dumps({"steps": steps, "healthy": success},
+                       ensure_ascii=False, indent=2))
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

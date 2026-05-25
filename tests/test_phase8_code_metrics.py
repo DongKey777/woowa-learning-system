@@ -60,7 +60,11 @@ def test_entry_point_count() -> None:
                    # Phase T new wrappers
                    "learn-pr-retro", "learn-record-code", "learn-test",
                    "learn-response-quality", "assess-learner-state",
-                   "profile-recompute", "session-start"}
+                   "profile-recompute", "session-start",
+                   # Phase U new wrappers
+                   "bootstrap", "bootstrap-repo", "onboard-repo", "list-repos",
+                   "archive-status", "sync-prs", "repo-readiness", "doctor",
+                   "validate-state", "registry-audit"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)
