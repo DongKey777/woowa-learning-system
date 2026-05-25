@@ -123,6 +123,22 @@ python3 bin/ask "테스트"
 - 인공적 표현 회피 (계약/깨뜨리다/부담/같은 결/비대칭 등 AI-stylized 단어 X).
 - 답변 마지막 1줄 요약 1-2 문장. 길게 설명하지 않음.
 
+### 4.6 Phase T learner-automation auto-call (2026-05-25 신설)
+
+학습자 의도에 따라 다음 wrapper 자동 호출:
+
+| 학습자 발화 / 행동 | AI 자동 호출 |
+|---|---|
+| *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
+| Write/Edit a `missions/<r>/**/*.java` file | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M [--linked-test C.M] --silent` |
+| 학습자가 `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
+| 매 coach turn 답변 직후 (필수) | `bin/learn-response-quality --source-event-id <id> --response-summary "<요약>" --response-file - --expected-citation <c> --declared-citation <c> --silent` |
+| 학습자가 미션 repo onboarded 후 첫 coaching 진입 시 | `bin/assess-learner-state --repo <r> --path missions/<r> --learner-login <l> --silent` |
+| 매 10 turn마다 OR *"내 상태"*, *"learning profile"* 발화 | `bin/profile-recompute --silent` |
+| *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
+
+모두 default `--silent` — stdout 노이즈 없음, AI session이 결과를 한국어로 narrate.
+
 ---
 
 ## 5. Mode B 행동 contract (시스템 개발)
