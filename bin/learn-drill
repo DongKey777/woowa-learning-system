@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""bin/learn-drill {offer|answer|status|cancel} — drill CLI sub-commands
+(Phase X5). Wraps core.drill primitives.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.drill import (  # noqa: E402
+    build_offer_if_due, build_review_offer_if_due, score_pending_answer,
+)
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+PENDING_FILE = "drill_pending.json"
+
+
+def cmd_offer(args) -> int:
+    pending = args.state_root / "learner" / PENDING_FILE
+    if pending.exists() and not args.force:
+        print(json.dumps({"rejected": True, "reason": "drill_pending exists",
+                           "fix": "answer or cancel first, or --force"},
+                          ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    if pending.exists() and args.force:
+        pending.unlink()
+    uncertain = [args.concept] if args.concept else []
+    offer = (build_review_offer_if_due(state_root=args.state_root)
+              if args.review else
+              build_offer_if_due(state_root=args.state_root,
+                                  uncertain_concept_ids=uncertain))
+    if offer is None:
+        print(json.dumps({"no_offer": True}, ensure_ascii=False, indent=2))
+        return 1
+    print(json.dumps({
+        "drill_session_id": offer.drill_session_id,
+        "concept_id": offer.concept_id,
+        "question": offer.question,
+        "expected_terms_n": len(offer.expected_terms),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_answer(args) -> int:
+    if args.answer == "-" or args.answer is None:
+        answer = sys.stdin.read()
+    else:
+        answer = args.answer
+    score = score_pending_answer(answer, state_root=args.state_root)
+    if score is None:
+        print(json.dumps({"rejected": True, "reason": "no pending drill"},
+                          ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "total": score.total, "level": score.level,
+        "dimensions": score.dimensions,
+        "matched_terms": score.matched_terms,
+        "improvement_notes": score.improvement_notes,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_status(args) -> int:
+    p = args.state_root / "learner" / PENDING_FILE
+    if not p.exists():
+        print(json.dumps({"pending": False}, ensure_ascii=False, indent=2))
+        return 0
+    data = json.loads(p.read_text(encoding="utf-8"))
+    print(json.dumps({"pending": True, "drill_session_id": data.get("drill_session_id"),
+                       "concept_id": data.get("concept_id"),
+                       "question": data.get("question")},
+                      ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_cancel(args) -> int:
+    p = args.state_root / "learner" / PENDING_FILE
+    if p.exists():
+        p.unlink()
+        print(json.dumps({"cancelled": True}, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({"cancelled": False, "reason": "nothing pending"},
+                          ensure_ascii=False, indent=2))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    sub = parser.add_subparsers(dest="action", required=True)
+    p_off = sub.add_parser("offer")
+    p_off.add_argument("--concept", default=None)
+    p_off.add_argument("--review", action="store_true",
+                        help="promote a past-due review")
+    p_off.add_argument("--force", action="store_true")
+    p_ans = sub.add_parser("answer")
+    p_ans.add_argument("--answer", default=None,
+                        help="answer text (or '-' for stdin)")
+    sub.add_parser("status")
+    sub.add_parser("cancel")
+    args = parser.parse_args(argv)
+
+    return {
+        "offer": cmd_offer, "answer": cmd_answer,
+        "status": cmd_status, "cancel": cmd_cancel,
+    }[args.action](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

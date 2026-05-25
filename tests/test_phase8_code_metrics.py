@@ -75,7 +75,12 @@ def test_entry_point_count() -> None:
                    "learning-turn-audit", "learning-path-graph-audit",
                    "reclassify-history", "cohort-eval", "cohort-compare",
                    "golden", "rag-eval", "router-generalization-eval",
-                   "learner-log-rag-eval"}
+                   "learner-log-rag-eval",
+                   # Phase X new wrappers (maintenance + sub-commands)
+                   "sync-index-metadata", "drill-grade-prepare", "learn-feedback",
+                   "learn-self-assess", "learn-drill", "learner-profile",
+                   "set-profile", "show-profile", "reviewer-profile",
+                   "rag-remote-build"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)

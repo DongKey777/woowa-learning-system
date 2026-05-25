@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""bin/learn-self-assess — record self-assessment with pending trigger guard
+(Phase X4). v4 contract: random scores rejected when no pending trigger.
+
+CLI: bin/learn-self-assess --trigger-session-id S --score N [--note N] [--silent]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import uuid
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT, append_history_event  # noqa: E402
+
+PENDING_FILE = "pending_triggers.json"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trigger-session-id", required=True)
+    parser.add_argument("--score", type=float, required=True,
+                        help="0..1 or 0..10 (auto-normalized)")
+    parser.add_argument("--note", default=None)
+    parser.add_argument("--concept-id", action="append", default=[])
+    parser.add_argument("--learner-id", default="default")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--silent", action="store_true")
+    args = parser.parse_args(argv)
+
+    pending_path = args.state_root / "learner" / PENDING_FILE
+    pending: dict = {}
+    if pending_path.exists():
+        try:
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        except Exception:
+            pending = {}
+
+    sa = pending.get("self_assessment")
+    if not sa or sa.get("trigger_session_id") != args.trigger_session_id:
+        print(json.dumps({
+            "rejected": True,
+            "reason": "no matching pending self_assessment trigger",
+            "trigger_session_id": args.trigger_session_id,
+        }, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+
+    score = args.score / 10.0 if args.score > 1.0 else args.score
+    ts = time.time()
+    event = {
+        "event_id": f"self_assessment-{int(ts * 1000)}-{uuid.uuid4().hex[:6]}",
+        "event_type": "self_assessment",
+        "mode": "learning",
+        "ts": ts,
+        "learner_id": args.learner_id,
+        "payload": {
+            "trigger_session_id": args.trigger_session_id,
+            "score": score,
+            "note": args.note,
+            "concept_ids": args.concept_id or (sa.get("payload") or {}).get("concept_ids", []),
+        },
+    }
+    append_history_event(event, state_root=args.state_root)
+
+    # Clear the trigger
+    pending.pop("self_assessment", None)
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(json.dumps(pending, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+
+    if not args.silent:
+        print(json.dumps({
+            "event_id": event["event_id"],
+            "score_normalized": score,
+            "trigger_cleared": True,
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
