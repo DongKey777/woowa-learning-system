@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""bin/compose-response — review thread response draft (Phase V8).
+
+Given a review thread (path:line:body), drafts a learner-side response
+informed by RAG concepts touched by the thread.
+
+CLI: bin/compose-response --repo R --thread-id T [--silent]
+   or: bin/compose-response --repo R --path P --line N --comment "..."
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _fetch_thread(repo: str, thread_id: int, state_root: Path) -> dict | None:
+    db = state_root / "repos" / repo / "archive" / "prs.sqlite3"
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        r = conn.execute(
+            "SELECT github_comment_id, user_login, body, path, line, "
+            "pull_request_id "
+            "FROM pull_request_review_comments_current "
+            "WHERE github_comment_id = ?",
+            (thread_id,),
+        ).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--thread-id", type=int, default=None,
+                        help="github_comment_id (root mentor comment)")
+    parser.add_argument("--path", default=None)
+    parser.add_argument("--line", type=int, default=None)
+    parser.add_argument("--comment", default=None)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--silent", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.thread_id:
+        t = _fetch_thread(args.repo, args.thread_id, args.state_root)
+        if not t:
+            print(f"ERROR: thread {args.thread_id} not found", file=sys.stderr)
+            return 2
+        path, line, comment = t["path"], t["line"], t["body"]
+    elif args.path and args.comment:
+        path, line, comment = args.path, args.line, args.comment
+    else:
+        print("ERROR: --thread-id OR (--path + --comment) required", file=sys.stderr)
+        return 2
+
+    prompt = (
+        f"리뷰 응답 초안을 도와줘. 멘토가 `{path}:{line}` 에 다음 코멘트를 남겼어:\n\n"
+        f"> {comment}\n\n"
+        "이 의견에 대한 학습자의 응답 (수정 의지 + 학습한 개념 + 추가 질문) 초안 1단락."
+    )
+    cmd = [sys.executable, str(REPO_ROOT / "bin" / "coach-run"),
+            "--repo", args.repo, "--prompt", prompt]
+    if args.silent:
+        cmd.append("--silent")
+    return subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

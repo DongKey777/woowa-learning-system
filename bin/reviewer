@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""bin/reviewer — per-reviewer pattern report (Phase V6).
+
+CLI: bin/reviewer --repo R --reviewer-login L [--top-n N]
+Output JSON: comment count, recurring keyword topics, sample threads.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sqlite3
+import sys
+from collections import Counter
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+TOKEN_RE = re.compile(r"[가-힣]{2,}|[A-Z][A-Za-z]{2,}")
+STOP = frozenset(s.lower() for s in {
+    "코드", "리뷰", "메서드", "클래스", "변수", "내용", "부분",
+    "the", "and", "for", "you", "PR", "Issue", "Major", "Minor",
+    "Refactor", "Note", "Tip", "Comment", "Fix", "Suggestion",
+})
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--reviewer-login", required=True)
+    parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    db = args.state_root / "repos" / args.repo / "archive" / "prs.sqlite3"
+    if not db.exists():
+        print(f"ERROR: archive missing: {db}", file=sys.stderr)
+        return 2
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT body, path, line, created_at, pull_request_id "
+            "FROM pull_request_review_comments_current "
+            "WHERE user_login = ? AND in_reply_to_github_comment_id IS NULL "
+            "ORDER BY created_at DESC",
+            (args.reviewer_login,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    topic_counter: Counter = Counter()
+    path_counter: Counter = Counter()
+    samples = []
+    for r in rows:
+        body = r["body"] or ""
+        toks = [t for t in TOKEN_RE.findall(body)
+                if t.lower() not in STOP and len(t) >= 3]
+        topic_counter.update(toks)
+        if r["path"]:
+            path_counter[r["path"].rsplit("/", 1)[-1]] += 1
+        if len(samples) < 3:
+            samples.append({"path": r["path"], "line": r["line"],
+                             "body_excerpt": body[:150]})
+
+    print(json.dumps({
+        "repo": args.repo,
+        "reviewer_login": args.reviewer_login,
+        "comments_total": len(rows),
+        "recurring_topics": [{"topic": t, "n": n}
+                              for t, n in topic_counter.most_common(args.top_n)],
+        "hotspot_files": [{"file": f, "n": n}
+                           for f, n in path_counter.most_common(args.top_n)],
+        "sample_threads": samples,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

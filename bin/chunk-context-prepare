@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""bin/chunk-context-prepare — concept chunk context bundle for AI session
+(Phase V12).
+
+CLI: bin/chunk-context-prepare --concept-id C [--out-dir D]
+Writes (or prints) 4 artifacts:
+  concept.json      — full concept body
+  neighbors.json    — confusable_with / prerequisites / related from graph
+  expected_queries.txt
+  exemplar_snippets.md (code_signals + sample queries)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CORPUS_DIR = REPO_ROOT / "corpus" / "concepts"
+CONCEPT_GRAPH = REPO_ROOT / "corpus" / "concept_graph.json"
+
+
+def _load_concept(cid: str) -> dict | None:
+    parts = cid.split("/", 1)
+    if len(parts) != 2:
+        return None
+    cat, slug = parts
+    p = CORPUS_DIR / cat / f"{slug}.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _neighbors(cid: str) -> dict:
+    if not CONCEPT_GRAPH.exists():
+        return {}
+    g = json.loads(CONCEPT_GRAPH.read_text(encoding="utf-8"))
+    edges = g.get("edges", {})
+    out = {}
+    for rel in ("prerequisite", "confusable_with", "extends"):
+        pairs = edges.get(rel, []) or []
+        out[rel] = sorted({to for fr, to in pairs if fr == cid})
+        out[f"{rel}_reverse"] = sorted({fr for fr, to in pairs if to == cid})
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--concept-id", required=True)
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="if set, write 4 files; else print summary JSON")
+    args = parser.parse_args(argv)
+
+    concept = _load_concept(args.concept_id)
+    if not concept:
+        print(f"ERROR: concept {args.concept_id} not found in corpus",
+              file=sys.stderr)
+        return 2
+
+    neighbors = _neighbors(args.concept_id)
+    eq = concept.get("expected_queries") or []
+    code_sig = concept.get("code_signals") or {}
+
+    if args.out_dir:
+        out = args.out_dir
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "concept.json").write_text(
+            json.dumps(concept, ensure_ascii=False, indent=2), encoding="utf-8")
+        (out / "neighbors.json").write_text(
+            json.dumps(neighbors, ensure_ascii=False, indent=2), encoding="utf-8")
+        (out / "expected_queries.txt").write_text(
+            "\n".join(eq), encoding="utf-8")
+        (out / "exemplar_snippets.md").write_text(
+            f"# Code signals\n```json\n{json.dumps(code_sig, indent=2)}\n```\n\n"
+            f"# Sample queries\n" + "\n".join(f"- {q}" for q in eq),
+            encoding="utf-8",
+        )
+        print(json.dumps({"concept_id": args.concept_id,
+                          "out_dir": str(out),
+                          "files": ["concept.json", "neighbors.json",
+                                     "expected_queries.txt", "exemplar_snippets.md"]},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({
+            "concept_id": args.concept_id,
+            "title": concept.get("title"),
+            "category": concept.get("category"),
+            "level": concept.get("level"),
+            "neighbors": neighbors,
+            "expected_queries_n": len(eq),
+            "code_signals": code_sig,
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

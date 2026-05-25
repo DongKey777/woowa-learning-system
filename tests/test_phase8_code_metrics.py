@@ -64,7 +64,12 @@ def test_entry_point_count() -> None:
                    # Phase U new wrappers
                    "bootstrap", "bootstrap-repo", "onboard-repo", "list-repos",
                    "archive-status", "sync-prs", "repo-readiness", "doctor",
-                   "validate-state", "registry-audit"}
+                   "validate-state", "registry-audit",
+                   # Phase V new wrappers (coaching context)
+                   "coach-run", "coach", "my-pr", "next-action", "topic",
+                   "reviewer", "compare", "compose-response", "mission-map",
+                   "rag-rewrite-prepare", "rag-route-fallback",
+                   "chunk-context-prepare"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)

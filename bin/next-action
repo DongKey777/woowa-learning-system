@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""bin/next-action — derive next-action from profile + drill_due (Phase V4).
+
+Reads profile.json + drill_due.json + pending_triggers.json → suggests next
+learner action (drill due, self_assessment pending, recommended concept).
+
+CLI: bin/next-action [--repo R] [--learner-id L]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _load(p: Path) -> dict | list | None:
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--learner-id", default="default")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    args = parser.parse_args(argv)
+
+    profile = _load(args.state_root / "learner" / "profile.json") or {}
+    drill_due = _load(args.state_root / "learner" / "drill_due.json") or []
+    pending = _load(args.state_root / "learner" / "pending_triggers.json") or {}
+    drill_pending = _load(args.state_root / "learner" / "drill_pending.json")
+
+    now = time.time()
+    actions = []
+
+    # 1. pending self_assessment
+    if pending.get("self_assessment"):
+        actions.append({
+            "kind": "answer_self_assessment",
+            "trigger_session_id": pending["self_assessment"].get("trigger_session_id"),
+            "priority": "high",
+        })
+
+    # 2. open drill
+    if drill_pending:
+        actions.append({
+            "kind": "answer_drill",
+            "concept_id": drill_pending.get("concept_id"),
+            "question": drill_pending.get("question"),
+            "priority": "high",
+        })
+
+    # 3. drill_due past
+    for d in (drill_due if isinstance(drill_due, list) else []):
+        if d.get("next_due_ts", 0) <= now:
+            actions.append({
+                "kind": "review_due_drill",
+                "concept_id": d.get("concept_id"),
+                "level": d.get("level"),
+                "priority": "medium",
+            })
+
+    # 4. next_recommendations from profile
+    for rec in (profile.get("next_recommendations") or [])[:3]:
+        actions.append({
+            "kind": "explore_concept",
+            "concept_id": rec.get("concept_id"),
+            "reason": rec.get("reason"),
+            "priority": "low",
+        })
+
+    print(json.dumps({
+        "learner_id": args.learner_id,
+        "repo": args.repo,
+        "actions_n": len(actions),
+        "actions": actions,
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

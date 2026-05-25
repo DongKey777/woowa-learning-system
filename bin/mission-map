@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""bin/mission-map — mission repo file → concept_ids map (Phase V9).
+
+Walks missions/<repo>/src + state/repos/<repo>/archive sqlite files → builds
+{file_path: [concept_ids]} via mission.extract on patch_text and HEAD content.
+
+CLI: bin/mission-map --repo R [--missions-root P] [--state-root P]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+from mission.extract import extract_from_text  # noqa: E402
+
+
+def build_map(repo: str, missions_root: Path, state_root: Path) -> dict:
+    file_to_concepts: dict[str, set[str]] = defaultdict(set)
+
+    # 1. Local mission Java files (HEAD content)
+    mission_dir = missions_root / repo
+    if mission_dir.exists():
+        for jf in mission_dir.rglob("*.java"):
+            try:
+                text = jf.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            rel = str(jf.relative_to(mission_dir))
+            for pat in extract_from_text(rel, text):
+                if pat.matched_concept_id:
+                    file_to_concepts[rel].add(pat.matched_concept_id)
+
+    # 2. Archive patches (covers historical files removed from HEAD)
+    db = state_root / "repos" / repo / "archive" / "prs.sqlite3"
+    if db.exists():
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT path, patch_text FROM pull_request_files_current "
+                "WHERE path LIKE '%.java' AND patch_text IS NOT NULL"
+            ).fetchall()
+            for r in rows:
+                for pat in extract_from_text(r["path"], r["patch_text"]):
+                    if pat.matched_concept_id:
+                        file_to_concepts[r["path"]].add(pat.matched_concept_id)
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    return {
+        "repo": repo,
+        "files_n": len(file_to_concepts),
+        "distinct_concepts_n": len({c for cs in file_to_concepts.values() for c in cs}),
+        "map": {f: sorted(cs) for f, cs in sorted(file_to_concepts.items())},
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--missions-root", type=Path,
+                        default=REPO_ROOT / "missions")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--summary", action="store_true",
+                        help="print counts only (no full map)")
+    args = parser.parse_args(argv)
+
+    report = build_map(args.repo, args.missions_root, args.state_root)
+    if args.summary:
+        print(json.dumps({k: v for k, v in report.items() if k != "map"},
+                          ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

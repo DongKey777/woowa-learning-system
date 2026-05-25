@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""bin/coach-run — paradigm-v2's drop-in replacement for legacy coach-run
+(Phase V1). Maps daemon ask output to legacy schema (snapshot_block,
+cs_block, drill_block, cognitive_block, coach_reply, telemetry, etc.).
+
+CLI: bin/coach-run --repo R --prompt P [--learner-id L] [--silent]
+Output: state/repos/<r>/actions/coach-run.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+import uuid
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _daemon_ask(prompt: str, repo: str | None, learner_id: str,
+                 state_root: Path) -> tuple[dict | None, str | None]:
+    sock_path = state_root / "rag-daemon.sock"
+    if not sock_path.exists():
+        return None, "daemon not running — start via bin/rag-daemon"
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(60)
+        s.connect(str(sock_path))
+        req = {"action": "ask", "query": prompt, "learner_id": learner_id}
+        if repo:
+            req["repo"] = repo
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+        s.close()
+        return json.loads(data.decode("utf-8").strip()), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"[:120]
+
+
+def _build_legacy_payload(prompt: str, repo: str | None,
+                            ask_resp: dict, learner_id: str) -> dict:
+    """Map paradigm-v2 ask response to legacy coach-run.json schema."""
+    ts = time.time()
+    event_id = ask_resp.get("event_id") or f"coach_run-{int(ts * 1000)}-{uuid.uuid4().hex[:6]}"
+    turn_id = f"turn-{uuid.uuid4().hex[:12]}"
+    return {
+        "execution_status": "ready",
+        "repo": repo,
+        "prompt": prompt,
+        "learner_id": learner_id,
+        "computed_at": ts,
+        "mode": ask_resp.get("mode"),
+        "budget_tokens": ask_resp.get("budget"),
+        "personas": ask_resp.get("personas", []),
+        "router_reason": ask_resp.get("reason"),
+        # Legacy-shape blocks (paradigm-v2 surfaces these inline in markdown;
+        # we expose the rendered markdown for AI session to consume directly)
+        "coach_reply_markdown": ask_resp.get("markdown", ""),
+        "response_contract": {
+            "snapshot_block": {"markdown": None,
+                                "reason": "see coach_reply_markdown body"},
+            "cs_block": {"markdown": None, "sources": [],
+                          "reason": "see coach_reply_markdown body"},
+            "drill_block": {"markdown": None, "reason": "see coach_reply_markdown body"},
+            "cognitive_block": {"markdown": None, "trigger_type": "none",
+                                 "applicability_hint": "omit"},
+        },
+        "telemetry": {
+            "source_event_id": event_id,
+            "turn_id": turn_id,
+        },
+        "response_quality_hint": {
+            "instructions": "After drafting learner-facing answer, pipe to "
+                           "bin/learn-response-quality --source-event-id "
+                           f"{event_id} --turn-id {turn_id} --response-file - "
+                           f"--silent",
+            "command_template": (
+                f"{sys.executable} {REPO_ROOT}/bin/learn-response-quality "
+                f"--source-event-id {event_id} --turn-id {turn_id} "
+                f"--response-summary '<one-line>' --response-file - --silent"
+            ),
+        },
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--learner-id", default="default")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--silent", action="store_true")
+    args = parser.parse_args(argv)
+
+    resp, err = _daemon_ask(args.prompt, args.repo, args.learner_id, args.state_root)
+    if err or resp is None:
+        print(json.dumps({"execution_status": "error", "error": err},
+                          ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+
+    payload = _build_legacy_payload(args.prompt, args.repo, resp, args.learner_id)
+
+    if args.repo:
+        out = args.state_root / "repos" / args.repo / "actions" / "coach-run.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        payload["out_path"] = str(out)
+
+    if not args.silent:
+        print(json.dumps({
+            "execution_status": payload["execution_status"],
+            "mode": payload["mode"],
+            "budget_tokens": payload["budget_tokens"],
+            "personas": payload["personas"],
+            "telemetry": payload["telemetry"],
+            "out_path": payload.get("out_path"),
+            "markdown_preview": payload["coach_reply_markdown"][:200],
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
