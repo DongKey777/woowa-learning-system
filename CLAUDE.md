@@ -123,19 +123,35 @@ python3 bin/ask "테스트"
 - 인공적 표현 회피 (계약/깨뜨리다/부담/같은 결/비대칭 등 AI-stylized 단어 X).
 - 답변 마지막 1줄 요약 1-2 문장. 길게 설명하지 않음.
 
-### 4.7 Phase U onboarding/collection auto-call (2026-05-25 신설)
+### 4.7 Phase U onboarding/collection auto-call (2026-05-25 신설, Y6 갱신)
 
-학습자가 새 미션 시작 의도 표현 시 (예: *"새 미션 step5 시작"*, *"<repo> 추가"*):
+**시스템 규칙 (학습자 결정 불필요)**:
+- `--owner` = `woowacourse` (Woowa 미션 표준 upstream)
+- `--learner-login` = `DongKey777` (학습자 본인)
+- clone source = 학습자 fork `DongKey777/<repo>` (mission_path 없으면 자동)
+
+**새 미션 시작** (학습자: *"새 미션 spring-roomescape-waiting 시작할게"*):
 
 ```
-bin/onboard-repo --repo <r> --owner <o> [--path missions/<r>] [--learner-login DongKey777]
-  → 1. gh repo clone (if missing)
-  → 2. bin/bootstrap-repo (full archive collection from GitHub)
-  → 3. bin/mission-patterns-build (F10 forward)
-  → 4. bin/cross-crew-build (F11 — 5-10분 BGE-M3)
+bin/onboard-repo --repo <r> --owner woowacourse --learner-login DongKey777
+  → 1. gh repo clone DongKey777/<r> → missions/<r>/ (if missing)
+  → 2. bin/bootstrap-repo (upstream archive — woowacourse cohort PRs)
+  → 3. bin/mission-patterns-build (F10 forward — 학습자 own Java patches)
+  → 4. bin/anchors-build (F11 input — 학습자 own review threads, merge into existing)
+  → 5. bin/cross-crew-build (F11 — anchors × cross-crew matching, BGE-M3)
 ```
 
-학습자가 *"PR 동기화"*, *"새 리뷰"* 표현 시: `bin/sync-prs --repo <r> --owner <o>` (incremental).
+**학습자가 PR push + mentor review 받은 후** (학습자: *"새 리뷰 동기화"* 또는 daily):
+
+```
+bin/sync-prs --repo <r> --owner woowacourse
+  → 1. incremental collect since last_run.finished_at
+  → 2. (자동) mission-patterns-build refresh
+  → 3. (자동) anchors-build refresh (학습자 own threads 추가)
+  → 4. (자동) cross-crew-build refresh (anchors × cohort 다시 매칭)
+```
+
+paradigm-v2 self-contained: legacy hub 의존 0 (Phase Y2 검증). 학습자 외울 명령 0.
 
 학습자가 *"오류"*, *"안 돼"* 표현 시 또는 정기 health check: `bin/doctor` (5/6+ healthy 확인).
 

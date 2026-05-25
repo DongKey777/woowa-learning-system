@@ -80,7 +80,9 @@ def test_entry_point_count() -> None:
                    "sync-index-metadata", "drill-grade-prepare", "learn-feedback",
                    "learn-self-assess", "learn-drill", "learner-profile",
                    "set-profile", "show-profile", "reviewer-profile",
-                   "rag-remote-build"}
+                   "rag-remote-build",
+                   # Phase Y6 onboarding chain fix (anchors-build wrapper)
+                   "anchors-build"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)
