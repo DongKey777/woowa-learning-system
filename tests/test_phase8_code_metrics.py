@@ -28,18 +28,22 @@ def _count_python_loc(root: Path) -> int:
 
 def test_runtime_loc_under_paradigm_v2_budget() -> None:
     total = sum(_count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS)
-    # Plan §D-I justified expansion: F6 drill (core/drill.py ~250 LOC) closes
-    # the offer-gen gap so paradigm-v2 owns the full Bloom autoloop end-to-end.
-    assert total <= 4300, f"runtime LOC {total} exceeds paradigm-v2 budget 4300"
+    # Plan §T-X (2026-05-25): legacy parity migration relaxed budget to ≤9500
+    # (legacy 80K LOC × 0.12 — 51 new wrappers + 19 new modules, still 8× smaller
+    # than legacy while including every measurable capability).
+    assert total <= 9500, f"runtime LOC {total} exceeds Phase T-X budget 9500"
 
 
 def test_per_module_loc_breakdown_within_plan() -> None:
-    """Plan §D-I — per-module budget after paradigm-v2 expansion."""
+    """Plan §T-X — per-module budget tracks 51-wrapper expansion."""
     breakdown = {d: _count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS}
     assert breakdown["rag"] <= 800, f"rag {breakdown['rag']} > 800"
-    # core bumped from 2200 → 2500 after Phase O (core/drill.py + daemon
-    # drill wiring + coach drill_offer render).
-    assert breakdown["core"] <= 2500, f"core {breakdown['core']} > 2500 (paradigm-v2 + Phase H/O)"
+    # core: 2500 → 5000 ceiling (Phase T-X new modules: pr_retro, code_event,
+    # junit_ingest, response_quality, learner_state, profile, session,
+    # bootstrap, onboard, readiness, doctor, state_validate, registry_audit,
+    # mission_map, rag_rewrite, route_fallback, profile_admin, reviewer_profile,
+    # index_metadata, etc.)
+    assert breakdown["core"] <= 5000, f"core {breakdown['core']} > 5000 (Phase T-X budget)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"
@@ -52,7 +56,9 @@ def test_entry_point_count() -> None:
     maintenance = {"corpus-build", "corpus-curate", "eval-compare", "learn-event",
                    "graph-build", "phase9-gate",
                    "mission-patterns-build", "cross-crew-build",
-                   "index-fetch"}
+                   "index-fetch",
+                   # Phase T-X new wrappers
+                   "learn-pr-retro"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)
