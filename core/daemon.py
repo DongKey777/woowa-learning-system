@@ -153,7 +153,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
     from core.coach import compose
     from core.lazy_loader import load as lazy_load
     from core.router import route
-    from core.state import load_profile, read_history
+    from core.state import append_history_event, load_profile, read_history
     corpus = load_corpus(strict=True)
     _ = encode_query("warm-up")
     print(f"[daemon] ready (pid={os.getpid()}, socket={sp})", flush=True)
@@ -206,9 +206,34 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     recent = read_history(state_root=state_root, tail=20)
                     markdown = compose(decision, artifacts, prompt, repo=repo,
                                        learner_id=learner_id, recent_history=recent)
+                    # Append turn event to history.jsonl so personalization /
+                    # recent_history / retro flows see live learner activity.
+                    # Session mode defaults to 'learning' unless caller overrides
+                    # (e.g. WOOWA_SESSION_MODE=development for benchmarks).
+                    rag_hits = artifacts.get("rag_hits") or []
+                    event_mode = req.get("mode") or os.environ.get(
+                        "WOOWA_SESSION_MODE", "learning")
+                    event = {
+                        "event_id": f"ask-{int(time.time() * 1000)}-{os.getpid()}",
+                        "ts": time.time(),
+                        "event_type": "rag_ask",
+                        "mode": event_mode,
+                        "payload": {
+                            "prompt": prompt,
+                            "repo": repo,
+                            "router_mode": decision.mode,
+                            "router_reason": decision.reason,
+                            "top_concept_ids": [h.get("concept_id") for h in rag_hits[:5]
+                                                 if h.get("concept_id")],
+                        },
+                    }
+                    try:
+                        append_history_event(event, state_root=state_root)
+                    except Exception:  # noqa: BLE001
+                        pass  # history append must not break the response
                     payload = {"markdown": markdown, "mode": decision.mode,
                                "budget": decision.budget_tokens, "personas": decision.personas,
-                               "reason": decision.reason}
+                               "reason": decision.reason, "event_id": event["event_id"]}
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 else:
                     conn.sendall(json.dumps({"error": f"unknown action {action}"}).encode() + b"\n")
