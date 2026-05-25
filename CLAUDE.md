@@ -141,6 +141,57 @@ bin/onboard-repo --repo <r> --owner <o> [--path missions/<r>] [--learner-login D
 
 학습자가 직접 명령 외울 필요 0. paradigm-v2 self-contained (legacy hub 의존 0). 의존: `gh` CLI 설치 + `gh auth login`.
 
+### 4.8 Phase V coaching context auto-call (2026-05-26)
+
+| 학습자 의도 / 발화 | AI 자동 호출 |
+|---|---|
+| `coach-run` schema가 필요한 외부 도구 호출 시 | `bin/coach-run --repo <r> --prompt <P> --silent` |
+| *"내 PR 분석"*, *"PR #N 검토"* | `bin/my-pr --repo <r> [--pr-number N] --silent` |
+| *"다음 뭐 하지?"*, *"learning profile 보여줘"* | `bin/next-action` |
+| *"<concept> 자세히"* | `bin/topic --concept <cid> [--repo <r>]` |
+| *"멘토 <login> 어떤 사람?"* | `bin/reviewer --repo <r> --reviewer-login <l>` |
+| *"PR A vs PR B 비교"* | `bin/compare --repo <r> --pr-a A --pr-b B` |
+| *"리뷰 응답 도와줘"* | `bin/compose-response --repo <r> --thread-id <id>` |
+| *"미션 파일 ↔ concept 매핑 보여줘"* | `bin/mission-map --repo <r> [--summary]` |
+| 학습자 prompt가 모호 / corpus 어휘와 거리 멀 때 | `bin/rag-rewrite-prepare --mode hyde\|decompose\|normalize --query <Q>` |
+| router confidence <0.7 | `bin/rag-route-fallback --prompt <P> [--repo <r>]` |
+| 깊은 concept 학습 시 | `bin/chunk-context-prepare --concept-id <cid> --out-dir <D>` |
+
+### 4.9 Phase W mining/analytics auto-call (시스템 개선 cycle, 2026-05-26)
+
+대부분 Mode B (development) — AI/maintainer가 시스템 개선 cycle에서 사용:
+
+| Wrapper | 용도 / Trigger |
+|---|---|
+| `bin/feedback-mine` | feedback.jsonl 누적 분석 (helpful vs not_helpful) |
+| `bin/response-quality-mine` | 답변 quality flag 분포 + citation drift |
+| `bin/routing-analyze` | 매주 router_mode dispatch 통계 |
+| `bin/learning-turn-audit --last 50` | 매 일 turn integrity 확인 |
+| `bin/learning-path-graph-audit` | corpus PR 후 broken edges / inversions check |
+| `bin/reclassify-history --last 1000` | router rule 변경 후 dispatch drift |
+| `bin/cohort-eval --cohort-file C.json` | release 전 50-q cohort 정확도 |
+| `bin/cohort-compare --control A --candidate B --fail-on-drift` | A/B gate |
+| `bin/golden verify` | CI per-commit golden top-1 |
+| `bin/rag-eval` | F1 RAG quality regression (Phase K) |
+| `bin/router-generalization-eval` | 20-fixture router accuracy |
+| `bin/learner-log-rag-eval --limit 50` | 실제 history replay drift |
+
+### 4.10 Phase X maintenance + sub-commands (2026-05-26)
+
+| 학습자 발화 / Trigger | AI 자동 호출 |
+|---|---|
+| 새 release tag publish 후 | `bin/sync-index-metadata --tag paradigm-v2-index-vX.Y.Z` |
+| drill answer 채점 미리보기 | `bin/drill-grade-prepare --pending-file P [--answer A]` |
+| *"도움 됐어"*, *"안 맞아"* | `bin/learn-feedback --signal helpful\|not_helpful\|unclear --silent` |
+| pending self_assessment + 학습자가 점수 회신 | `bin/learn-self-assess --trigger-session-id <id> --score N --silent` |
+| drill 명시 발화 (*"확인 질문 풀자"*) | `bin/learn-drill {offer\|answer\|status\|cancel}` |
+| *"내 프로필 보여줘"*, *"학습 상태"* | `bin/learner-profile show` |
+| profile 재계산 (10 turn 마다) | `bin/learner-profile recompute --silent` |
+| per-repo 선호 set | `bin/set-profile --repo <r> --field <f> --value <v>` |
+| global+repo profile 확인 | `bin/show-profile [--repo <r>]` |
+| 멘토 패턴 분석 | `bin/reviewer-profile --repo <r> --reviewer-login <l>` |
+| RunPod 인덱스 재빌드 (maintainer 전용) | `bin/rag-remote-build --r-phase r1` |
+
 ### 4.6 Phase T learner-automation auto-call (2026-05-25 신설)
 
 학습자 의도에 따라 다음 wrapper 자동 호출:

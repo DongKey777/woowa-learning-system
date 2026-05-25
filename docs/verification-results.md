@@ -102,14 +102,61 @@ paradigm-v2는 plan §verification에서 측정 가능한 모든 gate를 통과�
 ```bash
 cd /Users/idonghun/IdeaProjects/woowa-learning-system
 export WOOWA_SESSION_MODE=development
-python3 -m pytest tests/ -q                                              # 213/213
-python3 tests/benchmarks/rag_quality_regression.py                       # F1
-python3 tests/benchmarks/gate_measurements.py                            # 9 gates
-python3 tests/benchmarks/uncovered_scenarios.py                          # M 12
-python3 tests/benchmarks/uncovered_scenarios_phase_n.py                  # N 12
-python3 tests/benchmarks/deep_scenarios_phase_p.py                       # P 10
-python3 tests/benchmarks/full_scenario_comparison.py                     # J 14
-python3 tests/benchmarks/sidebyside_deepdive.py                          # J deepdive 4
+
+# 1. Unit tests (294/294)
+python3 -m pytest tests/ -q
+
+# 2. All 14 phase benches (J/K/L/M/N/P + T-X) via master runner
+python3 tests/benchmarks/phase_y_all_benches.py   # 14/14 in ~20s
 ```
 
-소요: ~20분 합계. 자세한 가이드: [`testing-guide.md`](testing-guide.md).
+자세한 가이드: [`testing-guide.md`](testing-guide.md).
+
+---
+
+## 10. Phase T-X (2026-05-25/26) — legacy parity migration
+
+**51 새 wrappers + 6 new modules + scripts/collection/ + scripts/mining/**
+
+| Phase | 범위 | Bench |
+|---|---|---|
+| **T** Learner automation (7 wrappers) | learn-pr-retro · learn-record-code · learn-test · learn-response-quality · assess-learner-state · profile-recompute · session-start | 7/7 PASS + 17/17 e2e integration |
+| **U** Onboarding/Collection (10, G1 closure) | bootstrap · bootstrap-repo · onboard-repo · list-repos · archive-status · sync-prs · repo-readiness · doctor · validate-state · registry-audit | 10/10 + 11/11 unit |
+| **V** Coaching context (12) | coach-run · coach · my-pr · next-action · topic · reviewer · compare · compose-response · mission-map · rag-rewrite-prepare · rag-route-fallback · chunk-context-prepare | 10/10 |
+| **W** Mining/Analytics (12) | feedback-mine · response-quality-mine · routing-analyze · learning-turn-audit · learning-path-graph-audit · reclassify-history · cohort-eval · cohort-compare · golden · rag-eval · router-generalization-eval · learner-log-rag-eval | 12/12 |
+| **X** Maintenance + sub-commands (10) | sync-index-metadata · drill-grade-prepare · learn-feedback · learn-self-assess · learn-drill · learner-profile · set-profile · show-profile · reviewer-profile · rag-remote-build | 11/11 |
+| **합계** | **51 wrappers** | **50/50 bench + 28/28 unit** |
+
+### 성능 향상 vs legacy (측정)
+
+| Wrapper | Legacy | paradigm-v2 | 향상 |
+|---|---|---|---|
+| learn-pr-retro p50 | 3000ms | 1.2ms | **2500× faster** |
+| learn-record-code p95 | 200ms | 1.19ms | **168× faster** |
+| learn-test parse | 1200ms | 3.6ms | **333× faster** |
+| assess-learner-state p50 | 60000ms | 113ms | **528× faster** |
+| coach-run | 310-1300ms | 96ms | **3-13× faster** |
+
+### Discovery (Phase W5)
+- corpus/concept_graph.json — **9 broken prereq edges** 발견 + fix (Phase Y3)
+- 306 level inversions 잔존 (non-blocking, 다음 corpus curation cycle)
+
+### Phase Y (2026-05-26) — final integration + cleanup
+
+| Step | Result |
+|---|---|
+| Y1 모든 phase bench 통합 실행 | 14/14 PASS (회귀 0) |
+| Y2 Legacy hub `.disabled` rename + paradigm-v2 self-contained 검증 | doctor 6/6 + ask + retro + status + readiness + mission-patterns 모두 PASS |
+| Y3 9 broken edges fix | concept_graph 5764 → 5755 edges, broken 0 |
+| Y5 Docs update (CLAUDE.md / AGENTS.md / docs/bin-reference.md) | Phase U/V/W/X auto-call contract 전부 반영 |
+
+Phase 9 final acceptance criteria #8 ("Legacy hub directory 삭제 가능 검증") **PASS** (Y2).
+
+### paradigm-v2 최종 상태
+
+- **bin/* entries**: 11 → **62** (legacy 75 - 17 reranker probes 의도 skip = 58 non-probe → 62 with 4 improvements)
+- **Unit tests**: 213 → **294** (Phase T-X +81)
+- **Runtime LOC**: 4416 → **6225** (T-X 9500 budget의 65%)
+- **Legacy hub 의존**: **0** (Y2 검증 완료)
+- **Latency p50**: **27ms** (legacy 120ms 대비 4.4× faster)
+- **Token cost**: **2.4KB avg** (legacy 48KB 대비 20× cheaper)
