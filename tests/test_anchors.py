@@ -89,13 +89,14 @@ def _seed_archive(tmp_path: Path, repo: str = "myrepo") -> Path:
 
 
 def test_stage_1_path_filter_excludes_anchor_mentor(tmp_path: Path) -> None:
-    legacy = _seed_archive(tmp_path)
+    seeded = _seed_archive(tmp_path)
     anchor = ReviewAnchor(
         thread_id="myrepo:100:1001", repo="myrepo", pr_number=100,
         path="src/main/X.java", line=42, code_hunk="service.save(req)",
         mentor_login="m1", comment_text="DI 권장", topic_concept_ids=[],
     )
-    cands = stage_1_path_filter(anchor, legacy_hub=legacy)
+    # archive_root expects {root}/repos/<repo>/archive/prs.sqlite3 layout
+    cands = stage_1_path_filter(anchor, archive_root=seeded / "state")
     # m1 자체 (donkey PR thread) 제외 + 다른 path Z.java 제외 → m2 only
     assert len(cands) == 1
     assert cands[0]["comment_id"] == 1002

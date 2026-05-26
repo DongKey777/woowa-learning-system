@@ -47,11 +47,15 @@ def _open(db_path: Path):
 def extract_from_archive(
     repo: str,
     learner_login: str,
-    legacy_hub: Path,
+    archive_root: Path,
     limit: int = MAX_ANCHORS,
 ) -> list[ReviewAnchor]:
-    """Pull root mentor comments on learner-authored PRs."""
-    db = legacy_hub / "state" / "repos" / repo / "archive" / "prs.sqlite3"
+    """Pull root mentor comments on learner-authored PRs.
+
+    archive_root: paradigm-v2 self-contained state root (default DEFAULT_STATE_ROOT).
+    Reads {archive_root}/repos/<repo>/archive/prs.sqlite3.
+    """
+    db = archive_root / "repos" / repo / "archive" / "prs.sqlite3"
     with _open(db) as conn:
         rows = conn.execute(
             """

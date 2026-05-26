@@ -66,10 +66,13 @@ def jaccard(a: str, b: str) -> float:
 
 def stage_1_path_filter(
     anchor: ReviewAnchor,
-    legacy_hub: Path,
+    archive_root: Path,
 ) -> list[dict]:
-    """Find candidate review_comments in cross-crew PRs at the same path suffix."""
-    db = legacy_hub / "state" / "repos" / anchor.repo / "archive" / "prs.sqlite3"
+    """Find candidate review_comments in cross-crew PRs at the same path suffix.
+
+    archive_root: paradigm-v2 state root containing repos/<repo>/archive/prs.sqlite3.
+    """
+    db = archive_root / "repos" / anchor.repo / "archive" / "prs.sqlite3"
     if not db.exists():
         return []
     suffix = anchor.path.split("/")[-1] if anchor.path else ""

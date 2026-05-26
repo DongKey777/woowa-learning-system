@@ -160,7 +160,8 @@ python3 bin/ask "테스트 query"
 
 ### Mission patterns가 0개
 - 학습자 own PR이 archive에 없거나, Java 파일 patch_text가 비어 있음.
-- archive sqlite 확인: `sqlite3 ../woowa-learning-hub/state/repos/<repo>/archive/prs.sqlite3 "SELECT COUNT(*) FROM pull_requests_current WHERE author_login = '<learner-login>'"`
+- archive sqlite 확인: `sqlite3 state/repos/<repo>/archive/prs.sqlite3 "SELECT COUNT(*) FROM pull_requests_current WHERE author_login = '<learner-login>'"`
+- archive 자체가 없으면 (`state/repos/` 미생성) onboarding 첫 setup 시 fork repo 복사가 안 됐을 가능성 → maintainer에게 문의.
 
 ---
 
