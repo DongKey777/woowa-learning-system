@@ -84,4 +84,7 @@ def test_reformulated_query_flows_into_hints():
     )
     assert rc == 0
     payload = json.loads(out)
+    assert payload["mode"] == "cs_qa"
     assert payload["response_hints"]["reformulated_query"] == "Spring DI 정의"
+    assert payload["response_hints"]["tier_downgrade"] is None
+    assert payload["response_hints"]["citation_paths"]

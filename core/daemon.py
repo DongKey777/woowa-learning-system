@@ -262,6 +262,8 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                 elif action == "ask":
                     # Full ask pipeline in daemon — bin/ask becomes thin socket client
                     prompt = req["query"]
+                    reformulated_query = str(req.get("reformulated_query") or "").strip()
+                    retrieval_query = reformulated_query or prompt
                     repo = req.get("repo")
                     learner_id = req.get("learner_id", "default")
                     profile = load_profile(learner_id, state_root=state_root)
@@ -270,11 +272,17 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
                         pending_drill=profile.pending_triggers.get("review_drill"),
                     )
+                    if decision.mode == "tier_0_fallback" and reformulated_query:
+                        decision = route(
+                            reformulated_query, repo=repo,
+                            pending_self_assessment=profile.pending_triggers.get("self_assessment"),
+                            pending_drill=profile.pending_triggers.get("review_drill"),
+                        )
                     artifacts = lazy_load(
                         decision,
                         repo=repo,
                         state_root=state_root,
-                        query=prompt,
+                        query=retrieval_query,
                         corpus=corpus,
                         learner_profile=profile,
                     )
@@ -296,8 +304,8 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                                 "expected_terms": offer.expected_terms,
                                 "source": offer.source,
                             }
-                    if req.get("reformulated_query"):
-                        artifacts["reformulated_query"] = req["reformulated_query"]
+                    if reformulated_query:
+                        artifacts["reformulated_query"] = reformulated_query
                     recent = read_history(state_root=state_root, tail=20)
                     # Phase Y11 F8: event_id is generated BEFORE compose so the
                     # response_quality_hint.command_template can embed it and
@@ -339,6 +347,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             "repo": repo,
                             "router_mode": effective_route.mode,
                             "router_reason": effective_route.reason,
+                            "reformulated_query": reformulated_query or None,
                             # I2: history aligns with hints (downgrade → []).
                             "top_concept_ids": list(response_hints["citation_paths"]),
                         },

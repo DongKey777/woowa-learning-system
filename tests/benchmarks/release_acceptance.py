@@ -65,6 +65,7 @@ SUITE = [
     ("H_Y_integration", "phase_y8_concurrent_append", BENCH / "phase_y8_concurrent_append.py", 60),
     ("H_Y_integration", "daemon_latency", BENCH / "daemon_latency.py", 60),
     ("H_Y_integration", "concurrent_ask", BENCH / "concurrent_ask.py", 60),
+    ("H_Y_integration", "reformulated_query_path", BENCH / "reformulated_query_path.py", 60),
 
     # I. Learner cycle e2e
     ("I_learner_cycle", "phase_y_learner_cycle", BENCH / "phase_y_learner_cycle.py", 60),
@@ -323,6 +324,45 @@ def _y13_gate_checks() -> list[dict]:
             "op": op,
             "pass": passed,
         })
+
+    reform_report = _read_json(REPO_ROOT / "reports" / "reformulated_query_path.json")
+    reform = (reform_report or {}).get("reformulated", {})
+    raw = (reform_report or {}).get("raw", {})
+    reform_checks = (reform_report or {}).get("checks", {})
+    out.extend([
+        {
+            "category": "K_Y13_gates",
+            "name": "reformulated_query_raw_fallback",
+            "observed": raw.get("modes"),
+            "threshold": ["tier_0_fallback"],
+            "op": "==",
+            "pass": reform_checks.get("raw_falls_back_without_citations") is True,
+        },
+        {
+            "category": "K_Y13_gates",
+            "name": "reformulated_query_routes_cs_qa",
+            "observed": reform.get("modes"),
+            "threshold": ["cs_qa"],
+            "op": "==",
+            "pass": reform_checks.get("reformulated_routes_to_cs_qa") is True,
+        },
+        {
+            "category": "K_Y13_gates",
+            "name": "reformulated_query_citations",
+            "observed": reform.get("citation_counts"),
+            "threshold": "min>=1",
+            "op": ">=",
+            "pass": reform_checks.get("reformulated_has_citations") is True,
+        },
+        {
+            "category": "K_Y13_gates",
+            "name": "reformulated_query_p95_ms",
+            "observed": reform.get("p95_ms"),
+            "threshold": 500.0,
+            "op": "<=",
+            "pass": reform_checks.get("reformulated_latency_p95_budget") is True,
+        },
+    ])
     return out
 
 
