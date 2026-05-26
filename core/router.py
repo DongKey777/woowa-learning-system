@@ -5,7 +5,11 @@ Deterministic Python — no extra LLM call. The AI session is only invoked
 later in core/coach.py with the final composed prompt.
 
 Output `RouteDecision` tells the rest of the system:
-- which mode (cs_qa, coaching, drill, retro, self_assess, tool_only, f11_anchor)
+- which mode (cs_qa, coaching, drill, retro, self_assess, tool_only,
+  f11_anchor, tier_0_fallback)
+  - tier_0_fallback: Phase Y11 P0.5 guard — prompt has no CS domain/intent
+    or mission signal (e.g. "오늘 날씨 어때"). Skips RAG retrieval; the
+    AI is instructed to surface fallback_disclaimer instead of citations.
 - which lazy artifacts to load (subset of 5)
 - which multi-agent personas to compose (subset of 3)
 - token budget for this turn (avg 5K, F11 up to 15K)
@@ -15,7 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from core.intent import IntentDecision, detect_mode
+from core.intent import IntentDecision, detect_mode, should_use_rag
 
 # F11 explicit triggers — line-level cross-crew/reviewer analysis intent
 F11_KEYWORDS = (
@@ -79,6 +83,23 @@ def route(
         pending_self_assessment=pending_self_assessment,
         pending_drill=pending_drill,
     )
+
+    # Phase Y11 P0.5 — only the cs_qa *default* branch is checked; pending
+    # drill/self-assess, tool_only, retro, coaching, F11 (above) keep their
+    # legitimate routes.
+    if intent.mode == "cs_qa" and not should_use_rag(prompt, repo):
+        return RouteDecision(
+            mode="tier_0_fallback",
+            need_rag=False,
+            need_mission_ctx=False,
+            need_anchors=False,
+            personas=[],
+            budget_tokens=2000,
+            lazy_artifacts=[],
+            reason="guard: non-CS prompt (no domain+intent or mission signal)",
+            confidence=0.7,
+        )
+
     return _from_intent(intent)
 
 
