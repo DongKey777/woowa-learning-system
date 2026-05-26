@@ -1,62 +1,125 @@
 #!/usr/bin/env python3
-"""bin/cohort-eval — run query cohort through bin/ask + aggregate metrics
-(Phase W7).
+"""bin/cohort-eval - cohort and qrels retrieval measurement.
 
-CLI: bin/cohort-eval --cohort-file C.json [--out reports/cohort_X.json]
-Cohort format: [{"prompt": "...", "expected_mode": "cs_qa", "repo": ...}, ...]
+Two input contracts are supported:
+  1. --cohort-file: legacy v2 smoke rows with prompt + expected_mode.
+  2. --qrels: R3 real qrels rows with expected_concepts and cohort_tag.
+
+The qrels path is evaluation-only: it uses daemon search, not daemon ask, so
+it does not append learner history events.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import socket
-import statistics
 import sys
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+from rag.eval import retrieval_metrics  # noqa: E402
 
 
-def _daemon_ask(prompt, repo, state_root):
+SearchFn = Callable[[str, int, int, Path], tuple[list[dict], float, str | None]]
+COHORT_INTENT_WEIGHTS = {
+    "paraphrase_human": 0.40,
+    "mission_bridge": 0.20,
+    "symptom_to_cause": 0.20,
+    "confusable_pairs": 0.10,
+    "forbidden_neighbor": 0.10,
+    "corpus_gap_probe": 0.00,
+}
+
+
+def _percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(ordered[0], 1)
+    pos = (len(ordered) - 1) * p
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return round(ordered[lo] * (1.0 - frac) + ordered[hi] * frac, 1)
+
+
+def _mean(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 3) if values else None
+
+
+def _socket_request(state_root: Path, req: dict[str, Any], timeout_s: int = 30) -> dict:
     sp = state_root / "rag-daemon.sock"
     if not sp.exists():
+        raise RuntimeError(f"daemon socket missing: {sp}")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout_s)
+    try:
+        sock.connect(str(sp))
+        sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        sock.close()
+    return json.loads(data.decode("utf-8").strip())
+
+
+def _daemon_ask(prompt: str, repo: str | None, state_root: Path) -> dict | None:
+    try:
+        req: dict[str, Any] = {
+            "action": "ask",
+            "query": prompt,
+            "learner_id": "default",
+        }
+        if repo:
+            req["repo"] = repo
+        return _socket_request(state_root, req)
+    except Exception:
         return None
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(30)
-    s.connect(str(sp))
-    req = {"action": "ask", "query": prompt, "learner_id": "default"}
-    if repo:
-        req["repo"] = repo
-    s.sendall((json.dumps(req) + "\n").encode())
-    s.shutdown(socket.SHUT_WR)
-    data = b""
-    while True:
-        c = s.recv(65536)
-        if not c:
-            break
-        data += c
-    s.close()
-    return json.loads(data.decode().strip())
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cohort-file", type=Path, required=True)
-    parser.add_argument("--out", type=Path, default=None)
-    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
-    args = parser.parse_args(argv)
+def _daemon_search(
+    prompt: str,
+    top_k: int,
+    relations_expand: int,
+    state_root: Path,
+) -> tuple[list[dict], float, str | None]:
+    started = time.perf_counter()
+    try:
+        resp = _socket_request(
+            state_root,
+            {
+                "action": "search",
+                "query": prompt,
+                "top_k": top_k,
+                "relations_expand": relations_expand,
+            },
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if resp.get("error"):
+            return [], elapsed_ms, str(resp["error"])[:200]
+        return list(resp.get("hits") or []), elapsed_ms, None
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        return [], elapsed_ms, f"{type(exc).__name__}: {exc}"[:200]
 
-    if not args.cohort_file.exists():
-        print(f"ERROR: cohort missing: {args.cohort_file}", file=sys.stderr)
-        return 2
-    cohort = json.loads(args.cohort_file.read_text(encoding="utf-8"))
 
+def _evaluate_mode_cohort(cohort_file: Path, state_root: Path) -> dict:
+    cohort = json.loads(cohort_file.read_text(encoding="utf-8"))
     results = []
-    latencies = []
+    latencies: list[float] = []
     mode_correct = 0
     mode_total = 0
     for q in cohort:
@@ -65,10 +128,10 @@ def main(argv: list[str] | None = None) -> int:
         repo = q.get("repo")
         t0 = time.perf_counter()
         try:
-            resp = _daemon_ask(prompt, repo, args.state_root)
+            resp = _daemon_ask(prompt, repo, state_root)
             ms = (time.perf_counter() - t0) * 1000
-        except Exception as e:
-            results.append({"prompt": prompt[:60], "error": str(e)[:100]})
+        except Exception as exc:  # noqa: BLE001
+            results.append({"prompt": prompt[:60], "error": str(exc)[:100]})
             continue
         if resp is None:
             results.append({"prompt": prompt[:60], "error": "daemon down"})
@@ -77,9 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         is_correct = None
         if expected:
             mode_total += 1
-            is_correct = (got == expected)
-            if is_correct:
-                mode_correct += 1
+            is_correct = got == expected
+            mode_correct += int(is_correct)
         latencies.append(ms)
         results.append({
             "prompt": prompt[:60],
@@ -90,19 +152,393 @@ def main(argv: list[str] | None = None) -> int:
         })
 
     summary = {
+        "input_mode": "cohort_file",
         "cohort_size": len(cohort),
-        "latency_p50_ms": round(statistics.median(latencies), 1) if latencies else None,
-        "latency_p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)], 1)
-                           if latencies else None,
+        "latency_p50_ms": _percentile(latencies, 0.50),
+        "latency_p95_ms": _percentile(latencies, 0.95),
         "mode_dispatch_correct": f"{mode_correct}/{mode_total}",
         "mode_accuracy": round(mode_correct / mode_total, 3) if mode_total else None,
     }
-    payload = {"summary": summary, "results": results}
+    return {"summary": summary, "results": results}
+
+
+def _load_qrels(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    blob = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(blob, list):
+        return {}, blob
+    if not isinstance(blob, dict):
+        raise ValueError(f"unexpected qrels root: {path}")
+    records = blob.get("queries")
+    if not isinstance(records, list):
+        raise ValueError(f"{path}: queries must be a list")
+    declared = blob.get("query_count")
+    if declared is not None and int(declared) != len(records):
+        raise ValueError(
+            f"{path}: query_count mismatch declared={declared} actual={len(records)}"
+        )
+    metadata = {k: v for k, v in blob.items() if k != "queries"}
+    return metadata, records
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_corpus_concept_ids() -> set[str]:
+    graph = json.loads((REPO_ROOT / "corpus" / "concept_graph.json").read_text(
+        encoding="utf-8"
+    ))
+    return set((graph.get("nodes") or {}).keys())
+
+
+def _path_to_concept_candidates(path: str, concept_ids: set[str]) -> list[str]:
+    parts = Path(path).parts
+    if len(parts) < 3 or parts[0] != "contents":
+        return []
+    category = parts[1]
+    stem = Path(parts[-1]).stem
+    candidates = [f"{category}/{stem}"]
+    prefixes = (
+        f"{category}-",
+        "spring-",
+        "java-",
+        "network-",
+        "database-",
+        "design-pattern-",
+        "software-engineering-",
+    )
+    for prefix in prefixes:
+        if stem.startswith(prefix):
+            candidates.append(f"{category}/{stem[len(prefix):]}")
+    suffixes = (
+        "-basics",
+        "-primer",
+        "-note",
+        "-card",
+        "-entrypoint-primer",
+    )
+    expanded = list(candidates)
+    for cid in candidates:
+        cat, cid_stem = cid.split("/", 1)
+        for suffix in suffixes:
+            if cid_stem.endswith(suffix):
+                expanded.append(f"{cat}/{cid_stem[:-len(suffix)]}")
+    return [cid for cid in dict.fromkeys(expanded) if cid in concept_ids]
+
+
+def _mapped_forbidden_concepts(record: dict[str, Any], concept_ids: set[str]) -> list[str]:
+    out: list[str] = []
+    for path in record.get("forbidden_paths") or []:
+        out.extend(_path_to_concept_candidates(str(path), concept_ids))
+    return list(dict.fromkeys(out))
+
+
+def _failure_class(
+    *,
+    record: dict[str, Any],
+    outcome: str,
+    error: str | None,
+    expected_in_corpus: list[str],
+) -> str | None:
+    if error:
+        return "search_error"
+    if outcome in {"primary_top1", "primary_topk", "gap_clean"}:
+        return None
+    if outcome == "forbidden_hit":
+        return "forbidden_polluted"
+    if outcome == "no_hits":
+        return "candidate_absent"
+    if not expected_in_corpus and record.get("cohort_tag") == "corpus_gap_probe":
+        return "corpus_gap"
+    focus = {str(x).lower() for x in (record.get("failure_focus") or [])}
+    if {"paraphrase_robustness", "korean_no_alias_match"} & focus:
+        return "query_understood_badly"
+    if "confusable_routing" in focus:
+        return "fusion_under_ranked"
+    if "forbidden_routing" in focus:
+        return "forbidden_polluted"
+    return "candidate_absent"
+
+
+def evaluate_qrels(
+    qrels_path: Path,
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+    top_k: int = 5,
+    relations_expand: int = 5,
+    use_reformulated_query: bool = False,
+    limit: int | None = None,
+    search_fn: SearchFn = _daemon_search,
+) -> dict:
+    metadata, records = _load_qrels(qrels_path)
+    if limit is not None:
+        records = records[:limit]
+    concept_ids = _load_corpus_concept_ids()
+
+    results: list[dict[str, Any]] = []
+    per_cohort_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    latencies: list[float] = []
+    rank_rows: list[dict[str, float]] = []
+    top1 = 0
+    topk_hit = 0
+    pass_count = 0
+    active_pass_count = 0
+    active_total = 0
+    errors = 0
+    no_hits = 0
+    excluded_gap = 0
+    missing_expected = 0
+    forbidden_hit_total = 0
+
+    for record in records:
+        query_id = str(record.get("query_id") or "")
+        cohort_tag = str(record.get("cohort_tag") or "unknown")
+        raw_prompt = str(record.get("prompt") or "")
+        reformulated = str(record.get("reformulated_query") or "").strip()
+        prompt = reformulated if use_reformulated_query and reformulated else raw_prompt
+        expected_all = [str(x) for x in (record.get("expected_concepts") or [])]
+        expected_in_corpus = [cid for cid in expected_all if cid in concept_ids]
+        forbidden_concepts = _mapped_forbidden_concepts(record, concept_ids)
+
+        hits, ms, error = search_fn(prompt, top_k, relations_expand, state_root)
+        latencies.append(ms)
+        if error:
+            errors += 1
+        if not hits and not error:
+            no_hits += 1
+
+        top_hits = hits[:top_k]
+        top_ids = [str(h.get("concept_id")) for h in top_hits if h.get("concept_id")]
+        forbidden_hit_ids = [cid for cid in top_ids if cid in set(forbidden_concepts)]
+        if forbidden_hit_ids:
+            forbidden_hit_total += 1
+
+        ranking_eligible = bool(expected_in_corpus)
+        rank_metrics: dict[str, float] | None = None
+        is_top1 = False
+        is_topk = False
+        if ranking_eligible:
+            rank_metrics = retrieval_metrics(top_ids, expected_in_corpus, k=top_k)
+            rank_rows.append(rank_metrics)
+            is_top1 = bool(top_ids and top_ids[0] in set(expected_in_corpus))
+            is_topk = rank_metrics[f"recall_at_{top_k}"] > 0.0
+            top1 += int(is_top1)
+            topk_hit += int(is_topk)
+        else:
+            missing_expected += len(expected_all)
+            if cohort_tag == "corpus_gap_probe":
+                excluded_gap += 1
+
+        if error:
+            outcome = "error"
+        elif not hits:
+            outcome = "no_hits"
+        elif cohort_tag == "corpus_gap_probe" and not expected_in_corpus:
+            outcome = "gap_returned_hits"
+        elif forbidden_hit_ids:
+            outcome = "forbidden_hit"
+        elif is_top1:
+            outcome = "primary_top1"
+        elif is_topk:
+            outcome = "primary_topk"
+        else:
+            outcome = "miss"
+
+        is_pass = outcome in {"primary_top1", "primary_topk", "gap_clean"}
+        pass_count += int(is_pass)
+        if cohort_tag != "corpus_gap_probe":
+            active_total += 1
+            active_pass_count += int(is_pass)
+
+        row = {
+            "query_id": query_id,
+            "cohort_tag": cohort_tag,
+            "prompt": raw_prompt[:120],
+            "query_used": "reformulated_query" if prompt != raw_prompt else "prompt",
+            "expected_concepts": expected_all,
+            "expected_concepts_in_corpus": expected_in_corpus,
+            "forbidden_concepts_mapped": forbidden_concepts,
+            "top_concepts": top_ids,
+            "top1_match": is_top1 if ranking_eligible else None,
+            f"top{top_k}_match": is_topk if ranking_eligible else None,
+            "ranking_eligible": ranking_eligible,
+            "metrics": {
+                key: round(value, 4)
+                for key, value in (rank_metrics or {}).items()
+            },
+            "outcome": outcome,
+            "pass_status": is_pass,
+            "failure_class": _failure_class(
+                record=record,
+                outcome=outcome,
+                error=error,
+                expected_in_corpus=expected_in_corpus,
+            ),
+            "failure_focus": record.get("failure_focus") or [],
+            "latency_ms": round(ms, 1),
+            "error": error,
+        }
+        results.append(row)
+        per_cohort_rows[cohort_tag].append(row)
+
+    ranking_n = len(rank_rows)
+    learner_alignment_sum = 0.0
+    learner_alignment_weight = 0.0
+    for tag, rows in per_cohort_rows.items():
+        weight = COHORT_INTENT_WEIGHTS.get(tag, 0.0)
+        eligible = [r for r in rows if r.get("ranking_eligible")]
+        if weight <= 0 or not eligible:
+            continue
+        topk_rate = sum(1 for r in eligible if r.get(f"top{top_k}_match") is True) / len(eligible)
+        learner_alignment_sum += topk_rate * weight
+        learner_alignment_weight += weight
+    learner_alignment_score = (
+        learner_alignment_sum / learner_alignment_weight
+        if learner_alignment_weight else None
+    )
+
+    summary = {
+        "input_mode": "qrels",
+        "fixture_id": metadata.get("fixture_id"),
+        "schema_version": metadata.get("schema_version"),
+        "qrel_sha256": _sha256(qrels_path),
+        "qrel_path": str(qrels_path),
+        "qrel_query_count": metadata.get("query_count", len(records)),
+        "cohort_size": len(records),
+        "query_field": "reformulated_query" if use_reformulated_query else "prompt",
+        "top_k": top_k,
+        "relations_expand": relations_expand,
+        "ranking_evaluated": ranking_n,
+        "ranking_excluded_corpus_gap": excluded_gap,
+        "missing_expected_concepts_n": missing_expected,
+        "errors_n": errors,
+        "no_hits_n": no_hits,
+        "overall_pass_rate": round(pass_count / len(records), 3) if records else None,
+        "active_pass_rate": round(active_pass_count / active_total, 3)
+        if active_total else None,
+        "top1_match_rate": round(top1 / ranking_n, 3) if ranking_n else None,
+        f"top{top_k}_match_rate": round(topk_hit / ranking_n, 3) if ranking_n else None,
+        f"recall_at_{top_k}": _mean([r[f"recall_at_{top_k}"] for r in rank_rows]),
+        "mrr": _mean([r["mrr"] for r in rank_rows]),
+        f"ndcg_at_{top_k}": _mean([r[f"ndcg_at_{top_k}"] for r in rank_rows]),
+        "learner_alignment_score": round(learner_alignment_score, 3)
+        if learner_alignment_score is not None else None,
+        "forbidden_hit_count": forbidden_hit_total,
+        "latency_p50_ms": _percentile(latencies, 0.50),
+        "latency_p95_ms": _percentile(latencies, 0.95),
+        "search_latency_p50_ms": _percentile(latencies, 0.50),
+        "search_latency_p95_ms": _percentile(latencies, 0.95),
+        "cohort_distribution": dict(Counter(r.get("cohort_tag") for r in records)),
+    }
+
+    per_cohort: dict[str, Any] = {}
+    for tag, rows in sorted(per_cohort_rows.items()):
+        cohort_rank_rows = [
+            r["metrics"] for r in rows
+            if r.get("ranking_eligible") and isinstance(r.get("metrics"), dict)
+        ]
+        cohort_latencies = [float(r["latency_ms"]) for r in rows]
+        total = len(rows)
+        eligible = len(cohort_rank_rows)
+        per_cohort[tag] = {
+            "total": total,
+            "ranking_evaluated": eligible,
+            "pass_rate": round(sum(1 for r in rows if r["pass_status"]) / total, 3)
+            if total else None,
+            "top1_match_rate": round(
+                sum(1 for r in rows if r.get("top1_match") is True) / eligible, 3
+            ) if eligible else None,
+            f"top{top_k}_match_rate": round(
+                sum(1 for r in rows if r.get(f"top{top_k}_match") is True) / eligible,
+                3,
+            ) if eligible else None,
+            f"recall_at_{top_k}": _mean([
+                float(r.get(f"recall_at_{top_k}", 0.0)) for r in cohort_rank_rows
+            ]),
+            "mrr": _mean([float(r.get("mrr", 0.0)) for r in cohort_rank_rows]),
+            f"ndcg_at_{top_k}": _mean([
+                float(r.get(f"ndcg_at_{top_k}", 0.0)) for r in cohort_rank_rows
+            ]),
+            "latency_p50_ms": _percentile(cohort_latencies, 0.50),
+            "latency_p95_ms": _percentile(cohort_latencies, 0.95),
+            "failure_counts": dict(Counter(
+                r["failure_class"] for r in rows if r.get("failure_class")
+            )),
+            "outcome_counts": dict(Counter(r["outcome"] for r in rows)),
+        }
+
+    return {
+        "summary": summary,
+        "per_cohort": per_cohort,
+        "results": results,
+        "metadata": metadata,
+    }
+
+
+def _threshold_failures(args: argparse.Namespace, summary: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    ndcg_key = f"ndcg_at_{args.top_k}"
+    if args.min_top1 is not None:
+        observed = summary.get("top1_match_rate")
+        if observed is None or observed < args.min_top1:
+            failures.append(f"top1_match_rate {observed} < {args.min_top1}")
+    if args.min_ndcg is not None:
+        observed = summary.get(ndcg_key)
+        if observed is None or observed < args.min_ndcg:
+            failures.append(f"{ndcg_key} {observed} < {args.min_ndcg}")
+    if args.max_p95_ms is not None:
+        observed = summary.get("latency_p95_ms")
+        if observed is None or observed > args.max_p95_ms:
+            failures.append(f"latency_p95_ms {observed} > {args.max_p95_ms}")
+    return failures
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--cohort-file", type=Path)
+    group.add_argument("--qrels", type=Path)
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--relations-expand", type=int, default=5)
+    parser.add_argument("--use-reformulated-query", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--min-top1", type=float, default=None)
+    parser.add_argument("--min-ndcg", type=float, default=None)
+    parser.add_argument("--max-p95-ms", type=float, default=None)
+    args = parser.parse_args(argv)
+
+    if args.cohort_file:
+        if not args.cohort_file.exists():
+            print(f"ERROR: cohort missing: {args.cohort_file}", file=sys.stderr)
+            return 2
+        payload = _evaluate_mode_cohort(args.cohort_file, args.state_root)
+    else:
+        if not args.qrels.exists():
+            print(f"ERROR: qrels missing: {args.qrels}", file=sys.stderr)
+            return 2
+        payload = evaluate_qrels(
+            args.qrels,
+            state_root=args.state_root,
+            top_k=args.top_k,
+            relations_expand=args.relations_expand,
+            use_reformulated_query=args.use_reformulated_query,
+            limit=args.limit,
+        )
+
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                             encoding="utf-8")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+        args.out.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+    failures = _threshold_failures(args, payload["summary"])
+    if failures:
+        for failure in failures:
+            print(f"FAIL: {failure}", file=sys.stderr)
+        return 1
     return 0
 
 

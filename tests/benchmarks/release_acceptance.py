@@ -35,6 +35,7 @@ SUITE = [
     # B. Foundation benches
     ("B_foundation", "rag_quality_regression", BENCH / "rag_quality_regression.py", 120),
     ("B_foundation", "gate_measurements", BENCH / "gate_measurements.py", 60),
+    ("B_foundation", "cohort_qrels_eval", BENCH / "cohort_qrels_eval.py", 120),
 
     # C. Phase T learner automation
     ("C_T_learner", "learn_pr_retro_bench", BENCH / "learn_pr_retro_bench.py", 30),
@@ -297,6 +298,30 @@ def _y13_gate_checks() -> list[dict]:
             "threshold": threshold,
             "op": "<=",
             "pass": observed is not None and observed <= threshold,
+        })
+
+    cohort_report = _read_json(REPO_ROOT / "reports" / "cohort_y13_baseline.json")
+    cohort = (cohort_report or {}).get("summary", {})
+    cohort_gates = [
+        ("cohort_qrels_top1", cohort.get("top1_match_rate"), 0.80, ">="),
+        ("cohort_qrels_ndcg_at_5", cohort.get("ndcg_at_5"), 0.78, ">="),
+        ("cohort_qrels_p95_ms", cohort.get("latency_p95_ms"), 500.0, "<="),
+        ("cohort_qrels_errors", cohort.get("errors_n"), 0, "=="),
+    ]
+    for name, observed, threshold, op in cohort_gates:
+        if op == ">=":
+            passed = observed is not None and observed >= threshold
+        elif op == "<=":
+            passed = observed is not None and observed <= threshold
+        else:
+            passed = observed == threshold
+        out.append({
+            "category": "K_Y13_gates",
+            "name": name,
+            "observed": observed,
+            "threshold": threshold,
+            "op": op,
+            "pass": passed,
         })
     return out
 
