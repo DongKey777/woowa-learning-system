@@ -38,6 +38,27 @@ def _run(cmd: list[str], cwd: Path = REPO_ROOT, timeout: float = 600) -> dict:
         return {"cmd": cmd, "rc": 124, "ms": -1, "error": "timeout"}
 
 
+def _probe_cohort_size(owner: str, repo: str) -> int | None:
+    """gh GraphQL → pullRequests.totalCount. 1 gh call. None if unavailable."""
+    import subprocess
+    query = ('query($o:String!,$r:String!){repository(owner:$o,name:$r)'
+             '{pullRequests(states:[OPEN,CLOSED,MERGED]){totalCount}}}')
+    try:
+        r = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"query={query}",
+             "-F", f"o={owner}", "-F", f"r={repo}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        return (data.get("data", {}).get("repository", {})
+                .get("pullRequests", {}).get("totalCount"))
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+
 def _detect_upstream_owner(learner_login: str, repo: str) -> str | None:
     """gh repo view DongKey777/<repo> --json parent → upstream owner.
 
@@ -86,12 +107,16 @@ def main(argv: list[str] | None = None) -> int:
     gh_repo = args.gh_repo or args.repo
 
     # Auto-resolve upstream owner: --owner > gh repo view parent > 'woowacourse'
-    owner = owner or _detect_upstream_owner(learner_login, args.repo) \
-            or "woowacourse"
+    if args.owner:
+        owner, owner_source = args.owner, "explicit"
+    else:
+        detected = _detect_upstream_owner(learner_login, args.repo)
+        if detected:
+            owner, owner_source = detected, "auto_parent"
+        else:
+            owner, owner_source = "woowacourse", "fallback"
     steps = [{"step": "resolve_owner", "rc": 0, "ms": 0,
-              "resolved_owner": owner,
-              "source": ("explicit" if owner else
-                         ("auto_parent" if owner != "woowacourse" else "fallback"))}]
+              "resolved_owner": owner, "source": owner_source}]
 
     # 1. clone if needed
     if not mission_path.exists():
@@ -106,13 +131,33 @@ def main(argv: list[str] | None = None) -> int:
     else:
         steps.append({"step": "clone", "rc": 0, "ms": 0, "skipped": "exists"})
 
+    # 1.5. probe cohort size → dynamic --max-gh-calls so big cohorts (>100 PRs)
+    # don't hit bootstrap-repo's default 500-call cap. Skipped if --limit set
+    # (learner already capped) or probe fails (falls back to bootstrap default).
+    auto_cap = None
+    cohort_size = None
+    if not args.limit:
+        cohort_size = _probe_cohort_size(owner, gh_repo)
+        if cohort_size:
+            # ~5 endpoints per PR (detail, files, reviews, review_comments,
+            # issue_comments) + 200 safety. Hard ceiling 3000 leaves margin
+            # within gh's 5000/h limit for follow-up work.
+            auto_cap = min(cohort_size * 5 + 200, 3000)
+        steps.append({"step": "probe_cohort_size", "rc": 0, "ms": 0,
+                      "cohort_size": cohort_size, "auto_cap": auto_cap})
+
     # 2. bootstrap-repo
     cmd = [sys.executable, str(REPO_ROOT / "bin" / "bootstrap-repo"),
             "--repo", args.repo, "--owner", owner,
             "--gh-repo", gh_repo, "--silent"]
     if args.limit:
         cmd.extend(["--limit", str(args.limit)])
-    steps.append({"step": "bootstrap-repo"} | _run(cmd, timeout=600))
+    if auto_cap:
+        cmd.extend(["--max-gh-calls", str(auto_cap)])
+    # ~6s per PR observed empirically; +120s setup margin, floor 600s.
+    bootstrap_timeout = max(600.0, ((cohort_size or 100) * 8) + 120) \
+        if not args.limit else 600.0
+    steps.append({"step": "bootstrap-repo"} | _run(cmd, timeout=bootstrap_timeout))
 
     # 3. mission-patterns-build
     steps.append({"step": "mission-patterns-build"} | _run(
