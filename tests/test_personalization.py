@@ -62,6 +62,11 @@ def test_family_match_by_root_segment() -> None:
     assert _matches_family("spring/bean", "spring/bean-lifecycle-deep") is True
 
 
+def test_family_match_does_not_merge_sibling_prefixes() -> None:
+    """`bean-di-*` and `bean-lifecycle-*` are siblings, not one family."""
+    assert _matches_family("spring/bean-di-basics", "spring/bean-lifecycle") is False
+
+
 def test_family_mismatch_across_categories() -> None:
     assert _matches_family("spring/bean", "database/bean") is False
 

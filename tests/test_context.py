@@ -65,6 +65,14 @@ def test_cs_qa_returns_personalized_hits(tmp_path: Path) -> None:
     assert "spring/bean" in ctx["personalization"]["mastered_applied"]
 
 
+def test_cs_qa_treats_proficient_as_mastered(tmp_path: Path) -> None:
+    save_profile(LearnerProfile(learner_id="dk", proficient_concepts=["spring/bean"]), state_root=tmp_path)
+    with patch("core.context.search", return_value=_mock_hits()):
+        ctx = collect_cs_qa_context("DI", learner_id="dk", state_root=tmp_path)
+    assert ctx["hits"][0]["concept_id"] == "spring/component"
+    assert ctx["personalization"]["mastered_applied"] == ["spring/bean"]
+
+
 def test_coaching_assembles_state_peer_rag(tmp_path: Path) -> None:
     _seed_archive(tmp_path)
     save_profile(LearnerProfile(learner_id="donkey"), state_root=tmp_path)

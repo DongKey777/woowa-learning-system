@@ -11,8 +11,9 @@ Score deltas reuse cycle 9.2 production values (Adaptive Response, AGENTS.md):
 
 Concept family matching (cycle 9.2 corpus mapping rules):
 - `concept:spring/bean` → strip `concept:` prefix
-- `spring/bean-di-basics` matches `spring/bean` family by first slash segment +
-  hyphen-prefix overlap of the second segment
+- `spring/bean-di-basics` matches `spring/bean` by full hyphen-prefix overlap.
+  Sibling families such as `spring/bean-di-*` and `spring/bean-lifecycle-*`
+  do not match each other.
 """
 from __future__ import annotations
 
@@ -44,9 +45,9 @@ def _split(cid: str) -> tuple[str, str]:
 def _matches_family(hit_id: str, profile_id: str) -> bool:
     """True if hit and profile share concept family.
 
-    Same category + (same slug OR slug shares root segment before first '-').
+    Same category + exact slug or full hyphen-prefix overlap.
     Example: `spring/bean` matches `spring/bean-di-basics`,
-    `spring/component`, but not `spring/transaction-propagation`.
+    but `spring/bean-di-basics` does not match `spring/bean-lifecycle`.
     """
     hit_id = _normalize(hit_id)
     profile_id = _normalize(profile_id)
@@ -58,9 +59,7 @@ def _matches_family(hit_id: str, profile_id: str) -> bool:
         return False
     if not hslug or not pslug:
         return False
-    hroot = hslug.split("-", 1)[0]
-    proot = pslug.split("-", 1)[0]
-    return hroot == proot and len(hroot) >= 3
+    return hslug.startswith(f"{pslug}-") or pslug.startswith(f"{hslug}-")
 
 
 def adjust(

@@ -132,6 +132,7 @@ def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> Lear
         learner_id=data.get("learner_id", learner_id),
         mastered_concepts=list(data.get("mastered_concepts", [])),
         uncertain_concepts=list(data.get("uncertain_concepts", [])),
+        proficient_concepts=list(data.get("proficient_concepts", [])),
         drill_due=list(data.get("drill_due", [])),
         pending_triggers=dict(data.get("pending_triggers", {})),
         total_events=data.get("total_events", 0),

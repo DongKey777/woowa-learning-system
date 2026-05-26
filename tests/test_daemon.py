@@ -31,6 +31,39 @@ def test_search_returns_none_when_socket_missing(tmp_path: Path) -> None:
     assert result is None
 
 
+def test_search_can_request_learner_profile_personalization(monkeypatch, tmp_path: Path) -> None:
+    sock_path = tmp_path / daemon.SOCKET_FILE
+    sock_path.touch()
+    sent: list[bytes] = []
+
+    class FakeSocket:
+        def __init__(self):
+            self._chunks = [b'{"hits": []}\n', b""]
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            self.path = path
+
+        def sendall(self, data):
+            sent.append(data)
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            return self._chunks.pop(0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(daemon.socket, "socket", lambda *args, **kwargs: FakeSocket())
+    assert daemon.search("DI", state_root=tmp_path, learner_id="dk") == []
+    payload = json.loads(sent[0].decode("utf-8"))
+    assert payload["learner_id"] == "dk"
+
+
 def test_ask_returns_none_when_socket_missing(tmp_path: Path) -> None:
     result = daemon.ask("test prompt", state_root=tmp_path)
     assert result is None

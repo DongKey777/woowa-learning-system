@@ -287,6 +287,18 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
         parts.append(f"  question: {do.get('question')}")
         if do.get("expected_terms"):
             parts.append(f"  expected_terms: {do['expected_terms'][:5]}")
+    if "personalization" in artifacts:
+        p = artifacts["personalization"]
+        parts.append(
+            "### personalization "
+            f"(enabled={p.get('enabled')}, "
+            f"mastered={len(p.get('mastered_applied', []))}, "
+            f"uncertain={len(p.get('uncertain_applied', []))})"
+        )
+        if p.get("mastered_applied"):
+            parts.append(f"  mastered_applied: {p['mastered_applied'][:5]}")
+        if p.get("uncertain_applied"):
+            parts.append(f"  uncertain_applied: {p['uncertain_applied'][:5]}")
     if "rag_hits" in artifacts:
         hits = artifacts["rag_hits"]
         parts.append("### rag_hits (BGE-M3 dense + relations walk, top-5)")

@@ -52,7 +52,7 @@ def collect_cs_qa_context(
     hits = search(prompt, corpus=corpus, rerank_fn=rerank_fn, **search_kwargs)
     adjusted = adjust(
         hits,
-        mastered_concepts=profile.mastered_concepts,
+        mastered_concepts=profile.mastered_concepts + profile.proficient_concepts,
         uncertain_concepts=profile.uncertain_concepts,
     )
     return {
@@ -60,7 +60,10 @@ def collect_cs_qa_context(
         "prompt": prompt,
         "hits": [_hit_to_dict(h) for h in adjusted],
         "personalization": {
-            "mastered_applied": [c for c in profile.mastered_concepts if _hit_in_family(adjusted, c)],
+            "mastered_applied": [
+                c for c in profile.mastered_concepts + profile.proficient_concepts
+                if _hit_in_family(adjusted, c)
+            ],
             "uncertain_applied": [c for c in profile.uncertain_concepts if _hit_in_family(adjusted, c)],
         },
     }
@@ -81,7 +84,7 @@ def collect_coaching_context(
     rag_hits = search(prompt, **search_kwargs) if prompt.strip() else []
     rag_adjusted = adjust(
         rag_hits,
-        mastered_concepts=profile.mastered_concepts,
+        mastered_concepts=profile.mastered_concepts + profile.proficient_concepts,
         uncertain_concepts=profile.uncertain_concepts,
     )
 

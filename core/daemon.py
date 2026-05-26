@@ -47,6 +47,7 @@ def search(
     top_k: int = 5,
     relations_expand: int = 3,
     state_root: Path = DEFAULT_STATE_ROOT,
+    learner_id: str | None = None,
 ) -> list[dict] | None:
     """Returns hits via daemon. None if daemon unavailable (caller falls back)."""
     sp = _socket_path(state_root)
@@ -56,8 +57,15 @@ def search(
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(DAEMON_TIMEOUT)
         sock.connect(str(sp))
-        req = json.dumps({"action": "search", "query": query, "top_k": top_k,
-                          "relations_expand": relations_expand}) + "\n"
+        req_payload = {
+            "action": "search",
+            "query": query,
+            "top_k": top_k,
+            "relations_expand": relations_expand,
+        }
+        if learner_id:
+            req_payload["learner_id"] = learner_id
+        req = json.dumps(req_payload) + "\n"
         sock.sendall(req.encode("utf-8"))
         sock.shutdown(socket.SHUT_WR)
         data = b""
@@ -192,7 +200,11 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
     from rag.encoder import encode_query
     from core.coach import compose
     from core.lexical_fusion import make_lexical_fusion_fn
-    from core.lazy_loader import load as lazy_load
+    from core.lazy_loader import (
+        _hits_to_dicts,
+        _personalize_hits,
+        load as lazy_load,
+    )
     from core.router import route
     from core.state import append_history_event, load_profile, read_history
     corpus = load_corpus(strict=True)
@@ -239,10 +251,13 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         rerank_fn=_lexical_fn(corpus, req.get("lexical_expand", 8)),
                         corpus=corpus,
                     )
-                    payload = {"hits": [{
-                        "concept_id": h.concept_id, "score": round(h.score, 4),
-                        "category": h.category, "title": h.title, "source": h.source,
-                    } for h in hits]}
+                    personalization = None
+                    if req.get("learner_id"):
+                        profile = load_profile(req["learner_id"], state_root=state_root)
+                        hits, personalization = _personalize_hits(hits, profile)
+                    payload = {"hits": _hits_to_dicts(hits)}
+                    if personalization is not None:
+                        payload["personalization"] = personalization
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 elif action == "ask":
                     # Full ask pipeline in daemon — bin/ask becomes thin socket client
@@ -255,8 +270,14 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
                         pending_drill=profile.pending_triggers.get("review_drill"),
                     )
-                    artifacts = lazy_load(decision, repo=repo, state_root=state_root,
-                                          query=prompt, corpus=corpus)
+                    artifacts = lazy_load(
+                        decision,
+                        repo=repo,
+                        state_root=state_root,
+                        query=prompt,
+                        corpus=corpus,
+                        learner_profile=profile,
+                    )
                     # Drill mode integration: if router dispatched drill and
                     # there's no pending offer yet, try to build one from the
                     # learner's uncertain concepts so the AI session has a

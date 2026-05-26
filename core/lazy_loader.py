@@ -8,6 +8,7 @@ Token-budget critical: never load all 5 artifacts at once. The router's
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
@@ -22,9 +23,12 @@ from core.router import (
     ARTIFACT_MISSION_PATTERNS,
     RouteDecision,
 )
+from core.state import LearnerProfile
+from rag.search import SearchHit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONCEPT_GRAPH = REPO_ROOT / "corpus" / "concept_graph.json"
+_PERSONALIZATION_DISABLED = {"0", "false", "off", "no"}
 
 
 def load(
@@ -34,6 +38,7 @@ def load(
     concept_graph_path: Path = DEFAULT_CONCEPT_GRAPH,
     query: str | None = None,
     corpus=None,
+    learner_profile: LearnerProfile | None = None,
 ) -> dict[str, Any]:
     """Return dict {artifact_name: artifact_content_or_summary}.
 
@@ -53,11 +58,23 @@ def load(
         elif name == ARTIFACT_CROSS_CREW:
             out[name] = _load_cross_crew(repo, state_root)
     if route.need_rag and query:
-        out["rag_hits"] = _load_rag_hits(query, corpus=corpus)
+        hits, personalization = _load_rag_hits(
+            query, corpus=corpus, learner_profile=learner_profile,
+            state_root=state_root,
+        )
+        out["rag_hits"] = hits
+        if personalization is not None:
+            out["personalization"] = personalization
     return out
 
 
-def _load_rag_hits(query: str, top_k: int = 5, corpus=None) -> list[dict]:
+def _load_rag_hits(
+    query: str,
+    top_k: int = 5,
+    corpus=None,
+    learner_profile: LearnerProfile | None = None,
+    state_root: Path = DEFAULT_STATE_ROOT,
+) -> tuple[list[dict], dict | None]:
     """Invoke rag.search.
 
     Priority: (1) in-process if corpus injected (daemon ask path — avoids
@@ -69,33 +86,95 @@ def _load_rag_hits(query: str, top_k: int = 5, corpus=None) -> list[dict]:
         try:
             from rag.search import search
             from core.lexical_fusion import make_lexical_fusion_fn
-            hits = search(
-                query,
-                top_k=top_k,
-                relations_expand=3,
-                rerank_fn=make_lexical_fusion_fn(corpus, expand=8),
-                corpus=corpus,
-            )
-            return [{"concept_id": h.concept_id, "score": round(h.score, 4),
-                     "category": h.category, "title": h.title, "source": h.source}
-                    for h in hits]
+            hits = search(query, top_k=top_k, relations_expand=3,
+                          rerank_fn=make_lexical_fusion_fn(corpus, expand=8),
+                          corpus=corpus)
+            hits, personalization = _personalize_hits(hits, learner_profile)
+            return _hits_to_dicts(hits), personalization
         except Exception as exc:
-            return [{"error": f"rag.search failed: {exc!s}"}]
+            return [{"error": f"rag.search failed: {exc!s}"}], None
     try:
         from core import daemon as rag_daemon
-        hits = rag_daemon.search(query, top_k=top_k, relations_expand=3)
-        if hits is not None:
-            return hits
+        hit_dicts = rag_daemon.search(query, top_k=top_k,
+                                      relations_expand=3, state_root=state_root)
+        if hit_dicts is not None:
+            hits = _dicts_to_hits(hit_dicts)
+            if not hits:
+                return hit_dicts, None
+            hits, personalization = _personalize_hits(hits, learner_profile)
+            return _hits_to_dicts(hits), personalization
     except Exception:
         pass
     try:
         from rag.search import search
         hits = search(query, top_k=top_k, relations_expand=3)
-        return [{"concept_id": h.concept_id, "score": round(h.score, 4),
-                 "category": h.category, "title": h.title, "source": h.source}
-                for h in hits]
+        hits, personalization = _personalize_hits(hits, learner_profile)
+        return _hits_to_dicts(hits), personalization
     except Exception as exc:
-        return [{"error": f"rag.search unavailable: {exc!s}"}]
+        return [{"error": f"rag.search unavailable: {exc!s}"}], None
+
+
+def personalization_active() -> bool:
+    value = os.environ.get("WOOWA_PERSONALIZATION_ACTIVE", "on").strip().lower()
+    return value not in _PERSONALIZATION_DISABLED
+
+
+def _mastered_like(profile: LearnerProfile | None) -> list[str]:
+    return [] if profile is None else (
+        list(profile.mastered_concepts)
+        + list(getattr(profile, "proficient_concepts", []))
+    )
+
+
+def _personalize_hits(
+    hits: list[SearchHit],
+    learner_profile: LearnerProfile | None,
+) -> tuple[list[SearchHit], dict | None]:
+    enabled = personalization_active()
+    mastered = _mastered_like(learner_profile)
+    uncertain = list(learner_profile.uncertain_concepts) if learner_profile else []
+    if not enabled:
+        if mastered or uncertain:
+            return list(hits), {"enabled": False, "mastered_applied": [],
+                                "uncertain_applied": []}
+        return list(hits), None
+    if not hits or (not mastered and not uncertain):
+        return list(hits), None
+
+    from rag.personalization import adjust, _matches_family
+
+    adjusted = adjust(hits, mastered_concepts=mastered,
+                      uncertain_concepts=uncertain)
+    return adjusted, {
+        "enabled": True,
+        "mastered_applied": [c for c in mastered
+                             if any(_matches_family(h.concept_id, c) for h in hits)],
+        "uncertain_applied": [c for c in uncertain
+                              if any(_matches_family(h.concept_id, c) for h in hits)],
+    }
+
+
+def _hits_to_dicts(hits: list[SearchHit]) -> list[dict]:
+    return [
+        {"concept_id": h.concept_id, "score": round(h.score, 4),
+         "category": h.category, "title": h.title, "source": h.source}
+        for h in hits
+    ]
+
+
+def _dicts_to_hits(hit_dicts: list[dict]) -> list[SearchHit]:
+    hits: list[SearchHit] = []
+    for h in hit_dicts:
+        if not isinstance(h, dict) or "error" in h:
+            continue
+        cid = h.get("concept_id")
+        if not cid:
+            continue
+        hits.append(SearchHit(
+            concept_id=str(cid), score=float(h.get("score") or 0.0),
+            category=str(h.get("category") or ""), title=str(h.get("title") or cid),
+            source=str(h.get("source") or "daemon")))
+    return hits
 
 
 def _load_mastery(state_root: Path) -> dict:

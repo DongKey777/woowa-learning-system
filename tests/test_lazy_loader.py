@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from core.lazy_loader import load
 from core.mastery import record_evidence
@@ -15,6 +17,8 @@ from core.router import (
     RouteDecision,
     route,
 )
+from core.state import LearnerProfile
+from rag.search import SearchHit
 
 
 def _make_route(artifacts: list[str]) -> RouteDecision:
@@ -22,6 +26,20 @@ def _make_route(artifacts: list[str]) -> RouteDecision:
         mode="test", need_rag=False, need_mission_ctx=False, need_anchors=False,
         personas=[], budget_tokens=0, lazy_artifacts=artifacts, reason="test",
     )
+
+
+def _make_rag_route() -> RouteDecision:
+    return RouteDecision(
+        mode="cs_qa", need_rag=True, need_mission_ctx=False, need_anchors=False,
+        personas=[], budget_tokens=0, lazy_artifacts=[], reason="test",
+    )
+
+
+def _mock_hits() -> list[SearchHit]:
+    return [
+        SearchHit("spring/bean", 0.9, "spring", "Bean", "dense"),
+        SearchHit("spring/component", 0.8, "spring", "Component", "dense"),
+    ]
 
 
 def test_load_only_asked_artifacts(tmp_path: Path) -> None:
@@ -126,3 +144,60 @@ def test_end_to_end_with_router_decision(tmp_path: Path) -> None:
     r2 = route("PR 37 정밀 비교")
     out2 = load(r2, repo="x", state_root=tmp_path)
     assert set(out2.keys()) == {ARTIFACT_ANCHORS, ARTIFACT_CROSS_CREW, ARTIFACT_MISSION_PATTERNS}
+
+
+def test_rag_hits_personalized_on_active_path(tmp_path: Path) -> None:
+    profile = LearnerProfile(
+        learner_id="dk",
+        mastered_concepts=["spring/bean"],
+    )
+    with patch("rag.search.search", return_value=_mock_hits()):
+        out = load(
+            _make_rag_route(),
+            state_root=tmp_path,
+            query="DI",
+            corpus=SimpleNamespace(concepts={}),
+            learner_profile=profile,
+        )
+
+    assert out["rag_hits"][0]["concept_id"] == "spring/component"
+    assert out["rag_hits"][1]["concept_id"] == "spring/bean"
+    assert out["personalization"]["enabled"] is True
+    assert out["personalization"]["mastered_applied"] == ["spring/bean"]
+
+
+def test_personalization_flag_off_keeps_raw_ranking(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WOOWA_PERSONALIZATION_ACTIVE", "off")
+    profile = LearnerProfile(
+        learner_id="dk",
+        mastered_concepts=["spring/bean"],
+    )
+    with patch("rag.search.search", return_value=_mock_hits()):
+        out = load(
+            _make_rag_route(),
+            state_root=tmp_path,
+            query="DI",
+            corpus=SimpleNamespace(concepts={}),
+            learner_profile=profile,
+        )
+
+    assert out["rag_hits"][0]["concept_id"] == "spring/bean"
+    assert out["personalization"]["enabled"] is False
+
+
+def test_proficient_concepts_demote_like_mastered(tmp_path: Path) -> None:
+    profile = LearnerProfile(
+        learner_id="dk",
+        proficient_concepts=["spring/bean"],
+    )
+    with patch("rag.search.search", return_value=_mock_hits()):
+        out = load(
+            _make_rag_route(),
+            state_root=tmp_path,
+            query="DI",
+            corpus=SimpleNamespace(concepts={}),
+            learner_profile=profile,
+        )
+
+    assert out["rag_hits"][0]["concept_id"] == "spring/component"
+    assert out["personalization"]["mastered_applied"] == ["spring/bean"]
