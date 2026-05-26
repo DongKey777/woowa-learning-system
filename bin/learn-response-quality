@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """bin/learn-response-quality — response telemetry recorder (Phase T4).
 
-AI session auto-calls after every coach turn answer:
+AI session auto-calls after every coach turn answer.
+
+Full mode (legacy):
   bin/learn-response-quality --source-event-id <id> --response-summary "..." \\
      --response-file - --expected-citation <c1> --declared-citation <c2> \\
      --quality-flag <flag> --silent
 
-Body via stdin (--response-file -) is preferred. Without body, summary_only
-mode flags `missing_response_body`.
+Minimal mode (Phase Y10 — recommended for low-friction auto-call):
+  bin/learn-response-quality --source-event-id <id> --minimal --silent
+  → response_summary auto-filled, body skipped (missing_response_body flag),
+    expected/declared citations auto-extracted from source rag_ask event's
+    top_concept_ids in history.jsonl. AI only needs the source-event-id.
+
+Body via stdin (--response-file -) is preferred when supplying body.
 """
 from __future__ import annotations
 
@@ -33,10 +40,44 @@ def _read_response(args) -> str | None:
     return None
 
 
+def _lookup_source_event(state_root: Path, learner_id: str,
+                          source_event_id: str) -> dict | None:
+    """Find the rag_ask event with matching event_id in history.jsonl.
+
+    Returns the parsed event dict or None.
+    """
+    history = state_root / "learner" / "history.jsonl"
+    if not history.exists():
+        return None
+    target = source_event_id.strip()
+    for line in history.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or '"' + target + '"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("event_id") == target:
+            return d
+    return None
+
+
+def _extract_citations_from_event(ev: dict) -> tuple[list[str], str | None]:
+    """Pull (top_concept_ids, repo) from a rag_ask event under either the
+    new payload-based schema or the legacy top-level schema.
+    """
+    payload = ev.get("payload") or {}
+    cids = payload.get("top_concept_ids") or ev.get("top_paths") or []
+    repo = payload.get("repo") or ev.get("repo_context")
+    return [c for c in cids if isinstance(c, str)], repo
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-event-id", required=True)
-    parser.add_argument("--response-summary", required=True)
+    parser.add_argument("--response-summary", default=None,
+                        help="required unless --minimal (then auto-filled)")
     parser.add_argument("--response-file", default=None,
                         help="path or '-' for stdin")
     parser.add_argument("--response-text", default=None,
@@ -50,15 +91,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--learner-id", default="default")
     parser.add_argument("--summary-only", action="store_true",
                         help="explicit partial telemetry (no body required)")
+    parser.add_argument("--minimal", action="store_true",
+                        help="auto-fill summary + extract citations from "
+                             "source rag_ask event. Only --source-event-id "
+                             "required from caller.")
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--silent", action="store_true")
     args = parser.parse_args(argv)
 
-    body = _read_response(args)
-    if body is None and not args.summary_only:
-        print("ERROR: --response-file or --response-text required (or --summary-only)",
-              file=sys.stderr)
-        return 2
+    if args.minimal:
+        ev = _lookup_source_event(args.state_root, args.learner_id,
+                                   args.source_event_id)
+        if ev is not None:
+            cids, ev_repo = _extract_citations_from_event(ev)
+            # Use top 3 concept_ids as both expected and declared (AI declared
+            # what the prompt was routed to).
+            top3 = cids[:3]
+            if not args.expected_citation:
+                args.expected_citation = list(top3)
+            if not args.declared_citation:
+                args.declared_citation = list(top3)
+            if args.repo is None:
+                args.repo = ev_repo
+        if args.response_summary is None:
+            args.response_summary = "auto-recorded (minimal mode)"
+        # body intentionally skipped — missing_response_body flag will fire
+        body = None
+    else:
+        if args.response_summary is None:
+            print("ERROR: --response-summary required (or use --minimal)",
+                  file=sys.stderr)
+            return 2
+        body = _read_response(args)
+        if body is None and not args.summary_only:
+            print("ERROR: --response-file or --response-text required "
+                  "(or --summary-only or --minimal)",
+                  file=sys.stderr)
+            return 2
 
     row = record_response_quality(
         source_event_id=args.source_event_id,
