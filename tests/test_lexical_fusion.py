@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from rag.corpus_loader import LoadedCorpus
 from rag.search import SearchHit
-from core.lexical_fusion import _fuse_lexical, _lexical_candidates
+from core.lexical_fusion import (
+    _fuse_lexical,
+    _lexical_candidates,
+)
 
 
 def test_lexical_fusion_adds_exact_corpus_candidate_without_moving_head() -> None:
@@ -22,11 +25,11 @@ def test_lexical_fusion_adds_exact_corpus_candidate_without_moving_head() -> Non
         },
     }
     tiny = LoadedCorpus(concepts=concepts, failures=[])
-    seed = [SearchHit("spring/transaction", 0.9, "spring", "Transaction", "dense")]
+    seed = [SearchHit("software-engineering/di", 0.9, "software-engineering", "DI", "dense")]
 
     lexical = _lexical_candidates("Spring Bean이 뭐야", tiny, limit=3)
     fused = _fuse_lexical(seed, lexical)
 
-    assert fused[0].concept_id == "spring/transaction"
+    assert fused[0].concept_id == "software-engineering/di"
     assert "spring/bean" in [h.concept_id for h in fused]
     assert any(h.source == "lexical" for h in fused)
