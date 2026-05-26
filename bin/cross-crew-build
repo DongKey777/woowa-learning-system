@@ -36,11 +36,34 @@ from anchors.match import (  # noqa: E402
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
 
 
+def _fresh_output(repo: str, state_root: Path) -> tuple[Path, bool]:
+    out_path = state_root / "repos" / repo / "cross_crew_review_graph.parquet"
+    if not out_path.exists():
+        return out_path, False
+    inputs = [
+        state_root / "learner" / "review_anchors.json",
+        state_root / "repos" / repo / "archive" / "prs.sqlite3",
+    ]
+    newest_input = max((p.stat().st_mtime for p in inputs if p.exists()), default=0.0)
+    return out_path, out_path.stat().st_mtime >= newest_input
+
+
 def build(
     repo: str,
     state_root: Path,
     stage3_top_k: int = 10,
+    force: bool = False,
 ) -> dict:
+    out_path, fresh = _fresh_output(repo, state_root)
+    if fresh and not force:
+        return {
+            "repo": repo,
+            "rows": -1,
+            "elapsed_s": 0,
+            "size_bytes": out_path.stat().st_size,
+            "out_path": str(out_path),
+            "skipped": "up-to-date",
+        }
     anchors = [a for a in load_anchors(state_root) if a.repo == repo]
     if not anchors:
         return {"repo": repo, "rows": 0, "elapsed_s": 0,
@@ -76,7 +99,6 @@ def build(
             print(f"  ...processed {i}/{len(anchors)} anchors ({len(rows)} rows so far)", flush=True)
     elapsed = time.perf_counter() - t0
 
-    out_path = state_root / "repos" / repo / "cross_crew_review_graph.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     import pyarrow as pa
@@ -100,9 +122,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--stage3-top-k", type=int, default=10)
+    parser.add_argument("--force", action="store_true",
+                        help="rebuild even when the parquet is newer than inputs")
     args = parser.parse_args(argv)
 
-    report = build(args.repo, args.state_root, args.stage3_top_k)
+    report = build(args.repo, args.state_root, args.stage3_top_k, force=args.force)
     print(f"repo={report['repo']}")
     for k, v in report.items():
         if k == "repo":

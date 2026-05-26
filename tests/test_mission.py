@@ -8,6 +8,7 @@ from core.mastery import record_evidence
 from mission.extract import (
     ANNOTATION_TO_CONCEPT,
     MissionPattern,
+    extract_concepts_from_text,
     extract_from_files,
     extract_from_text,
     save_patterns,
@@ -82,6 +83,14 @@ Stream.of(1, 2, 3).filter(...).collect(Collectors.toList());
     concepts = {p.matched_concept_id for p in tier2}
     assert "database/jdbc-jpa-mybatis-basics" in concepts
     assert "language/stream-filter-vs-map-decision-mini-card" in concepts
+
+
+def test_fast_concept_extraction_matches_pattern_concepts() -> None:
+    pattern_concepts = {
+        p.matched_concept_id
+        for p in extract_from_text("X.java", SAMPLE_CONTROLLER)
+    }
+    assert extract_concepts_from_text(SAMPLE_CONTROLLER) == pattern_concepts
 
 
 def test_extract_exception_patterns() -> None:

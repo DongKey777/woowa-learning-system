@@ -13,6 +13,7 @@ CLI: bin/bootstrap [--skip-pip] [--skip-index] [--skip-daemon]
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -36,6 +37,14 @@ def _run(cmd: list[str], cwd: Path = REPO_ROOT, timeout: float = 600) -> dict:
         return {"cmd": " ".join(cmd), "rc": 124, "ms": -1, "error": "timeout"}
 
 
+def _daemon_alive() -> bool:
+    r = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"), "ping"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=2,
+    )
+    return r.returncode == 0 and "alive" in r.stdout
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-pip", action="store_true")
@@ -47,10 +56,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # 1. pip install (idempotent)
     if not args.skip_pip:
-        try:
-            import sentence_transformers  # noqa: F401
+        if importlib.util.find_spec("sentence_transformers") is not None:
             steps.append({"step": "pip", "rc": 0, "ms": 0, "skipped": "deps present"})
-        except ImportError:
+        else:
             steps.append({"step": "pip"} | _run(
                 [sys.executable, "-m", "pip", "install", "-e", "."], timeout=600
             ))
@@ -67,23 +75,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3. daemon start (background)
     if not args.skip_daemon:
-        sock = REPO_ROOT / "state" / "rag-daemon.sock"
-        if sock.exists():
+        if _daemon_alive():
             steps.append({"step": "rag-daemon", "rc": 0, "ms": 0, "skipped": "alive"})
         else:
-            # Start in background, wait briefly for socket
             log = Path("/tmp/paradigm-v2-daemon-bootstrap.log")
-            with log.open("w") as f:
-                subprocess.Popen([sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"),
-                                   "start"], stdout=f, stderr=subprocess.STDOUT)
-            t0 = time.perf_counter()
-            while time.perf_counter() - t0 < 30:
-                if sock.exists():
-                    break
-                time.sleep(0.5)
-            steps.append({"step": "rag-daemon",
-                           "rc": 0 if sock.exists() else 1,
-                           "ms": round((time.perf_counter() - t0) * 1000, 1)})
+            steps.append({"step": "rag-daemon"} | _run(
+                [sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"),
+                 "start-bg", "--log-path", str(log), "--timeout-s", "90"],
+                timeout=95,
+            ))
 
     success = all(s.get("rc") == 0 for s in steps)
     print(json.dumps({"steps": steps, "healthy": success},

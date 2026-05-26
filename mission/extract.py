@@ -132,6 +132,13 @@ IMPORT_TRIGGERED_METHODS: dict[str, list[tuple[re.Pattern, str]]] = {
          "language/stream-filter-vs-map-decision-mini-card"),
     ],
 }
+FAST_CONCEPT_MARKERS = tuple(ANNOTATION_TO_CONCEPT) + (
+    "JdbcTemplate", "NamedParameterJdbcTemplate", "SimpleJdbcInsert",
+    "ResultSet", "RowMapper", "TransactionTemplate", "Stream", "Collectors",
+    "Optional", "CompletableFuture", "ExecutorService", "synchronized",
+    "volatile", "ConcurrentHashMap", "AtomicInteger", "AtomicLong",
+    "AtomicReference", "Exception", "try (", "try(",
+)
 
 
 def extract_from_text(file_path: str, text: str) -> list[MissionPattern]:
@@ -185,6 +192,50 @@ def extract_from_text(file_path: str, text: str) -> list[MissionPattern]:
                     confidence=0.70, extractor="regex_tier2",
                 ))
     return patterns
+
+
+def extract_concepts_from_text(text: str) -> set[str]:
+    """Fast concept-id extraction when line-level evidence is not needed."""
+    if not any(marker in text for marker in FAST_CONCEPT_MARKERS):
+        return set()
+    concepts: set[str] = set()
+    for ann, concept in ANNOTATION_TO_CONCEPT.items():
+        if ann in text:
+            concepts.add(concept)
+    if any(s in text for s in (
+        "JdbcTemplate", "NamedParameterJdbcTemplate", "SimpleJdbcInsert",
+        "ResultSet", "RowMapper", "EntityManager",
+    )):
+        concepts.add("database/jdbc-jpa-mybatis-basics")
+    if "TransactionTemplate" in text:
+        concepts.add("spring/transactional-self-invocation-call-path-router")
+    if any(s in text for s in (
+        "Stream.", ".stream(", ".parallelStream(", "Collectors.",
+    )):
+        concepts.add("language/stream-filter-vs-map-decision-mini-card")
+    if "Optional." in text:
+        concepts.add("language/java-optional-basics")
+    if "CompletableFuture." in text:
+        concepts.add("language/completablefuture-allof-join-timeout-exception-handling-hazards")
+    if "ExecutorService" in text:
+        concepts.add("language/executor-service-basics")
+    if "synchronized" in text or "volatile" in text:
+        concepts.add("language/synchronization-basics")
+    if "ConcurrentHashMap" in text:
+        concepts.add("language/java-collections-basics")
+    if any(s in text for s in ("AtomicInteger", "AtomicLong", "AtomicReference")):
+        concepts.add("language/atomic-classes")
+    if "DataIntegrityViolationException" in text or "EmptyResultDataAccessException" in text:
+        concepts.add("database/jdbc-jpa-mybatis-basics")
+    if "OptimisticLockingFailureException" in text:
+        concepts.add("database/transaction-isolation-basics")
+    if "NullPointerException" in text:
+        concepts.add("language/optional-collections-domain-null-handling-bridge")
+    if "IllegalStateException" in text or ("throw new" in text and "Exception" in text):
+        concepts.add("language/java-exception-handling-basics")
+    if "try (" in text or "try(" in text:
+        concepts.add("language/try-with-resources-suppressed-exceptions")
+    return concepts
 
 
 def extract_from_files(files: list[tuple[str, str]]) -> list[MissionPattern]:

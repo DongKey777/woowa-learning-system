@@ -88,9 +88,11 @@ def n1_state_persistence() -> ScenarioResult:
 
     subprocess.run(["bin/rag-daemon", "stop"], cwd=REPO_ROOT,
                    capture_output=True, text=True)
-    subprocess.Popen(["bin/rag-daemon", "start"], cwd=REPO_ROOT,
-                     stdout=open("/tmp/daemon_n1.log", "w"),
-                     stderr=subprocess.STDOUT)
+    subprocess.run(
+        ["bin/rag-daemon", "start-bg", "--log-path", "/tmp/daemon_n1.log",
+         "--timeout-s", "90"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=95,
+    )
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < 30:
         try:
@@ -159,9 +161,11 @@ def n3_fallback_no_daemon() -> ScenarioResult:
     )
 
     # Restart daemon for subsequent scenarios
-    subprocess.Popen(["bin/rag-daemon", "start"], cwd=REPO_ROOT,
-                     stdout=open("/tmp/daemon_n3.log", "w"),
-                     stderr=subprocess.STDOUT)
+    subprocess.run(
+        ["bin/rag-daemon", "start-bg", "--log-path", "/tmp/daemon_n3.log",
+         "--timeout-s", "90"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=95,
+    )
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < 30:
         try:

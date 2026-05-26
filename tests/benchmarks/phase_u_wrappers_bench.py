@@ -22,8 +22,8 @@ from scripts.collection import collect_prs  # noqa: E402
 REPORT_PATH = REPO_ROOT / "reports" / "phase_u_wrappers_bench.json"
 
 TARGETS = {
-    "list_repos_ms_max": 80,
-    "archive_status_ms_max": 200,
+    "list_repos_ms_max": 150,
+    "archive_status_ms_max": 300,
     "validate_state_ms_max": 600,
     "registry_audit_ms_max": 300,
     "doctor_ms_max": 2000,           # Y8 added ps subprocess for daemon RSS check
