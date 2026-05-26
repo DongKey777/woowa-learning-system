@@ -110,12 +110,29 @@ def save_repo_state(state: RepoState, state_root: Path = DEFAULT_STATE_ROOT) -> 
 
 
 def append_history_event(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> None:
-    """Append one event line to history.jsonl. Caller supplies event_id + ts."""
+    """Append one event line to history.jsonl. Caller supplies event_id + ts.
+
+    Concurrent-safe via fcntl LOCK_EX on POSIX (Linux/macOS). On Windows the
+    lock falls back to best-effort (single write call is small enough that
+    OS-level atomicity holds in practice).
+    """
     p = _history_path(state_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     event = {**event, "ts": event.get("ts", time.time())}
-    with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    try:
+        import fcntl
+        with p.open("a", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        # Windows or unsupported FS — single write is atomic enough for <4KB lines
+        with p.open("a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def read_history(

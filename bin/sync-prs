@@ -39,7 +39,9 @@ def _last_run_ts(db_path: Path) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--owner", required=True)
+    parser.add_argument("--owner", default=None,
+                        help="upstream owner; default: auto-detect via "
+                             "gh repo view <learner>/<repo> parent, else 'woowacourse'")
     parser.add_argument("--gh-repo", default=None)
     parser.add_argument("--since", default=None,
                         help="ISO timestamp; defaults to last successful run")
@@ -57,9 +59,32 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     gh_repo = args.gh_repo or args.repo
+    # Auto-resolve owner via learner identity + gh repo view parent
+    if args.owner:
+        owner = args.owner
+    else:
+        from core.identity import resolve_learner_login
+        learner = resolve_learner_login(args.state_root)
+        # Inline _detect_upstream_owner (same as bin/onboard-repo)
+        owner = None
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["gh", "repo", "view", f"{learner}/{args.repo}", "--json", "parent"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                parent = json.loads(r.stdout).get("parent")
+                if isinstance(parent, dict):
+                    owner = (parent.get("owner") or {}).get("login")
+        except Exception:
+            pass
+        if not owner:
+            owner = "woowacourse"
+
     try:
         report = collect(
-            owner=args.owner, repo=gh_repo, db_path=db_path,
+            owner=owner, repo=gh_repo, db_path=db_path,
             mode="incremental", since=since, limit=args.limit,
             max_calls=args.max_gh_calls,
         )

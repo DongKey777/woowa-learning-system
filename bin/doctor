@@ -64,6 +64,7 @@ def _check_bge_m3() -> dict:
 
 def _check_daemon(state_root: Path) -> dict:
     sock_path = state_root / "rag-daemon.sock"
+    pid_path = state_root / "rag-daemon.pid"
     if not sock_path.exists():
         return {"check": "daemon_alive", "ok": False,
                 "fix": "nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &"}
@@ -81,7 +82,27 @@ def _check_daemon(state_root: Path) -> dict:
             data += c
         s.close()
         resp = json.loads(data.decode().strip())
-        return {"check": "daemon_alive", "ok": resp.get("alive") is True}
+        out = {"check": "daemon_alive", "ok": resp.get("alive") is True}
+        # Memory + uptime telemetry (best effort)
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text().strip())
+                ps = subprocess.run(
+                    ["ps", "-o", "rss=,etimes=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=3,
+                )
+                parts = ps.stdout.strip().split()
+                if len(parts) == 2:
+                    rss_kb, uptime_s = int(parts[0]), int(parts[1])
+                    out["pid"] = pid
+                    out["rss_mb"] = round(rss_kb / 1024, 1)
+                    out["uptime_s"] = uptime_s
+                    # Warn if RSS > 10GB (likely model leak)
+                    if rss_kb > 10 * 1024 * 1024:
+                        out["warning"] = f"high RSS {out['rss_mb']}MB — consider restart"
+            except (ValueError, subprocess.TimeoutExpired):
+                pass
+        return out
     except Exception as e:
         return {"check": "daemon_alive", "ok": False, "error": str(e)[:80]}
 

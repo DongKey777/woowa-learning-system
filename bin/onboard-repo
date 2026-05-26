@@ -38,10 +38,38 @@ def _run(cmd: list[str], cwd: Path = REPO_ROOT, timeout: float = 600) -> dict:
         return {"cmd": cmd, "rc": 124, "ms": -1, "error": "timeout"}
 
 
+def _detect_upstream_owner(learner_login: str, repo: str) -> str | None:
+    """gh repo view DongKey777/<repo> --json parent → upstream owner.
+
+    Returns None if not a fork or gh unavailable. Caller defaults to
+    --owner explicit or 'woowacourse' fallback.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["gh", "repo", "view", f"{learner_login}/{repo}",
+             "--json", "parent"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        parent = data.get("parent")
+        if isinstance(parent, dict):
+            owner_obj = parent.get("owner") or {}
+            return owner_obj.get("login")
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--owner", required=True)
+    parser.add_argument("--owner", default=None,
+                        help="upstream owner; default: auto-detect from "
+                             "<learner>/<repo>'s parent (gh repo view), "
+                             "else 'woowacourse'")
     parser.add_argument("--gh-repo", default=None)
     parser.add_argument("--path", type=Path, default=None,
                         help="missions/<r>/ — if missing, gh repo clone")
@@ -53,15 +81,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--silent", action="store_true")
     args = parser.parse_args(argv)
 
-    learner_login = resolve_learner_login(args.state_root, explicit=learner_login)
+    learner_login = resolve_learner_login(args.state_root, explicit=args.learner_login)
     mission_path = args.path or (REPO_ROOT / "missions" / args.repo)
     gh_repo = args.gh_repo or args.repo
-    steps = []
+
+    # Auto-resolve upstream owner: --owner > gh repo view parent > 'woowacourse'
+    owner = owner or _detect_upstream_owner(learner_login, args.repo) \
+            or "woowacourse"
+    steps = [{"step": "resolve_owner", "rc": 0, "ms": 0,
+              "resolved_owner": owner,
+              "source": ("explicit" if owner else
+                         ("auto_parent" if owner != "woowacourse" else "fallback"))}]
 
     # 1. clone if needed
     if not mission_path.exists():
         steps.append({"step": "clone"} | _run(
-            ["gh", "repo", "clone", f"{args.owner}/{gh_repo}", str(mission_path)],
+            ["gh", "repo", "clone", f"{learner_login}/{gh_repo}", str(mission_path)],
             timeout=120,
         ))
         if steps[-1]["rc"] != 0:
@@ -73,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 2. bootstrap-repo
     cmd = [sys.executable, str(REPO_ROOT / "bin" / "bootstrap-repo"),
-            "--repo", args.repo, "--owner", args.owner,
+            "--repo", args.repo, "--owner", owner,
             "--gh-repo", gh_repo, "--silent"]
     if args.limit:
         cmd.extend(["--limit", str(args.limit)])
@@ -100,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
 
     success_n = sum(1 for s in steps if s.get("rc") == 0)
     payload = {
-        "repo": args.repo, "owner": args.owner,
+        "repo": args.repo, "owner": owner,
         "mission_path": str(mission_path),
         "steps_n": len(steps), "steps_success": success_n,
         "steps": steps if not args.silent else
