@@ -19,7 +19,8 @@ def parse_argv(argv):
               file=sys.stderr)
         return None
     out = {"prompt": argv[0], "repo": None, "learner_id": "default",
-           "json_route": False, "no_daemon": False, "state_root": None}
+           "json_route": False, "no_daemon": False, "state_root": None,
+           "json_mode": False, "reformulated_query": None}
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -29,6 +30,10 @@ def parse_argv(argv):
             out["learner_id"] = argv[i + 1]; i += 2
         elif a == "--state-root" and i + 1 < len(argv):
             out["state_root"] = argv[i + 1]; i += 2
+        elif a == "--reformulated-query" and i + 1 < len(argv):
+            out["reformulated_query"] = argv[i + 1]; i += 2
+        elif a == "--json":
+            out["json_mode"] = True; i += 1
         elif a == "--json-route":
             out["json_route"] = True; i += 1
         elif a == "--no-daemon":
@@ -47,8 +52,11 @@ def daemon_ask(args):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(TIMEOUT_S)
         sock.connect(sock_path)
-        req = json.dumps({"action": "ask", "query": args["prompt"],
-                          "repo": args["repo"], "learner_id": args["learner_id"]}) + "\n"
+        req_payload = {"action": "ask", "query": args["prompt"],
+                       "repo": args["repo"], "learner_id": args["learner_id"]}
+        if args.get("reformulated_query"):
+            req_payload["reformulated_query"] = args["reformulated_query"]
+        req = json.dumps(req_payload) + "\n"
         sock.sendall(req.encode("utf-8"))
         sock.shutdown(socket.SHUT_WR)
         data = b""
@@ -63,7 +71,12 @@ def daemon_ask(args):
         return None
 
 
-def render(resp, json_route):
+def render(resp, json_route, json_mode=False):
+    if json_mode:
+        # v2-native machine-readable mode — single JSON object on stdout,
+        # no markdown/hint comment lines mixed in.
+        print(json.dumps(resp, ensure_ascii=False))
+        return
     if json_route:
         print("# RouteDecision: " + json.dumps({
             "mode": resp.get("mode"),
@@ -71,6 +84,12 @@ def render(resp, json_route):
             "budget_tokens": resp.get("budget"),
             "reason": resp.get("reason"),
         }, ensure_ascii=False))
+    hints = resp.get("response_hints")
+    if hints:
+        print("# response_hints: " + json.dumps(hints, ensure_ascii=False))
+    rq_hint = resp.get("response_quality_hint")
+    if rq_hint:
+        print("# response_quality_hint: " + json.dumps(rq_hint, ensure_ascii=False))
     print(resp["markdown"])
 
 
@@ -83,7 +102,7 @@ def main(argv=None):
     if not args["no_daemon"]:
         resp = daemon_ask(args)
         if resp is not None and "markdown" in resp:
-            render(resp, args["json_route"])
+            render(resp, args["json_route"], args["json_mode"])
             return 0
 
     # Fallback: in-process (cold path, heavy imports)
@@ -107,15 +126,37 @@ def main(argv=None):
         return 2
 
     artifacts = load(decision, repo=args["repo"], state_root=sr, query=args["prompt"])
+    if args.get("reformulated_query"):
+        artifacts["reformulated_query"] = args["reformulated_query"]
     recent = read_history(sr, tail=20)
 
+    # Phase Y11 cold path: no event_id / no history append, so
+    # response_quality_hint is None. The AI session can still read
+    # response_hints.citation_markdown for paste-ready citations.
+    markdown, response_hints, _rq_hint, effective_route = compose(
+        decision, artifacts, args["prompt"],
+        repo=args["repo"], learner_id=args["learner_id"], recent_history=recent,
+        source_event_id=None, state_root=sr,
+    )
+    if args["json_mode"]:
+        print(json.dumps({
+            "markdown": markdown,
+            "mode": effective_route.mode,
+            "personas": effective_route.personas,
+            "budget": effective_route.budget_tokens,
+            "reason": effective_route.reason,
+            "response_hints": response_hints,
+            "response_quality_hint": None,
+        }, ensure_ascii=False))
+        return 0
     if args["json_route"]:
         print("# RouteDecision: " + json.dumps({
-            "mode": decision.mode, "personas": decision.personas,
-            "budget_tokens": decision.budget_tokens, "reason": decision.reason,
+            "mode": effective_route.mode, "personas": effective_route.personas,
+            "budget_tokens": effective_route.budget_tokens, "reason": effective_route.reason,
         }, ensure_ascii=False))
-    print(compose(decision, artifacts, args["prompt"], repo=args["repo"],
-                  learner_id=args["learner_id"], recent_history=recent))
+    if response_hints:
+        print("# response_hints: " + json.dumps(response_hints, ensure_ascii=False))
+    print(markdown)
     return 0
 
 

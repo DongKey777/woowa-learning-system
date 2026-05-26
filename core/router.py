@@ -16,10 +16,29 @@ Output `RouteDecision` tells the rest of the system:
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
 from core.intent import IntentDecision, detect_mode, should_use_rag
+
+
+def get_refusal_threshold() -> float | None:
+    """Phase Y11 P0.3 — opt-in cosine threshold for tier_0 downgrade.
+
+    Default `off` (None) because v2 uses cosine similarity (rag/search.py
+    returns 1 - distance) whereas the legacy cross-encoder threshold was in
+    a different score space. non-CS guard handles most cases; this threshold
+    is for eval/diagnostic. Set WOOWA_RAG_REFUSAL_THRESHOLD=0.35 (e.g.) to
+    enable per-session.
+    """
+    raw = os.environ.get("WOOWA_RAG_REFUSAL_THRESHOLD", "off").strip().lower()
+    if raw in ("off", "", "none"):
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 # F11 explicit triggers — line-level cross-crew/reviewer analysis intent
 F11_KEYWORDS = (

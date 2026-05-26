@@ -5,19 +5,31 @@ returns an integrated answer that weaves personas based on the route's
 persona list. Saves ×3 token cost vs separate calls while preserving the
 2024-25 multi-agent tutoring perspective benefit.
 
-Public API:
-  compose(route, artifacts, prompt, repo, learner_id) → markdown_prompt
+Public API (Phase Y11):
+  compose(route, artifacts, prompt, repo, learner_id, ...)
+    → (markdown_prompt, response_hints, response_quality_hint, effective_route)
+
+`effective_route` is the post-downgrade route (so daemon/payload/markdown
+header stay consistent when a non-CS prompt or low-score RAG hit triggers
+tier_0_fallback). `response_quality_hint` is None on cold paths where no
+history append happens (bin/ask --no-daemon).
 """
 from __future__ import annotations
 
+import dataclasses
+import shlex
+from pathlib import Path
 from typing import Any
 
+from core.response import render_citation_block
 from core.router import (
     PERSONA_MENTOR,
     PERSONA_REVIEWER,
     PERSONA_SOCRATIC,
     RouteDecision,
+    get_refusal_threshold,
 )
+from core.state import DEFAULT_STATE_ROOT
 
 
 MENTOR_INSTRUCTIONS = (
@@ -41,6 +53,98 @@ PERSONA_INSTRUCTIONS = {
 }
 
 
+FALLBACK_DISCLAIMER = (
+    "코퍼스에 이 주제의 신뢰할 만한 자료가 없어 일반 지식 기반으로 답한다. "
+    "정확성 검증이 필요하면 알려줘."
+)
+
+
+def _pick_top3(rag_hits: list[dict]) -> list[dict]:
+    """Return up to 3 hits with concept_id + no error, deduped + ordered."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for h in rag_hits or []:
+        if not isinstance(h, dict):
+            continue
+        if "error" in h:
+            continue
+        cid = h.get("concept_id")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(h)
+        if len(out) == 3:
+            break
+    return out
+
+
+def _build_response_hints(
+    route: RouteDecision,
+    valid_hits: list[dict],
+    downgrade_reason: str | None,
+    reformulated_query: str | None,
+) -> dict:
+    """Build the response_hints dict that the AI session pastes verbatim.
+
+    On downgrade we surface fallback_disclaimer + empty citation; otherwise
+    we emit paste-ready `참고:` markdown so the AI doesn't hand-write
+    concept_id paths (a known hallucination vector).
+    """
+    if downgrade_reason or route.mode == "tier_0_fallback":
+        return {
+            "citation_markdown": None,
+            "citation_paths": [],
+            "citation_concept_ids": [],
+            "citation_trace": [],
+            "tier_downgrade": downgrade_reason or "tier_0_fallback",
+            "fallback_disclaimer": FALLBACK_DISCLAIMER,
+            "reformulated_query": reformulated_query,
+        }
+    cids = [h["concept_id"] for h in valid_hits]
+    trace = [
+        {
+            "concept_id": h["concept_id"],
+            "score": h.get("score"),
+            "source": h.get("source"),
+            "category": h.get("category"),
+        }
+        for h in valid_hits
+    ]
+    return {
+        "citation_markdown": render_citation_block(cids) or None,
+        "citation_paths": list(cids),
+        "citation_concept_ids": list(cids),
+        "citation_trace": trace,
+        "tier_downgrade": None,
+        "fallback_disclaimer": None,
+        "reformulated_query": reformulated_query,
+    }
+
+
+def _build_response_quality_hint(
+    source_event_id: str | None,
+    expected_citation_paths: list[str],
+    state_root: Path | None,
+) -> dict | None:
+    """Build the response_quality_hint sibling. Returns None for cold paths
+    (no source_event_id available — bin/ask --no-daemon)."""
+    if source_event_id is None:
+        return None
+    cmd = (
+        f"bin/learn-response-quality --source-event-id {source_event_id} "
+        f"--minimal --silent"
+    )
+    if state_root is not None and Path(state_root) != Path(DEFAULT_STATE_ROOT):
+        cmd += f" --state-root {shlex.quote(str(state_root))}"
+    return {
+        "command_template": cmd,
+        "wrapper_cmd": cmd,
+        "source_event_id": source_event_id,
+        "expected_citation_paths": list(expected_citation_paths),
+        "obligation": "AI MUST invoke after answer",
+    }
+
+
 def compose(
     route: RouteDecision,
     artifacts: dict[str, Any],
@@ -48,17 +152,69 @@ def compose(
     repo: str | None = None,
     learner_id: str = "default",
     recent_history: list[dict] | None = None,
-) -> str:
-    """Build the full multi-agent prompt for the AI session."""
+    *,
+    source_event_id: str | None = None,
+    state_root: Path | None = None,
+    learner_context: dict | None = None,
+) -> tuple[str, dict, dict | None, RouteDecision]:
+    """Build the full multi-agent prompt + side-band hints.
+
+    Returns ``(markdown, response_hints, response_quality_hint, effective_route)``.
+
+    ``effective_route`` is the post-downgrade route — daemon should use it
+    when assembling the response payload so markdown's ``[Mode: …]`` header
+    matches ``payload.mode`` and ``history.payload.router_mode``.
+    """
+    # 1. valid-hit + downgrade selection BEFORE we render any prompt section
+    #    so _answer_format sees the effective tier_0_fallback mode.
+    rag_attempted = bool(artifacts) and "rag_hits" in artifacts
+    rag_hits = artifacts.get("rag_hits") if rag_attempted else None
+    valid_hits = _pick_top3(rag_hits or [])
+    threshold = get_refusal_threshold()
+    downgrade_reason: str | None = None
+    # Only downgrade when RAG was actually attempted (artifacts carries
+    # `rag_hits`) but returned nothing usable. Bare unit-test scaffolding
+    # without `rag_hits` keeps the original cs_qa rendering.
+    if route.need_rag and rag_attempted and not valid_hits:
+        downgrade_reason = "no_valid_citation"
+    elif threshold is not None and route.need_rag and valid_hits:
+        if (valid_hits[0].get("score") or 0.0) < threshold:
+            downgrade_reason = "corpus_gap_no_confident_match"
+    if route.mode == "tier_0_fallback" and downgrade_reason is None:
+        downgrade_reason = "non_cs_prompt"
+
+    if downgrade_reason and route.mode != "tier_0_fallback":
+        route = dataclasses.replace(
+            route,
+            mode="tier_0_fallback",
+            need_rag=False,
+            need_mission_ctx=False,
+            need_anchors=False,
+            personas=[],
+            lazy_artifacts=[],
+            reason=f"tier downgrade: {downgrade_reason}",
+        )
+
     parts: list[str] = []
     parts.append(_system_header(route))
     parts.append(_persona_section(route))
     parts.append(_artifact_section(route, artifacts, repo))
     if recent_history:
         parts.append(_recent_history(recent_history))
-    parts.append(_user_section(prompt, repo, learner_id))
-    parts.append(_answer_format(route))
-    return "\n\n".join(p for p in parts if p)
+    parts.append(_user_section(prompt, repo, learner_id, learner_context))
+    parts.append(_answer_format(route, downgrade_reason))
+    markdown = "\n\n".join(p for p in parts if p)
+
+    reformulated_query = (artifacts or {}).get("reformulated_query")
+    response_hints = _build_response_hints(
+        route, valid_hits, downgrade_reason, reformulated_query
+    )
+    response_quality_hint = _build_response_quality_hint(
+        source_event_id,
+        response_hints["citation_paths"],
+        state_root,
+    )
+    return markdown, response_hints, response_quality_hint, route
 
 
 def _system_header(route: RouteDecision) -> str:
@@ -154,22 +310,52 @@ def _recent_history(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _user_section(prompt: str, repo: str | None, learner_id: str) -> str:
+def _user_section(prompt: str, repo: str | None, learner_id: str,
+                    learner_context: dict | None = None) -> str:
     parts = [f"## Learner turn", f"**learner_id**: {learner_id}"]
     if repo:
         parts.append(f"**repo**: {repo}")
     parts.append(f"**prompt**: {prompt}")
+    if learner_context:
+        # P1.2 — personalization override surface. Mastered + proficient
+        # concepts go into must_skip_explanations_of so the AI doesn't
+        # rehash definitions the learner already owns.
+        must_skip = learner_context.get("must_skip_explanations_of") or []
+        must_include = learner_context.get("must_include_phrases") or []
+        must_offer = learner_context.get("must_offer_next_action") or None
+        if must_skip or must_include or must_offer:
+            parts.append("**learner_context**:")
+            if must_skip:
+                parts.append(f"- must_skip_explanations_of: {list(must_skip)[:10]}")
+            if must_include:
+                parts.append(f"- must_include_phrases: {list(must_include)[:5]}")
+            if must_offer:
+                parts.append(f"- must_offer_next_action: {must_offer}")
     return "\n".join(parts)
 
 
-def _answer_format(route: RouteDecision) -> str:
+def _answer_format(route: RouteDecision,
+                    downgrade_reason: str | None = None) -> str:
     rules = [
         "## 답변 지침",
         "- 한국어 자연스럽게, 학습자 수준에 맞춰",
         f"- 첫 줄 header: `[Mode: {route.mode}]`",
     ]
+    if route.mode == "tier_0_fallback":
+        # tier_0_fallback overrides citation guidance entirely.
+        rules.append(
+            f"- 둘째 줄에 fallback_disclaimer 그대로: "
+            f"`{FALLBACK_DISCLAIMER}`"
+        )
+        rules.append("- `참고:` 블록 출력 금지 (인용할 corpus 없음)")
+        rules.append("- 본문은 일반 지식 기반 답변 + 마지막에 출처 검증 안내")
+        return "\n".join(rules)
     if route.need_rag:
         rules.append("- 답변 마지막에 `참고:\\n- <concept_id>` 형식 인용 (최대 3개)")
+        rules.append(
+            "- response_hints.citation_markdown이 stdout에 있으면 "
+            "그 문자열을 verbatim 복사 (직접 path 작성 금지)"
+        )
     if route.need_mission_ctx:
         rules.append("- 학습자가 자기 코드 직접 쓰도록 (자동 코드 수정 ❌)")
         rules.append("- mission_patterns에 추출된 학습자 코드 위치 인용")

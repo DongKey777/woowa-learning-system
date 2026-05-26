@@ -221,37 +221,54 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                                 "expected_terms": offer.expected_terms,
                                 "source": offer.source,
                             }
+                    if req.get("reformulated_query"):
+                        artifacts["reformulated_query"] = req["reformulated_query"]
                     recent = read_history(state_root=state_root, tail=20)
-                    markdown = compose(decision, artifacts, prompt, repo=repo,
-                                       learner_id=learner_id, recent_history=recent)
-                    # Append turn event to history.jsonl so personalization /
-                    # recent_history / retro flows see live learner activity.
-                    # Session mode defaults to 'learning' unless caller overrides
-                    # (e.g. WOOWA_SESSION_MODE=development for benchmarks).
-                    rag_hits = artifacts.get("rag_hits") or []
+                    # Phase Y11 F8: event_id is generated BEFORE compose so the
+                    # response_quality_hint.command_template can embed it and
+                    # the AI session's follow-up wrapper call joins on the
+                    # same id as the history event.
+                    event_id = f"ask-{int(time.time() * 1000)}-{os.getpid()}"
+                    markdown, response_hints, response_quality_hint, effective_route = compose(
+                        decision, artifacts, prompt,
+                        repo=repo, learner_id=learner_id, recent_history=recent,
+                        source_event_id=event_id,
+                        state_root=state_root,
+                        learner_context=req.get("learner_context"),
+                    )
+                    # Append turn event with effective_route (post-downgrade) so
+                    # downstream telemetry (response-quality-mine, routing-analyze)
+                    # sees the same mode the AI session was instructed to answer in.
                     event_mode = req.get("mode") or os.environ.get(
                         "WOOWA_SESSION_MODE", "learning")
                     event = {
-                        "event_id": f"ask-{int(time.time() * 1000)}-{os.getpid()}",
+                        "event_id": event_id,
                         "ts": time.time(),
                         "event_type": "rag_ask",
                         "mode": event_mode,
                         "payload": {
                             "prompt": prompt,
                             "repo": repo,
-                            "router_mode": decision.mode,
-                            "router_reason": decision.reason,
-                            "top_concept_ids": [h.get("concept_id") for h in rag_hits[:5]
-                                                 if h.get("concept_id")],
+                            "router_mode": effective_route.mode,
+                            "router_reason": effective_route.reason,
+                            # I2: history aligns with hints (downgrade → []).
+                            "top_concept_ids": list(response_hints["citation_paths"]),
                         },
                     }
                     try:
                         append_history_event(event, state_root=state_root)
                     except Exception:  # noqa: BLE001
                         pass  # history append must not break the response
-                    payload = {"markdown": markdown, "mode": decision.mode,
-                               "budget": decision.budget_tokens, "personas": decision.personas,
-                               "reason": decision.reason, "event_id": event["event_id"]}
+                    payload = {
+                        "markdown": markdown,
+                        "mode": effective_route.mode,
+                        "budget": effective_route.budget_tokens,
+                        "personas": effective_route.personas,
+                        "reason": effective_route.reason,
+                        "event_id": event_id,
+                        "response_hints": response_hints,
+                        "response_quality_hint": response_quality_hint,
+                    }
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 else:
                     conn.sendall(json.dumps({"error": f"unknown action {action}"}).encode() + b"\n")
