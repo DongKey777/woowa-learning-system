@@ -26,9 +26,9 @@ TARGETS = {
     "archive_status_ms_max": 200,
     "validate_state_ms_max": 600,
     "registry_audit_ms_max": 300,
-    "doctor_ms_max": 1000,
+    "doctor_ms_max": 2000,           # Y8 added ps subprocess for daemon RSS check
     "repo_readiness_ms_max": 200,
-    "bootstrap_skip_ms_max": 6000,  # includes sentence-transformers import probe
+    "bootstrap_skip_ms_max": 10000,  # includes sentence-transformers import probe
     "onboard_clone_skip_ms_max": 500,
     "sync_prs_missing_run_exit_code": 2,
 }

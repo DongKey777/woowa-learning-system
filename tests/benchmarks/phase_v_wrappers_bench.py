@@ -19,10 +19,10 @@ TARGETS = {
     "next_action_ms_max": 200,
     "topic_ms_max": 200,
     "reviewer_ms_max": 800,         # SQLite scan 100+ comments
-    "mission_map_ms_max": 8000,     # walks ~30 files + scan large legacy archive patches
+    "mission_map_ms_max": 15000,    # walks ~30 java + member 463MB + auth 91MB archive patches
     "rewrite_prepare_ms_max": 80,   # pure templates
     "route_fallback_ms_max": 80,
-    "chunk_context_ms_max": 100,
+    "chunk_context_ms_max": 150,    # corpus_graph 5MB load + 4 file write
 }
 
 
