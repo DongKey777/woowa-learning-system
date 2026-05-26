@@ -25,6 +25,7 @@ DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 DAEMON_TIMEOUT = 30  # seconds per request
 PID_FILE = "rag-daemon.pid"
 SOCKET_FILE = "rag-daemon.sock"
+LISTEN_BACKLOG = 32
 
 
 # ── client API ────────────────────────────────────────────────────────────
@@ -160,7 +161,10 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(sp))
-    srv.listen(1)
+    # bin/ask clients may arrive in small bursts from AI sessions or tests.
+    # A larger backlog keeps those clients queued instead of forcing a cold
+    # in-process fallback that lacks daemon-only telemetry hints.
+    srv.listen(LISTEN_BACKLOG)
     try:
         while True:
             conn, _ = srv.accept()

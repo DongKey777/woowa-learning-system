@@ -38,8 +38,12 @@ def test_ask_returns_none_when_socket_missing(tmp_path: Path) -> None:
 def test_module_exports() -> None:
     # Public API contract
     for name in ("search", "ask", "DEFAULT_STATE_ROOT", "SOCKET_FILE",
-                 "PID_FILE", "DAEMON_TIMEOUT"):
+                 "PID_FILE", "DAEMON_TIMEOUT", "LISTEN_BACKLOG"):
         assert hasattr(daemon, name), f"missing public symbol: {name}"
+
+
+def test_listen_backlog_allows_small_bursts() -> None:
+    assert daemon.LISTEN_BACKLOG >= 16
 
 
 def test_default_state_root_under_repo(tmp_path: Path) -> None:
