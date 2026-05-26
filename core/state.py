@@ -35,6 +35,10 @@ class LearnerProfile:
     pending_triggers: dict = field(default_factory=dict)
     total_events: int = 0
     last_updated: float = 0.0
+    # Phase Y11 P1.2 — v3 profile carries `concepts.proficient` separately
+    # from mastered. Personalization treats both as "AI should skip
+    # re-explanations of these" (must_skip_explanations_of).
+    proficient_concepts: list[str] = field(default_factory=list)
 
     @classmethod
     def empty(cls, learner_id: str) -> "LearnerProfile":
@@ -113,6 +117,7 @@ def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> Lear
             learner_id=data.get("learner_id", learner_id),
             mastered_concepts=list(concepts.get("mastered", [])),
             uncertain_concepts=list(concepts.get("uncertain", [])),
+            proficient_concepts=list(concepts.get("proficient", [])),
             drill_due=list(data.get("drill_due", [])),
             pending_triggers=merged_pending,
             total_events=int(activity.get("events_total", 0) or 0),
@@ -162,6 +167,7 @@ def save_profile(profile: LearnerProfile, state_root: Path = DEFAULT_STATE_ROOT)
         existing.setdefault("concepts", {})
         existing["concepts"]["mastered"] = list(profile.mastered_concepts)
         existing["concepts"]["uncertain"] = list(profile.uncertain_concepts)
+        existing["concepts"]["proficient"] = list(profile.proficient_concepts)
         existing["learner_id"] = profile.learner_id
         existing["last_updated"] = profile.last_updated
         existing["drill_due"] = list(profile.drill_due)

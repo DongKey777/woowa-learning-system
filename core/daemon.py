@@ -229,12 +229,25 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     # the AI session's follow-up wrapper call joins on the
                     # same id as the history event.
                     event_id = f"ask-{int(time.time() * 1000)}-{os.getpid()}"
+                    # Phase Y11 P1.2 — derive learner_context from v3 profile
+                    # (mastered + proficient → must_skip_explanations_of).
+                    # Caller-provided learner_context wins if given.
+                    derived_context = req.get("learner_context")
+                    if derived_context is None:
+                        skip_targets = sorted(
+                            set(profile.mastered_concepts)
+                            | set(getattr(profile, "proficient_concepts", []))
+                        )
+                        if skip_targets:
+                            derived_context = {
+                                "must_skip_explanations_of": skip_targets,
+                            }
                     markdown, response_hints, response_quality_hint, effective_route = compose(
                         decision, artifacts, prompt,
                         repo=repo, learner_id=learner_id, recent_history=recent,
                         source_event_id=event_id,
                         state_root=state_root,
-                        learner_context=req.get("learner_context"),
+                        learner_context=derived_context,
                     )
                     # Append turn event with effective_route (post-downgrade) so
                     # downstream telemetry (response-quality-mine, routing-analyze)
