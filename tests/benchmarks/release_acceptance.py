@@ -363,6 +363,41 @@ def _y13_gate_checks() -> list[dict]:
             "pass": reform_checks.get("reformulated_latency_p95_budget") is True,
         },
     ])
+
+    phase_w_report = _read_json(REPO_ROOT / "reports" / "phase_w_wrappers_bench.json")
+    phase_w_results = (phase_w_report or {}).get("results", {})
+    mining_gates = [
+        (
+            "feedback_mine_since_p95_ms",
+            ("feedback_mine", "p95_ms"),
+            200.0,
+        ),
+        (
+            "feedback_mine_since_max_ms",
+            ("feedback_mine", "max_ms"),
+            400.0,
+        ),
+        (
+            "response_quality_mine_since_p95_ms",
+            ("response_quality_mine", "p95_ms"),
+            200.0,
+        ),
+        (
+            "response_quality_mine_since_max_ms",
+            ("response_quality_mine", "max_ms"),
+            400.0,
+        ),
+    ]
+    for name, (result_name, key), threshold in mining_gates:
+        observed = (phase_w_results.get(result_name) or {}).get(key)
+        out.append({
+            "category": "K_Y13_gates",
+            "name": name,
+            "observed": observed,
+            "threshold": threshold,
+            "op": "<=",
+            "pass": observed is not None and observed <= threshold,
+        })
     return out
 
 

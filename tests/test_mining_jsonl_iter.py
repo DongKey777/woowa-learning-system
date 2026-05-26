@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.mining.jsonl_iter import iter_jsonl, sample_jsonl  # noqa: E402
+from scripts.mining.jsonl_iter import iter_jsonl, parse_since_ts, sample_jsonl  # noqa: E402
 
 
 def _seed(tmp_path: Path) -> Path:
@@ -74,3 +77,30 @@ def test_iter_jsonl_combined_filters(tmp_path: Path) -> None:
     out = list(iter_jsonl(p, event_type="rag_ask", mode="learning", since_ts=300))
     assert len(out) == 1
     assert out[0]["ts"] == 500
+
+
+def test_iter_jsonl_since_ts_accepts_iso_logged_at(tmp_path: Path) -> None:
+    p = tmp_path / "events.jsonl"
+    p.write_text("\n".join([
+        json.dumps({"event_type": "old", "logged_at": "2026-05-20T00:00:00Z"}),
+        json.dumps({"event_type": "new", "logged_at": "2026-05-27T00:00:00Z"}),
+    ]) + "\n", encoding="utf-8")
+
+    since = parse_since_ts("2026-05-26T00:00:00Z")
+    out = list(iter_jsonl(p, since_ts=since))
+    assert [e["event_type"] for e in out] == ["new"]
+
+
+def test_parse_since_ts_relative_epoch_and_iso() -> None:
+    assert parse_since_ts("7d", now=1_000_000) == 395_200
+    assert parse_since_ts("24h", now=1_000_000) == 913_600
+    assert parse_since_ts("1779762582.7") == 1779762582.7
+
+    expected = datetime(2026, 5, 27, tzinfo=timezone.utc).timestamp()
+    assert parse_since_ts("2026-05-27T00:00:00Z") == expected
+    assert parse_since_ts("2026-05-27T00:00:00") == expected
+
+
+def test_parse_since_ts_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError):
+        parse_since_ts("last week")

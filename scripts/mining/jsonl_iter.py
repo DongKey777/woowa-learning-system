@@ -3,8 +3,71 @@ from __future__ import annotations
 
 import json
 import random
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+_RELATIVE_SINCE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)([smhdw])\s*$", re.IGNORECASE)
+_SECONDS_BY_UNIT = {
+    "s": 1,
+    "m": 60,
+    "h": 60 * 60,
+    "d": 24 * 60 * 60,
+    "w": 7 * 24 * 60 * 60,
+}
+
+
+def parse_since_ts(value: str | None, *, now: float | None = None) -> float | None:
+    """Parse --since values into epoch seconds.
+
+    Supported values:
+    - relative durations: 30m, 24h, 7d, 2w
+    - epoch seconds: 1779762582.7
+    - ISO-8601 timestamps: 2026-05-27T00:00:00Z
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    ref = time.time() if now is None else now
+    relative = _RELATIVE_SINCE_RE.match(text)
+    if relative:
+        amount = float(relative.group(1))
+        unit = relative.group(2).lower()
+        return ref - amount * _SECONDS_BY_UNIT[unit]
+
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(iso_text)
+    except ValueError as exc:
+        raise ValueError(
+            "--since must be a duration like 7d, epoch seconds, or ISO-8601 timestamp"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _row_timestamp(row: dict) -> float | None:
+    raw = row.get("ts") or row.get("logged_at")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        try:
+            return parse_since_ts(str(raw))
+        except ValueError:
+            return None
 
 
 def iter_jsonl(path: Path, since_ts: float | None = None,
@@ -29,10 +92,8 @@ def iter_jsonl(path: Path, since_ts: float | None = None,
             if mode is not None and ev.get("mode") != mode:
                 continue
             if since_ts is not None:
-                try:
-                    if float(ev.get("ts") or ev.get("logged_at") or 0) < since_ts:
-                        continue
-                except (TypeError, ValueError):
+                row_ts = _row_timestamp(ev)
+                if row_ts is None or row_ts < since_ts:
                     continue
             yield ev
             yielded += 1

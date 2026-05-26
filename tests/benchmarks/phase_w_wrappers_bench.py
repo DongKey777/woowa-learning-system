@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -16,8 +17,10 @@ sys.path.insert(0, str(REPO_ROOT))
 REPORT_PATH = REPO_ROOT / "reports" / "phase_w_wrappers_bench.json"
 
 TARGETS = {
-    "feedback_mine_ms_max": 200,
-    "rq_mine_ms_max": 200,
+    "feedback_mine_p95_ms_max": 200,
+    "feedback_mine_max_ms_max": 400,
+    "rq_mine_p95_ms_max": 200,
+    "rq_mine_max_ms_max": 400,
     "routing_analyze_ms_max": 1000,
     "turn_audit_ms_max": 800,
     "path_audit_ms_max": 1500,
@@ -37,19 +40,107 @@ def _run(cmd, timeout=30):
     return r.returncode, r.stdout, (time.perf_counter() - t0) * 1000
 
 
+def _percentile(values, percentile):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * percentile / 100) - 1))
+    return ordered[idx]
+
+
+def _measure_runs(cmd, *, runs=5, timeout=30):
+    timings = []
+    rcs = []
+    stdout = ""
+    for _ in range(runs):
+        rc, stdout, ms = _run(cmd, timeout=timeout)
+        rcs.append(rc)
+        timings.append(ms)
+    return {
+        "rc": 0 if all(rc == 0 for rc in rcs) else next(rc for rc in rcs if rc != 0),
+        "runs": runs,
+        "ms": round(_percentile(timings, 95), 1),
+        "p50_ms": round(_percentile(timings, 50), 1),
+        "p95_ms": round(_percentile(timings, 95), 1),
+        "max_ms": round(max(timings), 1),
+        "stdout_tail": stdout[-200:],
+    }
+
+
+def _seed_mining_state(root: Path, *, rows: int = 1000) -> None:
+    now = time.time()
+    feedback_path = root / "cs_rag" / "feedback.jsonl"
+    quality_path = root / "learner" / "response-quality.jsonl"
+    feedback_path.parent.mkdir(parents=True, exist_ok=True)
+    quality_path.parent.mkdir(parents=True, exist_ok=True)
+
+    feedback_rows = []
+    quality_rows = []
+    for i in range(rows):
+        recent = i % 2 == 0
+        logged_at = now - (3600 + i if recent else 10 * 86400 + i)
+        signal = "helpful" if i % 4 == 0 else "not_helpful"
+        feedback_rows.append({
+            "logged_at": logged_at,
+            "signal": signal,
+            "doc_paths": [f"doc/{i % 25}"],
+        })
+
+        flags = []
+        if i % 5 == 0:
+            flags.append("missing_response_body")
+        if i % 7 == 0:
+            flags.append("missing_citation")
+        quality_rows.append({
+            "logged_at": logged_at,
+            "quality_flags": flags,
+            "citation_paths_expected": [f"expected/{i % 20}"],
+            "citation_paths_declared": [f"declared/{i % 20}"] if i % 7 else [],
+        })
+
+    feedback_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in feedback_rows) + "\n",
+        encoding="utf-8",
+    )
+    quality_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in quality_rows) + "\n",
+        encoding="utf-8",
+    )
+
+
 def measure():
     PY = sys.executable
     results = {}
 
-    # W1 feedback-mine (empty log OK)
-    rc, _, ms = _run([PY, "bin/feedback-mine"])
-    results["feedback_mine"] = {"rc": rc, "ms": round(ms, 1),
-                                  "ok": rc == 0 and ms <= TARGETS["feedback_mine_ms_max"]}
+    with tempfile.TemporaryDirectory() as td:
+        mining_state = Path(td) / "state"
+        _seed_mining_state(mining_state)
 
-    # W2 response-quality-mine
-    rc, _, ms = _run([PY, "bin/response-quality-mine"])
-    results["response_quality_mine"] = {"rc": rc, "ms": round(ms, 1),
-                                          "ok": rc == 0 and ms <= TARGETS["rq_mine_ms_max"]}
+        # W1 feedback-mine with --since filter over 1k events.
+        feedback = _measure_runs([
+            PY, "bin/feedback-mine",
+            "--state-root", str(mining_state),
+            "--since", "7d",
+        ])
+        feedback["ok"] = (
+            feedback["rc"] == 0
+            and feedback["p95_ms"] <= TARGETS["feedback_mine_p95_ms_max"]
+            and feedback["max_ms"] <= TARGETS["feedback_mine_max_ms_max"]
+        )
+        results["feedback_mine"] = feedback
+
+        # W2 response-quality-mine with --since filter over 1k events.
+        rq = _measure_runs([
+            PY, "bin/response-quality-mine",
+            "--state-root", str(mining_state),
+            "--since", "7d",
+        ])
+        rq["ok"] = (
+            rq["rc"] == 0
+            and rq["p95_ms"] <= TARGETS["rq_mine_p95_ms_max"]
+            and rq["max_ms"] <= TARGETS["rq_mine_max_ms_max"]
+        )
+        results["response_quality_mine"] = rq
 
     # W3 routing-analyze
     rc, _, ms = _run([PY, "bin/routing-analyze"])

@@ -17,22 +17,33 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
-from scripts.mining.jsonl_iter import iter_jsonl  # noqa: E402
+from scripts.mining.jsonl_iter import iter_jsonl, parse_since_ts  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument(
+        "--since",
+        help="Only include rows since duration/epoch/ISO timestamp, e.g. 7d or 2026-05-27T00:00:00Z",
+    )
     args = parser.parse_args(argv)
 
     path = args.state_root / "cs_rag" / "feedback.jsonl"
-    rows = list(iter_jsonl(path))
+    try:
+        since_ts = parse_since_ts(args.since)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    signal_counter: Counter = Counter(r.get("signal", "?") for r in rows)
+    total = 0
+    signal_counter: Counter = Counter()
     doc_counter_neg: Counter = Counter()
     doc_counter_pos: Counter = Counter()
-    for r in rows:
+
+    for r in iter_jsonl(path, since_ts=since_ts):
+        total += 1
+        signal_counter[r.get("signal", "?")] += 1
         for d in r.get("doc_paths", []) or []:
             if r.get("signal") == "not_helpful":
                 doc_counter_neg[d] += 1
@@ -41,7 +52,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(json.dumps({
         "feedback_log_path": str(path),
-        "total_signals": len(rows),
+        "since": args.since,
+        "since_ts": since_ts,
+        "total_signals": total,
         "signals_by_type": dict(signal_counter),
         "top_not_helpful_docs": [{"doc": d, "n": n}
                                   for d, n in doc_counter_neg.most_common(args.top_n)],

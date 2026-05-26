@@ -12,38 +12,48 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
-from scripts.mining.jsonl_iter import iter_jsonl  # noqa: E402
+from scripts.mining.jsonl_iter import iter_jsonl, parse_since_ts  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument(
+        "--since",
+        help="Only include rows since duration/epoch/ISO timestamp, e.g. 7d or 2026-05-27T00:00:00Z",
+    )
     args = parser.parse_args(argv)
 
     path = args.state_root / "learner" / "response-quality.jsonl"
-    rows = list(iter_jsonl(path))
+    try:
+        since_ts = parse_since_ts(args.since)
+    except ValueError as exc:
+        parser.error(str(exc))
 
+    total = 0
     flag_counter: Counter = Counter()
-    for r in rows:
-        for f in r.get("quality_flags", []) or []:
-            flag_counter[f] += 1
-    missing_body = flag_counter.get("missing_response_body", 0)
-    drift = (flag_counter.get("citation_mismatch", 0)
-             + flag_counter.get("missing_citation", 0)
-             + flag_counter.get("extra_citation", 0))
-
     expected_paths: Counter = Counter()
     declared_paths: Counter = Counter()
-    for r in rows:
+    for r in iter_jsonl(path, since_ts=since_ts):
+        total += 1
+        for f in r.get("quality_flags", []) or []:
+            flag_counter[f] += 1
         for p in r.get("citation_paths_expected", []) or []:
             expected_paths[p] += 1
         for p in r.get("citation_paths_declared", []) or []:
             declared_paths[p] += 1
 
+    missing_body = flag_counter.get("missing_response_body", 0)
+    drift = (flag_counter.get("citation_mismatch", 0)
+             + flag_counter.get("missing_citation", 0)
+             + flag_counter.get("extra_citation", 0))
+
     print(json.dumps({
         "quality_log_path": str(path),
-        "rows_total": len(rows),
+        "since": args.since,
+        "since_ts": since_ts,
+        "rows_total": total,
         "missing_body_n": missing_body,
         "citation_drift_n": drift,
         "flag_counts": dict(flag_counter),
