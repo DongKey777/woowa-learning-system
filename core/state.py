@@ -19,6 +19,12 @@ from pathlib import Path
 
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 
+# Pending-trigger keys backed by dedicated files (NOT persisted into
+# profile.json). review_drill lives in state/learner/drill_pending.json; the
+# load path merges it back into the in-memory pending_triggers dict, but save
+# must skip it so stale drills don't leak into the profile snapshot.
+EPHEMERAL_PENDING_KEYS = frozenset({"review_drill"})
+
 
 @dataclass
 class LearnerProfile:
@@ -57,12 +63,66 @@ def _history_path(state_root: Path) -> Path:
     return state_root / "learner" / "history.jsonl"
 
 
+def _load_pending_triggers(state_root: Path) -> dict:
+    """Merge learner-level pending_triggers.json + drill_pending.json.
+
+    review_drill comes from drill_pending.json (ephemeral, not stored in
+    profile). Other pending keys come from pending_triggers.json.
+    """
+    triggers: dict = {}
+    pt = state_root / "learner" / "pending_triggers.json"
+    if pt.exists():
+        try:
+            triggers.update(json.loads(pt.read_text(encoding="utf-8")) or {})
+        except json.JSONDecodeError:
+            pass
+    dp = state_root / "learner" / "drill_pending.json"
+    if dp.exists() and "review_drill" not in triggers:
+        try:
+            triggers["review_drill"] = json.loads(dp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return triggers
+
+
+def _is_v3_profile(data: dict) -> bool:
+    """v3 schema: `concepts.*` wrapper + `schema_version: v3*`."""
+    return (
+        str(data.get("schema_version", "")).startswith("v3")
+        or "concepts" in data
+    )
+
+
 def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> LearnerProfile:
     p = _profile_path(state_root)
     if not p.exists():
         return LearnerProfile.empty(learner_id)
     mtime = p.stat().st_mtime
     data = _profile_json_cached(str(p), mtime)
+
+    if _is_v3_profile(data):
+        concepts = data.get("concepts", {}) or {}
+        activity = data.get("activity", {}) or {}
+        # Profile top-level pending_triggers + dedicated pending/drill files.
+        # The dedicated files win for keys they own (review_drill) so an
+        # already-cleared drill in drill_pending.json isn't resurrected by a
+        # stale profile entry.
+        merged_pending = dict(data.get("pending_triggers", {}) or {})
+        merged_pending.update(_load_pending_triggers(state_root))
+        return LearnerProfile(
+            learner_id=data.get("learner_id", learner_id),
+            mastered_concepts=list(concepts.get("mastered", [])),
+            uncertain_concepts=list(concepts.get("uncertain", [])),
+            drill_due=list(data.get("drill_due", [])),
+            pending_triggers=merged_pending,
+            total_events=int(activity.get("events_total", 0) or 0),
+            last_updated=float(
+                data.get("last_updated",
+                          data.get("computed_at", 0.0)) or 0.0
+            ),
+        )
+
+    # Legacy flat schema
     return LearnerProfile(
         learner_id=data.get("learner_id", learner_id),
         mastered_concepts=list(data.get("mastered_concepts", [])),
@@ -84,6 +144,34 @@ def save_profile(profile: LearnerProfile, state_root: Path = DEFAULT_STATE_ROOT)
     p = _profile_path(state_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     profile.last_updated = time.time()
+
+    existing: dict = {}
+    if p.exists():
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8")) or {}
+        except json.JSONDecodeError:
+            existing = {}
+
+    if _is_v3_profile(existing):
+        # Preserve v3 wrapper. Persist only non-ephemeral pending keys —
+        # review_drill is owned by drill_pending.json.
+        persistent_pending = {
+            k: v for k, v in profile.pending_triggers.items()
+            if k not in EPHEMERAL_PENDING_KEYS
+        }
+        existing.setdefault("concepts", {})
+        existing["concepts"]["mastered"] = list(profile.mastered_concepts)
+        existing["concepts"]["uncertain"] = list(profile.uncertain_concepts)
+        existing["learner_id"] = profile.learner_id
+        existing["last_updated"] = profile.last_updated
+        existing["drill_due"] = list(profile.drill_due)
+        existing["pending_triggers"] = persistent_pending
+        existing.setdefault("activity", {})
+        existing["activity"]["events_total"] = profile.total_events
+        p.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
+
+    # Legacy flat schema — preserve existing behaviour.
     p.write_text(json.dumps(profile.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
