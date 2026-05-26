@@ -34,6 +34,10 @@ N_SAMPLES = 200
 SEED = 42
 TIMEOUT_S = 30
 
+sys.path.insert(0, str(REPO_ROOT))
+
+from rag.eval import retrieval_metrics  # noqa: E402
+
 # Domain heuristic — query keyword → expected primary category in top-5
 DOMAIN_RULES = [
     # spring core
@@ -141,6 +145,9 @@ def measure() -> dict:
 
     results = []
     top1_strict = top5_strict = top1_cat_match = top5_cat_match = 0
+    ndcg_values = []
+    mrr_values = []
+    recall_values = []
     latencies = []
     errors = []
     no_hit = 0
@@ -165,6 +172,10 @@ def measure() -> dict:
         top1_cat = hits[0].get("category")
         top5_cids = [h.get("concept_id") for h in hits[:5]]
         top5_cats = [h.get("category") for h in hits[:5]]
+        rank_metrics = retrieval_metrics(top5_cids, [gt_cid], k=5)
+        ndcg_values.append(rank_metrics["ndcg_at_5"])
+        mrr_values.append(rank_metrics["mrr"])
+        recall_values.append(rank_metrics["recall_at_5"])
 
         is_top1 = (top1_cid == gt_cid)
         is_top5 = (gt_cid in top5_cids)
@@ -181,6 +192,9 @@ def measure() -> dict:
             "top1": top1_cid, "top1_cat": top1_cat,
             "top5": top5_cids, "is_top1": is_top1, "is_top5": is_top5,
             "is_top1_cat": is_top1_cat, "is_top5_cat": is_top5_cat,
+            "ndcg_at_5": round(rank_metrics["ndcg_at_5"], 4),
+            "mrr": round(rank_metrics["mrr"], 4),
+            "recall_at_5": round(rank_metrics["recall_at_5"], 4),
             "latency_ms": round(ms, 1),
         })
         if i % 20 == 0:
@@ -197,6 +211,9 @@ def measure() -> dict:
         "top5_strict_match_rate": round(top5_strict / n_eval, 3) if n_eval else None,
         "top1_category_match_rate": round(top1_cat_match / n_eval, 3) if n_eval else None,
         "top5_category_match_rate": round(top5_cat_match / n_eval, 3) if n_eval else None,
+        "ndcg_at_5": round(sum(ndcg_values) / len(ndcg_values), 3) if ndcg_values else None,
+        "mrr": round(sum(mrr_values) / len(mrr_values), 3) if mrr_values else None,
+        "recall_at_5": round(sum(recall_values) / len(recall_values), 3) if recall_values else None,
         "latency_ms_p50": round(statistics.median(latencies), 1) if latencies else None,
         "latency_ms_p95": (round(sorted(latencies)[int(len(latencies) * 0.95)], 1)
                           if latencies else None),

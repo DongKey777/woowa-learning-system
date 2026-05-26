@@ -7,15 +7,46 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import argparse
+import json
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET = REPO_ROOT / "tests" / "benchmarks" / "rag_quality_regression.py"
+REPORT = REPO_ROOT / "reports" / "rag_quality_regression.json"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--min-top1", type=float, default=None)
+    parser.add_argument("--min-ndcg5", type=float, default=None)
+    parser.add_argument("--max-p95-ms", type=float, default=None)
+    args = parser.parse_args(argv)
+
     env = {**os.environ, "WOOWA_SESSION_MODE": "development"}
-    return subprocess.call([sys.executable, str(TARGET)], cwd=REPO_ROOT, env=env)
+    rc = subprocess.call([sys.executable, str(TARGET)], cwd=REPO_ROOT, env=env)
+    if rc != 0:
+        return rc
+    if not any(v is not None for v in (args.min_top1, args.min_ndcg5, args.max_p95_ms)):
+        return 0
+    data = json.loads(REPORT.read_text(encoding="utf-8"))
+    summary = data["current_measurement"]
+    failures = []
+    top1 = summary.get("top1_strict_match_rate")
+    ndcg5 = summary.get("ndcg_at_5")
+    p95 = summary.get("latency_ms_p95")
+    if args.min_top1 is not None and (top1 is None or top1 < args.min_top1):
+        failures.append(f"top1_strict {top1} < {args.min_top1}")
+    if args.min_ndcg5 is not None and (ndcg5 is None or ndcg5 < args.min_ndcg5):
+        failures.append(f"ndcg_at_5 {ndcg5} < {args.min_ndcg5}")
+    if args.max_p95_ms is not None and (p95 is None or p95 > args.max_p95_ms):
+        failures.append(f"latency_ms_p95 {p95} > {args.max_p95_ms}")
+    if failures:
+        print("Y13 rag-eval threshold failure:", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

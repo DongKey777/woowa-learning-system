@@ -13,7 +13,11 @@ from rag.eval import (
     build_judge_prompt,
     load_history_samples,
     majority,
+    ndcg_at_k,
     parse_judgment,
+    recall_at_k,
+    reciprocal_rank,
+    retrieval_metrics,
 )
 
 
@@ -132,3 +136,17 @@ def test_load_history_samples_subsamples_deterministically(tmp_path: Path) -> No
     s2 = load_history_samples(history, n=5, seed=42)
     assert [s.sample_id for s in s1] == [s.sample_id for s in s2]
     assert len(s1) == 5
+
+
+def test_retrieval_ranking_metrics() -> None:
+    retrieved = ["a", "target", "c", "d", "e"]
+    expected = ["target"]
+    assert reciprocal_rank(retrieved, expected) == pytest.approx(0.5)
+    assert recall_at_k(retrieved, expected, 1) == 0.0
+    assert recall_at_k(retrieved, expected, 5) == 1.0
+    assert ndcg_at_k(retrieved, expected, 5) == pytest.approx(1 / 1.5849625, rel=1e-5)
+    assert retrieval_metrics(retrieved, expected, k=5) == pytest.approx({
+        "recall_at_5": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_5": 1 / 1.5849625,
+    })

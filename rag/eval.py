@@ -12,6 +12,7 @@ History sampler reads learner history.jsonl (D12 mode=learning filter).
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 from dataclasses import asdict, dataclass, field
@@ -92,6 +93,59 @@ def majority(judgments: list[Judgment]) -> Judgment:
         confidence=round(avg_conf, 3),
         reason=f"majority {true_votes}/{len(judgments)}",
     )
+
+
+def reciprocal_rank(retrieved_ids: list[str], expected_ids: list[str]) -> float:
+    """Return MRR contribution for one ranked result list."""
+    expected = set(expected_ids)
+    if not expected:
+        return 0.0
+    for idx, cid in enumerate(retrieved_ids, start=1):
+        if cid in expected:
+            return 1.0 / idx
+    return 0.0
+
+
+def recall_at_k(retrieved_ids: list[str], expected_ids: list[str], k: int) -> float:
+    """Fraction of expected ids present in the first k retrieved ids."""
+    expected = set(expected_ids)
+    if not expected:
+        return 0.0
+    return len(expected & set(retrieved_ids[:k])) / len(expected)
+
+
+def dcg_at_k(relevances: list[float], k: int) -> float:
+    """Discounted cumulative gain for a relevance vector."""
+    total = 0.0
+    for idx, rel in enumerate(relevances[:k], start=1):
+        total += (2**rel - 1) / math.log2(idx + 1)
+    return total
+
+
+def ndcg_at_k(retrieved_ids: list[str], expected_ids: list[str], k: int) -> float:
+    """NDCG@k using binary relevance against expected concept ids."""
+    expected = set(expected_ids)
+    if not expected:
+        return 0.0
+    relevances = [1.0 if cid in expected else 0.0 for cid in retrieved_ids[:k]]
+    ideal_relevances = [1.0] * min(len(expected), k)
+    ideal = dcg_at_k(ideal_relevances, k)
+    if ideal == 0:
+        return 0.0
+    return dcg_at_k(relevances, k) / ideal
+
+
+def retrieval_metrics(
+    retrieved_ids: list[str],
+    expected_ids: list[str],
+    k: int = 5,
+) -> dict[str, float]:
+    """Compute per-query ranking metrics used by Y13 gates."""
+    return {
+        f"recall_at_{k}": recall_at_k(retrieved_ids, expected_ids, k),
+        "mrr": reciprocal_rank(retrieved_ids, expected_ids),
+        f"ndcg_at_{k}": ndcg_at_k(retrieved_ids, expected_ids, k),
+    }
 
 
 @dataclass

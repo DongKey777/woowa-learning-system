@@ -20,6 +20,7 @@ Acceptance criteria for v1.0.1: ALL categories pass.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -61,6 +62,8 @@ SUITE = [
     ("H_Y_integration", "phase_y7_sync_prs_chain", BENCH / "phase_y7_sync_prs_chain.py", 60),
     ("H_Y_integration", "phase_y8_fresh_clone_sim", BENCH / "phase_y8_fresh_clone_sim.py", 60),
     ("H_Y_integration", "phase_y8_concurrent_append", BENCH / "phase_y8_concurrent_append.py", 60),
+    ("H_Y_integration", "daemon_latency", BENCH / "daemon_latency.py", 60),
+    ("H_Y_integration", "concurrent_ask", BENCH / "concurrent_ask.py", 60),
 
     # I. Learner cycle e2e
     ("I_learner_cycle", "phase_y_learner_cycle", BENCH / "phase_y_learner_cycle.py", 60),
@@ -105,8 +108,7 @@ def _run_bench(category: str, name: str, path: Path, timeout: int) -> dict:
             [sys.executable, str(path)],
             cwd=REPO_ROOT,
             capture_output=True, text=True, timeout=timeout,
-            env={**__import__("os").environ,
-                 "WOOWA_SESSION_MODE": "development"},
+            env={**os.environ, "WOOWA_SESSION_MODE": "development"},
         )
         elapsed = (time.perf_counter() - t0) * 1000
         return {
@@ -132,6 +134,22 @@ def _architectural_checks() -> list[dict]:
         "category": "J_architecture", "name": "wrapper_count",
         "observed": bin_n, "expected_min": 63,
         "pass": bin_n >= 63,
+    })
+
+    non_executable_wrappers = []
+    for p in sorted((REPO_ROOT / "bin").iterdir()):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        try:
+            first_line = p.open(encoding="utf-8", errors="replace").readline()
+        except OSError:
+            first_line = ""
+        if first_line.startswith("#!") and not os.access(p, os.X_OK):
+            non_executable_wrappers.append(str(p.relative_to(REPO_ROOT)))
+    out.append({
+        "category": "J_architecture", "name": "bin_wrappers_executable",
+        "observed": non_executable_wrappers,
+        "pass": len(non_executable_wrappers) == 0,
     })
 
     # Runtime LOC under budget
@@ -204,6 +222,85 @@ def _architectural_checks() -> list[dict]:
     return out
 
 
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _y13_gate_checks() -> list[dict]:
+    """Y13 quality/performance/latency gates over benchmark reports."""
+    out: list[dict] = []
+
+    rag_report = _read_json(REPO_ROOT / "reports" / "rag_quality_regression.json")
+    rag = (rag_report or {}).get("current_measurement", {})
+    rag_gates = [
+        ("rag_top1_strict", rag.get("top1_strict_match_rate"), 0.80, ">="),
+        ("rag_ndcg_at_5", rag.get("ndcg_at_5"), 0.78, ">="),
+        ("rag_latency_p95_ms", rag.get("latency_ms_p95"), 500.0, "<="),
+    ]
+    for name, observed, threshold, op in rag_gates:
+        passed = (
+            observed is not None
+            and ((observed >= threshold) if op == ">=" else (observed <= threshold))
+        )
+        out.append({
+            "category": "K_Y13_gates",
+            "name": name,
+            "observed": observed,
+            "threshold": threshold,
+            "op": op,
+            "pass": passed,
+        })
+
+    concurrent = _read_json(REPO_ROOT / "reports" / "concurrent_ask.json")
+    if concurrent is not None:
+        out.extend([
+            {
+                "category": "K_Y13_gates",
+                "name": "concurrent_ask_lost_events",
+                "observed": concurrent.get("lost_events"),
+                "threshold": 0,
+                "op": "==",
+                "pass": concurrent.get("lost_events") == 0,
+            },
+            {
+                "category": "K_Y13_gates",
+                "name": "concurrent_ask_p95_ms",
+                "observed": (concurrent.get("latency_ms") or {}).get("p95"),
+                "threshold": 1500.0,
+                "op": "<=",
+                "pass": ((concurrent.get("latency_ms") or {}).get("p95") or 10**9) <= 1500.0,
+            },
+        ])
+    else:
+        out.append({
+            "category": "K_Y13_gates",
+            "name": "concurrent_ask_report_present",
+            "path": "reports/concurrent_ask.json",
+            "pass": False,
+        })
+
+    latency = _read_json(REPO_ROOT / "reports" / "y13_latency_baseline.json")
+    layers = (latency or {}).get("layers", {})
+    latency_gates = [
+        ("warm_socket_p95_ms", ("warm_socket", "p95_ms"), 200.0),
+        ("warm_cli_p95_ms", ("warm_cli", "p95_ms"), 400.0),
+    ]
+    for name, (layer_name, key), threshold in latency_gates:
+        observed = (layers.get(layer_name) or {}).get(key)
+        out.append({
+            "category": "K_Y13_gates",
+            "name": name,
+            "observed": observed,
+            "threshold": threshold,
+            "op": "<=",
+            "pass": observed is not None and observed <= threshold,
+        })
+    return out
+
+
 def main():
     print("=== Release v1.0.1 acceptance bench ===\n", flush=True)
     results: list[dict] = []
@@ -220,6 +317,10 @@ def main():
     # J. architectural checks
     print("[J] architectural checks...", flush=True)
     results.extend(_architectural_checks())
+
+    # K. Y13 gates
+    print("[K] Y13 gates...", flush=True)
+    results.extend(_y13_gate_checks())
 
     # Aggregate per category
     from collections import defaultdict
