@@ -29,7 +29,7 @@
    - Python 3.10+ 확인 + `pip install -e .`
    - BGE-M3 모델 캐시 다운로드 (~3GB, 첫 실행만)
    - `bin/index-fetch` — GitHub Releases에서 사전 빌드된 Lance 인덱스 다운로드 (12.7MB, ~15초)
-   - `bin/rag-daemon start` 백그라운드
+   - `bin/rag-daemon start-bg` 백그라운드
 5. 학습자는 한국어로 질문만 던지면 됨. *"Bean DI가 뭐야"*, *"내 ReservationController 어떻게 리팩토링"*, *"다른 크루는 어떻게 작성했어"*, *"확인 질문 줘"* 등.
 
 > **🚫 학습자 기기에서 인덱스 빌드 금지** — `bin/corpus-build`는 15-30분 + 4-6GB peak RAM이라 학습 흐름 차단. 새 인덱스 버전은 maintainer가 RunPod에서 빌드 후 GitHub Releases에 publish, 학습자는 `bin/index-fetch --tag <new>` 로만 업데이트.

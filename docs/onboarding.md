@@ -96,13 +96,12 @@ GitHub Releases (`DongKey777/woowa-learning-system`)에 publish된 사전 빌드
 ### Step 4 — Daemon 시작
 
 ```bash
-nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &
+bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90
 ```
 
-5-10초 prewarm 후 `state/rag-daemon.sock` 생성. 확인:
+prewarm 후 `state/rag-daemon.sock` 생성. 확인:
 
 ```bash
-until grep -q "ready" /tmp/daemon.log 2>/dev/null; do sleep 0.3; done
 bin/rag-daemon ping
 # {"alive": true, "ts": ...}
 ```

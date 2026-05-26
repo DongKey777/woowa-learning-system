@@ -45,7 +45,8 @@ python3 bin/ask "다른 크루는 어떻게" --repo spring-roomescape-member  # 
 ## `bin/rag-daemon`
 
 ```bash
-bin/rag-daemon start    # foreground; nohup/bg 권장
+bin/rag-daemon start    # foreground
+bin/rag-daemon start-bg # detached background start + ready wait
 bin/rag-daemon stop
 bin/rag-daemon ping
 bin/rag-daemon status   # JSON: pid/uptime/socket/health
@@ -60,7 +61,7 @@ bin/rag-daemon status   # JSON: pid/uptime/socket/health
 
 권장 시작:
 ```bash
-nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &
+bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90
 ```
 
 ---

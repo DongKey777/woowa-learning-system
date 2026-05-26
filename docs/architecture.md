@@ -135,7 +135,7 @@ Phase L 측정:
 ### State files
 - `state/rag-daemon.sock` — socket
 - `state/rag-daemon.pid` — pid
-- 시작: `nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &`
+- 시작: `bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90`
 
 ## 8. Performance (warm)
 

@@ -53,7 +53,7 @@ def _ensure_daemon() -> bool:
 
 def measure() -> dict:
     if not _ensure_daemon():
-        return {"pass": False, "error": "daemon not running — start with `nohup bin/rag-daemon start`"}
+        return {"pass": False, "error": "daemon not running — start with `bin/rag-daemon start-bg`"}
 
     # Force cold (force_refresh=True) for cold-path measurement
     cold_times = []

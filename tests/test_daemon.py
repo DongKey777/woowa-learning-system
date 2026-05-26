@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -38,7 +39,8 @@ def test_ask_returns_none_when_socket_missing(tmp_path: Path) -> None:
 def test_module_exports() -> None:
     # Public API contract
     for name in ("search", "ask", "DEFAULT_STATE_ROOT", "SOCKET_FILE",
-                 "PID_FILE", "DAEMON_TIMEOUT", "LISTEN_BACKLOG"):
+                 "PID_FILE", "DAEMON_TIMEOUT", "LISTEN_BACKLOG",
+                 "start_background"):
         assert hasattr(daemon, name), f"missing public symbol: {name}"
 
 
@@ -50,3 +52,31 @@ def test_default_state_root_under_repo(tmp_path: Path) -> None:
     """DEFAULT_STATE_ROOT should be project-relative."""
     assert daemon.DEFAULT_STATE_ROOT.name == "state"
     assert daemon.DEFAULT_STATE_ROOT.parent.name == "woowa-learning-system"
+
+
+def test_start_background_returns_true_when_already_running(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(daemon, "ping", lambda state_root: True)
+    popen = Mock()
+    monkeypatch.setattr(daemon.subprocess, "Popen", popen)
+    assert daemon.start_background(state_root=tmp_path, log_path=tmp_path / "d.log", timeout_s=0.01) is True
+    popen.assert_not_called()
+
+
+def test_start_background_spawns_detached_process(monkeypatch, tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def fake_ping(state_root):
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(daemon, "ping", fake_ping)
+    popen = Mock(return_value=FakeProc())
+    monkeypatch.setattr(daemon.subprocess, "Popen", popen)
+    assert daemon.start_background(state_root=tmp_path, log_path=tmp_path / "d.log", timeout_s=1) is True
+    kwargs = popen.call_args.kwargs
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] is daemon.subprocess.DEVNULL

@@ -17,15 +17,18 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 DAEMON_TIMEOUT = 30  # seconds per request
 PID_FILE = "rag-daemon.pid"
 SOCKET_FILE = "rag-daemon.sock"
 LISTEN_BACKLOG = 32
+DEFAULT_LOG_PATH = Path("/tmp/daemon.log")
 
 
 # ── client API ────────────────────────────────────────────────────────────
@@ -133,6 +136,42 @@ def stop(state_root: Path = DEFAULT_STATE_ROOT) -> bool:
     pid_p.unlink(missing_ok=True)
     sp.unlink(missing_ok=True)
     return True
+
+
+def start_background(
+    state_root: Path = DEFAULT_STATE_ROOT,
+    log_path: Path = DEFAULT_LOG_PATH,
+    timeout_s: float = 90.0,
+) -> bool:
+    """Start daemon in a detached process and wait until ping succeeds."""
+    if ping(state_root):
+        return True
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("a", encoding="utf-8")
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "bin" / "rag-daemon"),
+        "start",
+        "--state-root",
+        str(state_root),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+    )
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        if ping(state_root):
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.25)
+    return False
 
 
 # ── server (daemon) ───────────────────────────────────────────────────────
@@ -302,11 +341,21 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
 def main(argv: list[str] | None = None) -> int:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("start", "stop", "ping", "status"))
+    parser.add_argument("action", choices=("start", "start-bg", "stop", "ping", "status"))
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
+    parser.add_argument("--timeout-s", type=float, default=90.0)
     args = parser.parse_args(argv)
     if args.action == "start":
         serve(state_root=args.state_root)
+    elif args.action == "start-bg":
+        ok = start_background(
+            state_root=args.state_root,
+            log_path=args.log_path,
+            timeout_s=args.timeout_s,
+        )
+        print("started" if ok else f"not ready; see {args.log_path}")
+        return 0 if ok else 1
     elif args.action == "stop":
         print("stopped" if stop(args.state_root) else "not running")
     elif args.action == "ping":

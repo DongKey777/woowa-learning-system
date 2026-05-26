@@ -131,7 +131,7 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 python3 -m pytest tests/ -q || exit 1
 
 # 2. Ensure both daemons up
-bin/rag-daemon status || nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &
+bin/rag-daemon status || bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90
 # (legacy hub daemon은 학습자가 별도 관리)
 
 # 3. Ensure mission/cross_crew built (idempotent)

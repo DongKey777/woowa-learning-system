@@ -8,7 +8,7 @@
 - `pip install -e .`
 - BGE-M3 모델 캐시 다운로드 (~3GB)
 - Lance 인덱스 빌드 또는 release fetch
-- `bin/rag-daemon start` 백그라운드
+- `bin/rag-daemon start-bg` 백그라운드
 - `bin/ask "..."` 자체
 - 에러 복구
 
@@ -45,9 +45,9 @@ GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.0
 
 ### Step 4. Daemon 시작
 ```bash
-nohup bin/rag-daemon start > /tmp/daemon.log 2>&1 &
+bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90
 ```
-5-10초 prewarm 후 `grep -q ready /tmp/daemon.log` 확인.
+완료 후 `bin/rag-daemon ping` 확인.
 
 ### Step 5. (옵션) Mission patterns / cross-crew 사전 빌드
 학습자가 mission repo onboarded 후:
