@@ -191,10 +191,20 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
     from rag.corpus_loader import load_corpus
     from rag.encoder import encode_query
     from core.coach import compose
+    from core.lexical_fusion import make_lexical_fusion_fn
     from core.lazy_loader import load as lazy_load
     from core.router import route
     from core.state import append_history_event, load_profile, read_history
     corpus = load_corpus(strict=True)
+    lexical_fns: dict[int, object] = {}
+
+    def _lexical_fn(loaded_corpus, expand: int):
+        if expand <= 0:
+            return None
+        if expand not in lexical_fns:
+            lexical_fns[expand] = make_lexical_fusion_fn(loaded_corpus, expand=expand)
+        return lexical_fns[expand]
+
     _ = encode_query("warm-up")
     print(f"[daemon] ready (pid={os.getpid()}, socket={sp})", flush=True)
 
@@ -226,6 +236,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         req["query"],
                         top_k=req.get("top_k", 5),
                         relations_expand=req.get("relations_expand", 3),
+                        rerank_fn=_lexical_fn(corpus, req.get("lexical_expand", 8)),
                         corpus=corpus,
                     )
                     payload = {"hits": [{

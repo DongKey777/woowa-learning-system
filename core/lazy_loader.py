@@ -68,7 +68,14 @@ def _load_rag_hits(query: str, top_k: int = 5, corpus=None) -> list[dict]:
         # In-process path (daemon ask handler injects corpus)
         try:
             from rag.search import search
-            hits = search(query, top_k=top_k, relations_expand=3, corpus=corpus)
+            from core.lexical_fusion import make_lexical_fusion_fn
+            hits = search(
+                query,
+                top_k=top_k,
+                relations_expand=3,
+                rerank_fn=make_lexical_fusion_fn(corpus, expand=8),
+                corpus=corpus,
+            )
             return [{"concept_id": h.concept_id, "score": round(h.score, 4),
                      "category": h.category, "title": h.title, "source": h.source}
                     for h in hits]
