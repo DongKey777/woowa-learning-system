@@ -79,7 +79,7 @@ def start_session(
     mission_path: Path | None = None,
     *,
     learner_id: str = "default",
-    learner_login: str = "DongKey777",
+    learner_login: str | None = None,
     state_root: Path = DEFAULT_STATE_ROOT,
     context: str = "auto",
     force_refresh: bool = False,
@@ -87,9 +87,14 @@ def start_session(
 ) -> dict:
     """Orchestrate cold or warm boot, then ask.
 
+    learner_login defaults to auto-detection via core.identity (gh CLI + cache).
+
     Returns: {boot_type, assess_ran, profile_ran, ask_ok, ask_latency_ms,
               markdown, mode, errors[...]}
     """
+    from core.identity import resolve_learner_login
+    if learner_login is None:
+        learner_login = resolve_learner_login(state_root)
     ts = now or time.time()
     errors: list[str] = []
     boot_type = "warm"

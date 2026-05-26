@@ -196,12 +196,18 @@ def assess_learner_state(
     repo: str,
     mission_path: Path,
     state_root: Path = DEFAULT_STATE_ROOT,
-    learner_login: str = "DongKey777",
+    learner_login: str | None = None,
     budget_secs: float = BUDGET_DEFAULT,
     target_pr_number: int | None = None,
     now: float | None = None,
 ) -> dict:
-    """Snapshot mission repo state. Bounded by `budget_secs` wall-clock."""
+    """Snapshot mission repo state. Bounded by `budget_secs` wall-clock.
+
+    learner_login defaults to auto-detection via core.identity.
+    """
+    from core.identity import resolve_learner_login
+    if learner_login is None:
+        learner_login = resolve_learner_login(state_root)
     t0 = time.time()
     ts = now or t0
 
