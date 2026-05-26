@@ -20,7 +20,7 @@ _STOPWORDS = {
 }
 _LEXICAL_CACHE: dict[int, tuple[dict, ...]] = {}
 _CATEGORY_HINTS = {
-    "spring": ("spring", "스프링", "@transactional", "transactional", "bean", "mvc"),
+    "spring": ("spring", "스프링", "@transactional", "transactional", "bean", "mvc", "aop"),
     "database": ("database", "db", "mvcc", "replica", "lock", "pool", "sql"),
     "security": ("401", "403", "cookie", "cors", "csrf", "xss", "jwt", "auth", "인증", "인가"),
 }
@@ -35,6 +35,13 @@ _CANONICAL_PROMOTION_IDS = {
 _SPECIALIZED_MARKERS = (
     "bridge", "router", "drill", "interview", "decision-guide", "chooser",
 )
+_INTRO_QUERY_MARKERS = (
+    "뭐야", "무슨 의미", "기초", "처음", "입문", "큰 그림", "단계 알려줘",
+    "what is", "basics", "primer",
+)
+_COMPARISON_QUERY_MARKERS = (
+    " vs ", "vs", "차이", "비교", "구분", "대신", "보다", "다른", "같은 거", "분리",
+)
 
 
 def make_lexical_fusion_fn(
@@ -48,7 +55,8 @@ def make_lexical_fusion_fn(
         fused = _fuse_lexical(hits, _lexical_candidates(query, corpus, expand))
         promoted = _promote_hinted_category(query, fused)
         promoted = _promote_canonical_candidate(promoted)
-        return _promote_exact_expected_query(promoted, _exact_expected_candidates(query, corpus))
+        promoted = _promote_exact_expected_query(promoted, _exact_expected_candidates(query, corpus))
+        return _refine_confusable_order(query, promoted, corpus)
 
     return _rerank
 
@@ -84,6 +92,7 @@ def _lexical_entries(corpus_key: int, corpus: LoadedCorpus) -> tuple[dict, ...]:
         entries.append({
             "concept_id": cid,
             "category": concept.get("category", ""),
+            "level": concept.get("level", ""),
             "title": title,
             "expected_query_norms": {
                 _norm_exact(str(q))
@@ -204,6 +213,166 @@ def _promote_canonical_candidate(hits: list[SearchHit]) -> list[SearchHit]:
         if hit.category == head_category and hit.concept_id in _CANONICAL_PROMOTION_IDS:
             return [hit] + hits[:idx] + hits[idx + 1:]
     return hits
+
+
+def _refine_confusable_order(
+    query: str,
+    hits: list[SearchHit],
+    corpus: LoadedCorpus,
+) -> list[SearchHit]:
+    if len(hits) < 2:
+        return hits
+    head = hits[0]
+    head_concept = corpus.concepts.get(head.concept_id)
+    if head_concept is None:
+        return hits
+
+    promoted: list[SearchHit] = []
+    neutral: list[SearchHit] = []
+    demoted: list[SearchHit] = []
+    for hit in hits[1:]:
+        concept = corpus.concepts.get(hit.concept_id)
+        if concept is None:
+            neutral.append(hit)
+        elif _should_promote_comparison_neighbor(query, head, head_concept, hit, concept):
+            promoted.append(hit)
+        elif _should_demote_neighbor(query, head, head_concept, hit, concept):
+            demoted.append(hit)
+        else:
+            neutral.append(hit)
+    return [head] + promoted + neutral + demoted
+
+
+def _should_promote_comparison_neighbor(
+    query: str,
+    head: SearchHit,
+    head_concept: dict,
+    hit: SearchHit,
+    concept: dict,
+) -> bool:
+    return (
+        _is_comparison_query(query)
+        and hit.category == head.category
+        and not _is_mission_bridge_concept(hit.concept_id)
+        and _is_confusable_pair(head.concept_id, head_concept, hit.concept_id, concept)
+        and _is_comparison_concept(hit.concept_id, concept)
+        and len(_tokens(query) & _id_tokens(hit.concept_id)) >= 2
+    )
+
+
+def _should_demote_neighbor(
+    query: str,
+    head: SearchHit,
+    head_concept: dict,
+    hit: SearchHit,
+    concept: dict,
+) -> bool:
+    if _should_demote_category_mismatch(query, head, hit):
+        return True
+    if _should_demote_advanced_from_beginner(query, head_concept, concept):
+        return True
+    if _should_demote_unasked_comparison_neighbor(query, head.concept_id, head_concept, hit.concept_id, concept):
+        return True
+    if _is_single_side_of_comparison(query, head.concept_id, head_concept, hit.concept_id, concept):
+        return True
+    return False
+
+
+def _should_demote_category_mismatch(query: str, head: SearchHit, hit: SearchHit) -> bool:
+    category = _hinted_category(query)
+    return (
+        category in {"security", "spring"}
+        and head.category == category
+        and hit.category != category
+    )
+
+
+def _should_demote_advanced_from_beginner(query: str, head_concept: dict, concept: dict) -> bool:
+    if head_concept.get("level") != "beginner" or concept.get("level") != "advanced":
+        return False
+    return _is_intro_query(query) or _is_comparison_query(query)
+
+
+def _should_demote_unasked_comparison_neighbor(
+    query: str,
+    head_id: str,
+    head_concept: dict,
+    candidate_id: str,
+    candidate_concept: dict,
+) -> bool:
+    return (
+        not _is_comparison_query(query)
+        and _is_routing_head(head_id)
+        and not _is_mission_bridge_concept(candidate_id)
+        and _is_comparison_concept(candidate_id, candidate_concept)
+        and _is_confusable_pair(head_id, head_concept, candidate_id, candidate_concept)
+    )
+
+
+def _is_confusable_pair(
+    head_id: str,
+    head_concept: dict,
+    candidate_id: str,
+    candidate_concept: dict,
+) -> bool:
+    head_confusables = set(head_concept.get("relations", {}).get("confusable_with", []) or [])
+    candidate_confusables = set(candidate_concept.get("relations", {}).get("confusable_with", []) or [])
+    return candidate_id in head_confusables or head_id in candidate_confusables
+
+
+def _is_intro_query(query: str) -> bool:
+    ql = query.lower()
+    return any(marker in ql for marker in _INTRO_QUERY_MARKERS)
+
+
+def _is_comparison_query(query: str) -> bool:
+    ql = f" {query.lower()} "
+    return any(marker in ql for marker in _COMPARISON_QUERY_MARKERS)
+
+
+def _is_comparison_concept(concept_id: str, concept: dict) -> bool:
+    text = f" {concept_id.lower()} {str(concept.get('title') or '').lower()} "
+    return "-vs-" in text or " vs " in text or " vs-" in text or "-vs " in text
+
+
+def _is_single_side_of_comparison(
+    query: str,
+    head_id: str,
+    head_concept: dict,
+    candidate_id: str,
+    candidate_concept: dict,
+) -> bool:
+    if not (_is_comparison_query(query) and _is_comparison_concept(head_id, head_concept)):
+        return False
+    if head_concept.get("category") != "security":
+        return False
+    if _is_comparison_concept(candidate_id, candidate_concept):
+        return False
+    head_tokens = _id_tokens(head_id)
+    candidate_tokens = _id_tokens(candidate_id)
+    if len(head_tokens & candidate_tokens) < 2:
+        return False
+    return bool(head_tokens - candidate_tokens)
+
+
+def _id_tokens(concept_id: str) -> set[str]:
+    _, _, stem = concept_id.partition("/")
+    return {
+        token
+        for token in re.split(r"[-_/]+", stem.lower())
+        if len(token) >= 3 and token not in {"basics", "primer", "guide", "card"}
+    }
+
+
+def _is_routing_head(concept_id: str) -> bool:
+    return any(marker in concept_id for marker in ("splitter", "router", "first-check", "chooser"))
+
+
+def _is_mission_bridge_concept(concept_id: str) -> bool:
+    return any(
+        marker in concept_id
+        for marker in ("-bridge", "roomescape", "lotto", "shopping-cart", "baseball", "blackjack")
+    )
 
 
 def _fuse_lexical(hits: list[SearchHit], lexical_hits: list[SearchHit]) -> list[SearchHit]:
