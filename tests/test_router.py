@@ -55,6 +55,18 @@ def test_cs_qa_routing() -> None:
     assert d.budget_tokens == 4500
 
 
+def test_transactional_location_question_stays_cs_qa() -> None:
+    d = route("@Transactional 어노테이션은 어디에 붙이는 게 좋아?")
+    assert d.mode == "cs_qa"
+    assert d.need_rag is True
+
+
+def test_learning_practice_request_without_pending_stays_cs_qa() -> None:
+    d = route("확인 질문 하나 줘")
+    assert d.mode == "cs_qa"
+    assert d.need_rag is True
+
+
 def test_coaching_routing_loads_mission_ctx() -> None:
     d = route("내 코드 어떻게 리팩토링", repo="roomescape-admin")
     assert d.mode == "coaching"

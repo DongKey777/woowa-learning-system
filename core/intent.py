@@ -48,7 +48,10 @@ LEARNING_INTENT = (
     "trade-off", "장단점", "설명", "이해", "알려줘",
     # CS-concept intents that aren't generic "어떻게"
     "종류", "원리", "설정", "메커니즘", "처리법", "vs",
-    "생명주기", "benefits", "어디서", "구조", "흐름",
+    "생명주기", "benefits", "어디서", "어디에", "구조", "흐름",
+)
+LEARNING_REQUEST_TOKENS = (
+    "확인 질문", "질문 하나", "퀴즈", "연습 문제",
 )
 # Short CS tokens whose plain `in` match would false-positive (e.g. "di" in
 # "dinner") — matched via ASCII-boundary lookaround instead. Also covers
@@ -108,6 +111,11 @@ def has_learning_intent(prompt: str) -> bool:
     return any(t in lp for t in LEARNING_INTENT)
 
 
+def has_learning_request(prompt: str) -> bool:
+    lp = prompt.lower()
+    return any(t in lp for t in LEARNING_REQUEST_TOKENS)
+
+
 def has_definition_signal(prompt: str) -> bool:
     """Short, definition-form CS prompts pass even without an explicit
     learning intent.
@@ -141,6 +149,7 @@ def should_use_rag(prompt: str, repo: str | None = None) -> bool:
         (has_cs_domain(prompt) and has_learning_intent(prompt))
         or has_mission_signal(prompt, repo)
         or has_definition_signal(prompt)
+        or has_learning_request(prompt)
     )
 
 RETRO_KEYWORDS = (
