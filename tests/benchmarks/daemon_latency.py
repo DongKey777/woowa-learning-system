@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import math
 import socket
 import statistics
 import subprocess
@@ -25,7 +26,7 @@ def _percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
-    idx = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * q)))
+    idx = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * q) - 1))
     return ordered[idx]
 
 

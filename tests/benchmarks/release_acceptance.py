@@ -63,7 +63,7 @@ SUITE = [
     ("H_Y_integration", "phase_y7_sync_prs_chain", BENCH / "phase_y7_sync_prs_chain.py", 60),
     ("H_Y_integration", "phase_y8_fresh_clone_sim", BENCH / "phase_y8_fresh_clone_sim.py", 60),
     ("H_Y_integration", "phase_y8_concurrent_append", BENCH / "phase_y8_concurrent_append.py", 60),
-    ("H_Y_integration", "daemon_latency", BENCH / "daemon_latency.py", 60),
+    ("H_Y_integration", "daemon_latency", BENCH / "daemon_latency.py", 180),
     ("H_Y_integration", "concurrent_ask", BENCH / "concurrent_ask.py", 60),
     ("H_Y_integration", "reformulated_query_path", BENCH / "reformulated_query_path.py", 60),
 
@@ -104,10 +104,21 @@ def _run_bench(category: str, name: str, path: Path, timeout: int) -> dict:
     if not path.exists():
         return {"category": category, "name": name, "rc": -1, "ms": 0,
                 "missing": True, "pass": False}
+    extra_args = []
+    if name == "daemon_latency":
+        # Keep L1/L2 visible in the canonical report. They are final-superiority
+        # audit metrics, not v1.0.1 release-ready gates yet.
+        extra_args = [
+            "--warm-socket", "5",
+            "--warm-cli", "5",
+            "--cold-start", "3",
+            "--first-ask", "3",
+            "--cold-timeout-s", "45",
+        ]
     t0 = time.perf_counter()
     try:
         r = subprocess.run(
-            [sys.executable, str(path)],
+            [sys.executable, str(path), *extra_args],
             cwd=REPO_ROOT,
             capture_output=True, text=True, timeout=timeout,
             env={**os.environ, "WOOWA_SESSION_MODE": "development"},

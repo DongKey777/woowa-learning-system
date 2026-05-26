@@ -6,6 +6,7 @@ but actually changes routing/retrieval before prompt composition.
 from __future__ import annotations
 
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -23,7 +24,7 @@ def _percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
-    idx = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * q)))
+    idx = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * q) - 1))
     return ordered[idx]
 
 
