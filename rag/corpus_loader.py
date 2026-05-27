@@ -1,6 +1,6 @@
 """JSON concept corpus loader + schema validator.
 
-Hypothesis (Phase 1): 3199 JSON concepts load + validate in <2s on M4.
+Hypothesis (Phase 1): current JSON concepts load + validate in <2s on M4.
 Errors return structured `(failed_path, error_message)` list — no silent skip.
 """
 from __future__ import annotations

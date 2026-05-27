@@ -33,7 +33,7 @@ def _run_ask(*args: str) -> tuple[str, str, int]:
 
 
 def test_json_mode_emits_single_json_object():
-    out, err, rc = _run_ask("Spring DI 어떻게", "--json")
+    out, err, rc = _run_ask("DI가 뭐야?", "--json")
     assert rc == 0, err
     assert out.count("\n") <= 2, "json mode must not mix multi-line markdown"
     payload = json.loads(out)
@@ -45,7 +45,7 @@ def test_json_mode_emits_single_json_object():
 
 
 def test_json_mode_contains_response_hints_citation():
-    out, _, rc = _run_ask("Spring DI 어떻게", "--json")
+    out, _, rc = _run_ask("DI가 뭐야?", "--json")
     assert rc == 0
     payload = json.loads(out)
     hints = payload["response_hints"]
@@ -68,7 +68,7 @@ def test_json_mode_tier_0_fallback_for_non_cs():
 def test_default_mode_keeps_markdown_with_comments():
     """Without --json, AI session reads markdown + leading `# response_hints:`
     comment line. This is the everyday format — not JSON-only."""
-    out, _, rc = _run_ask("Spring DI 어떻게")
+    out, _, rc = _run_ask("DI가 뭐야?")
     assert rc == 0
     lines = out.splitlines()
     assert any(l.startswith("# response_hints: ") for l in lines)
@@ -79,12 +79,12 @@ def test_default_mode_keeps_markdown_with_comments():
 def test_reformulated_query_flows_into_hints():
     out, _, rc = _run_ask(
         "그게 뭐야",
-        "--reformulated-query", "Spring DI 정의",
+        "--reformulated-query", "DI가 뭐야?",
         "--json",
     )
     assert rc == 0
     payload = json.loads(out)
     assert payload["mode"] == "cs_qa"
-    assert payload["response_hints"]["reformulated_query"] == "Spring DI 정의"
+    assert payload["response_hints"]["reformulated_query"] == "DI가 뭐야?"
     assert payload["response_hints"]["tier_downgrade"] is None
     assert payload["response_hints"]["citation_paths"]

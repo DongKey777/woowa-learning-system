@@ -7,7 +7,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from rag.corpus_loader import DEFAULT_CORPUS_DIR
 from rag.index import EMBED_DIM, IndexBuildReport, build_index, open_index
+
+
+def _concept_file_count() -> int:
+    return sum(1 for _ in DEFAULT_CORPUS_DIR.rglob("*.json"))
 
 
 def _mock_encode_factory(seed: int = 0):
@@ -23,16 +28,17 @@ def _mock_encode_factory(seed: int = 0):
 
 
 def test_build_index_round_trip(tmp_path: Path) -> None:
-    """Build index from real 3199 corpus using mock encoder, verify Lance table."""
+    """Build index from the real corpus using mock encoder, verify Lance table."""
     index_dir = tmp_path / "index"
     report = build_index(index_dir=index_dir, encode_fn=_mock_encode_factory(seed=42))
 
     assert isinstance(report, IndexBuildReport)
-    assert report.concepts_indexed == 3199
+    expected = _concept_file_count()
+    assert report.concepts_indexed == expected
     assert report.index_path == index_dir
 
     table = open_index(index_dir=index_dir)
-    assert table.count_rows() == 3199
+    assert table.count_rows() == expected
 
     rows = table.to_pandas()
     assert sorted(rows["concept_id"].unique()) == sorted(rows["concept_id"].tolist())

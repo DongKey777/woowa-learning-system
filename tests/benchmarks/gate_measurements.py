@@ -356,7 +356,7 @@ def gate_f10_backward() -> list[GateResult]:
     # for concepts the learner is ACTUALLY learning (i.e., that appear in their
     # mission code), the system can point back to the file.
     #
-    # Recall over the full 3199-concept corpus would be meaningless since
+    # Recall over the full corpus would be meaningless since
     # learner mission code naturally covers ~10-20 concepts. The functional
     # gate is: for each covered concept, does lookup return a valid file_path?
     covered_concepts = list(reverse_map.keys())

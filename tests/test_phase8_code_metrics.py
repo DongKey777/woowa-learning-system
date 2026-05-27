@@ -40,9 +40,10 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # Y13-D adds runtime corpus snapshots and latency sidecar plumbing under
     # rag/. Y13-H adds exact-query shortcut lookup. Y13-K/K3 add the direct
     # transformers encoder backend plus cold-start import/load scheduling
-    # controls without changing embedding semantics. Keep this module budget
-    # explicit while the total runtime LOC gate remains primary.
-    assert breakdown["rag"] <= 1180, f"rag {breakdown['rag']} > 1180"
+    # controls. Y14 adds a small no-index lexical fallback for first-run/test
+    # recovery without changing the dense-index hot path. Keep this module
+    # budget explicit while the total runtime LOC gate remains primary.
+    assert breakdown["rag"] <= 1240, f"rag {breakdown['rag']} > 1240"
     # core: 2500 → 6500 ceiling (Phase T-X/Y13 new modules: pr_retro, code_event,
     # junit_ingest, response_quality, learner_state, profile, session,
     # bootstrap, onboard, readiness, doctor, state_validate, registry_audit,
@@ -97,9 +98,9 @@ def test_entry_point_count() -> None:
 
 
 def test_corpus_concept_count_matches_phase0() -> None:
-    """3199 v3 concept JSONs (Phase 0b spot-check)."""
+    """Corpus expansion must not regress below the Phase 0b baseline."""
     n = sum(1 for _ in CORPUS_DIR.rglob("*.json"))
-    assert n == 3199, f"expected 3199 concepts, got {n}"
+    assert n >= 3199, f"expected at least 3199 concepts, got {n}"
 
 
 def test_corpus_size_under_60mb_baseline() -> None:

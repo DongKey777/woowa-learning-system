@@ -4,7 +4,7 @@
 
 ```
 corpus/
-├── concepts/                      # 3199 JSON entities (1 concept = 1 file)
+├── concepts/                      # 3219 JSON entities (1 concept = 1 file)
 │   ├── algorithm/*.json
 │   ├── data-structure/*.json
 │   ├── database/*.json
@@ -16,7 +16,7 @@ corpus/
 │   ├── software-engineering/*.json
 │   ├── spring/*.json
 │   └── system-design/*.json
-├── concept_graph.json             # 5MB — nodes (3199) + edges (prerequisite 5764, confusable_with N)
+├── concept_graph.json             # ~5MB — nodes (3219) + edges (prerequisite 5822, confusable_with N)
 └── schemas/
     └── concept.schema.json        # JSON schema (validation)
 ```
@@ -66,7 +66,7 @@ corpus/
     ...
   },
   "edges": {
-    "prerequisite": [["from_id", "to_id"], ...],   # 5764 pairs
+    "prerequisite": [["from_id", "to_id"], ...],   # 5822 pairs
     "confusable_with": [...],
     "extends": [...]
   },
@@ -81,7 +81,7 @@ corpus/
 ```
 state/
 ├── index/
-│   ├── concept.lance/             # Lance vector table (3199 × 1024-d float32, ~12MB)
+│   ├── concept.lance/             # Lance vector table; release index rebuilds after each 200 staged corpus docs
 │   │   ├── _versions/
 │   │   ├── data/
 │   │   └── _transactions/

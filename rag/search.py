@@ -12,7 +12,7 @@ from rag.corpus_loader import (
     load_corpus,
     load_corpus_runtime,
 )
-from rag.index import DEFAULT_INDEX_DIR, open_index
+from rag.index import DEFAULT_INDEX_DIR, TABLE_NAME, open_index
 
 if TYPE_CHECKING:
     import numpy as np
@@ -73,6 +73,19 @@ def search(
             assert loaded_corpus is not None
             shortcut_hits.extend(_walk_relations(shortcut_hits, loaded_corpus, relations_expand))
         return shortcut_hits
+
+    if (
+        encode_fn is None
+        and index_dir == DEFAULT_INDEX_DIR
+        and not (index_dir / f"{TABLE_NAME}.lance").exists()
+    ):
+        if loaded_corpus is None:
+            loaded_corpus = _load_search_corpus(corpus_dir)
+        lexical_hits = _lexical_fallback_hits(query, loaded_corpus, top_k)
+        if lexical_hits:
+            if relations_expand > 0:
+                lexical_hits.extend(_walk_relations(lexical_hits, loaded_corpus, relations_expand))
+            return lexical_hits
 
     cache_key = None
     if encode_fn is None:
@@ -217,6 +230,69 @@ def _add_exact_values(
         bucket = target.setdefault(norm, [])
         if not any(existing.concept_id == cid for existing in bucket):
             bucket.append(hit)
+
+
+def _lexical_fallback_hits(
+    query: str,
+    corpus: LoadedCorpus,
+    top_k: int,
+) -> list[SearchHit]:
+    """Small no-index fallback for tests and first-run recovery.
+
+    Dense search remains the normal path. This only runs when the Lance table
+    is absent, so `bin/ask --no-daemon` can still cite obvious corpus matches
+    before `bin/index-fetch` has completed.
+    """
+    query_norm = _norm_exact(query)
+    tokens = _lexical_tokens(query_norm)
+    if not tokens:
+        return []
+    scored: list[tuple[float, str, dict]] = []
+    for cid, concept in corpus.concepts.items():
+        title = str(concept.get("title") or "")
+        aliases = " ".join(str(v) for v in (concept.get("aliases") or []))
+        expected = " ".join(str(v) for v in (concept.get("expected_queries") or []))
+        summary = str(concept.get("summary") or "")
+        fields = (
+            (title, 3.0),
+            (aliases, 2.5),
+            (expected, 2.0),
+            (summary, 0.8),
+        )
+        score = 0.0
+        for text, weight in fields:
+            text_norm = _norm_exact(text)
+            if not text_norm:
+                continue
+            if query_norm and query_norm in text_norm:
+                score += weight * 2.0
+            field_tokens = set(_lexical_tokens(text_norm))
+            if field_tokens:
+                score += weight * len(tokens & field_tokens) / len(tokens)
+        if score > 0:
+            scored.append((score, cid, concept))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    if not scored:
+        return []
+    top_score = scored[0][0]
+    hits: list[SearchHit] = []
+    for raw_score, cid, concept in scored[:top_k]:
+        hits.append(
+            SearchHit(
+                concept_id=cid,
+                score=round(min(0.89, 0.55 + (raw_score / max(top_score, 1e-9)) * 0.34), 4),
+                category=str(concept.get("category") or ""),
+                title=str(concept.get("title") or cid),
+                source="lexical_fallback",
+            )
+        )
+    return hits
+
+
+def _lexical_tokens(text: str) -> set[str]:
+    raw_tokens = re.findall(r"[0-9a-zA-Z가-힣@+#.:-]+", text.lower())
+    stop = {"어떻게", "뭐야", "무엇", "설명", "알려줘", "차이", "정의", "처음"}
+    return {t for t in raw_tokens if len(t) >= 2 and t not in stop}
 
 
 def _walk_relations(

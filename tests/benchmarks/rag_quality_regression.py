@@ -1,6 +1,6 @@
 """F1 RAG quality regression — corpus expected_queries fixture.
 
-For each corpus concept (3199 total), the curated `expected_queries` field
+For each corpus concept, the curated `expected_queries` field
 lists canonical natural-language phrasings learners would use. Each query
 maps unambiguously to one ground-truth concept_id (the source file).
 

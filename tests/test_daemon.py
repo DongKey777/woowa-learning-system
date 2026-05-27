@@ -123,7 +123,7 @@ def test_parallel_startup_import_prime() -> None:
 def test_default_state_root_under_repo(tmp_path: Path) -> None:
     """DEFAULT_STATE_ROOT should be project-relative."""
     assert daemon.DEFAULT_STATE_ROOT.name == "state"
-    assert daemon.DEFAULT_STATE_ROOT.parent.name == "woowa-learning-system"
+    assert daemon.DEFAULT_STATE_ROOT.parent == REPO_ROOT
 
 
 def test_start_background_returns_true_when_already_running(monkeypatch, tmp_path: Path) -> None:

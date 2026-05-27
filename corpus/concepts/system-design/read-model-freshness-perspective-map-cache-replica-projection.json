@@ -1,0 +1,63 @@
+{
+  "id": "system-design/read-model-freshness-perspective-map-cache-replica-projection",
+  "title": "Read Model Freshness Perspective Map - Cache, Replica, Projection",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "이 문서는 수정 후 목록이나 조회 화면이 옛값을 보일 때 cache stale, replica lag, projection lag, read-after-write routing을 분리하는 perspective map이다. Cache는 invalidation과 TTL, replica는 primary/replica routing과 lag, projection은 비동기 read model rebuild와 watermark, client는 reload와 local state를 각각 맡는다.",
+  "body_markdown": "# Read Model Freshness Perspective Map - Cache, Replica, Projection\n\n## 이 문서가 맡는 질문\n수정은 성공했는데 목록이나 상세 화면이 옛값을 보여줄 때 원인을 네 갈래로 나눈다. Cache stale은 invalidate나 TTL 문제다. Replica lag는 write primary 후 read replica로 읽는 routing 문제다. Projection lag는 event나 batch로 만든 read model이 아직 따라오지 못한 문제다. Client stale은 browser/local state나 재요청 타이밍 문제다.\n\n## 빠른 분기\n같은 endpoint를 cache bypass로 호출하면 fresh면 cache 문제다. primary로 직접 읽으면 fresh면 replica 문제다. source table은 fresh인데 read model table이 늦으면 projection 문제다. network tab에 요청 자체가 없으면 client state 문제다.\n\n## 설계 기준\n사용자에게 즉시 반영을 보장해야 하면 read-your-writes token, primary read, synchronous update를 고려한다. eventual consistency를 허용한다면 lag budget, watermark, pending UI를 명시한다.\n\n## 실전 시나리오\n사용자가 프로필을 수정했는데 상세 화면은 즉시 바뀌고 검색 목록은 10초 뒤에 바뀐다고 하자. 상세 화면은 primary DB를 읽고, 목록은 search projection이나 read model을 읽을 수 있다. 이때 버그인지 정상 지연인지 판단하려면 freshness budget이 필요하다. “수정 후 3초 안에 목록 반영” 같은 SLO가 없다면 매번 장애인지 설명하기 어렵다.\n\n```text\ntimeline 예시\nT0: command DB commit\nT0+50ms: 상세 조회 primary DB에서 새 값 확인\nT0+500ms: outbox event 발행\nT0+2s: projection worker 반영\nT0+3s: 목록 조회에서 새 값 확인\n```\n\n## 다음 행동\n- 읽는 저장소가 primary DB, replica, cache, projection 중 무엇인지 API별로 표시한다.\n- watermark, last_applied_event_id, replica lag, cache age 같은 관측값을 붙인다.\n- read-your-writes가 필요한 화면에는 token, primary read, cache bypass 같은 보장을 별도 설계한다.\n\n## 확인 질문\n이 화면은 즉시 일관성이 필요한가, 아니면 몇 초 지연을 사용자 경험과 contract로 허용할 수 있는가?\n\n## CS 배경: consistency model과 read-your-writes\n분산 시스템에서는 모든 replica와 projection이 즉시 같은 값을 보기는 어렵다. Strong consistency는 읽기가 최신 write를 반영하도록 보장하지만 latency와 availability 비용이 커질 수 있다. Eventual consistency는 시간이 지나면 수렴하지만 그 사이 stale read를 허용한다. Read-your-writes는 적어도 자신이 쓴 값은 이후 읽기에서 보이게 하는 session guarantee다.\n\nProjection은 write model을 읽기 편한 형태로 비동기 변환한 것이다. 이때 watermark, offset, event id는 “어디까지 반영됐는가”를 나타내는 CS적 clock 역할을 한다. Freshness 문제는 단순 버그가 아니라 consistency contract가 명시되지 않았을 때 더 크게 보인다.\n\n## 깊게 볼 포인트\nFreshness는 단일 수치가 아니라 관찰자별 보장이다. 작성자 본인에게는 read-your-writes가 필요하지만, 다른 사용자에게는 몇 초 지연이 허용될 수 있다. Admin 화면은 primary read를 요구하고, public 목록은 projection lag를 허용할 수 있다. 이 차이를 문서화하지 않으면 모든 stale read가 버그처럼 보인다. CS적으로는 logical clock과 monotonicity도 중요하다. event id나 version을 response에 포함하면 client가 “내가 본 것보다 오래된 상태”를 감지할 수 있다. Projection이 역순 event를 처리하지 않도록 ordering key와 idempotent apply도 필요하다.\n\n## 추가 예시\n주문 완료 직후 “내 주문 목록”은 primary read나 read-your-writes token을 써서 새 주문을 보여주고, 전체 인기 상품 목록은 projection 지연을 허용할 수 있다. 두 화면의 freshness 요구가 다른데 같은 cache 정책을 쓰면 한쪽은 느려지고 다른 쪽은 낡아진다. 화면별 freshness budget을 정하면 cache TTL, replica read, projection update 주기를 합리적으로 고를 수 있다.\n",
+  "aliases": [
+    "read model freshness perspective map",
+    "cache replica projection stale read",
+    "read after write stale list",
+    "projection lag replica lag cache stale",
+    "수정 후 옛값 목록",
+    "read model freshness",
+    "cache stale replica lag projection lag",
+    "read-your-writes routing",
+    "목록 화면 옛날 데이터",
+    "projection watermark lag"
+  ],
+  "expected_queries": [
+    "수정했는데 목록 화면에는 옛날 데이터가 보이면 cache replica projection 중 뭘 봐야 해?",
+    "read-after-write 문제를 cache stale과 replica lag와 projection lag로 나눠줘",
+    "DB에는 반영됐는데 read model이 늦게 따라오는 문제를 어떻게 설명해?",
+    "수정 직후 조회를 primary로 보내야 하는 기준이 뭐야?",
+    "projection lag를 사용자에게 어떻게 노출하거나 숨겨야 해?",
+    "목록 stale 문제를 네트워크 캐시 문제로만 보면 안 되는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "source table은 fresh인데 화면용 read model은 늦게 갱신된다",
+    "primary DB에는 반영됐지만 replica에서 옛값을 읽는다",
+    "browser cache와 server cache와 projection lag를 한 원인으로 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/projection-lag-user-facing-state-router",
+      "system-design/stale-after-write-cache-replica-symptom-router",
+      "database/read-your-writes-vs-monotonic-reads-vs-causal-consistency-decision-guide"
+    ],
+    "next_docs": [
+      "system-design/mixed-cache-replica-freshness-bridge",
+      "database/cache-replica-split-read-inconsistency",
+      "system-design/read-model-rebuild-backfill-playbook"
+    ],
+    "confusable_with": [
+      "system-design/stale-after-write-cache-replica-symptom-router",
+      "database/cache-replica-split-read-inconsistency",
+      "system-design/projection-lag-user-facing-state-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch1"
+      }
+    ]
+  }
+}

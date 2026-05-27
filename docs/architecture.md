@@ -171,8 +171,8 @@ Historical Phase M in-process cold/warm numbers are superseded by Y13 daemon-lay
 - **Append-heavy + queryable** → SQLite (`mastery_graph.sqlite`)
 - **Read-mostly small** → JSON (`review_anchors.json`, `mission_patterns.json`, `drill_pending.json`, `drill_due.json`)
 - **Large columnar** → Parquet (`cross_crew_review_graph.parquet`)
-- **Immutable corpus** → JSON adjacency (`concept_graph.json` 3199 nodes / 5764 prereq edges / 5MB)
-- **Dense embed index** → Lance (`state/index/concept.lance` ~12MB, 3199 × 1024-d float32)
+- **Immutable corpus** → JSON adjacency (`concept_graph.json` 3219 nodes / 5822 prereq edges / ~5MB)
+- **Dense embed index** → Lance (`state/index/concept.lance` ~12MB release artifact; rebuild after each 200 staged corpus docs)
 - **Append-only event log** → JSONL (`history.jsonl`)
 
 ## 10. LOC budget (plan §D-I)

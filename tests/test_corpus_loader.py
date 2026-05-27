@@ -17,9 +17,12 @@ from rag.corpus_loader import (
 
 
 def test_load_real_corpus_strict() -> None:
-    """Production corpus must load strict + report 3199 concepts + 0 failures."""
+    """Production corpus must load strict + every concept file + 0 failures."""
     loaded = load_corpus(strict=True)
-    assert len(loaded.concepts) == 3199, f"expected 3199 concepts, got {len(loaded.concepts)}"
+    expected = sum(1 for _ in DEFAULT_CORPUS_DIR.rglob("*.json"))
+    assert len(loaded.concepts) == expected, (
+        f"expected {expected} concepts, got {len(loaded.concepts)}"
+    )
     assert loaded.failures == []
     # Phase 0 spot-check 5 categories present
     cats = loaded.categories
@@ -92,7 +95,7 @@ def test_corpus_snapshot_round_trip(tmp_path: Path) -> None:
     stats = write_corpus_snapshot(corpus, path)
     loaded = load_corpus_snapshot(path)
 
-    assert stats["concepts"] == 3199
+    assert stats["concepts"] == len(corpus.concepts)
     assert loaded is not None
     assert loaded.failures == []
     assert loaded.concepts["spring/ioc-di-basics"]["title"]

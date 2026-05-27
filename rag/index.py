@@ -1,7 +1,7 @@
 """Lance concept dense index — build + load.
 
 Hypothesis (Phase 2):
-- 3199 concepts × 1024-d float32 = 13.1MB raw vectors → Lance index ≤16MB
+- Current corpus × 1024-d float32 vectors should keep Lance index ≤50MB
 - Index build time on RunPod H100 warm BGE-M3: <5min
 - Index build time on M4 warm BGE-M3: <30min (encode dominates)
 

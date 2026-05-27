@@ -37,7 +37,7 @@ def _det_batch_encode(seed: int):
 
 @pytest.fixture(scope="module")
 def real_index(tmp_path_factory):
-    """Build one Lance index on the real 3199-concept corpus, shared by tests."""
+    """Build one Lance index on the real corpus, shared by tests."""
     index_dir = tmp_path_factory.mktemp("index_phase3")
     build_index(index_dir=index_dir, encode_fn=_det_batch_encode(seed=42))
     return index_dir
