@@ -134,7 +134,7 @@ bin/index-fetch [--tag paradigm-v2-index-v1.0.0] [--force] [--expected-sha256 <h
 
 의존: `gh` CLI + GitHub 인증 (`gh auth login`)
 
-학습자 onboarding의 Step 3에 해당. 소요 ~15초 (12.7MB).
+학습자 onboarding의 Step 3에 해당. 소요 ~15초 (release별 약 13-18MB).
 
 ---
 
@@ -153,11 +153,30 @@ bin/corpus-build [--corpus-dir corpus/concepts] [--index-dir state/index]
 
 Build 후 publish 흐름:
 ```bash
-tar --use-compress-program='zstd -19' -cf /tmp/paradigm-v2-index-vX.Y.Z.tar.zst -C state index
+bin/index-pack --archive /tmp/paradigm-v2-index-vX.Y.Z.tar.zst --force
+bin/index-pack --archive /tmp/paradigm-v2-index-vX.Y.Z.tar.zst --verify-only
 gh release create paradigm-v2-index-vX.Y.Z /tmp/paradigm-v2-index-vX.Y.Z.tar.zst \
     --title "paradigm-v2 Lance index vX.Y.Z" --notes "..."
 # 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-vX.Y.Z 로 업데이트
 ```
+
+---
+
+## `bin/index-pack` (maintainer only)
+
+현재 `state/index/`를 self-contained release archive로 패키징하고 검증한다. archive 안에는 `concepts.lance/`, `manifest.json`, `corpus_snapshot.json`, `lexical_fusion_sidecar.json`가 모두 들어가야 한다.
+
+```bash
+bin/index-pack --force
+bin/index-pack --verify-only
+```
+
+검증 항목:
+- archive manifest의 `dense_corpus_sha256`가 현재 `state/index/manifest.json`과 동일
+- archive manifest의 `full_corpus_sha256`가 현재 `state/index/manifest.json`과 동일
+- runtime sidecar 2개가 archive에 포함됨
+
+K18 local archive: `state/index.tar.zst`, **17.9MB**, SHA256 `24cc838c949078f767fd41afd7cc50fd865e2a4fb387b2dfcb6cc39ee793bec6`.
 
 ---
 
@@ -310,8 +329,8 @@ bin/phase9-gate
 | V | 12 | 10/10 |
 | W | 12 | 12/12 |
 | X | 11 | 11/11 |
-| **합계** | **52** | **50/50 bench + 28/28 unit** |
+| **합계** | **52** | **50/50 bench + 28/28 unit + release archive gate** |
 
-Total bin/* in paradigm-v2: **62 entries** (legacy 75 - 17 reranker probes = 58 non-probe; paradigm-v2 62 = 100% non-probe parity + 4 improvements).
+Total bin/* in paradigm-v2: **64 entries** (legacy 75 - 17 reranker probes = 58 non-probe; paradigm-v2 64 = 100% non-probe parity + 6 improvements).
 
 Full regression via meta-runner: `python3 tests/benchmarks/phase_y_all_benches.py` → 14/14 PASS in ~20s.

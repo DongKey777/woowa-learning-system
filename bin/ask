@@ -1,4 +1,83 @@
-#!/usr/bin/env python3
+#!/bin/sh
+''':'
+# Fast executable path: avoid Python startup when the daemon is already warm.
+# Direct `python3 bin/ask ...` still runs the Python implementation below.
+_ask_json_safe() {
+  case "$1" in
+    *\"*|*\\*|*$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+_ask_json_value() {
+  if [ -z "$1" ]; then
+    printf 'null'
+  else
+    printf '"%s"' "$1"
+  fi
+}
+
+_ask_fast() {
+  [ "$#" -gt 0 ] || return 1
+  case "$1" in -h|--help|-*) return 1 ;; esac
+  command -v nc >/dev/null 2>&1 || return 1
+
+  prompt="$1"
+  repo=""
+  learner_id="default"
+  state_root=""
+  reformulated_query=""
+  json_mode=0
+  json_route=0
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --repo) [ "$#" -ge 2 ] || return 1; repo="$2"; shift 2 ;;
+      --learner-id) [ "$#" -ge 2 ] || return 1; learner_id="$2"; shift 2 ;;
+      --state-root) [ "$#" -ge 2 ] || return 1; state_root="$2"; shift 2 ;;
+      --reformulated-query) [ "$#" -ge 2 ] || return 1; reformulated_query="$2"; shift 2 ;;
+      --json) json_mode=1; shift ;;
+      --json-route) json_route=1; shift ;;
+      --no-daemon) return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+
+  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
+    _ask_json_safe "$value" || return 1
+  done
+
+  if [ -n "$state_root" ]; then
+    sock_path="$state_root/rag-daemon.sock"
+  else
+    script_dir="${0%/*}"
+    [ "$script_dir" = "$0" ] && script_dir="."
+    repo_root="$(cd "$script_dir/.." 2>/dev/null && pwd)" || return 1
+    sock_path="$repo_root/state/rag-daemon.sock"
+  fi
+  [ -S "$sock_path" ] || return 1
+
+  if [ "$json_mode" -eq 1 ]; then
+    action="ask"
+  else
+    action="ask_text"
+  fi
+  mode="${WOOWA_SESSION_MODE:-learning}"
+  reformulation="${WOOWA_REFORMULATE:-}"
+  payload=$(printf '{"action":"%s","query":"%s","repo":%s,"learner_id":"%s","mode":"%s","reformulation":%s,"json_route":%s,"reformulated_query":%s}\n' \
+    "$action" "$prompt" "$(_ask_json_value "$repo")" "$learner_id" "$mode" \
+    "$(_ask_json_value "$reformulation")" "$json_route" "$(_ask_json_value "$reformulated_query")")
+  response=$(printf '%s' "$payload" | nc -U -w 30 "$sock_path" 2>/dev/null) || return 1
+  [ -n "$response" ] || return 1
+  printf '%s\n' "$response"
+}
+
+if _ask_fast "$@"; then
+  exit 0
+fi
+
+exec python3 -S "$0" "$@"
+':'''
 """bin/ask — thin socket client for daemon ask. Inline argv parse (no argparse)
 for sub-25ms cold-start. Falls back to in-process pipeline when daemon down.
 """
@@ -53,12 +132,13 @@ def daemon_ask(args):
         sock.settimeout(TIMEOUT_S)
         sock.connect(sock_path)
         req_payload = {"action": "ask", "query": args["prompt"],
-                       "repo": args["repo"], "learner_id": args["learner_id"]}
+                       "repo": args["repo"], "learner_id": args["learner_id"],
+                       "mode": os.environ.get("WOOWA_SESSION_MODE", "learning"),
+                       "reformulation": os.environ.get("WOOWA_REFORMULATE")}
         if args.get("reformulated_query"):
             req_payload["reformulated_query"] = args["reformulated_query"]
         req = json.dumps(req_payload) + "\n"
         sock.sendall(req.encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             chunk = sock.recv(65536)
@@ -106,21 +186,41 @@ def main(argv=None):
             return 0
 
     # Fallback: in-process (cold path, heavy imports)
+    import site  # noqa: F401, E402  # enable installed deps only off the daemon fast path
     sys.path.insert(0, REPO_ROOT)
     from pathlib import Path  # noqa: E402
     from core.coach import compose  # noqa: E402
     from core.lazy_loader import load  # noqa: E402
-    from core.router import route  # noqa: E402
+    from core.reformulate import reformulation_enabled, select_reformulation  # noqa: E402
+    from core.router import route, strip_override_tokens  # noqa: E402
     from core.state import DEFAULT_STATE_ROOT, load_profile, read_history  # noqa: E402
+    from core.trigger import (  # noqa: E402
+        load_drill_history,
+        load_pending_triggers,
+        load_profile_payload,
+        select_cognitive_trigger,
+        write_pending_triggers_atomic,
+    )
     sr = Path(args["state_root"]) if args["state_root"] else DEFAULT_STATE_ROOT
+    session_mode = os.environ.get("WOOWA_SESSION_MODE", "learning")
 
     profile = load_profile(args["learner_id"], state_root=sr)
+    recent = read_history(sr, tail=20)
+    reformulation = select_reformulation(
+        prompt=args["prompt"],
+        explicit_reformulated_query=args.get("reformulated_query"),
+        history=recent,
+        repo=args["repo"],
+        enabled=reformulation_enabled(),
+    )
+    reformulated_query = (
+        reformulation.reformulated_query if reformulation else ""
+    )
     decision = route(
         args["prompt"], repo=args["repo"],
         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
         pending_drill=profile.pending_triggers.get("review_drill"),
     )
-    reformulated_query = (args.get("reformulated_query") or "").strip()
     if decision.mode == "tier_0_fallback" and reformulated_query:
         decision = route(
             reformulated_query, repo=args["repo"],
@@ -132,7 +232,7 @@ def main(argv=None):
         print("ERROR: --repo required for retro mode", file=sys.stderr)
         return 2
 
-    retrieval_query = reformulated_query or args["prompt"]
+    retrieval_query = reformulated_query or strip_override_tokens(args["prompt"])
     artifacts = load(
         decision,
         repo=args["repo"],
@@ -140,9 +240,79 @@ def main(argv=None):
         query=retrieval_query,
         learner_profile=profile,
     )
+    if decision.mode == "drill":
+        from core.drill import build_offer_if_due  # noqa: E402
+
+        offer = build_offer_if_due(
+            learner_id=args["learner_id"],
+            state_root=sr,
+            uncertain_concept_ids=profile.uncertain_concepts or [],
+        )
+        if offer:
+            artifacts["drill_offer"] = {
+                "concept_id": offer.concept_id,
+                "question": offer.question,
+                "expected_terms": offer.expected_terms,
+                "source": offer.source,
+            }
     if reformulated_query:
         artifacts["reformulated_query"] = reformulated_query
-    recent = read_history(sr, tail=20)
+    if reformulation:
+        artifacts["reformulation_trace"] = reformulation.to_dict()
+    cognitive_trigger = (
+        select_cognitive_trigger(
+            history=recent,
+            profile=load_profile_payload(sr, repo=args["repo"]),
+            drill_pending=profile.pending_triggers.get("review_drill"),
+            drill_history=load_drill_history(sr) or profile.drill_due,
+            intent={"detected_intent": decision.mode},
+            pending_triggers=profile.pending_triggers,
+        )
+        if session_mode not in ("development", "test")
+        else {"trigger_type": "none"}
+    )
+    if cognitive_trigger.get("trigger_type") == "self_assessment":
+        from datetime import datetime, timedelta, timezone  # noqa: E402
+
+        pending = load_pending_triggers(sr)
+        trigger_to_store = dict(cognitive_trigger)
+        issued_at = datetime.now(timezone.utc)
+        trigger_to_store.setdefault("issued_at", issued_at.isoformat())
+        trigger_to_store.setdefault(
+            "expires_at", (issued_at + timedelta(hours=24)).isoformat()
+        )
+        pending["self_assessment"] = trigger_to_store
+        write_pending_triggers_atomic(pending, sr)
+        artifacts["cognitive_trigger"] = trigger_to_store
+    elif cognitive_trigger.get("trigger_type") == "review_drill":
+        from core.drill import build_review_offer_if_due  # noqa: E402
+
+        offer = build_review_offer_if_due(
+            learner_id=args["learner_id"],
+            state_root=sr,
+        )
+        if offer:
+            cognitive_trigger = {
+                **cognitive_trigger,
+                "payload": {
+                    **(cognitive_trigger.get("payload") or {}),
+                    "concept_id": offer.concept_id,
+                    "drill_session_id": offer.drill_session_id,
+                },
+                "markdown": (
+                    "## 복습 드릴\n"
+                    f"- 이전 드릴을 다시 풀어볼 차례야: {offer.question}"
+                ),
+            }
+            artifacts["drill_offer"] = {
+                "concept_id": offer.concept_id,
+                "question": offer.question,
+                "expected_terms": offer.expected_terms,
+                "source": offer.source,
+            }
+        artifacts["cognitive_trigger"] = cognitive_trigger
+    elif cognitive_trigger.get("trigger_type") == "follow_up":
+        artifacts["cognitive_trigger"] = cognitive_trigger
 
     # Phase Y11 cold path: no event_id / no history append, so
     # response_quality_hint is None. The AI session can still read

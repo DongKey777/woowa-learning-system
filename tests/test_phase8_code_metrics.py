@@ -37,13 +37,19 @@ def test_runtime_loc_under_paradigm_v2_budget() -> None:
 def test_per_module_loc_breakdown_within_plan() -> None:
     """Plan §T-X — per-module budget tracks 51-wrapper expansion."""
     breakdown = {d: _count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS}
-    assert breakdown["rag"] <= 800, f"rag {breakdown['rag']} > 800"
-    # core: 2500 → 5000 ceiling (Phase T-X new modules: pr_retro, code_event,
+    # Y13-D adds runtime corpus snapshots and latency sidecar plumbing under
+    # rag/. Y13-H adds exact-query shortcut lookup. Y13-K/K3 add the direct
+    # transformers encoder backend plus cold-start import/load scheduling
+    # controls without changing embedding semantics. Keep this module budget
+    # explicit while the total runtime LOC gate remains primary.
+    assert breakdown["rag"] <= 1180, f"rag {breakdown['rag']} > 1180"
+    # core: 2500 → 6500 ceiling (Phase T-X/Y13 new modules: pr_retro, code_event,
     # junit_ingest, response_quality, learner_state, profile, session,
     # bootstrap, onboard, readiness, doctor, state_validate, registry_audit,
     # mission_map, rag_rewrite, route_fallback, profile_admin, reviewer_profile,
-    # index_metadata, etc.)
-    assert breakdown["core"] <= 5000, f"core {breakdown['core']} > 5000 (Phase T-X budget)"
+    # index_metadata, cognitive trigger FSM, auto reformulation, unified profile
+    # rebuild, etc.)
+    assert breakdown["core"] <= 6500, f"core {breakdown['core']} > 6500 (Phase T-X/Y13 budget)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"
@@ -56,7 +62,7 @@ def test_entry_point_count() -> None:
     maintenance = {"corpus-build", "corpus-curate", "eval-compare", "learn-event",
                    "graph-build", "phase9-gate",
                    "mission-patterns-build", "cross-crew-build",
-                   "index-fetch",
+                   "index-fetch", "index-pack",
                    # Phase T new wrappers
                    "learn-pr-retro", "learn-record-code", "learn-test",
                    "learn-response-quality", "assess-learner-state",

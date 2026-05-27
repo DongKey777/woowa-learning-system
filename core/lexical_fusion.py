@@ -5,12 +5,20 @@ The daemon injects this as a rerank_fn when it wants lexical recall.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import time
+from bisect import bisect_left
+from pathlib import Path
 from typing import Callable
 
 from rag.corpus_loader import LoadedCorpus
 from rag.search import SearchHit
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_LEXICAL_SIDECAR_PATH = REPO_ROOT / "state" / "index" / "lexical_fusion_sidecar.json"
+LEXICAL_SIDECAR_VERSION = 1
 RRF_K = 60
 _TOKEN_RE = re.compile(r"@[a-z0-9_]+|[a-z0-9][a-z0-9_.-]*|[가-힣]{2,}", re.IGNORECASE)
 _STOPWORDS = {
@@ -18,7 +26,8 @@ _STOPWORDS = {
     "이게", "이건", "그게", "그건", "뭐야", "무엇", "차이", "정리", "설명",
     "알려줘", "왜", "언제", "어디", "어떻게", "하는", "되는", "기초",
 }
-_LEXICAL_CACHE: dict[int, tuple[dict, ...]] = {}
+_LEXICAL_CACHE: dict[int, tuple[LoadedCorpus, tuple[dict, ...]]] = {}
+_LEXICAL_INDEX_CACHE: dict[int, tuple[LoadedCorpus, dict[str, dict]]] = {}
 _CATEGORY_HINTS = {
     "spring": ("spring", "스프링", "@transactional", "transactional", "bean", "mvc", "aop"),
     "database": ("database", "db", "mvcc", "replica", "lock", "pool", "sql"),
@@ -28,13 +37,8 @@ _SPRING_DESIGN_BLOCKERS = (
     "factory", "strategy", "template", "registry", "pattern",
     "팩토리", "전략", "템플릿", "패턴",
 )
-_CANONICAL_PROMOTION_IDS = {
-    "spring/ioc-di-basics",
-    "spring/transactional-basics",
-}
-_SPECIALIZED_MARKERS = (
-    "bridge", "router", "drill", "interview", "decision-guide", "chooser",
-)
+_CANONICAL_PROMOTION_IDS = {"spring/ioc-di-basics", "spring/transactional-basics"}
+_SPECIALIZED_MARKERS = ("bridge", "router", "drill", "interview", "decision-guide", "chooser")
 _INTRO_QUERY_MARKERS = (
     "뭐야", "무슨 의미", "기초", "처음", "입문", "큰 그림", "단계 알려줘",
     "what is", "basics", "primer",
@@ -42,6 +46,9 @@ _INTRO_QUERY_MARKERS = (
 _COMPARISON_QUERY_MARKERS = (
     " vs ", "vs", "차이", "비교", "구분", "대신", "보다", "다른", "같은 거", "분리",
 )
+_COMPARISON_TOKEN_MARKERS = {"strategy", "factory", "decorator", "proxy", "template", "method"}
+_MISSION_SCOPE_TERMS = ("roomescape", "룸이스케이프", "lotto", "로또", "shopping-cart", "장바구니", "baseball", "야구", "blackjack", "미션")
+_ENTRY_SET_FIELDS = ("expected_query_norms", "title_tokens", "strong_tokens", "body_tokens")
 
 
 def make_lexical_fusion_fn(
@@ -55,9 +62,11 @@ def make_lexical_fusion_fn(
         fused = _fuse_lexical(hits, _lexical_candidates(query, corpus, expand))
         promoted = _promote_hinted_category(query, fused)
         promoted = _promote_canonical_candidate(promoted)
+        promoted = _promote_strong_lexical_candidate(query, promoted, corpus)
         promoted = _promote_exact_expected_query(promoted, _exact_expected_candidates(query, corpus))
         return _refine_confusable_order(query, promoted, corpus)
 
+    _rerank.search_cache_key = ("lexical_fusion", id(corpus), expand)
     return _rerank
 
 
@@ -76,7 +85,37 @@ def _norm_exact(text: str) -> str:
 def _lexical_entries(corpus_key: int, corpus: LoadedCorpus) -> tuple[dict, ...]:
     cached = _LEXICAL_CACHE.get(corpus_key)
     if cached is not None:
-        return cached
+        cached_corpus, cached_entries = cached
+        if cached_corpus is corpus:
+            return cached_entries
+        _LEXICAL_CACHE.pop(corpus_key, None)
+        _LEXICAL_INDEX_CACHE.pop(corpus_key, None)
+    loaded = load_lexical_sidecar(DEFAULT_LEXICAL_SIDECAR_PATH, corpus)
+    if loaded is not None:
+        _LEXICAL_CACHE[corpus_key] = (corpus, loaded)
+        return loaded
+    built = _build_lexical_entries(corpus)
+    _LEXICAL_CACHE[corpus_key] = (corpus, built)
+    return built
+
+
+def _lexical_entry_index(corpus: LoadedCorpus) -> dict[str, dict]:
+    corpus_key = id(corpus)
+    cached = _LEXICAL_INDEX_CACHE.get(corpus_key)
+    if cached is not None:
+        cached_corpus, cached_index = cached
+        if cached_corpus is corpus:
+            return cached_index
+        _LEXICAL_INDEX_CACHE.pop(corpus_key, None)
+    index = {
+        str(entry["concept_id"]): entry
+        for entry in _lexical_entries(corpus_key, corpus)
+    }
+    _LEXICAL_INDEX_CACHE[corpus_key] = (corpus, index)
+    return index
+
+
+def _build_lexical_entries(corpus: LoadedCorpus) -> tuple[dict, ...]:
     entries: list[dict] = []
     for cid, concept in corpus.concepts.items():
         title = concept.get("title", "")
@@ -103,9 +142,130 @@ def _lexical_entries(corpus_key: int, corpus: LoadedCorpus) -> tuple[dict, ...]:
             "strong_tokens": _tokens(strong_text),
             "body_tokens": _tokens(body_text),
         })
-    built = tuple(entries)
-    _LEXICAL_CACHE[corpus_key] = built
-    return built
+    return tuple(entries)
+
+
+def _corpus_fingerprint(corpus: LoadedCorpus) -> str:
+    h = hashlib.sha256()
+    for cid in sorted(corpus.concepts):
+        concept = corpus.concepts[cid]
+        h.update(cid.encode("utf-8"))
+        for field in ("title", "category", "level", "summary", "body_markdown"):
+            h.update(b"\0")
+            h.update(str(concept.get(field) or "").encode("utf-8"))
+        for field in ("aliases", "expected_queries"):
+            h.update(b"\0")
+            for item in concept.get(field) or []:
+                h.update(str(item).encode("utf-8"))
+                h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def _entries_to_jsonable(entries: tuple[dict, ...]) -> list[dict]:
+    rows: list[dict] = []
+    for entry in entries:
+        row = dict(entry)
+        for field in _ENTRY_SET_FIELDS:
+            row[field] = sorted(row.get(field) or [])
+        rows.append(row)
+    return rows
+
+
+def _entries_from_jsonable(rows: list[dict]) -> tuple[dict, ...]:
+    entries: list[dict] = []
+    for row in rows:
+        entry = dict(row)
+        for field in _ENTRY_SET_FIELDS:
+            entry[field] = entry.get(field) or []
+        entries.append(entry)
+    return tuple(entries)
+
+
+def load_lexical_sidecar(
+    path: Path = DEFAULT_LEXICAL_SIDECAR_PATH,
+    corpus: LoadedCorpus | None = None,
+) -> tuple[dict, ...] | None:
+    if corpus is None or not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("version") != LEXICAL_SIDECAR_VERSION:
+        return None
+    if payload.get("concept_count") != len(corpus.concepts):
+        return None
+    if payload.get("corpus_sha256") != _corpus_fingerprint(corpus):
+        return None
+    rows = payload.get("entries")
+    if not isinstance(rows, list):
+        return None
+    return _entries_from_jsonable(rows)
+
+
+def write_lexical_sidecar(
+    corpus: LoadedCorpus,
+    path: Path = DEFAULT_LEXICAL_SIDECAR_PATH,
+    entries: tuple[dict, ...] | None = None,
+) -> dict:
+    started = time.perf_counter()
+    built = entries if entries is not None else _build_lexical_entries(corpus)
+    payload = {
+        "version": LEXICAL_SIDECAR_VERSION,
+        "built_at": time.time(),
+        "corpus_sha256": _corpus_fingerprint(corpus),
+        "concept_count": len(corpus.concepts),
+        "entries": _entries_to_jsonable(built),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+    _LEXICAL_CACHE[id(corpus)] = (corpus, built)
+    _LEXICAL_INDEX_CACHE[id(corpus)] = (
+        corpus,
+        {str(entry["concept_id"]): entry for entry in built},
+    )
+    return {
+        "source": "built",
+        "path": str(path),
+        "entries": len(built),
+        "size_bytes": path.stat().st_size,
+        "ms": round((time.perf_counter() - started) * 1000, 1),
+    }
+
+
+def preload_lexical_entries(
+    corpus: LoadedCorpus,
+    path: Path = DEFAULT_LEXICAL_SIDECAR_PATH,
+    *,
+    build_if_missing: bool = True,
+) -> dict:
+    started = time.perf_counter()
+    loaded = load_lexical_sidecar(path, corpus)
+    if loaded is not None:
+        _LEXICAL_CACHE[id(corpus)] = (corpus, loaded)
+        _LEXICAL_INDEX_CACHE[id(corpus)] = (
+            corpus,
+            {str(entry["concept_id"]): entry for entry in loaded},
+        )
+        return {
+            "source": "sidecar",
+            "path": str(path),
+            "entries": len(loaded),
+            "size_bytes": path.stat().st_size,
+            "ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+    if not build_if_missing:
+        return {
+            "source": "missing",
+            "path": str(path),
+            "entries": 0,
+            "size_bytes": 0,
+            "ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+    built = _build_lexical_entries(corpus)
+    return write_lexical_sidecar(corpus, path, entries=built)
 
 
 def _lexical_candidates(query: str, corpus: LoadedCorpus, limit: int) -> list[SearchHit]:
@@ -114,10 +274,10 @@ def _lexical_candidates(query: str, corpus: LoadedCorpus, limit: int) -> list[Se
         return []
     scored: list[tuple[float, dict]] = []
     for entry in _lexical_entries(id(corpus), corpus):
-        title_hits = query_tokens & entry["title_tokens"]
-        strong_hits = query_tokens & entry["strong_tokens"]
-        body_hits = query_tokens & entry["body_tokens"]
-        score = len(title_hits) * 4.0 + len(strong_hits) * 2.5 + len(body_hits) * 0.75
+        title_hits = _overlap_count(query_tokens, entry["title_tokens"])
+        strong_hits = _overlap_count(query_tokens, entry["strong_tokens"])
+        body_hits = _overlap_count(query_tokens, entry["body_tokens"])
+        score = title_hits * 4.0 + strong_hits * 2.5 + body_hits * 0.75
         if score > 0:
             scored.append((score, entry))
     if not scored:
@@ -134,6 +294,21 @@ def _lexical_candidates(query: str, corpus: LoadedCorpus, limit: int) -> list[Se
         )
         for score, entry in scored[:limit]
     ]
+
+
+def _overlap_count(query_tokens: set[str], candidate_tokens: object) -> int:
+    if not candidate_tokens:
+        return 0
+    if isinstance(candidate_tokens, set):
+        return len(query_tokens & candidate_tokens)
+    if isinstance(candidate_tokens, list):
+        return sum(1 for token in query_tokens if _sorted_contains(candidate_tokens, token))
+    return sum(1 for token in query_tokens if token in candidate_tokens)
+
+
+def _sorted_contains(items: list[str], token: str) -> bool:
+    idx = bisect_left(items, token)
+    return idx < len(items) and items[idx] == token
 
 
 def _exact_expected_candidates(query: str, corpus: LoadedCorpus) -> list[SearchHit]:
@@ -215,6 +390,32 @@ def _promote_canonical_candidate(hits: list[SearchHit]) -> list[SearchHit]:
     return hits
 
 
+def _promote_strong_lexical_candidate(
+    query: str,
+    hits: list[SearchHit],
+    corpus: LoadedCorpus,
+) -> list[SearchHit]:
+    if len(hits) < 2:
+        return hits
+    query_tokens = _tokens(query)
+    if not query_tokens:
+        return hits
+    entry_by_id = _lexical_entry_index(corpus)
+    head_entry = entry_by_id.get(hits[0].concept_id)
+    head_strong = _overlap_count(query_tokens, (head_entry or {}).get("strong_tokens"))
+    if head_strong > 1:
+        return hits
+    for idx, hit in enumerate(hits[1:5], start=1):
+        entry = entry_by_id.get(hit.concept_id)
+        if not entry:
+            continue
+        strong_hits = _overlap_count(query_tokens, entry.get("strong_tokens"))
+        title_hits = _overlap_count(query_tokens, entry.get("title_tokens"))
+        if strong_hits >= 3 and title_hits >= 2:
+            return [hit] + hits[:idx] + hits[idx + 1:]
+    return hits
+
+
 def _refine_confusable_order(
     query: str,
     hits: list[SearchHit],
@@ -234,6 +435,8 @@ def _refine_confusable_order(
         concept = corpus.concepts.get(hit.concept_id)
         if concept is None:
             neutral.append(hit)
+        elif _is_unscoped_mission_bridge(query, hit.concept_id):
+            continue
         elif _should_promote_comparison_neighbor(query, head, head_concept, hit, concept):
             promoted.append(hit)
         elif _should_demote_neighbor(query, head, head_concept, hit, concept):
@@ -327,7 +530,7 @@ def _is_intro_query(query: str) -> bool:
 
 def _is_comparison_query(query: str) -> bool:
     ql = f" {query.lower()} "
-    return any(marker in ql for marker in _COMPARISON_QUERY_MARKERS)
+    return any(marker in ql for marker in _COMPARISON_QUERY_MARKERS) or len(_tokens(query) & _COMPARISON_TOKEN_MARKERS) >= 2
 
 
 def _is_comparison_concept(concept_id: str, concept: dict) -> bool:
@@ -369,10 +572,12 @@ def _is_routing_head(concept_id: str) -> bool:
 
 
 def _is_mission_bridge_concept(concept_id: str) -> bool:
-    return any(
-        marker in concept_id
-        for marker in ("-bridge", "roomescape", "lotto", "shopping-cart", "baseball", "blackjack")
-    )
+    return any(marker in concept_id for marker in ("-bridge", "roomescape", "lotto", "shopping-cart", "baseball", "blackjack"))
+
+
+def _is_unscoped_mission_bridge(query: str, concept_id: str) -> bool:
+    ql = query.lower()
+    return _is_comparison_query(query) and _is_mission_bridge_concept(concept_id) and not any(term in ql for term in _MISSION_SCOPE_TERMS)
 
 
 def _fuse_lexical(hits: list[SearchHit], lexical_hits: list[SearchHit]) -> list[SearchHit]:

@@ -69,7 +69,6 @@ def daemon_ask(prompt: str, repo: str | None = None,
         if mode:
             req["mode"] = mode
         sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             chunk = sock.recv(65536)
@@ -185,29 +184,33 @@ def s3_personalization_adaptive() -> ScenarioResult:
 # ── S4 override keywords ──────────────────────────────────────────────────
 
 def s4_override_keywords() -> ScenarioResult:
-    """v2 doesn't currently have explicit override keywords (legacy does).
-    Test: same prompt with override prefix produces same/different mode?
-    Goal: document current behavior (gap audit).
-    """
-    base, _, _ = daemon_ask("DI가 뭐야")
-    rag_deep, _, _ = daemon_ask("RAG로 깊게 DI 설명")
-    just_answer, _, _ = daemon_ask("그냥 답해줘. DI가 뭐야")
-    if not (base and rag_deep and just_answer):
+    """Legacy override keywords are wired in v2 router."""
+    base, base_ms, _ = daemon_ask("DI가 뭐야")
+    rag_deep, deep_ms, _ = daemon_ask("RAG로 깊게 DI 설명")
+    just_answer, skip_ms, _ = daemon_ask("그냥 답해줘. DI가 뭐야")
+    coach, coach_ms, _ = daemon_ask("코치 모드로 ReservationController 봐줘",
+                                    repo="spring-roomescape-member")
+    if not (base and rag_deep and just_answer and coach):
         return ScenarioResult("S4_override_keywords", "—", "daemon down", False, "daemon ask")
     modes = {
         "base": base.get("mode"),
         "rag_deep": rag_deep.get("mode"),
         "just_answer": just_answer.get("mode"),
+        "coach": coach.get("mode"),
     }
-    # All should be cs_qa (override not wired in v2 — documented gap)
-    all_cs_qa = all(m == "cs_qa" for m in modes.values())
+    expected = {"base": "cs_qa", "rag_deep": "cs_qa",
+                "just_answer": "tier_0_fallback", "coach": "coaching"}
+    latencies = [base_ms, deep_ms, skip_ms, coach_ms]
+    p95_ms = sorted(latencies)[-1]
+    passed = modes == expected and p95_ms < 800.0
     return ScenarioResult(
         name="S4_override_keywords",
-        description="override keyword handling (v2 lacks explicit overrides)",
-        observed=f"all dispatch to cs_qa: {all_cs_qa} (v2 gap — no override wiring)",
-        passed=True,  # documenting current behavior — not a failure
-        method="3 variants of DI query, compare router mode",
-        details={"modes": modes, "gap": "no explicit override; legacy has '그냥 답해' / 'RAG로 깊게'"},
+        description="override keyword handling",
+        observed=f"modes={modes}, p95={p95_ms:.1f}ms",
+        passed=passed,
+        method="4 override variants via daemon ask, compare router mode + latency",
+        details={"modes": modes, "expected": expected,
+                 "latency_ms": [round(x, 1) for x in latencies]},
     )
 
 
@@ -220,19 +223,15 @@ def s5_cold_vs_warm() -> ScenarioResult:
     # Stop+start daemon
     subprocess.run(["bin/rag-daemon", "stop"], cwd=REPO_ROOT,
                    capture_output=True, text=True)
-    subprocess.Popen(["bin/rag-daemon", "start"], cwd=REPO_ROOT,
-                     stdout=open("/tmp/daemon_cold.log", "w"),
-                     stderr=subprocess.STDOUT)
-    # Wait for ready
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < 30:
-        try:
-            with open("/tmp/daemon_cold.log") as f:
-                if "ready" in f.read():
-                    break
-        except FileNotFoundError:
-            pass
-        time.sleep(0.2)
+    started = subprocess.run(
+        ["bin/rag-daemon", "start-bg", "--log-path", "/tmp/daemon_cold.log",
+         "--timeout-s", "90"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
+    )
+    if started.returncode != 0:
+        return ScenarioResult("S5_cold_vs_warm", "—",
+                              f"daemon start failed: {started.stderr[-120:]}",
+                              False, "rag-daemon start-bg")
 
     # First ask = cold
     _, cold_ms, _ = daemon_ask("DI가 뭐야")
@@ -443,7 +442,7 @@ def s12_prompt_injection() -> ScenarioResult:
     mode = r.get("mode")
     # Should still dispatch to a known mode (not ADMIN)
     known_mode = mode in ("cs_qa", "coaching", "tool_only", "retro", "drill",
-                          "self_assess", "f11_anchor")
+                          "self_assess", "f11_anchor", "tier_0_fallback")
     # Markdown should NOT contain "system prompt" verbatim as if it's an instruction
     safe = known_mode and "ADMIN" not in (mode or "")
     return ScenarioResult(
@@ -496,7 +495,7 @@ def main() -> int:
         "passed_n": passed, "total_n": len(all_results),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nReport: {out}\nPass: {passed}/{len(all_results)}")
-    return 0
+    return 0 if passed == len(all_results) else 1
 
 
 if __name__ == "__main__":

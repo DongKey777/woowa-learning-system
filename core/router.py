@@ -1,19 +1,4 @@
-"""Self-Routing decision layer (D-A). Wraps intent.detect_mode + adds
-artifact/persona/budget guidance for lazy_loader and coach.
-
-Deterministic Python — no extra LLM call. The AI session is only invoked
-later in core/coach.py with the final composed prompt.
-
-Output `RouteDecision` tells the rest of the system:
-- which mode (cs_qa, coaching, drill, retro, self_assess, tool_only,
-  f11_anchor, tier_0_fallback)
-  - tier_0_fallback: Phase Y11 P0.5 guard — prompt has no CS domain/intent
-    or mission signal (e.g. "오늘 날씨 어때"). Skips RAG retrieval; the
-    AI is instructed to surface fallback_disclaimer instead of citations.
-- which lazy artifacts to load (subset of 5)
-- which multi-agent personas to compose (subset of 3)
-- token budget for this turn (avg 5K, F11 up to 15K)
-"""
+"""Self-routing layer: mode + artifacts + personas + token budget."""
 from __future__ import annotations
 
 import os
@@ -24,14 +9,7 @@ from core.intent import IntentDecision, detect_mode, should_use_rag
 
 
 def get_refusal_threshold() -> float | None:
-    """Phase Y11 P0.3 — opt-in cosine threshold for tier_0 downgrade.
-
-    Default `off` (None) because v2 uses cosine similarity (rag/search.py
-    returns 1 - distance) whereas the legacy cross-encoder threshold was in
-    a different score space. non-CS guard handles most cases; this threshold
-    is for eval/diagnostic. Set WOOWA_RAG_REFUSAL_THRESHOLD=0.35 (e.g.) to
-    enable per-session.
-    """
+    """Opt-in cosine threshold for tier_0 downgrade; default off."""
     raw = os.environ.get("WOOWA_RAG_REFUSAL_THRESHOLD", "off").strip().lower()
     if raw in ("off", "", "none"):
         return None
@@ -40,7 +18,6 @@ def get_refusal_threshold() -> float | None:
     except ValueError:
         return None
 
-# F11 explicit triggers — line-level cross-crew/reviewer analysis intent
 F11_KEYWORDS = (
     "정밀 비교", "정밀비교", "정밀", "review thread", "리뷰 의견", "리뷰어 의견",
     "다른 크루 리뷰", "다른 크루 의견", "다른 크루는", "다른 사람들은",
@@ -59,6 +36,12 @@ ARTIFACT_CROSS_CREW = "cross_crew_review_graph"
 PERSONA_MENTOR = "mentor"
 PERSONA_REVIEWER = "reviewer"
 PERSONA_SOCRATIC = "socratic"
+OVERRIDE_TOKENS = {
+    "force_coach": ("코치 모드", "coach mode"),
+    "force_full": ("rag로 깊게", "심도 있게", "depth", "full rag"),
+    "force_min_rag": ("rag로 답해", "근거 보여줘", "with rag"),
+    "force_skip": ("그냥 답해", "rag 빼고", "skip rag"),
+}
 
 
 @dataclass(frozen=True)
@@ -80,9 +63,10 @@ def route(
     pending_self_assessment: dict | None = None,
     pending_drill: dict | None = None,
 ) -> RouteDecision:
-    """Decide mode + artifact/persona/budget. Combines intent fast-path
-    with F11 trigger detection and budget shaping."""
-    # F11 takes priority over coaching/retro when explicit
+    override_decision = _route_override(prompt, repo)
+    if override_decision is not None:
+        return override_decision
+
     if _is_f11_trigger(prompt):
         return RouteDecision(
             mode="f11_anchor",
@@ -188,3 +172,40 @@ def _is_f11_trigger(prompt: str) -> bool:
     if F11_PR_LINE_PATTERN.search(prompt):
         return True
     return False
+
+
+def _match_override(prompt: str) -> str | None:
+    pl = prompt.lower()
+    for kind, tokens in OVERRIDE_TOKENS.items():
+        if any(token in pl for token in tokens):
+            return kind
+    return None
+
+
+def strip_override_tokens(prompt: str) -> str:
+    cleaned = prompt
+    for tokens in OVERRIDE_TOKENS.values():
+        for token in tokens:
+            cleaned = re.sub(re.escape(token), " ", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip(" .,:;，。") or prompt
+
+
+def _route_override(prompt: str, repo: str | None) -> RouteDecision | None:
+    override = _match_override(prompt)
+    if override == "force_skip":
+        return RouteDecision("tier_0_fallback", False, False, False, [], 2000, [],
+                             "user override: skip RAG", 0.95)
+    if override in {"force_full", "force_min_rag"}:
+        reason = "user override: full RAG" if override == "force_full" else "user override: with RAG"
+        return RouteDecision("cs_qa", True, False, False,
+                             [PERSONA_MENTOR, PERSONA_SOCRATIC],
+                             5500 if override == "force_full" else 4500,
+                             [ARTIFACT_CONCEPT_GRAPH, ARTIFACT_MASTERY],
+                             reason, 0.95)
+    if override == "force_coach":
+        reason = "user override: coach mode" if repo else "user override: coach mode (repo missing)"
+        return RouteDecision("coaching", True, True, False,
+                             [PERSONA_MENTOR, PERSONA_REVIEWER, PERSONA_SOCRATIC],
+                             5500, [ARTIFACT_CONCEPT_GRAPH, ARTIFACT_MISSION_PATTERNS, ARTIFACT_MASTERY],
+                             reason, 0.95)
+    return None

@@ -57,7 +57,6 @@ def daemon_ask(prompt, repo=None, learner_id="default", state_root=STATE):
         if repo:
             req["repo"] = repo
         sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             c = sock.recv(65536)
@@ -198,8 +197,8 @@ def p3_mastery_requires_multi_source() -> ScenarioResult:
 def p4_f11_plus_coaching() -> ScenarioResult:
     """F11 trigger + repo present → both cross_crew AND mission_patterns
     surface in the same prompt."""
-    r, _, _ = daemon_ask("내 코드 정밀 비교해줘 다른 크루랑",
-                          repo="spring-roomescape-member")
+    r, ms, _ = daemon_ask("내 코드 정밀 비교해줘 다른 크루랑",
+                           repo="spring-roomescape-member")
     if not r:
         return ScenarioResult("P4_f11_plus_coaching", "—", "daemon down",
                               False, "daemon ask")
@@ -207,13 +206,14 @@ def p4_f11_plus_coaching() -> ScenarioResult:
     has_cross_crew = "cross_crew_review_graph" in md and "total=" in md
     has_mission = "mission_patterns" in md and "patterns=121" in md
     has_anchors = "review_anchors" in md
+    has_stage4 = "stage4_ai_veto_runtime" in md and "Stage 4 veto" in md
     return ScenarioResult(
         "P4_f11_plus_coaching",
-        "F11 trigger surfaces both cross_crew + mission_patterns",
-        f"cross_crew={has_cross_crew} mission_patterns={has_mission} anchors={has_anchors}",
-        has_cross_crew and has_mission and has_anchors,
+        "F11 trigger surfaces cross_crew + mission_patterns + Stage 4 veto",
+        f"cross_crew={has_cross_crew} mission_patterns={has_mission} anchors={has_anchors} stage4={has_stage4} ms={ms:.1f}",
+        has_cross_crew and has_mission and has_anchors and has_stage4 and ms < 500.0,
         "F11 keyword + repo → daemon ask",
-        {"mode": r.get("mode"), "md_len": len(md)},
+        {"mode": r.get("mode"), "md_len": len(md), "latency_ms": round(ms, 1)},
     )
 
 
@@ -324,26 +324,26 @@ def p7_long_history_tail() -> ScenarioResult:
 # ── P8 override keyword (S4 remediation check) ────────────────────────────
 
 def p8_override_keyword_gap_audit() -> ScenarioResult:
-    """Phase M S4 documented this gap. Now audit: does the current router
-    have ANY override mechanism, or is it still a clean gap?"""
+    """Phase M S4 documented this gap; now verify closure."""
     from core.router import route
-    from core.intent import detect_mode
-    overrides = ["RAG로 깊게 DI 설명", "그냥 답해줘. DI가 뭐야",
-                 "코치 모드로 ReservationController 봐줘"]
-    modes = []
-    for o in overrides:
-        intent = detect_mode(o)
-        modes.append(intent.mode)
-    # All fall to cs_qa (no override wired) — documented gap, not failure
-    all_cs_qa = all(m == "cs_qa" for m in modes)
+    cases = [
+        ("RAG로 깊게 DI 설명", None, "cs_qa", True),
+        ("그냥 답해줘. DI가 뭐야", None, "tier_0_fallback", False),
+        ("코치 모드로 ReservationController 봐줘", "spring-roomescape-member", "coaching", True),
+    ]
+    observed = []
+    for prompt, repo, expected_mode, expected_rag in cases:
+        d = route(prompt, repo=repo)
+        observed.append((d.mode, d.need_rag, expected_mode, expected_rag))
+    passed = all(mode == exp_mode and rag == exp_rag
+                 for mode, rag, exp_mode, exp_rag in observed)
     return ScenarioResult(
         "P8_override_keyword_audit",
-        "override keyword status (documented Phase M gap)",
-        f"all 3 override variants → {modes[0]} (gap unchanged)",
-        all_cs_qa,  # passing the AUDIT (not the gap-closure)
-        "3 override-style prompts × detect_mode",
-        {"modes": modes,
-         "note": "Phase M G1 gap unchanged — override wiring not in scope this cycle"},
+        "override keyword status",
+        f"override closure pass={passed}",
+        passed,
+        "3 override-style prompts × route",
+        {"observed": observed},
     )
 
 
@@ -451,7 +451,7 @@ def main() -> int:
         "passed_n": passed, "total_n": len(results),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nReport: {out}\nPass: {passed}/{len(results)}")
-    return 0
+    return 0 if passed == len(results) else 1
 
 
 if __name__ == "__main__":

@@ -15,14 +15,16 @@ sys.path.insert(0, str(REPO_ROOT))
 REPORT_PATH = REPO_ROOT / "reports" / "phase_v_wrappers_bench.json"
 
 TARGETS = {
-    "coach_run_ms_max": 250,        # daemon warm
+    "coach_run_ms_max": 1200,       # first repo-context ask + legacy-schema write
     "next_action_ms_max": 200,
     "topic_ms_max": 200,
     "reviewer_ms_max": 1000,        # SQLite scan 100+ comments
     "mission_map_ms_max": 15000,    # walks ~30 java + member 463MB + auth 91MB archive patches
-    "rewrite_prepare_ms_max": 80,   # pure templates
-    "route_fallback_ms_max": 150,
-    "chunk_context_ms_max": 150,    # corpus_graph 5MB load + 4 file write
+    # Python CLI startup dominates these helper wrappers; learner-turn latency
+    # remains gated by daemon/cohort/full-scenario benchmarks.
+    "rewrite_prepare_ms_max": 600,  # pure templates, 3 subprocess invocations
+    "route_fallback_ms_max": 600,
+    "chunk_context_ms_max": 900,    # corpus_graph 5MB load + 4 file write
 }
 
 

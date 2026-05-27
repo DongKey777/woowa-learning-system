@@ -39,7 +39,7 @@ deps: `sentence-transformers`, `FlagEmbedding`, `lancedb`, `numpy`, `pyarrow`, `
 ```bash
 bin/index-fetch
 ```
-GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.0` (12.7MB, SHA256 검증) → `state/index/`. 소요 ~15초.
+GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.0` (release별 약 13-18MB, SHA256 검증) → `state/index/`. 소요 ~15초.
 
 **🚫 학습자 기기 로컬 빌드 금지** — `bin/corpus-build`는 maintainer 전용 (15-30분 + 4-6GB peak RAM). 학습자는 `bin/index-fetch`만 사용.
 
@@ -120,16 +120,16 @@ python3 bin/ask "테스트"
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
 
-### 4.7 Phase U-X auto-call (2026-05-26 신설 41 wrappers)
+### 4.7 Phase U-X auto-call (2026-05-26 신설 42 wrappers)
 
 CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 
 - **Phase U (10 onboarding)**: `bin/onboard-repo`, `bin/bootstrap-repo`, `bin/sync-prs`, `bin/archive-status`, `bin/repo-readiness`, `bin/doctor`, `bin/validate-state`, `bin/registry-audit`, `bin/list-repos`, `bin/bootstrap`. paradigm-v2 self-contained — legacy hub 의존 0 (Y2 검증 완료).
 - **Phase V (12 coaching context)**: `bin/coach-run` (legacy schema 호환), `bin/coach/my-pr/next-action/topic/reviewer/compare/compose-response`, `bin/mission-map`, `bin/rag-rewrite-prepare/route-fallback/chunk-context-prepare`.
 - **Phase W (12 mining/analytics, Mode B)**: `bin/feedback-mine`, `bin/response-quality-mine`, `bin/routing-analyze`, `bin/learning-turn-audit`, `bin/learning-path-graph-audit`, `bin/reclassify-history`, `bin/cohort-eval/compare`, `bin/golden`, `bin/rag-eval`, `bin/router-generalization-eval`, `bin/learner-log-rag-eval`.
-- **Phase X (10 maintenance + sub-commands)**: `bin/sync-index-metadata`, `bin/drill-grade-prepare`, `bin/learn-feedback/self-assess/drill`, `bin/learner-profile` (show/recompute/set/clear/redact), `bin/set-profile/show-profile`, `bin/reviewer-profile` (alias), `bin/rag-remote-build`.
+- **Phase X (11 maintenance + sub-commands)**: `bin/index-pack`, `bin/sync-index-metadata`, `bin/drill-grade-prepare`, `bin/learn-feedback/self-assess/drill`, `bin/learner-profile` (show/recompute/set/clear/redact), `bin/set-profile/show-profile`, `bin/reviewer-profile` (alias), `bin/rag-remote-build`.
 
-paradigm-v2 bin/* 합계: **62 entries** (legacy 75 - 17 reranker probes 의도 skip = 58 non-probe 대응 → 62 with improvements). 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출.
+paradigm-v2 bin/* 합계: **64 entries** (legacy 75 - 17 reranker probes 의도 skip = 58 non-probe 대응 → 64 with improvements). 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출.
 
 ---
 

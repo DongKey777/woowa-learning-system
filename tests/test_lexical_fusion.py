@@ -1,16 +1,52 @@
 """Tests for cheap lexical fusion rerank_fn."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from rag.corpus_loader import LoadedCorpus
 from rag.search import SearchHit
 from core.lexical_fusion import (
+    _LEXICAL_CACHE,
+    _LEXICAL_INDEX_CACHE,
     _fuse_lexical,
     _hinted_category,
     _lexical_candidates,
     _promote_canonical_candidate,
     _refine_confusable_order,
+    load_lexical_sidecar,
     make_lexical_fusion_fn,
+    preload_lexical_entries,
+    write_lexical_sidecar,
 )
+
+
+def _concept(
+    cid: str,
+    title: str,
+    category: str,
+    *,
+    summary: str = "",
+    body_markdown: str = "",
+    expected_queries: list[str] | None = None,
+    aliases: list[str] | None = None,
+    level: str = "beginner",
+) -> dict:
+    return {
+        "id": cid,
+        "title": title,
+        "category": category,
+        "level": level,
+        "summary": summary,
+        "body_markdown": body_markdown,
+        "expected_queries": expected_queries or [],
+        "aliases": aliases or [],
+        "metadata": {
+            "schema_version": "v2",
+            "created_at": "2026-05-23",
+            "last_modified": "2026-05-23",
+        },
+    }
 
 
 def test_lexical_fusion_adds_exact_corpus_candidate_without_moving_head() -> None:
@@ -37,6 +73,65 @@ def test_lexical_fusion_adds_exact_corpus_candidate_without_moving_head() -> Non
     assert fused[0].concept_id == "software-engineering/di"
     assert "spring/bean" in [h.concept_id for h in fused]
     assert any(h.source == "lexical" for h in fused)
+
+
+def test_lexical_sidecar_round_trip_preserves_candidates(tmp_path: Path) -> None:
+    corpus = LoadedCorpus(concepts={
+        "spring/bean": _concept(
+            "spring/bean", "Spring Bean", "spring",
+            summary="bean basics", body_markdown="dependency injection container",
+            aliases=["Bean DI"], expected_queries=["bean이 뭐야"],
+        ),
+        "database/index": _concept(
+            "database/index", "Database Index", "database",
+            body_markdown="btree index query plan",
+        ),
+    }, failures=[])
+    path = tmp_path / "lexical_fusion_sidecar.json"
+
+    stats = write_lexical_sidecar(corpus, path)
+    _LEXICAL_CACHE.clear()
+    _LEXICAL_INDEX_CACHE.clear()
+    loaded = load_lexical_sidecar(path, corpus)
+
+    assert stats["entries"] == 2
+    assert stats["size_bytes"] > 0
+    assert loaded is not None
+    assert isinstance(loaded[0]["title_tokens"], list)
+    assert loaded[0]["title_tokens"]
+    assert loaded[0]["body_tokens"]
+    _LEXICAL_CACHE[id(corpus)] = (corpus, loaded)
+    assert "spring/bean" in [h.concept_id for h in _lexical_candidates("Bean DI", corpus, 3)]
+
+
+def test_lexical_sidecar_rejects_stale_corpus(tmp_path: Path) -> None:
+    corpus = LoadedCorpus(concepts={
+        "spring/bean": _concept("spring/bean", "Spring Bean", "spring"),
+    }, failures=[])
+    path = tmp_path / "lexical_fusion_sidecar.json"
+    write_lexical_sidecar(corpus, path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["concept_count"] = 999
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_lexical_sidecar(path, corpus) is None
+
+
+def test_preload_lexical_entries_builds_then_loads_sidecar(tmp_path: Path) -> None:
+    corpus = LoadedCorpus(concepts={
+        "spring/bean": _concept("spring/bean", "Spring Bean", "spring"),
+    }, failures=[])
+    path = tmp_path / "lexical_fusion_sidecar.json"
+
+    first = preload_lexical_entries(corpus, path)
+    _LEXICAL_CACHE.clear()
+    _LEXICAL_INDEX_CACHE.clear()
+    second = preload_lexical_entries(corpus, path)
+
+    assert first["source"] == "built"
+    assert second["source"] == "sidecar"
+    assert second["entries"] == 1
 
 
 def test_exact_expected_query_promotes_matching_concept() -> None:
@@ -77,6 +172,88 @@ def test_canonical_candidate_promotes_over_specialized_bridge() -> None:
     promoted = _promote_canonical_candidate(hits)
 
     assert promoted[0].concept_id == "spring/transactional-basics"
+
+
+def test_strong_lexical_signal_can_override_weak_dense_head() -> None:
+    concepts = {
+        "database/roomescape-table-drill": _concept(
+            "database/roomescape-table-drill",
+            "Roomescape Reservation Table Drill",
+            "database",
+            aliases=["roomescape table relationship"],
+            expected_queries=["예약 테이블 관계를 연습하고 싶어"],
+        ),
+        "software-engineering/roomescape-dao-vs-repository-bridge": _concept(
+            "software-engineering/roomescape-dao-vs-repository-bridge",
+            "roomescape DAO Repository naming bridge",
+            "software-engineering",
+            aliases=["JdbcReservationRepository 의도", "Roomescape DAO Repository"],
+            expected_queries=["DAO와 Repository 차이가 뭐야?"],
+        ),
+    }
+    tiny = LoadedCorpus(concepts=concepts, failures=[])
+    rerank = make_lexical_fusion_fn(tiny, expand=3)
+    seed = [
+        SearchHit(
+            "database/roomescape-table-drill",
+            0.9,
+            "database",
+            "Roomescape Table",
+            "dense",
+        ),
+        SearchHit(
+            "software-engineering/roomescape-dao-vs-repository-bridge",
+            0.8,
+            "software-engineering",
+            "DAO Repository",
+            "dense",
+        ),
+    ]
+
+    hits = rerank("JdbcReservationRepository DAO vs Repository naming bridge", seed)
+
+    assert hits[0].concept_id == "software-engineering/roomescape-dao-vs-repository-bridge"
+
+
+def test_strong_lexical_signal_preserves_head_when_head_also_matches() -> None:
+    concepts = {
+        "security/auth-failure-response-401-403-404": _concept(
+            "security/auth-failure-response-401-403-404",
+            "401 403 404 인증 인가 응답 코드",
+            "security",
+            aliases=["401 403 404 인증 인가 응답 코드"],
+            expected_queries=["401 403 404 응답 코드 차이"],
+        ),
+        "security/auth-response-code-triage-micro-drill": _concept(
+            "security/auth-response-code-triage-micro-drill",
+            "Auth response code drill",
+            "security",
+            aliases=["401 403 404 인증 인가 응답 코드 triage drill"],
+            expected_queries=["401 403 404 드릴"],
+        ),
+    }
+    tiny = LoadedCorpus(concepts=concepts, failures=[])
+    rerank = make_lexical_fusion_fn(tiny, expand=3)
+    seed = [
+        SearchHit(
+            "security/auth-failure-response-401-403-404",
+            0.9,
+            "security",
+            "401 403 404",
+            "dense",
+        ),
+        SearchHit(
+            "security/auth-response-code-triage-micro-drill",
+            0.8,
+            "security",
+            "drill",
+            "dense",
+        ),
+    ]
+
+    hits = rerank("401 vs 403 vs 404 응답 코드 차이 인증 인가", seed)
+
+    assert hits[0].concept_id == "security/auth-failure-response-401-403-404"
 
 
 def test_confusable_neighbor_is_demoted_after_neutral_candidate() -> None:
@@ -231,3 +408,30 @@ def test_category_mismatch_demoted_when_query_has_strong_category_hint() -> None
         "spring/aop-basics",
         "design-pattern/decorator-proxy-basics",
     ]
+
+
+def test_unscoped_comparison_demotes_mission_bridge() -> None:
+    concepts = {
+        "design-pattern/bridge-strategy-vs-factory-runtime-selection": _concept(
+            "design-pattern/bridge-strategy-vs-factory-runtime-selection",
+            "Strategy vs Factory Runtime Selection",
+            "design-pattern",
+        ),
+        "design-pattern/factory": _concept("design-pattern/factory", "Factory", "design-pattern"),
+        "design-pattern/roomescape-strategy-vs-factory-bridge": _concept(
+            "design-pattern/roomescape-strategy-vs-factory-bridge",
+            "roomescape Strategy vs Factory Bridge",
+            "design-pattern",
+        ),
+    }
+    hits = [
+        SearchHit("design-pattern/bridge-strategy-vs-factory-runtime-selection", 1.0, "design-pattern", "Strategy vs Factory", "dense"),
+        SearchHit("design-pattern/roomescape-strategy-vs-factory-bridge", 0.8, "design-pattern", "roomescape bridge", "fusion"),
+        SearchHit("design-pattern/factory", 0.7, "design-pattern", "Factory", "fusion"),
+    ]
+
+    generic = _refine_confusable_order("런타임에 알고리즘 갈아끼우는 게 strategy야 factory야?", hits, LoadedCorpus(concepts, []))
+    scoped = _refine_confusable_order("roomescape 검증에 Strategy 패턴 어떻게 적용해?", hits, LoadedCorpus(concepts, []))
+
+    assert "design-pattern/roomescape-strategy-vs-factory-bridge" not in [h.concept_id for h in generic]
+    assert scoped[1].concept_id == "design-pattern/roomescape-strategy-vs-factory-bridge"

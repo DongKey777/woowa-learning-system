@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import socket
 import sys
 import time
@@ -64,7 +65,6 @@ def _socket_request(state_root: Path, req: dict[str, Any], timeout_s: int = 30) 
     try:
         sock.connect(str(sp))
         sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             chunk = sock.recv(65536)
@@ -82,6 +82,7 @@ def _daemon_ask(prompt: str, repo: str | None, state_root: Path) -> dict | None:
             "action": "ask",
             "query": prompt,
             "learner_id": "default",
+            "mode": os.environ.get("WOOWA_SESSION_MODE", "learning"),
         }
         if repo:
             req["repo"] = repo
@@ -233,6 +234,13 @@ def _mapped_forbidden_concepts(record: dict[str, Any], concept_ids: set[str]) ->
     return list(dict.fromkeys(out))
 
 
+def _mapped_path_concepts(record: dict[str, Any], field: str, concept_ids: set[str]) -> list[str]:
+    out: list[str] = []
+    for path in record.get(field) or []:
+        out.extend(_path_to_concept_candidates(str(path), concept_ids))
+    return list(dict.fromkeys(out))
+
+
 def _failure_class(
     *,
     record: dict[str, Any],
@@ -242,7 +250,13 @@ def _failure_class(
 ) -> str | None:
     if error:
         return "search_error"
-    if outcome in {"primary_top1", "primary_topk", "gap_clean"}:
+    if outcome in {
+        "primary_top1",
+        "primary_topk",
+        "acceptable_top1",
+        "acceptable_topk",
+        "gap_clean",
+    }:
         return None
     if outcome == "forbidden_hit":
         return "forbidden_polluted"
@@ -279,8 +293,11 @@ def evaluate_qrels(
     per_cohort_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     latencies: list[float] = []
     rank_rows: list[dict[str, float]] = []
+    learner_rank_rows: list[dict[str, float]] = []
     top1 = 0
     topk_hit = 0
+    learner_top1 = 0
+    learner_topk_hit = 0
     pass_count = 0
     active_pass_count = 0
     active_total = 0
@@ -298,6 +315,10 @@ def evaluate_qrels(
         prompt = reformulated if use_reformulated_query and reformulated else raw_prompt
         expected_all = [str(x) for x in (record.get("expected_concepts") or [])]
         expected_in_corpus = [cid for cid in expected_all if cid in concept_ids]
+        primary_path_concepts = _mapped_path_concepts(record, "primary_paths", concept_ids)
+        acceptable_path_concepts = _mapped_path_concepts(record, "acceptable_paths", concept_ids)
+        primary_concepts = list(dict.fromkeys(expected_in_corpus + primary_path_concepts))
+        relevant_concepts = list(dict.fromkeys(primary_concepts + acceptable_path_concepts))
         forbidden_concepts = _mapped_forbidden_concepts(record, concept_ids)
 
         hits, ms, error = search_fn(prompt, top_k, relations_expand, state_root)
@@ -314,9 +335,15 @@ def evaluate_qrels(
             forbidden_hit_total += 1
 
         ranking_eligible = bool(expected_in_corpus)
+        learner_ranking_eligible = bool(relevant_concepts)
         rank_metrics: dict[str, float] | None = None
+        learner_metrics: dict[str, float] | None = None
         is_top1 = False
         is_topk = False
+        is_learner_top1 = False
+        is_learner_topk = False
+        is_primary_top1 = False
+        is_primary_topk = False
         if ranking_eligible:
             rank_metrics = retrieval_metrics(top_ids, expected_in_corpus, k=top_k)
             rank_rows.append(rank_metrics)
@@ -324,7 +351,16 @@ def evaluate_qrels(
             is_topk = rank_metrics[f"recall_at_{top_k}"] > 0.0
             top1 += int(is_top1)
             topk_hit += int(is_topk)
-        else:
+        if learner_ranking_eligible:
+            learner_metrics = retrieval_metrics(top_ids, relevant_concepts, k=top_k)
+            learner_rank_rows.append(learner_metrics)
+            is_learner_top1 = bool(top_ids and top_ids[0] in set(relevant_concepts))
+            is_learner_topk = learner_metrics[f"recall_at_{top_k}"] > 0.0
+            is_primary_top1 = bool(top_ids and top_ids[0] in set(primary_concepts))
+            is_primary_topk = any(cid in set(primary_concepts) for cid in top_ids)
+            learner_top1 += int(is_learner_top1)
+            learner_topk_hit += int(is_learner_topk)
+        if not ranking_eligible:
             missing_expected += len(expected_all)
             if cohort_tag == "corpus_gap_probe":
                 excluded_gap += 1
@@ -337,14 +373,24 @@ def evaluate_qrels(
             outcome = "gap_returned_hits"
         elif forbidden_hit_ids:
             outcome = "forbidden_hit"
-        elif is_top1:
+        elif is_primary_top1:
             outcome = "primary_top1"
-        elif is_topk:
+        elif is_learner_top1:
+            outcome = "acceptable_top1"
+        elif is_primary_topk:
             outcome = "primary_topk"
+        elif is_learner_topk:
+            outcome = "acceptable_topk"
         else:
             outcome = "miss"
 
-        is_pass = outcome in {"primary_top1", "primary_topk", "gap_clean"}
+        is_pass = outcome in {
+            "primary_top1",
+            "primary_topk",
+            "acceptable_top1",
+            "acceptable_topk",
+            "gap_clean",
+        }
         pass_count += int(is_pass)
         if cohort_tag != "corpus_gap_probe":
             active_total += 1
@@ -357,14 +403,32 @@ def evaluate_qrels(
             "query_used": "reformulated_query" if prompt != raw_prompt else "prompt",
             "expected_concepts": expected_all,
             "expected_concepts_in_corpus": expected_in_corpus,
+            "primary_path_concepts_in_corpus": primary_path_concepts,
+            "acceptable_path_concepts_in_corpus": acceptable_path_concepts,
+            "relevant_concepts_in_corpus": relevant_concepts,
             "forbidden_concepts_mapped": forbidden_concepts,
             "top_concepts": top_ids,
             "top1_match": is_top1 if ranking_eligible else None,
             f"top{top_k}_match": is_topk if ranking_eligible else None,
+            "strict_top1_match": is_top1 if ranking_eligible else None,
+            f"strict_top{top_k}_match": is_topk if ranking_eligible else None,
+            "learner_top1_match": is_learner_top1
+            if learner_ranking_eligible else None,
+            f"learner_top{top_k}_match": is_learner_topk
+            if learner_ranking_eligible else None,
             "ranking_eligible": ranking_eligible,
+            "learner_ranking_eligible": learner_ranking_eligible,
             "metrics": {
                 key: round(value, 4)
                 for key, value in (rank_metrics or {}).items()
+            },
+            "strict_metrics": {
+                key: round(value, 4)
+                for key, value in (rank_metrics or {}).items()
+            },
+            "learner_metrics": {
+                key: round(value, 4)
+                for key, value in (learner_metrics or {}).items()
             },
             "outcome": outcome,
             "pass_status": is_pass,
@@ -382,14 +446,18 @@ def evaluate_qrels(
         per_cohort_rows[cohort_tag].append(row)
 
     ranking_n = len(rank_rows)
+    learner_ranking_n = len(learner_rank_rows)
     learner_alignment_sum = 0.0
     learner_alignment_weight = 0.0
     for tag, rows in per_cohort_rows.items():
         weight = COHORT_INTENT_WEIGHTS.get(tag, 0.0)
-        eligible = [r for r in rows if r.get("ranking_eligible")]
+        eligible = [r for r in rows if r.get("learner_ranking_eligible")]
         if weight <= 0 or not eligible:
             continue
-        topk_rate = sum(1 for r in eligible if r.get(f"top{top_k}_match") is True) / len(eligible)
+        topk_rate = (
+            sum(1 for r in eligible if r.get(f"learner_top{top_k}_match") is True)
+            / len(eligible)
+        )
         learner_alignment_sum += topk_rate * weight
         learner_alignment_weight += weight
     learner_alignment_score = (
@@ -421,6 +489,30 @@ def evaluate_qrels(
         f"recall_at_{top_k}": _mean([r[f"recall_at_{top_k}"] for r in rank_rows]),
         "mrr": _mean([r["mrr"] for r in rank_rows]),
         f"ndcg_at_{top_k}": _mean([r[f"ndcg_at_{top_k}"] for r in rank_rows]),
+        "strict_ranking_evaluated": ranking_n,
+        "strict_top1_match_rate": round(top1 / ranking_n, 3) if ranking_n else None,
+        f"strict_top{top_k}_match_rate": round(topk_hit / ranking_n, 3)
+        if ranking_n else None,
+        f"strict_recall_at_{top_k}": _mean([
+            r[f"recall_at_{top_k}"] for r in rank_rows
+        ]),
+        "strict_mrr": _mean([r["mrr"] for r in rank_rows]),
+        f"strict_ndcg_at_{top_k}": _mean([
+            r[f"ndcg_at_{top_k}"] for r in rank_rows
+        ]),
+        "learner_ranking_evaluated": learner_ranking_n,
+        "learner_top1_match_rate": round(learner_top1 / learner_ranking_n, 3)
+        if learner_ranking_n else None,
+        f"learner_top{top_k}_match_rate": round(
+            learner_topk_hit / learner_ranking_n, 3
+        ) if learner_ranking_n else None,
+        f"learner_recall_at_{top_k}": _mean([
+            r[f"recall_at_{top_k}"] for r in learner_rank_rows
+        ]),
+        "learner_mrr": _mean([r["mrr"] for r in learner_rank_rows]),
+        f"learner_ndcg_at_{top_k}": _mean([
+            r[f"ndcg_at_{top_k}"] for r in learner_rank_rows
+        ]),
         "learner_alignment_score": round(learner_alignment_score, 3)
         if learner_alignment_score is not None else None,
         "forbidden_hit_count": forbidden_hit_total,
@@ -437,12 +529,19 @@ def evaluate_qrels(
             r["metrics"] for r in rows
             if r.get("ranking_eligible") and isinstance(r.get("metrics"), dict)
         ]
+        cohort_learner_rows = [
+            r["learner_metrics"] for r in rows
+            if r.get("learner_ranking_eligible")
+            and isinstance(r.get("learner_metrics"), dict)
+        ]
         cohort_latencies = [float(r["latency_ms"]) for r in rows]
         total = len(rows)
         eligible = len(cohort_rank_rows)
+        learner_eligible = len(cohort_learner_rows)
         per_cohort[tag] = {
             "total": total,
             "ranking_evaluated": eligible,
+            "learner_ranking_evaluated": learner_eligible,
             "pass_rate": round(sum(1 for r in rows if r["pass_status"]) / total, 3)
             if total else None,
             "top1_match_rate": round(
@@ -458,6 +557,29 @@ def evaluate_qrels(
             "mrr": _mean([float(r.get("mrr", 0.0)) for r in cohort_rank_rows]),
             f"ndcg_at_{top_k}": _mean([
                 float(r.get(f"ndcg_at_{top_k}", 0.0)) for r in cohort_rank_rows
+            ]),
+            "strict_top1_match_rate": round(
+                sum(1 for r in rows if r.get("strict_top1_match") is True)
+                / eligible, 3
+            ) if eligible else None,
+            "learner_top1_match_rate": round(
+                sum(1 for r in rows if r.get("learner_top1_match") is True)
+                / learner_eligible, 3
+            ) if learner_eligible else None,
+            f"learner_top{top_k}_match_rate": round(
+                sum(1 for r in rows if r.get(f"learner_top{top_k}_match") is True)
+                / learner_eligible, 3
+            ) if learner_eligible else None,
+            f"learner_recall_at_{top_k}": _mean([
+                float(r.get(f"recall_at_{top_k}", 0.0))
+                for r in cohort_learner_rows
+            ]),
+            "learner_mrr": _mean([
+                float(r.get("mrr", 0.0)) for r in cohort_learner_rows
+            ]),
+            f"learner_ndcg_at_{top_k}": _mean([
+                float(r.get(f"ndcg_at_{top_k}", 0.0))
+                for r in cohort_learner_rows
             ]),
             "latency_p50_ms": _percentile(cohort_latencies, 0.50),
             "latency_p95_ms": _percentile(cohort_latencies, 0.95),

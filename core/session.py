@@ -34,11 +34,15 @@ def _ask_via_daemon(prompt: str, repo: str | None, learner_id: str,
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(DAEMON_TIMEOUT)
         sock.connect(str(sock_path))
-        req = {"action": "ask", "query": prompt, "learner_id": learner_id}
+        req = {
+            "action": "ask",
+            "query": prompt,
+            "learner_id": learner_id,
+            "mode": os.environ.get("WOOWA_SESSION_MODE", "learning"),
+        }
         if repo:
             req["repo"] = repo
         sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             c = sock.recv(65536)

@@ -32,11 +32,14 @@ TOOL_TOKENS = (
 CS_TOKENS = (
     "transactional", "트랜잭션", "isolation",
     "bean", "di", "ioc", "dependency injection",
-    "mvc", "controller", "service", "dao", "repository",
+    "mvc", "controller", "service", "dao", "repository", "jdbctemplate",
     "jpa", "mybatis", "n+1", "lazy", "optimistic",
     "spring", "@autowired", "@component", "@configuration",
-    "@webmvctest", "@springboottest", "@jdbctest",
+    "@webmvctest", "@springboottest", "@jdbctest", "java", "optional", "stream api", "lambda",
     "test slice", "테스트 전략", "test double",
+    "컴퓨터공학", "알고리즘", "자료구조", "데이터베이스",
+    "db", "네트워크", "운영체제", "os", "보안", "security",
+    "design pattern", "디자인 패턴", "system design", "시스템 설계",
 )
 # Explicit mission tokens — always count as mission signal.
 MISSION_TOKENS_EXPLICIT = ("미션", "내 코드", "내 pr", "페어")
@@ -60,7 +63,7 @@ DEFINITION_TOKENS_SHORT_OK = (
     "di", "ioc", "@transactional", "n+1", "jpa", "mvc",
     "@autowired", "@component",
 )
-_CS_SHORT_TOKENS = {"di", "ioc", "jpa", "mvc", "dao", "n+1"}
+_CS_SHORT_TOKENS = {"di", "ioc", "jpa", "mvc", "dao", "db", "os", "n+1"}
 
 
 def _ascii_boundary_pattern(token: str) -> re.Pattern:

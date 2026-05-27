@@ -69,6 +69,23 @@ def test_ask_returns_none_when_socket_missing(tmp_path: Path) -> None:
     assert result is None
 
 
+def test_render_ask_stdout_matches_cli_text_shape() -> None:
+    text = daemon._render_ask_stdout({
+        "markdown": "# prompt",
+        "mode": "cs_qa",
+        "budget": 4500,
+        "personas": ["mentor"],
+        "reason": "unit",
+        "response_hints": {"citation_paths": ["spring/bean"]},
+        "response_quality_hint": {"source_event_id": "ask-1"},
+    }, json_route=True)
+
+    assert text.startswith("# RouteDecision: ")
+    assert "# response_hints: " in text
+    assert "# response_quality_hint: " in text
+    assert text.endswith("# prompt\n")
+
+
 def test_module_exports() -> None:
     # Public API contract
     for name in ("search", "ask", "DEFAULT_STATE_ROOT", "SOCKET_FILE",
@@ -79,6 +96,28 @@ def test_module_exports() -> None:
 
 def test_listen_backlog_allows_small_bursts() -> None:
     assert daemon.LISTEN_BACKLOG >= 16
+
+
+def test_default_encoder_warm_queries_include_smoke_prompt(monkeypatch) -> None:
+    monkeypatch.delenv("WOOWA_DAEMON_ENCODER_WARM_QUERIES", raising=False)
+    assert daemon._encoder_warm_queries() == ("DI",)
+
+
+def test_encoder_warm_queries_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("WOOWA_DAEMON_ENCODER_WARM_QUERIES", " DI | Spring Bean ")
+    assert daemon._encoder_warm_queries() == ("DI", "Spring Bean")
+
+
+def test_encoder_import_prime_defaults_on_with_env_rollback(monkeypatch) -> None:
+    monkeypatch.delenv("WOOWA_DAEMON_ENCODER_IMPORT_PRIME", raising=False)
+    assert daemon._encoder_import_prime_enabled() is True
+
+    monkeypatch.setenv("WOOWA_DAEMON_ENCODER_IMPORT_PRIME", "0")
+    assert daemon._encoder_import_prime_enabled() is False
+
+
+def test_parallel_startup_import_prime() -> None:
+    daemon._prime_parallel_startup_imports()
 
 
 def test_default_state_root_under_repo(tmp_path: Path) -> None:

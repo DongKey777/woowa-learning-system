@@ -270,6 +270,7 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
         if cc.get("ready"):
             total = cc.get("total_rows", 0)
             parts.append(f"### cross_crew_review_graph (total={total}, top-{len(cc.get('top_matches', []))} by embed_cosine)")
+            parts.append("### stage4_ai_veto_runtime: keep only same code-intent matches; drop path/token-only matches")
             for m in cc.get("top_matches", []):
                 parts.append(
                     f"  - PR#{m['anchor_pr']} {m['anchor_path']} (mentor={m['anchor_mentor']}) "
@@ -287,6 +288,16 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
         parts.append(f"  question: {do.get('question')}")
         if do.get("expected_terms"):
             parts.append(f"  expected_terms: {do['expected_terms'][:5]}")
+    if "cognitive_trigger" in artifacts:
+        trigger = artifacts["cognitive_trigger"]
+        parts.append(
+            "### cognitive_trigger "
+            f"(type={trigger.get('trigger_type')}, reason={trigger.get('reason')})"
+        )
+        if trigger.get("markdown"):
+            parts.append(str(trigger["markdown"]))
+        if trigger.get("trigger_session_id"):
+            parts.append(f"  trigger_session_id: {trigger['trigger_session_id']}")
     if "personalization" in artifacts:
         p = artifacts["personalization"]
         parts.append(
@@ -329,9 +340,6 @@ def _user_section(prompt: str, repo: str | None, learner_id: str,
         parts.append(f"**repo**: {repo}")
     parts.append(f"**prompt**: {prompt}")
     if learner_context:
-        # P1.2 — personalization override surface. Mastered + proficient
-        # concepts go into must_skip_explanations_of so the AI doesn't
-        # rehash definitions the learner already owns.
         must_skip = learner_context.get("must_skip_explanations_of") or []
         must_include = learner_context.get("must_include_phrases") or []
         must_offer = learner_context.get("must_offer_next_action") or None
@@ -373,6 +381,7 @@ def _answer_format(route: RouteDecision,
         rules.append("- mission_patterns에 추출된 학습자 코드 위치 인용")
     if route.need_anchors:
         rules.append("- review_anchors + cross_crew 의견 차이 narrate (reviewer별/크루별)")
+        rules.append("- cross_crew match는 먼저 Stage 4 veto로 같은 code intent인지 걸러")
     if PERSONA_SOCRATIC in route.personas:
         rules.append("- 답 직접 X, leading question 1개 끼워넣어")
     return "\n".join(rules)

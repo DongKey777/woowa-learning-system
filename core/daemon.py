@@ -1,17 +1,4 @@
-"""BGE-M3 keep-alive daemon (cold 7-8s → warm <2s).
-
-AF_UNIX socket + line-delimited JSON protocol. Single-learner = single-thread.
-~100 LOC, no extra deps.
-
-Protocol:
-  request:  {"action": "search", "query": "...", "top_k": 5, "rerank": true}
-  response: {"hits": [{"concept_id": ..., "score": ..., ...}, ...]}
-  request:  {"action": "ping"}
-  response: {"alive": true, "ts": ...}
-
-Client API (used by lazy_loader):
-  hits = daemon_client.search(query, top_k=5)  # returns [] if daemon down
-"""
+"""BGE-M3 keep-alive daemon over AF_UNIX line-delimited JSON."""
 from __future__ import annotations
 
 import json
@@ -20,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +17,7 @@ PID_FILE = "rag-daemon.pid"
 SOCKET_FILE = "rag-daemon.sock"
 LISTEN_BACKLOG = 32
 DEFAULT_LOG_PATH = Path("/tmp/daemon.log")
+DEFAULT_ENCODER_WARM_QUERIES = ("DI",)
 
 
 # ── client API ────────────────────────────────────────────────────────────
@@ -67,7 +56,6 @@ def search(
             req_payload["learner_id"] = learner_id
         req = json.dumps(req_payload) + "\n"
         sock.sendall(req.encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             chunk = sock.recv(65536)
@@ -99,10 +87,15 @@ def ask(
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(DAEMON_TIMEOUT)
         sock.connect(str(sp))
-        req = json.dumps({"action": "ask", "query": prompt, "repo": repo,
-                          "learner_id": learner_id}) + "\n"
+        req = json.dumps({
+            "action": "ask",
+            "query": prompt,
+            "repo": repo,
+            "learner_id": learner_id,
+            "mode": os.environ.get("WOOWA_SESSION_MODE", "learning"),
+            "reformulation": os.environ.get("WOOWA_REFORMULATE"),
+        }) + "\n"
         sock.sendall(req.encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)  # signal "done writing" so server can detect end
         data = b""
         while True:
             chunk = sock.recv(65536)
@@ -113,6 +106,25 @@ def ask(
         return json.loads(data.decode("utf-8").strip())
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _render_ask_stdout(resp: dict, json_route: bool = False) -> str:
+    lines: list[str] = []
+    if json_route:
+        lines.append("# RouteDecision: " + json.dumps({
+            "mode": resp.get("mode"),
+            "personas": resp.get("personas", []),
+            "budget_tokens": resp.get("budget"),
+            "reason": resp.get("reason"),
+        }, ensure_ascii=False))
+    hints = resp.get("response_hints")
+    if hints:
+        lines.append("# response_hints: " + json.dumps(hints, ensure_ascii=False))
+    rq_hint = resp.get("response_quality_hint")
+    if rq_hint:
+        lines.append("# response_quality_hint: " + json.dumps(rq_hint, ensure_ascii=False))
+    lines.append(resp["markdown"])
+    return "\n".join(lines) + "\n"
 
 
 def ping(state_root: Path = DEFAULT_STATE_ROOT) -> bool:
@@ -144,6 +156,45 @@ def stop(state_root: Path = DEFAULT_STATE_ROOT) -> bool:
     pid_p.unlink(missing_ok=True)
     sp.unlink(missing_ok=True)
     return True
+
+
+def _encoder_warm_queries() -> tuple[str, ...]:
+    raw = os.environ.get("WOOWA_DAEMON_ENCODER_WARM_QUERIES")
+    if raw is None:
+        return DEFAULT_ENCODER_WARM_QUERIES
+    queries = tuple(q.strip() for q in raw.split("|") if q.strip())
+    return queries or DEFAULT_ENCODER_WARM_QUERIES
+
+
+def _prewarm_encoder_queries() -> tuple[str, ...]:
+    from rag.encoder import encode_query
+
+    warmed: list[str] = []
+    for query in _encoder_warm_queries():
+        encode_query(query)
+        warmed.append(query)
+    return tuple(warmed)
+
+
+def _encoder_import_prime_enabled() -> bool:
+    raw = os.environ.get("WOOWA_DAEMON_ENCODER_IMPORT_PRIME", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _prime_parallel_startup_imports() -> None:
+    """Import lightweight modules before concurrent BGE/corpus warm-up.
+
+    Python 3.13 can expose partially initialized stdlib modules when startup
+    threads import typing/dataclasses at the same time. Priming these imports
+    keeps daemon readiness deterministic without moving heavy model work back
+    onto the critical path.
+    """
+    import dataclasses
+    import typing
+
+    from rag.corpus_loader import LoadedCorpus
+
+    _ = (dataclasses.dataclass, typing.ClassVar, LoadedCorpus)
 
 
 def start_background(
@@ -178,7 +229,7 @@ def start_background(
             return True
         if proc.poll() is not None:
             return False
-        time.sleep(0.25)
+        time.sleep(0.05)
     return False
 
 
@@ -193,21 +244,82 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
     sp.unlink(missing_ok=True)
 
     pid_p.write_text(str(os.getpid()))
+    startup_t0 = time.perf_counter()
+    startup_timings: dict[str, float | int | list[str]] = {"pid": os.getpid()}
 
-    # Pre-load encoder + corpus + ask pipeline
-    from rag.search import search as rag_search
-    from rag.corpus_loader import load_corpus
-    from rag.encoder import encode_query
-    from core.coach import compose
-    from core.lexical_fusion import make_lexical_fusion_fn
-    from core.lazy_loader import (
-        _hits_to_dicts,
-        _personalize_hits,
-        load as lazy_load,
-    )
-    from core.router import route
-    from core.state import append_history_event, load_profile, read_history
-    corpus = load_corpus(strict=True)
+    def _timed_startup(name: str, fn):
+        t0 = time.perf_counter()
+        try:
+            return fn()
+        finally:
+            startup_timings[f"{name}_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+
+    # Pre-load encoder + corpus + ask pipeline.
+    def _import_rag_search():
+        from rag.search import _cached_open_index, search as loaded_search
+
+        _cached_open_index()
+        return loaded_search
+
+    def _load_runtime_corpus():
+        from rag.corpus_loader import load_corpus_runtime
+
+        loaded_corpus = load_corpus_runtime()
+        # These caches are needed by the first real dense query. Loading them
+        # while BGE-M3 materializes keeps learner-facing first ask under the
+        # warm-path budget without delaying readiness on the critical path.
+        try:
+            from core.lexical_fusion import preload_lexical_entries
+            from rag.search import _exact_shortcut_lookup
+
+            preload_lexical_entries(loaded_corpus, build_if_missing=False)
+            _exact_shortcut_lookup(loaded_corpus)
+        except Exception:  # noqa: BLE001
+            pass
+        return loaded_corpus
+
+    _prime_parallel_startup_imports()
+    if _encoder_import_prime_enabled():
+        from rag.encoder import prime_encoder_backend_imports
+
+        startup_timings["encoder_backend"] = _timed_startup(
+            "encoder_imports",
+            prime_encoder_backend_imports,
+        )
+    else:
+        startup_timings["encoder_backend"] = "deferred"
+        startup_timings["encoder_imports_ms"] = 0.0
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        search_future = pool.submit(
+            lambda: _timed_startup("search_import_open_index", _import_rag_search)
+        )
+        corpus_future = pool.submit(
+            lambda: _timed_startup("corpus_cache_prewarm", _load_runtime_corpus)
+        )
+        encoder_future = pool.submit(
+            lambda: _timed_startup("encoder_prewarm", _prewarm_encoder_queries)
+        )
+
+        rag_search = search_future.result()
+        from core.coach import compose
+        from core.lexical_fusion import make_lexical_fusion_fn
+        from core.lazy_loader import (
+            _hits_to_dicts,
+            _personalize_hits,
+            load as lazy_load,
+        )
+        from core.reformulate import reformulation_enabled, select_reformulation
+        from core.router import route, strip_override_tokens
+        from core.state import append_history_event, load_profile, read_history
+        from core.trigger import (
+            load_drill_history,
+            load_pending_triggers,
+            load_profile_payload,
+            select_cognitive_trigger,
+            write_pending_triggers_atomic,
+        )
+        corpus = corpus_future.result()
+        startup_timings["encoder_warm_queries"] = list(encoder_future.result())
     lexical_fns: dict[int, object] = {}
 
     def _lexical_fn(loaded_corpus, expand: int):
@@ -217,7 +329,15 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
             lexical_fns[expand] = make_lexical_fusion_fn(loaded_corpus, expand=expand)
         return lexical_fns[expand]
 
-    _ = encode_query("warm-up")
+    startup_timings["total_to_ready_ms"] = round(
+        (time.perf_counter() - startup_t0) * 1000,
+        1,
+    )
+    print(
+        "[daemon] startup_timings "
+        + json.dumps(startup_timings, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
     print(f"[daemon] ready (pid={os.getpid()}, socket={sp})", flush=True)
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -259,14 +379,27 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     if personalization is not None:
                         payload["personalization"] = personalization
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
-                elif action == "ask":
+                elif action in ("ask", "ask_text"):
                     # Full ask pipeline in daemon — bin/ask becomes thin socket client
                     prompt = req["query"]
-                    reformulated_query = str(req.get("reformulated_query") or "").strip()
-                    retrieval_query = reformulated_query or prompt
                     repo = req.get("repo")
                     learner_id = req.get("learner_id", "default")
+                    event_mode = req.get("mode") or os.environ.get(
+                        "WOOWA_SESSION_MODE", "learning")
                     profile = load_profile(learner_id, state_root=state_root)
+                    recent = read_history(state_root=state_root, tail=20)
+                    reformulation = select_reformulation(
+                        prompt=prompt,
+                        explicit_reformulated_query=req.get("reformulated_query"),
+                        history=recent,
+                        corpus=corpus,
+                        repo=repo,
+                        enabled=reformulation_enabled(req.get("reformulation")),
+                    )
+                    reformulated_query = (
+                        reformulation.reformulated_query if reformulation else ""
+                    )
+                    retrieval_query = reformulated_query or strip_override_tokens(prompt)
                     decision = route(
                         prompt, repo=repo,
                         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
@@ -306,7 +439,62 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             }
                     if reformulated_query:
                         artifacts["reformulated_query"] = reformulated_query
-                    recent = read_history(state_root=state_root, tail=20)
+                    if reformulation:
+                        artifacts["reformulation_trace"] = reformulation.to_dict()
+                    cognitive_trigger = (
+                        select_cognitive_trigger(
+                            history=recent,
+                            profile=load_profile_payload(state_root, repo=repo),
+                            drill_pending=profile.pending_triggers.get("review_drill"),
+                            drill_history=load_drill_history(state_root) or profile.drill_due,
+                            intent={"detected_intent": decision.mode},
+                            pending_triggers=profile.pending_triggers,
+                        )
+                        if event_mode not in ("development", "test")
+                        else {"trigger_type": "none"}
+                    )
+                    if cognitive_trigger.get("trigger_type") == "self_assessment":
+                        from datetime import datetime, timedelta, timezone
+
+                        pending = load_pending_triggers(state_root)
+                        trigger_to_store = dict(cognitive_trigger)
+                        issued_at = datetime.now(timezone.utc)
+                        trigger_to_store.setdefault("issued_at", issued_at.isoformat())
+                        trigger_to_store.setdefault(
+                            "expires_at", (issued_at + timedelta(hours=24)).isoformat()
+                        )
+                        pending["self_assessment"] = trigger_to_store
+                        write_pending_triggers_atomic(pending, state_root)
+                        artifacts["cognitive_trigger"] = trigger_to_store
+                    elif cognitive_trigger.get("trigger_type") == "review_drill":
+                        from core.drill import build_review_offer_if_due
+
+                        offer = build_review_offer_if_due(
+                            learner_id=learner_id,
+                            state_root=state_root,
+                        )
+                        if offer:
+                            cognitive_trigger = {
+                                **cognitive_trigger,
+                                "payload": {
+                                    **(cognitive_trigger.get("payload") or {}),
+                                    "concept_id": offer.concept_id,
+                                    "drill_session_id": offer.drill_session_id,
+                                },
+                                "markdown": (
+                                    "## 복습 드릴\n"
+                                    f"- 이전 드릴을 다시 풀어볼 차례야: {offer.question}"
+                                ),
+                            }
+                            artifacts["drill_offer"] = {
+                                "concept_id": offer.concept_id,
+                                "question": offer.question,
+                                "expected_terms": offer.expected_terms,
+                                "source": offer.source,
+                            }
+                        artifacts["cognitive_trigger"] = cognitive_trigger
+                    elif cognitive_trigger.get("trigger_type") == "follow_up":
+                        artifacts["cognitive_trigger"] = cognitive_trigger
                     # Phase Y11 F8: event_id is generated BEFORE compose so the
                     # response_quality_hint.command_template can embed it and
                     # the AI session's follow-up wrapper call joins on the
@@ -335,8 +523,6 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     # Append turn event with effective_route (post-downgrade) so
                     # downstream telemetry (response-quality-mine, routing-analyze)
                     # sees the same mode the AI session was instructed to answer in.
-                    event_mode = req.get("mode") or os.environ.get(
-                        "WOOWA_SESSION_MODE", "learning")
                     event = {
                         "event_id": event_id,
                         "ts": time.time(),
@@ -348,6 +534,9 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             "router_mode": effective_route.mode,
                             "router_reason": effective_route.reason,
                             "reformulated_query": reformulated_query or None,
+                            "reformulation_source": (
+                                reformulation.source if reformulation else None
+                            ),
                             # I2: history aligns with hints (downgrade → []).
                             "top_concept_ids": list(response_hints["citation_paths"]),
                         },
@@ -366,7 +555,15 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         "response_hints": response_hints,
                         "response_quality_hint": response_quality_hint,
                     }
-                    conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
+                    if action == "ask_text":
+                        conn.sendall(
+                            _render_ask_stdout(
+                                payload,
+                                json_route=bool(req.get("json_route")),
+                            ).encode("utf-8")
+                        )
+                    else:
+                        conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 else:
                     conn.sendall(json.dumps({"error": f"unknown action {action}"}).encode() + b"\n")
             except Exception as exc:  # noqa: BLE001

@@ -124,7 +124,6 @@ def run_search(query: str) -> tuple[list[dict], float, str | None]:
         req = json.dumps({"action": "search", "query": query, "top_k": 5,
                           "relations_expand": 5}) + "\n"
         sock.sendall(req.encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             chunk = sock.recv(65536)

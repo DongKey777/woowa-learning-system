@@ -9,10 +9,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import jsonschema
-
-DEFAULT_CORPUS_DIR = Path(__file__).resolve().parent.parent / "corpus" / "concepts"
-DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "corpus" / "schemas" / "concept-v2.schema.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CORPUS_DIR = REPO_ROOT / "corpus" / "concepts"
+DEFAULT_SCHEMA_PATH = REPO_ROOT / "corpus" / "schemas" / "concept-v2.schema.json"
+DEFAULT_CORPUS_SNAPSHOT_PATH = REPO_ROOT / "state" / "index" / "corpus_snapshot.json"
+CORPUS_SNAPSHOT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,8 @@ def load_corpus(
     strict=True (default): raise if any concept fails validation.
     strict=False: return concepts that passed, collect failures separately.
     """
+    import jsonschema
+
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     validator = jsonschema.Draft7Validator(schema)
     concepts: dict[str, dict] = {}
@@ -66,6 +69,70 @@ def load_corpus(
         raise ValueError("\n".join(msg_lines))
 
     return LoadedCorpus(concepts=concepts, failures=failures)
+
+
+def write_corpus_snapshot(
+    corpus: LoadedCorpus,
+    path: Path = DEFAULT_CORPUS_SNAPSHOT_PATH,
+) -> dict:
+    """Write a pre-validated corpus snapshot for daemon cold-start."""
+    payload = {
+        "version": CORPUS_SNAPSHOT_VERSION,
+        "concept_count": len(corpus.concepts),
+        "concepts": corpus.concepts,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(path)
+    return {
+        "source": "built",
+        "path": str(path),
+        "concepts": len(corpus.concepts),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def load_corpus_snapshot(
+    path: Path = DEFAULT_CORPUS_SNAPSHOT_PATH,
+) -> LoadedCorpus | None:
+    """Load a corpus snapshot written after strict validation.
+
+    The snapshot is for runtime latency only. Maintainer/index-fetch paths still
+    use strict JSON schema validation before writing it.
+    """
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("version") != CORPUS_SNAPSHOT_VERSION:
+        return None
+    concepts_raw = payload.get("concepts")
+    if not isinstance(concepts_raw, dict):
+        return None
+    concept_count = payload.get("concept_count")
+    if concept_count != len(concepts_raw):
+        return None
+    concepts: dict[str, dict] = {}
+    for cid, concept in concepts_raw.items():
+        if not isinstance(concept, dict) or concept.get("id") != cid:
+            return None
+        concepts[str(cid)] = concept
+    return LoadedCorpus(concepts=concepts, failures=[])
+
+
+def load_corpus_runtime(
+    snapshot_path: Path = DEFAULT_CORPUS_SNAPSHOT_PATH,
+    corpus_dir: Path = DEFAULT_CORPUS_DIR,
+    schema_path: Path = DEFAULT_SCHEMA_PATH,
+) -> LoadedCorpus:
+    """Load the validated snapshot, falling back to strict corpus validation."""
+    snapshot = load_corpus_snapshot(snapshot_path)
+    if snapshot is not None:
+        return snapshot
+    return load_corpus(corpus_dir=corpus_dir, schema_path=schema_path, strict=True)
 
 
 def encoding_text(concept: dict) -> str:

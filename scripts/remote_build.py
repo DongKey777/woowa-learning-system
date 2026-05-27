@@ -21,9 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import shlex
 import signal
 import subprocess
 import sys
@@ -196,12 +194,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     api_key = os.environ.get("RUNPOD_API_KEY") or _read_key_file()
-    if not api_key:
-        print("ERROR: RUNPOD_API_KEY env not set, ~/.runpod/api_key not found", file=sys.stderr)
-        return 2
+    if not api_key and not args.dry_run:
+        parser.error("RUNPOD_API_KEY env not set, ~/.runpod/api_key not found")
+    if args.commit_sha and not (7 <= len(args.commit_sha) <= 40 and all(c in "0123456789abcdef" for c in args.commit_sha.lower())):
+        parser.error("--commit-sha must be a concrete hex git SHA")
 
+    if args.commit_sha is None and subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=REPO_ROOT, text=True
+    ).strip():
+        parser.error("dirty worktree; commit changes or pass --commit-sha")
     commit_sha = args.commit_sha or _current_commit_sha()
-    return run(api_key=api_key, commit_sha=commit_sha,
+    return run(api_key=api_key or "", commit_sha=commit_sha,
                keep_pod=args.keep_pod, dry_run=args.dry_run)
 
 

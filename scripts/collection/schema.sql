@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS pull_request_review_comments_current (
 );
 CREATE INDEX IF NOT EXISTS idx_rc_pr ON pull_request_review_comments_current(pull_request_id);
 CREATE INDEX IF NOT EXISTS idx_rc_reply ON pull_request_review_comments_current(in_reply_to_github_comment_id);
+CREATE INDEX IF NOT EXISTS idx_rc_reviewer_thread_created
+    ON pull_request_review_comments_current(user_login, in_reply_to_github_comment_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS pull_request_issue_comments_current (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

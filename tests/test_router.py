@@ -12,6 +12,7 @@ from core.router import (
     PERSONA_SOCRATIC,
     RouteDecision,
     route,
+    strip_override_tokens,
 )
 
 
@@ -59,6 +60,13 @@ def test_transactional_location_question_stays_cs_qa() -> None:
     d = route("@Transactional 어노테이션은 어디에 붙이는 게 좋아?")
     assert d.mode == "cs_qa"
     assert d.need_rag is True
+
+
+def test_java_short_concept_queries_stay_cs_qa() -> None:
+    for prompt in ("JdbcTemplate 사용", "Optional 사용", "Stream API", "Lambda"):
+        d = route(prompt)
+        assert d.mode == "cs_qa", prompt
+        assert d.need_rag is True
 
 
 def test_learning_practice_request_without_pending_stays_cs_qa() -> None:
@@ -125,3 +133,31 @@ def test_f11_priority_over_retro() -> None:
     """F11 explicit trigger beats retro keyword."""
     d = route("내 PR 흐름 정밀 비교", repo="x")
     assert d.mode == "f11_anchor"
+
+
+def test_override_skip_rag_wins_over_cs_signal() -> None:
+    d = route("그냥 답해줘. DI가 뭐야")
+    assert d.mode == "tier_0_fallback"
+    assert d.need_rag is False
+    assert "skip RAG" in d.reason
+
+
+def test_override_full_rag_forces_cs_qa() -> None:
+    d = route("RAG로 깊게 DI vs Service Locator 알려줘")
+    assert d.mode == "cs_qa"
+    assert d.need_rag is True
+    assert d.budget_tokens == 5500
+    assert strip_override_tokens("RAG로 깊게 DI 설명") == "DI 설명"
+
+
+def test_override_min_rag_rescues_weak_prompt() -> None:
+    d = route("근거 보여줘. 이거 왜?")
+    assert d.mode == "cs_qa"
+    assert d.need_rag is True
+
+
+def test_override_coach_mode_without_keyword_needs_mission_context() -> None:
+    d = route("코치 모드로 봐줘", repo="roomescape")
+    assert d.mode == "coaching"
+    assert d.need_mission_ctx is True
+    assert ARTIFACT_MISSION_PATTERNS in d.lazy_artifacts

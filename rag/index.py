@@ -22,13 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-import lancedb
-import numpy as np
-import pyarrow as pa
-
 from rag.corpus_loader import DEFAULT_CORPUS_DIR, encoding_text, load_corpus
 
 if TYPE_CHECKING:
+    import numpy as np
+    import pyarrow as pa
     from lancedb.table import Table
 
 DEFAULT_INDEX_DIR = Path(__file__).resolve().parent.parent / "state" / "index"
@@ -37,6 +35,8 @@ EMBED_DIM = 1024
 
 
 def _schema() -> pa.Schema:
+    import pyarrow as pa
+
     return pa.schema(
         [
             pa.field("concept_id", pa.string()),
@@ -65,6 +65,10 @@ def build_index(
 
     encode_fn override exists for tests — production uses rag.encoder.encode.
     """
+    import lancedb
+    import numpy as np
+    import pyarrow as pa
+
     loaded = load_corpus(corpus_dir=corpus_dir, strict=True)
     ids: list[str] = []
     texts: list[str] = []
@@ -106,7 +110,8 @@ def build_index(
     )
     _ = table.count_rows()
 
-    size = sum(p.stat().st_size for p in index_dir.rglob("*") if p.is_file())
+    table_path = index_dir / f"{TABLE_NAME}.lance"
+    size = sum(p.stat().st_size for p in table_path.rglob("*") if p.is_file())
     return IndexBuildReport(
         concepts_indexed=len(ids),
         elapsed_seconds=elapsed,
@@ -116,6 +121,8 @@ def build_index(
 
 
 def open_index(index_dir: Path = DEFAULT_INDEX_DIR) -> "Table":
+    import lancedb
+
     db = lancedb.connect(str(index_dir))
     if TABLE_NAME not in db.list_tables().tables:
         raise FileNotFoundError(f"no '{TABLE_NAME}' table at {index_dir}")

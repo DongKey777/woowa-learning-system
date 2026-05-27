@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_TAG = "paradigm-v2-index-v1.0.0"
 DEFAULT_PATTERN = "paradigm-v2-index-v1.0.0.tar.zst"
 EXPECTED_SHA256 = "400ea282e2f03f6c69c1e907940ab0a57f6b4f0cc7301abc8edb02f3639a4934"
@@ -32,6 +34,39 @@ def _sha256(p: Path) -> str:
     return h.hexdigest()
 
 
+def _ensure_runtime_sidecars() -> tuple[int, dict | None]:
+    try:
+        from rag.corpus_loader import load_corpus, write_corpus_snapshot
+        from core.lexical_fusion import (
+            _corpus_fingerprint as _dense_corpus_fingerprint,
+            preload_lexical_entries,
+        )
+
+        corpus = load_corpus(strict=True)
+        corpus_stats = write_corpus_snapshot(corpus)
+        lexical_stats = preload_lexical_entries(corpus)
+        stats = {
+            "corpus_snapshot": corpus_stats,
+            "lexical_sidecar": lexical_stats,
+            "dense_corpus_sha256": _dense_corpus_fingerprint(corpus),
+        }
+        print(f"[index-fetch] runtime sidecars {stats}", flush=True)
+        return 0, stats
+    except Exception as exc:  # noqa: BLE001
+        print(f"[index-fetch] runtime sidecars failed: {exc}", file=sys.stderr)
+        return 6, None
+
+
+def _manifest_dense_sha(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "invalid-json"
+    return manifest.get("dense_corpus_sha256") or manifest.get("corpus_sha256")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", default=DEFAULT_TAG)
@@ -44,6 +79,19 @@ def main(argv: list[str] | None = None) -> int:
 
     target = STATE_DIR / "index"
     if target.exists() and not args.force:
+        rc, stats = _ensure_runtime_sidecars()
+        if rc != 0:
+            return rc
+        manifest_sha = _manifest_dense_sha(target / "manifest.json")
+        current_sha = (stats or {}).get("dense_corpus_sha256")
+        if current_sha and manifest_sha != current_sha:
+            print(
+                "[index-fetch] WARNING: refreshed runtime sidecars but dense "
+                f"index manifest is stale (manifest={manifest_sha or 'missing'}, "
+                f"current={current_sha}). Run corpus rebuild readiness before "
+                "publishing a new index.",
+                file=sys.stderr,
+            )
         print(f"[index-fetch] state/index/ already exists ({target}). "
               f"Use --force to overwrite.", file=sys.stderr)
         return 0
@@ -110,6 +158,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[index-fetch] post-extract verification failed — "
               f"{target}/concepts.lance not found", file=sys.stderr)
         return 5
+
+    rc, _ = _ensure_runtime_sidecars()
+    if rc != 0:
+        return rc
 
     print(f"[index-fetch] ✓ {target}/concepts.lance ready", flush=True)
     return 0

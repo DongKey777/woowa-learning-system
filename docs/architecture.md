@@ -5,7 +5,7 @@
 ```
 학습자 자연어 prompt
        ↓
-bin/ask (socket client, 22ms cold-start floor)
+bin/ask (socket client; warm CLI p95 ~30ms)
        ↓
 core/daemon.py (AF_UNIX, single-thread, BGE-M3 warm in-process)
    1. core/router.py        → mode (cs_qa / coaching / tool_only / retro / drill / self_assess / f11_anchor)
@@ -107,7 +107,7 @@ bin/mission-patterns-build --repo <repo>
 1. **Stage 1 path**: anchor.path와 동일 filename을 가진 cross-crew review_comments fetch (SQL LIKE)
 2. **Stage 2 jaccard**: code hunk normalized-token Jaccard ≥0.4
 3. **Stage 3 embedding**: BGE-M3 cosine → top-10
-4. **Stage 4 AI veto** (runtime, query time): top-5만 LLM 검증
+4. **Stage 4 AI veto** (runtime, query time): F11 prompt가 top matches를 쓰기 전 same-code-intent 여부를 거르게 함
 
 ### 사전 빌드
 ```bash
@@ -117,13 +117,26 @@ bin/cross-crew-build --repo <repo>
 
 Phase L 측정:
 - **AI judge precision 85%** (10 sample = 5 high + 5 low conf)
-- Plan §D-E target (88-92%)는 Stage 4 runtime AI veto로 도달 가능
+- Stage 4 runtime veto prompt is now wired into the F11 answer path; next precision lift should be measured with post-answer sampling
 
 ## 7. Daemon (core/daemon.py)
 
 - **AF_UNIX socket** + line-delimited JSON protocol
 - **Single-thread** — single-learner design choice (concurrency 의도적 X)
-- **BGE-M3 + corpus + lazy_loader 모두 메모리에 keep** (cold 105ms → warm 4.5ms)
+- **BGE-M3 + corpus + lazy_loader 모두 메모리에 keep**
+- Current Y13 semantics:
+  - encoder backend: direct `transformers` CLS pooling by default; local snapshot first; fp16 on MPS/CUDA; rollback with `WOOWA_ENCODER_BACKEND=sentence-transformers` or `WOOWA_ENCODER_DTYPE=float32`
+  - tokenizer backend: `PreTrainedTokenizerFast(tokenizer_file=...)` by default to skip AutoTokenizer resolution; rollback with `WOOWA_ENCODER_TOKENIZER_BACKEND=auto`
+  - encoder startup scheduling: tokenizer/model parallel load + daemon encoder import priming; rollback with `WOOWA_ENCODER_PARALLEL_LOAD=0` or `WOOWA_DAEMON_ENCODER_IMPORT_PRIME=0`
+  - socket clients use newline-delimited requests only; client `shutdown(SHUT_WR)` is intentionally avoided because the server stops reading at newline and closes after response
+  - executable `bin/ask` uses a shell + AF_UNIX `nc` fast path for warm daemon text/JSON output; direct `python3 bin/ask` remains compatible and falls back to the Python client
+  - legacy override keywords are first-class: `그냥 답해` skips RAG, `RAG로 깊게` forces CS RAG, `코치 모드` forces coaching; override tokens are stripped from retrieval query before search
+  - search-result cache stores post-rerank unpersonalized hits for default encoder calls; stable lexical rerank cache keys keep repeated AI-session prompts on the cache path while profile adjustment remains per request
+  - warm socket p50/p95: **4.7ms / 6.3ms**
+  - warm CLI p50/p95: **88.2ms / 152.1ms**
+  - first ask after ready p50/p95: **322.6ms / 399.6ms**
+  - first-answer total(stop→prewarm-ready→첫 `bin/ask`) p50/p95: **20365.9ms / 20541.0ms**
+  - startup phase timing shows encoder import/materialization still dominates cold path, but first-ready p95 remains **20246.3ms**
 - Phase N1: SQLite mastery 등 모든 state daemon restart 후 survive 검증
 - Phase N12: 5 ask sequential = 5 well-formed event append (atomic)
 
@@ -137,17 +150,22 @@ Phase L 측정:
 - `state/rag-daemon.pid` — pid
 - 시작: `bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90`
 
-## 8. Performance (warm)
+## 8. Performance (Y13)
 
 | 지표 | paradigm-v2 | Legacy hub | Δ |
 |---|---|---|---|
-| p50 latency | **27.2ms** | 120.0ms | **4.4× faster** |
-| p95 latency | **30.7ms** | 423.7ms | **13.8× faster** |
-| Cold start | 105ms | ~20-25s | **~200× faster** |
+| warm CLI p50 | **88.2ms** | 147.2ms | **1.7× faster** |
+| warm CLI p95 | **152.1ms** | 431.7ms | **2.8× faster** |
+| first-answer total | **13.6s** (fair probe), **20.5s** canonical p95 | 43.9s | **3.24× faster** fair probe |
+| qrels p50/p95 | **235.4ms / 388.8ms** | 1080.1ms / 1814.2ms | **4.6× / 4.7× faster** |
+| qrels strict/primary top1 | **1.000** | 0.628 | **+37.2pp** |
+| 14-scenario bin/ask p50/p95 | **64.5ms / 87.0ms** | 88.0ms / 116.6ms | **1.4× / 1.3× faster** |
+| override keywords | **4/4, p95 148.3ms** | same override semantics confirmed | parity |
+| short exact concept queries | **8/8, p95 0.022ms** | 3-sample p95 546.6ms | **encoder-free + better top1 ownership** |
 | LLM payload | 2.4KB | 48.6KB | **20× cheaper** |
 | Memory (warm) | ~6.5GB | ~7-8GB | parity |
 
-100 query stress (Phase M S8): p50 3.5ms / p95 32.8ms / p99 57.2ms, 0 error.
+Historical Phase M in-process cold/warm numbers are superseded by Y13 daemon-layer reports in `reports/y13_latency_baseline.json`.
 
 ## 9. Storage decision tree
 
@@ -160,14 +178,30 @@ Phase L 측정:
 
 ## 10. LOC budget (plan §D-I)
 
-총 4416 LOC (목표 ≤4300, plan §D-I 자유 확장 동의):
-- `core/`: 2473 (router + intent + lazy_loader + coach + daemon + mastery + feedback + drill + state + …)
-- `rag/`: 733 (encoder + search + index + corpus_loader + personalization + reranker)
-- `mission/`: 344 (extract.py + graph.py)
-- `anchors/`: 319 (extract.py + match.py)
-- `curation/`: 297
+Release acceptance canonical runtime LOC: **9496 / 9500**.
 
-Legacy hub ~80K LOC 대비 **-94.5%**.
+Corpus rebuild policy: run `tests/benchmarks/corpus_rebuild_readiness.py`
+before any dense index rebuild. The gate validates strict schema load, title
+uniqueness, stress-query exact coverage, qrels short-query wrong-owner absence,
+runtime snapshot freshness, and lexical sidecar freshness. The readiness audit
+tracks two hashes: `dense_corpus_sha256` for fields that affect embedding text
+and `full_corpus_sha256` for the runtime snapshot, including relations and
+metadata. `bin/corpus-build` writes both hashes into `state/index/manifest.json`
+and emits matching `corpus_snapshot.json` / `lexical_fusion_sidecar.json` into
+the selected `--index-dir`, so a remote release artifact is self-contained.
+`bin/index-pack --verify-only` is part of release acceptance and checks that the
+published archive contains both sidecars and the same dense/full corpus hashes
+as the current index.
+
+Core runtime package breakdown (Python files under package dirs): **8667 LOC**.
+- `core/`: 6500 (router + lazy_loader + coach + daemon + mastery + feedback + drill + profile/session/onboarding/state + …)
+- `rag/`: 1149 (encoder + search + index + corpus_loader + personalization + reranker)
+- `mission/`: 395 (extract.py + graph.py)
+- `anchors/`: 326 (extract.py + match.py)
+- `curation/`: 297
+- `scripts/`: 829
+
+Legacy hub ~80K LOC 대비 여전히 약 **8× smaller**.
 
 ## 11. Development principles (4 원칙, commit 자체점검)
 
@@ -180,6 +214,6 @@ Commit message에 self-check 4 항목 포함.
 
 ## 12. 참고
 
-- Plan: `/Users/idonghun/.claude/plans/misty-giggling-valley.md`
+- Plan: `/Users/idonghun/.claude/plans/idempotent-snacking-puppy.md`
 - Verification: [`verification-results.md`](verification-results.md)
 - Testing: [`testing-guide.md`](testing-guide.md)

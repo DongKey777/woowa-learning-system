@@ -65,6 +65,19 @@ def test_index_size_under_50mb_with_mock_encoder(tmp_path: Path) -> None:
     assert mb < 50, f"index unexpectedly large: {mb:.1f}MB"
 
 
+def test_index_size_excludes_neighbor_sidecars(tmp_path: Path) -> None:
+    index_dir = tmp_path / "index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "corpus_snapshot.json").write_text("x" * 1024, encoding="utf-8")
+
+    report = build_index(index_dir=index_dir, encode_fn=_mock_encode_factory())
+    actual_table_size = sum(
+        p.stat().st_size for p in (index_dir / "concepts.lance").rglob("*") if p.is_file()
+    )
+
+    assert report.index_size_bytes == actual_table_size
+
+
 def test_lance_search_returns_ranked_neighbors(tmp_path: Path) -> None:
     """Sanity: query vector → top-K results ordered by distance."""
     index_dir = tmp_path / "index"

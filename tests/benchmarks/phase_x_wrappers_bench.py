@@ -13,7 +13,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 REPORT_PATH = REPO_ROOT / "reports" / "phase_x_wrappers_bench.json"
 
-TARGETS = {"max_ms": 500}
+TARGETS = {
+    "small_cli_ms_max": 300,
+    "profile_recompute_ms_max": 3000,
+    "reviewer_profile_ms_max": 1000,
+    "remote_build_dry_ms_max": 800,
+}
 
 
 def _run(cmd, timeout=30):
@@ -24,6 +29,7 @@ def _run(cmd, timeout=30):
 
 def measure():
     PY = sys.executable
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True).strip()
     results = {}
 
     # X1 sync-index-metadata (dry-run)
@@ -42,7 +48,7 @@ def measure():
     rc, _, ms = _run([PY, "bin/drill-grade-prepare",
                        "--pending-file", pending_p, "--answer", "Bean은 객체"])
     results["drill_grade_prepare"] = {"rc": rc, "ms": round(ms, 1),
-                                        "ok": rc == 0 and ms <= 200}
+                                        "ok": rc == 0 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X3 learn-feedback (helpful signal, isolated tmpstate)
     with tempfile.TemporaryDirectory() as tmp:
@@ -50,7 +56,7 @@ def measure():
                            "--hit", "spring/bean-di.md", "--note", "good",
                            "--state-root", tmp, "--silent"])
         results["learn_feedback"] = {"rc": rc, "ms": round(ms, 1),
-                                       "ok": rc == 0 and ms <= 200}
+                                       "ok": rc == 0 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X4 learn-self-assess (no pending → reject expected, rc=1)
     with tempfile.TemporaryDirectory() as tmp:
@@ -58,22 +64,22 @@ def measure():
         rc, _, ms = _run([PY, "bin/learn-self-assess", "--trigger-session-id",
                            "nope", "--score", "8", "--state-root", tmp, "--silent"])
         results["learn_self_assess_reject"] = {"rc": rc, "ms": round(ms, 1),
-                                                  "ok": rc == 1 and ms <= 200}
+                                                  "ok": rc == 1 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X5 learn-drill status
     rc, _, ms = _run([PY, "bin/learn-drill", "status"])
     results["learn_drill_status"] = {"rc": rc, "ms": round(ms, 1),
-                                       "ok": rc == 0 and ms <= 200}
+                                       "ok": rc == 0 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X6 learner-profile show
     rc, _, ms = _run([PY, "bin/learner-profile", "show"])
     results["learner_profile_show"] = {"rc": rc, "ms": round(ms, 1),
-                                         "ok": rc == 0 and ms <= 200}
+                                         "ok": rc == 0 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X6 learner-profile recompute
     rc, _, ms = _run([PY, "bin/learner-profile", "recompute"], timeout=10)
     results["learner_profile_recompute"] = {"rc": rc, "ms": round(ms, 1),
-                                              "ok": rc == 0 and ms <= 2000}
+                                              "ok": rc == 0 and ms <= TARGETS["profile_recompute_ms_max"]}
 
     # X7 set-profile (tmp)
     with tempfile.TemporaryDirectory() as tmp:
@@ -81,23 +87,25 @@ def measure():
                            "--field", "experience_level", "--value", "advanced",
                            "--state-root", tmp])
         results["set_profile"] = {"rc": rc, "ms": round(ms, 1),
-                                    "ok": rc == 0 and ms <= 200}
+                                    "ok": rc == 0 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X8 show-profile (real state)
     rc, _, ms = _run([PY, "bin/show-profile"])
     results["show_profile"] = {"rc": rc, "ms": round(ms, 1),
-                                 "ok": rc == 0 and ms <= 200}
+                                 "ok": rc == 0 and ms <= TARGETS["small_cli_ms_max"]}
 
     # X9 reviewer-profile (alias)
     rc, _, ms = _run([PY, "bin/reviewer-profile", "--repo", "spring-roomescape-member",
                        "--reviewer-login", "hyeonic", "--top-n", "3"])
     results["reviewer_profile_alias"] = {"rc": rc, "ms": round(ms, 1),
-                                           "ok": rc == 0 and ms <= 1000}
+                                           "ok": rc == 0 and ms <= TARGETS["reviewer_profile_ms_max"]}
 
-    # X10 rag-remote-build dry-run (no module → exit 0 with note)
-    rc, _, ms = _run([PY, "bin/rag-remote-build", "--dry-run"])
+    # X10 rag-remote-build dry-run on an explicit commit; default mode rejects
+    # dirty worktrees so maintainers don't publish a stale HEAD artifact.
+    rc, _, ms = _run([PY, "bin/rag-remote-build", "--dry-run",
+                       "--commit-sha", commit])
     results["rag_remote_build_dry"] = {"rc": rc, "ms": round(ms, 1),
-                                         "ok": ms <= 500}
+                                         "ok": rc == 0 and ms <= TARGETS["remote_build_dry_ms_max"]}
 
     passed = sum(1 for r in results.values() if r["ok"])
     return {

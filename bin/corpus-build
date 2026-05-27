@@ -9,6 +9,8 @@ RAM. RunPod H100 builds the same index in ~5 min. Output index ≤16MB.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +18,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from rag.index import DEFAULT_CORPUS_DIR, DEFAULT_INDEX_DIR, _write_manifest, build_index  # noqa: E402
+from rag.corpus_loader import load_corpus, write_corpus_snapshot  # noqa: E402
+from core.lexical_fusion import _corpus_fingerprint as _dense_corpus_fingerprint, preload_lexical_entries  # noqa: E402
+
+
+def _full_corpus_fingerprint(corpus) -> str:
+    payload = {
+        cid: corpus.concepts[cid]
+        for cid in sorted(corpus.concepts)
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,11 +50,29 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
     )
     _write_manifest(report)
+    corpus = load_corpus(corpus_dir=args.corpus_dir, strict=True)
+    corpus_snapshot = write_corpus_snapshot(corpus, args.index_dir / "corpus_snapshot.json")
+    lexical_sidecar = preload_lexical_entries(
+        corpus,
+        args.index_dir / "lexical_fusion_sidecar.json",
+    )
+    manifest_path = report.index_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    dense_corpus_sha = _dense_corpus_fingerprint(corpus)
+    manifest["corpus_sha256"] = dense_corpus_sha
+    manifest["dense_corpus_sha256"] = dense_corpus_sha
+    manifest["full_corpus_sha256"] = _full_corpus_fingerprint(corpus)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     mb = report.index_size_bytes / 1024 / 1024
     print(f"  concepts: {report.concepts_indexed}")
     print(f"  encode_seconds: {report.elapsed_seconds:.1f}")
     print(f"  size: {mb:.2f} MB")
     print(f"  path: {report.index_path}")
+    print(f"  corpus_snapshot: {corpus_snapshot['size_bytes']} bytes")
+    print(f"  lexical_sidecar: {lexical_sidecar['source']}")
     return 0
 
 

@@ -11,6 +11,8 @@ from rag.corpus_loader import (
     DEFAULT_SCHEMA_PATH,
     encoding_text,
     load_corpus,
+    load_corpus_snapshot,
+    write_corpus_snapshot,
 )
 
 
@@ -81,6 +83,30 @@ def test_load_corpus_rejects_duplicate_ids(tmp_path: Path) -> None:
     assert len(loaded.concepts) == 1
     assert len(loaded.failures) == 1
     assert "duplicate id" in loaded.failures[0][1]
+
+
+def test_corpus_snapshot_round_trip(tmp_path: Path) -> None:
+    corpus = load_corpus(strict=True)
+    path = tmp_path / "corpus_snapshot.json"
+
+    stats = write_corpus_snapshot(corpus, path)
+    loaded = load_corpus_snapshot(path)
+
+    assert stats["concepts"] == 3199
+    assert loaded is not None
+    assert loaded.failures == []
+    assert loaded.concepts["spring/ioc-di-basics"]["title"]
+
+
+def test_corpus_snapshot_rejects_stale_count(tmp_path: Path) -> None:
+    corpus = load_corpus(strict=True)
+    path = tmp_path / "corpus_snapshot.json"
+    write_corpus_snapshot(corpus, path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["concept_count"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_corpus_snapshot(path) is None
 
 
 def test_schema_path_exists() -> None:

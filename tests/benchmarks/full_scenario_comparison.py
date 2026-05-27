@@ -12,6 +12,7 @@ Outputs JSON + Markdown report under reports/.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import statistics
@@ -22,7 +23,7 @@ from pathlib import Path
 
 PARADIGM_V2_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
 LEGACY_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
-RUNS = 3  # warm runs per scenario
+RUNS = 5  # warm runs per scenario; p95 needs more than 3 samples to resist CLI jitter
 TIMEOUT_S = 60
 
 
@@ -117,6 +118,7 @@ class Result:
     latency_ms_p50: float
     latency_ms_p95: float
     latency_ms_min: float
+    latency_samples_ms: list[float]
     output_chars: int
     token_est: int      # chars / 4
     detected_mode: str
@@ -145,7 +147,7 @@ def _parse_legacy_intent(output: str) -> str:
 
 
 def _run_paradigm_v2(prompt: str, repo: str | None) -> tuple[str, float]:
-    cmd = ["python3", "bin/ask", prompt]
+    cmd = ["bin/ask", prompt]
     if repo:
         cmd.extend(["--repo", repo])
     t0 = time.perf_counter()
@@ -166,6 +168,14 @@ def _run_legacy(prompt: str, repo: str | None) -> tuple[str, float]:
                          env={**os.environ, "WOOWA_SESSION_MODE": "development"})
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return res.stdout + res.stderr, elapsed_ms
+
+
+def _percentile(samples: list[float], p: float) -> float | None:
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    idx = max(0, min(len(ordered) - 1, math.ceil(p * len(ordered)) - 1))
+    return ordered[idx]
 
 
 def _bench(scenario: Scenario, system: str) -> Result:
@@ -193,13 +203,14 @@ def _bench(scenario: Scenario, system: str) -> Result:
     if not times:
         return Result(sid=scenario.sid, system=system,
                       latency_ms_p50=-1, latency_ms_p95=-1, latency_ms_min=-1,
+                      latency_samples_ms=[],
                       output_chars=0, token_est=0,
                       detected_mode="?", expected_mode=scenario.expected_mode,
                       mode_correct=None, evidence_hits=0,
                       evidence_total=len(scenario.evidence_markers), err=err)
 
     p50 = statistics.median(times)
-    p95 = sorted(times)[min(len(times) - 1, int(len(times) * 0.95))]
+    p95 = _percentile(times, 0.95)
     detected = (_parse_paradigm_v2_mode(last_output) if system == "paradigm-v2"
                 else _parse_legacy_intent(last_output))
     mode_correct = (detected == scenario.expected_mode) if system == "paradigm-v2" else None
@@ -209,8 +220,9 @@ def _bench(scenario: Scenario, system: str) -> Result:
     return Result(
         sid=scenario.sid, system=system,
         latency_ms_p50=round(p50, 1),
-        latency_ms_p95=round(p95, 1),
+        latency_ms_p95=round(p95 or 0.0, 1),
         latency_ms_min=round(min(times), 1),
+        latency_samples_ms=[round(t, 1) for t in times],
         output_chars=len(last_output),
         token_est=len(last_output) // 4,
         detected_mode=detected,
@@ -231,8 +243,12 @@ def run_all() -> dict:
         results_legacy.append(_bench(sc, "legacy"))
 
     # Aggregate
-    v2_p50 = [r.latency_ms_p50 for r in results_v2 if r.latency_ms_p50 > 0]
-    legacy_p50 = [r.latency_ms_p50 for r in results_legacy if r.latency_ms_p50 > 0]
+    v2_samples = [t for r in results_v2 for t in r.latency_samples_ms if t > 0]
+    legacy_samples = [t for r in results_legacy for t in r.latency_samples_ms if t > 0]
+    v2_p50 = _percentile(v2_samples, 0.50)
+    v2_p95 = _percentile(v2_samples, 0.95)
+    legacy_p50 = _percentile(legacy_samples, 0.50)
+    legacy_p95 = _percentile(legacy_samples, 0.95)
     v2_mode_correct = [r for r in results_v2 if r.mode_correct is True]
     v2_mode_total = [r for r in results_v2 if r.mode_correct is not None]
     v2_evidence_pct = (sum(r.evidence_hits for r in results_v2) /
@@ -250,22 +266,21 @@ def run_all() -> dict:
         },
         "summary": {
             "paradigm_v2": {
-                "p50_overall_ms": round(statistics.median(v2_p50), 1) if v2_p50 else None,
-                "p95_overall_ms": round(max(v2_p50), 1) if v2_p50 else None,
+                "p50_overall_ms": round(v2_p50, 1) if v2_p50 is not None else None,
+                "p95_overall_ms": round(v2_p95, 1) if v2_p95 is not None else None,
                 "mode_dispatch_correct": f"{len(v2_mode_correct)}/{len(v2_mode_total)}",
                 "evidence_coverage_pct": round(v2_evidence_pct, 1),
                 "avg_output_chars": round(statistics.mean(r.output_chars for r in results_v2), 0),
             },
             "legacy": {
-                "p50_overall_ms": round(statistics.median(legacy_p50), 1) if legacy_p50 else None,
-                "p95_overall_ms": round(max(legacy_p50), 1) if legacy_p50 else None,
+                "p50_overall_ms": round(legacy_p50, 1) if legacy_p50 is not None else None,
+                "p95_overall_ms": round(legacy_p95, 1) if legacy_p95 is not None else None,
                 "evidence_coverage_pct": round(legacy_evidence_pct, 1),
                 "avg_output_chars": round(statistics.mean(r.output_chars for r in results_legacy), 0),
             },
             "comparison": {
-                "speedup_p50": (round(statistics.median(legacy_p50) /
-                                      statistics.median(v2_p50), 1)
-                                if v2_p50 and legacy_p50 else None),
+                "speedup_p50": round(legacy_p50 / v2_p50, 1) if v2_p50 and legacy_p50 else None,
+                "speedup_p95": round(legacy_p95 / v2_p95, 1) if v2_p95 and legacy_p95 else None,
             },
         },
         "scenarios": [asdict(s) for s in SCENARIOS],
@@ -288,7 +303,7 @@ def render_markdown(report: dict) -> str:
         f"| Metric | Paradigm-v2 | Legacy | Δ |",
         f"|---|---|---|---|",
         f"| p50 latency | {s['paradigm_v2']['p50_overall_ms']}ms | {s['legacy']['p50_overall_ms']}ms | {s['comparison']['speedup_p50']}× faster |",
-        f"| p95 latency | {s['paradigm_v2']['p95_overall_ms']}ms | {s['legacy']['p95_overall_ms']}ms | — |",
+        f"| p95 latency | {s['paradigm_v2']['p95_overall_ms']}ms | {s['legacy']['p95_overall_ms']}ms | {s['comparison']['speedup_p95']}× faster |",
         f"| Mode dispatch | {s['paradigm_v2']['mode_dispatch_correct']} | n/a (different schema) | — |",
         f"| Evidence coverage | {s['paradigm_v2']['evidence_coverage_pct']}% | {s['legacy']['evidence_coverage_pct']}% | — |",
         f"| Avg output chars | {s['paradigm_v2']['avg_output_chars']:.0f} | {s['legacy']['avg_output_chars']:.0f} | — |",

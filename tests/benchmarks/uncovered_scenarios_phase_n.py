@@ -20,20 +20,17 @@ from __future__ import annotations
 
 import json
 import os
-import random
-import re
 import socket
 import sqlite3
-import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
 STATE = REPO_ROOT / "state"
+LAST_RESTART_MASTERY_CHECK: dict | None = None
 
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -45,6 +42,7 @@ class ScenarioResult:
     observed: str
     passed: bool
     method: str
+    elapsed_ms: float = 0.0
     details: dict = field(default_factory=dict)
 
 
@@ -63,7 +61,6 @@ def daemon_ask(prompt: str, repo: str | None = None,
         if repo:
             req["repo"] = repo
         sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        sock.shutdown(socket.SHUT_WR)
         data = b""
         while True:
             chunk = sock.recv(65536)
@@ -76,48 +73,57 @@ def daemon_ask(prompt: str, repo: str | None = None,
         return None, 0.0, f"{type(e).__name__}: {e}"[:120]
 
 
+def restart_daemon(log_path: str) -> tuple[bool, dict]:
+    subprocess.run(["bin/rag-daemon", "stop"], cwd=REPO_ROOT,
+                   capture_output=True, text=True)
+    res = subprocess.run(
+        ["bin/rag-daemon", "start-bg", "--log-path", log_path,
+         "--timeout-s", "90"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=95,
+    )
+    ok = res.returncode == 0 and "started" in res.stdout
+    return ok, {"exit_code": res.returncode, "stdout": res.stdout.strip(),
+                "stderr_preview": res.stderr[:200]}
+
+
+def mastered_concepts() -> list[str]:
+    conn = sqlite3.connect(STATE / "learner" / "mastery_graph.sqlite")
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT concept_id FROM mastery WHERE bloom_level='mastered'"
+    ).fetchall()
+    conn.close()
+    return [r["concept_id"] for r in rows]
+
+
 # ── N1 state persistence ──────────────────────────────────────────────────
 
 def n1_state_persistence() -> ScenarioResult:
     """Mastery in SQLite must survive daemon restart."""
-    conn = sqlite3.connect(STATE / "learner" / "mastery_graph.sqlite")
-    conn.row_factory = sqlite3.Row
-    mastered_before = [r["concept_id"] for r in conn.execute(
-        "SELECT concept_id FROM mastery WHERE bloom_level='mastered'").fetchall()]
-    conn.close()
-
-    subprocess.run(["bin/rag-daemon", "stop"], cwd=REPO_ROOT,
-                   capture_output=True, text=True)
-    subprocess.run(
-        ["bin/rag-daemon", "start-bg", "--log-path", "/tmp/daemon_n1.log",
-         "--timeout-s", "90"],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=95,
-    )
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < 30:
-        try:
-            if "ready" in Path("/tmp/daemon_n1.log").read_text():
-                break
-        except FileNotFoundError:
-            pass
-        time.sleep(0.2)
-
-    conn = sqlite3.connect(STATE / "learner" / "mastery_graph.sqlite")
-    conn.row_factory = sqlite3.Row
-    mastered_after = [r["concept_id"] for r in conn.execute(
-        "SELECT concept_id FROM mastery WHERE bloom_level='mastered'").fetchall()]
-    conn.close()
+    global LAST_RESTART_MASTERY_CHECK
+    if LAST_RESTART_MASTERY_CHECK:
+        mastered_before = LAST_RESTART_MASTERY_CHECK["before"]
+        mastered_after = LAST_RESTART_MASTERY_CHECK["after"]
+        restarted = LAST_RESTART_MASTERY_CHECK["restarted"]
+        restart_details = LAST_RESTART_MASTERY_CHECK["restart_details"]
+        method = "reuse N3 daemon restart evidence → compare mastery before/after"
+    else:
+        mastered_before = mastered_concepts()
+        restarted, restart_details = restart_daemon("/tmp/daemon_n1.log")
+        mastered_after = mastered_concepts()
+        method = "dump mastery sqlite → restart daemon → re-dump → compare"
 
     survived = sorted(mastered_before) == sorted(mastered_after)
     return ScenarioResult(
         name="N1_state_persistence",
         description="mastery survives daemon stop→start",
         observed=f"{len(mastered_before)} mastered before, {len(mastered_after)} after, "
-                 f"identical: {survived}",
-        passed=survived and len(mastered_after) > 0,
-        method="dump mastery sqlite → restart daemon → re-dump → compare",
+                 f"identical: {survived}, restarted: {restarted}",
+        passed=restarted and survived and len(mastered_after) > 0,
+        method=method,
         details={"mastered_before_n": len(mastered_before),
-                 "mastered_after_n": len(mastered_after)},
+                 "mastered_after_n": len(mastered_after),
+                 "restart": restart_details},
     )
 
 
@@ -149,7 +155,9 @@ def n2_three_turn_history_foldin() -> ScenarioResult:
 
 def n3_fallback_no_daemon() -> ScenarioResult:
     """Stop daemon → bin/ask --no-daemon should still work (in-process)."""
-    # Stop daemon
+    global LAST_RESTART_MASTERY_CHECK
+    mastered_before = mastered_concepts()
+    # Stop daemon.
     subprocess.run(["bin/rag-daemon", "stop"], cwd=REPO_ROOT,
                    capture_output=True, text=True)
     time.sleep(0.5)
@@ -160,22 +168,18 @@ def n3_fallback_no_daemon() -> ScenarioResult:
         env={**os.environ, "WOOWA_SESSION_MODE": "development"},
     )
 
-    # Restart daemon for subsequent scenarios
-    subprocess.run(
-        ["bin/rag-daemon", "start-bg", "--log-path", "/tmp/daemon_n3.log",
-         "--timeout-s", "90"],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=95,
-    )
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < 30:
-        try:
-            if "ready" in Path("/tmp/daemon_n3.log").read_text():
-                break
-        except FileNotFoundError:
-            pass
-        time.sleep(0.2)
+    # Restart daemon for subsequent scenarios. start-bg already waits for ping.
+    restarted, restart_details = restart_daemon("/tmp/daemon_n3.log")
+    mastered_after = mastered_concepts()
+    LAST_RESTART_MASTERY_CHECK = {
+        "before": mastered_before,
+        "after": mastered_after,
+        "restarted": restarted,
+        "restart_details": restart_details,
+    }
 
-    ok = res.returncode == 0 and len(res.stdout) > 500 and "mode" in res.stdout.lower()
+    ok = (res.returncode == 0 and len(res.stdout) > 500
+          and "mode" in res.stdout.lower() and restarted)
     return ScenarioResult(
         name="N3_fallback_no_daemon",
         description="bin/ask --no-daemon in-process fallback works",
@@ -183,7 +187,8 @@ def n3_fallback_no_daemon() -> ScenarioResult:
         passed=ok,
         method="daemon stop → bin/ask --no-daemon → check stdout produced",
         details={"exit_code": res.returncode, "stdout_chars": len(res.stdout),
-                 "stderr_preview": res.stderr[:200]},
+                 "stderr_preview": res.stderr[:200],
+                 "restart": restart_details},
     )
 
 
@@ -401,6 +406,7 @@ def n12_history_append_atomicity() -> ScenarioResult:
 
 def main() -> int:
     print("=== Phase N additional uncovered scenarios ===\n", flush=True)
+    run_t0 = time.perf_counter()
     fns = [
         n2_three_turn_history_foldin,
         n4_long_prompt,
@@ -417,26 +423,37 @@ def main() -> int:
     ]
     all_results: list[ScenarioResult] = []
     for fn in fns:
+        t0 = time.perf_counter()
         try:
-            t0 = time.perf_counter()
             r = fn()
-            elapsed = (time.perf_counter() - t0) * 1000
-            marker = "✅" if r.passed else "❌"
-            print(f"  {marker} {r.name:<35} {r.observed[:80]}  ({elapsed:.0f}ms)", flush=True)
-            all_results.append(r)
         except Exception as e:
-            print(f"  ⚠ {fn.__name__} errored: {type(e).__name__}: {e}", flush=True)
+            r = ScenarioResult(
+                name=fn.__name__,
+                description="scenario raised an exception",
+                observed=f"{type(e).__name__}: {e}",
+                passed=False,
+                method="exception guard",
+                details={"error_type": type(e).__name__, "error": str(e)[:500]},
+            )
+        r.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        marker = "✅" if r.passed else "❌"
+        print(f"  {marker} {r.name:<35} {r.observed[:80]}  ({r.elapsed_ms:.0f}ms)",
+              flush=True)
+        all_results.append(r)
 
     passed = sum(1 for r in all_results if r.passed)
+    total_elapsed_ms = round((time.perf_counter() - run_t0) * 1000, 1)
     out = REPO_ROOT / "reports" / "phase_n_uncovered2.json"
     out.write_text(json.dumps({
         "metadata": {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                     "branch": "paradigm-v2"},
+                     "branch": "paradigm-v2",
+                     "total_elapsed_ms": total_elapsed_ms},
         "scenarios": [asdict(r) for r in all_results],
         "passed_n": passed, "total_n": len(all_results),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nReport: {out}\nPass: {passed}/{len(all_results)}")
-    return 0
+    print(f"Elapsed: {total_elapsed_ms:.0f}ms")
+    return 0 if passed == len(all_results) else 1
 
 
 if __name__ == "__main__":

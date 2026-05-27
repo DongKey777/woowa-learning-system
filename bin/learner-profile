@@ -7,16 +7,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import shutil
 import sys
-import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from core.profile import recompute_profile  # noqa: E402
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
 
 PROFILE = "profile.json"
@@ -33,17 +29,37 @@ def cmd_show(args) -> int:
 
 
 def cmd_recompute(args) -> int:
+    from core.profile import rebuild_unified_projection, recompute_profile
+
     profile = recompute_profile(args.learner_id, state_root=args.state_root)
-    print(json.dumps({
+    payload = {
         "computed_at": profile["computed_at"],
         "experience_level": profile["experience_level"],
         "mastered_n": len(profile["concepts"]["mastered"]),
         "events_total": profile["activity"]["events_total"],
-    }, ensure_ascii=False, indent=2))
+    }
+    if args.rebuild_unified_projection:
+        unified = rebuild_unified_projection(
+            args.learner_id,
+            state_root=args.state_root,
+            profile=profile,
+            now=profile.get("computed_at"),
+        )
+        payload["unified_projection"] = {
+            "rebuilt": True,
+            "path": str(args.state_root / "learner" / "unified_profile.json"),
+            "priority_focus_n": len(
+                (unified.get("reconciled") or {}).get("priority_focus") or []
+            ),
+            "cs_view_present": unified.get("cs_view") is not None,
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_set(args) -> int:
+    import time
+
     p = args.state_root / "learner" / PROFILE
     profile = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {
         "schema_version": "v3", "learner_id": args.learner_id, "concepts": {
@@ -65,6 +81,8 @@ def cmd_set(args) -> int:
 
 
 def cmd_clear(args) -> int:
+    import shutil
+
     if not args.yes:
         print("ERROR: --yes required to confirm destructive clear",
               file=sys.stderr)
@@ -77,13 +95,14 @@ def cmd_clear(args) -> int:
     return 0
 
 
-_PII_PATTERNS = [
-    re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"),
-]
-
-
 def cmd_redact(args) -> int:
+    import re
+    import shutil
+
+    pii_patterns = [
+        re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+        re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"),
+    ]
     target_file = args.state_root / "learner" / "history.jsonl"
     if not target_file.exists():
         print(json.dumps({"missing": True}, ensure_ascii=False, indent=2),
@@ -95,7 +114,7 @@ def cmd_redact(args) -> int:
     out_lines = []
     for line in target_file.read_text(encoding="utf-8").splitlines():
         new = line
-        for pat in _PII_PATTERNS:
+        for pat in pii_patterns:
             new, n = pat.subn("[REDACTED]", new)
             redacted_n += n
         out_lines.append(new)
@@ -111,7 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("show")
-    sub.add_parser("recompute")
+    r = sub.add_parser("recompute")
+    r.add_argument("--rebuild-unified-projection", action="store_true")
     s = sub.add_parser("set")
     s.add_argument("--field", choices=("mastered", "proficient", "uncertain",
                                          "underexplored"))

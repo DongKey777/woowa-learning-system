@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Pack and verify the local Lance index release archive."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR = REPO_ROOT / "state"
+DEFAULT_INDEX = STATE_DIR / "index"
+DEFAULT_ARCHIVE = STATE_DIR / "index.tar.zst"
+REQUIRED_FILES = (
+    "manifest.json",
+    "corpus_snapshot.json",
+    "lexical_fusion_sidecar.json",
+)
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_manifest(index_dir: Path) -> dict:
+    manifest_path = index_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError(f"manifest missing: {manifest_path}")
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"manifest is invalid JSON: {manifest_path}") from exc
+
+
+def _validate_index_dir(index_dir: Path) -> dict:
+    missing = [name for name in REQUIRED_FILES if not (index_dir / name).exists()]
+    if not (index_dir / "concepts.lance").exists():
+        missing.append("concepts.lance")
+    manifest = _load_manifest(index_dir)
+    dense_sha = manifest.get("dense_corpus_sha256") or manifest.get("corpus_sha256")
+    full_sha = manifest.get("full_corpus_sha256")
+    problems = []
+    if missing:
+        problems.append(f"missing files: {', '.join(missing)}")
+    if not dense_sha:
+        problems.append("manifest missing dense_corpus_sha256")
+    if not full_sha:
+        problems.append("manifest missing full_corpus_sha256")
+    if problems:
+        raise ValueError("; ".join(problems))
+    return {
+        "manifest": manifest,
+        "dense_corpus_sha256": dense_sha,
+        "full_corpus_sha256": full_sha,
+        "required_files": list(REQUIRED_FILES),
+    }
+
+
+def _normalized_info(tar: tarfile.TarFile, path: Path, arcname: Path) -> tarfile.TarInfo:
+    info = tar.gettarinfo(str(path), arcname=str(arcname))
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mtime = 0
+    return info
+
+
+def _add_tree(tar: tarfile.TarFile, path: Path, arcname: Path) -> None:
+    if path.name.startswith(".") or path.name == "__pycache__":
+        return
+    info = _normalized_info(tar, path, arcname)
+    if path.is_dir():
+        tar.addfile(info)
+        for child in sorted(path.iterdir(), key=lambda p: p.name):
+            _add_tree(tar, child, arcname / child.name)
+        return
+    with path.open("rb") as f:
+        tar.addfile(info, f)
+
+
+def pack_index(index_dir: Path, archive: Path, *, level: int, force: bool) -> dict:
+    if shutil.which("zstd") is None:
+        raise RuntimeError("zstd CLI is required to pack index archives")
+    info = _validate_index_dir(index_dir)
+    if archive.exists() and not force:
+        raise FileExistsError(f"{archive} exists; pass --force")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    tmp_archive = archive.with_suffix(archive.suffix + f".tmp-{os.getpid()}")
+    if tmp_archive.exists():
+        tmp_archive.unlink()
+    cmd = ["zstd", f"-{level}", "-T0", "-f", "-o", str(tmp_archive), "-"]
+    t0 = time.perf_counter()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        with tarfile.open(fileobj=proc.stdin, mode="w|") as tar:
+            _add_tree(tar, index_dir, Path("index"))
+        proc.stdin.close()
+        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        rc = proc.wait()
+    except Exception:
+        proc.kill()
+        raise
+    if rc != 0:
+        tmp_archive.unlink(missing_ok=True)
+        raise RuntimeError(f"zstd failed: {stderr[:400]}")
+    tmp_archive.replace(archive)
+    return {
+        "archive": str(archive),
+        "archive_size_bytes": archive.stat().st_size,
+        "archive_sha256": _sha256(archive),
+        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        **{k: info[k] for k in ("dense_corpus_sha256", "full_corpus_sha256")},
+    }
+
+
+def verify_archive(archive: Path, current_index: Path) -> dict:
+    if shutil.which("zstd") is None:
+        raise RuntimeError("zstd CLI is required to verify index archives")
+    current = _validate_index_dir(current_index)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        zstd = subprocess.Popen(
+            ["zstd", "-d", "-c", str(archive)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        tar = subprocess.Popen(
+            ["tar", "-xf", "-", "-C", str(tmp_dir)],
+            stdin=zstd.stdout,
+            stderr=subprocess.PIPE,
+        )
+        assert zstd.stdout is not None
+        zstd.stdout.close()
+        tar_stderr = tar.communicate()[1]
+        zstd_stderr = zstd.communicate()[1]
+        if zstd.returncode != 0 or tar.returncode != 0:
+            raise RuntimeError(
+                "archive extract failed: "
+                f"zstd={zstd_stderr.decode(errors='replace')[:200]} "
+                f"tar={tar_stderr.decode(errors='replace')[:200]}"
+            )
+        extracted = _validate_index_dir(tmp_dir / "index")
+    current_dense = current["dense_corpus_sha256"]
+    current_full = current["full_corpus_sha256"]
+    archive_dense = extracted["dense_corpus_sha256"]
+    archive_full = extracted["full_corpus_sha256"]
+    return {
+        "archive": str(archive),
+        "archive_size_bytes": archive.stat().st_size,
+        "archive_sha256": _sha256(archive),
+        "current_dense_corpus_sha256": current_dense,
+        "archive_dense_corpus_sha256": archive_dense,
+        "current_full_corpus_sha256": current_full,
+        "archive_full_corpus_sha256": archive_full,
+        "sidecars_in_archive": True,
+        "pass": current_dense == archive_dense and current_full == archive_full,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX)
+    parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
+    parser.add_argument("--level", type=int, default=19)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.verify_only:
+            report = {"action": "verify", **verify_archive(args.archive, args.index_dir)}
+        else:
+            packed = pack_index(
+                args.index_dir, args.archive, level=args.level, force=args.force
+            )
+            verified = verify_archive(args.archive, args.index_dir)
+            report = {"action": "pack", **packed, "verified": verified["pass"]}
+    except Exception as exc:  # noqa: BLE001
+        if args.json:
+            print(json.dumps({"pass": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"[index-pack] ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(
+            "[index-pack] "
+            f"{report['action']} ok sha256={report['archive_sha256']} "
+            f"size={report['archive_size_bytes']} bytes"
+        )
+    return 0 if report.get("pass", report.get("verified", False)) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

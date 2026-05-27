@@ -100,3 +100,23 @@ def test_compose_omits_artifact_section_when_empty() -> None:
     )
     prompt, _, _, _ = compose(r, {}, "git status")
     assert "Loaded artifacts" not in prompt
+
+
+def test_compose_surfaces_cognitive_trigger() -> None:
+    r = route("DI가 뭐야")
+    prompt, _, _, _ = compose(
+        r,
+        {
+            "cognitive_trigger": {
+                "trigger_type": "self_assessment",
+                "trigger_session_id": "s1",
+                "reason": "recent_code_attempt_without_self_assessment",
+                "markdown": "## 자기 점검\n- 1-10점으로 적어줘.",
+            }
+        },
+        "DI가 뭐야",
+    )
+
+    assert "### cognitive_trigger" in prompt
+    assert "self_assessment" in prompt
+    assert "trigger_session_id: s1" in prompt
