@@ -31,6 +31,11 @@ DEFAULT_CONCEPT_GRAPH = REPO_ROOT / "corpus" / "concept_graph.json"
 _PERSONALIZATION_DISABLED = {"0", "false", "off", "no"}
 
 
+def _empty_mastery() -> dict:
+    counts = {l: 0 for l in ("attempted", "familiar", "proficient", "mastered")}
+    return {"summary": {"counts": counts, "total_tracked": 0}, "by_level": {}}
+
+
 def load(
     route: RouteDecision,
     repo: str | None = None,
@@ -182,16 +187,17 @@ def _load_mastery(state_root: Path) -> dict:
     Single sqlite connection (summary + by_level in one open)."""
     db = state_root / "learner" / "mastery_graph.sqlite"
     if not db.exists():
-        return {"summary": {"counts": {l: 0 for l in ("attempted", "familiar", "proficient", "mastered")},
-                            "total_tracked": 0},
-                "by_level": {}}
+        return _empty_mastery()
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     try:
         # summary
         counts = {l: 0 for l in ("attempted", "familiar", "proficient", "mastered")}
-        for row in conn.execute("SELECT bloom_level, COUNT(*) c FROM mastery GROUP BY bloom_level"):
-            counts[row["bloom_level"]] = row["c"]
+        try:
+            for row in conn.execute("SELECT bloom_level, COUNT(*) c FROM mastery GROUP BY bloom_level"):
+                counts[row["bloom_level"]] = row["c"]
+        except sqlite3.OperationalError:
+            return _empty_mastery()
         # by_level
         by_level: dict[str, list[str]] = {}
         rows = conn.execute(

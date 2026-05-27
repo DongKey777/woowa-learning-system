@@ -19,7 +19,7 @@ mode: cs_qa
 budget: 4500
 personas: MENTOR, SOCRATIC
 artifacts loaded:
-  - concept_graph (3259 nodes)
+  - concept_graph (3279 nodes)
   - mastery_graph (mastered=5, proficient=2, ...)
   - rag_hits (top 5):
       1. spring/bean-di-basics — Bean DI 기초 (score 0.94)

@@ -11,6 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import core.drill as drill_module  # noqa: E402
 from core.drill import (  # noqa: E402
     DIM_WEIGHTS, SPACED_BANDS_DAYS,
     DrillOffer, DrillScore,
@@ -40,6 +41,49 @@ def test_build_offer_uses_real_corpus_concept(tmp_path: Path) -> None:
     # Pending file persisted
     pending = sr / "learner" / "drill_pending.json"
     assert pending.exists()
+
+
+def test_build_offer_uses_schema_object_learner_query_pattern(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus_dir = tmp_path / "concepts"
+    (corpus_dir / "spring").mkdir(parents=True)
+    concept = {
+        "id": "spring/pattern-only",
+        "title": "Pattern Only",
+        "category": "spring",
+        "level": "beginner",
+        "summary": "Pattern fallback test concept.",
+        "body_markdown": "Body content here for testing learner pattern fallback.",
+        "expected_queries": [],
+        "learner_query_patterns": [
+            {
+                "pattern": "스키마 객체 learner query pattern도 drill 질문이 돼?",
+                "match_count": 1,
+                "added_at": "2026-05-27",
+            }
+        ],
+        "metadata": {
+            "schema_version": "v2",
+            "created_at": "2026-05-27",
+            "last_modified": "2026-05-27",
+        },
+    }
+    (corpus_dir / "spring" / "pattern-only.json").write_text(
+        json.dumps(concept, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(drill_module, "CORPUS_DIR", corpus_dir)
+
+    offer = build_offer_if_due(
+        state_root=_seed_state(tmp_path),
+        uncertain_concept_ids=["spring/pattern-only"],
+    )
+
+    assert offer is not None
+    assert offer.question == "스키마 객체 learner query pattern도 drill 질문이 돼?"
+    assert offer.source == "learner_query_patterns[0]"
 
 
 def test_build_offer_returns_none_when_pending_exists(tmp_path: Path) -> None:

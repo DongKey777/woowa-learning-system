@@ -34,7 +34,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-REPO_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LEGACY_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
 STATE = REPO_ROOT / "state"
 

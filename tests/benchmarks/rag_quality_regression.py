@@ -28,7 +28,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-REPO_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 HISTORY = REPO_ROOT / "state" / "learner" / "history.jsonl"
 N_SAMPLES = 200
 SEED = 42

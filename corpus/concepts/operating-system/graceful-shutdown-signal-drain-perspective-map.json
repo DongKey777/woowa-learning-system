@@ -1,0 +1,68 @@
+{
+  "id": "operating-system/graceful-shutdown-signal-drain-perspective-map",
+  "title": "Graceful Shutdown, Signal, Drain Perspective Map",
+  "category": "operating-system",
+  "level": "advanced",
+  "summary": "SIGTERM, readiness off, load balancer drain, in-flight request completion을 연결하는 운영 종료 perspective map",
+  "body_markdown": "# Graceful Shutdown, Signal, Drain Perspective Map\n\n## 이 문서가 맡는 질문\ngraceful shutdown은 프로세스를 죽이는 명령이 아니라 새 요청 차단, 기존 요청 완료, resource cleanup, timeout 이후 강제 종료의 순서다.\n\n## 빠른 분기\nSIGTERM 직후 readiness off, LB drain, in-flight wait, background job stop, SIGKILL budget을 본다.\n\n## 실전 시나리오\n배포 중 SIGTERM을 받았는데 readiness가 계속 true면 LB가 새 요청을 보내고, 몇 초 뒤 SIGKILL로 in-flight 요청이 끊긴다. readiness와 preStop/drain budget이 맞아야 한다.\n\n## CS 배경\nPOSIX signal은 process에 비동기 이벤트를 전달한다. Kubernetes나 systemd는 graceful period를 주지만 시간이 지나면 강제 종료한다. LB drain은 traffic routing과 process lifecycle 사이의 분산 coordination이다.\n\n## shutdown timeline 예시\n```text\nt0 SIGTERM\nt0+0s readiness=false\nt0+2s LB stops new requests\nt0+25s in-flight complete\nt0+30s force exit budget\n```\ntimeline을 수치로 정해야 drain과 terminationGracePeriod가 맞는지 검증할 수 있다.\n\n## 깊게 볼 포인트\nlong polling, SSE, batch job은 shutdown budget을 쉽게 넘긴다. background worker는 새 작업 claim을 멈추고 lease를 반납하거나 checkpoint를 남겨야 한다.\n\n## 다음 행동\n1. SIGTERM handler를 둔다\n2. readiness를 먼저 내린다\n3. in-flight와 worker drain을 측정한다\n4. 강제 종료 전 cleanup timeout을 정한다\n\n## 확인 질문\n새 요청은 언제부터 막히고, 이미 받은 요청/작업은 언제까지 책임지는가?\n\n## 추가 실전 포인트\nGraceful shutdown은 startup probe/readiness probe와도 연결된다. 종료 시작 시 readiness를 먼저 false로 만들어 새 traffic을 빼고, 이미 들어온 요청은 server shutdown timeout 안에서 마무리한다. worker는 새 job claim을 멈춘 뒤 처리 중 job을 완료하거나 lease/checkpoint를 남긴다. 이 순서가 없으면 배포 때만 재현되는 499, 502, 중복 job이 생긴다.\n\n## 추가 실전 포인트\nKubernetes와 LB의 시간 예산은 서로 다르다. readiness=false가 endpoint에서 빠지는 시간, external LB deregistration delay, application server shutdown timeout, `terminationGracePeriodSeconds`가 모두 합쳐져야 한다. termination grace가 30초인데 LB deregistration만 25초 걸리면 app에 남는 drain 시간은 거의 없다.\n\n## 판단 매트릭스\n- Signal: 종료 의도를 process에 알린다\n- Readiness: traffic routing에서 제외한다\n- Drain: in-flight 요청과 worker를 마무리한다\n- 리뷰 질문: 종료 budget 안에 worst-case 요청이 끝나는가\n\n## 측정 지표와 레이턴시\nshutdown duration, in-flight aborted count, readiness propagation latency, LB 5xx, job duplicate count, deploy p95를 본다. 품질은 배포 중 오류 감소, 성능은 drain 처리량, 레이턴시는 shutdown 완료 p95로 판단한다.\n\n## 자주 하는 오해\n- SIGTERM 받으면 즉시 exit해도 된다고 본다\n- readiness와 liveness를 혼동한다\n- worker job 중복 처리를 고려하지 않는다\n\n이 오해를 줄이려면 먼저 실패 모드와 관찰 증거를 나누고, 그 다음 용어를 붙인다. 같은 현상이 자료구조, 런타임, 네트워크, 운영 지표에서 다르게 보일 수 있으므로 code path와 runtime signal을 함께 확인한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 signal, readiness, drain, force kill을 순서로 설명해야 한다. 마지막에는 aborted count, LB 5xx, shutdown p95로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. SIGTERM 통합 테스트를 만든다\n2. readiness off 후 새 요청 차단 시간을 측정한다\n3. long request와 background job을 주입한다\n4. termination budget을 조정한다\n5. 배포 중 5xx와 aborted count를 기록한다\n\n이 루프를 지키면 Graceful Shutdown, Signal, Drain Perspective Map 문서는 단순 정의 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nSIGTERM, readiness off, load balancer drain, in-flight request completion을 연결하는 운영 종료 perspective map\n",
+  "aliases": [
+    "graceful shutdown SIGTERM drain",
+    "readiness liveness drain",
+    "terminationGracePeriod shutdown",
+    "LB drain in-flight",
+    "Graceful Shutdown, Signal, Drain Perspective Map",
+    "graceful shutdown signal drain perspective map"
+  ],
+  "expected_queries": [
+    "SIGTERM 받으면 graceful shutdown은 어떤 순서로 해야 해?",
+    "배포 중 요청이 끊기지 않게 drain을 어떻게 설계해?",
+    "graceful shutdown에서 signal, readiness, LB drain, latency를 어떻게 맞춰?"
+  ],
+  "symptoms": [
+    "SIGTERM 받으면 즉시 exit해도 된다고 본다",
+    "readiness와 liveness를 혼동한다",
+    "worker job 중복 처리를 고려하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-signal-graceful-shutdown-primer",
+      "operating-system/signal-graceful-shutdown-primer",
+      "operating-system/proc-pid-status-signal-fields-debugging-primer"
+    ],
+    "next_docs": [
+      "system-design/load-balancer-drain-and-affinity-primer"
+    ],
+    "confusable_with": [
+      "operating-system/signals-process-supervision"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "Kubernetes graceful shutdown 순서는?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "readiness false와 LB drain은 뭐가 달라?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "terminationGracePeriod는 어떻게 잡아?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch4"
+      }
+    ]
+  }
+}

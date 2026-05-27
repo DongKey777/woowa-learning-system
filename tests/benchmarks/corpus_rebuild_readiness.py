@@ -10,7 +10,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-REPO_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 import sys
 

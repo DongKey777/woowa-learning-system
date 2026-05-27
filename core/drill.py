@@ -121,6 +121,16 @@ def _build_expected_terms(concept: dict, n: int = 8) -> list[str]:
     return out[:n]
 
 
+def _learner_query_pattern_text(entry: object) -> str | None:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        pattern = entry.get("pattern")
+        if isinstance(pattern, str):
+            return pattern
+    return None
+
+
 def build_offer_if_due(
     learner_id: str = "default",
     state_root: Path = DEFAULT_STATE_ROOT,
@@ -155,9 +165,11 @@ def build_offer_if_due(
         if eq and isinstance(eq[0], str) and len(eq[0]) >= 10:
             question = eq[0]
             source = "expected_queries[0]"
-        elif lqp and isinstance(lqp[0], str) and len(lqp[0]) >= 10:
-            question = lqp[0]
-            source = "learner_query_patterns[0]"
+        elif lqp:
+            pattern = _learner_query_pattern_text(lqp[0])
+            if pattern and len(pattern) >= 10:
+                question = pattern
+                source = "learner_query_patterns[0]"
         if not question:
             continue
         if not question.rstrip().endswith(("?", "?")):

@@ -215,6 +215,51 @@ def test_strong_lexical_signal_can_override_weak_dense_head() -> None:
     assert hits[0].concept_id == "software-engineering/roomescape-dao-vs-repository-bridge"
 
 
+def test_strong_lexical_only_candidate_can_override_stale_dense_head() -> None:
+    concepts = {
+        "data-structure/counting-bloom-cuckoo-filter-deletion-chooser": _concept(
+            "data-structure/counting-bloom-cuckoo-filter-deletion-chooser",
+            "Counting Bloom Cuckoo Filter Deletion Chooser",
+            "data-structure",
+            aliases=["Bloom Cuckoo filter deletion false positive"],
+            expected_queries=["Bloom filter 삭제와 Cuckoo filter 차이가 뭐야?"],
+        ),
+        "data-structure/bloom-cuckoo-counting-filter-membership-perspective-map": _concept(
+            "data-structure/bloom-cuckoo-counting-filter-membership-perspective-map",
+            "Bloom Cuckoo Counting Filter Membership Perspective Map",
+            "data-structure",
+            aliases=[
+                "Bloom Cuckoo Counting filter membership",
+                "membership filter cache guard",
+            ],
+            expected_queries=[
+                "캐시 앞단에서 Bloom/Cuckoo filter를 쓸 때 false positive, deletion, latency를 어떻게 판단해?"
+            ],
+        ),
+    }
+    tiny = LoadedCorpus(concepts=concepts, failures=[])
+    rerank = make_lexical_fusion_fn(tiny, expand=3)
+    seed = [
+        SearchHit(
+            "data-structure/counting-bloom-cuckoo-filter-deletion-chooser",
+            0.9,
+            "data-structure",
+            "Counting Bloom Cuckoo Filter Deletion Chooser",
+            "dense",
+        )
+    ]
+
+    hits = rerank(
+        "Bloom Cuckoo Counting filter membership Bloom filter false positive "
+        "삭제 membership filter cache guard",
+        seed,
+    )
+
+    assert hits[0].concept_id == (
+        "data-structure/bloom-cuckoo-counting-filter-membership-perspective-map"
+    )
+
+
 def test_strong_lexical_signal_preserves_head_when_head_also_matches() -> None:
     concepts = {
         "security/auth-failure-response-401-403-404": _concept(

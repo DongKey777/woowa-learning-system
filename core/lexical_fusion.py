@@ -403,15 +403,22 @@ def _promote_strong_lexical_candidate(
     entry_by_id = _lexical_entry_index(corpus)
     head_entry = entry_by_id.get(hits[0].concept_id)
     head_strong = _overlap_count(query_tokens, (head_entry or {}).get("strong_tokens"))
-    if head_strong > 1:
-        return hits
-    for idx, hit in enumerate(hits[1:5], start=1):
+    head_title = _overlap_count(query_tokens, (head_entry or {}).get("title_tokens"))
+    for idx, hit in enumerate(hits[1:12], start=1):
         entry = entry_by_id.get(hit.concept_id)
         if not entry:
             continue
         strong_hits = _overlap_count(query_tokens, entry.get("strong_tokens"))
         title_hits = _overlap_count(query_tokens, entry.get("title_tokens"))
-        if strong_hits >= 3 and title_hits >= 2:
+        lexical_only = hit.source == "lexical"
+        if (
+            lexical_only
+            and strong_hits >= 4
+            and title_hits >= 2
+            and (strong_hits >= head_strong + 2 or title_hits > head_title)
+        ):
+            return [hit] + hits[:idx] + hits[idx + 1:]
+        if head_strong <= 1 and strong_hits >= 3 and title_hits >= 2:
             return [hit] + hits[:idx] + hits[idx + 1:]
     return hits
 

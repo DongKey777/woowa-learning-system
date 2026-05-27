@@ -17,7 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
-PARADIGM_V2_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
+PARADIGM_V2_ROOT = Path(__file__).resolve().parent.parent.parent
 LEGACY_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
 
 DEEP_DIVE_SCENARIOS = [

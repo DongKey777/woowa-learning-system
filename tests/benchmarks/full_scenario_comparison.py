@@ -21,7 +21,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-PARADIGM_V2_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-system")
+PARADIGM_V2_ROOT = Path(__file__).resolve().parent.parent.parent
 LEGACY_ROOT = Path("/Users/idonghun/IdeaProjects/woowa-learning-hub")
 RUNS = 5  # warm runs per scenario; p95 needs more than 3 samples to resist CLI jitter
 TIMEOUT_S = 60

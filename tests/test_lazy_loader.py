@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,6 +52,18 @@ def test_load_only_asked_artifacts(tmp_path: Path) -> None:
 def test_mastery_graceful_when_empty(tmp_path: Path) -> None:
     r = _make_route([ARTIFACT_MASTERY])
     out = load(r, state_root=tmp_path)
+    assert out[ARTIFACT_MASTERY]["summary"]["total_tracked"] == 0
+    assert out[ARTIFACT_MASTERY]["by_level"] == {}
+
+
+def test_mastery_graceful_when_schema_missing(tmp_path: Path) -> None:
+    db = tmp_path / "learner" / "mastery_graph.sqlite"
+    db.parent.mkdir(parents=True)
+    sqlite3.connect(str(db)).close()
+    r = _make_route([ARTIFACT_MASTERY])
+
+    out = load(r, state_root=tmp_path)
+
     assert out[ARTIFACT_MASTERY]["summary"]["total_tracked"] == 0
     assert out[ARTIFACT_MASTERY]["by_level"] == {}
 

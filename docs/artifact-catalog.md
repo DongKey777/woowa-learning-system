@@ -4,7 +4,7 @@
 
 ```
 corpus/
-├── concepts/                      # 3259 JSON entities (1 concept = 1 file)
+├── concepts/                      # 3279 JSON entities (1 concept = 1 file)
 │   ├── algorithm/*.json
 │   ├── data-structure/*.json
 │   ├── database/*.json
@@ -16,7 +16,7 @@ corpus/
 │   ├── software-engineering/*.json
 │   ├── spring/*.json
 │   └── system-design/*.json
-├── concept_graph.json             # ~5MB — nodes (3259) + edges (prerequisite 5942, confusable_with N)
+├── concept_graph.json             # ~5MB — nodes (3279) + edges (prerequisite 6002, confusable_with N)
 └── schemas/
     └── concept.schema.json        # JSON schema (validation)
 ```
@@ -66,7 +66,7 @@ corpus/
     ...
   },
   "edges": {
-    "prerequisite": [["from_id", "to_id"], ...],   # 5942 pairs
+    "prerequisite": [["from_id", "to_id"], ...],   # 6002 pairs
     "confusable_with": [...],
     "extends": [...]
   },
