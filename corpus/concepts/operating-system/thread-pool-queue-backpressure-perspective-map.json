@@ -1,0 +1,64 @@
+{
+  "id": "operating-system/thread-pool-queue-backpressure-perspective-map",
+  "title": "Thread Pool, Queue, Backpressure Perspective Map",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "스레드 풀 문제를 worker 수, queue 길이, blocking I/O, rejection, backpressure 관점으로 나누는 perspective map이다. CPU는 낮은데 API가 느릴 때 pool wait, queue saturation, downstream latency, rejection policy를 함께 본다. CS 배경으로 Little Law, bounded queue, scheduler/context switch, backpressure 신호를 연결한다.",
+  "body_markdown": "# Thread Pool, Queue, Backpressure Perspective Map\n\n## 이 문서가 맡는 질문\n스레드 풀이 느리다는 말을 CPU 부족 하나로 뭉개지 않는다. worker thread가 부족한지, queue가 무한히 쌓이는지, blocking I/O가 thread를 오래 잡는지, rejection이 빠르게 실패시키는지, upstream에 backpressure를 보낼 수 있는지를 분리한다. 특히 Spring async, servlet thread, DB connection pool이 함께 보이면 어느 pool에서 기다리는지부터 찾아야 한다.\n\n## 빠른 분기\nCPU가 90% 이상이면 compute saturation을 먼저 본다. CPU가 낮고 latency가 크면 queue wait, DB/HTTP client pool wait, blocking I/O를 먼저 본다. 요청이 갑자기 429/503으로 실패하면 rejection/load shedding 정책을 본다. memory가 늘면 unbounded queue나 pending future를 의심한다.\n\n## 실전 시나리오\n이미지 처리 API가 느려졌는데 서버 CPU는 30%라고 하자. thread dump를 보면 worker 대부분이 외부 storage 응답을 기다리고, queue depth는 계속 증가한다. 이때 thread 수를 늘리면 잠깐 처리량은 늘 수 있지만 storage를 더 압박하고 context switch와 memory를 늘린다. bounded queue, timeout, bulkhead, rejection response, caller retry budget을 함께 설계해야 한다.\n\n## CS 배경\nThread pool은 producer-consumer queue 위에 worker를 둔 모델이다. Little Law는 L = lambda * W로, 처리율과 대기 시간이 queue 길이를 결정한다. Blocking I/O는 thread를 runnable이 아니라 waiting 상태로 오래 묶고, OS scheduler는 runnable thread가 많을수록 context switch 비용을 낸다. Backpressure는 consumer가 처리할 수 없다는 신호를 producer에게 전달하는 제어 흐름이다. 무한 queue는 실패를 지연으로 숨겨 tail latency와 OOM 위험을 키운다.\n\n## 깊게 볼 포인트\npool size만 조정하면 원인을 놓치기 쉽다. worker utilization, queue wait time, service time, rejection count, downstream p95를 함께 봐야 한다. Servlet thread pool, application executor, DB connection pool, HTTP client pool은 모두 queue를 가질 수 있으므로 하나의 latency 안에 여러 대기열이 겹친다. 좋은 설계는 각 queue를 bounded로 두고, 넘쳤을 때 block, drop, fail-fast, degrade 중 무엇을 할지 명시한다.\n\n## 다음 행동\n1. thread dump와 executor metrics에서 active, queued, completed, rejected를 본다. 2. downstream timeout과 pool wait metric을 분리한다. 3. queue capacity와 rejection response를 정한다. 4. caller retry가 overload를 증폭하지 않게 retry budget을 둔다.\n\n## 확인 질문\n이 지연은 worker가 계산하느라 바쁜 것인가, worker가 외부 I/O를 기다리는 것인가, 아니면 queue에서 시작도 못 하고 있는 것인가?\n\n## 추가 예시\n주문 알림 executor가 1000개 queue를 허용하면 장애 때 요청은 성공처럼 보이지만 알림은 몇 분 뒤 밀려 나간다. capacity 100에서 503을 주고 재시도 가능한 job으로 넘기면 실패는 빨리 보이지만 시스템은 회복 가능하다.\n\n## 설정 예시\n```java\nnew ThreadPoolExecutor(\n    16, 16,\n    0L, TimeUnit.MILLISECONDS,\n    new ArrayBlockingQueue<>(200),\n    new ThreadPoolExecutor.CallerRunsPolicy()\n);\n```\nbounded queue는 대기열을 무한히 키우지 않고, rejection policy는 overload를 호출자에게 되돌린다. 이 설정을 바꿀 때는 처리량만 보지 말고 queue wait p95, rejected count, caller latency를 함께 봐야 한다.\n\n## 판단 매트릭스\n- Pool 포화 신호: active thread가 max에 붙고 queue depth와 queue wait p95가 같이 오른다.\n- Downstream 지연 신호: CPU는 낮지만 worker가 WAITING/TIMED_WAITING에 몰리고 HTTP/DB p95가 먼저 튄다.\n- Backpressure 선택: bounded queue, rejection policy, caller-runs, shed load 중 어느 지점에서 압력을 되돌릴지 정한다.\n- 리뷰 질문: thread 수 증가는 처리량을 늘리는가, 아니면 느린 의존성 앞에 더 긴 대기열을 만드는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 active thread, queue depth, queue wait p95, rejected count, downstream p95, context switch rate이다. thread dump에서 WAITING/RUNNABLE 비율, executor active/queued, upstream timeout 분포를 같이 본다. 레이턴시는 request p50보다 queue wait p95와 p99가 먼저 튄다. \n\n## 자주 하는 오해\n- CPU가 낮으니 서버는 여유 있다고 판단한다\n- 무한 queue로 장애를 지연으로 숨긴다\n- thread 수를 늘리는 것과 backpressure를 주는 것을 구분하지 못한다\n이 오해를 줄이려면 thread dump, executor metric, downstream latency를 같은 시간축에 놓고 본다. CPU 사용률만 보면 queueing delay와 Little's Law가 숨겨지므로, 답변에는 도착률, 처리시간, 동시성 한계를 함께 넣어야 한다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 요청이 CPU-bound인지 I/O-bound인지 분류한다. 그 다음 active thread, queue depth, queue wait p95, rejected count, downstream p95를 근거로 병목 위치를 좁힌다. 마지막에는 bounded queue와 rejection/backpressure 정책이 품질, 처리량, 레이턴시에 어떤 영향을 주는지 설명한다.\n\n## 실전 검증 루프\n1. 부하를 일정하게 고정하고 active/queued/rejected metric과 request p50/p95/p99를 동시에 수집한다.\n2. thread dump에서 RUNNABLE, BLOCKED, WAITING 비율을 확인해 CPU 포화와 I/O 대기를 구분한다.\n3. queue capacity와 rejection policy를 바꾼 뒤 처리량, timeout, rejected count를 비교한다.\n4. downstream DB/HTTP pool latency가 먼저 튀는지 확인해 thread pool만의 문제가 아닌지 검증한다.\n5. 최종 선택은 최대 처리량뿐 아니라 실패를 빨리 드러내는지와 복구 시간을 함께 기록한다.\n\n이 루프를 지키면 thread pool 문서는 단순 튜닝 팁이 아니라 queueing theory와 backpressure를 연결하는 학습 재료가 된다.\n",
+  "aliases": [
+    "thread pool queue backpressure",
+    "executor saturation perspective",
+    "스레드 풀 큐 백프레셔",
+    "pool wait queue wait",
+    "bounded queue rejection",
+    "blocking IO thread pool",
+    "API slow CPU low pool wait",
+    "worker queue saturation",
+    "thread dump queue latency",
+    "executor rejection policy"
+  ],
+  "expected_queries": [
+    "CPU는 낮은데 API가 느릴 때 스레드 풀 큐 백프레셔를 어떻게 봐?",
+    "thread pool queue backpressure를 한 번에 설명해줘",
+    "executor queue가 쌓일 때 thread 수를 늘리면 되는지 판단해줘",
+    "스레드 풀 포화와 DB connection pool wait를 어떻게 구분해?",
+    "bounded queue와 rejection policy는 왜 필요해?",
+    "blocking I/O 때문에 스레드 풀이 느려지는 흐름을 알려줘",
+    "CPU는 낮은데 API가 느릴 때 thread pool queue backpressure 중 뭘 봐야 해?"
+  ],
+  "symptoms": [
+    "CPU가 낮으니 서버는 여유 있다고 판단한다",
+    "무한 queue로 장애를 지연으로 숨긴다",
+    "thread 수를 늘리는 것과 backpressure를 주는 것을 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/process-thread-basics",
+      "operating-system/blocking-io-thread-pool-backpressure-primer",
+      "data-structure/bounded-queue-policy-primer"
+    ],
+    "next_docs": [
+      "operating-system/thread-pool-backpressure-saturation-playbook",
+      "language/executor-sizing-queue-rejection-policy",
+      "spring/taskexecutor-taskscheduler-overload-rejection-semantics"
+    ],
+    "confusable_with": [
+      "software-engineering/api-slow-cpu-low-pool-wait-cause-router",
+      "database/connection-pool-starvation-symptom-router",
+      "network/upstream-queueing-connection-pool-wait-tail-latency"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch2"
+      }
+    ]
+  }
+}
