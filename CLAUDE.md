@@ -45,7 +45,7 @@ pip install -e .
 ```bash
 bin/index-fetch
 ```
-- GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.0` (release별 약 13-18MB, SHA256 검증) → `state/index/`
+- GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.1` (release별 약 13-18MB, SHA256 검증) → `state/index/`
 - 소요: ~15초
 - `gh` CLI 미설치면 한국어로 OS별 설치 안내 후 재시도
 

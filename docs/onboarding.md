@@ -82,7 +82,7 @@ GitHub Releases (`DongKey777/woowa-learning-system`)에 publish된 사전 빌드
 
 - 소요: 10-20초 (네트워크 광대역)
 - 의존: `gh` CLI (미설치면 한국어로 OS별 설치 안내)
-- 기본 tag: `paradigm-v2-index-v1.0.0`
+- 기본 tag: `paradigm-v2-index-v1.0.1`
 
 #### 🚫 학습자 기기 로컬 빌드 절대 금지
 

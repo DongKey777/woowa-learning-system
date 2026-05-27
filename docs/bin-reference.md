@@ -124,7 +124,7 @@ trigger: 학습자가 *"다른 크루는"*, *"정밀 비교"*, *"cross-crew"* �
 GitHub Releases에서 pre-built Lance 인덱스 다운로드. SHA256 검증 후 `state/index/`로 추출.
 
 ```bash
-bin/index-fetch [--tag paradigm-v2-index-v1.0.0] [--force] [--expected-sha256 <hex>]
+bin/index-fetch [--tag paradigm-v2-index-v1.0.1] [--force] [--expected-sha256 <hex>]
 ```
 
 옵션:
