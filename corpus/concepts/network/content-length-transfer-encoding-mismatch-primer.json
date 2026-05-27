@@ -1,0 +1,72 @@
+{
+  "id": "network/content-length-transfer-encoding-mismatch-primer",
+  "title": "Content Length Transfer Encoding Mismatch Primer",
+  "category": "network",
+  "level": "advanced",
+  "summary": "HTTP Content-Length와 Transfer-Encoding 불일치를 proxy parsing, request smuggling, keep-alive reuse, latency 관점으로 진단하는 network primer",
+  "body_markdown": "# Content Length Transfer Encoding Mismatch Primer\n\n## 이 문서가 맡는 질문\nHTTP Content-Length와 Transfer-Encoding 불일치를 proxy parsing, request smuggling, keep-alive reuse, latency 관점으로 진단하는 network primer. 이 문서는 단어 정의가 아니라 실제 증상에서 어떤 구조와 지표를 봐야 하는지 연결한다.\n\n## 빠른 분기\nCL과 TE가 같이 오면 trust boundary에서 기본적으로 reject한다. normalization은 단일 canonical framing을 완전히 검증한 경우에만 허용한다. proxy/backend parser 차이를 integration test로 고정한다. early reject 후 body drain 정책을 확인한다. 마지막으로 400/502 spike와 keep-alive reuse율을 같이 본다.\n\n## 실전 시나리오\nAPI gateway는 Transfer-Encoding: chunked를 기준으로 body를 끝냈지만 backend는 Content-Length를 기준으로 남은 byte를 다음 request 시작으로 해석한다. 특정 keep-alive 연결에서만 이상한 400/401이 발생한다.\n\n## CS 배경\nHTTP/1.1 message framing은 connection reuse의 안전성을 결정한다. proxy chain의 어느 한 구간이라도 Content-Length와 Transfer-Encoding 우선순위가 다르면 request boundary가 어긋난다. 이것이 request smuggling과 tail latency spike의 출발점이다.\n\n## 핵심 모델\n- 입력 신호: http_framing와 proxy_security가 어떤 경계에서 발생했는지 본다\n- 불변식: correctness를 깨뜨리는 조건을 먼저 말로 고정한다\n- 비용 모델: memory, CPU, IO, network roundtrip, queueing 중 어느 항이 tail latency를 키우는지 나눈다\n- 운영 모델: 장애 후 replay, rollback, retry, fallback이 같은 결과를 유지하는지 확인한다\n\n## 판단 매트릭스\n- CL과 TE가 같이 오면 trust boundary에서 기본적으로 reject한다. normalization은 단일 canonical framing을 완전히 검증한 경우에만 허용한다\n- proxy/backend parser 차이를 integration test로 고정한다\n- early reject 후 body drain 정책을 확인한다\n- 400/502 spike와 keep-alive reuse율을 같이 본다\n\n## 예시\n```text\nedge policy: reject multiple Content-Length, reject CL+TE ambiguity, parse one canonical body framing, then strip hop-by-hop headers before upstream.\n```\n이 예시는 API 이름보다 boundary와 invariant를 드러내기 위한 것이다. 실제 구현에서는 입력 크기, 실패 빈도, 배포 단위, 관측 가능성을 같이 적어야 한다.\n\n## 깊게 볼 포인트\n애플리케이션 controller 로그만 보면 원인이 보이지 않는다. body framing은 대개 proxy와 connection layer에서 깨진다. 관련 문서를 가져왔을 때도 이 문서의 목적은 하나의 정답을 외우게 하는 것이 아니라 선택 기준을 세우게 하는 것이다. 같은 현상이 algorithm, data structure, database, runtime, network, security, system design 중 어디에서 만들어졌는지 확인해야 한다.\n\n## 품질 관점\n품질은 잘못된 후보를 얼마나 빨리 배제하고, edge case를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 happy path보다 boundary condition, replay, stale state, version skew, concurrent update를 포함해야 한다.\n\n## 성능 관점\n성능은 평균 처리량만 보지 않는다. build cost, memory footprint, write amplification, cache locality, queue depth, retry amplification 중 어떤 비용이 커지는지 분리한다. benchmark는 synthetic micro case와 실제 traffic shape를 따로 둔다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. 첫 요청, 재시도, cache miss, compaction, checkpoint, handshake, index rebuild처럼 드문 경로가 학습자 체감 품질을 망칠 수 있다. 그래서 histogram, trace span, timeout budget을 같이 확인한다.\n\n## 주제별 추가 지표\nCL/TE 문서는 400/408/413 rate, request smuggling canary, keep-alive reuse 후 다음 요청 오염 여부, upstream 502 spike, body drain time을 주제별 지표로 본다. 보안 기본값은 모호한 framing 거부이며, proxy별 parser 차이는 integration fixture로 고정한다.\n\n## 자주 하는 오해\n- 이름이 비슷한 기존 패턴을 그대로 적용하면 된다고 생각한다\n- correctness 불변식 없이 성능 지표만 비교한다\n- latency spike를 애플리케이션 코드 한 곳의 문제로만 본다\n- rollback이나 replay 상황의 의미 보존을 검증하지 않는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 품질/성능/레이턴시를 어떤 명령, 테스트, 대시보드로 확인할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. 후보 해결책의 correctness invariant를 적는다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. p95/p99, error rate, retry/replay count를 비교한다\n6. 결과를 회고에 남기고 다음 학습 문서로 연결한다\n\n## 한 줄 정리\nHTTP Content-Length와 Transfer-Encoding 불일치를 proxy parsing, request smuggling, keep-alive reuse, latency 관점으로 진단하는 network primer\n",
+  "aliases": [
+    "Content-Length Transfer-Encoding mismatch",
+    "CL TE request smuggling",
+    "HTTP body framing mismatch",
+    "keep alive parse boundary",
+    "Content Length Transfer Encoding Mismatch Primer",
+    "content length transfer encoding mismatch primer",
+    "CL TE body framing ambiguity",
+    "request smuggling proxy parse boundary",
+    "Content-Length Transfer-Encoding keep-alive contamination"
+  ],
+  "expected_queries": [
+    "Content-Length랑 Transfer-Encoding이 같이 있으면 왜 위험해?",
+    "프록시마다 HTTP body 길이 해석이 다르면 어떤 문제가 생겨?",
+    "CL/TE mismatch를 보안과 latency 관점에서 어떻게 검증해?",
+    "Content-Length와 Transfer-Encoding 불일치는 왜 proxy 장애나 request smuggling으로 이어져?"
+  ],
+  "symptoms": [
+    "upstream과 proxy가 서로 다른 body boundary를 읽는다",
+    "keep-alive connection 재사용 후 다음 요청이 오염된다",
+    "early reject에서 request body drain을 잊는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/http-request-body-drain-early-reject-keepalive-reuse",
+      "network/gateway-buffering-vs-spring-early-reject",
+      "network/expect-100-continue-proxy-request-buffering"
+    ],
+    "next_docs": [
+      "security/trust-boundary-bypass-detection-signals"
+    ],
+    "confusable_with": [
+      "network/http-request-body-drain-early-reject-keepalive-reuse"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "Content-Length랑 Transfer-Encoding이 같이 있으면 왜 위험해?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "프록시마다 HTTP body 길이 해석이 다르면 어떤 문제가 생겨?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "Content-Length와 Transfer-Encoding 불일치는 왜 proxy 장애나 request smuggling으로 이어져?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch5"
+      }
+    ]
+  }
+}

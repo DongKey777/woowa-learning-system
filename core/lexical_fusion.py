@@ -395,31 +395,30 @@ def _promote_strong_lexical_candidate(
     hits: list[SearchHit],
     corpus: LoadedCorpus,
 ) -> list[SearchHit]:
-    if len(hits) < 2:
-        return hits
     query_tokens = _tokens(query)
-    if not query_tokens:
-        return hits
     entry_by_id = _lexical_entry_index(corpus)
     head_entry = entry_by_id.get(hits[0].concept_id)
     head_strong = _overlap_count(query_tokens, (head_entry or {}).get("strong_tokens"))
     head_title = _overlap_count(query_tokens, (head_entry or {}).get("title_tokens"))
-    for idx, hit in enumerate(hits[1:12], start=1):
+    fallback_idx: int | None = None
+    for idx, hit in enumerate(hits[1:32], start=1):
         entry = entry_by_id.get(hit.concept_id)
         if not entry:
             continue
         strong_hits = _overlap_count(query_tokens, entry.get("strong_tokens"))
         title_hits = _overlap_count(query_tokens, entry.get("title_tokens"))
-        lexical_only = hit.source == "lexical"
         if (
-            lexical_only
-            and strong_hits >= 4
-            and title_hits >= 2
+            hit.source == "lexical"
+            and (strong_hits >= 6 or title_hits >= 2)
+            and (title_hits >= 1 or strong_hits >= 8)
             and (strong_hits >= head_strong + 2 or title_hits > head_title)
         ):
             return [hit] + hits[:idx] + hits[idx + 1:]
-        if head_strong <= 1 and strong_hits >= 3 and title_hits >= 2:
-            return [hit] + hits[:idx] + hits[idx + 1:]
+        if fallback_idx is None and head_strong <= 1 and strong_hits >= 3 and title_hits >= 2:
+            fallback_idx = idx
+    if fallback_idx is not None:
+        hit = hits[fallback_idx]
+        return [hit] + hits[:fallback_idx] + hits[fallback_idx + 1:]
     return hits
 
 

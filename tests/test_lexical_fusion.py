@@ -260,6 +260,61 @@ def test_strong_lexical_only_candidate_can_override_stale_dense_head() -> None:
     )
 
 
+def test_strong_lexical_scan_does_not_stop_at_weak_dense_fallback() -> None:
+    concepts = {
+        "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design": _concept(
+            "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+            "Stateful Stream Processor State Store Checkpoint Recovery Design",
+            "system-design",
+            aliases=["stream processor state store checkpoint recovery"],
+        ),
+        "spring/async-mvc-streaming-observability-playbook": _concept(
+            "spring/async-mvc-streaming-observability-playbook",
+            "Spring Async MVC Streaming Observability Playbook",
+            "spring",
+            aliases=["spring async mvc streaming observability"],
+        ),
+        "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser": _concept(
+            "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser",
+            "Exactly Once Stream Processing Idempotent Sinks Checkpoint Chooser",
+            "system-design",
+            aliases=[
+                "exactly once stream processing idempotent sink checkpoint",
+                "source offset state checkpoint transactional sink replay latency",
+                "stream processing checkpoint sink commit ordering",
+            ],
+        ),
+    }
+    tiny = LoadedCorpus(concepts=concepts, failures=[])
+    rerank = make_lexical_fusion_fn(tiny, expand=8)
+    seed = [
+        SearchHit(
+            "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+            0.9,
+            "system-design",
+            "Stateful Stream Processor",
+            "dense",
+        ),
+        SearchHit(
+            "spring/async-mvc-streaming-observability-playbook",
+            0.8,
+            "spring",
+            "Spring Async MVC Streaming",
+            "dense",
+        ),
+    ]
+
+    hits = rerank(
+        "exactly once stream processing source offset checkpoint state store "
+        "idempotent sink transactional sink replay latency",
+        seed,
+    )
+
+    assert hits[0].concept_id == (
+        "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+    )
+
+
 def test_strong_lexical_signal_preserves_head_when_head_also_matches() -> None:
     concepts = {
         "security/auth-failure-response-401-403-404": _concept(

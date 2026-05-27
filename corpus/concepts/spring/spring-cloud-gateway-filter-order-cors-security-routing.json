@@ -1,0 +1,69 @@
+{
+  "id": "spring/spring-cloud-gateway-filter-order-cors-security-routing",
+  "title": "Spring Cloud Gateway Filter Order CORS Security Routing",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "Spring Cloud Gateway route predicate, WebFilter/pre-route normalization, GlobalFilter order, CORS, Security chain, forwarded header trust를 routing 품질과 latency 관점으로 판단하는 spring guide",
+  "body_markdown": "# Spring Cloud Gateway Filter Order CORS Security Routing\n\n## 이 문서가 맡는 질문\nSpring Cloud Gateway route predicate, WebFilter/pre-route normalization, GlobalFilter order, CORS, Security chain, forwarded header trust를 routing 품질과 latency 관점으로 판단하는 spring guide. 이 문서는 단어 정의가 아니라 실제 증상에서 어떤 구조와 지표를 봐야 하는지 연결한다.\n\n## 빠른 분기\npreflight는 auth와 분리해 허용 범위를 검증한다. trust boundary header는 edge에서 overwrite한다. route matching에 영향을 주는 normalization은 WebFilter/edge pre-processing에서 처리하고, route 선택 이후의 request mutation은 GlobalFilter/GatewayFilter에서 처리한다. 마지막으로 filter별 duration과 upstream latency를 trace로 본다.\n\n## 실전 시나리오\n브라우저 preflight는 403이고, 실제 API 호출은 gateway를 통과하지만 downstream에는 X-User-Id가 없다. route별 filter와 global filter 순서가 환경마다 다르게 등록되어 있다.\n\n## CS 배경\nGateway는 edge routing, protocol/header normalization, auth context propagation이 만나는 지점이다. Route predicates가 route를 고른 뒤 GlobalFilter와 route-specific GatewayFilter가 실행된다. 따라서 route matching에 필요한 forwarded header/path normalization은 edge 또는 WebFilter 계층에서 먼저 끝나야 하고, CORS/Security/GatewayFilter는 그 뒤의 책임으로 나눠야 한다.\n\n## 핵심 모델\n- 입력 신호: gateway_filter_order와 cors_security가 어떤 경계에서 발생했는지 본다\n- 불변식: correctness를 깨뜨리는 조건을 먼저 말로 고정한다\n- 비용 모델: memory, CPU, IO, network roundtrip, queueing 중 어느 항이 tail latency를 키우는지 나눈다\n- 운영 모델: 장애 후 replay, rollback, retry, fallback이 같은 결과를 유지하는지 확인한다\n\n## 판단 매트릭스\n- preflight는 auth와 분리해 허용 범위를 검증한다\n- trust boundary header는 edge에서 overwrite한다\n- route matching에 영향을 주는 normalization은 WebFilter/edge pre-processing에서 처리하고, route 선택 이후의 request mutation은 GlobalFilter/GatewayFilter에서 처리한다\n- filter별 duration과 upstream latency를 trace로 본다\n\n## 예시\n```text\npre-route: edge forwarded-header normalization + WebFilter CORS/preflight; route match: predicates; post-match: GlobalFilter auth/context -> route GatewayFilter rewrite -> metrics spans.\n```\n이 예시는 API 이름보다 boundary와 invariant를 드러내기 위한 것이다. 실제 구현에서는 입력 크기, 실패 빈도, 배포 단위, 관측 가능성을 같이 적어야 한다.\n\n## 깊게 볼 포인트\ndownstream controller에서 CORS를 고쳐도 gateway가 먼저 막으면 효과가 없다. edge ownership을 먼저 확인해야 한다. 관련 문서를 가져왔을 때도 이 문서의 목적은 하나의 정답을 외우게 하는 것이 아니라 선택 기준을 세우게 하는 것이다. 같은 현상이 algorithm, data structure, database, runtime, network, security, system design 중 어디에서 만들어졌는지 확인해야 한다.\n\n## 품질 관점\n품질은 잘못된 후보를 얼마나 빨리 배제하고, edge case를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 happy path보다 boundary condition, replay, stale state, version skew, concurrent update를 포함해야 한다.\n\n## 성능 관점\n성능은 평균 처리량만 보지 않는다. build cost, memory footprint, write amplification, cache locality, queue depth, retry amplification 중 어떤 비용이 커지는지 분리한다. benchmark는 synthetic micro case와 실제 traffic shape를 따로 둔다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. 첫 요청, 재시도, cache miss, compaction, checkpoint, handshake, index rebuild처럼 드문 경로가 학습자 체감 품질을 망칠 수 있다. 그래서 histogram, trace span, timeout budget을 같이 확인한다.\n\n## 주제별 추가 지표\nGateway 문서는 route predicate match trace, preflight 4xx rate, per-filter span duration, auth context header propagation failure, upstream route latency delta를 주제별 지표로 본다.\n\n## 자주 하는 오해\n- 이름이 비슷한 기존 패턴을 그대로 적용하면 된다고 생각한다\n- correctness 불변식 없이 성능 지표만 비교한다\n- latency spike를 애플리케이션 코드 한 곳의 문제로만 본다\n- rollback이나 replay 상황의 의미 보존을 검증하지 않는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 품질/성능/레이턴시를 어떤 명령, 테스트, 대시보드로 확인할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. 후보 해결책의 correctness invariant를 적는다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. p95/p99, error rate, retry/replay count를 비교한다\n6. 결과를 회고에 남기고 다음 학습 문서로 연결한다\n\n## 한 줄 정리\nSpring Cloud Gateway route predicate, WebFilter/pre-route normalization, GlobalFilter order, CORS, Security chain, forwarded header trust를 routing 품질과 latency 관점으로 판단하는 spring guide\n",
+  "aliases": [
+    "Spring Cloud Gateway filter order CORS security routing",
+    "gateway global filter route predicate order",
+    "Spring Gateway CORS Security chain",
+    "forwarded header gateway trust boundary",
+    "Spring Cloud Gateway Filter Order CORS Security Routing",
+    "spring cloud gateway filter order cors security routing"
+  ],
+  "expected_queries": [
+    "Spring Cloud Gateway에서 filter order와 Security/CORS 순서는 어떻게 봐?",
+    "Gateway route predicate와 global filter가 꼬이면 어떤 증상이 나와?",
+    "Gateway routing 품질과 latency를 어떻게 검증해?",
+    "Spring Cloud Gateway에서 CORS, Security, route filter 순서를 어떻게 검증해?"
+  ],
+  "symptoms": [
+    "CORS preflight가 Security filter에서 먼저 막힌다",
+    "route predicate 후에 필요한 header normalization을 한다",
+    "global filter order가 auth context 전파보다 늦다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/cors-security-vs-mvc-ownership",
+      "security/gateway-auth-context-header-trust-boundary",
+      "spring/security-filter-authentication-authorization-perspective-map"
+    ],
+    "next_docs": [
+      "network/forwarded-header-client-ip-trust-perspective-map"
+    ],
+    "confusable_with": [
+      "security/gateway-auth-context-header-trust-boundary"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "Spring Cloud Gateway에서 filter order와 Security/CORS 순서는 어떻게 봐?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "Gateway route predicate와 global filter가 꼬이면 어떤 증상이 나와?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "Spring Cloud Gateway에서 CORS, Security, route filter 순서를 어떻게 검증해?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch5"
+      }
+    ]
+  }
+}
