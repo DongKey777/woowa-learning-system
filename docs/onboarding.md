@@ -13,7 +13,7 @@
    - "Python 3.13 확인 ✓"
    - "의존성 설치 중… (~30초)"
    - "BGE-M3 모델 다운로드 중… (~5분, 첫 실행만 3GB)"
-   - "인덱스 빌드 중… (~20분, M4 기준)"
+   - "인덱스 다운로드 중… (~15초, release SHA256 검증)"
    - "Daemon 시작 + warm-up… (~10초)"
    - "준비 끝났어. 뭘 학습하고 싶어?"
 ```
@@ -108,7 +108,7 @@ bin/rag-daemon ping
 
 ### Step 5 — Mission patterns / cross-crew 사전 빌드 (선택)
 
-학습자가 미션 repo onboarded 후 (별도 git clone, paradigm-v2가 자동으로 하지 않음):
+학습자가 미션 repo 준비 후:
 
 ```bash
 bin/mission-patterns-build --repo <repo-name>

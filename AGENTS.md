@@ -7,7 +7,7 @@
 학습자가 외울 명령은 **0개**. 학습자는 한국어로 의도만 표현. AI 세션이 모든 명령 자동 실행:
 - `pip install -e .`
 - BGE-M3 모델 캐시 다운로드 (~3GB)
-- Lance 인덱스 빌드 또는 release fetch
+- Lance 인덱스 release fetch
 - `bin/rag-daemon start-bg` 백그라운드
 - `bin/ask "..."` 자체
 - 에러 복구
@@ -124,12 +124,12 @@ python3 bin/ask "테스트"
 
 CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 
-- **Phase U (10 onboarding)**: `bin/onboard-repo`, `bin/bootstrap-repo`, `bin/sync-prs`, `bin/archive-status`, `bin/repo-readiness`, `bin/doctor`, `bin/validate-state`, `bin/registry-audit`, `bin/list-repos`, `bin/bootstrap`. paradigm-v2 self-contained — legacy hub 의존 0 (Y2 검증 완료).
-- **Phase V (12 coaching context)**: `bin/coach-run` (legacy schema 호환), `bin/coach/my-pr/next-action/topic/reviewer/compare/compose-response`, `bin/mission-map`, `bin/rag-rewrite-prepare/route-fallback/chunk-context-prepare`.
+- **Phase U (10 onboarding)**: `bin/onboard-repo`, `bin/bootstrap-repo`, `bin/sync-prs`, `bin/archive-status`, `bin/repo-readiness`, `bin/doctor`, `bin/validate-state`, `bin/registry-audit`, `bin/list-repos`, `bin/bootstrap`. woowa-learning-system 단독으로 repo 준비와 상태 검증을 수행한다.
+- **Phase V (12 coaching context)**: `bin/coach-run`, `bin/coach/my-pr/next-action/topic/reviewer/compare/compose-response`, `bin/mission-map`, `bin/rag-rewrite-prepare/route-fallback/chunk-context-prepare`.
 - **Phase W (12 mining/analytics, Mode B)**: `bin/feedback-mine`, `bin/response-quality-mine`, `bin/routing-analyze`, `bin/learning-turn-audit`, `bin/learning-path-graph-audit`, `bin/reclassify-history`, `bin/cohort-eval/compare`, `bin/golden`, `bin/rag-eval`, `bin/router-generalization-eval`, `bin/learner-log-rag-eval`.
 - **Phase X (11 maintenance + sub-commands)**: `bin/index-pack`, `bin/sync-index-metadata`, `bin/drill-grade-prepare`, `bin/learn-feedback/self-assess/drill`, `bin/learner-profile` (show/recompute/set/clear/redact), `bin/set-profile/show-profile`, `bin/reviewer-profile` (alias), `bin/rag-remote-build`.
 
-paradigm-v2 bin/* 합계: **64 entries** (legacy 75 - 17 reranker probes 의도 skip = 58 non-probe 대응 → 64 with improvements). 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출.
+woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출.
 
 ---
 
@@ -138,7 +138,7 @@ paradigm-v2 bin/* 합계: **64 entries** (legacy 75 - 17 reranker probes 의도 
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (213/213 통과 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 484 passed 유지)
 
 ### 5.2 측정 명령
 ```bash
@@ -190,8 +190,8 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison
 - [`CLAUDE.md`](CLAUDE.md) — Claude 세션용 동등 문서
 - [`docs/architecture.md`](docs/architecture.md) — 7 mode router + Bloom + F10/F11 + multi-agent
 - [`docs/onboarding.md`](docs/onboarding.md) — First-Run Protocol 상세
-- [`docs/bin-reference.md`](docs/bin-reference.md) — 10 bin entry usage
+- [`docs/bin-reference.md`](docs/bin-reference.md) — 주요 bin entry usage
 - [`docs/learning-flow.md`](docs/learning-flow.md) — 학습자 일상 시나리오
 - [`docs/artifact-catalog.md`](docs/artifact-catalog.md) — `state/` `reports/` `corpus/` 구조
-- [`docs/testing-guide.md`](docs/testing-guide.md) — 77 시나리오 재현
+- [`docs/testing-guide.md`](docs/testing-guide.md) — release acceptance와 benchmark 재현
 - [`docs/verification-results.md`](docs/verification-results.md) — 모든 측정 결과 인덱스

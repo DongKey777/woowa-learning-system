@@ -1,6 +1,6 @@
-# Woowa Learning System (paradigm-v2)
+# Woowa Learning System
 
-우아한테크코스 미션 학습용 **자기 라우팅 RAG + 코드 그라운디드 + Bloom 자동 진행 + 멀티 에이전트** 학습 hub.
+우아한테크코스 미션 학습용 **자기 라우팅 RAG + 코드 그라운디드 + Bloom 자동 진행 + 멀티 에이전트** 학습 시스템.
 
 ```
 학습자 자연어 질문
@@ -41,33 +41,30 @@
 
 두 문서는 동일한 First-Run Protocol + system contract를 포함, 톤만 다름.
 
-## 검증 상태 (2026-05-25)
+## 검증 상태 (2026-05-27)
 
-| Phase | 범위 | 결과 |
-|---|---|---|
-| J | 14 mode dispatch + 4 legacy 비교 | 18/18 ✅ |
-| K | F1 RAG quality + F5 mastery | 2/2 ✅ |
-| L | 9 plan §verification gate | 9/9 ✅ |
-| M | 12 미측정 시나리오 | 12/12 ✅ |
-| N | 12 second-wave (persistence/idempotency) | 12/12 ✅ |
-| O | F6 drill offer-gen + scoring | 13/13 ✅ |
-| P | 10 deep scenario (drill cycle/multi-day/대규모) | 10/10 ✅ |
-| **합계** | **77 시나리오** | **77/77 ✅** + 213 unit test |
+| Gate | 결과 |
+|---|---|
+| Release acceptance | **96/96 RELEASE READY** |
+| Y13 Quality / Performance / Latency gates | **47/47 ✅** |
+| Unit tests | **484 passed** |
+| Runtime LOC budget | **9496 / 9500 ✅** |
+| Index release artifact | **17.9MB, SHA256 검증 ✅** |
 
 자세한 결과 → [`docs/verification-results.md`](docs/verification-results.md)
 
 ## 핵심 capability
 
-- **F1 RAG**: top-5 93.4% (Phase G v2 baseline 대비 +9.8pp)
+- **F1 RAG**: qrels strict top1 1.000, MRR 1.000, NDCG@5 0.987
 - **F2-F4 coaching/retro**: mentor concern alignment 86.7%, recurring signal 100%
-- **F5 Bloom autoloop**: legacy 0 mastered → v2 5 mastered + 2 proficient
+- **F5 Bloom autoloop**: 5 mastered + 2 proficient 자동 진행
 - **F6 drill**: corpus 100% 커버 (3199 concept 모두 non-stub 질문 생성)
 - **F8 prereq**: concept_graph 5764 edge, 100% level-correct
 - **F10 forward** (learner 코드 → concept): Tier 1 100%, Tier 2 85.2%
 - **F10 backward** (concept → learner 파일): 100%
 - **F11 cross-crew**: AI judge precision 85% (4-stage filter)
-- **Latency**: warm p50 27ms (Legacy 120ms 대비 **4.4× faster**)
-- **Token cost**: 2.4KB prompt avg (Legacy 48KB 대비 **20× cheaper**)
+- **Latency**: warm CLI p50/p95 43.9ms / 47.6ms, first ask p50/p95 187.2ms / 196.0ms
+- **Token cost**: 평균 prompt payload 약 4.1KB
 
 ## 아키텍처 / API / 운영 가이드
 
@@ -75,10 +72,10 @@
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | 7 mode router + multi-agent + Bloom + F10/F11 design |
 | [`docs/onboarding.md`](docs/onboarding.md) | First-Run Protocol 상세 + 트러블슈팅 |
-| [`docs/bin-reference.md`](docs/bin-reference.md) | 10개 `bin/*` entry 사용법 |
+| [`docs/bin-reference.md`](docs/bin-reference.md) | 주요 `bin/*` entry와 Phase T-X wrapper 사용법 |
 | [`docs/learning-flow.md`](docs/learning-flow.md) | 학습자 일상 사용 시나리오 |
 | [`docs/artifact-catalog.md`](docs/artifact-catalog.md) | `state/` `reports/` `corpus/` 구조 |
-| [`docs/testing-guide.md`](docs/testing-guide.md) | 77 scenario benchmark 재현 |
+| [`docs/testing-guide.md`](docs/testing-guide.md) | release acceptance와 benchmark 재현 |
 | [`docs/verification-results.md`](docs/verification-results.md) | 모든 측정 결과 인덱스 |
 
 ## Mode A vs Mode B (세션 모드)

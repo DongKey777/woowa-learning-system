@@ -1,4 +1,4 @@
-# bin/ reference — 10 entry points
+# bin/ reference — core entries + Phase T-X wrappers
 
 | Entry | Mode | Purpose |
 |---|---|---|
@@ -95,7 +95,7 @@ F10 forward 활성화. 학습자 own PR Java patch_text → annotation/method/ex
 bin/mission-patterns-build --repo <repo-name>
 ```
 
-source: `state/repos/<repo>/archive/prs.sqlite3` (paradigm-v2 자체 archive — 처음 1회 legacy hub에서 복사 후 self-contained로 유지. `--state-root` 로 다른 경로 지정 가능).
+source: `state/repos/<repo>/archive/prs.sqlite3` (woowa-learning-system 자체 archive. `bin/bootstrap-repo` / `bin/sync-prs`가 채우며, `--state-root` 로 다른 경로 지정 가능).
 
 결과: `state/repos/<repo>/mission_patterns.json` (~50-200 patterns).
 
@@ -254,7 +254,7 @@ bin/phase9-gate
 
 | Wrapper | Purpose | Bench |
 |---|---|---|
-| `bin/learn-pr-retro --repo R [--include-bot]` | PR retrospective: recurring mentor signals + unresolved threads + timeline | p50 1.2ms (legacy 3000ms = 2500× faster) |
+| `bin/learn-pr-retro --repo R [--include-bot]` | PR retrospective: recurring mentor signals + unresolved threads + timeline | p50 1.2ms |
 | `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference | p95 1.19ms (168× faster) |
 | `bin/learn-test --path build/test-results/test/` | JUnit XML → test_result events, stable event_id (idempotent) | p50 3.6ms (333× faster) |
 | `bin/learn-response-quality --source-event-id E --response-file -` | telemetry + PII redaction + citation drift detect | p95 0.16ms, drift 100%, PII 100% |
@@ -270,7 +270,7 @@ bin/phase9-gate
 | `bin/bootstrap-repo --repo R --owner O` | Full GitHub PR archive collection via gh CLI |
 | `bin/onboard-repo --repo R --owner O` | clone + bootstrap-repo + mission-patterns + cross-crew chain |
 | `bin/list-repos [--json]` | List all `state/repos/*/` + per-repo capability flags |
-| `bin/archive-status [--repo R]` | SQLite archive stats (legacy schema-tolerant) |
+| `bin/archive-status [--repo R]` | SQLite archive stats |
 | `bin/sync-prs --repo R --owner O` | Incremental sync since last collection_run.finished_at |
 | `bin/repo-readiness --repo R` | 4-check capability gate (archive/patterns/cross/state) |
 | `bin/doctor [--repo R]` | 6-check system health (python/gh/index/bge-m3/daemon/state) |
@@ -281,7 +281,7 @@ bin/phase9-gate
 
 | Wrapper | Purpose |
 |---|---|
-| `bin/coach-run --repo R --prompt P` | Legacy schema compat — writes `state/repos/<r>/actions/coach-run.json` |
+| `bin/coach-run --repo R --prompt P` | Coaching action snapshot — writes `state/repos/<r>/actions/coach-run.json` |
 | `bin/coach`, `bin/my-pr`, `bin/next-action`, `bin/topic`, `bin/reviewer`, `bin/compare`, `bin/compose-response` | Thin coaching-mode wrappers over `bin/ask`/`bin/coach-run` |
 | `bin/mission-map --repo R [--summary]` | File→concept_ids map (HEAD + archive patches) |
 | `bin/rag-rewrite-prepare --mode hyde\|decompose\|normalize` | Query rewrite prompt templates |
@@ -331,6 +331,6 @@ bin/phase9-gate
 | X | 11 | 11/11 |
 | **합계** | **52** | **50/50 bench + 28/28 unit + release archive gate** |
 
-Total bin/* in paradigm-v2: **64 entries** (legacy 75 - 17 reranker probes = 58 non-probe; paradigm-v2 64 = 100% non-probe parity + 6 improvements).
+Total bin/* in woowa-learning-system: **64 entries**.
 
 Full regression via meta-runner: `python3 tests/benchmarks/phase_y_all_benches.py` → 14/14 PASS in ~20s.

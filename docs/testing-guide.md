@@ -1,4 +1,4 @@
-# Testing guide — 77 시나리오 재현
+# Testing guide — release acceptance 재현
 
 ## 1. Unit tests (`pytest tests/`)
 
@@ -7,7 +7,7 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 python3 -m pytest tests/ -q
 ```
 
-현재 **213/213 pass**. 평균 7초.
+현재 **484 passed**. 최신 release acceptance 기준 pytest runtime은 76.63초.
 
 주요 test 모듈:
 - `test_router.py` — 7 mode dispatch
@@ -20,30 +20,23 @@ python3 -m pytest tests/ -q
 - `test_peer_pr.py` — peer PR analysis
 - `test_phase8_code_metrics.py` — LOC budget + entry point count
 
-회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 213/213 유지 확인.
+회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 484 passed 유지 확인.
 
 ---
 
 ## 2. Scenario benchmarks (`tests/benchmarks/`)
 
-총 **77 시나리오 across 5 wave** (J 제외 모두 자동):
+핵심 시나리오는 `tests/benchmarks/release_acceptance.py`에서 한 번에 집계한다.
 
-### 2.1 Phase J — mode dispatch + Legacy 비교 (14 + 4)
+### 2.1 Full scenario comparison
 
 ```bash
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison.py
-WOOWA_SESSION_MODE=development python3 tests/benchmarks/sidebyside_deepdive.py
 ```
 
-**전제**: 양 daemon 실행 중
-- `bin/rag-daemon start` in `woowa-learning-system`
-- `bin/rag-daemon start` in `woowa-learning-hub`
+**전제**: woowa-learning-system daemon 실행 중.
 
-소요: ~2분. 출력:
-- `reports/v2_vs_legacy_full_comparison.json/.md`
-- `reports/v2_vs_legacy_deepdive.json`
-
-기대: 14/14 mode dispatch correct, 4.4× faster p50, 20× cheaper tokens.
+기대: 14/14 mode dispatch correct, evidence coverage ≥90%, p50/p95 latency gate pass.
 
 ### 2.2 Phase K — F1 + F5 critical (2)
 
@@ -51,7 +44,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/sidebyside_deepdive.py
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/rag_quality_regression.py
 ```
 
-**전제**: v2 daemon 실행.
+**전제**: daemon 실행.
 
 소요: ~30초 (200 query stratified from corpus.expected_queries).
 
@@ -64,7 +57,7 @@ F5 mastery는 `state/learner/mastery_graph.sqlite` 직접 inspect:
 sqlite3 state/learner/mastery_graph.sqlite \
     "SELECT bloom_level, COUNT(*) FROM mastery GROUP BY bloom_level"
 ```
-기대: mastered ≥ 1 (legacy = 0).
+기대: mastered ≥ 1.
 
 ### 2.3 Phase L — 9 plan §verification gates (9)
 
@@ -72,7 +65,7 @@ sqlite3 state/learner/mastery_graph.sqlite \
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/gate_measurements.py
 ```
 
-**전제**: v2 daemon + mission_patterns + cross_crew parquet 빌드됨.
+**전제**: daemon + mission_patterns + cross_crew parquet 빌드됨.
 
 소요: ~3분. 출력: `reports/phase_l_gates.json`.
 
@@ -84,7 +77,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/gate_measurements.py
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/uncovered_scenarios.py
 ```
 
-**전제**: v2 daemon.
+**전제**: daemon.
 
 소요: ~20초 + ~15초 (S5 cold/warm restart).
 
@@ -98,7 +91,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/uncovered_scenarios.py
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/uncovered_scenarios_phase_n.py
 ```
 
-**전제**: v2 daemon + mission/cross_crew built.
+**전제**: daemon + mission/cross_crew built.
 
 소요: ~6분 (N6 cross-crew idempotent rebuild = 3분, N1+N3 daemon restart = 1분 각).
 
@@ -112,7 +105,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/uncovered_scenarios_phas
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/deep_scenarios_phase_p.py
 ```
 
-**전제**: v2 daemon.
+**전제**: daemon.
 
 소요: ~30초.
 
@@ -130,9 +123,8 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 # 1. Unit tests
 python3 -m pytest tests/ -q || exit 1
 
-# 2. Ensure both daemons up
+# 2. Ensure daemon up
 bin/rag-daemon status || bin/rag-daemon start-bg --log-path /tmp/daemon.log --timeout-s 90
-# (legacy hub daemon은 학습자가 별도 관리)
 
 # 3. Ensure mission/cross_crew built (idempotent)
 bin/mission-patterns-build --repo spring-roomescape-member
@@ -148,9 +140,9 @@ python3 tests/benchmarks/uncovered_scenarios.py
 python3 tests/benchmarks/uncovered_scenarios_phase_n.py
 python3 tests/benchmarks/deep_scenarios_phase_p.py
 python3 tests/benchmarks/full_scenario_comparison.py
-python3 tests/benchmarks/sidebyside_deepdive.py
 
-# 5. Aggregate pass count check (manual or script TBD)
+# 5. Full release gate
+python3 tests/benchmarks/release_acceptance.py
 ```
 
 전체 소요: ~15분 (대부분 N6 cross-crew rebuild).
@@ -221,5 +213,5 @@ sqlite3 state/learner/mastery_graph.sqlite \
 기대:
 - ping: `{"alive": true}`
 - ask: `[Mode: cs_qa]` markdown 응답
-- pytest: `213 passed`
+- pytest: `484 passed`
 - mastery: mastered ≥ 1

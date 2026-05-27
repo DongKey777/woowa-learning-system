@@ -1,4 +1,4 @@
-# Architecture — paradigm-v2
+# Architecture — Woowa Learning System
 
 ## 1. 한 페이지 view
 
@@ -72,9 +72,8 @@ Phase N9 측정: coaching mode markdown에 3 persona 모두 surface (MENTOR + RE
 
 ### 현재 상태
 - 5 mastered + 2 proficient (Spring core: bean-di, ioc-di, mvc-controller, configurationproperties, transactional-self-invocation, jdbc-jpa-mybatis, transaction-isolation)
-- Legacy hub는 mastered = 0 (broken). paradigm-v2가 즉시 fix.
 
-## 5. F10 forward — mission code → concept (paradigm-v2 unique)
+## 5. F10 forward — mission code → concept
 
 ### Tier 1 (annotation regex, deterministic)
 `mission/extract.py` `ANNOTATION_TO_CONCEPT` 35 매핑:
@@ -101,7 +100,7 @@ bin/mission-patterns-build --repo <repo>
 - learner own PR Java patch_text → 자동 추출
 - coaching mode 시 prompt에 surface
 
-## 6. F11 cross-crew (paradigm-v2 unique)
+## 6. F11 cross-crew
 
 ### 4-stage filter (`anchors/match.py`)
 1. **Stage 1 path**: anchor.path와 동일 filename을 가진 cross-crew review_comments fetch (SQL LIKE)
@@ -130,7 +129,7 @@ Phase L 측정:
   - encoder startup scheduling: tokenizer/model parallel load + daemon encoder import priming; rollback with `WOOWA_ENCODER_PARALLEL_LOAD=0` or `WOOWA_DAEMON_ENCODER_IMPORT_PRIME=0`
   - socket clients use newline-delimited requests only; client `shutdown(SHUT_WR)` is intentionally avoided because the server stops reading at newline and closes after response
   - executable `bin/ask` uses a shell + AF_UNIX `nc` fast path for warm daemon text/JSON output; direct `python3 bin/ask` remains compatible and falls back to the Python client
-  - legacy override keywords are first-class: `그냥 답해` skips RAG, `RAG로 깊게` forces CS RAG, `코치 모드` forces coaching; override tokens are stripped from retrieval query before search
+  - manual override keywords are first-class: `그냥 답해` skips RAG, `RAG로 깊게` forces CS RAG, `코치 모드` forces coaching; override tokens are stripped from retrieval query before search
   - search-result cache stores post-rerank unpersonalized hits for default encoder calls; stable lexical rerank cache keys keep repeated AI-session prompts on the cache path while profile adjustment remains per request
   - warm socket p50/p95: **4.1ms / 6.3ms**
   - warm CLI p50/p95: **43.9ms / 47.6ms**
@@ -152,18 +151,18 @@ Phase L 측정:
 
 ## 8. Performance (Y13)
 
-| 지표 | paradigm-v2 | Legacy hub | Δ |
-|---|---|---|---|
-| warm CLI p50 | **43.9ms** | 147.2ms | **3.4× faster** |
-| warm CLI p95 | **47.6ms** | 431.7ms | **9.1× faster** |
-| first-answer total | **13.6s** (fair probe), **15.2s** canonical p95 | 43.9s | **3.24× faster** fair probe |
-| qrels p50/p95 | **176.1ms / 278.6ms** | 1080.1ms / 1814.2ms | **6.1× / 6.5× faster** |
-| qrels strict/primary top1 | **1.000** | 0.628 | **+37.2pp** |
-| 14-scenario bin/ask p50/p95 | **48.8ms / 71.5ms** | 70.7ms / 100.4ms | **1.4× / 1.4× faster** |
-| override keywords | **4/4, p95 199.9ms** | same override semantics confirmed | parity |
-| short exact concept queries | **8/8, p95 0.017ms** | 3-sample p95 546.6ms | **encoder-free + better top1 ownership** |
-| LLM payload | 2.4KB | 48.6KB | **20× cheaper** |
-| Memory (warm) | ~6.5GB | ~7-8GB | parity |
+| 지표 | 최신 값 |
+|---|---:|
+| warm socket p50/p95 | **4.1ms / 6.3ms** |
+| warm CLI p50/p95 | **43.9ms / 47.6ms** |
+| first ask after ready p50/p95 | **187.2ms / 196.0ms** |
+| first-answer total p50/p95 | **15245.0ms / 15247.7ms** |
+| qrels p50/p95 | **176.1ms / 278.6ms** |
+| qrels strict top1 / MRR / NDCG@5 | **1.000 / 1.000 / 0.987** |
+| 14-scenario bin/ask p50/p95 | **48.8ms / 71.5ms** |
+| override keywords | **4/4, p95 199.9ms** |
+| short exact concept queries | **8/8, p95 0.017ms** |
+| release acceptance | **96/96 RELEASE READY** |
 
 Historical Phase M in-process cold/warm numbers are superseded by Y13 daemon-layer reports in `reports/y13_latency_baseline.json`.
 
@@ -200,8 +199,6 @@ Core runtime package breakdown (Python files under package dirs): **8667 LOC**.
 - `anchors/`: 326 (extract.py + match.py)
 - `curation/`: 297
 - `scripts/`: 829
-
-Legacy hub ~80K LOC 대비 여전히 약 **8× smaller**.
 
 ## 11. Development principles (4 원칙, commit 자체점검)
 

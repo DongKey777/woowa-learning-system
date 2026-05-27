@@ -8,12 +8,12 @@
 
 - `pip install -e .`
 - BGE-M3 모델 캐시 다운로드 (~3GB)
-- Lance 인덱스 빌드 또는 release fetch
+- Lance 인덱스 release fetch
 - `bin/rag-daemon start-bg` 백그라운드
 - `bin/ask "..."` 자체
 - 에러 복구
 
-학습자에게는 **한국어로 한 줄 진행 보고만** ("BGE-M3 다운로드 중…", "인덱스 빌드 완료").
+학습자에게는 **한국어로 한 줄 진행 보고만** ("BGE-M3 다운로드 중…", "인덱스 다운로드 완료").
 
 ---
 
@@ -151,11 +151,11 @@ bin/sync-prs --repo <r> --owner woowacourse
   → 4. (자동) cross-crew-build refresh (anchors × cohort 다시 매칭)
 ```
 
-paradigm-v2 self-contained: legacy hub 의존 0 (Phase Y2 검증). 학습자 외울 명령 0.
+woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 생성을 단독으로 처리한다. 학습자 외울 명령은 0개다.
 
 학습자가 *"오류"*, *"안 돼"* 표현 시 또는 정기 health check: `bin/doctor` (5/6+ healthy 확인).
 
-학습자가 직접 명령 외울 필요 0. paradigm-v2 self-contained (legacy hub 의존 0). 의존: `gh` CLI 설치 + `gh auth login`.
+학습자가 직접 명령 외울 필요 0. GitHub 연동 작업에는 `gh` CLI 설치 + `gh auth login`만 필요하다.
 
 ### 4.8 Phase V coaching context auto-call (2026-05-26)
 
@@ -232,7 +232,7 @@ paradigm-v2 self-contained: legacy hub 의존 0 (Phase Y2 검증). 학습자 외
 ### 5.1 모든 작업
 - `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령.
 - 변경은 commit 기반 reproducible. 측정 결과 `reports/` 폴더에 저장.
-- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 213/213 통과 유지.
+- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 484 passed 유지.
 
 ### 5.2 측정 명령
 ```bash
@@ -247,7 +247,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/uncovered_scenarios.py
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/uncovered_scenarios_phase_n.py
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/deep_scenarios_phase_p.py
 
-# Legacy 비교
+# Full scenario comparison
 WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison.py
 ```
 
@@ -286,8 +286,8 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison
 - [`AGENTS.md`](AGENTS.md) — Codex/Gemini/일반 AI용 동등 문서
 - [`docs/architecture.md`](docs/architecture.md) — 7 mode router + Bloom + F10/F11 + multi-agent
 - [`docs/onboarding.md`](docs/onboarding.md) — First-Run Protocol 상세 + 트러블슈팅
-- [`docs/bin-reference.md`](docs/bin-reference.md) — 10 bin entry usage
+- [`docs/bin-reference.md`](docs/bin-reference.md) — 주요 bin entry usage
 - [`docs/learning-flow.md`](docs/learning-flow.md) — 학습자 일상 시나리오
 - [`docs/artifact-catalog.md`](docs/artifact-catalog.md) — `state/` `reports/` `corpus/` 구조
-- [`docs/testing-guide.md`](docs/testing-guide.md) — 77 시나리오 재현
+- [`docs/testing-guide.md`](docs/testing-guide.md) — release acceptance와 benchmark 재현
 - [`docs/verification-results.md`](docs/verification-results.md) — 모든 측정 결과 인덱스
