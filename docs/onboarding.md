@@ -78,11 +78,11 @@ offline 환경: 사전에 모델 폴더 복사 후 `export HF_HUB_OFFLINE=1`.
 bin/index-fetch
 ```
 
-GitHub Releases (`DongKey777/woowa-learning-system`)에 publish된 사전 빌드 인덱스 (release별 약 13-18MB zstd compressed)를 다운로드해서 `state/index/`로 추출. SHA256 자동 검증.
+GitHub Releases (`DongKey777/woowa-learning-system`)에 publish된 사전 빌드 인덱스 (release별 약 13-19MB zstd compressed)를 다운로드해서 `state/index/`로 추출. SHA256 자동 검증.
 
 - 소요: 10-20초 (네트워크 광대역)
 - 의존: `gh` CLI (미설치면 한국어로 OS별 설치 안내)
-- 기본 tag: `paradigm-v2-index-v1.0.1`
+- 기본 tag: `paradigm-v2-index-v1.0.2`
 
 #### 🚫 학습자 기기 로컬 빌드 절대 금지
 
@@ -182,7 +182,7 @@ python3 bin/ask "테스트 query"
 |---|---|
 | `pip install -e .` | ~30초 (캐시 hit) ~ 2분 (cold) |
 | BGE-M3 다운로드 | ~5분 (3GB) |
-| `bin/index-fetch` (release) | ~15초 (약 13-18MB) |
+| `bin/index-fetch` (release) | ~15초 (약 13-19MB) |
 | Daemon prewarm | ~10초 |
 | **합계 (학습자 path)** | **~6분** |
 

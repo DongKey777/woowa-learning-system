@@ -124,17 +124,17 @@ trigger: 학습자가 *"다른 크루는"*, *"정밀 비교"*, *"cross-crew"* �
 GitHub Releases에서 pre-built Lance 인덱스 다운로드. SHA256 검증 후 `state/index/`로 추출.
 
 ```bash
-bin/index-fetch [--tag paradigm-v2-index-v1.0.1] [--force] [--expected-sha256 <hex>]
+bin/index-fetch [--tag paradigm-v2-index-v1.0.2] [--force] [--expected-sha256 <hex>]
 ```
 
 옵션:
 - `--tag <tag>`: 다른 release version 지정
 - `--force`: 기존 `state/index/`를 덮어쓰기 (default는 존재 시 건너뜀)
-- `--expected-sha256 <hex>`: 무결성 검증 (default는 v1.0.0의 hash hardcoded)
+- `--expected-sha256 <hex>`: 무결성 검증 (default는 v1.0.2의 hash hardcoded)
 
 의존: `gh` CLI + GitHub 인증 (`gh auth login`)
 
-학습자 onboarding의 Step 3에 해당. 소요 ~15초 (release별 약 13-18MB).
+학습자 onboarding의 Step 3에 해당. 소요 ~15초 (release별 약 13-19MB).
 
 ---
 
@@ -153,11 +153,11 @@ bin/corpus-build [--corpus-dir corpus/concepts] [--index-dir state/index]
 
 Build 후 publish 흐름:
 ```bash
-bin/index-pack --archive /tmp/paradigm-v2-index-vX.Y.Z.tar.zst --force
-bin/index-pack --archive /tmp/paradigm-v2-index-vX.Y.Z.tar.zst --verify-only
-gh release create paradigm-v2-index-vX.Y.Z /tmp/paradigm-v2-index-vX.Y.Z.tar.zst \
+bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.2.tar.zst --force
+bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.2.tar.zst --verify-only
+gh release create paradigm-v2-index-v1.0.2 /tmp/paradigm-v2-index-v1.0.2.tar.zst \
     --title "paradigm-v2 Lance index vX.Y.Z" --notes "..."
-# 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-vX.Y.Z 로 업데이트
+# 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-v1.0.2 로 업데이트
 ```
 
 ---
@@ -176,7 +176,7 @@ bin/index-pack --verify-only
 - archive manifest의 `full_corpus_sha256`가 현재 `state/index/manifest.json`과 동일
 - runtime sidecar 2개가 archive에 포함됨
 
-K18 local archive: `state/index.tar.zst`, **17.9MB**, SHA256 `24cc838c949078f767fd41afd7cc50fd865e2a4fb387b2dfcb6cc39ee793bec6`.
+Y14 remote archive: `state/index.tar.zst`, **18.7MB**, SHA256 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`.
 
 ---
 
