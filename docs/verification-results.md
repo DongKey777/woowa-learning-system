@@ -1,8 +1,8 @@
 # Verification results — latest Y13 acceptance + historical phase results
 
 최신 측정 날짜: 2026-05-27
-브랜치: `paradigm-v2`
-누적 commit: a07411e..working tree
+브랜치: `main`
+기준: latest local acceptance rerun after index release v1.0.1
 
 ## 1. 한 줄 요약
 
@@ -18,20 +18,20 @@ paradigm-v2는 최신 Y13 release acceptance **96/96**, K_Y13 gates **47/47**, f
 | runtime LOC | **9496 / 9500** | `reports/release_acceptance_v1.0.1.json` |
 | corpus rebuild readiness | **ready=true, rebuild_needed=false, 0 wrong exact owners** | `reports/corpus_rebuild_readiness.json` |
 | index release archive | **17.9MB, sidecars=true, SHA256 24cc838c...** | `state/index.tar.zst`, `bin/index-pack --verify-only` |
-| qrels strict top1 / learner top1 / NDCG@5 / p95 | **1.000 / 1.000 / 0.987 / 328.9ms** | `reports/cohort_y13_baseline.json` |
-| rag_quality top1 / NDCG@5 / p95 | **0.995 / 0.997 / 3.1ms** | `reports/rag_quality_regression.json` |
-| full scenario p50/p95 / evidence | **54.7ms / 70.9ms / 96.0%** | `reports/v2_vs_legacy_full_comparison.json` |
-| exact shortcut p50/p95 / cases | **0.009ms / 0.022ms / 8 synthetic cases** | `reports/exact_query_shortcut.json` |
-| F11 Stage 4 veto prompt | **P4 pass, 27.7ms** | `reports/phase_p_deep.json` |
-| override keywords p95 | **148.3ms** | `reports/phase_m_uncovered.json` |
-| stress test p50/p95 | **2.0ms / 3.0ms** | `reports/phase_m_uncovered.json` |
-| warm socket p50/p95 | **3.8ms / 4.0ms** | `reports/y13_latency_baseline.json` |
-| warm CLI p50/p95 | **67.3ms / 120.9ms** | `reports/y13_latency_baseline.json` |
-| first ask after ready p50/p95 | **222.7ms / 243.2ms** | `reports/y13_latency_baseline.json` |
-| first-answer total p50/p95 | **17613.5ms / 17743.0ms** | `reports/y13_latency_baseline.json` |
+| qrels strict top1 / learner top1 / NDCG@5 / p95 | **1.000 / 1.000 / 0.987 / 278.6ms** | `reports/cohort_y13_baseline.json` |
+| rag_quality top1 / NDCG@5 / p95 | **0.995 / 0.997 / 1.5ms** | `reports/rag_quality_regression.json` |
+| full scenario p50/p95 / evidence | **48.8ms / 71.5ms / 96.0%** | `reports/v2_vs_legacy_full_comparison.json` |
+| exact shortcut p50/p95 / cases | **0.009ms / 0.017ms / 8 synthetic cases** | `reports/exact_query_shortcut.json` |
+| F11 Stage 4 veto prompt | **P4 pass, 110.8ms** | `reports/phase_p_deep.json` |
+| override keywords p95 | **199.9ms** | `reports/phase_m_uncovered.json` |
+| stress test p50/p95 | **2.8ms / 6.4ms** | `reports/phase_m_uncovered.json` |
+| warm socket p50/p95 | **4.1ms / 6.3ms** | `reports/y13_latency_baseline.json` |
+| warm CLI p50/p95 | **43.9ms / 47.6ms** | `reports/y13_latency_baseline.json` |
+| first ask after ready p50/p95 | **187.2ms / 196.0ms** | `reports/y13_latency_baseline.json` |
+| first-answer total p50/p95 | **15245.0ms / 15247.7ms** | `reports/y13_latency_baseline.json` |
 | fair legacy prewarm total-to-first-answer | **43933.6ms** | `reports/daemon_latency_legacy_fair_probe.json` |
 
-Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file=...)` fast path로 대체했다. AutoTokenizer rollback은 `WOOWA_ENCODER_TOKENIZER_BACKEND=auto`이며, parity report는 input ids/masks 동일 + vector cosine min/mean **1.0/1.0**, max_abs_diff **0.0**이다. Y13-K6에서는 qrels strict 지표와 legacy-style learner-relevant 지표를 분리하고, AF_UNIX line-delimited protocol에서 불필요한 client `shutdown(SHUT_WR)`를 제거했다. Y13-K7에서는 weak dense head일 때만 strong lexical/title 후보를 승격해 qrels strict top1 **0.828→0.839**, learner top1 **0.856→0.867**, MRR **0.900→0.905**로 올렸다. Y13-K8에서는 executable `bin/ask` fast path를 shell + AF_UNIX `nc`로 추가하고 daemon `ask_text` action을 붙여 warm CLI p95 **86.3→48.6ms**, 14개 일반 시나리오 p50/p95 **81.4/110.8→47.7/64.6ms**로 낮췄다. Y13-K9에서는 search-result cache와 stable lexical rerank cache key를 추가하고 full-scenario p95 측정을 실제 run sample percentile로 강화했다. Y13-K10에서는 legacy override keywords(`그냥 답해`, `RAG로 깊게`, `코치 모드`)를 v2 router에 연결했고, override noise를 retrieval query에서 제거한다. Y13-K11에서는 F11 cross-crew prompt에 Stage 4 veto instruction을 실제 runtime path로 연결했다. Y13-K12에서는 duplicate exact query ownership을 정리하고 punctuation-insensitive exact normalization 및 Java/Spring short-query coverage를 추가했다. Y13-K13에서는 qrels strict 실패 taxonomy 중 명확한 corpus ownership 6건을 보강하고 generic Strategy/Factory 비교에서 mission bridge 오염을 막아 qrels strict top1 **0.839→0.872**, learner top1 **0.867→0.894**, MRR **0.905→0.921**로 올렸다. Y13-K14에서는 remote-build provenance guard, Phase V/X wrapper latency hardening, qrels legacy-superiority gates, full-scenario 5-run p95 sampling, Phase N timeout budget을 정리했다. Y13-K15에서는 dense index rebuild 전에 corpus readiness audit을 정식 gate로 추가하고, stress query exact coverage를 12/12로 맞춰 S8 p95 **232.7ms→3.0ms**를 확인했다. Y13-K16에서는 rebuild 전 corpus audit을 한 번 더 수행해 안전한 direct query 15개를 보강하고 high-impact duplicate exact ownership을 정리한 뒤 dense index를 재빌드했다. Y13-K17에서는 남은 strict miss 23건 중 현재 top1이 더 적절한 케이스는 유지하고, intended primary 표현 공백이 명확한 7건만 보강했다. Y13-K18에서는 남은 strict miss를 다시 감사해 stale gold 16건을 제품 기준에 맞게 정정하고, Repository/DAO·service locator·request binding 등 실제 표현 공백만 보강한 뒤 readiness audit 통과 후 dense index를 재빌드했다. 이후 `bin/index-pack`으로 self-contained archive를 만들고 release acceptance에 archive verification gate를 추가했다. 그 결과 qrels strict top1/learner top1/MRR **1.000/1.000/1.000**, NDCG@5 **0.987**, p50/p95 **202.8/328.9ms**가 됐고, 같은 qrels의 legacy는 active pass/top1/MRR **0.978/0.628/0.769**, p50/p95 **1080.1/1814.2ms**다. 최신 14개 일반 시나리오 p50/p95는 **54.7/70.9ms**로 legacy **77.7/104.6ms** 대비 p50/p95 **1.4×/1.5×** 빠르다.
+Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file=...)` fast path로 대체했다. AutoTokenizer rollback은 `WOOWA_ENCODER_TOKENIZER_BACKEND=auto`이며, parity report는 input ids/masks 동일 + vector cosine min/mean **1.0/1.0**, max_abs_diff **0.0**이다. Y13-K6에서는 qrels strict 지표와 legacy-style learner-relevant 지표를 분리하고, AF_UNIX line-delimited protocol에서 불필요한 client `shutdown(SHUT_WR)`를 제거했다. Y13-K7에서는 weak dense head일 때만 strong lexical/title 후보를 승격해 qrels strict top1 **0.828→0.839**, learner top1 **0.856→0.867**, MRR **0.900→0.905**로 올렸다. Y13-K8에서는 executable `bin/ask` fast path를 shell + AF_UNIX `nc`로 추가하고 daemon `ask_text` action을 붙여 warm CLI p95 **86.3→48.6ms**, 14개 일반 시나리오 p50/p95 **81.4/110.8→47.7/64.6ms**로 낮췄다. Y13-K9에서는 search-result cache와 stable lexical rerank cache key를 추가하고 full-scenario p95 측정을 실제 run sample percentile로 강화했다. Y13-K10에서는 legacy override keywords(`그냥 답해`, `RAG로 깊게`, `코치 모드`)를 v2 router에 연결했고, override noise를 retrieval query에서 제거한다. Y13-K11에서는 F11 cross-crew prompt에 Stage 4 veto instruction을 실제 runtime path로 연결했다. Y13-K12에서는 duplicate exact query ownership을 정리하고 punctuation-insensitive exact normalization 및 Java/Spring short-query coverage를 추가했다. Y13-K13에서는 qrels strict 실패 taxonomy 중 명확한 corpus ownership 6건을 보강하고 generic Strategy/Factory 비교에서 mission bridge 오염을 막아 qrels strict top1 **0.839→0.872**, learner top1 **0.867→0.894**, MRR **0.905→0.921**로 올렸다. Y13-K14에서는 remote-build provenance guard, Phase V/X wrapper latency hardening, qrels legacy-superiority gates, full-scenario 5-run p95 sampling, Phase N timeout budget을 정리했다. Y13-K15에서는 dense index rebuild 전에 corpus readiness audit을 정식 gate로 추가하고, stress query exact coverage를 12/12로 맞췄다. Y13-K16에서는 rebuild 전 corpus audit을 한 번 더 수행해 안전한 direct query 15개를 보강하고 high-impact duplicate exact ownership을 정리한 뒤 dense index를 재빌드했다. Y13-K17에서는 남은 strict miss 23건 중 현재 top1이 더 적절한 케이스는 유지하고, intended primary 표현 공백이 명확한 7건만 보강했다. Y13-K18에서는 남은 strict miss를 다시 감사해 stale gold 16건을 제품 기준에 맞게 정정하고, Repository/DAO·service locator·request binding 등 실제 표현 공백만 보강한 뒤 readiness audit 통과 후 dense index를 재빌드했다. 이후 `bin/index-pack`으로 self-contained archive를 만들고 release acceptance에 archive verification gate를 추가했다. 그 결과 qrels strict top1/learner top1/MRR **1.000/1.000/1.000**, NDCG@5 **0.987**, p50/p95 **176.1/278.6ms**가 됐고, 같은 qrels의 legacy는 active pass/top1/MRR **0.978/0.628/0.769**, p50/p95 **1080.1/1814.2ms**다. 최신 14개 일반 시나리오 p50/p95는 **48.8/71.5ms**로 legacy **70.7/100.4ms** 대비 p50/p95 **1.4×/1.4×** 빠르다.
 
 ## 2. Historical Phase Results
 
@@ -72,13 +72,13 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 | 지표 | paradigm-v2 | Legacy | Δ |
 |---|---:|---:|---:|
 | first-answer total (fair probe) | **13562.3ms** | 43933.6ms | **3.24× faster** |
-| first-answer total (canonical release) | **17743.0ms p95** | 43933.6ms | **2.5× faster** |
-| warm CLI p95 | **120.9ms** | 431.7ms | **3.6× faster** |
-| qrels production p95 | **328.9ms** | 1814.2ms | **5.5× faster** |
+| first-answer total (canonical release) | **15247.7ms p95** | 43933.6ms | **2.9× faster** |
+| warm CLI p95 | **47.6ms** | 431.7ms | **9.1× faster** |
+| qrels production p95 | **278.6ms** | 1814.2ms | **6.5× faster** |
 | qrels primary/strict top1 | **1.000** | 0.628 | **+37.2pp** |
-| 14-scenario full comparison p50/p95 | **54.7ms / 70.9ms** | 77.7ms / 104.6ms | **v2 faster 1.4× / 1.5×** |
-| override keyword dispatch | **4/4, p95 148.3ms** | same override semantics confirmed | parity + retrieval-noise fix |
-| short exact concept queries | **8/8, p95 0.010ms** | 3-sample p95 546.6ms | **encoder-free + better top1 ownership** |
+| 14-scenario full comparison p50/p95 | **48.8ms / 71.5ms** | 70.7ms / 100.4ms | **v2 faster 1.4× / 1.4×** |
+| override keyword dispatch | **4/4, p95 199.9ms** | same override semantics confirmed | parity + retrieval-noise fix |
+| short exact concept queries | **8/8, p95 0.017ms** | 3-sample p95 546.6ms | **encoder-free + better top1 ownership** |
 
 아래 표는 Phase J 당시 historical comparison이다.
 
@@ -118,7 +118,7 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 - **F7 gap shrinks 2주** — 학습자 weak concept이 14일 후 strengthen되는지 측정. 시간 외 측정 불가.
 - **F10 gap flagged → 30d mastered** — gap detect된 concept이 30일 내 mastered로 진행되는지 측정. 시간 외 측정 불가.
 
-두 gate 모두 학습자 daily 사용 시작 후 자연 누적 데이터로 측정. main merge 후 14-30일 시점에서 별도 cycle.
+두 gate 모두 학습자 daily 사용 시작 후 자연 누적 데이터로 측정. 실제 사용 데이터가 쌓인 뒤 14-30일 시점에서 별도 cycle.
 
 ## 7. Documented gaps (non-blockers)
 
@@ -129,10 +129,9 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 
 ## 8. 다음 cycle 후보
 
-1. **main merge** — plan §branch strategy 따라 force-push reset
-2. F7 / F10 gap longitudinal — 학습자 daily 14-30일 후 측정
-3. F11 answer-quality sampling after Stage 4 veto prompt
-4. F11 + coaching dual mode (Phase P P4)에서 더 풍부한 narrative 생성
+1. F7 / F10 gap longitudinal — 학습자 daily 14-30일 후 측정
+2. F11 answer-quality sampling after Stage 4 veto prompt
+3. F11 + coaching dual mode (Phase P P4)에서 더 풍부한 narrative 생성
 
 ## 9. 재현 명령
 
