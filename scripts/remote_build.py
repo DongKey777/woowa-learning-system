@@ -6,7 +6,7 @@ Build target: 3339 concepts × BGE-M3 dense → Lance index ≤20MB.
 Steps:
   1. Pod create (A100 PCIe, 96GB RAM, runpod/pytorch:2.4 image)
   2. Wait SSH ready
-  3. git clone DongKey777/woowa-learning-system @ commit
+  3. shallow fetch DongKey777/woowa-learning-system @ commit
   4. pip install --break-system-packages: lancedb pyarrow sentence-transformers
      FlagEmbedding jsonschema
   5. warm BGE-M3 (HF download)
@@ -33,6 +33,7 @@ REPO_URL = "https://github.com/DongKey777/woowa-learning-system.git"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 DEFAULT_GPU = "NVIDIA A100 80GB PCIe"
+DEFAULT_CLOUD_TYPE = "COMMUNITY"
 DEFAULT_DISK_GB = 50
 DEFAULT_MIN_VRAM_GB = 40
 DEFAULT_MIN_RAM_GB = 96
@@ -81,8 +82,11 @@ def _build_commands(commit_sha: str) -> list[str]:
     return [
         # 3. system deps
         "apt-get update -qq && apt-get install -y -qq zstd git",
-        # 4a. clone + checkout
-        f"git clone {REPO_URL} /workspace/repo && cd /workspace/repo && git checkout {commit_sha}",
+        # 4a. shallow fetch + checkout exact commit
+        "git init /workspace/repo && cd /workspace/repo && "
+        f"git remote add origin {REPO_URL} && "
+        f"git fetch --depth 1 origin {commit_sha} && "
+        "git checkout --detach FETCH_HEAD",
         # 4b. install deps (use Pod's CUDA-matched torch via --break-system-packages)
         "cd /workspace/repo && pip install --break-system-packages "
         "lancedb pyarrow numpy jsonschema sentence-transformers "
@@ -99,23 +103,31 @@ def _build_commands(commit_sha: str) -> list[str]:
     ]
 
 
-def run(api_key: str, *, commit_sha: str, keep_pod: bool, dry_run: bool) -> int:
+def run(
+    api_key: str,
+    *,
+    commit_sha: str,
+    keep_pod: bool,
+    dry_run: bool,
+    gpu_type: str,
+    cloud_type: str,
+) -> int:
     if dry_run:
         print("[dry-run] commands:")
         for i, cmd in enumerate(_build_commands(commit_sha)):
             print(f"  {i + 1}. {cmd}")
-        print(f"[dry-run] would create pod ({DEFAULT_GPU}), execute steps, scp {ARTIFACT_REMOTE} → {INDEX_LOCAL}")
+        print(f"[dry-run] would create pod ({gpu_type}, cloud={cloud_type}), execute steps, scp {ARTIFACT_REMOTE} → {INDEX_LOCAL}")
         return 0
 
     import runpod
     runpod.api_key = api_key
 
-    print(f"[runpod] creating pod ({DEFAULT_GPU}, image={DEFAULT_IMAGE[:40]}…)")
+    print(f"[runpod] creating pod ({gpu_type}, cloud={cloud_type}, image={DEFAULT_IMAGE[:40]}…)")
     pod = runpod.create_pod(
         name=f"woowa-build-{int(time.time())}",
         image_name=DEFAULT_IMAGE,
-        gpu_type_id=DEFAULT_GPU,
-        cloud_type="COMMUNITY",
+        gpu_type_id=gpu_type,
+        cloud_type=cloud_type,
         gpu_count=1,
         volume_in_gb=0,
         container_disk_in_gb=DEFAULT_DISK_GB,
@@ -191,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-pod", action="store_true",
                         help="leave pod running after build (manual cleanup)")
     parser.add_argument("--commit-sha", default=None)
+    parser.add_argument("--gpu-type", default=DEFAULT_GPU,
+                        help=f"RunPod GPU type id (default: {DEFAULT_GPU})")
+    parser.add_argument("--cloud-type", default=DEFAULT_CLOUD_TYPE,
+                        choices=("COMMUNITY", "SECURE"),
+                        help=f"RunPod cloud type (default: {DEFAULT_CLOUD_TYPE})")
     args = parser.parse_args(argv)
 
     api_key = os.environ.get("RUNPOD_API_KEY") or _read_key_file()
@@ -205,7 +222,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("dirty worktree; commit changes or pass --commit-sha")
     commit_sha = args.commit_sha or _current_commit_sha()
     return run(api_key=api_key or "", commit_sha=commit_sha,
-               keep_pod=args.keep_pod, dry_run=args.dry_run)
+               keep_pod=args.keep_pod, dry_run=args.dry_run,
+               gpu_type=args.gpu_type, cloud_type=args.cloud_type)
 
 
 def _read_key_file() -> str | None:

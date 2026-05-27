@@ -180,7 +180,7 @@ def _get_direct_model():
             source = _model_source(local_files_only)
             model_kwargs = {"local_files_only": local_files_only}
             if dtype_name is not None:
-                model_kwargs["dtype"] = getattr(torch, dtype_name)
+                model_kwargs["torch_dtype"] = getattr(torch, dtype_name)
             if _parallel_load_enabled():
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=2) as pool:
