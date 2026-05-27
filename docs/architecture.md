@@ -132,11 +132,11 @@ Phase L 측정:
   - executable `bin/ask` uses a shell + AF_UNIX `nc` fast path for warm daemon text/JSON output; direct `python3 bin/ask` remains compatible and falls back to the Python client
   - legacy override keywords are first-class: `그냥 답해` skips RAG, `RAG로 깊게` forces CS RAG, `코치 모드` forces coaching; override tokens are stripped from retrieval query before search
   - search-result cache stores post-rerank unpersonalized hits for default encoder calls; stable lexical rerank cache keys keep repeated AI-session prompts on the cache path while profile adjustment remains per request
-  - warm socket p50/p95: **4.7ms / 6.3ms**
-  - warm CLI p50/p95: **88.2ms / 152.1ms**
-  - first ask after ready p50/p95: **322.6ms / 399.6ms**
-  - first-answer total(stop→prewarm-ready→첫 `bin/ask`) p50/p95: **20365.9ms / 20541.0ms**
-  - startup phase timing shows encoder import/materialization still dominates cold path, but first-ready p95 remains **20246.3ms**
+  - warm socket p50/p95: **3.8ms / 4.0ms**
+  - warm CLI p50/p95: **67.3ms / 120.9ms**
+  - first ask after ready p50/p95: **222.7ms / 243.2ms**
+  - first-answer total(stop→prewarm-ready→첫 `bin/ask`) p50/p95: **17613.5ms / 17743.0ms**
+  - startup phase timing shows encoder import/materialization still dominates cold path, but first-ready p95 remains **17520.3ms**
 - Phase N1: SQLite mastery 등 모든 state daemon restart 후 survive 검증
 - Phase N12: 5 ask sequential = 5 well-formed event append (atomic)
 
@@ -154,12 +154,12 @@ Phase L 측정:
 
 | 지표 | paradigm-v2 | Legacy hub | Δ |
 |---|---|---|---|
-| warm CLI p50 | **88.2ms** | 147.2ms | **1.7× faster** |
-| warm CLI p95 | **152.1ms** | 431.7ms | **2.8× faster** |
-| first-answer total | **13.6s** (fair probe), **20.5s** canonical p95 | 43.9s | **3.24× faster** fair probe |
-| qrels p50/p95 | **235.4ms / 388.8ms** | 1080.1ms / 1814.2ms | **4.6× / 4.7× faster** |
+| warm CLI p50 | **67.3ms** | 147.2ms | **2.2× faster** |
+| warm CLI p95 | **120.9ms** | 431.7ms | **3.6× faster** |
+| first-answer total | **13.6s** (fair probe), **17.7s** canonical p95 | 43.9s | **3.24× faster** fair probe |
+| qrels p50/p95 | **202.8ms / 328.9ms** | 1080.1ms / 1814.2ms | **5.3× / 5.5× faster** |
 | qrels strict/primary top1 | **1.000** | 0.628 | **+37.2pp** |
-| 14-scenario bin/ask p50/p95 | **64.5ms / 87.0ms** | 88.0ms / 116.6ms | **1.4× / 1.3× faster** |
+| 14-scenario bin/ask p50/p95 | **54.7ms / 70.9ms** | 77.7ms / 104.6ms | **1.4× / 1.5× faster** |
 | override keywords | **4/4, p95 148.3ms** | same override semantics confirmed | parity |
 | short exact concept queries | **8/8, p95 0.022ms** | 3-sample p95 546.6ms | **encoder-free + better top1 ownership** |
 | LLM payload | 2.4KB | 48.6KB | **20× cheaper** |
