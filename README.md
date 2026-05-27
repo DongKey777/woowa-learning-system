@@ -47,15 +47,16 @@
 |---|---|
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
+| Y14 corpus closure qrels | **14/14 top1=1.000, p95≤1.5ms ✅** |
 | Unit tests | **488 passed** |
 | Runtime LOC budget | **9496 / 9500 ✅** |
-| Index release artifact | **17.9MB, SHA256 검증 ✅** |
+| Index release artifact | **18.7MB, SHA256 검증 ✅** |
 
 자세한 결과 → [`docs/verification-results.md`](docs/verification-results.md)
 
 ## 핵심 capability
 
-- **F1 RAG**: qrels strict top1 1.000, MRR 1.000, NDCG@5 0.987
+- **F1 RAG**: Y14 qrels strict top1/MRR/NDCG 1.000, rag_quality top1/NDCG 1.000
 - **F2-F4 coaching/retro**: mentor concern alignment 86.7%, recurring signal 100%
 - **F5 Bloom autoloop**: 5 mastered + 2 proficient 자동 진행
 - **F6 drill**: corpus 100% 커버 (3339 concept 모두 non-stub 질문 생성)
