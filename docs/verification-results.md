@@ -6,15 +6,15 @@
 
 ## 1. 한 줄 요약
 
-Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **1.0ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **488 passed**다.
+Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **488 passed**다.
 
 ## 1.1 Latest Y14 Snapshot
 
 | 축 | 최신 결과 | Report |
 |---|---:|---|
 | Corpus concepts / graph | **3339 concepts / 6172 prereq edges / broken 0** | `corpus/concept_graph.json`, `bin/learning-path-graph-audit` |
-| Y14 qrels prompt/reformulated | **14/14 sets top1=1.000, top5=1.000, forbidden=0, max p95=1.0ms** | `reports/y14_batch1_7_qrels_eval.json` |
-| rag_quality top1 / NDCG@5 / p95 | **1.000 / 1.000 / 0.3ms** | `reports/rag_quality_regression.json` |
+| Y14 qrels prompt/reformulated | **14/14 sets top1=1.000, top5=1.000, forbidden=0, max p95=3.6ms** | `reports/y14_batch1_7_qrels_eval.json` |
+| rag_quality top1 / NDCG@5 / p95 | **1.000 / 1.000 / 1.6ms** | `reports/rag_quality_regression.json` |
 | pytest | **488 passed** | local `python3 -m pytest tests/ -q` |
 | corpus rebuild readiness | **ready=true, rebuild_needed=false, 0 wrong exact owners** | `reports/corpus_rebuild_readiness.json` |
 | index archive | **v1.0.2, 18.7MB, sidecars=true, SHA256 d8da5782...** | `state/index.tar.zst`, `bin/index-pack --verify-only` |

@@ -47,7 +47,7 @@
 |---|---|
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
-| Y14 corpus closure qrels | **14/14 top1=1.000, p95≤1.0ms ✅** |
+| Y14 corpus closure qrels | **14/14 top1=1.000, p95≤3.6ms ✅** |
 | Unit tests | **488 passed** |
 | Runtime LOC budget | **9496 / 9500 ✅** |
 | Index release artifact | **18.7MB, SHA256 검증 ✅** |
