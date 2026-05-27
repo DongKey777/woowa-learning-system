@@ -1,0 +1,62 @@
+{
+  "id": "data-structure/lock-free-ring-buffer-memory-ordering-backpressure-chooser",
+  "title": "Lock Free Ring Buffer Memory Ordering Backpressure Chooser",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "lock-free ring buffer 선택은 알고리즘 이름보다 cursor ownership, memory ordering, backpressure 계약으로 결정한다.",
+  "body_markdown": "    # Lock Free Ring Buffer Memory Ordering Backpressure Chooser\n\n    ## 이 문서가 맡는 질문\n    lock-free ring buffer를 memory ordering, false sharing, bounded backpressure 기준으로 고르는 data-structure chooser다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    SPSC/MPSC/MPMC 모델, overwrite 허용 여부, bounded capacity, acquire/release ordering, padding 필요성을 먼저 본다.\n\n    ## 실전 시나리오\n    락을 없앴는데 처리량은 늘지 않고 간헐적으로 데이터 누락이나 CPU spike가 생긴다. queue 알고리즘보다 producer/consumer ownership과 backpressure 계약이 불명확한 상태다.\n\n    ## CS 배경\n    ring buffer는 고정 배열과 head/tail cursor로 동작한다. lock-free라고 해도 cursor publish 순서, cache line 공유, consumer visibility가 맞지 않으면 linearizability와 latency가 동시에 깨진다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - producer가 쓰기 완료 전에 tail을 publish하면 안 된다\n- consumer는 acquire로 published data를 본다\n- bounded queue는 full 상태에서 drop/block/fail-fast 정책을 명시한다\n- head/tail cursor는 false sharing을 피해야 한다\n\n    ## 판단 매트릭스\n    - SPSC면 단순 acquire/release ring\n- MPSC면 producer claim 충돌 관리\n- MPMC면 sequence number 기반 slot ownership\n- 부하 제어가 중요하면 queue length와 shed policy\n\n    ## 예시\n    ```text\n    producer writes slot -> release tail; consumer acquire tail -> reads slot -> release head\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    lock-free는 대기 없는 마법이 아니라 blocking 위치를 memory ordering과 retry loop로 옮기는 선택이다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 wrap-around, full/empty ambiguity, slow consumer, multi-producer race, false sharing benchmark를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. CAS retry count, cache line bouncing, queue depth, producer stall ratio를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. enqueue p99, dequeue p99, slow consumer backlog time, retry-loop spin duration가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    cas_retry_count, queue_depth_p99, false_sharing_cache_misses, enqueue_p99_ns, drop_or_backpressure_count를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - lock-free면 항상 lock보다 빠르다고 생각한다\n- volatile만 붙이면 memory ordering이 모두 해결된다고 본다\n- bounded queue full 정책 없이 backpressure가 생긴다고 가정한다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    lock-free ring buffer 선택은 알고리즘 이름보다 cursor ownership, memory ordering, backpressure 계약으로 결정한다.\n",
+  "aliases": [
+    "Lock Free Ring Buffer Memory Ordering Backpressure Chooser",
+    "lock free ring buffer memory ordering backpressure chooser",
+    "lock free ring buffer memory ordering acquire release backpressure bounded queue false sharing latency chooser",
+    "lock-free ring buffer를 쓸 때 memory ordering과 backpressure는 뭘 봐야 해?"
+  ],
+  "expected_queries": [
+    "lock-free ring buffer를 쓸 때 memory ordering과 backpressure는 뭘 봐야 해?",
+    "lock free ring buffer memory ordering acquire release backpressure bounded queue false sharing latency chooser",
+    "lock-free ring buffer 선택은 알고리즘 이름보다 cursor ownership, memory ordering, backpressure 계약으로 결정한다."
+  ],
+  "symptoms": [
+    "cas_retry_count",
+    "queue_depth_p99",
+    "false_sharing_cache_misses"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/lock-free-spsc-ring-buffer",
+      "data-structure/bounded-mpmc-queue",
+      "data-structure/circular-queue-vs-ring-buffer"
+    ],
+    "next_docs": [
+      "language/java-varhandle-unsafe-atomic-memory-ordering-primer",
+      "operating-system/cpu-cache-locality-false-sharing-perspective-map"
+    ],
+    "confusable_with": [
+      "data-structure/ring-buffer-backpressure-mission-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "lock-free ring buffer를 쓸 때 memory ordering과 backpressure는 뭘 봐야 해?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "lock free ring buffer memory ordering acquire release backpressure bounded queue false sharing latency chooser",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch7"
+      }
+    ]
+  }
+}

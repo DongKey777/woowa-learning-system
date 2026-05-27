@@ -1,0 +1,61 @@
+{
+  "id": "security/oauth-consent-scope-downscoping-confused-deputy-chooser",
+  "title": "Oauth Consent Scope Downscoping Confused Deputy Chooser",
+  "category": "security",
+  "level": "advanced",
+  "summary": "OAuth delegation 안전성은 scope 이름보다 actor, audience, consent, downscoping boundary를 함께 고정해야 생긴다.",
+  "body_markdown": "    # Oauth Consent Scope Downscoping Confused Deputy Chooser\n\n    ## 이 문서가 맡는 질문\n    OAuth consent, scope downscoping, confused deputy, delegation boundary를 구분하는 security chooser다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    사용자 consent인지, client 권한인지, resource audience인지, delegated action인지, token exchange인지 먼저 나눈다.\n\n    ## 실전 시나리오\n    관리자 도구가 사용자 대신 API를 호출하면서 과도한 scope를 가진 token을 재사용한다. 사용자는 동의했지만 어떤 client가 어떤 resource에 어떤 행위를 할 수 있는지 분리되지 않았다.\n\n    ## CS 배경\n    OAuth scope는 권한 문자열이지만, 실제 안전성은 resource server audience, client identity, user consent, delegation chain이 함께 맞아야 한다. confused deputy는 권한 있는 대리자가 다른 주체의 의도와 섞여 잘못 호출되는 문제다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - scope는 audience와 client identity 없이 해석하면 안 된다\n- downscoping은 권한을 줄이는 별도 token 발급 또는 정책 enforcement가 필요하다\n- user consent는 client의 모든 backend 행위를 포괄하지 않는다\n- delegation chain은 감사 로그와 revocation 단위를 가져야 한다\n\n    ## 판단 매트릭스\n    - 사용자 위임이면 consent/scope\n- 서비스 간 위임이면 token exchange\n- 권한 축소면 downscoped token\n- 대리자 혼동이면 audience와 actor claim\n\n    ## 예시\n    ```text\n    support tool receives broad admin token; downscope to user:read for target tenant before calling resource API\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    OAuth 보안은 scope 문자열보다 누가 누구 대신 어떤 audience에 호출하는지의 경계가 핵심이다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 wrong audience, excessive scope, missing actor, tenant switch, revocation after consent change를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. token introspection/cache cost, PDP call rate, scope evaluation cost를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. authorization decision p99, token exchange latency, cache miss latency, revocation propagation lag가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    excessive_scope_denied_count, token_exchange_p99_ms, wrong_audience_reject_count, revocation_lag_ms, authz_decision_p99_ms를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - scope 문자열이 있으면 resource server가 항상 안전하게 해석한다고 본다\n- 사용자 consent가 있으면 service delegation도 자동으로 안전하다고 생각한다\n- downscoping 없이 broad token을 내부에서만 쓰면 된다고 본다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    OAuth delegation 안전성은 scope 이름보다 actor, audience, consent, downscoping boundary를 함께 고정해야 생긴다.\n",
+  "aliases": [
+    "Oauth Consent Scope Downscoping Confused Deputy Chooser",
+    "oauth consent scope downscoping confused deputy chooser",
+    "OAuth consent scope downscoping confused deputy delegation audience actor token exchange security chooser",
+    "OAuth에서 consent, scope downscoping, confused deputy는 어떻게 구분해야 해?"
+  ],
+  "expected_queries": [
+    "OAuth에서 consent, scope downscoping, confused deputy는 어떻게 구분해야 해?",
+    "OAuth consent scope downscoping confused deputy delegation audience actor token exchange security chooser",
+    "OAuth delegation 안전성은 scope 이름보다 actor, audience, consent, downscoping boundary를 함께 고정해야 생긴다."
+  ],
+  "symptoms": [
+    "excessive_scope_denied_count",
+    "token_exchange_p99_ms",
+    "wrong_audience_reject_count"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/oauth-scope-vs-api-audience-vs-application-permission",
+      "security/oauth2-token-exchange-impersonation-delegation-boundary-chooser",
+      "security/pdp-pep-boundaries-design"
+    ],
+    "next_docs": [
+      "security/token-exchange-impersonation-risks"
+    ],
+    "confusable_with": [
+      "security/oauth2-token-exchange-on-behalf-of-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "OAuth에서 consent, scope downscoping, confused deputy는 어떻게 구분해야 해?",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    },
+    {
+      "pattern": "OAuth consent scope downscoping confused deputy delegation audience actor token exchange security chooser",
+      "match_count": 1,
+      "added_at": "2026-05-27"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch7"
+      }
+    ]
+  }
+}
