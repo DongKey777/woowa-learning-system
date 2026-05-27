@@ -1,7 +1,7 @@
 """Minimal RunPod build harness for woowa-learning-system.
 
 Replaces legacy 12-step paramiko harness with 8-step system-ssh flow.
-Build target: 3199 concepts × BGE-M3 dense → Lance index ≤16MB.
+Build target: 3339 concepts × BGE-M3 dense → Lance index ≤20MB.
 
 Steps:
   1. Pod create (A100 PCIe, 96GB RAM, runpod/pytorch:2.4 image)

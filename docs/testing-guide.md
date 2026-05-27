@@ -7,7 +7,7 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 python3 -m pytest tests/ -q
 ```
 
-현재 **484 passed**. 최신 release acceptance 기준 pytest runtime은 76.63초.
+현재 **488 passed**. 최신 corpus closure 기준 pytest runtime은 52.53초.
 
 주요 test 모듈:
 - `test_router.py` — 7 mode dispatch
@@ -20,7 +20,7 @@ python3 -m pytest tests/ -q
 - `test_peer_pr.py` — peer PR analysis
 - `test_phase8_code_metrics.py` — LOC budget + entry point count
 
-회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 484 passed 유지 확인.
+회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 488 passed 유지 확인.
 
 ---
 
@@ -213,5 +213,5 @@ sqlite3 state/learner/mastery_graph.sqlite \
 기대:
 - ping: `{"alive": true}`
 - ask: `[Mode: cs_qa]` markdown 응답
-- pytest: `484 passed`
+- pytest: `488 passed`
 - mastery: mastered ≥ 1

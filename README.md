@@ -41,13 +41,13 @@
 
 두 문서는 동일한 First-Run Protocol + system contract를 포함, 톤만 다름.
 
-## 검증 상태 (2026-05-27)
+## 검증 상태 (2026-05-28)
 
 | Gate | 결과 |
 |---|---|
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
-| Unit tests | **484 passed** |
+| Unit tests | **488 passed** |
 | Runtime LOC budget | **9496 / 9500 ✅** |
 | Index release artifact | **17.9MB, SHA256 검증 ✅** |
 
@@ -58,8 +58,8 @@
 - **F1 RAG**: qrels strict top1 1.000, MRR 1.000, NDCG@5 0.987
 - **F2-F4 coaching/retro**: mentor concern alignment 86.7%, recurring signal 100%
 - **F5 Bloom autoloop**: 5 mastered + 2 proficient 자동 진행
-- **F6 drill**: corpus 100% 커버 (3199 concept 모두 non-stub 질문 생성)
-- **F8 prereq**: concept_graph 5764 edge, 100% level-correct
+- **F6 drill**: corpus 100% 커버 (3339 concept 모두 non-stub 질문 생성)
+- **F8 prereq**: concept_graph 6172 prerequisite edges, broken edge 0
 - **F10 forward** (learner 코드 → concept): Tier 1 100%, Tier 2 85.2%
 - **F10 backward** (concept → learner 파일): 100%
 - **F11 cross-crew**: AI judge precision 85% (4-stage filter)

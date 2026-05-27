@@ -57,7 +57,7 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 | F5 | mastered > 0 | **5 mastered + 2 proficient** (legacy 0) | mastery_graph.sqlite inspection |
 | F6 | drill non-stub | **100% corpus 커버 + 4-dim 채점** | 12 unit + e2e + 100 random concept coverage |
 | F7 | gap shrinks 2주 | **deferred** | 14-day longitudinal 필요 |
-| F8 | prereq ≥ 80% | **100%** (10/10 edges) | concept_graph 5764 edges 검증 |
+| F8 | prereq ≥ 80% | **100%** (10/10 sampled edges), broken edge 0 | current concept_graph 3339 nodes / 6172 prereq edges |
 | F9 | mode tag 100% | **14/14** | Phase J |
 | F10f Tier 1 | ≥ 90% | **100%** (35/35) | annotation × corpus + round-trip |
 | F10f Tier 2 | ≥ 70% | **85.2%** (23/27) | method+exception+import × corpus |
