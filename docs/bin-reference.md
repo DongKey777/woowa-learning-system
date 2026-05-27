@@ -204,7 +204,7 @@ bin/graph-build
 
 - corpus JSON 전수 스캔
 - prereq cycle detect (있으면 fail)
-- 결과: `corpus/concept_graph.json` (~5MB, 3239 nodes / 5882 prereq edges)
+- 결과: `corpus/concept_graph.json` (~5MB, 3259 nodes / 5942 prereq edges)
 
 trigger: corpus 신규 concept 추가 후 (Mode B).
 

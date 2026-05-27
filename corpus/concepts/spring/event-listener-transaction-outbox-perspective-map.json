@@ -1,0 +1,52 @@
+{
+  "id": "spring/event-listener-transaction-outbox-perspective-map",
+  "title": "Spring Event Listener, Transaction Boundary, Outbox Perspective Map",
+  "category": "spring",
+  "level": "advanced",
+  "summary": "Spring application event, @TransactionalEventListener phase, afterCommit side effect, outbox 패턴을 연결하는 transaction side-effect perspective map이다.",
+  "body_markdown": "# Spring Event Listener, Transaction Boundary, Outbox Perspective Map\n\n## 이 문서가 맡는 질문\n이벤트를 발행했다고 외부 side effect가 안전해지는 것은 아니다. 이벤트 listener가 transaction 안에서 도는지, commit 후 도는지, 실패하면 재시도 가능한지, outbox가 필요한지 분리해야 한다.\n\n## 빠른 분기\n같은 DB invariant면 transaction 안에서 처리하고, 외부 알림/메시지는 afterCommit 또는 outbox를 본다. 유실되면 안 되는 통합 이벤트는 단순 listener보다 outbox relay가 안전하다.\n\n## 실전 시나리오\n예약 생성 transaction 안에서 이메일 발송 이벤트를 발행했는데 DB rollback 후에도 메일이 나갔다. 반대로 afterCommit listener에서 메일 발송 실패가 나면 DB는 이미 commit되어 재시도 저장소가 없으면 유실된다.\n\n## CS 배경\nTransaction boundary는 atomicity의 범위다. Application event는 in-process dispatch이고, transactional event listener는 transaction synchronization phase에 맞춰 실행된다. Outbox는 DB commit과 message 발행 사이의 atomic gap을 durable row로 메운다.\n\n## afterCommit + outbox 예시\n```java\n@Transactional\npublic void reserve(Command command) {\n    Reservation saved = repository.save(command.toReservation());\n    outboxRepository.save(OutboxMessage.of(\"ReservationCreated\", saved.id()));\n}\n```\n외부 broker publish를 transaction 안에서 바로 하지 않고 outbox row를 같은 transaction에 저장한다. relay가 outbox를 읽어 idempotent publish하면 commit 이후 실패도 재시도 가능하다.\n\n## 깊게 볼 포인트\n@TransactionalEventListener(phase = AFTER_COMMIT)는 DB commit 이후 side effect를 지연시키지만 durable retry를 제공하지 않는다. listener 실패가 사용자 요청 실패로 보일지, background retry로 갈지 명확해야 한다.\n\n## 다음 행동\n1. event가 domain invariant인지 외부 side effect인지 분류한다\n2. listener phase와 transaction 참여 여부를 확인한다\n3. 유실 허용 불가 이벤트는 outbox row로 저장한다\n4. relay publish idempotency와 중복 소비를 함께 설계한다\n\n## 확인 질문\n이 이벤트는 같은 transaction이 실패하면 함께 사라져야 하는가, commit 후 반드시 외부로 전달되어야 하는가?\n\n## 추가 주의: fallbackExecution, @Async, dedupe key\n`@TransactionalEventListener(fallbackExecution = false)`이면 transaction이 없을 때 listener는 실행되지 않는다. `@Async`를 붙이면 실행 thread와 transaction context가 달라지므로 예외 전파와 ordering을 다시 봐야 한다. Outbox/consumer는 `event_id`나 `(aggregate_id, version)`을 idempotency key로 저장해 중복 publish와 중복 consume을 막는다.\n\n## 판단 매트릭스\n- In-transaction listener: 같은 DB invariant에는 맞지만 외부 I/O를 끼우면 transaction이 길어진다\n- AFTER_COMMIT listener: rollback 후 side effect를 막지만 실패 재시도 저장소는 별도다\n- Outbox: commit과 발행 사이 gap을 durable하게 다루지만 relay 운영이 필요하다\n- 리뷰 질문: listener 실패 시 데이터와 외부 세계가 어떤 상태로 남는가\n\n## 측정 지표와 레이턴시\noutbox pending age, publish success rate, duplicate publish count, listener failure rate, transaction duration p95, relay lag p95를 본다. 품질은 유실/중복 side effect 감소, 성능은 relay 처리량, 레이턴시는 commit-to-publish delay로 본다.\n\n## 자주 하는 오해\n- Spring event를 쓰면 비동기/내구성이 자동으로 생긴다고 본다\n- afterCommit이면 재시도까지 해결된다고 생각한다\n- 외부 API 호출을 transaction 안에 넣어도 괜찮다고 본다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 event 종류, transaction phase, durable retry 여부를 분리해야 한다. 마지막에는 outbox pending age, relay lag, transaction p95로 품질/성능/레이턴시를 측정한다고 설명한다.\n\n## 실전 검증 루프\n1. rollback 시 listener가 실행되는지 테스트한다\n2. afterCommit 실패가 어디에 기록되는지 확인한다\n3. outbox 저장과 business write를 같은 transaction으로 묶는다\n4. relay idempotent publish와 중복 소비를 테스트한다\n5. commit-to-publish p95와 pending age를 모니터링한다\n\n이 루프를 지키면 Spring Event Listener, Transaction Boundary, Outbox Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nSpring application event, @TransactionalEventListener phase, afterCommit side effect, outbox 패턴을 연결하는 transaction side-effect perspective map이다.\n",
+  "aliases": [
+    "Spring event listener transaction outbox",
+    "TransactionalEventListener afterCommit outbox",
+    "Spring 이벤트 트랜잭션 경계",
+    "afterCommit side effect",
+    "Spring Event Listener, Transaction Boundary, Outbox Perspective Map",
+    "event listener transaction outbox perspective map"
+  ],
+  "expected_queries": [
+    "Spring 이벤트 listener랑 outbox는 언제 구분해?",
+    "TransactionalEventListener afterCommit이면 메시지 유실이 해결돼?",
+    "Spring 이벤트를 transaction 안에서 처리할지 afterCommit/outbox로 뺄지 어떻게 판단해?"
+  ],
+  "symptoms": [
+    "Spring event를 쓰면 비동기/내구성이 자동으로 생긴다고 본다",
+    "afterCommit이면 재시도까지 해결된다고 생각한다",
+    "외부 API 호출을 transaction 안에 넣어도 괜찮다고 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/eventlistener-transaction-phase-outbox",
+      "spring/payment-after-commit-outbox-mission-bridge",
+      "software-engineering/outbox-inbox-domain-events"
+    ],
+    "next_docs": [
+      "spring/post-commit-side-effect-routing-decision-guide"
+    ],
+    "confusable_with": [
+      "spring/transactional-outbox-event-listener-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch3"
+      }
+    ]
+  }
+}

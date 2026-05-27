@@ -1,0 +1,52 @@
+{
+  "id": "network/tls-handshake-sni-alpn-certificate-perspective-map",
+  "title": "TLS Handshake, SNI, ALPN, Certificate Perspective Map",
+  "category": "network",
+  "level": "advanced",
+  "summary": "TLS handshake 실패를 certificate chain, SNI routing, ALPN negotiation, proxy termination 관점으로 분해하는 네트워크 보안 판단 지도다.",
+  "body_markdown": "# TLS Handshake, SNI, ALPN, Certificate Perspective Map\n\n## 이 문서가 맡는 질문\nTLS 오류는 인증서가 틀렸다는 말 하나로 끝나지 않는다. client가 어떤 SNI를 보냈는지, 서버가 어떤 certificate chain을 돌려줬는지, ALPN이 어떤 protocol로 합의됐는지 봐야 한다.\n\n## 빠른 분기\nhostname mismatch면 SNI와 cert SAN, protocol mismatch면 ALPN, 중간 proxy가 있으면 termination 지점과 trust bundle을 먼저 본다.\n\n## 실전 시나리오\ngRPC client가 `UNAVAILABLE: failed ALPN negotiation`으로 실패하고 브라우저 HTTPS는 열린다. 이 경우 인증서 자체보다 ALPN에서 h2가 협상되지 않았거나 L7 proxy가 HTTP/2 upstream을 끊었을 수 있다.\n\n## CS 배경\nTLS handshake는 key exchange, server authentication, optional client authentication, application protocol negotiation을 포함한다. SNI는 하나의 IP에서 hostname별 certificate/routing을 가능하게 하고, ALPN은 HTTP/1.1, h2 같은 application protocol을 TLS 안에서 합의한다.\n\n## openssl 확인 예시\n```bash\nopenssl s_client -connect api.example.com:443   -servername api.example.com   -alpn h2,http/1.1 -showcerts </dev/null\n```\n출력에서 `subject`, `issuer`, certificate chain, `Verify return code`, `ALPN protocol`을 같이 본다. SNI를 빼고 실행한 결과와 비교하면 기본 인증서가 잘못 나가는지도 확인할 수 있다.\n\n## 깊게 볼 포인트\nTLS termination이 LB, gateway, service mesh sidecar, app 중 어디서 일어나는지에 따라 로그 위치가 달라진다. certificate rotation 장애는 배포 성공처럼 보여도 일부 instance trust store나 ticket key rotation에서만 실패할 수 있다.\n\n## 다음 행동\n1. client가 보낸 SNI와 Host header를 분리해 본다\n2. 서버가 반환한 full chain과 SAN을 확인한다\n3. ALPN 결과가 기대 protocol과 맞는지 확인한다\n4. proxy termination 지점별 로그와 metric을 찾는다\n\n## 확인 질문\n이 실패는 신뢰 체인 문제인가, hostname/SNI routing 문제인가, 아니면 h2/http1 ALPN 협상 문제인가?\n\n## 추가 출력 예시\n```text\nVerify return code: 0 (ok)\nALPN protocol: h2\n```\n정상이라면 SAN이 hostname과 맞고 ALPN에 `h2`가 보인다. SAN mismatch면 `hostname mismatch`, intermediate 누락이면 `unable to get local issuer certificate`, gRPC protocol 문제면 `ALPN protocol: http/1.1` 또는 ALPN 없음으로 나타날 수 있다. gRPC는 `grpcurl -vv api.example.com:443 list`처럼 client debug 출력도 함께 본다.\n\n## 판단 매트릭스\n- Certificate chain: issuer/root/intermediate 누락과 만료를 확인한다\n- SNI: 같은 IP에서 다른 hostname 인증서가 나가는지 본다\n- ALPN: h2가 필요한 client가 http/1.1로 떨어지거나 협상 실패하는지 본다\n- 리뷰 질문: TLS가 어느 hop에서 끝나고 다음 hop은 어떤 trust boundary인가\n\n## 측정 지표와 레이턴시\nhandshake failure rate, certificate verify error code, SNI mismatch count, ALPN protocol distribution, handshake latency p95, TLS session resumption rate를 본다. 성능은 handshake CPU와 resumption, 레이턴시는 full handshake p95와 재시도 비용을 본다.\n\n## 자주 하는 오해\n- TLS 오류를 모두 인증서 만료로 본다\n- SNI와 Host header를 같은 것으로 본다\n- 브라우저가 되면 gRPC도 된다고 생각한다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 handshake 단계를 certificate, SNI, ALPN, proxy termination으로 쪼개야 한다. 그 다음 openssl이나 client debug log로 확인할 증거를 말하고, 품질/성능/레이턴시는 실패율, protocol 분포, handshake p95로 검증한다고 설명한다.\n\n## 실전 검증 루프\n1. openssl s_client로 SNI 포함/미포함 결과를 비교한다\n2. ALPN 협상 결과와 client가 요구한 protocol을 맞춘다\n3. LB/gateway/app termination 지점을 그린다\n4. certificate rotation 전후 handshake error와 p95를 비교한다\n5. trust store와 intermediate chain 누락을 배포 checklist에 넣는다\n\n이 루프를 지키면 TLS Handshake, SNI, ALPN, Certificate Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nTLS handshake 실패를 certificate chain, SNI routing, ALPN negotiation, proxy termination 관점으로 분해하는 네트워크 보안 판단 지도다.\n",
+  "aliases": [
+    "TLS SNI ALPN certificate",
+    "TLS handshake failure diagnosis",
+    "gRPC ALPN 실패",
+    "certificate chain SNI",
+    "TLS Handshake, SNI, ALPN, Certificate Perspective Map",
+    "tls handshake sni alpn certificate perspective map"
+  ],
+  "expected_queries": [
+    "TLS 에러가 나면 SNI랑 ALPN을 어떻게 같이 확인해?",
+    "gRPC ALPN 실패랑 인증서 문제를 어떻게 구분해?",
+    "TLS handshake 실패가 certificate 문제인지 SNI/ALPN 문제인지 어떻게 분리해?"
+  ],
+  "symptoms": [
+    "TLS 오류를 모두 인증서 만료로 본다",
+    "SNI와 Host header를 같은 것으로 본다",
+    "브라우저가 되면 gRPC도 된다고 생각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/tls-handshake-certificate-interview-drill",
+      "network/sni-routing-mismatch-hostname-failure",
+      "network/alpn-negotiation-failure-routing-mismatch"
+    ],
+    "next_docs": [
+      "network/tls-certificate-chain-ocsp-stapling-failure-modes"
+    ],
+    "confusable_with": [
+      "security/tls-https-handshake-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch3"
+      }
+    ]
+  }
+}

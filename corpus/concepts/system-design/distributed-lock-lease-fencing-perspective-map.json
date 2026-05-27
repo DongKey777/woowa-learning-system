@@ -1,0 +1,52 @@
+{
+  "id": "system-design/distributed-lock-lease-fencing-perspective-map",
+  "title": "Distributed Lock, Lease, Fencing Perspective Map",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "분산 lock, lease expiry, fencing token, split brain, stale owner 문제를 연결해 coordination correctness를 판단하는 system design perspective map이다.",
+  "body_markdown": "# Distributed Lock, Lease, Fencing Perspective Map\n\n## 이 문서가 맡는 질문\n분산 lock을 잡았다는 사실만으로 write safety가 보장되지 않는다. lease가 만료된 old owner가 늦게 write할 수 있으므로 downstream resource가 fencing token을 검증해야 한다.\n\n## 빠른 분기\n중복 실행만 줄이면 lock, old owner write를 막아야 하면 fencing, 장시간 작업이면 lease renewal과 expiry race를 본다. DB row lock으로 충분한지도 먼저 확인한다.\n\n## 실전 시나리오\n작업자 A가 lock을 잡고 멈췄다가 lease 만료 후 다시 깨어나 write한다. 그 사이 작업자 B가 새 lock을 잡고 처리했다면 A의 늦은 write가 최신 상태를 덮을 수 있다. fencing token이 없으면 lock 서비스는 이미 늦다.\n\n## CS 배경\nLease는 time-bound ownership이다. 네트워크 partition과 GC pause에서는 owner가 자신이 아직 owner라고 착각할 수 있다. Fencing token은 monotonically increasing epoch를 resource write에 붙여 stale owner를 resource 계층에서 거부한다.\n\n## fencing token SQL 예시\n```sql\nUPDATE account\nSET balance = ?, fencing_token = ?\nWHERE id = ? AND fencing_token < ?;\n```\n새 owner가 더 큰 token을 갖고 write하면 old token write는 조건에 맞지 않아 실패한다. lock 획득 성공보다 resource write 조건이 마지막 방어선이다.\n\n## 깊게 볼 포인트\nRedlock 같은 알고리즘 논쟁보다 중요한 것은 실패 모델이다. clock drift, GC pause, network partition, storage write ordering을 가정하지 않으면 lock 선택을 평가할 수 없다.\n\n## 다음 행동\n1. 보호하려는 resource가 fencing token을 검증할 수 있는지 본다\n2. lease TTL과 renewal heartbeat를 작업 시간보다 짧은지 긴지 계산한다\n3. old owner resume 시나리오를 테스트한다\n4. DB transaction으로 충분한 문제인지 분산 lock이 필요한지 재검토한다\n\n## 확인 질문\n이 lock은 동시에 두 worker가 실행되는 것을 줄이는가, 아니면 stale owner의 write까지 막는가?\n\n## 추가 예시: TTL과 affected rows\n```sql\nUPDATE account\nSET balance = :new_balance, fencing_token = :new_token\nWHERE id = :account_id AND fencing_token < :new_token;\n```\nwrite 후 affected rows가 0이면 old owner이거나 더 최신 owner가 이미 쓴 것이다. TTL은 작업 p99가 2초라면 예를 들어 lease 10초, renewal 3초, 실패 감지 2회처럼 GC pause와 network jitter를 포함해 sizing하고, 긴 작업은 heartbeat 누락 시 중단 가능해야 한다.\n\n## 판단 매트릭스\n- Lock: 동시 진입 가능성을 낮추지만 partition에서는 완전한 write safety가 아니다\n- Lease: 만료와 renewal race를 가진 time-bound ownership이다\n- Fencing: downstream resource가 epoch를 비교해 stale write를 거부한다\n- 리뷰 질문: lock service 성공과 실제 resource write 성공 사이의 gap을 어떻게 막는가\n\n## 측정 지표와 레이턴시\nlock acquire latency, lease renewal failure, fencing reject count, duplicate execution count, stale write incident, job p95를 본다. 품질은 stale write 0건, 성능은 acquire throughput, 레이턴시는 lock wait와 renewal overhead로 본다.\n\n## 자주 하는 오해\n- 분산 lock을 잡으면 stale write가 자동으로 막힌다고 본다\n- TTL을 길게 하면 안전해진다고 생각한다\n- clock 기반 lease의 실패 모델을 무시한다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 lock, lease, fencing token을 분리하고 split brain/stale owner 시나리오를 설명해야 한다. 마지막에는 fencing reject, lock wait, job p95로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. old owner pause 후 resume 테스트를 만든다\n2. monotonic fencing token 발급과 저장소 검증을 구현한다\n3. lease renewal 실패와 network partition을 주입한다\n4. lock wait와 stale reject 지표를 모은다\n5. DB row lock이나 queue partitioning으로 대체 가능한지 비교한다\n\n이 루프를 지키면 Distributed Lock, Lease, Fencing Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\n분산 lock, lease expiry, fencing token, split brain, stale owner 문제를 연결해 coordination correctness를 판단하는 system design perspective map이다.\n",
+  "aliases": [
+    "distributed lock lease fencing token",
+    "분산락 lease fencing",
+    "stale owner split brain",
+    "fencing token stale write",
+    "Distributed Lock, Lease, Fencing Perspective Map",
+    "distributed lock lease fencing perspective map"
+  ],
+  "expected_queries": [
+    "분산락에서 fencing token은 왜 필요해?",
+    "lease 만료된 old owner write는 어떻게 막아?",
+    "분산락을 쓸 때 lease 만료와 fencing token을 어떻게 같이 설계해야 해?"
+  ],
+  "symptoms": [
+    "분산 lock을 잡으면 stale write가 자동으로 막힌다고 본다",
+    "TTL을 길게 하면 안전해진다고 생각한다",
+    "clock 기반 lease의 실패 모델을 무시한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/db-lease-fencing-coordination",
+      "database/application-level-fencing-token-propagation",
+      "system-design/lease-fencing-token-split-brain-deep-dive"
+    ],
+    "next_docs": [
+      "database/stale-lease-renewal-failure-fencing"
+    ],
+    "confusable_with": [
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch3"
+      }
+    ]
+  }
+}

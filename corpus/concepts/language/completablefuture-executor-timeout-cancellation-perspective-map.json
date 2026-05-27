@@ -1,0 +1,52 @@
+{
+  "id": "language/completablefuture-executor-timeout-cancellation-perspective-map",
+  "title": "CompletableFuture Executor, Timeout, Cancellation Perspective Map",
+  "category": "language",
+  "level": "advanced",
+  "summary": "CompletableFuture의 executor 선택, common pool 함정, timeout, cancellation, exception propagation을 연결하는 Java async perspective map이다.",
+  "body_markdown": "# CompletableFuture Executor, Timeout, Cancellation Perspective Map\n\n## 이 문서가 맡는 질문\nCompletableFuture는 비동기처럼 보이지만 어떤 executor에서 실행되는지, timeout이 실제 작업을 멈추는지, cancellation이 downstream으로 전파되는지 확인해야 한다.\n\n## 빠른 분기\nCPU 작업은 bounded CPU pool, blocking I/O는 별도 pool, timeout은 caller 결과 제한과 실제 작업 중단을 구분한다. allOf/join은 예외 수집 방식도 함께 본다.\n\n## 실전 시나리오\n외부 API 20개를 `supplyAsync`로 fan-out 했는데 commonPool worker가 blocking I/O에 묶여 전체 서비스가 느려진다. timeout을 붙여도 이미 시작된 HTTP call이 계속 돈다면 pool은 계속 고갈된다.\n\n## CS 배경\nCompletableFuture는 completion stage graph를 구성한다. async suffix가 없는 stage는 completion thread에서 실행될 수 있고, 기본 async는 common ForkJoinPool을 쓴다. Cancellation은 Future 상태를 바꾸지만 interrupt와 I/O abort가 자동 보장되지는 않는다.\n\n## executor 분리 예시\n```java\nExecutorService ioPool = Executors.newFixedThreadPool(32);\nCompletableFuture<Response> f = CompletableFuture\n    .supplyAsync(() -> client.call(request), ioPool)\n    .orTimeout(800, TimeUnit.MILLISECONDS)\n    .exceptionally(ex -> fallback(ex));\n```\n이 코드는 caller timeout을 만들지만 `client.call`이 실제로 abort되는지는 HTTP client timeout/cancellation 지원에 달려 있다. executor queue와 downstream timeout을 같이 설정해야 한다.\n\n## 깊게 볼 포인트\nCompletableFuture chain은 예외가 한 stage에서 삼켜질 수 있다. `handle`, `exceptionally`, `whenComplete`의 의미가 다르고, `allOf`는 어떤 작업이 실패했는지 별도 수집하지 않으면 원인 분석이 어렵다.\n\n## 다음 행동\n1. 각 stage가 어느 executor에서 도는지 표시한다\n2. blocking 작업을 commonPool에서 분리한다\n3. timeout과 실제 I/O cancellation 경계를 확인한다\n4. allOf 결과의 개별 성공/실패를 수집한다\n\n## 확인 질문\n이 timeout은 caller에게만 빨리 실패를 돌리는가, 아니면 실제 작업과 socket까지 중단시키는가?\n\n## 추가 구분: cancel, orTimeout, completeOnTimeout\n`CompletableFuture.cancel(true)`는 Future 상태를 cancellation으로 바꾸지만 이미 실행 중인 supplier를 안정적으로 interrupt한다고 기대하면 안 된다. `orTimeout`은 timeout 시 예외로 완료하고, `completeOnTimeout`은 fallback 값으로 완료한다. 둘 다 underlying HTTP call이나 blocking 작업을 자동으로 중단시키는 계약은 아니므로 client timeout과 resource cleanup이 따로 필요하다.\n\n## 판단 매트릭스\n- Executor: CPU와 blocking I/O를 같은 pool에 섞지 않는다\n- Timeout: result timeout과 resource cancellation을 구분한다\n- Exception: stage별 예외 전파와 aggregation을 명시한다\n- 리뷰 질문: async 작업이 실패하거나 늦어질 때 pool과 downstream resource가 회수되는가\n\n## 측정 지표와 레이턴시\nexecutor active/queue, task wait p95, timeout count, cancellation success rate, downstream in-flight, fan-out p99를 본다. 품질은 누락 없는 결과 수집, 성능은 pool utilization, 레이턴시는 전체 fan-out deadline으로 판단한다.\n\n## 자주 하는 오해\n- CompletableFuture를 쓰면 자동으로 non-blocking이라고 본다\n- orTimeout이 실제 HTTP 요청을 항상 끊는다고 생각한다\n- commonPool에 blocking I/O를 넣어도 괜찮다고 본다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 executor, timeout, cancellation, exception propagation을 분리해야 한다. 마지막에는 pool queue, timeout rate, downstream in-flight, p95/p99로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. stage별 thread name과 executor를 로그로 확인한다\n2. blocking I/O를 별도 bounded pool로 옮긴다\n3. HTTP client timeout과 CF timeout을 맞춘다\n4. allOf 실패 수집 로직을 테스트한다\n5. pool queue wait와 end-to-end p99를 비교한다\n\n이 루프를 지키면 CompletableFuture Executor, Timeout, Cancellation Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nCompletableFuture의 executor 선택, common pool 함정, timeout, cancellation, exception propagation을 연결하는 Java async perspective map이다.\n",
+  "aliases": [
+    "CompletableFuture executor timeout cancellation",
+    "commonPool blocking pitfall",
+    "CompletableFuture orTimeout cancellation",
+    "allOf exception handling",
+    "CompletableFuture Executor, Timeout, Cancellation Perspective Map",
+    "completablefuture executor timeout cancellation perspective map"
+  ],
+  "expected_queries": [
+    "CompletableFuture timeout이 실제 작업을 멈추는 거야?",
+    "commonPool에 blocking I/O를 넣으면 왜 위험해?",
+    "CompletableFuture에서 executor, timeout, cancellation을 같이 어떻게 설계해야 해?"
+  ],
+  "symptoms": [
+    "CompletableFuture를 쓰면 자동으로 non-blocking이라고 본다",
+    "orTimeout이 실제 HTTP 요청을 항상 끊는다고 생각한다",
+    "commonPool에 blocking I/O를 넣어도 괜찮다고 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/completablefuture-execution-model-common-pool-pitfalls",
+      "language/completablefuture-executor-timeout-interview-router",
+      "language/completablefuture-timeout-cancellation-playbook"
+    ],
+    "next_docs": [
+      "language/completablefuture-allof-join-timeout-exception-handling-hazards"
+    ],
+    "confusable_with": [
+      "spring/async-self-invocation-same-thread-symptom-card"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch3"
+      }
+    ]
+  }
+}

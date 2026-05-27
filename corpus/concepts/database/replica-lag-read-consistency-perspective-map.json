@@ -1,0 +1,52 @@
+{
+  "id": "database/replica-lag-read-consistency-perspective-map",
+  "title": "Replica Lag and Read Consistency Perspective Map",
+  "category": "database",
+  "level": "advanced",
+  "summary": "replica lag, read-your-writes, monotonic reads, session pinning, freshness SLO를 연결해 읽기 일관성을 판단하는 perspective map이다.",
+  "body_markdown": "# Replica Lag and Read Consistency Perspective Map\n\n## 이 문서가 맡는 질문\nread replica는 성능을 위해 쓰지만 사용자는 방금 쓴 값이 안 보이면 오류로 느낀다. lag를 허용할 UX인지, session consistency가 필요한지, primary pinning이 필요한지 구분해야 한다.\n\n## 빠른 분기\n방금 쓴 데이터가 안 보이면 read-your-writes, 이전 화면보다 과거로 돌아가면 monotonic reads, 전체 최신성이 중요하면 freshness SLO와 replica lag를 본다.\n\n## 실전 시나리오\n예약 생성 직후 상세 화면에서 404가 나는 경우 DB 쓰기는 성공했지만 읽기가 replica로 가고 lag가 남았을 수 있다. 이때 모든 읽기를 primary로 돌리면 안전하지만 read scaling 이점이 줄어든다.\n\n## CS 배경\nReplication은 write path와 read path를 분리한다. Asynchronous replica는 availability와 read throughput을 높이지만 staleness window를 만든다. Session guarantee는 global linearizability보다 약하지만 UX에는 충분한 경우가 많다.\n\n## session pinning 힌트 예시\n```http\nPOST /reservations -> 201 Created\nSet-Cookie: rw_until=2026-05-27T12:00:03Z; HttpOnly; SameSite=Lax\nGET /reservations/10\nX-Read-Preference: primary-if-within-rw-window\n```\n쓰기 직후 짧은 window 동안 같은 session을 primary에 pinning하면 read-your-writes를 만족시키면서 대부분의 일반 읽기는 replica로 보낼 수 있다.\n\n## 깊게 볼 포인트\n일관성은 하나가 아니다. read-your-writes, monotonic reads, causal reads는 사용자 경험에 가까운 보장이고, linearizability는 더 강하지만 비용이 크다. 화면별로 필요한 보장을 다르게 둬야 한다.\n\n## 다음 행동\n1. 쓰기 직후 읽기 경로가 primary인지 replica인지 추적한다\n2. 허용 가능한 staleness budget을 UX별로 정한다\n3. session pinning 또는 consistency token을 설계한다\n4. lag가 budget을 넘으면 fallback 정책을 둔다\n\n## 확인 질문\n이 읽기는 반드시 방금 쓴 값을 봐야 하는가, 아니면 몇 초 늦어도 되는 목록성 조회인가?\n\n## 추가 예시: consistency token\n```text\nPOST /reservations -> X-Last-Write-LSN: 16/B374D848\nGET /reservations/10 -> route to replica only if replay_lsn >= 16/B374D848\n```\nPostgreSQL LSN이나 MySQL GTID 같은 replication position을 session token으로 들고 있으면 replica가 해당 위치까지 따라잡았는지 확인한 뒤 읽을 수 있다. 단순 timestamp보다 정확하지만 DB/replication topology에 의존한다.\n\n## 판단 매트릭스\n- Read-your-writes: 같은 사용자의 쓰기 직후 읽기는 primary나 token으로 보장한다\n- Monotonic reads: 사용자가 같은 화면에서 과거 상태로 돌아가지 않게 한다\n- Freshness SLO: replica lag p95/p99와 stale read 비율을 예산화한다\n- 리뷰 질문: stale 허용 화면과 불허 화면이 코드 경로로 분리되어 있는가\n\n## 측정 지표와 레이턴시\nreplica lag p50/p95/p99, stale read rate, primary fallback rate, read throughput, primary CPU, post-write read latency를 본다. 품질은 사용자 관찰 불일치 감소로 보고, 성능은 replica offload율, 레이턴시는 primary pinning window의 p95 증가로 본다.\n\n## 자주 하는 오해\n- replica 읽기는 항상 안전하다고 본다\n- lag 평균만 보고 tail staleness를 놓친다\n- 모든 읽기를 primary로 바꿔 scaling 문제를 만든다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 먼저 필요한 consistency guarantee를 이름 붙이고, 그 다음 replica lag와 routing 정책을 연결해야 한다. 마지막에는 품질, 성능, 레이턴시를 stale read rate, primary fallback, post-write p95로 검증한다고 말한다.\n\n## 실전 검증 루프\n1. 쓰기 event와 다음 읽기 request에 correlation id를 붙인다\n2. replica lag와 stale read를 재현하는 테스트를 만든다\n3. session pinning 또는 consistency token을 적용한다\n4. primary fallback rate와 read latency를 비교한다\n5. lag budget 초과 시 degrade 정책을 문서화한다\n\n이 루프를 지키면 Replica Lag and Read Consistency Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nreplica lag, read-your-writes, monotonic reads, session pinning, freshness SLO를 연결해 읽기 일관성을 판단하는 perspective map이다.\n",
+  "aliases": [
+    "replica lag read consistency",
+    "read your writes replica",
+    "session pinning consistency",
+    "replica staleness SLO",
+    "Replica Lag and Read Consistency Perspective Map",
+    "replica lag read consistency perspective map"
+  ],
+  "expected_queries": [
+    "replica lag 때문에 방금 쓴 예약이 안 보이면 어떻게 설계해?",
+    "read-your-writes랑 monotonic reads 차이를 어떻게 봐?",
+    "예약 생성 직후 조회가 replica lag 때문에 안 보일 때 read consistency를 어떻게 잡아야 해?"
+  ],
+  "symptoms": [
+    "replica 읽기는 항상 안전하다고 본다",
+    "lag 평균만 보고 tail staleness를 놓친다",
+    "모든 읽기를 primary로 바꿔 scaling 문제를 만든다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/replica-lag-read-consistency-interview-drill",
+      "database/monotonic-reads-session-guarantees",
+      "database/replica-lag-read-after-write-strategies"
+    ],
+    "next_docs": [
+      "database/replica-lag-observability-routing-slo"
+    ],
+    "confusable_with": [
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-27",
+    "last_modified": "2026-05-27",
+    "revision_history": [
+      {
+        "date": "2026-05-27",
+        "source": "y14-batch3"
+      }
+    ]
+  }
+}
