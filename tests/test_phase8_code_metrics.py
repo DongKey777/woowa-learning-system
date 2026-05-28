@@ -52,7 +52,8 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # rebuild, etc. Y14-B4 adds schema-object learner query fallback and
     # stale-dense-index lexical promotion. Response capture token optimization
     # adds path/summary capture metadata plus content-addressed body sidecars.
-    assert breakdown["core"] <= 6600, f"core {breakdown['core']} > 6600 (Phase T-X/Y13/Y14 budget)"
+    # UX-first hook capture adds pending/repair state helpers.
+    assert breakdown["core"] <= 7000, f"core {breakdown['core']} > 7000 (Phase T-X/Y13/Y14 budget)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"
@@ -91,7 +92,9 @@ def test_entry_point_count() -> None:
                    "set-profile", "show-profile", "reviewer-profile",
                    "rag-remote-build",
                    # Phase Y6 onboarding chain fix (anchors-build wrapper)
-                   "anchors-build"}
+                   "anchors-build",
+                   # UX-first response capture hooks/repair
+                   "capture-response", "capture-repair", "learning-data-clean"}
     expected = learner_facing | maintenance
     extras = set(entries) - expected
     missing = expected - set(entries)

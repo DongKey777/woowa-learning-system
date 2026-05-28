@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -40,6 +41,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from core.response import parse_response  # noqa: E402
 from core.response_quality import record_response_quality  # noqa: E402
 from core.identity import resolve_learner_login  # noqa: E402
+from core.response_capture import append_repair_queue, load_source_event  # noqa: E402
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
 
 SHORT_BODY_MIN_CHARS = 500
@@ -133,21 +135,7 @@ def _lookup_source_event(state_root: Path, learner_id: str,
 
     Returns the parsed event dict or None.
     """
-    history = state_root / "learner" / "history.jsonl"
-    if not history.exists():
-        return None
-    target = source_event_id.strip()
-    for line in history.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or '"' + target + '"' not in line:
-            continue
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if d.get("event_id") == target:
-            return d
-    return None
+    return load_source_event(source_event_id, state_root=state_root)
 
 
 def _extract_citations_from_event(ev: dict) -> tuple[list[str], str | None]:
@@ -185,6 +173,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="auto-fill summary + extract citations from "
                              "source rag_ask event. Only --source-event-id "
                              "required from caller.")
+    parser.add_argument("--allow-orphan", action="store_true",
+                        help="test/repair only: allow source_event_id without "
+                             "a matching rag_ask event")
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--silent", action="store_true")
     args = parser.parse_args(argv)
@@ -197,19 +188,37 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    ev = _lookup_source_event(args.state_root, learner_id, args.source_event_id)
+    if ev is None and not args.allow_orphan:
+        mode = os.environ.get("WOOWA_SESSION_MODE", "learning")
+        if mode == "learning":
+            append_repair_queue(
+                "orphan_source_event",
+                state_root=args.state_root,
+                source_event_id=args.source_event_id,
+                client="learn-response-quality",
+                details={"body_source": sources[0] if sources else None},
+            )
+            print(
+                "ERROR: source_event_id does not match a learning rag_ask event "
+                "(use --allow-orphan only for tests/repair)",
+                file=sys.stderr,
+            )
+            return 2
+    if ev is not None:
+        cids, ev_repo = _extract_citations_from_event(ev)
+        top3 = cids[:3]
+        if not args.expected_citation:
+            args.expected_citation = list(top3)
+        if args.repo is None:
+            args.repo = ev_repo
+
     if args.minimal:
-        ev = _lookup_source_event(args.state_root, learner_id, args.source_event_id)
         if ev is not None:
-            cids, ev_repo = _extract_citations_from_event(ev)
             # Use top 3 concept_ids as both expected and declared (AI declared
             # what the prompt was routed to).
-            top3 = cids[:3]
-            if not args.expected_citation:
-                args.expected_citation = list(top3)
             if not args.declared_citation:
                 args.declared_citation = list(top3)
-            if args.repo is None:
-                args.repo = ev_repo
         if args.response_summary is None:
             args.response_summary = "auto-recorded (minimal mode)"
         # body intentionally skipped — missing_response_body flag will fire

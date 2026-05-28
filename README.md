@@ -13,7 +13,7 @@
        ↓
    AI 세션 (Claude / Codex / Gemini) → 학습자에게 답변
        ↓
-   learning telemetry: history + full answer body capture + Bloom 자동 진행
+   hook-first telemetry: history + full answer body capture + Bloom 자동 진행
 ```
 
 ## 5분 시작 (학습자)
@@ -32,7 +32,7 @@
    - `bin/rag-daemon start-bg` 백그라운드
 5. 학습자는 한국어로 질문만 던지면 됨. *"Bean DI가 뭐야"*, *"내 ReservationController 어떻게 리팩토링"*, *"다른 크루는 어떻게 작성했어"*, *"확인 질문 줘"* 등.
 
-AI 세션은 답변 직후 학습 데이터를 자동 저장한다. 답변 본문 전체 저장이 기본이며, 가능한 클라이언트에서는 `--response-path <answer.md>`로 본문을 로컬 파일 경로만 전달해 세션 토큰 재소모를 줄인다. path capture가 불가능하면 `--response-file -`로 본문 전체를 저장한다. 저장된 본문 파일은 redacted content hash 기준으로 dedupe된다.
+AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex/Gemini hook 환경에서는 `bin/capture-response`가 최종 답변 전체를 pending `rag_ask`에 자동 연결한다. 수집 실패는 학습 흐름을 막지 않고 repair queue에 남기며, 필요하면 *"학습 기록 저장은 나중에 자동 보정할게."* 정도로만 짧게 안내한다. hook이 없는 환경은 `--response-path <answer.md>` 또는 `--response-file -` fallback을 사용한다. 저장된 본문 파일은 redacted content hash 기준으로 dedupe된다.
 
 > **🚫 학습자 기기에서 인덱스 빌드 금지** — `bin/corpus-build`는 15-30분 + 4-6GB peak RAM이라 학습 흐름 차단. 새 인덱스 버전은 maintainer가 RunPod에서 빌드 후 GitHub Releases에 publish, 학습자는 `bin/index-fetch --tag <new>` 로만 업데이트.
 
@@ -50,7 +50,7 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. 답변 본�
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
 | Y14 corpus closure qrels | **14/14 top1=1.000, p95≤3.6ms ✅** |
-| Unit tests | **508 passed** |
+| Unit tests | **514 passed** |
 | Runtime LOC budget | **9496 / 9500 ✅** |
 | Index release artifact | **18.7MB, SHA256 검증 ✅** |
 

@@ -205,6 +205,7 @@ def test_learn_response_quality_cli_derives_summary_and_citations(tmp_path: Path
             "--source-event-id", "ask-cli",
             "--response-file", "-",
             "--expected-citation", "database/lock-basics",
+            "--allow-orphan",
             "--state-root", str(state),
             "--silent",
         ],
@@ -238,6 +239,7 @@ def test_learn_response_quality_cli_flags_summary_like_body(tmp_path: Path) -> N
             "--source-event-id", "ask-short",
             "--response-file", "-",
             "--expected-citation", "database/lock-basics",
+            "--allow-orphan",
             "--state-root", str(state),
             "--silent",
         ],
@@ -270,6 +272,7 @@ def test_learn_response_quality_cli_full_body_has_no_summary_flag(tmp_path: Path
             "--source-event-id", "ask-full",
             "--response-file", "-",
             "--expected-citation", "database/lock-basics",
+            "--allow-orphan",
             "--state-root", str(state),
             "--silent",
         ],
@@ -303,6 +306,7 @@ def test_learn_response_quality_cli_response_path_is_token_efficient(tmp_path: P
             "--source-event-id", "ask-path",
             "--response-path", str(answer),
             "--expected-citation", "database/lock-basics",
+            "--allow-orphan",
             "--state-root", str(state),
             "--silent",
         ],
@@ -322,6 +326,78 @@ def test_learn_response_quality_cli_response_path_is_token_efficient(tmp_path: P
     assert row["response_body_deduped"] is False
 
 
+def test_learn_response_quality_cli_enriches_from_source_event(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    history = state / "learner" / "history.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text(json.dumps({
+        "event_id": "ask-real",
+        "event_type": "rag_ask",
+        "mode": "learning",
+        "learner_id": "DongKey777",
+        "repo": "spring-roomescape-waiting",
+        "payload": {
+            "prompt": "격리 수준 설명",
+            "repo": "spring-roomescape-waiting",
+            "router_mode": "cs_qa",
+            "top_concept_ids": ["database/transaction-isolation-locking"],
+        },
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+    body = (
+        "[Mode: cs_qa]\n\n"
+        "격리 수준은 다른 트랜잭션 변경이 어디까지 보이는지 정하는 약속이야.\n\n"
+        "참고:\n"
+        "- database/transaction-isolation-locking\n"
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-real",
+            "--response-file", "-",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["repo"] == "spring-roomescape-waiting"
+    assert row["citation_paths_expected"] == ["database/transaction-isolation-locking"]
+    assert row["quality_flags"] == []
+
+
+def test_learn_response_quality_cli_rejects_orphan_source_event(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    body = "[Mode: cs_qa]\n\n답변 본문"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-orphan",
+            "--response-file", "-",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 2
+    assert "source_event_id" in proc.stderr
+    queue = state / "learner" / "capture-repair-queue.jsonl"
+    assert queue.exists()
+    row = json.loads(queue.read_text(encoding="utf-8"))
+    assert row["reason"] == "orphan_source_event"
+
+
 def test_learn_response_quality_cli_summary_only_marks_body_not_captured(
     tmp_path: Path,
 ) -> None:
@@ -334,6 +410,7 @@ def test_learn_response_quality_cli_summary_only_marks_body_not_captured(
             "--response-summary", "낙관락/비관락 차이를 짧게 설명함",
             "--summary-only",
             "--expected-citation", "database/lock-basics",
+            "--allow-orphan",
             "--state-root", str(state),
             "--silent",
         ],

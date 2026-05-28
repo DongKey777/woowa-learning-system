@@ -92,9 +92,12 @@ python3 bin/ask "테스트"
 4. 답변 끝 `참고:` 블록 (최대 3 concept_id)
 
 ### 4.2.1 답변 본문 수집 규칙
-- `# response_quality_hint.command_template`가 있으면 답변 직후 반드시 실행.
-- 매 turn 본문 저장이 원칙이다. **학습자에게 실제로 보여준 최종 답변 전체**를 저장한다.
-- 토큰 효율 최우선 경로는 `full_body_path_template`의 `--response-path <answer.md>`다. 호스트/클라이언트가 최종 답변을 transcript에 다시 붙여넣지 않고 로컬 파일로 materialize할 수 있을 때 사용한다.
+- UX가 우선이다. 답변 본문 수집 실패가 학습 답변을 막으면 안 된다.
+- Claude/Codex/Gemini hook이 가능한 환경은 `bin/capture-response`가 최종 답변을 자동 수집한다.
+- `bin/ask`는 learning turn마다 pending capture를 만들고, hook은 가장 최근 pending에 최종 답변을 연결한다.
+- hook 수집 실패 시 `state/learner/capture-repair-queue.jsonl`에 남기고, 학습자에게는 짧게만 안내한다: *"학습 기록 저장은 나중에 자동 보정할게."*
+- `# response_quality_hint.command_template` 수동 실행은 hook이 없는 환경의 fallback이다.
+- 수동 full-body fallback은 `full_body_path_template`의 `--response-path <answer.md>`를 우선 사용한다.
 - `--response-file -` stdin은 universal fallback이다. path capture가 불가능하면 세션 토큰 비용이 있더라도 본문 보존을 위해 사용한다.
 - 요약본, 축약본, paraphrase, 일부 excerpt를 full body처럼 넣지 않는다.
 - summary-only는 full-body capture가 정말 불가능한 예외 상황에서만 사용한다.
@@ -126,7 +129,7 @@ python3 bin/ask "테스트"
 | *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
 | 학습자 미션 Java 파일 Write/Edit | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` |
 | `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
-| 매 coach turn 답변 직후 | 기본 `bin/learn-response-quality --source-event-id <id> --response-file - --silent`; zero-copy 파일 capture 가능 시 `--response-path <answer.md>`로 최종 답변 전체 저장 |
+| 매 coach turn 답변 직후 | hook 가능 시 `bin/capture-response`; hook 불가 시 `bin/learn-response-quality --source-event-id <id> --response-path <answer.md>` 또는 `--response-file -` |
 | 미션 repo onboarded 후 첫 진입 | `bin/assess-learner-state --repo <r> --path missions/<r> --silent` |
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
@@ -149,7 +152,7 @@ woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 508 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 514 passed 유지)
 
 ### 5.2 측정 명령
 ```bash

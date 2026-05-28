@@ -155,17 +155,19 @@ def _build_response_quality_hint(
         "body_capture_preferred": True,
         "capture_policy": "full_body_required_path_preferred",
         "body_contract": (
-            "Every learner-facing answer should be captured as full body. "
-            "Prefer --response-path when the host can materialize the exact "
-            "final answer without echoing it into the AI session transcript. "
-            "If path capture is unavailable, use --response-file - even though "
-            "it costs transcript tokens. Use summary-only only when full-body "
-            "capture is impossible."
+            "Every learner-facing answer should be captured as full body, "
+            "but learning UX comes first. Hook capture is preferred. If hooks "
+            "are unavailable, prefer --response-path when the host can "
+            "materialize the exact final answer without echoing it into the "
+            "AI session transcript. If path capture is unavailable, use "
+            "--response-file -. Use summary-only only when full-body capture "
+            "is impossible."
         ),
         "declared_citations": "auto-extracted from response body 참고 block when omitted",
         "obligation": (
-            "AI MUST record full response telemetry after answer; path capture "
-            "is preferred for token efficiency, stdin is the universal fallback."
+            "AI SHOULD record full response telemetry after answer. Capture "
+            "failure must not block the learner-facing answer; enqueue repair "
+            "or give only a short learner notice."
         ),
     }
 

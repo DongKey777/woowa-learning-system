@@ -44,8 +44,9 @@ Bean DI는 Spring 컨테이너가 객체를 관리하고 협력 객체를 외부
 ```
 
 **자동 후속**:
-- daemon이 `history.jsonl`에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…], latency_ms=N). 다음 turn의 personalization에 반영.
-- AI 세션이 답변 직후 `bin/learn-response-quality`를 호출해 최종 답변 본문 전체를 저장. 가능하면 `--response-path <answer.md>`로 transcript 중복 없이 저장하고, 불가능하면 `--response-file -`로 본문 전체를 fallback 저장.
+- daemon이 `history.jsonl`에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…], latency_ms=N) + pending capture 생성. 다음 turn의 personalization에 반영.
+- Claude/Codex/Gemini hook이 답변 직후 `bin/capture-response`를 호출해 최종 답변 본문 전체를 저장. hook이 없으면 `bin/learn-response-quality --response-path` / `--response-file -` fallback을 사용한다.
+- 수집 실패는 답변을 막지 않고 repair queue에 남긴다. 필요 시 한 줄만 안내: *"학습 기록 저장은 나중에 자동 보정할게."*
 - full body는 `state/learner/response-bodies/sha256/`에 redacted content hash 기준으로 dedupe 저장되고, `response-quality.jsonl` row가 `source_event_id`로 `rag_ask`와 join된다.
 
 ---
@@ -300,7 +301,7 @@ python3 bin/ask "내 PR 흐름 보여줘" --repo spring-roomescape-member
 
 AI 세션이 자동으로:
 1. `bin/ask` (매 turn)
-2. `bin/learn-response-quality` (매 답변 직후 full body capture; path 우선, stdin fallback)
+2. `bin/capture-response` (hook-first full body capture; hook 불가 시 `bin/learn-response-quality` fallback)
 3. `bin/learn-event` (학습자 코드 수정 / drill 답변 / pending 응답 시)
 4. `bin/mission-patterns-build` / `bin/cross-crew-build` (학습자가 mission repo 분석 의도 표현 시 1회)
 5. `bin/rag-daemon start` (첫 진입 시)

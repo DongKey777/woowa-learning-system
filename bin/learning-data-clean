@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""bin/learning-data-clean — remove known learning telemetry contamination."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.identity import resolve_learner_login  # noqa: E402
+from core.response_capture import is_internal_capture_meta_prompt, pending_capture_dir  # noqa: E402
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            rows.append(data)
+    return rows
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    path.write_text(text, encoding="utf-8")
+
+
+def _source_id(row: dict) -> str | None:
+    sid = row.get("source_event_id")
+    if sid:
+        return str(sid)
+    payload = row.get("payload") or {}
+    sid = payload.get("source_event_id")
+    return str(sid) if sid else None
+
+
+def _is_partial_source_id(source_event_id: str | None) -> bool:
+    return bool(source_event_id and "-PARTIAL" in source_event_id)
+
+
+def _reset_profiles(state_root: Path, learner_id: str) -> None:
+    from core.feedback import replay_history
+    from core.profile import rebuild_unified_projection, recompute_profile
+
+    db = state_root / "learner" / "mastery_graph.sqlite"
+    db.unlink(missing_ok=True)
+    replay_history(state_root=state_root)
+    profile = recompute_profile(learner_id, state_root=state_root)
+    rebuild_unified_projection(learner_id, state_root=state_root, profile=profile)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--hard-delete-contamination", action="store_true",
+                        help="delete dummy source-id asks, orphan quality rows, "
+                             "partial source ids, and unreferenced body files")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--learner-id", default=None)
+    args = parser.parse_args(argv)
+
+    if not args.hard_delete_contamination:
+        print("ERROR: choose --hard-delete-contamination", file=sys.stderr)
+        return 2
+
+    learner_id = resolve_learner_login(args.state_root, explicit=args.learner_id)
+    history_path = args.state_root / "learner" / "history.jsonl"
+    quality_path = args.state_root / "learner" / "response-quality.jsonl"
+    history = _read_jsonl(history_path)
+    quality = _read_jsonl(quality_path)
+
+    contaminated_rag_ids: set[str] = set()
+    for row in history:
+        if row.get("event_type") != "rag_ask":
+            continue
+        payload = row.get("payload") or {}
+        if is_internal_capture_meta_prompt(payload.get("prompt")):
+            contaminated_rag_ids.add(str(row.get("event_id")))
+
+    remaining_rag_ids = {
+        str(row.get("event_id"))
+        for row in history
+        if row.get("event_type") == "rag_ask"
+        and row.get("event_id")
+        and str(row.get("event_id")) not in contaminated_rag_ids
+    }
+
+    contaminated_quality_sources: set[str] = set()
+    for row in quality:
+        sid = _source_id(row)
+        if (
+            sid in contaminated_rag_ids
+            or _is_partial_source_id(sid)
+            or (sid is not None and sid not in remaining_rag_ids)
+        ):
+            contaminated_quality_sources.add(sid)
+
+    new_history = []
+    removed_history_n = 0
+    for row in history:
+        eid = str(row.get("event_id"))
+        sid = _source_id(row)
+        remove = (
+            eid in contaminated_rag_ids
+            or sid in contaminated_quality_sources
+            or _is_partial_source_id(sid)
+        )
+        if remove:
+            removed_history_n += 1
+        else:
+            new_history.append(row)
+
+    new_quality = []
+    removed_quality_n = 0
+    for row in quality:
+        sid = _source_id(row)
+        if sid in contaminated_quality_sources or _is_partial_source_id(sid):
+            removed_quality_n += 1
+        else:
+            new_quality.append(row)
+
+    referenced_bodies = {
+        row.get("response_body_path")
+        for row in new_quality
+        if row.get("response_body_path")
+    }
+    body_root = args.state_root / "learner" / "response-bodies"
+    unreferenced_bodies = []
+    if body_root.exists():
+        for path in body_root.rglob("*.md"):
+            rel = str(path.relative_to(args.state_root))
+            if rel not in referenced_bodies:
+                unreferenced_bodies.append(path)
+
+    pending_removed_n = 0
+    pending_root = pending_capture_dir(args.state_root)
+    pending_to_remove: list[Path] = []
+    if pending_root.exists():
+        for path in pending_root.glob("*.json"):
+            source_event_id = path.stem
+            if source_event_id not in remaining_rag_ids:
+                pending_to_remove.append(path)
+    pending_removed_n = len(pending_to_remove)
+
+    if args.apply:
+        _write_jsonl(history_path, new_history)
+        _write_jsonl(quality_path, new_quality)
+        for path in unreferenced_bodies:
+            path.unlink(missing_ok=True)
+        for path in pending_to_remove:
+            path.unlink(missing_ok=True)
+        _reset_profiles(args.state_root, learner_id)
+
+    print(json.dumps({
+        "apply": args.apply,
+        "history_removed_n": removed_history_n,
+        "response_quality_removed_n": removed_quality_n,
+        "pending_removed_n": pending_removed_n,
+        "unreferenced_body_files_removed_n": len(unreferenced_bodies),
+        "contaminated_rag_ids": sorted(contaminated_rag_ids),
+        "contaminated_quality_sources": sorted(
+            sid for sid in contaminated_quality_sources if sid
+        ),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

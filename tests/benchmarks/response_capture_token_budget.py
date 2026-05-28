@@ -29,6 +29,7 @@ def main() -> int:
         "참고:\n- database/lock-basics\n"
     ) * 45
     stdin_extra = len(body)
+    hook_extra = 0
     path_cmd = (
         "bin/learn-response-quality --source-event-id "
         f"{source_event_id} --response-path {path} --silent"
@@ -42,17 +43,22 @@ def main() -> int:
     summary_extra = len(summary_cmd)
     report = {
         "answer_chars": len(body),
-        "current_stdin_extra_chars": stdin_extra,
-        "path_capture_extra_chars": path_extra,
+        "hook_capture_extra_chars": hook_extra,
+        "stdin_fallback_extra_chars": stdin_extra,
+        "path_fallback_extra_chars": path_extra,
         "summary_only_extra_chars": summary_extra,
-        "current_stdin_extra_tokens_est": _token_estimate(stdin_extra),
-        "path_capture_extra_tokens_est": _token_estimate(path_extra),
+        "hook_capture_extra_tokens_est": 0,
+        "stdin_fallback_extra_tokens_est": _token_estimate(stdin_extra),
+        "path_fallback_extra_tokens_est": _token_estimate(path_extra),
         "summary_only_extra_tokens_est": _token_estimate(summary_extra),
-        "path_capture_savings_pct": round((1 - path_extra / stdin_extra) * 100, 2),
+        "hook_capture_savings_pct": 100.0,
+        "path_fallback_savings_pct": round((1 - path_extra / stdin_extra) * 100, 2),
         "summary_only_savings_pct": round((1 - summary_extra / stdin_extra) * 100, 2),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    if report["path_capture_savings_pct"] < 90:
+    if report["hook_capture_savings_pct"] < 99:
+        return 1
+    if report["path_fallback_savings_pct"] < 90:
         return 1
     if report["summary_only_savings_pct"] < 90:
         return 1

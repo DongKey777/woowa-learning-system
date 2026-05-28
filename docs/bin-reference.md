@@ -248,7 +248,7 @@ bin/phase9-gate
 
 ---
 
-## Phase T-X 52 신규 wrappers (2026-05-25/26)
+## Phase T-X + capture wrappers (2026-05-25/26)
 
 ### Phase T — Learner automation (7)
 
@@ -258,6 +258,9 @@ bin/phase9-gate
 | `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference | p95 1.19ms (168× faster) |
 | `bin/learn-test --path build/test-results/test/` | JUnit XML → test_result events, stable event_id (idempotent) | p50 3.6ms (333× faster) |
 | `bin/learn-response-quality --source-event-id E --response-file -` / `--response-path answer.md` | full-response telemetry; path mode avoids transcript duplication, stdin is universal fallback, redacted full body + excerpt ≤5000 chars + summary/declared citation auto-extract | p95 0.16ms, drift 100%, PII 100% |
+| `bin/capture-response --client claude\|codex\|gemini --hook-json -` | hook-first full body capture; joins latest pending `rag_ask`, non-blocking repair queue on failure | hook path |
+| `bin/capture-repair --last N [--apply]` | replay repairable failed captures from `capture-repair-queue.jsonl` | local |
+| `bin/learning-data-clean --hard-delete-contamination [--apply]` | remove dummy source-id asks, orphan quality rows, partial ids, unreferenced body sidecars | local |
 | `bin/assess-learner-state --repo R --path missions/<r>` | git + SQLite snapshot: head/working_copy/PRs/threads classified | p50 113ms (528× faster) |
 | `bin/profile-recompute` | history → v3 profile.json (mastered/uncertain/calibration/recommendations) | 10K events ≤75ms |
 | `bin/session-start --repo R --prompt P --path missions/<r>` | orchestrator: assess → recompute → daemon ask | cold 332ms, warm 4.2ms |
@@ -293,7 +296,7 @@ bin/phase9-gate
 | Wrapper | Purpose |
 |---|---|
 | `bin/feedback-mine` | `state/learner/feedback.jsonl` helpful/not_helpful distribution |
-| `bin/response-quality-mine` | response-quality.jsonl flag + citation + capture method/dedupe analysis |
+| `bin/response-quality-mine` | response-quality.jsonl flag + citation + capture method/dedupe + repair queue analysis |
 | `bin/routing-analyze` | rag_ask router_mode + reason histogram |
 | `bin/learning-turn-audit --last N [--require-full-body]` | Per-event integrity + response-quality/full-body join |
 | `bin/learning-path-graph-audit` | concept_graph broken edges / cycles / level inversions |

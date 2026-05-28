@@ -497,6 +497,11 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         artifacts["cognitive_trigger"] = cognitive_trigger
                     elif cognitive_trigger.get("trigger_type") == "follow_up":
                         artifacts["cognitive_trigger"] = cognitive_trigger
+                    from core.response_capture import (
+                        create_pending_capture,
+                        is_internal_capture_meta_prompt,
+                    )
+                    internal_meta_prompt = is_internal_capture_meta_prompt(prompt)
                     # Phase Y11 F8: event_id is generated BEFORE compose so the
                     # response_quality_hint.command_template can embed it and
                     # the AI session's follow-up wrapper call joins on the
@@ -518,7 +523,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     markdown, response_hints, response_quality_hint, effective_route = compose(
                         decision, artifacts, prompt,
                         repo=repo, learner_id=learner_id, recent_history=recent,
-                        source_event_id=event_id,
+                        source_event_id=None if internal_meta_prompt else event_id,
                         state_root=state_root,
                         learner_context=derived_context,
                     )
@@ -544,8 +549,14 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         },
                     }
                     try:
-                        append_history_event(event, state_root=state_root)
-                        if event_mode == "learning":
+                        if not internal_meta_prompt:
+                            append_history_event(event, state_root=state_root)
+                            create_pending_capture(
+                                event,
+                                state_root=state_root,
+                                expected_citation_paths=list(response_hints["citation_paths"]),
+                            )
+                        if event_mode == "learning" and not internal_meta_prompt:
                             record_turn(event, state_root=state_root)
                     except Exception:  # noqa: BLE001
                         pass  # telemetry/evidence must not break the response
@@ -555,7 +566,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         "budget": effective_route.budget_tokens,
                         "personas": effective_route.personas,
                         "reason": effective_route.reason,
-                        "event_id": event_id,
+                        "event_id": None if internal_meta_prompt else event_id,
                         "latency_ms": latency_ms,
                         "response_hints": response_hints,
                         "response_quality_hint": response_quality_hint,
