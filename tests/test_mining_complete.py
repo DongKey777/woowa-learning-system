@@ -107,6 +107,9 @@ def test_response_quality_mine_since_filters_recent_rows(tmp_path: Path) -> None
             "logged_at": now - 120,
             "quality_flags": ["missing_response_body"],
             "contract_flags": ["possible_summary_body"],
+            "response_body_path": "learner/response-bodies/sha256/ab/abc.md",
+            "response_body_deduped": True,
+            "response_body_stored_bytes": 123,
             "citation_paths_expected": ["recent/expected"],
             "citation_paths_declared": ["recent/declared"],
             "learner_id": "DongKey777",
@@ -141,8 +144,64 @@ def test_response_quality_mine_since_filters_recent_rows(tmp_path: Path) -> None
     assert out["rows_skipped_fixture_or_demo_n"] == 1
     assert out["missing_body_n"] == 1
     assert out["possible_summary_body_n"] == 1
+    assert out["full_body_paths_n"] == 1
+    assert out["body_deduped_n"] == 1
+    assert out["response_body_stored_bytes_total"] == 123
     assert out["citation_drift_n"] == 1
     assert out["flag_counts"] == {"missing_citation": 1, "missing_response_body": 1}
     assert out["contract_flag_counts"] == {"possible_summary_body": 1}
     assert out["top_expected_citations"] == [{"path": "recent/expected", "n": 2}]
     assert out["top_declared_citations"] == [{"path": "recent/declared", "n": 1}]
+
+
+def test_learning_turn_audit_require_full_body(tmp_path: Path) -> None:
+    now = time.time()
+    state_root = tmp_path / "state"
+    body = state_root / "learner" / "response-bodies" / "sha256" / "aa" / "aa.md"
+    body.parent.mkdir(parents=True, exist_ok=True)
+    body.write_text("[Mode: cs_qa]\n\nanswer", encoding="utf-8")
+    _write_jsonl(state_root / "learner" / "history.jsonl", [
+        {
+            "event_id": "ask-ok",
+            "event_type": "rag_ask",
+            "mode": "learning",
+            "ts": now,
+            "payload": {"prompt": "락 설명", "router_mode": "cs_qa"},
+        },
+        {
+            "event_id": "ask-missing",
+            "event_type": "rag_ask",
+            "mode": "learning",
+            "ts": now,
+            "payload": {"prompt": "DI 설명", "router_mode": "cs_qa"},
+        },
+    ])
+    _write_jsonl(state_root / "learner" / "response-quality.jsonl", [
+        {
+            "source_event_id": "ask-ok",
+            "mode": "learning",
+            "response_body_path": "learner/response-bodies/sha256/aa/aa.md",
+            "response_length_chars": 20,
+        },
+    ])
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "bin/learning-turn-audit",
+            "--state-root", str(state_root),
+            "--last", "2",
+            "--require-full-body",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    out = json.loads(result.stdout)
+    assert result.returncode == 1
+    assert out["full_body_joined"] == 1
+    assert out["missing_full_body_n"] == 1
+    assert out["issues_sample"] == [
+        {"event_id": "ask-missing", "issues": ["missing_response_quality"]}
+    ]

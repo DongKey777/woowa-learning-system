@@ -293,9 +293,9 @@ bin/phase9-gate
 | Wrapper | Purpose |
 |---|---|
 | `bin/feedback-mine` | `state/learner/feedback.jsonl` helpful/not_helpful distribution |
-| `bin/response-quality-mine` | response-quality.jsonl flag + citation analysis |
+| `bin/response-quality-mine` | response-quality.jsonl flag + citation + capture method/dedupe analysis |
 | `bin/routing-analyze` | rag_ask router_mode + reason histogram |
-| `bin/learning-turn-audit --last N` | Per-event integrity + response-quality join |
+| `bin/learning-turn-audit --last N [--require-full-body]` | Per-event integrity + response-quality/full-body join |
 | `bin/learning-path-graph-audit` | concept_graph broken edges / cycles / level inversions |
 | `bin/reclassify-history --last N` | Re-route history through current router (dry-run drift) |
 | `bin/cohort-eval --cohort-file C.json` | N-query cohort latency + mode accuracy |

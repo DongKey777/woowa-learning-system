@@ -8,7 +8,7 @@ AI session auto-calls after every coach turn. Records:
 - declared citations (from actual final answer's 참고: block)
 - quality/contract flags (missing_body, citation_mismatch, possible_summary_body, …)
 PII redaction: emails / Bearer tokens / API keys / phone numbers replaced
-with placeholder before excerpt is stored.
+with placeholder before excerpt/full-body sidecar storage.
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ SCHEMA_ID = "assistant-response-quality-v1"
 EXCERPT_MAX_CHARS = 5000
 QUALITY_LOG = "response-quality.jsonl"
 BODY_DIR = "response-bodies"
+BODY_STORAGE_SCHEME = "sha256-redacted-v1"
 
 # PII patterns
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -51,9 +52,20 @@ def redact_pii(text: str) -> str:
     return out
 
 
-def _safe_event_id(value: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "response").strip("-")
-    return safe[:96] or "response"
+def _store_body_sidecar(state_root: Path, redacted_body: str) -> tuple[str, str, int, bool]:
+    body_hash = hashlib.sha256(redacted_body.encode("utf-8")).hexdigest()
+    body_path = (state_root / "learner" / BODY_DIR / "sha256"
+                 / body_hash[:2] / f"{body_hash}.md")
+    body_path.parent.mkdir(parents=True, exist_ok=True)
+    body_bytes = len(redacted_body.encode("utf-8"))
+    try:
+        with body_path.open("x", encoding="utf-8") as f:
+            f.write(redacted_body)
+        deduped = False
+    except FileExistsError:
+        deduped = True
+        body_bytes = 0
+    return str(body_path.relative_to(state_root)), body_hash, body_bytes, deduped
 
 
 def detect_citation_drift(
@@ -121,13 +133,16 @@ def record_response_quality(
     response_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] if body else ""
     response_body_path = None
     response_body_bytes = len(body.encode("utf-8")) if body else 0
+    response_body_hash = ""
+    response_body_stored_bytes = 0
+    response_body_deduped = False
     if body:
-        body_dir = state_root / "learner" / BODY_DIR
-        body_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{_safe_event_id(source_event_id)}-{response_hash}.md"
-        body_path = body_dir / filename
-        body_path.write_text(redacted_body, encoding="utf-8")
-        response_body_path = str(body_path.relative_to(state_root))
+        (
+            response_body_path,
+            response_body_hash,
+            response_body_stored_bytes,
+            response_body_deduped,
+        ) = _store_body_sidecar(state_root, redacted_body)
 
     row = {
         "schema_id": SCHEMA_ID,
@@ -142,6 +157,10 @@ def record_response_quality(
         "response_length_chars": len(body),
         "response_body_bytes": response_body_bytes,
         "response_body_path": response_body_path,
+        "response_body_storage": BODY_STORAGE_SCHEME if body else None,
+        "response_body_hash": response_body_hash,
+        "response_body_stored_bytes": response_body_stored_bytes,
+        "response_body_deduped": response_body_deduped,
         "response_excerpt_truncated": len(redacted_body) > EXCERPT_MAX_CHARS,
         "response_hash": response_hash,
         "capture_method": capture_method or ("unknown_body" if body else "none"),

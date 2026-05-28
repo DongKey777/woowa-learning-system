@@ -100,6 +100,7 @@ python3 bin/ask "테스트"
 - summary-only는 full-body capture가 정말 불가능한 예외 상황에서만 사용한다.
 - summary-only에서는 본문 인용을 검증할 수 없으므로 `declared_citation_unverified`가 남는다.
 - 정상 full-body 수집 시 `response-quality.jsonl.response_excerpt`에는 redacted prefix(최대 5000자), `response_body_path`에는 redacted full body 파일 경로가 저장된다.
+- full body 파일은 redacted content hash 기반으로 dedupe 저장된다. 같은 본문을 여러 turn에서 수집해도 파일은 한 번만 쓴다.
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:

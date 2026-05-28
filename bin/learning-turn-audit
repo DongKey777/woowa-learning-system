@@ -5,6 +5,7 @@ For each rag_ask event in the last N turns, check:
 - payload has prompt + router_mode
 - ts is non-zero
 - if response_quality.jsonl has matching source_event_id (telemetry joined)
+- optionally require response-quality/full-body capture for each sampled turn
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ from scripts.mining.jsonl_iter import is_backfilled, iter_jsonl  # noqa: E402
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--last", type=int, default=100)
+    parser.add_argument("--require-response-quality", action="store_true")
+    parser.add_argument("--require-full-body", action="store_true")
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     args = parser.parse_args(argv)
 
@@ -55,11 +58,26 @@ def main(argv: list[str] | None = None) -> int:
             evt_issues.append("missing_router_mode")
         if not ev.get("ts"):
             evt_issues.append("missing_ts")
-        # response-quality join optional (only some turns have it)
+        row = quality_index.get(eid)
+        if (args.require_response_quality or args.require_full_body) and row is None:
+            evt_issues.append("missing_response_quality")
+        if args.require_full_body:
+            if row is None:
+                pass
+            elif not row.get("response_body_path") or row.get("response_length_chars", 0) <= 0:
+                evt_issues.append("missing_full_response_body")
+            elif not (args.state_root / row["response_body_path"]).exists():
+                evt_issues.append("missing_response_body_file")
         if evt_issues:
             issues.append({"event_id": eid, "issues": evt_issues})
 
     joined_n = sum(1 for ev in sample if ev.get("event_id") in quality_index)
+    full_body_joined_n = sum(
+        1 for ev in sample
+        if (row := quality_index.get(ev.get("event_id")))
+        and row.get("response_body_path")
+        and int(row.get("response_length_chars") or 0) > 0
+    )
 
     print(json.dumps({
         "history_path": str(history),
@@ -69,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
         "issues_sample": issues[:10],
         "response_quality_joined": joined_n,
         "join_rate_pct": round(joined_n / max(1, len(sample)) * 100, 1),
+        "full_body_joined": full_body_joined_n,
+        "full_body_join_rate_pct": round(full_body_joined_n / max(1, len(sample)) * 100, 1),
+        "missing_response_quality_n": len(sample) - joined_n,
+        "missing_full_body_n": len(sample) - full_body_joined_n,
         "rows_backfilled_n": sum(1 for ev in sample if is_backfilled(ev)),
         "quality_rows_total": len(quality_rows),
     }, ensure_ascii=False, indent=2))

@@ -51,8 +51,8 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # index_metadata, cognitive trigger FSM, auto reformulation, unified profile
     # rebuild, etc. Y14-B4 adds schema-object learner query fallback and
     # stale-dense-index lexical promotion. Response capture token optimization
-    # adds path/summary capture metadata plus redacted body sidecar persistence.
-    assert breakdown["core"] <= 6575, f"core {breakdown['core']} > 6575 (Phase T-X/Y13/Y14 budget)"
+    # adds path/summary capture metadata plus content-addressed body sidecars.
+    assert breakdown["core"] <= 6600, f"core {breakdown['core']} > 6600 (Phase T-X/Y13/Y14 budget)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"

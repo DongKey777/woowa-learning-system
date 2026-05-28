@@ -162,6 +162,34 @@ def test_record_response_quality_keeps_five_thousand_char_excerpt(tmp_path: Path
     assert row["response_hash"]
 
 
+def test_record_response_quality_dedupes_identical_full_bodies(tmp_path: Path) -> None:
+    state = tmp_path
+    body = "[Mode: cs_qa]\n\n같은 답변 본문\n\n참고:\n- database/lock-basics\n"
+
+    first = record_response_quality(
+        source_event_id="ask-1",
+        response_summary="same",
+        response_body=body,
+        state_root=state,
+    )
+    second = record_response_quality(
+        source_event_id="ask-2",
+        response_summary="same again",
+        response_body=body,
+        state_root=state,
+    )
+
+    assert first["response_body_path"] == second["response_body_path"]
+    assert first["response_body_storage"] == "sha256-redacted-v1"
+    assert first["response_body_deduped"] is False
+    assert second["response_body_deduped"] is True
+    assert first["response_body_stored_bytes"] > 0
+    assert second["response_body_stored_bytes"] == 0
+    body_files = list((state / "learner" / "response-bodies").rglob("*.md"))
+    assert len(body_files) == 1
+    assert body_files[0].read_text(encoding="utf-8") == body
+
+
 def test_learn_response_quality_cli_derives_summary_and_citations(tmp_path: Path) -> None:
     state = tmp_path
     body = (
@@ -290,6 +318,8 @@ def test_learn_response_quality_cli_response_path_is_token_efficient(tmp_path: P
     assert row["response_length_chars"] == len(body)
     assert row["response_body_path"]
     assert (state / row["response_body_path"]).read_text(encoding="utf-8") == body
+    assert row["response_body_storage"] == "sha256-redacted-v1"
+    assert row["response_body_deduped"] is False
 
 
 def test_learn_response_quality_cli_summary_only_marks_body_not_captured(

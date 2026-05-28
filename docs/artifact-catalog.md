@@ -91,7 +91,7 @@ state/
 │   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)
 │   ├── feedback.jsonl             # explicit helpful/not_helpful/unclear learner feedback
 │   ├── response-quality.jsonl     # response telemetry: capture_method + redacted excerpt ≤5000 chars + body path/hash/flags
-│   ├── response-bodies/           # optional redacted full final-answer bodies captured by path/stdin/text mode
+│   ├── response-bodies/           # content-addressed redacted full final-answer bodies (sha256/redacted)
 │   ├── mastery_graph.sqlite       # Bloom autoloop state (mastery table + evidence table)
 │   ├── drill_pending.json         # 1 open drill offer (or absent)
 │   ├── drill_due.json             # spaced repetition due list
@@ -141,6 +141,7 @@ CREATE TABLE evidence (
 - `capture_method="summary_only"`는 full-body capture가 정말 불가능한 예외 상황이며, `contract_flags`에 `body_not_captured`, `token_efficient_summary_only`가 남는다.
 - summary-only에서는 본문 `참고:` 블록을 파싱할 수 없으므로 expected citation을 declared citation으로 복사하되 `declared_citation_unverified`를 남겨 false `missing_citation` drift를 피한다.
 - full body가 들어온 경우 `response_excerpt`는 redacted prefix(최대 5000자), `response_body_path`는 redacted full body 파일 경로다.
+- `response_body_path`는 redacted body hash 기반 content-addressed path라서 같은 본문은 한 번만 저장되고, row별 `response_body_deduped`로 중복 여부를 볼 수 있다.
 - 요약본, 축약본, paraphrase를 full body처럼 넣으면 `contract_flags`에 `possible_summary_body`가 붙을 수 있다.
 
 ### `profile.json` shape
