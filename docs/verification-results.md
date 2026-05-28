@@ -6,7 +6,7 @@
 
 ## 1. 한 줄 요약
 
-Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **504 passed**다.
+Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **508 passed**다.
 
 ## 1.1 Latest Y14 Snapshot
 
@@ -15,7 +15,7 @@ Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prer
 | Corpus concepts / graph | **3339 concepts / 6172 prereq edges / broken 0** | `corpus/concept_graph.json`, `bin/learning-path-graph-audit` |
 | Y14 qrels prompt/reformulated | **14/14 sets top1=1.000, top5=1.000, forbidden=0, max p95=3.6ms** | `reports/y14_batch1_7_qrels_eval.json` |
 | rag_quality top1 / NDCG@5 / p95 | **1.000 / 1.000 / 1.6ms** | `reports/rag_quality_regression.json` |
-| pytest | **504 passed** | local `python3 -m pytest tests/ -q` |
+| pytest | **508 passed** | local `python3 -m pytest tests/ -q` |
 | corpus rebuild readiness | **ready=true, rebuild_needed=false, 0 wrong exact owners** | `reports/corpus_rebuild_readiness.json` |
 | index archive | **v1.0.2, 18.7MB, sidecars=true, SHA256 d8da5782...** | `state/index.tar.zst`, `bin/index-pack --verify-only` |
 | remote build | **H100 secure, encode 9.2s, Lance 13.40MB** | `bin/rag-remote-build --commit-sha fd42dba7dd0a2beb4bfd0b1bc9133bf5547d18ca` |
@@ -158,7 +158,7 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 cd /Users/idonghun/IdeaProjects/woowa-learning-system
 export WOOWA_SESSION_MODE=development
 
-# 1. Unit tests (latest 504 passed)
+# 1. Unit tests (latest 508 passed)
 python3 -m pytest tests/ -q
 
 # 2. All 14 phase benches (J/K/L/M/N/P + T-X) via master runner

@@ -20,6 +20,13 @@
 
 이후 학습자는 한국어 질문만 던지면 됨.
 
+AI 세션은 매 답변 직후 학습 telemetry도 자동 저장한다. 신규 학습자가 따로 실행할 명령은 없다.
+- `rag_ask` 이벤트는 `history.jsonl`과 `mastery_graph.sqlite`에 누적된다.
+- 답변 본문 전체는 `bin/learn-response-quality`로 수집된다.
+- 최우선 경로는 `--response-path <answer.md>`다. 클라이언트가 최종 답변을 로컬 파일로 materialize할 수 있으면 긴 본문을 transcript에 다시 붙이지 않고 경로만 넘긴다.
+- path capture가 불가능하면 `--response-file -`로 본문 전체를 넘긴다. 이 경우 세션 토큰 비용은 있지만 본문 저장을 우선한다.
+- 저장된 full body는 `state/learner/response-bodies/sha256/`에 redacted content hash 기준으로 dedupe된다.
+
 ---
 
 ## AI 세션 시각의 자동 단계
@@ -143,6 +150,27 @@ python3 bin/ask "테스트 query"
 정상 응답이 돌아오면 onboarding 완료. 학습자에게 한국어 1줄 보고:
 
 > "세팅 끝났어. 뭘 학습하고 싶어?"
+
+### Step 7 — 학습 데이터 수집 contract 확인
+
+AI 세션이 `bin/ask` 결과의 `# response_quality_hint`를 보면 답변 직후 자동으로 response-quality 수집을 실행한다.
+
+우선순위:
+```bash
+# 가능하면: transcript 중복 없이 full body 저장
+bin/learn-response-quality --source-event-id <id> --response-path <answer.md> --silent
+
+# path capture가 불가능하면: full body 보존 fallback
+bin/learn-response-quality --source-event-id <id> --response-file - --silent
+```
+
+검증:
+```bash
+bin/learning-turn-audit --last 20 --require-full-body
+bin/response-quality-mine --since 7d
+```
+
+`summary-only`는 full body capture가 정말 불가능한 예외 상황에서만 사용한다.
 
 ---
 

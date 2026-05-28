@@ -43,7 +43,10 @@ Bean DI는 Spring 컨테이너가 객체를 관리하고 협력 객체를 외부
 - software-engineering/dependency-injection-basics
 ```
 
-**자동 후속**: daemon이 history.jsonl에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…], latency_ms=N). 다음 turn의 personalization에 반영.
+**자동 후속**:
+- daemon이 `history.jsonl`에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…], latency_ms=N). 다음 turn의 personalization에 반영.
+- AI 세션이 답변 직후 `bin/learn-response-quality`를 호출해 최종 답변 본문 전체를 저장. 가능하면 `--response-path <answer.md>`로 transcript 중복 없이 저장하고, 불가능하면 `--response-file -`로 본문 전체를 fallback 저장.
+- full body는 `state/learner/response-bodies/sha256/`에 redacted content hash 기준으로 dedupe 저장되고, `response-quality.jsonl` row가 `source_event_id`로 `rag_ask`와 join된다.
 
 ---
 
@@ -297,9 +300,10 @@ python3 bin/ask "내 PR 흐름 보여줘" --repo spring-roomescape-member
 
 AI 세션이 자동으로:
 1. `bin/ask` (매 turn)
-2. `bin/learn-event` (학습자 코드 수정 / drill 답변 / pending 응답 시)
-3. `bin/mission-patterns-build` / `bin/cross-crew-build` (학습자가 mission repo 분석 의도 표현 시 1회)
-4. `bin/rag-daemon start` (첫 진입 시)
-5. (Mode B) 측정 명령들 (학습자가 "회귀 측정", "코퍼스 확장" 같은 시스템 의도 표현 시)
+2. `bin/learn-response-quality` (매 답변 직후 full body capture; path 우선, stdin fallback)
+3. `bin/learn-event` (학습자 코드 수정 / drill 답변 / pending 응답 시)
+4. `bin/mission-patterns-build` / `bin/cross-crew-build` (학습자가 mission repo 분석 의도 표현 시 1회)
+5. `bin/rag-daemon start` (첫 진입 시)
+6. (Mode B) 측정 명령들 (학습자가 "회귀 측정", "코퍼스 확장" 같은 시스템 의도 표현 시)
 
 학습자는 한국어 의도만 표현, AI 세션이 모든 명령 + 결과 해석을 자동 수행.
