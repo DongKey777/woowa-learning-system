@@ -26,22 +26,22 @@
 
 ## 최적화 정책
 
-1. 기본값은 token-safe telemetry다.
-   - `--summary-only --contract-flag body_not_captured --contract-flag token_efficient_summary_only`
-   - 항상 `source_event_id`, expected citations, summary, 품질 flag는 남긴다.
+1. 기본 원칙은 매 turn full body capture다.
+   - 학습 품질을 위해 최종 답변 전체를 저장한다.
+   - 저장된 full body는 PII redaction 후 `state/learner/response-bodies/`에 남긴다.
+   - `response-quality.jsonl`에는 summary, hash, length, excerpt, capture metadata를 남긴다.
 
 2. full body는 zero-copy 경로에서 우선 수집한다.
    - host/client가 최종 답변을 로컬 파일에 자동 materialize할 수 있으면 `--response-path <answer.md>`를 사용한다.
    - 이 경우 transcript에는 짧은 path command만 남고, redacted full body는 `state/learner/response-bodies/`에 저장된다.
 
-3. stdin/heredoc은 호환 fallback이다.
-   - 짧은 답변 또는 body가 이미 tool stdin으로 전달될 수밖에 없는 host에서만 사용한다.
-   - 긴 답변을 telemetry만을 위해 heredoc으로 다시 붙여넣지 않는다.
+3. stdin/heredoc은 universal fallback이다.
+   - zero-copy path capture가 없는 일반 AI 세션에서는 `--response-file -`로 최종 답변 전체를 넘겨 full body 저장을 보장한다.
+   - 이 경로는 transcript token을 더 쓰지만, 본문 저장 누락보다 우선순위가 높다.
 
-4. full body가 들어온 경우 데이터는 더 풍부하게 남긴다.
-   - `response-quality.jsonl`: summary, flags, hash, length, capture_method, excerpt prefix.
-   - `response-bodies/*.md`: PII redacted full final answer.
-   - `response_excerpt_truncated=true`로 JSONL prefix 잘림 여부를 명시한다.
+4. summary-only는 예외다.
+   - full-body capture가 정말 불가능할 때만 사용한다.
+   - `body_not_captured`, `token_efficient_summary_only`, `declared_citation_unverified`를 남겨 데이터 품질 한계를 명시한다.
 
 ## 기대 효과
 
@@ -51,12 +51,13 @@
 - path capture: transcript 추가분은 대략 150자 안팎의 command/path다.
 - summary-only: transcript 추가분은 짧은 command와 1줄 summary 수준이다.
 
-즉 full body를 계속 보존할 수 있는 host에서는 학습 데이터 풍부함을 유지하면서 transcript 추가 비용을 90% 이상 줄일 수 있다. zero-copy host가 없는 일반 구독제 AI 세션에서는 summary-only를 기본으로 하여 장시간 학습의 context 수명을 보호한다.
+즉 full body를 계속 보존할 수 있는 host에서는 학습 데이터 풍부함을 유지하면서 transcript 추가 비용을 90% 이상 줄일 수 있다. zero-copy host가 없는 일반 구독제 AI 세션에서는 full body 저장을 위해 stdin fallback을 사용하므로 추가 토큰 비용이 남는다. 이 비용은 의도적인 trade-off다.
 
 ## 검증 기준
 
 - `learn-response-quality --response-path`가 body를 읽고 redacted full body 파일을 저장한다.
-- `summary-only`는 body 미수집을 명시적 contract flag로 남긴다.
+- `--response-file -`는 full body 저장의 universal fallback으로 유지된다.
+- `summary-only`는 body 미수집을 명시적 contract flag로 남기며 예외 경로로만 쓰인다.
 - `response-quality-mine`이 capture method, full body path 수, transcript 입력 대비 응답 길이 비율을 집계한다.
-- `response_quality_hint`는 stdin 강제를 중단하고 path/summary/stdin fallback을 모두 제공한다.
+- `response_quality_hint`는 full body required, path preferred, stdin fallback, summary-only exceptional을 모두 표현한다.
 - benchmark에서 path/summary mode의 transcript 추가량이 stdin 대비 90% 이상 감소한다.

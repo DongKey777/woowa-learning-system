@@ -257,7 +257,7 @@ bin/phase9-gate
 | `bin/learn-pr-retro --repo R [--include-bot]` | PR retrospective: recurring mentor signals + unresolved threads + timeline | p50 1.2ms |
 | `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference | p95 1.19ms (168× faster) |
 | `bin/learn-test --path build/test-results/test/` | JUnit XML → test_result events, stable event_id (idempotent) | p50 3.6ms (333× faster) |
-| `bin/learn-response-quality --source-event-id E --summary-only` / `--response-path answer.md` | token-efficient response telemetry; summary-only default avoids transcript duplication, path mode stores redacted full body + excerpt ≤5000 chars + summary/declared citation auto-extract | p95 0.16ms, drift 100%, PII 100% |
+| `bin/learn-response-quality --source-event-id E --response-file -` / `--response-path answer.md` | full-response telemetry; path mode avoids transcript duplication, stdin is universal fallback, redacted full body + excerpt ≤5000 chars + summary/declared citation auto-extract | p95 0.16ms, drift 100%, PII 100% |
 | `bin/assess-learner-state --repo R --path missions/<r>` | git + SQLite snapshot: head/working_copy/PRs/threads classified | p50 113ms (528× faster) |
 | `bin/profile-recompute` | history → v3 profile.json (mastered/uncertain/calibration/recommendations) | 10K events ≤75ms |
 | `bin/session-start --repo R --prompt P --path missions/<r>` | orchestrator: assess → recompute → daemon ask | cold 332ms, warm 4.2ms |

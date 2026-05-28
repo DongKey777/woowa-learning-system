@@ -144,27 +144,28 @@ def _build_response_quality_hint(
         f"--contract-flag token_efficient_summary_only --silent{state_root_arg}"
     )
     return {
-        "command_template": summary_cmd,
-        "wrapper_cmd": summary_cmd,
+        "command_template": stdin_cmd,
+        "wrapper_cmd": stdin_cmd,
         "full_body_path_template": path_cmd,
         "stdin_fallback_cmd": stdin_cmd,
         "summary_only_cmd": summary_cmd,
         "source_event_id": source_event_id,
         "expected_citation_paths": list(expected_citation_paths),
-        "body_required": False,
+        "body_required": True,
         "body_capture_preferred": True,
-        "capture_policy": "token_efficient_full_body_when_zero_copy",
+        "capture_policy": "full_body_required_path_preferred",
         "body_contract": (
+            "Every learner-facing answer should be captured as full body. "
             "Prefer --response-path when the host can materialize the exact "
-            "final learner-facing answer without echoing it into the AI "
-            "session transcript. Use --response-file - only when stdin capture "
-            "does not duplicate the full body in transcript. If neither is "
-            "available, use summary-only with body_not_captured."
+            "final answer without echoing it into the AI session transcript. "
+            "If path capture is unavailable, use --response-file - even though "
+            "it costs transcript tokens. Use summary-only only when full-body "
+            "capture is impossible."
         ),
         "declared_citations": "auto-extracted from response body 참고 block when omitted",
         "obligation": (
-            "AI MUST record response telemetry after answer, but must not paste "
-            "a long final answer into a shell heredoc solely for telemetry."
+            "AI MUST record full response telemetry after answer; path capture "
+            "is preferred for token efficiency, stdin is the universal fallback."
         ),
     }
 
