@@ -232,7 +232,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 ### 5.1 모든 작업
 - `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령.
 - 변경은 commit 기반 reproducible. 측정 결과 `reports/` 폴더에 저장.
-- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 498 passed 유지.
+- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 499 passed 유지.
 
 ### 5.2 측정 명령
 ```bash

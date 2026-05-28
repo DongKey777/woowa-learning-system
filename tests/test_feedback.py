@@ -66,6 +66,16 @@ def test_citations_extracted_from_rag_ask(tmp_path: Path) -> None:
     assert sorted(list_by_level("attempted", state_root=tmp_path)) == ["spring/bean", "spring/component"]
 
 
+def test_top_concept_ids_extracted_from_daemon_rag_ask(tmp_path: Path) -> None:
+    """daemon rag_ask payload.top_concept_ids feeds Bloom evidence."""
+    record_turn(
+        {"event_type": "rag_ask",
+         "payload": {"top_concept_ids": ["database/lock", "spring/tx"]}},
+        state_root=tmp_path,
+    )
+    assert sorted(list_by_level("attempted", state_root=tmp_path)) == ["database/lock", "spring/tx"]
+
+
 def test_replay_history_from_jsonl(tmp_path: Path) -> None:
     append_history_event(
         {"event_id": "e1", "event_type": "code_attempt", "mode": "learning",

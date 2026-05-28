@@ -80,6 +80,8 @@ def test_rag_ask_event_records_learner_identity_and_repo() -> None:
     assert '"repo": repo' in src
     assert '"top_concept_ids": list(response_hints["citation_paths"])' in src
     assert '"latency_ms": latency_ms' in src
+    assert "from core.feedback import record_turn" in src
+    assert "record_turn(event, state_root=state_root)" in src
 
 
 def test_render_ask_stdout_matches_cli_text_shape() -> None:

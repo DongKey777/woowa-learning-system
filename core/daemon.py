@@ -303,6 +303,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
 
         rag_search = search_future.result()
         from core.coach import compose
+        from core.feedback import record_turn
         from core.identity import resolve_learner_login
         from core.lexical_fusion import make_lexical_fusion_fn
         from core.lazy_loader import (
@@ -544,8 +545,10 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     }
                     try:
                         append_history_event(event, state_root=state_root)
+                        if event_mode == "learning":
+                            record_turn(event, state_root=state_root)
                     except Exception:  # noqa: BLE001
-                        pass  # history append must not break the response
+                        pass  # telemetry/evidence must not break the response
                     payload = {
                         "markdown": markdown,
                         "mode": effective_route.mode,

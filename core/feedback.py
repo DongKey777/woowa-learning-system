@@ -1,11 +1,4 @@
-"""Per-turn evidence write → auto mastery promotion (D-C, fixes mastered=0).
-
-Mapping: learner event → mastery evidence source.
-
-Called automatically at the end of every learner turn (via bin/learn-event or
-inline from bin/ask). Also offers `replay_history` to backfill the broken
-`mastered=0` profile from the existing 9992 history.jsonl events.
-"""
+"""Per-turn learner event evidence → Bloom mastery promotion."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -98,10 +91,9 @@ def replay_history(state_root: Path = DEFAULT_STATE_ROOT, mode_filter: str = "le
 def _extract_concepts(payload: dict) -> list[str]:
     """Pull concept_ids from various event payload shapes."""
     candidates: list = []
-    candidates.extend(payload.get("cited_concepts") or [])
-    candidates.extend(payload.get("citations") or [])
-    candidates.extend(payload.get("used_concepts") or [])
-    candidates.extend(payload.get("concept_ids") or [])
+    for key in ("cited_concepts", "citations", "top_concept_ids",
+                "citation_paths", "used_concepts", "concept_ids"):
+        candidates.extend(payload.get(key) or [])
     if payload.get("concept_id"):
         candidates.append(payload["concept_id"])
     # normalize: strip concept: prefix, drop empties
