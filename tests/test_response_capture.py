@@ -104,10 +104,29 @@ def test_hook_capture_failure_queues_repair_without_blocking(tmp_path: Path) -> 
 
     assert result["ok"] is False
     assert result["reason"] == "body_missing"
+    assert result["ignored"] is True
     queue = state / "learner" / "capture-repair-queue.jsonl"
     assert queue.exists()
     row = json.loads(queue.read_text(encoding="utf-8"))
     assert row["reason"] == "body_missing"
+    assert row["status"] == "ignored_non_learning"
+
+
+def test_progress_hook_message_without_pending_is_ignored(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "sync-prs 백그라운드 실행 중."},
+        client="claude",
+        state_root=state,
+    )
+
+    assert result["ok"] is True
+    assert result["ignored"] is True
+    queue = state / "learner" / "capture-repair-queue.jsonl"
+    row = json.loads(queue.read_text(encoding="utf-8"))
+    assert row["status"] == "ignored_non_learning"
+    assert row["reason"] == "non_learning_hook_message"
+    assert not (state / "learner" / "capture-repair-bodies").exists()
 
 
 def test_learning_data_clean_hard_deletes_orphans(tmp_path: Path) -> None:

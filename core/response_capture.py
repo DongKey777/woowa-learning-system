@@ -225,6 +225,7 @@ def append_repair_queue(
     reason: str,
     *,
     state_root: Path = DEFAULT_STATE_ROOT,
+    status: str = "pending_repair",
     source_event_id: str | None = None,
     client: str | None = None,
     details: dict[str, Any] | None = None,
@@ -233,7 +234,7 @@ def append_repair_queue(
     row: dict[str, Any] = {
         "schema_id": "response-capture-repair-v1",
         "queued_at": time.time(),
-        "status": "pending_repair",
+        "status": status,
         "reason": reason,
         "source_event_id": source_event_id,
         "client": client,
@@ -316,6 +317,12 @@ def _text_from_value(value: Any) -> str | None:
     return None
 
 
+def looks_like_learning_answer_body(body: str | None) -> bool:
+    """Return True when a hook body looks like a learner-facing answer."""
+    text = (body or "").lstrip()
+    return text.startswith("[Mode:")
+
+
 def capture_from_hook_payload(
     payload: dict[str, Any],
     *,
@@ -334,9 +341,11 @@ def capture_from_hook_payload(
         source_event_id = pending.get("source_event_id")
 
     if not body:
+        status = "pending_repair" if pending or source_event_id else "ignored_non_learning"
         append_repair_queue(
             "body_missing",
             state_root=state_root,
+            status=status,
             source_event_id=source_event_id,
             client=client,
             details={"payload_keys": sorted(str(k) for k in payload.keys())},
@@ -348,9 +357,29 @@ def capture_from_hook_payload(
                 status="failed_pending_repair",
                 updates={"last_error": "body_missing"},
             )
-        return {"ok": False, "reason": "body_missing", "source_event_id": source_event_id}
+        return {
+            "ok": False,
+            "reason": "body_missing",
+            "source_event_id": source_event_id,
+            "ignored": status != "pending_repair",
+        }
 
     if not pending or not source_event_id:
+        if not looks_like_learning_answer_body(body):
+            append_repair_queue(
+                "non_learning_hook_message",
+                state_root=state_root,
+                status="ignored_non_learning",
+                source_event_id=source_event_id,
+                client=client,
+                details={"payload_keys": sorted(str(k) for k in payload.keys())},
+            )
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "non_learning_hook_message",
+                "source_event_id": source_event_id,
+            }
         append_repair_queue(
             "pending_missing",
             state_root=state_root,

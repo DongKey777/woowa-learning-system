@@ -21,6 +21,29 @@ from core.state import DEFAULT_STATE_ROOT  # noqa: E402
 from scripts.mining.jsonl_iter import is_backfilled, iter_jsonl  # noqa: E402
 
 
+EXCLUDED_PENDING_STATUSES = {
+    "superseded_by_later_capture",
+    "ignored_non_learning",
+    "abandoned_interrupted",
+}
+
+
+def _load_pending_index(state_root: Path) -> dict[str, dict]:
+    root = state_root / "learner" / "pending-captures"
+    if not root.exists():
+        return {}
+    out: dict[str, dict] = {}
+    for path in root.glob("*.json"):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        source_event_id = row.get("source_event_id")
+        if source_event_id:
+            out[str(source_event_id)] = row
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--last", type=int, default=100)
@@ -39,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     ))
     quality_index = {r.get("source_event_id"): r for r in quality_rows
                       if r.get("source_event_id")}
+    pending_index = _load_pending_index(args.state_root)
 
     all_rag = list(iter_jsonl(
         history,
@@ -48,9 +72,16 @@ def main(argv: list[str] | None = None) -> int:
     sample = all_rag[-args.last:]
 
     issues: list[dict] = []
+    excluded_status_counts: dict[str, int] = {}
     for ev in sample:
         eid = ev.get("event_id")
         payload = ev.get("payload") or {}
+        pending_status = (pending_index.get(str(eid)) or {}).get("status")
+        excluded = pending_status in EXCLUDED_PENDING_STATUSES
+        if excluded:
+            excluded_status_counts[pending_status] = (
+                excluded_status_counts.get(pending_status, 0) + 1
+            )
         evt_issues = []
         if not payload.get("prompt"):
             evt_issues.append("missing_prompt")
@@ -59,9 +90,13 @@ def main(argv: list[str] | None = None) -> int:
         if not ev.get("ts"):
             evt_issues.append("missing_ts")
         row = quality_index.get(eid)
-        if (args.require_response_quality or args.require_full_body) and row is None:
+        if (
+            not excluded
+            and (args.require_response_quality or args.require_full_body)
+            and row is None
+        ):
             evt_issues.append("missing_response_quality")
-        if args.require_full_body:
+        if not excluded and args.require_full_body:
             if row is None:
                 pass
             elif not row.get("response_body_path") or row.get("response_length_chars", 0) <= 0:
@@ -71,9 +106,14 @@ def main(argv: list[str] | None = None) -> int:
         if evt_issues:
             issues.append({"event_id": eid, "issues": evt_issues})
 
-    joined_n = sum(1 for ev in sample if ev.get("event_id") in quality_index)
+    auditable_sample = [
+        ev for ev in sample
+        if (pending_index.get(str(ev.get("event_id"))) or {}).get("status")
+        not in EXCLUDED_PENDING_STATUSES
+    ]
+    joined_n = sum(1 for ev in auditable_sample if ev.get("event_id") in quality_index)
     full_body_joined_n = sum(
-        1 for ev in sample
+        1 for ev in auditable_sample
         if (row := quality_index.get(ev.get("event_id")))
         and row.get("response_body_path")
         and int(row.get("response_length_chars") or 0) > 0
@@ -83,14 +123,20 @@ def main(argv: list[str] | None = None) -> int:
         "history_path": str(history),
         "rag_ask_total": len(all_rag),
         "audited_last_n": len(sample),
+        "auditable_n": len(auditable_sample),
+        "excluded_pending_n": len(sample) - len(auditable_sample),
+        "excluded_pending_status_counts": excluded_status_counts,
         "issues_n": len(issues),
         "issues_sample": issues[:10],
         "response_quality_joined": joined_n,
-        "join_rate_pct": round(joined_n / max(1, len(sample)) * 100, 1),
+        "join_rate_pct": round(joined_n / max(1, len(auditable_sample)) * 100, 1),
         "full_body_joined": full_body_joined_n,
-        "full_body_join_rate_pct": round(full_body_joined_n / max(1, len(sample)) * 100, 1),
-        "missing_response_quality_n": len(sample) - joined_n,
-        "missing_full_body_n": len(sample) - full_body_joined_n,
+        "full_body_join_rate_pct": round(
+            full_body_joined_n / max(1, len(auditable_sample)) * 100,
+            1,
+        ),
+        "missing_response_quality_n": len(auditable_sample) - joined_n,
+        "missing_full_body_n": len(auditable_sample) - full_body_joined_n,
         "rows_backfilled_n": sum(1 for ev in sample if is_backfilled(ev)),
         "quality_rows_total": len(quality_rows),
     }, ensure_ascii=False, indent=2))

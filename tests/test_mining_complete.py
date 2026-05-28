@@ -205,3 +205,64 @@ def test_learning_turn_audit_require_full_body(tmp_path: Path) -> None:
     assert out["issues_sample"] == [
         {"event_id": "ask-missing", "issues": ["missing_response_quality"]}
     ]
+
+
+def test_learning_turn_audit_ignores_superseded_pending(tmp_path: Path) -> None:
+    now = time.time()
+    state_root = tmp_path / "state"
+    body = state_root / "learner" / "response-bodies" / "sha256" / "bb" / "bb.md"
+    body.parent.mkdir(parents=True, exist_ok=True)
+    body.write_text("[Mode: cs_qa]\n\nanswer", encoding="utf-8")
+    pending = state_root / "learner" / "pending-captures"
+    pending.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(state_root / "learner" / "history.jsonl", [
+        {
+            "event_id": "ask-canceled",
+            "event_type": "rag_ask",
+            "mode": "learning",
+            "ts": now,
+            "payload": {"prompt": "취소된 질문", "router_mode": "cs_qa"},
+        },
+        {
+            "event_id": "ask-final",
+            "event_type": "rag_ask",
+            "mode": "learning",
+            "ts": now,
+            "payload": {"prompt": "최종 질문", "router_mode": "cs_qa"},
+        },
+    ])
+    (pending / "ask-canceled.json").write_text(json.dumps({
+        "source_event_id": "ask-canceled",
+        "status": "superseded_by_later_capture",
+        "superseded_by": "ask-final",
+    }, ensure_ascii=False), encoding="utf-8")
+    _write_jsonl(state_root / "learner" / "response-quality.jsonl", [
+        {
+            "source_event_id": "ask-final",
+            "mode": "learning",
+            "response_body_path": "learner/response-bodies/sha256/bb/bb.md",
+            "response_length_chars": 20,
+        },
+    ])
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "bin/learning-turn-audit",
+            "--state-root", str(state_root),
+            "--last", "2",
+            "--require-full-body",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    out = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert out["audited_last_n"] == 2
+    assert out["auditable_n"] == 1
+    assert out["excluded_pending_n"] == 1
+    assert out["excluded_pending_status_counts"] == {"superseded_by_later_capture": 1}
+    assert out["issues_n"] == 0
+    assert out["join_rate_pct"] == 100.0
