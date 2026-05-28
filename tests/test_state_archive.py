@@ -36,6 +36,12 @@ def test_load_profile_returns_empty_for_missing(tmp_path: Path) -> None:
     assert profile.total_events == 0
 
 
+def test_learner_profile_rejects_non_canonical_ids() -> None:
+    for learner_id in ("default", "", "higgs95@naver.com"):
+        with pytest.raises(ValueError):
+            LearnerProfile(learner_id=learner_id)
+
+
 def test_save_then_load_profile_roundtrip(tmp_path: Path) -> None:
     p = LearnerProfile(
         learner_id="donkey",

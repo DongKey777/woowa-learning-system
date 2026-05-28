@@ -3,7 +3,7 @@
 v3 profile.json schema:
   {
     "schema_version": "v3",
-    "learner_id": "default",
+    "learner_id": "TestLearner",
     "computed_at": <float>,
     "concepts": { "mastered": [...], "uncertain": [...], "proficient": [...], "underexplored": [...] },
     "activity": { "events_total": N, ... },
@@ -28,7 +28,7 @@ def _write_v3_profile(state_root, **overrides):
     learner_dir.mkdir(parents=True, exist_ok=True)
     data = {
         "schema_version": "v3",
-        "learner_id": "default",
+        "learner_id": "TestLearner",
         "computed_at": 1700000000.0,
         "concepts": {
             "mastered": ["spring/di", "spring/mvc"],
@@ -48,7 +48,7 @@ def _write_v3_profile(state_root, **overrides):
 def test_load_profile_v3_returns_concepts(tmp_path):
     _write_v3_profile(tmp_path)
 
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
 
     assert len(p.mastered_concepts) == 2
     assert len(p.uncertain_concepts) == 3
@@ -61,14 +61,14 @@ def test_load_profile_flat_schema_back_compat(tmp_path):
     learner_dir.mkdir(parents=True)
     # legacy flat schema (no schema_version / no concepts wrapper)
     (learner_dir / "profile.json").write_text(json.dumps({
-        "learner_id": "default",
+        "learner_id": "TestLearner",
         "mastered_concepts": ["a", "b", "c"],
         "uncertain_concepts": ["x"],
         "total_events": 99,
         "last_updated": 1690000000.0,
     }), encoding="utf-8")
 
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
 
     assert p.mastered_concepts == ["a", "b", "c"]
     assert p.total_events == 99
@@ -76,7 +76,7 @@ def test_load_profile_flat_schema_back_compat(tmp_path):
 
 def test_save_profile_v3_round_trip(tmp_path):
     _write_v3_profile(tmp_path)
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
     p.mastered_concepts.append("spring/transactional")
 
     save_profile(p, state_root=tmp_path)
@@ -90,7 +90,7 @@ def test_save_profile_v3_round_trip(tmp_path):
 
 def test_save_profile_skips_ephemeral_pending(tmp_path):
     _write_v3_profile(tmp_path, pending_triggers={"self_assessment": {"id": "s1"}})
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
     # In-memory pending includes both persistent + ephemeral
     p.pending_triggers["review_drill"] = {"concept_id": "alg/dp"}
     p.pending_triggers["self_assessment"] = {"id": "s1"}
@@ -113,7 +113,7 @@ def test_load_pending_triggers_merges_dedicated_files(tmp_path):
         "concept_id": "alg/dp", "question": "What is DP?",
     }), encoding="utf-8")
 
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
 
     # Dedicated files take precedence for ownership keys.
     assert p.pending_triggers["self_assessment"]["id"] == "from_pt_file"
@@ -122,7 +122,7 @@ def test_load_pending_triggers_merges_dedicated_files(tmp_path):
 
 
 def test_empty_profile_path_returns_empty_learner_profile(tmp_path):
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
     assert isinstance(p, LearnerProfile)
     assert p.mastered_concepts == []
     assert p.uncertain_concepts == []

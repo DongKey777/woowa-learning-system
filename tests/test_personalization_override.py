@@ -26,7 +26,7 @@ def test_must_skip_explanations_of_surfaces_in_prompt():
     }
     md, _, _, _ = compose(
         _cs_route(), {}, "DI 어떻게",
-        learner_id="default", learner_context=context,
+        learner_id="TestLearner", learner_context=context,
     )
     assert "learner_context" in md
     assert "must_skip_explanations_of" in md
@@ -74,7 +74,7 @@ def test_v3_profile_proficient_field_loaded(tmp_path):
     learner_dir.mkdir(parents=True)
     (learner_dir / "profile.json").write_text(json.dumps({
         "schema_version": "v3",
-        "learner_id": "default",
+        "learner_id": "TestLearner",
         "computed_at": 1700000000.0,
         "concepts": {
             "mastered": ["spring/di"],
@@ -85,7 +85,7 @@ def test_v3_profile_proficient_field_loaded(tmp_path):
         "activity": {"events_total": 10},
     }), encoding="utf-8")
 
-    p = load_profile("default", state_root=tmp_path)
+    p = load_profile("TestLearner", state_root=tmp_path)
     assert p.proficient_concepts == ["spring/mvc", "db/tx"]
     p.proficient_concepts.append("db/locks")
     save_profile(p, state_root=tmp_path)

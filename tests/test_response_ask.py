@@ -82,6 +82,12 @@ def test_render_citation_block_empty() -> None:
 
 
 def _run(args: list[str], state_root: Path, **env_extra) -> subprocess.CompletedProcess:
+    identity_dir = state_root / "learner"
+    identity_dir.mkdir(parents=True, exist_ok=True)
+    (identity_dir / "identity.json").write_text(
+        json.dumps({"github_login": "TestLearner", "learner_id": "TestLearner"}),
+        encoding="utf-8",
+    )
     env = {
         "PYTHONPATH": str(REPO_ROOT),
         "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",

@@ -12,6 +12,7 @@ them verbatim without per-field marshalling.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -19,11 +20,14 @@ from pathlib import Path
 
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 
-# Pending-trigger keys backed by dedicated files (NOT persisted into
-# profile.json). review_drill lives in state/learner/drill_pending.json; the
-# load path merges it back into the in-memory pending_triggers dict, but save
-# must skip it so stale drills don't leak into the profile snapshot.
 EPHEMERAL_PENDING_KEYS = frozenset({"review_drill"})
+VALID_LEARNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$")
+
+def _validate_learner_id(learner_id: str) -> None:
+    if learner_id in {None, "", "default"} or "@" in str(learner_id):
+        raise ValueError(f"invalid learner_id: {learner_id!r}; use resolve_learner_login")
+    if not VALID_LEARNER_ID_RE.match(str(learner_id)):
+        raise ValueError(f"invalid learner_id: {learner_id!r}")
 
 
 @dataclass
@@ -35,10 +39,10 @@ class LearnerProfile:
     pending_triggers: dict = field(default_factory=dict)
     total_events: int = 0
     last_updated: float = 0.0
-    # Phase Y11 P1.2 — v3 profile carries `concepts.proficient` separately
-    # from mastered. Personalization treats both as "AI should skip
-    # re-explanations of these" (must_skip_explanations_of).
     proficient_concepts: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        _validate_learner_id(self.learner_id)
 
     @classmethod
     def empty(cls, learner_id: str) -> "LearnerProfile":
@@ -107,10 +111,6 @@ def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> Lear
     if _is_v3_profile(data):
         concepts = data.get("concepts", {}) or {}
         activity = data.get("activity", {}) or {}
-        # Profile top-level pending_triggers + dedicated pending/drill files.
-        # The dedicated files win for keys they own (review_drill) so an
-        # already-cleared drill in drill_pending.json isn't resurrected by a
-        # stale profile entry.
         merged_pending = dict(data.get("pending_triggers", {}) or {})
         merged_pending.update(_load_pending_triggers(state_root))
         return LearnerProfile(

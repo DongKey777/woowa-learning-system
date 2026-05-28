@@ -24,6 +24,8 @@ This acceptance pass closes the learning-data collection/processing defects foun
 - `scripts/mining/jsonl_iter.py` supports `exclude_modes` and fixture/demo row detection.
 - W mining/audit wrappers now report backfilled/original/skipped fixture counts.
 - `scripts/migration/canonical_id_backfill.py` canonicalizes production telemetry with timestamped backups.
+- `LearnerProfile.__post_init__` rejects `default`, empty, email-shaped, and malformed learner IDs.
+- `core.profile.recompute_profile()` resolves the canonical learner ID when called with the old default.
 
 ## State Acceptance
 
@@ -33,34 +35,39 @@ This acceptance pass closes the learning-data collection/processing defects foun
 - Final dry-run:
   - `changed_total`: 0
   - `skipped_unknown_total`: 0
-  - `skipped_non_production_n`: 4 (`learner-A/B` development isolation rows)
+  - `skipped_non_production_n`: 6 (`learner-A/B` development isolation rows)
 - Current learner history:
-  - `DongKey777`: 4907 rows
-  - development isolation rows: `learner-A` 2, `learner-B` 2
+  - `DongKey777`: 5155 rows
+  - development isolation rows: `learner-A` 3, `learner-B` 3
 - `bin/validate-state --strict`: pass
+- `bin/doctor`: 6/6 healthy
 - daemon ping: alive
 - direct socket smoke with `learner_id=default`: recorded as `DongKey777`
+- `bin/profile-recompute --rebuild-unified-projection --silent`: profile and unified profile both `DongKey777`
+- isolated wrapper e2e: `learn-feedback` and `learn-response-quality --minimal` both write `DongKey777` under `state/learner/`
 
 ## Verification
 
 | Check | Result |
 |---|---:|
-| `pytest tests/ -q` | 491 passed |
+| `pytest tests/ -q` | 492 passed |
 | `rag_quality_regression.py` | top1/top5/ndcg/mrr/recall all 1.0 |
-| RAG retrieval latency | p50 0.2ms / p95 0.3ms |
+| RAG retrieval latency | p50 0.2ms / p95 2.9ms |
 | `gate_measurements.py` | 9/9 pass |
 | `uncovered_scenarios.py` | 12/12 pass |
 | `uncovered_scenarios_phase_n.py` | 12/12 pass |
 | `deep_scenarios_phase_p.py` | 10/10 pass |
 | Phase W wrappers | 12/12 pass |
 | Phase X wrappers | 11/11 pass |
-| Full scenario comparison | v2 p50 32.0ms / p95 40.0ms |
+| `concurrent_ask.py` | p50 65.8ms / p95 70.2ms |
+| `learn_response_quality_bench.py` | p50 0.413ms / p95 2.364ms |
+| Full scenario comparison | v2 p50 32.2ms / p95 37.5ms |
 
 Full comparison after the final daemon restart:
 
 - mode dispatch: 14/14
 - evidence coverage: v2 96.0% vs legacy 64.0%
-- latency: v2 p50 32.0ms vs legacy 41.0ms, v2 p95 40.0ms vs legacy 50.0ms
+- latency: v2 p50 32.2ms vs legacy 43.3ms, v2 p95 37.5ms vs legacy 48.8ms
 - output size: v2 average 4117 chars vs legacy 7332 chars
 
 ## Remaining Notes

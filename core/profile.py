@@ -16,14 +16,10 @@ Output: state/learner/profile.json (v3 schema)
     calibration_status: { drill_avg_score, self_assess_count, delta },
     next_recommendations: [{ concept_id, reason }],
   }
-
 experience_level rules:
 - junior:        events_total < 100
 - intermediate:  100 ≤ events < 1000 OR mastered ≥ 1
 - advanced:      events ≥ 1000 OR mastered ≥ 5
-
-Public API:
-  recompute_profile(learner_id, state_root) -> dict (saved + returned)
 """
 from __future__ import annotations
 
@@ -35,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.identity import resolve_learner_login
 from core.state import DEFAULT_STATE_ROOT, read_history
 
 PROFILE_PATH = "profile.json"
@@ -254,6 +251,8 @@ def recompute_profile(
     now: float | None = None,
 ) -> dict:
     """Scan history.jsonl + mastery_graph → write profile.json (v3)."""
+    if learner_id == "default":
+        learner_id = resolve_learner_login(state_root)
     ts = now or time.time()
     events = read_history(state_root=state_root)
     learning = [e for e in events if _is_learning_event(e)]
