@@ -52,8 +52,10 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # rebuild, etc. Y14-B4 adds schema-object learner query fallback and
     # stale-dense-index lexical promotion. Response capture token optimization
     # adds path/summary capture metadata plus content-addressed body sidecars.
-    # UX-first hook capture adds pending/repair state helpers.
-    assert breakdown["core"] <= 7000, f"core {breakdown['core']} > 7000 (Phase T-X/Y13/Y14 budget)"
+    # UX-first hook capture adds pending/repair state helpers and same-turn
+    # supersede handling for clients that call ask multiple times before one
+    # learner-facing answer.
+    assert breakdown["core"] <= 7100, f"core {breakdown['core']} > 7100 (Phase T-X/Y13/Y14 budget)"
     assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"

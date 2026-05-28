@@ -69,6 +69,35 @@ def test_hook_capture_writes_quality_and_marks_pending(tmp_path: Path) -> None:
     assert pending["response_body_path"] == row["response_body_path"]
 
 
+def test_hook_capture_supersedes_older_pending_in_same_turn(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    first = _ask_event()
+    first["event_id"] = "ask-first"
+    first["payload"]["prompt"] = "학습 시작"
+    second = _ask_event()
+    second["event_id"] = "ask-second"
+    second["payload"]["prompt"] = "학습 시작 구체화"
+    append_history_event(first, state_root=state)
+    create_pending_capture(first, state_root=state)
+    append_history_event(second, state_root=state)
+    create_pending_capture(second, state_root=state)
+
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "[Mode: cs_qa]\n\n최종 답변"},
+        client="claude",
+        state_root=state,
+        learner_id="DongKey777",
+    )
+
+    assert result["ok"] is True
+    assert result["source_event_id"] == "ask-second"
+    assert result["superseded_pending_n"] == 1
+    first_pending = load_pending_capture("ask-first", state_root=state)
+    assert first_pending is not None
+    assert first_pending["status"] == "superseded_by_later_capture"
+    assert first_pending["superseded_by"] == "ask-second"
+
+
 def test_hook_capture_failure_queues_repair_without_blocking(tmp_path: Path) -> None:
     state = tmp_path / "state"
     result = capture_from_hook_payload({}, client="codex", state_root=state)

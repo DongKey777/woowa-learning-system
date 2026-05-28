@@ -141,6 +141,7 @@ CREATE TABLE evidence (
 - hook이 없는 환경의 토큰 효율 fallback은 `--response-path <answer.md>`다. 이 방식은 최종 답변을 transcript에 다시 붙여넣지 않는 host/client에서 사용한다.
 - `--response-file -` stdin은 universal fallback이다. path capture가 불가능하면 세션 토큰 비용이 있더라도 본문 보존을 위해 사용한다.
 - hook 수집 실패는 학습 답변을 막지 않고 `capture-repair-queue.jsonl`에 남긴다.
+- 한 사용자 턴에서 `bin/ask`가 여러 번 호출되면 최종 hook capture와 연결되지 않은 이전 pending은 `superseded_by_later_capture`로 닫힌다.
 - `capture_method="summary_only"`는 full-body capture가 정말 불가능한 예외 상황이며, `contract_flags`에 `body_not_captured`, `token_efficient_summary_only`가 남는다.
 - summary-only에서는 본문 `참고:` 블록을 파싱할 수 없으므로 expected citation을 declared citation으로 복사하되 `declared_citation_unverified`를 남겨 false `missing_citation` drift를 피한다.
 - full body가 들어온 경우 `response_excerpt`는 redacted prefix(최대 5000자), `response_body_path`는 redacted full body 파일 경로다.

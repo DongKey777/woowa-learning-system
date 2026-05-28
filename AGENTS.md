@@ -152,7 +152,7 @@ woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 514 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 515 passed 유지)
 
 ### 5.2 측정 명령
 ```bash

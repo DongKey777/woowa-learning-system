@@ -157,6 +157,49 @@ def update_pending_capture(
     return row
 
 
+def supersede_older_pending_captures(
+    captured_source_event_id: str,
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+    window_s: float = 900.0,
+) -> int:
+    """Close stale pending rows from the same short session window.
+
+    AI clients sometimes call ``bin/ask`` more than once before producing one
+    learner-facing answer. The hook can only capture the final answer once, so
+    older pending rows in that burst are marked superseded instead of staying
+    open forever.
+    """
+    captured = load_pending_capture(captured_source_event_id, state_root=state_root)
+    if not captured:
+        return 0
+    captured_created = float(captured.get("created_at") or 0.0)
+    root = pending_capture_dir(state_root)
+    if not root.exists():
+        return 0
+    count = 0
+    for path in root.glob("*.json"):
+        if path.stem == captured_source_event_id:
+            continue
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if row.get("status") != "pending":
+            continue
+        created = float(row.get("created_at") or 0.0)
+        if not created or created > captured_created:
+            continue
+        if captured_created - created > window_s:
+            continue
+        row["status"] = "superseded_by_later_capture"
+        row["updated_at"] = time.time()
+        row["superseded_by"] = captured_source_event_id
+        _atomic_write_json(path, row)
+        count += 1
+    return count
+
+
 def load_source_event(
     source_event_id: str,
     *,
@@ -360,11 +403,16 @@ def capture_from_hook_payload(
             "quality_flags": row["quality_flags"],
         },
     )
+    superseded_n = supersede_older_pending_captures(
+        source_event_id,
+        state_root=state_root,
+    )
     return {
         "ok": True,
         "source_event_id": source_event_id,
         "response_body_path": row["response_body_path"],
         "quality_flags": row["quality_flags"],
+        "superseded_pending_n": superseded_n,
     }
 
 
