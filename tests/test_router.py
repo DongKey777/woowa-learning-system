@@ -69,6 +69,12 @@ def test_java_short_concept_queries_stay_cs_qa() -> None:
         assert d.need_rag is True
 
 
+def test_java_optional_use_avoid_question_stays_cs_qa() -> None:
+    d = route("Java Optional은 언제 쓰고 언제 피해야 해?")
+    assert d.mode == "cs_qa"
+    assert d.need_rag is True
+
+
 def test_learning_practice_request_without_pending_stays_cs_qa() -> None:
     d = route("확인 질문 하나 줘")
     assert d.mode == "cs_qa"

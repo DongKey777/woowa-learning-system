@@ -113,3 +113,22 @@ def test_record_response_quality_appends_history_event(tmp_path: Path) -> None:
     rq = [e for e in events if e.get("event_type") == "response_quality"]
     assert len(rq) == 1
     assert rq[0]["payload"]["source_event_id"] == "ask-h"
+
+
+def test_record_response_quality_persists_session_mode(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WOOWA_SESSION_MODE", "development")
+    state = tmp_path
+    (state / "learner").mkdir(parents=True)
+
+    row = record_response_quality(
+        source_event_id="ask-mode",
+        response_summary="x",
+        response_body="answer body",
+        learner_id="TestLearner",
+        state_root=state,
+    )
+
+    hist = (state / "learner" / "history.jsonl").read_text(encoding="utf-8")
+    event = json.loads(hist.strip())
+    assert row["mode"] == "development"
+    assert event["mode"] == "development"

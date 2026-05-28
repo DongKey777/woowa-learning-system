@@ -23,6 +23,8 @@ from core.intent import (
     ("Spring DI 어떻게 동작해", None, True),
     ("트랜잭션 isolation level 종류", None, True),
     ("@Transactional 원리 설명", None, True),
+    ("Java Optional은 언제 쓰고 언제 피해야 해?", None, True),
+    ("Optional을 언제 사용하고 피해야 하는지 알려줘", None, True),
     # 정의형 (1-3 token, definition signal) → 통과
     ("DI", None, True),
     ("DI가 뭐야", None, True),
@@ -38,6 +40,7 @@ from core.intent import (
     ("오늘 날씨 어때", None, False),
     ("오늘 날씨 왜 이래", None, False),
     ("요리 어떻게 해", None, False),
+    ("오늘 날씨는 언제 풀려", None, False),
     ("food 추천", None, False),
     # mission needs-repo: repo 없으면 차단
     ("예약 흐름 봐줘", None, False),

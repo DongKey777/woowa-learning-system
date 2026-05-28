@@ -382,13 +382,13 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         payload["personalization"] = personalization
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 elif action in ("ask", "ask_text"):
+                    ask_started = time.perf_counter()
                     prompt = req["query"]
                     repo = req.get("repo")
                     learner_id = req.get("learner_id", "default")
                     if learner_id == "default":
                         learner_id = resolve_learner_login(state_root)
-                    event_mode = req.get("mode") or os.environ.get(
-                        "WOOWA_SESSION_MODE", "learning")
+                    event_mode = req.get("mode") or os.environ.get("WOOWA_SESSION_MODE", "learning")
                     profile = load_profile(learner_id, state_root=state_root)
                     recent = read_history(state_root=state_root, tail=20)
                     reformulation = select_reformulation(
@@ -399,9 +399,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         repo=repo,
                         enabled=reformulation_enabled(req.get("reformulation")),
                     )
-                    reformulated_query = (
-                        reformulation.reformulated_query if reformulation else ""
-                    )
+                    reformulated_query = reformulation.reformulated_query if reformulation else ""
                     retrieval_query = reformulated_query or strip_override_tokens(prompt)
                     decision = route(
                         prompt, repo=repo,
@@ -523,6 +521,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         state_root=state_root,
                         learner_context=derived_context,
                     )
+                    latency_ms = round((time.perf_counter() - ask_started) * 1000, 1)
                     event = {
                         "event_id": event_id,
                         "ts": time.time(),
@@ -540,6 +539,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                                 reformulation.source if reformulation else None
                             ),
                             "top_concept_ids": list(response_hints["citation_paths"]),
+                            "latency_ms": latency_ms,
                         },
                     }
                     try:
@@ -553,6 +553,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         "personas": effective_route.personas,
                         "reason": effective_route.reason,
                         "event_id": event_id,
+                        "latency_ms": latency_ms,
                         "response_hints": response_hints,
                         "response_quality_hint": response_quality_hint,
                     }

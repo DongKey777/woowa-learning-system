@@ -47,11 +47,12 @@ MISSION_TOKENS_EXPLICIT = ("미션", "내 코드", "내 pr", "페어")
 # alone is ambiguous (could be 식당 예약) so it must be paired with --repo.
 MISSION_TOKENS_NEEDS_REPO = ("예약", "대기", "방탈출", "리뷰", "pr")
 LEARNING_INTENT = (
-    "어떻게", "왜", "차이", "비교", "어떤 방식", "최선",
+    "어떻게", "왜", "언제", "차이", "비교", "어떤 방식", "최선",
     "trade-off", "장단점", "설명", "이해", "알려줘",
     # CS-concept intents that aren't generic "어떻게"
     "종류", "원리", "설정", "메커니즘", "처리법", "vs",
     "생명주기", "benefits", "어디서", "어디에", "구조", "흐름",
+    "쓰고", "써야", "피해야", "피하", "사용", "언제 쓰", "when to", "avoid",
 )
 LEARNING_REQUEST_TOKENS = (
     "확인 질문", "질문 하나", "퀴즈", "연습 문제",

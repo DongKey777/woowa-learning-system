@@ -73,11 +73,13 @@ def test_ask_returns_none_when_socket_missing(tmp_path: Path) -> None:
 def test_rag_ask_event_records_learner_identity_and_repo() -> None:
     src = inspect.getsource(daemon.serve)
     assert '"event_type": "rag_ask"' in src
+    assert "ask_started = time.perf_counter()" in src
     assert 'if learner_id == "default":' in src
     assert 'learner_id = resolve_learner_login(state_root)' in src
     assert '"learner_id": learner_id' in src
     assert '"repo": repo' in src
     assert '"top_concept_ids": list(response_hints["citation_paths"])' in src
+    assert '"latency_ms": latency_ms' in src
 
 
 def test_render_ask_stdout_matches_cli_text_shape() -> None:

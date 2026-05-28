@@ -9,16 +9,12 @@ AI session auto-calls after every coach turn. Records:
 
 PII redaction: emails / Bearer tokens / API keys / phone numbers replaced
 with placeholder before excerpt is stored.
-
-Public API:
-  record_response_quality(...) -> dict (appended row)
-  detect_citation_drift(expected, declared) -> set[str] of drift flags
-  redact_pii(text) -> redacted text
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -92,6 +88,7 @@ def record_response_quality(
     state_root: Path = DEFAULT_STATE_ROOT,
     now: float | None = None,
     append_event: bool = True,
+    mode: str | None = None,
 ) -> dict:
     """Build telemetry row, write to response-quality.jsonl, optionally append
     a `response_quality` event to history.jsonl for join with other events.
@@ -99,6 +96,7 @@ def record_response_quality(
     Returns the written row (dict).
     """
     ts = now or time.time()
+    event_mode = mode or os.environ.get("WOOWA_SESSION_MODE", "learning")
     flags = set(quality_flags or [])
     cflags = list(contract_flags or [])
 
@@ -120,6 +118,7 @@ def record_response_quality(
         "source_event_id": source_event_id,
         "turn_id": turn_id or f"turn-{uuid.uuid4().hex[:12]}",
         "repo": repo,
+        "mode": event_mode,
         "learner_id": learner_id,
         "response_summary": (response_summary or "")[:300],
         "response_excerpt": excerpt,
@@ -141,7 +140,7 @@ def record_response_quality(
         append_history_event({
             "event_id": f"response_quality-{int(ts * 1000)}-{uuid.uuid4().hex[:6]}",
             "event_type": "response_quality",
-            "mode": "learning",
+            "mode": event_mode,
             "ts": ts,
             "learner_id": learner_id,
             "repo": repo,
