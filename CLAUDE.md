@@ -108,10 +108,12 @@ python3 bin/ask "테스트"
 
 ### 4.2.1 답변 본문 수집 규칙
 - `# response_quality_hint.command_template`가 있으면 답변 직후 반드시 실행.
-- `--response-file -` stdin에는 **학습자에게 실제로 보여준 최종 답변 전체**를 그대로 넣는다.
-- 요약본, 축약본, 다시 쓴 paraphrase, 일부 excerpt를 넣지 않는다.
-- 본문 capture가 불가능하면 요약본으로 대체하지 말고 `--summary-only --contract-flag body_not_captured`로 기록한다.
-- 정상 수집 시 `response-quality.jsonl.response_excerpt`에는 최종 답변의 redacted excerpt가 최대 5000자까지 저장된다.
+- 토큰 효율 기본값은 `--summary-only --contract-flag body_not_captured --contract-flag token_efficient_summary_only`다.
+- 호스트/클라이언트가 최종 답변을 transcript에 다시 붙여넣지 않고 로컬 파일로 materialize할 수 있을 때만 `full_body_path_template`의 `--response-path <answer.md>`를 사용한다.
+- `--response-file -` stdin은 호환 fallback이다. 긴 답변을 telemetry만을 위해 heredoc/stdin으로 다시 붙여넣지 않는다.
+- full body를 넣는 경우에는 **학습자에게 실제로 보여준 최종 답변 전체**를 그대로 넣는다. 요약본, 축약본, paraphrase, 일부 excerpt를 full body처럼 넣지 않는다.
+- summary-only에서는 본문 인용을 검증할 수 없으므로 `declared_citation_unverified`가 남는다.
+- 정상 full-body 수집 시 `response-quality.jsonl.response_excerpt`에는 redacted prefix(최대 5000자), `response_body_path`에는 redacted full body 파일 경로가 저장된다.
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 조건 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:
@@ -225,7 +227,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
 | Write/Edit a `missions/<r>/**/*.java` file | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M [--linked-test C.M] --silent` |
 | 학습자가 `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
-| 매 coach turn 답변 직후 (필수) | `bin/learn-response-quality --source-event-id <id> --response-file - --expected-citation <c> --silent` (최종 답변 전체를 stdin; summary/declared citation 자동 추출) |
+| 매 coach turn 답변 직후 (필수) | 기본 `bin/learn-response-quality --source-event-id <id> --summary-only --contract-flag body_not_captured --contract-flag token_efficient_summary_only --silent`; zero-copy 파일 capture 가능 시 `--response-path <answer.md>`로 최종 답변 전체 저장 |
 | 학습자가 미션 repo onboarded 후 첫 coaching 진입 시 | `bin/assess-learner-state --repo <r> --path missions/<r> --learner-login <l> --silent` |
 | 매 10 turn마다 OR *"내 상태"*, *"learning profile"* 발화 | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |

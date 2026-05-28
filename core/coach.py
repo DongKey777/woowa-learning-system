@@ -135,20 +135,37 @@ def _build_response_quality_hint(
     state_root_arg = (f" --state-root {shlex.quote(str(state_root))}"
                       if state_root is not None
                       and Path(state_root) != Path(DEFAULT_STATE_ROOT) else "")
-    cmd = (f"bin/learn-response-quality --source-event-id {source_event_id} "
-           f"--response-file -{citation_args} --silent{state_root_arg}")
+    base = (f"bin/learn-response-quality --source-event-id {source_event_id}"
+            f"{citation_args}")
+    path_cmd = (f"{base} --response-path <answer.md> --silent{state_root_arg}")
+    stdin_cmd = (f"{base} --response-file - --silent{state_root_arg}")
+    summary_cmd = (
+        f"{base} --summary-only --contract-flag body_not_captured "
+        f"--contract-flag token_efficient_summary_only --silent{state_root_arg}"
+    )
     return {
-        "command_template": cmd,
-        "wrapper_cmd": cmd,
+        "command_template": summary_cmd,
+        "wrapper_cmd": summary_cmd,
+        "full_body_path_template": path_cmd,
+        "stdin_fallback_cmd": stdin_cmd,
+        "summary_only_cmd": summary_cmd,
         "source_event_id": source_event_id,
         "expected_citation_paths": list(expected_citation_paths),
-        "body_required": True,
+        "body_required": False,
+        "body_capture_preferred": True,
+        "capture_policy": "token_efficient_full_body_when_zero_copy",
         "body_contract": (
-            "stdin must be the exact full learner-facing answer that was shown "
-            "to the learner; never a summary, excerpt, or paraphrase"
+            "Prefer --response-path when the host can materialize the exact "
+            "final learner-facing answer without echoing it into the AI "
+            "session transcript. Use --response-file - only when stdin capture "
+            "does not duplicate the full body in transcript. If neither is "
+            "available, use summary-only with body_not_captured."
         ),
         "declared_citations": "auto-extracted from response body 참고 block when omitted",
-        "obligation": "AI MUST pipe the final learner-facing answer body after answer",
+        "obligation": (
+            "AI MUST record response telemetry after answer, but must not paste "
+            "a long final answer into a shell heredoc solely for telemetry."
+        ),
     }
 
 def compose(

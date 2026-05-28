@@ -2,8 +2,8 @@
 
 daemon emits a top-level `response_quality_hint` so the AI session knows
 which `bin/learn-response-quality --source-event-id …` to invoke after the
-turn. The default command must capture the final answer body; --minimal is
-kept only as an explicit fallback.
+turn. The default command must avoid duplicating long answer bodies in the AI
+transcript; full body capture is still exposed through a path-based template.
 """
 from __future__ import annotations
 
@@ -41,12 +41,16 @@ def test_quality_hint_present_with_event_id():
     assert rq["source_event_id"] == "ask-12345"
     assert "bin/learn-response-quality" in rq["command_template"]
     assert "--source-event-id ask-12345" in rq["command_template"]
-    assert "--response-file -" in rq["command_template"]
+    assert "--summary-only" in rq["command_template"]
+    assert "--response-path <answer.md>" in rq["full_body_path_template"]
+    assert "--response-file -" in rq["stdin_fallback_cmd"]
     assert "--minimal" not in rq["command_template"]
     assert "--expected-citation spring/di" in rq["command_template"]
     assert "--silent" in rq["command_template"]
-    assert rq["body_required"] is True
-    assert "exact full learner-facing answer" in rq["body_contract"]
+    assert rq["body_required"] is False
+    assert rq["body_capture_preferred"] is True
+    assert rq["capture_policy"] == "token_efficient_full_body_when_zero_copy"
+    assert "Prefer --response-path" in rq["body_contract"]
     assert "minimal_fallback_cmd" not in rq
     # expected_citation_paths mirrors hints.citation_paths
     assert rq["expected_citation_paths"] == hints["citation_paths"]
@@ -70,6 +74,8 @@ def test_quality_hint_includes_non_default_state_root():
     )
     assert rq is not None
     assert "--state-root" in rq["command_template"]
+    assert "--state-root" in rq["full_body_path_template"]
+    assert "--state-root" in rq["stdin_fallback_cmd"]
     assert str(tmp) in rq["command_template"]
 
 
@@ -81,6 +87,7 @@ def test_quality_hint_omits_state_root_for_default():
     )
     assert rq is not None
     assert "--state-root" not in rq["command_template"]
+    assert "--state-root" not in rq["full_body_path_template"]
 
 
 def test_quality_hint_wrapper_cmd_alias_matches_command_template():
@@ -89,5 +96,5 @@ def test_quality_hint_wrapper_cmd_alias_matches_command_template():
         expected_citation_paths=["x/y"],
         state_root=None,
     )
-    # wrapper_cmd is a legacy alias for command_template — same value.
+    # wrapper_cmd remains an alias for the token-safe default command.
     assert rq["wrapper_cmd"] == rq["command_template"]

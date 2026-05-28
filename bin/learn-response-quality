@@ -8,6 +8,10 @@ Full mode:
      --response-file - --expected-citation <c1> --declared-citation <c2> \\
      --quality-flag <flag> --silent
 
+Token-efficient full mode:
+  bin/learn-response-quality --source-event-id <id> --response-path /path/answer.md \\
+     --expected-citation <c1> --silent
+
   If --response-summary is omitted but a body is supplied, a short summary is
   derived from the body. If --declared-citation is omitted, citations are
   extracted from the body's final `참고:` block.
@@ -18,7 +22,9 @@ Minimal mode (fallback only):
     expected/declared citations auto-extracted from source rag_ask event's
     top_concept_ids in history.jsonl. AI only needs the source-event-id.
 
-Body via stdin (--response-file -) is preferred when supplying body.
+Body via local path (--response-path or --response-file <path>) is preferred
+when the host can materialize the final answer without echoing it into the AI
+session transcript. Stdin (--response-file -) is a compatibility fallback.
 The body must be the exact full learner-facing answer, not a summary.
 """
 from __future__ import annotations
@@ -60,14 +66,53 @@ def _derive_summary(body: str | None) -> str:
     return " ".join(summary.split())[:300]
 
 
+def _body_sources(args) -> list[str]:
+    sources: list[str] = []
+    if args.response_text is not None:
+        sources.append("text")
+    if args.response_file is not None:
+        sources.append("file")
+    if args.response_path is not None:
+        sources.append("path")
+    return sources
+
+
 def _read_response(args) -> str | None:
     if args.response_text is not None:
         return args.response_text
+    if args.response_path:
+        return Path(args.response_path).read_text(encoding="utf-8")
     if args.response_file == "-":
         return sys.stdin.read()
     if args.response_file:
         return Path(args.response_file).read_text(encoding="utf-8")
     return None
+
+
+def _capture_method(args, body: str | None) -> str:
+    if args.minimal:
+        return "minimal"
+    if args.summary_only and not body:
+        return "summary_only"
+    if args.response_text is not None:
+        return "text"
+    if args.response_path is not None:
+        return "file_path"
+    if args.response_file == "-":
+        return "stdin"
+    if args.response_file:
+        return "file_path"
+    return "none"
+
+
+def _capture_input_chars(args, body: str | None) -> int:
+    if args.response_text is not None or args.response_file == "-":
+        return len(body or "")
+    if args.response_path:
+        return len(str(args.response_path))
+    if args.response_file:
+        return len(str(args.response_file))
+    return len(args.response_summary or "")
 
 
 def _body_contract_flags(body: str | None, expected: list[str]) -> list[str]:
@@ -123,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
                              "is supplied; derived from body if omitted")
     parser.add_argument("--response-file", default=None,
                         help="path or '-' for stdin")
+    parser.add_argument("--response-path", default=None,
+                        help="token-efficient alias for --response-file <path>")
     parser.add_argument("--response-text", default=None,
                         help="literal body string (alternative to --response-file)")
     parser.add_argument("--expected-citation", action="append", default=[])
@@ -143,6 +190,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     learner_id = resolve_learner_login(args.state_root, explicit=args.learner_id)
+    sources = _body_sources(args)
+    if len(sources) > 1:
+        print("ERROR: use only one body source among --response-file, "
+              "--response-path, --response-text",
+              file=sys.stderr)
+        return 2
 
     if args.minimal:
         ev = _lookup_source_event(args.state_root, learner_id, args.source_event_id)
@@ -165,15 +218,29 @@ def main(argv: list[str] | None = None) -> int:
         body = _read_response(args)
         if body is None and not args.summary_only:
             print("ERROR: --response-file or --response-text required "
-                  "(or --summary-only or --minimal)",
+                  "(or --response-path, --summary-only, or --minimal)",
                   file=sys.stderr)
             return 2
         if args.response_summary is None:
-            args.response_summary = _derive_summary(body)
+            args.response_summary = (
+                "auto-recorded (summary-only; body not captured)"
+                if args.summary_only and body is None
+                else _derive_summary(body)
+            )
+        if args.summary_only and body is None:
+            if "body_not_captured" not in args.contract_flag:
+                args.contract_flag.append("body_not_captured")
+            if "token_efficient_summary_only" not in args.contract_flag:
+                args.contract_flag.append("token_efficient_summary_only")
+            if args.expected_citation and not args.declared_citation:
+                args.declared_citation = list(args.expected_citation)
+                if "declared_citation_unverified" not in args.contract_flag:
+                    args.contract_flag.append("declared_citation_unverified")
         if body and not args.declared_citation:
             args.declared_citation = parse_response(body).citations
         args.contract_flag.extend(_body_contract_flags(body, args.expected_citation))
 
+    capture_method = _capture_method(args, body)
     row = record_response_quality(
         source_event_id=args.source_event_id,
         response_summary=args.response_summary,
@@ -184,13 +251,18 @@ def main(argv: list[str] | None = None) -> int:
         contract_flags=args.contract_flag,
         repo=args.repo, turn_id=args.turn_id,
         learner_id=learner_id, state_root=args.state_root,
+        capture_method=capture_method,
+        capture_input_chars=_capture_input_chars(args, body),
     )
     if not args.silent:
         print(json.dumps({
             "source_event_id": row["source_event_id"],
             "turn_id": row["turn_id"],
             "response_length_chars": row["response_length_chars"],
+            "response_body_path": row["response_body_path"],
+            "capture_method": row["capture_method"],
             "quality_flags": row["quality_flags"],
+            "contract_flags": row["contract_flags"],
         }, ensure_ascii=False, indent=2))
     return 0
 

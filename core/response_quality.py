@@ -3,6 +3,7 @@
 AI session auto-calls after every coach turn. Records:
 - source event id (the rag_ask / coach_run this answer responds to)
 - response summary + exact final-answer redacted excerpt (≤5000 chars)
+- optional redacted full-body file for path/stdin/text captures
 - expected citations (from coach prompt's response_hints.citation_paths)
 - declared citations (from actual final answer's 참고: block)
 - quality/contract flags (missing_body, citation_mismatch, possible_summary_body, …)
@@ -24,6 +25,7 @@ from core.state import DEFAULT_STATE_ROOT, append_history_event
 SCHEMA_ID = "assistant-response-quality-v1"
 EXCERPT_MAX_CHARS = 5000
 QUALITY_LOG = "response-quality.jsonl"
+BODY_DIR = "response-bodies"
 
 # PII patterns
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -47,6 +49,11 @@ def redact_pii(text: str) -> str:
     out = _API_KEY_RE.sub("[API_KEY]", out)
     out = _PHONE_RE.sub("[PHONE]", out)
     return out
+
+
+def _safe_event_id(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "response").strip("-")
+    return safe[:96] or "response"
 
 
 def detect_citation_drift(
@@ -88,6 +95,8 @@ def record_response_quality(
     now: float | None = None,
     append_event: bool = True,
     mode: str | None = None,
+    capture_method: str | None = None,
+    capture_input_chars: int | None = None,
 ) -> dict:
     """Build telemetry row, write to response-quality.jsonl, optionally append
     a `response_quality` event to history.jsonl for join with other events.
@@ -107,9 +116,18 @@ def record_response_quality(
     # Auto-detect: citation drift
     flags |= detect_citation_drift(expected_citation_paths, declared_citation_paths)
 
-    excerpt_raw = body[:EXCERPT_MAX_CHARS] if body else ""
-    excerpt = redact_pii(excerpt_raw)
+    redacted_body = redact_pii(body) if body else ""
+    excerpt = redacted_body[:EXCERPT_MAX_CHARS] if redacted_body else ""
     response_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] if body else ""
+    response_body_path = None
+    response_body_bytes = len(body.encode("utf-8")) if body else 0
+    if body:
+        body_dir = state_root / "learner" / BODY_DIR
+        body_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{_safe_event_id(source_event_id)}-{response_hash}.md"
+        body_path = body_dir / filename
+        body_path.write_text(redacted_body, encoding="utf-8")
+        response_body_path = str(body_path.relative_to(state_root))
 
     row = {
         "schema_id": SCHEMA_ID,
@@ -122,7 +140,12 @@ def record_response_quality(
         "response_summary": (response_summary or "")[:300],
         "response_excerpt": excerpt,
         "response_length_chars": len(body),
+        "response_body_bytes": response_body_bytes,
+        "response_body_path": response_body_path,
+        "response_excerpt_truncated": len(redacted_body) > EXCERPT_MAX_CHARS,
         "response_hash": response_hash,
+        "capture_method": capture_method or ("unknown_body" if body else "none"),
+        "capture_input_chars": capture_input_chars,
         "citation_paths_expected": list(expected_citation_paths or []),
         "citation_paths_declared": list(declared_citation_paths or []),
         "quality_flags": sorted(flags),
@@ -147,6 +170,9 @@ def record_response_quality(
                 "source_event_id": source_event_id,
                 "quality_flags": sorted(flags),
                 "summary": row["response_summary"],
+                "capture_method": row["capture_method"],
+                "response_body_path": response_body_path,
+                "response_length_chars": len(body),
             },
         }, state_root=state_root)
 

@@ -90,7 +90,8 @@ state/
 │   ├── profile.json               # v3 profile: concepts/activity/calibration/recommendations
 │   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)
 │   ├── feedback.jsonl             # explicit helpful/not_helpful/unclear learner feedback
-│   ├── response-quality.jsonl     # final answer telemetry: redacted excerpt ≤5000 chars + hash/length/contract_flags, joined by source_event_id
+│   ├── response-quality.jsonl     # response telemetry: capture_method + redacted excerpt ≤5000 chars + body path/hash/flags
+│   ├── response-bodies/           # optional redacted full final-answer bodies captured by path/stdin/text mode
 │   ├── mastery_graph.sqlite       # Bloom autoloop state (mastery table + evidence table)
 │   ├── drill_pending.json         # 1 open drill offer (or absent)
 │   ├── drill_due.json             # spaced repetition due list
@@ -134,9 +135,12 @@ CREATE TABLE evidence (
 
 ### `response-quality.jsonl` 수집 규칙
 - `source_event_id`는 직전 `rag_ask` / `coach_run` event id와 join된다.
-- `response_excerpt`는 학습자에게 실제로 보여준 최종 답변 전체의 redacted prefix(최대 5000자)다.
-- 요약본, 축약본, paraphrase를 본문으로 넣으면 `contract_flags`에 `possible_summary_body`가 붙을 수 있다.
-- 본문 capture가 불가능한 경우에만 `summary-only`를 쓰고, `contract_flags=["body_not_captured"]`로 남긴다.
+- 토큰 효율 기본값은 `capture_method="summary_only"`이며, `contract_flags`에 `body_not_captured`, `token_efficient_summary_only`가 남는다.
+- summary-only에서는 본문 `참고:` 블록을 파싱할 수 없으므로 expected citation을 declared citation으로 복사하되 `declared_citation_unverified`를 남겨 false `missing_citation` drift를 피한다.
+- full body capture는 `--response-path <answer.md>`가 우선이다. 이 방식은 최종 답변을 transcript에 다시 붙여넣지 않는 host/client에서 사용한다.
+- `--response-file -` stdin은 호환 fallback이다. 긴 답변을 telemetry만을 위해 heredoc으로 재전송하지 않는다.
+- full body가 들어온 경우 `response_excerpt`는 redacted prefix(최대 5000자), `response_body_path`는 redacted full body 파일 경로다.
+- 요약본, 축약본, paraphrase를 full body처럼 넣으면 `contract_flags`에 `possible_summary_body`가 붙을 수 있다.
 
 ### `profile.json` shape
 ```json

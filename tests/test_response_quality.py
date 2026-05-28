@@ -71,6 +71,12 @@ def test_record_response_quality_writes_jsonl(tmp_path: Path) -> None:
     )
     assert row["schema_id"] == SCHEMA_ID
     assert "[EMAIL]" in row["response_excerpt"]
+    assert row["response_body_path"]
+    body_path = state / row["response_body_path"]
+    assert body_path.exists()
+    stored = body_path.read_text(encoding="utf-8")
+    assert "[EMAIL]" in stored
+    assert "foo@bar.com" not in stored
     assert row["citation_paths_expected"] == ["spring/bean-di.md"]
     assert "missing_response_body" not in row["quality_flags"]
     # File written
@@ -150,6 +156,9 @@ def test_record_response_quality_keeps_five_thousand_char_excerpt(tmp_path: Path
     assert EXCERPT_MAX_CHARS == 5000
     assert row["response_length_chars"] == 5500
     assert len(row["response_excerpt"]) == 5000
+    assert row["response_excerpt_truncated"] is True
+    assert row["response_body_path"]
+    assert len((state / row["response_body_path"]).read_text(encoding="utf-8")) == 5500
     assert row["response_hash"]
 
 
@@ -246,3 +255,70 @@ def test_learn_response_quality_cli_full_body_has_no_summary_flag(tmp_path: Path
     row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
     assert row["response_length_chars"] == len(body)
     assert "possible_summary_body" not in row["contract_flags"]
+
+
+def test_learn_response_quality_cli_response_path_is_token_efficient(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    answer = tmp_path / "answer.md"
+    body = (
+        "[Mode: cs_qa]\n\n"
+        "비관적 락은 먼저 잠그고, 낙관적 락은 version 조건으로 나중에 충돌을 감지해.\n\n"
+        "참고:\n"
+        "- database/lock-basics\n"
+    )
+    answer.write_text(body, encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-path",
+            "--response-path", str(answer),
+            "--expected-citation", "database/lock-basics",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["capture_method"] == "file_path"
+    assert row["capture_input_chars"] == len(str(answer))
+    assert row["response_length_chars"] == len(body)
+    assert row["response_body_path"]
+    assert (state / row["response_body_path"]).read_text(encoding="utf-8") == body
+
+
+def test_learn_response_quality_cli_summary_only_marks_body_not_captured(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-summary",
+            "--response-summary", "낙관락/비관락 차이를 짧게 설명함",
+            "--summary-only",
+            "--expected-citation", "database/lock-basics",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["capture_method"] == "summary_only"
+    assert row["response_body_path"] is None
+    assert "missing_response_body" in row["quality_flags"]
+    assert "missing_citation" not in row["quality_flags"]
+    assert row["citation_paths_declared"] == ["database/lock-basics"]
+    assert "body_not_captured" in row["contract_flags"]
+    assert "token_efficient_summary_only" in row["contract_flags"]
+    assert "declared_citation_unverified" in row["contract_flags"]
