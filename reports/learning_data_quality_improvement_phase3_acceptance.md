@@ -45,6 +45,7 @@ This acceptance pass closes the learning-data collection/processing defects foun
 - direct socket smoke with `learner_id=default`: recorded as `DongKey777`
 - `bin/profile-recompute --rebuild-unified-projection --silent`: profile and unified profile both `DongKey777`
 - isolated wrapper e2e: `learn-feedback` and `learn-response-quality --minimal` both write `DongKey777` under `state/learner/`
+- obsolete empty `state/cs_rag/feedback.jsonl`: removed from local state
 
 ## Verification
 
