@@ -12,9 +12,9 @@ core/daemon.py (AF_UNIX, single-thread, BGE-M3 warm in-process)
    2. core/lazy_loader.py   → only artifacts the router asked for
    3. core/coach.py         → multi-agent labeled-section prompt
        ↓
-state/learner/history.jsonl ← append rag_ask event (mode/router_mode/top_concept_ids)
+state/learner/history.jsonl ← append rag_ask event (mode/router_mode/top_concept_ids/latency_ms)
        ↓
-prompt markdown (avg 2.4KB, F11 up to 12KB)
+prompt markdown (14-scenario avg ~4.1K chars, F11 up to 12KB)
        ↓
 AI session (Claude / Codex / Gemini) → 학습자에게 한국어 답변
        ↓
@@ -65,13 +65,14 @@ Phase N9 측정: coaching mode markdown에 3 persona 모두 surface (MENTOR + RE
 - **demotion**: 없음 (monotonic — 한 번 promoted 후 weak drill 받아도 demote X, 설계상)
 
 ### Daemon integration (Phase K 핵심 fix)
-- 매 `bin/ask` turn → daemon이 `rag_ask` event를 `history.jsonl`에 append (mode/router_mode/top_concept_ids 포함)
+- 매 `bin/ask` turn → daemon이 `rag_ask` event를 `history.jsonl`에 append (mode/router_mode/top_concept_ids/latency_ms 포함)
 - 학습자 코드 작성/수정 turn → AI 세션이 `bin/learn-event --event-type code_attempt --silent` 호출
 - drill answer turn → `bin/learn-event --event-type drill_answer --score s --silent` 호출
 - 모든 이벤트가 `core/feedback.record_turn` → `core/mastery.promote` 자동 trigger
 
 ### 현재 상태
-- 5 mastered + 2 proficient (Spring core: bean-di, ioc-di, mvc-controller, configurationproperties, transactional-self-invocation, jdbc-jpa-mybatis, transaction-isolation)
+- 2026-05-28 learner state reset 완료: `events_total=0`, mastered/proficient/uncertain/underexplored 모두 empty.
+- 이후 daily 학습 turn의 `rag_ask`, code, drill, feedback event로 실제 learner profile을 재누적한다.
 
 ## 5. F10 forward — mission code → concept
 
@@ -172,7 +173,7 @@ Historical Phase M in-process cold/warm numbers are superseded by Y13 daemon-lay
 - **Read-mostly small** → JSON (`review_anchors.json`, `mission_patterns.json`, `drill_pending.json`, `drill_due.json`)
 - **Large columnar** → Parquet (`cross_crew_review_graph.parquet`)
 - **Immutable corpus** → JSON adjacency (`concept_graph.json` 3339 nodes / 6172 prereq edges / ~5MB)
-- **Dense embed index** → Lance (`state/index/concept.lance` ~12MB release artifact; rebuild after each 200 staged corpus docs)
+- **Dense embed index** → Lance (`state/index/concepts.lance` ~13.4MB release artifact; rebuild after each 200 staged corpus docs)
 - **Append-only event log** → JSONL (`history.jsonl`)
 
 ## 10. LOC budget (plan §D-I)

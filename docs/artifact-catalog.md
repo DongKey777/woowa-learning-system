@@ -81,21 +81,21 @@ corpus/
 ```
 state/
 ├── index/
-│   ├── concept.lance/             # Lance vector table; release index rebuilds after each 200 staged corpus docs
+│   ├── concepts.lance/            # Lance vector table; release index rebuilds after each 200 staged corpus docs
 │   │   ├── _versions/
 │   │   ├── data/
 │   │   └── _transactions/
 │   └── manifest.json              # build metadata (corpus_hash, built_at, etc.)
 ├── learner/
-│   ├── profile.json               # mastered/uncertain/drill_due/pending_triggers
+│   ├── profile.json               # v3 profile: concepts/activity/calibration/recommendations
 │   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)
 │   ├── feedback.jsonl             # explicit helpful/not_helpful/unclear learner feedback
-│   ├── response-quality.jsonl     # answer telemetry joined by source_event_id
+│   ├── response-quality.jsonl     # answer telemetry: redacted excerpt ≤5000 chars + hash/length, joined by source_event_id
 │   ├── mastery_graph.sqlite       # Bloom autoloop state (mastery table + evidence table)
 │   ├── drill_pending.json         # 1 open drill offer (or absent)
 │   ├── drill_due.json             # spaced repetition due list
 │   ├── pending_triggers.json      # pending self_assessment / review_drill triggers
-│   └── review_anchors.json        # 31 thread anchors extracted from mission repos
+│   └── review_anchors.json        # optional thread anchors extracted from mission repos
 ├── repos/                          # per-repo derived artifacts
 │   └── <repo>/
 │       ├── mission_patterns.json   # F10 forward — Tier 1+2 extracted patterns
@@ -125,7 +125,7 @@ CREATE TABLE evidence (
 ### `history.jsonl` event types
 | event_type | mode | payload 필드 |
 |---|---|---|
-| `rag_ask` | learning/development | top-level learner_id/repo + prompt, repo, router_mode, router_reason, top_concept_ids |
+| `rag_ask` | learning/development | top-level learner_id/repo + prompt, repo, router_mode, router_reason, top_concept_ids, latency_ms |
 | `code_attempt` | learning | file_path, concept_ids, lines_added, lines_removed, summary, linked_test |
 | `drill_answer` | learning | drill_session_id, concept_ids, score, level, dimensions, answer_preview |
 | `self_assessment` | learning | trigger_session_id, score, concept_ids |
@@ -135,16 +135,25 @@ CREATE TABLE evidence (
 ### `profile.json` shape
 ```json
 {
+  "schema_version": "v3",
   "learner_id": "DongKey777",
-  "mastered_concepts": ["spring/bean-di-basics", ...],
-  "uncertain_concepts": ["language/java-optional-basics", ...],
-  "drill_due": [{"concept_id": "...", "next_due_ts": ..., "level": "weak"}, ...],
-  "pending_triggers": {
-    "self_assessment": {"trigger_session_id": "...", "issued_at": ...},
-    "review_drill": {"trigger_session_id": "...", "concept_id": "..."}
+  "computed_at": 1779937200.0,
+  "experience_level": "junior|intermediate|advanced",
+  "concepts": {
+    "mastered": ["spring/bean-di-basics"],
+    "proficient": [],
+    "uncertain": [],
+    "underexplored": []
   },
-  "total_events": 10000+,
-  "last_updated": 1779697427.0
+  "activity": {
+    "events_total": 0,
+    "days_active": 0,
+    "last_event_ts": 0.0,
+    "event_type_counts": {}
+  },
+  "recent_code_changes_24h": 0,
+  "calibration_status": {...},
+  "next_recommendations": []
 }
 ```
 
@@ -193,8 +202,7 @@ reports/
 ├── phase_n_uncovered2.json
 ├── phase_p_deep.json
 ├── rag_quality_regression.json               # F1 200-query measurement
-├── v2_vs_legacy_full_comparison.json/.md     # 14-scenario benchmark
-├── v2_vs_legacy_deepdive.json                # 4 sidebyside samples
+├── historical comparison reports             # archived 14-scenario / deepdive baselines
 ├── coaching_eval.json
 ├── phase_g_v2_eval.json                      # corpus enrichment cycle
 ├── phase9_rag_eval.json
@@ -211,11 +219,11 @@ reports/
 |---|---|---|---|
 | corpus/concepts/*.json | Mode B (corpus 작업) | RAG search + drill builder | corpus 신규 추가 |
 | corpus/concept_graph.json | `bin/graph-build` | RAG + F8 prereq walk | corpus 변경 후 |
-| state/index/concept.lance/ | `bin/corpus-build` 또는 release fetch | daemon search | corpus 변경 후 |
+| state/index/concepts.lance/ | `bin/corpus-build` 또는 release fetch | daemon search | corpus 변경 후 |
 | state/learner/history.jsonl | daemon ask 매 turn | recent_history + profile recompute | append-only |
 | state/learner/mastery_graph.sqlite | `core/feedback.record_turn` | profile.json compute | 매 evidence event |
-| state/learner/profile.json | profile recompute (현재 수동) | router pending_triggers + 학습자 surface | history 누적 후 |
-| state/learner/review_anchors.json | `anchors/extract.py` | F11 매칭 source | 학습자 신규 PR review 후 |
+| state/learner/profile.json | `bin/profile-recompute` / `bin/learner-profile recompute` | router pending_triggers + 학습자 surface | history 누적 후 |
+| state/learner/review_anchors.json | `anchors/extract.py` | F11 매칭 source | repo sync 후 optional |
 | state/repos/<repo>/mission_patterns.json | `bin/mission-patterns-build` | coaching prompt | 학습자 신규 PR 후 |
 | state/repos/<repo>/cross_crew_review_graph.parquet | `bin/cross-crew-build` | F11 prompt | anchors 갱신 후 |
 | reports/*.json/.md | 측정 script 실행 (Mode B) | 회귀 분석 + commit message | 측정 cycle |

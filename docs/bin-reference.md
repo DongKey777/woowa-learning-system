@@ -156,7 +156,7 @@ Build 후 publish 흐름:
 bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.2.tar.zst --force
 bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.2.tar.zst --verify-only
 gh release create paradigm-v2-index-v1.0.2 /tmp/paradigm-v2-index-v1.0.2.tar.zst \
-    --title "paradigm-v2 Lance index vX.Y.Z" --notes "..."
+    --title "woowa-learning-system Lance index vX.Y.Z" --notes "..."
 # 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-v1.0.2 로 업데이트
 ```
 
@@ -248,7 +248,7 @@ bin/phase9-gate
 
 ---
 
-## Phase T-X 51 신규 wrappers (2026-05-25/26)
+## Phase T-X 52 신규 wrappers (2026-05-25/26)
 
 ### Phase T — Learner automation (7)
 
@@ -257,7 +257,7 @@ bin/phase9-gate
 | `bin/learn-pr-retro --repo R [--include-bot]` | PR retrospective: recurring mentor signals + unresolved threads + timeline | p50 1.2ms |
 | `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference | p95 1.19ms (168× faster) |
 | `bin/learn-test --path build/test-results/test/` | JUnit XML → test_result events, stable event_id (idempotent) | p50 3.6ms (333× faster) |
-| `bin/learn-response-quality --source-event-id E --response-file -` | telemetry + PII redaction + citation drift detect | p95 0.16ms, drift 100%, PII 100% |
+| `bin/learn-response-quality --source-event-id E --response-file -` | telemetry + PII redaction + citation drift detect + redacted excerpt ≤5000 chars | p95 0.16ms, drift 100%, PII 100% |
 | `bin/assess-learner-state --repo R --path missions/<r>` | git + SQLite snapshot: head/working_copy/PRs/threads classified | p50 113ms (528× faster) |
 | `bin/profile-recompute` | history → v3 profile.json (mastered/uncertain/calibration/recommendations) | 10K events ≤75ms |
 | `bin/session-start --repo R --prompt P --path missions/<r>` | orchestrator: assess → recompute → daemon ask | cold 332ms, warm 4.2ms |
@@ -305,7 +305,7 @@ bin/phase9-gate
 | `bin/router-generalization-eval` | 20-fixture router accuracy |
 | `bin/learner-log-rag-eval --limit N` | Historical prompt replay drift |
 
-### Phase X — Maintenance + sub-commands (10)
+### Phase X — Maintenance + sub-commands (11)
 
 | Wrapper | Purpose |
 |---|---|

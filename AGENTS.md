@@ -120,7 +120,7 @@ python3 bin/ask "테스트"
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
 
-### 4.7 Phase U-X auto-call (2026-05-26 신설 42 wrappers)
+### 4.7 Phase U-X auto-call (2026-05-26 신설 45 wrappers)
 
 CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 
@@ -138,7 +138,7 @@ woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 484 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 498 passed 유지)
 
 ### 5.2 측정 명령
 ```bash

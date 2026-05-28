@@ -1,6 +1,6 @@
 # Learning Flow — 학습자 일상 사용 시나리오
 
-학습자가 매일 어떻게 paradigm-v2를 쓰는지 시나리오별 자세히 보여준다. 학습자는 한국어로 의도만, AI 세션이 모든 명령을 자동 실행.
+학습자가 매일 어떻게 woowa-learning-system을 쓰는지 시나리오별 자세히 보여준다. 학습자는 한국어로 의도만, AI 세션이 모든 명령을 자동 실행.
 
 ---
 
@@ -20,7 +20,7 @@ budget: 4500
 personas: MENTOR, SOCRATIC
 artifacts loaded:
   - concept_graph (3339 nodes)
-  - mastery_graph (mastered=5, proficient=2, ...)
+  - mastery_graph (events_total=0, mastered=0, proficient=0, ...; 실제 사용 후 누적)
   - rag_hits (top 5):
       1. spring/bean-di-basics — Bean DI 기초 (score 0.94)
       2. spring/ioc-di-basics — IoC와 DI (score 0.91)
@@ -43,7 +43,7 @@ Bean DI는 Spring 컨테이너가 객체를 관리하고 협력 객체를 외부
 - software-engineering/dependency-injection-basics
 ```
 
-**자동 후속**: daemon이 history.jsonl에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…]). 다음 turn의 personalization에 반영.
+**자동 후속**: daemon이 history.jsonl에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…], latency_ms=N). 다음 turn의 personalization에 반영.
 
 ---
 
@@ -108,7 +108,7 @@ python3 bin/ask "다른 크루는 이 reservation 코드를 어떻게 작성했�
 ```
 
 **daemon 응답** (mode `f11_anchor`, budget 12000, REVIEWER + MENTOR):
-- `review_anchors` (학습자 31 thread)
+- `review_anchors` (repo sync 후 생성되는 optional thread anchors)
 - `cross_crew_review_graph` (사전 빌드 parquet, top 3 by embed_cosine)
 - `mission_patterns`
 
@@ -187,7 +187,7 @@ python3 bin/ask "내 PR 흐름 보여줘" --repo spring-roomescape-member
 
 너의 spring-roomescape-member 작업 흐름 정리:
 
-학습 진척 (Bloom 레벨):
+학습 데이터가 충분히 쌓인 뒤의 예시 진척 (Bloom 레벨):
 - mastered: 5 (bean-di, ioc-di, mvc-controller, configurationproperties, transactional-self-invocation)
 - proficient: 2 (jdbc-jpa-mybatis, transaction-isolation)
 - attempted: 5 (java-optional, java-exception-handling, stream, try-with-resources, oop)
