@@ -2,7 +2,7 @@
 
 AI session auto-calls after every coach turn. Records:
 - source event id (the rag_ask / coach_run this answer responds to)
-- response summary (1-line) + redacted excerpt (≤1000 chars)
+- response summary (1-line) + redacted excerpt (≤5000 chars)
 - expected citations (from coach prompt's response_hints.citation_paths)
 - declared citations (from actual final answer's 참고: block)
 - quality flags (missing_body, citation_mismatch, tier_downgrade, …)
@@ -23,7 +23,7 @@ from pathlib import Path
 from core.state import DEFAULT_STATE_ROOT, append_history_event
 
 SCHEMA_ID = "assistant-response-quality-v1"
-EXCERPT_MAX_CHARS = 1000
+EXCERPT_MAX_CHARS = 5000
 QUALITY_LOG = "response-quality.jsonl"
 
 # PII patterns

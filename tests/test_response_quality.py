@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.response_quality import (  # noqa: E402
-    SCHEMA_ID, detect_citation_drift, record_response_quality, redact_pii,
+    EXCERPT_MAX_CHARS, SCHEMA_ID, detect_citation_drift, record_response_quality, redact_pii,
 )
 
 
@@ -132,3 +132,21 @@ def test_record_response_quality_persists_session_mode(monkeypatch, tmp_path: Pa
     event = json.loads(hist.strip())
     assert row["mode"] == "development"
     assert event["mode"] == "development"
+
+
+def test_record_response_quality_keeps_five_thousand_char_excerpt(tmp_path: Path) -> None:
+    state = tmp_path
+    (state / "learner").mkdir(parents=True)
+    body = "가" * 5500
+
+    row = record_response_quality(
+        source_event_id="ask-long",
+        response_summary="long answer",
+        response_body=body,
+        state_root=state,
+    )
+
+    assert EXCERPT_MAX_CHARS == 5000
+    assert row["response_length_chars"] == 5500
+    assert len(row["response_excerpt"]) == 5000
+    assert row["response_hash"]
