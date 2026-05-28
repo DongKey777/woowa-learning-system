@@ -2,8 +2,11 @@
 """bin/repo-readiness — per-repo capability readiness check (Phase U).
 
 Checks 4 sub-systems for a given repo:
-  archive (sqlite present + ready), mission_patterns, cross_crew (parquet),
+  archive (sqlite present + ready), mission_patterns, cross_crew readiness,
   learner-state.json recency.
+
+cross_crew is ready when the parquet exists, or when the repo currently has
+zero review anchors and therefore has no cross-crew graph to build yet.
 """
 from __future__ import annotations
 
@@ -19,6 +22,22 @@ sys.path.insert(0, str(REPO_ROOT))
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
 
 
+def _repo_anchor_count(repo: str, state_root: Path) -> int | None:
+    path = state_root / "learner" / "review_anchors.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    anchors = data.get("anchors") if isinstance(data, dict) else data
+    if not isinstance(anchors, list):
+        return None
+    return sum(1 for a in anchors
+               if isinstance(a, dict)
+               and (a.get("repo") == repo or a.get("anchor_repo") == repo))
+
+
 def assess_readiness(repo: str, state_root: Path,
                      learner_state_max_hours: float = 24) -> dict:
     base = state_root / "repos" / repo
@@ -26,10 +45,12 @@ def assess_readiness(repo: str, state_root: Path,
     mission_patterns = base / "mission_patterns.json"
     cross_crew = base / "cross_crew_review_graph.parquet"
     learner_state = base / "contexts" / "learner-state.json"
+    anchor_count = _repo_anchor_count(repo, state_root)
+    cross_crew_ready = cross_crew.exists() or anchor_count == 0
     checks = {
         "archive_present": archive.exists() and archive.stat().st_size > 0,
         "mission_patterns_built": mission_patterns.exists(),
-        "cross_crew_built": cross_crew.exists(),
+        "cross_crew_built": cross_crew_ready,
         "learner_state_fresh": False,
     }
     if learner_state.exists():
@@ -44,6 +65,8 @@ def assess_readiness(repo: str, state_root: Path,
         "repo": repo, "checks": checks, "passed": passed, "total": len(checks),
         "ready": passed == len(checks),
         "missing": [k for k, v in checks.items() if not v],
+        "cross_crew_anchor_count": anchor_count,
+        "cross_crew_not_applicable": anchor_count == 0 and not cross_crew.exists(),
     }
 
 

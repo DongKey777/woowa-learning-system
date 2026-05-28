@@ -106,7 +106,20 @@ bin/rag-daemon ping
 # {"alive": true, "ts": ...}
 ```
 
-### Step 5 — Mission patterns / cross-crew 사전 빌드 (선택)
+### Step 5 — Mission onboarding으로 자연스럽게 연결
+
+학습자가 *"미션 시작하자"*, *"내 PR 보자"*, *"<repo> 분석"* 같은 의도를 말하면 AI 세션이 repo 이름과 학습자 GitHub login을 추론해서 다음을 자동 실행한다.
+
+```bash
+bin/onboard-repo --repo <repo-name> --learner-login <login> --silent
+bin/repo-readiness --repo <repo-name>
+```
+
+`bin/onboard-repo`는 내부적으로 clone 필요 여부 확인 → archive 수집 → mission patterns → review anchors → cross-crew build 순서로 진행한다.
+
+새 미션이라 아직 리뷰 앵커가 0개면 cross-crew graph는 만들 대상이 없으므로 실패가 아니라 `cross_crew_not_applicable=true`로 처리한다. 이 경우에도 archive, mission patterns, learner-state가 준비되면 `repo-readiness`는 ready 4/4가 된다.
+
+개별로 재실행해야 할 때의 하위 명령:
 
 학습자가 미션 repo 준비 후:
 

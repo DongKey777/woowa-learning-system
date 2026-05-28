@@ -219,7 +219,7 @@ def compose(
 
 def _system_header(route: RouteDecision) -> str:
     return (
-        "# Woowa Learning Hub v2 — Coach prompt\n"
+        "# Woowa Learning System — Coach prompt\n"
         f"**mode**: `{route.mode}` (reason: {route.reason}, conf={route.confidence:.2f})\n"
         f"**token budget**: {route.budget_tokens} (avg ≤5K, F11 ≤15K)"
     )

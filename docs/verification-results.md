@@ -6,7 +6,7 @@
 
 ## 1. 한 줄 요약
 
-Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **499 passed**다.
+Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **501 passed**다.
 
 ## 1.1 Latest Y14 Snapshot
 
@@ -15,7 +15,7 @@ Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prer
 | Corpus concepts / graph | **3339 concepts / 6172 prereq edges / broken 0** | `corpus/concept_graph.json`, `bin/learning-path-graph-audit` |
 | Y14 qrels prompt/reformulated | **14/14 sets top1=1.000, top5=1.000, forbidden=0, max p95=3.6ms** | `reports/y14_batch1_7_qrels_eval.json` |
 | rag_quality top1 / NDCG@5 / p95 | **1.000 / 1.000 / 1.6ms** | `reports/rag_quality_regression.json` |
-| pytest | **499 passed** | local `python3 -m pytest tests/ -q` |
+| pytest | **501 passed** | local `python3 -m pytest tests/ -q` |
 | corpus rebuild readiness | **ready=true, rebuild_needed=false, 0 wrong exact owners** | `reports/corpus_rebuild_readiness.json` |
 | index archive | **v1.0.2, 18.7MB, sidecars=true, SHA256 d8da5782...** | `state/index.tar.zst`, `bin/index-pack --verify-only` |
 | remote build | **H100 secure, encode 9.2s, Lance 13.40MB** | `bin/rag-remote-build --commit-sha fd42dba7dd0a2beb4bfd0b1bc9133bf5547d18ca` |
@@ -40,6 +40,16 @@ Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prer
 | historical prewarm total-to-first-answer baseline | **43933.6ms** | archived historical baseline report |
 
 Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file=...)` fast path로 대체했다. AutoTokenizer rollback은 `WOOWA_ENCODER_TOKENIZER_BACKEND=auto`이며, parity report는 input ids/masks 동일 + vector cosine min/mean **1.0/1.0**, max_abs_diff **0.0**이다. Y13-K6에서는 qrels strict 지표와 learner-relevant 지표를 분리하고, AF_UNIX line-delimited protocol에서 불필요한 client `shutdown(SHUT_WR)`를 제거했다. Y13-K7~K18에서는 lexical/title promotion, executable `bin/ask` fast path, search-result cache, override keyword routing, F11 Stage 4 veto prompt, exact normalization, corpus ownership 보강, remote-build provenance guard, latency hardening, corpus readiness gate, stale gold 정정, index archive verification을 순차 적용했다. 최종 qrels strict top1/learner top1/MRR은 **1.000/1.000/1.000**, NDCG@5는 **0.987**, p50/p95는 **176.1/278.6ms**다. 최신 14개 일반 시나리오 p50/p95는 **48.8/71.5ms**다.
+
+## 1.3 Latest Fresh Onboarding Snapshot
+
+| 축 | 최신 결과 | Report |
+|---|---:|---|
+| Fresh clone live smoke | **bootstrap healthy, daemon alive, doctor 6/6, ask OK** | manual fresh clone live probe |
+| Fresh-state automation | **10/10 pass** | `reports/phase_y8_fresh_clone_sim.json` |
+| Phase U onboarding wrappers | **10/10 pass** | `reports/phase_u_wrappers_bench.json` |
+| New mission readiness without anchors | **ready 4/4, cross_crew_not_applicable=true** | `bin/repo-readiness --repo spring-roomescape-waiting` |
+| Existing mission readiness | **ready 4/4** | `bin/repo-readiness --repo spring-roomescape-member` |
 
 ## 2. Historical Phase Results
 
@@ -148,7 +158,7 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 cd /Users/idonghun/IdeaProjects/woowa-learning-system
 export WOOWA_SESSION_MODE=development
 
-# 1. Unit tests (latest 499 passed)
+# 1. Unit tests (latest 501 passed)
 python3 -m pytest tests/ -q
 
 # 2. All 14 phase benches (J/K/L/M/N/P + T-X) via master runner

@@ -72,7 +72,7 @@ def test_default_mode_keeps_markdown_with_comments():
     assert rc == 0
     lines = out.splitlines()
     assert any(l.startswith("# response_hints: ") for l in lines)
-    assert any("Woowa Learning Hub v2" in l for l in lines)
+    assert any("Woowa Learning System" in l for l in lines)
     # JSON one-line mode would not include the markdown header.
 
 
