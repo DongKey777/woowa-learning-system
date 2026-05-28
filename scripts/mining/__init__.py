@@ -6,5 +6,5 @@ cohort-eval, cohort-compare, golden, rag-eval, router-generalization-eval,
 learner-log-rag-eval.
 
 All wrappers stream JSONL (no SQL) — paradigm-v2 stores observability in
-state/learner/{history,response-quality}.jsonl + state/cs_rag/feedback.jsonl.
+state/learner/{history,response-quality,feedback}.jsonl.
 """

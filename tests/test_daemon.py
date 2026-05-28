@@ -7,6 +7,7 @@ resolution + payload construction logic that doesn't require BGE-M3 load.
 from __future__ import annotations
 
 import json
+import inspect
 import sys
 from pathlib import Path
 from unittest.mock import Mock
@@ -67,6 +68,16 @@ def test_search_can_request_learner_profile_personalization(monkeypatch, tmp_pat
 def test_ask_returns_none_when_socket_missing(tmp_path: Path) -> None:
     result = daemon.ask("test prompt", state_root=tmp_path)
     assert result is None
+
+
+def test_rag_ask_event_records_learner_identity_and_repo() -> None:
+    src = inspect.getsource(daemon.serve)
+    assert '"event_type": "rag_ask"' in src
+    assert 'if learner_id == "default":' in src
+    assert 'learner_id = resolve_learner_login(state_root)' in src
+    assert '"learner_id": learner_id' in src
+    assert '"repo": repo' in src
+    assert '"top_concept_ids": list(response_hints["citation_paths"])' in src
 
 
 def test_render_ask_stdout_matches_cli_text_shape() -> None:

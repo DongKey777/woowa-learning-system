@@ -27,6 +27,19 @@ def _run(cmd, timeout=30):
     return r.returncode, r.stdout, (time.perf_counter() - t0) * 1000
 
 
+def _seed_identity(state_root: Path, learner_id: str = "BenchLearner") -> None:
+    learner = state_root / "learner"
+    learner.mkdir(parents=True, exist_ok=True)
+    (learner / "identity.json").write_text(
+        json.dumps({
+            "github_login": learner_id,
+            "learner_id": learner_id,
+            "source": "benchmark_fixture",
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def measure():
     PY = sys.executable
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True).strip()
@@ -52,6 +65,7 @@ def measure():
 
     # X3 learn-feedback (helpful signal, isolated tmpstate)
     with tempfile.TemporaryDirectory() as tmp:
+        _seed_identity(Path(tmp))
         rc, _, ms = _run([PY, "bin/learn-feedback", "--signal", "helpful",
                            "--hit", "spring/bean-di.md", "--note", "good",
                            "--state-root", tmp, "--silent"])
@@ -60,7 +74,7 @@ def measure():
 
     # X4 learn-self-assess (no pending → reject expected, rc=1)
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "learner").mkdir(parents=True)
+        _seed_identity(Path(tmp))
         rc, _, ms = _run([PY, "bin/learn-self-assess", "--trigger-session-id",
                            "nope", "--score", "8", "--state-root", tmp, "--silent"])
         results["learn_self_assess_reject"] = {"rc": rc, "ms": round(ms, 1),

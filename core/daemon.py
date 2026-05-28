@@ -68,7 +68,6 @@ def search(
     except (OSError, json.JSONDecodeError):
         return None
 
-
 def ask(
     prompt: str,
     repo: str | None = None,
@@ -83,6 +82,9 @@ def ask(
     sp = _socket_path(state_root)
     if not sp.exists():
         return None
+    if learner_id == "default":
+        from core.identity import resolve_learner_login
+        learner_id = resolve_learner_login(state_root)
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(DAEMON_TIMEOUT)
@@ -106,7 +108,6 @@ def ask(
         return json.loads(data.decode("utf-8").strip())
     except (OSError, json.JSONDecodeError):
         return None
-
 
 def _render_ask_stdout(resp: dict, json_route: bool = False) -> str:
     lines: list[str] = []
@@ -302,6 +303,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
 
         rag_search = search_future.result()
         from core.coach import compose
+        from core.identity import resolve_learner_login
         from core.lexical_fusion import make_lexical_fusion_fn
         from core.lazy_loader import (
             _hits_to_dicts,
@@ -380,10 +382,11 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         payload["personalization"] = personalization
                     conn.sendall(json.dumps(payload, ensure_ascii=False).encode() + b"\n")
                 elif action in ("ask", "ask_text"):
-                    # Full ask pipeline in daemon — bin/ask becomes thin socket client
                     prompt = req["query"]
                     repo = req.get("repo")
                     learner_id = req.get("learner_id", "default")
+                    if learner_id == "default":
+                        learner_id = resolve_learner_login(state_root)
                     event_mode = req.get("mode") or os.environ.get(
                         "WOOWA_SESSION_MODE", "learning")
                     profile = load_profile(learner_id, state_root=state_root)
@@ -520,14 +523,13 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         state_root=state_root,
                         learner_context=derived_context,
                     )
-                    # Append turn event with effective_route (post-downgrade) so
-                    # downstream telemetry (response-quality-mine, routing-analyze)
-                    # sees the same mode the AI session was instructed to answer in.
                     event = {
                         "event_id": event_id,
                         "ts": time.time(),
                         "event_type": "rag_ask",
                         "mode": event_mode,
+                        "learner_id": learner_id,
+                        "repo": repo,
                         "payload": {
                             "prompt": prompt,
                             "repo": repo,
@@ -537,7 +539,6 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             "reformulation_source": (
                                 reformulation.source if reformulation else None
                             ),
-                            # I2: history aligns with hints (downgrade → []).
                             "top_concept_ids": list(response_hints["citation_paths"]),
                         },
                     }

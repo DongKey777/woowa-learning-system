@@ -26,7 +26,7 @@ bin/ask "<prompt>" [--repo R] [--learner-id L] [--json-route] [--no-daemon] [--s
 
 옵션:
 - `--repo R`: 학습자 mission repo 지정 (coaching/retro/F11 모드 트리거 가능)
-- `--learner-id L`: learner identifier (default `default`)
+- `--learner-id L`: learner identifier (omitted이면 `state/learner/identity.json`에서 자동 해석)
 - `--json-route`: stdout 첫 줄에 `# RouteDecision: {...}` 표기 (디버그)
 - `--no-daemon`: daemon 우회, in-process pipeline (cold ~30s, debug/CI)
 - `--state-root PATH`: 다른 state dir 지정 (테스트용)
@@ -292,7 +292,7 @@ bin/phase9-gate
 
 | Wrapper | Purpose |
 |---|---|
-| `bin/feedback-mine` | feedback.jsonl helpful/not_helpful distribution |
+| `bin/feedback-mine` | `state/learner/feedback.jsonl` helpful/not_helpful distribution |
 | `bin/response-quality-mine` | response-quality.jsonl flag + citation analysis |
 | `bin/routing-analyze` | rag_ask router_mode + reason histogram |
 | `bin/learning-turn-audit --last N` | Per-event integrity + response-quality join |

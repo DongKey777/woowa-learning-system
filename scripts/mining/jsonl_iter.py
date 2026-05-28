@@ -73,7 +73,8 @@ def _row_timestamp(row: dict) -> float | None:
 def iter_jsonl(path: Path, since_ts: float | None = None,
                 event_type: str | None = None,
                 mode: str | None = None,
-                limit: int | None = None) -> Iterator[dict]:
+                limit: int | None = None,
+                exclude_modes: tuple[str, ...] = ()) -> Iterator[dict]:
     """Stream JSONL with optional filters."""
     if not path.exists():
         return
@@ -91,6 +92,8 @@ def iter_jsonl(path: Path, since_ts: float | None = None,
                 continue
             if mode is not None and ev.get("mode") != mode:
                 continue
+            if exclude_modes and ev.get("mode") in exclude_modes:
+                continue
             if since_ts is not None:
                 row_ts = _row_timestamp(ev)
                 if row_ts is None or row_ts < since_ts:
@@ -107,3 +110,18 @@ def sample_jsonl(path: Path, n: int, seed: int = 0, **filters) -> list[dict]:
     if n >= len(pool):
         return pool
     return random.Random(seed).sample(pool, n)
+
+
+def is_fixture_or_demo_row(row: dict) -> bool:
+    """Return True for rows that should not drive learner-quality mining."""
+    learner_id = row.get("learner_id")
+    if learner_id in {None, "multi-turn-test", "fixture", "demo"}:
+        return True
+    if row.get("source_event_id") == "demo-event":
+        return True
+    return False
+
+
+def is_backfilled(row: dict) -> bool:
+    """Rows with inferred provenance should be visible in audit outputs."""
+    return bool(row.get("_backfilled_from") or row.get("_canonical_id_source"))

@@ -17,6 +17,17 @@ _ask_json_value() {
   fi
 }
 
+_ask_identity_from_state_root() {
+  identity_file="$1/learner/identity.json"
+  [ -r "$identity_file" ] || return 1
+  learner_id="$(sed -n 's/.*"learner_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file" | head -n 1)"
+  if [ -z "$learner_id" ]; then
+    learner_id="$(sed -n 's/.*"github_login"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file" | head -n 1)"
+  fi
+  [ -n "$learner_id" ] || return 1
+  printf '%s' "$learner_id"
+}
+
 _ask_fast() {
   [ "$#" -gt 0 ] || return 1
   case "$1" in -h|--help|-*) return 1 ;; esac
@@ -24,7 +35,7 @@ _ask_fast() {
 
   prompt="$1"
   repo=""
-  learner_id="default"
+  learner_id=""
   state_root=""
   reformulated_query=""
   json_mode=0
@@ -43,18 +54,23 @@ _ask_fast() {
     esac
   done
 
-  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
-    _ask_json_safe "$value" || return 1
-  done
-
   if [ -n "$state_root" ]; then
     sock_path="$state_root/rag-daemon.sock"
+    identity_root="$state_root"
   else
     script_dir="${0%/*}"
     [ "$script_dir" = "$0" ] && script_dir="."
     repo_root="$(cd "$script_dir/.." 2>/dev/null && pwd)" || return 1
-    sock_path="$repo_root/state/rag-daemon.sock"
+    identity_root="$repo_root/state"
+    sock_path="$identity_root/rag-daemon.sock"
   fi
+  if [ -z "$learner_id" ]; then
+    learner_id="$(_ask_identity_from_state_root "$identity_root" 2>/dev/null || printf default)"
+  fi
+
+  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
+    _ask_json_safe "$value" || return 1
+  done
   [ -S "$sock_path" ] || return 1
 
   if [ "$json_mode" -eq 1 ]; then
@@ -87,6 +103,7 @@ import socket
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 DEFAULT_SOCK = os.path.join(REPO_ROOT, "state", "rag-daemon.sock")
 TIMEOUT_S = 30
 
@@ -97,7 +114,7 @@ def parse_argv(argv):
         print("Usage: bin/ask <prompt> [--repo R] [--learner-id L] [--json-route] [--no-daemon]",
               file=sys.stderr)
         return None
-    out = {"prompt": argv[0], "repo": None, "learner_id": "default",
+    out = {"prompt": argv[0], "repo": None, "learner_id": None,
            "json_route": False, "no_daemon": False, "state_root": None,
            "json_mode": False, "reformulated_query": None}
     i = 1
@@ -177,6 +194,12 @@ def main(argv=None):
     args = parse_argv(argv if argv is not None else sys.argv[1:])
     if args is None:
         return 2
+    if args["learner_id"] is None:
+        from pathlib import Path
+        from core.identity import resolve_learner_login
+
+        state_root = Path(args["state_root"]) if args["state_root"] else Path(REPO_ROOT) / "state"
+        args["learner_id"] = resolve_learner_login(state_root)
 
     # Daemon fast-path
     if not args["no_daemon"]:

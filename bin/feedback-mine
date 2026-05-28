@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bin/feedback-mine — mine learn-feedback signals (Phase W1).
 
-Aggregates state/cs_rag/feedback.jsonl (helpful/not_helpful/unclear).
+Aggregates state/learner/feedback.jsonl (helpful/not_helpful/unclear).
 Currently `bin/learn-feedback` (Phase X3) generates this file — empty
 until learner provides explicit feedback. Mine wrapper works on empty too.
 """
@@ -17,7 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
-from scripts.mining.jsonl_iter import iter_jsonl, parse_since_ts  # noqa: E402
+from scripts.mining.jsonl_iter import (  # noqa: E402
+    is_backfilled,
+    is_fixture_or_demo_row,
+    iter_jsonl,
+    parse_since_ts,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,19 +35,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    path = args.state_root / "cs_rag" / "feedback.jsonl"
+    path = args.state_root / "learner" / "feedback.jsonl"
     try:
         since_ts = parse_since_ts(args.since)
     except ValueError as exc:
         parser.error(str(exc))
 
     total = 0
+    skipped_fixture_or_demo = 0
+    backfilled_n = 0
     signal_counter: Counter = Counter()
     doc_counter_neg: Counter = Counter()
     doc_counter_pos: Counter = Counter()
 
-    for r in iter_jsonl(path, since_ts=since_ts):
+    for r in iter_jsonl(
+        path,
+        since_ts=since_ts,
+        exclude_modes=("development", "test"),
+    ):
+        if is_fixture_or_demo_row(r):
+            skipped_fixture_or_demo += 1
+            continue
         total += 1
+        backfilled_n += int(is_backfilled(r))
         signal_counter[r.get("signal", "?")] += 1
         for d in r.get("doc_paths", []) or []:
             if r.get("signal") == "not_helpful":
@@ -55,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
         "since": args.since,
         "since_ts": since_ts,
         "total_signals": total,
+        "rows_backfilled_n": backfilled_n,
+        "rows_original_n": total - backfilled_n,
+        "rows_skipped_fixture_or_demo_n": skipped_fixture_or_demo,
         "signals_by_type": dict(signal_counter),
         "top_not_helpful_docs": [{"doc": d, "n": n}
                                   for d, n in doc_counter_neg.most_common(args.top_n)],

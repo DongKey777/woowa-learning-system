@@ -35,21 +35,38 @@ def _run_json(*args: str) -> dict:
 def test_feedback_mine_since_filters_recent_rows(tmp_path: Path) -> None:
     now = time.time()
     state_root = tmp_path / "state"
-    _write_jsonl(state_root / "cs_rag" / "feedback.jsonl", [
+    _write_jsonl(state_root / "learner" / "feedback.jsonl", [
         {
             "logged_at": now - 10 * 86400,
             "signal": "not_helpful",
             "doc_paths": ["old/doc"],
+            "learner_id": "DongKey777",
         },
         {
             "logged_at": now - 3600,
             "signal": "helpful",
             "doc_paths": ["recent/helpful"],
+            "learner_id": "DongKey777",
         },
         {
             "logged_at": now - 120,
             "signal": "not_helpful",
             "doc_paths": ["recent/not-helpful"],
+            "learner_id": "DongKey777",
+        },
+        {
+            "logged_at": now - 60,
+            "signal": "not_helpful",
+            "doc_paths": ["fixture/ignored"],
+            "learner_id": "default",
+            "source_event_id": "demo-event",
+        },
+        {
+            "logged_at": now - 30,
+            "mode": "development",
+            "signal": "helpful",
+            "doc_paths": ["dev/ignored"],
+            "learner_id": "DongKey777",
         },
     ])
 
@@ -62,6 +79,7 @@ def test_feedback_mine_since_filters_recent_rows(tmp_path: Path) -> None:
     assert out["since"] == "7d"
     assert out["since_ts"] is not None
     assert out["total_signals"] == 2
+    assert out["rows_skipped_fixture_or_demo_n"] == 1
     assert out["signals_by_type"] == {"helpful": 1, "not_helpful": 1}
     assert out["top_helpful_docs"] == [{"doc": "recent/helpful", "n": 1}]
     assert out["top_not_helpful_docs"] == [{"doc": "recent/not-helpful", "n": 1}]
@@ -76,18 +94,37 @@ def test_response_quality_mine_since_filters_recent_rows(tmp_path: Path) -> None
             "quality_flags": ["citation_mismatch"],
             "citation_paths_expected": ["old/expected"],
             "citation_paths_declared": ["old/declared"],
+            "learner_id": "DongKey777",
         },
         {
             "logged_at": now - 3600,
             "quality_flags": ["missing_citation"],
             "citation_paths_expected": ["recent/expected"],
             "citation_paths_declared": [],
+            "learner_id": "DongKey777",
         },
         {
             "logged_at": now - 120,
             "quality_flags": ["missing_response_body"],
             "citation_paths_expected": ["recent/expected"],
             "citation_paths_declared": ["recent/declared"],
+            "learner_id": "DongKey777",
+        },
+        {
+            "logged_at": now - 60,
+            "quality_flags": ["missing_response_body"],
+            "citation_paths_expected": ["fixture/ignored"],
+            "citation_paths_declared": [],
+            "learner_id": "default",
+            "source_event_id": "demo-event",
+        },
+        {
+            "logged_at": now - 30,
+            "mode": "development",
+            "quality_flags": ["missing_response_body"],
+            "citation_paths_expected": ["dev/ignored"],
+            "citation_paths_declared": [],
+            "learner_id": "DongKey777",
         },
     ])
 
@@ -100,6 +137,7 @@ def test_response_quality_mine_since_filters_recent_rows(tmp_path: Path) -> None
     assert out["since"] == "7d"
     assert out["since_ts"] is not None
     assert out["rows_total"] == 2
+    assert out["rows_skipped_fixture_or_demo_n"] == 1
     assert out["missing_body_n"] == 1
     assert out["citation_drift_n"] == 1
     assert out["flag_counts"] == {"missing_citation": 1, "missing_response_body": 1}

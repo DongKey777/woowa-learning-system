@@ -72,7 +72,7 @@ def _measure_runs(cmd, *, runs=5, timeout=30):
 
 def _seed_mining_state(root: Path, *, rows: int = 1000) -> None:
     now = time.time()
-    feedback_path = root / "cs_rag" / "feedback.jsonl"
+    feedback_path = root / "learner" / "feedback.jsonl"
     quality_path = root / "learner" / "response-quality.jsonl"
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
     quality_path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +85,7 @@ def _seed_mining_state(root: Path, *, rows: int = 1000) -> None:
         signal = "helpful" if i % 4 == 0 else "not_helpful"
         feedback_rows.append({
             "logged_at": logged_at,
+            "learner_id": "DongKey777",
             "signal": signal,
             "doc_paths": [f"doc/{i % 25}"],
         })
@@ -96,6 +97,7 @@ def _seed_mining_state(root: Path, *, rows: int = 1000) -> None:
             flags.append("missing_citation")
         quality_rows.append({
             "logged_at": logged_at,
+            "learner_id": "DongKey777",
             "quality_flags": flags,
             "citation_paths_expected": [f"expected/{i % 20}"],
             "citation_paths_declared": [f"declared/{i % 20}"] if i % 7 else [],

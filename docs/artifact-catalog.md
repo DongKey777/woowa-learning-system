@@ -89,6 +89,8 @@ state/
 ├── learner/
 │   ├── profile.json               # mastered/uncertain/drill_due/pending_triggers
 │   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)
+│   ├── feedback.jsonl             # explicit helpful/not_helpful/unclear learner feedback
+│   ├── response-quality.jsonl     # answer telemetry joined by source_event_id
 │   ├── mastery_graph.sqlite       # Bloom autoloop state (mastery table + evidence table)
 │   ├── drill_pending.json         # 1 open drill offer (or absent)
 │   ├── drill_due.json             # spaced repetition due list
@@ -123,7 +125,7 @@ CREATE TABLE evidence (
 ### `history.jsonl` event types
 | event_type | mode | payload 필드 |
 |---|---|---|
-| `rag_ask` | learning/development | prompt, repo, router_mode, router_reason, top_concept_ids |
+| `rag_ask` | learning/development | top-level learner_id/repo + prompt, repo, router_mode, router_reason, top_concept_ids |
 | `code_attempt` | learning | file_path, concept_ids, lines_added, lines_removed, summary, linked_test |
 | `drill_answer` | learning | drill_session_id, concept_ids, score, level, dimensions, answer_preview |
 | `self_assessment` | learning | trigger_session_id, score, concept_ids |
@@ -133,7 +135,7 @@ CREATE TABLE evidence (
 ### `profile.json` shape
 ```json
 {
-  "learner_id": "default",
+  "learner_id": "DongKey777",
   "mastered_concepts": ["spring/bean-di-basics", ...],
   "uncertain_concepts": ["language/java-optional-basics", ...],
   "drill_due": [{"concept_id": "...", "next_due_ts": ..., "level": "weak"}, ...],
