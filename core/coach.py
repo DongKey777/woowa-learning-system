@@ -126,24 +126,26 @@ def _build_response_quality_hint(
     expected_citation_paths: list[str],
     state_root: Path | None,
 ) -> dict | None:
-    """Build the response_quality_hint sibling. Returns None for cold paths
-    (no source_event_id available — bin/ask --no-daemon)."""
+    """Build response_quality_hint; None on cold paths with no event id."""
     if source_event_id is None:
         return None
-    cmd = (
-        f"bin/learn-response-quality --source-event-id {source_event_id} "
-        f"--minimal --silent"
-    )
-    if state_root is not None and Path(state_root) != Path(DEFAULT_STATE_ROOT):
-        cmd += f" --state-root {shlex.quote(str(state_root))}"
+    expected_args = " ".join(f"--expected-citation {shlex.quote(p)}"
+                             for p in expected_citation_paths)
+    citation_args = f" {expected_args}" if expected_args else ""
+    state_root_arg = (f" --state-root {shlex.quote(str(state_root))}"
+                      if state_root is not None
+                      and Path(state_root) != Path(DEFAULT_STATE_ROOT) else "")
+    cmd = (f"bin/learn-response-quality --source-event-id {source_event_id} "
+           f"--response-file -{citation_args} --silent{state_root_arg}")
     return {
         "command_template": cmd,
         "wrapper_cmd": cmd,
         "source_event_id": source_event_id,
         "expected_citation_paths": list(expected_citation_paths),
-        "obligation": "AI MUST invoke after answer",
+        "body_required": True,
+        "declared_citations": "auto-extracted from response body 참고 block when omitted",
+        "obligation": "AI MUST pipe the final learner-facing answer body after answer",
     }
-
 
 def compose(
     route: RouteDecision,

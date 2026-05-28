@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -150,3 +151,36 @@ def test_record_response_quality_keeps_five_thousand_char_excerpt(tmp_path: Path
     assert row["response_length_chars"] == 5500
     assert len(row["response_excerpt"]) == 5000
     assert row["response_hash"]
+
+
+def test_learn_response_quality_cli_derives_summary_and_citations(tmp_path: Path) -> None:
+    state = tmp_path
+    body = (
+        "[Mode: cs_qa]\n\n"
+        "락은 동시에 같은 데이터를 바꿀 때 순서를 보장하는 장치야.\n\n"
+        "참고:\n"
+        "- database/lock-basics\n"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-cli",
+            "--response-file", "-",
+            "--expected-citation", "database/lock-basics",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["response_length_chars"] == len(body)
+    assert row["response_summary"].startswith("락은 동시에")
+    assert row["citation_paths_declared"] == ["database/lock-basics"]
+    assert "missing_response_body" not in row["quality_flags"]
+    assert "missing_citation" not in row["quality_flags"]

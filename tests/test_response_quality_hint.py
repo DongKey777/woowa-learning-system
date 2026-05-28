@@ -2,7 +2,8 @@
 
 daemon emits a top-level `response_quality_hint` so the AI session knows
 which `bin/learn-response-quality --source-event-id …` to invoke after the
-turn (Phase Y10 introduced --minimal mode; Y11 surfaces the trigger).
+turn. The default command must capture the final answer body; --minimal is
+kept only as an explicit fallback.
 """
 from __future__ import annotations
 
@@ -40,8 +41,12 @@ def test_quality_hint_present_with_event_id():
     assert rq["source_event_id"] == "ask-12345"
     assert "bin/learn-response-quality" in rq["command_template"]
     assert "--source-event-id ask-12345" in rq["command_template"]
-    assert "--minimal" in rq["command_template"]
+    assert "--response-file -" in rq["command_template"]
+    assert "--minimal" not in rq["command_template"]
+    assert "--expected-citation spring/di" in rq["command_template"]
     assert "--silent" in rq["command_template"]
+    assert rq["body_required"] is True
+    assert "minimal_fallback_cmd" not in rq
     # expected_citation_paths mirrors hints.citation_paths
     assert rq["expected_citation_paths"] == hints["citation_paths"]
 

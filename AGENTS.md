@@ -115,7 +115,7 @@ python3 bin/ask "테스트"
 | *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
 | 학습자 미션 Java 파일 Write/Edit | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` |
 | `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
-| 매 coach turn 답변 직후 | `bin/learn-response-quality --source-event-id <id> --response-summary "<요약>" --response-file - --silent` |
+| 매 coach turn 답변 직후 | `bin/learn-response-quality --source-event-id <id> --response-file - --silent` (최종 답변 본문 stdin; summary/declared citation 자동 추출) |
 | 미션 repo onboarded 후 첫 진입 | `bin/assess-learner-state --repo <r> --path missions/<r> --silent` |
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
@@ -138,7 +138,7 @@ woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 501 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 502 passed 유지)
 
 ### 5.2 측정 명령
 ```bash

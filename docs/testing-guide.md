@@ -7,7 +7,7 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 python3 -m pytest tests/ -q
 ```
 
-현재 **501 passed**. 최신 regression 기준 pytest runtime은 65.25초.
+현재 **502 passed**. 최신 regression 기준 pytest runtime은 26.31초.
 
 주요 test 모듈:
 - `test_router.py` — 7 mode dispatch
@@ -20,7 +20,7 @@ python3 -m pytest tests/ -q
 - `test_peer_pr.py` — peer PR analysis
 - `test_phase8_code_metrics.py` — LOC budget + entry point count
 
-회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 501 passed 유지 확인.
+회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 502 passed 유지 확인.
 
 ---
 
@@ -213,5 +213,5 @@ sqlite3 state/learner/mastery_graph.sqlite \
 기대:
 - ping: `{"alive": true}`
 - ask: `[Mode: cs_qa]` markdown 응답
-- pytest: `501 passed`
+- pytest: `502 passed`
 - mastery: reset 직후는 empty 가능, 실제 learning/code/drill event 누적 후 attempted/proficient/mastered가 생김

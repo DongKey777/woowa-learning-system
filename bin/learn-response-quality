@@ -3,12 +3,16 @@
 
 AI session auto-calls after every coach turn answer.
 
-Full mode (legacy):
+Full mode:
   bin/learn-response-quality --source-event-id <id> --response-summary "..." \\
      --response-file - --expected-citation <c1> --declared-citation <c2> \\
      --quality-flag <flag> --silent
 
-Minimal mode (Phase Y10 — recommended for low-friction auto-call):
+  If --response-summary is omitted but a body is supplied, a short summary is
+  derived from the body. If --declared-citation is omitted, citations are
+  extracted from the body's final `참고:` block.
+
+Minimal mode (fallback only):
   bin/learn-response-quality --source-event-id <id> --minimal --silent
   → response_summary auto-filled, body skipped (missing_response_body flag),
     expected/declared citations auto-extracted from source rag_ask event's
@@ -26,9 +30,31 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from core.response import parse_response  # noqa: E402
 from core.response_quality import record_response_quality  # noqa: E402
 from core.identity import resolve_learner_login  # noqa: E402
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _derive_summary(body: str | None) -> str:
+    if not body:
+        return "auto-recorded full response"
+    candidate_lines: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("# response_"):
+            continue
+        if line.startswith("[Mode:"):
+            continue
+        if line == "참고:" or line.startswith("- "):
+            continue
+        candidate_lines.append(line)
+        if len(" ".join(candidate_lines)) >= 120:
+            break
+    summary = " ".join(candidate_lines) or "auto-recorded full response"
+    return " ".join(summary.split())[:300]
 
 
 def _read_response(args) -> str | None:
@@ -78,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-event-id", required=True)
     parser.add_argument("--response-summary", default=None,
-                        help="required unless --minimal (then auto-filled)")
+                        help="optional when --response-file/--response-text "
+                             "is supplied; derived from body if omitted")
     parser.add_argument("--response-file", default=None,
                         help="path or '-' for stdin")
     parser.add_argument("--response-text", default=None,
@@ -120,16 +147,16 @@ def main(argv: list[str] | None = None) -> int:
         # body intentionally skipped — missing_response_body flag will fire
         body = None
     else:
-        if args.response_summary is None:
-            print("ERROR: --response-summary required (or use --minimal)",
-                  file=sys.stderr)
-            return 2
         body = _read_response(args)
         if body is None and not args.summary_only:
             print("ERROR: --response-file or --response-text required "
                   "(or --summary-only or --minimal)",
                   file=sys.stderr)
             return 2
+        if args.response_summary is None:
+            args.response_summary = _derive_summary(body)
+        if body and not args.declared_citation:
+            args.declared_citation = parse_response(body).citations
 
     row = record_response_quality(
         source_event_id=args.source_event_id,
