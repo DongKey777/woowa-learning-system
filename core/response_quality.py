@@ -2,11 +2,10 @@
 
 AI session auto-calls after every coach turn. Records:
 - source event id (the rag_ask / coach_run this answer responds to)
-- response summary (1-line) + redacted excerpt (≤5000 chars)
+- response summary + exact final-answer redacted excerpt (≤5000 chars)
 - expected citations (from coach prompt's response_hints.citation_paths)
 - declared citations (from actual final answer's 참고: block)
-- quality flags (missing_body, citation_mismatch, tier_downgrade, …)
-
+- quality/contract flags (missing_body, citation_mismatch, possible_summary_body, …)
 PII redaction: emails / Bearer tokens / API keys / phone numbers replaced
 with placeholder before excerpt is stored.
 """

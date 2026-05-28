@@ -184,3 +184,65 @@ def test_learn_response_quality_cli_derives_summary_and_citations(tmp_path: Path
     assert row["citation_paths_declared"] == ["database/lock-basics"]
     assert "missing_response_body" not in row["quality_flags"]
     assert "missing_citation" not in row["quality_flags"]
+
+
+def test_learn_response_quality_cli_flags_summary_like_body(tmp_path: Path) -> None:
+    state = tmp_path
+    body = (
+        "[Mode: cs_qa]\n\n"
+        "학습자 답 invariant 보호 측면 정답 인정. 간접 lock 패턴을 추가 설명.\n\n"
+        "참고:\n"
+        "- database/lock-basics\n"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-short",
+            "--response-file", "-",
+            "--expected-citation", "database/lock-basics",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["response_length_chars"] == len(body)
+    assert "possible_summary_body" in row["contract_flags"]
+
+
+def test_learn_response_quality_cli_full_body_has_no_summary_flag(tmp_path: Path) -> None:
+    state = tmp_path
+    paragraph = (
+        "락은 동시에 같은 데이터를 바꿀 때 순서를 보장하는 장치야. "
+        "reservation row를 FOR UPDATE로 잡으면 예약 자체가 사라지지 않도록 "
+        "보호하면서, 같은 슬롯 대기 등록을 시도하는 여러 트랜잭션이 같은 row "
+        "앞에서 차례대로 줄 서게 된다. 그래서 이 row는 domain invariant를 "
+        "보호하는 대상이면서 동시에 guard row 또는 간접 mutex 역할을 한다. "
+    )
+    body = "[Mode: cs_qa]\n\n" + paragraph * 3 + "\n참고:\n- database/lock-basics\n"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-full",
+            "--response-file", "-",
+            "--expected-citation", "database/lock-basics",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["response_length_chars"] == len(body)
+    assert "possible_summary_body" not in row["contract_flags"]

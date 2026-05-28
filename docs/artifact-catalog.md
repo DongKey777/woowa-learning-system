@@ -90,7 +90,7 @@ state/
 │   ├── profile.json               # v3 profile: concepts/activity/calibration/recommendations
 │   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)
 │   ├── feedback.jsonl             # explicit helpful/not_helpful/unclear learner feedback
-│   ├── response-quality.jsonl     # answer telemetry: redacted excerpt ≤5000 chars + hash/length, joined by source_event_id
+│   ├── response-quality.jsonl     # final answer telemetry: redacted excerpt ≤5000 chars + hash/length/contract_flags, joined by source_event_id
 │   ├── mastery_graph.sqlite       # Bloom autoloop state (mastery table + evidence table)
 │   ├── drill_pending.json         # 1 open drill offer (or absent)
 │   ├── drill_due.json             # spaced repetition due list
@@ -131,6 +131,12 @@ CREATE TABLE evidence (
 | `self_assessment` | learning | trigger_session_id, score, concept_ids |
 | `test_result` | learning | test_class, test_method, status |
 | `coach_run` | learning | prompt, repo, mode, evidence_summary |
+
+### `response-quality.jsonl` 수집 규칙
+- `source_event_id`는 직전 `rag_ask` / `coach_run` event id와 join된다.
+- `response_excerpt`는 학습자에게 실제로 보여준 최종 답변 전체의 redacted prefix(최대 5000자)다.
+- 요약본, 축약본, paraphrase를 본문으로 넣으면 `contract_flags`에 `possible_summary_body`가 붙을 수 있다.
+- 본문 capture가 불가능한 경우에만 `summary-only`를 쓰고, `contract_flags=["body_not_captured"]`로 남긴다.
 
 ### `profile.json` shape
 ```json

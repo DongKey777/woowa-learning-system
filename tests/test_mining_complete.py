@@ -106,6 +106,7 @@ def test_response_quality_mine_since_filters_recent_rows(tmp_path: Path) -> None
         {
             "logged_at": now - 120,
             "quality_flags": ["missing_response_body"],
+            "contract_flags": ["possible_summary_body"],
             "citation_paths_expected": ["recent/expected"],
             "citation_paths_declared": ["recent/declared"],
             "learner_id": "DongKey777",
@@ -139,7 +140,9 @@ def test_response_quality_mine_since_filters_recent_rows(tmp_path: Path) -> None
     assert out["rows_total"] == 2
     assert out["rows_skipped_fixture_or_demo_n"] == 1
     assert out["missing_body_n"] == 1
+    assert out["possible_summary_body_n"] == 1
     assert out["citation_drift_n"] == 1
     assert out["flag_counts"] == {"missing_citation": 1, "missing_response_body": 1}
+    assert out["contract_flag_counts"] == {"possible_summary_body": 1}
     assert out["top_expected_citations"] == [{"path": "recent/expected", "n": 2}]
     assert out["top_declared_citations"] == [{"path": "recent/declared", "n": 1}]

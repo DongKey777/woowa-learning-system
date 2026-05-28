@@ -46,6 +46,7 @@ def test_quality_hint_present_with_event_id():
     assert "--expected-citation spring/di" in rq["command_template"]
     assert "--silent" in rq["command_template"]
     assert rq["body_required"] is True
+    assert "exact full learner-facing answer" in rq["body_contract"]
     assert "minimal_fallback_cmd" not in rq
     # expected_citation_paths mirrors hints.citation_paths
     assert rq["expected_citation_paths"] == hints["citation_paths"]

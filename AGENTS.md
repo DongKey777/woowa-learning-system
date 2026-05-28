@@ -91,6 +91,13 @@ python3 bin/ask "테스트"
 3. 첫 줄 header: `[Mode: <router_mode>]`
 4. 답변 끝 `참고:` 블록 (최대 3 concept_id)
 
+### 4.2.1 답변 본문 수집 규칙
+- `# response_quality_hint.command_template`가 있으면 답변 직후 반드시 실행.
+- `--response-file -` stdin에는 **학습자에게 실제로 보여준 최종 답변 전체**를 그대로 넣는다.
+- 요약본, 축약본, 다시 쓴 paraphrase, 일부 excerpt를 넣지 않는다.
+- 본문 capture가 불가능하면 요약본으로 대체하지 말고 `--summary-only --contract-flag body_not_captured`로 기록한다.
+- 정상 수집 시 `response-quality.jsonl.response_excerpt`에는 최종 답변의 redacted excerpt가 최대 5000자까지 저장된다.
+
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:
 1. AI가 학습자 미션 파일 실제 수정/생성 (예: Codex apply diff)
@@ -115,7 +122,7 @@ python3 bin/ask "테스트"
 | *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
 | 학습자 미션 Java 파일 Write/Edit | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` |
 | `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
-| 매 coach turn 답변 직후 | `bin/learn-response-quality --source-event-id <id> --response-file - --silent` (최종 답변 본문 stdin; summary/declared citation 자동 추출) |
+| 매 coach turn 답변 직후 | `bin/learn-response-quality --source-event-id <id> --response-file - --silent` (최종 답변 전체를 stdin; summary/declared citation 자동 추출) |
 | 미션 repo onboarded 후 첫 진입 | `bin/assess-learner-state --repo <r> --path missions/<r> --silent` |
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
@@ -138,7 +145,7 @@ woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 502 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 504 passed 유지)
 
 ### 5.2 측정 명령
 ```bash

@@ -143,6 +143,10 @@ def _build_response_quality_hint(
         "source_event_id": source_event_id,
         "expected_citation_paths": list(expected_citation_paths),
         "body_required": True,
+        "body_contract": (
+            "stdin must be the exact full learner-facing answer that was shown "
+            "to the learner; never a summary, excerpt, or paraphrase"
+        ),
         "declared_citations": "auto-extracted from response body 참고 block when omitted",
         "obligation": "AI MUST pipe the final learner-facing answer body after answer",
     }
