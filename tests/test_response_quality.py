@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -375,6 +376,9 @@ def test_learn_response_quality_cli_enriches_from_source_event(tmp_path: Path) -
 def test_learn_response_quality_cli_rejects_orphan_source_event(tmp_path: Path) -> None:
     state = tmp_path / "state"
     body = "[Mode: cs_qa]\n\n답변 본문"
+    # Orphan rejection writes to learner state (capture-repair-queue), so it is
+    # gated to learning mode and skipped under development mode. Pin the mode so
+    # the test is hermetic regardless of the suite's ambient WOOWA_SESSION_MODE.
     proc = subprocess.run(
         [
             sys.executable,
@@ -388,6 +392,7 @@ def test_learn_response_quality_cli_rejects_orphan_source_event(tmp_path: Path) 
         capture_output=True,
         text=True,
         timeout=30,
+        env={**os.environ, "WOOWA_SESSION_MODE": "learning"},
     )
 
     assert proc.returncode == 2
