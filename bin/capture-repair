@@ -5,56 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.identity import resolve_learner_login  # noqa: E402
-from core.response import parse_response  # noqa: E402
-from core.response_capture import (  # noqa: E402
-    load_source_event,
-    repair_queue_path,
-    update_pending_capture,
-)
-from core.response_quality import record_response_quality  # noqa: E402
+from core.response_capture import drain_repair_queue, repair_queue_path  # noqa: E402
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
-
-
-def _iter_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            rows.append(data)
-    return rows
-
-
-def _source_metadata(ev: dict) -> tuple[list[str], str | None]:
-    payload = ev.get("payload") or {}
-    cids = payload.get("top_concept_ids") or ev.get("top_paths") or []
-    repo = payload.get("repo") or ev.get("repo_context") or ev.get("repo")
-    return [c for c in cids if isinstance(c, str)], repo
-
-
-def _quality_sources(state_root: Path) -> set[str]:
-    rows = _iter_jsonl(state_root / "learner" / "response-quality.jsonl")
-    return {r.get("source_event_id") for r in rows if r.get("source_event_id")}
-
-
-def _append_status(state_root: Path, row: dict) -> None:
-    out = repair_queue_path(state_root)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,71 +24,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     learner_id = resolve_learner_login(args.state_root, explicit=args.learner_id)
-    rows = _iter_jsonl(repair_queue_path(args.state_root))[-args.last:]
-    existing_quality = _quality_sources(args.state_root)
-    repairable: list[dict] = []
-    unrecoverable = 0
-
-    for row in rows:
-        if row.get("status") != "pending_repair":
-            continue
-        source_event_id = row.get("source_event_id")
-        body_rel = row.get("repair_body_path")
-        ev = load_source_event(source_event_id, state_root=args.state_root) if source_event_id else None
-        if not source_event_id or not body_rel or ev is None:
-            unrecoverable += 1
-            continue
-        if source_event_id in existing_quality:
-            continue
-        body_path = args.state_root / body_rel
-        if not body_path.exists():
-            unrecoverable += 1
-            continue
-        repairable.append({**row, "_event": ev, "_body_path": str(body_path)})
-
-    applied = 0
-    if args.apply:
-        for row in repairable:
-            body = Path(row["_body_path"]).read_text(encoding="utf-8")
-            expected, repo = _source_metadata(row["_event"])
-            quality = record_response_quality(
-                source_event_id=row["source_event_id"],
-                response_summary="auto-repaired full response capture",
-                response_body=body,
-                expected_citation_paths=expected,
-                declared_citation_paths=parse_response(body).citations,
-                repo=repo,
-                learner_id=learner_id,
-                state_root=args.state_root,
-                capture_method="repair_queue",
-                capture_input_chars=0,
-            )
-            update_pending_capture(
-                row["source_event_id"],
-                state_root=args.state_root,
-                status="captured",
-                updates={
-                    "captured_at": quality["logged_at"],
-                    "response_body_path": quality["response_body_path"],
-                    "quality_flags": quality["quality_flags"],
-                    "repaired": True,
-                },
-            )
-            _append_status(args.state_root, {
-                "schema_id": "response-capture-repair-v1",
-                "queued_at": time.time(),
-                "status": "repaired",
-                "source_event_id": row["source_event_id"],
-                "repair_body_path": row.get("repair_body_path"),
-            })
-            applied += 1
+    summary = drain_repair_queue(
+        state_root=args.state_root,
+        learner_id=learner_id,
+        limit=args.last,
+        apply=args.apply,
+    )
 
     print(json.dumps({
         "queue_path": str(repair_queue_path(args.state_root)),
-        "scanned_n": len(rows),
-        "repairable_n": len(repairable),
-        "unrecoverable_n": unrecoverable,
-        "applied_n": applied,
+        "scanned_n": summary["scanned"],
+        "repairable_n": summary["repairable"],
+        "unrecoverable_n": summary["unrecoverable"],
+        "applied_n": summary["applied"],
     }, ensure_ascii=False, indent=2))
     return 0
 

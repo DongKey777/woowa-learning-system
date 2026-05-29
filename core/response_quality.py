@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from core.state import DEFAULT_STATE_ROOT, append_history_event
+from core.state import DEFAULT_STATE_ROOT, append_history_event, append_jsonl_locked
 
 SCHEMA_ID = "assistant-response-quality-v1"
 EXCERPT_MAX_CHARS = 5000
@@ -171,10 +171,7 @@ def record_response_quality(
         "contract_flags": cflags,
     }
 
-    out = state_root / "learner" / QUALITY_LOG
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    append_jsonl_locked(state_root / "learner" / QUALITY_LOG, row)
 
     if append_event:
         # Also surface as a learner history event so mining tools can join

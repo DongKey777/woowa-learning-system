@@ -9,10 +9,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.response_capture import (  # noqa: E402
+    append_repair_queue,
     capture_from_hook_payload,
     create_pending_capture,
+    drain_repair_queue,
     is_internal_capture_meta_prompt,
     load_pending_capture,
+    repair_queue_path,
 )
 from core.state import append_history_event  # noqa: E402
 
@@ -127,6 +130,76 @@ def test_progress_hook_message_without_pending_is_ignored(tmp_path: Path) -> Non
     assert row["status"] == "ignored_non_learning"
     assert row["reason"] == "non_learning_hook_message"
     assert not (state / "learner" / "capture-repair-bodies").exists()
+
+
+def test_successful_capture_drains_repairable_queue_entry(tmp_path: Path) -> None:
+    """A learning capture should opportunistically repair a stale queue row
+    whose source_event_id is already in history (was a race-time miss)."""
+    state = tmp_path / "state"
+
+    # 1) historic ask that previously failed to capture — body sits in queue
+    stale = _ask_event()
+    stale["event_id"] = "ask-stale"
+    stale["payload"]["prompt"] = "예전 미스 캡쳐"
+    append_history_event(stale, state_root=state)
+    stale_body = (
+        "[Mode: cs_qa]\n\n"
+        "예전 답변 본문.\n\n"
+        "참고:\n"
+        "- database/transaction-isolation-locking\n"
+    )
+    append_repair_queue(
+        "pending_missing",
+        state_root=state,
+        source_event_id="ask-stale",
+        client="claude",
+        response_body=stale_body,
+    )
+
+    # 2) new ask comes in and the hook successfully captures it
+    fresh = _ask_event()
+    fresh["event_id"] = "ask-fresh"
+    fresh["payload"]["prompt"] = "새 질문"
+    append_history_event(fresh, state_root=state)
+    create_pending_capture(fresh, state_root=state)
+    fresh_body = (
+        "[Mode: cs_qa]\n\n"
+        "새 답변 본문.\n\n"
+        "참고:\n"
+        "- database/transaction-isolation-locking\n"
+    )
+    result = capture_from_hook_payload(
+        {"last_assistant_message": fresh_body, "source_event_id": "ask-fresh"},
+        client="claude",
+        state_root=state,
+        learner_id="DongKey777",
+    )
+
+    # fresh capture succeeds AND the stale queue row gets repaired in the same call.
+    # pending_missing queue rows have no pending-capture file by definition (that's
+    # why they were queued); drain only needs to record response-quality telemetry.
+    assert result["ok"] is True
+    assert result["drained_repaired_n"] == 1
+    quality = [
+        json.loads(line)
+        for line in (state / "learner" / "response-quality.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert {q["source_event_id"] for q in quality} == {"ask-stale", "ask-fresh"}
+    # And drain is idempotent — re-running finds nothing new to repair.
+    rerun = drain_repair_queue(state_root=state, learner_id="DongKey777")
+    assert rerun["applied"] == 0
+
+
+def test_drain_is_idempotent_when_nothing_repairable(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    (state / "learner").mkdir(parents=True)
+    # empty queue → drain returns zeros, no file created beyond what exists
+    summary = drain_repair_queue(state_root=state, learner_id="DongKey777")
+    assert summary == {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0}
+    assert not repair_queue_path(state).exists()
 
 
 def test_learning_data_clean_hard_deletes_orphans(tmp_path: Path) -> None:

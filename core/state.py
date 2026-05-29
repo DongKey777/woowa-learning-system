@@ -204,20 +204,18 @@ def save_repo_state(state: RepoState, state_root: Path = DEFAULT_STATE_ROOT) -> 
     p.write_text(json.dumps(state.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def append_history_event(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> None:
-    """Append one event line to history.jsonl. Caller supplies event_id + ts.
+def append_jsonl_locked(path: Path, row: dict) -> None:
+    """Append one dict as a JSON line, fcntl LOCK_EX-serialized on POSIX.
 
-    Concurrent-safe via fcntl LOCK_EX on POSIX (Linux/macOS). On Windows the
-    lock falls back to best-effort (single write call is small enough that
-    OS-level atomicity holds in practice).
+    Falls back to a plain append on Windows / unsupported filesystems (single
+    write <4KB lines are atomic enough in practice). Used for every jsonl log
+    in state/learner/ that may see concurrent writers.
     """
-    p = _history_path(state_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    event = {**event, "ts": event.get("ts", time.time())}
-    line = json.dumps(event, ensure_ascii=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(row, ensure_ascii=False) + "\n"
     try:
         import fcntl
-        with p.open("a", encoding="utf-8") as f:
+        with path.open("a", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 f.write(line)
@@ -225,9 +223,14 @@ def append_history_event(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> 
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except (ImportError, OSError):
-        # Windows or unsupported FS — single write is atomic enough for <4KB lines
-        with p.open("a", encoding="utf-8") as f:
+        with path.open("a", encoding="utf-8") as f:
             f.write(line)
+
+
+def append_history_event(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> None:
+    """Append one event line to history.jsonl. Caller supplies event_id + ts."""
+    event = {**event, "ts": event.get("ts", time.time())}
+    append_jsonl_locked(_history_path(state_root), event)
 
 
 def read_history(

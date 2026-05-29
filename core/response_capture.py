@@ -436,12 +436,138 @@ def capture_from_hook_payload(
         source_event_id,
         state_root=state_root,
     )
+    drain_summary: dict[str, int] | None = None
+    try:
+        drain_summary = drain_repair_queue(
+            state_root=state_root,
+            learner_id=learner_id,
+            limit=20,
+            apply=True,
+        )
+    except Exception:  # noqa: BLE001
+        drain_summary = None  # opportunistic — never break the response path
     return {
         "ok": True,
         "source_event_id": source_event_id,
         "response_body_path": row["response_body_path"],
         "quality_flags": row["quality_flags"],
         "superseded_pending_n": superseded_n,
+        "drained_repaired_n": (drain_summary or {}).get("applied", 0),
+    }
+
+
+def drain_repair_queue(
+    state_root: Path = DEFAULT_STATE_ROOT,
+    *,
+    learner_id: str = "default",
+    limit: int = 50,
+    apply: bool = True,
+) -> dict[str, int]:
+    """Replay repairable failures from capture-repair-queue.jsonl.
+
+    Idempotent — skips rows whose source_event_id already has a quality entry.
+    Used by both bin/capture-repair (explicit) and capture_from_hook_payload's
+    success path (opportunistic), so successful hooks gradually drain backlog
+    without a separate cron/daemon job.
+    """
+    queue_path = repair_queue_path(state_root)
+    if not queue_path.exists():
+        return {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0}
+
+    rows: list[dict[str, Any]] = []
+    for line in queue_path.read_text(encoding="utf-8").splitlines()[-limit:]:
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            rows.append(data)
+
+    quality_path = state_root / "learner" / "response-quality.jsonl"
+    existing: set[str] = set()
+    if quality_path.exists():
+        for line in quality_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = d.get("source_event_id") if isinstance(d, dict) else None
+            if sid:
+                existing.add(sid)
+
+    repairable: list[tuple[dict[str, Any], dict[str, Any], Path]] = []
+    unrecoverable = 0
+    for row in rows:
+        if row.get("status") != "pending_repair":
+            continue
+        sid = row.get("source_event_id")
+        body_rel = row.get("repair_body_path")
+        ev = load_source_event(sid, state_root=state_root) if sid else None
+        if not sid or not body_rel or ev is None:
+            unrecoverable += 1
+            continue
+        if sid in existing:
+            continue
+        body_path = state_root / body_rel
+        if not body_path.exists():
+            unrecoverable += 1
+            continue
+        repairable.append((row, ev, body_path))
+
+    applied = 0
+    if apply and repairable:
+        from core.response import parse_response
+        from core.response_quality import record_response_quality
+
+        for row, ev, body_path in repairable:
+            try:
+                body = body_path.read_text(encoding="utf-8")
+                expected, repo = _source_event_metadata(ev)
+                quality = record_response_quality(
+                    source_event_id=row["source_event_id"],
+                    response_summary="auto-repaired full response capture",
+                    response_body=body,
+                    expected_citation_paths=expected,
+                    declared_citation_paths=parse_response(body).citations,
+                    repo=repo,
+                    learner_id=learner_id,
+                    state_root=state_root,
+                    capture_method="repair_queue",
+                    capture_input_chars=0,
+                )
+                update_pending_capture(
+                    row["source_event_id"],
+                    state_root=state_root,
+                    status="captured",
+                    updates={
+                        "captured_at": quality["logged_at"],
+                        "response_body_path": quality["response_body_path"],
+                        "quality_flags": quality["quality_flags"],
+                        "repaired": True,
+                    },
+                )
+                append_repair_queue(
+                    "drain_repaired",
+                    state_root=state_root,
+                    status="repaired",
+                    source_event_id=row["source_event_id"],
+                    details={"repair_body_path": row.get("repair_body_path")},
+                )
+                existing.add(row["source_event_id"])
+                applied += 1
+            except Exception:  # noqa: BLE001
+                # Drain failures must never propagate — keep response flow alive.
+                continue
+
+    return {
+        "scanned": len(rows),
+        "repairable": len(repairable),
+        "applied": applied,
+        "unrecoverable": unrecoverable,
     }
 
 
