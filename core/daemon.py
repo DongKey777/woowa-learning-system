@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -514,7 +515,13 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     # response_quality_hint.command_template can embed it and
                     # the AI session's follow-up wrapper call joins on the
                     # same id as the history event.
-                    event_id = f"ask-{int(time.time() * 1000)}-{os.getpid()}"
+                    # The uuid suffix guarantees uniqueness: the serve loop is
+                    # serial but the warm/exact-shortcut path can complete two
+                    # asks within the same millisecond, and event_id is also the
+                    # pending-capture filename ({event_id}.json) — a ms+pid
+                    # collision would silently overwrite a sibling's capture.
+                    # Matches the {prefix}-{ms}-{uuid} convention in code_event.
+                    event_id = f"ask-{int(time.time() * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
                     # Phase Y11 P1.2 — derive learner_context from v3 profile
                     # (mastered + proficient → must_skip_explanations_of).
                     # Caller-provided learner_context wins if given.
