@@ -85,7 +85,7 @@ state/
 │   │   ├── _versions/
 │   │   ├── data/
 │   │   └── _transactions/
-│   └── manifest.json              # build metadata (corpus_hash, built_at, etc.)
+│   └── manifest.json              # build metadata (corpus_sha256, built_at, concepts_indexed, embed_dim, encoder_model, …)
 ├── learner/
 │   ├── profile.json               # v3 profile: concepts/activity/calibration/recommendations
 │   ├── history.jsonl              # append-only event log (rag_ask/code_attempt/drill_answer/…)

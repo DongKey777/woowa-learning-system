@@ -50,8 +50,8 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
 | Y14 corpus closure qrels | **14/14 top1=1.000, p95≤3.6ms ✅** |
-| Unit tests | **517 passed** |
-| Runtime LOC budget | **9496 / 9500 ✅** |
+| Unit tests | **523 passed** |
+| Runtime LOC budget | **9574 / 9700 ✅** |
 | Index release artifact | **18.7MB, SHA256 검증 ✅** |
 
 자세한 결과 → [`docs/verification-results.md`](docs/verification-results.md)

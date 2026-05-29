@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from core.identity import resolve_learner_login
-from core.state import DEFAULT_STATE_ROOT, read_history
+from core.state import DEFAULT_STATE_ROOT, atomic_write_json, read_history
 
 PROFILE_PATH = "profile.json"
 UNIFIED_PROFILE_PATH = "unified_profile.json"
@@ -343,8 +343,7 @@ def recompute_profile(
     }
     profile = _merge_preserved_profile_fields(_load_existing_profile(state_root), profile)
     out = state_root / "learner" / PROFILE_PATH
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(out, profile)
     return profile
 
 

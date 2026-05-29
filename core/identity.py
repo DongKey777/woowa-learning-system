@@ -22,6 +22,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from core.state import atomic_write_json
+
 DEFAULT_FALLBACK = "default"
 IDENTITY_FILE = "identity.json"
 
@@ -96,8 +98,7 @@ def detect_and_cache(state_root: Path, force_refresh: bool = False) -> dict | No
         "detected_at": time.time(),
     }
     p = _identity_path(state_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(p, record)
     return record
 
 

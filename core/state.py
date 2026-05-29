@@ -175,11 +175,11 @@ def save_profile(profile: LearnerProfile, state_root: Path = DEFAULT_STATE_ROOT)
         existing["pending_triggers"] = persistent_pending
         existing.setdefault("activity", {})
         existing["activity"]["events_total"] = profile.total_events
-        p.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(p, existing)
         return
 
     # Legacy flat schema — preserve existing behaviour.
-    p.write_text(json.dumps(profile.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(p, profile.__dict__)
 
 
 def load_repo_state(repo: str, state_root: Path = DEFAULT_STATE_ROOT) -> RepoState:
@@ -199,9 +199,21 @@ def load_repo_state(repo: str, state_root: Path = DEFAULT_STATE_ROOT) -> RepoSta
 
 def save_repo_state(state: RepoState, state_root: Path = DEFAULT_STATE_ROOT) -> None:
     p = _repo_state_path(state_root, state.repo_name)
-    p.parent.mkdir(parents=True, exist_ok=True)
     state.last_updated = time.time()
-    p.write_text(json.dumps(state.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(p, state.__dict__)
+
+
+def atomic_write_json(path: Path, payload, *, indent: int = 2) -> None:
+    """Atomically write a JSON file via tmp→replace (crash-safe).
+
+    A mid-write crash (power loss / OOM / Ctrl-C) leaves the previous good file
+    intact instead of a truncated one. Use for single-source-of-truth state
+    files; concurrent appenders use append_jsonl_locked instead.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=indent), encoding="utf-8")
+    tmp.replace(path)
 
 
 def append_jsonl_locked(path: Path, row: dict) -> None:

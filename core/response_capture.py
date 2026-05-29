@@ -14,7 +14,7 @@ from typing import Any
 
 from core.response import parse_response
 from core.response_quality import record_response_quality, redact_pii
-from core.state import DEFAULT_STATE_ROOT
+from core.state import DEFAULT_STATE_ROOT, append_jsonl_locked, atomic_write_json
 
 PENDING_DIR = "pending-captures"
 REPAIR_QUEUE = "capture-repair-queue.jsonl"
@@ -55,10 +55,7 @@ def repair_queue_path(state_root: Path = DEFAULT_STATE_ROOT) -> Path:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_json(path, payload)
 
 
 def _source_event_metadata(ev: dict[str, Any] | None) -> tuple[list[str], str | None]:
@@ -244,10 +241,7 @@ def append_repair_queue(
         body_path, body_hash = _store_repair_body(state_root, response_body)
         row["repair_body_path"] = body_path
         row["repair_body_hash"] = body_hash
-    out = repair_queue_path(state_root)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    append_jsonl_locked(repair_queue_path(state_root), row)
     return row
 
 
@@ -453,6 +447,7 @@ def capture_from_hook_payload(
         "quality_flags": row["quality_flags"],
         "superseded_pending_n": superseded_n,
         "drained_repaired_n": (drain_summary or {}).get("applied", 0),
+        "drain_errors": (drain_summary or {}).get("drain_errors", 0),
     }
 
 
@@ -472,7 +467,7 @@ def drain_repair_queue(
     """
     queue_path = repair_queue_path(state_root)
     if not queue_path.exists():
-        return {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0}
+        return {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0, "drain_errors": 0}
 
     rows: list[dict[str, Any]] = []
     for line in queue_path.read_text(encoding="utf-8").splitlines()[-limit:]:
@@ -519,6 +514,7 @@ def drain_repair_queue(
         repairable.append((row, ev, body_path))
 
     applied = 0
+    drain_errors = 0
     if apply and repairable:
         from core.response import parse_response
         from core.response_quality import record_response_quality
@@ -561,6 +557,8 @@ def drain_repair_queue(
                 applied += 1
             except Exception:  # noqa: BLE001
                 # Drain failures must never propagate — keep response flow alive.
+                # Counted (not silent): the row stays queued for the next drain.
+                drain_errors += 1
                 continue
 
     return {
@@ -568,6 +566,7 @@ def drain_repair_queue(
         "repairable": len(repairable),
         "applied": applied,
         "unrecoverable": unrecoverable,
+        "drain_errors": drain_errors,
     }
 
 

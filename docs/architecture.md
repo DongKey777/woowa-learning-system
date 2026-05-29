@@ -178,7 +178,7 @@ Historical Phase M in-process cold/warm numbers are superseded by the Y13 daemon
 
 ## 10. LOC budget (plan §D-I)
 
-Release acceptance canonical runtime LOC: **9496 / 9500**.
+Release acceptance canonical runtime LOC: **9574 / 9700**.
 
 Corpus rebuild policy: run `tests/benchmarks/corpus_rebuild_readiness.py`
 before any dense index rebuild. The gate validates strict schema load, title

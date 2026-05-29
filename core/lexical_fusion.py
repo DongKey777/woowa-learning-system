@@ -5,7 +5,6 @@ The daemon injects this as a rerank_fn when it wants lexical recall.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
@@ -13,7 +12,7 @@ from bisect import bisect_left
 from pathlib import Path
 from typing import Callable
 
-from rag.corpus_loader import LoadedCorpus
+from rag.corpus_loader import LoadedCorpus, corpus_fingerprint
 from rag.search import SearchHit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -145,20 +144,10 @@ def _build_lexical_entries(corpus: LoadedCorpus) -> tuple[dict, ...]:
     return tuple(entries)
 
 
-def _corpus_fingerprint(corpus: LoadedCorpus) -> str:
-    h = hashlib.sha256()
-    for cid in sorted(corpus.concepts):
-        concept = corpus.concepts[cid]
-        h.update(cid.encode("utf-8"))
-        for field in ("title", "category", "level", "summary", "body_markdown"):
-            h.update(b"\0")
-            h.update(str(concept.get(field) or "").encode("utf-8"))
-        for field in ("aliases", "expected_queries"):
-            h.update(b"\0")
-            for item in concept.get(field) or []:
-                h.update(str(item).encode("utf-8"))
-                h.update(b"\x1f")
-    return h.hexdigest()
+# Promoted to rag.corpus_loader.corpus_fingerprint so the index manifest and the
+# daemon drift check share one definition. Alias kept for existing importers
+# (bin/corpus-build, corpus_rebuild_readiness benchmark).
+_corpus_fingerprint = corpus_fingerprint
 
 
 def _entries_to_jsonable(entries: tuple[dict, ...]) -> list[dict]:

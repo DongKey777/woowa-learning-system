@@ -5,6 +5,7 @@ Errors return structured `(failed_path, error_message)` list — no silent skip.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,28 @@ class LoadedCorpus:
         for c in self.concepts.values():
             out[c["category"]] = out.get(c["category"], 0) + 1
         return out
+
+
+def corpus_fingerprint(corpus: LoadedCorpus) -> str:
+    """Stable sha256 over the concept fields that drive dense embeddings.
+
+    Shared by the lexical sidecar freshness check, the Lance index manifest, and
+    the daemon startup drift check so all three compare the identical hash. The
+    byte layout must stay fixed — changing it invalidates every persisted hash.
+    """
+    h = hashlib.sha256()
+    for cid in sorted(corpus.concepts):
+        concept = corpus.concepts[cid]
+        h.update(cid.encode("utf-8"))
+        for field in ("title", "category", "level", "summary", "body_markdown"):
+            h.update(b"\0")
+            h.update(str(concept.get(field) or "").encode("utf-8"))
+        for field in ("aliases", "expected_queries"):
+            h.update(b"\0")
+            for item in concept.get(field) or []:
+                h.update(str(item).encode("utf-8"))
+                h.update(b"\x1f")
+    return h.hexdigest()
 
 
 def load_corpus(

@@ -6,7 +6,7 @@
 
 ## 1. 한 줄 요약
 
-Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **517 passed**다.
+Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **523 passed**다.
 
 ## 1.1 Latest Y14 Snapshot
 
@@ -158,7 +158,7 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 cd /Users/idonghun/IdeaProjects/woowa-learning-system
 export WOOWA_SESSION_MODE=development
 
-# 1. Unit tests (latest 517 passed)
+# 1. Unit tests (latest 523 passed)
 python3 -m pytest tests/ -q
 
 # 2. All 14 phase benches (J/K/L/M/N/P + T-X) via master runner

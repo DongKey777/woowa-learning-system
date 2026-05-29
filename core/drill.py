@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Iterable
 
 from core.feedback import record_turn
-from core.state import DEFAULT_STATE_ROOT, append_history_event
+from core.state import DEFAULT_STATE_ROOT, append_history_event, atomic_write_json
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CORPUS_DIR = REPO_ROOT / "corpus" / "concepts"
@@ -183,10 +183,7 @@ def build_offer_if_due(
             source=source,
             created_at=now or time.time(),
         )
-        pending.write_text(
-            json.dumps(offer.__dict__, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        atomic_write_json(pending, offer.__dict__)
         return offer
     return None
 
@@ -304,8 +301,7 @@ def score_pending_answer(
         "next_due_ts": due_ts,
         "last_score": score.total,
     })
-    due_path.write_text(json.dumps(due_list, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
+    atomic_write_json(due_path, due_list)
 
     pending.unlink()
     return score

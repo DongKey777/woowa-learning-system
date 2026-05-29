@@ -323,6 +323,14 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
         )
         corpus = corpus_future.result()
         startup_timings["encoder_warm_queries"] = list(encoder_future.result())
+    try:
+        from rag.index import check_corpus_drift
+
+        drift_warning = check_corpus_drift(corpus)
+        if drift_warning:
+            print(f"[daemon] WARNING {drift_warning}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass  # drift check is advisory — never block startup
     lexical_fns: dict[int, object] = {}
 
     def _lexical_fn(loaded_corpus, expand: int):
@@ -558,8 +566,14 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             )
                         if event_mode == "learning" and not internal_meta_prompt:
                             record_turn(event, state_root=state_root)
-                    except Exception:  # noqa: BLE001
-                        pass  # telemetry/evidence must not break the response
+                    except Exception as exc:  # noqa: BLE001
+                        # Telemetry/evidence must not break the response, but a
+                        # persistent failure (disk full, perms) would otherwise be
+                        # silent — surface to stderr (→ daemon --log-path).
+                        print(
+                            f"[telemetry] event_id={event_id} capture failed: {exc!r}",
+                            file=sys.stderr,
+                        )
                     payload = {
                         "markdown": markdown,
                         "mode": effective_route.mode,

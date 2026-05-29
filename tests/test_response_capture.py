@@ -198,7 +198,7 @@ def test_drain_is_idempotent_when_nothing_repairable(tmp_path: Path) -> None:
     (state / "learner").mkdir(parents=True)
     # empty queue → drain returns zeros, no file created beyond what exists
     summary = drain_repair_queue(state_root=state, learner_id="DongKey777")
-    assert summary == {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0}
+    assert summary == {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0, "drain_errors": 0}
     assert not repair_queue_path(state).exists()
 
 

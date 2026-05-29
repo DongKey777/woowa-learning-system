@@ -22,7 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from rag.corpus_loader import DEFAULT_CORPUS_DIR, encoding_text, load_corpus
+from rag.corpus_loader import (
+    DEFAULT_CORPUS_DIR,
+    corpus_fingerprint,
+    encoding_text,
+    load_corpus,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -53,6 +58,7 @@ class IndexBuildReport:
     elapsed_seconds: float
     index_size_bytes: int
     index_path: Path
+    corpus_sha256: str = ""
 
 
 def build_index(
@@ -117,6 +123,7 @@ def build_index(
         elapsed_seconds=elapsed,
         index_size_bytes=size,
         index_path=index_dir,
+        corpus_sha256=corpus_fingerprint(loaded),
     )
 
 
@@ -137,7 +144,39 @@ def _write_manifest(report: IndexBuildReport) -> None:
         "index_size_bytes": report.index_size_bytes,
         "embed_dim": EMBED_DIM,
         "encoder_model": "BAAI/bge-m3",
+        "corpus_sha256": report.corpus_sha256,
+        "built_at": time.time(),
     }
     (report.index_path / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def check_corpus_drift(
+    corpus, index_dir: Path = DEFAULT_INDEX_DIR
+) -> str | None:
+    """Return a warning string if the on-disk index is stale vs the corpus.
+
+    Compares manifest.json's corpus_sha256 against the current corpus
+    fingerprint. Soft by design: returns None when the manifest is missing or
+    predates the corpus_sha256 key (older fetched indexes), so a stale-key index
+    never hard-fails startup — only a confirmed mismatch warns.
+    """
+    manifest_path = index_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    indexed_sha = manifest.get("corpus_sha256")
+    if not indexed_sha:
+        return None
+    current_sha = corpus_fingerprint(corpus)
+    if indexed_sha == current_sha:
+        return None
+    return (
+        f"corpus↔index drift: corpus_sha256={current_sha[:12]} but index manifest "
+        f"has {str(indexed_sha)[:12]} — run bin/index-fetch (learner) or rebuild "
+        f"(maintainer); search may use stale embeddings."
     )
