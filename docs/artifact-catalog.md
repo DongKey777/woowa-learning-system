@@ -1,4 +1,4 @@
-# Artifact catalog — `state/` `reports/` `corpus/` 구조
+# Artifact catalog — `state/` `corpus/` 구조 (+ local `reports/`)
 
 ## 1. `corpus/` (committed, read-only at runtime)
 
@@ -203,29 +203,11 @@ CREATE TABLE evidence (
 
 ---
 
-## 3. `reports/` (committed, append-only measurement results)
+## 3. `reports/` (local maintainer output, gitignored)
 
-```
-reports/
-├── PARADIGM_V2_VS_LEGACY_FINAL.md           # Phase J narrative
-├── PHASE_K_VERIFICATION.md                   # F1 + F5 critical gates
-├── PHASE_L_ALL_GATES_FINAL.md                # 9 plan gates
-├── PHASE_M_UNCOVERED_FINAL.md                # 12 uncovered scenarios
-├── PHASE_N_UNCOVERED2_FINAL.md               # 12 second-wave + read_history fix
-├── PHASE_P_DEEP_FINAL.md                     # 10 deep scenarios + drill cycle
-├── phase_l_gates.json                        # raw JSON per gate
-├── phase_m_uncovered.json
-├── phase_n_uncovered2.json
-├── phase_p_deep.json
-├── rag_quality_regression.json               # F1 200-query measurement
-├── historical comparison reports             # archived 14-scenario / deepdive baselines
-├── coaching_eval.json
-├── phase_g_v2_eval.json                      # corpus enrichment cycle
-├── phase9_rag_eval.json
-└── ... (older reports retained for history)
-```
+Mode B 측정 스크립트(`tests/benchmarks/*.py`, `bin/rag-eval`, `bin/cohort-eval` 등)는 결과를 `reports/`에 남긴다. 이 디렉토리는 **`.gitignore`** 처리되어 있어 public clone에는 포함되지 않는다 — 학습자에겐 0 가치이고 per-machine latency/cohort 스냅샷이 clone weight만 늘리기 때문이다.
 
-각 `PHASE_*.md`는 narrative + table + reproduction 명령 포함. `*.json`은 raw structured output.
+학습자/contributor가 헤드라인 metric만 보려면 [verification-results.md](verification-results.md)에 inline으로 정리되어 있다. 본인 환경에서 raw report를 재생성하려면 해당 benchmark 스크립트를 직접 실행하면 디렉토리가 자동 생성된다.
 
 ---
 
@@ -242,4 +224,4 @@ reports/
 | state/learner/review_anchors.json | `anchors/extract.py` | F11 매칭 source | repo sync 후 optional |
 | state/repos/<repo>/mission_patterns.json | `bin/mission-patterns-build` | coaching prompt | 학습자 신규 PR 후 |
 | state/repos/<repo>/cross_crew_review_graph.parquet | `bin/cross-crew-build` | F11 prompt | anchors 갱신 후 |
-| reports/*.json/.md | 측정 script 실행 (Mode B) | 회귀 분석 + commit message | 측정 cycle |
+| reports/*.json/.md (local, gitignored) | 측정 script 실행 (Mode B) | 회귀 분석 + commit message 작성용 | 측정 cycle |

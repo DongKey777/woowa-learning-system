@@ -165,7 +165,7 @@ Phase L 측정:
 | short exact concept queries | **8/8, p95 0.017ms** |
 | release acceptance | **96/96 RELEASE READY** |
 
-Historical Phase M in-process cold/warm numbers are superseded by Y13 daemon-layer reports in `reports/y13_latency_baseline.json`.
+Historical Phase M in-process cold/warm numbers are superseded by the Y13 daemon-layer measurements summarized in §1.2 of [verification-results.md](verification-results.md).
 
 ## 9. Storage decision tree
 

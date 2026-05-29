@@ -10,59 +10,59 @@ Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prer
 
 ## 1.1 Latest Y14 Snapshot
 
-| 축 | 최신 결과 | Report |
-|---|---:|---|
-| Corpus concepts / graph | **3339 concepts / 6172 prereq edges / broken 0** | `corpus/concept_graph.json`, `bin/learning-path-graph-audit` |
-| Y14 qrels prompt/reformulated | **14/14 sets top1=1.000, top5=1.000, forbidden=0, max p95=3.6ms** | `reports/y14_batch1_7_qrels_eval.json` |
-| rag_quality top1 / NDCG@5 / p95 | **1.000 / 1.000 / 1.6ms** | `reports/rag_quality_regression.json` |
-| pytest | **517 passed** | local `python3 -m pytest tests/ -q` |
-| corpus rebuild readiness | **ready=true, rebuild_needed=false, 0 wrong exact owners** | `reports/corpus_rebuild_readiness.json` |
-| index archive | **v1.0.2, 18.7MB, sidecars=true, SHA256 d8da5782...** | `state/index.tar.zst`, `bin/index-pack --verify-only` |
-| remote build | **H100 secure, encode 9.2s, Lance 13.40MB** | `bin/rag-remote-build --commit-sha fd42dba7dd0a2beb4bfd0b1bc9133bf5547d18ca` |
+| 축 | 최신 결과 |
+|---|---:|
+| Corpus concepts / graph | **3339 concepts / 6172 prereq edges / broken 0** |
+| Y14 qrels prompt/reformulated | **14/14 sets top1=1.000, top5=1.000, forbidden=0, max p95=3.6ms** |
+| rag_quality top1 / NDCG@5 / p95 | **1.000 / 1.000 / 1.6ms** |
+| pytest | **523 passed** (run via `WOOWA_SESSION_MODE=development python3 -m pytest tests/ -q`) |
+| corpus rebuild readiness | **ready=true, rebuild_needed=false, 0 wrong exact owners** |
+| index archive | **v1.0.2, 18.7MB, sidecars=true, SHA256 d8da5782...** |
+| remote build | **H100 secure, encode 9.2s, Lance 13.40MB** |
 
 ## 1.2 Latest Y13 Release Snapshot
 
-| 축 | 최신 결과 | Report |
-|---|---:|---|
-| Release acceptance | **96/96 RELEASE READY** | `reports/release_acceptance_v1.0.1.json` |
-| Y13 gates | **47/47** | `reports/release_acceptance_v1.0.1.json` |
-| runtime LOC | **9496 / 9500** | `reports/release_acceptance_v1.0.1.json` |
-| qrels strict top1 / learner top1 / NDCG@5 / p95 | **1.000 / 1.000 / 0.987 / 278.6ms** | `reports/cohort_y13_baseline.json` |
-| full scenario p50/p95 / evidence | **48.8ms / 71.5ms / 96.0%** | archived historical baseline report |
-| exact shortcut p50/p95 / cases | **0.009ms / 0.017ms / 8 synthetic cases** | `reports/exact_query_shortcut.json` |
-| F11 Stage 4 veto prompt | **P4 pass, 110.8ms** | `reports/phase_p_deep.json` |
-| override keywords p95 | **199.9ms** | `reports/phase_m_uncovered.json` |
-| stress test p50/p95 | **2.8ms / 6.4ms** | `reports/phase_m_uncovered.json` |
-| warm socket p50/p95 | **4.1ms / 6.3ms** | `reports/y13_latency_baseline.json` |
-| warm CLI p50/p95 | **43.9ms / 47.6ms** | `reports/y13_latency_baseline.json` |
-| first ask after ready p50/p95 | **187.2ms / 196.0ms** | `reports/y13_latency_baseline.json` |
-| first-answer total p50/p95 | **15245.0ms / 15247.7ms** | `reports/y13_latency_baseline.json` |
-| historical prewarm total-to-first-answer baseline | **43933.6ms** | archived historical baseline report |
+| 축 | 최신 결과 |
+|---|---:|
+| Release acceptance | **96/96 RELEASE READY** |
+| Y13 gates | **47/47** |
+| runtime LOC | **9502 / 9600** |
+| qrels strict top1 / learner top1 / NDCG@5 / p95 | **1.000 / 1.000 / 0.987 / 278.6ms** |
+| full scenario p50/p95 / evidence | **48.8ms / 71.5ms / 96.0%** |
+| exact shortcut p50/p95 / cases | **0.009ms / 0.017ms / 8 synthetic cases** |
+| F11 Stage 4 veto prompt | **P4 pass, 110.8ms** |
+| override keywords p95 | **199.9ms** |
+| stress test p50/p95 | **2.8ms / 6.4ms** |
+| warm socket p50/p95 | **4.1ms / 6.3ms** |
+| warm CLI p50/p95 | **43.9ms / 47.6ms** |
+| first ask after ready p50/p95 | **187.2ms / 196.0ms** |
+| first-answer total p50/p95 | **15245.0ms / 15247.7ms** |
+| historical prewarm total-to-first-answer baseline | **43933.6ms** |
 
 Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file=...)` fast path로 대체했다. AutoTokenizer rollback은 `WOOWA_ENCODER_TOKENIZER_BACKEND=auto`이며, parity report는 input ids/masks 동일 + vector cosine min/mean **1.0/1.0**, max_abs_diff **0.0**이다. Y13-K6에서는 qrels strict 지표와 learner-relevant 지표를 분리하고, AF_UNIX line-delimited protocol에서 불필요한 client `shutdown(SHUT_WR)`를 제거했다. Y13-K7~K18에서는 lexical/title promotion, executable `bin/ask` fast path, search-result cache, override keyword routing, F11 Stage 4 veto prompt, exact normalization, corpus ownership 보강, remote-build provenance guard, latency hardening, corpus readiness gate, stale gold 정정, index archive verification을 순차 적용했다. 최종 qrels strict top1/learner top1/MRR은 **1.000/1.000/1.000**, NDCG@5는 **0.987**, p50/p95는 **176.1/278.6ms**다. 최신 14개 일반 시나리오 p50/p95는 **48.8/71.5ms**다.
 
 ## 1.3 Latest Fresh Onboarding Snapshot
 
-| 축 | 최신 결과 | Report |
-|---|---:|---|
-| Fresh clone live smoke | **bootstrap healthy, daemon alive, doctor 6/6, ask OK** | manual fresh clone live probe |
-| Fresh-state automation | **10/10 pass** | `reports/phase_y8_fresh_clone_sim.json` |
-| Phase U onboarding wrappers | **10/10 pass** | `reports/phase_u_wrappers_bench.json` |
-| New mission readiness without anchors | **ready 4/4, cross_crew_not_applicable=true** | `bin/repo-readiness --repo spring-roomescape-waiting` |
-| Existing mission readiness | **ready 4/4** | `bin/repo-readiness --repo spring-roomescape-member` |
+| 축 | 최신 결과 |
+|---|---:|
+| Fresh clone live smoke | **bootstrap healthy, daemon alive, doctor 6/6, ask OK** |
+| Fresh-state automation | **10/10 pass** |
+| Phase U onboarding wrappers | **10/10 pass** |
+| New mission readiness without anchors | **ready 4/4, cross_crew_not_applicable=true** |
+| Existing mission readiness | **ready 4/4** |
 
 ## 2. Historical Phase Results
 
-| Phase | 시나리오 수 | Pass | 핵심 발견 | Report |
-|---|---|---|---|---|
-| J | 14 mode + 4 deepdive = 18 | 18/18 | mode dispatch 100%, 4.4× faster | [PARADIGM_V2_VS_LEGACY_FINAL.md](../reports/PARADIGM_V2_VS_LEGACY_FINAL.md) |
-| K | F1 RAG + F5 mastery = 2 | 2/2 | top-5 93.4%, 5 mastered + **daemon history append 버그 fix** | [PHASE_K_VERIFICATION.md](../reports/PHASE_K_VERIFICATION.md) |
-| L | 9 plan §verification | 9/9 | F11 AI judge 85%, F10 forward 100%, F10 backward 100% | [PHASE_L_ALL_GATES_FINAL.md](../reports/PHASE_L_ALL_GATES_FINAL.md) |
-| M | 12 uncovered | 12/12 | historical in-process cold/warm probe; current daemon cold semantics are tracked by Y13 | [PHASE_M_UNCOVERED_FINAL.md](../reports/PHASE_M_UNCOVERED_FINAL.md) |
-| N | 12 second-wave | 12/12 | persistence + idempotency + **read_history tail 버그 fix** | [PHASE_N_UNCOVERED2_FINAL.md](../reports/PHASE_N_UNCOVERED2_FINAL.md) |
-| O | 12 drill unit + 1 e2e | 13/13 | F6 offer-gen 완성 (drill_pending + 4-dim 채점 + spaced) | (drill.py + test_drill.py) |
-| P | 10 deep scenarios | 10/10 | drill cycle full, 100% corpus 커버, mastery 단조성 | [PHASE_P_DEEP_FINAL.md](../reports/PHASE_P_DEEP_FINAL.md) |
-| **합계** | **77 시나리오 + 213 unit** | **77/77 + 213/213** | — | — |
+| Phase | 시나리오 수 | Pass | 핵심 발견 |
+|---|---|---|---|
+| J | 14 mode + 4 deepdive = 18 | 18/18 | mode dispatch 100%, 4.4× faster |
+| K | F1 RAG + F5 mastery = 2 | 2/2 | top-5 93.4%, 5 mastered + **daemon history append 버그 fix** |
+| L | 9 plan §verification | 9/9 | F11 AI judge 85%, F10 forward 100%, F10 backward 100% |
+| M | 12 uncovered | 12/12 | historical in-process cold/warm probe; current daemon cold semantics are tracked by Y13 |
+| N | 12 second-wave | 12/12 | persistence + idempotency + **read_history tail 버그 fix** |
+| O | 12 drill unit + 1 e2e | 13/13 | F6 offer-gen 완성 (drill_pending + 4-dim 채점 + spaced) |
+| P | 10 deep scenarios | 10/10 | drill cycle full, 100% corpus 커버, mastery 단조성 |
+| **합계** | **77 시나리오 + 213 unit** | **77/77 + 213/213** | — |
 
 ## 3. Plan §verification 11 feature gate 매핑
 
@@ -173,7 +173,7 @@ python3 tests/benchmarks/phase_y_all_benches.py   # 14/14 in ~20s
 
 **52 새 wrappers + 6 new modules + scripts/collection/ + scripts/mining/**
 
-| Phase | 범위 | Bench |
+| Phase | 범위 | Pass |
 |---|---|---|
 | **T** Learner automation (7 wrappers) | learn-pr-retro · learn-record-code · learn-test · learn-response-quality · assess-learner-state · profile-recompute · session-start | 7/7 PASS + 17/17 e2e integration |
 | **U** Onboarding/Collection (10, G1 closure) | bootstrap · bootstrap-repo · onboard-repo · list-repos · archive-status · sync-prs · repo-readiness · doctor · validate-state · registry-audit | 10/10 + 11/11 unit |
