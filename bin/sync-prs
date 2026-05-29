@@ -25,9 +25,13 @@ def _last_run_ts(db_path: Path) -> str | None:
         return None
     conn = sqlite3.connect(str(db_path))
     try:
+        # Partial runs now advance the cursor (finished_at = last collected PR's
+        # updated_at), so they count too — otherwise a capped run could never
+        # make forward progress.
         r = conn.execute(
             "SELECT finished_at FROM collection_runs "
-            "WHERE status = 'succeeded' ORDER BY id DESC LIMIT 1"
+            "WHERE status IN ('succeeded', 'partial') AND finished_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return r[0] if r else None
     except sqlite3.OperationalError:
@@ -46,7 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", default=None,
                         help="ISO timestamp; defaults to last successful run")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-gh-calls", type=int, default=200)
+    parser.add_argument("--max-gh-calls", type=int, default=None,
+                        help="gh call budget; default auto-derives from the live "
+                             "authenticated REST limit (gh api rate_limit)")
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--silent", action="store_true")
     args = parser.parse_args(argv)
@@ -114,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
             "prs_processed": report.prs_processed,
             "review_comments_upserted": report.review_comments_upserted,
             "gh_calls_used": report.gh_calls_used,
+            "gh_call_budget": report.gh_call_budget,
             "downstream_refresh": refresh_steps,
         }, ensure_ascii=False, indent=2))
     return 0 if report.finished_status == "succeeded" else 1

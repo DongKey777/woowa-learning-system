@@ -159,6 +159,18 @@ def test_collect_filter_limit() -> None:
     assert len(out) == 3
 
 
+def test_collect_filter_sorts_ascending_before_limit() -> None:
+    # GitHub returns newest-created first; limit must take the OLDEST-updated so
+    # the cursor advances over a contiguous prefix with no gaps.
+    prs = [
+        {"number": 3, "updated_at": "2026-05-03T00:00:00Z"},
+        {"number": 1, "updated_at": "2026-05-01T00:00:00Z"},
+        {"number": 2, "updated_at": "2026-05-02T00:00:00Z"},
+    ]
+    out = collect_prs._filter_prs(prs, since=None, limit=2)
+    assert [p["number"] for p in out] == [1, 2]
+
+
 def test_collect_filter_title_contains() -> None:
     prs = [
         {"number": 1, "title": "step1 feature", "updated_at": "2026-05-25T00:00:00Z"},
@@ -210,3 +222,73 @@ def test_collect_end_to_end_mocked(monkeypatch, tmp_path: Path) -> None:
     rc_n = conn.execute("SELECT COUNT(*) FROM pull_request_review_comments_current").fetchone()[0]
     assert prs_n == 1 and files_n == 1 and rc_n == 1
     conn.close()
+
+
+# ── budget + cursor regression tests ─────────────────────────────────────
+
+
+def _pr_detail(number: int, updated_at: str) -> str:
+    return json.dumps({
+        "id": 1000 + number, "number": number, "title": f"step1 #{number}",
+        "state": "open", "user": {"login": "DongKey777"}, "body": "",
+        "base": {"ref": "main"}, "head": {"ref": "step1", "sha": f"sha{number}"},
+        "additions": 1, "deletions": 0, "created_at": updated_at,
+        "updated_at": updated_at,
+    })
+
+
+def test_fetch_rate_limit_does_not_consume_budget(monkeypatch) -> None:
+    _patch_gh(monkeypatch, {
+        "rate_limit": json.dumps({"resources": {"core": {"remaining": 4800}}}),
+    })
+    c = GitHubCLIClient("o", "r")
+    rl = c.fetch_rate_limit()
+    assert rl["resources"]["core"]["remaining"] == 4800
+    assert c.calls_used == 0  # /rate_limit must not count against the cap
+
+
+def test_collect_budget_derived_from_rate_limit(monkeypatch, tmp_path: Path) -> None:
+    _patch_gh(monkeypatch, {
+        "user": json.dumps({"login": "t"}),
+        "rate_limit": json.dumps({"resources": {"core": {"remaining": 1234}}}),
+        "repos/o/r/pulls?state=all&per_page=100": json.dumps([[]]),
+    })
+    report = collect_prs.collect(owner="o", repo="r", db_path=tmp_path / "d.sqlite3")
+    assert report.gh_call_budget == 1234 - collect_prs.RATE_LIMIT_MARGIN
+    assert report.finished_status == "succeeded"
+
+
+def test_collect_partial_advances_cursor(monkeypatch, tmp_path: Path) -> None:
+    """A capped run must record the last fully-collected PR's updated_at as the
+    cursor (not wall-clock), so the next run resumes instead of restarting."""
+    pulls = [[
+        {"number": 3, "updated_at": "2026-05-03T00:00:00Z"},
+        {"number": 1, "updated_at": "2026-05-01T00:00:00Z"},
+        {"number": 2, "updated_at": "2026-05-02T00:00:00Z"},
+    ]]
+    responses = {
+        "user": json.dumps({"login": "t"}),
+        "repos/o/r/pulls?state=all&per_page=100": json.dumps(pulls),
+    }
+    for n, ts in [(1, "2026-05-01T00:00:00Z"), (2, "2026-05-02T00:00:00Z")]:
+        responses[f"repos/o/r/pulls/{n}"] = _pr_detail(n, ts)
+        responses[f"repos/o/r/pulls/{n}/files?per_page=100"] = json.dumps([[]])
+        responses[f"repos/o/r/pulls/{n}/reviews?per_page=100"] = json.dumps([[]])
+        responses[f"repos/o/r/pulls/{n}/comments?per_page=100"] = json.dumps([[]])
+        responses[f"repos/o/r/issues/{n}/comments?per_page=100"] = json.dumps([[]])
+    _patch_gh(monkeypatch, responses)
+
+    db_path = tmp_path / "d.sqlite3"
+    # auth(1) + list(1) + 5/PR: fully covers #1 and #2, then #3 detail hits cap.
+    report = collect_prs.collect(owner="o", repo="r", db_path=db_path,
+                                  max_calls=12)
+    assert report.finished_status == "partial"
+    assert report.prs_processed == 2
+
+    conn = sqlite3.connect(str(db_path))
+    finished_at = conn.execute(
+        "SELECT finished_at FROM collection_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    conn.close()
+    # Cursor = updated_at of #2 (last clean PR), not #3 and not wall-clock.
+    assert finished_at == "2026-05-02T00:00:00Z"

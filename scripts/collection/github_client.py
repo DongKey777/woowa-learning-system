@@ -11,6 +11,7 @@ Public class: GitHubCLIClient(owner, repo)
   - fetch_pull_request_reviews(number) -> list[dict]
   - fetch_pull_request_review_comments(number) -> list[dict]
   - fetch_pull_request_issue_comments(number) -> list[dict]
+  - fetch_rate_limit() -> dict   # /rate_limit; does not consume quota
 """
 from __future__ import annotations
 
@@ -38,6 +39,23 @@ class GitHubCLIClient:
 
     def fetch_authenticated_user(self) -> dict[str, Any]:
         return self._run_api("user")
+
+    def fetch_rate_limit(self) -> dict[str, Any]:
+        """Query GitHub's documented 5000/hr authenticated REST budget.
+
+        The /rate_limit endpoint itself does not count against the quota
+        (GitHub docs), so this bypasses the local cap and calls_used counter.
+        """
+        try:
+            result = subprocess.run(
+                ["gh", "api", "rate_limit"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            raise GitHubCLIError(f"rate_limit probe failed: {e}")
+        if result.returncode != 0:
+            raise GitHubCLIError((result.stderr or "rate_limit probe failed").strip())
+        return json.loads(result.stdout)
 
     def fetch_pull_requests(self, state: str = "all") -> list[dict[str, Any]]:
         endpoint = (f"repos/{self.owner}/{self.repo}/pulls"

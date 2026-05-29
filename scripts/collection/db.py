@@ -74,11 +74,14 @@ class ArchiveDatabase:
         return int(cur.lastrowid)
 
     def finish_collection_run(self, run_id: int, status: str,
-                                prs_processed: int = 0, notes: str | None = None) -> None:
+                                prs_processed: int = 0, notes: str | None = None,
+                                finished_at: str | None = None) -> None:
+        # finished_at doubles as the incremental cursor: pass the updated_at of
+        # the last fully-collected PR so partial runs resume correctly.
         self.conn.execute(
             "UPDATE collection_runs SET finished_at=?, status=?, prs_processed=?, "
             "notes=? WHERE id=?",
-            (_now(), status, prs_processed, notes, run_id),
+            (finished_at or _now(), status, prs_processed, notes, run_id),
         )
         self.conn.commit()
 
