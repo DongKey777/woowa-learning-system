@@ -2,6 +2,7 @@
 
 | Entry | Mode | Purpose |
 |---|---|---|
+| [`bin/setup`](#binsetup) | A/B | `.venv` 생성 + `pip install -e .` (PEP 668 안전, `--dev`로 pytest 포함) |
 | [`bin/ask`](#binask) | A | 학습자 자연어 query → daemon ask (학습자 외울 명령 X) |
 | [`bin/rag-daemon`](#binrag-daemon) | A/B | BGE-M3 warm daemon start/stop/ping/status |
 | [`bin/index-fetch`](#binindex-fetch) | A | GitHub Releases에서 pre-built Lance 인덱스 다운로드 |
@@ -13,6 +14,22 @@
 | [`bin/graph-build`](#bingraph-build) | B | concept_graph.json 재빌드 (prereq 등) |
 | [`bin/eval-compare`](#bineval-compare) | B | 두 eval 결과 비교 |
 | [`bin/phase9-gate`](#binphase9-gate) | B | release gate 검증 |
+
+---
+
+## `bin/setup`
+
+repo-local `.venv`를 만들고 그 안에서 `pip install -e .`를 실행하는 First-Run 의존성 부트스트랩.
+
+```bash
+bin/setup          # 런타임 deps (학습자 / Mode A)
+bin/setup --dev    # + pytest (시스템 개발 / Mode B)
+```
+
+- macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라 직접 `pip install`이 거부된다. venv가 이를 마찰 없이 우회한다 (`--break-system-packages` 불필요, 시스템 Python 오염 없음).
+- 설치 후 `bin/` 명령들은 `core/_venv.py` 가드를 통해 `.venv`를 자동 사용한다. `.venv`가 없으면 가드는 no-op이라 시스템 Python에 deps가 이미 깔린 환경은 그대로 동작.
+- 멱등(idempotent): 재실행 시 `.venv`를 재사용하고 in-place 업그레이드.
+- `bin/bootstrap`이 First-Run 1단계에서 자동 호출 (deps가 이미 import되면 skip).
 
 ---
 
@@ -269,7 +286,7 @@ bin/phase9-gate
 
 | Wrapper | Purpose |
 |---|---|
-| `bin/bootstrap` | First-Run system bootstrap (pip / index-fetch / daemon) |
+| `bin/bootstrap` | First-Run system bootstrap (bin/setup → index-fetch → daemon) |
 | `bin/bootstrap-repo --repo R --owner O` | Full GitHub PR archive collection via gh CLI |
 | `bin/onboard-repo --repo R --owner O` | clone + bootstrap-repo + mission-patterns + cross-crew chain |
 | `bin/list-repos [--json]` | List all `state/repos/*/` + per-repo capability flags |

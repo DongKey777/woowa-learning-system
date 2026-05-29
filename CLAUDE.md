@@ -6,7 +6,7 @@
 
 학습자가 외울 명령은 **0개**. 학습자는 한국어로 의도만 표현. 모든 명령은 Claude 세션이 자동 실행:
 
-- `pip install -e .`
+- `bin/setup` (의존성 설치 — 내부적으로 `.venv` 생성 후 `pip install -e .`)
 - BGE-M3 모델 캐시 다운로드 (~3GB)
 - Lance 인덱스 release fetch
 - `bin/rag-daemon start-bg` 백그라운드
@@ -33,9 +33,12 @@ uname -a
 
 ### Step 1. Python 의존성
 ```bash
-pip install -e .
+bin/setup
 ```
-- 핵심: `sentence-transformers`, `FlagEmbedding` (BGE-M3), `lancedb`, `numpy`, `pyarrow`, `jsonschema`, `torch` (MPS on M-series).
+- `bin/setup`이 repo-local `.venv`를 만들고 그 안에 `pip install -e .`를 실행한다. macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라 시스템에 직접 `pip install`이 거부되므로, venv가 마찰 없는 경로다 (`--break-system-packages` 불필요).
+- 설치 후 `bin/` 명령들은 `core/_venv.py` 가드를 통해 `.venv`를 자동 사용한다 — 학습자/AI가 venv를 의식할 필요 없음. `.venv`가 없으면 가드는 no-op (시스템 Python에 deps가 이미 있는 maintainer 환경은 그대로).
+- 핵심 deps: `sentence-transformers` (BGE-M3 wrapper), `transformers`, `torch` (MPS on M-series), `lancedb`, `numpy`, `pyarrow`, `jsonschema`. BGE-M3는 transformers + sentence-transformers로 로드한다 (FlagEmbedding은 RunPod 빌드 전용, 학습자 dep 아님).
+- Mode B (시스템 개발)는 `bin/setup --dev`로 pytest까지 설치.
 
 ### Step 2. HuggingFace 모델 캐시 warm-up
 - 첫 daemon 시작 시 `BAAI/bge-m3` (~3GB) 자동 다운로드.

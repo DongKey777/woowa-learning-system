@@ -5,7 +5,7 @@
 ## 1. 무엇이 학습자에게 보이고 무엇이 자동인가
 
 학습자가 외울 명령은 **0개**. 학습자는 한국어로 의도만 표현. AI 세션이 모든 명령 자동 실행:
-- `pip install -e .`
+- `bin/setup` (`.venv` 생성 후 `pip install -e .`)
 - BGE-M3 모델 캐시 다운로드 (~3GB)
 - Lance 인덱스 release fetch
 - `bin/rag-daemon start-bg` 백그라운드
@@ -28,9 +28,11 @@
 
 ### Step 1. 의존성
 ```bash
-pip install -e .
+bin/setup          # 학습자 (Mode A)
+bin/setup --dev    # 시스템 개발 (Mode B, pytest 포함)
 ```
-deps: `sentence-transformers`, `FlagEmbedding`, `lancedb`, `numpy`, `pyarrow`, `jsonschema`, `torch`.
+`bin/setup`은 repo-local `.venv`를 만들고 그 안에 `pip install -e .`를 실행한다. macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라 시스템 직접 설치가 거부되므로 venv가 마찰 없는 경로다 (`--break-system-packages` 불필요). 설치 후 `bin/` 명령들은 `core/_venv.py` 가드로 `.venv`를 자동 사용하고, `.venv`가 없으면 가드는 no-op.
+deps: `sentence-transformers`, `transformers`, `lancedb`, `numpy`, `pyarrow`, `jsonschema`, `torch`. (BGE-M3는 transformers + sentence-transformers로 로드 — `FlagEmbedding`은 RunPod 빌드 전용, 학습자 dep 아님.)
 
 ### Step 2. HF 모델 캐시
 - 첫 daemon 시작 때 `BAAI/bge-m3` (~3GB) 자동 fetch. offline = `export HF_HUB_OFFLINE=1`.

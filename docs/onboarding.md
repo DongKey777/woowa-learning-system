@@ -49,23 +49,36 @@ uname -a                     # macOS / Linux 확인
 ### Step 1 — Python 의존성
 
 ```bash
-pip install -e .
+bin/setup          # 학습자 (Mode A)
+bin/setup --dev    # 시스템 개발 (Mode B, pytest 포함)
 ```
+
+`bin/setup`은 repo-local `.venv`를 만들고 그 안에서 `pip install -e .`를 실행한다.
+macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라
+시스템에 직접 `pip install`하면 거부되는데, venv가 이를 마찰 없이 우회한다
+(`--break-system-packages` 불필요, 시스템 Python 오염 없음). 설치 후
+`bin/` 명령들은 `core/_venv.py` 가드를 통해 `.venv`를 자동으로 사용한다 —
+학습자도 AI도 venv를 의식할 필요가 없다. `.venv`가 없으면 가드는 no-op이라,
+시스템 Python에 deps가 이미 깔린 maintainer 환경은 그대로 동작한다.
 
 설치되는 핵심 패키지:
 - `sentence-transformers` (BGE-M3 wrapper)
-- `FlagEmbedding` (BGE-M3 native)
+- `transformers` (BGE-M3 모델/토크나이저 로드)
 - `lancedb` (vector index)
 - `numpy`, `pyarrow` (수치/columnar)
 - `jsonschema` (corpus validation)
 - `torch` (BGE-M3 backend, MPS on M-series)
 
-성공 신호: `pip list | grep -E "sentence-transformers|lancedb"` 로 둘 다 출력.
+> BGE-M3는 `transformers` + `sentence-transformers`로 로드한다. `FlagEmbedding`은
+> RunPod 인덱스 빌드(`scripts/remote_build.py`)에서만 쓰이는 maintainer 전용
+> 패키지로, 학습자 런타임 의존성이 **아니다**.
+
+성공 신호: `.venv/bin/pip list | grep -E "sentence-transformers|lancedb"` 로 둘 다 출력.
 
 실패 시 OS별 안내:
-- macOS Apple Silicon: torch wheel은 MPS 지원판 자동 선택됨. 안 되면 `pip install --upgrade torch`.
+- macOS Apple Silicon: torch wheel은 MPS 지원판 자동 선택됨. 안 되면 `.venv/bin/pip install --upgrade torch`.
 - Ubuntu Intel/AMD: CUDA가 없으면 CPU torch 자동. 성능은 비슷.
-- Windows native: native venv 권장. WSL이 더 안정.
+- Windows native: `bin/setup`은 sh 스크립트라 Git Bash/WSL에서 실행. WSL이 더 안정.
 
 ### Step 2 — HuggingFace 모델 캐시 warm-up
 
@@ -227,7 +240,7 @@ bin/capture-repair --last 50
 
 | 단계 | 시간 (M4 / 광대역) |
 |---|---|
-| `pip install -e .` | ~30초 (캐시 hit) ~ 2분 (cold) |
+| `bin/setup` (`.venv` + `pip install -e .`) | ~30초 (캐시 hit) ~ 2분 (cold) |
 | BGE-M3 다운로드 | ~5분 (3GB) |
 | `bin/index-fetch` (release) | ~15초 (약 13-19MB) |
 | Daemon prewarm | ~10초 |

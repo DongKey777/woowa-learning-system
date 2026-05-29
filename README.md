@@ -26,7 +26,7 @@
 2. AI 세션 열기 — Claude Code / Codex CLI / Gemini CLI 중 아무거나.
 3. AI에게 한국어로 한 문장: *"세팅하고 학습 시작하자"*
 4. AI가 [First-Run Protocol](docs/onboarding.md)을 자동 수행 (~6분):
-   - Python 3.10+ 확인 + `pip install -e .`
+   - Python 3.10+ 확인 + `bin/setup` (`.venv` 생성 후 `pip install -e .` — PEP 668 시스템 Python에서도 마찰 없이)
    - BGE-M3 모델 캐시 다운로드 (~3GB, 첫 실행만)
    - `bin/index-fetch` — GitHub Releases에서 사전 빌드된 Lance 인덱스 다운로드 (약 13-19MB, ~15초)
    - `bin/rag-daemon start-bg` 백그라운드

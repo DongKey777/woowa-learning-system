@@ -2,7 +2,7 @@
 """bin/bootstrap — paradigm-v2 system-level bootstrap (Phase U).
 
 Runs First-Run Protocol step 1-6:
-  1. pip install -e . (if dev deps missing)
+  1. bin/setup (.venv + pip install -e .) if deps missing
   2. (HF model warm-up happens on first daemon ask)
   3. bin/index-fetch (release artifact)
   4. bin/rag-daemon start
@@ -37,6 +37,17 @@ def _run(cmd: list[str], cwd: Path = REPO_ROOT, timeout: float = 600) -> dict:
         return {"cmd": " ".join(cmd), "rc": 124, "ms": -1, "error": "timeout"}
 
 
+def _interp_has_deps(interp: Path) -> bool:
+    try:
+        r = subprocess.run(
+            [str(interp), "-c", "import sentence_transformers"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _daemon_alive() -> bool:
     r = subprocess.run(
         [sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"), "ping"],
@@ -54,13 +65,20 @@ def main(argv: list[str] | None = None) -> int:
 
     steps: list[dict] = []
 
-    # 1. pip install (idempotent)
+    # 1. dependency setup (idempotent). bin/setup creates a repo-local .venv and
+    # installs there, so it works on PEP 668 externally-managed system Python
+    # (macOS Homebrew / Debian) without --break-system-packages. Skip entirely
+    # when deps already import on this interpreter (maintainer system-Python
+    # setup) or when an existing .venv already has them.
     if not args.skip_pip:
+        venv_py = REPO_ROOT / ".venv" / "bin" / "python"
         if importlib.util.find_spec("sentence_transformers") is not None:
-            steps.append({"step": "pip", "rc": 0, "ms": 0, "skipped": "deps present"})
+            steps.append({"step": "setup", "rc": 0, "ms": 0, "skipped": "deps present"})
+        elif venv_py.exists() and _interp_has_deps(venv_py):
+            steps.append({"step": "setup", "rc": 0, "ms": 0, "skipped": ".venv ready"})
         else:
-            steps.append({"step": "pip"} | _run(
-                [sys.executable, "-m", "pip", "install", "-e", "."], timeout=600
+            steps.append({"step": "setup"} | _run(
+                [str(REPO_ROOT / "bin" / "setup")], timeout=900
             ))
 
     # 2. index fetch + runtime sidecar ensure
