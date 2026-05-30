@@ -15,7 +15,25 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from core import daemon  # noqa: E402
 from core.router import route  # noqa: E402
+
+
+def _build_cosine_fn():
+    """Pure dense top-1 cosine via the warm daemon — mirrors the daemon's own
+    _nearest_concept_cosine so the gate fixtures exercise the deployed path.
+    Returns None if no daemon is up (gate fixtures then route to tier_0)."""
+    if not daemon.ping():
+        return None
+
+    def _cosine(text: str) -> float | None:
+        hits = daemon.search(text, top_k=1, relations_expand=0, lexical_expand=0)
+        if not hits:
+            return None
+        return float(hits[0].get("score"))
+
+    return _cosine
+
 
 FIXTURES = [
     # Phase J 14-scenario set
@@ -49,12 +67,19 @@ FIXTURES = [
     ("DI가 뭐야", "cs_qa"),                          # Korean josa
     ("Spring Bean 생명주기", "cs_qa"),               # CS phrase (no explicit intent)
     ("JPA n+1 문제 원리", "cs_qa"),                  # short token (n+1) + intent
+    # Pillar 2 — semantic router gate rescues genuine CS prompts the lexical
+    # CS_TOKENS guard misses (no hardcoded token), via nearest-concept cosine.
+    ("MVCC가 뭐야", "cs_qa"),                        # exact-query match, guard blind
+    ("격리 수준이 뭐야", "cs_qa"),                    # exact-query match, guard blind
+    ("MVCC와 낙관적 락 차이", "cs_qa"),               # paraphrase, cosine >= threshold
+    ("낙관적 락이 뭐야", "cs_qa"),                    # paraphrase, cosine >= threshold
 ]
 
 
 def main(argv: list[str] | None = None) -> int:
     # Use repo-context for coaching-relevant prompts
     repo_keywords = {"내", "이 코드", "JdbcTemplate", "리팩토링"}
+    cosine_fn = _build_cosine_fn()
     correct = 0
     by_mode_correct: Counter = Counter()
     by_mode_total: Counter = Counter()
@@ -62,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     confusion: dict[tuple, int] = defaultdict(int)
     for prompt, expected in FIXTURES:
         repo = "spring-roomescape-member" if any(k in prompt for k in repo_keywords) else None
-        decision = route(prompt, repo=repo)
+        decision = route(prompt, repo=repo, nearest_concept_cosine=cosine_fn)
         got = decision.mode
         by_mode_total[expected] += 1
         if got == expected:
