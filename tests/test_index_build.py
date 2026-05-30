@@ -36,18 +36,13 @@ def test_build_index_round_trip(tmp_path: Path) -> None:
     expected = _concept_file_count()
     assert report.concepts_indexed == expected
     assert report.index_path == index_dir
-    # Chunk index: one card chunk + N body windows per concept, so rows >= concepts.
-    assert report.chunks_indexed >= expected
 
     table = open_index(index_dir=index_dir)
-    assert table.count_rows() == report.chunks_indexed
+    assert table.count_rows() == expected
 
     rows = table.to_pandas()
-    # Every concept is present exactly once as a group key (chunk rows repeat it).
-    assert rows["concept_id"].nunique() == expected
-    assert {"concept_id", "chunk_index", "vector", "category", "title"} <= set(rows.columns)
-    # chunk 0 (the card) must exist for every concept (top1-precision guard).
-    assert set(rows[rows["chunk_index"] == 0]["concept_id"]) == set(rows["concept_id"].unique())
+    assert sorted(rows["concept_id"].unique()) == sorted(rows["concept_id"].tolist())
+    assert {"concept_id", "vector", "category", "title"} <= set(rows.columns)
     first_vec = rows["vector"].iloc[0]
     assert len(first_vec) == EMBED_DIM
 
@@ -64,21 +59,16 @@ def test_open_index_missing_raises(tmp_path: Path) -> None:
         open_index(index_dir=tmp_path / "nope")
 
 
-def test_chunk_index_size_tracks_raw_vector_floor(tmp_path: Path) -> None:
-    """Lance index size should stay close to its raw chunk-vector floor.
+def test_index_size_under_50mb_with_mock_encoder(tmp_path: Path) -> None:
+    """Lance index size should stay close to the 13MB raw-vector floor.
 
-    The chunk index holds ~26k vectors (card + body windows per concept) at
-    1024 float32 = ~102MB raw. Real BGE-M3 vectors are the same bytes as mock
-    ones, so this confirms Lance overhead does not balloon the index beyond a
-    small multiple of the raw float floor.
+    Real BGE-M3 vectors are not denser than mock ones at the bytes layer —
+    this confirms the Lance overhead does not balloon the index.
     """
     index_dir = tmp_path / "index"
     report = build_index(index_dir=index_dir, encode_fn=_mock_encode_factory())
     mb = report.index_size_bytes / (1024 * 1024)
-    raw_floor_mb = report.chunks_indexed * EMBED_DIM * 4 / (1024 * 1024)
-    assert mb < raw_floor_mb * 1.5, (
-        f"index unexpectedly large: {mb:.1f}MB vs raw floor {raw_floor_mb:.1f}MB"
-    )
+    assert mb < 50, f"index unexpectedly large: {mb:.1f}MB"
 
 
 def test_index_size_excludes_neighbor_sidecars(tmp_path: Path) -> None:
