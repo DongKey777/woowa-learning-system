@@ -34,9 +34,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 DEFAULT_GPU = "NVIDIA A100 80GB PCIe"
 DEFAULT_CLOUD_TYPE = "COMMUNITY"
-DEFAULT_DISK_GB = 50
+# ~3GB model cache + deps + ~150MB index; 25GB leaves headroom while staying
+# deployable on small-disk community hosts (50GB tripped "machine lacks
+# resources" on 24GB cards).
+DEFAULT_DISK_GB = 25
 DEFAULT_MIN_VRAM_GB = 40
-DEFAULT_MIN_RAM_GB = 96
+# BGE-M3 encode of the corpus needs ~16GB host RAM; requiring 96GB filtered out
+# every single-GPU instance (24-48GB cards pair with far less host RAM) and made
+# RunPod return a generic "no instances available" for all GPUs/clouds.
+DEFAULT_MIN_RAM_GB = 16
 
 INDEX_LOCAL = REPO_ROOT / "state" / "index"
 ARTIFACT_REMOTE = "/workspace/index.tar.zst"
@@ -111,6 +117,8 @@ def run(
     dry_run: bool,
     gpu_type: str,
     cloud_type: str,
+    min_ram_gb: int = DEFAULT_MIN_RAM_GB,
+    disk_gb: int = DEFAULT_DISK_GB,
 ) -> int:
     if dry_run:
         print("[dry-run] commands:")
@@ -130,9 +138,9 @@ def run(
         cloud_type=cloud_type,
         gpu_count=1,
         volume_in_gb=0,
-        container_disk_in_gb=DEFAULT_DISK_GB,
+        container_disk_in_gb=disk_gb,
         min_vcpu_count=4,
-        min_memory_in_gb=DEFAULT_MIN_RAM_GB,
+        min_memory_in_gb=min_ram_gb,
         ports="22/tcp",
         support_public_ip=True,
         start_ssh=True,
@@ -206,8 +214,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gpu-type", default=DEFAULT_GPU,
                         help=f"RunPod GPU type id (default: {DEFAULT_GPU})")
     parser.add_argument("--cloud-type", default=DEFAULT_CLOUD_TYPE,
-                        choices=("COMMUNITY", "SECURE"),
+                        choices=("COMMUNITY", "SECURE", "ALL"),
                         help=f"RunPod cloud type (default: {DEFAULT_CLOUD_TYPE})")
+    parser.add_argument("--min-ram-gb", type=int, default=DEFAULT_MIN_RAM_GB,
+                        help=f"min host RAM filter (default: {DEFAULT_MIN_RAM_GB})")
+    parser.add_argument("--disk-gb", type=int, default=DEFAULT_DISK_GB,
+                        help=f"container disk size (default: {DEFAULT_DISK_GB})")
     args = parser.parse_args(argv)
 
     api_key = os.environ.get("RUNPOD_API_KEY") or _read_key_file()
@@ -223,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     commit_sha = args.commit_sha or _current_commit_sha()
     return run(api_key=api_key or "", commit_sha=commit_sha,
                keep_pod=args.keep_pod, dry_run=args.dry_run,
-               gpu_type=args.gpu_type, cloud_type=args.cloud_type)
+               gpu_type=args.gpu_type, cloud_type=args.cloud_type,
+               min_ram_gb=args.min_ram_gb, disk_gb=args.disk_gb)
 
 
 def _read_key_file() -> str | None:
