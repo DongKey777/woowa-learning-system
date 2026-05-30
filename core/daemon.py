@@ -38,8 +38,12 @@ def search(
     relations_expand: int = 3,
     state_root: Path = DEFAULT_STATE_ROOT,
     learner_id: str | None = None,
+    lexical_expand: int | None = None,
 ) -> list[dict] | None:
-    """Returns hits via daemon. None if daemon unavailable (caller falls back)."""
+    """Returns hits via daemon. None if daemon unavailable (caller falls back).
+
+    lexical_expand=0 disables the fusion rerank for a pure dense top-k (the
+    signal the semantic router gate consumes); None keeps the server default."""
     sp = _socket_path(state_root)
     if not sp.exists():
         return None
@@ -53,6 +57,8 @@ def search(
             "top_k": top_k,
             "relations_expand": relations_expand,
         }
+        if lexical_expand is not None:
+            req_payload["lexical_expand"] = lexical_expand
         if learner_id:
             req_payload["learner_id"] = learner_id
         req = json.dumps(req_payload) + "\n"
@@ -341,6 +347,19 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
             lexical_fns[expand] = make_lexical_fusion_fn(loaded_corpus, expand=expand)
         return lexical_fns[expand]
 
+    def _nearest_concept_cosine(text: str) -> float | None:
+        """Top-1 dense cosine for the semantic router rescue (Pillar 2).
+
+        Only invoked by route() when the lexical CS_TOKENS guard would drop a
+        cs_qa prompt and WOOWA_SEMANTIC_ROUTER_THRESHOLD is set, so it adds zero
+        cost on the happy path. Uses the warm encoder + Lance index already held
+        by the daemon."""
+        try:
+            hits = rag_search(text, top_k=1, relations_expand=0, rerank_fn=None, corpus=corpus)
+        except Exception:  # noqa: BLE001
+            return None
+        return float(hits[0].score) if hits else None
+
     startup_timings["total_to_ready_ms"] = round(
         (time.perf_counter() - startup_t0) * 1000,
         1,
@@ -415,12 +434,14 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         prompt, repo=repo,
                         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
                         pending_drill=profile.pending_triggers.get("review_drill"),
+                        nearest_concept_cosine=_nearest_concept_cosine,
                     )
                     if decision.mode == "tier_0_fallback" and reformulated_query:
                         decision = route(
                             reformulated_query, repo=repo,
                             pending_self_assessment=profile.pending_triggers.get("self_assessment"),
                             pending_drill=profile.pending_triggers.get("review_drill"),
+                            nearest_concept_cosine=_nearest_concept_cosine,
                         )
                     artifacts = lazy_load(
                         decision,

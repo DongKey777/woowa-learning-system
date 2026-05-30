@@ -8,7 +8,6 @@ from rag.corpus_loader import LoadedCorpus
 from rag.search import SearchHit
 from core.lexical_fusion import (
     _LEXICAL_CACHE,
-    _LEXICAL_INDEX_CACHE,
     _fuse_lexical,
     _hinted_category,
     _lexical_candidates,
@@ -91,7 +90,6 @@ def test_lexical_sidecar_round_trip_preserves_candidates(tmp_path: Path) -> None
 
     stats = write_lexical_sidecar(corpus, path)
     _LEXICAL_CACHE.clear()
-    _LEXICAL_INDEX_CACHE.clear()
     loaded = load_lexical_sidecar(path, corpus)
 
     assert stats["entries"] == 2
@@ -126,7 +124,6 @@ def test_preload_lexical_entries_builds_then_loads_sidecar(tmp_path: Path) -> No
 
     first = preload_lexical_entries(corpus, path)
     _LEXICAL_CACHE.clear()
-    _LEXICAL_INDEX_CACHE.clear()
     second = preload_lexical_entries(corpus, path)
 
     assert first["source"] == "built"
@@ -174,7 +171,9 @@ def test_canonical_candidate_promotes_over_specialized_bridge() -> None:
     assert promoted[0].concept_id == "spring/transactional-basics"
 
 
-def test_strong_lexical_signal_can_override_weak_dense_head() -> None:
+def test_strong_lexical_lookalike_does_not_override_dense_head() -> None:
+    # A cross-category lexical lookalike must NOT displace the dense top-1:
+    # this aggressive override regressed real paraphrased queries (Pillar 0).
     concepts = {
         "database/roomescape-table-drill": _concept(
             "database/roomescape-table-drill",
@@ -212,10 +211,12 @@ def test_strong_lexical_signal_can_override_weak_dense_head() -> None:
 
     hits = rerank("JdbcReservationRepository DAO vs Repository naming bridge", seed)
 
-    assert hits[0].concept_id == "software-engineering/roomescape-dao-vs-repository-bridge"
+    assert hits[0].concept_id == "database/roomescape-table-drill"
 
 
-def test_strong_lexical_only_candidate_can_override_stale_dense_head() -> None:
+def test_strong_lexical_only_candidate_does_not_override_dense_head() -> None:
+    # Even when the only lexical candidate has a richer token overlap, the dense
+    # top-1 head is preserved rather than displaced (Pillar 0).
     concepts = {
         "data-structure/counting-bloom-cuckoo-filter-deletion-chooser": _concept(
             "data-structure/counting-bloom-cuckoo-filter-deletion-chooser",
@@ -256,11 +257,13 @@ def test_strong_lexical_only_candidate_can_override_stale_dense_head() -> None:
     )
 
     assert hits[0].concept_id == (
-        "data-structure/bloom-cuckoo-counting-filter-membership-perspective-map"
+        "data-structure/counting-bloom-cuckoo-filter-deletion-chooser"
     )
 
 
-def test_strong_lexical_scan_does_not_stop_at_weak_dense_fallback() -> None:
+def test_strong_lexical_scan_does_not_displace_dense_head() -> None:
+    # A deep strong-lexical match further down the list must not be promoted
+    # over the dense top-1 head (Pillar 0).
     concepts = {
         "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design": _concept(
             "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
@@ -311,7 +314,7 @@ def test_strong_lexical_scan_does_not_stop_at_weak_dense_fallback() -> None:
     )
 
     assert hits[0].concept_id == (
-        "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+        "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design"
     )
 
 

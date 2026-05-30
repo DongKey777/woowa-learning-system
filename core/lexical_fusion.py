@@ -26,7 +26,6 @@ _STOPWORDS = {
     "알려줘", "왜", "언제", "어디", "어떻게", "하는", "되는", "기초",
 }
 _LEXICAL_CACHE: dict[int, tuple[LoadedCorpus, tuple[dict, ...]]] = {}
-_LEXICAL_INDEX_CACHE: dict[int, tuple[LoadedCorpus, dict[str, dict]]] = {}
 _CATEGORY_HINTS = {
     "spring": ("spring", "스프링", "@transactional", "transactional", "bean", "mvc", "aop"),
     "database": ("database", "db", "mvcc", "replica", "lock", "pool", "sql"),
@@ -59,9 +58,7 @@ def make_lexical_fusion_fn(
         if expand <= 0 or not hits:
             return hits
         fused = _fuse_lexical(hits, _lexical_candidates(query, corpus, expand))
-        promoted = _promote_hinted_category(query, fused)
-        promoted = _promote_canonical_candidate(promoted)
-        promoted = _promote_strong_lexical_candidate(query, promoted, corpus)
+        promoted = _promote_canonical_candidate(fused)
         promoted = _promote_exact_expected_query(promoted, _exact_expected_candidates(query, corpus))
         return _refine_confusable_order(query, promoted, corpus)
 
@@ -88,7 +85,6 @@ def _lexical_entries(corpus_key: int, corpus: LoadedCorpus) -> tuple[dict, ...]:
         if cached_corpus is corpus:
             return cached_entries
         _LEXICAL_CACHE.pop(corpus_key, None)
-        _LEXICAL_INDEX_CACHE.pop(corpus_key, None)
     loaded = load_lexical_sidecar(DEFAULT_LEXICAL_SIDECAR_PATH, corpus)
     if loaded is not None:
         _LEXICAL_CACHE[corpus_key] = (corpus, loaded)
@@ -96,22 +92,6 @@ def _lexical_entries(corpus_key: int, corpus: LoadedCorpus) -> tuple[dict, ...]:
     built = _build_lexical_entries(corpus)
     _LEXICAL_CACHE[corpus_key] = (corpus, built)
     return built
-
-
-def _lexical_entry_index(corpus: LoadedCorpus) -> dict[str, dict]:
-    corpus_key = id(corpus)
-    cached = _LEXICAL_INDEX_CACHE.get(corpus_key)
-    if cached is not None:
-        cached_corpus, cached_index = cached
-        if cached_corpus is corpus:
-            return cached_index
-        _LEXICAL_INDEX_CACHE.pop(corpus_key, None)
-    index = {
-        str(entry["concept_id"]): entry
-        for entry in _lexical_entries(corpus_key, corpus)
-    }
-    _LEXICAL_INDEX_CACHE[corpus_key] = (corpus, index)
-    return index
 
 
 def _build_lexical_entries(corpus: LoadedCorpus) -> tuple[dict, ...]:
@@ -211,10 +191,6 @@ def write_lexical_sidecar(
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(path)
     _LEXICAL_CACHE[id(corpus)] = (corpus, built)
-    _LEXICAL_INDEX_CACHE[id(corpus)] = (
-        corpus,
-        {str(entry["concept_id"]): entry for entry in built},
-    )
     return {
         "source": "built",
         "path": str(path),
@@ -234,10 +210,6 @@ def preload_lexical_entries(
     loaded = load_lexical_sidecar(path, corpus)
     if loaded is not None:
         _LEXICAL_CACHE[id(corpus)] = (corpus, loaded)
-        _LEXICAL_INDEX_CACHE[id(corpus)] = (
-            corpus,
-            {str(entry["concept_id"]): entry for entry in loaded},
-        )
         return {
             "source": "sidecar",
             "path": str(path),
@@ -359,16 +331,6 @@ def _hinted_category(query: str) -> str | None:
     return None
 
 
-def _promote_hinted_category(query: str, hits: list[SearchHit]) -> list[SearchHit]:
-    category = _hinted_category(query)
-    if category is None or not hits or hits[0].category == category:
-        return hits
-    for idx, hit in enumerate(hits[1:], start=1):
-        if hit.category == category:
-            return [hit] + hits[:idx] + hits[idx + 1:]
-    return hits
-
-
 def _promote_canonical_candidate(hits: list[SearchHit]) -> list[SearchHit]:
     if not hits or not any(marker in hits[0].concept_id for marker in _SPECIALIZED_MARKERS):
         return hits
@@ -376,38 +338,6 @@ def _promote_canonical_candidate(hits: list[SearchHit]) -> list[SearchHit]:
     for idx, hit in enumerate(hits[1:5], start=1):
         if hit.category == head_category and hit.concept_id in _CANONICAL_PROMOTION_IDS:
             return [hit] + hits[:idx] + hits[idx + 1:]
-    return hits
-
-
-def _promote_strong_lexical_candidate(
-    query: str,
-    hits: list[SearchHit],
-    corpus: LoadedCorpus,
-) -> list[SearchHit]:
-    query_tokens = _tokens(query)
-    entry_by_id = _lexical_entry_index(corpus)
-    head_entry = entry_by_id.get(hits[0].concept_id)
-    head_strong = _overlap_count(query_tokens, (head_entry or {}).get("strong_tokens"))
-    head_title = _overlap_count(query_tokens, (head_entry or {}).get("title_tokens"))
-    fallback_idx: int | None = None
-    for idx, hit in enumerate(hits[1:32], start=1):
-        entry = entry_by_id.get(hit.concept_id)
-        if not entry:
-            continue
-        strong_hits = _overlap_count(query_tokens, entry.get("strong_tokens"))
-        title_hits = _overlap_count(query_tokens, entry.get("title_tokens"))
-        if (
-            hit.source == "lexical"
-            and (strong_hits >= 6 or title_hits >= 2)
-            and (title_hits >= 1 or strong_hits >= 8)
-            and (strong_hits >= head_strong + 2 or title_hits > head_title)
-        ):
-            return [hit] + hits[:idx] + hits[idx + 1:]
-        if fallback_idx is None and head_strong <= 1 and strong_hits >= 3 and title_hits >= 2:
-            fallback_idx = idx
-    if fallback_idx is not None:
-        hit = hits[fallback_idx]
-        return [hit] + hits[:fallback_idx] + hits[fallback_idx + 1:]
     return hits
 
 

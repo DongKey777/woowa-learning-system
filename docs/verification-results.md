@@ -1,8 +1,86 @@
-# Verification results — latest Y14 corpus closure + historical phase results
+# Verification results — latest retrieval redesign (Pillar 0+2) + historical phase results
 
-최신 측정 날짜: 2026-05-28
+최신 측정 날짜: 2026-05-31
 브랜치: `main`
-기준: Y14 batch 1-7 corpus closure after remote dense index rebuild and release v1.0.2 sync. Learner state는 2026-05-28 reset 완료 (`events_total=0`) 후 실제 사용 데이터로 재누적한다.
+기준: 근본적 retrieval 재설계 cycle. **실제 학습 데이터(`history.jsonl` 1,354 rag_ask)** 기반 측정-우선. Pillar 0(rerank overfit 제거) + Pillar 2(시맨틱 라우터 게이트)를 배포했고, Pillar 1(chunk body dense)은 빌드·측정 후 **이득 없음으로 reject**했다. 직전 기준선은 Y14 corpus closure + index v1.0.2다.
+
+## 0. 최신 — Retrieval 재설계 (Pillar 0+2, 2026-05-31)
+
+### 0.1 한 줄 요약
+
+실제 학습 prompt로 라벨링한 `real_learner_qrels_v1`(50 q, 40 ranking-eligible) 기준, **top1 0.400 → 0.725 (+32.5pp)**, MRR +21.4pp, NDCG@5 +11.7pp, forbidden 9 → 8, p95 회귀 +0.5%(예산 내). 합성 qrels(180 q) 교차검증도 top1 +2.8pp / NDCG +1.1pp로 비회귀. 이 이득은 **전부 코드(Pillar 0 rerank fix + Pillar 2 router gate)** 에서 나오며 **인덱스는 v1.0.2 그대로**다 → 새 release 불필요(학습자는 `git pull`로 코드만 갱신, 기존 index 유지). Pillar 1 chunk 인덱스는 RunPod에서 빌드(26,188 chunks)했으나 실데이터에서 single-vector 대비 top1·recall·ndcg를 **희석**(top1 0.725→0.625)해 reject·복원했다. full pytest **523 passed**, golden **2/2**, router-generalization **27/27 (acc 1.000)**.
+
+### 0.2 헤드라인 델타 — 실데이터 qrels (핵심, control=baseline v1.0.2-equiv)
+
+| 지표 | baseline | 배포본 | Δ | 게이트 |
+|---|---:|---:|---:|---|
+| top1_match_rate | 0.400 | **0.725** | **+32.5pp** | ✅ (fail-on-drift PASS) |
+| recall@5 | 0.773 | 0.785 | +1.2pp | — |
+| MRR | 0.601 | **0.815** | +21.4pp | — |
+| NDCG@5 | 0.627 | **0.744** | +11.7pp | ✅ |
+| learner_alignment | 0.947 | 0.960 | +1.3pp | — |
+| forbidden_hit_count | 9 | 8 | −1 | ✅ 비상승 |
+| p50 / p95 ms | 48.4 / 179.4 | 60.1 / 180.3 | +0.5% p95 | ✅ <10% |
+
+(ranking-eligible 40/50. corpus-gap probe 8건·forbidden 2건 등은 ranking 제외.)
+
+### 0.3 교차검증 — 합성 qrels (회귀 안전, 180 q)
+
+| 지표 | baseline | 배포본 | Δ |
+|---|---:|---:|---:|
+| top1_match_rate | 0.739 | 0.767 | +2.8pp |
+| recall@5 | 0.925 | 0.918 | −0.7pp (fail field 아님) |
+| MRR | 0.825 | 0.842 | +1.7pp |
+| NDCG@5 | 0.834 | 0.845 | +1.1pp |
+| forbidden_hit_count | 2 | 2 | 0 |
+| p95 ms | 53.6 | 50.9 | −5.0% |
+
+`cohort-compare --fail-on-drift`: 실·합성 **둘 다 PASS**(accuracy_drift 0, top1/ndcg drift ≥ 0, p95 회귀 < 10%).
+
+### 0.4 도달성 — Pillar 2 시맨틱 라우터 게이트 (tier_0 구제)
+
+cohort-eval은 라우터 독립(pure retrieval)이라 게이트 이득을 안 잡는다. 라우터 측 증거:
+- `router-generalization-eval`: **27/27 (acc 1.000)** — cs_qa **15/15**(신규 MVCC/동시성 fixture 포함), tier_0_fallback **3/3**(weather/dinner/예약 가드 유지). **양방향**(CS 구제 + 비-CS 차단) 입증.
+- 라이브 확인: `"MVCC가 뭐야"` → 기존 tier_0 → 이제 **cs_qa** (reason: `semantic rescue: lexical guard missed but nearest concept cosine 1.000 >= 0.560`).
+- `reclassify-history --last 1000`: lexical drift **0** — 게이트는 base 라우터를 안 바꾸고 daemon 레이어에서 **가산적**으로만 구제(부작용 없음).
+
+### 0.5 Pillar 1 (chunk body dense) — 측정 후 reject (negative result)
+
+| 지표 (실데이터) | single-vector | chunk (pen=1.0) | 판정 |
+|---|---:|---:|---|
+| top1 | 0.725 | 0.625 | 희석 ↓ |
+| recall@5 | 0.785 | 0.746 | ↓ |
+| NDCG@5 | 0.744 | 0.668 | ↓ |
+| forbidden | 8 | 3 | ↑(유일 이득) |
+
+search-side rescue 스윕(overfetch×body-penalty, 재빌드 없음): `body_penalty ≤ 0.80`이면 chunk가 single-vector **수치와 정확히 일치**(card가 max-pool을 항상 이김). top1·recall 동시 우위 config **없음**. 실제 학습 질문이 concept 수준("MVCC가 뭐야", "낙관적 락")이라 이미 card(title|aliases|expected_queries|summary)로 도달 가능 → body window는 max-pool 노이즈만 추가. chunk index는 **66MB vs 14MB(5×)** 로 학습자 fetch에도 불리. 가설 기각, `f3afab6` revert(`b2a5406`).
+
+### 0.6 라벨 신뢰도 (Phase M)
+
+`authoring_method: behavioral_evidence_plus_ai_semantic_join`. 40 ranking-eligible 라벨 근거: **behavioral 16 / semantic 24 / none 10**(none = corpus-gap probe, 의도적 unanswerable). cohort 분포: mission_bridge 16, confusable_pairs 13, paraphrase_human 10, corpus_gap_probe 8, forbidden_neighbor 2, symptom_to_cause 1. 근거 1줄/라벨은 `reports/qrels_label_rationale.jsonl`(50줄, gitignored). 합성 qrels 교차검증으로 한쪽 라벨 편향 상호 견제.
+
+### 0.7 무엇이 배포됐나 / 비용 / 안전
+
+- **main 머지(green-gated)**: Phase M qrels fixture(`8833698`) + Pillar 0 rerank fix(`b6e0cc8`) + Pillar 2 router gate(`e3b4639`) + RunPod 빌드 tooling fix(`5219477`) + Pillar 1 revert(`b2a5406`).
+- **새 index release 없음** — 인덱스는 v1.0.2 그대로(이득이 코드-온리). 학습자 영향: `git pull` 후 즉시 적용, `index-fetch` 재실행 불필요.
+- **RunPod**: 1 빌드(A40 SECURE, chunk index 26,188 chunks, ~$0.05), reject 후 pod 정상 종료(orphan 0).
+- **안전**: `WOOWA_SESSION_MODE=development` 유지. `state/learner/*.jsonl`은 gitignored → 게이트 fixture prompt가 main/public에 안 들어감. force-push 없음, 미통과본 배포 없음.
+- **알림(로컬 history)**: 이번 무인 cycle의 eval/golden 실행이 로컬 `state/learner/history.jsonl`에 dev-mode rag_ask **10건**(MVCC smoke 1 + golden tool_only 3×3, ts ≈ 1780165539~1780166684)을 남겼다. gitignored라 main/public clone엔 영향 없다. "`state/learner` 변경 절대 금지" 하드 제약이 cleanup 편집보다 우선하므로 **삭제하지 않고 그대로 보존**했다(진짜 학습 데이터 오삭제 위험 회피). 원하면 사람이 위 ts 범위 라인만 직접 제거 가능 — gitignored라 git 복구는 불가하니 백업 후 진행 권고.
+- **보류(다음 supervised 세션 권고)**: evidence enrichment(history 신호 기반 aliases/expected_queries 보강). 자가 라벨 qrels에만 검증 가능 → overfit/teach-to-test 위험 + 학습자 노출 index release를 동반하므로, 무인 배포 대신 corpus diff·label 도출을 사람이 검토하는 세션에서 진행 권고. `curation/mine_history.py`는 실제 `history.jsonl` payload 스키마(prompt/router_mode/top_concept_ids…)에 맞춘 어댑터 필요.
+
+### 0.8 재현
+
+```bash
+export WOOWA_SESSION_MODE=development
+bin/rag-daemon start-bg && bin/rag-daemon ping
+bin/cohort-eval --qrels tests/fixtures/real_learner_qrels_v1.json --out reports/deploy_real.json
+bin/cohort-compare --control reports/baseline_real.json --candidate reports/deploy_real.json --fail-on-drift
+bin/cohort-eval --qrels tests/fixtures/r3_qrels_real_v1.json --out reports/deploy_synth.json
+bin/cohort-compare --control reports/baseline_synth.json --candidate reports/deploy_synth.json --fail-on-drift
+bin/golden verify && bin/router-generalization-eval
+WOOWA_SESSION_MODE=development python3 -m pytest tests/ -q   # 523 passed
+```
+`reports/`는 gitignored(baseline/deploy/sweep/auto_loop_log 산출물). chunk 인덱스 롤백 불필요(미배포). 코드 롤백은 `b2a5406` 또는 main merge revert.
 
 ## 1. 한 줄 요약
 

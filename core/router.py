@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from core.intent import IntentDecision, detect_mode, should_use_rag
@@ -11,6 +12,31 @@ from core.intent import IntentDecision, detect_mode, should_use_rag
 def get_refusal_threshold() -> float | None:
     """Opt-in cosine threshold for tier_0 downgrade; default off."""
     raw = os.environ.get("WOOWA_RAG_REFUSAL_THRESHOLD", "off").strip().lower()
+    if raw in ("off", "", "none"):
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+# Tuned on real learning-mode tier_0 prompts (Pillar 2): the genuine CS cluster
+# (MVCC / 락 / 격리 questions) sits at cosine 0.56-0.66, guard fixtures
+# (weather/dinner) at 0.40-0.47, with the adversarial "식당 예약 어떻게" guard at
+# 0.545. 0.56 clears that guard with margin while rescuing every labeled CS
+# prompt. Gate only fires when route() is given a nearest_concept_cosine
+# callback (daemon only), so direct callers stay backward-compatible regardless.
+DEFAULT_SEMANTIC_ROUTER_THRESHOLD = "0.56"
+
+
+def get_semantic_router_threshold() -> float | None:
+    """Cosine threshold to rescue a lexically-guarded cs_qa prompt back into
+    retrieval. When the lexical CS_TOKENS guard would drop a cs_qa prompt to
+    tier_0_fallback, a nearest-concept cosine at or above this threshold
+    overrides the drop. Set env to 'off' to disable (kill-switch)."""
+    raw = os.environ.get(
+        "WOOWA_SEMANTIC_ROUTER_THRESHOLD", DEFAULT_SEMANTIC_ROUTER_THRESHOLD
+    ).strip().lower()
     if raw in ("off", "", "none"):
         return None
     try:
@@ -62,6 +88,7 @@ def route(
     repo: str | None = None,
     pending_self_assessment: dict | None = None,
     pending_drill: dict | None = None,
+    nearest_concept_cosine: Callable[[str], float | None] | None = None,
 ) -> RouteDecision:
     override_decision = _route_override(prompt, repo)
     if override_decision is not None:
@@ -91,6 +118,17 @@ def route(
     # drill/self-assess, tool_only, retro, coaching, F11 (above) keep their
     # legitimate routes.
     if intent.mode == "cs_qa" and not should_use_rag(prompt, repo):
+        threshold = get_semantic_router_threshold()
+        if threshold is not None and nearest_concept_cosine is not None:
+            cosine = nearest_concept_cosine(prompt)
+            if cosine is not None and cosine >= threshold:
+                return _from_intent(
+                    intent,
+                    reason_override=(
+                        f"semantic rescue: lexical guard missed but nearest "
+                        f"concept cosine {cosine:.3f} >= {threshold:.3f}"
+                    ),
+                )
         return RouteDecision(
             mode="tier_0_fallback",
             need_rag=False,
@@ -106,14 +144,15 @@ def route(
     return _from_intent(intent)
 
 
-def _from_intent(intent: IntentDecision) -> RouteDecision:
+def _from_intent(intent: IntentDecision, reason_override: str | None = None) -> RouteDecision:
     mode = intent.mode
+    reason = reason_override if reason_override is not None else intent.reason
 
     if mode == "tool_only":
         return RouteDecision(
             mode=mode, need_rag=False, need_mission_ctx=False, need_anchors=False,
             personas=[], budget_tokens=1500, lazy_artifacts=[],
-            reason=intent.reason, confidence=intent.confidence,
+            reason=reason, confidence=intent.confidence,
         )
     if mode == "cs_qa":
         return RouteDecision(
@@ -121,7 +160,7 @@ def _from_intent(intent: IntentDecision) -> RouteDecision:
             personas=[PERSONA_MENTOR, PERSONA_SOCRATIC],
             budget_tokens=4500,
             lazy_artifacts=[ARTIFACT_CONCEPT_GRAPH, ARTIFACT_MASTERY],
-            reason=intent.reason, confidence=intent.confidence,
+            reason=reason, confidence=intent.confidence,
         )
     if mode == "coaching":
         return RouteDecision(
