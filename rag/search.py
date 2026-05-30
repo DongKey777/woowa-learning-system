@@ -21,6 +21,10 @@ RELATIONS_DECAY = 0.7
 DEFAULT_TOP_K = 5
 DEFAULT_RELATIONS_EXPAND = 5
 EXACT_SHORTCUT_SCORE = 1.0
+# Chunk over-fetch (Pillar 1): fetch top_k*N chunk rows, then max-pool to
+# concepts. N covers the worst case where one concept owns many of the top
+# chunks. No-op for a single-vector index (one row per concept).
+CHUNK_OVERFETCH = 12
 
 # Module-level Lance table cache (daemon side hot path; 0.6ms/call → 0)
 _TABLE_CACHE: dict[str, object] = {}
@@ -111,19 +115,27 @@ def search(
     q_vec = np.asarray(encode_fn(query), dtype=np.float32)
 
     table = _cached_open_index(index_dir)
-    raw = table.search(q_vec).metric("cosine").limit(top_k).to_pandas()
+    raw = table.search(q_vec).metric("cosine").limit(top_k * CHUNK_OVERFETCH).to_pandas()
 
-    dense_hits: list[SearchHit] = []
+    # Max-pool chunk rows to concepts: a concept's dense score is its best
+    # chunk. Single-vector indexes have one row per concept, so this reduces to
+    # the previous top_k ordering exactly.
+    best: dict[str, SearchHit] = {}
     for _, row in raw.iterrows():
-        dense_hits.append(
-            SearchHit(
-                concept_id=row["concept_id"],
-                score=float(1.0 - row["_distance"]),  # cosine→similarity
+        cid = row["concept_id"]
+        score = float(1.0 - row["_distance"])  # cosine→similarity
+        existing = best.get(cid)
+        if existing is None or score > existing.score:
+            best[cid] = SearchHit(
+                concept_id=cid,
+                score=score,
                 category=row["category"],
                 title=row["title"],
                 source="dense",
             )
-        )
+    dense_hits: list[SearchHit] = sorted(
+        best.values(), key=lambda h: h.score, reverse=True
+    )[:top_k]
 
     if relations_expand > 0 and dense_hits:
         if loaded_corpus is None:

@@ -53,7 +53,11 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # to rag/corpus_loader.py (shared by lexical_fusion + index manifest) and
     # check_corpus_drift() added to rag/index.py so a stale fetched index warns
     # at daemon startup; lift to ≤1350.
-    assert breakdown["rag"] <= 1350, f"rag {breakdown['rag']} > 1350"
+    # 2026-05-31: Pillar 1 chunk-level body dense embedding — encode_chunks() +
+    # _pack_body_windows() in corpus_loader, chunk_index schema field + chunk
+    # build loop in index.py, over-fetch + group-by max-pool in search.py; lift
+    # to ≤1450 (LOC gate is a soft drift alarm, not a hard trip-wire).
+    assert breakdown["rag"] <= 1450, f"rag {breakdown['rag']} > 1450"
     # core: 2500 → 6500 ceiling (Phase T-X/Y13 new modules: pr_retro, code_event,
     # junit_ingest, response_quality, learner_state, profile, session,
     # bootstrap, onboard, readiness, doctor, state_validate, registry_audit,

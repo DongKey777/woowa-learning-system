@@ -8,11 +8,14 @@ Hypothesis (Phase 2):
 Builder reads JSON corpus, encodes via rag.encoder, writes Lance table.
 Loader opens existing Lance table read-only for search.
 
-Lance schema (intentionally minimal — body lives in JSON corpus, not index):
-- concept_id: str
+Lance schema (Pillar 1 — chunk-level body embeddings):
+- concept_id: str   (group key; multiple rows per concept)
+- chunk_index: int32 (0 = card/encoding_text, 1..N = body windows)
 - vector: list[float32, 1024]
 - category: str
 - title: str
+Search group-by's concept_id with max-pool, so a single-vector index (one row
+per concept, chunk_index 0) and a chunk index are both valid.
 """
 from __future__ import annotations
 
@@ -23,8 +26,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from rag.corpus_loader import (
+    CHUNK_BODY_CHARS,
+    CHUNK_BODY_OVERLAP,
+    CHUNK_INCLUDE_CARD,
+    CHUNK_MAX_BODY,
     DEFAULT_CORPUS_DIR,
     corpus_fingerprint,
+    encode_chunks,
     encoding_text,
     load_corpus,
 )
@@ -45,6 +53,7 @@ def _schema() -> pa.Schema:
     return pa.schema(
         [
             pa.field("concept_id", pa.string()),
+            pa.field("chunk_index", pa.int32()),
             pa.field("vector", pa.list_(pa.float32(), EMBED_DIM)),
             pa.field("category", pa.string()),
             pa.field("title", pa.string()),
@@ -59,6 +68,8 @@ class IndexBuildReport:
     index_size_bytes: int
     index_path: Path
     corpus_sha256: str = ""
+    chunks_indexed: int = 0
+    chunk_params: dict | None = None
 
 
 def build_index(
@@ -77,15 +88,18 @@ def build_index(
 
     loaded = load_corpus(corpus_dir=corpus_dir, strict=True)
     ids: list[str] = []
+    chunk_indices: list[int] = []
     texts: list[str] = []
     categories: list[str] = []
     titles: list[str] = []
     for cid in sorted(loaded.concepts):
         c = loaded.concepts[cid]
-        ids.append(cid)
-        texts.append(encoding_text(c))
-        categories.append(c["category"])
-        titles.append(c["title"])
+        for chunk_index, text in encode_chunks(c):
+            ids.append(cid)
+            chunk_indices.append(chunk_index)
+            texts.append(text)
+            categories.append(c["category"])
+            titles.append(c["title"])
 
     if encode_fn is None:
         from rag.encoder import encode as _encode  # lazy ML import
@@ -95,8 +109,8 @@ def build_index(
     t0 = time.perf_counter()
     vectors = encode_fn(texts)
     elapsed = time.perf_counter() - t0
-    if vectors.shape != (len(ids), EMBED_DIM):
-        raise ValueError(f"encoder output shape {vectors.shape} != expected {(len(ids), EMBED_DIM)}")
+    if vectors.shape != (len(texts), EMBED_DIM):
+        raise ValueError(f"encoder output shape {vectors.shape} != expected {(len(texts), EMBED_DIM)}")
 
     index_dir.mkdir(parents=True, exist_ok=True)
     db = lancedb.connect(str(index_dir))
@@ -107,6 +121,7 @@ def build_index(
         data=pa.table(
             {
                 "concept_id": ids,
+                "chunk_index": chunk_indices,
                 "vector": vectors.astype(np.float32).tolist(),
                 "category": categories,
                 "title": titles,
@@ -119,11 +134,18 @@ def build_index(
     table_path = index_dir / f"{TABLE_NAME}.lance"
     size = sum(p.stat().st_size for p in table_path.rglob("*") if p.is_file())
     return IndexBuildReport(
-        concepts_indexed=len(ids),
+        concepts_indexed=len(loaded.concepts),
         elapsed_seconds=elapsed,
         index_size_bytes=size,
         index_path=index_dir,
         corpus_sha256=corpus_fingerprint(loaded),
+        chunks_indexed=len(texts),
+        chunk_params={
+            "body_chars": CHUNK_BODY_CHARS,
+            "overlap": CHUNK_BODY_OVERLAP,
+            "include_card": CHUNK_INCLUDE_CARD,
+            "max_body": CHUNK_MAX_BODY,
+        },
     )
 
 
@@ -138,8 +160,10 @@ def open_index(index_dir: Path = DEFAULT_INDEX_DIR) -> "Table":
 
 def _write_manifest(report: IndexBuildReport) -> None:
     manifest = {
-        "schema_version": "v2",
+        "schema_version": "v3-chunked",
         "concepts_indexed": report.concepts_indexed,
+        "chunks_indexed": report.chunks_indexed,
+        "chunk_params": report.chunk_params,
         "encode_seconds": round(report.elapsed_seconds, 2),
         "index_size_bytes": report.index_size_bytes,
         "embed_dim": EMBED_DIM,

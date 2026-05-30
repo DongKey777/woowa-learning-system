@@ -171,3 +171,77 @@ def encoding_text(concept: dict) -> str:
     if concept.get("summary"):
         parts.append(concept["summary"])
     return " | ".join(parts)
+
+
+# Pillar 1 chunk-embedding params. Character windows (not tokens) keep the split
+# deterministic and tokenizer-free in the loader; ~1000 chars ≈ 350-400 BGE-M3
+# tokens for mixed Korean+code bodies. Recorded in the index manifest and used
+# as the rebuild cache key. Tuned per sweep by editing these constants + a
+# fresh remote build (the SHA pins the params).
+CHUNK_BODY_CHARS = 1000
+CHUNK_BODY_OVERLAP = 150
+CHUNK_INCLUDE_CARD = True
+CHUNK_MAX_BODY = 8
+
+
+def _pack_body_windows(body: str, size: int, overlap: int, max_windows: int) -> list[str]:
+    """Deterministic, structure-aware body split. Packs markdown paragraphs
+    greedily up to `size` chars (carrying `overlap` tail chars across windows);
+    hard-splits any single oversized paragraph. Caps at max_windows."""
+    import re as _re
+
+    paras = [p.strip() for p in _re.split(r"\n\s*\n", body) if p.strip()]
+    windows: list[str] = []
+    cur = ""
+    for p in paras:
+        if cur and len(cur) + len(p) + 1 > size:
+            windows.append(cur)
+            cur = (cur[-overlap:] + "\n" + p) if overlap > 0 else p
+        else:
+            cur = (cur + "\n" + p) if cur else p
+    if cur:
+        windows.append(cur)
+
+    final: list[str] = []
+    hard_cap = int(size * 1.5)
+    for w in windows:
+        if len(w) <= hard_cap:
+            final.append(w)
+            continue
+        step = max(1, size - overlap)
+        for i in range(0, len(w), step):
+            final.append(w[i:i + size])
+    return final[:max_windows]
+
+
+def encode_chunks(
+    concept: dict,
+    *,
+    body_chars: int = CHUNK_BODY_CHARS,
+    overlap: int = CHUNK_BODY_OVERLAP,
+    include_card: bool = CHUNK_INCLUDE_CARD,
+    max_body: int = CHUNK_MAX_BODY,
+) -> list[tuple[int, str]]:
+    """Return [(chunk_index, text)] for a concept's dense embedding.
+
+    chunk 0 = the card (`encoding_text`) so the existing title/alias/
+    expected_query/summary signal is preserved exactly (top1 precision guard).
+    chunks 1..N = body_markdown windows, each prefixed `title | summary |` so a
+    body chunk is self-contextualizing when retrieved in isolation.
+    """
+    chunks: list[tuple[int, str]] = []
+    idx = 0
+    if include_card:
+        chunks.append((idx, encoding_text(concept)))
+        idx += 1
+    body = (concept.get("body_markdown") or "").strip()
+    if body:
+        prefix = concept["title"]
+        if concept.get("summary"):
+            prefix = f"{concept['title']} | {concept['summary']}"
+        for window in _pack_body_windows(body, body_chars, overlap, max_body):
+            chunks.append((idx, f"{prefix} | {window}"))
+            idx += 1
+    if not chunks:  # concept with neither card nor body — fall back to title
+        chunks.append((0, concept["title"]))
+    return chunks
