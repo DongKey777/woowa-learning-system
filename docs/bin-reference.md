@@ -147,7 +147,8 @@ bin/index-fetch [--tag paradigm-v2-index-v1.0.3] [--force] [--expected-sha256 <h
 옵션:
 - `--tag <tag>`: 다른 release version 지정
 - `--force`: 기존 `state/index/`를 덮어쓰기 (default는 존재 시 건너뜀)
-- `--expected-sha256 <hex>`: 무결성 검증 (default는 v1.0.2의 hash hardcoded)
+- `--expected-sha256 <hex>`: 무결성 검증 override (default는 `KNOWN_SHA256[tag]` — known tag면 자동 검증, unknown tag면 경고 후 skip)
+- `--pattern <name>`: asset 이름 override (default는 `<tag>.tar.zst`)
 
 의존: `gh` CLI + GitHub 인증 (`gh auth login`)
 
@@ -170,12 +171,15 @@ bin/corpus-build [--corpus-dir corpus/concepts] [--index-dir state/index]
 
 Build 후 publish 흐름:
 ```bash
-bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.3 --force
-bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.3 --verify-only
-gh release create paradigm-v2-index-v1.0.3 /tmp/paradigm-v2-index-v1.0.3 \
-    --title "woowa-learning-system Lance index vX.Y.Z" --notes "..."
+# index-pack은 state/index.tar.zst를 만든다. asset 이름은 반드시 <tag>.tar.zst 규칙을
+# 따라야 index-fetch의 derived --pattern (<tag>.tar.zst)이 매칭된다.
+bin/index-pack --force && bin/index-pack --verify-only   # archive_sha256 기록
+cp state/index.tar.zst /tmp/paradigm-v2-index-v1.0.3.tar.zst
+gh release create paradigm-v2-index-v1.0.3 /tmp/paradigm-v2-index-v1.0.3.tar.zst \
+    --title "woowa-learning-system Lance index v1.0.3" --notes "...SHA256..."
 # 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-v1.0.3 로 업데이트
 ```
+**새 release마다 필수**: `bin/index-fetch`의 `KNOWN_SHA256`에 `{tag: archive_sha256}` 한 줄 추가 + `DEFAULT_TAG`를 새 tag로 bump. (`sync-index-metadata`는 문서/manifest만 갱신하고 index-fetch 상수는 건드리지 않는다.)
 
 ---
 
