@@ -74,7 +74,11 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # adds atomic_write_json (core/state.py) + telemetry stderr + drift-check call
     # (core/daemon.py); lift to ≤7400.
     assert breakdown["core"] <= 7400, f"core {breakdown['core']} > 7400 (Phase T-X/Y13/Y14 budget)"
-    assert breakdown["curation"] <= 350, f"curation {breakdown['curation']} > 350"
+    # 2026-05-31: corpus-expansion cycle adds a real-state join adapter to
+    # mine_history (build_joined_events/mine_real) so mining runs on actual
+    # history.jsonl + response-quality.jsonl + profile.uncertain instead of the
+    # synthetic payload shape; lift the soft ceiling to ≤500 (matches mission/anchors).
+    assert breakdown["curation"] <= 500, f"curation {breakdown['curation']} > 500"
     assert breakdown["mission"] <= 500, f"mission {breakdown['mission']} > 500"
     assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"
 
