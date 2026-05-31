@@ -1,0 +1,56 @@
+{
+  "id": "security/path-traversal-primer",
+  "title": "Path / Directory Traversal 입문: ../ 로 base 디렉터리 밖 파일 접근",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 문서는 new File(baseDir, userInput)처럼 사용자 입력을 그대로 경로에 이어 붙일 때 ../../etc/passwd 같은 ../ 시퀀스로 의도한 base 디렉터리 밖 파일을 읽거나 쓰는 path/directory traversal(경로 탐색) 취약점이 왜 위험한지, 안전한 방어(File.getCanonicalPath로 정규화한 뒤 base 디렉터리 prefix 검증, 파일명 allowlist, decode-then-check 순서, 레거시 null byte 주의)는 무엇인지를 단순 startsWith·문자열 치환의 함정과 함께 구체적 Java 취약/안전 코드로 정리한다.",
+  "body_markdown": "# Path / Directory Traversal 입문: `../` 로 base 디렉터리 밖을 읽고 쓰는 취약점\n\n> 한 줄 요약: 파일 경로를 만들 때 사용자 입력을 그대로 base 디렉터리에 이어 붙이면 `../../etc/passwd` 같은 입력으로 의도한 폴더 밖 파일을 읽거나 덮어쓸 수 있다 — 방어의 핵심은 `getCanonicalPath()`로 경로를 정규화한 뒤 \"정말 base 디렉터리 안에 있는지\" prefix로 검증하고, 가능한 한 파일명 자체를 allowlist 로 제한하는 것이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [입력값 검증 기초](./input-validation-basics.md)\n- [OS Command Injection 입문](./command-injection-primer.md)\n- [SQL 인젝션 기초](./sql-injection-basics.md)\n- [Signed URL / Presigned Upload 위협 모델](./signed-url-presigned-upload-threat-model.md)\n- [OWASP Top 10 기초](./owasp-top10-basics.md)\n\nretrieval-anchor-keywords: path traversal, directory traversal, 경로 탐색, 디렉터리 트래버설, ../ 시퀀스, dot dot slash, getCanonicalPath, canonicalization 정규화, base 디렉터리 검증, startsWith prefix 검증, allowlist 파일명, decode then check, URL 디코딩 순서, null byte 우회, etc passwd 읽기, 파일 다운로드 취약점, 임의 파일 읽기 쓰기\n\n## 핵심 개념 (정의)\n\n**Path Traversal(경로 탐색, = Directory Traversal)**은 파일 경로를 조립할 때 신뢰할 수 없는 입력을 그대로 사용해서, 공격자가 `../`(상위 디렉터리로 이동) 시퀀스 등을 끼워 넣어 **애플리케이션이 의도한 base 디렉터리 밖의 파일을 읽거나 쓰게 만드는** 취약점이다.\n\n전형적인 예:\n\n- 서버가 `/var/www/uploads/` 안의 파일만 내려주려 한다.\n- 코드가 `new File(baseDir, fileName)`처럼 입력 `fileName`을 그냥 붙인다.\n- 공격자가 `fileName = \"../../../../etc/passwd\"`를 주면, 결과 경로가 `/etc/passwd`로 빠져나간다.\n\n읽기뿐 아니라 쓰기도 위험하다. 업로드 저장 경로에 `../`를 섞으면 웹 루트 밖의 설정 파일이나 실행 가능한 위치를 덮어쓸 수 있어, 최악의 경우 코드 실행으로 이어진다.\n\n## 왜 위험한가 (직관)\n\n파일 시스템 경로는 \"트리\"이고, `..`는 그 트리에서 **한 칸 위로 올라가는 상대 경로 토큰**이다. base 디렉터리 안에만 머물러야 할 입력이 `..`로 위로 올라가 버리면, 우리가 그어둔 울타리(base 디렉터리)를 그냥 넘어간다.\n\n직관적으로 이렇게 생각하면 된다:\n\n```\n의도:  baseDir = /var/www/uploads\n       사용자가 고른 파일 = report.pdf\n       => /var/www/uploads/report.pdf  (울타리 안)\n\n공격:  사용자가 고른 파일 = ../../../../etc/passwd\n       => /var/www/uploads/../../../../etc/passwd\n       => 정규화하면 /etc/passwd        (울타리 밖!)\n```\n\n핵심 함정은 **\"문자열을 붙인 시점에는 아직 안전해 보인다\"**는 것이다. `/var/www/uploads/../../../../etc/passwd`라는 문자열만 보면 base 경로가 앞에 붙어 있어 안전한 듯하지만, 운영체제가 이 경로를 **해석(정규화)**하는 순간 `..`이 적용되어 전혀 다른 위치를 가리키게 된다. 그래서 \"붙인 문자열\"이 아니라 **\"정규화된 실제 경로\"**를 기준으로 검사해야 한다.\n\n## 상세 분해: canonicalization 과 base prefix 검증\n\n방어의 중심은 **canonicalization(정규화)** 이다. `File.getCanonicalPath()`(또는 `Path.toRealPath()` / `normalize().toAbsolutePath()`)는 `..`, `.`, 중복 슬래시, 심볼릭 링크 등을 모두 해소해 **하나의 명확한 절대 경로**로 만든다.\n\n올바른 검증 순서는 다음과 같다:\n\n1. **(필요 시) 디코딩 먼저** — 입력이 URL 인코딩되어 들어왔다면 먼저 디코딩한다. `%2e%2e%2f` 는 `../`의 인코딩이다. 검증 후 디코딩하면, 검증은 통과하고 디코딩된 위험 값이 실제 사용되는 **decode-after-check** 우회가 생긴다. 반드시 **decode-then-check**(디코딩 → 그다음 정규화/검증) 순서를 지킨다.\n2. **base 와 결합 후 정규화** — `new File(baseDir, input).getCanonicalPath()`로 실제 경로를 구한다.\n3. **base 의 정규 경로로 prefix 검증** — 정규화된 경로가 정규화된 base 디렉터리 안에 있는지 확인한다. 단순 `startsWith(baseString)`은 `\"/var/www/uploads\"`가 `\"/var/www/uploads-evil\"`도 통과시키는 함정이 있으므로, **base 뒤에 구분자(`File.separator`)를 붙여** 비교하거나 `Path.startsWith(Path)`(경로 요소 단위 비교)를 사용한다.\n\n```\n[안전 판정 흐름]\ninput ── decode ──> \"../../../../etc/passwd\"\n       ── new File(base, input).getCanonicalPath() ──> \"/etc/passwd\"\n       ── \"/etc/passwd\".startsWith(\"/var/www/uploads\" + \"/\") ? ──> false ──> 거부\n```\n\n가능하다면 검증보다 더 강한 수단은 **파일명 자체를 제한**하는 것이다. 사용자에게 자유 경로를 받지 말고, \"허용된 파일 ID → 실제 경로\" 매핑(allowlist)이나 `^[A-Za-z0-9_\\-]+\\.pdf$` 같은 엄격한 형식 검증으로 `/`, `..`, 절대 경로가 애초에 못 들어오게 한다.\n\n## SQL/Command Injection 과의 관계\n\n같은 \"신뢰할 수 없는 입력이 위험한 sink에 도달\"하는 결함 계열이지만 sink가 다르다. SQL injection은 DB 쿼리, command injection은 OS 셸, **path traversal은 파일 시스템 경로 해석기**가 sink다. 그래서 방어도 \"입력을 신뢰 경계 밖으로 넘기기 전에 데이터/제어 경계를 분리\"한다는 철학은 같되, 구체 도구는 정규화+base 검증+파일명 allowlist 로 다르다.\n\n## 흔한 오해와 함정\n\n- **\"`../`만 문자열 치환으로 제거하면 된다\"** → `....//` 처럼 한 번 제거하면 다시 `../`가 되는 중첩, 인코딩(`%2e%2e%2f`), 백슬래시(`..\\\\`, 윈도우) 등으로 우회된다. **정규화 후 검증**이 정답이다.\n- **\"`startsWith(baseString)` 한 줄이면 충분하다\"** → `\"/data/app\"` 이 `\"/data/app-backup/secret\"` 도 통과시킨다. 구분자를 포함해 비교하거나 `Path.startsWith` 를 써야 한다.\n- **\"검증부터 하고 그다음 디코딩하면 된다\"** → decode-after-check 는 우회된다. 반드시 **디코딩을 먼저**, 그 다음 정규화/검증 (decode-then-check).\n- **\"심볼릭 링크는 신경 안 써도 된다\"** → base 안의 파일이 base 밖을 가리키는 심링크일 수 있다. `getCanonicalPath()`/`toRealPath()`는 심링크까지 해소해 주므로 정규화 기반 검증이 이 경우도 막아 준다.\n- **(레거시) null byte 우회** → 오래된 자바/네이티브 경로 처리에서 `file.pdf\\0../../etc/passwd` 의 NUL(`\\0`) 이후가 잘려 검증을 우회하던 이슈가 있었다. 최신 JDK는 경로의 NUL을 거부하지만, 입력에 `\\0`이 있으면 일찍 거부하는 습관이 안전하다.\n\n## 코드로 보기 (Java)\n\n### 취약 코드\n\n```java\n// 안티패턴: 사용자 입력을 base 에 그냥 붙여 파일을 읽음\npublic byte[] download(String fileName) throws IOException {\n    File base = new File(\"/var/www/uploads\");\n    File target = new File(base, fileName); // fileName = \"../../../../etc/passwd\"\n    return Files.readAllBytes(target.toPath()); // /etc/passwd 를 읽어버림\n}\n```\n\n### 안전 코드 — 정규화 후 base prefix 검증\n\n```java\npublic byte[] download(String fileName) throws IOException {\n    // 0) (입력이 URL 인코딩되어 왔다면) 디코딩을 먼저 — decode-then-check\n    //    여기서는 이미 디코딩된 값이 들어온다고 가정. NUL 은 즉시 거부.\n    if (fileName == null || fileName.indexOf('\\0') >= 0) {\n        throw new IllegalArgumentException(\"잘못된 파일명\");\n    }\n\n    File baseDir = new File(\"/var/www/uploads\").getCanonicalFile();\n    File target = new File(baseDir, fileName).getCanonicalFile(); // .. 등 해소된 실제 경로\n\n    // 1) 정규화된 경로가 정규화된 base 안에 있는지 검증\n    //    Path.startsWith 는 경로 \"요소\" 단위 비교라 'uploads-evil' 같은 prefix 함정이 없다\n    if (!target.toPath().startsWith(baseDir.toPath())) {\n        throw new SecurityException(\"base 디렉터리 밖 접근 거부\");\n    }\n    return Files.readAllBytes(target.toPath());\n}\n```\n\n`fileName`이 `../../../../etc/passwd`라면 `target`의 canonical path 는 `/etc/passwd`가 되고, 이는 `/var/www/uploads` 아래가 아니므로 `startsWith` 검증에서 걸러진다.\n\n### 더 강한 형태 — 파일명 allowlist / ID 매핑\n\n```java\n// 사용자에게 자유 경로를 받지 않고, 허용된 파일만 ID 로 받는다\nprivate static final Map<String, Path> ALLOWED = Map.of(\n    \"manual\",  Path.of(\"/var/www/uploads/manual.pdf\"),\n    \"invoice\", Path.of(\"/var/www/uploads/invoice-2026.pdf\")\n);\n\npublic byte[] downloadById(String fileId) throws IOException {\n    Path p = ALLOWED.get(fileId);\n    if (p == null) {\n        throw new IllegalArgumentException(\"허용되지 않은 파일\");\n    }\n    return Files.readAllBytes(p); // 경로가 코드에 고정되어 traversal 통로가 없다\n}\n```\n\n또는 자유 입력을 꼭 받아야 한다면 `if (!fileName.matches(\"^[A-Za-z0-9_\\\\-]+\\\\.pdf$\")) reject;` 처럼 `/`·`..`·절대경로가 원천 차단되는 엄격한 형식 검증을 정규화 검증과 함께 적용한다.\n\n## 면접/시니어 질문 미리보기\n\n**Q. path traversal은 무엇이고 왜 문자열 필터링만으로는 부족한가요?**\n`../` 같은 시퀀스로 base 디렉터리 밖 파일을 읽거나 쓰는 취약점이다. `../`를 단순 제거하면 `....//` 중첩이나 인코딩(`%2e%2e%2f`), 백슬래시로 우회된다. 그래서 \"붙인 문자열\"이 아니라 `getCanonicalPath()`로 정규화한 \"실제 경로\"가 정말 base 안에 있는지 검증해야 한다.\n\n**Q. canonicalization 후 base 검증을 어떻게 정확히 하나요?**\nbase 와 입력을 결합해 정규화하고, 그 정규 경로가 정규화된 base 디렉터리 안에 있는지 확인한다. 단순 `startsWith(문자열)`은 `/data/app` 이 `/data/app-backup` 도 통과시키므로, 구분자를 포함하거나 `Path.startsWith(Path)`로 경로 요소 단위 비교를 한다. 심링크는 canonical/realPath 가 해소해 준다.\n\n**Q. decode-then-check 가 왜 중요한가요?**\n입력이 URL 인코딩(`%2e%2e%2f`=`../`)되어 들어올 때 검증 후 디코딩하면, 검증은 인코딩 상태를 보고 통과시키고 실제로는 디코딩된 위험 경로가 쓰인다. 반드시 디코딩을 먼저 끝낸 뒤 정규화·검증해야 한다.\n\n## 한 줄 정리\n\nPath traversal은 사용자 입력을 그대로 경로에 붙여 `../`로 base 디렉터리 밖 파일을 읽고 쓰는 취약점이며, 방어는 (디코딩을 먼저 끝낸 뒤) `getCanonicalPath()`로 정규화한 실제 경로가 정규화된 base 안에 있는지 구분자 포함/`Path.startsWith`로 검증하고, 가능하면 파일명 자체를 allowlist·ID 매핑·엄격 형식 검증으로 제한하는 것이다.\n",
+  "aliases": [
+    "path traversal 취약점",
+    "directory traversal 경로 탐색",
+    "../ 상위 디렉터리 접근",
+    "getCanonicalPath base 검증",
+    "임의 파일 읽기 쓰기 취약점",
+    "파일 다운로드 경로 우회",
+    "decode-then-check 경로 검증",
+    "base 디렉터리 prefix 검증",
+    "파일명 allowlist 경로 방어"
+  ],
+  "expected_queries": [
+    "path traversal이 뭐야? 왜 위험해?",
+    "new File에 사용자 입력 파일명 붙이면 왜 위험해?",
+    "../ 로 디렉터리 밖 파일 읽는 걸 어떻게 막아?",
+    "getCanonicalPath로 정규화한 다음 어떻게 base 검증을 해야 해?",
+    "startsWith로 경로 검증하면 왜 부족해?"
+  ],
+  "symptoms": [
+    "new File(baseDir, fileName) 처럼 사용자 입력 파일명을 그대로 붙여 파일을 읽거나 쓴다",
+    "../ 를 단순 문자열 치환으로 제거하려다 ....// 중첩이나 %2e%2e%2f 인코딩으로 우회당한다",
+    "startsWith(baseString) 한 줄로만 검증해 /data/app-backup 같은 prefix 함정에 노출된다",
+    "URL 인코딩 입력을 검증 후 디코딩(decode-after-check)해 검증이 무력화된다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/input-validation-basics",
+      "security/sql-injection-basics"
+    ],
+    "next_docs": [
+      "security/command-injection-primer",
+      "security/signed-url-presigned-upload-threat-model",
+      "security/owasp-top10-basics"
+    ],
+    "confusable_with": [
+      "security/command-injection-primer",
+      "security/sql-injection-basics",
+      "security/ssrf-egress-control"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-31",
+    "last_modified": "2026-05-31",
+    "revision_history": []
+  }
+}
