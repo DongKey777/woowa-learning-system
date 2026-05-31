@@ -1,0 +1,55 @@
+{
+  "id": "network/ddos-syn-flood-firewall-primer",
+  "title": "DDoS, SYN Flood, SYN Cookie, Firewall Basics Primer",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "이 문서는 DDoS의 개념, SYN flood가 미완성(half-open) 연결로 SYN 큐를 고갈시키는 메커니즘, 방어책인 SYN cookie와 rate limiting, 그리고 stateful vs stateless 방화벽/보안 그룹 기초를 정리한다. 정상 트래픽 폭주로 accept 큐가 차는 accept-queue-syn-backlog와 달리, 여기서는 악의적 자원 고갈과 그 방어가 핵심이다.",
+  "body_markdown": "# DDoS, SYN Flood, SYN Cookie, 방화벽 기초\n\n> 한 줄 요약: SYN flood는 핸드셰이크를 일부러 끝내지 않는 half-open 연결로 서버의 SYN 큐를 고갈시키는 공격이고, SYN cookie와 rate limiting, stateful 방화벽이 대표 방어다 — 이는 정상 부하로 accept 큐가 차는 용량 문제와 구분해야 한다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Accept Queue, SYN Backlog, Listen Overflow](./accept-queue-syn-backlog-listen-overflow.md)\n> - [SYN Retransmission, Handshake Timeout Behavior](./syn-retransmission-handshake-timeout.md)\n> - [TCP 3-way handshake 기초](./tcp-three-way-handshake-basics.md)\n> - [Retry Storm Containment, Concurrency Limiter, Load Shedding](./retry-storm-containment-concurrency-limiter-load-shedding.md)\n> - [Rate Limiting vs Brute-force Defense](../security/rate-limiting-vs-brute-force-defense.md)\n\nretrieval-anchor-keywords: ddos, ddos 공격, syn flood, half-open connection, syn 큐 고갈, syn cookie, rate limiting, 방화벽 기초, stateful firewall, stateless firewall, security group, 보안 그룹, 자원 고갈 공격, ip spoofing\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n**DoS(Denial of Service)**는 서버 자원을 고갈시켜 정상 사용자가 서비스를 못 쓰게 만드는 공격이다. 한 출처가 아니라 **여러(분산된) 출처**에서 동시에 하면 **DDoS(Distributed DoS)**다. 분산이라 IP 차단 한 줄로 막기 어렵고 트래픽 양 자체가 크다.\n\nDDoS는 노리는 자원에 따라 종류가 나뉜다.\n\n- **대역폭 고갈형(volumetric)**: 회선 대역폭을 채워 버린다 (예: UDP/ICMP flood, 증폭 공격).\n- **상태 자원 고갈형(state exhaustion)**: 연결 추적 테이블, SYN 큐, conntrack 같은 \"상태 저장 공간\"을 채운다. **SYN flood**가 대표.\n- **애플리케이션 계층형(L7)**: 비싼 API를 정상처럼 호출해 CPU/DB를 태운다.\n\n이 문서는 특히 **SYN flood(상태 고갈형)**와 방어를 깊게 본다.\n\n### 정상 폭주 vs 악의적 고갈 (꼭 구분)\n\n| 구분 | accept-queue-syn-backlog 문서 | 이 문서(SYN flood) |\n|---|---|---|\n| 원인 | **정상** 트래픽 burst, 느린 accept loop | **악의적** half-open 연결 의도적 생성 |\n| 핸드셰이크 | 완료까지 가서 accept 큐가 참 | 마지막 ACK를 일부러 안 보내 half-open으로 멈춤 |\n| 본질 | 용량(capacity) 문제 | 공격(자원 고갈) 문제 |\n| 대응 | backlog/accept loop/드레인 튜닝 | SYN cookie, rate limit, 방화벽, 상류 완화 |\n\n증상이 비슷해 보여도(연결이 안 됨, SYN-RECV 폭증) 한쪽은 튜닝, 한쪽은 방어가 답이라 구분이 중요하다.\n\n## 깊이 들어가기\n\n### 1. TCP 핸드셰이크를 악용하는 SYN flood\n\n정상 TCP 연결은 3-way handshake로 시작한다.\n\n```\n클라이언트            서버\n   |  SYN  ------------->|   서버: half-open 상태 기록 (SYN 큐에 저장)\n   |<------ SYN-ACK -----|   서버: \"마지막 ACK 기다림\"\n   |  ACK  ------------->|   서버: ESTABLISHED, accept 큐로 이동\n```\n\nSYN flood는 **마지막 ACK를 일부러 보내지 않는다.**\n\n```\n공격자 (보통 출발지 IP 위조)         서버\n   |  SYN  ------------------------->|  half-open 기록 (자원 점유)\n   |<------ SYN-ACK -----------------|  (위조 IP라 응답이 허공으로)\n   |   (ACK 영영 안 옴)               |  타이머 만료까지 자리 차지\n   |  SYN  ------------------------->|  또 점유\n   |  SYN  ------------------------->|  또 점유 ... 큐 고갈\n```\n\n- 서버는 각 SYN마다 half-open 상태를 **메모리에 저장**하고 마지막 ACK를 기다린다.\n- 공격자는 보통 **출발지 IP를 위조(spoofing)**해 SYN-ACK가 엉뚱한 곳/허공으로 가게 한다. 그래서 서버는 ACK를 영영 못 받고 자리만 점유당한다.\n- half-open 슬롯(SYN 큐)이 가득 차면 **정상 사용자의 SYN도 받을 자리가 없어** 연결이 거부되거나 타임아웃 난다.\n\n핵심: 공격자는 **연결을 완성할 생각이 없다.** 미완성 상태로 큐를 채우는 것이 목적이다. 그래서 accept 큐(완료된 연결 대기)가 아니라 그 **이전 단계의 SYN 큐(half-open 저장소)**가 1차 표적이다.\n\n### 2. 방어 1 — SYN cookie\n\n핵심 아이디어: **half-open 상태를 서버 메모리에 저장하지 않는다.**\n\n- 정상이라면 서버는 SYN을 받아 상태를 저장하고 SYN-ACK를 보낸다.\n- SYN cookie는 그 상태를 저장하는 대신, 연결 정보(주소/포트/타임스탬프 등)를 **암호학적으로 인코딩한 시퀀스 번호**를 SYN-ACK에 실어 보낸다.\n- 클라이언트가 진짜라면 그 번호+1을 ACK로 돌려주고, 서버는 ACK에 담긴 값만으로 \"아까 그 연결\"을 **메모리 저장 없이 재구성**한다.\n- 위조 IP는 SYN-ACK를 못 받으니 ACK도 못 돌려준다 → 자원이 점유되지 않는다.\n\n트레이드오프: SYN cookie는 일부 TCP 옵션을 온전히 보존하기 어려워 평상시 항상 켜기보다 **큐 압박이 감지될 때 발동**하는 식으로 쓰는 경우가 많다. (\"SYN cookie가 켜졌다\"는 것은 그 자체로 큰 burst/공격 신호일 수 있다.)\n\n### 3. 방어 2 — Rate limiting과 상류 완화\n\n- **Rate limiting**: 출발지/구간별로 초당 SYN 또는 신규 연결 수를 제한한다. 단, 출발지 IP가 위조되거나 진짜 분산(수만 IP)이면 IP별 제한 효과가 떨어진다.\n- **상류(CDN/스크러빙 센터)**: 대규모 volumetric/분산 공격은 서버 앞단(클라우드 DDoS 보호, anycast scrubbing)에서 흡수·필터링하는 것이 현실적이다. 단일 서버가 회선을 채우는 공격을 막을 수는 없다.\n- **백로그/타임아웃 조정**: half-open 타임아웃을 줄이고 SYN backlog를 늘리는 것은 보조 완화다(근본 방어는 아님).\n\n### 4. 방화벽과 보안 그룹 기초 — stateful vs stateless\n\n방화벽은 어떤 패킷을 통과/차단할지 결정한다. 연결 \"상태\"를 기억하는지로 두 부류다.\n\n- **Stateless(무상태) 방화벽/ACL**: 각 패킷을 **독립적으로** 규칙(출발지/목적지 IP, 포트, 프로토콜)에만 비춰 판단한다. 빠르고 가볍지만, \"이 응답이 내가 보낸 요청에 대한 것인지\"를 모른다 → 인바운드/아웃바운드 규칙을 양방향 다 명시해야 한다. (예: AWS Network ACL)\n- **Stateful(상태 추적) 방화벽/보안 그룹**: 연결 상태(이미 수립된 연결인지)를 **추적**한다. 한 방향(예: 아웃바운드 요청)을 허용하면 그에 대한 **응답은 자동으로 허용**한다. 더 직관적이지만 연결 추적 테이블(conntrack)을 쓰므로, 그 테이블 자체가 상태 고갈 공격의 표적이 될 수 있다. (예: AWS Security Group)\n\n보안 그룹/방화벽은 \"누가 어느 포트로 들어올 수 있나\"를 좁혀 공격 표면을 줄이지만, **이미 허용한 포트(예: 443)로 오는 SYN flood/L7 공격 자체를 다 막지는 못한다.** 그래서 방화벽 + rate limit + SYN cookie + 상류 보호를 겹쳐 쓴다.\n\n## 실전 시나리오\n\n### 시나리오 1: SYN-RECV가 폭증하고 신규 연결만 실패\n\n`ss -tn state syn-recv | wc -l`이 비정상적으로 크고, 출발지 IP가 매우 다양하거나 응답 없는 IP가 많다면 SYN flood를 의심한다. 정상 burst라면 대부분 곧 ESTABLISHED로 넘어가지만, flood는 half-open에 머문다.\n\n### 시나리오 2: 정상 burst인데 공격으로 오인\n\n배포 직후/이벤트 트래픽으로 SYN-RECV가 잠깐 늘 수 있다. 출발지가 실제 사용자 분포이고 곧 ESTABLISHED로 전환되면 용량 문제(accept-queue 문서)이지 공격이 아니다. 이때 방어 정책을 잘못 켜면 정상 사용자를 차단한다.\n\n### 시나리오 3: 보안 그룹은 443만 열었는데도 공격을 받음\n\n공개해야 하는 포트(443)는 닫을 수 없다. 방화벽은 표면을 줄일 뿐, 열린 포트로 오는 flood는 rate limit/SYN cookie/상류 보호로 막는다.\n\n## 코드로 보기\n\n```bash\n# half-open(SYN-RECV) 연결 수 — 급증 시 flood 의심\nss -tn state syn-recv | wc -l\n\n# SYN cookie 발동 통계 등 핵심 카운터\nnetstat -s | grep -Ei 'SYN|listen|cookie|overflow'\n\n# (리눅스) 공격 완화 관련 커널 노브 — 운영 정책에 따라 신중히\nsysctl net.ipv4.tcp_syncookies          # 1이면 압박 시 SYN cookie 발동\nsysctl net.ipv4.tcp_max_syn_backlog     # half-open 큐 상한\n\n# 출발지별 SYN rate 제한 예 (개념 예시, 환경마다 다름)\n# iptables -A INPUT -p tcp --syn -m limit --limit 50/s --limit-burst 100 -j ACCEPT\n```\n\n```text\n관찰 포인트\n- syn-recv 수 추이 vs established 전환율\n- 출발지 IP 다양성/위조 여부 (응답 없는 IP 비율)\n- SYN cookie 발동 카운터가 튀는 시점\n- 같은 시점에 정상 사용자 connect 실패율\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| SYN cookie | half-open 메모리 점유 제거 | 일부 TCP 옵션 보존 한계 | 큐 압박/flood 감지 시 |\n| per-IP rate limit | 단순, 단일 출처 공격에 효과 | IP 위조/진짜 분산엔 약함 | 소규모/단일 출처 |\n| 상류 스크러빙/CDN | 대규모 volumetric 흡수 | 비용, 외부 의존 | 큰 분산 공격 대비 |\n| stateful 방화벽/보안 그룹 | 표면 축소, 응답 자동 허용 | conntrack 테이블도 고갈 대상 | 기본 가드 |\n| stateless ACL | 빠르고 가벼움 | 양방향 규칙 직접 관리, 연결 인지 못 함 | 경계 1차 필터 |\n\n핵심은 **단일 방어가 아니라 계층 방어(방화벽 + rate limit + SYN cookie + 상류 보호)**이고, 무엇보다 **이게 공격인지 정상 폭주인지 먼저 구분**하는 것이다.\n\n## 꼬리질문\n\n> Q: SYN flood는 어느 단계 자원을 고갈시키나요?\n> 핵심: 마지막 ACK를 안 보내 half-open 상태(SYN 큐)에 머물게 해 그 슬롯을 점유한다. accept 큐 이전 단계다.\n\n> Q: SYN cookie는 어떻게 방어하나요?\n> 핵심: half-open 상태를 서버에 저장하지 않고, 연결 정보를 인코딩한 시퀀스 번호로 SYN-ACK를 보내 ACK가 돌아올 때 상태를 재구성한다.\n\n> Q: stateful과 stateless 방화벽 차이는?\n> 핵심: stateful은 연결 상태를 추적해 응답을 자동 허용(보안 그룹), stateless는 패킷마다 독립 판단해 양방향 규칙을 직접 둔다(Network ACL).\n\n## 한 줄 정리\n\nSYN flood는 핸드셰이크를 일부러 미완성으로 남겨 SYN 큐를 고갈시키는 DDoS이고, SYN cookie·rate limiting·상류 스크러빙·stateful 방화벽을 겹쳐 막되, 정상 트래픽 폭주(accept 큐 용량 문제)와는 반드시 구분해야 한다.\n",
+  "aliases": [
+    "DDoS",
+    "DDoS 공격",
+    "SYN flood",
+    "rate limiting 방어",
+    "stateful firewall",
+    "stateless firewall",
+    "security group 기초",
+    "자원 고갈 공격"
+  ],
+  "expected_queries": [
+    "SYN flood 공격은 어떻게 동작해?",
+    "DDoS랑 DoS 차이가 뭐고 종류는 어떻게 나눠?",
+    "SYN cookie는 SYN flood를 어떻게 막아?",
+    "stateful 방화벽이랑 stateless 방화벽 차이가 뭐야?",
+    "SYN-RECV가 폭증하는데 공격인지 정상 트래픽인지 어떻게 구분해?"
+  ],
+  "symptoms": [
+    "SYN flood(악의적 half-open 고갈)와 정상 트래픽 폭주로 accept 큐가 차는 것을 구분하지 못한다",
+    "SYN flood가 accept 큐가 아니라 그 이전 SYN(half-open) 큐를 표적으로 한다는 것을 모른다",
+    "SYN cookie가 half-open 상태를 저장하지 않는 방어라는 원리를 모른다",
+    "stateful 방화벽/보안 그룹과 stateless ACL 차이를 응답 자동 허용 관점에서 설명하지 못한다",
+    "방화벽이 열린 포트로 오는 flood 자체를 막아 준다고 오해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/tcp-three-way-handshake-basics"
+    ],
+    "next_docs": [
+      "network/syn-retransmission-handshake-timeout",
+      "network/retry-storm-containment-concurrency-limiter-load-shedding",
+      "security/rate-limiting-vs-brute-force-defense"
+    ],
+    "confusable_with": [
+      "network/accept-queue-syn-backlog-listen-overflow",
+      "network/syn-retransmission-handshake-timeout",
+      "network/nat-conntrack-ephemeral-port-exhaustion"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-05-31",
+    "last_modified": "2026-05-31",
+    "revision_history": []
+  }
+}

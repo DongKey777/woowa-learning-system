@@ -72,6 +72,60 @@ def test_mine_returns_empty_when_history_missing(tmp_path: Path) -> None:
     assert mine(tmp_path / "missing.jsonl") == []
 
 
+def test_mine_recognizes_real_extra_citation_flag(tmp_path: Path) -> None:
+    # Real response-quality emits extra_citation/missing_citation, not citation_mismatch.
+    history = _write_history(tmp_path, [
+        {"mode": "learning", "payload": {"prompt": "DI", "citations": ["spring/bean"], "quality_flags": ["extra_citation"]}},
+        {"mode": "learning", "payload": {"prompt": "IoC", "citations": ["spring/bean"], "quality_flags": ["missing_citation"]}},
+    ])
+    signals = mine(history)
+    mismatch = [s for s in signals if s.pattern == "citation_mismatch"]
+    assert mismatch and mismatch[0].target_concept_id == "spring/bean"
+    assert mismatch[0].frequency == 2
+
+
+# ── join adapter (real learner state) ───────────────────────────────────────
+
+
+def test_build_joined_events_projects_hits_and_joins_quality(tmp_path: Path) -> None:
+    from curation.mine_history import build_joined_events
+
+    history = _write_history(tmp_path, [
+        {"event_type": "rag_ask", "event_id": "ask-1", "mode": "learning",
+         "payload": {"prompt": "DI 뭐야", "top_concept_ids": ["spring/bean"]}},
+        {"event_type": "rag_ask", "event_id": "ask-2", "mode": "development",
+         "payload": {"prompt": "dev", "top_concept_ids": ["x/y"]}},
+    ])
+    rq = tmp_path / "response-quality.jsonl"
+    rq.write_text(json.dumps({
+        "source_event_id": "ask-1", "quality_flags": ["extra_citation"],
+        "citation_paths_declared": ["spring/bean"],
+    }) + "\n", encoding="utf-8")
+
+    joined = build_joined_events(history, rq, mode_filter="learning")
+    assert len(joined) == 1  # development event filtered out
+    p = joined[0]["payload"]
+    assert p["hits"] == [{"concept_id": "spring/bean"}]
+    assert p["quality_flags"] == ["extra_citation"]
+    assert p["citations"] == ["spring/bean"]
+
+
+def test_mine_real_surfaces_profile_uncertain(tmp_path: Path) -> None:
+    from curation.mine_history import mine_real
+
+    (tmp_path / "history.jsonl").write_text(
+        json.dumps({"event_type": "rag_ask", "event_id": "ask-1", "mode": "learning",
+                    "payload": {"prompt": "q", "top_concept_ids": ["a/b", "c/d", "e/f"]}}) + "\n",
+        encoding="utf-8")
+    (tmp_path / "profile.json").write_text(
+        json.dumps({"concepts": {"uncertain": ["database/lock-basics", "spring/bean-di-basics"]}}),
+        encoding="utf-8")
+
+    signals = mine_real(tmp_path, mode_filter="learning")
+    hu = {s.target_concept_id for s in signals if s.pattern == "high_uncertain"}
+    assert hu == {"database/lock-basics", "spring/bean-di-basics"}
+
+
 # ── propose_changes ────────────────────────────────────────────────────────
 
 
