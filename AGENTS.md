@@ -41,7 +41,7 @@ deps: `sentence-transformers`, `transformers`, `lancedb`, `numpy`, `pyarrow`, `j
 ```bash
 bin/index-fetch
 ```
-GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.2` (release별 약 13-19MB, SHA256 검증) → `state/index/`. 소요 ~15초.
+GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.3` (release별 약 13-19MB, SHA256 검증) → `state/index/`. 소요 ~15초.
 
 **🚫 학습자 기기 로컬 빌드 금지** — `bin/corpus-build`는 maintainer 전용 (15-30분 + 4-6GB peak RAM). 학습자는 `bin/index-fetch`만 사용.
 

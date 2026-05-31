@@ -141,7 +141,7 @@ trigger: 학습자가 *"다른 크루는"*, *"정밀 비교"*, *"cross-crew"* �
 GitHub Releases에서 pre-built Lance 인덱스 다운로드. SHA256 검증 후 `state/index/`로 추출.
 
 ```bash
-bin/index-fetch [--tag paradigm-v2-index-v1.0.2] [--force] [--expected-sha256 <hex>]
+bin/index-fetch [--tag paradigm-v2-index-v1.0.3] [--force] [--expected-sha256 <hex>]
 ```
 
 옵션:
@@ -170,11 +170,11 @@ bin/corpus-build [--corpus-dir corpus/concepts] [--index-dir state/index]
 
 Build 후 publish 흐름:
 ```bash
-bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.2.tar.zst --force
-bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.2.tar.zst --verify-only
-gh release create paradigm-v2-index-v1.0.2 /tmp/paradigm-v2-index-v1.0.2.tar.zst \
+bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.3 --force
+bin/index-pack --archive /tmp/paradigm-v2-index-v1.0.3 --verify-only
+gh release create paradigm-v2-index-v1.0.3 /tmp/paradigm-v2-index-v1.0.3 \
     --title "woowa-learning-system Lance index vX.Y.Z" --notes "..."
-# 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-v1.0.2 로 업데이트
+# 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-v1.0.3 로 업데이트
 ```
 
 ---

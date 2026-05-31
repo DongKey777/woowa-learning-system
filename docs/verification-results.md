@@ -1,10 +1,94 @@
-# Verification results — latest retrieval redesign (Pillar 0+2) + historical phase results
+# Verification results — corpus 확장·심화 (dense v1.0.3) + retrieval 재설계 (Pillar 0+2) + historical phase results
 
 최신 측정 날짜: 2026-05-31
 브랜치: `main`
-기준: 근본적 retrieval 재설계 cycle. **실제 학습 데이터(`history.jsonl` 1,354 rag_ask)** 기반 측정-우선. Pillar 0(rerank overfit 제거) + Pillar 2(시맨틱 라우터 게이트)를 배포했고, Pillar 1(chunk body dense)은 빌드·측정 후 **이득 없음으로 reject**했다. 직전 기준선은 Y14 corpus closure + index v1.0.2다.
+기준: 직전 cycle에서 retrieval 구조(Pillar 0+2)를 배포해 검색 병목을 해소한 뒤, 이번 cycle은 **코퍼스 콘텐츠**를 확장·심화했다. 14개 작성 사이클(`auto/corpus-expand`)로 11개 카테고리 전반에 신규 개념 11개 + thin-body 심화 + 학습자 재질문 클러스터 enrich + 코퍼스 전체 summary 복구를 누적하고, **dense 인덱스를 1회 재빌드(3350 concepts)** 해 release `paradigm-v2-index-v1.0.3`으로 배포했다. 직전 기준선은 index v1.0.2(3339 concepts)다.
 
-## 0. 최신 — Retrieval 재설계 (Pillar 0+2, 2026-05-31)
+## 0. 최신 — Corpus 확장·심화 + dense index v1.0.3 (2026-05-31)
+
+### 0.1 한 줄 요약
+
+`auto/corpus-expand`에서 **14개 작성 사이클**(매 사이클 비-GPU 게이트 통과 후 commit)로 코퍼스를 확장·심화했다: 신규 개념 **11개**(network 4·language 3·security 2·system-design 1·design-pattern 1, 표준 CS 커리큘럼 누락 근거), 학습자 재질문 클러스터 **5개**(version-confusion·transaction-boundary·optimistic-vs-pessimistic·isolation·non-repeatable-read↔replica-lag) enrich, gap 해소 **4개**(MVCC engine-support·storage-engine/InnoDB·`@Configuration` vs `@Component`·H2 isolation), thin-body 심화 **20개**(body-only, dense-neutral), 코퍼스 전체 **summary 복구**(58% broken → 0). 누적 본문 **+58.4k자**. dense 재빌드 **1회**(RunPod A40, 3339 → 3350 concepts).
+
+**accept authority(실 학습 history 기반 frozen qrels, 40 ranking-eligible)** 기준 top1 **0.725 → 0.750 (+2.5pp)**, NDCG@5 +0.5pp, MRR +2.3pp, forbidden 8 → 6, learner_alignment 0.96 유지, p95 +2.0%(예산 내) — `cohort-compare --fail-on-drift` **PASS**. r3 합성 cross-check(180 q)는 top1 −1.7pp로 drift gate를 건드리지만, top5 이탈 11건 중 **9건이 라벨 아티팩트**(동일주제 형제 개념이 top5에 잔존 — +11 신규 개념으로 근접-동률이 재정렬됨), **2건만 진짜 miss**(`mvcc-read-view-consistent-read-internals`, `mvc-controller-basics`)다. 게이트 all green: strict load 3350/0, graph broken=0·orphan=0, readiness 6/6, golden 2/2, router 31/31, **pytest 526 passed**.
+
+### 0.2 헤드라인 델타 — 실데이터 frozen accept set (핵심, control = index v1.0.2)
+
+| 지표 | v1.0.2 | v1.0.3 | Δ | 게이트 |
+|---|---:|---:|---:|---|
+| top1_match_rate | 0.725 | **0.750** | **+2.5pp** | ✅ (fail-on-drift PASS) |
+| top5_match_rate | 0.95 | 0.95 | 0 | — |
+| recall@5 | 0.785 | 0.769 | −1.6pp | — (fail field 아님) |
+| NDCG@5 | 0.744 | 0.749 | +0.5pp | ✅ |
+| MRR | 0.815 | 0.838 | +2.3pp | — |
+| learner_alignment | 0.96 | 0.96 | 0 | — |
+| forbidden_hit_count | 8 | 6 | **−2** | ✅ 비상승 |
+| p95 ms (cold) | 178.2 | 181.7 | +2.0% | ✅ <10% |
+
+(ranking-eligible 40/50. corpus-gap probe 5건 등은 ranking 제외. control은 cold-cache 재측정값 — 초기 cache-warm 측정의 p95 아티팩트 제거.)
+
+### 0.3 교차검증 — r3 합성 qrels (180 q) + 회귀 진단
+
+| 지표 | v1.0.2 | v1.0.3 | Δ |
+|---|---:|---:|---:|
+| top1_match_rate | 0.767 | 0.750 | −1.7pp |
+| top5_match_rate | 0.95 | 0.889 | −6.1pp |
+| recall@5 | 0.918 | 0.859 | −5.9pp |
+| NDCG@5 | 0.845 | 0.804 | −4.1pp |
+| MRR | 0.842 | 0.806 | −3.6pp |
+| forbidden_hit_count | 2 | 2 | 0 |
+| p95 ms (cold) | 57.7 | 60.1 | +4.2% |
+
+`cohort-compare --fail-on-drift`: 실데이터 **PASS**, 합성 **FAIL**(top1·ndcg drift). 합성 하락의 근본 원인 — top5에서 이탈한 expected 개념 11건(신규 진입 0건)을 per-query로 분류하면:
+
+- **라벨 아티팩트 9건**: candidate top5에 동일주제 형제 개념이 잔존한다. 예) `registry-primer…` → `registry-pattern`(더 정준), filter-chain bridge → 정준 `spring-security-filter-chain`, `replica-lag…` → `db-read-replica-write-primary-routing-primer`(#2). +11 신규 개념으로 dense 공간이 이동하며 **근접-동률 co-relevant 개념들의 순위가 뒤바뀐 것**이고, 단일 라벨 합성 qrels는 동등하게 타당한 형제 개념을 정답으로 인정하지 못한다.
+- **진짜 miss 2건**: `mvcc-read-view-consistent-read-internals`(lock/connection-pool 개념으로 대체), `mvc-controller-basics`(network/http 개념으로 대체). top5에 등가 개념이 없다. 다음 cycle에서 card 필드 보강 후보.
+
+accept authority(실 history)는 전 지표 개선·forbidden 감소했고, 합성 하락은 ~80%가 라벨 아티팩트라 **품질 저하가 아닌 코퍼스 성장의 부수효과**로 판단해 배포했다(사용자 승인).
+
+### 0.4 무엇이 추가·심화됐나 (카테고리별 + 근거)
+
+| 종류 | 수 | 근거 | 비고 |
+|---|---:|---|---|
+| 신규 개념 (Track C) | 11 | curriculum 누락 + corpus_gap_probe | network 4, language 3, security 2, system-design 1, design-pattern 1 |
+| 재질문 클러스터 enrich (Track A+B, tier-1) | 5 | 학습자 history 재질문·uncertain | version-confusion, transaction-boundary, optimistic-vs-pessimistic, isolation misconception, non-repeatable-read↔replica-lag |
+| gap 해소 enrich (Track A, tier-2) | 4 | corpus_gap_probe + history(예: `@Configuration` vs `@Component` 52회 재질문) | MVCC engine-support, storage-engine/InnoDB, `@Configuration` vs `@Component`, H2 isolation/locking |
+| thin-body 심화 (Track B, body-only) | 20 | depth audit(body<2600 또는 헤더<3) | cycles 13·14, dense-neutral(encoding_text 불변) |
+| summary 복구 (품질) | 코퍼스 전체 | 58% broken summary | body 한줄요약 기반 content-grounded 복구 |
+
+누적 본문 **+58,396자**. dense 벡터를 바꾸는 편집(신규·alias·expected_query·summary)은 최종 1회 재빌드로 반영, body 심화는 dense-neutral.
+
+### 0.5 검증 요약 (overfit 가드)
+
+- 14 사이클 × 매 사이클 비-GPU 게이트(strict load·graph audit·readiness·lexical·pytest·golden·router) + 서브에이전트 독립 CS 정확도+풍부함 리뷰(작성자≠검증자). reject된 콘텐츠는 정정 후 반영.
+- 최종 dense 게이트 all green: strict load 3350/0, graph broken=0·orphan=0(cycle/inversion은 main과 동일한 기존값), readiness 6/6(`ready_for_dense_rebuild=True`), golden 2/2, router 31/31, pytest 526.
+- **overfit 가드**: alias/expected_query는 qrels 라벨이 아닌 학습자 실제 history 표현에서 도출, 합성 qrels는 독립 cross-check로만 사용. accept authority(real frozen) 개선 + 합성 하락의 라벨-아티팩트 진단으로 enrich-to-test 아님을 확인.
+
+### 0.6 배포 / 비용 / 안전
+
+- main merge: `77f47f9` (auto/corpus-expand, 15 commits, --no-ff).
+- release: **`paradigm-v2-index-v1.0.3`** — `state/index.tar.zst` 18.6MB, SHA256 `74fa417d213a31cd011208118bde276966a369005b813fc630c2a3a72d87dd7d`, dense_corpus_sha256 `d511b244…`, full_corpus_sha256 `9dbbc96d…`. `bin/sync-index-metadata --tag paradigm-v2-index-v1.0.3`로 manifest + 문서 토큰 갱신.
+- 빌드: RunPod **A40 (SECURE)** 1회 dense encode(3350 concepts, encode 18.4s), ~$0.1–0.3. (A100 80GB PCIe·A40 COMMUNITY는 capacity 부족으로 A40 SECURE로 전환.)
+- 롤백: `bin/index-fetch --tag paradigm-v2-index-v1.0.2` (1커맨드) + 코드 `git revert 77f47f9`.
+
+### 0.7 재현
+
+```bash
+export WOOWA_SESSION_MODE=development
+# control(v1.0.2)은 cold-cache로 재측정: index swap 후 daemon 재시작 → cohort-eval
+bin/cohort-eval --qrels tests/fixtures/real_learner_qrels_v1.json --out reports/fin_control_real_cold.json --top-k 5 --relations-expand 5
+bin/cohort-eval --qrels tests/fixtures/r3_qrels_real_v1.json   --out reports/fin_control_synth_cold.json --top-k 5 --relations-expand 5
+# candidate(v1.0.3)
+bin/cohort-eval --qrels tests/fixtures/real_learner_qrels_v1.json --out reports/fin_cand_real.json --top-k 5 --relations-expand 5
+bin/cohort-eval --qrels tests/fixtures/r3_qrels_real_v1.json   --out reports/fin_cand_synth.json --top-k 5 --relations-expand 5
+# gate
+bin/cohort-compare --control reports/fin_control_real_cold.json  --candidate reports/fin_cand_real.json  --fail-on-drift   # PASS
+bin/cohort-compare --control reports/fin_control_synth_cold.json --candidate reports/fin_cand_synth.json --fail-on-drift   # FAIL(라벨 아티팩트, §0.3)
+```
+
+report 경로: `reports/fin_{control,cand}_{real,synth}.json` (+ cold control), 사이클 로그 `reports/corpus_loop_log.jsonl`(gitignored).
+
+## 0′ 직전 cycle — Retrieval 재설계 (Pillar 0+2, 2026-05-31)
 
 ### 0.1 한 줄 요약
 

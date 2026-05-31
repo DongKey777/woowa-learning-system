@@ -48,7 +48,7 @@ bin/setup
 ```bash
 bin/index-fetch
 ```
-- GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.2` (release별 약 13-19MB, SHA256 검증) → `state/index/`
+- GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.3` (release별 약 13-19MB, SHA256 검증) → `state/index/`
 - 소요: ~15초
 - `gh` CLI 미설치면 한국어로 OS별 설치 안내 후 재시도
 
@@ -214,7 +214,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | 학습자 발화 / Trigger | AI 자동 호출 |
 |---|---|
 | 새 index archive 패키징 | `bin/index-pack --force && bin/index-pack --verify-only` |
-| 새 release tag publish 후 | `bin/sync-index-metadata --tag paradigm-v2-index-v1.0.2` |
+| 새 release tag publish 후 | `bin/sync-index-metadata --tag paradigm-v2-index-v1.0.3` |
 | drill answer 채점 미리보기 | `bin/drill-grade-prepare --pending-file P [--answer A]` |
 | *"도움 됐어"*, *"안 맞아"* | `bin/learn-feedback --signal helpful\|not_helpful\|unclear --silent` |
 | pending self_assessment + 학습자가 점수 회신 | `bin/learn-self-assess --trigger-session-id <id> --score N --silent` |
