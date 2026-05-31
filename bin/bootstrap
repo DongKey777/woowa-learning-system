@@ -56,6 +56,16 @@ def _daemon_alive() -> bool:
     return r.returncode == 0 and "alive" in r.stdout
 
 
+def _installed_index_tag() -> str | None:
+    mf = REPO_ROOT / "state" / "index" / "manifest.json"
+    if not mf.exists():
+        return None
+    try:
+        return json.loads(mf.read_text(encoding="utf-8")).get("release_tag")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-pip", action="store_true")
@@ -81,23 +91,32 @@ def main(argv: list[str] | None = None) -> int:
                 [str(REPO_ROOT / "bin" / "setup")], timeout=900
             ))
 
-    # 2. index fetch + runtime sidecar ensure
+    # 2. index fetch + runtime sidecar ensure. --auto-upgrade re-fetches when the
+    # installed released index is older than the code's latest tag (e.g. after a
+    # git pull), and is a no-op when already current or for local maintainer builds.
+    daemon_was_alive = _daemon_alive()
+    tag_before = _installed_index_tag()
     if not args.skip_index:
         steps.append({"step": "index-fetch"} | _run(
-            [sys.executable, str(REPO_ROOT / "bin" / "index-fetch")], timeout=120
+            [sys.executable, str(REPO_ROOT / "bin" / "index-fetch"),
+             "--auto-upgrade"], timeout=120
         ))
+    index_upgraded = _installed_index_tag() != tag_before
 
-    # 3. daemon start (background)
+    # 3. daemon start (background). A live daemon holds the old index in memory, so
+    # restart it only when the index was actually replaced.
     if not args.skip_daemon:
-        if _daemon_alive():
+        log = Path("/tmp/paradigm-v2-daemon-bootstrap.log")
+        start_cmd = [sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"),
+                     "start-bg", "--log-path", str(log), "--timeout-s", "90"]
+        if daemon_was_alive and index_upgraded:
+            _run([sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"), "stop"],
+                 timeout=15)
+            steps.append({"step": "rag-daemon-restart"} | _run(start_cmd, timeout=95))
+        elif _daemon_alive():
             steps.append({"step": "rag-daemon", "rc": 0, "ms": 0, "skipped": "alive"})
         else:
-            log = Path("/tmp/paradigm-v2-daemon-bootstrap.log")
-            steps.append({"step": "rag-daemon"} | _run(
-                [sys.executable, str(REPO_ROOT / "bin" / "rag-daemon"),
-                 "start-bg", "--log-path", str(log), "--timeout-s", "90"],
-                timeout=95,
-            ))
+            steps.append({"step": "rag-daemon"} | _run(start_cmd, timeout=95))
 
     success = all(s.get("rc") == 0 for s in steps)
     print(json.dumps({"steps": steps, "healthy": success},

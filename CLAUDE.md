@@ -51,6 +51,7 @@ bin/index-fetch
 - GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.3` (release별 약 13-19MB, SHA256 검증) → `state/index/`
 - 소요: ~15초
 - `gh` CLI 미설치면 한국어로 OS별 설치 안내 후 재시도
+- **기존 학습자 재진입(git pull 후)**: 이미 `state/index/`가 있으면 무인자 `bin/index-fetch`는 건너뛴다. 새 release가 들어왔는지 자동 반영하려면 `bin/index-fetch --auto-upgrade` — 설치된 `manifest.release_tag`가 코드 최신 tag보다 낡았을 때만 재fetch(이미 최신이면 no-op). `bin/bootstrap`이 이 플래그를 자동으로 넘긴다.
 
 **🚫 학습자 기기 `bin/corpus-build` 금지** — 15-30분 + 4-6GB peak RAM이라 학습 흐름 차단. 새 버전 필요 시 maintainer가 RunPod에서 빌드 후 `gh release create`, 학습자는 `bin/index-fetch --tag <new>` 로 업데이트.
 
@@ -292,7 +293,8 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison
 세션 시작 → 학습자 첫 발화를 받기 전에 다음 자체점검:
 1. `git rev-parse HEAD`로 현재 commit 확인.
 2. `state/rag-daemon.sock` 존재 + `bin/rag-daemon ping` ok 확인.
-3. 아니면 First-Run Protocol step 1-6 자동 시작.
+3. ping ok면 인덱스 최신성도 확인: `bin/index-fetch --auto-upgrade` (설치 인덱스가 최신 release보다 낡았으면 자동 교체, 최신이면 no-op). 인덱스가 교체됐으면 `bin/rag-daemon stop` 후 `start-bg`로 재시작해 새 인덱스를 메모리에 올린다. (이 점검+재시작은 `bin/bootstrap` 한 번으로도 처리된다 — idempotent.)
+4. ping 실패면 First-Run Protocol step 1-6(`bin/bootstrap`) 자동 시작.
 
 준비 완료 시 한국어 한 줄: *"세팅 끝났어. 뭘 학습하고 싶어?"*
 

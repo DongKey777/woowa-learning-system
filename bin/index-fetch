@@ -71,6 +71,25 @@ def _manifest_dense_sha(path: Path) -> str | None:
     return manifest.get("dense_corpus_sha256") or manifest.get("corpus_sha256")
 
 
+def _manifest_release_tag(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("release_tag")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _needs_auto_upgrade(installed_tag: str | None, target_tag: str,
+                        auto_upgrade: bool) -> bool:
+    """Re-fetch only when an installed *released* index is older than target.
+
+    A locally-built index has no release_tag (only sync-index-metadata sets it),
+    so installed_tag=None never triggers an upgrade — protects maintainer builds.
+    """
+    return bool(auto_upgrade and installed_tag and installed_tag != target_tag)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", default=DEFAULT_TAG)
@@ -81,13 +100,22 @@ def main(argv: list[str] | None = None) -> int:
                              "(default: KNOWN_SHA256[tag], abort on mismatch)")
     parser.add_argument("--force", action="store_true",
                         help="overwrite state/index/ if already present")
+    parser.add_argument("--auto-upgrade", action="store_true",
+                        help="re-fetch when the installed index is an older "
+                             "release than --tag (no-op if already latest)")
     args = parser.parse_args(argv)
 
     pattern = args.pattern or f"{args.tag}.tar.zst"
     expected_sha = args.expected_sha256 or KNOWN_SHA256.get(args.tag)
 
     target = STATE_DIR / "index"
-    if target.exists() and not args.force:
+    installed_tag = _manifest_release_tag(target / "manifest.json")
+    needs_upgrade = _needs_auto_upgrade(installed_tag, args.tag, args.auto_upgrade)
+    if needs_upgrade:
+        print(f"[index-fetch] auto-upgrade: installed {installed_tag} → "
+              f"{args.tag}; refreshing index", flush=True)
+
+    if target.exists() and not args.force and not needs_upgrade:
         rc, stats = _ensure_runtime_sidecars()
         if rc != 0:
             return rc

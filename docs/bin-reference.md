@@ -141,12 +141,13 @@ trigger: 학습자가 *"다른 크루는"*, *"정밀 비교"*, *"cross-crew"* �
 GitHub Releases에서 pre-built Lance 인덱스 다운로드. SHA256 검증 후 `state/index/`로 추출.
 
 ```bash
-bin/index-fetch [--tag paradigm-v2-index-v1.0.3] [--force] [--expected-sha256 <hex>]
+bin/index-fetch [--tag paradigm-v2-index-v1.0.3] [--force] [--auto-upgrade] [--expected-sha256 <hex>]
 ```
 
 옵션:
 - `--tag <tag>`: 다른 release version 지정
 - `--force`: 기존 `state/index/`를 덮어쓰기 (default는 존재 시 건너뜀)
+- `--auto-upgrade`: 설치된 인덱스의 `manifest.release_tag`가 `--tag`(최신)보다 낡았으면 자동 재fetch. 이미 최신이면 no-op, tag 없는 로컬 빌드는 건드리지 않음(maintainer 보호). git pull로 새 release가 들어온 기존 학습자가 별도 명령 없이 최신화되는 경로 — `bin/bootstrap`이 이 플래그를 넘기고 인덱스가 바뀐 경우에만 daemon을 재시작.
 - `--expected-sha256 <hex>`: 무결성 검증 override (default는 `KNOWN_SHA256[tag]` — known tag면 자동 검증, unknown tag면 경고 후 skip)
 - `--pattern <name>`: asset 이름 override (default는 `<tag>.tar.zst`)
 
