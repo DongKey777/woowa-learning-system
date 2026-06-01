@@ -7,10 +7,10 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 python3 -m pytest tests/ -q
 ```
 
-현재 **523 passed**. 최신 regression 기준 pytest runtime은 26.42초.
+현재 **662 passed**.
 
 주요 test 모듈:
-- `test_router.py` — 7 mode dispatch
+- `test_router.py` — router decision (force-token override, AI 세션 mode override, f11 fast-path, 키워드 dispatch, cs_qa guard)
 - `test_intent_prompt.py` / `test_phase8_intent_dispatch.py` — intent classification
 - `test_drill.py` — 12 drill tests (offer/scoring/spaced repetition)
 - `test_lazy_loader.py` — artifact loading
@@ -20,7 +20,7 @@ python3 -m pytest tests/ -q
 - `test_peer_pr.py` — peer PR analysis
 - `test_phase8_code_metrics.py` — LOC budget + entry point count
 
-회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 523 passed 유지 확인.
+회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 662 passed 유지 확인.
 
 ---
 

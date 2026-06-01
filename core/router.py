@@ -105,23 +105,24 @@ def route(
     pending_self_assessment: dict | None = None,
     pending_drill: dict | None = None,
     nearest_concept_cosine: Callable[[str], float | None] | None = None,
+    mode_override: str | None = None,
 ) -> RouteDecision:
     override_decision = _route_override(prompt, repo)
     if override_decision is not None:
         return override_decision
 
+    # AI-session-driven routing: the AI reads the learner's message and may
+    # pass an explicit mode. It wins over keyword detection, which generalizes
+    # poorly to paraphrase (router_paraphrase_recall ≈ 3.8% on held-out
+    # phrasing). Absent/unknown → fall through to keyword routing, so headless
+    # callers, other agents, and every eval gate keep today's deterministic
+    # behavior.
+    forced = _mode_override_decision(mode_override)
+    if forced is not None:
+        return forced
+
     if _is_f11_trigger(prompt):
-        return RouteDecision(
-            mode="f11_anchor",
-            need_rag=False,
-            need_mission_ctx=True,
-            need_anchors=True,
-            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
-            budget_tokens=12000,
-            lazy_artifacts=[ARTIFACT_ANCHORS, ARTIFACT_CROSS_CREW, ARTIFACT_MISSION_PATTERNS],
-            reason="F11 explicit trigger (cross-crew review analysis)",
-            confidence=0.9,
-        )
+        return _f11_decision()
 
     intent = detect_mode(
         prompt,
@@ -314,6 +315,49 @@ def _from_intent(intent: IntentDecision, reason_override: str | None = None) -> 
         lazy_artifacts=[ARTIFACT_CONCEPT_GRAPH],
         reason=f"fallback (unknown mode {mode!r})", confidence=0.3,
     )
+
+
+def _f11_decision() -> RouteDecision:
+    return RouteDecision(
+        mode="f11_anchor",
+        need_rag=False,
+        need_mission_ctx=True,
+        need_anchors=True,
+        personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+        budget_tokens=12000,
+        lazy_artifacts=[ARTIFACT_ANCHORS, ARTIFACT_CROSS_CREW, ARTIFACT_MISSION_PATTERNS],
+        reason="F11 explicit trigger (cross-crew review analysis)",
+        confidence=0.9,
+    )
+
+
+# Router modes the AI session may force via an explicit mode_override. f11_anchor
+# is built inline (route() fast-path), the rest flow through _from_intent's
+# mode-keyed dispatch. tier_0_fallback is intentionally excluded — it's a guard
+# outcome, never an intent the AI should select.
+_VALID_OVERRIDE_MODES = frozenset({
+    "tool_only", "cs_qa", "coaching", "drill", "retro", "self_assess",
+    "pr_diff_evolution", "cross_mission", "memory_review", "pr_review",
+    "reviewer_profile", "learning_path", "pr_meta", "thread_recon", "temporal",
+    "meta_analytics", "cohort", "predict", "f11_anchor",
+})
+
+
+def _mode_override_decision(mode_override: str | None) -> RouteDecision | None:
+    """Build a RouteDecision for an AI-session-supplied mode, or None to defer
+    to keyword routing when the override is absent or unrecognized."""
+    if not mode_override:
+        return None
+    mode = mode_override.strip()
+    if mode not in _VALID_OVERRIDE_MODES:
+        return None
+    if mode == "f11_anchor":
+        return _f11_decision()
+    return _from_intent(IntentDecision(
+        mode=mode,
+        reason=f"ai-session mode override: {mode}",
+        confidence=0.95,
+    ))
 
 
 def _is_f11_trigger(prompt: str) -> bool:

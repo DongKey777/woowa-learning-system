@@ -418,6 +418,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     if learner_id == "default":
                         learner_id = resolve_learner_login(state_root)
                     event_mode = req.get("mode") or os.environ.get("WOOWA_SESSION_MODE", "learning")
+                    route_mode = req.get("route_mode")  # AI-session-driven mode (optional)
                     profile = load_profile(learner_id, state_root=state_root)
                     recent = read_history(state_root=state_root, tail=20)
                     reformulation = select_reformulation(
@@ -435,6 +436,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
                         pending_drill=profile.pending_triggers.get("review_drill"),
                         nearest_concept_cosine=_nearest_concept_cosine,
+                        mode_override=route_mode,
                     )
                     if decision.mode == "tier_0_fallback" and reformulated_query:
                         decision = route(
@@ -442,6 +444,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             pending_self_assessment=profile.pending_triggers.get("self_assessment"),
                             pending_drill=profile.pending_triggers.get("review_drill"),
                             nearest_concept_cosine=_nearest_concept_cosine,
+                            mode_override=route_mode,
                         )
                     artifacts = lazy_load(
                         decision,

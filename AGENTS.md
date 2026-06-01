@@ -90,10 +90,11 @@ python3 bin/ask "테스트"
 - 외부 paid LLM API 호출 (예: OpenAI API key로 별도 호출). 모든 추론은 현재 ChatGPT Plus/Pro 구독 세션 안에서만.
 
 ### 4.2 매 turn 자동
-1. `bin/ask "<prompt>" [--repo <repo>]` 자동 호출
-2. 받은 prompt markdown 그대로 → 학습자에게 한국어 답변
-3. 첫 줄 header: `[Mode: <router_mode>]`
-4. 답변 끝 `참고:` 블록 (최대 3 concept_id)
+1. 모드 선택 — 학습자 발화 의미를 읽고 §4.2.2 카탈로그에서 맞는 모드를 골라 `bin/ask "<prompt>" --mode <mode> [--repo <repo>]`로 넘긴다. 애매하면 `--mode` 생략 → 키워드 router(`detect_mode`)가 fallback.
+2. `bin/ask` 자동 호출
+3. 받은 prompt markdown 그대로 → 학습자에게 한국어 답변
+4. 첫 줄 header: `[Mode: <router_mode>]`
+5. 답변 끝 `참고:` 블록 (최대 3 concept_id)
 
 ### 4.2.1 답변 본문 수집 규칙
 - UX가 우선이다. 답변 본문 수집 실패가 학습 답변을 막으면 안 된다.
@@ -108,6 +109,10 @@ python3 bin/ask "테스트"
 - summary-only에서는 본문 인용을 검증할 수 없으므로 `declared_citation_unverified`가 남는다.
 - 정상 full-body 수집 시 `response-quality.jsonl.response_excerpt`에는 redacted prefix(최대 5000자), `response_body_path`에는 redacted full body 파일 경로가 저장된다.
 - full body 파일은 redacted content hash 기반으로 dedupe 저장된다. 같은 본문을 여러 turn에서 수집해도 파일은 한 번만 쓴다.
+
+### 4.2.2 모드 카탈로그 (AI가 `--mode`로 직접 선택)
+
+키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). AI 세션이 발화 의미를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로, 키워드 router는 deterministic fallback. 모드 목록과 선택 기준은 CLAUDE.md §4.2.2와 동일하다 — `cs_qa` / `coaching` / `drill` / `self_assess` / `retro` / `pr_diff_evolution`(코드 변화·리뷰 반영) / `cross_mission`(미션 간 개념·반복 실수) / `memory_review`(사각지대·복습) / `pr_review`(받은 리뷰) / `reviewer_profile`(멘토 성향) / `learning_path`(다음 학습) / `pr_meta`(PR 품질·크기) / `thread_recon`(스레드 복원) / `temporal`(시간축) / `meta_analytics`(학습 메타) / `cohort`(동기 비교) / `predict`(리뷰 미리 보기) / `f11_anchor`(cross-crew). `tool_only`/`tier_0_fallback`은 직접 고르지 않는다.
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:
@@ -207,7 +212,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison
 ## 8. 참고 문서
 
 - [`CLAUDE.md`](CLAUDE.md) — Claude 세션용 동등 문서
-- [`docs/architecture.md`](docs/architecture.md) — 7 mode router + Bloom + F10/F11 + multi-agent
+- [`docs/architecture.md`](docs/architecture.md) — router (AI 세션 드리븐 + 키워드 fallback) + Bloom + F10/F11 + multi-agent
 - [`docs/onboarding.md`](docs/onboarding.md) — First-Run Protocol 상세
 - [`docs/bin-reference.md`](docs/bin-reference.md) — 주요 bin entry usage
 - [`docs/learning-flow.md`](docs/learning-flow.md) — 학습자 일상 시나리오

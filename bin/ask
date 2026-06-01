@@ -38,6 +38,7 @@ _ask_fast() {
   learner_id=""
   state_root=""
   reformulated_query=""
+  route_mode=""
   json_mode=0
   json_route=0
   shift
@@ -47,6 +48,7 @@ _ask_fast() {
       --learner-id) [ "$#" -ge 2 ] || return 1; learner_id="$2"; shift 2 ;;
       --state-root) [ "$#" -ge 2 ] || return 1; state_root="$2"; shift 2 ;;
       --reformulated-query) [ "$#" -ge 2 ] || return 1; reformulated_query="$2"; shift 2 ;;
+      --mode) [ "$#" -ge 2 ] || return 1; route_mode="$2"; shift 2 ;;
       --json) json_mode=1; shift ;;
       --json-route) json_route=1; shift ;;
       --no-daemon) return 1 ;;
@@ -68,7 +70,7 @@ _ask_fast() {
     learner_id="$(_ask_identity_from_state_root "$identity_root" 2>/dev/null || printf default)"
   fi
 
-  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
+  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "$route_mode" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
     _ask_json_safe "$value" || return 1
   done
   [ -S "$sock_path" ] || return 1
@@ -80,9 +82,10 @@ _ask_fast() {
   fi
   mode="${WOOWA_SESSION_MODE:-learning}"
   reformulation="${WOOWA_REFORMULATE:-}"
-  payload=$(printf '{"action":"%s","query":"%s","repo":%s,"learner_id":"%s","mode":"%s","reformulation":%s,"json_route":%s,"reformulated_query":%s}\n' \
+  payload=$(printf '{"action":"%s","query":"%s","repo":%s,"learner_id":"%s","mode":"%s","reformulation":%s,"json_route":%s,"reformulated_query":%s,"route_mode":%s}\n' \
     "$action" "$prompt" "$(_ask_json_value "$repo")" "$learner_id" "$mode" \
-    "$(_ask_json_value "$reformulation")" "$json_route" "$(_ask_json_value "$reformulated_query")")
+    "$(_ask_json_value "$reformulation")" "$json_route" "$(_ask_json_value "$reformulated_query")" \
+    "$(_ask_json_value "$route_mode")")
   response=$(printf '%s' "$payload" | nc -U -w 30 "$sock_path" 2>/dev/null) || return 1
   [ -n "$response" ] || return 1
   printf '%s\n' "$response"
@@ -111,12 +114,12 @@ TIMEOUT_S = 30
 def parse_argv(argv):
     """Minimal argv parser — faster than argparse for hot path."""
     if not argv or argv[0] in ("-h", "--help"):
-        print("Usage: bin/ask <prompt> [--repo R] [--learner-id L] [--json-route] [--no-daemon]",
+        print("Usage: bin/ask <prompt> [--repo R] [--learner-id L] [--mode M] [--json-route] [--no-daemon]",
               file=sys.stderr)
         return None
     out = {"prompt": argv[0], "repo": None, "learner_id": None,
            "json_route": False, "no_daemon": False, "state_root": None,
-           "json_mode": False, "reformulated_query": None}
+           "json_mode": False, "reformulated_query": None, "route_mode": None}
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -128,6 +131,8 @@ def parse_argv(argv):
             out["state_root"] = argv[i + 1]; i += 2
         elif a == "--reformulated-query" and i + 1 < len(argv):
             out["reformulated_query"] = argv[i + 1]; i += 2
+        elif a == "--mode" and i + 1 < len(argv):
+            out["route_mode"] = argv[i + 1]; i += 2
         elif a == "--json":
             out["json_mode"] = True; i += 1
         elif a == "--json-route":
@@ -154,6 +159,8 @@ def daemon_ask(args):
                        "reformulation": os.environ.get("WOOWA_REFORMULATE")}
         if args.get("reformulated_query"):
             req_payload["reformulated_query"] = args["reformulated_query"]
+        if args.get("route_mode"):
+            req_payload["route_mode"] = args["route_mode"]
         req = json.dumps(req_payload) + "\n"
         sock.sendall(req.encode("utf-8"))
         data = b""
@@ -245,12 +252,14 @@ def main(argv=None):
         args["prompt"], repo=args["repo"],
         pending_self_assessment=profile.pending_triggers.get("self_assessment"),
         pending_drill=profile.pending_triggers.get("review_drill"),
+        mode_override=args.get("route_mode"),
     )
     if decision.mode == "tier_0_fallback" and reformulated_query:
         decision = route(
             reformulated_query, repo=args["repo"],
             pending_self_assessment=profile.pending_triggers.get("self_assessment"),
             pending_drill=profile.pending_triggers.get("review_drill"),
+            mode_override=args.get("route_mode"),
         )
 
     if decision.mode == "retro" and not args["repo"]:

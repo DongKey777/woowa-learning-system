@@ -38,11 +38,12 @@ bin/setup --dev    # + pytest (시스템 개발 / Mode B)
 학습자 query를 daemon에 보내고 markdown prompt 반환. AI 세션이 학습자 의도 받으면 자동 호출.
 
 ```bash
-bin/ask "<prompt>" [--repo R] [--learner-id L] [--json-route] [--no-daemon] [--state-root PATH]
+bin/ask "<prompt>" [--repo R] [--mode M] [--learner-id L] [--json-route] [--no-daemon] [--state-root PATH]
 ```
 
 옵션:
-- `--repo R`: 학습자 mission repo 지정 (coaching/retro/F11 모드 트리거 가능)
+- `--repo R`: 학습자 mission repo 지정 (coaching/retro/F11 등 모드 트리거 가능)
+- `--mode M`: AI 세션이 발화 의미를 읽고 고른 모드를 명시. 키워드 검출보다 우선하고, 미지정·미인식이면 키워드 router로 fallback. 선택 가능한 모드는 [`CLAUDE.md`](../CLAUDE.md) §4.2.2 카탈로그 참조.
 - `--learner-id L`: learner identifier (omitted이면 `state/learner/identity.json`에서 자동 해석)
 - `--json-route`: stdout 첫 줄에 `# RouteDecision: {...}` 표기 (디버그)
 - `--no-daemon`: daemon 우회, in-process pipeline (cold ~30s, debug/CI)
@@ -52,9 +53,10 @@ bin/ask "<prompt>" [--repo R] [--learner-id L] [--json-route] [--no-daemon] [--s
 
 예:
 ```bash
-python3 bin/ask "Bean DI가 뭐야"                              # cs_qa
-python3 bin/ask "내 코드 어때" --repo spring-roomescape-member  # coaching
-python3 bin/ask "다른 크루는 어떻게" --repo spring-roomescape-member  # f11_anchor
+python3 bin/ask "Bean DI가 뭐야"                                          # 키워드 → cs_qa
+python3 bin/ask "내 코드 어때" --repo spring-roomescape-member --mode coaching
+python3 bin/ask "올리기 전에 어떤 리뷰 받을지 보고 싶어" --repo spring-roomescape-waiting --mode predict
+python3 bin/ask "다른 크루는 어떻게" --repo spring-roomescape-member --mode f11_anchor
 ```
 
 ---

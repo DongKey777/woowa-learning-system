@@ -71,7 +71,7 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 
 ## 지원 기능 목록 (학습 모드)
 
-한국어로 의도만 말하면 router가 알맞은 모드로 알아서 보낸다.
+한국어로 의도만 말하면 AI 세션이 발화를 읽고 알맞은 모드로 보낸다. 모드가 애매하면 키워드 router가 받쳐준다.
 
 **기본 질문/코칭 모드** — 개념을 배우거나 코드 코칭을 받는 평소 경로:
 
@@ -105,7 +105,7 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 
 | 문서 | 내용 |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | 7 mode router + multi-agent + Bloom + F10/F11 design |
+| [`docs/architecture.md`](docs/architecture.md) | router (AI 세션 드리븐 + 키워드 fallback) + multi-agent + Bloom + F10/F11 design |
 | [`docs/onboarding.md`](docs/onboarding.md) | First-Run Protocol 상세 + 트러블슈팅 |
 | [`docs/bin-reference.md`](docs/bin-reference.md) | 주요 `bin/*` entry와 Phase T-X wrapper 사용법 |
 | [`docs/learning-flow.md`](docs/learning-flow.md) | 학습자 일상 사용 시나리오 |

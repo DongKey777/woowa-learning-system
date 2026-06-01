@@ -8,7 +8,7 @@
 bin/ask (socket client; warm CLI p95 ~30ms)
        ↓
 core/daemon.py (AF_UNIX, single-thread, BGE-M3 warm in-process)
-   1. core/router.py        → mode (cs_qa / coaching / tool_only / retro / drill / self_assess / f11_anchor)
+   1. core/router.py        → mode (AI 세션이 --mode로 직접 선택, 미지정 시 키워드 router fallback)
    2. core/lazy_loader.py   → only artifacts the router asked for
    3. core/coach.py         → multi-agent labeled-section prompt
        ↓
@@ -23,19 +23,40 @@ bin/learn-event (학습자 code/drill/self-assess 이벤트) → core/feedback.p
 state/learner/mastery_graph.sqlite : attempted → familiar → proficient → mastered
 ```
 
-## 2. 7-mode router (core/router.py)
+## 2. Router — AI 세션 드리븐 hybrid (core/router.py)
 
-| Mode | Trigger | Personas | Artifacts | Budget |
+`route()`의 결정 순서:
+1. **force-token override** (`_route_override`) — `그냥 답해줘`(skip RAG) / `RAG로 깊게`(full RAG) 같은 명시 토큰.
+2. **AI 세션 mode override** (`mode_override`, `bin/ask --mode <X>`) — AI 세션이 학습자 발화 **의미**를 읽고 고른 모드. 키워드 검출보다 우선. 키워드 router는 학습자가 특정 단어를 그대로 쳐야 맞기 때문에 paraphrase에 약하다(held-out 측정 recall ≈ 3.8%) → AI가 모드를 골라 넘기는 게 1차 경로다. 미지정·미인식 모드면 다음 단계로 떨어져 **기존 키워드 동작을 그대로 유지**(headless 호출·다른 AI·eval gate 모두 deterministic).
+3. **f11 fast-path** (`_is_f11_trigger`) — `정밀 비교`/`다른 크루는`/`PR N line` 등은 키워드만으로도 cross-crew 진입.
+4. **키워드 router** (`core/intent.py:detect_mode`) — 순수 substring 매칭, 다어절 한국어 구 기반.
+5. **cs_qa guard** — cs_qa 기본 분기에서 도메인+의도/미션 신호가 없으면 `tier_0_fallback`(no RAG).
+
+모드별 RouteDecision (`_from_intent`):
+
+| Mode | 언제 | Personas | Artifacts | Budget |
 |---|---|---|---|---|
-| `tool_only` | TOOL_TOKENS (gradle/git/docker/etc.) OR short greeting | — | — | 1500 |
-| `cs_qa` | default — concept/CS question | MENTOR + SOCRATIC | concept_graph + mastery + rag_hits | 4500 |
-| `coaching` | repo + coaching keyword (리뷰/리팩토링/내 코드/이 코드/쓰는 게/…) | MENTOR + REVIEWER + SOCRATIC | concept_graph + mission_patterns + mastery + rag_hits | 5500 |
-| `retro` | 회고/반복/내 PR/정밀/사이클 키워드 | MENTOR + REVIEWER | mission_patterns + mastery | 5000 |
+| `tool_only` | TOOL_TOKENS (gradle/git/docker) OR short greeting | — | — | 1500 |
+| `cs_qa` | default — 개념/CS 질문 | MENTOR + SOCRATIC | concept_graph + mastery + rag_hits | 4500 |
+| `coaching` | repo + 내 코드/접근 코칭 | MENTOR + REVIEWER + SOCRATIC | concept_graph + mission_patterns + mastery + rag_hits | 5500 |
+| `retro` | 내 PR 흐름·반복 멘토 코멘트 회고 | MENTOR + REVIEWER | mission_patterns + mastery | 5000 |
 | `drill` | pending_drill + answer-shaped reply | SOCRATIC | mastery + drill_offer | 3000 |
-| `self_assess` | pending_self_assessment + pure `^N점$` reply | — | mastery | 2000 |
-| `f11_anchor` | F11_KEYWORDS (정밀 비교/다른 크루는/cross-crew/…) OR `PR N line` regex | REVIEWER + MENTOR | review_anchors + cross_crew_review_graph + mission_patterns | 12000 |
+| `self_assess` | pending_self_assessment + pure `^N점$` | — | mastery | 2000 |
+| `pr_diff_evolution` | 라운드별 코드 변화·리뷰 반영·핫스팟 | REVIEWER + MENTOR | pr_diff_evolution + mission_patterns | 9000 |
+| `cross_mission` | 미션 간 개념 전이·반복 실수·난이도 | MENTOR | cross_mission + mastery | 6000 |
+| `memory_review` | 사각지대 개념·복습 카드·망각 점검 | MENTOR | memory_review + mastery | 6000 |
+| `pr_review` | 받은 리뷰 분석 (anchor 근거) | REVIEWER + MENTOR | pr_review + review_anchors | 7000 |
+| `reviewer_profile` | 특정 멘토 성향 | REVIEWER + MENTOR | reviewer_profile + mission_patterns | 6000 |
+| `learning_path` | 다음 학습·prereq/다음 개념 경로 | MENTOR + SOCRATIC | learning_path + mastery | 6000 |
+| `pr_meta` | PR 본문 품질·크기 추세·커밋 응집도 | REVIEWER + MENTOR | pr_meta + mission_patterns | 6000 |
+| `thread_recon` | 리뷰 스레드 대화 복원 | REVIEWER + MENTOR | thread_recon + mission_patterns | 6000 |
+| `temporal` | 라운드 latency·정체 구간 시간축 | MENTOR + REVIEWER | temporal + mission_patterns | 6000 |
+| `meta_analytics` | 재질문/드릴 추세/과신 학습 메타 | MENTOR + SOCRATIC | meta_analytics + mastery | 6000 |
+| `cohort` | 동기 대비 내 PR 위치 | MENTOR + REVIEWER | cohort + mission_patterns | 6000 |
+| `predict` | 올리기 전 받을 리뷰 미리 보기 | REVIEWER + MENTOR | predict + mission_patterns | 7000 |
+| `f11_anchor` | 내 anchor가 다른 크루는 어땠는지(cross-crew) | REVIEWER + MENTOR | review_anchors + cross_crew_review_graph + mission_patterns | 12000 |
 
-Phase J 측정 결과: **14/14 시나리오 mode dispatch 100% correct**.
+`tier_0_fallback`(guard 결과)·`tool_only`(force-token)은 AI가 `--mode`로 직접 고르지 않는다. AI 세션의 모드 선택 가이드는 [`CLAUDE.md`](../CLAUDE.md) §4.2.2 카탈로그.
 
 ## 3. Multi-agent (single-call, labeled section)
 

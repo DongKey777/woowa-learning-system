@@ -105,10 +105,11 @@ python3 bin/ask "테스트"
 - 외부 paid LLM API 호출 — 모든 reasoning은 현재 세션 안에서 (Claude Pro/Max 구독).
 
 ### 4.2 매 turn 자동 수행
-1. **`bin/ask "<prompt>" [--repo <repo>]`** 자동 호출 — 학습자가 명령 외울 필요 없음.
-2. 응답 받은 prompt markdown을 그대로 사용해 학습자에게 한국어 답변 생성.
-3. 첫 줄 헤더: `[Mode: <router_mode>]` (예: `[Mode: cs_qa]`, `[Mode: coaching]`).
-4. 답변 끝에 `참고:` 블록으로 인용 (최대 3개 concept_id).
+1. **모드 선택** — 학습자 발화를 읽고 아래 §4.2.2 카탈로그에서 가장 맞는 모드를 직접 고른다. 고른 모드를 `bin/ask "<prompt>" --mode <mode> [--repo <repo>]`로 넘긴다.
+2. **`bin/ask` 자동 호출** — 학습자가 명령 외울 필요 없음. 어느 모드인지 확신이 안 서면 `--mode`를 빼고 호출한다. 그러면 키워드 기반 router(`detect_mode`)가 결정한다 — 이게 deterministic 하한선이다.
+3. 응답 받은 prompt markdown을 그대로 사용해 학습자에게 한국어 답변 생성.
+4. 첫 줄 헤더: `[Mode: <router_mode>]` (예: `[Mode: cs_qa]`, `[Mode: coaching]`).
+5. 답변 끝에 `참고:` 블록으로 인용 (최대 3개 concept_id).
 
 ### 4.2.1 답변 본문 수집 규칙
 - UX가 우선이다. 답변 본문 수집 실패가 학습 답변을 막으면 안 된다.
@@ -123,6 +124,33 @@ python3 bin/ask "테스트"
 - summary-only에서는 본문 인용을 검증할 수 없으므로 `declared_citation_unverified`가 남는다.
 - 정상 full-body 수집 시 `response-quality.jsonl.response_excerpt`에는 redacted prefix(최대 5000자), `response_body_path`에는 redacted full body 파일 경로가 저장된다.
 - full body 파일은 redacted content hash 기반으로 dedupe 저장된다. 같은 본문을 여러 turn에서 수집해도 파일은 한 번만 쓴다.
+
+### 4.2.2 모드 카탈로그 (AI가 `--mode`로 직접 선택)
+
+키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). 그래서 AI 세션이 발화 **의미**를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로다. 카탈로그에 없거나 애매하면 `--mode`를 생략 → 키워드 router가 fallback.
+
+| 모드 | 언제 고르나 | repo 필요 |
+|---|---|---|
+| `cs_qa` | CS/개념 질문 ("DI가 뭐야", "트랜잭션 전파 설명") | — |
+| `coaching` | 내 코드/접근에 대한 코칭, 방향 잡기 | 권장 |
+| `drill` | 확인 질문 풀기 (학습자가 명시) | — |
+| `self_assess` | pending self-assessment에 점수 회신할 때만 | — |
+| `retro` | 내 PR 흐름·반복 멘토 코멘트 회고 | 필수 |
+| `pr_diff_evolution` | 라운드별 코드 변화, 리뷰 반영 이력, 핫스팟 | 권장 |
+| `cross_mission` | 미션끼리 이어진 개념, 반복된 실수, 난이도 | — |
+| `memory_review` | 안 본 사각지대 개념, 복습 카드, 망각 점검 | — |
+| `pr_review` | 받은 리뷰 분석 (anchor·리뷰 코멘트 근거) | 권장 |
+| `reviewer_profile` | 특정 멘토가 어떤 사람인지·리뷰 성향 | 권장 |
+| `learning_path` | 다음에 뭘 배울지, prereq/다음 개념 경로 | — |
+| `pr_meta` | PR 본문 품질·크기 추세·커밋 응집도 | 권장 |
+| `thread_recon` | 리뷰 스레드 대화 복원 | 권장 |
+| `temporal` | 라운드 latency, 정체 구간 같은 시간축 | 권장 |
+| `meta_analytics` | 재질문/드릴 추세/과신 같은 학습 메타 분석 | — |
+| `cohort` | 동기들과 비교해 내 PR이 어디쯤인지 | 권장 |
+| `predict` | 올리기 전에 어떤 리뷰가 올지 미리 보기 | 권장 |
+| `f11_anchor` | 내 리뷰 anchor가 다른 크루는 어땠는지(cross-crew) | 필수 |
+
+`tool_only`/`tier_0_fallback`은 AI가 직접 고르지 않는다(전자는 force-token, 후자는 guard 결과).
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 조건 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:
@@ -303,7 +331,7 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison
 ## 8. 참고 문서
 
 - [`AGENTS.md`](AGENTS.md) — Codex/Gemini/일반 AI용 동등 문서
-- [`docs/architecture.md`](docs/architecture.md) — 7 mode router + Bloom + F10/F11 + multi-agent
+- [`docs/architecture.md`](docs/architecture.md) — router (AI 세션 드리븐 + 키워드 fallback) + Bloom + F10/F11 + multi-agent
 - [`docs/onboarding.md`](docs/onboarding.md) — First-Run Protocol 상세 + 트러블슈팅
 - [`docs/bin-reference.md`](docs/bin-reference.md) — 주요 bin entry usage
 - [`docs/learning-flow.md`](docs/learning-flow.md) — 학습자 일상 시나리오

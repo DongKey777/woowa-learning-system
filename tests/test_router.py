@@ -167,3 +167,39 @@ def test_override_coach_mode_without_keyword_needs_mission_context() -> None:
     assert d.mode == "coaching"
     assert d.need_mission_ctx is True
     assert ARTIFACT_MISSION_PATTERNS in d.lazy_artifacts
+
+
+def test_mode_override_forces_mode_regardless_of_wording() -> None:
+    """AI-session-supplied mode wins over keyword detection. The prompt below
+    keyword-routes to coaching (no predict substring), but the override forces
+    predict and loads its artifacts."""
+    d = route("어떤 리뷰 나올지 미리 알려줘", repo="x", mode_override="predict")
+    assert d.mode == "predict"
+    assert "predict" in d.lazy_artifacts
+
+
+def test_mode_override_invalid_defers_to_keyword_routing() -> None:
+    """Unrecognized override is ignored — keyword routing decides."""
+    d = route("그냥 DI가 뭐야", repo="x", mode_override="not_a_real_mode")
+    assert d.mode == route("그냥 DI가 뭐야", repo="x").mode
+
+
+def test_mode_override_none_preserves_retro_guard() -> None:
+    """No override → today's deterministic keyword behavior, incl. retro guard."""
+    d = route("내 PR 흐름 보여줘 리뷰", repo="x")
+    assert d.mode == "retro"
+    d2 = route("내 PR 흐름 보여줘 리뷰", repo="x", mode_override=None)
+    assert d2.mode == "retro"
+
+
+def test_mode_override_empty_string_defers() -> None:
+    d = route("Bean DI 설명해줘", repo="x", mode_override="")
+    assert d.mode == route("Bean DI 설명해줘", repo="x").mode
+
+
+def test_mode_override_f11_builds_anchor_decision() -> None:
+    d = route("아무 말이나", repo="x", mode_override="f11_anchor")
+    assert d.mode == "f11_anchor"
+    assert d.need_anchors is True
+    assert ARTIFACT_CROSS_CREW in d.lazy_artifacts
+    assert ARTIFACT_ANCHORS in d.lazy_artifacts
