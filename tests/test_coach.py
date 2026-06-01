@@ -57,6 +57,17 @@ def test_compose_f11_anchor_emphasizes_review_diff(tmp_path: Path) -> None:
     assert "Phase C pending" in prompt  # artifacts not yet built
 
 
+def test_compose_retro_reviewer_does_not_cite_unloaded_review_data(tmp_path: Path) -> None:
+    # retro carries REVIEWER persona but loads neither review_anchors nor
+    # cross_crew_review_graph → it must NOT instruct citing those (hallucination guard).
+    r = route("내 PR 회고", repo="myrepo")
+    arts = load(r, repo="myrepo", state_root=tmp_path)
+    prompt, _, _, _ = compose(r, arts, "내 PR 회고", repo="myrepo")
+    assert "[REVIEWER]" in prompt
+    assert "cross_crew_review_graph + review_anchors" not in prompt
+    assert "없는 리뷰를 지어내" in prompt  # NO_XCREW variant active
+
+
 def test_compose_drill_persona_only_socratic(tmp_path: Path) -> None:
     r = route("DI는 의존성 주입.", pending_drill={"id": "d1"})
     arts = load(r, state_root=tmp_path)

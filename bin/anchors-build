@@ -17,6 +17,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from anchors.concept_link import default_threshold, link_concepts  # noqa: E402
 from anchors.extract import (  # noqa: E402
     MAX_ANCHORS, extract_from_archive, load_anchors, save_anchors,
 )
@@ -31,6 +32,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="default: auto-detect via gh CLI + cache")
     parser.add_argument("--limit", type=int, default=MAX_ANCHORS)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--skip-concept-link", action="store_true",
+                        help="skip topic_concept_ids semantic linking pass")
+    parser.add_argument("--concept-link-threshold", type=float, default=None,
+                        help="cosine cutoff for linking (default: env or 0.60)")
     parser.add_argument("--silent", action="store_true")
     args = parser.parse_args(argv)
 
@@ -40,6 +45,15 @@ def main(argv: list[str] | None = None) -> int:
         repo=args.repo, learner_login=learner,
         archive_root=args.state_root, limit=args.limit,
     )
+    # Concept-linking pass: fill topic_concept_ids via warm daemon (build-time only).
+    if not args.skip_concept_link:
+        threshold = (args.concept_link_threshold
+                     if args.concept_link_threshold is not None
+                     else default_threshold())
+        new_anchors = link_concepts(
+            new_anchors, threshold=threshold, state_root=args.state_root,
+        )
+    linked_for_repo = sum(1 for a in new_anchors if a.topic_concept_ids)
     # Merge with existing (preserve other repos' anchors)
     existing = load_anchors(state_root=args.state_root)
     other_repo = [a for a in existing if a.repo != args.repo]
@@ -52,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "repo": args.repo,
             "new_anchors_for_repo": len(new_anchors),
+            "linked_for_repo": linked_for_repo,
             "preserved_other_repo_anchors": len(other_repo),
             "merged_total": len(merged),
             "per_repo": dict(c),

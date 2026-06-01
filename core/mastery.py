@@ -95,14 +95,30 @@ def record_evidence(
     payload: dict | None = None,
     state_root: Path = DEFAULT_STATE_ROOT,
     ts: float | None = None,
+    dedup_key: str | None = None,
 ) -> int:
-    """Append one evidence event. Returns evidence_id. Source must be a known weight key."""
+    """Append one evidence event. Returns evidence_id. Source must be a known weight key.
+
+    When dedup_key is given, the key is stored in payload_json and a prior row
+    with the same key short-circuits the insert (returns its id) — makes repeated
+    batch syncs (bin/learn-evidence-sync) idempotent without double-counting.
+    """
     if source not in EVIDENCE_WEIGHTS:
         raise ValueError(f"unknown evidence source: {source!r}")
     weight = EVIDENCE_WEIGHTS[source] * max(0.0, min(1.0, score))
-    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    payload = dict(payload or {})
+    if dedup_key is not None:
+        payload["dedup_key"] = dedup_key
+    payload_json = json.dumps(payload, ensure_ascii=False)
     now = ts if ts is not None else time.time()
     with _connect(state_root) as conn:
+        if dedup_key is not None:
+            prior = conn.execute(
+                "SELECT id FROM evidence WHERE json_extract(payload_json,'$.dedup_key')=? LIMIT 1",
+                (dedup_key,),
+            ).fetchone()
+            if prior is not None:
+                return prior["id"]
         cur = conn.execute(
             "INSERT INTO evidence(concept_id, source, weight, ts, payload_json) VALUES (?,?,?,?,?)",
             (concept_id, source, weight, now, payload_json),

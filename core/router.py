@@ -50,6 +50,10 @@ F11_KEYWORDS = (
     "크루 비교", "크루비교", "크루들 비교",
     "cross-crew", "anchor", "앵커", "비교 의견", "다른 reviewer",
     "다양한 시각", "여러 의견",
+    # B 발견성: 자연어 진입 — 다른 크루/사람의 실제 "코드/풀이/구현"을 보고 싶은
+    # 발화. cohort(F)의 "비해/위치/순위" 지표 비교와 구분되는 코드 비교 의도.
+    "다른 크루 코드", "다른 사람 코드", "동료 코드", "다른 풀이",
+    "다른 구현 보여", "남들은 어떻게 풀", "남들은 어떻게 짰", "다른 크루 풀이",
 )
 F11_PR_LINE_PATTERN = re.compile(r"pr\s*#?\s*\d+.*(line|줄|thread)", re.IGNORECASE)
 
@@ -58,6 +62,18 @@ ARTIFACT_MISSION_PATTERNS = "mission_patterns"
 ARTIFACT_MASTERY = "mastery_graph"
 ARTIFACT_ANCHORS = "review_anchors"
 ARTIFACT_CROSS_CREW = "cross_crew_review_graph"
+ARTIFACT_PR_DIFF_EVOLUTION = "pr_diff_evolution"
+ARTIFACT_CROSS_MISSION = "cross_mission"
+ARTIFACT_MEMORY_REVIEW = "memory_review"
+ARTIFACT_PR_REVIEW = "pr_review"
+ARTIFACT_REVIEWER_PROFILE = "reviewer_profile"
+ARTIFACT_LEARNING_PATH = "learning_path"
+ARTIFACT_PR_META = "pr_meta"
+ARTIFACT_THREAD_RECON = "thread_recon"
+ARTIFACT_TEMPORAL = "temporal"
+ARTIFACT_META_ANALYTICS = "meta_analytics"
+ARTIFACT_COHORT = "cohort"
+ARTIFACT_PREDICT = "predict"
 
 PERSONA_MENTOR = "mentor"
 PERSONA_REVIEWER = "reviewer"
@@ -192,6 +208,102 @@ def _from_intent(intent: IntentDecision, reason_override: str | None = None) -> 
             personas=[],
             budget_tokens=2000,
             lazy_artifacts=[ARTIFACT_MASTERY],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "pr_diff_evolution":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=9000,
+            lazy_artifacts=[ARTIFACT_PR_DIFF_EVOLUTION, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "cross_mission":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=False, need_anchors=False,
+            personas=[PERSONA_MENTOR],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_CROSS_MISSION, ARTIFACT_MASTERY],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "memory_review":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=False, need_anchors=False,
+            personas=[PERSONA_MENTOR],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_MEMORY_REVIEW, ARTIFACT_MASTERY],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "pr_review":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=True,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=7000,
+            lazy_artifacts=[ARTIFACT_PR_REVIEW, ARTIFACT_ANCHORS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "reviewer_profile":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_REVIEWER_PROFILE, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "learning_path":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=False, need_anchors=False,
+            personas=[PERSONA_MENTOR, PERSONA_SOCRATIC],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_LEARNING_PATH, ARTIFACT_MASTERY],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "pr_meta":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_PR_META, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "thread_recon":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_THREAD_RECON, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "temporal":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_MENTOR, PERSONA_REVIEWER],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_TEMPORAL, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "meta_analytics":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=False, need_anchors=False,
+            personas=[PERSONA_MENTOR, PERSONA_SOCRATIC],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_META_ANALYTICS, ARTIFACT_MASTERY],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "cohort":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_MENTOR, PERSONA_REVIEWER],
+            budget_tokens=6000,
+            lazy_artifacts=[ARTIFACT_COHORT, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
+    if mode == "predict":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=7000,
+            lazy_artifacts=[ARTIFACT_PREDICT, ARTIFACT_MISSION_PATTERNS],
             reason=intent.reason, confidence=intent.confidence,
         )
     # fallback: treat as cs_qa minimal

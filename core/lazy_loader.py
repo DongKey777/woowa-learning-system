@@ -19,8 +19,20 @@ from core.router import (
     ARTIFACT_ANCHORS,
     ARTIFACT_CONCEPT_GRAPH,
     ARTIFACT_CROSS_CREW,
+    ARTIFACT_CROSS_MISSION,
     ARTIFACT_MASTERY,
+    ARTIFACT_MEMORY_REVIEW,
     ARTIFACT_MISSION_PATTERNS,
+    ARTIFACT_PR_DIFF_EVOLUTION,
+    ARTIFACT_PR_REVIEW,
+    ARTIFACT_REVIEWER_PROFILE,
+    ARTIFACT_LEARNING_PATH,
+    ARTIFACT_PR_META,
+    ARTIFACT_THREAD_RECON,
+    ARTIFACT_TEMPORAL,
+    ARTIFACT_META_ANALYTICS,
+    ARTIFACT_COHORT,
+    ARTIFACT_PREDICT,
     RouteDecision,
 )
 from core.state import LearnerProfile
@@ -62,6 +74,30 @@ def load(
             out[name] = _load_anchors(state_root)
         elif name == ARTIFACT_CROSS_CREW:
             out[name] = _load_cross_crew(repo, state_root)
+        elif name == ARTIFACT_PR_DIFF_EVOLUTION:
+            out[name] = _load_pr_diff_evolution(repo, state_root)
+        elif name == ARTIFACT_CROSS_MISSION:
+            out[name] = _load_cross_mission(state_root)
+        elif name == ARTIFACT_MEMORY_REVIEW:
+            out[name] = _load_memory_review(state_root)
+        elif name == ARTIFACT_PR_REVIEW:
+            out[name] = _load_pr_review(repo, state_root)
+        elif name == ARTIFACT_REVIEWER_PROFILE:
+            out[name] = _load_reviewer_profile(repo, state_root)
+        elif name == ARTIFACT_LEARNING_PATH:
+            out[name] = _load_learning_path(state_root)
+        elif name == ARTIFACT_PR_META:
+            out[name] = _load_pr_meta(repo, state_root)
+        elif name == ARTIFACT_THREAD_RECON:
+            out[name] = _load_thread_recon(repo, state_root)
+        elif name == ARTIFACT_TEMPORAL:
+            out[name] = _load_temporal(repo, state_root)
+        elif name == ARTIFACT_META_ANALYTICS:
+            out[name] = _load_meta_analytics(state_root)
+        elif name == ARTIFACT_COHORT:
+            out[name] = _load_cohort(repo, state_root)
+        elif name == ARTIFACT_PREDICT:
+            out[name] = _load_predict(repo, state_root)
     if route.need_rag and query:
         hits, personalization = _load_rag_hits(
             query, corpus=corpus, learner_profile=learner_profile,
@@ -254,6 +290,353 @@ def _load_cross_crew(repo: str | None, state_root: Path, top_n: int = 3) -> dict
     if not p.exists():
         return {"repo": repo, "rows": 0, "missing": True, "path": str(p)}
     return _load_cross_crew_cached(str(p), p.stat().st_mtime, top_n)
+
+
+def _load_pr_diff_evolution(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt code-evolution artifact (bin/pr-diff-evolution-build).
+
+    Budget-bounded: the builder already caps rounds/links/hotspots/smells, so we
+    just gate to the most recent PRs and surface as-is. ``missing=True`` when the
+    builder hasn't run, mirroring _load_mission_patterns."""
+    if not repo:
+        return {"repo": None, "prs": [], "missing": True}
+    p = state_root / "repos" / repo / "pr_diff_evolution.json"
+    if not p.exists():
+        return {"repo": repo, "prs": [], "missing": True}
+    return _load_pr_diff_evolution_cached(str(p), p.stat().st_mtime)
+
+
+def _load_pr_review(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt received-review artifact (bin/learn-pr-review-build).
+
+    Repo-scoped (mirrors _load_pr_diff_evolution): reads
+    state/repos/<repo>/pr_review.json. ``missing=True`` when the builder
+    hasn't run, so the coach render degrades gracefully."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "anchors": [], "unresolved_threads": [], "pr_overview": []}
+    p = state_root / "repos" / repo / "pr_review.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "anchors": [], "unresolved_threads": [], "pr_overview": []}
+    return _load_pr_review_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_pr_review_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "anchors": data.get("anchors", [])[:top_n],
+        "unresolved_threads": data.get("unresolved_threads", [])[:top_n],
+        "pr_overview": data.get("pr_overview", [])[:top_n],
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_reviewer_profile(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt reviewer-profile artifact (bin/reviewer-profile-build).
+
+    Repo-scoped (mirrors _load_pr_review): reads
+    state/repos/<repo>/reviewer_profile.json. ``missing=True`` when the
+    builder hasn't run, so the coach render degrades gracefully."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "recurring_topics": [], "hotspot_files": [], "sample_threads": []}
+    p = state_root / "repos" / repo / "reviewer_profile.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "recurring_topics": [], "hotspot_files": [], "sample_threads": []}
+    return _load_reviewer_profile_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_reviewer_profile_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "reviewer_login": data.get("reviewer_login"),
+        "nickname": data.get("nickname"),
+        "comments_total": data.get("comments_total"),
+        "comments_on_learner_pr": data.get("comments_on_learner_pr"),
+        "prs_reviewed": data.get("prs_reviewed"),
+        "review_states": data.get("review_states", {}),
+        "first_seen": data.get("first_seen"),
+        "last_seen": data.get("last_seen"),
+        "recurring_topics": data.get("recurring_topics", [])[:top_n],
+        "hotspot_files": data.get("hotspot_files", [])[:top_n],
+        "sample_threads": data.get("sample_threads", [])[:3],
+    }
+
+
+def _load_learning_path(state_root: Path) -> dict:
+    """Learner-scoped learning-path artifact (bin/learn-learning-path-build).
+
+    Cross-repo, so it ignores `repo` and reads state/learner/learning_path.json
+    (mirrors _load_memory_review). ``missing=True`` when unbuilt."""
+    p = state_root / "learner" / "learning_path.json"
+    if not p.exists():
+        return {"ready": False, "missing": True, "next_concepts": [],
+                "unmet_prereqs": [], "confusable_pairs": []}
+    return _load_learning_path_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=2)
+def _load_learning_path_cached(path_str: str, mtime: float, top_n: int = 12) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "status": data.get("status"),
+        "mastery_distribution": data.get("mastery_distribution", {}),
+        "next_concepts": data.get("next_concepts", [])[:top_n],
+        "unmet_prereqs": data.get("unmet_prereqs", [])[:top_n],
+        "confusable_pairs": data.get("confusable_pairs", [])[:8],
+        "graph_sparse": data.get("graph_sparse", False),
+    }
+
+
+def _load_pr_meta(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt pr-meta artifact (bin/learn-pr-meta-build).
+
+    Repo-scoped (mirrors _load_pr_review): reads
+    state/repos/<repo>/pr_meta.json. ``missing=True`` when the builder
+    hasn't run, so the coach render degrades gracefully."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "cohort": {}, "prs": []}
+    p = state_root / "repos" / repo / "pr_meta.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "cohort": {}, "prs": []}
+    return _load_pr_meta_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_pr_meta_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "cohort": data.get("cohort", {}),
+        "prs": data.get("prs", [])[:top_n],
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_thread_recon(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt thread-recon artifact (bin/learn-thread-recon-build).
+
+    Repo-scoped (mirrors _load_pr_meta): reads
+    state/repos/<repo>/thread_recon.json. ``missing=True`` when unbuilt."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True, "threads": []}
+    p = state_root / "repos" / repo / "thread_recon.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True, "threads": []}
+    return _load_thread_recon_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_thread_recon_cached(path_str: str, mtime: float, top_n: int = 8) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "threads": data.get("threads", [])[:top_n],
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_temporal(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt temporal artifact (bin/learn-temporal-build).
+
+    Repo-scoped (mirrors _load_pr_meta): reads
+    state/repos/<repo>/temporal.json. ``missing=True`` when unbuilt."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "prs": [], "aggregate": {}}
+    p = state_root / "repos" / repo / "temporal.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "prs": [], "aggregate": {}}
+    return _load_temporal_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_temporal_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "prs": data.get("prs", [])[:top_n],
+        "aggregate": data.get("aggregate", {}),
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_meta_analytics(state_root: Path) -> dict:
+    """Learner-scoped meta-analytics artifact (bin/learn-meta-analytics-build).
+
+    Cross-repo, so it ignores `repo` and reads
+    state/learner/meta_analytics.json (mirrors _load_learning_path).
+    ``missing=True`` when unbuilt."""
+    p = state_root / "learner" / "meta_analytics.json"
+    if not p.exists():
+        return {"ready": False, "missing": True, "repeated_concepts": [],
+                "mode_mix": [], "quality_trend": {}, "mastery_distribution": {}}
+    return _load_meta_analytics_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=2)
+def _load_meta_analytics_cached(path_str: str, mtime: float, top_n: int = 12) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "repeated_concepts": data.get("repeated_concepts", [])[:top_n],
+        "mode_mix": data.get("mode_mix", []),
+        "quality_trend": data.get("quality_trend", {}),
+        "mastery_distribution": data.get("mastery_distribution", {}),
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_cohort(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt cohort artifact (bin/learn-cohort-build).
+
+    Repo-scoped (mirrors _load_pr_meta): reads
+    state/repos/<repo>/cohort.json. ``missing=True`` when unbuilt."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "cohort": {}, "learner_prs": [], "comparison": []}
+    p = state_root / "repos" / repo / "cohort.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "cohort": {}, "learner_prs": [], "comparison": []}
+    return _load_cohort_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_cohort_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "cohort": data.get("cohort", {}),
+        "learner_prs": data.get("learner_prs", [])[:top_n],
+        "comparison": data.get("comparison", []),
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_predict(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt predict artifact (bin/learn-predict-build).
+
+    Repo-scoped (mirrors _load_cohort): reads state/repos/<repo>/predict.json.
+    Synthesizes the C/F/H surfaces, so it's only meaningful once those have
+    been built. ``missing=True`` when the predict builder hasn't run."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "likely_review_topics": [], "likely_hotspot_files": [],
+                "smell_warnings": [], "review_load_projection": {}}
+    p = state_root / "repos" / repo / "predict.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "likely_review_topics": [], "likely_hotspot_files": [],
+                "smell_warnings": [], "review_load_projection": {}}
+    return _load_predict_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_predict_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "inputs": data.get("inputs", {}),
+        "likely_review_topics": data.get("likely_review_topics", [])[:top_n],
+        "likely_hotspot_files": data.get("likely_hotspot_files", [])[:top_n],
+        "smell_warnings": data.get("smell_warnings", [])[:top_n],
+        "review_load_projection": data.get("review_load_projection", {}),
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_cross_mission(state_root: Path, top_carryover: int = 10) -> dict:
+    """Learner-scoped cross-mission artifact (bin/learn-cross-mission-build).
+
+    Cross-repo, so it ignores `repo` and reads state/learner/cross_mission.json
+    (mirrors _load_anchors). The builder already caps lists; we just gate
+    carryover to a prompt-friendly top-N. ``missing=True`` when unbuilt."""
+    p = state_root / "learner" / "cross_mission.json"
+    if not p.exists():
+        return {"ready": False, "missing": True, "carryover": [],
+                "recurring_across_missions": [], "difficulty": []}
+    return _load_cross_mission_cached(str(p), p.stat().st_mtime, top_carryover)
+
+
+@lru_cache(maxsize=2)
+def _load_cross_mission_cached(path_str: str, mtime: float, top_carryover: int) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repos_analyzed": data.get("repos_analyzed", []),
+        "carryover": data.get("carryover", [])[:top_carryover],
+        "recurring_across_missions": data.get("recurring_across_missions", []),
+        "difficulty": data.get("difficulty", []),
+    }
+
+
+def _load_memory_review(state_root: Path) -> dict:
+    """Learner-scoped memory-review artifact (bin/learn-memory-review-build).
+
+    Cross-repo, so it ignores `repo` and reads state/learner/memory_review.json
+    (mirrors _load_anchors). ``missing=True`` when unbuilt."""
+    p = state_root / "learner" / "memory_review.json"
+    if not p.exists():
+        return {"ready": False, "missing": True, "blind_spots": [],
+                "forgetting": [], "review_cards": []}
+    return _load_memory_review_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=2)
+def _load_memory_review_cached(path_str: str, mtime: float) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "blind_spots": data.get("blind_spots", []),
+        "forgetting": data.get("forgetting", []),
+        "review_cards": data.get("review_cards", []),
+    }
+
+
+@lru_cache(maxsize=4)
+def _load_pr_diff_evolution_cached(path_str: str, mtime: float, top_prs: int = 2) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    prs = data.get("prs", [])
+    prs = sorted(prs, key=lambda x: x.get("number", 0), reverse=True)[:top_prs]
+    return {
+        "repo": data.get("repo"),
+        "clone_available": data.get("clone_available", False),
+        "ready": True,
+        "pr_count": len(data.get("prs", [])),
+        "prs": prs,
+    }
 
 
 @lru_cache(maxsize=4)

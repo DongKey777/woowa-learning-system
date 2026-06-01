@@ -7,6 +7,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from anchors.concept_link import (
+    default_threshold,
+    link_concepts,
+    query_text,
+)
 from anchors.extract import ReviewAnchor, load_anchors, save_anchors
 from anchors.match import (
     CrossCrewMatch,
@@ -211,3 +216,92 @@ def test_anchor_save_load_roundtrip(tmp_path: Path) -> None:
 
 def test_load_anchors_empty_when_missing(tmp_path: Path) -> None:
     assert load_anchors(state_root=tmp_path) == []
+
+
+# ── concept_link (F0-d: fill topic_concept_ids) ─────────────────────────
+
+
+def _anchor(comment="DI를 권장합니다", path="src/main/Bean.java") -> ReviewAnchor:
+    return ReviewAnchor(
+        thread_id="r:1:1", repo="r", pr_number=1, path=path, line=1,
+        code_hunk="service.save(req)", mentor_login="m",
+        comment_text=comment, topic_concept_ids=[],
+    )
+
+
+def test_query_text_uses_comment_and_path_stem_not_hunk() -> None:
+    q = query_text(_anchor(comment="여기 DI 적용", path="src/main/Bean.java"))
+    assert "여기 DI 적용" in q
+    assert "Bean" in q  # path stem
+    assert "service.save" not in q  # code_hunk excluded as noise
+
+
+def test_link_concepts_populates_topic_concept_ids() -> None:
+    def fake_search(query, top_k):
+        return [
+            {"concept_id": "spring/ioc-di-basics", "score": 0.81},
+            {"concept_id": "spring/bean", "score": 0.62},
+        ]
+
+    out = link_concepts([_anchor()], search_fn=fake_search, threshold=0.56)
+    assert out[0].topic_concept_ids == ["spring/ioc-di-basics", "spring/bean"]
+
+
+def test_link_concepts_filters_below_threshold() -> None:
+    def fake_search(query, top_k):
+        return [
+            {"concept_id": "high", "score": 0.70},
+            {"concept_id": "low", "score": 0.40},
+        ]
+
+    out = link_concepts([_anchor()], search_fn=fake_search, threshold=0.56)
+    assert out[0].topic_concept_ids == ["high"]
+
+
+def test_link_concepts_caps_at_max_links() -> None:
+    def fake_search(query, top_k):
+        return [{"concept_id": f"c{i}", "score": 0.9} for i in range(10)]
+
+    out = link_concepts(
+        [_anchor()], search_fn=fake_search, threshold=0.5, max_links=3,
+    )
+    assert out[0].topic_concept_ids == ["c0", "c1", "c2"]
+
+
+def test_link_concepts_dedupes_concept_ids() -> None:
+    def fake_search(query, top_k):
+        return [
+            {"concept_id": "dup", "score": 0.9},
+            {"concept_id": "dup", "score": 0.8},
+            {"concept_id": "other", "score": 0.7},
+        ]
+
+    out = link_concepts([_anchor()], search_fn=fake_search, threshold=0.5)
+    assert out[0].topic_concept_ids == ["dup", "other"]
+
+
+def test_link_concepts_isolates_ml_failure_per_anchor() -> None:
+    calls = {"n": 0}
+
+    def flaky_search(query, top_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("encoder OOM")
+        return [{"concept_id": "ok", "score": 0.9}]
+
+    a1, a2 = _anchor(comment="첫번째"), _anchor(comment="두번째")
+    out = link_concepts([a1, a2], search_fn=flaky_search, threshold=0.5)
+    assert out[0].topic_concept_ids == []   # failed anchor keeps []
+    assert out[1].topic_concept_ids == ["ok"]  # build survives
+
+
+def test_link_concepts_handles_none_from_search() -> None:
+    out = link_concepts([_anchor()], search_fn=lambda q, k: None, threshold=0.5)
+    assert out[0].topic_concept_ids == []
+
+
+def test_default_threshold_reads_env(monkeypatch) -> None:
+    monkeypatch.setenv("WOOWA_CONCEPT_LINK_THRESHOLD", "0.42")
+    assert default_threshold() == 0.42
+    monkeypatch.setenv("WOOWA_CONCEPT_LINK_THRESHOLD", "notafloat")
+    assert default_threshold() == 0.60  # falls back on bad value

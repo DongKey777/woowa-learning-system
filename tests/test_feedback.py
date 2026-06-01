@@ -55,6 +55,37 @@ def test_unknown_event_type_ignored(tmp_path: Path) -> None:
     assert out == []
 
 
+def test_record_turn_copies_top_level_repo_into_evidence(tmp_path: Path) -> None:
+    import sqlite3
+    # code_event.py carries repo at the event top level, not in payload.
+    record_turn(
+        {"event_type": "code_attempt", "repo": "spring-roomescape-member",
+         "payload": {"used_concepts": ["spring/bean"]}},
+        state_root=tmp_path,
+    )
+    conn = sqlite3.connect(str(tmp_path / "learner" / "mastery_graph.sqlite"))
+    row = conn.execute(
+        "SELECT json_extract(payload_json,'$.repo') FROM evidence WHERE concept_id='spring/bean'"
+    ).fetchone()
+    conn.close()
+    assert row[0] == "spring-roomescape-member"  # repo attributable for L use-case
+
+
+def test_record_turn_does_not_overwrite_payload_repo(tmp_path: Path) -> None:
+    import sqlite3
+    record_turn(
+        {"event_type": "rag_ask", "repo": "outer",
+         "payload": {"top_concept_ids": ["spring/bean"], "repo": "inner"}},
+        state_root=tmp_path,
+    )
+    conn = sqlite3.connect(str(tmp_path / "learner" / "mastery_graph.sqlite"))
+    row = conn.execute(
+        "SELECT json_extract(payload_json,'$.repo') FROM evidence WHERE concept_id='spring/bean'"
+    ).fetchone()
+    conn.close()
+    assert row[0] == "inner"  # payload repo wins; top-level only fills when absent
+
+
 def test_citations_extracted_from_rag_ask(tmp_path: Path) -> None:
     """rag_ask with payload.citations gives mission_use evidence."""
     record_turn(

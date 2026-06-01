@@ -156,6 +156,114 @@ def should_use_rag(prompt: str, repo: str | None = None) -> bool:
         or has_learning_request(prompt)
     )
 
+# Family H (pr_diff_evolution) — multi-word phrases only, checked BEFORE retro.
+# None is a substring of the retro guard "내 PR 흐름 보여줘 리뷰" (test_intent_prompt
+# :50), so the retro fixture still routes to retro.
+PR_DIFF_EVOLUTION_KEYWORDS = (
+    "라운드별 코드", "코드 변화", "코드 진화", "리뷰 반영", "리뷰 후 수정",
+    "수정 이력", "리뷰 핫스팟", "자주 지적받은 파일", "코드 스멜", "리뷰 전 점검",
+)
+# Family L (cross_mission) — cross-repo learning. Natural learner phrasing only
+# (no stiff "미션 간"/"개념 전이" translationese). Checked BEFORE retro; none is
+# a substring of the retro guard "내 PR 흐름 보여줘 리뷰". "반복된/반복되는 실수"
+# is more specific than the retro "반복" token and wins by order.
+CROSS_MISSION_KEYWORDS = (
+    "미션 사이", "미션끼리", "이전 미션", "지난 미션",
+    "반복되는 실수", "반복된 실수", "계속 틀리는",
+    "미션별 난이도", "미션마다 난이도", "이어서 배운",
+)
+# Family M (memory_review) — spaced-review / blind-spots. Natural learner
+# phrasing (no stiff "기억 점검"/"개념 회상"). Checked BEFORE retro; none is a
+# substring of the retro guard "내 PR 흐름 보여줘 리뷰". "사각지대"/"안 물어본"
+# don't appear in cross_mission/retro/coaching keys, so order is safe.
+MEMORY_REVIEW_KEYWORDS = (
+    "복습할 개념", "복습 카드", "복습해야", "다시 봐야 할 개념",
+    "까먹은", "잊어버린", "기억나지", "기억 안 나",
+    "사각지대", "안 물어본", "한 번도 안 물어",
+)
+# Family A (pr_review) — received mentor/peer review comments + unresolved
+# threads. Natural learner phrasing only. Checked BEFORE retro; none is a
+# substring of the retro guard "내 PR 흐름 보여줘 리뷰" so that fixture still
+# routes to retro. "받은 리뷰" is more specific than retro's "내가 받은" and
+# claims the review-bodies intent (retro = activity timeline, no bodies).
+PR_REVIEW_KEYWORDS = (
+    "받은 리뷰", "멘토가 남긴", "멘토 코멘트", "리뷰 코멘트 모아",
+    "답 안 단 리뷰", "안 단 리뷰", "미해결 리뷰", "아직 답 안",
+    "리뷰 정리해", "pr 총평", "리뷰 총평",
+)
+# Family C (reviewer_profile) — "이 리뷰어/멘토 어떤 사람?" 스타일/성향 분석.
+# repo-gated (per-repo archive scoped). Multi-word phrases only; checked after
+# pr_review, before coaching, so "리뷰 스타일"/"리뷰 성향" claim the
+# reviewer-profile intent rather than coaching's bare "리뷰". None is a
+# substring of the retro guard "내 PR 흐름 보여줘 리뷰".
+REVIEWER_PROFILE_KEYWORDS = (
+    "이 멘토 어떤", "멘토 어떤 사람", "리뷰어 어떤 사람", "리뷰어 스타일",
+    "리뷰 스타일", "리뷰 성향", "리뷰 습관", "어떤 리뷰어",
+    "누가 주로 리뷰", "리뷰어 분석", "멘토 성향",
+)
+# Family D (learning_path) — "다음에 뭐 배우면 좋아?" 학습 순서/선수 개념 추천.
+# Cross-repo, learner-scoped — NO repo gate. Multi-word phrases only; checked
+# after reviewer_profile, before retro. None is a substring of the retro guard
+# "내 PR 흐름 보여줘 리뷰". "이어서 배울"(미래)은 cross_mission "이어서 배운"(과거)과
+# 글자가 달라 충돌 없음 (cross_mission이 먼저 검사되지만 매칭 안 됨).
+LEARNING_PATH_KEYWORDS = (
+    "다음에 뭐 배우", "다음에 뭐 공부", "다음에 뭘 공부", "뭐부터 공부",
+    "학습 순서", "공부 순서", "선수 개념", "뭘 먼저 알아야",
+    "이어서 배울", "다음 단계 개념",
+)
+# Family J (pr_meta) — PR 메타 위생(본문 품질 / PR 크기 / 커밋 응집). repo-gated
+# (per-repo archive scoped). 자연스러운 학습자 표현만 (번역체 X). retro 앞에서
+# 검사돼 "pr 너무 큰"/"pr 크기"가 retro의 "내 pr"보다 먼저 잡힌다. 어느 것도 retro
+# 가드 "내 pr 흐름 보여줘 리뷰"의 부분문자열이 아니다. "변경량"은 pr_diff_evolution
+# "코드 변화"와 글자가 달라 충돌 없음.
+PR_META_KEYWORDS = (
+    "pr 본문 잘", "pr 설명 잘", "pr 설명 충분", "pr 너무 큰", "pr 너무 커",
+    "pr 크기", "변경량 너무", "커밋 너무 잘게", "커밋 잘게 쪼", "커밋 단위",
+    "pr 위생",
+)
+# Family G (thread_recon) — 리뷰 댓글 reply 체인 복원. repo-gated. 다어절 구만.
+# coaching의 bare "리뷰"보다 먼저 검사돼 "리뷰 대화"/"리뷰 스레드"가 thread_recon을
+# claim한다. reviewer_profile "리뷰 스타일"/"리뷰 성향"과 글자가 달라 충돌 없음.
+# retro 가드 "내 pr 흐름 보여줘 리뷰"의 부분문자열 아님.
+# NB: "주고받은 리뷰"는 의도적으로 제외 — pr_review의 "받은 리뷰"가 부분문자열로
+# 먼저 잡아 절대 thread_recon에 닿지 못한다. "주고받은 대화"로 같은 의미를 커버.
+THREAD_RECON_KEYWORDS = (
+    "리뷰 대화", "리뷰 스레드", "주고받은 대화",
+    "리뷰 토론", "댓글 주고받", "대화 흐름 복원", "스레드 복원",
+    "리뷰 대화 복원",
+)
+# Family I (temporal) — PR 리뷰 사이클의 시간 동학(첫 리뷰까지/머지까지/정체). repo-gated.
+# 다어절 구만. pr_diff_evolution "라운드별 코드"와 "라운드 간격"은 글자가 달라 충돌 없음.
+# retro 가드의 부분문자열 아님.
+TEMPORAL_KEYWORDS = (
+    "리뷰 얼마나 걸렸", "리뷰까지 얼마나", "머지까지 얼마나", "얼마나 오래 걸렸",
+    "리뷰 주기", "리뷰 텀", "라운드 간격", "리뷰 대기 시간",
+    "정체된 구간", "오래 멈춰", "얼마나 걸렸어",
+)
+# Family E (meta_analytics) — cross-repo 학습 메타: 내가 반복해 묻는 개념/질문 패턴/
+# mastery 분포. repo-gate 없음(cross-repo). 다어절 구만. learning_path "다음에 뭐
+# 배우"와 글자 달라 충돌 없음. retro 가드의 부분문자열 아님.
+META_ANALYTICS_KEYWORDS = (
+    "자주 물어본 개념", "반복해서 물어본", "내 학습 패턴", "어떤 질문 많이",
+    "학습 메타", "내가 자주 묻는", "질문 패턴", "공부 패턴 분석", "학습 분석",
+)
+# Family F (cohort) — repo 내 동기/또래 대비 내 PR 위치(크기/리뷰 수/라운드 percentile).
+# repo-gated. f11 fast-path("크루 비교"/"비교 의견"/"다른 사람들은")와 글자가 달라
+# cross-crew로 새지 않는다. 다어절 구만. retro 가드의 부분문자열 아님.
+COHORT_KEYWORDS = (
+    "동료들에 비해", "동기들에 비해", "남들에 비해", "또래에 비해",
+    "평균에 비해", "내 위치는", "내 순위", "동기들과 비교",
+    "코호트 비교", "다른 학습자에 비해",
+)
+# Family K (predict) — C(reviewer_profile)+F(cohort)+H(pr_diff_evolution) 합성한
+# 푸시 전 예측. repo-gated. pr_diff_evolution "리뷰 전 점검"/"자주 지적받은 파일"/
+# "코드 스멜", pr_review "멘토가 남긴"/"멘토 코멘트", reviewer_profile "멘토 어떤"과
+# 글자가 달라 충돌 없음(이들이 모두 predict보다 먼저 검사돼도 substring 안 됨).
+PREDICT_KEYWORDS = (
+    "멘토가 뭘 지적할", "어떤 지적 받을", "지적받을 만한", "리뷰 미리 예측",
+    "올리기 전에 점검", "푸시 전에 점검", "리뷰 예상", "지적 예상",
+    "리뷰 시뮬", "리뷰 예측",
+)
 RETRO_KEYWORDS = (
     "회고", "반복", "내 pr", "정밀", "내가 놓친", "pr 흐름", "내 흐름", "pr 타임라인",
     "사이클", "이전 pr", "내가 받은", "pr 시리즈", "활동 요약", "history",
@@ -196,6 +304,72 @@ def detect_mode(
         SCORE_LIKE_PATTERN.search(prompt) or DRILL_ANSWER_HINT_PATTERN.search(prompt)
     ):
         return IntentDecision("drill", "pending drill + answer-shaped reply", 0.85)
+
+    for kw in PR_DIFF_EVOLUTION_KEYWORDS:
+        if kw in pl:
+            return IntentDecision(
+                "pr_diff_evolution", f"pr_diff_evolution keyword '{kw}'", 0.85)
+
+    for kw in CROSS_MISSION_KEYWORDS:
+        if kw in pl:
+            return IntentDecision(
+                "cross_mission", f"cross_mission keyword '{kw}'", 0.85)
+
+    for kw in MEMORY_REVIEW_KEYWORDS:
+        if kw in pl:
+            return IntentDecision(
+                "memory_review", f"memory_review keyword '{kw}'", 0.85)
+
+    for kw in PR_REVIEW_KEYWORDS:
+        if kw in pl:
+            return IntentDecision(
+                "pr_review", f"pr_review keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in REVIEWER_PROFILE_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "reviewer_profile", f"reviewer_profile keyword '{kw}'", 0.85)
+
+    for kw in LEARNING_PATH_KEYWORDS:
+        if kw in pl:
+            return IntentDecision(
+                "learning_path", f"learning_path keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in PR_META_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "pr_meta", f"pr_meta keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in THREAD_RECON_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "thread_recon", f"thread_recon keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in TEMPORAL_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "temporal", f"temporal keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in COHORT_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "cohort", f"cohort keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in PREDICT_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "predict", f"predict keyword '{kw}'", 0.85)
+
+    for kw in META_ANALYTICS_KEYWORDS:
+        if kw in pl:
+            return IntentDecision(
+                "meta_analytics", f"meta_analytics keyword '{kw}'", 0.85)
 
     for kw in RETRO_KEYWORDS:
         if kw in pl:

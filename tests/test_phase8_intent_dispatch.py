@@ -62,6 +62,54 @@ SAMPLES = [
     ("내 흐름 보여줘", None, None, None, "retro"),
     ("정밀 비교", None, None, None, "retro"),
 
+    # pr_diff_evolution — family H, checked before retro (2)
+    ("라운드별 코드 변화 보여줘", "roomescape-member", None, None, "pr_diff_evolution"),
+    ("리뷰 반영해서 수정한 이력 보여줘", "roomescape-member", None, None, "pr_diff_evolution"),
+
+    # cross_mission — family L, cross-repo, checked before retro (2)
+    ("이전 미션에서 이어서 배운 거 뭐 있어", None, None, None, "cross_mission"),
+    ("미션 사이에 반복되는 실수 알려줘", None, None, None, "cross_mission"),
+
+    # memory_review — family M, spaced-review, checked before retro (2)
+    ("사각지대 개념 알려줘", None, None, None, "memory_review"),
+    ("내가 까먹은 개념 복습할 개념 뭐야", None, None, None, "memory_review"),
+
+    # pr_review — family A+N, received reviews, checked before retro (2)
+    ("받은 리뷰 정리해줘", "roomescape-waiting", None, None, "pr_review"),
+    ("아직 답 안 단 리뷰 있어?", "roomescape-waiting", None, None, "pr_review"),
+
+    # reviewer_profile — family C, repo-gated, checked before retro (2)
+    ("이 멘토 어떤 사람이야?", "roomescape-member", None, None, "reviewer_profile"),
+    ("리뷰어 스타일 분석해줘", "roomescape-member", None, None, "reviewer_profile"),
+
+    # learning_path — family D, cross-repo (no repo), checked before retro (2)
+    ("다음에 뭐 배우면 좋을지 학습 순서 알려줘", None, None, None, "learning_path"),
+    ("선수 개념부터 뭘 먼저 알아야 해?", None, None, None, "learning_path"),
+
+    # pr_meta — family J, repo-gated (PR 본문/크기/커밋 위생), before retro (2)
+    ("내 PR 너무 큰지 봐줘", "roomescape-member", None, None, "pr_meta"),
+    ("커밋 너무 잘게 쪼갰나?", "roomescape-member", None, None, "pr_meta"),
+
+    # thread_recon — family G, repo-gated (리뷰 reply 대화 복원), before retro (2)
+    ("리뷰 스레드 통째로 보여줘", "roomescape-waiting", None, None, "thread_recon"),
+    ("리뷰 대화 복원해줘", "roomescape-waiting", None, None, "thread_recon"),
+
+    # temporal — family I, repo-gated (리뷰 사이클 시간 동학), before retro (2)
+    ("리뷰까지 얼마나 걸렸어?", "roomescape-waiting", None, None, "temporal"),
+    ("머지까지 얼마나 걸렸는지 보여줘", "roomescape-waiting", None, None, "temporal"),
+
+    # cohort — family F, repo-gated (동료 대비 내 PR 위치), before retro (2)
+    ("동기들에 비해 내 PR 어때?", "roomescape-member", None, None, "cohort"),
+    ("평균에 비해 내 위치는 어디야?", "roomescape-member", None, None, "cohort"),
+
+    # meta_analytics — family E, cross-repo (학습 메타 패턴), before retro (2)
+    ("내가 자주 묻는 개념 뭐야?", None, None, None, "meta_analytics"),
+    ("내 학습 패턴 분석해줘", None, None, None, "meta_analytics"),
+
+    # predict — family K, repo-gated (C+F+H 합성 푸시 전 예측), before retro (2)
+    ("이번 PR 올리면 멘토가 뭘 지적할까?", "roomescape-member", None, None, "predict"),
+    ("리뷰에서 어떤 지적 받을지 미리 예측해줘", "roomescape-member", None, None, "predict"),
+
     # self_assess — pending trigger + score reply (3)
     ("8점", None, {"trigger_session_id": "s1"}, None, "self_assess"),
     ("잘 모르겠어", None, {"trigger_session_id": "s2"}, None, "self_assess"),
@@ -76,7 +124,7 @@ SAMPLES = [
 
 def test_intent_dispatch_accuracy_50_sample() -> None:
     """D13 falsification gate — must hit ≥95% accuracy."""
-    assert len(SAMPLES) == 50, f"expected 50 samples, got {len(SAMPLES)}"
+    assert len(SAMPLES) == 74, f"expected 74 samples, got {len(SAMPLES)}"
 
     correct = 0
     failures: list[tuple[str, str, str]] = []

@@ -24,7 +24,11 @@ def record_turn(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> list[tupl
     et = event.get("event_type")
     if et not in EVENT_TO_SOURCE:
         return []
-    payload = event.get("payload") or {}
+    payload = dict(event.get("payload") or {})
+    # Some emitters (code_event.py) carry repo at the event top level, not in
+    # payload — copy it so evidence stays attributable per-repo (L use-case).
+    if event.get("repo") and not payload.get("repo"):
+        payload["repo"] = event["repo"]
     source = EVENT_TO_SOURCE[et]
     ts = event.get("ts")
 
@@ -45,13 +49,21 @@ def ingest_pr_merge(
     concept_ids: Iterable[str],
     state_root: Path = DEFAULT_STATE_ROOT,
     ts: float | None = None,
+    payload: dict | None = None,
+    dedup_prefix: str | None = None,
 ) -> list[tuple[str, str]]:
-    """Trigger pr_merge evidence (highest weight). Called after PR merged + mentor approved."""
+    """Trigger pr_merge evidence (highest weight). Called after PR merged + mentor approved.
+
+    dedup_prefix builds a per-concept dedup_key (prefix:cid) so batch syncs are
+    idempotent; payload (e.g. {"repo": r, "pr_number": n}) is attached for audit.
+    """
     out: list[tuple[str, str]] = []
     for cid in concept_ids:
         if not cid:
             continue
-        record_evidence(cid, source="pr_merge", state_root=state_root, ts=ts)
+        key = f"{dedup_prefix}:{cid}" if dedup_prefix else None
+        record_evidence(cid, source="pr_merge", state_root=state_root, ts=ts,
+                        payload=payload, dedup_key=key)
         out.append((cid, promote(cid, state_root=state_root, now=ts)))
     return out
 
@@ -60,13 +72,17 @@ def ingest_mentor_accept(
     concept_ids: Iterable[str],
     state_root: Path = DEFAULT_STATE_ROOT,
     ts: float | None = None,
+    payload: dict | None = None,
+    dedup_prefix: str | None = None,
 ) -> list[tuple[str, str]]:
-    """Trigger mentor_accept evidence (resolved review thread)."""
+    """Trigger mentor_accept evidence (resolved review thread / APPROVED review)."""
     out: list[tuple[str, str]] = []
     for cid in concept_ids:
         if not cid:
             continue
-        record_evidence(cid, source="mentor_accept", state_root=state_root, ts=ts)
+        key = f"{dedup_prefix}:{cid}" if dedup_prefix else None
+        record_evidence(cid, source="mentor_accept", state_root=state_root, ts=ts,
+                        payload=payload, dedup_key=key)
         out.append((cid, promote(cid, state_root=state_root, now=ts)))
     return out
 

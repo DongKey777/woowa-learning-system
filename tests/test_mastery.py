@@ -46,6 +46,21 @@ def test_familiar_requires_distinct_sources(tmp_path: Path) -> None:
     assert promote("spring/bean", state_root=tmp_path, now=now) == "attempted"
 
 
+def test_dedup_key_makes_record_idempotent(tmp_path: Path) -> None:
+    eid1 = record_evidence("spring/bean", "pr_merge", state_root=tmp_path,
+                           dedup_key="pr_merge:r:1:spring/bean")
+    eid2 = record_evidence("spring/bean", "pr_merge", state_root=tmp_path,
+                           dedup_key="pr_merge:r:1:spring/bean")
+    assert eid1 == eid2  # second call short-circuits to the prior row
+    assert get("spring/bean", state_root=tmp_path).evidence_count == 1
+
+
+def test_dedup_key_distinct_keys_both_recorded(tmp_path: Path) -> None:
+    record_evidence("spring/bean", "pr_merge", state_root=tmp_path, dedup_key="k1")
+    record_evidence("spring/bean", "mentor_accept", state_root=tmp_path, dedup_key="k2")
+    assert get("spring/bean", state_root=tmp_path).evidence_count == 2
+
+
 def test_proficient_requires_pr_merge_and_mentor_accept(tmp_path: Path) -> None:
     now = 1_000_000.0
     record_evidence("spring/bean", "pr_merge", state_root=tmp_path, ts=now - 100)
