@@ -9,7 +9,7 @@
        ↓
    daemon (BGE-M3 warm, AF_UNIX)
        ↓
-   router (7 mode 결정) → lazy_loader (필요한 artifact만) → coach (multi-agent prompt)
+   router (질문 의도 → 모드 결정) → lazy_loader (필요한 artifact만) → coach (multi-agent prompt)
        ↓
    AI 세션 (Claude / Codex / Gemini) → 학습자에게 답변
        ↓
@@ -68,6 +68,38 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 - **F11 cross-crew**: AI judge precision 85% (4-stage filter)
 - **Latency**: warm CLI p50/p95 43.9ms / 47.6ms, first ask p50/p95 187.2ms / 196.0ms
 - **Prompt payload**: 14-scenario 평균 약 4.1K chars
+
+## 지원 기능 목록 (학습 모드)
+
+학습자는 명령을 외울 필요 없이 한국어로 의도만 말하면 router가 알맞은 모드로 보낸다. 외울 명령은 0개.
+
+**기본 질문/코칭 모드** — 개념을 배우거나 코드 코칭을 받는 평소 경로:
+
+| 모드 | 무엇을 답하나 | 이렇게 물어보면 |
+|---|---|---|
+| `cs_qa` | CS 개념 설명 (corpus RAG) | *"Bean DI가 뭐야"* |
+| `coaching` | 내 미션 코드 리팩토링 코칭 | *"ReservationController 어떻게 개선해?"* |
+| `drill` | 확인 질문 출제 + 4축 채점 | *"확인 질문 줘"* |
+| `self_assess` | 자가평가 점수 반영 (평가 대기 중일 때만) | *"DI 8점"* |
+| `retro` | 멘토가 반복해서 짚은 부분 돌아보기 | *"내 PR 흐름 보여줘"* |
+
+**미션 그라운디드 분석 모드 (A–N)** — 내 실제 PR·리뷰·동기 데이터를 읽어 답하는 전용 경로:
+
+| 모드 | 무엇을 답하나 | 이렇게 물어보면 |
+|---|---|---|
+| `pr_review` (A) | 받은 리뷰 모아서 정리 | *"받은 리뷰 정리해줘"* |
+| `reviewer_profile` (C) | 멘토가 어떤 스타일로 리뷰하는지 | *"내 멘토 리뷰 스타일 어때?"* |
+| `learning_path` (D) | 지금 실력에 맞춰 다음 학습 순서 추천 | *"다음에 뭐 배우면 좋을지 알려줘"* |
+| `meta_analytics` (E) | 내가 자주 묻는 것과 학습 패턴 짚기 | *"내가 자주 묻는 개념 뭐야?"* |
+| `cohort` (F) | 동기들과 비교해 내 PR이 어디쯤인지 | *"동기들에 비해 내 PR 어때?"* |
+| `thread_recon` (G) | 리뷰 스레드를 통째로 복원 | *"내 리뷰 스레드 통째로 보여줘"* |
+| `pr_diff_evolution` (H) | 라운드마다 코드가 어떻게 바뀌었는지 + 리뷰→수정 연결 | *"라운드별 코드 변화 보여줘"* |
+| `temporal` (I) | 리뷰 주기와 오래 멈춘 구간 짚기 | *"내 리뷰까지 얼마나 걸렸어?"* |
+| `pr_meta` (J) | PR 크기·커밋 응집도 점검 | *"내 PR 너무 큰지 봐줘"* |
+| `predict` (K) | C·F·H를 합쳐 어떤 리뷰가 올지 미리 예측 | *"내 PR 리뷰 미리 예측해줘"* |
+| `cross_mission` (L) | 미션을 넘나드는 반복 실수와 개념 전이 | *"미션 간 반복된 실수 알려줘"* |
+| `memory_review` (M) | 안 본 사각지대 개념과 복습 카드 | *"사각지대 개념 알려줘"* |
+| `f11_anchor` (B) | 같은 미션 다른 크루 코드와 비교 | *"다른 크루 코드 보여줘"* |
 
 ## 아키텍처 / API / 운영 가이드
 
