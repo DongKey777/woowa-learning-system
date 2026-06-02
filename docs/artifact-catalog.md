@@ -98,14 +98,32 @@ state/
 │   ├── drill_pending.json         # 1 open drill offer (or absent)
 │   ├── drill_due.json             # spaced repetition due list
 │   ├── pending_triggers.json      # pending self_assessment / review_drill triggers
-│   └── review_anchors.json        # optional thread anchors extracted from mission repos
+│   ├── review_anchors.json        # F11 input — learner own review thread anchors (anchors-build)
+│   ├── cross_mission.json         # mode cross_mission (learn-cross-mission-build)
+│   ├── learning_path.json         # mode learning_path (learn-learning-path-build)
+│   ├── memory_review.json         # mode memory_review (learn-memory-review-build)
+│   └── meta_analytics.json        # mode meta_analytics (learn-meta-analytics-build)
 ├── repos/                          # per-repo derived artifacts
 │   └── <repo>/
+│       ├── archive/prs.sqlite3     # GitHub PR archive (bootstrap-repo / sync-prs)
 │       ├── mission_patterns.json   # F10 forward — Tier 1+2 extracted patterns
-│       └── cross_crew_review_graph.parquet  # F11 — 4-stage filter result
+│       ├── cross_crew_review_graph.parquet  # F11 — 4-stage filter result
+│       ├── pr_meta.json            # mode pr_meta (learn-pr-meta-build)
+│       ├── pr_review.json          # mode pr_review (learn-pr-review-build)
+│       ├── pr_diff_evolution.json  # mode pr_diff_evolution (pr-diff-evolution-build)
+│       ├── reviewer_profile.json   # mode reviewer_profile (reviewer-profile-build)
+│       ├── temporal.json           # mode temporal (learn-temporal-build)
+│       ├── thread_recon.json       # mode thread_recon (learn-thread-recon-build)
+│       ├── cohort.json             # mode cohort (learn-cohort-build)
+│       ├── predict.json            # mode predict — fuses C/F/H artifacts (learn-predict-build)
+│       ├── pr_threads/<n>.json     # live PR review-cycle snapshot per PR (pr-thread-status; delta source)
+│       ├── actions/                # coach-run action snapshots (coach-run.json, …)
+│       └── contexts/ analysis/ cache/ memory/ packets/ profiles/ logs/  # coaching context outputs
 ├── rag-daemon.sock                 # AF_UNIX daemon socket
 └── rag-daemon.pid                  # daemon pid
 ```
+
+> `pr_threads/<n>.json`은 진행 중 리뷰 사이클 전용 라이브 스냅샷이다. `bin/pr-thread-status`가 매 호출 GitHub를 fresh로 쿼리해 정합한 스레드 상태(미답변/pending/answered + resolved/outdated)를 기록하고, 다음 호출의 **델타**(새 resolved / 새 멘토 코멘트 / 새 답변) 계산 기준으로 직전 스냅샷을 덮어쓴다. archive(`prs.sqlite3`)와 달리 stale하지 않다(아카이브는 `sync-prs` 시점 + submitted-only).
 
 ### `mastery_graph.sqlite` schema
 ```sql

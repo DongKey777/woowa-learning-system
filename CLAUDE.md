@@ -103,6 +103,7 @@ python3 bin/ask "테스트"
 - 학습자 미션 코드 자동 수정 — 학습자가 직접 작성. *"진행해보자"*는 "코치해줘"이지 "코드 만들어줘" 아님.
 - 학습자 미션 repo 자동 git clone — 학습자가 `missions/<repo>/` 아래 직접 fork clone 후 알림.
 - 외부 paid LLM API 호출 — 모든 reasoning은 현재 세션 안에서 (Claude Pro/Max 구독).
+- **PR 리뷰 답글 시스템 생성 금지 + 자동 post/submit 금지** — `pr-thread-status`·`learn-pr-retro --live`는 read-only 진단(GitHub GET만, 상태 정합·델타만). 답글 문구는 **시스템 도구로 만들지 않는다** — 세션이 대화체 초안만 직접 작성하고(리뷰어 말 반복 금지·인정→내 관점→되묻기·간결, 학습자 추론 날조 금지), 실제 게시/리뷰 제출은 학습자가 직접 한다(스레드별 명시 확인 없이는 `gh` post 호출 금지).
 
 ### 4.2 매 turn 자동 수행
 1. **모드 선택** — 학습자 발화를 읽고 아래 §4.2.2 카탈로그에서 가장 맞는 모드를 직접 고른다. 고른 모드를 `bin/ask "<prompt>" --mode <mode> [--repo <repo>]`로 넘긴다.
@@ -205,15 +206,19 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 
 ### 4.8 Phase V coaching context auto-call (2026-05-26)
 
+**라이브 vs 오프라인 — PR 진행 중 사이클은 라이브 우선.** `bin/pr-thread-status`·`learn-pr-retro --live`는 매 호출 GitHub를 fresh로 쿼리해 **멘토 원댓글 ∖ (제출답글 ∪ 본인 PENDING 초안)** 으로 미답변을 정합한다(GraphQL로 resolved/outdated/decision 오버레이 + 직전 대비 델타). 반면 `my-pr`·`learn-pr-retro`(무플래그)는 `bin/sync-prs` 시점 SQLite라 **stale + submitted-only**(본인 pending 초안 안 보임). 따라서 **진행 중 리뷰 사이클 = 라이브 도구로 현재 상태부터 확인**, `learn-pr-retro`(오프라인) = 머지 후 회고. 라이브 답변/추천/상태분석 직전마다 캐시·직전 결과 신뢰 금지하고 새로 재쿼리한다. **답글 문구 생성은 시스템 기능이 아니다** — 세션이 미답변 스레드를 보고 직접 초안을 쓴다.
+
 | 학습자 의도 / 발화 | AI 자동 호출 |
 |---|---|
 | `coach-run` schema가 필요한 외부 도구 호출 시 | `bin/coach-run --repo <r> --prompt <P> --silent` |
-| *"내 PR 분석"*, *"PR #N 검토"* | `bin/my-pr --repo <r> [--pr-number N] --silent` |
+| *"리뷰 스레드 상태"*, *"미답변 스레드"*, *"안 단 리뷰 어디"*, *"내 답변 초안 반영됐나"*, *"리뷰 사이클 상태"* | `bin/pr-thread-status --repo <r> --pr <N> --silent` (라이브 정합) |
+| *"내 PR 분석"*, *"PR #N 검토"* | **먼저** `bin/pr-thread-status --repo <r> --pr <N> --silent`(현재 상태) **후** `bin/my-pr --repo <r> [--pr-number N] --silent`(아카이브 보조) |
 | *"다음 뭐 하지?"*, *"learning profile 보여줘"* | `bin/next-action` |
 | *"<concept> 자세히"* | `bin/topic --concept <cid> [--repo <r>]` |
 | *"멘토 <login> 어떤 사람?"* | `bin/reviewer --repo <r> --reviewer-login <l>` |
 | *"PR A vs PR B 비교"* | `bin/compare --repo <r> --pr-a A --pr-b B` |
-| *"리뷰 응답 도와줘"* | `bin/compose-response --repo <r> --thread-id <id>` |
+| *"리뷰 응답 도와줘"* (진행 중) | `bin/pr-thread-status --repo <r> --pr <N> --silent`로 미답변 스레드(`diff_hunk`·멘토 원문 포함)를 확인한 뒤 **세션이 직접** 대화체 초안 작성 — **답글 문구는 시스템이 생성하지 않는다** |
+| *"내 PR 흐름"*, *"회고"* (진행 중 사이클) | `bin/learn-pr-retro --repo <r> --live` (stale "미해결"을 라이브 status로 정정) |
 | *"미션 파일 ↔ concept 매핑 보여줘"* | `bin/mission-map --repo <r> [--summary]` |
 | 학습자 prompt가 모호 / corpus 어휘와 거리 멀 때 | `bin/rag-rewrite-prepare --mode hyde\|decompose\|normalize --query <Q>` |
 | router confidence <0.7 | `bin/rag-route-fallback --prompt <P> [--repo <r>]` |

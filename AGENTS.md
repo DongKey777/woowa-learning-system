@@ -88,6 +88,7 @@ python3 bin/ask "테스트"
 - 학습자 미션 코드 자동 수정
 - 학습자 mission repo 자동 git clone
 - 외부 paid LLM API 호출 (예: OpenAI API key로 별도 호출). 모든 추론은 현재 ChatGPT Plus/Pro 구독 세션 안에서만.
+- **PR 리뷰 답글 시스템 생성 금지 + 자동 post/submit 금지** — `pr-thread-status`·`learn-pr-retro --live`는 read-only 진단(GitHub GET만, 상태 정합·델타만). 답글 문구는 **시스템 도구로 만들지 않는다** — 세션이 대화체 초안만 직접 작성하고(리뷰어 말 반복 금지·인정→내 관점→되묻기·간결, 학습자 추론 날조 금지), 실제 게시/리뷰 제출은 학습자가 직접 한다(스레드별 명시 확인 없이는 `gh` post 호출 금지).
 
 ### 4.2 매 turn 자동
 1. 모드 선택 — 학습자 발화 의미를 읽고 §4.2.2 카탈로그에서 맞는 모드를 골라 `bin/ask "<prompt>" --mode <mode> [--repo <repo>]`로 넘긴다. 애매하면 `--mode` 생략 → 키워드 router(`detect_mode`)가 fallback.
@@ -133,9 +134,14 @@ python3 bin/ask "테스트"
 
 ### 4.6 Phase T learner-automation auto-call (2026-05-25 신설)
 
+**라이브 vs 오프라인 (진행 중 리뷰 사이클은 라이브 우선)**: `bin/pr-thread-status`·`learn-pr-retro --live`는 매 호출 GitHub를 fresh로 쿼리해 **멘토 원댓글 ∖ (제출답글 ∪ 본인 PENDING 초안)** 으로 미답변을 정합한다(GraphQL로 resolved/outdated/decision 오버레이 + 직전 대비 델타). `my-pr`/무플래그 `learn-pr-retro`는 `sync-prs` 시점 SQLite라 stale + submitted-only(본인 pending 초안 안 보임). → **진행 중 사이클 = 라이브 도구로 현재 상태부터**, 무플래그 `learn-pr-retro` = 머지 후 회고. 라이브 답변/추천 직전마다 캐시 신뢰 금지하고 재쿼리한다. 답글 문구 생성은 시스템 기능이 아니다(§4.1) — 세션이 미답변 스레드를 보고 직접 초안을 쓴다.
+
 | 학습자 발화 / 행동 | 자동 호출 |
 |---|---|
-| *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
+| *"리뷰 스레드 상태"*, *"미답변 스레드"*, *"안 단 리뷰 어디"*, *"리뷰 사이클 상태"* | `bin/pr-thread-status --repo <r> --pr <N> --silent` (라이브 정합) |
+| *"리뷰 응답 도와줘"* (진행 중) | `bin/pr-thread-status --repo <r> --pr <N> --silent`로 미답변 스레드(`diff_hunk`·멘토 원문 포함) 확인 후 **세션이 직접** 대화체 초안 작성 (답글 문구 시스템 생성 X) |
+| *"내 PR 흐름"*, *"회고"* (진행 중 사이클) | `bin/learn-pr-retro --repo <r> --live` (stale "미해결"을 라이브 status로 정정) |
+| *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* (머지 후) | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
 | 학습자 미션 Java 파일 Write/Edit | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` |
 | `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
 | 매 coach turn 답변 직후 | hook 가능 시 `bin/capture-response`; hook 불가 시 `bin/learn-response-quality --source-event-id <id> --response-path <answer.md>` 또는 `--response-file -` |
@@ -148,11 +154,11 @@ python3 bin/ask "테스트"
 CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 
 - **Phase U (10 onboarding)**: `bin/onboard-repo`, `bin/bootstrap-repo`, `bin/sync-prs`, `bin/archive-status`, `bin/repo-readiness`, `bin/doctor`, `bin/validate-state`, `bin/registry-audit`, `bin/list-repos`, `bin/bootstrap`. woowa-learning-system 단독으로 repo 준비와 상태 검증을 수행한다.
-- **Phase V (12 coaching context)**: `bin/coach-run`, `bin/coach/my-pr/next-action/topic/reviewer/compare/compose-response`, `bin/mission-map`, `bin/rag-rewrite-prepare/route-fallback/chunk-context-prepare`.
+- **Phase V (11 coaching context)**: `bin/coach-run`, `bin/coach/my-pr/next-action/topic/reviewer/compare`, `bin/mission-map`, `bin/rag-rewrite-prepare/route-fallback/chunk-context-prepare`.
 - **Phase W (12 mining/analytics, Mode B)**: `bin/feedback-mine`, `bin/response-quality-mine`, `bin/routing-analyze`, `bin/learning-turn-audit`, `bin/learning-path-graph-audit`, `bin/reclassify-history`, `bin/cohort-eval/compare`, `bin/golden`, `bin/rag-eval`, `bin/router-generalization-eval`, `bin/learner-log-rag-eval`.
 - **Phase X (11 maintenance + sub-commands)**: `bin/index-pack`, `bin/sync-index-metadata`, `bin/drill-grade-prepare`, `bin/learn-feedback/self-assess/drill`, `bin/learner-profile` (show/recompute/set/clear/redact), `bin/set-profile/show-profile`, `bin/reviewer-profile` (alias), `bin/rag-remote-build`.
 
-woowa-learning-system `bin/*` 합계: **64 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출.
+위 Phase T-X 외에 **Mode feature builders 14개**(`anchors-build`, `learn-evidence-sync`, `pr-diff-evolution-build`, `learn-pr-meta-build`, `learn-pr-review-build`, `learn-predict-build`, `reviewer-profile-build`, `learn-temporal-build`, `learn-thread-recon-build`, `learn-cohort-build`, `learn-cross-mission-build`, `learn-learning-path-build`, `learn-memory-review-build`, `learn-meta-analytics-build` — §4.2.2 고급 모드 artifact 사전 빌드)와 Live PR review cycle `bin/pr-thread-status`(라이브 정합)가 더 있다. woowa-learning-system `bin/*` 합계: **81 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출. 자세한 usage는 [`docs/bin-reference.md`](docs/bin-reference.md).
 
 ---
 

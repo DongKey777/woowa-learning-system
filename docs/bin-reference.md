@@ -304,12 +304,12 @@ bin/phase9-gate
 | `bin/validate-state [--strict]` | JSON/SQLite schema validation across state/ |
 | `bin/registry-audit [--repair]` | orphan / uninitialized / corrupt detection |
 
-### Phase V — Coaching context (12)
+### Phase V — Coaching context (11)
 
 | Wrapper | Purpose |
 |---|---|
 | `bin/coach-run --repo R --prompt P` | Coaching action snapshot — writes `state/repos/<r>/actions/coach-run.json` |
-| `bin/coach`, `bin/my-pr`, `bin/next-action`, `bin/topic`, `bin/reviewer`, `bin/compare`, `bin/compose-response` | Thin coaching-mode wrappers over `bin/ask`/`bin/coach-run` |
+| `bin/coach`, `bin/my-pr`, `bin/next-action`, `bin/topic`, `bin/reviewer`, `bin/compare` | Thin coaching-mode wrappers over `bin/ask`/`bin/coach-run` |
 | `bin/mission-map --repo R [--summary]` | File→concept_ids map (HEAD + archive patches) |
 | `bin/rag-rewrite-prepare --mode hyde\|decompose\|normalize` | Query rewrite prompt templates |
 | `bin/rag-route-fallback --prompt P` | Router internals + AI disambig for low-confidence |
@@ -347,17 +347,47 @@ bin/phase9-gate
 | `bin/reviewer-profile --repo R --reviewer-login L` | Alias for `bin/reviewer` |
 | `bin/rag-remote-build [--dry-run]` | RunPod build wrapper (maintainer) |
 
+### Mode feature builders (advanced-mode artifact precompute)
+
+§4.2.2 카탈로그의 고급 모드들은 daemon ask 전에 per-repo / per-learner artifact를 사전 빌드해 둔다. 학습자가 해당 의도를 표현하거나 `sync-prs` 후 자동 호출(idempotent). source는 대부분 `state/repos/<r>/archive/prs.sqlite3` + git clone, 산출물은 모드 로더가 읽는다.
+
+| Wrapper | Mode | 산출물 |
+|---|---|---|
+| `bin/anchors-build --repo R` | F11 input | `state/learner/review_anchors.json` |
+| `bin/learn-evidence-sync --repo R` | Bloom mastery | mentor_accept/pr_merge evidence → `mastery_graph.sqlite` (idempotent dedup) |
+| `bin/pr-diff-evolution-build --repo R` | `pr_diff_evolution` | `state/repos/<r>/pr_diff_evolution.json` |
+| `bin/learn-pr-meta-build --repo R` | `pr_meta` | `state/repos/<r>/pr_meta.json` |
+| `bin/learn-pr-review-build --repo R` | `pr_review` | `state/repos/<r>/pr_review.json` |
+| `bin/learn-predict-build --repo R` | `predict` | `state/repos/<r>/predict.json` (C/F/H artifact fusion) |
+| `bin/reviewer-profile-build --repo R` | `reviewer_profile` | `state/repos/<r>/reviewer_profile.json` |
+| `bin/learn-temporal-build --repo R` | `temporal` | `state/repos/<r>/temporal.json` |
+| `bin/learn-thread-recon-build --repo R` | `thread_recon` | `state/repos/<r>/thread_recon.json` |
+| `bin/learn-cohort-build --repo R` | `cohort` | `state/repos/<r>/cohort.json` |
+| `bin/learn-cross-mission-build` | `cross_mission` | `state/learner/cross_mission.json` |
+| `bin/learn-learning-path-build` | `learning_path` | `state/learner/learning_path.json` |
+| `bin/learn-memory-review-build` | `memory_review` | `state/learner/memory_review.json` |
+| `bin/learn-meta-analytics-build` | `meta_analytics` | `state/learner/meta_analytics.json` |
+
+### Live PR review cycle (2026-06-02)
+
+진행 중인 리뷰 사이클 전용. 매 호출 GitHub를 fresh로 쿼리해 **멘토 원댓글 ∖ (제출답글 ∪ 본인 PENDING 초안)** 으로 미답변을 정합한다(REST가 spine, GraphQL이 resolved/outdated/`reviewDecision` 오버레이, 직전 호출 대비 델타). SQLite 아카이브(`my-pr`/무플래그 `learn-pr-retro`)는 `sync-prs` 시점 stale + submitted-only(본인 pending 초안 미수집)라 진행 중 판정엔 부적합 — 라이브 도구로 현재 상태부터 본다. 모두 read-only(post/submit 안 함). 답글 문구 생성은 시스템 기능이 아니다 — 세션이 `pr-thread-status`의 미답변 스레드(`diff_hunk`·멘토 원문 포함)를 보고 직접 초안을 쓴다.
+
+| Wrapper | Purpose |
+|---|---|
+| `bin/pr-thread-status --repo R --pr N [--silent] [--no-snapshot]` | 라이브 3소스 정합 + GraphQL 상태 + 델타 + 라운드 타임라인. 미답변 스레드를 좌표(path/line/root body/diff_hunk)와 함께 surface. 스냅샷: `state/repos/<r>/pr_threads/<n>.json` |
+| `bin/learn-pr-retro --repo R --live` | 아카이브 회고의 stale "unresolved"를 라이브 status(answered/resolved/outdated)로 정정 |
+
 ### Bench totals (Phase T-X)
 
 | Phase | Wrappers | Bench result |
 |---|---|---|
 | T | 7 | 7/7 + 17/17 e2e integration checks |
 | U | 10 | 10/10 + 11/11 collection unit |
-| V | 12 | 10/10 |
+| V | 11 | 9/9 |
 | W | 12 | 12/12 |
 | X | 11 | 11/11 |
-| **합계** | **52** | **50/50 bench + 28/28 unit + release archive gate** |
+| **합계** | **51** | **49/49 bench + 28/28 unit + release archive gate** |
 
-Total bin/* in woowa-learning-system: **64 entries**.
+위 51은 Phase T-X wrapper만 센 것이다. 여기에 상단 core entries + 위 "Mode feature builders" 14개 + Live PR review cycle의 `bin/pr-thread-status`(신규)까지 더한 **Total bin/\* in woowa-learning-system: 81 entries** (`find bin -maxdepth 1 -type f`). 학습자 외울 명령 = 0개.
 
-Full regression via meta-runner: `python3 tests/benchmarks/phase_y_all_benches.py` → 14/14 PASS in ~20s.
+Full regression via meta-runner: `python3 tests/benchmarks/phase_y_all_benches.py` → 14 benches. 13개는 무조건 PASS. 14번째 `phase_t_e2e_integration.py`는 7개 wrapper STEP은 항상 green이지만 S2가 **라이브 학습자 진척**(`experience_level==advanced` + mastered ≥ 5)을 스냅샷 assert하므로, 학습자가 그 마일스톤에 도달했을 때만 14/14다(코드 회귀 아님 — DongKey777 현재 0 mastered/9 proficient면 13/14).

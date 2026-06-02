@@ -209,6 +209,36 @@ python3 bin/ask "내 PR 흐름 보여줘" --repo spring-roomescape-member
 - spring/mvc-controller-basics
 ```
 
+### 시나리오 5b — 진행 중 리뷰 사이클 (라이브 정합)
+
+회고(위)는 **머지 후 오프라인** 관점이라 `bin/sync-prs` 시점 SQLite(stale + 제출분만)다. **아직 머지 안 된 PR에서 멘토 리뷰를 받고 답글을 다는 중**이라면 라이브 도구로 현재 상태부터 본다 — 내 PENDING 초안까지 인지해서 "뭐가 아직 미답변인지"를 정확히 잡는다.
+
+**학습자**: "이번 PR 리뷰 어디까지 했지?" / "안 단 스레드 뭐 남았어?"
+
+**AI 세션 자동** (라이브 우선):
+```bash
+bin/pr-thread-status --repo spring-roomescape-waiting --pr 391 --silent
+```
+- 매 호출 fresh: 멘토 원댓글 ∖ (제출답글 ∪ 본인 PENDING 초안) → 미답변 정합
+- GraphQL 오버레이: 스레드별 resolved/outdated + PR `reviewDecision`
+- 직전 호출 대비 델타(새 멘토 코멘트 / 새로 답변 / 새로 resolved) + 라운드 타임라인
+
+**AI 세션 → 학습자** (미답변 먼저):
+```
+[PR #391] 변경 요청 · open · 머지 가능
+스레드 17개 — 미답변 1 · pending 0 · 답변완료 16 · resolved 0 · outdated 8
+
+아직 답 안 단 스레드 하나 남았어:
+- Reservation.java · "비슷한 일을 하는 것 같은데 용어를 통일해서 하나만 쓰면 어떨까요?"
+  (멘토 06-02 라운드2에서 새로 단 코멘트)
+
+라운드: jurlring 05-29 → 너 06-01 → jurlring 06-02 → 너 06-02
+```
+
+**이어서** "답글 도와줘"라고 하면, `pr-thread-status`가 미답변 스레드를 좌표·멘토 원문·`diff_hunk`까지 이미 surface하므로 **세션이 그걸 보고 직접** 답글 초안을 쓴다(대화체·간결, 리뷰어 말 반복 금지). 답글 문구를 만들어주는 시스템 도구는 없다 — 작성은 세션 몫, 실제 게시/리뷰 제출은 학습자가 직접 한다(자동 post 금지).
+
+재리뷰를 받은 뒤 다시 `pr-thread-status`를 부르면 직전 스냅샷 대비 **새로 resolved된 스레드 / 새 멘토 코멘트**가 델타로 잡혀 사이클이 어디까지 진행됐는지 추적된다.
+
 ---
 
 ## 시나리오 6 — Drill (F6, 시스템이 issue → 학습자 답변)

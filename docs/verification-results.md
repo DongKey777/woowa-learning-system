@@ -333,16 +333,16 @@ python3 tests/benchmarks/phase_y_all_benches.py   # 14/14 in ~20s
 
 ## 10. Phase T-X (2026-05-25/26) — automation expansion
 
-**52 새 wrappers + 6 new modules + scripts/collection/ + scripts/mining/**
+**51 새 wrappers + 6 new modules + scripts/collection/ + scripts/mining/**
 
 | Phase | 범위 | Pass |
 |---|---|---|
 | **T** Learner automation (7 wrappers) | learn-pr-retro · learn-record-code · learn-test · learn-response-quality · assess-learner-state · profile-recompute · session-start | 7/7 PASS + 17/17 e2e integration |
 | **U** Onboarding/Collection (10, G1 closure) | bootstrap · bootstrap-repo · onboard-repo · list-repos · archive-status · sync-prs · repo-readiness · doctor · validate-state · registry-audit | 10/10 + 11/11 unit |
-| **V** Coaching context (12) | coach-run · coach · my-pr · next-action · topic · reviewer · compare · compose-response · mission-map · rag-rewrite-prepare · rag-route-fallback · chunk-context-prepare | 10/10 |
+| **V** Coaching context (11) | coach-run · coach · my-pr · next-action · topic · reviewer · compare · mission-map · rag-rewrite-prepare · rag-route-fallback · chunk-context-prepare | 9/9 |
 | **W** Mining/Analytics (12) | feedback-mine · response-quality-mine · routing-analyze · learning-turn-audit · learning-path-graph-audit · reclassify-history · cohort-eval · cohort-compare · golden · rag-eval · router-generalization-eval · learner-log-rag-eval | 12/12 |
 | **X** Maintenance + sub-commands (11) | index-pack · sync-index-metadata · drill-grade-prepare · learn-feedback · learn-self-assess · learn-drill · learner-profile · set-profile · show-profile · reviewer-profile · rag-remote-build | 11/11 + archive gate |
-| **합계** | **52 wrappers** | **50/50 bench + 28/28 unit + archive gate** |
+| **합계** | **51 wrappers** | **49/49 bench + 28/28 unit + archive gate** |
 
 ### Historical baseline 대비 성능 향상 (측정)
 
@@ -377,3 +377,27 @@ Phase 9 final acceptance criteria #8 ("predecessor directory 삭제 가능 검�
 - **외부 predecessor 의존**: **0** (Y2 검증 완료)
 - **Latency p50**: **27ms** (historical baseline 120ms 대비 4.4× faster)
 - **Prompt payload**: **~4.1K chars avg** (historical baseline 48.6KB 대비 약 11.8× smaller)
+
+---
+
+## 11. Live PR review cycle (2026-06-02)
+
+PR #391 리뷰 사이클에서 "미답변" 정합을 반복 오판한 근본 원인(시스템에 라이브 + 본인 PENDING 인지 경로 부재)을 메우는 기능. 매 호출 GitHub fresh 3-소스 정합(멘토 원댓글 ∖ (제출답글 ∪ 본인 PENDING 초안)) + GraphQL resolved/outdated/`reviewDecision` 오버레이 + 직전 스냅샷 대비 델타.
+
+**추가/변경**
+- `scripts/collection/github_client.py` — `fetch_pull_request_review_comments_for_review`, `fetch_review_threads`(GraphQL), `_run_graphql`.
+- `core/pr_threads.py` (신규) — `reconcile_pr_threads(...)` 엔진(REST spine + GraphQL 오버레이, 스냅샷 델타).
+- `bin/pr-thread-status` (신규) — 라이브 진입점(read-only, `--silent` JSON + 한국어 narration).
+- `bin/learn-pr-retro --live` — 아카이브 회고의 stale "unresolved"를 라이브 status로 정정.
+- **답글 문구 생성은 시스템 기능 아님** — 세션이 미답변 스레드(`diff_hunk`+멘토 원문)를 보고 직접 초안. `compose-response --live`는 사용자 지시로 폐기.
+
+**검증 (2026-06-02)**
+| 항목 | 결과 |
+|---|---|
+| `pytest tests/ -q` | **681 passed** (회귀 0) |
+| `bin/router-generalization-eval` | exit 0, failures [] (새 router 모드 없음) |
+| `bin/golden verify` | 2/2 pass |
+| meta-runner `phase_y_all_benches.py` | **13/14** — 13 무조건 PASS; `phase_t_e2e_integration.py`는 7 wrapper STEP 모두 green이나 S2가 라이브 학습자 진척(experience=advanced + mastered≥5)을 assert → DongKey777 현재 0 mastered/9 proficient/620 events라 미충족(코드 회귀 아님, 학습 진척 마일스톤 미도달) |
+| 라이브 스모크 PR #391 | 17 스레드 전부 `jurlring`, `reviewDecision=CHANGES_REQUESTED`, 유일 unanswered = Reservation.java root, 재실행 시 델타 비어 idempotent |
+
+`bin/*` entries: 64 → **81** (Mode feature builders 14 + Live PR `pr-thread-status` 신규, `compose-response` 제거 — 답글 문구 생성은 시스템 기능 아님).

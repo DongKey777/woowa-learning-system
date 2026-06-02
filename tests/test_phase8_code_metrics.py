@@ -67,7 +67,11 @@ def test_runtime_loc_under_paradigm_v2_budget() -> None:
     # 13657, lift to <=13900.
     # 2026-06-01: F7 family K (predict) adds mission/predict.py (C+F+H synthesis)
     # + loader/render/route/intent wiring; total reaches 14049, lift to <=14300.
-    assert total <= 14300, f"runtime LOC {total} exceeds Phase T-X budget 14300"
+    # 2026-06-02: live PR review-thread reconciliation adds core/pr_threads.py
+    # (~278 LOC: fresh 3-source REST+GraphQL reconcile + pending-aware status +
+    # delta vs snapshot). No new router mode (AI calls bin/pr-thread-status
+    # directly); total reaches 14418, lift to <=14600.
+    assert total <= 14600, f"runtime LOC {total} exceeds Phase T-X budget 14600"
 
 
 def test_per_module_loc_breakdown_within_plan() -> None:
@@ -116,7 +120,10 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # 2026-06-01: F6 J + F5 G/I + F6 E + F7 F all add loader/render/route/intent
     # wiring across the same 4 core files (5 new render helpers in coach.py are
     # the bulk); lands at 8564, lift to <=8750.
-    assert breakdown["core"] <= 8750, f"core {breakdown['core']} > 8750 (Phase T-X/Y13/Y14 budget)"
+    # 2026-06-02: core/pr_threads.py (~278 LOC: live pending-aware PR thread
+    # reconcile engine) + recent daemon/state hardening land core at 9009; lift
+    # to <=9150 to keep this a generous drift alarm, not a hard trip-wire.
+    assert breakdown["core"] <= 9150, f"core {breakdown['core']} > 9150 (Phase T-X/Y13/Y14 budget)"
     # 2026-05-31: corpus-expansion cycle adds a real-state join adapter to
     # mine_history (build_joined_events/mine_real) so mining runs on actual
     # history.jsonl + response-quality.jsonl + profile.uncertain instead of the
@@ -165,7 +172,7 @@ def test_entry_point_count() -> None:
                    "validate-state", "registry-audit",
                    # Phase V new wrappers (coaching context)
                    "coach-run", "coach", "my-pr", "next-action", "topic",
-                   "reviewer", "compare", "compose-response", "mission-map",
+                   "reviewer", "compare", "mission-map",
                    "rag-rewrite-prepare", "rag-route-fallback",
                    "chunk-context-prepare",
                    # Phase W new wrappers (mining/analytics)
@@ -207,6 +214,8 @@ def test_entry_point_count() -> None:
                    "learn-cohort-build",
                    # A~N usecases F7 K: pre-push review prediction (C+F+H synthesis)
                    "learn-predict-build",
+                   # Live pending-aware PR review-thread reconciliation
+                   "pr-thread-status",
                    # UX-first response capture hooks/repair
                    "capture-response", "capture-repair", "learning-data-clean",
                    # Onboarding bootstrap (.venv + pip install -e .)

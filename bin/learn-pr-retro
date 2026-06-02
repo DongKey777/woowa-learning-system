@@ -22,7 +22,62 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from core.identity import resolve_learner_login  # noqa: E402
 from core.pr_retro import build_retrospective, save_retrospective  # noqa: E402
+from core.pr_threads import reconcile_pr_threads  # noqa: E402
 from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+
+def _norm(s: str | None) -> str:
+    return " ".join((s or "").split())
+
+
+def _match_live(unresolved, live_threads: list[dict]) -> dict | None:
+    """Join a stale archive thread to its live counterpart by path + body prefix."""
+    cands = [t for t in live_threads if t.get("path") == unresolved.path]
+    ub = _norm(unresolved.body_excerpt)[:60]
+    for t in cands:
+        lb = _norm(t.get("root_excerpt"))[:60]
+        if ub and lb and (ub.startswith(lb[:40]) or lb.startswith(ub[:40])):
+            return t
+    if unresolved.line is not None:
+        for t in cands:
+            if t.get("line") == unresolved.line:
+                return t
+    return cands[0] if len(cands) == 1 else None
+
+
+def _live_reconciliation(retro, repo: str, learner: str, owner: str,
+                         state_root: Path) -> dict:
+    """Annotate each stale 'unresolved' thread with its real live status —
+    so a stale retro no longer flags already-answered threads as open."""
+    by_pr: dict[int, list] = {}
+    for u in retro.unresolved_threads:
+        by_pr.setdefault(u.pr_number, []).append(u)
+    annotations: list[dict] = []
+    for pr, items in sorted(by_pr.items()):
+        res = reconcile_pr_threads(repo, pr, learner, owner=owner,
+                                   state_root=state_root, write_snapshot=False)
+        live = res.get("threads", []) if res.get("status") == "ok" else []
+        for u in items:
+            m = _match_live(u, live)
+            annotations.append({
+                "pr_number": pr, "path": u.path,
+                "body_excerpt": (u.body_excerpt or "")[:80],
+                "live_status": m["status"] if m else "live_unknown",
+                "is_resolved": bool(m["is_resolved"]) if m else None,
+                "is_outdated": bool(m["is_outdated"]) if m else None,
+            })
+    now_closed = sum(1 for a in annotations
+                     if a["is_resolved"] or a["live_status"] in
+                     ("answered_submitted", "answered_pending"))
+    still_open = sum(1 for a in annotations
+                     if a["live_status"] == "unanswered" and not a["is_resolved"])
+    return {
+        "checked_prs": sorted(by_pr),
+        "stale_unresolved_total": len(annotations),
+        "actually_answered_or_resolved": now_closed,
+        "still_open": still_open,
+        "annotations": annotations,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +89,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--include-bot", action="store_true",
                         help="include [bot] reviewers (default exclude — human mentor priority)")
+    parser.add_argument("--live", action="store_true",
+                        help="reconcile stale 'unresolved' threads against live GitHub")
+    parser.add_argument("--owner", default="woowacourse")
     parser.add_argument("--silent", action="store_true")
     args = parser.parse_args(argv)
 
@@ -43,18 +101,23 @@ def main(argv: list[str] | None = None) -> int:
                                  include_bot=args.include_bot)
     out_path = save_retrospective(retro, state_root=args.state_root)
 
-    if not args.silent:
-        print(json.dumps({
-            "repo": retro.repo,
-            "learner_login": retro.learner_login,
-            "prs_total": retro.prs_total,
-            "prs_merged": retro.prs_merged,
-            "avg_review_rounds": retro.avg_review_rounds,
-            "recurring_signals_n": len(retro.recurring_mentor_signals),
-            "unresolved_threads_n": len(retro.unresolved_threads),
-            "source": retro.source,
-            "out_path": str(out_path),
-        }, ensure_ascii=False, indent=2))
+    summary = {
+        "repo": retro.repo,
+        "learner_login": retro.learner_login,
+        "prs_total": retro.prs_total,
+        "prs_merged": retro.prs_merged,
+        "avg_review_rounds": retro.avg_review_rounds,
+        "recurring_signals_n": len(retro.recurring_mentor_signals),
+        "unresolved_threads_n": len(retro.unresolved_threads),
+        "source": retro.source,
+        "out_path": str(out_path),
+    }
+    if args.live and retro.source != "missing_archive":
+        summary["live_reconciliation"] = _live_reconciliation(
+            retro, args.repo, learner, args.owner, args.state_root)
+
+    if args.live or not args.silent:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if retro.source != "missing_archive" else 2
 
 

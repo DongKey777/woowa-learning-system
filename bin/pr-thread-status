@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""bin/pr-thread-status — live, pending-aware PR review-thread status.
+
+Unlike the offline SQLite archive (bin/learn-pr-retro, bin/my-pr), this queries
+GitHub live on every call and reconciles three sources — mentor root comments,
+submitted learner replies, and the learner's own PENDING draft comments — then
+overlays GraphQL per-thread isResolved/isOutdated/resolvedBy + PR reviewDecision
+and a delta vs. the previous call. Read-only diagnostics: never posts/submits.
+
+Usage:
+  bin/pr-thread-status --repo spring-roomescape-waiting --pr 391
+  bin/pr-thread-status --repo spring-roomescape-waiting --pr 391 --silent
+
+Snapshot (builder output): state/repos/<repo>/pr_threads/<pr>.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from core.identity import resolve_learner_login  # noqa: E402
+from core.pr_threads import reconcile_pr_threads  # noqa: E402
+from core.state import DEFAULT_STATE_ROOT  # noqa: E402
+
+_DECISION_KO = {
+    "CHANGES_REQUESTED": "변경 요청",
+    "APPROVED": "승인",
+    "REVIEW_REQUIRED": "리뷰 대기",
+    "DISMISSED": "기각",
+}
+_ACTOR_KO = {"mentor": "멘토", "learner": "학습자"}
+
+
+def _day(ts: str | None) -> str:
+    return (ts or "")[:10]
+
+
+def _thread_line(t: dict) -> str:
+    loc = t["path"] or "?"
+    if t.get("line") is not None:
+        loc += f" L{t['line']}"
+    head = f"  - {loc} · root {t['root_comment_id']}"
+    flags = []
+    if t.get("is_resolved"):
+        flags.append(f"resolved by {t['resolved_by']}" if t.get("resolved_by") else "resolved")
+    if t.get("is_outdated"):
+        flags.append("outdated")
+    if flags:
+        head += "  [" + ", ".join(flags) + "]"
+    excerpt = t.get("root_excerpt") or ""
+    return head + (f'\n      "{excerpt}"' if excerpt else "")
+
+
+def _narrate(r: dict) -> str:
+    c = r["counts"]
+    decision = _DECISION_KO.get(r.get("review_decision") or "", r.get("review_decision") or "—")
+    mergeable = {True: "머지 가능", False: "충돌", None: "판정 보류"}.get(r.get("mergeable"), "—")
+    lines = [
+        f"[PR #{r['pr_number']}] {decision} · {r.get('pr_state') or '?'} · {mergeable}",
+        (f"스레드 {c['total']}개 — 미답변 {c['unanswered']} · pending {c['answered_pending']} · "
+         f"답변완료 {c['answered_submitted']} · resolved {c['resolved']} · outdated {c['outdated']}"),
+    ]
+
+    unanswered = [t for t in r["threads"] if t["status"] == "unanswered"]
+    lines.append(f"\n■ 미답변 ({len(unanswered)})")
+    lines.extend(_thread_line(t) for t in unanswered) if unanswered else lines.append("  (없음)")
+
+    pending = [t for t in r["threads"] if t["status"] == "answered_pending"]
+    if pending:
+        lines.append(f"\n■ pending 초안 ({len(pending)})")
+        lines.extend(_thread_line(t) for t in pending)
+
+    submitted = [t for t in r["threads"] if t["status"] == "answered_submitted"]
+    resolved_n = sum(1 for t in submitted if t["is_resolved"])
+    lines.append(f"\n■ 답변완료 {len(submitted)} (resolved {resolved_n})")
+
+    d = r.get("delta") or {}
+    if d.get("first_run"):
+        lines.append("\n직전 대비: 첫 실행 — 비교 대상 없음")
+    else:
+        nr, na, nm = d.get("newly_resolved", []), d.get("newly_answered", []), d.get("new_mentor_roots", [])
+        if nr or na or nm:
+            parts = []
+            if nm:
+                parts.append(f"새 멘토 코멘트 {len(nm)}")
+            if na:
+                parts.append(f"새로 답변 {len(na)}")
+            if nr:
+                parts.append(f"새로 resolved {len(nr)}")
+            lines.append("\n직전 대비: " + " · ".join(parts))
+        else:
+            lines.append("\n직전 대비: 변화 없음")
+
+    tl = r.get("round_timeline") or []
+    if tl:
+        lines.append("\n라운드 타임라인:")
+        for e in tl:
+            actor = _ACTOR_KO.get(e["actor"], e["actor"])
+            lines.append(f"  {actor} {e['login']} {e['state']} {_day(e['submitted_at'])} "
+                         f"(코멘트 {e['comment_count']})")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--pr", type=int, required=True)
+    parser.add_argument("--learner-login", default=None,
+                        help="default: auto-detect via gh CLI + cache")
+    parser.add_argument("--owner", default="woowacourse")
+    parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument("--no-snapshot", action="store_true",
+                        help="do not persist the delta snapshot for this call")
+    parser.add_argument("--silent", action="store_true",
+                        help="JSON only (no Korean narration)")
+    args = parser.parse_args(argv)
+
+    learner = resolve_learner_login(args.state_root, explicit=args.learner_login)
+    result = reconcile_pr_threads(
+        args.repo, args.pr, learner, owner=args.owner,
+        state_root=args.state_root, write_snapshot=not args.no_snapshot)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not args.silent and result.get("status") == "ok":
+        print("\n" + _narrate(result))
+    return 0 if result.get("status") == "ok" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -67,13 +67,7 @@ def measure():
     results["compare"] = {"rc": rc, "ms": round(ms, 1),
                            "ok": rc == 0 and ms <= 2000}
 
-    # V8 compose-response (with --thread-id from a known mentor root comment in member)
-    rc, stdout, ms = _run([PY, "bin/compose-response", "--repo", "spring-roomescape-member",
-                            "--thread-id", "3202357560", "--silent"])
-    results["compose_response"] = {"rc": rc, "ms": round(ms, 1),
-                                     "ok": rc == 0 and ms <= 3000}
-
-    # V9 mission-map summary
+    # V8 mission-map summary
     rc, _, ms = _run([PY, "bin/mission-map", "--repo", "spring-roomescape-member",
                        "--summary"], timeout=15)
     results["mission_map"] = {"rc": rc, "ms": round(ms, 1),
