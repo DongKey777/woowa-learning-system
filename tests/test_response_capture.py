@@ -72,6 +72,30 @@ def test_hook_capture_writes_quality_and_marks_pending(tmp_path: Path) -> None:
     assert pending["response_body_path"] == row["response_body_path"]
 
 
+def test_hook_capture_inherits_mode_from_source_event(monkeypatch, tmp_path: Path) -> None:
+    # The Stop-hook env must NOT override the source rag_ask event's mode or
+    # provenance — the rag_ask event is the single source of truth. Here env
+    # says development, but the captured row must stay learning/explicit.
+    monkeypatch.setenv("WOOWA_SESSION_MODE", "development")
+    state = tmp_path / "state"
+    event = _ask_event()
+    event["mode_source"] = "explicit"
+    append_history_event(event, state_root=state)
+    create_pending_capture(event, state_root=state)
+
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "[Mode: cs_qa]\n\n격리 수준 답변"},
+        client="claude",
+        state_root=state,
+        learner_id="DongKey777",
+    )
+
+    assert result["ok"] is True
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["mode"] == "learning"
+    assert row["mode_source"] == "explicit"
+
+
 def test_hook_capture_supersedes_older_pending_in_same_turn(tmp_path: Path) -> None:
     state = tmp_path / "state"
     first = _ask_event()

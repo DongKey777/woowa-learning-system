@@ -67,7 +67,8 @@ def _socket_ask(prompt: str, timeout_s: int) -> tuple[float, dict]:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout_s)
     sock.connect(str(sock_path))
-    req = json.dumps({"action": "ask", "query": prompt, "learner_id": "default"}) + "\n"
+    req = json.dumps({"action": "ask", "query": prompt, "learner_id": "default",
+                      "mode": "development", "mode_source": "explicit"}) + "\n"
     sock.sendall(req.encode("utf-8"))
     data = b""
     while True:

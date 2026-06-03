@@ -413,6 +413,8 @@ def capture_from_hook_payload(
         repo=pending.get("repo") or repo,
         learner_id=learner_id,
         state_root=state_root,
+        mode=ev.get("mode"),
+        mode_source=ev.get("mode_source"),
         capture_method=f"hook_{client}",
         capture_input_chars=0,
     )
@@ -532,6 +534,8 @@ def drain_repair_queue(
                     repo=repo,
                     learner_id=learner_id,
                     state_root=state_root,
+                    mode=ev.get("mode"),
+                    mode_source=ev.get("mode_source"),
                     capture_method="repair_queue",
                     capture_input_chars=0,
                 )

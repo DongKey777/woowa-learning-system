@@ -73,12 +73,12 @@ python3 bin/ask "테스트"
 
 ## 3. Session Mode
 
-학습(Mode A) vs 시스템 개발(Mode B) 자동 분기. 같은 세션에서 두 흐름 섞이면 personalization 오염.
+학습(Mode A) vs 시스템 개발(Mode B). 같은 세션에서 두 흐름 섞이면 personalization 오염.
 
 - **Mode A** (default): 미션 코딩 / 개념 질문 / drill / coaching
-- **Mode B**: corpus·core·bin·tests·docs 변경. `WOOWA_SESSION_MODE=development` set 후 명령.
+- **Mode B**: corpus·core·bin·tests·docs 변경. `WOOWA_SESSION_MODE=development` set 후 명령 (또는 개별 `bin/ask`에 `--session-mode development` 명시).
 
-자동 분류 (env 미설정): `core/`, `corpus/`, `docs/`, `bin/`, `tests/`, `scripts/`, root `.md` 시작 file_path → development. `missions/`, `src/main/` → learning. 모호 → learning default.
+**모드 결정 = 세션의 명시 선언이지 코드 추측이 아니다.** 세션이 작업 의도를 읽고 `bin/ask --session-mode learning|development`로 모드를 직접 선언한다(provenance `explicit`). 명시가 없으면 daemon은 `WOOWA_SESSION_MODE` env로 라벨하고(`env`), 그것도 없으면 보수적으로 `learning`(`default`)으로 둔다 — 이 출처가 이벤트의 `mode_source`에 남는다. 아래 file_path/내용 신호는 세션이 `--session-mode`를 **고를 때 쓰는 판단 기준**이지 코드 분류기가 아니다(과거 문서가 설명하던 자동 분류기는 코드에 존재하지 않는다): `core/`·`corpus/`·`docs/`·`bin/`·`tests/`·`scripts/`·root `.md` 편집/측정/빌드 → `development`; `missions/`·`src/main/` 미션 코딩·개념 질문 → `learning`; 모호하면 `learning`(보수적, 학습자의 정당한 도구 질문을 dev로 오분류 X).
 
 ---
 
@@ -91,8 +91,8 @@ python3 bin/ask "테스트"
 - **PR 리뷰 답글 시스템 생성 금지 + 자동 post/submit 금지** — `pr-thread-status`·`learn-pr-retro --live`는 read-only 진단(GitHub GET만, 상태 정합·델타만). 답글 문구는 **시스템 도구로 만들지 않는다** — 세션이 대화체 초안만 직접 작성하고(리뷰어 말 반복 금지·인정→내 관점→되묻기·간결, 학습자 추론 날조 금지), 실제 게시/리뷰 제출은 학습자가 직접 한다(스레드별 명시 확인 없이는 `gh` post 호출 금지).
 
 ### 4.2 매 turn 자동
-1. 모드 선택 — 학습자 발화 의미를 읽고 §4.2.2 카탈로그에서 맞는 모드를 골라 `bin/ask "<prompt>" --mode <mode> [--repo <repo>]`로 넘긴다. 애매하면 `--mode` 생략 → 키워드 router(`detect_mode`)가 fallback.
-2. `bin/ask` 자동 호출
+1. 모드 선택 — 학습자 발화 의미를 읽고 §4.2.2 카탈로그에서 맞는 라우팅 모드를 고른다(`--mode`).
+2. `bin/ask` 자동 호출 — 학습 turn은 `bin/ask "<재작성한 검색 쿼리>" --raw-utterance "<학습자 원문 발화>" --session-mode learning --mode <mode> [--repo <repo>]` 형태. positional = 기술어휘로 재작성한 검색 쿼리, `--raw-utterance` = 학습자 원문 발화 그대로(요약·재작성 X, raw→rewritten 쌍 축적), `--session-mode learning` = 학습 세션 명시(provenance `explicit`; 생략 시 env/`default`). `--mode`는 라우팅 모드 오버라이드(세션 모드와 별개) — 확신 없으면 생략 → 키워드 router(`detect_mode`) fallback.
 3. 받은 prompt markdown 그대로 → 학습자에게 한국어 답변
 4. 첫 줄 header: `[Mode: <router_mode>]`
 5. 답변 끝 `참고:` 블록 (최대 3 concept_id)
@@ -165,7 +165,7 @@ CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 ## 5. Mode B 행동 contract
 
 ### 5.1 매 작업
-- `WOOWA_SESSION_MODE=development` set
+- `WOOWA_SESSION_MODE=development` set (또는 개별 `bin/ask`에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨.
 - commit 기반 reproducible
 - 회귀 검증: `pytest tests/ -q` (현재 523 passed 유지)
 

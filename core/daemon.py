@@ -418,6 +418,12 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     if learner_id == "default":
                         learner_id = resolve_learner_login(state_root)
                     event_mode = req.get("mode") or os.environ.get("WOOWA_SESSION_MODE", "learning")
+                    # Provenance of event_mode: resolved by bin/ask (explicit/env/
+                    # default). If a caller predates mode_source, fall back to what
+                    # the daemon can observe — env presence vs. conservative default.
+                    event_mode_source = req.get("mode_source") or (
+                        "env" if os.environ.get("WOOWA_SESSION_MODE") else "default"
+                    )
                     route_mode = req.get("route_mode")  # AI-session-driven mode (optional)
                     profile = load_profile(learner_id, state_root=state_root)
                     recent = read_history(state_root=state_root, tail=20)
@@ -572,11 +578,13 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         "ts": time.time(),
                         "event_type": "rag_ask",
                         "mode": event_mode,
+                        "mode_source": event_mode_source,
                         "learner_id": learner_id,
                         "repo": repo,
                         "payload": {
                             "prompt": prompt,
                             "repo": repo,
+                            "raw_utterance": req.get("raw_utterance") or None,
                             "router_mode": effective_route.mode,
                             "router_reason": effective_route.reason,
                             "reformulated_query": reformulated_query or None,

@@ -146,12 +146,19 @@ CREATE TABLE evidence (
 ### `history.jsonl` event types
 | event_type | mode | payload 필드 |
 |---|---|---|
-| `rag_ask` | learning/development | top-level learner_id/repo + prompt, repo, router_mode, router_reason, top_concept_ids, latency_ms |
+| `rag_ask` | learning/development | top-level learner_id/repo/`mode_source` + payload: prompt, `raw_utterance`, repo, router_mode, router_reason, `reformulated_query`, `reformulation_source`, top_concept_ids, latency_ms |
 | `code_attempt` | learning | file_path, concept_ids, lines_added, lines_removed, summary, linked_test |
 | `drill_answer` | learning | drill_session_id, concept_ids, score, level, dimensions, answer_preview |
 | `self_assessment` | learning | trigger_session_id, score, concept_ids |
 | `test_result` | learning | test_class, test_method, status |
 | `coach_run` | learning | prompt, repo, mode, evidence_summary |
+
+#### `rag_ask` 필드 의미 (prompt vs raw_utterance / mode provenance)
+- `payload.prompt`은 검색에 실제로 넘어간 텍스트다. 세션이 학습자 발화를 기술어휘로 **재작성한 출력**이며 raw 발화가 아니다.
+- `payload.raw_utterance`는 세션이 `bin/ask --raw-utterance "<원문>"`로 동반 전달한 학습자 원문이다. raw→rewritten 쌍을 축적해 운영 경로(재작성 ON)를 나중에 측정하기 위한 필드. 미전달이면 `null`.
+- `payload.reformulated_query`/`reformulation_source`는 daemon `core/reformulate`가 잡는 **anaphora 정도의 보정**만 기록한다(세션 재작성과는 다른 좁은 경로). 미해당이면 `null`.
+- top-level `mode_source`는 `mode` 라벨의 출처다: `explicit`(세션이 `--session-mode` 명시) · `env`(`WOOWA_SESSION_MODE`) · `default`(둘 다 없어 보수적 `learning`) · `backfill_reclassified`(일회성 마이그레이션이 정정). 신뢰 가능한 mode 라벨과 그 신뢰도를 구분하기 위한 provenance다.
+- 같은 `mode_source` 값이 그 turn의 `response_quality` 이벤트/`response-quality.jsonl` 행에도 상속된다(소스 `rag_ask` 이벤트가 단일 진실원천 — Stop-hook env로 재유도하지 않는다).
 
 ### `response-quality.jsonl` 수집 규칙
 - `source_event_id`는 직전 `rag_ask` / `coach_run` event id와 join된다.

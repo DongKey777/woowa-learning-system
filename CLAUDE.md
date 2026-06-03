@@ -90,10 +90,13 @@ python3 bin/ask "테스트"
 
 ### Mode B — System Development
 - 의도: corpus 수정, `core/`/`bin/`/`tests/`/`docs/` 변경, 회귀 측정, RunPod 빌드 등
-- 환경: `WOOWA_SESSION_MODE=development` set 후 후속 명령
+- 환경: `WOOWA_SESSION_MODE=development` set 후 후속 명령 (또는 개별 `bin/ask` 호출에 `--session-mode development` 명시)
 - 예: *"코퍼스 확장해"*, *"회귀 측정 돌려"*, *"새 bin entry 추가"*
 
-자동 분류 (env 미설정 시): file_path가 `core/`, `corpus/`, `docs/`, `bin/`, `tests/`, `scripts/`, root `.md` 시작이면 `development`. `missions/`, `src/main/` 같은 미션 형태면 `learning`. 모호 → `learning` default (보수적).
+**모드 결정 = 세션의 명시 선언이지 코드 추측이 아니다.** 세션이 작업 의도를 읽고 `bin/ask --session-mode learning|development`로 모드를 직접 선언한다(provenance `explicit`). 명시가 없으면 daemon은 `WOOWA_SESSION_MODE` env로 라벨하고(`env`), 그것도 없으면 보수적으로 `learning`(`default`)으로 둔다 — 이 출처가 이벤트의 `mode_source`에 남는다. 아래 file_path/내용 신호는 세션이 `--session-mode`를 **고를 때 쓰는 판단 기준**이지 코드 분류기가 아니다(과거 문서가 설명하던 자동 분류기는 코드에 존재하지 않는다):
+- `core/`, `corpus/`, `docs/`, `bin/`, `tests/`, `scripts/`, root `.md` 편집/측정/빌드 → `development`
+- `missions/`, `src/main/` 같은 미션 코딩·개념 질문 → `learning`
+- 모호하면 `learning`(보수적). 학습자의 정당한 도구 질문(*"pytest가 뭐야"*)을 dev로 오분류하지 않는다.
 
 ---
 
@@ -106,8 +109,13 @@ python3 bin/ask "테스트"
 - **PR 리뷰 답글 시스템 생성 금지 + 자동 post/submit 금지** — `pr-thread-status`·`learn-pr-retro --live`는 read-only 진단(GitHub GET만, 상태 정합·델타만). 답글 문구는 **시스템 도구로 만들지 않는다** — 세션이 대화체 초안만 직접 작성하고(리뷰어 말 반복 금지·인정→내 관점→되묻기·간결, 학습자 추론 날조 금지), 실제 게시/리뷰 제출은 학습자가 직접 한다(스레드별 명시 확인 없이는 `gh` post 호출 금지).
 
 ### 4.2 매 turn 자동 수행
-1. **모드 선택** — 학습자 발화를 읽고 아래 §4.2.2 카탈로그에서 가장 맞는 모드를 직접 고른다. 고른 모드를 `bin/ask "<prompt>" --mode <mode> [--repo <repo>]`로 넘긴다.
-2. **`bin/ask` 자동 호출** — 학습자가 명령 외울 필요 없음. 어느 모드인지 확신이 안 서면 `--mode`를 빼고 호출한다. 그러면 키워드 기반 router(`detect_mode`)가 결정한다 — 이게 deterministic 하한선이다.
+1. **모드 선택** — 학습자 발화를 읽고 아래 §4.2.2 카탈로그에서 가장 맞는 라우팅 모드를 직접 고른다(`--mode`).
+2. **`bin/ask` 자동 호출** — 학습 turn은 다음 형태로 호출한다:
+   `bin/ask "<재작성한 검색 쿼리>" --raw-utterance "<학습자 원문 발화>" --session-mode learning --mode <mode> [--repo <repo>]`
+   - positional = 세션이 기술어휘로 **재작성한** 검색 쿼리(검색에 실제로 넘어가는 텍스트).
+   - `--raw-utterance` = 학습자가 실제로 친 **원문 한국어 발화**(재작성 전). raw→rewritten 쌍 축적용 — 발화를 그대로 넘긴다(요약·재작성 금지).
+   - `--session-mode learning` = 학습 세션 명시(provenance `explicit`). 생략하면 env/`default`로 떨어진다.
+   - `--mode`는 **라우팅 모드** 오버라이드다(세션 모드와 별개). 어느 라우팅 모드인지 확신이 안 서면 `--mode`를 빼고 호출 → 키워드 router(`detect_mode`)가 결정(deterministic 하한선).
 3. 응답 받은 prompt markdown을 그대로 사용해 학습자에게 한국어 답변 생성.
 4. 첫 줄 헤더: `[Mode: <router_mode>]` (예: `[Mode: cs_qa]`, `[Mode: coaching]`).
 5. 답변 끝에 `참고:` 블록으로 인용 (최대 3개 concept_id).
@@ -281,7 +289,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 ## 5. Mode B 행동 contract (시스템 개발)
 
 ### 5.1 모든 작업
-- `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령.
+- `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령 (또는 개별 `bin/ask` 호출에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨된다.
 - 변경은 commit 기반 reproducible. 측정 결과는 로컬 `reports/`에 저장 (gitignored — public clone에 안 들어감). 헤드라인 metric은 `docs/verification-results.md`에 inline로 정리한다.
 - 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 523 passed 유지.
 

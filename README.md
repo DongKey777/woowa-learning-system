@@ -115,10 +115,10 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 
 ## Mode A vs Mode B (세션 모드)
 
-학습자가 같은 AI 세션에서 미션 학습(Mode A)과 시스템 개발(Mode B)을 섞으면 personalization 데이터가 오염됨. AI는 의도를 읽고 `WOOWA_SESSION_MODE`를 자동 설정:
+학습자가 같은 AI 세션에서 미션 학습(Mode A)과 시스템 개발(Mode B)을 섞으면 personalization 데이터가 오염됨. AI 세션이 의도를 읽고 모드를 **명시 선언**한다(`bin/ask --session-mode learning|development`, provenance `explicit`) — 명시가 없으면 `WOOWA_SESSION_MODE` env(`env`), 그것도 없으면 보수적 `learning`(`default`). 이 출처는 이벤트 `mode_source`에 남는다:
 
 - **Mode A (learning, 기본값)**: 미션 코딩, 개념 질문, drill, coaching. `code_attempt` 이벤트가 `learning` 모드로 기록되어 mastery autoloop에 반영.
-- **Mode B (development)**: `corpus/`, `core/`, `bin/`, `tests/`, `docs/` 수정 같은 시스템 작업. `WOOWA_SESSION_MODE=development` set 후 후속 명령 호출. personalization stream에서 자동 제외.
+- **Mode B (development)**: `corpus/`, `core/`, `bin/`, `tests/`, `docs/` 수정 같은 시스템 작업. `WOOWA_SESSION_MODE=development` set 후 후속 명령 호출 (또는 개별 `bin/ask`에 `--session-mode development`). personalization stream에서 자동 제외.
 
 ## License
 

@@ -39,6 +39,8 @@ _ask_fast() {
   state_root=""
   reformulated_query=""
   route_mode=""
+  raw_utterance=""
+  session_mode_explicit=""
   json_mode=0
   json_route=0
   shift
@@ -49,6 +51,8 @@ _ask_fast() {
       --state-root) [ "$#" -ge 2 ] || return 1; state_root="$2"; shift 2 ;;
       --reformulated-query) [ "$#" -ge 2 ] || return 1; reformulated_query="$2"; shift 2 ;;
       --mode) [ "$#" -ge 2 ] || return 1; route_mode="$2"; shift 2 ;;
+      --raw-utterance) [ "$#" -ge 2 ] || return 1; raw_utterance="$2"; shift 2 ;;
+      --session-mode) [ "$#" -ge 2 ] || return 1; session_mode_explicit="$2"; shift 2 ;;
       --json) json_mode=1; shift ;;
       --json-route) json_route=1; shift ;;
       --no-daemon) return 1 ;;
@@ -70,7 +74,7 @@ _ask_fast() {
     learner_id="$(_ask_identity_from_state_root "$identity_root" 2>/dev/null || printf default)"
   fi
 
-  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "$route_mode" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
+  for value in "$prompt" "$repo" "$learner_id" "$state_root" "$reformulated_query" "$route_mode" "$raw_utterance" "$session_mode_explicit" "${WOOWA_SESSION_MODE:-learning}" "${WOOWA_REFORMULATE:-}"; do
     _ask_json_safe "$value" || return 1
   done
   [ -S "$sock_path" ] || return 1
@@ -80,12 +84,23 @@ _ask_fast() {
   else
     action="ask_text"
   fi
-  mode="${WOOWA_SESSION_MODE:-learning}"
+  # Session mode + provenance resolved here so the daemon never re-guesses from
+  # env: explicit --session-mode wins, else env, else conservative learning.
+  if [ -n "$session_mode_explicit" ]; then
+    mode="$session_mode_explicit"
+    mode_source="explicit"
+  elif [ -n "${WOOWA_SESSION_MODE:-}" ]; then
+    mode="$WOOWA_SESSION_MODE"
+    mode_source="env"
+  else
+    mode="learning"
+    mode_source="default"
+  fi
   reformulation="${WOOWA_REFORMULATE:-}"
-  payload=$(printf '{"action":"%s","query":"%s","repo":%s,"learner_id":"%s","mode":"%s","reformulation":%s,"json_route":%s,"reformulated_query":%s,"route_mode":%s}\n' \
-    "$action" "$prompt" "$(_ask_json_value "$repo")" "$learner_id" "$mode" \
+  payload=$(printf '{"action":"%s","query":"%s","repo":%s,"learner_id":"%s","mode":"%s","mode_source":"%s","reformulation":%s,"json_route":%s,"reformulated_query":%s,"route_mode":%s,"raw_utterance":%s}\n' \
+    "$action" "$prompt" "$(_ask_json_value "$repo")" "$learner_id" "$mode" "$mode_source" \
     "$(_ask_json_value "$reformulation")" "$json_route" "$(_ask_json_value "$reformulated_query")" \
-    "$(_ask_json_value "$route_mode")")
+    "$(_ask_json_value "$route_mode")" "$(_ask_json_value "$raw_utterance")")
   response=$(printf '%s' "$payload" | nc -U -w 30 "$sock_path" 2>/dev/null) || return 1
   [ -n "$response" ] || return 1
   printf '%s\n' "$response"
@@ -114,12 +129,14 @@ TIMEOUT_S = 30
 def parse_argv(argv):
     """Minimal argv parser — faster than argparse for hot path."""
     if not argv or argv[0] in ("-h", "--help"):
-        print("Usage: bin/ask <prompt> [--repo R] [--learner-id L] [--mode M] [--json-route] [--no-daemon]",
+        print("Usage: bin/ask <prompt> [--repo R] [--learner-id L] [--mode M] "
+              "[--raw-utterance U] [--session-mode S] [--json-route] [--no-daemon]",
               file=sys.stderr)
         return None
     out = {"prompt": argv[0], "repo": None, "learner_id": None,
            "json_route": False, "no_daemon": False, "state_root": None,
-           "json_mode": False, "reformulated_query": None, "route_mode": None}
+           "json_mode": False, "reformulated_query": None, "route_mode": None,
+           "raw_utterance": None, "session_mode": None}
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -133,6 +150,10 @@ def parse_argv(argv):
             out["reformulated_query"] = argv[i + 1]; i += 2
         elif a == "--mode" and i + 1 < len(argv):
             out["route_mode"] = argv[i + 1]; i += 2
+        elif a == "--raw-utterance" and i + 1 < len(argv):
+            out["raw_utterance"] = argv[i + 1]; i += 2
+        elif a == "--session-mode" and i + 1 < len(argv):
+            out["session_mode"] = argv[i + 1]; i += 2
         elif a == "--json":
             out["json_mode"] = True; i += 1
         elif a == "--json-route":
@@ -153,14 +174,22 @@ def daemon_ask(args):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(TIMEOUT_S)
         sock.connect(sock_path)
+        if args.get("session_mode"):
+            mode, mode_source = args["session_mode"], "explicit"
+        elif os.environ.get("WOOWA_SESSION_MODE"):
+            mode, mode_source = os.environ["WOOWA_SESSION_MODE"], "env"
+        else:
+            mode, mode_source = "learning", "default"
         req_payload = {"action": "ask", "query": args["prompt"],
                        "repo": args["repo"], "learner_id": args["learner_id"],
-                       "mode": os.environ.get("WOOWA_SESSION_MODE", "learning"),
+                       "mode": mode, "mode_source": mode_source,
                        "reformulation": os.environ.get("WOOWA_REFORMULATE")}
         if args.get("reformulated_query"):
             req_payload["reformulated_query"] = args["reformulated_query"]
         if args.get("route_mode"):
             req_payload["route_mode"] = args["route_mode"]
+        if args.get("raw_utterance"):
+            req_payload["raw_utterance"] = args["raw_utterance"]
         req = json.dumps(req_payload) + "\n"
         sock.sendall(req.encode("utf-8"))
         data = b""

@@ -67,3 +67,25 @@ def test_eval_compare_supports_legacy_skip_when_path_missing(tmp_path: Path) -> 
     runs = json.loads(out.with_suffix(".runs.json").read_text())
     assert runs[0]["legacy"]["returncode"] == -1
     assert "not found" in runs[0]["legacy"]["stderr"]
+
+
+def test_dev_tool_ask_probes_are_labeled_development() -> None:
+    """Regression guard for the history-contamination leak: every dev/eval tool
+    that sends a daemon `ask` must declare development session-mode, otherwise
+    its probe queries land in the learner's `learning` history (the daemon
+    defaults req-less asks to its own env, which is `learning` on the prod
+    daemon). This is what mislabeled `gradle daemon stop` etc. as learning."""
+    # eval-compare shells out through bin/ask CLI
+    eval_compare = (REPO_ROOT / "bin" / "eval-compare").read_text(encoding="utf-8")
+    assert '"--session-mode", "development"' in eval_compare
+    # direct-socket callers set req["mode"] themselves
+    for rel in (
+        "bin/cohort-eval",
+        "tests/benchmarks/uncovered_scenarios.py",
+        "tests/benchmarks/uncovered_scenarios_phase_n.py",
+        "tests/benchmarks/deep_scenarios_phase_p.py",
+        "tests/benchmarks/daemon_latency.py",
+    ):
+        src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert '"development"' in src, rel
+        assert '"mode_source": "explicit"' in src, rel

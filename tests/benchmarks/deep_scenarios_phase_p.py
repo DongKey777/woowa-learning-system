@@ -53,7 +53,8 @@ def daemon_ask(prompt, repo=None, learner_id="default", state_root=STATE):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(60)
         sock.connect(sock_path)
-        req = {"action": "ask", "query": prompt, "learner_id": learner_id}
+        req = {"action": "ask", "query": prompt, "learner_id": learner_id,
+               "mode": "development", "mode_source": "explicit"}
         if repo:
             req["repo"] = repo
         sock.sendall((json.dumps(req) + "\n").encode("utf-8"))

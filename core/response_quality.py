@@ -107,6 +107,7 @@ def record_response_quality(
     now: float | None = None,
     append_event: bool = True,
     mode: str | None = None,
+    mode_source: str | None = None,
     capture_method: str | None = None,
     capture_input_chars: int | None = None,
 ) -> dict:
@@ -117,6 +118,11 @@ def record_response_quality(
     """
     ts = now or time.time()
     event_mode = mode or os.environ.get("WOOWA_SESSION_MODE", "learning")
+    # Inherited from the source rag_ask event when captured via hook; legacy/
+    # direct callers fall back to the same observation the daemon uses.
+    event_mode_source = mode_source or (
+        "env" if os.environ.get("WOOWA_SESSION_MODE") else "default"
+    )
     flags = set(quality_flags or [])
     cflags = list(contract_flags or [])
 
@@ -151,6 +157,7 @@ def record_response_quality(
         "turn_id": turn_id or f"turn-{uuid.uuid4().hex[:12]}",
         "repo": repo,
         "mode": event_mode,
+        "mode_source": event_mode_source,
         "learner_id": learner_id,
         "response_summary": (response_summary or "")[:300],
         "response_excerpt": excerpt,
@@ -179,6 +186,7 @@ def record_response_quality(
             "event_id": f"response_quality-{int(ts * 1000)}-{uuid.uuid4().hex[:6]}",
             "event_type": "response_quality",
             "mode": event_mode,
+            "mode_source": event_mode_source,
             "ts": ts,
             "learner_id": learner_id,
             "repo": repo,

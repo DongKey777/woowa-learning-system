@@ -142,6 +142,50 @@ def test_record_response_quality_persists_session_mode(monkeypatch, tmp_path: Pa
     assert event["mode"] == "development"
 
 
+def test_record_response_quality_mode_source_explicit(monkeypatch, tmp_path: Path) -> None:
+    # Explicit mode + provenance (e.g. inherited from the source rag_ask event)
+    # wins over env, and is recorded on both the row and the history event.
+    monkeypatch.setenv("WOOWA_SESSION_MODE", "learning")
+    state = tmp_path
+    (state / "learner").mkdir(parents=True)
+
+    row = record_response_quality(
+        source_event_id="ask-ms", response_summary="x", response_body="body",
+        mode="development", mode_source="backfill_reclassified", state_root=state,
+    )
+
+    event = json.loads((state / "learner" / "history.jsonl").read_text().strip())
+    assert row["mode"] == "development"
+    assert row["mode_source"] == "backfill_reclassified"
+    assert event["mode_source"] == "backfill_reclassified"
+
+
+def test_record_response_quality_mode_source_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("WOOWA_SESSION_MODE", "development")
+    state = tmp_path
+    (state / "learner").mkdir(parents=True)
+
+    row = record_response_quality(
+        source_event_id="ask-env", response_summary="x", response_body="body",
+        state_root=state,
+    )
+    assert row["mode"] == "development"
+    assert row["mode_source"] == "env"
+
+
+def test_record_response_quality_mode_source_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("WOOWA_SESSION_MODE", raising=False)
+    state = tmp_path
+    (state / "learner").mkdir(parents=True)
+
+    row = record_response_quality(
+        source_event_id="ask-def", response_summary="x", response_body="body",
+        state_root=state,
+    )
+    assert row["mode"] == "learning"
+    assert row["mode_source"] == "default"
+
+
 def test_record_response_quality_keeps_five_thousand_char_excerpt(tmp_path: Path) -> None:
     state = tmp_path
     (state / "learner").mkdir(parents=True)

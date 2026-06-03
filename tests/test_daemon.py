@@ -84,6 +84,15 @@ def test_rag_ask_event_records_learner_identity_and_repo() -> None:
     assert "record_turn(event, state_root=state_root)" in src
 
 
+def test_rag_ask_event_records_raw_utterance_and_mode_source() -> None:
+    src = inspect.getsource(daemon.serve)
+    # Part A: raw learner utterance logged alongside the session-rewritten prompt
+    assert '"raw_utterance": req.get("raw_utterance") or None' in src
+    # Part B: mode provenance resolved from request, recorded on the event
+    assert 'event_mode_source = req.get("mode_source")' in src
+    assert '"mode_source": event_mode_source' in src
+
+
 def test_render_ask_stdout_matches_cli_text_shape() -> None:
     text = daemon._render_ask_stdout({
         "markdown": "# prompt",

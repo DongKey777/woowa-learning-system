@@ -63,11 +63,10 @@ def daemon_ask(prompt: str, repo: str | None = None,
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(30)
         sock.connect(sock_path)
-        req: dict = {"action": "ask", "query": prompt, "learner_id": learner_id}
+        req: dict = {"action": "ask", "query": prompt, "learner_id": learner_id,
+                     "mode": mode or "development", "mode_source": "explicit"}
         if repo:
             req["repo"] = repo
-        if mode:
-            req["mode"] = mode
         sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
         data = b""
         while True:
