@@ -38,7 +38,7 @@ bin/setup
 - `bin/setup`이 repo-local `.venv`를 만들고 그 안에 `pip install -e .`를 실행한다. macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라 시스템에 직접 `pip install`이 거부되므로, venv가 마찰 없는 경로다 (`--break-system-packages` 불필요).
 - 설치 후 `bin/` 명령들은 `core/_venv.py` 가드를 통해 `.venv`를 자동 사용한다 — 학습자/AI가 venv를 의식할 필요 없음. `.venv`가 없으면 가드는 no-op (시스템 Python에 deps가 이미 있는 maintainer 환경은 그대로).
 - 핵심 deps: `sentence-transformers` (BGE-M3 wrapper), `transformers`, `torch` (MPS on M-series), `lancedb`, `numpy`, `pyarrow`, `jsonschema`. BGE-M3는 transformers + sentence-transformers로 로드한다 (FlagEmbedding은 RunPod 빌드 전용, 학습자 dep 아님).
-- Mode B (시스템 개발)는 `bin/setup --dev`로 pytest까지 설치.
+- Mode B (시스템 개발)는 `bin/setup --dev`로 pytest, pandas, pylance 등 전체 테스트 의존성까지 설치.
 
 ### Step 2. HuggingFace 모델 캐시 warm-up
 - 첫 daemon 시작 시 `BAAI/bge-m3` (~3GB) 자동 다운로드.
@@ -133,6 +133,7 @@ python3 bin/ask "테스트"
 - summary-only에서는 본문 인용을 검증할 수 없으므로 `declared_citation_unverified`가 남는다.
 - 정상 full-body 수집 시 `response-quality.jsonl.response_excerpt`에는 redacted prefix(최대 5000자), `response_body_path`에는 redacted full body 파일 경로가 저장된다.
 - full body 파일은 redacted content hash 기반으로 dedupe 저장된다. 같은 본문을 여러 turn에서 수집해도 파일은 한 번만 쓴다.
+- `bin/learn-response-quality` fallback이 full body를 저장하면 같은 `source_event_id`의 pending capture도 즉시 `captured`로 갱신한다. 오래 남은 pending은 `bin/capture-repair --sync-pending`으로 `response-quality.jsonl` 기준 재동기화한다.
 
 ### 4.2.2 모드 카탈로그 (AI가 `--mode`로 직접 선택)
 
@@ -162,11 +163,11 @@ python3 bin/ask "테스트"
 `tool_only`/`tier_0_fallback`은 AI가 직접 고르지 않는다(전자는 force-token, 후자는 guard 결과).
 
 ### 4.3 학습자 코드 작성/수정 시
-다음 조건 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:
+다음 조건 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
 - Claude가 학습자 미션 파일을 실제로 수정/생성한 경우 (Write/Edit tool)
 - 학습자가 명시적으로 파일 경로 지목해 검토 요청 (*"`Reservation.java` 어때?"*)
 
-"코드 어때?" 단독은 트리거하지 않음 (파일 path 불명확).
+`missions/<repo>/...` 경로에서는 repo를 자동 추론한다. "코드 어때?" 단독은 트리거하지 않음 (파일 path 불명확).
 
 ### 4.4 Drill / Self-assessment
 - daemon `ask`가 drill mode dispatch + `drill_offer` artifact 포함 시 → 학습자에게 question surface.
@@ -275,7 +276,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | 학습자 발화 / 행동 | AI 자동 호출 |
 |---|---|
 | *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
-| Write/Edit a `missions/<r>/**/*.java` file | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M [--linked-test C.M] --silent` |
+| Write/Edit a `missions/<r>/**/*.java` file | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M [--linked-test C.M] --silent` (`missions/<r>/...` 경로에서 repo 자동 추론) |
 | 학습자가 `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
 | 매 coach turn 답변 직후 (필수) | hook 가능 시 `bin/capture-response`; hook 불가 시 `bin/learn-response-quality --source-event-id <id> --response-path <answer.md>` 또는 `--response-file -` |
 | 학습자가 미션 repo onboarded 후 첫 coaching 진입 시 | `bin/assess-learner-state --repo <r> --path missions/<r> --learner-login <l> --silent` |
@@ -291,7 +292,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 ### 5.1 모든 작업
 - `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령 (또는 개별 `bin/ask` 호출에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨된다.
 - 변경은 commit 기반 reproducible. 측정 결과는 로컬 `reports/`에 저장 (gitignored — public clone에 안 들어감). 헤드라인 metric은 `docs/verification-results.md`에 inline로 정리한다.
-- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 523 passed 유지.
+- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 696 passed 유지.
 
 ### 5.2 측정 명령
 ```bash

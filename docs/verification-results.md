@@ -1,10 +1,42 @@
-# Verification results — corpus 확장·심화 (dense v1.0.3) + retrieval 재설계 (Pillar 0+2) + historical phase results
+# Verification results — current operations + corpus/retrieval historical phase results
 
-최신 측정 날짜: 2026-05-31
+최신 측정 날짜: 2026-06-09
 브랜치: `main`
-기준: 직전 cycle에서 retrieval 구조(Pillar 0+2)를 배포해 검색 병목을 해소한 뒤, 이번 cycle은 **코퍼스 콘텐츠**를 확장·심화했다. 14개 작성 사이클(`auto/corpus-expand`)로 11개 카테고리 전반에 신규 개념 11개 + thin-body 심화 + 학습자 재질문 클러스터 enrich + 코퍼스 전체 summary 복구를 누적하고, **dense 인덱스를 1회 재빌드(3350 concepts)** 해 release `paradigm-v2-index-v1.0.3`으로 배포했다. 직전 기준선은 index v1.0.2(3339 concepts)다.
+기준: 2026-06-09에는 학습 telemetry와 PR archive 운영 상태를 정비하고, 코드 변경 사항을 full pytest + state health gate로 검증했다. 2026-05-31 corpus/retrieval release 결과는 아래 historical section으로 보존한다.
 
-## 0. 최신 — Corpus 확장·심화 + dense index v1.0.3 (2026-05-31)
+## 0. 최신 — telemetry/archive maintenance verification (2026-06-09)
+
+### 0.1 한 줄 요약
+
+학습 시스템 운영 데이터의 정합성을 정리했다. `learn-response-quality` fallback이 full body를 저장하면 pending capture도 즉시 `captured`로 갱신하도록 했고, 기존 stale pending은 `capture-repair --sync-pending`으로 재동기화했다. `learn-record-code`는 `missions/<repo>/...` 경로에서 repo를 자동 추론하도록 보강했고, 기존 `code_attempt` 29건도 repo 누락을 backfill했다. `spring-roomescape-waiting` PR archive는 라이브 재동기화 후 stale interrupted run을 failed로 정리했다.
+
+### 0.2 검증 결과
+
+| Gate | 결과 |
+|---|---:|
+| Unit tests | **696 passed** (`.venv/bin/python -m pytest tests/ -q`) |
+| Focused regression | **45 passed** (`test_code_event.py`, `test_response_capture.py`, `test_response_quality.py`) |
+| `bin/repo-readiness --repo spring-roomescape-waiting` | **4/4 ready**, cross-crew anchors **31** |
+| `bin/validate-state` | **ok** |
+| `bin/doctor` | **6/6 healthy** |
+| `bin/learning-turn-audit --last 50` | **0 issues** |
+
+### 0.3 데이터 정합성 정리
+
+| 영역 | 처리 결과 |
+|---|---:|
+| PR archive sync (`spring-roomescape-waiting`) | run 19 succeeded, **91 PRs**, **2190 review comments** |
+| stale collection run cleanup | interrupted run 18 → `failed` 처리, SQLite integrity ok, journal 없음 |
+| pending capture sync | checked **580**, synced **40**, skipped_missing_body **0** |
+| pending capture status after sync | captured **166**, superseded **409**, pending **5** |
+| `code_attempt` repo backfill | missing repo **29 → 0**, total **50** all mapped to `spring-roomescape-waiting` |
+| derived artifacts rebuilt | profile, meta_analytics, learning_path, memory_review, cross_mission, pr_review, pr_meta, thread_recon, temporal, reviewer_profile |
+
+### 0.4 남은 관찰
+
+`bin/learning-turn-audit --last 200 --strict`에는 2026-05월의 오래된 품질 이슈 16건이 남아 있다. 최신 50턴 audit은 0건이고, 이번 정비 범위에서는 현재 운영 경로의 pending/full-body/code_attempt/archive 정합성만 대상으로 삼았다.
+
+## 1. 이전 — Corpus 확장·심화 + dense index v1.0.3 (2026-05-31)
 
 ### 0.1 한 줄 요약
 
@@ -162,15 +194,15 @@ bin/cohort-compare --control reports/baseline_real.json --candidate reports/depl
 bin/cohort-eval --qrels tests/fixtures/r3_qrels_real_v1.json --out reports/deploy_synth.json
 bin/cohort-compare --control reports/baseline_synth.json --candidate reports/deploy_synth.json --fail-on-drift
 bin/golden verify && bin/router-generalization-eval
-WOOWA_SESSION_MODE=development python3 -m pytest tests/ -q   # 523 passed
+WOOWA_SESSION_MODE=development python3 -m pytest tests/ -q   # 당시 523 passed
 ```
 `reports/`는 gitignored(baseline/deploy/sweep/auto_loop_log 산출물). chunk 인덱스 롤백 불필요(미배포). 코드 롤백은 `b2a5406` 또는 main merge revert.
 
-## 1. 한 줄 요약
+## 2. Y14 closure historical snapshot
 
 Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prerequisite edges**, broken edge **0** 상태로 닫았다. Batch 1-7 qrels prompt/reformulated 14세트는 strict top1/top5/MRR/NDCG **1.000**, forbidden **0**, latency p95 최대 **3.6ms**다. Remote dense index는 H100 secure에서 빌드했고, archive SHA256은 `d8da5782c6fdceeec34e541a30e511bf2f8d168c01dab4e47dfefcde641921dc`, Lance size는 **13.40MB**, archive size는 **18.7MB**다. Corpus readiness는 **ready=true / rebuild_needed=false**이고, full pytest는 **523 passed**다.
 
-## 1.1 Latest Y14 Snapshot
+## 2.1 Historical Y14 Snapshot
 
 | 축 | 최신 결과 |
 |---|---:|
@@ -182,7 +214,7 @@ Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prer
 | index archive | **v1.0.2, 18.7MB, sidecars=true, SHA256 d8da5782...** |
 | remote build | **H100 secure, encode 9.2s, Lance 13.40MB** |
 
-## 1.2 Latest Y13 Release Snapshot
+## 2.2 Historical Y13 Release Snapshot
 
 | 축 | 최신 결과 |
 |---|---:|
@@ -203,7 +235,7 @@ Y14 corpus closure는 corpus **3339 concepts**, `concept_graph.json` **6172 prer
 
 Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file=...)` fast path로 대체했다. AutoTokenizer rollback은 `WOOWA_ENCODER_TOKENIZER_BACKEND=auto`이며, parity report는 input ids/masks 동일 + vector cosine min/mean **1.0/1.0**, max_abs_diff **0.0**이다. Y13-K6에서는 qrels strict 지표와 learner-relevant 지표를 분리하고, AF_UNIX line-delimited protocol에서 불필요한 client `shutdown(SHUT_WR)`를 제거했다. Y13-K7~K18에서는 lexical/title promotion, executable `bin/ask` fast path, search-result cache, override keyword routing, F11 Stage 4 veto prompt, exact normalization, corpus ownership 보강, remote-build provenance guard, latency hardening, corpus readiness gate, stale gold 정정, index archive verification을 순차 적용했다. 최종 qrels strict top1/learner top1/MRR은 **1.000/1.000/1.000**, NDCG@5는 **0.987**, p50/p95는 **176.1/278.6ms**다. 최신 14개 일반 시나리오 p50/p95는 **48.8/71.5ms**다.
 
-## 1.3 Latest Fresh Onboarding Snapshot
+## 2.3 Historical Fresh Onboarding Snapshot
 
 | 축 | 최신 결과 |
 |---|---:|
@@ -320,7 +352,7 @@ Y13-K5에서 AutoTokenizer resolution을 `PreTrainedTokenizerFast(tokenizer_file
 cd /Users/idonghun/IdeaProjects/woowa-learning-system
 export WOOWA_SESSION_MODE=development
 
-# 1. Unit tests (latest 523 passed)
+# 1. Unit tests (current 696 passed)
 python3 -m pytest tests/ -q
 
 # 2. All 14 phase benches (J/K/L/M/N/P + T-X) via master runner

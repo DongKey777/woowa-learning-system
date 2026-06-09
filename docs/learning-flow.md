@@ -45,8 +45,8 @@ Bean DI는 Spring 컨테이너가 객체를 관리하고 협력 객체를 외부
 
 **자동 후속**:
 - daemon이 `history.jsonl`에 `rag_ask` 이벤트 append (mode=cs_qa, top_concept_ids=[…], latency_ms=N) + pending capture 생성. 다음 turn의 personalization에 반영.
-- Claude/Codex/Gemini hook이 답변 직후 `bin/capture-response`를 호출해 최종 답변 본문 전체를 저장. hook이 없으면 `bin/learn-response-quality --response-path` / `--response-file -` fallback을 사용한다.
-- 수집 실패는 답변을 막지 않고 repair queue에 남긴다. 필요 시 한 줄만 안내: *"학습 기록 저장은 나중에 자동 보정할게."*
+- Claude/Codex/Gemini hook이 답변 직후 `bin/capture-response`를 호출해 최종 답변 본문 전체를 저장. hook이 없으면 `bin/learn-response-quality --response-path` / `--response-file -` fallback을 사용하고, full body가 저장되면 pending capture도 함께 `captured`로 닫힌다.
+- 수집 실패는 답변을 막지 않고 repair queue에 남긴다. 오래 남은 pending은 `bin/capture-repair --sync-pending`으로 재동기화한다. 필요 시 한 줄만 안내: *"학습 기록 저장은 나중에 자동 보정할게."*
 - full body는 `state/learner/response-bodies/sha256/`에 redacted content hash 기준으로 dedupe 저장되고, `response-quality.jsonl` row가 `source_event_id`로 `rag_ask`와 join된다.
 
 ---
@@ -97,7 +97,7 @@ prompt 일부:
 - spring/transactional-basics
 ```
 
-**자동 후속**: 학습자가 코드 수정 시 AI가 `bin/learn-event --event-type code_attempt --concept-ids spring/mvc-controller-basics --silent` 자동 호출. mastery_graph에 evidence 누적.
+**자동 후속**: 학습자가 코드 수정 시 AI가 `bin/learn-record-code --file-path missions/<repo>/... --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출. repo는 `missions/<repo>/...` 경로에서 자동 추론되고, mastery_graph에 evidence가 누적된다.
 
 ---
 
@@ -332,7 +332,7 @@ bin/pr-thread-status --repo spring-roomescape-waiting --pr 391 --silent
 AI 세션이 자동으로:
 1. `bin/ask` (매 turn)
 2. `bin/capture-response` (hook-first full body capture; hook 불가 시 `bin/learn-response-quality` fallback)
-3. `bin/learn-event` (학습자 코드 수정 / drill 답변 / pending 응답 시)
+3. `bin/learn-record-code` / `bin/learn-event` (학습자 코드 수정 / drill 답변 / pending 응답 시)
 4. `bin/mission-patterns-build` / `bin/cross-crew-build` (학습자가 mission repo 분석 의도 표현 시 1회)
 5. `bin/rag-daemon start` (첫 진입 시)
 6. (Mode B) 측정 명령들 (학습자가 "회귀 측정", "코퍼스 확장" 같은 시스템 의도 표현 시)

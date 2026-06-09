@@ -197,6 +197,73 @@ def supersede_older_pending_captures(
     return count
 
 
+def sync_pending_captures_from_quality(
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+) -> dict[str, int]:
+    """Mark pending capture files as captured when quality telemetry exists.
+
+    Manual ``bin/learn-response-quality`` calls write response-quality rows
+    directly. If the hook-created pending file is not updated in the same path,
+    audits can report a stale pending capture even though the full body was
+    already stored. The response-quality log is the stronger source of truth.
+    """
+    quality_path = state_root / "learner" / "response-quality.jsonl"
+    root = pending_capture_dir(state_root)
+    if not quality_path.exists() or not root.exists():
+        return {"checked": 0, "synced": 0, "skipped_missing_body": 0}
+
+    latest_quality: dict[str, dict[str, Any]] = {}
+    for line in quality_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        sid = row.get("source_event_id")
+        if isinstance(sid, str) and sid.strip():
+            latest_quality[sid] = row
+
+    checked = 0
+    synced = 0
+    skipped_missing_body = 0
+    for path in root.glob("*.json"):
+        try:
+            pending = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(pending, dict):
+            continue
+        checked += 1
+        if pending.get("status") == "captured":
+            continue
+        sid = pending.get("source_event_id")
+        quality = latest_quality.get(sid)
+        if not quality:
+            continue
+        body_path = quality.get("response_body_path")
+        if not body_path:
+            skipped_missing_body += 1
+            continue
+        pending["status"] = "captured"
+        pending["updated_at"] = time.time()
+        pending["captured_at"] = quality.get("logged_at")
+        pending["response_body_path"] = body_path
+        pending["quality_flags"] = list(quality.get("quality_flags") or [])
+        pending["synced_from_response_quality"] = True
+        _atomic_write_json(path, pending)
+        synced += 1
+
+    return {
+        "checked": checked,
+        "synced": synced,
+        "skipped_missing_body": skipped_missing_body,
+    }
+
+
 def load_source_event(
     source_event_id: str,
     *,

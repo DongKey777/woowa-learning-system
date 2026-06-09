@@ -29,10 +29,10 @@
 ### Step 1. 의존성
 ```bash
 bin/setup          # 학습자 (Mode A)
-bin/setup --dev    # 시스템 개발 (Mode B, pytest 포함)
+bin/setup --dev    # 시스템 개발 (Mode B, pytest+pandas+pylance 포함)
 ```
 `bin/setup`은 repo-local `.venv`를 만들고 그 안에 `pip install -e .`를 실행한다. macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라 시스템 직접 설치가 거부되므로 venv가 마찰 없는 경로다 (`--break-system-packages` 불필요). 설치 후 `bin/` 명령들은 `core/_venv.py` 가드로 `.venv`를 자동 사용하고, `.venv`가 없으면 가드는 no-op.
-deps: `sentence-transformers`, `transformers`, `lancedb`, `numpy`, `pyarrow`, `jsonschema`, `torch`. (BGE-M3는 transformers + sentence-transformers로 로드 — `FlagEmbedding`은 RunPod 빌드 전용, 학습자 dep 아님.)
+deps: `sentence-transformers`, `transformers`, `lancedb`, `numpy`, `pyarrow`, `jsonschema`, `torch`. dev extra는 `pytest`, `pandas`, `pylance`를 추가한다. (BGE-M3는 transformers + sentence-transformers로 로드 — `FlagEmbedding`은 RunPod 빌드 전용, 학습자 dep 아님.)
 
 ### Step 2. HF 모델 캐시
 - 첫 daemon 시작 때 `BAAI/bge-m3` (~3GB) 자동 fetch. offline = `export HF_HUB_OFFLINE=1`.
@@ -110,17 +110,18 @@ python3 bin/ask "테스트"
 - summary-only에서는 본문 인용을 검증할 수 없으므로 `declared_citation_unverified`가 남는다.
 - 정상 full-body 수집 시 `response-quality.jsonl.response_excerpt`에는 redacted prefix(최대 5000자), `response_body_path`에는 redacted full body 파일 경로가 저장된다.
 - full body 파일은 redacted content hash 기반으로 dedupe 저장된다. 같은 본문을 여러 turn에서 수집해도 파일은 한 번만 쓴다.
+- `bin/learn-response-quality` fallback이 full body를 저장하면 같은 `source_event_id`의 pending capture도 즉시 `captured`로 갱신한다. 오래 남은 pending은 `bin/capture-repair --sync-pending`으로 `response-quality.jsonl` 기준 재동기화한다.
 
 ### 4.2.2 모드 카탈로그 (AI가 `--mode`로 직접 선택)
 
 키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). AI 세션이 발화 의미를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로, 키워드 router는 deterministic fallback. 모드 목록과 선택 기준은 CLAUDE.md §4.2.2와 동일하다 — `cs_qa` / `coaching` / `drill` / `self_assess` / `retro` / `pr_diff_evolution`(코드 변화·리뷰 반영) / `cross_mission`(미션 간 개념·반복 실수) / `memory_review`(사각지대·복습) / `pr_review`(받은 리뷰) / `reviewer_profile`(멘토 성향) / `learning_path`(다음 학습) / `pr_meta`(PR 품질·크기) / `thread_recon`(스레드 복원) / `temporal`(시간축) / `meta_analytics`(학습 메타) / `cohort`(동기 비교) / `predict`(리뷰 미리 보기) / `f11_anchor`(cross-crew). `tool_only`/`tier_0_fallback`은 직접 고르지 않는다.
 
 ### 4.3 학습자 코드 작성/수정 시
-다음 둘 중 하나면 `bin/learn-event --event-type code_attempt --concept-ids <ids> --silent` 자동 호출:
+다음 둘 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
 1. AI가 학습자 미션 파일 실제 수정/생성 (예: Codex apply diff)
 2. 학습자가 명시적으로 file path 지목해 검토 요청
 
-"코드 어때?" 단독 (path 불명확)은 트리거 X.
+`missions/<repo>/...` 경로에서는 repo를 자동 추론한다. "코드 어때?" 단독 (path 불명확)은 트리거 X.
 
 ### 4.4 Drill / Self-assessment
 - daemon 응답에 `drill_offer` artifact 포함 시 → question 학습자에게 surface
@@ -142,7 +143,7 @@ python3 bin/ask "테스트"
 | *"리뷰 응답 도와줘"* (진행 중) | `bin/pr-thread-status --repo <r> --pr <N> --silent`로 미답변 스레드(`diff_hunk`·멘토 원문 포함) 확인 후 **세션이 직접** 대화체 초안 작성 (답글 문구 시스템 생성 X) |
 | *"내 PR 흐름"*, *"회고"* (진행 중 사이클) | `bin/learn-pr-retro --repo <r> --live` (stale "미해결"을 라이브 status로 정정) |
 | *"내 PR 흐름"*, *"반복 멘토 지적"*, *"회고"* (머지 후) | `bin/learn-pr-retro --repo <r> --learner-login <l> --silent` |
-| 학습자 미션 Java 파일 Write/Edit | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` |
+| 학습자 미션 Java 파일 Write/Edit | `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` (`missions/<r>/...` 경로에서 repo 자동 추론) |
 | `./gradlew test` 결과 mention | `bin/learn-test --path missions/<r>/build/test-results/test/ --repo <r> --silent` |
 | 매 coach turn 답변 직후 | hook 가능 시 `bin/capture-response`; hook 불가 시 `bin/learn-response-quality --source-event-id <id> --response-path <answer.md>` 또는 `--response-file -` |
 | 미션 repo onboarded 후 첫 진입 | `bin/assess-learner-state --repo <r> --path missions/<r> --silent` |
@@ -167,7 +168,7 @@ CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set (또는 개별 `bin/ask`에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨.
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 523 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 696 passed 유지)
 
 ### 5.2 측정 명령
 ```bash

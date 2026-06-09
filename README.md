@@ -32,7 +32,7 @@
    - `bin/rag-daemon start-bg` 백그라운드
 5. 학습자는 한국어로 질문만 던지면 됨. *"Bean DI가 뭐야"*, *"내 ReservationController 어떻게 리팩토링"*, *"다른 크루는 어떻게 작성했어"*, *"확인 질문 줘"* 등.
 
-AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex/Gemini hook 환경에서는 `bin/capture-response`가 최종 답변 전체를 pending `rag_ask`에 자동 연결한다. 수집 실패는 학습 흐름을 막지 않고 repair queue에 남기며, 필요하면 *"학습 기록 저장은 나중에 자동 보정할게."* 정도로만 짧게 안내한다. hook이 없는 환경은 `--response-path <answer.md>` 또는 `--response-file -` fallback을 사용한다. 저장된 본문 파일은 redacted content hash 기준으로 dedupe된다.
+AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex/Gemini hook 환경에서는 `bin/capture-response`가 최종 답변 전체를 pending `rag_ask`에 자동 연결한다. hook이 없는 환경은 `bin/learn-response-quality --response-path <answer.md>` 또는 `--response-file -` fallback을 사용하고, full body가 저장되면 같은 `source_event_id`의 pending capture도 자동으로 `captured` 상태가 된다. 오래 남은 pending은 `bin/capture-repair --sync-pending`으로 `response-quality.jsonl` 기준 재동기화한다. 수집 실패는 학습 흐름을 막지 않고 repair queue에 남기며, 필요하면 *"학습 기록 저장은 나중에 자동 보정할게."* 정도로만 짧게 안내한다. 저장된 본문 파일은 redacted content hash 기준으로 dedupe된다.
 
 > **🚫 학습자 기기에서 인덱스 빌드 금지** — `bin/corpus-build`는 15-30분 + 4-6GB peak RAM이라 학습 흐름 차단. 새 인덱스 버전은 maintainer가 RunPod에서 빌드 후 GitHub Releases에 publish, 학습자는 `bin/index-fetch --tag <new>` 로만 업데이트.
 
@@ -43,15 +43,18 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 
 두 문서는 동일한 First-Run Protocol + system contract를 포함, 톤만 다름.
 
-## 검증 상태 (2026-05-28)
+## 검증 상태 (2026-06-09)
 
 | Gate | 결과 |
 |---|---|
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
 | Y14 corpus closure qrels | **14/14 top1=1.000, p95≤3.6ms ✅** |
-| Unit tests | **523 passed** |
-| Runtime LOC budget | **9574 / 9700 ✅** |
+| Unit tests | **696 passed** |
+| System health | `doctor` **6/6**, `validate-state` **ok** |
+| Mission readiness (`spring-roomescape-waiting`) | **4/4 ready**, cross-crew anchors **31** |
+| PR archive sync (`spring-roomescape-waiting`) | **91 PRs**, review comments **2190** |
+| Capture maintenance | stale pending **40 synced**, latest audit last 50 **0 issues** |
 | Index release artifact | **18.7MB, SHA256 검증 ✅** |
 
 자세한 결과 → [`docs/verification-results.md`](docs/verification-results.md)
@@ -118,7 +121,7 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 학습자가 같은 AI 세션에서 미션 학습(Mode A)과 시스템 개발(Mode B)을 섞으면 personalization 데이터가 오염됨. AI 세션이 의도를 읽고 모드를 **명시 선언**한다(`bin/ask --session-mode learning|development`, provenance `explicit`) — 명시가 없으면 `WOOWA_SESSION_MODE` env(`env`), 그것도 없으면 보수적 `learning`(`default`). 이 출처는 이벤트 `mode_source`에 남는다:
 
 - **Mode A (learning, 기본값)**: 미션 코딩, 개념 질문, drill, coaching. `code_attempt` 이벤트가 `learning` 모드로 기록되어 mastery autoloop에 반영.
-- **Mode B (development)**: `corpus/`, `core/`, `bin/`, `tests/`, `docs/` 수정 같은 시스템 작업. `WOOWA_SESSION_MODE=development` set 후 후속 명령 호출 (또는 개별 `bin/ask`에 `--session-mode development`). personalization stream에서 자동 제외.
+- **Mode B (development)**: `corpus/`, `core/`, `bin/`, `tests/`, `docs/` 수정 같은 시스템 작업. `WOOWA_SESSION_MODE=development` set 후 후속 명령 호출 (또는 개별 `bin/ask`에 `--session-mode development`). personalization stream에서 자동 제외. `bin/setup --dev`는 전체 테스트에 필요한 `pytest`, `pandas`, `pylance`까지 설치한다.
 
 ## License
 

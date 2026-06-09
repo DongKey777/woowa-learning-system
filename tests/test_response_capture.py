@@ -16,6 +16,7 @@ from core.response_capture import (  # noqa: E402
     is_internal_capture_meta_prompt,
     load_pending_capture,
     repair_queue_path,
+    sync_pending_captures_from_quality,
 )
 from core.state import append_history_event  # noqa: E402
 
@@ -224,6 +225,40 @@ def test_drain_is_idempotent_when_nothing_repairable(tmp_path: Path) -> None:
     summary = drain_repair_queue(state_root=state, learner_id="DongKey777")
     assert summary == {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0, "drain_errors": 0}
     assert not repair_queue_path(state).exists()
+
+
+def test_sync_pending_captures_from_quality_marks_stale_pending(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    learner = state / "learner"
+    pending_dir = learner / "pending-captures"
+    pending_dir.mkdir(parents=True)
+    (pending_dir / "ask-synced.json").write_text(json.dumps({
+        "schema_id": "response-capture-pending-v1",
+        "source_event_id": "ask-synced",
+        "repo": "spring-roomescape-waiting",
+        "prompt": "테스트",
+        "status": "pending",
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "attempts": 0,
+    }, ensure_ascii=False), encoding="utf-8")
+    (learner / "response-quality.jsonl").write_text(json.dumps({
+        "source_event_id": "ask-synced",
+        "logged_at": 2.0,
+        "response_body_path": "learner/response-bodies/sha256/aa/aa.md",
+        "quality_flags": [],
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    summary = sync_pending_captures_from_quality(state_root=state)
+
+    assert summary["synced"] == 1
+    pending = load_pending_capture("ask-synced", state_root=state)
+    assert pending is not None
+    assert pending["status"] == "captured"
+    assert pending["response_body_path"] == "learner/response-bodies/sha256/aa/aa.md"
+    assert pending["synced_from_response_quality"] is True
 
 
 def test_learning_data_clean_hard_deletes_orphans(tmp_path: Path) -> None:

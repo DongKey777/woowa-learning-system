@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from core.response_quality import (  # noqa: E402
     EXCERPT_MAX_CHARS, SCHEMA_ID, detect_citation_drift, record_response_quality, redact_pii,
 )
+from core.response_capture import create_pending_capture, load_pending_capture  # noqa: E402
 
 
 def test_redact_email() -> None:
@@ -415,6 +416,55 @@ def test_learn_response_quality_cli_enriches_from_source_event(tmp_path: Path) -
     assert row["repo"] == "spring-roomescape-waiting"
     assert row["citation_paths_expected"] == ["database/transaction-isolation-locking"]
     assert row["quality_flags"] == []
+
+
+def test_learn_response_quality_cli_marks_pending_as_captured(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    event = {
+        "event_id": "ask-pending",
+        "event_type": "rag_ask",
+        "mode": "learning",
+        "learner_id": "DongKey777",
+        "repo": "spring-roomescape-waiting",
+        "payload": {
+            "prompt": "격리 수준 설명",
+            "repo": "spring-roomescape-waiting",
+            "router_mode": "cs_qa",
+            "top_concept_ids": ["database/transaction-isolation-locking"],
+        },
+    }
+    history = state / "learner" / "history.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    create_pending_capture(event, state_root=state)
+    body = (
+        "[Mode: cs_qa]\n\n"
+        "격리 수준은 다른 트랜잭션 변경이 어디까지 보이는지 정하는 약속이야.\n\n"
+        "참고:\n"
+        "- database/transaction-isolation-locking\n"
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-pending",
+            "--response-file", "-",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    pending = load_pending_capture("ask-pending", state_root=state)
+    assert pending is not None
+    assert pending["status"] == "captured"
+    assert pending["response_body_path"]
+    assert pending["synced_from_response_quality"] is True
 
 
 def test_learn_response_quality_cli_rejects_orphan_source_event(tmp_path: Path) -> None:

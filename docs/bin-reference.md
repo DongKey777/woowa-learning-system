@@ -2,7 +2,7 @@
 
 | Entry | Mode | Purpose |
 |---|---|---|
-| [`bin/setup`](#binsetup) | A/B | `.venv` 생성 + `pip install -e .` (PEP 668 안전, `--dev`로 pytest 포함) |
+| [`bin/setup`](#binsetup) | A/B | `.venv` 생성 + `pip install -e .` (PEP 668 안전, `--dev`로 pytest+pandas+pylance 포함) |
 | [`bin/ask`](#binask) | A | 학습자 자연어 query → daemon ask (학습자 외울 명령 X) |
 | [`bin/rag-daemon`](#binrag-daemon) | A/B | BGE-M3 warm daemon start/stop/ping/status |
 | [`bin/index-fetch`](#binindex-fetch) | A | GitHub Releases에서 pre-built Lance 인덱스 다운로드 |
@@ -23,7 +23,7 @@ repo-local `.venv`를 만들고 그 안에서 `pip install -e .`를 실행하는
 
 ```bash
 bin/setup          # 런타임 deps (학습자 / Mode A)
-bin/setup --dev    # + pytest (시스템 개발 / Mode B)
+bin/setup --dev    # + pytest/pandas/pylance (시스템 개발 / Mode B)
 ```
 
 - macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라 직접 `pip install`이 거부된다. venv가 이를 마찰 없이 우회한다 (`--break-system-packages` 불필요, 시스템 Python 오염 없음).
@@ -282,11 +282,11 @@ bin/phase9-gate
 | Wrapper | Purpose | Bench |
 |---|---|---|
 | `bin/learn-pr-retro --repo R [--include-bot]` | PR retrospective: recurring mentor signals + unresolved threads + timeline | p50 1.2ms |
-| `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference | p95 1.19ms (168× faster) |
+| `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference + repo inference from `missions/<r>/...` | p95 1.19ms (168× faster) |
 | `bin/learn-test --path build/test-results/test/` | JUnit XML → test_result events, stable event_id (idempotent) | p50 3.6ms (333× faster) |
-| `bin/learn-response-quality --source-event-id E --response-file -` / `--response-path answer.md` | full-response telemetry; path mode avoids transcript duplication, stdin is universal fallback, redacted full body + excerpt ≤5000 chars + summary/declared citation auto-extract | p95 0.16ms, drift 100%, PII 100% |
+| `bin/learn-response-quality --source-event-id E --response-file -` / `--response-path answer.md` | full-response telemetry; path mode avoids transcript duplication, stdin is universal fallback, redacted full body + excerpt ≤5000 chars + summary/declared citation auto-extract; full body capture also marks matching pending capture `captured` | p95 0.16ms, drift 100%, PII 100% |
 | `bin/capture-response --client claude\|codex\|gemini --hook-json -` | hook-first full body capture; joins latest pending `rag_ask`, non-blocking repair queue on failure | hook path |
-| `bin/capture-repair --last N [--apply]` | replay repairable failed captures from `capture-repair-queue.jsonl` | local |
+| `bin/capture-repair --last N [--apply] [--sync-pending]` | replay repairable failed captures from `capture-repair-queue.jsonl`; with `--sync-pending`, reconcile stale pending-captures from `response-quality.jsonl` full-body rows | local |
 | `bin/learning-data-clean --hard-delete-contamination [--apply]` | remove dummy source-id asks, orphan quality rows, partial ids, unreferenced body sidecars | local |
 | `bin/assess-learner-state --repo R --path missions/<r>` | git + SQLite snapshot: head/working_copy/PRs/threads classified | p50 113ms (528× faster) |
 | `bin/profile-recompute` | history → v3 profile.json (mastered/uncertain/calibration/recommendations) | 10K events ≤75ms |

@@ -147,7 +147,7 @@ CREATE TABLE evidence (
 | event_type | mode | payload 필드 |
 |---|---|---|
 | `rag_ask` | learning/development | top-level learner_id/repo/`mode_source` + payload: prompt, `raw_utterance`, repo, router_mode, router_reason, `reformulated_query`, `reformulation_source`, top_concept_ids, latency_ms |
-| `code_attempt` | learning | file_path, concept_ids, lines_added, lines_removed, summary, linked_test |
+| `code_attempt` | learning | top-level repo(지정값 또는 `missions/<repo>/...` 경로 추론) + payload: file_path, concept_ids, lines_added, lines_removed, summary, linked_test |
 | `drill_answer` | learning | drill_session_id, concept_ids, score, level, dimensions, answer_preview |
 | `self_assessment` | learning | trigger_session_id, score, concept_ids |
 | `test_result` | learning | test_class, test_method, status |
@@ -167,6 +167,8 @@ CREATE TABLE evidence (
 - `--response-file -` stdin은 universal fallback이다. path capture가 불가능하면 세션 토큰 비용이 있더라도 본문 보존을 위해 사용한다.
 - hook 수집 실패는 학습 답변을 막지 않고 `capture-repair-queue.jsonl`에 남긴다.
 - 한 사용자 턴에서 `bin/ask`가 여러 번 호출되면 최종 hook capture와 연결되지 않은 이전 pending은 `superseded_by_later_capture`로 닫힌다.
+- hook 없이 `bin/learn-response-quality` fallback으로 full body가 저장되면 같은 `source_event_id`의 pending capture도 `captured`로 갱신된다.
+- 오래 남은 pending capture는 `bin/capture-repair --sync-pending`이 `response-quality.jsonl`의 full-body 행을 기준으로 재동기화한다.
 - `capture_method="summary_only"`는 full-body capture가 정말 불가능한 예외 상황이며, `contract_flags`에 `body_not_captured`, `token_efficient_summary_only`가 남는다.
 - summary-only에서는 본문 `참고:` 블록을 파싱할 수 없으므로 expected citation을 declared citation으로 복사하되 `declared_citation_unverified`를 남겨 false `missing_citation` drift를 피한다.
 - full body가 들어온 경우 `response_excerpt`는 redacted prefix(최대 5000자), `response_body_path`는 redacted full body 파일 경로다.

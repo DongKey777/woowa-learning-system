@@ -22,6 +22,17 @@ from core.feedback import record_turn
 from core.state import DEFAULT_STATE_ROOT, append_history_event
 
 
+def infer_repo_from_path(file_path: str) -> str | None:
+    """Infer mission repo name from missions/<repo>/... paths."""
+    parts = Path(file_path).parts
+    for index, part in enumerate(parts):
+        if part == "missions" and index + 1 < len(parts):
+            repo = parts[index + 1]
+            if repo and repo not in {".", ".."}:
+                return repo
+    return None
+
+
 def infer_concepts_from_file(file_path: str) -> list[str]:
     """Read file (if exists) and run mission.extract.extract_from_text.
 
@@ -63,6 +74,7 @@ def record_code_attempt(
     ts = now or time.time()
     concept_ids = explicit_concept_ids if explicit_concept_ids else \
         infer_concepts_from_file(file_path)
+    resolved_repo = repo or infer_repo_from_path(file_path)
 
     event_id = f"code_attempt-{int(ts * 1000)}-{uuid.uuid4().hex[:6]}"
     event = {
@@ -71,7 +83,7 @@ def record_code_attempt(
         "mode": mode,
         "ts": ts,
         "learner_id": learner_id,
-        "repo": repo,
+        "repo": resolved_repo,
         "payload": {
             "file_path": file_path,
             "summary": summary,

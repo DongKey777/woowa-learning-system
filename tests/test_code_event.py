@@ -8,7 +8,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from core.code_event import infer_concepts_from_file, record_code_attempt  # noqa: E402
+from core.code_event import (  # noqa: E402
+    infer_concepts_from_file,
+    infer_repo_from_path,
+    record_code_attempt,
+)
 
 
 def test_infer_concepts_from_real_spring_file(tmp_path: Path) -> None:
@@ -35,6 +39,16 @@ def test_infer_concepts_from_missing_file_returns_empty(tmp_path: Path) -> None:
     assert infer_concepts_from_file(str(tmp_path / "nope.java")) == []
 
 
+def test_infer_repo_from_mission_path() -> None:
+    assert infer_repo_from_path(
+        "missions/spring-roomescape-waiting/src/main/java/Foo.java"
+    ) == "spring-roomescape-waiting"
+    assert infer_repo_from_path(
+        "/Users/idonghun/project/missions/spring-roomescape-member/src/Foo.java"
+    ) == "spring-roomescape-member"
+    assert infer_repo_from_path("src/main/java/Foo.java") is None
+
+
 def test_record_code_attempt_appends_event(tmp_path: Path) -> None:
     state = tmp_path
     (state / "learner").mkdir(parents=True)
@@ -53,6 +67,18 @@ def test_record_code_attempt_appends_event(tmp_path: Path) -> None:
         encoding="utf-8").splitlines() if l.strip()]
     assert len(lines) == 1
     assert json.loads(lines[0])["event_type"] == "code_attempt"
+
+
+def test_record_code_attempt_infers_repo_from_file_path(tmp_path: Path) -> None:
+    state = tmp_path
+    (state / "learner").mkdir(parents=True)
+    event = record_code_attempt(
+        file_path="missions/spring-roomescape-waiting/src/main/java/Foo.java",
+        summary="update waiting",
+        explicit_concept_ids=[],
+        state_root=state,
+    )
+    assert event["repo"] == "spring-roomescape-waiting"
 
 
 def test_record_code_attempt_explicit_concepts_skip_inference(tmp_path: Path) -> None:

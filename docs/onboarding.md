@@ -50,7 +50,7 @@ uname -a                     # macOS / Linux 확인
 
 ```bash
 bin/setup          # 학습자 (Mode A)
-bin/setup --dev    # 시스템 개발 (Mode B, pytest 포함)
+bin/setup --dev    # 시스템 개발 (Mode B, pytest+pandas+pylance 포함)
 ```
 
 `bin/setup`은 repo-local `.venv`를 만들고 그 안에서 `pip install -e .`를 실행한다.
@@ -68,6 +68,8 @@ macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라
 - `numpy`, `pyarrow` (수치/columnar)
 - `jsonschema` (corpus validation)
 - `torch` (BGE-M3 backend, MPS on M-series)
+
+`bin/setup --dev`는 여기에 `pytest`, `pandas`, `pylance`를 더 설치한다. 전체 `tests/` 회귀는 Lance/PyArrow 계층까지 import하므로 dev extra를 기준으로 실행한다.
 
 > BGE-M3는 `transformers` + `sentence-transformers`로 로드한다. `FlagEmbedding`은
 > RunPod 인덱스 빌드(`scripts/remote_build.py`)에서만 쓰이는 maintainer 전용
@@ -168,7 +170,7 @@ python3 bin/ask "테스트 query"
 
 ### Step 7 — 학습 데이터 수집 contract 확인
 
-AI 세션이 `bin/ask`를 호출하면 learning mode에서 pending capture가 생성된다. Claude/Codex/Gemini hook 환경은 답변 종료 시 `bin/capture-response`가 최종 답변 본문을 자동 수집한다. 수집 실패는 학습 답변을 막지 않고 repair queue에 남긴다.
+AI 세션이 `bin/ask`를 호출하면 learning mode에서 pending capture가 생성된다. Claude/Codex/Gemini hook 환경은 답변 종료 시 `bin/capture-response`가 최종 답변 본문을 자동 수집한다. hook이 없는 환경의 `bin/learn-response-quality` fallback도 full body가 저장되면 같은 `source_event_id`의 pending capture를 `captured`로 갱신한다. 수집 실패는 학습 답변을 막지 않고 repair queue에 남긴다.
 
 우선순위:
 ```bash
@@ -186,11 +188,13 @@ bin/learn-response-quality --source-event-id <id> --response-file - --silent
 ```bash
 bin/learning-turn-audit --last 20 --require-full-body
 bin/response-quality-mine --since 7d
-bin/capture-repair --last 50
+bin/capture-repair --sync-pending --last 50
 ```
 
 실패 안내는 짧게만 한다: *"학습 기록 저장은 나중에 자동 보정할게."*
 `summary-only`는 full body capture가 정말 불가능한 예외 상황에서만 사용한다.
+
+오래 남은 pending capture가 보이면 `bin/capture-repair --sync-pending --apply --last 1000`으로 `response-quality.jsonl`의 full-body 행과 재동기화한다.
 
 ---
 
