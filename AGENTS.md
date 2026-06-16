@@ -207,6 +207,10 @@ python3 bin/ask "테스트"
 
 키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). AI 세션이 발화 의미를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로, 키워드 router는 deterministic fallback. 모드 목록과 선택 기준은 CLAUDE.md §4.2.2와 동일하다 — `cs_qa` / `coaching` / `drill` / `self_assess` / `retro` / `pr_diff_evolution`(코드 변화·리뷰 반영) / `cross_mission`(미션 간 개념·반복 실수) / `memory_review`(사각지대·복습) / `pr_review`(받은 리뷰) / `reviewer_profile`(멘토 성향) / `learning_path`(다음 학습) / `pr_meta`(PR 품질·크기) / `thread_recon`(스레드 복원) / `temporal`(시간축) / `meta_analytics`(학습 메타) / `cohort`(동기 비교) / `predict`(리뷰 미리 보기) / `f11_anchor`(cross-crew). `tool_only`/`tier_0_fallback`은 직접 고르지 않는다.
 
+### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
+
+발화가 2개 이상 독립 주제면 주제별로 분해한다(한 벡터에 여러 주제 = dense 평균화로 모든 인텐트에서 어중간). 1순위는 단일 `bin/ask` + `--reformulated-query`(추가 pending capture 없음). sub-ask로 N번 쪼개면 pending capture N개가 생기고 Stop hook은 최신 1개만 연결하므로 `bin/capture-repair --sync-pending`으로 정합한다. `--raw-utterance`는 한 호출에만(중복 = raw→rewritten 쌍 오염). 개념 부재 기인 미스는 분해로 못 고치며 코퍼스 과제다.
+
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
 1. AI가 학습자 미션 파일 실제 수정/생성 (예: Codex apply diff)
