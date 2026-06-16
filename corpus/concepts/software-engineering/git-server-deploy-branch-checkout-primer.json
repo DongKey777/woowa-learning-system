@@ -1,0 +1,63 @@
+{
+  "id": "software-engineering/git-server-deploy-branch-checkout-primer",
+  "title": "서버 배포 브랜치 확인과 checkout Primer",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "EC2 서버에서 내가 의도한 GitHub branch나 step branch를 띄운 것이 맞는지 `git branch --show-current`, `git rev-parse`, `git fetch`, `git switch`, `git pull --ff-only`로 확인하고 안전하게 전환하는 입문 문서다.",
+  "body_markdown": "# 서버 배포 브랜치 확인과 checkout Primer\n\n> 한 줄 요약: 서버에서 실행 중인 코드가 `dongkey`, `step2` 같은 의도한 branch인지 확인하려면 프로세스보다 먼저 Git working tree의 remote, branch, commit, 빌드 산출물 시간을 분리해서 봐야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Gradle Wrapper와 Java/Spring 빌드 생명주기 입문](./gradle-wrapper-java-build-lifecycle-primer.md)\n- [Spring Boot 실행형 jar EC2 배포 Runbook](../spring/spring-boot-executable-jar-ec2-runbook.md)\n- [Idempotent Deploy Script PID/Log Primer](./idempotent-deploy-script-pid-log-primer.md)\n\nretrieval-anchor-keywords: server deploy branch checkout, EC2 git branch show current, git rev-parse HEAD, git fetch origin step2, git switch branch, git pull ff only, detached HEAD deploy, Spring Boot server wrong branch, 배포 브랜치 확인, step2 branch deploy\n\n## 먼저 잡는 멘탈 모델\n\n서버의 Git repository는 GitHub 화면이 아니다. GitHub에 `step2` branch가 있어도 EC2 안의 working tree가 `main`에 머물러 있으면 서버는 `main` 코드로 빌드한다. 반대로 서버에서 예전에 `step2`를 checkout했더라도 `git pull`을 하지 않으면 오래된 commit일 수 있다.\n\n그래서 \"내 branch를 띄운 게 맞아?\"라는 질문은 네 증거를 나눠야 한다.\n\n| 증거 | 확인 명령 | 의미 |\n|---|---|---|\n| 어느 저장소인가 | `git remote -v` | 내가 기대한 GitHub repo를 보고 있는가 |\n| 어느 branch인가 | `git branch --show-current` | working tree가 현재 어떤 branch 위에 있는가 |\n| 어느 commit인가 | `git rev-parse --short HEAD` | branch 이름이 같아도 최신 commit인지 확인 |\n| 무엇을 빌드했나 | `ls -l build/libs`, jar 실행 command | 실행 jar가 그 commit 이후에 다시 만들어졌는가 |\n\n프로세스가 살아 있다는 사실은 branch 증거가 아니다. `java -jar`는 이미 만들어진 jar를 실행할 뿐이고, 그 jar가 어떤 commit에서 나왔는지는 별도로 확인해야 한다.\n\n## 서버에서 먼저 확인할 30초 명령\n\n```bash\npwd\ngit remote -v\ngit branch --show-current\ngit status --short\ngit rev-parse --short HEAD\ngit log --oneline -3\nls -lh build/libs 2>/dev/null || true\nps -ef | grep '[j]ava'\n```\n\n여기서 `git status --short`가 비어 있지 않으면 먼저 멈춘다. 서버에서 직접 수정한 파일, 생성된 추적 파일, conflict 흔적이 있으면 checkout이나 pull이 예상과 다르게 동작할 수 있다. 학습 서버에서는 서버에서 코드를 직접 고치기보다 GitHub branch를 source of truth로 두는 편이 안전하다.\n\n## branch를 안전하게 바꾸는 흐름\n\n서버가 이미 repository를 clone한 상태라면 기본 흐름은 이렇다.\n\n```bash\ncd ~/spring-roomescape-waiting\ngit fetch origin\ngit switch step2\ngit pull --ff-only origin step2\n./gradlew clean bootJar\n```\n\n`git fetch origin`은 GitHub의 최신 branch 정보를 서버로 가져온다. `git switch step2`는 working tree를 그 branch로 바꾼다. `git pull --ff-only origin step2`는 서버 branch가 원격 branch보다 뒤처져 있을 때만 fast-forward로 맞추고, 서버에 엇갈린 commit이 있으면 멈춘다. 배포 서버에서 자동 merge commit이 생기는 것보다 멈추는 편이 낫다.\n\nbranch가 서버에 아직 없으면 아래처럼 명시해도 된다.\n\n```bash\ngit fetch origin step2\ngit switch -c step2 --track origin/step2\n```\n\n이미 local branch가 있으면 `git switch step2`만으로 충분하다. `git checkout origin/step2`처럼 원격 branch 이름을 직접 checkout하면 detached HEAD가 될 수 있다. detached HEAD는 실험에는 쓸 수 있지만, 초보 배포에서는 이후 pull과 commit 추적이 헷갈리므로 피하는 편이 좋다.\n\n## rebuild와 restart를 분리한다\n\nbranch를 바꿨다고 실행 중인 프로세스가 자동으로 바뀌지는 않는다. 보통은 아래 순서가 필요하다.\n\n```text\n1. Git branch/commit 맞추기\n2. Gradle로 새 jar 만들기\n3. 기존 프로세스 종료 또는 서비스 restart\n4. 새 jar 실행\n5. `/actuator/health`나 실제 API로 확인\n```\n\n예를 들어 `git switch step2`만 하고 `java -jar build/libs/app.jar`를 재시작하지 않으면 기존 JVM은 계속 예전 bytecode로 돈다. `./gradlew bootJar`를 다시 실행하지 않으면 `build/libs`의 jar도 이전 commit 산출물일 수 있다.\n\n## wrong-bucket 표\n\n| 관찰 | 잘못된 결론 | 더 안전한 해석 |\n|---|---|---|\n| GitHub PR branch가 `step2`다 | 서버도 step2다 | 서버 working tree branch를 별도로 확인해야 한다 |\n| `git branch`에 `step2`가 보인다 | 지금 step2를 실행 중이다 | 별표가 붙은 현재 branch와 실행 jar 재빌드 여부를 봐야 한다 |\n| `git pull`이 Already up to date다 | GitHub 최신이다 | 어느 remote/branch 기준인지 `git remote -v`, `git branch -vv`를 본다 |\n| 서버에서 API가 응답한다 | 새 코드가 배포됐다 | PID와 jar mtime, commit endpoint/log를 확인해야 한다 |\n| `origin/step2`를 checkout했다 | 정상 branch다 | detached HEAD일 수 있으니 `git branch --show-current`를 본다 |\n\n## 배포 스크립트에 넣을 때\n\n학습용 스크립트라도 branch를 변수로 받는 편이 좋다.\n\n```bash\nAPP_DIR=\"$HOME/spring-roomescape-waiting\"\nBRANCH=\"${1:-step2}\"\n\ncd \"$APP_DIR\"\ngit fetch origin\ngit switch \"$BRANCH\"\ngit pull --ff-only origin \"$BRANCH\"\n./gradlew clean bootJar\n```\n\n여기서 중요한 건 `BRANCH`를 echo로 출력하고, 빌드 전에 현재 commit도 로그로 남기는 것이다.\n\n```bash\necho \"deploy branch: $(git branch --show-current)\"\necho \"deploy commit: $(git rev-parse --short HEAD)\"\n```\n\n나중에 \"내 branch 맞아?\"가 다시 나오면 이 두 줄이 가장 빠른 증거가 된다.\n\n## 흔한 오해\n\n- GitHub에서 branch를 바꾸면 EC2가 자동으로 따라온다고 생각한다.\n- `git checkout origin/step2`로 배포하고 detached HEAD 상태를 모른다.\n- branch를 바꾼 뒤 jar를 다시 빌드하지 않는다.\n- 새 jar를 만들었지만 기존 Java 프로세스를 종료하지 않아 예전 코드가 계속 응답한다.\n- `git pull` 기준 branch를 확인하지 않고 `Already up to date`만 믿는다.\n\n## 꼬리질문\n\n> Q: 서버에서 `git branch --show-current`가 비어 있으면 무슨 뜻인가요?\n> 의도: detached HEAD를 알아차리는지 확인한다.\n> 핵심: local branch 위가 아니라 특정 commit이나 remote ref를 직접 checkout한 상태일 수 있어, 초보 배포에서는 branch를 명시해 다시 switch하는 편이 안전하다.\n\n> Q: branch를 바꿨는데 왜 서버 응답은 그대로인가요?\n> 의도: source checkout, build artifact, running process를 분리하는지 확인한다.\n> 핵심: Git working tree 변경은 실행 중 JVM에 자동 반영되지 않는다. 새 jar를 빌드하고 프로세스나 systemd 서비스를 재시작해야 한다.\n\n> Q: 배포 로그에 commit hash를 남기는 이유는 무엇인가요?\n> 의도: 나중에 실행 코드와 GitHub 코드를 맞춰 볼 증거를 남기는 습관을 확인한다.\n> 핵심: branch 이름은 움직이고, commit hash는 특정 소스 상태를 가리키므로 재현과 확인에 좋다.\n\n## 한 줄 정리\n\n서버 배포 branch 확인은 `remote -> branch -> commit -> jar rebuild -> process restart`를 순서대로 증거화하는 일이다.\n",
+  "aliases": [
+    "server deploy branch",
+    "EC2 git checkout branch",
+    "git branch show-current",
+    "git rev-parse HEAD deploy",
+    "git switch step2",
+    "git pull ff-only",
+    "detached HEAD 배포",
+    "배포 브랜치 확인",
+    "step2 브랜치 배포",
+    "서버 코드 버전 확인"
+  ],
+  "expected_queries": [
+    "EC2에 띄운 서버가 내 dongkey 브랜치인지 step2 브랜치인지 어떻게 확인해?",
+    "서버에서 git switch step2 하고 pull 했는데 실제 실행 코드도 바뀐 게 맞아?",
+    "git checkout origin/step2로 배포했는데 branch 이름이 안 보이면 detached HEAD야?",
+    "배포 스크립트에서 BRANCH를 받아서 git fetch, switch, pull --ff-only 하는 흐름을 알려줘",
+    "GitHub에는 최신 commit이 있는데 EC2 서버는 예전 코드로 응답할 때 어디부터 봐?"
+  ],
+  "symptoms": [
+    "GitHub branch와 서버 working tree branch를 같은 것으로 착각한다",
+    "branch checkout 뒤 jar rebuild와 JVM restart를 빼먹는다",
+    "origin/step2 checkout으로 detached HEAD 상태가 된다",
+    "서버 실행 코드의 commit hash를 남기지 않아 배포 상태를 확인하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/gradle-wrapper-java-build-lifecycle-primer"
+    ],
+    "next_docs": [
+      "software-engineering/idempotent-deploy-script-pid-log-primer",
+      "spring/spring-boot-executable-jar-ec2-runbook"
+    ],
+    "confusable_with": [
+      "software-engineering/git-fork-upstream-sync-workflow",
+      "software-engineering/idempotent-deploy-script-pid-log-primer"
+    ],
+    "forbidden_for_queries": [
+      "GitHub fork upstream sync",
+      "Git rebase conflict 해결",
+      "PR branch 전략 일반론"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "note": "batch13 deployment-ops gap fill"
+      }
+    ]
+  }
+}
