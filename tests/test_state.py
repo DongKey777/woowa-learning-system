@@ -107,6 +107,15 @@ def test_beginner_flags_round_trip(tmp_path: Path) -> None:
     assert load_beginner_flags(tmp_path) == ["a/x", "a/y"]
 
 
+def test_beginner_flags_malformed_concepts_ignored(tmp_path: Path) -> None:
+    # W7: a non-list 'concepts' must not per-char/key-iterate → [].
+    from core.state import load_beginner_flags
+    learner = tmp_path / "learner"
+    learner.mkdir(parents=True)
+    (learner / "beginner_flags.json").write_text(json.dumps({"concepts": "abc"}), encoding="utf-8")
+    assert load_beginner_flags(tmp_path) == []
+
+
 def test_load_profile_populates_beginner_flags(tmp_path: Path) -> None:
     # W7: load_profile surfaces the self-declared-beginner list on LearnerProfile.
     from core.state import load_profile, save_beginner_flags

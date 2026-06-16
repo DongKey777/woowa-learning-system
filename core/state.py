@@ -154,9 +154,12 @@ def load_beginner_flags(state_root: Path = DEFAULT_STATE_ROOT) -> list[str]:
         return []
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        return [str(c) for c in (data.get("concepts") or []) if c]
     except (json.JSONDecodeError, OSError):
         return []
+    raw = data.get("concepts") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []  # malformed (non-list) → ignore, don't per-char/key-iterate
+    return [str(c) for c in raw if c]
 
 
 def save_beginner_flags(concepts: list[str], state_root: Path = DEFAULT_STATE_ROOT) -> None:
