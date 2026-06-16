@@ -37,6 +37,7 @@ SUITE = [
     ("B_foundation", "rag_quality_regression", BENCH / "rag_quality_regression.py", 120),
     ("B_foundation", "gate_measurements", BENCH / "gate_measurements.py", 60),
     ("B_foundation", "cohort_qrels_eval", BENCH / "cohort_qrels_eval.py", 120),
+    ("B_foundation", "real_learner_qrels_eval", BENCH / "real_learner_qrels_eval.py", 120),
 
     # C. Phase T learner automation
     ("C_T_learner", "learn_pr_retro_bench", BENCH / "learn_pr_retro_bench.py", 30),
@@ -288,27 +289,39 @@ def _y13_gate_checks() -> list[dict]:
 
     rag_report = _read_json(REPO_ROOT / "reports" / "rag_quality_regression.json")
     rag = (rag_report or {}).get("current_measurement", {})
+    # W9: rag_quality_regression scores retrieval against each concept's OWN
+    # expected_queries — self-referential. It rewards corpus authors phrasing
+    # queries the way they index, so it cannot detect "the learner's real words
+    # miss." Demoted to report_only here; the held-out authority gate over
+    # real_learner_qrels_v1 (below) is what actually blocks on top-1 quality.
+    # Latency + errors stay blocking (cheap correctness/perf, not self-referential).
     rag_gates = [
-        ("rag_top1_strict", rag.get("top1_strict_match_rate"), 0.80, ">="),
-        ("rag_ndcg_at_5", rag.get("ndcg_at_5"), 0.78, ">="),
-        ("rag_latency_p95_ms", rag.get("latency_ms_p95"), 500.0, "<="),
-        ("rag_errors", rag.get("errors_n"), 0, "=="),
+        ("rag_top1_strict", rag.get("top1_strict_match_rate"), 0.80, ">=", True),
+        ("rag_ndcg_at_5", rag.get("ndcg_at_5"), 0.78, ">=", True),
+        ("rag_latency_p95_ms", rag.get("latency_ms_p95"), 500.0, "<=", False),
+        ("rag_errors", rag.get("errors_n"), 0, "==", False),
     ]
-    for name, observed, threshold, op in rag_gates:
+    for name, observed, threshold, op, report_only in rag_gates:
         if op == ">=":
-            passed = observed is not None and observed >= threshold
+            would_pass = observed is not None and observed >= threshold
         elif op == "<=":
-            passed = observed is not None and observed <= threshold
+            would_pass = observed is not None and observed <= threshold
         else:
-            passed = observed == threshold
-        out.append({
+            would_pass = observed == threshold
+        entry = {
             "category": "K_Y13_gates",
             "name": name,
             "observed": observed,
             "threshold": threshold,
             "op": op,
-            "pass": passed,
-        })
+            # report_only items never block: pass forced True, real verdict kept
+            # under would_pass for visibility.
+            "pass": True if report_only else would_pass,
+        }
+        if report_only:
+            entry["report_only"] = True
+            entry["would_pass"] = would_pass
+        out.append(entry)
 
     concurrent = _read_json(REPO_ROOT / "reports" / "concurrent_ask.json")
     if concurrent is not None:
@@ -387,6 +400,47 @@ def _y13_gate_checks() -> list[dict]:
             "op": op,
             "pass": passed,
         })
+
+    # W9: held-out AUTHORITY gate. real_learner_qrels_v1 = 50 real learner
+    # utterances, 0% overlap with expected_queries, edit-frozen. This is the one
+    # quality signal that isn't self-referential, so top-1 here BLOCKS release.
+    # Floor 0.73 over a measured baseline of 0.75 (30/40 ranking-evaluated). With
+    # ~40 scored queries that is a near-zero-regression floor: a single top-1
+    # flip trips it. That is intentional and matches the dual-qrels doctrine —
+    # the real frozen set is the authority and any drop must be per-query
+    # root-caused (re-baseline only deliberately). Retrieval is deterministic
+    # (golden verify is flake-0), so a trip is a real ranking change, never noise.
+    # Latency is NOT gated: cohort-eval reuses the warm daemon embedding cache so
+    # p95 collapses to ~0.1ms, a cache artifact, not a real-path number.
+    # Secondary metrics (top5/ndcg/mrr) report_only.
+    real_report = _read_json(REPO_ROOT / "reports" / "real_learner_qrels_baseline.json")
+    real = (real_report or {}).get("summary", {})
+    real_gates = [
+        ("real_qrels_top1", real.get("top1_match_rate"), 0.73, ">=", False),
+        ("real_qrels_errors", real.get("errors_n"), 0, "==", False),
+        ("real_qrels_top5", real.get("top5_match_rate"), 0.90, ">=", True),
+        ("real_qrels_ndcg_at_5", real.get("ndcg_at_5"), 0.70, ">=", True),
+        ("real_qrels_mrr", real.get("mrr"), 0.78, ">=", True),
+    ]
+    for name, observed, threshold, op, report_only in real_gates:
+        if op == ">=":
+            would_pass = observed is not None and observed >= threshold
+        elif op == "<=":
+            would_pass = observed is not None and observed <= threshold
+        else:
+            would_pass = observed == threshold
+        entry = {
+            "category": "K_Y13_gates",
+            "name": name,
+            "observed": observed,
+            "threshold": threshold,
+            "op": op,
+            "pass": True if report_only else would_pass,
+        }
+        if report_only:
+            entry["report_only"] = True
+            entry["would_pass"] = would_pass
+        out.append(entry)
 
     cohort_legacy_report = _read_json(REPO_ROOT / "reports" / "cohort_y13_vs_legacy.json")
     cohort_legacy = (cohort_legacy_report or {}).get("legacy", {})
