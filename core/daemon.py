@@ -482,6 +482,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         artifacts["reformulated_query"] = reformulated_query
                     if reformulation:
                         artifacts["reformulation_trace"] = reformulation.to_dict()
+                    from core.drill import read_last_proactive_offer_at
                     cognitive_trigger = (
                         select_cognitive_trigger(
                             history=recent,
@@ -490,6 +491,8 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             drill_history=load_drill_history(state_root) or profile.drill_due,
                             intent={"detected_intent": decision.mode},
                             pending_triggers=profile.pending_triggers,
+                            uncertain_concepts=profile.uncertain_concepts,
+                            last_drill_offer_at=read_last_proactive_offer_at(state_root),
                         )
                         if event_mode not in ("development", "test")
                         else {"trigger_type": "none"}
@@ -536,6 +539,25 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         artifacts["cognitive_trigger"] = cognitive_trigger
                     elif cognitive_trigger.get("trigger_type") == "follow_up":
                         artifacts["cognitive_trigger"] = cognitive_trigger
+                    elif cognitive_trigger.get("trigger_type") == "proactive_drill":
+                        from core.drill import (
+                            build_offer_if_due, write_last_proactive_offer_at,
+                        )
+
+                        offer = build_offer_if_due(
+                            learner_id=learner_id, state_root=state_root,
+                            uncertain_concept_ids=profile.uncertain_concepts or [],
+                        )
+                        if offer:
+                            artifacts["drill_offer"] = {
+                                "concept_id": offer.concept_id,
+                                "question": offer.question,
+                                "expected_terms": offer.expected_terms,
+                                "source": offer.source,
+                            }
+                            artifacts["cognitive_trigger"] = cognitive_trigger
+                            write_last_proactive_offer_at(offer.created_at, state_root)
+                        # else: no resolvable question -> drop the trigger silently.
                     from core.response_capture import (
                         create_pending_capture,
                         is_internal_capture_meta_prompt,

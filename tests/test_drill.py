@@ -204,3 +204,11 @@ def test_spaced_repetition_future_due_skipped(tmp_path: Path) -> None:
          "level": "good", "last_score": 0.7}
     ]), encoding="utf-8")
     assert build_review_offer_if_due(state_root=sr) is None
+
+
+def test_proactive_offer_marker_round_trip(tmp_path: Path) -> None:
+    # W8: frequency-cap marker (drill_offer_meta.json) read/write.
+    from core.drill import read_last_proactive_offer_at, write_last_proactive_offer_at
+    assert read_last_proactive_offer_at(tmp_path) is None
+    write_last_proactive_offer_at(1234.5, tmp_path)
+    assert read_last_proactive_offer_at(tmp_path) == 1234.5

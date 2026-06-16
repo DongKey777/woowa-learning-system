@@ -249,3 +249,66 @@ def test_bin_ask_persists_trigger_only_in_learning_mode(tmp_path: Path) -> None:
     )
     assert pending["self_assessment"]["trigger_type"] == "self_assessment"
     assert "cognitive_trigger" in json.loads(learn.stdout)["markdown"]
+
+
+# --- W8: proactive drill-offer trigger -------------------------------------
+
+_W8_NOW = datetime(2026, 5, 27, tzinfo=timezone.utc)
+_W8_UNCERTAIN = ["spring/a", "spring/b", "spring/c"]  # >= N_PROACTIVE_UNCERTAIN
+
+
+def test_proactive_drill_fires_for_accumulated_uncertain() -> None:
+    t = select_cognitive_trigger(
+        history=[], profile={}, drill_pending=None, drill_history=[],
+        uncertain_concepts=_W8_UNCERTAIN, last_drill_offer_at=None, now=_W8_NOW,
+    )
+    assert t["trigger_type"] == "proactive_drill"
+    assert t["payload"]["concept_ids"] == _W8_UNCERTAIN
+    assert "proactive_drill" in t["competed_against"]
+
+
+def test_proactive_drill_loses_to_self_assessment() -> None:
+    # Lowest priority: a competing self_assessment (recent code attempt) wins.
+    t = select_cognitive_trigger(
+        history=[_code_attempt(_W8_NOW.timestamp())], profile={}, drill_pending=None,
+        uncertain_concepts=_W8_UNCERTAIN, now=_W8_NOW,
+    )
+    assert t["trigger_type"] == "self_assessment"
+
+
+def test_proactive_drill_suppressed_when_drill_pending() -> None:
+    t = select_cognitive_trigger(
+        history=[], profile={}, drill_pending={"drill_session_id": "d1"},
+        uncertain_concepts=_W8_UNCERTAIN, now=_W8_NOW,
+    )
+    assert t["trigger_type"] == "none"  # FSM early-exit on existing drill_pending
+
+
+def test_proactive_drill_needs_n_uncertain() -> None:
+    t = select_cognitive_trigger(
+        history=[], profile={}, drill_pending=None,
+        uncertain_concepts=["spring/a", "spring/b"], now=_W8_NOW,  # only 2 < 3
+    )
+    assert t["trigger_type"] != "proactive_drill"
+
+
+def test_proactive_drill_frequency_cap_offer_marker() -> None:
+    within = select_cognitive_trigger(
+        history=[], profile={}, drill_pending=None, uncertain_concepts=_W8_UNCERTAIN,
+        last_drill_offer_at=_W8_NOW.timestamp() - 3600, now=_W8_NOW,  # 1h < 24h
+    )
+    assert within["trigger_type"] != "proactive_drill"
+    outside = select_cognitive_trigger(
+        history=[], profile={}, drill_pending=None, uncertain_concepts=_W8_UNCERTAIN,
+        last_drill_offer_at=_W8_NOW.timestamp() - 25 * 3600, now=_W8_NOW,  # 25h
+    )
+    assert outside["trigger_type"] == "proactive_drill"
+
+
+def test_proactive_drill_recent_drill_answer_suppresses() -> None:
+    history = [{"event_type": "drill_answer", "ts": _W8_NOW.timestamp() - 3600}]  # 1h
+    t = select_cognitive_trigger(
+        history=history, profile={}, drill_pending=None,
+        uncertain_concepts=_W8_UNCERTAIN, now=_W8_NOW,
+    )
+    assert t["trigger_type"] != "proactive_drill"

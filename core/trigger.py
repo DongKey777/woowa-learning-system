@@ -395,10 +395,60 @@ def _review_due_candidate(
     }
 
 
+N_PROACTIVE_UNCERTAIN = 3                   # W8: min accumulated uncertain concepts
+PROACTIVE_DRILL_COOLDOWN_SECS = 24 * 3600   # W8: no re-offer within this window
+
+
+def _last_drill_answer_ts(history: list[dict[str, Any]] | None) -> float:
+    latest = 0.0
+    for ev in history or []:
+        if ev.get("event_type") == "drill_answer":
+            ts = ev.get("ts")
+            if isinstance(ts, (int, float)) and ts > latest:
+                latest = float(ts)
+    return latest
+
+
+def _proactive_drill_candidate(
+    *,
+    uncertain_concepts: list[str] | None = None,
+    drill_pending: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+    last_drill_offer_at: float | None = None,
+    now: datetime,
+    **_: Any,
+) -> dict[str, Any] | None:
+    """W8: proactively offer a forward drill when uncertain concepts accumulate and
+    no drill activity is within the cooldown. Side-effect free (the daemon branch
+    writes drill_pending.json + the offer marker). Sits LAST in the priority FSM."""
+    if drill_pending is not None:
+        return None
+    uncertain = [c for c in (uncertain_concepts or []) if c]
+    if len(uncertain) < N_PROACTIVE_UNCERTAIN:
+        return None
+    last_activity = max(last_drill_offer_at or 0.0, _last_drill_answer_ts(history))
+    if now.timestamp() - last_activity < PROACTIVE_DRILL_COOLDOWN_SECS:
+        return None
+    return {
+        "trigger_type": "proactive_drill",
+        "trigger_session_id": str(uuid.uuid4()),
+        "markdown": (
+            "## 확인 드릴 제안\n"
+            "- 헷갈리는 개념이 좀 쌓였어. 짧은 확인 드릴 하나 풀어볼까?"
+        ),
+        "payload": {"concept_ids": uncertain},
+        "applicability_hint": "supporting",
+        "reason": "uncertain_concepts_accumulated",
+        "evidence": {"source": "profile.uncertain_concepts", "n_uncertain": len(uncertain)},
+        "competed_against": [],
+    }
+
+
 _CANDIDATE_REGISTRY: dict[str, dict[str, Any]] = {
     "self_assessment_due": {"enabled": True, "fn": _self_assessment_due_candidate},
     "review_due": {"enabled": True, "fn": _review_due_candidate},
     "follow_up": {"enabled": True, "fn": _follow_up_candidate},
+    "proactive_drill": {"enabled": True, "fn": _proactive_drill_candidate},
 }
 
 
@@ -412,6 +462,8 @@ def select_cognitive_trigger(
     learner_context: dict[str, Any] | None = None,
     pending_triggers: dict[str, Any] | None = None,
     input_signals: dict[str, Any] | None = None,
+    uncertain_concepts: list[str] | None = None,
+    last_drill_offer_at: float | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Select at most one cognitive trigger for the current turn."""
@@ -441,9 +493,11 @@ def select_cognitive_trigger(
         "learner_context": learner_context,
         "pending_triggers": pending_triggers or {},
         "input_signals": input_signals or {},
+        "uncertain_concepts": uncertain_concepts or [],
+        "last_drill_offer_at": last_drill_offer_at,
         "now": reference,
     }
-    for name in ("self_assessment_due", "review_due", "follow_up"):
+    for name in ("self_assessment_due", "review_due", "follow_up", "proactive_drill"):
         spec = _CANDIDATE_REGISTRY.get(name) or {}
         if not spec.get("enabled"):
             continue
