@@ -188,6 +188,7 @@ def test_entry_point_count() -> None:
                    # Phase X new wrappers (maintenance + sub-commands)
                    "sync-index-metadata", "drill-grade-prepare", "learn-feedback",
                    "learn-self-assess", "learn-drill", "learner-profile",
+                   "learn-beginner-flag",  # W7: self-declared beginner override
                    "set-profile", "show-profile", "reviewer-profile",
                    "rag-remote-build",
                    # Phase Y6 onboarding chain fix (anchors-build wrapper)

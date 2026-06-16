@@ -576,12 +576,18 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     event_id = f"ask-{int(time.time() * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
                     # Phase Y11 P1.2 — derive learner_context from v3 profile
                     # (mastered + proficient → must_skip_explanations_of).
-                    # Caller-provided learner_context wins if given.
+                    # W7: subtract self-declared-beginner concepts so a concept the
+                    # learner says they're new to is always re-explained, even if
+                    # mastery over-promoted it. Caller-provided learner_context wins.
                     derived_context = req.get("learner_context")
                     if derived_context is None:
+                        beginner = set(
+                            getattr(profile, "self_declared_beginner_concepts", []) or []
+                        )
                         skip_targets = sorted(
-                            set(profile.mastered_concepts)
-                            | set(getattr(profile, "proficient_concepts", []))
+                            (set(profile.mastered_concepts)
+                             | set(getattr(profile, "proficient_concepts", [])))
+                            - beginner
                         )
                         if skip_targets:
                             derived_context = {

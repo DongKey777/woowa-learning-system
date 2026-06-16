@@ -244,6 +244,7 @@ python3 bin/ask "테스트"
 | 미션 repo onboarded 후 첫 진입 | `bin/assess-learner-state --repo <r> --path missions/<r> --silent` |
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
+| 세션이 **판단**상 학습자가 특정 개념을 *아직 잘 모른다/처음/기초부터*로 드러낼 때 (W7 — 키워드 매칭 아닌 의미 판단) | `bin/learn-beginner-flag --concept <id> --silent` — 그 concept를 `must_skip_explanations_of`에서 제외(mastery 과승급 자기신고 override). 확실히 익혔으면 `--clear` |
 
 ### 4.7 Phase U-X auto-call (2026-05-26 신설 45 wrappers)
 

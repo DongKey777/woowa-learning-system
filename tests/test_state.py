@@ -97,3 +97,25 @@ def test_drill_pending_fresh_offer_kept(tmp_path: Path) -> None:
     pending = _load_pending_triggers(tmp_path, now=NOW)
     assert "review_drill" in pending
     assert dp.exists()
+
+
+def test_beginner_flags_round_trip(tmp_path: Path) -> None:
+    # W7: self-declared-beginner concept list save/load (deduped).
+    from core.state import load_beginner_flags, save_beginner_flags
+    assert load_beginner_flags(tmp_path) == []
+    save_beginner_flags(["a/x", "a/y", "a/x"], tmp_path)
+    assert load_beginner_flags(tmp_path) == ["a/x", "a/y"]
+
+
+def test_load_profile_populates_beginner_flags(tmp_path: Path) -> None:
+    # W7: load_profile surfaces the self-declared-beginner list on LearnerProfile.
+    from core.state import load_profile, save_beginner_flags
+    learner = tmp_path / "learner"
+    learner.mkdir(parents=True)
+    (learner / "profile.json").write_text(json.dumps({
+        "schema_version": "v3", "learner_id": "t",
+        "concepts": {"proficient": ["language/java-exception-handling-basics"]},
+    }), encoding="utf-8")
+    save_beginner_flags(["language/java-exception-handling-basics"], tmp_path)
+    p = load_profile("t", state_root=tmp_path)
+    assert p.self_declared_beginner_concepts == ["language/java-exception-handling-basics"]

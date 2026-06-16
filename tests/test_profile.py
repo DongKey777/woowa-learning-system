@@ -261,6 +261,15 @@ def test_build_unified_projection_is_deterministic() -> None:
     assert a["reconciled"]["priority_focus"] == ["spring/bean"]
 
 
+def test_unified_projection_must_skip_excludes_beginner() -> None:
+    # W7: a self-declared-beginner concept is never must_skip'd even if proficient.
+    profile = {"concepts": {"proficient": ["spring/x", "spring/y"], "mastered": []}}
+    proj = build_unified_projection(profile, beginner_concepts=["spring/x"])
+    skip = proj["coach_view"]["must_skip_explanations_of"]
+    assert "spring/x" not in skip
+    assert "spring/y" in skip
+
+
 def test_rebuild_unified_projection_writes_file(tmp_path: Path) -> None:
     sr = _seed(tmp_path, [
         {"event_type": "drill_answer", "mode": "learning", "ts": time.time(),

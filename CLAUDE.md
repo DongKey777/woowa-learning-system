@@ -289,6 +289,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | 학습자가 미션 repo onboarded 후 첫 coaching 진입 시 | `bin/assess-learner-state --repo <r> --path missions/<r> --learner-login <l> --silent` |
 | 매 10 turn마다 OR *"내 상태"*, *"learning profile"* 발화 | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
+| **세션이 판단**상 학습자가 특정 개념을 *아직 잘 모른다 / 처음 접한다 / 기초부터 다시 필요*로 드러낼 때 (W7 — **키워드 매칭이 아니라 의미 판단**; 라우터 모드 선택과 동일 원리) | `bin/learn-beginner-flag --concept <id> --silent` (해당 concept를 `must_skip_explanations_of`에서 제외해 항상 재설명. mastery 과승급을 학습자 자기신고로 override). 학습자가 그 개념을 확실히 익혔다고 판단되면 `--clear`로 해제 |
 
 모두 default `--silent` — stdout 노이즈 없음, AI session이 결과를 한국어로 narrate.
 
