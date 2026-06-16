@@ -537,6 +537,36 @@ def test_learn_response_quality_cli_inherits_mode_from_source_event(tmp_path: Pa
     assert row["mode_source"] == "explicit"
 
 
+def test_learn_response_quality_cli_rejects_orphan_in_development_mode(tmp_path: Path) -> None:
+    # W5: a non-learning orphan must also be rejected (exit 2 + repair queue),
+    # not silently recorded with empty citations.
+    state = tmp_path / "state"
+    body = "[Mode: cs_qa]\n\n답변 본문"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-orphan-dev",
+            "--response-file", "-",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "WOOWA_SESSION_MODE": "development"},
+    )
+    assert proc.returncode == 2, proc.stderr
+    # No silent response-quality row written.
+    assert not (state / "learner" / "response-quality.jsonl").exists()
+    # Repair entry enqueued instead.
+    queue = state / "learner" / "capture-repair-queue.jsonl"
+    assert queue.exists()
+    row = json.loads(queue.read_text(encoding="utf-8"))
+    assert row["reason"] == "orphan_source_event"
+
+
 def test_learn_response_quality_cli_summary_only_marks_body_not_captured(
     tmp_path: Path,
 ) -> None:
