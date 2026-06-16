@@ -45,6 +45,15 @@ def _iter_jsonl(path: Path):
             continue
 
 
+_NON_LEARNING_MODES = frozenset({"development", "test"})
+
+
+def _is_learning_event(ev: dict) -> bool:
+    """W2: exclude development/test telemetry from learner-facing analytics
+    (missing mode is treated as learning, matching core/reformulate.py)."""
+    return str(ev.get("mode") or "learning") not in _NON_LEARNING_MODES
+
+
 def _repeated_concepts(rag_events: list[dict]) -> list[dict]:
     """concept_id → {times_asked, repos} for concepts asked ≥2× (re-asked)."""
     times: Counter[str] = Counter()
@@ -99,6 +108,8 @@ def _quality_trend(state_root: Path) -> dict:
     total = 0
     flags: Counter[str] = Counter()
     for row in _iter_jsonl(path):
+        if not _is_learning_event(row):
+            continue
         total += 1
         for f in (row.get("quality_flags") or []):
             if f:
@@ -134,7 +145,7 @@ def analyze(learner_login: str = "DongKey777",
     history = state_root / "learner" / "history.jsonl"
     rag_events = [
         ev for ev in _iter_jsonl(history)
-        if ev.get("event_type") == "rag_ask"
+        if ev.get("event_type") == "rag_ask" and _is_learning_event(ev)
     ]
 
     mastery_distribution = _mastery_distribution(state_root)
