@@ -21,6 +21,7 @@ from pathlib import Path
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 
 EPHEMERAL_PENDING_KEYS = frozenset({"review_drill"})
+DRILL_PENDING_TTL_SECS = 24 * 3600  # W8: stale drill offer expiry (epoch created_at)
 VALID_LEARNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$")
 
 def _validate_learner_id(learner_id: str) -> None:
@@ -111,9 +112,24 @@ def _load_pending_triggers(state_root: Path, now=None) -> dict:
     dp = state_root / "learner" / "drill_pending.json"
     if dp.exists() and "review_drill" not in triggers:
         try:
-            triggers["review_drill"] = json.loads(dp.read_text(encoding="utf-8"))
+            offer = json.loads(dp.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            pass
+            offer = None
+        if isinstance(offer, dict):
+            # W8: drill_pending TTL on epoch created_at (disjoint from W1's ISO
+            # expiry above). A stale offer is dropped AND its file unlinked so it
+            # stops hijacking cs_qa (intent.py DRILL_ANSWER_HINT) and unblocks
+            # build_offer_if_due's one-open guard. A timestamp-less offer is kept
+            # (real offers always carry created_at; honors the review_drill contract).
+            now_epoch = now.timestamp() if now is not None else time.time()
+            created_at = offer.get("created_at")
+            if isinstance(created_at, (int, float)) and now_epoch - created_at > DRILL_PENDING_TTL_SECS:
+                try:
+                    dp.unlink()
+                except OSError:
+                    pass
+            else:
+                triggers["review_drill"] = offer
     return triggers
 
 

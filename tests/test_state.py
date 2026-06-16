@@ -73,3 +73,27 @@ def test_keeps_timestampless_pending_entry(tmp_path: Path) -> None:
     _write(tmp_path, "pending_triggers.json", {"some_trigger": {"trigger_session_id": "x1"}})
     pending = _load_pending_triggers(tmp_path, now=NOW)
     assert "some_trigger" in pending
+
+
+def test_drill_pending_ttl_drops_and_unlinks_stale(tmp_path: Path) -> None:
+    # W8: a stale drill_pending (created_at > 24h ago) is dropped on load AND its
+    # file unlinked — stops the cs_qa hijack and unblocks fresh offers.
+    _write(tmp_path, "drill_pending.json", {
+        "drill_session_id": "d1",
+        "created_at": (NOW - timedelta(hours=25)).timestamp(),
+    })
+    dp = tmp_path / "learner" / "drill_pending.json"
+    pending = _load_pending_triggers(tmp_path, now=NOW)
+    assert "review_drill" not in pending
+    assert not dp.exists()  # unlinked
+
+
+def test_drill_pending_fresh_offer_kept(tmp_path: Path) -> None:
+    # W8: a fresh drill offer (created_at within TTL) is merged as review_drill.
+    _write(tmp_path, "drill_pending.json", {
+        "drill_session_id": "d2", "created_at": NOW.timestamp(),
+    })
+    dp = tmp_path / "learner" / "drill_pending.json"
+    pending = _load_pending_triggers(tmp_path, now=NOW)
+    assert "review_drill" in pending
+    assert dp.exists()
