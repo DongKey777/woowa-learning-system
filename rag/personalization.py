@@ -25,8 +25,10 @@ from rag.search import SearchHit
 MASTERED_DELTA = -0.15
 UNCERTAIN_DELTA = 0.10
 # W12: personalization reorders by bounded RANK MOVE (not a global score re-sort)
-# so fusion's score-blind positional refinements survive. A matched hit moves at
-# most this many ranks (mastered = down, uncertain = up).
+# so fusion's score-blind positional refinements survive. A matched hit's target
+# rank shifts by this offset; among non-matched neighbors the effective move is a
+# single adjacent swap (mastered = down, uncertain = up) — the full offset only
+# applies across consecutive matched items.
 RANK_STEP = 2
 CONCEPT_PREFIX = "concept:"
 

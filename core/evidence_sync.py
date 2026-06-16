@@ -164,24 +164,27 @@ def sync_repo(
                     mentor_accept_emitted += len(concepts)
 
             # 3. mentor_accept — resolved threads (learner replied to mentor root).
-            reply_ids = {
-                r["in_reply_to_github_comment_id"] for r in conn.execute(
-                    "SELECT in_reply_to_github_comment_id FROM "
-                    "pull_request_review_comments_current WHERE pull_request_id=? AND user_login=?",
-                    (pr_id, learner_login),
-                ).fetchall() if r["in_reply_to_github_comment_id"]
-            }
+            reply_ts: dict = {}
+            for r in conn.execute(
+                "SELECT in_reply_to_github_comment_id, created_at FROM "
+                "pull_request_review_comments_current WHERE pull_request_id=? AND user_login=?",
+                (pr_id, learner_login),
+            ).fetchall():
+                rid = r["in_reply_to_github_comment_id"]
+                if rid is not None:
+                    reply_ts.setdefault(rid, r["created_at"])
             for a in anchors:
                 if a.pr_number != number or not a.topic_concept_ids:
                     continue
                 cid = _anchor_comment_id(a.thread_id)
-                if cid is not None and cid in reply_ids:
+                if cid is not None and cid in reply_ts:
                     ingest_mentor_accept(
                         a.topic_concept_ids, state_root=state_root,
-                        # W6: use the PR's real merged_at (deterministic, consistent
-                        # with pr_merge/review_approved) instead of ts=now (None ->
-                        # wall-clock, non-deterministic across runs).
-                        ts=_parse_iso(merged_at),
+                        # W6: use the learner reply's created_at (the thread
+                        # resolution time — always present + deterministic, works
+                        # for unmerged PRs too), falling back to merged_at then the
+                        # caller's `now`; never bare wall-clock.
+                        ts=_parse_iso(reply_ts[cid]) or _parse_iso(merged_at) or now,
                         payload={"repo": repo, "pr_number": number,
                                  "signal": "thread_resolved", "thread_id": a.thread_id},
                         dedup_prefix=f"mentor_accept:thread:{repo}:{cid}",

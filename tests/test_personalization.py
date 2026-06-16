@@ -131,3 +131,15 @@ def test_head_never_displaced_by_promoted_tail() -> None:
     hits = [_hit("spring/head", 0.9), _hit("spring/grow", 0.5), _hit("a/z", 0.4)]
     out = [h.concept_id for h in adjust(hits, uncertain_concepts=["spring/grow"])]
     assert out[0] == "spring/head"
+
+
+def test_mastered_tail_item_demoted_bounded() -> None:
+    # W12: a mastered NON-head item moves DOWN by a bounded step; head pinned,
+    # non-matched relative order preserved (the demote direction, symmetric to
+    # the uncertain promote test).
+    hits = [_hit("spring/head", 0.9), _hit("a/one", 0.5), _hit("spring/known", 0.4),
+            _hit("a/three", 0.3), _hit("a/four", 0.2)]
+    out = [h.concept_id for h in adjust(hits, mastered_concepts=["spring/known"])]
+    assert out[0] == "spring/head"                       # head pinned
+    assert out.index("spring/known") == 3                # 2 -> 3 (demoted, bounded)
+    assert out.index("a/three") < out.index("a/four")    # non-matched order preserved

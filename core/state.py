@@ -15,6 +15,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def _history_path(state_root: Path) -> Path:
     return state_root / "learner" / "history.jsonl"
 
 
-def _load_pending_triggers(state_root: Path, now=None) -> dict:
+def _load_pending_triggers(state_root: Path, now: datetime | None = None) -> dict:
     """Merge learner-level pending_triggers.json + drill_pending.json.
 
     review_drill comes from drill_pending.json (ephemeral, not stored in
