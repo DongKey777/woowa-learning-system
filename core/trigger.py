@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal
 
 from core.state import DEFAULT_STATE_ROOT
 
-TriggerType = Literal["self_assessment", "review_drill", "follow_up", "none"]
+TriggerType = Literal["self_assessment", "review_drill", "follow_up", "proactive_drill", "none"]
 
 RECENT_CODE_WINDOW_SECS = 86_400
 
@@ -423,7 +423,7 @@ def _proactive_drill_candidate(
     writes drill_pending.json + the offer marker). Sits LAST in the priority FSM."""
     if drill_pending is not None:
         return None
-    uncertain = [c for c in (uncertain_concepts or []) if c]
+    uncertain = list(dict.fromkeys(c for c in (uncertain_concepts or []) if c))
     if len(uncertain) < N_PROACTIVE_UNCERTAIN:
         return None
     last_activity = max(last_drill_offer_at or 0.0, _last_drill_answer_ts(history))
