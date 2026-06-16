@@ -240,3 +240,16 @@ def test_quality_trend_excludes_dev_test_rows(tmp_path: Path) -> None:
     ])
     rep = analyze(LEARNER, tmp_path, now=NOW)
     assert rep["quality_trend"]["total_quality_events"] == 2   # learning + missing only
+
+
+def test_repeated_concepts_dedups_within_event(tmp_path: Path) -> None:
+    # W6: a concept listed twice in ONE event must not count as 2 asks.
+    ev = json.dumps({
+        "event_id": "e1", "ts": NOW, "event_type": "rag_ask", "mode": "learning",
+        "learner_id": LEARNER, "repo": A,
+        "payload": {"router_mode": "cs_qa", "top_concept_ids": [STICKY, STICKY]},
+    }, ensure_ascii=False)
+    _write_history(tmp_path, [ev])
+    rep = analyze(LEARNER, tmp_path, now=NOW)
+    # one event -> STICKY counted once -> below the >=2 threshold -> not repeated.
+    assert all(c["concept_id"] != STICKY for c in rep["repeated_concepts"])

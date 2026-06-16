@@ -62,9 +62,9 @@ def _repeated_concepts(rag_events: list[dict]) -> list[dict]:
         payload = ev.get("payload") or {}
         repo = payload.get("repo") or ev.get("repo") or None
         repo_label = repo if repo else _NO_REPO
-        for cid in payload.get("top_concept_ids") or []:
-            if not cid:
-                continue
+        # W6: dedup per event so one event listing a concept twice counts once
+        # toward the >=2 re-ask signal.
+        for cid in dict.fromkeys(c for c in (payload.get("top_concept_ids") or []) if c):
             times[cid] += 1
             repos[cid].add(repo_label)
     out = [

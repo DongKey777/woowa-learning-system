@@ -177,7 +177,11 @@ def sync_repo(
                 cid = _anchor_comment_id(a.thread_id)
                 if cid is not None and cid in reply_ids:
                     ingest_mentor_accept(
-                        a.topic_concept_ids, state_root=state_root, ts=now,
+                        a.topic_concept_ids, state_root=state_root,
+                        # W6: use the PR's real merged_at (deterministic, consistent
+                        # with pr_merge/review_approved) instead of ts=now (None ->
+                        # wall-clock, non-deterministic across runs).
+                        ts=_parse_iso(merged_at),
                         payload={"repo": repo, "pr_number": number,
                                  "signal": "thread_resolved", "thread_id": a.thread_id},
                         dedup_prefix=f"mentor_accept:thread:{repo}:{cid}",
