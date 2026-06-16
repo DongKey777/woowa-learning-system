@@ -126,8 +126,17 @@ def _extract_concepts(payload: dict) -> list[str]:
 
 
 def _extract_score(payload: dict, source: str) -> float:
-    """Normalize score to 0..1 for record_evidence weight scaling."""
-    if source != "drill_score":
+    """Normalize score to 0..1 for record_evidence weight scaling.
+
+    Both drill_score and self_assess carry a learner-reported score that must
+    scale evidence weight: a "2/10" self-assessment is the learner saying they
+    are NOT confident and must not earn the same mastery credit as "9/10". W4b:
+    previously only drill_score honored the score; self_assess silently returned
+    1.0, so every self-assessment promoted as full confidence regardless of the
+    reported number. The live emitter stores self_assess score already in 0..1;
+    the >1.0 legacy /10 path keeps history replay of 10-point events correct.
+    """
+    if source not in ("drill_score", "self_assess"):
         return 1.0
     raw = payload.get("score")
     if raw is None:

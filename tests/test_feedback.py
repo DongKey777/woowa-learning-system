@@ -139,6 +139,45 @@ def test_replay_excludes_development_mode(tmp_path: Path) -> None:
     assert get("dev/x", state_root=tmp_path) is None
 
 
+def test_extract_score_honors_self_assess(tmp_path: Path) -> None:
+    """W4b: self_assess score scales evidence weight (was hard-coded 1.0)."""
+    from core.feedback import _extract_score
+    # live emitter stores 0..1 already
+    assert _extract_score({"score": 0.3}, "self_assess") == 0.3
+    assert _extract_score({"score": 0.9}, "self_assess") == 0.9
+    # legacy 10-point self_assessment events in history replay still normalize
+    assert _extract_score({"score": 2}, "self_assess") == 0.2
+    # no score → calibration-only full weight (1 self_assess never promotes anyway)
+    assert _extract_score({}, "self_assess") == 1.0
+    # drill_score unchanged; unrelated sources untouched
+    assert _extract_score({"score": 0.4}, "drill_score") == 0.4
+    assert _extract_score({"score": 0.5}, "mission_use") == 1.0
+
+
+def test_self_assess_low_score_records_lower_weight(tmp_path: Path) -> None:
+    """W4b end-to-end: a low self-assessment stores less evidence weight than a
+    high one (before, both stored full weight regardless of the reported score)."""
+    import sqlite3
+
+    def weight_for(score: float, cid: str) -> float:
+        record_turn(
+            {"event_type": "self_assessment",
+             "payload": {"concept_id": cid, "score": score}},
+            state_root=tmp_path,
+        )
+        conn = sqlite3.connect(str(tmp_path / "learner" / "mastery_graph.sqlite"))
+        w = conn.execute(
+            "SELECT weight FROM evidence WHERE concept_id=?", (cid,)
+        ).fetchone()[0]
+        conn.close()
+        return w
+
+    low = weight_for(0.2, "spring/low")
+    high = weight_for(1.0, "spring/high")
+    assert low < high  # "2/10" must not earn the same mastery credit as "10/10"
+    assert low == high * 0.2  # weight scales linearly with the reported score
+
+
 def test_drill_score_normalized_from_legacy_10_point(tmp_path: Path) -> None:
     """score=8 → weight 0.7 × 0.8 = 0.56 (exactly mastered threshold)."""
     now = 1_000_000.0
