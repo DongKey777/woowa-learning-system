@@ -1,0 +1,56 @@
+{
+  "id": "spring/service-transaction-readonly-placement-primer",
+  "title": "Service 계층의 @Transactional(readOnly=true) 배치 입문",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "Spring 미션에서 @Transactional(readOnly=true)를 어디에 붙일지 설명한다. Controller나 Repository가 아니라 유스케이스를 조립하는 Service 계층에 의도를 표시하고, readOnly가 쓰기 방지 장치가 아니라 조회 의도와 flush 최적화 힌트라는 점을 구분한다.",
+  "body_markdown": "# Service 계층의 @Transactional(readOnly=true) 배치 입문\n\n> 한 줄 요약: `@Transactional(readOnly=true)`는 조회 유스케이스의 의도를 Service 계층에 적는 표시다. 쓰기를 절대 막는 안전장치로 믿으면 안 된다.\n\n**난이도: Beginner**\n\n관련 문서:\n\n- [Transactional Basics](./transactional-basics.md)\n- [Service Layer Transaction Boundary Patterns](./service-layer-transaction-boundary-patterns.md)\n- [Transactional Readonly FlushMode Caveats](./transactional-readonly-flushmode-caveats.md)\n- [Transaction Isolation Readonly Pitfalls](./transaction-isolation-readonly-pitfalls.md)\n\nretrieval-anchor-keywords: Spring @Transactional readOnly placement, service transaction boundary, readOnly true, 조회 트랜잭션, transactional service layer, flush mode, write prevention misconception\n\n## 리뷰에서 자주 보이는 증상\n\n| 코드나 질문 | 리뷰어가 보는 위험 | 먼저 잡을 기준 |\n|---|---|---|\n| Controller 메서드에 `@Transactional(readOnly=true)`를 붙인다 | HTTP 경계가 DB 트랜잭션 경계를 직접 안다 | Service 유스케이스에 둔다 |\n| Repository에만 readOnly를 붙인다 | 여러 repository 호출을 묶는 경계가 없다 | 조립 단위는 Service다 |\n| class 전체에 readOnly를 붙이고 쓰기 메서드도 그대로 둔다 | 쓰기 유스케이스 의도가 흐려진다 | command 메서드는 명시적으로 readOnly를 끈다 |\n| readOnly면 save가 절대 안 된다고 믿는다 | 환경과 JPA 동작에 따라 다르다 | 의도 표시와 write prevention을 구분한다 |\n\n## 왜 Service 계층인가\n\n트랜잭션은 보통 하나의 유스케이스를 묶는다. 예약 조회, 예약 생성, 예약 취소처럼 사용자가 요청한 일을 끝까지 처리하는 단위다. 이 조립은 Controller보다 안쪽, Repository보다 바깥쪽인 Service가 맡는다.\n\nController는 HTTP 요청과 응답을 다룬다. Repository는 저장소 접근을 다룬다. 여러 Repository 호출과 도메인 규칙을 하나의 흐름으로 묶는 곳이 Service라서 트랜잭션 경계도 Service에 두는 것이 읽기 쉽다.\n\n## readOnly의 의미\n\n`readOnly=true`는 이 메서드가 조회 의도라는 신호다. JPA에서는 flush 모드나 dirty checking 비용과 관련된 최적화 힌트로 이어질 수 있다. 하지만 이것만으로 모든 쓰기가 물리적으로 막힌다고 생각하면 위험하다.\n\n그래서 readOnly는 다음처럼 읽어야 한다.\n\n| 관점 | 맞는 이해 | 위험한 이해 |\n|---|---|---|\n| 의도 | 이 유스케이스는 조회다 | 이 메서드 안에서는 절대 쓰기가 불가능하다 |\n| 위치 | Service의 query 메서드에 둔다 | Controller나 모든 Repository에 흩뿌린다 |\n| class level | 조회가 대부분인 Service에서 기본값으로 쓸 수 있다 | 쓰기 메서드 override를 잊어도 괜찮다 |\n| 성능 | flush 관련 비용을 줄이는 힌트가 될 수 있다 | 성능 문제를 자동으로 해결한다 |\n\n## 배치 예시\n\n조회와 명령을 같은 Service에 둘 때는 class level 기본값을 조심해서 쓴다.\n\n```java\n@Service\n@Transactional(readOnly = true)\npublic class ReservationService {\n    public List<ReservationResponse> findAll() {\n        return reservationRepository.findAll().stream().map(ReservationResponse::from).toList();\n    }\n\n    @Transactional\n    public ReservationResponse create(ReservationRequest request) {\n        Reservation reservation = reservationRepository.save(request.toReservation());\n        return ReservationResponse.from(reservation);\n    }\n}\n```\n\n이 예시에서 class level은 조회 기본값이다. 쓰기 메서드인 `create`는 `@Transactional`로 다시 표시해 command 의도를 분명히 한다. 팀이 class level 기본값을 헷갈려 한다면 메서드마다 붙이는 방식이 더 읽기 쉬울 수 있다.\n\n## 흔한 오해\n\n| 오해 | 바로잡기 |\n|---|---|\n| readOnly는 쓰기 방지 보안 장치다 | 주된 의미는 조회 의도와 JPA flush 힌트다 |\n| Repository에 붙이면 충분하다 | 유스케이스 전체 경계는 여러 Repository 호출을 묶는 Service에 있다 |\n| Controller에 붙이면 더 바깥이라 안전하다 | HTTP 경계와 트랜잭션 경계가 섞인다 |\n| 모든 Service class에 readOnly 기본값을 붙이면 좋다 | 쓰기 메서드 override를 놓치면 의도가 흐려진다 |\n\n## 미션에서 적용하는 순서\n\n1. Service 메서드를 조회 query와 변경 command로 나눈다.\n2. query 메서드에 `@Transactional(readOnly=true)`를 붙인다.\n3. command 메서드는 `@Transactional`로 쓰기 의도를 분명히 한다.\n4. class level readOnly를 쓸 때는 모든 쓰기 메서드가 override됐는지 확인한다.\n5. readOnly가 실제 flush와 isolation에서 어떻게 동작하는지는 고급 caveat 문서로 넘긴다.\n\n## 다음 문서로 가는 길\n\n- 트랜잭션 자체가 처음이면 `spring/transactional-basics`를 먼저 본다.\n- Service 경계를 어디로 잡을지 모르겠다면 `spring/service-layer-transaction-boundary-patterns`로 간다.\n- readOnly와 flush mode의 실제 함정은 `spring/transactional-readonly-flushmode-caveats`에서 더 자세히 본다.",
+  "aliases": [
+    "Transactional readOnly placement",
+    "@Transactional(readOnly=true)",
+    "readOnly transaction service",
+    "조회 트랜잭션",
+    "Service 트랜잭션 경계",
+    "readOnly true 위치",
+    "transactional service layer",
+    "readOnly write prevention",
+    "transaction readonly flush mode placement",
+    "Spring readOnly transaction"
+  ],
+  "expected_queries": [
+    "@Transactional(readOnly=true)는 Controller, Service, Repository 중 어디에 붙여야 해?",
+    "readOnly=true면 save가 절대 안 되는 건지 아니면 조회 의도 표시인지 알려줘",
+    "Service class 전체에 readOnly를 붙이고 쓰기 메서드만 @Transactional로 바꿔도 돼?",
+    "Spring 미션에서 조회 메서드와 생성 메서드의 트랜잭션 어노테이션을 어떻게 나눠야 해?",
+    "readOnly transaction과 flush mode caveat는 어떤 관계야?"
+  ],
+  "symptoms": [
+    "Controller나 Repository에 트랜잭션 어노테이션을 흩뿌려 유스케이스 경계가 보이지 않는다",
+    "readOnly=true를 쓰기 방지 장치로 오해해 dirty checking과 flush 동작을 잘못 설명한다",
+    "class level readOnly를 붙인 뒤 command 메서드의 @Transactional override를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transactional-basics",
+      "spring/service-layer-transaction-boundary-patterns"
+    ],
+    "next_docs": [
+      "spring/transactional-readonly-flushmode-caveats",
+      "spring/transaction-isolation-readonly-pitfalls"
+    ],
+    "confusable_with": [
+      "spring/transactional-basics",
+      "spring/service-layer-transaction-boundary-patterns",
+      "spring/transactional-readonly-flushmode-caveats"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-16",
+    "last_modified": "2026-06-16",
+    "batch": "y14_expansion_batch9",
+    "revision_history": []
+  }
+}
