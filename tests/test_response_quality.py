@@ -497,6 +497,46 @@ def test_learn_response_quality_cli_rejects_orphan_source_event(tmp_path: Path) 
     assert row["reason"] == "orphan_source_event"
 
 
+def test_learn_response_quality_cli_inherits_mode_from_source_event(tmp_path: Path) -> None:
+    # W3: a non-orphan CLI capture inherits mode/mode_source from the source
+    # rag_ask event, not re-derived from the CLI process env.
+    state = tmp_path
+    learner_dir = state / "learner"
+    learner_dir.mkdir(parents=True)
+    source = {
+        "event_id": "ask-w3",
+        "event_type": "rag_ask",
+        "mode": "development",
+        "mode_source": "explicit",
+        "payload": {"top_concept_ids": ["database/lock-basics"]},
+    }
+    (learner_dir / "history.jsonl").write_text(
+        json.dumps(source) + "\n", encoding="utf-8"
+    )
+    body = "[Mode: cs_qa]\n\n본문\n\n참고:\n- database/lock-basics\n"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "bin" / "learn-response-quality"),
+            "--source-event-id", "ask-w3",
+            "--response-file", "-",
+            "--learner-id", "testuser",
+            "--state-root", str(state),
+            "--silent",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        # env says learning; source event says development → must inherit source.
+        env={**os.environ, "WOOWA_SESSION_MODE": "learning"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads((state / "learner" / "response-quality.jsonl").read_text())
+    assert row["mode"] == "development"
+    assert row["mode_source"] == "explicit"
+
+
 def test_learn_response_quality_cli_summary_only_marks_body_not_captured(
     tmp_path: Path,
 ) -> None:
