@@ -173,8 +173,9 @@ def test_rag_hits_personalized_on_active_path(tmp_path: Path) -> None:
             learner_profile=profile,
         )
 
-    assert out["rag_hits"][0]["concept_id"] == "spring/component"
-    assert out["rag_hits"][1]["concept_id"] == "spring/bean"
+    # W12: head (spring/bean) is pinned; the mastered delta is still applied/recorded.
+    assert out["rag_hits"][0]["concept_id"] == "spring/bean"
+    assert out["rag_hits"][1]["concept_id"] == "spring/component"
     assert out["personalization"]["enabled"] is True
     assert out["personalization"]["mastered_applied"] == ["spring/bean"]
 
@@ -212,5 +213,6 @@ def test_proficient_concepts_demote_like_mastered(tmp_path: Path) -> None:
             learner_profile=profile,
         )
 
-    assert out["rag_hits"][0]["concept_id"] == "spring/component"
+    # W12: head (spring/bean) pinned; proficient treated as mastered (recorded).
+    assert out["rag_hits"][0]["concept_id"] == "spring/bean"
     assert out["personalization"]["mastered_applied"] == ["spring/bean"]

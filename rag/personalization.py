@@ -24,6 +24,10 @@ from rag.search import SearchHit
 
 MASTERED_DELTA = -0.15
 UNCERTAIN_DELTA = 0.10
+# W12: personalization reorders by bounded RANK MOVE (not a global score re-sort)
+# so fusion's score-blind positional refinements survive. A matched hit moves at
+# most this many ranks (mastered = down, uncertain = up).
+RANK_STEP = 2
 CONCEPT_PREFIX = "concept:"
 
 
@@ -68,23 +72,38 @@ def adjust(
     mastered_concepts: Iterable[str] = (),
     uncertain_concepts: Iterable[str] = (),
 ) -> list[SearchHit]:
-    """Return hits with scores adjusted by mastered/uncertain matches.
+    """Return hits reordered by mastered/uncertain matches.
 
-    Stable ordering: ties broken by original index (Python's sorted is stable).
-    Mutation-free: each SearchHit replaced via dataclasses.replace.
+    W12: the score delta is kept as a telemetry/payload annotation, but ordering
+    is by BOUNDED RANK MOVE rather than a global sort-by-score. This preserves
+    fusion's score-blind positional refinements (``_refine_confusable_order``,
+    ``_promote_canonical_candidate``) — which a global re-sort discarded — and
+    avoids the old "uncertain hit jumps unconditionally to rank 2" behavior. The
+    dense head (rank 0) is pinned so a strong top-1 is never displaced by an
+    RRF-noise tail item. Non-matched items keep their relative fusion order.
+
+    Pure function, mutation-free: each SearchHit replaced via dataclasses.replace.
     """
     mastered = [m for m in mastered_concepts if m]
     uncertain = [u for u in uncertain_concepts if u]
     if not hits or (not mastered and not uncertain):
         return list(hits)
 
-    adjusted: list[SearchHit] = []
-    for hit in hits:
+    annotated: list[SearchHit] = []
+    targets: list[int] = []
+    for i, hit in enumerate(hits):
         delta = 0.0
+        move = 0
         if any(_matches_family(hit.concept_id, m) for m in mastered):
             delta += MASTERED_DELTA
+            move += RANK_STEP   # demote: learner already knows this
         if any(_matches_family(hit.concept_id, u) for u in uncertain):
             delta += UNCERTAIN_DELTA
-        adjusted.append(replace(hit, score=hit.score + delta))
-    adjusted.sort(key=lambda h: -h.score)
-    return adjusted
+            move -= RANK_STEP   # promote: learner's growth edge
+        annotated.append(replace(hit, score=hit.score + delta))
+        # Head (rank 0) is pinned; tail items move by a bounded step but can
+        # never rise above the head (clamp to >= 1).
+        targets.append(-1 if i == 0 else max(1, i + move))
+    # Stable sort by target rank; ties keep fusion order (original index).
+    order = sorted(range(len(hits)), key=lambda i: (targets[i], i))
+    return [annotated[i] for i in order]
