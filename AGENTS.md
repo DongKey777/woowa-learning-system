@@ -2,6 +2,97 @@
 
 이 문서는 Claude 외 AI 세션(Codex CLI, ChatGPT Plus/Pro, Gemini CLI, OpenAI SDK 등)이 이 repo에 진입했을 때의 행동 contract다. [`CLAUDE.md`](CLAUDE.md)와 동일한 system contract를 따른다. 톤만 OpenAI/Gemini 환경에 맞춰 조정.
 
+## 0. Project Knowledge Base (init-deep)
+
+**Generated:** 2026-06-12
+**Commit:** `b292f17`
+**Branch:** `main`
+
+### Overview
+
+Woowa mission learning system: Python flat-layout RAG daemon + CLI wrappers + learner telemetry + Java mission workspace. Runtime path is `bin/ask` → `core/daemon.py` → `core/router.py` / `core/coach.py`.
+
+### Structure
+
+```text
+woowa-learning-system/
+├── bin/        # 81+ user/operator commands; thin wrappers over core/rag/mission
+├── core/       # daemon, routing, prompt, state, telemetry, learner profile
+├── rag/        # corpus load, BGE-M3 encode, Lance index, retrieval/fusion
+├── mission/    # system-side mission/PR analytics; writes state/repos artifacts
+├── missions/   # learner-owned nested Java/Gradle repos; do not auto-edit
+├── corpus/     # editable concept JSON/schema; graph/index are derived
+├── state/      # gitignored runtime artifacts, daemon sock/pid, telemetry, indexes
+├── tests/      # pytest unit suite plus standalone benchmark gates
+├── scripts/    # collection, migration, mining, RunPod remote build helpers
+└── reports/    # generated benchmark/analysis outputs plus a few generator scripts
+```
+
+### Where To Look
+
+| Task | Location | Notes |
+|---|---|---|
+| First-run setup | `bin/bootstrap`, `bin/setup`, `bin/index-fetch`, `bin/rag-daemon` | learner should not remember commands |
+| Ask/runtime flow | `bin/ask`, `core/daemon.py`, `core/router.py`, `core/lazy_loader.py`, `core/coach.py` | newline-delimited AF_UNIX socket |
+| Retrieval/index | `rag/encoder.py`, `rag/index.py`, `rag/search.py`, `corpus/` | local build maintainer-only |
+| Learner telemetry | `core/response_capture.py`, `core/response_quality.py`, `core/state.py`, `state/learner/` | failures must not block answers |
+| PR/review modes | `mission/*.py`, `core/pr_threads.py`, `core/pr_retro.py`, `anchors/` | live GitHub vs offline archive split |
+| Commands | `docs/bin-reference.md`, `bin/` | wrappers are the public API |
+| Verification | `docs/testing-guide.md`, `tests/`, `tests/benchmarks/release_acceptance.py` | use development session mode |
+
+### Code Map
+
+| Symbol/File | Type | Location | Role |
+|---|---|---|---|
+| `serve()` / `main()` | runtime | `core/daemon.py` | daemon lifecycle and request handling |
+| `RouteDecision` | model | `core/router.py` | selected mode, artifacts, token budget |
+| `compose()` | prompt | `core/coach.py` | final coach prompt and citation hints |
+| `load_artifacts()` | loader | `core/lazy_loader.py` | selective mode artifact hydration |
+| `encode_query()` | retrieval | `rag/encoder.py` | BGE-M3 embedding path |
+| `search()` | retrieval | `rag/search.py` | exact/fallback/personalized search |
+| `MissionPattern` | analytics | `mission/extract.py` | learner Java concept extraction |
+| `ReviewAnchor` | analytics | `anchors/extract.py` | review-thread anchor extraction |
+
+### Conventions
+
+- Flat package layout; `pyproject.toml` explicitly includes `core*`, `rag*`, `scripts*`, `mission*`, `anchors*`, `curation*`.
+- Session mode is explicit: system work sets `WOOWA_SESSION_MODE=development`; learning remains conservative default.
+- Learner-facing progress is Korean and short; command execution is automatic.
+- Full-body response capture is preferred; summary-only is exceptional repair fallback.
+- Benchmarks are direct Python scripts, not pytest-collected tests.
+
+### Anti-Patterns (This Project)
+
+- Do not run `bin/corpus-build` on learner machines; fetch release indexes.
+- Do not silently abort; report cause + next action.
+- Do not auto-edit or auto-clone learner mission repos.
+- Do not post PR replies or review comments automatically.
+- Do not rewrite `--raw-utterance`.
+- Do not manually choose `tool_only` / `tier_0_fallback`.
+- Do not eagerly load all lazy artifacts.
+- Do not let telemetry, drift checks, or capture failures block the learner answer.
+
+### Commands
+
+```bash
+bin/setup --dev
+bin/bootstrap
+python3 -m pytest tests/ -q
+python3 tests/benchmarks/release_acceptance.py
+WOOWA_SESSION_MODE=development python3 tests/benchmarks/rag_quality_regression.py
+WOOWA_SESSION_MODE=development python3 tests/benchmarks/gate_measurements.py
+```
+
+### Child Knowledge Bases
+
+- `bin/AGENTS.md` — CLI wrapper invariants.
+- `core/AGENTS.md` — runtime/state/telemetry contracts.
+- `mission/AGENTS.md` — system-side mission analytics.
+- `missions/AGENTS.md` — learner-owned Java repo boundary.
+- `rag/AGENTS.md` — retrieval/index conventions.
+- `tests/AGENTS.md` — pytest vs benchmark split.
+- `corpus/AGENTS.md` — editable corpus vs derived artifacts.
+
 ## 1. 무엇이 학습자에게 보이고 무엇이 자동인가
 
 학습자가 외울 명령은 **0개**. 학습자는 한국어로 의도만 표현. AI 세션이 모든 명령 자동 실행:
