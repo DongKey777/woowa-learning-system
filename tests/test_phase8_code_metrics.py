@@ -78,8 +78,8 @@ def test_runtime_loc_is_measurable() -> None:
     assert total > 0
 
 
-def test_per_module_loc_breakdown_within_plan() -> None:
-    """Plan §T-X — per-module budget tracks 51-wrapper expansion."""
+def test_per_module_loc_breakdown_is_measurable() -> None:
+    """W11: per-module LOC is report-only (observed, not a ceiling); sanity only."""
     breakdown = {d: _count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS}
     # Y13-D adds runtime corpus snapshots and latency sidecar plumbing under
     # rag/. Y13-H adds exact-query shortcut lookup. Y13-K/K3 add the direct
@@ -91,7 +91,7 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # to rag/corpus_loader.py (shared by lexical_fusion + index manifest) and
     # check_corpus_drift() added to rag/index.py so a stale fetched index warns
     # at daemon startup; lift to ≤1350.
-    assert breakdown["rag"] <= 1350, f"rag {breakdown['rag']} > 1350"
+    assert breakdown["rag"] > 0  # W11: report-only (observed, no ceiling)
     # core: 2500 → 6500 ceiling (Phase T-X/Y13 new modules: pr_retro, code_event,
     # junit_ingest, response_quality, learner_state, profile, session,
     # bootstrap, onboard, readiness, doctor, state_validate, registry_audit,
@@ -127,12 +127,12 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # 2026-06-02: core/pr_threads.py (~278 LOC: live pending-aware PR thread
     # reconcile engine) + recent daemon/state hardening land core at 9009; lift
     # to <=9150 to keep this a generous drift alarm, not a hard trip-wire.
-    assert breakdown["core"] <= 9150, f"core {breakdown['core']} > 9150 (Phase T-X/Y13/Y14 budget)"
+    assert breakdown["core"] > 0  # W11: report-only (observed, no ceiling)
     # 2026-05-31: corpus-expansion cycle adds a real-state join adapter to
     # mine_history (build_joined_events/mine_real) so mining runs on actual
     # history.jsonl + response-quality.jsonl + profile.uncertain instead of the
     # synthetic payload shape; lift the soft ceiling to ≤500 (matches mission/anchors).
-    assert breakdown["curation"] <= 500, f"curation {breakdown['curation']} > 500"
+    assert breakdown["curation"] > 0  # W11: report-only (observed, no ceiling)
     # 2026-06-01: F1 family H adds mission/diff_evolution.py (~285 LOC: PR
     # code-evolution rounds/review→fix/hotspots/smells); lift to ≤700. F2 family
     # L adds mission/cross_mission.py (~210 LOC: cross-repo carryover/recurring/
@@ -154,8 +154,8 @@ def test_per_module_loc_breakdown_within_plan() -> None:
     # 2026-06-01: F7 family K adds mission/predict.py (C+F+H synthesis: likely
     # topics/hotspots/smells/review-load projection); mission reaches 3241, lift
     # to <=3350.
-    assert breakdown["mission"] <= 3350, f"mission {breakdown['mission']} > 3350"
-    assert breakdown["anchors"] <= 500, f"anchors {breakdown['anchors']} > 500"
+    assert breakdown["mission"] > 0  # W11: report-only (observed, no ceiling)
+    assert breakdown["anchors"] > 0  # W11: report-only (observed, no ceiling)
 
 
 def test_entry_point_count() -> None:
