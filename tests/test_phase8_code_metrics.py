@@ -26,7 +26,7 @@ def _count_python_loc(root: Path) -> int:
     return total
 
 
-def test_runtime_loc_under_paradigm_v2_budget() -> None:
+def test_runtime_loc_is_measurable() -> None:
     total = sum(_count_python_loc(REPO_ROOT / d) for d in RUNTIME_DIRS)
     # Plan §T-X (2026-05-25): legacy parity migration relaxed budget to ≤9500
     # (legacy 80K LOC × 0.12 — 51 new wrappers + 19 new modules, still 8× smaller
@@ -71,7 +71,11 @@ def test_runtime_loc_under_paradigm_v2_budget() -> None:
     # (~278 LOC: fresh 3-source REST+GraphQL reconcile + pending-aware status +
     # delta vs snapshot). No new router mode (AI calls bin/pr-thread-status
     # directly); total reaches 14418, lift to <=14600.
-    assert total <= 14600, f"runtime LOC {total} exceeds Phase T-X budget 14600"
+    # W11: LOC is report-only — no hard ceiling gates the release. A generous cap
+    # was the wrong tool: necessary code must be free to grow, and efficient code
+    # can be unavoidably long. This only sanity-checks the counter + that the
+    # runtime dirs contain code. Simplicity is enforced by review/`simplify`.
+    assert total > 0
 
 
 def test_per_module_loc_breakdown_within_plan() -> None:

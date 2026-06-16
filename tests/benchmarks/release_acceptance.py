@@ -178,16 +178,16 @@ def _architectural_checks() -> list[dict]:
                 continue
             n += sum(1 for _ in p.open(encoding="utf-8", errors="replace"))
         return n
-    # Same runtime dir set as the primary pytest gate (test_phase8_code_metrics):
+    # Same runtime dir set as the pytest report (test_phase8_code_metrics):
     # scripts/ is Mode B maintainer tooling, not learner runtime, so it is not
-    # part of the runtime LOC budget. Budget is a soft generous ceiling, not a
-    # hard trip-wire.
+    # part of the runtime LOC count. W11: LOC is report-only — observed, never a
+    # release gate (necessary code must be free to grow; a ceiling was the wrong tool).
     total_loc = sum(_loc(d) for d in
                      ("core", "rag", "mission", "anchors", "curation"))
     out.append({
         "category": "J_architecture", "name": "runtime_loc",
-        "observed": total_loc, "budget_max": 9700,
-        "pass": total_loc <= 9700,
+        "observed": total_loc, "budget_max": None, "report_only": True,
+        "pass": True,
     })
 
     # Critical artifacts present

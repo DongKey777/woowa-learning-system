@@ -197,9 +197,9 @@ Historical Phase M in-process cold/warm numbers are superseded by the Y13 daemon
 - **Dense embed index** → Lance (`state/index/concepts.lance` ~13.4MB release artifact; rebuild after each 200 staged corpus docs)
 - **Append-only event log** → JSONL (`history.jsonl`)
 
-## 10. LOC budget (plan §D-I)
+## 10. LOC (report-only — not a release gate)
 
-Release acceptance canonical runtime LOC: **9574 / 9700**.
+Runtime LOC is **report-only (observed, not a release gate)** as of 2026-06-16 (W11): ~14.5K across core/rag/mission/anchors/curation. Length follows necessity/efficiency; simplicity is enforced by review and `simplify`, not a LOC ceiling.
 
 Corpus rebuild policy: run `tests/benchmarks/corpus_rebuild_readiness.py`
 before any dense index rebuild. The gate validates strict schema load, title
