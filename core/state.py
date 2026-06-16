@@ -71,19 +71,43 @@ def _history_path(state_root: Path) -> Path:
     return state_root / "learner" / "history.jsonl"
 
 
-def _load_pending_triggers(state_root: Path) -> dict:
+def _load_pending_triggers(state_root: Path, now=None) -> dict:
     """Merge learner-level pending_triggers.json + drill_pending.json.
 
     review_drill comes from drill_pending.json (ephemeral, not stored in
     profile). Other pending keys come from pending_triggers.json.
+
+    pending_triggers.json entries that carry their own timestamps
+    (expires_at / issued_at) are expired on load (W1) so a stale
+    self_assessment never blocks new offers or hijacks a score-like reply.
+    Timestamp-less entries, and review_drill, are never dropped.
     """
     triggers: dict = {}
     pt = state_root / "learner" / "pending_triggers.json"
     if pt.exists():
         try:
-            triggers.update(json.loads(pt.read_text(encoding="utf-8")) or {})
+            raw = json.loads(pt.read_text(encoding="utf-8")) or {}
         except json.JSONDecodeError:
-            pass
+            raw = {}
+        if raw:
+            from datetime import datetime, timezone
+
+            from core.trigger import expire_stale_triggers  # lazy: avoid import cycle
+
+            if now is None:
+                now = datetime.now(timezone.utc)
+            # Only timestamped entries are subject to expiry; preserve
+            # timestamp-less entries untouched (expire_stale_triggers would
+            # otherwise drop them). review_drill is merged separately below.
+            timestamped = {
+                k: v
+                for k, v in raw.items()
+                if isinstance(v, dict) and (v.get("expires_at") or v.get("issued_at"))
+            }
+            for key, value in raw.items():
+                if key not in timestamped:
+                    triggers[key] = value
+            triggers.update(expire_stale_triggers(timestamped, now))
     dp = state_root / "learner" / "drill_pending.json"
     if dp.exists() and "review_drill" not in triggers:
         try:
