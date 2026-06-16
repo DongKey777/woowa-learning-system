@@ -199,3 +199,57 @@ def test_generated_at_is_iso(tmp_path: Path) -> None:
     from datetime import datetime
     # parses as ISO8601 without raising
     datetime.fromisoformat(rep["generated_at"])
+
+
+def test_analyze_excludes_dev_test_mode_events(tmp_path: Path) -> None:
+    # W2: development/test telemetry must not pollute learner-facing analytics.
+    def ask(mode, cid, n):
+        ev = {
+            "event_id": f"ask-{mode}-{cid}-{n}",
+            "ts": NOW,
+            "event_type": "rag_ask",
+            "learner_id": LEARNER,
+            "repo": A,
+            "payload": {"router_mode": "cs_qa", "top_concept_ids": [cid]},
+        }
+        if mode is not None:
+            ev["mode"] = mode
+        return json.dumps(ev, ensure_ascii=False)
+
+    _write_history(tmp_path, [
+        ask("learning", STICKY, 1),
+        ask("learning", STICKY, 2),     # STICKY 2x in learning -> repeated
+        ask("development", STICKY, 3),  # excluded
+        ask("development", STICKY, 4),  # excluded
+        ask("test", "spring/z", 5),     # excluded
+        ask(None, "spring/y", 6),       # missing mode -> treated as learning
+    ])
+    rep = analyze(LEARNER, tmp_path, now=NOW)
+    assert rep["counts"]["rag_ask_events"] == 3            # 2 learning + 1 missing, not 6
+    repeated = {c["concept_id"]: c["times_asked"] for c in rep["repeated_concepts"]}
+    assert repeated.get(STICKY) == 2                       # learning only, not 4
+
+
+def test_quality_trend_excludes_dev_test_rows(tmp_path: Path) -> None:
+    # W2: _quality_trend filters development/test response-quality rows.
+    _write_quality(tmp_path, [
+        {"mode": "learning", "quality_flags": ["citation_mismatch"], "contract_flags": []},
+        {"mode": "development", "quality_flags": ["citation_mismatch"], "contract_flags": []},
+        {"mode": "test", "quality_flags": ["x"], "contract_flags": []},
+        {"quality_flags": ["citation_mismatch"], "contract_flags": []},  # missing -> learning
+    ])
+    rep = analyze(LEARNER, tmp_path, now=NOW)
+    assert rep["quality_trend"]["total_quality_events"] == 2   # learning + missing only
+
+
+def test_repeated_concepts_dedups_within_event(tmp_path: Path) -> None:
+    # W6: a concept listed twice in ONE event must not count as 2 asks.
+    ev = json.dumps({
+        "event_id": "e1", "ts": NOW, "event_type": "rag_ask", "mode": "learning",
+        "learner_id": LEARNER, "repo": A,
+        "payload": {"router_mode": "cs_qa", "top_concept_ids": [STICKY, STICKY]},
+    }, ensure_ascii=False)
+    _write_history(tmp_path, [ev])
+    rep = analyze(LEARNER, tmp_path, now=NOW)
+    # one event -> STICKY counted once -> below the >=2 threshold -> not repeated.
+    assert all(c["concept_id"] != STICKY for c in rep["repeated_concepts"])

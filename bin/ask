@@ -322,6 +322,7 @@ def main(argv=None):
         artifacts["reformulated_query"] = reformulated_query
     if reformulation:
         artifacts["reformulation_trace"] = reformulation.to_dict()
+    from core.drill import read_last_proactive_offer_at  # noqa: E402
     cognitive_trigger = (
         select_cognitive_trigger(
             history=recent,
@@ -330,6 +331,8 @@ def main(argv=None):
             drill_history=load_drill_history(sr) or profile.drill_due,
             intent={"detected_intent": decision.mode},
             pending_triggers=profile.pending_triggers,
+            uncertain_concepts=profile.uncertain_concepts,
+            last_drill_offer_at=read_last_proactive_offer_at(sr),
         )
         if session_mode not in ("development", "test")
         else {"trigger_type": "none"}
@@ -376,13 +379,33 @@ def main(argv=None):
         artifacts["cognitive_trigger"] = cognitive_trigger
     elif cognitive_trigger.get("trigger_type") == "follow_up":
         artifacts["cognitive_trigger"] = cognitive_trigger
+    elif cognitive_trigger.get("trigger_type") == "proactive_drill":
+        from core.drill import build_offer_if_due, write_last_proactive_offer_at  # noqa: E402
+
+        offer = build_offer_if_due(
+            learner_id=args["learner_id"], state_root=sr,
+            uncertain_concept_ids=profile.uncertain_concepts or [],
+        )
+        if offer:
+            artifacts["drill_offer"] = {
+                "concept_id": offer.concept_id,
+                "question": offer.question,
+                "expected_terms": offer.expected_terms,
+                "source": offer.source,
+            }
+            artifacts["cognitive_trigger"] = cognitive_trigger
+            write_last_proactive_offer_at(offer.created_at, sr)
+        # else: no resolvable question -> drop the trigger silently.
 
     # Phase Y11 cold path: no event_id / no history append, so
     # response_quality_hint is None. The AI session can still read
     # response_hints.citation_markdown for paste-ready citations.
+    # W7: subtract self-declared-beginner concepts (always re-explain those).
+    _beginner = set(getattr(profile, "self_declared_beginner_concepts", []) or [])
     skip_targets = sorted(
-        set(profile.mastered_concepts)
-        | set(getattr(profile, "proficient_concepts", []))
+        (set(profile.mastered_concepts)
+         | set(getattr(profile, "proficient_concepts", [])))
+        - _beginner
     )
     learner_context = (
         {"must_skip_explanations_of": skip_targets}

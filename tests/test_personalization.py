@@ -22,22 +22,26 @@ def test_no_profile_returns_unchanged() -> None:
     assert out == hits
 
 
-def test_mastered_concept_demotes_score() -> None:
+def test_mastered_head_keeps_rank_but_score_annotated() -> None:
+    # W12: the dense head (rank 0) is pinned for stability; the mastered delta
+    # still annotates its score, but the head is not displaced by a tail item.
     hits = [_hit("spring/bean", 0.9), _hit("spring/component", 0.85)]
     out = adjust(hits, mastered_concepts=["spring/bean"])
     bean = next(h for h in out if h.concept_id == "spring/bean")
     component = next(h for h in out if h.concept_id == "spring/component")
     assert bean.score == pytest.approx(0.9 + MASTERED_DELTA)
     assert component.score == pytest.approx(0.85)
-    assert out[0].concept_id == "spring/component"  # reordering
+    assert out[0].concept_id == "spring/bean"  # head pinned (W12)
 
 
-def test_uncertain_concept_boosts_score() -> None:
+def test_uncertain_head_keeps_rank_score_annotated() -> None:
+    # W12: fusion order is preserved — the head stays #1 even though a tail item
+    # has a higher raw score (the old code re-sorted by score and lost this).
     hits = [_hit("spring/bean", 0.7), _hit("database/index", 0.85)]
     out = adjust(hits, uncertain_concepts=["spring/bean"])
     bean = next(h for h in out if h.concept_id == "spring/bean")
     assert bean.score == pytest.approx(0.7 + UNCERTAIN_DELTA)
-    assert out[0].concept_id == "database/index"  # 0.85 still highest
+    assert out[0].concept_id == "spring/bean"  # head pinned, fusion order kept
 
 
 def test_both_deltas_combine() -> None:
@@ -97,3 +101,45 @@ def test_empty_profile_ids_ignored() -> None:
     hits = [_hit("spring/bean", 0.9)]
     out = adjust(hits, mastered_concepts=["", "  "], uncertain_concepts=[None])  # type: ignore[list-item]
     assert out[0].score == 0.9
+
+
+def test_uncertain_tail_item_promoted_bounded_not_to_rank_2() -> None:
+    # W12: an uncertain TAIL item moves up by a bounded step, NOT an unconditional
+    # jump to rank 2; the head and non-matched relative order are preserved.
+    hits = [_hit("spring/head", 0.9), _hit("a/one", 0.5), _hit("a/two", 0.4),
+            _hit("spring/grow", 0.3), _hit("a/four", 0.2)]
+    out = [h.concept_id for h in adjust(hits, uncertain_concepts=["spring/grow"])]
+    assert out[0] == "spring/head"                  # head pinned
+    assert out.index("spring/grow") == 2            # 3 -> 2 (bounded), not rank 1
+    assert out.index("a/one") < out.index("a/two")  # non-matched order preserved
+
+
+def test_fusion_tail_order_survives_personalization() -> None:
+    # W12 core contract: fusion may order tail items against their raw score (a
+    # refinement). Personalization must NOT re-sort by score and lose it. Here
+    # b/x(0.30) precedes b/y(0.40) in fusion order; an unrelated uncertain match
+    # must keep b/x before b/y (the old global score sort would have flipped them).
+    hits = [_hit("spring/head", 0.9), _hit("spring/grow", 0.5),
+            _hit("b/x", 0.30), _hit("b/y", 0.40)]
+    out = [h.concept_id for h in adjust(hits, uncertain_concepts=["spring/grow"])]
+    assert out[0] == "spring/head"               # head pinned
+    assert out.index("b/x") < out.index("b/y")   # fusion tail order preserved
+
+
+def test_head_never_displaced_by_promoted_tail() -> None:
+    # W12: even a promoted rank-1 item cannot rise above the pinned head.
+    hits = [_hit("spring/head", 0.9), _hit("spring/grow", 0.5), _hit("a/z", 0.4)]
+    out = [h.concept_id for h in adjust(hits, uncertain_concepts=["spring/grow"])]
+    assert out[0] == "spring/head"
+
+
+def test_mastered_tail_item_demoted_bounded() -> None:
+    # W12: a mastered NON-head item moves DOWN by a bounded step; head pinned,
+    # non-matched relative order preserved (the demote direction, symmetric to
+    # the uncertain promote test).
+    hits = [_hit("spring/head", 0.9), _hit("a/one", 0.5), _hit("spring/known", 0.4),
+            _hit("a/three", 0.3), _hit("a/four", 0.2)]
+    out = [h.concept_id for h in adjust(hits, mastered_concepts=["spring/known"])]
+    assert out[0] == "spring/head"                       # head pinned
+    assert out.index("spring/known") == 3                # 2 -> 3 (demoted, bounded)
+    assert out.index("a/three") < out.index("a/four")    # non-matched order preserved

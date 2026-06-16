@@ -430,12 +430,14 @@ def build_unified_projection(
     history: list[dict] | None = None,
     *,
     computed_at: float | None = None,
+    beginner_concepts: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic derived learner projection from profile truth."""
     profile = profile or {}
     concepts = profile.get("concepts") or {}
     mastered = list(concepts.get("mastered") or [])
     proficient = list(concepts.get("proficient") or [])
+    beginner_set = set(beginner_concepts or [])  # W7: never must_skip these
     uncertain = list(concepts.get("uncertain") or [])
     underexplored = list(concepts.get("underexplored") or [])
     recommendations = list(profile.get("next_recommendations") or [])
@@ -468,7 +470,9 @@ def build_unified_projection(
             "uncertain_concepts": uncertain[:30],
             "underexplored_concepts": underexplored[:30],
             "next_recommendations": recommendations[:5],
-            "must_skip_explanations_of": (mastered + proficient)[:50],
+            "must_skip_explanations_of": [
+                c for c in (mastered + proficient) if c not in beginner_set
+            ][:50],
         },
         "cs_view": cs_view,
         "reconciled": {
@@ -490,10 +494,12 @@ def rebuild_unified_projection(
     if not loaded_profile:
         loaded_profile = recompute_profile(learner_id, state_root=state_root, now=now)
     history = [e for e in read_history(state_root=state_root) if _is_learning_event(e)]
+    from core.state import load_beginner_flags
     projection = build_unified_projection(
         loaded_profile,
         history,
         computed_at=now if now is not None else time.time(),
+        beginner_concepts=load_beginner_flags(state_root),
     )
     out = state_root / "learner" / UNIFIED_PROFILE_PATH
     out.parent.mkdir(parents=True, exist_ok=True)

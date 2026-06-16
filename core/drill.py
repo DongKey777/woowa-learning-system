@@ -33,6 +33,7 @@ CORPUS_DIR = REPO_ROOT / "corpus" / "concepts"
 
 PENDING_FILE = "drill_pending.json"
 DUE_FILE = "drill_due.json"
+OFFER_META_FILE = "drill_offer_meta.json"  # W8: last proactive offer epoch (freq cap)
 
 # Spaced repetition bands (days). After scoring, schedule next review.
 SPACED_BANDS_DAYS = {"weak": 1, "ok": 3, "good": 7, "mastered": 14}
@@ -129,6 +130,25 @@ def _learner_query_pattern_text(entry: object) -> str | None:
         if isinstance(pattern, str):
             return pattern
     return None
+
+
+def read_last_proactive_offer_at(state_root: Path = DEFAULT_STATE_ROOT) -> float | None:
+    """W8: epoch of the last proactive drill offer (frequency-cap marker)."""
+    p = state_root / "learner" / OFFER_META_FILE
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return float(data.get("last_proactive_drill_offer_at"))
+    except (json.JSONDecodeError, TypeError, ValueError, OSError):
+        return None
+
+
+def write_last_proactive_offer_at(ts: float, state_root: Path = DEFAULT_STATE_ROOT) -> None:
+    """W8: record the last proactive offer epoch for the cooldown gate."""
+    d = state_root / "learner"
+    d.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(d / OFFER_META_FILE, {"last_proactive_drill_offer_at": float(ts)})
 
 
 def build_offer_if_due(

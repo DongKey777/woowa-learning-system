@@ -116,6 +116,15 @@ def test_resolved_thread_emits_mentor_accept(tmp_path: Path) -> None:
     report = sync_repo(repo, learner_login=LEARNER, state_root=tmp_path)
     assert report["mentor_accept_emitted"] == 1  # resolved-thread anchor link
     assert get("spring/ioc-di-basics", state_root=tmp_path) is not None
+    # W6: thread_resolved ts is the learner reply's created_at (deterministic, NOT
+    # wall-clock) — works even for this UNMERGED PR (merged_at NULL).
+    from core.evidence_sync import _parse_iso
+    mg = sqlite3.connect(str(tmp_path / "learner" / "mastery_graph.sqlite"))
+    ts_rows = mg.execute(
+        "SELECT ts FROM evidence WHERE concept_id=?", ("spring/ioc-di-basics",)
+    ).fetchall()
+    mg.close()
+    assert ts_rows and ts_rows[0][0] == _parse_iso("2026-05-02")  # reply created_at
 
 
 def test_unresolved_thread_no_mentor_accept(tmp_path: Path) -> None:

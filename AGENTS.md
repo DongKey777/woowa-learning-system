@@ -2,6 +2,97 @@
 
 이 문서는 Claude 외 AI 세션(Codex CLI, ChatGPT Plus/Pro, Gemini CLI, OpenAI SDK 등)이 이 repo에 진입했을 때의 행동 contract다. [`CLAUDE.md`](CLAUDE.md)와 동일한 system contract를 따른다. 톤만 OpenAI/Gemini 환경에 맞춰 조정.
 
+## 0. Project Knowledge Base (init-deep)
+
+**Generated:** 2026-06-12
+**Commit:** `b292f17`
+**Branch:** `main`
+
+### Overview
+
+Woowa mission learning system: Python flat-layout RAG daemon + CLI wrappers + learner telemetry + Java mission workspace. Runtime path is `bin/ask` → `core/daemon.py` → `core/router.py` / `core/coach.py`.
+
+### Structure
+
+```text
+woowa-learning-system/
+├── bin/        # 81+ user/operator commands; thin wrappers over core/rag/mission
+├── core/       # daemon, routing, prompt, state, telemetry, learner profile
+├── rag/        # corpus load, BGE-M3 encode, Lance index, retrieval/fusion
+├── mission/    # system-side mission/PR analytics; writes state/repos artifacts
+├── missions/   # learner-owned nested Java/Gradle repos; do not auto-edit
+├── corpus/     # editable concept JSON/schema; graph/index are derived
+├── state/      # gitignored runtime artifacts, daemon sock/pid, telemetry, indexes
+├── tests/      # pytest unit suite plus standalone benchmark gates
+├── scripts/    # collection, migration, mining, RunPod remote build helpers
+└── reports/    # generated benchmark/analysis outputs plus a few generator scripts
+```
+
+### Where To Look
+
+| Task | Location | Notes |
+|---|---|---|
+| First-run setup | `bin/bootstrap`, `bin/setup`, `bin/index-fetch`, `bin/rag-daemon` | learner should not remember commands |
+| Ask/runtime flow | `bin/ask`, `core/daemon.py`, `core/router.py`, `core/lazy_loader.py`, `core/coach.py` | newline-delimited AF_UNIX socket |
+| Retrieval/index | `rag/encoder.py`, `rag/index.py`, `rag/search.py`, `corpus/` | local build maintainer-only |
+| Learner telemetry | `core/response_capture.py`, `core/response_quality.py`, `core/state.py`, `state/learner/` | failures must not block answers |
+| PR/review modes | `mission/*.py`, `core/pr_threads.py`, `core/pr_retro.py`, `anchors/` | live GitHub vs offline archive split |
+| Commands | `docs/bin-reference.md`, `bin/` | wrappers are the public API |
+| Verification | `docs/testing-guide.md`, `tests/`, `tests/benchmarks/release_acceptance.py` | use development session mode |
+
+### Code Map
+
+| Symbol/File | Type | Location | Role |
+|---|---|---|---|
+| `serve()` / `main()` | runtime | `core/daemon.py` | daemon lifecycle and request handling |
+| `RouteDecision` | model | `core/router.py` | selected mode, artifacts, token budget |
+| `compose()` | prompt | `core/coach.py` | final coach prompt and citation hints |
+| `load_artifacts()` | loader | `core/lazy_loader.py` | selective mode artifact hydration |
+| `encode_query()` | retrieval | `rag/encoder.py` | BGE-M3 embedding path |
+| `search()` | retrieval | `rag/search.py` | exact/fallback/personalized search |
+| `MissionPattern` | analytics | `mission/extract.py` | learner Java concept extraction |
+| `ReviewAnchor` | analytics | `anchors/extract.py` | review-thread anchor extraction |
+
+### Conventions
+
+- Flat package layout; `pyproject.toml` explicitly includes `core*`, `rag*`, `scripts*`, `mission*`, `anchors*`, `curation*`.
+- Session mode is explicit: system work sets `WOOWA_SESSION_MODE=development`; learning remains conservative default.
+- Learner-facing progress is Korean and short; command execution is automatic.
+- Full-body response capture is preferred; summary-only is exceptional repair fallback.
+- Benchmarks are direct Python scripts, not pytest-collected tests.
+
+### Anti-Patterns (This Project)
+
+- Do not run `bin/corpus-build` on learner machines; fetch release indexes.
+- Do not silently abort; report cause + next action.
+- Do not auto-edit or auto-clone learner mission repos.
+- Do not post PR replies or review comments automatically.
+- Do not rewrite `--raw-utterance`.
+- Do not manually choose `tool_only` / `tier_0_fallback`.
+- Do not eagerly load all lazy artifacts.
+- Do not let telemetry, drift checks, or capture failures block the learner answer.
+
+### Commands
+
+```bash
+bin/setup --dev
+bin/bootstrap
+python3 -m pytest tests/ -q
+python3 tests/benchmarks/release_acceptance.py
+WOOWA_SESSION_MODE=development python3 tests/benchmarks/rag_quality_regression.py
+WOOWA_SESSION_MODE=development python3 tests/benchmarks/gate_measurements.py
+```
+
+### Child Knowledge Bases
+
+- `bin/AGENTS.md` — CLI wrapper invariants.
+- `core/AGENTS.md` — runtime/state/telemetry contracts.
+- `mission/AGENTS.md` — system-side mission analytics.
+- `missions/AGENTS.md` — learner-owned Java repo boundary.
+- `rag/AGENTS.md` — retrieval/index conventions.
+- `tests/AGENTS.md` — pytest vs benchmark split.
+- `corpus/AGENTS.md` — editable corpus vs derived artifacts.
+
 ## 1. 무엇이 학습자에게 보이고 무엇이 자동인가
 
 학습자가 외울 명령은 **0개**. 학습자는 한국어로 의도만 표현. AI 세션이 모든 명령 자동 실행:
@@ -116,6 +207,10 @@ python3 bin/ask "테스트"
 
 키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). AI 세션이 발화 의미를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로, 키워드 router는 deterministic fallback. 모드 목록과 선택 기준은 CLAUDE.md §4.2.2와 동일하다 — `cs_qa` / `coaching` / `drill` / `self_assess` / `retro` / `pr_diff_evolution`(코드 변화·리뷰 반영) / `cross_mission`(미션 간 개념·반복 실수) / `memory_review`(사각지대·복습) / `pr_review`(받은 리뷰) / `reviewer_profile`(멘토 성향) / `learning_path`(다음 학습) / `pr_meta`(PR 품질·크기) / `thread_recon`(스레드 복원) / `temporal`(시간축) / `meta_analytics`(학습 메타) / `cohort`(동기 비교) / `predict`(리뷰 미리 보기) / `f11_anchor`(cross-crew). `tool_only`/`tier_0_fallback`은 직접 고르지 않는다.
 
+### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
+
+발화가 2개 이상 독립 주제면 주제별로 분해한다(한 벡터에 여러 주제 = dense 평균화로 모든 인텐트에서 어중간). 1순위는 단일 `bin/ask` + `--reformulated-query`(추가 pending capture 없음). sub-ask로 N번 쪼개면 pending capture N개가 생기고 Stop hook은 최신 1개만 연결하므로 `bin/capture-repair --sync-pending`으로 정합한다. `--raw-utterance`는 한 호출에만(중복 = raw→rewritten 쌍 오염). 개념 부재 기인 미스는 분해로 못 고치며 코퍼스 과제다.
+
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
 1. AI가 학습자 미션 파일 실제 수정/생성 (예: Codex apply diff)
@@ -149,6 +244,7 @@ python3 bin/ask "테스트"
 | 미션 repo onboarded 후 첫 진입 | `bin/assess-learner-state --repo <r> --path missions/<r> --silent` |
 | 10 turn 마다 OR *"내 상태"* | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
+| 세션이 **판단**상 학습자가 특정 개념을 *아직 잘 모른다/처음/기초부터*로 드러낼 때 (W7 — 키워드 매칭 아닌 의미 판단) | `bin/learn-beginner-flag --concept <id> --silent` — 그 concept를 `must_skip_explanations_of`에서 제외(mastery 과승급 자기신고 override). 확실히 익혔으면 `--clear` |
 
 ### 4.7 Phase U-X auto-call (2026-05-26 신설 45 wrappers)
 

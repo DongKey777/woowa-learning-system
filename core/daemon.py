@@ -482,6 +482,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         artifacts["reformulated_query"] = reformulated_query
                     if reformulation:
                         artifacts["reformulation_trace"] = reformulation.to_dict()
+                    from core.drill import read_last_proactive_offer_at
                     cognitive_trigger = (
                         select_cognitive_trigger(
                             history=recent,
@@ -490,6 +491,8 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                             drill_history=load_drill_history(state_root) or profile.drill_due,
                             intent={"detected_intent": decision.mode},
                             pending_triggers=profile.pending_triggers,
+                            uncertain_concepts=profile.uncertain_concepts,
+                            last_drill_offer_at=read_last_proactive_offer_at(state_root),
                         )
                         if event_mode not in ("development", "test")
                         else {"trigger_type": "none"}
@@ -536,6 +539,25 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                         artifacts["cognitive_trigger"] = cognitive_trigger
                     elif cognitive_trigger.get("trigger_type") == "follow_up":
                         artifacts["cognitive_trigger"] = cognitive_trigger
+                    elif cognitive_trigger.get("trigger_type") == "proactive_drill":
+                        from core.drill import (
+                            build_offer_if_due, write_last_proactive_offer_at,
+                        )
+
+                        offer = build_offer_if_due(
+                            learner_id=learner_id, state_root=state_root,
+                            uncertain_concept_ids=profile.uncertain_concepts or [],
+                        )
+                        if offer:
+                            artifacts["drill_offer"] = {
+                                "concept_id": offer.concept_id,
+                                "question": offer.question,
+                                "expected_terms": offer.expected_terms,
+                                "source": offer.source,
+                            }
+                            artifacts["cognitive_trigger"] = cognitive_trigger
+                            write_last_proactive_offer_at(offer.created_at, state_root)
+                        # else: no resolvable question -> drop the trigger silently.
                     from core.response_capture import (
                         create_pending_capture,
                         is_internal_capture_meta_prompt,
@@ -554,12 +576,18 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     event_id = f"ask-{int(time.time() * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
                     # Phase Y11 P1.2 — derive learner_context from v3 profile
                     # (mastered + proficient → must_skip_explanations_of).
-                    # Caller-provided learner_context wins if given.
+                    # W7: subtract self-declared-beginner concepts so a concept the
+                    # learner says they're new to is always re-explained, even if
+                    # mastery over-promoted it. Caller-provided learner_context wins.
                     derived_context = req.get("learner_context")
                     if derived_context is None:
+                        beginner = set(
+                            getattr(profile, "self_declared_beginner_concepts", []) or []
+                        )
                         skip_targets = sorted(
-                            set(profile.mastered_concepts)
-                            | set(getattr(profile, "proficient_concepts", []))
+                            (set(profile.mastered_concepts)
+                             | set(getattr(profile, "proficient_concepts", [])))
+                            - beginner
                         )
                         if skip_targets:
                             derived_context = {

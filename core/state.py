@@ -15,12 +15,15 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 
 EPHEMERAL_PENDING_KEYS = frozenset({"review_drill"})
+DRILL_PENDING_TTL_SECS = 24 * 3600  # W8: stale drill offer expiry (epoch created_at)
+BEGINNER_FLAGS_FILE = "beginner_flags.json"  # W7: learner self-declared beginner concepts
 VALID_LEARNER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,38}$")
 
 def _validate_learner_id(learner_id: str) -> None:
@@ -40,6 +43,7 @@ class LearnerProfile:
     total_events: int = 0
     last_updated: float = 0.0
     proficient_concepts: list[str] = field(default_factory=list)
+    self_declared_beginner_concepts: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _validate_learner_id(self.learner_id)
@@ -71,25 +75,64 @@ def _history_path(state_root: Path) -> Path:
     return state_root / "learner" / "history.jsonl"
 
 
-def _load_pending_triggers(state_root: Path) -> dict:
+def _load_pending_triggers(state_root: Path, now: datetime | None = None) -> dict:
     """Merge learner-level pending_triggers.json + drill_pending.json.
 
     review_drill comes from drill_pending.json (ephemeral, not stored in
     profile). Other pending keys come from pending_triggers.json.
+
+    pending_triggers.json entries that carry their own timestamps
+    (expires_at / issued_at) are expired on load (W1) so a stale
+    self_assessment never blocks new offers or hijacks a score-like reply.
+    Timestamp-less entries, and review_drill, are never dropped.
     """
     triggers: dict = {}
     pt = state_root / "learner" / "pending_triggers.json"
     if pt.exists():
         try:
-            triggers.update(json.loads(pt.read_text(encoding="utf-8")) or {})
+            raw = json.loads(pt.read_text(encoding="utf-8")) or {}
         except json.JSONDecodeError:
-            pass
+            raw = {}
+        if raw:
+            from datetime import datetime, timezone
+
+            from core.trigger import expire_stale_triggers  # lazy: avoid import cycle
+
+            if now is None:
+                now = datetime.now(timezone.utc)
+            # Only timestamped entries are subject to expiry; preserve
+            # timestamp-less entries untouched (expire_stale_triggers would
+            # otherwise drop them). review_drill is merged separately below.
+            timestamped = {
+                k: v
+                for k, v in raw.items()
+                if isinstance(v, dict) and (v.get("expires_at") or v.get("issued_at"))
+            }
+            for key, value in raw.items():
+                if key not in timestamped:
+                    triggers[key] = value
+            triggers.update(expire_stale_triggers(timestamped, now))
     dp = state_root / "learner" / "drill_pending.json"
     if dp.exists() and "review_drill" not in triggers:
         try:
-            triggers["review_drill"] = json.loads(dp.read_text(encoding="utf-8"))
+            offer = json.loads(dp.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            pass
+            offer = None
+        if isinstance(offer, dict):
+            # W8: drill_pending TTL on epoch created_at (disjoint from W1's ISO
+            # expiry above). A stale offer is dropped AND its file unlinked so it
+            # stops hijacking cs_qa (intent.py DRILL_ANSWER_HINT) and unblocks
+            # build_offer_if_due's one-open guard. A timestamp-less offer is kept
+            # (real offers always carry created_at; honors the review_drill contract).
+            now_epoch = now.timestamp() if now is not None else time.time()
+            created_at = offer.get("created_at")
+            if isinstance(created_at, (int, float)) and now_epoch - created_at > DRILL_PENDING_TTL_SECS:
+                try:
+                    dp.unlink()
+                except OSError:
+                    pass
+            else:
+                triggers["review_drill"] = offer
     return triggers
 
 
@@ -101,12 +144,39 @@ def _is_v3_profile(data: dict) -> bool:
     )
 
 
+def load_beginner_flags(state_root: Path = DEFAULT_STATE_ROOT) -> list[str]:
+    """W7: learner self-declared 'beginner' concepts. Subtracted from
+    must_skip_explanations_of so a self-declared-beginner concept is always
+    re-explained even if mastery over-promoted it. Written by the AI session via
+    bin/learn-beginner-flag (AI judgment, not a keyword filter)."""
+    p = state_root / "learner" / BEGINNER_FLAGS_FILE
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    raw = data.get("concepts") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []  # malformed (non-list) → ignore, don't per-char/key-iterate
+    return [str(c) for c in raw if c]
+
+
+def save_beginner_flags(concepts: list[str], state_root: Path = DEFAULT_STATE_ROOT) -> None:
+    """Persist the self-declared-beginner concept list (deduped, order-preserving)."""
+    d = state_root / "learner"
+    d.mkdir(parents=True, exist_ok=True)
+    deduped = list(dict.fromkeys(str(c) for c in concepts if c))
+    atomic_write_json(d / BEGINNER_FLAGS_FILE, {"concepts": deduped})
+
+
 def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> LearnerProfile:
     p = _profile_path(state_root)
     if not p.exists():
         return LearnerProfile.empty(learner_id)
     mtime = p.stat().st_mtime
     data = _profile_json_cached(str(p), mtime)
+    beginner = load_beginner_flags(state_root)
 
     if _is_v3_profile(data):
         concepts = data.get("concepts", {}) or {}
@@ -118,6 +188,7 @@ def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> Lear
             mastered_concepts=list(concepts.get("mastered", [])),
             uncertain_concepts=list(concepts.get("uncertain", [])),
             proficient_concepts=list(concepts.get("proficient", [])),
+            self_declared_beginner_concepts=beginner,
             drill_due=list(data.get("drill_due", [])),
             pending_triggers=merged_pending,
             total_events=int(activity.get("events_total", 0) or 0),
@@ -133,6 +204,7 @@ def load_profile(learner_id: str, state_root: Path = DEFAULT_STATE_ROOT) -> Lear
         mastered_concepts=list(data.get("mastered_concepts", [])),
         uncertain_concepts=list(data.get("uncertain_concepts", [])),
         proficient_concepts=list(data.get("proficient_concepts", [])),
+        self_declared_beginner_concepts=beginner,
         drill_due=list(data.get("drill_due", [])),
         pending_triggers=dict(data.get("pending_triggers", {})),
         total_events=data.get("total_events", 0),

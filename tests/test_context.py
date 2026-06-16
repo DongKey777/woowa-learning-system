@@ -60,8 +60,8 @@ def test_cs_qa_returns_personalized_hits(tmp_path: Path) -> None:
         ctx = collect_cs_qa_context("DI", learner_id="dk", state_root=tmp_path)
     assert ctx["mode"] == "cs_qa"
     assert ctx["prompt"] == "DI"
-    # spring/bean got -0.15 demotion → spring/component ranks first
-    assert ctx["hits"][0]["concept_id"] == "spring/component"
+    # W12: head (spring/bean) pinned; mastered delta applied + recorded.
+    assert ctx["hits"][0]["concept_id"] == "spring/bean"
     assert "spring/bean" in ctx["personalization"]["mastered_applied"]
 
 
@@ -69,7 +69,8 @@ def test_cs_qa_treats_proficient_as_mastered(tmp_path: Path) -> None:
     save_profile(LearnerProfile(learner_id="dk", proficient_concepts=["spring/bean"]), state_root=tmp_path)
     with patch("core.context.search", return_value=_mock_hits()):
         ctx = collect_cs_qa_context("DI", learner_id="dk", state_root=tmp_path)
-    assert ctx["hits"][0]["concept_id"] == "spring/component"
+    # W12: head (spring/bean) pinned; proficient treated as mastered (recorded).
+    assert ctx["hits"][0]["concept_id"] == "spring/bean"
     assert ctx["personalization"]["mastered_applied"] == ["spring/bean"]
 
 

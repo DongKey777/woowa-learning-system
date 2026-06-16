@@ -162,6 +162,13 @@ python3 bin/ask "테스트"
 
 `tool_only`/`tier_0_fallback`은 AI가 직접 고르지 않는다(전자는 force-token, 후자는 guard 결과).
 
+### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
+
+발화가 **2개 이상 독립 주제**를 담으면(예: "서블릿 응답 + 자동구성 + WAS") 주제별로 분해해 검색 적중을 높인다 — 한 벡터에 여러 주제를 섞으면 dense가 평균화돼 모든 인텐트에서 어중간해진다(실측: 풀 쿼리 미스, sub-쿼리 단독은 적중).
+- **1순위**: 단일 `bin/ask` 호출에 `--reformulated-query`로 주제별 재작성을 넘긴다(추가 pending capture 없음 — 텔레메트리 정합 유지).
+- 굳이 sub-ask로 N번 쪼개면 pending capture가 N개 생기고 Stop hook은 최신 1개에만 연결되므로, 후속으로 `bin/capture-repair --sync-pending`을 돌려 stale pending을 정합한다.
+- `--raw-utterance`는 **한 호출에만** 넘긴다(중복 전달 시 raw→rewritten 쌍 오염 — 'Verify raw source' 정책). 개념 부재 기인 미스("WAS와 웹서버 차이" 단독 무관 1위)는 분해로 못 고치며 코퍼스 확장 과제다(분리 인식).
+
 ### 4.3 학습자 코드 작성/수정 시
 다음 조건 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
 - Claude가 학습자 미션 파일을 실제로 수정/생성한 경우 (Write/Edit tool)
@@ -282,6 +289,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | 학습자가 미션 repo onboarded 후 첫 coaching 진입 시 | `bin/assess-learner-state --repo <r> --path missions/<r> --learner-login <l> --silent` |
 | 매 10 turn마다 OR *"내 상태"*, *"learning profile"* 발화 | `bin/profile-recompute --silent` |
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
+| **세션이 판단**상 학습자가 특정 개념을 *아직 잘 모른다 / 처음 접한다 / 기초부터 다시 필요*로 드러낼 때 (W7 — **키워드 매칭이 아니라 의미 판단**; 라우터 모드 선택과 동일 원리) | `bin/learn-beginner-flag --concept <id> --silent` (해당 concept를 `must_skip_explanations_of`에서 제외해 항상 재설명. mastery 과승급을 학습자 자기신고로 override). 학습자가 그 개념을 확실히 익혔다고 판단되면 `--clear`로 해제 |
 
 모두 default `--silent` — stdout 노이즈 없음, AI session이 결과를 한국어로 narrate.
 
