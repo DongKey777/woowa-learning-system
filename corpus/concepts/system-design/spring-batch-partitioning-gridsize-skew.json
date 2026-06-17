@@ -1,0 +1,61 @@
+{
+  "id": "system-design/spring-batch-partitioning-gridsize-skew",
+  "title": "Spring Batch Partitioning GridSize Skew",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Spring Batch partitioning에서 master가 처리 범위를 나누고 worker Step이 병렬 처리할 때 gridSize, partition range, skew, DB pressure, restart boundary를 함께 보는 방법을 설명한다.",
+  "body_markdown": "# Spring Batch Partitioning GridSize Skew\n\n## 한 줄 요약\n\nSpring Batch partitioning은 큰 Step을 여러 partition으로 나눠 병렬 처리하는 방식이다. `gridSize`는 작업을 몇 조각으로 나눌지에 가깝고, 실제 성능은 partition range 균형, worker 수, DB 부하, hot partition, restart 경계에 달려 있다.\n\n## 왜 그냥 thread 수를 늘리면 안 되나\n\n대량 배치가 느리다고 worker를 늘리면 처리량이 늘 수도 있지만, DB range scan, lock, connection pool, 외부 API 한도, 특정 tenant skew 때문에 오히려 tail이 길어질 수 있다. Batch 병렬화는 \"더 많은 thread\"가 아니라 \"어떤 단위로 일을 나눌 것인가\"의 문제다.\n\nSpring Batch partitioning에서는 보통 manager/master Step이 partition metadata를 만들고, worker Step이 각 partition의 범위를 처리한다. 이때 각 worker가 같은 reader/writer 구조를 갖더라도 읽는 범위와 checkpoint는 partition별로 분리된다.\n\n## 핵심 용어\n\n| 용어 | 의미 | 확인할 질문 |\n|---|---|---|\n| Partition | 나눠진 작업 조각 | 각 조각의 row 수와 처리 시간이 비슷한가? |\n| gridSize | partition을 몇 개 만들지에 대한 힌트 | worker 수와 같은 뜻으로 쓰고 있지 않은가? |\n| Worker Step | partition 하나를 처리하는 Step 실행 | 실패한 partition만 재시작 가능한가? |\n| Range key | partition 범위를 나누는 기준 | skew가 적고 range scan이 가능한가? |\n| Skew | 일부 partition만 오래 걸리는 현상 | hot tenant, 큰 row, 외부 API 지연이 몰리는가? |\n\n## partition range를 고르는 법\n\n가장 단순한 방식은 primary key range다.\n\n```text\npartition 1: id 1      - 100000\npartition 2: id 100001 - 200000\npartition 3: id 200001 - 300000\n```\n\n하지만 id range가 row 수나 처리 비용과 항상 비례하지 않는다. 삭제된 row가 많거나 특정 구간에 큰 payload가 몰려 있거나 tenant별 데이터 크기가 다르면 partition 처리 시간이 크게 갈린다.\n\n더 나은 설계는 다음 증거를 본다.\n\n- partition별 input row count\n- partition별 processing time\n- partition별 writer conflict/lock wait\n- worker별 DB connection hold time\n- 가장 느린 partition이 전체 job end time을 잡아먹는지\n\n## gridSize와 worker 수의 관계\n\n`gridSize`를 worker thread 수와 같은 말로 외우면 위험하다. gridSize는 partitioner가 만들 partition 수의 힌트이고, 실제 동시에 도는 worker 수는 TaskExecutor, thread pool, remote partitioning worker capacity에 영향을 받는다.\n\n보통 partition 수는 worker 수보다 약간 많게 잡아 느린 partition이 있어도 다른 worker가 일을 이어 받을 수 있게 한다. 하지만 너무 잘게 쪼개면 metadata, transaction, query overhead가 커진다.\n\n## skew가 생기는 대표 원인\n\n| 증상 | 가능한 원인 | 대응 |\n|---|---|---|\n| 한 partition만 오래 걸림 | tenant/data skew | range 재분할, tenant split, dynamic partition |\n| worker를 늘려도 DB가 느려짐 | DB connection/IO/lock saturation | concurrency cap, query/index 개선 |\n| 재시작 시 같은 범위를 다시 많이 처리 | partition checkpoint 부정확 | partition별 ExecutionContext와 idempotent writer |\n| 특정 partition에서 deadlock 증가 | 같은 key range write 충돌 | write order, smaller chunk, key-range 분리 |\n| 마지막 몇 partition 때문에 job 종료 지연 | straggler partition | 더 작은 range, work stealing, skew-aware split |\n\n## remote partitioning과 local partitioning\n\nLocal partitioning은 한 JVM 안에서 여러 thread가 partition을 처리한다. Remote partitioning은 partition request를 메시지로 보내 여러 worker JVM이나 node가 처리할 수 있다.\n\nRemote partitioning은 scale-out에 유리하지만 실패 감지, worker 중복 실행, partition ownership, result aggregation이 더 복잡하다. 그래서 beginner/intermediate 단계에서는 먼저 local partitioning에서 range와 skew를 검증하고, DB 병목인지 CPU 병목인지 분리하는 편이 안전하다.\n\n## 흔한 오해\n\n- \"gridSize를 크게 하면 무조건 빨라진다\": DB와 writer가 병목이면 더 느려질 수 있다.\n- \"partition 수는 worker 수와 같다\": partition count, active worker count, thread pool size는 다른 축이다.\n- \"id range로 나누면 균등하다\": row 수와 처리 비용이 균등하다는 증거가 필요하다.\n- \"partitioning은 retry/skip 문제를 해결한다\": 실패 범위를 나눌 뿐이고 writer idempotency와 checkpoint는 여전히 필요하다.\n- \"remote partitioning이면 scale-out이 자동이다\": worker 중복 실행과 result tracking까지 설계해야 한다.\n\n## 검증 체크리스트\n\n1. Partition별 row count와 processing time을 기록한다.\n2. 가장 느린 partition의 원인이 row 수인지 processing cost인지 본다.\n3. DB connection pool, lock wait, IO wait가 worker 수 증가와 함께 악화되는지 확인한다.\n4. Partition별 ExecutionContext와 restart 경계를 검증한다.\n5. Writer가 같은 partition을 재처리해도 안전한지 본다.\n6. gridSize 변경 전후 throughput, p95 partition duration, failed partition count를 비교한다.\n\n## 면접 답변 축\n\nSpring Batch partitioning 질문에는 \"큰 Step을 partition range로 나눠 worker Step들이 병렬 처리하지만, gridSize는 worker 수 자체가 아니라 partitioning 힌트이고, 실제 성능은 skew와 DB saturation을 측정해야 한다\"고 답한다. 이어서 partition별 checkpoint와 idempotent writer가 없으면 실패 후 중복/누락이 생길 수 있다고 말하면 된다.\n\n## Safe Next Docs\n\n기본 구조는 `spring-batch-job-step-reader-processor-writer-beginner-primer`, chunk retry/skip은 `batch-chunk-retry-skip`, skew 일반화는 `hot-key-skew-mitigation-interview-playbook`과 `distributed-shuffle-partition-skew-spill`로 이어진다.\n",
+  "aliases": [
+    "Spring Batch partitioning",
+    "gridSize skew",
+    "스프링 배치 파티셔닝",
+    "배치 gridSize",
+    "partition range skew",
+    "worker Step 병렬",
+    "remote partitioning",
+    "배치 병렬 처리",
+    "hot partition batch",
+    "partition별 checkpoint"
+  ],
+  "expected_queries": [
+    "Spring Batch partitioning에서 gridSize는 worker thread 수랑 같은 뜻이야?",
+    "배치 작업을 partition으로 나눴는데 특정 partition만 오래 걸리는 skew는 어떻게 봐?",
+    "Spring Batch remote partitioning을 쓰기 전에 range와 DB 병목을 어떻게 확인해?",
+    "gridSize를 키웠는데 DB lock wait와 connection wait가 늘면 어떻게 판단해야 해?",
+    "partition별 ExecutionContext와 writer idempotency를 같이 봐야 하는 이유가 뭐야?",
+    "대량 배치를 병렬 처리할 때 id range가 균등하지 않으면 어떤 문제가 생겨?"
+  ],
+  "symptoms": [
+    "gridSize를 크게 했는데 전체 배치 시간이 줄지 않는다",
+    "마지막 partition 몇 개 때문에 job 종료가 늦어진다",
+    "worker를 늘린 뒤 DB connection wait와 lock wait가 증가한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-batch-job-step-reader-processor-writer-beginner-primer",
+      "system-design/hot-key-skew-mitigation-interview-playbook"
+    ],
+    "next_docs": [
+      "spring/batch-chunk-retry-skip",
+      "system-design/distributed-shuffle-partition-skew-spill",
+      "database/spring-batch-no-offset-cursor-restart-checkpoint"
+    ],
+    "confusable_with": [
+      "spring/spring-batch-restartability-jobrepository-executioncontext-primer",
+      "system-design/distributed-shuffle-partition-skew-spill",
+      "operating-system/thread-pool-backpressure-saturation-playbook"
+    ],
+    "forbidden_for_queries": [
+      "Spring Batch Reader Processor Writer 기본 구조를 처음부터 설명해줘",
+      "분산 shuffle에서 partition skew와 spill을 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/spring-batch-partitioning-gridsize-skew.md",
+    "revision_history": []
+  }
+}
