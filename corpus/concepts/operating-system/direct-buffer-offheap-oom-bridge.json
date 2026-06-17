@@ -6,15 +6,24 @@
   "summary": "이 bridge는 Java heap OOM과 direct buffer/off-heap/native memory OOM을 구분한다. Heap은 남았는데 RSS 높음, Direct buffer memory, 컨테이너 OOMKilled, Netty/NIO buffer 누수 질문을 다룬다.",
   "body_markdown": "# Direct Buffer Off-Heap OOM Bridge\n\n## 한 줄 요약\n\nDirect buffer와 native memory는 Java heap 바깥을 쓸 수 있다. 그래서 heap dump가 깨끗해 보여도 프로세스 RSS나 cgroup memory limit은 터질 수 있다.\n\n## 미션 진입 증상\n\n`java.lang.OutOfMemoryError: Direct buffer memory`가 보이거나, heap 사용률은 낮은데 컨테이너가 OOMKilled된다. 이때 heap object leak만 찾으면 원인을 놓친다.\n\n## 핵심 mental model\n\nHeap, metaspace, thread stack, direct buffer, mmap, native allocator는 모두 프로세스 메모리를 차지한다. 컨테이너 limit은 이 합계를 본다.\n\nJDK, GC, container 인식 방식, allocator, framework에 따라 어떤 메모리가 어떤 지표에 보이는지 다르다. heap dump에 보이지 않는다고 \"메모리 사용이 없다\"고 보지 말고, JVM 내부 지표와 OS/cgroup 지표를 같이 맞춘다.\n\n## 운영 관찰 지표\n\n- Java heap used/committed/max와 process RSS, cgroup memory usage/limit을 나란히 본다.\n- `BufferPoolMXBean`의 direct/mapped buffer count와 used capacity, Netty allocator metric, direct buffer allocation failure 로그를 확인한다.\n- Native Memory Tracking이 켜져 있다면 category별 committed/reserved를 본다. 운영에서 항상 켜져 있다고 가정하지 않는다.\n- thread count와 stack size, metaspace, code cache, classloader 수, mapped file, JNI/native library 사용을 함께 본다.\n- OOMKilled라면 JVM OOM stack trace가 없을 수 있으므로 container event, kernel log, orchestrator reason, 직전 RSS 추이를 확인한다.\n\n## 1차 분기\n\n1. Direct buffer pressure: direct/mapped buffer 지표가 늘고 `Direct buffer memory` 에러나 Netty leak hint가 보인다.\n2. mmap/file mapping: heap은 낮지만 mapped buffer나 파일 매핑이 커진다.\n3. Thread/native overhead: thread 수 증가, stack, native library, compression/TLS allocator가 RSS를 밀어 올린다.\n4. Container budget mismatch: `-Xmx`와 metaspace/direct/thread/native 여유를 합치면 cgroup limit에 가까워진다.\n5. Heap leak과 혼합: heap도 오르고 RSS도 오르며, heap dump의 retained path와 off-heap 지표를 동시에 봐야 한다.\n\n## 운영 대응 순서\n\n먼저 OOM 종류를 분리한다. `java.lang.OutOfMemoryError: Java heap space`, `Direct buffer memory`, metaspace OOM, container OOMKilled는 수집해야 할 증거와 대응이 다르다.\n\n그다음 메모리 예산을 합산한다. `Xmx`만이 아니라 direct memory cap, metaspace, thread stack, code cache, native allocator, safety margin을 cgroup limit 안에 넣어 본다. 특정 JDK에서는 default direct memory 한도와 container 인식 방식이 달라질 수 있으므로 실제 런타임 옵션과 지표로 확인한다.\n\n마지막으로 소유자를 찾는다. Netty/ByteBuf라면 release 누락과 leak detector, NIO라면 direct buffer lifecycle, mmap이라면 unmap/lifecycle, thread라면 pool 생성 경로를 확인한다.\n\n## 흔한 오해\n\nHeap size를 줄이면 항상 OOM이 해결된다고 생각하면 안 된다. Direct memory limit, buffer pool metrics, Native Memory Tracking, thread count를 같이 본다.\n\n## 잘못된 대응\n\n- heap dump만 반복해서 뜬다. off-heap/native 문제는 heap dump에 충분히 드러나지 않을 수 있다.\n- `Xmx`만 늘린다. container limit이 고정이면 native/off-heap 여유가 줄어 OOMKilled가 빨라질 수 있다.\n- direct buffer를 전부 heap buffer로 바꾸면 해결된다고 단정한다. I/O 성능, GC pressure, framework 기대 동작이 달라진다.\n- RSS 증가를 모두 leak으로 본다. allocator cache, mmap, committed/reserved 차이, warm-up 효과를 분리해야 한다.\n- Netty leak 로그만 끄거나 sampling만 낮춘다. 증거가 사라질 뿐 pressure는 남는다.\n\n## Safe Next Docs\n\ncgroup memory limit OOM router에서 container budget과 OOMKilled를 분리하고, Java OOM heap dump playbook에서 heap leak 수집 절차를 확인한다. retained path가 의심되면 GC root retention analysis로 이어진다.\n",
   "aliases": [
-    "direct buffer offheap oom bridge",
-    "java native memory direct bytebuffer",
-    "direct buffer off-heap OOM",
-    "네이티브 메모리 OOM"
+    "direct buffer memory OOM",
+    "offheap native memory triage",
+    "Java DirectByteBuffer OOM",
+    "MaxDirectMemorySize Netty buffer",
+    "heap outside RSS memory",
+    "native memory tracking bridge",
+    "오프힙 메모리 OOM",
+    "direct buffer 누수",
+    "힙 밖 메모리 분석",
+    "Netty ByteBuf release 누락"
   ],
   "expected_queries": [
     "Java heap은 남았는데 Direct buffer memory OOM이 나는 이유가 뭐야?",
     "off-heap 메모리는 heap dump에 안 보이면 어떻게 확인해?",
-    "Netty나 NIO direct buffer 누수는 어디서 봐?"
+    "Netty나 NIO direct buffer 누수는 어디서 봐?",
+    "MaxDirectMemorySize와 container memory limit을 같이 봐야 하는 이유는?",
+    "heap dump가 깨끗한데 RSS가 높으면 Native Memory Tracking으로 무엇을 확인해?",
+    "ByteBuf release 누락이나 direct buffer pool 증가를 운영 지표에서 어떻게 잡아?"
   ],
   "symptoms": [
     "Java heap 사용량은 낮은데 컨테이너가 OOMKilled 돼요",
