@@ -1,0 +1,60 @@
+{
+  "id": "system-design/kafka-streams-interactive-queries-state-store-routing-primer",
+  "title": "Kafka Streams Interactive Queries State Store Routing Primer",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Kafka Streams Interactive Queries에서 key가 어느 task/host의 local state store에 있는지 찾고, 해당 host로 read를 routing하는 개념을 설명한다. Rebalance, stale store, standby read, service discovery, read availability trade-off를 다룬다.",
+  "body_markdown": "# Kafka Streams Interactive Queries State Store Routing Primer\n\n## 한 줄 요약\n\nKafka Streams Interactive Queries는 local state store를 query API처럼 읽게 해 주지만, key가 어느 host의 task에 있는지 routing해야 한다. Rebalance 중에는 owner가 바뀌고, standby나 stale store를 읽을지 정책이 필요하다.\n\n## 왜 routing이 필요한가\n\nKafka Streams state store는 모든 instance에 전체 데이터가 있는 구조가 아니다. Task와 partition assignment에 따라 key별 state가 특정 instance에 local로 존재한다. 따라서 API server가 아무 instance에나 물으면 해당 key의 store가 없을 수 있다.\n\n```text\nkey=user-123 -> partition 4 -> task 4 -> host B local store\nclient -> host A\nhost A finds host B for key\nhost A proxies or redirects to host B\n```\n\nInteractive Queries의 핵심은 state store read 자체보다 key metadata와 host routing이다.\n\n## 기본 구성요소\n\n| 구성요소 | 역할 |\n|---|---|\n| local state store | task가 소유한 key range의 상태 저장 |\n| metadata lookup | key가 어느 host에 있는지 찾음 |\n| host info | 외부에서 접근 가능한 instance 주소 |\n| proxy/redirect | 요청을 owner host로 전달 |\n| standby store | active가 아니지만 따라가는 복제 상태 |\n| rebalance handling | owner 변경 중 read 실패/재시도 처리 |\n\n## active read와 standby read\n\n가장 안전한 기본값은 active task owner에게 읽는 것이다. 하지만 active host가 느리거나 rebalance 중이면 standby store를 읽고 싶어질 수 있다. Standby read는 availability를 높일 수 있지만 freshness가 늦을 수 있다.\n\n| 선택 | 장점 | 위험 |\n|---|---|---|\n| Active owner read | 가장 최신에 가까움 | owner 장애/이동 시 실패 |\n| Standby read | availability와 tail 개선 | stale result 가능 |\n| Redirect | client가 owner로 직접 감 | client 복잡도 증가 |\n| Proxy | client 단순 | proxy hop latency와 timeout 필요 |\n| Fallback query store | 장애 시 대체 | consistency 차이를 문서화해야 함 |\n\n## rebalance 중 문제\n\nRebalance가 일어나면 key owner가 바뀔 수 있다. 이때 old host는 더 이상 해당 store를 소유하지 않거나, new host는 restore 중일 수 있다.\n\n운영 증상:\n\n- 특정 key read가 404/store not available을 반환한다.\n- Rebalance 중 interactive query latency가 튄다.\n- Standby에서 읽은 값이 active보다 늦다.\n- Host metadata cache가 낡아 잘못된 instance로 routing한다.\n\n대응:\n\n- metadata refresh와 retry policy를 둔다.\n- store state가 RUNNING/RESTORING인지 확인한다.\n- stale read 허용 여부를 API contract에 넣는다.\n- rebalance duration과 store unavailable rate를 metric으로 본다.\n\n## service discovery와 host info\n\nKafka Streams가 key owner metadata를 알려줘도, 외부 client가 그 host로 접근할 수 있어야 한다. Kubernetes나 service mesh 환경에서는 advertised host/port가 실제 routing 가능한 주소인지 확인해야 한다.\n\n잘못된 host info는 state store가 있어도 query가 실패하는 원인이 된다. 이 문제는 Kafka가 아니라 service discovery와 network routing 문제로 드러난다.\n\n## 흔한 오해\n\n- \"Interactive Queries는 모든 instance가 모든 state를 읽을 수 있다는 뜻이다\": key owner host로 routing해야 한다.\n- \"standby store를 읽으면 항상 안전하다\": stale window와 lag를 봐야 한다.\n- \"rebalance는 write path만 영향 있다\": read owner가 바뀌므로 interactive query도 흔들린다.\n- \"metadata lookup만 하면 끝이다\": host info, proxy timeout, retry, store state 확인이 필요하다.\n- \"state store read는 DB read처럼 강한 consistency다\": stream processing lag와 restore lag를 고려해야 한다.\n\n## 운영 지표\n\n- metadata lookup latency\n- owner host routing miss count\n- store unavailable count\n- rebalance duration\n- standby lag\n- active versus standby read divergence\n- proxy hop latency\n- restore state duration\n- stale read fallback count\n\n## 면접 답변 축\n\nInteractive Queries 질문에는 \"Kafka Streams state는 task별 local store에 있으므로 key metadata로 owner host를 찾아 그 host로 proxy/redirect해야 한다\"고 답한다. 이어서 rebalance와 restore 중 store availability가 흔들릴 수 있고, standby read는 availability를 높이지만 stale window를 계약해야 한다고 말하면 된다.\n\n## Safe Next Docs\n\nState store 복구는 `kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer`, service routing은 `service-discovery-health-routing-design`, shard-aware freshness는 `shard-aware-watermark-scope-primer`로 이어진다.\n",
+  "aliases": [
+    "Kafka Streams interactive queries",
+    "state store routing",
+    "카프카 스트림즈 조회",
+    "interactive query host routing",
+    "key owner metadata",
+    "standby store read",
+    "rebalance stale read",
+    "로컬 상태 조회",
+    "store unavailable",
+    "state store 라우팅"
+  ],
+  "expected_queries": [
+    "Kafka Streams Interactive Queries는 key가 있는 host를 어떻게 찾아서 state store를 읽어?",
+    "state store가 local이라면 아무 Kafka Streams instance에 query하면 안 되는 이유가 뭐야?",
+    "rebalance 중 Interactive Query가 store unavailable을 반환할 때 어떤 routing 문제를 봐야 해?",
+    "standby store에서 읽으면 availability는 좋아지지만 stale read가 생길 수 있다는 걸 어떻게 설명해?",
+    "Kafka Streams host info와 service discovery가 interactive query 실패에 어떤 영향을 줘?",
+    "Interactive Queries에서 proxy와 redirect 중 어떤 trade-off가 있어?"
+  ],
+  "symptoms": [
+    "Interactive Query가 특정 key에서 store not available을 반환한다",
+    "rebalance 중 state store read latency가 튄다",
+    "standby store에서 읽은 값이 active owner보다 늦다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer",
+      "system-design/service-discovery-health-routing-design"
+    ],
+    "next_docs": [
+      "system-design/shard-aware-watermark-scope-primer",
+      "system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser"
+    ],
+    "confusable_with": [
+      "system-design/service-discovery-health-routing-design",
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection",
+      "system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka Streams RocksDB changelog standby recovery를 설명해줘",
+      "일반 service discovery health routing 설계를 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-streams-interactive-queries-state-store-routing-primer.md",
+    "revision_history": []
+  }
+}

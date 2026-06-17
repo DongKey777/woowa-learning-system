@@ -1,0 +1,60 @@
+{
+  "id": "system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer",
+  "title": "Kafka Streams State Store, RocksDB, Changelog, Standby Recovery Primer",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Kafka Streams의 state store를 RocksDB local state, changelog topic, standby replica, restore lag 관점으로 설명한다. Generic stateful stream processor 문서보다 Kafka Streams 운영과 복구 경계에 초점을 둔다.",
+  "body_markdown": "# Kafka Streams State Store, RocksDB, Changelog, Standby Recovery Primer\n\n## 한 줄 요약\n\nKafka Streams의 state store는 로컬 RocksDB 같은 저장소에 상태를 두고, changelog topic에 상태 변경을 기록해 task 이동이나 장애 후 복구한다. 빠른 로컬 조회와 복구 가능성을 얻는 대신 restore lag, changelog retention, standby replica, rebalance 비용을 운영해야 한다.\n\n## 왜 state store가 필요한가\n\nStream 처리에서 단순 map/filter만 한다면 상태가 거의 필요 없다. 하지만 window count, join, dedup, aggregation, session store 같은 연산은 key별 상태를 유지해야 한다. Kafka Streams는 이 상태를 task별 local state store에 저장하고, changelog topic으로 durable하게 만든다.\n\n```text\ninput topic partition -> stream task\n  local state store(RocksDB)\n  changelog topic <- state update log\n```\n\nLocal state는 빠르지만 node가 죽으면 사라질 수 있다. Changelog는 복구의 source가 된다.\n\n## RocksDB local state와 changelog\n\nRocksDB는 JVM heap 밖 local disk에 상태를 저장하는 embedded key-value store로 자주 쓰인다. Local state는 query와 aggregation을 빠르게 하지만, disk IO, compaction, file descriptor, state size가 운영 이슈가 된다.\n\nChangelog topic은 state update를 Kafka log로 남긴다. Task가 다른 instance로 이동하면 Kafka Streams는 changelog를 replay해 local store를 재구성한다. 따라서 changelog retention과 compacted topic 설정은 recovery 가능성에 직접 연결된다.\n\n## standby replica\n\nStandby replica는 active task의 state를 다른 instance에 미리 따라가게 만들어 failover 시 restore 시간을 줄인다. 완전히 무료는 아니다. Standby도 changelog를 읽고 local disk를 사용하므로 storage와 network 비용이 든다.\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| standby 없음 | 단순하고 비용 낮음 | failover 때 changelog replay가 길어짐 |\n| standby 1개 | 복구 시간 감소 | storage/network 증가 |\n| standby 여러 개 | 더 빠른 failover 가능 | 비용과 assignment 복잡도 증가 |\n\n## restore lag가 의미하는 것\n\nRestore lag는 새 task가 local state를 따라잡기 위해 changelog를 얼마나 더 읽어야 하는지를 나타낸다. State가 크고 changelog가 많으면 rebalance 후 task가 오래 준비되지 않을 수 있다.\n\n확인 지표:\n\n- restore records remaining\n- restore bytes remaining\n- state store size\n- changelog end offset minus restored offset\n- standby catch-up lag\n- rebalance duration\n- RocksDB compaction latency\n\n## 복구 흐름\n\n```text\ninstance A dies\nactive task moves to instance B\nB checks local/standby state\nmissing state is restored from changelog topic\nrestore catches up to input offsets\nB resumes processing\n```\n\nExactly-once나 transaction 설정이 있어도 local state restore 자체가 빠른 것은 아니다. State size와 changelog replay 속도가 복구 시간을 지배할 수 있다.\n\n## 흔한 오해\n\n- \"state store는 Kafka topic 안에만 있다\": active processing은 local store를 사용하고 changelog가 durable recovery log 역할을 한다.\n- \"RocksDB라서 heap 문제가 없다\": off-heap/disk/compaction/file descriptor 문제가 남는다.\n- \"changelog가 있으면 복구는 즉시 된다\": state size와 restore lag에 따라 오래 걸릴 수 있다.\n- \"standby replica는 공짜다\": storage, network, assignment 비용이 있다.\n- \"retention을 줄여도 compaction topic이면 안전하다\": compacted changelog도 tombstone/retention 설정을 잘못 잡으면 restore에 필요한 key가 사라질 수 있다.\n\n## 운영 체크리스트\n\n1. State store size와 key cardinality를 측정한다.\n2. Changelog topic이 compacted로 올바르게 설정되어 있는지 본다.\n3. Restore lag와 rebalance duration을 배포 때 측정한다.\n4. Standby replica 수와 비용을 RTO에 맞춘다.\n5. RocksDB compaction, disk IO, local state directory 용량을 본다.\n6. State schema/version 변경 시 rolling upgrade와 restore compatibility를 검증한다.\n7. Changelog topic retention/tombstone 정책이 restore 가능한지 확인한다.\n\n## 면접 답변 축\n\nKafka Streams state store 질문에는 \"local RocksDB store가 active state를 빠르게 제공하고, changelog topic이 durable recovery log 역할을 하며, standby replica는 failover restore 시간을 줄인다\"고 답한다. 이어서 운영상 restore lag, changelog retention, state size, rebalance duration, RocksDB compaction을 봐야 한다고 말하면 된다.\n\n## Safe Next Docs\n\n일반 stateful stream processor는 `stateful-stream-processor-state-store-checkpoint-recovery-design`, Kafka transaction/EOS 범위는 `exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser`, rebalance는 `kafka-consumer-group-rebalance-cooperative-vs-eager`로 이어진다.\n",
+  "aliases": [
+    "Kafka Streams state store",
+    "RocksDB changelog",
+    "카프카 스트림즈 상태 저장소",
+    "Kafka Streams RocksDB",
+    "changelog topic restore",
+    "standby replica recovery",
+    "복구 지연",
+    "state store 복구",
+    "RocksDB compaction",
+    "Kafka Streams standby"
+  ],
+  "expected_queries": [
+    "Kafka Streams state store는 RocksDB local state와 changelog topic을 어떻게 같이 써?",
+    "Kafka Streams에서 task가 다른 instance로 이동하면 state store를 어떻게 복구해?",
+    "standby replica를 두면 Kafka Streams restore lag가 왜 줄어들 수 있어?",
+    "RocksDB state store를 쓰면 heap 문제는 줄어도 disk compaction과 restore 비용이 남는 이유가 뭐야?",
+    "changelog topic retention을 잘못 잡으면 Kafka Streams state restore가 왜 위험해?",
+    "Kafka Streams stateful aggregation 복구에서 restore lag와 rebalance duration을 어떤 지표로 봐?"
+  ],
+  "symptoms": [
+    "Kafka Streams 배포 후 rebalance가 오래 걸리며 task가 READY가 되지 않는다",
+    "state store가 커져 changelog replay restore 시간이 길어진다",
+    "standby replica 없이 장애 후 local state를 처음부터 복구한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager"
+    ],
+    "next_docs": [
+      "system-design/kafka-streams-interactive-queries-state-store-routing-primer",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser",
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism"
+    ],
+    "confusable_with": [
+      "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+    ],
+    "forbidden_for_queries": [
+      "stateful stream processor의 일반 checkpoint recovery를 설명해줘",
+      "Kafka offset gap tracking과 병렬 consumer commit을 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer.md",
+    "revision_history": []
+  }
+}
