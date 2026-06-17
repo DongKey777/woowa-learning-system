@@ -6,9 +6,18 @@
   "summary": "authorization cache는 decision latency와 revocation freshness를 함께 SLO로 잡아야 안전하다.",
   "body_markdown": "    # Authorization Decision Cache Invalidation Latency SLO Playbook\n\n    ## 이 문서가 맡는 질문\n    authorization decision cache invalidation, revocation propagation, freshness SLO를 연결하는 security playbook이다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    권한 변경 후 cache TTL, negative cache, event propagation, PDP/PEP 위치, stale allow/deny 정책을 확인한다.\n\n    ## 실전 시나리오\n    역할을 제거했는데 몇 분 동안 API 접근이 계속 허용된다. cache hit ratio만 보면 좋아 보이지만 authz freshness SLO를 위반하고 있다.\n\n    ## CS 배경\n    authorization cache는 decision latency를 줄이지만 권한 변경 freshness를 늦춘다. 보안 시스템에서는 cache correctness가 hit ratio보다 중요하며, stale allow와 stale deny의 위험이 다르다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - 권한 변경 이벤트는 cache invalidation 경로를 가져야 한다\n- stale allow와 stale deny를 같은 severity로 보지 않는다\n- negative cache TTL은 복구 지연을 만들 수 있다\n- authz decision latency와 revocation freshness를 동시에 SLO로 둔다\n\n    ## 판단 매트릭스\n    - low latency가 우선이면 short TTL/cache\n- 강한 revocation이면 push invalidation\n- 장애 degrade면 fail closed/open 정책\n- multi-region이면 propagation lag budget\n\n    ## 예시\n    ```text\n    role revoked at t0; PEP cache still allows until TTL t0+300s; revocation SLO violated despite fast authz p50\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    보안 cache는 빠른 결정을 만드는 동시에 오래된 결정을 계속 믿게 만드는 위험을 만든다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 role revoke, group membership change, negative cache recovery, event loss, regional lag를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. cache hit ratio, PDP QPS, invalidation fanout, decision cost를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. authz p99, revocation propagation p99, stale decision duration, cache miss penalty가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    authz_cache_hit_ratio, stale_allow_count, revocation_p99_ms, authz_decision_p99_ms, invalidation_event_lag_ms를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - authz cache hit ratio가 높으면 품질도 좋다고 본다\n- TTL을 짧게 하면 revocation 문제가 완전히 해결된다고 생각한다\n- stale allow와 stale deny를 같은 운영 이슈로 취급한다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    authorization cache는 decision latency와 revocation freshness를 함께 SLO로 잡아야 안전하다.\n",
   "aliases": [
-    "Authorization Decision Cache Invalidation Latency SLO Playbook",
-    "authorization decision cache invalidation revocation propagation freshness SLO stale allow latency playbook",
-    "권한을 제거했는데 캐시 때문에 계속 허용되면 authz latency와 freshness SLO를 어떻게 잡아?"
+    "권한 회수 반영 지연",
+    "권한회수 반영지연",
+    "권한 뺐는데 계속 접근됨",
+    "권한뺐는데 계속접근됨",
+    "인가 캐시 무효화 시간",
+    "인가캐시 무효화시간",
+    "stale allow 측정",
+    "revocation lag SLO",
+    "캐시 무효화 SLO",
+    "권한 변경 전파 시간",
+    "권한 캐시 SLO",
+    "authz cache revoke lag"
   ],
   "expected_queries": [
     "권한을 제거했는데 캐시 때문에 계속 허용되면 authz latency와 freshness SLO를 어떻게 잡아?",
