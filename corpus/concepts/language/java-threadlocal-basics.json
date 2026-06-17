@@ -1,0 +1,68 @@
+{
+  "id": "language/java-threadlocal-basics",
+  "title": "Java ThreadLocal 기초",
+  "category": "language",
+  "level": "beginner",
+  "summary": "ThreadLocal은 같은 변수를 쓰더라도 스레드마다 독립된 값을 보관하게 해 주는 Java 도구다. 요청을 처리하는 현재 스레드에 사용자 정보, 로그 trace id, 트랜잭션 리소스 같은 컨텍스트를 잠깐 묶어 둘 때 유용하지만, 스레드풀에서는 remove를 빠뜨리면 다음 요청이 이전 요청 값을 볼 수 있다. 이 문서는 set/get/remove, 요청 컨텍스트, 누수 오해를 입문 단계에서 연결한다.",
+  "body_markdown": "# Java ThreadLocal 기초\n\n> 한 줄 요약: ThreadLocal은 변수 하나를 여러 스레드가 공유하지 않고, 각 스레드가 자기 칸에 값을 따로 넣어 쓰게 하는 도구다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Java 스레드와 동기화 기초](./java-thread-basics.md)\n- [ThreadLocal Leaks and Context Propagation](./threadlocal-leaks-context-propagation.md)\n- [ThreadLocal Leak Web Request Router](./threadlocal-leak-web-request-router.md)\n- [InheritableThreadLocal vs ScopedValue Context Propagation](./inheritablethreadlocal-vs-scopedvalue-context-propagation.md)\n\nretrieval-anchor-keywords: Java ThreadLocal, ThreadLocal basics, 스레드 로컬, 스레드로컬, ThreadLocal set get remove, 요청 컨텍스트 ThreadLocal, SecurityContext ThreadLocal, MDC ThreadLocal, ThreadLocal remove, 스레드별 저장소, thread local map, thread pool leak\n\n---\n\n## 핵심 개념\n\nThreadLocal은 이름 그대로 현재 스레드에 붙은 작은 보관함처럼 생각하면 된다. 코드에서는 같은 `ThreadLocal<UserContext>` 변수를 보지만, 스레드 A와 스레드 B가 `get()`으로 꺼내는 값은 서로 다를 수 있다.\n\n일반 필드는 객체가 값을 들고 있고, 여러 스레드가 같은 객체를 공유하면 값도 함께 보인다. 반면 ThreadLocal은 값의 주인이 ThreadLocal 객체 자체라기보다 현재 실행 중인 스레드다.\n\n```text\nThreadLocal 변수: currentUser\n\nworker-1 thread -> currentUser = dongkey\nworker-2 thread -> currentUser = gugu\nworker-3 thread -> currentUser = null\n```\n\n그래서 ThreadLocal은 전역 변수처럼 어디서나 꺼낼 수 있어 보이지만, 실제 의미는 전역 공유가 아니라 **현재 스레드 범위의 컨텍스트**다. 이 차이를 놓치면 편해 보이는 static 보관함으로 오용하기 쉽다.\n\n---\n\n## set, get, remove 흐름\n\n가장 작은 사용 흐름은 세 단계다.\n\n```java\nclass RequestContextHolder {\n    private static final ThreadLocal<String> USER_ID = new ThreadLocal<>();\n\n    static void set(String userId) {\n        USER_ID.set(userId);\n    }\n\n    static String get() {\n        return USER_ID.get();\n    }\n\n    static void clear() {\n        USER_ID.remove();\n    }\n}\n```\n\n요청이 들어오면 filter나 interceptor에서 값을 넣고, service 깊은 곳에서는 method parameter로 계속 넘기지 않아도 현재 요청 사용자 id를 읽을 수 있다. 요청이 끝나면 반드시 `remove()`로 지운다.\n\n```java\ntry {\n    RequestContextHolder.set(authenticatedUserId);\n    chain.doFilter(request, response);\n} finally {\n    RequestContextHolder.clear();\n}\n```\n\n여기서 `finally`가 중요하다. 예외가 나도 현재 스레드에 붙은 값을 정리해야 다음 작업에 섞이지 않는다.\n\n---\n\n## 왜 스레드풀에서 remove가 중요할까\n\n초보자는 요청이 끝나면 스레드도 끝난다고 생각하기 쉽다. 하지만 웹 서버는 보통 매 요청마다 새 스레드를 만들지 않고, worker thread pool의 스레드를 재사용한다.\n\n```text\n요청 1: worker-7이 userId = A를 set\n요청 1 종료: remove를 안 함\n요청 2: 같은 worker-7이 재사용됨\n요청 2 시작: get()을 먼저 하면 userId = A가 남아 있을 수 있음\n```\n\n이것이 ThreadLocal leak의 첫 번째 감각이다. 메모리만 새는 문제가 아니라, 이전 요청의 보안 컨텍스트나 trace id가 다음 요청에 오염될 수 있다.\n\n정리 규칙은 단순하다.\n\n| 위치 | 할 일 |\n|---|---|\n| 요청 진입 | 필요한 context를 `set()` 한다 |\n| 요청 처리 | 현재 스레드 안에서만 `get()` 한다 |\n| 요청 종료 | `finally`에서 `remove()` 한다 |\n| 비동기 작업 전달 | 자동 전파된다고 가정하지 않는다 |\n\n---\n\n## 어디에 쓰이나\n\nThreadLocal 자체는 낮은 수준 도구지만, 프레임워크 안에서 많이 보인다.\n\n| 장면 | ThreadLocal로 보관하는 대표 값 | 주의점 |\n|---|---|---|\n| Spring Security | 현재 인증 정보, SecurityContext | 요청 종료 정리와 async 전파 경계를 봐야 한다 |\n| logging MDC | trace id, request id | thread pool 재사용 시 clear가 필요하다 |\n| Spring transaction | 현재 스레드에 묶인 connection/session 정보 | 다른 스레드로 넘어가면 같은 transaction이라고 가정하면 안 된다 |\n| locale/request context | locale, request attributes | servlet async나 scheduler에서 경계가 바뀔 수 있다 |\n\n이런 사례 때문에 초보자는 ThreadLocal을 직접 많이 작성하지 않더라도 원리는 알아야 한다. `@Transactional`이 같은 스레드 안에서 connection을 묶는다는 설명, SecurityContext가 현재 요청에서 꺼내진다는 설명이 ThreadLocal 감각 위에 놓인다.\n\n---\n\n## worked example: 예약 생성 요청의 trace id\n\n방 예약 API에서 요청마다 로그를 묶고 싶다고 하자.\n\n```text\nPOST /reservations\ntraceId = req-123\n```\n\nfilter에서 trace id를 ThreadLocal에 넣으면 controller, service, repository가 같은 method parameter를 계속 받지 않아도 로그에 trace id를 찍을 수 있다.\n\n```java\ntry {\n    TraceContext.set(traceId);\n    reservationService.reserve(command);\n} finally {\n    TraceContext.clear();\n}\n```\n\n장점은 호출부가 깔끔해진다는 점이다. 단점은 값이 코드 흐름에 명시적으로 보이지 않는다는 점이다. 그래서 ThreadLocal은 request context처럼 범위가 분명하고 수명이 짧은 값에만 제한적으로 쓰는 편이 좋다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 왜 위험한가 | 더 정확한 관점 |\n|---|---|---|\n| ThreadLocal은 전역 변수다 | 어디서나 접근 가능하니 공유 상태처럼 쓴다 | 현재 스레드에 묶인 context다 |\n| 요청이 끝나면 자동으로 값도 사라진다 | thread pool은 스레드를 재사용한다 | 요청 종료 시 remove가 필요하다 |\n| 다른 스레드에서도 같은 값을 읽을 수 있다 | async, scheduler, CompletableFuture에서 값이 사라진다 | 스레드가 바뀌면 context 전달을 별도로 설계해야 한다 |\n| InheritableThreadLocal이면 전파 문제가 끝난다 | thread pool과 가상 스레드, 생명주기에서 더 헷갈릴 수 있다 | 상속 전파와 요청 context 전파는 분리해서 본다 |\n| 편하니 domain state를 넣어도 된다 | 숨은 의존성이 커지고 테스트가 어려워진다 | 인증, trace, transaction 같은 cross-cutting context로 제한한다 |\n\n---\n\n## ThreadLocal을 쓰기 전에 묻는 질문\n\n1. 이 값은 현재 스레드의 짧은 작업 범위에만 의미가 있는가?\n2. method parameter로 명시적으로 넘기는 편이 더 단순하지 않은가?\n3. 요청 종료, job 종료, 테스트 종료 시 clear 지점이 확실한가?\n4. 작업이 다른 thread pool, scheduler, CompletableFuture로 넘어가지 않는가?\n5. 값이 남아도 보안이나 데이터 오염 문제가 없는가?\n\n이 질문에 자신이 없으면 ThreadLocal을 직접 만들기보다 프레임워크가 제공하는 context holder를 쓰거나, 아예 parameter로 전달하는 설계를 먼저 검토한다.\n\n---\n\n## 다음에 이어 볼 문서\n\n| 지금 궁금한 것 | 다음 문서 |\n|---|---|\n| remove를 안 했을 때 실제 누수와 오염이 어떻게 생기나 | [ThreadLocal Leaks and Context Propagation](./threadlocal-leaks-context-propagation.md) |\n| 웹 요청에서 이전 사용자 정보가 남는 증상을 어떻게 라우팅하나 | [ThreadLocal Leak Web Request Router](./threadlocal-leak-web-request-router.md) |\n| InheritableThreadLocal과 ScopedValue는 무엇이 다른가 | [InheritableThreadLocal vs ScopedValue Context Propagation](./inheritablethreadlocal-vs-scopedvalue-context-propagation.md) |\n| 스레드 자체가 아직 헷갈린다면 | [Java 스레드와 동기화 기초](./java-thread-basics.md) |\n\n---\n\n## 꼬리질문\n\n> Q: ThreadLocal은 왜 static으로 선언하는 예제가 많나요?\n> 의도: ThreadLocal 변수와 그 안의 per-thread value를 분리하는지 확인\n> 핵심: ThreadLocal 객체는 접근 지점이고, 실제 값은 각 스레드의 ThreadLocalMap에 따로 저장된다고 이해하면 된다.\n\n> Q: ThreadLocal을 쓰면 동기화가 필요 없나요?\n> 의도: 스레드별 값과 공유 객체 내부 상태를 구분하는지 확인\n> 핵심: 각 스레드가 다른 값을 쓰면 그 값 자체에는 동기화가 덜 필요하지만, 값으로 넣은 객체를 다른 스레드와 공유하면 별도 안전성이 필요하다.\n\n> Q: CompletableFuture에서 ThreadLocal 값이 안 보이는 이유는 무엇인가요?\n> 의도: 현재 스레드 범위라는 기본 정의 확인\n> 핵심: 작업이 다른 executor thread에서 실행되면 원래 요청 스레드의 ThreadLocal 값을 자동으로 읽는다고 보장할 수 없다.\n\n## 한 줄 정리\n\nThreadLocal은 현재 스레드에 짧게 묶인 context를 다루는 도구이고, 스레드풀 환경에서는 `set -> 사용 -> finally remove` 생명주기를 지키는 것이 기초다.\n",
+  "aliases": [
+    "Java ThreadLocal",
+    "ThreadLocal 기초",
+    "스레드 로컬",
+    "스레드로컬",
+    "ThreadLocal set get remove",
+    "요청 컨텍스트 ThreadLocal",
+    "SecurityContext ThreadLocal",
+    "MDC ThreadLocal",
+    "ThreadLocal remove",
+    "thread local basics",
+    "스레드별 저장소",
+    "트랜잭션 컨텍스트 ThreadLocal"
+  ],
+  "expected_queries": [
+    "Java ThreadLocal이 스레드마다 값을 따로 가진다는 말이 무슨 뜻이야?",
+    "ThreadLocal set get remove 흐름을 웹 요청 컨텍스트 예시로 설명해줘",
+    "스레드풀에서 ThreadLocal remove를 안 하면 다음 요청에 값이 남을 수 있어?",
+    "SecurityContext나 MDC가 ThreadLocal을 쓴다는 말을 초급자 기준으로 알고 싶어",
+    "CompletableFuture로 다른 스레드에 넘기면 ThreadLocal 값이 왜 자동으로 안 따라가?",
+    "ThreadLocal은 전역 변수와 뭐가 다르고 언제 쓰면 안 돼?"
+  ],
+  "symptoms": [
+    "ThreadLocal을 static 전역 변수처럼 이해해서 per-thread value와 공유 상태를 구분하지 못한다.",
+    "웹 요청이 끝나면 스레드도 사라진다고 생각해 ThreadLocal remove 필요성을 놓친다.",
+    "비동기 작업이나 다른 executor로 넘어가도 현재 요청 context가 자동으로 보인다고 가정한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-thread-basics"
+    ],
+    "next_docs": [
+      "language/threadlocal-leaks-context-propagation",
+      "language/threadlocal-leak-web-request-router",
+      "language/threadlocal-leak-interview-router",
+      "language/inheritablethreadlocal-vs-scopedvalue-context-propagation"
+    ],
+    "confusable_with": [
+      "language/inheritablethreadlocal-vs-scopedvalue-context-propagation",
+      "language/completablefuture-execution-model-common-pool-pitfalls",
+      "language/memory-leak-perspective-map-heap-offheap-threadlocal"
+    ],
+    "forbidden_for_queries": [
+      "ThreadLocalMap stale entry와 weak reference 누수 내부 구조를 자세히 설명해줘",
+      "ScopedValue와 InheritableThreadLocal 중 무엇을 선택해야 하는지 비교해줘",
+      "CompletableFuture executor 경계에서 context propagation을 구현하는 패턴을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch49-stream-a-foundation"
+      }
+    ]
+  }
+}
