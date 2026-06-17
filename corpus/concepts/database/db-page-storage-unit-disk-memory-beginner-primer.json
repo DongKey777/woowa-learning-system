@@ -1,0 +1,68 @@
+{
+  "id": "database/db-page-storage-unit-disk-memory-beginner-primer",
+  "title": "DB 페이지 저장 단위와 디스크-메모리 모델",
+  "category": "database",
+  "level": "beginner",
+  "summary": "DB 페이지는 데이터베이스가 디스크와 메모리 사이에서 데이터를 주고받는 기본 저장 단위다. 애플리케이션은 row 하나를 조회한다고 말하지만, 저장 엔진은 보통 page를 읽어 buffer pool에 올리고 그 안에서 record를 찾는다. 이 감각이 있어야 buffer pool, clustered index, page split, redo/undo, crash recovery 같은 고급 문서가 물리적으로 이해된다.",
+  "body_markdown": "# DB 페이지 저장 단위와 디스크-메모리 모델\n\n> 한 줄 요약: DB는 row 하나만 집어 오는 기계가 아니라, 디스크 page를 buffer pool에 올리고 그 page 안에서 record를 찾는 저장 엔진이다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Database First-Step Bridge](./database-first-step-bridge.md)\n- [Page Directory and Record Layout Intuition](./page-directory-and-record-layout-intuition.md)\n- [InnoDB Buffer Pool Internals](./innodb-buffer-pool-internals.md)\n- [Buffer Pool Read-Ahead and Eviction Interaction](./buffer-pool-read-ahead-eviction-interaction.md)\n- [LOB Off-Page Storage Behavior](./lob-off-page-storage-behavior.md)\n\nretrieval-anchor-keywords: DB page, database page, page storage unit, disk memory model, buffer pool page, InnoDB page, page IO, disk page, dirty page, page split beginner, clustered index page, 데이터베이스 페이지, DB 페이지가 뭐야, row 하나 조회해도 page를 읽는 이유\n\n---\n\n## 핵심 개념\n\nDB 페이지(page)는 데이터베이스가 디스크와 메모리 사이에서 데이터를 주고받는 기본 단위다.\n\n애플리케이션 코드는 보통 이렇게 말한다.\n\n```sql\nSELECT * FROM reservation WHERE id = 42;\n```\n\n겉으로는 예약 row 하나를 읽는 요청처럼 보인다. 하지만 저장 엔진은 디스크에서 row 하나의 바이트만 똑 떼어 가져오는 식으로 일하지 않는다. 보통 일정 크기의 page를 읽고, 그 page를 메모리의 buffer pool에 올린 뒤, page 안에서 원하는 record를 찾는다.\n\nInnoDB에서는 대표적으로 16KB page를 사용한다. 정확한 page 크기나 내부 형식은 엔진마다 다르지만, beginner 단계에서 중요한 감각은 하나다.\n\n```text\n애플리케이션 관점: row 하나 조회\n저장 엔진 관점: index page를 따라가고, 필요한 data page를 buffer pool에 올리고, page 안 record를 찾음\n```\n\n이 차이를 모르면 buffer pool, clustered index, page split, redo/undo log 문서가 모두 추상적으로 보인다.\n\n---\n\n## 왜 row 단위가 아니라 page 단위로 움직일까\n\n디스크 I/O는 메모리에서 변수 하나 읽는 것보다 훨씬 비싸다. 그래서 DB는 디스크에서 필요한 바이트만 매번 가져오기보다, 주변 record와 index entry를 묶은 page 단위로 읽는다.\n\npage 단위 모델의 장점은 이렇다.\n\n- 한 번 읽은 page 안의 여러 record를 재사용할 수 있다.\n- range scan처럼 인접한 데이터를 읽는 작업에 유리하다.\n- B+Tree의 root, internal, leaf node를 page 단위로 관리할 수 있다.\n- buffer pool이 page를 캐싱하므로 같은 page를 반복해서 디스크에서 읽지 않아도 된다.\n\n반대로 비용도 있다.\n\n- row 하나만 필요해도 page 전체가 메모리에 올라올 수 있다.\n- 대량 scan이 많은 page를 읽으면 buffer pool의 hot page를 밀어낼 수 있다.\n- 자주 바뀌는 page는 dirty page가 되어 나중에 flush 압력을 만든다.\n\n즉 page는 성능의 최소 물리 단위에 가깝다. SQL 튜닝이 단순히 WHERE 절을 고치는 일이 아니라 page read를 줄이는 일이 되는 이유도 여기에 있다.\n\n---\n\n## worked example: 예약 id 하나를 clustered index에서 찾기\n\n예약 테이블의 primary key가 `id`라고 해 보자.\n\n```sql\nSELECT id, member_id, time_id\nFROM reservation\nWHERE id = 42;\n```\n\n저장 엔진 내부를 단순화하면 다음 순서로 볼 수 있다.\n\n```text\n1. clustered index root page를 확인한다.\n2. key 범위에 맞는 internal page로 내려간다.\n3. leaf page에 도착한다.\n4. leaf page 안에서 id = 42 record를 찾는다.\n5. page가 buffer pool에 없으면 디스크에서 page 단위로 읽어 온다.\n```\n\n이때 이미 root/internal page는 자주 쓰여 buffer pool에 있을 가능성이 높다. leaf page는 workload에 따라 있을 수도 있고 없을 수도 있다.\n\n따라서 같은 쿼리라도 아래 두 상황은 비용이 다르다.\n\n| 상황 | 실제 감각 |\n|---|---|\n| 필요한 page가 buffer pool에 있음 | 메모리에서 page를 찾고 record를 읽는다 |\n| 필요한 page가 buffer pool에 없음 | 디스크에서 page를 읽어 buffer pool에 올린 뒤 record를 읽는다 |\n\n초보자가 자주 놓치는 점은 여기다. 인덱스가 있어도 page가 차갑고 buffer pool miss가 많으면 응답 시간이 튈 수 있다.\n\n---\n\n## 쓰기는 page를 더 중요하게 만든다\n\n읽기만 page 단위인 것은 아니다. update도 page 단위 감각으로 봐야 한다.\n\n```sql\nUPDATE reservation\nSET status = 'CONFIRMED'\nWHERE id = 42;\n```\n\n이 작업은 대상 record가 들어 있는 page를 buffer pool에 올리고, 메모리 안 page를 수정한다. 수정된 page는 디스크의 page와 내용이 달라졌으므로 dirty page가 된다.\n\n```text\n디스크 page: 아직 옛 상태\nbuffer pool page: status가 CONFIRMED로 바뀐 상태\n```\n\nDB는 매번 update 직후 데이터 page를 즉시 디스크에 완전히 반영하지 않을 수 있다. 대신 redo log 같은 로그에 먼저 기록하고, dirty page는 나중에 적절한 시점에 flush한다. 장애가 나면 redo/undo와 checkpoint 정보를 이용해 commit된 변경은 살리고, 미완료 변경은 정리한다.\n\n그래서 page 모델은 단순 조회 성능뿐 아니라 durability와 crash recovery의 토대다.\n\n---\n\n## page와 buffer pool 관계\n\nbuffer pool은 page를 담아 두는 DB 엔진의 메모리 공간이다.\n\n| 용어 | beginner-first 의미 |\n|---|---|\n| disk page | 디스크에 저장된 page |\n| buffer pool page | 메모리에 올라온 page 사본 |\n| dirty page | 메모리에서 수정됐지만 아직 디스크 반영이 끝나지 않은 page |\n| page miss | 필요한 page가 buffer pool에 없어 디스크에서 읽어야 하는 상황 |\n| flush | dirty page를 디스크로 내려 쓰는 작업 |\n\n이 관계를 모르면 buffer pool hit ratio 같은 지표도 그냥 캐시 숫자로만 보인다. 실제로는 읽기 캐시, 쓰기 완충, crash recovery 부담이 모두 얽혀 있다.\n\n---\n\n## page 크기 trade-off\n\npage가 크면 한 번의 I/O로 더 많은 record를 가져온다. 범위 조회나 locality가 좋은 workload에는 도움이 된다.\n\n하지만 page가 크다고 항상 좋은 것은 아니다.\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| 큰 page | 인접 record를 한 번에 가져오기 좋다 | 필요 없는 데이터까지 buffer pool을 차지할 수 있다 |\n| 작은 page | 세밀하게 읽을 수 있다 | 많은 page를 따라가야 할 수 있고 metadata overhead가 커진다 |\n| hot page 유지 | 반복 조회가 빠르다 | 대량 scan이 들어오면 hot page가 밀릴 수 있다 |\n| dirty page 지연 flush | 쓰기 burst를 흡수한다 | flush storm이나 recovery 부담이 커질 수 있다 |\n\n실무에서는 page 크기를 매번 바꾸기보다, page 단위로 움직인다는 사실을 바탕으로 index, query, buffer pool, batch workload를 해석하는 일이 더 중요하다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 왜 틀리기 쉬운가 | 더 정확한 관점 |\n|---|---|---|\n| row 하나 조회하면 디스크에서도 row 하나만 읽는다 | SQL 결과가 row라서 내부 I/O도 row라고 상상한다 | DB는 보통 page 단위로 읽고 그 안에서 record를 찾는다 |\n| page는 디스크에만 있다 | page라는 이름 때문에 저장 파일만 떠올린다 | 같은 page의 사본이 buffer pool에 올라와 있을 수 있다 |\n| buffer pool은 단순 read cache다 | 캐시 hit만 보면 된다고 생각한다 | dirty page, flush, checkpoint와도 연결된다 |\n| OS page와 DB page는 같은 개념이다 | 둘 다 page라는 이름을 쓴다 | OS page는 가상 메모리 단위, DB page는 저장 엔진 구조 단위다 |\n\n특히 OS page와 DB page를 섞지 않는 것이 중요하다. 둘은 크기와 관리 주체가 다를 수 있고, 문제를 진단하는 계층도 다르다.\n\n---\n\n## 미션 코드에서 어떻게 보이나\n\n방 예약 미션에서 `reservation` 테이블이 커졌다고 하자. `member_id`로 예약 목록을 조회하는 API가 느리다.\n\n초보자는 보통 SQL만 본다.\n\n```sql\nSELECT *\nFROM reservation\nWHERE member_id = 10\nORDER BY date DESC;\n```\n\npage 감각을 붙이면 질문이 바뀐다.\n\n- 이 조건으로 시작 위치를 찾는 index page가 있는가?\n- 조회 결과가 같은 leaf page 근처에 모여 있는가?\n- secondary index를 타고 실제 row page를 다시 많이 읽는가?\n- 대량 조회가 buffer pool의 hot page를 밀어내는가?\n- update가 많은 table이라 dirty page flush가 읽기까지 흔드는가?\n\n즉 page 모델은 SQL 문장을 storage-engine 비용으로 번역하는 첫 다리다.\n\n---\n\n## 다음에 이어 볼 문서\n\n| 지금 궁금한 것 | 다음 문서 |\n|---|---|\n| page 안 record와 directory가 어떻게 생겼나 | [Page Directory and Record Layout Intuition](./page-directory-and-record-layout-intuition.md) |\n| buffer pool이 LRU, dirty page, flush list를 어떻게 관리하나 | [InnoDB Buffer Pool Internals](./innodb-buffer-pool-internals.md) |\n| index가 page 단위 B+Tree로 왜 낮게 유지되나 | [디스크 B+Tree 인덱스와 Fanout 입문](./index-as-btree-on-disk-fanout-beginner-primer.md) |\n| 큰 컬럼이 page 밖으로 나가는 경우는 무엇인가 | [LOB Off-Page Storage Behavior](./lob-off-page-storage-behavior.md) |\n\n---\n\n## 꼬리질문\n\n> Q: row 하나를 조회해도 DB가 page 단위로 읽는 이유는 무엇인가요?\n> 의도: SQL 결과 단위와 storage I/O 단위를 분리하는지 확인\n> 핵심: 디스크 I/O 비용 때문에 DB는 page를 읽고 그 안에서 record를 찾는다.\n\n> Q: buffer pool page와 disk page는 어떤 관계인가요?\n> 의도: 메모리 사본과 디스크 원본의 차이를 이해하는지 확인\n> 핵심: buffer pool에는 disk page의 메모리 사본이 올라오며, 수정되면 dirty page가 된다.\n\n> Q: page 모델을 모르면 clustered index나 redo/undo가 왜 어려워지나요?\n> 의도: foundation 문서의 목적 확인\n> 핵심: index node, data row, dirty page, recovery가 모두 page 단위 움직임과 연결되기 때문이다.\n\n## 한 줄 정리\n\nDB 페이지는 row와 disk I/O 사이의 실제 작업 단위라서, buffer pool, clustered index, page split, redo/undo를 이해하려면 가장 먼저 잡아야 하는 저장 엔진의 바닥 개념이다.\n",
+  "aliases": [
+    "DB page",
+    "database page",
+    "데이터베이스 페이지",
+    "DB 페이지",
+    "디비 페이지",
+    "저장 페이지",
+    "디스크 페이지",
+    "버퍼 페이지",
+    "page storage unit",
+    "page I/O",
+    "InnoDB page",
+    "B+Tree page"
+  ],
+  "expected_queries": [
+    "DB 페이지가 뭐야?",
+    "데이터베이스는 왜 row 하나만 읽지 않고 page 단위로 읽어?",
+    "버퍼 풀에 page가 올라온다는 말이 무슨 뜻이야?",
+    "디스크에 있는 데이터가 메모리로 올라와서 조회되는 과정을 알고 싶어",
+    "dirty page와 flush는 DB page 모델에서 어떻게 연결돼?",
+    "클러스터드 인덱스를 이해하려면 page 단위를 먼저 알아야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "row 하나를 조회하면 디스크에서도 row 하나만 읽는다고 생각해 buffer pool miss와 page read 비용을 설명하지 못한다.",
+    "buffer pool을 단순 캐시로만 보고 dirty page, flush, checkpoint와 연결하지 못한다.",
+    "clustered index, page split, redo/undo 문서를 읽을 때 page가 물리 저장 단위라는 감각이 없어 막힌다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/database-first-step-bridge"
+    ],
+    "next_docs": [
+      "database/index-as-btree-on-disk-fanout-beginner-primer",
+      "database/page-directory-and-record-layout-intuition",
+      "database/innodb-buffer-pool-internals",
+      "database/buffer-pool-read-ahead-eviction-interaction"
+    ],
+    "confusable_with": [
+      "database/innodb-buffer-pool-internals",
+      "database/page-directory-and-record-layout-intuition",
+      "database/lob-off-page-storage-behavior"
+    ],
+    "forbidden_for_queries": [
+      "InnoDB buffer pool LRU free list flush list 내부 구조를 설명해줘",
+      "page directory와 infimum supremum record layout을 자세히 알고 싶어",
+      "큰 TEXT 컬럼이 off-page로 저장되는 조건이 궁금해"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch46-stream-a-foundation"
+      }
+    ]
+  }
+}
