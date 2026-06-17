@@ -7,15 +7,23 @@
   "body_markdown": "# JPA Flush Commit Transaction Interview Router\n\n## 관찰 증거\n\n- entity 변경은 persistence context에 쌓이고 flush 시 현재 transaction 안에서 SQL로 DB에 전송된다.\n- commit은 transaction을 확정하는 단계이며 보통 commit 전에 flush가 일어난다.\n- flush가 됐어도 transaction이 rollback되면 rollback 가능한 데이터 변경은 최종 반영되지 않는다.\n- flush는 SQL 동기화 시점이고, commit은 DB transaction의 확정 시점이다.\n- 영속성 컨텍스트 1차 캐시 때문에 flush/clear 없이 테스트하면 실제 DB 조회 문제를 놓칠 수 있다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| SQL이 늦게 나감 | write-behind flush | flush mode, transaction boundary, id generation |\n| constraint 예외가 늦게 발생 | flush 시점 검증 | explicit flush test |\n| 테스트가 통과하지만 운영 실패 | persistence context cache | flush/clear |\n| flush 후 rollback됨 | commit 전 transaction 실패 | rollback log, exception propagation |\n| 조회 전 SQL이 나감 | query execution 전 auto flush | flush mode, JPQL/native query |\n\n## 면접 답변 골격\n\nFlush는 persistence context 변경을 SQL로 동기화하는 것이고, commit은 transaction 결과를 확정하는 것이다. 둘은 관련 있지만 같은 사건이 아니다.\n\n면접 답변은 세 단계로 말하면 안전하다.\n\n```text\nentity state change\n  -> persistence context dirty checking/write-behind\n  -> flush: SQL sent to DB inside current transaction\n  -> commit: DB transaction confirmed\n```\n\nflush가 일어나면 DB는 현재 transaction 안에서 SQL을 받지만, 아직 commit 전이면 다른 transaction에 보이는지는 isolation과 DB 정책에 좌우된다. 그리고 rollback되면 flush된 SQL도 최종 반영되지 않는다.\n\n단, IDENTITY 식별자처럼 DB insert가 필요해야 id를 얻는 전략, `saveAndFlush()`, 명시적 `flush()`, query 실행 전 auto flush 때문에 SQL이 더 일찍 나갈 수 있다. 그래서 \"save는 항상 SQL을 늦춘다\"보다 \"JPA는 보통 write-behind를 쓰지만 flush가 필요한 지점에서는 SQL을 보낸다\"가 더 안전한 표현이다.\n\n## 시점별로 볼 것\n\n| 시점 | 일어나는 일 | 흔한 착각 |\n|---|---|---|\n| `save()` | entity를 persist/merge 대상으로 만든다 | 항상 즉시 insert SQL이 나간다고 생각한다 |\n| dirty checking | transaction 안 변경을 감지한다 | setter 호출마다 update가 나간다고 생각한다 |\n| flush | SQL을 DB에 보낸다 | flush면 이미 확정됐다고 생각한다 |\n| commit | transaction 결과를 확정한다 | commit과 flush를 같은 말로 쓴다 |\n| rollback | transaction 변경을 되돌린다 | flush 후에는 rollback이 안 된다고 생각한다 |\n\n## 테스트 경계\n\nJPA 테스트에서 `repository.findById()`가 같은 persistence context의 managed entity를 돌려주면 DB에 실제로 저장/조회되는 SQL 문제를 못 볼 수 있다. 그래서 constraint, mapping, query 검증이 목적이면 `flush()`로 SQL을 강제로 보내고 `clear()`로 1차 캐시를 비운 뒤 다시 조회하는 편이 안전하다.\n\n```text\nsave\nflush: constraint와 SQL shape 확인\nclear: 1차 캐시 제거\nfind: DB에서 다시 읽는 경로 확인\n```\n\n## 오답 교정\n\n- \"flush는 commit이다\"가 아니다. flush는 동기화, commit은 확정이다.\n- \"save했는데 SQL이 안 보이니 저장이 안 됐다\"가 아니다. transaction write-behind 때문에 flush 전까지 SQL이 늦게 보일 수 있다. 다만 id 생성 전략이나 explicit flush 때문에 즉시 보이는 경우도 있다.\n- \"테스트가 rollback되니 flush를 안 봐도 된다\"가 아니다. rollback 테스트에서도 flush 시점 constraint 예외는 잡아야 한다.\n- flush된 SQL의 일반적인 데이터 변경은 rollback 대상이지만, sequence 증가나 DB 외부 side effect처럼 transaction rollback으로 되돌아가지 않는 요소가 섞일 수 있다.\n- `@Transactional` method 밖 lazy loading, detached entity 변경, self-invocation transaction 누락은 flush/commit 차이와 별도의 boundary 문제다.\n\n## 관련 playbook\n\n테스트 blind spot은 `datajpatest-flush-clear-rollback-visibility-pitfalls`로 이어진다.\n",
   "aliases": [
     "JPA flush commit interview",
-    "flush commit transaction router",
+    "flush vs commit transaction",
+    "persistence context flush",
+    "save SQL delayed",
+    "flush rollback still possible",
     "JPA flush 면접 디버깅",
     "영속성 컨텍스트 commit 차이",
-    "@Transactional"
+    "SQL 바로 안 나감",
+    "flush 후 rollback",
+    "transaction write-behind"
   ],
   "expected_queries": [
     "JPA flush랑 commit 차이를 면접에서 어떻게 설명해?",
     "save했는데 SQL이 바로 안 나가는 이유가 뭐야?",
-    "flush했으면 rollback이 안 되는 거야?"
+    "flush했으면 rollback이 안 되는 거야?",
+    "영속성 컨텍스트의 write-behind 때문에 save와 SQL 실행 시점이 달라지는 흐름을 설명해줘",
+    "flush는 DB에 SQL을 보내는 것인데 commit과 rollback 가능성은 어떻게 달라?",
+    "면접에서 flush, commit, transaction boundary, persistence context를 한 번에 어떻게 답해?"
   ],
   "symptoms": [
     "repository save 후 SQL이 바로 나가지 않아요",
