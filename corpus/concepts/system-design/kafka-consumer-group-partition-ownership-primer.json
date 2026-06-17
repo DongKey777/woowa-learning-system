@@ -1,0 +1,68 @@
+{
+  "id": "system-design/kafka-consumer-group-partition-ownership-primer",
+  "title": "Kafka Consumer Group Partition Ownership Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka consumer group은 같은 group 안의 consumer들이 topic partition을 나눠 소유하며 읽는 단위다. partition ownership, idle consumer, lag, rebalance의 기초를 잡아야 cooperative/eager rebalance와 병렬 처리 한계를 이해할 수 있다.",
+  "body_markdown": "# Kafka Consumer Group Partition Ownership Primer\n\n> 한 줄 요약: Kafka consumer group 안에서는 partition이 consumer들에게 배정되고, 한 partition은 보통 한 group 안에서 한 consumer가 소유해 순서와 offset을 관리한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer](./kafka-foundations-topic-partition-broker-offset-beginner-primer.md)\n- [Kafka Partition Count and Consumer Parallelism Primer](./kafka-partition-count-consumer-parallelism-primer.md)\n- [Kafka Partition Key Ordering Primer](./kafka-partition-key-ordering-primer.md)\n- [Kafka Offset Commit Timing and At-Least-Once Card](./kafka-offset-commit-timing-at-least-once-card.md)\n- [Kafka Consumer Group Rebalance Cooperative vs Eager](./kafka-consumer-group-rebalance-cooperative-vs-eager.md)\n- [Kafka Out-of-Order Commit Offset Gap Parallelism](./kafka-out-of-order-commit-offset-gap-parallelism.md)\n\nretrieval-anchor-keywords: Kafka consumer group partition ownership, consumer group assignment, partition owner consumer, idle consumer partition count, group instance ownership, consumer group lag partition, 카프카 컨슈머 그룹 소유권, 파티션 배정, consumer 수 partition 수\n\n---\n\n## 기본 그림\n\nKafka consumer group은 같은 목적의 consumer들이 partition을 나눠 읽는 단위다.\n\n```text\ntopic order-events\n  partition 0 -> consumer A\n  partition 1 -> consumer B\n  partition 2 -> consumer B\n  partition 3 -> consumer C\n```\n\n여기서 consumer B는 partition 1과 2를 소유한다. 같은 group 안에서는 partition 1을 A와 B가 동시에 읽는 방식이 기본이 아니다. 이 규칙 덕분에 partition 내부 순서와 offset commit 경계를 비교적 단순하게 유지할 수 있다.\n\n반대로 group이 다르면 각 group이 같은 topic을 독립적으로 읽는다.\n\n```text\norder-projection-group  -> 주문 조회 모델 갱신\nnotification-group      -> 알림 발송\nanalytics-group         -> 분석 적재\n```\n\n이 점 때문에 Kafka는 한 group 안에서는 work queue처럼 분산되고, group이 다르면 pub/sub처럼 fan-out된다.\n\n---\n\n## partition ownership이 왜 중요한가\n\nPartition ownership은 세 가지 질문의 출발점이다.\n\n| 질문 | ownership 관점 |\n|---|---|\n| consumer를 늘리면 처리량이 늘까 | partition 수보다 consumer가 많으면 idle consumer가 생긴다 |\n| 같은 주문 이벤트 순서가 지켜질까 | 같은 key가 같은 partition에 가고 그 partition owner가 순차 처리해야 한다 |\n| 장애나 scale out 때 왜 멈칫할까 | partition ownership을 다시 나누는 rebalance가 일어난다 |\n\n따라서 consumer group을 설명할 때는 \"여러 consumer가 같이 읽는다\"보다 \"partition ownership을 나눠 가진다\"고 말하는 편이 정확하다.\n\n---\n\n## worked example: partition 3개, consumer 5개\n\n`payment-events` topic에 partition이 3개 있고 consumer를 5개 띄웠다고 하자.\n\n```text\npartition 0 -> consumer-1\npartition 1 -> consumer-2\npartition 2 -> consumer-3\nconsumer-4 -> idle\nconsumer-5 -> idle\n```\n\n같은 group 안에서는 partition 하나를 두 consumer가 동시에 소유하지 않으므로, consumer 4와 5는 할 일이 없을 수 있다. 이때 lag가 높다고 consumer만 더 늘리면 해결되지 않는다. 병목은 아래 중 하나일 수 있다.\n\n- partition 수가 병렬성 상한이다.\n- 특정 key가 한 partition에 몰린 hot partition이다.\n- consumer 내부 처리나 downstream DB/API가 느리다.\n- retry나 poison message가 한 partition을 막고 있다.\n\n이 판단이 `kafka-partition-count-consumer-parallelism-primer`와 이어진다.\n\n---\n\n## ownership과 offset commit\n\nConsumer가 partition을 소유하면 그 partition에서 poll한 record를 처리하고 offset을 commit한다. Ownership이 바뀌면 새 consumer는 committed offset 이후부터 읽는다.\n\n```text\nconsumer A owns partition 0\n  poll offset 10, 11, 12\n  process 10, 11\n  commit 11\n\nrebalance after A leaves\nconsumer B owns partition 0\n  starts from offset 12\n```\n\n이 그림에서 commit timing이 중요하다. A가 12를 처리했지만 commit 전에 죽었다면 B는 12를 다시 처리할 수 있다. A가 처리 전에 commit했다면 12를 잃을 수 있다. 그래서 ownership과 offset commit timing은 같이 배워야 한다.\n\n---\n\n## ownership과 ordering\n\nKafka의 순서 보장은 topic 전체보다 partition 내부에서 먼저 생각한다. 같은 주문 ID를 key로 보내면 같은 partition으로 가고, 그 partition owner가 순차 처리하면 주문별 순서를 지키기 쉽다.\n\n하지만 consumer 내부에서 record를 병렬로 던지면 다시 조심해야 한다.\n\n```text\npartition 0 owner consumer A\n  offset 100 -> worker-1 느림\n  offset 101 -> worker-2 빠름\n```\n\n101이 먼저 끝났다고 101까지 commit하면 100 실패를 건너뛰는 문제가 생길 수 있다. 이 주제는 offset gap tracking과 out-of-order commit 문서로 이어진다.\n\n---\n\n## rebalance를 배우기 전 알아야 할 것\n\nRebalance는 partition ownership을 다시 나누는 과정이다. 새 consumer가 들어오거나, consumer가 죽거나, heartbeat가 끊기거나, `max.poll.interval.ms`를 넘기면 group coordinator가 assignment를 다시 만들 수 있다.\n\nAdvanced 문서의 cooperative/eager 차이를 이해하려면 먼저 아래 문장을 알아야 한다.\n\n```text\nrebalance는 record 자체를 옮기는 것이 아니라 partition ownership을 다시 배정하는 과정이다.\n```\n\nEager rebalance가 왜 stop-the-world처럼 보이고, cooperative rebalance가 왜 일부 partition만 점진적으로 넘기려 하는지는 이 ownership 모델 위에서 이해된다.\n\n---\n\n## 증상별 첫 분기\n\n| 증상 | 먼저 볼 것 | 이유 |\n|---|---|---|\n| consumer를 늘렸는데 처리량이 그대로 | partition count와 idle consumer | ownership 상한이 partition 수일 수 있다 |\n| 한 partition lag만 계속 증가 | key skew, poison message, downstream wait | owner 하나가 해당 partition을 처리한다 |\n| scale out 직후 잠깐 멈춤 | rebalance event, assignment log | ownership 재배정 중일 수 있다 |\n| 같은 key 순서가 깨짐 | key 선택, partitioner, 내부 병렬 처리 | partition ownership만으로 worker ordering까지 보장되지는 않는다 |\n| 처리 완료됐는데 다시 처리됨 | offset commit timing | commit 전 owner 장애면 재처리된다 |\n\n---\n\n## 면접 답변 골격\n\n\"Kafka consumer group은 같은 목적의 consumer들이 topic partition을 나눠 읽는 단위입니다. 같은 group 안에서는 partition 하나가 보통 한 consumer에게 배정되기 때문에 partition 수가 병렬성 상한이 되고, consumer가 더 많으면 idle이 생길 수 있습니다. Ownership이 바뀌는 과정이 rebalance이고, 새 owner는 committed offset 이후부터 읽습니다. 그래서 ordering, lag, rebalance, offset commit은 모두 partition ownership 모델에서 같이 설명해야 합니다.\"\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| consumer를 많이 띄우면 무조건 빨라진다 | 같은 group의 병렬성은 partition ownership에 묶인다 |\n| consumer group은 subscriber 목록일 뿐이다 | partition assignment와 committed offset을 갖는 처리 단위다 |\n| rebalance는 데이터를 옮기는 과정이다 | partition ownership을 다시 배정하는 과정이다 |\n| partition owner가 하나면 내부 병렬화도 안전하다 | worker 병렬화는 ordering과 offset gap 문제를 다시 만든다 |\n| lag가 높으면 consumer만 늘리면 된다 | hot partition, downstream, retry blocking을 같이 봐야 한다 |\n\n---\n\n## 꼬리질문\n\n> Q: partition 3개에 consumer 5개면 왜 consumer 2개가 놀 수 있나요?\n> 의도: consumer group 병렬성 상한 이해 확인\n> 핵심: 같은 group 안에서 partition 하나는 보통 한 consumer가 소유하므로 partition 수가 기본 상한이다.\n\n> Q: rebalance는 record를 옮기는 건가요?\n> 의도: ownership과 data movement 구분 확인\n> 핵심: rebalance는 partition ownership assignment를 다시 만드는 과정이다.\n\n> Q: 같은 partition owner가 순차 poll했는데도 순서가 깨질 수 있나요?\n> 의도: 내부 병렬 처리와 offset gap 이해 확인\n> 핵심: worker 병렬화가 들어오면 완료 순서와 commit 순서가 달라질 수 있다.\n\n## 한 줄 정리\n\nKafka consumer group의 핵심은 partition ownership이며, 이 모델을 알아야 consumer 병렬성, lag, rebalance, offset commit 문제를 정확히 분리할 수 있다.\n",
+  "aliases": [
+    "Kafka consumer group ownership",
+    "partition ownership Kafka",
+    "consumer group assignment",
+    "카프카 컨슈머 그룹",
+    "파티션 소유권",
+    "consumer idle partition",
+    "consumer 수 partition 수",
+    "rebalance ownership",
+    "카프카 파티션 배정",
+    "consumer group lag"
+  ],
+  "expected_queries": [
+    "Kafka consumer group에서 partition ownership이란 게 뭐야?",
+    "카프카 consumer를 partition 수보다 많이 늘리면 왜 idle consumer가 생길 수 있어?",
+    "consumer group 안에서 한 partition을 여러 consumer가 동시에 읽지 않는 이유가 뭐야?",
+    "rebalance는 record를 옮기는 게 아니라 partition ownership을 다시 나누는 과정이라는 말을 설명해줘",
+    "Kafka lag가 높을 때 consumer 수, partition 수, hot partition을 어떤 순서로 봐야 해?",
+    "partition owner가 바뀌면 committed offset 이후부터 읽는다는 게 중복 처리와 어떻게 연결돼?"
+  ],
+  "symptoms": [
+    "consumer 수를 늘리면 항상 처리량이 늘어난다고 생각한다",
+    "consumer group과 pub/sub subscriber group을 같은 말로만 이해한다",
+    "rebalance를 데이터 이동으로 오해한다",
+    "partition ownership과 offset commit timing을 분리해서 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-partition-count-consumer-parallelism-primer",
+      "system-design/kafka-partition-key-ordering-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/kafka-offset-commit-timing-at-least-once-card"
+    ],
+    "confusable_with": [
+      "system-design/publish-subscribe-messaging-basics-primer",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+      "system-design/kafka-partition-count-consumer-parallelism-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka cooperative rebalance와 eager rebalance 차이를 자세히 설명해줘",
+      "Kafka retry topic ladder와 DLQ 설계를 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-consumer-group-partition-ownership-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch92-stream-a-kafka-foundation"
+      }
+    ]
+  }
+}
