@@ -1,0 +1,63 @@
+{
+  "id": "system-design/request-latency-phase-queue-vs-service",
+  "title": "Request Latency Phase Queue vs Service",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "요청 latency는 queue wait, connection wait, remote wait, service time, response write 같은 위상으로 나눠야 Little's Law와 p99 디버깅이 실제 병목으로 이어진다.",
+  "body_markdown": "# Request Latency Phase Queue vs Service\n\n> 한 줄 요약: 느린 요청을 하나의 latency 숫자로 보면 병목을 못 찾는다. queue time, connection wait, local service time, remote time, lock wait, response write를 분리해야 pool을 늘릴지, downstream을 볼지, admission을 닫을지 판단할 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Latency Bandwidth Throughput Basics](../network/latency-bandwidth-throughput-basics.md)\n- [Little's Law Capacity Planning Primer](./littles-law-capacity-planning-primer.md)\n- [Upstream Queueing, Connection Pool Wait, Tail Latency](../network/upstream-queueing-connection-pool-wait-tail-latency.md)\n- [Tail Latency P99 Debugging Playbook](./tail-latency-p99-debugging-playbook.md)\n- [Read Path Waterfall Tail Latency Debugging Map](./read-path-waterfall-tail-latency-debugging-map.md)\n\nretrieval-anchor-keywords: request latency phase, queue time vs service time, connection pool wait latency, remote wait vs local processing, Little's Law latency decomposition, 요청 지연 위상 분해, 큐 대기 시간, 서비스 시간, p99 latency breakdown\n\n---\n\n## latency를 한 숫자로 보면 생기는 문제\n\nAPI p99가 2초라고 하자. 이 숫자만 보면 할 수 있는 말이 거의 없다.\n\n- thread pool queue에서 1.5초 기다렸는가\n- DB connection pool에서 1.5초 기다렸는가\n- 실제 SQL이 1.5초였는가\n- 외부 API가 1.5초였는가\n- response write가 client/network 때문에 막혔는가\n\n원인은 모두 다르고 처방도 다르다. 그래서 latency를 waterfall처럼 쪼갠다.\n\n```text\narrival\n  -> ingress/proxy wait\n  -> app queue wait\n  -> handler start\n  -> connection acquire wait\n  -> DB/remote service time\n  -> local compute/serialization\n  -> response write\n  -> complete\n```\n\n핵심은 queue time과 service time을 분리하는 것이다. Queue time은 자원을 얻기 전 기다린 시간이고, service time은 자원을 잡고 실제 일을 한 시간이다. queue가 커지면 Little's Law 관점에서 같은 처리량에도 in-flight가 늘고, 다시 queue wait가 커지는 피드백이 생긴다.\n\n---\n\n## phase table\n\n| phase | 의미 | 대표 지표 | 흔한 잘못된 처방 |\n|---|---|---|---|\n| ingress wait | LB/proxy/gateway 대기 | upstream queue, 503, pending requests | 앱 thread만 늘림 |\n| app queue wait | worker/thread/event loop를 기다림 | executor queue age, active threads | downstream만 의심 |\n| connection acquire wait | DB/HTTP pool connection을 기다림 | Hikari pending, pool wait p99 | query timeout만 조정 |\n| service time | CPU, SQL, remote 호출 실제 실행 | handler span, query span, remote span | queue를 늘림 |\n| lock wait | DB lock이나 mutex를 기다림 | lock wait, blocked thread | pool을 키움 |\n| response write | 결과를 client로 쓰는 시간 | write blocked, client abort | DB를 의심 |\n\n같은 2초라도 connection acquire wait 1.8초와 SQL execution 1.8초는 완전히 다르다. 전자는 pool starvation이나 긴 transaction을 보고, 후자는 query plan, lock, I/O를 본다.\n\n---\n\n## worked example: 평균은 괜찮은데 p99만 나쁨\n\n예약 조회 API 지표가 아래처럼 나왔다.\n\n```text\nRPS: 200\np50 total latency: 80ms\np99 total latency: 1800ms\nDB query p99: 70ms\nHikari acquire p99: 1200ms\napp executor queue age p99: 400ms\n```\n\n이 경우 DB query 자체는 빠르다. p99 대부분은 DB connection을 얻기 전과 app queue에서 사라진다. pool size를 무작정 키우기 전에 봐야 할 것은 다음이다.\n\n1. transaction 안에서 외부 API나 긴 작업으로 connection을 붙잡는 endpoint가 있는가\n2. 특정 batch나 scheduler가 pool을 오래 점유하는가\n3. pool size가 app instance 합산으로 DB max connection을 넘기지 않는가\n4. queue age가 timeout budget을 넘는다면 admission/load shedding이 필요한가\n\n만약 query p99가 1200ms이고 acquire wait가 10ms였다면 방향이 반대다. 그때는 query plan, lock wait, index, DB I/O를 본다.\n\n---\n\n## Little's Law로 읽는 queue\n\nLittle's Law는 평균 in-flight work가 처리량과 체류 시간의 곱이라는 관점이다. 여기서 중요한 것은 W가 service time만이 아니라 queue wait까지 포함한다는 점이다.\n\n```text\nL = lambda * W\n```\n\n200 RPS에서 평균 체류 시간이 100ms면 평균 in-flight는 20이다. 그런데 queue wait 때문에 p95가 1초가 되면, 같은 RPS에서도 훨씬 많은 요청이 시스템 안에 머문다. 이 요청들이 thread, memory, connection wait slot, timeout budget을 붙잡아 다음 요청을 더 늦춘다.\n\n따라서 latency phase decomposition은 capacity planning과 바로 연결된다.\n\n- service time이 길다: 일을 줄이거나 병렬화하거나 downstream을 개선한다.\n- queue time이 길다: admission, pool/worker sizing, priority, load shedding을 본다.\n- remote time이 길다: timeout budget, retry, circuit breaker, fallback을 본다.\n- lock wait가 길다: transaction 범위, index path, blocker를 본다.\n\n---\n\n## 계측 방법\n\n가장 좋은 방법은 request span 안에 phase timestamp를 남기는 것이다.\n\n```text\nrequest_received_at\nhandler_started_at\ndb_connection_acquired_at\ndb_query_started_at\ndb_query_finished_at\nremote_call_started_at\nremote_call_finished_at\nresponse_write_started_at\nrequest_finished_at\n```\n\n이 timestamp로 아래를 계산한다.\n\n| 계산 | 의미 |\n|---|---|\n| handler_started - request_received | app queue wait |\n| db_connection_acquired - db_acquire_requested | DB pool wait |\n| db_query_finished - db_query_started | DB service time |\n| remote_call_finished - remote_call_started | downstream time |\n| request_finished - response_write_started | response write time |\n\nOpenTelemetry span을 쓴다면 `server`, `client`, `db`, `messaging` span을 쪼개고, pool acquire는 별도 event/metric으로 남긴다. APM이 모든 phase를 자동으로 잡아주지 않는 경우가 많으므로 connection pool wait와 executor queue age는 직접 계측이 필요할 수 있다.\n\n---\n\n## 처방 chooser\n\n| 가장 큰 phase | 먼저 볼 것 | 피해야 할 반응 |\n|---|---|---|\n| app queue wait | worker saturation, blocking call, event loop block | DB index부터 튜닝 |\n| DB pool wait | active connection age, transaction duration, leak | pool size만 무작정 증가 |\n| DB service time | query plan, lock wait, rows examined | timeout만 증가 |\n| remote wait | downstream p99, retry budget, circuit breaker | 무한 retry |\n| lock wait | blocker transaction, index range, transaction order | connection pool 확대 |\n| response write | client slow read, proxy buffering, large payload | DB 최적화 |\n\n이 표는 원인 단정이 아니라 첫 분기를 잡기 위한 것이다. 예를 들어 DB pool wait가 길어도 근본 원인은 slow query일 수 있다. slow query가 connection을 오래 잡아 pool wait를 만들기 때문이다. 그래서 phase는 시간축으로 같이 봐야 한다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| p99가 높으면 DB가 느린 것이다 | DB 전 대기 시간이 대부분일 수 있다 |\n| queue는 buffer니까 길어도 괜찮다 | timeout budget을 넘는 queue는 실패를 늦게 알릴 뿐이다 |\n| pool을 키우면 queue wait는 항상 줄어든다 | downstream capacity가 병목이면 더 많은 동시 부하만 만든다 |\n| service time만 줄이면 된다 | service time이 짧아도 admission이 없으면 queue 폭주가 p99를 만든다 |\n| 평균 latency가 괜찮으면 충분하다 | p99 tail이 자원을 오래 붙잡아 장애를 만든다 |\n\n---\n\n## 면접 답변 골격\n\n질문이 `API가 느릴 때 어떻게 병목을 찾나요?`라면 이렇게 답한다.\n\n1. total latency를 queue wait, connection wait, service time, remote time, response write로 나눈다.\n2. p50뿐 아니라 p95/p99 phase별 시간을 본다.\n3. DB query가 느린지, DB connection을 얻기 전이 느린지 먼저 구분한다.\n4. queue wait가 크면 Little's Law로 in-flight와 throughput, timeout budget을 본다.\n5. 가장 큰 phase에 맞춰 pool sizing, query plan, downstream timeout, load shedding 중 처방을 고른다.\n6. pool이나 timeout을 키우기 전에 phase별 증거를 남긴다.\n\n---\n\n## 꼬리질문\n\n> Q: DB query p99는 낮은데 API p99가 높은 경우 무엇을 봐야 하나요?\n> 의도: query execution과 pool/queue wait를 분리하는지 확인\n> 핵심: connection acquire wait, app queue wait, external wait, response write를 본다.\n\n> Q: queue time과 service time은 왜 구분하나요?\n> 의도: 처방이 달라짐을 이해하는지 확인\n> 핵심: queue time은 자원 대기이고 service time은 실제 작업 시간이라, sizing/admission과 최적화 방향이 다르다.\n\n> Q: Little's Law가 latency phase 분석에 왜 나오나요?\n> 의도: latency와 capacity를 연결하는지 확인\n> 핵심: 체류 시간이 늘면 같은 throughput에서도 in-flight가 늘어 queue와 자원 점유를 다시 키운다.\n\n## 한 줄 정리\n\nRequest latency phase decomposition은 느림을 한 숫자로 탓하지 않고, 어디에서 기다렸고 어디에서 일했는지를 나눠 queue, pool, downstream, DB, response 중 맞는 처방으로 연결하는 디버깅 습관이다.\n",
+  "aliases": [
+    "request latency phase",
+    "queue time vs service time",
+    "요청 지연 위상",
+    "큐 대기 시간",
+    "서비스 시간 구분",
+    "connection pool wait latency",
+    "API p99 breakdown",
+    "latency decomposition",
+    "Little's Law latency",
+    "DB pool wait p99"
+  ],
+  "expected_queries": [
+    "API p99가 높은데 DB 쿼리는 빠를 때 queue time이랑 service time을 어떻게 나눠 봐야 해?",
+    "request latency를 connection pool wait, remote wait, service time으로 분해하는 기준을 알려줘",
+    "Little's Law가 요청 지연 분석에서 queue wait와 in-flight를 설명하는 데 왜 필요해?",
+    "DB pool acquire 시간이 긴 건 SQL이 느린 것과 어떻게 다르게 봐야 해?",
+    "p99 latency를 줄이려고 pool size를 늘리기 전에 어떤 phase 지표를 확인해야 해?",
+    "응답이 느린 원인이 app queue인지 downstream 호출인지 DB 실행시간인지 구분하는 방법을 설명해줘"
+  ],
+  "symptoms": [
+    "API p99는 높은데 DB query span은 짧다",
+    "connection pool wait가 total latency의 대부분을 차지한다",
+    "queue age가 timeout budget을 넘는데 worker만 늘리려 한다",
+    "latency 한 숫자만 보고 DB나 network를 단정한다"
+  ],
+  "learner_query_patterns": [],
+  "relations": {
+    "prerequisites": [
+      "network/latency-bandwidth-throughput-basics",
+      "system-design/littles-law-capacity-planning-primer",
+      "network/upstream-queueing-connection-pool-wait-tail-latency"
+    ],
+    "next_docs": [
+      "system-design/tail-latency-p99-debugging-playbook",
+      "system-design/production-latency-layer-router",
+      "database/connection-pool-littles-law-sizing-playbook"
+    ],
+    "confusable_with": [
+      "network/upstream-queueing-connection-pool-wait-tail-latency",
+      "system-design/read-path-waterfall-tail-latency-debugging-map",
+      "system-design/littles-law-capacity-planning-primer"
+    ],
+    "forbidden_for_queries": [
+      "Little's Law 공식으로 평균 동시성을 계산하는 방법만 설명해줘",
+      "search shard fanout에서 가장 느린 replica가 전체 p99를 키우는 이유를 설명해줘"
+    ]
+  },
+  "metadata": {
+    "created_at": "2026-06-18T00:00:00+09:00",
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "version": 1,
+    "source": "y14-expansion-batch95-stream-a-ops-diagnostics",
+    "legacy_path": "knowledge/cs/contents/system-design/request-latency-phase-queue-vs-service.md"
+  }
+}
