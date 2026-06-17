@@ -1,0 +1,57 @@
+{
+  "id": "network/http2-rapid-reset-continuation-flood-rst-stream-dos-primer",
+  "title": "HTTP/2 Rapid Reset and CONTINUATION flood - RST_STREAM DoS primer",
+  "category": "network",
+  "level": "advanced",
+  "summary": "HTTP/2 Rapid Reset은 stream을 빠르게 열고 RST_STREAM으로 취소해 서버 작업과 stream bookkeeping을 과도하게 만드는 DoS 패턴이다. CONTINUATION flood는 header block continuation 처리를 남용한다. max concurrent streams만으로는 충분하지 않아 frame rate, header size, request accounting, proxy/server 패치와 관측이 필요하다.",
+  "body_markdown": "# HTTP/2 Rapid Reset and CONTINUATION flood - RST_STREAM DoS primer\n\n> 한 줄 요약: HTTP/2에서는 stream을 많이 만들고 빨리 reset하거나 header continuation을 남용해 서버 자원을 소모시킬 수 있다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: HTTP/2 Rapid Reset, CVE-2023-44487, RST_STREAM DoS, HTTP/2 CONTINUATION flood, h2 stream reset flood, max concurrent streams bypass, header block flood, http2 frame rate limit, gateway h2 protection\n\n## 먼저 멘탈모델\n\nHTTP/2는 하나의 connection 위에 여러 stream을 multiplex한다. 이 구조는 효율적이지만, stream lifecycle과 frame 처리 자체가 서버 자원을 쓴다.\n\nRapid Reset 공격은 대략 이런 감각이다.\n\n```text\n1. client가 stream을 빠르게 연다.\n2. request를 시작하자마자 RST_STREAM으로 취소한다.\n3. 서버는 stream 생성, header 처리, routing 준비, cancellation 처리를 반복한다.\n4. max concurrent streams limit에 오래 걸리지 않고도 높은 churn을 만든다.\n```\n\n즉 동시 stream 수가 낮아 보여도 stream 생성/취소 rate가 높으면 서버가 바쁠 수 있다.\n\n## CONTINUATION flood와 구분\n\nCONTINUATION frame은 HTTP/2 header block이 여러 frame으로 이어질 때 사용된다. 공격자는 header block 처리를 악용해 memory나 CPU를 소모시키거나 parser 상태를 오래 붙잡게 만들 수 있다.\n\n둘은 모두 HTTP/2 DoS지만 관찰 포인트가 다르다.\n\n| 패턴 | 핵심 남용 | 주요 관찰 |\n|---|---|---|\n| Rapid Reset | stream open 후 즉시 RST_STREAM | stream reset rate, stream churn, short-lived stream |\n| CONTINUATION flood | header block continuation 처리 남용 | header bytes, continuation frame count, parser memory |\n\n## 왜 max concurrent streams만으로 부족한가\n\n`max_concurrent_streams`는 동시에 열린 stream 수를 제한한다. Rapid Reset은 stream을 빨리 닫아 동시에 열린 수는 낮게 유지하면서도 생성/취소 비용을 반복시킬 수 있다.\n\n그래서 아래가 함께 필요하다.\n\n- connection별 stream creation rate 제한\n- reset rate 또는 abnormal close rate 관측\n- header list size와 continuation frame 제한\n- request가 application까지 도달하기 전 proxy/gateway 방어\n- HTTP/2 library, proxy, load balancer 보안 패치\n\n## 운영 지표\n\n- connection별 stream open rate\n- RST_STREAM count와 reason 분포\n- opened stream 대비 completed request 비율\n- header bytes와 continuation frame count\n- h2 connection CPU와 memory 사용량\n- proxy local reply, 4xx/5xx, connection close 이유\n\n애플리케이션 access log만 보면 공격이 보이지 않을 수 있다. 많은 stream이 app handler까지 도달하기 전에 reset되기 때문이다.\n\n## 방어 방향\n\n- HTTP/2 stack, gateway, load balancer를 보안 패치된 버전으로 유지한다.\n- max concurrent streams뿐 아니라 stream churn과 reset rate를 제한한다.\n- header size, header count, continuation frame 관련 제한을 둔다.\n- edge에서 비정상 connection을 빨리 닫고 upstream으로 전달하지 않는다.\n- HTTP/1.1 fallback이나 h2 disable은 최후 수단으로 성능/호환성 tradeoff를 검토한다.\n\n## Spring 관점\n\nSpring MVC handler가 호출되지 않았는데 edge나 container에서 HTTP/2 reset 관련 metric이 튄다면 application code 문제가 아닐 수 있다. 이때는 access log, container h2 metric, gateway frame/reset metric을 같이 봐야 한다.\n\n## 한 줄 정리\n\nHTTP/2 Rapid Reset과 CONTINUATION flood는 HTTP/2 stream/frame 처리 비용을 남용하는 DoS 패턴이다. 동시 stream 수뿐 아니라 stream churn, reset rate, header continuation, edge 패치 상태를 함께 봐야 한다.\n",
+  "aliases": [
+    "HTTP/2 Rapid Reset",
+    "RST_STREAM 공격",
+    "HTTP2 rapid reset",
+    "HTTP2 reset 폭주",
+    "CONTINUATION flood",
+    "HTTP/2 DoS",
+    "h2 reset rate",
+    "스트림 reset 공격",
+    "HTTP2 continuation"
+  ],
+  "expected_queries": [
+    "HTTP/2 Rapid Reset 공격은 RST_STREAM으로 서버 자원을 어떻게 소모시켜?",
+    "max concurrent streams를 제한해도 rapid reset DoS가 남는 이유가 뭐야?",
+    "HTTP/2 CONTINUATION flood는 rapid reset과 어떤 점이 달라?",
+    "Spring handler까지 안 왔는데 HTTP/2 reset rate가 높으면 어디를 봐야 해?",
+    "HTTP/2 DoS 방어에서 stream churn과 header continuation 지표를 왜 봐야 해?",
+    "CVE-2023-44487 같은 Rapid Reset 대응은 gateway와 서버에서 무엇을 확인해야 해?"
+  ],
+  "symptoms": [
+    "HTTP/2 동시 stream 수가 낮아 보여도 reset churn 때문에 CPU가 높다",
+    "애플리케이션 access log에는 적게 보이는데 gateway h2 reset metric이 폭증한다",
+    "max concurrent streams만 조정하면 HTTP/2 rapid reset이 해결된다고 착각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/http2-http3-hol-flow-control-perspective-map",
+      "network/http2-rst-stream-goaway-streaming-failure-semantics",
+      "network/http2-max-concurrent-streams-pending-queue-saturation"
+    ],
+    "next_docs": [
+      "spring/http2-reset-attribution-spring-mvc",
+      "network/api-gateway-reverse-proxy-operational-points"
+    ],
+    "confusable_with": [
+      "network/http2-flow-control-window-update-stalls",
+      "network/http2-hol-blocking-vs-flow-control-stall-quick-decision-table",
+      "spring/http2-reset-attribution-spring-mvc"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/network/http2-rapid-reset-continuation-flood-rst-stream-dos-primer.md",
+    "revision_history": []
+  }
+}
