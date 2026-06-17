@@ -4,20 +4,28 @@
   "category": "database",
   "level": "advanced",
   "summary": "CDC와 outbox를 binlog lag, replay, schema evolution, idempotency 관점으로 연결하는 데이터 파이프라인 perspective map",
-  "body_markdown": "# CDC, Outbox, Replay, Schema Evolution Perspective Map\n\n## 이 문서가 맡는 질문\nCDC는 DB 변경을 읽어 downstream으로 보내지만 schema와 replay, lag, idempotency 문제가 함께 따라온다. outbox와 CDC를 어떻게 조합할지 명확해야 한다.\n\n## 빠른 분기\nDB 변경 전체가 필요하면 CDC, domain event intent가 필요하면 outbox, 둘을 Debezium으로 읽으면 schema evolution과 replay idempotency를 함께 본다.\n\n## 실전 시나리오\n주문 테이블 column rename이 CDC consumer를 깨뜨릴 수 있다. outbox payload에 version을 넣고 consumer가 tolerant reader가 되면 DB schema와 event contract를 분리할 수 있다.\n\n## CS 배경\nCDC는 commit log/binlog/WAL 순서를 따라 변경을 외부화한다. At-least-once delivery가 일반적이므로 replay와 중복 소비가 정상 조건이다. Schema evolution은 producer DB와 consumer contract 사이의 시간차 문제다.\n\n## outbox payload version 예시\n```json\n{\"event_id\":\"evt-1\",\"type\":\"OrderCreated\",\"schema_version\":2,\"payload\":{\"orderId\":10}}\n```\nevent_id는 idempotency key이고 schema_version은 consumer가 decoder를 선택하는 기준이다. replay 시 같은 event_id가 다시 올 수 있다.\n\n## 깊게 볼 포인트\nCDC lag가 늘면 downstream freshness가 깨지고, connector pause가 길면 WAL/binlog retention이 위험해진다. snapshot과 streaming 전환 구간도 중복/순서 검증이 필요하다.\n\n## 다음 행동\n1. event contract와 DB schema를 분리한다\n2. replay 가능한 idempotent consumer를 만든다\n3. schema version과 compatibility test를 둔다\n4. lag와 retention budget을 모니터링한다\n\n## 확인 질문\n필요한 것은 row change stream인가, domain event stream인가, 재처리 가능한 integration contract인가?\n\n## 추가 실전 포인트\nSchema evolution은 expand-contract 순서가 안전하다. 새 optional field를 먼저 추가하고 consumer가 unknown field를 무시하도록 배포한 뒤 producer가 채우기 시작한다. 삭제는 tombstone이나 deprecated period를 거친 뒤 consumer 사용량이 0임을 확인하고 contract 단계에서 제거한다.\n\n## 판단 매트릭스\n- CDC: DB 변경을 거의 그대로 전달하며 schema coupling이 강하다\n- Outbox: domain event intent를 local transaction에 저장한다\n- Replay: at-least-once 중복을 정상으로 보고 idempotency를 둔다\n- 리뷰 질문: schema 변경이 consumer deploy 순서를 강제하지 않는가\n\n## 측정 지표와 레이턴시\ncdc lag p95, connector error, replay duplicate count, consumer decode failure, WAL retention headroom, end-to-end publish latency를 본다. 품질은 유실/중복 안전성, 성능은 connector throughput, 레이턴시는 commit-to-consume p95로 판단한다.\n\n## 자주 하는 오해\n- CDC면 exactly-once라고 믿는다\n- DB schema 변경과 event contract 변경을 같은 것으로 본다\n- replay를 장애 상황으로만 보고 테스트하지 않는다\n\n이 오해를 줄이려면 먼저 실패 모드와 관찰 증거를 나누고, 그 다음 용어를 붙인다. 같은 현상이 자료구조, 런타임, 네트워크, 운영 지표에서 다르게 보일 수 있으므로 code path와 runtime signal을 함께 확인한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 CDC, outbox, replay, schema evolution을 분리해야 한다. 마지막에는 lag, duplicate, decode failure, commit-to-consume p95로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. snapshot+streaming 전환을 테스트한다\n2. 같은 event_id replay를 consumer에 주입한다\n3. schema version up/down fixture를 만든다\n4. connector pause 후 retention headroom을 확인한다\n5. lag와 downstream p95를 dashboard에 둔다\n\n이 루프를 지키면 CDC, Outbox, Replay, Schema Evolution Perspective Map 문서는 단순 정의 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nCDC와 outbox를 binlog lag, replay, schema evolution, idempotency 관점으로 연결하는 데이터 파이프라인 perspective map\n\n## 품질 관점\n정합성, isolation, lock/plan/replication failure mode를 테스트와 실행 계획으로 함께 검증한다. 이 문서의 답변 품질은 `CDC, Outbox, Replay, Schema Evolution Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`query_p95_ms, lock_wait_p99_ms, rows_examined, plan_hash_change_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# CDC, Outbox, Replay, Schema Evolution Perspective Map\n\n## 이 문서가 맡는 질문\nCDC는 DB 변경을 읽어 downstream으로 보내지만 schema와 replay, lag, idempotency 문제가 함께 따라온다. outbox와 CDC를 어떻게 조합할지 명확해야 한다.\n\n## 빠른 분기\nDB 변경 전체가 필요하면 CDC, domain event intent가 필요하면 outbox, 둘을 Debezium으로 읽으면 schema evolution과 replay idempotency를 함께 본다.\n\n## 실전 시나리오\n주문 테이블 column rename이 CDC consumer를 깨뜨릴 수 있다. outbox payload에 version을 넣고 consumer가 tolerant reader가 되면 DB schema와 event contract를 분리할 수 있다.\n\n## CS 배경\nCDC는 commit log/binlog/WAL 순서를 따라 변경을 외부화한다. At-least-once delivery가 일반적이므로 replay와 중복 소비가 정상 조건이다. Schema evolution은 producer DB와 consumer contract 사이의 시간차 문제다.\n\n## outbox payload version 예시\n```json\n{\"event_id\":\"evt-1\",\"type\":\"OrderCreated\",\"schema_version\":2,\"payload\":{\"orderId\":10}}\n```\nevent_id는 idempotency key이고 schema_version은 consumer가 decoder를 선택하는 기준이다. replay 시 같은 event_id가 다시 올 수 있다.\n\n## 깊게 볼 포인트\nCDC lag가 늘면 downstream freshness가 깨지고, connector pause가 길면 WAL/binlog retention이 위험해진다. snapshot과 streaming 전환 구간도 중복/순서 검증이 필요하다.\n\n## 다음 행동\n1. event contract와 DB schema를 분리한다\n2. replay 가능한 idempotent consumer를 만든다\n3. schema version과 compatibility test를 둔다\n4. lag와 retention budget을 모니터링한다\n\n## 확인 질문\n필요한 것은 row change stream인가, domain event stream인가, 재처리 가능한 integration contract인가?\n\n## 추가 실전 포인트\nSchema evolution은 expand-contract 순서가 안전하다. 새 optional field를 먼저 추가하고 consumer가 unknown field를 무시하도록 배포한 뒤 producer가 채우기 시작한다. 삭제는 tombstone이나 deprecated period를 거친 뒤 consumer 사용량이 0임을 확인하고 contract 단계에서 제거한다.\n\n## 판단 매트릭스\n- CDC: DB 변경을 거의 그대로 전달하며 schema coupling이 강하다\n- Outbox: domain event intent를 local transaction에 저장한다\n- Replay: at-least-once 중복을 정상으로 보고 idempotency를 둔다\n- 리뷰 질문: schema 변경이 consumer deploy 순서를 강제하지 않는가\n\n## 측정 지표와 레이턴시\ncdc lag p95, connector error, replay duplicate count, consumer decode failure, WAL retention headroom, end-to-end publish latency를 본다. 품질은 유실/중복 안전성, 성능은 connector throughput, 레이턴시는 commit-to-consume p95로 판단한다.\n\n## 자주 하는 오해\n- CDC면 exactly-once라고 믿는다\n- DB schema 변경과 event contract 변경을 같은 것으로 본다\n- replay를 장애 상황으로만 보고 테스트하지 않는다\n\n이 오해를 줄이려면 먼저 실패 모드와 관찰 증거를 나누고, 그 다음 용어를 붙인다. 같은 현상이 자료구조, 런타임, 네트워크, 운영 지표에서 다르게 보일 수 있으므로 code path와 runtime signal을 함께 확인한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 CDC, outbox, replay, schema evolution을 분리해야 한다. 마지막에는 lag, duplicate, decode failure, commit-to-consume p95로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. snapshot+streaming 전환을 테스트한다\n2. 같은 event_id replay를 consumer에 주입한다\n3. schema version up/down fixture를 만든다\n4. connector pause 후 retention headroom을 확인한다\n5. lag와 downstream p95를 dashboard에 둔다\n\n이 루프를 지키면 CDC, Outbox, Replay, Schema Evolution Perspective Map 문서는 단순 정의 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nCDC와 outbox를 binlog lag, replay, schema evolution, idempotency 관점으로 연결하는 데이터 파이프라인 perspective map\n\n## 품질 관점\n정합성, isolation, lock/plan/replication failure mode를 테스트와 실행 계획으로 함께 검증한다. 이 문서의 답변 품질은 `CDC, Outbox, Replay, Schema Evolution Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`query_p95_ms, lock_wait_p99_ms, rows_examined, plan_hash_change_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n\n## 운영 판단: event record, transport, replay를 분리한다\n\nCDC와 outbox를 한 단어처럼 쓰면 설계 축이 흐려진다. outbox는 비즈니스 DB commit과 event record 저장을 같은 로컬 트랜잭션에 묶는 패턴이다. CDC는 committed change를 binlog나 WAL에서 읽어 외부 시스템으로 전달하는 transport에 가깝다. replay는 이미 기록된 변경을 다시 처리해 projection이나 downstream 상태를 복구하는 운영 행위다. schema evolution은 이 모든 경로에서 old consumer와 old event가 계속 해석될 수 있게 하는 호환성 계약이다.\n\n따라서 설계 질문은 순서대로 나눠야 한다. 이벤트가 어떤 aggregate version에서 만들어졌는가, outbox row에 event id와 schema version이 있는가, CDC connector lag와 retention은 안전한가, consumer는 idempotent한가, replay 때 side effect를 mute하거나 dedupe할 수 있는가. 이 다섯 질문이 없으면 \"Debezium을 붙였다\"만으로는 데이터 손실과 중복 부작용을 막을 수 없다.\n\n## schema evolution과 replay compatibility\n\n새 필드를 추가하는 것은 쉬워 보이지만 replay가 들어오면 오래된 payload가 다시 흐른다. consumer가 필수 field 추가를 기대하면 과거 event replay에서 깨질 수 있다. 안전한 방향은 optional add, default, versioned envelope, consumer capability check, reserved/removed field policy를 둔다. contract phase에서는 producer가 새 schema를 쓰기 전에 consumer가 old/new 모두 읽을 수 있는지 검증해야 한다.\n\n## acceptance gate와 지표\n\nCDC pipeline은 lag만 보지 않는다. `outbox_publish_lag_ms`, `connector_lag_bytes`, `retention_headroom_seconds`, `consumer_dedupe_hit_count`, `replay_side_effect_suppressed_count`, `schema_decode_failure_count`, `projection_acceptance_diff_count`를 함께 본다. replay 완료는 record를 다시 흘렸다는 뜻이 아니라 count/checksum/sample diff/consumer acceptance가 통과했다는 뜻이다. 이 문서의 primary 답변은 outbox, CDC, replay, schema compatibility를 하나의 운영 지도 안에서 연결해야 한다.\n",
   "aliases": [
     "CDC outbox replay schema evolution",
     "Debezium outbox schema version",
     "CDC lag replay idempotency",
     "binlog outbox contract",
-    "CDC, Outbox, Replay, Schema Evolution Perspective Map",
-    "cdc outbox replay schema evolution perspective map",
-    "CDC outbox replay schema evolution Debezium outbox schema version CDC lag replay idempotency"
+    "CDC 재처리 중복 방지",
+    "outbox event schema version",
+    "WAL retention replay lag",
+    "이벤트 schema evolution",
+    "consumer compatibility replay",
+    "CDC 검증 acceptance gate",
+    "replay side effect suppression",
+    "outbox CDC latency SLO"
   ],
   "expected_queries": [
     "CDC랑 outbox를 언제 같이 쓰고 schema evolution은 어떻게 관리해?",
     "CDC replay에서 중복 소비를 어떻게 막아?",
-    "CDC/outbox 기반 이벤트에서 replay, schema evolution, latency를 어떻게 설계해?"
+    "CDC/outbox 기반 이벤트에서 replay, schema evolution, latency를 어떻게 설계해?",
+    "outbox 이벤트 payload에 필드를 추가할 때 old consumer와 replay가 깨지지 않게 schema version을 어떻게 잡아야 해?",
+    "CDC lag가 커져 binlog retention을 넘길 위험이 있으면 replay, snapshot, acceptance gate를 어떻게 나눠 봐야 해?",
+    "CDC 이벤트를 다시 흘릴 때 외부 알림 같은 side effect가 중복 실행되지 않게 어떤 idempotency guard가 필요해?"
   ],
   "symptoms": [
     "CDC면 exactly-once라고 믿는다",
@@ -58,7 +66,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -71,6 +79,11 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch126",
+        "note": "Expanded CDC outbox replay decision surfaces for batch126."
       }
     ]
   }
