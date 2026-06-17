@@ -1,0 +1,55 @@
+{
+  "id": "network/jvm-inetaddress-dns-cache-ttl-failover-pitfall",
+  "title": "JVM InetAddress DNS cache TTL failover pitfall",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "JVM InetAddress는 DNS 결과를 프로세스 안에서 캐시할 수 있고, networkaddress.cache.ttl 및 negative TTL 정책에 따라 DNS failover 반영이 늦어질 수 있다. DNS TTL만 낮춰도 기존 JVM cache와 connection pool이 old IP를 계속 쓸 수 있다.",
+  "body_markdown": "# JVM InetAddress DNS cache TTL failover pitfall\n\n> 한 줄 요약: DNS record가 바뀌어도 JVM 프로세스와 connection pool이 예전 주소를 계속 들고 있을 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: JVM InetAddress DNS cache, networkaddress.cache.ttl, negative DNS cache TTL, Java DNS failover, stale IP, JVM resolver cache, connection pool DNS, DNS TTL failover, InetAddress cache policy\n\n## 먼저 멘탈모델\n\nDNS failover는 authoritative DNS record만 바꾸면 끝나는 일이 아니다. Java 애플리케이션은 `InetAddress` 조회 결과를 프로세스 안에서 캐시할 수 있고, HTTP/gRPC/DB client connection pool은 이미 연결된 old endpoint를 계속 쓸 수 있다.\n\n```text\nDNS record -> recursive resolver cache -> OS/runtime cache -> JVM InetAddress cache -> client connection pool\n```\n\n어느 층이 old IP를 들고 있는지 분리해야 한다.\n\n## JVM cache 정책\n\nJVM DNS cache는 보안 속성으로 제어된다.\n\n```text\nnetworkaddress.cache.ttl\nnetworkaddress.cache.negative.ttl\n```\n\n양수는 초 단위 TTL, 0은 캐시하지 않음, 음수는 구현/정책상 오래 캐시하는 의미로 쓰일 수 있다. 실제 기본값은 Java 버전, 보안 설정, 배포 환경에 따라 확인해야 한다.\n\n중요한 점은 DNS record의 TTL과 JVM의 cache TTL이 항상 같지 않을 수 있다는 것이다.\n\n## 장애 시나리오\n\n### DB/Redis endpoint failover\n\nDNS가 새 primary IP를 가리키도록 바뀌었는데 Java 앱이 old IP에 계속 붙는다. `dig`는 새 IP를 보여도 애플리케이션 connection pool은 기존 socket을 재사용하거나 JVM cache가 old answer를 들고 있을 수 있다.\n\n### negative caching\n\n초기 배포 순간 도메인이 잠깐 NXDOMAIN이었다면 JVM이나 resolver가 negative answer를 캐시할 수 있다. record가 생긴 뒤에도 앱만 계속 못 찾는 것처럼 보인다.\n\n### gRPC channel\n\ngRPC channel이나 HTTP client가 resolver update를 언제 반영하는지, 기존 subchannel을 언제 drain하는지 별도로 봐야 한다. DNS 결과가 바뀌어도 connection lifecycle이 따로 움직인다.\n\n## 확인 순서\n\n1. authoritative DNS와 public resolver answer를 비교한다.\n2. 같은 host에서 `dig` 결과와 애플리케이션 실제 connection target을 비교한다.\n3. JVM `networkaddress.cache.ttl`과 negative TTL 설정을 확인한다.\n4. HTTP/gRPC/DB client connection pool lifetime과 reconnect policy를 확인한다.\n5. failover test에서 old endpoint traffic drain 시간을 측정한다.\n\n## 운영 선택\n\nTTL을 너무 길게 두면 failover 반영이 늦다. 너무 짧게 두면 DNS lookup과 resolver 부하가 늘고, connection churn이 커질 수 있다. 보통은 DNS TTL, JVM TTL, connection pool max lifetime, health check, retry budget을 한 세트로 맞춘다.\n\n## 한 줄 정리\n\nJava DNS failover 문제는 DNS TTL 하나가 아니라 JVM InetAddress cache와 client connection pool이 함께 만드는 문제다. record 변경, runtime cache, 실제 socket target을 같은 시간축에서 확인해야 한다.\n",
+  "aliases": [
+    "JVM DNS cache",
+    "InetAddress 캐시",
+    "networkaddress.cache.ttl",
+    "Java DNS failover",
+    "JVM DNS 캐시",
+    "InetAddress TTL",
+    "stale IP 예전주소",
+    "negative DNS cache",
+    "DNS failover"
+  ],
+  "expected_queries": [
+    "JVM InetAddress DNS cache TTL 때문에 failover가 늦어지는 이유가 뭐야?",
+    "networkaddress.cache.ttl과 DNS record TTL은 어떻게 다를 수 있어?",
+    "dig는 새 IP인데 Java 앱만 old IP로 붙을 때 무엇을 확인해야 해?",
+    "negative DNS cache TTL 때문에 새 도메인이 생겨도 JVM이 계속 못 찾을 수 있어?",
+    "DNS failover에서 JVM cache와 connection pool lifetime을 같이 봐야 하는 이유는?",
+    "gRPC channel이나 HTTP client가 DNS 변경을 바로 반영하지 않을 때 어떤 지표를 봐?"
+  ],
+  "symptoms": [
+    "DNS record는 바뀌었는데 Java 앱만 예전 endpoint로 계속 연결한다",
+    "DNS TTL만 낮추면 JVM failover도 즉시 될 것이라고 생각한다",
+    "connection pool reuse와 JVM InetAddress cache를 분리해서 보지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/dns-cache-ttl-interview-symptom-router"
+    ],
+    "next_docs": [
+      "network/grpc-client-side-load-balancing-name-resolver-subchannel-pick-first-wait-for-ready",
+      "network/connection-reuse-vs-service-discovery-churn"
+    ],
+    "confusable_with": [
+      "network/browser-cache-toggles-vs-alt-svc-dns-cache-primer",
+      "network/dns-cache-ttl-interview-symptom-router",
+      "network/connection-reuse-vs-service-discovery-churn"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/network/jvm-inetaddress-dns-cache-ttl-failover-pitfall.md",
+    "revision_history": []
+  }
+}
