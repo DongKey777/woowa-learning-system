@@ -1,0 +1,68 @@
+{
+  "id": "system-design/redis-setnx-distributed-lock-beginner-primer",
+  "title": "Redis SET NX Distributed Lock Beginner Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis 분산락의 기본은 `SET key owner NX PX ttl`로 한 owner만 lease를 잡게 하고, 해제할 때 owner token을 Lua compare-and-delete로 확인하는 것이다. TTL은 죽은 lock을 풀어 주지만 stale owner 문제를 완전히 해결하지는 못한다.",
+  "body_markdown": "# Redis SET NX Distributed Lock Beginner Primer\n\n> 한 줄 요약: Redis lock의 기본형은 `SET lock:key owner-token NX PX ttl`이고, 해제할 때는 owner token이 맞을 때만 삭제해야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Redis Basics](./redis-basics-in-memory-kv-single-thread-primer.md)\n- [Redis TTL과 키 만료 메커니즘 입문](./redis-ttl-key-expiration-mechanics-primer.md)\n- [Redis Single Thread Atomic Commands INCR Primer](./redis-single-thread-atomic-commands-incr-primer.md)\n- [Distributed Lock 설계](./distributed-lock-design.md)\n- [Distributed Lock, Lease, Fencing Perspective Map](./distributed-lock-lease-fencing-perspective-map.md)\n- [Redisson Pub/Sub Lock Watchdog Primer](./redisson-pubsub-lock-watchdog-primer.md)\n\nretrieval-anchor-keywords: Redis SET NX PX lock, Redis SETNX distributed lock, owner token compare and delete, Lua unlock Redis lock, Redis lock TTL expiry, lease based lock, Redis spin lock, distributed lock beginner, Redis 분산락 입문, SET NX PX, 락 owner token\n\n---\n\n## 기본 acquire\n\nRedis 분산락의 가장 기본 형태는 아래와 같다.\n\n```text\nSET lock:reservation:123 <owner-token> NX PX 30000\n```\n\n- `NX`: key가 없을 때만 set한다.\n- `PX 30000`: 30초 TTL을 붙인다.\n- `<owner-token>`: 누가 잡았는지 구분하는 random token이다.\n\n성공하면 이 client가 일정 시간 동안 lease owner다. 실패하면 누군가 이미 lock을 잡은 것이다.\n\n---\n\n## 왜 TTL이 필요한가\n\nTTL이 없으면 owner가 죽었을 때 lock key가 영원히 남을 수 있다. TTL은 crashed owner의 lock을 언젠가 풀어 주는 안전장치다.\n\n하지만 TTL은 동시에 위험도 만든다.\n\n```text\n1. A가 lock을 잡고 작업 시작\n2. A가 GC pause나 network 지연으로 30초 넘게 멈춤\n3. lock TTL 만료\n4. B가 새 lock 획득\n5. A가 깨어나 작업 결과를 write\n```\n\n이 경우 A와 B가 둘 다 자신이 owner라고 믿는 시간이 생긴다. 그래서 Redis lock은 TTL만으로 “절대 하나만 실행”을 보장한다고 말하면 안 된다.\n\n---\n\n## release는 compare-and-delete\n\n해제는 그냥 `DEL lock:key`가 아니다. owner token이 일치할 때만 삭제해야 한다.\n\n```lua\nif redis.call(\"get\", KEYS[1]) == ARGV[1] then\n  return redis.call(\"del\", KEYS[1])\nend\nreturn 0\n```\n\n왜 필요할까?\n\n1. A가 lock을 잡는다.\n2. A의 TTL이 만료된다.\n3. B가 같은 key로 새 lock을 잡는다.\n4. A가 늦게 `DEL lock:key`를 호출한다.\n5. owner token 검증이 없으면 B의 lock을 지워 버린다.\n\nowner token은 “내 lock만 해제한다”는 최소 안전장치다.\n\n---\n\n## spin polling과 fail-fast\n\nlock 획득 실패 시 선택지는 크게 둘이다.\n\n| 선택 | 의미 | 주의 |\n|---|---|---|\n| fail-fast | 바로 busy/409/처리중 반환 | 사용자 요청에 적합할 수 있다 |\n| spin/backoff retry | 잠깐 기다렸다 재시도 | hot key에서 Redis와 app을 같이 압박할 수 있다 |\n\n무한 spin은 위험하다. 모든 worker가 짧은 간격으로 `SET NX`를 반복하면 lock service가 병목이 된다. backoff, jitter, timeout, max wait를 둬야 한다.\n\n---\n\n## DB lock과 Redis lock을 먼저 비교한다\n\n예약/재고처럼 DB row invariant가 핵심이면 DB unique constraint, conditional update, pessimistic lock이 더 단순할 수 있다. Redis lock은 여러 process 사이 coordination을 돕지만, 최종 write safety는 protected resource가 맡아야 한다.\n\n| 문제 | 먼저 볼 선택 |\n|---|---|\n| 중복 row 생성 방지 | DB unique constraint |\n| 재고 수량 조건부 감소 | DB conditional update 또는 row lock |\n| 여러 인스턴스의 같은 batch 중복 실행 방지 | Redis lock 후보 |\n| 외부 API 호출을 한 번만 수행 | lock + idempotency key 후보 |\n\n---\n\n## 다음 단계: Redisson과 fencing\n\nRedisson 같은 라이브러리는 pub/sub wakeup, watchdog renewal 같은 편의 기능을 제공한다. 하지만 라이브러리를 써도 TTL 만료 후 stale owner write 문제는 사라지지 않는다. long-running critical section이나 중요한 write라면 fencing token과 idempotency를 함께 본다.\n\n---\n\n## 흔한 오해\n\n- `SETNX`만 쓰면 충분하다고 본다. TTL과 owner token release가 빠져 있다.\n- TTL을 길게 하면 안전하다고 본다. 장애 복구가 늦어지고 stale owner write는 여전히 가능하다.\n- unlock을 `DEL`로만 한다. 늦은 owner가 새 owner의 lock을 지울 수 있다.\n- lock 실패 시 무한 spin을 한다. lock service와 downstream을 동시에 압박한다.\n- Redis lock이 DB constraint를 대체한다고 본다. 최종 invariant는 source of truth에서 닫는 편이 더 안전할 수 있다.\n\n## 한 줄 정리\n\nRedis `SET NX PX` lock은 owner token, TTL, Lua compare-and-delete까지가 최소 세트이고, TTL 만료 뒤 stale owner write를 막으려면 fencing이나 DB invariant까지 이어서 봐야 한다.\n",
+  "aliases": [
+    "Redis SET NX lock",
+    "Redis SETNX 분산락",
+    "Redis 분산락 입문",
+    "SET NX PX 락",
+    "owner token lock",
+    "Lua compare delete",
+    "Redis lock TTL",
+    "Redis spin lock",
+    "분산락 owner token",
+    "SETNX TTL 락",
+    "Redis unlock Lua",
+    "lease based Redis lock"
+  ],
+  "expected_queries": [
+    "Redis SET NX PX로 분산락을 잡을 때 owner token과 TTL은 왜 필요해?",
+    "Redis lock 해제할 때 DEL만 하지 말고 Lua compare-and-delete를 쓰는 이유가 뭐야?",
+    "SETNX 락에서 TTL이 만료된 old owner가 나중에 write하면 어떤 문제가 생겨?",
+    "Redis 분산락 실패 시 무한 spin polling이 왜 위험하고 fail-fast와 backoff를 어떻게 봐야 해?",
+    "예약 재고 동시성에서 DB lock과 Redis distributed lock 중 무엇을 먼저 봐야 해?"
+  ],
+  "symptoms": [
+    "Redis SETNX만 쓰면 분산락이 완성된다고 생각한다.",
+    "owner token 없이 DEL로 unlock해 새 owner의 lock을 지울 수 있다.",
+    "TTL 만료 후 stale owner가 계속 작업하는 실패 모드를 놓친다.",
+    "lock 획득 실패를 무한 spin으로 처리해 Redis hot key와 latency를 키운다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-basics-in-memory-kv-single-thread-primer",
+      "system-design/redis-ttl-key-expiration-mechanics-primer",
+      "system-design/redis-single-thread-atomic-commands-incr-primer"
+    ],
+    "next_docs": [
+      "system-design/redisson-pubsub-lock-watchdog-primer",
+      "system-design/distributed-lock-design",
+      "system-design/distributed-lock-lease-fencing-perspective-map"
+    ],
+    "confusable_with": [
+      "system-design/distributed-lock-design",
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide",
+      "database/idempotency-key-and-deduplication"
+    ],
+    "forbidden_for_queries": [
+      "Redisson watchdog과 pub/sub lock 구현을 자세히 설명해줘",
+      "fencing token으로 stale owner write를 막는 고급 설계를 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch56-stream-a-redis-runway"
+      }
+    ]
+  }
+}

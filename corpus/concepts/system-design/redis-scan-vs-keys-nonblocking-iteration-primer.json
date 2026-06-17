@@ -1,0 +1,67 @@
+{
+  "id": "system-design/redis-scan-vs-keys-nonblocking-iteration-primer",
+  "title": "Redis SCAN vs KEYS Nonblocking Iteration Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "`KEYS pattern`은 Redis keyspace를 한 번에 훑어 단일 이벤트 루프를 오래 막을 수 있다. `SCAN`은 cursor로 조금씩 순회해 운영 중 영향은 줄이지만, snapshot이 아니고 중복/누락 가능성을 고려해야 한다.",
+  "body_markdown": "# Redis SCAN vs KEYS Nonblocking Iteration Primer\n\n> 한 줄 요약: 운영 Redis에서 `KEYS *`는 keyspace 전체를 한 번에 훑어 이벤트 루프를 막을 수 있고, `SCAN`은 cursor로 조금씩 나눠 훑어 영향을 줄이는 대안이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Redis Basics](./redis-basics-in-memory-kv-single-thread-primer.md)\n- [Redis Single Thread Atomic Commands INCR Primer](./redis-single-thread-atomic-commands-incr-primer.md)\n- [Redis TTL과 키 만료 메커니즘 입문](./redis-ttl-key-expiration-mechanics-primer.md)\n- [Redis Cache Aside Write Through Interview Chooser](./redis-cache-aside-write-through-interview-chooser.md)\n- [Cache Invalidation Patterns Primer](./cache-invalidation-patterns-primer.md)\n\nretrieval-anchor-keywords: Redis SCAN vs KEYS, KEYS blocking Redis, SCAN cursor iteration, Redis nonblocking iteration, SCAN duplicate keys, SCAN not snapshot, Redis keyspace scan, COUNT MATCH cursor, Redis 운영 KEYS 장애, 레디스 SCAN KEYS 차이\n\n---\n\n## 왜 KEYS가 위험한가\n\n`KEYS pattern`은 조건에 맞는 key를 한 번에 찾아 반환한다.\n\n```text\nKEYS user:*\n```\n\n작은 개발 Redis에서는 편하지만, 운영에서 key가 수백만 개라면 Redis 이벤트 루프가 오랫동안 이 명령을 처리하느라 다른 `GET`, `SET`, `INCR` 요청을 늦출 수 있다. Redis가 단일 명령을 빠르게 처리한다는 장점은 명령 하나가 짧을 때의 이야기다.\n\n---\n\n## SCAN은 cursor 기반이다\n\n`SCAN`은 한 번에 전체를 반환하지 않고 cursor를 돌려준다.\n\n```text\nSCAN 0 MATCH user:* COUNT 100\n-> next cursor: 3512, keys: [...]\n\nSCAN 3512 MATCH user:* COUNT 100\n-> next cursor: 0이면 종료\n```\n\ncursor가 0으로 돌아올 때까지 반복한다. `COUNT`는 정확히 그 개수만 반환한다는 보장이 아니라 “이 정도 effort로 조금씩 훑어 달라”는 hint에 가깝다.\n\n---\n\n## SCAN이 주는 것과 주지 않는 것\n\n| 항목 | SCAN의 의미 |\n|---|---|\n| blocking 완화 | 한 번에 긴 시간 막지 않도록 나눠 돈다 |\n| cursor iteration | 이전 위치 이후를 계속 훑을 수 있다 |\n| snapshot 보장 | 아니다. 순회 중 key가 추가/삭제될 수 있다 |\n| 중복 없음 보장 | 아니다. 같은 key가 다시 보일 수 있다 |\n| 정확한 batch size | 아니다. COUNT는 hint다 |\n\n따라서 SCAN 결과를 처리하는 작업은 idempotent해야 한다. 같은 key를 두 번 봐도 안전해야 하고, 순회 중 생긴 key가 이번 round에 반드시 포함된다고 기대하면 안 된다.\n\n---\n\n## 언제 무엇을 쓰나\n\n| 상황 | 선택 |\n|---|---|\n| 로컬 개발에서 key 이름 잠깐 확인 | `KEYS` 허용 가능 |\n| 운영에서 prefix key를 점검 | `SCAN MATCH prefix:* COUNT N` |\n| 많은 key 삭제 | SCAN으로 나눠 찾고 batch delete |\n| 정확한 전체 inventory 필요 | Redis keyspace scan보다 별도 index/source of truth 검토 |\n| cache invalidation 대상 찾기 | key naming, explicit index, event 기반 invalidation 우선 |\n\n운영에서 “prefix가 이런 key를 모두 찾아 지우자”는 요구가 자주 생긴다면 key naming과 보조 index 설계가 더 중요할 수 있다. SCAN은 응급 도구이지 모든 key 관리의 설계 중심이 아니다.\n\n---\n\n## 안전한 운영 루프\n\n1. production에서 `KEYS *`를 금지하거나 제한한다.\n2. SCAN은 작은 COUNT로 시작하고 Redis latency를 보며 조정한다.\n3. 처리 작업은 idempotent하게 만든다.\n4. duplicate key를 다시 봐도 안전하게 한다.\n5. 많은 delete는 한 번에 몰지 않고 rate limit한다.\n6. scan job의 진행 cursor, 처리 count, error count를 남긴다.\n\n---\n\n## 흔한 오해\n\n- SCAN은 완전히 non-blocking이라고 생각한다. 한 호출도 일을 하므로 작은 blocking은 있을 수 있지만, KEYS처럼 한 번에 길게 막는 것을 피하는 모델이다.\n- COUNT가 반환 개수라고 생각한다. COUNT는 hint다.\n- SCAN 결과가 snapshot이라고 믿는다. 순회 중 keyspace 변화가 반영될 수 있다.\n- 중복 key가 안 나온다고 생각한다. idempotent 처리해야 한다.\n- SCAN이면 운영에서 아무렇게나 delete해도 된다고 본다. delete 자체도 부하와 side effect를 만든다.\n\n## 한 줄 정리\n\nRedis keyspace를 운영 중 훑어야 한다면 `KEYS`의 한 방 blocking을 피하고 `SCAN`으로 나눠 처리하되, SCAN이 snapshot/중복 없음/정확한 batch size를 보장하지 않는다는 점을 설계에 반영해야 한다.\n",
+  "aliases": [
+    "Redis SCAN KEYS",
+    "Redis SCAN vs KEYS",
+    "레디스 SCAN KEYS",
+    "KEYS blocking Redis",
+    "Redis KEYS 장애",
+    "SCAN cursor iteration",
+    "Redis cursor scan",
+    "SCAN not snapshot",
+    "SCAN duplicate keys",
+    "MATCH COUNT cursor",
+    "Redis keyspace scan",
+    "운영 Redis KEYS 금지"
+  ],
+  "expected_queries": [
+    "운영 Redis에서 KEYS *를 쓰면 왜 단일 스레드 이벤트 루프를 막아 장애가 날 수 있어?",
+    "Redis SCAN cursor는 KEYS와 다르게 어떻게 조금씩 keyspace를 순회해?",
+    "SCAN COUNT는 정확한 반환 개수가 아니라 hint라는 말이 무슨 뜻이야?",
+    "Redis SCAN은 snapshot이 아니라서 중복 key나 순회 중 변경을 어떻게 처리해야 해?",
+    "많은 Redis key를 prefix로 찾아 삭제할 때 SCAN과 idempotent 처리, rate limit을 어떻게 같이 봐?"
+  ],
+  "symptoms": [
+    "운영 Redis에서 key 확인을 위해 KEYS *를 실행해 전체 latency spike를 만든다.",
+    "SCAN을 snapshot 조회처럼 믿고 중복 또는 순회 중 변경을 고려하지 않는다.",
+    "COUNT가 정확한 batch size라고 생각한다.",
+    "SCAN으로 찾은 key를 대량 삭제하면서 delete 부하와 idempotency를 놓친다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-basics-in-memory-kv-single-thread-primer",
+      "system-design/redis-single-thread-atomic-commands-incr-primer"
+    ],
+    "next_docs": [
+      "system-design/cache-invalidation-patterns-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser",
+      "system-design/redis-eviction-vs-replication-stale-cache-bridge"
+    ],
+    "confusable_with": [
+      "system-design/redis-data-types-string-hash-list-set-zset-primer",
+      "system-design/cache-invalidation-patterns-primer",
+      "database/index-skip-scan-behavior"
+    ],
+    "forbidden_for_queries": [
+      "DB index skip scan behavior를 설명해줘",
+      "Redis Streams consumer group pending entries를 운영에서 복구하는 법을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch56-stream-a-redis-runway"
+      }
+    ]
+  }
+}
