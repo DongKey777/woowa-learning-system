@@ -1,0 +1,58 @@
+{
+  "id": "spring/micrometer-client-percentile-vs-histogram-aggregation-pitfall",
+  "title": "Micrometer percentile vs histogram - instance p95 집계 함정",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "Micrometer에서 client-side percentile은 각 JVM instance가 계산한 p95/p99 값을 내보내므로 여러 instance 사이에서 평균내도 전체 p95가 되지 않는다. Prometheus 같은 backend에서 service 전체 latency를 보려면 percentile histogram bucket을 publish하고 bucket을 합산한 뒤 quantile을 계산해야 한다.",
+  "body_markdown": "# Micrometer percentile vs histogram - instance p95 집계 함정\n\n> 한 줄 요약: instance가 계산한 p95 숫자를 평균내면 service p95가 아니고, bucket histogram을 합산해야 전체 p95를 추정할 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: Micrometer percentile histogram, publishPercentiles vs publishPercentileHistogram, client side percentile aggregation pitfall, Spring Boot Micrometer p95, Prometheus histogram_quantile Micrometer, Timer percentile histogram, service p95 aggregation, instance p95 average wrong\n\n## 먼저 멘탈모델\n\nSpring Boot + Micrometer에서 latency를 보려 할 때 두 선택지가 자주 헷갈린다.\n\n- client-side percentile: 각 애플리케이션 instance가 p95, p99 같은 값을 계산해서 내보낸다.\n- percentile histogram: latency 관측값을 bucket count로 내보내고 backend가 bucket을 합산해 quantile을 계산한다.\n\n둘 다 p95라는 단어와 연결되지만 aggregation 가능성이 다르다.\n\n## client-side percentile의 함정\n\ninstance A와 B가 있다고 해보자.\n\n```text\nA p95 = 100ms, 요청 10개\nB p95 = 900ms, 요청 10,000개\n```\n\n두 값을 평균내서 500ms라고 하면 전체 p95가 되지 않는다. quantile은 요청 개수와 분포를 보존해야 계산할 수 있다. instance별 p95 하나만 남기면 전체 분포 정보가 사라진다.\n\n그래서 `publishPercentiles` 계열 값은 instance 내부 상태를 보는 데는 쓸 수 있어도, 여러 instance를 합쳐 service 전체 p95 alert를 만들기에는 위험하다.\n\n## percentile histogram의 장점\n\n`publishPercentileHistogram` 계열 설정은 Timer 관측값을 bucket count로 내보내게 한다. Prometheus에서는 bucket을 instance 간 합산한 뒤 `histogram_quantile`로 service 전체 quantile을 추정할 수 있다.\n\n```text\nsum by (le, uri, status) (\n  rate(http_server_requests_seconds_bucket[5m])\n)\n```\n\n그 다음 이 합산 결과에 quantile을 계산한다. 이 방식은 bucket 경계에 따른 추정 오차는 있지만, instance별 p95 평균보다 훨씬 올바른 aggregation 경로다.\n\n## 언제 무엇을 쓰나\n\n| 목적 | 더 안전한 선택 | 이유 |\n|---|---|---|\n| 단일 JVM 내부 latency를 빠르게 보고 싶다 | client-side percentile 가능 | instance 내부 분포만 보면 된다 |\n| service 전체 p95/p99 alert가 필요하다 | percentile histogram | bucket을 합산한 뒤 quantile을 계산할 수 있다 |\n| backend 비용을 줄여야 한다 | percentile/histogram 모두 신중히 | percentile series와 bucket series 모두 비용이 있다 |\n| SLO 경계가 명확하다 | histogram bucket/SLO boundary 조정 | 해당 경계 근처 오차를 줄일 수 있다 |\n\n## 비용과 cardinality\n\nHistogram bucket은 label 조합마다 bucket 수만큼 time series를 만든다. `uri`, `status`, `method`, `exception` 같은 tag가 붙은 Timer에 bucket이 추가되면 series 수가 빠르게 늘어난다.\n\n따라서 histogram을 켤 때는 함께 확인해야 한다.\n\n- route tag가 raw path가 아니라 template인지\n- userId, reservationId 같은 high-cardinality tag가 없는지\n- SLO에 필요한 bucket만 충분히 있는지\n- 모든 metric에 histogram을 켜는 대신 주요 latency metric에만 켤 수 있는지\n\n## Spring Boot에서 설명할 답변 골격\n\n면접이나 리뷰에서 안전한 답변은 이렇다.\n\nMicrometer percentile은 각 instance가 계산한 분위수라서 service 전체 p95로 합산하기 어렵다. Prometheus에서 전체 latency SLO를 보려면 histogram bucket을 publish하고, `sum by (le, ...)`로 bucket을 먼저 합친 뒤 `histogram_quantile`을 적용해야 한다. 다만 histogram도 bucket 수와 tag cardinality만큼 series 비용이 늘어나므로 SLO 경계와 label 설계를 같이 잡아야 한다.\n\n## 흔한 함정\n\n- instance별 p95를 평균내 service p95로 alert를 건다.\n- histogram을 모든 Timer에 켜서 metric series를 폭발시킨다.\n- raw path가 `uri` tag로 들어간 상태에서 histogram을 켠다.\n- bucket 경계가 SLO와 맞지 않아 quantile 추정이 거칠다.\n- p95가 좋아졌는데 request mix가 바뀐 것을 놓친다.\n\n## 한 줄 정리\n\nMicrometer에서 client-side percentile은 instance 내부 숫자이고, service 전체 p95/p99를 보려면 histogram bucket을 backend에서 합산한 뒤 quantile을 계산해야 한다. 정확도는 bucket 경계, 비용은 tag cardinality가 결정한다.\n",
+  "aliases": [
+    "Micrometer percentile histogram",
+    "publishPercentiles",
+    "publishPercentileHistogram",
+    "Micrometer p95",
+    "instance p95 집계",
+    "클라이언트 percentile",
+    "히스토그램 집계",
+    "Timer percentile",
+    "Spring p95"
+  ],
+  "expected_queries": [
+    "Micrometer publishPercentiles와 publishPercentileHistogram은 어떻게 달라?",
+    "Spring Boot instance별 p95를 평균내면 service p95가 아닌 이유가 뭐야?",
+    "Prometheus에서 Micrometer histogram bucket으로 전체 p95를 계산하려면 어떻게 해야 해?",
+    "Micrometer Timer histogram을 켤 때 tag cardinality를 왜 같이 봐야 해?",
+    "client-side percentile은 어떤 경우에만 안전하게 쓸 수 있어?",
+    "SLO latency 경계에 맞춰 histogram bucket을 잡아야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "각 Spring instance가 내보낸 p95를 평균내 전체 service p95 alert로 쓴다",
+    "Micrometer histogram을 모든 Timer와 raw path tag에 켜 series 수를 폭발시킨다",
+    "publishPercentiles와 histogram bucket의 aggregation 가능성을 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/metric-types-counter-gauge-histogram-basics",
+      "system-design/prometheus-histogram-quantile-bucket-interpolation-error",
+      "spring/micrometer-actuator-observability-interview-drill"
+    ],
+    "next_docs": [
+      "spring/micrometer-tag-cardinality-pitfalls",
+      "spring/spring-boot-actuator-observability-primer",
+      "system-design/metrics-pipeline-tsdb-design"
+    ],
+    "confusable_with": [
+      "spring/micrometer-tag-cardinality-pitfalls",
+      "system-design/prometheus-histogram-quantile-bucket-interpolation-error",
+      "spring/observability-micrometer-tracing"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/spring/micrometer-client-percentile-vs-histogram-aggregation-pitfall.md",
+    "revision_history": []
+  }
+}

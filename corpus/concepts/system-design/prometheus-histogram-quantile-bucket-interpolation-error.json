@@ -1,0 +1,56 @@
+{
+  "id": "system-design/prometheus-histogram-quantile-bucket-interpolation-error",
+  "title": "Prometheus histogram quantile - bucket interpolation 오차",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Prometheus classic histogram은 bucket별 누적 count, sum, count를 저장하고 histogram_quantile로 quantile을 추정한다. 추정 정확도는 bucket 경계에 의존하며, bucket을 먼저 합산한 뒤 quantile을 계산해야 instance 간 전체 p95를 얻을 수 있다.",
+  "body_markdown": "# Prometheus histogram quantile - bucket interpolation 오차\n\n> 한 줄 요약: histogram quantile은 진짜 raw latency 정렬값이 아니라 bucket 안에서 추정한 값이다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: Prometheus histogram quantile, histogram_quantile, bucket interpolation error, classic histogram buckets, le label, p95 latency bucket, percentile aggregation, histogram bucket boundaries, summary vs histogram aggregation, Prometheus p95 error\n\n## 먼저 멘탈모델\n\nPrometheus classic histogram은 관측값 하나하나를 저장하지 않는다. 대신 bucket 경계 이하에 몇 개가 들어갔는지 누적 count를 저장한다.\n\n```text\nhttp_request_duration_seconds_bucket{le=0.1} 120\nhttp_request_duration_seconds_bucket{le=0.3} 240\nhttp_request_duration_seconds_bucket{le=1.0} 290\nhttp_request_duration_seconds_bucket{le=+Inf} 300\nhttp_request_duration_seconds_sum 75\nhttp_request_duration_seconds_count 300\n```\n\n`histogram_quantile(0.95, ...)`는 이 bucket count로 p95를 추정한다. raw sample을 모두 정렬해서 정확한 95번째 값을 찾는 것이 아니다.\n\n## bucket interpolation이란\n\np95 위치가 `0.3s` bucket과 `1.0s` bucket 사이에 있다고 해보자. Prometheus는 bucket 안의 값들이 어느 정도 균등하게 분포한다고 보고 quantile 위치를 보간한다.\n\n즉 실제 값이 bucket 안에서 한쪽에 몰려 있어도, query는 bucket 경계를 기준으로 추정한다. 그래서 bucket이 넓을수록 quantile 오차도 커질 수 있다.\n\n## bucket 경계가 중요한 이유\n\nlatency SLO가 300ms라면 300ms 근처 bucket이 촘촘해야 한다. bucket이 `0.1, 1.0, +Inf`처럼 거칠면 p95가 SLO 근처에서 얼마나 나쁜지 보기 어렵다.\n\n좋은 bucket 설계는 질문에서 시작한다.\n\n- 100ms, 300ms, 1s 같은 SLO 경계가 있는가\n- p95/p99 중 무엇을 alert에 쓸 것인가\n- 긴 tail을 어느 정도까지 보고 싶은가\n- bucket 수 증가로 생기는 series 비용을 감당할 수 있는가\n\n## instance 간 aggregation 순서\n\nHistogram의 장점은 bucket count를 instance 간 합칠 수 있다는 점이다.\n\n```text\nsum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))\n```\n\n처럼 같은 bucket boundary를 먼저 합산한 뒤, 그 결과에 `histogram_quantile`을 적용해야 전체 p95에 가깝다.\n\n반대로 instance A의 p95와 instance B의 p95를 각각 구한 뒤 평균내면 전체 p95가 아니다. quantile은 평균처럼 결합되지 않는다.\n\n## Summary와의 차이\n\nPrometheus summary는 client가 quantile을 계산해서 보낼 수 있다. 이 값은 instance 내부에서는 유용할 수 있지만, 여러 instance의 summary quantile을 의미 있게 합산하기 어렵다.\n\nHistogram은 bucket 기반이라 오차가 있지만, bucket을 합산해 service 전체 quantile을 추정할 수 있다. 운영 dashboard와 alert에는 이 aggregation 가능성이 중요하다.\n\n## 흔한 함정\n\n- bucket이 너무 거칠어 p95가 SLO 근처에서 부정확하다.\n- bucket 수를 너무 늘려 label cardinality와 series 비용이 커진다.\n- p95 값을 instance별로 구한 뒤 평균낸다.\n- `le` label 없이 bucket을 합산해 histogram 구조를 깨뜨린다.\n- 평균 latency만 보고 tail latency를 놓친다.\n\n## 한 줄 정리\n\nPrometheus histogram quantile은 bucket count를 합산한 뒤 보간해 얻는 추정값이다. 정확도는 bucket 경계에 달려 있고, service 전체 p95는 instance별 p95 평균이 아니라 bucket aggregation 이후 계산해야 한다.\n",
+  "aliases": [
+    "Prometheus histogram quantile",
+    "histogram_quantile",
+    "bucket interpolation",
+    "히스토그램 분위수",
+    "버킷 보간 오차",
+    "Prometheus p95 오차",
+    "classic histogram",
+    "le label",
+    "summary vs histogram"
+  ],
+  "expected_queries": [
+    "Prometheus histogram_quantile은 bucket으로 p95를 어떻게 추정해?",
+    "histogram bucket 경계가 latency p95 오차에 왜 영향을 줘?",
+    "instance별 p95를 평균내면 service 전체 p95가 아닌 이유가 뭐야?",
+    "Prometheus summary와 histogram은 aggregation 관점에서 어떻게 달라?",
+    "histogram bucket을 sum by le로 먼저 합산해야 하는 이유가 뭐야?",
+    "SLO가 300ms일 때 histogram bucket을 왜 그 근처에 촘촘히 둬야 해?"
+  ],
+  "symptoms": [
+    "Prometheus p95를 raw sample의 정확한 95번째 값으로 오해한다",
+    "instance별 quantile을 평균내 service 전체 p95처럼 사용한다",
+    "bucket 경계가 SLO와 맞지 않아 histogram quantile 오차를 크게 만든다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/metric-types-counter-gauge-histogram-basics",
+      "system-design/metric-temporality-cumulative-delta-counter-reset-rate-pitfall"
+    ],
+    "next_docs": [
+      "spring/micrometer-client-percentile-vs-histogram-aggregation-pitfall",
+      "system-design/metrics-pipeline-tsdb-design"
+    ],
+    "confusable_with": [
+      "spring/micrometer-tag-cardinality-pitfalls",
+      "system-design/red-use-metrics-observability-chooser",
+      "spring/micrometer-actuator-observability-interview-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/prometheus-histogram-quantile-bucket-interpolation-error.md",
+    "revision_history": []
+  }
+}
