@@ -6,15 +6,24 @@
   "summary": "이 symptom_router는 client, edge, proxy, service mesh, origin app 사이의 502/504/500 attribution을 구분한다.",
   "body_markdown": "# Client Edge Origin Error Attribution Router\n\n## 관찰 증거\n\nHTTP status는 누가 만든 응답인지까지 말해 주지 않는다. 같은 504라도 browser timeout, CDN timeout, gateway local reply, service mesh timeout, origin app timeout이 모두 후보가 될 수 있다. 따라서 status code 하나로 \"gateway 문제\" 또는 \"app 문제\"라고 단정하지 말고, 같은 요청의 시간축과 응답 생성 주체를 먼저 맞춘다.\n\n함께 묶어 볼 지표는 request id/trace id, `Via`/`Server`/proxy 전용 header, upstream status, upstream service time, downstream bytes sent, client reset 여부, proxy response flag, origin access log status, app exception log, browser waterfall의 DNS/connect/TLS/TTFB/TTLB 구간이다.\n\n추가로 retry가 있으면 최종 client status와 최초 실패 지점이 다를 수 있다. 한 요청 id 아래 여러 attempt가 생겼는지, proxy가 local reply를 만들었는지, origin이 만든 body를 proxy가 그대로 전달했는지 분리한다.\n\n## 1차 분기\n\n| 관찰 | 먼저 볼 위치 | 다음 문서 |\n|---|---|---|\n| app access log가 없음 | edge/CDN/LB/proxy가 origin까지 보냈는지 | `proxy-local-reply-vs-upstream-error-attribution` |\n| app은 200, client는 504 | 응답 전송 중 timeout, downstream deadline, client reset 후보 | access log correlation |\n| proxy에는 upstream 500, app trace에도 exception | origin app 또는 app의 하위 의존성 실패 후보 | app log와 dependency trace |\n| proxy local reply 502/503/504 | upstream 미선택, connect 실패, route/health, proxy timeout 후보 | `proxy-local-reply-vs-upstream-error-attribution` |\n| sidecar metric만 5xx | mesh timeout/reset/policy local reply 후보 | `service-mesh-local-reply-timeout-reset-attribution` |\n| browser waterfall 앞단 지연 | DNS/connect/TLS/client network 후보 | `request-timing-decomposition` |\n| retry 후 최종 200이지만 latency spike | 최초 attempt 실패 또는 hedged request 후보 | retry attempt log, idempotency key |\n| edge는 502, origin에는 짧은 499/closed write | downstream/client abort 또는 proxy timeout 후보 | bytes sent, reset reason |\n\n## 운영 진단 축\n\n먼저 같은 요청을 찾는다. trace id가 없으면 임시 header나 unique query parameter로 재현 요청을 만들고, client, edge, proxy, sidecar, origin access log의 timestamp를 같은 기준으로 정렬한다. 시계 오차가 있으면 짧은 spike의 선후관계가 뒤집힐 수 있으므로 window를 넓혀 본다.\n\n그다음 \"누가 응답 body와 status를 만들었는가\"와 \"어느 구간에서 시간이 소진됐는가\"를 분리한다. 예를 들어 origin이 200을 기록했더라도 downstream write가 늦거나 client가 끊겼다면 client는 실패를 볼 수 있다. 반대로 app log가 없더라도 proxy가 origin connect 전에 실패했는지, route는 선택했지만 upstream이 reset했는지에 따라 대응이 달라진다.\n\n원인 후보를 줄일 때는 다음 질문을 순서대로 묻는다.\n\n1. Client가 실제로 받은 body/header는 어느 layer의 signature를 갖는가.\n2. Edge/proxy가 upstream route를 선택했는가, 아니면 local reply였는가.\n3. Origin access log가 있다면 request body를 다 읽었는가, response body를 다 썼는가.\n4. Downstream client가 먼저 끊었는가, upstream origin이 먼저 끊었는가.\n5. Retry/hedge 때문에 하나의 사용자 요청이 여러 origin attempt로 갈라졌는가.\n6. Timeout budget이 client, CDN, gateway, app에서 서로 어떤 순서로 만료되는가.\n\n## 면접 답변 축\n\n면접에서는 \"502/504면 gateway, 500이면 app\"처럼 숫자에 책임을 고정하지 않는 것이 중요하다. 더 좋은 답변은 \"HTTP status는 특정 layer가 생성한 관찰 결과이고, attribution은 response header, access log, trace id, upstream/downstream timing을 상관시켜 정한다\"로 시작한다.\n\n역할에 맞는 답변은 관찰 지점을 같이 말한다. Frontend 관점은 browser waterfall과 response header, platform 관점은 edge/proxy response flag와 upstream timing, backend 관점은 access log, exception, downstream write failure를 본다. 같은 장애라도 각 역할이 보는 로그의 의미가 다르다.\n\n## 다음 확인\n\nStatus code, response header, server header, trace id, upstream service time, downstream bytes sent를 함께 본다. App이 응답을 만들었는지, proxy가 대신 만들었는지, client가 먼저 끊었는지부터 나누면 원인 후보가 크게 줄어든다.\n\n## 피해야 할 단정\n\n- \"client가 504를 봤으니 origin은 느렸다\"는 단정은 위험하다.\n- \"origin access log가 200이니 사용자 영향은 없다\"는 단정도 위험하다.\n- proxy의 5xx 그래프에는 upstream 5xx와 proxy local reply가 함께 섞일 수 있다.\n- retry가 있으면 최종 응답의 status와 최초 실패 원인이 다를 수 있다.\n- app JSON schema가 아닌 HTML error page가 보이면 origin app이 아니라 중간 layer가 만든 응답일 수 있다.\n- 동일 status라도 request body upload 전, upstream processing 중, response streaming 중 실패는 대응이 다르다.\n\n## 관련 playbook\n\n초기 분기는 `browser-devtools-502-504-app-500-decision-card`, proxy attribution은 `proxy-local-reply-vs-upstream-error-attribution`, container별 access log 연결은 `access-log-correlation-recipes-tomcat-jetty-undertow`로 이어진다.\n",
   "aliases": [
-    "client edge origin error attribution",
-    "gateway app error router",
-    "클라이언트 엣지 오리진 에러 구분",
-    "502 504 app 500 원인 분기"
+    "client edge origin attribution",
+    "edge gateway origin error",
+    "proxy local reply attribution",
+    "upstream error owner router",
+    "502 504 app 500 분기",
+    "클라이언트 엣지 오리진 구분",
+    "gateway app error owner",
+    "브라우저 오류 책임 분기",
+    "X-Request-Id 로그 추적",
+    "app log missing gateway error"
   ],
   "expected_queries": [
     "502 504 500이 섞일 때 gateway 문제인지 app 문제인지 어떻게 구분해?",
     "브라우저에는 504인데 app 로그에는 200이면 어디가 책임이야?",
-    "proxy local reply와 upstream error는 어떻게 다르게 봐?"
+    "proxy local reply와 upstream error는 어떻게 다르게 봐?",
+    "client, edge, origin 중 어느 계층이 오류를 만든 건지 Server, Via, X-Request-Id로 어떻게 가르지?",
+    "앱 로그가 없는데 브라우저에는 gateway error가 보이면 책임 계층을 어떻게 좁혀?",
+    "edge timeout과 origin 500이 섞인 장애에서 첫 attribution 순서를 알려줘"
   ],
   "symptoms": [
     "client는 504를 봤지만 origin access log에는 200이 있습니다",
