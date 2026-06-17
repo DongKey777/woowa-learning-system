@@ -1,0 +1,59 @@
+{
+  "id": "system-design/straggler-speculative-execution-batch-barrier",
+  "title": "Straggler speculative execution batch barrier - 느린 task 하나가 stage를 잡는 문제",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Straggler는 분산 batch stage에서 대부분 task가 끝났는데 일부 task가 유난히 늦어 전체 barrier를 붙잡는 현상이다. Speculative execution은 늦은 task의 복제 실행을 다른 worker에서 시작해 먼저 끝난 결과를 쓰는 완화 기법이지만, deterministic하고 side effect가 없는 작업에만 안전하다.",
+  "body_markdown": "# Straggler speculative execution batch barrier - 느린 task 하나가 stage를 잡는 문제\n\n> 한 줄 요약: 분산 batch는 가장 늦은 task 하나를 기다리고, speculative execution은 그 task를 복제 실행해 먼저 끝나는 결과를 택한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: straggler task, speculative execution, batch barrier, slow task duplicate execution, tail task, MapReduce straggler, skew partition straggler, hedged task, stage barrier wait, deterministic idempotent task\n\n## 먼저 멘탈모델\n\n분산 batch stage에서는 작업이 100개로 나뉘어도 stage 완료 시점은 대개 마지막 task가 끝나는 시간이다.\n\n```text\ntask 1-97: done in 30s\ntask 98: done in 35s\ntask 99: done in 32s\ntask 100: still running after 7m\n\nstage: task 100을 기다림\n```\n\n이렇게 전체 진행을 붙잡는 느린 task가 straggler다. 원인은 다양하다.\n\n- partition skew로 입력이 유독 크다.\n- worker 하나의 disk, network, CPU가 느리다.\n- GC pause나 noisy neighbor가 있다.\n- retry된 task가 느린 node에 계속 배치된다.\n- remote storage read가 특정 split에서만 느리다.\n\n## speculative execution이란\n\nSpeculative execution은 느린 task를 실패로 단정하지 않고, 같은 task를 다른 worker에서 한 번 더 실행해 본다.\n\n```text\noriginal task 100: worker A에서 7분째 실행 중\nspeculative copy: worker D에서 새로 시작\n\n먼저 끝난 결과를 채택하고 다른 실행은 취소 또는 무시\n```\n\n이 아이디어는 API의 hedged request와 닮았지만 batch task에 적용된 형태다. 목적은 tail task 하나 때문에 stage가 오래 묶이는 것을 줄이는 것이다.\n\n## 언제 안전한가\n\nSpeculative execution은 아래 조건이 맞을 때 안전하다.\n\n- task input이 같으면 output이 결정적이다.\n- task가 외부 side effect를 직접 만들지 않는다.\n- output commit이 원자적이거나 중복 commit을 방지한다.\n- 두 실행 중 하나만 최종 결과로 채택하는 commit protocol이 있다.\n- 추가 실행이 cluster capacity를 과도하게 먹지 않는다.\n\n반대로 task가 외부 API 호출, DB write, 이메일 발송 같은 side effect를 포함하면 복제 실행이 중복 부작용을 만들 수 있다. 이런 작업은 speculative execution 대상이 아니라 idempotency, outbox, checkpoint, retry queue 설계가 먼저다.\n\n## straggler와 skew 구분\n\n모든 straggler가 나쁜 node 때문은 아니다. 특히 shuffle 이후 reducer 하나가 큰 key를 떠안으면, 그 task는 느린 것이 아니라 **정말 일이 많은 것**이다.\n\n| 신호 | 해석 |\n|---|---|\n| 같은 partition만 반복해서 늦음 | data skew 가능성 큼 |\n| 특정 worker에서 여러 task가 늦음 | node/resource 문제 가능성 큼 |\n| retry해도 동일한 key group이 큼 | partitioning/salting 문제 |\n| speculative copy도 똑같이 오래 걸림 | 입력 자체가 크거나 알고리즘 비용 문제 |\n\n따라서 speculative execution은 증상 완화고, skew 자체는 partitioner, salting, pre-aggregation으로 줄여야 한다.\n\n## 운영 함정\n\n### 너무 이른 speculative 실행\n\n조금 늦는 task까지 모두 복제하면 cluster capacity를 두 배로 먹는다. 그러면 원래 정상 task까지 느려져 악순환이 생긴다. threshold는 task duration 분포와 progress rate를 보고 잡아야 한다.\n\n### side effect 중복\n\nspeculative copy가 같은 외부 write를 두 번 만들면 결과가 깨진다. batch task는 가능한 한 pure computation + atomic output commit 구조로 두는 편이 좋다.\n\n### root cause 은폐\n\nspeculative execution으로 stage time은 줄어도 hot key, bad node, disk spill 원인이 사라지는 것은 아니다. straggler metric과 partition input size를 계속 봐야 한다.\n\n### barrier 단계 오해\n\nstage가 기다리는 것은 thread join이 아니라 작업 graph의 다음 단계가 필요한 input을 다 받기 위한 barrier다. reduce stage가 필요한 partition을 못 받으면 전체 결과를 확정할 수 없다.\n\n## Hedged request와의 차이\n\n둘 다 느린 실행을 하나 더 시도한다는 점은 닮았다. 차이는 적용 범위다.\n\n- Hedged request: 사용자 요청이나 RPC의 tail latency를 줄이기 위한 중복 요청이다.\n- Speculative execution: batch task나 distributed job stage의 tail task를 줄이기 위한 중복 실행이다.\n\n둘 다 capacity 비용과 side effect 안전성을 봐야 하지만, batch에서는 output commit protocol과 stage barrier가 더 중요하다.\n\n## 한 줄 정리\n\nStraggler는 분산 batch stage에서 가장 늦은 task가 전체 barrier를 붙잡는 현상이고, speculative execution은 안전한 task에 한해 복제 실행으로 tail을 줄이는 완화책이다. 원인이 skew라면 복제보다 partition 설계가 먼저다.\n",
+  "aliases": [
+    "straggler task",
+    "speculative execution",
+    "batch barrier",
+    "느린 태스크",
+    "추측 실행",
+    "배치 배리어",
+    "tail task",
+    "hedged task",
+    "stage barrier wait"
+  ],
+  "expected_queries": [
+    "분산 batch에서 straggler task 하나가 stage 전체를 늦추는 이유가 뭐야?",
+    "speculative execution은 느린 task를 어떻게 복제 실행하고 어떤 결과를 채택해?",
+    "MapReduce에서 speculative execution을 side effect 있는 task에 쓰면 왜 위험해?",
+    "straggler가 bad node 때문인지 partition skew 때문인지 어떻게 구분해?",
+    "batch barrier wait와 thread join은 어떤 점이 달라?",
+    "hedged request와 speculative execution은 비슷하지만 어디가 달라?"
+  ],
+  "symptoms": [
+    "대부분 task가 끝났는데 마지막 partition 하나 때문에 batch stage가 끝나지 않는다",
+    "느린 task를 무조건 retry하면 된다고 보고 side effect 중복 위험을 놓친다",
+    "speculative execution으로 stage가 빨라져도 skew와 bad node 원인을 계속 봐야 한다는 점을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/mapreduce-shuffle-paradigm-basics",
+      "system-design/distributed-shuffle-partition-skew-spill",
+      "software-engineering/batch-partial-failure"
+    ],
+    "next_docs": [
+      "system-design/hedged-requests-tail-latency-chooser",
+      "software-engineering/batch-recovery-runbook",
+      "system-design/hot-key-skew-mitigation-interview-playbook"
+    ],
+    "confusable_with": [
+      "system-design/hedged-requests-tail-latency-chooser",
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser",
+      "software-engineering/batch-partial-failure",
+      "system-design/distributed-shuffle-partition-skew-spill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/straggler-speculative-execution-batch-barrier.md",
+    "revision_history": []
+  }
+}

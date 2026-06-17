@@ -1,0 +1,58 @@
+{
+  "id": "system-design/fan-out-fan-in-parallel-merge-basics",
+  "title": "Fan-out/Fan-in parallel merge basics - 나누고 합치는 병렬 처리",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Fan-out/Fan-in은 큰 일을 여러 독립 작업으로 나눠 병렬 실행하고, 결과를 다시 모아 하나의 응답이나 다음 단계 입력으로 합치는 패턴이다. 핵심은 병렬화 자체가 아니라 작업 분할 기준, 동시성 제한, deadline, partial success, merge semantics를 함께 정하는 것이다.",
+  "body_markdown": "# Fan-out/Fan-in parallel merge basics - 나누고 합치는 병렬 처리\n\n> 한 줄 요약: 일을 여러 갈래로 나누는 것이 fan-out이고, 결과를 다시 모아 의미 있는 하나로 만드는 것이 fan-in이다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: fan-out fan-in, parallel merge basics, scatter gather, parallel aggregation, shard query fanout, partial result merge, concurrency limit, slowest branch, fanout width, merge semantics, 병렬 조회 합치기, 분산 검색 fan-in\n\n## 먼저 멘탈모델\n\nFan-out/Fan-in은 한 작업을 여러 조각으로 나눠 동시에 처리한 뒤 다시 합치는 구조다.\n\n```text\n            -> worker A -> result A\nrequest/job -> worker B -> result B -> merge -> final result\n            -> worker C -> result C\n```\n\n예시는 많다.\n\n- 여러 shard에 검색 요청을 보내고 top-N 결과를 합친다.\n- 여러 외부 API를 병렬 호출하고 화면 응답을 만든다.\n- 큰 파일을 chunk로 나눠 처리한 뒤 summary를 만든다.\n- batch 입력을 partition별로 처리하고 run 결과를 합친다.\n\n여기서 중요한 점은 fan-out이 성능을 자동으로 올려 주지 않는다는 것이다. 병렬 branch가 많아질수록 merge, timeout, retry, partial failure, downstream rate limit 문제가 같이 커진다.\n\n## 설계 축 5가지\n\n| 축 | 질문 | 놓치면 생기는 문제 |\n|---|---|---|\n| split unit | 무엇을 기준으로 나눌까 | 특정 partition만 커져 skew가 생긴다 |\n| fan-out width | 동시에 몇 개까지 보낼까 | downstream saturation, thread/connection 폭증 |\n| deadline | 언제까지 기다릴까 | 느린 branch 하나가 전체 응답을 붙잡는다 |\n| fan-in policy | 일부 실패를 어떻게 볼까 | null, 빈 값, 예외가 섞여 의미가 흐려진다 |\n| merge semantics | 어떤 순서와 중복 제거로 합칠까 | top-N, 정렬, 중복, 집계 결과가 흔들린다 |\n\nFan-out은 보통 코드 한 줄로 쉬워 보인다. 하지만 운영에서 어려운 부분은 fan-in이다. 모든 branch가 성공해야 하는지, 일부 결과만으로 응답 가능한지, 늦은 결과는 버릴지, 같은 item이 여러 branch에서 나오면 어떻게 deduplicate할지 먼저 정해야 한다.\n\n## fan-out이 빨라지는 조건\n\nFan-out이 효과를 내려면 아래 조건이 어느 정도 맞아야 한다.\n\n- branch들이 서로 독립적으로 실행될 수 있다.\n- 가장 느린 branch가 전체 시간을 지배해도 받아들일 수 있다.\n- 작업을 나누고 합치는 비용이 병렬화 이득보다 작다.\n- downstream이 늘어난 동시 요청을 감당할 수 있다.\n- merge 함수가 결정적이고 설명 가능하다.\n\n예를 들어 10개 shard에 동시에 검색하면 평균은 빨라질 수 있다. 하지만 가장 느린 shard 하나를 기다리면 p99가 전체 응답 p99가 된다. 그래서 timeout, partial result, fallback, straggler 처리 정책이 필요해진다.\n\n## 흔한 함정\n\n### 무제한 fan-out\n\n입력 item 수만큼 thread, HTTP call, DB query를 동시에 만들면 처리량이 아니라 장애 전파가 커진다. fan-out width는 semaphore, worker pool, queue, remote bulkhead 같은 별도 limit으로 제한해야 한다.\n\n### merge semantics 부재\n\n결과를 그냥 list에 더하는 것은 merge가 아니다. 정렬 기준, 중복 제거 key, partial result 표시, score tie-breaker, 집계 단위가 있어야 한다.\n\n### side effect branch\n\n읽기 fan-out은 비교적 안전하지만 쓰기 fan-out은 멱등성, 중복 실행, 보상 트랜잭션 문제가 붙는다. 병렬 실행이 가능하다고 해서 side effect를 무작정 fan-out하면 복구가 어려워진다.\n\n### 단일 느린 branch\n\nfan-in은 보통 가장 느린 branch를 기다린다. 그래서 fan-out 폭이 넓어질수록 어느 하나가 느릴 확률도 올라간다. batch에서는 straggler, API에서는 tail latency 문제로 나타난다.\n\n## MapReduce와의 연결\n\nMapReduce도 큰 관점에서는 fan-out/fan-in이다.\n\n- map 단계: 입력 split을 여러 worker가 병렬 처리한다.\n- shuffle 단계: 같은 key끼리 모이도록 중간 결과를 재분배한다.\n- reduce 단계: key별 결과를 합친다.\n\n단순 API fan-out과 다른 점은 중간에 **shuffle barrier**가 있다는 것이다. 모든 map output이 key 기준으로 재배치되어야 reduce가 의미 있게 시작된다.\n\n## 다른 문서와 구분\n\n- `Structured Fan-out With HttpClient`는 Java request scope 안의 원격 호출 fan-out이다.\n- `Partial Success Fan-in Patterns`는 일부 downstream 실패를 응답 계약으로 표현하는 language/API 패턴이다.\n- 이 문서는 분산 시스템 관점에서 split, fan-out width, merge semantics, slowest branch 문제를 먼저 잡는다.\n\n## 한 줄 정리\n\nFan-out/Fan-in은 병렬화 문법이 아니라 **무엇을 나누고, 얼마나 동시에 보내고, 언제 포기하고, 어떤 규칙으로 합칠지**를 함께 정하는 시스템 설계 패턴이다.\n",
+  "aliases": [
+    "fan-out fan-in",
+    "parallel merge",
+    "병렬 처리 합치기",
+    "나누고 합치기",
+    "scatter gather",
+    "분산 검색 합치기",
+    "fanout width",
+    "partial result merge",
+    "slowest branch"
+  ],
+  "expected_queries": [
+    "fan-out fan-in은 일을 나누고 다시 합칠 때 어떤 설계 축을 봐야 해?",
+    "병렬로 여러 shard를 조회한 뒤 결과를 merge할 때 무엇을 정해야 해?",
+    "fan-out 폭을 제한하지 않으면 downstream에 어떤 문제가 생겨?",
+    "fan-in에서 가장 느린 branch가 전체 응답 시간을 잡아먹는 이유가 뭐야?",
+    "partial result merge와 단순 list 합치기는 어떻게 달라?",
+    "MapReduce가 fan-out fan-in 패턴과 어떻게 이어져?"
+  ],
+  "symptoms": [
+    "병렬로 돌리면 무조건 빨라진다고 생각해 fan-out 폭 제한을 두지 않는다",
+    "여러 shard 결과를 합치면서 정렬, 중복 제거, partial result 의미를 정하지 않았다",
+    "느린 branch 하나가 전체 응답을 붙잡는 이유를 fan-in 관점에서 설명하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/system-design-foundations",
+      "language/java-executorservice-threadpool-basics"
+    ],
+    "next_docs": [
+      "system-design/mapreduce-shuffle-paradigm-basics",
+      "language/structured-fanout-httpclient",
+      "language/partial-success-fan-in-patterns"
+    ],
+    "confusable_with": [
+      "system-design/newsfeed-fanout-interview-chooser",
+      "language/structured-fanout-httpclient",
+      "language/partial-success-fan-in-patterns",
+      "software-engineering/batch-partial-failure"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/fan-out-fan-in-parallel-merge-basics.md",
+    "revision_history": []
+  }
+}
