@@ -1,0 +1,69 @@
+{
+  "id": "system-design/redis-set-sadd-idempotent-dedup-primer",
+  "title": "Redis Set SADD Idempotent Dedup Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis Set의 `SADD`는 membership check와 add를 단일 atomic command로 처리하므로 event id, webhook id, user action id 같은 값을 중복 없이 기록하는 간단한 dedup gate로 쓸 수 있다. 다만 side effect 전후 기록 시점, dedup window, TTL, crash recovery를 정하지 않으면 정확히 한 번 처리가 아니라 중복을 줄이는 힌트에 그친다.",
+  "body_markdown": "# Redis Set SADD Idempotent Dedup Primer\n\n> 한 줄 요약: `SADD`는 중복 없는 set add를 단일 명령으로 처리하므로 event id dedup에 유용하지만, side effect와 recovery 경계까지 자동으로 해결하지는 않는다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Redis 자료구조 String Hash List Set ZSet 입문](./redis-data-types-string-hash-list-set-zset-primer.md)\n- [Redis Single Thread Atomic Commands and INCR Primer](./redis-single-thread-atomic-commands-incr-primer.md)\n- [Redis TTL과 키 만료 메커니즘 입문](./redis-ttl-key-expiration-mechanics-primer.md)\n- [멱등성 키와 중복 방지](../database/idempotency-key-and-deduplication.md)\n- [Idempotency Key Store / Dedup Window / Replay-Safe Retry 설계](./idempotency-key-store-dedup-window-replay-safe-retry-design.md)\n\nretrieval-anchor-keywords: Redis SADD dedup, Redis Set idempotency, event id dedup Redis, SADD return value duplicate, processed event set, duplicate suppression Redis, dedup window Redis TTL, Redis idempotent consumer, 레디스 SADD 중복 제거, Redis Set 멱등성\n\n---\n\n## 핵심 아이디어\n\nRedis Set은 중복 없는 멤버 집합이고, `SADD`는 새 멤버를 추가하면서 이미 있었는지 결과를 알려준다.\n\n```text\nSADD processed:order-events event-123\n-> 1이면 처음 본 event\n-> 0이면 이미 처리한 event\n```\n\n이 membership check와 add가 Redis 단일 명령 안에서 일어나므로, 애플리케이션에서 `SISMEMBER` 후 `SADD`로 나누는 것보다 race가 적다.\n\n초보자에게 중요한 구분은 이것이다.\n\n```text\nSADD는 중복 진입을 줄이는 gate다.\n하지만 business side effect가 정확히 한 번 성공했는지는 별도 상태로 봐야 한다.\n```\n\n---\n\n## 어디에 잘 맞나\n\n| 요구 | SADD dedup이 잘 맞는 이유 |\n|---|---|\n| webhook event id 중복 수신 | 같은 id를 window 동안 한 번만 통과시킬 수 있다 |\n| 사용자 이벤트 참여 중복 방지 | membership 자체가 요구와 잘 맞는다 |\n| 알림 발송 요청 중복 억제 | 같은 notification request id를 짧게 기억할 수 있다 |\n| batch chunk 재시도 skip | 이미 본 item id를 window 동안 빠르게 거를 수 있다 |\n\n특히 “같은 id가 다시 오면 skip해도 되는가”가 분명한 경우에 단순하고 빠르다. 반대로 결제 승인, 예약 확정처럼 side effect 성공 여부를 복구해야 하는 흐름은 Redis Set만으로 부족하다.\n\n---\n\n## dedup window와 key 설계\n\nSet은 무한히 커지면 안 된다. 그래서 window를 정한다.\n\n```text\nprocessed:webhook:stripe:20260617\nprocessed:reservation-events:20260617T10\nprocessed:notification:campaign-42\n```\n\nkey를 날짜나 시간 bucket으로 나누고 TTL을 붙이면 오래된 dedup record를 자연스럽게 정리할 수 있다.\n\n```text\nSADD processed:webhook:stripe:20260617 evt_abc\nEXPIRE processed:webhook:stripe:20260617 172800\n```\n\n실무에서는 첫 생성 시에만 TTL을 붙이도록 Lua로 묶거나, key rotation을 운영 규칙으로 둔다. 매 요청마다 `EXPIRE`를 다시 걸면 window가 의도보다 계속 늘어날 수 있다.\n\n---\n\n## side effect 전후 기록 시점\n\n가장 위험한 부분은 `SADD`를 언제 하느냐다.\n\n| 선택 | 장점 | 위험 |\n|---|---|---|\n| side effect 전에 SADD | 동시 중복 실행을 빨리 막는다 | 이후 작업 실패 시 retry가 막힐 수 있다 |\n| side effect 후에 SADD | 성공한 것만 기록한다 | 성공 후 SADD 전에 crash하면 중복 side effect 가능 |\n| status store와 함께 사용 | PROCESSING/COMPLETED를 구분한다 | 구현이 idempotency store에 가까워진다 |\n\n그래서 단순 SADD dedup은 “중복을 줄이는 admission gate”로 생각하면 좋다. side effect가 비가역적이면 DB unique constraint, inbox table, idempotency key store, outbox/recovery를 같이 봐야 한다.\n\n---\n\n## 분산락보다 단순한 경우\n\n아래 요구라면 lock보다 `SADD`가 더 직접적일 수 있다.\n\n```text\n같은 event id를 여러 worker가 동시에 받는다.\n처음 통과한 worker 하나만 처리하면 된다.\n```\n\n이때 모든 worker가 분산락을 잡고 풀 필요 없이, 같은 set에 `SADD event_id`를 날려 반환값이 1인 worker만 진행하게 만들 수 있다.\n\n하지만 critical section이 길거나, 처리 중 상태를 관찰해야 하거나, 실패 후 takeover가 필요하면 단순 Set보다 lease/status model이 필요하다. `SADD`는 lock service가 아니라 membership update다.\n\n---\n\n## 흔한 오해\n\n- `SADD`로 dedup하면 exactly-once processing이 보장된다고 생각한다.\n- `SISMEMBER` 후 `SADD`로 나눠도 단일 `SADD`와 같다고 본다.\n- Set TTL/window 없이 모든 event id를 한 key에 계속 쌓는다.\n- side effect 실패와 crash recovery를 기록하지 않고 중복 skip만 구현한다.\n- 비가역 업무에도 Redis memory record만 믿고 DB unique constraint나 idempotency store를 생략한다.\n\n## 한 줄 정리\n\nRedis `SADD` dedup은 event id 같은 membership을 빠르게 한 번만 통과시키는 좋은 도구지만, window, TTL, side effect 기록 시점, recovery 요구를 분리해야 멱등 처리 설계로 이어진다.\n",
+  "aliases": [
+    "Redis SADD dedup",
+    "Redis Set idempotency",
+    "SADD 중복 제거",
+    "레디스 Set 멱등성",
+    "Redis event id dedup",
+    "SADD 반환값",
+    "processed event set",
+    "Redis duplicate suppression",
+    "Redis dedup window",
+    "SADD without lock",
+    "Redis idempotent consumer",
+    "Redis Set membership dedup"
+  ],
+  "expected_queries": [
+    "Redis SADD 반환값으로 event id 중복 처리를 하면 왜 별도 락 없이 dedup gate를 만들 수 있어?",
+    "Redis Set으로 webhook 중복 수신을 막을 때 dedup window와 TTL은 어떻게 잡아야 해?",
+    "SADD를 side effect 전에 기록하는 것과 처리 후 기록하는 것은 어떤 실패 모드가 달라?",
+    "SISMEMBER 후 SADD로 나누면 단일 SADD dedup보다 왜 race가 생길 수 있어?",
+    "Redis Set dedup은 idempotency key store나 DB unique constraint를 언제 대체하지 못해?"
+  ],
+  "symptoms": [
+    "SADD dedup을 exactly-once 처리 보장으로 과장한다.",
+    "SISMEMBER와 SADD를 따로 호출해 membership check와 add 사이 race를 만든다.",
+    "dedup key에 TTL이나 window를 두지 않아 Redis Set이 계속 커진다.",
+    "side effect 실패 후 재시도와 crash recovery를 Redis Set membership 하나로만 처리하려 한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-data-types-string-hash-list-set-zset-primer",
+      "system-design/redis-single-thread-atomic-commands-incr-primer",
+      "database/idempotency-key-and-deduplication"
+    ],
+    "next_docs": [
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "system-design/webhook-consumer-platform-design",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+    ],
+    "confusable_with": [
+      "system-design/redis-single-thread-atomic-commands-incr-primer",
+      "database/idempotency-key-and-deduplication",
+      "system-design/distributed-lock-design",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design"
+    ],
+    "forbidden_for_queries": [
+      "Kafka offset commit과 transactional sink로 exactly-once를 설명해줘",
+      "분산락에서 lease와 fencing token을 설계하는 법을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch57-stream-a-cache-coherence"
+      }
+    ]
+  }
+}

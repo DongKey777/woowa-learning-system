@@ -1,0 +1,68 @@
+{
+  "id": "system-design/local-vs-distributed-cache-l1-l2-primer",
+  "title": "Local vs Distributed Cache L1/L2 Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "L1 local cache는 각 애플리케이션 인스턴스 안의 매우 빠른 캐시이고, L2 distributed cache는 Redis처럼 여러 인스턴스가 공유하는 캐시다. 둘을 같이 쓰면 latency와 Redis 부하를 더 줄일 수 있지만, 같은 데이터 사본이 여러 곳에 생기므로 무효화, TTL, version, source of truth 경계를 반드시 정해야 한다.",
+  "body_markdown": "# Local vs Distributed Cache L1/L2 Primer\n\n> 한 줄 요약: L1은 애플리케이션 인스턴스 안의 local cache, L2는 Redis 같은 shared cache이며, 둘을 겹치면 빨라지지만 stale copy가 여러 계층에 생긴다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [Redis Basics](./redis-basics-in-memory-kv-single-thread-primer.md)\n- [Redis TTL과 키 만료 메커니즘 입문](./redis-ttl-key-expiration-mechanics-primer.md)\n- [Cache Invalidation Patterns Primer](./cache-invalidation-patterns-primer.md)\n- [Spring Cache Abstraction](../spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer.md)\n- [분산 캐시 설계](./distributed-cache-design.md)\n\nretrieval-anchor-keywords: local cache vs distributed cache, L1 L2 cache, two level cache, Caffeine Redis cache, JVM local cache, Redis shared cache, near cache basics, multi-level cache, 로컬 캐시 분산 캐시, L1 L2 캐시, Caffeine Redis 계층 캐시\n\n---\n\n## 먼저 잡는 그림\n\nL1/L2 캐시는 CPU 캐시 용어처럼 들리지만, 백엔드 서비스에서는 보통 아래 구조를 뜻한다.\n\n```text\nrequest\n  -> L1 local cache (각 app instance 안, 예: Caffeine)\n  -> L2 distributed cache (공유 Redis)\n  -> DB / API / 비싼 계산\n```\n\nL1은 네트워크를 타지 않아서 매우 빠르다. 대신 인스턴스마다 따로 존재하므로 A 서버의 L1과 B 서버의 L1이 서로 다른 값을 들고 있을 수 있다.\n\nL2는 Redis처럼 여러 인스턴스가 공유한다. L1보다는 느리지만 DB보다 빠르고, 여러 서버가 같은 cached value를 볼 수 있다.\n\n---\n\n## 왜 둘을 같이 쓰나\n\n| 계층 | 얻는 것 | 잃는 것 |\n|---|---|---|\n| L1 local cache | 가장 낮은 latency, Redis 호출 감소 | 인스턴스 간 불일치, 메모리 중복 |\n| L2 Redis cache | shared hot data, DB 보호 | 네트워크 비용, Redis 장애/부하 |\n| DB/source | 최종 진실, transaction/constraint | 가장 비싸고 느릴 수 있음 |\n\nL1/L2를 같이 쓰는 대표 이유는 hot read path다.\n\n- 권한 정책 snapshot을 매 요청마다 Redis에서 읽으면 Redis가 hot spot이 된다.\n- feature flag/config처럼 자주 읽고 가끔 바뀌는 값은 L1에 잠깐 올리면 latency가 안정된다.\n- Redis가 잠깐 느려져도 L1 TTL 안에서는 일부 read가 버틸 수 있다.\n\n하지만 이것은 성능 최적화이지 정합성 보장이 아니다. source of truth는 DB인지 Redis인지, 아니면 외부 control plane인지 먼저 정해야 한다.\n\n---\n\n## 첫 선택 기준\n\n| 상황 | 첫 선택 |\n|---|---|\n| 단일 인스턴스 학습/테스트 | L1 local cache만으로도 충분할 수 있다 |\n| 여러 인스턴스가 같은 값을 공유해야 함 | L2 Redis부터 본다 |\n| 매우 hot하고 stale을 짧게 허용 가능 | L1 + L2를 검토한다 |\n| write 직후 최신성이 중요함 | L1/L2보다 invalidation과 DB 검증을 먼저 본다 |\n| 결제, 재고 차감, 예약 확정 | 캐시는 보조 read path로 두고 최종 결정은 source에서 닫는다 |\n\n초보자가 자주 하는 실수는 Redis를 붙였으니 local cache도 자동으로 일관된다고 생각하는 것이다. 실제로는 L1에 남은 값을 지우거나 만료시키는 별도 경로가 필요하다.\n\n---\n\n## 쓰기 후 무효화 흐름\n\n가장 단순한 cache-aside 흐름은 이렇다.\n\n```text\nread:\n  L1 hit -> return\n  L1 miss -> L2 hit -> L1 fill -> return\n  L2 miss -> DB read -> L2 fill -> L1 fill -> return\n\nwrite:\n  DB commit\n  L2 delete/update\n  L1 delete or invalidate signal\n```\n\n여기서 어려운 지점은 마지막 줄이다. L2는 한 곳이라 지우기 쉽지만, L1은 모든 애플리케이션 인스턴스 안에 흩어져 있다. 그래서 보통 짧은 local TTL, Pub/Sub invalidation, versioned value를 조합한다.\n\n---\n\n## 운영에서 보는 지표\n\nL1/L2를 같이 쓰면 hit ratio도 한 개가 아니다.\n\n- L1 hit ratio\n- L2 hit ratio after L1 miss\n- DB fallback rate\n- stale read count 또는 rejected stale hit\n- invalidation event delay/drop\n- Redis latency/error rate\n- local cache memory usage와 eviction count\n\nL1 hit만 높고 stale complaint가 늘면 성능 숫자는 좋아 보여도 사용자 경험은 나빠진 것이다. 캐시는 latency 지표와 freshness 지표를 같이 봐야 한다.\n\n---\n\n## 흔한 오해\n\n- L1/L2를 두면 Redis와 DB가 자동으로 보호된다고 본다. invalidation 실패나 stampede가 있으면 오히려 장애 전파가 커질 수 있다.\n- local cache는 인스턴스별 복사본이라는 사실을 잊고, 여러 서버가 같은 값을 본다고 생각한다.\n- Redis가 있으니 source of truth도 Redis라고 착각한다. 캐시와 원천 경계를 먼저 정해야 한다.\n- TTL을 길게 늘리면 hit ratio는 좋아지지만 stale window도 길어진다는 점을 놓친다.\n\n## 한 줄 정리\n\nL1/L2 캐시는 local cache의 빠름과 Redis의 공유성을 함께 쓰는 구조지만, 값의 사본이 여러 곳에 생기므로 TTL, invalidation, version, source of truth를 명확히 해야 안전하다.\n",
+  "aliases": [
+    "local vs distributed cache",
+    "L1 L2 cache primer",
+    "local cache Redis L2",
+    "로컬 캐시 분산 캐시",
+    "L1 L2 캐시",
+    "Caffeine Redis two level",
+    "near cache basics",
+    "multi level cache",
+    "JVM cache Redis",
+    "local cache stale",
+    "캐시 계층 설계",
+    "two level cache"
+  ],
+  "expected_queries": [
+    "로컬 캐시와 Redis 분산 캐시를 L1/L2로 같이 쓰면 요청 흐름이 어떻게 돼?",
+    "Caffeine local cache와 Redis cache는 latency, 공유, 일관성 측면에서 어떻게 달라?",
+    "여러 인스턴스에서 local cache 값이 서로 달라질 수 있는 이유가 뭐야?",
+    "L1 cache hit ratio가 높은데 stale data가 늘면 어떤 지표를 같이 봐야 해?",
+    "L1/L2 cache를 쓸 때 DB commit 후 L2와 각 서버 L1을 어떻게 무효화해야 해?"
+  ],
+  "symptoms": [
+    "Redis를 붙이면 각 서버의 local cache도 자동으로 같은 값을 본다고 생각한다.",
+    "L1 hit ratio만 보고 stale window와 invalidation delay를 측정하지 않는다.",
+    "source of truth가 DB인지 Redis인지 정하지 않은 채 캐시 계층을 늘린다.",
+    "write 직후 최신성이 중요한 데이터에도 긴 local TTL을 그대로 둔다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer",
+      "system-design/redis-basics-in-memory-kv-single-thread-primer"
+    ],
+    "next_docs": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer",
+      "system-design/distributed-cache-design"
+    ],
+    "confusable_with": [
+      "system-design/cache-basics-primer",
+      "system-design/distributed-cache-design",
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer",
+      "system-design/cache-invalidation-patterns-primer"
+    ],
+    "forbidden_for_queries": [
+      "Redis Streams consumer group pending entries를 운영에서 어떻게 복구해?",
+      "Kafka consumer group rebalance와 offset commit 문제를 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch57-stream-a-cache-coherence"
+      }
+    ]
+  }
+}
