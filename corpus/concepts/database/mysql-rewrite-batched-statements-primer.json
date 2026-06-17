@@ -1,0 +1,68 @@
+{
+  "id": "database/mysql-rewrite-batched-statements-primer",
+  "title": "MySQL rewriteBatchedStatements Primer",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "MySQL Connector/J의 `rewriteBatchedStatements=true`는 JDBC batch로 모인 호환 가능한 INSERT/REPLACE를 더 큰 SQL로 재작성해 network round trip과 statement 실행 비용을 줄이는 드라이버 옵션이다. Hibernate batch가 켜져 있어도 이 옵션이 없으면 MySQL 경로에서 기대한 multi-row insert 효과가 작을 수 있다.",
+  "body_markdown": "# MySQL rewriteBatchedStatements Primer\n\n> 한 줄 요약: `rewriteBatchedStatements=true`는 MySQL JDBC driver가 compatible batch를 multi-value insert 등으로 재작성하게 하는 옵션이고, Hibernate batch와는 다른 레이어의 설정이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [JDBC 실전 코드 패턴](./jdbc-code-patterns.md)\n- [Hibernate JDBC Batch Size, Flush, Clear Primer](./hibernate-jdbc-batch-size-flush-clear-primer.md)\n- [JPA Batch Insert IDENTITY rewriteBatchedStatements Pitfall](./jpa-batch-insert-identity-rewritebatched-pitfall.md)\n- [Connection Pool, Transaction Propagation, Bulk Write](./connection-pool-transaction-propagation-bulk-write.md)\n- [Query Tuning Checklist](./query-tuning-checklist.md)\n\nretrieval-anchor-keywords: MySQL rewriteBatchedStatements, rewrite batched statements, Connector/J batch rewrite, JDBC executeBatch MySQL, multi value insert JDBC, MySQL batch insert performance, addBatch executeBatch rewrite, MySQL 드라이버 배치 재작성, rewriteBatchedStatements true, JPA MySQL batch insert\n\n---\n\n## 레이어를 먼저 나누기\n\nJPA batch insert는 여러 층이 맞아야 효과가 난다.\n\n```text\nJPA/Hibernate: statement를 batch로 모을 수 있는가\nJDBC driver: executeBatch를 어떻게 wire protocol/SQL로 보낼 것인가\nMySQL server: 받은 insert를 어떻게 실행할 것인가\n```\n\n`rewriteBatchedStatements=true`는 두 번째 층, 즉 MySQL Connector/J 드라이버 옵션이다. Hibernate의 `hibernate.jdbc.batch_size`와 같은 설정이 아니다.\n\n---\n\n## 무엇을 바꾸나\n\n드라이버가 batch를 재작성할 수 있으면 아래처럼 같은 insert들이 더 큰 문장으로 합쳐질 수 있다.\n\n```text\nINSERT INTO item(name, price) VALUES (?, ?)\nINSERT INTO item(name, price) VALUES (?, ?)\nINSERT INTO item(name, price) VALUES (?, ?)\n```\n\n재작성 후 감각은 아래에 가깝다.\n\n```sql\nINSERT INTO item(name, price)\nVALUES (?, ?), (?, ?), (?, ?)\n```\n\n이렇게 되면 DB 왕복과 statement 실행 오버헤드가 줄어든다. 특히 많은 단순 insert를 넣는 작업에서 차이가 크다.\n\n---\n\n## 설정 위치\n\nJDBC URL에 보통 아래처럼 붙인다.\n\n```properties\nspring.datasource.url=jdbc:mysql://localhost:3306/app?rewriteBatchedStatements=true\n```\n\n다른 URL 옵션과 함께 쓸 때는 `&`로 이어 붙인다.\n\n```text\njdbc:mysql://host:3306/app?rewriteBatchedStatements=true&cachePrepStmts=true\n```\n\n중요한 것은 이 옵션이 애플리케이션 코드의 `addBatch()`/`executeBatch()` 또는 Hibernate batching 위에서 동작한다는 점이다. batch 자체가 만들어지지 않으면 rewrite할 것도 없다.\n\n---\n\n## 언제 효과가 작나\n\n| 상황 | 이유 |\n|---|---|\n| Hibernate가 batch를 만들지 못함 | driver rewrite 전에 모인 batch가 없다 |\n| SQL shape가 서로 다름 | 재작성 가능한 같은 문장으로 묶기 어렵다 |\n| batch size가 너무 작음 | 왕복 절감 효과가 작다 |\n| generated keys를 즉시 row마다 요구함 | driver와 ORM이 더 보수적으로 동작할 수 있다 |\n| packet이 너무 커짐 | `max_allowed_packet` 같은 한계와 실패 범위가 커진다 |\n\n이 옵션은 성능 스위치이지 correctness 스위치가 아니다. 실패 시 어느 row가 문제였는지, generated key를 어떻게 받을지, 중복키 처리와 row count가 어떻게 보이는지는 드라이버/DB 조합을 실제로 확인해야 한다.\n\n---\n\n## 관측 방법\n\n`rewriteBatchedStatements`가 효과를 냈는지 확인할 때는 단순 SQL 문자열보다 아래를 같이 본다.\n\n- rows/sec 처리량\n- datasource-proxy나 p6spy의 batch 실행 수\n- MySQL general log 또는 performance_schema에서 실제 문장 모양\n- network round trip 감소\n- DB CPU/redo/index maintenance 비용\n- 실패 시 batch update counts와 예외 정보\n\n성능이 그대로라면 드라이버 옵션이 빠진 것만 보지 말고, Hibernate가 애초에 batch를 만들었는지, IDENTITY generator가 막고 있는지, chunk가 너무 작은지, index/constraint 비용이 병목인지 같이 봐야 한다.\n\n---\n\n## 흔한 오해\n\n- `rewriteBatchedStatements=true`만 붙이면 JPA `saveAll`이 자동으로 batch가 된다고 생각한다.\n- Hibernate `batch_size`와 MySQL driver rewrite를 같은 설정으로 본다.\n- SQL 로그에 insert가 여러 줄 찍히면 무조건 rewrite가 안 된 것이라고 판단한다.\n- 큰 multi-row insert가 항상 안전하다고 본다. packet 크기, rollback 범위, error granularity가 커진다.\n- generated key가 필요한 insert에서도 항상 같은 방식으로 재작성된다고 단정한다.\n\n## 한 줄 정리\n\n`rewriteBatchedStatements=true`는 MySQL JDBC driver가 이미 만들어진 compatible batch를 더 효율적인 SQL로 재작성하게 하는 옵션이며, Hibernate batch 설정과 ID 생성 전략까지 같이 맞아야 기대한 insert 성능이 나온다.\n",
+  "aliases": [
+    "MySQL rewriteBatchedStatements",
+    "rewriteBatchedStatements true",
+    "rewrite batched statements",
+    "Connector/J batch rewrite",
+    "JDBC executeBatch MySQL",
+    "MySQL batch insert",
+    "multi value insert JDBC",
+    "addBatch executeBatch rewrite",
+    "MySQL 드라이버 배치",
+    "JPA MySQL batch",
+    "MySQL 배치 인서트",
+    "배치 재작성 옵션"
+  ],
+  "expected_queries": [
+    "MySQL rewriteBatchedStatements=true는 JDBC executeBatch를 어떻게 multi value insert로 바꿔줘?",
+    "Hibernate batch_size와 MySQL rewriteBatchedStatements는 서로 다른 레이어 설정이야?",
+    "JPA batch insert가 느릴 때 MySQL JDBC URL에 rewriteBatchedStatements를 왜 확인해야 해?",
+    "rewriteBatchedStatements를 켜도 효과가 작을 수 있는 generated keys나 SQL shape 조건은 뭐야?",
+    "MySQL batch insert가 실제로 rewrite됐는지 어떤 로그와 지표로 확인해야 해?"
+  ],
+  "symptoms": [
+    "hibernate.jdbc.batch_size와 rewriteBatchedStatements를 같은 설정으로 이해한다.",
+    "JDBC driver rewrite만 켜면 ORM batching 조건과 상관없이 multi-row insert가 된다고 생각한다.",
+    "batch size를 키운 뒤 packet 크기, 실패 범위, generated key 동작을 확인하지 않는다.",
+    "SQL 로그 한 줄만 보고 실제 batch rewrite 여부와 처리량을 단정한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/jdbc-code-patterns",
+      "database/hibernate-jdbc-batch-size-flush-clear-primer"
+    ],
+    "next_docs": [
+      "database/jpa-batch-insert-identity-rewritebatched-pitfall",
+      "database/connection-pool-transaction-propagation-bulk-write",
+      "database/query-tuning-checklist"
+    ],
+    "confusable_with": [
+      "database/hibernate-jdbc-batch-size-flush-clear-primer",
+      "database/jdbc-code-patterns",
+      "database/query-tuning-checklist",
+      "database/connection-pool-transaction-propagation-bulk-write"
+    ],
+    "forbidden_for_queries": [
+      "JPA N+1 query를 fetch join과 EntityGraph로 해결해줘",
+      "MySQL duplicate key 1062를 busy retryable already exists로 분류해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch58-stream-a-jpa-mysql-batch"
+      }
+    ]
+  }
+}
