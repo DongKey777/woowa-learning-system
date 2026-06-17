@@ -1,0 +1,69 @@
+{
+  "id": "security/aws-iam-console-permission-denied-primer",
+  "title": "AWS IAM 권한 오류와 Console Permission Denied Primer",
+  "category": "security",
+  "level": "beginner",
+  "summary": "AWS 콘솔이나 CLI에서 `User is not authorized to perform ... because no identity-based policy allows ...`가 나올 때, 이것이 EC2 인스턴스 장애가 아니라 현재 IAM user/role에 해당 AWS API action 권한이 없다는 신호임을 action, resource, policy 기준으로 읽는 입문 문서다.",
+  "body_markdown": "# AWS IAM 권한 오류와 Console Permission Denied Primer\n\n> 한 줄 요약: AWS의 `not authorized to perform` 메시지는 대부분 서비스가 고장났다는 뜻이 아니라, 지금 로그인한 IAM identity가 그 AWS API action을 호출할 권한이 없다는 뜻이다.\n\n**난이도: Beginner**\n\n관련 문서:\n\n- [AWS EC2, RDS, S3, IAM, VPC 백엔드 입문 지도](../system-design/aws-ec2-rds-s3-iam-vpc-backend-primer.md)\n- [인증과 인가의 차이](./authentication-vs-authorization.md)\n- [Role Permission Resource AuthZ Chooser](./role-permission-resource-authz-chooser.md)\n- [EC2 퍼블릭 IP와 보안 그룹 SSH 접속 기초](../network/ec2-public-ip-security-group-ssh-primer.md)\n\nretrieval-anchor-keywords: AWS IAM not authorized to perform, identity-based policy allows, compute-optimizer GetEnrollmentStatus, IAM permission denied console, AWS AccessDenied beginner, IAM user role policy action resource, AWS 콘솔 권한 오류, AWS 권한 없음, compute optimizer 권한 없음, IAM policy action resource 읽기\n\n## 먼저 오류 문장을 쪼개서 읽는다\n\n초보자가 가장 많이 헷갈리는 지점은 AWS 콘솔 오른쪽에 뜬 권한 오류를 보고 EC2 서버 자체가 잘못됐다고 생각하는 것이다. 예를 들어 이런 메시지가 보일 수 있다.\n\n```text\nUser: arn:aws:iam::843255971531:user/DongKey777 is not authorized to perform: compute-optimizer:GetEnrollmentStatus on resource: * because no identity-based policy allows the compute-optimizer:GetEnrollmentStatus action\n```\n\n이 문장은 긴데, 실제로는 네 조각이다.\n\n| 조각 | 의미 | 이 예시에서 읽는 값 |\n|---|---|---|\n| `User: ...` | 지금 로그인한 AWS identity | IAM user `DongKey777` |\n| `not authorized to perform` | 이 action을 호출할 권한이 없다 | 인증은 됐지만 인가가 실패했다 |\n| `compute-optimizer:GetEnrollmentStatus` | 막힌 AWS API action | Compute Optimizer 등록 상태 조회 |\n| `because no identity-based policy allows ...` | user/group/role에 허용 policy가 없다 | policy를 붙이거나 관리자에게 요청해야 한다 |\n\n핵심은 `running EC2 instance`와 `AWS API 호출 권한`을 분리하는 것이다. EC2 인스턴스가 실행 중이고 public IP가 보이며 SSH도 될 수 있다. 동시에 콘솔의 어떤 위젯은 Compute Optimizer 조회 권한이 없어서 실패할 수 있다. 둘은 같은 문제가 아니다.\n\n## 인증 성공과 권한 허용은 다르다\n\nAWS 콘솔에 로그인했다는 것은 `누구인지 확인됨`에 가깝다. 하지만 로그인한 사용자가 모든 AWS action을 할 수 있다는 뜻은 아니다. IAM은 identity마다 허용된 action과 resource를 policy로 계산한다.\n\n| 구분 | 질문 | AWS에서 보는 장면 |\n|---|---|---|\n| Authentication | 너는 누구인가? | IAM user/password, MFA, federation login |\n| Authorization | 이 action을 해도 되는가? | identity-based policy, resource policy, explicit deny |\n| Application auth | 우리 서비스 사용자가 무엇을 할 수 있나? | Spring Security, session, JWT, DB role |\n\n그래서 AWS IAM 오류와 Spring API의 `403 Forbidden`은 모양은 비슷해도 위치가 다르다. `compute-optimizer:GetEnrollmentStatus`가 막힌 것은 AWS control plane 권한이고, `/admin/reservations`가 막힌 것은 우리 애플리케이션 권한이다.\n\n## 콘솔 위젯 오류인지, 실제 작업 차단인지 먼저 나눈다\n\nAWS 콘솔은 한 화면을 그리면서 여러 서비스의 API를 같이 부른다. EC2 상세 화면을 열었는데 Compute Optimizer 권한 오류가 보이는 경우, 그 오류는 인스턴스 조회 자체가 아니라 추천/분석 위젯 조회일 수 있다.\n\n| 보이는 오류 | 먼저 판단할 것 | 사용자가 할 다음 행동 |\n|---|---|---|\n| `compute-optimizer:GetEnrollmentStatus` 권한 없음 | 비용/성능 추천 상태 조회 권한 문제 | EC2 생성, SSH, public IP 확인과 분리해서 본다 |\n| `ec2:RunInstances` 권한 없음 | 인스턴스 생성 action 자체가 막힘 | 실습 권한 범위나 region, 계정 정책을 관리자에게 확인한다 |\n| `ec2:TerminateInstances` 권한 없음 | 삭제 action이 막힘 | 수업 계정이면 중지 후 이름을 `delete-me`로 바꾸는 정책일 수 있다 |\n| `iam:PassRole` 권한 없음 | role을 AWS 서비스에 넘기는 권한이 없음 | role attachment가 필요한 작업인지 관리자에게 확인한다 |\n| `s3:PutObject` 권한 없음 | 앱이나 CLI가 S3 object 쓰기 권한이 없음 | EC2 role 또는 IAM policy의 S3 action/resource를 본다 |\n\n이렇게 나누면 불필요한 방향으로 헤매지 않는다. Compute Optimizer 위젯이 실패했다고 보안 그룹을 열거나 Spring Boot를 재시작하는 것은 원인과 맞지 않는다. 반대로 `ec2:RunInstances`가 막혔다면 EC2 생성 작업 자체가 policy 밖이라는 뜻이므로 사용자 쪽에서 쉘 명령으로 해결할 문제가 아니다.\n\n## policy 문장을 action과 resource로 읽는다\n\nIAM policy는 대략 `누가`, `어떤 action을`, `어떤 resource에`, `허용/거부하는가`를 정한다. 초급 단계에서는 JSON 문법을 모두 외우기보다 action 이름을 정확히 복사해서 보는 것이 먼저다.\n\n예를 들어 메시지에 `compute-optimizer:GetEnrollmentStatus`가 나오면 필요한 것은 Compute Optimizer enrollment status 조회 권한이다. `ec2:DescribeInstances`가 나오면 EC2 인스턴스 조회 권한이다. `s3:GetObject`가 나오면 특정 bucket/object 읽기 권한이다.\n\n| action 모양 | 대략의 의미 | 초보자가 조심할 점 |\n|---|---|---|\n| `ec2:Describe*` | EC2 조회 | 조회 권한과 생성/삭제 권한은 다르다 |\n| `ec2:RunInstances` | EC2 생성 | key pair, subnet, security group 선택이 권한으로 막힐 수 있다 |\n| `ec2:TerminateInstances` | EC2 삭제 | 교육 계정은 의도적으로 막아 둘 수 있다 |\n| `compute-optimizer:GetEnrollmentStatus` | 추천 기능 상태 조회 | EC2 실행 여부와 직접 관련 없는 콘솔 보조 기능일 수 있다 |\n| `iam:PassRole` | role을 서비스에 넘김 | 권한 상승 위험이 있어 별도 제어가 많다 |\n| `s3:PutObject` | S3 object 쓰기 | bucket ARN과 object ARN 범위를 같이 본다 |\n\n`resource: *`는 모든 리소스라는 뜻일 수 있지만, 항상 위험한 허용을 의미하는 것은 아니다. 어떤 action은 리소스 단위 제어가 제한되어 `*`를 쓰는 경우도 있다. 초급자가 직접 판단하기 어렵다면 action과 resource를 그대로 복사해서 관리자에게 전달하는 편이 가장 빠르다.\n\n## 수업용 AWS 계정에서는 제한이 정상일 수 있다\n\n교육용 계정이나 회사 계정은 모든 권한을 열어 두지 않는다. 비용 폭주, 리소스 삭제, 권한 상승을 막기 위해 일부 action은 의도적으로 막힌다.\n\n예를 들어 다음 정책은 학습 환경에서 흔하다.\n\n- EC2 생성은 허용하지만 삭제는 제한한다.\n- 특정 VPC, subnet, security group만 쓰게 한다.\n- IAM role 생성이나 policy 변경은 막는다.\n- Compute Optimizer, Cost Explorer, 일부 계정 설정 조회는 막혀 있을 수 있다.\n\n그래서 권한 오류가 보인다고 바로 우회하려고 하면 안 된다. 먼저 `내가 하려는 실습의 핵심 action이 막혔는가`, 아니면 `화면의 부가 기능 조회가 막혔는가`를 본다. EC2가 실행 중이고 SSH 접속 정보가 정상이라면 Compute Optimizer 권한 오류는 실습 진행을 막지 않을 수 있다.\n\n## 디버깅 절차\n\n권한 오류를 만나면 아래 순서로 읽는다.\n\n1. 오류 전체를 복사한다.\n2. `User` 또는 `Role` ARN에서 현재 identity를 확인한다.\n3. `not authorized to perform:` 뒤 action을 확인한다.\n4. `on resource:` 뒤 resource 범위를 확인한다.\n5. `explicit deny`인지 `no identity-based policy allows`인지 본다.\n6. 내가 하려던 핵심 작업인지 콘솔 부가 기능인지 분리한다.\n7. 핵심 작업이면 관리자에게 action/resource를 그대로 전달한다.\n\n`explicit deny`가 있으면 허용 policy를 추가해도 deny가 우선할 수 있다. `no identity-based policy allows`는 보통 허용 policy가 없다는 뜻이다. 둘 다 초보자가 콘솔에서 임의로 고칠 수 없는 경우가 많다.\n\n## 흔한 오해와 교정\n\n- `AWS에 로그인했으니 모든 EC2 작업이 가능하다` -> 아니다. 로그인은 인증이고, 각 action은 IAM policy로 별도 허용되어야 한다.\n- `Compute Optimizer 권한 오류가 떴으니 EC2가 망가졌다` -> 아니다. 추천 상태 조회 위젯 권한일 수 있다.\n- `403처럼 보이면 Spring Security 문제다` -> AWS 콘솔/CLI에서 난 오류면 IAM부터 본다.\n- `보안 그룹을 열면 IAM 오류가 풀린다` -> 아니다. 보안 그룹은 네트워크 경로이고 IAM은 AWS API 권한이다.\n- `권한 오류는 access key를 새로 만들면 해결된다` -> 새 자격 증명을 만들어도 그 identity에 policy가 없으면 똑같이 막힌다.\n\n## 꼬리질문\n\n> Q: `not authorized to perform: compute-optimizer:GetEnrollmentStatus`가 보이면 EC2 SSH 접속도 실패한다는 뜻인가요?\n> 의도: 콘솔 부가 API 권한과 인스턴스 네트워크 접속을 분리한다.\n> 핵심: 아니다. Compute Optimizer 조회 권한 문제일 수 있고, SSH는 public IP, security group, key pair를 따로 본다.\n\n> Q: `no identity-based policy allows`와 `explicit deny`는 어떻게 다른가요?\n> 의도: IAM 실패 이유를 처음부터 두 갈래로 읽는다.\n> 핵심: 전자는 허용 policy가 없다는 뜻이고, 후자는 deny 규칙이 우선 적용된다는 뜻이다.\n\n> Q: AWS IAM role과 우리 서비스 admin role은 같은 role인가요?\n> 의도: AWS control plane 권한과 애플리케이션 권한을 분리한다.\n> 핵심: 아니다. IAM role은 AWS API 호출 권한이고, 서비스 admin은 앱 내부 인가 모델이다.\n\n## 한 줄 정리\n\nAWS 권한 오류는 `identity`, `action`, `resource`, `deny reason`을 읽는 문제다. EC2 서버 상태, 보안 그룹, Spring Security와 섞지 말고 어느 층의 권한 실패인지 먼저 가르면 된다.\n",
+  "aliases": [
+    "AWS IAM 권한 오류",
+    "AWS 권한 없음",
+    "not authorized to perform",
+    "identity-based policy allows",
+    "compute-optimizer GetEnrollmentStatus",
+    "Compute Optimizer 권한",
+    "AWS console permission denied",
+    "AWS AccessDenied",
+    "IAM policy action resource",
+    "IAM user role policy",
+    "ec2 terminate 권한 없음",
+    "iam PassRole 권한"
+  ],
+  "expected_queries": [
+    "AWS 콘솔에서 User is not authorized to perform 라고 뜨면 EC2가 잘못된 거야?",
+    "compute-optimizer:GetEnrollmentStatus 권한 오류는 인스턴스 실행이랑 무슨 관계야?",
+    "because no identity-based policy allows 라는 문장을 IAM action resource 기준으로 읽는 법 알려줘",
+    "EC2 삭제 권한이 없을 때 수업 계정 정책인지 내 설정 문제인지 어떻게 구분해?",
+    "AWS IAM 권한 오류랑 Spring API 403 Forbidden은 어떤 층이 다른 거야?",
+    "iam:PassRole이나 ec2:RunInstances not authorized가 나오면 관리자에게 뭘 전달해야 해?"
+  ],
+  "symptoms": [
+    "AWS 콘솔 위젯 권한 오류를 EC2 인스턴스 장애로 오해한다",
+    "AWS IAM role과 애플리케이션 사용자 role을 같은 권한 체계로 섞는다",
+    "보안 그룹이나 SSH 설정으로 IAM authorization 실패를 고치려 한다",
+    "오류 메시지에서 action과 resource를 복사하지 않고 권한 없다는 말만 전달한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/aws-ec2-rds-s3-iam-vpc-backend-primer",
+      "security/authentication-vs-authorization"
+    ],
+    "next_docs": [
+      "security/role-permission-resource-authz-chooser",
+      "security/secrets-management-basics",
+      "network/ec2-public-ip-security-group-ssh-primer"
+    ],
+    "confusable_with": [
+      "system-design/aws-ec2-rds-s3-iam-vpc-backend-primer",
+      "security/authentication-vs-authorization",
+      "network/ec2-public-ip-security-group-ssh-primer"
+    ],
+    "forbidden_for_queries": [
+      "Spring Security 401 403 404 응답 코드만 묻는 질문",
+      "EC2 SSH timeout 또는 public IP 없음만 묻는 질문",
+      "보안 그룹 inbound port 설정만 묻는 질문"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "note": "batch19 beginner AWS IAM console permission gap fill"
+      }
+    ]
+  }
+}
