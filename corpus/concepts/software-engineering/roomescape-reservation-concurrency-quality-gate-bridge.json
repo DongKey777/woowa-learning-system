@@ -6,9 +6,18 @@
   "summary": "roomescape 예약 동시성 품질은 predicate, DB 보호선, transaction, 테스트 증거, latency 지표가 함께 있어야 한다.",
   "body_markdown": "    # Roomescape Reservation Concurrency Quality Gate Bridge\n\n    ## 이 문서가 맡는 질문\n    roomescape 예약 중복 방지에서 predicate, lock, transaction, test evidence를 품질 gate로 묶는 mission bridge다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    도메인 불변식, DB 제약/락, transaction boundary, 동시성 테스트, 운영 지표를 한 묶음으로 본다.\n\n    ## 실전 시나리오\n    예약 시간이 겹치면 안 된다는 규칙을 service if문으로만 막았더니 동시 요청에서 둘 다 성공한다. 리뷰는 코드 스타일보다 품질 gate 부재를 지적한 것이다.\n\n    ## CS 배경\n    동시성 품질은 단위 테스트 하나로 보장되지 않는다. predicate가 DB에서 원자적으로 보호되는지, transaction isolation이 phantom을 막는지, 실패를 어떤 사용자 언어로 돌려주는지가 함께 필요하다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - 예약 overlap predicate는 한 곳에서 정의되어야 한다\n- 동시 write는 DB constraint/lock/serializable 중 하나로 닫아야 한다\n- 실패 응답은 busy/already exists/retryable을 구분해야 한다\n- 품질 gate는 재현 가능한 동시성 테스트와 지표를 포함한다\n\n    ## 판단 매트릭스\n    - 단일 slot이면 unique/constraint\n- 범위 overlap이면 exclusion/guard row/serializable\n- 리뷰 품질이면 test evidence\n- 운영 품질이면 conflict/deadlock/latency metric\n\n    ## 예시\n    ```text\n    two POST /reservations same room/time -> one commits, one returns domain conflict with evidence test\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    미션 concurrency는 구현 트릭이 아니라 품질 gate로 증명해야 한다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 same slot race, adjacent slot non-overlap, retry after conflict, deadlock order, rollback response mapping를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. conflict rate, lock duration, transaction length, index selectivity를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. reservation create p95, lock wait p99, conflict response time, retry backoff latency가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    overlap_violation_count, lock_wait_p99_ms, reservation_create_p95_ms, conflict_rate, deadlock_count를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - service에서 먼저 조회하면 중복 예약이 막힌다고 생각한다\n- 동시성 테스트 없이 local sequential test만으로 품질 gate를 통과했다고 본다\n- DB lock을 쓰면 사용자 응답 언어는 아무렇게나 해도 된다고 본다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    roomescape 예약 동시성 품질은 predicate, DB 보호선, transaction, 테스트 증거, latency 지표가 함께 있어야 한다.\n",
   "aliases": [
-    "Roomescape Reservation Concurrency Quality Gate Bridge",
-    "roomescape reservation concurrency quality gate overlap predicate lock transaction test evidence latency bridge",
-    "roomescape 예약 중복 방지는 어떤 품질 gate와 동시성 테스트로 증명해야 해?"
+    "룸이스케이프 예약 중복 방지",
+    "룸이스케이프 예약중복 방지",
+    "예약 동시성 테스트 증거",
+    "예약동시성 테스트 증거",
+    "동시에 예약하면 둘 다 성공해요",
+    "같은 시간 예약 중복됨",
+    "예약 겹침 조건 어디서 막아",
+    "예약 overlap predicate",
+    "예약 락 품질 게이트",
+    "예약 중복 DB 제약 필요해",
+    "예약 동시 요청 검증",
+    "예약 충돌 응답 설계"
   ],
   "expected_queries": [
     "roomescape 예약 중복 방지는 어떤 품질 gate와 동시성 테스트로 증명해야 해?",
