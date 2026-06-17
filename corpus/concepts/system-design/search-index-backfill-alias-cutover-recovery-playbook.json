@@ -1,0 +1,61 @@
+{
+  "id": "system-design/search-index-backfill-alias-cutover-recovery-playbook",
+  "title": "Search Index Backfill Alias Cutover Recovery Playbook",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "검색 index schema나 analyzer 변경 시 새 index를 backfill하고, live delta를 따라잡고, alias cutover로 전환하며, rollback과 validation을 준비하는 운영 playbook이다.",
+  "body_markdown": "# Search Index Backfill Alias Cutover Recovery Playbook\n\n## 한 줄 요약\n\n검색 index를 크게 바꿀 때는 기존 index를 직접 덮어쓰기보다 새 index를 만들고 backfill, live delta catch-up, 검증, alias swap, rollback 계획을 거쳐 cutover하는 편이 안전하다.\n\n## 왜 alias cutover가 필요한가\n\n검색 index는 schema, analyzer, mapping 변경에 민감하다. 기존 index를 in-place로 바꾸기 어렵거나 위험한 경우가 많다. 새 index version을 만들어 데이터를 채우고 검증한 뒤, read alias를 새 index로 바꾸면 전환 순간을 작게 만들 수 있다.\n\n```text\nproducts_v1 <- read alias: products_current\nproducts_v2 <- backfill + live delta catch-up\nvalidate v1/v2\nalias swap: products_current -> products_v2\nrollback: products_current -> products_v1\n```\n\nAlias cutover는 zero-downtime에 가까운 전환을 돕지만, 데이터 품질과 live delta 정합성을 자동으로 보장하지는 않는다.\n\n## 단계별 runbook\n\n1. 새 index schema와 analyzer를 정의한다.\n2. `products_v2` 같은 versioned index를 만든다.\n3. Source of truth에서 historical backfill을 실행한다.\n4. Backfill 중 들어온 live write delta를 별도 cursor로 따라잡는다.\n5. Count, checksum, sampled query, top-k diff로 old/new를 검증한다.\n6. Tombstone/delete event가 새 index에 반영됐는지 확인한다.\n7. Read alias를 새 index로 atomically swap한다.\n8. Error, empty result, latency, click metric을 관찰한다.\n9. 문제가 있으면 alias를 old index로 rollback한다.\n10. 충분한 soak 후 old index를 제거한다.\n\n## backfill과 live delta\n\nBackfill은 과거 전체 데이터를 채우는 작업이고, live delta는 backfill 중 발생한 변경을 반영하는 작업이다. 이 둘 사이에 gap이 생기면 cutover 직후 새 index가 stale하거나 누락된 문서를 보여줄 수 있다.\n\n대응:\n\n- backfill start cursor와 end cursor를 기록한다.\n- live update stream offset이나 watermark를 추적한다.\n- cutover 전 새 index가 target watermark까지 따라잡았는지 확인한다.\n- delete/tombstone event를 upsert보다 더 조심한다.\n\n## 검증 방법\n\n| 검증 | 보는 것 | 한계 |\n|---|---|---|\n| document count | 전체 수 차이 | field quality와 ranking 차이는 모름 |\n| checksum/hash | source와 index 필드 일치 | analyzer 결과와 ranking은 별도 |\n| sampled query diff | 검색 결과 품질 | 샘플 편향 가능 |\n| top-k overlap | 사용자 체감 ranking 변화 | 의도된 ranking 변경과 구분 필요 |\n| tombstone replay check | 삭제 문서 노출 방지 | late delete event 누락 가능 |\n| shadow read | 실제 query에서 old/new 비교 | 비용과 latency 증가 |\n\n검색 index cutover는 count가 맞는다고 끝나지 않는다. Analyzer 변경은 ranking과 recall을 바꾸므로 top-k 품질 검증이 필요하다.\n\n## rollback 준비\n\nAlias swap은 빠르게 rollback할 수 있어야 한다. 하지만 rollback도 공짜가 아니다. 새 index로 전환한 뒤 write가 계속 들어왔다면 old index가 뒤처질 수 있다. 그래서 일정 시간 dual-write나 delta replay 경로를 유지하거나, rollback 가능 window를 명확히 정해야 한다.\n\nRollback checklist:\n\n- old index가 아직 삭제되지 않았는가?\n- old index도 live delta를 계속 받고 있는가?\n- alias rollback이 client cache와 routing에 반영되는가?\n- 새 index에서 생성한 side effect나 cache를 되돌릴 필요가 있는가?\n- rollback 후 재시도할 backfill checkpoint가 남아 있는가?\n\n## 흔한 오해\n\n- \"alias swap만 하면 zero downtime이다\": 데이터 검증, live delta catch-up, client cache까지 봐야 한다.\n- \"backfill count가 맞으면 안전하다\": ranking, analyzer, tombstone, field mismatch는 count로 잡히지 않는다.\n- \"새 index가 문제면 old index로 바로 돌아가면 된다\": old index가 live delta를 놓치면 rollback도 stale하다.\n- \"delete는 upsert와 같다\": tombstone 누락은 삭제된 문서 노출로 이어질 수 있어 더 위험하다.\n- \"reindex는 운영 트래픽과 무관하다\": source DB scan과 index merge가 live traffic을 압박할 수 있다.\n\n## 운영 지표\n\n- backfill progress and lag\n- live delta watermark gap\n- old/new document count diff\n- sampled query top-k overlap\n- tombstone replay count\n- indexing error and DLQ count\n- alias swap timestamp and rollback readiness\n- search latency before/after cutover\n- empty result rate and click-through change\n\n## 면접 답변 축\n\n검색 reindex/cutover 질문에는 \"새 versioned index를 만들고 historical backfill과 live delta catch-up을 끝낸 뒤, count/checksum/query diff/tombstone 검증을 거쳐 alias를 swap한다\"고 답한다. 이어서 old index를 rollback window 동안 유지하고, rollback 가능한 상태로 live delta를 관리한다고 말하면 된다.\n\n## Safe Next Docs\n\n검색 indexing 큰그림은 `search-indexing-pipeline-design`, derived read model rebuild는 `read-model-rebuild-backfill-playbook`, stale hit 보정은 `search-hit-overlay-pattern`, projection lag UX는 `projection-lag-user-facing-state-router`로 이어진다.\n",
+  "aliases": [
+    "search index alias cutover",
+    "검색 인덱스 백필",
+    "reindex alias swap",
+    "blue green search index",
+    "검색 alias rollback",
+    "live delta catch up",
+    "tombstone replay",
+    "검색 재색인",
+    "old new index diff",
+    "index cutover validation"
+  ],
+  "expected_queries": [
+    "검색 index schema가 바뀔 때 새 index를 backfill하고 alias cutover하는 절차를 설명해줘",
+    "search reindex 중 live write delta를 놓치지 않으려면 어떤 watermark를 봐야 해?",
+    "검색 alias swap 전에 old/new index count와 top-k diff를 어떻게 검증해?",
+    "새 검색 index로 전환했다가 문제가 생기면 rollback이 가능하려면 무엇을 유지해야 해?",
+    "검색 backfill에서 tombstone delete event를 따로 확인해야 하는 이유가 뭐야?",
+    "blue green search index cutover에서 alias swap만으로 충분하지 않은 이유를 알려줘"
+  ],
+  "symptoms": [
+    "새 search index cutover 후 최근 수정 문서가 검색되지 않는다",
+    "count는 맞는데 ranking과 top-k 결과가 크게 달라졌다",
+    "rollback하려고 보니 old index가 live delta를 받지 않아 stale하다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/search-indexing-pipeline-design",
+      "system-design/read-model-rebuild-backfill-playbook"
+    ],
+    "next_docs": [
+      "system-design/search-hit-overlay-pattern",
+      "system-design/projection-lag-user-facing-state-router",
+      "system-design/historical-backfill-replay-platform-design"
+    ],
+    "confusable_with": [
+      "system-design/search-indexing-pipeline-design",
+      "system-design/read-model-rebuild-backfill-playbook",
+      "system-design/search-hit-overlay-pattern"
+    ],
+    "forbidden_for_queries": [
+      "검색 query를 shard로 routing하고 top-k merge하는 방법을 설명해줘",
+      "검색 fanout p99와 slowest shard를 어떻게 줄여?"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/search-index-backfill-alias-cutover-recovery-playbook.md",
+    "revision_history": []
+  }
+}
