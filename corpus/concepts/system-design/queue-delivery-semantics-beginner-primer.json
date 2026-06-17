@@ -7,14 +7,23 @@
   "body_markdown": "# Queue Delivery Semantics Beginner Primer\n\n## 한 줄 요약\n\n큐는 비동기 처리를 돕지만 중복, 누락, 순서 문제를 자동으로 없애지 않는다. delivery semantics는 \"장애와 재시도 상황에서 메시지가 어떻게 보일 수 있는가\"를 말한다.\n\n## 운영 증상\n\n| 증상 | 먼저 의심할 것 | 확인할 증거 |\n|---|---|---|\n| 같은 메시지가 두 번 처리됨 | at-least-once 재전달, ack 전 consumer crash | event id, delivery attempt, ack log |\n| 메시지가 사라진 것처럼 보임 | at-most-once ack 순서, publish 실패, DLQ 방치 | broker offset, outbox row, DLQ |\n| 순서가 뒤집힘 | FIFO 범위 오해, partition/key 부재, 병렬 consumer, retry 재삽입 | queue/group/partition, key, consumer concurrency |\n| read model이 늦게 반영됨 | consumer lag, poison message, projection backlog | lag, oldest unprocessed age, watermark |\n| replay 후 데이터가 중복됨 | idempotent handler/dedup 없음 | dedup table, unique constraint, replay log |\n\nConsumer가 메시지를 처리하고 ack하기 전에 죽으면 broker는 다시 전달할 수 있다. 이때 at-least-once에서는 중복 처리를 전제로 consumer를 설계해야 한다. 반대로 처리 전에 ack나 offset commit을 먼저 끝내면 consumer crash 시 메시지가 처리되지 않은 채 지나간 것처럼 보일 수 있다.\n\n## 핵심 mental model\n\nAt-most-once는 중복이 적지만 누락 가능성이 있다. At-least-once는 누락을 줄이지만 중복 가능성이 있다. Exactly-once는 범위와 조건이 좁고, 보통 consumer side effect까지 마법처럼 보장하지 않는다. 그래서 면접에서는 \"broker가 메시지를 어떻게 다시 보여주는가\"와 \"handler가 DB/API에 무엇을 남겼는가\"를 분리해야 한다.\n\n| Semantic | 초보자용 의미 | 장애 시 보이는 현상 | 설계 기본값 |\n|---|---|---|---|\n| at-most-once | 많아야 한 번 전달 | 중복은 적지만 유실 가능 | 손실이 허용되는 telemetry 정도 |\n| at-least-once | 최소 한 번 전달하려고 재시도 | 중복 가능 | 업무 이벤트의 흔한 기본값 |\n| exactly-once | 정해진 경계 안에서 한 번처럼 관측 | end-to-end side effect까지는 조건이 좁음 | broker/stream transaction, output store 협력 조건 확인 |\n\n여기서 source of truth를 분리해야 한다. 큐의 broker log가 업무 상태의 source of truth인지, 아니면 DB row가 source of truth이고 큐는 projection/update 전달용인지가 다르다. 대부분의 미션/서비스에서는 업무 DB가 원장이고 큐는 read model, 알림, 외부 연동을 따라오게 하는 경로다.\n\n## 원인 후보\n\n### 1. Ack 경계가 side effect보다 앞선다\n\nconsumer가 메시지를 받자마자 ack하고 그 뒤 DB 업데이트를 하면, 업데이트 전에 죽었을 때 broker는 이미 처리됐다고 볼 수 있다. 이 경우 누락처럼 보인다.\n\n반대로 DB 업데이트 후 ack 전에 죽으면 broker는 다시 전달할 수 있다. 이 경우 중복처럼 보인다. at-least-once를 택하면 후자를 받아들이고 idempotency로 막는 쪽이 일반적이다.\n\n### 2. Handler가 idempotent하지 않다\n\n아래 코드는 중복 전달에 약하다.\n\n```text\non OrderPaid(event):\n  points += event.points\n```\n\n같은 event id가 두 번 오면 포인트가 두 번 쌓인다. 더 안전한 방식은 event id를 처리 이력에 저장하거나, source of truth의 상태 전이를 조건부로 만든다.\n\n```text\nif not processed(event.id):\n  apply_side_effect()\n  mark_processed(event.id)\n```\n\nDB transaction, unique constraint, idempotency table을 함께 설계해야 한다.\n\n### 3. Replay는 복구이면서 중복 발생기다\n\nDLQ나 offset replay는 missing event를 복구하는 강력한 도구다. 하지만 이미 처리된 메시지도 다시 보일 수 있다. replay를 허용하려면 dedup key, event version, handler idempotency가 먼저 있어야 한다.\n\n### 4. 순서 보장은 정해진 scope 범위다\n\n큐를 쓴다고 전체 순서가 자동 보장되지 않는다. 구현에 따라 단일 FIFO queue, message group, partition, shard key처럼 순서 보장의 scope가 정해진다. 그 scope 밖의 메시지끼리는 전역 순서를 기대하면 안 된다. 여러 consumer가 병렬 처리하거나 retry가 별도 topic/queue로 빠졌다가 돌아오면 downstream 관측 순서가 달라질 수 있다.\n\n## Trade-off\n\n큐를 쓰면 API retry 문제가 사라진다고 생각하면 안 된다. retry 위치가 바뀔 뿐이고, dedup key, idempotent consumer, dead letter queue가 함께 필요하다.\n\n| 선택 | 얻는 것 | 비용/위험 |\n|---|---|---|\n| at-most-once | 중복 최소화 | 메시지 유실 가능 |\n| at-least-once | 유실 가능성 감소 | consumer 중복 처리 필수 |\n| 강한 ordering scope/key | entity별 순서 안정 | hot partition, hot FIFO group, throughput 제한 |\n| DLQ | poison message 격리 | 방치하면 영구 누락 |\n| replay | 누락 복구 | 중복 side effect 위험 |\n| dedup window | 중복 억제 | 저장소 비용, window 밖 중복 |\n\n## 검증 지표\n\n- delivery: delivery attempt count, redelivery rate, ack latency, consumer lag, oldest unacked age\n- correctness: duplicate event id count, idempotency hit rate, processed-event table conflict count\n- replay: replayed message count, replay dedup hit count, replay failure count\n- DLQ: DLQ count, oldest DLQ age, poison message category\n- ordering: out-of-order detected count, per-key lag, hot partition ratio\n- projection: source event id와 read model watermark gap, reconciliation repair count\n\n## 흔한 오해\n\n- \"큐를 쓰면 중복 처리가 없어졌다\": 아니다. broker가 재전달할 수 있고 consumer side effect는 별도 idempotency가 필요하다.\n- \"exactly-once면 모든 외부 API도 한 번만 호출된다\": 보통 아니다. 보장 범위가 broker/stream transaction 안인지, DB와 외부 API까지 포함하는지 확인해야 한다.\n- \"DLQ로 보내면 해결됐다\": 처리 지연을 격리한 것이다. 재처리와 reconciliation 계획이 없으면 누락이 남는다.\n- \"순서 보장 큐니까 전체 순서가 맞다\": 대개 queue가 약속한 FIFO scope, message group, partition/key 범위의 순서다.\n\n## 안전한 다음 문서\n\noutbox/CDC delivery semantics와 idempotency reconciliation을 이어서 본다.\n",
   "aliases": [
     "queue delivery semantics beginner",
-    "at least once at most once exactly once basics",
+    "at least once at most once basics",
     "큐 전달 보장 입문",
-    "메시지 중복 누락 순서 기본"
+    "메시지 중복 누락 순서 기본",
+    "ack redelivery duplicate",
+    "consumer crash before ack",
+    "메시지 재전달",
+    "중복 처리 방어",
+    "DLQ replay delivery",
+    "exactly once 오해"
   ],
   "expected_queries": [
     "메시지 큐에서 at-least-once at-most-once exactly-once는 뭐가 달라?",
     "큐를 쓰면 중복 처리가 없어지는 거야?",
-    "consumer가 메시지를 두 번 받을 수 있으면 어떻게 설계해?"
+    "consumer가 메시지를 두 번 받을 수 있으면 어떻게 설계해?",
+    "ack 전에 consumer가 죽으면 broker가 메시지를 다시 줄 수 있는 이유가 뭐야?",
+    "DLQ replay를 하면 왜 중복 side effect를 조심해야 해?",
+    "exactly-once가 외부 API 호출까지 한 번만 보장한다는 뜻이 아닌 이유를 설명해줘"
   ],
   "symptoms": [
     "같은 메시지가 두 번 처리됐어요",
