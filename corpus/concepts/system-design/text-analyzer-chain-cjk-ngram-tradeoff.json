@@ -1,0 +1,64 @@
+{
+  "id": "system-design/text-analyzer-chain-cjk-ngram-tradeoff",
+  "title": "Text Analyzer Chain CJK NGram Tradeoff",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "검색 analyzer는 char filter, tokenizer, token filter를 거쳐 문서를 token stream으로 바꾸는 체인이며, CJK 검색에서는 형태소 분석과 n-gram이 recall, precision, index size, autocomplete 요구를 다르게 만족한다.",
+  "body_markdown": "# Text Analyzer Chain CJK NGram Tradeoff\n\n> 한 줄 요약: 검색 analyzer는 text를 바로 검색하는 것이 아니라 char filter, tokenizer, token filter를 거쳐 token stream으로 바꾼다. CJK 검색에서는 공백 기반 tokenizer가 약하므로 형태소 분석, n-gram, edge n-gram을 요구별로 골라야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Search Inverted Index Interview Primer](./search-inverted-index-interview-primer.md)\n- [Search Indexing Pipeline Design](./search-indexing-pipeline-design.md)\n- [Trie Prefix Search Autocomplete](../data-structure/trie-prefix-search-autocomplete.md)\n- [Document Search Ranking Platform Design](./document-search-ranking-platform-design.md)\n- [Search Index Backfill, Alias Cutover, Recovery Playbook](./search-index-backfill-alias-cutover-recovery-playbook.md)\n\nretrieval-anchor-keywords: text analyzer chain, char filter tokenizer token filter, CJK analyzer, ngram tokenizer, edge_ngram autocomplete, morphological analyzer, Korean search analyzer, inverted index tokens, search precision recall, 검색 분석기, 형태소 분석 ngram\n\n---\n\n## analyzer는 무엇을 하는가\n\n검색엔진은 원문 문자열을 그대로 index에 넣지 않는다. analyzer가 text를 token stream으로 바꾼 뒤 inverted index에 넣는다. Elastic 공식 문서 기준 analyzer는 보통 아래 흐름으로 설명된다.\n\n```text\nraw text\n  -> character filters\n  -> tokenizer\n  -> token filters\n  -> tokens\n```\n\n각 단계의 역할은 다르다.\n\n| 단계 | 역할 | 예시 |\n|---|---|---|\n| character filter | tokenizer 전에 문자 자체를 정리 | HTML 제거, 기호 정규화, 전각/반각 처리 |\n| tokenizer | 문자열을 token으로 자름 | standard, whitespace, ngram, edge_ngram, language tokenizer |\n| token filter | token stream을 수정 | lowercase, stopword, synonym, stemmer |\n\n중요한 제약은 analyzer에 tokenizer는 보통 하나이고, char filter와 token filter는 여러 개를 조합할 수 있다는 점이다. 그래서 analyzer 설계는 `어떤 단위로 자를 것인가`와 `잘린 token을 어떻게 정규화할 것인가`를 나누는 일이다.\n\n---\n\n## CJK에서 왜 더 어렵나\n\n영어 문장은 공백이 단어 경계 힌트를 준다. 반면 한국어, 일본어, 중국어 같은 CJK text는 공백이 없거나, 조사/어미/복합어 때문에 단순 공백 분리가 약하다.\n\n예를 들어 사용자가 `예약확정`을 검색한다고 하자.\n\n```text\n원문: 예약 확정 알림을 보냈습니다\n검색어: 예약확정\n```\n\n공백만 기준으로 token을 만들면 `예약`, `확정`은 있어도 `예약확정`은 없을 수 있다. 반대로 모든 부분 문자열을 다 token으로 만들면 recall은 좋아지지만 index가 커지고 엉뚱한 match가 늘 수 있다.\n\n---\n\n## n-gram과 edge n-gram\n\nn-gram tokenizer는 단어를 다시 작은 연속 문자열 조각으로 만든다. Elastic 문서는 n-gram을 sliding window처럼 설명한다. 예를 들어 `검색`을 1-2gram으로 자르면 `검`, `검색`, `색` 같은 token이 생길 수 있다.\n\n| 방식 | 감각 | 잘 맞는 요구 | 위험 |\n|---|---|---|---|\n| n-gram | 모든 위치의 부분 문자열 | CJK 부분 일치, typo-like recall | index size 증가, 낮은 precision |\n| edge n-gram | 시작 부분에 붙은 prefix 조각 | search-as-you-type, autocomplete | 중간 문자열 검색에는 약함 |\n| 형태소 분석 | 언어 지식으로 단어/형태소 분리 | 한국어 일반 검색 품질 | analyzer 설치/사전 관리 필요 |\n| keyword + normalizer | 전체 문자열을 하나의 token처럼 | exact match, id/code 검색 | 부분 검색에 약함 |\n\n`ngram`과 `edge_ngram`은 같은 것이 아니다. 검색창 자동완성처럼 prefix가 중요하면 edge n-gram이 더 자연스럽다. 상품명 중간 글자까지 맞추고 싶으면 n-gram이 도움이 될 수 있지만, index size와 false positive를 조심해야 한다.\n\n---\n\n## worked example: 방 이름 검색\n\nRoomescape 미션에서 방 이름이 아래와 같다고 하자.\n\n```text\n방탈출 초급자 코스\n고급 추리 방탈출\n예약 확정 알림\n```\n\n요구가 세 가지라면 analyzer도 달라질 수 있다.\n\n| 요구 | analyzer 후보 | 이유 |\n|---|---|---|\n| `방탈`만 쳐도 방탈출 자동완성 | edge n-gram field | prefix 검색에 맞다 |\n| `추리방`처럼 붙여 쳐도 찾기 | CJK 형태소 또는 n-gram 보조 field | 공백 불일치 보정 |\n| 정확한 코드 `ROOM-001` 찾기 | keyword field + normalizer | tokenization하면 안 된다 |\n\n실무에서는 한 field에 모든 요구를 넣기보다 multi-field를 둔다.\n\n```text\nname.text        -> 형태소/standard analyzer\nname.ngram       -> 부분 일치용 n-gram analyzer\nname.autocomplete-> edge n-gram analyzer\nname.keyword     -> exact/filter/sort용 keyword\n```\n\n이렇게 나누면 사용자의 일반 검색은 `name.text` 중심으로 scoring하고, autocomplete endpoint는 `name.autocomplete`를 쓰며, 운영 exact lookup은 `name.keyword`를 쓴다. 같은 text라도 query intent에 따라 field와 analyzer가 달라진다.\n\n---\n\n## precision과 recall trade-off\n\nAnalyzer를 강하게 쪼개면 recall은 올라갈 수 있다. 하지만 너무 많은 token이 생기면 precision과 ranking이 흔들린다.\n\n| 선택 | recall | precision | 비용 |\n|---|---|---|---|\n| 형태소 분석 중심 | 언어에 맞으면 좋음 | 비교적 좋음 | 사전/품질 관리 필요 |\n| 짧은 n-gram | 매우 높음 | 낮아지기 쉬움 | index size와 query cost 증가 |\n| edge n-gram | prefix에는 높음 | autocomplete에 적합 | prefix 외 요구는 약함 |\n| keyword exact | 낮음 | 매우 높음 | partial search 불가 |\n\n특히 1-gram을 넓게 쓰면 거의 모든 문서가 조금씩 match할 수 있다. 그래서 n-gram field는 boost를 낮추거나, query length별로 사용을 제한하거나, exact/형태소 field와 함께 scoring해야 한다.\n\n---\n\n## index-time analyzer와 search-time analyzer\n\nIndex할 때와 search할 때 analyzer가 다를 수 있다. 예를 들어 autocomplete는 index-time에 edge n-gram으로 많이 쪼개고, search-time에는 사용자가 입력한 text를 덜 쪼개는 구성을 쓴다. 반대로 index와 query analyzer가 너무 다르면 예상한 token이 만나지 않아 검색 누락이 생긴다.\n\n검증은 `_analyze` 같은 도구로 실제 token을 보는 방식이 안전하다.\n\n```text\ninput: 예약확정\nindex analyzer tokens: 예, 예약, 예약확, 예약확정 ...\nsearch analyzer tokens: 예약확정\n```\n\n이 결과를 보지 않고 analyzer 이름만 보고 튜닝하면, 왜 문서가 안 나오는지 또는 너무 많이 나오는지 설명하기 어렵다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| analyzer는 검색 query에만 적용된다 | index-time analyzer가 inverted index token을 만든다 |\n| n-gram을 켜면 검색 품질이 항상 좋아진다 | recall은 오르지만 index size, false positive, ranking 문제가 생긴다 |\n| CJK는 무조건 n-gram이면 된다 | 형태소 분석, 사전, synonym, multi-field를 같이 봐야 한다 |\n| autocomplete와 일반 검색은 같은 analyzer면 된다 | prefix 요구와 full-text ranking 요구가 다르다 |\n| token filter가 token 위치와 offset을 마음대로 바꿀 수 있다 | token filter는 token stream을 수정하지만 tokenizer 경계 결정과 역할이 다르다 |\n| keyword field도 full-text처럼 부분 검색된다 | keyword는 exact/filter/sort에 맞다 |\n\n---\n\n## 설계 체크리스트\n\n1. 검색 요구를 exact, prefix, partial, semantic/full-text로 나눈다.\n2. field별 analyzer를 multi-field로 분리한다.\n3. CJK에서는 공백 기준 token이 충분한지 `_analyze`로 본다.\n4. n-gram min/max를 작게 잡기 전에 index size와 false positive를 예상한다.\n5. search-time analyzer와 index-time analyzer가 만나는 token을 실제로 확인한다.\n6. ranking에서 n-gram field boost를 낮추거나 exact/형태소 field와 조합한다.\n7. analyzer 변경은 reindex가 필요할 수 있으므로 alias cutover와 backfill 계획을 둔다.\n\n---\n\n## 면접 답변 골격\n\n질문이 `한국어 검색에서 n-gram analyzer를 왜 쓰고 언제 위험한가요?`라면 이렇게 답한다.\n\n1. 검색엔진은 원문을 analyzer로 token stream으로 바꿔 inverted index에 넣는다.\n2. Analyzer는 char filter, tokenizer, token filter 단계로 나뉜다.\n3. CJK는 공백 분리만으로 단어 경계가 잘 안 잡혀 형태소 분석이나 n-gram이 필요할 수 있다.\n4. n-gram은 부분 문자열 match recall을 높이지만 index size와 false positive를 늘린다.\n5. autocomplete는 edge n-gram, 일반 검색은 형태소/standard, exact는 keyword처럼 field를 나눠 쓴다.\n6. `_analyze`로 실제 token을 확인하고 analyzer 변경은 reindex/cutover와 같이 설계한다.\n\n---\n\n## 꼬리질문\n\n> Q: n-gram과 edge n-gram은 어떻게 다른가요?\n> 의도: 부분 문자열 검색과 prefix 검색을 구분하는지 확인\n> 핵심: n-gram은 모든 위치의 sliding window이고, edge n-gram은 시작 부분 prefix에 앵커된다.\n\n> Q: analyzer 변경이 왜 reindex와 연결되나요?\n> 의도: index-time token이 이미 저장된다는 사실 확인\n> 핵심: 기존 문서 token이 새 analyzer로 자동 재생성되지 않으므로 새 index/backfill/alias cutover가 필요할 수 있다.\n\n> Q: CJK 검색에서 n-gram만 쓰면 왜 ranking이 나빠질 수 있나요?\n> 의도: recall과 precision trade-off 이해 확인\n> 핵심: 짧은 조각 token이 너무 많이 match되어 false positive와 index size가 늘 수 있다.\n\n## 한 줄 정리\n\nText analyzer 설계는 문자열을 어떻게 token으로 바꾸는지의 문제이며, CJK 검색에서는 형태소 분석과 n-gram/edge n-gram을 query intent별 field로 분리해 recall, precision, index size를 함께 조정해야 한다.\n",
+  "aliases": [
+    "text analyzer chain",
+    "검색 analyzer 체인",
+    "char filter tokenizer",
+    "token filter analyzer",
+    "CJK ngram search",
+    "한국어 검색 분석기",
+    "형태소 분석 ngram",
+    "edge ngram autocomplete",
+    "검색 토크나이저",
+    "analyzer reindex"
+  ],
+  "expected_queries": [
+    "검색 analyzer에서 char filter, tokenizer, token filter는 각각 어떤 역할을 해?",
+    "한국어 검색에서 공백 기준 tokenizer만 쓰면 왜 예약확정 같은 붙여 쓴 검색어가 잘 안 맞을 수 있어?",
+    "n-gram analyzer를 쓰면 부분 검색 recall은 좋아지지만 index size와 false positive가 늘어나는 이유가 뭐야?",
+    "edge n-gram은 autocomplete에 좋고 일반 n-gram은 중간 문자열 검색에 쓰인다는 차이를 설명해줘",
+    "Elasticsearch analyzer를 바꾸면 왜 기존 문서를 reindex하고 alias cutover를 해야 할 수 있어?",
+    "검색 field를 text, ngram, autocomplete, keyword multi-field로 나누는 기준을 알려줘"
+  ],
+  "symptoms": [
+    "한국어 검색어를 붙여 쓰면 문서가 안 나온다",
+    "n-gram 적용 후 검색 결과가 너무 많이 나온다",
+    "autocomplete와 일반 검색을 같은 analyzer로 처리한다",
+    "analyzer 변경 후 기존 index가 바로 바뀐다고 생각한다"
+  ],
+  "learner_query_patterns": [],
+  "relations": {
+    "prerequisites": [
+      "system-design/search-inverted-index-interview-primer",
+      "system-design/search-indexing-pipeline-design",
+      "data-structure/trie-prefix-search-autocomplete"
+    ],
+    "next_docs": [
+      "system-design/document-search-ranking-platform-design",
+      "system-design/search-indexing-ranking-interview-drill",
+      "system-design/search-index-backfill-alias-cutover-recovery-playbook"
+    ],
+    "confusable_with": [
+      "data-structure/trie-prefix-search-autocomplete",
+      "design-pattern/search-normalization-query-pattern",
+      "system-design/search-system-design"
+    ],
+    "forbidden_for_queries": [
+      "분산 검색에서 shard scatter gather query fetch phase를 설명해줘",
+      "BM25와 vector search ranking을 비교해줘"
+    ]
+  },
+  "metadata": {
+    "created_at": "2026-06-18T00:00:00+09:00",
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "version": 1,
+    "source": "y14-expansion-batch101-stream-a-search-analyzer",
+    "legacy_path": "knowledge/cs/contents/system-design/text-analyzer-chain-cjk-ngram-tradeoff.md",
+    "reference_note": "Checked against Elastic analyzer and n-gram tokenizer documentation."
+  }
+}
