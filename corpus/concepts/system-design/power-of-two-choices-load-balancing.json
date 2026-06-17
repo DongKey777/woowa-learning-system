@@ -1,0 +1,59 @@
+{
+  "id": "system-design/power-of-two-choices-load-balancing",
+  "title": "Power of Two Choices 로드밸런싱 - 두 번 뽑고 더 가벼운 쪽 선택",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Power of Two Choices는 모든 backend 상태를 완벽히 정렬하지 않고, 무작위로 두 후보만 뽑아 더 가벼운 쪽을 선택하는 로드밸런싱 알고리즘이다. 단순 random보다 hot backend를 빠르게 피하고, global least-loaded보다 상태 수집 비용이 낮다.",
+  "body_markdown": "# Power of Two Choices 로드밸런싱 - 두 번 뽑고 더 가벼운 쪽 선택\n\n> 한 줄 요약: 전체 서버를 다 비교하지 말고 건강한 backend 두 개만 뽑은 뒤, 그중 더 가벼운 쪽으로 보낸다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: power of two choices load balancing, P2C 로드밸런싱, two random choices, least loaded of two, in-flight request balancing, least request sampling, client side load balancing, service mesh load balancing, hot backend avoidance, random vs round robin vs least connections\n\n## 먼저 멘탈모델\n\nRandom 로드밸런싱은 구현이 쉽지만 운이 나쁘면 특정 backend에 요청이 몰린다. Least Connections는 현재 연결 수가 가장 적은 서버를 고르지만, 모든 backend의 최신 상태를 계속 알아야 한다.\n\nPower of Two Choices, 줄여서 P2C는 중간 지점이다.\n\n```text\n1. healthy backend 중 두 개를 무작위로 고른다.\n2. 두 후보의 load signal을 비교한다.\n3. 더 가벼운 후보에 요청을 보낸다.\n```\n\n두 개만 봐도 가장 나쁜 선택을 피할 확률이 크게 올라간다. 핵심은 완벽한 최적화가 아니라 **싼 비용으로 hot backend를 피하는 것**이다.\n\n## 기본 알고리즘\n\n```text\nc1, c2 = randomTwo(healthyBackends)\nif load(c1) <= load(c2):\n    return c1\nreturn c2\n```\n\n여기서 load는 구현마다 다르다.\n\n| load signal | 의미 | 주의점 |\n|---|---|---|\n| active connections | 현재 연결 수 | HTTP keep-alive, long-lived stream이 섞이면 요청 부하와 다를 수 있다 |\n| in-flight requests | 처리 중인 요청 수 | 짧은 요청이 많은 API에서 직관적이다 |\n| pending queue depth | backend 또는 client pool 대기열 | 큐 위치가 어디인지 명확해야 한다 |\n| latency EWMA | 최근 응답 시간 추정 | 느린 backend 회피에 좋지만 노이즈와 cold start 보정이 필요하다 |\n\n## 왜 효과가 큰가\n\n요청 하나가 backend N개 중 하나로 완전히 random하게 가면, 순간적으로 같은 backend가 계속 뽑히는 일이 생긴다. P2C는 두 후보 중 더 바쁜 쪽을 버리므로, 이미 hot한 backend가 계속 더 뜨거워지는 경로를 줄인다.\n\n운영 관점의 장점은 세 가지다.\n\n- **상태 수집 비용이 작다**: 전체 backend를 매 요청마다 정렬하지 않는다.\n- **확장성이 좋다**: backend가 많아져도 비교는 두 후보만 한다.\n- **불균형 회피가 빠르다**: 단순 random이나 round robin보다 hot spot을 덜 만든다.\n\n## 언제 쓰기 좋은가\n\n- backend 수가 많고, 모든 backend를 매번 비교하기 부담스러울 때\n- 요청 처리 시간이 균등하지 않아 round robin이 tail latency를 키울 때\n- client-side load balancing, service mesh, gateway처럼 호출자가 backend 후보를 알고 있을 때\n- 대략적인 in-flight count나 latency score를 얻을 수 있을 때\n\nP2C는 서버가 모두 같은 성능이라는 가정에서도 잘 동작하지만, backend 성능이 다르면 weight를 함께 고려해야 한다. 예를 들어 큰 인스턴스는 후보에 더 자주 들어오게 하거나, score를 capacity로 나누는 방식이 필요하다.\n\n## 흔한 함정\n\n### 오래된 load signal\n\n분산 환경에서 load 정보는 항상 늦게 온다. 1초 전 in-flight count로 선택하면 이미 상황이 바뀌었을 수 있다. 그래서 P2C는 완벽한 상태 추적이 아니라 **rough signal로 나쁜 선택을 줄이는 방식**이라고 봐야 한다.\n\n### 작은 cluster에서 과한 기대\n\nbackend가 2-3대뿐이면 두 개를 뽑는 의미가 작다. 이때는 least connections나 weighted round robin과 차이가 크지 않을 수 있다.\n\n### sticky session과 충돌\n\n사용자별 sticky가 필요하면 매 요청마다 다른 후보를 고를 수 없다. 이 경우에는 key 기반 해싱, cookie affinity, stateless 전환을 먼저 검토해야 한다.\n\n### retry와 결합한 폭주\n\n느린 backend를 피하려고 retry까지 즉시 걸면 다른 backend로 부하가 번질 수 있다. P2C는 timeout budget, retry budget, circuit breaker와 함께 봐야 한다.\n\n## 다른 알고리즘과 구분\n\n| 알고리즘 | 선택 기준 | 핵심 차이 |\n|---|---|---|\n| Round Robin | 순서 | 현재 부하를 보지 않는다 |\n| Least Connections | 전체 후보 중 연결 수 최소 | 더 정확하지만 전체 상태 추적 비용이 크다 |\n| P2C | 무작위 두 후보 중 가벼운 쪽 | 낮은 비용으로 hot backend를 피한다 |\n| Maglev Hashing | request key -> lookup table | 안정적 매핑이 목표이지 현재 부하 회피가 목표는 아니다 |\n| Peak-EWMA | 최근 latency score | 느려진 backend를 동적으로 벌점 처리한다 |\n\n## 면접/설계 질문 포인트\n\n> Q: 왜 두 개만 뽑아도 효과가 있나요?\n> 핵심: 완벽히 가장 한가한 서버를 찾지는 못하지만, 이미 바쁜 서버가 선택될 확률을 크게 줄인다. 비교 비용은 상수로 유지된다.\n\n> Q: P2C를 쓰면 least connections가 필요 없나요?\n> 핵심: 아니다. 후보 두 개만 비교하므로 global optimum은 아니다. 대신 backend 수가 크고 상태 수집 비용이 중요한 환경에서 비용 대비 효과가 좋다.\n\n> Q: 어떤 signal을 비교해야 하나요?\n> 핵심: HTTP API는 in-flight request, long connection은 active connection, tail latency 문제가 크면 latency EWMA를 후보로 둔다. 하나의 지표가 모든 workload에 맞지는 않는다.\n\n## 한 줄 정리\n\nPower of Two Choices는 random의 단순함을 유지하면서도 두 후보 비교만으로 hot backend를 피하는 로드밸런싱 기법이다. 핵심 질문은 항상 같다. **두 후보의 가벼움을 어떤 signal로 판단할 것인가?**\n",
+  "aliases": [
+    "power of two choices",
+    "P2C load balancing",
+    "두 번 선택 로드밸런싱",
+    "두 후보 부하 분산",
+    "least loaded of two",
+    "two random choices",
+    "in-flight 기반 분산",
+    "least request sampling",
+    "hot backend 회피"
+  ],
+  "expected_queries": [
+    "Power of Two Choices 로드밸런싱은 왜 두 개만 비교해도 효과가 있어?",
+    "round robin 대신 P2C를 쓰면 hot backend를 어떻게 피할 수 있어?",
+    "로드밸런서가 모든 서버 상태를 보지 않고 두 후보만 고르는 이유가 뭐야?",
+    "P2C에서 active connection과 in-flight request 중 어떤 신호를 비교해야 해?",
+    "client-side load balancing에서 power of two choices를 쓰는 장단점은 뭐야?",
+    "sticky session이 필요한 서비스에서 P2C가 왜 그대로 맞지 않을 수 있어?"
+  ],
+  "symptoms": [
+    "round robin인데 특정 서버만 계속 느려지는 이유를 모르겠어",
+    "least connections를 구현하려면 모든 서버 상태를 다 봐야 해서 부담돼",
+    "서비스 mesh나 gateway에서 backend를 고르는 알고리즘을 어떻게 정할지 헷갈려",
+    "로드밸런싱에서 in-flight request를 왜 비교하는지 모르겠어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/load-balancing-basics-primer",
+      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+    ],
+    "next_docs": [
+      "system-design/maglev-hashing-lookup-table-load-balancing",
+      "system-design/peak-ewma-latency-aware-load-balancing",
+      "system-design/service-discovery-health-routing-design"
+    ],
+    "confusable_with": [
+      "system-design/load-balancer-basics",
+      "system-design/load-balancer-drain-and-affinity-primer",
+      "system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser",
+      "system-design/hedged-requests-tail-latency-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/power-of-two-choices-load-balancing.md",
+    "revision_history": []
+  }
+}
