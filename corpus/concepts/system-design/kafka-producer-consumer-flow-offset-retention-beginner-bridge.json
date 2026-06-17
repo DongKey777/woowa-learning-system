@@ -1,0 +1,62 @@
+{
+  "id": "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+  "title": "Kafka Producer Consumer Flow, Offset, and Retention Beginner Bridge",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "Kafka record가 producer에서 broker partition log로 쓰이고 consumer가 poll, process, commit하는 흐름을 offset과 retention 기준으로 연결한다. beginner가 ordering/delivery 문서로 넘어가기 전, ack, offset commit, retry, replay의 기본 경계를 잡는다.",
+  "body_markdown": "# Kafka Producer Consumer Flow, Offset, and Retention Beginner Bridge\n\n## 한 줄 요약\n\nKafka 흐름은 `produce -> broker partition log append -> consumer poll -> business processing -> offset commit`으로 보면 된다. 장애 질문은 대부분 \"record는 log에 남아 있는가\", \"consumer는 어디까지 처리했다고 선언했는가\", \"같은 record를 다시 봐도 안전한가\"로 정리된다.\n\n## 기본 흐름\n\n```text\nproducer\n  -> topic partition에 record append\n  -> broker ack\nconsumer group\n  -> assigned partition poll\n  -> record 처리\n  -> 처리 완료 경계에 맞춰 offset commit\nretention window\n  -> record 보관\n  -> 필요하면 offset rewind/replay\n```\n\n초보자가 가장 먼저 잡아야 할 경계는 producer ack와 consumer commit이 서로 다른 문제라는 점이다. Producer ack는 broker가 record를 받았다는 신호이고, consumer offset commit은 consumer group이 특정 위치까지 처리했다고 선언하는 신호다.\n\n## Producer 쪽에서 보는 것\n\nProducer는 record를 topic으로 보낸다. Key가 있으면 보통 key 기반으로 partition이 결정되고, 같은 key를 같은 partition으로 보내면 그 partition 안에서는 순서를 설명하기 쉬워진다.\n\nProducer 관점의 질문은 다음이다.\n\n- broker가 record를 받았는가?\n- retry로 같은 record가 중복 write될 수 있는가?\n- key 선택 때문에 특정 partition이 hot해지는가?\n- schema나 payload version이 consumer와 맞는가?\n\nProducer retry는 availability를 높이지만 중복 가능성과 순서 문제를 함께 만든다. 그래서 producer 단계만 보고 \"한 번만 처리된다\"고 말하면 과장이다.\n\n## Consumer 쪽에서 보는 것\n\nConsumer는 partition에서 record를 poll하고 handler를 실행한다. 여기서 업무 side effect가 생긴다. DB update, 외부 API call, email 발송, read model update 같은 일이 record 처리 중에 일어난다.\n\nConsumer 질문은 보통 이렇다.\n\n- handler가 성공하기 전에 offset을 commit했는가?\n- handler 성공 후 commit 전에 consumer가 죽으면 어떻게 되는가?\n- 같은 record를 다시 받으면 side effect가 중복되는가?\n- poison record 하나가 partition progress를 막는가?\n\nAt-least-once 흐름에서는 handler 성공 후 offset commit 전에 죽으면 같은 record를 다시 볼 수 있다. 그래서 idempotent consumer가 기본값에 가깝다.\n\n## Offset commit을 처리 완료 선언으로 보기\n\nOffset commit은 단순 bookmark가 아니라 \"이 group은 이 partition에서 여기까지 처리했다고 볼게\"라는 선언이다. 따라서 commit 위치와 side effect 완료 위치가 어긋나면 중복이나 누락이 생긴다.\n\n| 순서 | 장애 시 현상 | 설계 감각 |\n|---|---|---|\n| 먼저 commit, 나중 처리 | 처리 전 crash면 누락처럼 보임 | 업무 이벤트에는 위험 |\n| 먼저 처리, 나중 commit | commit 전 crash면 중복 처리 가능 | idempotency로 방어 |\n| 처리와 commit을 transaction처럼 묶음 | 범위 안에서는 강해짐 | sink와 Kafka transaction 조건 확인 |\n\nBeginner 단계에서는 \"중복 가능성을 받아들이고 idempotent하게 만든다\"가 가장 실용적인 출발점이다.\n\n## Retention과 replay의 의미\n\nRetention은 record가 log에 남아 있는 기간/크기 정책이다. Consumer group이 offset을 어디에 두든, retention이 남아 있으면 예전 record를 다시 읽을 수 있다.\n\nReplay가 필요한 상황:\n\n- read model을 다시 만들 때\n- bug fix 후 특정 구간 이벤트를 재처리할 때\n- 새 consumer group을 만들어 과거 이벤트부터 따라잡을 때\n- DLQ나 retry topic에서 원인을 고친 뒤 재처리할 때\n\n하지만 replay는 같은 side effect를 다시 만들 수 있다. 그래서 replay 가능성을 말할 때는 dedup key, processed event table, idempotent upsert, external API idempotency key를 같이 말해야 한다.\n\n## Beginner 확인 순서\n\n1. Topic과 partition 수를 확인한다.\n2. Producer key가 ordering scope와 맞는지 본다.\n3. Consumer group이 몇 개이고 각 group이 어떤 책임을 갖는지 나눈다.\n4. Offset commit이 handler 성공 뒤에 일어나는지 확인한다.\n5. Handler가 같은 event id를 다시 봐도 안전한지 본다.\n6. Retention이 replay와 장애 catch-up에 충분한지 본다.\n7. Lag, retry, DLQ, duplicate event 지표를 함께 본다.\n\n## 흔한 오해\n\n- \"producer ack를 받았으니 모든 consumer 처리가 끝났다\": 아니다. broker append와 consumer processing은 다른 단계다.\n- \"offset을 commit했으니 DB update도 반드시 성공했다\": commit 위치를 어디서 잡았는지 봐야 한다.\n- \"retention이 있으니 언제든 replay할 수 있다\": retention window가 지나면 source record가 사라질 수 있다.\n- \"consumer lag만 줄이면 안전하다\": 빠르게 잘못 처리하거나 빠르게 중복 처리할 수도 있다.\n- \"retry topic으로 빼면 ordering 문제도 사라진다\": 실패 record를 main flow 밖으로 빼면 관측 순서와 보정 정책을 따로 설명해야 한다.\n\n## 운영 지표\n\n- producer send error rate, retry count, record size\n- partition별 append rate와 hot partition skew\n- consumer lag, oldest unprocessed age\n- handler success/failure count, processing latency\n- offset commit latency, rebalance count\n- duplicate event id, idempotency hit count\n- retention remaining time versus catch-up time\n- DLQ count and oldest DLQ age\n\n## 면접 답변 축\n\nKafka 흐름 질문에는 \"producer ack, broker log append, consumer processing, offset commit을 분리해서 본다\"고 답한다. 그런 다음 handler 성공 후 commit 전에 죽으면 at-least-once 재전달로 중복이 가능하므로 idempotent consumer가 필요하고, retention이 남아 있으면 offset을 조정해 replay할 수 있지만 side effect 중복을 막아야 한다고 이어가면 된다.\n\n## Safe Next Docs\n\n순서와 delivery semantics 면접 답변은 `kafka-ordering-delivery-interview-primer`, consumer group 재배치는 `kafka-consumer-group-rebalance-cooperative-vs-eager`, partition 내 병렬 처리와 offset gap은 `kafka-out-of-order-commit-offset-gap-parallelism`으로 이어진다.\n",
+  "aliases": [
+    "Kafka producer consumer flow",
+    "Kafka offset commit flow",
+    "카프카 producer consumer 흐름",
+    "카프카 offset commit",
+    "Kafka retention replay beginner",
+    "consumer poll process commit",
+    "producer ack broker append",
+    "카프카 재처리",
+    "consumer lag retention",
+    "idempotent consumer Kafka"
+  ],
+  "expected_queries": [
+    "Kafka producer가 보낸 record를 consumer가 처리하고 offset commit하기까지 흐름을 설명해줘",
+    "카프카에서 producer ack와 consumer offset commit은 뭐가 달라?",
+    "Kafka consumer가 처리 후 commit 전에 죽으면 왜 중복 처리가 생겨?",
+    "retention이 남아 있으면 offset을 되돌려 replay할 수 있다는 말이 무슨 뜻이야?",
+    "Kafka consumer lag와 retention을 같이 봐야 하는 이유가 뭐야?",
+    "카프카에서 재처리를 안전하게 하려면 consumer를 어떻게 만들어야 해?"
+  ],
+  "symptoms": [
+    "producer ack를 consumer 처리 완료와 같은 뜻으로 이해한다",
+    "offset commit 전에 죽은 consumer의 중복 처리 가능성을 놓친다",
+    "retention replay를 side effect 중복 없이 안전하다고 오해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design"
+    ],
+    "confusable_with": [
+      "system-design/queue-delivery-semantics-beginner-primer",
+      "system-design/publish-subscribe-messaging-basics-primer",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+    ],
+    "forbidden_for_queries": [
+      "Kafka cooperative rebalance가 배포 때 lag spike를 만드는 이유를 설명해줘",
+      "Kafka partition 안에서 offset gap tracking을 구현하는 방법을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge.md",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "spring/spring-batch-job-step-reader-processor-writer-beginner-primer",
+  "title": "Spring Batch Job, Step, Reader, Processor, Writer Beginner Primer",
+  "category": "spring",
+  "level": "beginner",
+  "summary": "Spring Batch를 처음 배울 때 Job, Step, ItemReader, ItemProcessor, ItemWriter, chunk, JobRepository의 역할을 한 흐름으로 정리한다. retry/skip/restartability로 가기 전, 배치가 긴 작업을 작은 단위로 읽고 처리하고 쓰며 진행 상태를 남기는 구조임을 잡는다.",
+  "body_markdown": "# Spring Batch Job, Step, Reader, Processor, Writer Beginner Primer\n\n## 한 줄 요약\n\nSpring Batch는 긴 작업을 `Job`으로 정의하고, Job을 여러 `Step`으로 나눈 뒤, Step 안에서 `ItemReader -> ItemProcessor -> ItemWriter` 흐름으로 데이터를 처리한다. Chunk는 몇 개 item을 모아 transaction으로 commit할지 정하는 기본 단위다.\n\n## 먼저 잡을 mental model\n\n온라인 API는 요청 하나를 빨리 처리하고 응답한다. Batch는 많은 데이터를 오래 처리하고, 중간 실패와 재시작, 진행 상태, 운영자가 볼 결과가 중요하다.\n\nSpring Batch의 기본 질문은 다음이다.\n\n1. 어떤 업무 실행 전체가 Job인가?\n2. 그 Job은 어떤 Step들로 나뉘는가?\n3. 각 Step은 무엇을 읽고, 어떻게 바꾸고, 어디에 쓰는가?\n4. 몇 개 item마다 transaction을 commit하는가?\n5. 실패하면 어디부터 다시 시작할 수 있는가?\n\n## 핵심 구성요소\n\n| 구성요소 | 역할 | beginner가 기억할 말 |\n|---|---|---|\n| Job | 배치 작업 전체 | \"회원 쿠폰 발급 배치\" 같은 실행 단위 |\n| Step | Job을 나눈 단계 | 읽기/계산/쓰기의 한 경계 |\n| ItemReader | 입력을 하나씩 읽음 | DB row, CSV line, API page 등을 item으로 꺼냄 |\n| ItemProcessor | item을 변환/검증 | 필요 없으면 생략할 수 있음 |\n| ItemWriter | 처리된 item을 저장/전송 | DB write, file write, API call 등이 side effect |\n| Chunk | N개 item을 묶어 transaction 처리 | commit/rollback 비용과 재처리 범위가 여기서 갈림 |\n| JobRepository | 실행 상태와 결과 metadata 저장 | 실패 후 재시작과 운영 추적의 근거 |\n\n## Reader, Processor, Writer 흐름\n\n가장 기본 흐름은 이렇게 읽으면 된다.\n\n```text\nreader가 item을 읽는다\nprocessor가 item을 변환하거나 걸러낸다\nwriter가 chunk 단위로 결과를 쓴다\nchunk commit이 성공하면 진행 상태를 남긴다\n```\n\nProcessor는 필수가 아니다. 단순 copy나 migration이면 reader와 writer만 있을 수 있다. 반대로 processor에 너무 많은 side effect를 넣으면 retry, skip, rollback을 설명하기 어려워진다. Beginner 단계에서는 side effect는 writer 쪽에 모으고, processor는 계산/검증에 가깝게 보는 것이 이해하기 쉽다.\n\n## Chunk는 왜 중요한가\n\nChunk size가 100이면 보통 100개 item을 읽고 처리한 뒤 writer가 한 번 호출되고 transaction이 commit된다. 중간에 실패하면 그 chunk 안의 item은 다시 볼 수 있다.\n\n| chunk가 너무 작음 | chunk가 너무 큼 |\n|---|---|\n| commit overhead가 커짐 | 실패 시 rollback/retry 범위가 커짐 |\n| throughput이 낮아질 수 있음 | memory 사용량이 커질 수 있음 |\n| 장애 복구 단위가 작음 | long transaction과 lock 시간이 길어질 수 있음 |\n\n따라서 chunk size는 성능 숫자 하나가 아니라 실패 복구 비용, writer idempotency, DB lock, memory를 같이 보고 정한다.\n\n## JobRepository와 재시작 감각\n\nJobRepository는 Job/Step 실행 이력과 상태를 저장한다. Beginner는 세부 테이블 이름보다 \"Spring Batch가 어디까지 했는지 기억하는 곳\"으로 먼저 이해하면 된다.\n\n하지만 JobRepository가 있다고 재시작이 자동으로 안전해지는 것은 아니다. Reader가 현재 위치를 저장해야 하고, Writer가 같은 item을 다시 봐도 중복 side effect를 만들지 않도록 설계해야 한다. 이 주제는 다음 단계에서 restartability 문서로 이어진다.\n\n## 간단한 예시\n\n```text\nJob: 만료 쿠폰 정리\n  Step 1: 만료 대상 쿠폰 읽기\n    Reader: DB에서 만료된 coupon row를 page로 읽음\n    Processor: 이미 사용된 쿠폰은 제외\n    Writer: coupon status를 EXPIRED로 update\n```\n\n이 예시에서 beginner가 물어야 할 것은 \"어떤 annotation을 쓰나\"보다 아래다.\n\n- Reader의 정렬 기준이 안정적인가?\n- Processor가 side effect 없이 판단만 하는가?\n- Writer가 같은 coupon을 다시 봐도 안전한가?\n- Chunk commit 실패 후 어떤 item이 다시 처리될 수 있는가?\n- 운영자는 몇 건 처리됐고 몇 건 실패했는지 어디서 보는가?\n\n## 흔한 오해\n\n- \"Spring Batch는 cron처럼 시간 맞춰 실행하는 기능이다\": scheduling이 아니라 batch processing framework다. 실행은 scheduler가 트리거할 수 있지만 핵심은 Job/Step 처리와 상태 관리다.\n- \"Processor에서 외부 API를 호출해도 괜찮다\": rollback/retry 경계와 side effect 중복을 먼저 봐야 한다.\n- \"chunk size는 크면 빠르다\": commit overhead는 줄 수 있지만 실패 복구와 lock, memory 비용이 커질 수 있다.\n- \"JobRepository가 있으면 재시작은 자동 안전하다\": Reader state와 Writer idempotency가 같이 필요하다.\n- \"retry, skip, restart는 같은 말이다\": retry는 같은 실행 안의 재시도, skip은 특정 item 격리, restart는 실패 후 새 실행에서 이어가기다.\n\n## 운영 지표\n\n- JobExecution status, start/end time\n- StepExecution read/write/filter/skip count\n- chunk commit count and rollback count\n- item processing latency\n- writer duplicate/update conflict count\n- failed item audit count\n- restart time and resumed position\n\n## 면접 답변 축\n\nSpring Batch 기본 구조를 묻는 질문에는 \"Job은 배치 작업 전체, Step은 처리 단계, Reader/Processor/Writer는 item을 읽고 변환하고 쓰는 역할이며, chunk는 transaction commit 단위다. JobRepository는 실행 상태를 저장해 운영 추적과 재시작의 근거가 된다\"고 답한다.\n\n그 다음에는 chunk size와 transaction boundary, writer idempotency, retry/skip/restart 차이를 이어 말하면 beginner에서 intermediate로 자연스럽게 넘어간다.\n\n## Safe Next Docs\n\n재시작 가능성은 `spring-batch-restartability-jobrepository-executioncontext-primer`, retry/skip과 fault tolerant step은 `batch-chunk-retry-skip`, batch failure handling은 `batch-partial-failure`와 함께 본다.\n",
+  "aliases": [
+    "Spring Batch basics",
+    "Job Step Reader Processor Writer",
+    "스프링 배치 기초",
+    "Spring Batch Job Step",
+    "ItemReader ItemProcessor ItemWriter",
+    "배치 chunk transaction",
+    "JobRepository 입문",
+    "배치 Reader Writer",
+    "chunk size 기초",
+    "Spring Batch 구조"
+  ],
+  "expected_queries": [
+    "Spring Batch Job Step Reader Processor Writer를 처음부터 설명해줘",
+    "스프링 배치에서 chunk는 transaction 경계라는 말이 무슨 뜻이야?",
+    "ItemReader ItemProcessor ItemWriter는 각각 어떤 책임을 가져?",
+    "JobRepository는 Spring Batch에서 왜 필요한 거야?",
+    "batch processor에서 외부 API를 호출하면 retry rollback이 왜 복잡해져?",
+    "Spring Batch retry skip restart 차이를 배우기 전에 기본 구조를 알려줘"
+  ],
+  "symptoms": [
+    "Spring Batch를 단순 scheduler나 cron으로 이해한다",
+    "Reader Processor Writer 책임을 섞어 side effect 경계를 흐린다",
+    "chunk size를 성능 숫자로만 정하고 실패 복구 범위를 보지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/bean-di-basics",
+      "software-engineering/batch-partial-failure"
+    ],
+    "next_docs": [
+      "spring/spring-batch-restartability-jobrepository-executioncontext-primer",
+      "spring/batch-chunk-retry-skip",
+      "software-engineering/batch-recovery-runbook",
+      "software-engineering/batch-idempotency-keys"
+    ],
+    "confusable_with": [
+      "spring/batch-chunk-retry-skip",
+      "spring/spring-batch-restartability-jobrepository-executioncontext-primer",
+      "software-engineering/batch-job-scope"
+    ],
+    "forbidden_for_queries": [
+      "Spring Batch ExecutionContext로 재시작 가능성을 상세히 설계해줘",
+      "retry skip policy를 fault tolerant step에서 어떻게 나눠야 해?"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/spring/spring-batch-job-step-reader-processor-writer-beginner-primer.md",
+    "revision_history": []
+  }
+}
