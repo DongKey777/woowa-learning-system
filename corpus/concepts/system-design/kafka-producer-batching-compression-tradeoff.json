@@ -1,0 +1,64 @@
+{
+  "id": "system-design/kafka-producer-batching-compression-tradeoff",
+  "title": "Kafka Producer Batching Compression Tradeoff",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka producer의 `linger.ms`, `batch.size`, `compression.type`은 처리량, 지연, memory, broker/network 부하를 함께 움직이므로 단순히 크게 잡는 튜닝이 아니라 workload별 trade-off로 봐야 한다.",
+  "body_markdown": "# Kafka Producer Batching Compression Tradeoff\n\n> 한 줄 요약: Kafka producer batching은 같은 partition으로 갈 record를 모아 더 큰 produce request로 보내 throughput과 compression 효율을 높이는 대신, 대기 시간과 memory를 쓴다. `linger.ms`, `batch.size`, `compression.type`은 함께 봐야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer](./kafka-foundations-topic-partition-broker-offset-beginner-primer.md)\n- [Kafka Producer Consumer Flow, Offset, Retention Beginner Bridge](./kafka-producer-consumer-flow-offset-retention-beginner-bridge.md)\n- [Kafka Partition Key Ordering Primer](./kafka-partition-key-ordering-primer.md)\n- [Producer Retry Duplicate Origin Primer](./producer-retry-duplicate-origin-primer.md)\n- [Kafka Ordering Delivery Interview Primer](./kafka-ordering-delivery-interview-primer.md)\n\nretrieval-anchor-keywords: Kafka producer batching, linger.ms, batch.size, compression.type, producer batch per partition, Kafka throughput latency tradeoff, Kafka lz4 zstd compression, producer buffer memory, batch utilization, 카프카 프로듀서 배칭, linger batch size 압축\n\n---\n\n## 먼저 잡을 그림\n\nKafka producer는 `send()`를 호출할 때마다 네트워크 요청 하나를 즉시 보내는 단순한 모델이 아니다. producer는 record accumulator에 record를 쌓고, 같은 topic-partition으로 갈 record들을 batch로 묶어 broker에 보낸다.\n\n```text\nproducer.send(record A for partition 0)\nproducer.send(record B for partition 0)\nproducer.send(record C for partition 1)\n\npartition 0 batch: A, B\npartition 1 batch: C\n```\n\n이때 batching의 이득은 세 가지다.\n\n- request 수가 줄어 network와 broker overhead가 줄어든다.\n- record header와 protocol overhead가 amortize된다.\n- 여러 record가 같이 압축되어 compression ratio가 좋아질 수 있다.\n\n대신 비용도 있다.\n\n- batch를 채우려고 조금 기다리면 end-to-end latency가 늘 수 있다.\n- partition별 buffer와 전체 `buffer.memory`를 쓴다.\n- compression은 CPU를 쓰고, 작은 batch에서는 이득이 작을 수 있다.\n\n---\n\n## 핵심 설정 세 개\n\n| 설정 | 의미 | 커지면 기대하는 것 | 주의 |\n|---|---|---|---|\n| `linger.ms` | batch가 덜 찼을 때 추가 record를 기다리는 최대 시간 | 더 큰 batch, 더 좋은 compression, request 수 감소 | latency budget을 먹고 broker backpressure에서는 실제 대기가 더 길 수 있다 |\n| `batch.size` | partition별 batch size 상한 | 큰 batch로 throughput 향상 가능 | record가 여러 partition에 흩어지면 잘 안 찰 수 있고 memory footprint가 늘 수 있다 |\n| `compression.type` | producer가 record batch를 압축하는 방식 | network 사용량 감소, storage 감소 | CPU 비용, 작은 batch에서 낮은 효율, consumer/broker 영향 |\n\nApache Kafka 4.x 공식 producer config 기준으로 `linger.ms` 기본값은 5ms로 설명된다. 오래된 자료는 0ms를 기본값으로 설명하는 경우가 있으므로 버전을 확인해야 한다. 숫자를 외우는 것보다 중요한 것은 `linger.ms`가 delay upper bound이고, batch가 `batch.size`에 도달하면 linger가 끝나기 전에도 전송될 수 있다는 점이다.\n\n---\n\n## worked example: 알림 이벤트 vs 결제 이벤트\n\n### 알림 이벤트\n\n초당 수천 건의 알림 이벤트가 들어오고, 개별 이벤트가 몇 ms 늦는 것은 괜찮다고 하자. 이 경우 작은 `linger.ms`를 주고 compression을 켜면 throughput과 network 비용이 좋아질 수 있다.\n\n```text\n목표: high throughput, small delay acceptable\n관찰: batch size average, compression ratio, request rate, produce latency p99\n```\n\n이때 튜닝 방향은 대략 이렇다.\n\n- `linger.ms`를 5ms, 10ms처럼 작은 값부터 실험한다.\n- `batch.size`를 키워도 실제 batch가 차는지 본다.\n- `lz4`나 `zstd` 같은 compression이 CPU와 latency에 맞는지 측정한다.\n- partition key가 너무 잘게 흩어져 batch가 비는지 본다.\n\n### 결제 승인 이벤트\n\n결제 승인 이벤트는 throughput보다 latency와 확정성이 더 중요할 수 있다. 몇 ms의 대기도 무조건 나쁜 것은 아니지만, client response path에 붙어 있다면 latency budget을 먼저 본다.\n\n```text\n목표: predictable latency, correctness first\n관찰: produce latency, delivery timeout, retry, idempotency, outbox relay lag\n```\n\n이 경우 producer batching tuning보다 outbox, idempotency, retry, timeout budget이 먼저일 수 있다. `linger.ms`를 낮춘다고 correctness가 생기지 않고, compression을 켠다고 delivery guarantee가 생기지 않는다.\n\n---\n\n## batch가 안 차는 이유\n\n`batch.size`를 키웠는데 throughput이 안 오를 수 있다. 이유는 자주 다음 중 하나다.\n\n| 원인 | 설명 | 확인 |\n|---|---|---|\n| traffic 자체가 적다 | 기다려도 record가 충분히 안 온다 | partition별 record rate |\n| partition이 너무 많다 | record가 partition별 accumulator에 흩어진다 | partition별 batch average |\n| key 분포가 넓다 | 같은 partition으로 모이는 양이 적다 | key cardinality, partition distribution |\n| `linger.ms`가 너무 낮다 | batch가 차기 전에 바로 나간다 | request rate와 batch size metric |\n| broker backpressure | producer 내부 대기와 retry가 섞인다 | buffer available, request latency, throttle time |\n\n배칭은 topic 전체 record 수가 아니라 partition별로 모이는 record 수에 좌우된다. partition을 늘리면 consumer parallelism은 열리지만 producer batch efficiency는 낮아질 수 있다.\n\n---\n\n## compression은 batch와 같이 본다\n\nCompression은 record 하나씩보다 batch 단위에서 이득이 커지기 쉽다. 비슷한 JSON payload가 많이 모이면 dictionary 효과가 좋아지고 network bytes가 줄어든다. 하지만 CPU와 latency를 같이 쓴다.\n\n| 상황 | compression 판단 |\n|---|---|\n| payload가 크고 반복 구조가 많다 | compression 이득이 클 수 있다 |\n| payload가 이미 압축된 이미지/바이너리다 | 이득이 작고 CPU만 쓸 수 있다 |\n| broker/network가 병목이다 | compression으로 bytes를 줄이는 실험 가치가 있다 |\n| producer CPU가 이미 높다 | compression level/type을 조심한다 |\n| batch가 작다 | compression ratio가 낮을 수 있다 |\n\n`gzip`, `snappy`, `lz4`, `zstd` 같은 선택지는 workload에 따라 다르다. 면접에서는 특정 알고리즘 하나를 정답으로 외우기보다, CPU, compression ratio, latency, compatibility를 측정한다고 말하는 편이 안전하다.\n\n---\n\n## 관측 지표\n\n튜닝 전후에는 최소한 아래를 본다.\n\n| 지표 | 질문 |\n|---|---|\n| batch-size-avg / batch-size-max | batch가 실제로 차는가 |\n| records-per-request-avg | request당 record 수가 늘었는가 |\n| compression-rate-avg | 압축 이득이 있는가 |\n| request-latency-avg/p99 | broker round trip과 대기가 늘었는가 |\n| record-send-rate / byte-rate | 처리량이 실제로 늘었는가 |\n| buffer-available-bytes / bufferpool-wait | producer memory 압박이 있는가 |\n| record-error-rate / retry-rate | throughput 튜닝이 오류를 숨기지 않는가 |\n\n단순히 producer 처리량만 좋아졌다고 성공은 아니다. end-to-end lag, consumer 처리량, broker CPU/network, error rate가 같이 안정적인지 봐야 한다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| `linger.ms`를 올리면 무조건 느려진다 | 작은 linger가 batch 효율을 높여 비슷하거나 낮은 평균 latency를 만들 수도 있지만 p99와 budget을 측정해야 한다 |\n| `batch.size`를 키우면 항상 throughput이 오른다 | partition별 traffic이 적으면 batch가 차지 않는다 |\n| compression은 공짜다 | producer/broker/consumer CPU와 latency를 쓴다 |\n| producer tuning이 delivery guarantee를 만든다 | ordering, idempotence, retry, ack, outbox는 별도 축이다 |\n| partition을 늘리면 producer도 항상 좋아진다 | record가 흩어져 batch efficiency가 낮아질 수 있다 |\n| 최신 기본값은 모든 버전에서 같다 | Kafka client version별 기본값과 의미를 공식 문서로 확인해야 한다 |\n\n---\n\n## 면접 답변 골격\n\n질문이 `Kafka producer에서 linger.ms와 batch.size를 어떻게 튜닝하나요?`라면 이렇게 답한다.\n\n1. producer는 partition별 batch accumulator에 record를 모아 전송한다.\n2. `linger.ms`는 덜 찬 batch를 조금 기다리는 시간 축이고, `batch.size`는 batch size 상한이다.\n3. 더 큰 batch는 request overhead와 network bytes를 줄이고 compression 효율을 높일 수 있다.\n4. 대신 latency budget, memory, CPU, broker backpressure를 같이 본다.\n5. 실제 batch-size-avg, records-per-request, compression-rate, request latency p99를 측정한다.\n6. correctness와 delivery semantics는 batching이 아니라 ack, idempotence, retry, outbox, consumer idempotency 축에서 따로 닫는다.\n\n---\n\n## 꼬리질문\n\n> Q: `batch.size`를 키웠는데 효과가 없으면 무엇을 의심하나요?\n> 의도: partition별 batch accumulation을 이해하는지 확인\n> 핵심: traffic이 적거나 partition/key가 흩어져 batch가 차지 않을 수 있다.\n\n> Q: compression을 켜면 항상 좋은가요?\n> 의도: network와 CPU trade-off 이해 확인\n> 핵심: payload 성격, batch 크기, producer/broker CPU, latency를 같이 측정해야 한다.\n\n> Q: `linger.ms`는 정확히 그 시간만큼 항상 기다리나요?\n> 의도: time-based batching과 size-based batching 관계 확인\n> 핵심: batch가 차면 먼저 전송될 수 있고, broker backpressure가 있으면 실제 대기는 더 길 수 있다.\n\n## 한 줄 정리\n\nKafka producer batching/compression 튜닝은 `linger.ms`, `batch.size`, `compression.type`을 크게 잡는 게임이 아니라, partition별 batch가 실제로 차는지와 latency/memory/CPU/delivery budget이 함께 버티는지 측정하는 trade-off다.\n",
+  "aliases": [
+    "Kafka producer batching",
+    "카프카 프로듀서 배칭",
+    "linger.ms batch.size",
+    "Kafka compression.type",
+    "카프카 압축 튜닝",
+    "producer batch size",
+    "Kafka linger ms",
+    "lz4 zstd Kafka",
+    "batching throughput latency",
+    "프로듀서 버퍼 메모리"
+  ],
+  "expected_queries": [
+    "Kafka producer에서 linger.ms랑 batch.size를 키우면 처리량과 latency가 어떻게 달라져?",
+    "카프카 producer compression.type을 켜면 network는 줄어도 CPU나 p99가 늘 수 있는 이유가 뭐야?",
+    "batch.size를 키웠는데 Kafka producer throughput이 안 오를 때 partition별 batch가 안 차는 원인을 어떻게 봐야 해?",
+    "Kafka producer batching 튜닝할 때 records-per-request, batch-size-avg, compression-rate를 왜 같이 봐야 해?",
+    "linger.ms는 항상 그 시간만큼 기다리는 설정인지 batch.size와 broker backpressure 관점으로 설명해줘",
+    "Kafka producer 배칭은 delivery guarantee나 exactly-once를 해결하는 설정이 아니라는 걸 설명해줘"
+  ],
+  "symptoms": [
+    "Kafka producer 처리량을 올리려고 batch.size만 크게 잡는다",
+    "compression을 켰는데 producer CPU와 p99 latency가 늘어난다",
+    "partition을 늘린 뒤 batch efficiency가 떨어진다",
+    "linger.ms 기본값을 오래된 자료 기준으로 외운다"
+  ],
+  "learner_query_patterns": [],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "system-design/kafka-partition-key-ordering-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/tiered-retry-topic-ladder-backoff-dlq"
+    ],
+    "confusable_with": [
+      "system-design/kafka-partition-count-consumer-parallelism-primer",
+      "system-design/producer-retry-duplicate-origin-primer",
+      "system-design/kafka-consumer-group-partition-ownership-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka consumer group에서 partition ownership과 idle consumer가 생기는 이유를 설명해줘",
+      "Kafka producer retry로 broker append duplicate가 생기는 원인을 알려줘"
+    ]
+  },
+  "metadata": {
+    "created_at": "2026-06-18T00:00:00+09:00",
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "version": 1,
+    "source": "y14-expansion-batch97-stream-a-kafka-producer-tuning",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-producer-batching-compression-tradeoff.md",
+    "reference_note": "Checked against Apache Kafka producer configs documentation for linger.ms/batch.size/compression.type semantics."
+  }
+}
