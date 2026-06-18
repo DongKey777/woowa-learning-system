@@ -4,26 +4,28 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Search Indexing Pipeline 설계를 다루는 deep_dive 문서다. 검색 인덱싱 파이프라인은 원본 데이터를 정규화하고 토큰화해 검색 엔진에 반영하는 지속적 데이터 처리 시스템이다. 검색 질의가 search indexing pipeline, ingest, normalization, tokenization처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Search Indexing Pipeline 설계\n\n> 한 줄 요약: 검색 인덱싱 파이프라인은 원본 데이터를 정규화하고 토큰화해 검색 엔진에 반영하는 지속적 데이터 처리 시스템이다.\n\nretrieval-anchor-keywords: search indexing pipeline, ingest, normalization, tokenization, inverted index, refresh latency, reindex, schema evolution, backfill, dead letter queue, freshness, alias cutover, cdc source, dual read verification\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Search 시스템 설계](./search-system-design.md)\n> - [Search Hit Overlay Pattern](./search-hit-overlay-pattern.md)\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)\n> - [Change Data Capture / Outbox Relay 설계](./change-data-capture-outbox-relay-design.md)\n> - [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)\n> - [Zero-Downtime Schema Migration Platform 설계](./zero-downtime-schema-migration-platform-design.md)\n> - [Dual-Read Comparison / Verification Platform 설계](./dual-read-comparison-verification-platform-design.md)\n> - [Projection Rebuild, Backfill, and Cutover Pattern](../design-pattern/projection-rebuild-backfill-cutover-pattern.md)\n> - [Event Upcaster Compatibility Patterns](../design-pattern/event-upcaster-compatibility-patterns.md)\n> - [JSON `null`, Missing Field, Unknown Property, and Schema Evolution](../language/java/json-null-missing-unknown-field-schema-evolution.md)\n> - [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](../database/cdc-gap-repair-reconciliation-playbook.md)\n\n## 핵심 개념\n\n검색 인덱싱 파이프라인은 \"DB 변경을 검색 엔진에 복제하는 ETL\"보다 더 넓다.\n실전에서는 다음까지 포함한다.\n\n- 소스 데이터 수집\n- 정규화와 스키마 변환\n- 토큰화와 필드 추출\n- 역인덱스 반영\n- freshness 관리\n- reindex와 backfill\n- 장애 복구와 DLQ\n\n즉, 검색 품질은 query 시점보다 ingest 시점에서 이미 결정된다.\n\n## 깊이 들어가기\n\n### 1. Source of truth와 index는 다르다\n\n원본 DB는 정합성 중심이고, 검색 인덱스는 조회 최적화 중심이다.\n둘을 같은 저장소로 취급하면 다음 문제가 생긴다.\n\n- 검색 쿼리가 원본 DB를 압박한다\n- schema 변경이 검색을 망친다\n- freshness와 query latency가 서로 충돌한다\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 신규/변경 문서 5,000건\n- 평균 문서 크기 2 KB\n- reindex window 24시간\n\n인덱싱 파이프라인은 단순 쓰기량뿐 아니라, reprocess와 backfill을 감당해야 한다.\n그래서 평상시 처리량보다 장애 후 재처리 속도를 같이 봐야 한다.\n\n보는 숫자:\n\n- ingest lag\n- indexing throughput\n- reindex duration\n- segment merge cost\n- DLQ 적재량\n\n### 3. 파이프라인 단계\n\n```text\nCDC / Event Stream\n  -> Normalize\n  -> Enrich\n  -> Tokenize\n  -> Build Document\n  -> Write Index\n  -> Refresh / Commit\n```\n\n실무에서 각 단계는 독립적으로 실패할 수 있다.\n그래서 단계별 retry와 DLQ가 필요하다.\n\n### 4. 스키마와 버전 관리\n\n검색 인덱스는 schema evolution에 민감하다.\n\n- 필드 추가\n- analyzer 변경\n- ranking feature 추가\n- 정규화 규칙 변경\n\n권장 전략:\n\n- index versioning\n- alias cutover\n- backward compatible document schema\n- reindex job 분리\n\n이런 구조가 없으면 운영 중 schema change가 곧 서비스 장애가 된다.\nsource DB schema와 search document schema를 같이 바꾸는 경우에는 CDC payload 버전, application rollout, index alias 전환 순서를 함께 설계해야 한다.\n\n### 5. Freshness와 consistency\n\n검색은 \"반영 속도\"가 중요하다.\n\n선택지:\n\n- near real-time indexing\n- micro-batch indexing\n- batch reindex\n\n보통은 신규 데이터는 빠르게, 대량 재처리는 배치로 섞는다.\n즉, `hot path`와 `cold path`를 분리하는 것이 핵심이다.\n\n### 6. Reindex와 backfill\n\n인덱스가 잘못되면 다시 만들어야 한다.\n\n그러려면:\n\n- source of truth에서 재수집 가능해야 한다\n- reindex를 idempotent하게 만들어야 한다\n- alias를 통해 무중단 전환해야 한다\n- backfill이 live indexing을 방해하지 않아야 한다\n\n대규모 재색인은 사실상 replay 작업이므로 범위 지정, checkpoint, live path 보호 전략은 [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)와 거의 같은 문제다.\n\n### 7. 장애와 DLQ\n\n인덱싱은 실패가 흔하다.\n\n- malformed document\n- analyzer 오류\n- external enrichment timeout\n- partial shard failure\n\n대응:\n\n- dead-letter queue\n- bad record quarantine\n- retry with bounded backoff\n- poison pill detection\n\n이 부분은 [Job Queue 설계](./job-queue-design.md)와 묶어서 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 게시글 검색 인덱싱\n\n문제:\n\n- 제목, 본문, 태그를 검색해야 한다\n- 삭제/비공개 상태가 즉시 반영돼야 한다\n\n해결:\n\n- event stream으로 변경 이벤트를 받는다\n- soft delete는 delete tombstone으로 반영한다\n- alias cutover로 reindex를 무중단 처리한다\n\n### 시나리오 2: 검색 analyzer 변경\n\n문제:\n\n- 토큰화 규칙을 바꿔야 한다\n\n해결:\n\n- 새 index version을 만든다\n- backfill 후 alias를 전환한다\n- 구 버전은 점진적으로 retire한다\n\n### 시나리오 3: 대규모 backfill\n\n문제:\n\n- 수억 건 문서를 다시 색인해야 한다\n\n해결:\n\n- partition 단위로 병렬화한다\n- backfill rate limit을 둔다\n- live traffic과 worker pool을 분리한다\n\n## 코드로 보기\n\n```pseudo\nfunction processChange(change):\n  doc = normalize(change)\n  doc = enrich(doc)\n  tokens = tokenize(doc)\n  index.write(doc.id, tokens)\n\nfunction reindex(snapshot):\n  for record in snapshot:\n    queue.publish(record)\n```\n\n```java\npublic IndexedDocument build(ChangeEvent event) {\n    NormalizedDocument doc = normalizer.normalize(event);\n    return indexer.index(doc);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Sync indexing | 단순하다 | write latency 증가 | 아주 작은 시스템 |\n| Async indexing | 서비스 경로가 가볍다 | freshness 지연 | 대부분의 실서비스 |\n| NRT indexing | 반영이 빠르다 | 운영 복잡도 높음 | 검색 중심 서비스 |\n| Batch indexing | 안정적이다 | 지연이 길다 | 로그/아카이브 |\n| Alias cutover | 무중단 전환이 쉽다 | 운영 절차 필요 | schema migration |\n\n핵심은 \"색인만 만든다\"가 아니라 **변경, 반영 지연, 재처리, 스키마 진화까지 운영 가능한가**다.\n\n## 꼬리질문\n\n> Q: 검색 인덱스를 DB 대체로 쓰면 안 되나요?\n> 의도: source of truth와 search index 구분 확인\n> 핵심: 검색 인덱스는 조회 최적화용이라 정합성의 원천이 되기 어렵다.\n\n> Q: reindex는 왜 어려운가요?\n> 의도: 대량 재처리와 무중단 전환 이해 확인\n> 핵심: 데이터량, freshness, live traffic, schema change가 동시에 걸리기 때문이다.\n\n> Q: DLQ에 들어간 문서는 어떻게 하나요?\n> 의도: 운영 복구 감각 확인\n> 핵심: 원인 분석 후 수정 재처리하거나 quarantine 한다.\n\n> Q: freshness를 높이면 무엇을 희생하나요?\n> 의도: latency와 consistency trade-off 이해 확인\n> 핵심: write 비용과 운영 복잡도가 올라간다.\n\n## 한 줄 정리\n\nSearch indexing pipeline은 원본 변경을 검색 가능한 형태로 지속 반영하고, freshness와 재처리, 스키마 진화를 함께 다루는 시스템이다.\n",
+  "body_markdown": "# Search Indexing Pipeline 설계\n\n> 한 줄 요약: 검색 인덱싱 파이프라인은 원본 데이터를 정규화하고 토큰화해 검색 엔진에 반영하는 지속적 데이터 처리 시스템이다.\n\nretrieval-anchor-keywords: search indexing pipeline, ingest, normalization, tokenization, inverted index, refresh latency, reindex, schema evolution, backfill, dead letter queue, freshness, alias cutover, cdc source, dual read verification\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Search 시스템 설계](./search-system-design.md)\n> - [Search Hit Overlay Pattern](./search-hit-overlay-pattern.md)\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)\n> - [Change Data Capture / Outbox Relay 설계](./change-data-capture-outbox-relay-design.md)\n> - [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)\n> - [Zero-Downtime Schema Migration Platform 설계](./zero-downtime-schema-migration-platform-design.md)\n> - [Dual-Read Comparison / Verification Platform 설계](./dual-read-comparison-verification-platform-design.md)\n> - [Projection Rebuild, Backfill, and Cutover Pattern](../design-pattern/projection-rebuild-backfill-cutover-pattern.md)\n> - [Event Upcaster Compatibility Patterns](../design-pattern/event-upcaster-compatibility-patterns.md)\n> - [JSON `null`, Missing Field, Unknown Property, and Schema Evolution](../language/java/json-null-missing-unknown-field-schema-evolution.md)\n> - [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](../database/cdc-gap-repair-reconciliation-playbook.md)\n\n## 핵심 개념\n\n검색 인덱싱 파이프라인은 \"DB 변경을 검색 엔진에 복제하는 ETL\"보다 더 넓다.\n실전에서는 다음까지 포함한다.\n\n- 소스 데이터 수집\n- 정규화와 스키마 변환\n- 토큰화와 필드 추출\n- 역인덱스 반영\n- freshness 관리\n- reindex와 backfill\n- 장애 복구와 DLQ\n\n즉, 검색 품질은 query 시점보다 ingest 시점에서 이미 결정된다.\n\n## 깊이 들어가기\n\n### 1. Source of truth와 index는 다르다\n\n원본 DB는 정합성 중심이고, 검색 인덱스는 조회 최적화 중심이다.\n둘을 같은 저장소로 취급하면 다음 문제가 생긴다.\n\n- 검색 쿼리가 원본 DB를 압박한다\n- schema 변경이 검색을 망친다\n- freshness와 query latency가 서로 충돌한다\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 신규/변경 문서 5,000건\n- 평균 문서 크기 2 KB\n- reindex window 24시간\n\n인덱싱 파이프라인은 단순 쓰기량뿐 아니라, reprocess와 backfill을 감당해야 한다.\n그래서 평상시 처리량보다 장애 후 재처리 속도를 같이 봐야 한다.\n\n보는 숫자:\n\n- ingest lag\n- indexing throughput\n- reindex duration\n- segment merge cost\n- DLQ 적재량\n\n### 3. 파이프라인 단계\n\n```text\nCDC / Event Stream\n  -> Normalize\n  -> Enrich\n  -> Tokenize\n  -> Build Document\n  -> Write Index\n  -> Refresh / Commit\n```\n\n실무에서 각 단계는 독립적으로 실패할 수 있다.\n그래서 단계별 retry와 DLQ가 필요하다.\n\n### 4. 스키마와 버전 관리\n\n검색 인덱스는 schema evolution에 민감하다.\n\n- 필드 추가\n- analyzer 변경\n- ranking feature 추가\n- 정규화 규칙 변경\n\n권장 전략:\n\n- index versioning\n- alias cutover\n- backward compatible document schema\n- reindex job 분리\n\n이런 구조가 없으면 운영 중 schema change가 곧 서비스 장애가 된다.\nsource DB schema와 search document schema를 같이 바꾸는 경우에는 CDC payload 버전, application rollout, index alias 전환 순서를 함께 설계해야 한다.\n\n### 5. Freshness와 consistency\n\n검색은 \"반영 속도\"가 중요하다.\n\n선택지:\n\n- near real-time indexing\n- micro-batch indexing\n- batch reindex\n\n보통은 신규 데이터는 빠르게, 대량 재처리는 배치로 섞는다.\n즉, `hot path`와 `cold path`를 분리하는 것이 핵심이다.\n\n### 6. Reindex와 backfill\n\n인덱스가 잘못되면 다시 만들어야 한다.\n\n그러려면:\n\n- source of truth에서 재수집 가능해야 한다\n- reindex를 idempotent하게 만들어야 한다\n- alias를 통해 무중단 전환해야 한다\n- backfill이 live indexing을 방해하지 않아야 한다\n\n대규모 재색인은 사실상 replay 작업이므로 범위 지정, checkpoint, live path 보호 전략은 [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)와 거의 같은 문제다.\n\n### 7. 장애와 DLQ\n\n인덱싱은 실패가 흔하다.\n\n- malformed document\n- analyzer 오류\n- external enrichment timeout\n- partial shard failure\n\n대응:\n\n- dead-letter queue\n- bad record quarantine\n- retry with bounded backoff\n- poison pill detection\n\n이 부분은 [Job Queue 설계](./job-queue-design.md)와 묶어서 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 게시글 검색 인덱싱\n\n문제:\n\n- 제목, 본문, 태그를 검색해야 한다\n- 삭제/비공개 상태가 즉시 반영돼야 한다\n\n해결:\n\n- event stream으로 변경 이벤트를 받는다\n- soft delete는 delete tombstone으로 반영한다\n- alias cutover로 reindex를 무중단 처리한다\n\n### 시나리오 2: 검색 analyzer 변경\n\n문제:\n\n- 토큰화 규칙을 바꿔야 한다\n\n해결:\n\n- 새 index version을 만든다\n- backfill 후 alias를 전환한다\n- 구 버전은 점진적으로 retire한다\n\n### 시나리오 3: 대규모 backfill\n\n문제:\n\n- 수억 건 문서를 다시 색인해야 한다\n\n해결:\n\n- partition 단위로 병렬화한다\n- backfill rate limit을 둔다\n- live traffic과 worker pool을 분리한다\n\n## 코드로 보기\n\n```pseudo\nfunction processChange(change):\n  doc = normalize(change)\n  doc = enrich(doc)\n  tokens = tokenize(doc)\n  index.write(doc.id, tokens)\n\nfunction reindex(snapshot):\n  for record in snapshot:\n    queue.publish(record)\n```\n\n```java\npublic IndexedDocument build(ChangeEvent event) {\n    NormalizedDocument doc = normalizer.normalize(event);\n    return indexer.index(doc);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Sync indexing | 단순하다 | write latency 증가 | 아주 작은 시스템 |\n| Async indexing | 서비스 경로가 가볍다 | freshness 지연 | 대부분의 실서비스 |\n| NRT indexing | 반영이 빠르다 | 운영 복잡도 높음 | 검색 중심 서비스 |\n| Batch indexing | 안정적이다 | 지연이 길다 | 로그/아카이브 |\n| Alias cutover | 무중단 전환이 쉽다 | 운영 절차 필요 | schema migration |\n\n핵심은 \"색인만 만든다\"가 아니라 **변경, 반영 지연, 재처리, 스키마 진화까지 운영 가능한가**다.\n\n## 꼬리질문\n\n> Q: 검색 인덱스를 DB 대체로 쓰면 안 되나요?\n> 의도: source of truth와 search index 구분 확인\n> 핵심: 검색 인덱스는 조회 최적화용이라 정합성의 원천이 되기 어렵다.\n\n> Q: reindex는 왜 어려운가요?\n> 의도: 대량 재처리와 무중단 전환 이해 확인\n> 핵심: 데이터량, freshness, live traffic, schema change가 동시에 걸리기 때문이다.\n\n> Q: DLQ에 들어간 문서는 어떻게 하나요?\n> 의도: 운영 복구 감각 확인\n> 핵심: 원인 분석 후 수정 재처리하거나 quarantine 한다.\n\n> Q: freshness를 높이면 무엇을 희생하나요?\n> 의도: latency와 consistency trade-off 이해 확인\n> 핵심: write 비용과 운영 복잡도가 올라간다.\n\n## freshness lag를 설명하는 방식\n\n검색 인덱싱 파이프라인은 대개 비동기다. 사용자가 글을 수정하면 DB transaction은 먼저 끝나고, 변경 이벤트가 queue나 CDC를 통해 indexing worker로 전달되며, worker가 문서를 정규화하고 analyzer를 적용한 뒤 검색 엔진에 반영한다. 검색 엔진도 segment refresh나 commit 주기에 따라 즉시 visible하지 않을 수 있다.\n\n그래서 `DB에는 있는데 검색에 없다`는 증상은 한 단계가 아니라 여러 시계의 차이다.\n\n- 원본 DB write time\n- change event publish time\n- indexing worker consume time\n- search engine refresh visible time\n- query cache 또는 result cache expire time\n\n운영 답변에서는 이 시간을 하나의 freshness SLO로 잡고, lag가 어느 구간에서 커졌는지 계측한다고 말해야 한다. 단순히 `refresh interval을 줄이면 된다`고만 하면 write 비용, segment merge 압력, indexing throughput 저하를 놓친다.\n\n## analyzer/schema 변경과 alias cutover\n\nAnalyzer나 field mapping을 바꾸면 이미 색인된 문서가 자동으로 새 규칙으로 다시 token화되지 않는다. 이 때문에 production에서는 새 index version을 만들고 snapshot/backfill로 채운 다음, 검증 후 read alias를 새 index로 넘긴다. 실패하면 alias를 되돌릴 수 있어야 하며, live change stream은 old/new index 양쪽에 dual-write하거나 cutover 시점 이후 replay할 수 있어야 한다.\n\n핵심은 reindex를 단순 batch job으로 보지 않는 것이다. schema evolution, backfill rate limit, live update catch-up, validation query, alias flip, rollback window가 하나의 runbook으로 묶여야 한다. 이 관점은 `검색 인덱스`를 자료구조가 아니라 운영되는 derived data system으로 보게 만든다.\n\n## 한 줄 정리\nSearch indexing pipeline은 원본 변경을 검색 가능한 형태로 지속 반영하고, freshness와 재처리, 스키마 진화를 함께 다루는 시스템이다.\n",
   "aliases": [
     "search indexing pipeline",
-    "ingest",
-    "normalization",
-    "tokenization",
-    "inverted index",
-    "refresh latency",
-    "reindex",
-    "schema evolution",
-    "backfill",
-    "dead letter queue",
-    "freshness",
-    "alias cutover"
+    "검색 인덱싱 파이프라인",
+    "검색 색인 반영 지연",
+    "문서 정규화 색인",
+    "tokenization indexing flow",
+    "inverted index refresh",
+    "reindex alias cutover",
+    "검색 schema evolution",
+    "검색 backfill 재처리",
+    "indexing dead letter queue",
+    "검색 freshness lag",
+    "색인 alias 전환"
   ],
   "expected_queries": [
-    "Search Indexing Pipeline 설계 설계 핵심을 설명해줘",
-    "search indexing pipeline가 왜 필요한지 알려줘",
-    "Search Indexing Pipeline 설계 실무 트레이드오프는 뭐야?",
-    "search indexing pipeline 설계에서 흔한 실수는 무엇이야?"
+    "검색 인덱스에 원본 데이터 변경을 반영할 때 ingest, normalization, tokenization 순서를 어떻게 잡아?",
+    "문서 schema가 바뀌면 reindex 없이 검색 결과를 바로 바꾸기 어려운 이유가 뭐야?",
+    "inverted index refresh latency 때문에 방금 쓴 글이 검색에 안 보일 때 무엇을 확인해?",
+    "검색 인덱싱 파이프라인에서 실패한 문서를 재처리하려면 어떤 checkpoint가 필요해?",
+    "검색 analyzer를 바꿀 때 왜 새 index를 만들고 alias cutover를 해야 해?",
+    "DB는 업데이트됐는데 검색 결과가 늦게 바뀌는 freshness lag를 어떻게 설계로 설명해?"
   ],
   "symptoms": [
     "`Search Indexing Pipeline 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +35,32 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/search-inverted-index-interview-primer",
+      "system-design/text-analyzer-chain-cjk-ngram-tradeoff"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/search-index-backfill-alias-cutover-recovery-playbook",
+      "system-design/document-search-ranking-platform-design",
+      "system-design/search-shard-replica-fanout-tail-latency-playbook"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/materialized-view-vs-search-index-vs-cache-derived-data-chooser",
+      "system-design/historical-backfill-replay-platform-design",
+      "database/secondary-index-change-propagation"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/search-indexing-pipeline-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "note": "Expanded search platform query surfaces for batch103."
+      }
+    ]
   }
 }

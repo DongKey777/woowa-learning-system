@@ -1,0 +1,69 @@
+{
+  "id": "database/jpa-batch-insert-identity-rewritebatched-pitfall",
+  "title": "JPA Batch Insert IDENTITY rewriteBatchedStatements Pitfall",
+  "category": "database",
+  "level": "advanced",
+  "summary": "JPA `saveAll`이 느리고 insert가 한 줄씩 나가는 증상은 보통 한 가지 설정 문제가 아니라, Hibernate batching 조건, `GenerationType.IDENTITY`의 즉시 key 필요성, MySQL Connector/J `rewriteBatchedStatements`, flush/clear chunk, connection 점유 시간이 겹친 결과다. 레이어별로 나눠야 잘못된 튜닝을 피할 수 있다.",
+  "body_markdown": "# JPA Batch Insert IDENTITY rewriteBatchedStatements Pitfall\n\n> 한 줄 요약: JPA batch insert가 안 먹히는 대표 원인은 `saveAll`이 아니라 IDENTITY generator, Hibernate batch 조건, MySQL driver rewrite, flush/clear chunk를 한 레이어로 섞어 보는 데 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Hibernate JDBC Batch Size, Flush, Clear Primer](./hibernate-jdbc-batch-size-flush-clear-primer.md)\n- [MySQL rewriteBatchedStatements Primer](./mysql-rewrite-batched-statements-primer.md)\n- [JDBC 실전 코드 패턴](./jdbc-code-patterns.md)\n- [Connection Pool, Transaction Propagation, Bulk Write](./connection-pool-transaction-propagation-bulk-write.md)\n- [Query Tuning Checklist](./query-tuning-checklist.md)\n\nretrieval-anchor-keywords: JPA batch insert identity rewriteBatchedStatements pitfall, GenerationType.IDENTITY disables batching, saveAll insert one by one, Hibernate batch insert MySQL, hibernate.jdbc.batch_size identity, MySQL rewriteBatchedStatements JPA, JPA 대량 insert 느림, auto increment identity batch insert, flush clear batch insert, JPA saveAll 성능\n\n---\n\n## 증상부터 보기\n\n학습자가 자주 만나는 문장은 이렇다.\n\n```text\nsaveAll로 1000건 저장했는데 insert가 1000번 나가요.\nhibernate.jdbc.batch_size를 줬는데도 빨라지지 않아요.\nMySQL인데 rewriteBatchedStatements를 켜야 하나요?\n```\n\n이 증상은 한 가지 답으로 끝나지 않는다. 아래 세 레이어를 나눠야 한다.\n\n| 레이어 | 먼저 볼 질문 |\n|---|---|\n| Hibernate | batch_size, flush 시점, SQL shape, ID generator가 batching을 허용하는가 |\n| JDBC driver | `executeBatch()`를 MySQL에 효율적으로 보내도록 rewrite가 켜져 있는가 |\n| 운영 경계 | chunk, transaction, connection hold time, index/constraint 비용이 병목은 아닌가 |\n\n---\n\n## IDENTITY가 왜 자주 막는가\n\n`GenerationType.IDENTITY`는 보통 DB auto increment로 key를 만든다. 문제는 애플리케이션이 insert 직후 생성된 id를 알아야 엔티티를 managed 상태로 계속 다룰 수 있다는 점이다.\n\n```text\npersist entity\n  -> insert immediately\n  -> generated id read\n  -> entity id 채움\n```\n\n이 흐름에서는 Hibernate가 insert 여러 개를 오래 모아 두기 어렵다. 그래서 IDENTITY 전략은 Hibernate insert batching을 깨는 대표 원인으로 나온다.\n\n반대로 sequence/pooled optimizer/application-assigned id처럼 insert 전에 id를 확보할 수 있는 전략은 batching과 더 잘 맞을 수 있다. MySQL auto increment 중심 테이블에서는 이 한계가 특히 자주 드러난다.\n\n---\n\n## rewriteBatchedStatements는 다른 문제다\n\nIDENTITY가 Hibernate batch 자체를 막는 문제라면, `rewriteBatchedStatements=true`는 MySQL driver가 이미 받은 batch를 어떻게 보낼지의 문제다.\n\n즉 순서는 이렇게 봐야 한다.\n\n```text\n1. Hibernate가 batch를 만들 수 있는가?\n2. 만들어진 JDBC batch를 MySQL driver가 효율적으로 rewrite하는가?\n3. DB와 transaction boundary가 그 batch를 감당하는가?\n```\n\n1번이 안 되면 2번을 켜도 기대한 효과가 작다. 1번이 되더라도 2번이 빠져 있으면 MySQL에서 round trip 절감이 기대보다 작을 수 있다.\n\n---\n\n## 실전 점검 순서\n\n1. 엔티티 id 전략을 확인한다. `GenerationType.IDENTITY`인지 본다.\n2. Hibernate batch 설정을 확인한다. `hibernate.jdbc.batch_size`, `order_inserts`가 있는지 본다.\n3. batch 대상 SQL shape가 같은지 본다. 엔티티 종류와 nullable column 조합이 섞이면 쪼개질 수 있다.\n4. MySQL JDBC URL에 `rewriteBatchedStatements=true`가 있는지 본다.\n5. 대량 작업이면 chunk마다 `flush/clear`하고 transaction 크기를 제한한다.\n6. connection pool active time, borrow wait, DB redo/index/constraint 비용을 같이 본다.\n\n이 순서를 지키면 “pool size를 늘리자”, “batch_size를 1000으로 키우자” 같은 성급한 처방을 줄일 수 있다.\n\n---\n\n## 선택지와 trade-off\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| IDENTITY 유지 | MySQL auto increment와 단순하게 맞는다 | Hibernate insert batching이 제한될 수 있다 |\n| UUID/ULID/application assigned id | insert 전에 id를 알 수 있어 batch에 유리하다 | key 크기, index locality, 도메인 규칙 검토 필요 |\n| sequence/pooled optimizer | batch-friendly id allocation | DB 지원과 설정 복잡도 필요 |\n| JDBC/MyBatis bulk path 분리 | 대량 import 성능을 직접 제어하기 쉽다 | JPA 영속성 컨텍스트와 도메인 이벤트 경계를 따로 관리해야 한다 |\n\n대량 import 전용 경로와 일반 도메인 저장 경로를 분리하는 선택도 현실적이다. 모든 write path를 JPA batch에 맞추려다 도메인 모델과 운영성이 모두 나빠질 수 있다.\n\n---\n\n## 관측 예시\n\n좋은 검증은 “설정했는가”가 아니라 “어느 레이어에서 묶였는가”를 본다.\n\n- Hibernate statistics: prepared statement 수와 batch execution 수\n- datasource-proxy/p6spy: `executeBatch` 호출 여부\n- MySQL general log/performance_schema: multi-value insert 또는 round trip 감소\n- application rows/sec와 p95 latency\n- Hikari active/borrow wait: connection을 너무 오래 잡지 않는지\n- DB redo log, index maintenance, lock wait\n\ninsert 개수만 줄었다고 끝이 아니다. 너무 큰 batch는 실패 범위, rollback 비용, lock 유지 시간, packet 크기를 키울 수 있다.\n\n---\n\n## 흔한 오해\n\n- `saveAll`을 쓰면 JPA가 알아서 batch insert를 한다고 생각한다.\n- `hibernate.jdbc.batch_size`를 설정했으니 IDENTITY에서도 insert가 묶일 거라고 본다.\n- `rewriteBatchedStatements=true`를 붙이면 Hibernate batching 조건과 무관하게 빨라진다고 생각한다.\n- batch size를 크게 할수록 무조건 빠르다고 본다. 커넥션 점유와 rollback 비용도 커진다.\n- 대량 import 요구와 일반 도메인 저장 요구를 같은 repository 메서드로 끝내려 한다.\n\n## 한 줄 정리\n\nJPA batch insert 성능 문제는 `saveAll` 한 줄이 아니라 ID 생성 전략, Hibernate batch 생성, MySQL driver rewrite, flush/clear chunk, connection hold time을 순서대로 분해해야 원인을 맞출 수 있다.\n",
+  "aliases": [
+    "JPA batch insert identity",
+    "GenerationType.IDENTITY batching",
+    "saveAll insert one by one",
+    "hibernate batch identity",
+    "rewriteBatchedStatements JPA",
+    "JPA 대량 insert 느림",
+    "auto increment batch insert",
+    "hibernate.jdbc.batch_size identity",
+    "MySQL JPA batch pitfall",
+    "JPA saveAll 성능",
+    "배치 인서트 함정",
+    "JPA batch insert pitfall"
+  ],
+  "expected_queries": [
+    "JPA saveAll로 대량 insert를 하는데 GenerationType.IDENTITY 때문에 batch가 안 먹힐 수 있어?",
+    "hibernate.jdbc.batch_size와 MySQL rewriteBatchedStatements를 둘 다 설정했는데 insert가 한 줄씩 나가는 이유는 뭐야?",
+    "JPA batch insert가 느릴 때 ID generator, driver rewrite, flush clear를 어떤 순서로 확인해야 해?",
+    "MySQL auto increment IDENTITY 전략이 Hibernate insert batching을 깨는 이유를 설명해줘",
+    "대량 import에서 JPA batch path와 JDBC bulk path를 분리할지 어떻게 판단해?"
+  ],
+  "symptoms": [
+    "JPA saveAll을 쓰면 대량 insert가 자동으로 batch 처리된다고 생각한다.",
+    "IDENTITY generator가 insert 직후 generated key를 요구해 Hibernate batching을 막을 수 있다는 점을 놓친다.",
+    "rewriteBatchedStatements를 Hibernate batch 설정과 같은 레이어로 착각한다.",
+    "batch size만 키우고 flush/clear, transaction 크기, connection hold time을 측정하지 않는다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/hibernate-jdbc-batch-size-flush-clear-primer",
+      "database/mysql-rewrite-batched-statements-primer",
+      "database/connection-pool-transaction-propagation-bulk-write"
+    ],
+    "next_docs": [
+      "database/query-tuning-checklist",
+      "database/jdbc-code-patterns",
+      "database/connection-pool-sizing-timeout-tuning-intermediate-primer"
+    ],
+    "confusable_with": [
+      "database/hibernate-jdbc-batch-size-flush-clear-primer",
+      "database/mysql-rewrite-batched-statements-primer",
+      "database/n-plus-one-query-detection-solutions",
+      "database/connection-pool-transaction-propagation-bulk-write"
+    ],
+    "forbidden_for_queries": [
+      "N+1 query에서 fetch join과 EntityGraph를 언제 쓰는지 알려줘",
+      "Spring Batch JobRepository와 ExecutionContext 재시작성을 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch58-stream-a-jpa-mysql-batch"
+      }
+    ]
+  }
+}

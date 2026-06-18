@@ -4,28 +4,24 @@
   "category": "network",
   "level": "intermediate",
   "summary": "timeout, retry, circuit breaker, retry budget을 한 요청 경로의 failure containment 관점으로 묶는다. 외부 API가 느리거나 실패할 때 timeout을 늘릴지 retry를 넣을지 circuit breaker를 열지 구분한다. Timeout은 기다림의 상한, retry는 다시 시도하는 정책, circuit breaker는 실패한 dependency를 잠시 차단하는 상태 기계다.",
-  "body_markdown": "# Timeout, Retry, Circuit Breaker, Budget Perspective Map\n\n## 이 문서가 맡는 질문\n외부 API가 느리거나 실패할 때 timeout을 늘릴지 retry를 넣을지 circuit breaker를 열지 구분한다. Timeout은 기다림의 상한, retry는 다시 시도하는 정책, circuit breaker는 실패한 dependency를 잠시 차단하는 상태 기계다.\n\n## 빠른 분기\ntimeout은 요청 latency budget 안에서 잡고, retry는 idempotent이고 retryable한 실패에만 둔다. circuit breaker는 실패율이 높을 때 빠르게 거절해 thread와 connection을 보호한다.\n\n## 실전 시나리오\n결제 승인 API가 p95 300ms인데 장애 때 5초까지 늘었다. client timeout이 10초고 retry 3회면 한 사용자 요청이 최대 30초 동안 자원을 잡는다. circuit breaker가 없으면 모든 worker가 결제사를 기다리며 내부 API까지 느려진다.\n\n## CS 배경\n분산 시스템에서 timeout은 partial failure를 감지하는 failure detector다. Retry는 확률적으로 성공률을 높이지만 load amplification을 만든다. Circuit breaker는 closed/open/half-open 상태를 가진 control loop다. Budget은 end-to-end deadline을 하위 호출에 나눠 주는 방식이다.\n\n## 깊게 볼 포인트\nretry가 항상 안정성을 높이지 않는다. timeout이 길고 retry가 많으면 장애 dependency에 트래픽을 더 밀어 넣는다. retryable error, idempotency, jittered backoff, max attempts, hedging 여부를 함께 봐야 한다. circuit breaker threshold는 오류율뿐 아니라 volume과 half-open probe 수를 포함해야 한다.\n\n## 다음 행동\n1. 전체 사용자 요청 latency budget을 정한다. 2. 하위 호출별 timeout을 budget 안에 배치한다. 3. retry 가능한 실패와 아닌 실패를 나눈다. 4. circuit breaker open 시 fallback이나 빠른 실패 응답을 정한다.\n\n## 확인 질문\n이 실패는 기다리면 되는 지연인가, 다시 시도하면 성공할 일시 실패인가, 잠시 차단해야 하는 dependency 장애인가?\n\n## 추가 예시\n같은 503이라도 rate limit이면 retry-after를 존중하고, validation error면 retry하지 않는다. timeout 후 retry를 할 때는 이전 요청이 서버에서 성공했을 수 있으므로 idempotency key나 status 조회가 필요하다.\n\n## 설정 예시\n```text\nrequest deadline: 1500ms\nconnect timeout: 200ms\nread timeout: 800ms\nretry: max 2, exponential backoff 100ms + jitter, only idempotent 5xx/timeout\nbreaker: failure_rate >= 50% over 20 calls, half_open probes = 3\n```\n이 숫자는 정답이 아니라 budget을 쪼개는 예시다. 두 번 재시도하면 최악 지연은 각 attempt와 backoff의 합으로 커지므로, caller deadline 안에서 retry가 끝나도록 설계해야 한다.\n\n## 판단 매트릭스\n- Timeout 근거: connect, TLS handshake, pool acquire, read, request deadline 중 어디에서 시간이 소모되는지 분리한다.\n- Retry 근거: 멱등성, retryable error, exponential backoff, jitter, retry budget이 모두 있을 때만 재시도한다.\n- Breaker 근거: failure rate와 slow call rate가 threshold를 넘고, half-open probe로 복구를 확인할 수 있어야 한다.\n- 리뷰 질문: 이 설정은 장애를 숨기는가, 아니면 호출자에게 빠르게 실패를 돌려 전체 예산을 지키는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 end-to-end latency budget, timeout count, retry attempts, breaker open rate, fallback rate이다. 한 요청의 하위 호출별 latency 합이 전체 budget을 넘는지 본다. retry 후 성공률만 보지 말고 retry가 만든 추가 요청 수와 p95 증가를 같이 본다. \n\n## 자주 하는 오해\n- retry를 넣으면 항상 안정적이라고 생각한다\n- timeout을 하위 호출마다 독립적으로 길게 둔다\n- circuit breaker를 단순 if문 fallback으로만 이해한다\n이 오해를 줄이려면 timeout을 숫자 하나로 두지 말고 호출 체인의 deadline budget으로 본다. 재시도는 성공률을 올릴 수 있지만 같은 downstream에 더 많은 요청을 몰아 retry storm을 만들 수도 있다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 실패가 연결 지연, 응답 지연, pool 대기, downstream 오류 중 어디인지 분류한다. 그 다음 timeout 분리, deadline propagation, backoff+jitter, circuit breaker 상태 전이를 설명한다. 마지막에는 성공률, 오류율, 처리량, p95/p99 레이턴시가 어떻게 바뀌는지 측정 계획을 붙인다.\n\n## 실전 검증 루프\n1. connect/read/request timeout과 pool acquire timeout을 분리해 현재 값을 기록한다.\n2. downstream 지연과 오류를 주입해 retry 횟수, total attempt, caller latency를 측정한다.\n3. backoff+jitter와 retry budget을 적용한 뒤 QPS 증폭률과 p99를 비교한다.\n4. breaker open/half-open/closed 전이와 recovery latency를 로그와 metric으로 검증한다.\n5. 전체 호출 체인의 deadline 안에서 실패가 빠르게 반환되는지 확인한다.\n\n이 루프를 지키면 timeout/retry 문서는 장애 대응 옵션 나열이 아니라 분산 시스템의 예산 관리 자료가 된다.\n\n## 품질 관점\n프로토콜 상태, timeout, retry, 중간 장비, client/server 관측값을 분리해 같은 증상을 재현한다. 이 문서의 답변 품질은 `Timeout, Retry, Circuit Breaker, Budget Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p99_ms, retransmit_or_retry_count, timeout_count, connection_reuse_ratio`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# Timeout, Retry, Circuit Breaker, Budget Perspective Map\n\n## 이 문서가 맡는 질문\n외부 API가 느리거나 실패할 때 timeout을 늘릴지, retry를 넣을지, circuit breaker를 열지, 또는 빠르게 실패시킬지 판단한다. 이 문서의 중심은 옵션 목록이 아니라 한 사용자 요청의 end-to-end latency budget 안에서 failure containment를 설계하는 것이다.\n\n## 빠른 분기\ntimeout은 기다릴 수 있는 상한을 정한다. retry는 일시적이고 retryable하며 멱등성이 보장된 실패에만 둔다. circuit breaker는 dependency가 이미 나쁜 상태일 때 새 호출을 잠시 막아 caller thread, connection, queue를 보호한다. retry budget은 재시도가 성공률을 올리는 대신 downstream 트래픽을 증폭하지 않도록 총 attempt를 제한한다.\n\n## 실전 시나리오\n결제 승인 API의 정상 p95는 300ms인데 장애 때 5초까지 늘어난다. client read timeout이 10초이고 retry가 3회면 한 사용자 요청이 최악 30초 이상 worker와 connection을 잡을 수 있다. 이때 timeout을 더 늘리면 사용자는 더 오래 기다리고 내부 pool은 더 빨리 고갈된다. breaker가 열려 빠른 실패나 fallback을 주면 일부 기능은 실패하더라도 전체 서비스의 queue collapse를 막을 수 있다.\n\n## budget 사고법\n상위 요청 deadline이 1500ms라면 connect, TLS, pool acquire, server processing, read, retry backoff가 모두 그 안에 들어와야 한다. 하위 호출마다 독립적으로 2초 timeout을 주면 호출 체인의 합이 상위 deadline을 넘는다. deadline propagation은 남은 시간을 하위 호출에 전달하는 방식이고, retry는 남은 시간 안에서만 시도해야 한다. retry가 caller deadline 밖에서 계속 돌면 사용자에게는 실패했지만 downstream에는 작업이 남는다.\n\n## retry 판단 기준\n재시도는 실패 종류와 operation semantics를 함께 봐야 한다. connection reset, timeout, 일부 5xx는 retry 후보가 될 수 있지만 validation error, auth failure, non-idempotent mutation은 보통 retry하지 않는다. 결제나 주문 생성처럼 서버에서 이미 성공했을 수 있는 작업은 idempotency key, status 조회, duplicate suppression 없이 retry하면 중복 부작용을 만든다. exponential backoff와 jitter는 동시에 몰리는 retry storm을 줄이기 위한 기본 장치다.\n\n## circuit breaker 판단 기준\nbreaker는 closed, open, half-open 상태를 가진 control loop다. 단순히 `if error then fallback`이 아니다. failure rate, slow call rate, minimum volume, open duration, half-open probe 수를 정하고, 회복 확인 전에는 새 호출을 제한한다. breaker open은 장애를 숨기는 기능이 아니라 dependency 보호와 caller 자원 보호를 위한 빠른 실패 신호다. fallback은 stale cache, degraded response, enqueue, 명시적 실패처럼 제품 요구에 맞게 정해야 한다.\n\n## 판단 매트릭스\n- connect 지연: DNS/TCP/TLS 또는 network path 문제이므로 connect timeout과 connection reuse를 본다.\n- read 지연: upstream 처리나 response streaming 문제이므로 server latency와 read timeout을 분리한다.\n- pool 대기: connection pool이나 thread pool 고갈이므로 retry를 추가하면 악화될 수 있다.\n- 일시 5xx: 멱등성과 retry budget이 있으면 backoff+jitter로 제한 재시도한다.\n- 높은 실패율/느린 호출률: breaker threshold와 half-open probe로 dependency를 격리한다.\n- rate limit: provider의 `Retry-After`와 quota 정책을 존중하고 blind retry를 피한다.\n\n## 측정 지표\n`end_to_end_deadline_ms`, `timeout_count_by_phase`, `retry_attempts_per_request`, `retry_amplification_ratio`, `breaker_state`, `breaker_open_rate`, `half_open_success_rate`, `fallback_rate`, `caller_p99_ms`, `downstream_qps`를 함께 본다. retry 후 성공률만 보면 위험하다. retry가 만든 추가 요청 수, downstream p99, caller queue depth가 같이 좋아져야 안정성 개선으로 인정할 수 있다.\n\n## 검증 루프\n1. 현재 connect/read/request/pool timeout과 retry 횟수를 한 요청 경로에 적는다.\n2. downstream latency와 5xx를 주입해 caller p99, total attempts, pool 점유 시간을 본다.\n3. retryable error와 non-retryable error를 분리하고 idempotency key가 필요한 작업을 표시한다.\n4. backoff+jitter와 retry budget을 적용한 뒤 amplification ratio를 비교한다.\n5. breaker open, half-open, close 전이를 로그와 metric으로 확인한다.\n6. fallback이 product contract와 맞는지, 빠른 실패가 사용자에게 어떻게 보이는지 검토한다.\n\n## 자주 하는 오해\n- retry를 넣으면 항상 안정성이 오른다고 생각한다.\n- timeout을 하위 호출마다 길게 주면 안전하다고 본다.\n- circuit breaker를 예외 처리 if문이나 fallback 함수로만 이해한다.\n- breaker open을 장애 은폐로만 보고 caller 자원 보호 효과를 놓친다.\n- retry budget 없이 provider rate limit을 재시도로 뚫으려 한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 먼저 실패가 connect, pool acquire, read, upstream error, rate limit 중 어디인지 분류해야 한다. 그 다음 end-to-end deadline, retryable 조건, idempotency, backoff+jitter, breaker state transition을 연결한다. 마지막에는 retry amplification, breaker open rate, fallback rate, caller p99로 검증 계획을 제시한다.\n\n## 한 줄 정리\ntimeout, retry, circuit breaker는 각각 따로 켜는 옵션이 아니라 한 요청의 시간 예산과 장애 전파 범위를 관리하는 같은 설계 문제다.\n",
   "aliases": [
-    "timeout retry circuit breaker",
-    "retry budget",
-    "타임아웃 재시도 서킷브레이커",
-    "failure containment",
+    "timeout retry budget",
+    "타임아웃 재시도 예산",
+    "서킷브레이커 half open",
+    "retry storm 방지",
+    "빠른 실패 설계",
+    "deadline propagation",
     "backoff jitter",
-    "dependency failure budget",
-    "circuit breaker half open",
-    "timeout budget",
-    "retry amplification",
-    "빠른 실패 fallback",
-    "timeout retry circuit breaker budget fallback half open retry amplification"
+    "의존성 장애 격리",
+    "retry amplification"
   ],
   "expected_queries": [
-    "timeout retry circuit breaker를 한 번에 어떻게 설계해?",
-    "외부 API가 느릴 때 timeout을 늘릴지 circuit breaker를 둘지 어떻게 판단해?",
-    "retry budget이 왜 필요해?",
-    "timeout과 deadline 차이를 요청 경로로 설명해줘",
-    "circuit breaker half-open은 왜 필요해?",
-    "재시도가 장애를 더 키우는 경우를 알려줘",
-    "외부 API 장애에서 timeout retry circuit breaker를 어떻게 구분해?"
+    "외부 API가 느릴 때 timeout을 늘릴지 retry를 넣을지 circuit breaker를 둘지 어떻게 판단해?",
+    "retry budget이 없으면 장애 상황에서 왜 더 위험해져?",
+    "circuit breaker의 half-open 상태는 어떤 문제를 해결하려고 있는 거야?",
+    "timeout과 deadline을 호출 체인 예산으로 어떻게 나눠야 해?",
+    "결제 같은 비멱등 작업에서 재시도를 안전하게 하려면 무엇이 필요해?"
   ],
   "symptoms": [
     "retry를 넣으면 항상 안정적이라고 생각한다",
@@ -54,7 +50,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +63,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

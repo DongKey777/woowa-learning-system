@@ -6,15 +6,24 @@
   "summary": "이 router는 CPU utilization이 낮아도 latency가 높은 상황에서 cgroup throttling, GC/safepoint, lock contention을 분기한다.",
   "body_markdown": "# CPU Throttling GC Lock Contention Router\n\n## 관찰 증거\n\nCPU 사용률 평균은 낮은데 p99 latency가 높거나 주기적으로 튄다. 이때 \"CPU가 남으니 CPU 문제는 아니다\"라고 단정하면 안 된다.\n\n이 router의 첫 분기는 **실행 시간이 잘렸는가, JVM이 스스로 멈췄는가, lock 앞에서 잤는가**다. 셋 다 CPU percent를 낮게 보이게 만들 수 있으므로, 평균 CPU보다 timestamp correlation과 runnable/wait state를 먼저 본다.\n\n## 1차 분기\n\nCgroup throttling은 container가 quota를 다 써서 실행 시간이 잘리는 문제다. cgroup v2에서는 `cpu.max`로 quota/period를 보고, `cpu.stat`의 `nr_throttled`와 `throttled_usec` 증가, run queue, container limit을 함께 본다.\n\nGC/safepoint는 JVM이 application thread를 멈추는 구간이다. GC log, JFR safepoint event, stop-the-world pause와 latency spike timestamp를 맞춘다.\n\nLock contention은 thread가 CPU를 쓰지 못하고 lock 앞에서 기다리는 문제다. Thread dump의 `BLOCKED`, futex off-CPU profile, synchronized hotspot을 본다.\n\n## 분기 matrix\n\n| 관찰 | 더 가까운 후보 | 추가 확인 |\n|---|---|---|\n| CPU utilization 평균은 낮지만 throttled time과 run queue가 같이 증가 | cgroup throttling 또는 quota mismatch | quota/period, pod/container limit, burst traffic, runnable thread 수 |\n| Latency spike가 GC log pause와 같은 시간에 반복 | GC/safepoint | allocation rate, heap pressure, safepoint reason, native memory, humongous allocation |\n| Thread dump에서 같은 monitor 앞 `BLOCKED`가 반복 | lock contention | lock owner stack, critical section I/O, synchronized hotspot, DB/remote call 포함 여부 |\n| CPU도 낮고 BLOCKED도 적지만 요청이 멈춤 | downstream wait 또는 connection pool | socket wait, DB pool active/waiting, timeout, remote p99 |\n\n## 운영 관찰 기준\n\n- 한 시점의 CPU percent보다 timestamp correlation을 우선한다. p99 spike, GC pause, throttled period, thread dump, request log를 같은 시간축에 놓는다.\n- Container 환경에서는 host CPU 여유와 container quota가 다를 수 있으므로 node 지표와 cgroup 지표를 분리한다. host가 여유 있어도 해당 cgroup의 quota가 소진되면 throttle될 수 있다.\n- JVM 문제는 GC log만 보지 말고 JFR safepoint, allocation rate, thread state, lock event를 같이 본다.\n- Lock 문제는 `BLOCKED` 개수만 보지 말고 같은 lock이 오래 유지되는지, owner가 CPU를 쓰는지 I/O를 기다리는지 본다.\n- 조치 후에는 평균 latency뿐 아니라 tail latency, error/retry, queue age, throughput 변화가 같이 개선되는지 확인한다.\n\n## 명령으로 보는 첫 증거\n\n```bash\n# cgroup v2 CPU quota: \"max\"면 hard quota 없음, \"quota period\"면 period마다 quota가 리필된다.\ncat /sys/fs/cgroup/cpu.max\ncat /sys/fs/cgroup/cpu.stat\n\n# 프로세스 관점 context switch와 runnable/wait 상태\npidstat -u -w -p <pid> 1\ncat /proc/<pid>/sched\n\n# JVM 관점 pause/lock 후보\njcmd <pid> Thread.print\njcmd <pid> JFR.check\n```\n\n`cpu.stat`은 누적값이므로 spike 전후 delta를 본다. `throttled_usec`가 늘어도 그 시간이 곧 요청 latency 전체 원인이라고 단정하지 말고, 같은 구간의 request p99, GC pause, lock owner stack과 겹치는지 확인한다.\n\n컨테이너 안에서 `/sys/fs/cgroup`이 보이더라도 host 전체 scheduler state와 같지는 않다. cgroup quota/period는 container boundary 안의 실행 예산이고, 실제 CPU run queue와 IRQ/NUMA locality는 host 관찰이 필요할 수 있다.\n\n## 다음 확인\n\nCPU utilization은 평균이다. Throttling, pause, lock wait는 짧은 구간의 tail latency를 만들 수 있으므로 timestamp correlation이 중요하다.\n\n조치 검증:\n\n- CPU limit을 조정했다면 `nr_throttled`/`throttled_usec` delta와 p99가 같이 줄었는가\n- GC 조정을 했다면 pause time은 줄었지만 lock wait나 queue age가 남지 않았는가\n- lock 수정 후에는 `BLOCKED`/futex off-CPU 시간이 줄고 throughput이 올라갔는가\n- 세 지표 중 하나만 좋아졌는데 tail latency가 그대로면 downstream wait와 pool queue로 다음 분기를 넘긴다\n\n## 답변에서 피할 단정\n\nCPU가 낮다고 CPU 계층을 제외하거나, GC 로그가 보인다고 GC만 원인이라고 단정하지 않는다. Throttling, safepoint, lock wait, downstream wait가 같은 장애에서 동시에 나타날 수 있으므로 가장 먼저 시간 상관관계와 대기 상태를 분리한다.\n\n## 관련 playbook\n\nJVM pause는 `safepoint-stop-the-world-diagnostics`, lock wait는 `lock-contention-futex-offcpu-debugging`으로 이어진다.\n",
   "aliases": [
-    "CPU throttling GC lock contention router",
-    "CPU throttling GC lock contention 구분",
-    "CPU 낮은데 latency 높음 triage",
-    "cgroup throttling lock GC latency"
+    "CPU throttling GC lock triage",
+    "cgroup throttling p99 latency",
+    "GC safepoint lock contention",
+    "CPU 낮은데 latency 높음",
+    "run queue throttle pause",
+    "lock contention GC 구분",
+    "CPU 스로틀링 GC 락",
+    "p99 런타임 병목 분석",
+    "throttled_usec latency correlation",
+    "safepoint futex offcpu router"
   ],
   "expected_queries": [
     "CPU가 낮은데 latency가 높으면 뭘 봐야 해?",
     "cgroup CPU throttling과 GC pause와 lock contention을 어떻게 구분해?",
-    "p99 latency가 튈 때 OS와 JVM 지표를 어떻게 나눠?"
+    "p99 latency가 튈 때 OS와 JVM 지표를 어떻게 나눠?",
+    "cpu.stat의 throttled_usec 증가와 request p99 spike를 어떻게 상관분석해?",
+    "GC safepoint와 lock contention이 둘 다 보이면 어떤 시간축으로 원인을 좁혀?",
+    "thread dump의 BLOCKED와 futex off-CPU profile을 lock contention 증거로 어떻게 해석해?"
   ],
   "symptoms": [
     "CPU utilization은 낮지만 run queue나 throttling이 보입니다",

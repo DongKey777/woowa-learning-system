@@ -1,0 +1,70 @@
+{
+  "id": "language/java-wait-notify-basics",
+  "title": "Java wait/notify 협력 기초",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "Java wait/notify는 스레드끼리 이벤트 문자열을 보내는 API가 아니라, 같은 monitor 아래에서 공유 조건이 바뀔 때까지 기다리고 깨우는 조건 대기 프로토콜이다.",
+  "body_markdown": "# Java wait/notify 협력 기초\n\n> 한 줄 요약: `wait()`/`notify()`는 스레드끼리 메시지를 보내는 API가 아니라, 같은 monitor 아래에서 공유 조건(predicate)이 바뀔 때까지 기다리고 깨우는 조건 대기 프로토콜이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Java 스레드와 동기화 기초](./java-thread-basics.md)\n- [Java synchronized vs ReentrantLock 기초](./java-synchronized-vs-lock-basics.md)\n- [Java Memory Model Happens-Before Beginner Primer](./java-memory-model-happens-before-beginner-primer.md)\n- [wait/notify, Condition, Spurious Wakeup, and Lost Signal](./wait-notify-condition-spurious-wakeup-lost-signal.md)\n- [Semaphore, CountDownLatch, CyclicBarrier, and Phaser Coordination Semantics](./semaphore-countdownlatch-cyclicbarrier-phaser-coordination-semantics.md)\n- [LockSupport park/unpark Permit Semantics](./locksupport-park-unpark-permit-semantics.md)\n\nretrieval-anchor-keywords: Java wait notify basics, wait notify beginner, monitor wait set, wait releases monitor lock, notify wakes one thread, notifyAll wakes all, guarded block beginner, while predicate wait, producer consumer wait notify basics, IllegalMonitorStateException wait notify synchronized, wait notify는 왜 synchronized 안에서, 자바 wait notify 기초\n\n---\n\n## 먼저 알아야 할 위치\n\n`wait()`와 `notify()`는 `Thread` 메서드가 아니라 `Object` 메서드다. 이유는 Java의 모든 객체가 monitor로 쓰일 수 있고, wait set도 그 monitor에 붙기 때문이다.\n\n```java\nprivate final Object lock = new Object();\n\nsynchronized (lock) {\n    while (!ready) {\n        lock.wait();\n    }\n    consume();\n}\n```\n\n여기서 `lock.wait()`는 세 가지 일을 한다.\n\n1. 현재 스레드가 `lock` monitor를 잡고 있어야 한다.\n2. `wait()`를 호출하면 monitor를 풀고 wait set에서 기다린다.\n3. 깨어난 뒤에는 다시 monitor를 잡은 다음 다음 줄로 진행한다.\n\n따라서 `wait()`는 잠든 채로 lock을 계속 붙잡는 API가 아니다. lock을 풀어야 다른 스레드가 같은 lock 아래에서 조건을 바꾸고 `notify`할 수 있다.\n\n---\n\n## wait/notify의 최소 규칙\n\n| 규칙 | 이유 |\n|---|---|\n| `wait`, `notify`, `notifyAll`은 같은 객체의 `synchronized` 블록 안에서 호출한다 | monitor를 소유해야 wait set을 다룰 수 있다 |\n| 기다리는 조건은 공유 상태로 둔다 | signal 자체는 저장되지 않기 때문에 조건이 진짜 상태다 |\n| `if`가 아니라 `while`로 조건을 다시 확인한다 | 깨어났다고 조건이 참이라는 보장이 없다 |\n| 조건 변경과 notify는 같은 lock 아래에서 한다 | lost signal과 visibility 문제를 줄인다 |\n| 실무에서는 가능하면 `BlockingQueue` 같은 고수준 도구를 먼저 검토한다 | raw wait/notify는 실수 여지가 크다 |\n\n초급 단계에서 가장 중요한 문장은 이것이다.\n\n```java\nwhile (!condition) {\n    lock.wait();\n}\n```\n\n`while`은 형식이 아니라 안전 규칙이다. 깨어난 뒤 조건이 여전히 false일 수 있기 때문이다.\n\n---\n\n## notify와 notifyAll\n\n`notify()`는 같은 monitor wait set에서 기다리는 스레드 하나를 깨운다. `notifyAll()`은 모두 깨운다.\n\n```java\nsynchronized (lock) {\n    ready = true;\n    lock.notifyAll();\n}\n```\n\n`notify()`는 효율적일 수 있지만, 서로 다른 조건을 기다리는 스레드가 섞이면 잘못된 스레드를 깨울 수 있다. `notifyAll()`은 더 많은 스레드가 깨어나 다시 조건을 확인하므로 비용은 커질 수 있지만, beginner code에서는 조건 혼선을 줄이기 쉽다.\n\n조건이 여러 개라면 raw monitor wait set 하나로 모두 처리하기보다 `ReentrantLock`의 여러 `Condition`, 또는 `BlockingQueue`, `Semaphore`, `CountDownLatch` 같은 고수준 도구가 더 읽기 좋을 수 있다.\n\n---\n\n## producer-consumer 아주 작은 예\n\n```java\npublic final class OneSlotBox<T> {\n    private final Object lock = new Object();\n    private T value;\n    private boolean hasValue;\n\n    public void put(T next) throws InterruptedException {\n        synchronized (lock) {\n            while (hasValue) {\n                lock.wait();\n            }\n            value = next;\n            hasValue = true;\n            lock.notifyAll();\n        }\n    }\n\n    public T take() throws InterruptedException {\n        synchronized (lock) {\n            while (!hasValue) {\n                lock.wait();\n            }\n            T current = value;\n            value = null;\n            hasValue = false;\n            lock.notifyAll();\n            return current;\n        }\n    }\n}\n```\n\n이 예시는 실무에서 직접 쓰라는 코드보다 규칙을 보여 주는 예다. 실제 생산자-소비자 구조는 대개 `BlockingQueue`가 더 안전하다.\n\n---\n\n## 처음 보는 에러와 증상\n\n| 증상 | 먼저 볼 것 |\n|---|---|\n| `IllegalMonitorStateException` | `wait/notify`를 해당 객체의 `synchronized` 안에서 호출했는가 |\n| worker가 영원히 `WAITING` | 조건 변경과 notify가 같은 lock 아래 있는가, notify 전에 조건이 저장됐는가 |\n| 가끔 빈 큐를 소비하거나 멈춤 | `if`로 조건을 확인하지 않았는가, `while`로 재확인하는가 |\n| notify했는데 아무도 못 받음 | signal을 이벤트처럼 쓰고 조건 상태를 저장하지 않았는가 |\n| 여러 종류의 대기가 한 lock에 섞임 | `notify` 대신 `notifyAll`, 또는 `Condition` 분리를 검토해야 하는가 |\n\n---\n\n## Condition, Semaphore, LockSupport와의 위치\n\n- `wait/notify`: intrinsic monitor와 wait set을 직접 쓴다.\n- `Condition`: `ReentrantLock`과 함께 쓰며 조건 큐를 여러 개로 나눌 수 있다.\n- `Semaphore`: permit 개수를 세는 데 맞다.\n- `CountDownLatch`: 한 번 열리는 시작/완료 gate에 맞다.\n- `LockSupport.park/unpark`: 더 낮은 수준의 permit 기반 대기다.\n\n즉 `wait/notify`를 배우는 이유는 저수준 조건 대기 원리를 이해하기 위해서다. 매번 직접 구현하라는 뜻은 아니다.\n\n---\n\n## 자주 하는 오해\n\n- `notify`는 메시지를 저장해 두었다가 나중에 오는 스레드에게 전달한다고 생각한다. 아니다. 조건 상태를 따로 저장하지 않으면 신호를 놓칠 수 있다.\n- `wait()`가 lock을 계속 잡고 잠든다고 생각한다. 실제로는 monitor를 풀고 기다렸다가 깨어날 때 다시 잡는다.\n- `notify()`가 깨운 스레드가 바로 실행된다고 생각한다. 깨어난 스레드는 monitor를 다시 얻어야 진행한다.\n- `if (!ready) wait()`면 충분하다고 생각한다. 깨어난 뒤 조건을 다시 확인해야 하므로 `while`이 기본이다.\n- raw wait/notify가 더 근본적이니 항상 직접 쓰는 게 좋다고 생각한다. 대부분은 `BlockingQueue`나 concurrency utility가 더 안전하다.\n\n## 한 줄 정리\n\nJava `wait/notify`의 핵심은 신호가 아니라 **같은 monitor 아래의 조건 상태**이며, `while` predicate loop 없이 쓰면 lost signal과 영구 대기 버그로 이어지기 쉽다.\n",
+  "aliases": [
+    "Java wait notify basics",
+    "wait notify 기초",
+    "자바 wait notify 기초",
+    "자바 wait notify",
+    "wait는 lock을 풀어요",
+    "wait lock release",
+    "notify notifyAll 차이",
+    "wait notify synchronized 안에서",
+    "IllegalMonitorStateException wait",
+    "guarded block 기초",
+    "while wait predicate",
+    "producer consumer wait notify"
+  ],
+  "expected_queries": [
+    "Java wait notify는 왜 synchronized 블록 안에서 호출해야 해?",
+    "wait를 호출하면 lock을 잡고 자는 건지 아니면 풀고 기다리는 건지 설명해줘",
+    "notify와 notifyAll 차이를 초급자 기준으로 알려줘",
+    "wait notify에서 if가 아니라 while로 조건을 다시 확인해야 하는 이유가 뭐야?",
+    "producer consumer를 wait notify로 처음 이해할 때 공유 조건 predicate가 왜 중요해?"
+  ],
+  "symptoms": [
+    "wait가 monitor lock을 풀고 기다린다는 점을 몰라 producer가 조건을 바꿀 수 없는 구조로 이해한다.",
+    "notify를 저장되는 이벤트처럼 생각해 조건 상태 없이 signal만 보낸다.",
+    "wait/notify를 synchronized 밖에서 호출해 IllegalMonitorStateException을 만난다.",
+    "if로 한 번만 조건을 확인해 spurious wakeup이나 경쟁 소비 상황을 놓친다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-thread-basics",
+      "language/java-synchronized-vs-lock-basics",
+      "language/java-memory-model-happens-before-beginner-primer"
+    ],
+    "next_docs": [
+      "language/wait-notify-condition-spurious-wakeup-lost-signal",
+      "language/semaphore-countdownlatch-cyclicbarrier-phaser-coordination-semantics",
+      "language/locksupport-park-unpark-permit-semantics",
+      "language/blockingqueue-transferqueue-concurrentskiplistset-semantics"
+    ],
+    "confusable_with": [
+      "language/java-synchronized-vs-lock-basics",
+      "language/wait-notify-condition-spurious-wakeup-lost-signal",
+      "language/semaphore-countdownlatch-cyclicbarrier-phaser-coordination-semantics",
+      "language/locksupport-park-unpark-permit-semantics"
+    ],
+    "forbidden_for_queries": [
+      "spurious wakeup과 lost signal을 runtime incident 수준으로 깊게 분석해줘",
+      "LockSupport park/unpark permit semantics를 자세히 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch54-stream-a-foundation"
+      }
+    ]
+  }
+}

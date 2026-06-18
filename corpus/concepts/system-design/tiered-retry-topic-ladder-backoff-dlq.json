@@ -1,0 +1,68 @@
+{
+  "id": "system-design/tiered-retry-topic-ladder-backoff-dlq",
+  "title": "Tiered Retry Topic Ladder, Backoff, and DLQ",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Tiered retry topic ladder는 실패 메시지를 main topic에서 즉시 재시도해 head-of-line blocking을 만들지 않고, 지연 시간이 다른 retry topic을 거쳐 재처리한 뒤 실패가 소진되면 DLQ로 격리하는 패턴이다.",
+  "body_markdown": "# Tiered Retry Topic Ladder, Backoff, and DLQ\n\n> 한 줄 요약: tiered retry topic ladder는 실패 메시지를 `main -> retry-1m -> retry-10m -> retry-1h -> DLQ`처럼 지연 단계별 topic으로 옮겨 main consumer를 막지 않고 재시도하는 패턴이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Queue Delivery Semantics Beginner Primer](./queue-delivery-semantics-beginner-primer.md)\n- [Kafka Ordering Delivery Interview Primer](./kafka-ordering-delivery-interview-primer.md)\n- [Kafka Out-of-Order Commit Offset Gap Parallelism](./kafka-out-of-order-commit-offset-gap-parallelism.md)\n- [DLQ Poison Message Replay Playbook](./dlq-poison-message-replay-playbook.md)\n- [Idempotency Key Store / Dedup Window / Replay-Safe Retry](./idempotency-key-store-dedup-window-replay-safe-retry-design.md)\n- [Webhook Retry Dedup Deadletter Playbook](./webhook-retry-dedup-deadletter-playbook.md)\n\nretrieval-anchor-keywords: tiered retry topic ladder, retry topic backoff DLQ, Kafka retry topic, delayed retry topic, non blocking retry, retryable non retryable message, dead letter topic, poison message retry exhausted, attempt header original offset, exponential backoff topic ladder, 재시도 토픽 사다리, 지연 재시도 DLQ\n\n---\n\n## 핵심 흐름\n\n일시 장애가 있는 메시지를 main topic에서 즉시 계속 재처리하면 같은 partition이 막히고 정상 메시지까지 늦어진다. retry topic ladder는 실패 메시지를 지연 단계로 옮겨 main path를 비운다.\n\n```text\nmain.orders\n  -> retry.orders.1m\n  -> retry.orders.10m\n  -> retry.orders.1h\n  -> dlq.orders\n```\n\n각 단계는 retry delay, max attempt, failure class를 가진다. consumer는 실패 원인이 retryable이면 다음 retry topic으로 보내고, non-retryable이면 DLQ나 quarantine으로 보낸다.\n\n---\n\n## 왜 그냥 즉시 재시도하지 않나\n\n| 방식 | 장점 | 위험 |\n|---|---|---|\n| 같은 consumer loop에서 즉시 retry | 구현이 단순하다 | downstream 장애 때 worker를 오래 붙잡고 lag를 키운다 |\n| thread sleep으로 기다림 | delay가 직관적이다 | consumer thread와 partition ownership을 묶어 둔다 |\n| retry topic ladder | main path를 비우고 지연을 외부화한다 | topic 수, ordering, idempotency, 관측성이 필요하다 |\n| 바로 DLQ | 정상 path 보호가 강하다 | 일시 장애도 수동 복구 대상이 될 수 있다 |\n\nretry topic은 실패를 숨기는 장치가 아니라 지연과 격리를 명시적으로 모델링하는 장치다.\n\n---\n\n## Retryable과 non-retryable을 먼저 나눈다\n\n| 실패 종류 | retry topic 적합성 | 예시 |\n|---|---|---|\n| 일시 dependency 실패 | 높음 | timeout, 5xx, rate limit |\n| downstream 과부하 | 높음, 단 backoff 필요 | 429, circuit breaker open |\n| schema mismatch | 낮음 | unknown enum, missing required field |\n| business invariant 위반 | 낮음 | 이미 취소된 주문에 결제 완료 이벤트 |\n| consumer bug | 낮음 | deterministic NPE, parsing bug |\n| 악성/계약 위반 payload | 자동 retry 금지 | malformed event, validation failure |\n\nretryable을 잘못 넓히면 poison message가 topic ladder를 끝없이 돌고, non-retryable을 잘못 넓히면 일시 장애까지 수동 복구가 된다.\n\n---\n\n## Envelope와 header에 남길 것\n\nretry ladder를 운영하려면 메시지 본문만 옮기면 부족하다.\n\n- original topic, partition, offset\n- event id 또는 idempotency key\n- attempt count\n- first failure time, last failure time\n- failure class, exception fingerprint\n- next retry not-before time\n- producer/service name, schema version\n\n이 정보가 있어야 DLQ에서 원인을 분류하고, replay할 때 같은 side effect가 중복되지 않았는지 확인할 수 있다.\n\n---\n\n## Ordering trade-off\n\nretry topic으로 실패 record를 빼면 main partition은 뒤 record를 계속 처리할 수 있다. 처리량에는 좋지만 순서 의미는 달라진다.\n\n예를 들어 같은 orderId의 `CREATED`가 retry topic으로 빠지고 `PAID`가 main에서 먼저 처리되면 downstream 상태 전이가 깨질 수 있다. 이 경우 선택지는 세 가지다.\n\n1. 같은 key ordering이 중요하면 partition을 멈추거나 key별로 blocked 상태를 둔다.\n2. eventual ordering이 허용되면 retry topic으로 빼고 handler를 상태 전이 idempotent하게 만든다.\n3. 실패 event를 DLQ로 격리하고 reconciliation으로 source of truth와 맞춘다.\n\n따라서 retry ladder는 delivery pattern이지 ordering을 자동으로 지키는 장치가 아니다.\n\n---\n\n## 운영 지표\n\n- retry topic depth by tier\n- oldest retry message age\n- retry success rate by attempt\n- DLQ entry rate and re-entry rate\n- failure class distribution\n- duplicate side effect count, idempotency hit rate\n- main consumer lag vs retry consumer lag\n- downstream 429/5xx and circuit breaker state\n\n성공 기준은 DLQ가 0이라는 숫자가 아니다. retryable 실패가 제한된 budget 안에서 회복되고, poison message가 정상 traffic을 막지 않으며, replay 시 side effect가 중복되지 않는 것이다.\n\n---\n\n## 흔한 오해\n\n- retry topic을 만들면 중복 처리가 사라진다고 생각한다. retry는 at-least-once를 더 명시적으로 만드는 것이므로 idempotency가 더 중요하다.\n- DLQ는 실패를 해결한 상태라고 본다. DLQ는 격리이며, 원인 분류와 replay 정책이 없으면 누락이다.\n- 모든 실패를 retryable로 둔다. schema bug나 business invariant 위반은 반복해도 성공하지 않는다.\n- backoff를 thread sleep으로 구현한다. consumer thread를 붙잡아 main 처리량과 rebalance 안정성을 해칠 수 있다.\n- retry topic으로 빼도 원래 partition ordering이 유지된다고 본다. retry는 순서를 바꿀 수 있다.\n\n## 한 줄 정리\n\nTiered retry topic ladder는 실패 메시지를 지연 단계로 옮겨 main path를 보호하는 패턴이지만, retryable 분류, idempotency, ordering trade-off, DLQ replay 정책이 함께 있어야 안전하다.\n",
+  "aliases": [
+    "retry topic ladder",
+    "재시도 토픽 사다리",
+    "지연 재시도 DLQ",
+    "Kafka retry topic",
+    "tiered retry topic",
+    "백오프 재시도 토픽",
+    "논블로킹 재시도",
+    "재시도 가능 실패 구분",
+    "재시도불가 poison",
+    "dead letter topic",
+    "DLQ retry exhausted",
+    "attempt header retry"
+  ],
+  "expected_queries": [
+    "Kafka에서 실패 메시지를 main topic에서 바로 재시도하지 않고 retry topic ladder로 보내는 이유가 뭐야?",
+    "retry-1m retry-10m DLQ 같은 재시도 토픽 사다리는 어떤 정보를 header에 남겨야 해?",
+    "retryable failure와 non-retryable poison message를 어떻게 나눠야 해?",
+    "retry topic으로 실패 이벤트를 빼면 Kafka ordering은 어떻게 달라질 수 있어?",
+    "DLQ로 보내기 전 backoff retry topic을 두는 패턴을 idempotency와 같이 설명해줘"
+  ],
+  "symptoms": [
+    "downstream 장애 때 같은 메시지를 즉시 재시도해 consumer thread와 partition을 오래 붙잡는다.",
+    "schema bug 같은 non-retryable 실패를 retry topic으로 계속 돌린다.",
+    "retry topic으로 빼면 중복 처리와 ordering 문제가 자동으로 해결된다고 본다.",
+    "DLQ entry를 해결로 착각하고 failure class, replay, idempotency evidence를 남기지 않는다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/queue-delivery-semantics-beginner-primer",
+      "system-design/kafka-ordering-delivery-interview-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/dlq-poison-message-replay-playbook",
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "system-design/webhook-retry-dedup-deadletter-playbook"
+    ],
+    "confusable_with": [
+      "system-design/dlq-poison-message-replay-playbook",
+      "system-design/webhook-retry-dedup-deadletter-playbook",
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "forbidden_for_queries": [
+      "DLQ에 쌓인 poison message를 운영에서 어떻게 분류하고 replay해?",
+      "webhook retry dedup deadletter 설계를 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch55-stream-a-messaging"
+      }
+    ]
+  }
+}

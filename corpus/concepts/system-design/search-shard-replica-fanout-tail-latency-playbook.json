@@ -1,0 +1,66 @@
+{
+  "id": "system-design/search-shard-replica-fanout-tail-latency-playbook",
+  "title": "Search Shard Replica Fanout Tail Latency Playbook",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "검색 query fanout에서 가장 느린 shard나 replica가 전체 p99를 키우는 현상을 진단한다. shard별 latency, replica 선택, hedged request, timeout, partial result, hot shard skew를 함께 보는 운영 playbook이다.",
+  "body_markdown": "# Search Shard Replica Fanout Tail Latency Playbook\n\n## 한 줄 요약\n\n분산 검색 p99는 평균 shard latency가 아니라 fanout된 shard/replica 중 가장 느린 branch에 끌려간다. 따라서 search tail latency는 query fanout width, shard별 p99, replica skew, timeout/partial result 정책을 함께 봐야 한다. 검색 장애를 평균 latency로만 보면 coordinator가 어디서 기다렸는지, 특정 shard가 반복 tail을 만드는지, partial result가 품질을 얼마나 낮췄는지 놓친다.\n\n## 왜 fanout tail이 커지나\n\n검색 coordinator가 20개 shard에 동시에 요청을 보내고 모든 결과를 기다린다면, 최종 응답 시간은 대체로 가장 느린 shard에 맞춰진다. 각 shard의 p99가 낮아 보여도 fanout width가 커지면 하나쯤 tail에 걸릴 확률이 올라간다.\n\n```text\ncoordinator\n  shard 1: 20ms\n  shard 2: 23ms\n  shard 3: 180ms  <- 전체 query p99를 결정\n  shard 4: 25ms\n```\n\n이 현상은 검색, 추천, federation query처럼 fan-out/fan-in 구조에서 반복된다. 단일 shard의 평균이 20ms여도 query가 30개 shard를 기다리면 slowest branch의 tail이 query p99로 올라온다. 그래서 query p99를 낮추는 작업은 shard 하나를 빠르게 만드는 일뿐 아니라 fanout 수를 줄이고, 느린 replica 선택을 피하고, deadline 안에서 partial을 허용할지 결정하는 일이다.\n\n## 먼저 볼 지표\n\n| 지표 | 의미 |\n|---|---|\n| query fanout width | query 하나가 몇 shard/replica를 호출하는가 |\n| per-shard latency | 특정 shard가 반복적으로 느린가 |\n| slowest shard contribution | 전체 p99 sample에서 어떤 shard가 tail을 만들었는가 |\n| shard timeout rate | 일부 shard가 deadline을 넘는 비율 |\n| partial result rate | timeout/실패를 partial로 응답한 비율 |\n| replica selected | replica 선택이 tail을 분산하는가 |\n| hot shard ratio | 특정 shard에 query/doc/load가 몰리는가 |\n| merge time | shard 응답 이후 top-k merge나 aggregation이 지배적인가 |\n\n평균 query latency만 보면 어떤 shard가 tail을 만드는지 보이지 않는다. Timeout 직전 query sample을 shard span으로 쪼개야 한다. Trace에는 coordinator receive, parse, route, shard dispatch, shard wait, merge, serialize 단계를 분리해 남긴다. p99 sample에서 shard wait가 80퍼센트라면 search node 문제이고, merge가 80퍼센트라면 top-k, aggregation, sort field, result size를 봐야 한다.\n\n## tail 원인 분류\n\n| 원인 | 증거 | 다음 확인 |\n|---|---|---|\n| hot shard | 같은 shard가 slowest top N에 반복 | routing key skew, doc count, query term skew |\n| replica skew | 같은 shard의 replica별 latency 차이 큼 | cache warmness, GC, CPU steal, disk IO |\n| segment merge/GC | 특정 시간대에 spike 반복 | JVM GC, Lucene merge, compaction, IO queue |\n| fanout width 과대 | shard 수가 늘수록 p99 급증 | shard pruning, routing filter, tiered index |\n| coordinator 병목 | shard는 빠른데 merge/serialize가 느림 | top-k size, aggregation cardinality, payload size |\n| timeout 정책 부재 | deadline까지 모든 shard를 기다림 | per-shard timeout, partial result contract |\n\n원인을 나눠야 완화책이 맞는다. Hot shard를 hedging으로 가리면 duplicate load가 더해질 수 있고, coordinator merge 병목을 shard split으로 고치려 하면 효과가 없다. 반대로 fanout width가 문제라면 shard 하나의 CPU를 올려도 slowest branch 확률은 계속 남는다.\n\n## 완화 선택지\n\n| 완화 | 장점 | 위험 |\n|---|---|---|\n| fanout pruning | 호출 shard 수 감소 | recall 누락 가능 |\n| replica 선택 개선 | 느린 replica 회피 | load imbalance, stale replica |\n| hedged request | tail shard 대체 응답 확보 | duplicate load 증가 |\n| shard timeout + partial | availability 개선 | recall/ranking 품질 저하 |\n| hot shard split | skew 완화 | reindex/reshard 비용 |\n| cache hot query | repeated query p99 감소 | freshness와 invalidation 비용 |\n| coordinator merge 제한 | merge CPU와 payload 감소 | top-k 품질 또는 aggregation 정확도 저하 |\n\nHedging은 검색 tail 완화에 유용할 수 있지만, 이미 포화된 cluster에 duplicate load를 더하면 전체 tail이 악화될 수 있다. Partial result도 제품 요구상 허용되는 검색인지 확인해야 한다. 자동완성이나 상품 탐색은 partial을 허용할 수 있지만, 정산/감사/법적 검색은 missing result가 더 큰 장애다.\n\n## tail sample 분석 순서\n\n1. p99 query sample을 trace로 뽑는다.\n2. Coordinator 내부 시간을 parsing, routing, shard wait, merge로 나눈다.\n3. Shard wait가 지배적이면 slowest shard id와 replica id를 모은다.\n4. 같은 shard가 반복되면 hot shard, segment merge, GC, disk IO를 본다.\n5. 여러 shard가 랜덤하게 tail이면 fanout width와 deadline 정책을 본다.\n6. Replica 간 차이가 크면 replica selection, cache warmness, resource imbalance를 본다.\n7. Timeout/partial result가 사용자 품질에 어떤 영향을 주는지 metric에 남긴다.\n\n분석은 반드시 sample 기반이어야 한다. p99 구간의 query id를 잡아 해당 query가 어떤 shard들을 호출했고 어떤 shard가 마지막까지 남았는지 확인한다. 전체 shard latency histogram만 보면 p99 query의 조합 효과를 놓친다. 한 query 안에서 slowest branch가 무엇인지 기록해야 fanout tail을 설명할 수 있다.\n\n## partial result 정책\n\n검색 p99를 낮추려고 shard timeout을 짧게 잡으면 partial result가 늘 수 있다. 이것은 latency를 줄이는 대신 recall과 ranking 품질을 낮추는 선택이다.\n\n정책 예:\n\n- 상품 검색: 일부 shard 누락을 허용하되 partial metric과 fallback 노출\n- 관리자 감사 검색: partial 허용하지 않고 async export나 긴 deadline\n- 자동완성: stale cache와 partial 허용 가능\n- 법적/정산 검색: missing result가 위험하므로 fail closed\n\nPartial response에는 누락 shard 수, timeout shard id, degraded marker, served deadline을 남긴다. 사용자에게는 결과 없음과 부분 결과를 구분해야 한다. shard timeout 때문에 결과가 빠졌는데 진짜 검색 결과가 없는 것처럼 보이면 사용자는 잘못된 결론을 내린다. API 소비자가 ranking 품질을 전제로 후속 결정을 한다면 partial은 contract 변경이다.\n\n## hedged request guardrail\n\nHedging은 일정 시간이 지나도 응답하지 않는 shard 요청을 다른 replica에 한 번 더 보내는 방식이다. 성공하면 slow replica의 tail을 피할 수 있다. 하지만 hedge trigger가 너무 빠르면 정상 요청에도 중복 부하가 붙는다. 이미 cluster가 saturation 상태라면 duplicate request가 queue를 더 길게 만들고 모든 replica의 p99를 악화시킨다.\n\n안전하게 켜려면 hedge rate budget, per-query duplicate limit, only-idempotent-read 조건, loser cancellation, replica health score를 둔다. 지표는 hedge winner latency만 보지 말고 loser count, duplicate CPU, network egress, original request completion after hedge를 같이 본다. Hedging은 tail을 숨기는 도구이지 hot shard나 bad routing을 해결하는 근본책은 아니다.\n\n## 흔한 오해\n\n- shard 평균 latency가 낮으니 query p99도 낮다: fanout 구조에서는 slowest branch가 중요하다.\n- replica를 늘리면 p99가 자동으로 줄어든다: replica 선택과 load balancing이 맞아야 한다.\n- hedging은 무료다: duplicate request가 cluster 부하를 증폭할 수 있다.\n- timeout을 줄이면 해결이다: partial result 품질과 recall 손실을 봐야 한다.\n- hot query cache만 있으면 된다: cold query, shard skew, segment merge tail은 여전히 남는다.\n- shard를 더 잘게 나누면 항상 좋아진다: fanout width가 늘어 slowest branch 확률이 커질 수 있다.\n\n## 운영 runbook\n\n- p99 query trace에서 shard span breakdown을 확인한다.\n- Slow shard top N을 시간대별로 집계한다.\n- Replica별 CPU, heap, GC, disk IO, segment merge 상태를 비교한다.\n- Fanout width별 latency bucket을 본다.\n- Timeout shard가 결과 품질에 미치는 영향을 offline judge나 click metric으로 확인한다.\n- Hedge를 켠다면 hedge rate, duplicate load, winner/loser latency를 함께 본다.\n- Partial response에는 누락 shard 수와 degraded marker를 남긴다.\n- Hot shard 의심 시 routing key, document distribution, query term popularity를 같이 본다.\n- Coordinator merge가 의심되면 result size, aggregation cardinality, sort field, serialization size를 줄여 실험한다.\n\n## 검증 실험\n\n부하 테스트는 전체 QPS만 올리지 말고 fanout width별 cohort를 나눈다. shard 4개, 16개, 64개 query의 p95/p99를 비교하면 slowest branch 효과가 보인다. 특정 replica에 artificial delay를 넣고 coordinator가 slowest shard를 어떻게 기록하는지도 확인한다. Partial timeout을 줄이는 실험은 latency 개선과 함께 recall, click-through, zero-result rate, conversion 같은 품질 지표를 같이 봐야 한다.\n\nHedging 실험은 shadow 또는 low percentage부터 시작한다. Tail sample에서 hedge가 실제로 느린 replica를 이겼는지 확인하고, cluster CPU와 queue depth가 올라가는지 본다. Hot shard split이나 resharding은 비용이 크므로 먼저 routing filter, cache, replica selection, deadline 정책으로 완화 가능한지 확인한다.\n\n## 면접 답변 축\n\n검색 p99 질문에는 검색은 fanout 구조라 전체 latency가 slowest shard/replica에 끌려간다고 답한다. 이어서 shard별 trace, fanout width, hot shard, replica selection, hedging, timeout/partial result 정책을 증거로 보며, latency 개선과 recall 품질을 같이 검증한다고 말하면 된다. 마지막에는 hedging과 timeout이 무료가 아니며 duplicate load와 partial 품질 손실을 guardrail로 관리한다고 덧붙인다.\n\n## Safe Next Docs\n\n일반 p99 triage는 `tail-latency-p99-debugging-playbook`, hedging 선택은 `hedged-requests-tail-latency-chooser`, shard routing은 `distributed-search-scatter-gather-shard-routing-chooser`로 이어진다.\n",
+  "aliases": [
+    "search fanout tail latency",
+    "검색 shard p99",
+    "slowest shard",
+    "검색 fanout 지연",
+    "shard replica hedging",
+    "partial search timeout",
+    "검색 partial timeout",
+    "hot shard search",
+    "search replica skew",
+    "coordinator shard wait"
+  ],
+  "expected_queries": [
+    "검색 query가 여러 shard로 fanout될 때 가장 느린 shard가 p99를 끌어올리는 이유가 뭐야?",
+    "search p99를 줄이려면 shard별 latency와 fanout width를 어떤 순서로 봐야 해?",
+    "검색 shard 하나가 timeout일 때 partial result를 줄지 전체 실패로 볼지 어떻게 정해?",
+    "검색 replica에 hedged request를 보내면 tail latency는 줄 수 있지만 어떤 부하 위험이 있어?",
+    "hot shard나 replica skew가 검색 p99를 만드는지 trace에서 어떻게 확인해?",
+    "검색 coordinator latency를 routing, shard wait, merge 시간으로 나눠 봐야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "검색 평균 latency는 괜찮은데 p99 query만 timeout이 난다",
+    "특정 shard나 replica가 반복적으로 slowest branch가 된다",
+    "timeout을 줄였더니 partial result rate가 늘었지만 품질 영향이 측정되지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/distributed-search-scatter-gather-shard-routing-chooser",
+      "system-design/tail-latency-p99-debugging-playbook"
+    ],
+    "next_docs": [
+      "system-design/hedged-requests-tail-latency-chooser",
+      "system-design/hot-key-skew-mitigation-interview-playbook",
+      "system-design/read-path-waterfall-tail-latency-debugging-map"
+    ],
+    "confusable_with": [
+      "system-design/tail-latency-p99-debugging-playbook",
+      "system-design/hedged-requests-tail-latency-chooser",
+      "system-design/distributed-search-scatter-gather-shard-routing-chooser"
+    ],
+    "forbidden_for_queries": [
+      "검색 shard routing과 top-k merge 설계를 설명해줘",
+      "검색 인덱스 alias cutover와 rollback 절차를 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-18",
+    "legacy_path": "knowledge/cs/contents/system-design/search-shard-replica-fanout-tail-latency-playbook.md",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
+  }
+}

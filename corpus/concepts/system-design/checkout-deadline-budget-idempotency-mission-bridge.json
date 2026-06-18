@@ -6,10 +6,18 @@
   "summary": "checkout 설계는 deadline budget과 idempotency 상태 계약이 있어야 retry와 결제가 안전하게 만난다.",
   "body_markdown": "    # Checkout Deadline Budget Idempotency Mission Bridge\n\n    ## 이 문서가 맡는 질문\n    checkout/payment 경로에서 deadline budget, retry, idempotency, outbox를 함께 설계하는 mission bridge다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    사용자 요청 deadline, PG 호출 timeout, 재시도 가능성, idempotency key, 주문/결제 상태 저장, after-commit outbox를 한 흐름으로 본다.\n\n    ## 실전 시나리오\n    결제 요청이 timeout되어 사용자가 다시 눌렀고 주문은 두 번 생성됐다. timeout만 늘린 것이 아니라 idempotency와 상태 계약이 빠진 것이다.\n\n    ## CS 배경\n    checkout은 사용자 command, 외부 side effect, DB transaction, message delivery가 한 경로에 얽힌다. deadline budget은 각 hop의 최대 시간을 제한하고, idempotency는 retry가 같은 business effect로 수렴하게 만든다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - 한 checkout intent는 하나의 idempotency key로 대표되어야 한다\n- 외부 결제 호출은 DB transaction을 오래 잡지 않도록 경계를 분리한다\n- 성공/처리중/불명확 실패 상태는 서로 다른 응답 계약을 가진다\n- after-commit event/outbox는 DB commit 이후 side effect 전달을 담당한다\n\n    ## 판단 매트릭스\n    - 동기 응답이 필요하면 짧은 deadline과 상태 저장\n- PG timeout이면 uncertain state와 reconciliation\n- 중복 클릭이면 idempotency replay\n- 후속 알림/배송이면 outbox\n\n    ## 예시\n    ```text\n    POST /checkout key=K -> claim row PROCESSING -> PG call budget -> commit SUCCEEDED -> outbox publish\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    checkout latency는 빠른 응답만의 문제가 아니라 retry가 안전하게 수렴하는 상태 기계 문제다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 duplicate submit, PG timeout, response lost after success, DB commit success publish fail, retry after processing를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. PG call time, transaction duration, outbox relay lag, dedup table contention를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. checkout p95, PG timeout budget, replay response latency, outbox delivery p99가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    checkout_p95_ms, idempotency_replay_count, pg_timeout_count, outbox_lag_p99_ms, uncertain_payment_count를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - 프론트 버튼 disable로 중복 결제를 막을 수 있다고 본다\n- timeout이면 실패니까 바로 새 결제를 해도 된다고 생각한다\n- outbox는 메시지 기능일 뿐 checkout latency와 무관하다고 본다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    checkout 설계는 deadline budget과 idempotency 상태 계약이 있어야 retry와 결제가 안전하게 만난다.\n",
   "aliases": [
-    "Checkout Deadline Budget Idempotency Mission Bridge",
-    "checkout deadline budget idempotency mission bridge",
-    "shopping-cart checkout deadline budget idempotency key retry payment timeout outbox mission bridge latency",
-    "shopping-cart checkout에서 deadline budget, retry, idempotency key는 어떻게 같이 설계해?"
+    "체크아웃 중복 결제 방지",
+    "체크아웃중복결제방지",
+    "결제 재시도 멱등성",
+    "결제재시도멱등성",
+    "결제 타임아웃 처리",
+    "결제타임아웃처리",
+    "체크아웃 데드라인 예산",
+    "체크아웃데드라인예산",
+    "중복 클릭 결제 방어",
+    "PG timeout 후 재시도",
+    "처리중 결제 상태",
+    "결제 outbox 경계"
   ],
   "expected_queries": [
     "shopping-cart checkout에서 deadline budget, retry, idempotency key는 어떻게 같이 설계해?",

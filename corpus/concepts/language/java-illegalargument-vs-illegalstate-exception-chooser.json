@@ -1,0 +1,64 @@
+{
+  "id": "language/java-illegalargument-vs-illegalstate-exception-chooser",
+  "title": "Java 예외 선택: `IllegalArgumentException` vs `IllegalStateException` vs 도메인 예외",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "Java 17/21에서 `IllegalArgumentException`은 호출자가 넘긴 인자나 인자 기반 precondition이 잘못됐을 때, `IllegalStateException`은 인자는 말이 되지만 receiver 객체의 현재 상태나 호출 순서가 잘못됐을 때 먼저 떠올린다. API나 미션 코드에서 클라이언트가 실패 이유를 구분해야 하면 `InvalidGuessException`, `GameAlreadyFinishedException` 같은 도메인 커스텀 예외로 의미를 드러낸다.",
+  "body_markdown": "# Java 예외 선택: `IllegalArgumentException` vs `IllegalStateException` vs 도메인 예외\n\n> 한 줄 요약: `IllegalArgumentException`은 \"넘긴 값이 이 메서드의 입력으로 부적절하다\", `IllegalStateException`은 \"값은 말이 되지만 이 객체가 지금 그 요청을 받을 상태가 아니다\"라는 신호다. 도메인/API 경계에서 이 차이를 클라이언트가 알아야 하면 커스텀 예외 이름으로 드러낸다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- `language/java-exception-handling-basics`\n- `software-engineering/business-vs-technical-exception-primer`\n- `spring/baseball-invalid-guess-400-vs-finished-game-409-exception-bridge`\n\nretrieval-anchor-keywords: IllegalArgumentException vs IllegalStateException, invalid parameter, invalid receiver state, method precondition, domain custom exception, invalid guess, finished game, 야구 미션 예외 선택, 잘못된 인자 예외, 잘못된 상태 예외, 커스텀 도메인 예외\n\n## 먼저 멘탈모델\n\n입문자가 가장 헷갈리는 건 `IllegalArgumentException`을 \"사용자 입력이 틀렸을 때\", `IllegalStateException`을 \"서버 상태가 이상할 때\"처럼 HTTP나 운영 장애 언어로 외우는 것이다. Java 표준 예외의 기준은 더 작다. **메서드 호출이라는 장면**에서 무엇이 틀렸는지 묻는다.\n\n- 호출자가 넘긴 값 자체가 이 메서드의 계약에 맞지 않으면 `IllegalArgumentException`\n- 넘긴 값은 괜찮지만 receiver 객체가 지금 그 메서드를 받을 수 없는 상태면 `IllegalStateException`\n- 실패를 도메인/API 계약으로 구분해야 하면 구체적인 custom exception\n\n여기서 receiver는 `game.guess(guess)`의 `game` 같은 호출 대상 객체다. `guess` 값이 틀렸는지, `game`의 현재 상태가 틀렸는지를 먼저 분리하면 대부분 결정된다.\n\n## 선택표\n\n| 질문 | 먼저 고를 예외 | 미션 장면 | 이유 |\n|---|---|---|---|\n| 파라미터 값이 범위, 형식, 개수, null 정책을 어겼나? | `IllegalArgumentException` 또는 null이면 `NullPointerException` | `Guess` 숫자가 3개가 아니거나 중복됨 | 호출자가 넘긴 argument가 메서드 계약을 못 만족했다 |\n| 같은 인자를 나중에 다시 넘기면 성공할 수 있지만, 지금 receiver 상태가 막나? | `IllegalStateException` | 이미 `finished=true`인 `Game`에 `guess()` 호출 | `Guess`는 유효하지만 `Game`이 더 진행할 상태가 아니다 |\n| 이 실패를 handler, 테스트, 클라이언트가 별도 code/status로 분기해야 하나? | domain custom exception | `InvalidGuessException`, `GameAlreadyFinishedException` | Java 표준 예외보다 도메인 의미가 응답 계약에 중요하다 |\n| 외부 시스템 실패나 인프라 장애인가? | 이 문서의 주제가 아님 | DB timeout, network failure | 인자/상태 선택이 아니라 technical exception 분류 문제다 |\n\n`precondition`이라는 말을 쓸 때도 조심해야 한다. 모든 precondition 실패가 `IllegalArgumentException`은 아니다. **인자에 대한 precondition**이면 `IllegalArgumentException`이고, **객체의 현재 상태나 호출 순서에 대한 precondition**이면 `IllegalStateException`이 더 자연스럽다.\n\n## baseball 미션으로 보는 분기\n\n`POST /games/{id}/guesses`를 생각해 보자. 요청 body가 `1,1,2`라면 숫자 중복 때문에 `Guess`라는 값으로 만들 수 없다. 이때는 `Guess.of(...)`나 record constructor에 들어온 argument가 잘못됐다. Java 레벨에서는 `IllegalArgumentException`이 맞고, 웹 API 레벨에서는 `InvalidGuessException`으로 감싸 400에 매핑할 수 있다.\n\n반대로 `Guess`는 `[1, 2, 3]`처럼 정상인데, 게임이 이미 끝났다. 이 실패는 `guess` argument가 이상한 게 아니다. `game` receiver가 현재 `finished` 상태라 `guess()`라는 동작을 받을 수 없는 것이다. Java 레벨에서는 `IllegalStateException`이 맞고, 웹 API 레벨에서는 `GameAlreadyFinishedException`으로 드러내 409 같은 상태 충돌 응답으로 번역하기 좋다.\n\n## worked code\n\n아래 코드는 Java 17/21에서 그대로 쓸 수 있는 평범한 `RuntimeException` 계열 설계다. `IllegalArgumentException`과 `IllegalStateException`은 `java.lang`이라 import가 필요 없다.\n\n```java\nimport java.util.List;\nimport java.util.Objects;\n\nrecord Guess(List<Integer> digits) {\n    Guess {\n        Objects.requireNonNull(digits, \"digits must not be null\");\n        digits = List.copyOf(digits);\n\n        if (digits.size() != 3) {\n            throw new IllegalArgumentException(\"guess must contain 3 digits: size=\" + digits.size());\n        }\n        if (digits.stream().anyMatch(number -> number < 1 || number > 9)) {\n            throw new IllegalArgumentException(\"guess digit must be between 1 and 9: \" + digits);\n        }\n        if (digits.stream().distinct().count() != digits.size()) {\n            throw new IllegalArgumentException(\"guess digits must be distinct: \" + digits);\n        }\n    }\n}\n\nfinal class Game {\n    private boolean finished;\n\n    public Score guess(Guess guess) {\n        Objects.requireNonNull(guess, \"guess must not be null\");\n\n        if (finished) {\n            throw new IllegalStateException(\"game is already finished\");\n        }\n\n        Score score = Score.calculate(guess);\n        if (score.isThreeStrike()) {\n            finished = true;\n        }\n        return score;\n    }\n}\n\nrecord Score(int strikes, int balls) {\n    public static Score calculate(Guess guess) {\n        return new Score(0, 0);\n    }\n\n    public boolean isThreeStrike() {\n        return strikes == 3;\n    }\n}\n```\n\n이 코드는 작은 domain object 내부에서는 충분히 명확하다. 다만 웹 미션에서 `@ControllerAdvice`가 `IllegalArgumentException` 전체를 400으로 잡고, `IllegalStateException` 전체를 409로 잡는 식으로 커지면 다른 Java 버그까지 같은 응답으로 뭉칠 수 있다. 그때는 표준 예외를 바깥 계약으로 직접 노출하지 말고 도메인 예외를 만든다.\n\n```java\nabstract class BaseballException extends RuntimeException {\n    private final String code;\n\n    protected BaseballException(String code, String message) {\n        super(message);\n        this.code = code;\n    }\n\n    public String code() {\n        return code;\n    }\n}\n\nfinal class InvalidGuessException extends BaseballException {\n    InvalidGuessException(String message) {\n        super(\"INVALID_GUESS\", message);\n    }\n}\n\nfinal class GameAlreadyFinishedException extends BaseballException {\n    GameAlreadyFinishedException(long gameId) {\n        super(\"GAME_ALREADY_FINISHED\", \"game is already finished: gameId=\" + gameId);\n    }\n}\n```\n\n커스텀 예외는 `IllegalArgumentException`/`IllegalStateException`을 항상 대체하라는 뜻이 아니다. **분기할 가치가 있는 도메인 의미가 생겼을 때 이름과 code를 주는 도구**다. 콘솔 미션의 값 객체 내부 검증은 표준 예외로도 충분할 수 있고, Spring API 응답 계약이 생기면 custom exception이 더 읽기 쉽다.\n\n## 자주 틀리는 판단\n\n| 오해 | 왜 아쉬운가 | 더 나은 판단 |\n|---|---|---|\n| 사용자 입력에서 왔으니 전부 `IllegalArgumentException`이다 | 입력 형식은 맞지만 현재 게임 상태가 막는 경우가 있다 | argument 실패와 receiver state 실패를 나눈다 |\n| `IllegalStateException`이면 무조건 500이다 | Java 예외 타입과 HTTP status는 다른 층의 언어다 | API 경계에서 domain exception 또는 handler로 번역한다 |\n| 도메인 예외는 전부 checked exception으로 만들어야 명시적이다 | 호출 체인마다 `throws`가 번지고 Spring handler 흐름과도 어색해진다 | 보통 `RuntimeException` 기반 domain root를 둔다 |\n| null도 그냥 `IllegalArgumentException`으로 처리한다 | JDK 관례와 `Objects.requireNonNull`은 null 계약 위반을 `NullPointerException`으로 드러낸다 | null 정책은 `Objects.requireNonNull`, 값 범위는 `IllegalArgumentException`으로 나눌 수 있다 |\n| 커스텀 예외를 만들면 설계가 무조건 좋아진다 | 이름만 다른 얇은 예외가 많아지면 catch/handler만 복잡해진다 | 클라이언트 행동, error code, 테스트 분기가 달라질 때 만든다 |\n\n## 결정 절차\n\n1. 실패 지점의 메서드 시그니처를 본다. 문제가 parameter 값인가, receiver 객체 상태인가?\n2. parameter 값이면 `IllegalArgumentException`을 기본값으로 잡는다. null은 `Objects.requireNonNull`을 먼저 고려한다.\n3. receiver 상태나 호출 순서가 문제면 `IllegalStateException`을 기본값으로 잡는다.\n4. 이 실패를 도메인 언어로 구분해 응답 code/status, 테스트명, 로그 검색 키로 삼아야 하면 custom exception으로 승격한다.\n5. Spring, HTTP, DB 같은 바깥 경계 번역은 별도 문서로 넘긴다. Java 표준 예외 이름만으로 API 계약을 끝내지 않는다.\n\n## 꼬리질문\n\n> Q: `Guess.of(\"112\")`가 실패하면 어떤 예외가 맞나요?\n> 의도: argument 값 검증과 domain custom 승격 기준 확인\n> 핵심: Java 내부에서는 `IllegalArgumentException`이 자연스럽고, API에서 별도 code가 필요하면 `InvalidGuessException`으로 드러낸다.\n\n> Q: `Game.guess(validGuess)`인데 게임이 이미 끝났다면요?\n> 의도: valid argument와 invalid receiver state 구분 확인\n> 핵심: `guess`는 맞지만 `Game`의 현재 상태가 틀렸으므로 `IllegalStateException` 또는 `GameAlreadyFinishedException`이 맞다.\n\n> Q: `IllegalArgumentException`을 상속한 `InvalidGuessException`을 만들어도 되나요?\n> 의도: 표준 예외 계층과 domain root의 trade-off 확인\n> 핵심: 가능은 하지만 handler가 `IllegalArgumentException` 전체를 잡을 때 섞일 수 있다. 도메인 응답 계약이 중요하면 별도 `BusinessException extends RuntimeException` root가 더 단순할 때가 많다.\n\n> Q: finished game은 사용자가 잘못 요청했으니 argument 문제 아닌가요?\n> 의도: 요청 전체와 메서드 argument를 섞는 오해 교정\n> 핵심: HTTP 요청은 잘못된 행동일 수 있지만, Java 메서드 안에서는 `Guess` argument가 아니라 `Game` state가 실패 원인이다.\n\n## 한 줄 정리\n\n`IllegalArgumentException`은 잘못된 인자, `IllegalStateException`은 잘못된 현재 상태다. 미션 코드에서는 이 Java 기준으로 먼저 원인을 나누고, 응답 계약이나 리뷰 설명에서 의미 분리가 필요해질 때 `InvalidGuessException`, `GameAlreadyFinishedException` 같은 도메인 예외로 승격한다.\n",
+  "aliases": [
+    "IllegalArgumentException IllegalStateException 차이",
+    "IllegalArgumentException IllegalStateException 언제",
+    "IllegalStateException 언제",
+    "잘못된 인자 예외",
+    "잘못된인자 예외",
+    "잘못된 상태 예외",
+    "잘못된상태 예외",
+    "커스텀 예외",
+    "커스텀예외",
+    "도메인 예외 승격 기준",
+    "invalid guess finished game 예외",
+    "야구 미션 예외 선택"
+  ],
+  "expected_queries": [
+    "IllegalArgumentException이랑 IllegalStateException은 각각 언제 던지는 거야?",
+    "메서드 인자가 잘못된 건지 객체 상태가 잘못된 건지 예외를 어떻게 골라?",
+    "야구 미션에서 중복 숫자 guess와 이미 끝난 game 재추측 예외를 다르게 봐야 해?",
+    "도메인 규칙 위반이면 IllegalArgumentException 대신 커스텀 예외를 만들어야 하나?",
+    "입력값은 정상인데 지금 상태에서 호출하면 안 되는 경우는 어떤 예외가 맞아?",
+    "finished game에 guess를 또 보내는 건 invalid argument야 illegal state야?"
+  ],
+  "symptoms": [
+    "잘못된 입력과 잘못된 현재 상태를 모두 IllegalArgumentException으로 처리한다",
+    "IllegalStateException을 서버 장애나 500 응답으로만 이해한다",
+    "도메인 custom exception을 언제 만들지 모르고 표준 예외와 섞어 쓴다",
+    "baseball 미션에서 invalid guess와 finished game 재요청을 같은 예외로 뭉갠다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-exception-handling-basics"
+    ],
+    "next_docs": [
+      "software-engineering/business-vs-technical-exception-primer",
+      "spring/baseball-invalid-guess-400-vs-finished-game-409-exception-bridge",
+      "language/java-exception-design-checked-vs-unchecked-vs-runtime-chooser"
+    ],
+    "confusable_with": [
+      "language/java-exception-design-checked-vs-unchecked-vs-runtime-chooser",
+      "software-engineering/business-vs-technical-exception-primer",
+      "spring/baseball-invalid-guess-400-vs-finished-game-409-exception-bridge"
+    ],
+    "forbidden_for_queries": [
+      "Checked Exception이랑 Unchecked Exception 중 뭘 만들어?",
+      "ControllerAdvice에서 중복 숫자 입력과 finished game 예외를 어떻게 다르게 번역해야 해?",
+      "예외 wrapping할 때 cause chaining을 어떻게 써야 해?"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "batch": "corpus-expansion-worker",
+    "revision_history": []
+  }
+}

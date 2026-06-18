@@ -1,0 +1,65 @@
+{
+  "id": "database/external-payment-timeout-reversal-reconciliation",
+  "title": "External Payment Timeout Reversal Reconciliation",
+  "category": "database",
+  "level": "advanced",
+  "summary": "외부 결제 호출에서 timeout은 실패가 아니라 unknown일 수 있으므로, 승인 조회, 취소 보상, 멱등 키, reconciliation job을 하나의 상태 수렴 프로토콜로 설계해야 한다.",
+  "body_markdown": "# External Payment Timeout Reversal Reconciliation\n\n> 한 줄 요약: 외부 결제 API timeout은 실패가 아니라 unknown이다. 결제사가 이미 승인했을 수 있으므로 새 승인 재시도보다 provider 조회, 멱등 키, 취소 보상, reconciliation job으로 상태를 수렴시키는 설계가 먼저다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Remote Call Tristate Unknown Idempotent Recovery](../system-design/remote-call-tristate-unknown-idempotent-recovery.md)\n- [Spring Payment Approval DB Failure Compensation Idempotency Primer](../spring/payment-approval-db-failure-compensation-idempotency-primer.md)\n- [Idempotency Key Status Contract Examples](./idempotency-key-status-contract-examples.md)\n- [Payment System Ledger, Idempotency, Reconciliation](../system-design/payment-system-ledger-idempotency-reconciliation-design.md)\n- [Payment Ledger State Reconciliation Mission Bridge](./payment-ledger-state-reconciliation-mission-bridge.md)\n- [Reconciliation Window Cutoff Control Design](../system-design/reconciliation-window-cutoff-control-design.md)\n\nretrieval-anchor-keywords: external payment timeout unknown, payment reversal reconciliation, payment approval timeout not failure, provider commit local timeout, payment cancel compensation idempotency, PG approval lookup, payment reconciliation job, 결제 타임아웃 불확정, 승인 취소 보상, 결제 정합성 수렴\n\n---\n\n## 핵심 mental model\n\n결제 timeout을 HTTP client 예외 하나로 보면 설계가 틀어진다. timeout은 세 가지 상태 중 하나로 열려 있다.\n\n| 우리 쪽 관측 | 외부 결제사 실제 상태 | 안전한 해석 |\n|---|---|---|\n| 응답을 못 받음 | 승인 안 됨 | 실패일 수 있다 |\n| 응답을 못 받음 | 승인 됨 | 성공일 수 있다 |\n| 응답을 못 받음 | 처리 중 | 나중에 성공/실패로 닫힐 수 있다 |\n\n따라서 timeout을 곧바로 `FAILED`로 닫고 같은 주문에 새 승인 요청을 보내면, 사용자는 결제가 두 번 잡히거나 우리 DB와 결제사 상태가 갈라질 수 있다.\n\n이 문서의 출발점은 이 문장이다.\n\n```text\n원격 호출 timeout은 실패 증거가 아니라 결과를 모른다는 증거다.\n돈이 걸린 흐름에서는 unknown을 저장하고 조회/보상/reconciliation으로 닫는다.\n```\n\n---\n\n## 상태 모델을 먼저 만든다\n\n단순히 `SUCCESS/FAIL` boolean으로는 부족하다. 결제 시도는 최소한 아래처럼 열린 상태를 가져야 한다.\n\n| 내부 상태 | 의미 | 다음 행동 |\n|---|---|---|\n| `REQUESTED` | idempotency key를 선점했고 승인 호출 전이다 | 외부 승인 호출 |\n| `UNKNOWN` | timeout/reset 등으로 외부 결과를 모른다 | provider 조회, webhook 대기, reconciliation enqueue |\n| `APPROVED_EXTERNAL` | 외부 승인은 확인했지만 내부 확정은 아직 불완전하다 | 로컬 ledger/order commit 또는 취소 보상 |\n| `PAID` | 내부 주문/원장까지 확정됐다 | outbox, receipt, downstream 전달 |\n| `REVERSAL_REQUESTED` | 취소 보상을 요청했다 | 취소 결과 조회/재시도 |\n| `REVERSED` | 외부 승인 취소까지 확인했다 | 사용자/운영 상태 정리 |\n| `FAILED_FINAL` | 외부 실패 또는 보상 완료로 최종 실패다 | 재시도 가능 여부 안내 |\n\n상태 이름은 시스템마다 달라도 된다. 중요한 것은 unknown을 실패로 접지 않는 것이다. unknown은 운영자가 보기 싫은 중간 상태가 아니라, 중복 결제와 누락 결제를 막는 안전장치다.\n\n---\n\n## worked example: checkout 승인 timeout\n\n사용자가 30,000원 주문을 결제한다. 서버는 결제사 승인 API를 호출했지만 read timeout이 났다.\n\n```text\n1. payment_attempt(idempotency_key=K, amount=30000) INSERT\n2. PG approve(K, amount=30000) 호출\n3. client read timeout\n4. 우리 서버는 응답을 못 받음\n```\n\n이때 잘못된 흐름은 다음이다.\n\n```text\ncatch TimeoutException:\n  mark FAILED\n  user retry -> approve again with new key\n```\n\n왜 위험한가? 첫 번째 승인 요청이 결제사에서는 성공했을 수 있다. 사용자가 재시도하면 두 번째 승인도 성공해서 double charge가 된다.\n\n안전한 흐름은 아래에 가깝다.\n\n```text\ncatch TimeoutException:\n  mark UNKNOWN with provider_request_key K\n  enqueue reconcile(K)\n  return processing/unknown response\n\nreconcile(K):\n  providerStatus = paymentGateway.lookup(K)\n  if providerStatus == APPROVED:\n      record approval or request reversal according to local order state\n  if providerStatus == NOT_FOUND or FAILED:\n      close FAILED_FINAL after cutoff policy\n  if providerStatus == PENDING:\n      retry lookup later within window\n```\n\n여기서 핵심은 새 승인보다 lookup이 먼저라는 점이다. provider가 idempotency key나 merchant order id로 조회를 지원하지 않는다면, 우리 쪽 idempotency 설계만으로는 unknown을 닫기 어렵다. 그래서 PG 연동을 설계할 때는 승인 API보다 조회/취소 API의 멱등성과 식별자를 함께 봐야 한다.\n\n---\n\n## reversal과 reconciliation의 차이\n\n두 단어가 자주 섞인다.\n\n| 개념 | 목적 | 예시 |\n|---|---|---|\n| reversal / compensation | 이미 생긴 외부 side effect를 되돌리거나 상쇄한다 | 승인 취소, 환불 요청, capture 취소 |\n| reconciliation | 외부 사실과 내부 기록을 비교해 어느 쪽이 맞는지 수렴한다 | PG 승인 목록과 내부 payment table 대조 |\n\nTimeout 직후에는 보통 reconciliation이 먼저다. 외부 승인이 있었는지 모른다면 취소할 대상도 확정되지 않았다. 조회 결과 승인됨이 확인되었는데 내부 주문을 확정할 수 없는 상황이라면 reversal을 요청한다.\n\n예를 들어 내부 DB commit이 실패했고 외부 승인이 확인됐다면 선택지는 두 갈래다.\n\n| 내부 상태 | 외부 상태 | 결정 |\n|---|---|---|\n| 주문 row 없음 | 승인됨 | 취소 보상 또는 주문 재구성 정책 |\n| 주문 pending | 승인됨 | payment ledger를 확정하고 주문 paid로 전이 |\n| 주문 paid | 승인됨 | 중복 webhook/조회라면 idempotent success |\n| 주문 canceled | 승인됨 | reversal 요청 후 운영 확인 |\n\n돈이 걸린 흐름에서는 자동 취소가 항상 정답은 아니다. 상품 재고, 주문 생성 여부, 사용자 응답, PG 정책, 취소 가능 시간에 따라 forward recovery가 맞을 수 있다. 그래서 상태 전이와 운영 정책을 코드 밖 runbook에도 남겨야 한다.\n\n---\n\n## 데이터 모델 최소 조건\n\n결제 unknown을 안전하게 닫으려면 최소한 아래 식별자가 필요하다.\n\n| 필드 | 이유 |\n|---|---|\n| `payment_attempt_id` | 내부 결제 시도 식별자 |\n| `idempotency_key` | 같은 사용자 재시도를 같은 시도에 묶는다 |\n| `request_hash` | 같은 key로 다른 금액/주문을 보내는 오용을 막는다 |\n| `provider_request_key` | PG 조회/취소 API에 넘길 외부 식별자 |\n| `provider_approval_id` | 승인 확인 후 ledger/reversal 기준 |\n| `state` | `UNKNOWN`, `PAID`, `REVERSAL_REQUESTED` 같은 전이 상태 |\n| `next_reconcile_at` | 재조회 스케줄 |\n| `reconcile_attempt_count` | 반복 조회와 cutoff 판단 |\n| `last_provider_snapshot` | 운영자가 판단할 외부 사실의 마지막 증거 |\n\n`last_provider_snapshot`은 대충 JSON을 저장하라는 뜻이 아니다. 나중에 왜 paid/reversed가 되었는지 설명할 수 있는 최소 증거를 보존하라는 뜻이다. 결제 감사에서는 상태값 하나보다, 어떤 외부 사실을 보고 어떤 내부 전이를 했는지가 중요하다.\n\n---\n\n## blind retry를 막는 멱등 계약\n\n사용자가 결제 버튼을 다시 누르면 서버는 새 승인부터 보내면 안 된다. 먼저 idempotency record를 본다.\n\n| 재요청 | 응답 |\n|---|---|\n| 같은 key + 같은 request hash + `PAID` | 기존 성공 응답 재생 |\n| 같은 key + 같은 request hash + `UNKNOWN` | processing/unknown 반환, 새 승인 금지 |\n| 같은 key + 같은 request hash + `REVERSAL_REQUESTED` | 취소 진행 중 반환 또는 운영 안내 |\n| 같은 key + 다른 request hash | 409 conflict |\n| 다른 key + 같은 order pending | 주문 정책에 따라 기존 시도 안내 또는 새 시도 금지 |\n\n중요한 점은 unknown도 idempotent response를 가져야 한다는 것이다. 성공 응답만 저장하고 unknown을 버리면, 가장 위험한 순간에 blind retry가 열린다.\n\n---\n\n## reconciliation job 설계\n\nReconciliation job은 로그를 뒤져 수동으로 맞추는 작업이 아니다. 상태 수렴 프로토콜의 일부다.\n\n### 입력\n\n- 내부 `payment_attempt` 중 `UNKNOWN`, `APPROVED_EXTERNAL`, `REVERSAL_REQUESTED`\n- provider lookup API 결과\n- webhook으로 들어온 승인/취소 이벤트\n- 정산 파일이나 daily settlement snapshot\n\n### 출력\n\n- 내부 ledger/order 상태 전이\n- reversal 요청 또는 reversal 확인\n- mismatch row와 운영 검토 task\n- cutoff 후 final failure 또는 manual review\n\n### cutoff\n\n무한히 `UNKNOWN`을 들고 있을 수는 없다. 하지만 cutoff는 단순 timeout이 아니라 provider의 보장과 운영 정책에 맞춰야 한다.\n\n| 상황 | 가능한 cutoff |\n|---|---|\n| provider가 idempotency key 조회를 제공 | 조회 결과 not found가 일정 기간 반복되면 final failure |\n| provider가 나중에 webhook을 보낼 수 있음 | webhook 지연 윈도우 동안 unknown 유지 |\n| 승인 취소 가능 시간이 짧음 | reversal retry 우선순위 상승 |\n| 정산 파일이 다음 날 도착 | daily reconciliation 전까지 manual hold |\n\n`UNKNOWN`을 빨리 지우는 것보다, 중복 청구와 미청구를 나중에 증명 가능하게 닫는 것이 더 중요하다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| timeout이면 실패다 | 상대가 commit했을 수 있으므로 unknown이다 |\n| 재시도하면 언젠가 성공한다 | 비멱등 승인 재시도는 double charge를 만들 수 있다 |\n| 취소 API를 한 번 보내면 보상이 끝난다 | 취소 호출도 timeout/unknown이 될 수 있어 조회와 재시도가 필요하다 |\n| webhook이 있으니 reconciliation은 필요 없다 | webhook도 유실/중복/지연될 수 있어 snapshot 대조가 필요하다 |\n| 내부 DB rollback이면 외부 승인도 취소된다 | 외부 결제사는 같은 DB transaction에 없다 |\n| 결제 상태 하나만 저장하면 된다 | audit 가능한 외부 snapshot, idempotency key, ledger event가 필요하다 |\n\n---\n\n## 면접 답변 골격\n\n질문이 `결제 승인 API가 timeout이면 실패 처리하면 되나요?`라면 이렇게 답한다.\n\n1. timeout은 실패가 아니라 unknown이다. 외부 결제사는 이미 승인했을 수 있다.\n2. 같은 주문에 새 승인 요청을 바로 보내면 중복 결제가 생길 수 있다.\n3. 그래서 결제 attempt와 idempotency key를 먼저 저장하고, timeout 시 `UNKNOWN` 상태로 남긴다.\n4. provider request key로 승인 조회를 하고, 승인 확인 시 내부 주문을 확정하거나 취소 보상을 요청한다.\n5. 취소 보상도 멱등하게 재시도하고 결과를 조회한다.\n6. webhook과 정산 snapshot까지 reconciliation job으로 대조해 최종 상태를 닫는다.\n\n---\n\n## 꼬리질문\n\n> Q: timeout 직후 같은 결제 요청을 새 idempotency key로 다시 보내면 왜 위험한가요?\n> 의도: unknown과 double charge 위험 이해 확인\n> 핵심: 첫 호출이 외부에서 승인됐을 수 있어 두 번째 승인까지 성공하면 중복 결제가 된다.\n\n> Q: reversal과 reconciliation은 어떻게 다른가요?\n> 의도: 보상 행동과 상태 대조 루프를 구분하는지 확인\n> 핵심: reversal은 외부 side effect를 되돌리는 행동이고, reconciliation은 외부 사실과 내부 기록을 비교해 상태를 수렴시키는 과정이다.\n\n> Q: webhook이 있는데 왜 reconciliation job이 필요한가요?\n> 의도: 외부 이벤트도 at-least-once/지연/누락 가능성이 있음을 아는지 확인\n> 핵심: webhook만 신뢰하지 말고 provider snapshot이나 정산 파일과 내부 ledger를 대조해야 한다.\n\n## 한 줄 정리\n\n외부 결제 timeout 처리는 예외 처리 분기가 아니라 unknown을 보존하고 idempotency, provider lookup, reversal, reconciliation으로 최종 상태를 증명 가능하게 닫는 정합성 설계다.\n",
+  "aliases": [
+    "external payment timeout",
+    "결제 타임아웃 unknown",
+    "payment reversal reconciliation",
+    "승인 취소 보상",
+    "PG timeout reconciliation",
+    "결제사 승인 조회",
+    "payment unknown state",
+    "외부 결제 보상",
+    "결제 정합성 수렴",
+    "blind retry double charge"
+  ],
+  "expected_queries": [
+    "결제 승인 API가 timeout이면 실패 처리하고 다시 승인 요청을 보내도 돼?",
+    "외부 결제 timeout이 unknown이라는 걸 상태 모델과 reconciliation으로 어떻게 설계해야 해?",
+    "PG 승인은 됐을 수 있는데 우리 DB에는 결제 실패로 남았을 때 취소 보상과 조회를 어떤 순서로 해야 해?",
+    "결제사 webhook이 있는데도 reconciliation job이 필요한 이유가 뭐야?",
+    "payment reversal이랑 reconciliation은 각각 무엇이고 timeout 이후에 어떻게 연결돼?",
+    "같은 주문 결제 재시도에서 idempotency key를 잘못 바꾸면 double charge가 생기는 이유를 설명해줘"
+  ],
+  "symptoms": [
+    "결제 승인 API timeout 뒤 같은 주문에 새 승인 요청을 보낸다",
+    "PG에는 승인됐는데 내부 주문은 실패로 남아 있다",
+    "취소 API timeout 뒤 보상이 끝났는지 모른다",
+    "webhook과 내부 payment table 상태가 서로 다르다"
+  ],
+  "learner_query_patterns": [],
+  "relations": {
+    "prerequisites": [
+      "system-design/remote-call-tristate-unknown-idempotent-recovery",
+      "spring/payment-approval-db-failure-compensation-idempotency-primer",
+      "database/idempotency-key-status-contract-examples"
+    ],
+    "next_docs": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design",
+      "database/payment-ledger-state-reconciliation-mission-bridge",
+      "system-design/reconciliation-window-cutoff-control-design"
+    ],
+    "confusable_with": [
+      "database/transaction-boundary-external-io-checklist",
+      "design-pattern/compensation-vs-reconciliation-pattern",
+      "database/payment-succeeded-but-order-not-visible-symptom-router"
+    ],
+    "forbidden_for_queries": [
+      "Spring @Transactional 안에서 외부 API를 호출하면 왜 connection을 오래 잡는지 설명해줘",
+      "주문 결제 완료 후 첫 조회에서 order가 안 보이는 read replica 문제를 설명해줘"
+    ]
+  },
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18T00:00:00+09:00",
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "version": 1,
+    "source": "y14-expansion-batch94-stream-a-payment-reconciliation",
+    "legacy_path": "knowledge/cs/contents/database/external-payment-timeout-reversal-reconciliation.md",
+    "last_modified": "2026-06-18T00:00:00+09:00"
+  }
+}

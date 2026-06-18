@@ -4,19 +4,26 @@
   "category": "language",
   "level": "intermediate",
   "summary": "이 primer는 heap dump에서 shallow size, retained size, dominator tree를 읽는 법을 설명한다. 큰 객체 graph, GC root retention, memory leak 분석 질문을 다룬다.",
-  "body_markdown": "# Heap Dump Retained Size Primer\n\n## 한 줄 요약\n\nShallow size는 객체 자신이 차지하는 크기이고, retained size는 그 객체가 사라지면 함께 회수될 수 있는 전체 graph 크기다.\n\n## 미션 진입 증상\n\n작은 manager 객체 하나가 큰 cache map을 참조하고 있으면 shallow size는 작아도 retained size는 클 수 있다.\n\n## 핵심 mental model\n\nDominator tree는 어떤 객체가 다른 객체들의 회수를 막고 있는지 보여준다. Leak 분석에서는 \"큰 객체\"보다 \"큰 graph를 붙잡는 객체\"가 중요하다.\n\nretained size는 \"이 객체 하나가 없어지면 반드시 이만큼 줄어든다\"는 운영 보증값이 아니라 heap dump graph에서 계산한 분석값이다. 공유 참조, weak/soft reference, classloader, finalizer/cleaner, tool의 계산 방식에 따라 해석이 달라질 수 있으므로 dominator tree와 GC root path를 같이 본다.\n\n## 운영 관찰 지표\n\n- histogram의 class별 instance count/shallow size와 dominator tree의 retained size 상위 객체를 함께 본다.\n- retained size가 큰 객체에서 GC root까지의 path를 확인한다. static field, thread local, classloader, cache, listener registry, queue, executor task가 대표적인 anchor가 될 수 있다.\n- GC 후 live heap trend, old generation 점유율, allocation rate, full GC 이후 heap 회수 여부를 시간축으로 본다.\n- 가능한 경우 비슷한 부하 조건에서 시간 차를 둔 heap dump를 비교한다. 한 장의 dump는 peak snapshot일 수 있다.\n- heap dump에 큰 객체가 없는데 RSS나 cgroup memory가 높다면 direct buffer, mmap, thread stack, native memory도 별도 경로로 확인한다.\n\n## 1차 분기\n\n1. 실제 heap retention 증가: full GC 이후에도 같은 dominator나 같은 GC root path가 커지고 old heap이 내려오지 않는다.\n2. 정상 cache/load peak: retained size는 크지만 size limit, eviction, TTL, hit rate가 의도대로 동작하고 부하가 줄면 회수된다.\n3. 단일 owner 문제: 작은 manager, static registry, session object가 큰 collection이나 graph를 붙잡는다.\n4. 다수 소형 객체 누적: 하나의 dominator보다 request/session/job 단위 객체가 대량으로 남는다.\n5. heap 밖 문제: heap dump는 깨끗하지만 direct/off-heap/native memory가 증가한다.\n\n## 운영 분석 순서\n\n먼저 \"큰 객체\"가 아니라 \"큰 graph를 회수하지 못하게 하는 owner\"를 찾는다. dominator tree 상위 항목을 보고, 해당 객체의 incoming reference와 GC root path를 따라간다.\n\n그다음 lifecycle을 확인한다. cache라면 eviction 조건, collection이라면 remove 경로, thread local이라면 cleanup, listener라면 unregister, executor task라면 완료/취소 경로가 있는지 본다.\n\n마지막으로 시간 비교를 한다. 배포 직후, 부하 peak, GC 직후, 장애 직전 dump를 비교하면 단발성 peak와 지속 누수를 구분하기 쉽다. production heap dump는 pause와 민감정보 노출 위험이 있으므로 운영 절차에 맞춰 수집한다.\n\n## 흔한 오해\n\nHeap dump 한 장만으로 leak 확정은 어렵다. 시간 차를 둔 dump와 GC 후 heap trend를 같이 본다.\n\n## 잘못된 대응\n\n- shallow size가 큰 class만 지운다. 작은 root object가 큰 graph를 붙잡는 경우를 놓친다.\n- retained size 상위 객체를 무조건 leak으로 단정한다. bounded cache나 정상 warm-up data일 수 있다.\n- heap dump만 보고 RSS 증가를 설명하려 한다. direct buffer나 native memory는 heap dump에 충분히 나타나지 않을 수 있다.\n- 원인 객체를 제거하기 전에 ownership과 lifecycle을 확인하지 않는다. 참조를 끊으면 기능적으로 필요한 cache나 registry가 깨질 수 있다.\n- Xmx만 늘린다. leak이면 장애 시간을 늦출 뿐이고, container 환경에서는 native memory 여유를 줄일 수도 있다.\n\n## Safe Next Docs\n\nOOM heap dump playbook에서 수집 절차와 운영 위험을 확인하고, GC root retention analysis에서 root path 해석을 이어서 본다. heap은 낮은데 RSS가 높다면 direct buffer/off-heap OOM bridge로 분기한다.\n",
+  "body_markdown": "# Heap Dump Retained Size Primer\n\n## 한 줄 요약\n\nShallow size는 객체 자신이 차지하는 크기이고, retained size는 그 객체가 사라지면 함께 회수될 수 있는 전체 graph 크기다.\n\n## 미션 진입 증상\n\n작은 manager 객체 하나가 큰 cache map을 참조하고 있으면 shallow size는 작아도 retained size는 클 수 있다.\n\n## 핵심 mental model\n\nDominator tree는 어떤 객체가 다른 객체들의 회수를 막고 있는지 보여준다. Leak 분석에서는 \"큰 객체\"보다 \"큰 graph를 붙잡는 객체\"가 중요하다.\n\nretained size는 \"이 객체 하나가 없어지면 반드시 이만큼 줄어든다\"는 운영 보증값이 아니라 heap dump graph에서 계산한 분석값이다. 공유 참조, weak/soft reference, classloader, finalizer/cleaner, tool의 계산 방식에 따라 해석이 달라질 수 있으므로 dominator tree와 GC root path를 같이 본다.\n\n## 운영 관찰 지표\n\n- histogram의 class별 instance count/shallow size와 dominator tree의 retained size 상위 객체를 함께 본다.\n- retained size가 큰 객체에서 GC root까지의 path를 확인한다. static field, thread local, classloader, cache, listener registry, queue, executor task가 대표적인 anchor가 될 수 있다.\n- GC 후 live heap trend, old generation 점유율, allocation rate, full GC 이후 heap 회수 여부를 시간축으로 본다.\n- 가능한 경우 비슷한 부하 조건에서 시간 차를 둔 heap dump를 비교한다. 한 장의 dump는 peak snapshot일 수 있다.\n- heap dump에 큰 객체가 없는데 RSS나 cgroup memory가 높다면 direct buffer, mmap, thread stack, native memory도 별도 경로로 확인한다.\n\n## 1차 분기\n\n1. 실제 heap retention 증가: full GC 이후에도 같은 dominator나 같은 GC root path가 커지고 old heap이 내려오지 않는다.\n2. 정상 cache/load peak: retained size는 크지만 size limit, eviction, TTL, hit rate가 의도대로 동작하고 부하가 줄면 회수된다.\n3. 단일 owner 문제: 작은 manager, static registry, session object가 큰 collection이나 graph를 붙잡는다.\n4. 다수 소형 객체 누적: 하나의 dominator보다 request/session/job 단위 객체가 대량으로 남는다.\n5. heap 밖 문제: heap dump는 깨끗하지만 direct/off-heap/native memory가 증가한다.\n\n## Retained size 읽는 순서\n\nHeap dump를 열면 먼저 histogram 상위 class를 훑어 전체 분위기를 본다. 하지만 원인 판단은 dominator tree로 옮겨서 한다. histogram은 \"어떤 class의 객체가 많이 보이는가\"를 알려 주고, dominator tree는 \"어떤 owner가 그 객체들을 회수하지 못하게 붙잡는가\"를 보여 준다.\n\n실제 순서는 다음이 안전하다.\n\n1. full GC 이후에도 heap이 내려오지 않는지 운영 지표로 확인한다.\n2. heap dump의 dominator tree에서 retained size 상위 객체를 고른다.\n3. 그 객체의 incoming reference와 GC root path를 따라 owner를 찾는다.\n4. owner가 cache, registry, thread local, session, queue, classloader 중 무엇인지 분류한다.\n5. owner lifecycle에 remove, evict, clear, unregister, close 같은 종료 경로가 있는지 본다.\n6. 시간 차 dump나 재현 테스트로 같은 root path가 계속 커지는지 확인한다.\n\n이 순서를 지키면 \"큰 byte array가 많다\"에서 멈추지 않고 \"누가 그 byte array들을 계속 붙잡는가\"로 질문이 바뀐다. 누수 수정은 대개 byte array class가 아니라 owner의 lifecycle을 고치는 일이다.\n\n## 작은 owner가 큰 graph를 붙잡는 예\n\n예를 들어 `SessionManager` 객체 자체의 shallow size는 작을 수 있다. 그러나 내부 map이 만료되지 않은 session, 장바구니, 최근 조회 목록, 인증 토큰, listener를 계속 참조하면 retained size는 매우 커진다. 이때 shallow size 기준으로 보면 `SessionManager`는 원인 후보에서 밀리지만, dominator tree에서는 큰 graph의 지배자로 보인다.\n\n비슷하게 static registry, singleton cache, executor queue, thread local holder도 작은 객체 하나가 많은 객체를 붙잡는 구조를 만든다. retained size 분석은 바로 이 지점을 찾기 위한 도구다. 객체 크기보다 ownership과 reachability를 먼저 보는 이유가 여기에 있다.\n\n## Heap dump 해석의 안전장치\n\nRetained size 상위 항목을 찾았다고 곧바로 코드를 삭제하지 않는다. bounded cache라면 warm-up 이후 retained size가 큰 것이 정상일 수 있고, read-heavy 서비스에서는 의도한 메모리 사용일 수 있다. 그래서 size limit, TTL, eviction metric, hit rate, load profile을 함께 본다.\n\n또한 heap dump는 민감정보를 포함할 수 있다. 운영 dump를 공유할 때는 접근 권한, 저장 위치, 삭제 기한을 정하고, 가능하면 staging 재현이나 샘플 dump로 먼저 분석한다. 원인 후보를 찾은 뒤 production에서 바로 dump를 반복 수집하기보다, 필요한 metric과 allocation/log 증거를 좁혀서 추가 관찰한다.\n\n## 수정 검증\n\n수정 후에는 같은 부하 조건에서 다음을 비교한다.\n\n- full GC 이후 old heap이 이전보다 내려오는가?\n- dominator tree 상위 owner의 retained size가 줄거나 bounded 상태로 유지되는가?\n- GC root path가 사라졌거나 의도한 cache owner로 바뀌었는가?\n- p95 latency, full GC 횟수, allocation rate가 함께 악화되지 않았는가?\n- RSS 증가가 남아 있다면 direct buffer나 native memory를 별도 지표로 설명했는가?\n\n이 검증까지 있어야 retained size 분석이 단순 스냅샷 해석이 아니라 누수 수정 루프로 이어진다.\n\n## 운영 분석 순서\n\n먼저 \"큰 객체\"가 아니라 \"큰 graph를 회수하지 못하게 하는 owner\"를 찾는다. dominator tree 상위 항목을 보고, 해당 객체의 incoming reference와 GC root path를 따라간다.\n\n그다음 lifecycle을 확인한다. cache라면 eviction 조건, collection이라면 remove 경로, thread local이라면 cleanup, listener라면 unregister, executor task라면 완료/취소 경로가 있는지 본다.\n\n마지막으로 시간 비교를 한다. 배포 직후, 부하 peak, GC 직후, 장애 직전 dump를 비교하면 단발성 peak와 지속 누수를 구분하기 쉽다. production heap dump는 pause와 민감정보 노출 위험이 있으므로 운영 절차에 맞춰 수집한다.\n\n## 흔한 오해\n\nHeap dump 한 장만으로 leak 확정은 어렵다. 시간 차를 둔 dump와 GC 후 heap trend를 같이 본다.\n\n## 잘못된 대응\n\n- shallow size가 큰 class만 지운다. 작은 root object가 큰 graph를 붙잡는 경우를 놓친다.\n- retained size 상위 객체를 무조건 leak으로 단정한다. bounded cache나 정상 warm-up data일 수 있다.\n- heap dump만 보고 RSS 증가를 설명하려 한다. direct buffer나 native memory는 heap dump에 충분히 나타나지 않을 수 있다.\n- 원인 객체를 제거하기 전에 ownership과 lifecycle을 확인하지 않는다. 참조를 끊으면 기능적으로 필요한 cache나 registry가 깨질 수 있다.\n- Xmx만 늘린다. leak이면 장애 시간을 늦출 뿐이고, container 환경에서는 native memory 여유를 줄일 수도 있다.\n\n## Safe Next Docs\n\nOOM heap dump playbook에서 수집 절차와 운영 위험을 확인하고, GC root retention analysis에서 root path 해석을 이어서 본다. heap은 낮은데 RSS가 높다면 direct buffer/off-heap OOM bridge로 분기한다.\n",
   "aliases": [
-    "heap dump retained size primer",
-    "shallow size retained size dominator tree",
-    "heap dump retained size",
-    "dominator tree 메모리 분석",
-    "native",
-    "static"
+    "heap dump retained size analysis",
+    "shallow retained size 차이",
+    "dominator tree leak analysis",
+    "retained heap owner 찾기",
+    "MAT dominator tree",
+    "객체 retained size",
+    "메모리 누수 dominator",
+    "큰 객체 retained 비교",
+    "GC root retained path",
+    "heap dump ownership"
   ],
   "expected_queries": [
-    "heap dump에서 shallow size와 retained size는 뭐가 달라?",
-    "dominator tree는 memory leak을 찾을 때 왜 봐?",
-    "큰 객체보다 retained size가 큰 객체를 봐야 하는 이유가 뭐야?"
+    "heap dump에서 shallow size보다 retained size와 dominator tree를 먼저 보는 이유는 뭐야?",
+    "MAT dominator tree에서 retained heap owner를 찾고 GC root path로 leak을 검증하는 순서를 알려줘",
+    "큰 객체보다 retained size가 큰 객체를 봐야 하는 이유가 뭐야?",
+    "heap dump에서 객체 자체 크기와 그 객체가 붙잡는 전체 그래프 크기를 어떻게 구분해?",
+    "dominator tree 상위 객체가 진짜 leak owner인지 어떻게 의심하고 검증해?",
+    "OOM heap dump를 봤는데 shallow size만 크고 retained size는 작으면 어떻게 해석해?"
   ],
   "symptoms": [
     "shallow size만 보고 누수 원인을 단정해요",
@@ -40,8 +47,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/heap-dump-retained-size-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

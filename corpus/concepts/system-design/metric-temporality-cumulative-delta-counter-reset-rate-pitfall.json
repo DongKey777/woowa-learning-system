@@ -1,0 +1,56 @@
+{
+  "id": "system-design/metric-temporality-cumulative-delta-counter-reset-rate-pitfall",
+  "title": "Metric temporality pitfall - cumulative, delta, counter reset, rate 해석",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Metric temporality는 측정값이 시작 이후 누적인지, 직전 구간의 delta인지, 현재 상태인지 구분하는 축이다. Counter reset, scrape gap, delta/cumulative 변환을 이해하지 못하면 rate가 허위 spike를 만들거나 이벤트 수가 이중 집계된다.",
+  "body_markdown": "# Metric temporality pitfall - cumulative, delta, counter reset, rate 해석\n\n> 한 줄 요약: metric 값이 누적값인지 구간값인지 현재값인지 알아야 rate와 alert를 맞게 해석할 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: metric temporality, cumulative delta metric, counter reset, Prometheus rate reset, OpenTelemetry temporality, delta temporality aggregation, cumulative counter, scrape gap spike, rate pitfall, counter reset false spike\n\n## 먼저 멘탈모델\n\n같은 요청 수 metric이라도 표현 방식이 다를 수 있다.\n\n```text\ncumulative counter:\n  10:00 -> 1000\n  10:01 -> 1060\n  10:02 -> 1125\n\ndelta metric:\n  10:00-10:01 -> 60\n  10:01-10:02 -> 65\n```\n\n둘 다 요청이 60번, 65번 늘었다는 정보를 담지만 저장과 집계 방식은 다르다. Cumulative는 시작 이후 누적값이고, delta는 관측 구간 증가분이다.\n\n## temporality가 왜 중요한가\n\nMetric pipeline은 값을 여러 instance, collector, time window로 합친다. 이때 temporality를 잘못 해석하면 숫자가 틀어진다.\n\n| 상황 | 잘못된 해석 |\n|---|---|\n| cumulative counter를 그대로 합산해 기간 이벤트 수로 봄 | 기간별 이벤트 수가 과대 계산된다 |\n| delta metric을 또 rate로 변환함 | 단위가 꼬인다 |\n| process restart counter reset을 spike로 봄 | 장애 아닌 재시작이 false alert가 된다 |\n| gauge를 cumulative처럼 누적함 | 현재 상태값이 이벤트 수처럼 부풀려진다 |\n\n## Counter reset\n\nCounter는 보통 감소하지 않는다고 가정하지만 process가 재시작되면 0부터 다시 시작할 수 있다.\n\n```text\n10:00 -> 12000\n10:01 -> 12100\n10:02 -> 30      <- restart\n10:03 -> 90\n```\n\n단순 차분을 하면 `30 - 12100`이 음수가 된다. query 함수는 reset을 감안해야 한다. Prometheus의 `rate()`나 `increase()`는 counter reset을 처리하려고 설계되었지만, scrape gap이 크거나 reset이 너무 잦거나 label이 바뀌면 여전히 해석이 어려워질 수 있다.\n\n## cumulative와 delta 집계\n\nCumulative counter는 backend가 기간 증가량을 계산하기 좋다. 그러나 중간 collector가 cumulative를 delta로 바꾸거나, delta를 cumulative로 다시 누적하는 pipeline에서는 start time과 reset detection이 중요하다.\n\nDelta metric은 collector가 구간 증가분을 보내므로 immediate aggregation에는 편하지만, collector restart나 window alignment가 어긋나면 누락과 중복이 생길 수 있다.\n\n핵심은 exporter, collector, backend가 같은 temporality 계약을 이해해야 한다는 것이다.\n\n## rate의 흔한 함정\n\n### 너무 짧은 window\n\n`rate(counter[10s])`처럼 window가 scrape interval과 비슷하면 노이즈가 크다. alert에는 보통 충분한 sample이 들어오는 window를 둔다.\n\n### label churn\n\npod id, instance id, raw path처럼 자주 바뀌는 label이 붙으면 series가 끊겨 reset처럼 보일 수 있다. cardinality 문제와 temporality 문제가 같이 온다.\n\n### gauge에 rate 적용\n\nGauge도 변화율을 볼 수는 있지만 의미가 다르다. queue depth가 줄어든 변화율을 이벤트 처리량으로 해석하면 잘못이다. 처리량은 completed counter로 따로 세는 편이 안전하다.\n\n## OTel/Prometheus 경계\n\nOpenTelemetry는 metric temporality를 명시적으로 다루고, exporter에 따라 cumulative 또는 delta로 내보낼 수 있다. Prometheus는 전통적으로 cumulative counter를 scrape하고 query에서 rate를 계산하는 모델에 익숙하다.\n\n따라서 OTel collector를 Prometheus와 붙일 때는 temporality 변환, cumulative start time, counter reset 처리가 어떻게 되는지 확인해야 한다. 숫자가 보인다고 의미가 맞는 것은 아니다.\n\n## 한 줄 정리\n\nMetric temporality는 값의 시간 의미를 정하는 계약이다. cumulative, delta, gauge를 섞어 이해하면 rate와 alert가 쉽게 거짓 spike를 만들기 때문에 exporter부터 query까지 같은 해석을 유지해야 한다.\n",
+  "aliases": [
+    "metric temporality",
+    "cumulative delta metric",
+    "counter reset",
+    "메트릭 시간성",
+    "누적 델타 메트릭",
+    "카운터 리셋",
+    "Prometheus rate",
+    "OTel temporality",
+    "rate pitfall"
+  ],
+  "expected_queries": [
+    "metric temporality에서 cumulative와 delta는 어떻게 달라?",
+    "Prometheus counter reset이 rate 계산에서 false spike를 만들 수 있는 이유가 뭐야?",
+    "delta metric을 또 rate로 계산하면 어떤 해석 문제가 생겨?",
+    "Gauge와 Counter를 temporality 관점에서 어떻게 구분해야 해?",
+    "OpenTelemetry metric을 Prometheus로 보낼 때 temporality 변환을 왜 확인해야 해?",
+    "scrape gap이나 label churn이 counter reset처럼 보일 수 있는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "cumulative counter 값을 기간 이벤트 수처럼 그대로 더한다",
+    "process restart 이후 counter reset을 실제 트래픽 spike로 착각한다",
+    "delta metric과 rate 함수의 단위를 섞어 alert threshold를 잘못 잡는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/metric-types-counter-gauge-histogram-basics",
+      "system-design/metrics-pipeline-tsdb-design"
+    ],
+    "next_docs": [
+      "system-design/prometheus-histogram-quantile-bucket-interpolation-error",
+      "spring/micrometer-client-percentile-vs-histogram-aggregation-pitfall"
+    ],
+    "confusable_with": [
+      "spring/micrometer-tag-cardinality-pitfalls",
+      "system-design/red-use-metrics-observability-chooser",
+      "system-design/metrics-pipeline-tsdb-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/metric-temporality-cumulative-delta-counter-reset-rate-pitfall.md",
+    "revision_history": []
+  }
+}

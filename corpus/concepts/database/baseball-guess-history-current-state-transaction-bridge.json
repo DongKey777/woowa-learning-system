@@ -4,13 +4,16 @@
   "category": "database",
   "level": "beginner",
   "summary": "baseball 추측 한 번은 \"guess_history 한 줄 추가\"만이 아니라 \"현재 게임 상태가 어떻게 바뀌었는가\"까지 함께 확정되는 write다. 그래서 이력 append와 games 현재 상태 update를 같은 트랜잭션으로 읽는 편이 리뷰와 운영 둘 다 덜 흔들린다.",
-  "body_markdown": "# baseball 추측 기록/현재 게임 상태 ↔ DB 트랜잭션 브릿지\n\n## 한 줄 요약\n\n> baseball 추측 한 번은 \"guess_history 한 줄 추가\"만이 아니라 \"현재 게임 상태가 어떻게 바뀌었는가\"까지 함께 확정되는 write다. 그래서 이력 append와 `games` 현재 상태 update를 같은 트랜잭션으로 읽는 편이 리뷰와 운영 둘 다 덜 흔들린다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"3스트라이크 이력은 저장됐는데 games.finished는 false예요\" | guess_history append와 games current state update가 분리된 코드 | 한 guess 요청이 남기는 history와 current truth를 같은 transaction으로 묶는다 |\n| \"guess_history만 쌓으면 현재 상태를 매번 계산해도 되나요?\" | read마다 이력 전체로 finished/last_result를 재구성하려는 beginner 설계 | audit history와 API가 믿는 current snapshot 역할을 먼저 구분한다 |\n| \"insert와 update가 여러 개라 어디까지 rollback돼야 하나요?\" | 한 추측 처리에서 history, last_result, finished가 함께 바뀌는 write | 같은 유스케이스 write 단위를 commit/rollback 경계로 잡는다 |\n\n## 미션 시나리오\n\n콘솔 baseball는 메모리 안 `Game` 객체 하나로 끝난다. 하지만 웹으로 옮기면 `POST /games/{id}/guesses` 한 번마다 최소 두 가지를 남기고 싶어진다. \"이번 추측이 몇 strike였는가\" 같은 이력과, \"게임이 아직 진행 중인가 끝났는가\" 같은 현재 상태다.\n\n이때 학습자가 자주 만드는 구조는 `guess_history`에 먼저 insert하고, 서비스 마지막에서 `games.finished = true`를 따로 update하는 방식이다. 처음엔 동작해 보여도 한쪽만 반영되면 \"`마지막 시도는 3 strike로 저장됐는데 게임은 아직 진행 중`\" 같은 어색한 상태가 생긴다. PR에서 \"`한 번의 추측 요청이 남기는 truth를 한 write 단위로 묶어 보세요`\"라는 코멘트가 붙는 장면이 여기다.\n\n## CS concept 매핑\n\n여기서 닿는 개념은 `append-only history`와 `current snapshot`을 같은 트랜잭션으로 맞추는 감각이다. `guess_history`는 지나간 시도들을 설명하고, `games` row는 지금 API가 바로 참조할 현재 truth를 가진다. 둘의 역할은 다르지만, 같은 추측 요청에서 함께 움직여야 일관된 읽기가 된다.\n\n예를 들면 `INSERT INTO guess_history (...) VALUES (...)` 뒤에 `UPDATE games SET last_result = ?, finished = ? WHERE id = ?`가 같은 commit 안에 있어야 한다. 핵심은 테이블 수가 아니라 \"현재 상태를 어디서 믿을지\"를 고정하는 것이다. history만 보고 매번 재계산할 수도 있지만, beginner 단계에서는 현재 상태 row를 명시적으로 두고 한 요청의 판정 결과를 원자적으로 반영하는 편이 더 읽기 쉽다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`guess_history`는 쌓이는데 `games`의 현재 상태 갱신이 분리돼 있어 중간 실패 시 설명이 어렵습니다.\"\n- \"현재 게임이 끝났는지 매번 history 전체를 다시 읽어 계산하지 말고, 지금 시스템이 믿는 state를 한 row로 보여 주세요.\"\n- \"insert 후 update가 각각 성공할 수도 있는 구조라면 한 번의 추측 요청이 남기는 truth가 찢어집니다.\"\n- \"도메인 판정은 객체가 하고, DB는 그 판정 결과를 이력과 현재 상태로 함께 commit하는 역할을 가져가게 나눠 보세요.\"\n\n## 다음 학습\n\n- 트랜잭션이 왜 \"같이 성공/같이 실패\"의 기본 단위인지 다시 잡으려면 `transaction-basics`\n- 현재 상태 row와 이력 테이블을 SQL 관점으로 더 읽어 보려면 `sql-reading-relational-modeling-primer`\n- DB 실패를 서비스 결과와 HTTP 응답으로 번역하는 흐름까지 보려면 `db-signal-service-result-http-bridge`\n- 입력 DTO와 도메인 `Guess` 경계를 먼저 정리하려면 `baseball-mvc-controller-binding-bridge`와 `baseball-guess-value-object-boundary-bridge`를 같이 본다.\n",
+  "body_markdown": "# baseball 추측 기록/현재 게임 상태 ↔ DB 트랜잭션 브릿지\n\n## 한 줄 요약\n\n> baseball 추측 한 번은 \"guess_history 한 줄 추가\"만이 아니라 \"현재 게임 상태가 어떻게 바뀌었는가\"까지 함께 확정되는 write다. 그래서 이력 append와 `games` 현재 상태 update를 같은 트랜잭션으로 읽는 편이 리뷰와 운영 둘 다 덜 흔들린다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"3스트라이크 이력은 저장됐는데 games.finished는 false예요\" | guess_history append와 games current state update가 분리된 코드 | 한 guess 요청이 남기는 history와 current truth를 같은 transaction으로 묶는다 |\n| \"guess_history만 쌓으면 현재 상태를 매번 계산해도 되나요?\" | read마다 이력 전체로 finished/last_result를 재구성하려는 beginner 설계 | audit history와 API가 믿는 current snapshot 역할을 먼저 구분한다 |\n| \"insert와 update가 여러 개라 어디까지 rollback돼야 하나요?\" | 한 추측 처리에서 history, last_result, finished가 함께 바뀌는 write | 같은 유스케이스 write 단위를 commit/rollback 경계로 잡는다 |\n\n## 미션 시나리오\n\n콘솔 baseball는 메모리 안 `Game` 객체 하나로 끝난다. 하지만 웹으로 옮기면 `POST /games/{id}/guesses` 한 번마다 최소 두 가지를 남기고 싶어진다. \"이번 추측이 몇 strike였는가\" 같은 이력과, \"게임이 아직 진행 중인가 끝났는가\" 같은 현재 상태다.\n\n이때 학습자가 자주 만드는 구조는 `guess_history`에 먼저 insert하고, 서비스 마지막에서 `games.finished = true`를 따로 update하는 방식이다. 처음엔 동작해 보여도 한쪽만 반영되면 \"`마지막 시도는 3 strike로 저장됐는데 게임은 아직 진행 중`\" 같은 어색한 상태가 생긴다. PR에서 \"`한 번의 추측 요청이 남기는 truth를 한 write 단위로 묶어 보세요`\"라는 코멘트가 붙는 장면이 여기다.\n\n## CS concept 매핑\n\n여기서 닿는 개념은 `append-only history`와 `current snapshot`을 같은 트랜잭션으로 맞추는 감각이다. `guess_history`는 지나간 시도들을 설명하고, `games` row는 지금 API가 바로 참조할 현재 truth를 가진다. 둘의 역할은 다르지만, 같은 추측 요청에서 함께 움직여야 일관된 읽기가 된다.\n\n예를 들면 `INSERT INTO guess_history (...) VALUES (...)` 뒤에 `UPDATE games SET last_result = ?, finished = ? WHERE id = ?`가 같은 commit 안에 있어야 한다. 핵심은 테이블 수가 아니라 \"현재 상태를 어디서 믿을지\"를 고정하는 것이다. history만 보고 매번 재계산할 수도 있지만, beginner 단계에서는 현재 상태 row를 명시적으로 두고 한 요청의 판정 결과를 원자적으로 반영하는 편이 더 읽기 쉽다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`guess_history`는 쌓이는데 `games`의 현재 상태 갱신이 분리돼 있어 중간 실패 시 설명이 어렵습니다.\"\n- \"현재 게임이 끝났는지 매번 history 전체를 다시 읽어 계산하지 말고, 지금 시스템이 믿는 state를 한 row로 보여 주세요.\"\n- \"insert 후 update가 각각 성공할 수도 있는 구조라면 한 번의 추측 요청이 남기는 truth가 찢어집니다.\"\n- \"도메인 판정은 객체가 하고, DB는 그 판정 결과를 이력과 현재 상태로 함께 commit하는 역할을 가져가게 나눠 보세요.\"\n\n## 다음 학습\n\n- 트랜잭션이 왜 \"같이 성공/같이 실패\"의 기본 단위인지 다시 잡으려면 `transaction-basics`\n- 현재 상태 row와 이력 테이블을 SQL 관점으로 더 읽어 보려면 `sql-reading-relational-modeling-primer`\n- DB 실패를 서비스 결과와 HTTP 응답으로 번역하는 흐름까지 보려면 `db-signal-service-result-http-bridge`\n- 입력 DTO와 도메인 `Guess` 경계를 먼저 정리하려면 `baseball-mvc-controller-binding-bridge`와 `baseball-guess-value-object-boundary-bridge`를 같이 본다.\n\n## 트랜잭션 경계\n\nguess history를 append하고 current state를 갱신한다면 두 쓰기는 하나의 트랜잭션 안에서 묶어야 한다. history만 저장되고 state가 갱신되지 않으면 화면은 이전 상태를 보여 주고, state만 바뀌면 감사 가능한 시도 기록이 사라진다. 동시 제출이 가능하면 현재 attempt 번호를 조건으로 update하거나 version을 비교해 lost update도 막아야 한다.\n",
   "aliases": [
     "baseball 게임 상태 저장",
     "야구 미션 추측 이력 테이블",
     "baseball guess history transaction",
     "야구 미션 현재 라운드 row",
-    "baseball 턴 결과 DB 반영"
+    "baseball 턴 결과 DB 반영",
+    "guess_history games 같은 트랜잭션",
+    "야구 추측 저장 현재 상태 갱신",
+    "baseball finished update transaction"
   ],
   "expected_queries": [
     "야구 미션을 웹으로 바꿀 때 추측 한 번을 DB에 어떤 단위로 저장해야 해?",
@@ -49,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/baseball-guess-history-current-state-transaction-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch145"
+      }
+    ]
   }
 }

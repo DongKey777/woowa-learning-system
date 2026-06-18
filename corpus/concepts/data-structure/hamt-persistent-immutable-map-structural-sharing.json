@@ -1,0 +1,68 @@
+{
+  "id": "data-structure/hamt-persistent-immutable-map-structural-sharing",
+  "title": "HAMT Persistent Immutable Map - structural sharing으로 만드는 불변 Map",
+  "category": "data-structure",
+  "level": "advanced",
+  "summary": "HAMT(Hash Array Mapped Trie)는 hash 값을 여러 bit 조각으로 나눠 trie처럼 내려가고, update 때 바뀐 경로만 복사해 기존 버전을 공유하는 persistent immutable map 자료구조다. 전체 Map을 매번 복사하지 않고도 불변성과 구조 공유를 함께 얻는 것이 핵심이다.",
+  "body_markdown": "# HAMT Persistent Immutable Map - structural sharing으로 만드는 불변 Map\n\n> 한 줄 요약: HAMT는 hash 값을 trie 경로로 쪼개고, 수정 시 바뀐 경로만 새로 만들어 이전 Map과 대부분의 노드를 공유하는 persistent immutable map 구조다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: HAMT, hash array mapped trie, persistent map, immutable map, structural sharing, bitmap indexed node, path copying, hash trie, collision node, copy on write map, functional collection\n\n## 먼저 멘탈모델\n\n일반 `HashMap`은 값을 넣거나 지우면 같은 map 객체 내부 bucket이 바뀐다. 그래서 같은 map을 여러 곳에서 공유하면 한쪽 변경이 다른 쪽 관찰 결과에도 영향을 준다. 반대로 매 수정마다 전체 map을 복사하면 불변성은 얻지만 원소가 많을 때 비용이 너무 크다.\n\nHAMT(Hash Array Mapped Trie)는 이 사이의 해법이다.\n\n```text\nkey.hashCode()\n  -> 5비트씩 잘라 경로를 만든다\n  -> 각 level의 노드에서 다음 child를 고른다\n  -> update 시 바뀐 경로의 노드만 새로 만든다\n  -> 나머지 subtree는 이전 map과 공유한다\n```\n\n즉 핵심은 **전체 복사가 아니라 path copying + structural sharing**이다. 새 버전의 map은 논리적으로 새 값이지만, 물리적으로는 대부분의 노드를 이전 버전과 같이 쓴다.\n\n## 왜 HashMap 복사와 다른가\n\n불변 Map을 단순하게 만들려면 다음처럼 생각할 수 있다.\n\n```java\nMap<K, V> next = new HashMap<>(old);\nnext.put(key, value);\nreturn Collections.unmodifiableMap(next);\n```\n\n이 방식은 이해하기 쉽지만 매 update가 `O(n)` 복사다. 원소가 10개면 괜찮지만, 수만 개의 설정 map이나 compiler symbol table, undo history, functional pipeline state에서는 부담이 커진다.\n\nHAMT는 hash trie 경로 길이만큼만 새 노드를 만든다. 보통 hash를 5비트씩 나누면 한 level에서 최대 32갈래를 가진다. 32진 trie처럼 동작하므로 깊이가 얕고, lookup/update는 실무적으로 거의 상수에 가깝게 느껴질 수 있다. 정확히는 hash bit width와 충돌에 따라 제한된 깊이를 갖는 구조다.\n\n## 기본 구조\n\n개념적으로 노드는 다음을 가진다.\n\n- bitmap: 현재 노드에 실제로 존재하는 child 위치를 표시한다.\n- entries/children array: bitmap에 켜진 위치만 압축해서 저장한다.\n- collision node: hash가 완전히 같은 서로 다른 key를 담는 예외 경로다.\n\n고정 32칸 배열을 모든 노드에 두면 메모리 낭비가 크다. 그래서 많은 HAMT 구현은 bitmap indexed node를 쓴다.\n\n```text\nhash bits: 10110 00101 11100 ...\nlevel 0: 10110 위치로 이동\nlevel 1: 00101 위치로 이동\nlevel 2: 11100 위치로 이동\n```\n\nbitmap은 `이 노드에 32개 슬롯 중 어떤 슬롯이 실제로 있는가`를 표시하고, 실제 array index는 그 bit 앞에 켜진 bit 개수(popcount)로 계산한다. 이 덕분에 sparse node도 작은 배열로 표현할 수 있다.\n\n## update가 버전을 만드는 방식\n\n`put(k, v)`는 기존 map을 직접 바꾸지 않는다. 대신 root에서 target leaf까지 내려가며 지나온 노드만 새로 만든다.\n\n```text\nold root\n ├─ A subtree  ───────────────┐  공유\n ├─ B node      -> B' node     │  경로 복사\n │   └─ C node  -> C' node     │\n │       └─ old value -> new value\n └─ D subtree  ───────────────┘  공유\n\nnew root는 B' 경로를 가리키고, A/D subtree는 old root와 공유한다.\n```\n\n이때 old map을 들고 있는 코드는 계속 old value를 본다. new map을 받은 코드는 new value를 본다. 두 map은 독립된 논리 버전이지만, 변경과 무관한 subtree는 같은 객체를 공유할 수 있다.\n\n이 성질이 persistent data structure의 핵심이다. 여기서 persistent는 disk persistence가 아니라 **이전 버전이 계속 사용 가능하다**는 뜻이다.\n\n## 조회, 삽입, 삭제 비용\n\nHAMT의 비용은 다음처럼 이해하면 좋다.\n\n| 연산 | 비용 감각 | 이유 |\n|---|---|---|\n| lookup | hash 조각을 따라 얕게 내려감 | branching factor가 커서 깊이가 작다 |\n| put/update | lookup 경로 + path copying | 바뀐 경로 노드만 새로 만든다 |\n| remove | path copying + 빈 노드 정리 | 삭제 후 child가 줄면 압축 가능하다 |\n| iteration | 전체 entry 순회 | 내부 순서는 hash/trie 구조에 따른다 |\n\n일반 HashMap의 평균 `O(1)`과 비교하면 HAMT는 상수항과 allocation 비용이 더 있다. 대신 immutable snapshot, undo, concurrent read sharing, functional update에서 전체 복사보다 훨씬 유리하다.\n\n## 충돌 처리는 어떻게 하나\n\n서로 다른 key가 같은 5비트 조각을 계속 공유하면 더 깊은 level로 내려간다. hash 전체가 달라지는 지점이 있으면 그 level에서 갈라진다. 만약 hash 값 자체가 완전히 같은 서로 다른 key라면 더 내려가도 구분할 수 없으므로 collision node가 필요하다.\n\ncollision node 안에서는 작은 list나 array로 key equality를 확인한다. 그래서 HAMT도 `equals/hashCode` 계약을 피할 수 없다. mutable key를 넣고 key의 hash/equality가 바뀌면 일반 HashMap처럼 조회가 깨질 수 있다. 불변 Map이라고 해서 key까지 자동으로 안전해지는 것은 아니다.\n\n## 언제 쓰기 좋은가\n\nHAMT는 다음 상황에서 가치가 크다.\n\n- 상태를 불변 snapshot으로 넘기고 싶다.\n- 많은 reader가 이전 버전을 안전하게 읽어야 한다.\n- undo/redo나 versioned state를 유지해야 한다.\n- functional style로 `map.put(k, v)`가 새 map을 반환하는 API가 필요하다.\n- 전체 복사는 비싸지만 mutable shared state는 피하고 싶다.\n\n예를 들어 설정 map을 매 요청마다 조금씩 바꾸는 것이 아니라, 배포된 config version을 immutable snapshot으로 들고 있다가 새 version을 만들 때만 일부 key를 바꾸는 구조라면 HAMT식 structural sharing이 잘 맞는다.\n\n## 언제 맞지 않는가\n\nHAMT가 항상 빠른 기본 Map은 아니다.\n\n- 단일 mutable owner가 hot loop에서 계속 update한다면 `HashMap`이 더 단순하고 빠를 수 있다.\n- 원소 수가 아주 작으면 persistent 구조의 노드/bitmap overhead가 더 클 수 있다.\n- iteration order가 중요하면 별도 ordered persistent map 구조가 필요하다.\n- primitive key/value 대량 처리에서는 boxing과 node allocation이 부담이 될 수 있다.\n- update가 매우 잦고 버전 보존이 필요 없다면 structural sharing의 장점이 줄어든다.\n\n즉 HAMT는 `불변성을 공짜로 주는 HashMap`이 아니라, **불변 snapshot과 효율적 부분 복사를 위해 추가 구조를 쓰는 Map**이다.\n\n## Java 학습자가 헷갈리는 지점\n\n### `Map.copyOf`와 같은가?\n\n아니다. `Map.copyOf`는 결과가 unmodifiable이라는 API 계약을 준다. 하지만 그것이 HAMT처럼 update마다 structural sharing을 제공한다는 뜻은 아니다. JDK의 일반 `Map` API도 `put`이 새 map을 반환하는 persistent API가 아니다.\n\n### Copy-on-write map과 같은가?\n\n전체 copy-on-write는 write 때 전체 구조를 복사하는 쪽에 가깝다. HAMT는 hash trie 경로만 복사한다. 그래서 큰 map에서 작은 변경을 반복할 때 차이가 커진다.\n\n### Trie와 같은가?\n\nTrie라는 이름이 들어가지만 문자열 prefix trie와 목적이 다르다. 문자열 Trie는 key의 문자 prefix를 공유한다. HAMT는 key hash의 bit prefix를 공유한다. 그래서 prefix autocomplete가 아니라 hash map의 immutable/persistent 구현 쪽에 가깝다.\n\n### 동시성 문제를 모두 해결하나?\n\n불변 버전은 reader에게 안전하게 공유하기 쉽다. 하지만 여러 writer가 같은 최신 버전을 갱신해 publish하는 문제는 별도 atomic reference, CAS, lock, transaction이 필요할 수 있다. HAMT는 내부 구조 sharing을 제공하지만, 최신 root 교체 정책까지 자동으로 정해 주지는 않는다.\n\n## 간단한 의사 코드\n\n```text\nput(node, key, value, shift):\n  fragment = hash(key) bits at [shift, shift+5)\n  child = node.childAt(fragment)\n\n  if child is empty:\n    return node.withInserted(fragment, key, value)\n\n  if child is entry with same key:\n    return node.withReplaced(fragment, key, value)\n\n  newChild = put(child, key, value, shift + 5)\n  return node.withChild(fragment, newChild)\n```\n\n여기서 `withChild`는 기존 node를 바꾸지 않고 새 node를 반환한다. 이것이 path copying이다.\n\n## 면접 답변 골격\n\n1. `HAMT는 hash 값을 bit chunk로 나눠 trie처럼 내려가는 map 구조입니다.`\n2. `수정할 때 전체 map을 복사하지 않고 root-to-leaf 경로만 새로 만들고 나머지 subtree는 공유합니다.`\n3. `그래서 immutable/persistent map에서 snapshot과 undo, concurrent read sharing에 유리합니다.`\n4. `대신 일반 HashMap보다 allocation과 상수항이 있고, key equals/hashCode 계약과 collision 처리는 여전히 중요합니다.`\n5. `문자열 prefix Trie나 Map.copyOf와는 목적이 다릅니다.`\n\n## 꼬리질문\n\n> Q: HAMT의 persistent는 disk에 저장된다는 뜻인가요?\n> 핵심: 아니다. 이전 버전이 update 후에도 계속 사용 가능하다는 자료구조 용어다.\n\n> Q: 왜 branching factor를 크게 잡나요?\n> 핵심: hash bit를 여러 bit씩 소비해 trie 깊이를 줄이기 위해서다. 다만 sparse node 메모리를 줄이려고 bitmap indexed node를 쓴다.\n\n> Q: immutable map이면 동시성 제어가 필요 없나요?\n> 핵심: reader가 snapshot을 공유하기는 쉬워지지만, 최신 root를 여러 writer가 갱신하는 publish 경계에는 CAS나 lock 같은 정책이 필요할 수 있다.\n\n## 한 줄 정리\n\nHAMT는 hash trie와 structural sharing을 결합해, 전체 복사 없이 새 버전을 만드는 persistent immutable map 자료구조다. 핵심 질문은 `이 Map이 mutable hot path인지, 아니면 버전이 살아 있는 immutable snapshot을 많이 공유해야 하는지`다.\n",
+  "aliases": [
+    "HAMT persistent map",
+    "Hash Array Mapped Trie",
+    "persistent immutable map",
+    "불변 Map structural sharing",
+    "구조 공유 Map",
+    "persistent map path copying",
+    "bitmap indexed node",
+    "hash trie immutable map",
+    "HAMT 자료구조",
+    "immutable map update",
+    "copy-on-write map 차이",
+    "persistent collection map"
+  ],
+  "expected_queries": [
+    "HAMT는 immutable map에서 전체 복사 없이 업데이트를 어떻게 해?",
+    "persistent map에서 structural sharing이 무슨 뜻인지 예시로 설명해줘",
+    "HashMap을 매번 복사하는 것과 HAMT path copying은 뭐가 달라?",
+    "Hash Array Mapped Trie는 문자열 Trie랑 어떤 점이 다르고 왜 Map 구현에 쓰여?",
+    "불변 Map이면 동시성 문제가 다 없어지는 건지 HAMT 기준으로 알려줘",
+    "HAMT에서 bitmap indexed node와 collision node는 왜 필요한 거야?"
+  ],
+  "symptoms": [
+    "불변 Map을 만들려면 매번 전체 HashMap을 복사해야 한다고 생각한다",
+    "persistent data structure의 persistent를 디스크 저장으로 오해한다",
+    "Trie라는 이름 때문에 prefix autocomplete 자료구조로만 이해한다",
+    "immutable collection이면 writer publish 경계까지 자동으로 안전하다고 착각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "data-structure/hash-table-basics",
+      "data-structure/hashmap-internals",
+      "language/java-immutable-object-basics"
+    ],
+    "next_docs": [
+      "data-structure/persistent-segment-tree",
+      "data-structure/persistent-treap-implicit-sequence-chooser",
+      "language/immutable-objects-and-defensive-copying"
+    ],
+    "confusable_with": [
+      "data-structure/trie-prefix-search-autocomplete",
+      "language/map-of-copyof-unmodifiablemap-readonly-bridge",
+      "data-structure/hashmap-internals",
+      "data-structure/radix-tree-compressed-trie-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "legacy_path": "knowledge/cs/contents/data-structure/hamt-persistent-immutable-map-structural-sharing.md",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "note": "Added Stream A HAMT persistent immutable map concept from Round-3 backlog for batch117."
+      }
+    ]
+  }
+}

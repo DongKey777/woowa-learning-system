@@ -1,0 +1,63 @@
+{
+  "id": "system-design/materialized-view-vs-search-index-vs-cache-derived-data-chooser",
+  "title": "Materialized View vs Search Index vs Cache Derived Data Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "조회 성능을 위해 원본 DB 외부에 만든 derived read surface를 cache, materialized view, search index, projection/read model로 구분한다. Freshness, query shape, rebuild cost, invalidation, ranking/search 필요성 기준으로 어떤 도구를 고를지 설명한다.",
+  "body_markdown": "# Materialized View vs Search Index vs Cache Derived Data Chooser\n\n## 한 줄 요약\n\nCache, materialized view, search index, projection/read model은 모두 원본 데이터를 읽기 좋게 바꾼 derived data지만 답하는 질문이 다르다. Cache는 같은 결과를 빠르게 재사용하고, materialized view는 DB 안의 계산 결과를 저장하며, search index는 텍스트 검색/랭킹을 돕고, projection은 이벤트나 비동기 파이프라인으로 조회 모델을 만든다.\n\n## 왜 구분해야 하나\n\n\"조회가 느리니 캐시를 붙이자\" 또는 \"검색엔진에 넣자\"처럼 시작하면 freshness, invalidation, rebuild, consistency contract가 흐려진다. 같은 데이터를 복사하더라도 어떤 읽기 문제를 풀려는지 먼저 정해야 한다.\n\n기본 질문은 네 가지다.\n\n1. 같은 query 결과를 잠깐 재사용하면 충분한가?\n2. DB 안에서 join/aggregate 결과를 미리 계산하면 되는가?\n3. full-text search, ranking, analyzer, typo tolerance가 필요한가?\n4. 원본 write와 다른 read model을 비동기로 유지해야 하는가?\n\n## 선택 표\n\n| 도구 | 잘 맞는 문제 | 약한 부분 |\n|---|---|---|\n| Cache | 반복 조회, hot key, expensive read 재사용 | invalidation, stale value, stampede |\n| Materialized view | DB aggregate/report query, summary table | refresh window, lock, unique index, stale aggregate |\n| Search index | full-text search, ranking, filter/sort, autocomplete | refresh latency, reindex, analyzer/schema migration |\n| Projection/read model | CQRS, event-driven list/detail, UI-specific shape | projection lag, replay, backfill, watermark |\n| Replica | read scaling | write 후 stale read, lag, read-your-writes |\n\n중요한 점은 이들이 서로 대체재이기도 하지만 조합되기도 한다는 것이다. 예를 들어 search index로 ranked ids를 찾고, top-k만 DB/detail store로 hydrate하며, 결과 일부를 cache할 수 있다.\n\n## cache를 고를 때\n\nCache는 같은 계산이나 조회 결과가 반복되고, stale 허용 범위가 명확할 때 좋다. 하지만 write 직후 최신성이 중요한 화면에서 긴 TTL만 쓰면 사용자가 옛값을 볼 수 있다.\n\nCache 질문:\n\n- 어떤 key로 저장하는가?\n- write 때 delete-on-write를 할 것인가?\n- stale while revalidate를 허용할 것인가?\n- stampede를 어떻게 막을 것인가?\n- cache miss 때 origin이 버틸 수 있는가?\n\n## materialized view를 고를 때\n\nMaterialized view는 DB 내부에서 join/aggregate 결과를 저장해 dashboard나 report query를 빠르게 할 때 좋다. PostgreSQL `REFRESH MATERIALIZED VIEW CONCURRENTLY`처럼 읽기 차단을 줄이는 옵션이 있어도 refresh 중 stale value가 보일 수 있다.\n\nMaterialized view 질문:\n\n- refresh 주기는 freshness 요구를 만족하는가?\n- concurrent refresh 조건과 unique index가 맞는가?\n- refresh job이 실패하면 stale aggregate를 어떻게 표시하는가?\n- 원본 table write 부하와 refresh 비용이 충돌하지 않는가?\n\n## search index를 고를 때\n\nSearch index는 DB `LIKE`나 단순 index로 풀기 어려운 텍스트 검색, ranking, analyzer, filter/sort 조합에 적합하다. 하지만 source of truth가 아니며, refresh latency와 reindex/cutover 운영이 필요하다.\n\nSearch index 질문:\n\n- full-text search와 ranking이 실제로 필요한가?\n- analyzer/schema 변경 시 reindex가 가능한가?\n- delete/tombstone이 index에서 누락되지 않는가?\n- search hit를 detail store로 overlay할 필요가 있는가?\n\n## projection/read model을 고를 때\n\nProjection은 write model과 read model의 shape가 다르거나, 이벤트 기반으로 list/detail 화면을 따로 유지할 때 적합하다. 예를 들어 주문 원장은 정규화되어 있지만 주문 목록 화면은 사용자별 summary를 빠르게 보여줘야 할 수 있다.\n\nProjection 질문:\n\n- 원본 이벤트와 read model의 watermark를 추적하는가?\n- lag가 사용자에게 어떻게 보이는가?\n- rebuild/backfill/replay가 idempotent한가?\n- source schema 변경과 read model version을 어떻게 맞추는가?\n\n## 흔한 오해\n\n- \"Cache와 read model은 같은 말이다\": cache는 재사용 계층이고 read model은 별도 조회 모델일 수 있다.\n- \"Search index가 source of truth다\": 보통 원본 DB나 event log가 source of truth이고 index는 derived copy다.\n- \"Materialized view는 항상 최신이다\": refresh 시점과 duration에 따라 stale aggregate가 보일 수 있다.\n- \"Projection lag는 버그다\": 비동기 projection에서는 lag가 정상 상태일 수 있고 watermark/UX 계약이 필요하다.\n- \"성능 문제면 하나만 고르면 된다\": search index + overlay + cache처럼 조합이 필요할 수 있다.\n\n## 선택 순서\n\n1. Query shape를 본다. 단순 key lookup인지, aggregate인지, full-text/ranking인지, UI-specific read model인지 나눈다.\n2. Freshness 요구를 정한다. write 직후 반드시 최신이어야 하는지, 몇 초/분 stale이 허용되는지 정한다.\n3. Rebuild 비용을 본다. derived data가 깨졌을 때 다시 만들 수 있어야 한다.\n4. Invalidation 또는 replay 경로를 정한다.\n5. 사용자가 stale/partial/pending 상태를 어떻게 볼지 결정한다.\n6. Source of truth와 derived copy의 ownership을 문서화한다.\n\n## 면접 답변 축\n\nDerived read surface 선택 질문에는 \"cache는 반복 조회 재사용, materialized view는 DB aggregate materialization, search index는 full-text/ranking, projection/read model은 UI나 CQRS용 비동기 조회 모델\"이라고 구분한다. 이어서 선택 기준은 query shape, freshness contract, rebuild/replay 비용, invalidation/refresh 방법, 사용자 UX라고 답하면 된다.\n\n## Safe Next Docs\n\nFreshness 관점은 `read-model-freshness-perspective-map-cache-replica-projection`, cache 세부는 `cache-invalidation-patterns-primer`, materialized view 운영은 `materialized-view-refresh-concurrently-staleness-playbook`, search index 운영은 `search-indexing-pipeline-design`과 `search-index-backfill-alias-cutover-recovery-playbook`으로 이어진다.\n",
+  "aliases": [
+    "derived data chooser",
+    "cache vs materialized view",
+    "search index vs cache",
+    "캐시 검색 인덱스",
+    "materialized view projection",
+    "조회 모델 선택",
+    "read model derived data",
+    "검색 인덱스 read model",
+    "projection cache 차이",
+    "freshness rebuild tradeoff"
+  ],
+  "expected_queries": [
+    "cache, materialized view, search index, read model은 조회 성능 개선에서 어떻게 다르게 골라?",
+    "검색 인덱스와 캐시와 materialized view를 모두 derived data로 보면 어떤 기준으로 구분해?",
+    "full-text search와 ranking이 필요하면 cache보다 search index를 봐야 하는 이유가 뭐야?",
+    "dashboard aggregate는 materialized view가 맞을지 projection read model이 맞을지 어떻게 골라?",
+    "write 직후 최신성이 중요한 화면에서 cache TTL만 쓰면 왜 위험해?",
+    "derived read surface를 고를 때 freshness, rebuild, invalidation, UX를 같이 봐야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "조회가 느리다는 이유만으로 cache, search index, materialized view를 구분 없이 제안한다",
+    "search index를 source of truth처럼 사용하려 한다",
+    "projection lag나 materialized view refresh window를 사용자 UX로 설명하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection",
+      "system-design/cache-invalidation-patterns-primer"
+    ],
+    "next_docs": [
+      "database/materialized-view-refresh-concurrently-staleness-playbook",
+      "system-design/search-indexing-pipeline-design",
+      "system-design/search-hit-overlay-pattern",
+      "system-design/read-model-rebuild-backfill-playbook"
+    ],
+    "confusable_with": [
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection",
+      "system-design/cache-invalidation-patterns-primer",
+      "database/materialized-view-refresh-concurrently-staleness-playbook",
+      "system-design/search-indexing-pipeline-design"
+    ],
+    "forbidden_for_queries": [
+      "cache invalidation TTL delete-on-write write-through 패턴을 자세히 설명해줘",
+      "PostgreSQL REFRESH MATERIALIZED VIEW CONCURRENTLY 조건을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/materialized-view-vs-search-index-vs-cache-derived-data-chooser.md",
+    "revision_history": []
+  }
+}

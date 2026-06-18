@@ -1,0 +1,68 @@
+{
+  "id": "database/hibernate-jdbc-batch-size-flush-clear-primer",
+  "title": "Hibernate JDBC Batch Size, Flush, Clear Primer",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "Hibernate insert/update batching은 `saveAll`을 호출한다고 자동으로 끝나는 기능이 아니라, 같은 SQL 모양의 statement를 영속성 컨텍스트 flush 시점에 `executeBatch()`로 묶는 동작이다. `hibernate.jdbc.batch_size`, generator 전략, `flush/clear` chunk, `order_inserts`, transaction 크기, connection 점유 시간을 함께 봐야 한다.",
+  "body_markdown": "# Hibernate JDBC Batch Size, Flush, Clear Primer\n\n> 한 줄 요약: Hibernate batch는 같은 SQL을 flush 시점에 JDBC `executeBatch()`로 묶는 기능이고, `saveAll` 자체가 batch 성능을 보장하지 않는다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [JDBC 실전 코드 패턴](./jdbc-code-patterns.md)\n- [JDBC · JPA · MyBatis 기초](./jdbc-jpa-mybatis-basics.md)\n- [Connection Pool, Transaction Propagation, Bulk Write](./connection-pool-transaction-propagation-bulk-write.md)\n- [MySQL rewriteBatchedStatements Primer](./mysql-rewrite-batched-statements-primer.md)\n- [JPA Batch Insert IDENTITY rewriteBatchedStatements Pitfall](./jpa-batch-insert-identity-rewritebatched-pitfall.md)\n\nretrieval-anchor-keywords: hibernate jdbc batch size, hibernate.jdbc.batch_size, JPA batch insert, saveAll batch insert, Hibernate flush clear batch, order_inserts order_updates, persistence context memory, executeBatch Hibernate, JDBC batching primer, JPA 대량 저장, flush clear chunk\n\n---\n\n## 먼저 잡는 그림\n\nJPA에서 여러 엔티티를 저장할 때 코드는 이렇게 짧을 수 있다.\n\n```java\nrepository.saveAll(items);\n```\n\n하지만 이 한 줄이 곧바로 DB에 multi-row insert 하나로 나간다는 뜻은 아니다. Hibernate는 엔티티를 영속성 컨텍스트에 모아 두고, flush 시점에 SQL을 만든다. JDBC batching이 켜져 있고 조건이 맞으면 같은 SQL 모양을 `executeBatch()`로 묶는다.\n\n```text\npersist entity 1\npersist entity 2\npersist entity 3\n...\nflush\n  -> INSERT statement batch\n```\n\n즉 batch insert를 볼 때는 repository 메서드 이름보다 아래 네 가지를 봐야 한다.\n\n- Hibernate가 JDBC batch를 켰는가\n- 같은 SQL shape가 충분히 모이는가\n- ID 생성 전략이 batching을 막지 않는가\n- 영속성 컨텍스트를 너무 오래 키우지 않는가\n\n---\n\n## 최소 설정 감각\n\n대표 설정은 아래와 같다.\n\n```properties\nhibernate.jdbc.batch_size=50\nhibernate.order_inserts=true\nhibernate.order_updates=true\n```\n\nSpring Boot에서는 보통 `spring.jpa.properties.hibernate.jdbc.batch_size` 형태로 넣는다.\n\n| 설정 | 의미 |\n|---|---|\n| `hibernate.jdbc.batch_size` | 몇 개 statement를 한 batch로 묶을지 정한다 |\n| `hibernate.order_inserts` | 같은 insert SQL끼리 모이도록 순서를 정렬한다 |\n| `hibernate.order_updates` | 같은 update SQL끼리 모이도록 순서를 정렬한다 |\n\n`batch_size=50`이라고 항상 50개씩 묶이는 것은 아니다. 엔티티 종류가 섞이거나, SQL 컬럼 모양이 달라지거나, flush가 중간에 발생하면 batch가 쪼개진다.\n\n---\n\n## flush/clear chunk가 필요한 이유\n\n대량 저장을 하나의 트랜잭션에서 10만 건 수행하면 영속성 컨텍스트가 계속 커진다.\n\n```java\nfor (int i = 0; i < items.size(); i++) {\n    entityManager.persist(items.get(i));\n\n    if (i % 50 == 0) {\n        entityManager.flush();\n        entityManager.clear();\n    }\n}\n```\n\n`flush()`는 지금까지의 SQL을 DB로 보내고, `clear()`는 영속성 컨텍스트에 쌓인 managed entity를 비운다.\n\n이 패턴의 목적은 두 가지다.\n\n- JDBC batch를 적당한 단위로 실행한다.\n- 1차 캐시와 dirty checking 대상이 무한히 커지는 것을 막는다.\n\n단, `clear()` 이후에는 엔티티가 detached가 된다. 이후 로직에서 같은 객체를 managed 상태라고 가정하면 안 된다.\n\n---\n\n## batching이 깨지는 흔한 이유\n\n| 증상 | 가능 원인 |\n|---|---|\n| insert가 계속 한 줄씩 나간다 | `GenerationType.IDENTITY` 때문에 insert 직후 key가 필요하다 |\n| batch size를 줬는데 묶이는 수가 작다 | 엔티티 종류나 SQL shape가 섞인다 |\n| 메모리가 커진다 | flush/clear 없이 영속성 컨텍스트를 계속 키운다 |\n| DB는 빠른데 API가 느리다 | 큰 transaction이 connection을 오래 점유한다 |\n| MySQL에서 네트워크 round trip이 많다 | driver `rewriteBatchedStatements` 설정이 빠졌을 수 있다 |\n\n이 중 `IDENTITY`와 MySQL driver rewrite는 별도 문서에서 더 좁게 본다. 여기서는 먼저 Hibernate가 어떤 단위로 batching을 시도하는지 잡으면 된다.\n\n---\n\n## 관측 기준\n\nbatch가 실제로 먹혔는지는 느낌이 아니라 지표로 봐야 한다.\n\n- Hibernate statistics의 statement prepare count\n- datasource-proxy 또는 p6spy의 batch execution log\n- DB slow log와 row count\n- application 처리량(rows/sec)\n- connection pool active time과 borrow wait\n\nSQL 로그에 insert 문장이 여러 줄 보인다고 무조건 batch가 안 된 것은 아니다. 로그 도구가 batch parameter를 풀어서 보여줄 수도 있다. 반대로 `saveAll` 시간이 줄지 않았다면 DB보다 connection 점유, flush memory, driver rewrite, index/constraint 비용이 병목일 수 있다.\n\n---\n\n## 흔한 오해\n\n- `saveAll`이면 자동으로 multi-row insert가 된다고 생각한다.\n- `hibernate.jdbc.batch_size`만 주면 IDENTITY generator에서도 insert batching이 그대로 된다고 본다.\n- flush를 자주 하면 항상 빠르다고 생각한다. 너무 작은 chunk는 round trip을 늘린다.\n- clear 후에도 엔티티가 managed 상태라고 가정한다.\n- batch insert가 빠르면 connection pool 문제도 사라진다고 본다. 큰 batch는 오히려 connection을 오래 잡을 수 있다.\n\n## 한 줄 정리\n\nHibernate batch insert는 `saveAll`의 마법이 아니라 flush 시점의 JDBC batching이며, batch size, SQL shape, ID generator, flush/clear chunk, connection 점유 시간을 함께 맞춰야 효과가 난다.\n",
+  "aliases": [
+    "hibernate jdbc batch size",
+    "hibernate.jdbc.batch_size",
+    "JPA batch insert",
+    "saveAll batch insert",
+    "Hibernate flush clear",
+    "flush clear chunk",
+    "order_inserts order_updates",
+    "JDBC batching Hibernate",
+    "JPA 대량 저장",
+    "하이버네이트 배치",
+    "persistence context batch memory",
+    "영속성 컨텍스트 배치"
+  ],
+  "expected_queries": [
+    "Hibernate jdbc batch_size를 켰는데 JPA saveAll이 실제로 어떻게 executeBatch로 묶이는지 설명해줘",
+    "JPA 대량 저장에서 flush와 clear를 chunk마다 호출하는 이유가 뭐야?",
+    "hibernate.order_inserts와 order_updates는 batch insert에 어떤 도움을 줘?",
+    "saveAll을 썼는데 insert가 한 줄씩 나갈 때 batch가 깨지는 원인은 뭐야?",
+    "Hibernate batch insert가 먹혔는지 SQL 로그 말고 어떤 지표로 확인해야 해?"
+  ],
+  "symptoms": [
+    "saveAll을 호출하면 자동으로 multi-row insert가 된다고 생각한다.",
+    "hibernate.jdbc.batch_size만 설정하고 ID generator, SQL shape, flush 시점을 보지 않는다.",
+    "대량 persist 중 영속성 컨텍스트가 계속 커져 메모리와 dirty checking 비용이 증가한다.",
+    "batch insert 개선 후에도 connection 점유 시간이 길어질 수 있다는 점을 놓친다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/jdbc-code-patterns",
+      "database/jdbc-jpa-mybatis-basics"
+    ],
+    "next_docs": [
+      "database/mysql-rewrite-batched-statements-primer",
+      "database/jpa-batch-insert-identity-rewritebatched-pitfall",
+      "database/connection-pool-transaction-propagation-bulk-write"
+    ],
+    "confusable_with": [
+      "database/jdbc-code-patterns",
+      "database/connection-pool-transaction-propagation-bulk-write",
+      "database/query-tuning-checklist",
+      "database/jdbc-jpa-mybatis-basics"
+    ],
+    "forbidden_for_queries": [
+      "Spring Batch retry skip과 JobRepository 재시작성을 설명해줘",
+      "N+1 query를 fetch join과 EntityGraph로 해결하는 법을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch58-stream-a-jpa-mysql-batch"
+      }
+    ]
+  }
+}

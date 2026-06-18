@@ -1,0 +1,65 @@
+{
+  "id": "system-design/peak-ewma-latency-aware-load-balancing",
+  "title": "Peak-EWMA latency-aware load balancing - 느린 backend 벌점 선택",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Peak-EWMA 계열 로드밸런싱은 backend의 최근 응답 시간과 지연 spike를 점수로 추적하고, 점수가 높은 backend를 잠시 덜 선택하는 latency-aware 방식이다. P2C와 결합하면 두 후보 중 최근 지연이 낮은 쪽을 고르는 형태가 된다.",
+  "body_markdown": "# Peak-EWMA latency-aware load balancing - 느린 backend 벌점 선택\n\n> 한 줄 요약: 최근에 느린 응답을 보인 backend의 score를 올리고, 시간이 지나며 score를 서서히 낮춰 다시 기회를 준다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: Peak EWMA load balancing, latency aware load balancing, EWMA latency score, slow backend penalty, least request latency score, P2C EWMA, tail latency load balancing, service mesh latency balancing, outlier penalty, exponential moving average latency\n\n## 먼저 멘탈모델\n\nRound robin은 요청 수를 균등하게 나누지만, 어떤 backend가 GC pause, disk stall, downstream 지연 때문에 갑자기 느려졌는지는 모른다. Least connections도 연결 수만 볼 뿐, 연결 하나가 20ms인지 2초인지는 직접 반영하지 못한다.\n\nPeak-EWMA 계열은 backend마다 최근 지연을 score로 들고 있다.\n\n```text\nbackend A score: 25ms\nbackend B score: 800ms  <- 방금 느린 응답 발생\nbackend C score: 30ms\n\n새 요청은 B보다 A/C를 선호한다.\n시간이 지나면 B score는 서서히 내려가고 다시 후보가 된다.\n```\n\n핵심은 느린 backend를 영구 퇴출하는 것이 아니라, **최근 지연 spike에 벌점을 주고 decay로 회복 기회를 주는 것**이다.\n\n## EWMA가 하는 일\n\nEWMA는 Exponentially Weighted Moving Average의 약자다. 최근 값에 더 큰 비중을 주고 오래된 값의 영향은 점점 줄인다.\n\n로드밸런싱에서는 보통 다음 감각으로 이해하면 충분하다.\n\n- 방금 응답이 느렸으면 score가 빠르게 올라간다.\n- 시간이 지나며 score가 점차 내려간다.\n- 너무 오래된 느린 응답 하나가 backend를 계속 나쁘게 만들지는 않는다.\n\nPeak-EWMA라는 이름의 핵심은 평균만 보는 것이 아니라, 최근의 높은 지연 spike를 보수적으로 반영한다는 데 있다. 그래서 tail latency가 중요한 호출에서 유용하다.\n\n## P2C와 결합하는 방식\n\n많은 구현은 모든 backend를 정렬하지 않고 P2C와 결합한다.\n\n```text\n1. healthy backend 두 개를 무작위로 뽑는다.\n2. 두 backend의 latency score를 비교한다.\n3. 더 낮은 score를 가진 backend를 선택한다.\n```\n\n이렇게 하면 매 요청마다 전체 backend의 latency score를 정렬하지 않아도, 최근에 느려진 backend를 피할 확률이 높아진다.\n\n## 언제 효과적인가\n\n- backend마다 순간 latency가 자주 달라지는 서비스\n- GC pause, noisy neighbor, downstream stall 때문에 일부 backend가 일시적으로 느려지는 환경\n- p99, p999 tail latency가 평균보다 중요한 내부 RPC\n- service mesh, client-side LB, gateway가 backend별 응답 시간을 관찰할 수 있는 구조\n\n반대로 요청 시간이 workload별로 너무 다르면 조심해야 한다. 예를 들어 같은 backend에 짧은 health API와 긴 report API가 섞여 있으면, report API의 정상적인 긴 응답을 backend 장애처럼 벌점 처리할 수 있다. route, method, endpoint 단위로 latency signal을 나눌지 검토해야 한다.\n\n## 운영 함정\n\n### cold start score\n\n새 backend는 latency 데이터가 없다. score를 0으로 두면 새 backend에 요청이 몰릴 수 있고, 너무 큰 값으로 두면 영원히 트래픽을 못 받을 수 있다. warmup, initial score, slow start 정책이 필요하다.\n\n### retry amplification\n\n느린 backend를 피하려고 retry를 적극적으로 걸면 다른 backend에 부하가 번진다. latency-aware LB는 timeout budget, retry budget, circuit breaker와 함께 설계해야 한다.\n\n### 측정 위치 문제\n\nclient가 본 latency에는 network queue, TLS, proxy buffering, backend processing, response body streaming이 섞일 수 있다. 어떤 구간의 latency를 EWMA에 넣는지 모호하면 score가 엉뚱한 backend를 벌점 처리한다.\n\n### streaming 요청\n\nSSE, WebSocket, gRPC streaming처럼 오래 열린 요청은 일반 request latency와 비교하기 어렵다. 이런 traffic은 별도 pool이나 별도 signal로 분리하는 편이 안전하다.\n\n### outlier detection과 혼동\n\nPeak-EWMA는 선택 확률을 낮추는 load balancing score에 가깝다. Circuit breaker나 outlier ejection처럼 backend를 일정 시간 완전히 제외하는 정책과는 다르다. 둘을 같이 쓰면 어떤 정책이 먼저 작동하는지 명확히 해야 한다.\n\n## 다른 방식과 구분\n\n| 방식 | 보는 신호 | 강점 | 약점 |\n|---|---|---|---|\n| Round Robin | 순서 | 단순함 | 느린 backend를 모름 |\n| Least Connections | 연결 수 | long-running 연결에 유리 | latency spike를 직접 반영하지 않음 |\n| P2C | 두 후보의 load signal | 상태 비용 대비 효과 좋음 | signal 선택이 중요 |\n| Peak-EWMA | 최근 latency score | tail latency 악화 backend 회피 | 노이즈, cold start, workload mix에 민감 |\n| Circuit Breaker | 실패율/타임아웃 | 장애 backend 차단 | 너무 공격적이면 capacity를 잃음 |\n\n## 면접/설계 질문 포인트\n\n> Q: latency-aware LB가 round robin보다 좋은 경우는 언제인가요?\n> 핵심: backend 수는 같아도 순간적으로 느려진 backend가 생기는 환경에서 tail latency를 줄일 수 있다.\n\n> Q: Peak-EWMA는 느린 backend를 영구 제거하나요?\n> 핵심: 아니다. score가 decay되며 다시 선택될 기회를 준다. 완전 제외는 circuit breaker나 outlier ejection의 책임이다.\n\n> Q: 어떤 latency를 측정해야 하나요?\n> 핵심: client가 관찰한 end-to-end latency인지, proxy-to-backend latency인지, application 처리 시간인지 분리해야 한다. 섞인 값으로 score를 만들면 원인 attribution이 흔들린다.\n\n## score를 route별로 나눌지 결정하기\n\nPeak-EWMA가 흔들리는 대표 원인은 서로 다른 workload를 같은 latency score에 섞는 것이다. `/health`는 5ms가 정상이고 `/reports/export`는 2초가 정상인 서비스에서 backend 단위 score 하나만 만들면, export 요청을 처리한 backend가 갑자기 나쁜 backend처럼 보일 수 있다. 반대로 모든 endpoint별로 score를 만들면 데이터가 희소해지고 cold start 문제가 커진다.\n\n그래서 설계에서는 score 차원을 먼저 정한다.\n\n- backend 단위: 단순하고 데이터가 많지만 workload mix에 민감하다.\n- route/method 단위: 의미가 정확하지만 cardinality와 warmup 부담이 있다.\n- pool 단위: API 성격이 비슷한 route를 묶어 타협한다.\n\n실무 답변에서는 `latency-aware LB를 쓴다`보다 `short RPC pool과 streaming/report pool을 분리하고, short RPC는 backend별 EWMA latency를 P2C 비교 신호로 쓴다`처럼 traffic class를 나눠 말하는 편이 좋다.\n\n## panic mode와 outlier ejection의 경계\n\nPeak-EWMA는 느린 backend의 선택 확률을 낮추지만, capacity가 부족한 상황에서는 모든 backend가 느려질 수 있다. 이때 score가 낮은 곳을 계속 찾는 것만으로는 해결되지 않는다. 남은 backend에 요청을 더 몰아 tail latency를 더 키울 수도 있다.\n\n그래서 production routing은 보통 여러 안전장치와 함께 설계한다.\n\n- timeout budget: 한 요청이 backend를 붙잡는 시간을 제한한다.\n- retry budget: 재시도가 전체 부하를 폭증시키지 않게 한다.\n- outlier ejection: 명백히 실패율이 높은 backend를 잠시 제외한다.\n- adaptive concurrency: backend별 동시 처리량을 latency 신호로 조절한다.\n- panic threshold: 너무 많은 backend가 제외되면 일부를 다시 후보에 넣어 capacity 붕괴를 막는다.\n\nPeak-EWMA는 이 중 `어느 건강한 후보가 더 덜 느린가`를 고르는 역할에 가깝다. 장애 판정, 퇴출, 복귀, 전체 부하 제한을 혼자 담당하지 않는다고 구분해야 한다.\n\n## 관측 지표와 검증 방법\n\n도입 후에는 평균 latency만 보면 효과를 놓치기 쉽다. latency-aware LB의 목적은 보통 p95/p99 tail을 낮추는 것이므로 다음 지표를 같이 본다.\n\n- backend별 selected request 비율\n- backend별 EWMA score 분포\n- route별 p50/p95/p99 latency 변화\n- retry rate와 timeout rate 변화\n- outlier ejection 또는 circuit breaker 발동 횟수\n- 새 backend 배포 직후 warmup 중 traffic 비율\n\n좋은 결과는 `느린 backend 선택률이 줄고 tail latency가 낮아졌지만 retry와 ejection은 과도하게 늘지 않은 상태`다. p99는 낮아졌는데 retry가 두 배로 늘었다면, 사용자가 보는 성공 latency만 좋아지고 시스템 부하는 악화됐을 수 있다. 이 검증 관점이 있어야 Peak-EWMA를 알고리즘 설명에서 운영 설계로 연결할 수 있다.\n\n## 한 줄 정리\nPeak-EWMA latency-aware load balancing은 최근 latency spike를 score로 반영해 느려진 backend를 잠시 덜 고르는 방식이다. P2C와 결합하면 낮은 비용으로 tail latency 악화 backend를 피할 수 있지만, cold start와 측정 위치를 잘못 잡으면 오히려 트래픽이 흔들린다.\n",
+  "aliases": [
+    "Peak EWMA",
+    "peak-ewma load balancing",
+    "latency aware LB",
+    "지연 기반 로드밸런싱",
+    "EWMA 지연 점수",
+    "느린 backend 벌점",
+    "tail latency load balancing",
+    "P2C EWMA",
+    "latency-aware balancing"
+  ],
+  "expected_queries": [
+    "Peak-EWMA 로드밸런싱은 최근에 느린 backend를 어떻게 피하는 거야?",
+    "latency-aware load balancing과 least connections는 어떤 점이 달라?",
+    "P2C와 EWMA latency score를 같이 쓰면 어떤 효과가 있어?",
+    "새 backend에 latency 데이터가 없을 때 Peak-EWMA cold start는 어떻게 처리해?",
+    "SSE나 gRPC streaming 요청에서 latency-aware LB를 그대로 쓰면 왜 위험해?",
+    "Peak-EWMA와 circuit breaker outlier ejection은 어떻게 구분해야 해?"
+  ],
+  "symptoms": [
+    "요청 수는 균등한데 특정 서버가 느려져 p99가 튀어",
+    "round robin으로는 GC pause가 난 backend를 빨리 피하지 못해",
+    "latency-aware load balancing이 circuit breaker와 같은 건지 헷갈려",
+    "EWMA score가 어떤 latency를 봐야 하는지 모르겠어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/power-of-two-choices-load-balancing",
+      "system-design/production-latency-layer-router",
+      "system-design/request-deadline-timeout-budget-primer"
+    ],
+    "next_docs": [
+      "system-design/tail-latency-p99-debugging-playbook",
+      "system-design/hedged-requests-tail-latency-chooser",
+      "network/adaptive-concurrency-limiter-latency-signal-gateway-mesh"
+    ],
+    "confusable_with": [
+      "system-design/circuit-breaker-basics",
+      "system-design/hedged-requests-tail-latency-chooser",
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser",
+      "system-design/load-balancing-basics-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-18",
+    "legacy_path": "knowledge/cs/contents/system-design/peak-ewma-latency-aware-load-balancing.md",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "note": "Expanded load balancing depth for batch102."
+      }
+    ]
+  }
+}

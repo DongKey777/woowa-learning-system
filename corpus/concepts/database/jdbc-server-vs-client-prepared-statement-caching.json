@@ -1,0 +1,65 @@
+{
+  "id": "database/jdbc-server-vs-client-prepared-statement-caching",
+  "title": "JDBC Server vs Client Prepared Statement Caching",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "JDBC prepared statement 성능 문제는 PreparedStatement API 하나가 아니라 driver client cache, server-side prepare, connection pool별 cache 범위를 나눠 봐야 한다.",
+  "body_markdown": "# JDBC Server vs Client Prepared Statement Caching\n\n> 한 줄 요약: `PreparedStatement`를 쓴다는 말은 SQL injection 방어, parse 비용 절감, driver cache, server-side prepare를 모두 자동으로 얻는다는 뜻이 아니다. 어떤 계층에서 무엇이 캐시되는지 나눠야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Prepared Statement, Plan Cache, and Parameter Sniffing Router](./prepared-statement-plan-cache-parameter-sniffing-router.md)\n- [Statement Digest and Plan Cache Behavior](./statement-digest-plan-cache-behavior.md)\n- [PgBouncer Pool Mode, Session State, and Prepared Statement Chooser](./pgbouncer-pool-mode-session-state-prepared-statement-chooser.md)\n- [MySQL rewriteBatchedStatements Primer](./mysql-rewrite-batched-statements-primer.md)\n- [JDBC, JPA, MyBatis Basics](./jdbc-jpa-mybatis-basics.md)\n\nretrieval-anchor-keywords: JDBC PreparedStatement cache, useServerPrepStmts, cachePrepStmts, prepStmtCacheSize, client side prepared statement cache, server side prepared statement, MySQL Connector/J prepared statement, Hikari prepared statement cache\n\n---\n\n## 네 가지를 분리하자\n\n`PreparedStatement`라는 단어 하나로 너무 많은 것을 섞으면 장애를 못 푼다. 최소 네 계층을 분리한다.\n\n| 계층 | 질문 | 대표 혼동 |\n|---|---|---|\n| JDBC API | 값을 SQL 문자열에 붙이지 않고 bind하는가 | SQL injection 방어와 성능 캐시를 섞음 |\n| driver client cache | 같은 connection에서 statement 객체/metadata를 재사용하는가 | pool 전체 전역 cache로 착각 |\n| server-side prepare | DB 서버가 prepare handle을 갖고 반복 execute하는가 | URL에 속성 이름만 쓰면 켜진다고 착각 |\n| DB optimizer/plan | 같은 SQL shape가 항상 같은 좋은 plan인가 | prepared면 plan regression이 없다고 착각 |\n\n이 문서는 특히 MySQL Connector/J처럼 `useServerPrepStmts`, `cachePrepStmts`, `prepStmtCacheSize`, `prepStmtCacheSqlLimit` 같은 설정이 섞이는 장면을 다룬다. 버전마다 기본값과 세부 동작은 달라질 수 있으므로 공식 문서와 현재 driver 버전을 확인해야 한다. 중요한 원칙은 설정 이름을 외우는 것이 아니라 cache가 어느 계층에 붙는지 설명하는 것이다.\n\n---\n\n## worked example: HikariCP + MySQL\n\nSpring 애플리케이션이 HikariCP 20개 connection을 열고 MySQL Connector/J를 쓴다고 하자. 개발자가 아래처럼 생각한다.\n\n```text\nPreparedStatement를 쓰니까 DB가 알아서 statement를 전역 캐시하겠지.\ncachePrepStmts=true면 모든 connection이 같은 cache를 공유하겠지.\nuseServerPrepStmts라고 URL에 써두면 켜졌겠지.\n```\n\n이 세 문장은 모두 위험하다.\n\n- driver cache는 보통 physical connection 단위로 생각해야 한다. pool size가 20이면 cache footprint도 connection 수와 함께 늘 수 있다.\n- server-side prepared statement는 DB session에 묶인다. connection이 닫히거나 proxy/pool mode가 바뀌면 lifetime 가정도 바뀐다.\n- MySQL 공식 문서 기준으로 URL에 `useServerPrepStmts`라는 이름만 넣는 것은 값을 설정한 것이 아니다. `useServerPrepStmts=true`처럼 명시해야 한다.\n\n예시는 이렇게 읽는다.\n\n```text\njdbc:mysql://host:3306/app?useServerPrepStmts=true&cachePrepStmts=true&prepStmtCacheSize=250&prepStmtCacheSqlLimit=2048\n```\n\n이 설정은 처방전이 아니다. 반복 실행되는 SQL shape가 안정적이고, server-side prepare가 이 workload에 맞고, cache size가 pool 전체에서 감당 가능한지 확인하라는 신호다.\n\n---\n\n## client cache와 server prepare의 차이\n\n| 항목 | client-side cache | server-side prepare |\n|---|---|---|\n| 위치 | JDBC driver process, 보통 connection별 | DB server session |\n| 줄이는 비용 | 객체 생성, client parse/metadata 일부, prepare 호출 반복 | server parse/prepare와 wire protocol 반복 비용 |\n| lifetime | physical connection lifetime에 묶임 | server connection/session lifetime에 묶임 |\n| 위험 | SQL shape 폭발 시 cache churn, memory 증가 | server resource 증가, proxy/session state 호환성 |\n| 관찰 | driver 설정, pool size, statement count | server prepared stmt count, session state, errors |\n\n중요한 것은 `cachePrepStmts=true`와 `useServerPrepStmts=true`가 같은 말이 아니라는 점이다. 전자는 driver가 prepared statement를 캐시할지의 축이고, 후자는 server-side prepared statement를 사용할지의 축이다. 둘을 같이 켜는 구성도 있지만, workload와 driver 버전, batch rewrite, proxy 호환성을 같이 검증해야 한다.\n\n---\n\n## 동적 SQL이 cache를 망치는 방식\n\nPrepared statement cache는 SQL text shape가 반복될 때 이득이 난다. 아래처럼 값이 literal로 붙거나 조건 조합이 무한히 늘면 cache hit가 떨어진다.\n\n```text\nSELECT * FROM reservation WHERE user_id = 1\nSELECT * FROM reservation WHERE user_id = 2\nSELECT * FROM reservation WHERE status = ? ORDER BY created_at DESC\nSELECT * FROM reservation WHERE status = ? ORDER BY id DESC\n```\n\n첫 두 쿼리는 bind parameter를 쓰지 않으면 서로 다른 SQL text가 된다. 뒤 두 쿼리는 정렬 축이 달라 다른 statement shape가 된다. 동적 query builder를 쓸 때는 cache hit보다 SQL shape 폭발과 plan 분산을 먼저 볼 때가 많다.\n\nJPA/Hibernate를 써도 이 문제가 사라지지 않는다. generated SQL이 실제로 어떤 shape인지, bind type이 안정적인지, batch/fetch 설정이 statement 재사용을 방해하지 않는지 log와 metrics로 확인해야 한다.\n\n---\n\n## batch insert와 섞일 때\n\nMySQL batch insert 튜닝에서 `rewriteBatchedStatements=true`가 자주 나온다. 이것은 JDBC batch로 모인 INSERT를 더 큰 SQL로 재작성해 round trip을 줄이는 축이다. prepared statement cache와 같은 문제가 아니다.\n\n예를 들어 `saveAll()`이 느린 원인을 볼 때는 순서가 있다.\n\n1. Hibernate가 JDBC batch를 실제로 만들고 있는가.\n2. IDENTITY 전략 때문에 insert batch가 깨지지 않았는가.\n3. Connector/J에서 batch rewrite가 필요한 workload인가.\n4. prepared statement cache/server-side prepare가 이 batch path와 충돌하거나 기대와 다르게 동작하지 않는가.\n\n즉 prepared statement cache를 켰다고 batch insert가 자동으로 묶이는 것이 아니다. 배치 묶음, SQL 재작성, server prepare, plan cache는 서로 다른 레버다.\n\n---\n\n## 운영 체크리스트\n\n| 질문 | 확인 방법 |\n|---|---|\n| 반복되는 SQL shape가 충분히 안정적인가 | statement digest, slow query log, ORM SQL log |\n| pool size와 cache size를 곱했을 때 메모리와 server handle이 과하지 않은가 | Hikari max pool, prep stmt cache size, server status |\n| URL property가 실제로 값까지 설정됐는가 | effective config 출력, driver 문서 확인 |\n| server-side prepare가 proxy와 호환되는가 | PgBouncer/ProxySQL mode, session state 문서 |\n| DDL이나 schema migration 후 invalidation이 안전한가 | deploy runbook, error log, retry path |\n| batch insert path와 충돌하지 않는가 | rewriteBatchedStatements, Hibernate batch setting, driver release note |\n\n성능 개선은 cache hit만 보면 안 된다. parse 비용이 병목이 아닌데 cache를 키우면 메모리와 server resource만 늘 수 있다. 반대로 같은 SQL이 매우 자주 반복되고 connection lifetime이 안정적이면 효과가 클 수 있다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| `PreparedStatement`면 server-side prepare가 항상 켜진다 | driver 설정과 DB protocol 동작을 확인해야 한다 |\n| `cachePrepStmts`는 pool 전체 전역 cache다 | 보통 physical connection 단위 footprint를 계산해야 한다 |\n| prepared statement cache는 SQL injection 방어와 같은 말이다 | injection 방어는 bind 사용이고, cache는 성능/리소스 문제다 |\n| cache size는 클수록 좋다 | SQL shape가 많으면 churn과 memory만 늘 수 있다 |\n| prepared면 plan이 항상 안정적이다 | optimizer 통계, bind 값 skew, DB별 plan 정책은 별도다 |\n| PgBouncer 뒤에서도 session state는 항상 유지된다 | pool mode에 따라 server-side prepared statement lifetime이 깨질 수 있다 |\n\n---\n\n## 미션/면접 답변 골격\n\n질문이 `PreparedStatement cache를 켜면 뭐가 빨라지나요?`라면 이렇게 답한다.\n\n1. 먼저 JDBC API의 bind와 성능 cache를 구분한다.\n2. driver client cache는 같은 physical connection에서 반복되는 SQL shape의 준비 비용을 줄일 수 있다.\n3. server-side prepare는 DB server session에 prepare handle을 만들고 반복 execute 비용을 줄일 수 있다.\n4. 둘 다 connection pool, proxy, SQL shape, driver 버전에 묶인다.\n5. pool size 곱하기 cache size로 resource footprint를 계산한다.\n6. plan 안정성, parameter sniffing, batch rewrite는 별도의 문제로 분리한다.\n\n---\n\n## 꼬리질문\n\n> Q: `useServerPrepStmts`와 `cachePrepStmts`는 같은 설정인가요?\n> 의도: server-side prepare와 driver cache를 구분하는지 확인\n> 핵심: 하나는 server-side prepared statement 사용 축이고, 하나는 prepared statement cache 축이다.\n\n> Q: Hikari pool size가 20이고 cache size가 250이면 무엇을 조심해야 하나요?\n> 의도: cache가 connection별 footprint를 가질 수 있음을 아는지 확인\n> 핵심: 전체 cache/resource 상한을 pool size와 함께 계산해야 한다.\n\n> Q: prepared statement cache를 켜면 batch insert가 자동으로 빨라지나요?\n> 의도: batch rewrite, Hibernate batching, ID strategy를 분리하는지 확인\n> 핵심: batch insert는 JDBC batch와 rewrite, ID generation 문제가 별도다.\n\n## 한 줄 정리\n\nJDBC prepared statement 캐시는 API, driver cache, server-side prepare, optimizer plan을 분리해서 봐야 하며, connection pool과 SQL shape까지 곱해 resource footprint를 계산해야 안전하게 튜닝할 수 있다.\n",
+  "aliases": [
+    "JDBC prepared statement cache",
+    "PreparedStatement 캐시",
+    "useServerPrepStmts",
+    "cachePrepStmts",
+    "server side prepare",
+    "client side statement cache",
+    "드라이버 statement 캐시",
+    "JDBC 서버 prepare",
+    "Hikari prepared statement",
+    "prepStmtCacheSize"
+  ],
+  "expected_queries": [
+    "JDBC PreparedStatement를 쓰면 client cache랑 server-side prepare가 자동으로 다 켜지는 거야?",
+    "useServerPrepStmts랑 cachePrepStmts 차이를 MySQL Connector/J 기준으로 설명해줘",
+    "HikariCP pool size가 클 때 prepared statement cache size를 왜 connection 수와 같이 계산해야 해?",
+    "PreparedStatement 캐시를 켰는데 batch insert가 안 묶이는 건 rewriteBatchedStatements랑 어떤 관계야?",
+    "prepared statement는 SQL injection 방어, parse 비용 감소, plan cache 중 무엇을 해결하는 거야?",
+    "PgBouncer나 proxy 뒤에서 server-side prepared statement가 깨질 수 있는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "PreparedStatement를 쓰는데도 반복 쿼리 성능 개선이 없다",
+    "pool size를 늘린 뒤 prepared statement 관련 server resource가 늘어난다",
+    "proxy 전환 후 prepared statement does not exist 에러가 난다",
+    "batch insert 최적화와 prepared statement cache 설정을 섞어 이해한다"
+  ],
+  "learner_query_patterns": [],
+  "relations": {
+    "prerequisites": [
+      "database/jdbc-jpa-mybatis-basics",
+      "database/prepared-statement-plan-cache-parameter-sniffing-router",
+      "database/statement-digest-plan-cache-behavior"
+    ],
+    "next_docs": [
+      "database/pgbouncer-pool-mode-session-state-prepared-statement-chooser",
+      "database/mysql-rewrite-batched-statements-primer",
+      "database/jpa-batch-insert-identity-rewritebatched-pitfall"
+    ],
+    "confusable_with": [
+      "database/postgresql-prepared-transactions-2pc-xa-chooser",
+      "database/prepared-statement-plan-cache-parameter-sniffing-router",
+      "database/statement-digest-plan-cache-behavior"
+    ],
+    "forbidden_for_queries": [
+      "PostgreSQL PREPARE TRANSACTION과 2PC prepared transaction 복구를 설명해줘",
+      "parameter sniffing 때문에 prepared statement plan이 나빠지는 이유를 알려줘"
+    ]
+  },
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18T00:00:00+09:00",
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "version": 1,
+    "source": "y14-expansion-batch93-stream-a-db-execution",
+    "legacy_path": "knowledge/cs/contents/database/jdbc-server-vs-client-prepared-statement-caching.md",
+    "last_modified": "2026-06-18T00:00:00+09:00"
+  }
+}

@@ -4,20 +4,28 @@
   "category": "spring",
   "level": "advanced",
   "summary": "Spring에서 virtual thread를 쓸 때 JDBC pool, transaction boundary, blocking I/O를 어떻게 제한할지 고르는 spring chooser",
-  "body_markdown": "# Spring Virtual Thread JDBC Pool Blocking Boundary Chooser\n\n## 이 문서가 맡는 질문\nSpring에서 virtual thread를 쓸 때 JDBC pool, transaction boundary, blocking I/O를 어떻게 제한할지 고르는 spring chooser. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\nvirtual thread는 request thread 비용을 낮추지만 DB connection 수를 늘리지 않는다. transaction 안 blocking time, pool wait, carrier pinning을 분리한다. pool size와 timeout budget을 먼저 맞춘다.\n\n## 실전 시나리오\nSpring MVC를 virtual thread로 바꾼 뒤 thread starvation은 줄었지만 Hikari pool wait와 DB CPU가 증가했다. 요청 수는 늘었지만 transaction hold time은 그대로였다.\n\n## CS 배경\nVirtual thread는 blocking call을 싼 task로 표현하지만 외부 resource capacity를 늘리지는 않는다. JDBC connection, DB lock, transaction time은 별도의 물리적 한계다.\n\n## 핵심 불변식\n- virtual thread 수와 DB connection 수는 같은 budget이 아니다\n- transaction 안 remote call이나 long wait는 connection hold time을 늘린다\n- pool wait는 backpressure 신호이지 thread 부족 신호가 아닐 수 있다\n- pinning은 carrier thread 신호와 resource saturation을 분리해 봐야 한다\n\n## 판단 매트릭스\n- web layer blocking만 문제면 virtual thread가 유리\n- DB pool wait가 병목이면 pool/transaction/SQL부터 조정\n- transaction 안 원격 I/O가 있으면 boundary 분리\n- pinning 의심이면 JFR와 synchronized/native section 확인\n\n## 예시\n```text\nvirtual-thread-per-request -> short transaction -> JDBC call; remote fan-out stays outside transaction\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\nSpring에서 virtual thread 전환은 concurrency control 제거가 아니다. thread는 싸져도 DB connection과 lock은 그대로 비싸다.\n\n## 품질 관점\n품질은 Spring virtual threads의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 pool wait, long transaction, remote call inside tx, pinning report를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. connection pool size, transaction duration, DB CPU, request concurrency를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. pool wait p95, transaction hold p99, carrier pinning pause, DB lock wait가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\nhikari_pending_threads, connection_acquire_p95, transaction_duration_p99, carrier_pinned_count, db_cpu_pct를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- virtual thread를 켜면 pool size도 크게 늘려야 한다고 생각한다\n- thread starvation이 사라지면 DB saturation도 해결됐다고 본다\n- transaction 안의 blocking I/O를 virtual thread가 안전하게 만들어 준다고 착각한다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## 한 줄 정리\nSpring virtual thread 도입의 핵심은 thread가 아니라 JDBC pool과 transaction boundary가 만드는 실제 concurrency budget이다.\n",
+  "body_markdown": "# Spring Virtual Thread JDBC Pool Blocking Boundary Chooser\n\n## 이 문서가 맡는 질문\nSpring에서 virtual thread를 쓸 때 JDBC pool, transaction boundary, blocking I/O를 어떻게 제한할지 고르는 spring chooser. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\nvirtual thread는 request thread 비용을 낮추지만 DB connection 수를 늘리지 않는다. transaction 안 blocking time, pool wait, carrier pinning을 분리한다. pool size와 timeout budget을 먼저 맞춘다.\n\n## 실전 시나리오\nSpring MVC를 virtual thread로 바꾼 뒤 thread starvation은 줄었지만 Hikari pool wait와 DB CPU가 증가했다. 요청 수는 늘었지만 transaction hold time은 그대로였다.\n\n## CS 배경\nVirtual thread는 blocking call을 싼 task로 표현하지만 외부 resource capacity를 늘리지는 않는다. JDBC connection, DB lock, transaction time은 별도의 물리적 한계다.\n\n## 핵심 불변식\n- virtual thread 수와 DB connection 수는 같은 budget이 아니다\n- transaction 안 remote call이나 long wait는 connection hold time을 늘린다\n- pool wait는 backpressure 신호이지 thread 부족 신호가 아닐 수 있다\n- pinning은 carrier thread 신호와 resource saturation을 분리해 봐야 한다\n\n## 판단 매트릭스\n- web layer blocking만 문제면 virtual thread가 유리\n- DB pool wait가 병목이면 pool/transaction/SQL부터 조정\n- transaction 안 원격 I/O가 있으면 boundary 분리\n- pinning 의심이면 JFR와 synchronized/native section 확인\n\n## 예시\n```text\nvirtual-thread-per-request -> short transaction -> JDBC call; remote fan-out stays outside transaction\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\nSpring에서 virtual thread 전환은 concurrency control 제거가 아니다. thread는 싸져도 DB connection과 lock은 그대로 비싸다.\n\n## 품질 관점\n품질은 Spring virtual threads의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 pool wait, long transaction, remote call inside tx, pinning report를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. connection pool size, transaction duration, DB CPU, request concurrency를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. pool wait p95, transaction hold p99, carrier pinning pause, DB lock wait가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\nhikari_pending_threads, connection_acquire_p95, transaction_duration_p99, carrier_pinned_count, db_cpu_pct를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- virtual thread를 켜면 pool size도 크게 늘려야 한다고 생각한다\n- thread starvation이 사라지면 DB saturation도 해결됐다고 본다\n- transaction 안의 blocking I/O를 virtual thread가 안전하게 만들어 준다고 착각한다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## thread budget과 resource budget 분리\n\nVirtual thread를 켜면 동시에 대기할 수 있는 request 수는 늘 수 있다. 하지만 JDBC connection, DB CPU, row lock, transaction log bandwidth는 그대로다. 그래서 virtual thread 전환 후 처리량이 늘면서 DB pool wait가 커지는 것은 이상한 일이 아니다. 예전에는 platform thread가 먼저 막아서 DB까지 못 가던 요청이, 이제 더 많이 DB pool 앞에 도착할 수 있다.\n\n답변할 때는 concurrency budget을 세 층으로 나누면 좋다.\n\n- request execution budget: virtual thread가 담당하는 애플리케이션 실행 단위\n- connection budget: Hikari 같은 pool이 제한하는 DB 동시 접근 수\n- database budget: DB CPU, I/O, lock, transaction duration이 만드는 실제 처리 한계\n\nVirtual thread는 첫 번째 budget을 크게 완화하지만 두 번째와 세 번째를 자동으로 늘리지 않는다. 따라서 pool wait 증가는 `thread가 부족하다`가 아니라 `downstream capacity 앞에서 backpressure가 걸린다`는 신호일 수 있다.\n\n## 트랜잭션 hold time을 먼저 줄이기\n\nConnection pool 문제가 보일 때 pool size를 키우기 전에 transaction hold time을 본다. Transaction 안에서 외부 HTTP 호출, 파일 I/O, 긴 계산, user-level lock 대기가 있으면 connection을 빌린 채로 오래 기다린다. Virtual thread에서는 이 대기가 싸게 보일 수 있지만 DB connection은 여전히 비싼 자원이다.\n\n좋은 구조는 다음과 같다.\n\n```text\nexternal call / validation / fan-out\n  -> short DB transaction\n  -> after-commit side effect or outbox\n```\n\n반대로 `transaction begin -> remote call -> JDBC write -> commit` 구조는 virtual thread에서도 좋지 않다. Thread parking 비용은 낮아져도 connection hold time과 lock wait는 낮아지지 않기 때문이다.\n\n## pinning과 pool saturation 구분\n\nCarrier pinning은 virtual thread가 carrier thread를 오래 붙잡는 문제이고, pool saturation은 DB connection이 부족한 문제다. 둘은 같이 나타날 수 있지만 지표가 다르다.\n\n- pinning 의심: JFR pinned event, synchronized/native section, carrier thread 점유\n- pool saturation 의심: Hikari pending, connection acquire p95/p99, active connections maxed out\n- DB 병목 의심: DB CPU, lock wait, slow query, transaction duration p99\n\n따라서 `virtual thread가 느리다`고 말하지 말고 어느 층의 budget이 찼는지 말해야 한다. 이 구분이 있어야 pool을 키울지, transaction boundary를 줄일지, SQL을 고칠지, pinning section을 제거할지 결정할 수 있다.\n\n## 한 줄 정리\nSpring virtual thread 도입의 핵심은 thread가 아니라 JDBC pool과 transaction boundary가 만드는 실제 concurrency budget이다.\n",
   "aliases": [
-    "Spring virtual thread JDBC pool blocking boundary",
-    "virtual threads Hikari transaction hold time",
-    "carrier pinning JDBC connection pool",
-    "Spring Virtual Thread JDBC Pool Blocking Boundary Chooser",
-    "spring virtual thread jdbc pool blocking boundary chooser",
-    "Spring virtual thread JDBC pool Hikari connection wait transaction hold time blocking IO carrier pinning latency"
+    "Spring virtual thread JDBC pool",
+    "virtual thread Hikari pool",
+    "가상 스레드 JDBC 풀",
+    "Hikari connection wait",
+    "transaction hold time",
+    "carrier pinning JDBC",
+    "Spring MVC virtual thread",
+    "DB pool wait backpressure",
+    "트랜잭션 blocking I/O",
+    "virtual thread DB 병목",
+    "connection pool concurrency budget",
+    "JDBC pool boundary"
   ],
   "expected_queries": [
     "Spring에서 virtual thread를 쓰면 JDBC pool size도 늘려야 해?",
     "virtual thread 전환 후 Hikari pool wait가 늘면 무엇을 봐?",
     "transaction 안 blocking I/O와 virtual thread는 어떤 관계야?",
-    "Spring MVC를 virtual thread로 바꿨는데 DB pool wait가 늘면 뭘 봐야 해?"
+    "Spring MVC를 virtual thread로 바꿨는데 DB pool wait가 늘면 뭘 봐야 해?",
+    "virtual thread는 request thread를 싸게 만들지만 DB connection budget을 늘리지 않는다는 걸 어떻게 설명해?",
+    "carrier pinning 문제와 JDBC connection pool saturation을 지표로 어떻게 구분해?"
   ],
   "symptoms": [
     "virtual thread Hikari wait",
@@ -28,13 +36,18 @@
     "prerequisites": [
       "language/virtual-thread-jdbc-cancel-semantics",
       "language/jdbc-observability-under-virtual-threads",
-      "spring/transactional-readonly-flushmode-caveats"
+      "database/connection-pool-littles-law-sizing-playbook"
     ],
     "next_docs": [
-      "language/virtual-thread-migration-pinning"
+      "language/virtual-thread-migration-pinning",
+      "spring/service-layer-external-io-after-commit-outbox-primer",
+      "database/connection-pool-hold-and-wait-deadlock-sizing"
     ],
     "confusable_with": [
-      "spring/webflux-vs-mvc"
+      "spring/webflux-vs-mvc",
+      "spring/spring-async-non-blocking-primer",
+      "database/connection-pool-littles-law-sizing-playbook",
+      "language/virtual-thread-migration-pinning"
     ],
     "forbidden_for_queries": []
   },
@@ -58,7 +71,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +80,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "note": "Expanded virtual thread JDBC pool boundary surfaces for batch115."
       }
     ]
   }

@@ -4,7 +4,7 @@
   "category": "database",
   "level": "advanced",
   "summary": "이 문서는 DB commit, queue publish, outbox, at-least-once delivery, idempotent consumer 경계에서 end-to-end exactly-once 신화를 해체하는 advanced deep dive다.",
-  "body_markdown": "# Exactly-Once 신화와 DB + Queue 경계\n\n> 한 줄 요약: DB 트랜잭션과 메시지 발행을 붙여도, end-to-end exactly-once가 자동으로 생기지는 않는다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md), [CDC, Debezium, Outbox, Binlog](./cdc-debezium-outbox-binlog.md), [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)\nretrieval-anchor-keywords: exactly once, at-least-once, outbox, idempotent consumer, queue retry\n\n## 핵심 개념\n\n많은 시스템이 “한 번만 처리”를 원하지만, 실제 인프라가 주는 기본값은 대개 at-least-once에 가깝다.\n\n왜 중요한가:\n\n- 브로커가 중복 전달할 수 있다\n- 프로듀서가 재시도하면 같은 메시지가 다시 갈 수 있다\n- DB 커밋과 큐 발행을 한 번에 원자화하기 어렵다\n\n그래서 exactly-once는 보통 **전송 보장**과 **비즈니스 효과 보장**을 혼동한 신화가 된다.\n\n## 깊이 들어가기\n\n### 1. 왜 exactly-once가 어려운가\n\nDB와 큐는 서로 다른 실패 모델을 가진다.\n\n- DB는 커밋/롤백이 명확하다\n- Queue는 ack/timeout/retry가 중심이다\n\n둘을 동시에 다루면 다음 문제가 생긴다.\n\n- DB는 커밋됐는데 메시지는 못 나감\n- 메시지는 나갔는데 DB는 롤백됨\n- 소비자는 같은 메시지를 여러 번 받음\n\n즉 정확히 한 번은 시스템 전체의 자연 상태가 아니라, **추가 설계가 있어야 하는 성질**이다.\n\n### 2. outbox가 왜 필요한가\n\nDB 트랜잭션 안에서 이벤트를 outbox에 같이 써두면,\n\n- 커밋 성공 시 변경과 이벤트 기록이 같이 남고\n- 실패 시 둘 다 남지 않는다\n\n그 뒤 worker가 큐로 발행한다.  \n하지만 여기서도 중복 발행은 가능하므로 소비자 멱등성이 필요하다.\n\n### 3. 소비자 멱등성이 왜 핵심인가\n\nExactly-once를 만들려는 시도는 결국 소비자에서 멱등성을 강제하는 것으로 수렴하는 경우가 많다.\n\n- 이벤트 ID 저장\n- 처리 완료 마킹\n- 중복 수신 시 skip\n\n즉 “메시지가 한 번만 도착해야 한다”보다 “두 번 와도 결과가 한 번만 반영돼야 한다”가 실무적 목표다.\n\n### 4. 브로커의 exactly-once와 비즈니스 exactly-once는 다르다\n\n어떤 브로커는 producer/consumer 수준에서 더 강한 보장을 제공한다.  \n하지만 그 보장이 곧바로 주문 생성, 결제 승인, 재고 차감의 비즈니스 exactly-once로 이어지지는 않는다.\n\n중복 호출, 외부 API, DB 재시도, 운영 재처리는 여전히 남는다.\n\n## 실전 시나리오\n\n### 시나리오 1: 주문은 저장됐는데 알림이 안 감\n\nDB는 커밋됐지만 큐 발행이 실패하면 외부 알림이 영영 누락될 수 있다.  \n이때 outbox가 없으면 회복이 어렵다.\n\n### 시나리오 2: 메시지가 두 번 와서 포인트가 두 번 적립됨\n\n브로커 retry는 정상 동작이지만 소비자가 멱등하지 않으면 중복 적립이 발생한다.\n\n### 시나리오 3: 재시도 중 같은 이벤트를 다시 발행함\n\n프로듀서가 timeout 후 다시 publish하면 동일 이벤트가 중복될 수 있다.  \n큐와 DB를 같이 쓴다면 이중 방어가 필요하다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE outbox (\n  id BIGINT PRIMARY KEY AUTO_INCREMENT,\n  event_id VARCHAR(80) NOT NULL,\n  aggregate_id BIGINT NOT NULL,\n  payload JSON NOT NULL,\n  published_at DATETIME NULL,\n  UNIQUE KEY uk_event_id (event_id)\n);\n\nCREATE TABLE processed_events (\n  event_id VARCHAR(80) PRIMARY KEY,\n  processed_at DATETIME NOT NULL\n);\n```\n\n```java\n// 소비자 멱등성\nif (processedEventRepository.exists(eventId)) {\n    return;\n}\nhandle(event);\nprocessedEventRepository.save(eventId);\n```\n\n```text\nbad:\n  DB commit -> queue publish retry -> consumer double apply\n\ngood:\n  DB commit -> outbox persist -> publish retry -> consumer dedupe\n```\n\nExactly-once는 “한 번만 보내기”보다, **중복이 와도 한 번만 반영되게 만들기**로 접근해야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| pure exactly-once 기대 | 단순해 보인다 | 현실에서 자주 깨진다 | 거의 없음 |\n| outbox + dedupe | 가장 실용적이다 | 구현 요소가 늘어난다 | 일반적인 비즈니스 이벤트 |\n| transactional broker 기능 | 전송 품질이 좋다 | 범용 비즈니스 정합성은 아님 | 지원 환경이 명확할 때 |\n| at-least-once + idempotent consumer | 운영이 안정적이다 | 소비자 설계가 필요하다 | 대부분의 서비스 |\n\n## 꼬리질문\n\n> Q: DB 트랜잭션과 큐 발행을 붙이면 exactly-once가 되나요?\n> 의도: DB와 브로커의 원자성 경계를 아는지 확인\n> 핵심: 서로 다른 실패 모델이라 자동으로 하나가 되지 않는다\n\n> Q: outbox만 있으면 충분한가요?\n> 의도: 소비자 멱등성 필요성을 아는지 확인\n> 핵심: 발행 중복과 소비 중복을 같이 막아야 한다\n\n> Q: 브로커의 exactly-once와 비즈니스 exactly-once는 왜 다른가요?\n> 의도: 보장 계층을 구분하는지 확인\n> 핵심: 전송 보장과 도메인 효과 보장은 같은 말이 아니다\n\n## 한 줄 정리\n\nDB + Queue에서 exactly-once는 신화에 가깝고, 실무 해법은 outbox와 idempotent consumer로 중복을 안전하게 흡수하는 것이다.\n",
+  "body_markdown": "# Exactly-Once 신화와 DB + Queue 경계\n\n> 한 줄 요약: DB 트랜잭션과 메시지 발행을 붙여도, end-to-end exactly-once가 자동으로 생기지는 않는다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md), [CDC, Debezium, Outbox, Binlog](./cdc-debezium-outbox-binlog.md), [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)\nretrieval-anchor-keywords: exactly once, at-least-once, outbox, idempotent consumer, queue retry\n\n## 핵심 개념\n\n많은 시스템이 “한 번만 처리”를 원하지만, 실제 인프라가 주는 기본값은 대개 at-least-once에 가깝다.\n\n왜 중요한가:\n\n- 브로커가 중복 전달할 수 있다\n- 프로듀서가 재시도하면 같은 메시지가 다시 갈 수 있다\n- DB 커밋과 큐 발행을 한 번에 원자화하기 어렵다\n\n그래서 exactly-once는 보통 **전송 보장**과 **비즈니스 효과 보장**을 혼동한 신화가 된다.\n\n## 깊이 들어가기\n\n### 1. 왜 exactly-once가 어려운가\n\nDB와 큐는 서로 다른 실패 모델을 가진다.\n\n- DB는 커밋/롤백이 명확하다\n- Queue는 ack/timeout/retry가 중심이다\n\n둘을 동시에 다루면 다음 문제가 생긴다.\n\n- DB는 커밋됐는데 메시지는 못 나감\n- 메시지는 나갔는데 DB는 롤백됨\n- 소비자는 같은 메시지를 여러 번 받음\n\n즉 정확히 한 번은 시스템 전체의 자연 상태가 아니라, **추가 설계가 있어야 하는 성질**이다.\n\n### 2. outbox가 왜 필요한가\n\nDB 트랜잭션 안에서 이벤트를 outbox에 같이 써두면,\n\n- 커밋 성공 시 변경과 이벤트 기록이 같이 남고\n- 실패 시 둘 다 남지 않는다\n\n그 뒤 worker가 큐로 발행한다.  \n하지만 여기서도 중복 발행은 가능하므로 소비자 멱등성이 필요하다.\n\n### 3. 소비자 멱등성이 왜 핵심인가\n\nExactly-once를 만들려는 시도는 결국 소비자에서 멱등성을 강제하는 것으로 수렴하는 경우가 많다.\n\n- 이벤트 ID 저장\n- 처리 완료 마킹\n- 중복 수신 시 skip\n\n즉 “메시지가 한 번만 도착해야 한다”보다 “두 번 와도 결과가 한 번만 반영돼야 한다”가 실무적 목표다.\n\n### 4. 브로커의 exactly-once와 비즈니스 exactly-once는 다르다\n\n어떤 브로커는 producer/consumer 수준에서 더 강한 보장을 제공한다.  \n하지만 그 보장이 곧바로 주문 생성, 결제 승인, 재고 차감의 비즈니스 exactly-once로 이어지지는 않는다.\n\n중복 호출, 외부 API, DB 재시도, 운영 재처리는 여전히 남는다.\n\n## 실전 시나리오\n\n### 시나리오 1: 주문은 저장됐는데 알림이 안 감\n\nDB는 커밋됐지만 큐 발행이 실패하면 외부 알림이 영영 누락될 수 있다.  \n이때 outbox가 없으면 회복이 어렵다.\n\n### 시나리오 2: 메시지가 두 번 와서 포인트가 두 번 적립됨\n\n브로커 retry는 정상 동작이지만 소비자가 멱등하지 않으면 중복 적립이 발생한다.\n\n### 시나리오 3: 재시도 중 같은 이벤트를 다시 발행함\n\n프로듀서가 timeout 후 다시 publish하면 동일 이벤트가 중복될 수 있다.  \n큐와 DB를 같이 쓴다면 이중 방어가 필요하다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE outbox (\n  id BIGINT PRIMARY KEY AUTO_INCREMENT,\n  event_id VARCHAR(80) NOT NULL,\n  aggregate_id BIGINT NOT NULL,\n  payload JSON NOT NULL,\n  published_at DATETIME NULL,\n  UNIQUE KEY uk_event_id (event_id)\n);\n\nCREATE TABLE processed_events (\n  event_id VARCHAR(80) PRIMARY KEY,\n  processed_at DATETIME NOT NULL\n);\n```\n\n```java\n// 소비자 멱등성\nif (processedEventRepository.exists(eventId)) {\n    return;\n}\nhandle(event);\nprocessedEventRepository.save(eventId);\n```\n\n```text\nbad:\n  DB commit -> queue publish retry -> consumer double apply\n\ngood:\n  DB commit -> outbox persist -> publish retry -> consumer dedupe\n```\n\nExactly-once는 “한 번만 보내기”보다, **중복이 와도 한 번만 반영되게 만들기**로 접근해야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| pure exactly-once 기대 | 단순해 보인다 | 현실에서 자주 깨진다 | 거의 없음 |\n| outbox + dedupe | 가장 실용적이다 | 구현 요소가 늘어난다 | 일반적인 비즈니스 이벤트 |\n| transactional broker 기능 | 전송 품질이 좋다 | 범용 비즈니스 정합성은 아님 | 지원 환경이 명확할 때 |\n| at-least-once + idempotent consumer | 운영이 안정적이다 | 소비자 설계가 필요하다 | 대부분의 서비스 |\n\n## 꼬리질문\n\n> Q: DB 트랜잭션과 큐 발행을 붙이면 exactly-once가 되나요?\n> 의도: DB와 브로커의 원자성 경계를 아는지 확인\n> 핵심: 서로 다른 실패 모델이라 자동으로 하나가 되지 않는다\n\n> Q: outbox만 있으면 충분한가요?\n> 의도: 소비자 멱등성 필요성을 아는지 확인\n> 핵심: 발행 중복과 소비 중복을 같이 막아야 한다\n\n> Q: 브로커의 exactly-once와 비즈니스 exactly-once는 왜 다른가요?\n> 의도: 보장 계층을 구분하는지 확인\n> 핵심: 전송 보장과 도메인 효과 보장은 같은 말이 아니다\n\n## 보장 계층을 나눠서 보기\n\nExactly-once라는 말은 계층을 섞어 쓰면 위험하다. Broker가 producer transaction이나 offset commit을 더 강하게 묶어 준다고 해도, 그것이 곧바로 외부 DB update, 결제 승인, 이메일 발송, 재고 차감 같은 side effect를 정확히 한 번만 만든다는 뜻은 아니다. 메시지 시스템 안의 record 처리 보장과 도메인 효과의 보장은 다른 경계에 있다.\n\n답변할 때는 세 계층으로 나누면 안전하다.\n\n- transport delivery: 메시지가 producer에서 broker로, broker에서 consumer로 전달되는 방식\n- processing transaction: consumer가 읽은 offset과 내부 state update를 어떻게 묶는지\n- business side effect: DB row 변경, 외부 API 호출, 포인트 적립 같은 실제 결과가 몇 번 반영되는지\n\n많은 장애는 세 번째 계층에서 난다. Consumer가 메시지를 처리하고 DB에 반영한 뒤 ack 전에 죽으면, broker는 같은 메시지를 다시 보낼 수 있다. 이때 transport는 정상적으로 재전달한 것이고, business side effect를 한 번으로 만들 책임은 consumer dedupe와 idempotency key에 있다.\n\n## outbox 이후에도 남는 중복\n\nOutbox는 `DB 변경은 됐는데 이벤트가 사라지는 문제`를 줄인다. 하지만 outbox relay가 publish 성공 후 published_at 업데이트 전에 죽거나, broker ack를 받지 못해 retry하면 같은 event가 여러 번 발행될 수 있다. 따라서 outbox는 발행 누락을 줄이는 패턴이지, end-to-end 중복을 제거하는 마법이 아니다.\n\n실무 설계는 보통 다음 조합으로 간다.\n\n1. producer 쪽은 outbox에 event_id를 저장한다.\n2. relay는 event_id를 보존해서 broker에 발행한다.\n3. consumer는 processed_events나 domain unique key로 중복 적용을 막는다.\n4. side effect가 외부 API라면 idempotency key나 reconciliation으로 unknown outcome을 복구한다.\n\n이렇게 보면 exactly-once 목표는 `메시지가 한 번만 움직인다`가 아니라 `재전달과 재처리가 있어도 business invariant가 한 번만 바뀐다`로 바뀐다.\n\n## XA/2PC와의 tradeoff\n\nDB와 broker를 2PC로 묶으면 원자성 문제를 줄일 수 있어 보인다. 하지만 운영에서는 coordinator 장애, participant timeout, lock retention, 성능 저하, 지원 범위 문제가 커진다. 또한 외부 결제 API처럼 2PC에 참여하지 않는 resource가 들어오면 다시 unknown outcome과 idempotency 문제가 남는다.\n\n그래서 대부분의 서비스 설계에서는 강한 분산 transaction보다 outbox, idempotent consumer, retry envelope, reconciliation을 선호한다. 이것은 correctness를 포기하는 것이 아니라, 실패를 피할 수 없다는 전제에서 중복과 재처리를 흡수하는 방향이다. 면접에서는 `2PC가 이론적으로 가능하다`에서 멈추지 말고, 운영 비용과 참여하지 않는 외부 side effect의 한계를 같이 말해야 한다.\n\n## 디버깅 질문\n\n- 중복 메시지가 온 것인가, 같은 command가 여러 번 생성된 것인가.\n- event_id가 producer에서 consumer까지 보존되는가.\n- consumer transaction 안에서 dedupe record와 domain write가 같이 commit되는가.\n- ack/offset commit은 domain write 전인가 후인가.\n- 외부 API timeout 후 성공 여부가 unknown일 때 조회나 reconciliation 경로가 있는가.\n- replay/backfill을 돌려도 같은 event가 두 번 적용되지 않는가.\n\n이 질문들은 exactly-once라는 단어 대신, 실제로 중복이 들어올 수 있는 경계와 중복을 흡수하는 위치를 찾게 해 준다.\n\n## 한 줄 정리\nDB + Queue에서 exactly-once는 신화에 가깝고, 실무 해법은 outbox와 idempotent consumer로 중복을 안전하게 흡수하는 것이다.\n",
   "aliases": [
     "exactly once myths db queue",
     "exactly once myth",
@@ -14,15 +14,18 @@
     "queue retry duplicate",
     "business exactly once",
     "메시지 중복 처리",
-    "outbox consumer dedupe",
-    "한 번만 처리"
+    "한 번만 처리 착각",
+    "비즈니스 exactly once",
+    "consumer dedupe 멱등성",
+    "outbox 중복 발행"
   ],
   "expected_queries": [
     "DB 트랜잭션과 queue publish를 같이 써도 exactly-once가 자동으로 안 되는 이유는 뭐야?",
     "outbox pattern을 써도 consumer idempotency가 필요한 이유를 설명해줘",
     "at-least-once delivery에서 메시지가 두 번 와도 비즈니스 효과가 한 번만 반영되게 하려면 어떻게 해?",
     "broker exactly-once와 주문 결제 같은 business exactly-once는 왜 다른 층위야?",
-    "DB commit은 됐는데 메시지 발행 실패하거나 메시지만 중복되는 경계를 어떻게 설계해?"
+    "DB commit은 됐는데 메시지 발행 실패하거나 메시지만 중복되는 경계를 어떻게 설계해?",
+    "Kafka나 queue가 exactly-once를 지원한다고 해도 외부 DB side effect에는 왜 dedupe가 필요해?"
   ],
   "symptoms": [
     "DB 커밋과 queue publish를 붙이면 end-to-end exactly-once가 자동으로 생긴다고 생각하고 있어",
@@ -31,21 +34,22 @@
   ],
   "relations": {
     "prerequisites": [
-      "database/outbox-saga-eventual-consistency",
-      "database/idempotency-key-and-deduplication"
+      "system-design/queue-delivery-semantics-beginner-primer",
+      "database/idempotency-key-and-deduplication",
+      "database/outbox-saga-eventual-consistency"
     ],
     "next_docs": [
       "database/cdc-debezium-outbox-binlog",
       "database/outbox-vs-cdc-vs-saga-decision-guide",
-      "system-design/message-queue-basics"
+      "system-design/effectively-once-delivery-idempotent-side-effects-deep-dive",
+      "design-pattern/idempotent-consumer-projection-dedup-pattern"
     ],
     "confusable_with": [
-      "database/outbox-saga-eventual-consistency",
-      "database/cdc-debezium-outbox-binlog",
-      "database/idempotency-key-and-deduplication",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser",
       "database/xa-two-phase-commit-pitfalls",
       "database/idempotent-transaction-retry-envelopes",
-      "database/io-failure-signal-three-bucket-mapping-card"
+      "system-design/kafka-offset-commit-timing-at-least-once-card",
+      "system-design/message-queue-basics"
     ],
     "forbidden_for_queries": []
   },
@@ -53,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/exactly-once-myths-db-queue.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "note": "Expanded exactly-once DB queue boundary surfaces for batch106."
+      }
+    ]
   }
 }

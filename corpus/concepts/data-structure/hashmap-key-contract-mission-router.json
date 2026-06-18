@@ -4,17 +4,23 @@
   "category": "data-structure",
   "level": "beginner",
   "summary": "이 symptom_router는 HashMap/HashSet key contract 문제를 분기한다. equals hashCode, mutable key, put 후 get null, 중복 key 같은 미션 디버깅 표현을 다룬다.",
-  "body_markdown": "# HashMap Key Contract Mission Router\n\n## 관찰 증거\n\n`put` 시점과 `get` 시점의 key hashCode, equals 결과, key 필드 변경 여부를 본다. 같은 값처럼 보여도 contract가 깨지면 bucket lookup이 실패할 수 있다.\n\n이 문서는 \"Map이 이상하다\"를 바로 HashMap 내부 구현 탓으로 보내지 않고, key contract 문제인지 먼저 분기하는 symptom router다. 재현 로그에는 key의 출력 문자열보다 `equals`, `hashCode`, identity, mutation 시점이 더 중요하다.\n\n## 1차 분기\n\nequals만 있고 hashCode가 없으면 같은 값이 다른 bucket으로 갈 수 있다. key로 쓴 뒤 필드가 바뀌면 원래 bucket에서 찾을 수 없다.\n\n| 증상 | 먼저 볼 것 | 가능성 높은 원인 |\n|---|---|---|\n| `put`한 값이 `get`에서 `null` | `put`/`get` 시점 hashCode 비교 | key 필드 mutation 또는 hashCode 불일치 |\n| 같은 값이 `HashSet`에 중복 저장 | `equals`와 `hashCode` 동시 구현 여부 | equals만 재정의했거나 비교 필드가 다름 |\n| 테스트는 통과하지만 운영 데이터에서 실패 | key 필드 nullable/정규화 여부 | 대소문자, 공백, id 생성 시점 차이 |\n| DTO를 key로 쓰고 나중에 setter 호출 | equals/hashCode 포함 필드 변경 | mutable key 사용 |\n| `Map<Key, V>` 대신 `Map<String, V>`는 정상 | Key contract | 자료구조보다 key 타입 문제 |\n\n## 선택 기준\n\n- key의 값 동등성이 도메인 규칙이면 `equals/hashCode`를 명시적으로 정의한다.\n- key가 생성 후 바뀌면 안 되는 식별자라면 immutable value object나 record를 우선 검토한다.\n- key가 단순 식별자 하나면 복잡한 객체보다 `String`, `Long`, enum 같은 안정적인 타입이 낫다.\n- 정렬이나 범위 조회가 필요하면 HashMap key contract가 아니라 ordered map 문서로 분기한다.\n- 객체 identity가 진짜 기준이면 일반 `HashMap`보다 identity 기반 비교가 의도인지 먼저 문서화한다. 대부분의 미션에서는 value equality가 기대된다.\n\n## 다음 확인\n\nKey 객체는 가능하면 immutable로 만들고, equals/hashCode에 들어가는 필드를 명확히 고정한다.\n\n## 핵심 invariant\n\n- `a.equals(b) == true`이면 `a.hashCode() == b.hashCode()`여야 한다.\n- `equals`와 `hashCode`에 참여하는 필드는 key가 Map/Set에 들어간 뒤 바뀌면 안 된다.\n- `equals`는 reflexive, symmetric, transitive, consistent를 지켜야 한다.\n- null 비교와 타입 비교가 일관되어야 한다.\n- `compareTo`를 같이 쓰는 타입이라면 `compareTo == 0`과 `equals == true`의 관계도 의도적으로 맞춘다. TreeMap/TreeSet으로 옮길 때 다른 버그가 생길 수 있다.\n\nHashMap은 `hashCode`로 bucket 후보를 좁힌 뒤 `equals`로 같은 key인지 확인한다. 따라서 hashCode가 바뀌면 예전 bucket에 들어간 entry를 새 hashCode 경로로 찾지 못한다.\n\n## 실패 반례\n\n```java\nclass ReservationKey {\n    private String date;\n    private String time;\n\n    @Override\n    public boolean equals(Object o) {\n        if (!(o instanceof ReservationKey other)) return false;\n        return Objects.equals(date, other.date)\n            && Objects.equals(time, other.time);\n    }\n}\n```\n\n위 타입은 `equals`만 있고 `hashCode`가 없어서 같은 날짜/시간처럼 보여도 다른 bucket에 들어갈 수 있다.\n\n```java\nReservationKey key = new ReservationKey(\"2026-05-14\", \"19:00\");\nmap.put(key, seat);\nkey.setTime(\"20:00\");\nmap.get(key); // 실패 가능\n```\n\n두 번째 예시는 key로 사용한 뒤 hashCode 참여 필드를 바꾼다. 객체 reference는 같아도 HashMap 내부 위치는 예전 hash 기준이라 lookup이 깨진다.\n\n## 복잡도와 운영 비용\n\nHashMap lookup은 평균 `O(1)`이지만, 그 전제는 hash 분포와 key contract가 정상이라는 것이다. hash가 한 bucket으로 몰리면 충돌 처리 비용이 커지고, contract가 깨지면 Big-O와 무관하게 correctness가 깨진다.\n\n운영 비용은 디버깅 난도가 크다. 로그에는 key 문자열이 같아 보이는데 실제 hashCode나 정규화 상태가 다를 수 있다. 그래서 key 타입 테스트는 `equals`, `hashCode`, mutation 금지, collection round-trip을 함께 검증해야 한다.\n\n## 흔한 오해\n\n- \"toString이 같으면 같은 key다\"는 틀리다. HashMap은 `toString`을 보지 않는다.\n- \"equals만 맞으면 된다\"는 틀리다. 같은 값이면 같은 hashCode도 필요하다.\n- \"객체 reference가 같으면 mutation해도 안전하다\"는 틀리다. bucket 위치는 hashCode 기준이다.\n- \"IDE가 생성한 equals/hashCode면 끝\"도 위험하다. 어떤 필드를 포함할지 도메인 기준으로 정해야 한다.\n- \"HashMap 버그\"처럼 보이는 많은 문제는 key 타입의 불변성/동등성 계약 문제다.\n\n## 관련 playbook\n\nJava hashmap/hashset hashCode equals lookup bridge로 이어진다.\n\n## Safe Next Docs\n\n- `data-structure/hash-table-basics`: bucket, collision, 평균 `O(1)` 전제를 복습한다.\n- `language/hashmap-hashset-hashcode-equals-lookup-bridge`: Java의 equals/hashCode 구현 규칙과 테스트 포인트로 이어진다.\n",
+  "body_markdown": "# HashMap Key Contract Mission Router\n\n## 이 문서가 잡는 증상\n\n`put`한 key로 `get`했는데 `null`이 나온다, `HashSet`에 같은 값이 중복으로 들어간다, 로그상으로는 같은 예약 번호인데 Map lookup이 실패한다, key 객체의 setter를 호출한 뒤부터 결과가 흔들린다. 이런 증상은 HashMap 구현 자체보다 key contract가 먼저 의심 대상이다.\n\nHashMap은 key의 `hashCode`로 bucket 후보를 찾고, 그 bucket 안에서 `equals`로 실제 같은 key인지 확인한다. 그래서 value equality, hashCode, 불변성 중 하나라도 어긋나면 평균 `O(1)`이라는 복잡도보다 먼저 correctness가 깨진다.\n\n## 1차 분기 질문\n\n| 관찰 증상 | 먼저 확인할 것 | 흔한 원인 |\n|---|---|---|\n| `put` 직후 `get`이 실패 | `put`과 `get` 시점의 hashCode | key 필드 변경 또는 hashCode 누락 |\n| `HashSet`에 중복 저장 | `equals`와 `hashCode` 동시 구현 | equals만 재정의함 |\n| 테스트 데이터는 통과, 운영 값은 실패 | 공백, 대소문자, null 정규화 | 비교 필드 정규화 불일치 |\n| DTO를 key로 사용 | setter 호출 시점 | mutable key 사용 |\n| `Map<String, V>`로 바꾸면 정상 | key 객체의 동등성 규칙 | 자료구조가 아니라 key 타입 문제 |\n\n## 핵심 contract\n\n- `a.equals(b) == true`이면 `a.hashCode() == b.hashCode()`여야 한다.\n- `equals`와 `hashCode`가 보는 필드는 Map이나 Set에 들어간 뒤 바뀌면 안 된다.\n- `equals`는 자기 자신과 같고, 비교 순서를 바꿔도 같고, 전이성이 있어야 하며, 같은 상태에서는 결과가 흔들리지 않아야 한다.\n- `null` 처리와 타입 비교가 일관되어야 한다. proxy 객체나 상속 계층이 있으면 `getClass`와 `instanceof` 선택도 의도적으로 정한다.\n- `compareTo`를 같이 쓰는 타입은 `compareTo == 0`과 `equals == true` 관계를 확인한다. HashMap에서는 괜찮아 보여도 TreeMap으로 바꾸면 다른 중복 판단이 생길 수 있다.\n\n## 미션 디버깅 예시\n\n예약 미션에서 날짜와 시간으로 좌석을 찾는 key가 있다고 하자. 처음에는 `date`, `time`으로 put했는데, validation 과정에서 `time`을 보정하거나 문자열 공백을 제거하는 setter가 뒤늦게 호출되면 hashCode가 달라진다. entry는 예전 bucket에 남아 있는데 lookup은 새 hashCode 경로로 이동하므로 같은 객체 reference를 넣어도 찾지 못할 수 있다.\n\n```java\nclass ReservationKey {\n    private LocalDate date;\n    private LocalTime time;\n\n    boolean equals(Object other) {\n        return sameDateAndTime(other);\n    }\n\n    int hashCode() {\n        return Objects.hash(date, time);\n    }\n}\n```\n\n이 형태 자체는 괜찮지만 `date`와 `time`이 변경 가능하면 key로는 위험하다. 더 안전한 선택은 생성 시점에 값을 확정한 value object, Java record, 또는 `reservationId`처럼 단일 불변 식별자를 key로 쓰는 것이다. 도메인에서 날짜와 시간이 곧 식별자라면 record key가 좋고, 예약 생성 뒤 id가 발급된다면 id 기반 Map이 더 단순하다.\n\n## 선택 기준\n\n- 값 동등성이 도메인 규칙이면 immutable value object나 record를 만든다.\n- key가 단순 식별자 하나면 객체 key보다 `Long`, `String`, enum 같은 안정적인 타입을 먼저 본다.\n- key 필드가 생성 뒤 변해야 한다면 그 객체는 HashMap key로 쓰지 않는다. 변경 전 값을 별도 key로 만들거나 Map에서 제거 후 새 key로 다시 넣는다.\n- 조회 조건이 prefix, 범위, 정렬이라면 HashMap보다 TreeMap, 인덱스, database query가 맞을 수 있다.\n- identity 비교가 의도라면 value equality와 다르다는 사실을 테스트 이름과 타입 이름에 드러낸다. 대부분의 미션 코드에서는 identity Map보다 value equality가 자연스럽다.\n\n## 안전한 key 설계 패턴\n\n가장 단순한 패턴은 immutable key다. 생성자에서 필요한 값을 모두 받고 field를 `final`로 두며, equals/hashCode에 들어가는 값을 이후에 바꾸지 않는다. Java record는 이 요구에 잘 맞는다. 다만 record도 내부에 mutable collection을 들고 있거나 외부에서 변경 가능한 객체 reference를 그대로 보관하면 완전한 불변이 아니다. key 안에 List나 배열이 필요하면 defensive copy와 변경 금지 정책까지 같이 본다.\n\n두 번째 패턴은 정규화된 primitive key다. 이메일, 전화번호, 날짜 문자열처럼 표현이 흔들리는 값은 key 생성 전에 trim, case normalization, timezone 기준을 확정한다. 같은 예약자라도 한쪽은 공백이 있고 한쪽은 소문자로 저장되면 equals가 맞지 않을 수 있다. 정규화 책임이 controller, service, value object에 흩어져 있으면 운영 데이터에서만 재현되는 lookup 실패가 생기기 쉽다.\n\n세 번째 패턴은 key 변경을 update로 다루는 것이다. 이미 Map에 들어간 key의 동등성 필드를 바꿔야 한다면 in-place mutation이 아니라 `remove(oldKey)` 후 `put(newKey, value)`로 생각한다. 이 규칙을 모르면 객체 하나를 계속 수정하면서 Map 내부 bucket만 과거 상태로 남기는 버그를 만들 수 있다.\n\n## 테스트 포인트\n\nkey 타입 테스트는 단순히 getter를 확인하는 수준으로 끝내면 안 된다. 같은 값 두 객체가 서로 `equals`이고 hashCode도 같은지, 다른 값은 다르게 비교되는지, collection round-trip이 되는지 본다. 특히 `Set.of(a, b)` 크기, `map.put(a, value)` 후 `map.get(b)` 결과, key로 넣은 뒤 변경 가능한 API가 없는지를 확인한다.\n\n운영 로그를 남길 때는 `toString`만 찍지 않는다. `toString`이 같아도 HashMap은 그 값을 보지 않는다. 재현 로그에는 key class, hashCode, equals 비교 결과, 정규화 전후 값, put/get 시점을 같이 남겨야 원인을 빠르게 좁힐 수 있다.\n\n## 미션/운영 맥락\n\n방탈출 예약에서 날짜, 시간, 테마명을 묶어 key로 쓰면 중복 예약을 빠르게 찾을 수 있다. 하지만 테마명이 나중에 표시용 이름으로 바뀌거나, 시간 문자열이 파싱 뒤 다른 포맷으로 바뀌면 key 안정성이 깨진다. 이 경우 domain identity는 예약 slot id인지, 날짜와 시간의 조합인지, 테마까지 포함하는지 먼저 정해야 한다. 동등성 규칙이 도메인 언어로 설명되지 않으면 equals/hashCode 구현도 우연한 필드 묶음이 된다.\n\n트래픽이 많은 서비스에서는 key contract 버그가 성능 장애처럼 보이기도 한다. 캐시 hit가 떨어지고, 중복 entry가 쌓이고, 같은 요청이 재계산된다. 그래서 cache key, idempotency key, deduplication key는 HashMap 내부 지식이 아니라 운영 안정성의 일부로 다뤄야 한다.\n\n## 흔한 오해\n\n- `toString`이 같으면 같은 key라고 생각한다. HashMap은 `toString`을 사용하지 않는다.\n- equals만 맞으면 된다고 생각한다. 같은 값이면 같은 hashCode가 필요하다.\n- 같은 객체 reference면 필드를 바꿔도 안전하다고 생각한다. bucket 위치는 hashCode 기준이라 lookup 경로가 달라질 수 있다.\n- IDE 생성 코드면 끝이라고 생각한다. 어떤 필드를 동등성에 넣을지는 도메인 결정이다.\n- HashMap 평균 `O(1)`만 말하면 충분하다고 생각한다. 평균 시간복잡도는 key contract가 정상일 때의 이야기다.\n\n## Safe Next Docs\n\nBucket과 collision 전제는 `data-structure/hash-table-basics`에서 복습하고, Java의 equals/hashCode 구현 규칙과 HashSet lookup 실패 사례는 `language/hashmap-hashset-hashcode-equals-lookup-bridge`로 이어진다.\n",
   "aliases": [
-    "hashmap key contract mission router",
-    "equals hashcode mutable key hashmap",
-    "HashMap key 계약",
-    "mutable key lookup 실패"
+    "equals hashCode 계약",
+    "HashMap 키 불변성",
+    "맵 get null 원인",
+    "객체 키 변경 문제",
+    "HashSet 중복 저장",
+    "mutable key lookup 실패",
+    "key contract 디버깅",
+    "record key 안전성"
   ],
   "expected_queries": [
-    "HashMap key로 쓴 객체를 바꾸면 왜 get이 실패해?",
-    "equals hashCode를 같이 구현해야 하는 이유가 뭐야?",
-    "Map lookup이 안 될 때 key contract를 어디서 봐야 해?"
+    "HashMap에 put했는데 get이 null인 이유가 뭐야?",
+    "equals만 구현하면 HashSet 중복이 막히지 않아?",
+    "객체를 Map key로 쓴 뒤 필드를 바꾸면 왜 위험해?",
+    "record를 key로 쓰면 어떤 점이 안전해?",
+    "미션에서 예약 key 중복을 어떻게 디버깅해?"
   ],
   "symptoms": [
     "put한 key로 get했는데 null이 나와요",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/data-structure/hashmap-key-contract-mission-router.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch145"
+      }
+    ]
   }
 }

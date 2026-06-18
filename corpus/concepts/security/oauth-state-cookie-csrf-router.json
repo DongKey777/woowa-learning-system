@@ -6,15 +6,20 @@
   "summary": "이 symptom_router는 OAuth login state mismatch와 state cookie/CSRF 방어 문제를 분기한다. callback state 불일치, SameSite, state cookie 사라짐, 소셜 로그인 실패 같은 질문을 다룬다.",
   "body_markdown": "# OAuth State Cookie CSRF Router\n\n## 재현 조건\n\n다음 조건에서 OAuth state/cookie mismatch를 재현할 수 있다.\n\n- login start에서 state cookie/session을 만들고 callback 전에 cookie Domain/Path/SameSite 조건을 바꾼다\n- 같은 브라우저에서 두 개 이상의 login attempt를 열어 expected state를 overwrite한다\n- `response_mode=form_post`, popup, iframe, cross-site fetch처럼 top-level navigation이 아닌 callback 형태를 쓴다\n- callback handler가 state 검증 전에 authorization code exchange를 실행하도록 순서를 바꾼다\n- 성공 또는 실패 후 state cleanup을 생략해 같은 state를 재사용한다\n\n재현 중에는 state mismatch를 provider token 문제로 넘기지 않는다. state는 token exchange 전 correlation guard이며, 실패 callback에서 token endpoint를 호출하면 방어 순서가 깨진 것이다.\n\n## 한 줄 판단\n\nOAuth `state` mismatch는 \"provider token이 틀렸다\"가 아니라 로그인 시작 요청과 callback 응답의 상관관계 검증이 실패했다는 뜻이다. `state`, state 저장소, callback cookie, token exchange를 분리해서 봐야 한다.\n\n## 첫 분기\n\n처음에는 provider 장애보다 callback correlation을 먼저 본다.\n\n| 첫 관찰 | 먼저 볼 축 | 의미 |\n|---|---|---|\n| callback에 `state` 파라미터가 없음 | authorization request/redirect URI 구성 | provider가 state를 돌려주지 않았거나 시작 요청이 잘못됨 |\n| returned state는 있는데 expected state가 없음 | state 저장소/cookie/session continuity | callback까지 expected value가 살아오지 못함 |\n| expected와 returned가 다름 | 중복 로그인, overwrite, 다른 tab | 서로 다른 login attempt가 섞임 |\n| state 검증 전에 token exchange가 실행됨 | handler 순서 | CSRF 방어가 token 발급 뒤로 밀림 |\n| state는 맞는데 로그인 세션이 안 생김 | token exchange/user mapping/session 생성 | OAuth state 문제가 아니라 다음 단계 문제 |\n\n## 공격 모델\n\nState는 OAuth login CSRF를 막기 위한 correlation value다. 공격자가 자기 계정으로 만든 authorization response를 피해자의 브라우저 callback에 밀어 넣거나, 사용자가 시작하지 않은 로그인 callback을 처리하게 만드는 흐름을 막는다.\n\n따라서 state 검증은 provider가 준 authorization code를 token으로 바꾸기 전에 끝나야 한다. state가 틀린 callback에서 access token이나 refresh token을 받아 오려고 하면 방어 순서가 뒤집힌다.\n\n## 섞으면 안 되는 것\n\n| 항목 | 역할 | 검증 증거 |\n|---|---|---|\n| OAuth `state` parameter | login start와 callback을 묶는 nonce/correlation value | start에서 생성한 expected state, callback query/form의 returned state |\n| state 저장 cookie/session/cache | expected state를 callback까지 보관 | storage key, cookie Domain/Path/SameSite/Secure, TTL, one-time delete |\n| session cookie | 같은 브라우저 흐름을 서버 session과 연결 | callback request `Cookie` header, session id continuity |\n| authorization code | provider가 발급한 code, token exchange 입력 | state 통과 후 code exchange log |\n| access/refresh token | provider API 호출 권한 | state mismatch 원인으로 먼저 보지 않음 |\n| app CSRF token | 앱 내부 form/API CSRF 방어 | OAuth state와 목적이 다르며 혼용 금지 |\n\n## 관찰 증거\n\n로그인 시작 요청에서 만든 `state`, 저장 위치(cookie/session/cache), callback 요청의 `state`, callback에 붙은 cookie를 같은 trace id로 본다. 값 전체를 로그에 남기지 말고 hash 또는 prefix만 남겨도 충분하다.\n\n| 증거 | 무엇을 판단하나 |\n|---|---|\n| login start response | `state` 생성, redirect URL에 state 포함, expected state 저장 여부 |\n| Application cookie row | state cookie가 저장됐는지, Domain/Path/SameSite/Secure가 callback URL과 맞는지 |\n| callback request | returned `state`, `Cookie` header, method(GET/POST), redirect URI |\n| state store lookup | expected state hit/miss, TTL 만료, one-time use 여부 |\n| cleanup log | 성공/실패 후 state가 삭제되어 재사용되지 않는지 |\n\n## 10초 분기표\n\n| 관찰 | 먼저 볼 원인 | 다음 액션 |\n|---|---|---|\n| callback에 state cookie/session 없음 | 저장소 연결 실패 | Domain/Path/SameSite/Secure, session id continuity |\n| callback cookie는 있는데 expected state miss | TTL 만료 또는 cleanup/overwrite | 로그인 시작 중복, cache key, state delete 시점 |\n| expected와 returned 값이 다름 | 다른 login attempt와 섞임 | browser tab 중복, provider redirect URI, state overwrite |\n| state 검증 전 token exchange가 실행됨 | 방어 순서 오류 | callback handler 순서 수정 |\n| 특정 브라우저/환경에서만 실패 | cookie 정책 차이 | third-party context, HTTPS, SameSite, proxy domain |\n\n## 확인 순서\n\n1. login start에서 state를 생성하고 expected state가 cookie/session/cache에 저장됐는지 확인한다.\n2. redirect URL에 포함된 returned 예정 state와 저장된 expected state hash가 같은지 본다.\n3. callback request에 returned state와 `Cookie` header가 실제로 왔는지 확인한다.\n4. expected state lookup miss라면 TTL, Domain, Path, SameSite, Secure, session continuity를 본다.\n5. expected와 returned가 다르면 중복 tab, overwrite, 다른 provider callback이 섞였는지 확인한다.\n6. state 검증 통과 전 token exchange가 실행되지 않는지 확인한다.\n7. 성공/실패 후 state cleanup이 한 번만 실행되는지 확인한다.\n\n## wrong-bucket 비교\n\n| 잘못 묶는 버킷 | 왜 다른가 | 확인 방법 |\n|---|---|---|\n| CORS 문제 | OAuth callback은 보통 fetch가 아니라 browser navigation이다 | Network에서 callback request method와 initiator를 본다 |\n| provider token 문제 | state mismatch는 token exchange 전 검증 실패다 | token endpoint 호출이 state 검증 후에만 나가는지 확인 |\n| 앱 CSRF token 문제 | OAuth state는 login callback correlation이고 app CSRF token은 앱 요청 방어다 | 저장 위치와 검증 endpoint를 분리한다 |\n| session hijack | state mismatch만으로 탈취를 단정할 수 없다 | session id continuity, duplicate tab, overwrite evidence를 먼저 본다 |\n\n## failure matrix\n\n| 관찰 | 더 가능성 높은 원인 | 보수적 대응 |\n|---|---|---|\n| returned state가 없음 | authorization request 구성 또는 provider redirect 문제 | token exchange 금지, start URL 확인 |\n| expected state가 없음 | state cookie/session/cache continuity 실패 | cookie attributes와 TTL 확인 |\n| expected와 returned가 다름 | duplicate login attempt 또는 overwrite | 새 login flow로 restart, 기존 state cleanup |\n| 특정 브라우저만 실패 | SameSite/Secure/third-party context 차이 | callback 형태와 cookie policy 분리 |\n| state 통과 후 session이 안 생김 | token exchange/user mapping/session creation 문제 | OAuth state bucket에서 다음 auth flow 단계로 handoff |\n\n## 브라우저/cookie 규칙 포인트\n\nOAuth callback이 provider에서 app으로 돌아오는 top-level GET navigation이면 `SameSite=Lax` cookie가 붙는 경우가 많다. 하지만 `response_mode=form_post`, iframe, popup postMessage, SPA cross-site fetch처럼 흐름이 바뀌면 Lax 기대가 깨질 수 있다. 이때 `SameSite=None; Secure`가 필요한지 검토한다.\n\nState cookie의 Domain은 callback host에 match되어야 하고, Path는 callback path를 포함해야 한다. `Path=/oauth2/authorization`에 저장한 쿠키가 `/login/oauth2/code/google` callback에 붙지 않는 식의 Path mismatch가 흔하다.\n\n`Secure` state cookie는 HTTPS callback에만 붙는다. 로컬 HTTP에서만 실패하거나 운영 HTTPS에서만 성공하는 경우 이 축을 먼저 본다.\n\n## 검증\n\n1. login start request에서 생성한 state hash와 저장 위치를 기록한다.\n2. redirect URL에 들어간 state hash와 저장소의 expected state hash가 같은지 확인한다.\n3. callback request의 returned state hash, request `Cookie` header, session id를 확인한다.\n4. expected state lookup이 hit인지 miss인지, TTL이 지났는지 본다.\n5. 값이 다르면 같은 브라우저에서 중복 로그인 시도가 state를 overwrite했는지 확인한다.\n6. state 검증 통과 전에는 authorization code exchange가 실행되지 않는지 확인한다.\n7. 성공과 실패 모두 cleanup이 실행되어 state 재사용이 불가능한지 본다.\n\n검증 성공 기준은 \"로그인이 된다\"가 아니라 \"start에서 만든 expected state가 callback에서 한 번만 검증되고, 실패 callback은 token exchange 없이 거부되며, 성공/실패 후 state가 재사용되지 않는다\"이다.\n\n## 흔한 오해\n\nState를 access token처럼 오래 보관하면 안 된다. State는 짧게 살고 한 번만 쓰이는 correlation value다.\n\nState mismatch를 CORS 문제로 먼저 보면 길을 잃기 쉽다. OAuth authorization callback은 보통 브라우저 navigation이고, CORS는 fetch/XHR 응답 노출 정책이다. callback에 필요한 것은 state 저장소와 cookie/session continuity다.\n\nCSRF token과 OAuth state를 같은 이름으로 구현할 수는 있어도 의미까지 같아지는 것은 아니다. 앱 내부 상태 변경 요청의 CSRF 방어와 OAuth login callback correlation은 검증 위치와 공격 모델이 다르다.\n\n## 관련 playbook\n\nOAuth login state cookie cleanup과 cookie visible router로 이어진다.\n",
   "aliases": [
-    "oauth state cookie csrf router",
-    "oauth login state mismatch cookie",
-    "OAuth state 쿠키 CSRF",
-    "소셜 로그인 state mismatch"
+    "oauth state mismatch 분기",
+    "OAuth state 쿠키",
+    "소셜 로그인 state 오류",
+    "callback state cookie 문제",
+    "로그인 CSRF state 검증",
+    "OAuth callback 쿠키 사라짐",
+    "state 검증 token exchange 순서"
   ],
   "expected_queries": [
     "OAuth 로그인에서 state mismatch가 나면 어디부터 봐?",
     "state 파라미터와 쿠키는 CSRF 방어에서 어떤 역할이야?",
-    "소셜 로그인 callback에서 state cookie가 사라지는 이유는 뭐야?"
+    "소셜 로그인 callback에서 state cookie가 사라지는 이유는 뭐야?",
+    "OAuth callback에서 state 검증 전에 token exchange를 해도 돼?",
+    "중복 로그인 탭 때문에 state 값이 달라질 수 있어?"
   ],
   "symptoms": [
     "OAuth callback에서 state가 일치하지 않아요",
@@ -38,8 +43,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/oauth-state-cookie-csrf-router.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

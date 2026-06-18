@@ -6,15 +6,21 @@
   "summary": "이 drill은 Bloom Filter를 면접 답변으로 설명한다. false positive, false negative, cache penetration 방어를 다룬다.",
   "body_markdown": "# Bloom Filter Interview Drill\n\n## 질문\n\n\"Bloom Filter는 무엇이고, false positive가 있다는 말은 무슨 뜻인가요?\"\n\n## 기대 답변 축\n\n- Bloom Filter는 여러 hash function으로 bit array를 설정해 membership을 빠르게 추정하는 probabilistic data structure다.\n- \"없다\"는 답은 확실하지만, \"있다\"는 답은 false positive일 수 있다.\n- false negative가 없어야 하는 guard에서 유용하다. 예를 들어 없는 key의 DB 조회를 줄이는 cache penetration 방어에 쓸 수 있다.\n- 일반 Bloom Filter는 삭제가 어렵고, 삭제가 필요하면 counting bloom filter나 cuckoo filter를 검토한다.\n\n## 선택 기준\n\n- 정확한 Set이 아니라 \"대부분의 불필요한 조회를 싸게 걸러도 되는가\"를 먼저 본다.\n- false positive가 허용되는지 확인한다. false positive는 비용 증가일 뿐 정합성 오류가 아니어야 한다.\n- false negative가 발생하면 안 되는 경로인지 확인한다. 삽입 누락, stale filter, 잘못된 삭제가 있으면 이 조건이 깨진다.\n- 예상 원소 수 `n`과 허용 false positive rate `p`가 있어야 bit array 크기와 hash 개수를 정할 수 있다.\n- 삭제, TTL, tenant별 격리, 재빌드 주기가 필요하면 일반 Bloom Filter만으로 끝내지 않는다.\n\n## 핵심 invariant\n\n- 삽입 시 `k`개의 hash 위치 bit를 모두 1로 만든다.\n- 조회 시 `k`개 위치 중 하나라도 0이면 \"확실히 없음\"이다.\n- 모든 위치가 1이면 \"있을 수도 있음\"이다. 다른 원소들이 같은 bit를 세웠을 수 있기 때문이다.\n- insert-only이고 bit가 손상되지 않으며 같은 hash 함수가 유지될 때, 삽입된 원소에 대한 false negative는 없어야 한다.\n- bit를 직접 0으로 되돌리면 다른 원소가 공유하던 bit까지 지워 false negative가 생길 수 있다.\n\n## Complexity/운영 비용\n\n- insert/query는 hash `k`번이므로 `O(k)`다. 보통 `k`는 작지만 hash 비용과 cache miss가 latency에 반영된다.\n- 메모리는 bit array 크기 `m`에 비례한다. 너무 작게 잡으면 false positive rate가 빠르게 올라간다.\n- 포화도가 높아지면 대부분의 bit가 1이 되어 filter가 \"있을 수도 있음\"만 돌려주는 장식이 된다.\n- 운영에서는 filter 재빌드, warm-up, shard별 동기화, 배포 중 신구 hash 함수 호환을 관리해야 한다.\n- cache penetration guard에서는 false positive가 DB 조회 일부를 통과시키는 비용으로 나타난다.\n\n## 실패 반례\n\n- 신규 key를 DB에 추가했지만 Bloom Filter 갱신이 늦으면 guard가 \"확실히 없음\"으로 판단해 정상 데이터를 막을 수 있다.\n- 삭제를 지원하려고 bit를 단순히 0으로 내리면 같은 bit를 공유하던 다른 key 조회가 false negative가 된다.\n- 공격자가 계속 새로운 key를 던지는 상황에서 filter가 너무 작으면 빠르게 포화되어 방어 효과가 사라진다.\n- \"있을 수도 있음\"을 \"반드시 있음\"으로 처리해 DB 확인을 생략하면 정합성 버그가 된다.\n\n## 흔한 오해\n\n- Bloom Filter는 cache가 아니다. 값은 저장하지 않고 membership 가능성만 저장한다.\n- false positive는 \"없는 것을 있을 수 있다고 말함\"이고, 일반 조건에서 false negative는 없어야 한다.\n- hash function을 많이 늘리면 항상 좋아지는 것이 아니다. CPU 비용이 늘고 bit가 더 빨리 포화될 수 있다.\n- 삭제가 필요하다고 해서 무조건 counting Bloom Filter가 정답은 아니다. 카운터 overflow와 메모리 비용을 같이 본다.\n\n## 약점 태그\n\n- `exact-set-confusion`: Bloom Filter를 정확한 Set으로 설명함\n- `false-positive-reversed`: false positive/negative를 반대로 말함\n- `delete-gap`: 삭제 제약을 놓침\n\n## 손으로 따라가는 예제\n\nm=10(비트 배열 10칸), k=2(해시 함수 2개), 삽입할 키: `\"alice\"`, `\"bob\"`.\n\n**삽입 \"alice\"**\n- h1(\"alice\") % 10 = 2 → bit[2] = 1\n- h2(\"alice\") % 10 = 7 → bit[7] = 1\n\n**삽입 \"bob\"**\n- h1(\"bob\") % 10 = 4 → bit[4] = 1\n- h2(\"bob\") % 10 = 7 → bit[7] = 1 (이미 1, 그대로)\n\n비트 배열 상태:\n```text\nindex:  0  1  2  3  4  5  6  7  8  9\nbit:    0  0  1  0  1  0  0  1  0  0\n```\n\n**조회 \"alice\"** → h1=2(1), h2=7(1) → 모두 1 → \"있을 수도 있음\" (실제로 있으니 맞음)\n\n**조회 \"carol\"** (삽입한 적 없음)\n- h1(\"carol\") % 10 = 4 → bit[4] = 1\n- h2(\"carol\") % 10 = 2 → bit[2] = 1\n- 모두 1 → \"있을 수도 있음\" → **false positive**\n\n\"carol\"은 넣지 않았지만 \"bob\"이 4번, \"alice\"가 2번을 이미 세워둔 덕에 검사를 통과한다. 이게 false positive가 생기는 원리다.\n\n**조회 \"dave\"** (삽입한 적 없음)\n- h1(\"dave\") % 10 = 5 → bit[5] = 0 → 하나라도 0 → **\"확실히 없음\"** (true negative)\n\n한 개라도 0이 뜨면 그 키를 넣었을 때 반드시 해당 위치를 1로 만들었어야 하는데 그렇지 않다는 뜻이므로, 삽입된 적이 없다는 사실이 확정된다. 이 방향(false negative 불가)은 절대 깨지지 않는다.\n\n**tradeoff 직관**\n- m을 늘리면 각 키가 차지하는 bit 밀도가 낮아져 우연히 겹치는 확률이 줄어들고 false positive rate가 내려간다.\n- k를 너무 늘리면 배열을 빠르게 채워 오히려 false positive rate가 올라간다. 최적 k는 `k = (m/n) × ln2` 근방이다.\n- 실전 경험칙: n개 원소, FPR 1% 목표 → m ≈ 9.6n bits, k ≈ 7.\n\n**Java 스케치** (개념 확인용, 프로덕션 용도 아님)\n```java\nimport java.util.BitSet;\n\npublic class TinyBloom {\n    private final BitSet bits;\n    private final int m;\n    private final int k;\n\n    public TinyBloom(int m, int k) {\n        this.m = m;\n        this.k = k;\n        this.bits = new BitSet(m);\n    }\n\n    public void insert(String key) {\n        for (int i = 0; i < k; i++) {\n            bits.set(hash(key, i) % m);\n        }\n    }\n\n    /** true = \"있을 수도 있음\",  false = \"확실히 없음\" */\n    public boolean mightContain(String key) {\n        for (int i = 0; i < k; i++) {\n            if (!bits.get(hash(key, i) % m)) return false;\n        }\n        return true;\n    }\n\n    private int hash(String key, int seed) {\n        // 실제라면 MurmurHash 계열; 예제용 단순 해시\n        return Math.abs((key.hashCode() ^ (seed * 0x9e3779b9)) & Integer.MAX_VALUE);\n    }\n}\n```\n\n**실전 쓰임새** — Redis/Cassandra에서 없는 key를 조회할 때 디스크 I/O를 생략하는 cache penetration guard가 대표 사례다. false positive가 생겨도 \"DB로 한 번 더 조회\"하는 비용이 추가될 뿐, 정합성 오류는 없다. 반면 삽입된 key에 대해 \"없다\"는 오답을 내리면 실제 데이터를 못 읽는 버그가 생기므로, false negative 불가 보장이 이 구조의 핵심 가치다.\n\n## 스스로 점검\n\n1. 비트 배열 크기를 절반으로 줄이면 false positive rate는 어떻게 변하고, 이를 상쇄하려면 해시 함수 k를 어떻게 조정해야 할까?\n2. 캐시 penetration guard에 Bloom Filter를 쓰는데, 새 키가 DB에 추가될 때 Filter 갱신이 1초 지연된다면 그 사이에 어떤 잘못된 동작이 일어날 수 있고, 어떻게 방어할 수 있을까?\n\n## 복습 연결\n\ncache guard는 `bloom-filter-cache-guard-primer`, Cuckoo 비교는 `bloom-filter-vs-cuckoo-filter`로 이어진다.\n",
   "aliases": [
-    "Bloom Filter interview drill",
-    "블룸 필터 면접 답변",
-    "false positive probabilistic set",
-    "cache penetration guard answer"
+    "Bloom membership false positive",
+    "블룸 필터 거짓 양성",
+    "확률적 membership 구조",
+    "캐시 관통 방어 필터",
+    "false negative 없는 guard",
+    "Bloom Filter 삭제 한계",
+    "DB 조회 차단 Bloom",
+    "bit array hash membership"
   ],
   "expected_queries": [
-    "Bloom Filter를 면접에서 어떻게 설명해?",
-    "false positive는 있고 false negative는 없다는 게 무슨 뜻이야?",
-    "캐시 penetration 방어에 Bloom Filter를 왜 써?"
+    "Bloom Filter는 왜 없다는 답만 확실하다고 해?",
+    "false positive와 false negative를 헷갈리지 않게 설명해줘",
+    "캐시 관통 방어에서 블룸 필터를 어떻게 써?",
+    "블룸 필터에서 삭제가 어려운 이유가 뭐야?",
+    "원소 수와 오탐률로 Bloom Filter 크기를 어떻게 잡아?"
   ],
   "symptoms": [
     "Bloom Filter를 정확한 Set으로 설명해요",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-31",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/data-structure/bloom-filter-interview-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

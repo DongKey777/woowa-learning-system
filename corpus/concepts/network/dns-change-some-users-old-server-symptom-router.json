@@ -4,21 +4,29 @@
   "category": "network",
   "level": "beginner",
   "summary": "같은 도메인인데 일부 사용자만 예전 서버로 가면 \"DNS가 아직 안 바뀌었다\"보다 먼저 어떤 캐시와 어떤 resolver가 아직 다른 현실을 보고 있는지 분리해서 본다.",
-  "body_markdown": "# DNS 변경 후 일부 사용자만 예전 서버로 감 원인 라우터\n\n## 한 줄 요약\n\n> 같은 도메인인데 일부 사용자만 예전 서버로 가면 \"DNS가 아직 안 바뀌었다\"보다 먼저 어떤 캐시와 어떤 resolver가 아직 다른 현실을 보고 있는지 분리해서 본다.\n\n## 관찰에서 첫 분기\n\n- 관찰: authoritative DNS는 새 IP를 주지만 특정 사용자만 예전 IP로 접속한다. 첫 분기: zone 변경 실패보다 recursive resolver, OS, 브라우저 DNS cache의 TTL 잔존으로 본다. 다음 확인: 같은 시각에 authoritative 조회, 사용자 PC의 system resolver 조회, 브라우저 Secure DNS/DoH 설정을 나란히 기록한다.\n- 관찰: 회사망이나 VPN에서만 예전 서버로 가고 모바일망에서는 새 서버로 간다. 첫 분기: 전파 지연보다 split-horizon 또는 사내 DNS view 차이를 먼저 의심한다. 다음 확인: 네트워크별 resolver 주소, `dig @resolver host`, 응답 IP의 ASN/내부망 여부, 응답 헤더의 server identity를 비교한다.\n- 관찰: `dig`는 새 IP인데 브라우저 실제 요청은 예전 서버 로그에 찍힌다. 첫 분기: DNS answer만 보지 말고 브라우저 Alt-Svc, socket pool, 기존 keep-alive connection 재사용으로 갈라 본다. 다음 확인: DevTools `Remote Address`, Protocol, connection reuse 여부, 브라우저 DNS/socket cache 초기화 전후를 비교한다.\n\n## 가능한 원인\n\n1. DNS TTL이 끝나지 않아 브라우저, OS resolver, recursive resolver 중 일부가 이전 answer를 아직 들고 있을 수 있다. 이런 경우 authoritative zone은 이미 바뀌었는데도 사용자마다 다른 IP를 본다. 다음 문서: [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n2. 회사 DNS와 외부 DNS가 의도적으로 다른 답을 주는 split-horizon 환경일 수 있다. 사무실, VPN, 내부망에서만 예전 서버를 보면 \"전파 지연\"보다 \"다른 view\"일 가능성을 먼저 남겨 둔다. 다음 문서: [DNS Split-Horizon Behavior](./dns-split-horizon-behavior.md)\n3. 브라우저는 DoH나 `HTTPS` RR, `Alt-Svc` 힌트를 보고 있고 terminal `dig`는 다른 resolver를 보고 있을 수 있다. 그래서 `dig`에는 새 answer가 없는데 브라우저는 이미 다른 경로를 타거나, 반대로 `dig`는 새 answer인데 브라우저는 옛 힌트를 쓸 수 있다. 다음 문서: [HTTPS RR Resolver Drift Primer: browser DoH, OS resolver, `dig`가 왜 다르게 보이나](./https-rr-resolver-drift-primer.md), [Browser Cache Toggles vs Alt-Svc DNS Cache Primer](./browser-cache-toggles-vs-alt-svc-dns-cache-primer.md)\n4. DNS answer는 이미 바뀌었지만 기존 connection reuse나 service discovery churn 때문에 실제 요청은 잠시 예전 경로를 탈 수 있다. 특히 long-lived connection이나 pool이 남아 있으면 \"DNS는 바뀌었는데 트래픽은 안 옮겨갔다\"처럼 보인다. 다음 문서: [Connection Reuse vs Service Discovery Churn](./connection-reuse-vs-service-discovery-churn.md)\n\n## 빠른 자기 진단\n\n1. 영향을 받는 사용자를 네트워크별로 나눈다. 사무실 와이파이, VPN, 집, 모바일망 중 어디서만 예전 서버로 가는지 적으면 TTL 문제와 view 차이를 빨리 가를 수 있다.\n2. browser 주소창의 host와 terminal에서 확인한 host가 정말 같은지 맞춘다. `www`와 apex가 섞이거나 다른 서브도메인을 보면 DNS 문제를 잘못 읽기 쉽다.\n3. 같은 시점에 `dig`를 system resolver와 지정 resolver 둘 다로 비교하고, 브라우저 Secure DNS 여부도 같이 확인한다. 관측 지점이 다르면 answer가 달라도 이상하지 않다.\n4. 응답 헤더나 접속 로그로 실제로 어느 서버에 붙었는지 확인한다. DNS answer가 새 값이어도 기존 connection이 살아 있으면 요청 owner는 여전히 예전 서버일 수 있다.\n5. 브라우저 캐시를 껐다고 DNS, `Alt-Svc`, socket pool이 함께 초기화된다고 가정하지 않는다. \"새로고침했는데 그대로\"라는 증상은 캐시 종류가 다르다는 신호일 수 있다.\n\n## 다음 학습\n\n- TTL과 캐시 층이 왜 사용자별 시간차를 만드는지 보려면 [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n- 회사망과 외부망이 다른 답을 주는 장면을 분리하려면 [DNS Split-Horizon Behavior](./dns-split-horizon-behavior.md)\n- 브라우저 DoH, `HTTPS` RR, `dig` 결과가 왜 어긋나는지 좁히려면 [HTTPS RR Resolver Drift Primer: browser DoH, OS resolver, `dig`가 왜 다르게 보이나](./https-rr-resolver-drift-primer.md)\n- DNS는 바뀌었는데 기존 연결이 남아 트래픽 이동이 늦는 장면을 보려면 [Connection Reuse vs Service Discovery Churn](./connection-reuse-vs-service-discovery-churn.md)\n",
+  "body_markdown": "# DNS 변경 후 일부 사용자만 예전 서버로 감 원인 라우터\n\n## 한 줄 요약\n\n> 같은 도메인인데 일부 사용자만 예전 서버로 가면 \"DNS가 아직 안 바뀌었다\"보다 먼저 어떤 캐시와 어떤 resolver가 아직 다른 현실을 보고 있는지 분리해서 본다.\n\n## 관찰에서 첫 분기\n\n- 관찰: authoritative DNS는 새 IP를 주지만 특정 사용자만 예전 IP로 접속한다. 첫 분기: zone 변경 실패보다 recursive resolver, OS, 브라우저 DNS cache의 TTL 잔존으로 본다. 다음 확인: 같은 시각에 authoritative 조회, 사용자 PC의 system resolver 조회, 브라우저 Secure DNS/DoH 설정을 나란히 기록한다.\n- 관찰: 회사망이나 VPN에서만 예전 서버로 가고 모바일망에서는 새 서버로 간다. 첫 분기: 전파 지연보다 split-horizon 또는 사내 DNS view 차이를 먼저 의심한다. 다음 확인: 네트워크별 resolver 주소, `dig @resolver host`, 응답 IP의 ASN/내부망 여부, 응답 헤더의 server identity를 비교한다.\n- 관찰: `dig`는 새 IP인데 브라우저 실제 요청은 예전 서버 로그에 찍힌다. 첫 분기: DNS answer만 보지 말고 브라우저 Alt-Svc, socket pool, 기존 keep-alive connection 재사용으로 갈라 본다. 다음 확인: DevTools `Remote Address`, Protocol, connection reuse 여부, 브라우저 DNS/socket cache 초기화 전후를 비교한다.\n\n## 가능한 원인\n\n1. DNS TTL이 끝나지 않아 브라우저, OS resolver, recursive resolver 중 일부가 이전 answer를 아직 들고 있을 수 있다. 이런 경우 authoritative zone은 이미 바뀌었는데도 사용자마다 다른 IP를 본다. 다음 문서: [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n2. 회사 DNS와 외부 DNS가 의도적으로 다른 답을 주는 split-horizon 환경일 수 있다. 사무실, VPN, 내부망에서만 예전 서버를 보면 \"전파 지연\"보다 \"다른 view\"일 가능성을 먼저 남겨 둔다. 다음 문서: [DNS Split-Horizon Behavior](./dns-split-horizon-behavior.md)\n3. 브라우저는 DoH나 `HTTPS` RR, `Alt-Svc` 힌트를 보고 있고 terminal `dig`는 다른 resolver를 보고 있을 수 있다. 그래서 `dig`에는 새 answer가 없는데 브라우저는 이미 다른 경로를 타거나, 반대로 `dig`는 새 answer인데 브라우저는 옛 힌트를 쓸 수 있다. 다음 문서: [HTTPS RR Resolver Drift Primer: browser DoH, OS resolver, `dig`가 왜 다르게 보이나](./https-rr-resolver-drift-primer.md), [Browser Cache Toggles vs Alt-Svc DNS Cache Primer](./browser-cache-toggles-vs-alt-svc-dns-cache-primer.md)\n4. DNS answer는 이미 바뀌었지만 기존 connection reuse나 service discovery churn 때문에 실제 요청은 잠시 예전 경로를 탈 수 있다. 특히 long-lived connection이나 pool이 남아 있으면 \"DNS는 바뀌었는데 트래픽은 안 옮겨갔다\"처럼 보인다. 다음 문서: [Connection Reuse vs Service Discovery Churn](./connection-reuse-vs-service-discovery-churn.md)\n\n## 빠른 자기 진단\n\n1. 영향을 받는 사용자를 네트워크별로 나눈다. 사무실 와이파이, VPN, 집, 모바일망 중 어디서만 예전 서버로 가는지 적으면 TTL 문제와 view 차이를 빨리 가를 수 있다.\n2. browser 주소창의 host와 terminal에서 확인한 host가 정말 같은지 맞춘다. `www`와 apex가 섞이거나 다른 서브도메인을 보면 DNS 문제를 잘못 읽기 쉽다.\n3. 같은 시점에 `dig`를 system resolver와 지정 resolver 둘 다로 비교하고, 브라우저 Secure DNS 여부도 같이 확인한다. 관측 지점이 다르면 answer가 달라도 이상하지 않다.\n4. 응답 헤더나 접속 로그로 실제로 어느 서버에 붙었는지 확인한다. DNS answer가 새 값이어도 기존 connection이 살아 있으면 요청 owner는 여전히 예전 서버일 수 있다.\n5. 브라우저 캐시를 껐다고 DNS, `Alt-Svc`, socket pool이 함께 초기화된다고 가정하지 않는다. \"새로고침했는데 그대로\"라는 증상은 캐시 종류가 다르다는 신호일 수 있다.\n\n## 다음 학습\n\n- TTL과 캐시 층이 왜 사용자별 시간차를 만드는지 보려면 [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n- 회사망과 외부망이 다른 답을 주는 장면을 분리하려면 [DNS Split-Horizon Behavior](./dns-split-horizon-behavior.md)\n- 브라우저 DoH, `HTTPS` RR, `dig` 결과가 왜 어긋나는지 좁히려면 [HTTPS RR Resolver Drift Primer: browser DoH, OS resolver, `dig`가 왜 다르게 보이나](./https-rr-resolver-drift-primer.md)\n- DNS는 바뀌었는데 기존 연결이 남아 트래픽 이동이 늦는 장면을 보려면 [Connection Reuse vs Service Discovery Churn](./connection-reuse-vs-service-discovery-churn.md)\n\n## 실제 서버 증거를 먼저 고정한다\n\n일부 사용자만 예전 서버로 간다는 말은 DNS answer만으로 확정하지 않는다. 같은 요청의 `Remote Address`, 응답 헤더의 server identifier, access log의 request id, TLS certificate/SNI, HTTP protocol을 같이 본다. DNS는 새 IP를 줬지만 브라우저가 기존 keep-alive connection을 재사용하면 실제 요청은 잠시 old server에 남을 수 있다.\n\n브라우저와 terminal도 같은 resolver를 본다고 가정하면 안 된다. 브라우저가 Secure DNS/DoH를 쓰고 terminal `dig`는 시스템 resolver를 쓰면 서로 다른 답을 보는 것이 정상이다. 회사망/VPN에서만 old IP가 보이면 split-horizon DNS view인지, 내부 recursive resolver의 TTL cache인지, 프록시가 old upstream을 들고 있는지 나눈다.\n\n## 사용자 재현 정보 템플릿\n\n영향 사용자를 모을 때는 `어느 네트워크인가`, `브라우저 Secure DNS 설정`, `dig @system-resolver 결과`, `dig @public-resolver 결과`, `브라우저 Remote Address`, `응답 헤더`, `새로고침/브라우저 재시작 전후`를 같이 받는다. 이 정보가 있어야 전파 지연, split-horizon, browser cache, connection reuse를 한꺼번에 DNS 문제라고 부르지 않는다.\n\n## 분기별 다음 조치\n\nTTL 잔존이면 기다리는 것만 답이 아니다. 영향 사용자의 resolver를 식별하고, 서비스 쪽에서는 old/new origin hit ratio를 함께 본다. old IP hit가 줄어드는 추세라면 convergence tail일 가능성이 크고, 특정 회사망에서만 계속 고정되면 split-horizon 또는 사내 recursive cache를 의심한다.\n\nSplit-horizon이면 public resolver 결과와 내부 resolver 결과가 다를 수 있다. 이 경우 authoritative zone 하나만 보는 것이 아니라 내부 view와 외부 view가 같은 변경을 받았는지 확인해야 한다. VPN이나 사내 DNS가 private zone을 우선한다면 외부 DNS 변경은 해당 사용자에게 영향을 주지 않을 수 있다.\n\n브라우저만 old server를 본다면 DNS answer와 실제 connection owner를 분리한다. DevTools에서 `Remote Address`, `Connection ID`, protocol, Alt-Svc 사용 여부를 확인하고, 브라우저 재시작 또는 socket flush 전후를 비교한다. DNS는 새 IP인데 old connection을 재사용하는 경우에는 DNS cache를 flush해도 즉시 바뀌지 않을 수 있다.\n\n## 장애 중 커뮤니케이션\n\n사용자에게는 `DNS 전파 중`이라고만 말하면 원인이 흐려진다. 더 정확하게는 `일부 resolver 또는 client cache가 이전 응답을 보관 중`, `회사망 DNS view가 외부망과 다름`, `브라우저가 기존 연결을 재사용 중`처럼 관찰된 버킷을 말한다. 운영팀 내부에는 resolver별 답, 실제 접속 서버, 영향 네트워크, 예상 만료 시각을 공유한다.\n",
   "aliases": [
     "DNS 바꿨는데 일부만 옛 서버로 가요",
     "도메인은 같은데 어떤 사람만 이전 서버로 붙어요",
     "배포 후 일부 사용자만 예전 IP를 봐요",
     "DNS 전환했는데 몇 명만 오래된 경로를 타요",
     "같은 URL인데 네트워크마다 다른 서버로 가요",
-    "DNS 바꿨는데 회사 사람만 예전 주소로 가요"
+    "DNS 바꿨는데 회사 사람만 예전 주소로 가요",
+    "some users old IP after DNS change",
+    "회사망만 old server DNS",
+    "dig 새 IP 브라우저 old server",
+    "DNS 변경 일부 사용자 지연",
+    "DoH와 시스템 resolver 차이",
+    "connection reuse old server"
   ],
   "expected_queries": [
     "DNS를 바꿨는데 왜 일부 사용자만 계속 예전 서버로 가요?",
     "배포 후 몇 명만 이전 IP를 보는 상황이면 어디부터 의심해야 해?",
     "브라우저는 새 서버로 가는데 동료는 옛 서버로 가면 DNS 캐시를 어떻게 나눠 봐야 해?",
     "회사 와이파이에서만 이전 경로로 가고 집에서는 정상일 때 무슨 차이를 봐야 해?",
-    "dig 결과와 실제 브라우저 접속 서버가 다를 때 DNS 전파 문제인지 어떻게 판단해?"
+    "dig 결과와 실제 브라우저 접속 서버가 다를 때 DNS 전파 문제인지 어떻게 판단해?",
+    "authoritative는 새 IP인데 회사망 resolver만 old IP를 주면 split horizon인지 cache인지 어떻게 구분해?",
+    "DNS answer는 새 IP인데 브라우저 Remote Address가 old server면 connection reuse와 Alt-Svc를 어떻게 확인해?"
   ],
   "symptoms": [
     "DNS를 바꿨다고 들었는데 어떤 사용자만 계속 이전 서버나 이전 IP로 붙어서 배포가 안 끝난 것처럼 보인다",
@@ -48,8 +56,14 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/dns-변경-후-일부-사용자만-예전-서버로-감-원인-라우터.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch136",
+        "note": "Expanded DNS failover, negative cache, resolver cache, and old-server symptom query surfaces."
+      }
+    ]
   }
 }

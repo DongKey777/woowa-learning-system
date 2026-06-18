@@ -1,0 +1,62 @@
+{
+  "id": "database/spring-batch-no-offset-cursor-restart-checkpoint",
+  "title": "Spring Batch No-Offset Cursor Restart Checkpoint",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "Spring Batch에서 대량 DB row를 읽을 때 offset pagination 대신 stable sort key와 cursor checkpoint로 재시작 위치를 잡는 이유를 설명한다. 실패 후 이어 달리기, 중복/누락 방지, reader state 저장을 DB pagination 관점으로 연결한다.",
+  "body_markdown": "# Spring Batch No-Offset Cursor Restart Checkpoint\n\n## 한 줄 요약\n\n대량 DB batch에서 `OFFSET 100000` 같은 pagination은 느리고, 실행 중 데이터가 변하면 재시작 때 row를 건너뛰거나 중복 처리할 수 있다. 안정적인 정렬 key와 `last_processed_key` cursor checkpoint를 저장하면 실패 후 어디부터 이어갈지 더 명확해진다.\n\n## 왜 Spring Batch에서 cursor가 중요한가\n\nSpring Batch는 긴 작업을 여러 chunk로 나누고, 실패 후 저장된 상태에서 다시 시작할 수 있어야 한다. DB reader가 \"몇 번째 페이지\"만 기억하면 운영 중 insert/delete/update 때문에 그 페이지의 내용이 바뀔 수 있다.\n\n예를 들어 10,000번째 row부터 다시 읽는다고 해도, 앞쪽 row가 삭제되거나 새 row가 끼어들면 실제로 다시 읽는 데이터가 달라진다. 그래서 batch checkpoint는 offset number보다 업무적으로 안정적인 key를 기준으로 잡는 편이 안전하다.\n\n## offset pagination과 cursor checkpoint 차이\n\n| 방식 | 기억하는 것 | 장점 | 위험 |\n|---|---|---|---|\n| Offset pagination | page number, offset | 구현이 쉽다 | 큰 offset에서 느리고, 데이터 변경 시 skip/duplicate 가능 |\n| Cursor pagination | 마지막 처리 key | 이어 읽기가 안정적이다 | stable unique ordering key가 필요 |\n| Snapshot range | 시작/끝 key 범위 | 처리 대상이 고정된다 | 범위 선정과 late row 정책 필요 |\n\nBatch에서는 \"사용자 페이지 보여주기\"보다 \"정확히 한 번 처리한 것처럼 결과를 맞추기\"가 중요하다. 그래서 성능보다 checkpoint 의미가 먼저다.\n\n## 어떤 key가 좋은가\n\n좋은 cursor key 조건은 다음이다.\n\n- unique하거나 tie-breaker와 함께 total order를 만들 수 있다.\n- 처리 중 값이 바뀌지 않는다.\n- index로 range scan이 가능하다.\n- 업무 대상 범위를 표현할 수 있다.\n\n예를 들어 `id`가 증가하는 immutable primary key라면 `WHERE id > :lastId ORDER BY id LIMIT :chunkSize`가 단순하다. 반대로 `updated_at`만 쓰면 같은 timestamp row, 실행 중 update, clock precision 때문에 누락/중복이 생길 수 있어 `updated_at, id` 같은 복합 cursor가 필요할 수 있다.\n\n## 재시작 흐름\n\n```text\n1. reader가 id > lastProcessedId 범위를 읽는다\n2. processor가 item을 변환한다\n3. writer가 chunk를 쓴다\n4. chunk commit이 성공하면 lastProcessedId를 ExecutionContext에 저장한다\n5. 실패 후 restart는 저장된 key 다음부터 읽는다\n```\n\n주의할 점은 checkpoint를 너무 빨리 저장하면 안 된다는 것이다. Writer side effect가 commit되기 전에 last key를 저장하면 실패 후 그 row들을 건너뛸 수 있다. 반대로 writer가 성공했지만 checkpoint 저장 전에 죽으면 같은 chunk를 다시 볼 수 있으므로 writer idempotency가 필요하다.\n\n## 운영 시나리오\n\n쿠폰 만료 batch가 `status = ACTIVE and expires_at < now()` row를 읽는다고 하자. Offset 기반으로 읽으면 batch 실행 중 다른 transaction이 row를 바꾸거나 새 row가 들어와 page 경계가 흔들릴 수 있다.\n\n더 안전한 방식은 실행 시작 시 대상 기준을 고정하고, stable key range로 읽는 것이다.\n\n```sql\nSELECT id, status, expires_at\nFROM coupons\nWHERE id > :last_id\n  AND id <= :upper_bound_id\n  AND status = 'ACTIVE'\n  AND expires_at < :cutoff\nORDER BY id\nLIMIT :chunk_size;\n```\n\n`upper_bound_id`와 `cutoff`를 JobParameter나 ExecutionContext에 남기면 이번 실행의 대상 범위가 더 선명해진다.\n\n## 흔한 오해\n\n- \"Spring Batch가 재시작을 지원하니 reader 위치도 자동으로 안전하다\": reader state와 ordering key를 올바르게 저장해야 한다.\n- \"offset page number만 저장하면 충분하다\": 데이터 변경과 큰 offset 성능 문제를 같이 만든다.\n- \"cursor를 쓰면 중복 처리가 없다\": checkpoint 저장 전후 crash에 따라 같은 chunk를 다시 볼 수 있으므로 writer idempotency가 필요하다.\n- \"created_at으로 정렬하면 항상 안정적이다\": 동일 timestamp와 값 변경 가능성을 확인해야 한다.\n- \"chunk commit 후 key만 저장하면 된다\": writer side effect와 checkpoint 저장 경계를 테스트해야 한다.\n\n## 검증 체크리스트\n\n1. Reader query에 stable order가 있는가?\n2. Cursor key가 unique order를 만드는가?\n3. Cursor column이 처리 중 바뀌지 않는가?\n4. 마지막 처리 key를 ExecutionContext에 저장하는가?\n5. 실패 후 restart 테스트에서 skip/duplicate가 없는가?\n6. Writer가 같은 item을 다시 봐도 idempotent한가?\n7. 큰 데이터에서 range scan index를 타는가?\n8. 실행 시작 시 처리 대상 cutoff나 upper bound가 필요한가?\n\n## 면접 답변 축\n\nSpring Batch DB reader 재시작 질문에는 \"offset page는 위치가 데이터 변경에 취약하고 큰 offset에서 느리므로, stable sort key 기반 cursor와 ExecutionContext checkpoint를 쓴다\"고 답한다. 이어서 chunk commit 경계 이후 last key를 저장하고, crash 타이밍 때문에 writer idempotency를 함께 검증한다고 말하면 된다.\n\n## Safe Next Docs\n\nSpring Batch 기본 구조는 `spring-batch-job-step-reader-processor-writer-beginner-primer`, JobRepository/ExecutionContext 재시작은 `spring-batch-restartability-jobrepository-executioncontext-primer`, offset/seek pagination 차이는 `pagination-offset-vs-seek`로 이어진다.\n",
+  "aliases": [
+    "Spring Batch cursor checkpoint",
+    "batch no offset pagination",
+    "스프링 배치 cursor",
+    "배치 offset 위험",
+    "last processed key",
+    "ExecutionContext cursor",
+    "재시작 checkpoint",
+    "stable sort key",
+    "offset pagination 누락",
+    "배치 이어달리기"
+  ],
+  "expected_queries": [
+    "Spring Batch에서 offset pagination으로 DB row를 읽으면 재시작 때 왜 위험해?",
+    "배치 reader는 마지막 처리 id 같은 cursor를 ExecutionContext에 저장해야 해?",
+    "offset page number 대신 stable sort key checkpoint를 쓰는 이유가 뭐야?",
+    "batch가 실패 후 다시 시작할 때 row가 누락되거나 중복되는 걸 어떻게 막아?",
+    "created_at 기준 cursor로 배치를 돌릴 때 같은 timestamp row는 어떻게 처리해?",
+    "Spring Batch DB reader에서 last_processed_id와 writer idempotency를 같이 봐야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "배치 재시작 후 일부 row가 건너뛰어진다",
+    "offset pagination batch가 데이터가 많아질수록 느려진다",
+    "ExecutionContext에 page number만 저장하고 stable key를 저장하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-batch-job-step-reader-processor-writer-beginner-primer",
+      "spring/spring-batch-restartability-jobrepository-executioncontext-primer",
+      "database/pagination-offset-vs-seek"
+    ],
+    "next_docs": [
+      "spring/batch-chunk-retry-skip",
+      "software-engineering/batch-recovery-runbook",
+      "software-engineering/batch-idempotency-keys"
+    ],
+    "confusable_with": [
+      "spring/spring-batch-restartability-jobrepository-executioncontext-primer",
+      "database/pagination-offset-vs-seek",
+      "software-engineering/batch-partial-failure"
+    ],
+    "forbidden_for_queries": [
+      "Spring Batch JobRepository와 ExecutionContext의 개념 전체를 설명해줘",
+      "사용자 목록 pagination에서 offset과 seek를 비교해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/database/spring-batch-no-offset-cursor-restart-checkpoint.md",
+    "revision_history": []
+  }
+}

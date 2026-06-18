@@ -4,20 +4,24 @@
   "category": "network",
   "level": "advanced",
   "summary": "gRPC streaming에서 HTTP/2 flow control, deadline, cancellation, application backpressure를 함께 해석하는 network primer",
-  "body_markdown": "# gRPC Flow Control Deadline Cancellation Backpressure Primer\n\n## 이 문서가 맡는 질문\ngRPC streaming에서 HTTP/2 flow control, deadline, cancellation, application backpressure를 함께 해석하는 network primer. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\ndeadline exceeded와 cancellation을 먼저 구분한다. stream window, message production rate, consumer drain rate를 본다. retry보다 flow-control stall과 application queue를 먼저 측정한다.\n\n## 실전 시나리오\n서버 streaming API에서 클라이언트가 느려지면 서버 메모리가 늘고 deadline exceeded가 같이 발생한다. 네트워크 timeout으로만 보면 원인이 설명되지 않는다.\n\n## CS 배경\ngRPC는 HTTP/2 stream 위에서 동작하며 connection/window flow control을 가진다. application이 메시지를 만드는 속도와 peer가 window를 갱신하는 속도가 어긋나면 backpressure가 생긴다.\n\n## 핵심 불변식\n- deadline은 호출 수명 상한이고 flow control은 byte 전송 허용량이다\n- cancellation은 application work를 중단시키는 신호로 전파되어야 한다\n- server producer는 outbound window와 application queue를 무시하면 안 된다\n- retry는 idempotency와 deadline budget 안에서만 의미가 있다\n\n## 판단 매트릭스\n- DEADLINE_EXCEEDED면 parent deadline과 per-hop timeout 확인\n- CANCELLED면 client disconnect와 cancellation propagation 확인\n- memory 증가면 outbound queue/window stall 확인\n- slow consumer면 message batch size와 compression을 같이 본다\n\n## 예시\n```text\nserver stream producer -> bounded queue -> HTTP/2 window -> client receive; cancel closes producer\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\ngRPC streaming 장애는 네트워크 timeout 하나로 설명되지 않는다. transport flow control과 application-level queue ownership을 같이 봐야 한다.\n\n## 품질 관점\n품질은 gRPC streaming의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 slow consumer, client cancel, deadline exceeded, retry duplicate를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. message size, compression, window update, queue depth, retry attempts를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. window stall duration, deadline remaining, cancellation propagation lag, queue wait p99가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\nstream_window_stall_ms, deadline_exceeded_rate, cancel_propagation_ms, outbound_queue_depth, message_p99_bytes를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- deadline을 늘리면 backpressure가 해결된다고 생각한다\n- client cancel을 로그만 남기고 producer를 계속 돌린다\n- HTTP/2 flow control과 application queue를 분리해서 보지 않는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## 한 줄 정리\ngRPC streaming은 deadline/cancel과 flow control/backpressure를 하나의 수명 예산으로 묶어야 안전하다.\n",
+  "body_markdown": "# gRPC Flow Control Deadline Cancellation Backpressure Primer\n\n## 이 문서가 맡는 질문\ngRPC streaming 호출이 느려지고 서버 메모리가 늘며 `DEADLINE_EXCEEDED`나 `CANCELLED`가 섞여 보일 때, transport flow control과 application backpressure, deadline budget, cancellation propagation을 한 장의 사고 모델로 묶는다. 핵심은 gRPC를 단순 RPC timeout 문제가 아니라 HTTP/2 stream 위에서 동작하는 수명 관리와 압력 전파 문제로 보는 것이다.\n\n## 기본 모델\ngRPC는 HTTP/2 stream 위에 메시지를 싣는다. HTTP/2에는 connection-level window와 stream-level window가 있고, receiver가 읽고 `WINDOW_UPDATE`를 보내야 sender가 더 보낼 수 있다. application도 별도 queue를 가진다. 서버가 메시지를 만드는 속도, runtime이 serialize/compress하는 속도, HTTP/2 window가 열리는 속도, 클라이언트가 메시지를 소비하는 속도가 어긋나면 backpressure가 생긴다.\n\n## 빠른 분기\n`DEADLINE_EXCEEDED`가 보이면 먼저 caller deadline과 하위 작업의 남은 budget을 확인한다. `CANCELLED`가 보이면 client disconnect, explicit cancel, upstream context cancellation이 서버 작업을 실제로 중단했는지 본다. 메모리가 늘면 outbound queue, per-stream buffered bytes, message size, slow consumer를 본다. throughput은 낮은데 CPU가 낮다면 transport window나 application queue에서 막혔을 가능성이 있다.\n\n## 핵심 불변식\n- deadline은 호출 전체 수명 상한이고, flow control은 byte 전송 허용량이다.\n- cancellation은 로그 이벤트가 아니라 producer, database call, downstream RPC까지 중단되어야 하는 제어 신호다.\n- stream window가 닫혔는데 application producer가 계속 메시지를 만들면 memory backpressure가 application queue에 쌓인다.\n- retry는 남은 deadline, idempotency, stream 재생 가능성 안에서만 의미가 있다.\n- streaming RPC는 한 메시지가 아니라 긴 수명 자원이므로 cleanup, half-close, cancel path를 happy path만큼 테스트해야 한다.\n\n## 실전 시나리오\n서버 streaming API가 주문 상태를 계속 보낸다. 모바일 클라이언트가 느린 네트워크에 들어가면 receive loop가 늦어지고 HTTP/2 window update도 늦어진다. 서버는 계속 이벤트를 읽어 outbound queue에 넣고, queue가 커진 뒤 caller deadline이 지나 `DEADLINE_EXCEEDED`가 난다. 운영자는 timeout을 늘리지만 메모리 증가는 줄지 않는다. 원인은 deadline 값이 아니라 slow consumer를 만났을 때 producer를 멈추거나 drop/coalesce/fail-fast하는 backpressure 정책이 없기 때문이다.\n\n## 상태 코드 해석\n`DEADLINE_EXCEEDED`는 시간이 끝났다는 신호이지만, 어디서 시간을 썼는지는 말하지 않는다. stream open 대기, 서버 queue, downstream call, flow-control stall, client receive 지연을 분리해야 한다. `CANCELLED`는 client가 호출을 취소했거나 connection이 끊겼을 때 흔히 보인다. 서버는 이 신호를 보고 context를 확인한 뒤 더 이상 필요 없는 작업을 멈춰야 한다. `RESOURCE_EXHAUSTED`는 bounded queue나 rate limit이 의도적으로 거절할 때 더 정확한 신호가 될 수 있다.\n\n## 관찰 지표\n`stream_window_stall_ms`, `connection_window_remaining`, `outbound_buffered_bytes`, `application_queue_depth`, `message_p99_bytes`, `deadline_remaining_ms`, `cancel_propagation_ms`, `server_stream_duration`, `slow_consumer_count`를 본다. 한 지표만으로 결론 내리지 않는다. 예를 들어 window stall이 큰데 queue depth도 같이 커지면 transport가 막힌 상태에서 producer가 계속 밀어 넣는 구조다. deadline exceeded rate만 보면 timeout 문제처럼 보이지만, deadline remaining이 stream open 전부터 줄어들었다면 queueing 문제가 먼저다.\n\n## 설계 원칙\nproducer와 transport 사이에는 bounded queue가 있어야 한다. queue가 찼을 때는 무한 대기, drop, 최신값 coalescing, client별 disconnect, backpressure upstream 전파 중 하나를 명시적으로 선택한다. server streaming에서는 client별 속도 차이가 전체 producer를 막지 않도록 fan-out 구조와 per-client buffer 상한을 둔다. bidi streaming에서는 read loop와 write loop가 서로를 막지 않도록 cancellation과 half-close 처리를 분리한다.\n\n## deadline과 retry\ndeadline은 하위 호출에 전파되어야 한다. 서버가 parent deadline을 모르고 내부 DB/RPC에 긴 timeout을 쓰면 client가 이미 떠난 뒤에도 작업이 계속된다. unary retry는 idempotency key와 retryable status가 있을 때만 남은 deadline 안에서 수행한다. streaming retry는 메시지 순서, 중복 처리, resume token이 없으면 단순 재시도로 복구할 수 없다. retry가 flow-control stall을 만나면 같은 느린 consumer에 더 많은 work를 보내는 amplification이 될 수 있다.\n\n## 구현 체크포인트\n서버 handler는 send 호출이 느려질 때 producer가 계속 앞서가지 않도록 해야 한다. cancel callback이나 context done 신호는 queue consumer, event subscription, downstream RPC에 모두 연결한다. per-client buffer 상한과 overflow 정책은 코드에 드러나야 하며, 로그에는 deadline remaining과 queued duration을 남겨 timeout 원인이 flow control인지 application queue인지 구분할 수 있어야 한다.\n\n## 검증 루프\n1. slow consumer를 인위적으로 만들고 window update 지연, outbound queue, memory를 동시에 기록한다.\n2. client cancel을 발생시켜 server producer와 downstream 작업이 몇 ms 안에 멈추는지 측정한다.\n3. deadline을 짧게 두고 queue wait와 actual service time을 분리해 `DEADLINE_EXCEEDED` 원인을 재현한다.\n4. message size와 compression을 바꿔 flow-control stall과 CPU 병목을 구분한다.\n5. bounded queue 정책을 적용한 뒤 p99, dropped/coalesced message 수, memory ceiling을 비교한다.\n\n## 자주 하는 오해\n- deadline을 늘리면 backpressure가 해결된다고 생각한다.\n- `CANCELLED`를 client 문제로만 보고 서버 작업을 계속 돌린다.\n- HTTP/2 flow control과 application queue를 같은 것으로 본다.\n- streaming RPC를 unary retry처럼 다시 호출하면 안전하다고 생각한다.\n- channel이나 connection 수만 늘리면 slow consumer 문제가 사라진다고 기대한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 먼저 상태 코드와 증상을 분리해야 한다. 그 다음 deadline budget, cancellation propagation, HTTP/2 window, application queue ownership을 각각 설명한다. 마지막에는 slow consumer 재현, cancel path 검증, bounded queue 정책, p95/p99와 memory ceiling 관측 계획을 붙인다.\n\n## 한 줄 정리\ngRPC streaming 안정성은 timeout 숫자보다 deadline, cancel, HTTP/2 flow control, application backpressure가 같은 방향으로 압력을 전달하는지로 결정된다.\n",
   "aliases": [
-    "gRPC flow control deadline cancellation backpressure",
-    "HTTP2 stream window slow consumer",
-    "grpc streaming outbound queue deadline exceeded",
-    "gRPC Flow Control Deadline Cancellation Backpressure Primer",
-    "grpc flow control deadline cancellation backpressure primer",
-    "gRPC streaming flow control HTTP2 stream window deadline cancellation slow consumer outbound queue backpressure latency"
+    "gRPC flow control",
+    "grpc 스트리밍 백프레셔",
+    "DEADLINE_EXCEEDED 진단",
+    "CANCELLED 전파",
+    "HTTP2 window stall",
+    "느린 클라이언트 처리",
+    "outbound queue 포화",
+    "stream deadline budget",
+    "slow consumer gRPC"
   ],
   "expected_queries": [
-    "gRPC streaming에서 flow control과 deadline은 어떻게 같이 봐야 해?",
-    "느린 클라이언트 때문에 gRPC 서버 메모리가 늘면 무엇을 봐?",
-    "DEADLINE_EXCEEDED와 CANCELLED를 어떻게 구분해?",
-    "gRPC streaming에서 느린 소비자와 deadline exceeded를 어떻게 진단해?"
+    "gRPC 스트리밍에서 느린 클라이언트 때문에 서버 메모리가 늘면 어디를 봐야 해?",
+    "DEADLINE_EXCEEDED와 CANCELLED를 flow control 관점에서 어떻게 구분해?",
+    "gRPC server streaming에서 backpressure를 application queue까지 어떻게 전파해?",
+    "클라이언트가 cancel했는데 서버 작업이 계속 돌 때 무엇을 확인해야 해?",
+    "HTTP/2 window stall과 deadline 초과가 같이 보이면 어떤 순서로 진단해?"
   ],
   "symptoms": [
     "grpc slow consumer",
@@ -58,7 +62,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +71,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

@@ -1,0 +1,76 @@
+{
+  "id": "language/java-executorservice-threadpool-basics",
+  "title": "Java ExecutorService와 스레드 풀 기초",
+  "category": "language",
+  "level": "beginner",
+  "summary": "ExecutorService는 Runnable/Callable 작업 제출, worker thread 재사용, Future 결과/예외 관찰, shutdown lifecycle을 묶는 Java 동시성 기본 API다. execute와 submit은 결과와 예외를 관찰하는 방식이 다르고, Future.get은 caller를 기다리게 하며, bounded queue와 rejection은 스레드 풀이 감당할 수 있는 부하 한계를 드러내는 신호다.",
+  "body_markdown": "# Java ExecutorService와 스레드 풀 기초\n\n> 한 줄 요약: `ExecutorService`는 작업을 제출하는 코드와 실제 스레드를 만들고 재사용하는 책임을 분리하는 Java 표준 API다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Java 스레드와 동기화 기초](./java-thread-basics.md)\n- [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n- [Executor Sizing Queue Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n- [ForkJoinPool Work-Stealing](./forkjoinpool-work-stealing.md)\n- [CompletableFuture Execution Model and Common Pool Pitfalls](./completablefuture-execution-model-common-pool-pitfalls.md)\n- [MVC Async Executor Boundaries](./mvc-async-executor-boundaries.md)\n\nretrieval-anchor-keywords: Java ExecutorService basics, thread pool basics, execute submit Future shutdown, bounded queue rejection, 스레드 풀, 스레드풀, 작업 제출, 작업제출, Future get block, RejectedExecutionException, mission async job\n\n---\n\n## 핵심 개념\n\n`Thread`가 실행 흐름 하나라면, `ExecutorService`는 작업을 받는 창구와 worker thread 묶음을 함께 관리하는 API다.\n\n초급 단계에서는 이렇게 나누면 된다.\n\n| 구분 | 먼저 볼 질문 |\n|---|---|\n| `Runnable` / `Callable` | 어떤 일을 실행할 것인가 |\n| `execute` / `submit` | 작업을 어떻게 제출할 것인가 |\n| `Future` | 결과, 예외, 취소 상태를 어떻게 볼 것인가 |\n| thread pool | 몇 개의 worker로 작업을 처리할 것인가 |\n| queue / rejection | worker가 바쁠 때 어디까지 기다리고 언제 거절할 것인가 |\n| `shutdown` | 더 이상 작업을 받지 않고 어떻게 종료할 것인가 |\n\n중요한 점은 `ExecutorService`가 thread safety를 자동으로 해결하지 않는다는 것이다. 여러 작업이 같은 객체를 동시에 바꾸면 여전히 race condition이 생길 수 있고, 그때는 `synchronized`, atomic type, 불변 객체 같은 별도 설계가 필요하다.\n\n---\n\n## 왜 new Thread 대신 쓰나\n\n작업마다 `new Thread(task).start()`를 호출하면 작업 수만큼 스레드가 계속 늘 수 있다. 스레드는 생성 비용도 있고, 너무 많아지면 context switching과 메모리 사용량이 커진다.\n\n`ExecutorService`는 이 문제를 다음 방식으로 줄인다.\n\n- worker thread를 미리 만들거나 필요할 때 만들고 재사용한다.\n- 동시에 실행할 작업 수를 제한한다.\n- worker가 바쁠 때 task를 queue에 잠시 보관한다.\n- 더 이상 받을 수 없을 때 rejection policy로 과부하를 드러낸다.\n- 애플리케이션 종료 시점에 `shutdown`으로 정리할 수 있다.\n\n즉 executor는 비동기를 멋있게 쓰는 문법이 아니라, 작업 제출과 thread 자원 관리를 분리하는 도구다.\n\n---\n\n## execute와 submit 차이\n\n두 API 모두 작업을 pool에 넣지만, caller가 결과와 예외를 보는 방식이 다르다.\n\n| API | 받을 수 있는 작업 | 반환값 | 예외를 보는 방식 | 초급 감각 |\n|---|---|---|---|---|\n| `execute` | `Runnable` | 없음 | caller가 `Future`로 받을 수 없다 | 결과가 필요 없는 fire-and-forget에 가깝다 |\n| `submit` | `Runnable`, `Callable` | `Future` | `Future.get()`에서 `ExecutionException`으로 관찰한다 | 결과, 실패, 취소 상태를 나중에 확인할 수 있다 |\n\n예를 들어 값을 계산해야 하면 `Callable`과 `submit`이 자연스럽다.\n\n```java\nExecutorService pool = Executors.newFixedThreadPool(4);\n\nFuture<Integer> future = pool.submit(() -> {\n    return 1 + 2;\n});\n\nInteger result = future.get();\n```\n\n반대로 단순 로그 전송처럼 caller가 결과를 기다리지 않는 작업은 `execute`로도 충분할 수 있다. 다만 fire-and-forget은 실패를 잃어버리기 쉽다. 미션 코드에서 알림 전송, 통계 갱신, 외부 API 호출을 background로 넘겼다면 실패를 어디에 기록하고 어떻게 재시도할지까지 정해야 한다.\n\n---\n\n## Future를 어떻게 읽을까\n\n`Future`는 작업의 현재 상태를 보는 손잡이다.\n\n- `get()`은 작업이 끝날 때까지 caller thread를 기다리게 한다.\n- `get(timeout, unit)`은 정해진 시간만 기다린다.\n- `isDone()`은 완료 여부를 본다.\n- `cancel(true)`는 실행 중인 작업에 interrupt를 시도할 수 있다.\n- `isCancelled()`는 취소 상태를 본다.\n\n여기서 가장 흔한 함정은 `Future.get()`이다. 작업을 background로 제출해 놓고 곧바로 `get()`을 호출하면, 현재 request thread가 결과를 기다리므로 체감상 동기 코드와 비슷해진다.\n\n또 하나의 함정은 cancel이다. `cancel(true)`가 호출됐다고 해서 HTTP 호출, DB query, 긴 loop가 반드시 즉시 멈추는 것은 아니다. 작업 코드가 interrupt를 확인하거나, 사용 중인 client가 취소를 지원해야 실제 자원 회수가 된다.\n\n---\n\n## shutdown은 왜 필요한가\n\n`ExecutorService`는 worker thread를 가진다. 작업을 다 제출했다고 해서 pool이 자동으로 닫히지 않는다. 프로그램이나 테스트가 끝나지 않고 남아 있는 이유가 executor 미종료일 때도 많다.\n\n종료 API는 이렇게 읽는다.\n\n| API | 의미 |\n|---|---|\n| `shutdown()` | 새 작업은 받지 않고, 이미 제출된 작업은 마저 실행한다 |\n| `awaitTermination(...)` | shutdown 이후 종료될 때까지 일정 시간 기다린다 |\n| `shutdownNow()` | 실행 중인 작업에는 interrupt를 시도하고, queue에 남은 작업을 반환한다 |\n\n`shutdownNow()`도 강제 kill 보장이 아니다. interrupt를 무시하는 작업이나 interrupt로 끊기지 않는 blocking I/O는 계속 남을 수 있다. 그래서 운영 코드에서는 종료 정책을 정하고, 테스트 코드에서는 executor를 만든 쪽이 반드시 닫는 습관이 중요하다.\n\n```java\nExecutorService pool = Executors.newFixedThreadPool(4);\ntry {\n    Future<Integer> future = pool.submit(() -> 42);\n    Integer result = future.get();\n} finally {\n    pool.shutdown();\n}\n```\n\n---\n\n## bounded queue와 rejection 직관\n\n스레드 풀을 식당처럼 보면 이해하기 쉽다.\n\n- worker thread는 앉아서 일을 처리하는 좌석이다.\n- queue는 좌석이 찰 때 기다리는 줄이다.\n- bounded queue는 기다리는 줄의 최대 길이를 정한다.\n- rejection은 좌석도 줄도 꽉 찼을 때 새 손님을 더 받지 않는 신호다.\n\n`ThreadPoolExecutor`는 보통 `corePoolSize`, `maximumPoolSize`, `BlockingQueue`, `RejectedExecutionHandler`를 함께 본다.\n\n```java\nExecutorService pool = new ThreadPoolExecutor(\n    4,\n    8,\n    30,\n    TimeUnit.SECONDS,\n    new ArrayBlockingQueue<>(100),\n    new ThreadPoolExecutor.AbortPolicy()\n);\n```\n\n초급 직관은 이렇다.\n\n1. worker 여유가 있으면 바로 실행한다.\n2. worker가 바쁘면 queue에서 기다린다.\n3. queue도 꽉 차고 더 늘릴 worker도 없으면 reject한다.\n\n`RejectedExecutionException`은 단순한 이상한 에러가 아니라, 이 executor가 지금 더 받을 수 없다는 과부하 신호다. `AbortPolicy`는 빠르게 실패를 드러내고, `CallerRunsPolicy`는 제출한 thread가 직접 실행하게 해서 caller를 느리게 만드는 backpressure 역할을 할 수 있다.\n\n반대로 무제한 queue는 에러가 덜 나는 것처럼 보이지만, 장애 상황에서 latency와 메모리 사용량을 뒤로 쌓아 둔다. 그래서 미션이나 실무에서는 에러를 없애려고 queue를 무한대로 키우기보다, 어느 정도까지 기다릴지와 넘쳤을 때 어떻게 실패할지를 먼저 정해야 한다.\n\n---\n\n## 미션 코드에서 연결하기\n\n우테코 미션 코드에서는 처음부터 복잡한 executor 튜닝을 할 필요는 없다. 대신 아래 질문을 먼저 잡으면 좋다.\n\n- 이 작업은 정말 request 응답 전에 끝나야 하나?\n- background로 넘기면 실패를 어디에서 관찰하나?\n- 테스트는 background 작업 완료를 어떻게 기다리나?\n- 애플리케이션 종료 시 executor는 누가 닫나?\n- 요청이 몰렸을 때 queue가 쌓이는지, reject되는지, caller가 느려지는지 정했나?\n\n예를 들어 예약 생성 뒤 알림 전송, 외부 API 호출, 통계 갱신을 별도 작업으로 보낼 수 있다. 하지만 예약 저장 자체처럼 도메인 결과를 결정하는 작업을 background로 숨기면 controller는 성공을 반환했는데 실제 작업은 실패하는 이상한 상태가 될 수 있다.\n\nSpring을 쓰는 미션이라면 직접 `new Thread`를 만들기보다 Spring이 관리하는 `TaskExecutor`, `@Async`, 또는 명시적으로 등록한 `ExecutorService`를 검토한다. 그래도 핵심은 같다. pool 크기, queue, rejection, shutdown, 실패 관찰 지점을 정해야 한다.\n\n---\n\n## 흔한 오해와 함정\n\n| 오해 | 더 정확한 설명 |\n|---|---|\n| `ExecutorService`를 쓰면 thread safety가 자동으로 해결된다 | 작업 실행만 관리한다. 공유 데이터 보호는 별도다 |\n| `execute`와 `submit`은 이름만 다르다 | `submit`은 `Future`로 결과와 예외를 관찰할 수 있다 |\n| `Future.get()`을 호출해도 비동기 장점은 그대로다 | caller가 기다리므로 request path에서는 병목이 될 수 있다 |\n| `cancel(true)`면 작업이 즉시 죽는다 | interrupt 시도일 뿐이고 작업이 협력해야 멈춘다 |\n| queue를 크게 잡으면 안정적이다 | 과부하를 latency와 memory pressure로 숨길 수 있다 |\n| rejection은 무조건 없애야 하는 에러다 | capacity 초과를 드러내는 정상적인 부하 제어 신호일 수 있다 |\n\n---\n\n## 더 깊이 가려면\n\n| 지금 궁금한 것 | 다음 문서 |\n|---|---|\n| Java 동시성 유틸리티 전체 지도를 보고 싶다 | [Java 동시성 유틸리티](./java-concurrency-utilities.md) |\n| pool 크기, queue, rejection policy를 운영 관점으로 보고 싶다 | [Executor Sizing Queue Rejection Policy](./executor-sizing-queue-rejection-policy.md) |\n| `CompletableFuture`가 어떤 executor에서 실행되는지 보고 싶다 | [CompletableFuture Execution Model and Common Pool Pitfalls](./completablefuture-execution-model-common-pool-pitfalls.md) |\n| work-stealing과 commonPool의 차이를 보고 싶다 | [ForkJoinPool Work-Stealing](./forkjoinpool-work-stealing.md) |\n| Spring MVC async executor 경계까지 이어 보고 싶다 | [MVC Async Executor Boundaries](./mvc-async-executor-boundaries.md) |\n\n## 한 줄 정리\n\n`ExecutorService`는 작업 제출, thread pool, `Future`, shutdown을 한 묶음으로 다루는 입문 관문이다. `execute`와 `submit`의 관찰 차이, `Future.get()`의 blocking, bounded queue와 rejection의 의미를 먼저 잡으면 고급 executor 튜닝 문서로 넘어갈 준비가 된다.\n",
+  "aliases": [
+    "Java ExecutorService",
+    "ExecutorService basics",
+    "ExecutorService 기초",
+    "자바 ExecutorService",
+    "Java thread pool basics",
+    "자바 스레드 풀",
+    "자바 스레드풀",
+    "스레드 풀 기초",
+    "스레드풀 기초",
+    "작업 제출",
+    "작업제출",
+    "Future shutdown rejection"
+  ],
+  "expected_queries": [
+    "ExecutorService가 뭐고 new Thread랑 뭐가 달라?",
+    "execute랑 submit 차이를 Future랑 예외 처리 기준으로 설명해줘",
+    "Future.get은 언제 block되고 cancel true는 작업을 바로 멈춰?",
+    "ExecutorService shutdown은 왜 해야 하고 shutdownNow랑 뭐가 달라?",
+    "스레드 풀 queue가 꽉 차면 RejectedExecutionException이 나는 흐름을 쉽게 설명해줘",
+    "미션에서 알림이나 외부 API 작업을 스레드 풀로 분리할 때 뭘 조심해야 해?"
+  ],
+  "symptoms": [
+    "요청이나 작업마다 new Thread를 만들면 왜 위험한지 설명하지 못한다.",
+    "execute와 submit을 같은 작업 제출 API로만 보고 Future 결과와 예외 관찰 차이를 놓친다.",
+    "Future.get을 바로 호출해서 비동기 작업을 사실상 동기 병목으로 만든다.",
+    "ExecutorService를 만들고 shutdown하지 않아 테스트나 애플리케이션이 종료되지 않는 원인을 놓친다.",
+    "무제한 queue가 과부하를 해결하는 것이 아니라 latency와 memory pressure를 쌓을 수 있다는 점을 모른다.",
+    "RejectedExecutionException을 단순 버그로만 보고 pool saturation과 backpressure 신호로 읽지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-thread-basics"
+    ],
+    "next_docs": [
+      "language/java-concurrency-utilities",
+      "language/executor-sizing-queue-rejection-policy",
+      "language/forkjoinpool-work-stealing",
+      "language/completablefuture-execution-model-common-pool-pitfalls",
+      "language/mvc-async-executor-boundaries"
+    ],
+    "confusable_with": [
+      "language/java-concurrency-utilities",
+      "language/executor-sizing-queue-rejection-policy",
+      "language/completablefuture-execution-model-common-pool-pitfalls",
+      "language/forkjoinpool-work-stealing",
+      "language/mvc-async-executor-boundaries",
+      "language/completablefuture-thread-pool-timeout-bridge"
+    ],
+    "forbidden_for_queries": [
+      "ThreadPoolExecutor corePoolSize maximumPoolSize queue capacity를 운영 지표로 튜닝하는 법을 알고 싶어",
+      "CompletableFuture commonPool blocking starvation과 thenApplyAsync 실행 모델을 자세히 설명해줘",
+      "ForkJoinPool work stealing deque와 ManagedBlocker를 깊게 설명해줘",
+      "Spring MVC Callable StreamingResponseBody SseEmitter executor boundary가 궁금해"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch49-stream-a-foundation"
+      }
+    ]
+  }
+}

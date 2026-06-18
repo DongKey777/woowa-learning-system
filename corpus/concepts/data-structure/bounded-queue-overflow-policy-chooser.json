@@ -6,15 +6,21 @@
   "summary": "이 chooser는 bounded queue overflow 정책을 drop, block, reject, shed load 기준으로 고른다. 큐 무한 증가, timeout, backpressure, thread pool saturation 같은 질문을 다룬다.",
   "body_markdown": "# Bounded Queue Overflow Policy Chooser\n\n## 10초 chooser\n\n| 정책 | 쓸 때 | 위험 |\n|---|---|---|\n| block | 생산자가 기다릴 수 있고 backpressure가 안전함 | upstream thread 고갈, event loop 정지 |\n| reject/fail fast | caller가 실패를 처리할 수 있음 | retry storm, 사용자 오류 증가 |\n| drop newest | 오래된 작업 보존이 중요함 | 최신 요청 손실 |\n| drop oldest | 최신성, telemetry, sampling이 중요함 | 아직 처리 안 된 중요한 작업 손실 |\n| coalesce/deduplicate | 같은 key의 최신 상태만 필요함 | 중간 이벤트 의미가 사라짐 |\n\n## 문제 선택 기준\n\nBounded queue 설계는 \"가득 찼을 때 무엇을 희생할지\"를 정하는 일이다. 손실이 절대 안 되는 결제/정산 이벤트라면 drop은 위험하고, block이나 reject 후 재시도/내구성 있는 저장소를 봐야 한다. 최신 상태만 중요하면 drop oldest나 key별 coalesce가 더 낫다.\n\nQueue size는 단순 용량이 아니라 장애를 얼마나 늦게 드러낼지 정하는 정책이다. 무한 큐는 일시적인 안정감 대신 메모리 OOM과 긴 tail latency를 만든다. bounded queue는 시스템이 포화됐다는 사실을 빠르게 드러내기 위한 장치다.\n\n## 핵심 invariant\n\nBounded queue invariant는 \"메모리 사용량이 capacity에 의해 제한되고, overflow 시 동작이 명시적이다\"이다. enqueue는 성공, 대기, 거절, drop 중 하나로 관찰 가능해야 한다. 조용히 버리면 데이터 손실을 운영 지표로도 발견하지 못한다.\n\n정책 invariant도 필요하다. block은 생산 속도를 소비 속도에 맞춘다. reject는 caller에게 즉시 실패를 돌려준다. drop oldest는 최신성을 보존하고, drop newest는 이미 대기 중인 작업을 보존한다. 이 보장이 도메인 요구와 맞아야 한다.\n\n## Wrong-bucket neighbor\n\nOverflow 정책만 고쳐서 처리량 부족이 해결되지는 않는다. consumer 처리 시간, downstream 병목, retry 정책을 같이 봐야 한다.\n\nQueue가 꽉 찼을 때 reject를 선택했는데 caller가 즉시 무한 retry하면 부하가 더 커진다. reject에는 retry budget, backoff, idempotency key 같은 주변 정책이 같이 필요하다.\n\n## 반례로 확인\n\ndrop oldest 반례: 결제 승인 이벤트 queue에서 오래된 이벤트를 버리면 장부가 맞지 않는다. 최신성보다 정확성이 중요한 domain에서는 drop 정책이 invariant를 깨뜨린다.\n\nblock 반례: 단일 event loop thread에서 enqueue가 block되면 consumer도 같은 loop에서 실행되지 못해 교착에 가까운 정지가 생길 수 있다. 기다릴 수 있는 producer인지 먼저 확인해야 한다.\n\nunbounded 반례: consumer가 초당 100개 처리하고 producer가 초당 1000개 넣으면 큐 길이는 계속 증가한다. 에러는 늦게 나타나지만, 그때는 이미 latency와 메모리가 회복하기 어려울 수 있다.\n\n## 복잡도\n\n일반 circular bounded queue의 enqueue/dequeue는 `O(1)`이고 메모리는 `O(capacity)`다. drop oldest/newest도 보통 `O(1)`이다. priority 기반 overflow나 key별 coalesce를 넣으면 heap/hash map 때문에 `O(log n)` 또는 `O(1)` 평균 비용이 추가될 수 있다.\n\n## 흔한 실수\n\n- \"나중에 처리하면 된다\"며 unbounded queue를 둔다.\n- drop을 silent로 처리해 손실 개수, drop reason, queue depth metric이 없다.\n- 중요한 이벤트와 샘플링 가능한 이벤트를 같은 queue policy에 넣는다.\n- block이 thread pool 전체를 붙잡아 consumer 실행 기회까지 줄인다.\n- reject 후 caller retry 정책을 설계하지 않아 retry storm을 만든다.\n- capacity를 throughput 계산 없이 감으로 잡고 saturation test를 하지 않는다.\n\n## 최소 drill\n\n1. 최신 주가 tick 처리와 결제 이벤트 처리에 각각 drop oldest, block, reject 중 어떤 정책이 맞는지 고른다.\n2. `producer=1000/s`, `consumer=100/s`이면 unbounded queue 길이가 10초 뒤 얼마나 늘어나는지 계산한다.\n3. reject 정책을 고를 때 caller 쪽에 반드시 있어야 할 retry/backoff 조건을 한 문장으로 적는다.\n\n## Java API로 보는 정책별 동작\n\nJava 표준 라이브러리는 overflow 정책을 API 수준에서 명확하게 드러낸다. `ArrayBlockingQueue`를 예로 들면 같은 큐에 넣는 방식이 달라지면 동작이 완전히 달라진다.\n\n```java\nArrayBlockingQueue<String> queue = new ArrayBlockingQueue<>(3); // capacity = 3\n\n// --- block 정책 ---\n// 큐가 가득 찼을 때 자리가 날 때까지 생산자 스레드를 블로킹한다.\n// backpressure가 upstream으로 자연스럽게 전파된다.\nqueue.put(\"task\");   // InterruptedException 선언 필요; 자리 날 때까지 대기\n\n// --- reject 정책 ---\n// 큐가 가득 찼을 때 즉시 false를 반환하거나 예외를 던진다. caller가 직접 처리해야 한다.\nboolean accepted = queue.offer(\"task\");          // false 반환, 대기 없음\nqueue.add(\"task\");                               // IllegalStateException 던짐\n\n// --- 시간 제한 block (중간 지점) ---\n// 지정한 시간 안에 자리가 나면 넣고, 못 나면 false 반환\nboolean ok = queue.offer(\"task\", 100, TimeUnit.MILLISECONDS);\n```\n\n**ThreadPoolExecutor의 네 가지 RejectedExecutionHandler** — 스레드 풀 큐가 꽉 찼을 때 어떻게 반응할지 정책을 직접 주입할 수 있다.\n\n```java\n// 1. AbortPolicy (기본값) — reject / fail fast\n//    작업을 거절하고 RejectedExecutionException을 던진다.\n//    caller가 예외를 받아 재시도/로깅/회로 차단기를 붙여야 한다.\nnew ThreadPoolExecutor(corePoolSize, maxPoolSize, 60L, TimeUnit.SECONDS,\n    new ArrayBlockingQueue<>(100),\n    new ThreadPoolExecutor.AbortPolicy());\n\n// 2. CallerRunsPolicy — block과 유사한 backpressure 효과\n//    submit한 스레드가 직접 그 작업을 실행한다. 새 작업을 넣는 속도 자체가 줄어든다.\n//    이벤트 루프 스레드에서 호출하면 루프 전체가 멈추므로 주의.\nnew ThreadPoolExecutor.CallerRunsPolicy()\n\n// 3. DiscardPolicy — drop newest (조용한 버림)\n//    새로 들어온 작업을 아무 알림 없이 버린다.\n//    메트릭 없이 쓰면 손실을 절대 발견할 수 없다.\nnew ThreadPoolExecutor.DiscardPolicy()\n\n// 4. DiscardOldestPolicy — drop oldest\n//    큐 맨 앞(가장 오래 기다린) 작업을 버리고 새 작업을 넣으려 시도한다.\n//    최신성이 중요한 telemetry/샘플링에 맞는 정책이다.\nnew ThreadPoolExecutor.DiscardOldestPolicy()\n```\n\n**정책 선택 비교표**\n\n| 정책 | Java API | 손실 대상 | 맞는 도메인 | 주의사항 |\n|---|---|---|---|---|\n| block | `put()` / `CallerRunsPolicy` | 없음 (대기) | 결제·정산 이벤트, 순서 중요 작업 | 생산자 스레드 고갈, event loop 금지 |\n| reject (fail fast) | `offer()` / `AbortPolicy` | 새 요청 | API 호출, 사용자가 실패를 볼 수 있는 경로 | caller 쪽 retry + backoff 필수 |\n| drop newest | `DiscardPolicy` | 새 작업 | 로그 샘플링, 비중요 배경 작업 | 메트릭 없으면 손실 불투명 |\n| drop oldest | `DiscardOldestPolicy` | 오래된 작업 | 주가 tick, IoT 센서 최신값 | 완료되지 않은 중요 작업이 큐에 있을 때 위험 |\n\n**CallerRunsPolicy의 backpressure 메커니즘** — submit 스레드가 직접 실행하므로 그동안 새 작업을 submit하지 못한다. 자연스럽게 생산 속도가 소비 속도에 맞춰진다. 단, HTTP 요청 스레드에서 호출하면 그 요청의 응답 지연이 늘어나고, Netty나 Vert.x 같은 단일 event loop에서 호출하면 루프 자체가 멈출 수 있다.\n\n## 스스로 점검\n\n1. `DiscardPolicy`(drop newest)를 쓰기로 했다면, 손실을 운영 중에 눈치채려면 어떤 메트릭이나 로그를 어디에 붙여야 할까?\n2. `CallerRunsPolicy`가 backpressure를 만드는 원리는 이해했는데, 이 정책을 써서 오히려 시스템이 더 느려지거나 불안정해지는 상황은 어떤 경우일까?\n\n## Safe Next Docs\n\nthread pool backpressure saturation playbook으로 운영 지표를 연결한다.\n",
   "aliases": [
-    "bounded queue overflow policy chooser",
-    "drop block reject queue policy",
-    "bounded queue overflow 정책",
-    "큐가 꽉 찼을 때 선택"
+    "큐 포화 정책 선택",
+    "bounded queue backpressure",
+    "큐 overflow 처리",
+    "drop block reject 비교",
+    "가득 찬 큐 대응",
+    "제한 큐 손실 정책",
+    "thread pool reject policy",
+    "생산자 소비자 속도 조절"
   ],
   "expected_queries": [
-    "bounded queue가 꽉 차면 drop block reject 중 뭘 골라야 해?",
-    "큐 크기를 무한으로 두면 왜 위험해?",
-    "backpressure를 자료구조 정책으로 어떻게 표현해?"
+    "큐가 꽉 찼을 때 기다리기와 거절 중 무엇을 골라야 해?",
+    "무한 큐를 쓰면 왜 장애가 늦게 드러나?",
+    "drop oldest와 drop newest는 어떤 상황에서 달라?",
+    "CallerRunsPolicy가 backpressure를 만드는 이유가 뭐야?",
+    "중요한 이벤트 큐에서 drop 정책을 피해야 하는 이유는 뭐야?"
   ],
   "symptoms": [
     "큐가 계속 커져서 메모리가 터져요",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-31",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/data-structure/bounded-queue-overflow-policy-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

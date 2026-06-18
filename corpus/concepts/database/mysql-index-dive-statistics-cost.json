@@ -1,0 +1,65 @@
+{
+  "id": "database/mysql-index-dive-statistics-cost",
+  "title": "MySQL Index Dive Statistics Cost",
+  "category": "database",
+  "level": "advanced",
+  "summary": "MySQL optimizer가 IN 조건이나 여러 equality range의 row 수를 추정할 때 index dive와 index statistics 중 무엇을 쓰는지 이해해야, 인덱스가 있는데도 plan이 흔들리는 이유를 설명할 수 있다.",
+  "body_markdown": "# MySQL Index Dive Statistics Cost\n\n> 한 줄 요약: MySQL index dive는 인덱스 경계로 직접 내려가 row 수를 더 구체적으로 추정하는 방식이고, index statistics는 저장된 통계로 더 싸게 추정하는 방식이다. 둘 사이의 선택은 IN 목록, 통계 신선도, optimizer 비용 판단을 흔든다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Query Optimizer Statistics Interview Deep Dive](./query-optimizer-statistics-interview-deep-dive.md)\n- [Index Selectivity Cardinality Interview Primer](./index-selectivity-cardinality-interview-primer.md)\n- [EXPLAIN Execution Plan Reading Intermediate Primer](./explain-execution-plan-reading-intermediate-primer.md)\n- [Statistics, Histograms, and Cardinality Estimation](./statistics-histograms-cardinality-estimation.md)\n- [MySQL Optimizer Hints and Index Merge](./mysql-optimizer-hints-index-merge.md)\n\nretrieval-anchor-keywords: MySQL index dive, eq_range_index_dive_limit, equality range estimate, IN list optimizer estimate, index statistics vs index dive, ANALYZE TABLE statistics, optimizer cost misestimate, MySQL range optimizer\n\n---\n\n## 먼저 잡을 구분\n\n초보자는 EXPLAIN에서 key가 잡혔는지만 본다. 하지만 운영에서 더 자주 만나는 질문은 이것이다.\n\n```text\n인덱스는 있는데 왜 이번에는 full scan을 골랐지?\nIN 조건 id가 많아지니 왜 plan이 바뀌지?\n통계 갱신 후 왜 갑자기 다른 index를 타지?\n```\n\n이때 optimizer는 실제 후보 plan을 모두 실행해 보고 고르지 않는다. 실행 전 추정 row 수와 비용으로 고른다. MySQL range optimizer가 여러 equality range, 예를 들어 `col IN (...)` 같은 조건을 만나면 row 수를 추정해야 한다. 이때 큰 축이 두 가지다.\n\n| 방식 | 의미 | 장점 | 위험 |\n|---|---|---|---|\n| index dive | 인덱스 B+Tree 경계로 내려가 특정 key range 근처를 직접 살핀다 | 특정 값의 분포를 더 잘 반영할 수 있다 | 값이 많으면 optimizer 단계 비용이 커진다 |\n| index statistics | 저장된 cardinality/statistics 요약을 사용한다 | 빠르고 값이 많아도 싸다 | skew, stale stats, correlation을 놓칠 수 있다 |\n\n공식 MySQL 문서의 핵심도 이 구분이다. `eq_range_index_dive_limit`가 0보다 크면 equality range 개수가 threshold 이상일 때 index dive 대신 기존 index statistics를 사용할 수 있다. 0으로 두면 N과 무관하게 index dive를 쓰도록 만들 수 있지만, 이것을 무조건 성능 튜닝 답으로 외우면 안 된다. optimizer 단계 비용과 실행 plan 안정성을 같이 봐야 한다.\n\n---\n\n## worked example: 큰 IN 목록\n\n예약 목록 API가 특정 사용자들의 최근 예약을 한 번에 조회한다고 하자.\n\n```sql\nSELECT id, user_id, status, created_at\nFROM reservation\nWHERE user_id IN (?, ?, ?, ?, ... 500개)\n  AND status = ?\nORDER BY created_at DESC\nLIMIT 100;\n```\n\n후보 인덱스가 둘 있다고 하자.\n\n```text\nidx_user_status_created(user_id, status, created_at)\nidx_status_created(status, created_at)\n```\n\nIN 값이 몇 개 안 되면 optimizer는 각 user_id range를 비교적 구체적으로 추정해 `idx_user_status_created`가 싸다고 볼 수 있다. 그런데 IN 값이 수백 개로 늘면 equality range가 많아지고, index dive를 전부 수행하는 비용도 커진다. 설정과 버전에 따라 저장된 statistics 기반 추정으로 넘어갈 수 있다.\n\n문제는 statistics가 평균 분포를 강하게 반영한다는 점이다. 특정 user_id 몇 개가 예약을 압도적으로 많이 가진 hot user라면 평균 cardinality로는 실제 row 수를 놓칠 수 있다. 반대로 IN 목록 대부분이 cold user라면 너무 크게 추정할 수도 있다. 이 오차가 커지면 optimizer는 더 넓은 index를 택하거나, 정렬 비용이 큰 plan을 택하거나, 실행 때 실제 rows가 예상과 크게 어긋나는 plan을 고른다.\n\n---\n\n## EXPLAIN에서 보는 순서\n\nindex dive 자체가 EXPLAIN에 친절하게 한 줄로 찍히는 것은 아니다. 그래서 아래 증거를 조합한다.\n\n| 증거 | 보는 이유 |\n|---|---|\n| `type=range`, `key`, `rows`, `filtered` | optimizer가 어떤 range access와 row 수를 믿었는지 본다 |\n| `EXPLAIN ANALYZE` actual rows/time | estimate와 실제 row 수 차이를 본다 |\n| IN 목록 개수와 값 분포 | equality range 수와 skew 가능성을 본다 |\n| `SHOW INDEX` cardinality, histogram, ANALYZE 시점 | statistics가 낡았거나 평균에 치우쳤는지 본다 |\n| slow query bind 값 | 특정 값만 느린 parameter-sensitive plan인지 본다 |\n| optimizer trace | 가능하면 range 후보 비용 비교를 더 자세히 본다 |\n\n면접 답변에서는 `rows` 숫자 하나만 외우면 약하다. 핵심은 estimated rows가 어디서 왔고, actual rows와 얼마나 어긋났는지를 묻는 것이다.\n\n---\n\n## `eq_range_index_dive_limit`를 어떻게 말할까\n\n이 변수는 튜닝 마법 버튼이 아니라 optimizer의 추정 비용과 정확도 사이의 균형점이다.\n\n- 값이 0보다 크면, equality range 개수가 threshold 이상일 때 index dive 대신 index statistics를 사용할 수 있다.\n- N개 equality range까지 index dive를 허용하려면 문서 기준으로 값을 N+1처럼 잡는 식으로 설명된다.\n- 0은 statistics 사용을 비활성화하고 N과 관계없이 index dive를 사용하게 하는 의미로 문서화되어 있다.\n- 하지만 운영에서 0을 바로 권장하면 위험하다. optimizer 시간이 늘고, workload 전체에서 이득인지 모른다.\n\n따라서 답변은 이렇게 닫는 게 안전하다.\n\n```text\n이 변수는 plan 원인을 설명하는 관찰 축이지, 첫 번째 해결책이 아니다.\n먼저 estimate/actual 차이, 통계 신선도, histogram, query shape, index 설계를 본다.\n```\n\n---\n\n## 해결 후보를 고르는 순서\n\n| 상황 | 먼저 할 일 | 그 다음 |\n|---|---|---|\n| 통계가 낡았다 | `ANALYZE TABLE`로 statistics 갱신 검토 | plan diff와 회귀 모니터링 |\n| 특정 값 skew가 크다 | histogram 또는 query 분리 검토 | tenant/hot key isolation |\n| IN 목록이 과하게 크다 | batch 분할, temp table join, query shape 변경 검토 | application paging 전략 점검 |\n| composite index 축이 맞지 않는다 | equality/range/order by 순서 재검토 | covering 여부와 write cost 비교 |\n| plan drift가 위험하다 | invisible index, optimizer switch, hint는 제한적으로 실험 | rollout과 rollback 기준 마련 |\n\n힌트나 global variable 변경은 마지막이다. 실무에서는 특정 쿼리 하나를 살리려고 전체 workload의 optimizer 추정 방식을 바꾸면 다른 쿼리 회귀가 날 수 있다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| index dive는 항상 좋은 것이다 | 값이 많으면 optimizer 단계 비용이 커질 수 있다 |\n| statistics는 부정확하니 버려야 한다 | 빠른 추정에는 필요하고, 문제는 stale/skew/correlation이다 |\n| `eq_range_index_dive_limit=0`이면 모든 쿼리가 빨라진다 | 더 정확한 추정 가능성과 optimizer 비용 증가를 같이 본다 |\n| EXPLAIN key만 보면 된다 | estimated rows와 actual rows 차이가 핵심이다 |\n| IN 목록이 많아도 같은 인덱스를 항상 탄다 | equality range 수, 값 분포, cost model에 따라 plan이 바뀔 수 있다 |\n\n---\n\n## 미션/면접 답변 골격\n\n질문이 `IN 조건이 커지면 MySQL plan이 왜 바뀌나요?`라면 이렇게 답한다.\n\n1. MySQL optimizer는 실행 전에 row 수와 비용을 추정해 plan을 고른다.\n2. 여러 equality range에서는 특정 key range를 직접 보는 index dive와 저장된 index statistics 기반 추정 사이의 선택이 있다.\n3. IN 값이 많아지면 index dive 비용이 커지고, 설정에 따라 statistics 기반 추정으로 넘어갈 수 있다.\n4. statistics가 stale이거나 skew를 못 담으면 estimated rows가 실제와 크게 어긋난다.\n5. 그래서 EXPLAIN의 estimated rows와 EXPLAIN ANALYZE actual rows, 통계 최신성, histogram, IN 값 분포, composite index 순서를 같이 본다.\n6. 변수나 hint는 원인 확인 후 제한적으로 실험한다.\n\n---\n\n## 꼬리질문\n\n> Q: index dive와 index statistics는 무엇이 다른가요?\n> 의도: 추정의 정확도와 비용 trade-off를 구분하는지 확인\n> 핵심: index dive는 특정 range를 더 직접 살피고, statistics는 저장된 요약으로 빠르게 추정한다.\n\n> Q: IN 목록이 커질 때 왜 plan이 바뀔 수 있나요?\n> 의도: equality range 수와 optimizer 비용을 연결하는지 확인\n> 핵심: range가 많아지면 dive 비용과 statistics 전환, row estimate 오차가 plan 선택을 흔든다.\n\n> Q: `eq_range_index_dive_limit=0`을 바로 권해도 되나요?\n> 의도: 튜닝 knob 남용을 막는지 확인\n> 핵심: workload 전체 비용과 회귀를 봐야 하며, 먼저 estimate/actual과 통계 문제를 검증한다.\n\n## 한 줄 정리\n\nMySQL index dive 이슈는 인덱스 존재 여부가 아니라 optimizer가 row 수를 어떻게 추정했는지의 문제이며, 큰 IN 목록과 skew에서는 estimated rows와 actual rows를 비교하는 습관이 출발점이다.\n",
+  "aliases": [
+    "MySQL index dive",
+    "인덱스 다이브",
+    "eq_range_index_dive_limit",
+    "IN 조건 plan 변경",
+    "MySQL range optimizer",
+    "index statistics cost",
+    "옵티마이저 row 추정",
+    "MySQL 통계 추정",
+    "큰 IN절 실행계획",
+    "index dive vs statistics"
+  ],
+  "expected_queries": [
+    "MySQL에서 IN 조건 값이 많아지면 왜 갑자기 다른 인덱스를 타거나 full scan으로 바뀔 수 있어?",
+    "eq_range_index_dive_limit가 index dive랑 statistics 선택에 어떤 영향을 주는지 쉽게 설명해줘",
+    "EXPLAIN rows 추정은 낮은데 실제 실행은 훨씬 많이 읽을 때 MySQL optimizer가 뭘 잘못 본 거야?",
+    "인덱스가 있는데 MySQL이 안 쓰는 이유를 index dive, 통계, cardinality 관점으로 설명해줘",
+    "큰 IN절 조회가 느려졌을 때 ANALYZE TABLE, histogram, query split 중 무엇을 먼저 봐야 해?",
+    "MySQL optimizer trace를 보기 전에 EXPLAIN estimated rows와 actual rows를 어떻게 비교해야 해?"
+  ],
+  "symptoms": [
+    "IN 목록이 커진 뒤 같은 SQL의 실행 계획이 바뀐다",
+    "EXPLAIN rows 추정과 실제 rows가 크게 어긋난다",
+    "ANALYZE TABLE 이후 특정 쿼리 plan이 바뀐다",
+    "인덱스가 있는데 optimizer가 더 넓은 scan을 고른다"
+  ],
+  "learner_query_patterns": [],
+  "relations": {
+    "prerequisites": [
+      "database/query-optimizer-statistics-interview-deep-dive",
+      "database/index-selectivity-cardinality-interview-primer",
+      "database/explain-execution-plan-reading-intermediate-primer"
+    ],
+    "next_docs": [
+      "database/mysql-optimizer-hints-index-merge",
+      "database/optimizer-switch-plan-stability-invisible-indexes",
+      "database/join-order-cardinality-misestimation-plan-regression-playbook"
+    ],
+    "confusable_with": [
+      "database/statistics-histograms-cardinality-estimation",
+      "database/mysql-optimizer-hints-index-merge",
+      "database/index-cardinality-query-plan-perspective-map"
+    ],
+    "forbidden_for_queries": [
+      "PostgreSQL extended statistics로 column correlation을 잡는 방법을 설명해줘",
+      "MySQL optimizer hint FORCE INDEX와 invisible index rollout을 비교해줘"
+    ]
+  },
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18T00:00:00+09:00",
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "version": 1,
+    "source": "y14-expansion-batch93-stream-a-db-execution",
+    "legacy_path": "knowledge/cs/contents/database/mysql-index-dive-statistics-cost.md",
+    "last_modified": "2026-06-18T00:00:00+09:00"
+  }
+}

@@ -4,17 +4,26 @@
   "category": "system-design",
   "level": "intermediate",
   "summary": "이 primer는 full-text search inverted index를 면접 답변으로 설명한다. token, posting list, analyzer, ranking을 다룬다.",
-  "body_markdown": "# Search Inverted Index Interview Primer\n\n## 한 줄 요약\n\nInverted index는 term에서 그 term을 포함한 document 목록(posting list)으로 가는 색인이다. 문서에서 term을 찾는 것이 아니라 term으로 문서를 찾는다.\n\n## 미션 진입 증상\n\n학습자가 \"검색도 DB index랑 같은 거 아닌가요?\"라고 묻는다면 B-Tree index와 역색인(inverted index)을 분리한다. `LIKE '%keyword%'`는 앞쪽 wildcard 때문에 일반 B-Tree가 범위를 좁히기 어렵다. Full-text search는 문서를 token으로 쪼개고, token에서 document id 목록으로 가는 구조를 만든다. 이때 관찰 증거는 검색어가 어떤 token으로 분석(analyze)되는지, posting list가 얼마나 큰지, ranking score가 어떤 field와 term frequency를 반영하는지다.\n\n## 핵심 mental model\n\n문서를 analyzer가 tokenization, lowercasing, stemming, stop word 제거 같은 규칙으로 term으로 분해한다. 각 term은 posting list를 가진다. Posting에는 document id뿐 아니라 position, field, term frequency 같은 정보가 들어갈 수 있다. Query도 같은 analyzer를 거쳐 term으로 바뀌고, 검색 엔진은 posting list를 합치거나 교차해 후보 문서를 만든 뒤 BM25 같은 ranking 함수로 정렬한다.\n\n불변식은 \"색인 시점과 검색 시점의 analyzer가 호환되어야 한다\"는 점이다. 색인에는 `reservation`으로 저장했는데 query analyzer가 `reserve`로만 찾으면 hit가 줄 수 있다. 한글 검색은 형태소 분석, 초성, 동의어, 띄어쓰기 처리에 따라 품질이 크게 달라진다.\n\n## 보장 범위와 아닌 것\n\n| 단계 | 주는 보장 | 보장하지 않는 것 |\n|---|---|---|\n| Analyzer | 같은 입력을 정해진 term 규칙으로 변환 | 사용자 의도 이해, 모든 동의어/오타 자동 처리 |\n| Inverted index | term으로 후보 document 집합을 빠르게 찾음 | 최신 DB 상태 즉시 반영, relevance 정답성 |\n| Posting merge | AND/OR/filter 조건에 맞는 후보 축소 | 권한/품절/비즈니스 정책 자동 적용 |\n| Ranking | 후보를 점수 함수 기준으로 정렬 | \"가장 좋은 결과\"의 절대 보장, 공정성/악성 문서 차단 |\n\n즉 역색인은 검색의 빠른 후보 생성 장치다. 검색 품질은 analyzer, field 설계, filter 순서, ranking feature, index freshness, 운영 계측이 함께 맞아야 나온다.\n\n## 실패 모드 분기\n\n| 증상 | 먼저 확인 | 대표 원인 |\n|---|---|---|\n| 문서가 있는데 검색 안 됨 | index analyzer와 query analyzer 결과 | 형태소/동의어/띄어쓰기 mismatch, stop word 제거 |\n| 생성 직후 검색에 안 뜸 | index lag, refresh interval, ingestion queue | 비동기 indexing, segment refresh 지연 |\n| 결과는 있는데 순서가 이상함 | `_explain`, score component, field boost | BM25 field weight, term frequency, popularity feature 왜곡 |\n| 인기 단어 query가 느림 | posting list cardinality, shard hot spot | 너무 큰 posting list, shard skew, cache miss |\n| 사용자가 보면 안 되는 결과 노출 | permission filter 위치와 snippet 생성 순서 | ranking 뒤 필터, highlight/count leak |\n| 검색 결과가 갑자기 0건 | analyzer 배포, synonym dictionary, index alias | analyzer/schema 변경 불일치, alias cutover 실수 |\n\n면접에서 좋은 답은 \"역색인이 빠르다\"에서 멈추지 않는다. 검색 장애는 대부분 analyzer mismatch, freshness gap, ranking/filter 순서, shard 운영 문제로 드러난다고 분기해야 한다.\n\n## 운영 관찰 증거\n\n- `_analyze` 또는 analyzer debug API로 색인 문서와 query가 어떤 term으로 바뀌는지 비교한다.\n- `_explain`, profile/slow log로 어떤 posting list와 ranking feature가 시간을 쓰는지 본다.\n- index lag는 원본 DB update time, ingestion event time, index visible time의 차이로 본다.\n- no-result rate, zero-click rate, CTR, query p95/p99 latency, shard error rate를 함께 본다.\n- document count, deleted document 비율, segment merge backlog, refresh/commit latency로 write path 압력을 본다.\n- 권한 검색은 \"후보 생성 전/중/후 어느 단계에서 필터가 적용되는지\"와 snippet/highlight가 필터 이후 생성되는지 확인한다.\n\n## 흔한 오해\n\nTrie는 prefix autocomplete에 유용하지만 full-text relevance ranking 전체를 대체하지 않는다. 검색은 정확 일치(exact lookup), prefix, fuzzy typo tolerance, 필터링, relevance ranking 요구를 나눠야 한다. 역색인은 검색 후보를 빠르게 찾고 점수를 매기는 데 강하지만, 최신성(freshness)을 즉시 보장하지는 않는다. 색인 파이프라인이 비동기라면 DB write 직후 검색 결과에 늦게 반영될 수 있다. 이를 줄이려면 refresh interval, write-through indexing, fallback DB read 같은 tradeoff를 검토한다.\n\n또한 ranking은 정답 보장이 아니라 \"더 관련 있을 가능성이 높은 순서\"를 계산하는 휴리스틱이다. 권한 필터, 품절 상품 제외, 악성 문서 제거 같은 비즈니스 필터는 ranking과 별도로 적용해야 한다.\n\nDB index와도 목적이 다르다. B-Tree는 정렬된 key range와 point lookup에 강하고, inverted index는 token 기반 후보 생성에 강하다. 상품 검색에서 `category_id = ?` 같은 구조화 필터는 DB/columnar/filter index 쪽 사고가 필요하고, `가벼운 러닝화` 같은 full-text query는 analyzer와 posting list 사고가 필요하다.\n\n## 면접 답변 골격\n\n1. \"문서를 analyzer로 term으로 나누고, term -> posting list(document id, position, field, frequency) 구조를 만듭니다.\"\n2. \"Query도 같은 analyzer를 거쳐 term이 되고, posting list를 merge해 candidate를 만든 뒤 filter와 ranking을 적용합니다.\"\n3. \"역색인은 후보 생성과 점수 계산을 빠르게 하지만, 최신성/권한/비즈니스 정책/정답 ranking을 자동 보장하지 않습니다.\"\n4. \"운영에서는 analyzer output, index lag, no-result rate, query p99, explain score, shard hot spot을 봅니다.\"\n\n## Safe Next Docs\n\nPrefix 구조 선택은 `trie-vs-hashmap-prefix-interview-chooser`로 이어진다. DB index와 헷갈리면 `database/index-basics`를 비교해 본다.\n",
+  "body_markdown": "# Search Inverted Index Interview Primer\n\n## 한 줄 요약\n\nInverted index는 term에서 그 term을 포함한 document 목록(posting list)으로 가는 색인이다. 문서에서 term을 찾는 것이 아니라 term으로 문서를 찾는다.\n\n## 미션 진입 증상\n\n학습자가 \"검색도 DB index랑 같은 거 아닌가요?\"라고 묻는다면 B-Tree index와 역색인(inverted index)을 분리한다. `LIKE '%keyword%'`는 앞쪽 wildcard 때문에 일반 B-Tree가 범위를 좁히기 어렵다. Full-text search는 문서를 token으로 쪼개고, token에서 document id 목록으로 가는 구조를 만든다. 이때 관찰 증거는 검색어가 어떤 token으로 분석(analyze)되는지, posting list가 얼마나 큰지, ranking score가 어떤 field와 term frequency를 반영하는지다.\n\n## 핵심 mental model\n\n문서를 analyzer가 tokenization, lowercasing, stemming, stop word 제거 같은 규칙으로 term으로 분해한다. 각 term은 posting list를 가진다. Posting에는 document id뿐 아니라 position, field, term frequency 같은 정보가 들어갈 수 있다. Query도 같은 analyzer를 거쳐 term으로 바뀌고, 검색 엔진은 posting list를 합치거나 교차해 후보 문서를 만든 뒤 BM25 같은 ranking 함수로 정렬한다.\n\n불변식은 \"색인 시점과 검색 시점의 analyzer가 호환되어야 한다\"는 점이다. 색인에는 `reservation`으로 저장했는데 query analyzer가 `reserve`로만 찾으면 hit가 줄 수 있다. 한글 검색은 형태소 분석, 초성, 동의어, 띄어쓰기 처리에 따라 품질이 크게 달라진다.\n\n## 보장 범위와 아닌 것\n\n| 단계 | 주는 보장 | 보장하지 않는 것 |\n|---|---|---|\n| Analyzer | 같은 입력을 정해진 term 규칙으로 변환 | 사용자 의도 이해, 모든 동의어/오타 자동 처리 |\n| Inverted index | term으로 후보 document 집합을 빠르게 찾음 | 최신 DB 상태 즉시 반영, relevance 정답성 |\n| Posting merge | AND/OR/filter 조건에 맞는 후보 축소 | 권한/품절/비즈니스 정책 자동 적용 |\n| Ranking | 후보를 점수 함수 기준으로 정렬 | \"가장 좋은 결과\"의 절대 보장, 공정성/악성 문서 차단 |\n\n즉 역색인은 검색의 빠른 후보 생성 장치다. 검색 품질은 analyzer, field 설계, filter 순서, ranking feature, index freshness, 운영 계측이 함께 맞아야 나온다.\n\n## 실패 모드 분기\n\n| 증상 | 먼저 확인 | 대표 원인 |\n|---|---|---|\n| 문서가 있는데 검색 안 됨 | index analyzer와 query analyzer 결과 | 형태소/동의어/띄어쓰기 mismatch, stop word 제거 |\n| 생성 직후 검색에 안 뜸 | index lag, refresh interval, ingestion queue | 비동기 indexing, segment refresh 지연 |\n| 결과는 있는데 순서가 이상함 | `_explain`, score component, field boost | BM25 field weight, term frequency, popularity feature 왜곡 |\n| 인기 단어 query가 느림 | posting list cardinality, shard hot spot | 너무 큰 posting list, shard skew, cache miss |\n| 사용자가 보면 안 되는 결과 노출 | permission filter 위치와 snippet 생성 순서 | ranking 뒤 필터, highlight/count leak |\n| 검색 결과가 갑자기 0건 | analyzer 배포, synonym dictionary, index alias | analyzer/schema 변경 불일치, alias cutover 실수 |\n\n면접에서 좋은 답은 \"역색인이 빠르다\"에서 멈추지 않는다. 검색 장애는 대부분 analyzer mismatch, freshness gap, ranking/filter 순서, shard 운영 문제로 드러난다고 분기해야 한다.\n\n## 운영 관찰 증거\n\n- `_analyze` 또는 analyzer debug API로 색인 문서와 query가 어떤 term으로 바뀌는지 비교한다.\n- `_explain`, profile/slow log로 어떤 posting list와 ranking feature가 시간을 쓰는지 본다.\n- index lag는 원본 DB update time, ingestion event time, index visible time의 차이로 본다.\n- no-result rate, zero-click rate, CTR, query p95/p99 latency, shard error rate를 함께 본다.\n- document count, deleted document 비율, segment merge backlog, refresh/commit latency로 write path 압력을 본다.\n- 권한 검색은 \"후보 생성 전/중/후 어느 단계에서 필터가 적용되는지\"와 snippet/highlight가 필터 이후 생성되는지 확인한다.\n\n## 흔한 오해\n\nTrie는 prefix autocomplete에 유용하지만 full-text relevance ranking 전체를 대체하지 않는다. 검색은 정확 일치(exact lookup), prefix, fuzzy typo tolerance, 필터링, relevance ranking 요구를 나눠야 한다. 역색인은 검색 후보를 빠르게 찾고 점수를 매기는 데 강하지만, 최신성(freshness)을 즉시 보장하지는 않는다. 색인 파이프라인이 비동기라면 DB write 직후 검색 결과에 늦게 반영될 수 있다. 이를 줄이려면 refresh interval, write-through indexing, fallback DB read 같은 tradeoff를 검토한다.\n\n또한 ranking은 정답 보장이 아니라 \"더 관련 있을 가능성이 높은 순서\"를 계산하는 휴리스틱이다. 권한 필터, 품절 상품 제외, 악성 문서 제거 같은 비즈니스 필터는 ranking과 별도로 적용해야 한다.\n\nDB index와도 목적이 다르다. B-Tree는 정렬된 key range와 point lookup에 강하고, inverted index는 token 기반 후보 생성에 강하다. 상품 검색에서 `category_id = ?` 같은 구조화 필터는 DB/columnar/filter index 쪽 사고가 필요하고, `가벼운 러닝화` 같은 full-text query는 analyzer와 posting list 사고가 필요하다.\n\n## 면접 답변 골격\n\n1. \"문서를 analyzer로 term으로 나누고, term -> posting list(document id, position, field, frequency) 구조를 만듭니다.\"\n2. \"Query도 같은 analyzer를 거쳐 term이 되고, posting list를 merge해 candidate를 만든 뒤 filter와 ranking을 적용합니다.\"\n3. \"역색인은 후보 생성과 점수 계산을 빠르게 하지만, 최신성/권한/비즈니스 정책/정답 ranking을 자동 보장하지 않습니다.\"\n4. \"운영에서는 analyzer output, index lag, no-result rate, query p99, explain score, shard hot spot을 봅니다.\"\n\n## DB 인덱스와 비교해서 말하는 법\n\n면접에서 가장 자주 생기는 혼동은 `검색 인덱스도 결국 index 아닌가요?`라는 질문이다. 답은 `둘 다 조회를 빠르게 하지만 lookup key의 모양이 다르다`로 시작하면 좋다. B-Tree 계열 DB index는 정렬된 column value를 기준으로 point lookup이나 range scan을 빠르게 한다. 반면 inverted index는 문서 본문에서 추출한 term을 key로 삼아 그 term을 포함한 document set을 찾는다.\n\n예를 들어 `WHERE email = ?`는 하나의 정확한 column value를 찾는 문제이고, `환불 정책 변경` 검색은 여러 token의 posting list를 합치고 순위를 매기는 문제다. 그래서 검색 답변에서는 equality/range 조건, prefix autocomplete, full-text relevance ranking을 구분해야 한다. prefix만 필요하면 trie나 edge n-gram이 유용할 수 있지만, 긴 본문 검색과 ranking까지 필요하면 analyzer, posting list, scoring, filter pipeline이 함께 필요하다.\n\n좋은 답변은 `역색인 = term -> documents`라는 구조를 말한 뒤, `검색 품질은 analyzer와 ranking, freshness, permission filter가 같이 결정한다`로 확장한다. 이렇게 말하면 자료구조 암기와 시스템 설계 사고가 자연스럽게 연결된다.\n\n## Safe Next Docs\nPrefix 구조 선택은 `trie-vs-hashmap-prefix-interview-chooser`로 이어진다. DB index와 헷갈리면 `database/index-basics`를 비교해 본다.\n",
   "aliases": [
     "inverted index interview primer",
     "검색 엔진 역색인 면접",
     "search ranking basics answer",
-    "full text search primer"
+    "full text search primer",
+    "역색인 posting list",
+    "DB LIKE 검색 차이",
+    "tokenization analyzer",
+    "검색 랭킹 기초",
+    "inverted index 설명",
+    "posting list 면접"
   ],
   "expected_queries": [
     "검색 엔진 inverted index를 면접에서 어떻게 설명해?",
     "DB like 검색과 검색 엔진은 뭐가 달라?",
-    "역색인에서 posting list가 뭐야?"
+    "역색인에서 posting list가 뭐야?",
+    "검색을 B-Tree index lookup처럼만 설명하면 왜 부족해?",
+    "tokenization과 analyzer가 full text search에서 왜 필요한지 면접 답변으로 알려줘",
+    "inverted index에서 term이 posting list로 문서를 찾고 ranking으로 정렬되는 흐름을 설명해줘"
   ],
   "symptoms": [
     "검색을 DB index와 같은 B-Tree lookup으로만 설명해요",
@@ -23,14 +32,18 @@
   ],
   "relations": {
     "prerequisites": [
-      "data-structure/trie-prefix-search-autocomplete"
+      "data-structure/trie-prefix-search-autocomplete",
+      "database/index-basics"
     ],
     "next_docs": [
-      "data-structure/trie-vs-hashmap-prefix-interview-chooser"
+      "system-design/text-analyzer-chain-cjk-ngram-tradeoff",
+      "system-design/search-indexing-pipeline-design",
+      "data-structure/inverted-index-wand-block-max-chooser"
     ],
     "confusable_with": [
       "data-structure/trie-vs-hashmap-prefix-interview-chooser",
-      "database/index-basics"
+      "database/index-basics",
+      "system-design/search-indexing-pipeline-design"
     ],
     "forbidden_for_queries": []
   },
@@ -38,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/search-inverted-index-interview-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "note": "Expanded search platform query surfaces for batch103."
+      }
+    ]
   }
 }

@@ -1,0 +1,63 @@
+{
+  "id": "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+  "title": "Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "Kafka를 처음 볼 때 필요한 topic, partition, broker, producer, consumer group, offset, retention의 역할을 beginner 관점에서 정리한다. Kafka는 단순 queue가 아니라 append-only log를 partition별로 저장하고 consumer가 offset으로 어디까지 읽었는지 관리하는 event stream 플랫폼이다.",
+  "body_markdown": "# Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer\n\n## 한 줄 요약\n\nKafka는 메시지를 topic에 넣고, topic을 partition이라는 순서 있는 log 조각으로 나누어 broker에 저장한다. Producer는 record를 쓰고, consumer group은 partition을 나눠 읽으며, offset은 consumer가 어디까지 읽었는지 나타내는 위치표다.\n\n## 왜 queue만으로 설명하면 부족한가\n\n일반 queue는 보통 \"작업 하나를 consumer 하나가 가져가 처리한다\"는 이미지가 강하다. Kafka는 그보다 log에 가깝다. 메시지는 partition log에 append되고, 여러 consumer group이 자기 offset을 따로 들고 같은 log를 읽을 수 있다.\n\n그래서 beginner 단계에서 먼저 분리해야 할 질문은 세 가지다.\n\n1. 메시지는 어디에 저장되는가? topic의 partition log에 저장된다.\n2. 누가 읽는가? consumer group이 partition을 나눠 읽는다.\n3. 어디까지 읽었는지 누가 기억하는가? consumer group의 committed offset이 기억한다.\n\n## 기본 구성요소\n\n| 용어 | 초보자용 의미 | 헷갈리기 쉬운 점 |\n|---|---|---|\n| Topic | 같은 종류의 record를 넣는 logical stream | DB table처럼 update/delete 중심이 아니다 |\n| Partition | topic을 나눈 순서 있는 append-only log | 순서 보장은 partition 안에서만 먼저 생각한다 |\n| Broker | partition 데이터를 저장하고 요청을 처리하는 Kafka 서버 | broker 하나가 전체 Kafka가 아니다 |\n| Producer | record를 topic partition에 쓰는 client | key가 partition 선택과 ordering scope에 영향을 준다 |\n| Consumer | record를 읽고 처리하는 client | 읽었다고 업무 side effect가 성공했다는 뜻은 아니다 |\n| Consumer group | 여러 consumer가 partition을 나눠 읽는 단위 | group이 다르면 같은 record를 각자 읽을 수 있다 |\n| Offset | partition 안 record 위치 | offset commit은 처리 완료 선언과 연결된다 |\n| Retention | record를 얼마 동안 보관할지 정하는 정책 | consumer가 읽었다고 바로 삭제되는 queue 모델과 다르다 |\n\n## Topic과 partition을 왜 나누나\n\nTopic 하나를 partition 여러 개로 나누면 parallelism을 얻는다. 예를 들어 `order-events` topic이 partition 6개라면 consumer group 안의 consumer들이 partition을 나눠 읽을 수 있다.\n\n하지만 partition은 공짜가 아니다. 같은 key의 순서를 지키려면 같은 partition으로 보내야 하고, hot key가 있으면 특정 partition만 밀릴 수 있다. partition 수를 늘리면 처리 병렬성은 늘 수 있지만 ordering scope, rebalance, 운영 복잡도도 같이 본다.\n\n## Offset은 무엇인가\n\nOffset은 partition 안에서 record의 위치다. `order-events-2` partition에서 offset 153이라는 말은 그 partition log의 특정 위치를 가리킨다.\n\n중요한 점은 offset이 message id나 업무 id가 아니라는 것이다. 같은 주문 id가 다른 topic이나 partition에서는 다른 offset을 가진다. Consumer group은 partition별로 committed offset을 저장해 \"다음에 어디부터 읽을지\"를 결정한다.\n\n```text\npartition 0: offset 10 11 12 13\nconsumer group A committed offset: 12\n\n다음 poll은 보통 13부터 읽는다\n```\n\n## Consumer group mental model\n\nConsumer group은 \"같은 일을 같이 나눠 하는 팀\"이다. 한 consumer group 안에서는 partition 하나가 동시에 여러 consumer에게 중복 배정되지 않는 것이 기본 mental model이다. 그래서 consumer 수가 partition 수보다 많으면 남는 consumer가 생길 수 있다.\n\n반대로 consumer group이 다르면 같은 record를 각 group이 독립적으로 읽을 수 있다. 주문 이벤트를 결제 projection group, 알림 group, 분석 group이 각각 읽는 식이다. 이 점 때문에 Kafka는 queue 작업 분배와 pub/sub fan-out 성격을 함께 가진다.\n\n## Retention과 replay\n\nKafka는 consumer가 record를 읽었다고 즉시 삭제하지 않는다. Retention 기간이나 크기 정책 안에서는 record가 남아 있고, consumer group은 offset을 되돌려 replay할 수 있다.\n\nReplay는 강력하지만 위험하다. 같은 이벤트를 다시 처리하므로 handler가 idempotent하지 않으면 DB row, 포인트, 알림 같은 side effect가 중복될 수 있다. 그래서 Kafka foundation은 offset과 retention뿐 아니라 idempotent consumer 설계로 이어진다.\n\n## 흔한 오해\n\n- \"Kafka topic은 queue 하나다\": topic은 partitioned log이고, consumer group에 따라 queue처럼도 pub/sub처럼도 보인다.\n- \"consumer가 읽으면 메시지가 사라진다\": retention 정책까지 record가 남을 수 있고 offset만 움직인다.\n- \"partition이 많으면 항상 좋다\": 병렬성은 늘 수 있지만 ordering, hot key, rebalance 비용이 생긴다.\n- \"offset은 업무 처리 성공을 자동 보장한다\": offset commit과 DB/API side effect 경계는 별도로 설계해야 한다.\n- \"consumer group이 많으면 메시지가 분산된다\": 같은 group 안에서는 분산되고, 다른 group이면 각자 읽는다.\n\n## 면접 답변 축\n\nKafka를 처음 설명하라는 질문에는 \"Kafka는 topic을 partition이라는 append-only log로 나눠 broker에 저장하고, producer가 record를 쓰며, consumer group이 partition을 나눠 읽는다. 각 group은 offset으로 읽은 위치를 관리하고 retention 기간 안에서 replay할 수 있다\"고 시작하면 된다.\n\n그 다음에는 ordering은 partition 안에서 먼저 생각하고, delivery는 offset commit과 consumer side effect가 어디서 성공했는지에 달려 있다고 이어가면 중급 문서로 자연스럽게 연결된다.\n\n## Safe Next Docs\n\nKafka producer/consumer 흐름은 `kafka-producer-consumer-flow-offset-retention-beginner-bridge`, queue/stream/pub-sub 선택은 `message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser`, ordering과 delivery 면접 답변은 `kafka-ordering-delivery-interview-primer`로 이어진다.\n\n---\n\n## queue처럼 사라지는 모델과 다른 점\n\nKafka를 처음 배울 때 가장 자주 헷갈리는 부분은 `consumer가 읽으면 메시지가 사라지는가`다. Kafka record는 consumer가 읽었다고 즉시 삭제되지 않는다. topic partition의 log에 retention 정책에 따라 남고, consumer group은 자신이 어디까지 읽었는지 offset을 따로 저장한다.\n\n| 질문 | queue식 직관 | Kafka식 직관 |\n|---|---|---|\n| 읽으면 사라지나 | 보통 사라진다고 생각 | retention 동안 log에 남는다 |\n| 누가 읽기 위치를 기억하나 | broker queue가 제거로 표현 | consumer group offset이 표현 |\n| 다시 읽을 수 있나 | 보통 어렵다 | offset reset/replay 가능 |\n| 병렬성 단위 | worker 수 | partition 수와 consumer group assignment |\n\n이 구분이 잡혀야 consumer lag, replay, retention, offset commit이 한 그림으로 이어진다. offset은 record의 생존 여부가 아니라 특정 consumer group의 읽기 위치다.\n\n## 입문자 체크리스트\n\n- topic은 이름 붙은 log이고, partition은 그 log를 여러 줄로 나눈 단위다.\n- broker는 partition replica를 저장하고 producer/consumer 요청을 받는다.\n- offset은 partition 안 record 위치이지 전역 메시지 번호가 아니다.\n- consumer group은 group별로 offset을 따로 가진다.\n- retention은 record 보존 정책이고, offset commit은 읽기 위치 저장이다.\n- 같은 topic도 consumer group이 다르면 서로 독립적으로 읽을 수 있다.\n\n## 추가 한 줄 정리\n\nKafka 입문에서 가장 중요한 전환은 `메시지를 꺼내면 사라지는 queue`가 아니라 `partition log를 group별 offset으로 읽는 모델`로 생각하는 것이다.\n",
+  "aliases": [
+    "Kafka foundations",
+    "Kafka topic partition broker offset",
+    "카프카 기초",
+    "카프카 토픽 파티션",
+    "Kafka consumer group basics",
+    "offset retention replay",
+    "broker producer consumer",
+    "카프카 오프셋",
+    "consumer group 입문",
+    "partition log"
+  ],
+  "expected_queries": [
+    "Kafka topic partition broker offset을 처음부터 설명해줘",
+    "카프카에서 consumer group과 offset은 각각 무슨 역할이야?",
+    "Kafka는 메시지를 읽으면 queue처럼 사라지는 거야?",
+    "topic과 partition을 나누는 이유를 beginner 수준으로 알려줘",
+    "Kafka retention과 replay가 consumer offset과 어떻게 연결돼?",
+    "카프카 broker producer consumer 관계를 그림 없이 말로 정리해줘"
+  ],
+  "symptoms": [
+    "Kafka topic을 단일 queue처럼만 이해한다",
+    "consumer group과 consumer를 같은 말로 쓴다",
+    "offset commit을 업무 처리 성공과 자동으로 동일시한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/message-queue-basics",
+      "system-design/publish-subscribe-messaging-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+      "system-design/kafka-ordering-delivery-interview-primer"
+    ],
+    "confusable_with": [
+      "system-design/message-queue-basics",
+      "system-design/publish-subscribe-messaging-basics-primer",
+      "system-design/redis-streams-consumer-group-pending-entries-playbook"
+    ],
+    "forbidden_for_queries": [
+      "Kafka cooperative rebalance와 eager rebalance 차이를 설명해줘",
+      "partition 안에서 병렬 처리할 때 offset gap tracking을 어떻게 해야 해?"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer.md",
+    "revision_history": [],
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "last_expansion_source": "y14-expansion-batch98-stream-c-kafka-foundation-depth"
+  }
+}

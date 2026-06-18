@@ -4,20 +4,23 @@
   "category": "security",
   "level": "advanced",
   "summary": "OAuth2 token exchange에서 impersonation, delegation, actor token, audience boundary를 구분하는 security chooser",
-  "body_markdown": "# OAuth2 Token Exchange Impersonation Delegation Boundary Chooser\n\n## 이 문서가 맡는 질문\nOAuth2 token exchange에서 impersonation, delegation, actor token, audience boundary를 구분하는 security chooser. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\n누가 누구를 대신하는지 actor와 subject를 먼저 나눈다. audience, scope, token lifetime, audit chain을 고정한다. impersonation은 고권한 감사와 step-up이 필요하고 delegation은 원 권한 범위를 넘으면 안 된다.\n\n## 실전 시나리오\n관리자 지원 기능에서 사용자를 대신해 API를 호출해야 한다. 단순히 user token을 복사하면 audit trail과 권한 경계가 흐려지고 confused deputy 위험이 생긴다.\n\n## CS 배경\nToken exchange는 한 token을 다른 audience/actor 의미의 token으로 바꾸는 절차다. delegation은 사용자가 위임한 범위, impersonation은 운영자가 사용자를 가장하는 고위험 행위로 구분해야 한다.\n\n## 핵심 불변식\n- actor, subject, audience를 token claim과 audit log에 분리한다\n- exchanged token은 원 token보다 넓은 권한을 얻으면 안 된다\n- impersonation은 reason, approval, expiry, replay trace가 있어야 한다\n- downstream은 token audience와 issuer를 엄격히 검증해야 한다\n\n## 판단 매트릭스\n- 서비스 간 호출이면 audience-restricted exchanged token\n- 사용자 위임이면 delegated scope와 consent\n- 지원자 가장이면 impersonation policy와 audit\n- 권한 상승 가능성이 있으면 step-up과 approval gate\n\n## 예시\n```text\nsupport_admin -> step-up -> token exchange(actor=admin, subject=user, audience=orders-api, scope=read-only)\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\nOAuth2에서 token을 바꾼다는 것은 문자열 변환이 아니라 trust boundary와 accountability를 새로 쓰는 일이다.\n\n## 품질 관점\n품질은 OAuth2 token exchange의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 confused deputy, missing audit actor, scope widening, wrong audience를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. token mint rate, introspection/JWKS cost, policy lookup, audit write를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. exchange latency, downstream authz cache staleness, approval wait, revocation propagation가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\nexchange_latency_ms, scope_widening_denied_count, actor_subject_audit_coverage, wrong_audience_reject_count, revocation_lag_ms를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- user token을 복사해서 쓰면 delegation이라고 생각한다\n- audience를 바꾸지 않고 모든 API에 같은 token을 보낸다\n- impersonation과 delegation을 audit에서 구분하지 않는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## 한 줄 정리\ntoken exchange 설계는 actor/subject/audience를 분리해 위임과 가장의 책임 경계를 남기는 보안 설계다.\n",
+  "body_markdown": "# OAuth2 Token Exchange Impersonation Delegation Boundary Chooser\n\n## 이 문서가 맡는 질문\n\nOAuth2 token exchange에서 impersonation, delegation, actor token, audience boundary를 구분하는 security chooser다. 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n관리자 지원 기능, BFF에서 내부 API 호출, batch worker가 사용자 작업을 대행하는 흐름은 모두 비슷해 보인다. 하지만 security boundary는 다르다. 누가 실제 행위자인지(actor), 누구의 권한 범위 안에서 일하는지(subject), 어느 API를 위해 발급된 토큰인지(audience)를 분리하지 않으면 audit trail과 권한 제한이 흐려진다.\n\n## 빠른 분기\n\n1. **delegation**: 사용자가 어떤 범위의 행동을 다른 client나 service에 위임한다. exchanged token은 원래 사용자 권한보다 넓어지면 안 되고, consent와 delegated scope가 중요하다.\n2. **impersonation**: 운영자나 지원 담당자가 사용자를 가장해 행동한다. 고위험 기능이므로 reason, approval, step-up, short expiry, audit chain이 필요하다.\n3. **service-to-service exchange**: user context가 없거나 제한적으로만 전달된다. audience-restricted token과 workload identity가 핵심이다.\n4. **on-behalf-of flow**: service가 사용자를 대신해 downstream을 호출한다. actor chain과 subject claim이 모두 필요하며, downstream은 audience와 issuer를 엄격히 검증해야 한다.\n\n분기 기준은 API 이름이 아니라 accountability다. 장애나 보안 사고가 났을 때 이 요청을 누가 승인했고, 누구 권한으로 실행됐으며, 어떤 downstream만 호출할 수 있었는지 재구성할 수 있어야 한다.\n\n## 핵심 불변식\n\n- actor, subject, audience를 token claim과 audit log에 분리한다.\n- exchanged token은 원 token보다 넓은 권한을 얻으면 안 된다.\n- impersonation은 reason, approval, expiry, replay trace가 있어야 한다.\n- downstream은 token audience와 issuer를 엄격히 검증해야 한다.\n- scope 축소, lifetime 축소, audience 축소가 기본값이다.\n- audit에는 end user, acting admin/service, exchange request id, original token id 또는 hash, policy decision을 남긴다.\n\n## 실전 시나리오: 관리자 지원 기능\n\n고객센터 관리자가 사용자의 주문 내역을 확인해야 한다고 하자. 가장 나쁜 설계는 사용자의 access token을 복사해서 관리자 화면에서 그대로 쓰는 것이다. 이 방식은 누가 호출했는지 audit이 흐려지고, 사용자가 원래 허용한 범위를 넘어선 지원자 행동과 구분되지 않는다. 토큰 탈취나 내부 오남용이 생겨도 actor를 재구성하기 어렵다.\n\n더 안전한 설계는 support admin이 step-up 인증을 통과하고, token exchange endpoint가 `actor=admin`, `subject=user`, `audience=orders-api`, `scope=orders:read`, 짧은 expiry를 가진 토큰을 발급하는 것이다. orders-api는 이 토큰이 자신을 audience로 하는지 확인하고, admin actor와 user subject를 audit에 모두 남긴다. 결제 취소나 주소 변경처럼 side effect가 큰 기능은 별도 approval이나 금지 정책을 둘 수 있다.\n\n```text\nsupport_admin -> step-up -> token exchange\nactor=admin, subject=user, audience=orders-api, scope=orders:read, ttl=5m\n```\n\n## delegation과 impersonation의 차이\n\nDelegation은 사용자가 권한 일부를 맡기는 모델이다. 예를 들어 사용자가 캘린더 앱에 일정 읽기 권한을 허용하면, 앱은 사용자의 consent와 scope 안에서만 행동한다. 핵심 질문은 사용자가 무엇을 위임했는가다.\n\nImpersonation은 운영자가 사용자를 가장하는 모델이다. 사용자가 직접 위임한 것이 아니라 운영 정책에 의해 지원자가 제한적으로 들어오는 것이므로, 핵심 질문은 누가 왜 가장했는가다. 그래서 impersonation은 더 강한 audit, step-up, just-in-time approval, session recording, 짧은 TTL이 필요하다.\n\n둘을 audit에서 같은 사용자 요청처럼 저장하면 문제가 생긴다. 장애 분석에서는 사용자가 한 행동인지 지원자가 한 행동인지 구분할 수 없고, 보안 조사에서는 내부자 오남용을 추적하기 어렵다. 또한 downstream이 subject만 보고 권한을 판단하면 actor의 위험도를 반영하지 못한다.\n\n## audience boundary\n\nToken exchange의 흔한 실패는 audience를 넓게 둔 토큰을 여러 API에 재사용하는 것이다. `aud=all-services` 같은 토큰은 한 downstream에서 탈취되면 다른 API에도 replay될 수 있다. 또한 service A가 service B를 대신해 고권한 API를 호출하는 confused deputy 문제가 생긴다.\n\n안전한 방향은 exchanged token을 목적 API 단위로 좁히는 것이다. orders-api를 호출하려면 `aud=orders-api`, payment-api를 호출하려면 별도 exchange가 필요하다. scope도 endpoint와 action 기준으로 줄인다. downstream은 bearer token이 유효한지만 보지 말고 issuer, audience, token type, actor/subject claim, expiry, policy version을 검증한다.\n\n## 선택 매트릭스\n\n| 상황 | 선택 | 필수 검증 |\n|---|---|---|\n| 서비스 간 호출 | audience-restricted service token | workload identity, issuer, audience |\n| 사용자가 앱에 권한 위임 | delegated token | consent, delegated scope, subject 유지 |\n| 지원자가 사용자 화면 확인 | impersonation token | actor/subject 분리, reason, step-up, 짧은 TTL |\n| 백엔드가 사용자 대신 downstream 호출 | on-behalf-of token | actor chain, subject, audience 축소 |\n| 권한 상승 가능 | approval gate | scope widening deny, audit alert |\n\n## 운영 지표와 테스트\n\n품질은 happy path보다 boundary condition을 얼마나 재현 가능하게 막는지로 본다. 테스트는 confused deputy, missing audit actor, scope widening, wrong audience, expired impersonation token, revoked subject를 포함해야 한다. 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n성능은 평균 처리량 하나로 보지 않는다. token mint rate, JWKS/introspection cost, policy lookup, audit write latency를 분리해서 측정한다. 레이턴시는 exchange latency, downstream authz cache staleness, approval wait, revocation propagation이 p95/p99를 키우는지 trace span과 histogram으로 확인한다.\n\n최소 지표는 다음과 같다.\n\n- `exchange_latency_ms`: token exchange endpoint latency\n- `scope_widening_denied_count`: 원 권한보다 넓은 scope 요청 차단 수\n- `wrong_audience_reject_count`: audience mismatch로 downstream이 거절한 수\n- `actor_subject_audit_coverage`: actor와 subject가 모두 남은 요청 비율\n- `impersonation_active_sessions`: 현재 가장 세션 수와 TTL 분포\n- `revocation_lag_ms`: revocation이 downstream cache에 반영되는 지연\n\n## 자주 하는 오해\n\n- user token을 복사해서 쓰면 delegation이라고 생각한다.\n- audience를 바꾸지 않고 모든 API에 같은 token을 보낸다.\n- impersonation과 delegation을 audit에서 구분하지 않는다.\n- subject가 같으면 보안적으로 같은 요청이라고 본다. actor와 approval이 다르면 위험도가 다르다.\n- scope만 줄이면 충분하다고 생각한다. audience, lifetime, token type, issuer 검증도 같이 필요하다.\n- 내부망 service 호출은 bearer token audience 검증이 약해도 된다고 본다. 내부 confused deputy는 실제 사고 원인이 될 수 있다.\n\n## 학습자가 답변에 포함해야 할 구조\n\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n면접 답변은 이렇게 정리할 수 있다. token exchange는 문자열을 바꾸는 기능이 아니라 trust boundary와 accountability를 새로 쓰는 절차입니다. delegation은 사용자가 허용한 scope 안에서 subject 권한을 위임하는 것이고, impersonation은 운영자가 사용자를 가장하는 고위험 행위라 actor, subject, reason, approval, expiry를 audit에 남겨야 합니다. exchanged token은 audience와 scope, lifetime을 줄이는 방향이어야 하며, downstream은 issuer와 audience를 검증해 confused deputy를 막아야 합니다.\n\n## 실전 검증 루프\n\n1. 증상을 한 문장으로 고정한다.\n2. actor, subject, audience, issuer, scope, expiry를 표로 쓴다.\n3. correctness invariant를 먼저 쓴다.\n4. scope widening, wrong audience, missing actor audit 테스트를 만든다.\n5. synthetic case와 production-like case를 나눠 측정한다.\n6. exchange latency, audit write, revocation lag를 trace로 묶는다.\n7. 결과를 policy와 다음 학습 문서에 반영한다.\n\n## 한 줄 정리\n\ntoken exchange 설계는 actor/subject/audience를 분리해 위임과 가장의 책임 경계를 남기는 보안 설계다.\n",
   "aliases": [
-    "OAuth2 token exchange impersonation delegation boundary",
-    "actor token subject token audience scope",
-    "confused deputy token exchange",
-    "OAuth2 Token Exchange Impersonation Delegation Boundary Chooser",
-    "oauth2 token exchange impersonation delegation boundary chooser",
-    "OAuth2 token exchange impersonation delegation actor subject audience scope confused deputy audit boundary"
+    "OAuth2 token exchange 경계",
+    "impersonation delegation 차이",
+    "actor subject audience",
+    "관리자 사용자 가장",
+    "위임 토큰 scope 제한",
+    "confused deputy 방지",
+    "audience token 검증",
+    "audit chain token"
   ],
   "expected_queries": [
-    "OAuth2 token exchange에서 impersonation과 delegation은 어떻게 구분해?",
-    "관리자가 사용자를 대신해 호출할 때 actor와 subject를 어떻게 남겨?",
-    "token exchange에서 audience와 scope를 왜 줄여야 해?",
-    "관리자가 사용자를 대신해 호출할 때 OAuth token exchange 경계를 어떻게 잡아?"
+    "OAuth2 token exchange에서 impersonation과 delegation을 어떻게 나눠?",
+    "관리자 지원 기능에서 사용자를 대신 호출할 때 토큰을 어떻게 만들까?",
+    "actor subject audience claim을 audit에 왜 분리해야 해?",
+    "token exchange가 scope widening이 되지 않게 뭘 검증해?",
+    "confused deputy를 막으려면 audience boundary를 어떻게 잡아?"
   ],
   "symptoms": [
     "impersonation audit missing",
@@ -58,7 +61,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +70,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch145"
       }
     ]
   }

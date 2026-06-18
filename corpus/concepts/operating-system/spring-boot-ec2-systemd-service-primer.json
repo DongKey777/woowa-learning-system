@@ -1,0 +1,63 @@
+{
+  "id": "operating-system/spring-boot-ec2-systemd-service-primer",
+  "title": "Spring Boot EC2 systemd 서비스 Primer",
+  "category": "operating-system",
+  "level": "intermediate",
+  "summary": "EC2에서 Spring Boot 실행형 jar를 오래 운영하려면 `java -jar` 한 번 실행이나 `nohup`보다 systemd service로 등록해 main process, 종료 신호, 재시작 정책, journal 로그, 부팅 자동 시작을 한곳에서 관리하는 편이 안정적이다.",
+  "body_markdown": "# Spring Boot EC2 systemd 서비스 Primer\n\n> 한 줄 요약: `systemd`는 Spring Boot jar를 대신 빌드하는 도구가 아니라, 이미 준비된 jar 프로세스의 시작, 중지, 실패 재시작, 로그 수집, 부팅 자동 시작을 맡는 Linux service supervisor다.\n\n## 이 문서의 범위\n\n이 문서는 EC2 Ubuntu 같은 Linux 서버 한 대에서 Spring Boot 실행형 jar를 `systemd` service로 돌리는 초급에서 중급 사이의 운영 감각을 다룬다. `deploy.sh`가 Git pull, Gradle build, jar 교체, PID 파일, 로그 파일을 어떻게 다루는지는 별도 문서의 범위다. 여기서는 그 다음 질문에 집중한다.\n\n- SSH를 끊어도 앱이 살아 있어야 한다.\n- 서버 재부팅 후 앱이 자동으로 올라와야 한다.\n- JVM이 비정상 종료되면 정해진 정책으로 다시 시작되어야 한다.\n- `systemctl status`와 `journalctl -u`로 현재 상태와 최근 로그를 바로 봐야 한다.\n- `systemctl stop`이 보낸 SIGTERM을 Spring Boot가 graceful shutdown 기회로 받아야 한다.\n\n즉 systemd는 배포 스크립트의 대체품이라기보다, 실행된 애플리케이션 프로세스를 Linux 서비스 생명주기 안에 넣는 층이다.\n\n## `java -jar`, `nohup`, `systemd`를 나누는 기준\n\n처음에는 세 방법이 모두 앱을 띄우는 명령처럼 보인다. 하지만 운영에서 묻는 질문은 다르다.\n\n| 방식 | 주로 해결하는 문제 | 남는 문제 |\n|---|---|---|\n| `java -jar app.jar` | 지금 터미널에서 바로 실행하고 로그를 눈으로 본다 | 터미널 종료, 재부팅, 실패 재시작, 서비스 상태 관리가 없다 |\n| `nohup java -jar app.jar &` | SSH hangup 영향을 줄이고 background에 남긴다 | 누가 main PID를 믿을지, 실패 시 재시작할지, 부팅 시 올릴지, 로그를 어떻게 회전할지 직접 챙겨야 한다 |\n| `systemd service` | service manager가 main process, stop signal, restart, journal, boot auto-start를 관리한다 | unit 파일, 사용자 권한, 작업 디렉터리, 환경 파일을 명시해야 한다 |\n\n초보자가 꼭 기억할 문장은 이것이다. `nohup`은 shell이 끝날 때 프로세스가 바로 죽는 문제를 줄이는 임시 장치이고, `systemd`는 서비스 생명주기를 추적하는 관리자다. 둘은 같은 층이 아니다.\n\n## systemd 아래에서는 foreground로 실행한다\n\n`systemd`가 관리하는 서비스에서는 `ExecStart` 안에서 `nohup`, `&`, `disown`을 붙이지 않는다. Spring Boot JVM을 foreground main process로 두어야 systemd가 그 프로세스를 정확히 추적한다.\n\n나쁜 예시는 이런 모양이다.\n\n```ini\nExecStart=/usr/bin/nohup /usr/bin/java -jar app.jar &\n```\n\n이렇게 하면 systemd 입장에서는 진짜 JVM이 아니라 wrapper나 shell 동작만 보일 수 있고, main PID 추적과 종료 신호 전달이 흐려진다. 기본은 단순하다.\n\n```ini\nExecStart=/usr/bin/java -jar /home/ubuntu/apps/roomescape/app.jar\n```\n\n로그도 별도 파일로 억지 redirection하지 않아도 된다. stdout과 stderr는 journald로 들어가고, `journalctl -u roomescape`로 조회한다. 파일 로그가 필요한 팀은 애플리케이션 로깅 정책으로 따로 정할 수 있지만, systemd primer의 첫 목표는 service lifecycle을 명확히 보는 것이다.\n\n## 최소 unit 파일 예시\n\n아래 예시는 `/etc/systemd/system/roomescape.service`에 둘 수 있는 작은 service unit이다. 앱 이름, jar 경로, 사용자, 환경 파일 경로는 팀 상황에 맞춘다.\n\n```ini\n[Unit]\nDescription=Roomescape Spring Boot Service\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=ubuntu\nWorkingDirectory=/home/ubuntu/apps/roomescape\nEnvironmentFile=/etc/roomescape/roomescape.env\nExecStart=/usr/bin/java -jar /home/ubuntu/apps/roomescape/app.jar\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=30\nSuccessExitStatus=143\n\n[Install]\nWantedBy=multi-user.target\n```\n\n이 unit에서 중요한 줄은 명령 자체보다 실행 환경을 고정하는 줄들이다.\n\n- `Type=simple`: `ExecStart`로 시작한 process를 main process로 본다. Spring Boot jar처럼 foreground로 계속 떠 있는 프로그램에 자연스럽다.\n- `User=ubuntu`: root가 아니라 지정한 Linux 사용자 권한으로 실행한다. jar, 설정 파일, working directory를 이 사용자가 읽을 수 있어야 한다.\n- `WorkingDirectory`: 상대 경로 기준점을 SSH 접속 위치가 아니라 서비스 설정으로 고정한다.\n- `EnvironmentFile`: profile, port, DB URL 같은 환경 변수를 unit 밖 파일로 분리한다.\n- `Restart=on-failure`: 비정상 종료일 때만 재시작한다. 사람이 `systemctl stop`으로 정상 중지한 경우까지 즉시 되살리는 정책은 아니다.\n- `TimeoutStopSec`: SIGTERM 이후 graceful shutdown을 기다릴 최대 시간이다. 이 시간을 넘기면 systemd가 더 강한 종료 단계로 넘어갈 수 있다.\n\n`SuccessExitStatus=143`은 JVM이 SIGTERM 종료를 exit code 143으로 표현하는 환경에서 정상 종료로 다루기 위한 보조 설정이다. 모든 서비스에 반드시 필요한 마법 줄은 아니지만, Spring Boot jar를 stop할 때 실패처럼 보이는 로그를 줄이는 데 도움이 될 수 있다.\n\n## EnvironmentFile과 Spring profile\n\n환경 파일은 보통 `/etc/<app>/<app>.env`처럼 repo 밖에 둔다.\n\n```bash\nSPRING_PROFILES_ACTIVE=prod\nSERVER_PORT=8080\n```\n\nSpring Boot는 OS 환경 변수 `SPRING_PROFILES_ACTIVE`를 읽어 active profile로 사용할 수 있다. 그래서 unit 파일에 profile을 command-line argument로 길게 박아 넣지 않아도 된다.\n\n환경 파일을 쓸 때의 기준은 단순하다.\n\n- repo에 넣기 어려운 운영 환경 값을 unit 밖으로 뺀다.\n- 파일 권한을 서비스 사용자와 운영자만 읽을 수 있게 제한한다.\n- unit 파일을 바꾸지 않고 profile이나 port를 조정할 수 있게 한다.\n- 비밀값을 평문 파일에 두는 것이 팀 정책상 맞는지 별도로 판단한다. systemd의 `EnvironmentFile`은 secret vault가 아니다.\n\n환경 파일을 수정한 뒤에는 서비스 재시작이 필요하다. unit 파일 자체를 수정했다면 `daemon-reload`도 필요하다.\n\n## 등록과 시작 순서\n\nunit 파일을 만든 뒤에는 systemd manager가 새 파일을 다시 읽어야 한다.\n\n```bash\nsudo systemctl daemon-reload\nsudo systemctl enable --now roomescape.service\nsudo systemctl status roomescape.service\n```\n\n여기서 `enable --now`는 두 가지를 동시에 한다. `enable`은 다음 부팅 때 자동 시작되도록 등록하고, `--now`는 지금 즉시 시작한다. 이미 등록되어 있고 지금만 시작하고 싶다면 `sudo systemctl start roomescape`를 쓰면 된다.\n\n변경 상황별로 보면 이렇게 나뉜다.\n\n| 바꾼 것 | 필요한 명령 |\n|---|---|\n| unit 파일 내용 | `sudo systemctl daemon-reload` 후 `sudo systemctl restart roomescape` |\n| env 파일 내용 | 보통 `sudo systemctl restart roomescape` |\n| jar 파일 내용 | stable path를 유지한다면 `sudo systemctl restart roomescape` |\n| 부팅 자동 시작 여부 | `sudo systemctl enable roomescape` 또는 `sudo systemctl disable roomescape` |\n\njar 파일 경로는 가능하면 안정적인 이름을 둔다. 예를 들어 배포 과정이 새 jar를 `/home/ubuntu/apps/roomescape/app.jar`로 교체하거나 symlink를 갱신하면, unit 파일은 매 배포마다 바뀌지 않아도 된다. 이 문서는 jar를 어떻게 교체할지보다, 교체된 jar를 service manager가 어떻게 다시 띄우는지에 초점을 둔다.\n\n## 상태 확인: `systemctl status`\n\n`systemctl status roomescape`는 첫 화면 진단 도구다. 여기서 보는 것은 단순히 실행 중이라는 한 단어가 아니다.\n\n- `Loaded`: unit 파일을 읽었는지, enable 상태인지 본다.\n- `Active`: `active running`, `failed`, `inactive` 중 어디인지 본다.\n- `Main PID`: systemd가 추적하는 JVM PID가 무엇인지 본다.\n- `Status`와 최근 로그: startup 실패, exit code, restart 반복 흔적을 본다.\n- `Tasks`, `Memory`, `CPU`: 서비스가 너무 커졌는지 대략 확인한다.\n\n`status`에서 `failed`가 보이면 바로 unit 파일을 고치기보다 최근 로그를 이어서 본다. Java 경로가 틀렸는지, jar 파일 권한이 없는지, profile 설정이 빠졌는지, port 충돌이 났는지는 대개 journal에 남는다.\n\n## 로그 확인: `journalctl -u`\n\nsystemd service의 표준 출력과 표준 에러는 journald로 들어간다. 그래서 별도 `app.log`를 정하지 않아도 아래 명령으로 볼 수 있다.\n\n```bash\nsudo journalctl -u roomescape.service -n 100 --no-pager\nsudo journalctl -u roomescape.service -f\nsudo journalctl -u roomescape.service --since today\n```\n\n각 명령의 느낌은 다르다. `-n 100`은 최근 100줄만 빠르게 확인하고, `-f`는 실시간 tail처럼 따라가며, `--since today`는 오늘 발생한 서비스 로그를 넓게 본다.\n\n로그를 볼 때는 Spring Boot startup banner만 찾지 말고, systemd가 남긴 종료 원인도 같이 본다. 예를 들어 exit code, signal, restart count가 반복되면 앱 자체 예외뿐 아니라 service policy도 함께 확인해야 한다.\n\n## 종료와 graceful shutdown 경계\n\n`sudo systemctl stop roomescape`를 실행하면 systemd는 기본적으로 main process에 SIGTERM을 보낸다. 이때 Spring Boot는 종료 준비 시간을 얻는다. 하지만 SIGTERM을 받았다는 사실만으로 모든 요청이 안전하게 끝나는 것은 아니다.\n\nSpring Boot 쪽에서는 보통 아래 설정을 함께 본다.\n\n```yaml\nserver:\n  shutdown: graceful\nspring:\n  lifecycle:\n    timeout-per-shutdown-phase: 20s\n```\n\n운영 경계는 이렇게 맞춘다.\n\n- systemd의 `TimeoutStopSec`가 Spring Boot의 shutdown timeout보다 충분히 길어야 한다.\n- 애플리케이션은 새 요청을 받지 않고 in-flight 요청과 background task를 정리해야 한다.\n- `TimeoutStopSec`가 지나면 systemd가 강제 종료 단계로 넘어갈 수 있으므로 shutdown hook에서 무한 대기하면 안 된다.\n- 평소 재시작도 `kill -9`가 아니라 `systemctl restart` 또는 `systemctl stop`으로 SIGTERM 경로를 타게 한다.\n\n즉 graceful shutdown은 systemd와 Spring Boot가 나눠 맡는다. systemd는 종료 신호와 시간 제한을 주고, 애플리케이션은 그 시간 안에서 요청 drain, resource close, consumer stop을 수행한다.\n\n## `Restart=on-failure`가 하는 일과 안 하는 일\n\n`Restart=on-failure`는 JVM이 예외로 죽거나 비정상 종료했을 때 service를 다시 올리는 정책이다. 이것은 프로세스 감시에는 유용하지만 애플리케이션 버그를 고치는 기능은 아니다.\n\n예를 들어 DB 설정이 잘못되어 startup마다 즉시 죽는다면 systemd는 몇 번이고 재시작을 시도할 수 있다. 이때 해결책은 `Restart=always`로 더 세게 되살리는 것이 아니라, journal에서 첫 번째 Spring exception을 보고 설정을 고치는 것이다.\n\n반대로 사람이 유지보수 때문에 `systemctl stop roomescape`를 실행한 경우에는 보통 다시 살아나면 안 된다. 그래서 입문 단계에서는 `always`보다 `on-failure`가 이해하기 쉽다. 정말 항상 살아 있어야 하는 서비스라면 왜 정상 stop 후에도 되살려야 하는지 운영 정책을 먼저 정한다.\n\n## 자주 틀리는 구성\n\n- `ExecStart`에 `nohup`이나 `&`를 넣는다. systemd가 main process를 추적하기 어려워진다.\n- `WorkingDirectory`를 생략하고 상대 경로 파일을 읽는다. SSH로 실행할 때와 service로 실행할 때 기준 디렉터리가 달라질 수 있다.\n- `User=root`로 그냥 둔다. 8080 같은 일반 port를 쓰는 Spring Boot 앱은 보통 root 권한이 필요 없다.\n- env 파일을 repo 안에 넣고 비밀값까지 commit한다. `EnvironmentFile`은 repo 밖 운영 파일로 다루는 편이 낫다.\n- unit 파일을 바꿨는데 `daemon-reload`를 하지 않는다. systemd가 이전 unit 정의를 계속 쓰는 것처럼 보일 수 있다.\n- `journalctl`을 보지 않고 app이 안 뜬다고만 판단한다. service 실패 원인은 대개 journal에 먼저 남는다.\n- `systemctl restart` 대신 PID를 찾아 `kill -9`부터 한다. graceful shutdown 경로와 restart policy를 우회하게 된다.\n\n## 디버깅 순서\n\n문제가 생기면 아래 순서로 보면 원인을 덜 섞는다.\n\n1. `sudo systemctl status roomescape`로 active, failed, main PID, exit code를 본다.\n2. `sudo journalctl -u roomescape -n 200 --no-pager`로 최근 실패 로그를 본다.\n3. `java` 절대 경로와 jar 절대 경로가 맞는지 확인한다.\n4. `User`가 jar, working directory, env file을 읽을 수 있는지 확인한다.\n5. env file에 `SPRING_PROFILES_ACTIVE`와 필수 설정이 있는지 확인한다.\n6. port 충돌이면 `sudo ss -ltnp`로 누가 해당 port를 잡고 있는지 본다.\n7. unit 파일을 수정했다면 `daemon-reload` 후 다시 시작한다.\n\n이 순서의 핵심은 네트워크나 Controller 코드로 바로 뛰지 않는 것이다. service가 뜨지 않았다면 먼저 Linux service lifecycle 증거를 봐야 한다.\n\n## 한 줄 정리\n\nEC2에서 Spring Boot jar를 운영 서비스로 다룰 때 systemd의 핵심은 명령을 길게 만드는 것이 아니라, `User`, `WorkingDirectory`, `EnvironmentFile`, `ExecStart`, `Restart`, `TimeoutStopSec`, journal, boot enable을 통해 프로세스 생명주기를 Linux가 이해할 수 있는 형태로 선언하는 것이다.\n",
+  "aliases": [
+    "Spring Boot systemd service",
+    "스프링부트 systemd 서비스",
+    "EC2 systemd jar 실행",
+    "java -jar nohup systemd 차이",
+    "systemctl Spring Boot",
+    "journalctl -u Spring Boot",
+    "SPRING_PROFILES_ACTIVE systemd",
+    "EnvironmentFile systemd",
+    "Restart=on-failure",
+    "WorkingDirectory User systemd"
+  ],
+  "expected_queries": [
+    "EC2에서 Spring Boot jar를 nohup 말고 systemd 서비스로 띄우려면 어떻게 해?",
+    "java -jar, nohup, systemd 차이를 운영 생명주기 관점에서 설명해줘",
+    "systemd unit에서 WorkingDirectory, User, EnvironmentFile은 왜 필요해?",
+    "SPRING_PROFILES_ACTIVE=prod를 systemd 서비스에 넣는 방법 알려줘",
+    "Spring Boot 서비스가 죽었을 때 systemctl status와 journalctl -u로 무엇을 확인해야 해?"
+  ],
+  "symptoms": [
+    "SSH를 끊으면 Spring Boot jar가 같이 죽거나 재부팅 뒤 자동으로 올라오지 않는다",
+    "`nohup`과 systemd를 같은 백그라운드 실행 방식으로 보고 실패 재시작과 상태 관리를 놓친다",
+    "unit 파일에서 `WorkingDirectory`, `User`, `EnvironmentFile`의 역할을 모른 채 `ExecStart`만 복사한다",
+    "서비스가 죽었을 때 `systemctl status`와 `journalctl -u` 대신 PID 파일이나 임시 로그만 찾는다",
+    "SIGTERM으로 graceful shutdown할 시간과 systemd의 강제 종료 timeout 경계를 맞추지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "operating-system/shell-job-control-command-bridge",
+      "operating-system/process-signal-graceful-shutdown-primer"
+    ],
+    "next_docs": [
+      "software-engineering/idempotent-deploy-script-pid-log-primer",
+      "operating-system/daemonization-checklist-primer"
+    ],
+    "confusable_with": [
+      "software-engineering/idempotent-deploy-script-pid-log-primer",
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "operating-system/shell-job-control-command-bridge",
+      "operating-system/daemonization-checklist-primer"
+    ],
+    "forbidden_for_queries": [
+      "deploy.sh에서 PID 파일과 app.log를 구현하는 방법",
+      "EC2 security group에서 8080 포트를 여는 방법",
+      "Nginx reverse proxy와 TLS 인증서 설정"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": []
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "id": "operating-system/ubuntu-apt-corretto-repository-troubleshooting-primer",
+  "title": "Ubuntu apt와 Amazon Corretto repository 문제 해결 Primer",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "Ubuntu 서버에서 Amazon Corretto 같은 외부 apt repository를 추가할 때 `corretto.list`의 deb line 형식, signed-by keyring, gpg dearmor, 중복 source, Malformed entry 오류를 분리해 `apt-get update` 실패를 안전하게 복구하는 입문 문서다.",
+  "body_markdown": "# Ubuntu apt와 Amazon Corretto repository 문제 해결 Primer\n\n> 한 줄 요약: `apt-get update`가 `Malformed entry`, `NO_PUBKEY`, `signed-by` 오류로 멈추면 Java 설치 문제가 아니라 apt가 읽는 repository 목록과 keyring 형식 문제부터 봐야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Spring Boot 실행형 jar EC2 배포 Runbook](../spring/spring-boot-executable-jar-ec2-runbook.md)\n- [Linux 서버 첫 디버깅 체크리스트](./linux-server-first-debug-checklist-primer.md)\n- [EC2 첫 서버 bootstrap 스크립트 Primer](../software-engineering/ec2-first-server-bootstrap-script-primer.md)\n\nretrieval-anchor-keywords: Ubuntu apt Corretto repository troubleshooting, apt.corretto.aws, corretto.list malformed entry URI, signed-by keyring, gpg dearmor, NO_PUBKEY, apt-get update source list, Amazon Corretto Java 21 install, apt sources.list.d repair, 외부 apt 저장소 오류\n\n## 이 문서가 먼저 맞는 질문\n\n| 증상 | 먼저 볼 것 | 이유 |\n|---|---|---|\n| `Malformed entry 1 in list file ... (URI)` | `.list` 파일의 `deb ... URL suite component` 형식 | apt가 repository 줄을 문법적으로 읽지 못한다 |\n| `NO_PUBKEY` 또는 서명 검증 실패 | keyring 파일과 `signed-by=` 경로 | package metadata 서명을 검증할 키가 없다 |\n| `apt-get update` 자체가 멈춤 | 잘못된 source 파일 제거/수정 | 한 repository 줄이 깨져도 전체 update가 실패할 수 있다 |\n| Java 설치 전부터 실패 | Java 패키지보다 apt metadata 단계 | 아직 `java-21-amazon-corretto-jdk` 설치 단계가 아니다 |\n\n입문자가 가장 헷갈리는 지점은 `apt-get install java`가 실패했다고 생각하는 것이다. 실제로는 그 앞 단계인 `apt-get update`가 repository 목록을 읽다가 멈춘 경우가 많다. apt는 `/etc/apt/sources.list`와 `/etc/apt/sources.list.d/*.list`를 먼저 읽고, 거기에 적힌 repository metadata를 내려받은 뒤에야 package 설치 후보를 계산한다.\n\n## apt repository 한 줄의 모양\n\n전통적인 `.list` 파일 한 줄은 대략 이런 구조다.\n\n```text\ndeb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main\n```\n\n각 칸은 역할이 다르다.\n\n| 부분 | 의미 | 흔한 실수 |\n|---|---|---|\n| `deb` | binary package repository | 빠뜨리거나 다른 문자열을 넣음 |\n| `[signed-by=...]` | 이 저장소 metadata 서명을 확인할 keyring | bracket 깨짐, 경로 오타, 공백 위치 오류 |\n| `https://apt.corretto.aws` | repository URI | 따옴표나 이상한 문자가 섞임 |\n| `stable` | suite/distribution | URI 자리에 들어가거나 빠짐 |\n| `main` | component | 누락되어 entry가 불완전해짐 |\n\n`Malformed entry ... (URI)`는 대개 apt가 URI가 있어야 할 위치에서 URL처럼 읽을 수 없는 값을 만났다는 뜻이다. `echo` 명령의 따옴표가 깨졌거나, 줄바꿈이 중간에 들어갔거나, shell 변수 치환이 빈 값이 된 상태로 `.list` 파일을 만든 경우가 흔하다.\n\n## keyring과 `signed-by`의 역할\n\n외부 repository는 package metadata에 서명한다. apt는 keyring에 있는 공개키로 이 서명을 검증한다. 예전 문서에서는 `apt-key add`를 쓰는 예가 많지만, 현대 Ubuntu/Debian 흐름에서는 저장소별 keyring 파일을 만들고 `signed-by=`로 연결하는 방식이 더 명확하다.\n\n일반적인 흐름은 이렇다.\n\n```bash\nwget -O /tmp/corretto.key https://apt.corretto.aws/corretto.key\nsudo gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg /tmp/corretto.key\necho 'deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main' \\\n  | sudo tee /etc/apt/sources.list.d/corretto.list\nsudo apt-get update\n```\n\n`gpg --dearmor`는 ASCII armored key를 apt가 keyring으로 읽기 좋은 binary `.gpg` 파일로 바꾸는 단계다. key 파일 다운로드가 성공했어도 keyring 경로가 다르거나 `signed-by`가 그 경로를 가리키지 않으면 apt는 서명 검증에서 실패할 수 있다.\n\n## 깨졌을 때 안전하게 확인하는 순서\n\n먼저 파일 내용을 본다. `cat`으로 전체를 보고, 이상하면 줄 번호를 붙여 확인한다.\n\n```bash\ncat /etc/apt/sources.list.d/corretto.list\nnl -ba /etc/apt/sources.list.d/corretto.list\nls -l /usr/share/keyrings/corretto-keyring.gpg\n```\n\n정상이라면 `corretto.list`에는 repository 줄 하나가 깔끔하게 있어야 한다. 빈 줄은 괜찮지만, `deb` 줄이 두 줄로 쪼개졌거나, URL 앞뒤에 따옴표가 파일에 그대로 들어갔거나, `signed-by` bracket이 닫히지 않았으면 고쳐야 한다.\n\n안전한 복구는 파일을 다시 만드는 것이다.\n\n```bash\nsudo rm -f /etc/apt/sources.list.d/corretto.list\nsudo rm -f /usr/share/keyrings/corretto-keyring.gpg\n\nwget -O /tmp/corretto.key https://apt.corretto.aws/corretto.key\nsudo gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg /tmp/corretto.key\necho 'deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main' \\\n  | sudo tee /etc/apt/sources.list.d/corretto.list\n\nsudo apt-get update\n```\n\n여기서 `rm -f` 대상은 Corretto repository 파일과 keyring 파일로 좁혀야 한다. `/etc/apt/sources.list.d/` 전체를 지우거나 `/usr/share/keyrings/` 전체를 건드리면 다른 repository까지 망가질 수 있다.\n\n## 오류별 분기표\n\n| 오류 문장 | 가까운 원인 | 다음 행동 |\n|---|---|---|\n| `Malformed entry ... (URI)` | `.list` 줄 형식 깨짐 | `nl -ba corretto.list`로 줄 확인 후 재작성 |\n| `The list of sources could not be read` | source file 중 하나가 문법 오류 | 방금 추가한 `.list` 파일부터 되돌림 |\n| `NO_PUBKEY` | 서명 검증 키 없음 | key download, `gpg --dearmor`, `signed-by` 경로 확인 |\n| `Conflicting values set for option Signed-By` | 같은 URI가 서로 다른 keyring으로 중복 등록 | 중복 `.list` 파일을 찾아 하나만 남김 |\n| `Could not resolve host` | DNS/네트워크 문제 | repository 줄보다 네트워크, DNS, proxy 확인 |\n| `404 Not Found` | URI/suite/component가 repository와 안 맞음 | 공식 설치 문서의 suite/component와 비교 |\n\n한 번에 여러 명령을 붙여 실행하면 어느 단계에서 깨졌는지 놓치기 쉽다. 처음 서버를 세팅할 때는 key 다운로드, keyring 생성, source list 작성, `apt-get update`, package 설치를 단계별로 나눠 보고 실패한 줄부터 고친다.\n\n## 배포 스크립트에 넣을 때의 기준\n\n스크립트는 여러 번 실행돼도 같은 결과가 나와야 한다. 그래서 repository 추가는 아래처럼 덮어쓰기 형태가 단순하다.\n\n```bash\nset -euo pipefail\n\ninstall_corretto_repo() {\n  local keyring=/usr/share/keyrings/corretto-keyring.gpg\n  local list=/etc/apt/sources.list.d/corretto.list\n\n  wget -O /tmp/corretto.key https://apt.corretto.aws/corretto.key\n  sudo gpg --dearmor -o \"$keyring\" /tmp/corretto.key\n  echo \"deb [signed-by=$keyring] https://apt.corretto.aws stable main\" | sudo tee \"$list\" >/dev/null\n  sudo apt-get update\n}\n```\n\n다만 `gpg --dearmor -o`는 파일이 이미 있으면 환경에 따라 overwrite 확인이나 실패가 날 수 있다. 자동화에서는 기존 파일을 지우고 다시 만들거나 임시 파일을 만든 뒤 `install -m 0644`로 교체하는 식으로 의도를 명확히 한다.\n\n## 흔한 오해\n\n- `wget`이 성공했으니 Java 설치 준비가 끝났다고 생각한다. key를 받은 것과 apt source가 올바른 것은 별개다.\n- `Malformed entry`를 package 이름 문제로 본다. 이 오류는 보통 `.list` 문법 문제다.\n- `sudo apt-get update`가 실패했는데 계속 `apt-get install`을 반복한다. metadata update가 성공해야 install 후보가 생긴다.\n- 급해서 `/etc/apt/sources.list.d` 전체를 지운다. 방금 추가한 파일만 좁게 되돌리는 편이 안전하다.\n- 설치 문서를 복사하면서 따옴표, 줄바꿈, shell prompt 문자까지 파일에 넣는다.\n\n## 꼬리질문\n\n> Q: `Malformed entry ... (URI)`가 나오면 Java 패키지를 다시 설치하면 되나요?\n> 의도: apt source parsing 단계와 package install 단계를 구분하는지 확인한다.\n> 핵심: 아니다. `.list` 파일의 deb line 형식을 먼저 고쳐 `apt-get update`가 성공해야 한다.\n\n> Q: `signed-by`는 왜 붙이나요?\n> 의도: repository별 keyring과 package metadata 서명 검증을 연결하는지 확인한다.\n> 핵심: 해당 repository metadata를 어떤 공개키로 검증할지 apt에 알려 주는 경로다.\n\n> Q: 같은 repository 줄을 여러 파일에 넣으면 왜 문제가 되나요?\n> 의도: 중복 source와 conflicting signed-by 오류를 이해하는지 확인한다.\n> 핵심: 같은 URI/suite/component가 서로 다른 옵션으로 등록되면 apt가 어떤 설정을 써야 할지 충돌할 수 있다.\n\n## 한 줄 정리\n\nCorretto 설치 실패를 만나면 `java` 명령부터 보지 말고 `/etc/apt/sources.list.d/corretto.list`의 `deb [signed-by=...] URL stable main` 형식, keyring 파일, 중복 source를 먼저 확인한다.\n",
+  "aliases": [
+    "Ubuntu apt Corretto",
+    "Amazon Corretto apt repository",
+    "corretto.list malformed entry",
+    "apt signed-by keyring",
+    "gpg dearmor apt key",
+    "NO_PUBKEY Corretto",
+    "apt-get update malformed URI",
+    "외부 apt 저장소 오류",
+    "Java 21 Corretto 설치 오류",
+    "sources.list.d 복구"
+  ],
+  "expected_queries": [
+    "Corretto 설치하다가 E: Malformed entry 1 in list file corretto.list (URI)가 나왔는데 어디가 잘못된 거야?",
+    "apt-get update가 The list of sources could not be read에서 멈추면 Java 설치를 다시 하면 돼?",
+    "wget으로 corretto.key는 받았는데 signed-by랑 gpg --dearmor가 각각 무슨 역할이야?",
+    "Ubuntu 서버에서 외부 apt repository를 추가할 때 sources.list.d 파일 형식을 어떻게 확인해?",
+    "NO_PUBKEY나 conflicting Signed-By 오류가 나면 keyring과 list 파일을 어떻게 복구해?"
+  ],
+  "symptoms": [
+    "Corretto key download는 성공했지만 apt-get update가 Malformed entry로 실패한다",
+    "signed-by 경로와 keyring 파일 역할을 구분하지 못한다",
+    "source list 한 줄 문법 오류를 package install 실패로 오해한다",
+    "중복 repository 파일 때문에 apt update가 conflicting Signed-By로 멈춘다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/linux-server-first-debug-checklist-primer"
+    ],
+    "next_docs": [
+      "software-engineering/ec2-first-server-bootstrap-script-primer",
+      "spring/spring-boot-executable-jar-ec2-runbook"
+    ],
+    "confusable_with": [
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "software-engineering/ec2-first-server-bootstrap-script-primer"
+    ],
+    "forbidden_for_queries": [
+      "Spring Boot jar 실행 방법",
+      "Gradle bootJar 실패",
+      "EC2 security group inbound 설정"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "note": "batch13 deployment-ops gap fill"
+      }
+    ]
+  }
+}

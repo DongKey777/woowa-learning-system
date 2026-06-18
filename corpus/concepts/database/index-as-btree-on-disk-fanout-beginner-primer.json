@@ -1,0 +1,69 @@
+{
+  "id": "database/index-as-btree-on-disk-fanout-beginner-primer",
+  "title": "디스크 B+Tree 인덱스와 Fanout 입문",
+  "category": "database",
+  "level": "beginner",
+  "summary": "DB 인덱스는 메모리의 이진 탐색 트리라기보다 디스크 page 단위로 읽히는 B+Tree 계열 구조로 이해하는 편이 안전하다. 한 page에 많은 key와 child pointer가 들어가 fanout이 커지고, 그래서 트리 높이가 낮아져 root에서 leaf까지 몇 번의 page read로 후보 위치를 찾는다. 이 개념은 clustered index, secondary index, covering index, page split, B+Tree vs LSM을 읽는 입문 다리다.",
+  "body_markdown": "# 디스크 B+Tree 인덱스와 Fanout 입문\n\n> 한 줄 요약: DB 인덱스는 이진트리처럼 깊게 내려가는 그림보다, page 하나에 많은 key를 담아 넓고 낮게 만든 디스크 B+Tree 구조로 이해해야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [DB 페이지 저장 단위와 디스크-메모리 모델](./db-page-storage-unit-disk-memory-beginner-primer.md)\n- [Index Basics](./index-basics.md)\n- [Index and EXPLAIN](./index-and-explain.md)\n- [BTree vs Hash Index Chooser](./btree-vs-hash-index-chooser.md)\n- [Clustered Index Locality](./clustered-index-locality.md)\n- [Covering Index Width, Leaf Fanout, and Write Amplification](./covering-index-width-fanout-write-amplification.md)\n\nretrieval-anchor-keywords: disk btree index, B+Tree fanout, database index page read, index height fanout, db index binary tree misconception, clustered index secondary index bridge, index root internal leaf page, 디스크 B트리 인덱스, 인덱스 fanout, 인덱스 페이지 읽기, 이진트리 오해\n\n---\n\n## 먼저 잡을 감각\n\n인덱스를 처음 배우면 정렬된 자료구조니까 이진 탐색 트리처럼 찾겠다고 생각하기 쉽다.\n\n```text\n        50\n      /    \\\n    20      80\n   /  \\    /  \\\n ...  ... ... ...\n```\n\n이 그림은 알고리즘 수업에서는 좋지만 DB 인덱스의 핵심 비용을 숨긴다. DB 인덱스는 메모리 포인터를 한 칸씩 따라가는 구조라기보다, 디스크 page를 읽고 그 page 안에서 여러 key를 비교하는 구조에 가깝다.\n\n초보자 기준 핵심은 세 가지다.\n\n- DB는 page 단위로 읽고 쓴다.\n- B+Tree의 한 node는 보통 page 하나로 생각할 수 있고, page 안에는 key가 많이 들어간다.\n- key가 많이 들어가면 자식도 많이 가리킬 수 있어 tree height가 낮아진다. 이 자식 수 감각이 fanout이다.\n\n그래서 DB 인덱스 성능을 설명할 때는 비교 횟수보다 page read 횟수를 먼저 떠올리는 편이 현실적이다.\n\n---\n\n## B+Tree는 어떻게 내려가나\n\n단순화하면 인덱스 lookup은 이렇게 진행된다.\n\n```text\nroot page\n  -> internal page\n    -> leaf page\n      -> matching key 또는 row 위치\n```\n\n각 page에는 key가 여러 개 들어 있다.\n\n```text\nroot page: [100 | 300 | 700 | 900]\n             |     |     |     |\n           child child child child ...\n```\n\n찾는 값이 `member_id = 720`이면 root page 안에서 700과 900 사이 범위를 보고 다음 child page를 고른다. 그 child page에서도 같은 방식으로 범위를 좁히고, 마지막 leaf page에서 실제 index entry를 찾는다.\n\n여기서 중요한 점은 root page 하나가 자식 2개가 아니라 수십~수백 개 이상의 child page를 가리킬 수 있다는 것이다. 이것이 fanout이다.\n\n---\n\n## fanout이 왜 중요한가\n\nfanout이 크면 tree가 넓고 낮아진다.\n\n예를 들어 단순하게 fanout이 100이라고 해 보자. 정확한 수치는 page 크기, key 크기, pointer 크기, fill factor에 따라 달라지지만 감각을 잡기에는 충분하다.\n\n| 단계 | 대략적인 감각 |\n|---|---|\n| root page 1장 | 다음 100개 영역 중 하나를 고른다 |\n| root + internal | 10,000개 영역 중 하나로 좁힌다 |\n| root + internal + leaf | 1,000,000개 규모도 몇 장의 page로 접근할 수 있다 |\n\n그래서 인덱스는 O(log n)이라고 외우는 것보다, beginner 단계에서는 이렇게 기억하는 편이 낫다.\n\n```text\n많은 row를 한 칸씩 비교하지 않는다.\n넓은 page fanout으로 범위를 크게 줄이고,\n몇 번의 page read로 leaf에 도착한다.\n```\n\n---\n\n## worked example: 예약 테이블에서 member_id로 찾기\n\n예약 테이블이 1,000,000건 있고 `member_id`에 secondary index가 있다고 하자.\n\n```sql\nCREATE INDEX idx_reservation_member_id\nON reservation(member_id);\n\nSELECT *\nFROM reservation\nWHERE member_id = 42;\n```\n\n인덱스 탐색은 대략 이렇게 보인다.\n\n```text\n1. root page 읽기\n2. internal page 읽기\n3. leaf page 읽기\n4. leaf에서 member_id = 42인 index entry 찾기\n5. 실제 row를 읽으러 이동\n```\n\n1~3은 B+Tree를 내려가는 비용이다. 5번은 인덱스 종류에 따라 달라진다.\n\n| 구분 | leaf에 무엇이 있나 | 조회 감각 |\n|---|---|---|\n| clustered index | row 데이터 자체 또는 row 저장 순서의 기준 | index를 찾으면 실제 row에 바로 가깝다 |\n| secondary index | 보조 key와 primary key 값 | 보조 index를 찾고 primary key로 clustered index를 다시 찾을 수 있다 |\n| covering index | 쿼리에 필요한 컬럼이 index 안에 모두 있음 | 실제 row 재조회 없이 index만 읽고 끝날 수 있다 |\n\n즉 secondary index lookup은 흔히 이런 식이다.\n\n```text\nsecondary index 탐색\n  -> leaf에서 primary key 획득\n  -> clustered index에서 primary key로 row 재조회\n```\n\n그래서 index를 탄다고 항상 page read가 작다고 단정하면 안 된다. 어떤 index인지, SELECT 컬럼이 무엇인지, 결과 row가 얼마나 되는지를 같이 봐야 한다.\n\n---\n\n## 범위 조회에서 B+Tree가 유리한 이유\n\nB+Tree는 leaf page들이 key 순서로 이어져 있다는 감각이 중요하다.\n\n```sql\nSELECT *\nFROM reservation\nWHERE member_id = 42\n  AND date BETWEEN '2026-06-01' AND '2026-06-30'\nORDER BY date;\n```\n\n시작 위치를 찾은 뒤에는 leaf page를 순서대로 따라가며 범위를 읽을 수 있다. 그래서 B+Tree는 단건 lookup뿐 아니라 range scan, ORDER BY, pagination 같은 패턴에도 잘 맞는다.\n\nHash index가 equality lookup에는 유리할 수 있어도 range query에 약한 이유도 여기서 이어진다. Hash는 순서를 보존하지 않기 때문이다.\n\n---\n\n## trade-off: fanout을 높이면 항상 좋을까\n\nfanout은 한 page에 들어가는 entry 수와 연결된다. entry가 작고 좁으면 한 page에 많이 들어가고, entry가 크고 넓으면 덜 들어간다.\n\n예를 들어 covering index를 만들려고 컬럼을 많이 넣으면 읽기 query 하나는 빨라질 수 있다.\n\n```sql\nCREATE INDEX idx_order_cover\nON orders(member_id, status, created_at, total_price, coupon_code, memo);\n```\n\n하지만 index가 넓어지면 비용도 생긴다.\n\n- leaf page에 들어가는 entry 수가 줄어 fanout이 낮아질 수 있다.\n- index 전체 크기가 커진다.\n- insert/update/delete 때 유지해야 할 index payload가 늘어난다.\n- buffer pool에 올라갈 수 있는 hot index page 비율이 줄어든다.\n- page split과 write amplification이 늘 수 있다.\n\n따라서 index 설계는 조회 한 번을 빠르게 만드는 일이 아니라, page read 감소와 write path 비용을 같이 보는 일이다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 왜 틀리기 쉬운가 | 더 정확한 관점 |\n|---|---|---|\n| 인덱스는 그냥 이진 탐색이다 | 정렬된 자료구조라는 설명만 기억한다 | DB index는 page 단위 B+Tree fanout이 핵심이다 |\n| 인덱스가 있으면 row를 바로 읽는다 | leaf에서 끝난다고 생각한다 | secondary index는 실제 row를 다시 찾아야 할 수 있다 |\n| covering index는 항상 좋다 | row lookup 감소만 본다 | index 폭, fanout, write amplification도 같이 봐야 한다 |\n| B+Tree는 단건 조회만 빠르다 | lookup만 떠올린다 | leaf 순서 덕분에 range query에도 강하다 |\n\n---\n\n## 미션에서 이렇게 연결된다\n\n예약 목록 조회가 느려 리뷰어가 index를 고려해 보라고 했다고 하자. 바로 `CREATE INDEX`를 붙이기 전에 질문을 나눠야 한다.\n\n- 이 query는 어떤 조건으로 시작 위치를 찾는가?\n- 결과가 한 건인가, 범위인가?\n- secondary index를 타고 실제 row를 많이 재조회하는가?\n- 필요한 컬럼만 읽으면 covering이 가능한가?\n- covering을 위해 index를 넓히면 write 비용이 커지지 않는가?\n- 정렬 조건과 range 조건이 같은 B+Tree 순서에서 자연스럽게 처리되는가?\n\n이 질문들이 B+Tree page read 감각에서 clustered/secondary/covering index 설계로 넘어가는 다리다.\n\n---\n\n## 다음에 이어 볼 문서\n\n| 지금 궁금한 것 | 다음 문서 |\n|---|---|\n| SQL에서 실제로 index를 탔는지 확인하고 싶다 | [Index and EXPLAIN](./index-and-explain.md) |\n| clustered, secondary, covering을 골라야 한다 | [Index Type Selection: Clustered / Secondary / Covering](./index-type-selection-clustered-secondary-covering-intermediate-chooser.md) |\n| covering index를 넓히면 왜 비용이 커지는지 궁금하다 | [Covering Index Width, Leaf Fanout, and Write Amplification](./covering-index-width-fanout-write-amplification.md) |\n| B+Tree와 Hash index를 비교하고 싶다 | [BTree vs Hash Index Chooser](./btree-vs-hash-index-chooser.md) |\n\n---\n\n## 꼬리질문\n\n> Q: DB 인덱스를 이진트리로만 설명하면 무엇을 놓치나요?\n> 의도: 디스크 page read 비용을 이해하는지 확인\n> 핵심: DB index는 page 하나에 많은 key를 담아 fanout을 키우고 tree height를 낮춘다.\n\n> Q: secondary index를 탔는데도 실제 row를 다시 찾는다는 말은 무엇인가요?\n> 의도: secondary leaf와 clustered row 접근을 구분하는지 확인\n> 핵심: secondary index leaf에는 보조 key와 primary key가 있고, 그 primary key로 clustered index를 다시 찾을 수 있다.\n\n> Q: covering index는 왜 항상 좋은 선택이 아닌가요?\n> 의도: read 최적화와 write/storage 비용을 함께 보는지 확인\n> 핵심: index entry가 넓어지면 fanout, cache residency, page split, write amplification 비용이 커질 수 있다.\n\n## 한 줄 정리\n\n디스크 B+Tree 인덱스의 핵심은 page 단위 fanout으로 tree를 넓고 낮게 만들어 page read를 줄이는 것이며, clustered/secondary/covering 여부가 실제 row까지 가는 비용을 바꾼다.\n",
+  "aliases": [
+    "B+Tree 인덱스",
+    "BTree 인덱스",
+    "비트리 인덱스",
+    "비트리인덱스",
+    "디스크 B트리",
+    "디스크B트리",
+    "인덱스 fanout",
+    "인덱스 팬아웃",
+    "DB index page read",
+    "B+Tree page",
+    "인덱스 이진트리 오해",
+    "clustered secondary index bridge"
+  ],
+  "expected_queries": [
+    "DB 인덱스가 왜 이진트리처럼 깊게 내려가지 않는다고 해?",
+    "인덱스로 찾을 때 디스크 page를 몇 번 읽는지 감이 안 와",
+    "B+Tree에서 fanout이 크면 인덱스 조회가 왜 빨라져?",
+    "secondary index를 타도 실제 row를 다시 찾는다는 게 무슨 뜻이야?",
+    "covering index가 좋아 보여도 컬럼을 많이 넣으면 왜 비용이 생겨?",
+    "범위 조회에서 B+Tree leaf가 정렬되어 있다는 말이 왜 중요해?"
+  ],
+  "symptoms": [
+    "DB 인덱스를 메모리 이진 탐색 트리로만 이해해 page read 비용을 놓친다.",
+    "B+Tree fanout이 왜 tree height와 연결되는지 설명하지 못한다.",
+    "secondary index, clustered index, covering index의 실제 row 접근 차이를 헷갈린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/index-basics",
+      "database/db-page-storage-unit-disk-memory-beginner-primer"
+    ],
+    "next_docs": [
+      "database/btree-vs-hash-index-chooser",
+      "database/bptree-vs-lsm-tree",
+      "database/page-split-merge-fill-factor",
+      "database/clustered-index-locality"
+    ],
+    "confusable_with": [
+      "database/index-and-explain",
+      "database/covering-index-vs-index-only-scan",
+      "database/covering-index-width-fanout-write-amplification"
+    ],
+    "forbidden_for_queries": [
+      "EXPLAIN에서 type과 key_len을 어떻게 읽는지 알려줘",
+      "covering index width가 write amplification을 어떻게 키우는지 자세히 설명해줘",
+      "B+Tree와 LSM Tree 중 storage engine을 어떻게 선택해?"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch46-stream-a-foundation"
+      }
+    ]
+  }
+}

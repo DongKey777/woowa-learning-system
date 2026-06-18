@@ -1,0 +1,63 @@
+{
+  "id": "system-design/kafka-partition-count-consumer-parallelism-primer",
+  "title": "Kafka Partition Count and Consumer Parallelism Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka consumer group에서 병렬 처리 상한은 기본적으로 partition 수에 묶인다. consumer 수, partition 수, lag, rebalance, hot partition을 함께 보며 왜 consumer를 무작정 늘려도 처리량이 늘지 않는지 설명한다.",
+  "body_markdown": "# Kafka Partition Count and Consumer Parallelism Primer\n\n## 한 줄 요약\n\nKafka consumer group 안에서는 한 partition이 한 시점에 보통 하나의 consumer에게 배정된다. 그래서 consumer 수가 partition 수보다 많아지면 남는 consumer가 생기고, 처리량을 늘리려면 partition 수, key skew, consumer 처리 시간, downstream 병목을 같이 봐야 한다.\n\n## consumer를 늘렸는데 왜 빨라지지 않을까\n\nKafka 초보자가 자주 겪는 문제는 lag가 늘어서 consumer replica를 늘렸는데 처리량이 그대로인 상황이다. Topic partition이 3개인데 consumer instance를 10개 띄우면 같은 consumer group 안에서 동시에 일할 수 있는 consumer는 최대 3개에 가깝다. 나머지는 partition을 배정받지 못한다.\n\n```text\ntopic partitions: P0 P1 P2\nconsumer group:   C1 C2 C3 C4 C5\nassignment:       C1->P0, C2->P1, C3->P2, C4 idle, C5 idle\n```\n\n이 모델은 단순하지만 운영에서는 hot partition, slow handler, DB saturation 때문에 더 복잡해진다.\n\n## partition 수가 주는 병렬성 상한\n\n| 상황 | 의미 | 다음 확인 |\n|---|---|---|\n| consumer 수 < partition 수 | consumer 하나가 여러 partition 처리 | consumer 추가로 처리량 증가 가능 |\n| consumer 수 = partition 수 | partition당 consumer 하나 | 대체로 group 병렬성 상한에 가까움 |\n| consumer 수 > partition 수 | idle consumer 발생 | partition 수나 내부 병렬화 필요 |\n| partition별 lag 편차 큼 | key skew 또는 hot partition | key 분포와 handler latency 확인 |\n| consumer 추가 후 lag 그대로 | downstream 병목 | DB/API/CPU/pool saturation 확인 |\n\nPartition 수는 처리량만이 아니라 ordering scope도 바꾼다. Partition을 늘리면 parallelism은 늘 수 있지만, 기존 key의 partition mapping 변경, 운영 복잡도, file/socket/resource 비용도 증가한다.\n\n## partition을 늘리기 전 질문\n\n1. Lag가 모든 partition에서 균등하게 쌓이는가?\n2. 특정 partition만 hot한가?\n3. Consumer handler가 CPU bound인가, DB/API bound인가?\n4. Consumer 수가 partition 수보다 이미 많은가?\n5. Partition key가 skew를 만들고 있지 않은가?\n6. Partition을 늘려도 downstream이 감당할 수 있는가?\n\nPartition 수를 늘리는 것은 마지막 수단일 수 있다. Hot key 하나가 대부분 traffic을 만든다면 partition을 늘려도 그 key는 여전히 한 partition으로 갈 수 있다.\n\n## consumer 내부 병렬화와 offset gap\n\n한 partition을 한 consumer가 맡는다고 해서 consumer 내부에서 절대 병렬 처리할 수 없는 것은 아니다. Poll한 record를 worker pool로 넘겨 처리할 수 있다. 하지만 이 경우 처리 완료 순서가 offset 순서와 달라져 offset gap 문제가 생긴다.\n\n따라서 내부 병렬화를 선택하면 다음이 필요하다.\n\n- gap 없이 완료된 offset까지만 commit하는 tracker\n- 같은 record 재처리에 안전한 idempotent handler\n- pause/resume으로 partition backlog를 조절하는 전략\n- max.poll.interval.ms를 넘지 않도록 poll loop 관리\n\n## rebalance 비용\n\nConsumer 수나 partition assignment가 바뀌면 rebalance가 발생한다. Consumer를 자주 늘리고 줄이면 lag를 줄이려다 오히려 stop-the-world처럼 처리 공백을 만들 수 있다. Cooperative rebalance나 static membership은 이 비용을 줄일 수 있지만, 먼저 partition/consumer/lag 관계를 이해해야 한다.\n\n## 흔한 오해\n\n- \"consumer replica를 늘리면 무조건 빨라진다\": partition 수와 downstream 병목이 상한을 만든다.\n- \"partition 수만 늘리면 된다\": hot key와 ordering scope, resource cost를 같이 봐야 한다.\n- \"idle consumer는 장애다\": partition보다 consumer가 많으면 자연스러운 결과일 수 있다.\n- \"lag가 있으면 Kafka가 문제다\": handler latency, DB lock, 외부 API 지연이 원인일 수 있다.\n- \"내부 병렬화는 공짜다\": offset gap과 idempotency 설계를 요구한다.\n\n## 운영 지표\n\n- partition count, consumer count, assigned partition count\n- partition별 lag와 oldest record age\n- consumer별 records/sec와 processing latency\n- rebalance count and duration\n- idle consumer count\n- key distribution and hot partition ratio\n- downstream DB/API latency and error rate\n- offset commit lag and commit failure count\n\n## 면접 답변 축\n\nKafka consumer 병렬성 질문에는 \"consumer group의 기본 병렬성은 partition 수가 상한이고, consumer가 partition보다 많으면 idle consumer가 생길 수 있다\"고 답한다. 이어서 lag가 줄지 않으면 partition별 skew, handler latency, downstream 병목을 확인하고, partition 증설이나 내부 병렬화는 ordering과 offset commit trade-off를 만든다고 말하면 된다.\n\n## Safe Next Docs\n\nPartition key와 ordering은 `kafka-partition-key-ordering-primer`, rebalance는 `kafka-consumer-group-rebalance-cooperative-vs-eager`, partition 내 병렬 처리와 offset gap은 `kafka-out-of-order-commit-offset-gap-parallelism`으로 이어진다.\n\n---\n\n## consumer 수를 늘려도 안 빨라지는 경우\n\nPartition이 3개인 topic에 같은 group consumer를 5개 붙이면 동시에 owner가 될 수 있는 consumer는 최대 3개다. 나머지는 idle이다. 그래서 처리량이 낮을 때 무조건 consumer instance를 늘리는 것은 답이 아니다.\n\n| 관찰 | 해석 | 다음 확인 |\n|---|---|---|\n| consumer 수 > partition 수 | idle consumer 가능 | assignment와 idle metric |\n| 특정 partition lag만 큼 | hot key 또는 skew | key 분포와 partition별 lag |\n| 모든 partition lag가 큼 | 전체 처리율 부족 | downstream, batch size, consumer CPU |\n| consumer CPU 낮고 lag 큼 | DB/API 병목 가능 | processing time, pool wait |\n\nPartition 수를 늘리면 병렬성 상한은 열리지만 ordering scope, rebalancing, file handle, broker metadata, producer batching efficiency에도 영향을 준다. 이미 hot key 하나가 대부분의 traffic을 만든다면 partition 수만 늘려도 그 key는 여전히 한 partition에 묶인다.\n\n## 내부 병렬 처리 caveat\n\n한 consumer가 partition에서 record를 읽은 뒤 내부 thread pool로 병렬 처리하면 partition 수보다 높은 병렬도를 만들 수 있다. 하지만 offset commit은 prefix 완료를 의미하므로, 앞 offset 실패와 뒤 offset 성공 사이 gap을 관리해야 한다. 이 지점이 out-of-order commit 문서로 이어진다.\n\n## 추가 한 줄 정리\n\nKafka consumer 병렬성의 첫 상한은 partition ownership이고, lag가 높을 때는 consumer 수보다 partition별 skew와 downstream 처리 시간을 먼저 나눠 봐야 한다.\n",
+  "aliases": [
+    "Kafka partition count",
+    "consumer parallelism",
+    "카프카 consumer 수",
+    "partition 수 병렬성",
+    "consumer idle partition",
+    "consumer lag partition",
+    "카프카 처리량",
+    "partition count scaling",
+    "consumer group capacity",
+    "hot partition lag"
+  ],
+  "expected_queries": [
+    "Kafka consumer를 partition 수보다 많이 늘려도 처리량이 안 늘 수 있는 이유가 뭐야?",
+    "카프카 consumer group 병렬성은 partition count가 상한이라는 말이 무슨 뜻이야?",
+    "consumer lag가 있는데 consumer를 늘려도 idle consumer만 생기면 무엇을 봐야 해?",
+    "Kafka partition 수를 늘리기 전에 key skew와 downstream 병목을 확인해야 하는 이유는?",
+    "한 partition 안에서 consumer 내부 병렬화를 하면 offset gap 문제가 생기는 이유가 뭐야?",
+    "partition count와 consumer count를 면접에서 처리량과 ordering trade-off로 설명해줘"
+  ],
+  "symptoms": [
+    "consumer replica를 늘렸는데 lag가 줄지 않는다",
+    "consumer 수가 partition 수보다 많아 idle consumer가 생긴다",
+    "특정 partition만 lag가 쌓여 전체 처리 완료가 늦어진다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-partition-key-ordering-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/hot-key-skew-mitigation-interview-playbook"
+    ],
+    "confusable_with": [
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "operating-system/thread-pool-backpressure-saturation-playbook",
+      "system-design/kafka-partition-key-ordering-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka cooperative rebalance와 eager rebalance 차이를 자세히 설명해줘",
+      "Kafka partition key로 주문 이벤트 순서를 지키는 방법을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-partition-count-consumer-parallelism-primer.md",
+    "revision_history": [],
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "last_expansion_source": "y14-expansion-batch98-stream-c-kafka-foundation-depth"
+  }
+}

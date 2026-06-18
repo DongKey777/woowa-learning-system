@@ -6,15 +6,24 @@
   "summary": "이 symptom_router는 file descriptor leak와 Too many open files 장애를 분기한다. socket leak, lsof, stream close 누락, connection 누수 같은 운영 증상을 다룬다.",
   "body_markdown": "# File Descriptor Leak Symptom Router\n\n## 관찰 증거\n\n프로세스의 open fd 수, `ulimit`, `lsof` output, socket state, 최근 배포 변경을 같이 본다. `Too many open files`는 결과 메시지이고, 1차 분기는 \"프로세스 한도(`EMFILE`)에 걸렸는가, 시스템 전체 한도(`ENFILE`)에 걸렸는가, 아니면 순간 burst인가\"다.\n\n이 router의 첫 분기는 **fd number leak**과 **open file description을 붙잡는 leak**을 나누는 것이다. Linux에서 fd는 open file description을 가리키는 참조이고, `dup()`/`fork()`로 복제된 fd가 남아 있으면 한쪽을 닫아도 underlying object는 계속 살아 있을 수 있다.\n\n```bash\n# 프로세스 한도와 현재 사용량\ncat /proc/<pid>/limits | grep -i \"open files\"\nls /proc/<pid>/fd | wc -l\n\n# 열린 객체 유형 분포\nlsof -p <pid> | awk 'NR>1 {count[$5]++} END {for (t in count) print count[t], t}' | sort -nr\nls -l /proc/<pid>/fd | head\ncat /proc/<pid>/fdinfo/<fd>\n\n# 소켓 상태\nss -tanp | grep <pid>\n\n# 시스템 전체 file handle\ncat /proc/sys/fs/file-nr\ncat /proc/sys/fs/file-max\n```\n\n## 1차 분기\n\n| 관찰 | 먼저 의심 | 다음 확인 |\n|---|---|---|\n| `/proc/<pid>/fd` 개수가 `Max open files`에 단조 증가하며 접근 | 프로세스 fd leak 또는 connection leak | `lsof` 유형 분포, 배포 diff, close path |\n| `lsof`에 같은 remote address socket이 계속 증가 | HTTP/DB/socket close 누락 또는 pool 반환 누락 | connection pool active/idle/leak detection |\n| `REG`/`(deleted)` 파일이 많음 | file stream close 누락, log rotation 후 fd 유지 | try-with-resources, logger reopen |\n| `CLOSE_WAIT`가 많음 | peer가 닫았는데 local app이 close 안 함 | response body/stream close 경로 |\n| `TIME_WAIT`가 많음 | leak보다는 connection churn 가능 | client/server 방향, keep-alive, ephemeral port |\n| 순간 spike 후 내려감 | traffic burst 또는 한도 sizing 문제 | peak, autoscaling, burst control |\n| 여러 프로세스가 동시에 흔들림 | system-wide file table pressure | `file-nr`, host-level top fd users |\n| child process 종료 뒤에도 fd가 남음 | fork/exec inheritance, `FD_CLOEXEC` 누락 | `/proc/<pid>/fdinfo`, child pid fd, launch code |\n\nOpen file/socket 수가 계속 증가하면 close 누락이나 connection leak을 의심한다. 순간 spike만 있다면 traffic burst나 limit sizing도 함께 본다.\n\n## 다음 확인\n\nHTTP response body, file stream, database connection, selector channel이 예외 경로에서도 닫히는지 확인한다.\n\n```java\n// 좋은 기본형: 예외 경로에서도 close\ntry (InputStream in = Files.newInputStream(path)) {\n    return in.readAllBytes();\n}\n```\n\nHTTP client에서는 \"request 객체를 만들었다\"가 아니라 response body까지 소비/close되는지가 중요하다.\n\n```java\n// 개념 예시: 실제 API는 client별로 다르다.\ntry (Response response = client.execute(request)) {\n    return response.body().string();\n}\n```\n\nDB에서는 connection close가 실제 socket close가 아니라 pool 반환일 수 있다. 그래도 application code는 `try-with-resources`로 반환 경로를 보장해야 한다.\n\n프로세스 생성 경로가 있다면 `FD_CLOEXEC`도 본다. exec 이후 필요 없는 fd가 child process에 상속되면 parent가 닫아도 child가 open file description을 붙잡을 수 있고, deleted file 공간 회수나 socket 종료가 늦어질 수 있다.\n\n## 관찰 지표\n\n- fd count slope: `/proc/<pid>/fd` 개수가 트래픽과 무관하게 계속 상승하는가.\n- fd type mix: `IPv4/IPv6`, `REG`, `FIFO`, `anon_inode`, `(deleted)` 중 무엇이 많은가.\n- socket state: `CLOSE_WAIT`, `ESTABLISHED`, `TIME_WAIT` 비율이 어떤가.\n- pool metric: DB/HTTP pool active, idle, pending acquire, leak detection log.\n- error log: `EMFILE`, `ENFILE`, `Too many open files`, accept 실패, log file open 실패.\n- deploy correlation: 특정 배포 이후 slope가 바뀌었는가.\n\n컨테이너에서는 namespace 경계를 주의한다. 컨테이너 내부 `lsof`/`ss`는 해당 PID/network namespace 기준이고, host에서 보는 pid와 fd 경로는 다를 수 있다. Kubernetes 증상이라면 container pid를 host pid로 매핑한 뒤 같은 프로세스를 보고 있는지 확인한다.\n\n## 명령 예시: 시간차 비교\n\n한 번 찍은 `lsof`보다 시간차 비교가 leak 증거에 가깝다.\n\n```bash\ndate\nls /proc/<pid>/fd | wc -l\nlsof -p <pid> | awk 'NR>1 {count[$5]++} END {for (t in count) print count[t], t}' | sort -nr\nsleep 60\ndate\nls /proc/<pid>/fd | wc -l\nlsof -p <pid> | awk 'NR>1 {count[$5]++} END {for (t in count) print count[t], t}' | sort -nr\n```\n\n증가한 유형이 socket인지 file인지 deleted file인지에 따라 다음 조사가 갈린다.\n\n검증 기준:\n\n- 같은 부하에서 fd count slope가 0에 가까워졌는가\n- `CLOSE_WAIT` 또는 `(deleted)` 같은 특정 유형이 줄었는가\n- `EMFILE`/`ENFILE` error와 accept/open 실패가 사라졌는가\n- 한도 상향만 했다면 장애 시간이 늦춰진 것인지 leak slope가 줄어든 것인지 분리했는가\n\n## 잘못된 대응\n\n- `ulimit -n`만 올리고 close 누락을 보지 않는다. leak이면 장애 시점만 늦어진다.\n- `TIME_WAIT`가 많다는 이유만으로 fd leak이라고 단정한다. 많은 `TIME_WAIT`는 연결 churn 증상일 수 있다.\n- `CLOSE_WAIT`를 커널 튜닝으로 해결하려 한다. 보통 local process가 close하지 않은 것이다.\n- `lsof` 한 장만 보고 결론낸다. fd leak은 slope와 유형 변화가 중요하다.\n- response stream, file stream, DB connection을 happy path에서만 닫고 예외 경로를 놓친다.\n- 삭제한 로그 파일 `(deleted)`을 프로세스가 붙잡고 있는데 디스크 사용량만 본다.\n- parent만 닫았으니 fd가 사라졌다고 본다. child나 duplicate fd가 같은 open file description을 잡고 있을 수 있다.\n\n## 관련 playbook\n\nJFR/thread dump로 blocking stack을 확인하고, connection pool metric과 함께 본다. fd leak은 Java heap leak과 달리 `/proc`, `lsof`, socket state 같은 OS 증거가 원인 분기에 직접적이다.\n",
   "aliases": [
-    "file descriptor leak symptom router",
-    "too many open files socket leak",
-    "file descriptor 누수",
-    "too many open files 원인"
+    "file descriptor leak triage",
+    "socket fd leak symptom",
+    "too many open files leak",
+    "lsof fd 증가 분석",
+    "CLOSE_WAIT close 누락",
+    "response body close leak",
+    "파일 디스크립터 누수",
+    "소켓 close 누락",
+    "connection pool fd leak",
+    "deleted file descriptor leak"
   ],
   "expected_queries": [
     "too many open files가 나면 어디부터 봐?",
     "socket이나 file descriptor leak은 어떻게 증거를 잡아?",
-    "connection close를 안 해서 FD가 늘어나는지 확인하려면?"
+    "connection close를 안 해서 FD가 늘어나는지 확인하려면?",
+    "lsof에서 같은 remote socket이 계속 늘면 close 누락을 어떻게 의심해?",
+    "CLOSE_WAIT가 많을 때 kernel tuning보다 application close path를 먼저 보는 이유는?",
+    "response body나 file stream을 예외 경로에서 닫지 않으면 fd leak이 어떻게 나타나?"
   ],
   "symptoms": [
     "Too many open files 에러가 보여요",

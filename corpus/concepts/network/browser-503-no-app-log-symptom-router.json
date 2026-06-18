@@ -6,19 +6,24 @@
   "summary": "503와 app 로그 부재가 같이 보이면 먼저 \"애플리케이션이 죽었다\"보다 \"앞단 gateway나 sidecar가 upstream을 고르지 못했거나, local reply로 먼저 실패를 선언했나?\"를 의심하는 편이 맞다.",
   "body_markdown": "# 브라우저는 503인데 앱 로그는 없음 원인 라우터\n\n## 한 줄 요약\n\n> `503`와 app 로그 부재가 같이 보이면 먼저 \"애플리케이션이 죽었다\"보다 \"앞단 gateway나 sidecar가 upstream을 고르지 못했거나, local reply로 먼저 실패를 선언했나?\"를 의심하는 편이 맞다.\n\n## 관찰에서 첫 분기\n\n- 관찰: DevTools body 첫 줄이 짧은 `503 Service Unavailable` HTML이고 app 공통 JSON이나 trace id가 없다. 첫 분기: app down 단정보다 proxy, LB, sidecar의 local reply owner를 먼저 찾는다. 다음 확인: `Server`, `Via`, Envoy/Nginx/ALB error field, upstream cluster, local reply reason을 request id로 맞춘다.\n- 관찰: 배포나 target 교체 구간에만 `503`이 몰리고 app access log는 비어 있다. 첫 분기: 코드 예외보다 healthy upstream 공백, readiness flap, deregistration delay 문제로 둔다. 다음 확인: target health timeline, readiness/liveness event, LB healthy host count, endpoint update 지연을 같은 분 단위로 비교한다.\n- 관찰: mesh 도입 뒤 특정 route만 `503`이고 origin은 조용하다. 첫 분기: app capacity 부족보다 sidecar overload, circuit breaker, adaptive concurrency shedding으로 갈라 본다. 다음 확인: local reply counter, pending request/queue wait, circuit breaker open count, route-level retry/timeout policy를 본다.\n\n## 가능한 원인\n\n1. gateway나 reverse proxy가 `no healthy upstream` 같은 상태를 자기 `503`으로 표면화했을 수 있다. 이때 app은 요청을 아예 못 받았거나, 받기 전에 upstream 선택이 끝나 버린다. 다음 문서: [Proxy Local Reply vs Upstream Error Attribution](./proxy-local-reply-vs-upstream-error-attribution.md), [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n2. 배포나 scale-in 직후 readiness 전환과 draining이 어긋나 healthy target이 잠깐 비었을 수 있다. app 예외가 없는 이유는 코드 실패보다 target 교체 타이밍에서 proxy가 먼저 `503`을 만들었기 때문이다. 다음 문서: [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md), [Vendor-Specific Proxy Symptom Translation: Nginx, Envoy, ALB](./vendor-specific-proxy-symptom-translation-nginx-envoy-alb.md)\n3. mesh나 gateway의 local overload, adaptive concurrency, circuit breaking이 일부 route를 먼저 shedding했을 수 있다. 사용자는 단순 `503`만 보지만 app capacity 부족이 아니라 sidecar 정책 응답일 수도 있다. 다음 문서: [Service Mesh Local Reply, Timeout, Reset Attribution](./service-mesh-local-reply-timeout-reset-attribution.md), [Mesh Adaptive Concurrency, Local Reply, Metrics Tuning](./mesh-adaptive-concurrency-local-reply-metrics-tuning.md)\n4. 실제 bottleneck은 upstream app보다 queue나 connection slot 부족인데, dispatch 전에 timeout이나 local reject가 나가 `503`처럼 보였을 수 있다. 이 경우 질문은 \"왜 app이 느렸나\"보다 \"왜 upstream으로 보내기 전에 막혔나\"로 바뀐다. 다음 문서: [Queue Saturation Attribution, Metrics, Runbook](./queue-saturation-attribution-metrics-runbook.md)\n5. 사실 `503`은 맞지만 body owner를 app으로 오해했을 수 있다. 짧은 `Service Unavailable` HTML이나 vendor 기본 문구가 보이면 app 공통 JSON보다 proxy 기본 페이지 후보를 먼저 잡는 편이 안전하다. 다음 문서: [Browser DevTools `Server` / `Via` / `X-Request-Id` 1분 헤더 카드](./browser-devtools-gateway-error-header-clue-card.md), [Gateway Default HTML First-Line Card](./gateway-default-html-first-line-card.md)\n\n## 빠른 자기 진단\n\n1. DevTools에서 `Status`와 response body 첫 줄을 같이 본다. 짧은 `503 Service Unavailable` HTML이나 vendor 기본 문구가 강하면 app payload보다 proxy local reply 후보를 먼저 적는다.\n2. 응답 헤더의 `Server`, `Via`, `X-Request-Id`를 함께 본다. proxy 흔적은 강한데 app trace key가 안 이어지면 \"app 로그 누락\"보다 \"앞단 owner\" 쪽으로 기운다.\n3. 같은 시각에 배포, scale-in, target deregistration, readiness flap, healthcheck 실패가 있었는지 본다. `503`이 그 구간에만 몰리면 코드 예외보다 healthy upstream 공백 분기가 더 유력하다.\n4. mesh나 gateway 메트릭에서 local reply reason, overload counter, queue wait, pending acquire가 튀는지 본다. 튄다면 app business 실패보다 보호 정책이나 dispatch 전 병목 쪽이 먼저다.\n5. 사용자가 본 `503`과 app 팀이 본 무응답이 같은 요청인지 request id로 대조한다. 서로 다른 홉의 다른 관찰을 같은 사건으로 묶으면 원인 분기가 틀어진다.\n\n## 다음 학습\n\n- proxy가 만든 응답인지 upstream 응답인지 더 정확히 보려면 [Proxy Local Reply vs Upstream Error Attribution](./proxy-local-reply-vs-upstream-error-attribution.md)\n- 배포 직후 `503`이 늘어나는 장면을 운영 관점에서 보려면 [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n- mesh 도입 뒤 local reply와 reset을 같이 읽으려면 [Service Mesh Local Reply, Timeout, Reset Attribution](./service-mesh-local-reply-timeout-reset-attribution.md)\n- `503` 대신 `502`인데 app 로그가 비는 장면이면 [브라우저는 502인데 앱 로그는 없음 원인 라우터](./브라우저는-502인데-앱-로그는-없음-원인-라우터.md)\n- `503` 대신 `504`인데 app은 나중에 `200`을 남기는 장면이면 [브라우저는 504인데 앱 로그는 200 원인 라우터](./browser-504-app-200-symptom-router.md)\n",
   "aliases": [
-    "브라우저는 503인데 앱 로그가 없어요",
-    "service unavailable인데 서버 로그가 없어요",
-    "503이 떴는데 애플리케이션은 조용해요",
-    "gateway 503인데 백엔드 로그가 안 보여요",
-    "브라우저에서만 503 보고 앱에는 흔적이 없어요",
-    "503 service unavailable인데 origin 로그가 비어요"
+    "브라우저 503 앱 로그 없음",
+    "service unavailable no server log",
+    "gateway 503 origin missing",
+    "503 proxy local reply",
+    "앱 trace 없는 503",
+    "mesh route 503",
+    "origin 로그 비어 있음",
+    "backend 못 받은 503",
+    "503 service unavailable 분기",
+    "endpoint unavailable gateway"
   ],
   "expected_queries": [
     "브라우저에서 503 service unavailable이 뜨는데 앱 로그가 없으면 어디부터 봐야 해?",
     "사용자는 503을 봤는데 백엔드에서는 요청을 못 받았다고 할 때 무슨 뜻이야?",
     "배포 직후에만 503이 나고 애플리케이션 로그는 비면 어느 홉을 의심해야 해?",
     "mesh 붙인 뒤 일부 route만 503이 늘고 앱 trace가 없으면 무엇부터 확인해?",
-    "service unavailable 응답인데 app 공통 에러 JSON이 없으면 proxy가 만든 응답으로 봐도 돼?"
+    "service unavailable 응답인데 app 공통 에러 JSON이 없으면 proxy가 만든 응답으로 봐도 돼?",
+    "endpoint가 없거나 upstream cluster가 비어서 gateway 503이 나면 앱 로그가 왜 남지 않아?"
   ],
   "symptoms": [
     "브라우저 DevTools에서는 `503 Service Unavailable`이 보이는데 애플리케이션 access log나 trace에는 같은 시각 요청 흔적이 거의 없어 어디서 막혔는지 감이 안 잡힌다",

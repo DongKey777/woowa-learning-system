@@ -4,20 +4,23 @@
   "category": "spring",
   "level": "beginner",
   "summary": "lotto 구매 한 번이 purchase 1건과 ticket 여러 장을 함께 확정하는 유스케이스라면, 트랜잭션 경계도 Controller나 Repository가 아니라 그 흐름을 조립하는 Service 메서드에 두는 편이 자연스럽다.",
-  "body_markdown": "# lotto 구매 1회/여러 장 티켓 저장 ↔ Spring @Transactional 경계 브릿지\n\n## 한 줄 요약\n\n> lotto 구매 한 번이 `purchase` 1건과 `ticket` 여러 장을 함께 확정하는 유스케이스라면, 트랜잭션 경계도 Controller나 Repository가 아니라 그 흐름을 조립하는 Service 메서드에 두는 편이 자연스럽다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"purchase 저장 후 ticket 저장이 실패하면 어디까지 남아요?\" | 구매 1건과 티켓 여러 장을 따로 저장하다 중간 실패가 생기는 lotto 저장 흐름 | 부모 row와 자식 row를 한 유스케이스 트랜잭션으로 묶는다 |\n| \"controller가 구매 흐름을 다 아니까 `@Transactional`을 붙여도 되나요?\" | HTTP 요청 처리와 DB 원자성 경계가 controller에 같이 들어간 코드 | 트랜잭션은 구매 유스케이스를 조립하는 service 메서드에 두는 편이 자연스럽다 |\n| \"중복 구매 방지도 transaction으로 해결되나요?\" | 더블클릭 재전송과 purchase-ticket 원자성을 같은 문제로 보는 설계 | atomic save와 idempotency/dedup을 다른 축으로 분리한다 |\n\n## 미션 시나리오\n\nlotto를 콘솔 과제에서 웹 애플리케이션으로 옮기면 구매 금액으로 장수를 계산하고, 번호를 생성하고, `purchase`를 저장한 뒤 `ticket` 여러 장을 저장하는 흐름이 생긴다. 이때 학습자는 자주 \"save는 repository가 하니까 트랜잭션도 repository에 두면 되지 않나?\" 혹은 \"Controller가 구매 요청을 다 알고 있으니 거기에 `@Transactional`을 붙이면 한 번에 묶이지 않나?\"에서 막힌다.\n\n문제는 저장 SQL 개수보다 의미 단위다. 리뷰에서 \"구매 한 번이 반쯤 저장되면 안 된다\", \"부모 purchase와 자식 ticket이 함께 성공하거나 함께 실패해야 한다\"는 말을 듣는 자리가 여기다. `purchase` row만 남고 `ticket` 저장이 중간에 터지면, DB에는 이미 존재하는 구매인데 학습자 눈에는 실패한 요청처럼 보이는 어색한 상태가 생긴다.\n\n## CS concept 매핑\n\nSpring에서 `@Transactional`은 \"이 메서드가 책임지는 DB 변경을 한 원자 단위로 commit/rollback한다\"는 선언이다. lotto 구매에서는 `구매 금액 해석 -> purchase 생성 -> ticket 여러 장 저장`이 하나의 유스케이스이므로, 이 순서를 조립하는 Service 메서드가 경계가 된다.\n\n짧게 그리면 `purchaseRepository.save(purchase)`와 `ticketRepository.saveAll(tickets)`를 같은 서비스 메서드 안에서 호출하고, 그 메서드에 `@Transactional`을 둔다. 그러면 자식 ticket 저장에서 예외가 나면 부모 purchase 저장도 함께 rollback된다. 반대로 각 Repository 메서드가 자기 안에서 따로 commit하면 \"부모는 저장됐는데 자식은 일부만 실패\" 같은 상태를 막기 어렵다.\n\n여기서 중요한 구분이 하나 더 있다. 이 문서는 \"부모-자식 row를 한 번에 확정하는 로컬 트랜잭션\" 이야기다. 더블클릭 재전송처럼 같은 구매 요청이 두 번 들어오는 문제는 별도 축이므로, 그것까지 해결하려면 멱등성 키나 `UNIQUE` 제약을 이어서 봐야 한다.\n\n## 미션 PR 코멘트 패턴\n\n- \"구매 한 번이 여러 repository 호출로 끝나는데 `@Transactional`이 없으면 중간 실패 시 반쯤 저장될 수 있습니다. 서비스 경계에서 묶어 보세요.\"\n- \"Controller는 HTTP 요청을 받고 응답을 만드는 자리이지, 원자성 경계를 표현하는 자리가 아닙니다.\"\n- \"Repository마다 트랜잭션을 따로 두면 purchase와 ticket 저장이 같은 비즈니스 단위로 묶이지 않습니다.\"\n- \"트랜잭션으로 막는 문제와 중복 요청을 막는 문제를 분리해 설명해 보세요. 전자는 atomic save, 후자는 idempotency입니다.\"\n\n## 다음 학습\n\n- service 메서드에 트랜잭션을 두는 일반 패턴은 `spring/spring-service-layer-transaction-boundary-patterns`\n- 구매 1건과 티켓 여러 장의 DB 구조를 먼저 다시 잡으려면 `database/lotto-purchase-ticket-parent-child-modeling-bridge`\n- 중복 구매 재전송까지 같이 고민해야 하면 `database/lotto-purchase-duplicate-submit-idempotency-bridge`\n- 메모리 안 구매 흐름 조립 책임을 복습하려면 `software-engineering/lotto-purchase-flow-service-layer-bridge`\n",
+  "body_markdown": "# lotto 구매 1회/여러 장 티켓 저장 ↔ Spring @Transactional 경계 브릿지\n\n## 한 줄 요약\n\n> lotto 구매 한 번이 `purchase` 1건과 `ticket` 여러 장을 함께 확정하는 유스케이스라면, 트랜잭션 경계도 Controller나 Repository가 아니라 그 흐름을 조립하는 Service 메서드에 두는 편이 자연스럽다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"purchase 저장 후 ticket 저장이 실패하면 어디까지 남아요?\" | 구매 1건과 티켓 여러 장을 따로 저장하다 중간 실패가 생기는 lotto 저장 흐름 | 부모 row와 자식 row를 한 유스케이스 트랜잭션으로 묶는다 |\n| \"controller가 구매 흐름을 다 아니까 `@Transactional`을 붙여도 되나요?\" | HTTP 요청 처리와 DB 원자성 경계가 controller에 같이 들어간 코드 | 트랜잭션은 구매 유스케이스를 조립하는 service 메서드에 둔다 |\n| \"중복 구매 방지도 transaction으로 해결되나요?\" | 더블클릭 재전송과 purchase-ticket 원자성을 같은 문제로 보는 설계 | atomic save와 idempotency/dedup을 다른 축으로 분리한다 |\n\n## 미션 시나리오\n\nlotto를 콘솔 과제에서 웹 애플리케이션으로 옮기면 구매 금액으로 장수를 계산하고, 번호를 생성하고, `purchase`를 저장한 뒤 `ticket` 여러 장을 저장하는 흐름이 생긴다. 이때 학습자는 자주 \"save는 repository가 하니까 트랜잭션도 repository에 두면 되지 않나?\" 혹은 \"Controller가 구매 요청을 다 알고 있으니 거기에 `@Transactional`을 붙이면 한 번에 묶이지 않나?\"에서 막힌다.\n\n문제는 저장 SQL 개수보다 의미 단위다. 리뷰에서 \"구매 한 번이 반쯤 저장되면 안 된다\", \"부모 purchase와 자식 ticket이 함께 성공하거나 함께 실패해야 한다\"는 말을 듣는 자리가 여기다. `purchase` row만 남고 `ticket` 저장이 중간에 터지면, DB에는 이미 존재하는 구매인데 학습자 눈에는 실패한 요청처럼 보이는 어색한 상태가 생긴다.\n\n## CS concept 매핑\n\nSpring에서 `@Transactional`은 \"이 메서드가 책임지는 DB 변경을 한 원자 단위로 commit/rollback한다\"는 선언이다. lotto 구매에서는 `구매 금액 해석 -> purchase 생성 -> ticket 여러 장 저장`이 하나의 유스케이스이므로, 이 순서를 조립하는 Service 메서드가 경계가 된다.\n\n짧게 그리면 `purchaseRepository.save(purchase)`와 `ticketRepository.saveAll(tickets)`를 같은 서비스 메서드 안에서 호출하고, 그 메서드에 `@Transactional`을 둔다. 그러면 자식 ticket 저장에서 예외가 나면 부모 purchase 저장도 함께 rollback된다. 반대로 각 Repository 메서드가 자기 안에서 따로 commit하면 \"부모는 저장됐는데 자식은 일부만 실패\" 같은 상태를 막기 어렵다.\n\n```java\n@Service\npublic class LottoPurchaseService {\n    @Transactional\n    public PurchaseResult purchase(Long memberId, int amount) {\n        Purchase purchase = purchaseRepository.save(Purchase.of(memberId, amount));\n        List<Ticket> tickets = ticketFactory.create(amount).stream()\n            .map(numbers -> Ticket.of(purchase.getId(), numbers))\n            .toList();\n        ticketRepository.saveAll(tickets);\n        return PurchaseResult.from(purchase, tickets);\n    }\n}\n```\n\n위 코드의 핵심은 `save` 호출을 한 메서드에 모았다는 사실이 아니라, \"구매 성공\"이라는 비즈니스 의미가 메서드 하나로 표현된다는 점이다. `ticketFactory.create()`가 순수 계산이면 트랜잭션 안에 있어도 DB 락을 오래 잡지 않는다. 반대로 외부 결제 API 호출, 긴 네트워크 호출, 대량 파일 처리 같은 작업을 트랜잭션 안에 넣으면 DB connection을 오래 점유할 수 있으므로 분리해야 한다.\n\n## worked example: 중간 실패를 따라가기\n\n상황을 숫자로 보자. 사용자가 5,000원을 넣어 5장을 산다.\n\n1. `purchase` row가 저장되어 id 42가 생긴다.\n2. ticket 1, 2, 3번이 저장된다.\n3. ticket 4번 저장에서 unique 제약, validation, DB 예외 중 하나가 난다.\n4. 서비스 메서드가 트랜잭션 안이면 id 42 purchase와 ticket 1-3이 모두 rollback된다.\n5. 트랜잭션이 없거나 repository별로 분리되면 purchase 또는 일부 ticket이 남을 수 있다.\n\n이 차이가 사용자 화면에서 크게 보인다. rollback이 되면 \"구매 실패\" 후 재시도하면 된다. 반쯤 남으면 사용자는 실패했다고 봤는데 관리자 통계에는 구매가 잡히거나, 구매 내역에는 있는데 티켓 수가 모자라는 상태가 된다. 그래서 트랜잭션 경계는 예쁜 코드 스타일 문제가 아니라 데이터 불변식을 지키는 장치다.\n\n## Controller, Service, Repository 중 어디인가\n\nController는 HTTP 요청을 해석하고 응답을 고르는 자리다. `@Transactional`을 붙일 수는 있지만, 그러면 view/response 조립, 인증 정보 해석, redirect 결정 같은 웹 관심사와 DB 원자성 경계가 같은 위치에 섞인다. 테스트도 \"HTTP 없이 구매 유스케이스만 검증\"하기 어려워진다.\n\nRepository는 단일 aggregate나 table 접근을 캡슐화하는 자리다. `save` 자체가 DB 작업인 것은 맞지만, purchase와 ticket을 함께 성공시켜야 한다는 판단은 repository 하나가 알기 어렵다. purchase repository는 ticket repository의 실패를 모른다. 그래서 여러 repository 호출을 조립하는 service가 트랜잭션 경계를 잡는 쪽이 보통 더 선명하다.\n\nService는 유스케이스 언어를 담는다. `purchase(memberId, amount)`가 성공했다는 말은 purchase row와 ticket row들이 모두 저장됐다는 뜻이다. 이 문장을 코드 경계와 일치시키면 리뷰에서 설명하기 쉽다.\n\n## 트레이드오프와 주의점\n\n- 트랜잭션은 중간 실패 rollback에는 강하지만, 같은 요청이 두 번 들어오는 문제를 자동으로 막지는 않는다. 더블클릭, 새로고침, 네트워크 재시도는 idempotency key나 unique 제약과 함께 다룬다.\n- RuntimeException은 기본 rollback 대상이지만 checked exception은 설정에 따라 다르다. 학습 단계에서는 예외 정책을 숨기지 말고 \"어떤 실패에서 rollback되는가\"를 테스트로 확인한다.\n- 자기 자신 메서드 호출(self-invocation)처럼 Spring proxy를 우회하는 호출에서는 `@Transactional`이 기대대로 동작하지 않을 수 있다. 공개 service 경계에서 진입하는 구조가 단순하다.\n- 조회만 하는 메서드에는 `readOnly=true`를 고려하되, 구매 저장 메서드에 붙이면 안 된다.\n- 여러 DB나 외부 시스템을 함께 묶는 문제는 로컬 DB 트랜잭션만으로 해결되지 않는다. lotto 구매의 기본 단계에서는 하나의 DB 안 부모-자식 저장부터 안정화한다.\n\n## 미션 PR 코멘트 패턴\n\n- \"구매 한 번이 여러 repository 호출로 끝나는데 `@Transactional`이 없으면 중간 실패 시 반쯤 저장될 수 있습니다. 서비스 경계에서 묶어 보세요.\"\n- \"Controller는 HTTP 요청을 받고 응답을 만드는 자리이지, 원자성 경계를 표현하는 자리가 아닙니다.\"\n- \"Repository마다 트랜잭션을 따로 두면 purchase와 ticket 저장이 같은 비즈니스 단위로 묶이지 않습니다.\"\n- \"트랜잭션으로 막는 문제와 중복 요청을 막는 문제를 분리해 설명해 보세요. 전자는 atomic save, 후자는 idempotency입니다.\"\n\n## 검증 질문\n\n- `ticketRepository.saveAll()` 도중 예외가 나면 `purchaseRepository.save()` 결과도 rollback되는가?\n- `PurchaseServiceTest`에서 repository mock만 보지 않고 실제 DB 통합 테스트로 row 수를 확인했는가?\n- service 메서드 이름이 \"구매 1회\"라는 유스케이스를 표현하는가, 아니면 controller 흐름의 일부만 표현하는가?\n- 재전송 방지와 중간 실패 rollback을 같은 테스트로 뭉개지 않았는가?\n\n## 다음 학습\n\n- service 메서드에 트랜잭션을 두는 일반 패턴은 `spring/service-layer-transaction-boundary-patterns`\n- 구매 1건과 티켓 여러 장의 DB 구조를 먼저 다시 잡으려면 `database/lotto-purchase-ticket-parent-child-modeling-bridge`\n- 중복 구매 재전송까지 같이 고민해야 하면 `database/lotto-purchase-duplicate-submit-idempotency-bridge`\n- 메모리 안 구매 흐름 조립 책임을 복습하려면 `software-engineering/lotto-purchase-flow-service-layer-bridge`\n",
   "aliases": [
-    "lotto 구매 저장 트랜잭션",
-    "로또 여러 장 티켓 @Transactional",
-    "lotto purchase service transaction",
-    "로또 purchase ticket atomic save",
-    "lotto 서비스 트랜잭션 경계"
+    "로또 구매 트랜잭션 경계",
+    "티켓 저장 롤백 기준",
+    "purchase ticket 원자 저장",
+    "서비스 메서드 @Transactional",
+    "로또 결제 중간 실패",
+    "부모 자식 저장 묶기",
+    "controller transaction 위치",
+    "ticket saveAll rollback"
   ],
   "expected_queries": [
-    "로또 구매 한 번에 purchase row와 ticket row 여러 개를 저장하면 서비스 메서드에 트랜잭션을 잡아야 해?",
-    "lotto를 웹으로 옮겼더니 구매 저장 중간 실패가 걱정돼. @Transactional 경계는 어디가 맞아?",
-    "controller에서 여러 장 로또를 만들고 저장하는 흐름에 트랜잭션을 붙이지 말라는 이유가 뭐야?",
-    "purchase 저장 후 ticket 저장이 실패하면 반쯤 남지 않게 Spring에서 어떻게 묶어?",
-    "로또 구매 서비스와 repository 중 어느 쪽이 원자성을 책임져야 해?"
+    "로또 구매에서 purchase 저장 후 ticket 저장이 실패하면 어떻게 롤백해?",
+    "여러 장 티켓을 saveAll 할 때 @Transactional은 서비스에 붙이는 게 맞아?",
+    "로또 구매 컨트롤러에 트랜잭션을 붙이면 왜 안 좋아?",
+    "purchase row와 ticket row를 한 번의 원자 작업으로 묶는 기준이 뭐야?",
+    "중복 클릭 문제와 구매 저장 트랜잭션은 어떻게 구분해?"
   ],
   "symptoms": [
     "로또 구매 1건과 티켓 여러 장을 저장할 때 어디에 @Transactional을 붙여야 할지 모르겠어요",
@@ -50,6 +53,11 @@
     "created_at": "2026-05-24",
     "last_modified": "2026-05-24",
     "legacy_path": "knowledge/cs/contents/spring/lotto-purchase-ticket-transaction-boundary-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch145"
+      }
+    ]
   }
 }

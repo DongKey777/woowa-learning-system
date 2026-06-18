@@ -6,24 +6,24 @@
   "summary": "이 문서는 security 카테고리에서 AuthZ Negative Cache Failure Case Study를 다루는 playbook 문서다. 인가 negative cache는 miss 비용을 줄이지만, concealment policy와 tenant/ownership 경계가 섞이면 stale deny가 보안 이슈와 운영 이슈를 동시에 만들 수 있다. 검색 질의가 authz negative cache, stale deny case study, concealment cache bug, tenant negative cache처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
   "body_markdown": "# AuthZ Negative Cache Failure Case Study\n\n> 한 줄 요약: 인가 negative cache는 miss 비용을 줄이지만, concealment policy와 tenant/ownership 경계가 섞이면 stale deny가 보안 이슈와 운영 이슈를 동시에 만들 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Authorization Caching / Staleness](./authorization-caching-staleness.md)\n> - [AuthZ Cache Inconsistency / Runtime Debugging](./authz-cache-inconsistency-runtime-debugging.md)\n> - [Authorization Runtime Signals / Shadow Evaluation](./authorization-runtime-signals-shadow-evaluation.md)\n> - [Auth Failure Response Contracts: `401` / `403` / `404`](./auth-failure-response-401-403-404.md)\n> - [Tenant Isolation / AuthZ Testing](./tenant-isolation-authz-testing.md)\n\nretrieval-anchor-keywords: authz negative cache, stale deny case study, concealment cache bug, tenant negative cache, 404 negative cache, ownership cache miss, authz failure case study, stale deny, grant but still denied, tenant-specific 403, only one tenant 403, inconsistent 401 404, 401 404 flip, concealment drift, cached 404 after grant\nretrieval-anchor-keywords: negative cache deep dive entry cue, stale deny beginner bridge handoff, grant path freshness to negative cache case study, negative cache next step, negative cache return path, authz tenant catalog return\n\n---\n\n## 시작 전에: 이 문서의 역할과 입장 큐\n\n- 이 문서는 `deep dive` 사례 분석이다. stale deny와 concealment 혼선을 운영 관점에서 분해한다.\n- 이 문서는 `primer`가 아니다. `401`/`403`/`404` 의미가 아직 섞이면 먼저 [Beginner Guide to Auth Failure Responses: `401` / `403` / `404`](./auth-failure-response-401-403-404.md)와 [Grant Path Freshness and Stale Deny Basics](./grant-path-freshness-stale-deny-basics.md)로 돌아간다.\n- 이 문서는 endpoint별 즉시 조치 runbook이 아니다. 실시간 분기 절차가 필요하면 [AuthZ Cache Inconsistency / Runtime Debugging](./authz-cache-inconsistency-runtime-debugging.md)으로 넘긴다.\n\n| 나는 어디서 왔나 | 이 문서에서 먼저 볼 구간 | 다음 문서 |\n|---|---|---|\n| primer bridge에서 `grant 후 403`를 stale deny로 분리했다 | `사례: tenant 이동 직후 stale deny` + `대응` | [Authorization Caching / Staleness](./authorization-caching-staleness.md), [AuthZ Cache Inconsistency / Runtime Debugging](./authz-cache-inconsistency-runtime-debugging.md) |\n| graph snapshot/relationship cache까지 얽혀 보인다 | `원인` + `대응` | [Authorization Graph Caching](./authorization-graph-caching.md), [Tenant Isolation / AuthZ Testing](./tenant-isolation-authz-testing.md) |\n\n- 이 사례 문서를 본 뒤에는 [Security README: AuthZ / Tenant / Response Contracts](./README.md#authz--tenant--response-contracts-deep-dive-catalog)로 돌아가 다음 갈래를 고른다.\n\n## 핵심 개념\n\nnegative cache는 \"없다\" 또는 \"deny\" 결과를 캐시해 miss 비용을 줄이는 방식이다.\n하지만 인가에서는 이 값이 오래 남으면 실제 상태와 다르게 거부가 계속된다.\n\n특히:\n\n- concealment 404\n- tenant mismatch\n- ownership miss\n\n가 섞일 때 디버깅이 어려워진다.\n\n---\n\n## 첫 분기: 먼저 세 갈래를 가른다\n\n`grant 후 계속 거부`를 보자마자 negative cache로 단정하지 않는다. 첫 분기는 다음 순서가 안전하다.\n\n| 첫 관찰 | 먼저 배제할 것 | negative cache 쪽 증거 |\n|---|---|---|\n| 새 로그인 또는 새 token 후에도 동일하게 거부 | 오래된 token/session claim | decision log가 cache hit이고 cached deny/not-found를 반환 |\n| cache bypass/forced refresh에서는 허용 | DB/정책 문제가 아니라 cache | 같은 subject-resource-action에서 bypass 결과만 allow |\n| 특정 pod/region/tenant만 거부 | local cache 또는 invalidation 전파 | instance id별 cache key, TTL remaining, invalidation receipt 차이 |\n| 외부는 404, 내부 reason은 deny | concealment response contract | 내부 decision reason이 not-found가 아니라 ownership/tenant deny |\n\n이 단계에서 `401`이면 인증/세션 연속성 문제를 먼저 본다. negative authz cache는 \"주체가 식별된 뒤의 deny/not-found decision\"을 캐시하는 문제다.\n\n## 깊이 들어가기\n\n### 사례: tenant 이동 직후 stale deny\n\n상황:\n\n1. 사용자는 tenant A에 있었고 리소스 접근이 deny됨\n2. 지원 작업으로 tenant B로 이동\n3. negative cache가 `user-resource -> deny/not-found`를 유지\n4. 실제론 접근 가능해졌는데 계속 404/403\n\n증상:\n\n- 일부 pod만 계속 deny\n- 특정 tenant에서만 403이 남거나, 다른 route에서는 404 concealment로 보임\n- 외부 응답은 404라 not-found와 구분 안 됨\n- support는 데이터가 안 보인다고만 느낌\n- authn context도 흔들리면 어떤 경로는 401, 어떤 경로는 404로 보여 원인 분리가 더 어려워진다\n\n원인:\n\n- cache key에 tenant/version 누락\n- negative TTL 과다\n- invalidate 누락\n- grant/tenant 이동 이벤트와 decision cache invalidation의 순서 보장 부재\n- concealment 404와 실제 resource not-found를 같은 metric으로 합침\n\n관찰 증거:\n\n- grant 또는 tenant 이동 commit time\n- invalidation event id, publish time, consumer receipt time\n- `subject_id`, `resource_id`, `tenant_id`, `action`, `policy_version`\n- negative cache key와 TTL remaining\n- cached reason(`deny`, `not_found`, `tenant_mismatch`, `ownership_miss`)과 external status(`403` 또는 concealment `404`)\n- cache bypass 또는 recompute 결과\n\n### 왜 위험한가\n\n- 권한 복구가 늦어 운영 장애가 됨\n- concealment policy 때문에 원인 추적이 어려움\n- cross-tenant 혼선과 섞여 보안 신호처럼 보일 수 있음\n\n### wrong-bucket 비교\n\n| 잘못 묶는 버킷 | 왜 다른가 | 확인 방법 |\n|---|---|---|\n| \"JWT가 오래돼서 그래\" | token claim이 바뀌지 않은 문제와 서버 deny cache는 수명이 다르다 | 새 token으로도 cached deny가 재현되는지 본다 |\n| \"리소스가 진짜 없음\" | concealment 404는 resource 존재를 숨긴 authz response일 수 있다 | 내부 reason code와 DB/resource lookup 결과를 분리한다 |\n| \"role policy 버그\" | policy 자체가 맞아도 과거 decision이 남을 수 있다 | policy version은 최신인데 cache hit가 과거 decision인지 본다 |\n| \"모든 tenant 장애\" | key에 tenant가 빠지거나 일부 invalidation만 실패하면 tenant별로 보인다 | tenant id 포함 key와 instance별 hit 분포를 비교한다 |\n\n### 대응\n\n- negative cache를 별도 telemetry로 분리\n- tenant/policy version을 키에 포함\n- concealment 404와 stale deny reason을 내부적으로 구분\n- `401`/`404`가 섞이면 authn cache와 negative cache를 분리해서 본다\n- hot route에서는 negative cache를 더 짧게 또는 비활성화\n- revoke/grant/tenant 이동처럼 freshness가 중요한 이벤트는 explicit invalidation을 우선하고, TTL은 fallback으로 둔다\n- negative cache가 필요한 경우 allow cache보다 짧은 TTL과 작은 scope를 먼저 검토한다\n\n### safety guard\n\n인가 negative cache는 \"성능 최적화\"보다 \"scope가 틀리면 권한 상태를 오래 왜곡하는 장치\"에 가깝다.\n\n- cache key에는 최소한 `subject_id`, `tenant_id`, `resource_id`, `action`, `policy_version`, concealment policy version을 포함한다.\n- 외부 `404` concealment 응답을 shared HTTP cache나 CDN에 그대로 올리지 않는다. 필요하면 `private`/`no-store` 또는 tenant/user scoped key가 있어야 한다.\n- negative cache는 revoke safety를 보장하지 않는다. revoke freshness는 allow/decision cache invalidation, token/session claim 갱신, policy version bump를 따로 본다.\n- authz evaluator가 실패했을 때 \"deny로 캐시\"하면 보안상 보수적일 수 있지만, 장애가 장기 stale deny로 고착될 수 있으므로 failure reason과 TTL을 정상 negative decision과 분리한다.\n\n### 검증\n\n수정 후에는 같은 `subject-resource-action`으로 세 가지 요청을 비교한다.\n\n1. 권한 변경 직후 일반 요청이 새 decision을 반환한다.\n2. cache bypass/forced refresh와 일반 요청의 decision이 일치한다.\n3. 최소 두 개 이상의 instance/region에서 같은 cache key가 새 version을 본다.\n4. 외부 응답이 concealment `404`여도 내부 log에는 실제 reason과 policy version이 남는다.\n5. old negative cache key가 다시 hit되지 않는 것을 TTL 만료 전후로 확인한다.\n\n## 한 줄 정리\n\nAuthZ negative cache의 진짜 위험은 캐시 그 자체보다, concealment와 tenant/ownership 변화가 겹칠 때 stale deny가 조용히 오래 남는 데 있다.\n",
   "aliases": [
-    "authz negative cache",
-    "stale deny case study",
-    "concealment cache bug",
-    "tenant negative cache",
-    "404 negative cache",
-    "ownership cache miss",
-    "authz failure case study",
-    "stale deny",
-    "grant but still denied",
-    "tenant-specific 403",
-    "only one tenant 403",
-    "inconsistent 401 404"
+    "거부 캐시 때문에 계속 막힘",
+    "거부캐시 때문에계속막힘",
+    "권한 줬는데 계속 거부",
+    "권한줬는데 계속거부",
+    "권한 줬는데 404",
+    "권한줬는데404",
+    "negative cache 사고",
+    "stale deny 사례",
+    "숨김 404 캐시",
+    "테넌트 이동 후 403",
+    "인가 negative cache",
+    "인가negativecache"
   ],
   "expected_queries": [
-    "AuthZ Negative Cache Failure Case Study 장애가 나면 복구 순서는?",
-    "authz negative cache 운영 대응 체크리스트가 뭐야?",
-    "AuthZ Negative Cache Failure Case Study에서 blast radius를 어떻게 줄여?",
-    "authz negative cache 사고 후 어떤 증거를 남겨야 해?"
+    "deny 결과를 캐싱했다가 권한 부여 후에도 계속 403이 나면 어디를 의심해?",
+    "negative cache TTL을 길게 잡으면 authz 장애에서 어떤 UX 문제가 생겨?",
+    "권한 부여 이벤트와 deny cache 무효화 순서를 어떻게 맞춰?",
+    "authz negative cache 사고 후 재현 로그에는 어떤 key와 policy version이 필요해?"
   ],
   "symptoms": [
     "AuthZ Negative Cache Failure Case Study 관련 운영 사고나 보안 이상 징후가 발생해 대응 순서가 필요하다"

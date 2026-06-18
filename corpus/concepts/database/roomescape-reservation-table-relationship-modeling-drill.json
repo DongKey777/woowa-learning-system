@@ -6,17 +6,23 @@
   "summary": "객체 그래프를 그대로 테이블 하나로 합치기보다, \"무엇이 독립 식별자를 갖고 반복 참조되는가\"를 기준으로 FK 관계를 먼저 잡는다.",
   "body_markdown": "# Roomescape Reservation Table Relationship Modeling Drill\n\n> 한 줄 요약: 객체 그래프를 그대로 테이블 하나로 합치기보다, \"무엇이 독립 식별자를 갖고 반복 참조되는가\"를 기준으로 FK 관계를 먼저 잡는다.\n\n**난이도: Beginner**\n\n## 드릴 목표\n\n이 드릴은 roomescape 예약 도메인을 테이블, FK, cardinality, unique constraint로 옮기는 연습이다. `Reservation` 객체가 `Member`, `Theme`, `Time`을 참조한다는 사실만으로 테이블을 합치거나 쪼개면 안 된다. 저장 모델은 \"무엇을 독립적으로 식별하고, 어떤 row가 어떤 row를 반복 참조하는가\"를 기준으로 잡는다.\n\n기본 불변식은 다음 문장으로 시작한다.\n\n```text\n예약은 누가(member), 어떤 날짜(date)에, 어떤 시간 슬롯(time)에,\n어떤 테마(theme)를 예약했는지 안정적으로 식별해야 한다.\n같은 date + time + theme 조합에는 활성 예약이 하나만 있어야 한다.\n```\n\n## 기대 모델링 축\n\n| 축 | 확인 질문 | Roomescape 예 |\n|---|---|---|\n| 독립 식별자 | 따로 생성/수정/조회되는가 | member, theme, reservation_time |\n| FK 관계 | 여러 예약이 반복 참조하는가 | reservation.member_id, theme_id, time_id |\n| cardinality | 한쪽 row가 몇 개의 상대 row와 연결되는가 | member 1:N reservation |\n| unique constraint | DB가 막아야 하는 중복은 무엇인가 | unique(date, time_id, theme_id) |\n| snapshot 여부 | 당시 값을 보존해야 하는가 | 예약 당시 테마명 변경 정책에 따라 선택 |\n| 조회 모델 | 화면 편의 때문에 합치는가 | 목록 DTO는 join/projection으로 해결 |\n\n## 시나리오 1: member, theme, time을 reservation에 복사할까\n\n상황:\n\n```text\nreservation row에 member_name, theme_name, time_value를 모두 문자열로 복사해 둔다.\n관리자 목록 조회는 join 없이 편하지만, 회원 이름이나 테마 이름이 바뀌면 과거 row도 함께 흔들린다.\n```\n\n기대 답변:\n\n`member`, `theme`, `reservation_time`이 독립적으로 관리되고 여러 예약에서 반복 참조된다면 FK로 참조하는 것이 기본이다. `reservation.member_id -> member.id`, `reservation.theme_id -> theme.id`, `reservation.time_id -> reservation_time.id`가 자연스럽다. 조회 화면에서 이름과 시간을 보여줘야 한다면 join이나 DTO projection으로 해결한다.\n\n단, \"예약 당시 이름을 법적/정산 목적으로 고정해야 한다\" 같은 요구가 있다면 snapshot column을 추가할 수 있다. 이때도 snapshot은 FK를 대체하는 것이 아니라 과거 표시 값을 보존하는 별도 목적이다.\n\n흔한 오답:\n\n| 오답 | 왜 위험한가 | 교정 |\n|---|---|---|\n| \"목록 조회가 편하니 reservation에 다 넣자\" | 중복 값 수정, 정합성 붕괴 | 저장은 FK, 조회는 join |\n| \"객체가 참조하니 DB도 객체처럼 한 row에 넣자\" | 반복 참조와 독립 생명주기를 놓침 | 독립 식별자를 먼저 찾는다 |\n| \"FK는 복잡하니 id 값만 저장하고 제약은 안 둔다\" | orphan reservation을 DB가 막지 못함 | FK constraint로 참조 무결성을 고정 |\n\n## 시나리오 2: 관계와 cardinality 읽기\n\n상황:\n\n```text\n한 회원은 여러 예약을 만들 수 있다.\n한 테마는 여러 날짜/시간에 예약될 수 있다.\n한 시간 슬롯은 여러 날짜와 여러 테마에서 재사용된다.\n한 예약은 회원 1명, 테마 1개, 시간 슬롯 1개, 날짜 1개를 가진다.\n```\n\n기대 답변:\n\nreservation을 중심 row로 두면 관계는 대부분 N:1이다.\n\n| 기준 row | 상대 row | cardinality | FK 위치 |\n|---|---|---|---|\n| reservation | member | N:1 | reservation.member_id |\n| reservation | theme | N:1 | reservation.theme_id |\n| reservation | reservation_time | N:1 | reservation.time_id |\n| member | reservation | 1:N | reservation.member_id |\n| theme | reservation | 1:N | reservation.theme_id |\n| reservation_time | reservation | 1:N | reservation.time_id |\n\n`date`는 보통 `reservation.date` 같은 값 column으로 충분하다. 날짜 자체가 독립적인 운영 대상이 되어 휴일, 영업일, 일별 capacity, blackout reason을 관리해야 한다면 `schedule_date` 또는 `availability_date` 테이블 후보가 된다. 처음부터 모든 날짜를 table로 만드는 것이 정답은 아니다.\n\n검증 포인트:\n\n- reservation row 하나는 member row 최대 하나와만 매칭되는가?\n- member row 하나는 reservation 여러 개와 매칭될 수 있는가?\n- `time` 문자열을 직접 저장할 때 중복/수정 문제가 생기는가?\n- date는 독립 테이블이 필요한 요구가 있는가, 단순 예약 일자인가?\n\n## 시나리오 3: 중복 예약 unique constraint\n\n상황:\n\n```text\n같은 날짜, 같은 시간, 같은 테마에는 활성 예약이 하나만 있어야 한다.\n서비스에서 먼저 조회한 뒤 없으면 INSERT한다.\n```\n\n기대 답변:\n\n서비스 pre-check만으로는 동시 요청을 막을 수 없다. DB가 이해할 수 있는 unique constraint가 필요하다. 기본 후보는 `reservation(date, time_id, theme_id)` 조합이다. 회원이 다르더라도 같은 슬롯을 동시에 두 명이 예약하면 안 되기 때문이다.\n\n예시 DDL:\n\n```sql\nALTER TABLE reservation\nADD CONSTRAINT uq_reservation_slot\nUNIQUE (date, time_id, theme_id);\n```\n\n취소 예약을 row로 남기는 모델이라면 조건이 바뀐다. `status = 'CANCELED'`도 같은 unique에 걸리면 재예약이 막힐 수 있다. 이때는 DB별 partial unique index, active reservation 별도 테이블, status를 포함한 정책 등을 논의해야 한다. beginner 단계에서는 \"활성 예약 기준 unique가 필요하다\"까지 말하면 충분하다.\n\n흔한 오답:\n\n| 오답 | 문제 | 교정 |\n|---|---|---|\n| `unique(date, time_id)` | 같은 시간 다른 테마 예약까지 막는다 | theme_id를 포함한다 |\n| `unique(member_id, date)` | 한 회원의 같은 날 여러 예약을 과도하게 막는다 | 슬롯 중복과 회원 정책을 구분한다 |\n| service 조회 후 insert만 사용 | race condition에서 둘 다 성공할 수 있다 | DB unique를 최종 방어선으로 둔다 |\n| `theme_name`, `time_value` 문자열에 unique | 이름 변경/표기 흔들림에 취약 | FK id 조합으로 고정한다 |\n\n## 시나리오 4: 관리자 목록 조회 때문에 테이블을 합칠까\n\n상황:\n\n```text\n관리자 예약 목록은 reservation id, member name, theme name, date, time을 한 번에 보여준다.\n그래서 reservation table에 member_name, theme_name, time_value를 모두 넣자는 제안이 나왔다.\n```\n\n기대 답변:\n\n조회 화면이 여러 테이블의 값을 한 번에 보여준다고 저장 모델을 합칠 필요는 없다. 저장 모델은 FK와 불변식을 보존하고, 조회 모델은 SQL join으로 만든다.\n\n예시 조회:\n\n```sql\nSELECT r.id,\n       m.name AS member_name,\n       t.name AS theme_name,\n       r.date,\n       rt.start_at\nFROM reservation r\nJOIN member m ON r.member_id = m.id\nJOIN theme t ON r.theme_id = t.id\nJOIN reservation_time rt ON r.time_id = rt.id\nORDER BY r.date, rt.start_at;\n```\n\n이 query의 row 단위는 reservation이다. `member`, `theme`, `reservation_time`은 모두 N:1로 붙으므로 join 조건이 PK/FK를 정확히 타면 reservation row 수가 늘지 않는 것이 정상이다.\n\n## 시나리오 5: FK delete policy\n\n```text\n회원이 탈퇴하거나 테마/시간 슬롯이 삭제될 때 기존 예약은 어떻게 할까?\n```\n\n기대 답변:\n\nFK를 만든 뒤에는 삭제 정책도 같이 정해야 한다. 무조건 cascade가 안전한 것은 아니다. 회원 삭제가 예약 내역 삭제로 이어지면 운영 기록이 사라질 수 있다. 반대로 테마 삭제를 막지 않으면 과거 예약이 orphan이 될 수 있다.\n\n실무 선택지:\n\n| 대상 | 흔한 선택 | 이유 |\n|---|---|---|\n| member 삭제 | 탈퇴 상태로 soft delete 또는 예약 있으면 restrict | 예약 이력 보존 |\n| theme 삭제 | 예약 있으면 restrict 또는 비활성화 | 운영 중 예약 보호 |\n| reservation_time 삭제 | 예약 있으면 restrict 또는 비활성화 | 과거/미래 예약 보호 |\n| reservation 삭제 | 직접 삭제보다 cancel status | 감사/운영 추적 |\n\n초기 미션에서는 삭제 요구가 작을 수 있다. 그래도 FK를 잡을 때 \"부모 row 삭제 시 자식 reservation을 어떻게 할 것인가\"를 말할 수 있어야 한다.\n\n## SQL 검증 드릴\n\n모델링 답변은 SQL로 확인할 수 있어야 한다. 아래 query는 특정 DB 문법에 조금씩 맞춰 조정하면 된다.\n\n### 1. FK join이 reservation row 수를 보존하는지 확인\n\n```sql\nSELECT COUNT(*) AS reservation_count\nFROM reservation;\n\nSELECT COUNT(*) AS joined_count\nFROM reservation r\nJOIN member m ON r.member_id = m.id\nJOIN theme t ON r.theme_id = t.id\nJOIN reservation_time rt ON r.time_id = rt.id;\n```\n\n`reservation_count`와 `joined_count`가 다르면 orphan row가 있거나 join 조건이 틀렸을 수 있다. FK가 켜져 있고 inner join 기준이면 둘은 같아야 한다.\n\n### 2. orphan reservation 찾기\n\n```sql\nSELECT r.id\nFROM reservation r\nLEFT JOIN member m ON r.member_id = m.id\nWHERE m.id IS NULL;\n```\n\n같은 방식으로 `theme`, `reservation_time`도 확인한다. 결과가 나오면 FK가 없거나, 데이터 적재 순서/삭제 정책이 잘못됐다는 신호다.\n\n### 3. 중복 슬롯 찾기\n\n```sql\nSELECT date, time_id, theme_id, COUNT(*) AS count\nFROM reservation\nGROUP BY date, time_id, theme_id\nHAVING COUNT(*) > 1;\n```\n\n결과가 있으면 `unique(date, time_id, theme_id)`로 막아야 할 중복이 이미 들어갔다는 뜻이다. 취소 row를 포함하는 모델이면 `WHERE status = 'ACTIVE'` 같은 활성 조건을 먼저 정의해야 한다.\n\n### 4. 잘못된 unique 후보 반증\n\n```sql\nSELECT date, time_id, COUNT(DISTINCT theme_id) AS theme_count\nFROM reservation\nGROUP BY date, time_id\nHAVING COUNT(DISTINCT theme_id) > 1;\n```\n\n이 결과가 자연스럽게 존재한다면 `unique(date, time_id)`는 너무 강한 제약이다. 같은 시간에 서로 다른 테마가 각각 예약될 수 있기 때문이다.\n\n## 기대 답변 축\n\n리뷰 답변은 아래 축을 빠뜨리지 않아야 한다.\n\n1. reservation을 중심 row로 두고 `member_id`, `theme_id`, `time_id`, `date`를 구분한다.\n2. member/theme/time은 독립 식별자를 갖는 테이블 후보이고, date는 요구가 없으면 값 column 후보다.\n3. cardinality를 `reservation N:1 member/theme/time`으로 설명한다.\n4. 중복 예약은 `date + time_id + theme_id` unique로 DB가 막아야 한다.\n5. 조회 편의는 join/projection 문제이지 저장 모델을 합칠 이유가 아니다.\n6. FK delete policy를 cascade/restrict/soft delete 중 요구에 맞춰 말한다.\n7. SQL count, left join, group by로 모델이 실제 데이터를 지키는지 확인한다.\n\n## 흔한 오답 모음\n\n| 오답 | 놓친 축 | 더 나은 답 |\n|---|---|---|\n| \"객체가 member를 가지니까 reservation table에 member 객체를 넣는다\" | 관계형 저장 단위 | member_id FK로 참조한다 |\n| \"이름만 필요하니 member_name 문자열이면 충분하다\" | 식별자와 변경 | member_id FK + 필요 시 snapshot |\n| \"날짜도 무조건 date table이 필요하다\" | 독립 생명주기 | 단순 예약일이면 date column |\n| \"같은 시간 중복은 `date + time` unique면 된다\" | theme 관계 | `date + time_id + theme_id`를 본다 |\n| \"서비스에서 중복 조회하니 DB unique는 없어도 된다\" | 동시성 | DB constraint를 최종 방어선으로 둔다 |\n| \"JOIN이 필요하니 테이블을 합친다\" | 저장/조회 분리 | 저장은 정규화, 조회는 projection |\n| \"FK cascade delete를 켜면 편하다\" | 이력 보존 | 예약 이력 보호 정책을 먼저 정한다 |\n\n## 검증 질문\n\n1. reservation row 하나가 반드시 member, theme, time row 하나씩을 참조하는가?\n2. member 한 명이 같은 날 여러 테마/시간을 예약할 수 있는 정책인가?\n3. 같은 date/time에 서로 다른 theme 예약이 가능한가?\n4. 중복 방지 unique에 member_id가 들어가면 어떤 정상 예약을 막는가?\n5. `theme.name`이 바뀌면 과거 예약 화면도 바뀌어도 되는가, snapshot이 필요한가?\n6. time slot 값이 \"10:00\"에서 \"10:30\"으로 수정되면 기존 예약 의미가 바뀌는가?\n7. 부모 row 삭제 시 reservation을 지울 것인가, 막을 것인가, 비활성화할 것인가?\n8. join count가 reservation count와 다른 경우 어떤 FK 또는 ON 조건을 의심할 것인가?\n9. `GROUP BY date, time_id, theme_id HAVING count(*) > 1` 결과가 있으면 어떤 제약이 빠진 것인가?\n10. 목록 조회 DTO 때문에 저장 테이블을 합치고 있지는 않은가?\n\n## 실전 리뷰 답변 템플릿\n\n```text\nReservation은 예약 자체의 식별자와 date를 갖고,\nmember/theme/reservation_time은 독립적으로 관리되는 row이므로 FK로 참조하겠습니다.\n관계는 reservation N:1 member, N:1 theme, N:1 reservation_time입니다.\n같은 슬롯 중복은 service pre-check만으로는 부족하니 active reservation 기준\ndate + time_id + theme_id unique constraint를 DB에 두겠습니다.\n관리자 목록은 reservation을 중심 row로 join/projection해서 조회하고,\n저장 편의를 위해 member_name/theme_name/time_value를 중복 저장하지 않겠습니다.\n```\n\n## 한 줄 정리\n\nRoomescape 예약 테이블은 reservation을 중심으로 member/theme/time을 FK로 참조하고, 같은 `date + time_id + theme_id` 활성 슬롯 중복을 DB unique와 SQL 검증으로 막는 모델이 기본이다.\n",
   "aliases": [
-    "roomescape reservation modeling drill",
-    "예약 테이블 관계 모델링 드릴",
-    "roomescape table relationship",
-    "member reservation time FK",
-    "reservation relational modeling"
+    "예약 테이블 모델링",
+    "예약테이블 모델링",
+    "roomescape reservation FK",
+    "reservation member theme time",
+    "date time theme unique",
+    "date_time_theme unique",
+    "예약 중복 unique",
+    "예약중복 unique",
+    "reservation row cardinality",
+    "예약 FK 삭제 정책"
   ],
   "expected_queries": [
-    "roomescape Reservation Member Time 테이블 관계를 드릴로 연습하고 싶어",
-    "예약 도메인을 테이블 FK로 옮길 때 어떤 관계부터 봐야 해?",
-    "예약 목록 조회 때문에 테이블을 합치면 안 되는 이유를 문제로 풀어줘",
-    "roomescape 미션에서 객체 관계와 DB 관계를 어떻게 나눠?"
+    "roomescape 예약 테이블에서 member theme time을 FK로 둘지 문자열로 복사할지 헷갈려",
+    "예약 중복을 막는 unique key가 date time만인지 theme까지 포함해야 하는지 모르겠어",
+    "Reservation 객체가 Member를 가지고 있으면 DB 테이블도 한 row에 합쳐야 해?",
+    "관리자 예약 목록 조회 때문에 member_name theme_name을 reservation에 넣어도 되는지 리뷰 답변을 준비하고 싶어",
+    "회원 탈퇴나 테마 삭제 때 reservation FK delete policy를 어떻게 생각해야 해?"
   ],
   "symptoms": [
     "Reservation, Member, Time 관계를 객체 참조만 보고 table 관계로 옮기지 못한다",
@@ -38,14 +44,23 @@
       "software-engineering/roomescape-dao-vs-repository-bridge",
       "spring/roomescape-admin-reservation-list-fetch-plan-bridge"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "roomescape 화면 CSS나 프론트 예약 버튼 동작만 보고 싶어",
+      "JPA Entity 연관관계 매핑 어노테이션만 설명해줘",
+      "동시 예약 race condition만 DB 락 중심으로 깊게 보고 싶어"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/roomescape-reservation-table-relationship-modeling-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147"
+      }
+    ]
   }
 }

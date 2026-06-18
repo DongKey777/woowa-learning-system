@@ -6,15 +6,21 @@
   "summary": "이 mission_bridge는 백엔드 미션의 예외, HTTP status, error response contract 리뷰를 연결한다.",
   "body_markdown": "# Backend API Error Status Contract Mission Bridge\n\n## 미션 장면\n\nSpring 백엔드 미션에서는 잘못된 JSON, validation 실패, 없는 리소스 조회, 이미 예약된 시간 선택, 로그인 누락이 모두 API 에러 응답(error response)으로 바뀐다. 학습자는 예외를 던지는 것만 신경 쓰기 쉽지만, 클라이언트 입장에서는 HTTP 상태 코드(status code), 에러 메시지 형식, 필드 에러 표현이 계약(contract)이다.\n\n## 리뷰에서 보이는 냄새\n\n리뷰 냄새는 controller마다 `try/catch`를 두고 `ResponseEntity.badRequest()`를 직접 만드는 코드에서 자주 보인다. 모든 예외를 `400 Bad Request`로 내리면 날짜 형식 오류와 이미 예약된 시간 충돌이 같은 실패처럼 보인다. 반대로 domain exception을 그대로 노출하면 내부 클래스 이름이나 구현 메시지가 API 계약으로 새어 나간다.\n\n또 다른 냄새는 테스트가 \"예외가 발생한다\"까지만 보고 HTTP 응답을 보지 않는 것이다.  \nAPI 계약을 학습하는 단계에서는 status, response body shape, validation field name, authentication/authorization split까지 테스트가 잡아줘야 한다.\n\n## 개념 문서 handoff\n\n출발점은 실패 종류를 먼저 나누는 것이다. 요청 형식이나 필드 validation 실패는 `400` 후보, 인증 없음은 `401`, 권한 부족은 `403`, 리소스 없음은 `404`, 현재 서버 상태와 충돌하는 요청은 `409` 후보가 된다. Spring에서는 `ControllerAdvice`와 exception handler가 이 매핑을 모으는 adapter 역할을 하고, domain은 HTTP를 몰라도 되는 예외나 결과를 표현한다.\n\n| 실패 종류 | 흔한 status 후보 | 리뷰에서 볼 질문 |\n|---|---|---|\n| JSON 파싱 실패, 타입 오류 | 400 | 요청 문법 자체가 깨졌나 |\n| Bean Validation 실패 | 400 | 어떤 field가 왜 실패했는지 내려가나 |\n| 로그인 안 함 | 401 | 인증 정보가 없거나 유효하지 않은가 |\n| 로그인했지만 권한 없음 | 403 | principal은 있지만 resource/action 권한이 없는가 |\n| 없는 예약/회원 조회 | 404 | 리소스 존재를 알려도 되는가 |\n| 이미 예약된 시간 선택 | 409 | 요청 형식은 맞지만 현재 상태와 충돌하는가 |\n| 서버 내부 버그 | 500 | 클라이언트가 고칠 수 없는 실패인가 |\n\n상태 코드는 외우는 표가 아니라 클라이언트 행동을 정하는 신호다.  \n`400`이면 요청을 고쳐 다시 보내라는 뜻에 가깝고, `409`는 현재 서버 상태를 다시 조회하거나 다른 선택을 하라는 뜻에 가깝다.\n\n## contract 설계 기준\n\n에러 body는 미션마다 단순해도 되지만, 한 애플리케이션 안에서는 일관돼야 한다.\n\n```json\n{\n  \"code\": \"RESERVATION_CONFLICT\",\n  \"message\": \"이미 예약된 시간입니다.\",\n  \"fieldErrors\": []\n}\n```\n\n초급 단계에서는 `code`가 없어도 괜찮지만, 최소한 controller마다 서로 다른 문자열/배열/객체 형태가 섞이지 않게 해야 한다.  \nfield validation은 전체 메시지 하나보다 어느 field가 실패했는지 알 수 있어야 프론트엔드와 테스트가 안정된다.\n\n## 코드로 보는 매핑 — @RestControllerAdvice 예시\n\n실제로 어떻게 연결되는지 뼈대 코드를 보자.\n\n```java\n// 도메인 예외들 (HTTP를 전혀 모름)\npublic class ReservationNotFoundException extends RuntimeException {\n    public ReservationNotFoundException(Long id) {\n        super(\"예약을 찾을 수 없습니다. id=\" + id);\n    }\n}\n\npublic class ReservationConflictException extends RuntimeException {\n    public ReservationConflictException() {\n        super(\"이미 예약된 시간입니다.\");\n    }\n}\n\npublic class InvalidReservationRequestException extends RuntimeException {\n    public InvalidReservationRequestException(String message) {\n        super(message);\n    }\n}\n```\n\n```java\n// 에러 응답 body — 애플리케이션 전체가 같은 형태를 쓴다\npublic record ErrorResponse(String code, String message) {}\n```\n\n```java\n@RestControllerAdvice\npublic class GlobalExceptionHandler {\n\n    // Bean Validation(@Valid) 실패 → 400, 어느 field가 왜 실패했는지 함께 내린다\n    @ExceptionHandler(MethodArgumentNotValidException.class)\n    public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {\n        String message = ex.getBindingResult().getFieldErrors().stream()\n            .map(e -> e.getField() + \": \" + e.getDefaultMessage())\n            .collect(Collectors.joining(\", \"));\n        return ResponseEntity.badRequest()\n            .body(new ErrorResponse(\"VALIDATION_FAILED\", message));\n    }\n\n    // 리소스 없음 → 404\n    @ExceptionHandler(ReservationNotFoundException.class)\n    public ResponseEntity<ErrorResponse> handleNotFound(ReservationNotFoundException ex) {\n        return ResponseEntity.status(HttpStatus.NOT_FOUND)\n            .body(new ErrorResponse(\"NOT_FOUND\", ex.getMessage()));\n    }\n\n    // 현재 상태와 충돌하는 요청 → 409\n    @ExceptionHandler(ReservationConflictException.class)\n    public ResponseEntity<ErrorResponse> handleConflict(ReservationConflictException ex) {\n        return ResponseEntity.status(HttpStatus.CONFLICT)\n            .body(new ErrorResponse(\"RESERVATION_CONFLICT\", ex.getMessage()));\n    }\n\n    // 요청 의미가 틀린 경우 (형식은 맞지만 논리적으로 거부) → 400\n    @ExceptionHandler(InvalidReservationRequestException.class)\n    public ResponseEntity<ErrorResponse> handleInvalidRequest(InvalidReservationRequestException ex) {\n        return ResponseEntity.badRequest()\n            .body(new ErrorResponse(\"INVALID_REQUEST\", ex.getMessage()));\n    }\n\n    // 예상 못한 서버 버그 → 500, 내부 메시지는 절대 그대로 노출하지 않는다\n    @ExceptionHandler(Exception.class)\n    public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex) {\n        // ex.getMessage()를 그대로 내리면 내부 구현이 새어 나간다\n        return ResponseEntity.internalServerError()\n            .body(new ErrorResponse(\"INTERNAL_ERROR\", \"서버 오류가 발생했습니다.\"));\n    }\n}\n```\n\n핵심 포인트 세 가지:\n\n1. **도메인 계층은 HTTP를 모른다.** `ReservationConflictException`은 `HttpStatus.CONFLICT`를 import하지 않는다. status 매핑은 `@RestControllerAdvice`가 한 곳에서 담당한다.\n2. **예외 종류가 다르면 status도 달라야 한다.** 날짜 형식 오류(400)와 이미 예약된 시간 충돌(409)을 같은 400으로 뭉개면 클라이언트는 \"재시도하면 될까, 다른 시간을 골라야 할까\"를 판단할 수 없다.\n3. **500은 \"클라이언트가 고칠 수 없는 실패\"다.** 클라이언트 잘못(잘못된 값, 권한 없음)에 500을 내리면 클라이언트는 코드 버그인지 입력 문제인지 알 수 없다.\n\n## 흔한 오개념 — \"200 OK에 에러 담기\"\n\n```java\n// ❌ 이렇게 하지 않는다\n@GetMapping(\"/reservations/{id}\")\npublic ResponseEntity<Map<String, Object>> getReservation(@PathVariable Long id) {\n    try {\n        Reservation r = reservationService.findById(id);\n        return ResponseEntity.ok(Map.of(\"success\", true, \"data\", r));\n    } catch (ReservationNotFoundException e) {\n        // HTTP는 200인데 body에서 실패를 표현하는 패턴 — 클라이언트가 body를 파싱해야만 성공 여부를 안다\n        return ResponseEntity.ok(Map.of(\"success\", false, \"error\", e.getMessage()));\n    }\n}\n```\n\n이 패턴의 문제는 HTTP status가 의미를 잃는다는 것이다. 브라우저 개발자 도구, 로드 밸런서, API 모니터링 도구는 모두 HTTP status를 보고 성공/실패를 판단한다. `200 OK`가 실패 응답으로도 오면 이 도구들이 오동작하고, 프론트엔드 코드마다 `body.success`를 확인하는 별도 계층이 생긴다.\n\nHTTP status는 통신 계층과 애플리케이션 계층이 함께 쓰는 언어다. 그 언어를 포기하면 클라이언트는 협업할 공통어를 잃는다.\n\n## 스스로 점검\n\n- 지금 내 코드에서 \"이미 예약된 시간\"과 \"날짜 형식 오류\"를 같은 예외 타입이나 같은 status로 처리하고 있진 않은가? 클라이언트가 둘을 구분해서 다르게 반응해야 한다면 무엇을 바꿔야 할까?\n- `@RestControllerAdvice`에서 `Exception.class`를 마지막으로 잡을 때, 도메인 예외 메시지를 그대로 `message` 필드에 담으면 어떤 정보가 외부로 노출될 수 있을까?\n\n## Drill 후보\n\n\"이미 예약된 시간에 다시 예약하면 400인가 409인가?\"를 묻는다. 기대 답변은 요청 형식은 맞지만 현재 예약 상태와 충돌하므로 conflict로 볼 수 있다는 것이다. 이어서 \"로그인하지 않은 요청과 로그인했지만 권한이 없는 요청은 같은가?\"를 물어 `401`과 `403`을 분리한다. 흔한 실수는 상태 코드 표를 외우듯 답하거나, 모든 business exception을 `400`으로 몰아넣는 것이다.\n\n추가 drill:\n\n- 날짜 형식이 틀린 요청과 과거 날짜 예약 요청은 같은 실패인가?\n- 존재하지 않는 예약 ID를 조회할 때 `404`와 `403` 중 무엇을 먼저 고민해야 하는가?\n- domain exception 메시지를 그대로 response로 내리면 어떤 정보가 새나갈 수 있는가?\n",
   "aliases": [
-    "backend api error status contract bridge",
-    "백엔드 API 에러 상태코드 계약",
-    "exception to status mission bridge",
-    "HTTP status error response design"
+    "api error status contract",
+    "백엔드 에러 상태 코드 계약",
+    "예외 status 매핑 기준",
+    "ControllerAdvice 에러 응답 설계",
+    "validation conflict status split",
+    "business exception response contract",
+    "401 403 404 구분",
+    "API 오류 응답 일관성"
   ],
   "expected_queries": [
-    "백엔드 미션에서 예외를 어떤 HTTP status로 바꿔야 해?",
-    "validation 실패와 business conflict는 둘 다 400이야?",
-    "API error response contract를 처음 어떻게 잡아?"
+    "백엔드 예외를 HTTP 상태 코드로 어떻게 나눠야 해?",
+    "validation 실패와 이미 예약된 시간 충돌은 같은 400으로 내려도 돼?",
+    "ControllerAdvice에서 에러 응답 body를 어떤 형태로 맞춰야 해?",
+    "401과 403은 인증 인가 관점에서 어떻게 구분해?",
+    "도메인 예외 메시지를 API 응답에 그대로 넣으면 왜 위험해?"
   ],
   "symptoms": [
     "모든 예외를 500이나 400으로만 내려줍니다",
@@ -39,8 +45,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-31",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/backend-api-error-status-contract-mission-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

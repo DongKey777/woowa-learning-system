@@ -1,0 +1,68 @@
+{
+  "id": "network/ec2-spring-boot-public-access-cause-router",
+  "title": "EC2 스프링부트 public-ip:8080 접속 실패 원인 라우터",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "EC2에서 Spring Boot가 실행 중인데 public-ip:8080이 안 열리면, 먼저 앱이 어느 주소와 포트에 LISTEN 중인지, 서버 안 localhost와 외부 public IP 테스트가 어떻게 다른지, EC2 public IPv4와 public subnet, security group, OS firewall, Nginx 경유 여부를 순서대로 갈라야 한다.",
+  "body_markdown": "# EC2 스프링부트 public-ip:8080 접속 실패 원인 라우터\n\n> 한 줄 요약: EC2에서 Spring Boot가 떴는데 `public-ip:8080`이 안 열리면, 앱 프로세스, listen 주소, EC2 네트워크, firewall, direct 8080 vs Nginx 80/443 경로를 순서대로 자르면 된다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [IP 주소와 포트 기초](./ip-address-port-basics.md)\n- [EC2 public IP와 security group SSH primer](./ec2-public-ip-security-group-ssh-primer.md)\n- [Spring Boot executable jar EC2 runbook](../spring/spring-boot-executable-jar-ec2-runbook.md)\n- [프록시와 리버스 프록시 기초](./proxy-reverse-proxy-basics.md)\n\nretrieval-anchor-keywords: EC2 Spring Boot 8080 접속 안됨, public-ip:8080, 퍼블릭 IP 8080, 공인 IP 8080, 보안 그룹 8080, 보안그룹 8080, localhost:8080 works public ip fails, 0.0.0.0:8080, 127.0.0.1:8080, connection refused timeout 404 차이, Nginx 80 443 8080, Spring Boot EC2 외부 접속 실패\n\n## 핵심 개념\n\n입문자가 가장 헷갈리는 지점은 `Spring Boot가 실행됐다`와 `인터넷에서 그 포트까지 도달할 수 있다`를 같은 말로 보는 것이다. EC2 배포에서 외부 접속은 한 줄이 아니라 아래 경로 전체가 맞아야 성공한다.\n\n```text\n브라우저 또는 내 노트북 curl\n-> 인터넷\n-> EC2 public IPv4 또는 Elastic IP\n-> public subnet route table + Internet Gateway\n-> security group inbound rule\n-> OS firewall\n-> EC2 내부 네트워크 인터페이스\n-> Java process listen address:port\n-> Spring MVC route 또는 Nginx reverse proxy route\n```\n\n어느 한 칸만 막혀도 결과는 비슷하게 보인다. 그래서 이 문서는 `SSH가 안 돼요` 같은 일반 EC2 접속 문서가 아니라, **Spring Boot 앱을 public-ip:8080 또는 Nginx 80/443으로 공개하는 경로**만 빠르게 가르는 라우터다.\n\n## 먼저 결과 모양으로 갈라라\n\n| 바깥에서 보이는 결과 | 네트워크적으로 뜻하는 것 | 먼저 볼 곳 | 다음 문서 |\n|---|---|---|---|\n| `404 Not Found` | TCP 연결과 HTTP 응답은 이미 왔다 | Spring route, context path, Nginx location/server block | [Spring Boot executable jar EC2 runbook](../spring/spring-boot-executable-jar-ec2-runbook.md) |\n| `Connection refused` | 목적지까지 갔지만 그 주소:포트에 listener가 없거나 즉시 reject됐다 | Java process alive, `ss -ltnp`, bind address, app port | [Spring Boot executable jar EC2 runbook](../spring/spring-boot-executable-jar-ec2-runbook.md) |\n| `Connection timed out` | SYN이 답을 못 받았다. 보통 EC2 network path나 firewall drop이다 | public IPv4, route table, security group 8080, OS firewall | [EC2 public IP와 security group SSH primer](./ec2-public-ip-security-group-ssh-primer.md) |\n| `localhost:8080`만 성공 | 앱은 살아 있지만 외부 interface 또는 EC2 network path가 막혔다 | `127.0.0.1` bind인지, SG 8080인지, OS firewall인지 | [IP 주소와 포트 기초](./ip-address-port-basics.md) |\n| `public-ip`만 입력하면 안 되고 `:8080`을 붙이면 됨 | 브라우저 기본 포트 80/443과 앱 포트 8080을 섞었다 | direct 8080 공개인지, Nginx 80/443 proxy인지 결정 | [프록시와 리버스 프록시 기초](./proxy-reverse-proxy-basics.md) |\n| `http://public-ip:8080`은 안 되고 `http://public-ip`는 Nginx 화면만 보임 | Nginx는 80에서 뜨지만 Spring Boot upstream 연결 또는 location이 다르다 | Nginx `proxy_pass`, app listen, 502/404 구분 | [프록시와 리버스 프록시 기초](./proxy-reverse-proxy-basics.md) |\n\n`timeout`과 `refused`를 구분하는 이유는 크다. AWS security group이 닫혀 있으면 대개 조용히 drop되어 timeout처럼 보인다. 반대로 refused는 OS나 process 레벨까지 도달했는데 받을 listener가 없을 때 더 흔하다.\n\n## 1단계: Java process가 살아 있고 포트를 열었는가\n\nEC2 안에서 먼저 본다.\n\n```bash\nps -ef | grep java\nsudo ss -ltnp | grep ':8080'\ncurl -v http://127.0.0.1:8080/\n```\n\n판별은 이렇게 한다.\n\n| EC2 안에서 본 결과 | 해석 | 다음 행동 |\n|---|---|---|\n| `ps`에 Java process 없음 | 앱이 안 떠 있다 | jar 실행, 로그, systemd/nohup 경로를 본다 |\n| `ss`에 `:8080` LISTEN 없음 | 앱이 다른 포트로 떴거나 바로 종료됐다 | `server.port`, 실행 로그의 Tomcat started port 확인 |\n| `127.0.0.1:8080` curl 실패 | EC2 네트워크보다 앱 실행 문제다 | jar runbook으로 내려간다 |\n| `127.0.0.1:8080` curl 성공, 외부만 실패 | 앱은 살아 있다. 이제 bind address와 EC2 network를 본다 | 다음 단계로 간다 |\n\nSpring Boot 기본값은 보통 8080이고, `server.address`를 따로 제한하지 않으면 모든 interface에 bind되는 쪽이 일반적이다. 하지만 설정이나 실행 옵션으로 `server.address=127.0.0.1`이 들어가면 서버 안의 localhost에서는 보이지만 외부에서는 안 보인다.\n\n`ss` 출력에서 특히 이 차이를 본다.\n\n| `ss` listen 주소 | 의미 | 외부 접속 가능성 |\n|---|---|---|\n| `127.0.0.1:8080` | loopback에만 bind | direct public-ip:8080 불가. Nginx가 같은 서버에서 proxy하면 가능 |\n| `0.0.0.0:8080` | 모든 IPv4 interface에 bind | EC2 network rule만 맞으면 direct 8080 가능 |\n| `:::8080` | IPv6 wildcard. 환경에 따라 IPv4도 받을 수 있지만 확인 필요 | IPv4 public IP 테스트는 별도로 확인 |\n\n## 2단계: localhost 테스트와 public IP 테스트를 섞지 말라\n\n`curl localhost:8080`은 EC2 **자기 자신 안에서** 앱 프로세스가 응답하는지 보는 테스트다. 내 노트북에서 `curl http://localhost:8080`을 치면 내 노트북 자신을 보는 것이지 EC2가 아니다.\n\n안전한 테스트 순서는 이렇다.\n\n```bash\n# EC2 안에서: process와 bind 확인\ncurl -v http://127.0.0.1:8080/\ncurl -v http://<EC2-private-ip>:8080/\n\n# 내 노트북이나 휴대폰 테더링 같은 EC2 밖에서: public 경로 확인\ncurl -v --connect-timeout 3 http://<EC2-public-ip>:8080/\n```\n\nEC2 안에서 자기 public IPv4를 직접 때리는 테스트는 진단 기준으로 삼지 않는 편이 낫다. EC2 OS는 보통 public IPv4를 NIC에 직접 가진 것처럼 보이지 않고, AWS가 public IPv4와 private IPv4를 매핑한다. 내부에서 확인할 때는 `127.0.0.1`과 private IP로 앱 상태를 보고, public IP는 EC2 바깥에서 확인한다.\n\n## 3단계: EC2 public IPv4와 public subnet 경로\n\n앱이 살아 있는데 외부에서 timeout이면 다음을 본다.\n\n| 확인 항목 | 맞아야 하는 상태 | 틀렸을 때 증상 |\n|---|---|---|\n| Public IPv4 또는 Elastic IP | 인스턴스에 public IPv4가 있거나 EIP가 연결됨 | public IP 자체가 없어서 인터넷에서 못 들어옴 |\n| Subnet route table | `0.0.0.0/0 -> Internet Gateway` route 존재 | private subnet이면 SG를 열어도 외부에서 timeout |\n| Security group inbound | TCP 8080 source가 내 IP 또는 임시로 `0.0.0.0/0` | timeout. 앱 로그에는 요청 흔적 없음 |\n| Security group inbound 22 | SSH 관리용. 앱 8080과 별개 | SSH는 되는데 앱은 안 될 수 있음 |\n| Network ACL | subnet NACL이 inbound/outbound ephemeral response를 막지 않음 | SG가 맞아도 timeout 가능 |\n\n중요한 오해가 하나 있다. SSH 22번을 열었다고 앱 8080이 열린 것이 아니다. security group rule은 포트별이다. `22/tcp`는 관리 접속이고, direct 8080 공개를 하려면 `8080/tcp`도 별도로 열어야 한다. 운영에서는 `0.0.0.0/0:8080`을 오래 열어두기보다 내 IP로 제한하거나, 더 흔하게는 80/443만 공개하고 Nginx가 내부 `localhost:8080`으로 넘기게 만든다.\n\n## 4단계: OS firewall과 instance 내부 차단\n\nAWS security group이 열려도 인스턴스 안의 firewall이 막으면 같은 timeout 또는 reject가 날 수 있다.\n\nUbuntu 계열이면 보통 이렇게 본다.\n\n```bash\nsudo ufw status\n```\n\nAmazon Linux나 RHEL 계열이면 이렇게 볼 수 있다.\n\n```bash\nsudo firewall-cmd --state\nsudo firewall-cmd --list-ports\n```\n\n대부분의 초급 EC2 실습에서는 OS firewall이 꺼져 있거나 기본 허용인 경우가 많지만, 이미지나 이전 실습 흔적에 따라 달라질 수 있다. 그래서 SG가 맞는데도 외부에서 timeout이면 OS firewall을 한 번은 확인한다.\n\n## 5단계: direct 8080 공개인지, Nginx 80/443 공개인지 결정\n\n두 방식은 문제를 보는 위치가 다르다.\n\n| 방식 | 외부 URL | security group | 앱 bind | 흔한 실패 |\n|---|---|---|---|---|\n| direct Spring Boot | `http://public-ip:8080` | inbound TCP 8080 필요 | 보통 `0.0.0.0:8080` 필요 | SG 8080 누락, app down, wrong port |\n| Nginx reverse proxy | `http://public-ip` 또는 `https://domain` | inbound TCP 80/443 필요. 8080은 외부에 닫아도 됨 | `127.0.0.1:8080`도 가능 | Nginx 502, `proxy_pass` 오타, Host/server block mismatch |\n\nNginx를 쓰는 순간 `public-ip:8080`이 안 되는 것이 항상 장애는 아니다. 설계를 80/443 공개로 잡았다면 8080은 외부에서 닫혀 있는 편이 더 자연스럽다. 이때 확인할 대상은 `public-ip:8080`이 아니라 `http://public-ip/` 또는 도메인, 그리고 Nginx가 내부 `http://127.0.0.1:8080`으로 잘 넘기는지다.\n\n반대로 Nginx 없이 jar만 띄운 상태라면 브라우저에 `http://public-ip`만 치면 80번으로 간다. Spring Boot 기본 포트 8080과 다르므로 `:8080`을 붙여야 한다.\n\n## worked diagnostics: 실제로 이렇게 자른다\n\n### 장면 A: EC2 안에서는 되는데 밖에서는 timeout\n\n```text\nEC2$ curl http://127.0.0.1:8080/actuator/health -> 200\nLaptop$ curl --connect-timeout 3 http://public-ip:8080/actuator/health -> timeout\n```\n\n이 경우 Spring controller나 jar 문제부터 보지 않는다. 앱은 이미 응답했다. 다음 순서는 public IPv4 존재, public subnet route, SG inbound 8080, OS firewall이다. 특히 SSH가 된다는 사실은 8080 성공의 증거가 아니다. 22와 8080은 다른 inbound rule이다.\n\n### 장면 B: 밖에서 connection refused\n\n```text\nLaptop$ curl -v http://public-ip:8080/\nconnect to public-ip port 8080 failed: Connection refused\n```\n\n이 경우는 SG drop보다는 listener 부재나 bind 문제 가능성이 커진다. EC2 안에서 `sudo ss -ltnp | grep ':8080'`을 본다. 아무것도 없으면 Java process가 죽었거나 `server.port`가 다르다. `127.0.0.1:8080`에만 떠 있으면 외부 direct 접속은 안 되고, Nginx가 같은 서버에서 받아 넘기는 구조인지 확인한다.\n\n### 장면 C: 404가 뜬다\n\n```text\nLaptop$ curl -i http://public-ip:8080/\nHTTP/1.1 404\n```\n\n이건 나쁜 소식만은 아니다. 네트워크, SG, OS firewall, listener는 이미 통과했다. 이제는 `/` 경로에 매핑이 없는지, 실제 API가 `/api/reservations` 같은 다른 path인지, `server.servlet.context-path`가 붙었는지 본다. Nginx 경유라면 Spring 404인지 Nginx 404인지 응답 header와 access log로 구분한다.\n\n### 장면 D: Nginx 80은 뜨는데 앱 API가 502\n\n```text\nLaptop$ curl -i http://public-ip/api/health\nHTTP/1.1 502 Bad Gateway\nServer: nginx\n```\n\n502는 public network보다 Nginx와 upstream Spring Boot 사이가 더 의심된다. EC2 안에서 `curl http://127.0.0.1:8080/api/health`가 되는지 보고, Nginx `proxy_pass http://127.0.0.1:8080;`와 app port를 맞춘다. 이 장면에서 SG 8080을 외부에 여는 것은 보통 본질 해결이 아니다. Nginx가 같은 인스턴스에서 내부로 붙는 구조라면 8080은 localhost로만 열어도 된다.\n\n## 흔한 오해와 함정\n\n- `Started Application` 로그만 보고 외부 접속까지 된다고 결론내리면 안 된다. 그 로그는 앱 프로세스와 port listen 쪽 증거이지 AWS inbound rule 증거가 아니다.\n- `localhost`는 언제나 지금 명령을 실행한 머신 자신이다. 내 노트북의 localhost와 EC2의 localhost는 다르다.\n- `404`는 보통 네트워크 실패가 아니다. 오히려 HTTP 서버까지 도달했다는 좋은 증거다.\n- `public-ip`만 브라우저에 치면 기본은 80번이다. Spring Boot 기본 8080을 직접 열었다면 URL에 `:8080`이 필요하다.\n- Nginx를 앞에 두면 외부는 80/443, 내부는 8080이 된다. 이때 8080을 인터넷에 직접 열어야 한다고 생각하면 경계가 흐려진다.\n- 보안 그룹에서 source를 `0.0.0.0/0`으로 여는 것은 실습 확인에는 편하지만 운영 기본값은 아니다. 학습 단계에서는 확인 후 내 IP나 프록시 경로로 좁히는 습관을 들인다.\n\n## 꼬리질문\n\n> Q: EC2 안에서 `curl localhost:8080`은 되는데 내 노트북에서 `public-ip:8080`은 timeout이면 controller부터 봐야 할까?\n> 의도: app 내부 성공과 public network 실패를 분리하는지 확인\n> 핵심: 아니다. 앱은 응답했다. public IPv4, route table, security group 8080, OS firewall을 먼저 본다.\n\n> Q: `public-ip:8080`에서 404가 나오면 배포 실패일까?\n> 의도: HTTP 도달과 application route miss를 구분하는지 확인\n> 핵심: 보통 네트워크는 통과했다. `/` mapping, API path, context path, Nginx location을 본다.\n\n> Q: Nginx를 쓰는데 8080을 외부에 꼭 열어야 할까?\n> 의도: direct app 공개와 reverse proxy 공개의 경계 확인\n> 핵심: 보통 아니다. 외부는 80/443만 열고 Nginx가 내부 `127.0.0.1:8080`으로 넘기는 구성이 더 흔하다.\n\n## 한 줄 정리\n\nEC2 Spring Boot 공개 접속 문제는 `앱이 떠 있음`에서 끝나지 않고, listen 주소, 내부 curl, public IPv4와 subnet route, security group, OS firewall, 그리고 direct 8080인지 Nginx 80/443인지까지 이어지는 한 경로를 차례대로 확인해야 빠르게 좁혀진다.\n",
+  "aliases": [
+    "EC2 Spring Boot 8080 접속 안됨",
+    "EC2 스프링부트 8080 접속 안 됨",
+    "public-ip:8080",
+    "퍼블릭 IP 8080",
+    "퍼블릭IP 8080",
+    "공인 IP 8080",
+    "공인IP 8080",
+    "보안 그룹 8080",
+    "보안그룹 8080",
+    "localhost:8080은 되는데 외부 접속 안됨",
+    "0.0.0.0:8080",
+    "connection refused timeout 404 차이"
+  ],
+  "expected_queries": [
+    "EC2에서 Spring Boot는 떴는데 public ip 8080으로 브라우저 접속이 안 돼",
+    "서버 안에서 curl localhost:8080은 되는데 내 노트북에서 공인 IP:8080은 안 되는 이유가 뭐야?",
+    "EC2 보안 그룹에 8080 열었는데도 스프링부트 접속이 timeout 나는 걸 어디부터 봐야 해?",
+    "public-ip:8080이 connection refused일 때 앱 문제랑 네트워크 문제를 어떻게 구분해?",
+    "EC2에 jar 실행했는데 404가 뜨는 건 배포 실패야 아니면 API 경로 문제야?",
+    "Nginx를 쓰면 8080을 직접 여는 거랑 80 443으로 프록시하는 거 중 뭐가 달라?"
+  ],
+  "symptoms": [
+    "EC2에서 Spring Boot jar는 실행됐는데 public-ip:8080 접속이 안 된다",
+    "EC2 안의 curl localhost:8080은 되지만 내 노트북 브라우저에서는 timeout이 난다",
+    "security group에 SSH 22번은 열었는데 8080 앱 접속은 안 된다",
+    "public-ip:8080에서 connection refused와 timeout 중 무엇을 봐야 할지 모른다",
+    "Nginx를 앞에 둔 뒤 80/443과 8080 공개 범위를 섞어서 진단한다",
+    "404가 뜨면 네트워크 실패인지 Spring route 문제인지 헷갈린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/ip-address-port-basics",
+      "network/ec2-public-ip-security-group-ssh-primer"
+    ],
+    "next_docs": [
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "network/proxy-reverse-proxy-basics"
+    ],
+    "confusable_with": [
+      "network/ec2-public-ip-security-group-ssh-primer",
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "network/proxy-reverse-proxy-basics",
+      "network/ip-address-port-basics"
+    ],
+    "forbidden_for_queries": [
+      "EC2 SSH 접속 안됨",
+      "EC2 pem 키 Permission denied",
+      "EC2 22번 포트 안 열림",
+      "SSH public key permission denied",
+      "보안 그룹 SSH 설정"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": []
+  }
+}

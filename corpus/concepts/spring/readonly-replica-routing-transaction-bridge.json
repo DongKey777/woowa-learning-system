@@ -6,16 +6,24 @@
   "summary": "이 bridge는 Spring readOnly transaction과 replica routing, read-after-write stale read를 연결한다. 저장 직후 조회에서 예전 값, readOnly 성능 옵션 오해, primary fallback 기준 질문을 다룬다.",
   "body_markdown": "# ReadOnly Replica Routing Transaction Bridge\n\n## 한 줄 요약\n\n`readOnly=true`는 \"쓰기 의도가 없다\"는 힌트지만, 운영에서는 replica routing과 만나면 최신성 문제가 생길 수 있다. 특히 방금 쓴 사용자의 다음 조회는 read-after-write 보장이 필요하다.\n\n## 미션 진입 증상\n\n관리자 화면에서 저장 성공 후 목록이 바로 갱신되지 않거나, 테스트에서는 통과하지만 운영에서만 예전 값이 보이면 transaction 속성보다 read path를 같이 봐야 한다.\n\n미션 단계에서는 `@Transactional(readOnly = true)`를 성능 최적화나 관례로만 접하는 경우가 많다. 실무에서는 이 annotation이 ORM flush mode, JDBC connection hint, DataSource routing key와 연결될 수 있다. 즉 \"읽기 전용\"이라는 한 줄이 실제로는 primary DB를 볼지 replica DB를 볼지 결정하는 신호가 될 수 있다.\n\n## 핵심 mental model\n\nSpring transaction 속성, DataSource routing, DB replication lag는 서로 다른 계층이다. readOnly가 붙었다고 항상 replica가 안전한 것도 아니고, primary로 보낸다고 항상 성능이 안전한 것도 아니다.\n\n세 계층을 분리해서 봐야 한다.\n\n- Spring transaction: `@Transactional(readOnly = true)`는 현재 transaction이 쓰기 의도가 없다는 metadata를 제공한다. JPA/Hibernate에서는 flush 최적화에 영향을 줄 수 있다.\n- Routing DataSource: `TransactionSynchronizationManager.isCurrentTransactionReadOnly()` 같은 값을 보고 primary 또는 replica DataSource를 선택할 수 있다.\n- Database replication: primary에 commit된 데이터가 replica에 도착하기까지 lag가 있다. 이 lag는 application annotation이 없애 주지 않는다.\n\n따라서 readOnly routing의 핵심 질문은 \"이 조회가 최신 primary 값을 반드시 봐야 하는가\"다. 방금 예약을 생성한 사용자가 곧바로 예약 상세를 보는 화면, 결제 직후 주문 상태 확인, 권한 변경 직후 관리자 API 접근 판단은 stale read에 취약하다. 반대로 통계 목록, 검색 결과, 약간 늦어도 되는 dashboard는 replica에 보내도 괜찮을 수 있다.\n\n## read-after-write 경계\n\n저장 직후 조회가 stale해지는 대표 흐름은 다음과 같다.\n\n1. Write transaction이 primary에 commit된다.\n2. 다음 HTTP 요청이 `readOnly=true` service를 탄다.\n3. Routing DataSource가 replica를 선택한다.\n4. Replica lag 때문에 방금 쓴 row가 아직 보이지 않는다.\n\n이 상황에서 readOnly annotation을 제거하는 것만이 답은 아니다. 시스템 요구사항에 따라 sticky primary, recent-write hint, min-version floor, lag-aware fallback 같은 전략을 고른다.\n\n- Sticky primary: 사용자가 write를 한 직후 일정 시간 동안 같은 사용자 read를 primary로 보낸다.\n- Recent-write hint: request/session/context에 \"방금 쓴 데이터가 필요함\"을 표시해 routing layer가 primary를 선택한다.\n- Version floor: 클라이언트나 서버가 마지막으로 본 version 이상을 요구하고, replica가 못 따라오면 primary로 fallback한다.\n- Lag metric fallback: replica lag가 threshold를 넘으면 stale-sensitive read를 primary로 보낸다.\n\n초보 단계에서는 \"readOnly면 replica\"라는 기계적 규칙보다 \"최신성이 기능 요구사항인가\"를 먼저 묻는 습관이 중요하다.\n\n## 흔한 오해\n\nreadOnly는 stale read를 허용한다는 뜻이 아니다. 사용자가 방금 쓴 값을 다시 볼 화면이면 recent-write hint, min-version floor, primary fallback 같은 system-design 패턴이 필요하다.\n\n또 다른 오해는 inner method에 `@Transactional(readOnly = true)`를 붙이면 언제나 readOnly connection으로 바뀐다는 것이다. Spring AOP는 proxy를 통해 호출될 때 transaction을 적용하고, 이미 열린 outer transaction이 있으면 propagation 설정에 따라 기존 connection을 그대로 쓸 수 있다. 그래서 routing은 \"어느 method에 annotation이 붙었는가\"뿐 아니라 \"실제로 transaction이 언제 시작됐는가\"를 함께 봐야 한다.\n\n읽기 메서드 안에서 실수로 write가 일어나도 DB가 항상 막아 주는 것은 아니다. 드라이버와 DB 설정에 따라 readOnly hint가 강제되지 않을 수 있다. readOnly는 설계 의도를 표현하고 일부 최적화를 돕는 신호이지, 모든 정합성 보장을 대신하는 보안 장치가 아니다.\n\n## 점검 질문\n\n- 이 조회는 방금 쓴 사용자가 최신 값을 반드시 봐야 하는가?\n- Replica lag가 발생했을 때 사용자에게 어떤 증상으로 보이는가?\n- Routing 기준이 transaction readOnly만 보는가, 아니면 request context도 보는가?\n- Outer write transaction 안에서 호출되는 read method에 readOnly가 붙어 있어도 의도대로 동작하는가?\n- Primary fallback 기준과 관찰 지표가 있는가?\n\n이 질문이 명확하면 `readOnly=true`를 성능 관례가 아니라 최신성 정책의 일부로 다룰 수 있다.\n\n## Safe Next Docs\n\nread-after-write routing과 post-write stale dashboard로 이어서 운영 관찰 지표를 본다.\n",
   "aliases": [
-    "readonly transaction replica routing",
-    "spring readOnly stale read bridge",
-    "readOnly 트랜잭션 복제본 라우팅",
-    "읽기 전용 트랜잭션 stale read",
-    "@Transactional"
+    "readOnly replica routing",
+    "readOnly stale read bridge",
+    "transaction read replica",
+    "read after write readOnly",
+    "primary replica consistency",
+    "읽기 전용 복제본 라우팅",
+    "방금 쓴 데이터 안 보임",
+    "readOnly 트랜잭션 stale read",
+    "replica lag transaction",
+    "primary fallback after write"
   ],
   "expected_queries": [
     "@Transactional(readOnly=true)면 replica로 보내도 항상 안전해?",
     "방금 쓴 데이터를 readOnly에서 못 보면 어디를 봐야 해?",
-    "readOnly routing과 read-after-write는 어떻게 같이 봐?"
+    "readOnly routing과 read-after-write는 어떻게 같이 봐?",
+    "예약 생성 직후 조회가 replica로 가서 안 보이는 문제를 transaction routing 관점에서 설명해줘",
+    "readOnly=true는 성능 힌트인지 replica routing 정책인지 어떻게 구분해야 해?",
+    "primary write 후 같은 사용자 read를 일정 시간 primary로 보내는 전략은 언제 필요해?"
   ],
   "symptoms": [
     "저장 직후 조회했는데 readOnly 경로에서 예전 값이 보여요",

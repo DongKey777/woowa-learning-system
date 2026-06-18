@@ -4,17 +4,23 @@
   "category": "spring",
   "level": "beginner",
   "summary": "이 mission_bridge는 Lotto 미션에서 요청 검증과 도메인 불변식 검증을 나누는 문서다. 로또 번호 중복, 생성자 검증, DTO Service Domain 검증 위치 같은 질문을 다룬다.",
-  "body_markdown": "# Lotto Validation Boundary Mission Bridge\n\n## 미션 장면\n\nLotto 번호는 1부터 45 사이이고 중복되면 안 된다. 이 규칙은 HTTP 요청으로 들어오든 테스트에서 직접 만들든 항상 지켜져야 하므로 Domain 불변식에 가깝다.\n\n이 문서의 핵심은 \"검증을 어디에 한 번만 둘까\"가 아니다. 같은 규칙처럼 보여도 요청 모양 검증과 도메인 불변식 검증은 실패 의미가 다르다. 요청 DTO는 바깥에서 들어온 데이터를 application이 이해할 수 있는 모양으로 거르고, domain object는 만들어진 뒤 절대 깨지면 안 되는 상태를 지킨다.\n\n## 리뷰에서 보이는 냄새\n\nController가 숫자 범위와 중복까지 모두 검사하면 다른 생성 경로에서 잘못된 Lotto가 만들어질 수 있다. 반대로 Domain이 JSON 형식 오류까지 알면 HTTP 세부가 도메인 안으로 들어온다.\n\n예를 들어 `List<Integer>`가 null인지, 요청 body가 비어 있는지, 문자열을 숫자로 바꿀 수 있는지는 adapter 쪽 관심사다. 하지만 \"로또 한 장은 6개의 서로 다른 1..45 숫자를 가진다\"는 HTTP와 무관하게 항상 참이어야 하므로 `Lotto` 생성자나 static factory가 방어해야 한다.\n\n## 개념 handoff\n\nDTO validation은 요청 모양을 거르고, Lotto 생성자나 static factory는 유효한 Lotto만 존재하게 만든다. Service는 여러 Lotto와 저장소 상태를 조합하는 유스케이스를 담당한다.\n\n레이어별 기준은 다음처럼 잡을 수 있다.\n\n- Controller/Request DTO: 필드 존재 여부, 타입 변환, 요청 body shape, query parameter 범위처럼 transport에 가까운 문제를 처리한다.\n- Domain: `Lotto`, `LottoNumber`, `WinningNumbers`가 스스로 유효한 상태만 갖도록 보장한다. 중복 금지, 번호 범위, 개수 제한은 여기에 가깝다.\n- Service/Application: 구입 금액으로 몇 장을 만들지, 당첨 번호와 보너스 번호 조합이 유스케이스 규칙을 만족하는지, 저장소와 외부 협력자를 어떤 순서로 호출할지 결정한다.\n\n이렇게 나누면 같은 검증이 여러 곳에 있는 것처럼 보여도 목적이 다르다는 점을 설명할 수 있다. DTO의 `@Size`는 빠른 요청 실패와 에러 메시지를 돕고, domain의 검증은 어떤 경로로 객체가 만들어져도 잘못된 상태가 존재하지 않게 하는 최후 방어선이다.\n\n## 설계 품질 기준\n\n`Lotto`가 생성된 뒤에는 항상 유효해야 한다. 그래서 생성자에서 받은 list를 그대로 들고 있지 말고, 필요한 경우 defensive copy와 불변 collection을 사용한다. 외부에서 list를 바꿔 `Lotto` 내부 상태가 변하면 생성자 검증이 무력화된다.\n\n값 객체를 나누는 것도 도움이 된다. `LottoNumber`가 1..45 범위를 책임지면 `Lotto`는 \"6개이고 중복이 없다\"에 집중할 수 있다. 다만 초반 미션에서 값 객체를 과하게 늘리면 읽기 어려워질 수 있으므로, 리뷰 포인트가 \"범위 검증이 흩어져 있다\" 또는 \"primitive int가 여러 의미로 섞인다\"일 때 분리하는 것이 자연스럽다.\n\nService가 domain 규칙을 대신 검증하기 시작하면 테스트도 흔들린다. Service 테스트마다 숫자 범위 실패를 반복 검증하게 되고, 나중에 다른 factory나 fixture가 생겼을 때 잘못된 `Lotto`가 생길 수 있다. Service 테스트는 \"구입 금액만큼 로또를 생성한다\", \"당첨 결과를 계산한다\" 같은 유스케이스에 집중하는 편이 낫다.\n\n## 예외와 메시지 경계\n\nDomain은 실패 이유를 알 수 있는 예외를 던질 수 있지만, HTTP status나 JSON error shape을 알 필요는 없다. `IllegalArgumentException`을 쓰든 custom domain exception을 쓰든, 그것을 400 응답으로 바꾸는 일은 ControllerAdvice나 adapter layer의 책임이다.\n\n초보 단계에서는 custom exception hierarchy보다 경계를 먼저 세우는 것이 중요하다. \"도메인이 `ResponseEntity`를 반환하지 않는다\", \"DTO가 `Lotto` 내부 정책을 전부 복제하지 않는다\", \"Service가 생성자 검증을 우회하지 않는다\"가 기본선이다.\n\n## Drill 후보\n\n`Lotto(List<Integer> numbers)`가 직접 검증할 규칙과 Request DTO가 검증할 규칙을 두 열로 나눠 본다.\n\n추가로 `WinningNumbers`와 `BonusNumber`를 만든다고 가정하고, \"보너스 번호가 당첨 번호와 중복되면 안 된다\"는 규칙이 어느 객체 또는 유스케이스에 가까운지 설명해 본다. 단일 객체 내부 불변식인지, 두 객체를 조합할 때만 생기는 application rule인지 구분하는 연습이 된다.\n",
+  "body_markdown": "# Lotto Validation Boundary Mission Bridge\n\n## 미션 장면\n\nLotto 번호는 1부터 45 사이이고 중복되면 안 된다. 이 규칙은 HTTP 요청으로 들어오든 테스트에서 직접 만들든 항상 지켜져야 하므로 Domain 불변식에 가깝다.\n\n이 문서의 핵심은 \"검증을 어디에 한 번만 둘까\"가 아니다. 같은 규칙처럼 보여도 요청 모양 검증과 도메인 불변식 검증은 실패 의미가 다르다. 요청 DTO는 바깥에서 들어온 데이터를 application이 이해할 수 있는 모양으로 거르고, domain object는 만들어진 뒤 절대 깨지면 안 되는 상태를 지킨다.\n\n## 리뷰에서 보이는 냄새\n\nController가 숫자 범위와 중복까지 모두 검사하면 다른 생성 경로에서 잘못된 Lotto가 만들어질 수 있다. 반대로 Domain이 JSON 형식 오류까지 알면 HTTP 세부가 도메인 안으로 들어온다.\n\n예를 들어 `List<Integer>`가 null인지, 요청 body가 비어 있는지, 문자열을 숫자로 바꿀 수 있는지는 adapter 쪽 관심사다. 하지만 \"로또 한 장은 6개의 서로 다른 1..45 숫자를 가진다\"는 HTTP와 무관하게 항상 참이어야 하므로 `Lotto` 생성자나 static factory가 방어해야 한다.\n\n## 개념 handoff\n\nDTO validation은 요청 모양을 거르고, Lotto 생성자나 static factory는 유효한 Lotto만 존재하게 만든다. Service는 여러 Lotto와 저장소 상태를 조합하는 유스케이스를 담당한다.\n\n레이어별 기준은 다음처럼 잡을 수 있다.\n\n- Controller/Request DTO: 필드 존재 여부, 타입 변환, 요청 body shape, query parameter 범위처럼 transport에 가까운 문제를 처리한다.\n- Domain: `Lotto`, `LottoNumber`, `WinningNumbers`가 스스로 유효한 상태만 갖도록 보장한다. 중복 금지, 번호 범위, 개수 제한은 여기에 가깝다.\n- Service/Application: 구입 금액으로 몇 장을 만들지, 당첨 번호와 보너스 번호 조합이 유스케이스 규칙을 만족하는지, 저장소와 외부 협력자를 어떤 순서로 호출할지 결정한다.\n\n이렇게 나누면 같은 검증이 여러 곳에 있는 것처럼 보여도 목적이 다르다는 점을 설명할 수 있다. DTO의 `@Size`는 빠른 요청 실패와 에러 메시지를 돕고, domain의 검증은 어떤 경로로 객체가 만들어져도 잘못된 상태가 존재하지 않게 하는 최후 방어선이다.\n\n## 설계 품질 기준\n\n`Lotto`가 생성된 뒤에는 항상 유효해야 한다. 그래서 생성자에서 받은 list를 그대로 들고 있지 말고, 필요한 경우 defensive copy와 불변 collection을 사용한다. 외부에서 list를 바꿔 `Lotto` 내부 상태가 변하면 생성자 검증이 무력화된다.\n\n값 객체를 나누는 것도 도움이 된다. `LottoNumber`가 1..45 범위를 책임지면 `Lotto`는 \"6개이고 중복이 없다\"에 집중할 수 있다. 다만 초반 미션에서 값 객체를 과하게 늘리면 읽기 어려워질 수 있으므로, 리뷰 포인트가 \"범위 검증이 흩어져 있다\" 또는 \"primitive int가 여러 의미로 섞인다\"일 때 분리하는 것이 자연스럽다.\n\nService가 domain 규칙을 대신 검증하기 시작하면 테스트도 흔들린다. Service 테스트마다 숫자 범위 실패를 반복 검증하게 되고, 나중에 다른 factory나 fixture가 생겼을 때 잘못된 `Lotto`가 생길 수 있다. Service 테스트는 \"구입 금액만큼 로또를 생성한다\", \"당첨 결과를 계산한다\" 같은 유스케이스에 집중하는 편이 낫다.\n\n## 예외와 메시지 경계\n\nDomain은 실패 이유를 알 수 있는 예외를 던질 수 있지만, HTTP status나 JSON error shape을 알 필요는 없다. `IllegalArgumentException`을 쓰든 custom domain exception을 쓰든, 그것을 400 응답으로 바꾸는 일은 ControllerAdvice나 adapter layer의 책임이다.\n\n초보 단계에서는 custom exception hierarchy보다 경계를 먼저 세우는 것이 중요하다. \"도메인이 `ResponseEntity`를 반환하지 않는다\", \"DTO가 `Lotto` 내부 정책을 전부 복제하지 않는다\", \"Service가 생성자 검증을 우회하지 않는다\"가 기본선이다.\n\n## 증상에서 경계로 가는 판단\n\n\"Controller에서 중복과 범위를 다 검사했는데 테스트가 또 깨진다\"는 증상은 검증 코드 양이 부족한 것이 아니라 잘못된 Lotto가 만들어질 수 있는 생성 경로가 남아 있다는 뜻이다. HTTP 요청을 거치지 않는 fixture, service test, random generator에서도 `Lotto`가 생성된다면 번호 개수, 중복, 범위는 Domain 생성자나 factory가 지켜야 한다. Controller의 빠른 요청 실패는 사용자 입력을 친절하게 거르는 보조 장치로 남긴다.\n\n\"DTO와 Domain에 같은 검증이 있어서 중복 아닌가요\"라는 질문은 실패 의미를 나눠 보면 풀린다. DTO의 null, 빈 body, 타입 변환 실패는 요청 모양이 application으로 들어오기 전의 문제다. Domain의 6개 숫자, 1..45 범위, 중복 금지는 생성된 객체가 항상 유효해야 한다는 불변식이다. 보너스 번호가 당첨 번호와 겹치면 안 된다는 규칙은 단일 `Lotto` 내부가 아니라 `WinningNumbers`와 `BonusNumber`를 조합하는 유스케이스 경계에서 판단할 수 있다.\n\n## Drill 후보\n\n`Lotto(List<Integer> numbers)`가 직접 검증할 규칙과 Request DTO가 검증할 규칙을 두 열로 나눠 본다.\n\n추가로 `WinningNumbers`와 `BonusNumber`를 만든다고 가정하고, \"보너스 번호가 당첨 번호와 중복되면 안 된다\"는 규칙이 어느 객체 또는 유스케이스에 가까운지 설명해 본다. 단일 객체 내부 불변식인지, 두 객체를 조합할 때만 생기는 application rule인지 구분하는 연습이 된다.\n",
   "aliases": [
     "lotto validation boundary bridge",
     "lotto number invariant layer",
     "로또 검증 경계",
-    "lotto domain validation mission"
+    "로또 번호 불변식",
+    "로또 DTO 도메인 검증",
+    "로또 생성자 검증",
+    "lotto domain validation mission",
+    "validation boundary lotto"
   ],
   "expected_queries": [
     "Lotto 번호 검증은 DTO Service Domain 중 어디에 둬야 해?",
     "로또 생성자 검증과 요청 검증은 어떻게 나눠?",
-    "Lotto 미션에서 중복 번호 검증은 어느 객체 책임이야?"
+    "Lotto 미션에서 중복 번호 검증은 어느 객체 책임이야?",
+    "DTO에도 검증하고 Lotto 생성자에도 검증하면 중복인지 궁금해",
+    "보너스 번호가 당첨 번호와 겹치면 안 되는 규칙은 어디에서 확인해?"
   ],
   "symptoms": [
     "Controller에서 로또 번호 중복까지 검사하고 있어요",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/lotto-validation-boundary-mission-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
+      }
+    ]
   }
 }

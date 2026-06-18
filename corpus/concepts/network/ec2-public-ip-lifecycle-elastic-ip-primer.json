@@ -1,0 +1,62 @@
+{
+  "id": "network/ec2-public-ip-lifecycle-elastic-ip-primer",
+  "title": "EC2 Public IP 변경과 Elastic IP Primer",
+  "category": "network",
+  "level": "beginner",
+  "summary": "EC2의 자동 할당 public IPv4는 stop/start나 새 인스턴스 생성으로 바뀔 수 있고, 고정 주소가 필요하면 Elastic IP를 명시적으로 연결해야 한다는 점을 Route 53, SSH, 보안 그룹 확인 흐름과 연결하는 beginner primer다.",
+  "body_markdown": "# EC2 Public IP 변경과 Elastic IP Primer\n\n> 한 줄 요약: EC2의 자동 할당 public IPv4는 인스턴스를 새로 만들거나 stop/start하면 바뀔 수 있다. 도메인이나 SSH 접속 주소를 오래 유지하려면 Elastic IP나 DNS 갱신 전략을 따로 잡아야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [EC2 public IP, security group, SSH 접속 Primer](./ec2-public-ip-security-group-ssh-primer.md)\n- [Route 53 도메인을 EC2 Spring Boot 배포에 연결하는 입문 프라이머](./route53-domain-to-ec2-spring-boot-primer.md)\n- [SSH Host Key와 known_hosts Fingerprint Primer](./ssh-host-key-known-hosts-fingerprint-primer.md)\n\nretrieval-anchor-keywords: EC2 public IP lifecycle, auto assigned public IPv4 changes, Elastic IP beginner, EC2 stop start public IP changed, Route53 A record old IP, SSH new public IP, public DNS changed, EIP allocation association, 고정 public IP EC2, EC2 IP 바뀜\n\n## 먼저 나누는 세 주소\n\nEC2 화면에는 여러 주소가 보인다. 초보자는 먼저 이름을 나눠야 한다.\n\n| 항목 | 의미 | 바뀔 수 있나 |\n|---|---|---|\n| private IPv4 | VPC 내부 주소 | 같은 인스턴스에서는 보통 유지 |\n| auto-assigned public IPv4 | 인터넷에서 접근하는 임시 public 주소 | stop/start, 새 인스턴스에서 바뀔 수 있음 |\n| Elastic IP | 계정에 할당해 인스턴스에 연결하는 고정 public 주소 | 직접 release하지 않으면 유지 |\n\n수업에서 처음 EC2를 만들 때는 public IP 자동 할당을 켜서 바로 SSH 접속한다. 이 public IP는 편하지만 \"내 서버의 영구 주소\"라고 생각하면 안 된다. 인스턴스를 새로 만들면 당연히 새 public IP가 생기고, stop/start 상황에서도 자동 할당 public IP가 바뀔 수 있다.\n\n## public IP가 바뀌면 무엇이 깨지나\n\npublic IP가 바뀌면 이 주소를 직접 들고 있던 곳이 모두 낡는다.\n\n| 들고 있던 곳 | 증상 |\n|---|---|\n| SSH 명령 | 예전 IP로 접속하면 timeout 또는 다른 서버 경고 |\n| 브라우저 bookmark | public-ip:8080이 더 이상 열리지 않음 |\n| Route 53 A record | 도메인이 예전 서버/IP로 감 |\n| 외부 webhook callback | callback target이 낡음 |\n| known_hosts | 같은 IP에 다른 host key가 붙으면 경고 가능 |\n\n그래서 \"서버가 변경됐어\"라는 상황에서는 먼저 인스턴스 ID와 현재 public IP를 같이 확인한다. IP만 보지 말고 `i-...` 인스턴스 ID도 봐야 같은 서버인지 알 수 있다.\n\n## Elastic IP는 무엇을 해결하나\n\nElastic IP는 AWS 계정에 할당된 고정 public IPv4 주소다. 인스턴스에 연결하면 그 인스턴스가 해당 public IP로 인터넷에 노출된다. 인스턴스를 교체해야 할 때도 Elastic IP를 새 인스턴스에 다시 연결하면 클라이언트 주소 변경을 줄일 수 있다.\n\n흐름은 이렇다.\n\n```text\nElastic IP allocate\n  -> EC2 instance에 associate\n  -> SSH/Route53/webhook은 Elastic IP를 바라봄\n  -> instance 교체 시 새 instance에 reassociate\n```\n\n다만 Elastic IP도 공짜 마법 주소가 아니다. 사용하지 않고 할당만 해 둔 EIP는 비용이 날 수 있고, public IPv4 자체도 비용 정책이 바뀔 수 있다. 학습용이면 꼭 필요한 경우에만 쓰고, 안 쓰는 EIP는 release해야 한다.\n\n## Route 53과 같이 볼 때\n\n도메인을 EC2에 붙였다면 Route 53 A record가 어느 IP를 가리키는지 확인한다.\n\n```bash\ndig +short example.com\nnslookup example.com\n```\n\nEC2 public IP가 바뀌었는데 A record가 예전 IP를 가리키면 도메인은 예전 주소로 간다. record를 수정해도 TTL cache 때문에 내 노트북이나 DNS resolver가 잠시 예전 값을 볼 수 있다. 그래서 public IP 변경 문제인지, DNS cache 문제인지, app 프로세스 문제인지 나눠 봐야 한다.\n\n| `curl localhost` on EC2 | `curl public IP` | `curl domain` | 해석 |\n|---|---|---|---|\n| 성공 | 성공 | 실패 | DNS/Route 53 쪽 가능성 |\n| 성공 | 실패 | 실패 | security group, bind address, OS firewall |\n| 실패 | 실패 | 실패 | 앱 프로세스/포트 문제 |\n\n## SSH와 known_hosts까지 연결하기\n\n새 public IP로 접속할 때는 SSH known_hosts prompt가 다시 나올 수 있다. 처음 보는 IP면 authenticity prompt가 뜨는 것이 자연스럽다. 반대로 예전 IP에 다른 인스턴스가 붙었거나, Elastic IP를 다른 인스턴스로 옮겼다면 host key changed 경고가 날 수 있다.\n\n이때 판단 순서는 이렇다.\n\n1. AWS 콘솔에서 인스턴스 ID와 public IP가 내가 의도한 대상인지 확인한다.\n2. key pair 이름과 SSH user(`ubuntu`)가 맞는지 확인한다.\n3. 처음 보는 host면 fingerprint prompt를 이해하고 trust 여부를 결정한다.\n4. 정당한 host key 변경이면 `ssh-keygen -R <host>`로 old entry를 제거한다.\n\npublic IP 변경은 네트워크 주소 문제이고, host key prompt는 SSH 서버 신원 확인 문제다. 둘이 이어져 보일 뿐 같은 원인은 아니다.\n\n## 언제 Elastic IP를 쓰나\n\n| 상황 | Elastic IP 필요도 |\n|---|---|\n| 하루 실습하고 버릴 서버 | 낮음 |\n| 도메인을 붙여 계속 접속할 서버 | 중간 이상 |\n| 외부 서비스가 내 서버 IP를 allowlist함 | 높음 |\n| 인스턴스를 자주 교체하지만 주소를 유지해야 함 | 높음 |\n| Load Balancer 뒤로 갈 예정 | 보통 LB/DNS 전략을 먼저 봄 |\n\n처음에는 자동 public IP로 실습해도 된다. 다만 도메인을 붙이거나 팀원이 같은 주소로 접속해야 하면 EIP 또는 load balancer/DNS 전략을 빨리 정하는 것이 좋다.\n\n## 꼬리질문\n\n> Q: EC2 public IP가 바뀌면 보안 그룹도 다시 설정해야 하나요?\n> 의도: 주소와 방화벽 규칙을 분리하는지 확인한다.\n> 핵심: 보안 그룹은 인스턴스/ENI에 붙은 inbound 규칙이고, public IP 변경과 별개다. 다만 접속 대상 주소는 새 IP로 바꿔야 한다.\n\n> Q: Route 53 A record를 EC2 자동 public IP에 연결해도 되나요?\n> 의도: 자동 public IP의 lifecycle을 이해하는지 확인한다.\n> 핵심: 가능하지만 IP가 바뀌면 record를 갱신해야 한다. 오래 유지할 주소가 필요하면 Elastic IP나 다른 DNS/LB 전략을 고려한다.\n\n> Q: Elastic IP를 쓰면 앱이 자동으로 살아나나요?\n> 의도: 네트워크 주소와 앱 프로세스를 분리하는지 확인한다.\n> 핵심: 아니다. EIP는 public 주소를 고정할 뿐이고, 앱 프로세스, 포트, 보안 그룹은 별도로 정상이어야 한다.\n\n## 한 줄 정리\n\nEC2 자동 public IP는 편한 임시 주소이고, Elastic IP는 주소를 고정하는 도구다. 배포 확인은 `인스턴스 ID -> 현재 public IP/EIP -> DNS record -> SSH/app 상태` 순서로 본다.\n\n## 실습 서버에서 자주 생기는 타임라인\n\n실습 중에는 아래 흐름이 자주 생긴다.\n\n```text\n1. public IP가 없는 인스턴스를 만들었다.\n2. 새 인스턴스를 다시 만들며 public IP를 받았다.\n3. SSH 명령과 브라우저 주소가 예전 IP를 보고 있었다.\n4. Route 53 record나 README에 적어 둔 주소도 예전 IP였다.\n5. 새 IP로 접속하니 known_hosts prompt가 다시 나왔다.\n```\n\n이 상황에서 가장 먼저 할 일은 모든 곳을 동시에 고치는 것이 아니라 현재 사실을 한 줄로 적는 것이다.\n\n```text\ninstance_id=i-...\npublic_ip=54.x.x.x\npublic_dns=ec2-54-x-x-x.ap-northeast-2.compute.amazonaws.com\nkey_pair=key-dongkey\nsecurity_group=techcourse-lv2-public\n```\n\n그다음 SSH, 브라우저, Route 53, 문서에 적힌 주소를 이 값과 맞춘다. 주소가 여러 곳에 흩어져 있으면 한 곳만 고치고 다른 곳을 놓치기 쉽다.\n\n## 비용과 정리 기준\n\nElastic IP는 편하지만 정리 기준도 있어야 한다. 학습용으로 EIP를 할당한 뒤 인스턴스에 연결하지 않고 방치하면 비용이 발생할 수 있다. 따라서 EIP를 쓰기로 했다면 아래를 같이 기록한다.\n\n- 어떤 인스턴스에 associate되어 있는가\n- Route 53 A record가 이 EIP를 가리키는가\n- 실습이 끝나면 release할 것인가, 다음 배포에도 유지할 것인가\n- 인스턴스를 삭제하거나 중지할 때 EIP가 orphan으로 남지 않는가\n\n초보자에게 중요한 기준은 \"고정 주소가 필요하지 않으면 자동 public IP로도 충분하다\"와 \"고정 주소가 필요하면 EIP를 쓰되 비용/정리 책임도 생긴다\"를 같이 기억하는 것이다.\n\n",
+  "aliases": [
+    "EC2 public IP changed",
+    "Elastic IP beginner",
+    "auto assigned public IPv4",
+    "EC2 stop start IP changed",
+    "Route53 old IP",
+    "EC2 고정 IP",
+    "EIP associate instance",
+    "public DNS changed",
+    "EC2 IP 바뀜",
+    "인스턴스 ID public IP 확인"
+  ],
+  "expected_queries": [
+    "EC2 서버를 새로 만들었더니 public IP가 바뀌었는데 Route53이랑 SSH는 뭘 다시 봐야 해?",
+    "자동 할당 public IPv4랑 Elastic IP는 뭐가 다르고 언제 EIP를 써야 해?",
+    "EC2 stop/start 후 public IP가 달라지면 보안 그룹도 다시 바꿔야 하는 거야?",
+    "도메인 A record가 예전 EC2 IP를 보고 있는지 dig로 어떻게 확인해?",
+    "Elastic IP를 새 인스턴스에 연결하면 known_hosts 경고가 날 수도 있어?"
+  ],
+  "symptoms": [
+    "자동 public IP를 영구 주소로 착각한다",
+    "public IP 변경과 security group inbound를 같은 문제로 본다",
+    "Route53 A record가 예전 IP를 가리키는 상황을 앱 장애로 오해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/ec2-public-ip-security-group-ssh-primer"
+    ],
+    "next_docs": [
+      "network/route53-domain-to-ec2-spring-boot-primer",
+      "network/ssh-host-key-known-hosts-fingerprint-primer"
+    ],
+    "confusable_with": [
+      "network/ec2-public-ip-security-group-ssh-primer",
+      "network/route53-domain-to-ec2-spring-boot-primer"
+    ],
+    "forbidden_for_queries": [
+      "VPC private subnet routing deep dive",
+      "ALB 고가용성 설계",
+      "TLS 인증서 설정"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "note": "batch18 beginner ops surface gap fill"
+      }
+    ]
+  }
+}

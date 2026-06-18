@@ -4,26 +4,25 @@
   "category": "security",
   "level": "advanced",
   "summary": "이 문서는 security 카테고리에서 Envelope Encryption / KMS Basics를 다루는 primer 문서다. envelope encryption은 데이터 키와 마스터 키를 분리해 대량 데이터는 빠르게 암호화하고, 상위 키는 KMS로 더 강하게 보호하는 방식이다. 검색 질의가 envelope encryption, KMS, data key, master key처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
-  "body_markdown": "# Envelope Encryption / KMS Basics\n\n> 한 줄 요약: envelope encryption은 데이터 키와 마스터 키를 분리해 대량 데이터는 빠르게 암호화하고, 상위 키는 KMS로 더 강하게 보호하는 방식이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Secret Management, Rotation, Leak Patterns](./secret-management-rotation-leak-patterns.md)\n> - [Key Rotation Runbook](./key-rotation-runbook.md)\n> - [Secret Scanning / Credential Leak Response](./secret-scanning-credential-leak-response.md)\n> - [HTTPS / HSTS / MITM](./https-hsts-mitm.md)\n> - [mTLS Certificate Rotation / Trust Bundle Rollout](./mtls-certificate-rotation-trust-bundle-rollout.md)\n\nretrieval-anchor-keywords: envelope encryption, KMS, data key, master key, CMK, DEK, key wrapping, unwrap, envelope, rotation, ciphertext, key hierarchy\n\n---\n\n## 핵심 개념\n\nenvelope encryption은 큰 데이터를 직접 마스터 키로 암호화하지 않고, 데이터 키(DEK)로 암호화한 뒤 그 DEK를 KMS가 보호하는 상위 키로 감싸는 방식이다.\n\n왜 이렇게 하냐면:\n\n- 대량 데이터 암호화는 빠르게 해야 한다\n- 상위 키는 자주 노출되면 안 된다\n- 키 회전은 데이터 전체를 다시 암호화하지 않게 하고 싶다\n\n즉 envelope encryption은 성능과 보안을 동시에 맞추기 위한 키 계층화다.\n\n---\n\n## 깊이 들어가기\n\n### 1. key hierarchy\n\n보통 이렇게 나눈다.\n\n- `root/master key`: 가장 상위 신뢰 키\n- `KMS key/CMK`: 관리 가능한 상위 키\n- `data key/DEK`: 실제 데이터 암호화에 쓰는 키\n\nDEK는 데이터와 함께 사용되지만, 직접 평문으로 오래 남기지 않는다.\n\n### 2. KMS가 하는 일\n\nKMS는 대개 다음을 제공한다.\n\n- key 생성\n- key wrapping/unwrapping\n- 접근 제어\n- audit log\n- rotation\n\n중요한 건 KMS가 \"모든 암호화를 대신 해주는 서비스\"가 아니라는 점이다.  \n대용량 데이터는 앱이 DEK로 직접 암호화하고, KMS는 DEK를 보호한다.\n\n### 3. 왜 rotation이 쉬워지나\n\n데이터 전체를 다시 암호화하는 건 비싸다.  \n하지만 envelope 구조에서는 상위 키만 바꾸고 DEK를 다시 감쌀 수 있다.\n\n- 대용량 ciphertext는 그대로 둔다\n- DEK를 새 CMK로 re-wrap 한다\n- 상위 키 교체 비용을 줄인다\n\n### 4. access control이 암호화만큼 중요하다\n\nKMS가 있어도 권한이 느슨하면 끝이다.\n\n- 누가 decrypt를 요청할 수 있는가\n- 어떤 서비스 역할만 unwrap 가능한가\n- audit trail이 남는가\n\n즉 envelope encryption은 암호화 설계이면서 접근 제어 설계다.\n\n### 5. envelope encryption이 필요한 대표 경로\n\n- DB column level encryption\n- object metadata encryption\n- secret at rest\n- client-specific token wrapping\n- backup encryption\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: DB에 민감 값이 남아 있음\n\n대응:\n\n- 필드 단위 DEK를 둔다\n- KMS로 DEK를 보호한다\n- decrypt 권한을 최소화한다\n\n### 시나리오 2: KMS 키 rotation이 필요함\n\n대응:\n\n- 기존 ciphertext는 유지한다\n- DEK만 re-wrap한다\n- decrypt 성공/실패 로그를 확인한다\n\n### 시나리오 3: 운영자가 평문 키를 서버에 두려 함\n\n대응:\n\n- 평문 master key를 앱에 두지 않는다\n- KMS IAM 정책과 audit log를 사용한다\n- 로컬 파일 대신 managed key를 쓴다\n\n---\n\n## 코드로 보기\n\n### 1. envelope 개념\n\n```java\npublic EncryptedBlob encrypt(byte[] plaintext) {\n    DataKey dataKey = kms.generateDataKey();\n    byte[] ciphertext = symmetricEncrypt(dataKey.plaintextKey(), plaintext);\n    return new EncryptedBlob(dataKey.encryptedKey(), ciphertext);\n}\n```\n\n### 2. decrypt 개념\n\n```java\npublic byte[] decrypt(EncryptedBlob blob) {\n    byte[] plaintextDataKey = kms.decrypt(blob.encryptedKey());\n    return symmetricDecrypt(plaintextDataKey, blob.ciphertext());\n}\n```\n\n### 3. re-wrap 개념\n\n```text\n1. 새 CMK를 만든다\n2. 기존 DEK를 새 CMK로 다시 감싼다\n3. ciphertext는 그대로 둔다\n4. decrypt 경로가 새 CMK를 보게 한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| direct master-key encryption | 단순하다 | 회전과 노출 위험이 크다 | 거의 비권장 |\n| envelope encryption | 확장성과 회전에 유리하다 | 구현이 복잡하다 | 대부분의 실서비스 |\n| per-record DEK | 격리가 좋다 | 메타데이터 관리가 늘어난다 | 고보안 데이터 |\n| KMS only | 운영이 편하다 | 성능/비용을 고려해야 한다 | 소규모 시스템 |\n\n판단 기준은 이렇다.\n\n- 데이터 양이 많은가\n- key rotation이 자주 필요한가\n- decrypt 권한을 세밀하게 나눠야 하는가\n- audit log가 필요한가\n\n---\n\n## 꼬리질문\n\n> Q: envelope encryption의 핵심 이점은 무엇인가요?\n> 의도: 데이터 키와 상위 키 분리를 아는지 확인\n> 핵심: 대용량 데이터는 빠르게 암호화하고 상위 키는 강하게 보호할 수 있다.\n\n> Q: KMS는 무엇을 해주나요?\n> 의도: KMS의 역할 경계를 아는지 확인\n> 핵심: key 관리, wrapping, 권한, audit, rotation을 돕는다.\n\n> Q: 왜 전체 데이터를 다시 암호화하지 않아도 되나요?\n> 의도: re-wrap의 의미를 이해하는지 확인\n> 핵심: 데이터 자체는 유지하고 DEK만 다시 감싸면 되기 때문이다.\n\n> Q: 접근 제어가 왜 중요한가요?\n> 의도: 암호화만으로는 부족하다는 점을 아는지 확인\n> 핵심: decrypt 권한이 넓으면 암호화가 있어도 안전하지 않다.\n\n## 한 줄 정리\n\nenvelope encryption은 데이터와 키를 분리해 성능과 보안을 모두 챙기는 키 계층 설계다.\n",
+  "body_markdown": "# Envelope Encryption / KMS Basics\n\n> 한 줄 요약: envelope encryption은 데이터 키와 마스터 키를 분리해 대량 데이터는 빠르게 암호화하고, 상위 키는 KMS로 더 강하게 보호하는 방식이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Secret Management, Rotation, Leak Patterns](./secret-management-rotation-leak-patterns.md)\n> - [Key Rotation Runbook](./key-rotation-runbook.md)\n> - [Secret Scanning / Credential Leak Response](./secret-scanning-credential-leak-response.md)\n> - [HTTPS / HSTS / MITM](./https-hsts-mitm.md)\n> - [mTLS Certificate Rotation / Trust Bundle Rollout](./mtls-certificate-rotation-trust-bundle-rollout.md)\n\nretrieval-anchor-keywords: envelope encryption, KMS, data key, master key, CMK, DEK, key wrapping, unwrap, envelope, rotation, ciphertext, key hierarchy\n\n---\n\n## 핵심 개념\n\nenvelope encryption은 큰 데이터를 직접 마스터 키로 암호화하지 않고, 데이터 키(DEK)로 암호화한 뒤 그 DEK를 KMS가 보호하는 상위 키로 감싸는 방식이다.\n\n왜 이렇게 하냐면:\n\n- 대량 데이터 암호화는 빠르게 해야 한다\n- 상위 키는 자주 노출되면 안 된다\n- 키 회전은 데이터 전체를 다시 암호화하지 않게 하고 싶다\n\n즉 envelope encryption은 성능과 보안을 동시에 맞추기 위한 키 계층화다.\n\n---\n\n## 깊이 들어가기\n\n### 1. key hierarchy\n\n보통 이렇게 나눈다.\n\n- `root/master key`: 가장 상위 신뢰 키\n- `KMS key/CMK`: 관리 가능한 상위 키\n- `data key/DEK`: 실제 데이터 암호화에 쓰는 키\n\nDEK는 데이터와 함께 사용되지만, 직접 평문으로 오래 남기지 않는다.\n\n### 2. KMS가 하는 일\n\nKMS는 대개 다음을 제공한다.\n\n- key 생성\n- key wrapping/unwrapping\n- 접근 제어\n- audit log\n- rotation\n\n중요한 건 KMS가 \"모든 암호화를 대신 해주는 서비스\"가 아니라는 점이다.  \n대용량 데이터는 앱이 DEK로 직접 암호화하고, KMS는 DEK를 보호한다.\n\n### 3. 왜 rotation이 쉬워지나\n\n데이터 전체를 다시 암호화하는 건 비싸다.  \n하지만 envelope 구조에서는 상위 키만 바꾸고 DEK를 다시 감쌀 수 있다.\n\n- 대용량 ciphertext는 그대로 둔다\n- DEK를 새 CMK로 re-wrap 한다\n- 상위 키 교체 비용을 줄인다\n\n### 4. access control이 암호화만큼 중요하다\n\nKMS가 있어도 권한이 느슨하면 끝이다.\n\n- 누가 decrypt를 요청할 수 있는가\n- 어떤 서비스 역할만 unwrap 가능한가\n- audit trail이 남는가\n\n즉 envelope encryption은 암호화 설계이면서 접근 제어 설계다.\n\n### 5. envelope encryption이 필요한 대표 경로\n\n- DB column level encryption\n- object metadata encryption\n- secret at rest\n- client-specific token wrapping\n- backup encryption\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: DB에 민감 값이 남아 있음\n\n대응:\n\n- 필드 단위 DEK를 둔다\n- KMS로 DEK를 보호한다\n- decrypt 권한을 최소화한다\n\n### 시나리오 2: KMS 키 rotation이 필요함\n\n대응:\n\n- 기존 ciphertext는 유지한다\n- DEK만 re-wrap한다\n- decrypt 성공/실패 로그를 확인한다\n\n### 시나리오 3: 운영자가 평문 키를 서버에 두려 함\n\n대응:\n\n- 평문 master key를 앱에 두지 않는다\n- KMS IAM 정책과 audit log를 사용한다\n- 로컬 파일 대신 managed key를 쓴다\n\n---\n\n## 코드로 보기\n\n### 1. envelope 개념\n\n```java\npublic EncryptedBlob encrypt(byte[] plaintext) {\n    DataKey dataKey = kms.generateDataKey();\n    byte[] ciphertext = symmetricEncrypt(dataKey.plaintextKey(), plaintext);\n    return new EncryptedBlob(dataKey.encryptedKey(), ciphertext);\n}\n```\n\n### 2. decrypt 개념\n\n```java\npublic byte[] decrypt(EncryptedBlob blob) {\n    byte[] plaintextDataKey = kms.decrypt(blob.encryptedKey());\n    return symmetricDecrypt(plaintextDataKey, blob.ciphertext());\n}\n```\n\n### 3. re-wrap 개념\n\n```text\n1. 새 CMK를 만든다\n2. 기존 DEK를 새 CMK로 다시 감싼다\n3. ciphertext는 그대로 둔다\n4. decrypt 경로가 새 CMK를 보게 한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| direct master-key encryption | 단순하다 | 회전과 노출 위험이 크다 | 거의 비권장 |\n| envelope encryption | 확장성과 회전에 유리하다 | 구현이 복잡하다 | 대부분의 실서비스 |\n| per-record DEK | 격리가 좋다 | 메타데이터 관리가 늘어난다 | 고보안 데이터 |\n| KMS only | 운영이 편하다 | 성능/비용을 고려해야 한다 | 소규모 시스템 |\n\n판단 기준은 이렇다.\n\n- 데이터 양이 많은가\n- key rotation이 자주 필요한가\n- decrypt 권한을 세밀하게 나눠야 하는가\n- audit log가 필요한가\n\n---\n\n## 꼬리질문\n\n> Q: envelope encryption의 핵심 이점은 무엇인가요?\n> 의도: 데이터 키와 상위 키 분리를 아는지 확인\n> 핵심: 대용량 데이터는 빠르게 암호화하고 상위 키는 강하게 보호할 수 있다.\n\n> Q: KMS는 무엇을 해주나요?\n> 의도: KMS의 역할 경계를 아는지 확인\n> 핵심: key 관리, wrapping, 권한, audit, rotation을 돕는다.\n\n> Q: 왜 전체 데이터를 다시 암호화하지 않아도 되나요?\n> 의도: re-wrap의 의미를 이해하는지 확인\n> 핵심: 데이터 자체는 유지하고 DEK만 다시 감싸면 되기 때문이다.\n\n> Q: 접근 제어가 왜 중요한가요?\n> 의도: 암호화만으로는 부족하다는 점을 아는지 확인\n> 핵심: decrypt 권한이 넓으면 암호화가 있어도 안전하지 않다.\n\n## 운영 설계 체크포인트\n\n실서비스에서 먼저 정할 것은 암호화 알고리즘보다 키 책임 경계다. 애플리케이션은 평문 DEK를 필요한 순간에만 메모리에 들고, 저장소에는 ciphertext, encrypted DEK, KMS key id, algorithm version, encryption context 같은 복호화 메타데이터를 함께 남긴다. 이 메타데이터가 없으면 나중에 키를 회전하거나 라이브러리를 바꿀 때 어떤 방식으로 암호화했는지 추적하기 어렵다.\n\nKMS 권한은 encrypt보다 decrypt를 더 좁게 본다. 많은 서비스가 데이터를 쓸 수는 있어도, 민감 값을 읽어 평문으로 복원할 수 있는 역할은 제한되어야 한다. 감사 로그에서는 누가 어떤 key id로 decrypt를 요청했는지, 비정상적으로 많은 실패가 있었는지, 평소와 다른 서비스 계정이 접근했는지를 본다. 암호화 자체가 강해도 decrypt 권한이 넓으면 운영자는 사실상 평문 DB를 가진 것과 비슷한 위험을 떠안는다.\n\n## 저장 포맷과 회전 감각\n\nEnvelope 구조의 장점은 re-encrypt와 re-wrap을 나눌 수 있다는 점이다. 데이터 암호화 알고리즘이나 DEK 자체를 바꾸려면 payload를 다시 암호화해야 하지만, 상위 KMS key만 교체하는 회전이라면 기존 DEK를 새 key로 다시 감싸는 re-wrap으로 끝낼 수 있다. 그래서 저장 포맷에는 key version과 wrapping key 식별자를 반드시 넣는다.\n\n장애 대응에서는 encrypted DEK 손상이 가장 위험하다. payload ciphertext가 남아 있어도 DEK를 풀 수 없으면 데이터는 복구할 수 없다. 백업, 복제, 마이그레이션 파이프라인이 ciphertext만 옮기고 encrypted DEK나 metadata를 빠뜨리지 않는지 점검해야 한다.\n\n## 한 줄 정리\n\nenvelope encryption은 데이터와 키를 분리해 성능과 보안을 모두 챙기는 키 계층 설계다.\n",
   "aliases": [
-    "envelope encryption",
-    "KMS",
-    "data key",
-    "master key",
-    "CMK",
-    "DEK",
-    "key wrapping",
-    "unwrap",
-    "envelope",
-    "rotation",
-    "ciphertext",
-    "key hierarchy"
+    "봉투 암호화",
+    "KMS 데이터 키",
+    "데이터 키 감싸기",
+    "CMK와 DEK",
+    "키 래핑 구조",
+    "KMS 복호화 권한",
+    "envelope key hierarchy",
+    "data key rewrap",
+    "암호화 키 회전",
+    "ciphertext metadata"
   ],
   "expected_queries": [
-    "Envelope Encryption / KMS Basics 핵심 개념을 설명해줘",
-    "envelope encryption가 왜 필요한지 알려줘",
-    "Envelope Encryption / KMS Basics 실무 설계 포인트는 뭐야?",
-    "envelope encryption에서 흔한 실수는 무엇이야?"
+    "envelope encryption에서 데이터 키와 KMS 키를 왜 분리해?",
+    "KMS가 대용량 데이터를 직접 암호화하지 않는 이유가 뭐야?",
+    "암호화된 DEK와 ciphertext를 같이 저장해도 되는 조건은 뭐야?",
+    "키 회전할 때 데이터를 다시 암호화하지 않고 re-wrap만 하는 흐름을 설명해줘",
+    "decrypt 권한이 넓으면 envelope encryption도 왜 위험해?"
   ],
   "symptoms": [
     "`Envelope Encryption / KMS Basics`의 기본 용어와 책임 경계가 헷갈려 다음 심화 문서로 넘어가지 못한다",
@@ -45,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/envelope-encryption-kms-basics.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

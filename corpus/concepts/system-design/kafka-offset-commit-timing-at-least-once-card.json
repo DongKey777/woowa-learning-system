@@ -1,0 +1,68 @@
+{
+  "id": "system-design/kafka-offset-commit-timing-at-least-once-card",
+  "title": "Kafka Offset Commit Timing and At-Least-Once Card",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka consumer에서 offset commit은 record를 읽었다는 표시가 아니라 다음 poll을 어디서 시작할지 저장하는 처리 완료 선언에 가깝다. 처리 전 commit, 처리 후 commit, auto commit이 유실과 중복을 어떻게 만드는지 at-least-once 관점으로 설명한다.",
+  "body_markdown": "# Kafka Offset Commit Timing and At-Least-Once Card\n\n> 한 줄 요약: Kafka offset commit은 \"이 record를 업무적으로 끝냈다\"는 경계로 설계해야 하며, 너무 이르면 유실, 너무 늦거나 실패하면 중복 재처리가 생긴다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer](./kafka-foundations-topic-partition-broker-offset-beginner-primer.md)\n- [Kafka Producer Consumer Flow, Offset, Retention Beginner Bridge](./kafka-producer-consumer-flow-offset-retention-beginner-bridge.md)\n- [Queue Delivery Semantics Beginner Primer](./queue-delivery-semantics-beginner-primer.md)\n- [Producer Retry Duplicate Origin Primer](./producer-retry-duplicate-origin-primer.md)\n- [Kafka Out-of-Order Commit Offset Gap Parallelism](./kafka-out-of-order-commit-offset-gap-parallelism.md)\n- [Tiered Retry Topic Ladder, Backoff, and DLQ](./tiered-retry-topic-ladder-backoff-dlq.md)\n\nretrieval-anchor-keywords: Kafka offset commit timing, auto commit duplicate loss, at-least-once consumer, commit before processing loss, commit after processing duplicate, consumer crash before commit, offset commit 처리 완료, 카프카 오프셋 커밋 시점, at least once 카프카\n\n---\n\n## 먼저 구분할 것\n\nKafka consumer는 record를 poll로 읽는다. 하지만 읽었다는 사실과 업무 처리가 성공했다는 사실은 다르다.\n\n```text\npoll record\n  -> DB 저장 / 외부 API 호출 / 파일 생성 같은 side effect\n  -> offset commit\n```\n\n여기서 offset commit은 broker에게 \"다음에는 이 위치 이후부터 읽어도 된다\"고 알려 주는 위치 저장이다. 그래서 commit을 처리 성공보다 먼저 하면 실패 시 record를 다시 못 볼 수 있고, 처리 성공 뒤 commit 전에 죽으면 같은 record를 다시 볼 수 있다.\n\n초보자가 잡아야 할 기준은 하나다.\n\n```text\noffset commit 위치는 중복을 감수할지, 유실을 감수할지의 선택이다.\n대부분 업무 이벤트는 유실보다 중복을 방어하는 at-least-once 쪽으로 설계한다.\n```\n\n---\n\n## 세 가지 타이밍\n\n| 타이밍 | 흐름 | 실패 시 결과 | 해석 |\n|---|---|---|---|\n| 처리 전 commit | commit -> side effect | side effect 실패 시 record 유실 | at-most-once 쪽에 가깝다 |\n| 처리 후 commit | side effect -> commit | commit 전 crash면 중복 재처리 | at-least-once 쪽에 가깝다 |\n| auto commit | poll 이후 주기적 commit | 처리 완료와 commit 시점이 어긋남 | 편하지만 경계가 흐려진다 |\n\n`enable.auto.commit=true`는 편하지만 \"내 업무 처리가 끝난 뒤 commit\"이라는 의도를 코드로 표현하기 어렵다. 처리 시간이 길거나 batch 안에서 일부만 실패하는 서비스라면 manual commit으로 처리 완료 경계를 드러내는 편이 안전하다.\n\n---\n\n## worked example: 예약 생성 이벤트 consumer\n\n`reservation-created` 이벤트를 받아 알림 발송 이력을 DB에 저장한다고 하자.\n\n```text\noffset 120: reservationId=7 notificationId=n-7\n```\n\n### commit이 너무 이른 경우\n\n```text\n1. offset 120 commit\n2. DB insert 시도\n3. DB timeout\n4. consumer process 종료\n5. 재시작 후 offset 121부터 읽음\n```\n\n이 경우 offset 120은 다시 처리되지 않을 수 있다. 알림 이력이 빠진다. 이것이 처리 전 commit의 유실 위험이다.\n\n### commit이 늦은 경우\n\n```text\n1. DB insert 성공\n2. offset commit 전에 process 종료\n3. 재시작 후 offset 120 다시 poll\n4. DB insert 재시도\n```\n\n이번에는 중복 가능성이 생긴다. 그래서 `notificationId`에 unique constraint를 두거나, event id를 처리 완료 테이블에 저장해 idempotent하게 만들어야 한다.\n\n```sql\nCREATE UNIQUE INDEX ux_notification_event\nON notification_log(event_id);\n```\n\n```java\ntry {\n    notificationLogRepository.insert(eventId, reservationId);\n} catch (DuplicateKeyException alreadyProcessed) {\n    // 같은 이벤트 재처리. side effect는 이미 완료됐다고 보고 offset commit 가능.\n}\nconsumer.commitSync();\n```\n\n위 코드는 개념 예시다. 실제 코드에서는 poll loop, batch commit, transaction boundary, retry 정책을 함께 설계해야 한다.\n\n---\n\n## auto commit이 헷갈리게 만드는 지점\n\nAuto commit은 일정 주기로 가장 최근 poll된 offset을 commit할 수 있다. 문제는 poll된 record가 모두 업무적으로 성공했다는 보장이 없다는 것이다.\n\n예를 들어 poll로 100개를 가져온 뒤 80번째에서 외부 API가 막혔다고 하자. auto commit이 이미 100개 이후 위치를 저장했다면 실패한 record를 다시 읽기 어렵다. 반대로 auto commit 주기가 늦으면 이미 처리한 record를 다시 읽을 수 있다.\n\n따라서 auto commit은 빠른 실험이나 손실 가능성이 낮은 통계성 처리에는 편할 수 있지만, 주문·결제·예약처럼 유실이 치명적인 흐름에서는 처리 완료 기준을 명시하는 manual commit을 먼저 검토한다.\n\n---\n\n## batch poll에서 더 어려워지는 이유\n\nKafka consumer는 한 번에 여러 record를 poll할 수 있다. offset commit은 partition별 위치이므로, offset 105를 commit하면 일반적으로 그 이전 record도 처리됐다고 선언하는 의미가 된다.\n\n```text\npartition 0: 100 101 102 103 104 105\n처리 성공: 100, 101, 103, 104, 105\n처리 실패: 102\n```\n\n여기서 105를 그냥 commit하면 102를 건너뛰는 문제가 생긴다. 그래서 partition 안에서 순차 처리하거나, 병렬 처리한다면 offset gap tracking이 필요하다. 이 주제가 `kafka-out-of-order-commit-offset-gap-parallelism`으로 이어진다.\n\n---\n\n## at-least-once 설계 체크리스트\n\n| 질문 | 안전한 답변 방향 |\n|---|---|\n| side effect가 성공하기 전에 commit하는가 | 유실 위험을 설명하고 피한다 |\n| side effect 성공 후 commit 실패가 가능한가 | 중복 재처리를 전제로 둔다 |\n| 중복 재처리 방어가 있는가 | event id, unique constraint, idempotency key를 둔다 |\n| batch 안 일부 실패를 어떻게 다루는가 | 순차 처리, retry topic, offset gap tracking 중 하나를 선택한다 |\n| poison message가 main consumer를 막는가 | inline retry와 DLQ/retry topic을 분리한다 |\n| commit 실패 자체를 관측하는가 | commit latency, commit failure log, consumer lag를 본다 |\n\n---\n\n## 흔한 오해\n\n| 오해 | 교정 |\n|---|---|\n| poll하면 처리된 것이다 | poll은 읽기이고, 업무 성공은 side effect 성공이다 |\n| commit하면 메시지가 삭제된다 | commit은 consumer group의 위치 저장이고, record retention은 별도다 |\n| auto commit이면 안전하다 | 처리 완료와 commit 시점이 어긋날 수 있다 |\n| at-least-once면 정확히 한 번 처리된다 | 최소 한 번이므로 중복 처리를 방어해야 한다 |\n| 중복은 producer 문제다 | producer retry 중복과 consumer 재처리 중복은 원인이 다르다 |\n\n---\n\n## 미션/면접 답변 골격\n\n\"Kafka consumer offset commit은 다음에 어디서 읽을지 저장하는 것입니다. 처리 전에 commit하면 처리 실패 시 record를 잃을 수 있고, 처리 후 commit하면 commit 전 장애 시 같은 record를 다시 처리할 수 있습니다. 그래서 보통 유실을 피하려고 side effect 성공 후 commit하고, 중복은 event id나 unique constraint로 idempotent하게 막습니다. batch 병렬 처리에서는 offset gap을 관리하지 않으면 앞의 실패 record를 건너뛸 수 있습니다.\"\n\n---\n\n## 꼬리질문\n\n> Q: offset commit은 메시지 삭제인가요?\n> 의도: Kafka retention과 consumer group 위치 저장을 분리하는지 확인\n> 핵심: commit은 group의 읽기 위치 저장이고 record 보존은 retention 정책이 담당한다.\n\n> Q: 처리 후 commit 전략에서도 왜 중복이 생기나요?\n> 의도: at-least-once 실패 창 이해 확인\n> 핵심: side effect 성공 후 commit 전에 crash하면 같은 offset을 다시 읽을 수 있다.\n\n> Q: batch에서 offset 105를 commit하면 102 실패를 어떻게 놓칠 수 있나요?\n> 의도: offset은 prefix 완료 선언이라는 감각 확인\n> 핵심: high offset commit은 그 이전 record들이 완료됐다는 의미가 되므로 gap 관리가 필요하다.\n\n## 한 줄 정리\n\nKafka offset commit timing은 유실과 중복 사이의 선택이며, 실무에서는 처리 후 commit과 idempotent consumer로 at-least-once를 안전하게 만드는 것이 출발점이다.\n",
+  "aliases": [
+    "Kafka offset commit timing",
+    "카프카 오프셋 커밋",
+    "처리 후 offset commit",
+    "auto commit 유실 중복",
+    "at least once consumer",
+    "commit before processing",
+    "consumer crash before commit",
+    "오프셋 커밋 시점",
+    "카프카 중복 재처리",
+    "manual commit Kafka"
+  ],
+  "expected_queries": [
+    "Kafka consumer에서 offset commit을 처리 전과 처리 후에 하면 각각 어떤 문제가 생겨?",
+    "카프카 auto commit을 켜면 왜 메시지 유실이나 중복 처리가 생길 수 있어?",
+    "consumer가 DB 저장은 성공했는데 offset commit 전에 죽으면 같은 메시지를 다시 읽는 이유가 뭐야?",
+    "Kafka at-least-once 처리는 offset commit timing과 idempotent consumer를 어떻게 같이 봐야 해?",
+    "batch poll에서 일부 record만 실패했는데 높은 offset을 commit하면 왜 위험해?",
+    "카프카 offset commit은 메시지 삭제가 아니라 consumer group 위치 저장이라는 말을 설명해줘"
+  ],
+  "symptoms": [
+    "poll로 읽으면 처리 완료라고 생각한다",
+    "auto commit이 업무 성공 이후에만 일어난다고 착각한다",
+    "at-least-once를 중복 없는 처리로 오해한다",
+    "batch 안 일부 실패와 high offset commit의 관계를 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "system-design/tiered-retry-topic-ladder-backoff-dlq"
+    ],
+    "confusable_with": [
+      "system-design/producer-retry-duplicate-origin-primer",
+      "system-design/queue-delivery-semantics-beginner-primer",
+      "database/exactly-once-myths-db-queue"
+    ],
+    "forbidden_for_queries": [
+      "Kafka producer retry로 broker append duplicate가 생기는 원인을 설명해줘",
+      "Kafka cooperative rebalance와 eager rebalance 차이를 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-offset-commit-timing-at-least-once-card.md",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch92-stream-a-kafka-foundation"
+      }
+    ]
+  }
+}

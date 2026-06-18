@@ -1,0 +1,66 @@
+{
+  "id": "spring/spring-boot-executable-jar-ec2-runbook",
+  "title": "Spring Boot 실행형 jar EC2 배포 Runbook",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "Ubuntu EC2에서 Spring Boot 실행형 jar를 배포할 때는 Git으로 소스 버전을 맞추고, Java 21 환경에서 `./gradlew bootJar`로 `build/libs`의 실행 jar를 만든 뒤, `java -jar` 프로세스와 `app.log`/PID를 확인하고, `curl localhost`와 public IP 접근을 서로 다른 검증 단계로 나눠 본다.",
+  "body_markdown": "# Spring Boot 실행형 jar EC2 배포 Runbook: clone부터 public IP 확인까지\n\n> 한 줄 요약: EC2 배포는 `git clone` -> Java 21 확인 -> `./gradlew bootJar` -> `build/libs`의 실행 jar 선택 -> `java -jar` 실행 -> `app.log`/PID 확인 -> `curl localhost`와 public IP를 나눠 확인하는 흐름이다.\n>\n> 문서 역할: 이 문서는 Spring Boot 앱을 Ubuntu EC2 한 대에 직접 올려 실행하는 초급 운영 runbook이다. 핵심은 명령을 외우는 것이 아니라, 각 명령이 어느 경계를 검증하는지 분리하는 것이다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Embedded Tomcat Auto-configuration Bridge](./embedded-tomcat-autoconfiguration-bridge.md)\n- [WAS와 웹 서버 기초](../network/was-vs-web-server-basics.md)\n- [Shell Job-Control Command Bridge](../operating-system/shell-job-control-command-bridge.md)\n- [Spring Logging primer](./spring-logging-basics-primer.md)\n\nretrieval-anchor-keywords: Spring Boot executable jar EC2, Ubuntu EC2 Java 21 bootJar, gradlew bootJar build libs jar, java -jar app.log pid, nohup Spring Boot jar, curl localhost public IP, EC2 security group 8080, t4g.micro Gradle Xmx, Gradle daemon memory, OpenJDK 21 arm64\n\n## 먼저 멘탈 모델\n\n입문자가 가장 자주 빠지는 함정은 `java -jar` 한 줄만 성공하면 배포가 끝났다고 보는 것이다. 실제로는 아래 네 경계가 모두 통과해야 외부 사용자가 API를 볼 수 있다.\n\n| 경계 | 확인할 것 | 대표 명령 | 실패하면 보는 곳 |\n|---|---|---|---|\n| 코드 버전 | EC2의 코드가 기대한 commit인가 | `git fetch`, `git pull --ff-only`, `git log -1` | Git remote, branch, local edit |\n| 빌드 | Java 21과 Gradle이 실행 jar를 만들었는가 | `./gradlew --no-daemon bootJar` | JDK 버전, 메모리, test 실패, jar 종류 |\n| 프로세스 | JVM이 살아 있고 Spring Boot가 포트를 열었는가 | `java -jar`, `ps`, `tail -f app.log` | 로그, PID, port 충돌, profile |\n| 네트워크 | EC2 밖에서 해당 port로 들어올 수 있는가 | `curl localhost`, `curl public-ip` | security group, UFW, server.address, Nginx |\n\n즉 `curl localhost:8080`은 애플리케이션 프로세스 검증이고, `curl http://<public-ip>:8080`은 외부 네트워크 경로 검증이다. 둘을 섞으면 원인을 잘못 잡는다.\n\n## 배포 방식의 위치\n\nSpring Boot executable jar는 embedded Tomcat을 포함한다. 그래서 외부 Tomcat에 WAR를 올리는 방식이 아니라, EC2에서 애플리케이션 프로세스 하나를 직접 띄우는 방식이다.\n\n```text\nclient -> EC2 public IP:8080 -> Spring Boot process -> embedded Tomcat -> DispatcherServlet -> Controller\n```\n\nNginx를 앞에 두면 그림은 이렇게 바뀐다.\n\n```text\nclient -> EC2 public IP:80/443 -> Nginx -> localhost:8080 Spring Boot\n```\n\n이 문서는 Nginx 없이 jar를 직접 8080으로 노출하는 가장 작은 흐름을 먼저 다룬다. 운영에서는 systemd, Nginx, TLS, log rotation을 붙이는 편이 낫지만, 처음에는 경계를 줄여서 어디가 막히는지 보는 것이 더 중요하다.\n\n## Worked command sequence\n\n아래는 Ubuntu EC2에 SSH 접속한 뒤, 배포용 디렉터리에서 실행하는 최소 흐름이다. 실제 repo URL과 branch 이름은 팀 상황에 맞춘다.\n\n```bash\n# 1. Java 21 확인 또는 설치\njava -version\nsudo apt update\nsudo apt install -y openjdk-21-jdk\njava -version\n\n# 2. 처음 배포: clone\nmkdir -p ~/apps\ncd ~/apps\ngit clone https://github.com/example/roomescape.git\ncd roomescape\n\n# 3. 이후 배포: 같은 clone에서 최신 commit으로 이동\ncd ~/apps/roomescape\ngit fetch origin\ngit checkout main\ngit pull --ff-only origin main\ngit log -1 --oneline\n\n# 4. Gradle wrapper 실행 권한과 bootJar\nchmod +x gradlew\n./gradlew --no-daemon clean bootJar\n\n# 5. plain jar가 아닌 실행형 jar 선택\nls -lh build/libs\nJAR=$(find build/libs -maxdepth 1 -type f -name '*.jar' ! -name '*-plain.jar' | head -n 1)\necho $JAR\n\n# 6. 기존 프로세스가 있으면 종료\nif [ -f app.pid ]; then kill $(cat app.pid); fi\n\n# 7. SSH가 끊겨도 일단 남도록 nohup으로 실행\nSPRING_PROFILES_ACTIVE=prod nohup java -jar $JAR > app.log 2>&1 & echo $! > app.pid\n\n# 8. 프로세스와 로그 확인\ncat app.pid\nps -p $(cat app.pid) -o pid,ppid,stat,etime,cmd\ntail -n 80 app.log\n\n# 9. EC2 내부에서 애플리케이션 확인\ncurl -i http://localhost:8080/\ncurl -i http://localhost:8080/actuator/health\n\n# 10. 내 노트북 또는 외부 네트워크에서 public IP 확인\ncurl -i http://<EC2_PUBLIC_IP>:8080/\n```\n\n여기서 `nohup`은 SSH 세션이 끝날 때 `SIGHUP` 영향으로 바로 죽는 것을 줄이는 임시 장치다. 다만 `nohup`은 진짜 운영 supervisor가 아니다. 재부팅 후 자동 시작, 실패 시 재시작, stdout/stderr rotation까지 필요하면 `systemd` unit으로 옮겨야 한다.\n\n## Java 21 확인 포인트\n\nSpring Boot 3.x 프로젝트가 Java 21로 빌드되도록 되어 있으면 EC2의 JDK도 21이어야 한다. 먼저 `java -version`으로 runtime을 보고, `./gradlew -version`으로 Gradle이 어느 JVM을 쓰는지도 확인한다. Ubuntu 24.04 계열은 보통 `openjdk-21-jdk`를 apt로 설치할 수 있다. 더 오래된 이미지에서 패키지가 없으면 OS 이미지를 바꾸거나 검증된 JDK 배포판을 사용해야지, 출처가 불명확한 PPA를 급하게 붙이는 방식은 피한다.\n\n`t4g.micro`는 ARM64 Graviton 인스턴스라 JDK도 arm64 패키지를 써야 한다. 보통 apt가 아키텍처에 맞는 패키지를 고르지만, tarball을 직접 받을 때는 `x64`와 `aarch64`를 혼동하지 않는다.\n\n## `bootJar`와 `build/libs`를 보는 법\n\n`bootJar`는 Spring Boot Gradle plugin이 만드는 실행형 jar task다. 일반 jar와 다르게 dependency와 boot loader 구조가 들어 있어 `java -jar`로 실행할 수 있다. `build/libs`에 여러 jar가 있으면 흔히 아래처럼 보인다.\n\n```text\nroomescape-0.0.1-SNAPSHOT.jar\nroomescape-0.0.1-SNAPSHOT-plain.jar\n```\n\n대개 `*-plain.jar`는 dependency가 들어 있지 않은 일반 jar라서 EC2 실행 대상이 아니다. `no main manifest attribute`, `ClassNotFoundException`, 의존성 누락처럼 보이면 plain jar를 실행했는지 먼저 본다.\n\n멀티 모듈 프로젝트라면 root의 `build/libs`가 아니라 실제 boot application module의 `app/build/libs`나 `api/build/libs`에 jar가 생길 수 있다. 그래서 `bootJar` 성공 후에는 항상 `ls -lh */build/libs build/libs`처럼 결과 위치를 눈으로 확인한다.\n\n## t4g.micro 메모리 caveat\n\n`t4g.micro`는 1GiB 메모리 인스턴스다. 작은 학습용 Spring Boot 앱을 실행하기엔 가능할 수 있지만, 같은 인스턴스에서 Gradle 빌드까지 하면 메모리 여유가 빠듯하다. 특히 Gradle daemon, Kotlin compiler, test JVM, Spring Boot 앱 JVM이 겹치면 Linux OOM killer가 프로세스를 죽일 수 있다.\n\nGradle daemon의 기본 JVM 설정은 별도 설정이 없을 때 보통 `-Xmx512m -XX:MaxMetaspaceSize=384m` 계열이다. 1GiB 머신에서는 이 값만으로도 OS, file cache, javac, test worker와 경쟁한다. 빌드가 `Killed`, `OutOfMemoryError`, SSH 멈춤처럼 보이면 먼저 daemon을 남기지 않고 heap을 줄인다.\n\n```bash\nmkdir -p ~/.gradle\nprintf '%s\\n' 'org.gradle.daemon=false' > ~/.gradle/gradle.properties\nprintf '%s\\n' 'org.gradle.jvmargs=-Xmx256m -XX:MaxMetaspaceSize=128m -Dfile.encoding=UTF-8' >> ~/.gradle/gradle.properties\n./gradlew --no-daemon clean bootJar\n```\n\n주의할 점은 두 가지다.\n\n- `-Xmx256m`은 작은 미션 프로젝트용 보수값이다. 프로젝트가 크면 빌드가 느려지거나 실패할 수 있다.\n- EC2에서 소스 빌드가 계속 불안정하면, 더 큰 인스턴스나 CI/local에서 jar를 만들고 EC2에는 jar만 복사하는 방식이 더 맞다.\n\n실행 JVM도 별도로 잡는다. 예를 들어 작은 앱이라면 아래처럼 시작할 수 있다.\n\n```bash\nSPRING_PROFILES_ACTIVE=prod nohup java -Xms128m -Xmx384m -jar $JAR > app.log 2>&1 & echo $! > app.pid\n```\n\n하지만 heap을 너무 작게 잡아 런타임 OOM을 만들면 안 된다. 빌드 메모리와 실행 메모리는 따로 생각한다. 빌드가 끝난 뒤 Gradle daemon이 남아 있지 않은지 `ps`로 보고, 앱 실행 전 여유 메모리를 확인한다.\n\n## `app.log`와 PID를 같이 남기는 이유\n\n`java -jar`를 foreground로 실행하면 로그가 터미널에 바로 보이므로 처음에는 이해하기 쉽다. 하지만 SSH를 끊으면 프로세스 lifetime이 터미널 lifetime과 섞인다. 그래서 최소 runbook에서는 stdout/stderr를 `app.log`로 돌리고, background PID를 `app.pid`에 남긴다.\n\n| 파일/값 | 의미 | 확인 명령 |\n|---|---|---|\n| `app.log` | Spring Boot startup log와 예외 stack trace | `tail -f app.log` |\n| `app.pid` | 지금 실행 중이라고 믿는 JVM PID | `cat app.pid`, `ps -p $(cat app.pid)` |\n| `localhost:8080` | EC2 내부에서 앱 process가 port를 받는지 | `curl -i http://localhost:8080/` |\n| public IP | 외부에서 EC2까지 네트워크가 열려 있는지 | 내 노트북에서 `curl -i http://IP:8080/` |\n\nPID 파일은 진실의 원천이 아니라 힌트다. 앱이 죽었는데 오래된 PID 파일만 남을 수 있고, 시간이 지나 PID가 재사용될 수도 있다. 그래서 항상 `ps`와 `app.log`를 같이 본다.\n\n## localhost와 public IP를 분리해서 디버깅하기\n\n`curl localhost:8080`이 성공한다는 것은 EC2 안에서 Spring Boot process가 요청을 받는다는 뜻이다. 하지만 외부 접근 성공을 보장하지 않는다. public IP 접근에는 아래 조건이 추가된다.\n\n1. EC2 security group inbound rule이 8080을 허용한다.\n2. OS 방화벽(UFW 등)이 막지 않는다.\n3. 앱이 `127.0.0.1`에만 bind된 상태가 아니다.\n4. public IP가 맞고, instance가 running 상태다.\n5. 요청한 path가 실제 controller나 static resource로 존재한다.\n\nSpring Boot 기본은 보통 모든 interface에 bind된다. 그런데 `server.address=127.0.0.1`처럼 설정했다면 public IP로 들어온 연결은 받을 수 없다. 이 경우 `localhost`는 되고 public IP는 안 되는 증상이 자연스럽다.\n\n반대로 `localhost`도 안 되면 security group을 먼저 볼 일이 아니다. 앱이 안 떴거나 port가 다르거나 startup 중 예외가 났을 가능성이 크다. 이때는 `tail -n 200 app.log`와 `lsof -i :8080` 쪽이 먼저다.\n\n## Troubleshooting table\n\n| 증상 | 더 그럴듯한 원인 | 먼저 볼 증거 | 다음 조치 |\n|---|---|---|---|\n| `./gradlew bootJar`가 `Permission denied` | wrapper 실행 권한 없음 | `ls -l gradlew` | `chmod +x gradlew` 후 재실행 |\n| 빌드 중 `Killed`만 보이고 끝남 | t4g.micro 메모리 부족, OOM killer | `dmesg`, `free -h`, Gradle daemon 여부 | `--no-daemon`, `org.gradle.jvmargs` 축소, 더 큰 인스턴스/CI 빌드 검토 |\n| `UnsupportedClassVersionError` | 컴파일 Java와 실행 Java 버전 불일치 | `java -version`, `./gradlew -version` | EC2 JDK를 Java 21로 맞춤 |\n| `no main manifest attribute` | plain jar 실행 | `ls build/libs`, jar 이름 | `*-plain.jar`가 아닌 bootJar 산출물 실행 |\n| `Address already in use` | 이전 앱이 8080 점유 | `lsof -i :8080`, `ps` | 기존 PID 종료 또는 `SERVER_PORT` 변경 |\n| `curl localhost:8080` 실패 | 앱 process 미기동, port 다름, startup error | `tail app.log`, `ps`, `lsof` | 로그의 첫 예외부터 해결 |\n| `localhost`는 되는데 public IP는 실패 | security group, UFW, bind address 문제 | inbound rule, `sudo ufw status`, `server.address` | 8080 inbound 허용, bind 설정 제거/수정 |\n| SSH 종료 후 앱이 죽음 | foreground 실행 또는 hangup 영향 | `jobs`, `ps`, `app.log` 종료 시각 | 임시로 `nohup`, 운영은 systemd 사용 |\n| 배포 후 예전 코드처럼 동작 | EC2 clone이 기대 commit이 아님 | `git log -1 --oneline`, branch | `git fetch`, `git pull --ff-only`, commit 확인 |\n\n## 흔한 오해\n\n- `git pull`만 하면 항상 원하는 버전이 된다고 생각한다. local edit, branch 착각, non-fast-forward가 있으면 배포 서버 코드가 애매해진다. 배포용 clone은 가능하면 local edit 없이 commit을 명시적으로 확인한다.\n- `build/libs`의 jar는 아무거나 실행해도 된다고 생각한다. plain jar와 boot jar는 역할이 다르다.\n- `curl localhost` 성공을 외부 접속 성공으로 착각한다. localhost는 EC2 내부 loopback이고 public IP는 외부 네트워크 경로다.\n- `nohup`과 PID 파일을 운영 프로세스 관리라고 생각한다. 학습용 임시 실행에는 쓸 수 있지만, 운영에서는 systemd 같은 supervisor가 맞다.\n- t4g.micro에서 빌드가 한 번 됐으니 항상 된다고 생각한다. 메모리 여유가 작아 test 개수, dependency, daemon 상태에 따라 쉽게 흔들린다.\n\n## 꼬리질문\n\n> Q: `curl localhost:8080`은 되는데 내 노트북에서 public IP로 접속이 안 되면 Spring Controller부터 고쳐야 하나요?\n> 의도: 애플리케이션 내부 경계와 외부 네트워크 경계 분리 확인\n> 핵심: 아니다. 이 경우는 security group, OS 방화벽, bind address, public IP/port를 먼저 본다.\n\n> Q: `build/libs`에 jar가 두 개일 때 왜 `*-plain.jar`를 피하나요?\n> 의도: bootJar 산출물과 일반 jar 차이 확인\n> 핵심: 실행형 boot jar는 dependency와 boot loader를 포함해 `java -jar` 진입점이 준비된 산출물이고, plain jar는 그렇지 않을 수 있다.\n\n> Q: t4g.micro에서 Gradle build가 `Killed`로 끝나면 첫 조치는 무엇인가요?\n> 의도: 작은 EC2에서 빌드 메모리와 실행 메모리를 분리하는지 확인\n> 핵심: `--no-daemon`과 `org.gradle.jvmargs`로 Gradle heap/metaspace를 줄이고, 반복되면 빌드는 CI나 더 큰 머신으로 옮긴다.\n\n> Q: `nohup java -jar ... & echo $! > app.pid`를 쓰면 운영 준비가 끝난 건가요?\n> 의도: shell job control과 supervisor 경계 확인\n> 핵심: 아니다. SSH 생명주기와 분리하는 임시 방법일 뿐, 자동 재시작과 재부팅 후 복구는 systemd 같은 supervisor 책임이다.\n\n## 한 줄 정리\n\nSpring Boot jar를 EC2에 올릴 때는 `java -jar` 한 줄이 아니라 코드 버전, Java 21 빌드, 실행형 jar 선택, 프로세스 로그/PID, 내부 localhost, 외부 public IP를 차례로 분리해 검증해야 한다.\n",
+  "aliases": [
+    "Spring Boot EC2 jar 배포",
+    "스프링부트 EC2 jar 배포",
+    "실행형 jar 배포",
+    "실행형jar 배포",
+    "Ubuntu EC2 Java 21",
+    "gradlew bootJar",
+    "build/libs jar",
+    "java -jar app.log pid",
+    "nohup java -jar",
+    "curl localhost public IP",
+    "EC2 security group 8080",
+    "t4g.micro Gradle Xmx"
+  ],
+  "expected_queries": [
+    "EC2에 Spring Boot jar 올려서 실행하려면 git clone부터 어떤 순서로 해야 해?",
+    "./gradlew bootJar 했는데 build/libs에 jar가 생긴 다음 뭘 확인해야 해?",
+    "java -jar로 서버를 띄웠는데 localhost curl은 되고 public IP로는 안 돼 왜 그래?",
+    "Ubuntu EC2에서 Java 21 설치하고 Spring Boot 앱 실행하는 흐름을 알려줘",
+    "app.log랑 PID 파일을 남기면서 백그라운드로 jar 실행하려면 어떻게 해야 해?",
+    "t4g.micro에서 Gradle bootJar가 메모리 때문에 죽으면 Xmx를 어떻게 낮춰야 해?"
+  ],
+  "symptoms": [
+    "EC2에서 Spring Boot jar를 빌드하고 실행하는 순서를 명령 암기처럼만 알고 각 단계가 무엇을 검증하는지 모른다",
+    "localhost curl 성공과 public IP 접속 성공을 같은 문제로 보고 security group 또는 Controller 코드를 잘못 고친다",
+    "build/libs의 plain jar와 executable boot jar를 구분하지 못해 java -jar 실행 오류를 만난다",
+    "t4g.micro에서 Gradle build가 Killed로 끝났는데 메모리와 Gradle daemon 설정을 어디서 봐야 할지 모른다",
+    "nohup, app.log, app.pid를 써도 프로세스 관리가 어디까지 임시 방법인지 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/embedded-tomcat-autoconfiguration-bridge",
+      "network/was-vs-web-server-basics",
+      "operating-system/shell-job-control-command-bridge"
+    ],
+    "next_docs": [
+      "spring/spring-logging-basics-primer",
+      "spring/actuator-readiness-liveness-health-exposure-bridge",
+      "network/proxy-reverse-proxy-basics"
+    ],
+    "confusable_with": [
+      "spring/embedded-tomcat-autoconfiguration-bridge",
+      "network/was-vs-web-server-basics",
+      "operating-system/shell-job-control-command-bridge"
+    ],
+    "forbidden_for_queries": [
+      "git push non-fast-forward rejected는 어떻게 해결해?",
+      "Nginx와 Tomcat의 역할 차이가 뭐야?",
+      "nohup과 disown은 어떻게 달라?"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": []
+  }
+}

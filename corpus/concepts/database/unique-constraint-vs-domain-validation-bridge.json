@@ -6,16 +6,24 @@
   "summary": "이 bridge는 domain validation과 DB unique constraint의 역할 차이를 설명한다. 저장 전 중복 조회 race, unique 에러 500, 예약 중복 검증, 사용자 메시지 변환 질문을 다룬다.",
   "body_markdown": "# Unique Constraint vs Domain Validation Bridge\n\n## 한 줄 요약\n\nDomain validation은 규칙을 설명하고 빠르게 실패시키는 역할에 강하고, DB unique constraint는 동시 요청 아래에서도 중복을 막는 최종 방어선 역할에 강하다. 둘은 중복 구현이 아니라 서로 다른 실패 지점을 맡는다.\n\n## 미션 진입 증상\n\n저장 전 `exists` 조회로 중복을 확인했는데 두 요청이 동시에 들어오면 둘 다 \"없다\"고 보고 insert를 시도할 수 있다. 이 race는 application validation만으로 닫기 어렵고, 같은 invariant를 표현하는 DB unique constraint가 마지막에 막아야 한다.\n\n관찰 증거는 다음처럼 잡는다.\n\n- 같은 `(member_id, date, time)` 또는 같은 business key로 row가 여러 개 생겼는지\n- unique constraint violation이 500으로 노출되는지\n- 중복 체크 query와 insert 사이에 transaction 경계가 어떻게 나뉘는지\n- constraint 이름이 예외 번역 로직에서 식별 가능한지\n- soft delete, status column, nullable column 때문에 constraint가 실제 invariant와 어긋나는지\n\n## 핵심 mental model\n\nApplication 검증은 사용자 메시지와 흐름 제어에 좋다. \"이미 예약된 시간입니다\"처럼 도메인 언어로 빠르게 알려줄 수 있고, UI에서 어떤 필드를 고쳐야 하는지도 표현하기 쉽다. DB constraint는 동시성 아래에서도 데이터 불변식을 지키는 방어선이다. 둘은 같은 규칙을 다른 계층에서 다른 목적으로 다룬다.\n\n정리하면 다음과 같다.\n\n| 계층 | 강점 | 한계 |\n|---|---|---|\n| Domain validation | 의미 있는 메시지, 빠른 실패, 복잡한 조건 설명 | check-then-insert race를 혼자 막기 어려움 |\n| DB unique constraint | 최종 중복 방지, 동시성에 강함 | 사용자 친화 메시지와 복구 흐름은 별도 필요 |\n| Idempotency key | 같은 요청 재시도/중복 제출 흡수 | 도메인상 서로 다른 요청의 충돌을 모두 막지는 않음 |\n\n예를 들어 예약 중복 invariant가 \"같은 방, 같은 날짜, 같은 시간에는 확정 예약이 하나만\"이라면 unique key도 그 invariant와 같은 모양이어야 한다. soft delete나 `status = CANCELLED`가 있다면 일반 unique constraint가 과하게 막거나 부족하게 막을 수 있다. DB별 partial unique index, generated column, 별도 active reservation table 같은 모델링을 검토해야 한다.\n\n## 구현 패턴\n\n1. 저장 전 domain validation으로 빠른 피드백을 준다.\n2. 같은 invariant를 DB unique constraint로 한 번 더 고정한다.\n3. insert/update에서 constraint violation이 나면 constraint 이름이나 SQL state를 보고 domain exception으로 번역한다.\n4. API에서는 보통 409 Conflict 또는 도메인에 맞는 400 계열로 응답하되, 내부 SQL 메시지를 그대로 노출하지 않는다.\n5. 중복 제출이 문제라면 domain unique와 별도로 idempotency key를 둔다.\n\n`SERIALIZABLE` isolation이나 pessimistic lock으로도 일부 race를 줄일 수 있지만, unique해야 하는 데이터 invariant를 constraint 없이 운영하는 것은 여전히 위험하다. isolation은 transaction 관찰과 충돌 제어 도구이고, unique constraint는 저장된 데이터 모양 자체를 제한하는 schema 계약이다.\n\n## 흔한 오해\n\nDB constraint만 있으면 사용자 경험이 자동으로 좋아지지는 않는다. constraint violation을 의미 있는 409/400 응답으로 번역해야 한다. 반대로 domain validation만 있으면 테스트의 순차 실행에서는 통과해도 운영 동시 요청에서 중복 row가 생길 수 있다.\n\n또 하나의 오해는 unique constraint와 idempotency key를 같은 것으로 보는 것이다. Unique constraint는 \"이 business key는 하나만 존재한다\"를 보장한다. Idempotency key는 \"같은 command를 여러 번 보내도 같은 처리 결과로 수렴한다\"를 보장한다. 예약 슬롯 충돌과 결제 버튼 중복 클릭은 겹칠 수 있지만 완전히 같은 문제가 아니다.\n\n## Trade-off\n\nDB constraint는 migration 전에 기존 중복 데이터를 정리해야 하고, constraint 이름을 안정적으로 관리해야 한다. 예외 번역 코드도 DB dialect에 따라 달라질 수 있다. 그래도 데이터 불변식을 schema에 남기면 application bug, batch, admin tool, 다른 서비스 write path가 생겨도 마지막 방어선이 유지된다.\n\n## 검증 절차\n\n- 같은 key로 병렬 insert를 걸고 최종 row가 한 건인지 확인한다.\n- constraint violation이 500이 아니라 도메인 예외와 사용자 메시지로 번역되는지 확인한다.\n- migration 전 기존 데이터에 중복이 있는지 검사한다.\n- nullable column, soft delete, status별 unique 조건이 도메인 invariant와 맞는지 테스트한다.\n- idempotency key 재시도와 domain unique 충돌을 서로 다른 케이스로 테스트한다.\n\n## Safe Next Docs\n\nunique vs idempotency key decision guide와 roomescape duplicate reservation bridge를 이어서 본다.\n",
   "aliases": [
-    "unique constraint vs domain validation bridge",
-    "duplicate check validation database constraint",
-    "유니크 제약 도메인 검증 차이",
-    "중복 검사 DB 제약"
+    "unique constraint",
+    "domain validation",
+    "duplicate check constraint",
+    "database uniqueness guard",
+    "유니크 제약",
+    "유니크제약",
+    "도메인 검증",
+    "도메인검증",
+    "중복 검증 위치",
+    "중복검증위치",
+    "예약 중복 방지",
+    "예약중복방지"
   ],
   "expected_queries": [
     "중복 검사를 Domain에서 했는데도 unique constraint가 필요한 이유가 뭐야?",
     "예약 중복은 Service 검증과 DB unique 중 어디에서 막아?",
     "DB 제약을 믿으면 사용자 메시지는 어떻게 주지?",
-    "무결성 제약 다음 단계 공부하자"
+    "UNIQUE 제약과 도메인 검증은 예약 중복 방지에서 역할이 어떻게 달라?"
   ],
   "symptoms": [
     "저장 전 중복 조회를 했는데 동시에 두 요청이 성공했어요",

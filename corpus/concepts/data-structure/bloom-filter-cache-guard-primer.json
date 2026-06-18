@@ -4,17 +4,28 @@
   "category": "data-structure",
   "level": "intermediate",
   "summary": "이 primer는 Bloom Filter를 cache guard/negative lookup 보호 관점에서 설명한다. 없는 key 조회, false positive, false negative 없음, DB 보호 같은 질문을 다룬다.",
-  "body_markdown": "# Bloom Filter Cache Guard Primer\n\n## 한 줄 요약\n\nBloom Filter는 \"확실히 없는 key\"를 빠르게 걸러 DB나 cache miss 폭주를 줄이는 확률적 membership structure다.\n\n## 미션 진입 증상\n\n존재하지 않는 상품 ID나 사용자 ID 조회가 반복되어 DB까지 내려간다. 이때 Bloom Filter는 \"아마 있음\"과 \"확실히 없음\"을 나누는 guard가 될 수 있다.\n\n## 핵심 mental model\n\nBloom Filter는 `없음`은 강하게 말하고, `있음`은 후보로만 말한다. `mightContain=true`는 \"원본 저장소를 조회해도 된다\"는 통과 신호이고, 존재 확정 신호가 아니다.\n\nfalse positive는 있을 수 있다. 있다고 했는데 실제로는 없을 수 있다. 하지만 같은 snapshot에 정상 insert된 key를 동일한 canonicalization, 동일한 hash 함수, 동일한 bit array로 조회하고 bit를 잘못 내리지 않았다면 false negative는 없다.\n\n운영에서는 이 전제가 깨질 수 있다. filter가 stale이거나, write path가 filter update보다 먼저 key를 외부에 노출하거나, key serialization이 달라지거나, 일반 Bloom Filter에서 삭제하려고 bit를 0으로 내리면 수학적 보장이 아니라 구현/동기화 문제로 false negative가 생길 수 있다.\n\n## 정확한 보장과 확률적 caveat\n\n- insert는 key가 매핑되는 k개 bit를 1로 만든다.\n- lookup에서 k개 bit 중 하나라도 0이면 그 key는 현재 filter에 insert된 적이 없다고 판단할 수 있다.\n- lookup에서 k개 bit가 모두 1이면 \"있을 수 있음\"일 뿐, 실제 존재는 원본 저장소나 cache가 확인해야 한다.\n- false positive rate는 예상 원소 수 `n`, bit 크기 `m`, hash 개수 `k`에 따라 정해지는 확률적 목표다. 대략 `p = (1 - e^(-kn/m))^k` 형태로 커지고, `n`이 예상을 넘거나 bit saturation이 높아지면 rate가 빠르게 나빠진다.\n- false positive rate는 workload와 hash 품질에 의존한다. adversarial key, canonicalization 오류, hash seed 변경, shard별 분포 불균형이 있으면 설계값보다 보호 효과가 낮아질 수 있다.\n\n## Cache Guard 답변 축\n\n- 없는 key 요청이 DB까지 반복해서 내려가는 cache penetration을 줄이는 용도라고 말한다.\n- Bloom Filter의 hit은 cache/DB 조회를 허용하는 신호이고, miss는 DB 조회를 생략할 수 있는 신호라고 구분한다.\n- 정확한 존재 여부, 권한 검증, 최신 상태 검증을 Bloom Filter 하나에 맡기지 않는다.\n- filter가 authoritative dataset의 어떤 시점 snapshot인지 명시한다. 새 key가 생성되는 시스템이면 write path에서 filter를 먼저 갱신하거나, 짧은 grace window 동안 exact lookup fallback을 둔다.\n- 삭제가 많은 도메인이면 stale positive를 허용할지, 재빌드 주기, counting Bloom Filter, tombstone, allow-list fallback 중 무엇을 쓸지 같이 말한다.\n- false positive는 비용 문제로 다룬다. 실제로 없는 key가 \"있을 수 있음\"으로 통과해 DB를 한 번 더 보는 것이지, 존재하지 않는 데이터를 존재한다고 확정하는 보장이 아니다.\n- miss를 바로 404로 바꾸는 경로는 더 엄격하게 본다. warm-up 미완료, shard 누락, event lag가 있으면 cache guard가 사용자-visible false negative 장애가 될 수 있다.\n\n## 실패 반례\n\n- 예상 100만 key 기준으로 만든 filter에 1천만 key를 넣으면 false positive가 늘어 guard 효과가 약해진다.\n- 상품 삭제 후 filter를 갱신하지 않으면 삭제된 상품 ID가 계속 \"있을 수 있음\"으로 통과한다. 이는 stale positive이지 정합성 보장이 아니다.\n- 일반 Bloom Filter에서 삭제하려고 bit를 0으로 내리면, 같은 bit를 공유하던 다른 key가 false negative가 될 수 있다.\n- filter miss만 보고 404를 반환하면서 실제 write path와 rebuild path가 어긋나면, 방금 생성된 key를 못 찾는 장애가 생길 수 있다.\n- 공격성 없는 트래픽에서는 DB 부하가 줄어도, adversarial key가 false positive가 높은 영역에 몰리면 보호 효과가 예상보다 낮아질 수 있다.\n- key normalization이 `User:1`, `user:1`, binary id처럼 경로마다 달라지면 insert된 key도 lookup에서 miss될 수 있다. 이는 Bloom Filter의 확률 문제가 아니라 입력 canonicalization 문제다.\n\n## 검증 신호\n\n- 목표 false positive rate와 예상 key 수를 먼저 정했는가?\n- bit saturation, 추정 inserted count, shard별 fill ratio가 설계 범위 안에 있는가?\n- filter miss short-circuit 수, filter hit 뒤 DB miss, filter hit 뒤 DB hit 비율을 metric으로 볼 수 있는가?\n- shadow mode에서 miss 일부를 원본 저장소에 샘플 조회해 pipeline false negative를 잡고 있는가?\n- create/delete/update 이벤트가 filter와 언제 동기화되는가?\n- stale membership을 허용하는 시간, rebuild lag, rolling filter 교체 전략이 있는가?\n- filter 장애나 warm-up 전에는 DB를 보호할 fallback rate limit/cache negative entry가 있는가?\n- false positive 증가가 backend QPS, DB miss QPS, cache penetration rate로 관측되는가?\n\n## 흔한 오해\n\nBloom Filter는 정확한 Set 대체물이 아니다. 삭제, 재빌드, false positive rate, stale membership을 함께 설계해야 한다.\n\n특히 \"false negative가 없다\"는 말은 수학적 구조의 invariant이지 운영 파이프라인 전체의 무조건 보장이 아니다. cache guard 설계에서는 filter build 시점, write propagation, key canonicalization, 장애 fallback까지 포함해 검증해야 한다.\n\n## Safe Next Docs\n\nBloom Filter vs Cuckoo Filter chooser와 cache basics로 이어진다.\n",
+  "body_markdown": "# Bloom Filter Cache Guard Primer\n\n## 한 줄 요약\n\nBloom Filter는 \"확실히 없는 key\"를 빠르게 걸러 DB나 cache miss 폭주를 줄이는 확률적 membership structure다.\n\n## 미션 진입 증상\n\n존재하지 않는 상품 ID나 사용자 ID 조회가 반복되어 DB까지 내려간다. 이때 Bloom Filter는 \"아마 있음\"과 \"확실히 없음\"을 나누는 guard가 될 수 있다.\n\n## 핵심 mental model\n\nBloom Filter는 `없음`은 강하게 말하고, `있음`은 후보로만 말한다. `mightContain=true`는 \"원본 저장소를 조회해도 된다\"는 통과 신호이고, 존재 확정 신호가 아니다.\n\nfalse positive는 있을 수 있다. 있다고 했는데 실제로는 없을 수 있다. 하지만 같은 snapshot에 정상 insert된 key를 동일한 canonicalization, 동일한 hash 함수, 동일한 bit array로 조회하고 bit를 잘못 내리지 않았다면 false negative는 없다.\n\n운영에서는 이 전제가 깨질 수 있다. filter가 stale이거나, write path가 filter update보다 먼저 key를 외부에 노출하거나, key serialization이 달라지거나, 일반 Bloom Filter에서 삭제하려고 bit를 0으로 내리면 수학적 보장이 아니라 구현/동기화 문제로 false negative가 생길 수 있다.\n\n## 정확한 보장과 확률적 caveat\n\n- insert는 key가 매핑되는 k개 bit를 1로 만든다.\n- lookup에서 k개 bit 중 하나라도 0이면 그 key는 현재 filter에 insert된 적이 없다고 판단할 수 있다.\n- lookup에서 k개 bit가 모두 1이면 \"있을 수 있음\"일 뿐, 실제 존재는 원본 저장소나 cache가 확인해야 한다.\n- false positive rate는 예상 원소 수 `n`, bit 크기 `m`, hash 개수 `k`에 따라 정해지는 확률적 목표다. 대략 `p = (1 - e^(-kn/m))^k` 형태로 커지고, `n`이 예상을 넘거나 bit saturation이 높아지면 rate가 빠르게 나빠진다.\n- false positive rate는 workload와 hash 품질에 의존한다. adversarial key, canonicalization 오류, hash seed 변경, shard별 분포 불균형이 있으면 설계값보다 보호 효과가 낮아질 수 있다.\n\n## Cache Guard 답변 축\n\n- 없는 key 요청이 DB까지 반복해서 내려가는 cache penetration을 줄이는 용도라고 말한다.\n- Bloom Filter의 hit은 cache/DB 조회를 허용하는 신호이고, miss는 DB 조회를 생략할 수 있는 신호라고 구분한다.\n- 정확한 존재 여부, 권한 검증, 최신 상태 검증을 Bloom Filter 하나에 맡기지 않는다.\n- filter가 authoritative dataset의 어떤 시점 snapshot인지 명시한다. 새 key가 생성되는 시스템이면 write path에서 filter를 먼저 갱신하거나, 짧은 grace window 동안 exact lookup fallback을 둔다.\n- 삭제가 많은 도메인이면 stale positive를 허용할지, 재빌드 주기, counting Bloom Filter, tombstone, allow-list fallback 중 무엇을 쓸지 같이 말한다.\n- false positive는 비용 문제로 다룬다. 실제로 없는 key가 \"있을 수 있음\"으로 통과해 DB를 한 번 더 보는 것이지, 존재하지 않는 데이터를 존재한다고 확정하는 보장이 아니다.\n- miss를 바로 404로 바꾸는 경로는 더 엄격하게 본다. warm-up 미완료, shard 누락, event lag가 있으면 cache guard가 사용자-visible false negative 장애가 될 수 있다.\n\n## 실패 반례\n\n- 예상 100만 key 기준으로 만든 filter에 1천만 key를 넣으면 false positive가 늘어 guard 효과가 약해진다.\n- 상품 삭제 후 filter를 갱신하지 않으면 삭제된 상품 ID가 계속 \"있을 수 있음\"으로 통과한다. 이는 stale positive이지 정합성 보장이 아니다.\n- 일반 Bloom Filter에서 삭제하려고 bit를 0으로 내리면, 같은 bit를 공유하던 다른 key가 false negative가 될 수 있다.\n- filter miss만 보고 404를 반환하면서 실제 write path와 rebuild path가 어긋나면, 방금 생성된 key를 못 찾는 장애가 생길 수 있다.\n- 공격성 없는 트래픽에서는 DB 부하가 줄어도, adversarial key가 false positive가 높은 영역에 몰리면 보호 효과가 예상보다 낮아질 수 있다.\n- key normalization이 `User:1`, `user:1`, binary id처럼 경로마다 달라지면 insert된 key도 lookup에서 miss될 수 있다. 이는 Bloom Filter의 확률 문제가 아니라 입력 canonicalization 문제다.\n\n## 검증 신호\n\n- 목표 false positive rate와 예상 key 수를 먼저 정했는가?\n- bit saturation, 추정 inserted count, shard별 fill ratio가 설계 범위 안에 있는가?\n- filter miss short-circuit 수, filter hit 뒤 DB miss, filter hit 뒤 DB hit 비율을 metric으로 볼 수 있는가?\n- shadow mode에서 miss 일부를 원본 저장소에 샘플 조회해 pipeline false negative를 잡고 있는가?\n- create/delete/update 이벤트가 filter와 언제 동기화되는가?\n- stale membership을 허용하는 시간, rebuild lag, rolling filter 교체 전략이 있는가?\n- filter 장애나 warm-up 전에는 DB를 보호할 fallback rate limit/cache negative entry가 있는가?\n- false positive 증가가 backend QPS, DB miss QPS, cache penetration rate로 관측되는가?\n\n## 흔한 오해\n\nBloom Filter는 정확한 Set 대체물이 아니다. 삭제, 재빌드, false positive rate, stale membership을 함께 설계해야 한다.\n\n특히 \"false negative가 없다\"는 말은 수학적 구조의 invariant이지 운영 파이프라인 전체의 무조건 보장이 아니다. cache guard 설계에서는 filter build 시점, write propagation, key canonicalization, 장애 fallback까지 포함해 검증해야 한다.\n\n## Safe Next Docs\n\nBloom Filter vs Cuckoo Filter chooser와 cache basics로 이어진다.\n\n## 운영 판단: cache penetration guard는 확정 판단이 아니다\n\nBloom Filter를 cache 앞에 두는 목적은 없는 key 조회가 cache miss를 거쳐 DB까지 내려가는 비용을 줄이는 것이다. guard가 \"확실히 없음\"이라고 판단하면 backend 조회를 생략할 수 있고, \"있을 수도 있음\"이면 원래 cache/DB 경로로 보낸다. false positive는 없는 key가 DB까지 한 번 더 내려가는 비용이다. 그래서 cache guard에서는 false positive가 비용 문제로 끝나야지, 존재를 확정하거나 권한을 허용하는 근거가 되면 안 된다.\n\n랜덤 key 공격이나 crawler가 없는 상품 ID를 계속 조회하는 경우, Bloom guard는 DB miss storm을 줄인다. 하지만 filter가 너무 작거나 bit density가 높아지면 대부분 \"있을 수도 있음\"이 되어 방어 효과가 사라진다. negative cache와 rate limit, fallback degradation을 같이 두는 이유가 여기에 있다.\n\n## 운영 stale 방어\n\n\"Bloom Filter는 false negative가 없다\"는 말은 insert-only 구조와 올바른 build/update가 유지될 때의 성질이다. 운영에서는 새 key 생성 이벤트가 filter에 늦게 반영되거나, key canonicalization이 cache와 filter에서 다르거나, rolling deploy 중 hash seed가 바뀌면 정상 key를 \"없음\"으로 차단할 수 있다. 그래서 shadow mode, sample bypass, rebuild watermark, dual filter rollover, write-through update 지표가 필요하다.\n\n## 지표\n\n`guard_reject_count`, `guard_might_contain_count`, `filter_hit_db_miss`, `filter_hit_db_hit`, `estimated_fpr`, `new_key_filter_lag_ms`, `shadow_false_negative_sample_count`를 본다. cache guard의 성공은 DB QPS가 줄었다는 것만이 아니라, 정상 key를 막지 않고 stale filter를 안전하게 교체했다는 증거까지 포함한다.\n",
   "aliases": [
-    "bloom filter cache guard primer",
-    "negative lookup false positive cache protection",
+    "bloom filter cache guard",
+    "negative lookup cache protection",
     "Bloom Filter 캐시 보호",
-    "false positive membership test"
+    "false positive membership test",
+    "cache penetration 방어",
+    "없는 key DB 조회 차단",
+    "Bloom guard false positive",
+    "filter hit DB miss",
+    "stale Bloom filter rebuild",
+    "캐시 miss DB 보호",
+    "negative cache Bloom filter",
+    "random key attack guard"
   ],
   "expected_queries": [
     "Bloom Filter는 캐시 앞에서 어떤 문제를 줄여?",
-    "false positive는 있는데 false negative는 없다는 말이 무슨 뜻이야?",
-    "없는 key 조회가 너무 많을 때 Bloom Filter를 써도 돼?"
+    "없는 key 조회가 너무 많아 DB까지 내려갈 때 Bloom Filter를 앞에 두면 뭐가 달라져?",
+    "cache penetration을 막을 때 false positive가 있어도 괜찮은 이유가 뭐야?",
+    "결제 idempotency처럼 오답이 위험한 곳에 Bloom Filter만 쓰면 왜 안 돼?",
+    "랜덤한 없는 key 요청이 몰릴 때 Bloom Filter guard가 DB miss 폭주를 어떻게 줄여?",
+    "Bloom Filter cache guard를 운영할 때 stale build와 새 key 반영 지연은 어떻게 방어해야 해?"
   ],
   "symptoms": [
     "존재하지 않는 key 요청이 DB까지 계속 내려가요",
@@ -38,8 +49,14 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/data-structure/bloom-filter-cache-guard-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch127",
+        "note": "Expanded membership filter decision surfaces for batch127."
+      }
+    ]
   }
 }

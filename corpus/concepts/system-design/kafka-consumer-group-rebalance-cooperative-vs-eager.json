@@ -1,0 +1,68 @@
+{
+  "id": "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+  "title": "Kafka Consumer Group Rebalance: Cooperative vs Eager",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Kafka consumer group rebalance는 partition ownership을 다시 나누는 과정이다. eager rebalance는 전체 partition을 한 번에 revoke해 stop-the-world처럼 보일 수 있고, cooperative rebalance는 일부 partition만 단계적으로 넘겨 중단 폭을 줄인다.",
+  "body_markdown": "# Kafka Consumer Group Rebalance: Cooperative vs Eager\n\n> 한 줄 요약: consumer group rebalance는 partition ownership을 다시 나누는 과정이고, eager 방식은 전체 revoke로 멈춤 폭이 크며 cooperative 방식은 incremental revoke로 이동해야 할 partition만 단계적으로 넘긴다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Message Queue vs Event Stream vs Pub-Sub](./message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser.md)\n- [Kafka Ordering Delivery Interview Primer](./kafka-ordering-delivery-interview-primer.md)\n- [Queue Delivery Semantics Beginner Primer](./queue-delivery-semantics-beginner-primer.md)\n- [Kafka Out-of-Order Commit Offset Gap Parallelism](./kafka-out-of-order-commit-offset-gap-parallelism.md)\n- [DLQ Poison Message Replay Playbook](./dlq-poison-message-replay-playbook.md)\n\nretrieval-anchor-keywords: Kafka consumer group rebalance, cooperative rebalance, eager rebalance, cooperative-sticky assignor, sticky assignor, range assignor, partition assignment, revoke partitions, max.poll.interval.ms, session.timeout.ms, static membership, group.instance.id, rebalance storm, consumer group lag spike, Kafka 리밸런스, 카프카 리밸런스 멈춤\n\n---\n\n## 핵심 모델\n\nKafka consumer group은 topic partition을 group 안의 consumer들에게 나눠 맡긴다. 한 consumer가 죽거나 새 consumer가 들어오거나 partition 수가 바뀌면 group coordinator는 누가 어떤 partition을 읽을지 다시 정해야 한다. 이 과정이 rebalance다.\n\n```text\ntopic partitions: P0 P1 P2 P3\nconsumer A: P0 P1\nconsumer B: P2 P3\n\nconsumer C join\n-> rebalance\nconsumer A: P0\nconsumer B: P1\nconsumer C: P2 P3\n```\n\n문제는 이 재분배 동안 consumer가 메시지를 계속 처리할 수 있는가다. rebalance가 자주 길게 일어나면 처리량은 떨어지고 consumer lag가 튄다.\n\n---\n\n## Rebalance가 시작되는 흔한 이유\n\n| 트리거 | 실제로 보는 증상 | 먼저 확인할 지표 |\n|---|---|---|\n| consumer instance 추가/제거 | 배포 때마다 lag spike | rebalance count, assignment change |\n| consumer crash 또는 heartbeat timeout | 특정 consumer가 group에서 빠졌다 들어온다 | session timeout, heartbeat 실패 |\n| `max.poll.interval.ms` 초과 | 처리 시간이 긴 record 뒤 consumer가 쫓겨난다 | poll 간격, processing latency |\n| topic partition 수 변경 | 전체 assignment가 다시 계산된다 | partition count change event |\n| assignor 설정 변경/rolling upgrade | 배포 중 group이 반복 재조정된다 | assignor list, protocol mismatch |\n\n초보자는 consumer 수를 늘리면 항상 처리량이 늘어난다고 생각하기 쉽다. 하지만 rebalance storm이 생기면 오히려 멈춤과 lag가 커질 수 있다.\n\n---\n\n## Eager rebalance\n\nEager rebalance는 기존 consumer가 맡던 partition을 먼저 모두 revoke하고, group이 새 assignment를 받은 뒤 다시 처리한다. 단순하지만 중단 폭이 크다.\n\n```text\n1. 모든 consumer가 partition revoke\n2. group coordinator가 새 assignment 계산\n3. consumer들이 새 partition을 assign 받고 처리 재개\n```\n\n장점은 상태가 명확하다는 점이다. 단점은 움직일 필요가 없는 partition까지 모두 멈춘다는 점이다. 큰 group이나 배포가 잦은 시스템에서는 이 시간이 stop-the-world처럼 보일 수 있다.\n\n---\n\n## Cooperative rebalance\n\nCooperative rebalance는 필요한 partition만 단계적으로 revoke한다. 이미 올바른 consumer가 계속 처리해도 되는 partition은 유지하고, 이동해야 하는 partition만 넘긴다.\n\n```text\n1. 새 assignment를 계산하되 유지 가능한 partition은 계속 유지\n2. 이동해야 하는 partition만 revoke\n3. 다음 round에서 새 owner가 해당 partition을 assign 받음\n```\n\n이 방식은 중단 폭을 줄이지만, 설정과 rolling upgrade가 더 중요하다. group 안 consumer들이 cooperative protocol과 compatible assignor를 함께 써야 한다. 예를 들어 `CooperativeStickyAssignor`를 적용할 때는 모든 consumer가 같은 방향으로 안전하게 rolling upgrade되어야 한다.\n\n---\n\n## Assignor를 같이 봐야 한다\n\n| Assignor | 직관 | 주의 |\n|---|---|---|\n| Range | topic별 partition range를 consumer에 나눈다 | topic 여러 개면 불균형이 생길 수 있다 |\n| RoundRobin | 전체 partition을 round-robin으로 나눈다 | 기존 assignment 유지성이 약할 수 있다 |\n| Sticky | 가능한 기존 assignment를 유지한다 | rebalance 이동량을 줄이는 데 유리하다 |\n| CooperativeSticky | sticky를 cooperative rebalance와 함께 쓴다 | 호환성/rolling upgrade 절차를 지켜야 한다 |\n\nassignor 선택은 성능 옵션 하나가 아니라 배포 중단, stateful consumer warmup, lag spike와 연결된다.\n\n---\n\n## 운영 디버깅 순서\n\n1. consumer lag spike 시점과 rebalance log 시점을 먼저 겹쳐 본다.\n2. join/leave 원인이 배포인지 crash인지 `max.poll.interval.ms` 초과인지 분리한다.\n3. record 처리 시간이 poll interval을 넘는지 확인한다.\n4. assignor와 cooperative 설정이 모든 consumer에 일관되게 적용됐는지 본다.\n5. stateful consumer라면 partition revoke/assign 때 local cache, state store, in-flight work를 어떻게 정리하는지 확인한다.\n6. static membership(`group.instance.id`)이 배포 중 불필요한 churn을 줄일 수 있는지 검토한다.\n\n---\n\n## 흔한 오해\n\n- consumer를 늘리면 항상 처리량이 늘어난다. partition 수가 상한이고, rebalance 비용이 오히려 처리량을 깎을 수 있다.\n- rebalance는 오류가 아니다. ownership 변경 과정이다. 다만 너무 잦거나 오래 걸리면 장애 신호다.\n- cooperative로 바꾸면 모든 멈춤이 사라진다. 이동해야 할 partition은 여전히 revoke/assign이 필요하고, 호환성 설정을 잘못하면 효과를 잃는다.\n- `max.poll.interval.ms`를 크게 하면 해결된다. 긴 처리를 숨길 뿐이고, poison record나 downstream 지연을 분리하지 못하면 lag가 커질 수 있다.\n- static membership은 crash를 없애지 않는다. 정상 재시작/배포 중 불필요한 group churn을 줄이는 도구다.\n\n---\n\n## 답변 골격\n\nKafka rebalance를 설명할 때는 이렇게 말한다.\n\n1. consumer group은 partition ownership을 나눠 갖는다.\n2. member 변화, timeout, partition 변화가 있으면 ownership을 다시 나눈다.\n3. eager는 전체 revoke 후 새 assignment라 멈춤 폭이 크다.\n4. cooperative는 필요한 partition만 단계적으로 revoke해 멈춤 폭을 줄인다.\n5. 실제 운영에서는 `max.poll.interval.ms`, assignor, static membership, rebalance duration과 lag를 함께 본다.\n\n## 한 줄 정리\n\nKafka rebalance는 consumer group 확장의 부작용이 아니라 partition ownership 재조정의 핵심 메커니즘이며, eager/cooperative 차이를 알아야 배포 중 lag spike와 처리 중단을 설명할 수 있다.\n",
+  "aliases": [
+    "Kafka consumer rebalance",
+    "카프카 리밸런스",
+    "카프카 컨슈머 리밸런스",
+    "consumer group rebalance",
+    "cooperative rebalance",
+    "eager rebalance",
+    "CooperativeStickyAssignor",
+    "카프카 assignor",
+    "max.poll.interval 리밸런스",
+    "consumer lag rebalance",
+    "static membership Kafka",
+    "partition revoke assign"
+  ],
+  "expected_queries": [
+    "Kafka consumer group rebalance가 왜 배포 때 lag spike를 만들 수 있어?",
+    "eager rebalance와 cooperative rebalance 차이를 partition revoke 기준으로 설명해줘",
+    "CooperativeStickyAssignor를 쓰면 어떤 partition만 단계적으로 넘기는 거야?",
+    "max.poll.interval.ms를 넘으면 consumer group에서 빠져 리밸런스가 나는 이유가 뭐야?",
+    "consumer를 늘렸는데 오히려 카프카 처리량이 멈추는 rebalance storm을 어떻게 봐?"
+  ],
+  "symptoms": [
+    "consumer 수를 늘리면 무조건 처리량이 오른다고 보고 rebalance 비용을 놓친다.",
+    "배포 직후 consumer lag spike를 broker 장애로만 본다.",
+    "max.poll.interval 초과로 group에서 쫓겨나는 긴 처리 record를 분리하지 못한다.",
+    "cooperative rebalance를 설정하면 revoke/assign 비용이 완전히 사라진다고 오해한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/tiered-retry-topic-ladder-backoff-dlq",
+      "system-design/dlq-poison-message-replay-playbook"
+    ],
+    "confusable_with": [
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka partition key ordering과 at-least-once delivery를 면접 답변으로 설명해줘",
+      "DLQ poison message replay 운영 절차를 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": [
+      {
+        "date": "2026-06-17",
+        "source": "y14-expansion-batch55-stream-a-messaging"
+      }
+    ]
+  }
+}

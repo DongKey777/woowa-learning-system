@@ -1,0 +1,63 @@
+{
+  "id": "system-design/mapreduce-shuffle-paradigm-basics",
+  "title": "MapReduce shuffle paradigm basics - map, shuffle, reduce의 경계",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "MapReduce는 입력을 독립 map 작업으로 나누고, 중간 key를 기준으로 shuffle해서 같은 key의 값을 한 reducer로 모은 뒤 reduce로 집계하는 batch 처리 패러다임이다. 핵심은 map과 reduce 사이의 shuffle barrier가 네트워크, 디스크, skew 비용을 만든다는 점이다.",
+  "body_markdown": "# MapReduce shuffle paradigm basics - map, shuffle, reduce의 경계\n\n> 한 줄 요약: map은 독립 처리, shuffle은 같은 key끼리 모으는 재분배, reduce는 key별 집계다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: MapReduce basics, map shuffle reduce, shuffle barrier, distributed batch processing, key value intermediate data, reducer grouping, word count example, batch aggregation, map task reduce task, 맵리듀스 셔플 기초\n\n## 먼저 멘탈모델\n\nMapReduce는 대량 데이터를 한 머신에서 순차 처리하기 어렵거나 느릴 때, 입력을 나눠 여러 worker가 처리하게 만든 batch 처리 방식이다.\n\n```text\ninput splits -> map tasks -> intermediate key/value\n                         -> shuffle by key\n                         -> reduce tasks -> output\n```\n\n고전적인 word count 예시는 이렇다.\n\n```text\nmap(line):\n  각 단어마다 (word, 1)을 낸다\n\nshuffle:\n  같은 word를 같은 reducer로 보낸다\n\nreduce(word, values):\n  values를 합산해 (word, count)를 낸다\n```\n\n여기서 `map`과 `reduce`라는 이름보다 더 중요한 것은 **shuffle이 중간 결과의 소유 worker를 바꾼다**는 점이다.\n\n## 세 단계 구분\n\n| 단계 | 하는 일 | 병목 |\n|---|---|---|\n| map | 입력 split을 독립 처리하고 중간 key/value를 만든다 | CPU, local read, parsing |\n| shuffle | 중간 key를 기준으로 reducer에 재분배한다 | network, serialization, disk spill |\n| reduce | 같은 key의 값들을 모아 집계한다 | skew key, sort/group, output write |\n\nMap task는 서로 독립적일수록 좋다. Reduce task는 같은 key의 모든 값이 모여야 의미가 있다. 그래서 shuffle 단계는 단순 전달이 아니라 **분산 join/집계를 가능하게 하는 재배치**다.\n\n## shuffle barrier란 무엇인가\n\nReduce가 시작되려면 필요한 map output이 준비되고 key 기준으로 재분배되어야 한다. 이 경계가 batch barrier다.\n\n```text\nmap A done\nmap B done\nmap C slow  -> reduce가 필요한 partition을 아직 못 받음\n```\n\n일부 시스템은 map output이 도착하는 대로 reduce 쪽 준비를 시작할 수 있지만, 개념적으로 reduce 결과는 필요한 key group이 모여야 확정된다. 그래서 느린 map, skew partition, network stall이 전체 stage를 늦춘다.\n\n## 왜 Java Stream의 map/reduce와 다른가\n\nJava Stream에서도 `map`, `reduce`라는 단어를 쓴다. 하지만 MapReduce 패러다임에서의 핵심은 여러 머신/worker 사이의 **shuffle과 장애 복구**다.\n\n- Java Stream map/reduce: 한 프로세스 안의 collection 변환/집계에 가깝다.\n- MapReduce: 입력 split, task scheduling, intermediate data, network shuffle, reducer partition, retry가 함께 있다.\n\n따라서 MapReduce 질문에서 `map은 변환, reduce는 집계`만 말하면 부족하다. shuffle이 왜 필요한지, 그리고 shuffle이 왜 비싼지까지 설명해야 한다.\n\n## 언제 잘 맞는가\n\n- 로그나 이벤트를 key별로 집계한다.\n- 대용량 파일을 partition별로 처리한다.\n- inverted index, word count, group-by count처럼 key grouping이 명확하다.\n- latency보다 throughput과 재시작 가능성이 중요하다.\n\n반대로 실시간 사용자 응답, 반복적인 그래프 알고리즘, 상태가 계속 바뀌는 low-latency stream에는 MapReduce 한 번의 batch barrier가 부담이 될 수 있다.\n\n## 흔한 함정\n\n### key skew\n\n특정 key가 너무 많으면 그 key를 맡은 reducer만 과부하된다. 전체 job은 그 reducer 하나를 기다리게 된다.\n\n### intermediate data 폭증\n\nmap output이 input보다 커질 수 있다. local disk spill, network 전송, reducer sort 비용이 커진다. 가능하면 combiner나 map-side aggregation으로 중간 결과를 줄인다.\n\n### side effect map\n\nmap task는 실패 시 재실행될 수 있다. 외부 API 호출, DB write 같은 side effect를 map 안에 넣으면 중복 실행 문제가 생긴다. map/reduce task는 가능하면 deterministic하고 idempotent한 계산으로 유지해야 한다.\n\n## 단계별로 생기는 데이터의 모양\n\nMapReduce를 이해할 때는 함수 이름보다 데이터 모양을 따라가면 덜 헷갈린다. 입력은 보통 파일 block이나 partition처럼 나뉜다. 각 map task는 자기 입력 조각만 읽고 중간 key/value를 만든다. 이 중간 key는 reduce가 어떤 단위로 묶을지를 정한다. word count라면 key는 단어이고 value는 `1`이다. 사용자별 매출 집계라면 key는 user id이고 value는 주문 금액일 수 있다.\n\nshuffle은 이 중간 key/value를 key 기준으로 다시 나눈다. 같은 key의 값들이 같은 reducer로 가야 최종 집계가 가능하기 때문이다. 이때 partitioner는 보통 key hash를 사용해 reducer를 고른다. 그래서 map output은 local disk에 정렬되거나 spill되고, 네트워크를 타고 reducer 쪽으로 이동하며, reducer는 받은 데이터를 다시 sort/group한다. 단순히 다음 함수로 넘기는 호출이 아니라 소유 worker와 저장 위치가 바뀌는 단계다.\n\n## 성능을 볼 때의 질문\n\nMapReduce job이 느릴 때는 \"map이 느린가 reduce가 느린가\"보다 shuffle 전후의 양과 분포를 먼저 본다.\n\n- map output이 input보다 훨씬 커졌는가?\n- combiner나 map-side aggregation으로 줄일 수 있는가?\n- 특정 key가 대부분의 value를 가져 reducer 하나에 몰리는가?\n- spill 횟수와 shuffle read/write 크기가 큰가?\n- straggler task 하나가 stage 완료를 잡고 있는가?\n\n이 질문은 batch 시스템 전반에 이어진다. Spark, Hadoop, Flink batch mode처럼 구현은 달라도 key별 재분배, partition skew, spill, straggler라는 문제는 반복된다. 그래서 MapReduce basics는 오래된 프레임워크 암기가 아니라, 분산 집계에서 왜 shuffle이 비싼지 배우는 입구로 보는 편이 좋다.\n\n## 장애와 재시도 관점\n\nMapReduce task는 실패하면 재실행될 수 있다. 이 특성 때문에 map이나 reduce 내부의 계산은 deterministic하고 idempotent해야 한다. map task가 외부 결제 API를 호출하거나 DB에 insert를 하면, task retry 때 같은 side effect가 다시 발생할 수 있다. 로그 파싱, key/value 생성, 집계처럼 입력에서 출력이 계산으로 정해지는 작업이 잘 맞는 이유가 여기에 있다.\n\n출력도 보통 임시 경로에 쓰고 성공한 task의 결과만 최종 경로로 commit한다. 일부 task가 실패해도 전체 job을 처음부터 다시 하지 않도록 하기 위해서다. 하지만 shuffle 중간 데이터가 사라지거나 reducer가 실패하면 필요한 partition을 다시 받아야 하므로 network와 disk 비용이 다시 발생한다. 성능 최적화와 장애 복구가 같은 shuffle 구조에 묶여 있는 셈이다.\n\n## 어떤 문제에 맞고 어떤 문제에 맞지 않나\n\nMapReduce는 큰 입력을 한 번 훑어 key별로 모으는 batch 문제에 잘 맞는다. 일별 로그 집계, inverted index 생성, 사용자별 count, 대용량 ETL처럼 throughput이 중요하고 결과가 조금 늦게 나와도 되는 작업이 대표적이다. 반대로 사용자 요청마다 즉시 응답해야 하거나, 이전 결과를 계속 수정하면서 낮은 지연으로 반응해야 하는 문제에는 batch barrier가 무겁다. 이때는 stream processing, online serving store, queue 기반 worker, incremental aggregation 같은 다른 구조를 검토한다.\n\n핵심 감각은 \"map과 reduce를 썼다\"가 아니라 \"중간 key를 기준으로 전체 데이터를 다시 나눌 만큼 그 집계가 필요한가\"다. shuffle이 꼭 필요하면 그 비용을 설계하고, 필요 없다면 worker local 처리나 fan-out/fan-in merge만으로 끝낼 수 있는지 먼저 본다.\n\n## 한 줄 정리\n\nMapReduce는 대량 입력을 map으로 나누고 shuffle로 key별 소유권을 재배치한 뒤 reduce로 집계하는 batch 패러다임이며, 성능과 장애의 핵심 비용은 대개 map이나 reduce 이름보다 shuffle barrier에서 나온다.\n",
+  "aliases": [
+    "MapReduce map shuffle",
+    "distributed batch shuffle",
+    "key value grouping",
+    "shuffle barrier",
+    "word count pipeline",
+    "맵리듀스 셔플",
+    "키별 재분배",
+    "리듀서 병목",
+    "분산 배치 집계"
+  ],
+  "expected_queries": [
+    "MapReduce에서 map, shuffle, reduce가 각각 어떤 역할을 하는지 예시로 설명해줘",
+    "맵리듀스의 shuffle barrier가 왜 네트워크와 디스크 병목을 만들 수 있어?",
+    "word count 예시에서 중간 key value가 reducer로 모이는 과정을 알려줘",
+    "Java Stream의 map reduce와 분산 MapReduce는 무엇이 달라?",
+    "MapReduce에서 key skew 때문에 reducer 하나가 전체 job을 늦추는 이유가 뭐야?",
+    "map task 안에서 외부 API 호출이나 DB write 같은 side effect를 넣으면 왜 위험해?"
+  ],
+  "symptoms": [
+    "MapReduce를 map은 변환 reduce는 합계 정도로만 이해하고 shuffle 비용을 놓친다",
+    "reduce가 왜 같은 key의 모든 값을 기다려야 하는지 설명하지 못한다",
+    "key skew와 intermediate data 폭증이 batch stage를 늦추는 이유를 모른다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/fan-out-fan-in-parallel-merge-basics",
+      "system-design/system-design-foundations"
+    ],
+    "next_docs": [
+      "system-design/distributed-shuffle-partition-skew-spill",
+      "system-design/straggler-speculative-execution-batch-barrier",
+      "software-engineering/batch-recovery-runbook"
+    ],
+    "confusable_with": [
+      "language/structured-fanout-httpclient",
+      "software-engineering/batch-partial-failure",
+      "system-design/message-queue-basics",
+      "system-design/job-queue-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-18",
+    "legacy_path": "knowledge/cs/contents/system-design/mapreduce-shuffle-paradigm-basics.md",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "id": "system-design/backup-chain-retention-restore-point-selection-playbook",
+  "title": "Backup Chain Retention and Restore Point Selection Playbook",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Backup chain 설계는 full snapshot, incremental backup, WAL/change log, catalog, key material을 하나의 복원 가능한 체인으로 보고, 오염 시점과 보존 정책 안에서 어떤 restore point를 선택할지 검증하는 운영 playbook이다.",
+  "body_markdown": "# Backup Chain Retention and Restore Point Selection Playbook\n\n> 한 줄 요약: 백업은 파일 목록이 아니라 restore point를 만들 수 있는 chain이며, 좋은 복구 판단은 오염 시점, RPO/RTO, retention, 검증 비용을 함께 본다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Backup, Restore, Disaster Recovery Drill 설계](./backup-restore-disaster-recovery-drill-design.md)\n- [Write-Ahead Log Durability Interview Primer](../database/write-ahead-log-durability-interview-primer.md)\n- [Redo/Undo/Checkpoint Crash Recovery](../database/redo-undo-checkpoint-crash-recovery.md)\n- [Data Retention / Deletion / Tombstone / GDPR Playbook](./data-retention-deletion-tombstone-gdpr-playbook.md)\n- [Audit Evidence Vault 설계](./audit-evidence-vault-design.md)\n\nretrieval-anchor-keywords: backup chain, restore point selection, PITR, point in time recovery, backup retention, full snapshot, incremental backup, WAL shipping, change log replay, backup catalog, immutable backup, corruption window, 복구 시점 선택, 백업 체인 보존 정책, 스냅샷 WAL 체인 복구, 오염 시점 기준 백업 선택\n\n## 이 문서가 맡는 질문\n\n이 문서는 `PITR에서 어느 시점으로 복구해야 해요`, `full snapshot과 incremental backup 체인을 어떻게 고르나요`, `retention 정책 때문에 clean restore point가 없으면 어떻게 판단하나요` 같은 질문을 맡는다. DR 전체 runbook은 backup-restore 문서가 맡고, 이 문서는 그 안에서 **복구 가능한 체인과 복구 시점 선택**을 더 좁게 다룬다.\n\n## Backup chain 멘탈 모델\n\n복구 가능한 백업은 보통 다음 조합이다.\n\n- full snapshot: 특정 시점의 전체 기준점\n- incremental backup: 기준점 이후 변경분\n- WAL/binlog/change stream: 더 촘촘한 point-in-time recovery 재생 로그\n- catalog: 어떤 파일이 어떤 시간, schema, encryption key, checksum에 대응하는지 기록\n- manifest/checksum: 복원 후 깨지지 않았는지 검증하는 증거\n- key material reference: 암호화된 백업을 실제로 읽기 위한 키와 권한\n\n`backup file이 있다`와 `target time으로 restore 가능하다`는 다르다. snapshot이 있어도 그 뒤 WAL 일부가 없거나 catalog가 손상되면 원하는 restore point를 만들 수 없다.\n\n## Restore point 선택 절차\n\n1. **사고 종류를 분류한다**: 물리 장애, 논리 삭제, 잘못된 migration, 랜섬웨어, silent corruption인지 나눈다.\n2. **오염 시작 시각을 추정한다**: audit log, deploy timeline, batch window, checksum diff, user report를 모은다.\n3. **후보 restore point를 잡는다**: 오염 직전, 마지막 검증 성공 시각, business cutoff, regulatory hold 시점을 비교한다.\n4. **격리 환경에서 복원한다**: production에 바로 붙이지 말고 isolated restore로 checksum과 invariant를 본다.\n5. **손실과 오염을 비교한다**: 더 이른 restore는 데이터 손실이 크고, 더 늦은 restore는 오염이 남을 수 있다.\n6. **재적용 계획을 세운다**: clean base를 고른 뒤 안전한 event, payment, webhook, CDC offset만 재적용한다.\n\nRestore point는 보통 `가장 최근 백업`이 아니다. 오염이 이미 복제된 후라면 최신 백업은 빠르지만 틀린 상태를 복구한다.\n\n## Retention 설계\n\nRetention은 비용 절감 정책이면서 복구 가능성을 제한하는 정책이다.\n\n| 계층 | 예시 | 목적 | 주의점 |\n|---|---|---|---|\n| Hot backup | 최근 24~72시간 snapshot+log | 빠른 PITR | 비용과 storage pressure |\n| Warm backup | 며칠~몇 주 incremental chain | 운영 실수 복구 | chain 중간 파일 손실 위험 |\n| Cold archive | 월간 snapshot, immutable vault | 장기 보존, 감사 | restore가 느리고 key 절차가 복잡 |\n| Legal hold | 삭제 금지 보존 | 규제/소송 대응 | GDPR deletion과 충돌 가능 |\n\n좋은 retention 답변은 `얼마나 오래 보관`만 말하지 않는다. chain이 길어질수록 restore time과 검증 시간이 늘고, 중간 incremental 하나가 깨지면 뒤 restore point가 모두 위험해진다. 그래서 주기적으로 full snapshot을 새 기준점으로 만들고, catalog와 checksum을 같이 검증한다.\n\n## Chain 검증 체크리스트\n\n복구 가능성을 말하려면 백업 파일 존재 여부보다 chain 증거를 먼저 본다. catalog에는 snapshot id, WAL 범위, schema version, encryption key reference, checksum, retention class가 함께 남아야 한다. 각 항목이 따로 흩어져 있으면 실제 사고 때 어느 조합이 같은 restore point를 만드는지 추적하기 어렵다.\n\n검증은 dry-run restore로 닫아야 한다. 샘플 dataset만 내려받아 파일이 열리는지 보는 수준은 부족하다. 격리 환경에서 snapshot을 복원하고, 필요한 WAL segment를 끝까지 replay하고, application invariant와 row count, checksum, 외부 side effect 재적용 가능성을 확인해야 한다. 이 결과가 drill report와 audit evidence에 남아야 다음 사고에서 신뢰할 수 있는 후보가 된다.\n\nChain이 너무 길면 RTO가 깨질 수 있다. 따라서 retention 설계에는 full snapshot 주기, incremental depth 상한, WAL 보관 시간, cold archive restore 시간, key recovery 시간을 함께 넣는다. restore point가 많아도 정해진 시간 안에 검증하고 승격할 수 없다면 운영상 복구 가능한 지점이라고 보기 어렵다.\n\n## 의사결정 기록\n\n실제 사고에서는 복구 시점 선택 이유를 남기는 것도 중요하다. 후보 restore point, 제외한 시점, 예상 데이터 손실, 남을 수 있는 오염, 재적용할 event 범위, 승인자를 기록한다. 나중에 감사나 장애 회고에서 왜 최신 백업을 쓰지 않았는지, 왜 더 이른 시점으로 물러났는지 설명할 수 있어야 한다. 이 기록이 없으면 같은 사고를 다시 분석할 때 운영 판단이 개인 기억에만 남는다.\n\n특히 고객 영향이 큰 복구에서는 선택한 restore point의 근거를 타임라인으로 남긴다.\n\n## 실전 시나리오\n\n### 잘못된 배치가 새벽 02:13부터 가격을 오염시킴\n\n최신 snapshot은 03:00이고 WAL은 02:13 이후 오염된 update를 포함한다. 이 경우 03:00 snapshot을 그대로 쓰면 빠르지만 오염이 남는다. 02:12:59 restore point를 만들고, 이후 정상 주문 event만 선별 재적용하는 계획이 필요하다.\n\n### 랜섬웨어가 production credential을 탈취함\n\nproduction 계정으로 접근 가능한 backup은 같이 삭제되었을 수 있다. immutable vault, 분리된 catalog, 별도 key recovery 절차가 있어야 한다. 여기서 restore point 선택은 데이터 시각뿐 아니라 신뢰 가능한 control plane과 key material을 포함한다.\n\n### Silent corruption이 한 달 뒤 발견됨\n\n오염 시작 시점이 불명확하면 여러 restore point를 격리 환경에 복원해 checksum과 domain invariant를 비교한다. retention이 짧으면 clean point가 이미 사라졌을 수 있으므로 장기 archive와 sample verification이 중요하다.\n\n## 판단 매트릭스\n\n| 증상 | 의심 원인 | 다음 확인 |\n|---|---|---|\n| PITR 후보가 여러 개인데 어느 것이 맞는지 모름 | 오염 시작 시각 불명확 | audit log, deploy window, bad batch input, checksum diff |\n| restore chain이 중간에서 끊김 | incremental file, WAL segment, catalog 누락 | manifest completeness, storage lifecycle rule, checksum |\n| 최신 백업은 있는데 데이터가 이상함 | 논리 오염이 백업에도 포함 | corruption propagation time, clean backup availability |\n| RTO를 넘김 | chain replay가 길거나 verification 병목 | full snapshot 주기, restore throughput, parallel verification |\n| 백업은 있는데 열 수 없음 | key material, IAM, KMS 정책 손상 | key escrow, break-glass 권한, vault isolation |\n\n## 흔한 오해\n\n- **최신 백업이 항상 최선이다**: 논리 오염이 최신 백업에 들어갔으면 더 이른 restore point가 필요하다.\n- **retention은 storage 비용 문제다**: retention은 clean restore point를 얼마나 오래 유지할지 정하는 복구 가능성 문제다.\n- **snapshot이 있으면 PITR이 된다**: PITR은 snapshot 이후 로그 체인과 catalog가 완전해야 가능하다.\n- **restore 완료가 서비스 정상화다**: checksum, domain invariant, queue/CDC offset, external side effect 재적용까지 확인해야 한다.\n\n## 관측 지표\n\n- recoverable restore points per dataset\n- backup chain completeness, missing WAL segment count\n- restore throughput, replay lag, verification duration\n- oldest clean restore point age, retention gap days\n- checksum mismatch rate, drill success rate\n- key recovery time, immutable vault access latency\n\n## 답변에 포함할 구조\n\n복구 시점 선택 질문에는 사고 시각, 오염 전파 범위, chain completeness, retention 제약, RPO/RTO, 검증 절차, 재적용 계획이 모두 들어가야 한다. `어제 백업으로 돌립니다` 같은 답은 운영 판단으로 부족하다.\n\n## 한 줄 정리\n\nBackup chain과 restore point 선택은 저장된 파일을 고르는 일이 아니라, 오염되지 않은 기준점과 재생 가능한 로그 체인을 찾아 손실과 오염을 함께 최소화하는 운영 의사결정이다.\n",
+  "aliases": [
+    "backup chain retention restore point selection",
+    "PITR restore point selection",
+    "backup retention restore chain",
+    "full incremental WAL backup chain",
+    "restore catalog retention",
+    "복구 시점 선택",
+    "백업 체인 보존 정책",
+    "PITR 어느 시점으로 복구",
+    "스냅샷 WAL 체인 복구",
+    "오염 시점 기준 백업 선택"
+  ],
+  "expected_queries": [
+    "PITR에서 최신 백업이 아니라 오염 직전 restore point를 어떻게 선택해야 해?",
+    "full snapshot, incremental backup, WAL 체인이 끊기면 복구 가능성을 어떻게 판단해?",
+    "backup retention 정책을 RPO/RTO와 clean restore point 관점에서 어떻게 설계해?",
+    "잘못된 배치가 데이터 오염을 만든 뒤 어떤 백업 시점으로 복원해야 할지 절차를 알려줘",
+    "immutable backup vault와 backup catalog가 restore point 선택에 왜 중요해?"
+  ],
+  "symptoms": [
+    "백업은 있는데 어느 시점으로 복구해야 할지 모르겠어",
+    "최신 backup이 오염된 상태일 수 있어서 PITR 후보를 비교해야 해",
+    "retention 때문에 clean restore point가 남아 있는지 확신이 없어"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/backup-restore-disaster-recovery-drill-design",
+      "database/redo-undo-checkpoint-crash-recovery",
+      "database/write-ahead-log-durability-interview-primer"
+    ],
+    "next_docs": [
+      "system-design/data-retention-deletion-tombstone-gdpr-playbook",
+      "system-design/audit-evidence-vault-design",
+      "system-design/read-model-rebuild-backfill-playbook"
+    ],
+    "confusable_with": [
+      "system-design/failover-redundancy-primer",
+      "system-design/multi-region-active-active-design",
+      "database/read-repair-reconciliation-after-failover"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147",
+        "note": "Created for backup chain retention and restore point retrieval coverage."
+      }
+    ]
+  }
+}

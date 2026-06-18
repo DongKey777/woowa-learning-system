@@ -1,0 +1,59 @@
+{
+  "id": "system-design/distributed-shuffle-partition-skew-spill",
+  "title": "Distributed shuffle partition skew spill - 분산 재배치의 세 병목",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "Distributed shuffle은 중간 데이터를 key나 partition 기준으로 다른 worker에 재배치하는 단계다. 네트워크 전송, partition skew, memory 부족으로 인한 disk spill이 주된 병목이며, combiner, salting, custom partitioner, range sampling, spill tuning으로 완화한다.",
+  "body_markdown": "# Distributed shuffle partition skew spill - 분산 재배치의 세 병목\n\n> 한 줄 요약: shuffle은 데이터를 다시 나누는 비용이고, 병목은 보통 network, skew, spill에서 나온다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: distributed shuffle, partition skew, shuffle spill, map reduce shuffle bottleneck, reducer skew, network shuffle, disk spill, combiner, salting heavy key, custom partitioner, range partition sampling, intermediate data explosion\n\n## 먼저 멘탈모델\n\nShuffle은 worker가 만든 중간 데이터를 최종 소유자에게 다시 보내는 과정이다.\n\n```text\nmap worker 1 -> key A, key B, key C\nmap worker 2 -> key A, key B\nmap worker 3 -> key C, key C\n\nshuffle by key:\n  reducer A <- 모든 key A\n  reducer B <- 모든 key B\n  reducer C <- 모든 key C\n```\n\n이 단계는 계산이라기보다 **분산 재배치**에 가깝다. 그래서 CPU보다 network, serialization, disk, memory가 먼저 병목이 되는 일이 많다.\n\n## 세 병목\n\n### 1. Network shuffle\n\nMap output이 reducer로 이동한다. 데이터가 크면 네트워크가 병목이 되고, cross-AZ나 rack 간 전송이 많으면 더 비싸진다.\n\n완화 방향:\n\n- map-side aggregation이나 combiner로 중간 데이터를 줄인다.\n- 필요한 column만 남겨 serialization payload를 줄인다.\n- partition 수를 너무 작거나 크게 잡지 않는다.\n\n### 2. Partition skew\n\n특정 key나 partition에 데이터가 몰리면 reducer 하나만 거대해진다. 나머지 reducer가 끝나도 전체 job은 가장 큰 partition을 기다린다.\n\n완화 방향:\n\n- heavy key를 salting해서 여러 reducer로 나눈 뒤 다시 합친다.\n- custom partitioner로 hot key를 특별 처리한다.\n- range partitioning에서는 sample로 boundary를 잡아 균등도를 높인다.\n- key cardinality와 top key 비율을 미리 본다.\n\n### 3. Spill\n\n정렬, grouping, aggregation 중 memory에 다 담지 못하면 disk로 spill한다. Spill은 반드시 나쁜 것은 아니지만, 반복 spill과 merge가 많아지면 stage 시간이 길어진다.\n\n완화 방향:\n\n- map output을 줄인다.\n- partition 수와 memory budget을 조정한다.\n- key/value 크기와 serialization 비용을 줄인다.\n- reduce-side sort/group이 필요한지, pre-aggregation이 가능한지 본다.\n\n## 왜 shuffle이 비싼가\n\nShuffle은 여러 비용이 겹친다.\n\n| 비용 | 설명 |\n|---|---|\n| serialization | intermediate record를 네트워크로 보내기 위해 encode한다 |\n| network transfer | 다른 worker/rack으로 데이터를 옮긴다 |\n| sort/group | 같은 key를 모으기 위해 정렬하거나 hash grouping한다 |\n| disk spill | memory를 넘는 데이터를 임시 파일로 쓴다 |\n| barrier wait | 가장 느린 partition이 끝날 때까지 다음 단계가 기다린다 |\n\n그래서 shuffle 최적화는 단일 함수 튜닝보다 데이터 모양을 바꾸는 일이 많다.\n\n## Kafka partition과 헷갈리지 않기\n\nKafka partition도 key 기준 분산을 말하지만, shuffle과 목적이 다르다.\n\n- Kafka partition: append-only log의 저장/소비 단위다.\n- Distributed shuffle: 한 job stage 안에서 중간 데이터를 다음 stage 소유자에게 재배치한다.\n\n둘 다 partition key와 skew를 고민하지만, shuffle은 batch stage의 transient data movement이고 Kafka partition은 지속되는 log layout이다.\n\n## 관측 신호\n\n- reducer별 input bytes와 record count 분포\n- shuffle read/write bytes\n- spill bytes와 spill file count\n- task duration p50/p95/p99와 가장 느린 partition id\n- top key 빈도와 null/default key 비율\n- retry된 task가 같은 partition에서 반복되는지\n\n이 지표가 없으면 shuffle 병목을 CPU 부족이나 worker 수 부족으로 오해하기 쉽다.\n\n## 한 줄 정리\n\nDistributed shuffle은 key별로 데이터를 다시 모으는 분산 재배치 단계이고, 성능 문제는 대개 네트워크 전송량, hot key skew, memory 부족 spill, 그리고 가장 느린 partition을 기다리는 barrier에서 나온다.\n",
+  "aliases": [
+    "distributed shuffle",
+    "shuffle spill",
+    "partition skew",
+    "분산 셔플",
+    "파티션 스큐",
+    "셔플 스필",
+    "reducer skew",
+    "heavy key salting",
+    "shuffle bottleneck"
+  ],
+  "expected_queries": [
+    "distributed shuffle에서 network, partition skew, spill이 왜 병목이 돼?",
+    "MapReduce reducer 하나만 느릴 때 shuffle skew를 어떻게 의심해?",
+    "shuffle spill bytes가 늘면 어떤 비용이 생기고 어떻게 줄일 수 있어?",
+    "heavy key salting과 custom partitioner는 partition skew를 어떻게 줄여?",
+    "Kafka partition과 distributed shuffle partition은 뭐가 달라?",
+    "shuffle 단계에서 combiner나 map-side aggregation이 왜 중요한가?"
+  ],
+  "symptoms": [
+    "worker 수를 늘렸는데 특정 reducer partition 하나만 오래 걸린다",
+    "shuffle read/write와 spill bytes가 커졌는데 CPU 튜닝만 보고 있다",
+    "Kafka partition과 batch shuffle partition을 같은 개념으로 섞어 설명한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/mapreduce-shuffle-paradigm-basics",
+      "system-design/shard-key-selection-basics",
+      "database/sort-buffer-temp-table-spill"
+    ],
+    "next_docs": [
+      "system-design/straggler-speculative-execution-batch-barrier",
+      "system-design/hot-key-skew-mitigation-interview-playbook",
+      "system-design/shard-rebalancing-partition-relocation-design"
+    ],
+    "confusable_with": [
+      "system-design/sharding-hotspot-rebalancing-perspective-map",
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "database/index-condition-pushdown-filesort-temporary-table",
+      "database/temp-table-engine-spill-behavior"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/distributed-shuffle-partition-skew-spill.md",
+    "revision_history": []
+  }
+}

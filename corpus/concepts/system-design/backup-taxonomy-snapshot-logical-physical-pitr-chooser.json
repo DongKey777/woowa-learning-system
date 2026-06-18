@@ -1,0 +1,62 @@
+{
+  "id": "system-design/backup-taxonomy-snapshot-logical-physical-pitr-chooser",
+  "title": "Backup Taxonomy: Snapshot, Logical, Physical, PITR Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "백업을 snapshot, logical dump, physical backup, WAL/binlog 기반 PITR로 구분하고 RPO/RTO, 복원 단위, 검증 난이도, 운영 위험에 따라 어떤 백업 전략을 선택할지 설명한다.",
+  "body_markdown": "# Backup Taxonomy: Snapshot, Logical, Physical, PITR Chooser\n\n## 한 줄 요약\n\n백업은 \"파일 하나 저장\"이 아니라 복구 목표에 맞는 복원 방법을 고르는 일이다. Snapshot, logical dump, physical backup, WAL/binlog 기반 PITR은 복구 단위, 속도, 특정 시점 복구 가능성, 검증 방법이 다르다.\n\n## 먼저 RPO/RTO로 묻기\n\n백업 종류를 고르기 전에 두 질문을 먼저 정한다.\n\n- RPO: 장애 시 어느 시점까지 데이터 손실을 허용할 수 있는가?\n- RTO: 얼마나 빨리 서비스를 복구해야 하는가?\n\n매일 새벽 logical dump만 있으면 RPO는 최대 하루에 가까울 수 있다. 반면 base backup과 WAL archive가 있으면 특정 시점까지 복구하는 PITR을 설계할 수 있지만, WAL 보관, restore rehearsal, timeline 관리가 필요하다.\n\n## 백업 종류 비교\n\n| 종류 | 무엇을 저장하나 | 장점 | 한계 |\n|---|---|---|---|\n| Snapshot | volume/storage 상태 | 빠른 생성, 큰 데이터에 유리 | app/DB consistency 확인 필요 |\n| Logical dump | SQL/row/object 형태 | 버전 이동과 일부 복원에 유리 | 대규모 복원 느림, 권한/extension 누락 가능 |\n| Physical backup | DB data file/base backup | 대용량 DB 복원에 유리 | 같은 engine/version 제약과 절차 필요 |\n| PITR | base backup + WAL/binlog | 특정 시점 복구 가능 | log chain 누락 시 실패, target time 선택 필요 |\n| Cross-region copy | 다른 지역 저장 | region 장애 대비 | 비용, 지연, 규정 관리 필요 |\n\n실무에서는 하나만 고르기보다 조합한다. 예를 들어 매일 physical base backup, 지속 WAL archive, 주기적 logical export, cross-region immutable copy를 함께 둘 수 있다.\n\n## snapshot은 언제 조심해야 하나\n\nStorage snapshot은 빠르지만 DB가 쓰는 중인 page와 WAL이 서로 맞는지 확인해야 한다. Managed database가 consistency를 보장하는 snapshot인지, 직접 volume snapshot을 찍는지에 따라 절차가 다르다.\n\nSnapshot만 있으면 특정 row를 실수로 삭제한 직전 시점으로 되돌리기 어렵다. 전체 volume을 snapshot 시점으로 되돌리는 것은 빠를 수 있지만, 그 이후 정상 write까지 함께 사라질 수 있다.\n\n## logical dump는 언제 유용한가\n\nLogical dump는 table 단위 복원, migration, 개발/검증 환경 복제에 유용하다. 하지만 대규모 DB 전체 복원은 오래 걸릴 수 있고, index rebuild, constraint, sequence, permission, extension 같은 주변 요소를 놓치기 쉽다.\n\n또한 logical dump가 생성되는 동안 source data가 계속 변하면 일관된 snapshot 옵션이 필요하다.\n\n## physical backup과 PITR\n\nPhysical base backup은 DB data files를 복구 가능한 형태로 저장한다. 여기에 WAL/binlog 같은 변경 log를 이어 붙이면 특정 시점까지 replay할 수 있다.\n\nPITR mental model:\n\n```text\nbase backup at 00:00\nWAL 00:00 -> 10:17 replay\nrestore target: 10:16:30, before accidental delete\nnew timeline starts\n```\n\nPITR은 \"가장 최근으로 복원\"이 아니라 \"원하는 손상 직전 시점으로 복원\"하는 능력이다. 그래서 사고 시각, corruption window, log chain 완전성이 중요하다.\n\n## 선택 기준\n\n| 요구 | 우선 후보 |\n|---|---|\n| 작은 table 일부 복원 | logical dump, targeted export/import |\n| 대용량 DB 빠른 복원 | physical backup, storage snapshot |\n| 실수 삭제 직전으로 복구 | PITR |\n| region 전체 장애 대비 | cross-region immutable backup |\n| schema migration 전 safety net | logical dump + snapshot |\n| 재해복구 훈련 | physical restore + PITR rehearsal |\n\n## 흔한 오해\n\n- \"백업 파일이 있으면 복구된다\": restore drill을 해 보기 전까지는 모른다.\n- \"snapshot은 항상 일관적이다\": DB와 storage snapshot의 consistency 보장을 확인해야 한다.\n- \"logical dump면 충분하다\": 대규모 복원 RTO를 만족하지 못할 수 있다.\n- \"PITR은 최신 상태로 되돌리는 기능이다\": 손상 직전 target time을 고르는 기능이다.\n- \"백업은 DB만 보면 된다\": 권한, index, extension, object storage, cache warm-up, app config도 복원 검증 대상이다.\n\n## 검증 체크리스트\n\n1. RPO/RTO가 문서화되어 있는가?\n2. 백업 종류별 restore 절차가 자동화되어 있는가?\n3. 백업 catalog와 checksum이 검증되는가?\n4. PITR log chain이 끊기지 않았는가?\n5. 격리 환경에서 restore drill을 반복하는가?\n6. 권한, sequence, index, extension, job scheduler까지 확인하는가?\n7. backup encryption key와 접근 권한이 복구 시점에도 사용 가능한가?\n8. cross-region copy와 retention 정책이 규정과 맞는가?\n\n## 면접 답변 축\n\n백업 종류 질문에는 \"snapshot은 빠른 storage 상태 저장, logical dump는 SQL/row 단위 이동성, physical backup은 DB 파일 기반 빠른 복원, PITR은 base backup과 변경 log로 특정 시점 복구\"라고 구분한다. 이어서 선택은 RPO/RTO, 복원 단위, 데이터 크기, 검증 난이도에 따라 조합한다고 답하면 된다.\n\n## Safe Next Docs\n\nDR drill 전체는 `backup-restore-disaster-recovery-drill-design`, PostgreSQL PITR 세부는 `postgresql-pitr-wal-archive-timeline-recovery-playbook`, restore point 선택은 `backup-chain-retention-restore-point-selection-playbook`으로 이어진다.\n\n---\n\n## worked example: mysqldump만 있던 서비스\n\n매일 새벽 3시에 `mysqldump`만 남기는 서비스가 있다고 하자. 오전 11시에 실수로 주문 테이블 일부를 잘못 업데이트했다면 선택지는 제한된다.\n\n| 질문 | mysqldump만 있을 때 | base backup + binlog/PITR가 있을 때 |\n|---|---|---|\n| 손실 범위 | 새벽 3시 이후 정상 write가 모두 위험 | 사고 직전 시점까지 replay 가능 |\n| 복원 속도 | dump import와 index rebuild로 오래 걸릴 수 있음 | physical restore가 더 빠를 수 있음 |\n| 일부 table 복원 | 비교적 다루기 쉬움 | 격리 restore 뒤 추출 필요 |\n| 검증 | schema, 권한, sequence 누락 확인 | log chain, timeline, target time 확인 |\n\n이 예시는 logical backup이 나쁘다는 뜻이 아니다. 작은 table 일부를 복원하거나 버전 이동을 할 때는 logical dump가 편하다. 다만 대용량 전체 복구 RTO와 사고 직전 RPO를 요구하면 physical backup과 log archive가 필요해진다.\n\n## hot/cold backup과 일관성 질문\n\n운영 DB를 멈추지 않고 찍는 hot backup은 서비스 중단을 줄이지만, DB engine이 어떤 방식으로 일관성을 보장하는지 확인해야 한다. cold backup은 멈춘 상태에서 찍어 단순하지만 downtime이 크다. managed database snapshot은 이 복잡도를 감춰 주지만, 그래도 restore drill로 실제 일관성과 복구 시간을 확인해야 한다.\n\n## 추가 한 줄 정리\n\n백업 taxonomy의 핵심은 종류 이름을 외우는 것이 아니라, 특정 사고에서 `얼마나 잃어도 되는가`, `얼마나 빨리 돌아와야 하는가`, `어느 단위로 복구해야 하는가`를 맞추는 것이다.\n\n복구 절차는 문서가 아니라 실제 restore rehearsal 결과로만 신뢰할 수 있다.",
+  "aliases": [
+    "backup taxonomy",
+    "snapshot logical physical PITR",
+    "백업 종류",
+    "스냅샷 논리 물리 백업",
+    "point in time recovery",
+    "RPO RTO backup",
+    "logical dump restore",
+    "physical backup",
+    "WAL PITR",
+    "복구 목표 선택"
+  ],
+  "expected_queries": [
+    "snapshot backup, logical dump, physical backup, PITR은 각각 언제 쓰는 거야?",
+    "백업 종류를 RPO와 RTO 기준으로 어떻게 골라야 해?",
+    "logical dump는 일부 table 복원에는 좋지만 대용량 전체 복원에는 왜 느릴 수 있어?",
+    "PITR은 최신 상태 복구가 아니라 손상 직전 시점 복구라는 말이 무슨 뜻이야?",
+    "storage snapshot만 있으면 DB consistency가 항상 보장되는지 어떻게 확인해?",
+    "백업 전략은 snapshot과 WAL archive와 logical dump를 왜 조합해서 쓰는 경우가 많아?"
+  ],
+  "symptoms": [
+    "백업 파일은 있는데 RPO/RTO를 만족하는 복원 방법이 없다",
+    "snapshot이 있으면 특정 시점 row 삭제도 쉽게 되돌릴 수 있다고 오해한다",
+    "logical dump 복원 시간이 운영 RTO보다 훨씬 길다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/backup-restore-disaster-recovery-drill-design"
+    ],
+    "next_docs": [
+      "system-design/backup-chain-retention-restore-point-selection-playbook",
+      "database/postgresql-pitr-wal-archive-timeline-recovery-playbook",
+      "database/full-page-writes-checkpoint-wal-crash-recovery-primer"
+    ],
+    "confusable_with": [
+      "system-design/backup-restore-disaster-recovery-drill-design",
+      "design-pattern/checkpoint-snapshot-pattern",
+      "database/postgresql-pitr-wal-archive-timeline-recovery-playbook"
+    ],
+    "forbidden_for_queries": [
+      "PostgreSQL PITR에서 restore_command와 timeline recovery 절차를 자세히 설명해줘",
+      "restore drill 전체 runbook을 설계해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "legacy_path": "knowledge/cs/contents/system-design/backup-taxonomy-snapshot-logical-physical-pitr-chooser.md",
+    "revision_history": [],
+    "updated_at": "2026-06-18T00:00:00+09:00",
+    "last_expansion_source": "y14-expansion-batch99-stream-c-backup-depth"
+  }
+}

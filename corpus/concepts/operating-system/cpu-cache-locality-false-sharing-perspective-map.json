@@ -4,20 +4,28 @@
   "category": "operating-system",
   "level": "advanced",
   "summary": "CPU cache locality, cache line, false sharing, NUMA, perf c2c 관찰을 연결해 동시성 성능을 판단하는 OS perspective map이다.",
-  "body_markdown": "# CPU Cache Locality and False Sharing Perspective Map\n\n## 이 문서가 맡는 질문\nCPU 사용률이 높아도 실제 병목은 연산이 아니라 cache line 이동일 수 있다. 여러 thread가 서로 다른 변수만 갱신해도 같은 cache line에 있으면 false sharing이 생긴다.\n\n## 빠른 분기\ncore는 바쁜데 throughput이 안 오르고 cache miss나 c2c hitm이 높으면 locality와 false sharing을 본다. JVM이면 object layout과 padding, off-heap 구조도 확인한다.\n\n## 실전 시나리오\n카운터 배열을 thread별로 나눴는데 thread 수를 늘릴수록 느려진다. index는 다르지만 인접한 long들이 같은 cache line에 올라 false sharing이 발생할 수 있다.\n\n## CS 배경\nCPU cache는 spatial/temporal locality를 이용한다. Cache coherence protocol은 core들이 같은 cache line의 최신 상태를 맞추도록 하지만, write가 빈번하면 cache line ownership이 core 사이를 계속 이동한다. NUMA에서는 memory locality까지 더해진다.\n\n## false sharing 코드 예시\n```java\nfinal class CounterCell {\n    volatile long value;\n    // @jdk.internal.vm.annotation.Contended 또는 padding으로 cache line 분리 검토\n}\n```\n`volatile`은 visibility를 주지만 false sharing을 없애지 않는다. 중요한 것은 서로 다른 thread가 갱신하는 값이 같은 cache line에 놓이지 않도록 layout을 조정하는 것이다.\n\n## 깊게 볼 포인트\nFalse sharing은 lock contention과 증상이 비슷하지만 처방이 다르다. lock을 없애도 cache line이 공유되면 느리고, padding을 넣으면 메모리 사용량이 늘어난다. JMH 없이는 micro optimization 결론을 내리기 어렵다.\n\n## 다음 행동\n1. thread별 hot write field와 object layout을 확인한다\n2. perf c2c, cache miss, HITM 같은 지표를 본다\n3. padding, sharding, batching 적용 전후를 JMH로 비교한다\n4. NUMA pinning이나 allocation locality를 의심한다\n\n## 확인 질문\n이 병목은 lock을 기다리는 것인가, 같은 cache line ownership을 core들이 서로 빼앗는 것인가?\n\n## 추가 확인: JOL과 배열 false sharing\nJVM 객체 layout은 추측하지 말고 JOL 같은 도구로 확인한다. `@Contended`를 쓰려면 일반적으로 JVM flag(`-XX:-RestrictContended`)와 module 접근 문제가 함께 따라온다. 배열에서도 `long[] counters`의 인접 원소를 thread별로 갱신하면 같은 cache line을 공유할 수 있으므로, field padding만 보고 끝내면 안 된다.\n\n## 판단 매트릭스\n- False sharing: 다른 변수 갱신인데 같은 cache line write로 c2c/HITM이 오른다\n- Poor locality: data 구조가 cache miss를 키워 memory stall이 늘어난다\n- NUMA: remote memory access가 tail latency를 키운다\n- 리뷰 질문: 최적화가 실제 workload와 같은 access pattern에서 측정되었는가\n\n## 측정 지표와 레이턴시\nthroughput, CPU cycles, cache miss rate, HITM/c2c, context switch, p95 operation latency를 본다. 품질은 correctness 유지, 성능은 throughput과 cycles/op, 레이턴시는 tail operation time으로 확인한다.\n\n## 자주 하는 오해\n- volatile을 쓰면 cache 문제가 해결된다고 본다\n- CPU가 높으니 계산량만 줄이면 된다고 본다\n- padding은 무조건 좋은 최적화라고 생각한다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 lock contention, false sharing, locality miss를 분리하고 cache line과 coherence 관점으로 설명해야 한다. 마지막에는 perf/JMH 지표로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. thread 수를 늘리며 throughput 곡선을 그린다\n2. perf/JFR/JMH로 cache miss와 allocation을 확인한다\n3. padding 또는 data layout 변경을 적용한다\n4. 메모리 사용량 증가와 throughput 개선을 같이 본다\n5. 실제 workload에서 p95가 좋아지는지 재측정한다\n\n이 루프를 지키면 CPU Cache Locality and False Sharing Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nCPU cache locality, cache line, false sharing, NUMA, perf c2c 관찰을 연결해 동시성 성능을 판단하는 OS perspective map이다.\n\n## 품질 관점\n커널 지표, 런타임 지표, 애플리케이션 trace를 같은 타임라인에 올려 원인을 분리한다. 이 문서의 답변 품질은 `CPU Cache Locality and False Sharing Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`syscall_rate, queue_depth_p99, cpu_or_io_wait_ms, request_p99_ms`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# CPU Cache Locality and False Sharing Perspective Map\n\n## 이 문서가 맡는 질문\nCPU 사용률이 높아도 실제 병목은 연산이 아니라 cache line 이동일 수 있다. 여러 thread가 서로 다른 변수만 갱신해도 같은 cache line에 있으면 false sharing이 생긴다.\n\n## 빠른 분기\ncore는 바쁜데 throughput이 안 오르고 cache miss나 c2c hitm이 높으면 locality와 false sharing을 본다. JVM이면 object layout과 padding, off-heap 구조도 확인한다.\n\n## 실전 시나리오\n카운터 배열을 thread별로 나눴는데 thread 수를 늘릴수록 느려진다. index는 다르지만 인접한 long들이 같은 cache line에 올라 false sharing이 발생할 수 있다.\n\n## CS 배경\nCPU cache는 spatial/temporal locality를 이용한다. Cache coherence protocol은 core들이 같은 cache line의 최신 상태를 맞추도록 하지만, write가 빈번하면 cache line ownership이 core 사이를 계속 이동한다. NUMA에서는 memory locality까지 더해진다.\n\n## false sharing 코드 예시\n```java\nfinal class CounterCell {\n    volatile long value;\n    // @jdk.internal.vm.annotation.Contended 또는 padding으로 cache line 분리 검토\n}\n```\n`volatile`은 visibility를 주지만 false sharing을 없애지 않는다. 중요한 것은 서로 다른 thread가 갱신하는 값이 같은 cache line에 놓이지 않도록 layout을 조정하는 것이다.\n\n## 깊게 볼 포인트\nFalse sharing은 lock contention과 증상이 비슷하지만 처방이 다르다. lock을 없애도 cache line이 공유되면 느리고, padding을 넣으면 메모리 사용량이 늘어난다. JMH 없이는 micro optimization 결론을 내리기 어렵다.\n\n## 다음 행동\n1. thread별 hot write field와 object layout을 확인한다\n2. perf c2c, cache miss, HITM 같은 지표를 본다\n3. padding, sharding, batching 적용 전후를 JMH로 비교한다\n4. NUMA pinning이나 allocation locality를 의심한다\n\n## 확인 질문\n이 병목은 lock을 기다리는 것인가, 같은 cache line ownership을 core들이 서로 빼앗는 것인가?\n\n## 추가 확인: JOL과 배열 false sharing\nJVM 객체 layout은 추측하지 말고 JOL 같은 도구로 확인한다. `@Contended`를 쓰려면 일반적으로 JVM flag(`-XX:-RestrictContended`)와 module 접근 문제가 함께 따라온다. 배열에서도 `long[] counters`의 인접 원소를 thread별로 갱신하면 같은 cache line을 공유할 수 있으므로, field padding만 보고 끝내면 안 된다.\n\n## 판단 매트릭스\n- False sharing: 다른 변수 갱신인데 같은 cache line write로 c2c/HITM이 오른다\n- Poor locality: data 구조가 cache miss를 키워 memory stall이 늘어난다\n- NUMA: remote memory access가 tail latency를 키운다\n- 리뷰 질문: 최적화가 실제 workload와 같은 access pattern에서 측정되었는가\n\n## 측정 지표와 레이턴시\nthroughput, CPU cycles, cache miss rate, HITM/c2c, context switch, p95 operation latency를 본다. 품질은 correctness 유지, 성능은 throughput과 cycles/op, 레이턴시는 tail operation time으로 확인한다.\n\n## 자주 하는 오해\n- volatile을 쓰면 cache 문제가 해결된다고 본다\n- CPU가 높으니 계산량만 줄이면 된다고 본다\n- padding은 무조건 좋은 최적화라고 생각한다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 lock contention, false sharing, locality miss를 분리하고 cache line과 coherence 관점으로 설명해야 한다. 마지막에는 perf/JMH 지표로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. thread 수를 늘리며 throughput 곡선을 그린다\n2. perf/JFR/JMH로 cache miss와 allocation을 확인한다\n3. padding 또는 data layout 변경을 적용한다\n4. 메모리 사용량 증가와 throughput 개선을 같이 본다\n5. 실제 workload에서 p95가 좋아지는지 재측정한다\n\n이 루프를 지키면 CPU Cache Locality and False Sharing Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nCPU cache locality, cache line, false sharing, NUMA, perf c2c 관찰을 연결해 동시성 성능을 판단하는 OS perspective map이다.\n\n## 품질 관점\n커널 지표, 런타임 지표, 애플리케이션 trace를 같은 타임라인에 올려 원인을 분리한다. 이 문서의 답변 품질은 `CPU Cache Locality and False Sharing Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`syscall_rate, queue_depth_p99, cpu_or_io_wait_ms, request_p99_ms`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n\n## 운영 판단: lock contention처럼 보이는 cache-line 경합\n\nfalse sharing은 mutex를 잡고 기다리는 lock contention과 다르다. 코드에는 lock이 거의 없어 보여도 서로 다른 thread가 같은 cache line에 있는 다른 필드를 계속 쓰면 cache coherence protocol이 cache line ownership을 계속 옮긴다. 이때 CPU 사용률은 높고, thread 수를 늘렸는데 throughput은 오르지 않으며, p99 latency가 튈 수 있다.\n\n대표적인 함정은 thread별 counter array다. 논리적으로는 각 thread가 자기 index만 업데이트하므로 공유 상태가 없어 보인다. 하지만 인접한 counter가 같은 cache line에 있으면 물리적으로는 같은 line을 서로 invalidation한다. padding, `@Contended`, 구조체 재배치, per-core aggregation은 이 물리 경계를 줄이기 위한 선택지다.\n\n## 관측 순서\n\n먼저 blocking wait인지 CPU-bound coherence cost인지 나눈다. lock wait, park/unpark, blocked thread가 높으면 lock contention을 먼저 본다. 반대로 runnable thread가 많고 context switch보다 cache miss, HITM, LLC miss, remote NUMA access가 튀면 false sharing과 locality를 의심한다. Linux에서는 `perf c2c`, `perf stat`, flame graph, thread pinning 실험을 함께 본다. Java에서는 JMH 같은 microbenchmark와 production-like workload를 분리해 측정해야 한다.\n\n## 흔한 오해\n\n배열을 쓰면 항상 cache friendly하다는 말은 절반만 맞다. sequential read에는 강하지만 multi-writer update에서는 인접성이 오히려 false sharing을 만든다. 또한 padding은 만능 최적화가 아니다. memory footprint를 늘리고 cache pressure를 키울 수 있으므로, 실제 hot field와 write frequency를 확인한 뒤 적용해야 한다. 이 문서의 primary 답변은 \"락을 없앴다\"가 아니라 cache line ownership, locality, NUMA, 관측 지표를 함께 설명해야 한다.\n",
   "aliases": [
     "CPU cache false sharing locality",
     "false sharing cache line",
     "cache locality NUMA",
     "perf c2c HITM",
-    "CPU Cache Locality and False Sharing Perspective Map",
-    "cpu cache locality false sharing perspective map",
-    "CPU cache false sharing locality false sharing cache line cache locality NUMA"
+    "CPU 캐시 지역성",
+    "false sharing 락 경합 차이",
+    "cache line padding",
+    "NUMA thread pinning",
+    "Java false sharing p99",
+    "캐시라인 ping pong",
+    "thread scalability cache miss",
+    "multi core cache coherence"
   ],
   "expected_queries": [
     "false sharing은 lock contention이랑 어떻게 다르게 봐?",
     "CPU cache locality가 Java 성능에 왜 중요해?",
-    "thread 수를 늘렸는데 느려질 때 CPU cache locality랑 false sharing을 어떻게 의심해?"
+    "thread 수를 늘렸는데 느려질 때 CPU cache locality랑 false sharing을 어떻게 의심해?",
+    "counter를 thread별로 나눴는데도 p99가 튀면 같은 cache line을 공유하는 false sharing을 어떻게 확인해?",
+    "perf c2c에서 HITM이 높게 나오면 lock 문제와 cache line ping pong을 어떻게 구분해?",
+    "NUMA locality와 cache miss 때문에 코어를 늘려도 throughput이 안 오를 수 있는 이유가 뭐야?"
   ],
   "symptoms": [
     "volatile을 쓰면 cache 문제가 해결된다고 본다",
@@ -42,7 +50,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -55,6 +63,11 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch123",
+        "note": "Expanded low-level concurrency performance surfaces for batch123."
       }
     ]
   }

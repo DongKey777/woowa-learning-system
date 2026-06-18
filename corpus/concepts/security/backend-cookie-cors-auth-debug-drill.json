@@ -6,18 +6,25 @@
   "summary": "cookie/auth 문제는 저장됐나 -> 요청에 붙었나 -> 서버가 세션/principal로 복원했나 세 칸으로 먼저 자른다.",
   "body_markdown": "# Backend Cookie CORS Auth Debug Drill\n\n> 한 줄 요약: cookie/auth 문제는 `저장됐나 -> 요청에 붙었나 -> 서버가 세션/principal로 복원했나` 세 칸으로 먼저 자른다.\n\n**난이도: Beginner**\n\n## 풀이 기준\n\n브라우저 기반 백엔드 인증(cookie/session auth) 문제는 한 번에 CORS라고 부르면 오래 헤맨다. 먼저 쿠키가 저장됐는지(cookie stored), 다음 요청에 붙었는지(cookie attached), 서버가 세션이나 principal로 복원했는지(session restore)를 나눈다. DevTools의 Application 탭은 저장 여부를 보여주고, Network 탭의 request `Cookie` header는 실제 전송 여부를 보여준다. 둘은 같은 신호가 아니다.\n\nCORS는 브라우저가 cross-origin 응답을 읽도록 허용하는 정책이다. CORS가 막혀도 서버는 이미 `401`, `302`, `403`을 냈을 수 있고, 반대로 쿠키가 안 붙어서 서버가 anonymous로 본 결과가 CORS처럼 보일 수 있다. 그래서 로그인 응답의 `Set-Cookie`, 다음 요청의 `Cookie`, OPTIONS preflight, actual request, redirect, response CORS headers, request cache를 분리해 본다.\n\n## 기대 답변 축\n\n- `Set-Cookie`는 서버가 브라우저에게 저장을 요청한 response header이고, `Cookie`는 브라우저가 이후 요청에 실어 보낸 request header다.\n- Application 탭 cookie 존재는 저장 증거일 뿐 전송 증거가 아니다. 문제 API의 Network request headers에서 `Cookie`가 있는지 확인한다.\n- 저장 실패는 `Set-Cookie` blocked reason, `SameSite=None; Secure`, `Domain`, `Path`, `Expires/Max-Age`, HTTPS 여부를 먼저 본다.\n- 저장 후 미전송은 request URL과 cookie `Domain`/`Path`, scheme, same-site/cross-site 맥락, `Secure`, `SameSite`, fetch `credentials` 또는 axios `withCredentials`를 본다.\n- cross-origin cookie 인증은 client credentials 설정과 server CORS 응답이 같이 맞아야 한다. credentials 요청에는 `Access-Control-Allow-Credentials: true`와 wildcard가 아닌 구체 `Access-Control-Allow-Origin`이 필요하다.\n- `401`은 인증 없음/복원 실패, `302`는 browser login page redirect 또는 request cache saved request 흐름, `403`은 인증은 됐지만 인가/CSRF에서 막힘일 수 있다.\n- Network 패널에서 \"from disk cache\", \"from memory cache\", cached redirect, service worker 응답이면 새 서버 설정이 반영됐다고 단정하지 않는다.\n\n## 문제 1\n\n상황:\n\n```text\n로그인 응답에는 Set-Cookie가 있지만 Application 탭에는 저장되지 않는다.\n```\n\n답:\n\n저장 차단 단계다. `Set-Cookie`의 SameSite=None+Secure 조합, Domain/Path, 만료 시간, HTTPS 여부, Chrome blocked reason을 먼저 본다. localhost와 실제 도메인, http와 https가 섞였는지도 확인한다. 아직 request `Cookie` header나 서버 세션 복원을 볼 단계가 아니다.\n\n약한 답:\n\n```text\nSet-Cookie가 있으니까 서버는 정상이고 CORS만 풀면 된다.\n```\n\n이 답은 `Set-Cookie`가 저장됐는지 검증하지 않는다. 저장 차단이면 다음 요청에 `Cookie`가 생길 수 없다.\n\n## 문제 2\n\n상황:\n\n```text\nApplication 탭에는 session cookie가 있는데 API 요청의 Cookie header가 비어 있다.\n```\n\n답:\n\n저장 후 미전송 단계다. fetch credentials가 `include` 또는 필요한 값인지, SameSite 정책상 cross-site 요청에 붙을 수 있는지, Domain/Path가 요청 URL과 맞는지, Secure 쿠키를 http로 보내려는지 Network 요청 기준으로 확인한다. cookie가 보인다는 사실만으로 전송됐다고 보면 안 된다.\n\n확인 질문:\n\n```text\n요청 URL이 https://api.example.com/admin/reservations 일 때 cookie Domain이 app.example.com 이거나 Path가 /login 이면 붙을 수 있나?\n```\n\n답은 \"아니오\"다. Domain/Path가 요청 URL과 맞지 않으면 저장된 cookie라도 해당 요청의 `Cookie` header에 들어가지 않는다.\n\n## 문제 3\n\n상황:\n\n```text\nrequest Cookie header에는 session이 있는데 서버 응답은 401 또는 anonymous다.\n```\n\n답:\n\n서버 복원 단계다. session store에 해당 id가 있는지, SecurityContext가 저장되는지, gateway가 Cookie를 제거하지 않는지, custom filter가 principal을 덮어쓰지 않는지 본다. `401`은 인증 복원 실패일 수 있고, principal은 있는데 권한이 부족하면 `403`이다. CORS 설정만 계속 바꾸면 원인이 흐려진다.\n\n## 문제 4\n\n상황:\n\n```text\n브라우저 콘솔에는 CORS error만 보이고 Network에는 OPTIONS 204, 실제 요청 403이 보인다.\n```\n\n답:\n\npreflight는 통과했고 실제 요청에서 인가 실패가 난 장면일 수 있다. `Access-Control-Allow-Origin` 누락 때문에 브라우저가 응답 본문을 숨길 수 있지만, 서버 판정은 `403`이다. 서버 로그와 Network status를 근거로 authz 문제와 CORS 노출 문제를 따로 본다.\n\n## 문제 5\n\n상황:\n\n```text\n로그인 API는 200과 Set-Cookie를 내려준다.\n다음 cross-origin fetch는 credentials 옵션 없이 호출했고, 서버는\nAccess-Control-Allow-Origin: * 를 내려준다.\n브라우저에는 CORS credentials 관련 에러가 보인다.\n```\n\n답:\n\nclient와 server가 모두 credentials 인증 요청 계약을 만족하지 못했다. fetch/axios 쪽은 `credentials: \"include\"` 또는 `withCredentials: true`가 필요하고, 서버는 `Access-Control-Allow-Credentials: true`와 요청 origin을 구체적으로 echo해야 한다. credentials 요청에서 `Access-Control-Allow-Origin: *`는 맞는 응답이 아니다. 이 장면에서는 cookie 저장 여부, request `Cookie` header, actual response CORS header를 각각 캡처해야 한다.\n\n## 문제 6\n\n상황:\n\n```text\nAPI 호출이 302로 /login 으로 이동한다.\nfetch 응답은 HTML 로그인 페이지처럼 보이고, 다시 원래 URL로 돌아오며 login loop가 난다.\n```\n\n답:\n\n브라우저 API 호출에서 login page redirect가 노출된 장면일 수 있다. `401` JSON을 기대하는 API와 browser form login 흐름이 섞였는지 본다. Spring Security request cache가 원래 요청을 saved request로 저장하고 로그인 후 redirect하는 구성인지, API 요청이 authenticated entry point에서 `302`를 내리는지 확인한다. 이 문제를 CORS만으로 보면 `302 -> /login -> 200 HTML` 흐름을 놓친다.\n\n## 문제 7\n\n상황:\n\n```text\n서버 CORS 설정을 고쳤는데 DevTools Network에는 여전히 예전 302 또는 예전 CORS header가 보인다.\nSize 컬럼에는 from disk cache가 보인다.\n```\n\n답:\n\nrequest cache 또는 브라우저 캐시를 먼저 의심한다. Disable cache를 켠 상태에서 Network를 다시 찍고, hard reload, incognito, service worker bypass, preflight cache 만료를 확인한다. 서버 로그에 새 요청이 들어왔는지도 본다. 서버에 도달하지 않은 cached response를 보고 auth/CORS 설정이 아직 틀렸다고 판단하면 디버깅이 흔들린다.\n\n## 빠른 체크\n\n| 관찰 | 분기 |\n|---|---|\n| 로그인 response에 `Set-Cookie` 없음 | 서버가 저장 요청을 안 함 |\n| `Set-Cookie` blocked | 저장 차단 |\n| Application에는 있음, request `Cookie` 없음 | 저장 후 미전송 |\n| request `Cookie` 있음, 서버는 anonymous | 서버 복원 실패 |\n| OPTIONS에서 멈춤 | preflight/CORS 응답 먼저 |\n| OPTIONS 통과, actual `401` | 인증 없음 또는 cookie 미전송/복원 실패 |\n| OPTIONS 통과, actual `302` | login redirect/request cache 흐름 확인 |\n| OPTIONS 통과, actual `403` | 인가 실패 또는 CSRF 실패와 CORS 노출 분리 |\n| `from disk cache` / service worker | 새 서버 응답인지 검증 |\n\n## 흔한 오답\n\n| 오답 | 왜 틀렸나 |\n|---|---|\n| `Set-Cookie`가 보이니 cookie 전송은 성공했다 | 저장 요청과 request 전송을 섞었다 |\n| Application 탭에 cookie가 있으니 서버가 받은 것이다 | request `Cookie` header를 확인하지 않았다 |\n| `HttpOnly`라서 request에 cookie가 안 붙는다 | `HttpOnly`는 JS 접근 차단이지 브라우저 전송 차단이 아니다 |\n| CORS error니까 status code는 볼 필요 없다 | Network actual status가 `401/302/403`일 수 있다 |\n| `Access-Control-Allow-Origin: *`면 모든 CORS가 해결된다 | credentials 요청에서는 wildcard origin을 쓸 수 없다 |\n| 403이면 무조건 role 문제다 | CSRF token 누락/불일치도 403으로 보일 수 있다 |\n| 서버 설정을 바꿨으니 현재 Network 응답도 새 응답이다 | cache/service worker/preflight cache가 낡은 응답을 보여줄 수 있다 |\n\n## 검증 질문\n\n- 로그인 응답의 `Set-Cookie`와 다음 API 요청의 `Cookie`는 각각 어떤 방향의 헤더인가?\n- Application 탭에 보이는 cookie만으로 \"서버가 session id를 받았다\"고 말할 수 있나?\n- cross-origin cookie 인증에서 client credentials 설정과 server CORS header 중 하나만 맞으면 충분한가?\n- `SameSite=None`을 썼는데 `Secure`가 없거나 HTTP로 호출하면 어떤 단계에서 막히나?\n- request `Cookie`가 있는데 서버가 anonymous라면 browser CORS보다 어느 서버 경계를 먼저 봐야 하나?\n- Network에서 OPTIONS 204, actual 403이면 preflight 실패라고 말할 수 있나?\n- API 호출에서 302 login redirect가 보이면 `401` JSON API 계약과 request cache 흐름 중 무엇을 확인해야 하나?\n- `from memory cache` 또는 service worker 응답이면 서버 로그와 어떤 방식으로 대조해야 하나?\n\n## 약점 태그\n\n- `set-cookie-vs-cookie`: response 저장 요청과 request 전송 증거를 섞음\n- `application-tab-overread`: Application 탭만 보고 서버 수신을 단정함\n- `samesite-secure-domain-path`: SameSite/Secure/Domain/Path 매칭 조건을 빠뜨림\n- `credentials-cors-mix`: fetch credentials와 CORS credentials 응답을 한쪽만 봄\n- `cors-vs-auth-status`: CORS 노출 실패와 `401/302/403` 서버 판정을 섞음\n- `request-cache-blind`: cache/service worker/preflight cache 때문에 낡은 증거를 봄\n\n## 복습 포인트\n\n정답은 \"CORS 풀면 된다\"가 아니다. 저장, 전송, 복원, 인가, 브라우저 노출, cache 여부를 순서대로 말해야 한다. 각 단계마다 보는 탭과 헤더가 달라야 한다.\n",
   "aliases": [
-    "backend cookie cors auth debug drill",
+    "cookie auth DevTools drill",
     "cookie cors login loop drill",
     "DevTools cookie auth drill",
     "CORS cookie 401 403 drill",
-    "쿠키 CORS 인증 디버깅 드릴"
+    "쿠키 CORS 인증 디버깅 드릴",
+    "Set-Cookie vs Cookie header",
+    "Application tab cookie is not sent",
+    "SameSite None Secure credentials",
+    "OPTIONS 204 actual 403",
+    "request Cookie 있는데 anonymous",
+    "쿠키 저장 전송 복원"
   ],
   "expected_queries": [
     "cookie CORS auth 문제를 DevTools로 드릴하고 싶어",
     "Application에는 쿠키가 있는데 요청에는 안 붙는 문제를 연습해줘",
     "CORS 에러와 401 403을 어떻게 먼저 분리해야 해?",
     "login loop가 저장 차단인지 전송 누락인지 서버 익명 처리인지 문제로 풀어줘",
-    "spring-roomescape 인증 디버깅을 cookie request header 기준으로 연습하고 싶어"
+    "Set-Cookie는 보이는데 Application 탭에 저장되지 않을 때 CORS보다 먼저 뭘 봐?",
+    "OPTIONS는 204인데 actual request가 403이면 CORS 실패인지 CSRF 인가 실패인지 어떻게 나눠?"
   ],
   "symptoms": [
     "cookie가 있는데도 API가 anonymous로 보일 때 저장, 전송, 서버 복원 단계를 나누지 못한다",
@@ -45,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/backend-cookie-cors-auth-debug-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147"
+      }
+    ]
   }
 }

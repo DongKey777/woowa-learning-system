@@ -6,15 +6,20 @@
   "summary": "이 drill은 racingcar 랜덤 전진 조건을 deterministic test seam으로 복습한다.",
   "body_markdown": "# Racingcar Random Test Seam Drill\n\n## 질문\n\n`Car.move()` 안에서 `new Random().nextInt(10)`을 직접 호출하고, 4 이상이면 전진한다. 그래서 \"3이면 멈춤, 4이면 전진\" 테스트가 가끔 실패하거나 아예 작성하기 어렵다. 이 코드를 테스트 가능하게 바꾸는 방향을 설명해봐.\n\n추가로, 이 상황에서 \"Strategy 패턴을 적용한다\"와 \"테스트 seam을 만든다\"가 각각 무엇을 뜻하는지도 구분해봐. 패턴을 과하게 늘리지 않고 자동차 경주 미션 규모에 맞게 멈추는 기준까지 말하면 좋다.\n\n## 기대 답변 축\n\n좋은 답은 랜덤 숫자 생성(random number generation)과 자동차 상태 변경을 분리한다. `NumberGenerator`가 이번 턴의 숫자를 공급하고, `MoveStrategy` 또는 `MovePolicy`가 그 숫자로 전진 여부를 판단하게 만들 수 있다. 미션 규모가 작다면 `MoveStrategy.movable()` 하나로 합쳐도 된다. 핵심은 production에서는 실제 random 구현을 주입하고, 테스트에서는 `3`, `4`, `9`처럼 고정 값을 반환하는 fake/stub을 넣는 것이다.\n\n검증은 호출 횟수보다 결과 상태에 집중한다. 숫자 3을 주면 위치가 그대로이고, 4를 주면 한 칸 증가하고, 9를 줘도 한 턴에 한 칸만 증가해야 한다. 이때 `Car`는 랜덤 라이브러리를 몰라도 된다. `Car`가 지켜야 할 불변식(invariant)은 위치가 감소하지 않는 것, 한 번의 move가 허용된 범위만큼만 상태를 바꾸는 것, 이름이나 다른 자동차 상태를 건드리지 않는 것이다.\n\n리뷰에서 피해야 할 답은 static mock으로 `Random`을 억지로 고정하거나, production 코드에 `if (isTest)`를 넣는 것이다. 그 방식은 테스트를 작성할 수는 있어도 설계 경계가 나빠진다. 랜덤 이음새(test seam)를 만들면 전진 정책 테스트, 자동차 상태 테스트, 실제 랜덤 adapter 테스트를 분리해서 작고 빠르게 확인할 수 있다.\n\n## 좋은 답변 예시\n\n먼저 `Car`에서 랜덤 생성 책임을 제거한다. `Car`는 \"움직여도 되는지\"를 전달받아 위치를 바꾸는 객체로 두고, 랜덤 숫자를 뽑는 일은 `NumberGenerator`나 `MoveStrategy` 같은 협력 객체가 맡게 한다.\n\n```java\npublic interface NumberGenerator {\n    int generate();\n}\n\npublic final class MovePolicy {\n    private static final int MOVE_THRESHOLD = 4;\n\n    public boolean canMove(int number) {\n        return number >= MOVE_THRESHOLD;\n    }\n}\n```\n\n테스트에서는 실제 랜덤 대신 고정 값을 반환하는 대역을 넣는다.\n\n```java\nNumberGenerator generator = () -> 4;\nMovePolicy policy = new MovePolicy();\n\nassertThat(policy.canMove(generator.generate())).isTrue();\n```\n\n`Car` 자체는 더 작게 검증할 수 있다.\n\n```java\ncar.move(() -> true);\nassertThat(car.position()).isEqualTo(1);\n\ncar.move(() -> false);\nassertThat(car.position()).isEqualTo(1);\n```\n\n이 답의 핵심은 인터페이스 이름이 아니다. 같은 테스트를 100번 돌려도 결과가 변하지 않는 deterministic random seam을 만든다는 점, 그리고 `Car`가 랜덤 구현을 모르게 만든다는 점이다.\n\n## 채점 루브릭\n\n| 답변 요소 | 충분한 신호 | 부족한 신호 |\n|---|---|---|\n| 랜덤 경계 | random 생성 책임을 `Car` 밖으로 이동한다 | seed를 고정하거나 반복 실행으로 때운다 |\n| deterministic test | `3`, `4`, `9` 같은 고정 값 fake/stub을 넣는다 | 실제 `Random`을 그대로 쓰며 운에 맡긴다 |\n| Strategy 이해 | 바뀌는 전진 판단 규칙을 협력 객체로 둔다 | 패턴 이름만 말하고 책임 경계를 설명하지 못한다 |\n| 결과 검증 | 위치 변화와 boundary value를 확인한다 | `Random.nextInt()` 호출 횟수만 verify한다 |\n| 과설계 방지 | 함수형 인자나 작은 interface 하나로 멈춘다 | factory, registry, selector를 한꺼번에 만든다 |\n\n## 흔한 오답\n\n- \"`Random`에 seed를 주면 됩니다.\"\n  seed는 특정 실행을 재현하는 데 도움은 되지만, 도메인 객체가 랜덤 의존성을 숨긴 문제를 해결하지 않는다. 테스트는 여전히 구현 세부에 붙고, 원하는 boundary value를 직접 표현하기 어렵다.\n\n- \"static mock으로 `Randoms.pickNumberInRange()`를 고정합니다.\"\n  외부 라이브러리 호출을 잡는 테스트가 되어 설계 신호를 가린다. 자동차 경주 미션에서는 고정 숫자 fake나 `MoveStrategy` stub이 더 단순하다.\n\n- \"`Car` 생성자에 `boolean testMode`를 넣습니다.\"\n  production 코드가 테스트 사정을 알게 된다. seam은 테스트 전용 분기가 아니라 협력 객체 교체 지점이어야 한다.\n\n- \"`MoveStrategyFactory`와 `StrategyRegistry`를 만듭니다.\"\n  전진 정책이 하나뿐이면 과하다. 지금 필요한 것은 랜덤 통제와 책임 분리이지 전략 후보 관리 시스템이 아니다.\n\n## 추가 꼬리 질문\n\n1. `Car` 테스트와 `MovePolicy` 테스트를 왜 분리할까?\n2. `NumberGenerator` fake와 mock 중 어느 쪽이 이 미션에 더 자연스러울까?\n3. 숫자 `9`를 넣었을 때 \"한 칸만 전진\"을 확인하는 이유는 무엇일까?\n4. 실제 `RandomNumberGenerator`는 어떤 수준까지만 테스트하면 충분할까?\n\n기대 방향은 `Car`의 불변식과 랜덤 adapter의 범위를 분리해서 말하는 것이다. `RandomNumberGenerator`는 \"0 이상 9 이하를 반환한다\" 정도의 adapter contract만 확인하고, 모든 전진 시나리오는 deterministic fake로 검증하는 편이 안정적이다.\n\n## 약점 태그\n\n`randomness-boundary`, `fake-vs-mock`, `strategy`\n\n## 복습 연결 concept\n\n헷갈리면 `racingcar-random-number-generator-strategy-bridge`와 `test-double-choice-mission-chooser`를 이어서 본다.\n",
   "aliases": [
-    "racingcar random test seam drill",
-    "자동차 경주 랜덤 테스트 seam 드릴",
+    "racingcar random seam practice",
+    "자동차 경주 랜덤 테스트",
+    "랜덤 전진 테스트 드릴",
     "random generator strategy review drill",
-    "전진 조건 테스트 복습"
+    "전진 조건 테스트 복습",
+    "테스트 seam 전략 분리",
+    "고정값 fake 전진 정책"
   ],
   "expected_queries": [
-    "racingcar 랜덤 전진 테스트 설계 질문 내줘",
-    "Random 때문에 실패하는 테스트를 어떻게 고칠지 복습하고 싶어",
-    "전진 전략 분리 드릴 풀어볼래"
+    "자동차 경주에서 랜덤 때문에 테스트가 흔들리면 어떻게 분리해?",
+    "3이면 멈추고 4이면 전진하는 테스트를 어떻게 짜?",
+    "MoveStrategy랑 테스트 seam의 차이를 드릴로 확인하고 싶어",
+    "Random을 Car 안에서 직접 만들면 왜 테스트가 어려워?",
+    "fake 숫자 생성기로 전진 조건을 검증하는 연습 문제 줘"
   ],
   "symptoms": [
     "랜덤 값 때문에 테스트가 비결정적입니다",
@@ -41,6 +46,11 @@
     "created_at": "2026-05-24",
     "last_modified": "2026-05-24",
     "legacy_path": "knowledge/cs/contents/design-pattern/racingcar-random-test-seam-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch145"
+      }
+    ]
   }
 }

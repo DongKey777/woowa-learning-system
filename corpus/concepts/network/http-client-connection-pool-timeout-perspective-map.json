@@ -4,28 +4,24 @@
   "category": "network",
   "level": "intermediate",
   "summary": "HTTP client 성능 문제를 connection reuse, pool wait, connect/read timeout, stale idle connection, upstream queue 관점으로 나눈다. HTTP 호출이 느릴 때 서버가 느린지, client pool에서 기다리는지, connection 생성이 느린지, read timeout이 긴지, idle stale socket 재사용인지 구분한다.",
-  "body_markdown": "# HTTP Client Connection Pool, Timeout Perspective Map\n\n## 이 문서가 맡는 질문\nHTTP 호출이 느릴 때 서버가 느린지, client pool에서 기다리는지, connection 생성이 느린지, read timeout이 긴지, idle stale socket 재사용인지 구분한다.\n\n## 빠른 분기\npool wait metric이 크면 max connection과 pending acquire를 본다. connect timeout이면 DNS/TCP/TLS 경로를 본다. read timeout이면 upstream 처리나 response streaming을 본다. RST가 많으면 stale idle reuse를 본다.\n\n## 실전 시나리오\n외부 API 호출 p95가 2초인데 upstream server p95는 200ms라면 client 쪽 pending acquire를 의심한다. connection pool이 작거나 호출이 오래 걸려 pool slot을 점유하면 새 요청은 시작도 못 한다.\n\n## CS 배경\nHTTP keep-alive는 TCP/TLS handshake 비용을 줄이기 위해 connection을 재사용한다. Pool은 connection이라는 제한 자원을 queue로 관리한다. Timeout은 connect, TLS handshake, pool acquire, response read 등 단계별로 다르다.\n\n## 깊게 볼 포인트\ntimeout 하나만 설정하면 어디서 기다렸는지 모른다. Pool acquire timeout, connect timeout, response timeout, overall deadline을 분리해야 한다. Idle connection은 middlebox나 upstream이 먼저 닫았을 수 있어 validation과 max idle time이 필요하다.\n\n## 다음 행동\n1. client metric에서 acquire wait, active connection, idle connection을 본다. 2. DNS/connect/TLS/TTFB/TTLB waterfall을 분해한다. 3. timeout을 단계별로 설정한다. 4. retry가 pool exhaustion을 악화하지 않는지 본다.\n\n## 확인 질문\n느린 시간은 connection을 얻기 전 대기인가, 연결 수립인가, 서버 처리인가, 응답 body 수신인가?\n\n## 추가 예시\nWebClient pool pending queue가 쌓이면 CPU가 낮아도 API는 느리다. maxConnections만 늘리기 전에 upstream limit과 caller timeout budget을 같이 확인해야 한다.\n\n## 설정 예시\n```java\nHttpClient client = HttpClient.create(provider)\n    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 500)\n    .responseTimeout(Duration.ofMillis(1200));\nConnectionProvider provider = ConnectionProvider.builder(\"payment\")\n    .maxConnections(100)\n    .pendingAcquireTimeout(Duration.ofMillis(200))\n    .build();\n```\n이 예시는 connection 생성 timeout, pool acquire timeout, response timeout을 분리한다. 장애 분석에서는 `pending.connections`, `active.connections`, `responseTimeout` 발생 수를 같이 봐야 pool starvation과 downstream 지연을 구분할 수 있다.\n\n## 판단 매트릭스\n- Pool 근거: max connections, pending acquire count, pending acquire timeout, idle eviction을 본다.\n- Timeout 근거: connect, response, read, write, pool acquire timeout을 분리한다.\n- Retry 근거: retry가 connection starvation을 증폭하는지 total attempts와 queued requests를 확인한다.\n- 리뷰 질문: timeout이 요청 전체 budget을 지키는가, 아니면 pool 대기 뒤에 다시 긴 read timeout을 태우는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 pool acquire latency, active/idle connection, connect latency, TTFB, response timeout, reset count이다. 외부 API 레이턴시는 acquire/connect/TLS/TTFB/body로 나눠야 한다. pool acquire p95가 크면 서버 처리 전부터 기다린 것이다. \n\n## 자주 하는 오해\n- 서버가 느린 것과 client pool wait를 구분하지 못한다\n- timeout을 하나의 값으로만 본다\n- connection pool 크기를 무조건 늘리면 해결된다고 생각한다\n이 오해를 줄이려면 HTTP client timeout을 하나의 숫자로 보지 않는다. pool acquire에서 이미 대기한 요청이 read timeout까지 기다리면 caller p99는 각 단계의 합으로 커진다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 지연이 connection 생성, pool acquire, 서버 응답, body read 중 어디인지 분리한다. 그 다음 pool size, pending queue, timeout 계층, retry 정책을 설명한다. 마지막에는 성공률, 처리량, connection 재사용률, p95/p99 latency 변화를 품질/성능 기준으로 붙인다.\n\n## 실전 검증 루프\n1. max connection보다 높은 동시 요청을 넣고 pending acquire count와 timeout을 재현한다.\n2. connect/read/request/pool acquire timeout을 각각 낮춰 어떤 오류가 먼저 나는지 본다.\n3. retry를 켰을 때 total attempts와 pool 대기 시간이 얼마나 증가하는지 측정한다.\n4. downstream p95와 client p95를 비교해 client-side queueing을 분리한다.\n5. 설정 변경 후 throughput, error rate, p99, connection reuse ratio를 기록한다.\n\n이 루프를 지키면 HTTP client 문서는 timeout 옵션 목록이 아니라 resource pool과 tail latency를 연결하는 자료가 된다.\n\n## 품질 관점\n프로토콜 상태, timeout, retry, 중간 장비, client/server 관측값을 분리해 같은 증상을 재현한다. 이 문서의 답변 품질은 `HTTP Client Connection Pool, Timeout Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p99_ms, retransmit_or_retry_count, timeout_count, connection_reuse_ratio`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# HTTP Client Connection Pool, Timeout Perspective Map\n\n## 이 문서가 맡는 질문\n외부 API 호출이 느릴 때 upstream server가 느린지, HTTP client connection pool에서 기다리는지, DNS/TCP/TLS 연결 수립이 느린지, response read가 늦은지, stale idle socket 재사용 때문에 reset이 나는지 분리한다. 핵심은 HTTP timeout을 하나의 숫자로 보지 않고 pool acquire, connect, TLS, first byte, body read, overall deadline으로 나누는 것이다.\n\n## 빠른 분기\nclient p95는 높은데 upstream server p95가 낮으면 client-side queueing을 의심한다. `pending acquire`가 높으면 pool 크기, max pending, request concurrency, long read를 본다. connect timeout이면 DNS, TCP SYN, TLS handshake, proxy 경로를 본다. read timeout이면 upstream processing, response streaming, body size, backpressure를 본다. RST나 connection reset이 idle 직후 많으면 stale idle reuse와 keep-alive 정책을 본다.\n\n## 실전 시나리오\n결제 API 서버 p95는 200ms인데 우리 서비스의 결제 호출 p95는 2초다. 서버 로그만 보면 결제사는 빠르지만, 우리 WebClient에서는 pending acquire queue가 쌓이고 pool slot을 얻기까지 1.5초를 기다린다. connection pool이 작거나, read timeout이 긴 요청이 slot을 오래 점유하거나, retry가 같은 pool에 추가 요청을 밀어 넣으면 서버가 빠른데도 caller p99가 튄다.\n\n## timeout 계층\npool acquire timeout은 connection을 얻기 전 대기 상한이다. connect timeout은 TCP 연결 수립 상한이고, TLS handshake timeout은 보안 세션 수립 상한이다. response timeout 또는 read timeout은 요청을 보낸 뒤 응답을 기다리는 상한이다. overall deadline은 이 모든 단계를 합친 사용자 요청 수명이다. pool에서 이미 오래 기다린 요청이 다시 긴 read timeout을 태우면 caller budget을 쉽게 초과한다.\n\n## connection reuse와 stale idle\nkeep-alive는 TCP/TLS handshake 비용을 줄이지만, idle connection은 middlebox, load balancer, upstream server가 먼저 닫았을 수 있다. client가 닫힌 socket을 재사용하면 첫 write나 read에서 RST가 보일 수 있다. max idle time, eviction, validation, TCP keepalive, upstream idle timeout을 맞춰야 한다. stale reuse 문제를 retry로만 숨기면 tail latency와 duplicate attempt가 늘어난다.\n\n## pool size 판단\nmax connection을 무조건 늘리는 것은 답이 아니다. pool이 너무 작으면 pending acquire가 늘고, 너무 크면 upstream을 과도하게 압박하거나 connection churn이 커진다. 적정 크기는 동시 요청 수, 평균 service time, upstream concurrency limit, caller timeout budget, HTTP/1.1과 HTTP/2 사용 여부에 따라 달라진다. pool size 변경은 active/idle connection, pending acquire latency, upstream 429/503, caller p99를 같이 보고 판단한다.\n\n## 판단 매트릭스\n- pool wait 높음: active connection이 max에 붙고 pending queue가 증가한다. pool acquire timeout과 caller concurrency를 확인한다.\n- connect 지연: active connection은 부족하지 않은데 새 connection 생성이 늦다. DNS/TCP/TLS/proxy를 단계별로 본다.\n- read timeout: request는 보냈지만 first byte 또는 body 완료가 늦다. upstream service time과 response size를 비교한다.\n- reset 증가: idle 재사용 직후 RST가 난다. client max idle time과 upstream idle timeout 불일치를 본다.\n- retry 후 악화: total attempts가 늘며 pool wait도 같이 증가한다. retry budget과 backoff를 조정한다.\n\n## 측정 지표\n`pool_acquire_p95_ms`, `pending_acquire_count`, `active_connections`, `idle_connections`, `connect_latency_ms`, `tls_handshake_ms`, `ttfb_ms`, `ttlb_ms`, `response_timeout_count`, `connection_reset_count`, `connection_reuse_ratio`, `attempts_per_request`를 본다. 서버 p95와 client p95를 같은 trace id로 비교하면 client pool 대기와 upstream 처리 시간을 분리할 수 있다.\n\n## 검증 루프\n1. max connection보다 높은 동시 요청으로 pending acquire가 재현되는지 확인한다.\n2. pool acquire, connect, response timeout을 각각 낮춰 어떤 오류가 먼저 나는지 본다.\n3. upstream latency를 고정한 상태에서 retry를 켜고 total attempts와 pool wait 증가를 기록한다.\n4. upstream idle timeout보다 client max idle time을 길게 둔 뒤 stale socket reset을 재현한다.\n5. 설정 변경 후 throughput, error rate, connection reuse ratio, caller p99가 함께 개선되는지 확인한다.\n\n## 자주 하는 오해\n- 서버가 느린 것과 client pool wait를 구분하지 못한다.\n- timeout을 하나의 값으로만 설정하면 충분하다고 생각한다.\n- connection pool 크기를 늘리면 항상 해결된다고 본다.\n- retry가 pool starvation을 완화한다고 기대한다.\n- keep-alive connection은 살아 있으면 항상 재사용해도 안전하다고 생각한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 먼저 지연이 pool acquire, connect/TLS, upstream processing, response body read, stale idle reuse 중 어디인지 분류해야 한다. 그 다음 timeout 계층, pool sizing 근거, retry amplification, idle eviction 정책을 연결한다. 마지막에는 pool acquire p95, active/idle connection, TTFB/TTLB, reset count, connection reuse ratio로 검증 계획을 제시한다.\n\n## 한 줄 정리\nHTTP client 지연은 서버 처리 시간만으로 설명되지 않으며, connection pool이라는 제한 자원과 단계별 timeout을 분리해야 tail latency를 줄일 수 있다.\n",
   "aliases": [
-    "HTTP client connection pool timeout",
-    "connection pool wait HTTP",
-    "HTTP 커넥션 풀 타임아웃",
-    "keep alive stale idle",
+    "HTTP pool wait",
+    "커넥션 풀 대기",
     "pool acquire timeout",
-    "connect read response timeout",
-    "upstream queue latency",
-    "pending acquire WebClient",
-    "HTTP client p95 slow",
-    "stale socket RST",
-    "HTTP client connection pool acquire timeout connect read TTFB stale idle"
+    "HTTP 타임아웃 분리",
+    "stale idle socket",
+    "keep alive 재사용",
+    "WebClient pending acquire",
+    "connect read timeout",
+    "client-side queueing"
   ],
   "expected_queries": [
-    "HTTP client connection pool timeout을 어떻게 구분해?",
-    "pool acquire timeout과 read timeout 차이가 뭐야?",
-    "HTTP keep-alive connection reuse가 느린 API와 무슨 관련이 있어?",
-    "CPU는 낮은데 외부 API 호출이 느릴 때 어디를 봐?",
-    "stale idle connection 때문에 RST가 나는 흐름을 설명해줘",
-    "WebClient pending acquire가 쌓이면 어떻게 판단해?",
-    "외부 API가 느린데 서버는 빠르면 HTTP client connection pool timeout 중 어디를 봐?"
+    "외부 API 서버는 빠른데 우리 HTTP client 호출만 느리면 어디를 봐야 해?",
+    "pool acquire timeout과 connect timeout과 read timeout은 어떻게 달라?",
+    "WebClient pending acquire가 쌓일 때 connection pool 크기만 늘리면 돼?",
+    "idle connection 재사용 후 RST가 날 때 어떤 설정을 확인해야 해?",
+    "retry가 HTTP connection pool 고갈을 더 심하게 만들 수 있어?"
   ],
   "symptoms": [
     "서버가 느린 것과 client pool wait를 구분하지 못한다",
@@ -54,7 +50,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +63,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

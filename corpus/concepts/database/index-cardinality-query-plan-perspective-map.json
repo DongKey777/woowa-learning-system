@@ -4,28 +4,26 @@
   "category": "database",
   "level": "intermediate",
   "summary": "인덱스 문제를 B-tree 탐색, 선택도/cardinality, 실행 계획, 정렬/커버링, 통계 stale 관점으로 나누는 perspective map이다. “인덱스를 탔는데도 느림”, “EXPLAIN이 바뀜”, “where 조건이 있는데 full scan” 같은 질문을 구조화한다.",
-  "body_markdown": "# Index, Cardinality, Query Plan Perspective Map\n\n## 이 문서가 맡는 질문\n인덱스는 단순히 있으면 빠른 장치가 아니다. 어떤 access path를 줄이는지, 조건의 선택도가 충분한지, 정렬과 limit에 도움이 되는지, optimizer 통계가 맞는지, covering index가 필요한지로 나눠 봐야 한다. 실행 계획은 DB가 선택한 알고리즘의 증거다.\n\n## 빠른 분기\n조건이 많은데도 느리면 선택도와 leading column을 본다. 정렬이 느리면 ORDER BY와 index order를 본다. count query가 느리면 pagination/count 분리를 본다. 갑자기 계획이 바뀌면 통계, parameter skew, data distribution을 본다.\n\n## 실전 시나리오\n예약 목록에서 `theme_id`, `date`, `start_time`으로 조회하고 `start_time` 정렬을 한다고 하자. `(date, theme_id)` index가 있어도 정렬에 추가 sort가 생길 수 있고, `theme_id`가 거의 모든 row에 같은 값이면 선택도가 낮아 도움이 적다. EXPLAIN에서 rows, filtered, key, extra를 보고 index range scan인지 filesort인지 구분한다.\n\n## CS 배경\nB-tree index는 key order를 유지해 point lookup과 range scan을 빠르게 한다. Cardinality는 값의 다양성이고 selectivity는 조건이 얼마나 적은 row를 남기는지다. Optimizer는 통계와 비용 모델로 access path를 고른다. Covering index는 필요한 컬럼이 index에 모두 있어 table lookup을 줄인다. 하지만 index는 write 비용과 storage 비용을 만든다.\n\n## 깊게 볼 포인트\n복합 인덱스는 왼쪽 prefix와 equality/range 조건의 순서가 중요하다. `where a = ? and b between ? and ? order by c`는 index column 순서에 따라 range 이후 column이 정렬에 덜 쓰일 수 있다. Low-cardinality column도 다른 조건과 결합하면 유효할 수 있다. EXPLAIN은 답이 아니라 가설 검증 도구라 실제 rows examined와 slow query log를 함께 봐야 한다.\n\n## 다음 행동\n1. 쿼리의 필터, 정렬, limit을 분리한다. 2. 후보 인덱스의 leading column과 selectivity를 본다. 3. EXPLAIN과 실제 실행 통계를 비교한다. 4. read 성능 이득과 write/storage 비용을 함께 판단한다.\n\n## 확인 질문\n이 인덱스는 row를 적게 찾게 해 주는가, 정렬을 없애 주는가, table lookup을 줄여 주는가?\n\n## 추가 예시\n`status = ACTIVE`가 95%인 테이블에서 status 단독 index는 도움이 작을 수 있다. 하지만 `(status, created_at)`으로 최근 ACTIVE 20개만 찾는 query라면 정렬과 limit 때문에 가치가 생길 수 있다.\n\n## 판단 매트릭스\n- Plan 근거: EXPLAIN/EXPLAIN ANALYZE의 estimated rows, actual rows, filter, sort, index condition을 같이 본다.\n- 선택도 근거: cardinality가 높은 leading column인지, 복합 인덱스 순서가 where/order by/limit와 맞는지 확인한다.\n- 나쁜 predicate 신호: function wrapping, leading wildcard, implicit cast처럼 sargable하지 않은 조건은 인덱스를 약화한다.\n- 리뷰 질문: 이 인덱스는 읽기 레이턴시를 줄이지만 쓰기 비용, 저장공간, 통계 갱신 비용을 얼마나 늘리는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 query latency p50/p95, rows examined, rows returned, buffer read, filesort/temp table, plan hash이다. EXPLAIN 추정 rows와 실제 rows examined 차이를 본다. 레이턴시는 평균보다 slow query p95, p99와 계획 변경 시점이 중요하다. \n\n## 자주 하는 오해\n- 인덱스가 존재하면 무조건 빠르다고 생각한다\n- 카디널리티와 선택도를 구분하지 못한다\n- EXPLAIN 결과를 실제 실행 통계 없이 확정 답으로 본다\n이 오해를 줄이려면 쿼리 텍스트와 인덱스 이름만 보지 말고 실제 실행 계획의 row estimate 오차를 본다. 통계가 오래되었거나 데이터 분포가 치우치면 같은 인덱스라도 선택이 달라질 수 있다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 slow query가 filter 문제인지 sort 문제인지 join 순서 문제인지 나눈다. 그 다음 cardinality, leading column, covering index, non-sargable predicate, stale stats를 근거로 plan을 설명한다. 마지막에는 인덱스 추가가 품질, 쓰기 성능, 조회 레이턴시에 미치는 trade-off를 붙인다.\n\n## 실전 검증 루프\n1. 동일한 데이터 규모에서 EXPLAIN ANALYZE로 estimated rows와 actual rows를 기록한다.\n2. predicate를 sargable하게 바꾸거나 복합 인덱스 순서를 조정해 plan 변화를 본다.\n3. sort/filesort/temp table 발생 여부와 limit이 인덱스로 처리되는지 확인한다.\n4. p50/p95 query latency, rows examined, buffer hit, write latency 변화를 함께 비교한다.\n5. 새 인덱스가 다른 쿼리와 write path에 만든 비용을 회귀 테스트와 운영 지표로 남긴다.\n\n이 루프를 지키면 인덱스 문서는 “인덱스 추가” 처방이 아니라 cost-based optimizer를 읽는 훈련 자료가 된다.\n\n## 품질 관점\n정합성, isolation, lock/plan/replication failure mode를 테스트와 실행 계획으로 함께 검증한다. 이 문서의 답변 품질은 `Index, Cardinality, Query Plan Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`query_p95_ms, lock_wait_p99_ms, rows_examined, plan_hash_change_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# Index, Cardinality, Query Plan Perspective Map\n\n## 이 문서가 맡는 질문\n인덱스는 단순히 있으면 빠른 장치가 아니다. 어떤 access path를 줄이는지, 조건의 선택도가 충분한지, 정렬과 limit에 도움이 되는지, optimizer 통계가 맞는지, covering index가 필요한지로 나눠 봐야 한다. 실행 계획은 DB가 선택한 알고리즘의 증거다.\n\n## 빠른 분기\n조건이 많은데도 느리면 선택도와 leading column을 본다. 정렬이 느리면 ORDER BY와 index order를 본다. count query가 느리면 pagination/count 분리를 본다. 갑자기 계획이 바뀌면 통계, parameter skew, data distribution을 본다.\n\n## 실전 시나리오\n예약 목록에서 `theme_id`, `date`, `start_time`으로 조회하고 `start_time` 정렬을 한다고 하자. `(date, theme_id)` index가 있어도 정렬에 추가 sort가 생길 수 있고, `theme_id`가 거의 모든 row에 같은 값이면 선택도가 낮아 도움이 적다. EXPLAIN에서 rows, filtered, key, extra를 보고 index range scan인지 filesort인지 구분한다.\n\n## CS 배경\nB-tree index는 key order를 유지해 point lookup과 range scan을 빠르게 한다. Cardinality는 값의 다양성이고 selectivity는 조건이 얼마나 적은 row를 남기는지다. Optimizer는 통계와 비용 모델로 access path를 고른다. Covering index는 필요한 컬럼이 index에 모두 있어 table lookup을 줄인다. 하지만 index는 write 비용과 storage 비용을 만든다.\n\n## 깊게 볼 포인트\n복합 인덱스는 왼쪽 prefix와 equality/range 조건의 순서가 중요하다. `where a = ? and b between ? and ? order by c`는 index column 순서에 따라 range 이후 column이 정렬에 덜 쓰일 수 있다. Low-cardinality column도 다른 조건과 결합하면 유효할 수 있다. EXPLAIN은 답이 아니라 가설 검증 도구라 실제 rows examined와 slow query log를 함께 봐야 한다.\n\n## 다음 행동\n1. 쿼리의 필터, 정렬, limit을 분리한다. 2. 후보 인덱스의 leading column과 selectivity를 본다. 3. EXPLAIN과 실제 실행 통계를 비교한다. 4. read 성능 이득과 write/storage 비용을 함께 판단한다.\n\n## 확인 질문\n이 인덱스는 row를 적게 찾게 해 주는가, 정렬을 없애 주는가, table lookup을 줄여 주는가?\n\n## 추가 예시\n`status = ACTIVE`가 95%인 테이블에서 status 단독 index는 도움이 작을 수 있다. 하지만 `(status, created_at)`으로 최근 ACTIVE 20개만 찾는 query라면 정렬과 limit 때문에 가치가 생길 수 있다.\n\n## 판단 매트릭스\n- Plan 근거: EXPLAIN/EXPLAIN ANALYZE의 estimated rows, actual rows, filter, sort, index condition을 같이 본다.\n- 선택도 근거: cardinality가 높은 leading column인지, 복합 인덱스 순서가 where/order by/limit와 맞는지 확인한다.\n- 나쁜 predicate 신호: function wrapping, leading wildcard, implicit cast처럼 sargable하지 않은 조건은 인덱스를 약화한다.\n- 리뷰 질문: 이 인덱스는 읽기 레이턴시를 줄이지만 쓰기 비용, 저장공간, 통계 갱신 비용을 얼마나 늘리는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 query latency p50/p95, rows examined, rows returned, buffer read, filesort/temp table, plan hash이다. EXPLAIN 추정 rows와 실제 rows examined 차이를 본다. 레이턴시는 평균보다 slow query p95, p99와 계획 변경 시점이 중요하다. \n\n## 자주 하는 오해\n- 인덱스가 존재하면 무조건 빠르다고 생각한다\n- 카디널리티와 선택도를 구분하지 못한다\n- EXPLAIN 결과를 실제 실행 통계 없이 확정 답으로 본다\n이 오해를 줄이려면 쿼리 텍스트와 인덱스 이름만 보지 말고 실제 실행 계획의 row estimate 오차를 본다. 통계가 오래되었거나 데이터 분포가 치우치면 같은 인덱스라도 선택이 달라질 수 있다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 slow query가 filter 문제인지 sort 문제인지 join 순서 문제인지 나눈다. 그 다음 cardinality, leading column, covering index, non-sargable predicate, stale stats를 근거로 plan을 설명한다. 마지막에는 인덱스 추가가 품질, 쓰기 성능, 조회 레이턴시에 미치는 trade-off를 붙인다.\n\n## 실전 검증 루프\n1. 동일한 데이터 규모에서 EXPLAIN ANALYZE로 estimated rows와 actual rows를 기록한다.\n2. predicate를 sargable하게 바꾸거나 복합 인덱스 순서를 조정해 plan 변화를 본다.\n3. sort/filesort/temp table 발생 여부와 limit이 인덱스로 처리되는지 확인한다.\n4. p50/p95 query latency, rows examined, buffer hit, write latency 변화를 함께 비교한다.\n5. 새 인덱스가 다른 쿼리와 write path에 만든 비용을 회귀 테스트와 운영 지표로 남긴다.\n\n이 루프를 지키면 인덱스 문서는 “인덱스 추가” 처방이 아니라 cost-based optimizer를 읽는 훈련 자료가 된다.\n\n## 실행 계획을 DB별로 읽는 법\nMySQL에서는 `EXPLAIN`의 `type`, `key`, `rows`, `filtered`, `Extra`를 함께 본다. `key`가 찍혔다고 끝이 아니라 `rows`가 너무 크거나 `Extra`에 `Using filesort`, `Using temporary`가 있으면 정렬/임시 테이블 비용이 남아 있을 수 있다. MySQL 8의 `EXPLAIN ANALYZE`를 쓸 수 있으면 estimated rows와 actual rows 차이를 같이 본다. 추정이 크게 틀리면 인덱스 자체보다 통계, histogram, data skew가 문제일 수 있다.\n\nPostgreSQL에서는 `Seq Scan`, `Index Scan`, `Bitmap Heap Scan`, `Nested Loop`, `Hash Join` 같은 node를 cost와 actual row/time으로 비교한다. `Bitmap Heap Scan`은 인덱스를 쓰지만 heap page 재방문 비용이 남을 수 있고, `Seq Scan`이 항상 나쁜 것도 아니다. 테이블 대부분을 읽어야 하거나 조건 선택도가 낮으면 sequential scan이 더 싸게 계산될 수 있다. 따라서 \"인덱스를 타게 만들기\"가 아니라 \"이 쿼리의 rows examined와 sort/join 비용을 줄이기\"가 목표다.\n\n## 복합 인덱스 판단 규칙\n복합 인덱스는 equality 조건, range 조건, ordering, covering 요구를 순서대로 본다. 보통 equality로 많이 줄이는 컬럼을 앞에 두고, range가 나온 뒤의 컬럼은 추가 필터나 정렬에 제한적으로만 쓰일 수 있다. `WHERE member_id = ? AND created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT 20`은 `(member_id, created_at)`이 후보가 되지만, `ORDER BY price`까지 붙으면 같은 인덱스로 정렬을 해결하지 못할 수 있다.\n\nLow-cardinality 컬럼도 단독으로는 약하지만 다른 축과 결합하면 의미가 생긴다. `status='ACTIVE'`가 95%라면 status 단독 index는 거의 도움이 없지만, `(status, created_at)`으로 최신 ACTIVE 20개만 읽는 쿼리는 limit과 정렬 때문에 유리해질 수 있다. 반대로 함수로 감싼 predicate, leading wildcard, 암묵적 타입 변환은 sargability를 떨어뜨려 좋은 인덱스가 있어도 access path를 망칠 수 있다.\n\n## 운영에서 plan 변화를 의심하는 신호\n갑자기 느려진 쿼리는 코드 변경보다 데이터 분포 변화가 원인일 때가 많다. tenant별 row 수가 치우치거나 특정 status가 급증하면 optimizer의 평균 통계가 실제 요청을 잘 설명하지 못한다. 이때는 plan hash, slow query sample, bind parameter 값, rows examined/returned 비율을 같이 남겨야 한다. 새 인덱스를 추가한 뒤 다른 쿼리의 plan이 바뀌거나 write latency가 올라가는지도 함께 봐야 한다. 인덱스는 읽기 최적화인 동시에 write path에 추가 유지 비용을 만드는 DB 구조물이기 때문이다.\n\n## 품질 관점\n정합성, isolation, lock/plan/replication failure mode를 테스트와 실행 계획으로 함께 검증한다. 이 문서의 답변 품질은 `Index, Cardinality, Query Plan Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`query_p95_ms, lock_wait_p99_ms, rows_examined, plan_hash_change_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
   "aliases": [
-    "index cardinality query plan",
-    "인덱스 카디널리티 실행 계획",
-    "EXPLAIN perspective map",
-    "B-tree selectivity optimizer",
-    "covering index sort limit",
-    "index 타는데 느림",
-    "query plan 바뀜",
-    "database index chooser",
-    "rows filtered key extra",
+    "인덱스 카디널리티",
+    "실행 계획 읽기",
+    "EXPLAIN rows filtered",
     "복합 인덱스 순서",
-    "index cardinality query plan EXPLAIN rows filtered covering sort limit"
+    "선택도 카디널리티 차이",
+    "인덱스 탔는데 느림",
+    "covering index sort limit",
+    "optimizer stats skew",
+    "query plan change",
+    "rows examined 줄이기"
   ],
   "expected_queries": [
-    "인덱스 cardinality 실행 계획을 같이 봐야 하는 이유가 뭐야?",
-    "인덱스를 탔는데도 쿼리가 느릴 때 어디를 봐?",
-    "복합 인덱스 column 순서는 어떻게 판단해?",
-    "EXPLAIN에서 key rows filtered extra를 어떻게 해석해?",
-    "low cardinality 컬럼에도 인덱스가 필요할 수 있어?",
-    "정렬과 limit 때문에 인덱스가 빨라지는 흐름을 설명해줘",
-    "인덱스를 탔는데도 쿼리가 느릴 때 cardinality와 query plan을 어떻게 봐?"
+    "인덱스를 탔는데도 쿼리가 느릴 때 어디를 봐야 해?",
+    "카디널리티와 선택도는 실행 계획에서 어떻게 다르게 쓰여?",
+    "복합 인덱스 컬럼 순서는 where와 order by 중 무엇을 기준으로 정해?",
+    "EXPLAIN의 rows, filtered, key, Extra를 어떻게 해석하면 좋아?",
+    "low cardinality 컬럼도 인덱스가 도움이 되는 경우가 있어?",
+    "쿼리 계획이 갑자기 바뀌었을 때 통계와 데이터 분포를 어떻게 확인해?"
   ],
   "symptoms": [
     "인덱스가 존재하면 무조건 빠르다고 생각한다",
@@ -54,7 +52,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +65,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

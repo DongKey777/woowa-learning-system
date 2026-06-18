@@ -1,0 +1,63 @@
+{
+  "id": "operating-system/linux-server-first-debug-checklist-primer",
+  "title": "Linux 서버 첫 디버깅 체크리스트",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "배포된 Linux/EC2 서버에서 앱이 안 된다고 느껴질 때는 EC2 보안 그룹부터 뒤지기보다 서버 안에서 프로세스가 살아 있는지, 포트를 실제로 LISTEN 중인지, localhost curl이 되는지, systemd 서비스 상태와 journal 로그가 무엇을 말하는지, 실행 계정의 환경 변수와 profile, 파일 권한, OS firewall 증상을 순서대로 확인한다.",
+  "body_markdown": "# Linux 서버 첫 디버깅 체크리스트\n\n> 한 줄 요약: 배포 서버 안에서는 `ps` -> `ss` 또는 `lsof` -> `curl localhost` -> `systemctl` -> `journalctl`/`tail` -> env/profile -> 권한 -> OS firewall 순서로 보면 원인을 빠르게 좁힐 수 있다.\n>\n> 문서 역할: 이 문서는 EC2 public IP, security group, subnet 같은 AWS 바깥 경로를 설명하는 문서가 아니다. SSH로 서버 안에 들어온 뒤, Linux 안에서 앱 프로세스와 포트, 로그, 실행 환경을 처음 점검하는 beginner 체크리스트다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Spring Boot 실행형 jar EC2 배포 Runbook](../spring/spring-boot-executable-jar-ec2-runbook.md)\n- [EC2 스프링부트 public-ip:8080 접속 실패 원인 라우터](../network/ec2-spring-boot-public-access-cause-router.md)\n- [Shell Job-Control Command Bridge](./shell-job-control-command-bridge.md)\n- [파일 디스크립터 기초](./file-descriptor-basics.md)\n\nretrieval-anchor-keywords: Linux 서버 첫 디버깅, EC2 서버 안에서 확인, process alive ps, ss ltnp port listening, lsof port listen, curl localhost, systemctl status, journalctl -u, tail app.log, env profile 확인, chmod chown permission denied, UFW firewall symptom, connection refused vs timeout server inside, Spring Boot EC2 Linux triage\n\n## 먼저 잡는 멘탈 모델\n\n초보자가 배포 서버에서 가장 많이 헤매는 이유는 모든 실패를 한 문장으로 부르기 때문이다. 브라우저에서 안 열린다, API가 안 된다, 서버가 죽었다, 배포가 안 됐다가 모두 같은 말처럼 들린다. 하지만 서버 안에서 보면 최소한 아래 네 층이 따로 있다.\n\n| 층 | 확인 질문 | 대표 명령 | 실패 모양 |\n|---|---|---|---|\n| 프로세스 | 앱이 실제로 살아 있나 | `ps`, `systemctl status` | PID가 없거나 계속 재시작됨 |\n| 포트 | 그 프로세스가 포트를 듣고 있나 | `ss`, `lsof` | LISTEN 없음, 다른 포트, 다른 프로세스 점유 |\n| 로컬 HTTP | 서버 자기 자신에서 요청이 되나 | `curl 127.0.0.1` | refused, 404, 500, timeout |\n| 실행 환경 | 서비스로 띄울 때 설정과 권한이 맞나 | `journalctl`, `env`, `tail`, `chmod`, `chown` | profile 누락, 파일 못 읽음, 로그 못 씀 |\n\n이 문서의 핵심은 명령어를 외우는 것이 아니라, **각 명령이 어느 층의 증거를 주는지**를 구분하는 것이다. `curl localhost`가 실패하는데 보안 그룹을 고치는 것은 순서가 맞지 않다. 반대로 `curl localhost`는 성공하고 외부에서만 timeout이면 이 문서의 바깥, 즉 public IP와 security group 문서로 넘기는 편이 맞다.\n\n## 0단계: 지금 서버에서 보는 것이 맞는지 확인\n\n처음에는 내가 어느 서버에 접속했는지부터 확인한다. 배포 대상이 여러 대이거나 EC2를 새로 만들었다면 엉뚱한 인스턴스에서 열심히 디버깅할 수 있다.\n\n```bash\nhostname\nwhoami\npwd\ndate\nip -br addr\n```\n\n`whoami`는 중요하다. SSH로 접속한 계정과 systemd 서비스가 실행하는 계정이 다를 수 있기 때문이다. 터미널에서는 `ubuntu` 계정으로 잘 되는데 서비스에서는 `app` 계정으로 실행되어 파일을 못 읽는 일이 흔하다.\n\n## 1단계: 프로세스가 살아 있는지 본다\n\n먼저 앱 프로세스가 있는지 본다. Spring Boot jar라면 Java 프로세스가 보일 수 있고, Node, Python, Nginx 같은 다른 프로세스일 수도 있다.\n\n```bash\nps -ef | grep '[j]ava'\nps -ef | grep '[m]yapp'\nps -p <pid> -o pid,ppid,user,stat,etime,cmd\n```\n\n판별은 간단하게 시작한다.\n\n| 결과 | 해석 | 다음 행동 |\n|---|---|---|\n| PID가 없다 | 앱이 안 떠 있거나 바로 죽었다 | 로그와 서비스 상태를 본다 |\n| PID는 있는데 `etime`이 몇 초마다 작다 | 계속 재시작 중일 수 있다 | `systemctl status`, `journalctl`을 본다 |\n| PID는 있는데 CPU만 높고 응답이 없다 | 내부 hang, GC, deadlock, 외부 의존성 대기 가능성 | 로그와 thread dump 같은 후속 진단으로 간다 |\n| 예전 jar 경로가 보인다 | 배포한 버전이 아닌 프로세스일 수 있다 | 실행 command와 현재 release 경로를 맞춘다 |\n\n`ps`는 프로세스 생존의 증거일 뿐이다. PID가 있다고 해서 HTTP 요청을 받을 준비가 끝났다는 뜻은 아니다. 다음은 반드시 포트다.\n\n## 2단계: 포트가 실제로 LISTEN 중인지 본다\n\n서버 앱은 결국 어떤 주소와 포트를 듣고 있어야 한다. Linux에서는 `ss`가 기본 도구이고, 설치되어 있다면 `lsof`도 좋다.\n\n```bash\nsudo ss -ltnp\nsudo ss -ltnp | grep ':8080'\nsudo lsof -iTCP:8080 -sTCP:LISTEN -n -P\n```\n\n초보자는 출력에서 세 가지만 읽으면 된다.\n\n| 볼 것 | 예시 | 의미 |\n|---|---|---|\n| 상태 | `LISTEN` | 서버가 연결을 받을 준비가 된 상태 |\n| 주소 | `127.0.0.1:8080`, `0.0.0.0:8080` | localhost만 듣는지 모든 IPv4 인터페이스를 듣는지 |\n| 프로세스 | `java`, `nginx`, PID | 누가 그 포트를 잡고 있는지 |\n\n`127.0.0.1:8080`은 서버 자기 자신에서만 직접 접근 가능하다는 뜻이다. Nginx가 같은 서버에서 프록시하는 구조라면 자연스러울 수 있다. direct로 public-ip:8080을 열려는 구조라면 보통 `0.0.0.0:8080`이나 해당 private IP에 bind되어야 한다.\n\n아무것도 안 나오면 앱이 포트를 안 열었거나 다른 포트로 떴다. 이때는 `server.port`, 실행 옵션, 로그의 `Tomcat started on port` 같은 문장을 본다. `Address already in use`가 로그에 있으면 이전 프로세스나 다른 서비스가 포트를 점유한 것이다.\n\n## 3단계: 서버 안에서 `curl localhost`를 먼저 한다\n\n포트가 열려 보이면 서버 내부에서 HTTP 요청을 보낸다. 여기서는 public IP가 아니라 loopback을 먼저 본다.\n\n```bash\ncurl -i http://127.0.0.1:8080/\ncurl -i http://127.0.0.1:8080/actuator/health\ncurl -v --connect-timeout 3 http://127.0.0.1:8080/\n```\n\n결과 해석은 이렇게 한다.\n\n| curl 결과 | 의미 | 먼저 볼 곳 |\n|---|---|---|\n| `Connection refused` | 그 주소:포트에 listener가 없다 | `ss`, 앱 포트, 프로세스 생존 |\n| `Connection timed out` | 로컬에서는 드물다. 방화벽, 잘못된 주소, 앱 accept 지연을 의심 | `ss`, firewall, 앱 hang |\n| `HTTP 404` | 네트워크와 서버는 도달했다. 경로가 없을 수 있다 | Controller path, context path |\n| `HTTP 500` | 앱까지 도달했고 내부 예외가 났다 | 애플리케이션 로그 |\n| `HTTP 200` 또는 health `UP` | 서버 내부 앱 경계는 통과했다 | 외부 접속 문제면 EC2 네트워크 문서로 넘긴다 |\n\n여기서 중요한 습관은 `localhost`의 위치다. EC2 안에서 친 `localhost`는 EC2 자신이고, 내 노트북에서 친 `localhost`는 내 노트북 자신이다. 배포 서버 내부 진단은 SSH로 들어간 터미널에서 실행해야 한다.\n\n## 4단계: systemd 서비스 상태를 본다\n\n학습 단계에서는 `nohup java -jar ... &`로 띄우기도 하지만, 배포 서버에서는 systemd 서비스로 실행하는 경우가 많다. 서비스 이름을 안다면 바로 본다.\n\n```bash\nsudo systemctl status myapp --no-pager\nsudo systemctl is-active myapp\nsudo systemctl cat myapp\n```\n\n`status`에서 볼 포인트는 네 가지다.\n\n| 항목 | 볼 내용 |\n|---|---|\n| `Active` | `active (running)`인지, `failed`인지, 계속 재시작 중인지 |\n| `Main PID` | 실제 앱 PID가 무엇인지, `ps`와 맞는지 |\n| `ExecStart` | 어떤 jar, 어떤 Java, 어떤 옵션으로 실행하는지 |\n| 최근 로그 | 실패 원인이 바로 보이는지 |\n\n`systemctl cat`은 unit 파일과 drop-in을 보여 준다. 터미널에서 직접 실행할 때는 되는데 서비스로는 안 되면 여기서 `WorkingDirectory`, `User`, `Environment`, `EnvironmentFile`, `ExecStart`를 특히 본다. 상대 경로로 `application-prod.yml`을 읽는 앱은 `WorkingDirectory`가 달라지면 파일을 못 찾을 수 있다.\n\n## 5단계: 로그를 한 곳으로 정해서 본다\n\n로그는 여러 곳에 있을 수 있다. systemd로 띄운 서비스라면 journal이 1순위다.\n\n```bash\nsudo journalctl -u myapp -n 100 --no-pager\nsudo journalctl -u myapp -f\n```\n\n직접 실행하거나 nohup으로 띄웠다면 파일 로그를 본다.\n\n```bash\ntail -n 100 app.log\ntail -f app.log\n```\n\n로그를 볼 때는 맨 마지막 한 줄만 보지 않는다. Spring Boot나 서버 앱은 원인 예외가 위에 있고 마지막에는 종료 메시지만 남는 경우가 많다. `Permission denied`, `No such file or directory`, `Address already in use`, `Connection refused`, `UnsupportedClassVersionError`, `Failed to bind properties` 같은 첫 원인 문장을 찾는다.\n\n## 6단계: 환경 변수와 profile 차이를 의심한다\n\n터미널에서 직접 실행할 때와 systemd 서비스로 실행할 때 환경은 다르다. `.bashrc`, `.zshrc`, `.profile`에 넣은 값이 systemd 서비스에는 자동으로 들어가지 않는다고 보는 편이 안전하다.\n\n```bash\nprintenv | sort\nsudo systemctl show myapp -p Environment\nsudo systemctl cat myapp\n```\n\nSpring Boot라면 특히 아래를 확인한다.\n\n| 설정 | 흔한 증상 |\n|---|---|\n| `SPRING_PROFILES_ACTIVE` | 로컬 profile로 떠서 DB, port, logging 설정이 다름 |\n| `SERVER_PORT` | 기대한 8080이 아니라 다른 포트로 뜸 |\n| `JAVA_HOME`, `PATH` | 서비스에서 다른 Java를 사용하거나 Java를 못 찾음 |\n| DB 관련 env | 앱은 떴지만 요청 시 DB 연결 실패 |\n| `EnvironmentFile` 경로 | 파일이 없거나 권한 때문에 읽지 못함 |\n\n서비스 환경을 고친 뒤에는 보통 아래 순서가 필요하다.\n\n```bash\nsudo systemctl daemon-reload\nsudo systemctl restart myapp\nsudo journalctl -u myapp -n 80 --no-pager\n```\n\nunit 파일을 바꿨는데 `daemon-reload`를 빼먹으면 systemd가 예전 정의를 계속 들고 있을 수 있다.\n\n## 7단계: 파일 권한과 소유자를 본다\n\n서버에서 `Permission denied`는 매우 흔하다. 실행 권한, 로그 디렉터리 쓰기 권한, jar 파일 읽기 권한, 설정 파일 읽기 권한이 모두 다르다.\n\n```bash\nls -l app.jar gradlew app.log\nls -ld . logs config\nnamei -l /opt/myapp/config/application-prod.yml\n```\n\n수정은 증상에 맞게 작게 한다.\n\n```bash\nchmod +x gradlew\nsudo chown -R app:app /opt/myapp\nsudo chmod 640 /opt/myapp/config/application-prod.yml\nsudo chmod 750 /opt/myapp/logs\n```\n\n`chmod 777`은 초보자가 급해서 쓰기 쉽지만 좋은 기본값이 아니다. 읽어야 하는 파일, 실행해야 하는 파일, 써야 하는 디렉터리를 나눠서 최소 권한으로 맞춘다. systemd unit의 `User=app`이라면 그 계정이 jar와 설정 파일을 읽고 로그 디렉터리에 쓸 수 있어야 한다.\n\n## 8단계: OS firewall 증상을 구분한다\n\n이 문서는 EC2 security group 문서가 아니지만, 서버 안 OS firewall은 여기서 한 번 확인한다. Ubuntu에서는 UFW를 많이 본다.\n\n```bash\nsudo ufw status verbose\n```\n\nfirewalld 기반이면 이렇게 본다.\n\n```bash\nsudo firewall-cmd --state\nsudo firewall-cmd --list-ports\n```\n\n서버 안 `curl 127.0.0.1:8080`은 성공하는데 같은 서버의 private IP나 외부에서 접근이 안 되면 OS firewall, bind address, EC2 network를 나눠 본다. 다만 외부 public IP 경로, security group inbound, subnet route table은 별도 네트워크 문서의 책임이다. 여기서는 `ss`로 앱이 어디에 bind됐는지와 OS firewall이 포트를 막는지만 확인한다.\n\n## 작은 체크리스트: 순서대로 복사해서 쓰기\n\n아래 흐름은 처음 디버깅할 때 그대로 따라가기 좋다. 서비스 이름과 포트만 바꾼다.\n\n```bash\n# 1. 위치와 계정\nhostname\nwhoami\npwd\n\n# 2. 프로세스\nps -ef | grep '[j]ava'\n\n# 3. 포트\nsudo ss -ltnp | grep ':8080' || true\nsudo lsof -iTCP:8080 -sTCP:LISTEN -n -P || true\n\n# 4. 로컬 요청\ncurl -i --connect-timeout 3 http://127.0.0.1:8080/\n\n# 5. 서비스\nsudo systemctl status myapp --no-pager\nsudo systemctl cat myapp\n\n# 6. 로그\nsudo journalctl -u myapp -n 100 --no-pager\ntail -n 100 app.log\n\n# 7. 권한과 환경\nls -l app.jar\nls -ld . logs config\nsudo systemctl show myapp -p Environment\n\n# 8. OS firewall\nsudo ufw status verbose\n```\n\n## 증상별 첫 판단\n\n| 증상 | 첫 판단 | 바로 볼 명령 |\n|---|---|---|\n| 앱이 안 뜬다 | 프로세스와 로그부터 | `ps`, `systemctl status`, `journalctl` |\n| 8080이 안 열린다 | LISTEN 여부부터 | `ss -ltnp`, `lsof` |\n| `localhost`도 안 된다 | 앱 내부 또는 포트 문제 | `curl 127.0.0.1`, `tail`, `journalctl` |\n| 터미널 실행은 되는데 서비스는 실패 | 환경 변수, WorkingDirectory, User 차이 | `systemctl cat`, `systemctl show` |\n| `Permission denied` | 실행 계정의 파일 권한 문제 | `ls -l`, `namei -l`, `chmod`, `chown` |\n| 외부만 안 된다 | 서버 내부 통과 후 네트워크 경로 문제 | `curl localhost` 성공 확인 후 EC2 public access 문서로 이동 |\n\n## 흔한 오해\n\n- `ps`에 프로세스가 보이면 서버가 정상이라고 생각한다. 실제로는 포트 LISTEN과 HTTP 응답까지 봐야 한다.\n- `curl localhost` 실패를 security group 문제로 본다. localhost 실패는 보통 앱 실행, port, bind, 로그 문제다.\n- `.profile`에 export했으니 systemd 서비스도 같은 값을 쓴다고 생각한다. systemd 환경은 별도로 넣어야 한다.\n- `Permission denied`가 나오면 일단 `chmod 777`을 한다. 실행 계정과 필요한 권한을 먼저 보고 좁게 고쳐야 한다.\n- journal과 app.log를 섞어 보다가 원인 시간을 놓친다. 서비스 방식에 맞는 주 로그를 정하고 최근 100줄과 follow를 같이 본다.\n\n## 한 줄 정리\n\n서버 안 첫 디버깅은 public IP부터가 아니라 `프로세스 생존 -> 포트 LISTEN -> localhost curl -> 서비스 상태 -> 로그 -> 환경/profile -> 권한 -> OS firewall` 순서로 증거를 쌓는 일이다.\n",
+  "aliases": [
+    "Linux 서버 첫 디버깅",
+    "리눅스 서버 디버깅 체크리스트",
+    "EC2 서버 안에서 확인",
+    "process alive ps",
+    "ss ltnp 포트 확인",
+    "lsof 8080 LISTEN",
+    "curl localhost 확인",
+    "systemctl status journalctl",
+    "chmod chown permission denied",
+    "서버 환경 변수 profile 확인"
+  ],
+  "expected_queries": [
+    "EC2 서버에 들어가서 앱이 살아 있는지 어디부터 확인해야 해?",
+    "Spring Boot 배포 후 localhost curl도 안 될 때 ps ss systemctl journalctl 순서로 봐줘",
+    "systemd 서비스로 실행하면 터미널 실행과 다르게 실패하는데 env profile 권한을 어떻게 확인해?",
+    "Linux 서버에서 8080 포트가 열렸는지 ss나 lsof로 확인하는 법을 알려줘",
+    "Permission denied 때문에 배포 앱이 안 뜰 때 chmod chown을 어디에 적용해야 해?"
+  ],
+  "symptoms": [
+    "배포 서버에 SSH로 들어왔지만 프로세스, 포트, 로그 중 무엇부터 봐야 할지 모른다",
+    "localhost curl 실패와 public IP 접속 실패를 같은 문제로 보고 보안 그룹부터 수정한다",
+    "터미널에서 직접 실행하면 되는데 systemd 서비스로 실행하면 환경 변수나 권한 때문에 실패한다",
+    "Permission denied를 만날 때 chmod 777로 덮기 전에 어떤 파일과 계정을 확인해야 하는지 모른다",
+    "ss, lsof, systemctl, journalctl, tail 출력이 각각 어떤 증거인지 연결하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "operating-system/shell-job-control-command-bridge"
+    ],
+    "next_docs": [
+      "network/ec2-spring-boot-public-access-cause-router",
+      "operating-system/spring-boot-ec2-systemd-service-primer",
+      "operating-system/file-descriptor-basics"
+    ],
+    "confusable_with": [
+      "network/ec2-spring-boot-public-access-cause-router",
+      "spring/spring-boot-executable-jar-ec2-runbook",
+      "operating-system/spring-boot-ec2-systemd-service-primer"
+    ],
+    "forbidden_for_queries": [
+      "EC2 security group inbound rule 설정",
+      "public IP와 private subnet 차이",
+      "Nginx reverse proxy 설정 전체 절차",
+      "SSH pem key permission denied"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-17",
+    "last_modified": "2026-06-17",
+    "revision_history": []
+  }
+}
