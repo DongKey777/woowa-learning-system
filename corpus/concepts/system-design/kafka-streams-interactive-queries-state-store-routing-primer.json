@@ -2,59 +2,61 @@
   "id": "system-design/kafka-streams-interactive-queries-state-store-routing-primer",
   "title": "Kafka Streams Interactive Queries State Store Routing Primer",
   "category": "system-design",
-  "level": "advanced",
-  "summary": "Kafka Streams Interactive Queries에서 key가 어느 task/host의 local state store에 있는지 찾고, 해당 host로 read를 routing하는 개념을 설명한다. Rebalance, stale store, standby read, service discovery, read availability trade-off를 다룬다.",
-  "body_markdown": "# Kafka Streams Interactive Queries State Store Routing Primer\n\n## 한 줄 요약\n\nKafka Streams Interactive Queries는 local state store를 query API처럼 읽게 해 주지만, key가 어느 host의 task에 있는지 routing해야 한다. Rebalance 중에는 owner가 바뀌고, standby나 stale store를 읽을지 정책이 필요하다.\n\n## 왜 routing이 필요한가\n\nKafka Streams state store는 모든 instance에 전체 데이터가 있는 구조가 아니다. Task와 partition assignment에 따라 key별 state가 특정 instance에 local로 존재한다. 따라서 API server가 아무 instance에나 물으면 해당 key의 store가 없을 수 있다.\n\n```text\nkey=user-123 -> partition 4 -> task 4 -> host B local store\nclient -> host A\nhost A finds host B for key\nhost A proxies or redirects to host B\n```\n\nInteractive Queries의 핵심은 state store read 자체보다 key metadata와 host routing이다.\n\n## 기본 구성요소\n\n| 구성요소 | 역할 |\n|---|---|\n| local state store | task가 소유한 key range의 상태 저장 |\n| metadata lookup | key가 어느 host에 있는지 찾음 |\n| host info | 외부에서 접근 가능한 instance 주소 |\n| proxy/redirect | 요청을 owner host로 전달 |\n| standby store | active가 아니지만 따라가는 복제 상태 |\n| rebalance handling | owner 변경 중 read 실패/재시도 처리 |\n\n## active read와 standby read\n\n가장 안전한 기본값은 active task owner에게 읽는 것이다. 하지만 active host가 느리거나 rebalance 중이면 standby store를 읽고 싶어질 수 있다. Standby read는 availability를 높일 수 있지만 freshness가 늦을 수 있다.\n\n| 선택 | 장점 | 위험 |\n|---|---|---|\n| Active owner read | 가장 최신에 가까움 | owner 장애/이동 시 실패 |\n| Standby read | availability와 tail 개선 | stale result 가능 |\n| Redirect | client가 owner로 직접 감 | client 복잡도 증가 |\n| Proxy | client 단순 | proxy hop latency와 timeout 필요 |\n| Fallback query store | 장애 시 대체 | consistency 차이를 문서화해야 함 |\n\n## rebalance 중 문제\n\nRebalance가 일어나면 key owner가 바뀔 수 있다. 이때 old host는 더 이상 해당 store를 소유하지 않거나, new host는 restore 중일 수 있다.\n\n운영 증상:\n\n- 특정 key read가 404/store not available을 반환한다.\n- Rebalance 중 interactive query latency가 튄다.\n- Standby에서 읽은 값이 active보다 늦다.\n- Host metadata cache가 낡아 잘못된 instance로 routing한다.\n\n대응:\n\n- metadata refresh와 retry policy를 둔다.\n- store state가 RUNNING/RESTORING인지 확인한다.\n- stale read 허용 여부를 API contract에 넣는다.\n- rebalance duration과 store unavailable rate를 metric으로 본다.\n\n## service discovery와 host info\n\nKafka Streams가 key owner metadata를 알려줘도, 외부 client가 그 host로 접근할 수 있어야 한다. Kubernetes나 service mesh 환경에서는 advertised host/port가 실제 routing 가능한 주소인지 확인해야 한다.\n\n잘못된 host info는 state store가 있어도 query가 실패하는 원인이 된다. 이 문제는 Kafka가 아니라 service discovery와 network routing 문제로 드러난다.\n\n## 흔한 오해\n\n- \"Interactive Queries는 모든 instance가 모든 state를 읽을 수 있다는 뜻이다\": key owner host로 routing해야 한다.\n- \"standby store를 읽으면 항상 안전하다\": stale window와 lag를 봐야 한다.\n- \"rebalance는 write path만 영향 있다\": read owner가 바뀌므로 interactive query도 흔들린다.\n- \"metadata lookup만 하면 끝이다\": host info, proxy timeout, retry, store state 확인이 필요하다.\n- \"state store read는 DB read처럼 강한 consistency다\": stream processing lag와 restore lag를 고려해야 한다.\n\n## 운영 지표\n\n- metadata lookup latency\n- owner host routing miss count\n- store unavailable count\n- rebalance duration\n- standby lag\n- active versus standby read divergence\n- proxy hop latency\n- restore state duration\n- stale read fallback count\n\n## 면접 답변 축\n\nInteractive Queries 질문에는 \"Kafka Streams state는 task별 local store에 있으므로 key metadata로 owner host를 찾아 그 host로 proxy/redirect해야 한다\"고 답한다. 이어서 rebalance와 restore 중 store availability가 흔들릴 수 있고, standby read는 availability를 높이지만 stale window를 계약해야 한다고 말하면 된다.\n\n## Safe Next Docs\n\nState store 복구는 `kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer`, service routing은 `service-discovery-health-routing-design`, shard-aware freshness는 `shard-aware-watermark-scope-primer`로 이어진다.\n",
+  "level": "intermediate",
+  "summary": "Kafka Streams Interactive Queries는 각 app instance가 가진 local state store를 HTTP 같은 query endpoint로 노출할 수 있게 하지만, key가 어느 partition과 host에 있는지 찾아 올바른 instance로 라우팅해야 안전하다. 이 primer는 state store를 중앙 DB처럼 보지 않고, partition key, host metadata, standby replica, rebalance, freshness를 함께 설계하는 기준을 잡는다.",
+  "body_markdown": "# Kafka Streams Interactive Queries State Store Routing Primer\n\n> 한 줄 요약: Kafka Streams Interactive Queries는 local state store를 조회할 수 있게 하지만, key가 어느 partition과 host에 있는지 찾아 그 store를 가진 instance로 라우팅해야 안전하다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Kafka Ordering Delivery Interview Primer](./kafka-ordering-delivery-interview-primer.md)\n- [Stateful Stream Processor State Store / Checkpoint Recovery 설계](./stateful-stream-processor-state-store-checkpoint-recovery-design.md)\n- [Read Model Freshness Perspective Map - Cache, Replica, Projection](./read-model-freshness-perspective-map-cache-replica-projection.md)\n- [Exactly Once Stream Processing Idempotent Sinks Checkpoint Chooser](./exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser.md)\n\nretrieval-anchor-keywords: Kafka Streams interactive queries, state store routing, queryable state store, host metadata, StreamsMetadata, key query routing, partition key lookup, local RocksDB store, standby replica query, rebalance stale metadata, 카프카 스트림즈 인터랙티브 쿼리, 상태 저장소 라우팅\n\n## 핵심 개념\n\nKafka Streams에서 aggregation, join, table materialization을 쓰면 각 instance 안에 state store가 생긴다. Interactive Queries는 이 local state store를 애플리케이션 밖에서 조회할 수 있게 해 주는 기능이다.\n\n중요한 점은 이 store가 중앙 DB가 아니라는 것이다. 같은 application id로 여러 instance가 떠 있으면 key별 상태는 Kafka partition 배치에 따라 어느 한 instance의 local store에 있다. 따라서 `GET /customers/{id}` 같은 query endpoint를 만들 때는 먼저 그 key가 어느 partition에 속하고, 그 partition의 active task가 어느 host에 있는지 찾아야 한다.\n\n짧게 말하면 Interactive Queries의 질문은 \"state store를 어떻게 읽나\"보다 \"이 key의 state를 가진 host로 어떻게 보내나\"에 가깝다.\n\n## 한눈에 보기\n\n| 질문 | 확인할 것 | 흔한 함정 |\n|---|---|---|\n| 이 key는 어디에 있나 | key serializer, partitioner, topic partition, Streams metadata | key 직렬화가 producer와 다르면 다른 partition을 찾는다 |\n| 이 host가 읽어도 되나 | active host인지 standby host인지 | 아무 instance나 local store를 열면 null 또는 stale 값을 본다 |\n| scale-out 후에도 맞나 | rebalance와 metadata refresh | host metadata cache가 낡으면 잘못 라우팅한다 |\n| 장애 때 어떻게 하나 | standby replica, retry, fallback | standby는 stale할 수 있으므로 freshness 표시가 필요하다 |\n| 전체 조회가 필요한가 | scan 비용과 ownership | local store 전체 scan을 전체 cluster query처럼 착각한다 |\n\n## 라우팅 모델\n\n기본 흐름은 세 단계다.\n\n1. 요청 key를 Kafka Streams가 쓰는 것과 같은 serializer로 bytes로 바꾼다.\n2. Streams metadata에서 해당 key와 store name을 기준으로 active host를 찾는다.\n3. 현재 instance가 그 host면 local store를 읽고, 아니면 해당 host의 query endpoint로 proxy하거나 redirect한다.\n\n의사코드로 보면 다음과 같다.\n\n```text\nhost = streams.metadataForKey(storeName, key, keySerde.serializer())\nif host == thisHost:\n    return localStore.get(key)\nelse:\n    return httpClient.get(host, \"/state/\" + key)\n```\n\n여기서 핵심 불변식은 **partition key와 host metadata가 같은 세계를 봐야 한다**는 점이다. Producer가 `orderId`로 key를 잡았는데 query API가 `userId`를 key로 metadata를 찾으면 당연히 엉뚱한 host로 간다. JSON 문자열 직렬화와 Avro/Protobuf 직렬화가 다를 때도 partition hash가 달라질 수 있다.\n\n## 실무에서 보는 증상\n\n가장 흔한 증상은 \"분명 집계는 됐는데 API에서 null이 나온다\"이다. 이때 local store 자체를 먼저 의심하기보다 routing을 먼저 본다.\n\n- 요청을 받은 instance가 active owner가 아닌데 local store만 조회했다\n- store name이나 key serde가 topology와 다르다\n- rebalance 직후 metadata cache가 이전 host를 가리킨다\n- standby store를 읽었는데 active보다 늦다\n- restore 중인 task가 아직 query 가능한 상태가 아니다\n\n두 번째 증상은 scale-out 후에만 값이 흔들리는 것이다. instance가 하나일 때는 모든 key가 같은 process에 있으니 잘못된 라우팅 코드도 티가 안 난다. instance가 늘고 partition ownership이 나뉘는 순간 local-only lookup의 한계가 드러난다.\n\n## freshness와 장애 처리\n\nInteractive Queries는 읽기 경로를 빠르게 만들 수 있지만, 최신성 계약을 자동으로 만들어 주지는 않는다. State store는 changelog topic과 stream processing 진행 상황을 따라가므로 input lag, restore lag, rebalance 상태에 영향을 받는다.\n\n운영에서는 query 응답에 아래 정보를 붙이는 편이 안전하다.\n\n- `served_by`: active인지 standby인지\n- `partition`과 `offset` 또는 application-specific watermark\n- `state`: running, rebalancing, restoring\n- `fallback_reason`: metadata_stale, owner_unavailable, store_not_ready\n\nactive host가 죽었을 때 standby replica를 읽을 수는 있지만, standby는 최신 active state보다 뒤처질 수 있다. 그래서 \"장애 시 읽을 수 있음\"과 \"항상 최신\"을 같은 말로 두면 안 된다. 사용자에게 read-your-writes가 필요한 화면이라면 primary DB나 command response, watermark check, retry-after 같은 별도 보호가 필요하다.\n\n## 설계 체크리스트\n\n- query key가 stream topology의 key와 같은 의미인지 확인한다\n- producer, topology, query API가 같은 key serde와 partitioning 규칙을 쓰는지 검증한다\n- metadata lookup 결과가 현재 host가 아니면 proxy/redirect 경로를 둔다\n- rebalance 중에는 store-not-ready 응답과 짧은 retry를 준비한다\n- standby read는 freshness와 stale 가능성을 응답에 표시한다\n- 전체 scan이나 range query를 Interactive Queries의 기본 사용법으로 설계하지 않는다\n\n## Wrong-bucket 이웃\n\n- Kafka ordering/delivery 문제는 partition key와 offset commit 보장을 설명하는 문서가 먼저다.\n- Stateful stream processor checkpoint 문서는 state 복구와 rescale, checkpoint 비용을 더 넓게 다룬다.\n- Read model freshness 문서는 cache, replica, projection 중 어디가 낡았는지 분리하는 데 맞다.\n- 일반 DB query router처럼 보면 안 된다. Interactive Queries는 Streams task ownership과 state store locality를 함께 보는 기능이다.\n\n## 한 줄 정리\n\nKafka Streams Interactive Queries를 쓸 때는 state store를 중앙 DB처럼 호출하지 말고, key가 매핑된 partition의 active host를 metadata로 찾은 뒤 local/proxy/standby read와 freshness 계약을 분리해 설계해야 한다.\n",
   "aliases": [
     "Kafka Streams interactive queries",
-    "state store routing",
-    "카프카 스트림즈 조회",
-    "interactive query host routing",
-    "key owner metadata",
-    "standby store read",
-    "rebalance stale read",
-    "로컬 상태 조회",
-    "store unavailable",
-    "state store 라우팅"
+    "Kafka Streams state store routing",
+    "interactive queries state store",
+    "queryable state store routing",
+    "state store host metadata",
+    "interactive queries host routing",
+    "카프카 스트림즈 인터랙티브 쿼리",
+    "상태 저장소 라우팅",
+    "Kafka Streams 로컬 스토어 조회",
+    "파티션 키 기반 상태 조회"
   ],
   "expected_queries": [
-    "Kafka Streams Interactive Queries는 key가 있는 host를 어떻게 찾아서 state store를 읽어?",
-    "state store가 local이라면 아무 Kafka Streams instance에 query하면 안 되는 이유가 뭐야?",
-    "rebalance 중 Interactive Query가 store unavailable을 반환할 때 어떤 routing 문제를 봐야 해?",
-    "standby store에서 읽으면 availability는 좋아지지만 stale read가 생길 수 있다는 걸 어떻게 설명해?",
-    "Kafka Streams host info와 service discovery가 interactive query 실패에 어떤 영향을 줘?",
-    "Interactive Queries에서 proxy와 redirect 중 어떤 trade-off가 있어?"
+    "Kafka Streams interactive queries로 state store를 조회할 때 어떤 인스턴스로 라우팅해야 해?",
+    "카프카 스트림즈 state store가 local이라면 key별 조회 라우팅을 어떻게 설계해?",
+    "Interactive Queries에서 host metadata와 partition key를 왜 같이 봐야 해?",
+    "Kafka Streams 앱을 스케일아웃하면 state store query endpoint는 어떻게 안정화해?",
+    "state store를 DB처럼 직접 전체 조회하면 안 되는 이유가 뭐야?"
   ],
   "symptoms": [
-    "Interactive Query가 특정 key에서 store not available을 반환한다",
-    "rebalance 중 state store read latency가 튄다",
-    "standby store에서 읽은 값이 active owner보다 늦다"
+    "Kafka Streams instance가 여러 개인데 아무 local state store나 조회해 null 또는 낡은 값을 본다",
+    "producer key와 query key serializer가 달라 metadata lookup이 다른 partition을 가리킨다",
+    "rebalance나 restore 중에도 state store query가 항상 최신이라고 가정한다"
   ],
   "relations": {
     "prerequisites": [
-      "system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer",
-      "system-design/service-discovery-health-routing-design"
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection"
     ],
     "next_docs": [
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser",
       "system-design/shard-aware-watermark-scope-primer",
-      "system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser"
+      "system-design/read-model-rebuild-backfill-playbook"
     ],
     "confusable_with": [
-      "system-design/service-discovery-health-routing-design",
-      "system-design/read-model-freshness-perspective-map-cache-replica-projection",
-      "system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer"
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection"
     ],
-    "forbidden_for_queries": [
-      "Kafka Streams RocksDB changelog standby recovery를 설명해줘",
-      "일반 service discovery health routing 설계를 알려줘"
-    ]
+    "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
-    "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
-    "legacy_path": "knowledge/cs/contents/system-design/kafka-streams-interactive-queries-state-store-routing-primer.md",
-    "revision_history": []
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147"
+      }
+    ]
   }
 }

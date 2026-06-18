@@ -6,17 +6,23 @@
   "summary": "JOIN 뒤 row가 늘면 먼저 \"한 줄의 단위\"와 1:1/1:N/N:M cardinality를 고정하고, DISTINCT나 GROUP BY는 그다음에 선택한다.",
   "body_markdown": "# SQL Join Cardinality Mission Drill\n\n> 한 줄 요약: JOIN 뒤 row가 늘면 먼저 \"한 줄의 단위\"와 1:1/1:N/N:M cardinality를 고정하고, DISTINCT나 GROUP BY는 그다음에 선택한다.\n\n**난이도: Beginner**\n\n## 관찰 기준\n\n학습자가 \"JOIN 했더니 중복이 생겼어요\"라고 말하면 먼저 관계 수(cardinality)를 본다. SQL join은 객체를 예쁘게 합치는 기능이 아니라 조건에 맞는 row 조합을 만든다. 1:1은 row 수가 보통 유지되고, 1:N은 부모 column이 자식 수만큼 반복될 수 있으며, N:M은 bridge table을 거치며 양쪽 조합 수만큼 늘어난다.\n\n불변식은 \"무엇을 한 row로 보고 싶은가\"다. 화면이 주문(order) 단위인지, 주문 상품(order item) 단위인지, 예약(reservation) 단위인지 정하지 않으면 `DISTINCT`로 증상만 덮게 된다. `GROUP BY`는 정렬 도구가 아니라 요약 row를 만들기 위한 집계 경계다.\n\n## 문제 1\n\n상황:\n\n```text\nreservation과 reservation_time은 N:1이고 JOIN 뒤 reservation row 수가 그대로다.\n```\n\n답:\n\n정상적이다. 여러 reservation이 하나의 time을 가리킬 수 있지만, reservation에서 time으로 붙이면 reservation 기준 row 수가 보통 늘지 않는다. 관찰 증거는 join key가 `reservation.time_id = reservation_time.id`처럼 각 reservation이 최대 하나의 time과 매칭되는지다. 단, 조인 조건이 빠지거나 잘못되면 N:1도 곱집합처럼 늘 수 있다.\n\n기대 답변은 \"reservation 한 줄이 최대 하나의 time row와 매칭되므로 기준 row 수는 유지된다. 다만 `ON` 조건이 정확한 FK -> PK인지 확인해야 한다\"이다.\n\n## 문제 2\n\n상황:\n\n```text\norders와 order_item을 JOIN했더니 주문 1건이 상품 수만큼 여러 줄로 보인다.\n```\n\n답:\n\n1:N join의 정상 결과다. 주문 단위로 다시 보고 싶으면 `GROUP BY orders.id`로 집계하거나, application layer에서 order aggregate를 조립하거나, 목록 DTO를 주문 단위와 상품 단위로 나눈다. GROUP BY는 \"정렬\"이 아니라 row를 그룹으로 묶어 aggregate를 계산하는 장치다. 아무 column이나 같이 선택하면 DB별로 오류가 나거나 임의 값처럼 보일 수 있다.\n\n기대 답변은 \"부모 row가 duplicate 된 것이 아니라 결과 row 단위가 order item으로 펼쳐진 것이다. 주문 목록이면 주문 id를 먼저 page하고 item은 별도 조회하거나 집계한다\"이다.\n\n## 문제 3\n\n상황:\n\n```text\nproduct와 tag를 product_tag bridge로 JOIN했더니 product 1개가 tag 수만큼 반복된다.\n```\n\n답:\n\nN:M join의 정상 결과다. `product -> product_tag -> tag`는 bridge row 수만큼 product가 반복될 수 있다. \"특정 tag가 있는 product 목록\"이 목적이면 `JOIN` 후 `DISTINCT product.id`보다 `EXISTS`나 product id 사전 조회가 더 명확할 수 있다. \"tag 목록까지 보여주는 화면\"이면 반복 row가 정상이고 application layer에서 product별 tag collection으로 접는다.\n\n기대 답변은 \"N:M은 bridge table의 matching row가 결과 cardinality를 만든다. 최종 row 단위가 product인지 product-tag인지 먼저 말해야 한다\"이다.\n\n## 문제 4\n\n상황:\n\n```text\norders와 order_item을 JOIN했는데 예상보다 훨씬 많은 row가 나온다.\nON orders.id = order_item.order_id만 있고 tenant_id 조건은 빠져 있다.\n```\n\n답:\n\nmissing predicate 후보가 강하다. 단일 FK처럼 보여도 실제 모델이 `(tenant_id, order_id)` 스코프를 함께 요구하면 tenant 조건 누락으로 다른 tenant의 item까지 붙을 수 있다. 복합 키 일부만 붙인 경우, `ON` 자체가 없는 경우, unique가 아닌 `name`/`code`로 붙인 경우도 같은 계열이다.\n\n기대 답변은 \"정상 1:N 증가인지, predicate 누락으로 곱이 커진 것인지 단계별 count로 분리한다. 부모 count, 자식 `group by parent_id`, join count, `count(distinct parent.id)`를 비교한다\"이다.\n\n## 문제 5\n\n상황:\n\n```text\n중복처럼 보이니 SELECT DISTINCT를 붙였더니 화면은 맞아 보인다.\n```\n\n답:\n\n위험하다. 왜 row가 늘었는지 cardinality를 먼저 설명해야 한다. DISTINCT가 필요한 조회인지, 모델링이나 조인 조건이 틀린 것인지 구분해야 한다. DISTINCT는 결과 row를 줄일 수 있지만 잘못된 join을 고치지는 않는다. 또한 정렬, pagination, count와 결합하면 비용과 의미가 달라질 수 있다.\n\n기대 답변은 \"`DISTINCT`는 최종 projection이 같은 row를 set으로 줄이는 도구이고, `GROUP BY`는 parent별 count/sum/max 같은 집계 의미가 있을 때 쓴다. 둘 다 missing predicate를 고치는 도구는 아니다\"이다.\n\n## 문제 6\n\n상황:\n\n```text\nJPA에서 orders를 collection fetch join하고 Page로 조회했더니 같은 order가 반복되거나 page size가 이상하다.\n```\n\n답:\n\ncollection fetch join pagination 함정이다. SQL 결과는 `order x item` row로 펼쳐지므로 DB의 `LIMIT/OFFSET`이 부모 order 기준이 아니라 펼쳐진 join row 기준으로 잘릴 수 있다. Hibernate가 in-memory pagination 경고를 내거나, `select distinct o`로 부모 중복을 줄여도 count query와 실제 page 내용이 어긋날 수 있다.\n\n기대 답변은 \"부모 id를 먼저 page한 뒤 그 id들에 대해 items를 batch fetch/entity graph/별도 query로 가져온다. collection fetch join은 단건 상세에는 유용하지만 부모 목록 pagination과 섞을 때 조심한다\"이다.\n\n## 기대 답변 축\n\n- 최종 결과 한 줄의 단위를 먼저 말한다.\n- 1:1, 1:N, N:M 관계에서 row 수가 어떻게 변하는지 예측한다.\n- parent column 반복과 물리적 중복 row를 구분한다.\n- missing `ON`, 복합 키 일부 누락, tenant/status scope 누락을 확인한다.\n- `DISTINCT`는 중복 제거, `GROUP BY`는 집계 의미라는 차이를 설명한다.\n- collection fetch join과 pagination이 부모 기준 page를 깨뜨릴 수 있음을 말한다.\n\n## 빠른 체크\n\n| 신호 | 먼저 볼 것 |\n|---|---|\n| 1:1 join인데 row 증가 | unique 보장, 누락 predicate |\n| 부모 row가 자식 수만큼 반복 | 1:N cardinality |\n| bridge table을 거침 | N:M matching row 수 |\n| 예상보다 몇 배 더 큼 | missing predicate / 복합 키 누락 |\n| 집계 결과가 필요 | GROUP BY |\n| 중복 제거만 붙임 | 조인 조건/관계 재검토 |\n| 목록 pagination + collection fetch join | 부모 id page 후 자식 조회 |\n\n## 약점 태그\n\n- `row-unit-missing`: 최종 한 줄의 단위를 말하지 못함\n- `parent-duplicate-confusion`: 부모 column 반복을 DB 중복 row로 착각함\n- `predicate-blind`: `ON` 조건이나 복합 키 누락을 확인하지 않음\n- `distinct-first`: cardinality 설명 없이 `DISTINCT`부터 붙임\n- `groupby-as-sort`: `GROUP BY`를 정렬이나 임시 중복 제거로 이해함\n- `fetchjoin-pagination-blind`: collection fetch join과 page 조회를 안전하다고 가정함\n\n## 흔한 오답\n\n| 오답 | 왜 위험한가 | 교정 |\n|---|---|---|\n| \"JOIN하면 객체처럼 하나로 합쳐진다\" | SQL은 조건에 맞는 row 조합을 만든다 | 결과 row 단위를 먼저 정한다 |\n| \"부모가 여러 번 보이면 무조건 중복 데이터다\" | 1:N/N:M에서는 정상 반복일 수 있다 | child count 분포와 join count를 비교한다 |\n| \"`DISTINCT` 붙이면 해결이다\" | 누락 predicate, pagination 왜곡, 집계 의미를 숨긴다 | cardinality 원인을 설명한 뒤 선택한다 |\n| \"`GROUP BY id`는 중복 제거용이다\" | 집계 column 의미 없이 임의 값을 고를 수 있다 | count/sum/max 등 요약 목적을 명시한다 |\n| \"fetch join으로 한 번에 가져오면 page도 안전하다\" | collection row 기준으로 잘려 부모 page가 깨질 수 있다 | parent id page와 child fetch를 분리한다 |\n\n## 검증 질문\n\n1. 이 query의 최종 한 줄은 parent인가, child인가, parent-child pair인가?\n2. 각 join 관계는 1:1, 1:N, N:M 중 무엇인가?\n3. join을 하나씩 추가했을 때 row count가 처음 커지는 지점은 어디인가?\n4. `ON` 조건에 PK/FK, 복합 키, tenant/user/status scope가 모두 들어갔는가?\n5. `count(*)`와 `count(distinct parent.id)`의 차이가 정상 child 수 분포와 맞는가?\n6. `DISTINCT`가 필요한 set 결과인가, 아니면 `GROUP BY` 집계가 필요한가?\n7. pagination이 부모 id 기준으로 적용되는가, join으로 펼쳐진 row 기준으로 적용되는가?\n\n## Safe Next Docs\n\nRow 증가 증상은 `database/join-row-increase-distinct-symptom-card`, 집계는 `database/sql-aggregate-groupby-basics`, 관리자 목록 fetch plan은 `spring/roomescape-admin-reservation-list-fetch-plan-bridge`로 이어진다.\n",
   "aliases": [
-    "sql join cardinality mission drill",
-    "JOIN row 증가 드릴",
-    "roomescape reservation join drill",
-    "shopping cart order item join drill",
-    "1:N join group by practice"
+    "조인 row 증가",
+    "JOIN row 증가 원인",
+    "조인 카디널리티",
+    "join cardinality",
+    "1:N 조인",
+    "1:N join",
+    "N:M bridge join",
+    "브릿지 테이블 조인",
+    "DISTINCT 먼저 금지",
+    "컬렉션 fetch join page 깨짐"
   ],
   "expected_queries": [
-    "JOIN 뒤 row가 늘어나는 문제를 roomescape 예제로 연습하고 싶어",
-    "shopping-cart order item 1:N join과 group by를 드릴로 풀어줘",
-    "DISTINCT로 중복을 덮기 전에 cardinality를 어떻게 봐?",
-    "SQL join cardinality를 미션 문맥으로 문제 내줘"
+    "JOIN 했더니 주문 한 건이 상품 수만큼 여러 줄로 나와, 이게 중복 데이터야?",
+    "reservation이랑 time을 조인했는데 row 수가 안 늘어나는 게 맞는지 cardinality로 보고 싶어",
+    "DISTINCT 붙이기 전에 1:N 조인에서 결과 한 줄 기준을 어떻게 잡아?",
+    "product tag bridge 테이블을 조인하면 왜 product가 tag 수만큼 반복돼?",
+    "fetch join으로 order 목록을 page할 때 item 때문에 page size가 이상해지는 이유가 뭐야?"
   ],
   "symptoms": [
     "JOIN 뒤 row가 늘어나는 이유를 DISTINCT로만 덮으려 한다",
@@ -39,14 +45,23 @@
       "database/sql-relational-modeling-basics",
       "software-engineering/query-model-vs-domain-repository-drill"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "SQL JOIN 문법의 INNER JOIN과 LEFT JOIN 차이만 알고 싶어",
+      "GROUP BY 함수 문법만 예제로 알려줘",
+      "JPA N+1 fetch 전략을 join cardinality 없이 설명해줘"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/sql-join-cardinality-mission-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147"
+      }
+    ]
   }
 }

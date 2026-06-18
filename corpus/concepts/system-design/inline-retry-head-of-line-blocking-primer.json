@@ -2,60 +2,66 @@
   "id": "system-design/inline-retry-head-of-line-blocking-primer",
   "title": "Inline Retry Head-of-Line Blocking Primer",
   "category": "system-design",
-  "level": "intermediate",
-  "summary": "consumer loop나 worker thread 안에서 실패 메시지를 sleep/backoff로 붙잡고 재시도하면 같은 partition이나 queue 뒤의 정상 메시지가 막히는 head-of-line blocking을 설명한다. Retry topic ladder, DLQ, idempotency, backpressure로 이어지는 beginner failure mode다.",
-  "body_markdown": "# Inline Retry Head-of-Line Blocking Primer\n\n## 한 줄 요약\n\n실패한 메시지를 consumer thread 안에서 `sleep`하며 계속 retry하면 그 thread나 partition 뒤의 정상 메시지까지 막힌다. 이것이 inline retry가 만드는 head-of-line blocking이다.\n\n## 어떤 상황인가\n\nConsumer가 메시지를 읽고 downstream API를 호출한다. Downstream이 5분 동안 장애라서 실패한다. Consumer가 같은 메시지를 붙잡고 1초, 5초, 30초 sleep하며 재시도하면 그동안 같은 partition의 다음 메시지는 처리되지 못한다.\n\n```text\npartition P0 records: A(fails) B C D\nconsumer handles A\nA retry sleep 30s\nB C D wait behind A\nlag grows\n```\n\n이 방식은 단순하지만, 일시 장애 하나가 partition 전체 lag로 번질 수 있다.\n\n## head-of-line blocking이 왜 문제인가\n\nQueue나 Kafka partition은 순서를 지키기 위해 앞 메시지가 오래 걸리면 뒤 메시지가 기다릴 수 있다. Retry를 inline으로 오래 잡으면 실패 메시지가 줄 맨 앞에서 길을 막는다.\n\n증상:\n\n- consumer lag가 증가한다.\n- 처리 가능한 정상 메시지도 늦어진다.\n- max.poll.interval.ms를 넘겨 rebalance가 발생할 수 있다.\n- worker thread가 sleep으로 묶여 처리량이 떨어진다.\n- retry storm이 downstream 회복을 더 늦춘다.\n\n## retry topic ladder와 비교\n\nRetry topic ladder는 실패 메시지를 main path 밖으로 보내고, 지연 시간이 지난 뒤 다시 처리한다. 이렇게 하면 main topic partition을 오래 붙잡지 않는다.\n\n| 방식 | 장점 | 위험 |\n|---|---|---|\n| Inline retry | 구현이 쉽고 ordering 유지가 쉬움 | HOL blocking, lag 증가, thread 점유 |\n| Retry topic | main path unblock | ordering 변화, 중복 처리, 운영 복잡도 |\n| DLQ | poison message 격리 | 방치하면 누락 |\n| Immediate fail-fast | latency 보호 | transient failure 회복 기회 감소 |\n\nRetry topic이 항상 정답은 아니다. 같은 key의 순서가 매우 중요하면 inline retry나 partition pause를 제한적으로 쓸 수 있다. 하지만 오래 sleep하는 무제한 retry는 운영적으로 위험하다.\n\n## retryable과 poison 구분\n\nInline retry가 위험한 이유 중 하나는 모든 실패를 같은 방식으로 다시 시도하기 때문이다.\n\n- 일시 장애: timeout, 503, rate limit -> backoff retry 후보\n- 영구 실패: schema mismatch, validation error, unknown enum -> DLQ/수정 필요\n- 권한 문제: credential/config fix 필요\n- 데이터 충돌: idempotency/reconciliation 필요\n\nPoison message를 inline retry하면 같은 메시지가 계속 앞을 막는다. Retryable failure라도 retry budget과 deadline이 필요하다.\n\n## Kafka에서 특히 조심할 점\n\nKafka consumer는 poll loop와 offset commit 경계를 관리해야 한다. 긴 inline retry가 poll을 막으면 group에서 죽은 consumer처럼 보일 수 있다. 또 실패 record를 처리하지 못해 offset commit high watermark가 멈추면 같은 partition 뒤 record까지 진행되지 않는다.\n\n대응:\n\n- retry budget을 둔다.\n- 실패 record를 retry topic이나 DLQ로 보낸다.\n- partition pause/resume을 명시적으로 관리한다.\n- idempotent handler를 만든다.\n- max.poll.interval.ms와 processing time을 맞춘다.\n\n## 흔한 오해\n\n- \"재시도는 많을수록 안전하다\": downstream 장애 중에는 retry가 부하를 증폭한다.\n- \"sleep backoff를 넣었으니 괜찮다\": consumer thread와 partition을 붙잡는 비용이 있다.\n- \"retry topic으로 빼면 순서 문제가 사라진다\": main path는 풀리지만 ordering contract는 바뀐다.\n- \"DLQ는 실패 해결이다\": 격리일 뿐이고 replay/repair가 필요하다.\n- \"consumer lag는 Kafka 문제다\": inline retry나 downstream 장애가 만든 application lag일 수 있다.\n\n## 검증 지표\n\n- consumer processing time per record\n- retry sleep time total\n- partition lag and oldest record age\n- retry attempt count\n- max.poll.interval.ms violation count\n- rebalance count during failure\n- downstream error rate\n- retry topic inflow/outflow\n- DLQ count by failure class\n\n## 면접 답변 축\n\nInline retry 질문에는 \"consumer가 실패 메시지를 붙잡고 sleep/retry하면 같은 partition이나 worker queue 뒤의 정상 메시지까지 막아 head-of-line blocking을 만든다\"고 답한다. 이어서 retry budget, retry topic ladder, DLQ, idempotent consumer, ordering trade-off를 함께 설계해야 한다고 말하면 된다.\n\n## Safe Next Docs\n\nRetry topic ladder는 `tiered-retry-topic-ladder-backoff-dlq`, retry storm은 `retry-amplification-and-backpressure-primer`, Kafka offset gap은 `kafka-out-of-order-commit-offset-gap-parallelism`으로 이어진다.\n",
+  "level": "beginner",
+  "summary": "이 primer는 실패한 작업을 같은 요청 thread나 worker lane 안에서 즉시 재시도할 때, 뒤 작업이 앞 작업의 timeout/backoff에 막히는 inline retry head-of-line blocking을 설명한다. 핵심은 retry 횟수보다 scarce lane을 얼마나 오래 점유하는지와 delayed requeue, bounded retry, bulkhead로 점유 시간을 끊는 기준이다.",
+  "body_markdown": "# Inline Retry Head-of-Line Blocking Primer\n\n> 한 줄 요약: 실패한 작업을 같은 thread나 worker lane에서 기다리며 재시도하면, 그 작업 하나가 뒤에 선 요청까지 붙잡는 head-of-line blocking을 만든다.\n\n## 핵심 문제\n\nInline retry는 실패한 호출을 처리 중인 자리에서 바로 다시 시도하는 방식이다. 짧은 일시 오류에는 단순하지만, 같은 worker thread, consumer partition, request lane, connection slot을 계속 점유한다는 비용이 있다. 앞 작업이 외부 API timeout을 기다리고, backoff sleep까지 같은 lane 안에서 수행하면 뒤 작업은 처리 가능한 상태여도 시작하지 못한다.\n\n```text\nworker lane 1\nA: provider timeout -> sleep 500ms -> retry -> timeout -> retry\nB: ready but waiting behind A\nC: ready but waiting behind A\n```\n\n이 장면의 invariant는 \"재시도는 남은 deadline과 lane 점유 예산 안에서만 수행하고, 오래 기다릴 작업은 lane 밖의 delayed requeue 또는 별도 retry queue로 넘긴다\"이다. retry 자체가 문제라기보다, 실패한 작업이 scarce execution lane을 오래 붙잡는 것이 문제다.\n\n## 먼저 보는 증상\n\n| 증상 | inline retry 의심 신호 | 먼저 확인할 지표 |\n|---|---|---|\n| 처리량은 늘지 않는데 queue age가 증가 | worker가 retry sleep이나 timeout 대기에 묶임 | active worker, retry sleep time, oldest queued age |\n| 특정 provider 장애 뒤 무관한 작업도 늦어짐 | 같은 pool/lane에서 retry가 inline으로 수행됨 | dependency별 latency, pool occupancy, queue wait |\n| 실패 작업 하나가 partition을 오래 점유 | 같은 key나 partition 뒤 메시지가 시작하지 못함 | partition lag, per-key wait, processing duration |\n| timeout을 늘렸더니 성공률보다 p99가 더 나빠짐 | lane 점유 시간이 같이 늘어남 | attempt timeout, end-to-end deadline, started-too-late count |\n\n## Inline retry가 괜찮은 경우와 위험한 경우\n\n| 선택 | 맞는 경우 | 위험해지는 경우 |\n|---|---|---|\n| 짧은 inline retry | idempotent read, 수십 ms jitter, 남은 deadline 충분 | attempt timeout이 길고 worker 수가 적음 |\n| delayed requeue | backoff가 필요하고 기다리는 동안 lane을 비워야 함 | requeue가 중복 실행을 만들 idempotency가 없음 |\n| 별도 retry queue | 실패 작업을 정상 traffic과 격리해야 함 | retry queue에 age/depth 상한이 없음 |\n| DLQ 또는 quarantine | payload bug, terminal failure, 반복 poison | 원인 제거 전 replay로 다시 HOL을 만듦 |\n| circuit breaker/bulkhead | provider 장애가 계속되어 새 inline attempt를 줄여야 함 | fallback/status 계약 없이 실패만 숨김 |\n\n실무 판단은 \"retry를 몇 번 할까\"보다 \"그 retry가 어떤 lane을 점유하는가\"에서 시작한다. 사용자 요청 thread 안에서 2초를 두 번 기다리는 것은 queue worker 하나를 4초 잡는 것과 같은 형태의 비용을 만든다.\n\n## 흔한 오해\n\n- `retry 횟수가 1회라서 안전하다`고 단정하면 안 된다. 1회라도 timeout이 길면 뒤 작업을 오래 막을 수 있다.\n- `queue가 있으니 backpressure가 된다`고 보면 안 된다. worker가 inline sleep에 묶이면 queue는 단순 대기열이 되어 age가 증가한다.\n- `head-of-line blocking`을 HTTP/2나 TCP 문제로만 보면 안 된다. 애플리케이션 worker lane, partition, per-key queue에서도 같은 형태가 생긴다.\n- `delayed requeue`는 공짜가 아니다. idempotency key, max attempt, next visible time, deadline expired drop이 같이 있어야 한다.\n\n## 검증 순서\n\n1. retry가 실행되는 위치를 찾는다. request thread, scheduler thread, queue consumer, provider client interceptor 중 어디가 owner인지 표시한다.\n2. 한 logical work item의 최대 lane 점유 시간을 계산한다. `attempt_timeout * attempts + backoff_sleep + local_processing`이 end-to-end deadline보다 작아야 한다.\n3. retry sleep이나 timeout 대기 중 worker가 다른 작업을 처리할 수 있는지 확인한다. 처리할 수 없다면 HOL 위험이 있다.\n4. provider 지연을 주입해 queue depth뿐 아니라 oldest queued age와 started-too-late count가 증가하는지 본다.\n5. delayed requeue로 바꾸는 경우 같은 idempotency key, attempt count, next retry time, expired drop 기준이 남는지 확인한다.\n6. 정상 traffic p99와 retry traffic p99를 분리해 retry가 core lane을 잠식하지 않는지 본다.\n\n## 설계 체크리스트\n\n- retry owner는 한 곳인가?\n- 남은 deadline이 다음 attempt 비용보다 작은데도 retry하지 않는가?\n- backoff 대기는 worker lane 밖에서 일어나는가?\n- 같은 key나 partition 뒤 작업이 앞 실패 작업에 무기한 막히지 않는가?\n- retryable failure와 terminal failure가 분리되는가?\n- retry queue에는 depth, age, max attempt, DLQ 정책이 있는가?\n- 지표는 `retry_count`뿐 아니라 `lane_occupied_ms`, `queue_wait_ms`, `oldest_age`, `started_too_late_total`을 본다.\n\n## Safe Next Docs\n\nRetry 증폭의 전체 그림은 `retry-amplification-and-backpressure-primer`, timeout budget 계산은 `request-deadline-timeout-budget-primer`, queue 설계와 DLQ는 `job-queue-design`과 `work-queue-visibility-timeout-lease-heartbeat-chooser`로 이어진다. 동기 API와 queue handoff 선택이 헷갈리면 `per-key-queue-vs-direct-api-primer`로 돌아가 응답 계약부터 다시 고른다.\n\n## 작은 설계 예시\n\n주문 확인 worker가 외부 결제 provider를 호출한다고 하자. 각 worker는 20개뿐이고, provider timeout은 2초다. 여기서 `timeout 2초 * retry 2회 + sleep 500ms`를 같은 worker 안에서 수행하면 실패한 주문 하나가 최대 4.5초 동안 lane을 잡는다. 장애 순간에 실패 작업이 20개만 쌓여도 새 주문은 처리 가능한 상태여도 시작하지 못한다. 이때 p99가 나빠지는 이유는 provider 호출이 느려서만이 아니라, worker lane 전체가 기다리는 작업으로 채워지기 때문이다.\n\n더 안전한 구조는 첫 attempt를 짧게 수행하고, 남은 deadline이 충분하지 않으면 `next_visible_at`을 가진 retry queue로 넘기는 것이다. retry queue에는 `attempt`, `first_seen_at`, `deadline_at`, `last_error_class`를 남긴다. worker는 sleep하지 않고 다음 작업을 잡고, scheduler나 queue visibility timeout이 재시도 시점을 관리한다. 이렇게 하면 실패 작업은 사라지지 않지만 정상 traffic lane을 계속 점유하지 않는다.\n\n## 리뷰에서 확인할 질문\n\n코드 리뷰에서는 `@Retryable`, client interceptor, queue consumer loop 안의 `Thread.sleep`, `CompletableFuture.join` 같은 위치를 먼저 본다. retry가 library annotation으로 숨어 있으면 호출자가 lane 점유 시간을 계산하지 못한다. 그래서 PR 설명에는 attempt timeout, max attempt, backoff 위치, 전체 request deadline, retry exhausted 이후 상태가 같이 있어야 한다.\n\n특히 같은 partition 순서를 보존해야 하는 consumer라면 delayed requeue도 조심해야 한다. 앞 메시지를 밖으로 빼고 뒤 메시지를 먼저 처리해도 되는지, 아니면 per-key ordering 때문에 실패 key만 별도 lane으로 격리해야 하는지를 결정해야 한다. HOL을 피하겠다고 순서 보장을 몰래 포기하면 다른 종류의 정합성 버그가 생긴다.\n",
   "aliases": [
+    "inline retry head-of-line blocking",
     "inline retry HOL blocking",
-    "head of line blocking retry",
-    "consumer sleep retry",
-    "재시도 때문에 lag",
-    "메시지 줄막힘",
-    "Kafka inline retry",
-    "partition blocked by retry",
-    "retry topic 필요한 이유",
-    "consumer thread sleep",
-    "poison message blocks"
+    "retry in worker thread blocking",
+    "retry sleep blocks queue",
+    "worker retry head of line",
+    "backoff requeue vs inline retry",
+    "재시도 중 대기열 앞막힘",
+    "인라인 재시도 HOL blocking",
+    "동기 재시도 요청 지연",
+    "queue retry 앞 요청이 막음"
   ],
   "expected_queries": [
-    "consumer loop 안에서 sleep하면서 retry하면 왜 head-of-line blocking이 생겨?",
-    "Kafka에서 실패 메시지를 inline retry하면 같은 partition 뒤 메시지가 왜 밀려?",
-    "retry topic ladder를 쓰는 이유가 main topic consumer를 오래 붙잡지 않기 위해서야?",
-    "poison message를 계속 inline retry하면 consumer lag가 왜 계속 쌓여?",
-    "max.poll.interval.ms와 inline retry sleep은 어떤 관계가 있어?",
-    "재시도를 많이 하는 게 안전한 게 아니라 retry storm과 HOL blocking을 만들 수 있다는 걸 설명해줘"
+    "worker 안에서 바로 retry하면 뒤 요청이 왜 head-of-line blocking에 걸려?",
+    "inline retry와 delayed requeue retry는 언제 나눠야 해?",
+    "재시도 sleep을 같은 thread에서 하면 queue backlog가 왜 늘어나?",
+    "외부 API가 느릴 때 inline retry 대신 backoff queue를 쓰는 기준은 뭐야?",
+    "head-of-line blocking 없이 실패 작업을 재시도하려면 어떤 지표를 봐야 해?"
   ],
   "symptoms": [
-    "downstream 장애 동안 consumer thread가 sleep retry로 묶인다",
-    "하나의 실패 메시지 때문에 partition lag가 계속 증가한다",
-    "schema poison message를 계속 재시도해 정상 메시지도 처리되지 않는다"
+    "실패한 작업 하나가 retry sleep 동안 worker를 붙잡아 뒤 작업이 시작하지 못한다",
+    "외부 API timeout 뒤 queue depth보다 oldest queued age와 p99 latency가 먼저 악화된다",
+    "retry 횟수만 줄이면 된다고 보고 lane 점유 시간과 backoff 위치를 확인하지 않는다"
   ],
   "relations": {
     "prerequisites": [
-      "system-design/queue-delivery-semantics-beginner-primer",
+      "system-design/request-deadline-timeout-budget-primer",
       "system-design/retry-amplification-and-backpressure-primer"
     ],
     "next_docs": [
-      "system-design/tiered-retry-topic-ladder-backoff-dlq",
-      "system-design/dlq-poison-message-replay-playbook",
-      "system-design/kafka-out-of-order-commit-offset-gap-parallelism"
+      "system-design/backpressure-and-load-shedding-design",
+      "system-design/job-queue-design",
+      "system-design/work-queue-visibility-timeout-lease-heartbeat-chooser",
+      "system-design/per-key-queue-vs-direct-api-primer"
     ],
     "confusable_with": [
-      "system-design/tiered-retry-topic-ladder-backoff-dlq",
       "system-design/retry-amplification-and-backpressure-primer",
-      "system-design/work-queue-visibility-timeout-lease-heartbeat-chooser"
+      "system-design/request-deadline-timeout-budget-primer",
+      "system-design/job-queue-design",
+      "network/http2-http3-hol-flow-control-perspective-map"
     ],
     "forbidden_for_queries": [
-      "retry topic ladder와 DLQ header 설계를 자세히 설명해줘",
-      "work queue visibility timeout과 lease heartbeat를 설명해줘"
+
     ]
   },
-  "learner_query_patterns": [],
+  "learner_query_patterns": [
+
+  ],
   "metadata": {
     "schema_version": "v2",
-    "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
-    "legacy_path": "knowledge/cs/contents/system-design/inline-retry-head-of-line-blocking-primer.md",
-    "revision_history": []
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147"
+      }
+    ]
   }
 }

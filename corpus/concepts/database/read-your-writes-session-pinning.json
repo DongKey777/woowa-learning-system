@@ -6,30 +6,39 @@
   "summary": "사용자는 “방금 바꾼 값이 바로 보여야 한다”고 기대하고, 그 기대를 지키려면 읽기 라우팅에 세션 기억이 들어가야 한다.",
   "body_markdown": "# Read-Your-Writes와 Session Pinning 전략\n\n> 한 줄 요약: 사용자는 “방금 바꾼 값이 바로 보여야 한다”고 기대하고, 그 기대를 지키려면 읽기 라우팅에 세션 기억이 들어가야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md), [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md), [Monotonic Reads와 Session Guarantees](./monotonic-reads-session-guarantees.md), [Client Consistency Tokens](./client-consistency-tokens.md), [Causal Consistency Intuition](./causal-consistency-intuition.md), [Replication Failover and Split Brain](./replication-failover-split-brain.md)\nretrieval-anchor-keywords: read-your-writes, read your writes, session pinning, session pinning ttl, sticky session, session affinity, primary pinning, recent write primary fallback, monotonic read, consistency token, causal token, own write not visible, refresh after edit shows old value, profile update not showing, same user sees stale data, my update disappeared after refresh, 수정 직후 새로고침 옛값, 내가 바꾼 값이 안 보임, 사용자 본인 변경 즉시 반영, recent write routing\n\n## 증상별 바로 가기\n\n- `내가 방금 수정한 값이 내 화면에 안 보인다`, `my update disappeared after refresh`처럼 같은 사용자 세션의 최신성 보장이 핵심이면 이 문서에서 session pinning, TTL, primary fallback을 본다.\n- `write 직후 전체적으로 stale하다`, `insert succeeded but row is still missing`처럼 replica lag 자체를 먼저 의심해야 하면 [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md)로 간다.\n- `새로고침마다 old/new가 번갈아 나온다`, `retry changed result`, `pagination order keeps flipping`처럼 요청별 라우팅이 흔들리면 [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md)을 먼저 본다.\n- 세션 메모리보다 클라이언트 전달 토큰이 더 적합한 경우는 [Client Consistency Tokens](./client-consistency-tokens.md)에서 이어 본다.\n\n## 핵심 개념\n\nRead-your-writes는 한 세션에서 자신이 방금 쓴 데이터가 다음 읽기에서 보이는 성질이다.  \n분산 DB나 primary/replica 구조에서는 이 성질이 자동으로 보장되지 않는다.\n\n왜 중요한가:\n\n- 프로필 수정 직후 새로고침하면 옛 값이 보일 수 있다\n- 주문 생성 후 상세 조회가 replica를 타면 결과가 안 보일 수 있다\n- 사용자 입장에서는 “쓰기 성공”보다 “즉시 반영”이 더 중요할 때가 많다\n\nsession pinning은 이런 문제를 막기 위해, 최근 쓰기가 발생한 세션을 특정 읽기 경로에 묶는 전략이다.\n\n## 깊이 들어가기\n\n### 1. 왜 read-your-writes가 깨지는가\n\n쓰기와 읽기가 서로 다른 노드로 가면, replica lag 때문에 최신 write가 아직 보이지 않을 수 있다.\n\n하지만 lag만이 원인은 아니다.\n\n- 첫 읽기는 primary, 다음 읽기는 replica로 바뀐다\n- 커넥션 풀 재선택으로 다른 replica를 탄다\n- retry가 다른 endpoint로 라우팅된다\n- failover 직후 토폴로지 인식이 늦는다\n\n즉 read-your-writes는 복제 지연 문제이면서 동시에 **라우팅 일관성 문제**다.\n\n### 2. session pinning의 기본 방식\n\n가장 단순한 방식은 “최근 write가 있었으면 일정 시간 primary로 보낸다”다.\n\n이 패턴은 다음과 같다.\n\n- write 성공 시 세션에 플래그를 남긴다\n- 플래그가 살아 있는 동안 read는 primary로 간다\n- TTL이 지나면 replica로 복귀한다\n\n더 정교한 방식은 GTID, LSN, commit token을 세션에 저장해 replica가 그 지점까지 따라왔는지 확인하는 것이다.\n\n### 3. 언제 sticky session이 충분한가\n\nsticky session은 구현이 단순하지만 정확도가 낮다.\n\n- 모바일 앱처럼 한 사용자가 비교적 긴 세션을 유지하는 경우\n- read-after-write가 중요하지만, 세션 내 최신성만 맞으면 되는 경우\n- 트래픽이 크지 않아 primary 부담을 감당할 수 있는 경우\n\n반대로 관리자 화면, 결제 상태, 재고 화면처럼 정확한 최신성이 중요하면 token 기반 라우팅이 더 낫다.\n\n### 4. 세션 pinning의 함정\n\n- TTL이 너무 길면 primary가 과부하된다\n- TTL이 너무 짧으면 read-your-writes가 다시 깨진다\n- 세션이 아니라 커넥션에만 묶으면 connection pool 재사용 시 의미가 없다\n- 쿠키나 로컬 메모리만 쓰면 멀티 인스턴스에서 사라진다\n\n## 실전 시나리오\n\n### 시나리오 1: 회원 정보 수정 직후 페이지 새로고침\n\n이름을 바꿨는데 새로고침하자마자 옛 이름이 보이면 사용자 신뢰가 깨진다.  \n이때 최근 write 세션은 primary로 pinning해야 한다.\n\n### 시나리오 2: 주문 생성 후 주문 목록 조회\n\n주문은 성공했지만 목록이 replica에서 읽혀 아직 반영되지 않았다면, 사용자는 실패했다고 생각할 수 있다.  \n주문 생성 직후는 primary fallback이 안전하다.\n\n### 시나리오 3: 고객센터 상담사가 상태 변경 후 화면 확인\n\n관리자 도구는 지연보다 정합성이 중요하다.  \n이 경우 sticky session보다 causal token 기반 라우팅이 더 적합하다.\n\n## 코드로 보기\n\n```java\nclass SessionRoutingContext {\n    private boolean recentWrite;\n    private long writeAtMillis;\n\n    boolean shouldUsePrimary(long nowMillis) {\n        return recentWrite && nowMillis - writeAtMillis < 30_000;\n    }\n}\n\nclass ReadRouter {\n    DataSource route(SessionRoutingContext ctx, long nowMillis) {\n        if (ctx.shouldUsePrimary(nowMillis)) {\n            return primaryDataSource;\n        }\n        return replicaPool.pick();\n    }\n}\n```\n\n```sql\n-- GTID 기반 read-after-write 보강 예시\nSELECT WAIT_FOR_EXECUTED_GTID_SET('uuid:1-12345', 1);\nSELECT * FROM orders WHERE id = 9001;\n```\n\n세션 pinning은 “항상 primary로 읽자”가 아니라, **최근 write의 관측을 유지할 만큼만 primary를 쓰자**는 뜻이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 무작위 replica 읽기 | 확장성이 좋다 | read-your-writes가 깨진다 | 최신성이 덜 중요한 조회 |\n| TTL 기반 primary pinning | 구현이 쉽다 | primary 부하가 늘어난다 | 짧은 사용자 플로우 |\n| sticky session | 사용자 경험이 안정적이다 | 노드 분산 효율이 낮다 | 세션 중심 서비스 |\n| GTID/LSN 기반 라우팅 | 일관성이 높다 | 구현과 운영이 복잡하다 | 결제/관리/상태 변경 경로 |\n\n## 꼬리질문\n\n> Q: read-your-writes를 왜 replica lag만으로 설명하면 안 되나요?\n> 의도: 라우팅 자체의 흔들림을 이해하는지 확인\n> 핵심: lag가 작아도 다른 replica를 타면 옛 값을 볼 수 있다\n\n> Q: primary pinning은 왜 TTL이 필요하나요?\n> 의도: 영구 pinning이 아니라 완화 전략임을 아는지 확인\n> 핵심: 최신성이 지나간 뒤에도 primary를 계속 쓰면 부하가 커진다\n\n> Q: sticky session과 causal token 기반 라우팅의 차이는 무엇인가요?\n> 의도: 단순 affinity와 정교한 일관성 제어를 구분하는지 확인\n> 핵심: sticky는 단순하지만 부정확하고, token 기반은 더 정확하다\n\n## 한 줄 정리\n\nRead-your-writes를 지키려면 replica lag만 보는 게 아니라, 최근 write가 있었던 세션을 primary나 충분히 앞선 replica로 라우팅해야 한다.\n",
   "aliases": [
-    "read-your-writes",
-    "session pinning",
-    "sticky session",
+    "read-your-writes 세션 보장",
+    "read your writes session guarantee",
+    "session pinning TTL",
     "recent write primary fallback",
-    "내가 바꾼 값이 안 보임"
+    "최근 write primary",
+    "최근쓰기 primary",
+    "내 수정 즉시 반영",
+    "내수정 즉시반영",
+    "프로필 수정 옛값",
+    "주문 생성 직후 목록"
   ],
   "expected_queries": [
-    "read-your-writes는 session pinning으로 어떻게 보장해?",
-    "내가 방금 수정한 값이 새로고침하면 옛값으로 보일 때 뭘 봐?",
-    "recent write가 있으면 primary로 pinning하는 기준은 뭐야?",
-    "sticky session과 causal token은 read-your-writes에서 어떻게 달라?"
+    "프로필 수정 성공했는데 새로고침하면 옛 이름이 보여, 같은 사용자에게만 바로 보이게 하려면?",
+    "주문 생성 직후 목록 조회가 replica를 타서 안 보일 때 primary로 얼마나 묶어야 해?",
+    "recent write 플래그랑 LSN 토큰 중 어떤 방식으로 read-your-writes를 지켜야 할지 모르겠어",
+    "session pinning TTL을 너무 짧거나 길게 잡으면 각각 무슨 문제가 생겨?",
+    "sticky session만 걸면 내가 쓴 값이 안 보이는 문제를 해결했다고 말해도 돼?"
   ],
   "symptoms": [
-    "`Read-Your-Writes와 Session Pinning 전략`를 정의 수준으로만 알고 실제 락, 트랜잭션, 복제, 성능 문제와 연결하지 못한다",
-    "`Read-Your-Writes와 Session Pinning 전략` 관련 로그나 지표가 보여도 원인 후보와 확인 순서를 좁히지 못한다",
-    "`Read-Your-Writes와 Session Pinning 전략`의 보장 범위와 아닌 것을 구분하지 못해 과한 일반화를 한다",
-    "SQL, 락, 트랜잭션, 복제 지표가 섞여 DB 안에서 어떤 경계를 확인해야 하는지 헷갈린다"
+    "프로필 수정이나 주문 생성 직후 같은 사용자에게 옛값이 다시 보인다",
+    "replica lag만 줄이면 read-your-writes가 항상 보장된다고 오해한다",
+    "sticky session, TTL primary pinning, LSN token의 보장 범위를 구분하지 못한다",
+    "recent write 세션을 너무 오래 primary에 묶어 부하와 최신성 요구를 함께 흔든다"
   ],
   "relations": {
     "prerequisites": [
-      "database/transaction-basics"
+      "database/transaction-basics",
+      "database/read-after-write-routing-decision-guide"
     ],
     "next_docs": [
-      "database/isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer"
+      "database/client-consistency-tokens",
+      "database/read-your-writes-consistency-token-playbook",
+      "design-pattern/session-pinning-vs-version-gated-strict-reads"
     ],
     "confusable_with": [
       "database/roomescape-reservation-create-read-after-write-bridge",
@@ -39,14 +48,23 @@
       "database/read-after-write-routing-decision-guide",
       "database/cache-replica-split-read-inconsistency"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "replica lag가 시스템 전체 읽기 지연으로 보이는 현상만 설명해줘",
+      "monotonic reads와 causal consistency 차이를 이론적으로 비교해줘",
+      "snapshot isolation에서 같은 트랜잭션 read snapshot을 고정하는 방법을 알려줘"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/read-your-writes-session-pinning.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch147"
+      }
+    ]
   }
 }
