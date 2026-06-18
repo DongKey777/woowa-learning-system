@@ -4,17 +4,25 @@
   "category": "security",
   "level": "intermediate",
   "summary": "이 bridge는 tenant isolation과 resource-level authorization을 미션 설계로 연결한다. tenantId 위조, 조직별 데이터 접근, Repository query tenant 조건, admin scope 혼동 같은 질문을 다룬다.",
-  "body_markdown": "# Tenant Isolation Mission Authz Bridge\n\n## 미션 장면\n\n조직, 매장, 팀 단위로 데이터가 나뉘는 서비스에서는 같은 role이라도 tenant가 다르면 리소스 접근이 막혀야 한다.\n\n## 리뷰에서 보이는 냄새\n\nRequest body나 path의 `tenantId`를 그대로 신뢰하면 사용자가 값을 바꿔 다른 tenant 데이터에 접근할 수 있다. 인증 주체가 속한 tenant와 resource tenant를 서버에서 비교해야 한다.\n\n`ADMIN` role이 있으면 모든 tenant를 볼 수 있다고 처리하는 코드도 위험하다. global admin인지, 특정 tenant admin인지, support read-only role인지 scope를 분리해야 한다.\n\n## 관찰 증거\n\n- `GET /tenants/A/orders/1`에서 path tenant와 실제 order tenant가 같은지 확인한다.\n- 인증 principal에 tenant membership 또는 tenant scope가 어떤 형태로 들어오는지 본다.\n- repository query에 `tenant_id = ?` 조건이 빠진 list/detail 경로가 있는지 찾는다.\n- response body에 다른 tenant의 id, name, count, aggregate가 섞이는지 본다.\n- audit log에 actor tenant, resource tenant, decision reason이 남는지 확인한다.\n\n## 10초 분기\n\n| 관찰 | 먼저 볼 것 | 의미 |\n|---|---|---|\n| URL tenant만 바꾸면 데이터가 보임 | path tenant를 신뢰하는지 | resource-level authz 누락이다 |\n| detail은 막히는데 list에서 섞임 | repository/list query predicate | 목록 경로의 tenant 필터 누락이다 |\n| admin만 우회 가능 | admin role의 tenant scope | role과 tenant scope를 섞은 상태다 |\n| body tenant와 principal tenant가 다름 | server-side membership check | 클라이언트 입력을 권한 근거로 쓰면 안 된다 |\n| 캐시에서 다른 tenant 응답이 나옴 | cache key에 tenant 포함 여부 | authz와 cache isolation이 같이 깨진다 |\n\n## 개념 handoff\n\nTenant isolation은 API layer, service policy, repository query, DB constraint에서 중복 방어될 수 있다. 하나만 믿으면 누락된 경로가 생긴다.\n\n인증은 \"누구인가\"를 알려주고, tenant authorization은 \"이 사용자가 이 tenant의 이 resource에 접근할 수 있는가\"를 판단한다. JWT claim이나 세션 principal에 tenant가 들어 있어도 resource의 실제 tenant와 비교하지 않으면 격리가 완성되지 않는다.\n\n## 보안 의미와 운영 의미\n\n보안 의미는 다른 조직의 데이터 노출을 막는 invariant다. 사용자가 조작할 수 있는 path/body/query parameter는 권한 근거가 아니라 조회 대상 힌트일 뿐이다.\n\n운영 의미는 tenant 이동, 조직 병합, 멤버십 변경, support 접근 같은 예외 흐름을 추적 가능하게 만드는 것이다. 이때도 예외는 정책으로 표현하고 audit log에 남겨야지, role 하나로 모든 tenant 필터를 끄면 안 된다.\n\nDB row-level policy나 foreign key는 좋은 방어선이지만 애플리케이션 authz를 대체하지 않는다. 반대로 service check가 있어도 query predicate가 빠지면 list/aggregate leak이 생긴다.\n\n## 흔한 오해\n\n- `tenantId`를 JWT에 넣었으니 안전하다고 생각하면 안 된다. resource가 실제로 어느 tenant에 속하는지 비교해야 한다.\n- 프론트엔드에서 tenant dropdown을 제한하면 충분하다고 보면 안 된다. API 요청은 직접 만들 수 있다.\n- admin role은 tenant isolation 예외라고 단정하면 안 된다. global 권한과 tenant-local 권한을 구분해야 한다.\n- 404로 숨기면 audit이 필요 없다고 생각하면 안 된다. 사용자에게는 404를 주더라도 내부 decision log는 남기는 편이 좋다.\n\n## Drill 후보\n\n`GET /tenants/{tenantId}/orders/{orderId}`에서 인증 사용자, path tenant, order tenant를 어떤 순서로 검증할지 적어 본다.\n\n힌트: path tenant를 먼저 신뢰하지 말고 order를 tenant 조건과 함께 조회하거나, 조회 후 resource tenant와 principal tenant scope를 비교한다. 존재 여부 노출 정책은 별도로 정한다.\n\n## Safe Next Docs\n\n테스트 케이스로 격리를 검증하려면 `security/tenant-isolation-authz-testing`으로 이어서 본다.\n\nresource 단위 권한 판단의 기본기를 다시 잡으려면 `security/resource-level-authz-decision-practice`를 본다.\n",
+  "body_markdown": "# Tenant Isolation Mission Authz Bridge\n\n## 미션 장면\n\n조직, 매장, 팀 단위로 데이터가 나뉘는 서비스에서는 같은 role이라도 tenant가 다르면 리소스 접근이 막혀야 한다.\n\n## 리뷰에서 보이는 냄새\n\nRequest body나 path의 `tenantId`를 그대로 신뢰하면 사용자가 값을 바꿔 다른 tenant 데이터에 접근할 수 있다. 인증 주체가 속한 tenant와 resource tenant를 서버에서 비교해야 한다.\n\n`ADMIN` role이 있으면 모든 tenant를 볼 수 있다고 처리하는 코드도 위험하다. global admin인지, 특정 tenant admin인지, support read-only role인지 scope를 분리해야 한다.\n\n## 관찰 증거\n\n- `GET /tenants/A/orders/1`에서 path tenant와 실제 order tenant가 같은지 확인한다.\n- 인증 principal에 tenant membership 또는 tenant scope가 어떤 형태로 들어오는지 본다.\n- repository query에 `tenant_id = ?` 조건이 빠진 list/detail 경로가 있는지 찾는다.\n- response body에 다른 tenant의 id, name, count, aggregate가 섞이는지 본다.\n- audit log에 actor tenant, resource tenant, decision reason이 남는지 확인한다.\n\n## 10초 분기\n\n| 관찰 | 먼저 볼 것 | 의미 |\n|---|---|---|\n| URL tenant만 바꾸면 데이터가 보임 | path tenant를 신뢰하는지 | resource-level authz 누락이다 |\n| detail은 막히는데 list에서 섞임 | repository/list query predicate | 목록 경로의 tenant 필터 누락이다 |\n| admin만 우회 가능 | admin role의 tenant scope | role과 tenant scope를 섞은 상태다 |\n| body tenant와 principal tenant가 다름 | server-side membership check | 클라이언트 입력을 권한 근거로 쓰면 안 된다 |\n| 캐시에서 다른 tenant 응답이 나옴 | cache key에 tenant 포함 여부 | authz와 cache isolation이 같이 깨진다 |\n\n## 개념 handoff\n\nTenant isolation은 API layer, service policy, repository query, DB constraint에서 중복 방어될 수 있다. 하나만 믿으면 누락된 경로가 생긴다.\n\n인증은 \"누구인가\"를 알려주고, tenant authorization은 \"이 사용자가 이 tenant의 이 resource에 접근할 수 있는가\"를 판단한다. JWT claim이나 세션 principal에 tenant가 들어 있어도 resource의 실제 tenant와 비교하지 않으면 격리가 완성되지 않는다.\n\n## 보안 의미와 운영 의미\n\n보안 의미는 다른 조직의 데이터 노출을 막는 invariant다. 사용자가 조작할 수 있는 path/body/query parameter는 권한 근거가 아니라 조회 대상 힌트일 뿐이다.\n\n운영 의미는 tenant 이동, 조직 병합, 멤버십 변경, support 접근 같은 예외 흐름을 추적 가능하게 만드는 것이다. 이때도 예외는 정책으로 표현하고 audit log에 남겨야지, role 하나로 모든 tenant 필터를 끄면 안 된다.\n\nDB row-level policy나 foreign key는 좋은 방어선이지만 애플리케이션 authz를 대체하지 않는다. 반대로 service check가 있어도 query predicate가 빠지면 list/aggregate leak이 생긴다.\n\n## 흔한 오해\n\n- `tenantId`를 JWT에 넣었으니 안전하다고 생각하면 안 된다. resource가 실제로 어느 tenant에 속하는지 비교해야 한다.\n- 프론트엔드에서 tenant dropdown을 제한하면 충분하다고 보면 안 된다. API 요청은 직접 만들 수 있다.\n- admin role은 tenant isolation 예외라고 단정하면 안 된다. global 권한과 tenant-local 권한을 구분해야 한다.\n- 404로 숨기면 audit이 필요 없다고 생각하면 안 된다. 사용자에게는 404를 주더라도 내부 decision log는 남기는 편이 좋다.\n\n## Drill 후보\n\n`GET /tenants/{tenantId}/orders/{orderId}`에서 인증 사용자, path tenant, order tenant를 어떤 순서로 검증할지 적어 본다.\n\n힌트: path tenant를 먼저 신뢰하지 말고 order를 tenant 조건과 함께 조회하거나, 조회 후 resource tenant와 principal tenant scope를 비교한다. 존재 여부 노출 정책은 별도로 정한다.\n\n## Worked example: 주문 상세 조회\n\n`GET /tenants/{tenantId}/orders/{orderId}`를 구현한다고 하자. 안전한 흐름은 path의 `tenantId`를 권한 근거로 믿지 않는 데서 시작한다. 서버가 신뢰할 수 있는 principal에서 사용자의 tenant membership과 scope를 꺼내고, order가 실제로 어느 tenant에 속하는지 조회한 뒤 두 값을 비교한다. 더 안전한 구현은 처음부터 `orderId`와 허용된 tenant scope를 함께 조건으로 걸어 조회해 다른 tenant resource가 결과로 나오지 않게 한다.\n\n```text\nprincipal tenant scope: store-A member\nrequest path tenant: store-B\nresource order tenant: store-B\n결론: path와 resource가 같아도 principal scope가 다르므로 거부한다\n```\n\n이 예시에서 핵심은 세 값의 출처가 다르다는 점이다. principal은 인증/세션에서 오고, path tenant는 사용자가 조작할 수 있는 입력이며, resource tenant는 저장소의 사실이다. 리뷰에서 자주 보이는 버그는 path tenant와 principal tenant만 비교하고 실제 order tenant를 보지 않거나, order만 조회한 뒤 tenant 조건 없이 반환하는 형태다.\n\n## 설계 선택지와 trade-off\n\n조회 단계에서 `findByIdAndTenantId`처럼 tenant predicate를 강제하면 실수로 다른 tenant row를 service에 올리는 위험이 줄어든다. 대신 존재하지 않는 order와 권한 없는 order를 같은 404로 숨길지, 내부 audit에는 403 decision을 남길지 정책을 정해야 한다. 조회 후 비교 방식은 domain rule을 명확히 표현하기 쉽지만, list나 aggregate query에서 tenant filter를 빼먹기 쉽다.\n\nadmin도 같은 원칙을 따른다. `ADMIN` 하나로 모든 tenant filter를 제거하면 tenant-local admin과 global support 권한이 섞인다. `role=ADMIN`, `scope=tenant:A`, `capability=ORDER_READ`처럼 역할, 범위, 행동을 분리하면 리뷰어가 \"이 관리자가 왜 이 tenant를 볼 수 있는가\"를 코드에서 따라갈 수 있다.\n\n## 테스트와 운영 신호\n\n테스트는 성공 케이스보다 cross-tenant 실패 케이스가 중요하다. 같은 `orderId` 형식으로 tenant A 사용자가 tenant B URL을 호출했을 때 detail, list, count, export, cache hit 경로가 모두 막히는지 본다. 특히 list와 aggregate는 단건 조회보다 누락되기 쉽다. `count(*)`, dashboard total, autocomplete 결과도 tenant data leak이 될 수 있다.\n\n운영 로그에는 actor id, actor tenant scope, resource id, resource tenant, decision, reason을 남긴다. 단, 응답 본문에는 다른 tenant의 존재를 과하게 노출하지 않는다. 캐시를 쓰는 경우 cache key에 tenant와 authorization-relevant scope가 들어가는지 확인한다. `orders:page:1` 같은 전역 key는 tenant A의 응답을 tenant B에게 재사용할 수 있으므로 위험하다.\n\n## Safe Next Docs\n\n테스트 케이스로 격리를 검증하려면 `security/tenant-isolation-authz-testing`으로 이어서 본다.\n\nresource 단위 권한 판단의 기본기를 다시 잡으려면 `security/resource-level-authz-decision-practice`를 본다.\n",
   "aliases": [
-    "tenant isolation mission authz bridge",
-    "multi tenant resource access check",
-    "tenant 격리 권한 미션",
-    "조직별 리소스 접근 제어"
+    "tenant resource authz",
+    "multi tenant isolation check",
+    "tenant scope mismatch",
+    "조직별 데이터 격리",
+    "tenantId 위조 방지",
+    "리소스 tenant 검증",
+    "관리자 권한 범위 분리",
+    "repository tenant 조건",
+    "다른 조직 데이터 노출",
+    "캐시 tenant key 누락"
   ],
   "expected_queries": [
-    "멀티테넌트에서 다른 조직 데이터가 안 보이게 하려면 어디서 막아?",
-    "tenantId를 request body로 믿으면 왜 위험해?",
-    "Repository query에도 tenant 조건을 넣어야 해?"
+    "tenantId를 URL이나 body로 받는 API에서 다른 조직 데이터 접근을 어떻게 막아?",
+    "멀티테넌트 서비스에서 repository query에 tenant 조건을 어디까지 넣어야 해?",
+    "admin role이 있어도 tenant scope를 따로 봐야 하는 이유가 뭐야?",
+    "인증 principal의 tenant와 실제 resource tenant를 어떤 순서로 검증해?",
+    "캐시나 목록 조회에서 다른 tenant 데이터가 섞이지 않게 테스트하려면?"
   ],
   "symptoms": [
     "URL의 tenantId만 바꾸면 다른 조직 데이터가 보여요",
@@ -40,6 +48,11 @@
     "created_at": "2026-05-24",
     "last_modified": "2026-05-24",
     "legacy_path": "knowledge/cs/contents/security/tenant-isolation-mission-authz-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch145"
+      }
+    ]
   }
 }
