@@ -4,17 +4,20 @@
   "category": "security",
   "level": "advanced",
   "summary": "ReDoS는 백트래킹 정규식 엔진에서 특정 입력이 지수적으로 많은 탐색을 유발해 CPU를 묶는 공격이다. Java Pattern은 일반적인 match timeout을 직접 제공하지 않으므로, 패턴 단순화, 입력 길이 제한, atomic group/possessive quantifier, RE2J 같은 선형 시간 엔진 검토가 필요하다.",
-  "body_markdown": "# ReDoS catastrophic backtracking remediation - atomic group, possessive, RE2J\n\n> 한 줄 요약: 위험한 정규식은 악성 입력 하나로 CPU를 오래 붙잡을 수 있으므로, 패턴과 입력 길이와 엔진 선택을 같이 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: ReDoS, catastrophic backtracking, Java Pattern timeout, regex denial of service, atomic group, possessive quantifier, RE2J, regex input length limit, nested quantifier, 정규식 보안\n\n## 먼저 멘탈모델\n\n정규식 엔진이 가능한 매칭 경로를 여러 갈래로 되돌아가며 탐색할 때가 있다. 패턴이 모호하고 입력이 맞지 않으면, 엔진은 많은 조합을 시도한 뒤 실패한다.\n\n대표적으로 아래 같은 형태가 위험하다.\n\n```text\n(a+)+$\n```\n\n입력 `aaaaaaaaaaaaaaaa!`처럼 마지막에서 실패하는 문자열이 들어오면, 엔진은 `a+`가 어디까지 먹었어야 했는지 수많은 조합을 되돌아가며 확인할 수 있다. 이 현상이 catastrophic backtracking이다.\n\n## 왜 보안 문제가 되나\n\nReDoS는 메모리나 네트워크를 크게 쓰지 않아도 CPU를 묶는다. 로그인, 검색, validation, gateway filter처럼 요청마다 정규식을 도는 경로에 위험한 패턴이 있으면 작은 요청 몇 개로도 thread pool이 꽉 찰 수 있다.\n\n보통 증상은 이렇다.\n\n- 특정 입력에서만 요청 처리 시간이 비정상적으로 길다.\n- CPU는 높고 외부 dependency latency는 낮다.\n- thread dump에 regex matching stack이 반복된다.\n- timeout을 걸었지만 이미 worker thread가 오래 잡혀 있다.\n\n## Java Pattern의 함정\n\nJava의 기본 `Pattern`/`Matcher`는 일반적인 per-match timeout 옵션을 직접 제공하지 않는다. 그래서 위험한 정규식을 그냥 두고 timeout이 알아서 끊어 줄 것이라고 기대하면 안 된다.\n\n방어는 여러 층으로 둔다.\n\n1. 입력 길이를 제한한다.\n2. 위험한 nested quantifier와 ambiguous alternation을 피한다.\n3. 필요한 경우 atomic group 또는 possessive quantifier로 backtracking을 줄인다.\n4. untrusted pattern이나 고위험 입력에는 RE2J 같은 선형 시간 엔진을 검토한다.\n5. 요청 timeout, bulkhead, rate limit으로 영향 범위를 제한한다.\n\n## 완화 기법\n\n### 입력 길이 제한\n\n가장 단순하고 강한 방어다. regex가 아무리 좋아도 무제한 입력을 받으면 비용을 예측하기 어렵다. 특히 검색어, 이메일, URL, JSON field validation에는 길이 상한을 먼저 둔다.\n\n### 패턴 단순화\n\n가능하면 모호한 패턴을 명확한 character class와 반복으로 바꾼다. 중첩 반복, 겹치는 alternation, greedy wildcard 뒤의 복잡한 조건을 줄인다.\n\n### possessive quantifier\n\n`a++`처럼 possessive quantifier는 한 번 먹은 문자를 되돌려 주지 않는다. backtracking 후보를 줄일 수 있지만, 매칭 의미가 바뀔 수 있으므로 테스트가 필요하다.\n\n### atomic group\n\n`(?>...)`는 group 내부에서 성공한 선택을 나중에 되돌리지 않는다. 불필요한 backtracking을 줄이는 데 도움이 된다.\n\n### RE2J\n\nRE2 계열 엔진은 backtracking 대신 automata 기반 접근으로 선형 시간에 가까운 보장을 제공한다. 다만 Java regex의 모든 기능을 지원하지 않는다. backreference나 일부 lookaround 같은 기능이 필요하면 그대로 대체할 수 없다.\n\n## 검증 방법\n\n- 정상 입력, 실패 입력, 아주 긴 실패 입력을 fixture로 둔다.\n- match time을 input length별로 비교한다.\n- 단순 평균이 아니라 worst-case 실패 입력을 본다.\n- production path에서는 regex match가 어느 endpoint에서 얼마나 자주 도는지 metric을 둔다.\n\nReDoS 테스트는 정상 케이스 몇 개로는 잡히지 않는다. 공격자는 보통 match가 성공하는 입력보다 늦게 실패하는 입력을 찾는다.\n\n## 한 줄 정리\n\nReDoS 방어는 정규식 한 줄을 고치는 일이 아니라 입력 길이, 패턴 모호성, Java regex 엔진 특성, timeout/bulkhead를 함께 다루는 CPU 자원 방어다.\n",
+  "body_markdown": "# ReDoS catastrophic backtracking remediation - atomic group, possessive, RE2J\n\n> 한 줄 요약: 위험한 정규식은 악성 입력 하나로 CPU를 오래 붙잡을 수 있으므로, 패턴과 입력 길이와 엔진 선택을 같이 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: ReDoS, catastrophic backtracking, Java Pattern timeout, regex denial of service, atomic group, possessive quantifier, RE2J, regex input length limit, nested quantifier, 정규식 보안\n\n## 먼저 멘탈모델\n\n정규식 엔진이 가능한 매칭 경로를 여러 갈래로 되돌아가며 탐색할 때가 있다. 패턴이 모호하고 입력이 맞지 않으면, 엔진은 많은 조합을 시도한 뒤 실패한다.\n\n대표적으로 아래 같은 형태가 위험하다.\n\n```text\n(a+)+$\n```\n\n입력 `aaaaaaaaaaaaaaaa!`처럼 마지막에서 실패하는 문자열이 들어오면, 엔진은 `a+`가 어디까지 먹었어야 했는지 수많은 조합을 되돌아가며 확인할 수 있다. 이 현상이 catastrophic backtracking이다.\n\n## 왜 보안 문제가 되나\n\nReDoS는 메모리나 네트워크를 크게 쓰지 않아도 CPU를 묶는다. 로그인, 검색, validation, gateway filter처럼 요청마다 정규식을 도는 경로에 위험한 패턴이 있으면 작은 요청 몇 개로도 thread pool이 꽉 찰 수 있다.\n\n보통 증상은 이렇다.\n\n- 특정 입력에서만 요청 처리 시간이 비정상적으로 길다.\n- CPU는 높고 외부 dependency latency는 낮다.\n- thread dump에 regex matching stack이 반복된다.\n- timeout을 걸었지만 이미 worker thread가 오래 잡혀 있다.\n\n## Java Pattern의 함정\n\nJava의 기본 `Pattern`/`Matcher`는 일반적인 per-match timeout 옵션을 직접 제공하지 않는다. 그래서 위험한 정규식을 그냥 두고 timeout이 알아서 끊어 줄 것이라고 기대하면 안 된다.\n\n방어는 여러 층으로 둔다.\n\n1. 입력 길이를 제한한다.\n2. 위험한 nested quantifier와 ambiguous alternation을 피한다.\n3. 필요한 경우 atomic group 또는 possessive quantifier로 backtracking을 줄인다.\n4. untrusted pattern이나 고위험 입력에는 RE2J 같은 선형 시간 엔진을 검토한다.\n5. 요청 timeout, bulkhead, rate limit으로 영향 범위를 제한한다.\n\n## 완화 기법\n\n### 입력 길이 제한\n\n가장 단순하고 강한 방어다. regex가 아무리 좋아도 무제한 입력을 받으면 비용을 예측하기 어렵다. 특히 검색어, 이메일, URL, JSON field validation에는 길이 상한을 먼저 둔다.\n\n### 패턴 단순화\n\n가능하면 모호한 패턴을 명확한 character class와 반복으로 바꾼다. 중첩 반복, 겹치는 alternation, greedy wildcard 뒤의 복잡한 조건을 줄인다.\n\n### possessive quantifier\n\n`a++`처럼 possessive quantifier는 한 번 먹은 문자를 되돌려 주지 않는다. backtracking 후보를 줄일 수 있지만, 매칭 의미가 바뀔 수 있으므로 테스트가 필요하다.\n\n### atomic group\n\n`(?>...)`는 group 내부에서 성공한 선택을 나중에 되돌리지 않는다. 불필요한 backtracking을 줄이는 데 도움이 된다.\n\n### RE2J\n\nRE2 계열 엔진은 backtracking 대신 automata 기반 접근으로 선형 시간에 가까운 보장을 제공한다. 다만 Java regex의 모든 기능을 지원하지 않는다. backreference나 일부 lookaround 같은 기능이 필요하면 그대로 대체할 수 없다.\n\n## 검증 방법\n\n- 정상 입력, 실패 입력, 아주 긴 실패 입력을 fixture로 둔다.\n- match time을 input length별로 비교한다.\n- 단순 평균이 아니라 worst-case 실패 입력을 본다.\n- production path에서는 regex match가 어느 endpoint에서 얼마나 자주 도는지 metric을 둔다.\n\nReDoS 테스트는 정상 케이스 몇 개로는 잡히지 않는다. 공격자는 보통 match가 성공하는 입력보다 늦게 실패하는 입력을 찾는다.\n\n## 한 줄 정리\n\nReDoS 방어는 정규식 한 줄을 고치는 일이 아니라 입력 길이, 패턴 모호성, Java regex 엔진 특성, timeout/bulkhead를 함께 다루는 CPU 자원 방어다.\n\n## Batch152 보강 메모\n\nReDoS catastrophic backtracking remediation - atomic group, possessive, RE2J를 학습할 때는 용어 정의만 확인하기보다 보안 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. ReDoS는 백트래킹 정규식 엔진에서 특정 입력이 지수적으로 많은 탐색을 유발해 CPU를 묶는 공격이다. Java Pattern은 일반적인 match timeout을 직접 제공하지 않으므로, 패턴 단순화, 입력 길이 제한, atomic group/possessive quantifier, RE2J 같은 선형 시간 엔진 검토가 필요하다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
   "aliases": [
-    "ReDoS",
-    "catastrophic backtracking",
     "정규식 ReDoS",
     "정규식 백트래킹",
+    "정규식 서비스 거부",
+    "ReDoS catastrophic backtracking remediation 개념",
+    "ReDoS catastrophic backtracking remediation 정리",
+    "ReDoS",
+    "catastrophic backtracking",
     "Java Pattern timeout",
     "atomic group regex",
     "possessive quantifier",
     "RE2J",
-    "정규식 서비스 거부"
+    "redos catastrophic backtracking remediation guide"
   ],
   "expected_queries": [
     "ReDoS catastrophic backtracking은 정규식에서 왜 CPU를 오래 잡아먹어?",
@@ -48,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/redos-catastrophic-backtracking-remediation-atomic-group-re2j.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

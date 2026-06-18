@@ -6,18 +6,18 @@
   "summary": "이 playbook은 read model/projection rebuild와 backfill, catch-up, cutover를 다룬다. old/new model mismatch, backfill 중 write 유실, replay idempotency 같은 운영 질문을 다룬다.",
   "body_markdown": "# Read Model Rebuild Backfill Playbook\n\n## 핵심 invariant\n\nRead model rebuild의 invariant는 \"새 read model이 source of truth의 특정 cutoff까지 완전하고, cutoff 이후 변경분도 유실 없이 따라잡으며, replay가 중복 반영을 만들지 않는다\"이다. 운영 write가 계속 들어오는 동안 rebuild를 하므로 snapshot, watermark, catch-up, cutover를 하나의 절차로 봐야 한다.\n\n- source of truth와 cutoff 기준을 먼저 고정한다.\n- backfill snapshot이 어떤 시점까지의 데이터를 포함하는지 기록한다. timestamp만 쓰면 clock skew와 long transaction에 취약하므로 가능하면 log offset, version, monotonically increasing id 같은 재현 가능한 기준을 같이 둔다.\n- cutoff 이후 변경분은 outbox, CDC, event log, updated_at scan 중 하나로 추적한다.\n- projection update는 idempotent해야 한다. 집계형 read model은 \"더하기\"만 반복하면 replay 중복에 취약하다.\n- cutover 전에는 old/new dual-read 또는 sampling compare로 mismatch를 분류한다.\n\n## 증상 라우터\n\n| 증상 | 먼저 의심할 단계 | 확인할 증거 |\n|---|---|---|\n| backfill 후 새 모델에 일부 row가 없다 | snapshot/cutoff gap | scan range와 CDC/outbox start position 사이가 비었는지 |\n| 새 모델 count가 더 많다 | 중복 replay 또는 삭제/취소 상태 미반영 | idempotency key, tombstone 처리, status predicate |\n| old/new field 값만 다르다 | mapping/version 차이 | old model bug인지, new derivation인지 reason code로 분류 |\n| catch-up lag이 줄지 않는다 | consumer throughput 또는 poison event | offset lag, retry/DLQ, shard별 backlog |\n| cutover 직후 사용자 신고가 늘었다 | verification 대표성 부족 | dual-read sample이 hot key, deleted row, late event를 포함했는지 |\n\n## 역할별 책임\n\n| 역할 | 책임 | 산출물 |\n|---|---|---|\n| source owner | source of truth와 cutoff 의미 정의 | cutoff timestamp/log offset, source predicate |\n| backfill worker | snapshot 범위 스캔과 batch checkpoint | batch range, row count, checksum |\n| catch-up consumer | cutoff 이후 변경분 반영 | watermark, offset lag, dedup count |\n| verifier | old/new/source 비교와 mismatch 라벨링 | reason-coded diff, acceptance report |\n| release owner | traffic cutover와 rollback 결정 | feature flag, rollback window, post-cutover monitor |\n\n## 흔한 오개념\n\n| 오개념 | 왜 위험한가 | 더 안전한 판단 |\n|---|---|---|\n| \"전체 테이블을 한 번 읽으면 rebuild가 끝난다\" | scan 중 들어온 write를 놓칠 수 있다 | snapshot cutoff와 catch-up stream을 함께 설계한다 |\n| \"event replay는 항상 deterministic하다\" | handler가 현재 시간, 외부 조회, 비idempotent increment에 의존하면 결과가 달라진다 | event handler의 순수성, versioning, idempotency를 검증한다 |\n| \"mismatch는 새 모델 버그다\" | late event, old model 버그, schema mapping 차이도 mismatch로 보인다 | mismatch reason code를 붙여 비교한다 |\n| \"cutover 뒤 old model은 바로 지워도 된다\" | rollback과 reconciliation 근거를 잃는다 | 일정 기간 dual-write/dual-read evidence를 보관한다 |\n| \"updated_at scan이면 CDC가 없어도 충분하다\" | clock skew, 같은 timestamp pagination, soft delete, out-of-order update를 놓칠 수 있다 | source version/offset 기반 CDC 또는 overlap scan + idempotent upsert를 우선한다 |\n\n## Chooser table\n\n| 상황 | 선택 | 이유 | 주의할 점 |\n|---|---|---|---|\n| source DB가 크고 운영 write가 계속 있음 | snapshot backfill + CDC catch-up | scan과 변경분 추적을 분리 | cutoff와 CDC start position이 겹치거나 비면 안 됨 |\n| event log가 완전하고 ordering key가 명확함 | event replay rebuild | business state 전이를 재구성 가능 | handler version과 poison event 처리 필요 |\n| read model schema만 일부 변경 | incremental backfill | 전체 rebuild 비용 절감 | old/new field derivation 차이 비교 필요 |\n| mismatch가 사용자 영향 큰 핵심 조회 | dual-read verification | cutover 전 정확도 확보 | compare sampling이 대표성을 가져야 함 |\n| 새 모델 장애 시 빠른 복구 필요 | feature flag cutover + rollback window | read path 전환을 제어 | rollback 중 write/catch-up 이중 처리 주의 |\n\n## Gap-free handoff pattern\n\nBackfill과 catch-up 사이에는 \"절대 빈 구간이 없고, 겹치는 구간은 idempotency로 흡수한다\"가 안전한 기본값이다.\n\n1. Rebuild 시작 전에 durable cursor를 잡는다. CDC/outbox라면 log position, event log라면 offset, DB snapshot이라면 snapshot id와 transaction boundary를 기록한다.\n2. Snapshot backfill은 그 cursor 이하의 source state를 채운다.\n3. Catch-up은 cursor부터 시작하되, 같은 row/event가 두 번 들어와도 `source_version`, `event_id`, `(entity_id, version)` 같은 key로 덮어쓴다.\n4. 삭제/취소/tombstone은 별도 이벤트로 반영한다. \"없어진 row\"를 단순 scan으로만 추론하면 stale projection이 남기 쉽다.\n5. Cutover 전에는 count뿐 아니라 checksum, hot key sample, deleted entity sample, late event sample을 따로 비교한다.\n\n## 실무 지표와 증거\n\n- backfill progress: scanned rows, rows/sec, shard별 remaining count, oldest unprocessed timestamp\n- catch-up: watermark lag, CDC lag, event offset lag, late event count\n- correctness: old/new mismatch rate, mismatch by reason, sampled entity diff, aggregate checksum\n- safety: replay duplicate count, idempotency conflict count, poison event count, skipped event count\n- cutover: new read path latency/error, fallback rate, rollback count, reconciliation backlog\n\n단순 row count가 같아도 안전하다고 볼 수 없다. 정렬, 필터 조건, 삭제/취소 상태, derived field, late event까지 비교해야 한다.\n\n## 재현 조건\n\n기존 read model을 새 schema나 새 storage로 다시 만들고, 운영 write는 계속 들어온다. Backfill 도중 생성/수정/삭제된 entity가 새 모델에 정확히 반영되어야 하며, 같은 event를 다시 처리해도 집계가 중복되면 안 된다.\n\n## 검증 순서\n\n1. source of truth, rebuild 대상 범위, cutoff timestamp 또는 log offset을 확정한다.\n2. backfill worker가 snapshot 기준 데이터를 읽고, 각 batch의 range와 checksum을 남기는지 확인한다.\n3. cutoff 이후 변경분을 outbox/CDC/watermark로 catch-up한다. scan range와 stream start가 빠지지 않는지 확인하고, 의도적 overlap은 idempotency로 흡수되는지 테스트한다.\n4. projection handler를 같은 event로 두 번 호출해 idempotent한지 본다. 집계 필드는 set-based recompute인지 delta apply인지 구분하고, delta apply라면 event dedup table이나 last-applied version이 필요하다.\n5. old/new dual-read compare를 수행하고 mismatch를 `missing`, `extra`, `field_diff`, `late_event`, `known_old_bug`, `mapping_change`로 라벨링한다.\n6. cutover는 feature flag 또는 traffic slice로 시작하고, p99 latency/error/mismatch가 기준을 넘으면 rollback한다.\n7. cutover 후에도 reconciliation window를 유지해 late event와 사용자 신고를 추적한다.\n\n## 운영/테스트 fixture\n\n- backfill scan 중 entity 생성, 수정, 삭제\n- 같은 event replay 2회\n- out-of-order event와 late event\n- old schema enum을 new schema field로 매핑\n- aggregate read model에서 count/sum 중복 반영\n- cutover 직후 rollback과 재-catch-up\n\n## mismatch triage 확장\n\nread model rebuild에서 diff가 난다는 사실만으로 rollback 여부를 정하면 안 된다. `missing`은 새 모델에 row가 없는 상태이고, `extra`는 삭제나 tombstone 처리 누락일 수 있다. `field_diff`는 매핑 규칙 차이일 수 있고, `late_event`는 catch-up watermark가 아직 닫히지 않은 증거일 수 있다. 이 라벨을 나누면 cutover 전 수정해야 할 correctness bug와 허용 가능한 known divergence를 분리할 수 있다.\n\n집계 projection은 특히 idempotency를 따로 본다. 같은 event를 두 번 적용했을 때 count/sum이 두 번 증가하면 replay가 복구 도구가 아니라 손상 도구가 된다. aggregate version, event id dedup, recompute-from-source, last-applied watermark 중 하나로 중복 반영을 막아야 한다.\n",
   "aliases": [
+    "read model 재빌드 백필",
+    "조회 모델 재생성",
+    "백필 컷오버",
+    "idempotent replay 검증",
+    "Read Model Rebuild Backfill 개념",
     "read model rebuild backfill",
     "projection rebuild catch up cutover",
-    "read model 재빌드 백필",
     "projection rebuild backfill",
     "dual read cutover",
     "event replay idempotent",
     "backfill catch up gap",
-    "조회 모델 재생성",
-    "백필 컷오버",
-    "old new model diff",
-    "projection mismatch triage",
-    "idempotent replay 검증"
+    "old new model diff"
   ],
   "expected_queries": [
     "read model을 새로 만들 때 backfill과 catch-up을 어떻게 안전하게 해?",
@@ -25,8 +25,7 @@
     "이벤트를 다시 재생하면 중복 반영을 어떻게 막아?",
     "old read model과 new read model 결과가 다를 때 cutover 전에 무엇을 비교해야 해?",
     "backfill 중 새 write가 들어오는 catch-up gap을 어떻게 닫아?",
-    "조회 모델 재생성에서 dual read 검증과 idempotent replay가 왜 필요해?",
-    "read model dual-read mismatch를 missing, extra, field_diff, late_event로 나눠야 하는 이유가 뭐야?"
+    "조회 모델 재생성에서 dual read 검증과 idempotent replay가 왜 필요해?"
   ],
   "symptoms": [
     "새 read model이 old model과 계속 차이나요",
@@ -57,6 +56,10 @@
         "date": "2026-06-18",
         "source": "y14-expansion-batch129",
         "note": "Expanded rebuild backfill cutover surfaces for batch129."
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
       }
     ]
   }

@@ -4,7 +4,7 @@
   "category": "spring",
   "level": "intermediate",
   "summary": "콘솔 baseball의 Game 객체 하나를 Spring controller나 service 필드에 그대로 보관하면, 웹에서는 그 객체가 요청과 사용자 사이에 공유될 수 있다. 그래서 게임 진행 상태는 singleton Bean 안의 가변 필드보다 요청 밖 저장소나 명시적 세션 경계로 읽는 편이 안전하다.",
-  "body_markdown": "# baseball 게임 진행 상태 보관 ↔ Spring singleton Bean 상태 경계 브릿지\n\n## 한 줄 요약\n\n> 콘솔 baseball의 `Game` 객체 하나를 Spring controller나 service 필드에 그대로 보관하면, 웹에서는 그 객체가 요청과 사용자 사이에 공유될 수 있다. 그래서 게임 진행 상태는 singleton Bean 안의 가변 필드보다 요청 밖 저장소나 명시적 세션 경계로 읽는 편이 안전하다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"controller 필드에 `Game`을 두면 같은 사용자의 다음 요청에서 이어지지 않나요?\" | singleton controller/service가 현재 게임 객체 하나를 공유하는 구조 | Bean 수명과 게임 한 판의 수명이 다르다는 점을 분리한다 |\n| \"다른 탭에서 새 게임을 시작했더니 이전 게임 상태가 섞여요\" | 두 요청이 같은 `currentGame` 필드에 읽고 쓰는 테스트 | 사용자별 게임 상태는 field가 아니라 gameId와 저장소로 찾게 만든다 |\n| \"콘솔에서는 메모리 객체 하나면 됐는데 웹에서는 왜 안 되죠?\" | 콘솔 game loop를 HTTP 요청 여러 개로 옮기는 전환 단계 | 요청은 짧고 게임 상태는 길다는 lifecycle 차이를 먼저 본다 |\n\n## 미션 시나리오\n\n콘솔 baseball는 프로세스 안에서 한 사람이 게임 하나를 진행하니 `Game` 객체 하나가 자연스럽다. 하지만 웹으로 옮기면 `POST /games`, `POST /games/{id}/guesses`처럼 요청이 잘리고, 같은 서버 인스턴스가 여러 사용자의 요청을 함께 받는다. 이때 학습자가 자주 만드는 실수는 controller나 service에 `currentGame` 같은 필드를 두고, 새 게임 시작과 추측 진행을 그 필드 하나로 이어 붙이는 구조다.\n\n처음엔 혼자 테스트할 때 돌아간다. 그런데 새로고침, 두 개 브라우저 탭, 다른 사용자 요청이 섞이기 시작하면 \"방금 시작한 게임인데 이전 상태가 남아 있다\", \"내 추측이 다른 게임에 들어간다\" 같은 이상한 증상이 생긴다. PR에서 \"`Spring Bean은 기본이 singleton이라 상태를 들고 있으면 요청 간 오염이 난다`\", \"`게임 진행 상태를 어디에 둘지 먼저 정해야 한다`\"는 코멘트가 붙는 장면이 여기다.\n\n## CS concept 매핑\n\n여기서 닿는 개념은 `stateless singleton`과 `state store 분리`다. Spring의 일반적인 controller/service Bean은 애플리케이션 동안 재사용되는 singleton이라서, 가변 필드를 두면 요청 단위 정보가 전부 그 한 객체로 모인다. 그래서 Bean은 \"행동을 조립하는 협력자\"로 두고, 사용자별 게임 진행 상태는 DB row, 세션, 혹은 명시적인 저장소 객체로 분리하는 편이 맞다.\n\nbaseball에 대입하면 controller는 입력을 받고, service는 \"이 게임 id에 이번 추측을 반영하라\"를 조립하고, 실제 게임 상태는 외부 저장소에서 읽고 쓴다. 콘솔에서는 메모리 객체 하나가 곧 진실 원천이었지만, 웹에서는 \"누구의 몇 번째 게임인가\"를 식별할 키가 먼저 필요하다. 그래서 `Game` 인스턴스를 Bean 필드에 오래 붙잡기보다 `gameId`로 상태를 찾는 구조가 Spring의 기본 모델과 더 잘 맞는다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`@RestController`나 `@Service` 필드에 현재 게임 상태를 넣으면 singleton Bean 특성 때문에 요청 간 오염이 납니다.\"\n- \"콘솔 객체 수명과 웹 요청 수명을 같은 것으로 보면 안 됩니다. 게임 상태 저장 위치를 먼저 분리해 보세요.\"\n- \"서비스는 상태를 보관하는 곳보다 상태 변화를 조립하는 곳에 가깝습니다. `gameId` 기반 조회/갱신 흐름으로 바꾸는 편이 읽기 쉽습니다.\"\n- \"동시 사용자 시나리오를 떠올리면 Bean 필드 상태가 왜 위험한지 바로 드러납니다. 상태 원천을 DB나 세션으로 명시해 주세요.\"\n\n## 다음 학습\n\n- singleton Bean이 언제 만들어지고 왜 오래 살아남는지 다시 잡으려면 `spring/bean-lifecycle-basics`\n- baseball 상태를 결국 DB write 단위로 굳히는 흐름은 `database/baseball-guess-history-current-state-transaction-bridge`\n- 입력 바인딩과 도메인 `Guess` 경계를 먼저 정리하려면 `spring/baseball-mvc-controller-binding-bridge`\n- Bean scope에서 상태 공유 버그가 어떻게 생기는지 더 파고들려면 `contents/spring/spring-bean-lifecycle-scope-traps.md`\n",
+  "body_markdown": "# baseball 게임 진행 상태 보관 ↔ Spring singleton Bean 상태 경계 브릿지\n\n## 한 줄 요약\n\n> 콘솔 baseball의 `Game` 객체 하나를 Spring controller나 service 필드에 그대로 보관하면, 웹에서는 그 객체가 요청과 사용자 사이에 공유될 수 있다. 그래서 게임 진행 상태는 singleton Bean 안의 가변 필드보다 요청 밖 저장소나 명시적 세션 경계로 읽는 편이 안전하다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"controller 필드에 `Game`을 두면 같은 사용자의 다음 요청에서 이어지지 않나요?\" | singleton controller/service가 현재 게임 객체 하나를 공유하는 구조 | Bean 수명과 게임 한 판의 수명이 다르다는 점을 분리한다 |\n| \"다른 탭에서 새 게임을 시작했더니 이전 게임 상태가 섞여요\" | 두 요청이 같은 `currentGame` 필드에 읽고 쓰는 테스트 | 사용자별 게임 상태는 field가 아니라 gameId와 저장소로 찾게 만든다 |\n| \"콘솔에서는 메모리 객체 하나면 됐는데 웹에서는 왜 안 되죠?\" | 콘솔 game loop를 HTTP 요청 여러 개로 옮기는 전환 단계 | 요청은 짧고 게임 상태는 길다는 lifecycle 차이를 먼저 본다 |\n\n## 미션 시나리오\n\n콘솔 baseball는 프로세스 안에서 한 사람이 게임 하나를 진행하니 `Game` 객체 하나가 자연스럽다. 하지만 웹으로 옮기면 `POST /games`, `POST /games/{id}/guesses`처럼 요청이 잘리고, 같은 서버 인스턴스가 여러 사용자의 요청을 함께 받는다. 이때 학습자가 자주 만드는 실수는 controller나 service에 `currentGame` 같은 필드를 두고, 새 게임 시작과 추측 진행을 그 필드 하나로 이어 붙이는 구조다.\n\n처음엔 혼자 테스트할 때 돌아간다. 그런데 새로고침, 두 개 브라우저 탭, 다른 사용자 요청이 섞이기 시작하면 \"방금 시작한 게임인데 이전 상태가 남아 있다\", \"내 추측이 다른 게임에 들어간다\" 같은 이상한 증상이 생긴다. PR에서 \"`Spring Bean은 기본이 singleton이라 상태를 들고 있으면 요청 간 오염이 난다`\", \"`게임 진행 상태를 어디에 둘지 먼저 정해야 한다`\"는 코멘트가 붙는 장면이 여기다.\n\n## CS concept 매핑\n\n여기서 닿는 개념은 `stateless singleton`과 `state store 분리`다. Spring의 일반적인 controller/service Bean은 애플리케이션 동안 재사용되는 singleton이라서, 가변 필드를 두면 요청 단위 정보가 전부 그 한 객체로 모인다. 그래서 Bean은 \"행동을 조립하는 협력자\"로 두고, 사용자별 게임 진행 상태는 DB row, 세션, 혹은 명시적인 저장소 객체로 분리하는 편이 맞다.\n\nbaseball에 대입하면 controller는 입력을 받고, service는 \"이 게임 id에 이번 추측을 반영하라\"를 조립하고, 실제 게임 상태는 외부 저장소에서 읽고 쓴다. 콘솔에서는 메모리 객체 하나가 곧 진실 원천이었지만, 웹에서는 \"누구의 몇 번째 게임인가\"를 식별할 키가 먼저 필요하다. 그래서 `Game` 인스턴스를 Bean 필드에 오래 붙잡기보다 `gameId`로 상태를 찾는 구조가 Spring의 기본 모델과 더 잘 맞는다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`@RestController`나 `@Service` 필드에 현재 게임 상태를 넣으면 singleton Bean 특성 때문에 요청 간 오염이 납니다.\"\n- \"콘솔 객체 수명과 웹 요청 수명을 같은 것으로 보면 안 됩니다. 게임 상태 저장 위치를 먼저 분리해 보세요.\"\n- \"서비스는 상태를 보관하는 곳보다 상태 변화를 조립하는 곳에 가깝습니다. `gameId` 기반 조회/갱신 흐름으로 바꾸는 편이 읽기 쉽습니다.\"\n- \"동시 사용자 시나리오를 떠올리면 Bean 필드 상태가 왜 위험한지 바로 드러납니다. 상태 원천을 DB나 세션으로 명시해 주세요.\"\n\n## 다음 학습\n\n- singleton Bean이 언제 만들어지고 왜 오래 살아남는지 다시 잡으려면 `spring/bean-lifecycle-basics`\n- baseball 상태를 결국 DB write 단위로 굳히는 흐름은 `database/baseball-guess-history-current-state-transaction-bridge`\n- 입력 바인딩과 도메인 `Guess` 경계를 먼저 정리하려면 `spring/baseball-mvc-controller-binding-bridge`\n- Bean scope에서 상태 공유 버그가 어떻게 생기는지 더 파고들려면 `contents/spring/spring-bean-lifecycle-scope-traps.md`\n\n## Batch152 보강 메모\n\nbaseball 게임 진행 상태 보관 ↔ Spring singleton Bean 상태 경계 브릿지를 학습할 때는 용어 정의만 확인하기보다 스프링 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. 콘솔 baseball의 Game 객체 하나를 Spring controller나 service 필드에 그대로 보관하면, 웹에서는 그 객체가 요청과 사용자 사이에 공유될 수 있다. 그래서 게임 진행 상태는 singleton Bean 안의 가변 필드보다 요청 밖 저장소나 명시적 세션 경계로 읽는 편이 안전하다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
   "aliases": [
     "baseball 게임 상태 bean 저장",
     "야구 미션 singleton 상태 오염",
@@ -12,14 +12,20 @@
     "baseball 요청 간 상태 유지",
     "스프링 야구 게임 state 저장 위치",
     "@RestController",
-    "@Service"
+    "@Service",
+    "baseball game state singleton guide",
+    "baseball game state singleton checklist",
+    "baseball-game-state-singleton-bean-scope-bridge",
+    "baseball game state singleton bean scope bridge",
+    "baseball 게임 진행 상태 개념"
   ],
   "expected_queries": [
     "야구 미션을 웹으로 옮길 때 Game 객체를 controller 필드에 두면 왜 안 돼?",
     "Spring service가 singleton이면 현재 게임 상태를 멤버 변수로 가져도 되는 거 아니야?",
     "baseball 게임 진행 상태를 메모리에 두지 말고 어디에 저장해야 해?",
     "여러 사용자가 동시에 야구 게임을 하면 상태가 섞이는 이유가 뭐야?",
-    "콘솔에서는 Game 하나였는데 웹에서는 요청마다 왜 다시 생각해야 해?"
+    "콘솔에서는 Game 하나였는데 웹에서는 요청마다 왜 다시 생각해야 해?",
+    "baseball 게임 진행 상태 보관 ↔ Spring singleton Bean 상태 경계 브릿지를 언제 쓰는지 예제로 설명해줘"
   ],
   "symptoms": [
     "controller 필드에 Game을 넣었는데 요청이 바뀌면 상태가 섞여요",
@@ -51,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/baseball-game-state-singleton-bean-scope-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

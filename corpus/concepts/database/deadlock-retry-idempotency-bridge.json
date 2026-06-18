@@ -6,21 +6,26 @@
   "summary": "이 bridge는 deadlock/serialization failure retry와 idempotency를 연결한다. 그냥 retry 안전성, 외부 호출 두 번, 중복 주문/결제, DB retry와 API retry 경계 같은 질문을 다룬다.",
   "body_markdown": "# Deadlock Retry Idempotency Bridge\n\n## 한 줄 요약\n\nDeadlock이나 serialization failure는 retry 후보지만, retry 범위 안에 중복 생성, 중복 결제, 중복 메시지 발행 같은 side effect가 있으면 \"재시도 가능\"이 곧 \"안전\"을 뜻하지 않는다.\n\n## 미션 진입 증상\n\n트랜잭션 내부에서 외부 결제 API를 호출한 뒤 deadlock이 나서 전체 로직을 다시 실행하면, DB write는 rollback됐더라도 외부 결제 요청은 이미 나갔을 수 있다. 주문 생성, 포인트 차감, 쿠폰 사용, 알림 발송도 마찬가지다. DB 입장에서 실패한 트랜잭션과 외부 시스템 입장에서 처리된 요청은 같은 원자성 경계에 있지 않다.\n\n관찰 증거는 \"deadlock 로그가 있었는가\"보다 넓게 모아야 한다.\n\n- DB 오류 코드: PostgreSQL `40P01` deadlock, `40001` serialization failure, MySQL deadlock/lock wait timeout 계열\n- 같은 business key로 생성된 주문/예약/결제 row 수\n- 외부 API request id, idempotency key, provider transaction id\n- retry attempt count, backoff 적용 여부, 마지막 성공 attempt\n- outbox/event table에 같은 의미의 메시지가 여러 번 쌓였는지\n\n## 핵심 mental model\n\nDeadlock retry는 보통 \"DB 트랜잭션 단위\"의 복구 전략이다. Idempotency는 \"같은 의미의 요청이 여러 번 들어와도 최종 효과가 한 번처럼 보이게 하는\" 계약이다. 둘은 서로 대체하지 않고, retry가 idempotency 계약 위에서만 안전해진다.\n\n경계를 이렇게 나눈다.\n\n| 경계 | 안전하게 retry하려면 | 주의점 |\n|---|---|---|\n| 순수 DB write | transaction rollback 후 같은 command 재실행 | unique constraint, 조건부 update, version check가 불변식을 막아야 함 |\n| 외부 API 호출 | provider idempotency key 또는 request key | DB rollback이 외부 호출 취소를 보장하지 않음 |\n| 메시지 발행 | outbox row unique key, consumer dedup key | broker redelivery와 application retry를 따로 봐야 함 |\n| 사용자 요청 전체 | command idempotency key와 상태 조회 | 이미 성공한 요청의 응답 복구 정책 필요 |\n\n예를 들어 \"예약 생성\" command가 `reservation_id` 또는 `(member_id, schedule_id, seat_id)` unique constraint 없이 매번 새 row를 insert한다면, retry는 중복 예약을 만들 수 있다. 반대로 같은 key에 대해 insert가 한 번만 성공하고 이후에는 기존 결과를 조회해서 반환할 수 있으면 request-level retry가 훨씬 다루기 쉬워진다.\n\n## 구현 패턴\n\n1. 재시도 단위를 작게 둔다. 외부 API 호출, 이메일 발송, WebSocket push를 DB 트랜잭션 retry lambda 안에 넣지 않는다.\n2. command key를 만든다. 클라이언트 idempotency key, 서버 생성 operation id, 자연 business key 중 하나를 고르고 unique constraint로 고정한다.\n3. 외부 side effect는 outbox나 after-commit 단계로 분리한다. 트랜잭션이 commit된 사실을 기준으로 한 번 발행하고, 발행자는 outbox id 기준으로 중복을 제거한다.\n4. retry 정책은 bounded하게 둔다. 짧은 exponential backoff와 jitter, 최대 횟수, retryable SQL state allowlist를 둔다.\n5. 실패가 반복되면 사용자에게 \"잠시 후 다시 시도\" 또는 상태 조회를 안내한다. 무한 retry는 lock 경합을 더 키울 수 있다.\n\n## Trade-off\n\nIdempotency key와 unique constraint를 추가하면 schema와 상태 모델이 늘어난다. 대신 장애 상황에서 \"처리됐는지 모름\" 상태를 조회하고 복구할 수 있다. Outbox는 지연과 운영 컴포넌트를 추가하지만, DB commit과 외부 발행 사이의 모호한 구간을 관찰 가능한 row로 남긴다. Retry를 너무 공격적으로 걸면 성공률은 조금 올라갈 수 있어도 lock wait과 deadlock 빈도를 키울 수 있다.\n\n## 검증 절차\n\n- 동시 요청 테스트에서 같은 command key를 10회 이상 병렬 호출하고 최종 row가 한 건인지 확인한다.\n- deadlock이나 serialization failure를 일부러 만들 수 있는 작은 fixture를 두고 retry attempt 로그가 남는지 본다.\n- 외부 호출 mock에 request id를 기록해서 retry 후에도 provider 호출이 한 번인지, 또는 같은 idempotency key로 여러 번인지 확인한다.\n- transaction rollback 후 outbox row가 남지 않는지, commit 후 발행 실패는 재처리 가능한지 확인한다.\n- 운영 로그에서 retryable 오류와 non-retryable 오류를 구분해 집계한다.\n\n## 흔한 오해\n\nDeadlock은 transient니까 무조건 retry하면 된다고 외우면 안 된다. retry 대상은 \"한 번 더 실행해도 같은 의미\"인 코드여야 한다. 또한 retry가 deadlock 원인을 해결하지는 않는다. lock 획득 순서 통일, transaction 길이 축소, index 보강, hot row 분산 같은 원인 완화가 별도로 필요하다.\n\n## Safe Next Docs\n\ntransaction retry patterns와 idempotency reconciliation playbook으로 이어진다.\n",
   "aliases": [
-    "deadlock retry idempotency",
-    "transaction retry safety",
-    "serialization failure retry",
-    "idempotent transaction retry",
     "데드락 재시도",
     "데드락재시도",
     "재시도 멱등성",
     "재시도멱등성",
     "트랜잭션 재시도",
-    "트랜잭션재시도"
+    "deadlock retry idempotency",
+    "transaction retry safety",
+    "serialization failure retry",
+    "idempotent transaction retry",
+    "deadlock retry idempotency bridge guide",
+    "deadlock retry idempotency bridge checklist",
+    "deadlock-retry-idempotency-bridge"
   ],
   "expected_queries": [
     "deadlock이 나면 그냥 retry하면 안전해?",
     "트랜잭션 재시도에는 idempotency가 왜 필요해?",
-    "serialization failure 재시도와 중복 결제 방지는 어떻게 연결돼?"
+    "serialization failure 재시도와 중복 결제 방지는 어떻게 연결돼?",
+    "Deadlock Retry Idempotency Bridge를 언제 쓰는지 예제로 설명해줘",
+    "Deadlock Retry Idempotency Bridge 개념을 데이터베이스 관점에서 정리해줘",
+    "Deadlock Retry Idempotency Bridge 구현할 때 자주 하는 실수는 뭐야?"
   ],
   "symptoms": [
     "retry를 넣었더니 외부 호출이 두 번 나가요",
@@ -44,8 +49,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/deadlock-retry-idempotency-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

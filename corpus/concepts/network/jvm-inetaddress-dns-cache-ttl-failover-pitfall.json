@@ -4,17 +4,20 @@
   "category": "network",
   "level": "intermediate",
   "summary": "JVM InetAddress는 DNS 결과를 프로세스 안에서 캐시할 수 있고, networkaddress.cache.ttl 및 negative TTL 정책에 따라 DNS failover 반영이 늦어질 수 있다. DNS TTL만 낮춰도 기존 JVM cache와 connection pool이 old IP를 계속 쓸 수 있다.",
-  "body_markdown": "# JVM InetAddress DNS cache TTL failover pitfall\n\n> 한 줄 요약: DNS record가 바뀌어도 JVM 프로세스와 connection pool이 예전 주소를 계속 들고 있을 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: JVM InetAddress DNS cache, networkaddress.cache.ttl, negative DNS cache TTL, Java DNS failover, stale IP, JVM resolver cache, connection pool DNS, DNS TTL failover, InetAddress cache policy\n\n## 먼저 멘탈모델\n\nDNS failover는 authoritative DNS record만 바꾸면 끝나는 일이 아니다. Java 애플리케이션은 `InetAddress` 조회 결과를 프로세스 안에서 캐시할 수 있고, HTTP/gRPC/DB client connection pool은 이미 연결된 old endpoint를 계속 쓸 수 있다.\n\n```text\nDNS record -> recursive resolver cache -> OS/runtime cache -> JVM InetAddress cache -> client connection pool\n```\n\n어느 층이 old IP를 들고 있는지 분리해야 한다.\n\n## JVM cache 정책\n\nJVM DNS cache는 보안 속성으로 제어된다.\n\n```text\nnetworkaddress.cache.ttl\nnetworkaddress.cache.negative.ttl\n```\n\n양수는 초 단위 TTL, 0은 캐시하지 않음, 음수는 구현/정책상 오래 캐시하는 의미로 쓰일 수 있다. 실제 기본값은 Java 버전, 보안 설정, 배포 환경에 따라 확인해야 한다.\n\n중요한 점은 DNS record의 TTL과 JVM의 cache TTL이 항상 같지 않을 수 있다는 것이다.\n\n## 장애 시나리오\n\n### DB/Redis endpoint failover\n\nDNS가 새 primary IP를 가리키도록 바뀌었는데 Java 앱이 old IP에 계속 붙는다. `dig`는 새 IP를 보여도 애플리케이션 connection pool은 기존 socket을 재사용하거나 JVM cache가 old answer를 들고 있을 수 있다.\n\n### negative caching\n\n초기 배포 순간 도메인이 잠깐 NXDOMAIN이었다면 JVM이나 resolver가 negative answer를 캐시할 수 있다. record가 생긴 뒤에도 앱만 계속 못 찾는 것처럼 보인다.\n\n### gRPC channel\n\ngRPC channel이나 HTTP client가 resolver update를 언제 반영하는지, 기존 subchannel을 언제 drain하는지 별도로 봐야 한다. DNS 결과가 바뀌어도 connection lifecycle이 따로 움직인다.\n\n## 확인 순서\n\n1. authoritative DNS와 public resolver answer를 비교한다.\n2. 같은 host에서 `dig` 결과와 애플리케이션 실제 connection target을 비교한다.\n3. JVM `networkaddress.cache.ttl`과 negative TTL 설정을 확인한다.\n4. HTTP/gRPC/DB client connection pool lifetime과 reconnect policy를 확인한다.\n5. failover test에서 old endpoint traffic drain 시간을 측정한다.\n\n## 운영 선택\n\nTTL을 너무 길게 두면 failover 반영이 늦다. 너무 짧게 두면 DNS lookup과 resolver 부하가 늘고, connection churn이 커질 수 있다. 보통은 DNS TTL, JVM TTL, connection pool max lifetime, health check, retry budget을 한 세트로 맞춘다.\n\n## 한 줄 정리\n\nJava DNS failover 문제는 DNS TTL 하나가 아니라 JVM InetAddress cache와 client connection pool이 함께 만드는 문제다. record 변경, runtime cache, 실제 socket target을 같은 시간축에서 확인해야 한다.\n",
+  "body_markdown": "# JVM InetAddress DNS cache TTL failover pitfall\n\n> 한 줄 요약: DNS record가 바뀌어도 JVM 프로세스와 connection pool이 예전 주소를 계속 들고 있을 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: JVM InetAddress DNS cache, networkaddress.cache.ttl, negative DNS cache TTL, Java DNS failover, stale IP, JVM resolver cache, connection pool DNS, DNS TTL failover, InetAddress cache policy\n\n## 먼저 멘탈모델\n\nDNS failover는 authoritative DNS record만 바꾸면 끝나는 일이 아니다. Java 애플리케이션은 `InetAddress` 조회 결과를 프로세스 안에서 캐시할 수 있고, HTTP/gRPC/DB client connection pool은 이미 연결된 old endpoint를 계속 쓸 수 있다.\n\n```text\nDNS record -> recursive resolver cache -> OS/runtime cache -> JVM InetAddress cache -> client connection pool\n```\n\n어느 층이 old IP를 들고 있는지 분리해야 한다.\n\n## JVM cache 정책\n\nJVM DNS cache는 보안 속성으로 제어된다.\n\n```text\nnetworkaddress.cache.ttl\nnetworkaddress.cache.negative.ttl\n```\n\n양수는 초 단위 TTL, 0은 캐시하지 않음, 음수는 구현/정책상 오래 캐시하는 의미로 쓰일 수 있다. 실제 기본값은 Java 버전, 보안 설정, 배포 환경에 따라 확인해야 한다.\n\n중요한 점은 DNS record의 TTL과 JVM의 cache TTL이 항상 같지 않을 수 있다는 것이다.\n\n## 장애 시나리오\n\n### DB/Redis endpoint failover\n\nDNS가 새 primary IP를 가리키도록 바뀌었는데 Java 앱이 old IP에 계속 붙는다. `dig`는 새 IP를 보여도 애플리케이션 connection pool은 기존 socket을 재사용하거나 JVM cache가 old answer를 들고 있을 수 있다.\n\n### negative caching\n\n초기 배포 순간 도메인이 잠깐 NXDOMAIN이었다면 JVM이나 resolver가 negative answer를 캐시할 수 있다. record가 생긴 뒤에도 앱만 계속 못 찾는 것처럼 보인다.\n\n### gRPC channel\n\ngRPC channel이나 HTTP client가 resolver update를 언제 반영하는지, 기존 subchannel을 언제 drain하는지 별도로 봐야 한다. DNS 결과가 바뀌어도 connection lifecycle이 따로 움직인다.\n\n## 확인 순서\n\n1. authoritative DNS와 public resolver answer를 비교한다.\n2. 같은 host에서 `dig` 결과와 애플리케이션 실제 connection target을 비교한다.\n3. JVM `networkaddress.cache.ttl`과 negative TTL 설정을 확인한다.\n4. HTTP/gRPC/DB client connection pool lifetime과 reconnect policy를 확인한다.\n5. failover test에서 old endpoint traffic drain 시간을 측정한다.\n\n## 운영 선택\n\nTTL을 너무 길게 두면 failover 반영이 늦다. 너무 짧게 두면 DNS lookup과 resolver 부하가 늘고, connection churn이 커질 수 있다. 보통은 DNS TTL, JVM TTL, connection pool max lifetime, health check, retry budget을 한 세트로 맞춘다.\n\n## 한 줄 정리\n\nJava DNS failover 문제는 DNS TTL 하나가 아니라 JVM InetAddress cache와 client connection pool이 함께 만드는 문제다. record 변경, runtime cache, 실제 socket target을 같은 시간축에서 확인해야 한다.\n\n## Batch152 보강 메모\n\nJVM InetAddress DNS cache TTL failover pitfall를 학습할 때는 용어 정의만 확인하기보다 네트워크 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. JVM InetAddress는 DNS 결과를 프로세스 안에서 캐시할 수 있고, networkaddress.cache.ttl 및 negative TTL 정책에 따라 DNS failover 반영이 늦어질 수 있다. DNS TTL만 낮춰도 기존 JVM cache와 connection pool이 old IP를 계속 쓸 수 있다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
   "aliases": [
-    "JVM DNS cache",
     "InetAddress 캐시",
+    "JVM DNS 캐시",
+    "stale IP 예전주소",
+    "JVM InetAddress DNS cache 개념",
+    "JVM InetAddress DNS cache 정리",
+    "JVM DNS cache",
     "networkaddress.cache.ttl",
     "Java DNS failover",
-    "JVM DNS 캐시",
     "InetAddress TTL",
-    "stale IP 예전주소",
     "negative DNS cache",
-    "DNS failover"
+    "DNS failover",
+    "jvm inetaddress dns cache guide"
   ],
   "expected_queries": [
     "JVM InetAddress DNS cache TTL 때문에 failover가 늦어지는 이유가 뭐야?",
@@ -48,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/jvm-inetaddress-dns-cache-ttl-failover-pitfall.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

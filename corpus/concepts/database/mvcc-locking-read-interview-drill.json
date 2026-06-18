@@ -6,20 +6,26 @@
   "summary": "이 drill은 MVCC snapshot read와 locking read 차이를 면접 답변으로 구성한다. SELECT, SELECT FOR UPDATE, DB별 차이를 다룬다.",
   "body_markdown": "# MVCC Locking Read Interview Drill\n\n## 질문\n\n\"MVCC에서 일반 SELECT와 SELECT FOR UPDATE는 어떻게 다른가요?\"\n\n## 기대 답변 축\n\n- MVCC는 reader와 writer가 서로 덜 막히도록 version/snapshot을 활용한다.\n- 일반 SELECT는 transaction snapshot 또는 statement snapshot 기준의 consistent read일 수 있다.\n- `SELECT ... FOR UPDATE` 같은 locking read는 읽은 row에 lock을 걸어 이후 write 경쟁을 제어한다.\n- consistent read는 최신 committed write를 항상 보는 것이 아니라 snapshot 기준으로 볼 수 있다.\n- MySQL InnoDB와 PostgreSQL은 isolation level과 locking read 세부가 다르므로 DB별 문서를 확인해야 한다.\n\n## Invariant\n\n- MVCC는 row의 여러 version과 visibility rule을 이용해 read/write 충돌을 줄인다.\n- plain SELECT는 대개 lock을 잡아 최신 row를 기다리기보다, isolation level에 맞는 snapshot/statement view를 읽는다.\n- locking read는 \"읽고 곧 쓸 row\"에 대한 경쟁을 제어하기 위해 current version 확인과 row lock 획득을 동반할 수 있다.\n- snapshot read가 오래 유지되면 최신 commit을 못 볼 수 있다. 이것은 버그라기보다 isolation contract의 일부다.\n- gap lock, next-key lock, predicate lock, row lock 범위는 DB 제품, isolation level, index 사용 여부에 따라 달라진다.\n\n## 보장 범위와 DB별 caveat\n\n| 주제 | 보수적으로 말할 범위 | caveat |\n|---|---|---|\n| Plain SELECT | 보통 consistent non-locking read로, statement 또는 transaction snapshot에서 보이는 version을 읽는다 | 최신 committed row를 항상 보는 것이 아니다. DDL, explicit lock, isolation level, vendor-specific statement class에 따라 예외가 있다 |\n| `SELECT ... FOR UPDATE` | 읽은 row를 이후 update/delete 대상으로 보고 exclusive row lock을 잡아 경쟁 transaction을 기다리게 할 수 있다 | 성능 hint가 아니다. lock 범위는 index access path, isolation level, DB 제품에 의존한다 |\n| MySQL InnoDB `REPEATABLE READ` | plain SELECT는 첫 consistent read snapshot을 유지한다 | locking read/UPDATE/DELETE는 더 current한 state를 따라갈 수 있어 plain SELECT와 같은 table state로 단정하면 안 된다 |\n| MySQL InnoDB `READ COMMITTED` | consistent read마다 fresh snapshot을 잡는다 | locking read/UPDATE/DELETE의 gap protection이 약해져 phantom insert를 막는 용도로 과신하면 위험하다 |\n| PostgreSQL `READ COMMITTED` | statement마다 snapshot을 잡고, locking/DML은 경합 row를 기다린 뒤 조건을 다시 볼 수 있다 | 같은 transaction 안에서도 두 SELECT 결과가 달라질 수 있다 |\n| PostgreSQL `REPEATABLE READ`/`SERIALIZABLE` | transaction snapshot 일관성이 강하고 concurrent update는 retry/serialization failure로 드러날 수 있다 | `SERIALIZABLE`은 성공한 commit이 serial order와 같다는 보장이지, 모든 transaction이 조용히 성공한다는 뜻이 아니다 |\n\n## Evidence로 확인할 것\n\n- isolation evidence: 현재 transaction isolation과 DB default가 무엇인지.\n- statement evidence: plain SELECT, locking read, UPDATE/DELETE 중 어떤 statement class인지.\n- plan evidence: `FOR UPDATE` predicate가 unique lookup인지 range scan인지, 어떤 index를 타는지.\n- lock evidence: lock wait, deadlock, blocked session, `pg_locks`/InnoDB lock monitor 같은 관측값.\n- retry evidence: serialization failure, deadlock, lock wait timeout을 재시도할 수 있는 idempotent 경계가 있는지.\n- invariant evidence: absence check나 중복 방지가 unique/exclusion/guard row 같은 DB 방어선으로 닫혀 있는지.\n\n## 작은 시나리오\n\nMySQL InnoDB `REPEATABLE READ`에서 T1이 먼저 snapshot을 만든다.\n\n```sql\n-- T1\nSTART TRANSACTION;\nSELECT COUNT(*) FROM coupon WHERE code = 'A'; -- 0\n\n-- T2\nINSERT INTO coupon(code) VALUES ('A');\nCOMMIT;\n\n-- T1\nSELECT COUNT(*) FROM coupon WHERE code = 'A'; -- 여전히 0일 수 있음\nSELECT * FROM coupon WHERE code = 'A' FOR UPDATE; -- locking read는 T2 row를 볼 수 있음\n```\n\n이 장면의 답은 \"MVCC가 이상하다\"가 아니다. plain SELECT의 snapshot read와 locking read의 current-state path를 분리해서 이해해야 한다. 단, 이 예시를 PostgreSQL `REPEATABLE READ`에 그대로 옮기면 결과와 실패 surface가 달라질 수 있다.\n\n## 실패 반례\n\n- 일반 SELECT로 재고 1을 보고 나중에 update하면, 그 사이 다른 transaction이 재고를 바꿨을 수 있다.\n- `FOR UPDATE`를 성능 hint처럼 이해하면 안 된다. 목적은 read 결과를 기반으로 한 write 경쟁 제어다.\n- InnoDB에서 indexed range 조건과 non-index 조건은 잠금 범위가 달라질 수 있다. 실행 계획을 보지 않으면 예상보다 넓게 잠글 수 있다.\n- PostgreSQL과 MySQL의 repeatable read는 같은 이름이어도 snapshot과 anomaly 특성이 다를 수 있다.\n- \"MVCC라 reader는 writer를 절대 막지 않는다\"도 과장이다. vacuum/purge 지연, DDL, explicit lock, locking read 같은 예외가 있다.\n- 존재하지 않는 row를 읽고 \"없으면 insert\"를 할 때 unique constraint 없이 SELECT만 믿으면 중복 insert를 막지 못할 수 있다.\n\n## wrong-bucket / 오선택\n\n| wrong-bucket | 왜 위험한가 | 더 정확한 구분 |\n|---|---|---|\n| \"plain SELECT는 항상 최신 committed row를 본다\" | transaction snapshot이나 statement snapshot 때문에 오래된 version을 볼 수 있다 | snapshot/consistent read |\n| \"`FOR UPDATE`는 빠르게 읽는 옵션이다\" | 목적은 이후 write 경쟁 제어이고 lock wait/deadlock을 만들 수 있다 | locking read / current row control |\n| \"MVCC면 read/write가 절대 서로 막지 않는다\" | explicit lock, locking read, DDL, vacuum/purge debt, cleanup pressure 예외가 있다 | 일반 read/write 충돌 감소, 예외 별도 |\n| \"MySQL RR과 PostgreSQL RR은 이름이 같으니 같다\" | snapshot 기준, phantom 처리, locking/DML 경로, retry surface가 다르다 | product-specific isolation semantics |\n| \"존재하지 않는 row를 SELECT했으니 insert 중복은 막힌다\" | absence는 row lock 대상이 없고 DB별 gap/predicate 보장이 다르다 | unique constraint, exclusion, guard row, serializable retry |\n\n## 면접 답변 skeleton\n\n1. MVCC는 읽기 일관성을 version/snapshot으로 제공해 일반 read와 write의 직접 blocking을 줄인다고 시작한다.\n2. plain SELECT는 snapshot 기준의 consistent read라 최신 committed row와 다를 수 있다고 말한다.\n3. `SELECT ... FOR UPDATE`는 이후 update/delete를 전제로 row lock을 잡아 경쟁 transaction을 기다리게 하거나 실패시키는 용도라고 설명한다.\n4. DB별 구현 차이가 크므로 MySQL InnoDB, PostgreSQL, Oracle 같은 제품명을 붙여 답해야 한다고 마무리한다.\n\n## 검증 질문\n\n1. 이 SELECT는 plain consistent read인가, locking read인가?\n2. 같은 transaction에서 snapshot이 statement마다 새로 잡히는가, 첫 read 기준으로 유지되는가?\n3. `FOR UPDATE`가 unique index lookup을 하는가, range scan을 하는가, full scan을 하는가?\n4. 읽은 뒤 쓸 row가 \"이미 존재하는 row\"인가, \"없으면 insert\" 같은 absence invariant인가?\n5. MySQL `READ COMMITTED`/`REPEATABLE READ`, PostgreSQL `READ COMMITTED`/`REPEATABLE READ`/`SERIALIZABLE` 중 어느 동작을 전제로 답하고 있는가?\n6. lock wait, deadlock, serialization failure가 발생하면 전체 작업을 다시 실행해도 안전한가?\n\n## 검증 포인트\n\n- 현재 DB의 default isolation level과 transaction별 override를 확인했는가?\n- 같은 transaction에서 plain SELECT를 두 번 했을 때 snapshot이 statement 단위인지 transaction 단위인지 확인했는가?\n- `FOR UPDATE` 대상 predicate가 index를 타는지 실행 계획으로 확인했는가?\n- lock wait timeout, deadlock, serialization failure를 어떻게 처리하는지 정했는가?\n- 중복 방지 invariant는 locking read 외에 unique constraint로도 방어되는가?\n\n## 약점 태그\n\n- `plain-select-latest`: 일반 SELECT가 항상 최신이라고 말함\n- `for-update-purpose`: FOR UPDATE의 write 경쟁 제어 목적을 놓침\n- `db-portability`: DB별 isolation/MVCC 차이를 무시함\n\n## 복습 연결\n\nDB별 차이는 `mvcc-snapshot-vs-locking-read-portability`로 이어진다.\n",
   "aliases": [
-    "MVCC locking read interview",
-    "snapshot read for update answer",
     "MVCC 면접 답변",
     "락킹 리드 스냅샷 리드 설명",
     "스냅샷 읽기",
     "락킹 읽기",
+    "MVCC Locking Read Interview 개념",
+    "MVCC locking read interview",
+    "snapshot read for update answer",
     "SELECT FOR UPDATE",
     "consistent read",
-    "current read"
+    "current read",
+    "mvcc locking read interview guide",
+    "mvcc locking read interview checklist"
   ],
   "expected_queries": [
     "MVCC와 locking read 차이를 면접에서 어떻게 말해?",
     "SELECT와 SELECT FOR UPDATE는 무엇이 달라?",
-    "consistent read가 최신 값을 안 볼 수 있다는 뜻이야?"
+    "consistent read가 최신 값을 안 볼 수 있다는 뜻이야?",
+    "MVCC Locking Read Interview Drill를 언제 쓰는지 예제로 설명해줘",
+    "MVCC Locking Read Interview 개념을 데이터베이스 관점에서 정리해줘",
+    "MVCC Locking Read Interview 구현할 때 자주 하는 실수는 뭐야?"
   ],
   "symptoms": [
     "SELECT가 항상 최신 committed row를 본다고 생각해요",
@@ -43,8 +49,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/mvcc-locking-read-interview-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "이미 등록된 대상을 key로 꺼내면 Registry, key로 실행 방식을 골라 바로 실행하면 Strategy Map, 상황을 판정해 허용 여부와 이유까지 내리면 Policy Object다.",
   "body_markdown": "# Registry vs Strategy Map vs Policy Object 결정 가이드\n\n## 한 줄 요약\n\n> 이미 등록된 대상을 key로 꺼내면 Registry, key로 실행 방식을 골라 바로 실행하면 Strategy Map, 상황을 판정해 허용 여부와 이유까지 내리면 Policy Object다.\n\n## 결정 매트릭스\n\n| 지금 코드가 답하는 질문 | 먼저 볼 선택 | 왜 그쪽이 맞는가 |\n|---|---|---|\n| `CARD`에 등록된 handler가 무엇인지 꺼내려는가? | Registry | 이미 준비된 후보를 key로 lookup하는 문제가 중심이다. |\n| `CARD`면 카드 전략, `POINT`면 포인트 전략처럼 실행 방식을 고르려는가? | Strategy Map | 같은 역할의 구현 중 하나를 선택해 행동을 실행한다. |\n| 환불 가능 여부, 거절 이유, 수수료처럼 판정 결과를 내려야 하는가? | Policy Object | 실행보다 도메인 규칙 판단과 설명 가능한 결과가 핵심이다. |\n| 새 요구사항이 \"새 handler 추가\"에 가까운가? | Registry 또는 Strategy Map | 후보 집합을 늘리는 문제라서 lookup이나 선택 구조가 먼저다. |\n| 새 요구사항이 \"예외 규칙 추가\"에 가까운가? | Policy Object | 조건과 사유가 늘어나는 순간 key 선택보다 규칙 모델이 중요해진다. |\n| 실패 원인을 어떤 테스트가 가장 작게 설명하는가? | 선택 결과에 따라 다름 | registry는 등록표, strategy map은 선택 후 실행, policy object는 decision 결과를 각각 테스트한다. |\n\n`Map`을 쓴다는 사실만으로는 이름이 정해지지 않는다. 호출자가 기대하는 것이 \"꺼내 주기\"인지, \"골라 실행하기\"인지, \"판정해 설명하기\"인지가 먼저다.\n\n## ownership, extension axis, testability\n\n실무에서는 `Map`이 있다는 모양보다 \"이 객체가 무엇을 소유하나\"를 먼저 본다.\n\n| 선택지 | 소유하는 책임 | 주 extension axis | 단위 테스트 초점 | 도입하면 과한 경우 |\n|---|---|---|---|---|\n| Registry | key와 이미 준비된 후보의 등록표, duplicate/missing 검증 | 새 handler나 provider가 등록된다 | 생성 시 등록표 검증, unknown key 처리, key별 lookup | 후보가 하나뿐이고 bootstrap 검증도 필요 없는데 registry 클래스가 먼저 생김 |\n| Strategy Map | key로 같은 역할의 실행 방식을 골라 호출 | 새 결제 수단, 배송 방식, 알림 채널 같은 실행 방식 | key별로 올바른 strategy가 호출되는지, 없는 key를 거절하는지 | key 선택 뒤 모든 구현이 한 줄 함수이고 테스트가 map 준비에 더 오래 걸림 |\n| Policy Object | 규칙을 판정하고 허용 여부, 이유, 금액, 다음 액션을 반환 | 새 예외 조항, 등급, 시간 조건, 거절 사유 | 입력 조건별 `Decision` 결과와 reason code | 단순 구현 선택을 policy라 부르며 실제 판정 결과가 없음 |\n\n좋은 분리는 테스트 이름에서 드러난다. `duplicate_card_handler_fails_fast`는 registry 테스트이고, `card_method_uses_card_payment_strategy`는 strategy map 테스트이며, `expired_order_rejects_refund_with_reason`은 policy object 테스트다. 한 테스트가 Spring wiring, key lookup, 도메인 판정을 모두 준비해야 한다면 ownership이 섞였을 가능성이 크다.\n\n## 실제 미션/실무 기준\n\n작은 미션 코드에서는 처음부터 세 구조를 모두 만들 필요가 없다. 아래 신호가 반복될 때 한 단계 올린다.\n\n| 현재 냄새 | 먼저 할 일 | 다음 단계 |\n|---|---|---|\n| service의 `switch(method)`가 결제 실행 구현을 직접 호출한다 | strategy map이나 router로 실행 방식 선택을 분리한다 | method 추가 때 service test가 아니라 strategy/router test가 늘어나는지 본다 |\n| `get(key)` 뒤에 service에서 다시 복잡한 `if`가 돈다 | registry lookup과 policy decision을 분리한다 | registry는 찾기만 하고, 정책 객체가 decision을 만든다 |\n| selector가 없는 key, 중복 key, 필수 key 누락을 늦게 터뜨린다 | registry bootstrap validation을 추가한다 | enum처럼 닫힌 key면 missing까지 검증한다 |\n| 할인/환불 결과가 `boolean`에서 reason, fee, next action으로 커진다 | policy object와 decision result를 만든다 | API 응답과 테스트가 같은 reason code를 보게 한다 |\n\n즉 확장 축이 \"후보 추가\"라면 registry/strategy map 쪽이고, \"규칙 조항 추가\"라면 policy object 쪽이다. 이 둘을 섞으면 map은 있어도 변경 이유가 하나로 모이지 않는다.\n\n## 흔한 오선택\n\n`Map<Key, Handler>`를 전부 Strategy Map이라고 부르는 경우:\n호출부가 `registry.get(method)`처럼 이미 있는 대상을 꺼내는 데서 끝나면 Registry가 더 정확하다. 선택 이후 실행은 handler의 책임이고, map 자체는 lookup 선반에 가깝다.\n\n할인/환불 규칙을 Strategy Map으로만 밀어붙이는 경우:\n결과가 금액 하나가 아니라 허용 여부, 거절 이유, 다음 액션까지 커지면 Strategy보다 Policy Object가 읽기 쉽다. 학습자가 \"왜 안 되는지도 같이 내려야 해\"라고 말하면 policy 신호다.\n\nPolicy Object가 필요한데 Registry로 감싸서 해결하려는 경우:\nregistry는 규칙을 저장하거나 찾을 수는 있어도 판정 의미를 대신하지 못한다. `get(tier)` 뒤에 복잡한 `if`가 다시 생기면 lookup 문제가 아니라 규칙 모델링 문제가 남아 있다.\n\n패턴을 붙였는데 테스트가 더 무거워지는 경우:\nregistry, selector, policy를 모두 만들었는데 테스트마다 Spring context, mock registry, fake policy, fake strategy를 한꺼번에 준비한다면 추상화가 책임을 줄이지 못한 것이다. 이때는 map을 제거하라는 뜻이 아니라, lookup 테스트와 decision 테스트를 분리할 수 있는지부터 확인한다.\n\n## 빠른 판별 질문\n\n- key 공간이 닫힌 enum인가, 열린 provider code인가? 닫힌 enum이면 registry missing 검증이 더 중요하다.\n- 새 요구사항 설명이 \"새 타입 추가\"인가, \"기존 타입의 예외 규칙 추가\"인가?\n- 반환값이 실행 결과 하나인가, 허용 여부와 reason을 포함한 decision인가?\n- 호출자가 실제 구현을 몰라도 되는가, 아니면 숨은 service locator처럼 어디서든 꺼내 쓰는가?\n- 이 구조를 제거하면 테스트가 더 단순해지는가? 그렇다면 아직 over-patterning일 수 있다.\n\n## 다음 학습\n\n- 주입된 handler map이 lookup인지 creation인지 먼저 자르고 싶으면 [주입된 Handler Map에서 Registry vs Factory: lookup과 creation을 분리하기](./registry-vs-factory-injected-handler-maps.md)\n- strategy map이 언제 규칙 객체로 올라가는지 더 또렷하게 보려면 [Policy Object vs Strategy Map: 커지는 전략 맵을 규칙 객체로 올릴 때](./policy-object-vs-strategy-map-beginner-bridge.md)\n- policy object와 state까지 함께 가르고 싶으면 [Strategy vs State vs Policy Object 결정 가이드](./strategy-state-policy-object-decision-guide.md)\n- map 기반 클래스 이름을 더 넓게 비교하려면 [Map-backed 클래스 네이밍 체크리스트: `Selector`, `Resolver`, `Registry`, `Factory`](./map-backed-selector-resolver-registry-factory-naming-checklist.md)\n",
   "aliases": [
-    "registry vs strategy map vs policy object",
-    "registry strategy map policy object chooser",
     "map lookup 실행 선택 규칙 판정 차이",
     "handler map과 refund policy 구분",
     "map 기반 분기 이름 결정 가이드",
     "strategy map 커질 때 policy object 신호",
     "key lookup인지 정책 판정인지 구분",
+    "registry vs strategy map vs policy object",
+    "registry strategy map policy object chooser",
     "registry strategy map policy object over-patterning",
-    "map 기반 분기 테스트 경계",
-    "lookup selection policy ownership"
+    "lookup selection policy ownership",
+    "registry vs strategy map guide",
+    "registry vs strategy map checklist",
+    "registry-vs-strategy-map-vs-policy-object-decision-guide"
   ],
   "expected_queries": [
     "핸들러를 map에서 꺼내는 코드와 할인 규칙을 판단하는 코드를 같은 패턴으로 봐도 돼?",
@@ -23,8 +25,7 @@
     "구현 선택 map이 언제 정책 객체로 승격돼야 하는지 표로 설명해줘",
     "get으로 꺼내는 구조와 allowed를 판단하는 구조가 왜 다른지 감이 안 와",
     "map 기반 분기에서 lookup, 실행 선택, 규칙 판정을 한 번에 구분하고 싶어",
-    "registry, strategy map, policy object 중 어떤 구조가 테스트하기 쉬운지 기준을 알려줘",
-    "map 기반 분기를 과하게 패턴화했다는 신호와 실제 확장 축을 어떻게 구분해?"
+    "registry, strategy map, policy object 중 어떤 구조가 테스트하기 쉬운지 기준을 알려줘"
   ],
   "symptoms": [
     "Map<Key, Handler>가 있는데 registry인지 strategy map인지 이름을 못 정하겠어",
@@ -54,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/design-pattern/registry-vs-strategy-map-vs-policy-object-decision-guide.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

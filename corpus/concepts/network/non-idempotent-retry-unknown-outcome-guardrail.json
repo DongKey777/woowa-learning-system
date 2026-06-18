@@ -6,18 +6,18 @@
   "summary": "비멱등 요청은 timeout 뒤 blind retry를 하면 중복 side effect를 만들 수 있다. 요청이 서버에 도달했는지, side effect가 발생했는지, idempotency key나 operation id로 같은 시도를 묶을 수 있는지 확인한 뒤 retry 허용 범위를 정해야 한다.",
   "body_markdown": "# Non Idempotent Retry Unknown Outcome Guardrail\n\n> 한 줄 요약: 비멱등 요청은 timeout 뒤 바로 다시 보내면 안 된다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: non idempotent retry, unsafe retry guardrail, blind retry danger, POST retry risk, unknown outcome retry, duplicate side effect, retry guardrail, idempotency key required\n\n## 먼저 묻는 질문\n\nretry를 붙이기 전에 요청을 세 그룹으로 나눈다.\n\n| 요청 종류 | 예 | retry 기준 |\n|---|---|---|\n| safe/idempotent read | `GET /items` | timeout budget과 backoff 중심 |\n| idempotent write | `PUT /profile`, idempotent `DELETE` | 같은 결과로 수렴하는지 확인 |\n| non-idempotent write | `POST /payments`, `POST /orders`, `POST /tickets` | idempotency key 없이는 blind retry 금지 |\n\n비멱등 요청에서 중요한 질문은 \"다시 보내면 성공할까\"가 아니라 \"첫 요청이 이미 실행됐을 때 두 번째 요청이 무엇을 만들까\"다.\n\n## unknown outcome retry가 위험한 이유\n\nclient timeout은 여러 위치에서 날 수 있다.\n\n```text\nclient -> proxy -> service -> provider\n                 service commit 성공\n                 response 유실\nclient timeout\n```\n\nclient는 실패처럼 보지만 service나 provider는 성공했을 수 있다. 이때 같은 POST를 다시 보내면 주문, 결제, 쿠폰, 메시지가 두 번 만들어질 수 있다.\n\n## retry guardrail\n\n비멱등 요청에는 다음 중 하나가 있어야 한다.\n\n- idempotency key와 request fingerprint\n- operation id로 묶인 internal status record\n- provider-side idempotency key 또는 transaction lookup\n- duplicate suppression window\n- replay 가능한 response snapshot 또는 resource pointer\n- unknown 상태를 처리하는 recovery path\n\n이 장치가 없으면 network client나 proxy의 자동 retry를 끄는 편이 안전하다.\n\n## retry 가능한 것과 recover해야 하는 것\n\n| 관측 | remote side effect 가능성 | 행동 |\n|---|---|---|\n| connect timeout before request write | 낮을 수 있음 | 제한적 retry 가능, 단 client 경로 확인 |\n| write timeout after bytes sent | unknown | retry보다 status 확인 |\n| read timeout after request sent | unknown | operation lookup 또는 pending 응답 |\n| 503 before processing with explicit retry-after | 낮거나 서버가 거절 | backoff retry 가능 |\n| 504 from proxy | upstream 처리 여부 unknown | upstream log/status 확인 |\n\n## 운영 설정 포인트\n\n- HTTP client retry interceptor가 모든 POST를 자동 retry하지 않는지 확인한다.\n- load balancer, service mesh, gateway retry 정책이 메서드와 idempotency header를 구분하는지 본다.\n- `Retry-After`를 줄 때도 비멱등 요청은 같은 idempotency key 재시도를 요구한다.\n- retry budget은 idempotent read와 non-idempotent write를 같은 bucket으로 섞지 않는다.\n\n## 흔한 오해\n\n| 오해 | 왜 위험한가 | 더 나은 판단 |\n|---|---|---|\n| 한 번만 retry하면 괜찮다 | 한 번의 중복도 돈/재고/티켓에서는 사고다 | idempotency key 먼저 |\n| proxy 504면 upstream 실패다 | upstream이 뒤늦게 성공했을 수 있다 | unknown outcome으로 처리 |\n| POST도 서버가 잘 만들면 retry 가능하다 | 그 잘 만든다는 근거가 idempotency contract다 | key, fingerprint, replay 필요 |\n| retry budget만 있으면 안전하다 | 부하 증폭은 줄여도 중복 side effect는 못 막는다 | recovery path 필요 |\n\n## 한 줄 정리\n\n비멱등 요청의 retry 기준은 네트워크 성공률이 아니라 side effect 중복 위험이다. timeout 뒤 결과가 unknown이면 blind retry를 막고, 같은 operation을 식별해 조회하거나 replay할 수 있어야 한다.\n\n## 자동 retry 위치를 모두 확인한다\n\n비멱등 retry 사고는 애플리케이션 코드에서만 생기지 않는다. HTTP client interceptor, SDK retry 설정, gateway, service mesh, load balancer, proxy가 각각 재시도할 수 있다. 개발자는 `우리 코드에서는 retry 안 한다`고 생각하지만 mesh가 503, 504, reset을 보고 POST를 다시 보낼 수 있다.\n\n운영 가드레일은 retry 위치별로 둔다. client는 메서드와 idempotency header를 보고 자동 retry를 제한한다. gateway와 mesh는 기본적으로 non-idempotent method retry를 끄고, 허용하려면 `Idempotency-Key`와 request fingerprint header가 있는 요청만 대상에 넣는다. provider SDK는 결제, 주문, 발급 같은 side effect API에서 key 없이 retry하지 않게 설정한다. 관측 지표도 `retry_by_method`, `retry_by_idempotency_header`, `retry_after_bytes_sent`, `duplicate_suppressed_count`처럼 위치와 원인을 나눠야 한다.\n\n## Connect timeout과 write/read timeout을 구분한다\n\nconnect timeout은 요청 바이트가 원격 애플리케이션에 도달하지 않았을 가능성이 상대적으로 높다. 그래도 proxy나 connection reuse 환경에서는 단정하지 않는 편이 안전하다. write timeout after bytes sent와 read timeout은 훨씬 더 조심해야 한다. 이미 서버가 요청 본문을 받았고 side effect를 commit했지만 응답만 유실됐을 수 있기 때문이다.\n\n따라서 비멱등 write에서는 timeout phase를 로그에 남긴다. `connect_timeout_before_write`, `write_timeout_after_partial_body`, `read_timeout_after_request_sent`, `proxy_504_after_upstream_forward`를 같은 retry 규칙으로 묶지 않는다. 뒤의 세 경우는 대부분 unknown outcome으로 보고 operation lookup, idempotency key replay, provider status 확인을 먼저 한다.\n\n## 메서드 멱등성과 업무 멱등성\n\nHTTP 메서드가 idempotent처럼 보여도 업무적으로 안전하지 않을 수 있고, POST라도 idempotency key가 있으면 replay-safe하게 만들 수 있다. 중요한 것은 `같은 의도`가 `같은 결과`로 수렴하는 계약이다. 예를 들어 `PUT /profile`은 같은 payload라면 수렴하지만, 내부에서 포인트 지급 이벤트를 매번 발행하면 업무적으로는 멱등하지 않다. 반대로 `POST /payments`도 idempotency key, fingerprint, response replay, dedup window가 있으면 같은 결제 의도에 대해 한 번만 승인되도록 만들 수 있다.\n\n그래서 retry 정책은 메서드 이름만 보지 않는다. side effect 종류, idempotency contract, dedup window, response replay 가능성, unknown recovery path를 함께 본다. 이 정보가 없으면 network layer의 자동 retry를 금지하고, 애플리케이션 상태 모델에서 recover-before-retry를 명시하는 편이 안전하다.\n\n## 배포 전 점검 질문\n\n비멱등 retry 정책을 켜기 전에는 세 질문에 답해야 한다. 첫째, 같은 idempotency key로 다른 payload가 오면 거절하는가. 둘째, 성공 응답이 유실된 뒤 같은 key로 재시도하면 이전 response나 resource pointer를 replay하는가. 셋째, proxy나 mesh가 retry한 요청과 사용자가 직접 다시 누른 요청이 같은 operation으로 묶이는가. 셋 중 하나라도 아니면 자동 retry보다 unknown recovery flow를 먼저 만들어야 한다.\n",
   "aliases": [
+    "비멱등 재시도",
+    "안전하지 않은 retry",
+    "중복 side effect",
+    "Non Idempotent Retry Unknown 개념",
+    "Non Idempotent Retry Unknown 정리",
     "non-idempotent retry",
     "unsafe retry guardrail",
     "blind retry danger",
     "POST retry risk",
-    "비멱등 재시도",
-    "안전하지 않은 retry",
-    "중복 side effect",
     "unknown outcome retry",
     "retry guardrail",
-    "service mesh POST retry",
-    "write timeout unknown",
-    "idempotency header required"
+    "service mesh POST retry"
   ],
   "expected_queries": [
     "POST 같은 비멱등 요청은 timeout 후 왜 blind retry하면 안 돼?",
@@ -25,9 +25,7 @@
     "non-idempotent write retry에는 idempotency key와 request fingerprint가 왜 필요해?",
     "connect timeout과 read timeout에서 remote side effect 가능성이 어떻게 달라?",
     "HTTP client 자동 retry가 모든 POST에 켜져 있으면 어떤 중복 side effect가 생겨?",
-    "비멱등 API retry budget과 idempotent read retry budget을 왜 분리해야 해?",
-    "service mesh나 gateway가 POST를 자동 retry할 때 idempotency header가 없는 요청은 어떻게 막아야 해?",
-    "write timeout after bytes sent를 connect timeout처럼 안전하게 재시도하면 왜 위험해?"
+    "비멱등 API retry budget과 idempotent read retry budget을 왜 분리해야 해?"
   ],
   "symptoms": [
     "HTTP client나 proxy가 POST를 자동으로 재시도한다",
@@ -62,6 +60,10 @@
         "date": "2026-06-18",
         "source": "y14-expansion-batch132",
         "note": "Expanded unknown outcome retry recovery, cutoff-window, and non-idempotent automatic retry guardrails."
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
       }
     ]
   }

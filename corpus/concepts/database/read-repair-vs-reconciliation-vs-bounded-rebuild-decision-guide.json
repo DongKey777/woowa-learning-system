@@ -6,14 +6,18 @@
   "summary": "한두 건의 stale read를 요청 흐름에서 바로잡는 건 read repair, 어느 범위가 틀렸는지 스캔하며 맞추는 건 reconciliation, 드리프트가 확인된 구간만 다시 계산하는 건 bounded rebuild로 나눠 본다.",
   "body_markdown": "# Read Repair vs Reconciliation vs Bounded Rebuild 결정 가이드\n\n## 한 줄 요약\n\n> 한두 건의 stale read를 요청 흐름에서 바로잡는 건 `read repair`, 어느 범위가 틀렸는지 스캔하며 맞추는 건 `reconciliation`, 드리프트가 확인된 구간만 다시 계산하는 건 `bounded rebuild`로 나눠 본다.\n\n## 결정 매트릭스\n\n| 지금 보이는 문제 | 먼저 볼 선택지 | 왜 이쪽이 맞나 |\n|---|---|---|\n| 특정 요청에서 캐시 버전만 낡았고 DB 진실은 이미 확실하다 | `read repair` | 읽는 순간 최신 진실원으로 덮어쓰는 게 가장 작게 끝난다 |\n| failover 뒤 어떤 aggregate들이 갈라졌는지 아직 범위를 모른다 | `reconciliation` | source of truth와 projection을 대조하며 손상 범위를 찾는 단계가 먼저다 |\n| summary table의 특정 day bucket이 틀린 것이 확인됐다 | `bounded rebuild` | 영향 구간을 닫아 source에서 그 범위만 재계산하는 편이 빠르고 검증 가능하다 |\n| stale 현상이 한두 건이 아니라 여러 projection으로 번진다 | `reconciliation` 후 필요 시 `bounded rebuild` | 먼저 어디가 틀렸는지 자른 뒤, 재계산 범위를 좁혀야 blast radius가 줄어든다 |\n| 요청 경로에서 바로 고치면 write 폭증이나 잘못된 덮어쓰기가 걱정된다 | `read repair` 대신 배치성 `reconciliation` | 사용자 트래픽 경로보다 통제된 repair loop가 안전하다 |\n\n짧게 기억하면 read repair는 \"읽다가 한 건 고침\", reconciliation은 \"범위를 스캔하며 진실원과 대조\", bounded rebuild는 \"틀린 구간만 다시 만듦\"이다.\n\n## 운영 증거로 고르는 순서\n\n복구 방식은 \"어떤 도구가 편한가\"보다 **무엇이 진실이고, 얼마나 틀렸고, 언제 바꿔 끼워도 되는가**로 정한다.\n\n1. 먼저 source of truth를 고정한다. 새 primary의 현재 row, 이벤트 로그의 특정 offset, 결제 원장, 백업 스냅샷 중 무엇을 기준으로 삼을지 정하지 않으면 read repair도 잘못된 값으로 덮어쓸 수 있다.\n2. drift scope를 측정한다. 단일 key, tenant, time bucket, projection table, 전체 read model 중 어느 범위인지 count, checksum, high watermark, sample diff로 확인한다.\n3. 사용자 요청 경로에서 안전하게 고칠 수 있는지 본다. 단일 key이고 최신 source 조회 비용과 write 부하가 낮으면 read repair가 맞지만, 범위가 닫히지 않거나 쓰기 폭증이 예상되면 reconciliation job으로 뺀다.\n4. bounded rebuild가 필요하면 rebuild unit과 cutover 조건을 먼저 쓴다. 예를 들어 `(tenant_id, day)` bucket을 shadow table에 재계산하고, source count와 checksum이 맞고, replay high watermark가 repair 시작 시점 이상이며, dual-read sample mismatch가 허용치 안에 들어올 때 swap한다.\n\n이 순서가 없으면 \"read repair를 붙였는데 안 읽힌 row는 계속 틀림\", \"reconciliation이 mismatch만 찾고 실제 교체 기준이 없음\", \"bounded rebuild 결과를 검증 없이 overwrite함\" 같은 운영 사고로 이어진다.\n\n| 증거 | read repair 쪽 신호 | reconciliation 쪽 신호 | bounded rebuild 쪽 신호 |\n|---|---|---|---|\n| source of truth | 요청 시 primary나 authoritative API로 즉시 재조회 가능 | source와 projection을 대조해야 무엇이 맞는지 드러남 | source에서 해당 bucket을 재계산할 수 있음 |\n| drift scope | key 몇 개로 좁고 재발 원인이 닫힘 | affected key set을 아직 모름 | tenant, day, shard 같은 rebuild unit이 이미 닫힘 |\n| 실행 경로 | read path에서 idempotent upsert가 가능 | 별도 job으로 scan, compare, patch가 안전 | shadow rebuild, checksum, swap 같은 cutover 단계가 필요 |\n| 완료 증거 | repaired key의 version/freshness가 source와 같음 | mismatch count가 0이거나 허용 범위로 감소 | old/new dual-read diff와 count/checksum이 통과 |\n\n## 흔한 오선택\n\n가장 흔한 오선택은 stale cache 한두 건을 보고 곧바로 전체 rebuild로 뛰는 것이다. 학습자 표현으로는 \"어차피 값이 틀렸으니 summary를 전부 다시 밀어야 하나?\"에 가깝다. 하지만 진실원이 이미 확실하고 손상 범위가 국소적이면 read repair나 작은 reconciliation으로 끝날 일을 불필요하게 크게 만든다.\n\n반대로 failover 뒤 일부 화면이 갈라졌는데 read repair만 붙이고 끝내는 것도 자주 틀린다. 요청 경로에서 보이는 row만 고치면 아직 읽히지 않은 나머지 stale projection은 그대로 남을 수 있다. 이 장면은 \"읽는 김에 보정\"보다 \"어느 범위가 갈라졌는지 스캔\"이 먼저다.\n\n또 하나는 bounded rebuild를 reconciliation의 동의어처럼 쓰는 것이다. reconciliation은 손상 범위를 찾고 source와 비교하는 과정이고, bounded rebuild는 그 결과를 바탕으로 닫힌 구간을 다시 계산하는 실행 단계다. 범위를 모르는데 rebuild부터 시작하면 replay cutoff와 영향 범위 검증이 흔들린다.\n\n## 다음 학습\n\nfailover 뒤 stale read와 projection 정리 흐름을 먼저 보고 싶으면 [Read Repair와 Failover Reconciliation](./read-repair-reconciliation-after-failover.md)와 [Failover 뒤 옛값/새값 번갈아 보임 원인 라우터](./failover-after-old-new-flip-symptom-router.md)를 이어서 보면 된다.\n\nCDC gap이나 projection repair 경계를 더 엄밀하게 자르고 싶으면 [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](./cdc-gap-repair-reconciliation-playbook.md)로 내려가면 된다.\n\nsummary table drift가 확인된 뒤 어떤 bucket만 다시 계산할지 알고 싶으면 [Summary Drift Detection, Invalidation, and Bounded Rebuild](./summary-drift-detection-bounded-rebuild.md)와 [Incremental Summary Table Refresh and Watermark Discipline](./incremental-summary-table-refresh-watermark.md)를 다음 문서로 잡으면 된다.\n",
   "aliases": [
-    "read repair vs reconciliation vs bounded rebuild",
     "stale 데이터 복구 선택 가이드",
     "failover 복구 범위 결정",
-    "projection repair chooser",
-    "summary drift repair choice",
     "부분 복구 vs 재계산",
     "캐시 보정 vs 범위 재검증",
-    "source of truth drift scope rebuild cutover"
+    "Read Repair vs Reconciliation 개념",
+    "read repair vs reconciliation vs bounded rebuild",
+    "projection repair chooser",
+    "summary drift repair choice",
+    "source of truth drift scope rebuild cutover",
+    "read repair vs reconciliation guide",
+    "read repair vs reconciliation checklist",
+    "read-repair-vs-reconciliation-vs-bounded-rebuild-decision-guide"
   ],
   "expected_queries": [
     "failover 뒤 stale read가 보일 때 read repair랑 reconciliation job 중 어디서 시작해?",
@@ -21,8 +25,7 @@
     "summary table 값이 어긋났을 때 부분 재계산과 reconciliation을 어떻게 나눠 봐?",
     "read repair는 요청 경로에서 고치고 reconciliation은 배치라는데 실제 선택 기준이 뭐야?",
     "failover 후 일부 화면만 옛값이면 전체 rebuild보다 먼저 확인할 복구 단계가 있어?",
-    "source of truth와 drift scope를 어떻게 확인하고 repair 방식을 골라?",
-    "bounded rebuild cutover 전에 어떤 검증 지표를 봐야 해?"
+    "source of truth와 drift scope를 어떻게 확인하고 repair 방식을 골라?"
   ],
   "symptoms": [
     "일부 요청만 옛값을 보는데 read repair로 끝낼지 별도 reconciliation job이 필요한지 헷갈린다",
@@ -53,8 +56,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/read-repair-vs-reconciliation-vs-bounded-rebuild-decision-guide.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

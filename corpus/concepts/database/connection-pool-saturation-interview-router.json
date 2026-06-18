@@ -6,20 +6,26 @@
   "summary": "이 symptom_router는 DB connection pool saturation을 면접/운영 증상으로 분기한다. pool wait, slow query, lock wait, pool sizing을 다룬다.",
   "body_markdown": "# Connection Pool Saturation Interview Router\n\n## 한 줄 요약\n\nConnection pool saturation은 \"DB가 느리다\" 하나로 끝나지 않는다. 요청들이 connection을 빌리지 못해 대기하는 현상이고, 원인은 slow query, lock wait, long transaction, connection leak, pool sizing, DB capacity mismatch 중 하나일 수 있다.\n\n## Topic-specific invariant\n\n커넥션 풀의 불변식은 단순하다.\n\n> 동시에 DB와 대화할 수 있는 application request 수는 pool size를 넘을 수 없다. connection을 오래 쥔 요청이 늘어나면, DB CPU가 낮아도 새 요청은 pool borrow 대기에서 timeout될 수 있다.\n\n따라서 풀 고갈을 보면 \"pool을 키울까?\"보다 먼저 \"connection hold time이 왜 길어졌나?\"를 물어야 한다.\n\n## 관찰 증거\n\n- pool active가 max에 붙고 borrow wait 시간이 증가한다.\n- DB CPU는 낮은데 애플리케이션 thread가 connection 대기 상태다.\n- 느린 query, long transaction, lock wait, pool size mismatch가 모두 후보가 된다.\n- Hikari 기준 `active=max`, `idle=0`, `pending>0` 패턴이 반복된다.\n- timeout stack trace가 `getConnection` 또는 pool borrow 지점에 모인다.\n\n## 1차 분기\n\n| 증상 | 원인 후보 | 다음 확인 |\n|---|---|---|\n| active=max, wait 증가 | pool saturation | request concurrency와 query time |\n| DB lock wait 높음 | transaction blocking | lock wait router |\n| DB CPU 낮음 | connection leak/long tx | active stack trace |\n| DB CPU 높고 query time 증가 | DB capacity/slow query | top SQL, execution plan |\n| idle은 있는데 timeout | validation/network/pool 설정 문제 | connection test, maxLifetime, network error |\n| 특정 endpoint만 active 점유 | long transaction/external I/O | transaction boundary, trace span |\n\n## router table\n\n| 먼저 보이는 신호 | 더 가능성 높은 원인 | 확인할 증거 | 첫 대응 |\n|---|---|---|---|\n| pool wait p95/p99만 급증, DB CPU 낮음 | connection을 빌린 채 대기 | thread dump, active stack, transaction duration | long tx/외부 I/O 제거 |\n| lock wait와 pool wait가 같이 증가 | lock blocking이 connection을 붙잡음 | DB lock wait graph, blocking query | blocker 제거, transaction 단축 |\n| DB CPU와 rows examined가 같이 증가 | slow query가 connection을 오래 점유 | slow query log, plan regression | index/query plan 개선 |\n| pending thread가 request concurrency와 같이 증가 | pool size보다 동시 요청이 많음 | RPS, concurrency, service time | backpressure, timeout, pool/capacity 재산정 |\n| 시간이 지날수록 active가 돌아오지 않음 | connection leak 가능성 | leak detection log, borrow-return trace | 누락된 close/transaction boundary 점검 |\n\n## 면접 답변 골격\n\npool을 무조건 키우면 DB 동시 부하가 늘어 장애가 커질 수 있다. 먼저 connection 점유 시간이 긴 이유를 줄이고, DB capacity와 app concurrency에 맞춰 pool을 산정한다.\n\n면접에서는 아래 순서가 안전하다.\n\n1. `active`, `idle`, `pending`, `borrow wait`, `connection usage time`을 본다.\n2. DB 쪽 `CPU`, `lock wait`, `slow query`, `active sessions`를 같이 본다.\n3. thread dump/APM trace로 connection을 쥔 코드 위치와 transaction duration을 확인한다.\n4. slow query/lock/long transaction/leak/pool sizing 중 어느 가지인지 분기한다.\n5. 원인 제거 후 pool size는 DB max connection, instance count, query latency, expected concurrency에 맞춰 조정한다.\n\n## 실무 지표와 증거\n\n| 지표 | 의미 | 해석 |\n|---|---|---|\n| pool active | 사용 중인 connection 수 | max에 붙으면 saturation 가능 |\n| pool pending / waiters | connection을 기다리는 thread 수 | 사용자 latency로 바로 전파 |\n| borrow wait time | 빌릴 때까지 기다린 시간 | pool 병목의 직접 증거 |\n| connection usage/hold time | 빌린 뒤 반납까지 시간 | long tx, slow query, 외부 I/O를 찾는 핵심 |\n| DB lock wait | DB 안에서 기다리는 시간 | lock이 pool timeout으로 번지는지 확인 |\n| DB CPU/IO | DB 자체 포화 여부 | pool만의 문제가 아닌지 확인 |\n| leak detection log | 반납 누락 가능성 | active가 회복되지 않는 패턴 |\n\n## 흔한 오개념\n\n| 오개념 | 왜 위험한가 | 더 정확한 답 |\n|---|---|---|\n| pool timeout이면 pool size를 키우면 된다 | DB 동시 부하를 키워 더 큰 장애를 만들 수 있다 | hold time 원인을 먼저 줄인다 |\n| DB CPU가 낮으면 DB 문제는 아니다 | lock wait나 connection 대기는 CPU를 쓰지 않고도 latency를 만든다 | wait event와 lock graph를 본다 |\n| slow query만 없으면 pool은 안전하다 | 외부 API를 transaction 안에서 호출해도 connection을 오래 붙잡는다 | transaction boundary와 trace span을 본다 |\n| max connection은 클수록 좋다 | DB memory/context switching/lock contention이 늘 수 있다 | app instance 수와 DB capacity로 총량을 제한한다 |\n| timeout은 네트워크 문제다 | pool borrow timeout은 app 내부 대기일 수 있다 | stack trace가 getConnection인지 query execution인지 분리한다 |\n\n## 짧은 예시 답변\n\n\"커넥션 풀 고갈은 active connection이 max에 붙고 pending thread가 늘어 request가 connection borrow 단계에서 기다리는 상태입니다. 원인은 pool이 작아서일 수도 있지만 slow query, lock wait, long transaction, connection leak이 connection hold time을 늘린 경우가 더 흔합니다. 저는 Hikari active/idle/pending/borrow wait와 DB CPU, lock wait, slow query, thread dump를 같이 보고 원인을 줄인 뒤 DB capacity와 app instance 수에 맞춰 pool size를 조정하겠습니다.\"\n\n## 관련 playbook\n\nmetrics 해석은 `pool-metrics-lock-wait-timeout-mini-bridge`로 이어진다.\n",
   "aliases": [
-    "connection pool saturation interview",
-    "Hikari pool timeout router",
     "커넥션 풀 고갈 면접",
     "DB pool wait timeout 원인",
     "커넥션풀 고갈",
     "풀 타임아웃",
+    "Connection Pool Saturation Interview 개념",
+    "connection pool saturation interview",
+    "Hikari pool timeout router",
     "Hikari timeout",
     "pool acquire wait",
-    "active connection max"
+    "active connection max",
+    "connection pool saturation interview guide",
+    "connection pool saturation interview checklist"
   ],
   "expected_queries": [
     "DB connection pool이 고갈되면 어떤 증상이 나와?",
     "Hikari timeout이 DB가 느린 건지 pool이 작은 건지 어떻게 구분해?",
-    "커넥션 풀 크기는 크게 잡으면 해결돼?"
+    "커넥션 풀 크기는 크게 잡으면 해결돼?",
+    "Connection Pool Saturation Interview Router를 언제 쓰는지 예제로 설명해줘",
+    "Connection Pool Saturation Interview 개념을 데이터베이스 관점에서 정리해줘",
+    "Connection Pool Saturation Interview 구현할 때 자주 하는 실수는 뭐야?"
   ],
   "symptoms": [
     "API latency가 늘고 pool wait 시간이 높아요",
@@ -43,8 +49,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/connection-pool-saturation-interview-router.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

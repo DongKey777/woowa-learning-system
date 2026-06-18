@@ -6,16 +6,18 @@
   "summary": "컨테이너 OOMKilled를 JVM heap, direct/offheap, native memory, page cache, cgroup limit 기준으로 분해하는 operating-system playbook",
   "body_markdown": "# Container OOM Heap Offheap Page Cache Debugging\n\n## 이 문서가 맡는 질문\n컨테이너 OOMKilled를 JVM heap, direct/offheap, native memory, page cache, cgroup limit 기준으로 분해하는 operating-system playbook. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\nexit code와 cgroup memory.events를 먼저 본다. heap dump만 보지 말고 direct buffer, thread stack, metaspace, mmap, page cache를 나눠 본다. 마지막으로 memory pressure와 reclaim latency를 측정한다.\n\n## 실전 시나리오\nPod가 OOMKilled되지만 heap dump는 limit보다 작다. 파일 처리와 Netty direct buffer를 쓰는 시간대에 RSS가 치솟고 page cache도 같이 늘어난다.\n\n## CS 배경\n컨테이너 memory limit은 프로세스 heap만이 아니라 RSS, native allocation, direct buffer, thread stack, page cache까지 포함한다. OOM killer는 이 전체 사용량과 reclaim 가능성을 보고 죽인다.\n\n## 핵심 불변식\n- heap max가 container limit보다 작아도 OOM은 가능하다\n- direct/offheap memory와 mmap은 heap dump에 보이지 않을 수 있다\n- page cache는 reclaim 가능하지만 pressure 상황에서는 latency를 만든다\n- OOMKilled는 애플리케이션 예외가 아니라 cgroup/kernel 결정이다\n\n## 판단 매트릭스\n- heap이 작으면 NMT/JFR/direct buffer 확인\n- 파일 IO가 많으면 page cache와 tmpfs 확인\n- thread가 많으면 stack memory와 native allocation 확인\n- limit 근처 p99가 튀면 reclaim/major fault를 확인\n\n## 예시\n```text\nkubectl describe pod -> cgroup memory.events -> RSS breakdown -> heap/direct/native/page cache attribution\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\nOOM 디버깅의 핵심은 heap 사용량이 아니라 container가 청구받는 전체 memory footprint를 분해하는 것이다.\n\n## 품질 관점\n품질은 container OOM의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 heap dump small, direct buffer leak, mmap file, page cache pressure를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. RSS breakdown, NMT overhead, page cache, reclaim, stack count를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. major fault, reclaim stalls, OOM kill time, GC before kill가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\noom_kill_count, rss_bytes, heap_used_bytes, direct_memory_bytes, page_cache_bytes, major_faults를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- heap dump가 작으면 OOM 원인이 아니라고 본다\n- page cache는 공짜라고 생각한다\n- Xmx만 낮추면 container OOM이 해결된다고 단정한다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## 한 줄 정리\n컨테이너 OOM은 JVM heap이 아니라 cgroup이 보는 heap/offheap/native/page-cache 총합을 기준으로 디버깅해야 한다.\n\n## 실제 triage 순서\n\n먼저 애플리케이션 로그에서 `OutOfMemoryError`가 났는지와 kubelet/cgroup이 `OOMKilled`를 기록했는지를 분리한다. Java heap OOME라면 heap dump와 GC log가 1차 증거가 되지만, cgroup OOM kill이면 프로세스가 예외를 던질 시간 없이 종료될 수 있다. 이때는 `memory.events`, container exit code, RSS, cgroup current/max, node pressure event를 먼저 본다.\n\n그 다음 JVM 내부와 커널이 보는 메모리 계정을 맞춘다. `Xmx`는 heap 상한일 뿐이고, metaspace, code cache, thread stack, direct buffer, JNI/native allocation, mmap mapping, page cache는 별도다. NMT/JFR/direct buffer metric으로 JVM 쪽을 보고, `smaps_rollup`, cgroup memory.stat, page cache, anon/rss, file cache를 함께 대조해야 한다.\n\n## 원인별 다른 조치\n\nDirect buffer가 주범이면 `MaxDirectMemorySize`, Netty allocator, buffer release leak, pooled allocator 지표를 본다. thread stack이 크면 thread 수와 stack size를 본다. tmpfs나 file processing이 원인이면 page cache와 tmpfs가 cgroup limit에 들어오는지 확인한다. page cache는 reclaim 가능하지만 pressure가 커지면 major fault와 reclaim stall을 만들어 p99를 밀 수 있다.\n\n그래서 답변은 \"Xmx를 낮춘다\"로 끝나면 안 된다. container limit에서 heap budget, native budget, direct buffer budget, thread budget, page cache 여유를 합산하고, peak traffic과 배치 작업이 겹칠 때도 headroom이 남는지 계산해야 한다. OOM 재현 테스트도 큰 heap 객체 하나가 아니라 file read, mmap, direct buffer allocation, 많은 thread, concurrent request를 나눠 만들어야 한다.\n\n## 관측 체크리스트\n\n- `memory.events`의 `oom`, `oom_kill`, `high` 증가를 본다.\n- `memory.current`, `memory.stat`의 anon/file/kernel_stack/slab 값을 나눠 본다.\n- JVM NMT에서 Java heap, class, thread, code, GC, internal, arena chunk를 확인한다.\n- direct buffer pool 사용량, Netty allocator metric, mmap file count를 본다.\n- major fault, reclaim stall, PSI memory some/full이 p99와 같이 움직이는지 확인한다.\n\n## 답변에서 배제해야 할 잘못된 결론\n\nheap dump가 작다는 사실만으로 memory leak이 아니라고 결론내리면 안 된다. cgroup 관점에서는 file cache와 native allocation도 같은 limit 안에서 경쟁한다. 반대로 page cache가 보인다고 무조건 page cache를 없애는 것도 아니다. file cache는 정상적인 성능 최적화일 수 있고, 문제는 peak 순간에 reclaim이 충분히 빠른지와 애플리케이션 native budget이 limit 안에 들어오는지다.\n\n컨테이너 메모리 답변은 시간축을 맞춰야 한다. RSS가 먼저 증가했는지, GC가 먼저 길어졌는지, direct buffer pool이 먼저 찼는지, file cache가 batch job과 함께 늘었는지, node memory pressure event가 있었는지 순서를 본다. 이 순서가 있어야 Xmx 조정, offheap limit, buffer pooling, file streaming 방식 변경, pod limit 증설 중 어떤 조치가 맞는지 결정할 수 있다.\n",
   "aliases": [
-    "container OOM cgroup memory",
     "OOMKilled heap 작음",
     "direct buffer RSS 증가",
-    "page cache memory pressure",
     "JVM offheap OOM 진단",
     "cgroup memory.events 확인",
+    "컨테이너 메모리 limit",
+    "container OOM cgroup memory",
+    "page cache memory pressure",
     "NMT direct native memory",
     "mmap page cache OOM",
-    "컨테이너 메모리 limit",
-    "heap dump small OOMKilled"
+    "heap dump small OOMKilled",
+    "container oom heap offheap guide",
+    "container oom heap offheap checklist"
   ],
   "expected_queries": [
     "Pod가 OOMKilled되는데 heap dump는 작은 경우 뭘 봐야 해?",
@@ -23,8 +25,7 @@
     "direct buffer나 mmap 때문에 OOM이 날 때 어떤 지표를 봐?",
     "heap dump는 작은데 cgroup memory.events에 oom_kill이 찍히면 RSS를 어떻게 분해해?",
     "Netty direct buffer와 page cache 때문에 container OOM이 날 때 Xmx만 줄이면 왜 부족해?",
-    "Kubernetes OOMKilled 후 heap offheap native thread stack page cache를 어떤 순서로 확인해?",
-    "memory pressure 때문에 major fault와 reclaim latency가 p99를 올리는지 어떻게 봐?"
+    "Kubernetes OOMKilled 후 heap offheap native thread stack page cache를 어떤 순서로 확인해?"
   ],
   "symptoms": [
     "container OOM heap small",
@@ -78,6 +79,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch142"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
       }
     ]
   }

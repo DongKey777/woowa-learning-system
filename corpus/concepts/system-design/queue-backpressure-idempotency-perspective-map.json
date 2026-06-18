@@ -6,18 +6,18 @@
   "summary": "message queue를 처리량 완충, backpressure, duplicate delivery, idempotent consumer 관점으로 나눈다. Queue는 느린 consumer를 빠른 producer에서 분리하지만 실패를 없애지 않는다. 쌓이는 backlog, visibility timeout, retry, dead letter, idempotent consumer를 함께 봐야 한다.",
   "body_markdown": "# Queue, Backpressure, Idempotency Perspective Map\n\n## 이 문서가 맡는 질문\nQueue는 느린 consumer를 빠른 producer에서 분리하지만 실패를 없애지 않는다. 쌓이는 backlog, visibility timeout, retry, dead letter, idempotent consumer를 함께 봐야 한다.\n\n## 빠른 분기\nbacklog가 늘면 consumer 처리량과 producer 유입량을 비교한다. 중복 처리가 보이면 delivery guarantee와 idempotency key를 본다. DLQ가 늘면 poison message와 retry policy를 본다.\n\n## 실전 시나리오\n주문 생성 후 알림 queue에 메시지를 넣었는데 장애 후 같은 알림이 두 번 갔다고 하자. Queue가 at-least-once delivery라면 중복은 정상 failure model이다. Consumer는 notification_id나 order_id+type으로 dedup해야 한다.\n\n## CS 배경\nQueueing theory는 arrival rate와 service rate 차이가 backlog를 만든다고 본다. At-most-once, at-least-once, exactly-once는 delivery semantics의 trade-off다. Backpressure는 producer에게 늦추라는 신호이고, idempotency는 중복 실행의 부작용을 줄이는 성질이다.\n\n## 깊게 볼 포인트\nQueue를 넣으면 응답은 빨라질 수 있지만 전체 완료 시간은 backlog와 consumer rate에 달린다. Retry는 poison message를 계속 재처리할 수 있으므로 max retry와 DLQ가 필요하다. Ordering을 보장하려면 partition key를 고르고, 그 대가로 hot partition을 감수한다.\n\n## 다음 행동\n1. 메시지의 business id를 정한다. 2. consumer side effect를 idempotent하게 만든다. 3. backlog age와 DLQ count를 지표로 둔다. 4. producer rate limit 또는 load shedding을 설계한다.\n\n## 확인 질문\n이 queue는 지연을 흡수하는 장치인가, 작업 소유권을 넘기는 장치인가, 아니면 실패를 나중에 복구하기 위한 log인가?\n\n## 추가 예시\n결제 완료 메시지는 중복될 수 있으므로 “이미 처리됨” 상태를 읽고 넘어가야 한다. 반면 이메일 발송은 중복을 완전히 막기 어렵다면 수신자 경험 기준으로 dedup window를 둔다.\n\n## Idempotency 예시\n```sql\nCREATE UNIQUE INDEX ux_processed_message ON processed_message(message_id);\nINSERT INTO processed_message(message_id, processed_at) VALUES (?, now());\n```\nconsumer는 business update와 processed marker 저장을 같은 transaction으로 묶거나, outbox/inbox 패턴으로 재처리 가능하게 만들어야 한다. message 처리 후 ack 전에 crash가 나면 같은 message가 다시 올 수 있으므로 unique constraint가 중복 side effect를 막는 마지막 방어선이 된다.\n\n## 판단 매트릭스\n- Queue 건강도: backlog size보다 backlog age, consumer lag, oldest message age를 먼저 본다.\n- 처리 보장: at-most-once, at-least-once, exactly-once처럼 보이는 효과 중 실제 시스템이 제공하는 경계를 구분한다.\n- Idempotency 근거: unique constraint, atomic check-and-set, processed-message table, idempotency key TTL이 있는지 본다.\n- 리뷰 질문: 재처리와 중복 소비가 발생해도 domain invariant가 깨지지 않는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 backlog age, queue length, consumer lag, duplicate count, DLQ count, handler latency이다. queue length보다 가장 오래된 message age가 사용자 체감 지연에 가깝다. consumer p95와 producer rate 차이가 계속 벌어지면 backlog는 자연히 누적된다. \n\n## 자주 하는 오해\n- queue가 실패를 없앤다고 생각한다\n- at-least-once에서 중복 처리를 버그로만 본다\n- backlog age와 queue length를 구분하지 못한다\n이 오해를 줄이려면 queue가 버퍼인지 신뢰성 경계인지부터 분리한다. ack, visibility timeout, lease가 있는 시스템에서는 처리 시간이 timeout을 넘는 순간 중복 소비가 정상 동작이 된다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 queue가 흡수하려는 burst와 consumer 처리율을 수치로 잡는다. 그 다음 ack/visibility timeout, DLQ, idempotency 저장소, outbox 경계를 설명한다. 마지막에는 backlog age, 처리량, 중복 처리율, end-to-end latency가 품질과 성능에 어떤 영향을 주는지 말한다.\n\n## 실전 검증 루프\n1. producer rate, consumer rate, backlog age, oldest message age를 같은 시간축에 둔다.\n2. consumer timeout과 crash를 주입해 중복 delivery와 DLQ 이동을 재현한다.\n3. idempotency key 저장을 unique constraint 또는 atomic check-and-set으로 검증한다.\n4. hot partition이 있는지 key별 lag와 처리량을 비교한다.\n5. backpressure 정책 적용 후 upstream latency, drop/reject count, 복구 시간을 기록한다.\n\n이 루프를 지키면 queue 문서는 비동기 처리 소개가 아니라 delivery semantics와 idempotency 설계 자료가 된다.\n\n## 품질 관점\n시스템 설계 품질은 SLO, failure mode, capacity, recovery를 같은 시나리오에서 검증한다. 이 문서의 답변 품질은 `Queue, Backpressure, Idempotency Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`slo_burn_rate, saturation_pct, recovery_time_ms, p99_latency_ms`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n\n## 운영 판단: 큐는 부하를 없애지 않고 위치를 바꾼다\n\nqueue를 넣으면 생산자와 소비자의 속도를 분리할 수 있지만, 작업 자체가 사라지는 것은 아니다. consumer 처리량보다 producer 유입이 크면 backlog age가 증가하고, 사용자는 오래된 결과를 보게 되거나 retry 폭증을 겪는다. 그래서 queue 설계는 buffering, backpressure, load shedding, idempotency를 함께 본다.\n\nbackpressure는 upstream에게 속도를 줄이라는 신호를 보내는 것이다. 단순히 queue depth가 늘어나는 것은 신호가 아니라 증상일 수 있다. producer admission limit, per-tenant quota, retry budget, consumer autoscaling, DLQ policy가 없으면 queue는 장애를 늦게 드러내는 저장소가 된다.\n\n## 중복 처리와 visibility timeout\n\nat-least-once delivery에서는 consumer가 처리 후 ack하기 전에 죽거나, visibility timeout이 만료되거나, broker/consumer group rebalancing이 일어나면 같은 메시지가 다시 올 수 있다. 따라서 business side effect는 message id, idempotency key, natural unique key, processed-event table 중 하나로 보호해야 한다. visibility timeout은 처리 p99보다 충분히 길거나 heartbeat/extend가 있어야 하고, 너무 길면 실패 복구가 늦어진다.\n\n## DLQ와 재처리\n\nDLQ는 실패 메시지를 버리는 장소가 아니라 격리와 진단을 위한 대기열이다. poison message를 무한 retry하면 정상 메시지까지 막고 consumer capacity를 태운다. DLQ로 보낸 뒤에는 원인 수정, replay 범위, idempotency guard, side effect suppression을 확인해야 한다. 이 문서의 primary 답변은 queue backlog, retry, duplicate delivery, DLQ, idempotent consumer를 하나의 failure matrix로 연결해야 한다.\n",
   "aliases": [
+    "큐 백프레셔 멱등성",
+    "중복 메시지 처리 방지",
+    "DLQ 재처리 멱등성",
+    "Queue, Backpressure, Idempotency Perspective 개념",
+    "Queue, Backpressure, Idempotency Perspective 정리",
     "queue backpressure idempotency",
     "message queue duplicate delivery",
-    "큐 백프레셔 멱등성",
     "at least once consumer",
     "dead letter queue",
     "visibility timeout lease",
     "consumer idempotency",
-    "queue backlog age",
-    "poison message retry",
-    "producer consumer rate",
-    "중복 메시지 처리 방지",
-    "DLQ 재처리 멱등성"
+    "queue backlog age"
   ],
   "expected_queries": [
     "message queue backpressure idempotency를 같이 설명해줘",
@@ -25,9 +25,7 @@
     "backlog가 늘어날 때 producer와 consumer 중 어디를 봐야 해?",
     "DLQ는 언제 필요한 거야?",
     "at-least-once delivery에서 consumer 멱등성이 왜 필요해?",
-    "queue가 있으면 시스템이 무조건 안정적이야?",
-    "queue를 썼는데 메시지가 밀리고 중복 처리될 때 backpressure와 idempotency를 어떻게 봐?",
-    "visibility timeout이 짧아 같은 메시지가 두 consumer에게 다시 보이면 idempotency key와 lease heartbeat를 어떻게 봐?"
+    "queue가 있으면 시스템이 무조건 안정적이야?"
   ],
   "symptoms": [
     "queue가 실패를 없앤다고 생각한다",
@@ -74,6 +72,10 @@
         "date": "2026-06-18",
         "source": "y14-expansion-batch128",
         "note": "Expanded delivery semantics idempotency surfaces for batch128."
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
       }
     ]
   }

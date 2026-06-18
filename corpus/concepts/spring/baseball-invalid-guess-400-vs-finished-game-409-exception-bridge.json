@@ -4,7 +4,7 @@
   "category": "spring",
   "level": "intermediate",
   "summary": "baseball API에서 \"1,1,2처럼 규칙에 맞지 않는 추측\"과 \"이미 끝난 게임에 다시 추측\"은 둘 다 실패지만 실패 이유가 다르다. 전자는 입력 의미가 잘못된 400에 가깝고, 후자는 현재 게임 상태와 충돌한 409에 가깝다.",
-  "body_markdown": "# baseball 잘못된 추측 `400` vs 종료된 게임 재추측 `409` ↔ Spring 예외 번역 브릿지\n\n## 한 줄 요약\n\n> baseball API에서 \"`1,1,2`처럼 규칙에 맞지 않는 추측\"과 \"`이미 끝난 게임에 다시 추측`\"은 둘 다 실패지만 실패 이유가 다르다. 전자는 입력 의미가 잘못된 `400`에 가깝고, 후자는 현재 게임 상태와 충돌한 `409`에 가깝다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"중복 숫자 입력도 끝난 게임 재추측도 다 `IllegalArgumentException`이면 안 되나요?\" | 입력 규칙 실패와 현재 게임 상태 충돌이 같은 예외/응답으로 내려가는 API | 요청 값 자체 오류와 서버 현재 상태 충돌을 다른 bucket으로 나눈다 |\n| \"왜 종료된 게임에 다시 추측하면 400이 아니라 409예요?\" | `finished=true`인 게임에 정상 형식의 guess가 늦게 들어온 상황 | 숫자를 고쳐도 해결되지 않고 현재 게임 state가 문제라는 점을 본다 |\n| \"ControllerAdvice는 그냥 500 숨기는 곳 아닌가요?\" | 도메인 예외가 HTTP 응답 계약으로 번역되지 않아 클라이언트 행동이 흐려지는 코드 | 예외 타입별로 복구 행동이 드러나는 status/error code를 매핑한다 |\n\n## 미션 시나리오\n\nbaseball를 웹으로 옮기면 `POST /games/{id}/guesses` 하나가 여러 종류의 실패를 만나게 된다. 요청 본문은 JSON으로 잘 들어왔지만 `Guess.from(...)`에서 중복 숫자나 길이 오류가 날 수 있고, 반대로 추측 자체는 멀쩡하지만 이미 `finished=true`인 게임에 늦은 요청이 들어올 수도 있다.\n\n처음 구현에서는 이 둘을 모두 `IllegalArgumentException`으로 던지고, 공통 advice가 없어서 결국 `500`으로 보이기 쉽다. 혹은 반대로 전부 `400`으로 묶어서 \"`어차피 잘못된 요청 아닌가?`\"라고 끝내기도 한다. PR에서 \"`입력 규칙 위반과 게임 상태 충돌을 같은 bucket으로 보지 마세요`\", \"`응답 코드가 도메인 설명과 연결되어야 합니다`\"라는 코멘트가 나오는 장면이 여기다.\n\n## CS concept 매핑\n\n핵심은 예외 클래스 이름보다 실패의 축을 먼저 가르는 것이다. `Guess.from(...)`에서 터지는 실패는 \"이 입력을 baseball 추측으로 받아들일 수 있는가\"의 문제라서 `400 Bad Request` 쪽에 가깝다. 반면 `game.isFinished()` 이후 추가 추측을 막는 실패는 요청 형식보다 \"`지금 이 게임은 더 진행할 수 없다`\"는 상태 충돌이라 `409 Conflict`로 읽는 편이 자연스럽다.\n\nSpring에서는 이 차이를 `@RestControllerAdvice`에서 번역 계약으로 드러내면 된다. 예를 들면 `InvalidGuessException -> 400`, `GameAlreadyFinishedException -> 409`처럼 나누면 controller/service는 baseball 규칙에 집중하고, HTTP 숫자는 advice가 맡는다. 중요한 건 \"`예외를 몇 개 만들까`\"보다 \"`학습자가 실패 원인을 다시 행동으로 옮길 수 있게 응답 의미를 분리했는가`\"다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`중복 숫자 입력`과 `끝난 게임 재추측`은 둘 다 실패지만 수정 위치가 다르니 같은 상태 코드로 뭉개지 마세요.\"\n- \"`IllegalArgumentException` 하나로 다 받으면 도메인 충돌이 입력 오류처럼 보여 클라이언트 액션이 흐려집니다.\"\n- \"`ControllerAdvice`는 예외를 숨기는 곳이 아니라, baseball 규칙 실패를 HTTP 계약으로 번역하는 곳입니다.\"\n- \"`finished game`은 다시 숫자를 고쳐 보내서 해결되는 문제가 아니라 현재 state를 새로 조회하거나 새 게임을 시작해야 하는 충돌입니다.\"\n\n## 다음 학습\n\n- 입력 바인딩과 도메인 `Guess` 생성 경계를 먼저 정리하려면 `spring/baseball-mvc-controller-binding-bridge`\n- `@ExceptionHandler`와 `@RestControllerAdvice`의 큰 그림은 `spring/spring-exception-handling-basics`\n- `400` 안에서도 body 변환 실패, validation 실패, business `409`를 더 세밀하게 가르려면 `spring/requestbody-400-vs-validation-400-vs-business-409-decision-guide`\n- 종료된 게임에 늦게 도착한 요청이 왜 단순 입력 오류가 아니라 current state 충돌인지 더 파고들려면 `database/baseball-current-game-state-lost-update-version-cas-bridge`\n",
+  "body_markdown": "# baseball 잘못된 추측 `400` vs 종료된 게임 재추측 `409` ↔ Spring 예외 번역 브릿지\n\n## 한 줄 요약\n\n> baseball API에서 \"`1,1,2`처럼 규칙에 맞지 않는 추측\"과 \"`이미 끝난 게임에 다시 추측`\"은 둘 다 실패지만 실패 이유가 다르다. 전자는 입력 의미가 잘못된 `400`에 가깝고, 후자는 현재 게임 상태와 충돌한 `409`에 가깝다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"중복 숫자 입력도 끝난 게임 재추측도 다 `IllegalArgumentException`이면 안 되나요?\" | 입력 규칙 실패와 현재 게임 상태 충돌이 같은 예외/응답으로 내려가는 API | 요청 값 자체 오류와 서버 현재 상태 충돌을 다른 bucket으로 나눈다 |\n| \"왜 종료된 게임에 다시 추측하면 400이 아니라 409예요?\" | `finished=true`인 게임에 정상 형식의 guess가 늦게 들어온 상황 | 숫자를 고쳐도 해결되지 않고 현재 게임 state가 문제라는 점을 본다 |\n| \"ControllerAdvice는 그냥 500 숨기는 곳 아닌가요?\" | 도메인 예외가 HTTP 응답 계약으로 번역되지 않아 클라이언트 행동이 흐려지는 코드 | 예외 타입별로 복구 행동이 드러나는 status/error code를 매핑한다 |\n\n## 미션 시나리오\n\nbaseball를 웹으로 옮기면 `POST /games/{id}/guesses` 하나가 여러 종류의 실패를 만나게 된다. 요청 본문은 JSON으로 잘 들어왔지만 `Guess.from(...)`에서 중복 숫자나 길이 오류가 날 수 있고, 반대로 추측 자체는 멀쩡하지만 이미 `finished=true`인 게임에 늦은 요청이 들어올 수도 있다.\n\n처음 구현에서는 이 둘을 모두 `IllegalArgumentException`으로 던지고, 공통 advice가 없어서 결국 `500`으로 보이기 쉽다. 혹은 반대로 전부 `400`으로 묶어서 \"`어차피 잘못된 요청 아닌가?`\"라고 끝내기도 한다. PR에서 \"`입력 규칙 위반과 게임 상태 충돌을 같은 bucket으로 보지 마세요`\", \"`응답 코드가 도메인 설명과 연결되어야 합니다`\"라는 코멘트가 나오는 장면이 여기다.\n\n## CS concept 매핑\n\n핵심은 예외 클래스 이름보다 실패의 축을 먼저 가르는 것이다. `Guess.from(...)`에서 터지는 실패는 \"이 입력을 baseball 추측으로 받아들일 수 있는가\"의 문제라서 `400 Bad Request` 쪽에 가깝다. 반면 `game.isFinished()` 이후 추가 추측을 막는 실패는 요청 형식보다 \"`지금 이 게임은 더 진행할 수 없다`\"는 상태 충돌이라 `409 Conflict`로 읽는 편이 자연스럽다.\n\nSpring에서는 이 차이를 `@RestControllerAdvice`에서 번역 계약으로 드러내면 된다. 예를 들면 `InvalidGuessException -> 400`, `GameAlreadyFinishedException -> 409`처럼 나누면 controller/service는 baseball 규칙에 집중하고, HTTP 숫자는 advice가 맡는다. 중요한 건 \"`예외를 몇 개 만들까`\"보다 \"`학습자가 실패 원인을 다시 행동으로 옮길 수 있게 응답 의미를 분리했는가`\"다.\n\n## 미션 PR 코멘트 패턴\n\n- \"`중복 숫자 입력`과 `끝난 게임 재추측`은 둘 다 실패지만 수정 위치가 다르니 같은 상태 코드로 뭉개지 마세요.\"\n- \"`IllegalArgumentException` 하나로 다 받으면 도메인 충돌이 입력 오류처럼 보여 클라이언트 액션이 흐려집니다.\"\n- \"`ControllerAdvice`는 예외를 숨기는 곳이 아니라, baseball 규칙 실패를 HTTP 계약으로 번역하는 곳입니다.\"\n- \"`finished game`은 다시 숫자를 고쳐 보내서 해결되는 문제가 아니라 현재 state를 새로 조회하거나 새 게임을 시작해야 하는 충돌입니다.\"\n\n## 다음 학습\n\n- 입력 바인딩과 도메인 `Guess` 생성 경계를 먼저 정리하려면 `spring/baseball-mvc-controller-binding-bridge`\n- `@ExceptionHandler`와 `@RestControllerAdvice`의 큰 그림은 `spring/spring-exception-handling-basics`\n- `400` 안에서도 body 변환 실패, validation 실패, business `409`를 더 세밀하게 가르려면 `spring/requestbody-400-vs-validation-400-vs-business-409-decision-guide`\n- 종료된 게임에 늦게 도착한 요청이 왜 단순 입력 오류가 아니라 current state 충돌인지 더 파고들려면 `database/baseball-current-game-state-lost-update-version-cas-bridge`\n\n## Batch152 보강 메모\n\nbaseball 잘못된 추측 `400` vs 종료된 게임 재추측 `409` ↔ Spring 예외 번역 브릿지를 학습할 때는 용어 정의만 확인하기보다 스프링 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. baseball API에서 \"1,1,2처럼 규칙에 맞지 않는 추측\"과 \"이미 끝난 게임에 다시 추측\"은 둘 다 실패지만 실패 이유가 다르다. 전자는 입력 의미가 잘못된 400에 가깝고, 후자는 현재 게임 상태와 충돌한 409에 가깝다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
   "aliases": [
     "baseball 400 409 예외 번역",
     "야구 미션 종료 게임 409",
@@ -13,14 +13,19 @@
     "야구 미션 예외 응답 분리",
     "@ExceptionHandler",
     "@RestController",
-    "@RestControllerAdvice"
+    "@RestControllerAdvice",
+    "baseball invalid guess 400 guide",
+    "baseball invalid guess 400 checklist",
+    "baseball-invalid-guess-400-vs-finished-game-409-exception-bridge",
+    "baseball 잘못된 추측 `400` 개념"
   ],
   "expected_queries": [
     "야구 미션 API에서 잘못된 숫자 입력은 400이고 끝난 게임에 다시 추측하면 409인 이유가 뭐야?",
     "baseball에서 IllegalArgumentException 하나로 다 던지지 말라는 리뷰를 Spring 응답 관점으로 설명해줘",
     "ControllerAdvice에서 중복 숫자 입력과 finished game 예외를 어떻게 다르게 번역해야 해?",
     "Guess 생성 실패와 이미 종료된 game 상태 충돌을 같은 400으로 보면 왜 아쉬워?",
-    "baseball 웹 미션에서 500이 아니라 400과 409로 나누라는 기준이 뭐야?"
+    "baseball 웹 미션에서 500이 아니라 400과 409로 나누라는 기준이 뭐야?",
+    "baseball 잘못된 추측 `400` vs 종료된 게임 재추측 `409` ↔ Spring 예외 번역 브릿지를 언제 쓰는지 예제로 설명해줘"
   ],
   "symptoms": [
     "중복 숫자 추측과 이미 끝난 게임 재요청이 둘 다 500으로 내려가요",
@@ -49,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/baseball-invalid-guess-400-vs-finished-game-409-exception-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

@@ -6,18 +6,18 @@
   "summary": "같은 로컬 트랜잭션의 이벤트 누락을 막는 1차 선택은 outbox, DB 변경을 외부로 안정적으로 흘려보내는 수집 방식은 CDC, 여러 서비스의 실패를 되감는 업무 흐름은 saga로 나눠 본다.",
   "body_markdown": "# Outbox vs CDC vs Saga 결정 가이드\n\n## 한 줄 요약\n\n> 같은 로컬 트랜잭션의 이벤트 누락을 막는 1차 선택은 `outbox`, DB 변경을 외부로 안정적으로 흘려보내는 수집 방식은 `CDC`, 여러 서비스의 실패를 되감는 업무 흐름은 `saga`로 나눠 본다.\n\n## 결정 매트릭스\n\n| 지금 먼저 풀려는 문제 | 1차 선택 | 왜 이렇게 보나 |\n|---|---|---|\n| `order` 저장과 `order-created` 발행이 한 번에 맞물려야 함 | `outbox` | 같은 DB commit에 이벤트 기록을 묶어 dual write 누락을 줄인다 |\n| 애플리케이션이 직접 publish하지 않고 DB 변경분을 밖으로 흘려보내고 싶음 | `CDC` | binlog/WAL을 읽어 변경 사실을 수집하는 경로라 발행 채널과 분리된다 |\n| 결제, 재고, 포인트처럼 여러 서비스 단계 실패 시 보상 순서를 설계해야 함 | `saga` | 발행 기술이 아니라 분산 업무 흐름과 compensating action의 문제다 |\n| 이벤트 누락도 막고 운영상 중앙 수집도 필요함 | `outbox` + `CDC` 조합 | outbox가 의미를 만들고 CDC가 전달 파이프를 담당할 수 있다 |\n| \"메시지는 갔는데 후속 단계가 일부만 성공\"이 걱정됨 | `saga` + idempotency | 발행 자체보다 단계별 재시도와 보상 규칙이 핵심이다 |\n\n짧게 고정하면 outbox는 \"무엇을 남길지\", CDC는 \"어떻게 가져갈지\", saga는 \"실패를 어떻게 되감을지\"에 가깝다.\n\n## 보장 범위와 failure mode\n\n| 패턴 | 실제로 보장하는 범위 | 자주 터지는 failure mode | 같이 둬야 하는 방어선 |\n|---|---|---|---|\n| outbox | 도메인 상태 변경과 \"발행할 이벤트 row 생성\"을 같은 로컬 DB commit에 묶는다 | relay가 broker publish 뒤 `sent` 표시 전에 죽으면 duplicate publish가 난다. 반대로 broker ack 전에 `sent`로 표시하면 loss가 난다 | outbox event id, aggregate id/version, consumer dedup, `sent` mark는 publish ack 이후 |\n| CDC | commit된 DB 변경을 WAL/binlog offset 순서로 읽어 외부로 전달한다 | snapshot과 streaming 경계에서 중복이 생기거나, connector restart/rebalance 뒤 같은 record가 다시 전달될 수 있다 | stable primary key, offset checkpoint, idempotent sink, schema/version 검증 |\n| saga | 여러 로컬 트랜잭션을 단계와 보상 동작으로 이어서 최종 상태를 수렴시킨다 | command retry가 같은 결제/차감을 중복 실행하거나, compensation 자체가 실패해 saga가 중간 상태에 남는다 | saga id, step status table, command idempotency key, compensating action 재시도 정책 |\n\n따라서 셋 모두 \"정확히 한 번 side effect\"를 단독으로 보장하지 않는다. outbox와 CDC는 보통 **at-least-once delivery** 쪽으로 기울기 때문에 consumer가 중복을 견뎌야 하고, saga는 delivery 장치가 아니라 retry와 compensation을 안전하게 반복하는 workflow state machine에 가깝다.\n\n### 중복, 순서, replay를 나눠 보는 기준\n\n- 중복: outbox relay, CDC connector, saga command handler 모두 retry 지점이 있으므로 event id나 command id를 최종 side effect 테이블의 unique key까지 밀어 넣는다.\n- 순서: 전역 순서가 필요한지, aggregate별 순서만 필요한지 먼저 나눈다. 대부분은 `aggregate_id + version` 또는 partition key 순서가 핵심이고, broker 전체 순서를 믿고 도메인 순서를 설명하면 깨지기 쉽다.\n- replay: CDC offset reset, DLQ replay, saga recovery는 \"처음처럼 다시 실행\"이 아니라 이미 처리된 event/step/status를 조회한 뒤 missing transition만 전진시킨다.\n- 의미 경계: CDC가 row change를 읽어도 \"주문 생성 이벤트\"라는 비즈니스 의미는 자동으로 생기지 않는다. 그 의미를 안정적으로 replay하려면 outbox row처럼 event type, payload version, idempotency key를 남겨야 한다.\n\n## 흔한 오선택\n\n가장 흔한 오선택은 Debezium 같은 CDC를 붙이면 dual write 문제가 자동으로 끝난다고 믿는 것이다. 학습자 표현으로는 \"어차피 binlog를 읽어 가니까 이벤트 유실도 없지 않나?\"에 가깝다. 하지만 CDC는 이미 기록된 변경을 밖으로 전달하는 수집 경로이고, 어떤 비즈니스 이벤트를 어떤 시점에 남길지는 outbox나 명시적 모델링이 정한다.\n\n반대로 outbox를 saga 대체재로 보는 것도 자주 틀린다. outbox는 \"주문 저장과 이벤트 기록\"을 같은 로컬 트랜잭션에 묶는 데 강하지만, 결제는 성공했고 재고는 실패한 뒤 무엇을 보상할지까지 결정해 주지는 않는다. 그 장면은 메시지 전달 기술이 아니라 업무 단계 orchestration 문제다.\n\n또 하나 흔한 오선택은 saga를 도입하면 발행 보장도 같이 해결된다고 생각하는 것이다. \"보상 로직만 있으면 중간 이벤트 누락은 나중에 맞출 수 있지 않나?\"처럼 들리지만, 시작 이벤트가 빠지면 saga 자체가 출발하지 못할 수 있다. 그래서 로컬 commit 이후의 발행 보장과 다중 서비스 보상 흐름을 같은 박스로 다루면 설계 축이 섞인다.\n\n운영 관점에서 더 위험한 오선택은 replay를 복구 버튼 정도로만 보는 것이다. 오래된 outbox event나 CDC record를 다시 흘릴 때 현재 aggregate version, payload schema, downstream 처리 이력을 보지 않으면 중복 알림, 중복 포인트 적립, 취소된 주문의 재활성화 같은 역전이가 생긴다. replay는 항상 idempotency, version guard, reconciliation report와 한 세트로 둔다.\n\n## 다음 학습\n\nDB commit과 이벤트 발행을 같은 로컬 트랜잭션에 어떻게 묶는지 먼저 잡고 싶으면 [CDC, Debezium, Outbox, Binlog](./cdc-debezium-outbox-binlog.md)와 [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md)를 이어서 보면 된다.\n\n여러 서비스 단계의 보상 흐름과 pivot 지점을 더 분명히 보고 싶으면 [Saga Pivot Transaction Design](./saga-pivot-transaction-design.md)으로 내려가면 된다.\n\n중복 소비와 재처리 방어까지 같이 보려면 [Transactional Inbox와 Dedup 설계](./transactional-inbox-dedup-design.md)와 [Idempotency Key와 Deduplication](./idempotency-key-and-deduplication.md)을 다음 문서로 잡으면 된다.\n\n## 선택 기준 확장: 같은 축에 놓지 않는다\n\noutbox, CDC, saga는 모두 이벤트 흐름에서 같이 보이지만 같은 층의 선택지가 아니다. outbox는 로컬 DB commit과 메시지 기록 사이의 dual write를 줄이는 패턴이다. CDC는 DB 변경이나 outbox row를 읽어 broker로 옮기는 전달 메커니즘이다. saga는 여러 서비스의 로컬 트랜잭션을 보상 가능한 workflow로 묶는 coordination 패턴이다.\n\n그래서 첫 질문은 \"이벤트를 어떻게 보낼까\"가 아니라 \"어떤 실패를 닫고 싶은가\"다. 주문 row는 commit됐는데 event record가 없으면 outbox 문제다. outbox row는 있는데 broker 발행이 늦거나 중복되면 relay/CDC와 consumer dedupe 문제다. 결제 승인, 재고 차감, 배송 예약처럼 여러 서비스가 이미 각각 commit했는데 중간 실패를 되돌려야 하면 saga와 compensation 문제가 된다.\n\n## 자주 틀리는 답\n\nDebezium을 붙이면 outbox가 필요 없다고 말하는 답은 절반만 맞다. DB table 변경 자체를 event source로 삼을 수는 있지만, 어떤 business event를 어떤 payload와 idempotency key로 publish할지는 여전히 설계해야 한다. 반대로 outbox row를 만들었다고 saga가 필요 없어지는 것도 아니다. outbox는 메시지 발행 신뢰성을 높이지만, downstream 서비스가 실패했을 때 어떤 보상 단계로 수렴할지는 saga가 다룬다.\n\n## 검증 질문\n\n- business commit과 event record가 같은 transaction 안에 있는가?\n- relay/CDC가 중복 발행해도 consumer가 event id로 dedupe하는가?\n- ordering이 aggregate 단위인지 global order인지 명시했는가?\n- replay 때 external side effect가 다시 나가지 않게 mute/dedupe가 있는가?\n- 여러 서비스 단계가 실패하면 pivot transaction과 compensation action이 정해져 있는가?\n\n이 질문에 답하면 outbox, CDC, saga를 도구 이름이 아니라 실패 경계별 선택지로 설명할 수 있다.\n",
   "aliases": [
-    "outbox vs cdc vs saga",
     "debezium outbox saga 차이",
     "이벤트 발행 패턴 선택 가이드",
     "트랜잭션 후 메시지 발행 방식 선택",
     "dual write 피하려면 뭐 써야 해",
+    "로컬 commit 이벤트 발행",
+    "outbox vs cdc vs saga",
     "outbox cdc saga chooser",
     "binlog cdc or outbox or saga",
-    "로컬 commit 이벤트 발행",
-    "보상 트랜잭션 saga 선택",
     "CDC transport outbox record",
-    "consumer dedupe inbox 필요성",
-    "분산 rollback 보상 흐름"
+    "outbox vs cdc vs guide",
+    "outbox vs cdc vs checklist",
+    "outbox-vs-cdc-vs-saga-decision-guide"
   ],
   "expected_queries": [
     "주문 저장 후 이벤트도 같이 내보내야 할 때 outbox, CDC, saga 중 무엇부터 골라야 해?",
@@ -25,9 +25,7 @@
     "outbox는 발행 보장이고 saga는 보상 흐름이라는 말을 한 번에 어떻게 구분해?",
     "binlog CDC와 application outbox를 같은 선택지로 비교할 때 먼저 보는 기준이 뭐야?",
     "여러 서비스 결제 흐름이라 rollback이 어려운데 outbox와 saga를 어디서 나눠서 생각해야 해?",
-    "outbox랑 inbox를 같은 비교축으로 보고 있었는데 CDC, saga랑은 어디서 분리해서 이해해야 해?",
-    "outbox CDC saga에서 중복, 순서, replay 실패 모드는 각각 어디서 막아야 해?",
-    "CDC replay나 saga retry가 중복 side effect를 만들지 않게 하려면 어떤 키가 필요해?"
+    "outbox랑 inbox를 같은 비교축으로 보고 있었는데 CDC, saga랑은 어디서 분리해서 이해해야 해?"
   ],
   "symptoms": [
     "DB 저장과 이벤트 발행을 같이 맞추려는데 outbox, CDC, saga를 같은 계층 선택지로 보고 있다",
@@ -62,6 +60,10 @@
         "date": "2026-06-18",
         "source": "y14-expansion-batch126",
         "note": "Expanded CDC outbox replay decision surfaces for batch126."
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
       }
     ]
   }

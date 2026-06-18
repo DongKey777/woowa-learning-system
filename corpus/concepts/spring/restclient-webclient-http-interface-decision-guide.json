@@ -6,17 +6,18 @@
   "summary": "blocking 호출이면 RestClient, reactive fan-out이면 WebClient, HTTP Interface는 그 위에 얹는 선언형 프록시라고 먼저 나누면 된다.",
   "body_markdown": "# Spring `RestClient` vs `WebClient` vs HTTP Interface 결정 가이드\n\n## 한 줄 요약\n\n> blocking 호출이면 `RestClient`, reactive fan-out이면 `WebClient`, HTTP Interface는 그 위에 얹는 선언형 프록시라고 먼저 나누면 된다.\n\n## 결정 매트릭스\n\n| 지금 질문 | 먼저 고를 것 | 이유 |\n| --- | --- | --- |\n| MVC 서비스에서 외부 API 한두 개를 동기적으로 호출한다 | `RestClient` | 호출 스레드 모델이 단순하고 `RestTemplate` 다음 단계로 읽기 쉽다 |\n| 여러 외부 API를 fan-out하거나 reactive 체인 안에서 호출한다 | `WebClient` | non-blocking 체인, timeout, backpressure를 같은 모델에서 다룰 수 있다 |\n| 호출 방식은 이미 정했는데 메서드 시그니처를 인터페이스로 선언하고 싶다 | HTTP interface client | `RestClient`나 `WebClient` 위에 얹는 선언형 프록시라 구현 반복을 줄인다 |\n| `RestClient`와 HTTP interface 중 하나만 골라야 한다고 느껴진다 | `RestClient` 먼저, 필요하면 HTTP interface 추가 | 둘은 대체 관계보다 \"실행 엔진\"과 \"선언 방식\" 관계에 가깝다 |\n| WebClient를 쓰지만 내부에서 결국 `block()`할 예정이다 | `RestClient` 재검토 | reactive 장점을 버릴 거면 운영 복잡도만 늘기 쉽다 |\n| reactive controller가 `Mono`/`Flux`를 반환한다 | `WebClient` 체인 유지 | controller 안에서 중간 `block()`을 넣으면 event loop와 cancellation 모델이 깨질 수 있다 |\n| `4xx`/`5xx`를 도메인 예외로 통일하고 싶다 | underlying client status handler | HTTP interface proxy가 아니라 `RestClient`/`WebClient` builder 정책이 중심이다 |\n| trace, metric, 인증 헤더를 모든 outbound call에 붙인다 | builder customizer / client group 정책 | 선언형 인터페이스는 호출 모양을 줄일 뿐 운영 정책을 자동으로 채우지 않는다 |\n\n짧게 말하면 결정 축은 세 개다. 첫째는 blocking이냐 reactive냐, 둘째는 fan-out과 스트리밍이 실제로 필요한가, 셋째는 client 코드를 인터페이스 선언형으로 감쌀 가치가 있는가다.\n\n여기에 운영 축을 하나 더 붙이면 더 안전하다. timeout, retry, circuit breaker, auth header, observation registry, error status mapping은 \"인터페이스냐 직접 client냐\"보다 아래의 실행 엔진 설정에 가깝다. HTTP Interface를 도입해도 이 축은 사라지지 않는다.\n\n## 실행 모델과 선언 방식 분리\n\n| 축 | 질문 | 선택 기준 |\n| --- | --- | --- |\n| 실행 엔진 | 요청을 어떤 I/O 모델로 보낼까 | blocking이면 `RestClient`, reactive면 `WebClient` |\n| 선언 방식 | 호출 코드를 메서드 계약으로 감쌀까 | API가 많고 반복이 크면 HTTP Interface |\n| 반환 타입 | caller가 무엇을 받을까 | 동기 값이면 blocking 계약, `Mono`/`Flux`면 reactive 계약 |\n| 운영 정책 | timeout/error/metric/auth를 어디서 통일할까 | builder, adapter, group config, client test에서 검증 |\n\nHTTP Interface는 `@HttpExchange`가 붙은 Java interface를 proxy로 만들어 호출을 수행한다. 이 proxy는 단독 HTTP 엔진이 아니라 `RestClient`, `WebClient`, `RestTemplate` adapter 위에서 동작한다. 그래서 \"HTTP Interface를 골랐으니 RestClient/WebClient 선택이 끝났다\"가 아니라, 먼저 엔진을 고르고 그 위에 선언형 계약을 얹을지 결정해야 한다.\n\n## blocking / reactive caveat\n\n`WebClient`도 마지막에 `block()`해서 동기 스타일로 쓸 수는 있다. 하지만 여러 remote call을 각각 `block()`하면 fan-out 이점이 줄고, Spring MVC나 WebFlux controller에서 `Mono`/`Flux`를 다루는 중간에 block을 넣으면 reactive lifecycle의 cancellation, timeout, context propagation을 잃기 쉽다.\n\n반대로 MVC 애플리케이션에서 JDBC, JPA, blocking SDK가 대부분이고 외부 API를 한두 번 호출하는 흐름이라면 `WebClient`를 쓴다고 전체 경로가 reactive가 되지는 않는다. 이 경우는 `RestClient`로 명확하게 blocking timeout, connection pool, retry budget을 잡는 편이 더 검증하기 쉽다.\n\nHTTP Interface도 반환 타입이 중요하다. 동기 반환 타입을 쓰면 호출자는 응답을 기다리는 계약을 갖고, reactive 반환 타입을 쓰면 `Mono`/`Flux` 체인을 유지해야 한다. `ReactorHttpExchangeAdapter`의 synchronous return timeout 같은 adapter-level 장치만 믿기보다, 하위 HTTP client의 connect/read/response timeout을 먼저 검증해야 한다.\n\n## 흔한 오선택\n\n`RestClient`와 HTTP interface를 경쟁 기술처럼 고르면 구조가 흐려진다. HTTP interface는 보통 \"`어떤 메서드 계약으로 호출할까`\"의 문제라서, 아래에서 실제 요청을 보내는 엔진은 여전히 `RestClient`나 `WebClient`가 맡는다.\n\n\"비동기 같아 보여서 무조건 WebClient\"로 가는 것도 흔한 오선택이다. 학습자가 \"`외부 API 호출이니까 일단 WebClient가 최신 아닌가요?`\"라고 느껴도, 실제로 MVC 요청 스레드에서 한두 번 부르고 `block()`할 거면 `RestClient`가 더 정직한 선택일 수 있다.\n\n\"선언형이 좋아 보여서 HTTP interface부터\" 시작하면 timeout, retry, context propagation 책임이 가려질 수 있다. \"`인터페이스로 만들었는데 왜 인증 헤더와 MDC 전파가 그대로 어렵죠?`\"라는 표현이 나오면 선언 방식보다 실행 모델과 경계 설계를 먼저 점검해야 한다.\n\n`retrieve()`와 `exchange()`의 error handling 차이를 놓치는 것도 자주 나온다. `RestClient.exchange()`처럼 raw request/response에 직접 접근하는 경로는 status handler가 자동 적용되지 않는 선택지가 있으므로, 404/500 테스트를 실제 호출 경로로 검증해야 한다.\n\nHTTP Interface를 쓰면 4xx/5xx 처리도 annotation이 알아서 맞춰준다고 기대하기 쉽다. 실제로는 proxy 아래의 `RestClient`나 `WebClient`에 `defaultStatusHandler` 같은 정책을 걸고, proxy 호출에서도 같은 예외/응답 계약이 나오는지 확인해야 한다.\n\n## error handling / observability 검증\n\n| 검증 질문 | 확인할 증거 | 놓치기 쉬운 부분 |\n| --- | --- | --- |\n| 4xx/5xx가 어떤 예외나 결과로 바뀌나 | `onStatus`, `defaultStatusHandler`, client test의 404/500 응답 | HTTP Interface가 아니라 underlying client 정책이 적용된다 |\n| `exchange()`를 쓰는 호출이 status handler를 우회하지 않나 | 실제 코드 경로별 테스트 | `retrieve()` 기준으로만 테스트하면 raw exchange 분기가 빠진다 |\n| timeout이 어디서 걸리나 | connect/read/response timeout, adapter block timeout, retry budget 로그 | adapter timeout만 있고 하위 client timeout이 비어 있다 |\n| outbound metric이 남나 | `http.client.requests`의 `method`, `uri`, `client.name`, `status`, `outcome`, `error` | `ObservationRegistry` 없는 builder는 no-op일 수 있다 |\n| trace와 인증 헤더가 전파되나 | downstream 로그의 trace id, auth header, correlation id | HTTP Interface proxy는 context propagation을 자동 보장하지 않는다 |\n| reactive 호출이 중간에서 막히지 않나 | `block()` 위치, thread dump, event-loop blocking detector | `WebClient` 이름만 보고 reactive라고 착각한다 |\n| metric tag cardinality가 안전한가 | `uri`가 템플릿인지, raw id/path가 tag로 새지 않는지 | user id, order id 같은 high-cardinality 값을 low-cardinality tag로 넣는다 |\n\n검증은 mock server나 slice test에서 성공 응답만 보는 것으로 끝내지 않는다. `200`, `404`, `429`, `500`, timeout, connection refused를 최소 한 번씩 만들고, 응답 계약과 metric tag가 같은 정책 이름으로 남는지 확인한다. HTTP Interface를 쓰는 경우에도 proxy interface 호출로 같은 시나리오를 실행해야 한다.\n\n## 다음 학습\n\n- 공용 baseline, 전용 client bean, builder owner 교체를 나누려면 [Spring `RestClient.Builder` 입문 브리지: `RestClientCustomizer`, 전용 `RestClient` bean, builder 교체는 언제 고르나](./spring-restclient-builder-customizer-vs-dedicated-client-vs-builder-replacement-primer.md)\n- blocking과 reactive lifecycle 차이를 더 깊게 보려면 [Spring RestClient vs WebClient Lifecycle Boundaries](./spring-restclient-vs-webclient-lifecycle-boundaries.md)\n- `@Async`, SecurityContext, HTTP interface까지 섞인 경계를 보려면 [Spring `@Async` Context Propagation and RestClient / HTTP Interface Clients](./spring-async-context-propagation-restclient-http-interface-clients.md)\n- `http.client.requests`, trace, metric tag cardinality를 같이 보려면 [Spring Observability with Micrometer Tracing](./spring-observability-micrometer-tracing.md)\n",
   "aliases": [
-    "spring http client choice",
     "restclient webclient http interface 차이",
     "동기 http 클라이언트냐 reactive 클라이언트냐",
     "선언형 http client",
     "resttemplate 다음 뭐 써요",
     "outbound client 선택",
+    "spring http client choice",
     "http exchange client",
-    "http service client 선택",
     "@HttpExchange RestClient WebClient",
-    "spring 외부 api 클라이언트 고르기",
-    "@Async"
+    "@Async",
+    "restclient webclient http interface guide",
+    "restclient webclient http interface checklist",
+    "restclient-webclient-http-interface-decision-guide"
   ],
   "expected_queries": [
     "Spring에서 외부 API 호출할 때 RestClient, WebClient, HTTP interface 중 무엇부터 고르면 돼?",
@@ -24,8 +25,7 @@
     "WebClient를 써야 하는 상황과 그냥 RestClient로 끝내도 되는 상황을 어떻게 나눠?",
     "resttemplate 다음에 동기 클라이언트로 갈지 reactive 클라이언트로 갈지 결정 기준이 뭐야?",
     "외부 API client를 만들 때 선언형 인터페이스가 맞는지 직접 client를 다루는 게 맞는지 헷갈려",
-    "HTTP interface를 쓰면 4xx 5xx error handling과 timeout은 어디에 설정해야 해?",
-    "RestClient와 WebClient의 http.client.requests metric, trace, status handler를 어떻게 검증해?"
+    "HTTP interface를 쓰면 4xx 5xx error handling과 timeout은 어디에 설정해야 해?"
   ],
   "symptoms": [
     "외부 API를 붙여야 하는데 RestClient로 끝낼지 WebClient로 갈지 감이 안 와요",
@@ -55,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/spring-restclient-webclient-http-interface-decision-guide.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
+      }
+    ]
   }
 }

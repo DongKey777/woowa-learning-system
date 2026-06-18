@@ -6,18 +6,18 @@
   "summary": "DNS TTL, resolver cache, NXDOMAIN negative caching, failover 전파 지연을 함께 판단하는 네트워크 운영 perspective map이다.",
   "body_markdown": "# DNS TTL, Negative Cache, Failover Perspective Map\n\n## 이 문서가 맡는 질문\nDNS 변경은 authoritative server만 바꾸면 끝나지 않는다. recursive resolver, browser/OS cache, negative cache, CDN/Alt-Svc cache가 각자 다른 freshness window를 가진다.\n\n## 빠른 분기\n일부 사용자만 오래된 서버로 가면 positive TTL, 존재하지 않는 이름을 만들었다가 계속 실패하면 negative cache, 브라우저만 다르면 browser cache와 Alt-Svc를 본다.\n\n## 실전 시나리오\n장애 대응으로 `api.example.com` A record를 새 IP로 바꿨는데 일부 사용자는 10분 넘게 old origin으로 간다. TTL이 짧아도 ISP resolver나 client cache가 이미 old answer를 들고 있을 수 있다.\n\n## CS 배경\nDNS는 계층형 naming system이고 recursive resolver가 authoritative 응답을 TTL 동안 cache한다. RFC 계열에서 negative caching은 SOA TTL과 함께 NXDOMAIN/NODATA 결과도 cache할 수 있으므로 새 record 생성 직후에도 실패가 이어질 수 있다.\n\n## dig 비교 예시\n```bash\ndig api.example.com @8.8.8.8\ndig api.example.com @1.1.1.1\ndig api.example.com @$(scutil --dns | awk '/nameserver/ {print $3; exit}')\ndig missing.example.com SOA\n```\n여러 resolver의 answer와 remaining TTL을 비교해야 authoritative 변경 문제인지 resolver cache 문제인지 구분할 수 있다. NXDOMAIN은 SOA와 negative TTL까지 같이 본다.\n\n## 깊게 볼 포인트\nDNS failover는 빠른 health check와 다르다. 이미 배포된 DNS answer는 TTL 동안 살아 있고, mobile network와 enterprise DNS는 더 오래 잡을 수 있다. critical failover에는 DNS만 믿지 않고 load balancer, anycast, client retry, dual endpoint 전략을 함께 본다.\n\n## 다음 행동\n1. 변경 전 TTL과 negative TTL을 확인한다\n2. 여러 public resolver와 사용자 resolver를 비교한다\n3. old/new IP hit ratio와 client region을 기록한다\n4. failover는 DNS 외의 traffic steering과 함께 설계한다\n\n## 확인 질문\n지금 문제는 authoritative record가 틀린 것인가, resolver가 이전 응답을 cache한 것인가, 아니면 없는 이름의 negative cache가 남은 것인가?\n\n## 추가 확인: authoritative와 recursive 비교\n```bash\ndig +trace missing.example.com\ndig missing.example.com @ns1.example.com SOA\ndig missing.example.com @8.8.8.8 SOA\n```\nNXDOMAIN/NODATA의 negative cache TTL은 SOA에서 파생되는 값과 resolver별 cap에 영향을 받는다. authoritative는 이미 새 record를 알지만 recursive resolver가 negative answer를 TTL 동안 들고 있으면 client는 계속 실패할 수 있다.\n\n## 판단 매트릭스\n- Positive TTL: 기존 IP answer가 TTL 동안 유지된다\n- Negative cache: NXDOMAIN/NODATA도 cache되어 신규 record가 바로 안 보일 수 있다\n- Client/browser cache: resolver보다 더 가까운 계층에서 오래된 결정을 재사용한다\n- 리뷰 질문: DNS 전파 시간과 서비스 복구 목표가 같은 값으로 관리되는가\n\n## 측정 지표와 레이턴시\nresolver별 remaining TTL, old IP traffic ratio, NXDOMAIN rate, failover convergence p95, client error rate, connection latency를 본다. 품질은 올바른 endpoint 도달률, 성능은 resolver cache hit, 레이턴시는 failover 완료까지 사용자별 tail을 본다.\n\n## 자주 하는 오해\n- TTL을 낮추면 모든 사용자가 즉시 바뀐다고 본다\n- NXDOMAIN도 cache된다는 점을 놓친다\n- DNS failover를 health check failover와 같은 속도로 기대한다\n\n이 오해를 줄이려면 용어를 먼저 고르지 말고, 실패 모드와 관찰 증거를 분리해야 한다. 같은 단어가 여러 계층에서 쓰일 때는 code path, runtime signal, user-visible effect를 함께 놓고 판단한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 DNS 계층을 authoritative, recursive resolver, OS/browser cache로 나누고, TTL과 negative cache를 근거로 설명해야 한다. 마지막에는 old answer 비율, error rate, failover convergence p95로 품질/성능/레이턴시를 측정한다고 붙인다.\n\n## 실전 검증 루프\n1. authoritative answer와 public resolver answer를 동시에 캡처한다\n2. remaining TTL과 SOA negative TTL을 기록한다\n3. old/new IP별 traffic과 5xx를 region별로 본다\n4. DNS 외 fallback이 필요한 RTO인지 판단한다\n5. 변경 후 convergence p95/p99를 회고에 남긴다\n\n이 루프를 지키면 DNS TTL, Negative Cache, Failover Perspective Map 문서는 단순 용어 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nDNS TTL, resolver cache, NXDOMAIN negative caching, failover 전파 지연을 함께 판단하는 네트워크 운영 perspective map이다.\n\n## 품질 관점\n프로토콜 상태, timeout, retry, 중간 장비, client/server 관측값을 분리해 같은 증상을 재현한다. 이 문서의 답변 품질은 `DNS TTL, Negative Cache, Failover Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p99_ms, retransmit_or_retry_count, timeout_count, connection_reuse_ratio`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n\n## 계층별 cache window\n\nDNS 변경의 관측 지연은 한 TTL이 아니라 여러 cache window의 합성이다. Authoritative DNS가 새 값을 알고 있어도 recursive resolver는 old positive answer나 negative answer를 들고 있을 수 있다. OS resolver, browser Secure DNS/DoH, JVM `InetAddress`, connection pool, Alt-Svc cache는 또 다른 재사용 경로를 만든다.\n\n따라서 `TTL이 30초니까 30초 뒤 복구`라고 쓰면 위험하다. 운영 답변은 authoritative publish time, recursive resolver convergence, client runtime cache, existing connection reuse, old/new IP traffic ratio를 나눠야 한다. DNS는 이름 해석의 freshness를 제어할 뿐, 이미 맺어진 TCP/TLS connection이나 HTTP/2 stream을 강제로 끊지는 않는다.\n\n## RTO와 DNS TTL은 같은 값이 아니다\n\nFailover RTO가 짧아야 하는 서비스라면 DNS만으로 복구 목표를 맞추기 어렵다. DNS TTL을 낮춰도 resolver cap, negative cache, enterprise DNS, mobile carrier DNS, client runtime cache가 tail을 만든다. 그래서 중요한 경로는 anycast, global load balancer, stable hostname target switch, client retry, dual endpoint, health checked load balancer를 함께 본다.\n\n운영 회고에서는 resolver별 remaining TTL보다 사용자 관측 지표가 중요하다. old IP hit ratio, NXDOMAIN rate, region별 error rate, DoH 사용 client 비율, failover convergence p95/p99를 남긴다. 이 지표가 있어야 다음 변경에서 TTL 계획과 사전 record 준비가 충분했는지 판단할 수 있다.\n",
   "aliases": [
+    "DNS 전파 지연 TTL",
+    "브라우저 OS DNS cache",
+    "DNS 캐시 계층 분리",
+    "DNS TTL, Negative Cache, 개념",
+    "DNS TTL, Negative Cache, 정리",
     "dns ttl failover perspective",
     "DNS negative cache NXDOMAIN",
-    "DNS 전파 지연 TTL",
     "resolver cache failover",
     "authoritative recursive cache",
-    "브라우저 OS DNS cache",
     "old IP traffic ratio",
     "NXDOMAIN negative TTL",
-    "DNS failover p95",
-    "DoH resolver drift",
-    "DNS 캐시 계층 분리",
-    "negative cache RTO"
+    "DNS failover p95"
   ],
   "expected_queries": [
     "DNS 바꿨는데 일부 사용자만 예전 서버로 가는 이유가 뭐야?",
@@ -25,8 +25,7 @@
     "DNS failover 했는데 일부 사용자만 old IP로 가거나 NXDOMAIN이 남을 때 TTL을 어떻게 봐?",
     "DNS TTL을 30초로 낮췄는데 failover RTO가 30초가 아닌 이유를 계층별 캐시로 설명해줘",
     "authoritative, recursive resolver, OS cache, browser cache가 DNS 변경을 다르게 보는 상황을 어떻게 나눠?",
-    "DNS failover convergence p95와 old IP traffic ratio를 운영 지표로 봐야 하는 이유가 뭐야?",
-    "DoH를 쓰는 브라우저와 시스템 resolver dig 결과가 다를 때 DNS 캐시 계층을 어떻게 비교해?"
+    "DNS failover convergence p95와 old IP traffic ratio를 운영 지표로 봐야 하는 이유가 뭐야?"
   ],
   "symptoms": [
     "TTL을 낮추면 모든 사용자가 즉시 바뀐다고 본다",
@@ -69,6 +68,10 @@
         "date": "2026-06-18",
         "source": "y14-expansion-batch136",
         "note": "Expanded DNS failover, negative cache, resolver cache, and old-server symptom query surfaces."
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch152"
       }
     ]
   }
