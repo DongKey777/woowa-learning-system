@@ -3,34 +3,36 @@
   "title": "RDB tree storage patterns chooser - adjacency, materialized path, nested set, closure table",
   "category": "database",
   "level": "advanced",
-  "summary": "RDB에서 tree를 저장하는 방식은 adjacency list, materialized path, nested set, closure table 등이 있다. 부모 변경이 잦은지, subtree 조회가 잦은지, ancestor query가 필요한지, write 비용을 어디까지 감당할지에 따라 선택이 달라진다.",
-  "body_markdown": "# RDB tree storage patterns chooser - adjacency, materialized path, nested set, closure table\n\n> 한 줄 요약: RDB tree 모델은 쓰기 쉬운 구조와 읽기 빠른 구조가 다르므로, subtree/ancestor/move 빈도로 고른다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: RDB tree storage patterns, adjacency list, materialized path, nested set, closure table, recursive CTE, hierarchy modeling SQL, subtree query, ancestor query, tree move cost\n\n## 선택지 한눈 보기\n\n| 패턴 | 저장 방식 | 장점 | 비용 |\n|---|---|---|---|\n| Adjacency list | `parent_id` | 쓰기 단순, FK 자연스러움 | subtree는 recursive CTE 필요 |\n| Materialized path | `/1/4/9/` 같은 path | subtree prefix 조회 쉬움 | node move 시 descendant path 갱신 |\n| Nested set | left/right 범위 | subtree read 빠름 | insert/move 때 범위 재계산 큼 |\n| Closure table | ancestor-descendant row 저장 | ancestor/subtree 조회 강함 | 저장량과 write 비용 증가 |\n\n## 질문으로 고르기\n\n### 1. 부모 변경이 자주 있나\n\n부모를 자주 옮기면 nested set이나 materialized path는 갱신 범위가 커질 수 있다. adjacency list가 단순하다.\n\n### 2. subtree 조회가 매우 잦나\n\n매번 recursive CTE가 부담이라면 materialized path나 closure table을 검토한다.\n\n### 3. ancestor path가 자주 필요한가\n\nbreadcrumb, 권한 상속, 조직 상위 라인 조회가 많으면 closure table이나 materialized path가 유리할 수 있다.\n\n### 4. 트리 크기와 depth가 제한적인가\n\n작고 얕은 tree라면 adjacency list + recursive CTE로도 충분하다. 모델을 과하게 복잡하게 만들 필요가 없다.\n\n## 패턴별 감각\n\n### Adjacency list\n\n가장 먼저 고려할 기본값이다. 정규화와 FK가 자연스럽다. 대신 전체 subtree/ancestor를 자주 읽으면 recursive CTE와 index 튜닝이 필요하다.\n\n### Materialized path\n\nnode가 자신의 전체 path를 들고 있다.\n\n```text\n/1/4/9/\n```\n\nprefix 검색으로 subtree를 찾기 쉽다. 하지만 node를 다른 부모 아래로 옮기면 descendants path를 모두 갱신해야 한다.\n\n### Nested set\n\n각 node가 left/right 숫자 범위를 가진다. subtree는 범위 조건으로 빠르게 찾을 수 있지만, insert나 move 때 많은 row의 숫자를 바꿔야 할 수 있다.\n\n### Closure table\n\nancestor와 descendant 관계를 별도 테이블에 모두 저장한다.\n\n```text\nancestor_id, descendant_id, depth\n```\n\n조회는 강하지만 저장량이 늘고, node 추가/이동 시 closure row를 갱신해야 한다.\n\n## 실무 기본값\n\n처음에는 adjacency list로 시작하고, subtree/ancestor query가 실제 병목이면 materialized path나 closure table로 넘어가는 흐름이 안전한 경우가 많다. 단, 권한 상속이나 카테고리 navigation처럼 tree query가 핵심 기능이면 처음부터 조회 패턴을 더 보수적으로 잡는다.\n\n## 한 줄 정리\n\nRDB tree 저장 방식은 정답 하나가 아니라 읽기와 쓰기 비용 배분이다. 작고 변경 많은 tree는 adjacency list, subtree/ancestor 조회가 핵심이면 materialized path나 closure table을 검토한다.\n\n## Batch152 보강 메모\n\nRDB tree storage patterns chooser - adjacency, materialized path, nested set, closure table를 학습할 때는 용어 정의만 확인하기보다 데이터베이스 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. RDB에서 tree를 저장하는 방식은 adjacency list, materialized path, nested set, closure table 등이 있다. 부모 변경이 잦은지, subtree 조회가 잦은지, ancestor query가 필요한지, write 비용을 어디까지 감당할지에 따라 선택이 달라진다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
+  "summary": "RDB tree 저장 방식은 adjacency list, materialized path, nested set, closure table 중 하나를 이름으로 고르는 문제가 아니라 subtree read, ancestor query, node move, write amplification, depth, ordering, integrity, 운영 복잡도를 비교하는 선택 문제다. Recursive CTE는 adjacency list를 조회로 보완하는 도구이며, self-FK 기본 모델링이나 CTE 문법 자체는 별도 개념으로 둔다.",
+  "body_markdown": "# RDB tree storage patterns chooser - adjacency, materialized path, nested set, closure table\n\n> 한 줄 요약: RDB tree 패턴은 읽기 최적화와 쓰기 단순성 사이의 선택이다. 먼저 subtree read, ancestor query, node move 빈도와 허용 가능한 운영 복잡도를 정한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: RDB tree storage chooser, adjacency list, recursive CTE support, materialized path, nested set, closure table, subtree read, ancestor query, node move, write amplification, hierarchy ordering, tree integrity\n\n## 이 문서의 범위\n\n이 문서는 계층 데이터를 RDB에 저장할 때 어떤 storage pattern을 고를지 비교한다. `parent_id` self-FK를 어떻게 선언하는지, `WITH RECURSIVE`의 anchor/recursive term을 어떻게 쓰는지는 여기서 깊게 다루지 않는다. 그 둘은 각각 `database/self-referencing-fk-hierarchy-in-rdb`, `database/recursive-cte-tree-traversal-sql`의 역할이다.\n\n여기서 묻는 핵심 질문은 다음이다.\n\n1. API의 주 조회가 직계 자식인가, 전체 subtree인가, ancestor/breadcrumb인가.\n2. node insert, reorder, move가 얼마나 자주 발생하는가.\n3. 최대 depth와 fan-out이 제한되는가, 아니면 운영 데이터에서 계속 커지는가.\n4. sibling ordering, path ordering, pre-order traversal이 필요한가.\n5. cycle 방지, move 검증, derived row 정합성을 어디에서 보장할 것인가.\n6. 팀이 closure row, path rewrite, lft/rgt rebalance 같은 운영 작업을 감당할 수 있는가.\n\n## 빠른 선택 표\n\n| 상황 | 먼저 볼 패턴 | 이유 | 피해야 할 신호 |\n|---|---|---|---|\n| 화면이 한 단계씩 펼치고 수정이 잦음 | Adjacency list + 필요 시 recursive CTE | 쓰기와 move가 단순하고 FK가 자연스럽다 | 깊은 subtree를 매 요청마다 크게 펼침 |\n| subtree list, breadcrumb, 권한 상속이 모두 자주 필요함 | Closure table | ancestor/subtree 조회를 join으로 안정적으로 처리한다 | move가 매우 잦고 descendants가 많음 |\n| read-heavy 카테고리에서 prefix 기반 subtree가 중요함 | Materialized path | path prefix로 subtree와 ordering hint를 함께 잡기 쉽다 | 큰 subtree move, path 문자열 정합성 관리가 잦음 |\n| 정적 taxonomy에서 subtree를 매우 빠르게 읽어야 함 | Nested set | `lft/rgt` 범위 조건이 subtree read에 강하다 | insert, reorder, drag-and-drop move가 잦음 |\n| 작고 얕은 tree이며 subtree 조회가 가끔뿐임 | Adjacency list | 복잡한 derived table 없이 충분한 경우가 많다 | 실제 p95에서 recursive query가 병목 |\n\n## 패턴 비교표\n\n| 패턴 | 저장 단위 | Subtree read | Ancestor query | Insert/move 비용 | Ordering | Integrity와 운영 복잡도 |\n|---|---|---|---|---|---|---|\n| Adjacency list | 각 node의 `parent_id` | recursive CTE 또는 단계별 조회 필요 | 부모 방향 recursive CTE 필요 | move는 보통 한 row 갱신, 단 cycle 검증 필요 | `sort_order`를 sibling 단위로 둔다 | 가장 단순하지만 subtree 성능은 데이터 분포에 민감 |\n| Materialized path | `/1/4/9/` 같은 path 또는 path array | prefix 조건으로 쉽다 | path를 쪼개거나 prefix ancestor를 찾는다 | move 시 descendants path를 모두 rewrite | path segment에 sort key를 넣을 수 있다 | delimiter, collation, prefix index, path 정합성 관리 필요 |\n| Nested set | `lft`, `rgt` 범위 | 범위 조건으로 빠르다 | 자신을 감싸는 range를 찾는다 | insert/move/reorder 때 많은 row의 숫자 조정 | pre-order traversal에 자연스럽다 | invariant가 깨지면 복구가 어렵고 동시 쓰기 조심 |\n| Closure table | `ancestor_id`, `descendant_id`, `depth` row | descendant join으로 빠르다 | ancestor join으로 빠르다 | insert는 ancestor 수만큼, move는 ancestors x descendants 갱신 | 별도 sibling order 필요 | 저장량과 write amplification이 늘지만 read contract가 명확 |\n| Adjacency + recursive CTE | storage는 adjacency, 조회만 recursive | 가끔 쓰는 subtree에 적합 | 가끔 쓰는 breadcrumb에 적합 | storage write는 단순 | 정렬 컬럼을 recursive 결과에 함께 싣는다 | CTE는 storage pattern이 아니라 query support다 |\n\n## 시나리오별 신호\n\n### 카테고리 관리 화면\n\n관리자가 자주 드래그해서 부모를 바꾸고, 사용자는 한 단계씩 펼쳐 본다면 adjacency list가 기본값이다. `parent_id`, `sort_order`, sibling unique 정도를 명확히 하고, 전체 subtree가 필요한 관리자 기능만 recursive CTE로 처리할 수 있다. 이때 recursive CTE가 자주 무거워지면 그때 closure table이나 materialized path를 비교한다.\n\n### 상품 카탈로그나 문서 taxonomy\n\n사용자 요청마다 특정 카테고리 아래 모든 상품군, 모든 하위 문서, breadcrumb를 읽는다면 read-heavy 신호다. move가 드물고 path prefix index를 운영할 수 있으면 materialized path가 단순할 수 있다. ancestor와 descendant를 모두 SQL join으로 자주 물어야 하고 권한 상속까지 있으면 closure table이 더 명확하다.\n\n### 조직도와 권한 상속\n\n상위 조직 권한, manager chain, 특정 부서 subtree 권한을 자주 계산하면 closure table이 강하다. 단 조직 개편으로 큰 subtree move가 잦다면 move transaction에서 삭제될 old closure row와 추가될 new closure row 수를 먼저 산정해야 한다. 단순 현재 부모만 보여 주는 조직도라면 adjacency list가 더 적다.\n\n### 거의 변하지 않는 분류 체계\n\n법정 분류, 고정 메뉴, 읽기 전용 taxonomy처럼 변경이 드물고 subtree read가 압도적으로 많으면 nested set도 후보가 된다. 하지만 운영자가 자주 삽입, reorder, move를 하는 CMS 카테고리라면 nested set의 range 재계산이 장애 요인이 될 수 있다.\n\n## 선택 절차\n\n1. 첫 화면의 read path를 쓴다. direct children, subtree, ancestor, breadcrumb, count 중 무엇이 p95 경로인지 분리한다.\n2. 쓰기 path를 센다. create, rename, reorder, move, delete 중 어느 작업이 빈번하고 한 번에 영향을 받는 descendant 수가 얼마인지 본다.\n3. depth와 fan-out 상한을 정한다. 무제한 댓글처럼 깊어질 수 있으면 query limit과 UX limit도 같이 필요하다.\n4. ordering 요구를 분리한다. sibling order만 필요한지, 전체 pre-order export가 필요한지에 따라 `sort_order`, path segment, nested set의 의미가 달라진다.\n5. 무결성 책임을 정한다. FK는 부모 존재를 보장하지만 cycle 금지, move-to-descendant 금지, closure/path 재생성은 별도 책임이다.\n6. 복구 계획을 확인한다. path나 closure row가 깨졌을 때 adjacency source에서 rebuild 가능한지, nested set range를 재계산할 수 있는지 본다.\n\n## Anti-patterns\n\n- 계층 데이터라는 이유만으로 closure table부터 만든다. Read contract가 없으면 storage와 write 비용만 늘어난다.\n- recursive CTE가 낯설어서 materialized path나 nested set으로 도망간다. 작은 tree에서는 adjacency + CTE가 더 단순할 수 있다.\n- 자주 이동하는 drag-and-drop tree에 nested set을 고른다. move마다 넓은 range update가 생길 수 있다.\n- materialized path를 display name으로 만든다. 이름 변경이 path rewrite로 번지고 delimiter/escaping 문제가 생긴다.\n- `/1/10/`과 `/1/100/` 같은 prefix 충돌을 생각하지 않는다. delimiter, fixed-width segment, array path, prefix index를 설계해야 한다.\n- closure table에서 self row, depth, unique constraint, move transaction을 대충 둔다. 중복 closure row나 stale ancestor가 생기면 읽기 결과가 틀어진다.\n- tree 선택 문제를 SQL 문법 문제로 축소한다. CTE 문법보다 중요한 것은 어떤 query가 자주 오고 어떤 write amplification을 감당할지다.\n\n## 운영 지표\n\n선택 후에는 패턴 이름보다 지표를 봐야 한다.\n\n- subtree query p95/p99, returned row count, recursive rows visited\n- ancestor query p95, breadcrumb depth, permission inheritance hit count\n- move per day, moved descendants count, rows written per move\n- max depth, average fan-out, largest subtree size\n- closure table row multiplier, path length distribution, nested set rebalance rows\n- cycle reject count, orphan reject count, rebuild job duration\n\n## 한 줄 정리\n\n작고 자주 바뀌는 tree는 adjacency list가 기본값이고 recursive CTE는 조회 보조다. Subtree와 ancestor read가 제품의 핵심이면 closure table이나 materialized path를 비교하고, nested set은 변경이 드문 정적 taxonomy에서만 보수적으로 검토한다.\n",
   "aliases": [
-    "트리 저장 패턴",
-    "계층 저장 방식",
-    "계층 모델링",
-    "RDB tree storage patterns 개념",
-    "RDB tree storage patterns 정리",
-    "RDB tree storage",
-    "adjacency list",
-    "materialized path",
-    "nested set",
-    "closure table",
-    "subtree query",
-    "ancestor query"
+    "RDB tree chooser",
+    "계층 저장 방식 선택",
+    "트리 저장 패턴 비교",
+    "adjacency vs closure",
+    "materialized path 선택",
+    "nested set 선택",
+    "closure table 선택",
+    "subtree ancestor tradeoff",
+    "tree move write cost",
+    "hierarchy storage pattern"
   ],
   "expected_queries": [
-    "RDB에서 tree 저장할 때 adjacency list, materialized path, nested set, closure table을 어떻게 골라?",
-    "subtree 조회가 많은 계층 데이터에는 어떤 RDB tree storage pattern이 유리해?",
-    "node move가 잦으면 materialized path나 nested set이 왜 부담될 수 있어?",
-    "closure table은 ancestor와 descendant 조회에 강하지만 어떤 write 비용이 있어?",
-    "작고 얕은 category tree는 adjacency list와 recursive CTE로 충분할 수 있어?",
-    "RDB tree 모델링에서 읽기 빠른 구조와 쓰기 쉬운 구조 tradeoff를 설명해줘"
+    "카테고리 트리를 RDB에 저장할 때 adjacency list, materialized path, nested set, closure table 중 뭘 골라야 해?",
+    "subtree 조회가 많고 node move는 드문 계층 데이터면 어떤 tree storage pattern이 맞아?",
+    "breadcrumb나 권한 상속처럼 ancestor 조회가 잦으면 closure table과 materialized path 중 어떻게 비교해?",
+    "drag and drop으로 카테고리 이동이 자주 있으면 nested set이나 materialized path를 피해야 해?",
+    "작고 얕은 트리인데 가끔 전체 하위 노드를 읽을 때 adjacency list와 recursive CTE로 충분한지 판단하고 싶어",
+    "RDB tree 저장 방식에서 write amplification과 operational complexity를 어떻게 비교해?",
+    "정렬된 category tree를 저장할 때 sort_order, path segment, nested set lft rgt 중 어떤 비용을 봐야 해?",
+    "closure table은 subtree와 ancestor read가 빠른 대신 move와 insert에서 어떤 row를 더 써?"
   ],
   "symptoms": [
-    "모든 계층 데이터를 무조건 self-referencing FK 하나로만 해결하려 한다",
-    "subtree 읽기와 node move 비용을 비교하지 않고 tree storage pattern을 고른다",
-    "closure table과 materialized path의 저장량/write 비용을 놓친다"
+    "subtree read, ancestor read, node move 중 주 경로를 정하지 않고 tree storage pattern을 고른다",
+    "모든 계층 데이터를 self-referencing FK 하나로만 끝난다고 생각한다",
+    "자주 이동하는 tree에 materialized path나 nested set의 write amplification을 계산하지 않는다",
+    "closure table의 저장량, move transaction, rebuild 운영 비용을 놓친다",
+    "recursive CTE를 storage pattern 자체로 착각한다"
   ],
   "relations": {
     "prerequisites": [
@@ -45,18 +47,26 @@
       "database/recursive-cte-tree-traversal-sql",
       "database/json-column-vs-normalized-table-tradeoff"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "self-referencing FK parent_id 모델링과 FK 제약을 기본부터 설명해줘",
+      "WITH RECURSIVE anchor term recursive term SQL 문법을 자세히 알려줘",
+      "recursive CTE cycle guard와 depth limit 구현 SQL을 알려줘"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/rdb-tree-storage-patterns-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch152"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "batch177-rdb-tree-chooser"
       }
     ]
   }

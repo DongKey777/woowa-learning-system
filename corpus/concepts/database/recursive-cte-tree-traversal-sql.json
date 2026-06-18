@@ -3,34 +3,37 @@
   "title": "Recursive CTE tree traversal SQL",
   "category": "database",
   "level": "advanced",
-  "summary": "Recursive CTE는 anchor query와 recursive query를 반복해 adjacency list 같은 계층 데이터를 SQL에서 순회하는 도구다. subtree, ancestor path, depth 계산에 유용하지만 cycle guard, depth limit, parent_id index, materialization 비용을 함께 봐야 한다.",
-  "body_markdown": "# Recursive CTE tree traversal SQL\n\n> 한 줄 요약: Recursive CTE는 시작 row(anchor)에서 출발해 자식/부모를 반복적으로 따라가며 tree를 펼치는 SQL 도구다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: recursive CTE tree traversal, WITH RECURSIVE, adjacency list subtree SQL, ancestor query, depth column, cycle guard, hierarchical query, recursive SQL, parent_id index\n\n## 기본 구조\n\n```sql\nWITH RECURSIVE tree AS (\n  SELECT id, parent_id, name, 0 AS depth\n  FROM category\n  WHERE id = :root_id\n\n  UNION ALL\n\n  SELECT c.id, c.parent_id, c.name, tree.depth + 1\n  FROM category c\n  JOIN tree ON c.parent_id = tree.id\n)\nSELECT * FROM tree;\n```\n\n첫 SELECT가 anchor다. 두 번째 SELECT가 recursive term이다. recursive term은 이전 결과를 참조해 다음 level을 만든다.\n\n## 언제 쓰나\n\n- 특정 카테고리의 subtree 전체 조회\n- 현재 node의 ancestor path 조회\n- 조직도 depth 계산\n- 댓글 thread 펼치기\n- parent_id adjacency list를 한 번의 SQL로 순회\n\n## cycle guard\n\n데이터에 cycle이 있으면 recursive query가 끝나지 않거나 제한에 걸릴 수 있다. DB마다 cycle detection 기능이나 recursion limit이 다르므로, path tracking이나 depth limit을 둔다.\n\n```sql\n-- 개념 예시: path에 이미 있는 id는 제외\nWHERE NOT c.id = ANY(tree.path)\n```\n\n구체 문법은 DB별로 다르다. 중요한 것은 recursive CTE가 트리 invariant를 자동 보장하지 않는다는 점이다.\n\n## 성능 포인트\n\n- `parent_id` index가 없으면 매 level마다 child lookup이 비싸다.\n- subtree가 너무 크면 result materialization 비용이 크다.\n- depth limit 없이 전체 tree를 펼치면 응답이 커진다.\n- 정렬이 필요하면 path, depth, sort_order 설계를 같이 한다.\n\n## ancestor 조회\n\n자식에서 부모로 올라갈 수도 있다.\n\n```sql\nWITH RECURSIVE ancestors AS (\n  SELECT id, parent_id, name, 0 AS depth\n  FROM category\n  WHERE id = :leaf_id\n\n  UNION ALL\n\n  SELECT p.id, p.parent_id, p.name, ancestors.depth + 1\n  FROM category p\n  JOIN ancestors ON ancestors.parent_id = p.id\n)\nSELECT * FROM ancestors;\n```\n\n## 한 줄 정리\n\nRecursive CTE는 adjacency list를 SQL에서 subtree나 ancestor path로 펼치는 강력한 도구다. 하지만 cycle guard, depth limit, parent_id index, 결과 크기 제한을 설계하지 않으면 운영 쿼리로 위험해질 수 있다.\n\n## Batch152 보강 메모\n\nRecursive CTE tree traversal SQL를 학습할 때는 용어 정의만 확인하기보다 데이터베이스 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. Recursive CTE는 anchor query와 recursive query를 반복해 adjacency list 같은 계층 데이터를 SQL에서 순회하는 도구다. subtree, ancestor path, depth 계산에 유용하지만 cycle guard, depth limit, parent_id index, materialization 비용을 함께 봐야 한다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n\n추가 판단 기준은 실제 미션 코드에서 경계가 어디에 놓이는지, 실패를 어떤 테스트로 고정할 수 있는지, 다음 변경 때 같은 결정을 반복하지 않도록 어떤 이름을 남길지 확인하는 것이다.\n\n추가 판단 기준은 실제 미션 코드에서 경계가 어디에 놓이는지, 실패를 어떤 테스트로 고정할 수 있는지, 다음 변경 때 같은 결정을 반복하지 않도록 어떤 이름을 남길지 확인하는 것이다.\n",
+  "summary": "Recursive CTE는 `WITH RECURSIVE` 안의 anchor member와 recursive member를 반복 실행해 parent_id 기반 계층을 subtree, ancestor path, depth/path column으로 펼치는 SQL traversal mechanism이다. 종료 조건, cycle guard, parent_id index, worktable/materialization 비용까지 함께 설계해야 한다.",
+  "body_markdown": "# Recursive CTE tree traversal SQL\n\n> 한 줄 요약: Recursive CTE는 시작 row(anchor)에서 출발해 자식이나 부모를 반복적으로 따라가며 계층을 펼치는 SQL 순회 도구다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Self-Referencing FK Hierarchy in RDB](./self-referencing-fk-hierarchy-in-rdb.md) - `parent_id` 모델과 tree invariant의 prerequisite\n- [SQL JOINs Foundations Primer](./sql-joins-foundations-primer.md) - recursive member 안의 JOIN을 읽기 위한 prerequisite\n- [RDB tree storage patterns chooser](./rdb-tree-storage-patterns-chooser.md) - adjacency list로 충분한지 다른 저장 패턴을 골라야 하는지는 next doc\n\nretrieval-anchor-keywords: recursive CTE tree traversal, WITH RECURSIVE, anchor member, recursive member, adjacency list traversal SQL, subtree query SQL, ancestor path SQL, depth path column, cycle guard SQL, parent_id index, recursive worktable, materialization cost\n\n## 이 문서가 맡는 범위\n\n이 문서는 이미 `category(id, parent_id, name, sort_order)` 같은 adjacency list가 있다고 가정하고, 그 계층을 SQL로 순회하는 법을 다룬다.\n\n다루는 것:\n\n- `WITH RECURSIVE`의 anchor member와 recursive member 실행 모델\n- subtree 조회, ancestor path 조회\n- `depth`, `path`, 정렬용 column을 recursive result에 싣는 방법\n- 종료 조건, cycle guard, max depth\n- `parent_id` index와 recursive worktable/materialization 비용\n\n다루지 않는 것:\n\n- 같은 테이블 FK로 계층을 저장하는 모델링 기본은 self-referencing FK 문서가 맡는다.\n- adjacency list, materialized path, nested set, closure table 중 무엇을 고를지는 tree storage chooser 문서가 맡는다.\n- 일반 JOIN 문법과 row 증가 감각은 JOIN 기초 문서가 맡는다.\n\n## 실행 모델\n\nRecursive CTE는 한 번에 마법처럼 tree를 읽는 문법이 아니라, 다음 루프를 반복한다.\n\n1. anchor member가 시작 row 집합을 만든다.\n2. recursive member가 직전 단계의 결과를 참조해 다음 단계 row를 만든다.\n3. recursive member가 더 이상 row를 만들지 않으면 멈춘다.\n4. 최종 SELECT는 누적된 recursive worktable을 읽는다.\n\n`UNION ALL`은 보통 중복 제거 비용이 없어 빠르지만, cycle이 있으면 같은 node가 계속 들어올 수 있다. `UNION`은 중복 제거를 해 주지만 모든 cycle 문제를 의도대로 해결하는 설계 도구는 아니다. 운영 쿼리에서는 명시적인 cycle guard와 depth limit을 같이 둔다.\n\n## Subtree 내려가기\n\n특정 root 아래 모든 descendant를 펼치는 기본형이다.\n\n```sql\nWITH RECURSIVE tree(id, parent_id, name, depth, path) AS (\n  SELECT id,\n         parent_id,\n         name,\n         0 AS depth,\n         ARRAY[id] AS path\n  FROM category\n  WHERE id = :root_id\n\n  UNION ALL\n\n  SELECT c.id,\n         c.parent_id,\n         c.name,\n         t.depth + 1,\n         t.path || c.id\n  FROM category c\n  JOIN tree t ON c.parent_id = t.id\n  WHERE t.depth < :max_depth\n    AND NOT c.id = ANY(t.path)\n)\nSELECT id, parent_id, name, depth, path\nFROM tree\nORDER BY path;\n```\n\n읽는 순서:\n\n- anchor: `id = :root_id`인 시작 node를 depth 0으로 넣는다.\n- recursive member: 직전 frontier `tree t`의 각 node에 대해 `c.parent_id = t.id`인 child를 찾는다.\n- `depth`: 화면 indent, max depth 제한, 디버깅에 쓴다.\n- `path`: cycle guard와 preorder 정렬에 쓴다.\n\n`ARRAY` 문법은 PostgreSQL 감각의 예시다. MySQL, SQL Server, Oracle은 path 표현과 cycle 문법이 다르다. 중요한 것은 DB별 문법보다 visited node를 추적한다는 구조다.\n\n## Ancestor 위로 올라가기\n\nbreadcrumb, 권한 상속, 조직 상위 라인처럼 leaf에서 root로 올라가는 쿼리는 JOIN 방향만 반대가 된다.\n\n```sql\nWITH RECURSIVE ancestors(id, parent_id, name, depth, path) AS (\n  SELECT id,\n         parent_id,\n         name,\n         0 AS depth,\n         ARRAY[id] AS path\n  FROM category\n  WHERE id = :leaf_id\n\n  UNION ALL\n\n  SELECT p.id,\n         p.parent_id,\n         p.name,\n         a.depth + 1,\n         a.path || p.id\n  FROM category p\n  JOIN ancestors a ON p.id = a.parent_id\n  WHERE a.depth < :max_depth\n    AND NOT p.id = ANY(a.path)\n)\nSELECT id, parent_id, name, depth\nFROM ancestors\nORDER BY depth;\n```\n\nsubtree는 child lookup이 핵심이라 `parent_id` index가 중요하다. ancestor는 부모 row를 PK로 찾는 쿼리라 보통 `id` primary key lookup이 중심이다. 두 방향 모두 depth가 깊거나 cycle이 있으면 결과와 시간이 예측하기 어려워진다.\n\n## 종료 조건과 cycle guard\n\nRecursive CTE는 recursive member가 새 row를 못 만들 때 자연 종료된다. 하지만 데이터가 완전한 tree라는 보장이 깨지면 종료가 기대와 달라진다.\n\n자주 필요한 guard:\n\n- `WHERE t.depth < :max_depth`처럼 업무상 허용 depth를 둔다.\n- `path`에 이미 방문한 id가 있으면 제외한다.\n- DB가 제공하는 recursion limit이나 `CYCLE` 문법이 있으면 그 의미를 확인한다.\n- statement timeout은 안전망일 뿐 올바른 종료 조건의 대체재가 아니다.\n\n특히 `parent_id` FK는 없는 부모를 가리키는 orphan은 막을 수 있지만, 모든 DB에서 cycle을 자동으로 막아 주는 것은 아니다. cycle invariant는 self-referencing FK 문서의 모델링 주제이고, 여기서는 조회가 망가지지 않도록 guard를 둔다.\n\n## Depth, path, 정렬 column\n\nrecursive result에는 원래 테이블 column만 싣지 말고 traversal에 필요한 derived column을 같이 싣는 편이 실무적이다.\n\n| column | 쓰임 | 주의 |\n|---|---|---|\n| `depth` | indent, max depth, ancestor distance | 시작 node를 0으로 둘지 1로 둘지 API에서 고정한다 |\n| `path` | cycle guard, breadcrumb, preorder sort | 문자열 path는 lexical sort와 delimiter 충돌을 조심한다 |\n| `sort_path` | sibling `sort_order`까지 반영한 정렬 | recursive member에서 부모 path에 sibling order를 이어 붙인다 |\n| `root_id` | 여러 root를 한 번에 펼칠 때 grouping | forest 조회에서 root별 분리를 쉽게 한다 |\n\n최종 화면 정렬이 필요하면 `ORDER BY depth, name`만으로는 tree 순서가 깨질 수 있다. 보통 parent path와 sibling sort key를 함께 누적해야 안정적인 preorder가 나온다.\n\n## 성능 포인트\n\nRecursive CTE 성능은 SQL 문법보다 방문 row 수와 각 level의 child lookup 비용이 좌우한다.\n\n- subtree 조회에는 `category(parent_id)` index가 거의 기본이다.\n- sibling 정렬이 매번 필요하면 `(parent_id, sort_order, id)` 같은 composite index를 검토한다.\n- anchor predicate가 넓으면 forest 전체를 펼치게 된다. 시작 집합을 의도적으로 좁힌다.\n- recursive term 안에서 필요한 column만 고른다. 큰 JSON, 긴 text, BLOB을 worktable에 싣지 않는다.\n- 최종 SELECT의 `LIMIT`이 항상 traversal 자체를 줄여 주지는 않는다. 줄이고 싶은 조건은 recursive member 안에 넣어야 한다.\n- 큰 subtree는 intermediate worktable과 sort가 temp storage를 쓸 수 있다. p95 경로라면 visited row count, temp spill, execution plan을 본다.\n\n작고 얕은 tree라면 adjacency list + recursive CTE가 충분히 단순하다. 반대로 같은 subtree나 ancestor를 매우 자주 읽고 depth/fan-out이 크다면 materialized path나 closure table 같은 저장 패턴으로 넘어갈지 tree storage chooser에서 비교한다.\n\n## 초급에서 고급으로 보는 순서\n\n초급:\n\n- anchor member가 시작 row를 고른다는 점을 찾는다.\n- recursive member의 JOIN 방향이 subtree인지 ancestor인지 구분한다.\n- recursive CTE가 언제 멈추는지 말할 수 있어야 한다.\n\n중급:\n\n- `depth`와 `path`를 결과에 싣고, max depth와 cycle guard를 둔다.\n- `parent_id` index 없이 subtree를 펼쳤을 때 왜 level마다 비싸지는지 설명한다.\n- 화면 정렬이 필요하면 sibling `sort_order`와 path 정렬을 같이 본다.\n\n고급:\n\n- final `WHERE`나 `LIMIT`이 traversal 비용을 충분히 줄이지 못하는 사례를 식별한다.\n- recursive worktable에 너무 많은 column을 싣는 비용을 줄인다.\n- 실제 tree query가 병목이면 storage pattern 자체를 바꿀지 판단한다.\n\n## 흔한 실수\n\n| 실수 | 왜 위험한가 | 더 나은 판단 |\n|---|---|---|\n| anchor와 recursive member를 그냥 JOIN 두 개로만 본다 | 어떤 row에서 시작하고 어디로 반복되는지 놓친다 | 시작 집합, 다음 frontier, 종료 조건을 분리한다 |\n| cycle guard 없이 `UNION ALL`을 쓴다 | 잘못된 데이터에서 무한 반복이나 row 폭증이 난다 | visited path, max depth, DB별 cycle 기능을 둔다 |\n| final `LIMIT 100`이면 안전하다고 본다 | DB가 이미 큰 subtree를 materialize한 뒤 자를 수 있다 | recursive term 안에서 depth와 branch 조건을 줄인다 |\n| `parent_id` index 없이 subtree API를 운영 경로에 둔다 | 각 level마다 child lookup이 테이블 스캔으로 번질 수 있다 | `parent_id` 또는 `(parent_id, sort_order)` index를 둔다 |\n| 저장 패턴 선택 문제까지 recursive CTE로만 해결하려 한다 | read-heavy tree에서는 쿼리만 튜닝해도 한계가 있다 | 병목이면 materialized path나 closure table을 비교한다 |\n\n## 한 줄 정리\n\nRecursive CTE는 adjacency list를 subtree나 ancestor path로 펼치는 강력한 SQL traversal mechanism이다. 운영 쿼리로 쓰려면 anchor, recursive member, 종료 조건, cycle guard, depth/path column, `parent_id` index, worktable/materialization 비용을 함께 설계해야 한다.\n",
   "aliases": [
     "재귀 CTE",
-    "트리 순회 SQL",
-    "계층 쿼리",
-    "Recursive CTE tree traversal 개념",
-    "Recursive CTE tree traversal 정리",
-    "recursive CTE",
     "WITH RECURSIVE",
-    "tree traversal SQL",
-    "subtree query",
-    "ancestor query",
+    "recursive CTE",
+    "트리 순회 SQL",
+    "계층 순회 쿼리",
+    "subtree SQL",
+    "ancestor SQL",
+    "anchor member",
+    "recursive member",
+    "depth path column",
     "cycle guard",
-    "adjacency list query"
+    "worktable cost"
   ],
   "expected_queries": [
-    "Recursive CTE로 self-referencing category tree의 subtree를 어떻게 조회해?",
-    "WITH RECURSIVE에서 anchor query와 recursive term은 각각 무슨 역할이야?",
-    "recursive CTE에서 cycle guard와 depth limit을 왜 둬야 해?",
-    "parent_id index가 tree traversal SQL 성능에 중요한 이유가 뭐야?",
-    "recursive CTE로 ancestor path를 위로 올라가는 query도 만들 수 있어?",
-    "adjacency list를 recursive CTE로 조회할 때 result materialization 비용을 왜 봐야 해?"
+    "WITH RECURSIVE로 parent_id category의 subtree를 depth까지 조회하는 SQL 어떻게 짜?",
+    "recursive CTE에서 anchor member랑 recursive member는 어떤 순서로 실행돼?",
+    "재귀 CTE가 언제 멈추는지, cycle guard는 어디에 넣어야 해?",
+    "ancestor path를 leaf에서 root로 올라가는 recursive CTE 예시 보여줘",
+    "subtree query가 느릴 때 parent_id index랑 worktable materialization을 어떻게 봐야 해?",
+    "recursive CTE에서 depth column과 path column은 각각 왜 필요해?",
+    "final LIMIT을 걸었는데도 recursive CTE가 많이 도는 이유가 뭐야?",
+    "UNION ALL recursive CTE에서 중복이나 cycle 때문에 결과가 불어나는 걸 어떻게 막아?"
   ],
   "symptoms": [
-    "recursive CTE가 cycle을 자동으로 안전하게 처리한다고 생각한다",
-    "parent_id index와 depth limit 없이 subtree 전체를 펼친다",
-    "anchor query와 recursive term의 종료 조건을 구분하지 못한다"
+    "anchor member와 recursive member의 역할, 반복 순서, 종료 조건을 구분하지 못한다",
+    "cycle guard나 max depth 없이 `UNION ALL` recursive CTE를 운영 조회에 둔다",
+    "final `LIMIT`이나 바깥 `WHERE`가 recursive traversal 비용까지 줄인다고 오해한다",
+    "`parent_id` index와 recursive worktable/materialization 비용을 보지 않고 subtree 전체를 펼친다"
   ],
   "relations": {
     "prerequisites": [
@@ -45,18 +48,26 @@
       "database/join-row-explosion-symptom-router",
       "database/self-referencing-fk-hierarchy-in-rdb"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "parent_id self FK로 카테고리 테이블을 설계하는 기본을 설명해줘",
+      "root parent_id null과 자기참조 외래키 제약을 처음부터 알려줘",
+      "adjacency list, materialized path, nested set, closure table 중 어떤 storage pattern을 고를지 비교해줘"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/recursive-cte-tree-traversal-sql.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch152"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "batch177-recursive-cte"
       }
     ]
   }

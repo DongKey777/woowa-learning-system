@@ -3,31 +3,35 @@
   "title": "Self-Referencing FK Hierarchy in RDB",
   "category": "database",
   "level": "intermediate",
-  "summary": "이 문서는 같은 테이블의 parent_id가 id를 참조하는 self-referencing foreign key로 카테고리, 댓글, 조직도 같은 계층 구조를 RDB에 저장할 때 adjacency list, cycle 방지, recursive query, delete policy를 함께 보는 intermediate primer다.",
-  "body_markdown": "# Self-Referencing FK Hierarchy in RDB\n\n> 한 줄 요약: self-referencing FK는 같은 테이블 안에서 `parent_id -> id` 관계를 두어 계층을 저장하는 방식이고, 부모 존재는 DB가 보장하지만 cycle, depth, subtree 이동, 삭제 정책은 별도로 설계해야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [기본 키와 외래 키 기초](./primary-foreign-key-basics.md)\n- [관계형 모델링 기초](./sql-relational-modeling-basics.md)\n- [정규화 기초](./normalization-basics.md)\n- [트리 기초](../data-structure/tree-basics.md)\n- [FK 삭제 정책 드릴](./fk-delete-policy-mission-drill.md)\n\nretrieval-anchor-keywords: self referencing foreign key, self-referencing FK hierarchy, adjacency list model, parent_id foreign key, hierarchical data in RDB, recursive CTE hierarchy, category tree table, organization chart table, 댓글 대댓글 DB 설계, 계층형 테이블, 자기참조 외래키, parent_id 계층 구조\n\n## 핵심 모델\n\nSelf-referencing FK는 한 테이블의 FK가 같은 테이블의 PK를 참조하는 모델이다. 가장 흔한 형태는 adjacency list다.\n\n```sql\nCREATE TABLE category (\n    id BIGINT PRIMARY KEY,\n    parent_id BIGINT NULL,\n    name VARCHAR(100) NOT NULL,\n    CONSTRAINT fk_category_parent\n        FOREIGN KEY (parent_id) REFERENCES category(id)\n);\n```\n\n`parent_id IS NULL`이면 root node이고, `parent_id = 10`이면 id 10 row의 child다. 이 구조는 카테고리, 댓글 대댓글, 조직도, 메뉴 트리처럼 \"한 노드가 부모 하나를 가진다\"는 모델에 잘 맞는다.\n\n## FK가 보장하는 것과 못 하는 것\n\nFK는 참조 대상 부모 row가 존재하는지만 보장한다. 즉 없는 부모를 가리키는 orphan row는 막지만, 계층 구조의 모든 규칙을 자동으로 보장하지는 않는다.\n\n| 규칙 | FK만으로 가능한가 | 추가 설계 |\n|---|---|---|\n| 부모 row 존재 | 가능 | `FOREIGN KEY(parent_id) REFERENCES same_table(id)` |\n| root 표현 | 가능 | `parent_id NULL` 정책 |\n| cycle 금지 | 보통 불가 | application check, trigger, recursive query 검증 |\n| 최대 depth 제한 | 불가 | business rule 또는 constraint/trigger |\n| sibling name unique | 별도 필요 | `UNIQUE(parent_id, name)` 등 |\n| subtree 삭제/이동 정책 | 별도 필요 | restrict, cascade, soft delete, migration plan |\n\n초급자가 가장 자주 놓치는 지점은 \"FK가 있으니 트리도 자동으로 안전하다\"는 오해다. FK는 graph edge의 존재를 보장할 뿐, 그 edge들이 cycle 없는 tree인지까지 항상 보장하지 않는다.\n\n## 조회 패턴부터 고르기\n\nAdjacency list는 한 노드의 직계 자식을 찾는 조회가 단순하다.\n\n```sql\nSELECT *\nFROM category\nWHERE parent_id = :parentId\nORDER BY name;\n```\n\n반면 전체 subtree나 ancestor path를 자주 읽어야 하면 recursive CTE가 필요할 수 있다.\n\n```sql\nWITH RECURSIVE subtree AS (\n    SELECT id, parent_id, name, 0 AS depth\n    FROM category\n    WHERE id = :rootId\n\n    UNION ALL\n\n    SELECT c.id, c.parent_id, c.name, s.depth + 1\n    FROM category c\n    JOIN subtree s ON c.parent_id = s.id\n)\nSELECT *\nFROM subtree\nORDER BY depth, name;\n```\n\nrecursive query가 자주 무겁다면 closure table, materialized path, nested set 같은 대안을 비교한다. 다만 처음부터 복잡한 모델을 고르기보다 \"직계 자식 조회가 대부분인가, subtree 조회가 핵심인가\"를 먼저 본다.\n\n## 설계 체크리스트\n\n- `parent_id`에 index를 둔다. 직계 자식 조회와 recursive CTE의 다음 단계 탐색이 이 index에 기대는 경우가 많다.\n- root는 `NULL`로 둘지 별도 root row로 둘지 정한다. 대부분은 `NULL` root가 단순하다.\n- 자기 자신을 부모로 두는 `parent_id = id`를 막는다. cycle의 가장 짧은 형태다.\n- subtree 이동 시 새 부모가 자기 descendants 안에 있는지 확인한다.\n- 삭제 정책을 정한다. 부모 삭제가 자식 전체 삭제인지, 삭제 거부인지, soft delete인지 업무 이력과 함께 판단한다.\n- sibling 이름 중복이 문제라면 `UNIQUE(parent_id, name)` 같은 제약을 검토한다.\n\n## 흔한 오해와 함정\n\n| 오해 | 왜 위험한가 | 더 나은 첫 대응 |\n|---|---|---|\n| \"parent_id FK만 걸면 트리 무결성이 끝난다\" | cycle과 depth 폭증은 남는다 | cycle 방지와 이동 검증을 별도로 둔다 |\n| \"계층이면 무조건 NoSQL document가 맞다\" | 관계 조회, 권한, 검색, transaction 요구가 있으면 RDB가 더 단순할 수 있다 | 조회 패턴과 갱신 단위를 먼저 비교한다 |\n| \"cascade delete가 편하다\" | 상위 카테고리 삭제가 하위 상품/댓글 이력 손실로 이어질 수 있다 | restrict, soft delete, archive를 함께 검토한다 |\n| \"recursive CTE면 성능 걱정이 없다\" | 깊은 tree, 큰 fan-out, 빈번한 subtree 조회에서 p99가 커질 수 있다 | depth, row count, index 사용을 측정한다 |\n\n## 실무 예시\n\n### 카테고리 트리\n\n상품 카테고리는 `category(id, parent_id, name, sort_order)`로 시작할 수 있다. 화면에서 한 단계씩 펼치는 UX라면 adjacency list가 충분한 경우가 많다. 전체 breadcrumb나 subtree count가 자주 필요하면 path cache나 closure table을 추가로 본다.\n\n### 댓글 대댓글\n\n댓글은 parent comment를 가리킬 수 있지만, 무한 depth를 허용하면 moderation과 화면 렌더링이 어려워진다. `max_depth` 정책, 삭제된 부모 댓글 표시 방식, 정렬 기준을 FK와 별도로 정해야 한다.\n\n### 조직도\n\n조직도는 이동 이력이 중요할 수 있다. 단순 self FK는 현재 구조를 표현하기 쉽지만, 과거 소속 이력까지 필요하면 `organization_assignment` 같은 별도 기간 테이블이 필요할 수 있다.\n\n## 대안 모델 비교\n\n| 모델 | 장점 | 비용 | 적합한 경우 |\n|---|---|---|---|\n| Adjacency list | 쓰기와 직계 자식 조회가 단순하다 | 깊은 subtree 조회가 recursive query에 의존한다 | 카테고리, 메뉴, 댓글의 기본형 |\n| Closure table | ancestor/descendant 조회가 빠르다 | 쓰기 시 관계 row를 여러 개 관리한다 | subtree 조회와 권한 계산이 잦음 |\n| Materialized path | path prefix 조회가 직관적이다 | node 이동 시 path 갱신이 크다 | read-heavy tree와 path 기반 검색 |\n| Nested set | subtree range 조회가 빠르다 | 삽입/이동 비용이 크고 이해가 어렵다 | 이동이 드문 정적 taxonomy |\n\n## 품질 관점\n\n좋은 답변은 `parent_id` FK 문법만 말하지 않고, 부모 존재 보장과 tree invariant 보장을 분리해야 한다. cycle 방지, root 정책, sibling unique, delete policy, subtree 이동 검증을 함께 언급하면 이 문서의 핵심에 맞다.\n\n## 성능 관점\n\n성능은 `parent_id` index, depth, fan-out, recursive CTE가 방문한 row 수에 좌우된다. 직계 자식 조회가 대부분이면 adjacency list가 단순하지만, 전체 subtree 조회가 p95 경로라면 closure table이나 materialized path를 비교한다.\n\n## 레이턴시 관점\n\n계층 조회는 평균보다 최악 depth와 큰 fan-out에서 tail latency가 커진다. API가 tree 전체를 한 번에 내려 주는지, lazy loading으로 단계별 조회하는지, cache invalidation이 subtree 이동과 충돌하는지를 같은 timeline에서 본다.\n\n## 주제별 추가 지표\n\n`max_depth, avg_children_per_node, recursive_rows_visited, subtree_query_p95_ms, cycle_reject_count`를 최소 지표로 둔다. 이 지표들은 self-referencing FK 모델이 실제 데이터 분포와 조회 지연을 견디는지 확인하게 해 준다.\n\n## 한 줄 정리\n\nSelf-referencing FK는 RDB에서 계층을 시작하기 좋은 기본 모델이지만, FK가 보장하는 것은 부모 row 존재까지이므로 cycle, depth, 삭제, subtree 조회 비용은 별도 invariant와 지표로 관리해야 한다.\n",
+  "summary": "이 문서는 같은 테이블의 parent_id가 id를 참조하는 self-referencing foreign key로 카테고리, 댓글, 조직도 같은 계층을 RDB에 저장하는 adjacency list 모델을 설명한다. root parent null, 부모 존재 보장과 cycle 방지의 차이, delete policy, parent_id index를 beginner/intermediate 눈높이에서 다룬다.",
+  "body_markdown": "# Self-Referencing FK Hierarchy in RDB\n\n> 한 줄 요약: self-referencing FK는 같은 테이블에서 `parent_id`가 `id`를 참조하게 해서 row들을 부모-자식 노드로 저장하는 adjacency list 모델이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [기본 키와 외래 키 기초](./primary-foreign-key-basics.md)\n- [관계형 모델링 기초](./sql-relational-modeling-basics.md)\n- [트리 기초](../data-structure/tree-basics.md)\n- [Recursive CTE tree traversal SQL](./recursive-cte-tree-traversal-sql.md)\n- [RDB tree storage patterns chooser](./rdb-tree-storage-patterns-chooser.md)\n- [FK 삭제 정책 드릴](./fk-delete-policy-mission-drill.md)\n\nretrieval-anchor-keywords: parent_id가 뭐야, self FK로 계층 저장, same table foreign key, self referencing foreign key, 자기참조 외래키, adjacency list self FK, root parent_id null, category tree table, comment reply parent_id, organization chart table, 카테고리 트리 DB 설계, 댓글 대댓글 DB 설계, 조직도 테이블 모델링\n\n## 이 문서가 먼저 답하는 질문\n\n- `parent_id`가 뭐고 왜 같은 테이블의 `id`를 가리키는가?\n- 카테고리, 댓글, 조직도처럼 한 노드가 부모 하나를 가지는 구조를 RDB에 어떻게 저장하는가?\n- `parent_id` FK가 보장하는 부모 존재와, 별도로 막아야 하는 cycle은 어떻게 다른가?\n- root node는 `parent_id NULL`로 두어도 되는가?\n- 삭제 정책과 `parent_id` index를 왜 처음 설계에 포함해야 하는가?\n\n## 핵심 모델: 같은 테이블 안의 부모 포인터\n\nSelf-referencing FK는 한 row의 `parent_id`가 같은 테이블의 다른 row `id`를 참조하는 구조다. row 하나를 node로 보고, `parent_id`를 부모 node를 가리키는 포인터로 읽으면 된다. 이런 저장 방식을 보통 adjacency list라고 부른다.\n\n```sql\nCREATE TABLE category (\n    id BIGINT PRIMARY KEY,\n    parent_id BIGINT NULL,\n    name VARCHAR(100) NOT NULL,\n    sort_order INT NOT NULL DEFAULT 0,\n    CONSTRAINT fk_category_parent\n        FOREIGN KEY (parent_id) REFERENCES category(id),\n    CONSTRAINT chk_category_not_self_parent\n        CHECK (parent_id IS NULL OR parent_id <> id)\n);\n\nCREATE INDEX idx_category_parent_id ON category(parent_id);\n```\n\n`parent_id IS NULL`이면 최상위 category, 즉 root node다. `parent_id = 10`이면 id 10인 row의 child다. 그래서 상품 카테고리, 댓글과 대댓글, 메뉴 트리, 조직도처럼 한 노드가 직접 부모 하나만 가지는 모델에 자연스럽다.\n\n간단한 데이터는 이렇게 읽힌다.\n\n| id | parent_id | name | 의미 |\n|---|---:|---|---|\n| 1 | NULL | 음식 | root category |\n| 2 | 1 | 치킨 | 음식의 child |\n| 3 | 2 | 후라이드 | 치킨의 child |\n| 4 | NULL | 음료 | 다른 root category |\n\n## FK가 해 주는 일과 해 주지 않는 일\n\n자기참조 FK가 있으면 DB는 없는 부모를 가리키는 row를 막아 준다. 예를 들어 `parent_id = 999`인데 id 999 row가 없으면 insert/update가 실패한다. 이것이 부모 존재 보장이다.\n\n하지만 FK만으로 전체 구조가 올바른 tree가 되는 것은 아니다.\n\n| 설계 규칙 | FK만으로 되는가 | 보통의 대응 |\n|---|---|---|\n| 부모 row 존재 | 된다 | `FOREIGN KEY(parent_id) REFERENCES same_table(id)` |\n| root 표현 | 된다 | `parent_id NULL` 허용 |\n| 자기 자신을 부모로 지정 금지 | DB에 따라 가능 | `CHECK (parent_id IS NULL OR parent_id <> id)` |\n| A -> B -> C -> A 같은 긴 cycle 금지 | 보통 안 된다 | 저장 전 service 검증, trigger, cycle 검사용 query |\n| 최대 depth 제한 | 안 된다 | 업무 규칙으로 depth 계산 후 거부 |\n| 같은 부모 아래 이름 중복 금지 | 별도 제약 필요 | `UNIQUE(parent_id, name)` 또는 root용 보완 제약 |\n| 부모 삭제 시 자식 처리 | 자동 결정 아님 | restrict, cascade, set null, soft delete 중 선택 |\n\n초급 단계에서 가장 중요한 구분은 부모가 존재한다와 cycle이 없다를 분리하는 것이다. FK는 edge의 대상이 실제 row인지 확인하지만, edge들이 원형으로 돌아오는지는 보통 직접 설계해야 한다.\n\n## 초기에 정해야 하는 설계 결정\n\n- root 정책: 보통 `parent_id NULL`이 가장 단순하다. 별도 root row를 만들면 모든 tree가 한 가짜 부모 아래 붙어서 권한, 삭제, 화면 표현이 더 복잡해질 수 있다.\n- `parent_id` index: 직계 자식 목록은 거의 항상 `WHERE parent_id = ?`로 찾는다. 이 조회가 메뉴 펼치기, 댓글 더보기, 하위 카테고리 조회의 기본 경로라면 `parent_id` index가 필요하다.\n- 삭제 정책: 부모를 지울 때 자식까지 지울지, 삭제를 막을지, 부모만 끊을지, soft delete로 숨길지 정한다. 카테고리와 댓글처럼 이력이 남는 데이터는 편하다는 이유만으로 cascade를 고르면 위험하다.\n- cycle 방지: `parent_id = id`는 check constraint로 막기 쉽지만, 조상 중 하나를 새 부모로 지정하는 이동은 별도 검증이 필요하다. subtree 이동 전 새 부모가 자기 하위 노드인지 확인한다.\n- sibling unique: 같은 부모 아래 같은 이름을 허용하지 않을지 정한다. 필요하면 `UNIQUE(parent_id, name)`을 보되, `parent_id NULL`인 root들의 uniqueness는 DB별 NULL 처리 차이를 확인한다.\n- depth와 fan-out: 댓글 depth를 2단계로 제한하거나, 카테고리 깊이를 제한하는 규칙은 FK가 아니라 업무 규칙이다.\n\n## 기본 조회는 직계 자식부터\n\nAdjacency list의 가장 단순하고 자주 쓰는 조회는 한 부모의 바로 아래 child 목록이다.\n\n```sql\nSELECT id, parent_id, name, sort_order\nFROM category\nWHERE parent_id = :parentId\nORDER BY sort_order, name;\n```\n\nroot 목록은 `WHERE parent_id IS NULL`로 찾는다. 전체 subtree, breadcrumb, ancestor path를 한 번에 펼치는 SQL은 이 문서의 핵심이 아니라 다음 단계다. 그 쿼리 mechanics는 [Recursive CTE tree traversal SQL](./recursive-cte-tree-traversal-sql.md)에서 보고, adjacency list가 충분한지 closure table/materialized path와 비교하는 선택 문제는 [RDB tree storage patterns chooser](./rdb-tree-storage-patterns-chooser.md)로 넘긴다.\n\n## 미션에서 자주 만나는 예시\n\n### 카테고리 트리\n\n`category(id, parent_id, name, sort_order)`로 시작한다. 화면이 한 단계씩 펼쳐지는 UX라면 직계 자식 조회가 중심이므로 self FK와 `parent_id` index만으로도 출발할 수 있다. 삭제는 상품이나 주문 이력과 연결될 수 있으므로 restrict나 soft delete를 먼저 검토한다.\n\n### 댓글과 대댓글\n\n`comment(id, parent_id, post_id, author_id, content, deleted_at)`처럼 parent comment를 가리킨다. 대댓글 무한 depth를 허용하면 화면, 알림, moderation이 어려워지므로 `max_depth`를 업무 규칙으로 둔다. 부모 댓글 삭제 시 자식 댓글을 같이 지울지, 삭제됨 표시로 남길지 먼저 정한다.\n\n### 조직도와 메뉴\n\n조직도는 `department(id, parent_id, name)` 또는 `employee(id, manager_id, name)`처럼 현재 구조를 표현하기 쉽다. 다만 과거 소속 이력, 겸직, 기간별 상하 관계가 필요하면 self FK 한 칸으로는 부족하고 별도 이력 테이블이 필요할 수 있다.\n\n## 흔한 오해\n\n| 오해 | 왜 틀렸나 | 더 나은 답 |\n|---|---|---|\n| `parent_id`가 있으면 자동으로 tree다 | 부모 존재만 확인하고 긴 cycle은 남는다 | FK와 tree invariant를 분리해서 설명한다 |\n| root도 반드시 row로 만들어야 한다 | 대부분은 `NULL` root가 더 단순하다 | 화면/권한상 가짜 root가 필요한지 먼저 본다 |\n| cascade delete를 걸면 삭제 문제가 해결된다 | 하위 댓글, 카테고리, 이력이 한 번에 사라질 수 있다 | restrict/soft delete/archive를 업무 의미로 고른다 |\n| index는 나중에 느려지면 붙이면 된다 | 계층 UI의 기본 조회가 `parent_id` 조건이다 | 모델을 만들 때 child lookup index를 같이 둔다 |\n\n## 품질 관점\n\n좋은 답변은 self FK 문법만 말하지 않고, row를 node로 보는 모델, `parent_id NULL` root, `parent_id` index, 부모 존재와 cycle 방지의 차이, 삭제 정책을 함께 설명한다. recursive CTE 구현이나 전체 tree pattern 비교로 길게 빠지면 이 문서의 범위를 벗어난다.\n\n## 한 줄 정리\n\nSelf-referencing FK는 같은 테이블의 `parent_id -> id`로 RDB 계층을 저장하는 기본 모델이다. 부모 row 존재는 DB FK가 보장하지만, cycle 방지, 삭제 정책, depth 제한, `parent_id` index는 별도 설계로 잡아야 한다.\n",
   "aliases": [
+    "parent_id가 뭐야",
+    "self FK로 계층 저장",
     "self referencing foreign key",
-    "self-referencing FK hierarchy",
-    "adjacency list model",
-    "recursive hierarchy in RDB",
-    "parent_id foreign key",
-    "계층형 테이블",
+    "self-referencing FK",
     "자기참조 외래키",
+    "adjacency list self FK",
+    "same table FK parent_id",
+    "root parent_id null",
     "parent_id 계층 구조",
     "카테고리 트리 DB 설계",
+    "댓글 대댓글 DB 설계",
     "조직도 테이블 모델링"
   ],
   "expected_queries": [
-    "RDB에서 parent_id로 카테고리 트리를 저장할 때 self-referencing FK를 어떻게 설계해?",
-    "self-referencing foreign key가 부모 존재는 보장하지만 cycle은 막지 못하는 이유가 뭐야?",
-    "댓글 대댓글이나 조직도 계층을 adjacency list로 모델링할 때 어떤 index와 delete policy를 봐야 해?",
-    "recursive CTE와 closure table, materialized path는 언제 비교해야 해?",
-    "부모 카테고리를 삭제할 때 자식 노드 cascade, restrict, soft delete 중 무엇을 봐야 해?"
+    "parent_id가 뭐야? 같은 테이블 id를 가리키면 계층이 되는 거야?",
+    "카테고리 트리 DB 설계를 self FK 하나로 시작해도 돼?",
+    "self FK로 계층 저장할 때 root는 parent_id를 null로 두면 돼?",
+    "자기참조 외래키가 있으면 없는 부모는 막는데 cycle은 왜 따로 막아야 해?",
+    "댓글 대댓글 테이블에서 parent_id index와 삭제 정책은 어떻게 잡아?",
+    "조직도에서 상위 부서를 parent_id로 모델링할 때 무엇을 조심해야 해?",
+    "부모 카테고리 삭제 시 자식 카테고리를 cascade로 지울지 restrict나 soft delete로 막을지 어떻게 판단해?"
   ],
   "symptoms": [
-    "같은 테이블의 parent_id FK가 계층 구조를 어떻게 표현하는지 처음 연결해야 한다",
-    "self-referencing FK가 cycle과 subtree 이동까지 자동으로 막는다고 오해한다",
-    "카테고리, 댓글, 조직도 같은 계층 데이터를 RDB adjacency list로 둘지 다른 모델로 둘지 비교해야 한다"
+    "parent_id가 같은 테이블의 id를 참조한다는 모델을 처음 연결해야 한다",
+    "self-referencing FK가 부모 존재뿐 아니라 cycle과 subtree 이동까지 자동으로 막는다고 오해한다",
+    "카테고리, 댓글, 조직도 같은 계층 데이터를 한 테이블 adjacency list로 저장할 때 root, index, delete policy를 함께 잡아야 한다"
   ],
   "relations": {
     "prerequisites": [
@@ -36,28 +40,40 @@
       "data-structure/tree-basics"
     ],
     "next_docs": [
-      "database/normalization-basics",
+      "database/recursive-cte-tree-traversal-sql",
+      "database/rdb-tree-storage-patterns-chooser",
+      "database/fk-delete-policy-mission-drill",
       "database/foreign-key-cascade-lock-surprises",
-      "database/join-table-composite-key-basics"
+      "database/normalization-basics"
     ],
     "confusable_with": [
       "database/join-table-composite-key-basics",
       "database/normalization-basics",
       "database/fk-delete-policy-mission-drill",
+      "database/recursive-cte-tree-traversal-sql",
+      "database/rdb-tree-storage-patterns-chooser",
       "data-structure/tree-basics"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "WITH RECURSIVE anchor member recursive member로 subtree 조회 SQL을 짜줘",
+      "recursive CTE에서 cycle guard와 depth limit을 구현하는 SQL을 알려줘",
+      "adjacency list, materialized path, nested set, closure table 중 어떤 storage pattern을 고를지 비교해줘"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-18",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/self-referencing-fk-hierarchy-in-rdb.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch147"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "batch177-self-fk-surface-expansion"
       }
     ]
   }
