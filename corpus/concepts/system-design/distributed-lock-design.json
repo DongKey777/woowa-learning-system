@@ -7,23 +7,22 @@
   "body_markdown": "# Distributed Lock 설계\n\n> 한 줄 요약: 분산 환경에서 단일 실행권을 보장하려면, 락 자체보다 \"언제 안전하게 풀 수 있는가\"와 \"누가 진짜 소유자인가\"를 먼저 설계해야 한다.\n\nretrieval-anchor-keywords: distributed lock, lease, fencing token, ownership, leader election, stale owner, compare and delete, coordination, failover control, placement fencing, consensus reconfiguration\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [분산 캐시 설계](./distributed-cache-design.md)\n> - [Deadlock Case Study](../database/deadlock-case-study.md)\n> - [멱등성 키와 중복 방지](../database/idempotency-key-and-deduplication.md)\n> - [Transaction Debugging Playbook](../spring/spring-transaction-debugging-playbook.md)\n> - [Stateful Workload Placement / Failover Control Plane 설계](./stateful-workload-placement-failover-control-plane-design.md)\n> - [Consensus Membership Reconfiguration 설계](./consensus-membership-reconfiguration-design.md)\n\n---\n\n## 핵심 개념\n\n분산 락은 \"여러 서버가 동시에 같은 일을 하지 못하게 막는 장치\"다.  \n하지만 실무에서 진짜 문제는 락을 잡는 것이 아니라, 아래 세 가지다.\n\n- 누가 현재 소유자인가\n- 락이 죽은 세션에 남지 않았는가\n- 락이 만료된 뒤에도 이전 소유자가 작업을 계속하지 않는가\n\n그래서 분산 락은 단순히 `SET NX PX`로 끝나지 않는다.  \n락의 유효기간, 재연장, 해제 검증, fencing token까지 같이 설계해야 한다.\n\n### 언제 쓰는가\n\n- 같은 배치가 중복 실행되면 안 될 때\n- 크론 잡이 여러 인스턴스에서 동시에 뜰 때\n- 동일 자원에 대한 쓰기 경합이 매우 클 때\n- 외부 시스템과의 상호작용을 한 번만 수행해야 할 때\n\n### 언제 쓰지 않는가\n\n- DB 트랜잭션이나 유니크 키로 충분할 때\n- 큐를 단일 소비자로 돌리면 되는 경우\n- idempotency key로 중복 방지가 가능한 경우\n\n---\n\n## 깊이 들어가기\n\n### 1. 락의 정체성\n\n분산 락은 보통 아래 속성을 가진다.\n\n- `lock key`: 어떤 자원을 잠그는가\n- `owner token`: 누가 잡았는가\n- `ttl`: 얼마나 오래 유효한가\n- `renewal`: 작업이 길어질 때 연장할 수 있는가\n- `fencing token`: 오래된 소유자를 어떻게 거를 것인가\n\n`ttl`만 두면 \"죽은 락\"은 줄지만, \"만료된 뒤에도 이전 소유자가 쓰기하는 문제\"는 남는다.  \n그래서 진짜 중요한 건 fencing token이다.\n\n### 2. Redis 기반 분산 락\n\n가장 흔한 형태는 다음이다.\n\n```text\nSET lock:order:123 <uuid> NX PX 30000\n```\n\n성공하면 락을 잡는다. 해제할 때는 `uuid`를 다시 확인하고 삭제해야 한다.\n\n문제는 다음과 같다.\n\n- 네트워크 지연으로 TTL이 먼저 만료될 수 있다.\n- 오래 걸리는 작업이 락을 잃었는데도 계속 실행될 수 있다.\n- 락 해제 스크립트가 원자적이지 않으면 남의 락을 풀 수 있다.\n\n그래서 실무에서는 Lua 스크립트로 compare-and-delete를 만든다.\n\n```lua\nif redis.call(\"get\", KEYS[1]) == ARGV[1] then\n  return redis.call(\"del\", KEYS[1])\nend\nreturn 0\n```\n\n### 3. Fencing Token\n\n락이 오래 걸려 만료되면, 이전 소유자가 여전히 작업을 이어갈 수 있다.  \n이 문제를 막는 방식이 fencing token이다.\n\n개념은 단순하다.\n\n1. 락을 잡을 때 monotonically increasing token을 받는다.\n2. downstream 저장소는 더 큰 token만 허용한다.\n3. 오래된 소유자는 락이 만료돼도 최신 상태를 덮어쓰지 못한다.\n\n이 방식은 분산 락보다 \"쓰기 순서 제어\"에 더 가깝다.\n\n### 4. ZooKeeper/etcd 스타일\n\nRedis는 빠르지만, 강한 조정(consensus)보다는 캐시 성격이 강하다.  \n반면 ZooKeeper/etcd는 클러스터 조정에 더 적합하다.\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|---|---|---|---|\n| Redis 락 | 빠르고 구현이 쉽다 | split-brain과 TTL 문제를 직접 다뤄야 한다 | 일반적인 배치/단기 락 |\n| ZooKeeper/etcd | 소유권과 세션 관리가 강하다 | 운영 복잡도가 높다 | 조정이 중요한 인프라 작업 |\n| DB row lock | 이미 있는 자원을 쓴다 | DB 병목이 된다 | 작은 규모, 강한 정합성 필요 |\n\n### 5. 분산 락의 진짜 병목\n\n분산 락은 성능 문제보다 가용성 문제를 먼저 만든다.\n\n- 락 서버가 느려지면 전체 작업이 대기한다.\n- TTL이 짧으면 중복 실행이 생긴다.\n- TTL이 길면 장애 복구가 느려진다.\n- 락 재시도가 많으면 오히려 stampede가 생긴다.\n\n즉, 락은 병목을 제거하는 도구가 아니라 **병목을 하나로 모아 조정하는 도구**다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 스케줄러 중복 실행\n\n배치 서버가 3대인데 cron이 각 서버에서 동시에 돈다.\n\n대응:\n\n- 시작 시 분산 락 획득\n- 작업이 길면 TTL 연장\n- 종료 시 compare-and-delete\n\n### 시나리오 2: 재고 차감\n\n동시에 주문이 몰리면 같은 상품 재고를 여러 서버가 건드린다.\n\n선택지:\n\n- DB row lock\n- 낙관적 락 + 재시도\n- 분산 락 + fencing token\n\n재고처럼 정합성이 매우 중요하면, 분산 락보다 DB 레벨 제어가 더 단순한 경우가 많다.\n\n### 시나리오 3: 외부 API 호출\n\n한 번만 호출해야 하는 결제 승인/정산 작업이 중복되면 비용이 크게 난다.\n\n이 경우 락만 믿지 말고 다음을 같이 넣는다.\n\n- idempotency key\n- dedup store\n- 재시도 정책\n\n---\n\n## 코드로 보기\n\n```pseudo\nfunction acquireLock(key, owner, ttlMs):\n    return redis.set(key, owner, NX=true, PX=ttlMs)\n\nfunction releaseLock(key, owner):\n    luaCompareAndDelete(key, owner)\n\nfunction executeOnce(jobId):\n    token = uuid()\n    if !acquireLock(\"lock:job:\" + jobId, token, 30000):\n        return \"busy\"\n\n    try:\n        runJob()\n    finally:\n        releaseLock(\"lock:job:\" + jobId, token)\n```\n\n### fencing token 예시\n\n```java\npublic void updateInventory(long productId, long token, int delta) {\n    Inventory inventory = inventoryRepository.find(productId);\n    if (inventory.getFencingToken() > token) {\n        return; // stale owner\n    }\n    inventory.apply(delta, token);\n    inventoryRepository.save(inventory);\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Redis 락 | 빠르고 익숙하다 | TTL/재연장/중복 실행에 취약 | 일반적인 작업 중복 방지 |\n| ZooKeeper/etcd | 소유권 모델이 강하다 | 운영 복잡도가 높다 | 조정이 중요한 인프라 |\n| DB lock | 단순하다 | DB 병목이 된다 | 정합성이 최우선일 때 |\n| 락 없이 idempotency | 가장 안전한 경우가 많다 | 설계가 더 필요하다 | API 재시도가 가능한 경우 |\n\n핵심 판단 기준은 \"잠금이 필요한가\"가 아니라 **락으로 해결하려는 문제를 더 단순한 제어로 풀 수 있는가**다.\n\n---\n\n## 꼬리질문\n\n> Q: 분산 락만 있으면 중복 실행이 완전히 막히나요?\n> 의도: TTL 만료와 stale owner 문제를 아는가 확인\n> 핵심: 아니다. fencing token과 idempotency가 같이 필요할 수 있다.\n\n> Q: Redis 락과 DB row lock은 언제 각각 선택하나요?\n> 의도: 저장소별 제어 경계 이해\n> 핵심: 강한 정합성은 DB, 넓은 작업 조정은 분산 락이 유리하다.\n\n## 한 줄 정리\n\n분산 락은 \"한 번만 실행\"을 보장하는 마법이 아니라, 만료와 stale owner까지 포함해 소유권을 관리하는 조정 장치다.\n",
   "aliases": [
     "distributed lock",
-    "lease",
+    "lease lock",
     "fencing token",
-    "ownership",
-    "leader election",
+    "분산 락",
+    "리스 기반 락",
+    "펜싱 토큰",
     "stale owner",
     "compare and delete",
-    "coordination",
-    "failover control",
-    "placement fencing",
-    "consensus reconfiguration",
-    "Distributed Lock 설계"
+    "Redis SET NX PX",
+    "락 만료 stale write"
   ],
   "expected_queries": [
-    "Redis로 분산 락을 잡아도 TTL이 만료된 이전 owner가 쓰기를 계속할 수 있는 이유가 뭐야?",
-    "분산 락에서 fencing token은 stale owner 문제를 어떻게 막아?",
-    "배치 job 중복 실행을 막을 때 DB lock, Redis lock, idempotency key 중 무엇을 고를지 설명해줘",
-    "compare-and-delete 없이 락을 해제하면 남의 락을 풀 수 있는 상황이 왜 생겨?"
+    "Redis SET NX PX로 잡은 락이 만료된 뒤 stale owner 쓰기를 어떻게 막아?",
+    "분산 락 release에서 owner token을 비교하지 않으면 어떤 race가 생겨?",
+    "lease TTL을 짧게 잡는 것과 fencing token을 쓰는 것의 보장 차이는 뭐야?",
+    "DB unique constraint로 충분한 중복 방지에 distributed lock을 쓰면 뭐가 복잡해져?",
+    "lock service 장애 때 fail-open과 fail-closed를 어떤 기준으로 고르나?"
   ],
   "symptoms": [
     "`Distributed Lock 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +32,34 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/redis-setnx-distributed-lock-beginner-primer",
+      "database/lock-basics",
+      "database/idempotency-key-and-deduplication"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/distributed-lock-interview-drill",
+      "system-design/lease-fencing-token-split-brain-deep-dive",
+      "database/db-lease-fencing-coordination",
+      "database/advisory-locks-vs-row-locks"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/leader-election-split-brain-fencing-token-chooser",
+      "system-design/distributed-scheduler-misfire-lease-fencing-design",
+      "system-design/work-queue-visibility-timeout-lease-heartbeat-chooser"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/distributed-lock-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

@@ -6,35 +6,16 @@
   "summary": "이 문서는 unique/duplicate 경로와 lock/deadlock/serialization 경로를 already exists, busy, retryable 세 버킷으로 비교하는 beginner chooser다.",
   "body_markdown": "# Lock 예외와 Unique 예외 통합 미니 브리지\n\n> 한 줄 요약: beginner는 lock 경로와 duplicate-key 경로를 따로 외우기보다, 먼저 `already exists` / `busy` / `retryable` 3버킷으로 번역한 뒤 \"승자가 이미 있나, 아직 막혀 있나, 이번 시도만 버리면 되나\"를 한 장에서 비교하면 된다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [3버킷 공통 용어 카드](./three-bucket-terms-common-card.md)\n- [Duplicate Key vs Busy Response Mapping](./duplicate-key-vs-busy-response-mapping.md)\n- [`lock timeout` != `already exists` 공통 오해 카드](./lock-timeout-not-already-exists-common-confusion-card.md)\n- [3버킷 결정 트리 미니카드](./three-bucket-decision-tree-mini-card.md)\n- [UNIQUE vs Locking-Read Duplicate Primer](./unique-vs-locking-read-duplicate-primer.md)\n- [MySQL Duplicate-Key Retry Handling Cheat Sheet](./mysql-duplicate-key-retry-handling-cheat-sheet.md)\n- [MySQL/PostgreSQL Lock Timeout과 Deadlock의 Spring/JPA 예외 매핑](./spring-jpa-lock-timeout-deadlock-exception-mapping.md)\n- [`CannotAcquireLockException` / `40001` 혼동 FAQ](./cannotacquirelockexception-40001-insert-if-absent-faq.md)\n- [PostgreSQL SERIALIZABLE Retry Playbook for Beginners](./postgresql-serializable-retry-playbook.md)\n- [Insert-if-Absent Retry Outcome Guide](./insert-if-absent-retry-outcome-guide.md)\n- [database 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: lock unique exception bridge, duplicate key lock timeout deadlock one page, busy retryable already exists lock duplicate, deadlock 40001 same retry rule, deadlock serialization failure why same retry, beginner exception mapping bridge, spring exception 3 bucket bridge, unique violation vs lock timeout vs deadlock, deadlock 40p01 40001 beginner, 락 예외 중복키 예외 비교, deadlock 40001 왜 둘 다 재시도해요, deadlock serialization failure 헷갈려요, already exists busy retryable 연결 문서, lock duplicate mini bridge, what is deadlock 40001 retry basics, lock timeout vs duplicate vs deadlock, 3버킷 분류 already-exists busy retryable, deadlock과 40001 retry 단위, 전체 트랜잭션 retry vs 단일 쿼리 retry, DAO exception 분류 흐름, DataAccessException 상속 트리, lock timeout은 already-exists 아님, 중복 키 vs 락 대기 vs 교착 상태, Spring exception translator 결과 분기\n\n## 먼저 멘탈모델\n\n용어 뜻부터 헷갈리면 [3버킷 공통 용어 카드](./three-bucket-terms-common-card.md)를 먼저 보고 오는 편이 빠르다.\n\n이 문서에서는 그 공통 용어를 기준으로 **duplicate 경로와 lock 경로를 나란히 비교**한다.\n\n핵심은 이거다.\n\n> duplicate-key 경로는 보통 \"이미 승자가 있다\" 쪽이고, lock 경로는 \"지금 막혀 있거나 이번 시도만 깨졌다\" 쪽이다.\n\n처음에는 아래 `입문` 표만 보고, \"duplicate 경로와 lock 경로가 왜 다른가\"가 궁금할 때 `확장` 표로 내려가면 된다.\n\n## 입문: 3버킷 한 장 비교표\n\n| 경로 | 대표 신호 | 먼저 넣을 버킷 | 초급자 해석 | 기본 동작 |\n|---|---|---|---|---|\n| unique/duplicate 경로 | `duplicate key`, unique violation | `already exists` | 같은 key 승자가 이미 있다 | 기존 row/기존 결과 재조회 |\n| lock 경로 | `lock timeout` | `busy` | 지금 막혀 있어 결과를 단정 못 한다 | 즉시 무한 재시도 말고 혼잡 원인 확인 |\n| lock 경로 | `deadlock` | `retryable` | 이번 시도만 희생됐다 | 전체 트랜잭션 bounded retry |\n| lock/격리 경로 | `serialization failure` | `retryable` | 새 snapshot에서 다시 계산해야 한다 | 전체 트랜잭션 bounded retry |\n\n짧은 기억법:\n\n- `duplicate key` = 이미 자리 있음\n- `lock timeout` = 아직 줄이 안 빠짐\n- `deadlock` / `serialization failure` = 이번 판만 다시\n\n## 확장: duplicate 경로와 lock 경로를 나란히 보기\n\n| 질문 | duplicate-key 경로 | lock 경로 |\n|---|---|---|\n| DB가 말하는 핵심 | \"승자는 이미 있다\" | \"아직 못 들어갔거나, 이번 시도만 깨졌다\" |\n| 대표 예외 | `DuplicateKeyException`, unique violation | `CannotAcquireLockException`, deadlock, `CannotSerializeTransactionException` |\n| 흔한 첫 반응 | 기존 결과를 읽는다 | timeout인지 deadlock인지 먼저 가른다 |\n| 초보자 실수 | 같은 `INSERT`를 계속 다시 던진다 | timeout을 무조건 retry해서 혼잡을 키운다 |\n| 기본 처리 단위 | winner read / result replay | 새 트랜잭션 재시도 또는 busy 응답 |\n\n## 왜 `deadlock`과 `40001`이 같은 retry 규칙인가\n\n초보자 기준으로 둘을 한 줄로 묶는 핵심은 원인이 아니라 **망가진 범위**가 같다는 점이다.\n\n| 신호 | 왜 실패했나 | 공통점 | 그래서 같은 규칙 |\n|---|---|---|---|\n| `deadlock` | 잠금 순서가 맞물려 DB가 희생자 하나를 중단했다 | 현재 트랜잭션 attempt가 이미 깨졌다 | 새 트랜잭션으로 read -> validate -> write 전체 재시작 |\n| `serialization failure` (`40001`) | 지금 snapshot에서 읽고 계산한 판단을 직렬화할 수 없다 | 현재 트랜잭션 attempt의 판단 전체가 무효다 | 새 트랜잭션으로 read -> validate -> write 전체 재시작 |\n\n짧게 외우면:\n\n- `deadlock` = 락이 꼬여서 이번 판이 깨졌다\n- `40001` = 판단이 꼬여서 이번 판이 깨졌다\n- 둘 다 공통으로 **이번 판 전체를 버리고 다시 시작**해야 한다\n\n비유로는 \"`한 문제를 푸는 시도`가 통째로 무효가 됐다\"고 보면 된다.\n다만 이 비유는 \"원인도 같다\"는 뜻은 아니다.\n`deadlock`은 lock ordering 문제를, `40001`은 serializable/SSI 판단 충돌을 더 봐야 한다.\n\n## 작은 예시\n\n쿠폰 발급 API에서 `(coupon_id, member_id)`가 유일하다고 하자.\n\n| 장면 | 어느 경로인가 | 3버킷 | 기본 응답 |\n|---|---|---|---|\n| A가 먼저 insert commit, B는 같은 key insert에서 실패 | duplicate-key 경로 | `already exists` | \"이미 발급됨\" 또는 기존 결과 반환 |\n| A가 row를 오래 잡아서 B가 lock timeout | lock 경로 | `busy` | \"지금 혼잡\" 응답 또는 짧은 제한 retry |\n| A와 B가 잠금 순서를 엇갈리게 잡아 deadlock | lock 경로 | `retryable` | 전체 발급 트랜잭션 다시 시도 |\n| A와 B가 둘 다 \"아직 발급 가능\"이라고 읽고 PostgreSQL `SERIALIZABLE`에서 한쪽이 `40001` | lock/격리 경로 | `retryable` | 새 snapshot에서 전체 발급 트랜잭션 다시 시도 |\n\n같은 \"발급 실패\"라도, duplicate 경로와 lock 경로는 뜻이 다르다.\n\n- duplicate는 보통 **이미 결론이 난 실패**\n- lock timeout은 **아직 결론을 못 본 실패**\n- deadlock/serialization failure는 **이번 attempt만 무효인 실패**\n\n## 자주 헷갈리는 지점\n\n- `DuplicateKeyException`을 `retryable`로 두면 같은 key에 다시 부딪힐 가능성이 크다.\n- `lock timeout`을 `already exists`처럼 읽는 공통 오해는 [`lock timeout` != `already exists` 공통 오해 카드](./lock-timeout-not-already-exists-common-confusion-card.md) 5줄로 먼저 고정해 두면 덜 흔들린다.\n- `CannotAcquireLockException` 하나만 보고 retry 여부를 결정하면 deadlock과 timeout이 섞여 오분류될 수 있다.\n- `deadlock`과 `40001`을 같은 원인으로 외우면 안 된다. 같은 것은 **재시도 단위**이지 실패 원인 이름이 아니다.\n- `already exists`는 DB 상태 버킷이고, HTTP `409 conflict`는 그다음 서비스 응답 선택이다.\n- HTTP까지 한 장으로 이어서 보고 싶으면 [Duplicate Key vs Busy Response Mapping](./duplicate-key-vs-busy-response-mapping.md)을 바로 붙여 읽으면 된다.\n\n## 초보자용 실무 규칙\n\n1. 먼저 모든 예외를 `already exists` / `busy` / `retryable` 중 하나로 번역한다.\n2. duplicate-key 경로는 같은 `INSERT` 재시도보다 winner read가 먼저다.\n3. lock 경로는 timeout과 `deadlock`/`40001`을 분리한다.\n4. `deadlock`과 `40001`은 원인은 달라도 둘 다 `retryable`이다.\n5. `retryable`은 SQL 한 줄이 아니라 트랜잭션 전체를 다시 시작한다.\n\n## 다음에 이어서 볼 문서\n\n- 한 장 결정표를 더 짧게 보고 싶으면 [3버킷 결정 트리 미니카드](./three-bucket-decision-tree-mini-card.md)\n- duplicate-key 쪽을 더 자세히 보면 [MySQL Duplicate-Key Retry Handling Cheat Sheet](./mysql-duplicate-key-retry-handling-cheat-sheet.md)\n- lock 예외가 Spring/JPA에서 어떻게 보이는지 보면 [MySQL/PostgreSQL Lock Timeout과 Deadlock의 Spring/JPA 예외 매핑](./spring-jpa-lock-timeout-deadlock-exception-mapping.md)\n- service-layer `createIfAbsent()`에 바로 붙이려면 [Insert-if-Absent Retry Outcome Guide](./insert-if-absent-retry-outcome-guide.md)\n\n## 한 줄 정리\n\nbeginner는 lock 경로와 duplicate-key 경로를 따로 외우기보다, 먼저 `already exists` / `busy` / `retryable` 3버킷으로 번역한 뒤 \"승자가 이미 있나, 아직 막혀 있나, 이번 시도만 버리면 되나\"를 한 장에서 비교하면 된다.\n",
   "aliases": [
+    "락 예외 중복키 예외 비교",
+    "락 타임아웃",
+    "데드락",
+    "교착 상태",
     "lock unique exception bridge",
     "duplicate key lock timeout deadlock one page",
     "busy retryable already exists lock duplicate",
     "deadlock 40001 same retry rule",
     "unique violation vs lock timeout vs deadlock",
-    "spring exception 3 bucket bridge",
-    "lock duplicate mini bridge",
-    "락 예외 중복키 예외 비교",
-    "deadlock 40001 retry",
-    "already exists busy retryable",
-    "lock timeout",
-    "락 타임아웃",
-    "deadlock",
-    "데드락",
-    "교착 상태",
-    "unique violation",
-    "유니크 위반",
-    "duplicate key violation",
-    "중복 키 위반",
-    "retry 단위",
-    "retry granularity",
-    "전체 트랜잭션 retry",
-    "일부 쿼리만 retry",
-    "비교 3축",
-    "exception classification",
-    "예외 분류",
-    "DAO exception",
-    "error code translation",
-    "DataAccessException"
+    "spring exception 3 bucket bridge"
   ],
   "expected_queries": [
     "duplicate key, lock timeout, deadlock, serialization failure를 already exists busy retryable로 한 장에서 비교해줘",
@@ -73,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/lock-duplicate-three-bucket-mini-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

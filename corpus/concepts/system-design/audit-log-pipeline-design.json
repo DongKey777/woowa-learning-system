@@ -7,23 +7,24 @@
   "body_markdown": "# Audit Log Pipeline 설계\n\n> 한 줄 요약: 감사 로그 파이프라인은 누가 언제 무엇을 했는지 변경 불가능하게 수집하고, 조회와 규제 대응이 가능하도록 보관하는 시스템이다.\n\nretrieval-anchor-keywords: audit log pipeline, append-only, tamper-evident, compliance, actor action resource, immutable log, retention policy, SIEM, traceability, replay, forensic\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n> - [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n\n## 핵심 개념\n\nAudit log는 단순한 application log가 아니다.  \n실전에서는 아래를 만족해야 한다.\n\n- 누가 했는지 actor 추적\n- 무엇을 했는지 action 추적\n- 어떤 대상에 했는지 resource 추적\n- 언제 했는지 timestamp 추적\n- 변경 불가능성 또는 tamper evidence\n- 긴 보관 기간과 조회 가능성\n\n즉, audit log는 장애 분석용 로그가 아니라, **책임과 증거를 남기는 운영 데이터**다.\n\n## 깊이 들어가기\n\n### 1. 무엇을 audit로 남길 것인가\n\n모든 이벤트를 audit로 남기면 비용이 커진다.  \n보통 중요한 건 아래다.\n\n- 권한 변경\n- 금전 관련 변경\n- 데이터 export\n- 관리자 impersonation\n- 보안 설정 변경\n- 삭제/복구 작업\n\n### 2. Capacity Estimation\n\n예:\n\n- 1,000만 사용자\n- 하루 2천만 audit event\n- 평균 event 크기 1 KB\n\n그럼 일일 원본량은 약 20 GB이고, 보관/인덱스/replica를 포함하면 더 커진다.  \n여기서 핵심은 write QPS보다 retention과 query pattern이다.\n\n### 3. 파이프라인 구조\n\n```text\nApp Service\n  -> Audit Event Producer\n  -> Durable Queue / Stream\n  -> Normalizer\n  -> Immutable Store\n  -> Query Index\n  -> Export / SIEM\n```\n\n흐름:\n\n1. 애플리케이션이 audit event를 생성한다.\n2. queue로 보내며 outbox 패턴을 쓸 수 있다.\n3. normalizer가 schema를 맞춘다.\n4. immutable store에 append-only로 저장한다.\n5. 조회용 인덱스를 별도로 만든다.\n\n### 4. Append-only와 tamper evidence\n\n감사 로그는 수정 가능하면 의미가 약해진다.\n\n권장:\n\n- append-only table or object store\n- hash chain 또는 batch checksum\n- write-once storage 옵션\n- 관리자라도 삭제 대신 redaction 이벤트 기록\n\n완전한 불변성을 시스템만으로 보장하기 어렵다면, 적어도 변조 흔적이 남도록 설계해야 한다.\n\n### 5. 데이터 모델\n\n핵심 필드 예:\n\n- event_id\n- actor_type\n- actor_id\n- tenant_id\n- action\n- resource_type\n- resource_id\n- before_snapshot\n- after_snapshot\n- correlation_id\n- request_id\n- occurred_at\n- ip_address\n\n이렇게 해야 나중에 \"누가, 언제, 무엇을, 어떤 요청으로\"를 복원할 수 있다.\n\n### 6. 조회와 검색\n\nAudit log는 write-heavy지만 조회도 중요하다.\n\n자주 필요한 조회:\n\n- 특정 user의 변경 이력\n- 특정 resource의 시간순 변경 내역\n- 특정 action의 전체 목록\n- 기간별 export\n\n따라서 검색 인덱스와 partitioning이 필요하다.  \n이때는 [Search 시스템 설계](./search-system-design.md)와 [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)와 연결해서 생각하면 좋다.\n\n### 7. 보관 정책과 규제\n\nAudit log는 무한정 보관하지 않는다.\n\n- hot storage\n- warm archive\n- cold archive\n- legal hold\n\n삭제보다 보관 정책이 중요하다.  \n특히 규제 대응에서는 retention policy가 먼저 정해져야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 관리자 권한 변경\n\n문제:\n\n- 운영자가 권한을 바꿨는데 누가 바꿨는지 나중에 알아야 한다\n\n해결:\n\n- admin action을 반드시 audit에 남긴다\n- impersonation은 별도 이벤트로 기록한다\n\n### 시나리오 2: 데이터 export\n\n문제:\n\n- 고객 데이터 export는 민감한 작업이다\n\n해결:\n\n- export 시작/완료/실패를 모두 기록한다\n- 다운로드 링크와 대상 범위를 남긴다\n\n### 시나리오 3: 사고 조사\n\n문제:\n\n- 데이터가 의도치 않게 삭제되었다\n\n해결:\n\n- correlation id로 요청 체인을 복원한다\n- before/after snapshot을 대조한다\n\n## 코드로 보기\n\n```pseudo\nfunction audit(actor, action, resource, payload):\n  event = {\n    actor: actor,\n    action: action,\n    resource: resource,\n    payload: normalize(payload),\n    occurredAt: now()\n  }\n  queue.publish(event)\n\nfunction store(event):\n  appendOnlyStore.write(event)\n  index.write(event.searchKeys)\n```\n\n```java\npublic void record(AuditEvent event) {\n    queue.publish(event.normalize());\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Inline audit write | 단순하다 | user flow latency 증가 | 작은 시스템 |\n| Async queue | 서비스 경로가 가볍다 | eventual consistency | 대부분의 실서비스 |\n| Append-only store | 변조 방지에 유리 | 조회 인덱스가 별도 필요 | 컴플라이언스 |\n| Full snapshot | 복구가 쉽다 | 저장 비용이 크다 | 중요한 상태 변경 |\n| Hash chain | tamper evidence가 좋다 | 구현 복잡도 증가 | 높은 감사 요구 |\n\n핵심은 audit가 단순 로그가 아니라 **법적/운영적 책임을 지탱하는 증거 체계**라는 점이다.\n\n## 꼬리질문\n\n> Q: application log와 audit log는 어떻게 다른가요?\n> 의도: 운영 로그와 증거 로그 구분 확인\n> 핵심: audit log는 책임 추적과 규제 대응이 목적이다.\n\n> Q: audit log를 수정하면 왜 안 되나요?\n> 의도: 불변성과 신뢰성 이해 확인\n> 핵심: 변조 가능하면 증거로서 의미가 약해진다.\n\n> Q: sensitive data는 어떻게 다루나요?\n> 의도: 보안과 마스킹 감각 확인\n> 핵심: 최소 수집, 마스킹, redaction, 접근 통제를 함께 써야 한다.\n\n> Q: search index와 원본 저장소를 왜 분리하나요?\n> 의도: write path와 query path 분리 이해 확인\n> 핵심: 조회 요구와 보관 요구가 다르기 때문이다.\n\n## 한 줄 정리\n\nAudit log pipeline은 중요한 행위를 append-only로 수집해, 변조 방지와 추적 가능성을 동시에 제공하는 증거 인프라다.\n\n",
   "aliases": [
     "audit log pipeline",
-    "append-only",
-    "tamper-evident",
-    "compliance",
+    "감사 로그 수집",
+    "append-only audit",
+    "tamper-evident log",
     "actor action resource",
-    "immutable log",
+    "immutable event store",
     "retention policy",
-    "SIEM",
-    "traceability",
-    "replay",
-    "forensic",
-    "Audit Log Pipeline 설계"
+    "SIEM export",
+    "감사 추적성",
+    "redaction event",
+    "hash chain audit",
+    "규제 대응 로그"
   ],
   "expected_queries": [
-    "누가 언제 무엇을 했는지 감사 로그를 append-only로 남겨야 하는 이유가 뭐야?",
-    "audit log에서 actor, action, resource, before/after를 어떻게 모델링해?",
-    "변조 방지 로그를 만들 때 hash chain, retention, SIEM 전송을 어떻게 나눠?",
-    "감사 로그를 일반 application log처럼 지우거나 수정하면 어떤 문제가 생겨?"
+    "감사 로그에서 actor action resource before after를 꼭 남겨야 하는 이유가 뭐야?",
+    "append-only audit log를 비동기 queue로 보낼 때 유실과 중복을 어떻게 막아?",
+    "관리자가 audit event를 수정하지 못하게 하려면 redaction 이벤트와 hash chain을 어떻게 설계해?",
+    "감사 로그 원본 저장소와 검색 index를 분리하면 조회 지연과 증거성을 어떻게 맞춰?",
+    "SIEM으로 보내는 audit log와 장기 보관 immutable store는 어떤 책임이 달라?"
   ],
   "symptoms": [
     "`Audit Log Pipeline 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +34,31 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "security/audit-logging-auth-authz-traceability",
+      "system-design/search-indexing-pipeline-design"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/audit-evidence-vault-design",
+      "security/audit-log-hash-chain-tamper-evidence-primer",
+      "software-engineering/log-redaction-pii-secret-playbook"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/audit-evidence-vault-design",
+      "security/audit-logging-auth-authz-traceability"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/audit-log-pipeline-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

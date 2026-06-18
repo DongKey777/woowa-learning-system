@@ -4,26 +4,27 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Tenant Billing Dispute Workflow 설계를 다루는 deep_dive 문서다. tenant billing dispute workflow는 청구 오류, 과금 이의 제기, 크레딧 조정, 조사 승인 절차를 체계화하는 재무 운영 워크플로우다. 검색 질의가 billing dispute, invoice challenge, credit adjustment, tenant billing처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Tenant Billing Dispute Workflow 설계\n\n> 한 줄 요약: tenant billing dispute workflow는 청구 오류, 과금 이의 제기, 크레딧 조정, 조사 승인 절차를 체계화하는 재무 운영 워크플로우다.\n\nretrieval-anchor-keywords: billing dispute, invoice challenge, credit adjustment, tenant billing, chargeback, case review, dispute workflow, prorated correction, approval, billing operations\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Billing / Usage Metering System 설계](./billing-usage-metering-system-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Fraud Case Management Workflow 설계](./fraud-case-management-workflow-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n\n## 핵심 개념\n\nbilling dispute는 단순 CS 티켓이 아니다.  \n실전에서는 아래를 함께 관리해야 한다.\n\n- invoice challenge\n- usage verification\n- credit memo\n- proration correction\n- approval workflow\n- customer communication\n\n즉, dispute workflow는 청구와 정산을 되돌리거나 보정하는 재무 운영 시스템이다.\n\n## 깊이 들어가기\n\n### 1. dispute 유형\n\n대표적으로 다음이 있다.\n\n- 잘못된 사용량\n- 중복 청구\n- 계약 조건 불일치\n- 세금/할인 계산 오류\n- 서비스 장애 보상\n\n분류가 먼저 되어야 올바른 팀과 절차로 간다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 월 10만 invoices\n- dispute rate 0.5%\n- 월 500건 케이스\n\n숫자는 적어 보여도, 한 건당 영향 금액이 커서 워크플로우가 엄격해야 한다.\n\n봐야 할 숫자:\n\n- dispute intake rate\n- resolution SLA\n- credit issuance latency\n- reopen rate\n- approval queue depth\n\n### 3. workflow stages\n\n```text\nOPEN -> TRIAGED -> INVESTIGATING -> PROPOSED -> APPROVED -> APPLIED -> CLOSED\n```\n\n각 단계마다 증거와 승인이 필요하다.\n\n### 4. evidence and lineage\n\n이의 제기를 처리하려면 근거가 있어야 한다.\n\n- 원본 usage event\n- invoice snapshot\n- 계약/플랜 버전\n- 담당자 메모\n- audit log\n\n이 부분은 [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)와 [Billing / Usage Metering System 설계](./billing-usage-metering-system-design.md)와 연결된다.\n\n### 5. credit memo와 correction\n\n단순히 금액을 수정하면 안 된다.\n\n- credit memo\n- adjustment entry\n- next invoice offset\n- refund if needed\n\n정정은 원장에 남겨야 한다.\n\n### 6. approval and segregation\n\n재무 관련 수정은 단일 사람이 마음대로 하면 안 된다.\n\n- maker/checker\n- threshold-based approval\n- finance ops signoff\n\n### 7. communication\n\n고객에게 무엇이 바뀌었는지 설명할 수 있어야 한다.\n\n- disputed amount\n- adjustment reason\n- effective period\n- next invoice impact\n\n## 실전 시나리오\n\n### 시나리오 1: 중복 청구\n\n문제:\n\n- 같은 usage가 두 번 들어갔다\n\n해결:\n\n- 원본 이벤트 대사\n- credit memo 발행\n- 다음 청구 반영\n\n### 시나리오 2: 계약 조건 불일치\n\n문제:\n\n- 영업 계약과 실제 청구가 다르다\n\n해결:\n\n- contract override 확인\n- price book 재평가\n- 승인 후 correction\n\n### 시나리오 3: 장애 보상\n\n문제:\n\n- 다운타임 보상 크레딧을 지급해야 한다\n\n해결:\n\n- SLA 기준 계산\n- 승인 workflow\n- invoice offset\n\n## 코드로 보기\n\n```pseudo\nfunction openDispute(invoiceId, reason):\n  case = createCase(invoiceId, reason)\n  evidence = collectEvidence(invoiceId)\n  queue.publish(case, evidence)\n\nfunction applyCredit(caseId):\n  memo = createCreditMemo(caseId)\n  ledger.post(memo)\n```\n\n```java\npublic DisputeCase create(InvoiceId invoiceId, String reason) {\n    return disputeRepository.open(invoiceId, reason);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| manual CS handling | 단순하다 | 추적이 어렵다 | 소규모 |\n| workflow-based dispute | 추적이 쉽다 | 운영 절차가 늘어난다 | SaaS billing |\n| auto credit small amounts | 빠르다 | 오탐 위험 | 저액 분쟁 |\n| maker-checker approval | 안전하다 | 지연이 생긴다 | 고액 조정 |\n| ledger correction only | 감사가 쉽다 | UX가 복잡할 수 있다 | 재무 시스템 |\n\n핵심은 billing dispute가 단순 환불 요청이 아니라 **청구, 증거, 승인, 원장 수정을 잇는 운영 워크플로우**라는 점이다.\n\n## 꼬리질문\n\n> Q: dispute와 refund는 어떻게 다른가요?\n> 의도: 청구 보정과 환불 구분 확인\n> 핵심: dispute는 청구 오류를 다루고, refund는 결제 금액을 되돌린다.\n\n> Q: 왜 evidence가 필요한가요?\n> 의도: 재무 운영의 설명 가능성 이해 확인\n> 핵심: 어떤 청구가 왜 틀렸는지 증명해야 하기 때문이다.\n\n> Q: credit memo는 왜 원장에 남기나요?\n> 의도: 회계 추적성 이해 확인\n> 핵심: 수정도 거래로 남겨야 나중에 대사할 수 있다.\n\n> Q: maker/checker가 왜 필요한가요?\n> 의도: 승인 분리 이해 확인\n> 핵심: 금전 수정은 단일 담당자 실수로부터 보호해야 한다.\n\n## 한 줄 정리\n\nTenant billing dispute workflow는 청구 분쟁을 증거 수집, 승인, 원장 정정으로 풀어내는 재무 운영 시스템이다.\n\n",
+  "body_markdown": "# Tenant Billing Dispute Workflow 설계\n\n> 한 줄 요약: tenant billing dispute workflow는 청구 오류, 과금 이의 제기, 크레딧 조정, 조사 승인 절차를 체계화하는 재무 운영 워크플로우다.\n\nretrieval-anchor-keywords: billing dispute, invoice challenge, credit adjustment, tenant billing, chargeback, case review, dispute workflow, prorated correction, approval, billing operations\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Billing / Usage Metering System 설계](./billing-usage-metering-system-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Fraud Case Management Workflow 설계](./fraud-case-management-workflow-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n\n## 핵심 개념\n\nbilling dispute는 단순 CS 티켓이 아니다.  \n실전에서는 아래를 함께 관리해야 한다.\n\n- invoice challenge\n- usage verification\n- credit memo\n- proration correction\n- approval workflow\n- customer communication\n\n즉, dispute workflow는 청구와 정산을 되돌리거나 보정하는 재무 운영 시스템이다.\n\n## 깊이 들어가기\n\n### 1. dispute 유형\n\n대표적으로 다음이 있다.\n\n- 잘못된 사용량\n- 중복 청구\n- 계약 조건 불일치\n- 세금/할인 계산 오류\n- 서비스 장애 보상\n\n분류가 먼저 되어야 올바른 팀과 절차로 간다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 월 10만 invoices\n- dispute rate 0.5%\n- 월 500건 케이스\n\n숫자는 적어 보여도, 한 건당 영향 금액이 커서 워크플로우가 엄격해야 한다.\n\n봐야 할 숫자:\n\n- dispute intake rate\n- resolution SLA\n- credit issuance latency\n- reopen rate\n- approval queue depth\n\n### 3. workflow stages\n\n```text\nOPEN -> TRIAGED -> INVESTIGATING -> PROPOSED -> APPROVED -> APPLIED -> CLOSED\n```\n\n각 단계마다 증거와 승인이 필요하다.\n\n### 4. evidence and lineage\n\n이의 제기를 처리하려면 근거가 있어야 한다.\n\n- 원본 usage event\n- invoice snapshot\n- 계약/플랜 버전\n- 담당자 메모\n- audit log\n\n이 부분은 [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)와 [Billing / Usage Metering System 설계](./billing-usage-metering-system-design.md)와 연결된다.\n\n### 5. credit memo와 correction\n\n단순히 금액을 수정하면 안 된다.\n\n- credit memo\n- adjustment entry\n- next invoice offset\n- refund if needed\n\n정정은 원장에 남겨야 한다.\n\n### 6. approval and segregation\n\n재무 관련 수정은 단일 사람이 마음대로 하면 안 된다.\n\n- maker/checker\n- threshold-based approval\n- finance ops signoff\n\n### 7. communication\n\n고객에게 무엇이 바뀌었는지 설명할 수 있어야 한다.\n\n- disputed amount\n- adjustment reason\n- effective period\n- next invoice impact\n\n## 실전 시나리오\n\n### 시나리오 1: 중복 청구\n\n문제:\n\n- 같은 usage가 두 번 들어갔다\n\n해결:\n\n- 원본 이벤트 대사\n- credit memo 발행\n- 다음 청구 반영\n\n### 시나리오 2: 계약 조건 불일치\n\n문제:\n\n- 영업 계약과 실제 청구가 다르다\n\n해결:\n\n- contract override 확인\n- price book 재평가\n- 승인 후 correction\n\n### 시나리오 3: 장애 보상\n\n문제:\n\n- 다운타임 보상 크레딧을 지급해야 한다\n\n해결:\n\n- SLA 기준 계산\n- 승인 workflow\n- invoice offset\n\n## 코드로 보기\n\n```pseudo\nfunction openDispute(invoiceId, reason):\n  case = createCase(invoiceId, reason)\n  evidence = collectEvidence(invoiceId)\n  queue.publish(case, evidence)\n\nfunction applyCredit(caseId):\n  memo = createCreditMemo(caseId)\n  ledger.post(memo)\n```\n\n```java\npublic DisputeCase create(InvoiceId invoiceId, String reason) {\n    return disputeRepository.open(invoiceId, reason);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| manual CS handling | 단순하다 | 추적이 어렵다 | 소규모 |\n| workflow-based dispute | 추적이 쉽다 | 운영 절차가 늘어난다 | SaaS billing |\n| auto credit small amounts | 빠르다 | 오탐 위험 | 저액 분쟁 |\n| maker-checker approval | 안전하다 | 지연이 생긴다 | 고액 조정 |\n| ledger correction only | 감사가 쉽다 | UX가 복잡할 수 있다 | 재무 시스템 |\n\n핵심은 billing dispute가 단순 환불 요청이 아니라 **청구, 증거, 승인, 원장 수정을 잇는 운영 워크플로우**라는 점이다.\n\n## 꼬리질문\n\n> Q: dispute와 refund는 어떻게 다른가요?\n> 의도: 청구 보정과 환불 구분 확인\n> 핵심: dispute는 청구 오류를 다루고, refund는 결제 금액을 되돌린다.\n\n> Q: 왜 evidence가 필요한가요?\n> 의도: 재무 운영의 설명 가능성 이해 확인\n> 핵심: 어떤 청구가 왜 틀렸는지 증명해야 하기 때문이다.\n\n> Q: credit memo는 왜 원장에 남기나요?\n> 의도: 회계 추적성 이해 확인\n> 핵심: 수정도 거래로 남겨야 나중에 대사할 수 있다.\n\n> Q: maker/checker가 왜 필요한가요?\n> 의도: 승인 분리 이해 확인\n> 핵심: 금전 수정은 단일 담당자 실수로부터 보호해야 한다.\n\n## 검색/운영 표면 보강\n\ntenant billing dispute는 환불 API 하나의 문제가 아니라 invoice snapshot, usage lineage, approval, credit memo, ledger posting이 이어지는 운영 워크플로우다. \"고객이 사용량이 틀렸다고 한다\", \"계약 할인과 invoice가 다르다\", \"장애 보상 크레딧을 어디에 반영하나\" 같은 질의는 케이스 상태와 회계 반영 시점을 분리해서 답해야 한다.\n\n운영 지표는 dispute intake부터 ledger 반영까지 이어서 본다.\n\n- `dispute_intake_total`: 유형별 이의 제기 유입 수\n- `evidence_collection_lag_ms`: usage event, invoice snapshot, contract version 수집 지연\n- `approval_queue_depth`: 금액/권한별 승인 대기량\n- `credit_memo_post_lag_ms`: 승인 후 credit memo가 ledger에 반영되기까지의 시간\n- `dispute_reopen_rate`: 닫힌 케이스가 다시 열린 비율\n- `invoice_adjustment_mismatch_total`: invoice, credit memo, ledger projection 불일치 수\n\n품질 기준은 고객에게 빨리 답하는 것만이 아니다. 저액 자동 credit은 SLA에는 좋지만 오탐과 회계 왜곡 위험이 있고, maker/checker 승인은 안전하지만 resolution SLA를 늘린다. 따라서 답변에서는 case state machine과 ledger correction을 분리하고, 어떤 금액 이상에서 승인 단계를 추가하는지, 어떤 증거가 없으면 적용 단계로 못 넘어가는지를 말해야 한다. 그래야 billing dispute가 CS 티켓이 아니라 감사 가능한 재무 운영 시스템으로 보인다.\n\n## 상태 전이와 불변 조건\n\ndispute workflow는 상태 이름보다 불변 조건이 중요하다. `OPEN` 상태에서는 고객 주장과 대상 invoice가 고정되어야 하고, `INVESTIGATING`에서는 usage event, price book, contract version, invoice snapshot을 추적 가능한 evidence로 묶어야 한다. `PROPOSED` 이후에는 금액, 사유, 적용 기간, 세금 영향이 바뀌면 다시 승인으로 돌아가야 한다. `APPLIED`에서는 credit memo나 adjustment entry가 ledger에 남아야 하며, 기존 invoice row를 조용히 덮어쓰면 안 된다.\n\n권한도 workflow에 포함된다. 고객 응대 담당자는 케이스를 열고 증거를 모을 수 있지만 고액 credit을 적용할 수는 없다. finance approver는 금액과 회계 영향을 승인하고, system job은 승인된 adjustment만 ledger에 post한다. 이 maker/checker 분리가 없으면 실수나 내부 오남용을 나중에 설명하기 어렵다.\n\n실패 처리도 상태 머신으로 본다. evidence 수집이 실패하면 케이스는 닫히지 않고 `NEEDS_EVIDENCE`나 `BLOCKED`로 남아야 한다. credit memo post가 실패하면 고객에게 완료로 말하기 전에 재시도나 reconciliation으로 수렴해야 한다. 이미 적용된 credit을 취소해야 하면 기존 row 삭제가 아니라 reversal entry와 재승인 기록을 남겨야 한다. 이 불변 조건이 있어야 dispute reopen이나 감사 요청이 와도 어떤 판단으로 청구를 바꿨는지 재구성할 수 있다.\n\n## 한 줄 정리\n\nTenant billing dispute workflow는 청구 분쟁을 증거 수집, 승인, 원장 정정으로 풀어내는 재무 운영 시스템이다.\n\n",
   "aliases": [
     "billing dispute",
     "invoice challenge",
     "credit adjustment",
     "tenant billing",
-    "chargeback",
-    "case review",
     "dispute workflow",
-    "prorated correction",
-    "approval",
     "billing operations",
-    "Tenant Billing Dispute Workflow 설계",
-    "tenant billing dispute workflow design"
+    "청구 이의 처리",
+    "고객 과금 분쟁",
+    "청구 오류 조사",
+    "크레딧 조정 승인",
+    "인보이스 정정 워크플로우",
+    "테넌트 청구 분쟁"
   ],
   "expected_queries": [
-    "고객이 청구 금액에 이의를 제기했을 때 조사, 승인, credit adjustment를 어떤 workflow로 관리해?",
-    "invoice challenge와 chargeback을 같은 상태 머신으로 보면 어떤 재무 운영 문제가 생겨?",
-    "tenant billing dispute에서 승인 기록과 prorated correction을 남겨야 하는 이유가 뭐야?",
-    "과금 오류를 수정할 때 case review와 회계 반영 시점을 어떻게 분리해?"
+    "고객이 청구 금액에 이의를 제기했을 때 조사와 credit memo 발행을 어떤 workflow로 묶어?",
+    "tenant billing dispute에서 invoice snapshot과 usage evidence를 같이 보관해야 하는 이유가 뭐야?",
+    "과금 오류를 수정할 때 case approval과 ledger 반영 시점을 어떻게 분리해?",
+    "장애 보상 크레딧을 줄 때 자동 credit과 maker checker 승인을 나누는 기준은 뭐야?",
+    "계약 할인 조건이 invoice와 다를 때 dispute workflow에서 어떤 증거를 먼저 확인해?"
   ],
   "symptoms": [
     "`Tenant Billing Dispute Workflow 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +34,30 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/billing-usage-metering-system-design",
+      "system-design/payment-system-ledger-idempotency-reconciliation-design"
     ],
     "next_docs": [
-      "system-design/tenant-partition-strategy-reassignment-design"
+      "system-design/workflow-orchestration-saga-design",
+      "system-design/audit-log-pipeline-design"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/payment-system-ledger-idempotency-reconciliation-design",
+      "system-design/fraud-case-management-workflow-design"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/tenant-billing-dispute-workflow-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

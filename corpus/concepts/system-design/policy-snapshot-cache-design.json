@@ -4,26 +4,27 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Policy Snapshot Cache 설계를 다루는 deep_dive 문서다. policy snapshot cache는 flag, config, quota, authz, session 같은 정책 데이터를 버전화해 빠르게 읽고 안전하게 갱신하는 캐시 계층이다. 검색 질의가 policy snapshot, config cache, authz cache, quota cache처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Policy Snapshot Cache 설계\n\n> 한 줄 요약: policy snapshot cache는 flag, config, quota, authz, session 같은 정책 데이터를 버전화해 빠르게 읽고 안전하게 갱신하는 캐시 계층이다.\n\nretrieval-anchor-keywords: policy snapshot, config cache, authz cache, quota cache, session cache, versioned snapshot, stale policy, fallback, checksum, invalidation\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Edge Authorization Service 설계](./edge-authorization-service-design.md)\n> - [Rate Limit Config Service 설계](./rate-limit-config-service-design.md)\n> - [Session Store Design at Scale](./session-store-design-at-scale.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n\n## 핵심 개념\n\n정책 데이터는 자주 읽히고, 아주 중요하고, 자주 바뀌지 않는다.  \n그래서 snapshot cache와 궁합이 좋다.\n\n- feature flag snapshot\n- config snapshot\n- authz policy snapshot\n- quota snapshot\n- session version snapshot\n\n즉, policy snapshot cache는 제어 평면을 데이터 평면에서 빠르게 읽기 위한 저장 계층이다.\n\n## 깊이 들어가기\n\n### 1. 왜 snapshot이어야 하나\n\n정책 데이터는 원본 저장소를 매 요청마다 때리면 느리다.\n\n- flag eval\n- authz check\n- quota lookup\n- session validation\n\nsnapshot은 versioned copy를 읽게 해 속도를 확보한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 수십만 policy read\n- 수백 개 버전 동시 유지\n- refresh는 분당/초당 단위\n\n쓰기보다 읽기가 훨씬 많다.  \n그래서 cache hit ratio와 refresh latency가 핵심이다.\n\n봐야 할 숫자:\n\n- policy read QPS\n- snapshot refresh latency\n- stale window\n- version adoption rate\n- fallback hit rate\n\n### 3. snapshot lifecycle\n\n```text\nSource of Truth\n  -> Build Snapshot\n  -> Validate / Checksum\n  -> Publish Version\n  -> Data Plane Refresh\n  -> Fallback to Last Known Good\n```\n\n### 4. stale policy management\n\n정책은 stale해지면 위험하다.\n\n- revoke가 늦어짐\n- quota가 늦게 반영됨\n- 잘못된 flag가 유지됨\n\n그래서 critical path는 짧은 TTL 또는 synchronous verify가 필요하다.\n\n### 5. checksum and integrity\n\n스냅샷은 무결성이 중요하다.\n\n- checksum\n- version id\n- publish timestamp\n- source revision\n\n이 부분은 [Config Distribution System 설계](./config-distribution-system-design.md)와 [Secrets Distribution System 설계](./secrets-distribution-system-design.md)와 연결된다.\n\n### 6. invalidation strategy\n\n모든 스냅샷을 즉시 삭제하는 건 위험하다.\n\n- graceful rollover\n- old/new overlap\n- emergency revoke\n- pinning by critical action\n\n### 7. multi-tenant and multi-region\n\n스냅샷은 tenant와 region 경계를 따라야 한다.\n\n- tenant-specific quota\n- region-specific policy\n- global default\n- local override\n\n이 부분은 [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md), [Multi-Region Active-Active 설계](./multi-region-active-active-design.md), [Tenant-aware Search Architecture 설계](./tenant-aware-search-architecture-design.md)와 잘 맞는다.\n\n## 실전 시나리오\n\n### 시나리오 1: 권한 회수\n\n문제:\n\n- role을 바꿨는데 일부 노드가 옛 권한을 본다\n\n해결:\n\n- versioned snapshot\n- short TTL for critical authz\n- fallback to sync verify\n\n### 시나리오 2: rate limit 정책 변경\n\n문제:\n\n- 특정 endpoint 제한을 즉시 바꿔야 한다\n\n해결:\n\n- 정책 snapshot publish\n- edge refresh\n\n### 시나리오 3: feature flag rollback\n\n문제:\n\n- 잘못된 롤아웃을 빨리 되돌려야 한다\n\n해결:\n\n- last-known-good snapshot\n- version pinning\n\n## 코드로 보기\n\n```pseudo\nfunction readPolicy(ctx):\n  snapshot = cache.get(ctx.tenant, ctx.kind)\n  if snapshot == null:\n    snapshot = loadLastKnownGood(ctx)\n  if snapshot.version < ctx.requiredVersion:\n    refresh()\n  return snapshot\n```\n\n```java\npublic PolicySnapshot current(PolicyKey key) {\n    return snapshotCache.getOrFallback(key);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Live read from source | 최신성 좋다 | 느리다 | 낮은 QPS |\n| Versioned snapshot cache | 빠르고 안정적이다 | stale window 존재 | 대부분의 정책 읽기 |\n| Synchronous introspection | revoke가 빠르다 | auth server 의존 | 민감 경로 |\n| Per-tenant snapshot | 격리가 좋다 | 버전 관리가 늘어난다 | SaaS |\n| Last-known-good fallback | 장애에 강하다 | 오래된 정책 위험 | control plane 장애 |\n\n핵심은 policy snapshot cache가 단순 캐시가 아니라 **제어 평면 정책을 빠르게 읽기 위한 안전한 버전화 계층**이라는 점이다.\n\n## 꼬리질문\n\n> Q: snapshot cache와 일반 cache는 무엇이 다른가요?\n> 의도: 정책 스냅샷의 버전성과 안전성을 이해하는지 확인\n> 핵심: snapshot은 versioned policy를 안전하게 읽는 데 초점이 있다.\n\n> Q: stale policy를 왜 위험하게 보나요?\n> 의도: 권한/quota/flag의 최신성 중요성을 아는지 확인\n> 핵심: revoke나 quota 변경이 늦게 반영되면 사고가 난다.\n\n> Q: fallback은 어떻게 정하나요?\n> 의도: 장애 시 fail-open/fail-close 판단 이해 확인\n> 핵심: 민감 경로는 fail-close, 비핵심 경로는 degraded mode를 쓴다.\n\n> Q: 체크섬은 왜 필요한가요?\n> 의도: 배포 무결성 이해 확인\n> 핵심: 정책 파일이 손상되거나 잘못 배포되는 것을 막는다.\n\n## 한 줄 정리\n\nPolicy snapshot cache는 flag, config, quota, authz 같은 정책 데이터를 버전화해 빠르게 읽고, 장애 시에도 마지막으로 안전한 상태를 유지하게 한다.\n\n",
+  "body_markdown": "# Policy Snapshot Cache 설계\n\n> 한 줄 요약: policy snapshot cache는 flag, config, quota, authz, session 같은 정책 데이터를 버전화해 빠르게 읽고 안전하게 갱신하는 캐시 계층이다.\n\nretrieval-anchor-keywords: policy snapshot, config cache, authz cache, quota cache, session cache, versioned snapshot, stale policy, fallback, checksum, invalidation\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Edge Authorization Service 설계](./edge-authorization-service-design.md)\n> - [Rate Limit Config Service 설계](./rate-limit-config-service-design.md)\n> - [Session Store Design at Scale](./session-store-design-at-scale.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n\n## 핵심 개념\n\n정책 데이터는 자주 읽히고, 아주 중요하고, 자주 바뀌지 않는다.  \n그래서 snapshot cache와 궁합이 좋다.\n\n- feature flag snapshot\n- config snapshot\n- authz policy snapshot\n- quota snapshot\n- session version snapshot\n\n즉, policy snapshot cache는 제어 평면을 데이터 평면에서 빠르게 읽기 위한 저장 계층이다.\n\n## 깊이 들어가기\n\n### 1. 왜 snapshot이어야 하나\n\n정책 데이터는 원본 저장소를 매 요청마다 때리면 느리다.\n\n- flag eval\n- authz check\n- quota lookup\n- session validation\n\nsnapshot은 versioned copy를 읽게 해 속도를 확보한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 수십만 policy read\n- 수백 개 버전 동시 유지\n- refresh는 분당/초당 단위\n\n쓰기보다 읽기가 훨씬 많다.  \n그래서 cache hit ratio와 refresh latency가 핵심이다.\n\n봐야 할 숫자:\n\n- policy read QPS\n- snapshot refresh latency\n- stale window\n- version adoption rate\n- fallback hit rate\n\n### 3. snapshot lifecycle\n\n```text\nSource of Truth\n  -> Build Snapshot\n  -> Validate / Checksum\n  -> Publish Version\n  -> Data Plane Refresh\n  -> Fallback to Last Known Good\n```\n\n### 4. stale policy management\n\n정책은 stale해지면 위험하다.\n\n- revoke가 늦어짐\n- quota가 늦게 반영됨\n- 잘못된 flag가 유지됨\n\n그래서 critical path는 짧은 TTL 또는 synchronous verify가 필요하다.\n\n### 5. checksum and integrity\n\n스냅샷은 무결성이 중요하다.\n\n- checksum\n- version id\n- publish timestamp\n- source revision\n\n이 부분은 [Config Distribution System 설계](./config-distribution-system-design.md)와 [Secrets Distribution System 설계](./secrets-distribution-system-design.md)와 연결된다.\n\n### 6. invalidation strategy\n\n모든 스냅샷을 즉시 삭제하는 건 위험하다.\n\n- graceful rollover\n- old/new overlap\n- emergency revoke\n- pinning by critical action\n\n### 7. multi-tenant and multi-region\n\n스냅샷은 tenant와 region 경계를 따라야 한다.\n\n- tenant-specific quota\n- region-specific policy\n- global default\n- local override\n\n이 부분은 [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md), [Multi-Region Active-Active 설계](./multi-region-active-active-design.md), [Tenant-aware Search Architecture 설계](./tenant-aware-search-architecture-design.md)와 잘 맞는다.\n\n## 실전 시나리오\n\n### 시나리오 1: 권한 회수\n\n문제:\n\n- role을 바꿨는데 일부 노드가 옛 권한을 본다\n\n해결:\n\n- versioned snapshot\n- short TTL for critical authz\n- fallback to sync verify\n\n### 시나리오 2: rate limit 정책 변경\n\n문제:\n\n- 특정 endpoint 제한을 즉시 바꿔야 한다\n\n해결:\n\n- 정책 snapshot publish\n- edge refresh\n\n### 시나리오 3: feature flag rollback\n\n문제:\n\n- 잘못된 롤아웃을 빨리 되돌려야 한다\n\n해결:\n\n- last-known-good snapshot\n- version pinning\n\n## 코드로 보기\n\n```pseudo\nfunction readPolicy(ctx):\n  snapshot = cache.get(ctx.tenant, ctx.kind)\n  if snapshot == null:\n    snapshot = loadLastKnownGood(ctx)\n  if snapshot.version < ctx.requiredVersion:\n    refresh()\n  return snapshot\n```\n\n```java\npublic PolicySnapshot current(PolicyKey key) {\n    return snapshotCache.getOrFallback(key);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Live read from source | 최신성 좋다 | 느리다 | 낮은 QPS |\n| Versioned snapshot cache | 빠르고 안정적이다 | stale window 존재 | 대부분의 정책 읽기 |\n| Synchronous introspection | revoke가 빠르다 | auth server 의존 | 민감 경로 |\n| Per-tenant snapshot | 격리가 좋다 | 버전 관리가 늘어난다 | SaaS |\n| Last-known-good fallback | 장애에 강하다 | 오래된 정책 위험 | control plane 장애 |\n\n핵심은 policy snapshot cache가 단순 캐시가 아니라 **제어 평면 정책을 빠르게 읽기 위한 안전한 버전화 계층**이라는 점이다.\n\n## 꼬리질문\n\n> Q: snapshot cache와 일반 cache는 무엇이 다른가요?\n> 의도: 정책 스냅샷의 버전성과 안전성을 이해하는지 확인\n> 핵심: snapshot은 versioned policy를 안전하게 읽는 데 초점이 있다.\n\n> Q: stale policy를 왜 위험하게 보나요?\n> 의도: 권한/quota/flag의 최신성 중요성을 아는지 확인\n> 핵심: revoke나 quota 변경이 늦게 반영되면 사고가 난다.\n\n> Q: fallback은 어떻게 정하나요?\n> 의도: 장애 시 fail-open/fail-close 판단 이해 확인\n> 핵심: 민감 경로는 fail-close, 비핵심 경로는 degraded mode를 쓴다.\n\n> Q: 체크섬은 왜 필요한가요?\n> 의도: 배포 무결성 이해 확인\n> 핵심: 정책 파일이 손상되거나 잘못 배포되는 것을 막는다.\n\n## 운영 검증\n\nPolicy snapshot cache는 hit ratio만 높으면 좋은 캐시가 아니다. 최신성이 늦게 반영되면 사용자는 잘못된 권한, quota, feature flag를 보게 된다. 그래서 cache metric과 policy version metric을 같이 봐야 한다.\n\n| 신호 | 확인할 것 | 위험한 해석 |\n|---|---|---|\n| version adoption rate | 새 snapshot이 node/region에 퍼졌는지 본다 | publish 성공만 보고 완료로 판단 |\n| stale decision count | required version보다 낮은 snapshot 사용을 추적한다 | TTL 안이면 모두 허용 |\n| last-known-good age | fallback 정책이 얼마나 오래됐는지 본다 | fallback이 있으니 항상 안전하다고 봄 |\n| checksum mismatch | 손상 또는 partial publish를 찾는다 | cache miss와 같은 오류로 처리 |\n| sync verify rate | 민감 경로가 source로 우회한 비율을 본다 | hit ratio 하락만 문제로 봄 |\n\n민감한 authz/revoke 경로는 stale window를 더 짧게 잡거나, snapshot decision 뒤 source introspection을 붙일 수 있다. 반대로 feature flag나 비핵심 config는 last-known-good으로 degraded mode를 유지하는 편이 더 안전할 수 있다.\n\n## 잘못 고르기 쉬운 이웃 개념\n\n일반 distributed cache는 값 재사용을 통한 latency 감소가 주목적이다. Policy snapshot cache는 latency도 중요하지만, 버전, 배포 시각, checksum, fallback 기준까지 함께 저장해야 한다. 즉 payload만 빠르게 읽는 구조라면 정책 캐시라고 부르기 어렵다.\n\nConfig distribution system은 snapshot을 만들고 배포하는 control plane에 가깝다. Policy snapshot cache는 data plane이 그 snapshot을 읽고 판단하는 계층이다. publish가 성공해도 각 region의 cache가 같은 version을 보는지 확인하지 않으면 실제 정책 적용 완료를 말할 수 없다.\n\n\n## 한 줄 정리\n\nPolicy snapshot cache는 flag, config, quota, authz 같은 정책 데이터를 버전화해 빠르게 읽고, 장애 시에도 마지막으로 안전한 상태를 유지하게 한다.\n\n",
   "aliases": [
-    "policy snapshot",
-    "config cache",
-    "authz cache",
-    "quota cache",
-    "session cache",
-    "versioned snapshot",
-    "stale policy",
-    "fallback",
-    "checksum",
-    "invalidation",
-    "Policy Snapshot Cache 설계",
-    "policy snapshot cache design"
+    "policy snapshot cache",
+    "versioned policy cache",
+    "authz snapshot refresh",
+    "quota snapshot refresh",
+    "last known good policy",
+    "policy checksum rollout",
+    "정책 스냅샷 캐시",
+    "권한 정책 캐시",
+    "quota snapshot 캐시",
+    "stale policy 방지",
+    "마지막 정상 정책",
+    "정책 버전 전파"
   ],
   "expected_queries": [
     "flag, quota, authz 정책을 매 요청 DB 조회하지 않고 versioned snapshot cache로 읽는 이유가 뭐야?",
     "policy snapshot이 stale하면 권한이나 quota 판단이 틀릴 수 있는데 TTL만으로 충분하지 않은 이유는?",
     "정책 cache를 갱신할 때 version, checksum, fallback을 같이 저장해야 하는 이유가 뭐야?",
-    "config cache와 authz cache를 묶어 policy snapshot cache라고 부를 때 핵심 책임은 뭐야?"
+    "config cache와 authz cache를 묶어 policy snapshot cache라고 부를 때 핵심 책임은 뭐야?",
+    "권한 회수나 quota 변경을 빠르게 반영해야 할 때 snapshot cache와 synchronous verify를 어떻게 나눠?"
   ],
   "symptoms": [
     "`Policy Snapshot Cache 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -36,17 +37,24 @@
       "system-design/cache-basics-primer"
     ],
     "next_docs": [
-      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser"
+      "system-design/local-vs-distributed-cache-l1-l2-primer"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/config-distribution-system-design"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/policy-snapshot-cache-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

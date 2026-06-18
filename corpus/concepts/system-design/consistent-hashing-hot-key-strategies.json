@@ -4,26 +4,28 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Consistent Hashing / Hot Key 전략를 다루는 deep_dive 문서다. consistent hashing은 key 이동을 줄이는 분산 배치 기법이고, hot key 전략은 그 배치가 깨질 때를 버티는 운영 설계다. 검색 질의가 consistent hashing, hot key, virtual node, ring처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Consistent Hashing / Hot Key 전략\n\n> 한 줄 요약: consistent hashing은 key 이동을 줄이는 분산 배치 기법이고, hot key 전략은 그 배치가 깨질 때를 버티는 운영 설계다.\n\nretrieval-anchor-keywords: consistent hashing, hot key, virtual node, ring, rebalancing, shard split, cache hotspot, partition movement, key remap, hot shard\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [분산 캐시 설계](./distributed-cache-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Shard Rebalancing / Partition Relocation 설계](./shard-rebalancing-partition-relocation-design.md)\n> - [MVCC, Replication, Sharding](../database/mvcc-replication-sharding.md)\n> - [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)\n\n---\n\n## 핵심 개념\n\nconsistent hashing은 노드 수가 바뀌어도 key 재배치를 최소화하기 위해 쓰는 기법이다.  \nhot key 전략은 특정 key에 트래픽이 몰릴 때 한 노드가 죽지 않게 하는 운영 기법이다.\n\n두 개는 따로가 아니다.\n\n- consistent hashing은 평균적인 분산을 돕는다.\n- hot key 전략은 분산이 깨지는 예외 상황을 다룬다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 왜 필요한가\n\n단순 modulo 분배는 노드가 바뀌면 대부분의 key가 재배치된다.\n\n```text\nnode = hash(key) % N\n```\n\nN이 바뀌면 캐시 미스가 폭발하고, DB로 쏠리고, 서비스가 흔들린다.  \nconsistent hashing은 이 이동 범위를 줄이기 위해 ring 구조를 쓴다.\n\n### 2. 가상 노드\n\n실제 노드 수가 적으면 분포가 불균형해진다.  \n가상 노드는 이 문제를 줄인다.\n\n장점:\n\n- 분포가 더 고르게 된다\n- 노드 추가/삭제의 영향이 줄어든다\n\n단점:\n\n- 관리 포인트가 늘어난다\n- 해시 계산과 metadata가 복잡해진다\n\n### 3. hot key가 생기는 이유\n\nhot key는 보통 다음 원인으로 생긴다.\n\n- 특정 게시물/상품이 바이럴됨\n- 하나의 세션/토큰에 트래픽 집중\n- 캐시 키 설계가 지나치게 단순함\n- 배치 작업이 한 key만 자주 만짐\n\nhot key는 성능 문제이면서 장애 문제다.  \n한 노드에 CPU, 메모리, 네트워크가 같이 몰린다.\n\n### 4. 대응 전략\n\n대표 전략:\n\n- key splitting\n- local cache 추가\n- request coalescing\n- TTL jitter\n- read replica 분산\n- pre-warming\n- rate limit\n\n예를 들어 특정 게시물 조회가 많으면:\n\n```text\npost:123 -> post:123:meta\npost:123:view_count -> sharded counter\n```\n\n### 5. consistent hashing의 한계\n\n좋은 분배는 평균에 강하다.  \n하지만 hot key는 평균을 무시한다.\n\n즉, consistent hashing만 믿으면 안 된다.\n\n- key 하나가 뜨거우면 ring 상 한 노드에 계속 몰린다.\n- virtual node를 늘려도 한 key의 집중은 못 막는다.\n- 결국 key 자체를 쪼개거나 읽기 경로를 분리해야 한다.\n\n### 6. 운영 메트릭\n\n다음 지표를 봐야 한다.\n\n- per-key QPS\n- node별 CPU\n- cache hit ratio\n- eviction rate\n- key cardinality\n- rebalancing time\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 단일 인기 게시물\n\n한 게시물이 SNS에 퍼지면 조회가 한 key로 몰린다.\n\n대응:\n\n- local cache\n- CDN/edge cache\n- hot key 분리\n- 읽기용 복제본\n\n### 시나리오 2: 세션 키 폭주\n\n특정 login flow나 이벤트로 세션 키가 몰리면 하나의 shard가 터진다.\n\n대응:\n\n- key prefix 분산\n- shard key 재설계\n- rate limit\n\n### 시나리오 3: 노드 증설\n\n노드를 추가할 때 리밸런싱이 일어나면 DB가 흔들릴 수 있다.\n\n대응:\n\n- 점진적 rebalancing\n- warm-up\n- read throttle\n\n실제로 상태를 많이 가진 shard라면 hash ring 변경만으로 끝나지 않고, snapshot copy와 ownership handoff까지 포함한 relocation 절차가 필요하다.\n\n---\n\n## 코드로 보기\n\n```pseudo\nfunction getNode(key):\n    h = hash(key)\n    vnode = ring.ceiling(h)\n    if vnode == null:\n        vnode = ring.first()\n    return vnode.node\n```\n\n```java\npublic Node locate(String key) {\n    long hash = hashFunction.hash(key);\n    Map.Entry<Long, Node> entry = ring.ceilingEntry(hash);\n    if (entry == null) {\n        entry = ring.firstEntry();\n    }\n    return entry.getValue();\n}\n```\n\n### hot key 분할 예시\n\n```java\npublic String shardHotKey(String key, int bucketCount) {\n    int bucket = Math.abs(key.hashCode()) % bucketCount;\n    return key + \":\" + bucket;\n}\n```\n\n이 방식은 조회 시 재조합 비용이 생기므로, 읽기 패턴에 맞게만 써야 한다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|-------------|\n| modulo 분배 | 단순하다 | 노드 변경에 약하다 | 매우 작은 시스템 |\n| consistent hashing | key 이동이 적다 | hot key는 못 막는다 | 일반적인 분산 캐시 |\n| virtual node 증가 | 분포가 좋아진다 | 운영 복잡도 증가 | 노드 수가 적을 때 |\n| key splitting | hot key 완화 | 조회/정합성 복잡도 증가 | 특정 key 집중이 심할 때 |\n\n## 꼬리질문\n\n> Q: consistent hashing만 쓰면 hot key 문제도 해결되나요?\n> 의도: 평균 분산과 최악 상황을 구분하는지 확인\n> 핵심: 아니다. hot key는 별도 대응이 필요하다\n\n> Q: key를 쪼개면 왜 항상 좋은 것이 아니죠?\n> 의도: 설계 복잡도와 조회 비용을 보는지 확인\n> 핵심: 읽기 시 재조합과 정합성 비용이 생긴다\n\n## 한 줄 정리\n\nconsistent hashing은 배치 문제를, hot key 전략은 배치가 깨질 때의 운영 문제를 푼다.\n",
+  "body_markdown": "# Consistent Hashing / Hot Key 전략\n\n> 한 줄 요약: consistent hashing은 key 이동을 줄이는 분산 배치 기법이고, hot key 전략은 그 배치가 깨질 때를 버티는 운영 설계다.\n\nretrieval-anchor-keywords: consistent hashing, hot key, virtual node, ring, rebalancing, shard split, cache hotspot, partition movement, key remap, hot shard\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [분산 캐시 설계](./distributed-cache-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Shard Rebalancing / Partition Relocation 설계](./shard-rebalancing-partition-relocation-design.md)\n> - [MVCC, Replication, Sharding](../database/mvcc-replication-sharding.md)\n> - [B+Tree vs LSM-Tree](../database/bptree-vs-lsm-tree.md)\n\n---\n\n## 핵심 개념\n\nconsistent hashing은 노드 수가 바뀌어도 key 재배치를 최소화하기 위해 쓰는 기법이다.  \nhot key 전략은 특정 key에 트래픽이 몰릴 때 한 노드가 죽지 않게 하는 운영 기법이다.\n\n두 개는 따로가 아니다.\n\n- consistent hashing은 평균적인 분산을 돕는다.\n- hot key 전략은 분산이 깨지는 예외 상황을 다룬다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 왜 필요한가\n\n단순 modulo 분배는 노드가 바뀌면 대부분의 key가 재배치된다.\n\n```text\nnode = hash(key) % N\n```\n\nN이 바뀌면 캐시 미스가 폭발하고, DB로 쏠리고, 서비스가 흔들린다.  \nconsistent hashing은 이 이동 범위를 줄이기 위해 ring 구조를 쓴다.\n\n### 2. 가상 노드\n\n실제 노드 수가 적으면 분포가 불균형해진다.  \n가상 노드는 이 문제를 줄인다.\n\n장점:\n\n- 분포가 더 고르게 된다\n- 노드 추가/삭제의 영향이 줄어든다\n\n단점:\n\n- 관리 포인트가 늘어난다\n- 해시 계산과 metadata가 복잡해진다\n\n### 3. hot key가 생기는 이유\n\nhot key는 보통 다음 원인으로 생긴다.\n\n- 특정 게시물/상품이 바이럴됨\n- 하나의 세션/토큰에 트래픽 집중\n- 캐시 키 설계가 지나치게 단순함\n- 배치 작업이 한 key만 자주 만짐\n\nhot key는 성능 문제이면서 장애 문제다.  \n한 노드에 CPU, 메모리, 네트워크가 같이 몰린다.\n\n### 4. 대응 전략\n\n대표 전략:\n\n- key splitting\n- local cache 추가\n- request coalescing\n- TTL jitter\n- read replica 분산\n- pre-warming\n- rate limit\n\n예를 들어 특정 게시물 조회가 많으면:\n\n```text\npost:123 -> post:123:meta\npost:123:view_count -> sharded counter\n```\n\n### 5. consistent hashing의 한계\n\n좋은 분배는 평균에 강하다.  \n하지만 hot key는 평균을 무시한다.\n\n즉, consistent hashing만 믿으면 안 된다.\n\n- key 하나가 뜨거우면 ring 상 한 노드에 계속 몰린다.\n- virtual node를 늘려도 한 key의 집중은 못 막는다.\n- 결국 key 자체를 쪼개거나 읽기 경로를 분리해야 한다.\n\n### 6. 운영 메트릭\n\n다음 지표를 봐야 한다.\n\n- per-key QPS\n- node별 CPU\n- cache hit ratio\n- eviction rate\n- key cardinality\n- rebalancing time\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 단일 인기 게시물\n\n한 게시물이 SNS에 퍼지면 조회가 한 key로 몰린다.\n\n대응:\n\n- local cache\n- CDN/edge cache\n- hot key 분리\n- 읽기용 복제본\n\n### 시나리오 2: 세션 키 폭주\n\n특정 login flow나 이벤트로 세션 키가 몰리면 하나의 shard가 터진다.\n\n대응:\n\n- key prefix 분산\n- shard key 재설계\n- rate limit\n\n### 시나리오 3: 노드 증설\n\n노드를 추가할 때 리밸런싱이 일어나면 DB가 흔들릴 수 있다.\n\n대응:\n\n- 점진적 rebalancing\n- warm-up\n- read throttle\n\n실제로 상태를 많이 가진 shard라면 hash ring 변경만으로 끝나지 않고, snapshot copy와 ownership handoff까지 포함한 relocation 절차가 필요하다.\n\n---\n\n## 코드로 보기\n\n```pseudo\nfunction getNode(key):\n    h = hash(key)\n    vnode = ring.ceiling(h)\n    if vnode == null:\n        vnode = ring.first()\n    return vnode.node\n```\n\n```java\npublic Node locate(String key) {\n    long hash = hashFunction.hash(key);\n    Map.Entry<Long, Node> entry = ring.ceilingEntry(hash);\n    if (entry == null) {\n        entry = ring.firstEntry();\n    }\n    return entry.getValue();\n}\n```\n\n### hot key 분할 예시\n\n```java\npublic String shardHotKey(String key, int bucketCount) {\n    int bucket = Math.abs(key.hashCode()) % bucketCount;\n    return key + \":\" + bucket;\n}\n```\n\n이 방식은 조회 시 재조합 비용이 생기므로, 읽기 패턴에 맞게만 써야 한다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|-------------|\n| modulo 분배 | 단순하다 | 노드 변경에 약하다 | 매우 작은 시스템 |\n| consistent hashing | key 이동이 적다 | hot key는 못 막는다 | 일반적인 분산 캐시 |\n| virtual node 증가 | 분포가 좋아진다 | 운영 복잡도 증가 | 노드 수가 적을 때 |\n| key splitting | hot key 완화 | 조회/정합성 복잡도 증가 | 특정 key 집중이 심할 때 |\n\n## 꼬리질문\n\n> Q: consistent hashing만 쓰면 hot key 문제도 해결되나요?\n> 의도: 평균 분산과 최악 상황을 구분하는지 확인\n> 핵심: 아니다. hot key는 별도 대응이 필요하다\n\n> Q: key를 쪼개면 왜 항상 좋은 것이 아니죠?\n> 의도: 설계 복잡도와 조회 비용을 보는지 확인\n> 핵심: 읽기 시 재조합과 정합성 비용이 생긴다\n\n## 운영 표면 보강\n\nhot key 진단은 평균 분산률보다 꼬리 지표를 먼저 본다. ring 전체가 균등해 보여도 특정 key 하나가 per-key QPS, node CPU, network egress, eviction rate를 동시에 끌어올리면 consistent hashing의 문제가 아니라 key 집중 문제다. 이때 virtual node 수를 늘리는 것은 노드 간 평균 분포를 조금 부드럽게 만들 뿐, 같은 key가 한 owner로 가는 성질은 바꾸지 못한다.\n\n대응은 read path와 write path를 나눠 고른다. 읽기 hot key는 local cache, request coalescing, CDN/edge cache, pre-warming으로 완화할 수 있고, 쓰기 hot key는 sharded counter, logical split, rate limit, async aggregation처럼 key 의미를 바꾸는 선택이 필요하다. key splitting은 조회 시 fan-in과 정합성 비용을 만들기 때문에, \"나누면 끝\"이 아니라 재조합 latency와 stale read 허용 범위를 같이 답해야 한다.\n\n노드 증설 상황에서는 ring 변경량, moved key 비율, cache warmup progress, backend fallback QPS를 같이 관찰한다. 새 노드를 넣는 순간 miss storm이 생기면 DB나 origin이 먼저 흔들릴 수 있으므로 vnode 추가, traffic weight, prefill, read throttle을 단계적으로 조합한다.\n\n## 한 줄 정리\n\nconsistent hashing은 배치 문제를, hot key 전략은 배치가 깨질 때의 운영 문제를 푼다.\n",
   "aliases": [
     "consistent hashing",
-    "hot key",
-    "virtual node",
-    "ring",
-    "rebalancing",
-    "shard split",
-    "cache hotspot",
+    "hot key mitigation",
+    "virtual node ring",
+    "shard split strategy",
+    "cache hotspot handling",
     "partition movement",
     "key remap",
-    "hot shard",
-    "Consistent Hashing / Hot Key 전략",
-    "consistent hashing hot key strategies"
+    "hot shard diagnosis",
+    "일관 해싱",
+    "핫키 완화",
+    "가상 노드 링",
+    "캐시 hotspot 분산"
   ],
   "expected_queries": [
     "노드를 추가할 때 hash(key) % N 방식은 왜 캐시 미스를 크게 만들 수 있어?",
     "consistent hashing은 key 이동을 줄여도 hot key 문제를 왜 해결하지 못해?",
     "virtual node로 분산을 고르게 해도 인기 게시물 하나가 몰리면 어떻게 대응해?",
-    "hot key를 쪼개거나 local cache를 두면 읽기 정합성 비용이 생기는 이유가 뭐야?"
+    "hot key를 쪼개거나 local cache를 두면 읽기 정합성 비용이 생기는 이유가 뭐야?",
+    "per-key QPS와 node CPU가 같이 치솟을 때 hot shard인지 어떻게 진단해?",
+    "노드 증설 후 ring 변경과 cache warmup을 점진적으로 해야 하는 이유가 뭐야?"
   ],
   "symptoms": [
     "`Consistent Hashing / Hot Key 전략`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,13 +35,17 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/distributed-cache-design",
+      "system-design/database-scaling-primer"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/shard-rebalancing-partition-relocation-design",
+      "system-design/session-store-design-at-scale"
     ],
     "confusable_with": [
-      "system-design/shard-key-selection-basics"
+      "system-design/shard-rebalancing-partition-relocation-design",
+      "system-design/cache-stampede-interview-router",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook"
     ],
     "forbidden_for_queries": []
   },
@@ -47,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/consistent-hashing-hot-key-strategies.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

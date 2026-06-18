@@ -6,38 +6,23 @@
   "summary": "예외는 \"왜 발생했는가(사용자/도메인/인프라)\"로 분류하고, 발생 위치/복구 가능성/응답 코드를 각 분류마다 다르게 다뤄야 한다.",
   "body_markdown": "# Business vs Technical Exception primer — 잡을 것과 던질 것 분류\n\n> 한 줄 요약: 예외는 \"**왜 발생했는가(사용자/도메인/인프라)**\"로 분류하고,\n> 발생 위치/복구 가능성/응답 코드를 각 분류마다 다르게 다뤄야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [API 설계와 예외 처리](./api-design-error-handling.md)\n- [Spring Exception Handling 기초](../spring/spring-exception-handling-basics.md)\n- [자바 언어의 구조와 기본 문법](../language/java/java-language-basics.md)\n- [software-engineering 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: business vs technical exception primer, 비즈니스 예외 vs 기술 예외, checked vs unchecked, recover vs fail-fast, 도메인 예외 hierarchy, IllegalArgumentException custom exception, 예외 흐름 제어 안티패턴, @ControllerAdvice 매핑\n\n## 먼저 멘탈모델 — 예외는 \"왜 발생했나\"\n\n같은 ERROR라도 다음 3개로 본질이 다르다.\n\n| 분류 | 예시 | 누구의 잘못 | 복구 가능 | HTTP |\n|---|---|---|---|---|\n| **사용자 입력 오류** | \"email 형식이 잘못됨\" | 사용자 | 사용자가 다시 시도 | 400 Bad Request |\n| **비즈니스 규칙 위반** | \"잔액 부족\", \"재고 없음\" | 비즈니스 상태 | 비즈니스 조건 충족 후 가능 | 409 Conflict, 422 Unprocessable |\n| **인프라 / 기술 실패** | \"DB 연결 실패\", \"외부 API timeout\" | 시스템 | 운영자 또는 retry | 500 Internal, 503 Service Unavailable |\n\n신입은 보통 셋을 다 `RuntimeException`으로 잡거나 같은 catch에서 처리한다. 그러나\n**누구에게 무엇을 알릴지 다르다**.\n\n## Java 예외 계층\n\n```\nThrowable\n├── Error               ← JVM 시스템 에러 (OutOfMemoryError 등), 잡지 마라\n└── Exception\n    ├── (checked)       ← IOException, SQLException — 컴파일러가 처리 강제\n    └── RuntimeException ← (unchecked) IllegalArgumentException, NullPointerException\n```\n\n### Checked vs Unchecked\n\n| 차이 | Checked | Unchecked (RuntimeException) |\n|---|---|---|\n| 강제 | 호출자가 catch 또는 throws 명시 | 강제 없음 |\n| 의도 | \"이 메서드는 이 예외 가능, 처리하세요\" | \"이 메서드는 예외 발생할 수 있지만 처리 강제 안 함\" |\n| 예시 | IOException, SQLException | IllegalArgumentException, NullPointerException |\n\n**현재 시점 권장**: 거의 모든 경우 **Unchecked (RuntimeException 상속)**.\n- Checked는 method signature 오염 (`throws` 체인)\n- Spring/Hibernate도 checked → unchecked로 wrap\n\n## 3가지 분류 자세히\n\n### 1. 사용자 입력 오류 (Validation Exception)\n\n**원인**: API 호출자(사용자)가 잘못된 입력 제공.\n\n**예시**:\n- email 형식 잘못\n- 필수 필드 누락\n- 숫자가 음수\n- 길이 초과\n\n**처리**:\n- Controller에서 `@Valid` + `@RequestBody` validation\n- Spring `MethodArgumentNotValidException` 자동 throw\n- 400 Bad Request 응답\n- 응답 body에 어느 필드가 어떻게 잘못됐는지 명시\n\n```java\n@PostMapping(\"/users\")\npublic Response signup(@Valid @RequestBody SignupRequest req) {\n    // @Valid가 실패하면 MethodArgumentNotValidException\n}\n\n@ExceptionHandler(MethodArgumentNotValidException.class)\npublic ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException e) {\n    return ResponseEntity.badRequest().body(buildErrorResponse(e));\n}\n```\n\n**커스텀 validation이 필요하면**:\n```java\npublic class InvalidEmailException extends IllegalArgumentException {\n    public InvalidEmailException(String email) {\n        super(\"Invalid email: \" + email);\n    }\n}\n```\n\n### 2. 비즈니스 규칙 위반 (Domain Exception)\n\n**원인**: 입력은 valid이지만 비즈니스 상태가 허용 안 함.\n\n**예시**:\n- 잔액 부족 (`InsufficientBalanceException`)\n- 재고 없음 (`OutOfStockException`)\n- 예약 시간 충돌 (`ReservationConflictException`)\n- 이미 활성화된 계정 (`AlreadyActivatedException`)\n\n**처리**:\n- Service 계층에서 비즈니스 검증 시 throw\n- 보통 **custom domain exception** 사용 (의미 명확)\n- 409 Conflict 또는 422 Unprocessable Entity\n\n```java\npublic class InsufficientBalanceException extends BusinessException {\n    public InsufficientBalanceException(long accountId, BigDecimal requested) {\n        super(\"Account \" + accountId + \" has insufficient balance for \" + requested);\n    }\n}\n\npublic class AccountService {\n    public void withdraw(long id, BigDecimal amount) {\n        Account account = repo.findById(id);\n        if (account.getBalance().compareTo(amount) < 0) {\n            throw new InsufficientBalanceException(id, amount);\n        }\n        // ...\n    }\n}\n```\n\n### 3. 인프라/기술 실패 (Infrastructure Exception)\n\n**원인**: 외부 시스템 또는 우리 시스템 자체의 실패.\n\n**예시**:\n- DB 연결 실패\n- 외부 API timeout\n- File I/O 실패\n- 메모리 부족 (드물지만)\n\n**처리**:\n- 명확하게 우리 시스템의 문제 → 운영자/모니터링 알림 대상\n- 보통 5xx 응답\n- retry 또는 circuit breaker 패턴\n\n```java\n@Retryable(value = {DataAccessException.class}, maxAttempts = 3)\npublic List<User> fetchUsers() {\n    return repo.findAll();\n}\n```\n\n### 차이 — 같은 \"예외\"라도 다른 의미\n\n```java\n// Case 1: 사용자가 음수 amount 보냄 (입력 오류)\nthrow new IllegalArgumentException(\"amount must be positive\");\n// → 400, \"당신이 잘못 입력했어요\"\n\n// Case 2: 잔액 부족 (비즈니스 규칙)\nthrow new InsufficientBalanceException(...);\n// → 409, \"비즈니스 상태가 허용 안 함\"\n\n// Case 3: DB 연결 실패 (인프라)\nthrow new DataAccessException(...);\n// → 500, \"우리 시스템 문제, 잠시 후 재시도\"\n```\n\n## Custom Exception Hierarchy 설계\n\n### 권장 구조\n\n```java\n// Root\npublic abstract class BusinessException extends RuntimeException {\n    public BusinessException(String message) { super(message); }\n    public abstract HttpStatus getStatus();\n    public abstract String getCode();\n}\n\n// Categorize\npublic class NotFoundException extends BusinessException {\n    public HttpStatus getStatus() { return HttpStatus.NOT_FOUND; }\n    public String getCode() { return \"NOT_FOUND\"; }\n}\n\npublic class ConflictException extends BusinessException {\n    public HttpStatus getStatus() { return HttpStatus.CONFLICT; }\n    public String getCode() { return \"CONFLICT\"; }\n}\n\n// Specific\npublic class UserNotFoundException extends NotFoundException {\n    public UserNotFoundException(long id) {\n        super(\"User not found: \" + id);\n    }\n}\n\npublic class ReservationConflictException extends ConflictException {\n    public ReservationConflictException(long timeSlotId) {\n        super(\"Time slot \" + timeSlotId + \" already reserved\");\n    }\n}\n```\n\n### Spring @ControllerAdvice로 처리\n\n```java\n@RestControllerAdvice\npublic class GlobalExceptionHandler {\n\n    @ExceptionHandler(BusinessException.class)\n    public ResponseEntity<ErrorResponse> handleBusiness(BusinessException e) {\n        return ResponseEntity.status(e.getStatus())\n            .body(new ErrorResponse(e.getCode(), e.getMessage()));\n    }\n\n    @ExceptionHandler(MethodArgumentNotValidException.class)\n    public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException e) {\n        return ResponseEntity.badRequest()\n            .body(new ErrorResponse(\"VALIDATION_FAILED\", buildValidationMessage(e)));\n    }\n\n    @ExceptionHandler(Exception.class)\n    public ResponseEntity<ErrorResponse> handleAll(Exception e) {\n        log.error(\"Unhandled exception\", e);  // ← 로깅 필수\n        return ResponseEntity.status(500)\n            .body(new ErrorResponse(\"INTERNAL_ERROR\", \"Something went wrong\"));\n    }\n}\n```\n\n## 6 가지 안티 패턴\n\n### 1. 모든 예외를 잡고 무시\n\n```java\ntry {\n    service.doWork();\n} catch (Exception e) {\n    // 무시 ← 절대 금지\n}\n```\n\n**왜 안 좋은가**: 시스템이 silent fail. 디버깅 불가.\n\n**해결**: 최소한 로깅. 흐름 계속하려면 의도를 주석으로.\n\n### 2. 예외를 흐름 제어로\n\n```java\ntry {\n    return Integer.parseInt(s);\n} catch (NumberFormatException e) {\n    return 0;\n}\n```\n\n**왜 안 좋은가**: 예외 객체 생성 + stack trace 비용 (수 μs~ms). 핫 패스에서 성능 ↓.\n\n**해결**:\n```java\nif (s.matches(\"-?\\\\d+\")) {\n    return Integer.parseInt(s);\n}\nreturn 0;\n```\n\n### 3. 예외 메시지 정보 부족\n\n```java\nthrow new RuntimeException(\"error\");\n// ← 어디서? 무엇이? 누가?\n```\n\n**해결**:\n```java\nthrow new RuntimeException(String.format(\n    \"Failed to process order %d for user %d: %s\",\n    orderId, userId, reason\n));\n```\n\n### 4. Cause 끊기\n\n```java\ntry {\n    db.save(user);\n} catch (SQLException e) {\n    throw new RuntimeException(\"save failed\");  // ← e 안 넘김\n}\n```\n\n**왜 안 좋은가**: 원인 stack trace 사라짐.\n\n**해결**:\n```java\nthrow new RuntimeException(\"save failed\", e);  // ← cause 전달\n```\n\n### 5. NullPointerException 발생 시키기\n\n```java\nString name = user.getName();  // user가 null일 수도\n```\n\n**해결**:\n- Optional 사용\n- @NonNull / @Nullable 명시\n- Defensive 체크 (의미 있는 예외)\n\n```java\nObjects.requireNonNull(user, \"user must not be null\");\n```\n\n### 6. 비즈니스 검증을 Exception으로 흐름 제어\n\n```java\ntry {\n    accountService.withdraw(id, amount);\n    return \"ok\";\n} catch (InsufficientBalanceException e) {\n    return \"no money\";  // ← 정상 흐름인데 예외로 처리\n}\n```\n\n**왜 안 좋은가**: 잔액 부족은 비즈니스 정상 흐름. 예외보다 명시적 result 객체.\n\n**해결**:\n```java\nWithdrawResult result = accountService.withdraw(id, amount);\nif (result.isInsufficientBalance()) {\n    return \"no money\";\n}\n```\n\n단 Java에서는 result 객체가 verbose. 비즈니스 예외를 쓰되 흐름 제어 단순하게.\n\n## checked vs unchecked 결정\n\n### 신입 권장\n\n거의 모든 경우 **unchecked (RuntimeException 상속)**.\n\n이유:\n- Checked는 호출자가 catch 또는 throws 명시 강제 → method signature 오염\n- 대부분의 예외는 호출자가 직접 처리 못함 (어차피 위로 전파)\n- Spring/모던 framework는 unchecked 권장\n\n### Checked가 의미 있는 좁은 case\n\n- API 사용자가 명시적으로 처리해야 하는 예외 (예: `IOException`)\n- 도메인 외부 인터페이스 — 라이브러리 작성 시\n\n## 예외 vs 결과 객체 (Result)\n\n```java\n// Option 1: Exception\npublic User findUser(long id) {\n    User u = repo.findById(id);\n    if (u == null) throw new UserNotFoundException(id);\n    return u;\n}\n\n// Option 2: Optional\npublic Optional<User> findUser(long id) {\n    return Optional.ofNullable(repo.findById(id));\n}\n\n// Option 3: Result\npublic Result<User, NotFoundError> findUser(long id) {\n    User u = repo.findById(id);\n    return u != null ? Result.ok(u) : Result.err(new NotFoundError(id));\n}\n```\n\n| 패턴 | 언제 |\n|---|---|\n| Exception | 정말 예외적 상황, 호출자가 거의 항상 처리 안 함 |\n| Optional | null 가능성을 명시적으로 시그니처에 표현 |\n| Result | 예상 가능한 두 결과 (성공/실패)를 둘 다 정상 흐름 |\n\nJava에서 Result는 표준 없음. 실전에선 Exception + Optional 조합.\n\n## 자주 헷갈리는 지점\n\n### \"IllegalArgumentException은 항상 사용자 잘못\"\n\n대부분 맞음. 그러나 system 내부 코드 버그도 던질 수 있음(개발자가 잘못된 인자 전달).\n중요한 건: caller에게 의미 전달.\n\n### \"RuntimeException은 막 던져도 OK\"\n\n처리 강제 없지만, 의미 없는 RuntimeException 남발은 디버깅 지옥. 명확한 message + cause + 가능하면 custom class.\n\n### \"Exception은 비싸서 안 써야 한다\"\n\n핫 패스에서 흐름 제어로 쓰면 비쌈. 하지만 진짜 예외 상황은 발생 빈도가 낮아 성능 영향 미미.\n\n### \"도메인 예외도 결국 catch에서 잡으니 RuntimeException 상속 안 해도 되지 않나\"\n\nChecked로 하면:\n- Service 계층 모든 메서드에 `throws InsufficientBalanceException` 줄줄\n- 호출 체인 깊으면 끝까지 throws 전파\n- Spring/JPA같은 framework가 throws 강제 (어디서 catch 안 해도 되도록)\n\n→ Unchecked 권장.\n\n### \"에러 응답에 stack trace 그대로 노출\"\n\n보안 위험! production에선 stack trace 외부 숨기고 logging만. 일반 응답은 user-facing message만.\n\n## 빠른 확인 질문\n\n- 예외 3가지 분류?  답: 사용자 입력 / 비즈니스 규칙 / 인프라\n- 신입 권장: checked vs unchecked?  답: Unchecked (RuntimeException 상속)\n- 예외 흐름 제어 안티 패턴 예시?  답: NumberFormatException catch로 0 반환\n- 도메인 예외 root class 권장?  답: 추상 `BusinessException extends RuntimeException`\n- Cause 전달 중요한 이유?  답: 원인 stack trace 유지 → 디버깅 가능\n- 예외 응답에 stack trace 포함?  답: ❌ 보안 위험, logging만\n\n## 한 줄 정리\n\n예외는 \"**사용자 입력 / 비즈니스 규칙 / 인프라 실패**\" 3분류로 나뉘며, 각각\n*400 / 409·422 / 5xx* 응답 + *unchecked 도메인 hierarchy + @ControllerAdvice 매핑 +\ncause 전달*의 결합으로 처리하면 신입도 일관성 있는 예외 설계가 가능하다.\n",
   "aliases": [
-    "business exception",
-    "technical exception",
     "비즈니스 예외 vs 기술 예외",
-    "checked exception unchecked",
     "잡을 예외 던질 예외",
     "도메인 예외 인프라 예외",
-    "exception classification",
     "예외 분류 기준",
+    "business exception",
+    "technical exception",
+    "checked exception unchecked",
+    "exception classification",
     "복구 가능 vs 복구 불가",
-    "recoverable vs unrecoverable",
-    "IllegalArgumentException usage",
-    "RuntimeException 사용",
-    "Throwable hierarchy",
-    "예외 계층",
-    "exception design patterns",
-    "예외 설계",
-    "exception meaning vs cause",
-    "@ControllerAdvice 예외 매핑",
-    "exception translator spring",
-    "DAO exception translation",
-    "domain exception 정의",
-    "도메인 예외",
-    "인프라 예외"
+    "recoverable vs unrecoverable"
   ],
   "expected_queries": [
     "비즈니스 예외와 기술 예외를 어떻게 구분해?",
     "checked exception과 unchecked exception 중 어느 걸 써야 해?",
     "IllegalArgumentException은 비즈니스 예외야 기술 예외야?",
     "복구 가능한 예외와 그렇지 않은 예외를 어떻게 처리 분기해?",
-    "도메인 예외 hierarchy를 어떻게 설계해?",
-    "예외를 흐름 제어로 쓰면 안 되는 이유는?",
-    "비즈니스 예외와 기술 예외를 상속 구조로 나눌 때 기준이 뭐야?"
+    "도메인 예외 hierarchy를 어떻게 설계해?"
   ],
   "symptoms": [
     "어떤 예외를 잡고 어떤 예외를 던져야 할지 모르겠어",
@@ -68,7 +53,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/business-vs-technical-exception-primer.md",
     "revision_history": [
       {
@@ -78,6 +63,10 @@
       {
         "date": "2026-05-28",
         "source": "relation-prereq-placeholder-removal"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
       }
     ]
   }

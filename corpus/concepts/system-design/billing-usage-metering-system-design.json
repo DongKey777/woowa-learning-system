@@ -6,24 +6,25 @@
   "summary": "이 문서는 system-design 카테고리에서 Billing / Usage Metering System 설계를 다루는 deep_dive 문서다. billing과 usage metering은 사용량을 정확히 집계하고, 과금과 한도를 안전하게 연결하는 재무-운영 결합 시스템이다. 검색 질의가 billing, usage metering, invoice, proration처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
   "body_markdown": "# Billing / Usage Metering System 설계\n\n> 한 줄 요약: billing과 usage metering은 사용량을 정확히 집계하고, 과금과 한도를 안전하게 연결하는 재무-운영 결합 시스템이다.\n\nretrieval-anchor-keywords: billing, usage metering, invoice, proration, rating, ledger, quota, usage aggregation, billing period, metered events, revenue recognition\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Distributed Scheduler 설계](./distributed-scheduler-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n\n## 핵심 개념\n\nbilling은 단순히 카드에서 돈을 빼는 기능이 아니다.  \n실전에서는 아래를 같이 다뤄야 한다.\n\n- usage event 수집\n- aggregation\n- rate/rating\n- invoice 생성\n- proration\n- refunds/credits\n- revenue reconciliation\n\n즉, billing은 정책, 계량, 회계가 만나는 시스템이다.\n\n## 깊이 들어가기\n\n### 1. Usage event와 ledger는 다르다\n\nusage event는 \"얼마나 썼는가\"이고, ledger는 \"무엇이 청구 가능한가\"다.\n\n예:\n\n- API request\n- storage GB-hours\n- compute minutes\n- active seat count\n- outbound bandwidth\n\nusage event는 많고 noisy하지만, billing ledger는 정제되어야 한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 100만 tenant\n- tenant당 하루 1만 usage event\n\n하루 100억 이벤트까지도 갈 수 있다.  \n그래서 실시간 청구보다는 event ingestion + batch aggregation이 많다.\n\n봐야 할 숫자:\n\n- ingestion lag\n- aggregation lag\n- invoice close duration\n- rating QPS\n- dispute rate\n\n### 3. 파이프라인 구조\n\n```text\nUsage Event\n  -> Durable Stream\n  -> Normalize / Dedup\n  -> Aggregate\n  -> Rate / Price\n  -> Billing Ledger\n  -> Invoice / Credit / Alert\n```\n\n이 구조의 핵심은 event와 invoice를 분리하는 것이다.  \n정확한 사용량과 청구 가능한 사용량은 항상 같지 않을 수 있다.\n\n### 4. Metering과 dedup\n\n사용량 집계는 중복 이벤트가 매우 위험하다.\n\n- retry로 같은 event가 재전송됨\n- worker crash 후 재처리됨\n- upstream이 중복 발행함\n\n따라서 event id와 idempotency key가 필요하다.\n\n### 5. Proration과 billing period\n\n월 중간 업그레이드/다운그레이드가 흔하다.\n\n- 프로 플랜으로 중간 변경\n- seat 수 변경\n- 사용량 구간 변경\n\n이 경우 proration이 필요하다.  \nbilling period와 effective date가 정확히 정의되지 않으면 분쟁이 생긴다.\n\n### 6. Quota와 billing 연결\n\nquota는 단순 제한이 아니라 과금 전 단계다.\n\n- soft quota warning\n- hard quota enforcement\n- overage charge\n\n이 부분은 [Entitlement / Quota 설계](./entitlement-quota-design.md)와 함께 봐야 한다.\n\n### 7. Auditability\n\nbilling 시스템은 설명 가능해야 한다.\n\n- 어떤 usage가 invoice에 반영됐는가\n- 어떤 rate table이 사용됐는가\n- 어떤 환불/크레딧이 적용됐는가\n\n이런 이유로 audit trail과 reconciliation job이 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 월말 invoice 발행\n\n문제:\n\n- 월말에 수백만 건 usage를 마감해야 한다\n\n해결:\n\n- scheduler로 close job 실행\n- aggregate snapshot을 freeze\n- invoice line item 생성\n\n### 시나리오 2: 사용량 중복 반영\n\n문제:\n\n- 같은 usage event가 두 번 들어왔다\n\n해결:\n\n- event id dedup\n- aggregation checkpoint 저장\n\n### 시나리오 3: 플랜 업그레이드\n\n문제:\n\n- 중간에 플랜이 바뀌었다\n\n해결:\n\n- effective date 기준으로 proration\n- invoice correction entry 기록\n\n## 코드로 보기\n\n```pseudo\nfunction ingestUsage(event):\n  if dedup.exists(event.id):\n    return\n  normalized = normalize(event)\n  aggregate.update(normalized)\n  ledger.append(normalized)\n\nfunction closeBillingPeriod(period):\n  snapshot = aggregate.freeze(period)\n  invoice = price(snapshot)\n  emitInvoice(invoice)\n```\n\n```java\npublic Invoice closePeriod(BillingPeriod period) {\n    UsageSnapshot snapshot = usageService.freeze(period);\n    return invoiceService.generate(snapshot);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Real-time billing | 즉시성 높다 | 복잡하고 비싸다 | 초대형 overage |\n| Batch billing | 단순하고 안정적 | 지연이 있다 | 대부분의 SaaS |\n| Event-based metering | 재처리에 유리 | 중복 제어 필요 | usage-heavy service |\n| Invoice snapshot | 감사가 쉽다 | 수정이 번거롭다 | 월말 청구 |\n| Soft quota + overage | UX가 좋다 | 비용 통제가 약해질 수 있다 | 성장형 제품 |\n\n핵심은 billing이 금액 계산이 아니라 **사용량, 정책, 정산, 감사의 연결 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: usage event와 invoice line item은 왜 분리하나요?\n> 의도: 계량과 청구의 차이 이해 확인\n> 핵심: raw usage는 noisy하고, invoice는 정제되어야 한다.\n\n> Q: proration은 왜 어려운가요?\n> 의도: 기간 계산과 정책 변경 이해 확인\n> 핵심: 중간 변경, 취소, 환불이 동시에 들어오기 때문이다.\n\n> Q: billing에서 dedup이 중요한 이유는 무엇인가요?\n> 의도: 재전송과 재처리 영향 이해 확인\n> 핵심: 중복 반영은 곧 금전 오류다.\n\n> Q: quota와 billing을 왜 연결하나요?\n> 의도: 보호와 과금의 결합 이해 확인\n> 핵심: 사용량 초과는 제한뿐 아니라 과금 정책과도 연결되기 때문이다.\n\n## 한 줄 정리\n\nBilling / usage metering system은 대규모 사용량 이벤트를 정확히 집계하고, 청구와 한도, 정산을 일관된 ledger로 연결하는 시스템이다.\n\n",
   "aliases": [
-    "billing",
     "usage metering",
-    "invoice",
-    "proration",
-    "rating",
-    "ledger",
-    "quota",
-    "usage aggregation",
-    "billing period",
-    "metered events",
+    "사용량 과금",
+    "billing ledger",
+    "invoice snapshot",
+    "proration policy",
+    "rating engine",
+    "quota overage",
+    "usage event dedup",
+    "청구 대사",
+    "과금 기간 마감",
     "revenue recognition",
-    "Billing / Usage Metering System 설계"
+    "metered billing"
   ],
   "expected_queries": [
-    "usage event를 모아서 invoice까지 만들 때 metering, rating, billing ledger가 어떻게 이어져?",
-    "사용량 과금에서 중복 이벤트나 late event가 들어오면 invoice를 어떻게 보정해?",
-    "plan quota와 billing usage를 같은 숫자로 보면 안 되는 이유가 뭐야?",
-    "proration이나 plan 변경이 있을 때 사용량 집계와 청구 금액을 어떻게 맞춰?"
+    "usage event, aggregate snapshot, billing ledger, invoice line item을 왜 분리해서 저장해야 해?",
+    "late usage event가 월말 invoice close 이후 도착하면 credit이나 correction entry를 어떻게 남겨?",
+    "plan 변경 proration과 quota overage가 같이 있을 때 effective date를 어떻게 계산해야 해?",
+    "사용량 과금에서 retry 중복 event를 idempotency key와 aggregation checkpoint로 어떻게 막아?",
+    "billing dispute가 들어왔을 때 어떤 usage와 rate table이 invoice에 반영됐는지 어떻게 설명해?"
   ],
   "symptoms": [
     "`Billing / Usage Metering System 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +34,32 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/payment-system-ledger-idempotency-reconciliation-design",
+      "system-design/entitlement-quota-design"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "system-design/tenant-billing-dispute-workflow-design",
+      "system-design/audit-log-pipeline-design"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "database/payment-ledger-state-reconciliation-mission-bridge",
+      "system-design/payment-ledger-idempotency-interview-drill",
+      "system-design/payment-webhook-idempotency-reconciliation-drill"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/billing-usage-metering-system-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

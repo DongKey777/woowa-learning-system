@@ -4,26 +4,27 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Pricing / Plan Management System 설계를 다루는 deep_dive 문서다. pricing and plan management system은 상품 플랜, 가격 정책, 변경 이력, grandfathering, 과금 연동을 중앙에서 관리하는 상업 정책 시스템이다. 검색 질의가 pricing, plan management, tier, grandfathering처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Pricing / Plan Management System 설계\n\n> 한 줄 요약: pricing and plan management system은 상품 플랜, 가격 정책, 변경 이력, grandfathering, 과금 연동을 중앙에서 관리하는 상업 정책 시스템이다.\n\nretrieval-anchor-keywords: pricing, plan management, tier, grandfathering, upgrade downgrade, plan catalog, price book, effective date, billing integration, entitlements, offers\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Billing / Usage Metering System 설계](./billing-usage-metering-system-design.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n\n## 핵심 개념\n\nPricing 시스템은 단순 가격표가 아니다.  \n실전에서는 아래를 함께 관리한다.\n\n- plan catalog\n- price book\n- feature entitlements\n- effective date\n- upgrade / downgrade\n- grandfathering\n- promo / discount\n\n즉, pricing은 매출 정책과 제품 정책을 동시에 관리하는 시스템이다.\n\n## 깊이 들어가기\n\n### 1. Plan과 price를 분리한다\n\n플랜은 기능 묶음이고, 가격은 그 플랜의 청구 규칙이다.\n\n- plan: 무엇을 포함하는가\n- price: 얼마를, 어떤 기간에 청구하는가\n\n같은 plan이 지역이나 계약 조건에 따라 다른 price를 가질 수 있다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 수천 개 plan / offer\n- 수백만 tenant\n- 자주 있는 가격 조회와 적은 수정\n\n읽기는 많고 쓰기는 적다.  \n그래서 versioned snapshot과 cache가 핵심이다.\n\n봐야 할 숫자:\n\n- plan lookup QPS\n- price change rate\n- contract override count\n- cache hit ratio\n- billing sync lag\n\n### 3. 데이터 모델\n\n핵심 엔티티:\n\n- plan\n- price\n- feature bundle\n- entitlement\n- promotion\n- contract override\n- effective window\n\n모든 변경은 effective date를 가져야 한다.\n\n### 4. Grandfathering\n\n기존 고객을 새 가격으로 강제 전환하면 분쟁이 생긴다.\n\n- 기존 플랜 유지\n- 신규 가입자만 새 가격 적용\n- migrate window 제공\n\ngrandfathering 정책이 없으면 pricing 변경이 장애가 된다.\n\n### 5. Coupon / promo\n\n프로모션은 복잡도를 크게 올린다.\n\n- percentage discount\n- fixed amount discount\n- trial extension\n- one-time credit\n\n프로모션은 billing과 연결되므로 audit trail이 필요하다.\n\n### 6. Entitlement integration\n\n가격과 기능은 연결된다.\n\n- 플랜이 바뀌면 entitlement가 바뀜\n- quota와 overage도 바뀜\n- trial → paid 전환\n\n이 부분은 [Entitlement / Quota 설계](./entitlement-quota-design.md)와 함께 봐야 한다.\n\n### 7. Change governance\n\n가격 변경은 민감하다.\n\n- 승인 워크플로우\n- audit log\n- rollout schedule\n- customer communication\n\n이 부분은 [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)와도 닮아 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 가격 인상\n\n문제:\n\n- 신규 고객만 새 가격을 적용하고 싶다\n\n해결:\n\n- effective date 분리\n- existing contract grandfathering\n\n### 시나리오 2: 플랜 업그레이드\n\n문제:\n\n- 사용자가 중간에 상위 플랜으로 바꾼다\n\n해결:\n\n- billing system과 sync\n- entitlement 즉시 반영\n\n### 시나리오 3: 엔터프라이즈 계약\n\n문제:\n\n- 표준 price book과 다른 계약이 필요하다\n\n해결:\n\n- contract override\n- tenant-specific pricing\n\n## 코드로 보기\n\n```pseudo\nfunction resolvePrice(tenant, plan, date):\n  snapshot = catalog.snapshot(date)\n  override = contractOverride(tenant)\n  return merge(snapshot.plan(plan), override)\n```\n\n```java\npublic Price resolve(TenantId tenantId, PlanId planId, Instant at) {\n    return pricingRepository.resolve(tenantId, planId, at);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Single price book | 단순하다 | 유연성이 낮다 | 작은 제품 |\n| Versioned catalog | 변경 관리가 쉽다 | 운영 절차 필요 | 실서비스 |\n| Contract overrides | enterprise 대응 가능 | 복잡도 증가 | B2B SaaS |\n| Grandfathering | 고객 반발이 적다 | 정책이 늘어난다 | 가격 인상 |\n| Entitlement-linked pricing | 제품/과금 일관성 | coupling 증가 | 대부분의 SaaS |\n\n핵심은 pricing이 숫자 계산이 아니라 **상품 정책, 청구, entitlement를 연결하는 운영 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: plan과 price는 왜 분리하나요?\n> 의도: 상품 정책과 청구 규칙 구분 확인\n> 핵심: 같은 플랜이라도 가격 조건이 달라질 수 있기 때문이다.\n\n> Q: grandfathering은 왜 필요한가요?\n> 의도: 기존 고객 보호와 변경 관리 이해 확인\n> 핵심: 갑작스러운 가격 변경은 고객 이탈과 분쟁을 만든다.\n\n> Q: entitlement와 pricing의 관계는 무엇인가요?\n> 의도: 기능과 가격 연결 이해 확인\n> 핵심: 플랜이 바뀌면 허용 기능과 quota도 바뀐다.\n\n> Q: 가격 변경을 안전하게 하려면 무엇이 필요한가요?\n> 의도: governance와 audit 이해 확인\n> 핵심: effective date, 승인, audit trail이 필요하다.\n\n## 한 줄 정리\n\nPricing / plan management system은 가격, 플랜, entitlement, 계약 오버라이드를 버전화해 안전하게 운영하는 상업 정책 시스템이다.\n\n",
+  "body_markdown": "# Pricing / Plan Management System 설계\n\n> 한 줄 요약: pricing and plan management system은 상품 플랜, 가격 정책, 변경 이력, grandfathering, 과금 연동을 중앙에서 관리하는 상업 정책 시스템이다.\n\nretrieval-anchor-keywords: pricing, plan management, tier, grandfathering, upgrade downgrade, plan catalog, price book, effective date, billing integration, entitlements, offers\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Billing / Usage Metering System 설계](./billing-usage-metering-system-design.md)\n> - [Entitlement / Quota 설계](./entitlement-quota-design.md)\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Multi-tenant SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)\n\n## 핵심 개념\n\nPricing 시스템은 단순 가격표가 아니다.  \n실전에서는 아래를 함께 관리한다.\n\n- plan catalog\n- price book\n- feature entitlements\n- effective date\n- upgrade / downgrade\n- grandfathering\n- promo / discount\n\n즉, pricing은 매출 정책과 제품 정책을 동시에 관리하는 시스템이다.\n\n## 깊이 들어가기\n\n### 1. Plan과 price를 분리한다\n\n플랜은 기능 묶음이고, 가격은 그 플랜의 청구 규칙이다.\n\n- plan: 무엇을 포함하는가\n- price: 얼마를, 어떤 기간에 청구하는가\n\n같은 plan이 지역이나 계약 조건에 따라 다른 price를 가질 수 있다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 수천 개 plan / offer\n- 수백만 tenant\n- 자주 있는 가격 조회와 적은 수정\n\n읽기는 많고 쓰기는 적다.  \n그래서 versioned snapshot과 cache가 핵심이다.\n\n봐야 할 숫자:\n\n- plan lookup QPS\n- price change rate\n- contract override count\n- cache hit ratio\n- billing sync lag\n\n### 3. 데이터 모델\n\n핵심 엔티티:\n\n- plan\n- price\n- feature bundle\n- entitlement\n- promotion\n- contract override\n- effective window\n\n모든 변경은 effective date를 가져야 한다.\n\n### 4. Grandfathering\n\n기존 고객을 새 가격으로 강제 전환하면 분쟁이 생긴다.\n\n- 기존 플랜 유지\n- 신규 가입자만 새 가격 적용\n- migrate window 제공\n\ngrandfathering 정책이 없으면 pricing 변경이 장애가 된다.\n\n### 5. Coupon / promo\n\n프로모션은 복잡도를 크게 올린다.\n\n- percentage discount\n- fixed amount discount\n- trial extension\n- one-time credit\n\n프로모션은 billing과 연결되므로 audit trail이 필요하다.\n\n### 6. Entitlement integration\n\n가격과 기능은 연결된다.\n\n- 플랜이 바뀌면 entitlement가 바뀜\n- quota와 overage도 바뀜\n- trial → paid 전환\n\n이 부분은 [Entitlement / Quota 설계](./entitlement-quota-design.md)와 함께 봐야 한다.\n\n### 7. Change governance\n\n가격 변경은 민감하다.\n\n- 승인 워크플로우\n- audit log\n- rollout schedule\n- customer communication\n\n이 부분은 [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)와도 닮아 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 가격 인상\n\n문제:\n\n- 신규 고객만 새 가격을 적용하고 싶다\n\n해결:\n\n- effective date 분리\n- existing contract grandfathering\n\n### 시나리오 2: 플랜 업그레이드\n\n문제:\n\n- 사용자가 중간에 상위 플랜으로 바꾼다\n\n해결:\n\n- billing system과 sync\n- entitlement 즉시 반영\n\n### 시나리오 3: 엔터프라이즈 계약\n\n문제:\n\n- 표준 price book과 다른 계약이 필요하다\n\n해결:\n\n- contract override\n- tenant-specific pricing\n\n## 코드로 보기\n\n```pseudo\nfunction resolvePrice(tenant, plan, date):\n  snapshot = catalog.snapshot(date)\n  override = contractOverride(tenant)\n  return merge(snapshot.plan(plan), override)\n```\n\n```java\npublic Price resolve(TenantId tenantId, PlanId planId, Instant at) {\n    return pricingRepository.resolve(tenantId, planId, at);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Single price book | 단순하다 | 유연성이 낮다 | 작은 제품 |\n| Versioned catalog | 변경 관리가 쉽다 | 운영 절차 필요 | 실서비스 |\n| Contract overrides | enterprise 대응 가능 | 복잡도 증가 | B2B SaaS |\n| Grandfathering | 고객 반발이 적다 | 정책이 늘어난다 | 가격 인상 |\n| Entitlement-linked pricing | 제품/과금 일관성 | coupling 증가 | 대부분의 SaaS |\n\n핵심은 pricing이 숫자 계산이 아니라 **상품 정책, 청구, entitlement를 연결하는 운영 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: plan과 price는 왜 분리하나요?\n> 의도: 상품 정책과 청구 규칙 구분 확인\n> 핵심: 같은 플랜이라도 가격 조건이 달라질 수 있기 때문이다.\n\n> Q: grandfathering은 왜 필요한가요?\n> 의도: 기존 고객 보호와 변경 관리 이해 확인\n> 핵심: 갑작스러운 가격 변경은 고객 이탈과 분쟁을 만든다.\n\n> Q: entitlement와 pricing의 관계는 무엇인가요?\n> 의도: 기능과 가격 연결 이해 확인\n> 핵심: 플랜이 바뀌면 허용 기능과 quota도 바뀐다.\n\n> Q: 가격 변경을 안전하게 하려면 무엇이 필요한가요?\n> 의도: governance와 audit 이해 확인\n> 핵심: effective date, 승인, audit trail이 필요하다.\n\n## 운영 검증\n\nPricing 장애는 단순히 금액 계산 오류가 아니라 고객 신뢰와 매출 인식 문제로 이어진다. 따라서 가격 조회, 계약 override, entitlement 반영, billing sync를 같은 trace에서 볼 수 있어야 한다.\n\n| 신호 | 확인할 것 | 위험한 해석 |\n|---|---|---|\n| price resolution mismatch | catalog, override, promo 적용 결과를 비교한다 | 최종 금액만 맞으면 정상이라고 봄 |\n| billing sync lag | pricing 변경이 invoice 계산에 반영됐는지 본다 | catalog publish만 완료로 판단 |\n| entitlement drift | plan 변경 뒤 기능/quota가 같이 바뀌었는지 본다 | 결제 성공이면 제품 권한도 맞다고 봄 |\n| override cardinality | tenant별 예외가 운영 가능한 규모인지 본다 | enterprise 대응을 무제한 예외로 처리 |\n| grandfathered cohort count | 기존 가격 유지 대상과 만료 조건을 추적한다 | old plan을 그냥 남겨두면 된다고 봄 |\n\n가격 변경은 rollout처럼 운영해야 한다. draft, approval, effective window, customer communication, rollback 기준이 있어야 하고, 변경 이후에는 billing 결과와 entitlement 결과가 같은 version을 참조하는지 검증해야 한다.\n\n## 잘못 고르기 쉬운 이웃 개념\n\nBilling system은 사용량과 청구 주기를 계산하고 invoice를 만든다. Pricing/plan management는 어떤 plan과 price rule을 적용할지 정한다. 둘을 합치면 빠르게 시작할 수 있지만, 가격 변경 이력과 청구 재현성이 약해진다.\n\nEntitlement service는 사용자가 어떤 기능과 quota를 사용할 수 있는지 판단한다. Pricing은 그 entitlement bundle을 상업 조건과 연결한다. 가격만 바뀌는 변경, 기능만 바뀌는 변경, 둘 다 바뀌는 변경을 구분하지 않으면 고객에게 보이는 권한과 청구 금액이 어긋난다.\n\n\n## 한 줄 정리\n\nPricing / plan management system은 가격, 플랜, entitlement, 계약 오버라이드를 버전화해 안전하게 운영하는 상업 정책 시스템이다.\n\n",
   "aliases": [
-    "pricing",
-    "plan management",
-    "tier",
-    "grandfathering",
-    "upgrade downgrade",
-    "plan catalog",
-    "price book",
-    "effective date",
-    "billing integration",
-    "entitlements",
-    "offers",
-    "Pricing / Plan Management System 설계"
+    "pricing plan catalog",
+    "versioned price book",
+    "plan entitlement mapping",
+    "contract price override",
+    "grandfathered pricing",
+    "effective dated pricing",
+    "가격 플랜 관리",
+    "가격표 버전 관리",
+    "기존 고객 가격 유지",
+    "플랜 entitlement 연결",
+    "계약별 가격 override",
+    "가격 변경 승인 흐름"
   ],
   "expected_queries": [
     "상품 플랜 목록과 실제 가격표를 따로 관리하는 이유가 뭐야?",
     "가격을 바꿨는데 기존 고객 grandfathering과 새 고객 effective date를 어떻게 관리해?",
     "upgrade, downgrade, proration이 billing에 이어질 때 pricing system이 어떤 이력을 남겨야 해?",
-    "가격 정책을 코드에 박지 않고 plan management로 관리하면 어떤 trade-off가 있어?"
+    "가격 정책을 코드에 박지 않고 plan management로 관리하면 어떤 trade-off가 있어?",
+    "엔터프라이즈 고객별 contract override가 많아질 때 price book과 entitlement 일관성을 어떻게 검증해?"
   ],
   "symptoms": [
     "`Pricing / Plan Management System 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +34,27 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/billing-usage-metering-system-design"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/entitlement-quota-design"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/policy-snapshot-cache-design"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/pricing-plan-management-system-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

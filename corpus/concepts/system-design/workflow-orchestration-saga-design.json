@@ -4,26 +4,27 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Workflow Orchestration + Saga 설계를 다루는 deep_dive 문서다. 여러 서비스가 관여하는 업무 흐름은 하나의 트랜잭션으로 묶지 말고, orchestration과 compensation으로 상태 전이를 관리해야 한다. 검색 질의가 workflow orchestration, saga, compensation, state machine처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Workflow Orchestration + Saga 설계\n\n> 한 줄 요약: 여러 서비스가 관여하는 업무 흐름은 하나의 트랜잭션으로 묶지 말고, orchestration과 compensation으로 상태 전이를 관리해야 한다.\n\nretrieval-anchor-keywords: workflow orchestration, saga, compensation, state machine, approval workflow, human in the loop, repair campaign, long running operation, orchestration engine, timeout policy\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Outbox, Saga, Eventual Consistency](../software-engineering/outbox-inbox-domain-events.md)\n> - [Transaction 실전 시나리오](../database/transaction-case-studies.md)\n> - [멱등성 키와 중복 방지](../database/idempotency-key-and-deduplication.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](../network/connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [Replay / Repair Orchestration Control Plane 설계](./replay-repair-orchestration-control-plane-design.md)\n\n---\n\n## 핵심 개념\n\n워크플로우 오케스트레이션은 \"업무 순서\"를 코드/상태 머신으로 관리하는 것이다.  \nSaga는 그 과정에서 여러 로컬 트랜잭션을 묶고, 실패 시 compensation으로 되돌리는 패턴이다.\n\n이 패턴이 필요한 이유는 명확하다.\n\n- 결제, 재고, 배송, 알림이 서로 다른 서비스에 있다.\n- 하나의 DB 트랜잭션으로 묶을 수 없다.\n- 중간 실패를 허용하면서도 사용자 경험을 유지해야 한다.\n\n### 두 가지 스타일\n\n| 방식 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Orchestration | 흐름이 명시적이다 | 오케스트레이터가 복잡해진다 | 업무 순서가 중요할 때 |\n| Choreography | 서비스 간 결합이 낮다 | 흐름 추적이 어렵다 | 이벤트 중심 도메인 |\n\n---\n\n## 깊이 들어가기\n\n### 1. 상태 머신\n\nSaga는 결국 상태 머신이다.\n\n- `PENDING`\n- `PAYMENT_DONE`\n- `RESERVED`\n- `SHIPPED`\n- `COMPENSATED`\n- `FAILED`\n\n각 단계는 로컬 트랜잭션이어야 하고, 각 이벤트는 idempotent해야 한다.\n\n### 2. Orchestrator 역할\n\n오케스트레이터는 다음을 담당한다.\n\n- 다음 단계 호출\n- 타임아웃 관리\n- 재시도 정책\n- 보상 트리거\n- 최종 상태 기록\n\n오케스트레이터가 너무 똑똑해지면, 결국 분산 모놀리스가 된다.  \n그래서 흐름은 명시하되 비즈니스 규칙은 각 서비스에 남겨야 한다.\n\n### 3. 실패와 보상\n\n모든 실패가 rollback은 아니다.\n\n- 결제 성공 후 재고 실패 -> 결제 취소\n- 재고 성공 후 배송 실패 -> 재고 복구\n- 알림 실패 -> 보상보다 재시도/보류가 적절할 수 있음\n\n보상은 \"원래 상태로 완전히 되돌리기\"가 아니라 **업무적으로 허용 가능한 수정 작업**이다.\n\n### 4. Outbox와 Inbox\n\nSaga는 이벤트 전달이 안정적이어야 한다.  \n그때 필요한 것이 outbox/inbox다.\n\n- outbox: 로컬 트랜잭션과 이벤트 발행을 같이 기록\n- inbox: 중복 메시지를 한 번만 처리\n\n이 문맥은 [Outbox, Saga, Eventual Consistency](../software-engineering/outbox-inbox-domain-events.md)와 직결된다.\n\n### 5. 장애 허용 구간\n\n워크플로우 설계에서 중요한 질문은 \"어디까지 기다릴 수 있는가\"다.\n\n- 결제는 즉시성 요구가 높다.\n- 배송은 몇 초~몇 분 지연이 허용될 수 있다.\n- 알림은 eventual하게 도달하면 된다.\n\n따라서 step별 SLA가 달라야 한다.\n\n### 6. 관측성\n\n워크플로우는 추적이 어려우므로 다음이 필요하다.\n\n- correlation id\n- step별 상태 로그\n- timeout/ retry count\n- dead letter queue\n- 운영 대시보드\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문-결제-재고-배송\n\n흐름:\n\n1. 주문 생성\n2. 결제 승인\n3. 재고 예약\n4. 배송 요청\n5. 완료\n\n실패 시:\n\n- 결제 실패 -> 주문 실패\n- 재고 실패 -> 결제 취소\n- 배송 실패 -> 재고 해제 + 결제 취소 여부 판단\n\n### 시나리오 2: 환불 워크플로우\n\n환불은 역순 처리와 보상이 섞인다.\n\n- 결제 취소\n- 포인트 회수\n- 쿠폰 복구\n- 알림 발송\n\n### 시나리오 3: 휴먼 인 더 루프\n\n일부 워크플로우는 자동 실패보다 승인 대기 상태가 더 적절하다.\n\n- 이상 거래 검토\n- 수동 환불 승인\n- 운영자 재처리\n\n---\n\n## 코드로 보기\n\n```pseudo\nstate = getState(orderId)\n\nswitch state:\n  case PENDING:\n    callPayment()\n  case PAYMENT_DONE:\n    reserveInventory()\n  case RESERVED:\n    requestShipping()\n  case SHIPPED:\n    markComplete()\n```\n\n```java\npublic void advance(String orderId) {\n    WorkflowState state = workflowRepository.get(orderId);\n    switch (state) {\n        case PENDING -> paymentService.approve(orderId);\n        case PAYMENT_DONE -> inventoryService.reserve(orderId);\n        case RESERVED -> shippingService.request(orderId);\n        case SHIPPED -> workflowRepository.complete(orderId);\n        default -> throw new IllegalStateException(\"invalid state\");\n    }\n}\n```\n\n### 보상 예시\n\n```java\npublic void compensate(String orderId, WorkflowState failedAt) {\n    if (failedAt.ordinal() >= WorkflowState.PAYMENT_DONE.ordinal()) {\n        paymentService.cancel(orderId);\n    }\n    if (failedAt.ordinal() >= WorkflowState.RESERVED.ordinal()) {\n        inventoryService.release(orderId);\n    }\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Saga orchestration | 흐름이 명확하다 | 오케스트레이터가 커진다 | 주문/환불/승인 흐름 |\n| Choreography | 결합이 낮다 | 디버깅이 어렵다 | 이벤트 중심 도메인 |\n| 강한 분산 트랜잭션 | 일관성이 높다 | 사실상 확장 어렵다 | 매우 제한적 |\n| 단순 async chain | 구현이 쉽다 | 실패 복구가 약하다 | 작은 비즈니스 흐름 |\n\n핵심은 \"분산 트랜잭션을 대체하는 패턴\"이 아니라, **업무적으로 허용 가능한 실패 모델을 설계하는 방식**이라는 점이다.\n\n---\n\n## 꼬리질문\n\n> Q: Saga면 결국 롤백이 되는 건가요?\n> 의도: compensation과 rollback을 구분하는지 확인\n> 핵심: 아니다. compensation은 업무 보정이고, DB rollback과 다르다.\n\n> Q: choreography보다 orchestration이 항상 낫나요?\n> 의도: 패턴 선택 기준 이해 여부 확인\n> 핵심: 아니다. 흐름 추적과 제어가 중요하면 orchestration, 결합 최소화가 중요하면 choreography다.\n\n## 한 줄 정리\n\nSaga는 분산 시스템에서 로컬 트랜잭션과 보상 작업을 조합해 업무 흐름을 안전하게 전진시키는 상태 머신이다.\n",
+  "body_markdown": "# Workflow Orchestration + Saga 설계\n\n> 한 줄 요약: 여러 서비스가 관여하는 업무 흐름은 하나의 트랜잭션으로 묶지 말고, orchestration과 compensation으로 상태 전이를 관리해야 한다.\n\nretrieval-anchor-keywords: workflow orchestration, saga, compensation, state machine, approval workflow, human in the loop, repair campaign, long running operation, orchestration engine, timeout policy\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Outbox, Saga, Eventual Consistency](../software-engineering/outbox-inbox-domain-events.md)\n> - [Transaction 실전 시나리오](../database/transaction-case-studies.md)\n> - [멱등성 키와 중복 방지](../database/idempotency-key-and-deduplication.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](../network/connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [Replay / Repair Orchestration Control Plane 설계](./replay-repair-orchestration-control-plane-design.md)\n\n---\n\n## 핵심 개념\n\n워크플로우 오케스트레이션은 \"업무 순서\"를 코드/상태 머신으로 관리하는 것이다.  \nSaga는 그 과정에서 여러 로컬 트랜잭션을 묶고, 실패 시 compensation으로 되돌리는 패턴이다.\n\n이 패턴이 필요한 이유는 명확하다.\n\n- 결제, 재고, 배송, 알림이 서로 다른 서비스에 있다.\n- 하나의 DB 트랜잭션으로 묶을 수 없다.\n- 중간 실패를 허용하면서도 사용자 경험을 유지해야 한다.\n\n### 두 가지 스타일\n\n| 방식 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Orchestration | 흐름이 명시적이다 | 오케스트레이터가 복잡해진다 | 업무 순서가 중요할 때 |\n| Choreography | 서비스 간 결합이 낮다 | 흐름 추적이 어렵다 | 이벤트 중심 도메인 |\n\n---\n\n## 깊이 들어가기\n\n### 1. 상태 머신\n\nSaga는 결국 상태 머신이다.\n\n- `PENDING`\n- `PAYMENT_DONE`\n- `RESERVED`\n- `SHIPPED`\n- `COMPENSATED`\n- `FAILED`\n\n각 단계는 로컬 트랜잭션이어야 하고, 각 이벤트는 idempotent해야 한다.\n\n### 2. Orchestrator 역할\n\n오케스트레이터는 다음을 담당한다.\n\n- 다음 단계 호출\n- 타임아웃 관리\n- 재시도 정책\n- 보상 트리거\n- 최종 상태 기록\n\n오케스트레이터가 너무 똑똑해지면, 결국 분산 모놀리스가 된다.  \n그래서 흐름은 명시하되 비즈니스 규칙은 각 서비스에 남겨야 한다.\n\n### 3. 실패와 보상\n\n모든 실패가 rollback은 아니다.\n\n- 결제 성공 후 재고 실패 -> 결제 취소\n- 재고 성공 후 배송 실패 -> 재고 복구\n- 알림 실패 -> 보상보다 재시도/보류가 적절할 수 있음\n\n보상은 \"원래 상태로 완전히 되돌리기\"가 아니라 **업무적으로 허용 가능한 수정 작업**이다.\n\n### 4. Outbox와 Inbox\n\nSaga는 이벤트 전달이 안정적이어야 한다.  \n그때 필요한 것이 outbox/inbox다.\n\n- outbox: 로컬 트랜잭션과 이벤트 발행을 같이 기록\n- inbox: 중복 메시지를 한 번만 처리\n\n이 문맥은 [Outbox, Saga, Eventual Consistency](../software-engineering/outbox-inbox-domain-events.md)와 직결된다.\n\n### 5. 장애 허용 구간\n\n워크플로우 설계에서 중요한 질문은 \"어디까지 기다릴 수 있는가\"다.\n\n- 결제는 즉시성 요구가 높다.\n- 배송은 몇 초~몇 분 지연이 허용될 수 있다.\n- 알림은 eventual하게 도달하면 된다.\n\n따라서 step별 SLA가 달라야 한다.\n\n### 6. 관측성\n\n워크플로우는 추적이 어려우므로 다음이 필요하다.\n\n- correlation id\n- step별 상태 로그\n- timeout/ retry count\n- dead letter queue\n- 운영 대시보드\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문-결제-재고-배송\n\n흐름:\n\n1. 주문 생성\n2. 결제 승인\n3. 재고 예약\n4. 배송 요청\n5. 완료\n\n실패 시:\n\n- 결제 실패 -> 주문 실패\n- 재고 실패 -> 결제 취소\n- 배송 실패 -> 재고 해제 + 결제 취소 여부 판단\n\n### 시나리오 2: 환불 워크플로우\n\n환불은 역순 처리와 보상이 섞인다.\n\n- 결제 취소\n- 포인트 회수\n- 쿠폰 복구\n- 알림 발송\n\n### 시나리오 3: 휴먼 인 더 루프\n\n일부 워크플로우는 자동 실패보다 승인 대기 상태가 더 적절하다.\n\n- 이상 거래 검토\n- 수동 환불 승인\n- 운영자 재처리\n\n---\n\n## 코드로 보기\n\n```pseudo\nstate = getState(orderId)\n\nswitch state:\n  case PENDING:\n    callPayment()\n  case PAYMENT_DONE:\n    reserveInventory()\n  case RESERVED:\n    requestShipping()\n  case SHIPPED:\n    markComplete()\n```\n\n```java\npublic void advance(String orderId) {\n    WorkflowState state = workflowRepository.get(orderId);\n    switch (state) {\n        case PENDING -> paymentService.approve(orderId);\n        case PAYMENT_DONE -> inventoryService.reserve(orderId);\n        case RESERVED -> shippingService.request(orderId);\n        case SHIPPED -> workflowRepository.complete(orderId);\n        default -> throw new IllegalStateException(\"invalid state\");\n    }\n}\n```\n\n### 보상 예시\n\n```java\npublic void compensate(String orderId, WorkflowState failedAt) {\n    if (failedAt.ordinal() >= WorkflowState.PAYMENT_DONE.ordinal()) {\n        paymentService.cancel(orderId);\n    }\n    if (failedAt.ordinal() >= WorkflowState.RESERVED.ordinal()) {\n        inventoryService.release(orderId);\n    }\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Saga orchestration | 흐름이 명확하다 | 오케스트레이터가 커진다 | 주문/환불/승인 흐름 |\n| Choreography | 결합이 낮다 | 디버깅이 어렵다 | 이벤트 중심 도메인 |\n| 강한 분산 트랜잭션 | 일관성이 높다 | 사실상 확장 어렵다 | 매우 제한적 |\n| 단순 async chain | 구현이 쉽다 | 실패 복구가 약하다 | 작은 비즈니스 흐름 |\n\n핵심은 \"분산 트랜잭션을 대체하는 패턴\"이 아니라, **업무적으로 허용 가능한 실패 모델을 설계하는 방식**이라는 점이다.\n\n---\n\n## 꼬리질문\n\n> Q: Saga면 결국 롤백이 되는 건가요?\n> 의도: compensation과 rollback을 구분하는지 확인\n> 핵심: 아니다. compensation은 업무 보정이고, DB rollback과 다르다.\n\n> Q: choreography보다 orchestration이 항상 낫나요?\n> 의도: 패턴 선택 기준 이해 여부 확인\n> 핵심: 아니다. 흐름 추적과 제어가 중요하면 orchestration, 결합 최소화가 중요하면 choreography다.\n\n## 검색/운영 표면 보강\n\nworkflow orchestration과 saga 질의는 \"분산 트랜잭션 대신 saga\"라는 문장으로 끝나면 약하다. 실제 설계에서는 어떤 step이 로컬 트랜잭션인지, 어떤 실패가 retry인지 compensation인지, 사람이 승인하는 동안 timeout과 idempotency를 어떻게 유지하는지까지 상태 머신으로 설명해야 한다.\n\n운영 지표는 workflow instance와 step 단위로 나눈다.\n\n- `workflow_instance_age_p95`: 완료되지 않은 workflow의 나이\n- `step_retry_total`: step별 재시도 횟수\n- `compensation_trigger_total`: 보상 작업이 시작된 횟수\n- `compensation_failure_total`: 보상 자체가 실패한 횟수\n- `human_approval_queue_depth`: 수동 승인 대기량\n- `workflow_stuck_state_total`: timeout 뒤에도 전이되지 못한 상태 수\n\n품질 기준은 모든 것을 되돌리는 것이 아니라 업무적으로 허용 가능한 최종 상태로 수렴시키는 것이다. 결제 성공 뒤 재고 실패는 결제 취소가 보상일 수 있지만, 알림 실패는 보상보다 재시도와 DLQ가 맞을 수 있다. Orchestration은 흐름 추적과 timeout 제어가 좋고, choreography는 결합을 낮추지만 전체 상태를 추적하기 어렵다. 면접 답변에서는 이 선택 기준과 함께 outbox/inbox, idempotency key, repair campaign, 운영 대시보드를 붙여야 saga가 단순 패턴 암기가 아니라 장기 실행 작업의 실패 모델로 보인다.\n\n## 상태 전이 설계 체크리스트\n\nsaga 답변은 step 목록보다 전이 조건이 중요하다. 각 step은 command id나 idempotency key를 받아 같은 호출이 반복되어도 같은 결과로 수렴해야 한다. step이 성공했는지 모르는 timeout은 실패 확정이 아니라 unknown 상태다. 이 경우 orchestrator는 바로 compensation을 치기보다 상태 조회, retry budget, reconciliation step을 거쳐야 한다.\n\n보상 작업은 역순으로만 생각하면 부족하다. 이미 외부에 나간 이메일이나 push는 되돌릴 수 없고, 배송 요청은 취소 가능 시간이 지나면 refund나 고객 안내로 바뀐다. 그래서 compensation table에는 `undo 가능`, `forward fix 필요`, `manual review 필요` 같은 분류가 있어야 한다. 모든 step에 rollback 함수를 붙인다고 saga가 안전해지는 것은 아니다.\n\n운영 runbook도 설계 일부다. workflow instance가 특정 상태에 오래 머물면 timeout policy가 다음 상태를 정해야 한다. 자동 retry가 계속 실패하면 DLQ나 repair campaign으로 넘기고, 사람이 승인하는 단계는 approval SLA와 escalation owner를 둔다. replay 가능한 orchestrator를 쓴다면 deterministic code path와 side effect activity를 분리해야 한다. 그렇지 않으면 복구 중 같은 결제, 같은 재고 예약, 같은 알림이 다시 실행될 수 있다.\n\n## 한 줄 정리\n\nSaga는 분산 시스템에서 로컬 트랜잭션과 보상 작업을 조합해 업무 흐름을 안전하게 전진시키는 상태 머신이다.\n",
   "aliases": [
     "workflow orchestration",
     "saga",
     "compensation",
     "state machine",
     "approval workflow",
-    "human in the loop",
-    "repair campaign",
-    "long running operation",
     "orchestration engine",
-    "timeout policy",
-    "Workflow Orchestration + Saga 설계",
-    "workflow orchestration saga design"
+    "워크플로우 오케스트레이션",
+    "사가 보상 트랜잭션",
+    "분산 업무 상태 머신",
+    "장기 실행 작업 복구",
+    "승인 워크플로우 타임아웃",
+    "보상 단계 설계"
   ],
   "expected_queries": [
     "여러 서비스에 걸친 주문 처리를 하나의 DB transaction으로 묶지 않고 saga로 나누는 이유가 뭐야?",
     "workflow orchestration에서 state machine과 compensation step을 어디에 기록해야 해?",
     "approval workflow처럼 사람이 중간에 들어오는 긴 작업은 timeout과 retry를 어떻게 설계해?",
-    "orchestration engine을 쓰면 choreography보다 어떤 장애 복구가 쉬워져?"
+    "orchestration과 choreography 중 어떤 방식이 장애 복구와 추적에 더 유리해?",
+    "saga compensation이 DB rollback과 다른 이유를 주문 결제 재고 예시로 설명해줘"
   ],
   "symptoms": [
     "`Workflow Orchestration + Saga 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,10 +34,12 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "software-engineering/outbox-inbox-domain-events",
+      "database/idempotency-key-and-deduplication"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/durable-workflow-replay-idempotency-determinism-playbook",
+      "software-engineering/saga-compensation-failure-handling"
     ],
     "confusable_with": [
       "system-design/job-queue-design",
@@ -48,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/workflow-orchestration-saga-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

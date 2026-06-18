@@ -7,23 +7,22 @@
   "body_markdown": "# 분산 ID 생성 설계\n\n> 한 줄 요약: 분산 환경에서 충돌 없이, 정렬 가능하고, 샤드 친화적인 ID를 생성하는 방법을 설계한다.\n\nretrieval-anchor-keywords: distributed id generation, snowflake, uuidv7, ulid, monotonic id, shard key, hot partition, sequence, clock skew, base62\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)\n> - [URL 단축기 설계](./url-shortener-design.md)\n> - [Payment System Ledger, Idempotency, Reconciliation](./payment-system-ledger-idempotency-reconciliation-design.md)\n\n## 핵심 개념\n\nID 생성은 \"유일하면 끝\"이 아니다. 실무에서는 아래 성질을 같이 봐야 한다.\n\n- 전역 유일성\n- 시간 정렬 가능성\n- 샤드/파티션 친화성\n- 추측 가능성 낮음\n- 너무 길지 않은 표현\n- 장애와 시계 오차에 대한 내성\n\n즉, ID는 단순 식별자가 아니라 저장, 조회, 디버깅, 샤딩, 보안까지 영향을 주는 인프라 선택이다.\n\n## 깊이 들어가기\n\n### 1. 요구사항을 먼저 나눈다\n\nID가 필요한 이유를 먼저 분리한다.\n\n- 내부 조인용 숫자 키가 필요한가\n- 외부에 노출되는 공개 ID가 필요한가\n- 생성 순서가 보장되어야 하는가\n- 리전/서비스/노드를 역추적해야 하는가\n- 정렬 가능한 문자열이 필요한가\n\n하나의 ID로 모든 요구를 만족시키려 하면 오히려 복잡해진다. 실무에서는 내부 PK와 외부 공개 ID를 분리하는 경우가 많다.\n\n### 2. Capacity Estimation\n\n숫자 감각이 있어야 어떤 방식이 터질지 보인다.\n\n예를 들어:\n\n- 서비스 20개\n- 서비스당 초당 5,000개 ID 생성\n- 전체 생성량: 100,000 IDs/sec\n\n이 정도면 단일 DB sequence나 동기 중앙 발급기는 쉽게 병목이 된다.  \n반대로 각 노드가 독립적으로 생성하면 충돌 회피와 시계 관리가 중요해진다.\n\n계산할 때는 다음도 함께 본다.\n\n- 1일 생성량\n- 저장 시 인덱스 크기\n- ID를 문자열로 노출할 때의 길이\n- hot shard 가능성\n\n### 3. 대표적인 생성 방식\n\n| 방식 | 장점 | 단점 | 언제 쓰는가 |\n|---|---|---|---|\n| DB auto-increment | 단순하고 작다 | 단일 병목, 분산에 약하다 | 작은 서비스, 단일 DB |\n| 중앙 ID 서버 | 관리가 쉽다 | SPOF와 latency가 생긴다 | 내부 시스템, 낮은 QPS |\n| Hi/Lo 또는 segment | 발급량이 높다 | 세그먼트 관리가 필요하다 | 높은 처리량 |\n| Snowflake 계열 | 분산 생성에 강하다 | 시계와 node id가 중요하다 | 대규모 분산 시스템 |\n| ULID / UUIDv7 | 정렬성과 분산성을 함께 노린다 | 구현/표준 이해가 필요하다 | 공개 ID, 이벤트 ID |\n| 랜덤 UUID | 충돌이 매우 낮다 | 길고 정렬이 안 된다 | 단순 식별, 보안 우선 |\n\n실무에서는 내부 저장용 숫자 키와, 외부 공개용 정렬 문자열을 분리하는 설계도 흔하다.\n\n### 4. 시계 문제와 노드 문제\n\n분산 ID의 핵심 사고는 거의 항상 시계에서 시작한다.\n\n- NTP 보정으로 시간이 뒤로 갈 수 있다\n- 리전별 clock skew가 다를 수 있다\n- node id가 중복되면 충돌한다\n- timestamp 비트가 부족하면 수명이 짧아진다\n\n대응책:\n\n1. clock rollback을 감지하고 발급을 잠시 멈춘다.\n2. sequence overflow 시 다음 밀리초로 넘긴다.\n3. node id는 중앙 할당하거나 lease 기반으로 관리한다.\n4. 리전별 prefix를 넣어 충돌 범위를 줄인다.\n\n### 5. 샤딩과 hot partition\n\n순차 ID는 삽입이 빠를 수 있지만, 샤딩 기준으로 쓰면 마지막 샤드에 트래픽이 몰릴 수 있다.  \n반대로 무작위 ID는 쓰기는 고르게 퍼지지만, range query와 디버깅이 불편해진다.\n\n예:\n\n- `order_id`를 그대로 shard key로 쓰면 최신 row가 한쪽 끝에 몰릴 수 있다.\n- `user_id`와 `created_at` 조합으로 설계하면 조회 패턴에 맞출 수 있다.\n\n이 문제는 [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)과 같이 생각해야 한다.\n\n### 6. 공개 ID와 내부 ID를 분리한다\n\n공개 ID는 추측하기 어렵고 외부 노출에 안전해야 한다.\n\n- 내부 ID: 숫자형, 조인과 인덱스에 유리\n- 공개 ID: 짧거나 정렬 가능한 문자열, 외부 API와 URL에 유리\n\n예를 들어 URL 단축기나 주문 조회 API는 내부 PK를 그대로 노출하지 않는 편이 안전하다.\n\n### 7. 운영 관점 체크리스트\n\n- 중복 생성은 얼마나 빨리 감지되는가\n- 시계 오차가 발생하면 fail-open인지 fail-close인지\n- node id 할당이 재시작 후에도 안전한지\n- 리전 장애 때 ID prefix가 충돌하지 않는지\n- 로그와 메트릭으로 생성량을 추적할 수 있는지\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 번호를 외부에 노출해야 한다\n\n문제:\n\n- 주문 번호는 고객에게 보여야 한다\n- 너무 예측 가능하면 안 된다\n\n해결:\n\n- 내부 PK와 별도로 공개용 order code를 둔다\n- 공개용은 ULID/UUIDv7/Base62 조합을 고려한다\n- 조회 API는 공개 ID만 받는다\n\n### 시나리오 2: 이벤트 ID가 시간 순으로 정렬돼야 한다\n\n문제:\n\n- 로그/이벤트를 생성 순서대로 보고 싶다\n- 분산 환경이라도 대략적인 시간 정렬이 필요하다\n\n해결:\n\n- Snowflake 또는 UUIDv7처럼 k-sortable한 포맷을 쓴다\n- 리전 prefix와 sequence overflow 처리를 넣는다\n\n### 시나리오 3: 핫 키 회피가 중요하다\n\n문제:\n\n- 최신 ID가 하나의 shard로 쏠린다\n- 쓰기 병목이 생긴다\n\n해결:\n\n- shard key를 ID와 분리한다\n- write path는 분산시키고 read path는 별도 인덱스로 찾는다\n\n## 코드로 보기\n\n```pseudo\nfunction nextId():\n  now = currentMillis()\n  if now < lastTimestamp:\n    waitOrFail()\n  if now == lastTimestamp:\n    sequence = (sequence + 1) % MAX_SEQUENCE\n    if sequence == 0:\n      now = waitNextMillis(lastTimestamp)\n  else:\n    sequence = 0\n  lastTimestamp = now\n  return encode(now, regionId, nodeId, sequence)\n```\n\n```java\npublic String publicOrderCode(long internalId) {\n    return Base62.encode(internalId);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| DB sequence | 단순하고 짧다 | 중앙 병목 | 단일 DB, 낮은 복잡도 |\n| Snowflake | 고처리량, 정렬 가능 | 시계/노드 관리 필요 | 대규모 분산 시스템 |\n| UUIDv7/ULID | 분산성과 정렬성 균형 | 포맷이 길다 | 공개 ID, 이벤트 ID |\n| 랜덤 UUID | 충돌 걱정이 적다 | 조회/정렬이 불편 | 외부 노출만 중요한 경우 |\n| 내부 ID + 외부 ID 분리 | 유연하다 | 저장과 관리가 늘어난다 | 대부분의 실서비스 |\n\n핵심은 \"어떤 ID가 가장 멋진가\"가 아니라 **조회, 샤딩, 보안, 운영까지 같이 보면 무엇이 가장 덜 아픈가**다.\n\n## 꼬리질문\n\n> Q: UUIDv4 대신 UUIDv7을 쓰는 이유는 무엇인가요?\n> 의도: 정렬성과 분산성의 균형을 이해하는지 확인\n> 핵심: UUIDv7은 시간 순 정렬에 유리해서 인덱스와 조회 패턴에 더 잘 맞는다.\n\n> Q: Snowflake에서 시간이 뒤로 가면 어떻게 하나요?\n> 의도: clock skew와 failover 감각 확인\n> 핵심: 발급 중단, sequence 조정, node 재할당 같은 보호 장치가 필요하다.\n\n> Q: DB auto-increment는 왜 분산에 불리한가요?\n> 의도: 중앙 병목과 샤딩 문제 이해 확인\n> 핵심: 중앙 발급 의존도가 높아지고, scale-out 시 발급 지점이 병목이 된다.\n\n> Q: 공개 ID를 내부 ID와 분리하는 이유는 무엇인가요?\n> 의도: 보안과 운영 관점 확인\n> 핵심: 추측 가능성, URL 노출, 마이그레이션 유연성을 같이 확보할 수 있다.\n\n## 한 줄 정리\n\n분산 ID 설계는 유일성만 맞추는 문제가 아니라, 정렬, 샤딩, 보안, 시계 오차, 운영 난이도까지 함께 최적화하는 문제다.\n\n",
   "aliases": [
     "distributed id generation",
-    "snowflake",
+    "snowflake id",
     "uuidv7",
     "ulid",
-    "monotonic id",
-    "shard key",
-    "hot partition",
-    "sequence",
-    "clock skew",
-    "base62",
-    "분산 ID 생성 설계",
-    "distributed id generation design"
+    "분산 ID 생성",
+    "스노우플레이크 ID",
+    "정렬 가능한 ID",
+    "샤드 친화 ID",
+    "clock skew id",
+    "public order code"
   ],
   "expected_queries": [
-    "여러 서버가 동시에 ID를 만들 때 DB sequence 하나에만 의존하면 어떤 병목이 생겨?",
-    "Snowflake, UUIDv7, ULID는 정렬 가능성과 충돌 가능성에서 어떻게 달라?",
-    "분산 ID에 시간 정보와 shard id를 넣으면 어떤 장점과 노출 위험이 있어?",
-    "주문 번호를 전역으로 유일하게 만들면서 hot partition을 피하려면 무엇을 봐야 해?"
+    "Snowflake ID에서 clock rollback이 생기면 발급기는 어떻게 동작해야 해?",
+    "UUIDv7과 ULID를 공개 ID로 쓸 때 정렬성과 길이 tradeoff는 뭐야?",
+    "주문 번호를 외부에 보여 줄 때 내부 PK와 public code를 왜 나눠?",
+    "순차 ID를 shard key로 쓰면 hot partition이 생기는 이유가 뭐야?",
+    "node id 중복이나 sequence overflow를 운영에서 어떻게 감지해?"
   ],
   "symptoms": [
     "`분산 ID 생성 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +32,32 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/back-of-envelope-estimation",
+      "system-design/shard-key-selection-basics"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/distributed-id-snowflake-uuidv7-hlc-chooser",
+      "database/distributed-uniqueness-id-allocation-consistency",
+      "system-design/url-shortener-design"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/shard-key-selection-basics",
+      "database/idempotency-key-and-deduplication",
+      "database/btree-vs-hash-index-chooser"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/distributed-id-generation-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }

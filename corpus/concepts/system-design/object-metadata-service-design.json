@@ -4,26 +4,27 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "이 문서는 system-design 카테고리에서 Object Metadata Service 설계를 다루는 deep_dive 문서다. object metadata service는 대용량 파일의 위치, 버전, 권한, 무결성 정보를 중앙에서 관리하는 스토리지 제어 평면이다. 검색 질의가 object metadata service, bucket, object key, versioning처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
-  "body_markdown": "# Object Metadata Service 설계\n\n> 한 줄 요약: object metadata service는 대용량 파일의 위치, 버전, 권한, 무결성 정보를 중앙에서 관리하는 스토리지 제어 평면이다.\n\nretrieval-anchor-keywords: object metadata service, bucket, object key, versioning, checksum, lifecycle, multipart upload, presigned url, replication, metadata partition\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [File Storage, Presigned URL, CDN 설계](./file-storage-presigned-url-cdn-design.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)\n\n## 핵심 개념\n\n오브젝트 저장은 바이너리만 저장한다고 끝나지 않는다.  \n실전에서는 metadata가 더 중요할 때가 많다.\n\n- object key\n- version\n- owner\n- checksum\n- content type\n- lifecycle state\n- encryption metadata\n- replication status\n\n즉, metadata service는 파일 스토리지의 진짜 뇌다.\n\n## 깊이 들어가기\n\n### 1. Metadata와 blob storage를 분리한다\n\n대용량 파일은 object storage에 두고, 메타데이터는 별도 DB에 둔다.\n\n이유:\n\n- 조회 패턴이 다르다\n- 권한/버전/상태가 중요하다\n- blob 전체를 읽지 않아도 된다\n\n### 2. Capacity Estimation\n\n예:\n\n- 10억 objects\n- object당 metadata 1 KB\n\n메타데이터만으로도 엄청난 규모가 된다.  \n여기서 중요한 건 단순 저장량보다 인덱스, partition, lookup latency다.\n\n봐야 할 숫자:\n\n- metadata lookup QPS\n- upload commit latency\n- version count\n- replication lag\n- lifecycle job backlog\n\n### 3. 데이터 모델\n\n핵심 필드:\n\n- bucket_id\n- object_key\n- version_id\n- size\n- checksum\n- storage_class\n- created_at\n- deleted_at\n- owner_id\n- encryption_key_id\n\n버전이 있으면 삭제도 보통 soft delete나 tombstone으로 처리한다.\n\n### 4. 업로드 흐름\n\n일반적인 흐름:\n\n1. client가 upload intent를 만든다\n2. metadata service가 presigned URL 또는 upload session을 발급한다\n3. client가 blob store에 업로드한다\n4. commit 시 metadata를 최종 확정한다\n\n이 흐름이 없으면 업로드 중단/재시도에서 상태가 꼬인다.\n\n### 5. 일관성\n\nobject metadata는 강한 일관성이 필요한 경로와 eventual consistency가 가능한 경로가 섞인다.\n\n- 새 object 생성: 강한 일관성 선호\n- replication status: eventual consistency 허용\n- listing: 약간의 지연 허용\n- delete marker: 정책에 따라 다름\n\n### 6. Lifecycle와 TTL\n\n오브젝트는 영원히 보관되지 않는다.\n\n- temporary upload\n- archive transition\n- expired delete\n- legal hold\n\n지연 job으로 lifecycle을 관리하면 오브젝트 수명이 시스템 정책과 맞는다.\n\n### 7. 검색과 메타데이터\n\n사용자는 종종 파일 이름, owner, tag로 찾고 싶어 한다.\n\n그 경우:\n\n- metadata index\n- full-text search\n- tag index\n\n를 분리한다.\n\n이 부분은 [Search 시스템 설계](./search-system-design.md)와 [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1: presigned upload\n\n문제:\n\n- 클라이언트가 직접 대용량 파일을 올려야 한다\n\n해결:\n\n- metadata service가 upload session 발급\n- blob store에 직접 업로드\n- commit 시 metadata 확정\n\n### 시나리오 2: 버전 복구\n\n문제:\n\n- 실수로 잘못된 버전을 덮었다\n\n해결:\n\n- version history를 유지\n- 이전 버전으로 restore\n\n### 시나리오 3: 대량 listing\n\n문제:\n\n- bucket에 object가 너무 많아 listing이 느리다\n\n해결:\n\n- partitioned metadata store\n- prefix index\n- pagination cursor\n\n## 코드로 보기\n\n```pseudo\nfunction createUpload(bucket, key, user):\n  version = newVersionId()\n  session = createUploadSession(bucket, key, version, user)\n  return presignedUrl(session)\n\nfunction commitUpload(session, checksum):\n  validate(session, checksum)\n  metadataStore.save(session.object, checksum, state=\"READY\")\n```\n\n```java\npublic ObjectMetadata commit(UploadSession session, String checksum) {\n    validateChecksum(session, checksum);\n    return metadataRepository.save(session.toMetadata(checksum));\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Metadata DB + blob store | 분리가 명확하다 | 시스템이 둘로 나뉜다 | 대부분의 object storage |\n| Inline metadata in blob store | 단순하다 | 조회/검색이 약하다 | 작은 시스템 |\n| Versioned metadata | 복구가 쉽다 | 저장이 늘어난다 | 실서비스 |\n| Eventual listing | 확장성이 좋다 | 최신성 지연 | 대규모 bucket |\n| Strong commit confirmation | 안전하다 | latency 증가 | 중요 파일 업로드 |\n\n핵심은 오브젝트 스토리지가 단순 파일 저장이 아니라 **버전, 정책, 검색, 복구를 담는 데이터 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: 왜 blob와 metadata를 분리하나요?\n> 의도: 저장 구조 분리 이유 이해 확인\n> 핵심: 조회, 권한, 버전, lifecycle이 blob보다 metadata에 더 가깝기 때문이다.\n\n> Q: listing이 왜 어려운가요?\n> 의도: 대규모 prefix 탐색 이해 확인\n> 핵심: object 수가 많으면 prefix 탐색과 pagination이 비용이 커진다.\n\n> Q: versioning이 왜 중요한가요?\n> 의도: 복구와 감사 이해 확인\n> 핵심: 실수 overwrite와 삭제 후 복구를 가능하게 한다.\n\n> Q: presigned URL은 왜 쓰나요?\n> 의도: 대용량 업로드 경로 이해 확인\n> 핵심: 서버를 경유하지 않고 직접 업로드해 확장성을 확보한다.\n\n## 한 줄 정리\n\nObject metadata service는 blob storage의 위치, 버전, 정책, 검색 가능성을 관리해 대용량 파일 시스템의 제어 평면 역할을 한다.\n\n",
+  "body_markdown": "# Object Metadata Service 설계\n\n> 한 줄 요약: object metadata service는 대용량 파일의 위치, 버전, 권한, 무결성 정보를 중앙에서 관리하는 스토리지 제어 평면이다.\n\nretrieval-anchor-keywords: object metadata service, bucket, object key, versioning, checksum, lifecycle, multipart upload, presigned url, replication, metadata partition\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [File Storage, Presigned URL, CDN 설계](./file-storage-presigned-url-cdn-design.md)\n> - [Distributed Cache 설계](./distributed-cache-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)\n\n## 핵심 개념\n\n오브젝트 저장은 바이너리만 저장한다고 끝나지 않는다.  \n실전에서는 metadata가 더 중요할 때가 많다.\n\n- object key\n- version\n- owner\n- checksum\n- content type\n- lifecycle state\n- encryption metadata\n- replication status\n\n즉, metadata service는 파일 스토리지의 진짜 뇌다.\n\n## 깊이 들어가기\n\n### 1. Metadata와 blob storage를 분리한다\n\n대용량 파일은 object storage에 두고, 메타데이터는 별도 DB에 둔다.\n\n이유:\n\n- 조회 패턴이 다르다\n- 권한/버전/상태가 중요하다\n- blob 전체를 읽지 않아도 된다\n\n### 2. Capacity Estimation\n\n예:\n\n- 10억 objects\n- object당 metadata 1 KB\n\n메타데이터만으로도 엄청난 규모가 된다.  \n여기서 중요한 건 단순 저장량보다 인덱스, partition, lookup latency다.\n\n봐야 할 숫자:\n\n- metadata lookup QPS\n- upload commit latency\n- version count\n- replication lag\n- lifecycle job backlog\n\n### 3. 데이터 모델\n\n핵심 필드:\n\n- bucket_id\n- object_key\n- version_id\n- size\n- checksum\n- storage_class\n- created_at\n- deleted_at\n- owner_id\n- encryption_key_id\n\n버전이 있으면 삭제도 보통 soft delete나 tombstone으로 처리한다.\n\n### 4. 업로드 흐름\n\n일반적인 흐름:\n\n1. client가 upload intent를 만든다\n2. metadata service가 presigned URL 또는 upload session을 발급한다\n3. client가 blob store에 업로드한다\n4. commit 시 metadata를 최종 확정한다\n\n이 흐름이 없으면 업로드 중단/재시도에서 상태가 꼬인다.\n\n### 5. 일관성\n\nobject metadata는 강한 일관성이 필요한 경로와 eventual consistency가 가능한 경로가 섞인다.\n\n- 새 object 생성: 강한 일관성 선호\n- replication status: eventual consistency 허용\n- listing: 약간의 지연 허용\n- delete marker: 정책에 따라 다름\n\n### 6. Lifecycle와 TTL\n\n오브젝트는 영원히 보관되지 않는다.\n\n- temporary upload\n- archive transition\n- expired delete\n- legal hold\n\n지연 job으로 lifecycle을 관리하면 오브젝트 수명이 시스템 정책과 맞는다.\n\n### 7. 검색과 메타데이터\n\n사용자는 종종 파일 이름, owner, tag로 찾고 싶어 한다.\n\n그 경우:\n\n- metadata index\n- full-text search\n- tag index\n\n를 분리한다.\n\n이 부분은 [Search 시스템 설계](./search-system-design.md)와 [Search 인덱싱 파이프라인 설계](./search-indexing-pipeline-design.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1: presigned upload\n\n문제:\n\n- 클라이언트가 직접 대용량 파일을 올려야 한다\n\n해결:\n\n- metadata service가 upload session 발급\n- blob store에 직접 업로드\n- commit 시 metadata 확정\n\n### 시나리오 2: 버전 복구\n\n문제:\n\n- 실수로 잘못된 버전을 덮었다\n\n해결:\n\n- version history를 유지\n- 이전 버전으로 restore\n\n### 시나리오 3: 대량 listing\n\n문제:\n\n- bucket에 object가 너무 많아 listing이 느리다\n\n해결:\n\n- partitioned metadata store\n- prefix index\n- pagination cursor\n\n## 코드로 보기\n\n```pseudo\nfunction createUpload(bucket, key, user):\n  version = newVersionId()\n  session = createUploadSession(bucket, key, version, user)\n  return presignedUrl(session)\n\nfunction commitUpload(session, checksum):\n  validate(session, checksum)\n  metadataStore.save(session.object, checksum, state=\"READY\")\n```\n\n```java\npublic ObjectMetadata commit(UploadSession session, String checksum) {\n    validateChecksum(session, checksum);\n    return metadataRepository.save(session.toMetadata(checksum));\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Metadata DB + blob store | 분리가 명확하다 | 시스템이 둘로 나뉜다 | 대부분의 object storage |\n| Inline metadata in blob store | 단순하다 | 조회/검색이 약하다 | 작은 시스템 |\n| Versioned metadata | 복구가 쉽다 | 저장이 늘어난다 | 실서비스 |\n| Eventual listing | 확장성이 좋다 | 최신성 지연 | 대규모 bucket |\n| Strong commit confirmation | 안전하다 | latency 증가 | 중요 파일 업로드 |\n\n핵심은 오브젝트 스토리지가 단순 파일 저장이 아니라 **버전, 정책, 검색, 복구를 담는 데이터 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: 왜 blob와 metadata를 분리하나요?\n> 의도: 저장 구조 분리 이유 이해 확인\n> 핵심: 조회, 권한, 버전, lifecycle이 blob보다 metadata에 더 가깝기 때문이다.\n\n> Q: listing이 왜 어려운가요?\n> 의도: 대규모 prefix 탐색 이해 확인\n> 핵심: object 수가 많으면 prefix 탐색과 pagination이 비용이 커진다.\n\n> Q: versioning이 왜 중요한가요?\n> 의도: 복구와 감사 이해 확인\n> 핵심: 실수 overwrite와 삭제 후 복구를 가능하게 한다.\n\n> Q: presigned URL은 왜 쓰나요?\n> 의도: 대용량 업로드 경로 이해 확인\n> 핵심: 서버를 경유하지 않고 직접 업로드해 확장성을 확보한다.\n\n## 운영 검증\n\nObject metadata service는 blob store보다 작은 데이터를 다루지만 장애 영향은 더 크다. metadata가 틀리면 파일은 존재해도 권한, 버전, lifecycle, 검색 결과가 모두 흔들린다.\n\n| 신호 | 확인할 것 | 위험한 해석 |\n|---|---|---|\n| upload commit failure rate | blob 업로드 성공 뒤 metadata 확정 실패를 본다 | blob이 있으니 성공으로 간주 |\n| orphan blob count | metadata 없는 object를 청소해야 하는지 본다 | lifecycle job backlog로만 처리 |\n| metadata lookup p99 | bucket/prefix partition hotspot을 찾는다 | 전체 QPS 평균만 봄 |\n| checksum mismatch | client, multipart, commit checksum 경계를 분리한다 | 네트워크 오류로만 분류 |\n| listing lag | write 직후 list에 보이는 지연을 측정한다 | read-after-write 실패와 listing eventual consistency를 섞음 |\n\n업로드 경로에서는 `intent -> direct upload -> commit`의 세 상태가 관찰 가능해야 한다. commit 전 파일은 임시 상태이고, commit 후 metadata row가 source of truth가 된다. 이 경계가 없으면 재시도, 중단, cleanup이 모두 추측이 된다.\n\n## 잘못 고르기 쉬운 이웃 개념\n\nPresigned URL 설계는 클라이언트가 blob store에 직접 쓰도록 하는 접근 방식이고, object metadata service는 그 업로드를 어떤 object/version/owner/checksum으로 확정할지 결정한다. URL 발급만 있어서는 lifecycle, version restore, legal hold, search index를 설명할 수 없다.\n\nSearch indexing pipeline은 metadata를 검색 가능하게 복제한 read model에 가깝다. 원본 metadata store가 권한과 버전의 기준이고, search index는 지연될 수 있는 조회 최적화 계층이다. 따라서 검색 결과 누락과 metadata commit 실패를 같은 장애로 묶으면 원인 분석이 흐려진다.\n\n\n## 한 줄 정리\n\nObject metadata service는 blob storage의 위치, 버전, 정책, 검색 가능성을 관리해 대용량 파일 시스템의 제어 평면 역할을 한다.\n\n",
   "aliases": [
-    "object metadata service",
-    "bucket",
-    "object key",
-    "versioning",
-    "checksum",
-    "lifecycle",
-    "multipart upload",
-    "presigned url",
-    "replication",
-    "metadata partition",
-    "Object Metadata Service 설계",
-    "object metadata service design"
+    "object metadata control plane",
+    "versioned object metadata",
+    "metadata commit protocol",
+    "upload session metadata",
+    "object lifecycle index",
+    "bucket prefix partition",
+    "오브젝트 메타데이터 서비스",
+    "파일 메타데이터 제어 평면",
+    "업로드 세션 확정",
+    "버전별 object metadata",
+    "metadata partition 설계",
+    "checksum commit 검증"
   ],
   "expected_queries": [
     "파일 본문은 object storage에 두더라도 위치, 버전, 권한 metadata를 따로 관리해야 하는 이유가 뭐야?",
     "bucket과 object key, checksum, lifecycle 정보를 한 metadata service에서 관리하면 어떤 장점이 있어?",
     "presigned URL 발급 전에 object metadata에서 권한과 버전을 확인해야 하는 이유가 뭐야?",
-    "multipart upload가 끝난 뒤 metadata commit이 실패하면 파일 저장 시스템은 어떤 상태가 돼?"
+    "multipart upload가 끝난 뒤 metadata commit이 실패하면 파일 저장 시스템은 어떤 상태가 돼?",
+    "대량 bucket listing이 느릴 때 prefix partition과 metadata index를 어떤 지표로 점검해?"
   ],
   "symptoms": [
     "`Object Metadata Service 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -33,20 +34,27 @@
   ],
   "relations": {
     "prerequisites": [
-      "system-design/load-balancing-basics-primer"
+      "system-design/file-storage-presigned-url-cdn-design"
     ],
     "next_docs": [
-      "system-design/load-balancer-layer4-vs-layer7-intermediate-primer"
+      "system-design/object-storage-presigned-url-multipart-upload-playbook"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "system-design/search-indexing-pipeline-design"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/object-metadata-service-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch151"
+      }
+    ]
   }
 }
