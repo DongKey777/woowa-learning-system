@@ -6,12 +6,16 @@
   "summary": "이 문서는 parseInt, parseLong, Math.toIntExact를 중심으로 parser overflow, narrowing conversion, numeric payload validation boundary를 점검하는 advanced playbook이다.",
   "body_markdown": "# Parser Overflow Boundaries: `parseInt`, `parseLong`, and `toIntExact`\n\n> 한 줄 요약: parser overflow는 연산 overflow와 다른 층의 문제다. 입력 문자열이 아예 타입 범위를 넘는지, parse 후 축소 변환에서 깨지는지, whitespace/sign/radix를 어디까지 허용할지 정하지 않으면 숫자 payload 경계가 구현마다 달라진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Integer Overflow, Exact Arithmetic, and Unit Conversion Pitfalls](./integer-overflow-exact-arithmetic-unit-conversion-pitfalls.md)\n> - [`BigInteger`, Unsigned Parsing, and Numeric Boundary Semantics](./biginteger-unsigned-parsing-boundaries.md)\n> - [`BigInteger` Parser Radix, Leading Zero, and Sign Policies](./biginteger-radix-leading-zero-sign-policies.md)\n> - [Primitive vs Wrapper Fields in JSON Payload Semantics](./primitive-vs-wrapper-fields-json-payload-semantics.md)\n\n> retrieval-anchor-keywords: parser overflow, parseInt boundary, parseLong boundary, toIntExact, NumberFormatException, numeric payload validation, parse boundary, input range validation, narrowing conversion, string to int contract\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n숫자 payload boundary에는 보통 세 단계가 있다.\n\n- 문자열이 문법상 숫자인가\n- 그 숫자가 목표 타입 범위 안인가\n- parse 후 다른 더 작은 타입으로 줄여도 되는가\n\n즉 parser는 단순 문자열 변환이 아니라 범위 검증기다.\n\n## 깊이 들어가기\n\n### 1. parser overflow는 계산 overflow와 다르다\n\n`Integer.parseInt(\"999999999999\")`는 계산 결과가 wrap되지 않는다.  \n보통 `NumberFormatException`으로 경계를 넘었다는 사실을 바로 드러낸다.\n\n즉 parse boundary는 fail-fast이고,  \n계산 overflow는 silent wraparound일 수 있다.\n\n### 2. narrowing conversion도 별도 boundary다\n\n`long`으로는 읽히지만 `int`로는 안 되는 값이 있다.\n\n예:\n\n- DB bigint 읽기\n- external ID parsing\n- pagination size parsing 후 API 내부 int 사용\n\n이 경우는 parse 성공 후에도 `Math.toIntExact()` 같은 축소 변환 boundary가 필요하다.\n\n### 3. trim/sign/radix 정책이 parser contract 일부다\n\n이 경계에서 흔한 질문:\n\n- 앞뒤 공백 허용 여부\n- `+42` 허용 여부\n- leading zero 허용 여부\n- radix 10 고정 여부\n\n이걸 문서화하지 않으면 같은 API라도 구현마다 behavior가 달라진다.\n\n### 4. parser 에러를 domain 에러로 번역하는 계층이 필요할 수 있다\n\n`NumberFormatException` 자체는 low-level 예외다.  \nAPI boundary에서는 다음을 같이 정해야 한다.\n\n- 400 validation error로 바꿀지\n- field-level error로 묶을지\n- raw input을 로그/메트릭에 어떻게 남길지\n\n즉 parser boundary는 exception mapping boundary이기도 하다.\n\n### 5. 너무 이른 primitive parse는 intent를 잃을 수 있다\n\nJSON binding 단계에서 바로 primitive로 떨어뜨리면:\n\n- missing\n- invalid number\n- overflow\n- narrowing failure\n\n를 더 정교하게 구분하기 어려울 수 있다.\n\n## 재현 조건\n\n이 문제는 보통 \"숫자로 보이는 문자열\"이 실제로는 서로 다른 실패 원인을 갖는 입력일 때 드러난다.\n\n- `Integer.MAX_VALUE`보다 큰 문자열을 `parseInt`로 직접 읽는다\n- `Long.parseLong(...)`은 성공하지만 `Math.toIntExact(...)`는 실패하는 값을 넣는다\n- `\" 42 \"`, `\"+42\"`, `\"042\"`, `\"0x2A\"`처럼 문법 정책이 갈리는 값을 여러 API 경로에 넣는다\n- JSON binding이 먼저 primitive로 값을 만들어 missing, invalid, overflow를 같은 400 응답으로 뭉갠다\n\n재현의 핵심은 단순히 \"큰 숫자를 넣어 본다\"가 아니라, 문법 실패와 타입 범위 실패와 domain 범위 실패를 같은 테스트에서 분리해 보는 것이다.\n\n## failure matrix\n\n| 입력/상황 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| `\"999999999999\"`를 `parseInt`로 읽음 | arithmetic overflow | parser range overflow | `NumberFormatException`, wraparound 없음 |\n| `2147483648`을 `long`으로 읽은 뒤 `int`로 사용 | parser 실패 | narrowing conversion 실패 | `parseLong` 성공, `toIntExact` 실패 |\n| `\" 42 \"`가 API A에서는 성공하고 B에서는 실패 | 사용자 입력 실수 | trim policy 불일치 | boundary별 parser contract 차이 |\n| missing field가 `0`으로 들어옴 | 숫자 0 입력 | payload presence 손실 | raw payload와 DTO 값 불일치 |\n| `-1` page size가 parse는 성공 | parser 문제 | domain validation 문제 | parse 성공 후 invariant 실패 |\n\n## 검증/validation\n\n- boundary value를 `MAX_VALUE`, `MAX_VALUE + 1`, `MIN_VALUE`, `MIN_VALUE - 1` 근처로 parameterized test에 넣는다.\n- parse 실패, narrowing 실패, domain validation 실패가 서로 다른 error code나 field message로 매핑되는지 본다.\n- API contract에 trim, sign, radix, leading zero 허용 여부를 명시하고 controller/service 양쪽에서 같은 helper를 쓰는지 확인한다.\n- 로그와 metric에는 raw payload 전체를 남기기보다 field명, failure bucket, 길이, sample-safe 값 정도를 남긴다.\n\n## 오해와 wrong bucket\n\n- `parseInt` overflow를 산술 overflow처럼 설명하면 틀린 bucket이다. parser는 범위를 넘는 문자열을 보통 예외로 거부하고, `int` 연산처럼 조용히 wrap하지 않는다.\n- `Long.parseLong` 성공을 곧 `int` 사용 가능으로 해석하면 narrowing boundary를 놓친 것이다.\n- `NumberFormatException`을 그대로 domain exception으로 노출하면 \"무슨 정책을 위반했는가\"가 흐려진다. API boundary에서는 field-level validation 실패로 번역하는 편이 보통 더 읽기 쉽다.\n\n## 실전 시나리오\n\n### 시나리오 1: 외부 payload는 `long`인데 내부 API는 `int`다\n\nparse는 성공하지만 캐스팅 순간 잘리거나 예외가 난다.  \nboundary를 하나로 착각한 전형적인 사례다.\n\n### 시나리오 2: `\" 42 \"` 입력이 어떤 경로에선 되고 어떤 경로에선 안 된다\n\ntrim policy가 일관되지 않다.  \nAPI contract가 구현 detail에 묻힌 상태다.\n\n### 시나리오 3: 너무 큰 page size가 validation 없이 내려온다\n\n문자열 -> long parse는 성공하고, 내부에서 int cast가 조용히 이뤄지면 runtime correctness가 흔들린다.\n\n## 코드로 보기\n\n### 1. parse boundary\n\n```java\nint page = Integer.parseInt(rawPage);\n```\n\n### 2. narrowing boundary\n\n```java\nlong rawLimit = Long.parseLong(raw);\nint limit = Math.toIntExact(rawLimit);\n```\n\n### 3. domain validation과 분리\n\n```java\nif (limit <= 0) {\n    throw new IllegalArgumentException(\"limit must be positive\");\n}\n```\n\nparse 성공과 domain validity는 다른 문제다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| 바로 primitive parse | 구현이 단순하다 | policy와 에러 의미가 숨기 쉽다 |\n| `long` 후 `toIntExact` | boundary를 더 명확히 나눌 수 있다 | 코드가 조금 길어진다 |\n| `BigInteger`로 먼저 읽기 | 범위를 더 넓게 다룰 수 있다 | 일반 API엔 과할 수 있다 |\n\n핵심은 parser를 문자열 변환이 아니라 범위/정책/에러 번역 경계로 보는 것이다.\n\n## 꼬리질문\n\n> Q: parser overflow와 계산 overflow 차이는 무엇인가요?\n> 핵심: parser overflow는 보통 즉시 예외로 드러나고, 계산 overflow는 wraparound로 숨어들 수 있다.\n\n> Q: 왜 `toIntExact`가 중요한가요?\n> 핵심: parse 성공 이후의 narrowing conversion boundary를 명시적으로 드러내기 때문이다.\n\n> Q: parser 정책을 왜 문서화하나요?\n> 핵심: 공백, 부호, radix, leading zero 허용 여부가 API behavior를 바꾸기 때문이다.\n\n## 한 줄 정리\n\n숫자 parser boundary는 문자열 문법, 범위 검증, narrowing conversion, 에러 번역을 함께 다루는 계약이므로 `parseInt()` 한 줄로 끝나지 않는다.\n",
   "aliases": [
-    "Parser Overflow Boundaries parseInt parseLong toIntExact",
-    "Java parseInt parseLong toIntExact boundary",
-    "NumberFormatException numeric payload validation",
-    "parser overflow vs arithmetic overflow",
-    "narrowing conversion Math.toIntExact",
-    "자바 숫자 파싱 오버플로 경계"
+    "parseInt parseLong boundary",
+    "Math.toIntExact narrowing",
+    "NumberFormatException range validation",
+    "parser overflow boundary",
+    "numeric payload validation",
+    "narrowing conversion failure",
+    "숫자 파싱 오버플로",
+    "parseInt 범위 초과",
+    "toIntExact 축소 변환",
+    "숫자 payload 검증"
   ],
   "expected_queries": [
     "parseInt와 parseLong overflow는 arithmetic overflow와 어떻게 다르게 실패해?",
@@ -48,8 +52,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/parser-overflow-boundaries-parseint-parselong-tointexact.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149",
+        "changes": [
+          "alias-query-contract-repair"
+        ]
+      }
+    ]
   }
 }

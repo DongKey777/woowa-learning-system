@@ -6,13 +6,14 @@
   "summary": "CDS는 Java heap을 줄이는 마법이 아니라, 로딩된 class metadata 일부를 공유 아카이브로 재사용해 startup과 private footprint를 줄이는 JVM 기능이다.",
   "body_markdown": "# Class Data Sharing Startup and Memory Primer\n\n> 한 줄 요약: CDS는 Java heap을 줄이는 마법이 아니라, 로딩된 class metadata 일부를 공유 아카이브로 재사용해 startup과 private footprint를 줄이는 JVM 기능이다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [Java 실행 모델과 객체 메모리 mental model 입문](./java-execution-object-memory-mental-model-primer.md)\n> - [Class Data Sharing and AppCDS](./class-data-sharing-appcds.md)\n> - [CDS Startup Profiling](./cds-startup-profiling.md)\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [JFR and JMC Performance Playbook](./jfr-jmc-performance-playbook.md)\n> - [String Intern, Constant Pool, and Memory Deep Dive](./string-intern-constant-pool-memory-deep-dive.md)\n\n> retrieval-anchor-keywords:\n> - CDS\n> - AppCDS\n> - class data sharing\n> - shared archive\n> - SharedArchiveFile\n> - ArchiveClassesAtExit\n> - memory mapped metadata\n> - metaspace\n> - startup footprint\n> - Xshare\n\n## 핵심 개념\n\nCDS(Class Data Sharing)는 JVM이 class metadata를 매번 새로 준비하지 않도록, 미리 만든 shared archive를 시작 시점에 memory-map해서 쓰는 기능이다.\n\n입문 단계에서는 아래처럼 분리하면 된다.\n\n| 영역 | CDS가 직접 겨냥하나 | 설명 |\n|---|---|---|\n| Java heap | 보통 직접 대상 아님 | 애플리케이션 객체가 사는 곳이다 |\n| metaspace/class metadata | 예 | 로딩된 class 정보 일부를 archive 형태로 재사용한다 |\n| process RSS | 간접 영향 | read-only mapped page가 여러 JVM 사이에서 공유될 수 있다 |\n| JIT compiled code | 아님 | warmup과 compilation은 별도 문제다 |\n| first request latency | 일부만 | class loading은 줄어도 lazy init, JIT, remote IO는 남는다 |\n\n즉 \"CDS를 켰더니 heap dump가 작아진다\"가 핵심이 아니다. 더 정확한 기대치는 **class loading 초기 비용과 private memory footprint 감소**다.\n\n## startup에서 무슨 일이 줄어드나\n\n일반적인 JVM 시작 흐름에는 class 파일 탐색, 로딩, verification, metadata 생성, 초기화가 섞인다. CDS는 이 중 일부 class metadata와 로딩 준비 비용을 archive로 미리 정리한다.\n\n그래서 효과가 보이는 지점은 보통 아래다.\n\n- class loading 시간이 줄어든다.\n- 여러 JVM 인스턴스가 같은 archive page를 공유할 수 있다.\n- framework class가 많은 애플리케이션에서 cold start가 줄어들 수 있다.\n\n하지만 `static initializer`, application lazy init, DB connection, cache warmup, JIT compilation은 별도다. CDS 적용 후에도 첫 요청이 느리면 [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)이나 lazy initialization 경로를 따로 봐야 한다.\n\n## heap, metaspace, RSS caveat\n\nCDS 문서를 읽을 때 가장 많이 틀리는 지점은 memory 용어다.\n\n| 관측값 | CDS 해석 |\n|---|---|\n| `-Xmx` / heap used | 일반 객체 메모리. CDS 효과를 직접 보여 주는 핵심 지표가 아닐 수 있음 |\n| metaspace used | class metadata pressure를 볼 때 중요 |\n| RSS | mapped archive page가 포함되어 보일 수 있어 단순 증가/감소만 보면 안 됨 |\n| shared/private memory | 여러 JVM이 같은 read-only archive page를 공유하는지 볼 때 중요 |\n\n일부 JDK/GC 조합은 archived heap object 같은 기능도 갖지만, 입문 단계에서는 이를 일반 규칙으로 외우면 위험하다. 기본 mental model은 \"CDS는 class metadata 공유가 중심이고, heap 객체 공유는 제한적 기능\"으로 잡는 편이 안전하다.\n\n## AppCDS와 default CDS의 차이\n\n현대 JDK는 기본 CDS archive를 제공하거나 자동으로 사용할 수 있다. 이 archive는 주로 JDK/core library class에 효과가 있다.\n\nAppCDS는 여기에 application/library class를 더 포함하려는 접근이다.\n\n| 선택 | 포함 범위 | 운영 부담 |\n|---|---|---|\n| default CDS | JDK가 제공하는 기본 class set | 낮음 |\n| static AppCDS archive | class list 기반으로 명시 생성 | classpath와 dump step 관리 필요 |\n| dynamic CDS archive | 실행 종료나 `jcmd`로 생성 | 더 편하지만 archive 검증 필요 |\n\nAppCDS는 \"한 번 만들면 영원히 쓰는 파일\"이 아니다. JDK 버전, OS/architecture, classpath/module path, 일부 JVM option, 애플리케이션 class set이 달라지면 archive가 재사용되지 않거나 실패할 수 있다.\n\n## 운영 체크리스트\n\n| 체크 | 왜 필요한가 |\n|---|---|\n| archive가 실제 사용됐는가 | 옵션만 넣고 reuse가 안 되면 효과가 없다 |\n| classpath/module path가 dump 때와 맞는가 | 다른 class set이면 archive mismatch가 난다 |\n| JDK 버전과 배포 이미지가 같은가 | archive는 런타임과 강하게 묶인다 |\n| `-Xshare:on`을 production 기본으로 쓰지 않는가 | archive 사용 실패 시 JVM이 종료될 수 있다 |\n| `-Xshare:auto` 또는 명시 archive fallback 정책이 있는가 | 운영에서는 실패 모드가 중요하다 |\n| startup과 first request를 따로 측정했는가 | CDS 효과와 warmup 문제를 분리한다 |\n\n`-Xshare:on`은 검증 단계에서 \"반드시 archive를 써야 한다\"를 확인할 때 유용하다. 운영 기본값으로는 archive 사용 실패가 프로세스 시작 실패로 이어질 수 있으므로 신중해야 한다.\n\n## 명령 흐름 감각\n\n### 1. class list 기반 static archive\n\n```bash\njava -Xshare:off -XX:DumpLoadedClassList=app.classlist -cp app.jar com.example.Main\njava -Xshare:dump -XX:SharedClassListFile=app.classlist -XX:SharedArchiveFile=app.jsa -cp app.jar\njava -XX:SharedArchiveFile=app.jsa -cp app.jar com.example.Main\n```\n\n### 2. 종료 시 dynamic archive 생성\n\n```bash\njava -XX:ArchiveClassesAtExit=app-dynamic.jsa -cp app.jar com.example.Main\njava -XX:SharedArchiveFile=app-dynamic.jsa -cp app.jar com.example.Main\n```\n\n### 3. archive 사용 확인\n\n```bash\njava -XX:SharedArchiveFile=app.jsa -Xlog:class+load -cp app.jar com.example.Main\n```\n\n로그에서 shared archive에서 class가 로딩됐는지 확인한다. \"옵션이 들어갔다\"와 \"archive page가 실제로 재사용됐다\"는 다른 질문이다.\n\n## 판단 표\n\n| 증상 | CDS 후보인가 | 먼저 볼 것 |\n|---|---|---|\n| JVM process 시작 자체가 느림 | 가능성 높음 | class loading/JFR startup profile |\n| 첫 HTTP 요청만 느림 | 일부 가능 | lazy bean init, JIT, DB/cache warmup |\n| heap OOM | 직접 후보 아님 | heap dump, allocation rate |\n| metaspace pressure | 상황 의존 | classloader churn, generated class, archive 적용 여부 |\n| 여러 동일 JVM을 많이 띄움 | 가능성 높음 | shared/private RSS와 startup latency |\n\n## 흔한 오해와 함정\n\n- \"CDS를 켜면 heap 객체가 공유된다\"라고 일반화하면 안 된다.\n  - 기본 효과는 class metadata와 startup 경로에 가깝다.\n- \"archive 파일만 있으면 항상 쓴다\"라고 보면 안 된다.\n  - JDK/classpath/options mismatch에서 실패하거나 무시될 수 있다.\n- \"startup이 빨라졌으니 first request도 빨라진다\"라고 보면 안 된다.\n  - JIT warmup, lazy init, remote dependency는 별도다.\n- \"RSS가 늘었으니 나빠졌다\"라고 바로 결론내리면 안 된다.\n  - mapped shared page와 private dirty page를 분리해서 봐야 한다.\n\n## 한 줄 정리\n\nCDS/AppCDS는 heap 최적화가 아니라 class metadata와 startup 비용을 shared archive로 줄이는 기능이며, 적용 여부는 로그와 startup profile로 검증해야 한다.\n",
   "aliases": [
-    "Class Data Sharing Startup and Memory Primer",
     "Java CDS startup memory primer",
     "AppCDS heap metaspace caveat",
     "CDS shared archive memory mapped metadata",
     "JVM shared archive startup primer",
     "클래스 데이터 공유 시작 메모리 입문",
-    "static"
+    "CDS 시작 시간 메모리",
+    "AppCDS 아카이브 검증",
+    "CDS metaspace RSS 구분"
   ],
   "expected_queries": [
     "Java CDS는 heap을 줄이는 기능인지 metaspace와 shared archive 관점에서 입문자에게 설명해줘",
@@ -48,8 +49,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/class-data-sharing-startup-memory-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149"
+      }
+    ]
   }
 }

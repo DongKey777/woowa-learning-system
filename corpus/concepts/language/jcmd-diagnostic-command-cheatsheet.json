@@ -6,12 +6,15 @@
   "summary": "jcmd는 실행 중인 JVM에 진단 명령을 보내는 범용 도구이고, thread, GC, heap, native memory, JFR, classloader, code cache를 한 곳에서 다룰 수 있는 운영용 칼이다.",
   "body_markdown": "# `jcmd` Diagnostic Command Cheat Sheet\n\n> 한 줄 요약: `jcmd`는 실행 중인 JVM에 진단 명령을 보내는 범용 도구이고, thread, GC, heap, native memory, JFR, classloader, code cache를 한 곳에서 다룰 수 있는 운영용 칼이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JFR and JMC Performance Playbook](./jfr-jmc-performance-playbook.md)\n> - [Thread Dump State Interpretation](./thread-dump-state-interpretation.md)\n> - [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)\n> - [Direct Buffer Off-Heap Memory Troubleshooting](./direct-buffer-offheap-memory-troubleshooting.md)\n> - [JFR Event Interpretation](./jfr-event-interpretation.md)\n\n> retrieval-anchor-keywords: jcmd, GC.class_histogram, Thread.print, VM.flags, VM.native_memory, GC.heap_info, GC.heap_dump, JFR.start, JFR.check, JFR.stop, Compiler.codecache, VM.classloader_stats, diagnostic command\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [진단 루프](#진단-루프)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n`jcmd`는 살아 있는 JVM에 diagnostic command를 실행한다.\n즉 \"로그만 보는 도구\"가 아니라 JVM 내부 상태를 직접 조회하는 운영 도구다.\n\n자주 쓰는 명령:\n\n- `Thread.print`\n- `GC.class_histogram`\n- `GC.heap_info`\n- `GC.heap_dump`\n- `VM.flags`\n- `VM.native_memory`\n- `VM.classloader_stats`\n- `Compiler.codecache`\n- `JFR.start` / `JFR.check` / `JFR.stop`\n\n## 깊이 들어가기\n\n### 1. Thread.print는 thread dump의 기본형이다\n\nblocked thread와 lock owner를 보기 좋다.\nthread dump 해석은 [Thread Dump State Interpretation](./thread-dump-state-interpretation.md)와 같이 보면 좋다.\n\n### 2. GC.class_histogram은 살아 있는 객체 감시용이다\n\nheap dump까지 가지 않고도 클래스별 힙 분포를 빠르게 볼 수 있다.\n누수가 의심될 때 첫 관찰 도구로 유용하다.\n\n### 3. VM.native_memory는 heap 밖을 본다\n\ndirect buffer, thread stack, code cache, metaspace 같은 native memory를 볼 때 유용하다.\nheap 문제와 native 문제를 분리하는 데 좋다.\n\n### 4. JFR 명령은 운영 친화적이다\n\nJFR은 JVM 증상을 시간축으로 남기게 해 주고, `jcmd`로 시작/중지/체크를 제어할 수 있다.\n\n### 5. classloader와 code cache도 볼 수 있다\n\n배포 후 메모리나 startup이 이상하면 `VM.classloader_stats`와 `Compiler.codecache`가 힌트가 된다.\n\n## 실전 시나리오\n\n### 시나리오 1: 서비스가 느려졌는데 어디서 시작할지 모르겠다\n\n`Thread.print`, `GC.heap_info`, `VM.flags`, `JFR.start`를 먼저 본다.\n빠르게 상태를 좁힐 수 있다.\n\n### 시나리오 2: heap은 멀쩡한데 RSS가 오른다\n\n`VM.native_memory`와 thread 수, code cache, class metadata를 본다.\n\n### 시나리오 3: classloader leak이 의심된다\n\n`VM.classloader_stats`와 `GC.class_histogram`을 함께 본다.\n\n## 진단 루프\n\n`jcmd`는 명령을 많이 외우는 도구라기보다, 증상에서 증거를 좁히는 루프다.\n\n| 증상 | 첫 명령 | 실패 신호 | 다음 검증 |\n|---|---|---|---|\n| 요청이 멈추거나 느리다 | `Thread.print` | 같은 lock, socket read, pool wait에 thread가 몰림 | thread dump를 몇 초 간격으로 반복해 같은 위치에 머무는지 본다 |\n| heap 사용량이 계속 오른다 | `GC.class_histogram` | 특정 class count/bytes가 반복해서 증가 | heap dump 전후 또는 GC 후 histogram을 비교한다 |\n| RSS는 큰데 heap은 작다 | `VM.native_memory summary` | thread stack, direct buffer, metaspace, code cache 쪽이 큼 | NMT가 켜져 있는지 확인하고 detail/summary 차이를 분리한다 |\n| 짧은 장애를 사후 분석해야 한다 | `JFR.start` / `JFR.stop` | 로그만 있고 timeline 증거가 없음 | JFR 파일에서 GC, allocation, lock, socket/event time을 같이 본다 |\n\n주의할 점은 관측 행위도 비용이 있다는 것이다. heap dump나 detail급 native memory 추적은 운영 영향이 있을 수 있으므로, 먼저 가벼운 명령으로 가설을 좁히고 무거운 명령은 필요한 순간에만 쓴다.\n\n## 코드로 보기\n\n### 1. 기본 사용\n\n```bash\njcmd <pid> Thread.print\njcmd <pid> GC.class_histogram\njcmd <pid> VM.flags\n```\n\n### 2. native memory 확인\n\n```bash\njcmd <pid> VM.native_memory summary\njcmd <pid> VM.native_memory detail\n```\n\n### 3. JFR 제어\n\n```bash\njcmd <pid> JFR.start name=profile settings=profile duration=60s filename=/tmp/app.jfr\njcmd <pid> JFR.check\njcmd <pid> JFR.stop name=profile\n```\n\n### 4. heap dump / classloader 통계\n\n```bash\njcmd <pid> GC.heap_dump /tmp/heap.hprof\njcmd <pid> VM.classloader_stats\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| `jcmd` | JVM 내부를 직접 본다 | 명령을 알아야 한다 |\n| GUI tool | 읽기 쉽다 | 원격/자동화가 약할 수 있다 |\n| heap dump | 강력한 정밀 분석 가능 | 무겁고 늦다 |\n| JFR | 시간축 관찰이 좋다 | 명령과 해석이 필요하다 |\n\n핵심은 `jcmd`를 \"명령어 모음\"이 아니라 \"JVM 운영 기본 인터페이스\"로 보는 것이다.\n\n## 꼬리질문\n\n> Q: `jcmd`로 가장 먼저 볼 것은 무엇인가요?\n> 핵심: 상황에 따라 다르지만 보통 `Thread.print`, `GC.class_histogram`, `VM.flags`, `VM.native_memory`부터 본다.\n\n> Q: heap이 아닌 문제도 `jcmd`로 볼 수 있나요?\n> 핵심: 그렇다. native memory, code cache, classloader, JFR까지 볼 수 있다.\n\n> Q: `jcmd`와 JFR은 어떤 관계인가요?\n> 핵심: `jcmd`는 제어와 즉시 진단, JFR은 시간축 기록에 강하다.\n\n## 한 줄 정리\n\n`jcmd`는 JVM 운영 중 상태를 직접 조회하는 범용 진단 도구이고, thread, heap, native memory, classloader, JFR을 한 번에 연결해 볼 수 있다.\n",
   "aliases": [
-    "jcmd Diagnostic Command Cheat Sheet",
-    "JVM jcmd Thread.print GC.class_histogram",
+    "jcmd JVM diagnostic commands",
+    "jcmd Thread.print heap native memory",
     "VM.native_memory jcmd summary",
-    "JFR start check stop jcmd",
-    "Java production JVM diagnostic command",
-    "자바 jcmd 진단 명령 치트시트"
+    "JFR start check stop via jcmd",
+    "production JVM triage with jcmd",
+    "자바 jcmd 진단 명령",
+    "jcmd 스레드 덤프 확인",
+    "jcmd 네이티브 메모리 조사",
+    "JVM 운영 진단 jcmd"
   ],
   "expected_queries": [
     "jcmd로 운영 중 JVM에서 thread heap native memory JFR을 무엇부터 확인해야 해?",
@@ -47,8 +50,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/jcmd-diagnostic-command-cheatsheet.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149"
+      }
+    ]
   }
 }

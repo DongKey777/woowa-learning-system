@@ -6,15 +6,17 @@
   "summary": "이 도구들은 모두 \"스레드를 기다리게 한다\"는 공통점이 있지만 의미가 전혀 다르다. permit 제어, one-shot 완료 대기, rendezvous barrier, 다단계 phase 진행을 섞어 쓰면 startup hang, permit leak, broken barrier, 재시도 꼬임이 생긴다.",
   "body_markdown": "# `Semaphore`, `CountDownLatch`, `CyclicBarrier`, and `Phaser` Coordination Semantics\n\n> 한 줄 요약: 이 도구들은 모두 \"스레드를 기다리게 한다\"는 공통점이 있지만 의미가 전혀 다르다. permit 제어, one-shot 완료 대기, rendezvous barrier, 다단계 phase 진행을 섞어 쓰면 startup hang, permit leak, broken barrier, 재시도 꼬임이 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n> - [Thread Interruption and Cooperative Cancellation Playbook](./thread-interruption-cooperative-cancellation-playbook.md)\n> - [`wait`/`notify`, `Condition`, Spurious Wakeup, and Lost Signal](./wait-notify-condition-spurious-wakeup-lost-signal.md)\n> - [Executor Sizing, Queue, Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n\n> retrieval-anchor-keywords: Semaphore, CountDownLatch, CyclicBarrier, Phaser, permit leak, one-shot latch, barrier break, coordination primitive, acquire release, countdown hang, phased execution, startup gate, bulkhead, interruptible wait\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n네 도구는 목적이 다르다.\n\n- `Semaphore`: 동시에 들어갈 수 있는 수량을 제어한다\n- `CountDownLatch`: 어떤 일이 끝날 때까지 한 번 기다린다\n- `CyclicBarrier`: 정해진 인원이 모두 도착할 때까지 서로 기다린다\n- `Phaser`: 여러 phase를 동적으로 진행한다\n\n즉 \"기다림\"이 아니라 **무엇을 세고 있는가**를 먼저 봐야 한다.\n\n## 깊이 들어가기\n\n### 1. `Semaphore`는 ownership 없는 permit다\n\n`Semaphore`는 lock과 다르다.\n\n- permit는 특정 thread가 소유하지 않는다\n- acquire한 thread와 release하는 thread가 달라도 된다\n- resource pool, rate limiting, bulkhead에 자주 쓰인다\n\n장점은 유연성이지만, 그만큼 leak와 double-release 위험이 있다.\n\n즉 `Semaphore`는 mutual exclusion보다 capacity control에 가깝다.\n\n### 2. `CountDownLatch`는 one-shot gate다\n\n`CountDownLatch`는 count가 0이 되면 열린다.\n그리고 다시 닫히지 않는다.\n\n그래서 잘 맞는 곳:\n\n- startup initialization 대기\n- fan-out 작업 완료 합류\n- 테스트에서 비동기 완료 대기\n\n잘 안 맞는 곳:\n\n- 반복되는 라운드\n- reset이 필요한 프로토콜\n\n### 3. `CyclicBarrier`는 rendezvous다\n\n`CyclicBarrier`는 참여자들이 모두 barrier에 도착해야 다음 단계로 넘어간다.\n즉 \"한쪽이 끝나길 기다리는 것\"이 아니라 \"모두 같이 모인다\"는 semantics다.\n\n중요한 점:\n\n- 한 참가자가 실패하거나 interrupt되면 barrier가 깨질 수 있다\n- broken barrier 상태를 호출자가 이해해야 한다\n\n즉 barrier는 성공 경로만큼 실패 경로 설계가 중요하다.\n\n### 4. `Phaser`는 phase 수명 관리 도구다\n\n`Phaser`는 barrier보다 유연하다.\n\n- phase가 여러 번 진행된다\n- 참여자 수를 동적으로 등록/해제할 수 있다\n- 큰 배치나 staged workflow에 맞을 수 있다\n\n대신 읽기와 디버깅 난도가 올라간다.\n간단한 문제엔 과한 경우가 많다.\n\n### 5. interruption과 timeout을 무시하면 coordination이 hang으로 바뀐다\n\n이 도구들은 모두 \"기다림\"을 포함하므로 취소와 timeout 설계가 중요하다.\n\n- count가 영영 0이 안 되는 latch\n- release 누락된 semaphore\n- broken barrier를 무시한 재시도\n- deregister되지 않아 phase가 끝나지 않는 phaser\n\nbackend에서는 이런 문제가 보통 startup hang, stuck batch, queue drain 실패로 나타난다.\n\n## 실전 시나리오\n\n### 시나리오 1: 외부 API bulkhead를 만들고 싶다\n\n요청 수를 제한하려는 문제면 `Semaphore`가 더 맞다.\n`CountDownLatch`로는 \"동시 허용 수\" 개념을 표현하기 어렵다.\n\n### 시나리오 2: 애플리케이션 기동 시 warm-up 완료를 기다린다\n\n여러 초기화 작업이 끝난 뒤 only-once gate를 열고 싶다면 `CountDownLatch`가 자연스럽다.\n\n### 시나리오 3: 병렬 계산 라운드를 여러 번 돈다\n\n각 라운드마다 참여자들이 모두 합류해야 한다면 `CyclicBarrier`나 `Phaser`가 후보다.\n한 번 쓰고 끝나는 latch는 맞지 않는다.\n\n### 시나리오 4: semaphore permit가 회수되지 않는다\n\n예외 경로에서 `release()`가 빠지면 처리량이 서서히 줄고 결국 전체가 멈춘다.\n이 문제는 deadlock처럼 보이지만, 실제로는 capacity leak다.\n\n## 코드로 보기\n\n### 1. bulkhead 용도의 `Semaphore`\n\n```java\nimport java.util.concurrent.Semaphore;\n\nSemaphore permits = new Semaphore(20);\n\nif (!permits.tryAcquire()) {\n    throw new IllegalStateException(\"too many concurrent calls\");\n}\n\ntry {\n    callRemote();\n} finally {\n    permits.release();\n}\n```\n\n### 2. startup gate로 `CountDownLatch`\n\n```java\nimport java.util.concurrent.CountDownLatch;\n\nCountDownLatch ready = new CountDownLatch(3);\n\n// worker들이 준비되면 ready.countDown()\nready.await();\n```\n\n### 3. 반복 라운드용 `CyclicBarrier`\n\n```java\nimport java.util.concurrent.CyclicBarrier;\n\nCyclicBarrier barrier = new CyclicBarrier(4, this::afterRound);\nbarrier.await();\n```\n\n### 4. 동적 참여자용 `Phaser`\n\n```java\nimport java.util.concurrent.Phaser;\n\nPhaser phaser = new Phaser(1);\nphaser.register();\nphaser.arriveAndAwaitAdvance();\nphaser.arriveAndDeregister();\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| `Semaphore` | 동시 허용량 제어가 직관적이다 | permit leak와 fairness 비용을 직접 관리해야 한다 |\n| `CountDownLatch` | one-shot 완료 대기에 단순하다 | reset이 안 된다 |\n| `CyclicBarrier` | 반복 라운드 합류를 잘 표현한다 | broken barrier와 실패 처리가 까다롭다 |\n| `Phaser` | 다단계와 동적 참여자에 유연하다 | 가독성과 디버깅 난도가 높다 |\n\n핵심은 \"스레드를 막는다\"가 아니라 \"무엇을 세고 있으며 언제 다시 열리는가\"다.\n\n## wrong-bucket / 오선택\n\n이 네 도구를 \"thread를 기다리게 하는 클래스\" bucket에 넣으면 선택이 흔들린다.\n이 문서는 permit, one-shot gate, rendezvous, phase lifecycle을 구분하는 coordination contract bucket이다.\n\n- mutual exclusion이 목적이면 `Lock`/`synchronized` bucket을 먼저 본다.\n- 작업 제출량 제어라면 executor queue/backpressure와 함께 본다.\n- 결과 조합이 목적이면 `CompletableFuture`, structured concurrency, executor completion 흐름을 본다.\n- process 간 coordination이면 JVM concurrency primitive가 아니라 distributed lock/queue bucket이다.\n\n## 흔한 오해\n\n- `Semaphore`를 lock처럼 owner가 있는 도구로 생각한다.\n- `CountDownLatch`를 reset해서 반복 라운드에 쓰려 한다.\n- `CyclicBarrier`에서 한 참가자 실패가 전체 barrier에 미치는 영향을 놓친다.\n- `Phaser`를 더 강한 barrier로만 보고 등록/해제 lifecycle을 무시한다.\n\n## 재현 조건\n\ncoordination bug는 성공 경로만으로는 잘 안 보인다.\n\n1. 참가자 하나가 interrupt 또는 timeout되는 케이스를 만든다.\n2. permit release가 누락되는 exception 경로를 넣는다.\n3. latch count가 실제 worker 수와 어긋나는 상황을 만든다.\n4. barrier action 실패와 broken barrier 상태를 확인한다.\n5. phaser에서 dynamic registration/deregistration 순서를 바꿔 본다.\n\n## failure matrix\n\n| 증상 | 가능 원인 | 먼저 볼 것 |\n|---|---|---|\n| 처리량이 점점 줄어듦 | semaphore permit leak | `try/finally release` |\n| startup이 영원히 대기 | latch count mismatch 또는 worker 실패 | countDown 경로 |\n| 반복 라운드가 깨짐 | barrier participant interrupt/timeout | broken barrier handling |\n| 일부 phase가 끝나지 않음 | phaser deregister 누락 | registration lifecycle |\n\n## 검증/validation\n\n검증은 정상 합류뿐 아니라 실패 시 해제 정책을 본다.\n\n- timeout과 interrupt를 테스트에 넣는다.\n- permit/latch/barrier/phaser의 \"세는 대상\"을 주석이나 이름으로 드러낸다.\n- 실패한 participant가 전체 coordination을 어떻게 깨우는지 확인한다.\n- metric은 waiting thread 수와 permit/count/phase 값을 같이 본다.\n\n## 꼬리질문\n\n> Q: `Semaphore`와 lock의 차이는 무엇인가요?\n> 핵심: semaphore는 ownership 없는 permit 수량 제어이고, lock은 임계구역 소유에 가깝다.\n\n> Q: `CountDownLatch`를 왜 반복 작업에 쓰면 안 되나요?\n> 핵심: one-shot이어서 한 번 열리면 reset되지 않기 때문이다.\n\n> Q: `CyclicBarrier`가 깨진다는 것은 무슨 뜻인가요?\n> 핵심: 일부 참가자의 실패나 interrupt로 전체 rendezvous가 성립하지 못한 상태다.\n\n> Q: `Phaser`는 언제 고려하나요?\n> 핵심: 여러 phase를 거치고 참여자가 동적으로 늘고 줄어드는 coordination이 필요할 때다.\n\n## 한 줄 정리\n\n`Semaphore`, `CountDownLatch`, `CyclicBarrier`, `Phaser`는 모두 대기 도구가 아니라 서로 다른 coordination contract이므로, 세는 대상과 실패 경로를 먼저 맞춰야 한다.\n",
   "aliases": [
-    "Semaphore CountDownLatch CyclicBarrier Phaser Coordination Semantics",
-    "Java coordination primitive chooser",
-    "Semaphore permit CountDownLatch one-shot",
-    "CyclicBarrier rendezvous Phaser phase",
-    "permit leak broken barrier startup hang",
-    "자바 동시성 coordination primitive",
-    "CompletableFuture",
-    "permits",
-    "synchronized"
+    "Java coordination primitives",
+    "Semaphore permit bulkhead",
+    "CountDownLatch one shot gate",
+    "CyclicBarrier rendezvous failure handling",
+    "Phaser dynamic phase lifecycle",
+    "permit leak broken barrier",
+    "자바 동시성 조정 도구",
+    "세마포어 permit 누수",
+    "CountDownLatch 일회성 게이트",
+    "CyclicBarrier 깨짐 처리",
+    "Phaser 단계 등록 해제"
   ],
   "expected_queries": [
     "Semaphore CountDownLatch CyclicBarrier Phaser는 각각 무엇을 세고 기다리는 도구야?",
@@ -50,8 +52,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/semaphore-countdownlatch-cyclicbarrier-phaser-coordination-semantics.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149",
+        "changes": [
+          "alias-query-contract-repair"
+        ]
+      }
+    ]
   }
 }

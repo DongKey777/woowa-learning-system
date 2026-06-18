@@ -6,13 +6,16 @@
   "summary": "G1 String Deduplication은 같은 내용을 가진 String의 backing storage를 공유해 heap을 줄일 수 있지만, candidate 선별, hash table 조회, background dedup 작업, GC pause 접점 비용이 생기므로 p99 latency와 CPU 여유를 같이 보고 선택해야 한다.",
   "body_markdown": "# G1 String Deduplication Heap and Latency Chooser\n\n> 한 줄 요약: G1 String Deduplication은 같은 내용을 가진 `String`의 backing storage를 공유해 heap을 줄일 수 있지만, candidate 선별, hash table 조회, background dedup 작업, GC pause 접점 비용이 생기므로 p99 latency와 CPU 여유를 같이 보고 선택해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [String Intern, Constant Pool, and Memory Deep Dive](./string-intern-constant-pool-memory-deep-dive.md)\n> - [G1 GC vs ZGC](./g1-vs-zgc.md)\n> - [GC Allocation Rate Symptom Router](./gc-allocation-rate-symptom-router.md)\n> - [Heap Dump Retained Size Primer](./heap-dump-retained-size-primer.md)\n> - [JFR Event Interpretation](./jfr-event-interpretation.md)\n\n> retrieval-anchor-keywords: g1 string deduplication, usestringdeduplication, stringdeduplicationagethreshold, duplicate string heap, string dedup vs intern, compact strings, gc pause latency, string dedup cpu overhead, high cardinality strings, heap saving tradeoff, jfr gc evidence, xlog stringdedup\n\n## 핵심 선택 질문\n\n이 기능은 \"문자열이 많다\"가 아니라 \"같은 내용의 긴 수명 문자열 backing storage가 많다\"일 때 후보가 된다. `String` 객체 자체를 합치는 것이 아니고, 여러 `String` 객체가 같은 backing array/storage를 가리키도록 바꾸는 최적화다. 그래서 `a == b` 결과는 바뀌지 않는다. identity를 모으는 [String intern](./string-intern-constant-pool-memory-deep-dive.md)과도 다르다.\n\n켜기 전 질문은 세 개다.\n\n1. live heap에서 중복 문자열 backing storage가 의미 있는 비율인가?\n2. 그 문자열들이 young에서 바로 죽지 않고 충분히 오래 살아남는가?\n3. dedup CPU와 pause 접점 비용을 감당해도 p99 latency 목표를 지킬 수 있는가?\n\n셋 중 하나라도 아니면 우선순위가 낮다.\n\n## Chooser 매트릭스\n\n| 상황 | 선택 | 이유 |\n|---|---|---|\n| product code, locale, category name처럼 반복 값이 많고 오래 산다 | 실험 후보 | heap 절감 가능성이 있고 값 cardinality가 낮다 |\n| request id, trace id, random token, 사용자 입력이 대부분이다 | 피한다 | unique 값이 많아 table 비용이 절감보다 클 수 있다 |\n| heap pressure가 GC 빈도와 p99를 밀어 올린다 | 제한 실험 | heap 감소가 pause 빈도 감소로 이어질 수 있다 |\n| CPU bound이고 p99 budget이 빡빡하다 | 기본은 피한다 | dedup thread와 candidate 처리 비용이 tail에 보일 수 있다 |\n| 이미 enum/value object로 vocabulary를 닫을 수 있다 | application normalization 우선 | 더 명확하고 rollback이 쉽다 |\n\n## HotSpot 동작을 source-aware하게 읽기\n\nJEP 192의 원래 설명은 JDK 8u20 G1 기준으로 `String.value`의 `char[]` 중복을 줄이는 설계였다. Java 9+에는 Compact Strings가 들어와 내부 표현이 달라졌으므로 문서나 리뷰에서는 `char[]`라고 고정하지 말고 \"backing storage\"라고 말하는 편이 안전하다.\n\n동작 흐름은 대략 이렇다. GC가 live object를 방문하면서 dedup 후보가 될 `String`을 찾는다. young/mixed/full collection 경로에서 후보가 queue에 들어가고, VM 내부 dedup thread가 background에서 queue를 소비한다. 처리할 때는 dedup table에서 같은 내용의 backing storage를 찾고, 있으면 현재 `String`이 그 storage를 공유하도록 조정한다. 없으면 table에 등록해 나중 후보가 공유할 수 있게 한다.\n\n`StringDeduplicationAgeThreshold`는 너무 빨리 죽을 문자열을 건드리지 않기 위한 장치다. 짧은 수명 객체를 dedup하려고 hash 계산과 table 조회를 하면 CPU만 낭비한다. 반대로 threshold가 너무 높으면 오래 살아남는 중복 문자열을 놓칠 수 있다. 기본값을 바꾸는 것은 마지막 단계이며, 먼저 workload의 string lifetime을 봐야 한다.\n\n## 관측 절차\n\n1. [Heap Dump Retained Size Primer](./heap-dump-retained-size-primer.md) 방식으로 `String` retained path와 값 cardinality를 샘플링한다.\n2. [GC Allocation Rate Symptom Router](./gc-allocation-rate-symptom-router.md) 관점으로 allocation rate, promotion rate, GC 빈도, pause를 본다.\n3. 실험 환경에서 `-XX:+UseG1GC -XX:+UseStringDeduplication`을 켜고 같은 traffic replay를 돌린다.\n4. JDK 9+라면 `-Xlog:stringdedup=info` 또는 더 자세한 debug 로그를 확인한다. JDK 8 계열은 `PrintStringDeduplicationStatistics` 같은 구식 옵션을 쓰는 환경도 있다.\n5. [JFR Event Interpretation](./jfr-event-interpretation.md)으로 GC pause, allocation sample, CPU sample, code path latency를 같은 시간축에 붙인다.\n\n성공 신호는 단순히 \"heap이 줄었다\"가 아니다. old/live set 감소, GC 빈도나 pause 총량 감소, p99 안정, CPU 증가 허용 범위가 같이 보여야 한다.\n\n## 켜지 말아야 하는 경우\n\nhigh-cardinality 문자열에는 잘 맞지 않는다. trace id, request id, UUID, JWT 조각, 사용자 검색어처럼 대부분 unique인 값은 dedup table을 키우고 hash/lookup 비용만 늘릴 수 있다. JEP 192도 unique string이 많은 workload에서는 table이 절감보다 더 많은 메모리를 먹을 수 있다고 경고한다.\n\ntail latency가 핵심인 API도 조심해야 한다. 실제 dedup은 background thread가 처리하지만 후보 enqueue는 GC가 live object를 훑는 경로와 만난다. queue, table resize, rehash, CPU contention이 생기면 \"heap은 줄었는데 p99가 나빠지는\" 선택이 될 수 있다. 특히 CPU headroom이 낮은 container에서는 memory saving이 곧 latency saving이라고 가정하면 안 된다.\n\ncollector 선택과도 분리한다. 이 문서는 G1 기준 chooser다. [G1 GC vs ZGC](./g1-vs-zgc.md)를 먼저 보고, non-G1 collector를 쓰는 경우에는 해당 JDK/collector의 string dedup 지원과 로그 tag를 따로 확인한다.\n\n## intern, Compact Strings, application normalization과 비교\n\n`String.intern()`은 canonical `String` 객체 identity를 돌려준다. G1 String Deduplication은 identity를 바꾸지 않고 backing storage 공유를 노린다. Compact Strings는 Latin-1로 표현 가능한 문자열의 저장 폭을 줄이는 JDK 구현 최적화다. 셋은 목적과 위험이 다르다.\n\n업무 vocabulary가 닫혀 있으면 enum, code table, bounded canonical map이 더 선명하다. 예를 들어 결제 상태, 배송 상태, 국가 코드처럼 값 집합이 작으면 애플리케이션 모델에서 문자열을 줄이는 편이 관측과 rollback이 쉽다. 반대로 외부 payload에서 같은 긴 문자열이 반복 저장되고 수명이 길다면 G1 dedup 실험이 의미 있다.\n\n## 면접/시니어 질문 미리보기\n\n> Q: G1 String Dedup을 켜면 `==` 비교 결과가 바뀌나요?\n> 핵심: 아니다. `String` 객체 identity가 아니라 backing storage 공유가 목표다.\n\n> Q: heap이 줄면 무조건 좋은 설정인가요?\n> 핵심: 아니다. CPU, dedup table, queue 처리, GC pause 접점, p99 latency를 같이 봐야 한다.\n\n> Q: 어떤 문자열에는 부적합한가요?\n> 핵심: high-cardinality unique 값, 짧게 살고 바로 죽는 값, latency가 CPU보다 중요한 hot path에는 부적합할 수 있다.\n\n## 한 줄 정리\n\nG1 String Deduplication은 중복된 장수 문자열 backing storage가 live heap을 밀어 올릴 때만 실험할 후보이며, heap 절감보다 p99 latency와 CPU 비용을 함께 통과해야 운영 선택이 된다.\n",
   "aliases": [
-    "G1 String Deduplication Heap and Latency Chooser",
-    "UseStringDeduplication tradeoff",
+    "g1 string dedup tradeoff",
+    "UseStringDeduplication latency cost",
     "StringDeduplicationAgeThreshold tuning",
-    "string dedup heap saving latency cost",
-    "G1 string dedup vs intern",
-    "자바 G1 문자열 중복 제거",
-    "enum"
+    "duplicate string heap saving",
+    "string dedup vs intern",
+    "compact strings dedup 비교",
+    "G1 문자열 중복 제거",
+    "문자열 dedup 지연 비용",
+    "중복 문자열 heap 절감",
+    "p99 latency string dedup"
   ],
   "expected_queries": [
     "G1 String Deduplication을 켜면 heap 절약과 CPU pause latency 비용을 어떻게 비교해야 해?",
@@ -49,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/g1-string-deduplication-heap-latency-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149"
+      }
+    ]
   }
 }

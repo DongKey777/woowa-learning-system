@@ -6,12 +6,16 @@
   "summary": "큰 파일이나 스트림을 많이 옮길수록, 사용자 공간 복사를 줄이고 커널이 데이터를 직접 전달하게 만드는 구조가 성능과 CPU 효율을 좌우한다.",
   "body_markdown": "# mmap, sendfile, splice, zero-copy\n\n> 한 줄 요약: 큰 파일이나 스트림을 많이 옮길수록, 사용자 공간 복사를 줄이고 커널이 데이터를 직접 전달하게 만드는 구조가 성능과 CPU 효율을 좌우한다.\n\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../network/http-request-response-basics-url-dns-tcp-tls-keepalive.md)\n\n\nretrieval-anchor-keywords: mmap sendfile splice zero copy basics, mmap sendfile splice zero copy beginner, mmap sendfile splice zero copy intro, operating system basics, beginner operating system, 처음 배우는데 mmap sendfile splice zero copy, mmap sendfile splice zero copy 입문, mmap sendfile splice zero copy 기초, what is mmap sendfile splice zero copy, how to mmap sendfile splice zero copy\n\n## 핵심 개념\n\n`zero-copy`는 말 그대로 \"복사를 0번\" 한다는 뜻이라기보다, 불필요한 사용자 공간 복사를 줄여 데이터 이동 비용을 낮추는 접근이다.\n\n- `mmap()`: 파일을 프로세스 주소 공간에 매핑해, `read()` 대신 메모리 접근처럼 다룬다.\n- `sendfile()`: 파일 디스크립터에서 소켓으로 데이터를 직접 전달하는 데 쓰인다.\n- `splice()`: 두 fd 사이에서 커널 버퍼를 매개로 데이터를 옮긴다.\n- `zero-copy`: 사용자 공간 버퍼를 거치지 않도록 경로를 설계하는 방식이다.\n\n왜 중요한가:\n\n- 큰 응답 파일, 다운로드, 로그 전송, 미디어 스트리밍은 복사 비용이 누적되기 쉽다.\n- CPU가 바빠 보이는데 실제 비즈니스 로직보다 메모리 복사와 캐시 미스가 더 큰 경우가 있다.\n- 트래픽이 늘면 \"대역폭\"보다 \"복사 횟수\"가 먼저 병목이 되기도 한다.\n\n## 깊이 들어가기\n\n### 1. 왜 복사가 비싼가\n\n일반적인 `read()` + `write()` 경로는 대개 다음과 같다.\n\n1. 디스크/네트워크에서 커널 버퍼로 들어온다.\n2. 커널 버퍼에서 사용자 버퍼로 복사된다.\n3. 다시 사용자 버퍼에서 소켓 송신 버퍼로 복사된다.\n\n이 과정은 단순해 보이지만 다음 비용을 만든다.\n\n- 메모리 대역폭 소모\n- CPU cache 오염\n- 불필요한 context 전환과 syscall\n- 큰 payload에서의 tail latency 증가\n\n즉 zero-copy 계열 API의 목표는 \"데이터를 안 옮기는 것\"이 아니라, **옮기는 경로를 짧게 만드는 것**이다.\n\n### 2. `mmap()`의 장단점\n\n`mmap()`은 파일 내용을 메모리처럼 읽을 수 있게 한다.\n\n장점:\n\n- 큰 파일을 순차 또는 부분적으로 읽을 때 유용하다\n- 페이지 단위로 lazy loading 되므로 필요할 때만 들어온다\n- 동일 파일을 여러 프로세스가 공유하기 좋다\n\n주의점:\n\n- page fault가 발생할 수 있다\n- random access가 많으면 오히려 느릴 수 있다\n- 파일이 변경되면 매핑된 내용과 실제 디스크 상태를 이해해야 한다\n\n운영 관점에서는 `mmap()`이 \"빠른 read 대체재\"가 아니라, **페이지 캐시와 page fault 비용을 함께 보는 도구**다.\n\n### 3. `sendfile()`이 잘 맞는 경우\n\n`sendfile()`은 파일에서 소켓으로 직접 보낼 때 강력하다.\n\n대표 사례:\n\n- 정적 파일 다운로드\n- CDN origin 서버의 대용량 파일 응답\n- nginx 같은 서버의 파일 전송 경로\n\n이득:\n\n- 사용자 공간 버퍼를 거치지 않아 복사 단계가 줄어든다\n- 코드가 단순해질 수 있다\n- 대용량 응답에서 CPU 사용률을 낮출 수 있다\n\n한계:\n\n- 가공이 필요한 응답에는 맞지 않는다\n- 압축, 암호화, 본문 변환이 필요하면 중간 버퍼가 다시 생긴다\n- 모든 프로토콜/플러그인 조합에서 완전히 대체되지는 않는다\n\n### 4. `splice()`의 역할\n\n`splice()`는 pipe를 경유해 fd 간 데이터 이동을 수행할 수 있다.\n\n운영 감각에서 중요한 포인트는 다음과 같다.\n\n- socket, pipe, file 사이의 특정 조합에서 유용하다\n- 커널 내부 이동 경로를 활용해 복사를 줄일 수 있다\n- 하지만 코드가 직관적이지 않아 디버깅 난도가 높다\n\n즉 `splice()`는 범용 해법이 아니라, **특정 데이터 파이프라인을 더 얇게 만드는 저수준 도구**다.\n\n### 5. `zero-copy`를 현실적으로 이해하기\n\n실무에서 zero-copy는 완전 무복사를 뜻하지 않는다.\n\n- 디스크 I/O는 여전히 발생한다\n- 네트워크 NIC로 나가는 동안 DMA가 개입한다\n- 페이지 캐시와 버퍼 관리 비용은 남아 있다\n\n그래서 진짜 질문은 \"복사를 없앨 수 있나?\"가 아니라 다음이다.\n\n## 깊이 들어가기 (계속 2)\n\n- 요청당 복사 횟수를 줄일 수 있는가\n- 복사 대신 page cache 재사용으로 바꿀 수 있는가\n- 변환이 꼭 필요한 지점은 어디인가\n\n## 실전 시나리오\n\n### 시나리오 1: 대용량 파일 다운로드 API의 CPU 사용률이 비정상적으로 높다\n\n가능한 원인:\n\n- `read()` + `write()`로 파일 전체를 사용자 공간에 올렸다 내린다\n- 요청 수가 많아 동일 파일을 계속 복사한다\n- gzip이나 추가 처리 때문에 중간 버퍼가 더 생긴다\n\n대응:\n\n- 정적 파일은 `sendfile()` 또는 웹서버 레벨 오프로딩을 검토한다\n- 응답 변환이 필요 없으면 애플리케이션이 직접 복사하지 않게 한다\n- 파일 크기와 다운로드 패턴을 기준으로 페이지 캐시 적중률을 본다\n\n### 시나리오 2: 스트리밍 서버에서 메모리 사용량이 생각보다 빨리 늘어난다\n\n가능한 원인:\n\n- chunk를 너무 작게 쪼개 자잘한 복사가 많다\n- 사용자 버퍼를 요청마다 새로 만든다\n- backpressure 없이 계속 밀어 넣는다\n\n대응:\n\n- chunk size를 재조정한다\n- 커널 버퍼와 송신 속도를 보고 생산 속도를 조절한다\n- `splice()`나 `sendfile()` 적용 가능성을 검토한다\n\n### 시나리오 3: `mmap()` 적용 후 성능이 좋아지지 않는다\n\n가능한 이유:\n\n- 접근 패턴이 랜덤이라 page fault가 많다\n- 메모리 압박으로 페이지 회수가 잦다\n- 단순 `read()`보다 운영상 예측이 어려워졌다\n\n즉 `mmap()`은 \"무조건 빠른 API\"가 아니라, **메모리 접근 패턴과 캐시 특성을 맞춰야 이득이 나는 API**다.\n\n## 코드로 보기\n\n### `sendfile()`로 파일을 소켓에 직접 보내기\n\n```c\nint fd = open(\"report.pdf\", O_RDONLY);\nint client = accept(listen_fd, NULL, NULL);\n\noff_t offset = 0;\nstruct stat st;\nfstat(fd, &st);\n\nwhile (offset < st.st_size) {\n    ssize_t sent = sendfile(client, fd, &offset, st.st_size - offset);\n    if (sent <= 0) {\n        break;\n    }\n}\n```\n\n이 패턴의 핵심은 파일 내용을 사용자 버퍼에 복사하지 않고 커널이 전달을 맡게 하는 것이다.\n\n### `mmap()`으로 파일을 읽기\n\n```c\nint fd = open(\"config.json\", O_RDONLY);\nstruct stat st;\nfstat(fd, &st);\n\nchar *p = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);\nif (p != MAP_FAILED) {\n    // p를 메모리처럼 읽는다\n    write(STDOUT_FILENO, p, st.st_size);\n    munmap(p, st.st_size);\n}\n```\n\n이 방식은 파일을 메모리처럼 다루기 쉬우나, page fault와 접근 패턴을 함께 봐야 한다.\n\n### `splice()`의 사고방식\n\n```c\n// 의사 코드\nsplice(file_fd, NULL, pipe_fd[1], NULL, len, 0);\nsplice(pipe_fd[0], NULL, socket_fd, NULL, len, 0);\n```\n\n핵심은 \"중간에 사용자 버퍼를 넣지 않는다\"는 점이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 적합한 상황 |\n|------|------|------|-------------|\n| `read()` + `write()` | 단순하다 | 복사가 많다 | 일반적인 작은 I/O |\n| `mmap()` | 메모리처럼 다룰 수 있다 | page fault와 예측 어려움 | 읽기 중심 파일 접근 |\n| `sendfile()` | 파일-소켓 전송에 효율적이다 | 가공이 어렵다 | 정적 파일, 다운로드 |\n| `splice()` | 커널 내부 전달 경로를 만들 수 있다 | 조합 제약이 있다 | 특수한 파이프라인 |\n\n실무에서는 \"zero-copy를 쓰면 무조건 빠르다\"가 아니라, **데이터 가공이 필요한지, 전송량이 큰지, page cache가 도움 되는지**를 먼저 본다.\n\n## 꼬리질문\n\n> Q: `mmap()`은 왜 `read()`보다 항상 빠르지 않나요?\n> 의도: page fault와 접근 패턴을 이해하는지 확인\n> 핵심: 메모리처럼 보이지만 실제로는 페이지 단위 I/O와 fault 비용이 있다.\n\n> Q: `sendfile()`은 왜 대용량 파일 전송에 유리한가요?\n> 의도: 복사 횟수와 커널 경로를 이해하는지 확인\n> 핵심: 사용자 공간 버퍼를 거치지 않고 파일에서 소켓으로 직접 전달할 수 있다.\n\n> Q: zero-copy면 디스크와 네트워크 복사가 완전히 사라지나요?\n> 의도: 과장된 표현을 걸러낼 수 있는지 확인\n> 핵심: 완전 무복사가 아니라, 사용자 공간 복사를 줄여 경로를 최적화하는 개념이다.\n\n> Q: `splice()`는 왜 잘 안 쓰이나요?\n> 의도: API 복잡도와 실용성을 함께 보는지 확인\n> 핵심: 유연하지만 직관성이 낮고, 모든 데이터 처리 파이프라인에 잘 맞지는 않는다.\n\n## 한 줄 정리\n\n대용량 데이터 이동은 \"더 많이 읽고 쓰는 문제\"가 아니라, 사용자 공간 복사를 얼마나 줄여 커널 경로를 짧게 만들지의 문제다.\n",
   "aliases": [
-    "mmap sendfile splice zero-copy",
-    "kernel zero copy file transfer",
-    "user space copy avoidance",
+    "zero copy file transfer",
     "sendfile vs read write",
-    "splice pipe zero copy",
-    "large file transfer CPU efficiency"
+    "mmap page fault cost",
+    "splice pipe transfer",
+    "kernel buffer transfer",
+    "large file copy cost",
+    "제로카피 파일 전송",
+    "sendfile 파일 전송",
+    "mmap 페이지 캐시",
+    "splice 파이프 전송"
   ],
   "expected_queries": [
     "mmap sendfile splice zero-copy는 사용자 공간 복사를 어떻게 줄여?",
@@ -42,8 +46,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/mmap-sendfile-splice-zero-copy.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149",
+        "changes": [
+          "alias-query-contract-repair"
+        ]
+      }
+    ]
   }
 }

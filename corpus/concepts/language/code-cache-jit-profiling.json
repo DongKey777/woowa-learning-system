@@ -6,14 +6,15 @@
   "summary": "code cache는 JIT가 생성한 machine code를 담는 영역이고, 코드 캐시 압박이나 재컴파일이 잦으면 warmup 이후에도 latency와 throughput이 흔들릴 수 있다.",
   "body_markdown": "# Code Cache and JIT Profiling\n\n> 한 줄 요약: code cache는 JIT가 생성한 machine code를 담는 영역이고, 코드 캐시 압박이나 재컴파일이 잦으면 warmup 이후에도 latency와 throughput이 흔들릴 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [Method Inlining Heuristics and Deoptimization Triggers](./method-inlining-heuristics-deopt-triggers.md)\n> - [JFR Event Interpretation](./jfr-event-interpretation.md)\n> - [Jcmd Diagnostic Command Cheat Sheet](./jcmd-diagnostic-command-cheatsheet.md)\n\n> retrieval-anchor-keywords: code cache, JIT profiling, compilation, recompilation, nmethod, code cache pressure, C1, C2, tiered compilation, compiler queue, inline cache, deopt, hot methods\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nHotSpot은 hot method를 JIT로 컴파일해 machine code로 바꾼다.  \n그 코드가 들어가는 공간이 code cache다.\n\ncode cache는 단순 저장소가 아니라 JIT 성능과 밀접하게 연결된다.\n\n- 컴파일이 많으면 커진다\n- 코드가 너무 많으면 압박이 생긴다\n- 재컴파일과 deoptimization이 반복되면 흔들림이 생긴다\n\n운영 감각에서는 code cache를 \"JIT 결과물 저장소\"가 아니라 \"실행 중 생성된 native code의 예산\"으로\n본다. 예산이 부족하거나 profile이 자주 뒤집히면 compiler queue, deoptimization, non-entrant code,\nsweeper 활동이 latency timeline과 겹칠 수 있다. 그래서 GC heap, metaspace, thread pool만 보고\n끝내면 JIT 계층의 흔들림을 놓친다.\n\n## 깊이 들어가기\n\n### 1. code cache에 뭐가 들어가나\n\nJIT가 만든 nmethod와 관련 메타데이터가 들어간다고 보면 된다.  \n즉 실행 중 생성된 machine code의 보관소다.\n\n### 2. code cache pressure가 왜 문제인가\n\ncode cache가 압박을 받으면 다음이 함께 일어날 수 있다.\n\n- 컴파일 지연\n- 재컴파일 증가\n- deoptimization 후 복구 지연\n- hot path 안정성 저하\n\nHotSpot은 code cache를 용도별 heap으로 나눠 관리할 수 있다. JVM 버전과 옵션에 따라 세부는\n달라질 수 있지만, profiled code, non-profiled code, non-method code처럼 서로 다른 성격의 code가\n같은 \"컴파일된 코드 예산\" 안에서 움직인다고 이해하면 된다. 경고 로그에 `CodeCache is full` 또는\ncompiler disabled 계열 신호가 보이면 단순히 `ReservedCodeCacheSize`를 키우기 전에 왜 code가\n늘었는지, warmup이 안정됐는지, deopt가 반복되는지 확인해야 한다.\n\n### 3. tiered compilation과 함께 봐야 한다\n\nHotSpot은 보통 여러 tier를 거쳐 컴파일한다.\n\n- interpreter\n- C1\n- C2\n\n이 경로가 안정화되기 전에는 프로파일이 흔들릴 수 있다.\n\n### 4. inlining과 code cache는 연결된다\n\nInlining이 많아지면 성능은 좋아질 수 있지만 code size가 커져 cache pressure가 늘 수 있다.  \n그래서 [Method Inlining Heuristics and Deoptimization Triggers](./method-inlining-heuristics-deopt-triggers.md)와 같이 봐야 한다.\n\n### 5. JFR과 jcmd가 유용하다\n\nJFR은 컴파일 이벤트와 latency spike를 같이 볼 수 있고, `jcmd`는 code cache 상태를 빠르게 확인할 수 있다.  \n관련해서 [JFR Event Interpretation](./jfr-event-interpretation.md)와 [Jcmd Diagnostic Command Cheat Sheet](./jcmd-diagnostic-command-cheatsheet.md)을 참고하면 좋다.\n\n## 관측 증거\n\n| 증거 | 보는 이유 |\n|---|---|\n| `jcmd <pid> Compiler.codecache` | used/max/free size와 code heap 상태를 빠르게 확인 |\n| JFR `Compilation`, `CompilerPhase`, `CodeCacheFull`, `Deoptimization` 계열 이벤트 | latency spike와 컴파일/탈최적화 시간축 연결 |\n| `PrintCompilation`, `PrintInlining` | 어떤 method가 반복 compile/deopt 되는지 개발/재현 환경에서 확인 |\n| p95/p99 timeline + deploy/warmup 구간 | startup warmup 문제인지 steady-state churn인지 분리 |\n| compiler queue, CPU 사용률 | 컴파일 thread가 foreground CPU와 경쟁하는지 확인 |\n\n증거 해석에서 중요한 점은 \"컴파일 이벤트가 있다\"가 곧 장애 원인이라는 뜻은 아니라는 것이다.\nJIT는 정상적으로도 컴파일한다. 문제는 컴파일/탈최적화가 사용자 지연 구간과 반복적으로 겹치거나,\ncode cache 압박 때문에 hot method가 안정된 native code 상태를 유지하지 못할 때다.\n\n## 실전 시나리오\n\n### 시나리오 1: warmup은 끝난 것 같은데 여전히 느리다\n\n재컴파일, deopt, code cache pressure를 의심한다.  \n단순히 \"JIT가 아직 덜 됐다\"로 끝내면 안 된다.\n\n### 시나리오 2: 컴파일 로그가 많다\n\nhot method가 자주 바뀌거나 profile이 흔들릴 수 있다.  \ncall target instability와 code cache 성장도 함께 본다.\n\n### 시나리오 3: 배포 후만 이상하다\n\nstartup phase에서 code cache가 안정화되기 전에 traffic이 몰렸을 수 있다.  \nJFR로 startup과 steady state를 구분해서 보자.\n\n### 시나리오 4: feature flag 이후 특정 path만 느려짐\n\n새로운 call target이 늘어 inline cache가 monomorphic에서 polymorphic 또는 megamorphic 형태로\n바뀌었을 수 있다. 이 경우 method body 자체는 작아도 가상 호출 profile이 흔들려 inlining 실패,\ndeoptimization, recompilation이 이어질 수 있다. `jit-warmup-deoptimization`와 callsite 문서를 같이\n보며 \"어떤 receiver type이 늘었는가\"를 확인한다.\n\n## 코드로 보기\n\n### 1. 컴파일 로그 감각\n\n```bash\njava -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -XX:+PrintInlining -jar app.jar\n```\n\n### 2. code cache 확인\n\n```bash\njcmd <pid> Compiler.codecache\n```\n\n### 3. JFR 이벤트 확인\n\n```bash\njcmd <pid> JFR.start name=jit settings=profile duration=60s filename=/tmp/jit.jfr\n```\n\n### 4. hot path 관찰 감각\n\n```java\n// hot method가 자주 바뀌면 재컴파일과 code cache 압박이 함께 나타날 수 있다.\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| aggressive compilation | steady-state 성능이 좋다 | code cache와 compile 비용이 늘 수 있다 |\n| conservative compilation | 안정적이다 | peak 성능을 놓칠 수 있다 |\n| inlining 확대 | call overhead를 줄인다 | code size가 커질 수 있다 |\n| profile 기반 최적화 | 실제 패턴에 맞춘다 | profile이 흔들리면 재컴파일이 늘 수 있다 |\n| code cache 증설 | compiler disable 위험을 줄인다 | 근본 원인 없이 native code footprint만 키울 수 있다 |\n| warmup/canary traffic | 배포 직후 흔들림을 줄인다 | warmup workload가 실제 traffic을 대표해야 한다 |\n\n핵심은 code cache를 JIT 결과를 담는 저장소가 아니라 runtime performance stability의 핵심 자원으로 보는 것이다.\n\n## 위험한 결론\n\n- `ReservedCodeCacheSize`를 키웠더니 좋아졌다고 해서 원인이 항상 code cache 부족인 것은 아니다.\n  warmup 시간이 늘어났거나 traffic shape이 바뀐 효과일 수 있다.\n- `PrintCompilation`은 운영 상시 로깅 도구가 아니라 재현/분석용에 가깝다. 운영에서는 JFR과\n  bounded diagnostic window를 선호한다.\n- code cache pressure와 heap GC pause를 섞지 않는다. 둘 다 latency를 만들 수 있지만 지표와 처방이 다르다.\n- \"JIT가 문제\"라고 말하기 전에 interpreted/C1/C2 phase, deopt reason, compiler queue, code cache\n  occupancy를 같이 제시한다.\n\n## 꼬리질문\n\n> Q: code cache는 왜 중요한가요?\n> 핵심: JIT가 만든 machine code가 들어가고, 압박이 생기면 성능이 흔들릴 수 있기 때문이다.\n\n> Q: inlining과 code cache는 어떤 관계인가요?\n> 핵심: inlining이 많아지면 code size가 커져 cache pressure를 높일 수 있다.\n\n> Q: 어떻게 진단하나요?\n> 핵심: `PrintCompilation`, `PrintInlining`, `Compiler.codecache`, JFR을 같이 본다.\n\n## 한 줄 정리\n\ncode cache는 JIT 성능의 결과물이자 제약 조건이므로, warmup 이후에도 재컴파일과 압박 징후를 함께 봐야 한다.\n",
   "aliases": [
-    "Code Cache and JIT Profiling",
     "HotSpot code cache",
     "JIT code cache pressure",
     "Compiler.codecache",
     "tiered compilation profiling",
     "nmethod code cache",
     "JIT 재컴파일 지연",
-    "native"
+    "코드 캐시 압박",
+    "JIT 프로파일링 진단",
+    "컴파일러 큐 지연"
   ],
   "expected_queries": [
     "HotSpot code cache pressure가 warmup 이후 latency spike를 만들 수 있는 이유가 뭐야?",
@@ -47,8 +48,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/code-cache-jit-profiling.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149"
+      }
+    ]
   }
 }

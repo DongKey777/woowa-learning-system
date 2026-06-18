@@ -6,17 +6,21 @@
   "summary": "이 chooser는 Java WeakReference, SoftReference, PhantomReference를 면접 질문에서 구분한다.",
   "body_markdown": "# Weak Soft Phantom Reference Interview Chooser\n\n## 10초 chooser\n\n| Reference | 대략적 용도 | 주의 |\n|---|---|---|\n| WeakReference | canonical map, listener weak link, `WeakHashMap` key | weakly reachable 판정 뒤 clear/enqueue될 수 있지만 즉시성 약속이 아니다 |\n| SoftReference | 메모리 압박에 반응하는 임시 보조 cache | retention 시간, LRU 순서, hit rate를 보장하지 않는다 |\n| PhantomReference | referent 접근 없는 post-mortem cleanup signal | `get()`은 항상 `null`, `ReferenceQueue` drain이 핵심이다 |\n\n면접에서 한 문장으로 줄이면: weak는 \"다른 strong owner가 없으면 끊어도 되는 연결\", soft는 \"JVM이 메모리 상황에 따라 버릴 수 있는 보조 보관\", phantom은 \"객체를 다시 쓰지 않고 회수 가능 판정 이후 정리 신호만 받는 장치\"다.\n\n## 선택 기준\n\n- 객체 생명주기를 애플리케이션이 명확히 소유해야 하면 strong reference와 명시적 close가 기본이다.\n- key가 다른 곳에서 strong하게 참조될 때만 map entry가 살아 있길 원하면 `WeakHashMap`이나 `WeakReference`를 본다.\n- cache는 SoftReference보다 Caffeine 같은 size/TTL/weight 정책 기반 cache를 먼저 검토한다. 운영 cache는 eviction 이유, 최대 크기, TTL, metric을 설명할 수 있어야 한다.\n- native memory, file handle처럼 phantom reachability 기반의 정리 신호가 필요하면 `Cleaner`나 `PhantomReference + ReferenceQueue`를 검토한다. 그래도 주 경로는 `AutoCloseable`/`try-with-resources`다.\n- cleanup이 반드시 즉시 일어나야 하는 자원은 reference type에 맡기지 않는다.\n\n## 정확한 mental model\n\nreference object와 referent를 분리해서 봐야 한다. `WeakReference<T>` 객체 자체가 살아 있어도, 그 안의 referent `T`가 GC root에서 strong하게 도달 가능하면 수거 대상이 아니다. 반대로 referent가 weak/soft/phantom reachable 상태가 되면 GC가 reference를 처리할 수 있다.\n\n처리 순서는 \"내 코드가 원하는 시점\"이 아니라 collector의 reachability 판정과 reference processing phase에 묶인다. 따라서 \"다음 GC에 반드시 바로 사라진다\", \"SoftReference는 OOM 직전까지 항상 남는다\", \"PhantomReference queue에 들어왔으니 cleanup은 이미 끝났다\"처럼 말하면 과하다.\n\n## reachability별 caveat\n\n- Strong reachable: GC root에서 strong path가 있으면 weak/soft/phantom 정책은 referent에 적용되지 않는다. heap dump에서는 GC root path와 retained chain을 먼저 본다.\n- Soft reachable: strong path는 없고 soft reference로만 도달 가능하다. JVM은 메모리 압박과 구현 정책에 따라 clear할 수 있지만, cache entry별 retention 시간이나 공정한 eviction 순서를 약속하지 않는다.\n- Weak reachable: strong/soft path 없이 weak reference로만 도달 가능하다. clear와 enqueue는 GC의 reference processing 결과이며 application thread가 예측 가능한 순서로 관찰한다고 가정하지 않는다.\n- Phantom reachable: referent를 다시 꺼내 쓸 수 없다. queue에서 reference를 받아 native handle, off-heap block 같은 별도 cleanup state를 정리하는 패턴이다.\n\n## 핵심 invariant\n\n- strong reference가 하나라도 reachable하면 weak/soft/phantom 정책은 적용되지 않는다.\n- WeakReference referent는 weakly reachable해지면 GC가 clear할 수 있고, registered reference라면 이후 ReferenceQueue에 enqueue될 수 있다.\n- SoftReference는 메모리 압박과 JVM 정책에 따라 더 오래 남을 수 있지만 수명, 순서, hit rate 보장이 아니다.\n- PhantomReference의 `get()`은 항상 `null`이고, referent에 다시 접근하는 용도가 아니다.\n- ReferenceQueue를 drain하고 cleanup 작업을 idempotent하게 처리해야 reference 기반 정리가 의미를 갖는다.\n- Cleaner action이나 phantom cleanup state가 referent를 strong하게 캡처하면 cleanup 대상이 계속 살아남을 수 있다.\n\n## Complexity/운영 비용\n\n- reference clearing 시점은 GC에 의존하므로 latency와 순서를 deterministic하게 예측하기 어렵다.\n- `WeakHashMap`은 stale entry가 다음 map 접근이나 expunge 시점까지 남을 수 있다.\n- SoftReference cache는 hit rate가 GC 정책과 heap pressure에 흔들려 운영 예측성이 낮다.\n- Cleaner/PhantomReference 기반 정리는 queue 처리 thread, cleanup backlog, 예외 처리, shutdown 시 미처리 항목, classloader leak을 관리해야 한다.\n- scarce resource는 `try-with-resources`와 explicit close를 기본으로 두고, reference cleanup은 안전망으로만 둔다.\n\n## 실패 증상과 반례\n\n- `WeakHashMap<Key, Value>`에서 value가 key를 strong하게 참조하면 map entry가 key를 계속 살려 cleanup이 안 된다.\n- SoftReference cache에 의존하면 메모리 압박 때 중요한 cache가 한꺼번에 사라져 latency spike가 날 수 있다.\n- PhantomReference를 만들고 ReferenceQueue를 처리하지 않으면 cleanup signal을 받아도 아무 일도 일어나지 않는다.\n- file/socket close를 GC cleanup에 맡기면 descriptor 고갈이 먼저 올 수 있다.\n- Cleaner action lambda가 outer object나 referent를 캡처하면 \"청소 장치가 청소 대상을 붙잡는\" 구조가 된다.\n- weak listener를 썼는데 다른 strong owner가 없으면 listener가 예상보다 빨리 사라져 event가 누락될 수 있다.\n- queue drain thread가 죽거나 뒤처지면 heap은 내려가도 native memory, file descriptor, direct buffer 같은 외부 자원이 계속 늘 수 있다.\n\n## 흔한 오해\n\n- WeakReference는 \"조금 약한 strong reference\"가 아니라 GC가 쉽게 끊을 수 있는 참조다.\n- SoftReference는 범용 cache 정답이 아니다. eviction policy와 관측 가능성이 부족하다.\n- PhantomReference로 객체를 되살릴 수 없다. referent identity가 필요한 cleanup data는 별도 state에 보관해야 한다.\n- finalize는 자원 정리 전략으로 추천하면 안 된다. 예측 불가능하고 현대 Java에서는 대안 사용이 권장된다.\n- `System.gc()` 호출로 reference cleanup을 테스트하면 운영 동작을 검증했다고 보기 어렵다. collector, option, heap 상태에 따라 관찰이 달라진다.\n\n## 면접 검증 질문\n\n- \"이 객체를 지금 살리는 strong path가 어디인가?\"를 GC root, static field, ThreadLocal, collection, lambda capture 기준으로 설명할 수 있어야 한다.\n- \"`WeakHashMap` value가 key를 참조하면 왜 정리되지 않는가?\"를 entry graph로 말할 수 있어야 한다.\n- \"SoftReference cache를 운영 cache로 쓰면 어떤 metric과 장애 증상이 흔들리는가?\"에 hit rate cliff, latency spike, eviction 원인 불명확성을 답해야 한다.\n- \"PhantomReference cleanup은 referent를 다시 사용할 수 없는데 무엇을 정리하는가?\"에 native handle id, file descriptor wrapper state, off-heap address 같은 별도 cleanup state를 답해야 한다.\n- \"검증은 어떻게 하는가?\"에 heap dump dominator/GC root path, `jcmd GC.class_histogram`, JFR allocation/GC event, NMT/direct memory, `lsof`/fd count, ReferenceQueue backlog metric을 연결한다.\n\n## Wrong-bucket neighbor\n\n캐시는 SoftReference에 의존하기보다 Caffeine 같은 정책 기반 cache를 쓰는 편이 운영 가능성이 높다.\n\n## Safe Next Docs\n\n상세 reference type은 `phantom-weak-soft-references`, finalize 대안은 `cleaner-vs-finalize-deprecation`으로 이어진다.\n",
   "aliases": [
-    "Weak Soft Phantom Reference chooser",
+    "WeakReference SoftReference PhantomReference chooser",
     "Java Reference 면접 답변",
     "weak soft phantom 차이",
-    "GC reference type answer",
-    "lambda",
-    "native",
-    "static"
+    "WeakHashMap key cleanup",
+    "SoftReference cache caveat",
+    "PhantomReference ReferenceQueue cleanup",
+    "Cleaner finalize 대안",
+    "ReferenceQueue 정리 신호",
+    "GC reachability 참조 타입"
   ],
   "expected_queries": [
     "WeakReference SoftReference PhantomReference 차이를 면접에서 어떻게 설명해?",
-    "WeakHashMap은 언제 쓰는 거야?",
+    "WeakHashMap은 언제 쓰고 value가 key를 참조하면 왜 정리되지 않아?",
+    "SoftReference cache를 운영 cache로 쓰면 어떤 metric이 흔들릴 수 있어?",
+    "PhantomReference와 Cleaner는 referent에 다시 접근하지 않고 무엇을 정리해?",
     "finalize 대신 Cleaner나 PhantomReference를 쓰는 이유가 뭐야?"
   ],
   "symptoms": [
@@ -41,8 +45,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/weak-soft-phantom-reference-interview-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149",
+        "changes": [
+          "alias-query-contract-repair"
+        ]
+      }
+    ]
   }
 }

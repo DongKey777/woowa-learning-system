@@ -6,15 +6,16 @@
   "summary": "Java native serialization에서 내부 표현을 직접 직렬화하면 필드 구조와 불변식이 외부 계약이 된다. serialization proxy pattern은 writeReplace/readResolve로 안정된 proxy를 직렬화해 value object 불변식과 진화 여지를 더 잘 지키게 해준다.",
   "body_markdown": "# Serialization Proxy Pattern and Invariant Preservation\n\n> 한 줄 요약: Java native serialization에서 내부 표현을 직접 직렬화하면 필드 구조와 불변식이 외부 계약이 된다. serialization proxy pattern은 `writeReplace`/`readResolve`로 안정된 proxy를 직렬화해 value object 불변식과 진화 여지를 더 잘 지키게 해준다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Serialization Compatibility and `serialVersionUID`](./serialization-compatibility-serial-version-uid.md)\n> - [`serialPersistentFields`, `readObjectNoData`, and Native Serialization Evolution Escape Hatches](./serialpersistentfields-readobjectnodata-evolution-escape-hatches.md)\n> - [Record Serialization Evolution](./record-serialization-evolution.md)\n> - [Value Object Invariants, Canonicalization, and Boundary Design](./value-object-invariants-canonicalization-boundary-design.md)\n> - [Java IO, NIO, Serialization, JSON Mapping](./io-nio-serialization.md)\n\n> retrieval-anchor-keywords: serialization proxy pattern, writeReplace, readResolve, InvalidObjectException, invariant preservation, native serialization, serialization evolution, stable proxy schema, value object serialization, Effective Java, serial proxy, readObject guard, serialPersistentFields\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n기본 Java serialization은 객체의 내부 필드 구조를 그대로 바깥으로 드러내기 쉽다.  \n그러면 내부 표현이 곧 직렬화 계약이 된다.\n\nserialization proxy pattern은 이 문제를 줄인다.\n\n- 실제 객체 대신 proxy 객체를 직렬화한다\n- 역직렬화는 proxy가 원본 객체를 다시 생성한다\n- 원본 객체는 직접 역직렬화되지 않게 막는다\n\n즉 \"객체 상태 덤프\"가 아니라 \"안정된 재구성 계약\"으로 직렬화를 바꾸는 패턴이다.\n\n## 깊이 들어가기\n\n### 1. 왜 기본 직렬화가 value object에 거칠 수 있나\n\nvalue object는 보통 생성 시점에 invariant를 잠근다.\n\n- 정규화\n- 범위 검사\n- canonical form 강제\n- 필드 간 상호 제약\n\n그런데 기본 직렬화는 내부 필드 값을 그대로 복원하기 때문에,  \n생성자 규칙이 우회되기 쉽다.\n\n즉 정상 생성 경로와 역직렬화 경로가 다른 의미를 가질 수 있다.\n\n### 2. proxy는 \"재구성에 필요한 최소 계약\"만 노출한다\n\nproxy 클래스에는 보통 외부 계약으로 유지하고 싶은 최소 필드만 둔다.\n\n- 공개 의미에 필요한 값\n- 안정적으로 진화시킬 수 있는 표현\n- 원본 객체를 다시 만들 수 있는 정보\n\n즉 내부 캐시, 파생 필드, 구현 세부는 원본 객체에 남기고  \n직렬화 계약은 proxy가 담당한다.\n\n### 3. `writeReplace`와 `readResolve`가 흐름의 핵심이다\n\n전형적인 흐름:\n\n- 원본 객체가 `writeReplace()`로 proxy를 반환\n- proxy가 직렬화된다\n- proxy가 `readResolve()`로 원본 객체를 재구성한다\n\n그리고 원본 객체의 `readObject()`는 보통 직접 역직렬화를 막기 위해 실패시킨다.\n\n이렇게 해야 \"항상 proxy 경유\" 규칙이 강제된다.\n\n### 4. proxy도 versioned contract다\n\nserialization proxy를 쓴다고 evolution 문제가 사라지는 것은 아니다.  \n다만 어떤 필드를 계약으로 삼을지 더 의식적으로 고를 수 있다.\n\n즉 proxy 패턴의 장점은 마법이 아니라 boundary control이다.\n\n### 5. 모든 타입에 과한 것은 아니다\n\n단순 DTO나 short-lived cache object에는 과할 수 있다.  \n하지만 다음에는 가치가 크다.\n\n- value object\n- 불변식이 중요한 타입\n- 내부 표현을 숨기고 싶은 타입\n- 장기 저장 또는 서로 다른 버전 간 호환성이 중요한 타입\n\n## 재현 조건\n\nserialization proxy의 필요성은 생성자와 역직렬화 경로가 다른 상태를 만들 수 있을 때 드러난다.\n\n- 생성자에서는 거부되는 값이 serialized bytes 조작이나 이전 버전 데이터로 들어온다\n- 내부 표현을 바꿨지만 외부 저장 포맷은 유지해야 한다\n- `writeReplace`는 있는데 원본 `readObject` guard가 없어 직접 역직렬화 경로가 남아 있다\n- proxy `readResolve`가 생성자/팩토리를 우회해 필드를 직접 세팅한다\n\n재현은 정상 객체를 serialize/deserialize하는 happy path만으로 부족하다. guard 우회, old fixture, invalid proxy field를 함께 넣어야 한다.\n\n## failure matrix\n\n| 상황 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| 역직렬화 후 invalid value object | 생성자 버그 | 기본 serialization이 생성자 invariant 우회 | constructor path에서는 재현 안 됨 |\n| 내부 필드 변경 후 old data 실패 | `serialVersionUID`만 문제 | 내부 표현을 외부 계약으로 노출 | serialized field name/type에 내부 구현 반영 |\n| proxy를 쓰는데 직접 원본 read 가능 | proxy 적용 완료 | `readObject` guard 누락 | 원본 stream fixture가 성공 |\n| `readResolve`가 validation 없이 객체 생성 | proxy가 안전하다 | 재구성 경로 invariant 누락 | invalid proxy field가 통과 |\n| proxy field를 계속 추가 | schema evolution 해결 | proxy 자체도 versioned contract | old/new proxy fixture 필요 |\n\n## 검증/validation\n\n- 원본 객체 직접 역직렬화 fixture가 `InvalidObjectException`으로 실패하는지 확인한다.\n- proxy `readResolve`가 public constructor나 factory를 통과해 canonicalization과 validation을 재사용하는지 테스트한다.\n- old proxy bytes를 새 코드가 읽는 backward compatibility 테스트를 남긴다.\n- invalid proxy field, missing field, extra field에 대한 reset/default/fail-fast 정책을 명시한다.\n\n## 오해와 wrong bucket\n\n- serialization proxy를 쓰면 호환성 문제가 사라진다는 설명은 과하다. proxy도 버전 관리되는 저장 계약이다.\n- proxy를 DTO처럼 필드만 옮기는 코드로 만들면 핵심을 놓친 것이다. 목적은 내부 표현 노출 축소와 invariant 재적용이다.\n- `readObject` guard 없이 `writeReplace`만 있으면 \"항상 proxy 경유\"가 강제되지 않을 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 역직렬화 후 invalid object가 생긴다\n\n생성자에서는 음수 금액을 막는데,  \n역직렬화는 내부 필드만 복원해서 invalid state가 들어온다.\n\nproxy를 쓰면 재구성 경로를 생성자/팩토리로 통일할 수 있다.\n\n### 시나리오 2: 내부 표현을 바꿨더니 오래된 데이터가 깨진다\n\n원래는 `BigDecimal` 하나였는데 이후 `currency + minorUnit long`으로 바꿨다.  \n기본 직렬화라면 내부 구조 변화가 바로 호환성 문제로 번진다.\n\nproxy라면 이전 계약을 유지하며 내부 표현을 교체할 여지가 생긴다.\n\n### 시나리오 3: 파생 필드와 캐시 필드가 계약에 섞인다\n\n성능 때문에 넣은 derived field가 직렬화 포맷에 섞이면,  \n구현 최적화가 external contract가 되어버린다.\n\n## 코드로 보기\n\n### 1. 원본 객체는 proxy를 내보낸다\n\n```java\nimport java.io.InvalidObjectException;\nimport java.io.ObjectInputStream;\nimport java.io.Serial;\nimport java.io.Serializable;\nimport java.math.BigDecimal;\n\npublic final class Percent implements Serializable {\n    @Serial\n    private static final long serialVersionUID = 1L;\n\n    private final BigDecimal value;\n\n    public Percent(BigDecimal value) {\n        if (value.signum() < 0 || value.compareTo(new BigDecimal(\"100\")) > 0) {\n            throw new IllegalArgumentException(\"percent out of range\");\n        }\n        this.value = value.stripTrailingZeros();\n    }\n\n    @Serial\n    private Object writeReplace() {\n        return new SerializationProxy(value.toPlainString());\n    }\n\n    @Serial\n    private void readObject(ObjectInputStream in) throws InvalidObjectException {\n        throw new InvalidObjectException(\"proxy required\");\n    }\n\n    private static final class SerializationProxy implements Serializable {\n        @Serial\n        private static final long serialVersionUID = 1L;\n\n        private final String decimal;\n\n        private SerializationProxy(String decimal) {\n            this.decimal = decimal;\n        }\n\n        @Serial\n        private Object readResolve() {\n            return new Percent(new BigDecimal(decimal));\n        }\n    }\n}\n```\n\n### 2. 핵심 감각\n\n```java\n// 직렬화 계약은 proxy가 가진다.\n// 원본 객체는 항상 생성자 규칙을 통과해서만 복원된다.\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| 기본 직렬화 | 구현이 단순하다 | 내부 표현과 invariant가 외부 계약에 노출되기 쉽다 |\n| serialization proxy | 경계를 통제하고 invariant를 재적용하기 쉽다 | 보일러플레이트와 진화 설계가 필요하다 |\n| JSON/schema DTO | 명시성과 상호운용성이 높다 | native serialization보다 코드가 더 필요하다 |\n\n핵심은 직렬화가 \"현재 필드를 덤프하는가\" 아니면 \"의미를 재구성하는가\"를 선택하는 것이다.\n\n## 꼬리질문\n\n> Q: serialization proxy pattern은 왜 쓰나요?\n> 핵심: 내부 표현 대신 안정된 proxy 계약만 직렬화해 invariant와 진화 여지를 지키기 위해서다.\n\n> Q: `readObject()`를 왜 막나요?\n> 핵심: 원본 객체가 proxy를 우회해 직접 역직렬화되는 경로를 차단하기 위해서다.\n\n> Q: proxy를 쓰면 호환성 문제가 사라지나요?\n> 핵심: 아니지만, 어떤 필드를 계약으로 유지할지 더 의식적으로 통제할 수 있다.\n\n> Q: 모든 `Serializable` 타입에 필요한가요?\n> 핵심: 아니다. value object나 invariants가 중요한 타입에서 특히 가치가 크다.\n\n## 한 줄 정리\n\nserialization proxy pattern은 native serialization에서도 생성자 규칙과 불변식을 다시 중심에 놓게 해주는 boundary-control 패턴이다.\n",
   "aliases": [
-    "Serialization Proxy Pattern and Invariant Preservation",
-    "serialization proxy pattern writeReplace readResolve",
-    "Java native serialization invariant preservation",
-    "stable proxy schema value object",
+    "serialization proxy pattern",
+    "writeReplace readResolve proxy",
     "InvalidObjectException readObject guard",
-    "자바 serialization proxy pattern",
-    "final",
-    "record",
-    "static"
+    "value object invariant serialization",
+    "stable proxy schema",
+    "native serialization boundary control",
+    "자바 serialization proxy",
+    "직렬화 프록시 패턴",
+    "불변식 보존 직렬화",
+    "readObject 직접 역직렬화 차단"
   ],
   "expected_queries": [
     "serialization proxy pattern은 writeReplace와 readResolve로 value object invariant를 어떻게 지켜?",
@@ -50,8 +51,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/serialization-proxy-pattern-invariant-preservation.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch149",
+        "changes": [
+          "alias-query-contract-repair"
+        ]
+      }
+    ]
   }
 }
