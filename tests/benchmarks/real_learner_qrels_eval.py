@@ -57,6 +57,14 @@ def main() -> int:
         "cohort_size": summary.get("cohort_size"),
         "ranking_evaluated": summary.get("ranking_evaluated"),
         "top1_match_rate": summary.get("top1_match_rate"),
+        # learner_top1 = top1 in (expected ∪ primary_paths ∪ acceptable_paths) — the
+        # qrels' designed "did the learner get an acceptable answer" metric. As the
+        # corpus grows and legitimate sibling concepts multiply, strict top1 (expected
+        # only) over-penalizes acceptable sibling-swaps; learner_top1 credits the
+        # acceptable_paths the qrels authors deliberately included. This is the
+        # AUTHORITY gate metric (see release_acceptance _y13_gate_checks).
+        "learner_top1_match_rate": summary.get("learner_top1_match_rate"),
+        "learner_top5_match_rate": summary.get("learner_top5_match_rate"),
         "top5_match_rate": summary.get("top5_match_rate"),
         "ndcg_at_5": summary.get("ndcg_at_5"),
         "mrr": summary.get("mrr"),
