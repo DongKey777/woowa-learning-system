@@ -1,0 +1,68 @@
+{
+  "id": "security/breach-crime-http-compression-side-channel-token-leak",
+  "title": "BREACH/CRIME HTTP Compression Side-Channel Token Leak",
+  "category": "security",
+  "level": "advanced",
+  "summary": "BREACH와 CRIME 계열 공격은 암호를 깨는 공격이 아니라, secret과 공격자 입력이 같은 압축 context에 들어갈 때 압축된 길이가 조금 달라지는 성질을 반복 관찰해 CSRF token, session cookie 같은 값을 좁혀 가는 compression side-channel이다. HTTPS는 본문 내용을 숨기지만 압축 후 길이까지 완전히 숨기지는 않으므로, secret-bearing 응답의 압축 비활성화, token masking/randomization, reflected input과 secret 분리, SameSite와 CSRF 경계의 정확한 이해가 필요하다.",
+  "body_markdown": "# BREACH/CRIME HTTP Compression Side-Channel Token Leak\n\n> 한 줄 요약: TLS가 본문을 암호화해도 압축된 응답 길이는 남을 수 있고, secret과 공격자 입력이 같은 압축 단위에 섞이면 길이 차이가 token 추측의 힌트가 된다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [HTTP Response Compression, Buffering, Streaming Trade-offs](../network/http-response-compression-buffering-streaming-tradeoffs.md)\n- [HTTPS와 TLS 기초](./https-tls-beginner.md)\n- [세션·쿠키·JWT 기초](./session-cookie-jwt-basics.md)\n- [XSS와 CSRF 기초](./xss-csrf-basics.md)\n- [CSRF 방어 비교 큰그림](./csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge.md)\n\nretrieval-anchor-keywords: BREACH attack, CRIME attack, HTTP compression side channel, compressed length oracle, gzip csrf token leak, TLS does not hide response length, reflected input secret same response, compression oracle token leak, csrf token masking, disable compression secret response\n\n## 핵심 직관\n\n압축은 반복되는 문자열을 더 짧게 표현한다. 이 성질 자체는 성능 최적화지만, 공격자가 일부 문자열을 조작할 수 있고 같은 압축 결과의 길이를 볼 수 있으면 정보 누출 통로가 된다.\n\n예를 들어 로그인된 사용자의 HTML 응답 안에 다음 두 값이 같이 있다고 하자.\n\n```text\n검색어: <attacker-controlled input>\ncsrf_token=SECRET...\n```\n\n공격자가 입력을 `csrf_token=S`처럼 바꿔 보냈을 때 실제 token의 앞부분과 우연히 맞으면 압축 결과가 아주 조금 더 짧아질 수 있다. 다음에는 `csrf_token=SE`, 그 다음에는 `csrf_token=SEC`처럼 후보를 늘려 가며 길이를 비교한다. 이것이 길이 오라클(length oracle)의 직관이다.\n\n공격자는 응답 본문을 읽지 못해도 된다. 압축 후 byte 길이가 후보에 따라 달라진다는 신호만 반복해서 얻으면 secret을 한 글자씩 좁힐 수 있다.\n\n## BREACH와 CRIME을 어떻게 구분하나\n\n| 구분 | 주로 섞이는 위치 | 노리는 secret | 대표 완화 감각 |\n|---|---|---|---|\n| CRIME 계열 | TLS/SPDY 같은 연결 또는 header 압축 context | Cookie, session token 같은 request header secret | TLS-level compression 비활성화, 위험한 header compression context 분리 |\n| BREACH 계열 | HTTP response compression, gzip/brotli 응답 body | HTML 안의 CSRF token, reflected secret, response에 포함된 session-related 값 | secret-bearing response 압축 끄기, token masking, 입력과 secret 분리 |\n\n둘 다 본질은 같다. 암호 알고리즘을 깨는 것이 아니라, **압축기가 secret과 attacker-controlled bytes를 같은 dictionary/context에서 비교하게 만든 뒤 결과 길이를 본다**.\n\n현대 서비스에서 더 자주 고민하는 것은 BREACH 쪽이다. TLS compression은 대부분 꺼져 있지만, HTTP 응답 gzip/brotli는 여전히 흔하고, HTML form이나 bootstrap JSON에 CSRF token이 들어가는 패턴도 많기 때문이다.\n\n## 공격이 성립하는 조건\n\n다음 조건이 함께 맞아야 위험이 커진다.\n\n1. 피해자가 로그인되어 있고, 요청에 인증 쿠키나 세션 정보가 자동으로 붙는다.\n2. 공격자가 피해자 브라우저로 같은 endpoint에 반복 요청을 만들 수 있다.\n3. 공격자가 query parameter, form field, path 일부처럼 응답에 반사되는 입력을 조작할 수 있다.\n4. 같은 압축 응답 안에 공격자 입력과 secret이 함께 들어간다.\n5. 응답이 gzip, brotli, deflate 같은 방식으로 압축된다.\n6. 공격자가 압축된 응답 길이를 충분히 관찰하거나 추정할 수 있다.\n7. token이 여러 번의 추측 동안 안정적이거나, 회전하더라도 공격자가 반복 실험을 할 시간이 있다.\n\n이 중 하나라도 끊으면 공격 난이도가 크게 올라간다. 특히 4번과 5번이 핵심이다. secret과 reflected input이 같은 response body에 없거나, 그 응답을 압축하지 않으면 길이 오라클이 약해진다.\n\n## CSRF token과 session token leak model\n\nBREACH에서 전형적인 대상은 HTML form hidden field나 meta tag에 들어간 CSRF token이다.\n\n```html\n<input type=\"hidden\" name=\"_csrf\" value=\"a9f...\" />\n```\n\n이 token은 원래 CSRF를 막기 위한 값이다. 공격자가 피해자 브라우저에 쿠키가 붙은 요청을 만들 수 있어도 token 값을 모르기 때문에 상태 변경 요청이 실패해야 한다. 그런데 compression side-channel로 token을 알아내면, 이후에는 token을 포함한 위조 요청을 만들 가능성이 생긴다.\n\nSession token은 위치에 따라 다르다.\n\n- 일반적인 session cookie는 response body에 직접 들어가지 않으므로 BREACH의 직접 대상은 아니다.\n- CRIME 계열처럼 request header compression context에 cookie가 섞이면 session cookie 자체가 대상이 될 수 있다.\n- 서버가 session id, access token, OAuth state, invite token 같은 값을 HTML이나 JSON 응답에 다시 노출하면 BREACH 대상이 될 수 있다.\n\n그래서 대응할 때는 token 이름만 보지 말고, **secret이 어느 방향(request header인지 response body인지)에 있고 공격자 입력과 같은 압축 context에 들어가는지**를 본다.\n\n## TLS는 왜 충분하지 않은가\n\nHTTPS는 네트워크 관찰자가 response body 내용을 읽지 못하게 한다. 하지만 많은 환경에서 다음 메타데이터는 완전히 사라지지 않는다.\n\n- TLS record 크기\n- 압축 후 전송 byte 수\n- request/response timing\n- 여러 요청 사이의 상대적 길이 차이\n\nBREACH/CRIME은 평문을 훔쳐보는 공격이 아니라, 암호화 전에 압축된 결과의 길이를 이용하는 공격이다. 즉 TLS가 제대로 켜져 있어도 압축이 먼저 정보를 새기고, 그 길이 신호가 암호문 크기로 남을 수 있다.\n\n그래서 HTTPS 적용 여부와 compression side-channel 방어 여부는 다른 질문이다. HTTPS는 필수지만, secret-bearing response의 압축 정책까지 대신 판단해 주지는 않는다.\n\n## 완화 전략\n\n### 1. secret-bearing response는 압축을 끈다\n\n가장 직접적인 완화는 CSRF token, OAuth state, account recovery token, session-related secret을 담는 동적 HTML/JSON 응답에서 compression을 끄는 것이다.\n\n실무에서는 app, reverse proxy, CDN 중 누가 압축하는지부터 확인한다.\n\n- Spring/서버 설정에서 특정 endpoint compression 제외\n- Nginx/Envoy/CDN에서 authenticated HTML route gzip 제외\n- `Content-Encoding`과 응답 크기 bucket으로 실제 적용 여부 확인\n- 캐시 계층이 다시 압축하지 않는지 확인\n\n정적 JS/CSS나 공개 JSON까지 모두 끄라는 뜻은 아니다. **secret과 reflected input이 같이 들어가는 응답**을 먼저 좁힌다.\n\n### 2. token을 randomize/mask한다\n\nCSRF token이 매번 같은 문자열로 반복되면 압축기가 맞춘 후보를 잘 이용한다. 그래서 많은 프레임워크는 token masking을 쓴다. 예를 들어 서버의 실제 secret은 유지하되, 응답마다 random mask와 결합한 다른 표현을 내려 주고 검증 때 되돌린다.\n\n효과는 두 가지다.\n\n- 같은 token prefix가 응답마다 반복되는 정도를 줄인다.\n- 공격자가 여러 요청의 길이 차이를 안정적으로 평균내기 어렵게 한다.\n\n단순히 token을 길게 만드는 것만으로는 충분하지 않다. 길이가 길어도 반복 관찰이 가능하면 한 글자씩 좁힐 수 있다.\n\n### 3. reflected input과 secret을 분리한다\n\n위험한 조합은 `공격자 입력 + secret + 같은 압축 응답`이다. 따라서 다음 분리가 도움이 된다.\n\n- 검색어 echo와 CSRF token이 같은 HTML 조각에 들어가지 않게 한다.\n- token 발급 endpoint를 별도로 두고 해당 응답을 압축하지 않는다.\n- 사용자 입력을 그대로 반사해야 하는 페이지에는 secret 값을 같이 넣지 않는다.\n- template에서 token 주변에 공격자 입력이 반복적으로 붙는 구조를 피한다.\n\nXSS 방어처럼 출력 이스케이프도 중요하지만, 이 공격에서는 이스케이프만으로 충분하지 않다. 입력이 안전하게 escape되어도 압축기는 문자열 반복성을 여전히 본다.\n\n### 4. SameSite와 CSRF 방어 경계를 정확히 본다\n\nSameSite cookie는 cross-site 요청에 쿠키가 붙는 상황을 줄여 공격 표면을 좁힌다. 그러나 이것은 compression side-channel 자체의 완화가 아니다.\n\n- SameSite가 강하면 공격자가 피해자 세션으로 반복 요청을 만들기 어려워질 수 있다.\n- 하지만 same-site 하위 도메인, top-level navigation, 로그인 callback, embedded flow처럼 예외가 남을 수 있다.\n- CSRF token은 방어 수단이지만, BREACH에서는 그 token 자체가 누출 대상이 될 수 있다.\n\n따라서 SameSite, Origin/Referer 검증, CSRF token은 요청 위조 방어층으로 보고, compression side-channel은 별도로 압축/응답 설계를 점검한다.\n\n### 5. padding은 보조 수단으로만 본다\n\n응답에 random padding을 추가하면 길이 신호가 흐려질 수 있다. 하지만 공격자가 충분히 반복 측정하면 noise를 평균낼 수 있고, padding 정책이 잘못되면 성능과 캐시만 복잡해진다. padding은 압축 비활성화, token masking, secret/input 분리를 대체하는 주 완화책으로 두지 않는 편이 안전하다.\n\n## XSS/CSRF와 무엇이 다른가\n\n| 항목 | 핵심 | BREACH/CRIME과의 차이 |\n|---|---|---|\n| XSS | 대상 origin에서 script를 실행하거나 DOM을 읽는다 | compression side-channel은 대상 페이지 script 실행 없이 길이만으로 secret을 추론할 수 있다 |\n| CSRF | 피해자 브라우저가 인증 쿠키를 붙여 상태 변경 요청을 보내게 한다 | BREACH는 CSRF token을 알아내 CSRF 방어를 약화시키는 선행 정보 유출이 될 수 있다 |\n| CORS | cross-origin response를 JS에 노출할지 정한다 | body가 JS에 노출되지 않아도 길이 신호가 threat model에 남을 수 있다 |\n| TLS | 전송 중 본문과 변조를 보호한다 | 압축 후 길이 메타데이터까지 완전히 숨기는 장치는 아니다 |\n\n즉 이 문제를 XSS처럼 입력 검증만으로, CSRF처럼 token 존재만으로, TLS처럼 암호화만으로 닫았다고 판단하면 버킷이 틀린다.\n\n## 점검 순서\n\n1. 인증된 동적 응답 중 `Content-Encoding: gzip` 또는 `br`가 붙는 endpoint를 찾는다.\n2. 그 응답에 CSRF token, OAuth state, account token, session-related secret이 들어가는지 본다.\n3. 같은 응답에 query/form/path 값이 반사되는지 확인한다.\n4. 공격자가 그 요청을 cross-site 또는 same-site 경로로 반복 유도할 수 있는지 본다.\n5. token이 응답마다 같은지, masking 또는 one-time 표현을 쓰는지 확인한다.\n6. app/proxy/CDN 중 어느 계층에서 압축을 끌 수 있는지 정한다.\n7. SameSite, Origin/Referer, CSRF token 검증은 별도 요청 위조 방어로 점검한다.\n\n## 흔한 오해\n\n- HTTPS니까 압축 길이도 숨겨진다: 아니다. 본문은 숨겨도 암호문 길이는 힌트가 될 수 있다.\n- CSRF token이 있으니 안전하다: token이 같은 압축 응답에서 반복 노출되면 그 token이 공격 대상이 된다.\n- XSS가 없으면 괜찮다: 대상 origin script 실행 없이도 길이 오라클이 성립할 수 있다.\n- gzip을 전체 서비스에서 끄면 된다: 가능하면 secret-bearing route부터 selective하게 끄고 성능 영향과 보안 효과를 같이 본다.\n- token을 길게 만들면 끝이다: 반복 가능한 길이 오라클이 있으면 길이만으로도 후보를 좁힐 수 있다.\n\n## 한 줄 정리\n\nBREACH/CRIME은 TLS 실패가 아니라 compression context 설계 실패다. secret과 공격자 입력을 같은 압축 응답에 넣지 말고, 민감 응답 압축을 끄며, CSRF token은 masking과 SameSite 같은 방어층을 함께 써야 한다.\n",
+  "aliases": [
+    "BREACH 공격",
+    "CRIME 공격",
+    "HTTP 압축 사이드채널",
+    "압축 길이 오라클",
+    "응답 압축 토큰 유출",
+    "TLS 길이 노출",
+    "gzip CSRF token leak",
+    "compressed response token leak",
+    "reflection compression oracle",
+    "same response secret reflection"
+  ],
+  "expected_queries": [
+    "BREACH 공격이 뭐야?",
+    "CRIME이랑 BREACH 차이만 짧게 알려줘",
+    "HTTPS면 압축 길이로 토큰이 새는 걸 못 막아?",
+    "CSRF 토큰이 응답에 같이 있으면 gzip 때문에 유출될 수 있어?",
+    "내가 입력한 값이 화면에 다시 보이는 페이지에서 세션 토큰이 왜 위험해?",
+    "압축 사이드채널은 XSS나 CSRF랑 뭐가 달라?"
+  ],
+  "symptoms": [
+    "로그인된 HTML 응답에 CSRF hidden field와 검색어 echo가 함께 있고 gzip이 켜져 있다",
+    "HTTPS가 켜져 있으니 압축된 응답 길이로는 아무 정보도 새지 않는다고 판단한다",
+    "CSRF token을 두었지만 token 자체가 반복 노출되는 압축 응답에 들어간다는 점을 놓친다",
+    "XSS, CSRF, CORS, TLS 문제와 compression side-channel의 경계를 구분하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/http-response-compression-buffering-streaming-tradeoffs",
+      "security/https-tls-beginner",
+      "security/session-cookie-jwt-basics",
+      "security/xss-csrf-basics"
+    ],
+    "next_docs": [
+      "security/csrf-defense-synchronizer-token-vs-samesite-vs-double-submit-intermediate-bridge",
+      "security/browser-storage-threat-model-for-tokens",
+      "network/websocket-permessage-deflate-context-takeover-window-bits-tradeoff",
+      "security/secret-management-rotation-leak-patterns"
+    ],
+    "confusable_with": [
+      "security/xss-csrf-basics",
+      "security/csrf-vs-samesite-session-cookie-chooser",
+      "network/http-response-compression-buffering-streaming-tradeoffs",
+      "security/tls-https-handshake-primer",
+      "security/browser-storage-threat-model-for-tokens"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "round-3-backlog-b182-breach"
+      }
+    ]
+  }
+}
