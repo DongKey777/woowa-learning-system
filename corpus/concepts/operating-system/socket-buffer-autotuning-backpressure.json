@@ -6,12 +6,18 @@
   "summary": "socket buffer는 단순 저장 공간이 아니라, 커널이 네트워크 속도 차를 흡수하면서 backpressure를 전달하는 핵심 완충 장치다.",
   "body_markdown": "# Socket Buffer Autotuning, Backpressure\n\n> 한 줄 요약: socket buffer는 단순 저장 공간이 아니라, 커널이 네트워크 속도 차를 흡수하면서 backpressure를 전달하는 핵심 완충 장치다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [TCP Backlog, somaxconn, Listen Queue](./tcp-backlog-somaxconn-listen-queue.md)\n> - [Thundering Herd, Accept, Wakeup](./thundering-herd-accept-wakeup.md)\n> - [epoll, kqueue, io_uring](./epoll-kqueue-io-uring.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n\n> retrieval-anchor-keywords: SO_RCVBUF, SO_SNDBUF, tcp_rmem, tcp_wmem, autotuning, skbuff, backpressure, send buffer, receive buffer, tcp_mem\n\n## 핵심 개념\n\nTCP socket buffer는 송수신 데이터의 속도 차를 완충한다. Linux는 다양한 기준으로 buffer 크기를 자동 조정할 수 있고, 이를 `autotuning`이라고 부른다.\n\n- `SO_RCVBUF`: 수신 버퍼 크기 힌트다\n- `SO_SNDBUF`: 송신 버퍼 크기 힌트다\n- `tcp_rmem`, `tcp_wmem`: TCP 자동 조정 범위에 영향을 준다\n- `backpressure`: 상대나 커널이 더 이상 빨리 못 받는 신호다\n\n왜 중요한가:\n\n- 버퍼가 너무 작으면 throughput이 떨어진다\n- 버퍼가 너무 크면 메모리를 먹고 지연을 숨길 수 있다\n- backpressure를 무시하면 큐가 서버 내부에서만 커질 수 있다\n\n이 문서는 [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)와 [TCP Backlog, somaxconn, Listen Queue](./tcp-backlog-somaxconn-listen-queue.md)를 buffer 관점으로 잇는다.\n\n## 깊이 들어가기\n\n### 1. socket buffer는 큐잉 모델의 일부다\n\nsocket buffer는 네트워크가 즉시 처리되지 못할 때 데이터를 보관한다.\n\n- 송신 버퍼가 차면 `send()`가 block되거나 `EAGAIN`이 난다\n- 수신 버퍼가 차면 상대가 더 보내는 속도를 줄여야 한다\n- buffer는 네트워크 RTT와 앱 처리 속도의 차를 흡수한다\n\n### 2. autotuning은 편하지만 만능이 아니다\n\nLinux는 상황에 맞춰 buffer를 자동으로 키우려 한다.\n\n- RTT가 길고 대역폭이 큰 링크에서 유리하다\n- burst traffic에서 도움이 된다\n- 하지만 과도하면 메모리와 지연이 숨겨질 수 있다\n\n### 3. backpressure는 좋은 신호다\n\nbackpressure는 나쁜 현상이 아니라, 시스템이 더 느려져야 한다는 신호다.\n\n- sender가 너무 빨리 밀어 넣는다\n- receiver가 처리 속도를 못 따라간다\n- 커널이 큐를 통해 양쪽 속도를 맞춘다\n\n이 신호를 무시하면 앱 내부 큐, GC, 메모리 사용량만 커진다.\n\n### 4. 작은 buffer는 latency, 큰 buffer는 memory를 건드린다\n\n버퍼 크기와 지연은 단순 비례가 아니다.\n\n- 작으면 throughput이 떨어질 수 있다\n- 크면 큐가 길어져 hidden latency가 생길 수 있다\n- 네트워크가 느린 것이 아니라 앱이 backpressure를 못 읽는 경우가 많다\n\n## Playbook 역할\n\n### 재현 조건\n\n- connection 수가 늘 때 RSS나 kernel socket memory가 같이 증가한다\n- slow client가 생기면 application queue, send buffer, request latency가 함께 커진다\n- bandwidth는 충분해 보이지만 p99가 큐잉 지연처럼 늘어난다\n\n### 확인 순서\n\n1. `ss -m`으로 per-socket memory와 send/receive queue를 본다.\n2. `tcp_rmem`, `tcp_wmem`, application의 `SO_RCVBUF`/`SO_SNDBUF` 설정을 확인한다.\n3. 느린 consumer, 큰 RTT, application worker block, softirq 지연을 분리한다.\n4. `EAGAIN`, write timeout, per-connection queue cap이 실제 backpressure로 연결되는지 본다.\n\n### Failure Matrix\n\n| 관찰 | 더 가까운 원인 | 다음 확인 |\n|------|----------------|-----------|\n| `ss -m`의 socket memory가 connection 수와 함께 증가 | per-socket buffer 누적 | connection cap, buffer bound |\n| send queue가 긴 connection이 오래 유지됨 | slow consumer | write timeout, drop/close 정책 |\n| receive queue가 쌓임 | application read 속도 부족 | worker saturation, event loop lag |\n| buffer를 키워 throughput은 나아졌지만 p99 증가 | queueing delay 은폐 | end-to-end latency, queue length |\n\n### 검증\n\n버퍼 변경 후에는 throughput만 보지 말고 socket memory, queue 체류 시간, slow-client 격리 효과를 같이 확인한다. backpressure가 애플리케이션 생산 속도를 실제로 낮추지 못하면 커널 버퍼 크기 조정만으로는 장애가 재발한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 전송량은 늘지 않았는데 memory 사용량이 커진다\n\n가능한 원인:\n\n- send buffer가 과도하게 커진다\n- connection 수가 늘면서 per-socket buffer가 누적된다\n- autotuning이 큰 링크 기준으로 확대된다\n\n진단:\n\n```bash\ncat /proc/sys/net/ipv4/tcp_rmem\ncat /proc/sys/net/ipv4/tcp_wmem\nss -m\n```\n\n### 시나리오 2: 느린 클라이언트가 전체 서버를 밀어낸다\n\n가능한 원인:\n\n- 송신 버퍼가 꽉 차고 워커가 막힌다\n- backpressure를 무시한 채 write를 계속한다\n- 비동기라도 큐가 무한히 커진다\n\n대응:\n\n- per-connection cap을 둔다\n- `EAGAIN`을 정상 흐름으로 다룬다\n- slow consumer를 분리한다\n\n### 시나리오 3: 대역폭은 충분한데 p99가 튄다\n\n가능한 원인:\n\n- buffer가 너무 작아 syscall이 많다\n- buffer가 너무 커서 queueing delay가 길다\n- softirq와 wakeup 지연이 섞인다\n\n이 경우는 [softirq, hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)도 같이 본다.\n\n## 코드로 보기\n\n### 소켓 버퍼 힌트 주기\n\n```c\nint size = 1 << 20;\nsetsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));\nsetsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));\n```\n\n### 현재 소켓 buffer 상태 보기\n\n```bash\nss -m\n```\n\n### TCP 자동 조정 범위 확인\n\n```bash\nsysctl net.ipv4.tcp_rmem\nsysctl net.ipv4.tcp_wmem\nsysctl net.ipv4.tcp_mem\n```\n\n### backpressure를 읽는 의사 코드\n\n```c\nssize_t n = send(fd, buf, len, MSG_NOSIGNAL);\nif (n < 0 && errno == EAGAIN) {\n    // socket buffer full, stop producing\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 작은 buffer | 메모리 절약 | throughput이 떨어질 수 있다 | low-latency, small payload |\n| 큰 buffer | burst 흡수에 유리 | queueing delay가 숨는다 | high throughput |\n| autotuning | 운영이 편하다 | 예측이 어려울 수 있다 | 일반 TCP 서버 |\n| 명시적 backpressure | 큐 폭주를 막는다 | 구현이 어렵다 | 고부하 비동기 서버 |\n\n## 꼬리질문\n\n> Q: socket buffer를 키우면 항상 더 좋아지나요?\n> 핵심: 아니다. 큐가 길어져 지연이 숨을 수 있다.\n\n> Q: backpressure는 왜 중요한가요?\n> 핵심: 생산 속도를 소비 속도에 맞추지 않으면 내부 큐가 터지기 때문이다.\n\n> Q: autotuning은 무엇을 해주나요?\n> 핵심: 상황에 맞게 수신/송신 버퍼를 조정해 throughput을 돕는다.\n\n> Q: `EAGAIN`은 실패인가요?\n> 핵심: 비동기/논블로킹 흐름에서는 정상적인 흐름 신호다.\n\n## 한 줄 정리\n\nsocket buffer autotuning은 네트워크 속도 차를 완충하지만, 운영에서는 backpressure를 읽고 큐가 과도하게 커지지 않도록 제어하는 것이 더 중요하다.\n",
   "aliases": [
+    "Socket Buffer Autotuning Backpressure 개념",
+    "Socket Buffer Autotuning Backpressure 정리",
+    "Socket Buffer Autotuning Backpressure 실수",
+    "Socket Buffer Autotuning Backpressure 판단 기준",
+    "운영체제 Socket Buffer Autotuning Backpressure",
     "socket buffer autotuning",
     "TCP receive send buffer backpressure",
     "ss -m socket memory",
     "network backpressure",
     "kernel socket buffer",
-    "bufferbloat latency"
+    "bufferbloat latency",
+    "socket buffer autotuning backpressure guide"
   ],
   "expected_queries": [
     "socket buffer는 단순 저장 공간이 아니라 backpressure를 전달하는 장치야?",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/socket-buffer-autotuning-backpressure.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
+      }
+    ]
   }
 }

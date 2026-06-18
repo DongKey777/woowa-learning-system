@@ -6,12 +6,18 @@
   "summary": "이 문서는 slab memory를 process RSS에 잘 안 보이는 kernel object memory로 설명한다.",
   "body_markdown": "# Slab Allocator, Kernel Memory Pressure\n\n> 한 줄 요약: slab 메모리는 프로세스 RSS에 잘 안 보이지만, 커널 객체가 쌓이면 system memory pressure와 OOM의 숨은 원인이 될 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [OOM Killer, cgroup Memory Pressure](./oom-killer-cgroup-memory-pressure.md)\n> - [OOM Killer Scoring, Victim Selection](./oom-killer-scoring-victim-selection.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n> - [Page Table Overhead, Memory Footprint](./page-table-overhead-memory-footprint.md)\n\n> retrieval-anchor-keywords: slab allocator, SLUB, kmalloc, kmem_cache, slabtop, /proc/slabinfo, shrinker, kernel memory pressure, reclaimable slab\n\n## 핵심 개념\n\n슬랩 allocator는 커널이 자주 쓰는 작은 객체를 빠르게 할당하기 위한 메모리 관리 방식이다. 유저 프로세스의 `RSS`만 봐서는 잡히지 않는 커널 메모리 압박이 여기서 생길 수 있다.\n\n- `slab`: 같은 크기의 객체를 묶어 관리하는 캐시 구조다\n- `SLUB`: Linux에서 널리 쓰이는 slab 구현이다\n- `kmalloc`: 커널의 일반 목적 메모리 할당 경로다\n- `shrinker`: 메모리 압박 시 커널 캐시를 회수하려는 메커니즘이다\n\n왜 중요한가:\n\n- 네트워크 연결, inode, dentry, socket buffer 같은 커널 객체가 쌓이면 시스템 메모리를 압박한다\n- 유저 메모리는 멀쩡해 보여도 커널 쪽 캐시가 문제일 수 있다\n- slab pressure는 reclaim과 OOM을 뒤틀어서 장애 원인을 헷갈리게 만든다\n\n이 문서는 [OOM Killer, cgroup Memory Pressure](./oom-killer-cgroup-memory-pressure.md)와 [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)을 커널 메모리 관점으로 연결한다.\n\n## 깊이 들어가기\n\n### 1. slab은 빠르지만 누적되면 무겁다\n\nslab은 객체를 재사용하기 쉬워 성능이 좋다. 하지만 다음 상황에서 메모리가 크게 늘 수 있다.\n\n- 연결 수가 많다\n- inode나 dentry cache가 커진다\n- 커널 네트워크 객체가 쌓인다\n- 특정 타입의 객체가 해제되지 않는다\n\n### 2. reclaim 가능한 slab과 아닌 slab이 있다\n\n커널 캐시가 모두 똑같이 쉽게 회수되는 것은 아니다.\n\n- 일부 cache는 shrinker가 쉽게 줄일 수 있다\n- 일부는 참조가 살아 있어 잘 안 내려간다\n- \"reclaim 가능\"과 \"즉시 회수 가능\"은 다르다\n\n### 3. slab pressure는 유저 RSS보다 늦게 보일 수 있다\n\n유저 공간에서 보이는 메모리와 커널 내부 객체는 다른 축이다.\n\n- 프로세스 RSS는 작아 보이는데 메모리 부족이 온다\n- `free`만 보면 이유가 안 보일 수 있다\n- `/proc/slabinfo`와 `slabtop`이 답을 준다\n\n### 4. 커널 메모리 문제는 특정 워크로드에서 폭발한다\n\n- 많은 파일 열기/닫기\n- 네트워크 connection storm\n- container density가 높은 호스트\n- metadata-heavy filesystem workload\n\n## 실전 시나리오\n\n### 시나리오 1: 프로세스 RSS는 낮은데 노드가 메모리 압박을 받는다\n\n가능한 원인:\n\n- dentry/inode cache가 커졌다\n- socket-related slab이 늘었다\n- 커널 객체가 해제되지 않는다\n\n진단:\n\n```bash\nslabtop\ncat /proc/slabinfo | head\ncat /proc/meminfo | grep -E 'Slab|SReclaimable|SUnreclaim'\n```\n\n### 시나리오 2: connection surge 이후 메모리 사용량이 회복되지 않는다\n\n가능한 원인:\n\n- socket 관련 slab이 남아 있다\n- cache shrink가 느리다\n- reclaim pressure가 뒤늦게 왔다\n\n### 시나리오 3: 파일 시스템 작업 후 메모리 압박이 심해진다\n\n가능한 원인:\n\n- dentry/inode cache 성장\n- metadata churn\n- reclaim 우선순위가 꼬임\n\n이 경우는 [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)와 같이 본다.\n\n## 증상 라우터\n\n### 관찰 증거\n\nslab pressure는 process RSS가 설명하지 못하는 메모리 압박으로 나타난다.\n\n- `MemAvailable`은 줄고 PSI memory pressure나 reclaim latency가 오른다\n- 큰 프로세스 RSS 증가가 없는데 `Slab`, `SReclaimable`, `SUnreclaim`이 커진다\n- `slabtop`에서 dentry, inode, socket, kmalloc 계열 cache가 상위에 보인다\n- connection/file metadata churn 이후 사용량이 바로 내려오지 않는다\n\n### 1차 분기\n\n| 관찰 | 먼저 볼 bucket | 이유 |\n|---|---|---|\n| RSS 큰 프로세스가 명확함 | application heap/RSS | slab보다 user memory가 직접 원인일 수 있다 |\n| `SReclaimable`이 크고 pressure 때 줄어듦 | cache growth | 커널 캐시가 크지만 회수 가능성이 있다 |\n| `SUnreclaim`이 계속 증가 | unreclaimable kernel object | leak 또는 장기 참조를 의심한다 |\n| dentry/inode가 지배적 | filesystem metadata churn | 파일 생성/삭제/scan workload와 연결한다 |\n| socket 관련 slab이 지배적 | connection storm | conntrack/socket buffer/FD 수명과 연결한다 |\n\n### 다음 확인\n\n1. `/proc/meminfo`에서 `Slab`, `SReclaimable`, `SUnreclaim` 추이를 본다.\n2. `slabtop -o`로 어떤 cache가 증가하는지 확인한다.\n3. 증가 시점과 deploy, traffic burst, file scan, connection surge를 맞춘다.\n4. cgroup 환경이면 kernel memory accounting이 memory pressure에 포함되는지 확인한다.\n5. 완화 뒤에는 reclaim latency, PSI, OOM event가 함께 내려갔는지 검증한다.\n\n## 코드로 보기\n\n### slab 상태 확인\n\n```bash\ncat /proc/slabinfo | head -n 20\nslabtop -o\n```\n\n### 메모리 구성 확인\n\n```bash\ncat /proc/meminfo | grep -E 'MemFree|MemAvailable|Slab|SReclaimable|SUnreclaim'\n```\n\n### 단순 모델\n\n```text\nmany kernel objects\n  -> slab grows\n  -> reclaim pressure rises\n  -> if shrinkers cannot catch up, latency and OOM risk rise\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| slab 캐시 유지 | 빠른 재할당 | 메모리 점유 증가 | 일반 커널 경로 |\n| 공격적 shrink | 메모리 회수 | 재할당 비용 증가 | 압박 해소 필요 |\n| workload 제한 | 커널 객체 폭증 완화 | 처리량 감소 | connection/file storm |\n| 노드 여유 확보 | slab 압박 완화 | 자원 효율 저하 | 핵심 인프라 |\n\n## 꼬리질문\n\n> Q: slab 메모리는 왜 안 보이나요?\n> 핵심: 유저 RSS보다 커널 객체와 캐시로 잡히기 때문이다.\n\n> Q: SReclaimable과 SUnreclaim의 차이는?\n> 핵심: 전자는 상대적으로 회수 가능한 캐시, 후자는 더 회수 어려운 커널 메모리다.\n\n> Q: slab pressure가 OOM으로 이어질 수 있나요?\n> 핵심: 그렇다. 커널 메모리 압박이 reclaim을 밀어 OOM을 유발할 수 있다.\n\n## 한 줄 정리\n\nslab allocator는 커널 성능의 핵심이지만, 커널 객체가 누적되면 유저 메모리와 별개로 시스템 메모리 압박과 OOM의 원인이 될 수 있다.\n",
   "aliases": [
+    "Slab Allocator Kernel Memory 개념",
+    "Slab Allocator Kernel Memory 정리",
+    "Slab Allocator Kernel Memory 실수",
+    "Slab Allocator Kernel Memory 판단 기준",
+    "운영체제 Slab Allocator Kernel Memory",
     "slab allocator kernel memory pressure",
     "kernel object memory",
     "dentry inode slab pressure",
     "slab reclaim",
     "hidden kernel memory",
-    "OOM slab growth"
+    "OOM slab growth",
+    "slab allocator kernel memory guide"
   ],
   "expected_queries": [
     "slab memory는 process RSS에 잘 안 보이는데 OOM 원인이 될 수 있어?",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/slab-allocator-kernel-memory-pressure.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "`rm -rf /`가 왜 위험한지, shell glob과 빈 변수 때문에 삭제 범위가 커지는 원리, `realpath`/guard/preview/좁은 target으로 안전하게 파일을 지우는 습관을 다루는 Linux 입문 문서다.",
   "body_markdown": "# Linux 안전 삭제와 rm -rf Primer\n\n> 한 줄 요약: `rm -rf`는 확인 없이 재귀 삭제하는 강한 도구라서, 경로가 비었거나 `/`로 풀리거나 glob이 예상보다 넓게 펼쳐지면 복구하기 어려운 사고가 난다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Linux 서버 첫 디버깅 체크리스트](./linux-server-first-debug-checklist-primer.md)\n- [Linux pipeline access log analysis primer](./linux-pipeline-access-log-analysis-primer.md)\n- [Shell Job-Control Command Bridge](./shell-job-control-command-bridge.md)\n\nretrieval-anchor-keywords: rm -rf slash danger, safe delete Linux, rm preserve-root, empty variable rm rf, shell glob delete accident, realpath guard, dry run before rm, --one-file-system, Linux command safety, rm -rf / 뭐야\n\n## `rm -rf`를 단어로 나누기\n\n`rm -rf path`는 세 의미가 합쳐진 명령이다.\n\n| 부분 | 의미 |\n|---|---|\n| `rm` | 파일이나 디렉터리 entry를 삭제한다 |\n| `-r` | 디렉터리 안으로 재귀적으로 들어간다 |\n| `-f` | 없는 파일이나 확인 prompt를 조용히 무시한다 |\n\n그래서 `rm -rf`는 편하지만, 실수도 조용히 통과한다. `path`가 내가 생각한 디렉터리가 맞는지 확인하지 않으면 삭제 범위가 예상보다 커질 수 있다.\n\n## `rm -rf /`가 왜 위험한가\n\n`/`는 Linux 파일시스템의 root directory다. 여기 아래에 `/home`, `/etc`, `/usr`, `/var` 같은 시스템 전체가 달려 있다. 따라서 root directory를 재귀 삭제하려는 명령은 시스템 전체 삭제 의도와 같다.\n\n현대 GNU `rm`은 기본적으로 root directory 자체 삭제를 막는 보호 장치(`--preserve-root`)를 둔다. 하지만 이것을 믿고 위험한 명령을 실험하면 안 된다. `--no-preserve-root` 같은 옵션을 붙이거나, container/chroot/다른 mount 상황에서 예상과 다르게 큰 피해가 날 수 있다. 더 현실적인 사고는 직접 `/`를 쓰는 것보다 변수가 비거나 glob이 넓게 펼쳐지는 경우다.\n\n```bash\nTARGET=\"\"\nrm -rf \"$TARGET\"/*\n```\n\n위 예시는 `\"$TARGET\"/*`가 사실상 `/*`처럼 해석될 수 있다. 따옴표를 썼더라도 뒤의 `/*`는 별도 glob이므로 변수 값이 비면 root 아래 모든 entry를 대상으로 할 위험이 있다.\n\n## 삭제 전 preview 습관\n\n안전한 삭제는 먼저 대상이 무엇인지 출력하는 것에서 시작한다.\n\n```bash\nTARGET=\"$HOME/app/build\"\nprintf 'target=%q\\n' \"$TARGET\"\nrealpath \"$TARGET\"\nls -la \"$TARGET\"\n```\n\n그리고 실제 삭제 전에 `find`로 preview한다.\n\n```bash\nfind \"$TARGET\" -maxdepth 1 -mindepth 1 -print\n```\n\n눈으로 확인한 뒤에만 삭제한다.\n\n```bash\nfind \"$TARGET\" -maxdepth 1 -mindepth 1 -exec rm -rf -- {} +\n```\n\n꼭 `find`를 써야만 안전하다는 뜻은 아니다. 핵심은 delete command를 실행하기 전에 shell이 실제로 어떤 경로를 대상으로 보는지 확인하는 습관이다.\n\n## guard를 넣는 방법\n\n스크립트에서는 빈 변수와 root 경로를 막아야 한다.\n\n```bash\ndelete_dir_contents() {\n  local target=\"$1\"\n\n  if [ -z \"$target\" ]; then\n    echo \"target is empty\" >&2\n    return 1\n  fi\n\n  local resolved\n  resolved=\"$(realpath -m \"$target\")\"\n\n  case \"$resolved\" in\n    /|/home|/etc|/usr|/var)\n      echo \"refuse to delete dangerous target: $resolved\" >&2\n      return 1\n      ;;\n  esac\n\n  echo \"delete contents under: $resolved\"\n  find \"$resolved\" -maxdepth 1 -mindepth 1 -print\n  find \"$resolved\" -maxdepth 1 -mindepth 1 -exec rm -rf -- {} +\n}\n```\n\n`realpath`는 `..`, symlink, 상대 경로가 섞인 target을 절대 경로로 정리해 판단하기 쉽게 만든다. `--`는 뒤의 값이 `-rf`처럼 dash로 시작하더라도 option이 아니라 operand로 보게 하는 관례다.\n\n## glob 사고를 줄이는 기준\n\n| 패턴 | 위험 | 더 나은 습관 |\n|---|---|---|\n| `rm -rf $DIR/*` | 공백, 빈 변수, glob 확장 문제 | `\"$DIR\"` 확인 후 `find` 사용 |\n| `rm -rf ./build *` | 현재 위치 착각 시 넓게 삭제 | `pwd`, `realpath` 출력 |\n| `sudo rm -rf ...` | 권한 보호까지 우회 | sudo 필요성을 먼저 줄임 |\n| `rm -rf /tmp/app-*` | 다른 앱 파일까지 매칭 | prefix와 owner, mtime 확인 |\n| `rm -rf $(some command)` | command substitution 결과 예측 어려움 | 결과를 변수에 담아 preview |\n\nshell은 명령을 실행하기 전에 glob을 펼친다. `*.log`가 실제 어떤 파일 목록으로 바뀌는지는 shell이 결정한다. 그래서 삭제 전에는 같은 패턴으로 `printf '%s\\n' *.log`나 `find` preview를 해보는 것이 좋다.\n\n## 서버에서 특히 조심할 것\n\n배포 서버에서는 build artifact나 log만 지우려다 설정 파일, DB 파일, upload 파일을 같이 지울 수 있다. 아래는 target을 좁히는 기준이다.\n\n- build 산출물: project의 `build/` 디렉터리로 제한한다.\n- Gradle cache: `~/.gradle/caches/...`처럼 하위 경로를 명시한다.\n- log: logrotate나 journal 정책을 먼저 보고, 실행 중 프로세스가 잡고 있는 deleted file도 확인한다.\n- upload/static file: application data와 deploy artifact를 같은 디렉터리에 섞지 않는다.\n- root 권한: `sudo` 없이 지울 수 있게 소유자와 디렉터리 구조를 설계한다.\n\n## 꼬리질문\n\n> Q: `rm -rf /`는 실제로 항상 실행되나요?\n> 의도: 보호 장치가 있어도 위험한 의도를 이해하는지 확인한다.\n> 핵심: 현대 GNU rm은 root 보호가 있지만, 옵션/환경에 따라 우회될 수 있고 더 흔한 사고는 빈 변수나 glob으로 삭제 범위가 넓어지는 것이다.\n\n> Q: 따옴표를 쓰면 `rm -rf \"$DIR\"/*`는 항상 안전한가요?\n> 의도: 변수 quote와 glob 확장의 경계를 확인한다.\n> 핵심: 변수 부분은 보호되지만 `/*` glob은 남아 있다. `DIR`이 비면 위험한 경로가 될 수 있으므로 빈 값 guard와 preview가 필요하다.\n\n> Q: 삭제 명령을 스크립트에 넣을 때 최소 guard는 무엇인가요?\n> 의도: 자동화에서 파괴적 명령을 다루는 기본 습관을 확인한다.\n> 핵심: target empty check, `realpath` 확인, 위험 경로 거부, preview 출력, 좁은 경로 지정이 기본이다.\n\n## 한 줄 정리\n\n`rm -rf`는 외울 명령이 아니라 삭제 범위를 검증해야 하는 파괴적 도구이며, 안전한 습관은 `target 출력 -> realpath 확인 -> preview -> 좁은 삭제` 순서다.\n\n## `rm` 대신 선택할 수 있는 방식\n\n항상 `rm -rf`만 답은 아니다. 삭제 목적에 따라 더 좁은 도구를 고를 수 있다.\n\n| 목적 | 더 좁은 선택 | 이유 |\n|---|---|---|\n| 오래된 로그 일부 정리 | `find logs -name '*.log' -mtime +7 -print` 후 삭제 | 날짜와 확장자를 조건으로 제한한다 |\n| 빈 디렉터리만 제거 | `rmdir` | 내용이 있으면 실패하므로 실수 범위가 작다 |\n| build 산출물 제거 | build tool의 `clean` task | tool이 아는 산출물 범위만 지운다 |\n| 큰 파일 찾기 | `du -sh * | sort -h` | 삭제 전에 무엇이 큰지 먼저 본다 |\n| 휴지통처럼 복구 여지 남기기 | 별도 archive 디렉터리로 `mv` | 즉시 삭제보다 되돌리기 쉽다 |\n\n서버에서 disk가 찼을 때도 먼저 큰 파일을 찾아야 한다.\n\n```bash\ndf -h\ndu -xh --max-depth=1 /home/ubuntu | sort -h\n```\n\n`du`로 큰 디렉터리를 확인한 뒤, build artifact인지 application data인지 구분한다. upload 파일, DB 파일, 설정 파일은 크다고 바로 지우면 안 된다. 반대로 `build/`, 임시 압축 파일, 오래된 배포 artifact처럼 다시 만들 수 있는 대상은 삭제 후보가 될 수 있다.\n\n## 삭제 후 확인\n\n삭제가 끝난 뒤에는 의도한 공간이 줄었는지 확인한다.\n\n```bash\ndf -h\nls -la \"$TARGET\"\n```\n\n로그 파일을 지웠는데 `df`가 줄지 않으면 실행 중인 프로세스가 deleted file을 계속 잡고 있을 수 있다. 이 경우는 `rm` 문제가 아니라 open file descriptor와 log rotation 문제로 넘어간다.\n\n",
   "aliases": [
+    "삭제 명령 안전",
+    "Linux rm 위험",
+    "Linux 안전 삭제와 rm 개념",
+    "Linux 안전 삭제와 rm 정리",
+    "Linux 안전 삭제와 rm 실수",
     "rm -rf /",
     "safe delete Linux",
     "rm preserve root",
     "empty variable rm rf",
     "shell glob delete accident",
     "realpath guard",
-    "find preview delete",
-    "삭제 명령 안전",
-    "Linux rm 위험",
-    "rm -- one filesystem"
+    "find preview delete"
   ],
   "expected_queries": [
     "rm -rf /가 뭐길래 위험하다고 하는 거야?",
@@ -51,11 +53,15 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-06-17",
         "note": "batch13 deployment-ops gap fill"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
       }
     ]
   }

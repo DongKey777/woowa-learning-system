@@ -6,16 +6,18 @@
   "summary": "t4g.micro 같은 작은 EC2에서 `./gradlew bootJar`가 느리거나 `Killed`, disk full, daemon 메모리 문제로 실패할 때 memory, swap, disk, Gradle daemon, test/build 범위를 분리해 진단하는 입문 문서다.",
   "body_markdown": "# 작은 EC2에서 Gradle build 자원 문제 해결 Primer\n\n> 한 줄 요약: 작은 EC2에서 Gradle build가 실패하면 코드 오류만 보지 말고 memory, disk, CPU credit, Gradle daemon, test 실행 범위를 먼저 나눠야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Gradle Wrapper와 Java/Spring 빌드 생명주기 입문](../software-engineering/gradle-wrapper-java-build-lifecycle-primer.md)\n- [Linux 서버 첫 디버깅 체크리스트](./linux-server-first-debug-checklist-primer.md)\n- [Backend Runtime Resource Symptom Mission Bridge](./backend-runtime-resource-symptom-mission-bridge.md)\n\nretrieval-anchor-keywords: EC2 t4g.micro Gradle build killed, ./gradlew bootJar memory disk troubleshooting, Gradle daemon no-daemon small server, Java build OOMKilled, No space left on device Gradle, swap temporary build server, CPU credit small EC2, Spring Boot build resource\n\n## 먼저 나누는 질문\n\n`./gradlew bootJar`가 실패하면 초보자는 바로 Gradle이나 Spring 설정을 의심한다. 하지만 작은 EC2에서는 서버 자원 자체가 부족해서 build가 죽는 경우도 많다. 먼저 실패 문장을 bucket으로 나눈다.\n\n| 증상 | 가까운 bucket | 먼저 볼 명령 |\n|---|---|---|\n| `Killed`만 찍히고 종료 | 메모리 부족/OOM killer | `free -h`, `dmesg -T | grep -i killed` |\n| `Java heap space` | Gradle/JVM heap | `./gradlew --no-daemon`, JVM args 확인 |\n| `No space left on device` | 디스크 부족 | `df -h`, `du -sh ~/.gradle build` |\n| 매우 느리지만 죽진 않음 | CPU/IO/네트워크 | `top`, `vmstat 1`, dependency download 여부 |\n| local은 되는데 EC2만 실패 | 서버 Java/version/resource 차이 | `java -version`, `uname -m`, `free -h` |\n\n코드를 고치기 전에 서버가 build를 감당할 수 있는지부터 보는 것이다. 특히 작은 인스턴스는 메모리와 디스크 여유가 넉넉하지 않다. Gradle daemon, compiler, test JVM, dependency cache가 동시에 메모리를 쓴다.\n\n## 1단계: memory와 OOM 여부\n\n먼저 현재 메모리와 swap을 본다.\n\n```bash\nfree -h\nps -eo pid,comm,rss,%mem --sort=-rss | head\ndmesg -T | grep -Ei 'killed process|out of memory|oom' | tail -20\n```\n\n`Killed`만 찍히고 Gradle stack trace가 없으면 Linux OOM killer가 프로세스를 죽였을 가능성이 있다. 이 경우 Gradle 설정 파일보다 kernel log가 더 직접적인 증거다. 반대로 Gradle 로그 안에 `java.lang.OutOfMemoryError: Java heap space`가 있으면 JVM 내부 heap 한도 쪽을 먼저 본다.\n\n학습용 서버에서 임시로 build만 통과시키려면 `--no-daemon`을 붙여 daemon 상주 메모리를 줄이는 방법이 있다.\n\n```bash\n./gradlew clean bootJar --no-daemon\n```\n\n그래도 부족하면 Gradle JVM heap을 낮추거나 test 동시성을 줄일 수 있다. 단, 무작정 낮추면 compile 자체가 느려지거나 실패할 수 있으므로 로그를 보며 조정한다.\n\n```properties\n# gradle.properties 예시\norg.gradle.jvmargs=-Xmx512m -Dfile.encoding=UTF-8\norg.gradle.workers.max=1\n```\n\n아주 작은 서버에서 swap을 추가하는 방법도 있지만, 이는 학습용 임시 완충 장치에 가깝다. swap은 메모리 부족을 느리게 버티게 할 뿐, 충분한 빌드 자원이나 CI runner를 대체하지 않는다.\n\n## 2단계: disk와 Gradle cache\n\nbuild 실패가 disk 문제라면 메시지가 비교적 직접적이다.\n\n```bash\ndf -h\ndu -sh ~/.gradle 2>/dev/null || true\ndu -sh build 2>/dev/null || true\ndu -sh /tmp 2>/dev/null || true\n```\n\nGradle은 dependency cache를 `~/.gradle`에 저장하고, 프로젝트 build 산출물을 `build/` 아래에 만든다. EC2 root volume이 작으면 cache와 log가 쌓여 금방 찰 수 있다.\n\n안전한 정리는 범위를 좁혀 한다.\n\n```bash\n./gradlew clean\nrm -rf build\nrm -rf ~/.gradle/caches/modules-2/files-2.1\n```\n\n다만 `~/.gradle` 전체를 지우면 다음 build가 dependency를 다시 받아 느려진다. disk가 급한지, network 재다운로드 비용을 감수할지 판단한다. `/`나 `/home` 전체를 지우는 명령은 절대 쓰지 않는다.\n\n## 3단계: test 실패와 resource 실패를 구분한다\n\n`bootJar`와 `build`는 다르다. `build`는 보통 test까지 실행하고, `bootJar`는 실행형 jar 생성에 초점을 둔다. 미션에서는 test 실패를 숨기면 안 되지만, 서버 자원 문제를 분리하기 위해 일시적으로 범위를 나눠 볼 수 있다.\n\n```bash\n./gradlew test --no-daemon\n./gradlew bootJar --no-daemon\n```\n\n`test`만 실패하면 애플리케이션 코드나 test 환경 문제일 가능성이 크다. `bootJar`도 resource 때문에 죽으면 서버 자원 bucket을 계속 본다. `-x test`는 원인 분리를 위한 임시 진단에는 쓸 수 있지만, 최종 배포 품질 기준으로 test 실패를 무시하는 습관은 위험하다.\n\n## 4단계: 빌드 위치를 바꿀지 결정\n\n작은 EC2에서 매번 build하는 것은 학습에는 좋지만, 운영 구조로는 비효율적일 수 있다. 선택지는 세 가지다.\n\n| 방식 | 장점 | 단점 |\n|---|---|---|\n| EC2에서 직접 build | 단순하고 눈에 보임 | 작은 서버 자원에 취약, 느림 |\n| 로컬/CI에서 jar build 후 전송 | 서버 자원 부담 작음 | artifact 전달 절차 필요 |\n| Docker image/CI pipeline | 재현성과 자동화 좋음 | 초기 학습 부담 증가 |\n\n처음 실습에서는 EC2에서 직접 build해도 된다. 다만 OOM이나 disk full이 반복되면 \"내 코드가 틀렸다\"보다 \"build를 어디에서 수행할지\"의 문제로 올려 보는 것이 맞다.\n\n## 꼬리질문\n\n> Q: Gradle 로그 없이 `Killed`만 나오면 어디부터 보나요?\n> 의도: Linux OOM killer와 Gradle 예외를 구분하는지 확인한다.\n> 핵심: `dmesg`에서 killed process/OOM 기록을 보고, `free -h`로 memory/swap 여유를 확인한다.\n\n> Q: `--no-daemon`은 왜 작은 서버에서 도움이 될 수 있나요?\n> 의도: Gradle daemon의 상주 프로세스와 build JVM을 구분하는지 확인한다.\n> 핵심: daemon을 남기지 않아 반복 build 속도 이점은 줄지만, 작은 서버에서 남는 메모리 압박을 줄일 수 있다.\n\n> Q: 서버에서 `-x test`로 build하면 괜찮나요?\n> 의도: 진단용 범위 축소와 품질 기준을 분리하는지 확인한다.\n> 핵심: 원인 분리에는 잠깐 쓸 수 있지만, test 실패를 숨긴 상태로 정상 배포라고 보면 안 된다.\n\n## 한 줄 정리\n\n작은 EC2의 Gradle build 실패는 `code/test failure`, `JVM heap`, `Linux OOM`, `disk full`, `daemon/cache`, `build 위치 선택`을 분리해서 봐야 한다.\n\n## 바로 완화할 때의 순서\n\n작은 서버에서 build를 통과시키기 위한 완화는 원인을 지우지 않는 순서로 한다.\n\n1. `./gradlew clean bootJar --no-daemon`으로 daemon 상주 비용을 줄인다.\n2. `free -h`, `df -h`, `dmesg` 결과를 로그에 남긴다.\n3. disk가 부족하면 project `build/`와 오래된 cache만 좁게 정리한다.\n4. memory가 부족하면 worker 수와 JVM heap을 낮춰 한 번에 쓰는 자원을 줄인다.\n5. 그래도 반복되면 서버에서 build하지 않는 구조로 넘긴다.\n\n중요한 것은 \"어떻게든 한 번 성공\"과 \"계속 배포 가능한 구조\"를 구분하는 것이다. swap을 붙이거나 test를 잠깐 제외해서 원인을 좁힐 수는 있지만, 그 상태를 정상 운영 기준으로 삼으면 다음 배포에서 같은 문제가 반복된다. 학습 기록에는 어떤 완화가 임시였는지 남기는 편이 좋다.\n\n## 로그로 남기면 좋은 값\n\n배포 스크립트에는 build 전후로 아래 값을 남겨 두면 나중에 원인 추적이 쉽다.\n\n```bash\necho \"java=$(java -version 2>&1 | head -1)\"\necho \"branch=$(git branch --show-current) commit=$(git rev-parse --short HEAD)\"\nfree -h\ndf -h .\n./gradlew clean bootJar --no-daemon\n```\n\n이 로그가 있으면 \"이번 build가 느렸던 이유\"를 기억에 의존하지 않아도 된다. dependency를 처음 내려받은 build인지, disk가 95%였는지, Java version이 바뀌었는지 같은 단서가 남는다.\n\n",
   "aliases": [
+    "작은 EC2 빌드 실패",
+    "Gradle swap 임시 해결",
+    "작은 EC2에서 Gradle build 개념",
+    "작은 EC2에서 Gradle build 정리",
+    "작은 EC2에서 Gradle build 실수",
     "EC2 Gradle build killed",
     "t4g micro bootJar memory",
     "Gradle no-daemon small server",
     "Java build OOMKilled",
     "No space left on device Gradle",
     "Gradle daemon memory",
-    "EC2 build resource troubleshooting",
-    "작은 EC2 빌드 실패",
-    "bootJar Killed",
-    "Gradle swap 임시 해결"
+    "EC2 build resource troubleshooting"
   ],
   "expected_queries": [
     "t4g.micro에서 ./gradlew bootJar 하다가 Killed만 나오면 코드 문제야 메모리 문제야?",
@@ -53,11 +55,15 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-06-17",
         "note": "batch13 deployment-ops gap fill"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
       }
     ]
   }

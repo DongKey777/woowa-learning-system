@@ -6,12 +6,18 @@
   "summary": "dirty page 비율과 writeback 튜닝은 쓰기 폭주를 완충하는 장치지만, 잘못 잡으면 flush가 몰려 latency spike를 만든다.",
   "body_markdown": "# Dirty Page Ratios, Writeback Tuning\n\n> 한 줄 요약: dirty page 비율과 writeback 튜닝은 쓰기 폭주를 완충하는 장치지만, 잘못 잡으면 flush가 몰려 latency spike를 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n> - [Fsync Tail Latency, Dirty Writeback, Backend Debugging](./fsync-tail-latency-dirty-writeback-debugging.md)\n> - [Dirty Throttling, balance_dirty_pages, Writeback Stalls](./dirty-throttling-balance-dirty-pages-writeback-stalls.md)\n> - [Page Cache Thrash vs Direct I/O](./page-cache-thrash-vs-direct-io.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n> - [vm.swappiness, Reclaim Behavior](./vm-swappiness-reclaim-behavior.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n\n> retrieval-anchor-keywords: dirty_ratio, dirty_background_ratio, dirty_bytes, dirty_background_bytes, writeback, balance_dirty_pages, flush burst, dirty page pressure, writer throttling, dirty throttling, page cache debt\n\n## 핵심 개념\n\n파일 쓰기는 바로 디스크로 가지 않고 page cache에 dirty page로 쌓인 뒤 writeback으로 내려간다. dirty page 비율은 이 누적을 얼마나 허용할지 정한다.\n\n- `dirty_ratio`: 전체 메모리에서 dirty page가 차지할 수 있는 비율\n- `dirty_background_ratio`: background writeback이 시작되는 기준이다\n- `dirty_bytes`: 절대 바이트 기준 설정이다\n- `balance_dirty_pages`: 쓰기 속도를 조절하는 메커니즘이다\n\n왜 중요한가:\n\n- dirty page를 너무 많이 허용하면 flush burst가 생긴다\n- 너무 빡빡하면 write path가 자주 막힌다\n- writeback은 디스크 문제 같지만 사실 메모리 정책과도 연결된다\n\n이 문서는 [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)와 [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)를 writeback 관점에서 잇는다.\n\n## 깊이 들어가기\n\n### 1. dirty page는 버퍼이자 위험 신호다\n\ndirty page는 성능을 위해 쌓인다.\n\n- 잠깐의 burst를 흡수한다\n- 디스크를 배치로 쓰게 한다\n- 하지만 너무 쌓이면 한 번에 몰아서 쓰게 된다\n\n### 2. background ratio와 ratio는 역할이 다르다\n\n- background 기준은 \"이제 천천히 치우자\"는 신호다\n- ratio 기준은 \"이제 더는 안 된다\"는 신호다\n\n이 둘이 너무 멀거나 가까우면 둘 다 문제가 된다.\n\n### 3. writeback burst는 latency spike를 만든다\n\n쓰기 큐가 한 번에 밀리면 다음이 생긴다.\n\n- flush thread가 바빠진다\n- storage queue가 밀린다\n- direct reclaim과 겹치면 더 느려진다\n\n### 4. dirty tuning은 workload별로 달라야 한다\n\n- 로그/append workload\n- DB/WAL\n- mixed API with temp files\n- batch ETL\n\n각각 허용 가능한 dirty buffering이 다르다.\n\n## Playbook 역할\n\n### 재현 조건\n\n- write burst 이후 `Dirty`나 `Writeback`이 누적되고, 잠시 뒤 application write latency가 같이 오른다\n- `fsync`, log append, temp-file write가 특정 시간대에만 느려진다\n- memory pressure와 I/O pressure가 같은 구간에 겹친다\n\n### 확인 순서\n\n1. `Dirty`, `Writeback`, `WritebackTmp`를 시간축으로 본다.\n2. `dirty_background_*`와 `dirty_*` 중 ratio 기준인지 bytes 기준인지 확인한다.\n3. `iostat`, PSI, `pgscan`/`pgsteal`을 같이 보며 writeback과 reclaim이 겹치는지 확인한다.\n4. workload가 append log, DB WAL, batch write, temp-file churn 중 어디에 가까운지 분리한다.\n\n### Failure Matrix\n\n| 관찰 | 더 가까운 원인 | 다음 확인 |\n|------|----------------|-----------|\n| `Dirty`가 높게 쌓인 뒤 `Writeback`이 몰림 | background writeback 시작이 늦거나 storage가 못 따라감 | dirty threshold, storage queue |\n| writer가 간헐적으로 멈춤 | dirty throttling | `balance_dirty_pages` 관련 지표, write latency |\n| `Dirty`는 낮은데 `fsync`만 느림 | writeback보다 durability flush 병목 | fsync tail, device cache, WAL 경로 |\n| reclaim과 writeback이 함께 증가 | memory pressure가 dirty page 회수와 충돌 | PSI, `pgscan`, cgroup memory pressure |\n\n### 검증\n\n튜닝 후에는 dirty page 최대치 하나만 보지 말고, burst 직후 flush 지속 시간과 writer p99가 줄었는지 확인한다. bytes 기준으로 바꿨다면 메모리 증설 후에도 같은 운영 의도가 유지되는지 다시 본다.\n\n## 실전 시나리오\n\n### 시나리오 1: 주기적으로 디스크가 버벅인다\n\n가능한 원인:\n\n- dirty page가 많이 쌓였다가 한 번에 flush된다\n- background writeback이 너무 늦게 시작된다\n- flush와 reclaim이 겹친다\n\n진단:\n\n```bash\ncat /proc/meminfo | grep -E 'Dirty|Writeback'\nsysctl vm.dirty_ratio\nsysctl vm.dirty_background_ratio\niostat -x 1\n```\n\n### 시나리오 2: log writer가 갑자기 느려진다\n\n가능한 원인:\n\n- balance_dirty_pages가 강하게 작동한다\n- dirty page 허용치가 너무 낮다\n- fsync와 writeback이 겹친다\n\n### 시나리오 3: 배치 후 전체 노드 latency가 오른다\n\n가능한 원인:\n\n- 대량 writeback burst\n- page cache pressure\n- io pressure와 memory pressure 동시 상승\n\n이 경우는 [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)와 같이 본다.\n\n## 코드로 보기\n\n### dirty 설정 확인\n\n```bash\nsysctl vm.dirty_ratio\nsysctl vm.dirty_background_ratio\nsysctl vm.dirty_bytes\nsysctl vm.dirty_background_bytes\n```\n\n### dirty 상태 확인\n\n```bash\ncat /proc/meminfo | grep -E 'Dirty|Writeback'\n```\n\n### 단순 모델\n\n```text\nwrite -> dirty page accumulates\n  -> background writeback starts\n  -> dirty limit reached\n  -> writer throttled or flush burst occurs\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 높은 dirty ratio | write burst를 흡수 | flush가 몰릴 수 있다 | throughput 우선 |\n| 낮은 dirty ratio | burst를 줄인다 | writer가 자주 막힌다 | latency 우선 |\n| byte-based tuning | 예측성이 높다 | 운영 설계가 필요하다 | 대형 메모리 서버 |\n| 기본값 유지 | 단순하다 | workload와 안 맞을 수 있다 | 일반 환경 |\n\n## 꼬리질문\n\n> Q: dirty page는 왜 쌓이나요?\n> 핵심: 디스크 쓰기를 배치하고 write throughput을 높이기 위해서다.\n\n> Q: dirty_ratio를 높이면 무조건 좋은가요?\n> 핵심: 아니다. flush burst와 latency spike가 커질 수 있다.\n\n> Q: background ratio와 ratio의 차이는?\n> 핵심: 하나는 미리 치우는 기준이고, 다른 하나는 더 못 쌓게 하는 기준이다.\n\n## 한 줄 정리\n\ndirty page ratios와 writeback tuning은 write burst를 흡수하지만, 너무 느슨하거나 너무 빡빡하면 둘 다 latency 문제를 만든다.\n",
   "aliases": [
+    "Dirty Page Ratios Writeback 개념",
+    "Dirty Page Ratios Writeback 정리",
+    "Dirty Page Ratios Writeback 실수",
+    "Dirty Page Ratios Writeback 판단 기준",
+    "운영체제 Dirty Page Ratios Writeback",
     "dirty page ratios",
     "writeback tuning",
     "dirty_background_ratio dirty_ratio",
     "dirty_bytes dirty_background_bytes",
     "flush latency spike",
-    "page cache dirty tuning"
+    "page cache dirty tuning",
+    "dirty page ratios writeback guide"
   ],
   "expected_queries": [
     "dirty page ratio와 writeback tuning은 latency spike와 어떻게 연결돼?",
@@ -39,8 +45,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/dirty-page-ratios-writeback-tuning.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
+      }
+    ]
   }
 }

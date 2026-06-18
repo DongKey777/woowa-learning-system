@@ -6,12 +6,18 @@
   "summary": "outbound 연결이 많으면 ephemeral port와 TIME_WAIT가 병목이 될 수 있고, port reuse는 편하지만 잘못 다루면 충돌과 유실 위험이 생긴다.",
   "body_markdown": "# Ephemeral Ports, TIME_WAIT, Reuse Recovery\n\n> 한 줄 요약: outbound 연결이 많으면 ephemeral port와 TIME_WAIT가 병목이 될 수 있고, port reuse는 편하지만 잘못 다루면 충돌과 유실 위험이 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [TCP Backlog, somaxconn, Listen Queue](./tcp-backlog-somaxconn-listen-queue.md)\n> - [Thundering Herd, Accept, Wakeup](./thundering-herd-accept-wakeup.md)\n> - [Socket Buffer Autotuning, Backpressure](./socket-buffer-autotuning-backpressure.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n\n> retrieval-anchor-keywords: ephemeral ports, TIME_WAIT, port exhaustion, ip_local_port_range, tcp_tw_reuse, SO_REUSEADDR, outbound connections, 4-tuple, reuse recovery\n\n## 핵심 개념\n\n클라이언트 역할이 많은 서버는 outbound connection을 많이 열 수 있다. 이때 각 연결은 4-tuple로 구분되며, 로컬 ephemeral port가 고갈되면 새 연결이 안 열린다.\n\n- `ephemeral port`: 임시로 할당되는 로컬 포트다\n- `TIME_WAIT`: 연결 종료 후 한동안 상태를 유지하는 구간이다\n- `port exhaustion`: 사용 가능한 로컬 포트가 부족해지는 상태다\n- `SO_REUSEADDR`: 동일 주소 재사용을 돕는 옵션이다\n\n왜 중요한가:\n\n- connection burst가 많으면 새 outbound 연결이 실패할 수 있다\n- TIME_WAIT가 많으면 transient하게 포트 풀이 줄어든다\n- 잘못된 reuse는 충돌과 잘못된 연결 재사용을 유발할 수 있다\n\n이 문서는 [TCP Backlog, somaxconn, Listen Queue](./tcp-backlog-somaxconn-listen-queue.md)와 [Socket Buffer Autotuning, Backpressure](./socket-buffer-autotuning-backpressure.md)를 연결해, 연결 수명주기 전체를 본다.\n\n## 깊이 들어가기\n\n### 1. ephemeral port는 무한하지 않다\n\n클라이언트는 outbound 연결마다 로컬 포트를 소비한다.\n\n- 동시에 많은 연결을 열면 포트 풀이 줄어든다\n- 연결 종료 후 TIME_WAIT 동안 바로 재사용되지 않을 수 있다\n- 짧은 connection churn이 심하면 고갈이 빨라진다\n\n### 2. TIME_WAIT는 버그가 아니라 안전장치다\n\nTIME_WAIT는 늦게 도착하는 세그먼트가 새 연결을 망치지 않게 하려는 장치다.\n\n- 종료 직후 바로 같은 4-tuple을 쓰지 않게 한다\n- 포트 재사용을 신중하게 한다\n- 안정성을 위해 일정 시간 기다린다\n\n### 3. reuse는 편하지만 함부로 쓰면 안 된다\n\n`SO_REUSEADDR`나 관련 옵션은 유용하지만, 단순히 \"포트가 안 열릴 때 켜는 버튼\"은 아니다.\n\n- 서버 바인딩 안정성에 도움\n- 운영환경에 따라 안전한 의미가 다르다\n- 잘못 쓰면 의도치 않은 재사용 문제가 생긴다\n\n### 4. ephemeral port 문제는 outbound가 많은 서버에서 잘 드러난다\n\n- 프록시\n- API gateway\n- fan-out이 큰 백엔드\n- health check나 metric exporter가 많은 서버\n\n이런 경우는 CPU보다 연결 수명주기 자체가 병목일 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 외부 API 호출이 갑자기 실패한다\n\n가능한 원인:\n\n- ephemeral port가 부족하다\n- TIME_WAIT가 많다\n- NAT나 방화벽 상태와 충돌한다\n\n진단:\n\n```bash\ncat /proc/sys/net/ipv4/ip_local_port_range\nss -ant state time-wait | wc -l\nss -ant | head\n```\n\n### 시나리오 2: 연결은 열리는데 간헐적으로 실패한다\n\n가능한 원인:\n\n- 포트 풀이 좁다\n- connection churn이 높다\n- 재시도 폭주가 겹친다\n\n### 시나리오 3: 서버를 재시작했는데 이전 연결 흔적이 걸린다\n\n가능한 원인:\n\n- TIME_WAIT가 아직 남아 있다\n- reuse 정책이 환경과 맞지 않는다\n- 포트 재사용 시점이 너무 빠르다\n\n## 운영 플레이북\n\n### 재현 조건\n\nephemeral port 문제는 inbound listen queue보다 **짧은 outbound connection churn**에서 잘 드러난다.\n\n- 같은 source host에서 같은 destination으로 짧은 TCP 연결을 대량 생성한다\n- connection pooling on/off, keep-alive on/off를 비교한다\n- retry storm이나 fan-out batch가 겹치는 시간대를 따로 본다\n- NAT gateway가 있으면 host port range뿐 아니라 NAT state/port pressure도 함께 본다\n\n커널 파라미터의 의미와 안전성은 OS/커널 버전에 따라 달라질 수 있으므로, reuse knob을 보편적 처방처럼 쓰지 않는다.\n\n### 확인 순서\n\n1. `ip_local_port_range`와 destination별 동시 outbound 연결 수를 비교한다.\n2. `TIME_WAIT`, `SYN-SENT`, `ESTABLISHED` 비율을 본다.\n3. 실패 에러가 `EADDRNOTAVAIL`, connect timeout, NAT failure 중 어디에 가까운지 나눈다.\n4. connection pooling, max lifetime, retry/backoff가 port churn을 줄이는지 본다.\n5. reuse 관련 변경은 stale packet/4-tuple collision 위험과 rollback 경로를 먼저 확인한다.\n\n### failure matrix\n\n| 관찰 | 가능성 | 다음 확인 |\n|---|---|---|\n| `EADDRNOTAVAIL` 또는 local bind 실패 | local ephemeral port exhaustion | port range, destination별 4-tuple 사용량 |\n| TIME_WAIT가 급증 | short connection churn | pooling, keep-alive, retry burst |\n| NAT 뒤에서만 실패 | NAT state/port pressure | NAT gateway metric, conntrack count |\n| connect timeout이 많음 | remote backlog/network 문제도 가능 | SYN-SENT, retransmission, upstream accept |\n| reuse 후 이상한 간헐 오류 | stale segment/4-tuple reuse risk | same tuple 재사용 간격, packet capture |\n\n### 검증\n\n복구책은 포트 수만 늘리는 것으로 끝나지 않는다.\n\n- 새 연결 실패율과 connection churn이 같이 줄었는지 본다\n- TIME_WAIT 수가 줄어도 retry amplification이 늘지 않았는지 확인한다\n- pooling 도입 후 stale idle connection 문제가 생기지 않았는지 본다\n- port range/reuse 변경은 canary host에서 오류율과 packet anomaly를 먼저 본다\n\n## 코드로 보기\n\n### ephemeral port 범위 확인\n\n```bash\ncat /proc/sys/net/ipv4/ip_local_port_range\n```\n\n### TIME_WAIT 관찰\n\n```bash\nss -ant state time-wait | head\n```\n\n### 재사용 힌트 예시\n\n```c\nint on = 1;\nsetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));\n```\n\n### 단순 모델\n\n```text\nmany outbound connections\n  -> local ports consumed\n  -> TIME_WAIT holds ports\n  -> new connects fail or stall\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 연결 재사용 | port pressure를 줄인다 | keep-alive 관리가 필요하다 | HTTP client, proxy |\n| port range 확장 | 더 많은 포트를 수용한다 | 근본 churn 문제는 남는다 | fan-out 서버 |\n| TIME_WAIT 관리 조정 | 포트 회복을 돕는다 | 안전성/호환성 이슈 | 특수 운영환경 |\n| connection cap | 폭주를 막는다 | 유연성이 줄어든다 | 대형 outbound 서비스 |\n\n## 꼬리질문\n\n> Q: ephemeral port는 왜 고갈되나요?\n> 핵심: outbound connection이 너무 많고 TIME_WAIT가 포트를 묶기 때문이다.\n\n> Q: TIME_WAIT는 제거해도 되나요?\n> 핵심: 아니다. 안전성을 위한 상태다.\n\n> Q: 재사용 옵션은 항상 좋은가요?\n> 핵심: 아니다. 환경과 트래픽 패턴을 같이 봐야 한다.\n\n## 한 줄 정리\n\nephemeral port와 TIME_WAIT는 outbound 연결이 많은 서버의 숨은 병목이며, 연결 재사용과 포트 범위 조정은 안전장치와 함께 다뤄야 한다.\n",
   "aliases": [
+    "Ephemeral Ports TIME_WAIT Reuse 개념",
+    "Ephemeral Ports TIME_WAIT Reuse 정리",
+    "Ephemeral Ports TIME_WAIT Reuse 실수",
+    "Ephemeral Ports TIME_WAIT Reuse 판단 기준",
+    "운영체제 Ephemeral Ports TIME_WAIT Reuse",
     "ephemeral port exhaustion",
     "TIME_WAIT reuse",
     "ip_local_port_range",
     "tcp_tw_reuse",
     "outbound connection port exhaustion",
-    "4-tuple reuse risk"
+    "4-tuple reuse risk",
+    "ephemeral ports time wait guide"
   ],
   "expected_queries": [
     "ephemeral port exhaustion과 TIME_WAIT는 outbound connection에서 어떻게 병목이 돼?",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/ephemeral-ports-time-wait-reuse-recovery.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
+      }
+    ]
   }
 }

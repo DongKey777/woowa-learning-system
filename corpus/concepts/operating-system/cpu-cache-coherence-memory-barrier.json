@@ -6,18 +6,18 @@
   "summary": "이 문서는 멀티코어 CPU에서 cache line, coherence traffic, memory ordering, memory barrier, release/acquire, false sharing이 동시성 성능과 visibility bug에 어떻게 연결되는지 설명하는 advanced deep dive다.",
   "body_markdown": "# CPU Cache, Coherence, Memory Barrier\n\n> 한 줄 요약: 멀티코어에서 성능 문제와 동시성 버그는 cache line 경쟁, coherence traffic, memory ordering이 서로 섞여서 나타나며, 먼저 false sharing과 visibility를 구분해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [false sharing, cache line](./false-sharing-cache-line.md)\n> - [CPU Affinity, IRQ Affinity, Core Locality](./cpu-affinity-irq-affinity-core-locality.md)\n> - [CFS Scheduler, nice, CPU Fairness](./cfs-scheduler-nice-cpu-fairness.md)\n> - [Workqueues, Kthreads, Debugging](./workqueues-kthreads-debugging.md)\n> - [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n\n> retrieval-anchor-keywords: cache coherence, memory barrier, false sharing, cache line, MESI, release acquire, fence, perf c2c, visibility, ordering\n\n## 핵심 개념\n\nCPU는 DRAM보다 훨씬 가까운 캐시에 데이터를 둔다. 멀티코어 환경에서는 한 코어가 쓴 값이 다른 코어에 언제, 어떤 순서로 보이는지가 성능과 정합성을 좌우한다.\n\n- `cache line`: 캐시가 움직이는 기본 단위다\n- `coherence`: 같은 주소의 최신 값을 유지하려는 규칙이다\n- `memory barrier`: 명령 재정렬을 제한해 관찰 순서를 맞춘다\n\n왜 중요한가:\n\n- false sharing은 공유하지 않는 데이터인데도 캐시 경쟁을 만든다\n- release/acquire 없이 상태를 넘기면 stale read가 생길 수 있다\n- 성능 버그와 정합성 버그가 같은 코드에서 함께 보일 수 있다\n\n이 문서는 [false sharing, cache line](./false-sharing-cache-line.md)보다 더 넓게 coherence와 ordering을 함께 본다.\n\n## 깊이 들어가기\n\n### 1. cache line은 성능의 기본 단위다\n\n캐시는 바이트 단위가 아니라 cache line 단위로 움직인다.\n\n- 한 줄을 누가 자주 쓰느냐가 중요하다\n- 한 코어의 write가 다른 코어의 line을 무효화할 수 있다\n- false sharing이 대표적이다\n\n### 2. coherence와 ordering은 다르다\n\n- coherence: 같은 주소에 최신 값을 맞추는 문제다\n- ordering: 서로 다른 주소의 관찰 순서를 맞추는 문제다\n\n같은 값을 본다고 해서 코드 순서가 보장되는 것은 아니다.\n\n### 3. memory barrier는 재정렬을 제한한다\n\n- store barrier: 이전 write가 먼저 보이도록 돕는다\n- load barrier: 이후 read가 앞당겨지지 않도록 막는다\n- full fence: 둘 다 강하게 제한한다\n\n### 4. release/acquire는 실전에서 자주 보이는 패턴이다\n\n- producer는 `release`로 publish한다\n- consumer는 `acquire`로 확인한 뒤 읽는다\n\n## 실전 시나리오\n\n### 시나리오 1: 멀티스레드 카운터를 늘렸는데 느려진다\n\n가능한 원인:\n\n- false sharing\n- atomic contention\n- cache line ping-pong\n\n진단:\n\n```bash\nperf stat -e cache-references,cache-misses,LLC-load-misses,LLC-store-misses -- sleep 10\nperf c2c record -p <pid> -- sleep 20\nperf c2c report\n```\n\n### 시나리오 2: 플래그를 봤는데 데이터가 아직 예전 값이다\n\n가능한 원인:\n\n- ordering이 보장되지 않는다\n- barrier가 없다\n- release/acquire 패턴이 빠졌다\n\n### 시나리오 3: 워커 수를 늘릴수록 성능이 안 좋아진다\n\n가능한 원인:\n\n- cache line thrash\n- coherence traffic 증가\n- affinity와 locality가 깨짐\n\n이 경우는 [CPU Affinity, IRQ Affinity, Core Locality](./cpu-affinity-irq-affinity-core-locality.md)와 같이 본다.\n\n## 코드로 보기\n\n### 잘못된 패턴 예시\n\n```c\ndata = value;\nready = true;\n```\n\n이 순서가 다른 코어에서 그대로 보인다고 가정하면 위험하다.\n\n### 올바른 감각\n\n```c\n// producer\nstore_release(&ready, true);\n\n// consumer\nif (load_acquire(&ready)) {\n    // safe to read published data\n}\n```\n\n### false sharing 힌트\n\n```text\ndifferent variables\n  -> same cache line\n  -> writes invalidate each other\n  -> performance collapses\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| atomics only | 간단하다 | ordering 실수 위험 | 작은 동기화 |\n| mutex/lock | 정합성이 쉽다 | contention 비용이 든다 | 복잡한 공유 상태 |\n| padding으로 false sharing 완화 | 성능이 좋아질 수 있다 | 메모리 사용이 늘어난다 | 카운터/통계 |\n| release/acquire | 명확하다 | 이해가 필요하다 | lock-free publish |\n\n## 꼬리질문\n\n> Q: coherence와 memory ordering 차이는?\n> 핵심: coherence는 최신성, ordering은 관찰 순서다.\n\n> Q: false sharing은 왜 느린가요?\n> 핵심: 서로 다른 데이터라도 같은 cache line을 자주 무효화하기 때문이다.\n\n> Q: barrier 없이도 가끔 맞는 이유는?\n> 핵심: 우연히 순서가 맞을 수 있지만 보장되지 않기 때문이다.\n\n## 한 줄 정리\n\ncache coherence는 같은 주소의 최신성을 맞추고, memory barrier는 서로 다른 메모리 접근의 관찰 순서를 보장하며, 둘을 구분해야 멀티코어 버그를 제대로 잡을 수 있다.\n",
   "aliases": [
+    "멀티코어 가시성 순서",
+    "CPU cache와 JMM 연결",
+    "CPU Cache, Coherence, Memory 개념",
+    "CPU Cache, Coherence, Memory 정리",
+    "CPU Cache, Coherence, Memory 실수",
     "CPU cache coherence memory barrier",
     "cache coherence",
     "memory barrier",
     "false sharing",
     "cache line",
     "MESI basics",
-    "release acquire fence",
-    "visibility ordering",
-    "perf c2c cache line",
-    "멀티코어 가시성 순서",
-    "CPU cache와 JMM 연결",
-    "cache line ping pong"
+    "release acquire fence"
   ],
   "expected_queries": [
     "cache coherence와 memory ordering은 뭐가 달라?",
@@ -55,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/cpu-cache-coherence-memory-barrier.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
+      }
+    ]
   }
 }

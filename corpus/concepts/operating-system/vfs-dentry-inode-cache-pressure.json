@@ -6,12 +6,18 @@
   "summary": "dentry와 inode cache는 파일 경로 탐색을 빠르게 하지만, metadata-heavy workload에서는 슬랩 압박과 reclaim 비용을 동시에 키울 수 있다.",
   "body_markdown": "# VFS Dentry, Inode Cache Pressure\n\n> 한 줄 요약: dentry와 inode cache는 파일 경로 탐색을 빠르게 하지만, metadata-heavy workload에서는 슬랩 압박과 reclaim 비용을 동시에 키울 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Slab Allocator, Kernel Memory Pressure](./slab-allocator-kernel-memory-pressure.md)\n> - [Page Cache Thrash vs Direct I/O](./page-cache-thrash-vs-direct-io.md)\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n\n> retrieval-anchor-keywords: dentry, inode cache, VFS, metadata-heavy, path lookup, /proc/sys/fs/dentry-state, /proc/sys/fs/inode-state, shrinker\n\n## 핵심 개념\n\nVFS는 파일 경로를 찾고, inode와 dentry 캐시는 그 탐색을 빠르게 만든다. 문제는 metadata churn이 많아지면 이 cache가 커지고, 커널 메모리 압박과 reclaim 경합을 만들 수 있다는 점이다.\n\n- `dentry`: 경로명과 inode를 이어주는 디렉터리 항목이다\n- `inode`: 파일 메타데이터를 담는 자료구조다\n- `VFS`: 다양한 파일 시스템을 공통 인터페이스로 묶는 계층이다\n\n왜 중요한가:\n\n- `open`, `stat`, `ls`, `find` 같은 작업이 많으면 metadata cache가 커진다\n- 파일 수가 많고 수명이 짧으면 dentry/inode churn이 심해진다\n- cache가 커지면 유저 메모리와 별개로 slab pressure를 만들 수 있다\n\n이 문서는 [Slab Allocator, Kernel Memory Pressure](./slab-allocator-kernel-memory-pressure.md)를 파일 시스템 메타데이터 관점으로 좁혀 본다.\n\n## 깊이 들어가기\n\n### 1. dentry와 inode는 경로 탐색의 속도장치다\n\n같은 파일 경로를 반복해서 열면 cache hit가 이득을 준다.\n\n- 경로 탐색이 빨라진다\n- 시스템 콜의 실제 작업량이 줄어든다\n- metadata-heavy workload에 특히 유리하다\n\n### 2. metadata churn은 cache를 흔든다\n\n- 수많은 짧은 파일 생성/삭제\n- 자주 바뀌는 로그 로테이션\n- 대형 repository checkout\n- container image unpack\n\n이런 패턴은 dentry/inode cache를 크게 흔든다.\n\n### 3. cache pressure는 슬랩과 함께 봐야 한다\n\ninode/dentry cache는 slab 위에 쌓인다.\n\n- `/proc/sys/fs/dentry-state`\n- `/proc/sys/fs/inode-state`\n- `slabtop`\n\n이 조합으로 metadata cache pressure를 보아야 한다.\n\n### 4. cache가 커진다고 무조건 문제는 아니다\n\n재사용이 많으면 cache는 좋다. 문제는 회수 압박과 경합이 생길 때다.\n\n`drop_caches`로 내려가는지 보는 실험은 운영 중 해결책이 아니라 원인 확인용에 가깝다. 실제 처방은 파일 수/churn 감소, batch pacing, overlay layer 구조, memory headroom 조정 쪽에서 찾는다.\n\n## 실전 시나리오\n\n### 시나리오 1: 파일 수가 많은 서버에서 메모리가 점점 줄어든다\n\n가능한 원인:\n\n- dentry/inode cache가 커졌다\n- metadata churn이 많다\n- reclaim이 잘 안 된다\n\n진단:\n\n```bash\ncat /proc/sys/fs/dentry-state\ncat /proc/sys/fs/inode-state\nslabtop -o\n```\n\n### 시나리오 2: `open`/`stat`는 빠른데 시스템 메모리가 압박받는다\n\n가능한 원인:\n\n- metadata cache hit가 높아도 총량이 너무 크다\n- inode/dentry slab이 회수되지 않는다\n- 다른 커널 캐시와 경쟁한다\n\n### 시나리오 3: 배치가 끝난 뒤에도 cache가 안 내려간다\n\n가능한 원인:\n\n- cache lifetime이 길다\n- shrinker가 즉시 회수하지 못한다\n- slab pressure가 누적된다\n\n## 운영 Playbook\n\n### 관찰 증거\n\n- `/proc/meminfo`의 `Slab`, `SReclaimable`, `SUnreclaim`이 커지고 application RSS만으로 메모리 사용량이 설명되지 않는다.\n- `slabtop`에서 `dentry`, inode 관련 cache가 상위에 있다.\n- 파일 생성/삭제/`stat`/`find`/container image unpack 시점과 memory PSI, reclaim 지연이 겹친다.\n\n### 확인 순서\n\n1. `grep -E 'Slab|SReclaimable|SUnreclaim' /proc/meminfo`로 slab 비중을 본다.\n2. `slabtop -o`에서 dentry/inode 계열 cache가 상위인지 확인한다.\n3. `/proc/sys/fs/dentry-state`, `/proc/sys/fs/inode-state`를 전후 비교한다.\n4. workload 파일 수와 churn을 측정한다: 생성/삭제율, directory depth, overlayfs layer 수.\n5. OOM이면 user RSS, page cache, slab 중 어느 bucket이 커졌는지 먼저 분리한다.\n\n### Failure Matrix\n\n| 관찰 | 1차 bucket | 다음 확인 |\n|------|------------|-----------|\n| `SReclaimable` dentry/inode 큼 | metadata cache pressure | churn, shrinker latency, PSI |\n| `SUnreclaim` 큼 | 다른 kernel allocation 가능 | slabtop 상위 cache, driver/network |\n| file content cache가 큼 | page cache 이슈 | active/inactive, refault |\n| OverlayFS 환경에서 급증 | layer/copy-up metadata churn | overlay mount, image unpack, whiteout |\n| drop 후 빨리 다시 증가 | workload 구조 문제 | 파일 수/scan 주기 개선 |\n\n### 검증\n\n파일 수를 줄이거나 scan 주기를 낮춘 뒤에는 dentry/inode slab 증가율, memory PSI, application p99가 함께 좋아지는지 본다. 단순히 cache를 비워 일시적으로 메모리가 내려간 결과는 재발 방지 검증이 아니다.\n\n## 코드로 보기\n\n### metadata cache 상태 확인\n\n```bash\ncat /proc/sys/fs/dentry-state\ncat /proc/sys/fs/inode-state\n```\n\n### dentry/inode churn 감각\n\n```text\nmany file opens and path lookups\n  -> dentry/inode cache grows\n  -> metadata lookup gets faster\n  -> memory pressure may rise\n```\n\n### 단순 점검\n\n```bash\nfind /var/log -type f | wc -l\nslabtop | head\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| cache 유지 | 경로 탐색이 빠르다 | kernel memory pressure가 늘 수 있다 | 일반 파일 서버 |\n| 적극적 회수 | 메모리를 확보한다 | metadata lookup이 느려질 수 있다 | 압박 해소 필요 |\n| metadata churn 감소 | 근본 문제를 줄인다 | 앱/배치 수정이 필요하다 | 장기 최적화 |\n\n## 꼬리질문\n\n> Q: dentry와 inode cache는 왜 중요한가요?\n> 핵심: 파일 경로 탐색과 메타데이터 접근을 빠르게 하기 때문이다.\n\n> Q: 왜 slab pressure와 같이 보나요?\n> 핵심: 이 cache들이 slab 위에 쌓이기 때문이다.\n\n> Q: metadata-heavy workload는 어떤 것인가요?\n> 핵심: 파일 생성/삭제/조회가 매우 많은 패턴이다.\n\n## 한 줄 정리\n\ndentry와 inode cache는 VFS 성능의 핵심이지만, metadata churn이 크면 슬랩 압박과 reclaim 비용이 함께 커진다.\n",
   "aliases": [
+    "VFS Dentry Inode Cache 개념",
+    "VFS Dentry Inode Cache 정리",
+    "VFS Dentry Inode Cache 실수",
+    "VFS Dentry Inode Cache 판단 기준",
+    "운영체제 VFS Dentry Inode Cache",
     "VFS dentry inode cache pressure",
     "metadata-heavy workload",
     "dcache icache reclaim",
     "slab pressure filesystem",
     "path lookup cache",
-    "inode dentry memory"
+    "inode dentry memory",
+    "vfs dentry inode cache guide"
   ],
   "expected_queries": [
     "dentry와 inode cache는 path lookup을 빠르게 하지만 slab pressure를 만들 수 있어?",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/operating-system/vfs-dentry-inode-cache-pressure.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch160"
+      }
+    ]
   }
 }
