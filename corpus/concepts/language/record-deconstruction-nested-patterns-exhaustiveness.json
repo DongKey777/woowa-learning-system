@@ -1,0 +1,62 @@
+{
+  "id": "language/record-deconstruction-nested-patterns-exhaustiveness",
+  "title": "Record Deconstruction, Nested Patterns, and Exhaustiveness",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "Java 21 record pattern은 record를 값 객체로 설계하는 기능이 아니라 이미 record인 값을 패턴 매칭 자리에서 안전하게 분해하는 문법이다. nested deconstruction과 sealed hierarchy switch를 함께 쓰면 타입 확인, 구성 요소 추출, 분기 누락 검사를 한 흐름으로 묶을 수 있지만, 깊은 구조 결합과 default branch 남용은 피해야 한다.",
+  "body_markdown": "# Record Deconstruction, Nested Patterns, and Exhaustiveness\n\n> 한 줄 요약: Java 21의 record pattern은 record를 더 잘 만들게 해 주는 설계 문법이 아니라, 이미 record인 값을 `instanceof`나 `switch` 안에서 타입 확인과 구성 요소 추출까지 한 번에 하게 해 주는 deconstruction 문법이다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Java record와 class, Value Object 선택 기준](./java-record-vs-class-value-object-chooser.md)\n- [Java record, sealed class, pattern matching 입문](./records-sealed-pattern-matching.md)\n- [Sealed Interfaces and Exhaustive Switch Design](./sealed-interfaces-exhaustive-switch-design.md)\n- [Record/Sealed Hierarchy Evolution and Pattern Matching Compatibility](./record-sealed-hierarchy-evolution-pattern-matching-compatibility.md)\n\nretrieval-anchor-keywords: Java 21 record pattern, record deconstruction, nested record pattern, deconstruction pattern, pattern matching switch exhaustiveness, sealed hierarchy exhaustive switch, record pattern instanceof, case null, guarded case when, dominance, 자바 record 패턴 분해, 중첩 레코드 패턴, sealed switch 분기 누락\n\n## 먼저 잡을 멘탈 모델\n\nrecord pattern을 처음 보면 `record` 자체와 섞여 보인다. 하지만 두 기능의 질문은 다르다.\n\n| 구분 | 묻는 질문 | 대표 장면 |\n|---|---|---|\n| Java record | 이 타입을 값 중심으로 선언해도 되는가 | DTO, 작은 value object, 자동 `equals`/`hashCode` |\n| record pattern | 이미 record인 값을 어떻게 꺼내 읽을 것인가 | `instanceof`, `switch`, sealed hierarchy 분기 |\n| ordinary `instanceof` pattern | 이 객체가 어떤 타입인지 확인하고 그 타입 변수로 쓸 것인가 | `if (x instanceof Foo foo)` |\n| record deconstruction pattern | 타입 확인 후 record component까지 바로 분해할 것인가 | `if (x instanceof Foo(Bar(var id), var state))` |\n\n즉 record pattern은 value object 설계의 출발점이 아니라 **분기 지점에서의 읽기 방식**이다. `Order`를 record로 만들지 class로 만들지는 불변성, 내부 표현 공개, 검증 복잡도, 방어적 복사 기준으로 먼저 결정한다. 그다음 그 record 값을 분기에서 자주 꺼내야 한다면 record pattern이 후보가 된다.\n\n## Java 21에서 현재로 봐도 되는 범위\n\nJava 21 기준으로 record pattern과 pattern matching for switch는 final 기능으로 사용할 수 있다. record pattern은 `instanceof`와 `switch`의 pattern 자리에서 record component를 분해한다. nested record pattern도 Java 21 문맥에서 다룰 수 있다.\n\n반대로 Java 21에서 preview였던 문법을 현재 기능처럼 말하면 안 된다. 예를 들어 unnamed pattern의 `_`를 Java 21 표준 문법처럼 가르치지 않는다. 관심 없는 component가 있어도 Java 21 기준 설명에서는 `var ignored`처럼 명시 변수로 보여 주는 편이 보수적이다.\n\n## ordinary `instanceof`와 deconstruction의 차이\n\nordinary pattern matching for `instanceof`는 타입을 확인하고 그 타입 변수 하나를 만든다.\n\n```java\nif (value instanceof OrderView orderView) {\n    Customer customer = orderView.customer();\n    Address address = customer.address();\n    ZipCode zipCode = address.zipCode();\n    use(zipCode.value());\n}\n```\n\nrecord pattern은 그 안의 component를 패턴으로 다시 적어 한 번에 꺼낸다.\n\n```java\nrecord OrderView(Customer customer, Money total) {}\nrecord Customer(CustomerId id, Address address) {}\nrecord CustomerId(String value) {}\nrecord Address(String city, ZipCode zipCode) {}\nrecord ZipCode(String value) {}\nrecord Money(String amount) {}\n\nvoid inspect(Object value) {\n    if (value instanceof OrderView(\n            Customer(CustomerId(var customerId), Address(var city, ZipCode(var zip))),\n            Money(var amount)\n    )) {\n        use(customerId, city, zip, amount);\n    }\n}\n```\n\n여기서 핵심은 `OrderView(...)`, `Customer(...)`, `Address(...)`가 생성자 호출이 아니라 pattern이라는 점이다. 새 객체를 만드는 코드가 아니라, record header에 선언된 component 모양대로 값을 확인하고 바인딩한다. nested pattern은 바깥 record가 맞고, 안쪽 component도 다시 record pattern에 맞을 때만 전체 match가 성공한다.\n\n## nested deconstruction이 잘 맞는 순간\n\n중첩 record pattern은 구조가 작고, 읽는 목적이 분명할 때 좋다.\n\n- API response DTO 안의 작은 value record를 로그나 audit command로 바꾼다.\n- sealed event의 variant별 payload를 한 자리에서 분해한다.\n- 테스트나 변환 레이어에서 타입과 component shape를 동시에 검증한다.\n\n예를 들어 예약 이벤트를 audit command로 바꾸는 코드는 nested pattern이 읽기 쉬울 수 있다.\n\n```java\nsealed interface ReservationEvent permits Created, Cancelled, Changed {}\nrecord Created(ReservationId id, Customer customer) implements ReservationEvent {}\nrecord Cancelled(ReservationId id, Reason reason) implements ReservationEvent {}\nrecord Changed(ReservationId id, Schedule schedule) implements ReservationEvent {}\n\nrecord ReservationId(String value) {}\nrecord Reason(String value) {}\nrecord Schedule(String date, String time) {}\nrecord Customer(CustomerId id, Address address) {}\nrecord CustomerId(String value) {}\nrecord Address(String city, ZipCode zipCode) {}\nrecord ZipCode(String value) {}\n\nAuditCommand audit(ReservationEvent event) {\n    return switch (event) {\n        case Created(\n                ReservationId(var reservationId),\n                Customer(CustomerId(var customerId), Address(var city, ZipCode(var zip)))\n        ) -> AuditCommand.created(reservationId, customerId, city, zip);\n        case Cancelled(ReservationId(var reservationId), Reason(var reason)) ->\n                AuditCommand.cancelled(reservationId, reason);\n        case Changed(ReservationId(var reservationId), Schedule(var date, var time)) ->\n                AuditCommand.changed(reservationId, date, time);\n    };\n}\n```\n\n이 예시에서 `switch`는 sealed hierarchy의 허용 타입 세 개를 모두 다룬다. 그래서 `default` 없이도 분기가 완성된다. 나중에 `NoShow` 같은 새 permitted subtype을 추가하면, 이 switch는 빠진 분기를 컴파일 단계에서 드러낼 수 있다. 이것이 record pattern과 sealed exhaustive switch를 같이 쓰는 가장 큰 이점이다.\n\n## exhaustiveness는 닫힌 타입 집합에서 강해진다\n\nexhaustiveness는 모든 경우를 다뤘는지 확인하는 성질이다. Java 21의 pattern switch에서 sealed hierarchy를 selector로 쓰면 compiler가 permitted subtype 목록을 근거로 빠진 case를 판단할 수 있다.\n\n여기서 중요한 선택은 `default`를 너무 빨리 넣지 않는 것이다.\n\n```java\nreturn switch (event) {\n    case Created created -> AuditCommand.from(created);\n    case Cancelled cancelled -> AuditCommand.from(cancelled);\n    default -> AuditCommand.unknown(event);\n};\n```\n\n이 코드는 당장은 편하지만 `Changed`나 새 subtype을 조용히 default로 보낼 수 있다. sealed hierarchy에서 exhaustive switch를 쓰는 목적이 새 variant 추가를 컴파일 에러로 발견하는 것이라면, 넓은 `default`는 그 목적을 약하게 만든다. 내부 도메인 모델처럼 닫힌 세계를 믿을 수 있는 곳에서는 구체 case를 열거하는 편이 더 낫다.\n\n외부 JSON payload처럼 unknown variant가 실제로 들어올 수 있는 경계는 별도 문제다. 그때는 외부 payload parser에서 unknown을 보존하거나 거절하고, 내부 sealed domain으로 들어온 뒤에는 닫힌 타입 집합으로 다루는 식으로 경계를 나눈다.\n\n## `case null`과 guarded `when`을 조심한다\n\n`switch` selector가 null일 수 있다면 `case null`을 명시할지 먼저 결정해야 한다. null을 정상 입력으로 볼지, 호출 전 precondition 위반으로 볼지에 따라 정책이 달라진다.\n\n```java\nAuditCommand auditNullable(ReservationEvent event) {\n    return switch (event) {\n        case null -> AuditCommand.missing();\n        case Created created -> AuditCommand.from(created);\n        case Cancelled cancelled -> AuditCommand.from(cancelled);\n        case Changed changed -> AuditCommand.from(changed);\n    };\n}\n```\n\nguarded case의 `when`도 exhaustiveness와 함께 읽어야 한다. guard가 붙은 case는 조건이 true일 때만 match한다. 그래서 같은 타입의 나머지 값을 받을 unguarded case가 필요할 수 있다.\n\n```java\nreturn switch (event) {\n    case Created(ReservationId(var id), var customer) when id.startsWith(prefix) ->\n            AuditCommand.priority(id, customer);\n    case Created created -> AuditCommand.from(created);\n    case Cancelled cancelled -> AuditCommand.from(cancelled);\n    case Changed changed -> AuditCommand.from(changed);\n};\n```\n\n순서도 중요하다. 더 넓은 `case Created created`를 먼저 쓰면 뒤의 더 구체적인 guarded case가 도달 불가능해질 수 있다. 이 문제는 record pattern 자체보다 pattern switch의 dominance 규칙에 가깝다.\n\n## 자주 생기는 실패 모드\n\n첫째, record pattern을 record 설계의 이유로 착각한다. `record`를 선택하는 이유는 값 의미, component 공개, 얕은 불변성 수용 여부다. deconstruction이 편하다는 이유만으로 내부 표현을 공개하면 나중에 component 이름과 순서가 API처럼 굳을 수 있다.\n\n둘째, nested pattern을 너무 깊게 만든다. 세 단계 이상 이어진 pattern은 처음엔 멋져 보여도 domain shape 변화에 강하게 결합된다. 같은 값을 여러 곳에서 깊게 꺼내고 있다면 record method, mapper, visitor, polymorphic method가 더 나은지 본다.\n\n셋째, `default`로 exhaustive switch의 장점을 지운다. sealed hierarchy에서 새 subtype 추가를 컴파일러가 알려 주길 기대한다면, 넓은 default는 마지막 수단이어야 한다.\n\n넷째, null과 unknown variant를 같은 문제로 뭉갠다. null은 값 부재이고, unknown variant는 버전이나 외부 계약 진화 문제다. 내부 sealed switch에서 둘을 같은 default로 보내면 원인 추적이 어려워진다.\n\n다섯째, guarded case만 보고 모든 값이 처리됐다고 착각한다. `when`은 필터다. 조건 밖의 같은 subtype을 받을 case가 있어야 한다.\n\n## 언제 과하게 쓰지 않을까\n\nrecord pattern은 분기 코드가 data extraction 중심일 때 빛난다. 반대로 아래 장면에서는 절제한다.\n\n- 비즈니스 행위가 variant 내부로 들어가는 편이 자연스럽다.\n- record component가 외부에 드러나면 안 되는 내부 표현이다.\n- JSON schema나 API payload가 자주 진화해 component shape 결합이 부담된다.\n- pattern 한 줄을 이해하려고 record 선언 여러 개를 계속 왕복해야 한다.\n- 단순 타입 확인만 필요해서 `instanceof Foo foo`가 더 읽기 쉽다.\n\n짧게 말하면, nested deconstruction은 **읽는 쪽의 구조가 도메인 의미를 더 선명하게 만들 때** 쓴다. 구조를 한 번에 보여 주는 것이 오히려 독자를 지치게 하면 mapper나 작은 메서드로 풀어 쓰는 편이 낫다.\n\n## 빠른 판단표\n\n| 질문 | 선택 힌트 |\n|---|---|\n| 이 타입을 record로 만들지 고민 중인가 | record pattern 문서가 아니라 record vs class 기준을 먼저 본다 |\n| 이미 record이고 component를 바로 꺼내 분기하는가 | record pattern 후보다 |\n| sealed hierarchy의 모든 subtype을 다뤄야 하는가 | `default` 없는 exhaustive switch를 우선 검토한다 |\n| 안쪽 record까지 같이 꺼내야 의미가 선명한가 | nested deconstruction을 제한적으로 쓴다 |\n| guard가 붙은 case가 있는가 | 조건 밖 값을 받을 case와 dominance 순서를 확인한다 |\n\n## 꼬리질문\n\n> Q: `case Created(var id, var customer)`는 객체 생성인가요?\n> 핵심: 아니다. record component를 패턴으로 분해해 바인딩하는 match 문법이다.\n\n> Q: sealed switch에서 `default`를 넣으면 더 안전한가요?\n> 핵심: 꼭 그렇지 않다. 새 subtype 누락을 컴파일러가 알려 주는 장점을 가릴 수 있다.\n\n> Q: nested record pattern을 언제 피해야 하나요?\n> 핵심: 도메인 shape에 너무 깊게 결합되거나, 행위가 polymorphism으로 더 자연스러울 때 피한다.\n\n## 한 줄 정리\n\nJava 21 record pattern은 record의 설계 기준이 아니라 record 값을 읽는 분기 문법이고, sealed exhaustive switch와 함께 쓸 때 타입 확인, component 추출, 분기 누락 감지를 가장 잘 살릴 수 있다.",
+  "aliases": [
+    "record pattern deconstruction",
+    "nested record patterns",
+    "Java 21 record patterns",
+    "deconstruction pattern switch",
+    "sealed switch exhaustiveness",
+    "자바 record 패턴 분해",
+    "중첩 레코드 패턴",
+    "record 패턴 exhaustiveness",
+    "instanceof 패턴과 record 패턴",
+    "sealed 계층 switch 누락"
+  ],
+  "expected_queries": [
+    "record pattern이 뭐야?",
+    "record 분해 언제 써?",
+    "Java 21에서 record pattern deconstruction이 instanceof랑 어떻게 달라?",
+    "sealed interface랑 record pattern switch를 같이 쓰면 분기 누락을 컴파일러가 잡아줘?",
+    "record 안에 record가 들어간 DTO를 switch에서 분해해도 되는지 예제로 설명해줘"
+  ],
+  "symptoms": [
+    "record pattern을 record value object 설계 기준과 섞어서 이해한다",
+    "sealed switch에 default를 습관적으로 넣어 새 subtype 누락을 놓친다",
+    "nested record pattern을 너무 깊게 써서 domain shape에 강하게 결합된다",
+    "guarded when case가 모든 값을 처리한다고 착각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-record-vs-class-value-object-chooser",
+      "language/records-sealed-pattern-matching"
+    ],
+    "next_docs": [
+      "language/pattern-switch-guarded-when-case-null-dominance",
+      "language/sealed-interfaces-exhaustive-switch-design",
+      "language/record-sealed-hierarchy-evolution-pattern-matching-compatibility"
+    ],
+    "confusable_with": [
+      "language/sealed-interfaces-exhaustive-switch-design",
+      "language/record-sealed-hierarchy-evolution-pattern-matching-compatibility",
+      "language/records-sealed-pattern-matching"
+    ],
+    "forbidden_for_queries": []
+  },
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch166",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch166-worker-a"
+      }
+    ]
+  }
+}

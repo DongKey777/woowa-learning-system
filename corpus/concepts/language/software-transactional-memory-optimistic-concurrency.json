@@ -1,0 +1,65 @@
+{
+  "id": "language/software-transactional-memory-optimistic-concurrency",
+  "title": "Software Transactional Memory and Optimistic Concurrency",
+  "category": "language",
+  "level": "advanced",
+  "summary": "Software Transactional Memory(STM)은 공유 메모리 변경을 짧은 in-memory transaction처럼 실행하고, commit 시 read set/write set을 검증해 충돌이 있으면 재시도하는 optimistic concurrency 모델이다. Java 주류 서버 코드의 기본 선택지라기보다 synchronized, Lock, CAS, actor model, DB transaction을 비교할 때 사고방식을 넓혀 주는 고급 개념이다.",
+  "body_markdown": "# Software Transactional Memory and Optimistic Concurrency\n\n> 한 줄 요약: STM은 공유 메모리를 DB처럼 다룬다는 비유에서 출발하지만, 실제로는 읽은 version을 검증하고 쓰기를 한 번에 publish하려는 optimistic concurrency loop다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: software transactional memory, STM, optimistic concurrency, in-memory transaction, read set, write set, validation, transaction retry loop, conflict detection, irrevocable IO, side effect inside transaction, Java STM interview concept\n\n## 먼저 잡을 정신 모델\n\nSoftware Transactional Memory(STM)는 여러 thread가 같은 mutable memory를 직접 잠그는 대신, 메모리 접근을 작은 transaction으로 감싸 보려는 동시성 모델이다. 이름 때문에 DB transaction을 그대로 떠올리기 쉽지만, 핵심은 durable storage가 아니라 **in-process shared memory**다.\n\n감각적으로는 이렇다.\n\n- transaction 안에서는 transactional reference를 읽고 쓴다.\n- 읽은 값은 read set에 기록된다.\n- 쓴 값은 바로 공유 객체에 반영하지 않고 write set에 buffer한다.\n- commit 시점에 내가 읽은 값들이 아직 유효한지 검증한다.\n- 검증이 통과하면 write set을 한 번에 publish한다.\n- 충돌이 있으면 transaction body를 버리고 다시 실행한다.\n\n즉 STM은 lock을 먼저 잡고 들어가는 pessimistic model이 아니라, 일단 실행해 보고 마지막에 검증하는 optimistic concurrency model이다. 충돌이 드물고 transaction이 짧으면 코드 조합성이 좋아질 수 있지만, 충돌이 잦거나 부작용이 섞이면 retry 비용과 correctness 부담이 커진다.\n\n중요한 현실 감각도 필요하다. Java 일반 서버 애플리케이션에서 STM은 흔한 기본 선택지가 아니다. 보통은 `synchronized`, `ReentrantLock`, `StampedLock`, atomic/CAS, immutable snapshot, actor/message passing, DB transaction, queue 같은 도구가 먼저 검토된다. STM은 Clojure의 STM, Haskell STM, 연구 언어/runtime, 동시성 인터뷰 개념을 이해할 때 특히 유용한 렌즈로 보는 편이 안전하다.\n\n## 흔한 오해 바로잡기\n\n| 오해 | 더 정확한 말 |\n|---|---|\n| STM은 lock-free라서 충돌이 없다 | 구현 내부에서 version, lock, CAS를 쓸 수 있고 충돌은 retry로 처리한다 |\n| transaction이라고 하니 DB transaction과 같다 | STM은 보통 프로세스 안 memory의 atomicity/isolation 모델이고 durability는 제공하지 않는다 |\n| Java에서도 STM을 기본으로 쓰면 된다 | Java production 기본값으로 보기 어렵고, 개념 비교와 특수 runtime 이해에 가깝다 |\n| transaction body는 한 번만 실행된다 | conflict가 나면 같은 body가 여러 번 실행될 수 있다 |\n| rollback되니 안에서 외부 호출을 해도 된다 | 메모리는 버릴 수 있어도 이미 나간 IO, 로그, HTTP, 메시지는 되돌릴 수 없다 |\n\nSTM을 이해할 때 제일 중요한 문장은 하나다. **transaction body는 추측 실행이고 commit 전까지 확정된 일이 아니다.** 그래서 transaction 안의 계산은 가능하면 pure하고 짧아야 한다.\n\n## STM optimistic transaction loop\n\n전형적인 흐름을 단순화하면 아래와 같다.\n\n```text\nwhile true:\n  tx = begin()\n  try:\n    a = tx.read(accountA)\n    b = tx.read(accountB)\n\n    if a.balance < amount:\n      tx.abort()\n\n    tx.write(accountA, a.balance - amount)\n    tx.write(accountB, b.balance + amount)\n\n    tx.commit()\n    break\n  catch Conflict:\n    tx.rollbackLocalState()\n    backoffOrRetry()\n```\n\n여기서 `read`와 `write`는 일반 field 접근이 아니라 STM runtime이 추적할 수 있는 transactional access다. 일반 Java 객체 필드를 transaction 밖에서 마음대로 바꾸면 STM이 그 접근을 모를 수 있고, isolation이 깨진다.\n\ncommit은 보통 다음 단계를 포함한다.\n\n1. write set에 들어 있는 대상에 대해 commit 권한을 확보한다.\n2. read set에 기록된 version이 처음 읽을 때와 같은지 확인한다.\n3. 읽은 대상이 다른 committer에게 잠겨 있거나 바뀌었으면 abort한다.\n4. 검증이 통과하면 buffered write를 실제 shared memory에 반영한다.\n5. 관련 version을 올리고 transaction을 성공으로 끝낸다.\n\n구현마다 global version clock, per-object version, encounter-time locking, commit-time locking, read validation 전략은 다를 수 있다. 그래도 면접이나 개념 설명에서는 read set/write set/validation/retry 네 단어를 잡으면 큰 그림을 놓치지 않는다.\n\n## read set과 write set validation\n\nread set은 transaction이 의존한 과거 상태 목록이다. 예를 들어 `accountA.version = 10`, `accountB.version = 3`인 상태를 읽고 계산했다면, commit 때도 그 전제가 유지되어야 한다. 누군가 `accountA`를 먼저 바꿔 version이 11이 되었다면 내 계산은 오래된 전제 위에서 만들어진 것이므로 폐기해야 한다.\n\nwrite set은 transaction이 성공하면 publish할 변경 목록이다. transaction 중간에 shared memory를 직접 바꾸지 않고 buffer하는 이유는 실패 시 되돌리기 쉽게 만들기 위해서다. `accountA`는 이미 줄였는데 `accountB`를 늘리기 전에 conflict가 나면 메모리 상태가 깨질 수 있다. 그래서 STM은 중간 write를 외부에 보이지 않게 숨기고, commit에서 한 번에 반영하려 한다.\n\n이 구조가 주는 장점은 composability다. lock 기반 코드에서는 두 연산을 합치면 lock ordering, deadlock, unlock 위치가 새 문제가 된다. STM에서는 두 연산을 더 큰 transaction으로 묶는 사고방식이 가능하다. 다만 이 장점은 transaction body가 짧고, 외부 부작용이 없고, transactional access discipline이 지켜질 때 의미가 있다.\n\n## conflict와 retry는 정상 경로다\n\nSTM에서 conflict는 예외적인 버그라기보다 optimistic execution의 정상 비용이다. 두 transaction이 같은 값을 읽고 서로 다른 값을 쓰려 하면 하나는 성공하고 다른 하나는 abort될 수 있다. 실패한 transaction은 최신 값을 다시 읽고 계산해야 한다.\n\n이때 중요한 점은 retry가 단순 반복문보다 더 무섭다는 것이다.\n\n- transaction body가 여러 번 실행될 수 있다.\n- 실행 시간이 길수록 read set이 커지고 conflict 확률이 오른다.\n- 같은 hot key에 많은 thread가 몰리면 계속 abort될 수 있다.\n- 재시도마다 외부 side effect가 반복되면 시스템 상태가 오염된다.\n\n그래서 STM 설계에서는 transaction을 짧게 유지하고, conflict가 잦은 영역을 분리하거나, backoff를 두거나, 아예 lock/actor/CAS/queue 같은 다른 모델로 바꾸는 판단이 필요하다.\n\n## locks, CAS, DB transaction과 비교\n\n| 모델 | 먼저 떠올릴 질문 | STM과의 차이 |\n|---|---|---|\n| `synchronized`/`Lock` | 누가 임계영역에 들어갈 수 있는가 | lock은 먼저 막고 STM은 추측 실행 후 검증한다 |\n| CAS loop | 내가 읽은 한 위치가 아직 그대로인가 | CAS는 보통 단일 atomic location 중심이고 STM은 여러 transactional reference를 묶어 검증한다 |\n| `StampedLock` optimistic read | 읽은 snapshot이 아직 유효한가 | optimistic read는 주로 read validation이고 STM은 write buffering과 commit까지 포함한다 |\n| DB transaction | 어떤 durable row 변경을 commit/rollback할 것인가 | DB는 storage, isolation level, log, lock/MVCC, crash recovery가 있고 STM은 보통 process memory 범위다 |\n| Actor model | 상태 소유자에게 message를 보낼 것인가 | actor는 state owner가 순서를 직렬화하고, STM은 shared memory transaction으로 충돌을 검증한다 |\n\nCAS와 STM은 특히 연결해서 보면 좋다. version column CAS가 DB row 한 개를 저장 시점에 조건부 갱신하듯, STM도 read version을 보고 commit 가능성을 판단한다. 차이는 범위다. CAS는 작고 명시적인 원자 연산에 강하고, STM은 여러 메모리 위치를 하나의 transaction으로 묶는 추상화를 제공하려 한다. 대신 STM은 runtime과 접근 규칙이 무겁다.\n\nDB transaction과도 비슷하지만 같지 않다. DB는 commit 후 durability와 crash recovery까지 다룬다. STM은 보통 JVM 또는 runtime process 안에서 memory consistency를 다룬다. 프로세스가 죽으면 STM write set이 영구 저장되는 것이 아니다. 그래서 결제, 주문, 재고 같은 영속 상태에는 DB transaction이나 message/outbox 설계가 여전히 필요하다.\n\n## failure modes\n\n### 1. side effect inside transaction\n\ntransaction body 안에서 로그 적재, metric 증가, HTTP 호출, email 발송, Kafka publish, 파일 쓰기를 하면 retry 때 중복 실행될 수 있다. 메모리 write set은 abort로 버릴 수 있지만 이미 외부로 나간 부작용은 rollback되지 않는다.\n\n안전한 방향은 transaction 안에서는 계산과 transactional memory access만 하고, commit 성공 이후에 부작용을 내보내는 것이다. runtime이 after-commit hook을 제공하더라도 그 hook의 실행 보장, 실패 재시도, idempotency를 따로 봐야 한다.\n\n### 2. irrevocable IO\n\nirrevocable IO는 되돌릴 수 없는 작업이다. 파일 append, 네트워크 요청, 콘솔 입력, 난수 소비, 외부 lock 획득처럼 실행한 순간 transaction retry와 맞지 않는 일이 여기에 들어간다. 일부 STM runtime은 이런 작업을 금지하거나, transaction을 single global mode로 승격하거나, 사용자가 명시적으로 outside transaction으로 빼도록 요구한다.\n\n면접에서는 이 질문이 자주 나온다. STM transaction 안에서 HTTP 결제를 호출하면 왜 위험한가? 답은 간단하다. transaction이 abort되면 메모리 변경은 취소되지만 결제 요청은 이미 나갔고, retry가 다시 결제를 호출할 수 있기 때문이다.\n\n### 3. starvation과 livelock\n\noptimistic model은 충돌이 낮을 때 빛난다. 반대로 hot counter, 인기 상품 재고, 하나의 global registry처럼 모두가 같은 위치를 쓰면 transaction이 계속 abort될 수 있다. 어떤 thread는 계속 늦게 commit을 시도하다 실패할 수 있고, backoff가 없으면 livelock처럼 보일 수 있다.\n\n이 경우에는 STM을 고집하기보다 sharding, batching, actor per key, queue serialization, pessimistic lock, atomic accumulator 같은 선택지를 비교해야 한다.\n\n### 4. 긴 transaction과 큰 read set\n\ntransaction이 오래 실행되고 많은 객체를 읽을수록 검증해야 할 전제가 많아진다. read set 중 하나라도 바뀌면 abort될 수 있으므로, 큰 graph 순회나 오래 걸리는 계산은 STM에 잘 맞지 않을 수 있다. 읽은 reference가 mutable graph를 가리키고 그 내부가 transaction discipline 밖에서 바뀌면 reasoning은 더 어려워진다.\n\n### 5. non-transactional escape\n\nSTM이 보호하는 reference와 일반 mutable object가 섞이면 isolation이 구멍 난다. 어떤 코드는 `tx.read`로 읽고, 다른 코드는 일반 setter로 바꾸면 runtime은 충돌을 모를 수 있다. STM은 API 하나가 아니라 접근 규율이다. shared state를 transactional reference로 감싸고, 모든 접근 경로가 그 규율을 따라야 한다.\n\n## 코드 리뷰에서 묻는 질문\n\n- 이 transaction body는 실패 후 여러 번 실행되어도 같은 의미인가?\n- 외부 부작용이 commit 전 transaction 안에 들어가 있지 않은가?\n- read set이 커져서 conflict 확률을 높이고 있지 않은가?\n- hot key가 많아 starvation이나 retry storm이 생기지 않는가?\n- 일반 mutable field 접근이 transactional access를 우회하지 않는가?\n- 이 문제는 STM보다 lock, CAS, actor, queue, DB transaction이 더 단순하지 않은가?\n\n## 꼬리질문\n\n> Q: STM이면 lock이 없어지는 건가요?\n> 핵심: 사용자 코드가 lock을 직접 덜 다룰 수는 있지만, runtime 내부의 versioning, locking, CAS, validation은 남을 수 있다. 충돌도 사라지지 않는다.\n\n> Q: transaction body가 왜 pure해야 하나요?\n> 핵심: conflict가 나면 body가 다시 실행될 수 있기 때문이다. memory write는 버릴 수 있어도 외부 IO는 되돌리기 어렵다.\n\n> Q: Java 실무에서 STM을 먼저 쓰면 되나요?\n> 핵심: 보통 아니다. Java 서버 코드에서는 더 단순한 동시성 도구가 먼저고, STM은 optimistic concurrency와 transaction composition을 이해하는 고급 개념으로 보는 편이 현실적이다.\n\n> Q: DB transaction과 연결되는 지점은 뭔가요?\n> 핵심: 둘 다 atomicity/isolation을 말하지만 범위가 다르다. DB는 durable storage transaction이고 STM은 주로 process memory transaction이다.\n\n## 한 줄 정리\n\nSTM은 shared memory 변경을 optimistic transaction으로 묶는 모델이다. read set을 검증하고 write set을 commit한다는 그림은 강력하지만, retry와 side effect, starvation, access discipline을 함께 설명하지 않으면 현실적인 동시성 설계로 이어지지 않는다.\n",
+  "aliases": [
+    "software transactional memory",
+    "STM optimistic concurrency",
+    "transactional memory",
+    "read set write set validation",
+    "optimistic transaction retry loop",
+    "STM conflict retry",
+    "소프트웨어 트랜잭셔널 메모리",
+    "낙관적 메모리 트랜잭션",
+    "STM 충돌 재시도",
+    "읽기 집합 쓰기 집합 검증"
+  ],
+  "expected_queries": [
+    "STM이 뭐야?",
+    "소프트웨어 트랜잭셔널 메모리는 왜 retry를 전제로 봐야 해?",
+    "STM에서 read set write set validation이 commit 때 어떻게 동작해?",
+    "STM이 synchronized나 CAS보다 좋은 건 언제고 Java 실무 기본 선택지는 아닌 이유는?",
+    "트랜잭션 안에서 로그나 HTTP 호출 같은 side effect를 하면 왜 위험해?",
+    "DB 트랜잭션이랑 달라?"
+  ],
+  "symptoms": [
+    "STM을 DB transaction과 같은 durability 모델로 이해해 process memory 범위와 crash recovery 차이를 놓친다",
+    "optimistic transaction body가 conflict 후 여러 번 실행될 수 있다는 점을 모르고 외부 side effect를 transaction 안에 넣는다",
+    "read set/write set validation과 retry 비용을 설명하지 못한 채 STM을 lock-free 성능 최적화처럼만 말한다",
+    "Java production에서 STM을 흔한 기본 선택지로 착각하고 synchronized, Lock, CAS, actor, DB transaction과의 선택 기준을 비교하지 못한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-synchronized-vs-lock-basics",
+      "database/compare-and-set-version-columns"
+    ],
+    "next_docs": [
+      "language/stampedlock-optimistic-read-conversion-pitfalls",
+      "language/jcstress-concurrency-testing",
+      "database/idempotent-transaction-retry-envelopes"
+    ],
+    "confusable_with": [
+      "database/transaction-basics",
+      "language/actor-model-message-passing-vs-shared-memory",
+      "language/stampedlock-optimistic-read-conversion-pitfalls",
+      "database/compare-and-set-version-columns"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch166",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch166-worker-d"
+      }
+    ]
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "language/pattern-switch-guarded-when-case-null-dominance",
+  "title": "Java 21 Pattern Switch: Guarded when, case null, and Dominance",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "Java 21 pattern switch에서 guarded `when`, `case null`, case dominance와 순서, sealed type exhaustiveness를 함께 읽는 중급 가이드다. 넓은 pattern이 좁은 guarded case를 가릴 수 있다는 점과 null/default 차이를 실전 예제로 정리한다.",
+  "body_markdown": "# Java 21 Pattern Switch: Guarded `when`, `case null`, Dominance\n\n> 한 줄 요약: Java 21의 pattern switch는 타입별 분기를 짧게 쓰는 문법이 아니라, 어떤 값이 어떤 case에 먼저 잡히는지, null을 정상 입력으로 볼지, sealed hierarchy를 빠짐없이 다뤘는지를 컴파일러와 함께 확인하는 도구다.\n\n**난이도: Intermediate**\n\n> retrieval-anchor-keywords: Java 21 pattern switch, guarded when, case null, dominance, dominated case, sealed exhaustive switch, switch null default, pattern matching switch order, 자바 패턴 switch when, case null default 차이, sealed switch 분기 누락\n\n## 30초 멘탈 모델\n\nPattern switch를 읽을 때는 아래 순서로 보면 된다.\n\n1. selector 값이 `null`인가? `case null`이 있으면 거기로 가고, 없으면 기존 switch처럼 `NullPointerException` 쪽으로 간다. `default`는 null을 대신 잡아 주는 만능 case가 아니다.\n2. 위에서 아래로 case label을 본다. Java는 가장 잘 맞는 case를 찾아 주는 best-fit 모델이 아니라, 먼저 match되는 case를 선택하는 모델이다.\n3. `case SomeType x when predicate(x)`는 타입 match 뒤 guard가 true일 때만 선택된다. guard가 false면 다음 case로 내려간다.\n4. 더 넓은 pattern을 먼저 두면 뒤의 좁은 pattern이 도달 불가능해질 수 있다. 이때 컴파일러는 dominated case로 본다.\n5. sealed type을 switch expression으로 다룰 때는 허용된 subtype을 빠짐없이 다루는 설계가 핵심이다. null도 도메인상 입력이면 별도로 명시한다.\n\n즉 이 기능의 중심 질문은 `어떤 타입인가`보다 `어떤 case가 먼저 값을 가져가는가`다.\n\n## 흔한 오해 바로잡기\n\n### 오해 1: `when`은 if를 switch 안으로 옮기는 장식이다\n\n부분적으로 맞지만 충분하지 않다. `when`은 pattern label을 더 좁히는 guard다. 아래 case는 먼저 `Refund`인지 확인하고, 그 다음 `manualReview()`가 true인지 본다.\n\n```java\ncase Refund r when r.manualReview() -> ...\n```\n\nguard가 false이면 같은 타입이라도 이 case는 선택되지 않는다. 그래서 보통 guarded case를 먼저 두고, 같은 타입의 일반 case를 뒤에 둔다.\n\n```java\ncase Refund r when r.manualReview() -> ...\ncase Refund r -> ...\n```\n\n반대로 일반 `case Refund r`를 먼저 두면 모든 `Refund`를 이미 가져가므로 뒤의 guarded case는 의미가 사라진다.\n\n### 오해 2: `default`가 있으니 null도 처리된다\n\nJava 21 pattern switch에서도 `default`는 null을 자동으로 받지 않는다. null을 정상 입력으로 처리하려면 `case null`을 직접 쓴다. null과 나머지 모두를 같은 처리로 묶고 싶을 때는 `case null, default` 형태를 쓸 수 있다.\n\n```java\nstatic String label(Object value) {\n    return switch (value) {\n        case null -> \"missing\";\n        case String s when !s.isBlank() -> \"text\";\n        case String s -> \"blank text\";\n        default -> \"other\";\n    };\n}\n```\n\n이 예제에서 `default`는 `String`이 아닌 non-null 값만 받는다. null은 첫 case가 받는다.\n\n### 오해 3: 컴파일러가 조건의 의미까지 다 이해해서 exhaustiveness를 계산한다\n\n컴파일러는 임의의 business predicate를 증명하지 않는다. 예를 들어 `amount() > 0`, `isBlank()`, `status().isOpen()` 같은 guard가 모든 경우를 덮는지 일반적으로 추론하지 않는다. 그래서 guarded case만 나열하면 사람이 보기엔 충분해 보여도 switch expression 입장에서는 빠진 값이 있을 수 있다. 같은 타입을 모두 받는 unguarded fallback case나 `default`가 필요할 때가 많다.\n\n## Java 21 예제: sealed command routing\n\n아래는 payment command를 sealed interface와 record로 모델링한 예시다. Java 21에서 pattern matching for switch는 final 기능이고, guard는 `when`으로 쓴다.\n\n```java\nsealed interface PaymentCommand permits Pay, Refund, Cancel {\n}\n\nrecord Pay(String orderId, long amount) implements PaymentCommand {\n}\n\nrecord Refund(String orderId, long amount, boolean manualReview) implements PaymentCommand {\n}\n\nrecord Cancel(String orderId, String reason) implements PaymentCommand {\n}\n\nstatic String route(PaymentCommand command) {\n    return switch (command) {\n        case null -> \"reject:null command\";\n        case Refund r when r.manualReview() -> \"refund:manual-review\";\n        case Refund r -> \"refund:auto\";\n        case Pay p when p.amount() >= 100_000 -> \"pay:large\";\n        case Pay p -> \"pay:normal\";\n        case Cancel c -> \"cancel\";\n    };\n}\n```\n\n읽는 순서는 단순하다.\n\n- null은 먼저 명시적으로 거른다.\n- `Refund` 중 manual review가 필요한 값은 좁은 case가 먼저 받는다.\n- 남은 `Refund`는 일반 `case Refund r`가 받는다.\n- `Pay`도 큰 결제와 일반 결제를 같은 방식으로 나눈다.\n- sealed hierarchy의 non-null subtype인 `Pay`, `Refund`, `Cancel`을 모두 다뤘으므로 불필요한 `default` 없이도 의도가 선명하다.\n\n여기서 `case null`은 exhaustiveness를 예쁘게 보이게 하려고 넣은 것이 아니다. 도메인 입력에서 null을 어떤 의미로 처리할지 명시한 것이다. 만약 `command`가 null이 될 수 없다는 계약이 강하다면 호출 경계에서 `Objects.requireNonNull`로 막고 switch에는 null case를 두지 않는 선택도 가능하다.\n\n## Dominance와 case 순서\n\nPattern switch는 여러 case가 동시에 맞을 수 있다. `String`은 `CharSequence`이기도 하다. 이때 Java는 더 구체적인 타입을 알아서 고르는 대신, 위에서 아래로 처음 match되는 label을 고른다. 그래서 더 넓은 pattern이 먼저 나오면 뒤의 좁은 pattern은 dominated case가 된다.\n\n```java\nstatic String broken(Object value) {\n    return switch (value) {\n        case CharSequence cs -> \"some text\";\n        case String s when !s.isBlank() -> \"nonblank string\"; // compile-time error\n        default -> \"other\";\n    };\n}\n```\n\n`String` 값은 이미 `case CharSequence cs`에 잡힌다. 뒤의 `case String s when ...`는 아무리 guard가 있어도 선택될 기회가 없다. 사용자 요구사항에서 말한 broader pattern before narrower guarded case가 바로 이 상황이다.\n\n정렬은 좁은 case에서 넓은 case로 내려가야 한다.\n\n```java\nstatic String fixed(Object value) {\n    return switch (value) {\n        case String s when !s.isBlank() -> \"nonblank string\";\n        case String s -> \"blank string\";\n        case CharSequence cs -> \"other text\";\n        case null -> \"missing\";\n        default -> \"other\";\n    };\n}\n```\n\n같은 타입 안에서도 일반 pattern을 먼저 두면 guarded pattern이 dominated된다.\n\n```java\nstatic String alsoBroken(Object value) {\n    return switch (value) {\n        case String s -> \"string\";\n        case String s when s.length() > 10 -> \"long string\"; // compile-time error\n        default -> \"other\";\n    };\n}\n```\n\n따라서 실무 규칙은 짧다.\n\n- 상수 case와 null처럼 특수한 값은 의도에 맞게 먼저 배치한다.\n- guarded case는 같은 타입의 일반 case보다 앞에 둔다.\n- subtype case는 supertype case보다 앞에 둔다.\n- 마지막에는 남은 같은 타입 또는 default를 둔다.\n\n## Exhaustiveness와 sealed type\n\nSwitch expression은 값을 반환해야 하므로 모든 가능한 입력 경로를 덮어야 한다. Pattern switch statement도 pattern label을 쓰면 coverage 확인을 더 강하게 받는다. sealed type은 허용된 subtype 집합이 닫혀 있으므로 컴파일러가 빠진 subtype을 더 잘 찾아준다.\n\n```java\nsealed interface DeliveryEvent permits Requested, Assigned, Failed {\n}\n\nrecord Requested(String orderId) implements DeliveryEvent {\n}\n\nrecord Assigned(String orderId, String riderId) implements DeliveryEvent {\n}\n\nrecord Failed(String orderId, String reason) implements DeliveryEvent {\n}\n\nstatic String message(DeliveryEvent event) {\n    return switch (event) {\n        case Requested r -> \"requested:\" + r.orderId();\n        case Assigned a -> \"assigned:\" + a.riderId();\n        case Failed f -> \"failed:\" + f.reason();\n    };\n}\n```\n\n여기서 `Failed` case를 지우면 switch expression은 모든 non-null `DeliveryEvent` variant를 덮지 못한다. 그래서 컴파일 시점에 빠진 분기를 드러내는 설계가 된다. 이 장점 때문에 sealed type과 pattern switch를 함께 쓰면 도메인 상태 분기 누락을 줄일 수 있다.\n\n다만 두 가지를 구분해야 한다.\n\n- compile-time coverage: 현재 컴파일하는 소스 기준으로 모든 허용 subtype을 다뤘는가\n- runtime compatibility: 이미 배포된 코드와 나중에 바뀐 sealed hierarchy나 payload가 섞일 때 어떤 일이 생기는가\n\n두 번째는 별도 compatibility 문제다. 내부 도메인 모델에는 sealed switch가 좋지만, 외부 payload가 계속 진화한다면 boundary DTO에서 unknown variant 정책을 먼저 정해야 한다.\n\n## 실패 모드 체크리스트\n\n| 증상 | 흔한 원인 | 먼저 볼 것 |\n|---|---|---|\n| 뒤 case가 unreachable 또는 dominated compile error | 더 넓은 pattern을 앞에 둠 | subtype에서 supertype 순서로 정렬 |\n| null 입력에서 `NullPointerException` | `default`가 null도 잡는다고 착각 | `case null` 또는 호출 경계 null 금지 |\n| switch expression이 exhaustive하지 않다는 오류 | guarded case만 있고 일반 fallback이 없음 | unguarded subtype case나 default 추가 |\n| 새 subtype 추가 후 분기 누락 | sealed hierarchy 변경 | default로 숨기지 말고 명시 case 검토 |\n| guard 평가 중 예외 | guard가 business logic을 너무 많이 수행 | guard는 짧고 부작용 없이 유지 |\n\n특히 guard에는 계산이 싼 predicate만 두는 편이 좋다. 외부 호출, 상태 변경, 로그성 부수효과를 넣으면 switch label이 분기 선언인지 실행 로직인지 흐려진다.\n\n## 언제 if/else가 더 명확한가\n\nPattern switch가 항상 더 좋은 선택은 아니다. 아래 상황에서는 `if/else`가 더 읽기 쉽다.\n\n- 타입 분기가 아니라 하나의 객체에 대한 여러 business rule 우선순위가 핵심일 때\n- 조건들이 서로 겹치고 순서 자체가 도메인 정책일 때\n- guard가 길어져서 case label이 한 줄 설명이 아니라 작은 메서드 본문처럼 보일 때\n- null, validation, authorization, side effect를 한 흐름에서 빨리 return하는 코드일 때\n\n예를 들어 주문 검증에서 `amount <= 0`, `stock 부족`, `coupon 만료`, `user blocked`처럼 모두 같은 `OrderRequest`의 상태를 검사한다면 switch보다 guard clause가 낫다.\n\n```java\nif (request == null) {\n    return Reject.NULL_REQUEST;\n}\nif (request.amount() <= 0) {\n    return Reject.INVALID_AMOUNT;\n}\nif (request.userBlocked()) {\n    return Reject.BLOCKED_USER;\n}\nreturn Accept.OK;\n```\n\n반면 `PaymentCommand`의 subtype별 처리처럼 타입 계층이 이미 도메인 의미를 갖고 있고, subtype 안에서 한두 개 조건만 더 좁히면 pattern switch가 자연스럽다.\n\n## 실전 작성 순서\n\n1. selector type이 sealed인지, open hierarchy인지 먼저 확인한다.\n2. null이 정상 입력인지 버그인지 정한다.\n3. subtype case를 가장 좁은 타입부터 둔다.\n4. 같은 subtype 안에서는 guarded case를 일반 case보다 앞에 둔다.\n5. guard가 길어지면 private predicate method로 빼거나 if/else로 되돌린다.\n6. sealed hierarchy라면 습관적 default가 새 subtype 누락을 숨기지 않는지 본다.\n\n## 꼬리질문\n\n> Q: `case null`과 `default`는 어떻게 달라?\n> 핵심: `case null`은 null selector를 직접 받는다. `default`는 다른 case가 match되지 않은 non-null 값을 주로 받으며, null을 자동으로 대신 처리하지 않는다.\n\n> Q: 왜 `case String s when ...`를 `case CharSequence cs`보다 위에 둬야 해?\n> 핵심: `String`은 `CharSequence`에 포함되므로 넓은 supertype case가 먼저 있으면 좁은 String case가 dominated된다.\n\n> Q: guarded case만 있으면 exhaustive한가?\n> 핵심: 일반적으로 아니다. 컴파일러는 임의 guard가 모든 값을 덮는지 증명하지 않으므로 unguarded fallback case나 default가 필요할 수 있다.\n\n> Q: sealed type switch에 default를 넣으면 안 돼?\n> 핵심: 금지는 아니다. 다만 default가 새 subtype 추가를 조용히 숨길 수 있으므로, 내부 closed hierarchy에서는 명시 case를 선호하고 default를 evolution policy로 의식해야 한다.\n\n## 한 줄 정리\n\nJava 21 pattern switch는 `when`으로 조건을 좁히고 `case null`로 null 정책을 드러내며, dominance와 exhaustiveness로 분기 누락을 줄이는 도구다. 좋은 작성 순서는 좁은 case부터 넓은 case로 내려가고, guarded case 뒤에는 같은 타입을 받는 일반 fallback을 두는 것이다.\n",
+  "aliases": [
+    "guarded pattern switch",
+    "Java 21 switch when",
+    "case null switch",
+    "pattern switch dominance",
+    "sealed switch exhaustiveness",
+    "자바 switch when",
+    "case null 처리",
+    "패턴 switch 순서",
+    "guarded case 우선순위",
+    "sealed switch 누락 방지"
+  ],
+  "expected_queries": [
+    "when case 순서 왜 컴파일 에러 나?",
+    "case null은 default랑 달라?",
+    "guarded switch 언제 써?",
+    "Java 21 pattern switch에서 sealed type 분기랑 null 처리를 어떻게 잡아야 해?",
+    "넓은 case를 먼저 쓰면 왜 뒤의 guarded case가 unreachable 되는지 예제로 보여줘"
+  ],
+  "symptoms": [
+    "pattern switch를 best-fit dispatch처럼 생각해 supertype case를 먼저 두고 subtype guarded case가 dominated되는 이유를 놓친다",
+    "default가 null selector도 처리한다고 착각해 Java 21 switch에서 null 입력이 NullPointerException으로 터진다",
+    "guarded when case만 나열하면 컴파일러가 business predicate를 모두 이해해 exhaustive하다고 판단할 것이라 기대한다",
+    "sealed hierarchy switch에 습관적으로 default를 넣어 새 subtype 추가 시 명시 분기 누락을 숨긴다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/records-sealed-pattern-matching",
+      "language/sealed-interfaces-exhaustive-switch-design"
+    ],
+    "next_docs": [
+      "language/record-sealed-hierarchy-evolution-pattern-matching-compatibility"
+    ],
+    "confusable_with": [
+      "language/java-record-vs-class-value-object-chooser",
+      "language/record-sealed-hierarchy-evolution-pattern-matching-compatibility"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch166",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "corpus-expansion-batch166"
+      }
+    ]
+  }
+}

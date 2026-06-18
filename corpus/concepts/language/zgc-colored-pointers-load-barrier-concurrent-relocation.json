@@ -1,0 +1,61 @@
+{
+  "id": "language/zgc-colored-pointers-load-barrier-concurrent-relocation",
+  "title": "ZGC Colored Pointers, Load Barriers, and Concurrent Relocation",
+  "category": "language",
+  "level": "advanced",
+  "summary": "ZGC는 colored pointers와 load barrier를 이용해 application thread가 실행되는 동안 marking, relocation, remapping을 대부분 concurrent하게 진행하고, pause 시간을 heap 크기와 덜 묶이게 만드는 저지연 GC다. 이 문서는 정확한 bit layout보다 reference metadata, barrier, concurrent compaction의 mental model과 G1 대비 운영 판단을 다룬다.",
+  "body_markdown": "# ZGC Colored Pointers, Load Barriers, and Concurrent Relocation\n\n> 한 줄 요약: ZGC는 참조에 GC 상태를 담고 참조를 읽는 순간 load barrier로 보정해, marking과 relocation의 대부분을 애플리케이션 실행과 겹치게 만드는 저지연 compacting GC다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [G1 GC vs ZGC](./g1-vs-zgc.md)\n> - [JVM, GC, JMM](./jvm-gc-jmm-overview.md)\n> - [GC Allocation Rate Symptom Router](./gc-allocation-rate-symptom-router.md)\n> - [G1 String Deduplication Heap and Latency Chooser](./g1-string-deduplication-heap-latency-chooser.md)\n\nretrieval-anchor-keywords: ZGC colored pointers, ZGC load barrier, concurrent relocation, concurrent remapping, low pause collector, Java ZGC mental model, ZGC vs G1 barrier, ZGC relocation set, ZGC allocation stall, ZGC tail latency\n\n## 먼저 잡을 mental model\n\nZGC를 이해할 때 가장 좋은 그림은 “객체를 옮기는 동안에도 애플리케이션이 낡은 주소를 안전하게 만질 수 있게 만드는 시스템”이다. 전통적인 compacting GC는 객체를 옮기고 모든 참조를 고치는 동안 application thread를 오래 멈추기 쉽다. ZGC는 그 긴 작업을 한 번의 큰 stop-the-world 구간에 몰아넣지 않고, GC thread와 application thread가 동시에 달리는 시간으로 분산한다.\n\n이를 가능하게 하는 핵심 장치가 두 가지다.\n\n- colored pointer: reference 값에 GC가 해석할 metadata 상태를 함께 싣는 개념\n- load barrier: application code가 object reference를 읽을 때 JVM이 끼어들어 reference 상태를 확인하고 필요한 보정을 하는 장치\n\n여기서 중요한 점은 “정확히 몇 번째 bit가 어떤 의미다”가 아니다. JDK, platform, compressed reference, virtual address 사용 방식에 따라 구현 세부는 바뀔 수 있다. 학습자가 가져가야 할 모델은 reference가 단순 주소만이 아니라 GC phase와 관련된 상태를 표현할 수 있고, 그 상태를 읽기 경로의 barrier가 해석한다는 점이다.\n\n## colored pointer는 type tag가 아니다\n\ncolored pointer라는 이름 때문에 Java 객체 reference에 사용자 타입 정보가 붙는다고 오해하기 쉽다. ZGC의 color는 Java language level의 타입 태그가 아니다. `String`, `Order`, `List` 같은 타입을 담는 용도가 아니라 GC가 “이 reference가 현재 mark 관점에서 유효한가”, “relocation 이후 보정이 필요한가” 같은 runtime 상태를 판단하기 위한 metadata에 가깝다.\n\n그래서 colored pointer를 설명할 때는 이렇게 말하는 편이 안전하다.\n\n- Java 코드가 직접 보는 값이 아니다.\n- 정확한 bit 배치는 외우는 대상이 아니다.\n- GC가 concurrent phase 중 reference의 상태를 빠르게 판별하기 위한 runtime 표현이다.\n- 필요하면 JVM은 masking, remapping, barrier 처리를 통해 application이 정상 객체를 보도록 만든다.\n\n면접 답변에서도 “주소에 색깔 bit가 있다”에서 멈추면 약하다. 더 중요한 질문은 그 metadata를 어디서 사용하느냐다. ZGC에서는 reference load 시점의 barrier가 그 답이다.\n\n## load barrier가 하는 일\n\nG1 같은 collector를 배울 때 write barrier, card table, remembered set을 먼저 접하기 때문에 barrier를 “쓸 때만 드는 비용”으로 기억하는 경우가 많다. ZGC의 핵심은 load barrier다. 객체 필드나 배열 원소에서 object reference를 읽는 순간 JVM이 reference 상태를 확인하고, 필요하면 올바른 reference로 고친다.\n\n개념적으로는 다음 흐름이다.\n\n```text\napplication thread가 reference를 읽음\n-> load barrier가 reference metadata를 확인\n-> 이미 좋은 reference면 그대로 진행\n-> 낡았거나 relocation/remap 처리가 필요하면 JVM runtime 경로로 진입\n-> forwarding 정보를 따라 새 위치 reference를 얻음\n-> 가능한 경우 읽은 slot이나 관련 metadata를 갱신\n-> application은 정상 객체를 계속 사용\n```\n\n이 과정은 Java source code에 보이지 않는다. JIT와 runtime이 협력해 object reference load 경로에 barrier를 삽입하거나 최적화한다. 모든 primitive read가 같은 의미의 barrier를 타는 것도 아니다. GC가 관리하는 object reference를 application이 안전하게 관찰하도록 만드는 것이 핵심이다.\n\n비용도 있다. load barrier는 hot path에 들어갈 수 있으므로 CPU overhead, instruction footprint, optimization 제약을 만든다. ZGC가 pause를 줄인다는 말은 비용이 사라진다는 뜻이 아니라, 긴 정지 시간을 더 많은 concurrent work와 barrier 비용으로 바꾼다는 뜻에 가깝다.\n\n## concurrent marking, relocation, remapping\n\nZGC cycle은 버전별 세부 phase 이름이 조금씩 달라질 수 있지만, 큰 그림은 다음 세 단계로 읽으면 된다.\n\n### 1. Concurrent marking\n\nGC는 root에서 시작해 살아 있는 객체를 찾는다. 아주 짧은 stop-the-world 구간이 root 처리나 phase 전환에 필요할 수 있지만, 대부분의 tracing 작업은 application thread가 실행되는 동안 진행된다. 이때 colored pointer metadata와 barrier는 application이 object graph를 계속 바꾸는 상황에서도 mark 상태를 일관되게 해석하는 데 쓰인다.\n\n### 2. Concurrent relocation\n\n살아 있는 객체 중 옮길 대상을 정하고, selected region의 live object를 새 위치로 복사한다. ZGC는 compacting collector이므로 fragmentation을 줄이기 위해 객체를 옮길 수 있다. 하지만 모든 application thread를 오래 멈춘 뒤 한 번에 참조를 다 고치는 방식이 아니라, relocation 중에도 application이 실행될 수 있게 만든다.\n\nrelocation이 끝난 뒤에도 old location을 가리키는 reference가 어딘가에 남아 있을 수 있다. 이때 load barrier가 old reference를 만나면 forwarding 정보를 보고 새 reference로 보정한다. 그래서 “객체를 옮겼는데 application이 낡은 주소를 읽으면 어떻게 되나?”라는 질문의 답이 load barrier다.\n\n### 3. Concurrent remapping\n\nremapping은 heap 안에 남은 stale reference들을 새 위치 reference로 정리하는 과정이다. 일부는 load barrier를 통해 lazy하게 고쳐지고, 일부는 GC가 concurrent하게 훑으며 정리한다. 중요한 점은 remapping이 끝나기 전에도 application이 계속 진행할 수 있다는 것이다. barrier가 stale reference를 안전하게 다루기 때문이다.\n\n이 설계 덕분에 ZGC의 pause는 heap 전체 크기나 live set 크기에 단순 비례하지 않도록 설계된다. 다만 concurrent work 자체는 CPU와 memory bandwidth를 쓴다. allocation rate가 너무 높거나 live set이 매우 크거나 CPU 여유가 없으면 ZGC도 allocation stall, throughput 저하, cycle이 따라잡지 못하는 증상을 보일 수 있다.\n\n## G1과 비교해서 이해하기\n\nG1도 region 기반이고 concurrent marking을 사용하며, 대부분의 서버에서 좋은 기본 선택이다. G1은 pause target을 기준으로 young collection과 mixed collection 작업량을 조절하고, remembered set과 write barrier를 통해 region 간 reference를 관리한다. 실무에서는 운영 경험과 tooling이 풍부하고 throughput도 안정적이다.\n\nZGC는 같은 문제를 다른 방향으로 민다.\n\n| 관점 | G1 | ZGC |\n|---|---|---|\n| 기본 목표 | 균형 잡힌 throughput과 pause 제어 | 매우 짧은 pause와 tail latency 완화 |\n| compaction 비용 | evacuation 작업이 pause에 더 보이기 쉽다 | relocation과 remapping을 concurrent하게 분산한다 |\n| barrier 감각 | write barrier, remembered set, card marking이 중요 | load barrier와 colored pointer metadata가 핵심이다 |\n| 운영 판단 | 일반 서버의 기본값으로 시작하기 쉽다 | p99/p999 pause가 실제 병목일 때 검토한다 |\n| 비용 | pause가 커질 수 있지만 단순하고 익숙하다 | CPU, memory headroom, barrier overhead를 더 봐야 한다 |\n\n따라서 “ZGC가 G1보다 항상 빠르다”는 답은 틀리다. ZGC는 pause를 줄이는 쪽에 강하고, 그 대가로 concurrent GC thread, barrier, metadata, extra heap headroom 같은 비용을 지불한다. throughput batch나 CPU bound 서비스에서는 G1이 더 단순하고 충분할 수 있다. 반대로 큰 heap의 interactive API에서 GC pause가 p99를 직접 흔든다면 ZGC 검토 가치가 커진다.\n\n## 현재 JDK에서 조심할 표현\n\nZGC는 JDK 15 이후 production collector로 다뤄졌고, 최신 JDK 계열에서는 generational ZGC가 중심 경로가 되었다. 다만 운영 답변에서는 “내가 쓰는 JDK에서 어떤 ZGC mode가 기본인지”, “metric 이름과 memory pool 이름이 어떻게 보이는지”, “해당 배포판이 어떤 flag를 지원하는지”를 확인해야 한다. 예전 글의 non-generational ZGC 옵션이나 로그 예시를 그대로 외워 적용하면 틀릴 수 있다.\n\n이 문서의 mental model은 generational 여부와 무관하게 중요하다. ZGC를 저지연으로 만드는 큰 축은 still concurrent marking, concurrent relocation/remapping, colored pointers, load barriers다. 다만 young/old generation을 어떻게 나누고 어떤 phase 이름으로 기록하는지는 JDK 버전에 따라 달라질 수 있다.\n\n## 언제 ZGC를 고르지 않을까\n\nZGC가 좋은 기술이라는 말과 모든 서비스에 좋은 선택이라는 말은 다르다. 다음 상황에서는 먼저 다른 원인을 본다.\n\n- 작은 heap이고 GC pause가 사용자 latency를 거의 흔들지 않는다.\n- throughput batch라서 total work per second가 pause보다 더 중요하다.\n- CPU headroom이 낮아 concurrent GC thread와 barrier 비용을 감당하기 어렵다.\n- allocation rate가 너무 높아 collector 변경보다 object churn 감소가 먼저다.\n- memory headroom이 작아 relocation과 concurrent cycle 운영 여유가 부족하다.\n- 운영 팀이 G1 로그와 tooling에는 익숙하지만 ZGC metric 해석 경험이 없다.\n- 문제 원인이 Java heap이 아니라 native memory, lock contention, downstream timeout, database latency다.\n\n특히 “GC를 ZGC로 바꾸면 allocation hot spot이 사라진다”는 오해를 피해야 한다. ZGC는 객체를 덜 만들게 해 주지 않는다. DTO copy, JSON serialization, logging 문자열 생성, large buffer per request 같은 hot allocation path는 여전히 CPU와 memory bandwidth를 쓴다. 단지 그 비용이 긴 pause로 드러나는 방식을 줄일 수 있을 뿐이다.\n\n## 관측할 지표\n\nZGC 실험은 collector flag만 바꿔 끝내면 안 된다. 같은 traffic replay나 canary에서 다음을 비교한다.\n\n- request p95, p99, p999 latency와 GC pause timestamp overlap\n- allocation rate bytes/s와 request당 allocation bytes\n- live set, heap headroom, allocation stall 또는 allocation failure 신호\n- GC cycle 빈도, concurrent phase duration, CPU 사용률\n- application throughput과 error/timeout rate\n- container RSS, native memory, memory limit 여유\n\n성공 기준은 “pause 로그가 짧다” 하나가 아니다. 사용자 tail latency가 줄고, CPU와 memory 비용이 허용 범위이며, throughput이나 timeout이 악화되지 않아야 한다.\n\n## 흔한 오해 정리\n\n- ZGC는 pause-free GC가 아니다. 짧은 stop-the-world 구간과 safepoint는 여전히 존재할 수 있다.\n- colored pointer는 Java 객체의 type tag가 아니다. GC state를 표현하기 위한 runtime metadata 모델이다.\n- load barrier는 공짜가 아니다. pause를 줄이는 대신 읽기 경로와 runtime 보정 비용을 만든다.\n- concurrent relocation은 객체 이동이 없다는 뜻이 아니다. 오히려 compacting을 하되 application과 겹쳐 수행한다.\n- ZGC는 memory leak을 고치지 않는다. reachable object는 어떤 collector에서도 살아남는다.\n- G1을 모르면 ZGC를 잘 설명하기 어렵다. 둘 다 어떤 비용을 pause, throughput, CPU, memory headroom 중 어디에 배치하느냐의 차이다.\n\n## 면접 답변 뼈대\n\nZGC는 low-pause compacting GC입니다. reference에 GC 상태를 표현하는 colored pointer 개념을 쓰고, object reference를 읽을 때 load barrier가 상태를 확인합니다. 객체가 concurrent relocation으로 새 위치에 복사된 뒤에도 old reference가 남아 있을 수 있는데, load barrier가 forwarding 정보를 따라 새 reference로 보정해서 application thread가 계속 실행될 수 있습니다. 그래서 marking, relocation, remapping의 대부분을 concurrent하게 돌리고, 긴 STW pause를 줄입니다. 대신 CPU, barrier overhead, memory headroom, allocation rate를 봐야 하며, G1보다 항상 빠른 선택은 아닙니다.\n\n## 꼬리질문\n\n> Q: ZGC에서 colored pointer와 load barrier는 각각 무슨 역할인가요?\n> 핵심: colored pointer는 reference의 GC 상태 표현이고, load barrier는 reference read 시점에 그 상태를 확인해 안전한 reference로 보정하는 장치다.\n\n> Q: 객체를 옮기는데 application thread가 계속 달리면 stale reference는 어떻게 처리하나요?\n> 핵심: forwarding/remapping 정보를 load barrier가 사용해 old reference를 새 위치 reference로 보정한다.\n\n> Q: G1 대신 ZGC를 선택할 기준은 무엇인가요?\n> 핵심: 평균 throughput보다 p99/p999 pause가 실제 병목인지, CPU와 heap headroom 비용을 감당할 수 있는지부터 본다.\n\n## 한 줄 정리\n\nZGC의 colored pointer와 load barrier는 concurrent relocation을 안전하게 만드는 장치이며, ZGC 선택은 “pause를 줄이는 대신 concurrent work와 barrier 비용을 받아들일 것인가”라는 운영 판단이다.\n",
+  "aliases": [
+    "ZGC colored pointers",
+    "ZGC load barrier",
+    "concurrent relocation ZGC",
+    "ZGC remapping",
+    "ZGC low pause design",
+    "ZGC 색깔 포인터",
+    "ZGC 로드 배리어",
+    "ZGC 동시 재배치",
+    "ZGC와 G1 차이",
+    "저지연 GC 포인터 배리어"
+  ],
+  "expected_queries": [
+    "ZGC colored pointer랑 load barrier가 왜 low pause에 필요한지 설명해줘",
+    "ZGC는 객체를 옮기는데 애플리케이션 스레드가 어떻게 계속 돌아?",
+    "ZGC load barrier가 뭐야?",
+    "colored pointer가 뭐야?",
+    "G1 대신 ZGC를 선택하면 concurrent relocation 비용과 p99 latency를 어떻게 비교해야 해?"
+  ],
+  "symptoms": [
+    "ZGC를 pause가 전혀 없는 GC로 설명하고 safepoint, barrier overhead, CPU 비용을 빼먹어",
+    "colored pointer를 Java 타입 태그나 정확한 bit 암기 문제로만 이해해 load barrier와 연결하지 못해",
+    "G1에서 ZGC로 바꾸면 allocation hot spot이나 memory leak이 자동으로 사라진다고 기대해"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/g1-vs-zgc",
+      "language/jvm-gc-jmm-overview"
+    ],
+    "next_docs": [
+      "language/gc-allocation-rate-symptom-router",
+      "language/jfr-jmc-performance-playbook"
+    ],
+    "confusable_with": [
+      "language/g1-vs-zgc",
+      "language/g1-string-deduplication-heap-latency-chooser",
+      "language/gc-allocation-rate-symptom-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch166",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch166-worker-e"
+      }
+    ]
+  }
+}
