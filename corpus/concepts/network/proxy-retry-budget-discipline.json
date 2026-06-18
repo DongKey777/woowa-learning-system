@@ -6,33 +6,18 @@
   "summary": "이 문서는 운영 학습자가 장애 순간 프록시와 애플리케이션의 재시도가 복구인지 증폭인지 판단하고 제한 규칙을 이해하도록 기초를 잡는 primer다. 실패할수록 더 느려짐, 여러 계층이 동시에 다시 보냄, 잠깐 흔들린 호출만 제한적으로 살리기, 멱등 요청만 조심해서 재전송하기, 복구 시도가 트래픽 폭증으로 번지는 장면 같은 자연어 paraphrase가 본 문서의 핵심 개념에 매핑된다.",
   "body_markdown": "# Proxy Retry Budget Discipline\n\n> 한 줄 요약: retry budget은 프록시와 앱이 실패를 얼마나 재시도할지 정하는 안전장치로, 예산을 넘기면 복구가 아니라 증폭이 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [ALB, ELB Retry Amplification, Proxy Chain](./alb-elb-retry-amplification-proxy-chain.md)\n> - [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [TCP Reset Storms, Idle Reuse, Stale Sockets](./tcp-reset-storms-idle-reuse-stale-sockets.md)\n> - [gRPC Deadlines, Cancellation Propagation](./grpc-deadlines-cancellation-propagation.md)\n> - [Retry Storm Containment, Concurrency Limiter, Load Shedding](./retry-storm-containment-concurrency-limiter-load-shedding.md)\n> - [Spring MVC Async Dispatch with `Callable` / `DeferredResult`](../spring/spring-mvc-async-deferredresult-callable-dispatch.md)\n\nretrieval-anchor-keywords: retry budget, proxy retry, budget exhaustion, backoff, jitter, amplification control, idempotency, upstream failover, request storm, retry budget 의미, exponential backoff + jitter, retry amplification 방어, nested retry 위험, timeout budget propagation, proxy + app 둘 다 retry 위험, circuit breaker + retry 조합, load shedding 시점, concurrency limiter 활용\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로 보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한 줄 정리)\n\n</details>\n\n## 핵심 개념\n\nretry budget은 일정 시간이나 요청 수 안에서 재시도를 제한하는 규칙이다.\n\n- proxy가 마음대로 무한 retry하지 않게 한다\n- app retry와 합쳐져 폭증하지 않게 한다\n- 실패를 빨리 숨기지 않고, 제한된 범위에서만 복구한다\n\n### Retrieval Anchors\n\n- `retry budget`\n- `proxy retry`\n- `budget exhaustion`\n- `backoff`\n- `jitter`\n- `amplification control`\n- `idempotency`\n- `upstream failover`\n- `request storm`\n\n## 흔한 오해\n\n- retry budget은 retry를 더 잘하게 만드는 옵션이 아니라, 장애 때 **얼마나 덜 보낼지** 정하는 제한이다.\n- proxy retry가 있으면 app retry가 필요 없다는 뜻도 아니고, 둘을 독립적으로 켜도 된다는 뜻도 아니다. 합산 attempt가 예산 안에 있어야 한다.\n- 모든 `5xx`가 안전한 retry 대상은 아니다. method, idempotency key, side effect 여부를 같이 본다.\n- backoff만 있으면 충분하지 않다. jitter, deadline propagation, budget exhaustion 뒤 fail-fast 정책이 같이 있어야 증폭을 줄인다.\n\n## 깊이 들어가기\n\n### 1. 왜 budget이 필요한가\n\nretry는 좋게 보면 복구, 나쁘게 보면 증폭이다.\n\n- 잠깐의 네트워크 흔들림은 흡수할 수 있다\n- 하지만 여러 계층이 동시에 retry하면 위험하다\n\n### 2. 프록시가 왜 위험한가\n\n프록시는 많은 요청을 한 번에 받는다.\n\n- LB에서 retry\n- gateway에서 retry\n- app client에서 retry\n\n이 셋이 겹치면 예산이 쉽게 바닥난다.\n\n### 3. budget을 어디에 두나\n\n- per-request budget\n- per-connection budget\n- per-minute or per-cluster budget\n\n운영에서는 보통 요청과 시간 두 축을 함께 본다.\n\n### 4. idempotency가 왜 같이 나오나\n\nretry는 같은 요청을 다시 보낼 수 있다.\n\n- 멱등 요청이면 비교적 안전하다\n- 비멱등 요청이면 부작용이 커질 수 있다\n\n### 5. budget이 바닥나면\n\nretry를 멈추고 실패를 드러내는 편이 낫다.\n\n- tail latency를 지킨다\n- downstream을 보호한다\n- circuit breaker와 함께 작동한다\n\n## mental model과 failure matrix\n\nretry budget은 \"친절하게 한 번 더 해보기\"가 아니라 전체 시스템의 실패 비용을 나눠 쓰는 회계 장부에 가깝다. 한 hop이 예산을 모르면 다음 hop의 retry까지 합쳐져 요청 수가 곱으로 늘어난다.\n\n| 실패 모드 | triage 질문 | validation 기준 | wrong bucket |\n|---|---|---|---|\n| nested retry amplification | proxy, gateway, app client가 각각 몇 번 retry하나 | 한 원본 요청의 total attempt가 budget 안에 있다 | 단순 upstream 불안정으로만 보기 |\n| non-idempotent retry | 재전송해도 부작용이 한 번인가 | idempotency key나 method policy가 있다 | 모든 `5xx`를 재시도 가능으로 보기 |\n| timeout budget 무시 | retry 후 남은 deadline이 충분한가 | downstream deadline이 원본 budget을 넘지 않는다 | retry count만 제한하면 충분하다고 보기 |\n| synchronized retry | backoff와 jitter가 있는가 | retry burst가 peak traffic을 더 키우지 않는다 | backoff 없는 즉시 재시도 |\n| budget exhausted | 더 보내지 않고 실패를 드러내나 | load shedding/circuit breaker와 연결된다 | 예산 초과 후에도 fallback retry |\n\nretry success rate가 높다는 metric은 transient failure를 일부 흡수했다는 것을 **suggest**한다. 하지만 전체 요청 증폭률, downstream saturation, user-visible latency를 같이 보지 않으면 \"성공률은 올랐지만 장애는 커진\" 상태를 놓칠 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 장애가 커질수록 retry가 줄어들지 않는다\n\nbudget이 없거나 너무 넓을 수 있다.\n\n### 시나리오 2: proxy와 app이 서로 retry한다\n\n한 요청이 여러 번 증폭된다.\n\n### 시나리오 3: 멱등하지 않은 요청이 두 번 처리됐다\n\nretry 허용 범위가 잘못됐을 수 있다.\n\n## 코드로 보기\n\n### 정책 감각\n\n```text\nmax retries: limited\nbudget window: bounded\nretry only if idempotent\nrespect deadline\n```\n\n### 관찰 포인트\n\n```bash\ncurl -w 'time_total=%{time_total}\\n' -o /dev/null -s https://api.example.com\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 넉넉한 retry budget | transient failure를 흡수한다 | 폭증 위험이 있다 | 안정망이 있을 때 |\n| 엄격한 retry budget | 시스템 보호가 된다 | 일부 실패를 사용자에게 드러낸다 | 장애 억제 우선 |\n| no retry | 단순하다 | 작은 흔들림도 실패로 보인다 | 매우 민감한 작업 |\n\n핵심은 retry를 없애는 것이 아니라 **예산 안에서만 허용하는 것**이다.\n\n## 꼬리질문\n\n> Q: retry budget은 왜 필요한가요?\n> 핵심: 여러 계층의 retry가 합쳐져 폭증하는 것을 막기 위해서다.\n\n> Q: idempotency는 왜 중요하나요?\n> 핵심: 같은 요청을 다시 보내도 안전한지 판단해야 하기 때문이다.\n\n> Q: budget이 다 쓰이면 어떻게 하나요?\n> 핵심: 더 재시도하지 말고 실패를 드러내 downstream을 보호한다.\n\n## 한 줄 정리\n\nretry budget은 proxy와 app의 재시도를 제한하는 안전장치라서, 예산을 넘기면 복구가 아니라 트래픽 증폭이 된다.\n",
   "aliases": [
+    "재시도 폭주",
+    "지수 백오프",
+    "지터",
+    "재시도 증폭",
+    "타임아웃 예산 전파",
     "retry budget",
     "proxy retry",
     "budget exhaustion",
     "backoff",
     "jitter",
     "amplification control",
-    "idempotency",
-    "upstream failover",
-    "request storm",
-    "retry storm",
-    "재시도 폭주",
-    "exponential backoff",
-    "지수 백오프",
-    "지터",
-    "full jitter",
-    "equal jitter",
-    "decorrelated jitter",
-    "retry amplification",
-    "재시도 증폭",
-    "timeout budget propagation",
-    "타임아웃 예산 전파",
-    "nested retry",
-    "중첩 재시도",
-    "circuit breaker integration",
-    "load shedding",
-    "로드 셰딩",
-    "concurrency limiter"
+    "idempotency"
   ],
   "expected_queries": [
     "proxy retry budget은 왜 필요하고 어디에서 소진되나요?",
@@ -68,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/proxy-retry-budget-discipline.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }

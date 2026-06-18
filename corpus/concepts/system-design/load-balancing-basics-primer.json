@@ -6,30 +6,18 @@
   "summary": "로드 밸런서는 여러 백엔드 서버 앞에 서서 들어오는 요청을 \"어떤 규칙에 따라 분산\"시켜 단일 장애점 제거와 수평 확장을 가능하게 한다.",
   "body_markdown": "# Load Balancing 기초 primer — 분산의 첫 관문\n\n> 한 줄 요약: 로드 밸런서는 여러 백엔드 서버 앞에 서서 들어오는 요청을\n> \"어떤 규칙에 따라 분산\"시켜 단일 장애점 제거와 수평 확장을 가능하게 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Stateless vs Stateful 기초](./stateless-vs-stateful-basics.md)\n- [System Design Foundations](./system-design-foundations.md)\n- [Stateless Backend, Cache, Database, Queue 스타터 팩](./stateless-backend-cache-database-queue-starter-pack.md)\n- [HTTP 요청-응답 기본 흐름](../network/http-request-response-basics-url-dns-tcp-tls-keepalive.md)\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [system-design 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: load balancing primer, 로드 밸런서 입문, Round Robin vs Least Connections, Consistent Hashing 일관성 해싱, Sticky Session 세션 고정, L4 vs L7 load balancer, health check 헬스 체크, weighted round robin, IP hash, backend pool, 수평 확장 horizontal scaling, HAProxy NGINX 첫 선택, AWS ALB NLB\n\n## 먼저 멘탈모델\n\n서버 1대로 처리할 수 있는 요청량은 한정돼 있다. 트래픽이 증가하면 두 가지 길이 있다.\n\n- **Vertical scaling (스케일 업)**: 한 서버를 더 큰 머신으로 교체\n- **Horizontal scaling (스케일 아웃)**: 같은 역할의 서버를 여러 대 두기\n\n수평 확장은 \"같은 일을 하는 N개 서버\" 앞에 **로드 밸런서**를 두고, 클라이언트\n요청을 어떤 한 서버로 보내는 구조다.\n\n```\n                  ┌─→ Server A\nClient → LB ──────┼─→ Server B\n                  └─→ Server C\n```\n\n로드 밸런서가 해결하는 3가지:\n\n1. **부하 분산**: 한 서버에 몰림 방지\n2. **단일 장애점 제거**: 한 서버 죽어도 다른 서버로 계속 서비스\n3. **무중단 배포**: 한 서버씩 빼서 업데이트 후 재투입\n\n## L4 vs L7 — 어느 layer에서 분산하는가\n\nOSI 모델에서 두 layer가 있다.\n\n| 차이 | L4 (Transport Layer) | L7 (Application Layer) |\n|---|---|---|\n| 보는 정보 | TCP/UDP 패킷, port, IP | HTTP 헤더, URL, cookie, body |\n| 분산 기준 | IP, port 단위 | URL path, host, header, content |\n| 속도 | 매우 빠름 (패킷만 보고 forward) | 조금 느림 (HTTP parse) |\n| 기능 | 단순 forward | path-based routing, header rewrite, SSL termination, WAF |\n| 예시 | AWS NLB, LVS | AWS ALB, NGINX, HAProxy, CloudFlare |\n\n신입 권장:\n- **API/웹 서비스**: L7 (NGINX 또는 ALB) — URL/host 기반 routing 가능\n- **TCP 직접 통신 또는 매우 높은 throughput**: L4 (NLB) — 매우 빠름\n\n## 5가지 분산 알고리즘\n\n### 1. Round Robin (순환)\n\n차례대로 한 명씩 보냄.\n\n```\nreq 1 → A\nreq 2 → B\nreq 3 → C\nreq 4 → A\nreq 5 → B\n...\n```\n\n**장점**: 단순, 모든 서버 균등\n**단점**: 서버 성능이나 현재 부하 무시\n**언제**: 서버가 모두 동일 성능 + 요청이 균등 처리 시간\n\n### 2. Weighted Round Robin (가중 순환)\n\n서버마다 가중치를 두고 비례 분산.\n\n```\nA (weight 3), B (weight 1)\n→ A A A B A A A B ...\n```\n\n**언제**: 서버 성능이 다를 때 (큰 서버에 더 많이)\n\n### 3. Least Connections (현재 연결 적은 곳으로)\n\n지금 처리 중인 연결 수가 가장 적은 서버에 보냄.\n\n**장점**: 요청 처리 시간이 가변적일 때 더 균등\n**단점**: 연결 수 추적 비용 (단순한 LB에선 부담)\n**언제**: long-running 요청(파일 업로드, streaming)이 많을 때\n\n### 4. IP Hash (Source IP 기반)\n\n클라이언트 IP를 hash해서 같은 IP는 항상 같은 서버.\n\n```\nhash(client_ip) % N → server index\n```\n\n**장점**: sticky session 자동 (같은 IP는 같은 서버)\n**단점**: NAT 뒤 다수 클라이언트가 한 IP로 보이면 분산 안 됨, 노드 추가/제거 시 대부분 재배치\n\n### 5. Consistent Hashing (일관성 해싱)\n\n서버와 키를 같은 원형 hash space에 매핑.\n\n```\nhash space (원형): 0 ────────── 2^32-1\nservers: A(at 0.1), B(at 0.4), C(at 0.7)\nkeys: k1(at 0.2) → 다음 서버 B\n      k2(at 0.5) → 다음 서버 C\n      k3(at 0.8) → 다음 서버 A (wrap)\n```\n\n**핵심 장점**: 노드 추가/제거 시 **재배치되는 키가 1/N만**.\n- 일반 hash mod N은 노드 추가 시 **거의 모든 키가 재배치** (대형 cache invalidation)\n- Consistent hashing은 인접 구간만 재배치\n\n**언제**:\n- 분산 캐시 (Redis Cluster, Memcached 클러스터)\n- DB sharding\n- 노드가 자주 추가/제거되는 환경\n\n상세는 [Cache 기초 primer](./cache-basics-primer.md)와 [Distributed Cache Design](./distributed-cache-design.md).\n\n## Sticky Session (Session Affinity)\n\n같은 클라이언트의 모든 요청을 항상 **같은 서버**에 보내는 것.\n\n```\nclient X → 항상 Server A\nclient Y → 항상 Server B\n```\n\n구현:\n- IP Hash\n- Cookie-based (LB가 cookie 심어서 \"이 cookie는 server A로\")\n\n**장점**: 세션 데이터를 서버 메모리에 두면 그대로 작동\n**단점**:\n- 서버가 죽으면 그 세션 다 잃음\n- 노드 추가/제거 시 분산 깨짐\n- 한 서버에 long-lived client 몰리면 부하 불균형\n\n**대안 (Stateless 패턴)**:\n- 세션 데이터를 Redis 같은 중앙에 저장\n- 어떤 서버로 가도 동일 세션 조회 가능 → Sticky 불필요\n\n신입 권장: **Stateless로 시작**. Sticky session은 마지막 수단.\n\n상세: [Stateless vs Stateful 기초](./stateless-vs-stateful-basics.md)\n\n## 헬스 체크 (Health Check)\n\nLB가 backend 서버들을 주기적으로 체크해서 죽은 노드는 풀에서 제외.\n\n### 두 가지 체크 방식\n\n**Active health check**:\n- LB가 주기적으로 HTTP request 보냄 (`GET /health`)\n- 5초마다 + 3번 연속 fail이면 unhealthy\n- 단순, 가장 흔함\n\n**Passive health check**:\n- 실제 클라이언트 트래픽 결과 관찰 (5xx, timeout 등)\n- LB 부하 적지만 첫 fail까지 client에 노출\n\n### 헬스 체크 endpoint 설계\n\n```java\n@GetMapping(\"/health\")\npublic ResponseEntity<?> health() {\n    if (db.ping() && cache.ping()) {\n        return ResponseEntity.ok(\"UP\");\n    }\n    return ResponseEntity.status(503).body(\"DOWN\");\n}\n```\n\n**주의**:\n- 너무 자주 (1초마다 등): 서버 부하 증가, 매 1초 미세한 hiccup이 unhealthy로 잡혀 의도치 않은 제외\n- 너무 드물게 (30초마다): 죽은 노드 발견 늦어져 client에 fail 노출\n- 균형: **5-10초 + 2-3번 fail tolerance**\n\n## 30초 분기표 — 어느 알고리즘?\n\n| 상황 | 권장 |\n|---|---|\n| 단순 웹 API, 모든 서버 동일 성능 | Round Robin |\n| 서버 성능 다름 (큰/작은 인스턴스 혼재) | Weighted Round Robin |\n| 요청 처리 시간 가변 (long-running) | Least Connections |\n| 분산 캐시 / sharding | Consistent Hashing |\n| 세션 데이터를 서버 메모리에 둠 | Sticky Session (IP Hash 또는 cookie) |\n| 위 모두 모르겠고 그냥 시작 | Round Robin + 헬스 체크 |\n\n## 자주 헷갈리는 지점\n\n### \"Round Robin이면 부하가 균등\"\n\nRound Robin은 **요청 수**만 균등화. 요청별 처리 시간이 다르면 (어떤 요청 100ms,\n어떤 요청 10초) 부하는 안 균등. 그런 경우 Least Connections가 더 나음.\n\n### \"Sticky Session을 쓰면 일관성 OK\"\n\nSticky만으로는 노드 다운 시 그 세션 다 잃음. **Stateless + 중앙 session store**가\n더 안전한 패턴.\n\n### \"Consistent Hashing이 모든 hash mod 보다 좋다\"\n\nConsistent Hashing은 노드 추가/제거 시 재배치 비용이 작음. 그러나:\n- 분산 균등도는 약간 떨어질 수 있음 (virtual nodes로 보완)\n- 구현 복잡도 증가\n- 노드가 거의 안 변하는 환경(고정 N대)에서는 단순 mod N이 더 단순하고 효율\n\n### \"L7이 L4보다 항상 좋다\"\n\nL7은 더 많은 기능 제공하지만:\n- TCP/UDP 직접 통신(WebSocket 일부 시나리오, gaming)에는 L7이 불필요\n- L7 SSL termination이 모든 환경에서 적절하진 않음\n\n### \"헬스 체크는 모든 의존성을 확인해야 한다\"\n\n`/health`에서 DB, cache, S3, 외부 API 다 ping하면:\n- 외부 API 잠시 느려지면 모든 서버가 unhealthy\n- 그래서 split:\n  - `/health` (LB가 보는): 자기 자신의 기본 작동\n  - `/ready` (Kubernetes readiness): 의존성 포함\n  - `/diagnostics`: 운영 디버깅용 상세\n\n## 빠른 확인 질문\n\n- Round Robin과 Least Connections 차이?  답: 요청 수 vs 현재 연결 수 기준\n- Consistent Hashing의 핵심 장점?  답: 노드 추가/제거 시 1/N만 재배치\n- Sticky Session의 위험?  답: 노드 다운 시 그 세션 다 잃음, 노드 추가/제거 시 분산 깨짐\n- L4와 L7 LB 차이?  답: L4는 TCP/IP 단위, L7은 HTTP 단위 (path, header, cookie 가능)\n- 헬스 체크 빈도 권장?  답: 5-10초 + 2-3번 fail tolerance\n\n## 한 줄 정리\n\n로드 밸런서는 단순한 분산 도구가 아니라 **분산 알고리즘 선택 + L4/L7 layer 결정 +\nSticky 여부 + 헬스 체크 정책**이 합쳐진 시스템 컴포넌트이며, 신입은 *Round Robin + L7 +\nStateless + 5-10초 헬스 체크*에서 시작해서 필요에 따라 확장한다.\n",
   "aliases": [
-    "load balancing primer",
-    "load balancer basics",
     "로드밸런서 입문",
     "로드밸런싱 기초",
     "부하 분산 기초",
+    "일관성 해싱",
+    "세션 고정",
+    "load balancing primer",
+    "load balancer basics",
     "LB primer",
     "L4 vs L7 load balancer",
     "round robin",
     "least connections",
-    "consistent hashing",
-    "일관성 해싱",
-    "sticky session",
-    "세션 고정",
-    "session affinity",
-    "weighted round robin",
-    "IP hash",
-    "health check",
-    "헬스 체크",
-    "backend pool",
-    "백엔드 풀",
-    "horizontal scaling 수평 확장",
-    "HAProxy NGINX 입문",
-    "AWS ALB Application Load Balancer",
-    "AWS NLB Network Load Balancer"
+    "consistent hashing"
   ],
   "expected_queries": [
     "로드 밸런싱은 왜 필요해? 어떤 문제를 해결해?",
@@ -70,8 +58,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/load-balancing-basics-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }

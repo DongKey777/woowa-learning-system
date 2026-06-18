@@ -6,21 +6,18 @@
   "summary": "알림을 눌렀는데 원문, 주문, 댓글 같은 source가 안 보일 때는 모두 \"stale\"로 뭉개지 말고, stale read, deleted source, authorization filtering, async projection lag를 먼저 갈라야 대응이 빨라진다.",
   "body_markdown": "# Notification Source Missing Decision Table\n\n> 한 줄 요약: 알림을 눌렀는데 원문, 주문, 댓글 같은 source가 안 보일 때는 모두 \"stale\"로 뭉개지 말고, stale read, deleted source, authorization filtering, async projection lag를 먼저 갈라야 대응이 빨라진다.\n\nretrieval-anchor-keywords: notification source missing decision table, notification click source missing, notification troubleshooting matrix, stale read vs deleted source vs authorization filtering, async projection lag after click, notification click 404 403, notification source gone, notification source hidden by authz, notification projection lag matrix, 알림 눌렀는데 원문 없음, 알림 클릭 후 404, 알림 클릭 후 권한 필터링, 알림 클릭 후 projection lag, beginner notification troubleshooting, notification source missing decision table basics\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Causal Consistency Notification Primer](./causal-consistency-notification-primer.md)\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Notification Badge vs Source Freshness Primer](./notification-badge-vs-source-freshness-primer.md)\n- [Trace Attribute Freshness / Read-Source Bridge](./trace-attribute-freshness-read-source-bridge.md)\n- [Tombstone Response Template and Consumer Guidance](../software-engineering/tombstone-response-template-and-consumer-guidance.md)\n\n---\n\n## 먼저 잡을 mental model\n\n알림을 눌렀는데 source가 안 보이면 초보자는 자주 이렇게 생각한다.\n\n> \"아직 반영이 안 됐나 보다.\"\n\n실무에서는 이 가정이 절반만 맞다.\n겉보기 증상은 비슷해도 원인은 네 갈래로 자주 나뉜다.\n\n| 분류 | 쉬운 말 | 핵심 질문 |\n|---|---|---|\n| stale read | 데이터는 있는데 내가 오래된 read path를 탔다 | \"다른 더 신선한 경로로 읽으면 보이나?\" |\n| deleted source | source가 실제로 지워졌거나 tombstone 상태다 | \"없어진 것이 맞나?\" |\n| authorization filtering | source는 있지만 이 사용자는 못 본다 | \"안 보이는 게 아니라 숨겨진 것인가?\" |\n| async projection lag | 알림은 왔지만 상세 read model이 아직 못 따라왔다 | \"이벤트는 도착했는데 projection만 늦나?\" |\n\n핵심은 `보이지 않는다 = stale read`로 바로 단정하지 않는 것이다.\n\n---\n\n## 빠른 구분표\n\n| 의심 원인 | 사용자 화면에서 자주 보이는 모습 | 서버/데이터 쪽 의미 | 먼저 볼 신호 | 첫 대응 |\n|---|---|---|---|---|\n| stale read | 새 댓글 알림을 눌렀는데 상세는 잠깐 옛값 또는 404, 새로고침/잠시 후 재시도하면 보임 | cache나 replica가 causal 기준선보다 뒤처짐 | `required_watermark`, `read.source`, cache reject, primary fallback | token/watermark 기준으로 cache/replica를 거절하고 더 신선한 경로로 fallback |\n| deleted source | 알림 row는 남아 있는데 들어가면 계속 `삭제됨`, `존재하지 않음`, `410` 비슷한 상태가 유지됨 | source가 soft delete, hard delete, tombstone 처리됨 | delete event, tombstone flag, `deleted_at`, `410/404` policy | \"지연\"으로 숨기지 말고 삭제 안내나 tombstone contract로 응답 |\n| authorization filtering | 보낸 사람은 있다고 하는데 현재 사용자만 못 봄, 계정/권한 바꾸면 보일 수 있음 | tenant scope, role, ownership 정책이 source를 가림 | `403/404` masking policy, authz deny reason, membership/version | stale 조사 전에 authz decision과 scope mismatch부터 확인 |\n| async projection lag | 알림 본문/배지는 떴지만 댓글 목록, 검색, 상세 read model이 잠깐 비어 있음 | source write는 끝났지만 query model, search index, inbox/detail projection이 늦음 | projection watermark, consumer lag, backlog depth | source-of-truth 확인 후 projection lag SLO와 backfill/retry 상태 점검 |\n\n이 표를 짧게 외우면 좋다.\n\n- `새로고침하면 보임`에 가깝다: stale read 가능성\n- `계속 안 보이고 삭제 안내가 맞다`: deleted source 가능성\n- `사람마다 다르게 보인다`: authorization filtering 가능성\n- `이벤트는 왔는데 읽기 모델만 비었다`: async projection lag 가능성\n\n---\n\n## 30초 진단 순서\n\n### 1. source-of-truth가 실제로 살아 있는지 먼저 본다\n\n제일 먼저 갈라야 하는 질문은 이것이다.\n\n> 원본이 정말 존재하는가?\n\n- 원본 DB나 canonical source에서 row가 살아 있으면 `deleted source`는 우선순위가 내려간다.\n- 원본이 이미 삭제되었거나 tombstone이면 `stale read`나 `projection lag`를 오래 파지 말아야 한다.\n\n### 2. 같은 사용자인지, 같은 권한인지 확인한다\n\nnotification sender/producer 문맥과 현재 viewer 권한이 다를 수 있다.\n\n- 승인 알림은 갔지만 현재 사용자는 그 승인 결과를 볼 tenant scope가 없을 수 있다.\n- support operator, delegated admin, role downgrade 뒤에는 \"있는데 못 보는\" 문제가 흔하다.\n\n즉 `404`처럼 보여도 실제 의미는 `authorization filtering`일 수 있다.\n\n### 3. 그다음에야 freshness를 본다\n\nsource가 살아 있고 권한도 맞다면 이제 stale 계열을 본다.\n\n- source detail만 늦으면 `stale read`\n- source는 살아 있는데 특정 projection/list/search만 늦으면 `async projection lag`\n\n초보자에게는 아래 구분이 가장 실용적이다.\n\n| 질문 | 더 가까운 원인 |\n|---|---|\n| source-of-truth 직접 조회는 보이는데 앱 경로만 안 보이나? | stale read 또는 projection lag |\n| source-of-truth에서도 이미 삭제 상태인가? | deleted source |\n| 관리자/다른 사용자로는 보이는데 현재 사용자만 안 보이나? | authorization filtering |\n| 상세 원본은 보이는데 목록/검색/카운트만 늦나? | async projection lag |\n\n---\n\n## 예시로 보는 차이\n\n### 예시 1. 새 댓글 알림을 눌렀는데 2초 뒤엔 보인다\n\n- 가장 흔한 해석: stale read\n- 이유: 댓글 source는 이미 있지만 replica/cache가 늦었다\n- 운영 포인트: notification causal token과 primary fallback 로그를 본다\n\n### 예시 2. 주문 취소 알림을 눌렀는데 계속 \"삭제된 주문\" 안내가 나온다\n\n- 가장 흔한 해석: deleted source 또는 tombstone contract\n- 이유: 원본이 실제로 archive/delete 정책을 탔다\n- 운영 포인트: 지연 문제처럼 재시도만 시키지 말고 삭제 상태를 명시한다\n\n### 예시 3. 승인 완료 알림을 눌렀는데 당사자에겐 보이지만 동료에겐 안 보인다\n\n- 가장 흔한 해석: authorization filtering\n- 이유: 같은 notification이라도 viewer별 scope가 다르다\n- 운영 포인트: `404` masking 여부와 deny reason을 같이 본다\n\n### 예시 4. 알림 row는 왔는데 댓글 목록 검색엔 아직 안 나온다\n\n- 가장 흔한 해석: async projection lag\n- 이유: inbox event는 반영됐지만 댓글 검색 index나 detail projection이 늦었다\n- 운영 포인트: projection consumer lag와 watermark를 본다\n\n---\n\n## 흔한 혼동\n\n- `404면 무조건 deleted source`라고 보면 안 된다. 보안상 `403` 대신 `404`를 주는 masking일 수 있다.\n- `알림이 왔으니 source도 무조건 보여야 한다`도 단정은 아니다. 알림 producer와 viewer 권한 모델이 다를 수 있다.\n- `projection lag면 source-of-truth도 늦다`는 오해가 많다. 보통은 source write는 끝났고 read model만 늦다.\n- `새로고침 후 보였으니 원인은 항상 stale read다`도 과하다. 일시적 authz cache skew나 projection catch-up일 수도 있다.\n\n---\n\n## 초보자용 운영 메모\n\n문제 분류를 빨리 하려면 trace/log vocabulary를 작게 고정하는 편이 좋다.\n\n| 남기면 좋은 필드 | 왜 유용한가 |\n|---|---|\n| `notification.id`, `source.id` | 어떤 알림과 원본을 비교 중인지 묶기 쉽다 |\n| `required_watermark`, `projection_watermark` | stale read와 projection lag를 가르는 기준이 된다 |\n| `read.source`, `read.decision`, `read.reason` | cache/replica/primary 판단을 짧게 본다 |\n| `authz.decision`, `deny.reason` | authorization filtering을 stale read와 분리한다 |\n| `source.deleted_state` | delete/tombstone 여부를 바로 확인한다 |\n\n이 문서의 핵심은 진단 순서 하나다.\n\n> 존재 여부 -> 권한 여부 -> freshness 여부\n\n이 순서를 지키면 notification click 뒤 \"안 보임\" 문제를 훨씬 덜 헷갈린다.\n\n---\n\n## 더 깊이 가려면\n\n- [Causal Consistency Notification Primer](./causal-consistency-notification-primer.md)\n- [Notification Causal Token Walkthrough](./notification-causal-token-walkthrough.md)\n- [Notification Badge vs Source Freshness Primer](./notification-badge-vs-source-freshness-primer.md)\n- [Trace Attribute Freshness / Read-Source Bridge](./trace-attribute-freshness-read-source-bridge.md)\n- [Tombstone Response Template and Consumer Guidance](../software-engineering/tombstone-response-template-and-consumer-guidance.md)\n\n## 한 줄 정리\n\n알림을 눌렀는데 원문, 주문, 댓글 같은 source가 안 보일 때는 모두 \"stale\"로 뭉개지 말고, stale read, deleted source, authorization filtering, async projection lag를 먼저 갈라야 대응이 빨라진다.\n",
   "aliases": [
+    "알림 눌렀는데 원문 없음",
+    "알림 클릭 후 404",
+    "알림 클릭 후 권한 필터링",
+    "알림 클릭 후 projection lag",
+    "Notification Source Missing Decision 개념",
     "notification source missing decision table",
     "notification click source missing",
     "notification troubleshooting matrix",
     "stale read vs deleted source vs authorization filtering",
     "async projection lag after click",
     "notification click 404 403",
-    "notification source gone",
-    "notification source hidden by authz",
-    "notification projection lag matrix",
-    "알림 눌렀는데 원문 없음",
-    "알림 클릭 후 404",
-    "알림 클릭 후 권한 필터링",
-    "알림 클릭 후 projection lag",
-    "beginner notification troubleshooting",
-    "notification source missing decision table basics"
+    "notification source gone"
   ],
   "expected_queries": [
     "알림 클릭했더니 상세 화면이 비어 있는데 어디부터 봐야 해?",
@@ -58,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/notification-source-missing-decision-table.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }

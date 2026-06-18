@@ -6,34 +6,18 @@
   "summary": "Redundancy(이중화)는 같은 역할을 하는 component를 N개 이상 두는 것이고, Failover(페일오버)는 그 중 하나가 죽었을 때 다른 component로 트래픽을 전환하는 것이다.",
   "body_markdown": "# Failover와 Redundancy primer — 단일 장애점 제거의 기초\n\n> 한 줄 요약: Redundancy(이중화)는 같은 역할을 하는 component를 N개 이상 두는 것이고,\n> Failover(페일오버)는 그 중 하나가 죽었을 때 다른 component로 트래픽을 전환하는 것이다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Stateless vs Stateful 기초](./stateless-vs-stateful-basics.md)\n- [System Design Foundations](./system-design-foundations.md)\n- [Stateless Backend, Cache, Database, Queue 스타터 팩](./stateless-backend-cache-database-queue-starter-pack.md)\n- [Load Balancing 기초 primer](./load-balancing-basics-primer.md)\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [Replica Lag와 Read-After-Write 전략](../database/replica-lag-read-after-write-strategies.md)\n- [system-design 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: failover primer, redundancy primer, 페일오버 기초, 이중화 기초, single point of failure SPOF 제거, Active-Passive vs Active-Active, Hot Warm Cold Standby, 자동 페일오버 트리거, split-brain 문제, RTO RPO 결정, replication primer, leader election quorum, 재해 복구 DR, 고가용성 입문\n\n## 먼저 멘탈모델\n\n시스템에 단 하나의 component가 죽으면 전체가 멈추는 곳을 **SPOF(Single Point Of\nFailure)**라 부른다. 이걸 제거하는 방법은 그 component를 **여럿(N+1, 2, ...)** 두고,\n하나 죽어도 다른 게 일을 받게 하는 것이다.\n\n```\nSPOF 시스템:                안전 시스템:\nClient → Server             Client → LB ──→ Server A\n         ↓                            └──→ Server B\n        DB                                 (둘 다 동일 역할)\n       (SPOF)\n```\n\n핵심:\n- **Redundancy**: 같은 역할 component를 여럿 (구조)\n- **Failover**: 하나 죽으면 다른 게 받음 (동작)\n- 둘이 결합되어야 SPOF가 진짜로 제거됨\n\n## 어디에 SPOF가 있나 — 신입이 자주 놓치는 SPOF\n\n1. **DB 단일 인스턴스**: DB 죽으면 서비스 죽음 → DB replica 필요\n2. **단일 web 서버**: 그 서버 죽으면 끝 → 다중 web + LB\n3. **단일 LB**: LB도 죽을 수 있음 → DNS round robin 또는 LB 이중화\n4. **단일 메시지 큐 broker**: Kafka 1대만 → multi-broker cluster\n5. **단일 캐시 노드**: Redis 단일 노드 다운 → Redis replication 또는 cluster\n6. **DNS 단일 provider**: 한 DNS 회사 죽으면 도메인 해상 안 됨 → multi-provider\n7. **단일 region/AZ**: 한 region 장애 → multi-region (advanced)\n\n## Redundancy 패턴 — 3가지 기본 구조\n\n### 1. Active-Passive (Hot Standby)\n\nA가 트래픽 받고, B는 대기 (실시간 상태 동기화).\n\n```\nClient → A ──(replication)──→ B\n            ↑\n       A 죽으면 B로 전환\n```\n\n**장점**: 자원 절약 (B는 idle 시 sleep 비슷), 단순한 transition\n**단점**: B의 자원이 평소엔 놀고 있음, 페일오버 시점에 짧은 dead time\n**대표 사용처**: DB primary-replica, Redis master-slave\n\n### 2. Active-Active\n\nA, B 모두 동시에 트래픽 처리.\n\n```\nClient → LB ──→ A\n            └─→ B\n   (양쪽 모두 활성)\n```\n\n**장점**: 자원 100% 활용, 한 쪽 다운 시 다른 쪽이 계속 (LB가 routing 조정)\n**단점**: 데이터 정합성 복잡 (양쪽이 동시에 쓰면 conflict), 캐시 invalidation 더 어려움\n**대표 사용처**: stateless web 서버, NoSQL multi-master DB\n\n### 3. N+1 Redundancy\n\nN개로 트래픽 처리하고 +1 여분.\n\n```\nActive: A, B, C, D\nStandby: E (or pool of standby)\n```\n\n**장점**: 한 노드 다운 시 E가 채워 계속 처리, 자원 효율 (N개만큼만 active)\n**단점**: 동시에 2개 이상 다운 시 부족\n**대표 사용처**: 큰 시스템의 web 서버 pool, K8s replica\n\n## Hot vs Warm vs Cold Standby\n\n대기 상태의 \"준비 정도\"에 따른 분류.\n\n| 종류 | 상태 | 페일오버 시간 | 비용 |\n|---|---|---|---|\n| **Hot** | 실시간 상태 동기화, 트래픽 받을 준비 끝 | 수 초 | 매우 비쌈 |\n| **Warm** | 주기적 동기화, 시작은 빠르나 약간 준비 필요 | 수 분 | 중간 |\n| **Cold** | 꺼져 있음, 시작 후 데이터 복원 필요 | 수 시간 | 저렴 |\n\n**선택 기준**:\n- 매분 수만원 손실 → Hot\n- 매시간 수만원 손실 → Warm\n- 매시간 수천원 손실 + 비용 민감 → Cold (재해 복구 backup용)\n\n## 자동 vs 수동 Failover\n\n### 자동 페일오버 (Automatic)\n\nLB 또는 monitoring system이 health check로 죽은 노드 감지하면 즉시 트래픽 전환.\n\n**Trigger 신호**:\n- 헬스 체크 N회 연속 실패 (LB)\n- heartbeat timeout (cluster manager)\n- 노드 metric 임계치 초과 (CPU 100% 등)\n\n**장점**: 빠른 복구 (RTO 짧음)\n**단점**: false positive로 정상 노드를 죽일 위험 (flapping), split-brain 위험\n\n### 수동 페일오버 (Manual)\n\n운영자가 alert 받고 직접 전환.\n\n**장점**: 인간이 판단 → 잘못된 트리거 위험 적음\n**단점**: 새벽에 사람이 일어나야 함, RTO 길어짐 (수십 분~수 시간)\n\n**신입 권장**: 작은 시스템은 수동, 큰 시스템은 자동 + 신중한 health check 설계.\n\n## RTO와 RPO — 복구 목표 정량화\n\n### RTO (Recovery Time Objective)\n\n장애 발생 후 시스템이 다시 작동하기까지 **허용 가능한 최대 시간**.\n\n```\n12:00 장애 발생 → 12:05 복구 → RTO = 5분 만족 (목표가 10분이었다면)\n```\n\n### RPO (Recovery Point Objective)\n\n장애 발생 시 **허용 가능한 데이터 손실의 최대 시간 범위**.\n\n```\n12:00 장애. 마지막 backup은 11:55 → 5분 데이터 손실\nRPO = 5분 (목표가 1시간이었다면 만족)\n```\n\n### 결정 가이드\n\n| 서비스 | RTO | RPO |\n|---|---|---|\n| 결제 / 금융 | < 1분 | 0 (zero data loss) |\n| 일반 웹 서비스 | < 10분 | < 1분 |\n| 내부 도구 | < 1시간 | < 10분 |\n| 백업 / 아카이브 | < 24시간 | < 1시간 |\n\nRTO/RPO가 짧을수록 비용 ↑. 무한정 줄이지 말고 비즈니스가 감당할 수 있는 손실 기준으로 설정.\n\n## Split-brain — 분산 시스템의 함정\n\n두 노드가 서로를 죽었다고 오해해서 **둘 다 active**가 되는 상황.\n\n```\nA와 B 사이 네트워크 단절\nA: \"B 죽었네 → 내가 master\"\nB: \"A 죽었네 → 내가 master\"\n→ 클라이언트가 서로 다른 master를 보면서 데이터 정합성 파괴\n```\n\n### 해결 패턴\n\n**Quorum (정족수)**:\n- 3 노드 클러스터 + 과반수(2 이상)만 active 결정 가능\n- 1 노드만 격리되면 자기는 quorum 못 가져 → 자동 inactive\n\n```\n3 nodes (A, B, C) — quorum = 2\nA 격리 → A는 혼자라 inactive\nB + C 함께 → quorum 만족 → active\n```\n\n**Witness/Tiebreaker**:\n- 2 노드 시스템에 외부 witness 추가\n- 양쪽이 witness를 통해 누가 진짜 master인지 결정\n\n**Fencing**:\n- \"죽은 노드\"로 분류된 쪽을 강제로 격리 (예: STONITH — Shoot The Other Node In The Head)\n\n### Leader Election\n\n3 노드 이상에서 한 master를 선출하는 알고리즘.\n- Raft, Paxos (분산 합의 알고리즘)\n- ZooKeeper, etcd, Consul 같은 도구가 구현 제공\n- 신입은 직접 구현 X, 이런 도구 사용\n\n## Replication과의 관계\n\nReplication = 데이터를 여러 노드에 복사하는 것. Redundancy의 데이터 측면.\n\n**Synchronous (동기) replication**:\n- master가 replica에 쓰기 완료 응답 받고 client에 응답\n- 데이터 손실 0 (RPO = 0)\n- latency 증가\n\n**Asynchronous (비동기) replication**:\n- master가 즉시 client에 응답, replica는 나중에 복제\n- latency 빠름\n- 짧은 시간 데이터 손실 가능 (RPO > 0)\n\n대부분 사용: **준동기(semi-synchronous)** — replica 1개 이상이 받으면 OK.\n\n상세: [Replica Lag와 Read-After-Write 전략](../database/replica-lag-read-after-write-strategies.md)\n\n## 자주 헷갈리는 지점\n\n### \"이중화 = 안전\"\n\nActive-Passive에서 페일오버 자체가 실패하면 (자동 트리거 버그, replica 데이터 손실)\n오히려 둘 다 죽은 효과. **이중화는 페일오버 메커니즘 + 테스트가 함께 작동해야 안전**.\n\n신입 권장: 운영 환경에 들어가기 전에 **chaos engineering**으로 한 노드 일부러 죽여 보기.\n\n### \"Active-Active가 항상 좋다\"\n\nActive-Active는 강한 일관성을 보장하기 어렵다 (예: 양쪽이 동시에 같은 row 갱신).\n- conflict resolution 필요 (last-write-wins, CRDT 등)\n- 또는 sharding으로 충돌 회피\n\nDB는 보통 Active-Passive(primary-replica)가 안전. Active-Active는 stateless web 서버 같은 곳.\n\n### \"Hot Standby면 페일오버 즉시\"\n\nHot이라도 페일오버 시점에 **DNS TTL**, **LB 갱신**, **연결 재맺기** 등으로\n짧은 dead time (수 초~수십 초)이 발생.\n\n진짜 zero dead time은 LB 측이 active-active로 routing 조정해야 가능.\n\n### \"RPO = 0이 항상 가능\"\n\nRPO = 0은 동기 replication 필요 → latency 큰 증가 → throughput 감소.\n모든 시스템이 감당할 수 없음. 비즈니스 비용 / 손실 평가 후 결정해야 함.\n\n### \"Split-brain은 3 노드면 자동으로 안 일어남\"\n\n3 노드 quorum도 네트워크 partition에 따라 발생 가능. 신뢰성 위해서는 외부\narbiter (witness) 또는 fencing이 추가로 필요.\n\n## 빠른 확인 질문\n\n- SPOF의 정의?  답: 단 하나의 component가 죽으면 전체가 멈추는 곳\n- Active-Passive와 Active-Active 차이?  답: A-P는 한 쪽만 트래픽, A-A는 양쪽 동시\n- Hot vs Cold standby 차이?  답: 페일오버 시간 (Hot 수초, Cold 수시간)\n- RTO와 RPO 차이?  답: RTO는 복구 시간, RPO는 데이터 손실 허용 범위\n- Split-brain은?  답: 노드들이 서로를 죽었다고 오해해서 둘 다 active가 되는 상황\n- Quorum의 핵심?  답: 과반수 노드 합의 → 한 쪽 partition은 자동 inactive\n\n## 한 줄 정리\n\nFailover는 **Redundancy(이중화 구조) + Trigger(자동/수동) + Quorum(split-brain 방지) +\nReplication(데이터 일관성)**이 함께 작동해야 진짜로 SPOF를 제거하며, 신입은\nRTO/RPO 비즈니스 목표부터 정하고 *Active-Passive + Hot Standby + 자동 페일오버 +\n3-node Quorum*에서 시작하면 안전하다.\n",
   "aliases": [
-    "failover primer",
-    "redundancy primer",
     "페일오버 기초",
     "이중화 기초",
     "다중화 기초",
     "고가용성 입문",
+    "단일 장애점",
+    "failover primer",
+    "redundancy primer",
     "HA primer",
     "high availability basics",
     "SPOF",
     "single point of failure",
-    "단일 장애점",
-    "active-passive",
-    "active-active",
-    "hot standby",
-    "cold standby",
-    "warm standby",
-    "핫 스탠바이",
-    "콜드 스탠바이",
-    "failover automatic",
-    "자동 페일오버",
-    "RTO recovery time objective",
-    "RPO recovery point objective",
-    "복구 시간 목표",
-    "복구 시점 목표",
-    "replication primer",
-    "복제 입문",
-    "DR disaster recovery",
-    "재해 복구"
+    "active-passive"
   ],
   "expected_queries": [
     "단일 장애점 SPOF는 뭐고 어떻게 제거해야 해?",
@@ -70,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/failover-redundancy-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }

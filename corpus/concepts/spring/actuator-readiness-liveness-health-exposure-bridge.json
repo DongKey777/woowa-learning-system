@@ -6,17 +6,18 @@
   "summary": "이 문서는 Spring Boot Actuator health endpoint를 readiness, liveness, dependency health, exposure security 관점으로 나누어 보는 bridge다. Liveness는 process를 다시 시작해야 하는지, readiness는 traffic을 받아도 되는지, dependency health는 DB/Redis/외부 API 상태를 어떻게 반영할지에 가깝다. 운영 probe를 단순 상태 페이지로 보지 않고 배포, 장애 격리, 보안 노출과 함께 판단한다.",
   "body_markdown": "# Actuator Readiness, Liveness, Health Exposure Bridge\n\n## 핵심 구분\nLiveness probe는 애플리케이션 프로세스가 살아 있고 복구 불가능한 stuck 상태가 아닌지 본다. Readiness probe는 지금 traffic을 받아도 되는지 본다. Health indicator는 DB, Redis, disk, 외부 의존성 상태를 health tree에 반영한다. Endpoint exposure는 이 정보를 누가 볼 수 있는지 정하는 보안 경계다.\n\n## 빠른 분기\n배포 직후 warming이 끝나기 전 traffic을 막고 싶으면 readiness다. deadlock이나 fatal state로 process restart가 필요하면 liveness다. DB가 잠깐 느린데 모든 instance가 재시작되면 liveness에 dependency를 과하게 넣은 신호다. 민감한 detail이 외부에 노출되면 exposure/security 문제다.\n\n## 흔한 오해\n/readiness와 /liveness를 같은 DB health check로 만들면 장애 때 전체 pod가 재시작될 수 있다. Readiness는 traffic drain 도구이고, liveness는 restart 도구다.\n\n## 실전 시나리오\nDB가 잠깐 느려졌을 때 liveness가 실패해 pod가 재시작되면 장애가 커질 수 있다. 프로세스가 살아 있고 재시작으로 해결되지 않는 dependency 문제라면 liveness가 아니라 readiness에서 traffic만 빼는 편이 안전하다. 반대로 deadlock이나 event loop 정지처럼 프로세스 자체가 회복 불가능하면 liveness 실패가 맞을 수 있다. Health detail은 내부 운영자에게만 보이고 외부에는 노출하지 않도록 exposure와 show-details를 나눈다.\n\n```yaml\nmanagement:\n  endpoint:\n    health:\n      probes:\n        enabled: true\n      show-details: never\n  endpoints:\n    web:\n      exposure:\n        include: health,info,metrics\n```\n\n## 다음 행동\n- `/actuator/health/readiness`는 traffic 수용 가능성을, `/liveness`는 process 생존성을 표현하게 한다.\n- DB, Redis, 외부 API 장애를 liveness에 넣기 전에 재시작이 실제 복구인지 묻는다.\n- 운영망과 외부망의 actuator 노출 범위를 분리한다.\n\n## 확인 질문\n이 실패는 재시작해야 고쳐지는 프로세스 문제인가, 아니면 잠시 traffic에서 제외하면 되는 dependency 문제인가?\n\n## CS 배경: failure detector와 orchestration signal\nReadiness와 liveness는 distributed system에서 failure detector 신호에 가깝다. Liveness는 process가 계속 실행될 가치가 있는지 판단하고, readiness는 load balancer가 traffic을 보내도 되는지 판단한다. 둘을 섞으면 dependency 지연을 process crash처럼 다루거나, 죽은 process에 traffic을 계속 보내는 문제가 생긴다.\n\nHealth check는 완벽한 진실이 아니라 noisy signal이다. Timeout, threshold, consecutive failure count, graceful shutdown, connection draining이 함께 설계되어야 한다. Probe가 너무 민감하면 cascading restart를 만들고, 너무 둔하면 장애 감지가 늦어진다. Actuator는 이 신호를 노출하는 interface이고, 운영 정책은 orchestrator와 load balancer가 실행한다.\n\n## 깊게 볼 포인트\nProbe 설계는 latency와 availability에 직접 영향을 준다. Readiness가 dependency check를 너무 깊게 하면 잠깐 느린 DB 때문에 모든 instance가 traffic에서 빠질 수 있다. Liveness가 너무 공격적이면 GC pause나 일시 CPU spike를 process death로 오해해 restart storm을 만들 수 있다. Health endpoint 자체도 dependency가 되므로 빠르고 bounded timeout이어야 한다. Kubernetes에서는 startupProbe, readinessProbe, livenessProbe를 나눠 cold start와 steady-state를 다르게 다룬다. 운영자는 probe 실패율, restart count, endpoint latency, connection draining duration을 함께 봐야 한다.\n\n## 품질 관점\n프레임워크 annotation 존재보다 실제 proxy/filter/transaction/runtime boundary를 통합 테스트로 확인한다. 이 문서의 답변 품질은 `Actuator Readiness, Liveness, Health Exposure Bridge`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p95_ms, advisor_or_filter_order, transaction_duration_ms, error_mapping_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
   "aliases": [
+    "Spring Actuator 운영",
+    "readiness liveness 차이",
+    "헬스 체크 노출 보안",
+    "Actuator Readiness, Liveness, Health 개념",
+    "Actuator Readiness, Liveness, Health 정리",
     "Actuator readiness liveness",
     "Spring Boot health endpoint",
     "readiness probe liveness probe",
     "health exposure security",
-    "Spring Actuator 운영",
-    "readiness liveness 차이",
-    "헬스 체크 노출 보안",
     "traffic drain probe",
     "Kubernetes readiness liveness",
-    "dependency health indicator",
-    "Spring Boot Actuator readiness liveness health endpoint exposure security dependency health"
+    "dependency health indicator"
   ],
   "expected_queries": [
     "Spring Boot Actuator readiness와 liveness는 어떻게 구분해?",
@@ -55,7 +56,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -68,6 +69,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
       }
     ]
   }

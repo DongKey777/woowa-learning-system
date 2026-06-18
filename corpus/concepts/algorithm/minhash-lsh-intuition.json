@@ -6,16 +6,18 @@
   "summary": "MinHash는 집합의 Jaccard 유사도를 압축해 근사하고, LSH는 비슷한 항목끼리 같은 버킷에 들어가도록 설계하는 검색 기법이다.",
   "body_markdown": "# MinHash and LSH Intuition\n\n> 한 줄 요약: MinHash는 집합의 Jaccard 유사도를 압축해 근사하고, LSH는 비슷한 항목끼리 같은 버킷에 들어가도록 설계하는 검색 기법이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Rolling Hash / Rabin-Karp](./rolling-hash-rabin-karp.md)\n> - [HyperLogLog](../data-structure/hyperloglog.md)\n> - [Trie vs Radix vs Suffix Automaton](./trie-vs-radix-vs-suffix-automaton-comparison.md)\n\n> retrieval-anchor-keywords: minhash, lsh, locality sensitive hashing, jaccard similarity, near duplicate, approximate similarity, shingles, banding, candidate generation, similarity search\n\n## 핵심 개념\n\nMinHash와 LSH는 \"비슷한 것끼리 빨리 찾자\"는 문제를 푸는 대표적 근사 기법이다.\n\n- MinHash: 집합 유사도를 짧은 signature로 압축\n- LSH: 비슷한 signature가 같은 bucket에 들어갈 확률을 높임\n\n실무적으로는 near-duplicate 탐지, 문서 유사도, 아이템 후보 추천에 자주 연결된다.\n\n## 깊이 들어가기\n\n### 1. Jaccard 유사도\n\n두 집합의 유사도를 `교집합 / 합집합`으로 보는 것이 Jaccard다.\n\n문서의 shingle 집합이나 이벤트 집합을 비교할 때 자주 쓴다.\n\n예를 들어 문서를 5글자 shingle로 쪼개 set을 만들면 문장 순서 전체를 그대로 비교하지 않아도\n\"같은 조각을 얼마나 공유하는가\"를 볼 수 있다. 이때 중복 횟수보다 존재 여부가 중요하면\nJaccard가 자연스럽다. 반대로 단어 빈도, 의미 임베딩, 순서 유사도를 봐야 하는 문제라면\nMinHash만으로 답을 내기보다 TF-IDF, embedding retrieval, edit distance 같은 다른 표현을\n같이 검토해야 한다.\n\n### 2. MinHash가 하는 일\n\n집합을 해시 순서로 훑을 때 가장 먼저 만나는 원소를 기록하면,  \n그 signature가 Jaccard 유사도를 근사하는 성질을 가진다.\n\n즉 \"set의 전체를 보지 않고도 비슷한 정도를 추정\"할 수 있다.\n\n직관은 이렇다. 모든 shingle을 같은 random permutation 순서로 섞었다고 생각하면,\n두 집합에서 가장 먼저 등장하는 원소가 같을 확률은 두 집합의 Jaccard 유사도와 같다.\n현실에서는 진짜 permutation을 여러 개 저장하기 비싸므로 seed가 다른 hash function 여러 개로\n비슷한 효과를 낸다. signature 길이가 길수록 추정 분산은 줄지만 저장 공간과 계산량이 늘어난다.\n\n작은 예시:\n\n| 항목 | shingle set | signature 해석 |\n|---|---|---|\n| 문서 A | `{a,b,c,d}` | 여러 hash seed에서 가장 작은 shingle hash 목록 |\n| 문서 B | `{b,c,d,e}` | A와 같은 위치의 minhash가 많이 같으면 Jaccard가 높다고 추정 |\n| 문서 C | `{x,y,z}` | signature 일치가 거의 없으면 후보에서 빠질 가능성이 높음 |\n\n### 3. LSH가 하는 일\n\n비슷한 signature를 같은 후보 버킷에 넣는다.\n\nbanding 전략을 쓰면 비슷한 항목은 같은 bucket에 들어갈 가능성이 높아지고,  \n다른 항목은 후보에서 빠지기 쉬워진다.\n\nsignature를 `b`개 band로 나누고, 각 band는 `r`개 row를 가진다고 하자.\n두 항목의 실제 Jaccard 유사도를 `s`라고 근사하면, 한 band의 `r`개 row가 모두 같을 확률은\n대략 `s^r`이고, `b`개 band 중 적어도 하나가 같아 후보가 될 확률은 `1 - (1 - s^r)^b`다.\n\n| 조정 | 효과 | 비용 |\n|---|---|---|\n| `r` 증가 | 한 band가 match되기 어려워져 false positive가 줄어든다 | 낮은 유사도 후보는 잘 걸러지지만 recall도 줄 수 있다 |\n| `b` 증가 | 어떤 band든 하나만 맞으면 후보라 recall이 올라간다 | bucket 수와 후보 수가 늘어날 수 있다 |\n| signature 길이 증가 | 유사도 추정이 안정된다 | 저장/계산 비용 증가 |\n\n따라서 LSH는 \"정확한 top-k를 바로 반환\"하는 알고리즘이 아니라, expensive exact compare 전에\n후보 집합을 줄이는 장치로 설명하는 편이 안전하다.\n\n### 4. backend에서의 감각\n\n문서/상품/이벤트의 near-duplicate 탐지는 정제 전 단계에서 중요하다.\n\n- 검색 결과 중복 제거\n- 유사 상품 그룹화\n- 스팸/복제 콘텐츠 탐지\n\n## 실전 시나리오\n\n### 시나리오 1: near-duplicate 문서 찾기\n\n긴 텍스트를 정확히 비교하기 전에 MinHash로 후보를 줄일 수 있다.\n\n운영 파이프라인에서는 보통 `shingling -> MinHash signature 생성 -> LSH bucket 후보 생성 ->\n원문 또는 더 비싼 similarity로 재검증` 순서로 둔다. 마지막 재검증을 빼면 근사 후보를 정답으로\n오해해 false positive를 그대로 서비스에 노출하기 쉽다.\n\n### 시나리오 2: 추천 후보 생성\n\n유사한 아이템을 빠르게 모으는 후보 생성 단계에서 LSH가 잘 맞는다.\n\n### 시나리오 3: 오판\n\n정확한 문자열 equality를 원하는 경우에는 MinHash/LSH가 적합하지 않다.\n\n### 시나리오 4: 대규모 검색 전처리\n\n전체 공간을 다 비교하지 않고도 \"비슷할 가능성이 높은 것\"만 먼저 찾는다.\n\n여기서 \"가능성이 높은 것\"이라는 표현이 중요하다. LSH 후보에 없다고 해서 절대 비슷하지 않은\n것은 아니고, 후보에 있다고 해서 반드시 같은 것도 아니다. 목표 recall, 허용 가능한 후보 수,\n후속 exact 검증 비용을 함께 정해야 한다.\n\n## 코드로 보기\n\n```java\nimport java.util.Arrays;\n\npublic class MinHashNotes {\n    public int[] signature(int[] shingles, int[] seeds) {\n        int[] sig = new int[seeds.length];\n        Arrays.fill(sig, Integer.MAX_VALUE);\n        for (int shingle : shingles) {\n            for (int i = 0; i < seeds.length; i++) {\n                sig[i] = Math.min(sig[i], hash(shingle, seeds[i]));\n            }\n        }\n        return sig;\n    }\n\n    private int hash(int x, int seed) {\n        int h = x ^ (seed * 0x9e3779b9);\n        h ^= (h >>> 16);\n        return h;\n    }\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| MinHash | 유사도 근사가 가능하다 | 정확하지 않다 | Jaccard 근사 |\n| LSH | 비슷한 항목 후보를 줄인다 | 파라미터 튜닝이 필요하다 | 후보 생성 |\n| Full Compare | 정확하다 | 너무 비싸다 | 소규모 데이터 |\n| Embedding ANN | 의미 기반 유사도를 찾기 좋다 | Jaccard 중복률과 다른 신호다 | 의미 검색, 추천 후보 |\n\n## 튜닝과 검증 질문\n\n| 질문 | 좋은 답변 축 |\n|---|---|\n| near-duplicate threshold는 몇으로 둘 것인가 | labeled sample에서 precision/recall curve를 본다 |\n| banding 후보 수가 너무 많으면 무엇을 바꿀 것인가 | `r`을 늘리거나 preprocessing/shingle 정책을 조정한다 |\n| 비슷한 문서를 놓치면 어떤 지표가 흔들리는가 | recall, duplicate complaint, manual audit miss |\n| 후보가 너무 많으면 어디가 병목인가 | bucket skew, exact compare CPU, storage lookup |\n\n검증은 synthetic set만으로 끝내지 않는다. 실제 문서에서 boilerplate, 공통 footer,\n템플릿 문구가 shingle을 오염시키면 서로 다른 문서가 과하게 비슷해질 수 있다. 반대로 짧은 문서는\nshingle 수가 적어 signature가 불안정하므로 별도 threshold나 최소 길이 guard가 필요할 수 있다.\n\n## 꼬리질문\n\n> Q: MinHash는 무엇을 근사하나?\n> 의도: 유사도 유형을 아는지 확인\n> 핵심: Jaccard similarity다.\n\n> Q: LSH는 왜 필요한가?\n> 의도: 후보 생성과 정확 비교 분리를 아는지 확인\n> 핵심: 전체 비교를 줄이기 위해서다.\n\n> Q: band 수를 늘리면 어떤 일이 생기나?\n> 의도: recall/false positive trade-off를 아는지 확인\n> 핵심: 후보로 걸릴 확률이 올라가지만 bucket 조회와 후속 비교 후보도 늘 수 있다.\n\n> Q: 어디에 자주 쓰이나?\n> 의도: 실무 적용 감각 확인\n> 핵심: near-duplicate, 추천, 유사 문서 검색이다.\n\n## 한 줄 정리\n\nMinHash와 LSH는 집합 유사도와 near-duplicate 탐색을 대규모에서 근사적으로 빠르게 처리하는 기법이다.\n",
   "aliases": [
+    "유사 문서 탐색",
+    "MinHash and LSH Intuition 개념",
+    "MinHash and LSH Intuition 정리",
+    "MinHash and LSH Intuition 실수",
+    "MinHash and LSH Intuition 판단 기준",
     "minhash",
     "lsh",
     "locality sensitive hashing",
     "minhash lsh",
     "jaccard similarity approximation",
     "near duplicate detection",
-    "approximate similarity search",
-    "shingling",
-    "banding strategy",
-    "유사 문서 탐색"
+    "approximate similarity search"
   ],
   "expected_queries": [
     "MinHash는 Jaccard similarity를 어떻게 signature로 근사해?",
@@ -53,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/algorithm/minhash-lsh-intuition.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }

@@ -6,12 +6,18 @@
   "summary": "이 drill은 rolling hash와 randomized hashing의 collision risk, false positive, adversarial input, verify-after-hit 정책을 면접에서 설명하는 답변을 연습한다.",
   "body_markdown": "# Randomized Hashing Collision Risk Drill\n\n## 질문\n\n\"롤링 해시(rolling hash)는 충돌(collision)이 있을 수 있는데 문자열 비교 문제에서 써도 되나요?\"\n\n## 기대 답변 축\n\n해시가 같다는 것은 원본이 같다는 충분조건이 아니라 \"같을 후보\"라는 뜻이다. 정확성이 반드시 필요한 문제에서는 해시 일치 후 원문 비교를 하거나, 결정적 알고리즘(deterministic algorithm)인 KMP/Z algorithm을 선택한다. 롤링 해시를 계속 쓴다면 서로 다른 modulus/base 조합의 이중 해싱(double hashing)으로 충돌 가능성을 낮출 수 있다.\n\n면접 답변에서는 \"충돌 가능성이 0이다\"라고 말하지 않는 것이 중요하다. 대신 입력 규모, 공격적 입력(adversarial input) 가능성, 오답 허용 여부, 검증 단계 존재 여부를 기준으로 선택한다고 설명한다.\n\n## Collision risk를 계산하는 관점\n\n랜덤 해시의 위험은 \"한 번 비교하면 거의 안전\" 같은 단일 문장으로 끝나지 않는다. 비교 횟수가 늘면 위험도 같이 누적된다.\n\n| 상황 | 위험을 보는 방식 |\n|---|---|\n| 두 문자열 한 쌍 비교 | 균일한 m-bit fingerprint라면 대략 `1 / 2^m` 수준의 false match를 기대한다 |\n| 후보 비교를 Q번 수행 | union bound로 대략 `Q / 2^m`까지 누적 위험을 본다 |\n| N개 항목을 서로 비교/저장 | pair 수가 커져 birthday bound, 즉 대략 `N^2 / 2^(m+1)` 감각이 필요하다 |\n| double hashing | 두 해시가 독립에 가깝다는 전제에서 확률이 곱으로 줄어든다 |\n\n이 숫자는 직관을 위한 모델이다. 실제 rolling hash는 modulus, base, seed 선택과 입력 분포에 의존하므로 \"수학적으로 항상 균일하다\"고 과장하면 안 된다.\n\n## 안전한 표현\n\n무작위화 해싱(randomized hashing)의 충돌 확률은 해시 함수와 seed가 충분히 잘 선택되고 입력이 그 가정을 깨지 않는다는 전제에서 낮아진다. 프로덕션의 보안 경계나 돈이 걸린 정확성 판단에서는 \"확률적으로 낮다\"만으로 부족할 수 있다. 그때는 원문 비교, 강한 해시, DB unique constraint 같은 정확한 검증 계층을 둔다.\n\n안전한 면접 문장은 다음에 가깝다.\n\n> Rolling hash는 빠른 후보 필터입니다. hash가 같아도 collision 가능성이 있으니 정확성이 필요하면 원문 비교로 확정합니다. adversarial input이 가능하면 고정 base/modulus에 의존하지 않고 random seed, double hash, deterministic fallback, 또는 cryptographic hash와 별도 검증 계층을 함께 둡니다.\n\n## 약점 태그\n\n`collision-risk`, `false-positive`, `double-hashing`, `verify-after-hit`, `adversarial-input`\n\n## Adversarial input에서 달라지는 점\n\n고정된 base와 modulus를 코드에 박아두면, 공격자나 강한 테스트 데이터가 그 조합의 collision을 노릴 수 있다. 특히 해시 값만으로 \"동일 문자열\"을 확정하거나, 해시 버킷 충돌이 성능을 크게 흔드는 구조라면 문제가 커진다.\n\n대응은 목적에 따라 다르다.\n\n| 목적 | 더 안전한 선택 |\n|---|---|\n| 알고리즘 문제에서 정확 매칭 | KMP/Z algorithm 또는 hash hit 후 원문 비교 |\n| 많은 substring 후보 필터링 | runtime random base/seed + double hash + 최종 비교 |\n| 사용자 입력이 서비스 성능을 공격할 수 있음 | hash table의 collision hardening, per-process salt, 입력 크기 제한, timeout |\n| 보안 경계나 무결성 판단 | rolling hash 대신 SHA-256/HMAC 같은 보안용 primitive와 권한/DB 검증 |\n\nrandom seed는 공격자가 seed를 모른다는 전제에서 유용하다. 하지만 seed가 고정되어 공개되거나, 공격자가 여러 요청으로 결과를 관찰해 적응할 수 있으면 위험이 다시 커질 수 있다. 그리고 cryptographic hash도 \"절대 collision이 없다\"가 아니라, 현실적인 계산 자원으로 collision을 찾기 어렵게 설계된 도구다.\n\n## 흔한 오해\n\n해시 충돌은 구현 버그가 아니라 유한한 fingerprint를 쓰는 구조의 본질적인 가능성이다. 또한 false positive와 false negative를 구분해야 한다. 해시 기반 후보 필터는 다른 문자열을 같다고 의심하는 false positive가 문제이고, 원문 검증을 붙이면 최종 오답을 막을 수 있다.\n\ndouble hashing도 collision risk를 낮추는 방법이지 증명을 대신하지 않는다. 두 해시가 사실상 같은 seed, 같은 modulus family, 같은 구현 버그를 공유하면 독립성 가정이 약해진다. \"두 번 해시했으니 0\"이 아니라 \"독립에 가깝게 설계해 false positive budget을 충분히 낮춘다\"라고 말해야 한다.\n\n보안 문맥에서는 \"빠른 fingerprint\"와 \"보안용 digest/MAC\"을 분리한다. rolling hash는 substring window를 빨리 갱신하려는 알고리즘 도구이고, 인증/위변조 방지는 HMAC이나 서명처럼 공격자 모델을 포함한 primitive가 필요하다.\n\n## 드릴 축\n\n답변은 \"hash equality는 후보\", \"충돌 가능성을 인정\", \"비교 횟수와 adversarial input으로 위험 평가\", \"double hashing이나 random seed로 위험 감소\", \"정확성이 필요하면 verify-after-hit 또는 deterministic algorithm\" 순서가 좋다. 문자열 매칭 선택은 `kmp-rabin-karp-string-matching-interview-chooser`, rolling update 자체는 `rolling-hash-rabin-karp`로 이어진다.\n\n## 30초 답변 예시\n\n롤링 해시는 문자열을 확정 비교하는 도구라기보다 후보를 빨리 줄이는 fingerprint입니다. 해시가 같아도 collision으로 false positive가 날 수 있어서, 정답이 반드시 정확해야 하면 hash hit 뒤 원문 비교를 붙이거나 KMP/Z 같은 deterministic 알고리즘을 고릅니다. 입력이 랜덤하거나 contest에서 오답 확률을 낮추는 목적이면 큰 modulus, runtime random base, double hash로 위험을 줄일 수 있지만, adversarial input이나 보안 경계에서는 그 확률 모델이 깨질 수 있어 검증 계층을 따로 둬야 합니다.\n",
   "aliases": [
-    "randomized hashing collision drill",
     "해싱 충돌 확률 면접",
+    "Randomized Hashing Collision Risk 개념",
+    "Randomized Hashing Collision Risk 정리",
+    "Randomized Hashing Collision Risk 실수",
+    "Randomized Hashing Collision Risk 판단 기준",
+    "randomized hashing collision drill",
     "rolling hash collision risk",
     "adversarial rolling hash input",
     "randomized hash false positive",
-    "probabilistic algorithm answer"
+    "probabilistic algorithm answer",
+    "randomized hashing collision risk guide",
+    "randomized hashing collision risk checklist"
   ],
   "expected_queries": [
     "rolling hash는 충돌 가능성이 있는데 왜 써?",
@@ -43,8 +49,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/algorithm/randomized-hashing-collision-risk-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }

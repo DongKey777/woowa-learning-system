@@ -6,31 +6,18 @@
   "summary": "HTTPS는 TCP 위에 TLS layer를 얹어 \"인증서로 서버 신뢰 확인 → 공개키로 세션 키 안전 교환 → 이후 통신은 대칭키 암호화\"의 4단계 handshake를 거친다.",
   "body_markdown": "# TLS/HTTPS Handshake primer — 안전한 연결의 4단계\n\n> 한 줄 요약: HTTPS는 TCP 위에 TLS layer를 얹어 \"**인증서로 서버 신뢰 확인 →\n> 공개키로 세션 키 안전 교환 → 이후 통신은 대칭키 암호화**\"의 4단계 handshake를 거친다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [HTTP 요청-응답 기본 흐름](../network/http-request-response-basics-url-dns-tcp-tls-keepalive.md)\n- [HTTP/HTTPS 기초](../network/http-https-basics.md)\n- [대칭/비대칭 암호화 기초](./symmetric-asymmetric-encryption-basics.md)\n- [security 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: tls https handshake primer, TLS 1.2 vs 1.3, 증명서 신뢰 체인, root CA intermediate CA leaf, forward secrecy 전방위 비밀성, mutual TLS mTLS, self-signed certificate 위험, HSTS strict transport security, ephemeral key session key\n\n## 먼저 멘탈모델\n\nHTTP는 평문. HTTPS = HTTP + TLS layer.\n\n```\nApplication: HTTP (GET /users, POST /login, ...)\n         ↓\nTLS Layer: 암호화/복호화 (handshake로 키 교환 후)\n         ↓\nTransport: TCP (3-way handshake로 연결)\n         ↓\nNetwork: IP\n```\n\nTLS의 3가지 목표:\n1. **암호화 (Confidentiality)**: 중간자가 내용 못 봄\n2. **무결성 (Integrity)**: 중간자가 변조 못 함\n3. **인증 (Authentication)**: 서버가 진짜인지 확인 (client도 옵션)\n\n## TLS 1.2 Handshake — 고전 4단계\n\n```\nClient                          Server\n  │                                │\n  │── ClientHello ────────────────→│   ① 안녕, 내가 지원하는 cipher 목록 + random_c\n  │                                │\n  │←── ServerHello ────────────────│   ② 안녕, 선택한 cipher + random_s\n  │←── Certificate ────────────────│      내 인증서 (public key 포함)\n  │←── ServerKeyExchange ──────────│      (DH key 정보)\n  │←── ServerHelloDone ────────────│\n  │                                │\n  │── ClientKeyExchange ──────────→│   ③ pre-master secret을 server의 public key로 암호화해서 전송\n  │── ChangeCipherSpec ───────────→│\n  │── Finished ───────────────────→│   ④ 양쪽이 같은 session key 계산 (random_c + random_s + pre-master)\n  │                                │\n  │←── ChangeCipherSpec ───────────│\n  │←── Finished ───────────────────│\n  │                                │\n  │═══ 이후 모든 통신은 session key로 대칭 암호화 ═══│\n```\n\n**핵심 비유**:\n- 서버가 client에게 \"내 공개키\"를 보냄\n- client는 그 공개키로 \"이번 대화용 비밀키(session key)\"를 암호화해 보냄\n- 서버만 자기 private key로 그걸 복호화 가능 → session key 공유 완료\n- 이후 대칭 키로 빠른 암호화 (공개키 암호화는 느림)\n\n## TLS 1.3 — 더 빠르고 안전 (2018+)\n\nTLS 1.2는 2 round trip (RTT) 필요. TLS 1.3는 **1 RTT**.\n\n```\nClient                          Server\n  │                                │\n  │── ClientHello ────────────────→│   ① ClientHello + key share (ephemeral DH public)\n  │   + key share                  │\n  │                                │\n  │←── ServerHello + key share ────│   ② ServerHello + key share + Certificate + Finished\n  │     + Certificate              │      (Cert까지 한 번에)\n  │     + Finished                 │\n  │                                │\n  │── Finished ───────────────────→│   ③ 양쪽 session key 확정\n  │                                │\n  │═══ 이후 대칭 암호화 통신 ═══│\n```\n\n### TLS 1.3 주요 개선\n\n- **1 RTT** (latency 50% 감소)\n- **0 RTT mode** (resume — 더 빠름, 단 replay risk)\n- **Forward Secrecy 강제** (ephemeral DH 키만 허용)\n- **RSA key exchange 제거** (DHE/ECDHE만)\n- **MD5/SHA1 같은 약한 algorithm 제거**\n- 더 적은 cipher suite (선택 단순화)\n\n### 현재 상태\n\n- TLS 1.0/1.1: deprecated (2020+ 대부분 disabled)\n- TLS 1.2: 여전히 널리 사용\n- TLS 1.3: 새 서비스는 default. 모든 modern 브라우저 지원\n\n## 증명서 신뢰 체인\n\n서버가 보낸 인증서를 client가 어떻게 신뢰?\n\n```\nRoot CA (운영체제/브라우저 신뢰 store에 미리 포함)\n   └── Intermediate CA (Root가 서명)\n         └── Leaf Certificate (Intermediate가 서명, 실제 서버용)\n```\n\n검증 흐름:\n1. Server가 Leaf Certificate (+ Intermediate) 보냄\n2. Client가 chain을 따라 올라감\n3. Root CA가 자기 신뢰 store에 있는지 확인\n4. 각 단계의 서명 검증 (상위 CA의 public key로)\n5. 모두 통과 → 신뢰 OK\n\n### Root CA\n\n- 운영체제 (Windows, macOS, iOS, Android) + 브라우저가 미리 가지고 있는 CA 목록 (수십~수백 개)\n- 예: DigiCert, Let's Encrypt, GlobalSign, GoDaddy\n- Root CA의 private key가 누출되면 모든 서명 인증서 신뢰 깨짐 → 매우 엄격 관리\n\n### Intermediate CA\n\n- Root CA는 직접 leaf 발급 안 함 (보안 격리)\n- Intermediate가 leaf 발급. Intermediate가 침해돼도 Root는 살아 있음.\n\n### Leaf Certificate\n\n- 실제 서버용 (`*.example.com`)\n- 발급 시 도메인 소유 증명 (HTTP-01 / DNS-01 challenge)\n- Let's Encrypt 같은 무료 CA로 자동 발급 가능\n\n### 인증서에 들어 있는 것\n\n```\n- Subject: example.com (도메인)\n- Issuer: Let's Encrypt Authority X3 (서명한 CA)\n- Public Key: 서버의 RSA 또는 ECC public key\n- Valid From / To: 만료 기간\n- Subject Alternative Names (SAN): *.example.com, www.example.com\n- Signature: Issuer가 서명한 부분\n```\n\n## 자체 서명 인증서 (Self-Signed Certificate)\n\n```\nSelf-Signed:\n   Leaf Certificate (자기가 자기를 서명)\n```\n\n- Root CA 거치지 않음\n- 브라우저는 신뢰 store에 없는 root → \"이 사이트 안전 X\" 경고\n\n### Production에서 안 좋은 이유\n\n- 사용자에게 보안 경고 (UX 파탄)\n- MITM 공격 보호 X (실제로 가짜 인증서일 수도)\n- 검색 엔진 SEO 페널티\n\n### 자체 서명 OK인 경우\n\n- 로컬 개발 환경 (`localhost`)\n- 내부 microservice 간 통신 (private 네트워크 + 사전 신뢰 store 배포)\n- mTLS 인프라 (내부에서만 사용)\n\n신입 권장: **Let's Encrypt 무료** 사용. 자동 갱신 (`certbot` 같은 도구).\n\n## Forward Secrecy\n\n### 문제 상황 (Forward Secrecy 없음)\n\n```\n서버의 private key가 1년 후 유출됨\n공격자가 1년 전 통신 다 기록해 둠\n→ private key로 모든 옛 통신 복호화 가능\n```\n\n### 해결: 매 세션마다 새 키 (Ephemeral DH)\n\n```\n매 handshake마다 ephemeral (일시적) DH key pair 생성\nsession key는 ephemeral key 기반 → server private key와 무관\n→ server private key 유출돼도 옛 통신 안전\n```\n\n### 어떻게 작동\n\nDH (Diffie-Hellman) 또는 ECDH (Elliptic Curve)로 양쪽이 *세션 직후 버리는* key 교환.\n\nTLS 1.3: 강제. TLS 1.2: cipher suite 선택에 따라 (`ECDHE-*` 같은 ECDHE prefix가 forward secrecy).\n\n## Mutual TLS (mTLS)\n\n일반 TLS는 server만 인증. mTLS는 **client도 인증서로 인증**.\n\n```\nServer: \"client, 너 인증서 보여줘\"\nClient: 자기 인증서 제출\nServer: 신뢰 chain 검증\n```\n\n### 언제\n\n- 내부 microservice 간 (zero-trust 네트워크)\n- API gateway에서 backend 인증\n- IoT 디바이스 인증\n\n### 일반 비인증 (cookies/JWT)과 차이\n\n- mTLS: TCP/TLS layer 인증. 모든 HTTP 요청에 자동 적용.\n- 토큰: HTTP layer. Authorization 헤더 등.\n\nmTLS는 더 강력하지만 client 인증서 관리(발급, 갱신, revocation) 비용 ↑.\n\n## HSTS (HTTP Strict Transport Security)\n\n```http\nStrict-Transport-Security: max-age=31536000; includeSubDomains\n```\n\n응답 헤더로 \"이 도메인은 1년 동안 HTTPS only\"라고 브라우저에 알림.\n\n**효과**:\n- 사용자가 `http://example.com` 쳐도 브라우저가 자동 https로 (서버 redirect 기다리지 않음)\n- HTTPS strip attack (MITM이 http로 downgrade) 방어\n\n**주의**:\n- 한 번 HSTS 등록되면 max-age 동안 HTTP 회귀 불가\n- Local dev 시 HSTS pre-loaded면 self-signed 못 씀\n\n## TLS Handshake의 cost\n\n```\nTLS handshake:\n- 1.2: 2 RTT (~ 200-400ms in long distance)\n- 1.3: 1 RTT (~ 100-200ms)\n- 0-RTT resumption: 0 RTT (이전 세션 재사용)\n\n이후 통신:\n- 대칭 암호화 비용 매우 적음 (AES-NI 하드웨어 가속)\n```\n\n따라서 **첫 연결만 느리고** 이후는 거의 평문과 동일 성능.\n\n### 최적화\n\n- **HTTP/2, HTTP/3**: 하나의 TLS 연결로 여러 요청 (connection reuse)\n- **Session Resumption**: 이전 연결의 키를 재사용 (RTT 줄임)\n- **OCSP Stapling**: 인증서 revocation 검증을 서버가 미리\n\n## 자주 헷갈리는 지점\n\n### \"SSL과 TLS\"\n\n- SSL은 deprecated된 옛 이름 (SSL 3.0 == TLS 1.0)\n- 현재는 모두 TLS. 단 통상적으로 \"SSL\"로 부르기도 함 (Stripe SSL 이런 식)\n\n### \"HTTPS는 모든 보안을 해결\"\n\nHTTPS는:\n- 통신 도청 방지\n- 서버 인증\n\nHTTPS가 못 하는 것:\n- XSS 방지 (이건 client-side)\n- CSRF 방지\n- 인증서 만료 / 잘못된 도메인 / phishing\n- application 수준 취약점 (SQL injection 등)\n\n### \"자체 서명도 암호화는 같다\"\n\n암호화 자체는 같음. 단:\n- **인증 (authentication) 없음** → MITM 가능 (가짜 자체 서명 인증서 제시 가능)\n- 브라우저 경고 → 사용자가 무시하는 습관 → 진짜 공격도 무시\n\n### \"공개키 암호화로 모든 통신\"\n\n너무 느림. 그래서 handshake 시점에만 공개키로 session key 교환, 이후 대칭키.\n\n### \"TLS 1.3은 항상 더 빠르다\"\n\nhandshake는 빠름. 그러나 protocol overhead는 비슷. 큰 영향은 1 RTT 절감.\n\n### \"Forward Secrecy = 항상 안전\"\n\nForward secrecy는 *과거 통신* 보호. 미래 통신의 server key 유출 시 새 통신은 위험.\n\n## 빠른 확인 질문\n\n- TLS의 3가지 목표?  답: 암호화, 무결성, 인증\n- TLS 1.2와 1.3의 RTT 차이?  답: 2 RTT vs 1 RTT\n- 인증서 신뢰 체인 단계?  답: Root CA → Intermediate → Leaf\n- 자체 서명 인증서가 production에 안 좋은 이유?  답: 브라우저 경고 + MITM 보호 X\n- Forward Secrecy 의미?  답: server private key 유출돼도 옛 통신 안전\n- mTLS는 일반 TLS와 어떻게 달라?  답: client도 인증서로 인증\n\n## 한 줄 정리\n\nHTTPS는 \"**TLS layer + 인증서 신뢰 체인 + 공개키로 session key 교환 + 대칭키로 효율적\n통신**\"의 결합이며, 신입은 *Let's Encrypt + TLS 1.3 + HSTS + 적절한 cipher suite*로\n시작하면 안전한 HTTPS 인프라를 구축할 수 있다.\n",
   "aliases": [
-    "tls handshake primer",
-    "https handshake",
-    "tls 1.2 vs tls 1.3",
     "TLS 핸드쉐이크",
     "HTTPS 동작 원리",
     "SSL TLS 차이",
-    "certificate trust chain",
     "증명서 신뢰 체인",
-    "root CA intermediate CA",
     "자체 서명 인증서",
+    "tls handshake primer",
+    "https handshake",
+    "tls 1.2 vs tls 1.3",
+    "certificate trust chain",
+    "root CA intermediate CA",
     "self-signed certificate",
-    "공개키 인증서",
-    "public key certificate",
-    "session key",
-    "세션 키",
-    "ephemeral key",
-    "forward secrecy",
-    "전방위 비밀성",
-    "mutual TLS",
-    "mTLS",
-    "양방향 TLS",
-    "CSR certificate signing request",
-    "인증서 발급",
-    "Lets Encrypt",
-    "HSTS strict transport security"
+    "public key certificate"
   ],
   "expected_queries": [
     "TLS handshake가 정확히 무슨 4단계로 이루어져 있어?",
@@ -66,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/tls-https-handshake-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch154"
+      }
+    ]
   }
 }
