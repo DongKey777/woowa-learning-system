@@ -2,33 +2,36 @@
   "id": "system-design/local-vs-distributed-cache-l1-l2-primer",
   "title": "Local vs Distributed Cache L1/L2 Primer",
   "category": "system-design",
-  "level": "intermediate",
-  "summary": "Caffeine 같은 local cache는 한 프로세스 안에서는 가장 빠른 L1 near-cache지만, 서버가 여러 대가 되면 노드마다 서로 다른 복사본이 남을 수 있다. Redis 같은 distributed cache는 공유 L2 지점을 제공하며, L1/L2 조합은 invalidation, version, TTL fallback까지 함께 설계해야 안전하다.",
-  "body_markdown": "# Local vs Distributed Cache L1/L2 Primer\n\n> 한 줄 요약: local cache는 single instance에서는 가장 빠른 L1 near-cache지만, multi instance에서는 오래된 값을 빠르게 반환할 수 있다. Redis 같은 distributed cache를 L2로 두고 TTL, version, invalidation을 같이 설계해야 한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Caching Basics](./caching-basics.md)\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [Distributed Cache Design](./distributed-cache-design.md)\n- [Cache Invalidation Patterns Primer](./cache-invalidation-patterns-primer.md)\n- [Redis Cache-Aside / Write-Through Interview Chooser](./redis-cache-aside-write-through-interview-chooser.md)\n\nretrieval-anchor-keywords: local cache vs distributed cache, L1 L2 cache, near cache, remote cache, in-process cache, Redis L2 cache, Caffeine local cache, Caffeine Redis near cache, process local stale cache, versioned cache read, TTL fallback, pub/sub invalidation, 로컬 캐시 분산 캐시 차이, Caffeine만 캐싱, Redis 앞단 로컬 캐시, 로컬 캐시 무효화, L1 L2 캐시 계층\n\n## 이 문서가 맡는 질문\n\n이 문서는 `Redis도 있는데 Caffeine을 앞에 또 붙여도 돼?`, `서버가 여러 대면 로컬 캐시 값이 서로 달라지지 않아?`, `L1/L2 cache에서 invalidation을 놓치면 어떻게 회복해?`, `Caffeine만으로 권한이나 설정 값을 캐싱해도 안전해?` 같은 질문을 맡는다. 캐시 자체의 입문 개념은 caching basics가 맡고, Redis cluster, shard relocation, hot key 완화 같은 넓은 분산 캐시 운영은 distributed cache design으로 넘긴다.\n\n핵심은 저장 위치가 곧 안전성을 결정한다는 점이다. Local cache는 app process 안에 있으므로 network hop이 없고 가장 빠르다. 단일 인스턴스에서는 단순한 성능 최적화처럼 보이지만, 서버가 두 대 이상이면 각 instance가 자기 heap에 다른 복사본을 가진다. Distributed cache는 Redis/Memcached 같은 외부 저장소라 여러 app instance가 같은 L2 값을 본다. 대신 network latency, serialization cost, Redis 장애 전파, hot key 문제가 생긴다.\n\n## L1/L2 멘탈 모델\n\n```text\nrequest -> L1 local cache(Caffeine/JVM heap) -> L2 distributed cache(Redis) -> source of truth(DB/API)\n```\n\n- **L1 local cache**: Caffeine, Guava cache, JVM heap, process memory. 가장 빠르지만 node-local이다.\n- **L2 distributed cache**: Redis, Memcached. 여러 서버가 공유하지만 network hop이 있다.\n- **Source of truth**: DB, config service, authz service 같은 최종 기준이다.\n\nL1은 latency를 줄이는 복사본이고, L2는 fleet 전체가 공유하는 복사본이다. 어느 쪽도 원본이 아니다. 그래서 read path보다 write 이후 어떤 cache가 언제 비워지고, 놓친 invalidation을 어떻게 회복하는지가 더 중요하다.\n\n## single-instance speed와 multi-instance stale\n\nCaffeine만 써도 되는 순간은 있다. 단일 app process에서만 읽는 계산 결과, 값이 바뀌어도 몇 초에서 몇 분 stale이 허용되는 lookup, node-local memoization이면 L1만으로 충분할 수 있다. 이때 장점은 명확하다. network hop이 없고, Redis 장애와 무관하며, 구현도 작다.\n\n하지만 scale-out 순간부터 의미가 바뀐다. A instance의 Caffeine에는 `policy:v1`이 있고 B instance에는 `policy:v2`가 있을 수 있다. 사용자의 다음 요청이 어느 instance로 갈지 모르기 때문에, 로컬 캐시 hit은 빠른 대신 최신성 보장이 약하다. 권한 회수, session revoke, 재고 확정, 결제 가능 여부, tenant 설정처럼 잘못 stale되면 사고가 나는 값은 Caffeine alone으로 두면 위험하다.\n\n## Redis L2를 붙이는 이유\n\nRedis L2는 모든 app instance가 최소한 같은 shared cache 지점을 보게 만든다. L1 miss가 매번 DB로 가지 않고 L2에서 끝나므로 DB 부하도 줄어든다. 다만 Redis를 둔다고 L1 stale이 자동으로 사라지지는 않는다. L2 key를 지워도 이미 각 process heap에 올라간 값은 남아 있다.\n\n```pseudo\nvalue = l1.get(key)\nif value exists and value.version >= requiredVersion:\n  return value\n\nvalue = l2.get(key)\nif value exists and value.version >= requiredVersion:\n  l1.put(key, value, shortTtl)\n  return value\n\nvalue = source.read(key)\nl2.put(key, value, mediumTtl)\nl1.put(key, value, shortTtl)\nreturn value\n```\n\n여기서 `requiredVersion`은 요청 token, DB row version, policy publish version, event offset처럼 이 값보다 오래된 cache hit은 쓰면 안 된다는 기준이다. 버전 기준이 없으면 최소한 L1 TTL을 짧게 두고, 민감 경로는 L1을 우회하거나 원본 확인을 붙인다.\n\n## invalidation은 힌트, TTL과 version은 안전망\n\n쓰기 path는 보통 다음처럼 잡는다.\n\n```pseudo\nsource.update(key, newValue, version=v43)\nl2.delete(key) or l2.put(key, newValue)\npublishInvalidation(key, version=v43)\n```\n\nPub/Sub invalidation은 각 app instance의 L1을 빨리 비우기 위한 힌트다. 메시지는 유실되거나 늦게 도착할 수 있다. 그래서 안전한 L1/L2 설계는 보통 세 겹을 둔다.\n\n1. L1 TTL은 짧게 둔다. L2 TTL보다 짧게 두어 stale window를 제한한다.\n2. 값에는 version이나 updated_at을 넣는다. 기대 version보다 낮은 L1 hit은 버린다.\n3. 권한 회수나 결제 같은 critical path는 L1을 우회하거나 source verify를 붙인다.\n\n이렇게 하면 invalidation을 놓쳐도 TTL 만료나 version mismatch로 회복된다. 반대로 무기한 Caffeine cache에 pub/sub만 믿는 구조는 메시지 하나 유실로 stale 값이 오래 남을 수 있다.\n\n## 선택 기준\n\n| 질문 | Caffeine 같은 L1만 가능 | Redis L2 또는 L1+L2 필요 |\n|---|---|---|\n| 서버가 한 대인가 | 단일 instance면 단순 speed-up 가능 | 여러 instance면 공유 지점 필요 |\n| 값이 누가 바꾸나 | 같은 process 안에서만 바뀜 | 다른 instance, admin, batch, event가 바꿈 |\n| stale 허용 범위 | 몇 초 이상 허용 가능 | revoke/재고/결제처럼 짧거나 거의 없음 |\n| 실패 시 행동 | 오래된 값도 degraded로 허용 | fail-closed, source verify, version reject 필요 |\n| 관측 기준 | L1 hit ratio, heap pressure | L1/L2 hit ratio, invalidation lag, stale reject count |\n\n처음 분기는 `빠르게 읽고 싶은가`가 아니라 `다른 서버가 바꾼 값을 이 서버의 L1이 계속 들고 있어도 되는가`다.\n\n## 실패 모드\n\n- **stale L1**: DB와 Redis L2는 바뀌었지만 한 app instance의 Caffeine이 옛 값을 반환한다.\n- **invalidation 유실**: pub/sub 메시지를 놓친 노드가 TTL 만료 전까지 옛 값을 가진다.\n- **double stampede**: L1과 L2가 동시에 만료되어 모든 instance가 DB로 몰린다.\n- **hot key 집중**: Redis L2의 특정 key가 shard나 node를 압박한다.\n- **heap pressure**: L1 payload가 커져 GC pause나 eviction churn을 만든다.\n\nL1/L2는 latency를 줄이는 구조이지 최신성을 자동으로 보장하는 구조가 아니다. 답변에서는 stale window와 recovery path를 반드시 같이 말해야 한다.\n\n## 언제 Caffeine alone이 unsafe인가\n\nCaffeine만으로 두기 위험한 경우는 질문이 거의 정해져 있다.\n\n- 값이 다른 instance, batch, admin console, external event에 의해 바뀐다.\n- 사용자가 여러 app instance로 라우팅될 수 있다.\n- 권한 회수, session revoke, 재고 확정, 결제 가능 여부처럼 stale이 사고로 이어진다.\n- invalidation event를 잃었을 때 TTL이나 version으로 회복할 수 없다.\n- 최대 stale 시간을 설명할 수 없다.\n\n이 조건 중 하나라도 맞으면 Redis L2, 짧은 L1 TTL, version check, source verify 중 일부를 붙여야 한다.\n\n## 관측 지표\n\n좋은 답변은 cache hit ratio 하나로 끝나지 않는다.\n\n- L1 hit ratio, L2 hit ratio, DB fallback rate\n- L1 entry age, invalidation lag, stale reject count\n- version mismatch count, source verify rate\n- cache get p95/p99, serialization cost, payload size\n- Redis latency, hot key QPS, eviction count\n- source DB query rate during cache expiry\n\n특히 `L1 hit이 높아서 빠르다`와 `stale 값을 오래 반환한다`는 동시에 참일 수 있다. 그래서 hit ratio와 freshness 지표를 같이 봐야 한다.\n\n## 답변 템플릿\n\n면접이나 리뷰 답변에서는 먼저 `L1은 process-local latency 최적화, L2는 Redis 같은 shared cache 지점`이라고 나눈다. 그다음 single instance에서는 Caffeine만으로 충분할 수 있지만 multi instance에서는 stale copy가 생긴다고 말한다. 마지막으로 invalidation은 빠른 힌트이고, TTL과 version은 유실 복구 안전망이며, critical path는 L1 우회나 source verify가 필요하다고 정리하면 된다.\n\n## 한 줄 정리\n\nLocal cache와 distributed cache의 차이는 속도만이 아니라 공유 범위다. L1/L2 near-cache 구조를 쓰려면 Redis L2, L1 invalidation, 짧은 TTL, version fallback, Caffeine alone이 unsafe한 조건을 함께 설명해야 한다.\n",
+  "level": "beginner",
+  "summary": "Caffeine 같은 local cache는 애플리케이션 프로세스 안에 있는 빠른 L1 캐시이고, Redis 같은 distributed cache는 여러 서버가 같이 보는 공유 L2 캐시다. 이 문서는 초급자가 단일 서버의 반복 조회는 Caffeine, 여러 서버가 같은 값을 봐야 하는 조회는 Redis 또는 L1/L2 조합으로 고르는 기준을 Caffeine vs Redis 예시로 설명하며 local-vs-distributed-cache-caffeine-redis-beginner-primer surface를 흡수한다.",
+  "body_markdown": "# Local vs Distributed Cache L1/L2 Primer\n\n> 한 줄 요약: Caffeine은 한 JVM 안에서 가장 빠른 local L1 cache이고, Redis는 여러 app instance가 같이 보는 distributed L2 cache다. 첫 선택 기준은 속도보다 값이 여러 서버 사이에서 공유되어야 하는지다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Caching Basics](./caching-basics.md)\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [Distributed Cache Design](./distributed-cache-design.md)\n- [Near Cache L1/L2 Pub/Sub Invalidation Primer](./near-cache-l1-l2-pubsub-invalidation-primer.md)\n- [Redis Cache-Aside / Write-Through Interview Chooser](./redis-cache-aside-write-through-interview-chooser.md)\n\nretrieval-anchor-keywords: local cache vs distributed cache, Caffeine vs Redis cache, local-vs-distributed-cache-caffeine-redis-beginner-primer, local vs distributed cache Caffeine Redis beginner, Caffeine local cache Redis distributed cache, L1 local cache L2 Redis cache, in-process cache vs remote cache, single instance Caffeine cache, multi instance Redis cache, Redis 앞단 Caffeine, Caffeine만 캐싱, 로컬 캐시 분산 캐시 차이, Caffeine Redis 선택 기준, 여러 서버 로컬 캐시 stale\n\n## 이 문서가 맡는 질문\n\n이 문서는 `Caffeine이랑 Redis가 뭐가 달라?`, `서버 한 대면 Caffeine만 써도 돼?`, `서버가 여러 대면 Redis가 필요한 이유가 뭐야?`, `Redis를 쓰는데 Caffeine을 앞에 또 붙이는 이유가 뭐야?` 같은 초급 선택 질문을 맡는다. backlog exact surface `local-vs-distributed-cache-caffeine-redis-beginner-primer`도 이 초급 Caffeine vs Redis 선택 질문으로 흡수한다.\n\n범위는 local cache와 distributed cache의 역할 선택이다. Pub/Sub으로 여러 JVM의 L1을 어떻게 지울지, version/generation token으로 stale hit을 어떻게 거절할지, Redis cache-aside와 write-through 중 무엇을 고를지는 인접 문서로 넘긴다.\n\n## 먼저 나눌 것\n\n| 구분 | Caffeine local cache | Redis distributed cache |\n|---|---|---|\n| 위치 | app process/JVM heap 안 | app 밖의 별도 Redis 서버 |\n| 속도 | network hop이 없어 매우 빠름 | network와 serialization 비용이 있음 |\n| 공유 | 한 instance 안에서만 보임 | 여러 app instance가 같은 cache를 봄 |\n| 재시작 | app 재시작 시 사라짐 | Redis가 살아 있으면 app 재시작과 분리됨 |\n| 주의 | 서버마다 값이 달라질 수 있음 | 장애, timeout, hot key, 운영 비용이 생김 |\n\n그래서 Caffeine은 `내 프로세스 안 반복 조회를 줄이는 장치`이고, Redis는 `여러 서버가 같이 보는 빠른 공유 저장소`다. 둘 다 DB나 외부 API 같은 source of truth를 대신하지 않는다.\n\n## L1/L2 멘탈 모델\n\n```text\nrequest -> L1 local cache(Caffeine) -> L2 distributed cache(Redis) -> source of truth(DB/API)\n```\n\n- **L1 Caffeine**: 가장 먼저 확인하는 process-local cache다. hit이면 아주 빠르다.\n- **L2 Redis**: L1 miss 때 확인하는 shared cache다. 여러 서버가 같은 값을 재사용한다.\n- **Source of truth**: 최종 기준이다. cache miss나 검증이 필요할 때 돌아간다.\n\nL1/L2 조합은 성능 계층이다. Caffeine hit이 높아도 그 값이 최신이라는 뜻은 아니다. 반대로 Redis를 쓴다고 모든 정합성이 자동 해결되는 것도 아니다.\n\n## Caffeine만으로 충분한 예\n\nCaffeine만 먼저 고려할 수 있는 상황은 값이 process-local이어도 괜찮을 때다.\n\n- 단일 서버로 운영하는 작은 서비스의 상품 카테고리 목록 조회\n- 같은 JVM 안에서 반복 계산되는 비싼 함수 결과\n- 값이 몇 초에서 몇 분 늦어도 사용자 영향이 작은 코드/이름 lookup\n- 서버마다 따로 가져도 되는 feature toggle의 비민감 fallback 값\n- Redis 장애나 network hop을 피하고 싶은 아주 짧은 hot lookup\n\n이때도 TTL은 둔다. 무기한 Caffeine cache는 값이 바뀐 뒤에도 오래 남을 수 있다.\n\n## Redis 또는 L1+L2가 필요한 예\n\nRedis 쪽으로 기우는 질문은 값이 여러 서버 사이에서 공유되어야 하는 경우다.\n\n- API 서버가 여러 대이고 어느 서버로 요청이 갈지 모른다.\n- admin console, batch, 다른 instance가 값을 바꿀 수 있다.\n- 권한, session revoke, tenant 설정처럼 한 서버만 옛 값을 보면 사고가 난다.\n- 같은 인기 조회를 모든 instance가 DB로 다시 보내면 DB 부하가 커진다.\n- app 재시작 후에도 cache warm-up 비용을 줄이고 싶다.\n\n예를 들어 A 서버의 Caffeine에는 `role=USER`가 있고 B 서버에는 최신 `role=ADMIN`이 있을 수 있다. 사용자의 다음 요청이 A로 가면 A는 Redis를 보기도 전에 local hit으로 끝낼 수 있다. 이런 값은 Caffeine alone보다 Redis shared cache, 짧은 L1 TTL, 필요 시 원본 확인을 같이 생각해야 한다.\n\n## Redis 앞에 Caffeine을 붙이는 이유\n\nRedis가 있어도 Caffeine L1을 앞에 둘 수 있다. 아주 자주 읽는 설정, 카테고리, 권한 snapshot 같은 값에서 Redis 왕복도 줄이고 싶을 때다.\n\n다만 초급 답변에서는 이렇게 말하면 충분하다.\n\n1. Redis는 여러 서버가 공유하는 L2다.\n2. Caffeine은 각 서버 안에서 Redis 호출까지 줄이는 L1이다.\n3. 값이 바뀔 수 있으면 L1 TTL을 짧게 두고, 민감한 결정은 원본이나 Redis 기준을 다시 확인한다.\n\n여기서 Pub/Sub invalidation, event loss, version/generation guard까지 자세히 묻는다면 이 문서가 아니라 near-cache Pub/Sub 문서가 primary다.\n\n## 선택 질문\n\n| 질문 | Caffeine만으로 시작 | Redis 또는 L1+L2 고려 |\n|---|---|---|\n| 서버 수 | 한 대이거나 node-local이어도 됨 | 여러 대가 같은 값을 봐야 함 |\n| 변경 주체 | 같은 process에서만 바뀜 | 다른 instance, admin, batch가 바꿈 |\n| stale 허용 | 늦어도 큰 문제가 없음 | 권한/설정/재고/결제처럼 위험함 |\n| 장애 비용 | Redis 없이도 단순하게 가고 싶음 | 공유 cache 운영 비용을 감수할 가치가 있음 |\n| 성능 목표 | JVM 안 반복 조회 최적화 | DB 부하와 cross-instance miss를 줄임 |\n\n처음 분기는 `빠른가`가 아니라 `다른 서버가 바꾼 값을 이 서버의 local cache가 모르고 있어도 되는가`다.\n\n## 흔한 오해\n\n- Caffeine이 빠르니 여러 서버에서도 자동으로 같은 값을 본다고 생각한다.\n- Redis를 쓰면 DB와 cache 정합성이 자동으로 강해진다고 생각한다.\n- Redis 앞에 Caffeine을 붙이면 성능만 좋아지고 stale 위험은 없다고 생각한다.\n- 권한 회수, 결제 가능 여부 같은 결정을 local cache hit만으로 끝낸다.\n- cache-aside, write-through, Pub/Sub invalidation까지 한 질문 안에서 한꺼번에 설명하려 한다.\n\n## 경계\n\n- Cache 자체의 기본 용어와 TTL은 caching basics가 맡는다.\n- Redis cluster, shard, hot key, 장애 운영은 distributed cache design이 맡는다.\n- Pub/Sub으로 여러 instance의 Caffeine L1을 지우는 순서와 유실 복구는 near-cache Pub/Sub 문서가 맡는다.\n- Redis cache-aside, write-through, write-behind 선택은 Redis cache-aside/write-through chooser가 맡는다.\n\n## 답변 템플릿\n\n면접이나 리뷰 답변에서는 먼저 `Caffeine은 process-local L1, Redis는 shared L2`라고 나눈다. 그다음 단일 서버나 node-local lookup이면 Caffeine만으로도 충분할 수 있지만, 여러 서버가 같은 값을 봐야 하거나 다른 주체가 값을 바꾸면 Redis 같은 shared cache가 필요하다고 말한다. 마지막으로 L1+L2를 같이 쓰는 경우에는 Caffeine hit이 stale일 수 있으므로 짧은 TTL과 민감 경로의 원본 확인이 필요하다고 정리한다.\n\n## 한 줄 정리\n\nCaffeine vs Redis의 핵심 차이는 빠르냐 느리냐가 아니라 local copy냐 shared copy냐다. 초급 선택은 단일 프로세스 반복 조회면 Caffeine, 여러 서버가 같은 값을 재사용해야 하면 Redis, 둘 다 필요할 만큼 hot path면 Caffeine L1 + Redis L2로 시작한다.\n",
   "aliases": [
-    "local vs distributed cache L1 L2",
-    "local cache vs Redis cache",
-    "Caffeine Redis L1 L2 cache",
-    "near cache Redis L2",
-    "process local cache stale",
-    "로컬 캐시 분산 캐시 차이",
-    "L1 L2 캐시 계층",
-    "인프로세스 캐시 Redis 조합",
-    "Caffeine만 로컬 캐시",
-    "로컬 캐시 무효화 TTL 버전",
-    "near cache invalidation"
+    "local cache vs distributed cache",
+    "Caffeine vs Redis cache",
+    "Caffeine local cache Redis distributed cache",
+    "L1 local cache L2 Redis",
+    "single instance Caffeine cache",
+    "multi instance Redis cache",
+    "in-process cache vs remote cache",
+    "로컬 캐시 분산 캐시",
+    "Caffeine Redis 선택 기준",
+    "여러 서버 로컬 캐시 stale"
   ],
   "expected_queries": [
-    "Redis 쓰고 있는데 Caffeine 같은 로컬 캐시를 앞에 또 붙여도 괜찮아?",
-    "서버가 여러 대면 로컬 캐시에 저장한 값이 서로 달라질 수 있지 않아?",
-    "Caffeine만으로 권한이나 설정 값을 캐싱하면 언제 위험해?",
-    "L1 local cache와 L2 Redis cache를 같이 쓰면 invalidation, TTL, version을 어떻게 잡아?",
-    "로컬 캐시 hit은 빠른데 stale data를 어떻게 감지하고 제한해야 해?"
+    "Caffeine이랑 Redis 캐시는 뭐가 달라?",
+    "서버 한 대면 Caffeine만 써도 되고 여러 대면 Redis가 필요한 거야?",
+    "Redis 있는데 Caffeine을 앞에 또 붙이는 이유가 뭐야?",
+    "로컬 캐시는 빠른데 왜 분산 환경에서는 위험해?",
+    "상품 카테고리 목록 같은 조회는 Caffeine만으로 충분할까 Redis가 필요할까?",
+    "권한이나 설정값을 Caffeine local cache에만 두면 왜 위험해?",
+    "L1 local cache와 L2 Redis cache는 어떻게 역할이 달라?",
+    "local cache distributed cache 선택 기준을 초보자 관점으로 설명해줘"
   ],
   "symptoms": [
-    "Caffeine만 쓰면 충분한지 Redis L2가 필요한지 헷갈려",
-    "서버 여러 대에서 로컬 캐시 값이 서로 달라지는 stale 문제가 걱정돼",
-    "L1 invalidation을 놓쳐도 TTL이나 version으로 회복되는지 모르겠어"
+    "Caffeine과 Redis가 모두 cache라서 어떤 상황에 무엇을 써야 하는지 헷갈려",
+    "서버가 여러 대일 때 로컬 캐시가 서버마다 따로 있다는 점을 놓쳐",
+    "Redis를 쓰면 여러 서버가 공유한다는 장점과 network 비용을 같이 설명하지 못해",
+    "권한이나 설정값처럼 stale이 위험한 데이터를 Caffeine만으로 캐싱해도 되는지 판단이 안 돼"
   ],
   "relations": {
     "prerequisites": [
@@ -37,28 +40,39 @@
       "system-design/stateless-backend-cache-database-queue-starter-pack"
     ],
     "next_docs": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
       "system-design/distributed-cache-design",
       "system-design/cache-invalidation-patterns-primer",
       "system-design/redis-cache-aside-write-through-interview-chooser",
       "system-design/cache-stampede-ttl-jitter-interview-playbook"
     ],
     "confusable_with": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser",
       "system-design/caching-vs-read-replica-primer",
       "system-design/cdn-basics",
-      "system-design/cache-hit-miss-session-policy-bridge"
+      "spring/cacheable-redis-caffeine-interview-router"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "Redis Pub/Sub으로 Caffeine L1을 무효화하는 순서와 version generation을 설계해줘",
+      "Cache-Aside Write-Through Write-Behind 패턴 중 무엇을 골라야 해?"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-18",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch147",
         "note": "Created for local/distributed cache L1/L2 retrieval coverage."
+      },
+      {
+        "date": "2026-06-19",
+        "source": "batch187-local-vs-distributed-cache-caffeine-redis-beginner-surface",
+        "note": "Absorbed Caffeine vs Redis beginner chooser surface while routing advanced Pub/Sub near-cache and Redis cache-aside details to neighboring docs."
       }
     ]
   }
