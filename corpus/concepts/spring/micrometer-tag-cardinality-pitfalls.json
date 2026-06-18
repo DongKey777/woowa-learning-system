@@ -6,15 +6,18 @@
   "summary": "Micrometer 태그는 관측성을 풍부하게 하지만, cardinality가 높은 값을 넣으면 메트릭이 폭발해 오히려 시스템을 흐리게 만든다.",
   "body_markdown": "# Spring Micrometer Tag Cardinality Pitfalls\n\n> 한 줄 요약: Micrometer 태그는 관측성을 풍부하게 하지만, cardinality가 높은 값을 넣으면 메트릭이 폭발해 오히려 시스템을 흐리게 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Observability with Micrometer Tracing](./spring-observability-micrometer-tracing.md)\n> - [Spring Boot Condition Evaluation Report Debugging](./spring-boot-condition-evaluation-report-debugging.md)\n> - [Spring Actuator Exposure and Security](./spring-actuator-exposure-security.md)\n> - [Spring MVC 요청 생명주기](./spring-mvc-request-lifecycle.md)\n> - [Spring `@Async` Context Propagation and RestClient / HTTP Interface Clients](./spring-async-context-propagation-restclient-http-interface-clients.md)\n\nretrieval-anchor-keywords: Micrometer, tag cardinality, high cardinality, low cardinality, meter explosion, metric label, observability cost, histogram, timer tags\n\n## 핵심 개념\n\nMicrometer의 태그는 메트릭을 쪼개는 label이다.\n\n- endpoint\n- status\n- method\n- exception\n- client\n\n문제는 태그 값이 너무 다양해질 때다.\n\n고카디널리티 값이 들어가면 메트릭이 무한히 늘어나며 비용과 탐색성이 나빠진다.\n\n## 운영 playbook\n\n### 재현 조건\n\n다음 증상이 같이 보이면 tag cardinality 문제로 재현한다.\n\n- 메트릭 저장소의 series 수가 배포 이후 급증한다.\n- `uri`, `exception`, `client`, custom tag 중 하나의 distinct value가 요청 수에 비례해 늘어난다.\n- dashboard query가 느려지고 alert가 route별 집계 대신 개별 식별자별로 쪼개진다.\n\n### 확인 순서\n\n1. meter 이름별 series 수를 보고 어느 meter가 폭발했는지 찾는다.\n2. 해당 meter의 tag key별 distinct value를 확인한다.\n3. raw URL, user id, order id, request id, exception message가 tag value로 들어갔는지 본다.\n4. HTTP server metric이면 route template이 잡히는지, unmatched path가 raw path로 남는지 확인한다.\n5. 고유 식별이 필요하면 metric tag가 아니라 trace/log exemplar로 넘긴다.\n\n### failure matrix\n\n| 관찰 | 가능한 원인 | 다음 확인 |\n|---|---|---|\n| `uri=/orders/123` 같은 값이 많다 | route template 대신 raw path 사용 | MVC handler mapping tag, unmatched route |\n| `userId`, `requestId` tag가 있다 | 식별자를 metric label로 사용 | trace/log로 이동, tag 제거 |\n| exception tag value가 수천 개다 | exception message/class를 과도하게 세분화 | 안정적인 error bucket으로 축소 |\n| 배포 후 series 수만 급증 | 새 custom meter/tag 추가 | meter filter, tag cardinality budget |\n\n### 검증\n\n- 주요 meter의 tag value set이 bounded category로 유지된다.\n- route별 집계가 raw path별 집계보다 우선 보인다.\n- 개별 요청 추적은 trace/log에서 가능하고, metric은 SLO와 trend 집계에 남는다.\n\n## 깊이 들어가기\n\n### 1. low cardinality와 high cardinality를 구분해야 한다\n\n좋은 태그:\n\n- HTTP method\n- status code\n- route template\n- dependency name\n\n나쁜 태그:\n\n- user id\n- order id\n- request UUID\n- full URL with query string\n\n### 2. tag는 차트보다 비용에 영향을 준다\n\n카디널리티가 높으면 시계열이 폭발한다.\n\n- 저장 비용 증가\n- query 비용 증가\n- 대시보드 혼란 증가\n\n### 3. endpoint template을 써야 한다\n\n`/users/123` 대신 `/users/{id}` 같은 템플릿을 써야 한다.\n\n### 4. exception tag도 조심해야 한다\n\n에러 타입을 너무 세밀하게 나누면 메트릭이 쪼개진다.\n\n### 5. trace와 metric은 다른 문제다\n\ntrace는 세부 사건을, metric은 집계를 본다.\n\n이 문맥은 [Spring Observability with Micrometer Tracing](./spring-observability-micrometer-tracing.md)과 같이 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 메트릭은 늘었는데 대시보드가 쓰기 어렵다\n\n태그 폭발 때문이다.\n\n### 시나리오 2: user id를 태그에 넣었다\n\n유용해 보이지만 거의 항상 잘못된 선택이다.\n\n### 시나리오 3: query string까지 tag에 넣었다\n\n고카디널리티의 대표적 함정이다.\n\n### 시나리오 4: status만 보면 충분한데 exception까지 너무 많이 쪼갠다\n\n집계가 깨진다.\n\n## 코드로 보기\n\n### good tags\n\n```java\nTimer.builder(\"http.server.requests\")\n    .tag(\"method\", \"GET\")\n    .tag(\"status\", \"200\")\n    .tag(\"route\", \"/orders/{id}\")\n    .register(meterRegistry);\n```\n\n### bad tags\n\n```java\nTimer.builder(\"http.server.requests\")\n    .tag(\"userId\", userId.toString())\n    .tag(\"requestId\", requestId)\n    .register(meterRegistry);\n```\n\n### dependency metric\n\n```java\nTimer.builder(\"http.client.requests\")\n    .tag(\"client\", \"payment-api\")\n    .register(meterRegistry);\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| low-cardinality tags | 집계가 안정적이다 | 세부 추적이 적다 | 기본 메트릭 |\n| high-cardinality tags | 상세 식별이 된다 | 비용과 폭발 위험이 크다 | trace로 대체 |\n| path template tags | 분석이 쉽다 | route 매핑이 필요하다 | HTTP metrics |\n\n핵심은 메트릭 태그를 \"분류 키\"로 쓰되, **식별자**로 쓰지 않는 것이다.\n\n## 꼬리질문\n\n> Q: tag cardinality가 왜 문제인가?\n> 의도: 메트릭 비용 구조 이해 확인\n> 핵심: 시계열 수가 폭증하기 때문이다.\n\n> Q: user id를 metric tag에 넣으면 왜 안 되는가?\n> 의도: high-cardinality 위험 이해 확인\n> 핵심: 메트릭이 너무 잘게 쪼개진다.\n\n> Q: route template을 쓰는 이유는 무엇인가?\n> 의도: 집계 안정성 이해 확인\n> 핵심: 동일 엔드포인트를 하나의 시계열로 묶기 위해서다.\n\n> Q: metric과 trace를 어떻게 구분해야 하는가?\n> 의도: observability 역할 분리 확인\n> 핵심: metric은 집계, trace는 개별 사건이다.\n\n## 한 줄 정리\n\nMicrometer 태그는 low-cardinality로 유지해야 하며, 고유 식별자는 metric이 아니라 trace로 보아야 한다.\n",
   "aliases": [
+    "Spring Micrometer Tag Cardinality 개념",
+    "Spring Micrometer Tag Cardinality 정리",
+    "Spring Micrometer Tag Cardinality 실수",
+    "Spring Micrometer Tag Cardinality 판단 기준",
+    "스프링 Spring Micrometer Tag Cardinality",
     "Micrometer tag cardinality",
     "high cardinality",
     "low cardinality",
     "meter explosion",
     "metric label",
     "observability cost",
-    "timer tags",
-    "route template tags",
-    "@Async"
+    "timer tags"
   ],
   "expected_queries": [
     "Micrometer tag cardinality가 높으면 왜 metric cost가 폭발해?",
@@ -41,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/spring-micrometer-tag-cardinality-pitfalls.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch162"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "이 문서는 lazy loading과 DTO mapping 경계를 beginner checklist로 정리한다.",
   "body_markdown": "# Lazy Loading to DTO Mapping Checklist\n\n> 한 줄 요약: 초급자는 \"엔티티는 service 안에서 필요한 만큼만 읽고, DTO는 그 안에서 닫아서 반환하며, OSIV는 문제를 숨길 수 있다\"를 기본값으로 잡으면 lazy loading 혼란을 크게 줄일 수 있다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Controller Entity Return vs DTO Return Primer](./spring-controller-entity-return-vs-dto-return-primer.md)\n- [DTO Projection vs Entity Loading Mini Card for Read-Only Responses](./spring-dto-projection-vs-entity-loading-readonly-response-mini-card.md)\n- [Spring Persistence / Transaction Mental Model Primer: Web, Service, Repository를 한 장으로 묶기](./spring-persistence-transaction-web-service-repository-primer.md)\n- [Fetch Join vs `@EntityGraph` Mini Card for DTO Reads](./spring-fetch-join-vs-entitygraph-dto-read-mini-card.md)\n- [Spring Service-Layer Transaction Boundary Patterns](./spring-service-layer-transaction-boundary-patterns.md)\n- [Spring Open Session In View Trade-offs](./spring-open-session-in-view-tradeoffs.md)\n- [Spring Persistence Context Flush / Clear / Detach Boundaries](./spring-persistence-context-flush-clear-detach-boundaries.md)\n- [N+1 Query Detection and Solutions](../database/n-plus-one-query-detection-solutions.md)\n- [JDBC · JPA · MyBatis 기초](../database/jdbc-jpa-mybatis-basics.md)\n\nretrieval-anchor-keywords: lazy loading dto mapping checklist, service dto conversion point, lazy initialization exception dto, osiv dto mapping beginner, jpa fetch strategy checklist, controller entity return lazy loading, service dto 변환 시점, 지연 로딩 dto 변환 체크리스트, lazy loading 어디서 dto 로 바꾸나, osiv 켜져 있을 때 dto 변환, fetch join entity graph beginner, lazy initialization exception 초급자, spring lazy loading dto mapping checklist basics, spring lazy loading dto mapping checklist beginner, spring lazy loading dto mapping checklist intro\n\n## 먼저 mental model 한 줄\n\n`LAZY`는 \"필요할 때 SQL을 더 날릴 수 있다\"는 뜻이고, DTO 변환은 그 SQL이 **어디서 일어나도 되는지 경계를 정하는 작업**이다.\n\n초급자는 먼저 이렇게 잡으면 된다.\n\n- 조회 계획은 repository/service에서 정한다.\n- DTO 변환은 보통 service transaction 안에서 끝낸다.\n- controller는 DTO를 받아 응답으로 내보낸다.\n- OSIV가 켜져 있어도 \"controller에서 lazy loading 해도 된다\"는 뜻은 아니다.\n\n## 30초 체크리스트\n\n| 체크 항목 | 초급자 기본값 | 왜 이렇게 하나 |\n|---|---|---|\n| 엔티티를 어디까지 들고 가나 | service 안까지만 | transaction 경계 밖 lazy 접근을 줄인다 |\n| DTO는 어디서 만드나 | service 안에서 | 필요한 SQL을 한 경계 안에 묶는다 |\n| fetch 전략은 어떻게 정하나 | 응답에 필요한 연관만 쿼리 시점에 미리 결정 | 직렬화 중 숨은 SQL을 막는다 |\n| controller가 엔티티를 반환하나 | 가능하면 피한다 | Jackson 직렬화가 lazy loading을 터뜨릴 수 있다 |\n| OSIV가 켜져 있으면 안전한가 | 아니오 | 예외를 숨기는 대신 N+1과 늦은 SQL을 남길 수 있다 |\n\n## 가장 안전한 흐름\n\n```text\nController\n  -> Service (@Transactional readOnly = true)\n  -> 필요한 연관만 조회\n  -> Service 안에서 DTO 변환 완료\n  -> Controller는 DTO만 반환\n```\n\n핵심은 \"엔티티 조회\"와 \"DTO에 필요한 필드 읽기\"를 같은 transaction 안에 두는 것이다.\n\n## fetch 전략, DTO 변환 시점, OSIV를 한 장으로 묶기\n\n| 질문 | 좋은 기본값 | 흔한 실수 |\n|---|---|---|\n| 연관 객체를 언제 읽을지 | 응답에 필요하면 조회 시점에 함께 준비 | 그냥 `LAZY`로 두고 나중에 알아서 읽히길 기대 |\n| DTO를 언제 만들지 | service 메서드 안에서 | controller나 serializer에서 엔티티를 펼치며 생성 |\n| OSIV를 어떻게 해석할지 | 늦은 lazy loading을 허용하는 옵션으로 이해 | \"OSIV on이면 엔티티 직접 반환해도 괜찮다\"로 오해 |\n\n## 예시로 보면 더 덜 헷갈린다\n\n### 헷갈리기 쉬운 코드\n\n```java\n@GetMapping(\"/orders/{id}\")\npublic OrderResponse find(@PathVariable Long id) {\n    Order order = orderService.findById(id);\n    return new OrderResponse(\n        order.getId(),\n        order.getMember().getName()\n    );\n}\n```\n\n겉보기엔 단순하지만 초급자 관점에서는 위험 신호가 있다.\n\n- `order.getMember()`가 lazy면 controller에서 추가 SQL이 나갈 수 있다.\n- OSIV off면 여기서 `LazyInitializationException`이 날 수 있다.\n- OSIV on이면 예외는 안 나도, SQL이 controller/직렬화 시점으로 밀린다.\n- controller가 엔티티를 직접 반환할 때 같은 문제가 왜 더 쉽게 생기는지는 [Controller Entity Return vs DTO Return Primer](./spring-controller-entity-return-vs-dto-return-primer.md)에서 따로 볼 수 있다.\n\n### 더 안전한 기본 코드\n\n```java\n@Transactional(readOnly = true)\npublic OrderResponse findById(Long id) {\n    Order order = orderRepository.findDetailById(id)\n        .orElseThrow();\n\n    return new OrderResponse(\n        order.getId(),\n        order.getMember().getName()\n    );\n}\n```\n\n이 버전의 핵심은 두 가지다.\n\n- 어떤 연관을 읽을지 `findDetailById`에서 미리 정한다.\n- DTO 변환을 transaction 안에서 끝낸다.\n\n## fetch 전략은 \"항상 eager\"가 아니라 \"이번 응답에 필요한 만큼\"\n\n초급자가 많이 미끄러지는 지점은 `LAZY`와 `EAGER`를 전역 성격처럼 외우는 것이다.\n\n| 선택 | 초급자 해석 | 기억할 점 |\n|---|---|---|\n| `LAZY` | 지금은 안 읽고, 필요하면 나중에 읽는다 | 나중에 읽는 지점이 transaction 밖이면 문제다 |\n| `EAGER` | 항상 같이 읽으려는 쪽이다 | 모든 조회에 무거워질 수 있어 기본 해결책이 아니다 |\n| fetch join / `@EntityGraph` | 이번 조회에서만 필요한 연관을 같이 읽는다 | 응답 DTO가 요구하는 데이터에 맞춰 선택한다 |\n\n그래서 초급자 기본값은 이것이다.\n\n- 연관 매핑 기본은 보수적으로 본다.\n- 응답 DTO에 꼭 필요한 연관만 조회 메서드에서 명시한다.\n- fetch join과 `@EntityGraph` 중 무엇을 먼저 고를지 헷갈리면 [Mini Card](./spring-fetch-join-vs-entitygraph-dto-read-mini-card.md) 기준으로 \"기본 Repository 메서드 보강이면 `@EntityGraph`, 커스텀 JPQL이면 fetch join\"부터 적용한다.\n- 애초에 엔티티를 읽지 않고 응답용 값만 바로 뽑아도 되는지 헷갈리면 [DTO Projection vs Entity Loading Mini Card for Read-Only Responses](./spring-dto-projection-vs-entity-loading-readonly-response-mini-card.md)를 먼저 본다.\n- \"엔티티를 반환해도 되겠지\"보다 \"DTO가 필요한 필드를 지금 다 준비했나\"를 먼저 본다.\n\n## OSIV를 어떻게 받아들여야 하나\n\nOSIV는 편의 기능이지만, 초급자에게는 먼저 \"문제를 늦게 드러낼 수 있는 옵션\"으로 이해하는 편이 안전하다.\n\n| 상황 | OSIV off에서 보이는 것 | OSIV on에서 보이는 것 |\n|---|---|---|\n| service 밖 lazy 접근 | 빨리 실패한다 | 일단 동작할 수 있다 |\n| controller DTO 변환 | 경계 위반이 바로 드러난다 | 숨은 SQL이 늦게 실행될 수 있다 |\n| N+1 추적 | 비교적 빨리 눈에 띈다 | 직렬화 시점까지 밀려 더 찾기 어렵다 |\n\n초급자 기준으로는 OSIV 설정값보다 아래 질문이 더 중요하다.\n\n- \"DTO 변환을 service 안에서 끝냈나?\"\n- \"응답에 필요한 연관을 조회 시점에 명시했나?\"\n\n## 자주 하는 오해 4개\n\n- \"`LAZY`면 무조건 좋은 최적화다\"가 아니다. 어디서 초기화되는지 모르면 예외나 N+1로 돌아온다.\n- \"`OSIV on`이면 문제없다\"가 아니다. 예외를 숨길 뿐, controller SQL과 숨은 N+1은 남을 수 있다.\n- \"`DTO는 controller에서 만들어도 된다`\"가 아니다. 초급자 기본값은 service transaction 안 DTO 변환이다.\n- \"`EAGER`로 바꾸면 끝난다\"가 아니다. 필요한 조회마다 fetch plan을 정하는 쪽이 더 예측 가능하다.\n\n## 초급자용 한 줄 결론\n\nlazy loading 혼란을 줄이는 가장 쉬운 방법은 \"`어떤 연관을 읽을지`는 조회 시점에 정하고, `DTO로 닫는 시점`은 service transaction 안에 두며, `OSIV`는 그 경계를 무너뜨릴 수 있는 편의 옵션으로 경계한다\"라고 기억하는 것이다.\n\n## 한 줄 정리\n\n초급자는 \"엔티티는 service 안에서 필요한 만큼만 읽고, DTO는 그 안에서 닫아서 반환하며, OSIV는 문제를 숨길 수 있다\"를 기본값으로 잡으면 lazy loading 혼란을 크게 줄일 수 있다.\n",
   "aliases": [
+    "Lazy Loading to DTO 개념",
+    "Lazy Loading to DTO 정리",
+    "Lazy Loading to DTO 실수",
+    "Lazy Loading to DTO 판단 기준",
+    "스프링 Lazy Loading to DTO",
     "lazy loading DTO mapping",
     "service DTO conversion point",
     "LazyInitializationException DTO",
     "OSIV DTO mapping",
     "JPA fetch strategy checklist",
     "controller entity return lazy loading",
-    "fetch join EntityGraph beginner",
-    "@GetMapping",
-    "@PathVariable",
-    "@Transactional"
+    "fetch join EntityGraph beginner"
   ],
   "expected_queries": [
     "JPA lazy loading은 DTO 변환을 service 안에서 끝내야 해?",
@@ -46,8 +48,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/spring-lazy-loading-dto-mapping-checklist.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch162"
+      }
+    ]
   }
 }
