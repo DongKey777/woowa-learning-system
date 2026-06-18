@@ -1,0 +1,68 @@
+{
+  "id": "language/g1-evacuation-failure-to-space-exhausted-allocation-stall-bridge",
+  "title": "G1 Evacuation Failure To-Space Exhausted Allocation Stall Bridge",
+  "category": "language",
+  "level": "advanced",
+  "summary": "G1에서 region evacuation 중 survivor 또는 old로 옮길 공간이 부족해 to-space exhausted/overflow 신호가 나오고, 이것이 allocation stall과 Full GC fallback, p99 latency spike로 이어지는 과정을 GC log, JFR, heap 지표로 연결하는 운영 bridge다.",
+  "body_markdown": "# G1 Evacuation Failure, To-Space Exhausted, Allocation Stall Bridge\n\n> 한 줄 요약: G1의 to-space exhausted는 단순히 young 영역이 찼다는 말이 아니라, collection set의 살아 있는 객체를 survivor나 old 쪽 목적지로 대피시킬 free region/headroom이 부족해 evacuation이 깨지고, 그 결과 mutator allocation이 멈추거나 Full GC fallback으로 이어질 수 있다는 신호다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: G1 evacuation failure, G1 to-space exhausted, G1 to-space overflow, G1 allocation stall, G1 Full GC fallback, survivor promotion pressure, G1 promotion failure symptom, GC log Full GC preceded by evacuation failure, p99 latency GC pause bridge\n\n## 먼저 용어를 연결하기\n\nG1은 heap을 여러 region으로 나누고, young GC나 mixed GC pause에서 수집 대상 region 묶음, 즉 collection set을 고른다. pause 안에서 G1은 그 region 안의 살아 있는 객체를 다른 region으로 복사한다. 이 복사 작업을 evacuation이라고 부른다. 복사가 끝나면 원래 region은 비울 수 있고, 애플리케이션은 새 위치의 객체를 보게 된다.\n\n여기서 to-space는 하나의 고정된 공간 이름이라기보다, evacuation 중 살아 있는 객체가 옮겨 갈 목적지 공간을 가리키는 운영적 표현으로 이해하면 좋다. 짧게 살 객체는 사라지고, 아직 살아 있는 객체는 survivor 쪽으로 남거나 old 쪽으로 promotion된다. 이때 survivor 목적지, promotion 목적지, GC worker가 쓰는 복사 buffer, free region 여유가 충분해야 evacuation이 성공한다.\n\n## to-space exhausted가 의미하는 것\n\nOracle G1 tuning 문서 계열에서는 to-space overflow/exhausted를 G1이 survivor 객체나 promoted 객체를 위한 메모리를 확보하지 못한 상황으로 설명한다. 특히 heap이 이미 최대치에 가까워 더 키울 수 없는 상태라면 새 목적지 region을 준비하기 어렵다. 이 문서는 그 설명을 보수적으로 받아들인다. 즉 to-space exhausted는 특정 JDK의 정확한 로그 문자열 암기 문제가 아니라, **살아남은 객체를 안전하게 옮길 목적지 headroom이 부족했다**는 신호다.\n\n이 신호가 무서운 이유는 G1의 일반 경로가 '복사해서 원래 region을 비운다'이기 때문이다. 복사할 곳이 부족하면 일부 객체를 이동하지 못하고, 원래 region을 깔끔하게 회수하지 못하며, GC 이후 free region이 기대만큼 늘지 않는다. 그러면 다음 allocation이 다시 막히고, 다음 pause가 더 커지고, 마지막에는 더 강한 stop-the-world 정리 경로가 필요해질 수 있다.\n\n## evacuation failure는 왜 멈춤으로 보이나\n\nEvacuation failure는 collection set 안의 live object를 모두 목적지로 옮기지 못한 상태다. 애플리케이션 thread는 GC pause 중 멈춰 있고, GC는 실패한 객체를 special case로 처리해야 한다. 객체가 일부는 옮겨지고 일부는 제자리에 남는 상황을 참조 갱신과 remembered set 관점에서 일관되게 마무리해야 하므로, 성공적인 young/mixed pause보다 비용이 커질 수 있다.\n\n더 중요한 운영 효과는 pause 하나의 길이보다 이후의 압박이다. Evacuation 실패 후에는 원래 기대했던 만큼 region이 반환되지 않을 수 있다. old occupancy와 live set이 높은 상태라면 다음 allocation을 위한 free region이 계속 부족하다. 이 상태에서 애플리케이션이 새 객체를 만들려고 하면 TLAB refill, 큰 배열 allocation, humongous allocation, promotion destination 확보 같은 지점에서 대기나 실패가 보일 수 있다. 운영자가 보는 표현이 allocation stall, allocation failure, Full GC 직전의 긴 멈춤, p99/p999 spike로 달라질 뿐 같은 시간축의 heap headroom 부족으로 이어지는 경우가 많다.\n\n## allocation stall과 Full GC 로그를 잇는 방법\n\nFull GC는 원인 그 자체라기보다 앞선 실패의 fallback 결과로 나타나는 경우가 많다. OpenJDK 이슈나 운영 사례에서도 Full GC 앞에 evacuation failure 또는 to-space exhausted 계열 태그가 먼저 보이는 패턴이 자주 언급된다. 다만 JDK 버전과 log 설정에 따라 정확한 단어, tag, phase 이름은 달라질 수 있다. 그래서 답변에서는 특정 문자열 하나에 의존하지 말고 다음 순서로 읽는다.\n\n1. 같은 시간 창에서 request p99/p999 spike 또는 timeout이 있었는지 잡는다.\n2. 그 직전 GC log에서 young/mixed pause가 있었고, 그 pause 안팎에 evacuation failure, to-space exhausted, to-space overflow 같은 신호가 있었는지 본다.\n3. pause 전후 heap used, old occupancy, survivor 사용량, free region 여유, humongous region 증가를 같이 본다.\n4. 이후 allocation stall, allocation failure, TLAB refill 실패, outside TLAB 증가, 큰 object allocation이 이어졌는지 본다.\n5. 마지막에 Full GC 또는 compacting pause가 발생했는지 확인한다.\n\n핵심은 'Full GC가 떴다'에서 시작하지 않는 것이다. 더 좋은 표현은 'Full GC 직전 G1이 evacuation 목적지 공간을 못 마련했고, free region 부족 때문에 application allocation이 막혔는지 보자'다.\n\n## 로그와 지표에서 볼 것\n\nGC log에서는 평균 pause보다 sequence가 중요하다. 한 줄만 떼어 읽지 말고, 문제 시각 전후 몇 분을 연속으로 본다. 확인할 축은 다음과 같다.\n\n| 축 | 질문 | 해석 |\n|---|---|---|\n| Heap headroom | pause 전 heap이 max에 가까웠는가 | 더 키울 수 없으면 to-space 확보가 어렵다 |\n| After-GC live set | GC 후에도 used/old baseline이 높은가 | retention, cache, traffic working set 증가 가능성 |\n| Young/survivor pressure | survivor가 많이 차거나 promotion이 많았는가 | 살아남는 객체가 많아 evacuation 목적지를 압박한다 |\n| Humongous allocation | 큰 배열, 큰 byte buffer, 큰 string payload가 늘었는가 | region 단위 여유를 빠르게 잠식할 수 있다 |\n| Allocation rate | bytes/s 또는 bytes/request가 튀는가 | live set이 같아도 churn이 GC 빈도와 pause를 키운다 |\n| Full GC count/duration | evacuation 실패 뒤 더 긴 STW가 왔는가 | fallback 정리 비용이 사용자 latency로 보일 수 있다 |\n| Safepoint overlap | 모든 thread가 멈춘 시간이 요청 spike와 겹치는가 | GC가 사용자 p99 원인인지 검증한다 |\n\nJFR/JMC에서는 `Garbage Collection`, `GC Pause`, allocation 관련 event, thread state, safepoint event를 같은 timeline에 놓는다. allocation event 이름과 sampling 방식은 JDK와 설정에 따라 달라질 수 있으므로, 'JFR에 안 보인다'를 '할당이 없다'로 해석하지 않는다. 그래도 top allocation stack, request당 allocation bytes, 큰 배열/버퍼 생성 지점, serializer/DTO mapping/copy path는 반드시 본다.\n\n운영 명령은 환경 절차를 따른다. 재현이나 canary에서는 GC와 safepoint 로그를 함께 남기고, 짧은 JFR을 떠서 spike 창을 확인한다. 장애 중 heap dump는 stop-the-world와 디스크 비용이 크므로 retention 근거가 있을 때 선택한다.\n\n## leak, allocation churn, G1 headroom 문제를 나누기\n\nTo-space exhausted가 보였다고 곧바로 memory leak이라고 단정하면 위험하다. 세 가지가 섞일 수 있다.\n\n- Live set 증가: cache, queue, static map, session, ThreadLocal, listener retention 때문에 GC 후에도 old baseline이 오른다.\n- Allocation churn 증가: heap은 회수되지만 매초 만드는 객체가 너무 많아 young GC와 survivor pressure가 커진다.\n- Headroom 부족: live set이 정상 범위여도 heap sizing, traffic burst, 큰 object, pause target에 따른 collection set 규모 때문에 evacuation 여유가 부족할 수 있다.\n\n분기 규칙은 단순하다. GC 후 baseline이 여러 주기 동안 올라가면 살아남는 객체를 찾는다. Baseline은 안정적인데 GC 빈도와 allocation stack이 튀면 allocation rate를 줄인다. 둘 다 아니고 특정 큰 allocation이나 humongous region이 문제라면 payload 크기, buffer lifetime, chunking, streaming을 본다. Collector option은 이 증거를 본 뒤에 조정한다.\n\n## 대응 우선순위\n\n가장 먼저 할 일은 heap을 무작정 키우거나 collector를 바꾸는 것이 아니다. 운영 순서는 보통 아래가 안전하다.\n\n1. 동일 시간축으로 request latency, GC pause, safepoint, allocation rate, heap after GC를 맞춘다.\n2. Full GC 직전의 young/mixed pause에 evacuation failure/to-space 부족 신호가 있었는지 확인한다.\n3. old/live set이 높은지, allocation churn이 높은지, humongous/large allocation이 많은지 나눈다.\n4. hot path에서 DTO copy, JSON serialization, logging formatting, collection copy, large buffer per request를 줄인다.\n5. cache, queue, batch buffer, response aggregation처럼 오래 사는 객체를 제한한다.\n6. heap headroom, G1 reserve, marking start timing, pause target 같은 설정은 사용하는 JDK 문서와 실제 workload 기준으로 보수적으로 검토한다.\n7. 그래도 GC pause tail이 서비스 SLO를 해치고 CPU/memory headroom을 감당할 수 있으면 ZGC 같은 low-pause collector 실험을 별도로 비교한다.\n\n여기서 중요한 점은 G1 튜닝도 결국 headroom을 어디에 둘 것인가의 문제라는 것이다. Pause target을 낮추는 선택은 pause당 작업량을 줄이는 대신 cycle 빈도와 background work를 바꿀 수 있고, heap을 키우는 선택은 allocation stall을 늦출 수 있지만 Full GC가 발생했을 때 pause tail을 키울 수 있다. 정확한 flag 이름이나 기본값보다, workload의 live set과 allocation rate가 먼저다.\n\n## 짧은 답변 템플릿\n\n학습자가 'to-space exhausted가 뭐야?'라고 물으면 이렇게 답하면 된다.\n\nG1은 GC pause 중 살아 있는 객체를 다른 region으로 대피시키는데, 그 목적지 공간이 부족하면 to-space exhausted/overflow 신호가 나온다. survivor로 남길 객체나 old로 promotion할 객체를 옮길 공간이 부족한 것이다. 이때 evacuation failure가 발생하면 원래 region을 충분히 비우지 못하고, 이후 application allocation이 free region 부족 때문에 멈출 수 있다. 그래서 로그에서는 evacuation failure나 to-space exhausted가 먼저 보이고, 이어서 allocation stall 또는 Full GC가 보이는 흐름으로 해석한다. 확인할 지표는 GC 전후 heap, old/live set, survivor/promotion pressure, humongous allocation, allocation rate, JFR allocation stack, request p99와 safepoint overlap이다.\n\n## 자주 하는 오해\n\n- to-space exhausted를 단순 young generation 용량 부족으로만 본다. 실제로는 survivor/promotion 목적지와 전체 heap headroom 문제까지 포함한다.\n- Full GC 로그만 보고 그 앞의 evacuation failure 신호를 놓친다.\n- heap dump 한 장으로 allocation churn을 찾으려 한다. churn은 dump 시점에 이미 사라질 수 있다.\n- G1에서 ZGC로 바꾸면 allocation stall 원인이 사라진다고 기대한다. Collector 변경은 pause 표현 방식을 바꿀 수 있지만 bytes/request와 live set은 코드와 데이터 구조 문제다.\n- 버전별 log tag 하나를 외워서 모든 장애에 적용한다. 운영에서는 timestamp sequence와 여러 지표의 동시성을 봐야 한다.\n\n## 한 줄 정리\n\nG1 evacuation failure와 to-space exhausted는 '살아 있는 객체를 옮길 목적지 공간이 부족했다'는 신호이고, 이 신호를 allocation stall과 Full GC fallback, request p99 spike까지 같은 시간축으로 연결해야 실제 원인 분석이 된다.\n",
+  "aliases": [
+    "G1 evacuation failure",
+    "G1 to-space exhausted",
+    "G1 to-space overflow",
+    "G1 allocation stall",
+    "G1 Full GC fallback",
+    "G1 promotion pressure",
+    "G1 대피 실패",
+    "to-space 부족",
+    "G1 할당 정지",
+    "Full GC 직전 evacuation failure",
+    "survivor 공간 부족"
+  ],
+  "expected_queries": [
+    "to-space exhausted가 뭐야?",
+    "G1 evacuation failure가 나면 왜 멈춰?",
+    "allocation stall이랑 Full GC 로그를 어떻게 연결해?",
+    "G1 GC 로그에서 to-space exhausted 다음 Full GC가 보이면 어떤 순서로 해석해야 해?",
+    "survivor 공간이 부족하면 G1이 왜 promoted object를 못 옮기고 pause가 길어져?",
+    "p99 지연과 G1 evacuation failure to-space exhausted 신호를 JFR/GC log로 같이 보는 방법 알려줘"
+  ],
+  "symptoms": [
+    "G1 Full GC 로그만 보고 그 직전의 evacuation failure 또는 to-space exhausted 신호를 확인하지 않는다",
+    "to-space exhausted를 단순히 young 영역이 찬 상태로만 이해하고 survivor, promotion, free region headroom을 연결하지 못한다",
+    "allocation stall을 애플리케이션 lock 문제로만 보고 GC free region 부족과 timestamp를 맞춰 보지 않는다",
+    "collector 변경으로 allocation rate와 live set 문제가 자동 해결될 것이라고 기대한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/g1-vs-zgc",
+      "language/gc-allocation-rate-symptom-router",
+      "language/jvm-gc-allocation-pause-tail-latency-perspective-map",
+      "language/jvm-gc-jmm-overview"
+    ],
+    "next_docs": [
+      "language/jfr-jmc-performance-playbook",
+      "language/tlab-plab-allocation-intuition",
+      "language/oom-heap-dump-playbook"
+    ],
+    "confusable_with": [
+      "language/allocation-rate-vs-memory-leak-chooser",
+      "language/gc-root-retention-analysis",
+      "language/memory-leak-perspective-map-heap-offheap-threadlocal",
+      "language/safepoint-stop-the-world-diagnostics"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch167",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch167-worker-b"
+      }
+    ]
+  }
+}

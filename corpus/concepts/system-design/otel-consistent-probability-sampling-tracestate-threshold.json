@@ -1,0 +1,66 @@
+{
+  "id": "system-design/otel-consistent-probability-sampling-tracestate-threshold",
+  "title": "OTel Consistent Probability Sampling Tracestate Threshold",
+  "category": "system-design",
+  "level": "advanced",
+  "summary": "OpenTelemetry consistent probability sampling은 각 서비스가 자기 자리에서 독립적으로 판단하더라도 같은 trace에 대해 호환되는 sample/drop 결정을 하도록 공통 randomness와 rejection threshold를 전파하는 샘플링 모델이다.",
+  "body_markdown": "# OTel Consistent Probability Sampling Tracestate Threshold\n\n## 한 줄 모델\n\nOpenTelemetry consistent probability sampling은 \"각 서비스가 동전을 새로 던지는 방식\"이 아니라, **trace 전체가 공유하는 randomness `R`과 샘플링 확률에서 나온 rejection threshold `T`를 비교하는 방식**이다. 같은 `R`을 보고, 각 참여자가 자기 `T`와 비교하면 서로 다른 SDK, 서비스, collector가 독립적으로 실행되어도 sample/drop 결정이 호환된다.\n\n공식 OpenTelemetry 문서의 핵심 표현을 보수적으로 옮기면 이렇다.\n\n```text\n공통 randomness R >= rejection threshold T 이면 keep\n공통 randomness R <  rejection threshold T 이면 drop\n```\n\n여기서 `T`는 \"몇 퍼센트를 저장할까\"를 직접 문자열로 넣은 값이 아니라, sampling probability에서 계산된 rejection threshold다. OpenTelemetry는 이 threshold를 TraceState의 OpenTelemetry sampling state 안에서 `th` sub-key로 표현한다. randomness는 W3C Trace Context Level 2가 기대하는 TraceID의 뒤쪽 randomness를 쓸 수 있고, 필요한 경우 OpenTelemetry TraceState의 `rv` sub-key로 explicit randomness value를 전파할 수 있다. 정확한 encoding과 갱신 규칙은 SDK/collector가 따라야 할 spec 영역이고, 애플리케이션이 새 header를 만들어 흉내 낼 문제가 아니다.\n\n## 왜 이런 모델이 필요한가\n\n분산 trace는 gateway, application, queue consumer, worker, collector처럼 여러 지점을 지나간다. 각 지점이 독립적인 난수로 \"나는 10%만 저장\"을 실행하면 같은 trace 안에서도 upstream span은 있고 downstream span은 없는 조각난 결과가 쉽게 나온다. 비용은 줄었지만 장애 분석에서 보고 싶은 호출 경로는 사라진다.\n\nconsistent probability sampling은 이 문제를 \"같은 요청 흐름에는 같은 random 기준값을 보자\"로 푼다.\n\n- root 쪽에서 만들어진 trace randomness를 downstream이 재사용한다.\n- 각 참여자는 자기 sampling probability를 threshold로 바꿔 같은 randomness와 비교한다.\n- 더 높은 sampling probability를 쓰는 곳은 이미 낮은 probability에서 keep된 trace를 같이 keep할 수 있다.\n- 더 낮은 sampling probability로 추가 축소하는 downstream 단계는 그 사실을 threshold state로 남겨 이후 단계와 분석 도구가 알 수 있게 한다.\n\n즉 일관성의 핵심은 중앙 서버가 모든 결정을 내려 주는 것이 아니다. **같은 trace context 안에 비교 가능한 randomness와 threshold 상태를 싣고 다니게 하는 것**이다.\n\n## head sampling과 뭐가 다른가\n\nhead sampling은 결정 시점의 이름이다. 요청 초반, 보통 span 생성 시점에 저장 여부를 빠르게 정한다. tail sampling은 trace가 끝난 뒤 collector가 error, latency, route 같은 결과를 보고 정한다.\n\nconsistent probability sampling은 결정 시점이 아니라 결정이 서로 맞물리게 만드는 규칙에 가깝다. 그래서 아래처럼 나눠서 봐야 한다.\n\n| 질문 | head sampling | consistent probability sampling |\n|---|---|---|\n| 무엇을 말하나 | 요청 초반에 결정한다는 시점 | 같은 trace에서 호환되는 확률 결정을 만든다는 규칙 |\n| 주요 장점 | 비용을 빨리 줄이고 단순하다 | 여러 서비스가 독립 판단해도 trace가 덜 조각난다 |\n| 실패 모드 | 나중에 난 error trace를 놓칠 수 있다 | context 전파가 끊기거나 randomness 가정이 틀리면 일관성이 약해진다 |\n| 같이 쓸 수 있나 | 가능 | head sampler가 같은 `R`/`T` 모델을 쓰면 가능 |\n\n따라서 \"consistent sampling = tail sampling\"도 아니고, \"head sampling과 반대\"도 아니다. 더 정확한 문장은 \"head sampling을 하더라도 각 서비스가 같은 trace randomness와 threshold 체계를 쓰면 consistent probability sampling이 될 수 있다\"다.\n\n## `th`와 `rv`를 왜 전파하나\n\n`th`는 이 span 또는 context가 어떤 effective sampling probability를 거쳐 살아남았는지 표현하는 threshold 상태다. downstream collector가 다시 줄이거나, backend가 sampled telemetry의 adjusted count를 계산하거나, 다른 sampler가 부모/이전 단계의 결정을 이해하려면 단순한 sampled flag만으로는 부족하다. sampled flag는 \"남겼다\"만 말하고, \"어떤 확률을 대표하는 샘플인가\"를 충분히 말하지 못한다.\n\n`rv`는 explicit randomness value다. 모든 환경에서 TraceID의 뒤쪽 bits가 충분히 random하다고 확신할 수 있으면 TraceID randomness를 쓸 수 있다. 하지만 구형 SDK, 커스텀 ID generator, 다른 trace context 구현을 지나온 경우에는 그 가정이 흐려질 수 있다. 이때 OpenTelemetry는 TraceState 안의 `rv` sub-key로 별도 randomness를 전파할 수 있게 한다. 중요한 점은 `rv`가 있다면 같은 trace에서 마음대로 바꾸는 값이 아니라는 것이다. 바꾸면 각 서비스가 서로 다른 동전을 보고 판단하는 셈이 되어 일관성의 장점이 사라진다.\n\n짧게 정리하면:\n\n- `R`: 모두가 비교할 공통 random 기준값\n- `T`: sampling probability에서 나온 rejection threshold\n- `th`: OpenTelemetry TraceState에 실리는 threshold 표현\n- `rv`: TraceID randomness 대신 쓸 수 있는 explicit randomness 표현\n\n이 값들은 tenant id, user id, debug memo를 넣는 baggage가 아니다. 운영자가 DevTools에서 손으로 해석해야 하는 request id도 아니다. trace sampling 시스템이 확률과 대표성을 유지하기 위해 쓰는 내부 상태에 가깝다.\n\n## 숫자 직관\n\nsampling probability가 낮을수록 rejection threshold는 높아진다. 예를 들어 1%만 keep하려면 대부분의 randomness가 threshold보다 작아서 drop되고, 아주 큰 randomness 값만 keep된다. 반대로 100% sampling이면 reject할 구간이 없으므로 threshold는 가장 낮은 쪽이 된다.\n\n이 구조의 장점은 포함 관계다. 1% 기준에서 살아남은 trace는 같은 randomness를 기준으로 10%, 50%, 100% 기준에서도 살아남는다. 그래서 upstream이 더 엄격한 낮은 sampling probability로 keep한 trace를 downstream의 더 넓은 probability sampler가 다시 drop하지 않는 구성이 가능하다. 반대로 downstream이 더 엄격하게 줄이면 trace 일부가 빠질 수 있으므로, 그런 축소는 의도된 downstream sampling 단계로 보고 threshold state를 올바르게 남겨야 한다.\n\n## 실무에서 확인할 것\n\n1. 모든 서비스가 trace context propagation을 유지하는가. `traceparent`가 끊기면 randomness와 threshold 상태도 함께 끊길 수 있다.\n2. SDK/collector 조합이 OpenTelemetry ProbabilitySampler와 TraceState sampling state를 실제로 지원하는가. 문서의 개념만 알고 설정은 구형 sampler에 남아 있으면 기대와 다르게 동작한다.\n3. TraceID randomness를 신뢰할 수 있는가. 구형 SDK나 커스텀 ID generator가 섞이면 explicit randomness 또는 호환성 경고를 확인해야 한다.\n4. downstream collector가 local random resampling으로 span을 버리고 있지 않은가. 비용 절감 장치가 trace completeness를 해치면 consistent sampling의 이점이 줄어든다.\n5. logs, metrics exemplar, traces가 같은 trace id로 연결되는가. sampling은 모든 trace를 저장하지 않으므로 full trace가 없는 경우의 조사 경로도 필요하다.\n\n## 흔한 오해\n\n- `th`를 \"sampling rate 문자열\"로 생각한다. 실제로는 rejection threshold 표현으로 보는 편이 안전하다.\n- `rv`를 새 correlation id처럼 로그에 뿌린다. `rv`는 sampling randomness이지 사용자 요청 검색 키가 아니다.\n- 서비스마다 같은 10%를 설정했으니 자동으로 trace가 이어진다고 믿는다. 같은 확률이어도 각 서비스가 독립 난수를 쓰면 trace는 조각날 수 있다.\n- ParentBased sampler의 sampled flag 전파와 consistent probability sampling을 같은 것으로 본다. sampled flag 전파는 부모 결정을 따르는 정책이고, consistent probability sampling은 randomness와 threshold로 확률적 포함 관계를 유지하는 모델이다.\n- consistent sampling을 켜면 rare error를 항상 잡는다고 생각한다. 결과를 보고 고르는 tail policy가 아니므로, error 보존은 별도 tail sampling 또는 error-specific policy와 함께 설계해야 한다.\n\n## 답변 프레임\n\n학습자가 \"OTel consistent sampling이 뭐야?\"라고 물으면 이렇게 답하면 된다.\n\n1. trace마다 공유되는 randomness를 둔다.\n2. 각 sampler는 자기 sampling probability를 rejection threshold로 바꾼다.\n3. 모든 참여자가 같은 randomness와 자기 threshold를 비교한다.\n4. threshold와 explicit randomness 같은 상태를 OpenTelemetry TraceState로 전파해 downstream도 같은 기준을 이해하게 한다.\n5. 그래서 head sampling처럼 초기에 결정하더라도 서비스별 독립 난수보다 trace가 덜 조각나고, downstream 축소나 adjusted count 계산에도 근거가 남는다.\n\n한 줄로 줄이면, consistent probability sampling은 \"몇 퍼센트 뽑을까\"보다 \"여러 서비스가 같은 trace를 서로 호환되는 방식으로 뽑게 하려면 무엇을 같이 들고 다녀야 하나\"에 대한 답이다.\n",
+  "aliases": [
+    "OTel consistent sampling",
+    "consistent probability sampling",
+    "tracestate th rv",
+    "OpenTelemetry probability sampler threshold",
+    "trace randomness rejection threshold",
+    "일관된 확률 샘플링",
+    "OTel 샘플링 일관성",
+    "tracestate threshold rv",
+    "TraceID trailing randomness",
+    "분산 트레이싱 샘플링 난수"
+  ],
+  "expected_queries": [
+    "OTel consistent sampling이 뭐야?",
+    "head sampling이랑 뭐가 달라?",
+    "tracestate threshold랑 random value를 왜 전파해?",
+    "OpenTelemetry에서 th rv가 sampling decision에 어떤 역할을 해?",
+    "서비스마다 독립적으로 sampling하면 trace가 왜 조각나?",
+    "TraceID randomness랑 rv 중 뭘 써야 해?"
+  ],
+  "symptoms": [
+    "서비스마다 같은 sampling rate를 설정하면 자동으로 같은 trace가 온전하게 남는다고 생각한다",
+    "tracestate의 sampling threshold와 explicit randomness를 request id나 baggage처럼 해석한다",
+    "head sampling, tail sampling, consistent probability sampling을 같은 분류축으로 섞어서 설명한다",
+    "sampled flag만 있으면 sampled telemetry가 어떤 확률을 대표하는지 알 수 있다고 착각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/opentelemetry-trace-context-baggage-sampling-privacy-chooser",
+      "system-design/tracing-sampling-head-tail-exemplar-chooser",
+      "network/browser-devtools-traceparent-vs-tracestate-mini-card"
+    ],
+    "next_docs": [
+      "system-design/distributed-tracing-pipeline-design",
+      "spring/observability-micrometer-tracing",
+      "system-design/red-use-metrics-observability-chooser"
+    ],
+    "confusable_with": [
+      "system-design/tracing-sampling-head-tail-exemplar-chooser",
+      "network/browser-devtools-traceparent-vs-tracestate-mini-card",
+      "software-engineering/observability-logs-metrics-traces-perspective-map",
+      "network/x-request-id-gateway-app-log-trace-beginner-bridge"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch167",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch167"
+      }
+    ]
+  }
+}

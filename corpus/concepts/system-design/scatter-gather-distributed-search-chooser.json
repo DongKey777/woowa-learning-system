@@ -1,0 +1,58 @@
+{
+  "id": "system-design/scatter-gather-distributed-search-chooser",
+  "title": "Scatter-Gather Distributed Search Chooser",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "분산 검색 scatter-gather는 coordinator가 질의를 여러 shard에 동시에 보내고, query phase에서 후보 document id와 score를 모은 뒤, fetch phase에서 필요한 문서만 hydrate하여 global top-K를 만드는 실행 모델이다. 일반 로드밸런싱처럼 한 서버를 고르는 문제가 아니고, SQL join처럼 row를 관계식으로 결합하는 문제도 아니다. fanout 폭, shard timeout, score 비교 가능성, 후보 oversampling, partial result 계약을 함께 정해야 한다.",
+  "body_markdown": "# Scatter-Gather Distributed Search Chooser\n\n> 한 줄 요약: 분산 검색의 scatter-gather는 검색 질의를 여러 shard에 뿌려 후보를 모으고, coordinator가 global top-K를 합친 뒤 필요한 문서만 fetch해서 응답을 완성하는 실행 모델이다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: scatter gather search, distributed search query phase, fetch phase, shard top-k merge, search coordinator, partial shard result, document hydration, fanout latency, global top-k, 분산 검색, 검색 샤드 병합, query phase fetch phase\n\n## 먼저 잡는 멘탈모델\n\n검색 index가 커지면 하나의 노드가 전체 문서와 posting list를 들고 있기 어렵다. 그래서 문서를 여러 shard에 나눠 둔다. 사용자가 검색어를 보내면 coordinator는 관련 shard에 같은 query를 보내고, shard별 결과를 다시 모아 하나의 검색 결과처럼 보여 준다.\n\n```text\nclient query\n  -> search coordinator\n      -> shard A: local top candidates\n      -> shard B: local top candidates\n      -> shard C: local top candidates\n  -> global merge\n  -> fetch / hydrate selected docs\n  -> response\n```\n\n이 구조가 scatter-gather다. scatter는 query를 여러 shard로 흩뿌리는 단계이고, gather는 shard별 후보를 모아 global ranking과 응답을 만드는 단계다. 핵심은 \"분산해서 빨라진다\"가 아니라 **각 shard가 가진 부분 index에서 후보를 만들고, coordinator가 그 후보들을 같은 기준으로 비교한다**는 점이다.\n\n## query phase와 fetch phase\n\n분산 검색은 보통 두 단계로 나눈다.\n\n| 단계 | 하는 일 | 주고받는 데이터 | 왜 나누나 |\n|---|---|---|---|\n| Query phase | posting list 탐색, 필터 적용, scoring, shard-local top-N 후보 생성 | document id, score, sort key, shard id, routing metadata | 모든 shard에서 큰 문서 본문을 보내지 않기 위해 |\n| Fetch phase | global merge 후 선택된 문서의 source, display field, snippet, highlight를 읽음 | 최종 top-K 문서의 필요한 field | network와 field-store 비용을 top-K 근처로 제한하기 위해 |\n\nquery phase에서 shard가 full document를 전부 보내면 fanout 비용이 폭발한다. 검색 결과 page size가 20인데 50개 shard가 각자 문서 본문 20개씩 보내면 coordinator는 1000개 문서를 받아 대부분 버린다. 그래서 query phase는 가능한 한 가볍게 후보 id와 score만 보내고, fetch phase에서 최종 후보만 hydrate한다.\n\nfetch phase도 단순 조회가 아니다. highlight, snippet 생성, 권한 필터 재확인, stale/deleted 문서 제거, personalization rerank가 붙으면 일부 후보가 빠질 수 있다. 이 때문에 shard별로 정확히 K개만 가져오면 부족할 수 있고, `K + 여유분` 또는 shard별 `candidate window`를 둔다.\n\n## global top-K merge는 그냥 리스트 합치기가 아니다\n\n각 shard가 top 20을 보내면 coordinator는 이를 하나의 priority queue나 k-way merge로 합친다. 전제는 shard별 score와 sort key가 서로 비교 가능해야 한다는 것이다.\n\n```text\nshard A: (doc7,  9.8), (doc3,  8.1)\nshard B: (doc11, 9.6), (doc5,  8.7)\nshard C: (doc2,  9.9), (doc9,  7.4)\n\nglobal top 3: doc2, doc7, doc11\n```\n\n주의할 점은 많다.\n\n- score가 shard-local 통계만 쓰면 shard 간 비교가 흔들릴 수 있다.\n- 같은 score에서는 stable tie-breaker가 있어야 pagination이 흔들리지 않는다.\n- 권한 필터나 삭제 문서 제거가 fetch phase에서 일어나면 후보가 줄어든다.\n- collapse, diversity, rerank가 있으면 local top-K만으로 global top-K가 부족할 수 있다.\n- cursor pagination은 `score + tie_breaker + shard/doc id` 같은 안정적인 위치 정보를 가져야 한다.\n\n그래서 실무에서는 shard별 반환 개수를 page size보다 크게 잡는다. 예를 들어 global top 20을 만들기 위해 shard마다 top 20만 받는 것이 이론적으로 충분한 경우도 있지만, fetch 단계에서 후보가 탈락하거나 rerank가 붙으면 안전 여유가 없다. 검색 품질을 지키려면 oversampling, deterministic tie-breaker, fetch 탈락률 metric을 함께 본다.\n\n## shard 하나가 느리면 전체 latency가 튀는 이유\n\ncoordinator가 모든 shard 결과를 기다리는 정책이면 전체 응답 시간은 평균 shard 시간이 아니라 가장 느린 shard 시간에 묶인다.\n\n```text\nshard A 18ms\nshard B 21ms\nshard C 210ms  <- 전체 query가 여기까지 기다림\nshard D 19ms\n```\n\nfanout 폭이 넓어질수록 느린 branch가 하나 끼어들 확률이 올라간다. shard 1개가 p99 tail을 자주 만들면 전체 검색 p99도 따라 올라간다. 그래서 scatter-gather 설계에는 아래가 같이 들어간다.\n\n- per-shard timeout과 전체 query deadline\n- partial result를 허용할지 여부\n- 느린 shard를 다른 replica로 재시도하거나 hedging할지 여부\n- shard별 slow span을 trace에 남길지 여부\n- timeout shard가 결과 품질에 주는 영향을 측정할지 여부\n\npartial result를 허용한다면 응답과 metric에 반드시 드러내야 한다. shard 하나가 빠졌는데 사용자가 \"검색 결과 없음\"으로 오해하면 품질 문제가 장애로 번진다. 상품 탐색이나 자동완성은 partial이 허용될 수 있지만, 감사/정산/법적 검색은 fail closed가 더 안전할 수 있다.\n\n## fanout 비용을 숫자로 봐야 한다\n\nscatter-gather는 한 사용자 요청을 여러 내부 요청으로 증폭한다.\n\n- 1 query가 30 shard를 호출한다.\n- 각 shard가 replica 1개를 고른다.\n- timeout 후 hedge를 한 번 허용하면 일부 query는 60개 가까운 내부 요청을 만든다.\n- coordinator는 후보 heap, merge buffer, fetch batch를 메모리에 들고 있어야 한다.\n\n따라서 fanout width는 latency뿐 아니라 CPU, network, connection pool, thread pool, shard cache miss, failure probability를 같이 키운다. 검색이 느리다고 shard를 더 잘게 쪼개면 한 shard의 index는 작아질 수 있지만 query fanout은 더 넓어져 slowest shard 문제가 커질 수 있다.\n\n## 로드밸런싱과 다른 점\n\n일반 로드밸런싱은 보통 같은 요청을 처리할 수 있는 여러 backend 중 하나를 고른다.\n\n```text\nrequest -> load balancer -> one healthy backend\n```\n\nscatter-gather 검색은 다르다. 같은 query를 여러 shard에 보내야 전체 후보를 볼 수 있다.\n\n```text\nquery -> coordinator -> many shards -> merge\n```\n\n즉 로드밸런싱은 \"어느 한 곳에 보낼까\"가 중심이고, scatter-gather는 \"여러 곳에 보낸 결과를 어떤 의미로 합칠까\"가 중심이다. replica 선택은 로드밸런싱과 비슷한 면이 있지만, primary shard 여러 개에 fanout하고 top-K를 merge하는 부분은 별도 문제다.\n\n## DB join과 다른 점\n\nDB join은 관계형 row를 key 조건으로 결합한다. 검색 scatter-gather는 shard별 ranked candidate list를 합쳐 global ranking을 만든다. 둘 다 \"분산된 데이터를 합친다\"처럼 보이지만 질문이 다르다.\n\n| 비교 | DB join | 검색 scatter-gather |\n|---|---|---|\n| 기본 단위 | row | document candidate |\n| 결합 기준 | join key와 predicate | score, sort key, filter, ranking rule |\n| 정확성 기준 | 관계식 결과의 완전성 | top-K 품질, recall, ranking 안정성 |\n| 주된 비용 | join cardinality, shuffle, join algorithm | fanout width, shard wait, merge, fetch hydration |\n| 실패 정책 | 보통 query 실패 | 제품에 따라 partial result 가능 |\n\n검색에서 매 query마다 큰 cross-shard join을 하려 하면 latency가 버티기 어렵다. 그래서 검색 문서는 조회 시점에 필요한 field를 미리 denormalize하거나, 권한/재고/가격 같은 동적 조건은 filter index, side lookup, rerank 단계로 분리한다.\n\n## 선택 기준\n\n| 상황 | 우선 설계 |\n|---|---|\n| query가 어느 shard에 있을지 모름 | all-shard scatter, 강한 timeout과 partial policy 필요 |\n| tenant/time/category로 후보 shard를 줄일 수 있음 | shard routing과 fanout pruning 우선 |\n| page size는 작지만 문서 본문이 큼 | query phase와 fetch phase를 분리 |\n| fetch 후 권한/삭제 탈락이 많음 | shard별 oversampling과 탈락률 metric 필요 |\n| strict completeness가 필요함 | partial result 금지, deadline을 더 길게 잡거나 async export 고려 |\n| 탐색/자동완성처럼 availability가 중요함 | partial/stale cache 허용 가능, degraded marker 필요 |\n\n## 흔한 실수\n\n- shard별 top-K를 append만 하고 global sort를 하지 않는다.\n- score tie-breaker 없이 pagination cursor를 만든다.\n- query phase에서 full document source를 전부 실어 보낸다.\n- fetch phase 탈락률을 고려하지 않고 shard별 후보를 너무 적게 받는다.\n- shard timeout을 빈 결과처럼 숨긴다.\n- 로드밸런싱과 scatter-gather를 같은 분산 처리로 설명한다.\n- DB join처럼 runtime에 모든 관계를 조합하려고 하면서 검색 latency budget을 무시한다.\n\n## 관찰 지표\n\n- query fanout width\n- shard별 query phase latency\n- global merge latency\n- fetch phase latency와 hydration batch size\n- per-shard candidate count\n- fetch 탈락률(permission, delete, stale)\n- partial result rate와 missing shard count\n- slowest shard contribution\n- coordinator heap/memory usage\n- page depth별 top-K stability\n\n## 면접 답변 축\n\n분산 검색 scatter-gather를 설명할 때는 \"coordinator가 shard에 query를 fanout하고 shard-local top candidates를 받은 뒤 global top-K로 merge한다\"로 시작하면 된다. 이어서 query phase는 후보 id와 score를 가볍게 모으고, fetch phase는 최종 후보 문서를 hydrate한다고 말한다. 마지막으로 fanout이 넓어질수록 가장 느린 shard가 전체 latency를 잡고, partial result와 timeout 정책이 검색 품질 계약이라는 점을 덧붙이면 좋다.\n\n## Safe Next Docs\n\n검색 전체 큰그림은 `search-system-design`, 역색인 후보 생성은 `search-inverted-index-interview-primer`, 일반 fanout/fanin 패턴은 `fan-out-fan-in-parallel-merge-basics`로 먼저 잡는다. Shard 후보를 어떻게 줄일지는 `distributed-search-scatter-gather-shard-routing-chooser`, 검색 p99와 partial timeout 운영은 `search-shard-replica-fanout-tail-latency-playbook`으로 이어진다.\n\n## 한 줄 정리\n\nscatter-gather 분산 검색은 여러 shard에 질의를 보내는 기술보다, query phase 후보 수집과 fetch phase hydration을 분리하고 global top-K, timeout, partial result를 같은 계약으로 묶는 설계 문제다.\n",
+  "aliases": [
+    "scatter gather search",
+    "분산 검색 scatter-gather",
+    "검색 query phase",
+    "검색 fetch phase",
+    "샤드 top-k 병합",
+    "search coordinator merge",
+    "shard candidate collection",
+    "document hydration phase",
+    "partial shard result",
+    "검색 fanout merge"
+  ],
+  "expected_queries": [
+    "scatter-gather가 뭐야?",
+    "분산 검색 query phase fetch phase가 뭐야?",
+    "검색을 shard에 나눠 보내면 top K를 어떻게 합쳐?",
+    "검색 shard 하나가 느리면 전체 latency가 왜 튀어?",
+    "분산 검색이 로드밸런싱이나 DB join이랑 뭐가 달라?"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/search-system-design",
+      "system-design/search-inverted-index-interview-primer",
+      "system-design/fan-out-fan-in-parallel-merge-basics"
+    ],
+    "next_docs": [
+      "system-design/distributed-search-scatter-gather-shard-routing-chooser",
+      "system-design/search-shard-replica-fanout-tail-latency-playbook",
+      "system-design/search-index-backfill-alias-cutover-recovery-playbook"
+    ],
+    "confusable_with": [
+      "system-design/load-balancing-basics-primer",
+      "database/sql-join-basics",
+      "system-design/distributed-search-scatter-gather-shard-routing-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "batch": "batch167",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch167",
+        "note": "Initial concept focused on distributed search query/fetch phase, hydration, top-K merge, and scatter-gather boundaries."
+      }
+    ]
+  }
+}
