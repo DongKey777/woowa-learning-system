@@ -6,16 +6,18 @@
   "summary": "처음 만든 EC2에 git, curl, wget, Corretto Java, repository clone, branch checkout, Gradle build, app log/run까지 한 번에 준비하는 bootstrap script를 idempotent하게 구성하는 입문 문서다.",
   "body_markdown": "# EC2 첫 서버 Bootstrap 스크립트 Primer\n\n> 한 줄 요약: 첫 EC2 bootstrap 스크립트는 패키지 설치, Java repository 설정, Git clone/branch, Gradle build, 실행 로그를 한 번에 자동화하되, 여러 번 실행해도 망가지지 않게 idempotent하게 써야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Ubuntu apt와 Amazon Corretto repository 문제 해결 Primer](../operating-system/ubuntu-apt-corretto-repository-troubleshooting-primer.md)\n- [서버 배포 브랜치 확인과 checkout Primer](./git-server-deploy-branch-checkout-primer.md)\n- [Idempotent Deploy Script PID/Log Primer](./idempotent-deploy-script-pid-log-primer.md)\n- [Spring Boot 실행형 jar EC2 배포 Runbook](../spring/spring-boot-executable-jar-ec2-runbook.md)\n\nretrieval-anchor-keywords: EC2 first server bootstrap script, Ubuntu install git curl Java Corretto, clone branch build bootJar run app log, idempotent setup script, Spring Boot EC2 dependency install script, 처음 서버 의존성 설치 스크립트, set -euo pipefail deploy\n\n## 이 문서의 범위\n\n이 문서는 production-grade 배포 시스템이 아니라 학습용 EC2를 처음 만든 뒤 반복 가능한 상태로 만드는 bootstrap 스크립트를 다룬다. 목표는 명령어를 외우는 것이 아니라, 수동으로 하던 절차를 단계와 실패 지점이 보이게 묶는 것이다.\n\n첫 서버에서 보통 필요한 단계는 이렇다.\n\n```text\nOS package 준비\n  -> Java repository/keyring 추가\n  -> Java 21 설치\n  -> GitHub repository clone 또는 update\n  -> 원하는 branch checkout\n  -> Gradle bootJar\n  -> app.log로 실행 또는 systemd로 넘김\n  -> localhost health 확인\n```\n\n이 흐름을 한 파일에 넣되, 비밀번호나 DB secret 같은 민감한 값은 script에 직접 쓰지 않는다. bootstrap은 서버 뼈대를 만들고, 운영 secret은 환경변수, EnvironmentFile, secret store 같은 별도 경계로 넘긴다.\n\n## idempotent가 왜 중요한가\n\n스크립트는 한 번만 성공하는 것보다 다시 실행해도 안전한 것이 중요하다. EC2 세팅 중간에 네트워크가 끊기거나 apt source가 깨졌거나 Gradle build가 실패하면 학습자는 같은 스크립트를 다시 실행하게 된다. 이때 clone 대상 디렉터리가 이미 있다고 실패하거나, repository 줄을 계속 중복 추가하거나, 같은 앱 프로세스를 여러 개 띄우면 자동화가 오히려 문제를 만든다.\n\n| 단계 | 나쁜 방식 | 더 안전한 방식 |\n|---|---|---|\n| package install | 설치 여부를 추측한다 | `apt-get install -y`는 반복 실행 가능하게 둔다 |\n| repository source | `>>`로 계속 append | `.list` 파일을 정해진 내용으로 overwrite |\n| clone | 디렉터리 있으면 실패 | 있으면 fetch/pull, 없으면 clone |\n| branch | 현재 branch를 믿음 | `git switch`, `git pull --ff-only`로 맞춤 |\n| process | 매번 `nohup ... &` | 기존 PID 확인 후 종료하거나 systemd로 위임 |\n\n## 최소 bootstrap 예시\n\n아래는 학습용 예시다. 실제 repo URL과 branch는 자기 상황에 맞게 바꾼다.\n\n```bash\n#!/usr/bin/env bash\nset -euo pipefail\n\nAPP_NAME=\"roomescape\"\nREPO_URL=\"https://github.com/DongKey777/spring-roomescape-waiting.git\"\nBRANCH=\"${1:-step2}\"\nAPP_DIR=\"$HOME/spring-roomescape-waiting\"\nJAR_PATTERN=\"build/libs/*SNAPSHOT.jar\"\nLOG_FILE=\"$APP_DIR/app.log\"\n\nlog() { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] $*\"; }\n\ninstall_packages() {\n  sudo apt-get update\n  sudo apt-get install -y git curl wget gnupg ca-certificates\n}\n\ninstall_java() {\n  local keyring=/usr/share/keyrings/corretto-keyring.gpg\n  local list=/etc/apt/sources.list.d/corretto.list\n  wget -O /tmp/corretto.key https://apt.corretto.aws/corretto.key\n  sudo rm -f \"$keyring\"\n  sudo gpg --dearmor -o \"$keyring\" /tmp/corretto.key\n  echo \"deb [signed-by=$keyring] https://apt.corretto.aws stable main\" | sudo tee \"$list\" >/dev/null\n  sudo apt-get update\n  sudo apt-get install -y java-21-amazon-corretto-jdk\n}\n\nsync_repo() {\n  if [ ! -d \"$APP_DIR/.git\" ]; then\n    git clone \"$REPO_URL\" \"$APP_DIR\"\n  fi\n  cd \"$APP_DIR\"\n  git fetch origin\n  git switch \"$BRANCH\"\n  git pull --ff-only origin \"$BRANCH\"\n  log \"branch=$(git branch --show-current) commit=$(git rev-parse --short HEAD)\"\n}\n\nbuild_app() {\n  cd \"$APP_DIR\"\n  chmod +x ./gradlew\n  ./gradlew clean bootJar --no-daemon\n}\n\nrun_app() {\n  cd \"$APP_DIR\"\n  pkill -f \"$APP_NAME\" || true\n  nohup java -jar $JAR_PATTERN >> \"$LOG_FILE\" 2>&1 &\n  sleep 5\n  curl -fsS http://127.0.0.1:8080/ || true\n  log \"started; log=$LOG_FILE\"\n}\n\ninstall_packages\ninstall_java\nsync_repo\nbuild_app\nrun_app\n```\n\n이 예시는 의도적으로 단순하다. 장기 운영은 systemd 서비스 문서로 넘기는 편이 좋다. bootstrap 단계에서는 먼저 명령 순서와 실패 지점을 눈에 보이게 만드는 것이 목표다.\n\n## 실패 지점을 나누는 법\n\n| 멈춘 위치 | 확인할 것 | 관련 문서 |\n|---|---|---|\n| `apt-get update` | `.list` 문법, keyring, network | apt/Corretto troubleshooting |\n| `git clone` | repo URL, branch, GitHub 권한 | branch checkout primer |\n| `git switch` | branch 존재, detached HEAD, uncommitted change | branch checkout primer |\n| `./gradlew bootJar` | Java version, memory, disk, test failure | Gradle build lifecycle |\n| `java -jar` | port, profile, log, permission | Spring Boot EC2 runbook |\n| `curl localhost` | process alive, LISTEN, app error | Linux server debug checklist |\n\n스크립트는 실패하면 멈춰야 한다. `set -e` 없이 계속 진행하면 Java 설치가 실패했는데도 clone과 build가 이어져 더 헷갈리는 로그를 만든다. 다만 `pkill`처럼 \"없어도 괜찮은\" 명령에는 `|| true`를 붙여 실패로 보지 않는 의도를 명확히 한다.\n\n## script에 넣지 말아야 할 것\n\n- AWS access key, DB password, GitHub token 같은 secret\n- `chmod 777`처럼 원인을 숨기는 권한 완화\n- `/etc/apt` 전체 삭제 같은 넓은 복구 명령\n- `git reset --hard` 같은 소스 변경 파괴 명령\n- 기존 프로세스 확인 없이 무한히 앱을 추가 실행하는 `nohup` 반복\n\nsecret이 필요하면 최소한 `.env`나 systemd `EnvironmentFile` 같은 별도 파일로 넘기고, 그 파일은 Git에 올리지 않는다. 더 나아가면 Parameter Store, Secrets Manager, instance profile 같은 구조로 확장할 수 있다.\n\n## 언제 systemd로 넘어가나\n\nbootstrap script는 서버를 준비하는 데 좋지만, 장기 실행 프로세스 관리에는 systemd가 더 맞다. 아래 조건 중 하나라도 있으면 systemd 문서로 넘어간다.\n\n- 재부팅 후 자동 시작이 필요하다.\n- `journalctl`로 로그를 보고 싶다.\n- 실패 시 재시작 정책이 필요하다.\n- 실행 계정, WorkingDirectory, EnvironmentFile을 명시하고 싶다.\n- stop/start/status 명령을 표준화하고 싶다.\n\n즉 bootstrap은 \"처음 서버를 같은 상태로 만들기\", systemd는 \"앱 프로세스를 운영 생명주기로 관리하기\"에 가깝다.\n\n## 꼬리질문\n\n> Q: bootstrap 스크립트에 `set -euo pipefail`을 왜 넣나요?\n> 의도: 실패를 조용히 넘기지 않는 자동화 습관을 확인한다.\n> 핵심: 중간 명령 실패, 정의되지 않은 변수, pipe 중간 실패를 빨리 드러내서 뒤 단계의 가짜 오류를 줄인다.\n\n> Q: clone 디렉터리가 이미 있으면 어떻게 해야 하나요?\n> 의도: 최초 실행과 재실행을 같은 스크립트로 다루는지 확인한다.\n> 핵심: 없으면 clone하고, 있으면 `git fetch`, `git switch`, `git pull --ff-only`로 원하는 branch/commit에 맞춘다.\n\n> Q: bootstrap과 deploy script는 같은 건가요?\n> 의도: 서버 준비와 애플리케이션 교체를 구분하는지 확인한다.\n> 핵심: bootstrap은 OS/Java/repo 같은 기반을 만들고, deploy는 이미 준비된 서버에서 새 commit을 빌드/재시작하는 반복 작업이다.\n\n## 한 줄 정리\n\nEC2 첫 서버 bootstrap 스크립트는 `package -> Java -> repo branch -> build -> run -> local health`를 실패 지점이 보이게 자동화하고, 여러 번 실행해도 같은 상태로 수렴하게 만드는 작업이다.\n",
   "aliases": [
+    "처음 서버 의존성 설치 스크립트",
+    "Ubuntu Java Git Gradle 설치",
+    "EC2 첫 서버 Bootstrap 개념",
+    "EC2 첫 서버 Bootstrap 정리",
+    "EC2 첫 서버 Bootstrap 실수",
     "EC2 bootstrap script",
     "first server setup script",
-    "처음 서버 의존성 설치 스크립트",
     "Spring Boot EC2 bootstrap",
     "set -euo pipefail deploy",
     "Corretto install script",
     "git clone branch bootJar script",
-    "nohup app.log bootstrap",
-    "idempotent setup script",
-    "Ubuntu Java Git Gradle 설치"
+    "nohup app.log bootstrap"
   ],
   "expected_queries": [
     "처음 EC2 서버를 만들었다고 생각하고 git Java clone bootJar 실행까지 들어있는 스크립트를 어떻게 짜?",
@@ -53,11 +55,15 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-06-17",
         "note": "batch13 deployment-ops gap fill"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch161"
       }
     ]
   }

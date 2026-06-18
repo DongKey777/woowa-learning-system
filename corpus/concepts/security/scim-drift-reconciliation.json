@@ -6,18 +6,18 @@
   "summary": "이 문서는 security 카테고리에서 SCIM Drift / Reconciliation를 다루는 deep_dive 문서다. SCIM drift는 IdP와 서비스의 사용자, 그룹, 역할 상태가 어긋나는 현상이며, reconciliation은 그 차이를 안전하게 되돌리는 작업이다. 검색 질의가 SCIM drift, reconciliation, identity sync, directory sync처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
   "body_markdown": "# SCIM Drift / Reconciliation\n\n> 한 줄 요약: SCIM drift는 IdP와 서비스의 사용자, 그룹, 역할 상태가 어긋나는 현상이며, reconciliation은 그 차이를 안전하게 되돌리는 작업이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [SCIM Provisioning Security](./scim-provisioning-security.md)\n> - [Permission Model Drift / AuthZ Graph Design](./permission-model-drift-authz-graph-design.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n> - [SCIM Deprovisioning / Session / AuthZ Consistency](./scim-deprovisioning-session-authz-consistency.md)\n> - [Authorization Runtime Signals / Shadow Evaluation](./authorization-runtime-signals-shadow-evaluation.md)\n> - [AuthZ Decision Logging Design](./authz-decision-logging-design.md)\n> - [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n> - [Delegated Admin / Tenant RBAC](./delegated-admin-tenant-rbac.md)\n> - [System Design: Session Store / Claim-Version Cutover 설계](../system-design/session-store-claim-version-cutover-design.md)\n\nretrieval-anchor-keywords: SCIM drift, reconciliation, identity sync, directory sync, diff, backfill, orphan account, entitlement reconciliation, deprovisioning lag, source of truth, authz consistency, cleanup evidence, retirement evidence, decision log join key, audit evidence bundle, session store claim version cutover, reconciliation run id, directory event id\n\n---\n\n## 핵심 개념\n\nSCIM 동기화는 한 번 성공한다고 끝나지 않는다.  \n실제 운영에서는 IdP와 서비스 사이에 drift가 쌓인다.\n\n예:\n\n- 그룹은 바뀌었는데 서비스 반영이 늦다\n- 계정이 삭제됐는데 로컬엔 남아 있다\n- tenant 매핑이 어긋난다\n- entitlements가 뒤집힌다\n\nreconciliation은 이런 차이를 찾아서 다시 맞추는 프로세스다.\n\n---\n\n## 깊이 들어가기\n\n### 1. drift는 왜 생기나\n\n- event loss\n- retry 실패\n- partial update\n- manual override\n- schema mismatch\n- human operation delay\n\n### 2. reconciliation은 수정이 아니라 합의다\n\n무작정 덮어쓰면 안 된다.\n\n- source of truth가 어디인지 확인한다\n- 어떤 필드를 IdP가 소유하는지 정한다\n- 어떤 필드는 로컬 서비스가 소유하는지 정한다\n\n### 3. orphan account를 잡아야 한다\n\ndrift의 흔한 결과는 orphan account다.\n\n- IdP에서는 비활성인데 서비스엔 활성\n- tenant membership이 사라졌는데 role이 남아 있음\n- support 계정이 영구 권한을 유지함\n\n### 4. backfill과 replay가 필요하다\n\n새 reconciliation 프로세스를 도입하면 과거 drift도 정리해야 한다.\n\n- 과거 event replay\n- full snapshot diff\n- batch backfill\n\n### 5. dry-run이 중요하다\n\n바로 수정하면 사고가 날 수 있다.\n\n- 먼저 diff를 본다\n- 영향을 받는 계정을 집계한다\n- 큰 변경은 승인 후 반영한다\n\n### 6. reconciliation close는 session/claim retirement 입력이어야 한다\n\nreconciliation 결과를 \"row diff가 0이다\"로만 끝내면 cleanup 판단에 필요한 증거가 빠진다.\nauthority transfer나 deprovision tail 정리에서는\nSCIM repair가 실제 access shutdown과 authz convergence까지 밀어 넣었는지 남겨야 한다.\n\nretirement gate에 넘길 최소 산출물:\n\n- `reconciliation_run_id`, `directory_event_id` 또는 snapshot version\n- 어떤 `subject_id` / `tenant_id` / membership version이 바뀌었는지\n- session / refresh revoke 요청 시각과 완료 signal\n- `last_access_after_deprovision`, `orphan_grant_remaining`\n- decision/audit evidence를 다시 찾을 `request_id` / `session_id` / `policy_version`\n\n이 산출물이 있어야 [Session Store / Claim-Version Cutover 설계](../system-design/session-store-claim-version-cutover-design.md)의 cleanup clock이\n\"SCIM repair가 끝났는가\"를 별도 증거로 받을 수 있고,\n[AuthZ Decision Logging Design](./authz-decision-logging-design.md),\n[Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)와 조인해\n\"row는 고쳤지만 old allow가 왜 남았는가\"를 재구성할 수 있다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: IdP 그룹 변경이 서비스에 늦게 반영됨\n\n대응:\n\n- reconciliation job을 주기적으로 돌린다\n- drift report를 만든다\n- 대량 변경은 알림을 보낸다\n\n### 시나리오 2: 퇴사자 계정이 서비스에 남음\n\n대응:\n\n- orphan account를 찾아 비활성화한다\n- session revoke와 refresh revoke를 같이 한다\n- audit log를 남긴다\n\n### 시나리오 3: tenant 매핑 drift가 발생함\n\n대응:\n\n- tenant source of truth를 고정한다\n- cross-tenant role을 재검증한다\n- security test를 추가한다\n\n---\n\n## 코드로 보기\n\n### 1. diff 개념\n\n```java\npublic DriftReport reconcile(Snapshot idp, Snapshot local) {\n    return diffEngine.diff(idp, local);\n}\n```\n\n### 2. orphan account 정리\n\n```java\npublic void disableOrphans(List<UserAccount> accounts) {\n    for (UserAccount account : accounts) {\n        account.disable();\n    }\n}\n```\n\n### 3. dry-run workflow\n\n```text\n1. IdP snapshot과 local snapshot을 비교한다\n2. drift report를 만든다\n3. 위험도 높은 변경만 먼저 본다\n4. 승인 후에 실제 반영한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| realtime sync | 반영이 빠르다 | 실패에 민감하다 | 소규모 |\n| periodic reconciliation | drift를 잡기 쉽다 | 지연이 생긴다 | 대부분의 운영 |\n| snapshot backfill | 대규모 복구가 쉽다 | 비용이 든다 | 초기 도입 |\n| manual review | 통제가 강하다 | 느리다 | 고위험 변경 |\n\n판단 기준은 이렇다.\n\n- source of truth가 명확한가\n- drift를 자동으로 감지할 수 있는가\n- orphan account를 허용할 수 있는가\n- deprovisioning 지연이 위험한가\n\n---\n\n## 꼬리질문\n\n> Q: SCIM drift는 왜 생기나요?\n> 의도: sync failure와 schema mismatch를 아는지 확인\n> 핵심: event loss, retry failure, partial update 때문에 생긴다.\n\n> Q: reconciliation은 무엇인가요?\n> 의도: drift를 되돌리는 안전한 절차를 아는지 확인\n> 핵심: IdP와 local 상태를 비교해 다시 맞추는 작업이다.\n\n> Q: 왜 dry-run이 중요한가요?\n> 의도: 대량 변경의 위험을 아는지 확인\n> 핵심: 잘못된 일괄 변경을 막기 위해서다.\n\n> Q: orphan account가 왜 위험한가요?\n> 의도: deprovisioning 지연 리스크를 아는지 확인\n> 핵심: 권한이 남아서 불필요한 접근이 계속될 수 있기 때문이다.\n\n## 한 줄 정리\n\nSCIM drift reconciliation은 IdP와 서비스 상태의 어긋남을 찾아 안전하게 되돌리는 운영 프로세스다.\n",
   "aliases": [
+    "SCIM Drift / Reconciliation 개념",
+    "SCIM Drift / Reconciliation 정리",
+    "SCIM Drift / Reconciliation 실수",
+    "SCIM Drift / Reconciliation 판단 기준",
+    "보안 SCIM Drift / Reconciliation",
     "SCIM drift",
     "reconciliation",
     "identity sync",
     "directory sync",
     "diff",
     "backfill",
-    "orphan account",
-    "entitlement reconciliation",
-    "deprovisioning lag",
-    "source of truth",
-    "authz consistency",
-    "cleanup evidence"
+    "orphan account"
   ],
   "expected_queries": [
     "IdP와 서비스의 사용자, 그룹, 역할 상태가 서로 달라졌는지 어떻게 diff하고 reconciliation해?",
@@ -45,8 +45,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/scim-drift-reconciliation.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch161"
+      }
+    ]
   }
 }

@@ -6,14 +6,17 @@
   "summary": "이 chooser는 브라우저 기반 OAuth client에서 legacy implicit flow와 authorization code plus PKCE를 비교한다. `response_type=token`, URL fragment access token, SPA implicit migration, code_challenge_method S256, browser token leakage, BFF token boundary 같은 질의를 OAuth Security BCP 관점의 flow 선택 문제로 연결한다.",
   "body_markdown": "# OAuth2 PKCE vs Implicit Browser Flow Chooser\n\n> 한 줄 요약: 새 브라우저 클라이언트에서 기본 선택은 implicit flow가 아니라 authorization code + PKCE다. 다만 PKCE는 code 탈취 방어이지, 브라우저에 남은 access token 저장 문제까지 자동으로 해결하지 않는다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [OAuth2 Authorization Code Grant](./oauth2-authorization-code-grant.md)\n- [OAuth State Nonce PKCE Interview Chooser](./oauth-state-nonce-pkce-interview-chooser.md)\n- [PKCE Failure Modes / Recovery](./pkce-failure-modes-recovery.md)\n- [Browser Storage Threat Model for Tokens](./browser-storage-threat-model-for-tokens.md)\n- [Browser / BFF Token Boundary / Session Translation](./browser-bff-token-boundary-session-translation.md)\n- [OIDC, ID Token, UserInfo](./oidc-id-token-userinfo-boundaries.md)\n\nretrieval-anchor-keywords: oauth pkce implicit chooser, implicit flow legacy spa, authorization code pkce browser, response_type token, url fragment access_token, browser token leakage, code_challenge S256, code_verifier, spa migration pkce, browser bff token boundary\n\n## 이 문서의 범위\n\n이 문서는 `state`, `nonce`, PKCE의 역할 전체를 다시 설명하지 않는다. 그 구분은 [OAuth State Nonce PKCE Interview Chooser](./oauth-state-nonce-pkce-interview-chooser.md)가 담당한다. 여기서는 브라우저 앱에서 \"implicit flow를 계속 쓸지, authorization code + PKCE로 바꿀지\"만 고른다.\n\n핵심 판단 기준은 access token이 어디로 지나가느냐다. Implicit flow는 authorization endpoint 응답에서 access token을 바로 브라우저로 돌려준다. 보통 URL fragment에 token이 들어가고, SPA가 그 값을 읽어 API 호출에 쓴다. 지금은 token leakage와 replay 위험 때문에 legacy로 본다.\n\nAuthorization code + PKCE는 먼저 authorization code를 받고, token endpoint에서 `code_verifier`로 code를 증명한다. RFC 7636의 PKCE 모델은 authorization request에 `code_challenge`를 보내고 token request에 원본 `code_verifier`를 보내, 훔친 code만으로는 token을 받을 수 없게 만든다. RFC 9700 OAuth Security BCP는 public client가 code misuse와 injection을 줄이기 위해 PKCE를 사용해야 하며, 웹 앱에도 이 조언이 적용된다고 본다.\n\n## 10초 chooser\n\n| 상황 | 선택 | 이유 |\n|---|---|---|\n| 새 SPA 또는 browser-only public client | Authorization Code + PKCE | token을 authorization response URL에 싣지 않고, code를 verifier에 묶는다 |\n| 기존 SPA가 `response_type=token` 사용 | Code + PKCE로 migration | fragment, history, Referer leakage 면적을 줄인다 |\n| 민감 API, 여러 downstream audience | BFF + server-side token 보관 | 브라우저가 provider/downstream token을 직접 들지 않게 한다 |\n| provider가 code + PKCE를 지원하지 않는 legacy | 임시 예외만 검토 | leakage, injection, redirect URI hardening을 별도 증명해야 한다 |\n| OIDC 로그인에서 ID Token만 front-channel로 받음 | 별도 검토 | ID Token 검증은 필요하지만 API access token 노출 문제와는 다른 축이다 |\n\n실무 기본값은 `response_type=code`와 `code_challenge_method=S256`이다. `plain`은 호환성 성격이 강하므로 새 구현의 기본값으로 두지 않는다. Metadata나 provider 설정으로 PKCE enforcement도 확인한다.\n\n## 왜 implicit flow가 위험 신호인가\n\nImplicit flow의 문제는 \"브라우저가 token을 받는다\" 하나로 끝나지 않는다. token이 authorization response URL에 실리면 다음 증상이 같이 생긴다.\n\n- callback page의 third-party script, extension, history, debug/crash report, fragment 재작성 코드 주변으로 token이 샐 수 있다.\n- URL fragment가 history, crash report, analytics, extension, debug log 주변에 남는다.\n- access token을 특정 sender나 token endpoint 교환 과정에 묶기 어렵다.\n- SPA가 token을 `localStorage`에 오래 보관하면서 XSS 피해 범위가 커진다.\n\nRFC 9700은 implicit grant와 authorization response access token 발급을 피하라고 권고한다. token이 URL에 노출되지 않아야 authorization server가 replay 탐지, sender-constrained token 같은 방어를 적용할 여지가 생긴다.\n\n## PKCE가 해결하는 것과 못 하는 것\n\nPKCE가 해결하는 핵심은 authorization code binding이다. 공격자가 callback code를 훔치거나 다른 transaction의 code를 주입해도, token endpoint에서 verifier가 맞지 않으면 실패한다.\n\n하지만 PKCE는 다음을 대신하지 않는다.\n\n- 브라우저 저장소 threat model: token을 받은 뒤 `localStorage`, memory, cookie 중 어디에 둘지는 별도 판단이다.\n- API authorization: resource server는 access token audience와 scope를 검증해야 한다.\n- OIDC ID Token 검증: issuer, audience, expiry, nonce는 따로 본다.\n- return URL 무결성: `state`에 앱 이동 정보를 담으면 tampering과 open redirect를 막는다.\n\n따라서 \"PKCE를 썼으니 SPA가 access token을 오래 들고 있어도 안전하다\"는 결론은 틀리다. token 수령 후 보관/전송 방어는 [Browser Storage Threat Model for Tokens](./browser-storage-threat-model-for-tokens.md)나 BFF 문서로 내려가야 한다.\n\n## migration 관찰 포인트\n\n기존 앱을 볼 때 다음 항목을 확인한다. URL fragment는 일반 HTTP `Referer` header에 그대로 실리는 모델은 아니지만, 브라우저 히스토리, 확장 프로그램, callback page script, crash/debug 로그, fragment를 query로 재작성하는 코드 주변으로 token이 노출될 수 있다. 그래서 \"fragment니까 안전하다\"가 아니라 \"front-channel URL에 bearer token을 싣는 구조 자체가 위험하다\"로 판단한다.\n\n1. authorization request에 `response_type=token`, `id_token token`, `code token`이 남아 있는가.\n2. callback URL, 로그, analytics event에 `access_token`, `id_token`, `state`가 찍히는가.\n3. token endpoint 호출 없이 SPA가 fragment token만 읽어 API를 호출하는가.\n4. code flow 전환 후 `S256`과 `code_verifier` 검증 실패 로그가 남는가.\n5. redirect URI가 exact match인지, wildcard/prefix match나 open redirect가 섞였는가.\n6. token 수령 후 브라우저가 어떤 token을 얼마나 오래 저장하는가.\n\n## 면접/리뷰 답변 틀\n\n\"브라우저 앱에서는 implicit flow로 access token을 front-channel URL에 바로 받지 않는 쪽이 기본입니다. RFC 9700 기준 권장 흐름은 authorization code + PKCE이고, PKCE는 code를 verifier에 묶어 code 탈취와 주입을 줄입니다. 다만 token을 브라우저에 오래 저장하면 XSS나 leakage 위험은 남습니다. 민감 API라면 BFF/session boundary까지 같이 봐야 합니다.\"\n\n## Source-aware guardrails\n\n- RFC 7636 기준 PKCE verifier는 요청마다 새로 만든 고엔트로피 값이고, 가능한 client는 `S256` challenge를 써야 한다.\n- RFC 9700은 public client의 authorization code flow에서 PKCE를 요구하고, implicit grant나 authorization response access token 발급을 피하라고 권고한다.\n- OAuth 2.1은 아직 draft로 취급해야 하므로, 이 문서는 RFC 9700과 RFC 7636을 기준으로 판단한다.\n",
   "aliases": [
+    "response_type token 위험",
+    "oauth browser flow 선택",
+    "OAuth2 PKCE vs Implicit 개념",
+    "OAuth2 PKCE vs Implicit 정리",
+    "OAuth2 PKCE vs Implicit 실수",
     "oauth pkce implicit chooser",
     "implicit flow legacy spa",
     "authorization code pkce browser",
-    "response_type token 위험",
     "browser front channel token leakage",
     "spa oauth flow migration",
     "code flow pkce vs implicit",
-    "oauth browser flow 선택",
     "access token fragment leakage"
   ],
   "expected_queries": [
@@ -48,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/oauth2-pkce-vs-implicit-browser-flow-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch161"
+      }
+    ]
   }
 }

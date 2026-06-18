@@ -6,12 +6,18 @@
   "summary": "이 문서는 Domain Event, Integration Event, Outbox, Inbox, idempotent consumer, eventual consistency를 함께 다루는 advanced bridge이다.",
   "body_markdown": "# Domain Events, Outbox, Inbox\n\n**난이도: 🔴 Advanced**\n\n> 분산 시스템에서 “정확히 한 번처럼 보이게” 만들기 위한 이벤트 설계 정리\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 중요한가](#왜-중요한가)\n- [Domain Event와 Integration Event](#domain-event와-integration-event)\n- [Outbox Pattern](#outbox-pattern)\n- [Inbox Pattern](#inbox-pattern)\n- [이벤트 설계 기준](#이벤트-설계-기준)\n- [일관성 경계와 아키텍처](#일관성-경계와-아키텍처)\n- [시니어 관점 질문](#시니어-관점-질문)\n\n</details>\n\n> 관련 문서:\n> - [Software Engineering README: Domain Event, Outbox, Inbox](./README.md#domain-event-outbox-inbox)\n> - [`flush()` vs commit: `AFTER_COMMIT` 초심자 브리지 카드](./transactional-test-rollback-vs-commit-boundary-card.md)\n> - [Outbox and Message Adapter Test Matrix](./outbox-message-adapter-test-matrix.md)\n> - [Message-Driven Adapter Example](./message-driven-adapter-example.md)\n> - [Idempotency, Retry, Consistency Boundaries](./idempotency-retry-consistency-boundaries.md)\n> - [Event Schema Versioning and Compatibility](./event-schema-versioning-compatibility.md)\n\n> retrieval-anchor-keywords:\n> - domain event\n> - integration event\n> - outbox pattern\n> - inbox pattern\n> - idempotent consumer\n> - eventual consistency\n> - event dispatch\n> - consistency boundary\n> - outbox inbox testing\n> - outbox producer contract\n> - inbox dedup test\n> - outbox 왜 필요한가 beginner\n> - rollback commit 헷갈릴 때 outbox\n> - 메시지 side effect 한 번만 처리\n\n## 왜 중요한가\n\n초심자 기준으로는 먼저 이렇게만 잡아도 충분하다.\n\n| 지금 헷갈리는 말 | 먼저 떠올릴 한 문장 |\n|---|---|\n| \"`flush()`는 했는데 왜 메시지 쪽이 아직 애매하죠?\" | `flush`는 SQL 동기화이고, outbox/inbox는 commit 뒤 side effect까지 보는 이야기다 |\n| \"예외가 나면 메시지도 같이 없어져야 하나요?\" | outbox는 `업무 데이터 + 보낼 메시지 기록`을 같은 트랜잭션에 묶으려는 패턴이다 |\n| \"같은 메시지가 또 오면 또 처리되나요?\" | inbox는 `중복이 와도 결과를 한 번처럼 만들기` 위한 장치다 |\n\n이 감각이 아직 약하면, 구조를 깊게 읽기 전에 [`flush()` vs commit: `AFTER_COMMIT` 초심자 브리지 카드](./transactional-test-rollback-vs-commit-boundary-card.md)에서 `트랜잭션 안 질문`과 `commit 뒤 질문`을 먼저 나누고 다시 오면 된다.\n\n서비스가 하나의 데이터베이스 안에서만 끝나면 트랜잭션 하나로 설명이 된다. 하지만 실제 시스템은 보통 그렇지 않다.\n\n- 주문이 생성되면 결제가 이어지고\n- 결제가 완료되면 알림이 나가고\n- 재고가 줄어든 뒤 다른 서비스가 반응해야 한다\n\n이때 중요한 건 단순히 “이벤트를 보낸다”가 아니라, **이벤트가 유실되지 않고, 중복에도 안전하며, 도메인 의미를 유지하는가**다.\n\n---\n\n## Domain Event와 Integration Event\n\n두 개는 비슷해 보이지만 목적이 다르다.\n\n### Domain Event\n\n도메인 내부에서 일어난 사실이다.\n\n- `OrderPlaced`\n- `PaymentApproved`\n- `StockReserved`\n\n핵심은 “무슨 일이 일어났는가”를 도메인 언어로 표현하는 것이다.\n\n### Integration Event\n\n다른 서비스나 외부 시스템과 주고받기 위한 이벤트다.\n\n- 스키마 안정성\n- 역호환성\n- 외부 소비자 고려\n\n가 중요하다.\n\n실무에서는 도메인 이벤트와 외부 전송용 이벤트를 완전히 같은 것으로 다루지 않는 편이 안전하다. 도메인 모델을 그대로 외부에 노출하면 결합도가 빠르게 커진다.\n\n---\n\n## Outbox Pattern\n\nOutbox Pattern은 **업무 데이터 저장과 이벤트 저장을 같은 트랜잭션으로 묶는 방식**이다.\n\n문제 상황은 단순하다.\n\n- DB 저장은 성공\n- 메시지 브로커 발행은 실패\n\n이 순서가 어긋나면 데이터는 바뀌었는데 이벤트가 사라지는 상태가 된다.\n\n그래서 보통은 이렇게 한다.\n\n1. 비즈니스 데이터 저장\n2. 같은 트랜잭션에 outbox 테이블에 이벤트 기록\n3. 별도 릴레이 프로세스가 outbox를 읽어 브로커에 발행\n4. 발행 성공 시 outbox 상태 갱신\n\n이 구조의 장점은 분명하다.\n\n- DB와 이벤트 기록의 원자성을 확보하기 쉽다\n- 메시지 유실 가능성을 낮춘다\n- 재시도 전략을 두기 쉽다\n\n하지만 대가도 있다.\n\n- 릴레이가 추가된다\n- 지연이 생긴다\n- 정리 작업이 필요하다\n\n즉 Outbox는 단순 패턴이 아니라 **최소한의 신뢰성을 얻기 위한 운영 설계**다.\n\n---\n\n## Inbox Pattern\n\nInbox Pattern은 **컨슈머가 받은 이벤트를 먼저 기록하고, 중복 처리 여부를 판단하는 방식**이다.\n\n메시징 환경에서는 보통 이런 문제가 생긴다.\n\n- 같은 메시지가 두 번 도착한다\n- 처리 도중 실패해서 재전송된다\n- 네트워크 문제로 ack가 꼬인다\n\n그래서 컨슈머는 메시지를 처리하기 전에 inbox에 기록하거나, 처리 완료 키를 저장해서 **idempotency**를 확보한다.\n\n전형적인 흐름은 다음과 같다.\n\n1. 메시지 수신\n2. 메시지 ID 확인\n3. 이미 처리했으면 무시\n4. 아니면 도메인 로직 수행\n5. 처리 완료 기록\n\n이 방식의 핵심은 “중복이 절대 발생하지 않는다”는 가정이 아니라, **중복이 와도 결과가 안전하다**는 가정이다.\n\n---\n\n## 이벤트 설계 기준\n\n이벤트는 단순한 DTO가 아니다. 설계를 잘못하면 나중에 시스템 전체 결합도가 올라간다.\n\n### 1. 이벤트는 사실이어야 한다\n\n`OrderPlaced`는 사실이다.\n\n반면 `SendEmailNow`는 사실이 아니라 명령에 가깝다.\n\n이벤트 이름은 과거형이 더 자연스럽다.\n\n### 2. payload는 작고 안정적이어야 한다\n\n이벤트에는 꼭 필요한 정보만 넣는 편이 좋다.\n\n- 식별자\n- 상태 전이의 핵심 데이터\n- version\n- correlationId / causationId\n\n도메인 객체 전체를 넣는 방식은 외부 결합을 키운다.\n\n### 3. 소비자 기준으로 버전 관리해야 한다\n\n이벤트는 발행자가 아니라 소비자가 깨지지 않도록 관리해야 한다.\n\n- 필드는 추가 가능하게 설계\n- 의미 변경은 새 이벤트로 분리\n- 삭제는 매우 조심\n\n### 4. 중복과 순서를 기본값으로 생각해야 한다\n\n메시징 시스템은 기본적으로 순서와 정확히 한 번을 보장하지 않는 경우가 많다.\n\n그래서 이벤트 핸들러는:\n\n- 멱등해야 하고\n- 순서가 뒤집혀도 안전하거나\n- 최소한 순서 의존성을 명시해야 한다\n\n---\n\n## 일관성 경계와 아키텍처\n\n이벤트 설계는 결국 일관성 경계를 어디에 두느냐의 문제다.\n\n- 강한 일관성이 필요한 곳은 같은 트랜잭션으로 묶는다\n- 느슨한 일관성으로 충분한 곳은 이벤트로 분리한다\n\nLayered Architecture에서도 가능하지만, Application Service가 트랜잭션 경계를 잡고 Outbox를 쓰는 구조가 흔하다. Hexagonal Architecture에서는 포트 바깥의 메시지 브로커를 어댑터로 감싸서 도메인과 분리하기 쉽다.\n\n중요한 건 유행하는 패턴 이름이 아니라:\n\n- 어디까지를 동기적으로 보장할지\n- 어디부터 비동기 허용할지\n- 실패 시 누가 재시도 책임을 질지\n\n를 분명히 정하는 것이다.\n\n---\n\n## 시니어 관점 질문\n\n- Domain Event와 Integration Event를 왜 분리해야 하는가?\n- Outbox를 쓰지 않으면 어떤 실패 시나리오가 실제로 생기는가?\n- Inbox는 언제 필요한가, 그리고 언제 과한가?\n- 멱등성은 코드 레벨, 저장소 레벨, 메시지 레벨 중 어디에서 보장해야 하는가?\n- 이벤트 스키마를 바꿀 때 소비자 호환성을 어떻게 지킬 것인가?\n",
   "aliases": [
+    "도메인 이벤트 아웃박스 인박스",
+    "Domain Events, Outbox, Inbox 개념",
+    "Domain Events, Outbox, Inbox 정리",
+    "Domain Events, Outbox, Inbox 실수",
+    "Domain Events, Outbox, Inbox 판단 기준",
     "Domain Events Outbox Inbox",
     "domain event integration event",
     "outbox pattern inbox pattern",
     "idempotent consumer",
     "exactly once myth outbox inbox",
-    "도메인 이벤트 아웃박스 인박스"
+    "outbox inbox domain events guide",
+    "outbox inbox domain events checklist"
   ],
   "expected_queries": [
     "Domain Event와 Integration Event는 무엇이 다르고 왜 외부 전송용 이벤트를 따로 봐야 해?",
@@ -48,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/outbox-inbox-domain-events.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch161"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "EC2나 Linux 서버에서 실습 파일, key, release artifact를 받을 때 `curl -o`, `wget -O`, HTTP status, redirect, TLS, checksum, file size를 확인해 잘못 받은 HTML/error page를 데이터 파일로 착각하지 않게 돕는 beginner primer다.",
   "body_markdown": "# curl/wget 파일 다운로드와 검증 Primer\n\n> 한 줄 요약: 서버에서 파일을 받을 때는 `curl`이나 `wget` 명령만 성공했다고 끝내지 말고 HTTP status, 저장 파일 이름, 크기, 내용 첫 줄, checksum을 확인해야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [EC2 첫 서버 Bootstrap 스크립트 Primer](./ec2-first-server-bootstrap-script-primer.md)\n- [Ubuntu apt와 Amazon Corretto repository 문제 해결 Primer](../operating-system/ubuntu-apt-corretto-repository-troubleshooting-primer.md)\n- [Linux 표준 스트림, Redirect, Pipe 입문](../operating-system/linux-standard-streams-redirection-pipe-primer.md)\n\nretrieval-anchor-keywords: curl wget download verify, curl -o wget -O, HTTP status file download, checksum sha256sum verify, downloaded HTML error page, CloudFront access_log curl, Corretto key wget, Linux file download beginner, curl fail with status, wget output file name\n\n## `curl`과 `wget`의 기본 역할\n\n둘 다 URL에서 데이터를 내려받는 도구다. 실습에서는 access log 파일, apt key, release artifact, 배포용 jar 같은 파일을 받을 때 자주 쓴다.\n\n```bash\ncurl -o access_log.txt https://example.com/access_log.txt\nwget -O /tmp/corretto.key https://apt.corretto.aws/corretto.key\n```\n\n여기서 `-o`와 `-O`가 헷갈리기 쉽다.\n\n| 도구 | 옵션 | 의미 |\n|---|---|---|\n| `curl -o file` | 소문자 o | 응답 body를 file에 저장한다 |\n| `wget -O file` | 대문자 O | 응답 body를 file에 저장한다 |\n| `curl -O URL` | 대문자 O | URL의 파일 이름을 그대로 저장한다 |\n\n초보자는 먼저 명시 파일명을 쓰는 편이 안전하다. `curl -o access_log.txt URL`, `wget -O /tmp/key URL`처럼 저장 위치가 눈에 보이면 이후 검증이 쉽다.\n\n## 실패를 조용히 저장하지 않기\n\n다운로드에서 가장 흔한 실수는 404 HTML, 로그인 페이지, permission denied 응답을 정상 파일처럼 저장하는 것이다. 그래서 `curl`은 보통 아래 옵션을 같이 쓴다.\n\n```bash\ncurl -fL -o access_log.txt https://example.com/access_log.txt\n```\n\n| 옵션 | 의미 |\n|---|---|\n| `-f` | HTTP 4xx/5xx를 실패로 처리한다 |\n| `-L` | redirect를 따라간다 |\n| `-o file` | stdout 대신 file에 저장한다 |\n| `-sS` | progress는 조용히, 오류는 보여 준다 |\n\n예를 들어 아래처럼 쓰면 script에서 실패를 빨리 감지하기 좋다.\n\n```bash\nset -euo pipefail\ncurl -fsSL -o access_log.txt https://example.com/access_log.txt\n```\n\n`wget`은 진행률과 저장 로그를 잘 보여 주지만, script에서는 exit code를 확인해야 한다.\n\n```bash\nwget -O access_log.txt https://example.com/access_log.txt\necho $?\n```\n\nexit code가 0이 아니면 다음 단계로 넘어가면 안 된다.\n\n## 받은 파일 확인하기\n\n다운로드 직후에는 최소한 세 가지를 본다.\n\n```bash\nls -lh access_log.txt\nhead -5 access_log.txt\nfile access_log.txt\n```\n\n- `ls -lh`: 크기가 0인지, 예상보다 지나치게 작은지 본다.\n- `head`: HTML error page나 JSON error message가 아닌지 첫 줄을 본다.\n- `file`: binary인지 text인지 대략 확인한다.\n\nchecksum이 제공되는 release artifact라면 더 좋다.\n\n```bash\nsha256sum app.tar.gz\n# 제공된 SHA256 값과 비교\n```\n\nchecksum은 \"다운로드가 중간에 깨지지 않았는가\"와 \"내가 기대한 artifact가 맞는가\"를 확인하는 강한 증거다. 단순 실습용 access log에는 checksum이 없을 수 있지만, 실행 파일이나 release index, key 파일에는 가능한 한 검증을 붙이는 편이 안전하다.\n\n## stdout으로 볼지 파일로 저장할지\n\n`curl URL`은 기본적으로 response body를 stdout으로 출력한다. 그래서 pipe와 잘 맞는다.\n\n```bash\ncurl -fsSL https://example.com/access_log.txt | head\n```\n\n하지만 큰 파일이나 나중에 여러 번 쓸 파일은 저장하는 편이 낫다.\n\n```bash\ncurl -fsSL -o access_log.txt https://example.com/access_log.txt\n```\n\nkey 파일처럼 다른 command에 바로 넘길 때는 pipe를 쓰기도 한다.\n\n```bash\nwget -O - https://apt.corretto.aws/corretto.key | sudo gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg\n```\n\n`-O -`는 파일 대신 stdout으로 내보내라는 뜻이다. 이때 왼쪽 다운로드가 실패하면 오른쪽 `gpg`가 빈 입력이나 HTML error page를 받을 수 있으므로, script에서는 실패 처리를 더 신중히 해야 한다.\n\n## 오류별 첫 판단\n\n| 증상 | 가까운 원인 | 확인 |\n|---|---|---|\n| 저장 파일이 HTML이다 | 404, 로그인 페이지, redirect 미처리 | `head`, `curl -I`, `-L` |\n| 파일 크기가 0이다 | 다운로드 실패, 권한 문제 | exit code, stderr, URL 확인 |\n| `Could not resolve host` | DNS 문제 | URL 오타, 네트워크, DNS |\n| `SSL certificate problem` | TLS trust 또는 중간자 proxy | 시간, CA trust, corporate proxy |\n| `403 Forbidden` | 권한/서명 URL 만료 | URL 권한, token, 만료 시간 |\n| checksum 불일치 | 잘못된 파일, 중간 손상, 다른 버전 | URL과 release tag 재확인 |\n\n## 실습 access log 받을 때\n\n수업에서 access log를 받는다면 아래처럼 쓴다.\n\n```bash\ncurl -fsSL -o access_log.txt https://d3py6de6iez8oo.cloudfront.net/infra/access_log.txt\nls -lh access_log.txt\nhead -3 access_log.txt\n```\n\n그다음에야 `cut`, `sort`, `uniq` pipeline을 돌린다. 파일이 HTML error page인데 log 분석 command를 돌리면 엉뚱한 결과가 나온다.\n\n## 꼬리질문\n\n> Q: `curl -o`와 `curl -O`는 어떻게 다른가요?\n> 의도: 저장 파일명을 누가 정하는지 구분하는지 확인한다.\n> 핵심: `-o file`은 내가 파일명을 정하고, `-O`는 URL의 마지막 파일명을 사용한다.\n\n> Q: 다운로드 성공 후 바로 다음 명령으로 넘어가도 되나요?\n> 의도: file verification 습관을 확인한다.\n> 핵심: 중요한 파일은 크기, 첫 줄, file type, 가능하면 checksum을 확인해야 한다.\n\n> Q: key 파일을 pipe로 바로 `gpg`에 넘기는 것은 항상 안전한가요?\n> 의도: pipe 편의성과 실패 전파를 구분하는지 확인한다.\n> 핵심: 편하지만 왼쪽 다운로드 실패를 놓치면 오른쪽 command가 잘못된 입력을 받을 수 있으므로 `set -euo pipefail`, `curl -f`, 검증을 같이 둔다.\n\n## 한 줄 정리\n\n`curl`/`wget`은 파일을 받는 시작일 뿐이고, 안전한 습관은 `fail on HTTP error -> 저장 파일명 명시 -> 크기/내용/checksum 확인 -> 다음 단계` 순서다.\n\n## script에 넣을 때의 안전한 함수 모양\n\nbootstrap이나 deploy script에서는 다운로드를 함수로 감싸 두면 실패 지점을 로그로 남기기 쉽다.\n\n```bash\ndownload_file() {\n  local url=\"$1\"\n  local output=\"$2\"\n\n  echo \"download: $url -> $output\"\n  curl -fsSL -o \"$output.tmp\" \"$url\"\n  test -s \"$output.tmp\"\n  mv \"$output.tmp\" \"$output\"\n  ls -lh \"$output\"\n}\n```\n\n임시 파일에 먼저 저장한 뒤 성공하면 옮기는 이유는, 다운로드가 중간에 실패했는데도 기존 정상 파일을 반쯤 깨진 파일로 덮어쓰는 일을 줄이기 위해서다. `test -s`는 파일이 존재하고 크기가 0보다 큰지 확인한다. 물론 0보다 크다고 항상 정상 파일은 아니므로 중요한 artifact는 checksum까지 확인한다.\n\n```bash\necho \"<expected-sha256>  app.tar.gz\" | sha256sum -c -\n```\n\n이 명령은 왼쪽의 기대 hash와 실제 파일 hash를 비교한다. release note나 manifest가 SHA256을 제공한다면 이 검증을 자동화하는 편이 좋다.\n\n## redirect/pipe와 같이 볼 때\n\n`curl`은 기본 출력이 stdout이므로 redirect와 pipe 문서와 바로 연결된다.\n\n```bash\ncurl -fsSL https://example.com/data.txt > data.txt\ncurl -fsSL https://example.com/data.txt | grep profile | head\n```\n\n첫 번째는 shell redirect가 stdout을 파일로 바꾼 것이다. 두 번째는 response body를 다음 command의 stdin으로 넘긴 것이다. 반대로 `curl -o data.txt`는 curl 자체 옵션으로 파일에 저장한다. 결과는 비슷할 수 있지만, script를 읽을 때는 어느 쪽이 출력 경로를 정하는지 구분해야 한다.\n\n로그나 HTML을 직접 화면에 뿌리는 것은 괜찮지만, binary 파일을 stdout으로 보내면 터미널이 깨져 보일 수 있다. binary나 압축 파일은 `-o`로 파일에 저장하고, `file`, `ls -lh`, checksum으로 확인하는 편이 안전하다.\n\n",
   "aliases": [
+    "파일 다운로드 검증",
+    "curl/wget 파일 다운로드와 검증 개념",
+    "curl/wget 파일 다운로드와 검증 정리",
+    "curl/wget 파일 다운로드와 검증 실수",
+    "curl/wget 파일 다운로드와 검증 판단 기준",
     "curl wget download",
     "curl -o wget -O",
     "curl -fsSL",
     "download checksum verify",
     "sha256sum verify",
     "HTML error page downloaded",
-    "CloudFront access_log curl",
-    "wget stdout dash O",
-    "파일 다운로드 검증",
-    "curl HTTP status"
+    "CloudFront access_log curl"
   ],
   "expected_queries": [
     "curl -o랑 wget -O로 파일 받을 때 저장 이름과 검증은 어떻게 해?",
@@ -50,11 +52,15 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-06-17",
         "note": "batch18 beginner ops surface gap fill"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch161"
       }
     ]
   }

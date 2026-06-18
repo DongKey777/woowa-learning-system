@@ -6,18 +6,18 @@
   "summary": "이 문서는 security 카테고리에서 JWK Rotation / Cache Invalidation / `kid` Rollover를 다루는 deep_dive 문서다. JWK 회전은 새 키를 JWKS에 올리는 것보다, 검증자 캐시를 언제 깨고 `kid` 기반으로 어떤 키를 신뢰할지 운영하는 문제가 더 어렵다. 검색 질의가 JWK, JWKS, kid rollover, kid miss처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
   "body_markdown": "# JWK Rotation / Cache Invalidation / `kid` Rollover\n\n> 한 줄 요약: JWK 회전은 새 키를 JWKS에 올리는 것보다, 검증자 캐시를 언제 깨고 `kid` 기반으로 어떤 키를 신뢰할지 운영하는 문제가 더 어렵다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n> - [JWT Signature Verification Failure Playbook](./jwt-signature-verification-failure-playbook.md)\n> - [JWT / JWKS Outage Recovery / Failover Drills](./jwt-jwks-outage-recovery-failover-drills.md)\n> - [JWKS Rotation Cutover Failure / Recovery](./jwks-rotation-cutover-failure-recovery.md)\n> - [Token Introspection vs Self-Contained JWT](./token-introspection-vs-self-contained-jwt.md)\n> - [Key Rotation Runbook](./key-rotation-runbook.md)\n> - [Secret Scanning / Credential Leak Response](./secret-scanning-credential-leak-response.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n\nretrieval-anchor-keywords: JWK, JWKS, kid rollover, kid miss, key rotation, cache invalidation, public key cache, signing key, verification key, rotation window, stale key, JWKS TTL, refresh storm, verification outage, stale-if-error, known-good key, cutover failure\n\n---\n\n## 핵심 개념\n\nJWK(JSON Web Key)는 JWT 서명 검증에 쓰는 키 표현이다.  \n실무에서는 보통 JWKS endpoint에서 public key 집합을 가져와 검증한다.\n\n문제는 키를 한 번만 배포하고 끝낼 수 없다는 점이다.\n\n- 새 signing key가 생긴다\n- 옛 key는 아직 만료 전 토큰을 검증해야 한다\n- verifier는 JWKS를 캐시한다\n- `kid`가 바뀌면 검증 경로도 바뀐다\n\n즉 JWK 회전은 키 발급보다 캐시 무효화와 cutover 타이밍이 핵심이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. `kid`는 어떤 키를 쓸지 알려주는 힌트다\n\nJWT 헤더의 `kid`는 verifier가 여러 public key 중 무엇으로 검증할지 선택하는 데 도움을 준다.\n\n- 같은 issuer가 여러 key를 동시에 운영할 수 있다\n- rotation 기간에는 old/new key가 공존한다\n- verifier는 `kid`를 보고 후보 key를 고른다\n\n하지만 `kid`만 믿고 검증을 생략하면 안 된다.\n\n### 2. JWKS는 캐시되기 쉽다\n\nJWKS는 네트워크 요청을 아끼려고 캐시되는 경우가 많다.\n\n- 키 조회 비용을 줄인다\n- edge/gateway에서 공통 캐시를 쓴다\n- mobile/client SDK도 로컬 캐시를 둘 수 있다\n\n문제는 키가 바뀌어도 캐시가 예전 값을 계속 들고 있을 수 있다는 점이다.\n\n그래서 rotation에는 다음이 필요하다.\n\n- JWKS TTL\n- force refresh 조건\n- stale-while-revalidate 전략\n- key removal 시점 조절\n\n### 3. rotation은 추가만이 아니라 제거의 문제다\n\n새 key를 JWKS에 추가하는 것은 쉽다.  \n더 어려운 것은 언제 old key를 제거하느냐이다.\n\n- 너무 빨리 제거하면 아직 유효한 토큰이 검증 실패한다\n- 너무 늦게 제거하면 공격자가 오래된 key 기반 토큰을 더 오래 쓸 수 있다\n\n그래서 `token TTL + skew + rollout time`을 함께 계산해야 한다.\n\n### 4. verifier cache invalidation을 어떻게 트리거할까\n\n실무 트리거:\n\n- JWKS `Cache-Control` 만료\n- `kid` 미스 발생\n- rotation event pub/sub\n- 관리자가 수동 refresh\n\n그리고 failure path도 중요하다.\n\n- 새 `kid`를 못 찾으면 즉시 JWKS refresh를 시도한다\n- refresh 실패 시 fail-closed 또는 안전한 fallback을 선택한다\n\n### 5. multi-tenant / multi-issuer 환경이 더 어렵다\n\nissuer가 여러 개면 cache key도 달라진다.\n\n- issuer별 JWKS\n- tenant별 key set\n- environment별 key set\n\ncache key가 잘못 섞이면 다른 issuer의 public key로 검증하는 사고가 난다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 새 JWT가 발급됐는데 일부 서비스에서만 검증 실패\n\n문제:\n\n- signer는 새 key로 전환했다\n- 일부 verifier는 오래된 JWKS 캐시를 쓴다\n\n대응:\n\n- 새 key를 JWKS에 먼저 추가한다\n- verifier cache refresh를 강제한다\n- old key 제거를 늦춘다\n\n### 시나리오 2: `kid` 미스가 대량 발생함\n\n문제:\n\n- rotate 직후 verifier가 새 `kid`를 모른다\n\n대응:\n\n- `kid` miss를 cache refresh 신호로 쓴다\n- refresh storm을 막기 위해 backoff와 collapse를 넣는다\n- 관측 지표를 남긴다\n\n### 시나리오 3: old key 제거 후 유효 토큰이 깨짐\n\n문제:\n\n- 토큰 TTL과 key removal 시점을 분리해 생각하지 않았다\n\n대응:\n\n- 제거 전에 최대 토큰 수명을 계산한다\n- 서비스 배포 지연과 clock skew를 반영한다\n- 제거를 운영 runbook으로 관리한다\n\n---\n\n## 코드로 보기\n\n### 1. JWKS cache refresh 개념\n\n```java\npublic PublicKey resolveKey(String issuer, String kid) {\n    KeySet keySet = jwksCache.getOrLoad(issuer);\n    PublicKey key = keySet.findByKid(kid);\n    if (key != null) {\n        return key;\n    }\n\n    jwksCache.refresh(issuer);\n    return jwksCache.get(issuer).findByKid(kid);\n}\n```\n\n### 2. rotation window 계산 개념\n\n```text\n1. access token 최대 수명을 확인한다\n2. clock skew 허용치를 더한다\n3. verifier rollout 시간을 더한다\n4. old key 제거 시점을 잡는다\n```\n\n### 3. cache invalidation 개념\n\n```java\npublic void onKeyRotationEvent(String issuer) {\n    jwksCache.evict(issuer);\n    verificationFleet.refreshIssuer(issuer);\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| long JWKS TTL | 부하가 적다 | 새 key 반영이 늦다 | 변화가 적은 환경 |\n| short JWKS TTL | 반영이 빠르다 | 조회 부하가 늘어난다 | 자주 회전하는 환경 |\n| event-driven invalidation | 즉시성이 좋다 | 이벤트 전달 실패를 고려해야 한다 | 대규모 플랫폼 |\n| hard cutover | 정리가 빠르다 | 실패 위험이 높다 | 통제된 내부망 |\n\n판단 기준은 이렇다.\n\n- 토큰 TTL이 얼마나 긴가\n- verifier 수가 얼마나 많은가\n- key rotation이 얼마나 자주 일어나는가\n- JWKS 캐시를 강제로 깨울 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: `kid`는 왜 필요한가요?\n> 의도: 여러 키 공존과 검증 선택을 이해하는지 확인\n> 핵심: 어떤 public key로 검증할지 식별하기 위해서다.\n\n> Q: JWKS 캐시가 위험할 수 있는 이유는 무엇인가요?\n> 의도: stale key 문제를 아는지 확인\n> 핵심: 새 key를 못 보고 오래된 key를 계속 쓸 수 있기 때문이다.\n\n> Q: old key는 언제 제거해야 하나요?\n> 의도: 토큰 TTL과 rollout 시간을 연결하는지 확인\n> 핵심: 남아 있는 유효 토큰이 모두 만료된 뒤다.\n\n> Q: `kid` 미스가 났을 때 어떻게 해야 하나요?\n> 의도: 자동 refresh와 장애 대응을 이해하는지 확인\n> 핵심: JWKS를 새로 가져오고, 필요 시 보수적으로 거부한다.\n\n## 한 줄 정리\n\nJWK 회전의 핵심은 새 키 추가가 아니라 `kid` 기반 검증과 JWKS 캐시 무효화를 안전하게 운영하는 것이다.\n",
   "aliases": [
+    "JWK Rotation / Cache 개념",
+    "JWK Rotation / Cache 정리",
+    "JWK Rotation / Cache 실수",
+    "JWK Rotation / Cache 판단 기준",
+    "보안 JWK Rotation / Cache",
     "JWK",
     "JWKS",
     "kid rollover",
     "kid miss",
     "key rotation",
     "cache invalidation",
-    "public key cache",
-    "signing key",
-    "verification key",
-    "rotation window",
-    "stale key",
-    "JWKS TTL"
+    "public key cache"
   ],
   "expected_queries": [
     "JWT 서명 키를 rotation할 때 JWKS에 새 JWK를 먼저 올리고 kid rollover를 어떻게 진행해?",
@@ -45,8 +45,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/jwk-rotation-cache-invalidation-kid-rollover.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch161"
+      }
+    ]
   }
 }
