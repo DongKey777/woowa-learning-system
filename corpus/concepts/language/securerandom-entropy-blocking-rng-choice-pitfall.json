@@ -3,29 +3,27 @@
   "title": "SecureRandom entropy blocking and RNG choice pitfall",
   "category": "language",
   "level": "intermediate",
-  "summary": "Java에서 보안 토큰은 SecureRandom을 써야 하지만, provider와 OS entropy 상태, getInstanceStrong 사용, 매 요청 새 인스턴스 생성 방식에 따라 지연이 생길 수 있다. 시뮬레이션/분산용 난수와 보안용 난수를 분리하고, 운영에서는 RNG 초기화와 latency를 관측해야 한다.",
-  "body_markdown": "# SecureRandom entropy blocking and RNG choice pitfall\n\n> 한 줄 요약: 보안 토큰에는 SecureRandom이 필요하지만, 모든 난수에 SecureRandom을 쓰거나 매 요청 강한 RNG를 새로 만들면 latency 문제가 생길 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: SecureRandom blocking, Java SecureRandom entropy, getInstanceStrong blocking, RNG choice, ThreadLocalRandom vs SecureRandom, token generation, entropy starvation, /dev/random, cryptographic random, 난수 선택\n\n## 먼저 멘탈모델\n\nJava에는 목적이 다른 난수 도구가 있다.\n\n| 목적 | 후보 |\n|---|---|\n| 인증 토큰, reset token, nonce | `SecureRandom` |\n| 테스트 재현, deterministic simulation | seed를 고정한 `Random` |\n| 병렬 계산의 빠른 비보안 난수 | `ThreadLocalRandom`, `SplittableRandom` |\n\n보안 경계에 쓰이는 값은 예측 불가능해야 하므로 `SecureRandom`을 쓴다. 반대로 단순 샘플링, 테스트 데이터, load 분산 시뮬레이션에 매번 `SecureRandom`을 쓰면 비용만 커질 수 있다.\n\n## blocking이 왜 생기나\n\n`SecureRandom`은 provider와 OS entropy source를 사용한다. 환경에 따라 초기 seed 준비, 강한 entropy source 접근, VM/컨테이너 초기 부팅 시점에서 지연이 생길 수 있다.\n\n특히 조심할 패턴은 다음이다.\n\n- 매 요청마다 `SecureRandom.getInstanceStrong()`을 호출한다.\n- 앱 시작 직후 첫 토큰 생성이 critical path에 있다.\n- container나 VM early boot 환경에서 entropy 준비가 늦다.\n- RNG 초기화를 lazy로 두어 첫 사용자 요청이 비용을 맞는다.\n\n모든 현대 환경에서 항상 blocking이 난다는 뜻은 아니다. 문제는 **RNG 선택과 초기화 위치를 모르면 특정 배포 환경에서만 p99가 튈 수 있다**는 점이다.\n\n## 안전한 사용 감각\n\n- 보안 토큰용 `SecureRandom`은 재사용 가능한 singleton 또는 bean으로 둔다.\n- startup/warmup에서 필요한 RNG를 미리 초기화한다.\n- `getInstanceStrong()`은 정말 강한 blocking source가 필요한지 확인하고 쓴다.\n- 비보안 난수에는 `ThreadLocalRandom`이나 `SplittableRandom`을 쓴다.\n- token 길이, encoding, collision policy를 같이 설계한다.\n\n## 잘못된 선택 예시\n\n```java\n// 위험: 예측 가능한 Random으로 보안 토큰 생성\nString token = Long.toHexString(new Random().nextLong());\n```\n\n```java\n// 위험: 매 요청마다 strong RNG를 새로 찾고 초기화\nSecureRandom rng = SecureRandom.getInstanceStrong();\nbyte[] bytes = new byte[32];\nrng.nextBytes(bytes);\n```\n\n```java\n// 더 나은 감각: 앱 수명 동안 재사용\nfinal class TokenGenerator {\n    private final SecureRandom rng = new SecureRandom();\n\n    byte[] tokenBytes() {\n        byte[] bytes = new byte[32];\n        rng.nextBytes(bytes);\n        return bytes;\n    }\n}\n```\n\n## 운영 관측\n\n- 첫 토큰 생성 latency\n- token generation p95/p99\n- 앱 시작 직후 auth/reset API p99\n- container host entropy 관련 경고\n- RNG provider와 Java version 차이\n\n이 값이 없으면 SecureRandom 문제를 DB나 네트워크 지연으로 오해하기 쉽다.\n\n## 한 줄 정리\n\nSecureRandom은 보안 난수에는 필요하지만, provider/entropy/초기화 위치를 모르면 startup과 요청 p99를 흔들 수 있다. 보안용과 비보안용 RNG를 분리하고 재사용, warmup, 관측을 함께 둬야 한다.\n\n## Batch152 보강 메모\n\nSecureRandom entropy blocking and RNG choice pitfall를 학습할 때는 용어 정의만 확인하기보다 언어 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. Java에서 보안 토큰은 SecureRandom을 써야 하지만, provider와 OS entropy 상태, getInstanceStrong 사용, 매 요청 새 인스턴스 생성 방식에 따라 지연이 생길 수 있다. 시뮬레이션/분산용 난수와 보안용 난수를 분리하고, 운영에서는 RNG 초기화와 latency를 관측해야 한다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
+  "summary": "Java에서 보안 토큰은 SecureRandom을 써야 하지만, provider와 OS entropy 상태, getInstanceStrong 선택, 매 요청 새 인스턴스 생성 방식에 따라 시작 직후나 p99 latency가 튈 수 있다. 보안용 RNG와 비보안용 RNG를 분리하고, 운영에서는 초기화 위치와 token generation latency를 관측해야 한다.",
+  "body_markdown": "# SecureRandom entropy blocking and RNG choice pitfall\n\n> 한 줄 요약: 보안 토큰은 예측 불가능성이 우선이므로 SecureRandom을 쓰되, provider/OS entropy/source 선택과 초기화 위치를 모르면 시작 직후나 p99 latency 문제가 생길 수 있다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: SecureRandom blocking, Java SecureRandom entropy, getInstanceStrong blocking, RNG choice, ThreadLocalRandom vs SecureRandom, token generation latency, entropy starvation, /dev/random, /dev/urandom, cryptographic random, 난수 선택, 보안 토큰\n\n## 먼저 나눌 것: secret인가 아닌가\n\nJava의 난수 선택은 빠른가보다 이 값이 맞혀지면 보안 경계가 무너지는가로 나눈다.\n\n| 목적 | 적절한 선택 | 이유 |\n|---|---|---|\n| password reset token, session id, nonce, API key material | `SecureRandom` | 공격자가 다음 값을 예측하면 안 된다 |\n| 테스트 재현, 시뮬레이션 | seed를 고정한 `Random` 또는 `SplittableRandom` | 재현성과 속도가 더 중요하다 |\n| 샘플링, 분산, randomized algorithm | `ThreadLocalRandom`, `SplittableRandom` | 보안성이 아니라 성능과 독립성이 목표다 |\n\n`Random`과 `ThreadLocalRandom`은 빠르지만 cryptographic RNG가 아니다. seed나 내부 상태가 추정되면 이후 값도 좁혀질 수 있으므로 reset token, 인증 코드, 초대 링크 같은 secret에는 쓰지 않는다.\n\n## SecureRandom이 느려질 수 있는 지점\n\n`SecureRandom`은 이름 하나로 끝나는 API처럼 보이지만 실제 동작은 JDK 버전, security provider, OS entropy source에 따라 달라진다. 초기 seed를 준비하거나 강한 source를 선택하는 순간, 특히 VM/container 시작 직후에는 첫 호출이 느려질 수 있다.\n\n주의할 패턴은 이렇다.\n\n- 요청마다 `SecureRandom.getInstanceStrong()`을 호출한다.\n- 첫 토큰 생성을 로그인/가입/비밀번호 재설정 API의 critical path에 둔다.\n- 앱 부팅 직후 container나 VM의 entropy 준비가 늦다.\n- RNG 초기화를 lazy로 둬서 첫 사용자 요청이 비용을 맞는다.\n- latency 계측 없이 토큰 생성 지연을 DB, 네트워크, lock 문제로 추정한다.\n\nLinux blocking 이야기는 버전 맥락이 중요하다. 예전 JDK/Linux 조합이나 `/dev/random` 기반 설정에서는 entropy 부족으로 block되는 사례가 많았지만, 현대 Linux와 최신 JDK에서는 기본 동작이 달라진 경우가 많다. 그래서 SecureRandom은 항상 block된다거나 `java.security.egd`를 무조건 바꾸라는 식으로 외우면 위험하다. 현재 JDK의 provider, `securerandom.strongAlgorithms`, 배포 OS를 확인하고 실제 첫 호출 latency를 재야 한다.\n\n## getInstanceStrong의 함정\n\n`SecureRandom.getInstanceStrong()`은 더 안전한 기본값처럼 보이지만, JDK 설정의 strong algorithm 목록에서 provider를 고른다. 어떤 환경에서는 blocking source를 고를 수 있고, 매 요청마다 호출하면 provider 탐색과 초기화 비용까지 반복된다.\n\n보안 토큰 대부분은 앱 수명 동안 재사용하는 `new SecureRandom()` 또는 명시적으로 검토한 provider로 충분한 경우가 많다. 정말 strong algorithm이 필요한지 모르면 getInstanceStrong을 요청 경로에 넣기보다 보안 요구사항, JDK 설정, 운영 latency를 같이 확인한다.\n\n## 인스턴스 재사용과 warmup\n\n나쁜 패턴은 보안 API 호출마다 RNG를 새로 만드는 것이다.\n\n```java\n// 위험: 매 요청마다 strong RNG를 찾고 초기화할 수 있다.\nSecureRandom rng = SecureRandom.getInstanceStrong();\nbyte[] bytes = new byte[32];\nrng.nextBytes(bytes);\n```\n\n더 나은 기본값은 앱에서 재사용하는 생성기를 두고, 시작 시점에 첫 `nextBytes`를 한 번 지나가게 만드는 것이다.\n\n```java\nfinal class TokenGenerator {\n    private final SecureRandom rng = new SecureRandom();\n\n    void warmup() {\n        byte[] probe = new byte[1];\n        rng.nextBytes(probe);\n    }\n\n    byte[] tokenBytes() {\n        byte[] bytes = new byte[32];\n        rng.nextBytes(bytes);\n        return bytes;\n    }\n}\n```\n\nthroughput이 매우 높은 서비스에서 공유 인스턴스의 contention이 보이면 그때 pool이나 thread-local SecureRandom을 측정 기반으로 검토한다. 그 경우에도 secret을 `ThreadLocalRandom`으로 낮추는 것이 아니라 CSPRNG 사용 방식을 조정하는 문제다.\n\n## token generation에서 같이 봐야 할 것\n\nSecureRandom만 쓰면 토큰 설계가 끝나는 것은 아니다.\n\n- 최소 entropy가 충분한 byte 길이인지 확인한다. 예를 들어 16 bytes와 32 bytes는 보안 여유가 다르다.\n- URL에 넣을 값은 보통 Base64 URL-safe encoding을 쓴다.\n- 토큰을 짧은 숫자 코드로 줄이면 brute force 방어, 만료 시간, rate limit이 같이 필요하다.\n- 생성 latency를 `nextBytes` 주변에서 따로 재고 first-use/p95/p99를 남긴다.\n- provider algorithm, JDK version, container image, OS entropy 관련 로그를 운영 정보로 남긴다.\n\n## Random/ThreadLocalRandom을 쓰면 안 되는 예\n\n```java\n// 위험: 보안 토큰에 비보안 RNG 사용\nString token = Long.toHexString(ThreadLocalRandom.current().nextLong());\n```\n\n이 코드는 충돌 가능성만의 문제가 아니다. 공격자가 생성 시점, seed/state 특성, 관찰된 값을 이용해 탐색 공간을 줄일 수 있다는 점이 핵심이다. 보안 토큰은 빠른 랜덤이 아니라 예측 불가능한 랜덤이어야 한다.\n\n## 한 줄 정리\n\n보안용 난수와 비보안용 난수를 먼저 분리한다. Secret에는 SecureRandom을 쓰되, `getInstanceStrong()`을 요청마다 새로 만들지 말고 provider/OS entropy 맥락, startup warmup, token generation latency 관측까지 같이 설계해야 한다.\n",
   "aliases": [
     "보안 난수",
-    "엔트로피 blocking",
+    "엔트로피 블로킹",
     "난수 선택",
-    "SecureRandom entropy blocking and 개념",
-    "SecureRandom entropy blocking and 정리",
+    "보안 토큰 RNG",
     "SecureRandom blocking",
     "SecureRandom entropy",
-    "Java RNG choice",
-    "getInstanceStrong",
+    "getInstanceStrong latency",
     "ThreadLocalRandom vs SecureRandom",
-    "token generation",
-    "securerandom entropy blocking rng guide"
+    "token generation latency",
+    "Java cryptographic random"
   ],
   "expected_queries": [
-    "Java SecureRandom은 언제 blocking latency를 만들 수 있어?",
-    "getInstanceStrong을 매 요청마다 쓰면 왜 token 생성 p99가 튈 수 있어?",
-    "보안 토큰에는 SecureRandom을 쓰고 simulation에는 ThreadLocalRandom을 쓰는 이유가 뭐야?",
-    "SecureRandom을 singleton으로 재사용하고 startup에서 warmup하는 이유가 뭐야?",
-    "new Random으로 password reset token을 만들면 왜 위험해?",
-    "컨테이너 배포 직후 첫 토큰 생성이 느릴 때 RNG entropy 문제를 어떻게 확인해?"
+    "비밀번호 재설정 토큰 만들 때 SecureRandom이랑 ThreadLocalRandom 중 뭘 써야 해?",
+    "getInstanceStrong을 매 요청마다 호출하면 왜 첫 요청이나 p99가 느려질 수 있어?",
+    "SecureRandom을 매번 새로 만들지 말고 싱글톤으로 재사용하라는 이유가 뭐야?",
+    "컨테이너 배포 직후 토큰 생성이 느린데 entropy 문제인지 어떻게 확인해?",
+    "Java에서 Random으로 인증 토큰 만들면 실제로 뭐가 위험해?",
+    "SecureRandom blocking 얘기가 요즘 Linux에서도 항상 맞는 말이야?"
   ],
   "symptoms": [
     "보안 토큰을 java.util.Random으로 만들어 예측 가능성을 만든다",
@@ -44,18 +42,27 @@
       "algorithm/randomized-hashing-collision-risk-drill",
       "security/jwt-validation-pitfalls-deep-dive"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "랜덤 피벗 퀵소트에서 난수를 어떻게 고르면 돼?",
+      "랜덤 해싱 충돌 확률을 낮추는 방법이 궁금해",
+      "JWT 서명 검증에서 alg none을 막는 방법 알려줘",
+      "JWT 키 로테이션이랑 kid 검증은 어떻게 설계해?"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/language/securerandom-entropy-blocking-rng-choice-pitfall.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch152"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "round-3-b183-securerandom"
       }
     ]
   }
