@@ -7,28 +7,24 @@
   "body_markdown": "# 트랜잭션 격리 수준 입문 — Read Committed · Repeatable Read · Serializable\n\n> 한 줄 요약: 격리 수준은 *anomaly ↔ 성능* trade-off. 일반 default = Read Committed (PG) 또는 Repeatable Read (MySQL InnoDB). 강한 정합 = SERIALIZABLE (단 비용 큼).\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n같은 데이터에 동시 트랜잭션이 있을 때 *어떤 anomaly가 허용되느냐*.\n\n### 4가지 격리 수준 + 차단 anomaly\n\n| 격리 수준 | Dirty Read | Non-Repeatable Read | Phantom Read | Write Skew |\n|---|---|---|---|---|\n| READ UNCOMMITTED | 허용 | 허용 | 허용 | 허용 |\n| **READ COMMITTED** (PG default) | 차단 | 허용 | 허용 | 허용 |\n| **REPEATABLE READ** (MySQL default) | 차단 | 차단 | (MVCC로 일부 차단) | 허용 |\n| **SERIALIZABLE** | 차단 | 차단 | 차단 | 차단 |\n\n## 한 장 정리 — 각 anomaly 예시\n\n### Dirty Read\n```\nT1: UPDATE account SET balance = 100 WHERE id = 1;   (commit 안 함)\nT2: SELECT balance FROM account WHERE id = 1;   → 100 (commit 안 된 값!)\nT1: ROLLBACK;   → T2가 본 100은 *허위*\n```\n\n### Non-Repeatable Read\n```\nT1: SELECT balance FROM account WHERE id = 1;   → 50\nT2: UPDATE account SET balance = 100 WHERE id = 1; COMMIT;\nT1: SELECT balance FROM account WHERE id = 1;   → 100 (이전과 다름!)\n```\n\n### Phantom Read\n```\nT1: SELECT COUNT(*) FROM reservation WHERE time > NOW();   → 5\nT2: INSERT INTO reservation (time) VALUES (...); COMMIT;\nT1: SELECT COUNT(*) FROM reservation WHERE time > NOW();   → 6 (새 row 등장!)\n```\n\n### Write Skew\n```\n의사 코드:\nT1: SELECT FROM doctor WHERE on_call=true; -- (Alice, Bob 둘 다 oncall)\nT2: SELECT FROM doctor WHERE on_call=true; -- (Alice, Bob 둘 다 oncall)\nT1: UPDATE doctor SET on_call=false WHERE name='Alice';  -- \"Bob이 oncall이니 나는 휴식\"\nT2: UPDATE doctor SET on_call=false WHERE name='Bob';    -- \"Alice가 oncall이니 나는 휴식\"\nCOMMIT;\n→ 결과: 둘 다 off! invariant 위반\n```\n\nWrite Skew는 *Repeatable Read에서도 발생* — SERIALIZABLE만 차단.\n\n## \"MySQL vs PostgreSQL\"\n\n| | MySQL InnoDB | PostgreSQL |\n|---|---|---|\n| Default | REPEATABLE READ | READ COMMITTED |\n| MVCC | undo log 기반 | 별도 row version (table 안 multi-version) |\n| Phantom Read 차단 | gap lock + next-key lock (REPEATABLE READ에서도 일부 차단) | 별도 못 차단 (SERIALIZABLE 필요) |\n| Serializable 구현 | next-key lock + lock | Serializable Snapshot Isolation (SSI) |\n| FOR UPDATE | row lock | row lock |\n\n학습자 자주 헷갈림: **MySQL의 REPEATABLE READ가 *PostgreSQL의 REPEATABLE READ보다 약간 강함*** (gap lock 덕분에 phantom 일부 차단). 같은 이름 다른 동작.\n\n## MVCC (Multi-Version Concurrency Control)\n\n```\nTime T0: row v1 written\nT1 begins (snapshot at T0)\nTime T2: row v2 written (다른 transaction)\nT1 read → v1 (자기 snapshot)\nT2 commit\nTime T3: T1 read → still v1 (snapshot 안 변경)\n```\n\nMVCC는 *읽기와 쓰기가 lock 없이 동시 가능*하게 만든다. 양쪽 모두 *자기 snapshot* 봄.\n\nREPEATABLE READ가 MVCC 기반 — 트랜잭션 시작 시 *snapshot 고정*.\n\n## \"Serializable의 비용\"\n\nSERIALIZABLE은 *anomaly 완전 차단*이지만 비용 큼.\n\n### MySQL Serializable\n- 모든 SELECT가 *암묵적으로 FOR SHARE* — 다른 트랜잭션이 그 row를 *변경할 수 없음*.\n- → lock contention 매우 큼.\n\n### PostgreSQL SSI (Serializable Snapshot Isolation)\n- 비교적 *lock 적음*.\n- 충돌 감지 시 *retry 필요* (SQLState 40001).\n- 어쩌면 *재시도 무한 루프* — application에 retry 한계 필요.\n\n**일반 권장**: 대부분 운영 시스템 = READ COMMITTED 또는 REPEATABLE READ + 명시적 lock (FOR UPDATE). SERIALIZABLE은 *정말 필요한 transaction*에만.\n\n## \"어떤 격리 수준 골라?\"\n\n```\n1. dirty read 위험 없으면 OK?\n       → READ COMMITTED (PG default). 단순.\n\n2. 같은 트랜잭션 내 read 일관성 중요?\n       → REPEATABLE READ (MySQL default).\n\n3. write skew 같은 invariant 보호 절대 필요?\n       → SERIALIZABLE + retry 로직.\n\n4. *write 안 함* (read-only 분석)?\n       → READ COMMITTED + 명시적 snapshot (PG: SET TRANSACTION).\n```\n\n학습 단계: *default 유지가 안전*. SERIALIZABLE은 *특수 케이스*에만.\n\n## Spring `@Transactional(isolation = ...)`\n\n```java\n@Transactional(isolation = Isolation.REPEATABLE_READ)\npublic void process() { ... }\n```\n\n각 메서드마다 isolation 지정. 별도 안 지정하면 *DB 기본*.\n\n⚠️ 함정: *propagation* (REQUIRED, REQUIRES_NEW) 등이 함께 작용. 이전 트랜잭션 isolation을 *상속*하거나 새 트랜잭션 만들거나.\n\n## 자주 헷갈리는 지점\n\n- **\"MySQL REPEATABLE READ = PostgreSQL REPEATABLE READ\"** — 이름 같지만 *동작 다름*. MySQL이 phantom 일부 차단.\n- **\"SERIALIZABLE = 안전\"** — 안전하지만 *retry 필수 + lock contention 큼*. application 부담.\n- **\"READ COMMITTED는 위험\"** — 대부분 OLTP에 *충분*. 진짜 invariant 보호 필요한 곳만 강화.\n- **\"`@Transactional` 만 붙이면 모든 동시성 안전\"** — *격리 수준은 anomaly만*. *deadlock + lock 대기 + retry*는 별도.\n- **\"MVCC = lock 없음\"** — *읽기와 쓰기 사이*는 lock 없음. *쓰기끼리*는 여전히 lock.\n\n## 학습자가 자주 만나는 시나리오\n\n- 미션 \"예약 생성 시 동시 중복\" → SERIALIZABLE 아님. *Unique constraint + 예외 변환* 또는 *FOR UPDATE on slot row*.\n- \"report query 동안 데이터 변경 영향\" → READ COMMITTED는 영향 받음. REPEATABLE READ 또는 PG snapshot.\n- \"PostgreSQL에서 40001 retry\" → SERIALIZABLE 사용 + 자동 retry 라이브러리.\n- \"MySQL gap lock으로 deadlock\" → next-key lock 동작 이해 필요 (`mysql-gap-lock-blind-spots`).\n\n## 빠른 확인 질문\n\n- 4가지 격리 수준에서 각각 차단되는 anomaly?\n  - READ UNCOMMITTED: 없음 / READ COMMITTED: Dirty Read만 / REPEATABLE READ: + Non-Repeatable Read / SERIALIZABLE: + Phantom Read + Write Skew.\n- MySQL REPEATABLE READ가 PG REPEATABLE READ보다 강한 이유?\n  - Next-key lock (gap lock)으로 phantom 일부 차단.\n- SERIALIZABLE 사용 시 application 측 필수?\n  - Retry 로직 (40001 SQLState 또는 OptimisticLockException 같이).\n\n## 한 줄 정리\n\n격리 수준 = *anomaly 차단 정도 vs 성능*. 일반 default 사용이 안전. SERIALIZABLE은 *필요한 transaction*에만 + retry 로직. MySQL/PG의 default와 동작 차이 인지 필수.\n\nretrieval-anchor-keywords: transaction isolation level, READ UNCOMMITTED COMMITTED REPEATABLE READ SERIALIZABLE, Dirty Read, Non-Repeatable Read, Phantom Read, Write Skew, MVCC, Snapshot Isolation, Serializable Snapshot Isolation SSI, MySQL InnoDB gap lock next-key lock, PostgreSQL 40001 SQLState retry, Spring @Transactional isolation, default isolation MySQL PostgreSQL, write skew oncall doctor example\n",
   "aliases": [
     "트랜잭션 격리 수준",
+    "격리 수준 비교",
+    "읽기 커밋 격리",
+    "반복 읽기 격리",
+    "직렬화 격리 수준",
     "Isolation Level",
     "READ COMMITTED",
     "REPEATABLE READ",
     "SERIALIZABLE",
-    "READ UNCOMMITTED",
-    "Dirty Read",
-    "Non-Repeatable Read",
     "Phantom Read",
-    "MVCC",
-    "Snapshot Isolation",
     "Write Skew",
-    "격리 수준 비교"
+    "Snapshot Isolation"
   ],
   "expected_queries": [
-    "트랜잭션 격리 수준 4가지가 뭐야?",
-    "Read Committed랑 Repeatable Read 차이가 뭐야?",
-    "Phantom Read가 정확히 뭐야?",
-    "MySQL과 PostgreSQL의 default isolation 차이는?",
-    "SERIALIZABLE 비용이 얼마나 커?",
-    "MVCC가 격리 수준과 어떻게 연결돼?",
-    "트랜잭션이 서로 어디까지 보고 어디까지 못 보게 할지 단계가 있다며",
-    "트랜잭션 격리 수준 isolation level — 동시 실행 트랜잭션 간 가시성 단계 (read uncommitted/committed/repeatable read/serializable)"
+    "Read Committed와 Repeatable Read는 같은 데이터를 다시 읽을 때 어떻게 달라?",
+    "Serializable 격리 수준을 쓰면 어떤 이상 현상을 막고 어떤 비용이 생겨?",
+    "MySQL 기본 격리 수준과 PostgreSQL 기본 격리 수준은 왜 다르게 봐야 해?",
+    "Phantom Read와 Write Skew가 격리 수준 선택에 어떤 영향을 줘?",
+    "MVCC snapshot이 트랜잭션 안에서 보이는 데이터를 어떻게 고정해?"
   ],
   "symptoms": [
     "4가지 격리 수준 차이를 모름",
@@ -52,8 +48,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch148"
+      }
+    ]
   }
 }

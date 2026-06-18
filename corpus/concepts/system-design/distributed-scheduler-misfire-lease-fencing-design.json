@@ -4,20 +4,25 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "distributed scheduler의 misfire, lease renewal, fencing token, duplicate suppression을 정확성/성능/레이턴시 관점으로 설계하는 system-design guide",
-  "body_markdown": "# Distributed Scheduler Misfire Lease Fencing Design\n\n## 이 문서가 맡는 질문\ndistributed scheduler의 misfire, lease renewal, fencing token, duplicate suppression을 정확성/성능/레이턴시 관점으로 설계하는 system-design guide. 이 문서는 단어 정의가 아니라 실제 증상에서 어떤 구조와 지표를 봐야 하는지 연결한다.\n\n## 빠른 분기\nrenew interval은 lease TTL보다 충분히 짧게 잡고, TTL은 renew interval, coordination delay, clock skew, GC pause, failover 지연의 tradeoff를 반영한다. external sink가 fencing token을 검증하게 한다. misfire는 skip/catch-up/coalesce 정책을 분리한다. 마지막으로 duplicate execution, schedule lag, lease lost count를 본다.\n\n## 실전 시나리오\n정산 job이 매일 00시에 실행된다. leader가 GC pause로 lease renew를 놓친 사이 새 leader가 같은 job을 시작했고, 기존 leader도 pause에서 돌아와 외부 송금을 계속했다.\n\n## CS 배경\n분산 scheduler는 시간, leader election, work claiming, side effect idempotency가 모두 필요하다. lease는 소유권의 시간 제한이고 renewal heartbeat가 유지되는 동안 긴 job도 계속 실행될 수 있다. fencing token은 pause에서 돌아온 오래된 owner가 외부 시스템에 쓰는 것을 막는 단조 증가 증거다.\n\n## 핵심 모델\n- 입력 신호: scheduler와 lease_fencing가 어떤 경계에서 발생했는지 본다\n- 불변식: correctness를 깨뜨리는 조건을 먼저 말로 고정한다\n- 비용 모델: memory, CPU, IO, network roundtrip, queueing 중 어느 항이 tail latency를 키우는지 나눈다\n- 운영 모델: 장애 후 replay, rollback, retry, fallback이 같은 결과를 유지하는지 확인한다\n\n## 판단 매트릭스\n- renew interval은 lease TTL보다 충분히 짧게 잡고, TTL은 renew interval, coordination delay, clock skew, GC pause, failover 지연의 tradeoff를 반영한다\n- external sink가 fencing token을 검증하게 한다\n- misfire는 skip/catch-up/coalesce 정책을 분리한다\n- duplicate execution, schedule lag, lease lost count를 본다\n\n## 예시\n```text\nclaim(job, scheduled_at) returns token=42 and lease_ttl=30s; renew every 5s; every side effect passes token to a sink that rejects stale tokens.\n```\n이 예시는 API 이름보다 boundary와 invariant를 드러내기 위한 것이다. 실제 구현에서는 입력 크기, 실패 빈도, 배포 단위, 관측 가능성을 같이 적어야 한다.\n\n## 깊게 볼 포인트\nDB row lock만으로는 pause에서 돌아온 오래된 worker의 외부 side effect를 막지 못한다. 관련 문서를 가져왔을 때도 이 문서의 목적은 하나의 정답을 외우게 하는 것이 아니라 선택 기준을 세우게 하는 것이다. 같은 현상이 algorithm, data structure, database, runtime, network, security, system design 중 어디에서 만들어졌는지 확인해야 한다.\n\n## 품질 관점\n품질은 잘못된 후보를 얼마나 빨리 배제하고, edge case를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 happy path보다 boundary condition, replay, stale state, version skew, concurrent update를 포함해야 한다.\n\n## 성능 관점\n성능은 평균 처리량만 보지 않는다. build cost, memory footprint, write amplification, cache locality, queue depth, retry amplification 중 어떤 비용이 커지는지 분리한다. benchmark는 synthetic micro case와 실제 traffic shape를 따로 둔다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. 첫 요청, 재시도, cache miss, compaction, checkpoint, handshake, index rebuild처럼 드문 경로가 학습자 체감 품질을 망칠 수 있다. 그래서 histogram, trace span, timeout budget을 같이 확인한다.\n\n## 주제별 추가 지표\nScheduler 문서는 lease-lost count, renew latency histogram, duplicate side-effect count, misfire backlog, schedule lag, stale fencing token rejection을 주제별 지표로 본다.\n\n## 자주 하는 오해\n- 이름이 비슷한 기존 패턴을 그대로 적용하면 된다고 생각한다\n- correctness 불변식 없이 성능 지표만 비교한다\n- latency spike를 애플리케이션 코드 한 곳의 문제로만 본다\n- rollback이나 replay 상황의 의미 보존을 검증하지 않는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 품질/성능/레이턴시를 어떤 명령, 테스트, 대시보드로 확인할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. 후보 해결책의 correctness invariant를 적는다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. p95/p99, error rate, retry/replay count를 비교한다\n6. 결과를 회고에 남기고 다음 학습 문서로 연결한다\n\n## 한 줄 정리\ndistributed scheduler의 misfire, lease renewal, fencing token, duplicate suppression을 정확성/성능/레이턴시 관점으로 설계하는 system-design guide\n",
+  "body_markdown": "# Distributed Scheduler Misfire Lease Fencing Design\n\n## 이 문서가 맡는 질문\ndistributed scheduler의 misfire, lease renewal, fencing token, duplicate suppression을 정확성/성능/레이턴시 관점으로 설계하는 system-design guide. 이 문서는 단어 정의가 아니라 실제 증상에서 어떤 구조와 지표를 봐야 하는지 연결한다.\n\n## 빠른 분기\nrenew interval은 lease TTL보다 충분히 짧게 잡고, TTL은 renew interval, coordination delay, clock skew, GC pause, failover 지연의 tradeoff를 반영한다. external sink가 fencing token을 검증하게 한다. misfire는 skip/catch-up/coalesce 정책을 분리한다. 마지막으로 duplicate execution, schedule lag, lease lost count를 본다.\n\n## 실전 시나리오\n정산 job이 매일 00시에 실행된다. leader가 GC pause로 lease renew를 놓친 사이 새 leader가 같은 job을 시작했고, 기존 leader도 pause에서 돌아와 외부 송금을 계속했다.\n\n## CS 배경\n분산 scheduler는 시간, leader election, work claiming, side effect idempotency가 모두 필요하다. lease는 소유권의 시간 제한이고 renewal heartbeat가 유지되는 동안 긴 job도 계속 실행될 수 있다. fencing token은 pause에서 돌아온 오래된 owner가 외부 시스템에 쓰는 것을 막는 단조 증가 증거다.\n\n## 핵심 모델\n- 입력 신호: scheduler와 lease_fencing가 어떤 경계에서 발생했는지 본다\n- 불변식: correctness를 깨뜨리는 조건을 먼저 말로 고정한다\n- 비용 모델: memory, CPU, IO, network roundtrip, queueing 중 어느 항이 tail latency를 키우는지 나눈다\n- 운영 모델: 장애 후 replay, rollback, retry, fallback이 같은 결과를 유지하는지 확인한다\n\n## 판단 매트릭스\n- renew interval은 lease TTL보다 충분히 짧게 잡고, TTL은 renew interval, coordination delay, clock skew, GC pause, failover 지연의 tradeoff를 반영한다\n- external sink가 fencing token을 검증하게 한다\n- misfire는 skip/catch-up/coalesce 정책을 분리한다\n- duplicate execution, schedule lag, lease lost count를 본다\n\n## 예시\n```text\nclaim(job, scheduled_at) returns token=42 and lease_ttl=30s; renew every 5s; every side effect passes token to a sink that rejects stale tokens.\n```\n이 예시는 API 이름보다 boundary와 invariant를 드러내기 위한 것이다. 실제 구현에서는 입력 크기, 실패 빈도, 배포 단위, 관측 가능성을 같이 적어야 한다.\n\n## 깊게 볼 포인트\nDB row lock만으로는 pause에서 돌아온 오래된 worker의 외부 side effect를 막지 못한다. 관련 문서를 가져왔을 때도 이 문서의 목적은 하나의 정답을 외우게 하는 것이 아니라 선택 기준을 세우게 하는 것이다. 같은 현상이 algorithm, data structure, database, runtime, network, security, system design 중 어디에서 만들어졌는지 확인해야 한다.\n\n## 설계 분기 예시\n\n| 실패 신호 | 먼저 고정할 불변식 | 설계 선택 |\n|---|---|---|\n| 같은 scheduled_at의 job이 두 worker에서 시작됨 | 같은 job instance의 외부 side effect는 한 owner만 성공해야 한다 | claim key를 `(job_id, scheduled_at)`로 두고 token을 단조 증가시킨다 |\n| worker가 pause 후 돌아와 쓰기를 계속함 | 오래된 owner의 write는 sink가 거절해야 한다 | DB lock 해제 여부가 아니라 sink-side fencing token 검증을 둔다 |\n| 긴 장애 뒤 misfire backlog가 쌓임 | 복구가 live traffic을 압도하면 안 된다 | skip, catch-up, coalesce를 job별 정책으로 분리한다 |\n| lease renew 지연이 p99에서 튐 | 정상 worker를 너무 빨리 잃어도 안 되고 장애 감지도 늦으면 안 된다 | TTL은 renew interval보다 넉넉히 두되 GC pause와 coordination tail을 포함한다 |\n\n## lease TTL과 renew interval 잡기\n\nlease TTL은 \"장애를 얼마나 빨리 감지할까\"와 \"느린 정상 worker를 얼마나 참을까\"의 절충이다. 예를 들어 renew every 5s, TTL 30s라면 coordination store p99, 네트워크 jitter, GC pause, clock skew를 합쳐도 여러 번 renew 기회가 남아야 한다. 반대로 TTL이 너무 길면 failover가 늦어지고, 너무 짧으면 정상 worker가 lease를 잃어 duplicate execution을 만든다.\n\n설계 답변에서는 숫자 하나만 말하지 말고 다음을 같이 적는다.\n\n- renew latency histogram과 timeout budget\n- lease lost count와 false takeover 비율\n- worker pause 시간 분포와 배포/GC 이벤트 상관관계\n- failover 목표 시간과 외부 side effect의 위험도\n\n## fencing token 위치\n\nfencing token은 scheduler 내부 로그에만 남으면 부족하다. 실제 돈 이체, 정산 확정, 알림 발송처럼 외부 상태를 바꾸는 sink가 token을 받아서 이전 token을 거절해야 한다. sink가 token을 검증하지 못하면 lease를 다시 잡아도 pause에서 돌아온 옛 worker의 write를 막을 수 없다.\n\n따라서 설계 경계는 보통 세 층이다.\n\n1. scheduler는 job instance를 claim하고 token을 발급한다.\n2. worker는 renew가 살아 있는 동안만 작업을 진행한다.\n3. sink는 마지막으로 본 token보다 오래된 요청을 거절한다.\n\n## misfire 정책 분리\n\nmisfire는 하나의 정답이 없다. 결제 정산처럼 반드시 빠진 구간을 보정해야 하는 job은 catch-up이 필요할 수 있고, 알림 digest처럼 시간이 지나면 의미가 약한 job은 skip이 더 안전할 수 있다. 매분 실행되는 통계 job은 backlog 100개를 모두 실행하는 대신 coalesce해서 최신 구간 하나로 합치는 편이 낫다.\n\n그래서 job definition에는 schedule만 두지 말고 misfire policy, max catch-up window, concurrency key, idempotency key, side-effect class를 함께 둔다. 그래야 장애 뒤 복구가 \"밀린 것을 다 실행\"이라는 단순한 동작으로 운영 부하를 키우지 않는다.\n\n## 품질 관점\n품질은 잘못된 후보를 얼마나 빨리 배제하고, edge case를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 happy path보다 boundary condition, replay, stale state, version skew, concurrent update를 포함해야 한다.\n\n## 성능 관점\n성능은 평균 처리량만 보지 않는다. build cost, memory footprint, write amplification, cache locality, queue depth, retry amplification 중 어떤 비용이 커지는지 분리한다. benchmark는 synthetic micro case와 실제 traffic shape를 따로 둔다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. 첫 요청, 재시도, cache miss, compaction, checkpoint, handshake, index rebuild처럼 드문 경로가 학습자 체감 품질을 망칠 수 있다. 그래서 histogram, trace span, timeout budget을 같이 확인한다.\n\n## 주제별 추가 지표\nScheduler 문서는 lease-lost count, renew latency histogram, duplicate side-effect count, misfire backlog, schedule lag, stale fencing token rejection을 주제별 지표로 본다.\n\n## 자주 하는 오해\n- 이름이 비슷한 기존 패턴을 그대로 적용하면 된다고 생각한다\n- correctness 불변식 없이 성능 지표만 비교한다\n- latency spike를 애플리케이션 코드 한 곳의 문제로만 본다\n- rollback이나 replay 상황의 의미 보존을 검증하지 않는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 품질/성능/레이턴시를 어떤 명령, 테스트, 대시보드로 확인할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. 후보 해결책의 correctness invariant를 적는다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. p95/p99, error rate, retry/replay count를 비교한다\n6. 결과를 회고에 남기고 다음 학습 문서로 연결한다\n\n## 한 줄 정리\ndistributed scheduler의 misfire, lease renewal, fencing token, duplicate suppression을 정확성/성능/레이턴시 관점으로 설계하는 system-design guide\n",
   "aliases": [
     "distributed scheduler misfire lease fencing",
     "scheduler duplicate job fencing token",
     "lease renewal misfire handling",
     "cron drift distributed scheduler",
-    "Distributed Scheduler Misfire Lease Fencing Design",
-    "distributed scheduler misfire lease renewal fencing token duplicate job suppression cron drift failover latency"
+    "분산 스케줄러 중복 실행",
+    "스케줄러 lease fencing",
+    "misfire 처리 정책",
+    "fencing token 설계",
+    "lease 갱신 실패",
+    "cron drift failover"
   ],
   "expected_queries": [
-    "분산 scheduler에서 같은 job이 두 번 실행되지 않게 하려면?",
-    "misfire와 lease fencing을 어떻게 설계해?",
-    "Distributed scheduler의 correctness와 latency를 어떻게 검증해?",
-    "분산 scheduler에서 misfire, lease, fencing token을 어떻게 설계해?"
+    "분산 스케줄러에서 같은 작업이 두 번 실행되는 걸 어떻게 막아?",
+    "misfire 처리와 lease fencing을 함께 설계할 때 무엇부터 정해야 해?",
+    "분산 스케줄러의 정확성과 지연 시간은 어떤 지표로 검증해?",
+    "lease 갱신을 놓친 worker가 외부 시스템에 쓰지 못하게 하려면?",
+    "misfire가 많이 쌓였을 때 catch-up과 skip 정책을 어떻게 나눠?"
   ],
   "symptoms": [
     "leader failover 직후 같은 job이 두 node에서 실행된다",
@@ -58,7 +63,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +72,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch148"
       }
     ]
   }

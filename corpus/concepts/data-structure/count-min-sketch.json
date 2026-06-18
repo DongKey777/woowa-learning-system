@@ -6,13 +6,14 @@
   "summary": "Count-Min Sketch는 적은 메모리로 스트림의 빈도를 근사하고, 과대 추정만 허용하는 확률적 카운팅 자료구조다.",
   "body_markdown": "# Count-Min Sketch\n\n> 한 줄 요약: Count-Min Sketch는 적은 메모리로 스트림의 빈도를 근사하고, 과대 추정만 허용하는 확률적 카운팅 자료구조다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [응용 자료 구조 개요](./applied-data-structures-overview.md)\n> - [Approximate Counting for Rate Limiting and Observability](./approximate-counting-rate-limiting-observability.md)\n> - [Count-Min Sketch vs HyperLogLog](./count-min-vs-hyperloglog.md)\n> - [Space-Saving Heavy Hitters](./space-saving-heavy-hitters.md)\n> - [Sketch and Filter Selection Playbook](./sketch-filter-selection-playbook.md)\n> - [Top-k Streaming and Heavy Hitters](../algorithm/top-k-streaming-heavy-hitters.md)\n> - [HyperLogLog](./hyperloglog.md)\n\n> retrieval-anchor-keywords: count-min sketch, CMS, approximate frequency, frequency sketch, heavy hitters, hot keys, rate limiting, observability, noisy tenant, streaming analytics, overestimation, hash rows, approximate count\n\n## 핵심 개념\n\nCount-Min Sketch는 `d`개의 해시 행과 `w`개의 열을 가진 카운트 테이블이다.  \n원소가 들어올 때마다 각 행의 해시 위치를 하나씩 증가시키고, 조회할 때는 그 위치들의 **최솟값**을 빈도로 본다.\n\n이 구조의 핵심은 두 가지다.\n\n- 메모리를 고정할 수 있다.\n- 빈도를 정확히 저장하지 않아도 된다.\n\n다만 결과는 보통 **과소 추정이 아니라 과대 추정** 쪽으로 치우친다.  \n다른 원소와 충돌한 카운트가 더해질 수 있기 때문이다.\n\n## 깊이 들어가기\n\n### 1. 왜 min을 쓰나\n\n한 원소가 여러 행에서 같은 칸을 차지할 수 있고, 그 칸에는 다른 원소들의 카운트도 섞일 수 있다.\n\n그래서 각 행의 값을 전부 믿지 않고, 가장 작은 값을 빈도로 본다.  \n이렇게 하면 충돌에 의한 오차를 어느 정도 누를 수 있다.\n\n### 2. 왜 과대 추정만 생기나\n\n카운트를 더하는 구조이기 때문이다.\n\n- 실제로는 3번 나온 원소가\n- 충돌 때문에 5번처럼 보일 수 있다\n\n반대로 진짜보다 작아지는 경로는 없다.  \n이 성질이 hot key 탐지나 대략적인 빈도 추정에 유용하다.\n\n### 3. backend에서 왜 유용한가\n\nCount-Min Sketch는 완전한 카운터 대신 \"가벼운 관측 센서\"처럼 쓸 수 있다.\n\n- API hot key 추적\n- 테넌트별 요청 분포의 대략적 파악\n- 비정상적으로 자주 나타나는 이벤트 탐지\n- rate limit 보조 정보\n\n오차 모델은 width와 depth로 읽는다. width는 충돌로 더해지는 오차 크기를 줄이고,\ndepth는 모든 행에서 동시에 나쁜 충돌을 만날 확률을 줄인다. 그래서 production\n설계에서는 \"메모리가 작다\"보다 `epsilon`, `delta`, hash seed 수, counter overflow,\nwindow reset 정책을 먼저 정한다.\n\n### 4. Bloom Filter와의 차이\n\nBloom Filter는 membership, Count-Min Sketch는 frequency를 다룬다.\n\n- Bloom Filter: 있는가/없는가\n- Count-Min Sketch: 얼마나 자주 나오는가\n\n둘 다 hash + compact array를 쓰지만 목적이 다르다.\n\n## 실전 시나리오\n\n### 시나리오 1: hot key 추적\n\n분산 캐시에서 특정 key가 너무 자주 보이면 병목이 된다.  \nCount-Min Sketch는 메모리를 크게 쓰지 않고도 이런 키를 빠르게 의심할 수 있게 해준다.\n\n### 시나리오 2: 실시간 트래픽 분포\n\n대량 요청 로그에서 정확한 count를 전부 들고 있지 않아도, 대략적인 분포를 볼 수 있다.\n\n### 시나리오 3: rate limit 보조\n\n엄밀한 차단 판단은 다른 구조가 하더라도, 스케치로 \"대충 얼마나 자주 쓰였나\"를 보조할 수 있다.\n\n### 시나리오 4: 오판\n\n정확한 순위가 필요한 재무/정산 시스템에는 부적합하다.  \n이 경우는 정확한 카운터나 영속 저장소가 맞다.\n\n### 시나리오 5: shard별 CMS merge\n\n같은 width, depth, hash seed, counter type을 쓰는 CMS끼리는 table을 element-wise로\n더해 merge할 수 있다. 반대로 seed나 width가 다르면 같은 cell이 같은 의미를\n갖지 않으므로 합칠 수 없다. sliding window가 필요하면 window별 CMS를 따로 두고\n만료시키거나, decay가 있는 별도 구조를 택해야 한다.\n\n## 정신 모델\n\nCount-Min Sketch는 \"여러 개의 좁은 집계 장부에 같은 사건을 동시에 적고, 조회할 때 가장 덜 오염된 장부를 믿는 구조\"다.\n\n각 행은 독립적인 해시 장부다.\n충돌이 생기면 다른 key의 count가 섞여 값이 커진다.\n그래서 여러 행 중 최솟값을 고르면, 그 key가 겪은 충돌 오염을 가장 작게 받은 추정치를 선택하는 셈이다.\n\n확률적 구조라는 뜻은 \"아무렇게나 틀려도 된다\"가 아니다.\n\n- width는 충돌로 인한 오차 크기를 줄인다.\n- depth는 나쁜 충돌이 모든 행에서 동시에 일어날 확률을 줄인다.\n- 추정값은 삽입만 있는 기본 CMS에서 실제 빈도보다 작아지지 않는다.\n- merge는 같은 hash schema의 table 덧셈일 때만 의미가 있다.\n- CMS 자체는 \"누가 top-k인가\"를 열거하지 못한다. 후보 목록은 Space-Saving 같은 구조나 별도 sample/index가 맡아야 한다.\n\n## 자주 하는 오해\n\n| 오해 | 교정 |\n|---|---|\n| Count-Min Sketch는 distinct count용이다 | frequency 추정용이다. distinct count는 HLL 쪽이다 |\n| 조회값이 정확한 순위다 | 충돌 때문에 과대 추정될 수 있어 후보 신호로 봐야 한다 |\n| min을 쓰면 충돌이 사라진다 | 사라지는 게 아니라 가장 덜 오염된 행을 고르는 것이다 |\n| 삭제도 그냥 빼면 항상 안전하다 | conservative update/count-min variants가 아니면 음수/과소 추정 문제가 생길 수 있다 |\n| rate limit 판정을 단독으로 맡겨도 된다 | 사용자 차단 같은 강한 결정은 exact counter나 보정 로직과 함께 둔다 |\n| CMS로 현재 top-k를 바로 뽑을 수 있다 | 임의 key 빈도 추정은 가능하지만 후보 key 열거는 별도 구조가 필요하다 |\n| 서로 다른 CMS도 더하면 된다 | width/depth/hash seed/counter 의미가 같을 때만 merge가 안전하다 |\n\n## 코드로 보기\n\n아래 코드는 동작 감각을 위한 학습용이다. 운영에서는 독립 hash 함수, saturating\ncounter 또는 overflow 정책, conservative update 여부, window rotation,\nserialization metadata를 함께 설계해야 한다.\n\n```java\npublic class CountMinSketch {\n    private final int[][] table;\n    private final int width;\n    private final int depth;\n\n    public CountMinSketch(int depth, int width) {\n        this.depth = depth;\n        this.width = width;\n        this.table = new int[depth][width];\n    }\n\n    public void add(String value) {\n        for (int i = 0; i < depth; i++) {\n            table[i][indexOf(value, i)]++;\n        }\n    }\n\n    public int estimate(String value) {\n        int min = Integer.MAX_VALUE;\n        for (int i = 0; i < depth; i++) {\n            min = Math.min(min, table[i][indexOf(value, i)]);\n        }\n        return min;\n    }\n\n    private int indexOf(String value, int seed) {\n        int hash = value.hashCode() ^ (seed * 0x9e3779b9);\n        return Math.floorMod(hash, width);\n    }\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Count-Min Sketch | 메모리가 작고 스트리밍에 강함 | 과대 추정 오차가 있다 | 대략적인 빈도 추적 |\n| HashMap 카운터 | 정확하다 | 메모리를 많이 쓴다 | 정확도가 최우선일 때 |\n| Top-k heap | 상위 후보를 바로 볼 수 있다 | 전체 분포는 놓친다 | 상위 항목만 중요할 때 |\n\n핵심은 \"정확한 값\"이 아니라 \"충분히 유용한 근사치\"가 필요한가다.\n\n## 꼬리질문\n\n> Q: 왜 과소 추정이 거의 없나?\n> 의도: 카운트 합산 구조를 이해하는지 확인\n> 핵심: 충돌은 값을 더할 뿐, 빼지 않기 때문이다.\n\n> Q: heavy hitter와 왜 같이 쓰이나?\n> 의도: 빈도 근사와 상위 후보 추적을 구분하는지 확인\n> 핵심: 스케치로 대략적인 빈도를 보고, top-k로 후보를 좁힌다.\n\n> Q: Bloom Filter와 무엇이 다른가?\n> 의도: membership vs frequency 구분 확인\n> 핵심: Bloom은 존재 여부, Count-Min은 등장 횟수다.\n\n## 한 줄 정리\n\nCount-Min Sketch는 hash 충돌을 허용하는 대신, 스트림의 빈도를 작은 메모리로 빠르게 근사하는 자료구조다.\n",
   "aliases": [
-    "Count-Min Sketch",
     "CMS frequency sketch",
-    "approximate frequency",
-    "frequency sketch",
-    "overestimation sketch",
-    "hot key counting",
-    "hash rows count table"
+    "approximate frequency sketch",
+    "카운트 민 스케치",
+    "빈도 근사 스케치",
+    "과대 추정 카운터",
+    "hot key counting sketch",
+    "hash row counter table",
+    "스트림 빈도 추정"
   ],
   "expected_queries": [
     "Count-Min Sketch는 왜 여러 hash row의 최솟값을 frequency로 봐?",
@@ -50,8 +51,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/data-structure/count-min-sketch.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch148",
+        "changes": [
+          "alias-query-contract-repair"
+        ]
+      }
+    ]
   }
 }
