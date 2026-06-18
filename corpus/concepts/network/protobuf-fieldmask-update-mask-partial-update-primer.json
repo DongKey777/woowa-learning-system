@@ -1,0 +1,73 @@
+{
+  "id": "network/protobuf-fieldmask-update-mask-partial-update-primer",
+  "title": "Protobuf FieldMask update_mask partial update primer",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "Protobuf FieldMask 기반 `update_mask`는 partial update에서 어떤 필드를 실제로 바꿀지 선언하는 API 계약이다. `protobuf-fieldmask-update-mask-partial-...` backlog 항목의 핵심은 body에 필드가 빠졌는지, 0/false/empty string 같은 default 값으로 바꾸려는지, nested/repeated/message field를 어떻게 적용할지, 그리고 old client와 new server가 섞이는 rollout에서 mask 없는 요청을 어떻게 막을지 분리하는 것이다.",
+  "body_markdown": "# Protobuf FieldMask update_mask partial update primer\n\n> 한 줄 요약: `update_mask`는 값 자체보다 이번 요청이 건드릴 field set을 따로 보내서, omitted field와 default/zero value update를 구분하는 protobuf partial update 계약이다.\n\nretrieval-anchor-keywords: protobuf FieldMask update_mask, protobuf-fieldmask-update-mask-partial-..., protobuf-fieldmask-update-mask-partial-update-primer, google.protobuf.FieldMask, partial update, PATCH semantics, omitted field vs zero value, proto3 default value reset, nested field path, repeated field mask, message field merge, update mask rollout\n\n## 왜 필요할까\n\nproto3 scalar는 기본적으로 absent와 default 값이 비슷하게 보일 수 있다. `int32 age = 1`에서 클라이언트가 `age`를 안 보낸 것인지, 정말 `0`으로 바꾸려는 것인지 서버가 값만 보고 판단하면 partial update가 흔들린다.\n\n그래서 update API는 보통 값을 담는 resource와 변경할 field 목록을 분리한다.\n\n```proto\nmessage UpdateUserRequest {\n  User user = 1;\n  google.protobuf.FieldMask update_mask = 2;\n}\n```\n\n`user`는 새 값의 후보를 담고, `update_mask.paths`는 그중 실제로 적용할 field를 말한다. 서버의 첫 규칙은 단순하다.\n\n- mask에 있는 field만 바꾼다.\n- mask에 없는 field는 body에 값이 있어도 유지하거나 명시적으로 거절한다.\n- default 값으로 reset하려면 그 field를 mask에 넣고 값은 default로 보낸다.\n\n## omitted과 default를 나누는 표\n\n| 요청 의도 | update message 값 | update_mask | 서버 적용 |\n|---|---|---|---|\n| 필드 유지 | 값 없음 또는 값이 우연히 있음 | path 없음 | 기존 값 유지 |\n| 문자열을 빈 값으로 변경 | `display_name` empty string | `display_name` 포함 | empty string 적용 또는 domain validation |\n| 숫자를 0으로 변경 | `age = 0` | `age` 포함 | 0 적용 |\n| boolean을 false로 변경 | `marketing_opt_in = false` | `marketing_opt_in` 포함 | false 적용 |\n| nested field 하나만 변경 | `profile.timezone` 값 | `profile.timezone` 포함 | 그 leaf만 변경 |\n| message 전체 정책 적용 | `profile` message | `profile` 포함 | API가 정한 merge 또는 replace 정책 적용 |\n\n핵심은 `값이 default인가`가 아니라 `mask가 그 field를 가리키는가`다. mask 없이 값만 보고 변경 여부를 추론하면 0, false, empty string, empty list, default enum에서 사고가 난다.\n\n## PATCH semantic과 PUT boundary\n\nHTTP/JSON transcoding을 붙인다면 `update_mask` update는 보통 `PATCH`에 놓는다.\n\n```http\nPATCH /v1/users/42?updateMask=displayName,timezone\n```\n\n이 문서는 JSON Patch의 `add`, `remove`, `replace` op나 JSON Merge Patch의 `null` 삭제 의미를 설명하는 문서가 아니다. Protobuf/gRPC API에서 `google.protobuf.FieldMask`가 partial update field set을 맡는다는 계약을 다룬다.\n\nREST gateway에서는 표기 차이도 문서화한다. proto 내부 `paths`는 보통 proto field name 기준이고, HTTP/JSON 표현에서는 `updateMask=displayName,profile.timezone`처럼 lowerCamelCase로 보일 수 있다. 클라이언트 SDK, gateway, OpenAPI 문서가 같은 path naming을 쓰는지 fixture로 확인해야 한다.\n\n## nested path 설계\n\nNested path는 작은 변경을 표현할 때 유용하지만, 서버가 허용하는 path whitelist를 가져야 한다.\n\n```text\nAllowed:\n- display_name\n- profile.timezone\n- profile.avatar_url\n- notification_settings.email_enabled\n\nRejected:\n- id\n- created_at\n- role\n- profile.internal_score\n```\n\n`profile.timezone`처럼 leaf를 허용하면 기존 `profile`의 다른 field는 유지된다. 반대로 `profile` parent path를 허용하면 message merge인지 replace인지가 API 계약이 된다. 같은 API 안에서 어떤 path는 leaf only, 어떤 path는 parent message allowed처럼 섞을 수는 있지만, 문서와 validation 없이는 클라이언트가 예측하기 어렵다.\n\n## repeated와 message field는 특별히 적기\n\nFieldMask의 기본 설명만 믿고 repeated/message field를 대충 열어 두면 클라이언트별 결과가 달라질 수 있다.\n\n- repeated field는 path의 마지막 위치에서만 다루는 것이 안전하다.\n- protobuf 기본 merge 유틸은 repeated 값을 append하고 message 값을 merge하는 모델을 제공할 수 있다.\n- 많은 public API는 repeated field를 전체 replace로 계약하거나, 부분 변경은 별도 child resource API로 분리한다.\n- message parent path는 merge인지 replace인지, leaf path만 허용할지 먼저 정한다.\n- map field도 repeated entry에 가까우므로 key 단위 patch처럼 보이게 방치하지 않는다.\n\n예를 들어 `tags`를 mask에 넣었을 때 기존 tags에 append되는지, 전체 tags가 교체되는지, empty tags로 clear되는지를 API 문서와 테스트가 고정해야 한다. 배열 원소 하나를 고치는 요구가 중요하면 FieldMask 하나로 숨기기보다 `AddTag`, `RemoveTag`, child resource update 같은 별도 command가 더 명확할 수 있다.\n\n## 서버 validation 체크리스트\n\n1. `update_mask`가 없거나 비어 있을 때의 정책을 정한다. schema evolution 위험을 줄이려면 write API에서는 명시 mask를 요구하는 편이 안전하다.\n2. unknown path, immutable path, server-owned path를 `INVALID_ARGUMENT` 또는 문서화된 validation error로 거절한다.\n3. mask에 있는데 update message에 값이 default인 경우를 clear/reset 의도로 처리할지 domain validation으로 막을지 정한다.\n4. mask 밖에 값이 들어온 경우는 ignore와 reject 중 하나로 고정한다. 운영 디버깅에는 reject가 더 선명한 경우가 많다.\n5. nested parent path와 leaf path가 동시에 들어올 때 중복/충돌 규칙을 둔다.\n6. repeated/message/map field는 append, merge, replace, clear 정책을 field별로 테스트한다.\n\n## rollout과 compatibility\n\n`update_mask`를 나중에 붙이는 API는 old client가 mask 없이 보내는 기간을 반드시 고려해야 한다. mask가 없을 때 모든 field update로 해석하면, old client가 모르는 새 field나 채우지 않은 field가 default로 reset될 수 있다.\n\n실무 rollout은 보통 이렇게 간다.\n\n1. 서버가 `update_mask`를 받되, old client 경로를 telemetry로 분리한다.\n2. 새 client SDK는 변경한 field로 mask를 자동 생성하거나 명시 builder를 제공한다.\n3. 서버는 mask 없는 요청, unknown path, mask 밖 값 전송을 metric에 남긴다.\n4. 일정 기간 뒤 write API에서 missing mask를 reject한다.\n5. 새 field를 추가할 때는 old client가 full replace처럼 reset하지 않는지 fixture로 검증한다.\n\n이 부분은 protobuf field number/reserved compatibility와 다르다. field number를 재사용하지 않는 것은 wire schema evolution의 기본 규칙이고, `update_mask`는 이미 존재하는 resource의 어떤 field를 이번 update에서 건드릴지를 정하는 application-level update 계약이다.\n\n## fixture로 남길 행\n\n| Fixture | 기존 resource | 요청 | 기대 결과 |\n|---|---|---|---|\n| keep omitted | `display_name=A, age=20` | `age=0`, mask 없음 또는 `display_name`만 | `age=20` 유지 또는 missing mask reject |\n| set zero | `age=20` | `age=0`, mask `age` | `age=0` |\n| set false | `marketing_opt_in=true` | false, mask `marketing_opt_in` | false |\n| nested leaf | `profile.timezone=Asia/Seoul, profile.locale=ko` | timezone=UTC, mask `profile.timezone` | locale 유지 |\n| immutable path | `id=42` | id=99, mask `id` | validation error |\n| repeated policy | `tags=[a]` | tags=[b], mask `tags` | 문서화한 append 또는 replace 결과 |\n| mask outside value | body has `role=admin`, mask `display_name` | reject 또는 ignore | 선택한 정책대로 고정 |\n| old client rollout | new field added | mask absent update from old client | 새 field reset 방지 또는 request reject |\n\n## confusable boundary\n\n- Protobuf wire schema evolution 문서는 field number, reserved name, unknown field, oneof migration을 소유한다. 이 문서는 update 요청의 field selection을 소유한다.\n- JSON Merge Patch와 JSON Patch 문서는 REST body media type, null 삭제, op idempotency를 소유한다. 이 문서는 protobuf `FieldMask`와 `update_mask`를 소유한다.\n- PATCH DTO tri-state 문서는 Java DTO의 missing/null/value 모델을 소유한다. 이 문서는 protobuf API boundary에서 mask가 그 tri-state 의도를 어떻게 보존하는지 다룬다.\n- gRPC rich error model 문서는 `BadRequest`, `ErrorInfo`, `RetryInfo` 같은 failure detail을 소유한다. 이 문서는 mask validation 실패를 어떤 field path 기준으로 잡아야 하는지만 건드린다.\n\n## 한 줄 정리\n\n`update_mask`를 쓰는 partial update는 값 payload와 변경 field set을 분리하는 계약이다. 서버는 mask를 source of truth로 삼아 omitted/default를 구분하고, nested/repeated/message field 정책과 missing-mask rollout을 테스트로 고정해야 한다.\n",
+  "aliases": [
+    "protobuf FieldMask update_mask",
+    "protobuf-fieldmask-update-mask-partial-...",
+    "protobuf-fieldmask-update-mask-partial-update-primer",
+    "프로토버프 FieldMask 부분 수정",
+    "update_mask 부분 업데이트",
+    "필드마스크 PATCH 계약",
+    "gRPC update_mask",
+    "omitted vs zero value protobuf",
+    "nested FieldMask path",
+    "repeated field update mask",
+    "default value reset field mask"
+  ],
+  "expected_queries": [
+    "protobuf update_mask로 일부 필드만 수정할 때 0이나 false도 업데이트하려면 어떻게 해?",
+    "FieldMask 없으면 안 보낸 필드랑 default 값이 어떻게 구분돼?",
+    "gRPC PATCH에서 update_mask paths를 nested field까지 어떻게 잡아?",
+    "프로토버프에서 nickname을 빈 문자열로 바꾸는 것과 안 바꾸는 걸 어떻게 구분해?",
+    "repeated나 message field를 FieldMask로 수정하면 replace야 merge야?",
+    "클라이언트가 update_mask를 안 보내던 API를 안전하게 롤아웃하려면 어떻게 해?"
+  ],
+  "symptoms": [
+    "proto3 default 값만 보고 partial update 의도를 추론해 0, false, empty string 업데이트를 놓친다",
+    "mask에 없는 field 값을 body에 넣어도 서버가 적용할 것이라고 기대한다",
+    "nested parent path와 leaf path의 merge 또는 replace 정책을 문서화하지 않는다",
+    "repeated field를 update_mask에 넣었을 때 append, replace, clear 중 무엇인지 테스트하지 않는다",
+    "old client가 update_mask 없이 보내는 요청이 새 field를 default로 reset할 수 있다는 rollout 위험을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/grpc-vs-rest",
+      "network/protobuf-wire-schema-evolution-field-number-reserved-compatibility-rules",
+      "language/patch-tri-state-field-primer"
+    ],
+    "next_docs": [
+      "software-engineering/json-merge-patch-vs-json-patch-media-type-null-idempotency-contract",
+      "network/grpc-rich-error-model-status-details-errorinfo-retryinfo-badrequest",
+      "language/optional-vs-fieldpatch-patch-tri-state-bridge"
+    ],
+    "confusable_with": [
+      "network/protobuf-wire-schema-evolution-field-number-reserved-compatibility-rules",
+      "software-engineering/json-merge-patch-vs-json-patch-media-type-null-idempotency-contract",
+      "network/http-put-vs-patch-vs-post-idempotency-intermediate-chooser",
+      "language/patch-tri-state-field-primer",
+      "network/grpc-rich-error-model-status-details-errorinfo-retryinfo-badrequest"
+    ],
+    "forbidden_for_queries": [
+      "protobuf field number reserved backward compatibility wire schema evolution",
+      "JSON Patch add remove replace operation array and media type",
+      "JSON Merge Patch null deletes field RFC 7396",
+      "HTTP PUT vs PATCH vs POST method idempotency only",
+      "gRPC rich error model ErrorInfo RetryInfo BadRequest details"
+    ]
+  },
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "batch191-stream-a-fieldmask"
+      }
+    ]
+  }
+}
