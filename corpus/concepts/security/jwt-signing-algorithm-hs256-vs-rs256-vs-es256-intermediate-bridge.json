@@ -6,18 +6,18 @@
   "summary": "같은 서비스 내부 검증은 HS256, 외부/마이크로서비스 검증은 RS256/ES256. 함정은 alg=none 우회 + 키 교체 (JWKS로 해결).",
   "body_markdown": "# JWT 서명 알고리즘 — HS256 vs RS256 vs ES256 어떻게 고를까\n\n> 한 줄 요약: 같은 서비스 내부 검증은 HS256, 외부/마이크로서비스 검증은 RS256/ES256. 함정은 `alg=none` 우회 + 키 교체 (JWKS로 해결).\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\nJWT 검증 시 *누가 어떤 키*로 서명을 확인하는가가 핵심.\n\n```\nHS256 (HMAC SHA-256) — 대칭\n  발급자와 검증자가 같은 secret 공유\n  단순, 빠름\n  검증자가 secret을 알면 곧 발급도 가능 (관리 어려움)\n\nRS256 (RSA SHA-256) — 비대칭\n  발급자: 비밀키로 서명\n  검증자: 공개키로 검증\n  검증자는 발급 못 함 (안전)\n  키 크기 크고 약간 느림\n\nES256 (ECDSA P-256 SHA-256) — 비대칭\n  RS256과 같은 모델, 더 작은 키 (~256-bit)\n  서명도 짧음, 빠름\n  최신 권장\n```\n\n## 한 장 정리\n\n| 알고리즘 | 키 모델 | 서명 길이 | 적합 |\n|---|---|---|---|\n| HS256 | 대칭 (HMAC) | 32 bytes | 단일 서비스 내부 + secret 안전 관리 |\n| HS512 | 대칭 (HMAC) | 64 bytes | HS256과 같지만 더 큰 |\n| **RS256** | 비대칭 (RSA-2048) | 256 bytes | 외부 검증 / 마이크로서비스 (가장 흔함) |\n| RS512 | 비대칭 (RSA-4096) | 512 bytes | 더 강한 RSA |\n| **ES256** | 비대칭 (ECDSA P-256) | 64 bytes | RS256 대체 (작고 빠름, 최신 권장) |\n| EdDSA | 비대칭 (Ed25519) | 64 bytes | ES256과 유사, 새 표준 |\n\n## \"어떤 걸 고를까?\"\n\n```\n1. 같은 서비스가 발급 + 검증 (모놀리식)?\n       → HS256 (가장 단순). secret 관리만 잘.\n\n2. 다른 서비스/팀이 검증?\n       → RS256 또는 ES256. 발급자만 비밀키, 검증자는 공개키.\n\n3. 마이크로서비스 / OAuth Resource Server?\n       → RS256/ES256 + JWKS endpoint.\n\n4. 모바일 앱 / IoT (작은 페이로드 중요)?\n       → ES256 (서명 작음, 네트워크 비용 ↓).\n```\n\n## HS256 위험 — Secret 관리\n\n```java\n// HS256 발급\nString token = Jwts.builder()\n    .subject(\"user-123\")\n    .signWith(secretKey, Jwts.SIG.HS256)   // secretKey가 32+ bytes\n    .compact();\n\n// 같은 secretKey로 검증\nJws<Claims> claims = Jwts.parser()\n    .verifyWith(secretKey)\n    .build()\n    .parseSignedClaims(token);\n```\n\n⚠️ 함정:\n- secret이 *짧으면* (예: \"mysecret\") brute force 가능. *최소 32 bytes 무작위*.\n- secret이 *여러 서비스에 공유*되면 → 한 곳 leak이 전체 영향.\n- secret이 *git에 커밋*되면 즉시 사고.\n\n권장: secret = 32+ bytes random, env var/Secret Manager 보관, 로그 출력 금지.\n\n## RS256 비대칭 패턴\n\n```java\n// 발급자 (Auth Server)\nKeyPair keyPair = Keys.keyPairFor(SignatureAlgorithm.RS256);\nString token = Jwts.builder()\n    .subject(\"user-123\")\n    .signWith(keyPair.getPrivate())   // 비밀키\n    .compact();\n\n// 검증자 (Resource Server) — 공개키만 필요\nJws<Claims> claims = Jwts.parser()\n    .verifyWith(keyPair.getPublic())\n    .build()\n    .parseSignedClaims(token);\n```\n\n장점: 검증자가 *공개키*만 가지면 충분. **검증자가 우연히/악의적으로 새 JWT를 발급할 수 없다**.\n\nOAuth2/OIDC 환경에서 *Auth Server*만 비밀키, *모든 Resource Server*는 공개키 — 검증자가 N개여도 공격 표면 안 커진다.\n\n## JWKS — 공개키 배포\n\nRS256/ES256 환경에서 *Auth Server가 공개키를 어떻게 검증자에게 알려주나*?\n\n표준 답: **JWKS (JSON Web Key Set) endpoint**.\n\n```\nGET https://auth.example.com/.well-known/jwks.json\n\n{\n  \"keys\": [\n    {\"kid\": \"key-2025\", \"kty\": \"RSA\", \"n\": \"...\", \"e\": \"AQAB\", \"alg\": \"RS256\"},\n    {\"kid\": \"key-2024\", \"kty\": \"RSA\", \"n\": \"...\", \"e\": \"AQAB\", \"alg\": \"RS256\"}\n  ]\n}\n```\n\n검증자는 JWT 헤더의 `kid` (key id)로 어떤 키로 서명됐는지 알고, JWKS에서 해당 공개키를 가져와 검증한다.\n\nSpring Security OAuth2 Resource Server는 `jwk-set-uri` 설정 한 줄로 자동 처리:\n\n```yaml\nspring:\n  security:\n    oauth2:\n      resourceserver:\n        jwt:\n          jwk-set-uri: https://auth.example.com/.well-known/jwks.json\n```\n\n## 키 교체 (Key Rotation)\n\nRS256/ES256은 키 교체가 자연스럽다.\n\n```\n시점 T0: Auth Server가 key-2024로 발급 중. JWKS에 [key-2024]\n시점 T1: Auth Server가 새 key-2025 생성. JWKS에 [key-2024, key-2025]\n시점 T2: Auth Server가 key-2025로 발급 시작. JWKS는 여전히 [key-2024, key-2025]\n시점 T3: 모든 기존 토큰 만료 후 (예: 1시간) key-2024 JWKS에서 제거.\n```\n\n이 흐름은 *서비스 중단 없이* 키 교체가 가능. HS256은 *secret 공유*라 동시에 모든 검증자 업데이트가 필요해 어렵다.\n\n## \"alg=none 공격\"\n\nJWT 헤더에 `\"alg\": \"none\"`을 박으면 *서명 없이 통과*시키는 라이브러리 버그가 과거 있었음. 검증자가 *클라이언트 헤더의 alg를 그대로 신뢰*하면 우회.\n\n방어:\n- 라이브러리에서 `alg=none`을 명시 거부 (현대 라이브러리는 기본).\n- 검증 시 *기대 알고리즘 명시*:\n  ```java\n  Jws<Claims> claims = Jwts.parser()\n      .verifyWith(secretKey)\n      .build()\n      .parseSignedClaims(token);  // 라이브러리가 알고리즘 일관성 자동 확인\n  ```\n- 의심 시 `alg` 명시 화이트리스트 검증.\n\n또 다른 공격: **HS256 ↔ RS256 confusion attack**. Auth Server가 RS256 (공개키 검증) 사용 중인데 검증자가 HS256으로 잘못 설정 + 공개키를 secret으로 사용 → 공격자가 공개키로 HS256 토큰 만들면 통과.\n\n방어: *검증자가 알고리즘을 hardcode*. JWT 헤더 alg를 그대로 따르지 않음.\n\n## 자주 헷갈리는 지점\n\n- **\"HS256이 빠르니까 다 HS256\"** — 검증자가 *발급도 가능*. 마이크로서비스에선 위험.\n- **\"RS256이 무조건 좋다\"** — 모놀리식이면 과한 overhead. 키 관리 복잡도 ↑.\n- **\"공개키니까 인터넷에 공개해도 OK\"** — 공개키는 노출 OK이지만 *비밀키는 절대 ❌*. Public-Private 명명 정확히.\n- **\"JWT 서명 = 암호화\"** — 서명은 *변조 방지*. payload는 누구나 읽힘. 비밀 정보 ❌.\n- **\"키 교체는 모든 토큰 즉시 무효화\"** — 비대칭이면 *겹침 기간*으로 graceful. HS256은 어려움.\n\n## 학습자가 자주 만나는 시나리오\n\n- 학습 미션 단일 서버 JWT → HS256 + 32 bytes random secret.\n- OAuth2 + 외부 IdP (Google) → RS256/ES256 (provider 결정).\n- 마이크로서비스 환경 자체 Auth Server → RS256/ES256 + JWKS endpoint.\n- \"JWT가 만료 전인데 어떻게 강제 로그아웃\" → 짧은 만료 + refresh + 블랙리스트 (또는 세션 모델 재검토).\n\n## 빠른 확인 질문\n\n- HS256과 RS256의 핵심 차이?\n  - 대칭(공유 secret) vs 비대칭(비밀-공개키 분리).\n- 마이크로서비스에서 RS256/ES256이 권장되는 이유?\n  - 검증자가 *공개키만* 가져 발급 권한 분리. 키 교체 graceful.\n- `alg=none` 공격을 막는 핵심 원칙?\n  - 검증자가 *기대 알고리즘 명시*. 클라이언트 헤더 신뢰 ❌.\n\n## 한 줄 정리\n\nJWT 서명 알고리즘은 *키 모델*이 본질. 단일 서비스는 HS256, 분산/외부 검증은 RS256/ES256 + JWKS. `alg=none`/algorithm confusion 함정은 *기대 알고리즘 명시*로 차단.\n\nretrieval-anchor-keywords: JWT signing algorithm, HS256 HS512 HMAC, RS256 RS512 RSA, ES256 EdDSA ECDSA, JWT alg none attack, algorithm confusion attack, JWKS JSON Web Key Set, kid key id rotation, jwk-set-uri Spring OAuth2 Resource Server, asymmetric vs symmetric JWT, JWT key rotation, OIDC public key distribution, Jwts builder verifyWith\n",
   "aliases": [
-    "JWT signing algorithm chooser",
-    "HS256 vs RS256 선택",
-    "RS256 ES256 key model",
-    "HMAC vs public key JWT",
-    "JWT algorithm confusion defense",
-    "alg none attack defense",
-    "JWKS key rotation bridge",
-    "JWT 서명 알고리즘 선택",
-    "대칭키 비대칭키 JWT",
-    "공개키 검증 JWT",
-    "마이크로서비스 JWT 키 공유",
-    "JWT 키 교체 JWKS"
+    "JWT",
+    "JWT signature",
+    "JWT algorithm",
+    "HS256",
+    "HS512",
+    "RS256",
+    "RS512",
+    "ES256",
+    "JWT 서명 알고리즘 실수",
+    "JWT 서명 알고리즘 정리",
+    "JWT 서명 알고리즘 개념",
+    "JWT key rotation"
   ],
   "expected_queries": [
     "JWT 서명 알고리즘 어떻게 골라?",
@@ -57,6 +57,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch149"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

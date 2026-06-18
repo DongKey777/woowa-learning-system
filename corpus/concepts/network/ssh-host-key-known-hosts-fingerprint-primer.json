@@ -6,18 +6,18 @@
   "summary": "처음 SSH 접속할 때 나오는 authenticity prompt, host key fingerprint, `known_hosts`, IP 재사용으로 인한 host key changed 경고, `ssh-keygen -R`의 의미를 구분하는 입문 문서다.",
   "body_markdown": "# SSH Host Key와 known_hosts Fingerprint Primer\n\n> 한 줄 요약: `The authenticity of host ... can't be established`는 pem 키 문제가 아니라, 내가 접속하려는 서버의 host key를 처음 신뢰할지 묻는 SSH의 서버 신원 확인 절차다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [EC2 public IP, security group, SSH 접속 Primer](./ec2-public-ip-security-group-ssh-primer.md)\n- [Public Key Digital Signature Primer](../security/public-key-digital-signature-primer.md)\n- [Linux 서버 첫 디버깅 체크리스트](../operating-system/linux-server-first-debug-checklist-primer.md)\n\nretrieval-anchor-keywords: SSH authenticity of host, known_hosts fingerprint, ED25519 host key, ssh-keygen -R, host key verification failed, REMOTE HOST IDENTIFICATION HAS CHANGED, EC2 new public IP known_hosts, pem key vs host key, SSH fingerprint trust, MITM warning\n\n## pem 키와 host key는 다르다\n\nEC2 SSH에서 초보자가 가장 많이 섞는 두 키가 있다.\n\n| 키 | 누가 증명하나 | 어디에 있나 | 실패 메시지 |\n|---|---|---|---|\n| user key / pem key | 내가 `ubuntu` 사용자로 들어갈 권한이 있음을 증명 | 내 노트북의 `key.pem`, 서버의 `authorized_keys` | `Permission denied (publickey)` |\n| host key | 내가 접속한 대상 서버가 예전에 본 그 서버인지 증명 | 서버의 `/etc/ssh/ssh_host_*`, 내 `known_hosts` | authenticity prompt, host key changed |\n\n`ssh -i key.pem ubuntu@IP`에서 `-i`로 넘기는 pem은 사용자 인증용이다. 반면 처음 접속할 때 보이는 fingerprint는 서버 인증용 host key다. pem 권한을 `chmod 400`으로 바꾸는 것과 `known_hosts`에 host key를 저장하는 것은 서로 다른 단계다.\n\n## 처음 접속할 때 보이는 prompt\n\n처음 보는 서버에 SSH로 접속하면 이런 메시지가 나온다.\n\n```text\nThe authenticity of host '3.36.26.132 (3.36.26.132)' can't be established.\nED25519 key fingerprint is SHA256:....\nAre you sure you want to continue connecting (yes/no/[fingerprint])?\n```\n\n이것은 SSH client가 \"이 IP의 host key를 아직 본 적이 없다\"고 말하는 것이다. `yes`를 입력하면 해당 host key가 `~/.ssh/known_hosts`에 저장된다. 다음 접속부터는 같은 IP/hostname이 같은 host key를 내는지 자동으로 비교한다.\n\n학습용 EC2에서는 콘솔에서 막 만든 인스턴스의 public IP와 접속 명령을 직접 확인하고 처음 한 번 `yes`를 입력하는 일이 흔하다. 하지만 운영 환경에서는 fingerprint를 out-of-band로 확인하는 절차가 필요할 수 있다. prompt를 무조건 통과하는 습관은 좋지 않다.\n\n## `known_hosts`가 하는 일\n\n`known_hosts`는 \"이 hostname 또는 IP에서 예전에 본 host key\" 목록이다. SSH는 접속 때마다 서버가 내는 host key와 이 파일의 값을 비교한다.\n\n| 상황 | SSH 반응 | 의미 |\n|---|---|---|\n| 처음 보는 host | authenticity prompt | 신뢰할지 물어본다 |\n| 같은 host가 같은 key를 냄 | 조용히 진행 | 예전에 본 서버와 같다고 판단 |\n| 같은 host가 다른 key를 냄 | 큰 경고 후 차단 | 서버가 바뀌었거나 중간자 공격 가능성 |\n\nEC2에서는 public IP를 새 인스턴스에 재사용하거나, 같은 IP에 완전히 다른 서버가 붙는 상황이 생길 수 있다. 그러면 `REMOTE HOST IDENTIFICATION HAS CHANGED`가 나올 수 있다. 이 경고를 바로 무시하면 안 된다. 내가 정말 인스턴스를 새로 만들었고 IP가 바뀌었거나 재사용된 것이 맞는지 AWS 콘솔에서 먼저 확인한다.\n\n## host key changed 경고 처리\n\n경고가 정당한 상황이라고 확인했다면 old entry를 제거하고 다시 접속한다.\n\n```bash\nssh-keygen -R 3.36.26.132\nssh -i key-dongkey.pem ubuntu@3.36.26.132\n```\n\n`ssh-keygen -R`은 내 `known_hosts`에서 해당 host entry를 지운다. 서버의 key를 바꾸거나 pem 키를 바꾸는 명령이 아니다. 다음 접속 때 다시 authenticity prompt가 나오고, 새 host key를 저장할 수 있다.\n\nhostname으로 접속했다면 IP와 hostname entry가 따로 있을 수 있다.\n\n```bash\nssh-keygen -R ec2-54-180-244-246.ap-northeast-2.compute.amazonaws.com\nssh-keygen -R 54.180.244.246\n```\n\n## 문제별 분기\n\n| 메시지 | 가까운 원인 | 먼저 볼 것 |\n|---|---|---|\n| `can't be established` | 처음 보는 host key | 콘솔의 IP/DNS가 맞는지 확인 후 trust 결정 |\n| `Permanently added ... to known_hosts` | 저장 성공 | 이후 같은 host key면 prompt가 안 나온다 |\n| `REMOTE HOST IDENTIFICATION HAS CHANGED` | host key 변경 | 새 인스턴스/IP 재사용인지, MITM 가능성인지 확인 |\n| `Host key verification failed` | known_hosts 비교 실패 | 정당한 변경이면 `ssh-keygen -R` 후 재접속 |\n| `Permission denied (publickey)` | 사용자 인증 실패 | pem 파일, chmod 400, user name, key pair 확인 |\n| `Operation timed out` | 네트워크 경로 실패 | public IP, security group 22, subnet route 확인 |\n\n이렇게 나누면 SSH 문제를 한 덩어리로 보지 않게 된다. host key 문제는 \"서버 신원\", publickey 문제는 \"내 로그인 권한\", timeout은 \"네트워크 경로\"에 가깝다.\n\n## `StrictHostKeyChecking=no`를 조심해야 하는 이유\n\n검색하면 `ssh -o StrictHostKeyChecking=no ...` 같은 해결책을 볼 수 있다. 이 옵션은 unknown host를 자동으로 받아들이는 쪽이라 실습 자동화에서는 편해 보일 수 있지만, 서버 신원 확인 장치를 약하게 만든다. 특히 운영 서버나 중요한 계정에는 기본값을 유지하고, fingerprint 검증 또는 `known_hosts` 사전 배포를 쓰는 편이 안전하다.\n\n학습용 일회성 EC2에서도 이 옵션을 무작정 붙이면 \"왜 prompt가 없어졌는지\"를 배우지 못한다. 처음에는 prompt의 의미를 이해하고, 자동화가 필요한 경우에만 위험을 알고 선택한다.\n\n## 꼬리질문\n\n> Q: authenticity prompt가 나오면 pem 키가 틀렸다는 뜻인가요?\n> 의도: user key와 host key를 분리하는지 확인한다.\n> 핵심: 아니다. 아직 서버 host key를 신뢰 목록에 저장한 적이 없다는 뜻이다.\n\n> Q: `REMOTE HOST IDENTIFICATION HAS CHANGED`를 보면 바로 `ssh-keygen -R` 하면 되나요?\n> 의도: host key changed 경고를 보안 신호로 다루는지 확인한다.\n> 핵심: 먼저 내가 정말 새 서버나 재사용 IP에 접속하는 것이 맞는지 확인하고, 정당한 변경일 때만 old entry를 제거한다.\n\n> Q: timeout과 host key 경고는 같은 SSH 문제인가요?\n> 의도: 네트워크 도달 전/후 단계를 구분하는지 확인한다.\n> 핵심: timeout은 보통 서버 host key를 받기 전 네트워크 경로 문제이고, host key 경고는 SSH handshake가 시작되어 서버 신원을 받은 뒤의 문제다.\n\n## 한 줄 정리\n\nSSH 접속은 `네트워크 도달 -> 서버 host key 확인 -> pem으로 사용자 인증` 순서이며, `known_hosts`는 두 번째 단계의 기억장치다.\n",
   "aliases": [
+    "EC2 known_hosts",
     "SSH 서버 신원 확인",
-    "SSH Host Key와 known_hosts 개념",
-    "SSH Host Key와 known_hosts 정리",
-    "SSH Host Key와 known_hosts 실수",
-    "SSH Host Key와 known_hosts 판단 기준",
     "SSH host key",
     "known_hosts fingerprint",
     "authenticity of host",
     "REMOTE HOST IDENTIFICATION HAS CHANGED",
     "ssh-keygen -R",
     "Host key verification failed",
-    "ED25519 fingerprint"
+    "ED25519 fingerprint",
+    "SSH Host Key와 known_hosts 개념",
+    "SSH Host Key와 known_hosts 정리",
+    "SSH Host Key와 known_hosts 실수"
   ],
   "expected_queries": [
     "ssh 처음 접속할 때 authenticity of host랑 ED25519 fingerprint가 나오면 yes 해도 되는 거야?",
@@ -63,6 +63,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

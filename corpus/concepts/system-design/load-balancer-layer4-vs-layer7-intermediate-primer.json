@@ -6,18 +6,21 @@
   "summary": "L4는 *IP/port* 중심으로 분배(빠르고 단순), L7은 *HTTP 헤더/path*까지 보고 분배(유연하고 비싸다). path/header/cookie sticky는 L7이고, TLS 종단만 필요하면 L4 TLS listener도 후보가 될 수 있다.",
   "body_markdown": "# 로드밸런서 입문 (intermediate) — Layer 4 vs Layer 7 차이\n\n> 한 줄 요약: L4는 *IP/port* 중심으로 분배(빠르고 단순), L7은 *HTTP 헤더/path*까지 보고 분배(유연하고 비싸다). path/header/cookie sticky는 L7이고, TLS 종단만 필요하면 L4 TLS listener도 후보가 될 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n로드밸런서가 *얼마나 깊이* 트래픽을 들여다보냐가 L4/L7의 차이다.\n\n```\n[Layer 4 LB]\n  본다: IP, port, TCP flags\n  안 본다: HTTP method, URL, headers\n  결과: 빠르고 단순. SSL 통과(passthrough) 가능.\n\n[Layer 7 LB]\n  본다: 위에 + HTTP method, path, headers, cookies\n  결과: path /api → 백엔드 A, /admin → 백엔드 B 같은 라우팅 가능\n  비용: 패킷 재조립, parsing, 더 많은 메모리/CPU\n```\n\nL4는 트럭이 *어디로 갈지*만 결정. L7은 *짐을 풀어서 내용 보고* 결정.\n\n## 한 장 정리\n\n| 항목 | Layer 4 LB | Layer 7 LB |\n|---|---|---|\n| 분배 기준 | IP, port | HTTP method/path/header/cookie |\n| 프로토콜 | TCP, UDP | HTTP, HTTPS, gRPC |\n| TLS 처리 | 주로 passthrough 또는 TLS listener termination. HTTP 내용을 보지는 않음 | termination 후 HTTP 내용을 보고 라우팅 |\n| sticky session | IP/port 기반만 | cookie 기반 가능 |\n| path-based routing | ❌ | ✓ |\n| 헬스 체크 | TCP 연결 확인 | HTTP 응답 코드 확인 |\n| 성능 | 매우 빠름 | 빠름 (L4보다 느림) |\n| 클라우드 (AWS) | NLB | ALB |\n| 일반 도구 | LVS, HAProxy (L4 모드) | Nginx, HAProxy (L7 모드), Envoy |\n\n## \"어떤 걸 골라?\"\n\n```\n1. HTTP 외 프로토콜 (raw TCP, UDP, MQTT, ...)\n       → Layer 4 (HTTP 의미 없음)\n\n2. path/host 기반 라우팅 필요 (/api → A, /admin → B)\n       → Layer 7\n\n3. SSL 종단을 LB에서 하고 싶고 HTTP path/header 라우팅도 필요함\n       → Layer 7 termination\n\n   SSL 종단만 중앙화하고 HTTP 내용은 안 봐도 됨\n       → L4 TLS listener도 후보\n\n4. 최대 throughput + 단순함\n       → Layer 4\n\n5. cookie 기반 sticky session 필요\n       → Layer 7\n```\n\n## Chooser/router flow\n\nL4/L7 선택은 \"더 고급 기능\" 순서가 아니라 관찰해야 하는 정보의 깊이로 고른다.\n\n| 증상/요구 | 원인 또는 판단 축 | 선택 | 실무 증거 | 다음 문서 |\n|---|---|---|---|---|\n| HTTP path, host, header로 backend를 나눠야 함 | application layer 정보를 봐야 함 | L7 | route별 access log, 404/5xx 분포, header rewrite 여부 | `api-gateway-vs-reverse-proxy-vs-load-balancer-intermediate-chooser` |\n| raw TCP/UDP, database proxy, MQTT처럼 HTTP가 아님 | L7 parsing 의미 없음 | L4 | connection count, SYN/SYN-ACK, backend TCP reset | `load-balancing-basics-primer` |\n| TLS를 LB에서 끝내고 인증서를 중앙 관리하고 싶음 | HTTP 내용을 봐야 하는지와 backend 암호화 요구를 분리 | L7 termination 또는 L4 TLS listener | certificate rotation, TLS handshake error, backend protocol | `production-latency-layer-router` |\n| p99가 LB 앞뒤에서 다르게 보임 | queueing 위치를 분리해야 함 | L4/L7보다 timing 분해 우선 | client waterfall, LB target response time, app access log | `production-latency-layer-router` |\n| 같은 사용자가 항상 같은 backend로 가야 함 | application state가 backend에 남아 있음 | L7 cookie sticky 또는 state 분리 | session store hit, backend별 user skew, failover behavior | `db-read-replica-write-primary-routing-primer` |\n\n운영에서는 LB의 5xx와 application 5xx를 분리한다. L7 LB가 502/503/504를 냈는데 app log가 비어 있으면 backend connection, target health, idle timeout, request body 크기, TLS handshake 같은 LB 계층 원인이 먼저다. App이 500을 냈다면 LB가 아니라 application dependency trace를 따라가야 한다.\n\n## Sticky Session / Session Affinity\n\n같은 사용자의 요청이 *항상 같은 백엔드*로 가야 하는 경우.\n\n| 방식 | 어디서 |\n|---|---|\n| Source IP affinity | L4. 같은 IP는 같은 백엔드. 단 corporate NAT 환경에서 폭주. |\n| Cookie based | L7. LB가 *추가 cookie* 발급 또는 *application cookie* 활용. |\n| Application sticky | 백엔드가 응답에 routing token 포함. |\n\n⚠️ Sticky session이 필요한 이유 대부분은 *백엔드가 stateful*이기 때문. 진짜 답은 *stateless 만들기* (세션 store 분리 등). sticky는 임시방편.\n\n## TLS Termination — 어디서?\n\n```\n[클라이언트] --TLS--> [LB] --HTTP--> [백엔드]   (LB termination)\n[클라이언트] --TLS--> [LB] --TLS--> [백엔드]   (LB passthrough 또는 re-encrypt)\n```\n\n**LB termination 장점**:\n- 백엔드 CPU 부담 ↓ (TLS handshake 안 함)\n- 인증서 관리 *한 곳*만\n- L7 LB가 HTTP 보고 라우팅 가능\n\n**LB termination 단점**:\n- LB ↔ 백엔드 평문 (사내망 신뢰 필요)\n- 컴플라이언스/규제 환경에서 *end-to-end TLS* 요구\n\n판단: 외부 → LB는 TLS가 기본이고, LB → 백엔드는 private network 신뢰 범위와 규제 요구를 보고 정한다. VPC 내부 평문이 허용되는 조직도 있지만, zero-trust, PCI/HIPAA 같은 규제, 다중 테넌트 네트워크라면 re-encrypt 또는 end-to-end TLS를 검토한다.\n\n## Health Check — L4 vs L7\n\n```\nL4 health check:\n  TCP SYN → 백엔드 → SYN-ACK?\n  살아있다고 판정\n  ⚠ 함정: 프로세스는 살아있지만 *애플리케이션은 죽은* 좀비 통과\n\nL7 health check:\n  GET /actuator/health → 200 OK?\n  애플리케이션 응답 확인\n  더 정확하지만 *부하 살짝* 추가\n```\n\n운영에서는 *L7 health check + 의미 있는 endpoint*가 권장. `/actuator/health`이 DB 연결까지 확인하면 *진짜 서비스 가능 여부* 측정.\n\n## 자주 헷갈리는 지점\n\n- **\"L7이 항상 더 좋다\"** — L4는 *더 빠르고* TCP non-HTTP에 적합.\n- **\"L4는 SSL passthrough만 됨\"** — TLS termination 지원하는 L4 LB도 있음 (TLS handshake만 처리, HTTP는 안 봄).\n- **\"sticky session = WebSocket에 필수\"** — 연결 자체가 sticky라 *추가 sticky 설정 불필요*. 단 재연결 시 같은 백엔드 보장은 별개.\n- **\"클라우드 ALB가 L7만, NLB가 L4만\"** — AWS 기준 그렇지만 *다른 클라우드/onprem*은 다를 수 있음.\n- **\"L7 LB가 항상 TLS 종단해야 함\"** — 통과 모드도 가능. 다만 LB가 HTTP를 못 보면 L7 기능 의미 약함.\n- **\"L7 LB = API Gateway\"** — L7 LB는 HTTP 라우팅/헬스체크가 중심이고, API Gateway는 user auth, quota, API product policy, request transform까지 맡을 수 있다. 제품은 겹쳐도 책임 경계를 분리한다.\n\n## Overclaim control\n\n- L7은 L4의 상위 호환이 아니다. HTTP 의미를 봐야 할 때 유리하고, 단순 connection 분산에서는 비용과 failure mode가 늘 수 있다.\n- \"LB에서 TLS를 끝내면 안전하다\"는 충분하지 않다. LB와 backend 사이 암호화 요구, private network 신뢰 범위, compliance 조건을 확인해야 한다.\n- Sticky session은 확장성 해결책이 아니라 stateful backend의 증상 완화다. 장애 조치와 scale-out 때 skew가 생길 수 있다.\n- Health check가 200이라고 user path가 건강하다는 뜻은 아니다. readiness endpoint가 dependency, cache, migration 상태를 얼마나 포함하는지 봐야 한다.\n- LB timeout을 늘리는 것은 느린 요청을 살릴 수 있지만 worker와 connection을 더 오래 묶는다. gateway timeout, app timeout, downstream timeout 순서를 함께 맞춘다.\n- gRPC는 HTTP/2 기반이라 L7로 볼 수도 있지만, LB가 HTTP/2/gRPC health check와 long-lived stream을 제대로 지원하는지 확인해야 한다.\n\n## 학습자가 자주 만나는 시나리오\n\n- 학습 미션 단일 서버 → LB 불필요. (학습 단계에서 LB 직접 만지는 일 거의 없음)\n- 운영 환경 web app → ALB (HTTPS termination + path routing) 일반.\n- TCP 서비스 (DB proxy, gRPC, raw socket) → NLB.\n- \"특정 사용자가 항상 같은 서버\" → 보통은 *stateless 만들기*가 답. 어쩔 수 없으면 ALB cookie sticky.\n\n## 빠른 확인 질문\n\n- L4와 L7의 핵심 분배 기준 차이?\n  - L4 = IP/port, L7 = HTTP method/path/header.\n- TLS termination을 LB에서 하는 이점?\n  - 백엔드 CPU 부담 ↓, 인증서 한 곳 관리, L7 라우팅 가능.\n- L4 health check의 함정?\n  - TCP 살아있는 *좀비*가 통과할 수 있음.\n\n## 한 줄 정리\n\nL4는 *IP/port* 중심의 빠른 분배, L7은 *HTTP 내용*까지 보는 유연한 분배. path 라우팅 / header 조건 / cookie sticky가 필요하면 L7, 단순 TCP/UDP + 최대 throughput 또는 TLS 종단만 중앙화하면 L4도 후보가 된다.\n\nretrieval-anchor-keywords: Layer 4 load balancer, Layer 7 load balancer, NLB ALB AWS, TCP load balancer, HTTP load balancer, TLS termination, SSL passthrough, sticky session, session affinity, cookie based sticky, source IP affinity, health check L4 L7, actuator health endpoint, Nginx HAProxy Envoy, path based routing\n",
   "aliases": [
+    "NLB",
+    "Nginx LB",
+    "HAProxy",
+    "sticky session",
+    "session affinity",
     "로드밸런서",
     "L4 L7 차이",
     "로드밸런서 입문 (intermediate) — Layer 핵심",
     "로드밸런서 입문 (intermediate) — Layer 선택 기준",
     "Load Balancer",
     "Layer 4 LB",
-    "Layer 7 LB",
-    "TCP load balancer",
-    "HTTP load balancer",
-    "ALB"
+    "Layer 7 LB"
   ],
   "expected_queries": [
+    "로드밸런서 헬스 체크는 어떻게 설정해?",
     "Layer 4 로드밸런서와 Layer 7 차이가 뭐야?",
     "TCP 로드밸런서랑 HTTP 로드밸런서 어떤 거 골라?",
     "NLB랑 ALB 차이가 뭐야?",
@@ -53,6 +56,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch151"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

@@ -6,10 +6,7 @@
   "summary": "이 문서는 system-design 카테고리에서 API Gateway Control Plane 설계를 다루는 deep_dive 문서다. API gateway control plane은 라우팅, 인증, rate limit, observability, 정책 배포를 중앙에서 관리하는 엣지 제어 시스템이다. 검색 질의가 api gateway control plane, routing policy, authz, mTLS처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
   "body_markdown": "# API Gateway Control Plane 설계\n\n> 한 줄 요약: API gateway control plane은 라우팅, 인증, rate limit, observability, 정책 배포를 중앙에서 관리하는 엣지 제어 시스템이다.\n\nretrieval-anchor-keywords: api gateway control plane, routing policy, authz, mTLS, rate limit, request transform, canary, api versioning, plugin policy, edge config, service discovery, edge observability, traffic shadowing, progressive cutover, canary analysis\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [시스템 설계 면접 프레임워크](./system-design-framework.md)\n> - [Back-of-Envelope 추정법](./back-of-envelope-estimation.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [Feature Flag Control Plane 설계](./feature-flag-control-plane-design.md)\n> - [Multi-Region Active-Active 설계](./multi-region-active-active-design.md)\n> - [Service Discovery / Health Routing 설계](./service-discovery-health-routing-design.md)\n> - [Distributed Tracing Pipeline 설계](./distributed-tracing-pipeline-design.md)\n> - [Traffic Shadowing / Progressive Cutover 설계](./traffic-shadowing-progressive-cutover-design.md)\n> - [Automated Canary Analysis / Rollback Platform 설계](./automated-canary-analysis-rollback-platform-design.md)\n> - [Control Plane / Data Plane Separation 설계](./control-plane-data-plane-separation-design.md)\n> - [Service Mesh Control Plane 설계](./service-mesh-control-plane-design.md)\n\n## 핵심 개념\n\nGateway control plane은 API 요청을 직접 처리하는 게 아니라,  \ngateway data plane이 따라야 할 정책을 배포한다.\n\n- route 생성/수정\n- auth policy\n- rate limit policy\n- request/response transform\n- canary release\n- observability tags\n\n즉, control plane은 엣지에서 동작하는 네트워크 정책의 진원지다.\nbackend endpoint 집합과 health signal은 보통 gateway 바깥의 service discovery plane과 연결되므로, route 정책과 endpoint 선택 정책이 서로 어긋나지 않게 버전 관리해야 한다.\n\n## 깊이 들어가기\n\n### 1. Control plane과 data plane 분리\n\n```text\nAdmin / CI\n  -> Gateway Control Plane\n  -> Policy Store\n  -> Config Publisher\n  -> Gateway Nodes\n  -> Backend Services\n```\n\ncontrol plane은 변경과 검증을 담당하고, gateway nodes는 요청을 빠르게 처리한다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 초당 50만 edge request\n- route rule 수천 개\n- tenant별 policy 수백 개\n\n이 구조에서는 data plane latency가 매우 중요하고, control plane의 변경 fan-out도 무시할 수 없다.\n\n봐야 할 숫자:\n\n- policy propagation delay\n- request latency overhead\n- routing miss rate\n- config refresh error rate\n- canary failure rate\n\n### 3. 정책 모델\n\nGateway가 수행하는 일:\n\n- path / host routing\n- header mutation\n- JWT validation\n- mTLS enforcement\n- IP allow/deny\n- rate limit\n- request timeout\n\n정책은 declarative하게 관리하는 편이 안전하다.\n\n### 4. Canary와 traffic shifting\n\n새 backend로 트래픽을 옮길 때는 순차적으로 해야 한다.\n\n- 1%\n- 10%\n- 50%\n- 100%\n\n그리고 success criteria를 정해야 한다.\n\n- 5xx rate\n- latency\n- upstream saturation\n- business metric\n\n실무에서는 canary 전에 shadow traffic으로 새 경로의 응답과 latency를 먼저 검증하는 편이 안전하다.\n\n### 5. Tenant-aware edge policy\n\n멀티 테넌트 환경에서는 정책도 tenant-aware여야 한다.\n\n- tenant별 rate limit\n- tenant별 backend route\n- tenant별 auth scope\n- tenant별 logging tag\n\n이 부분은 [멀티 테넌트 SaaS 격리 설계](./multi-tenant-saas-isolation-design.md)와 직접 연결된다.\n\n### 6. Extensibility\n\n실무 gateway는 plugin-style policy가 많다.\n\n- auth plugin\n- transform plugin\n- logging plugin\n- custom header plugin\n\n하지만 plugin이 많아질수록 요청 path가 느려질 수 있으므로 실행 순서를 엄격히 관리해야 한다.\n\n### 7. Failure mode\n\ngateway control plane이 죽어도 request path는 살아야 한다.\n\n대응:\n\n- last-known-good config\n- local policy cache\n- safe default routing\n- emergency bypass rules\n\ntrace propagation이나 endpoint snapshot이 일시적으로 stale하더라도 request path 자체는 계속 살아 있어야 한다.\n또한 cutover guardrail이 흔들릴 때는 즉시 primary path로 복귀할 수 있는 abort switch가 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 새 API 버전 출시\n\n문제:\n\n- `/v2`로 일부만 보내고 싶다\n\n해결:\n\n- route policy에 canary 비율 적용\n- error budget이 넘으면 rollback\n\n### 시나리오 2: rate limit 조정\n\n문제:\n\n- 특정 tenant가 API를 과하게 호출한다\n\n해결:\n\n- tenant-aware limit 변경\n- control plane에서 즉시 배포\n\n### 시나리오 3: 인증 정책 변경\n\n문제:\n\n- 특정 엔드포인트는 mTLS가 필요하다\n\n해결:\n\n- route 단위 auth policy 적용\n- config checksum으로 배포 검증\n\n## 코드로 보기\n\n```pseudo\nfunction route(request):\n  policy = loadGatewayPolicy(request.host, request.path)\n  if !policy.allowed(request):\n    return deny()\n  upstream = policy.upstream\n  return proxy(upstream, request)\n```\n\n```java\npublic GatewayPolicy currentPolicy() {\n    return policyCache.loadOrFallback();\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Central control plane | 관리가 쉽다 | 운영 병목 위험 | 중간 규모 |\n| Distributed policy sync | 확장성이 좋다 | propagation 복잡 | 대규모 edge |\n| Static route config | 단순하다 | 변경이 느리다 | 작은 API |\n| Plugin-based gateway | 유연하다 | latency/complexity 증가 | enterprise gateway |\n| Last-known-good fallback | 안전하다 | stale policy risk | 필수 안전장치 |\n\n핵심은 gateway가 프록시가 아니라 **엣지 정책을 집행하는 분산 제어 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: gateway control plane과 data plane은 왜 나누나요?\n> 의도: 정책 관리와 요청 처리 분리 이해 확인\n> 핵심: 변경은 느려도 되지만 요청 처리는 매우 빨라야 하기 때문이다.\n\n> Q: canary를 왜 gateway에서 하죠?\n> 의도: 엣지에서 트래픽 조절하는 이유 확인\n> 핵심: backend까지 갈 필요 없이 비율 기반 제어가 가능하기 때문이다.\n\n> Q: tenant-aware routing이 왜 필요한가요?\n> 의도: 멀티테넌트 정책 격리 이해 확인\n> 핵심: tenant별 limit, backend, logging policy가 다를 수 있기 때문이다.\n\n> Q: control plane이 죽으면 어떻게 되나요?\n> 의도: fallback과 운영 연속성 확인\n> 핵심: last-known-good policy로 request path를 계속 살려야 한다.\n\n## 한 줄 정리\n\nAPI gateway control plane은 라우팅과 인증, rate limit, canary, 관측성 정책을 중앙에서 배포하고 엣지에서 집행하는 시스템이다.\n",
   "aliases": [
-    "API Gateway Control Plane 개념",
-    "API Gateway Control Plane 정리",
-    "API Gateway Control Plane 실수",
-    "API Gateway Control Plane 판단 기준",
+    "api versioning",
     "시스템 설계 API Gateway Control Plane",
     "api gateway control plane",
     "routing policy",
@@ -17,7 +14,10 @@
     "mTLS",
     "rate limit",
     "request transform",
-    "canary"
+    "canary",
+    "API Gateway Control Plane 개념",
+    "API Gateway Control Plane 정리",
+    "API Gateway Control Plane 실수"
   ],
   "expected_queries": [
     "API Gateway에서 라우팅, 인증, rate limit 정책을 코드마다 박지 않고 control plane으로 빼는 이유가 뭐야?",
@@ -51,6 +51,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch163"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

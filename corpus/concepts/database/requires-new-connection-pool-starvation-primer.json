@@ -6,18 +6,18 @@
   "summary": "Spring `REQUIRES_NEW`는 기존 transaction을 잠시 suspend하고 독립 physical transaction을 열기 때문에, 바깥 transaction이 connection을 잡은 상태에서 안쪽 작업이 또 connection을 빌릴 수 있다. 동시 요청 수가 pool size와 맞물리면 모든 요청이 outer connection을 든 채 inner connection을 기다리는 starvation/deadlock-like 상태가 된다.",
   "body_markdown": "# REQUIRES_NEW Connection Pool Starvation Primer\n\n> 한 줄 요약: `REQUIRES_NEW`는 새 physical transaction을 열 수 있으므로, outer transaction이 connection을 잡은 상태에서 inner transaction이 두 번째 connection을 기다리는 pool starvation을 만들 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [@Transactional 깊이 파기](../spring/transactional-deep-dive.md)\n- [Connection Borrow Wait vs Query Execution Time Primer](./connection-borrow-wait-vs-query-execution-time-primer.md)\n- [Connection Pool, Transaction Propagation, Bulk Write](./connection-pool-transaction-propagation-bulk-write.md)\n- [Connection Pool Little's Law Sizing Playbook](./connection-pool-littles-law-sizing-playbook.md)\n- [Connection pool 고갈 symptom router](./connection-pool-starvation-symptom-router.md)\n\nretrieval-anchor-keywords: REQUIRES_NEW connection pool starvation, Spring REQUIRES_NEW pool deadlock, nested transaction second connection, outer transaction holds connection, suspended transaction connection, Hikari timeout REQUIRES_NEW, requires_new 풀 고갈, 새 트랜잭션 커넥션 부족, transaction propagation pool\n\n---\n\n## 어떤 일이 생기나\n\n아래 코드는 audit만 독립 커밋하고 싶을 때 자주 나온다.\n\n```java\n@Transactional\npublic void placeOrder(OrderCommand command) {\n    orderRepository.save(command.toOrder());\n    auditService.writeAudit(command); // REQUIRES_NEW\n}\n\n@Transactional(propagation = Propagation.REQUIRES_NEW)\npublic void writeAudit(OrderCommand command) {\n    auditRepository.save(AuditLog.from(command));\n}\n```\n\n`REQUIRES_NEW`는 바깥 transaction에 그냥 합류하지 않는다. 바깥 transaction을 suspend하고, 안쪽 작업을 독립 transaction으로 실행한다. 이때 안쪽 transaction이 별도 DB connection을 빌릴 수 있다.\n\n```text\nrequest thread\n  outer @Transactional -> connection A borrow\n  inner REQUIRES_NEW   -> connection B borrow 필요\n```\n\n문제는 많은 요청이 동시에 같은 구조를 타는 순간이다.\n\n---\n\n## deadlock-like starvation 타임라인\n\npool size가 10이고 요청 10개가 동시에 들어왔다고 하자.\n\n```text\nT1..T10: outer transaction 시작 -> connection 10개 모두 점유\nT1..T10: inner REQUIRES_NEW 진입 -> 새 connection 필요\npool: idle 0\nT1..T10: 모두 inner connection을 기다림\n```\n\n각 요청은 connection을 하나씩 이미 들고 있으면서 두 번째 connection을 기다린다. pool에 idle이 없으므로 아무도 앞으로 가지 못한다. 결국 inner borrow wait가 `connectionTimeout`에 걸리고, 요청들이 실패한다.\n\n이것은 DB row deadlock과는 다르지만 운영 증상은 deadlock처럼 보일 수 있다. 핵심은 resource order다.\n\n```text\nouter connection을 들고 inner connection을 기다림\n```\n\n---\n\n## 언제 특히 위험한가\n\n| 패턴 | 위험 이유 |\n|---|---|\n| outer transaction 안에서 `REQUIRES_NEW` audit/log를 호출 | 모든 요청이 두 번째 connection을 요구한다 |\n| loop 안에서 `REQUIRES_NEW`를 반복 호출 | 요청 하나가 여러 번 borrow/release를 반복하며 tail이 커진다 |\n| retry와 `REQUIRES_NEW`가 함께 있음 | 실패 시도마다 connection 요구량과 hold time이 늘 수 있다 |\n| pool size가 web concurrency와 거의 같음 | outer만으로 pool을 다 채운다 |\n| DB max connection 때문에 pool을 크게 못 키움 | 여유 connection을 확보하기 어렵다 |\n\n`REQUIRES_NEW`가 항상 나쁜 것은 아니다. audit, outbox 보정, 실패 기록처럼 독립 커밋이 필요한 경우가 있다. 다만 비용은 “트랜잭션 하나 더”가 아니라 “동시에 connection 하나 더 필요할 수 있음”으로 봐야 한다.\n\n---\n\n## 완화 방향\n\n1. 가능하면 outer transaction이 끝난 뒤 후처리를 한다. `afterCommit`, outbox, message relay를 검토한다.\n2. `REQUIRES_NEW` 호출 동시성을 semaphore나 별도 executor로 제한한다.\n3. outer transaction이 DB connection을 잡기 전에는 inner 작업을 호출하지 않는다.\n4. loop 안 `REQUIRES_NEW`를 batch나 단일 후처리로 바꾼다.\n5. pool sizing은 outer concurrency + inner concurrency를 함께 계산한다.\n\n단순히 pool size를 크게 늘리는 것은 마지막 선택이다. DB 전체 connection budget, app instance 수, DB worker capacity를 넘기면 장애를 DB 쪽으로 옮길 뿐이다.\n\n---\n\n## 진단 신호\n\n- thread dump에 `getConnection` 대기가 inner service stack에서 반복된다.\n- Hikari `active=max`, `idle=0`, `pending>0`가 보인다.\n- DB는 실제로 바쁘지 않은데 app threads가 pool acquisition에서 멈춰 있다.\n- trace에서 outer transaction span은 열려 있고, inner `REQUIRES_NEW` 시작 직후 멈춘다.\n- pool timeout이 `REQUIRES_NEW`가 있는 코드 배포 이후 증가한다.\n\n---\n\n## 흔한 오해\n\n- `REQUIRES_NEW`는 기존 connection을 그대로 쓰면서 commit만 따로 한다고 생각한다.\n- audit/log는 작으니 pool 영향이 없다고 본다. 작은 작업도 두 번째 connection을 요구하면 병목이 된다.\n- pool size를 요청 thread 수와 같게 두면 충분하다고 생각한다. nested transaction은 추가 여유를 요구할 수 있다.\n- `REQUIRES_NEW`로 rollback 문제를 해결하면서 connection budget은 계산하지 않는다.\n\n## 한 줄 정리\n\n`REQUIRES_NEW`는 독립 commit 경계를 주는 대신 추가 physical transaction과 connection 요구를 만들 수 있으므로, outer transaction을 든 채 inner connection을 기다리는 starvation을 설계 단계에서 계산해야 한다.\n\n## Batch152 보강 메모\n\nREQUIRES_NEW Connection Pool Starvation Primer를 학습할 때는 용어 정의만 확인하기보다 데이터베이스 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. Spring `REQUIRES_NEW`는 기존 transaction을 잠시 suspend하고 독립 physical transaction을 열기 때문에, 바깥 transaction이 connection을 잡은 상태에서 안쪽 작업이 또 connection을 빌릴 수 있다. 동시 요청 수가 pool size와 맞물리면 모든 요청이 outer connection을 든 채 inner connection을 기다리는 starvation/deadlock-like 상태가 된다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
   "aliases": [
+    "REQUIRES_NEW deadlock",
     "REQUIRES_NEW 풀 고갈",
     "새 트랜잭션 커넥션 부족",
     "트랜잭션 전파 풀 고갈",
-    "REQUIRES_NEW Connection Pool Starvation 개념",
-    "REQUIRES_NEW Connection Pool Starvation 정리",
     "REQUIRES_NEW pool starvation",
     "requires_new connection pool",
     "nested transaction connection",
     "Spring propagation pool",
     "outer transaction holds connection",
     "inner transaction waits connection",
-    "Hikari timeout REQUIRES_NEW"
+    "Hikari timeout REQUIRES_NEW",
+    "REQUIRES_NEW Connection Pool Starvation 개념"
   ],
   "expected_queries": [
     "Spring REQUIRES_NEW가 outer transaction connection을 잡은 상태에서 두 번째 connection을 요구할 수 있어?",
@@ -68,6 +68,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch152"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

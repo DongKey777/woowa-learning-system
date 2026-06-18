@@ -6,16 +6,18 @@
   "summary": "이 primer는 JVM GC와 generational hypothesis를 면접 답변으로 설명한다. Young/Old, allocation rate, STW를 연결한다.",
   "body_markdown": "# GC Generational Interview Primer\n\n## 한 줄 요약\n\nJVM GC는 root에서 도달 불가능한 heap 객체를 회수하고, 세대별 GC는 \"대부분 객체는 금방 죽고 일부만 오래 산다\"는 generational hypothesis를 이용해 young 영역을 자주 수집하고 오래 산 객체는 old 영역으로 옮겨 전체 비용을 낮추려는 전략이다.\n\n## 미션 진입 증상\n\n테스트나 API 부하에서 pause가 생기면 \"메모리가 부족하다\"만 볼 게 아니라 allocation rate, 객체 생존률, old promotion, GC pause 시간을 나눠 봐야 한다.\n\n## 핵심 mental model\n\n새 객체는 보통 TLAB/Eden 같은 young 경로에 할당된다. 단, 큰 객체나 collector 정책에 따라 바로 다른 영역으로 가는 예외가 있을 수 있으니 \"항상 young\"이라고 말하지 않는다. young GC는 살아남은 객체를 survivor 영역에 복사하거나 old로 promotion한다. promotion은 단순 나이 하나가 아니라 survivor 공간, 객체 크기, collector 정책, heap 압력에 영향을 받는다.\n\nold generation은 \"중요한 객체 저장소\"가 아니라 오래 살아남은 객체가 모이는 영역이다. old에 객체가 많다는 사실만으로 leak은 아니고, full/concurrent cycle 뒤에도 old occupancy가 회복되지 않는지, retained path가 정상 business state인지, cache/session/static/ThreadLocal이 붙잡는지 봐야 한다.\n\n세대별 collector는 old-to-young reference를 추적하기 위해 remembered set/card table 같은 장치를 쓴다. 그래서 young GC가 young만 보면 된다는 설명도 절반만 맞다. old 객체가 young 객체를 참조할 수 있으므로 그 연결을 추적하는 비용과 dirty card 처리 비용이 붙는다.\n\n## 면접 답변 축\n\n- GC의 출발점은 \"메모리를 청소한다\"가 아니라 \"root에서 도달 가능한 객체와 불가능한 객체를 구분한다\"이다.\n- 세대별 수집은 모든 객체의 수명이 비슷하지 않다는 경험적 가정에 기대며, young 영역에서 금방 사라지는 객체를 빠르게 회수해 전체 비용을 낮추려는 전략이다.\n- young GC가 잦다는 사실만으로 장애라고 단정하지 않는다. allocation rate, pause 시간, promotion, old occupancy, application latency와 함께 해석한다.\n- old generation 압력이 커지는 경우는 진짜 leak, cache retention, long-lived session, humongous allocation, promotion 증가처럼 여러 후보가 있다.\n- Stop-the-world는 collector와 phase에 따라 범위와 시간이 달라진다. \"GC는 항상 긴 정지\" 또는 \"최신 GC는 정지가 없다\" 둘 다 단정이다.\n- G1, ZGC, Shenandoah, Parallel GC처럼 collector마다 generation 구조, concurrent phase, region 관리, pause 목표가 다르다. 면접에서는 이름 암기보다 \"어떤 증거로 pause와 throughput 문제를 구분할지\"가 더 중요하다.\n\n## 운영 관찰 증거\n\n- GC log에서 pause 원인, young/old 사용량 변화, promotion 양상, allocation rate를 시간축으로 본다.\n- JFR이나 allocation profiler로 어떤 code path가 객체를 많이 만드는지 보고, heap dump로 어떤 객체가 오래 잡혀 있는지 확인한다.\n- CPU가 높고 heap 사용량은 내려가는데 latency가 나빠지면 allocation churn과 GC CPU overhead를 의심할 수 있다.\n- heap이 계속 올라가고 full GC 이후에도 회복되지 않으면 reachable reference chain을 찾아야 한다.\n- container 환경에서는 JVM heap뿐 아니라 metaspace, direct buffer, thread stack, page cache가 cgroup limit에 함께 영향을 줄 수 있다.\n- safepoint 시간이 길다면 GC work 자체인지, thread가 safepoint에 늦게 도착한 것인지도 분리한다. GC pause 로그만 보고 lock contention이나 native call stuck을 GC 문제로 단정하지 않는다.\n\n## failure symptom router\n\n| 증상 | 먼저 볼 신호 | 흔한 원인 후보 |\n|---|---|---|\n| p99가 주기적으로 튄다 | pause duration, pause interval, allocation rate | young GC burst, humongous allocation, safepoint 지연 |\n| heap이 톱니처럼 내려가지만 CPU가 높다 | GC CPU, allocation profile, object churn | 짧게 사는 객체 과다, boxing/string/temp collection 생성 |\n| full GC 뒤에도 old가 거의 안 내려간다 | old occupancy after GC, dominator tree, GC root path | static/ThreadLocal/cache/session retention, 진짜 leak |\n| young GC 뒤 old가 빠르게 찬다 | promotion rate, survivor overflow, tenuring distribution | 객체 생존률 증가, survivor sizing 문제, long request state |\n| container에서 OOM kill이 난다 | RSS/cgroup memory, NMT, direct buffer, thread count | heap 밖 메모리, native allocation, direct buffer, thread stack |\n\n## caveat: GC 보장으로 말하지 않기\n\n- \"minor GC는 항상 빠르다\"가 아니다. live object가 많거나 remembered set 처리 비용이 크면 young GC도 길어질 수 있다.\n- \"full GC가 항상 stop-the-world 전체 heap 수집\"이라고 단순화하지 않는다. collector별 용어와 phase가 다르고, 로그의 cause를 확인해야 한다.\n- \"old에 갔으니 곧 죽지 않는다\"가 아니다. promotion은 관찰된 생존 이력과 정책의 결과일 뿐 business lifetime 보장이 아니다.\n- \"GC 튜닝으로 해결\"을 먼저 말하지 않는다. allocation을 줄일 수 있는지, retention이 의도인지, heap/container sizing이 traffic과 맞는지 확인한 뒤 collector option을 본다.\n- \"최신 low-latency GC는 pause가 없다\"가 아니다. concurrent collector도 root scan, relocation barrier, metadata 처리, safepoint 등 짧은 정지나 CPU 비용을 가질 수 있다.\n\n## 흔한 오해\n\nGC는 누수를 자동으로 없애지 않는다. 여전히 reachable한 객체는 GC 대상이 아니다. ThreadLocal, static collection, cache가 reference를 잡고 있으면 메모리는 계속 유지된다.\n\n- \"Young은 stack, Old는 heap\"처럼 설명하면 틀린 mental model이다. young/old는 heap 내부의 객체 수명 관리 관점이다.\n- \"Full GC가 발생했으니 원인은 메모리 부족 하나\"라고 단정하지 않는다. explicit GC, metadata pressure, allocation failure, collector 정책 등 후보를 나눠 본다.\n- \"GC 튜닝으로 해결\"을 먼저 말하기보다 allocation을 줄일 수 있는지, retention이 정상인지, heap sizing과 traffic pattern이 맞는지 먼저 확인한다.\n- collector 이름만 외우는 답변보다 어떤 증거로 pause, throughput, tail latency 문제를 구분할지 말하는 답변이 더 강하다.\n\n## 면접 검증 질문\n\n- \"GC root는 무엇이고, 왜 reachable object는 수거되지 않는가?\"를 stack local, static field, JNI, thread, classloader 관점으로 말한다.\n- \"young GC가 잦으면 무조건 나쁜가?\"에 allocation rate, pause budget, promotion rate, latency SLO를 함께 본다고 답한다.\n- \"old generation이 계속 증가하면 leak인가?\"에 full/concurrent cycle 후 회복 여부와 retained path 검증 전에는 단정하지 않는다고 답한다.\n- \"어떤 도구로 확인할 것인가?\"에 unified GC log, JFR allocation event, heap dump dominator tree, `jcmd GC.heap_info`, `jcmd VM.native_memory`, container RSS/cgroup metric을 연결한다.\n- \"코드 수정 후보는 무엇인가?\"에 unnecessary allocation 제거, collection 재사용이 아니라 scope 축소, cache bound 설정, ThreadLocal cleanup, batch size 조정, large object path 확인을 말한다.\n\n## Safe Next Docs\n\n증상 라우팅은 `gc-allocation-rate-symptom-router`, collector 비교는 `g1-vs-zgc`로 이어진다.\n",
   "aliases": [
+    "JVM GC 세대별 수집 면접",
+    "GC generational interview primer",
+    "stop the world 설명",
+    "native",
+    "static",
     "generational gc interview",
     "young old generation answer",
     "gc root reachability primer",
     "allocation rate gc pause",
     "promotion old generation pressure",
     "remembered set card table",
-    "JVM GC 세대별 수집",
-    "young old 세대 차이",
-    "STW allocation rate 설명",
-    "GC 면접 답변 구조"
+    "JVM GC 세대별 수집"
   ],
   "expected_queries": [
     "JVM GC를 면접에서 어디까지 설명해야 해?",
@@ -52,6 +54,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch149"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

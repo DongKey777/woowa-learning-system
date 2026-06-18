@@ -6,6 +6,7 @@
   "summary": "이 문서는 roomescape 예약 생성/삭제 미션에서 @Transactional boundary를 어디에 둘지 묻는 mission_bridge다.",
   "body_markdown": "# roomescape 예약 생성/삭제에서 @Transactional 경계 결정\n\n> 한 줄 요약: 트랜잭션 경계는 *비즈니스 의미 단위*에 그어야 하므로 `ReservationService.create()` / `delete()` 같은 Service 메소드 위에 `@Transactional`을 둔다. INSERT 한 줄짜리라도 *Service 단위*가 맞고, Repository에 트랜잭션을 두면 의미 단위가 깨진다.\n\n**난이도: 🟢 Beginner**\n\n**미션 컨텍스트**: spring-roomescape-admin (Woowa Spring 트랙) — 4단계 이후\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"ReservationService에 `@Transactional`을 붙여야 하나요?\" | 예약 생성/삭제 service 경계 설계 | repository 한 줄 호출보다 비즈니스 의미 단위에 경계를 둔다 |\n| \"INSERT 한 줄뿐인데 트랜잭션이 필요한지 모르겠어요\" | 예약 생성이 단순 저장처럼 보이는 단계 | 지금은 한 줄이어도 service 유스케이스가 원자성의 후보임을 본다 |\n| \"repository에 `@Transactional`을 붙이면 왜 의미 단위가 깨지나요?\" | 저장소 메서드별 tx로 분산된 코드 | 조회, 검증, 저장이 함께 성공해야 하는 service 흐름을 기준으로 잡는다 |\n\n관련 문서:\n\n- [Spring @Transactional 기초](./spring-transactional-basics.md) — 일반 개념\n- [Service Layer Transaction Boundary Patterns](./spring-service-layer-transaction-boundary-patterns.md) — 패턴 모음\n\n## 미션의 어디에 트랜잭션 경계 결정이 필요한가\n\n`ReservationService`의 두 핵심 메소드를 보자:\n\n```java\n@Service\npublic class ReservationService {\n    private final ReservationRepository reservationRepository;\n    private final ReservationTimeRepository reservationTimeRepository;\n\n    public Reservation create(ReservationRequest request) {\n        ReservationTime time = reservationTimeRepository\n            .findById(request.timeId())\n            .orElseThrow();                      // 조회\n        Reservation reservation = new Reservation(\n            null, request.name(), request.date(), time);\n        return reservationRepository.save(reservation);  // 저장\n    }\n\n    public void delete(Long id) {\n        reservationRepository.deleteById(id);\n    }\n}\n```\n\n`create()`는 *조회 → 검증 → 저장* 세 단계가 하나의 비즈니스 의미(\"예약 한 건 만들기\")를 이룬다. `delete()`는 한 줄짜리지만 *\"예약 취소\"*라는 의미 단위다. 이 두 곳이 트랜잭션 경계 후보다.\n\n## 왜 트랜잭션 경계가 *Service*에 그어지는가\n\n### 경계는 의미 단위\n\n트랜잭션은 *원자성을 보장해야 하는 단위*다. roomescape 5~6단계로 가면 같은 메소드 안에서 *여러 테이블*을 만지게 된다 (예: 예약 저장 + 멤버 통계 갱신). 그때 *\"세 INSERT가 모두 성공하거나 모두 실패해야 한다\"*는 보장이 필요하다. Service 메소드가 그 *의미 단위*를 표현한다.\n\n### Repository에 두면 안 되는 이유\n\n```java\n@Repository\npublic class JdbcReservationRepository implements ReservationRepository {\n    @Transactional  // ❌ 잘못된 위치\n    public Reservation save(Reservation reservation) { ... }\n}\n```\n\n이렇게 두면 두 가지 문제가 생긴다:\n\n1. **Service가 두 Repository를 호출하면 트랜잭션이 둘로 쪼개진다** — 첫 INSERT 후 두 번째 INSERT 실패 시 첫 INSERT는 이미 commit. 의미 단위가 깨진다.\n2. **재사용이 깨진다** — 같은 `save()`를 호출하는 모든 코드가 *원치 않는 새 트랜잭션*을 매번 시작한다.\n\n### 한 줄짜리 메소드도 Service에 둬야 하나\n\n`delete(Long id)`처럼 INSERT/DELETE 한 줄짜리라도 Service에 `@Transactional`을 둔다. 이유:\n\n- 일관성 — 모든 Service 메소드가 트랜잭션 경계라면 *어디까지 원자성이 보장되는지* 클래스 레벨에서 즉시 알 수 있다.\n- 확장성 — 나중에 *\"삭제 전 권한 체크 + 로그 남기기\"*가 추가되면 그대로 *원자 단위*로 묶인다.\n\n## 미션 PR에서 자주 보는 세 가지 패턴\n\n### 패턴 1 — 클래스 레벨 `@Transactional`\n\n```java\n@Service\n@Transactional(readOnly = true)\npublic class ReservationService {\n    @Transactional\n    public Reservation create(ReservationRequest request) { ... }\n    @Transactional\n    public void delete(Long id) { ... }\n    public List<Reservation> findAll() { ... }  // readOnly=true 그대로\n}\n```\n\n읽기 메소드는 `readOnly=true`로 가볍게, 쓰기 메소드는 명시적으로 `@Transactional`로 덮어쓴다. 멘토가 자주 권장하는 모양.\n\n### 패턴 2 — 컨트롤러 위에 `@Transactional`\n\n```java\n@RestController\n@Transactional   // ❌\npublic class ReservationController { ... }\n```\n\n컨트롤러는 *HTTP 경계*다. 트랜잭션 경계가 아니다. 요청 lifecycle과 트랜잭션 lifecycle이 섞이면 디버깅 난이도가 올라간다.\n\n### 패턴 3 — `private` 메소드에 `@Transactional`\n\n```java\n@Service\npublic class ReservationService {\n    public Reservation create(ReservationRequest request) {\n        return doCreate(request);  // self-invocation\n    }\n    @Transactional  // ❌ 동작 안 함\n    private Reservation doCreate(ReservationRequest request) { ... }\n}\n```\n\nSpring AOP는 *프록시*로 동작하므로 *같은 클래스 안의 self-invocation*에는 트랜잭션이 적용되지 않는다. 미션에서 자주 발생하는 함정.\n\n## 자가 점검\n\n- [ ] `@Transactional`이 Service 메소드(또는 클래스) 위에만 있나?\n- [ ] Repository나 Controller에는 `@Transactional`이 *없는가*?\n- [ ] 읽기 전용 메소드에 `readOnly = true`를 표시했나?\n- [ ] `private` 메소드에 `@Transactional`을 붙이지 않았나?\n- [ ] Service 메소드 하나가 *두 개 이상의 Repository*를 호출하면 그 메소드 위에 `@Transactional`이 있는가?\n\n## 다음 문서\n\n- 더 큰 그림: [Spring @Transactional 기초](./spring-transactional-basics.md)\n- Self-invocation 함정: [Self-invocation @Transactional 미신](./spring-self-invocation-transactional-only-misconception-primer.md)\n- 동시성 처리로 넘어가면 *roomescape 예약 동시성 브리지*도 함께 본다 (별도 문서)\n",
   "aliases": [
+    "한 줄 INSERT 트랜잭션 필요",
     "ReservationService 트랜잭션",
     "룸이스케이프 예약 트랜잭션",
     "예약 삭제 트랜잭션 경계",
@@ -16,16 +17,15 @@
     "@Repository",
     "@RestController",
     "@Service",
-    "roomescape transactional boundary bridge guide",
-    "roomescape transactional boundary bridge checklist"
+    "roomescape transactional boundary bridge guide"
   ],
   "expected_queries": [
+    "roomescape에서 @Transactional 어디 붙여?",
     "룸이스케이프 ReservationService에 @Transactional 붙여야 해?",
     "룸이스케이프 ReservationService.delete가 @Transactional 필요한가?",
     "roomescape ReservationService.delete @Transactional 필요성 — write 작업 트랜잭션 경계",
     "예약 한 줄짜리 INSERT만 있는데 트랜잭션 필요해?",
-    "create랑 delete 메소드 어디에 트랜잭션을 그어야 해?",
-    "repository에 @Transactional을 붙이면 안 되는 이유가 뭐야?"
+    "create랑 delete 메소드 어디에 트랜잭션을 그어야 해?"
   ],
   "symptoms": [
     "리뷰나 미션 증상을 `roomescape 예약 생성/삭제에서 @Transactional 경계 결정` 개념으로 연결하지 못한다",
@@ -60,6 +60,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch152"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

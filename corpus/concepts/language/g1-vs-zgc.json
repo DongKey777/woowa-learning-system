@@ -6,6 +6,9 @@
   "summary": "이 문서는 Java G1 GC와 ZGC를 pause time, tail latency, throughput, heap size, allocation rate, live set, GC tuning decision 관점으로 비교하는 advanced deep dive다.",
   "body_markdown": "# G1 GC vs ZGC\n\n> 한 줄 요약: G1은 균형 잡힌 기본 선택이고, ZGC는 짧은 멈춤 시간을 우선할 때 고려하는 저지연 GC다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [JVM, GC, JMM](./jvm-gc-jmm-overview.md)\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n> - [Virtual Threads(Project Loom)](./virtual-threads-project-loom.md)\n> - [CPU Cache, Coherence, Memory Barrier](../../operating-system/cpu-cache-coherence-memory-barrier.md)\n> - [Spring MVC vs WebFlux](../../spring/spring-webflux-vs-mvc.md)\n\nretrieval-anchor-keywords: G1 vs ZGC, Java GC choice, low latency GC, tail latency GC pause, STW pause, large heap GC, G1 pause target, ZGC short pause, allocation rate and live set, GC tuning decision\n\n---\n\n## 핵심 개념\n\nGC 선택은 \"무엇이 최고냐\"가 아니라, **어떤 지연 비용을 받아들일 수 있느냐**의 문제다.\n\n- G1은 예측 가능한 평균 성능과 균형을 중시한다.\n- ZGC는 매우 짧은 STW pause를 목표로 한다.\n- 둘 다 \"GC가 없다\"는 뜻이 아니라, **pause를 어디까지 줄이고 어떤 비용을 분산할지**의 차이다.\n\n백엔드에서는 보통 아래 질문으로 시작한다.\n\n- 응답 지연의 tail latency가 중요한가\n- heap이 큰가\n- 객체 생성이 많은가\n- throughput이 더 중요한가\n- 운영자가 튜닝할 시간이 있는가\n\n---\n\n## 깊이 들어가기\n\n### 1. G1은 왜 기본 선택이 되었나\n\nG1은 힙을 region으로 나누고, 우선순위가 높은 region부터 수집해 pause를 예측 가능하게 만들려는 방향이다.\n\n핵심 감각:\n\n- \"전체 힙을 한 번에\"가 아니라 \"일부 region씩\" 수집한다\n- pause time 목표를 기준으로 작업량을 조절한다\n- 큰 heap에서도 상대적으로 다루기 쉽다\n\nG1이 좋은 이유는, 특별한 요구가 없는 대부분의 서버에서 **성과 예측 가능성의 균형**이 좋기 때문이다.\n\n### 2. ZGC는 왜 저지연을 노리나\n\nZGC는 짧은 pause를 유지하기 위해, mark/relocate 작업을 가능한 한 병렬화하고 pause 구간을 극단적으로 줄이려는 설계다.\n\n핵심 감각:\n\n- pause를 짧게 만드는 대신 구현과 운영 복잡도가 올라간다\n- 큰 heap, latency-sensitive 서비스에서 의미가 커진다\n- \"평균 응답\"보다 \"최악 응답\"이 중요한 서비스에서 가치가 있다\n\n### 3. 선택 기준\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| G1 | 균형이 좋고 운영 경험이 많다 | 아주 짧은 pause는 어렵다 | 일반적인 웹/API 서버 |\n| ZGC | pause가 매우 짧다 | 환경/관측/운영 복잡도가 높다 | tail latency가 중요한 대형 heap 서비스 |\n\n실무 판단은 보통 이렇다.\n\n1. 먼저 G1으로 시작한다\n2. GC pause가 병목인지 확인한다\n3. pause가 실제 사용자 경험을 해친다면 ZGC를 검토한다\n4. GC만 바꿔도 안 풀리면 allocation rate와 object lifetime부터 본다\n\n### 4. 튜닝은 GC 이름보다 더 중요하다\n\nGC를 바꿔도 다음이 안 맞으면 효과가 없다.\n\n- heap 크기\n- young/old 비율\n- allocation rate\n- live set size\n- thread pool 과다 사용\n\n즉, GC는 \"버튼 하나\"가 아니라 **애플리케이션의 할당 패턴과 같이 봐야 하는 운영 파라미터**다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 평균은 빠른데 가끔 1초씩 멈춘다\n\n증상:\n\n- p99 latency가 튄다\n- CPU는 여유 있는데 요청이 간헐적으로 밀린다\n- 로그를 보면 GC pause와 겹친다\n\n대응:\n\n1. GC 로그로 pause 빈도와 길이를 본다\n2. live object가 많은지 확인한다\n3. G1의 pause target과 heap을 조정한다\n4. 그래도 tail이 문제면 ZGC를 검토한다\n\n### 시나리오 2: 큰 heap을 쓰는 서비스에서 배치 작업이 API를 방해한다\n\n배치가 대량 객체를 만들면 young GC와 old GC가 모두 흔들릴 수 있다.\n\n이때는 단순히 \"GC를 빠르게\"가 아니라:\n\n- 배치와 API JVM 분리\n- allocation을 줄이는 구조 변경\n- thread pool과 buffer 크기 조정\n\n까지 같이 본다.\n\n### 시나리오 3: Virtual Threads를 붙였는데 pause는 그대로다\n\nVirtual Threads는 스레드 모델을 바꾸지만 GC를 없애지 않는다.\n\n즉:\n\n- 요청 처리 구조는 단순해질 수 있다\n- 하지만 객체 할당량이 많으면 GC 압력은 그대로다\n\n이 문맥은 [Virtual Threads(Project Loom)](./virtual-threads-project-loom.md)와 함께 봐야 한다.\n\n---\n\n## 코드로 보기\n\n### GC 로그를 먼저 보는 습관\n\n```bash\njava \\\n  -XX:+UseG1GC \\\n  -Xms2g -Xmx2g \\\n  -Xlog:gc*:stdout:time,level,tags \\\n  -jar app.jar\n```\n\nZGC 검토 시에는:\n\n```bash\njava \\\n  -XX:+UseZGC \\\n  -Xms2g -Xmx2g \\\n  -Xlog:gc*:stdout:time,level,tags \\\n  -jar app.jar\n```\n\n### 힙 압박을 만드는 코드 예시\n\n```java\npublic class PayloadService {\n    public byte[] buildPayload(int sizeKb) {\n        return new byte[sizeKb * 1024];\n    }\n}\n```\n\n이런 코드가 반복되면 GC 선택보다 먼저 아래를 본다.\n\n- 큰 객체를 꼭 매 요청마다 만들어야 하는가\n- 캐시/버퍼 재사용이 가능한가\n- 직렬화 포맷을 줄일 수 있는가\n\n---\n\n## 트레이드오프\n\n| 관점 | G1 | ZGC |\n|---|---|---|\n| 평균 처리량 | 좋다 | 보통 좋다 |\n| 짧은 pause | 보통 | 매우 좋다 |\n| 운영 복잡도 | 낮다 | 높다 |\n| 기본값 적합성 | 높다 | 선택적 |\n| tail latency | 보통 | 유리 |\n\n핵심은 \"무조건 ZGC가 더 좋다\"가 아니라, **대부분의 서비스는 G1으로 충분하고, tail latency가 문제일 때 ZGC를 검토한다**는 점이다.\n\n---\n\n## 꼬리질문\n\n> Q: G1을 쓰다가 ZGC로 바꿔야 하는 기준은 무엇인가요?\n> 의도: GC 선택을 지연 시간 SLA와 연결해서 판단할 수 있는지 확인\n> 핵심: 평균이 아니라 p95/p99 latency와 pause 원인을 먼저 본다\n\n> Q: GC를 바꿨는데도 느리면 무엇부터 보나요?\n> 의도: GC를 만능 해결책으로 보는지 확인\n> 핵심: allocation rate, live set, heap size, thread pool, 직렬화 비용을 먼저 본다\n\n> Q: Virtual Threads를 쓰면 GC 문제가 줄어드나요?\n> 의도: 스레드 모델과 메모리 관리의 차이를 구분하는지 확인\n> 핵심: 스레드 수는 줄일 수 있어도 객체 할당과 살아 있는 데이터는 그대로다\n\n## 한 줄 정리\n\nG1은 기본 균형점이고, ZGC는 tail latency가 중요한 서비스에서 pause를 줄이기 위한 선택이다.\n",
   "aliases": [
+    "Java GC choice",
+    "low latency GC",
+    "tail latency GC pause",
     "g1 zgc collector choice",
     "g1 pause target tradeoff",
     "zgc low latency pause",
@@ -14,8 +17,7 @@
     "allocation rate live set gc",
     "G1 ZGC 비교",
     "GC pause p99 기준",
-    "저지연 GC 선택",
-    "큰 힙 GC 튜닝"
+    "저지연 GC 선택"
   ],
   "expected_queries": [
     "G1과 ZGC를 Java 서버에서 tail latency와 throughput 기준으로 비교해줘",
@@ -56,6 +58,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch149"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

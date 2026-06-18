@@ -6,16 +6,16 @@
   "summary": "셋은 *서로 보완*. SameSite=Lax (브라우저) + Synchronizer Token (서버) 조합이 표준. JWT stateless면 쿠키 의존 약해 CSRF 부담도 작음.",
   "body_markdown": "# CSRF 방어 — Synchronizer Token vs SameSite Cookie vs Double Submit\n\n> 한 줄 요약: 셋은 *서로 보완*. SameSite=Lax (브라우저) + Synchronizer Token (서버) 조합이 표준. JWT stateless면 쿠키 의존 약해 CSRF 부담도 작음.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델 — CSRF 위협\n\n```\n1. 사용자가 example.com에 로그인 → 세션 쿠키 보유\n2. 다른 사이트 attacker.com 방문\n3. attacker.com의 HTML에 <img src=\"https://example.com/transfer?to=hacker&amount=1000\">\n4. 브라우저가 example.com 요청에 *자동으로* 세션 쿠키 첨부\n5. example.com이 정상 사용자 요청으로 처리 → 실제 송금\n```\n\n핵심 원인: **브라우저가 cross-site 요청에 사용자 쿠키를 자동 첨부**. 사용자가 의도하지 않은 행위를 *기존 세션*으로 수행하게 됨.\n\nCSRF는 *읽기 공격이 아니라 쓰기 공격* — 데이터 변경 요청 (POST/PUT/DELETE)이 주 표적.\n\n## 한 장 정리 — 3가지 방어\n\n| 방법 | 동작 | 장점 | 단점 |\n|---|---|---|---|\n| **Synchronizer Token Pattern** | 서버가 세션마다 임의 토큰 발급, form에 포함시켜 검증 | 표준, 강력 | 서버 세션 상태 필요, SPA에 적용 복잡 |\n| **SameSite Cookie** | 브라우저가 cross-site 요청에 쿠키 자동 전송 차단 | 브라우저 자동, 코드 변경 ❌ | 모든 브라우저 지원 가정 어려움 (legacy 일부) |\n| **Double Submit Cookie** | 쿠키와 헤더에 같은 토큰을 두 번 넣고 서버가 비교 | stateless OK, SPA 적합 | XSS 있으면 토큰 노출 |\n\n추가 보조:\n- **Origin / Referer 헤더 검증** — 요청 출처 확인\n- **사용자 재인증** — 민감 작업 시 비밀번호 재확인\n\n## Synchronizer Token Pattern (전통 표준)\n\n```\n1. 서버: 로그인 시 세션에 csrf_token = random 저장\n2. 서버: form 렌더링 시 hidden input에 csrf_token 삽입\n   <form><input type=\"hidden\" name=\"_csrf\" value=\"abc123\">...\n3. 클라이언트: form 제출 → csrf_token이 같이 전송됨\n4. 서버: 받은 토큰 == 세션의 토큰? 일치하면 정상.\n```\n\nSpring Security 기본 동작 (form-based auth + session):\n\n```java\n@Configuration\nclass SecurityConfig {\n    @Bean\n    SecurityFilterChain filterChain(HttpSecurity http) throws Exception {\n        // CSRF 자동 활성화 (default)\n        return http\n            .csrf(c -> c.csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse()))\n            // ...\n            .build();\n    }\n}\n```\n\n→ 모든 POST/PUT/DELETE 요청에 토큰 필수. 누락 시 403.\n\n⚠️ stateless API (JWT)에서는 *세션 자체가 없으므로* 이 패턴 적용 의미 약함.\n\n## SameSite Cookie (브라우저 자동)\n\n```\nSet-Cookie: JSESSIONID=abc; HttpOnly; Secure; SameSite=Lax\n```\n\n`SameSite` 속성 값:\n\n| 값 | cross-site 요청 시 쿠키 전송 |\n|---|---|\n| `Strict` | 절대 안 보냄 (가장 안전) |\n| `Lax` | top-level 탐색 GET만 보냄 (default) |\n| `None` | 항상 보냄 (Secure 필수) |\n\n**현대 브라우저 default = Lax**. 즉 *대부분의 CSRF는 자동 차단*.\n\n⚠️ 함정:\n- `SameSite=None`이 *해당 쿠키 = cross-site 사용 의도* (예: third-party iframe). 이 경우 CSRF 다시 위험.\n- Lax는 GET 일부 허용 — GET이 *상태 변경*하면 위험 (REST 원칙 위반이지만 실수로 흔함).\n- 일부 legacy 브라우저는 SameSite 미지원 → 추가 토큰 패턴 필수.\n\n원칙: SameSite *외에* token 기반 방어를 *함께* 둔다.\n\n## Double Submit Cookie (Stateless 친화)\n\n```\n1. 로그인 시 서버: csrf_token 발급, 쿠키로 클라에 set\n2. 클라이언트(JS): 쿠키에서 토큰 읽어 헤더 X-CSRF-Token에도 같이 보냄\n3. 서버: 헤더 X-CSRF-Token == 쿠키 csrf_token? 일치하면 정상.\n```\n\n핵심 사고: cross-site attacker는 *쿠키를 자동 전송*시킬 수 있지만, *JS로 쿠키를 읽어 헤더에 박을 수 없다* (same-origin policy).\n\n장점: 서버 세션 상태 ❌. SPA + API 환경에 적합.\n단점: **XSS가 있으면 토큰 노출** (JS가 쿠키 읽음). XSS 방어 별도 필수.\n\nSpring Security 6+ 패턴:\n```java\nhttp.csrf(c -> c\n    .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())\n    .csrfTokenRequestHandler(new SpaCsrfTokenRequestHandler())\n);\n```\n\n## \"SPA + JWT 환경에서 CSRF?\"\n\nJWT를 *Authorization 헤더*로 보내는 stateless 환경:\n\n```\nRequest: GET /api/me\nHeaders: Authorization: Bearer eyJ...\n```\n\nCSRF 위협은 *쿠키 자동 전송* 때문에 생긴다. JWT는 *명시적 헤더*로 전송되므로 *브라우저가 자동 첨부 안 함*. 따라서 **CSRF 위협 약함**.\n\n⚠️ JWT를 *쿠키*로 저장하는 경우 (HttpOnly 쿠키 권장 패턴):\n- 쿠키 자동 전송 → CSRF 다시 위험.\n- 추가 방어: SameSite=Lax/Strict + 추가 token 필요.\n\n→ JWT를 쿠키로 두는 경우엔 CSRF가 다시 등장. localStorage 두면 CSRF 없지만 *XSS 노출* trade-off.\n\n## Origin / Referer 헤더 검증\n\n보조 방어. 모든 요청에 *어디에서 왔는지* 헤더가 있다.\n\n```java\nString origin = request.getHeader(\"Origin\");\nif (origin != null && !ALLOWED_ORIGINS.contains(origin)) {\n    throw new ForbiddenException();\n}\n```\n\n⚠️ `Origin`/`Referer`이 *없는 경우*가 있어 (사용자 설정, 일부 요청 타입) 단독으로 의지 ❌. token 패턴과 함께.\n\n## \"GET은 CSRF 영향 받나?\"\n\n원칙적으로 GET은 *상태 변경 안 함*이라 영향 없음. 하지만 실수로 `GET /transfer?...`를 만든 경우 → CSRF.\n\n규칙: **GET을 *상태 변경에 쓰지 않음*** (REST 원칙). 따른다면 GET에 CSRF token 강제 안 해도 OK.\n\n## 자주 헷갈리는 지점\n\n- **\"SameSite=Lax면 CSRF 토큰 불필요\"** — 80% 케이스는 막힘. 그래도 *완전 차단 아님* (top-level GET, 일부 legacy). token 패턴 함께.\n- **\"JWT면 CSRF 신경 안 써도 됨\"** — JWT가 *헤더*면 OK, *쿠키*면 다시 위험.\n- **\"Spring Security가 자동 다 막음\"** — 기본 ON. 단 stateless API에서 `csrf.disable()`하면 다른 방어 필요.\n- **\"CSRF는 읽기도 위험\"** — 쓰기 (POST/PUT/DELETE) 위협. 단 GET이 상태 변경하면 위험.\n- **\"Token을 URL 파라미터에\"** — Referer 헤더 통해 token leak 가능. 헤더 또는 form body.\n\n## 학습자가 자주 만나는 시나리오\n\n- 학습 미션 form-based 로그인 + Spring Security → CSRF token 자동 (그대로 두기).\n- \"POST 회원가입이 403 Forbidden\" → CSRF token 누락. form에 hidden `_csrf` 추가.\n- SPA + 자체 JWT (헤더) → `csrf.disable()` + JWT 검증으로 충분.\n- SPA + HttpOnly 쿠키 + Double Submit → `CookieCsrfTokenRepository.withHttpOnlyFalse()`.\n- Public API (POST) — *인증 없는* endpoint → CSRF 영향 없음 (어차피 누구나 가능).\n\n## 빠른 확인 질문\n\n- CSRF의 핵심 원리?\n  - *쿠키가 cross-site 요청에 자동 전송*되어 의도 없는 동작을 발생시킴.\n- SameSite=Lax + Synchronizer Token을 *함께* 쓰는 이유?\n  - Lax는 일부 GET 허용 + legacy 브라우저 미지원 → token이 추가 안전망.\n- JWT를 쿠키로 두면 CSRF가 다시 위험한 이유?\n  - 쿠키 자동 전송 모델로 돌아옴.\n\n## 한 줄 정리\n\nCSRF 방어 = SameSite (브라우저) + Synchronizer/Double Submit Token (서버) + Origin 검증 (보조). 셋은 보완. JWT를 헤더로 두면 CSRF 약하지만 쿠키 저장 시 다시 위험.\n\nretrieval-anchor-keywords: CSRF defense, Cross-Site Request Forgery, Synchronizer Token Pattern, SameSite Lax Strict None, Double Submit Cookie, CookieCsrfTokenRepository, Spring Security csrf disable stateless, Origin header check, Referer validation, csrf in SPA, JWT cookie CSRF, JWT header CSRF safe, _csrf hidden input, X-CSRF-Token header\n",
   "aliases": [
+    "stateless CSRF",
+    "CSRF in SPA",
+    "Spring Security CSRF",
+    "@Bean",
     "CSRF 방어",
     "CSRF 방어 — Synchronizer 개념",
-    "CSRF 방어 — Synchronizer 정리",
-    "CSRF 방어 — Synchronizer 실수",
-    "CSRF 방어 — Synchronizer 판단 기준",
-    "Synchronizer Token Pattern",
     "SameSite Cookie",
     "Double Submit Cookie",
     "CSRF token",
-    "Cross-Site Request Forgery",
+    "CSRF 방어 — Synchronizer 정리",
     "origin header check",
     "referer check"
   ],
@@ -56,6 +56,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch161"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }

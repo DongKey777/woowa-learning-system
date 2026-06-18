@@ -6,18 +6,18 @@
   "summary": "캐시는 \"느린/비싼 원천(DB, API, 계산)을 빠른 임시 저장에 복사\"해서 latency와 부하를 줄이지만, 그 대신 일관성(consistency)을 잃는다.",
   "body_markdown": "# Cache 기초 primer — 왜 캐시를 쓰고 무엇을 잃는가\n\n> 한 줄 요약: 캐시는 \"느린/비싼 원천(DB, API, 계산)을 빠른 임시 저장에 복사\"해서\n> latency와 부하를 줄이지만, 그 대신 **일관성(consistency)**을 잃는다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Stateless vs Stateful 기초](./stateless-vs-stateful-basics.md)\n- [System Design Foundations](./system-design-foundations.md)\n- [Stateless Backend, Cache, Database, Queue 스타터 팩](./stateless-backend-cache-database-queue-starter-pack.md)\n- [Replica Lag와 Read-Your-Writes 전략](../database/replica-lag-read-after-write-strategies.md)\n- [system-design 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: cache basics primer, 캐시 입문 primer, 캐시 왜 쓰는지, cache aside vs write-through vs write-back, 캐시 무효화 invalidation, TTL 만료, 캐시 키 설계, hit ratio 적중률, cache stampede 캐시 스탬피드, Redis vs Memcached 첫 분기, local cache vs remote cache, 일관성과 성능 trade-off, stale data 오래된 데이터\n\n## 먼저 멘탈모델\n\n캐시는 \"원래 답이 있는 곳(원천, source of truth)\"의 답을 **빠른 가까운 곳에 복사해\n두는 것**이다.\n\n- 원천: DB, 외부 API, CPU 무거운 계산\n- 캐시: 메모리(local), Redis/Memcached(remote)\n- 흐름: 요청 → 캐시 확인 → 있으면 캐시 답(hit), 없으면 원천 → 캐시 채움(miss)\n\n이 단순한 흐름에서 **3가지 본질적 비용**이 발생한다:\n\n1. **일관성 비용**: 원천이 바뀌었는데 캐시는 옛 값을 가지고 있을 수 있음 (stale data)\n2. **공간 비용**: 캐시에 무엇을 두고 무엇을 버릴까 (eviction)\n3. **운영 비용**: 캐시 노드가 다운되면? 캐시 stampede는 어떻게 막아?\n\n캐시를 도입하면 **성능을 얻고 일관성을 잃는다**. 이 trade-off를 명확히\n의식하지 않으면 \"캐시 때문에 옛 데이터가 보인다\"는 버그가 끊임없이 생긴다.\n\n## 왜 캐시를 쓰는가 — 3가지 동기\n\n### 1. Latency 줄이기\n\n- DB 쿼리 50ms vs 메모리 캐시 0.5ms → 100× 빠름\n- API 호출 200ms vs 캐시 1ms → 200× 빠름\n\n### 2. 원천 부하 줄이기\n\n- 같은 데이터를 1000명이 동시에 요청 → DB에 1000번 vs 캐시 1번\n- DB cost (CPU/disk I/O)와 비용(외부 API 호출당 과금) 절감\n\n### 3. Resilience (회복성)\n\n- 원천이 일시적으로 죽어도 캐시에 답이 있으면 서비스 유지 가능\n- 단 캐시도 죽으면 폭주 위험 (cache stampede)\n\n## 3가지 기본 캐시 전략 비교\n\n### Cache Aside (Look-aside, Lazy Loading)\n\n가장 흔한 패턴. 애플리케이션이 캐시와 DB 두 곳을 모두 관리.\n\n```\n읽기:\n  1. 캐시에서 key 찾는다\n  2. hit → 캐시 값 반환\n  3. miss → DB에서 가져와서 캐시에 저장 → 반환\n\n쓰기:\n  1. DB에 쓰기\n  2. 캐시는 (a) 무효화하거나 (b) 같은 값으로 갱신\n```\n\n**장점**: 단순, 캐시 다운돼도 직접 DB로 폴백 가능, 캐시에 자주 쓰는 데이터만 자동으로 적재\n**단점**: miss 시 latency 증가 (DB 호출), 일관성 직접 관리 필요\n**언제 쓰나**: 대부분의 case에서 기본 선택. 신입은 이 패턴부터 시작.\n\n### Write-Through (쓰기 통과)\n\n쓰기마다 캐시와 DB 둘 다 갱신하려는 패턴. 실제 구현에서는 두 저장소 갱신 순서,\n부분 실패, 재시도, transaction 경계가 보장 범위를 결정한다.\n\n```\n읽기:\n  1. 캐시에서 찾기 (hit 또는 miss)\n  2. miss면 DB로 폴백\n\n쓰기:\n  1. 캐시에 쓰기\n  2. DB에 쓰기 (둘 다 성공해야 응답)\n```\n\n**장점**: 쓰기 성공 직후 cache-aside보다 stale window를 줄이기 쉽다\n**단점**: 쓰기 latency 증가 (두 번 쓰기), 사용 안 하는 데이터까지 캐시에 들어감, cache/DB 부분 실패 처리 필요\n**언제 쓰나**: 쓰기 빈도가 낮고 일관성이 중요할 때\n\n주의: write-through라고 해서 모든 stale read가 사라지는 것은 아니다. 캐시 갱신은\n성공했지만 DB commit이 실패하거나, DB는 성공했지만 캐시 write가 timeout 나거나,\n다른 노드가 오래된 값을 다시 채우는 race가 있으면 여전히 불일치가 생길 수 있다.\n강한 정합성이 필요하면 source of truth, version, retry/idempotency, fallback 정책을\n같이 설계해야 한다.\n\n### Write-Back (Write-Behind)\n\n쓰기는 캐시에만 하고 DB는 비동기 배치로 나중에 갱신.\n\n```\n읽기:\n  1. 캐시에서 찾기 (캐시가 최신)\n\n쓰기:\n  1. 캐시에만 쓰기\n  2. 비동기로 큐에 적재, DB는 N초마다 일괄 반영\n```\n\n**장점**: 쓰기 latency 매우 낮음, 쓰기 부하 분산\n**단점**: 캐시 노드 다운되면 미반영 데이터 손실 위험, 일관성 약함\n**언제 쓰나**: 매우 쓰기 빈도 높은 카운터(view count) 같은 케이스\n\n## 30초 비교표\n\n| 전략 | 읽기 latency | 쓰기 latency | 일관성 | 캐시 다운 영향 |\n|---|---|---|---|---|\n| Cache Aside | miss는 느림 | 빠름 (DB만) | 중간 | DB로 폴백 OK |\n| Write-Through | 빠름 | 느림 (둘 다 쓰기) | cache-aside보다 강한 편, 부분 실패 설계 의존 | DB로 폴백 OK |\n| Write-Back | 빠름 | 매우 빠름 | 약 | 데이터 손실 위험 |\n\n## 캐시 무효화 (Invalidation)\n\n> \"There are only two hard things in Computer Science: cache invalidation and naming things.\"\n> — Phil Karlton\n\n캐시에 둔 값이 원천에서 바뀌었을 때, 캐시를 어떻게 처리할 것인가.\n\n### 1. TTL 만료 (Time To Live)\n\n```\n캐시에 저장할 때 만료 시간(예: 60초) 설정\n60초가 지나면 자동 삭제됨 (다음 요청은 miss → 원천 재조회)\n```\n\n**장점**: 단순, 자동\n**단점**: 그 60초 동안 stale data 가능, 만료 직후 cache stampede 위험\n\n### 2. 명시적 무효화 (Explicit Invalidation)\n\n```\nDB가 바뀔 때 코드가 직접 캐시 삭제:\n  db.update(...)\n  cache.delete(key)\n```\n\n**장점**: stale data 최소화\n**단점**: 모든 갱신 경로에서 캐시 삭제를 잊으면 안 됨, 분산 환경에서 race condition\n\n### 3. 같은 값으로 덮어쓰기 (Refresh)\n\n```\nDB 갱신 → 캐시도 같은 값으로 갱신\n```\n\n**장점**: 다음 읽기가 빠름\n**단점**: 갱신 시 latency 증가, 쓰지 않을 데이터까지 캐시에 들어감\n\n### 무효화 trade-off 정리\n\n- 무효화 안 함 (TTL만): 단순하지만 stale data window 존재\n- 명시적 무효화: 정합성 강하지만 코드 복잡 + race 가능성\n- 무효화 + TTL 둘 다: 안전망 추가 (대부분 권장)\n\n## 캐시 키 설계\n\n캐시 키는 단순 string이지만 설계가 중요하다.\n\n### 좋은 키 설계\n- **prefix로 entity 구분**: `user:123`, `product:456`, `session:abc`\n- **version 포함**: `v2:user:123` (스키마 바뀌면 v3으로, 자동 무효화 효과)\n- **predictable**: 같은 데이터 → 같은 키 (해시 함수 일관성 보장)\n\n### 나쁜 키 설계\n- ❌ `user_data_for_user_id_123` (장황)\n- ❌ `123` (prefix 없으면 충돌 위험)\n- ❌ 무작위 hash key (디버깅 불가)\n\n### 다국어/대소문자 정규화\n\n`user:ABC` ↔ `user:abc` ↔ `user:Abc` 셋이 다른 키로 들어가지 않게 정규화 필요.\n\n## Hit Ratio (적중률)\n\n```\nHit Ratio = 캐시 hit 수 / 전체 요청 수\n```\n\n목표: 보통 85%+ 이상 (서비스에 따라 다름).\n\n낮으면 의심해 볼 점:\n- TTL이 너무 짧음\n- 캐시 용량 부족 (eviction이 빈번)\n- 캐시 키 설계 잘못 (같은 데이터가 다른 키로 들어감)\n- 사용 패턴이 한 번만 보고 잊는 (long-tail)\n\n## Cache Stampede (Thundering Herd)\n\n문제: 인기 키 캐시가 만료된 순간 동시에 1000개 요청이 옴 → 1000개가 동시에\nDB로 가서 DB가 죽음.\n\n해결 패턴:\n- **확률적 조기 갱신**: 만료 90% 시점부터 일부 요청만 갱신 시도\n- **분산 락 (mutex)**: 첫 요청만 DB 호출, 나머지는 기다림\n- **soft TTL + hard TTL**: soft 만료 후에는 stale 값 + 비동기 갱신, hard 만료 후에만 진짜 무효화\n\n## Local vs Remote Cache\n\n| 구분 | Local (in-process) | Remote (Redis 등) |\n|---|---|---|\n| Latency | 매우 빠름 (메모리 직접) | 빠름 (네트워크 1-2ms) |\n| 공유 | 노드 간 공유 안 됨 (각 노드 독립) | 모든 노드 공유 |\n| 용량 | JVM heap 안에 제한 | GB~TB 가능 |\n| 무효화 | 노드별 따로 처리 | 중앙 관리 |\n| 일관성 | 노드 간 값이 다를 수 있음 | 캐시 기준값은 모이지만 DB/replica와 stale 가능 |\n\n### 신입의 첫 선택\n- 단일 노드 또는 노드별 독립 데이터: **Caffeine (Java local cache)**\n- 다중 노드 공유 필요: **Redis** (시작용 충분, Memcached는 더 가볍지만 기능 적음)\n\n## Redis vs Memcached 첫 분기\n\n| 차이 | Redis | Memcached |\n|---|---|---|\n| 자료형 | string, hash, list, set, sorted set, stream | string만 |\n| 영속성 | RDB/AOF 가능 (서버 재시작 후 복구) | 없음 (재시작 시 초기화) |\n| 복제 | replication 지원 | 없음 |\n| Pub/Sub | 지원 | 없음 |\n| 사용 사례 | 캐시 + 카운터 + 큐 + ranking | 캐시 only |\n\n신입 권장: **Redis부터 시작**. 캐시 + 다른 용도(분산 락, 카운터)도 같은 도구로.\n\n## 자주 헷갈리는 지점\n\n### \"캐시를 쓰면 무조건 빠르다\"는 오해\n\n캐시 hit ratio가 낮으면 오히려 느려진다(캐시 확인 + DB 둘 다). 캐시는\n**자주 쓰이는 데이터에만** 효과적이다.\n\n### \"캐시 = Redis\"라는 오해\n\nRedis는 캐시의 한 구현. 더 일반적으로는:\n- CPU 캐시 (L1/L2/L3)\n- 브라우저 캐시\n- CDN\n- 애플리케이션 in-memory cache (Caffeine)\n- 분산 캐시 (Redis, Memcached)\n\n각 계층마다 일관성 vs 성능 trade-off가 있다.\n\n### \"캐시에 두면 모든 게 빨라진다\"\n\n캐시 자체도 메모리/네트워크 비용이 있다. 짧은 시간만 사는 데이터(1초 미만)는\n캐시 미스 비용이 더 클 수 있다. 또한 매번 다른 값이 오는 데이터(예: 현재\n시간)는 캐시할 의미가 없다.\n\n### \"TTL만 짧게 두면 일관성 OK\"\n\nTTL 1초로 두면 stale data window가 1초로 줄지만:\n- DB 부하는 거의 안 줄어듦 (1초마다 갱신)\n- Cache stampede 위험 증가\n- \"1초도 stale은 안 되는\" 시나리오(결제, 재고 등)는 캐시 자체를 쓰면 안 됨\n\n## 빠른 확인 질문\n\n- Cache Aside의 읽기 흐름?  답: 캐시 hit → 답 / miss → DB → 캐시 저장 → 답\n- Write-Through의 단점?  답: 쓰기 latency 증가 + 안 쓰는 데이터까지 캐시에 들어감\n- 캐시 무효화 두 가지 방법?  답: TTL 자동 만료 + 명시적 delete (보통 둘 다 결합)\n- Cache stampede는?  답: 인기 키 만료 직후 동시 요청이 DB로 폭주\n- 신입의 첫 캐시 선택?  답: Cache Aside + Redis + TTL + version-prefixed key\n\n## 한 줄 정리\n\n캐시는 \"원천을 빠른 곳에 복사해서 latency와 부하를 줄이는\" 도구지만,\n일관성을 잃고 무효화/key 설계/stampede 관리 비용이 따라오며, 신입은\n**Cache Aside + Redis + TTL + 명시적 무효화**의 결합을 기본으로 시작하면 안전하다.\n",
   "aliases": [
-    "cache 입문",
-    "cache 기초",
-    "캐시 입문",
-    "캐시 왜 써",
-    "캐시 무효화",
-    "cache basics primer",
-    "cache why",
-    "cache aside",
-    "cache aside vs write through",
-    "look-aside cache",
-    "write-through cache",
-    "write-back cache"
+    "Redis Memcached 입문",
+    "캐시 일관성",
+    "캐시 정합성",
+    "캐시 적중률",
+    "캐시 폭주",
+    "캐시 만료 시간",
+    "캐시 키 설계",
+    "stale data 오래된 데이터",
+    "cache stampede 캐시 스탬피드",
+    "cache invalidation",
+    "thundering herd",
+    "cache 입문"
   ],
   "expected_queries": [
     "캐시를 왜 쓰는 거야? 어떤 문제를 해결해?",
@@ -61,6 +61,10 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch154"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-audit-natural-entrypoint-repair"
       }
     ]
   }
