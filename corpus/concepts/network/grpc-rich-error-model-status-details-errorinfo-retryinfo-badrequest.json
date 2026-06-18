@@ -3,31 +3,35 @@
   "title": "gRPC rich error model - Status details, ErrorInfo, RetryInfo, BadRequest",
   "category": "network",
   "level": "advanced",
-  "summary": "gRPC rich error model은 code/message만으로 부족한 실패 의미를 google.rpc.Status details에 ErrorInfo, RetryInfo, BadRequest 같은 typed detail로 담는 방식이다. 클라이언트 자동 처리, retry, validation 표시가 쉬워지지만 trailer 크기, proxy 호환성, PII 노출, detail type versioning을 주의해야 한다.",
-  "body_markdown": "# gRPC rich error model - Status details, ErrorInfo, RetryInfo, BadRequest\n\n> 한 줄 요약: gRPC error를 문자열 하나로 끝내지 않고, typed detail을 붙여 클라이언트가 구조적으로 해석하게 만든다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: gRPC rich error model, google.rpc.Status, grpc-status-details-bin, ErrorInfo, RetryInfo, BadRequest, PreconditionFailure, ResourceInfo, protobuf Any details, structured grpc errors, gRPC validation error\n\n## 먼저 멘탈모델\n\ngRPC 기본 status는 code와 message만으로도 실패를 표현할 수 있다.\n\n```text\nINVALID_ARGUMENT: invalid request\n```\n\n하지만 클라이언트가 무엇을 해야 하는지 알기에는 부족할 수 있다. 어떤 field가 잘못됐는지, 재시도해도 되는지, 몇 초 뒤 재시도해야 하는지, 어떤 quota가 막혔는지를 구조화하고 싶다.\n\nRich error model은 `google.rpc.Status`의 `details`에 typed protobuf message를 넣는다.\n\n예시 detail:\n\n- `BadRequest`: field violation 목록\n- `RetryInfo`: 재시도 지연 힌트\n- `ErrorInfo`: domain, reason, metadata\n- `PreconditionFailure`: 깨진 precondition 목록\n- `ResourceInfo`: 어떤 resource가 문제인지\n\n## 왜 message 문자열만으로 부족한가\n\n문자열 message는 사람이 읽기는 쉽지만, 클라이언트 로직이 안정적으로 파싱하기 어렵다.\n\n```text\nmessage = 이름은 필수입니다\n```\n\n이 문자열을 파싱해 UI field error로 바꾸는 것은 locale, 문구 변경, punctuation에 취약하다. `BadRequest.field_violations`처럼 구조화하면 field와 reason을 안정적으로 다룰 수 있다.\n\n## RetryInfo와 ErrorInfo\n\n`UNAVAILABLE`이나 `RESOURCE_EXHAUSTED` 같은 code만으로 retry 정책을 결정하면 거칠다. `RetryInfo`를 붙이면 서버가 권장 지연 시간을 줄 수 있다.\n\n`ErrorInfo`는 domain과 reason을 안정적인 코드로 제공한다.\n\n```text\nreason = QUOTA_EXCEEDED\ndomain = reservation.woowa\nmetadata = tier: free\n```\n\n이 값은 log, metric, client fallback과 맞춰야 한다. 단, metadata에 개인정보나 내부 secret을 넣으면 안 된다.\n\n## 전송과 호환성 주의\n\nRich error detail은 protobuf Any로 encode되어 trailer에 실릴 수 있다. 모든 client, proxy, gateway가 이 detail을 보존하고 해석한다고 가정하면 안 된다.\n\n확인할 것:\n\n- 사용하는 gRPC library가 rich error detail을 encode/decode하는가\n- gateway나 proxy가 trailer 크기와 binary metadata를 보존하는가\n- REST transcoding을 한다면 error detail이 어떻게 mapping되는가\n- detail message schema versioning을 어떻게 관리할 것인가\n\n## 설계 원칙\n\n- code는 coarse category로 안정적으로 둔다.\n- message는 사람에게 보여줄 수 있지만 로직의 source of truth로 삼지 않는다.\n- detail은 client가 행동을 바꿀 때만 넣는다.\n- PII, token, 내부 stack trace를 detail에 넣지 않는다.\n- detail type과 field number도 Protobuf evolution 규칙을 따른다.\n\n## REST ProblemDetail과의 차이\n\nSpring REST에서는 ProblemDetail 같은 JSON error body로 구조화할 수 있다. gRPC에서는 status trailer와 protobuf detail을 쓴다. 둘 다 목표는 비슷하다. 문자열이 아니라 안정적인 error code, field violation, retry hint를 제공하는 것이다.\n\n차이는 transport와 encoding이다. gRPC client가 detail을 자동으로 unpack할 수 있는지, HTTP/JSON gateway가 어떻게 변환하는지까지 계약에 포함해야 한다.\n\n## 한 줄 정리\n\ngRPC rich error model은 실패를 code/message 문자열에서 typed protobuf detail로 끌어올리는 방식이다. 클라이언트 행동이 달라지는 정보만 구조화하고, trailer/proxy/PII/schema evolution을 함께 관리해야 한다.\n",
+  "summary": "gRPC rich error model은 `grpc-status` code/message만으로 부족한 실패 의미를 `google.rpc.Status.details`의 typed detail로 보강하는 API 계약이다. `grpc-status-details-bin` trailer에 ErrorInfo, RetryInfo, BadRequest, ResourceInfo 등을 담으면 클라이언트가 retry, validation UI, quota 안내를 구조적으로 처리할 수 있지만, trailer 보존, grpc-web/browser 제약, PII 노출, detail versioning, REST ProblemDetail과의 경계를 함께 설계해야 한다.",
+  "body_markdown": "# gRPC rich error model - Status details, ErrorInfo, RetryInfo, BadRequest\n\n> 한 줄 요약: gRPC 에러를 code/message 문자열 하나로 끝내지 않고, 실패 뒤에 클라이언트 행동을 바꾸는 typed detail을 붙이는 계약이다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: gRPC rich error model, google.rpc.Status details, grpc-status-details-bin, ErrorInfo, RetryInfo, BadRequest, ResourceInfo, protobuf Any details, structured grpc error, validation field violation, retry hint, grpc-web trailers, REST ProblemDetail boundary\n\n## 핵심 모델\n\ngRPC의 기본 실패 계약은 `grpc-status` code와 `grpc-message`다. 이 둘은 호출이 성공인지 실패인지, 실패라면 큰 분류가 무엇인지를 알려 준다.\n\n```text\nouter trailers\n- grpc-status: INVALID_ARGUMENT\n- grpc-message: invalid request\n- grpc-status-details-bin: serialized google.rpc.Status\n\ninside google.rpc.Status\n- code: INVALID_ARGUMENT\n- message: invalid request\n- details: [BadRequest, ErrorInfo, RetryInfo, ResourceInfo, ...]\n```\n\nRich error model은 이 기본 status를 대체하지 않는다. 바깥 `grpc-status`와 `google.rpc.Status.code`는 충돌하지 않게 맞추고, `details`에 클라이언트가 안정적으로 unpack할 typed protobuf message를 넣는다.\n\n## code/message와 details의 역할 분리\n\n`code`는 coarse category다. 예를 들어 `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`처럼 retry 가능성, 입력 오류, 권한, quota 같은 큰 bucket을 잡는다.\n\n`message`는 사람에게 보여 주거나 로그에서 읽는 보조 설명이다. 클라이언트 로직의 source of truth로 삼으면 문구 변경, 다국어, punctuation, 운영 메시지 수정에 깨진다.\n\n`details`는 기계가 읽는 행동 힌트다. 클라이언트가 다음 행동을 바꾸는 정보만 넣는다. 화면의 특정 field에 오류를 붙일지, 몇 초 뒤 재시도할지, 어떤 quota reason을 보여 줄지 같은 정보가 여기에 들어간다.\n\n## 자주 쓰는 detail type\n\n| Detail type | 담는 의미 | 대표 사용처 |\n|---|---|---|\n| `BadRequest` | public request field와 violation 목록 | form validation, field-level UI error |\n| `ErrorInfo` | 안정적인 `domain`, `reason`, metadata | 에러 코드, quota/auth/domain reason, metric label |\n| `RetryInfo` | 서버가 권장하는 retry delay | backoff 시작점, retry-after 힌트 |\n| `ResourceInfo` | 문제가 된 resource type/name/owner | quota, lock, not found, conflict 안내 |\n| `PreconditionFailure` | 깨진 precondition 목록 | 상태 전이, optimistic check, business rule failure |\n\n예를 들어 입력 검증 실패라면 `INVALID_ARGUMENT` + `BadRequest.field_violations`가 자연스럽다. quota라면 `RESOURCE_EXHAUSTED` + `ErrorInfo(reason=QUOTA_EXCEEDED)` + 필요 시 `RetryInfo`가 더 읽기 쉽다. 특정 리소스가 문제라면 문자열 message에 id를 섞기보다 `ResourceInfo`로 의미를 분리한다.\n\n## 클라이언트 unpacking 계약\n\n서버가 detail을 넣는 것만으로 끝나지 않는다. 클라이언트 라이브러리도 error에서 `google.rpc.Status`를 꺼내고, `Any`에 들어 있는 detail을 타입별로 unpack해야 한다.\n\n실무 계약은 보통 이렇게 잡는다.\n\n- 클라이언트는 모르는 detail type을 무시하고 code/message fallback으로 처리한다.\n- 분기 로직은 message 문자열이 아니라 detail type, `ErrorInfo.reason`, `BadRequest.field` 같은 stable field를 본다.\n- field path는 public request DTO 이름과 맞춘다. 내부 entity field나 DB column 이름을 노출하지 않는다.\n- detail이 없을 때도 UX가 망가지지 않도록 기본 안내와 일반 retry 정책을 둔다.\n- 서버와 클라이언트는 reason 문자열과 metadata key를 API 계약 문서에 고정한다.\n\n## retry와 validation UI use case\n\nValidation UI에서는 `BadRequest`가 핵심이다. `field_violations.field`는 화면 입력 이름과 매핑할 수 있어야 하고, description은 사용자가 봐도 되는 문장만 담는다. 다국어가 필요하면 description 자체보다 stable code를 함께 설계하고, 문구는 클라이언트나 별도 message catalog에서 처리한다.\n\nRetry에서는 `RetryInfo`만 보고 무조건 다시 보내면 안 된다. 클라이언트는 여전히 아래 조건을 확인해야 한다.\n\n- RPC가 멱등한가\n- caller deadline 안에 retry가 의미 있는가\n- retry budget과 circuit breaker를 넘지 않는가\n- `ErrorInfo.reason`이 transient인지 quota/domain reject인지 구분되는가\n\n`RetryInfo`는 retry 허가증이 아니라 서버가 줄 수 있는 delay hint다. 특히 결제, 예약, 주문 같은 write API는 idempotency key나 중복 처리 계약 없이 자동 retry를 붙이면 위험하다.\n\n## trailer, proxy, grpc-web caveat\n\nRich detail은 보통 `grpc-status-details-bin`이라는 binary trailing metadata로 전달된다. 그래서 일반 JSON error body보다 중간 경로의 영향을 더 많이 받는다.\n\n확인해야 할 것:\n\n- proxy, gateway, service mesh가 HTTP/2 trailers와 binary metadata를 보존하는가\n- header/trailer size limit 때문에 detail이 잘리지 않는가\n- trailer가 사라졌을 때 클라이언트가 code/message fallback을 갖는가\n- observability에 detail 존재 여부와 unpack 실패를 남기는가\n- grpc-web gateway가 detail을 어떤 형식으로 브라우저 클라이언트에 전달하는가\n\n브라우저 환경에서는 raw HTTP/2 trailer 접근을 직접 기대하면 안 된다. grpc-web 클라이언트와 gateway가 trailer를 grpc-web 프로토콜 방식으로 전달해 주는지 확인해야 하며, fetch/XHR 일반 코드가 `grpc-status-details-bin`을 직접 읽는다고 가정하면 깨지기 쉽다.\n\n## PII, 보안, versioning\n\nError detail은 실패 응답의 일부라서 외부 클라이언트, 로그, support 도구에 퍼질 수 있다. 아래 값은 넣지 않는다.\n\n- token, secret, raw credential\n- 주민번호, 전화번호, 이메일 같은 PII 원문\n- 내부 stack trace, SQL, table name, shard id\n- 다른 tenant의 resource id나 운영 내부 topology\n\nDetail message와 `ErrorInfo.reason`은 API contract다. 한번 공개하면 클라이언트 분기 로직이 붙는다. 기존 field의 의미를 바꾸지 말고, 새 field나 새 reason을 추가하는 쪽으로 확장한다. 큰 의미 변경이 필요하면 새 detail type, 새 reason namespace, versioned metadata key를 고려한다.\n\n## REST ProblemDetail과의 경계\n\nSpring REST API에서는 `ProblemDetail`이나 JSON error body가 자연스러운 계약이다. 반면 gRPC rich error는 trailer에 protobuf `Any` detail을 담고, gRPC 클라이언트가 typed message로 unpack하는 모델이다.\n\nHTTP/JSON gateway를 같이 운영한다면 변환 규칙을 명시해야 한다.\n\n- `BadRequest.field_violations`를 ProblemDetail 확장 field나 invalid-params 배열로 어떻게 옮길지\n- `ErrorInfo.reason`을 REST의 `type`, `code`, extension field 중 어디에 둘지\n- `RetryInfo`를 `Retry-After` header나 body field로 노출할지\n- gRPC 전용 detail이 REST 클라이언트에 보이지 않을 때 fallback 문구는 무엇인지\n\n즉 이 문서는 gRPC 클라이언트와 서버 사이의 rich error 계약을 다룬다. 순수 REST API의 일반 error body 설계는 ProblemDetail/API error contract 문서로 보내는 편이 맞다.\n\n## Boundary notes\n\n- protobuf field number, reserved, oneof migration 같은 wire schema evolution 자체가 질문의 중심이면 이 문서가 아니라 protobuf schema evolution 문서로 보낸다.\n- gRPC load balancing, name resolver, subchannel, pick_first/round_robin 질문은 rich error detail과 별개다.\n- `UNAVAILABLE`이 app status인지 proxy reset인지 trailer 수신 여부로 가르는 질문은 gRPC status/trailer/transport mapping 문서가 우선이다.\n- HTTP status code와 REST JSON error body만 묻는 질문은 ProblemDetail 또는 generic API error contract로 보낸다.\n\n## 한 줄 정리\n\ngRPC rich error model은 실패를 code/message 문자열에서 typed detail 계약으로 끌어올리는 방식이다. 클라이언트 행동이 실제로 달라지는 정보만 넣고, trailer 보존성, PII, versioning, REST 변환 경계를 같이 관리해야 한다.\n",
   "aliases": [
     "gRPC rich error",
-    "google.rpc.Status",
     "grpc-status-details-bin",
-    "ErrorInfo RetryInfo",
-    "BadRequest 필드 오류",
-    "gRPC 구조화 에러",
-    "grpc 타입 에러",
+    "google.rpc.Status details",
+    "ErrorInfo",
     "RetryInfo",
-    "BadRequest"
+    "BadRequest",
+    "ResourceInfo",
+    "gRPC 구조화 에러",
+    "gRPC 상세 에러",
+    "grpc 필드 검증 에러",
+    "재시도 힌트 에러"
   ],
   "expected_queries": [
-    "gRPC rich error model에서 google.rpc.Status details는 어떤 문제를 해결해?",
-    "ErrorInfo RetryInfo BadRequest는 gRPC error에서 각각 언제 쓰는 detail이야?",
-    "grpc-status-details-bin trailer를 proxy가 보존하지 않으면 어떤 호환성 문제가 생겨?",
-    "gRPC error message 문자열을 클라이언트 로직이 파싱하면 왜 위험해?",
-    "gRPC rich error detail에 PII나 stack trace를 넣으면 왜 안 돼?",
-    "REST ProblemDetail과 gRPC rich error model은 구조화 에러 관점에서 어떻게 달라?"
+    "gRPC에서 code랑 message만 보내면 안 되고 rich error detail을 쓰는 기준이 뭐야?",
+    "BadRequest field violation으로 화면 검증 에러를 어떻게 연결해?",
+    "RetryInfo랑 ErrorInfo는 클라이언트 재시도 정책에서 어떻게 써야 해?",
+    "grpc-status-details-bin trailer가 프록시나 grpc-web에서 사라질 수 있으면 계약을 어떻게 잡아?",
+    "gRPC rich error detail에 개인정보나 내부 스택을 넣으면 왜 위험해?",
+    "REST ProblemDetail을 쓰는 API랑 gRPC rich error는 어디서 경계를 나눠야 해?"
   ],
   "symptoms": [
     "gRPC error message 문자열을 파싱해 field validation과 retry 정책을 만든다",
-    "rich error detail이 모든 proxy와 client에서 항상 보존된다고 가정한다",
-    "ErrorInfo metadata나 BadRequest detail에 개인정보와 내부 구현 정보를 넣는다"
+    "grpc-status-details-bin trailer가 모든 proxy, gateway, grpc-web client에서 항상 보존된다고 가정한다",
+    "ErrorInfo metadata, ResourceInfo, BadRequest detail에 개인정보와 내부 구현 정보를 넣는다",
+    "RetryInfo를 자동 재시도 허가로 보고 멱등성, deadline, retry budget을 확인하지 않는다",
+    "REST ProblemDetail과 gRPC rich error detail을 같은 wire contract로 취급한다"
   ],
   "relations": {
     "prerequisites": [
@@ -36,21 +40,35 @@
     ],
     "next_docs": [
       "network/grpc-deadline-retry-hedging-streaming-chooser",
+      "network/grpc-web-vs-bff-vs-rest-browser-boundary-bridge",
       "spring/problemdetail-error-response-design"
     ],
     "confusable_with": [
       "network/grpc-status-trailers-transport-error-mapping",
+      "network/protobuf-wire-schema-evolution-field-number-reserved-compatibility-rules",
+      "network/grpc-client-side-load-balancing-name-resolver-subchannel-pick-first-wait-for-ready",
       "spring/problemdetail-error-response-design",
       "software-engineering/http-status-error-response-design-bridge"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "protobuf field number reserved backward compatibility schema evolution",
+      "proto wire format oneof reserved field migration",
+      "gRPC load balancing name resolver subchannel pick_first round_robin",
+      "HTTP status code and generic REST JSON error response design",
+      "ProblemDetail status title detail type instance 기본 설명"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/grpc-rich-error-model-status-details-errorinfo-retryinfo-badrequest.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "round-3-api-contract-backlog"
+      }
+    ]
   }
 }

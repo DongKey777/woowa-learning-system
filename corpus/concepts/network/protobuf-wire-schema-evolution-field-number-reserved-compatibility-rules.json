@@ -3,34 +3,35 @@
   "title": "Protobuf wire schema evolution - field number, reserved, compatibility 규칙",
   "category": "network",
   "level": "advanced",
-  "summary": "Protobuf 호환성의 핵심은 field name보다 wire field number와 type이다. 제거한 field number를 재사용하지 말고 reserved로 막아야 하며, required field 추가, type 변경, enum zero/default, oneof 이동은 consumer 호환성을 깨뜨릴 수 있다.",
-  "body_markdown": "# Protobuf wire schema evolution - field number, reserved, compatibility 규칙\n\n> 한 줄 요약: Protobuf에서는 field 이름보다 number가 wire contract이므로, 지운 번호를 다시 쓰면 오래된 데이터가 다른 의미로 읽힐 수 있다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: Protobuf schema evolution, field number reserved, wire compatibility, proto3 optional, enum zero value, unknown fields, protobuf reserved field name, gRPC schema compatibility, oneof compatibility, field number reuse\n\n## 먼저 멘탈모델\n\nProtobuf message는 wire에서 field name을 보내지 않는다. field number와 wire type이 핵심이다.\n\n```proto\nmessage User {\n  string name = 1;\n  int32 age = 2;\n}\n```\n\nwire에서는 `name`, `age`라는 이름보다 `1`, `2`라는 번호가 중요하다. 그래서 field 이름을 바꾸는 것과 field number를 바꾸는 것은 위험도가 다르다.\n\n## 기본 규칙\n\n| 변경 | 판단 |\n|---|---|\n| 새 optional field 추가 | 보통 compatible |\n| field 이름 변경 | 같은 number/type이면 wire 호환은 유지되지만 코드/JSON mapping은 확인 |\n| field number 변경 | breaking |\n| field 제거 후 number 재사용 | 매우 위험, reserved 필요 |\n| type 변경 | wire type과 의미에 따라 breaking 가능 |\n| enum 값 추가 | consumer의 unknown 처리 확인 필요 |\n| required 성격의 field 추가 | old producer가 채울 수 없어 계약 위험 |\n\nproto3에서는 field presence와 default value도 중요하다. 값이 없어서 default인지, 실제로 default 값을 보낸 것인지 구분해야 하는 경우 `optional`이나 wrapper 타입을 검토한다.\n\n## reserved가 왜 필요한가\n\nfield를 제거했다면 번호와 이름을 reserved로 남겨야 한다.\n\n```proto\nmessage User {\n  reserved 2;\n  reserved \"age\";\n\n  string name = 1;\n  string email = 3;\n}\n```\n\n이렇게 해야 나중에 누군가 `2`번을 다른 의미로 재사용하는 것을 막을 수 있다. 재사용하면 오래된 payload, 로그, 캐시, dead letter data가 새 의미로 잘못 해석될 수 있다.\n\n## enum evolution\n\nenum은 반드시 안전하다고 보면 안 된다.\n\n```proto\nenum Status {\n  STATUS_UNSPECIFIED = 0;\n  CREATED = 1;\n  PAID = 2;\n}\n```\n\n새 값을 추가하면 old client가 그 값을 어떻게 처리하는지 확인해야 한다. generated language, JSON transcoding, switch exhaustiveness, DB 저장 방식에 따라 unknown enum handling이 달라진다.\n\n0번 값은 default로 쓰이므로 보통 `UNSPECIFIED` 같은 안전한 값을 둔다. 실제 business 상태를 0번 default로 두면 누락과 정상 상태가 섞인다.\n\n## oneof와 repeated 함정\n\n`oneof`에 field를 넣거나 빼면 presence 의미가 바뀔 수 있다. 기존 field를 oneof로 옮기는 것은 단순 refactor가 아니라 wire와 generated API 의미 변경이다.\n\n`repeated`와 packed encoding도 언어와 버전에 따라 호환성을 확인해야 한다. 특히 숫자 repeated field의 packed 여부는 오래된 consumer와 만날 때 주의한다.\n\n## 안전한 rollout\n\n1. 새 optional field를 추가한다.\n2. producer와 consumer가 dual-read/dual-write할 기간을 둔다.\n3. old field 사용량을 telemetry로 본다.\n4. 제거할 field number와 name을 reserved한다.\n5. consumer contract fixture에 old/new payload를 모두 넣는다.\n\n## 한 줄 정리\n\nProtobuf schema evolution은 proto 파일 diff가 아니라 wire number와 type의 호환성 문제다. field number 재사용 금지, reserved 선언, enum/default/presence 검증이 핵심이다.\n\n## Batch152 보강 메모\n\nProtobuf wire schema evolution - field number, reserved, compatibility 규칙를 학습할 때는 용어 정의만 확인하기보다 네트워크 문제에서 어떤 입력, 상태, 실패 조건을 분리해야 하는지 먼저 본다. Protobuf 호환성의 핵심은 field name보다 wire field number와 type이다. 제거한 field number를 재사용하지 말고 reserved로 막아야 하며, required field 추가, type 변경, enum zero/default, oneof 이동은 consumer 호환성을 깨뜨릴 수 있다. 이 기준을 적용하면 구현 중 발생한 증상을 단순 암기 항목이 아니라 재현 가능한 선택지로 바꿀 수 있다.\n\n리뷰나 실습에서는 첫째, 이 개념이 해결하려는 병목이나 불변식을 한 문장으로 적고, 둘째, 대체 접근과 비교해 어떤 비용을 받아들이는지 확인한다. 셋째, 테스트나 로그로 관찰할 수 있는 신호를 남겨야 같은 문제가 다시 나왔을 때 추측 대신 근거로 판단할 수 있다.\n",
+  "summary": "Protobuf의 wire 계약은 field name이 아니라 field number와 wire type에 묶인다. 안전한 변경은 새 번호에 optional/additive field를 더하고, 삭제한 번호와 이름은 reserved로 막으며, proto3 default/presence, enum zero, oneof, repeated/map, unknown field 보존 여부를 old producer/consumer 조합으로 검증하는 것이다.",
+  "body_markdown": "# Protobuf wire schema evolution - field number, reserved, compatibility 규칙\n\n> 한 줄 요약: Protobuf에서는 field name보다 field number와 wire type이 오래 살아남는 계약이다. 번호 재사용, type 의미 변경, presence 의미 변경은 proto 파일 diff보다 더 깊게 consumer 호환성을 깨뜨린다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: protobuf field number compatibility, protobuf reserved number, reserved field name, proto3 optional presence, protobuf unknown fields, enum zero default, oneof migration hazard, repeated packed compatibility, map field compatibility, protobuf compatibility gate, old producer old consumer rollout, wire type compatibility\n\n## 먼저 잡을 축\n\nProtobuf schema evolution은 `User.name` 같은 코드 이름을 바꾸는 문제가 아니라 **wire에서 어떤 번호와 어떤 wire type으로 읽히는가**를 유지하는 문제다.\n\n```proto\nmessage User {\n  string name = 1;\n  int32 age = 2;\n}\n```\n\nbinary payload에는 `name`, `age`라는 field name이 직접 들어가지 않는다. tag는 대략 `field_number + wire_type` 조합으로 읽힌다. 그래서 `age = 2`를 지운 뒤 `loyalty_level = 2`로 재사용하면, 오래된 payload나 cache, dead letter, log replay가 새 의미로 잘못 해석될 수 있다.\n\n## 10초 판단표\n\n| 변경 | wire 관점 판단 | 확인할 것 |\n|---|---|---|\n| 새 번호에 optional field 추가 | 대체로 안전한 additive change | old consumer가 무시해도 되는가, new consumer가 absent를 처리하는가 |\n| field name만 변경 | binary wire는 유지될 수 있음 | JSON mapping, reflection, generated API, text format 사용자 영향 |\n| field number 변경 | breaking | old data가 다른 field로 보이거나 unknown이 됨 |\n| field 삭제 뒤 번호 재사용 | 강한 breaking | 삭제한 number와 name을 reserved 했는가 |\n| type 변경 | wire type과 의미에 따라 위험 | 같은 wire type이어도 값 범위, 부호, UTF-8, business 의미 확인 |\n| required 성격 field 추가 | 계약 위험 | old producer가 값을 못 채워도 consumer가 동작하는가 |\n| enum 값 추가 | consumer별 위험 | unknown enum, switch exhaustiveness, DB 저장, JSON gateway 확인 |\n| oneof로 이동 | 단순 refactor 아님 | presence, clearing, generated API, old payload 해석 확인 |\n\n## field number가 wire identity다\n\nProtobuf에서 field number는 database column 이름보다 더 오래 보존해야 하는 식별자에 가깝다. field name은 generated code와 JSON/text mapping에 영향을 주지만, binary wire compatibility의 중심은 number다.\n\n따라서 아래는 서로 다르다.\n\n- `name = 1`을 `display_name = 1`로 rename: binary wire만 보면 같은 번호라서 읽힐 수 있다. 하지만 JSON field name, generated getter/setter, reflection 기반 코드, 문서 계약은 깨질 수 있다.\n- `name = 1`을 `name = 7`로 이동: wire에서는 완전히 다른 field다. old payload의 `1`번은 new schema에서 unknown이 되거나 다른 의미로 읽힌다.\n- `age = 2` 삭제 뒤 `loyalty_level = 2` 추가: 가장 위험하다. old producer가 보낸 `age=30`이 new consumer에서는 `loyalty_level=30`처럼 해석될 수 있다.\n\n번호는 한번 공개된 뒤에는 사실상 회수하지 않는다고 보는 편이 안전하다.\n\n## type과 wire type compatibility\n\nProtobuf type 변경은 단순히 컴파일되는지로 판단하지 않는다. 먼저 wire type이 같거나 parser가 양쪽 encoding을 받아 줄 수 있는지 보고, 그다음 값의 의미가 같은지 본다.\n\n| 변경 축 | 주의점 |\n|---|---|\n| `int32` ↔ `int64`, `uint32` ↔ `uint64` | varint 계열이라 읽힐 수 있어도 old reader의 범위를 넘는 값은 잘리거나 의미가 깨질 수 있다 |\n| `bool` ↔ integer varint | wire type은 비슷해도 business 의미가 거의 항상 깨진다 |\n| `string` ↔ `bytes` | 둘 다 length-delimited지만 `string`은 UTF-8 의미가 있고 JSON 표현도 다르다 |\n| message ↔ `bytes` | length-delimited라도 내부 구조를 잃거나 consumer 해석이 바뀐다 |\n| `fixed32` ↔ `float`, `fixed64` ↔ `double` | 같은 크기 wire라도 numeric 의미가 달라져 위험하다 |\n| scalar ↔ message | 대체로 breaking으로 본다 |\n\n즉 같은 wire type이면 무조건 compatible이라는 규칙은 없다. 호환성 판단은 `old binary payload -> new schema`, `new binary payload -> old schema` 양방향 fixture로 증명해야 한다.\n\n## 삭제 후 reserved number와 name\n\nfield를 삭제했다면 number와 name을 둘 다 막아 둔다.\n\n```proto\nmessage User {\n  reserved 2, 15, 20 to 29;\n  reserved \"age\", \"legacy_status\";\n\n  string name = 1;\n  string email = 3;\n}\n```\n\n- `reserved 2`는 wire number 재사용을 막는다.\n- `reserved \"age\"`는 JSON/text mapping이나 사람이 같은 이름을 다시 쓰는 실수를 줄인다.\n- range reserved는 오래된 실험 field 묶음이나 batch로 제거한 field를 막을 때 유용하다.\n\n삭제는 보통 마지막 단계다. 먼저 reader가 old field 없이도 동작하고, producer가 더 이상 old field를 쓰지 않으며, 저장된 old payload를 replay해도 문제가 없다는 증거가 있어야 한다. 그 뒤 번호와 이름을 reserved로 남긴다.\n\n## unknown fields는 안전망이지 계약이 아니다\n\nold consumer는 모르는 field를 무시할 수 있다. 일부 런타임은 binary parse 후 다시 serialize할 때 unknown field를 보존하기도 한다. 하지만 이 동작을 서비스 계약의 핵심으로 삼으면 위험하다.\n\n확인할 것:\n\n- binary gRPC 경로인지, JSON transcoding이나 gateway를 거치는지\n- 사용하는 language/runtime이 unknown field를 보존하는지\n- message를 읽고 domain DTO로 바꾼 뒤 다시 쓰는 경로에서 unknown이 사라지는지\n- log, cache, queue, dead letter replay가 binary 원본을 유지하는지\n\nunknown field는 forward compatibility를 돕지만, 모든 hop에서 보존된다고 가정하면 안 된다.\n\n## proto3 default, enum zero, optional presence\n\nproto3 scalar field는 기본적으로 값이 없을 때도 default value처럼 보일 수 있다. `int32 count = 1`은 absent와 `0`을 구분하지 못할 수 있고, `bool enabled = 2`는 absent와 `false`가 섞일 수 있다.\n\n구분이 필요하면 다음 중 하나를 검토한다.\n\n- `optional int32 count = 1;`로 presence를 드러낸다.\n- wrapper/message field로 감싼다.\n- business default를 별도 enum이나 상태로 분리한다.\n\nEnum은 특히 0번 값이 중요하다.\n\n```proto\nenum PaymentStatus {\n  PAYMENT_STATUS_UNSPECIFIED = 0;\n  PAYMENT_STATUS_CREATED = 1;\n  PAYMENT_STATUS_PAID = 2;\n}\n```\n\n0번을 실제 business 상태로 쓰면 field 누락과 정상 상태가 섞인다. 새 enum 값을 추가할 때도 old consumer가 unknown enum을 어떻게 다루는지 봐야 한다. generated language, switch/case exhaustive check, DB integer 저장, JSON 문자열 mapping, metrics label이 서로 다르게 깨질 수 있다.\n\n## oneof migration hazard\n\n기존 field를 `oneof` 안으로 옮기는 변경은 단순한 코드 정리가 아니다. wire number가 같아도 generated API, presence, clearing semantics가 바뀐다.\n\n위험한 장면:\n\n- 기존 optional field를 oneof member로 옮기며 setter 호출이 다른 member를 clear한다.\n- old payload에는 여러 후보 field가 같이 들어 있는데 new oneof에서는 마지막 값만 남는 식으로 의미가 바뀐다.\n- oneof case를 보고 분기하던 consumer가 unknown member나 제거된 member를 처리하지 못한다.\n- oneof 밖으로 빼면서 `which case` 정보를 잃는다.\n\noneof는 대체 표현 중 하나만 허용한다는 의미를 wire/API에 얹는 선택이다. 기존 데이터와 consumer가 그 의미를 이미 만족한다는 증거 없이 migration하면 호환성 사고가 난다.\n\n## repeated와 map compatibility\n\n`repeated`는 여러 값을 모으는 계약이다. singular field와 같은 번호를 공유하며 바꾸면 old reader는 마지막 값만 보거나, new reader는 old single value를 길이 1 목록으로 볼 수 있어 보일 수 있다. 하지만 의미가 정말 같은지 별도 판단이 필요하다.\n\n숫자 `repeated` field는 packed encoding도 확인해야 한다. 현대 protobuf parser는 보통 packed/unpacked를 모두 읽게 설계되지만, 오래된 proto2 consumer나 커스텀 decoder가 있으면 호환성 fixture가 필요하다.\n\n`map<K, V>`는 wire상으로는 key/value를 가진 repeated entry message에 가깝다. 그래서 기존 repeated message를 map으로 바꾸면 겉보기 wire가 비슷해도 다음 의미가 달라질 수 있다.\n\n- duplicate key 처리\n- entry ordering\n- missing key/value default\n- generated API type\n- JSON object mapping\n\n반복 구조를 바꿀 때는 `same bytes를 읽을 수 있는가`뿐 아니라 `같은 business 결과가 나오는가`를 테스트해야 한다.\n\n## old producer / old consumer rollout\n\n호환성은 한 번에 최신 버전끼리만 보는 문제가 아니다. 배포 중에는 최소 네 조합이 존재한다.\n\n| producer | consumer | 반드시 봐야 할 것 |\n|---|---|---|\n| old | old | 현행 동작 유지 |\n| old | new | new consumer가 absent/default/old field를 처리하는가 |\n| new | old | old consumer가 새 field, 새 enum, packed/repeated를 무시하거나 안전하게 처리하는가 |\n| new | new | 새 의미가 의도대로 동작하는가 |\n\n안전한 순서는 보통 expand -> migrate -> contract -> reserve다.\n\n1. 새 field는 새 번호로 optional/additive하게 추가한다.\n2. new reader를 먼저 배포해 old/new payload를 모두 읽게 한다.\n3. 필요한 기간 동안 producer가 dual-write하거나 reader가 dual-read한다.\n4. old field 사용량, unknown enum, parse failure, gateway drop을 telemetry로 본다.\n5. old producer가 사라진 뒤 old field read를 제거한다.\n6. 삭제한 number와 name을 reserved한다.\n\n## compatibility gate와 테스트 fixture\n\nrelease gate는 proto 파일 diff만 보는 것으로 끝나면 안 된다. 최소한 아래를 자동화한다.\n\n- descriptor diff에서 field number 변경, number 재사용, unsafe type change, reserved 누락을 막는다.\n- historical binary payload fixture를 new schema로 parse한다.\n- new binary payload fixture를 old consumer로 parse하거나 old consumer가 안전하게 무시하는지 본다.\n- enum zero/default, unknown enum, optional presence, oneof case를 golden fixture로 둔다.\n- JSON transcoding이나 REST gateway가 있으면 JSON field name, default omission, unknown field drop 여부를 별도 fixture로 본다.\n- repeated packed/unpacked와 map duplicate key 같은 경계값을 넣는다.\n\n여기서 중요한 것은 `컴파일된다`가 아니라 `old/new producer-consumer matrix에서 의미가 유지된다`다.\n\n## boundary notes\n\n이 문서는 Protobuf binary/wire schema evolution에 좁혀 둔다.\n\n- JSON Patch의 `add`, `replace`, `remove` operation이나 JSON path 부분 수정 충돌을 설명하는 문서가 아니다.\n- gRPC rich error model의 `ErrorInfo`, `RetryInfo`, `BadRequest` 선택 기준을 설명하는 문서가 아니다. 다만 rich error detail message 자체의 field number도 이 규칙을 따른다.\n- URI version, header version, media type version처럼 일반 API versioning 전략을 고르는 문서가 아니다. 그런 질문은 API compatibility 문서로 넘긴다.\n\n## 한 줄 정리\n\nProtobuf 호환성은 schema text의 모양보다 wire number, wire type, presence, default, rollout matrix의 문제다. 공개된 field number는 재사용하지 말고, 삭제 후 reserved로 막으며, old/new producer와 consumer fixture가 모두 통과할 때만 compatible change라고 부를 수 있다.\n",
   "aliases": [
     "protobuf 호환성",
-    "필드 번호 reserved",
-    "wire 호환성",
-    "Protobuf wire schema evolution 개념",
-    "Protobuf wire schema evolution 정리",
-    "Protobuf schema evolution",
-    "field number reserved",
-    "proto3 optional",
-    "enum zero value",
+    "프로토버프 필드 번호",
+    "필드 번호 재사용 금지",
+    "proto reserved",
+    "reserved number",
+    "reserved field name",
+    "wire type compatibility",
+    "proto3 optional presence",
     "unknown fields",
-    "field number reuse",
-    "protobuf wire schema evolution guide"
+    "enum zero default",
+    "oneof migration",
+    "repeated map compatibility"
   ],
   "expected_queries": [
-    "Protobuf schema evolution에서 field number를 재사용하면 왜 위험해?",
-    "proto field를 제거할 때 reserved number와 reserved name을 왜 남겨야 해?",
-    "Protobuf에서 새 optional field 추가와 required 성격 field 추가는 호환성이 어떻게 달라?",
-    "proto3 enum zero value를 UNSPECIFIED로 두는 이유가 뭐야?",
-    "oneof로 기존 field를 옮기는 변경은 왜 단순 refactor가 아닐 수 있어?",
-    "gRPC Protobuf 계약에서 unknown field와 enum expansion을 어떻게 검증해야 해?"
+    "프로토에서 필드 번호를 바꾸거나 재사용하면 왜 깨져?",
+    "삭제한 proto 필드는 number랑 name을 둘 다 reserved 해야 해?",
+    "int32를 string으로 바꾸거나 repeated로 바꾸면 하위 호환이 돼?",
+    "proto3에서 기본값 0이랑 optional presence는 왜 조심해야 해?",
+    "oneof로 필드를 옮기거나 map으로 바꿀 때 뭐가 위험해?",
+    "old producer랑 old consumer가 섞인 상태에서 protobuf 변경은 어떻게 배포하고 테스트해?"
   ],
   "symptoms": [
     "Protobuf field 이름만 같으면 wire 호환이라고 생각한다",
-    "삭제한 field number를 reserved하지 않아 나중에 다른 의미로 재사용한다",
-    "enum default 0과 unknown enum 처리 정책을 consumer별로 확인하지 않는다"
+    "삭제한 field number를 reserved하지 않아 오래된 payload가 새 의미로 읽힐 수 있다",
+    "proto3 default 0, optional presence, enum unknown 처리를 consumer별로 확인하지 않는다",
+    "oneof, repeated, map 변경을 generated API refactor 정도로만 본다"
   ],
   "relations": {
     "prerequisites": [
@@ -44,20 +45,29 @@
     "confusable_with": [
       "software-engineering/event-schema-versioning",
       "software-engineering/api-versioning-contract-compatibility-perspective-map",
-      "network/grpc-status-trailers-transport-error-mapping"
+      "network/grpc-status-trailers-transport-error-mapping",
+      "network/grpc-rich-error-model-status-details-errorinfo-retryinfo-badrequest"
     ],
-    "forbidden_for_queries": []
+    "forbidden_for_queries": [
+      "JSON Patch add replace remove path operation partial update conflict",
+      "gRPC rich error ErrorInfo RetryInfo BadRequest status details design",
+      "generic REST API versioning URI header media type strategy"
+    ]
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/protobuf-wire-schema-evolution-field-number-reserved-compatibility-rules.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch152"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "round-3-api-contract-backlog"
       }
     ]
   }
