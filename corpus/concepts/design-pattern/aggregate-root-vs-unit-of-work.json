@@ -6,16 +6,18 @@
   "summary": "Aggregate Root는 도메인 일관성 경계를 지키고, Unit of Work는 command 중 발생한 변경을 추적해 transaction commit으로 반영한다.",
   "body_markdown": "# Aggregate Root vs Unit of Work\n\n> 한 줄 요약: Aggregate Root는 도메인 일관성 경계를 지키고, Unit of Work는 command 중 발생한 변경을 추적해 transaction commit으로 반영한다.\n\n**난이도: 🔴 Expert**\n\n> 관련 문서:\n> - [Aggregate Boundary vs Transaction Boundary](./aggregate-boundary-vs-transaction-boundary.md)\n> - [Unit of Work Pattern](./unit-of-work-pattern.md)\n> - [Aggregate Version and Optimistic Concurrency Pattern](./aggregate-version-optimistic-concurrency-pattern.md)\n> - [Aggregate Invariant Guard Pattern](./aggregate-invariant-guard-pattern.md)\n> - [Reference Other Aggregates by ID](./aggregate-reference-by-id.md)\n> - [Ports and Adapters vs GoF 패턴](./ports-and-adapters-vs-classic-patterns.md)\n> - [상태 패턴: 워크플로와 결제 상태를 코드로 모델링하기](./state-pattern-workflow-payment.md)\n> - [CQRS: Command와 Query를 분리하는 패턴 언어](./cqrs-command-query-separation-pattern-language.md)\n\n---\n\n## 핵심 개념\n\n### 문서 역할: Chooser\n\n이 문서는 Aggregate Root와 Unit of Work 중 하나를 고르는 문서가 아니라, 같은 command 처리 흐름 안에서 두 개념을 어느 bucket에 넣어야 하는지 고르는 문서다. Aggregate Root는 도메인 규칙의 진입점이고, Unit of Work는 변경 감지와 commit의 persistence 메커니즘이다.\n\nAggregate Root와 Unit of Work는 서로 다른 레벨의 개념이지만 backend 설계에서 자주 함께 나온다.\n\n- Aggregate Root: 도메인 일관성의 경계\n- Unit of Work: 트랜잭션 단위의 변경 추적\n\n즉 하나는 **무엇이 함께 유효해야 하는가**를, 다른 하나는 **이번 command의 변경을 언제 반영할 것인가**를 다룬다.\n\n### Chooser bucket\n\n| 질문 | 들어갈 bucket | 잘못 넣었을 때 냄새 |\n|---|---|---|\n| 이 상태 전이가 도메인상 가능한가 | Aggregate Root | setter로 값을 바꾸고 service가 뒤늦게 검사한다 |\n| 변경된 객체를 언제 DB에 반영할까 | Unit of Work/ORM | aggregate가 `flush`, `save`를 직접 안다 |\n| 한 command가 어떤 transaction 안에서 실행될까 | Application service/transaction boundary | transaction 범위를 aggregate 크기와 동일시한다 |\n| 여러 aggregate나 외부 정책을 어떻게 조율할까 | Domain/application service | 모든 invariant를 service가 가져가 aggregate가 데이터 보관함이 된다 |\n\n### Retrieval Anchors\n\n- `aggregate root`\n- `aggregate boundary`\n- `domain consistency boundary`\n- `transaction boundary`\n- `aggregate vs transaction boundary`\n- `unit of work relation`\n- `aggregate invariants`\n- `aggregate invariant guard`\n- `aggregate version`\n- `optimistic concurrency`\n\n---\n\n## 깊이 들어가기\n\n### 1. Aggregate Root는 접근 규칙이다\n\nAggregate는 여러 엔티티를 묶는 도메인 경계이고, Root는 외부가 접점으로 삼는 객체다.\n\n- 외부는 root만 통해서 접근한다\n- 내부 엔티티는 root가 보호한다\n- 불변식은 경계 안에서 지켜진다\n\n### 2. Unit of Work는 변경 반영 규칙이다\n\nUnit of Work는 여러 변경을 모아 commit한다.\n\n- dirty checking\n- flush\n- commit\n\n이건 도메인 경계가 아니라 persistence 경계다.\n\n### 3. 둘을 헷갈리면 서비스가 비대해진다\n\nAggregate 규칙을 Unit of Work에 넣거나, 반대로 저장 규칙을 Aggregate에 넣으면 구조가 흐려진다.\n\n구체적인 냄새는 다음과 같다.\n\n- dirty checking을 믿고 aggregate가 public setter만 노출한다.\n- service가 `repository.save()`나 `flush()`를 먼저 호출한 뒤 상태 전이 가능 여부를 검사한다.\n- optimistic lock version을 persistence 세부사항으로만 보고 command 충돌 규칙과 연결하지 않는다.\n- aggregate 내부 entity를 service가 직접 꺼내 수정해 root invariant를 우회한다.\n- cross-aggregate 일관성을 Unit of Work 하나로 즉시 보장하려 해 transaction boundary가 계속 커진다.\n\n### 4. wrong bucket: domain service abuse를 경계한다\n\n둘의 경계를 놓치면 application/domain service가 모든 것을 대신 판단하는 중간층으로 비대해진다. 예를 들어 `OrderService.cancel(order)`가 주문 상태 전이, 재고 정책, repository flush 타이밍까지 모두 결정하면 Aggregate Root는 데이터 보관함이 되고 Unit of Work는 숨은 side effect가 된다.\n\n건강한 흐름은 보통 이렇다.\n\n- command handler/application service: aggregate를 로드하고 transaction boundary를 연다\n- aggregate root: 상태 전이와 invariant를 검증한다\n- unit of work/repository/ORM: 변경된 객체를 추적하고 commit한다\n\n도메인 서비스는 여러 aggregate나 외부 정책을 조율할 때 쓰는 보조 역할이지, aggregate 내부 규칙을 빼앗는 기본 위치가 아니다.\n\n### 운영 정확성 체크\n\nCommit 성공은 도메인 정확성의 증명이 아니다. 다음을 따로 확인해야 한다.\n\n- aggregate method가 실패하면 Unit of Work에 반영할 변경 자체가 만들어지지 않아야 한다.\n- 동시에 들어온 command는 aggregate version이나 compare-and-swap 정책으로 충돌을 드러내야 한다.\n- domain event/outbox record는 aggregate 상태 전이와 같은 transaction에서 일관되게 기록해야 한다.\n- 여러 aggregate를 한 transaction으로 묶는 대신, invariant가 정말 같은 aggregate 안에 있어야 하는지 먼저 되묻는다.\n- read model 갱신이나 projection 저장은 Unit of Work 책임처럼 보이더라도 aggregate invariant를 대신할 수 없다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 Aggregate\n\n주문과 주문 항목처럼 같은 불변식 안에 있는 상태는 root를 통해 변경돼야 한다.\n\n### 시나리오 2: 결제 상태 변경\n\n상태 패턴은 Aggregate 내부의 전이 규칙을 표현하고, Unit of Work는 그 변경을 모아 저장한다.\n\n### 시나리오 3: CQRS 명령 처리\n\n명령은 root를 통해 처리되고, 변경은 Unit of Work로 반영된다.\n\n---\n\n## 코드로 보기\n\n### Aggregate Root\n\n```java\npublic class Order {\n    private final List<OrderLine> lines = new ArrayList<>();\n\n    public void addLine(OrderLine line) {\n        // invariant checks\n        lines.add(line);\n    }\n}\n```\n\n### Unit of Work\n\n```java\n@Transactional\npublic void placeOrder(PlaceOrderCommand command) {\n    Order order = new Order();\n    order.addLine(new OrderLine(command.itemId()));\n    orderRepository.save(order);\n}\n```\n\n### 관계\n\n```java\n// Aggregate Root defines what must stay consistent.\n// Unit of Work defines when the change set is committed.\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Aggregate만 생각 | 도메인 일관성이 선명하다 | 저장 타이밍은 별도로 필요하다 | 도메인 설계 |\n| Unit of Work만 생각 | 트랜잭션이 단순해진다 | 도메인 경계가 흐려진다 | persistence 설계 |\n| 둘을 함께 사용 | 경계와 커밋이 분리된다 | 개념을 혼동하기 쉽다 | DDD 스타일 backend |\n\n판단 기준은 다음과 같다.\n\n- 일관성 규칙은 Aggregate Root\n- 저장 시점과 변경 추적은 Unit of Work\n- 둘을 같은 레이어에 놓지 않는다\n\n---\n\n## 꼬리질문\n\n> Q: Aggregate Root와 Unit of Work를 왜 구분해야 하나요?\n> 의도: 도메인 경계와 persistence 경계를 혼동하지 않는지 확인한다.\n> 핵심: 하나는 규칙, 다른 하나는 커밋이다.\n\n> Q: Aggregate Root 안에 저장 로직이 들어가면 안 되나요?\n> 의도: 관심사 분리를 아는지 확인한다.\n> 핵심: 저장은 persistence 계층 책임이다.\n\n> Q: Unit of Work가 없으면 Aggregate가 깨지나요?\n> 의도: 트랜잭션 관리의 필요성을 보는지 확인한다.\n> 핵심: Aggregate는 남지만 변경 반영이 흩어진다.\n\n## 한 줄 정리\n\nAggregate Root는 도메인 일관성 경계이고, Unit of Work는 그 변경을 하나의 트랜잭션으로 묶는 메커니즘이다.\n",
   "aliases": [
+    "aggregate와 unit of work",
+    "도메인 경계와 커밋 경계",
+    "Aggregate Root vs Unit 개념",
+    "Aggregate Root vs Unit 정리",
+    "Aggregate Root vs Unit 실수",
     "aggregate root vs unit of work",
     "aggregate root",
     "unit of work relation",
     "domain consistency boundary",
     "persistence change tracking",
     "aggregate invariants",
-    "aggregate version",
-    "aggregate와 unit of work",
-    "도메인 경계와 커밋 경계",
-    "@Transactional"
+    "aggregate version"
   ],
   "expected_queries": [
     "Aggregate Root와 Unit of Work는 도메인 일관성 경계와 변경 커밋 경계 관점에서 어떻게 달라?",
@@ -53,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/design-pattern/aggregate-root-vs-unit-of-work.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

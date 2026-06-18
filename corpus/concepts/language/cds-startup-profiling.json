@@ -6,6 +6,11 @@
   "summary": "CDS/AppCDS는 startup profiling에서 class loading과 metadata 비용을 줄이는 수단이며, 진짜 개선 효과를 보려면 cold start와 archive 재사용 여부를 같이 측정해야 한다.",
   "body_markdown": "# CDS Startup Profiling\n\n> 한 줄 요약: CDS/AppCDS는 startup profiling에서 class loading과 metadata 비용을 줄이는 수단이며, 진짜 개선 효과를 보려면 cold start와 archive 재사용 여부를 같이 측정해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Class Data Sharing and AppCDS](./class-data-sharing-appcds.md)\n> - [JFR and JMC Performance Playbook](./jfr-jmc-performance-playbook.md)\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)\n\n> retrieval-anchor-keywords: CDS profiling, startup profiling, cold start, AppCDS, class loading, shared archive, startup latency, footprint, archive reuse, class loading time\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nstartup profiling은 \"왜 처음이 느린가\"를 보는 일이다.  \nCDS/AppCDS는 그중 class loading 비용을 줄이는 대표적 도구다.\n\n핵심은 다음 질문들이다.\n\n- 어떤 class가 처음에 많이 로딩되는가\n- 아카이브가 실제로 재사용되는가\n- JIT warmup과 class loading을 분리해서 보고 있는가\n\n## 깊이 들어가기\n\n### 1. startup 문제는 여러 층이 섞인다\n\nstartup이 느린 이유는 class loading뿐만이 아니다.\n\n- class loading\n- verification\n- static initialization\n- JIT warmup\n- first request path\n\nCDS는 이 중 class loading에 주로 영향을 준다.\n\n### 2. archive reuse를 확인해야 한다\n\nAppCDS를 써도 아카이브가 실제로 reuse되지 않으면 효과가 없다.  \n그래서 startup profiling은 archive 생성 여부와 런타임 옵션을 같이 봐야 한다.\n\n### 3. JFR로 startup phase를 쪼개 본다\n\nJFR은 class loading, compilation, allocation, GC, thread state를 시간축으로 볼 수 있다.  \nstartup profiling과 잘 맞는다.\n\n### 4. warmup과 startup은 다르다\n\nCDS가 좋아져도 warmup이 길면 첫 요청은 여전히 느릴 수 있다.  \n둘을 혼동하면 진단이 틀어진다.\n\n## 실전 시나리오\n\n### 시나리오 1: cold start만 느리다\n\nAppCDS를 적용하고 startup time과 RSS 변화를 함께 본다.  \nclass loading에서 줄어든 시간이 실제 사용자 경험 개선으로 이어지는지 확인한다.\n\n### 시나리오 2: startup은 빨라졌지만 첫 요청이 느리다\n\n이건 JIT warmup이나 lazy init 문제일 수 있다.  \nCDS로 모든 startup 문제를 해결하려 하면 안 된다.\n\n### 시나리오 3: startup profiling 결과가 들쭉날쭉하다\n\nfilesystem cache, container pressure, JVM flags, classpath size가 원인일 수 있다.  \n반복 측정이 필요하다.\n\n## 코드로 보기\n\n### 1. startup 측정 흐름 감각\n\n```bash\njava -Xshare:on -XX:SharedArchiveFile=app-cds.jsa -jar app.jar\n```\n\n### 2. class loading과 JFR 같이 보기\n\n```bash\njava -XX:StartFlightRecording=name=startup,settings=profile,filename=/tmp/startup.jfr -jar app.jar\n```\n\n### 3. 측정 포인트\n\n```java\n// startup latency\n// first request latency\n// class loading count\n// archive reuse 여부\n```\n\n### 4. 운영 체크\n\n```java\n// AppCDS는 \"적용했다\"보다 \"실제로 재사용됐다\"가 중요하다.\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| CDS/AppCDS | class loading startup을 줄인다 | archive 관리가 필요하다 |\n| plain startup | 단순하다 | cold start가 느릴 수 있다 |\n| JFR startup profiling | 원인 분리가 쉽다 | 측정 습관이 필요하다 |\n| lazy init | 초기 비용을 늦춘다 | 첫 요청이 느려질 수 있다 |\n\n핵심은 CDS를 startup profiling의 한 축으로 보고, class loading과 warmup을 분리해서 측정하는 것이다.\n\n## 꼬리질문\n\n> Q: CDS는 어떤 비용을 줄이나요?\n> 핵심: class loading과 metadata 생성 비용의 일부를 줄인다.\n\n> Q: startup profiling에서 가장 중요한 것은 무엇인가요?\n> 핵심: class loading, initialization, JIT warmup을 분리해서 보는 것이다.\n\n> Q: AppCDS가 있는데도 첫 요청이 느릴 수 있나요?\n> 핵심: 그렇다. CDS는 warmup과 downstream I/O 병목을 해결하지 못한다.\n\n## 한 줄 정리\n\nCDS/AppCDS는 startup profiling에서 class loading 비용을 줄이는 수단이고, 효과는 archive 재사용과 warmup 분리를 같이 봐야 제대로 판단할 수 있다.\n",
   "aliases": [
+    "CDS Startup Profiling 개념",
+    "CDS Startup Profiling 정리",
+    "CDS Startup Profiling 실수",
+    "CDS Startup Profiling 판단 기준",
+    "자바 CDS Startup Profiling",
     "CDS startup profiling",
     "AppCDS cold start profiling",
     "Java class loading startup",
@@ -46,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/cds-startup-profiling.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

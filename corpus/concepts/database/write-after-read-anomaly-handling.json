@@ -6,16 +6,18 @@
   "summary": "read를 근거로 write할 때는, 그 read가 이미 stale일 수 있다는 사실을 전제로 다시 검증해야 한다.",
   "body_markdown": "# Write-After-Read Anomaly Handling\n\n> 한 줄 요약: read를 근거로 write할 때는, 그 read가 이미 stale일 수 있다는 사실을 전제로 다시 검증해야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md), [Cache와 Replica가 갈라질 때의 Read Inconsistency](./cache-replica-split-read-inconsistency.md), [Transaction Retry와 Serialization Failure 패턴](./transaction-retry-serialization-failure-patterns.md)\nretrieval-anchor-keywords: write-after-read, stale read, read validate write, read dependency, recheck before write\n\n## 핵심 개념\n\nWrite-after-read anomaly는 읽은 값을 근거로 다시 쓰는 흐름에서, 읽기 시점이 stale이면 잘못된 write가 일어나는 문제다.  \n이건 read-after-write와 반대 방향의 일관성 문제다.\n\n왜 중요한가:\n\n- 읽은 값에 따라 조건부 업데이트를 할 때 자주 생긴다\n- replica나 cache를 읽고 write 결정을 내리면 잘못된 판단이 가능하다\n- “읽었을 때 맞았는데 왜 쓰고 나니 틀렸지?”가 운영에서 자주 나온다\n\n핵심은 읽기 결과를 진실로 믿기 전에 **쓰기 직전 다시 확인**해야 한다는 점이다.\n\n## 깊이 들어가기\n\n### 1. 왜 문제가 생기나\n\n전형적인 흐름은 다음과 같다.\n\n1. 상태를 읽는다\n2. 읽은 값으로 비즈니스 결정을 한다\n3. 그 값을 근거로 write한다\n\n문제는 1번이 stale일 수 있다는 점이다.\n\n- cache가 오래됨\n- replica lag가 있음\n- 다른 트랜잭션이 그 사이 값을 바꿈\n\n### 2. recheck before write\n\n가장 단순한 방어는 write 직전에 다시 검증하는 것이다.\n\n- version token 재확인\n- 최신 row 다시 읽기\n- 조건부 update 사용\n- 비즈니스 불변식 재검증\n\n즉 read는 힌트일 뿐, write는 최종 검증을 거쳐야 한다.\n\n### 3. read dependency를 저장하라\n\n읽은 값이 write의 근거라면, 그 근거의 version을 같이 저장하는 편이 안전하다.\n\n- 어떤 version을 보고 결정을 했는지\n- write 시점에 그 version이 아직 유효한지\n\n이렇게 해야 stale read에 의한 잘못된 결정을 줄일 수 있다.\n\n### 4. write-after-read와 retry\n\nwrite 실패가 났을 때 무조건 같은 결정을 다시 쓰면 안 된다.  \nread를 다시 하고, 필요하면 결정 자체를 바꿔야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 재고를 보고 주문 생성\n\n재고를 읽고 주문을 만들었는데, 그 사이 재고가 줄었을 수 있다.  \nwrite 전에 다시 검증하지 않으면 초과 주문이 생긴다.\n\n### 시나리오 2: 권한을 보고 작업 승인\n\n권한 정보를 읽고 승인했는데, 실제 write 시점에는 권한이 취소됐을 수 있다.  \n이때 read dependency를 다시 확인해야 한다.\n\n### 시나리오 3: cache를 보고 정책 저장\n\n옛 정책을 읽고 새 정책을 저장하면, 최신 변경을 덮어쓸 수 있다.  \nversion check가 필요하다.\n\n## 코드로 보기\n\n```java\nOrderSnapshot snapshot = readCurrentOrThrow(orderId);\nif (snapshot.getVersion() != expectedVersion) {\n    throw new ConcurrentModificationException();\n}\nsaveWithVersion(orderId, snapshot.getVersion());\n```\n\n```sql\nUPDATE stock\nSET amount = amount - 1,\n    version = version + 1\nWHERE sku = 'SKU-1'\n  AND version = 12\n  AND amount > 0;\n```\n\nwrite-after-read 문제는 read를 믿는 순간 시작되므로, **write 직전 재검증이 핵심 방어선**이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| read once then write | 단순하다 | stale read 위험 | 거의 없음 |\n| recheck before write | 안전하다 | 추가 read가 필요하다 | 대부분의 상태 변경 |\n| conditional update | 짧고 강하다 | SQL로 표현해야 한다 | 카운터/재고 |\n| version dependency tracking | 정교하다 | 복잡하다 | 중요 워크플로우 |\n\n## 꼬리질문\n\n> Q: write-after-read anomaly는 왜 위험한가요?\n> 의도: 읽은 값이 stale일 수 있다는 점을 아는지 확인\n> 핵심: 잘못된 read를 근거로 잘못된 write를 하기 때문이다\n\n> Q: write 직전에 다시 확인해야 하는 이유는 무엇인가요?\n> 의도: 최종 검증의 필요성을 아는지 확인\n> 핵심: read 시점과 write 시점 사이에 상태가 바뀔 수 있다\n\n> Q: conditional update가 왜 도움이 되나요?\n> 의도: 저장 시점 충돌 감지를 이해하는지 확인\n> 핵심: version이나 조건이 맞을 때만 write되기 때문이다\n\n## 한 줄 정리\n\nWrite-after-read anomaly는 stale read를 근거로 잘못된 write를 하는 문제이고, write 직전 재검증이나 조건부 update로 막아야 한다.\n",
   "aliases": [
+    "최신 row 재검증",
+    "Write-After-Read Anomaly Handling 개념",
+    "Write-After-Read Anomaly Handling 정리",
+    "Write-After-Read Anomaly Handling 실수",
+    "Write-After-Read Anomaly Handling 판단 기준",
     "write-after-read",
     "stale read",
     "read validate write",
     "read dependency",
     "recheck before write",
     "stale read before write",
-    "write after stale replica read",
-    "conditional update after read",
-    "read dependency version token",
-    "최신 row 재검증"
+    "write after stale replica read"
   ],
   "expected_queries": [
     "write-after-read anomaly는 stale read를 근거로 write할 때 어떤 문제가 생기는 거야?",
@@ -50,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/write-after-read-anomaly-handling.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

@@ -6,15 +6,18 @@
   "summary": "Java 클래스 초기화는 로딩과 별개로 clinit 순서를 가지며, static 필드와 초기화 블록의 순서를 잘못 설계하면 NPE, 순환 초기화, 예상치 못한 side effect가 생긴다.",
   "body_markdown": "# Class Initialization Ordering\n\n> 한 줄 요약: Java 클래스 초기화는 로딩과 별개로 `clinit` 순서를 가지며, static 필드와 초기화 블록의 순서를 잘못 설계하면 NPE, 순환 초기화, 예상치 못한 side effect가 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n> - [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)\n> - [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n> - [Java Agent and Instrumentation Basics](./java-agent-instrumentation-basics.md)\n\n> retrieval-anchor-keywords: class initialization, clinit, static initializer, static field order, initialization-on-demand holder, circular initialization, class loading, initialization lock, constant variable, side effect, bootstrap\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n클래스가 JVM에 보인다고 해서 곧바로 초기화되는 것은 아니다.  \n로드, 링크, 초기화는 다른 단계다.\n\n초기화는 보통 `clinit`에서 일어나며, static field initialization과 static block이 순서대로 실행된다.  \n이 순서가 중요하다.\n\n### 왜 중요한가\n\n- static 필드가 아직 준비되지 않았는데 다른 초기화 코드가 읽을 수 있다\n- 순환 참조가 있으면 초기화 중에 반쯤 만들어진 값을 볼 수 있다\n- side effect가 있으면 class load만으로도 동작이 생긴다\n\n## 깊이 들어가기\n\n### 1. static 초기화 순서를 읽는 법\n\nJava는 선언 순서에 따라 static field와 static block을 초기화한다.  \n즉 앞에서 뒤로 읽으며 값이 들어간다.\n\n그래서 다음 패턴은 위험하다.\n\n- 뒤에서 선언한 static 필드를 앞의 초기화 코드가 읽음\n- static block에서 아직 null인 값을 사용\n- 초기화 중 다른 클래스가 다시 현재 클래스를 건드림\n\n### 2. 순환 초기화는 조용히 깨진다\n\n클래스 A의 초기화가 클래스 B를 부르고, B의 초기화가 다시 A를 부르면 중간 상태를 볼 수 있다.  \n이 문제는 컴파일 에러가 아니라 런타임 초기화 순서 문제다.\n\n### 3. initialization-on-demand holder는 왜 자주 쓰나\n\nholder 패턴은 lazy initialization을 안전하게 하려는 대표적 방법이다.  \n중첩 static holder는 필요할 때만 초기화되므로, 단순 싱글턴에 자주 쓴다.\n\n### 4. constant variable는 특별하다\n\n컴파일 타임 상수는 클래스 초기화 타이밍에 영향을 덜 줄 수 있다.  \n하지만 runtime 계산 값은 그렇지 않다.\n\n## 실전 시나리오\n\n### 시나리오 1: static 필드가 null인데 왜 벌써 쓰이나\n\n초기화 순서가 잘못되면 `null` 참조나 예상 못 한 default 값이 나온다.  \n이런 버그는 재현이 어렵고 부팅 순서에 따라 달라진다.\n\n### 시나리오 2: class loading만으로 로그가 찍힌다\n\nstatic initializer 안에 side effect가 있으면, class reference만 생겨도 외부 호출이 일어날 수 있다.  \n초기화 로직은 가능하면 작고 결정적으로 유지하는 편이 좋다.\n\n### 시나리오 3: 초기화 중 예외가 나서 이후에도 이상하다\n\n클래스 초기화가 실패하면 이후 사용 시 `NoClassDefFoundError`처럼 보일 수 있다.  \n이 경우 원래의 초기화 예외를 먼저 찾아야 한다.\n\n## 코드로 보기\n\n### 1. 선언 순서가 중요한 예\n\n```java\npublic class Config {\n    static final String BASE_URL = initBaseUrl();\n    static final String FULL_URL = BASE_URL + \"/api\";\n\n    private static String initBaseUrl() {\n        return \"https://example.com\";\n    }\n}\n```\n\n### 2. 순환 초기화의 냄새\n\n```java\npublic class A {\n    static final String VALUE = B.VALUE + \"-a\";\n}\n\npublic class B {\n    static final String VALUE = A.VALUE + \"-b\";\n}\n```\n\n### 3. holder 패턴\n\n```java\npublic class Singleton {\n    private Singleton() {}\n\n    private static class Holder {\n        private static final Singleton INSTANCE = new Singleton();\n    }\n\n    public static Singleton getInstance() {\n        return Holder.INSTANCE;\n    }\n}\n```\n\n### 4. 초기화 오류를 볼 때\n\n```java\ntry {\n    Class.forName(\"com.example.SomeClass\");\n} catch (ClassNotFoundException e) {\n    // loading 문제\n}\n```\n\n초기화 실패는 loading 실패와 다르므로 예외 체인을 함께 봐야 한다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| eager static init | 단순하다 | 초기화 비용이 앞당겨진다 |\n| lazy holder | 필요할 때만 만든다 | 초기화 경로가 숨겨진다 |\n| heavy static block | 한곳에 모인다 | 순서와 side effect 문제가 커진다 |\n| explicit factory | 제어가 명확하다 | 코드가 길어진다 |\n\n핵심은 static initialization을 \"편한 곳\"이 아니라 \"부팅 계약\"으로 다루는 것이다.\n\n## 꼬리질문\n\n> Q: class loading과 class initialization은 같은가요?\n> 핵심: 아니다. loading은 클래스를 JVM이 인식하는 단계이고, initialization은 static 초기화가 실제로 실행되는 단계다.\n\n> Q: static field 순서가 왜 중요한가요?\n> 핵심: 선언 순서대로 초기화되므로 앞선 코드가 뒤에 선언된 값을 읽으면 null이나 기본값을 볼 수 있다.\n\n> Q: holder 패턴은 왜 안전한가요?\n> 핵심: 필요할 때만 초기화되고 JVM 초기화 규칙을 이용해 lazy singleton을 만들 수 있기 때문이다.\n\n## 한 줄 정리\n\n클래스 초기화는 로딩과 별개이며, static 선언 순서와 순환 초기화를 제대로 다뤄야 `clinit` 기반 버그를 피할 수 있다.\n",
   "aliases": [
+    "클래스 초기화 순서",
+    "Class Initialization Ordering 개념",
+    "Class Initialization Ordering 정리",
+    "Class Initialization Ordering 실수",
+    "Class Initialization Ordering 판단 기준",
     "Java class initialization ordering",
     "clinit static initializer",
     "static field order",
     "initialization on demand holder",
     "circular class initialization",
     "Java static initialization",
-    "클래스 초기화 순서",
-    "final",
-    "volatile"
+    "final"
   ],
   "expected_queries": [
     "Java class loading과 class initialization은 어떻게 다르고 clinit은 언제 실행돼?",
@@ -48,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/class-initialization-ordering.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

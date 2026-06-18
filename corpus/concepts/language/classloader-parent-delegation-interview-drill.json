@@ -6,12 +6,18 @@
   "summary": "이 drill은 Java ClassLoader parent delegation과 class identity를 면접 답변으로 구성한다.",
   "body_markdown": "# ClassLoader Parent Delegation Interview Drill\n\n## 질문\n\n\"Java ClassLoader의 parent delegation model과 class identity를 설명해 주세요.\"\n\n## 기대 답변 축\n\n- class loading은 class bytecode를 찾아 JVM의 Class 객체로 올리는 과정이다.\n- parent delegation은 먼저 parent loader에게 로드를 위임하고, parent가 못 찾으면 child가 찾는 방식이다.\n- JDK 핵심 클래스가 애플리케이션 클래스에 의해 쉽게 shadowing되는 것을 막고 중복 로딩을 줄인다.\n- JVM에서 class identity는 class name만이 아니라 defining ClassLoader까지 포함한다. 같은 FQCN도 loader가 다르면 다른 type이 될 수 있다.\n- loading, linking, initialization은 한 문장으로 뭉개지 말고 역할을 나눠 말한다. bytecode를 찾는 것, 검증/준비/해결, static initializer 실행은 관찰 시점과 실패 예외가 다르다.\n- child-first나 plugin classloader 같은 예외 패턴은 parent delegation을 \"항상 부모가 최종 결정한다\"로 외운 답변을 깨는 좋은 후속 질문이다.\n- classloader isolation은 namespace와 lifecycle 경계를 만든다. 같은 library version을 application, webapp, plugin별로 분리할 수 있지만, 공유 API를 어느 loader에 둘지 잘못 정하면 같은 FQCN끼리도 cast가 실패한다.\n\n## 운영 관찰 증거\n\n- 같은 라이브러리 class가 container, application, plugin 영역에 중복 배치되면 `ClassCastException`, `LinkageError`, `NoSuchMethodError`처럼 타입 정체성 또는 binary compatibility 문제가 드러날 수 있다.\n- 로그에 찍힌 FQCN이 같아도 `clazz.getClassLoader()` 또는 error stack의 loader 정보를 같이 보지 않으면 원인을 놓칠 수 있다.\n- 재배포 후 classloader가 해제되지 않으면 static cache, thread context classloader, ThreadLocal value, JDBC driver registration 같은 reference chain이 남아 metaspace pressure로 이어질 수 있다.\n- 장애 분석에서는 \"어떤 jar가 먼저 검색됐는가\"뿐 아니라 \"누가 defining loader인가\", \"thread context classloader가 service loading에 개입했는가\"를 같이 확인한다.\n\n## Isolation 경계\n\nclassloader isolation은 단순히 jar 검색 순서를 바꾸는 기능이 아니다. \"어떤 클래스 집합을 같은 타입 세계로 볼 것인가\"와 \"언제 그 타입 세계를 버릴 수 있는가\"를 정하는 경계다.\n\n- web container는 보통 공통 API는 parent 쪽에 두고, 각 webapp 구현과 dependency는 child loader에 둔다. 이렇게 하면 애플리케이션끼리 라이브러리 버전을 다르게 가져갈 수 있다.\n- plugin 시스템은 plugin별 loader를 두어 dependency 충돌을 줄인다. 단, host와 plugin이 주고받는 interface는 공통 parent loader에서 로드되어야 한다. interface 사본이 plugin 안에 같이 들어가면 FQCN이 같아도 host 입장에서는 다른 타입이다.\n- child-first loader는 dependency isolation에는 유리하지만, JDK/core API 일관성이나 보안 경계를 흐릴 수 있어 제한적으로 쓴다. 기본 parent-first 모델을 이해한 뒤 예외로 설명해야 한다.\n- static singleton, cache, thread, ThreadLocal이 child loader의 class나 instance를 붙잡으면 redeploy 뒤에도 loader가 unload되지 않는다. isolation은 lifecycle 분리까지 포함한다.\n\n## 꼬리 질문 대응\n\n- \"왜 위임하나요?\"에는 보안, 핵심 API 일관성, 중복 로딩 감소를 함께 말한다.\n- \"같은 이름인데 왜 cast가 실패하나요?\"에는 class identity가 `(binary name, defining loader)` 조합이라는 점을 답한다.\n- \"로딩과 초기화가 같나요?\"에는 class를 찾고 검증하는 단계와 static 초기화가 실행되는 단계가 다르다고 분리한다.\n- \"모든 Java 런타임이 parent-first인가요?\"에는 기본 모델은 parent delegation이지만 framework나 container가 격리를 위해 변형할 수 있다고 답한다.\n- \"plugin API는 어디에 둬야 하나요?\"에는 host와 plugin이 공유하는 contract는 공통 parent loader에 두고, plugin 내부 구현 dependency는 plugin loader 아래에 격리한다고 답한다.\n\n## 흔한 오해\n\n- ClassLoader를 \"파일을 읽는 객체\"로만 보면 classpath 충돌, module/plugin 격리, hot deploy leak를 설명하지 못한다.\n- parent delegation은 성능 최적화만을 위한 규칙이 아니다. 신뢰할 수 있는 상위 loader의 class를 우선 사용한다는 안전 경계가 중요하다.\n- 같은 FQCN이면 같은 타입이라는 설명은 JVM class identity를 빠뜨린 답변이다.\n- child loader가 parent class를 덮어쓸 수 없다고 단정하면 child-first loader, shading, module layer 같은 현실 사례를 설명하기 어렵다.\n- classloader isolation을 \"완전한 sandbox\"로 단정하면 안 된다. permission model, module boundary, process isolation은 별도 보안 계층이며, classloader는 주로 class namespace와 lifecycle을 나누는 장치다.\n\n## 약점 태그\n\n- `delegation-purpose`: 위임 모델의 보안/일관성 이유를 설명하지 못함\n- `class-identity`: FQCN과 loader가 함께 type identity라는 점을 모름\n- `lifecycle-step`: loading/linking/initialization 단계를 섞음\n- `loader-isolation`: plugin/webapp 경계를 class identity와 lifecycle로 설명하지 못함\n\n## 복습 연결\n\nedge case는 `classloader-delegation-edge-cases`, exception 경계는 `classloader-exception-object-contracts`로 이어진다.\n",
   "aliases": [
-    "ClassLoader parent delegation interview",
     "클래스 로더 위임 면접",
+    "ClassLoader Parent Delegation Interview 개념",
+    "ClassLoader Parent Delegation Interview 정리",
+    "ClassLoader Parent Delegation Interview 실수",
+    "ClassLoader Parent Delegation Interview 판단 기준",
+    "ClassLoader parent delegation interview",
     "JVM class loading answer",
     "class identity drill",
     "classloader isolation answer",
-    "static"
+    "static",
+    "classloader parent delegation interview guide",
+    "classloader parent delegation interview checklist"
   ],
   "expected_queries": [
     "Java ClassLoader parent delegation을 면접에서 어떻게 설명해?",
@@ -42,8 +48,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/classloader-parent-delegation-interview-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "Coordinator는 명확한 유스케이스 흐름을 조율하지만, Manager는 책임이 뭉개질 때 붙는 이름이 되기 쉽다.",
   "body_markdown": "# Coordinator vs Manager Object Smell\n\n> 한 줄 요약: Coordinator는 명확한 유스케이스 흐름을 조율하지만, Manager는 책임이 뭉개질 때 붙는 이름이 되기 쉽다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Saga / Coordinator](./saga-coordinator-pattern-language.md)\n> - [Orchestration vs Choreography Pattern Language](./orchestration-vs-choreography-pattern-language.md)\n> - [Command Handler Pattern](./command-handler-pattern.md)\n> - [God Object / Spaghetti / Golden Hammer](./god-object-spaghetti-golden-hammer.md)\n> - [안티 패턴](./anti-pattern.md)\n\n---\n\n## 핵심 개념\n\nCoordinator는 흐름을 조율하는 역할이 분명하다.  \nManager는 이름만으로는 무엇을 하는지 잘 드러나지 않고, 종종 여러 책임의 쓰레기통이 된다.\n\nbackend에서 자주 보이는 신호는 다음과 같다.\n\n- `OrderManager`\n- `UserManager`\n- `WorkflowManager`\n- `DataManager`\n\n이름이 Manager인데 실제로는 validation, persistence, orchestration, notification을 다 하면 smell이다.\n\n### Retrieval Anchors\n\n- `coordinator vs manager smell`\n- `manager object`\n- `orchestrator responsibility`\n- `vague naming smell`\n- `god service`\n\n## 1차 분기\n\nManager라는 이름 자체가 금지는 아니다. 냄새는 이름이 넓어서 책임이 계속 들어올 때 생긴다.\n\n| 관찰 증상 | 아직 괜찮은 경우 | smell 쪽 |\n|---|---|---|\n| `PlaceOrderCoordinator`가 여러 port를 순서대로 호출한다 | 유스케이스 흐름과 보상/실패 경로만 조율한다 | 할인 정책, 검증 규칙, 저장 세부, 알림 문구까지 판단한다 |\n| `OrderManager`가 있다 | 아주 작은 module-local helper이고 변경 이유가 하나다 | 주문, 결제, 쿠폰, 재고, 통계를 모두 알고 있다 |\n| `WorkflowManager`가 state를 가진다 | process manager로 상태 소유와 timeout 책임이 명시돼 있다 | 임시 flag와 side effect 순서가 메서드 내부에 숨는다 |\n| 이름만 `UseCase`로 바꿨다 | 책임도 command handler, policy, notifier로 갈라졌다 | 이름만 바뀌고 dependency/mock 수와 분기 수가 그대로다 |\n\n### 리뷰에서 볼 증거\n\n- 생성자 인자가 repository, gateway, mapper, validator, publisher, clock, cache처럼 여러 계층을 한꺼번에 가리킨다.\n- 테스트 하나가 manager를 만들기 위해 거의 모든 infrastructure double을 준비한다.\n- public method 이름이 `process`, `handle`, `manage`처럼 도메인 결정을 드러내지 않는다.\n- transaction 안에서 외부 API 호출, event publish, 통계 갱신이 같이 일어난다.\n- 실패 로그가 `OrderManager failed`만 남고 어느 책임에서 실패했는지 분리되지 않는다.\n- 새 정책 추가가 새 policy 추가가 아니라 manager 내부 순서 이해로 시작된다.\n\n---\n\n## 깊이 들어가기\n\n### 1. Coordinator는 목적이 분명하다\n\nCoordinator는 다음 단계 선택과 순서 조정을 책임진다.\n\n- 무엇을 언제 호출할지\n- 실패 시 무엇을 되돌릴지\n- 어떤 조건에서 다음 단계로 갈지\n\n### 2. Manager는 의미가 너무 넓다\n\nManager는 너무 많은 것을 담기 쉽다.\n\n- 상태 변경\n- 외부 호출\n- 쿼리 조립\n- 이벤트 발행\n\n이름만 manager이고 실제로는 god service인 경우가 많다.\n\n### 3. 좋은 이름은 설계를 드러낸다\n\n`PlaceOrderCoordinator`, `RefundOrchestrator`, `BillingPolicyManager`처럼 이름 자체가 역할을 드러내야 한다.\n\n다만 `BillingPolicyManager`도 안전한 이름은 아니다. 실제 책임이 \"billing policy set을 로드하고 선택한다\"면 `BillingPolicyRegistry`나 `BillingPolicySelector`가 더 좁고, \"청구 규칙을 계산한다\"면 `BillingPolicy`가 더 낫다. 이름은 구조를 대신하지 못하고, 구조가 이름을 검증한다.\n\n### 4. Coordinator의 경계\n\nCoordinator가 가져도 되는 책임:\n\n- command를 받아 필요한 collaborator를 순서대로 호출한다.\n- 각 단계의 성공/실패 결과를 보고 다음 단계를 정한다.\n- saga/process라면 timeout, compensation, retry policy의 진입점을 명시한다.\n\nCoordinator가 흡수하면 냄새가 되는 책임:\n\n- 도메인 정책 계산: 할인율, 취소 가능성, 재고 차감 규칙\n- 영속성 세부: SQL 조립, JPA entity graph 선택, pagination query 구성\n- presentation concern: 응답 DTO 문구, HTTP status mapping\n- infrastructure policy: retry backoff 세부, circuit breaker 설정, metric label 설계\n\n### 5. 리팩터링 순서\n\n1. manager의 public method별로 변경 이유를 적는다.\n2. use case flow, domain policy, persistence/query, notification, integration call을 색깔별로 분류한다.\n3. flow만 남긴 얇은 coordinator/use case를 만든다.\n4. 정책 판단은 policy/specification/domain service로 옮기고, 외부 호출은 port로 숨긴다.\n5. transaction boundary와 side effect boundary를 다시 정한다. 특히 commit 전 외부 알림 발송은 별도 event/outbox를 검토한다.\n6. 테스트는 \"coordinator가 순서를 조율한다\"와 \"policy가 결정을 한다\"를 나눠서 쓴다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 생성\n\nOrderManager보다 PlaceOrderCoordinator가 흐름을 더 잘 드러낸다.\n\n### 시나리오 2: 배치 작업\n\n작업 단계가 분명하면 Coordinator가 적합하다.\n\n### 시나리오 3: 이름이 책임을 숨길 때\n\nManager라는 이름은 너무 넓으므로, 유스케이스나 정책 이름으로 바꾸는 편이 낫다.\n\n---\n\n## 코드로 보기\n\n### Coordinator\n\n```java\n@Service\npublic class PlaceOrderCoordinator {\n    private final InventoryPort inventoryPort;\n    private final PaymentPort paymentPort;\n\n    public void place(OrderCommand command) {\n        inventoryPort.reserve(command.items());\n        paymentPort.pay(command.payment());\n    }\n}\n```\n\n### Manager smell\n\n```java\npublic class OrderManager {\n    public void validate() {}\n    public void save() {}\n    public void notifyUsers() {}\n    public void calculateFees() {}\n}\n```\n\n### 개선 방향\n\n```java\npublic class PlaceOrderUseCase { }\npublic class OrderPolicy { }\npublic class OrderNotifier { }\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Coordinator | 흐름이 선명하다 | 너무 커질 수 있다 | 유스케이스 조율 |\n| Manager | 이름이 익숙하다 | 책임이 흐려진다 | 거의 없음 |\n| 분리된 역할 객체 | 읽기 쉽다 | 클래스 수가 늘어난다 | 책임이 여러 개일 때 |\n\n판단 기준은 다음과 같다.\n\n- 조율이면 Coordinator\n- 만능이면 smell\n- 이름으로 책임을 숨기면 다시 쪼갠다\n\n---\n\n## 꼬리질문\n\n> Q: 왜 Manager라는 이름이 냄새가 되기 쉬운가요?\n> 의도: 책임이 넓은 이름의 위험을 아는지 확인한다.\n> 핵심: 역할이 불명확해지기 때문이다.\n\n> Q: Coordinator와 service는 어떻게 다르죠?\n> 의도: 조율과 유스케이스 실행을 구분하는지 확인한다.\n> 핵심: Coordinator는 흐름, service는 작업을 실행한다.\n\n> Q: 이름만 바꾸면 해결되나요?\n> 의도: 명명과 구조를 분리하는지 확인한다.\n> 핵심: 아니다. 책임도 함께 나눠야 한다.\n\n## 한 줄 정리\n\nCoordinator는 명확한 흐름 조율자이고, Manager는 책임이 뭉개질 때 붙는 냄새 이름이 되기 쉽다.\n",
   "aliases": [
+    "manager 객체 냄새",
+    "매니저 클래스 냄새",
+    "Coordinator vs Manager Object 개념",
+    "Coordinator vs Manager Object 정리",
+    "Coordinator vs Manager Object 실수",
     "coordinator vs manager object smell",
     "manager object smell",
     "manager class smell",
     "god service manager",
     "vague naming smell",
     "orchestrator responsibility",
-    "workflow manager smell",
-    "manager 객체 냄새",
-    "매니저 클래스 냄새",
-    "@Service"
+    "workflow manager smell"
   ],
   "expected_queries": [
     "OrderManager 같은 이름이 validation save notification calculate를 모두 품으면 왜 manager object smell이야?",
@@ -52,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/design-pattern/coordinator-vs-manager-object-smell.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

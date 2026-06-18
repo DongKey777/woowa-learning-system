@@ -6,16 +6,18 @@
   "summary": "Retry Policy는 재시도 규칙을 캡슐화하고, Decorator Chain은 호출에 기능을 층층이 덧씌운다. 둘을 섞으면 실패와 부가기능의 경계가 흐려진다.",
   "body_markdown": "# Retry Policy vs Decorator Chain\n\n> 한 줄 요약: Retry Policy는 재시도 규칙을 캡슐화하고, Decorator Chain은 호출에 기능을 층층이 덧씌운다. 둘을 섞으면 실패와 부가기능의 경계가 흐려진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [데코레이터 vs 프록시](./decorator-vs-proxy.md)\n> - [책임 연쇄 패턴: 필터와 인터셉터로 요청 파이프라인 만들기](./chain-of-responsibility-filters-interceptors.md)\n> - [전략 패턴](./strategy-pattern.md)\n> - [안티 패턴](./anti-pattern.md)\n\n---\n\n## 핵심 개념\n\n### 문서 역할: Chooser\n\n이 문서는 retry를 decorator chain 안에 숨길지, 명시적인 failure policy로 둘지 고르는 문서다. 같은 wrapper 코드처럼 보여도 retry는 호출 의미를 바꾸고, logging/metrics/tracing decorator는 관찰과 부가기능을 더할 뿐이다.\n\n재시도는 단순한 부가 기능처럼 보이지만, 실제로는 **실패 정책**이다.  \n그래서 retry는 decorator로만 처리하면 안 되고, 정책 객체로 분리하는 편이 더 안전한 경우가 많다.\n\n- Retry Policy: 언제, 몇 번, 어떤 간격으로 다시 시도할지\n- Decorator Chain: 로깅, 메트릭, 트레이싱, 캐싱 같은 부가 기능 조합\n\n### Retrieval Anchors\n\n- `retry policy object`\n- `decorator chain`\n- `backoff strategy`\n- `idempotent operation`\n- `failure semantics`\n\n---\n\n## 깊이 들어가기\n\n### 1. 재시도는 의미론이 중요하다\n\n재시도는 \"한 번 더 호출\"이 아니다.\n\n- 어떤 예외를 다시 시도할지\n- 멱등성이 보장되는지\n- 지수 백오프를 쓸지\n- 최종 실패 시 무엇을 남길지\n\n이건 정책이다.\n\n### 2. Decorator는 기능, Policy는 결정이다\n\nDecorator는 기능을 추가한다.\n\n- 로깅\n- 인증 헤더 주입\n- 메트릭 수집\n- 압축\n\nRetry는 이와 다르다.\n\n- 실패 유형 판단\n- 재시도 횟수 계산\n- 지연 시간 계산\n- 포기 조건 결정\n\n### 3. 체인에 retry를 넣으면 복잡해진다\n\nDecorator chain 안에 retry가 섞이면 다음이 어려워진다.\n\n- 어느 단계가 몇 번 실행됐는지 추적\n- 중복 side effect 처리\n- 부분 실패와 최종 실패 구분\n\n### 4. retry 전에는 멱등성을 먼저 확인한다\n\n재시도는 실패를 줄이는 장치처럼 보이지만, 멱등성이 없으면 장애를 키울 수 있다.\n\n- 결제 승인 요청을 두 번 보내도 같은 결과로 수렴하는가?\n- 메일이나 알림이 중복 발송되어도 허용되는가?\n- idempotency key나 deduplication window가 있는가?\n- 최종 실패 후 보상/조사가 가능한 evidence가 남는가?\n\n이 질문에 답하지 못하면 decorator든 policy든 retry 자체를 넣기 전에 호출 계약부터 정리해야 한다.\n\nRetry policy가 idempotency를 만들어주지는 않는다. 같은 operation id, idempotency key, request fingerprint를 재시도 attempt 전체에서 유지할 때만 중복 호출을 같은 작업으로 묶을 수 있다. attempt마다 새 키를 만들면 \"재시도\"가 아니라 \"새 작업 여러 개\"가 된다.\n\n### 5. wrong bucket: retry는 관찰 decorator가 아니라 실행 정책이다\n\n`new Metrics(new Logging(new Retry(client)))`처럼 조립할 수 있다는 사실 때문에 retry가 decorator와 같은 bucket으로 보이기 쉽다. 하지만 retry는 내부 delegate를 여러 번 호출할 수 있으므로 결제 승인, 쿠폰 발급, 메일 발송 같은 side effect의 횟수와 의미를 바꾼다.\n\n그래서 retry 위치는 다음을 명시해야 한다.\n\n- 어떤 실패만 transient로 볼 것인가\n- attempt마다 같은 idempotency key를 유지할 것인가\n- 최종 실패를 caller에게 어떤 error로 노출할 것인가\n- decorator 로그/메트릭은 attempt 단위와 operation 단위를 어떻게 구분할 것인가\n\n### 6. timeout은 실패 확정이 아니라 결과 불명확일 수 있다\n\n외부 호출에서 가장 위험한 케이스는 \"실패했다\"가 아니라 \"성공했는지 모른다\"다. 예를 들어 결제 승인 요청이 PG에 도착했고 승인도 끝났지만, 응답을 받기 전에 네트워크 timeout이 날 수 있다.\n\n이때 retry policy는 다음을 구분해야 한다.\n\n- validation error, insufficient balance처럼 재시도해도 의미 없는 실패\n- connection reset, 503, rate limit처럼 transient일 수 있는 실패\n- timeout처럼 성공 여부가 불명확해서 조회/멱등 재시도가 필요한 실패\n\n결과 불명확 상태를 단순 실패로 취급하면 중복 승인이나 중복 발송을 만든다. 그래서 retry는 backoff만의 문제가 아니라 idempotency key, status inquiry, reconciliation까지 이어지는 failure semantics 문제다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 외부 PG 호출\n\n네트워크 오류는 retry policy로 다루고, 호출 전후 로깅은 decorator로 분리하는 편이 좋다.\n\n### 시나리오 2: 메일 발송\n\n메시지 전송은 재시도 정책이 중요하고, 메트릭과 트레이싱은 decorator가 담당하기 좋다.\n\n### 시나리오 3: 파일 업로드\n\n재시도 가능한 예외와 하면 안 되는 예외를 분리해야 한다.\n\n---\n\n## 코드로 보기\n\n### Retry Policy\n\n```java\npublic interface RetryPolicy {\n    boolean canRetry(int attempt, Exception ex);\n    Duration delay(int attempt);\n}\n\npublic class ExponentialBackoffRetryPolicy implements RetryPolicy {\n    @Override\n    public boolean canRetry(int attempt, Exception ex) {\n        return attempt < 3;\n    }\n\n    @Override\n    public Duration delay(int attempt) {\n        return Duration.ofMillis(100L * (1L << attempt));\n    }\n}\n```\n\n### 적용\n\n```java\npublic class PaymentClient {\n    private final RetryPolicy retryPolicy;\n\n    public PaymentResult pay(PaymentRequest request) {\n        int retryAttempt = 0;\n        while (true) {\n            try {\n                return call(request);\n            } catch (RuntimeException ex) {\n                if (!retryPolicy.canRetry(retryAttempt, ex)) {\n                    throw ex;\n                }\n                sleep(retryPolicy.delay(retryAttempt));\n                retryAttempt++;\n            }\n        }\n    }\n}\n```\n\n이 예시에서 `retryAttempt`는 \"같은 operation의 몇 번째 재시도인가\"를 뜻한다. `request`는 attempt마다 새로 만들지 않고 같은 idempotency key를 유지해야 한다. 실제 운영 코드에서는 retry 가능한 예외 분류와 최종 실패 기록도 policy 바깥으로 새지 않게 둔다.\n\n### Decorator\n\n```java\npublic class LoggingPaymentClient implements PaymentPort {\n    private final PaymentPort delegate;\n\n    @Override\n    public PaymentResult pay(PaymentRequest request) {\n        log(request);\n        return delegate.pay(request);\n    }\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Retry Policy | 실패 규칙이 명시적이다 | 구현이 조금 길다 | 호출 실패 의미가 중요할 때 |\n| Decorator Chain | 기능 추가가 쉽다 | 실패 의미가 흐려질 수 있다 | 로깅/메트릭/트레이싱 |\n| 둘을 섞기 | 역할 분리가 좋다 | 조립이 복잡해진다 | 운영 안정성이 중요할 때 |\n\n판단 기준은 다음과 같다.\n\n- 실패 의미를 설계해야 하면 retry policy\n- 기능을 덧붙이는 것이 목적이면 decorator\n- retry를 decorator 내부에 숨기면 추적이 어려워진다\n\n---\n\n## 꼬리질문\n\n> Q: Retry Policy를 decorator로 구현하면 왜 문제가 되나요?\n> 의도: 실패 의미와 기능 추가를 구분하는지 확인한다.\n> 핵심: 재시도는 정책이고 decorator는 기능이라 책임이 다르다.\n\n> Q: Decorator chain에 retry가 들어가면 어떤 위험이 있나요?\n> 의도: 중복 side effect와 추적성 문제를 아는지 확인한다.\n> 핵심: 같은 작업이 여러 번 실행되면서 로그와 부작용이 꼬일 수 있다.\n\n> Q: 멱등성이 왜 중요하죠?\n> 의도: 재시도의 안전 조건을 아는지 확인한다.\n> 핵심: 같은 요청이 다시 실행돼도 결과가 깨지지 않아야 한다.\n\n## 한 줄 정리\n\nRetry Policy는 실패 처리 규칙을 담고, Decorator Chain은 호출에 기능을 쌓는다. 둘을 섞되 역할은 분리해야 한다.\n",
   "aliases": [
+    "재시도 정책",
+    "데코레이터 체인 재시도",
+    "Retry Policy vs Decorator 개념",
+    "Retry Policy vs Decorator 정리",
+    "Retry Policy vs Decorator 실수",
     "retry policy vs decorator chain",
     "retry policy object",
     "decorator chain retry",
     "backoff strategy",
     "retry decorator",
     "idempotent retry policy",
-    "failure semantics",
-    "retry chain smell",
-    "재시도 정책",
-    "데코레이터 체인 재시도"
+    "failure semantics"
   ],
   "expected_queries": [
     "Retry Policy와 Decorator Chain은 실패 의미와 부가기능 조합 관점에서 어떻게 달라?",
@@ -52,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/design-pattern/retry-policy-vs-decorator-chain.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

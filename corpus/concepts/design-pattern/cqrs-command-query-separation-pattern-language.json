@@ -6,18 +6,18 @@
   "summary": "CQRS는 쓰기와 읽기의 관심사를 분리해, 명령은 상태 변경에 집중하고 조회는 읽기 최적화 모델에 집중하게 만든다.",
   "body_markdown": "# CQRS: Command와 Query를 분리하는 패턴 언어\n\n> 한 줄 요약: CQRS는 쓰기와 읽기의 관심사를 분리해, 명령은 상태 변경에 집중하고 조회는 읽기 최적화 모델에 집중하게 만든다.\n\n**난이도: 🔴 Expert**\n\n> 관련 문서:\n> - [Command Pattern, Undo, Queue](./command-pattern-undo-queue.md)\n> - [Specification Pattern](./specification-pattern.md)\n> - [Repository Boundary: Aggregate Persistence vs Read Model](./repository-boundary-aggregate-vs-read-model.md)\n> - [Read Model Staleness and Read-Your-Writes](./read-model-staleness-read-your-writes.md)\n> - [Projection Rebuild, Backfill, and Cutover Pattern](./projection-rebuild-backfill-cutover-pattern.md)\n> - [옵저버, Pub/Sub, ApplicationEvent](./observer-pubsub-application-events.md)\n> - [Ports and Adapters vs GoF 패턴](./ports-and-adapters-vs-classic-patterns.md)\n> - [Saga / Coordinator](./saga-coordinator-pattern-language.md)\n\n---\n\n## 핵심 개념\n\n### 문서 역할: Chooser\n\n이 문서는 CQRS를 \"DB를 둘로 나눌까\"로 시작하지 않고, command model과 query/read model의 책임을 어디까지 분리할지 고르는 문서다. Repository가 복잡한 화면 조회까지 떠안는 순간 CQRS 후보가 된다.\n\nCQRS(Command Query Responsibility Segregation)는 **상태를 바꾸는 책임과 상태를 읽는 책임을 분리**하는 아키텍처/패턴 언어다.  \n많이 오해하지만, CQRS는 반드시 두 개의 DB를 뜻하지 않는다.\n\n핵심은 다음이다.\n\n- Command: 상태를 변경한다\n- Query: 상태를 조회한다\n- 둘의 모델과 최적화 기준은 달라도 된다\n\n### Retrieval Anchors\n\n- `command query separation`\n- `read model`\n- `write model`\n- `projection`\n- `materialized view`\n- `query service boundary`\n- `aggregate persistence boundary`\n- `read your writes`\n- `projection lag`\n- `projection rebuild`\n- `projection cutover`\n\n---\n\n## 깊이 들어가기\n\n### 1. 명령과 조회는 요구사항이 다르다\n\n쓰기 모델은 정합성과 규칙이 중요하다.  \n읽기 모델은 조회 속도와 표현이 중요하다.\n\n둘을 하나의 모델로 억지로 맞추면 다음 문제가 생긴다.\n\n- 조회를 위해 엔티티가 비대해진다\n- 정합성을 위해 화면 편의가 희생된다\n- 복잡한 join과 계산이 쓰기 경로에 들어온다\n\n### 2. CQRS는 분리의 정도를 조절할 수 있다\n\n가벼운 형태는 같은 DB를 공유하면서 코드 구조만 분리할 수 있다.  \n강한 형태는 이벤트 기반으로 읽기 모델을 따로 유지한다.\n\n| 구분 | 가벼운 분리 | 강한 분리 |\n|---|---|---|\n| 저장소 | 동일 DB 가능 | 별도 read model 가능 |\n| 동기성 | 높다 | 비동기 projection이면 eventual consistency |\n| 복잡도 | 낮다 | 높다 |\n\n따라서 \"CQRS를 한다\"는 말만으로 별도 데이터베이스, message broker, event sourcing이 따라오는 것은 아니다. 첫 단계는 command handler와 query service의 책임을 분리하는 것일 수 있고, projection 분리는 조회 부하나 표현 요구가 실제로 커질 때 선택해도 된다.\n\n### 3. CQRS는 이벤트와 자주 연결된다\n\n쓰기 모델이 변경되면 이벤트를 발행하고, 읽기 모델은 그 이벤트를 소비해 projection을 갱신한다.\n이 구조는 응답성과 확장성에 좋지만, 운영 관점에서 추적 지점이 늘어난다.\n\n이벤트를 쓴다고 해서 command transaction과 read model update가 자동으로 원자적이 되는 것은 아니다. 같은 transaction 안에서 read table을 갱신하면 동기 정합성에 가깝고, outbox/relay를 통해 비동기 projection을 갱신하면 read model lag, 중복 이벤트, rebuild 정책을 같이 설계해야 한다.\n\n### 4. wrong bucket: command repository와 read model을 섞지 않는다\n\nCQRS를 도입하지 않은 작은 시스템에서도 command repository와 read model의 bucket은 구분할 수 있다. `OrderRepository`가 aggregate 저장, invariant 중심 재조회, optimistic version check를 담당한다면 command side다. `OrderReadRepository`나 `OrderQueryService`가 관리자 목록, 검색 조건, 집계 DTO를 담당한다면 query side다.\n\n혼동이 생기는 지점은 \"조회도 repository 아닌가?\"라는 질문이다. aggregate repository의 조회는 command를 수행하기 위해 root를 다시 구성하는 조회다. read model 조회는 사용자에게 보여줄 표현을 빠르게 만드는 조회다. 둘은 SQL을 쓴다는 점만 같고, 변경 이유와 계약이 다르다.\n\n### 5. read-your-writes는 제품 요구로 먼저 결정한다\n\n읽기 모델을 비동기 projection으로 분리하면 사용자는 방금 쓴 결과가 즉시 보이지 않을 수 있다. 이것은 구현 버그가 아니라 비동기 CQRS의 기본 trade-off다.\n\n선택지는 보통 세 가지다.\n\n- 같은 transaction에서 필요한 최소 read table을 갱신해 즉시성을 높인다\n- command 응답에서 새 resource id와 accepted 상태를 반환하고, 화면은 pending state를 보여준다\n- read-your-writes가 필수인 화면은 command model 조회나 동기 query path를 따로 둔다\n\nCQRS의 목적은 무조건 eventual consistency를 도입하는 것이 아니라, 쓰기 정합성과 읽기 최적화의 충돌을 명시적으로 설계하는 것이다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 등록과 주문 조회\n\n주문 등록은 검증과 정합성이 중요하고, 주문 조회는 검색 성능과 화면 조합이 중요하다.\n\n### 시나리오 2: 관리자 대시보드\n\n관리자 화면은 여러 테이블을 조합한 읽기 전용 모델이 더 적합하다.\n\n### 시나리오 3: 대용량 상태 집계\n\n주문 수, 결제 완료 건수, 취소율 같은 집계는 읽기 모델로 따로 두면 빠르다.\n\n---\n\n## 코드로 보기\n\n### Command\n\n```java\npublic record PlaceOrderCommand(Long userId, List<Long> itemIds) {}\n\n@Service\npublic class PlaceOrderCommandHandler {\n    private final OrderRepository repository;\n\n    public OrderId handle(PlaceOrderCommand command) {\n        Order order = Order.place(command.userId(), command.itemIds());\n        repository.save(order);\n        return order.getId();\n    }\n}\n```\n\n### Query\n\n```java\npublic record OrderSummary(Long orderId, String status, int totalAmount) {}\n\n@Service\npublic class OrderQueryService {\n    private final OrderReadRepository readRepository;\n\n    public List<OrderSummary> findRecentOrders(Long userId) {\n        return readRepository.findRecentOrders(userId);\n    }\n}\n```\n\n### Projection\n\n```java\n@Component\npublic class OrderProjection {\n    @EventListener\n    public void on(OrderPlacedEvent event) {\n        // read model 갱신\n    }\n}\n```\n\nCommand은 상태를 바꾸고, Query는 읽기 최적화 모델을 조회한다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 단일 모델 | 단순하다 | 읽기/쓰기 요구가 충돌한다 | 작은 시스템 |\n| 코드 분리만 CQRS | 도입 비용이 낮다 | 성능 최적화는 제한적이다 | 분리가 필요하지만 복잡도는 낮출 때 |\n| 읽기 모델 분리 | 조회가 빠르다 | 비동기 projection이면 lag/rebuild/read-your-writes 처리가 필요하다 | 조회 트래픽이나 표현 요구가 큰 시스템 |\n\n판단 기준은 다음과 같다.\n\n- 조회와 쓰기 요구가 크게 다르면 CQRS를 검토한다\n- 읽기 모델이 복잡해지면 동기 read table, query service, 비동기 projection 중 필요한 수준을 고른다\n- 정합성이 강하게 요구되면 단순 분리를 먼저 시도한다\n\n---\n\n## 꼬리질문\n\n> Q: CQRS는 무조건 데이터베이스를 둘로 나누나요?\n> 의도: CQRS의 본질이 저장소 분리가 아니라 책임 분리라는 점을 아는지 확인한다.\n> 핵심: 아니다. 핵심은 command와 query의 관심사 분리다.\n\n> Q: CQRS와 Command 패턴은 같은 건가요?\n> 의도: 이름이 비슷한 패턴을 같은 레벨로 보지 않는지 확인한다.\n> 핵심: Command 패턴은 요청 캡슐화이고, CQRS는 쓰기/읽기 분리다.\n\n> Q: CQRS를 쓰면 항상 더 좋아지나요?\n> 의도: 구조를 늘리는 대가를 이해하는지 확인한다.\n> 핵심: 아니다. 운영 복잡도와 eventual consistency 비용이 따라온다.\n\n## 한 줄 정리\n\nCQRS는 명령과 조회를 분리해 쓰기 정합성과 읽기 최적화를 각각 다루게 하는 패턴 언어다.\n",
   "aliases": [
+    "명령 조회 책임 분리",
+    "읽기 모델 쓰기 모델",
+    "CQRS: Command Query Responsibility 개념",
+    "CQRS: Command Query Responsibility 정리",
+    "CQRS: Command Query Responsibility 실수",
     "CQRS",
     "command query responsibility segregation",
     "command query separation",
     "read model",
     "write model",
     "projection",
-    "materialized view",
-    "query service boundary",
-    "명령 조회 책임 분리",
-    "읽기 모델 쓰기 모델",
-    "@Component",
-    "@EventListener"
+    "materialized view"
   ],
   "expected_queries": [
     "CQRS는 command와 query 책임 분리이지 반드시 DB를 둘로 나누는 뜻이 아닌 이유가 뭐야?",
@@ -57,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-31",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/design-pattern/cqrs-command-query-separation-pattern-language.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

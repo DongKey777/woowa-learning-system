@@ -6,16 +6,18 @@
   "summary": "Builder는 객체를 안전하게 조립하는 도구지만, fluent setter가 기존 객체를 바꾸기 시작하면 결국 mutable mutation smell이 된다.",
   "body_markdown": "# Builder vs Fluent Mutation Smell\n\n> 한 줄 요약: Builder는 객체를 안전하게 조립하는 도구지만, fluent setter가 기존 객체를 바꾸기 시작하면 결국 mutable mutation smell이 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [빌더 패턴](./builder-pattern.md)\n> - [Immutable Builder and Wither Patterns](./immutable-builder-wither-patterns.md)\n> - [Composition over Inheritance](./composition-over-inheritance-practical.md)\n> - [안티 패턴](./anti-pattern.md)\n\n---\n\n## 핵심 개념\n\nBuilder는 복잡한 객체를 단계적으로 만드는 패턴이다.  \n문제는 \"builder처럼 보이지만 실제로는 객체를 계속 수정하는 fluent API\"가 등장할 때다.\n\n이때 코드는 빌더가 아니라 **mutating fluent API**가 된다.\n\n- `setX().setY().setZ()`처럼 계속 바뀐다\n- 중간 상태가 외부로 노출된다\n- build 시점 이전에도 객체 상태가 흔들린다\n\n## 관찰 증거\n\n리뷰에서 다음 증거를 먼저 찾는다.\n\n- 메서드가 `return this`를 하면서 domain object field를 직접 바꾼다.\n- `build()`가 없거나, 있어도 이미 같은 객체가 외부에 노출되어 있다.\n- 체인 중간의 객체가 유효하지 않은 상태로 다른 메서드에 전달될 수 있다.\n- 호출 순서를 바꾸면 validation 결과나 최종 값이 달라진다.\n- 테스트 helper로 시작한 fluent setter가 production domain API에 들어와 있다.\n\n## 1차 분기\n\n| 관찰 | 1차 판단 | 다음 확인 |\n|---|---|---|\n| 별도 `Builder` 객체가 값을 모으고 `build()`에서 final 객체를 만든다 | Builder 후보 | build 시 invariant가 한 번에 검증되는지 본다 |\n| domain 객체 자신의 method가 field를 바꾸고 `this`를 반환한다 | fluent mutation smell | 중간 상태 노출과 호출 순서 의존성을 찾는다 |\n| `withX()`가 새 객체를 반환한다 | Wither 후보 | 원본이 보존되고 collection이 방어 복사되는지 본다 |\n| `toBuilder()`가 기존 값을 복사해 builder를 만든다 | copy-based update 후보 | domain command 우회 통로가 아닌지 본다 |\n\n## 다음 확인\n\n- 체인 중간 객체를 변수에 담아도 invariant가 깨지지 않는가?\n- `withX`/`toBuilder` 결과와 원본을 비교하는 테스트가 있는가?\n- mutable fluent API가 꼭 필요하다면 package-private test fixture나 builder 내부로 제한할 수 있는가?\n- domain 상태 전이는 fluent setter가 아니라 의미 있는 command method로 표현되어야 하지 않는가?\n\n### Retrieval Anchors\n\n- `builder vs fluent mutation`\n- `mutable fluent api`\n- `chainable setters`\n- `mutation smell`\n- `immutable construction`\n\n---\n\n## 깊이 들어가기\n\n### 1. Builder는 조립이고 fluent mutation은 변경이다\n\nBuilder의 핵심은 최종 객체를 한 번에 완성하는 것이다.  \n반면 fluent mutation은 메서드 체이닝을 이용해 기존 객체를 바꾼다.\n\n둘은 문법이 비슷해 보여도 의미가 다르다.\n\n### 2. 왜 smell이 되는가\n\nfluent setter가 mutable 객체를 다루면 다음 문제가 생긴다.\n\n- 호출 순서 의존성이 생긴다\n- 중간 객체 상태가 모호해진다\n- 테스트가 깨지기 쉽다\n- 체이닝이 읽기 좋다는 착각이 생긴다\n\n### 3. toBuilder와 wither는 괜찮다\n\n기존 객체를 바탕으로 새 객체를 만드는 `toBuilder()`와 `withX()`는 안전한 편이다.  \n문제는 기존 객체를 직접 바꾸는 fluent mutation이다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 요청 DTO 조립\n\n옵션이 많으면 builder가 적합하다.  \n하지만 내부 setter 체인이 mutable 객체를 바꾸면 smell이다.\n\n### 시나리오 2: 설정 객체 업데이트\n\n설정 변경이 필요하면 새 객체를 만드는 방식이 더 안전하다.\n\n### 시나리오 3: 테스트 헬퍼\n\n테스트에서만 쓰는 fluent helper가 실제 도메인 API로 퍼지면 경계가 무너진다.\n\n---\n\n## 코드로 보기\n\n### Bad: fluent mutation\n\n```java\npublic class OrderConfig {\n    private String couponCode;\n\n    public OrderConfig couponCode(String couponCode) {\n        this.couponCode = couponCode;\n        return this;\n    }\n}\n```\n\n### Better: immutable builder\n\n```java\npublic class OrderConfig {\n    private final String couponCode;\n\n    private OrderConfig(Builder builder) {\n        this.couponCode = builder.couponCode;\n    }\n}\n```\n\n### Wither 대안\n\n```java\npublic OrderConfig withCouponCode(String couponCode) {\n    return new OrderConfig(couponCode);\n}\n```\n\nBuilder처럼 보이지만 mutable setter면 결국 변경 API다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| mutable fluent API | 호출이 짧다 | 상태가 불안정하다 | 아주 단순한 내부 코드 |\n| Builder | 조립 의도가 드러난다 | 클래스가 늘어난다 | 복잡한 생성 |\n| Wither | 불변성을 유지한다 | 객체 복사가 발생한다 | 부분 수정 |\n\n판단 기준은 다음과 같다.\n\n- 객체를 \"만드는지\" \"바꾸는지\"를 먼저 구분한다\n- 체인이 길다고 Builder는 아니다\n- 불변 객체면 builder/wither가 더 안전하다\n\n---\n\n## 꼬리질문\n\n> Q: fluent API와 builder는 같은 건가요?\n> 의도: 문법만 보고 구조를 오해하지 않는지 확인한다.\n> 핵심: 아니다. fluent API는 스타일이고 builder는 의도다.\n\n> Q: mutable fluent API가 왜 위험한가요?\n> 의도: 체이닝의 편의와 상태 변경의 위험을 구분하는지 확인한다.\n> 핵심: 중간 상태가 계속 바뀌어 예측이 어려워진다.\n\n> Q: toBuilder는 왜 괜찮다고 하나요?\n> 의도: 복사 기반 수정과 직접 변경을 구분하는지 확인한다.\n> 핵심: 기존 객체를 유지하면서 새 객체를 만든다.\n\n## 한 줄 정리\n\nBuilder처럼 보이지만 실제로는 객체를 바꾸는 fluent API는 mutation smell일 가능성이 높다.\n",
   "aliases": [
+    "Builder vs Fluent Mutation 개념",
+    "Builder vs Fluent Mutation 정리",
+    "Builder vs Fluent Mutation 실수",
+    "Builder vs Fluent Mutation 판단 기준",
+    "디자인패턴 Builder vs Fluent Mutation",
     "builder vs fluent mutation",
     "mutable fluent api",
     "chainable setters",
     "mutation smell",
     "immutable construction",
     "fluent setter smell",
-    "builder smell",
-    "toBuilder wither",
-    "fluent api vs builder",
-    "mutable builder misuse"
+    "builder smell"
   ],
   "expected_queries": [
     "Builder와 fluent mutation은 문법은 비슷하지만 객체를 만드는지 기존 객체를 바꾸는지 어떻게 달라?",
@@ -52,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/design-pattern/builder-vs-fluent-mutation-smell.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
+      }
+    ]
   }
 }

@@ -6,15 +6,18 @@
   "summary": "이 문서는 ClassLoader loading boundary, exception design boundary, equals/hashCode/compareTo object contract를 하나의 Java boundary model로 묶는 advanced deep dive다.",
   "body_markdown": "# ClassLoader, Exception 경계, 객체 계약\n\n> 한 줄 요약: ClassLoader는 로딩 경계, Exception 설계는 실패 경계, equals/hashCode/compareTo는 객체 계약을 정하는 도구다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Language README](../README.md)\n> - [자바 언어의 구조와 기본 문법](./java-language-basics.md)\n> - [ClassLoader Delegation Edge Cases](./classloader-delegation-edge-cases.md)\n> - [Java Module System Runtime Boundaries](./java-module-system-runtime-boundaries.md)\n> - [Java Binary Compatibility and Runtime Linkage Errors](./java-binary-compatibility-linkage-errors.md)\n> - [Class Initialization Ordering](./class-initialization-ordering.md)\n> - [Serialization Compatibility and `serialVersionUID`](./serialization-compatibility-serial-version-uid.md)\n> - [Record Serialization Evolution](./record-serialization-evolution.md)\n> - [Jcmd Diagnostic Command Cheat Sheet](./jcmd-diagnostic-command-cheatsheet.md)\n> - [Java `equals`, `hashCode`, `Comparable` 계약](../java-equals-hashcode-comparable-contracts.md)\n\n> retrieval-anchor-keywords: ClassLoader, parent delegation, child-first, context class loader, exception design, domain exception, equals, hashCode, compareTo, natural ordering, identity, boundary, loadClass, findClass, compare contract, binary compatibility, LinkageError, NoSuchMethodError, AbstractMethodError\n\n<details>\n<summary>Table of Contents</summary>\n\n- [ClassLoader](#classloader)\n- [Exception 설계](#exception-설계)\n- [equals와 hashCode](#equals와-hashcode)\n- [Comparable과 compareTo](#comparable과-compareto)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## ClassLoader\n\nClassLoader는 클래스를 메모리로 가져오는 객체다.  \n교과서적으로는 \"클래스를 적재한다\"라고 설명하지만, 실무에서는 더 넓게 봐야 한다.\n\n- 어떤 loader가 어떤 클래스를 볼 수 있는가\n- class path / module path / context classloader가 어떻게 다르게 동작하는가\n- parent delegation이 언제 깨지는가\n- class unloading이 언제 일어나는가\n\n대표 계층:\n\n- Bootstrap\n- Platform\n- Application\n\n그리고 보통 parent delegation model로 동작한다.\n\n### 로더가 중요한 이유\n\nclass loading은 단순 I/O가 아니다.\n\n- linkage\n- verification\n- initialization\n- reflection visibility\n- service loading\n- plugin isolation\n\n이 모두가 얽힌다.\n\n### edge case\n\n자세한 예외는 [ClassLoader Delegation Edge Cases](./classloader-delegation-edge-cases.md)에서 다룬다.  \n특히 child-first loader, context classloader, webapp loader는 실무에서 자주 헷갈린다.\n\n그리고 loader 경계는 호환성 문제를 더 늦게 드러낼 수 있다.  \n버전이 섞인 런타임에서 생기는 `NoSuchMethodError`나 `AbstractMethodError`는 [Java Binary Compatibility and Runtime Linkage Errors](./java-binary-compatibility-linkage-errors.md)도 같이 보는 편이 좋다.\n\n## Exception 설계\n\n예외 설계는 \"에러를 던지느냐 마느냐\"가 아니라 **실패를 어디까지 의미 있게 표현하느냐**의 문제다.\n\n### 핵심 질문\n\n- 누구의 책임인지\n- 다시 시도 가능한지\n- 사용자에게 보여줄 메시지인지\n- 시스템 장애로 번질지\n- checked / unchecked 중 무엇이 더 적합한지\n\n### 도메인 예외와 인프라 예외\n\n- 도메인 규칙 위반: `IllegalArgumentException` 또는 domain-specific exception\n- 외부 시스템 실패: DB, IO, network failure\n\n둘을 섞으면 호출자가 복구 가능한 실패와 불가능한 실패를 구분하기 어렵다.\n\n### 예외가 계약이 되는 순간\n\n예외는 문서보다 강한 계약이 될 수 있다.  \n특히 public API나 service boundary에서는 예외 타입이 곧 behavior contract다.\n\n## equals와 hashCode\n\n이 문서에서는 객체 계약을 \"경계\" 관점으로만 짧게 본다.\n\n- `equals`는 두 객체를 논리적으로 같은 값으로 볼지 정한다.\n- `hashCode`는 해시 기반 컬렉션이 그 동등성을 빠르게 찾도록 돕는다.\n- mutable field, 상속 계층, JPA 엔티티 식별자처럼 **시간에 따라 의미가 변하는 값**이 특히 위험하다.\n\n즉 \"같아 보이는 객체\"를 코드가 어떻게 정의하는지가 `HashMap`, `HashSet`, 캐시 키, 중복 제거의 correctness를 직접 좌우한다.  \n구체적인 컬렉션 함정과 `BigDecimal`, JPA 엔티티 사례는 [Java `equals`, `hashCode`, `Comparable` 계약](../java-equals-hashcode-comparable-contracts.md)에서 더 자세히 다룬다.\n\n## Comparable과 compareTo\n\n`Comparable`은 natural ordering을 정의한다.  \n이 값은 단순 정렬 편의가 아니라, `TreeSet`/`TreeMap`이 중복과 위치를 판단하는 기준이 된다.\n\n- `compareTo == 0`과 `equals == true`는 강제적으로 같지 않아도 되지만, 실무에서는 일관되게 맞추는 편이 안전하다.\n- 정렬 컬렉션과 해시 컬렉션에 동시에 들어가는 타입은 특히 더 그렇다.\n- 상세 사례는 [Java `equals`, `hashCode`, `Comparable` 계약](../java-equals-hashcode-comparable-contracts.md)에서 이어서 보면 된다.\n\n## 실전 시나리오\n\n### 시나리오 1: 같은 이름의 클래스가 두 버전으로 보인다\n\nClassLoader 경계 문제를 의심한다.  \nwebapp, plugin, reflection, module boundary를 함께 봐야 한다.\n\n### 시나리오 2: 예외가 너무 많아 원인을 못 찾는다\n\n도메인 예외와 인프라 예외를 분리하지 않았을 가능성이 크다.  \n`try-with-resources`와 suppressed exception도 같이 봐야 한다.\n\n## 코드로 보기\n\n### 1. domain exception\n\n```java\npublic class InsufficientBalanceException extends RuntimeException {\n    public InsufficientBalanceException(String message) {\n        super(message);\n    }\n}\n```\n\n### 2. ClassLoader 진단 흐름\n\n```bash\njcmd <pid> VM.classloader_stats\njcmd <pid> Thread.print\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| 명시적 domain exception | 실패 의미가 분명하다 | 예외 타입이 많아질 수 있다 |\n| checked exception | 호출자가 처리 경로를 고민한다 | API가 장황해질 수 있다 |\n\n핵심은 세 주제를 따로 외우는 게 아니라 \"경계와 계약\"이라는 공통 축으로 읽는 것이다.\n\n## 꼬리질문\n\n> Q: ClassLoader는 왜 필요한가요?\n> 핵심: 클래스를 동적으로 로드하고 격리/재사용 경계를 만들기 위해서다.\n\n> Q: domain exception과 infrastructure exception을 왜 나누나요?\n> 핵심: 호출자가 복구 가능한 실패와 시스템 실패를 구분해야 하기 때문이다.\n\n## 한 줄 정리\n\nClassLoader, 예외 설계, equals/hashCode/compareTo는 각각 로딩, 실패, 객체 의미의 경계를 정의하고, 실무에서는 이 세 경계를 함께 설계해야 한다.\n",
   "aliases": [
+    "ClassLoader 객체 계약",
+    "ClassLoader, Exception Boundaries, and 개념",
+    "ClassLoader, Exception Boundaries, and 정리",
+    "ClassLoader, Exception Boundaries, and 실수",
+    "ClassLoader, Exception Boundaries, and 판단 기준",
     "ClassLoader exception object contracts",
     "Java exception boundary",
     "equals hashCode compareTo contract boundary",
     "LinkageError NoSuchMethodError",
     "domain exception design",
-    "ClassLoader 객체 계약",
     "Reflection",
-    "record",
-    "try-with-resources"
+    "record"
   ],
   "expected_queries": [
     "ClassLoader 경계, exception 설계, equals hashCode compareTo를 boundary contract로 같이 설명해줘",
@@ -50,7 +53,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/classloader-exception-boundaries-object-contracts.md",
     "revision_history": [
       {
@@ -60,6 +63,10 @@
       {
         "date": "2026-05-28",
         "source": "relation-prereq-placeholder-removal"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch157"
       }
     ]
   }
