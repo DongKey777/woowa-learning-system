@@ -6,15 +6,19 @@
   "summary": "이 drill은 파일 저장 시스템 설계 면접에서 presigned URL, object storage, metadata, CDN을 답변한다.",
   "body_markdown": "# File Storage Presigned URL Interview Drill\n\n## 질문\n\n\"대용량 파일 업로드와 다운로드를 지원하는 파일 저장 시스템을 설계해 보세요.\"\n\n## 기대 답변 축\n\nBinary object와 metadata를 분리한다. 실제 파일은 object storage에 두고, owner, size, content type, status, object key 같은 metadata는 DB에 저장한다.\n\nUpload는 application server가 presigned URL을 발급하고 client가 object storage로 직접 올리는 흐름이 일반적이다. 이렇게 하면 app server의 bandwidth와 memory 부담을 줄일 수 있다.\n\nDownload는 권한 확인 후 signed URL을 발급하거나, 공개 asset은 CDN을 통해 serve한다. Private file이면 URL TTL, scope, revocation 한계를 같이 말한다.\n\n## 약점 태그\n\n`object-vs-metadata`, `direct-upload`, `signed-url-ttl`, `cdn-cache`, `upload-status-contract`, `wrong-bucket`\n\n## 흔한 오답\n\n파일을 DB BLOB으로 모두 저장한다고 답하면 작은 규모에서는 가능해도 scale, backup, CDN, streaming 측면에서 trade-off가 크다. 면접에서는 object storage와 metadata DB를 나누는 이유를 설명해야 한다.\n\n## 핵심 요구사항\n\n- 큰 파일을 application server를 거치지 않고 안정적으로 업로드/다운로드한다.\n- 파일 owner, 권한, content type, size, checksum, scan status 같은 metadata를 관리한다.\n- private file과 public asset의 접근 제어, URL TTL, CDN cache 정책을 분리한다.\n- 업로드 실패, 부분 업로드, 바이러스 검사, 이미지 변환 같은 비동기 처리를 수용한다.\n- presigned URL이 허용하는 bucket/key/method/content 조건과 metadata 상태 전이를 명확히 제한한다.\n\n## 정확한 보장 범위\n\nPresigned URL은 \"짧은 시간 동안 특정 object operation을 수행할 권한\"을 위임할 뿐, 파일이 서비스에서 사용 가능하다는 보장이 아니다. 업로드 가능 보장은 URL scope, TTL, method, bucket/key, content length/type 조건까지이고, 서비스 노출 보장은 finalize API가 object existence, size, checksum, owner/session을 검증한 뒤 metadata status를 바꿀 때 생긴다.\n\nObject storage와 metadata DB는 원자적으로 묶이지 않는다. 그래서 object만 있고 metadata가 없는 orphan, metadata는 `initiated`인데 object가 없는 stale session, object는 uploaded 됐지만 scan이 끝나지 않은 quarantine 상태가 정상적으로 발생할 수 있다. 설계는 이 중간 상태를 숨기지 말고 status contract로 다룬다.\n\nDownload 권한도 URL 발급 시점의 권한이다. 짧은 TTL signed URL은 회수 지연을 줄이지만 이미 발급된 URL을 즉시 무효화하기 어렵다. Public CDN asset은 빠르지만 purge/TTL 전까지 오래 남을 수 있으므로 private file과 섞으면 안 된다.\n\n## Status/Idempotency Contract\n\nUpload flow는 `initiated -> uploading -> uploaded -> scanning -> available` 또는 `rejected/expired`처럼 둔다. `initiate`는 `upload_session_id`, expected size/type/checksum, object key, presigned URL을 반환한다. 같은 client retry는 같은 `upload_session_id` 또는 idempotency key로 기존 session을 반환하게 한다.\n\n`finalize`는 object storage의 head/checksum을 확인하고 expected metadata와 다르면 `rejected` 또는 `400/409`로 종료한다. 같은 finalize 재시도는 이미 `available`이면 같은 file id와 metadata를 반환해야 한다. Scan이나 thumbnail 생성은 비동기라 `uploaded/scanning` 상태에서는 다운로드를 막거나 제한된 preview만 허용한다.\n\nObject key는 server가 발급하고 tenant/user prefix, random id, immutable version을 포함한다. Client가 임의 key를 고르게 두면 overwrite, path traversal 성격의 key collision, 다른 tenant bucket/key 오염이 생긴다.\n\n## 데이터/트래픽 모델\n\n핵심 entity는 `FileObject`, `ObjectKey`, `UploadSession`, `MetadataRecord`, `AccessPolicy`, `DerivedAsset`이다. Binary는 object storage에 저장하고, DB에는 owner, bucket/key, status, checksum, visibility, created_at을 저장한다.\n\n트래픽은 upload bandwidth와 download bandwidth가 app server를 압도할 수 있다. Presigned upload URL은 client가 object storage로 직접 PUT하게 하고, metadata finalize API는 업로드 완료 후 checksum과 object existence를 확인한다. Download hot asset은 CDN을 탄다.\n\n## Consistency/Latency Trade-off\n\nUpload URL을 먼저 발급하면 binary object가 metadata보다 먼저 생기거나, metadata만 있고 object가 없는 orphan 상태가 생길 수 있다. 따라서 `initiated`, `uploaded`, `available`, `rejected` 같은 상태와 cleanup job이 필요하다.\n\nPrivate download는 매번 권한 확인 후 짧은 TTL signed URL을 발급하면 안전하지만 latency와 origin 부담이 늘어난다. CDN cache를 길게 두면 빠르지만 revocation과 권한 변경 반영이 어렵다.\n\n## 실패 반례\n\n- app server가 multipart file을 전부 memory에 받아 대용량 업로드에서 OOM이 난다.\n- presigned URL TTL과 scope가 너무 넓어 다른 사용자가 재사용할 수 있다.\n- metadata를 `available`로 바꾸기 전에 object existence/checksum을 확인하지 않아 깨진 파일이 노출된다.\n- private file을 public CDN URL로 cache해 권한 회수가 불가능해진다.\n- presigned URL이 bucket/key prefix를 제한하지 않아 다른 tenant 경로에 업로드된다.\n- upload session은 만료됐지만 object cleanup이 없어 orphan object storage 비용이 계속 증가한다.\n- image transform worker가 원본 scan 완료 전에 public derivative를 만들어 악성 파일이 노출된다.\n\n## 운영 지표\n\n- `upload_initiate_to_finalize_p95`: URL 발급부터 finalize 성공까지의 지연.\n- `finalize_checksum_mismatch_count`: checksum/size/content-type 검증 실패 수.\n- `orphan_object_count`: metadata 없이 남은 object 또는 expired session object 수.\n- `scan_backlog_age`: scan queue의 가장 오래된 item age.\n- `signed_url_denied_count`: 만료, scope mismatch, content 조건 위반으로 거절된 요청 수.\n- `cdn_hit_ratio`: public asset CDN hit 비율.\n- `private_url_leak_signal`: 비정상 referer/IP/user-agent에서 같은 signed URL이 반복 사용된 수.\n\n## Wrong Bucket\n\n- Presigned URL을 인증 시스템 자체로 보면 wrong bucket이다. 인증/인가 판단은 application server가 하고, URL은 제한된 object operation 위임이다.\n- 파일 저장을 DB BLOB 선택 문제로만 답하면 wrong bucket이다. 큰 파일은 object storage, 검색/권한/상태는 metadata DB, 배포는 CDN/cache 문제로 나뉜다.\n- Upload 성공과 서비스 노출을 같은 상태로 보면 wrong bucket이다. `uploaded`와 `available` 사이에는 checksum, scan, transform, policy 검증이 있다.\n- Private file을 CDN cache 최적화 문제로 먼저 풀면 wrong bucket이다. 권한 회수와 TTL/purge 한계를 먼저 분리해야 한다.\n\n## 면접 답변 Skeleton\n\n1. \"Binary object와 metadata DB를 분리하고, app server는 권한 확인과 URL 발급을 담당합니다.\"\n2. \"Upload는 server가 발급한 bucket/key/method/content 조건의 presigned URL로 직접 올리고, finalize 단계에서 checksum과 size를 검증합니다.\"\n3. \"Metadata status는 initiated, uploaded, scanning, available, rejected, expired로 나누어 중간 상태를 명시합니다.\"\n4. \"Download는 private이면 짧은 TTL signed URL, public이면 CDN을 사용하되 revocation 한계를 설명합니다.\"\n5. \"Scan/thumbnail/transcode는 비동기 pipeline으로 처리하고 metadata status로 노출을 제어합니다.\"\n6. \"metric은 finalize latency, checksum mismatch, orphan object, signed URL denied, CDN hit ratio, scan backlog입니다.\"\n\n## 복습 연결\n\nMetadata 모델은 `object-metadata-service-design`, 이미지 변환과 CDN은 `cdn-image-transformation-pipeline-design`으로 이어진다.\n",
   "aliases": [
-    "file storage presigned url drill",
-    "파일 저장 presigned URL 면접",
-    "object storage upload download design",
-    "이미지 업로드 CDN 설계"
+    "파일 업로드 presigned URL",
+    "오브젝트 스토리지 메타데이터",
+    "비공개 파일 다운로드 설계",
+    "object storage direct upload",
+    "signed URL TTL",
+    "CDN 파일 권한"
   ],
   "expected_queries": [
-    "File storage system design에서 presigned URL은 왜 써?",
-    "이미지 업로드와 다운로드를 어떻게 설계해?",
-    "CDN과 object storage 권한을 어떻게 나눠?"
+    "대용량 파일 업로드를 서버를 거치지 않게 하려면?",
+    "presigned URL을 발급한 뒤 업로드 완료는 어떻게 확인해?",
+    "파일 메타데이터와 실제 바이너리는 왜 분리해?",
+    "비공개 파일 다운로드 권한은 signed URL로 충분할까?",
+    "업로드 후 바이러스 검사 전에는 어떤 상태로 둬야 해?"
   ],
   "symptoms": [
     "큰 파일을 application server 메모리로 모두 받으려 합니다",
@@ -39,8 +43,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/file-storage-presigned-url-interview-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

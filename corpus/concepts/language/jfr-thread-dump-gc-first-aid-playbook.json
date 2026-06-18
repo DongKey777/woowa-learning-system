@@ -4,26 +4,26 @@
   "category": "language",
   "level": "intermediate",
   "summary": "이 playbook은 Java 성능 장애에서 JFR, thread dump, GC 로그를 첫 aid로 읽는 순서를 정한다. CPU spike, GC pause, lock contention, thread dump 여러 장 필요 같은 질문을 다룬다.",
-  "body_markdown": "# JFR Thread Dump GC First Aid Playbook\n\n## 재현 조건\n\n서비스가 느리거나 CPU가 높거나 pause가 길어졌지만 원인이 아직 모른다. 이때 단일 지표 하나로 결론내리지 말고 시간축을 맞춘 증거를 모은다.\n\n## 확인 순서\n\n1. JFR에서 CPU hot method, allocation pressure, lock event, socket/file I/O를 본다.\n2. Thread dump를 짧은 간격으로 여러 장 떠서 같은 stack이 반복되는지 본다.\n3. GC log에서 pause 시간, allocation rate, promotion failure, heap after GC를 확인한다.\n\nJFR, thread dump, GC log, application log, container/OS metrics는 timestamp 기준으로 맞춰야 한다. 도구 하나가 \"정답\"을 주는 것이 아니라 같은 구간에서 서로 설명이 맞는지 확인한다.\n\n## 운영 관찰 지표\n\n- JFR: method profiling, allocation pressure, monitor/park event, socket/file I/O, safepoint, thread state 비율을 본다.\n- Thread dump: `RUNNABLE`, `BLOCKED`, `WAITING/TIMED_WAITING` 상태와 stack 반복성을 본다. 한 장의 dump는 우연한 순간일 수 있다.\n- GC log: pause duration, pause 원인, allocation rate, heap before/after GC, old generation 회수 여부를 본다.\n- OS/container: CPU throttling, load average/run queue, RSS/cgroup memory, disk/network saturation을 함께 본다.\n- Application: endpoint별 latency, error rate, pool acquire time, queue lag, downstream timeout을 같은 시간축에 놓는다.\n\n## 1차 분기\n\n1. CPU-bound application path: JFR hot method와 thread dump의 반복 `RUNNABLE` application stack이 맞물린다.\n2. GC/memory pressure: allocation rate가 높고 GC pause가 latency spike와 겹치며, GC 후 heap이 충분히 내려가지 않는다.\n3. Lock contention: `BLOCKED`나 park event가 특정 monitor, lock, pool, semaphore에 집중된다.\n4. I/O wait/backpressure: socket read/write, file I/O, DB/HTTP client wait, pool acquire 대기가 반복된다.\n5. 외부 runtime/OS 압박: 애플리케이션 stack은 애매하지만 container CPU throttle, memory pressure, disk/network 지표가 같은 시간에 악화된다.\n\n## 운영 대응 순서\n\n증거 수집은 서비스 영향을 고려해 작은 범위부터 시작한다. 짧은 JFR, 여러 장의 thread dump, 이미 켜진 GC log, 애플리케이션 metric을 우선 모으고, heap dump처럼 pause와 용량 부담이 큰 수집은 OOM/retention 의심이 강할 때 절차에 맞춰 실행한다.\n\n분석은 timeline을 먼저 만든 뒤 분기한다. 예를 들어 CPU가 높아도 GC thread, busy loop, serialization, crypto, compression, logging, retry storm이 모두 가능하다. \"CPU 높음 = 코드 루프\" 또는 \"pause 있음 = GC 원인\"으로 바로 결론내리지 않는다.\n\n수정은 하나의 가설을 작게 검증한다. pool size, GC option, timeout, retry, cache size를 한꺼번에 바꾸면 어떤 변화가 효과였는지 알기 어렵다.\n\n## 실패 원인 matrix\n\nCPU spike는 busy loop, serialization, crypto, GC thread 모두 가능하다. Thread dump 한 장은 snapshot일 뿐이므로 반복 stack과 JFR event를 같이 봐야 한다.\n\n## 잘못된 대응\n\n- thread dump 한 장에서 보인 stack 하나로 원인을 확정한다.\n- GC pause가 보인다는 이유만으로 heap/GC option부터 바꾼다.\n- 장애 중 restart만 하고 JFR, GC log 구간, thread dump timestamp를 남기지 않는다.\n- JFR이나 GC log overhead를 과장해서 기본 관찰 지표를 꺼 둔다. 운영 정책에 맞는 낮은 overhead 설정을 검토한다.\n- CPU, memory, lock, I/O를 각각 따로 보고 timeline 상관관계를 맞추지 않는다.\n\n## 운영/테스트 검증\n\n장애 중 기록한 JFR 파일, GC log 구간, thread dump timestamp를 같은 timeline에 맞춘다.\n\n## Safe Next Docs\n\nJFR/JMC performance playbook에서 event 해석을 확장하고, safepoint stop-the-world diagnostics에서 pause와 safepoint를 분리해 본다. heap retention이나 OOM이 의심되면 OOM heap dump playbook으로 분기한다.\n",
+  "body_markdown": "# JFR Thread Dump GC First Aid Playbook\n\n## 이 문서가 맡는 질문\n\nJava 서비스가 느려지거나 CPU가 높거나 p99가 튈 때 JFR, thread dump, GC log를 어떤 순서로 모으고 어떻게 교차 검증할지 정한다. 이 문서는 특정 도구 하나로 원인을 찍는 자료가 아니라, 같은 시간대의 증거를 맞춰 CPU-bound, GC pressure, lock contention, I/O wait, OS 압박을 분리하는 first aid playbook이다.\n\n## 재현 조건\n\n다음 상황에서 이 순서를 쓴다.\n\n- CPU usage가 높지만 애플리케이션 코드, GC thread, logging, retry storm 중 무엇인지 모른다.\n- GC pause가 보이지만 pause가 원인인지 결과인지 확신이 없다.\n- thread dump 한 장에 보인 stack으로 원인을 단정하고 있다.\n- latency spike 시점의 JFR, GC log, application metric timestamp가 서로 맞지 않는다.\n- restart 전에 최소한의 증거를 남겨야 한다.\n\n## 기본 원칙\n\n첫 원칙은 timeline이다. JFR, thread dump, GC log, application log, OS/container metric은 모두 timestamp 기준으로 맞춰야 한다. 도구 하나가 정답을 주는 것이 아니라, 같은 구간에서 서로 설명이 맞는지 확인한다.\n\n```text\np99 spike at 10:03:20\nJFR: allocation pressure 증가\nGC log: young GC pause 증가\nthread dump: 대부분 RUNNABLE이 아니라 TIMED_WAITING\n결론: CPU loop보다 allocation/GC pressure 가설이 먼저다.\n```\n\n두 번째 원칙은 반복성이다. thread dump 한 장은 우연한 순간일 수 있다. 짧은 간격으로 여러 장을 떠서 같은 stack, 같은 lock, 같은 pool wait가 반복되는지 봐야 한다.\n\n## 수집 순서\n\n1. 장애 시각과 영향 범위를 고정한다. 어떤 endpoint, batch, tenant, region에서 p99가 튀었는지 적는다.\n2. 짧은 JFR을 켠다. 이미 continuous recording이 있으면 해당 구간을 잘라낸다.\n3. thread dump를 5초에서 10초 간격으로 여러 장 수집한다.\n4. GC log에서 pause duration, cause, heap before/after, allocation rate를 확인한다.\n5. OS/container metric에서 CPU throttling, run queue, RSS, disk/network saturation을 본다.\n6. application metric에서 pool acquire time, queue lag, downstream timeout을 맞춘다.\n\nheap dump는 first aid 기본값이 아니다. OOM, leak, retention 의심이 강하고 pause와 파일 크기를 감당할 절차가 있을 때만 실행한다.\n\n## JFR에서 먼저 볼 것\n\nJFR은 sampling과 event를 함께 제공하므로 hot method만 보지 않는다.\n\n- Method profiling: CPU를 실제로 쓰는 application stack인지, JIT/GC/runtime stack인지 본다.\n- Allocation pressure: 특정 endpoint나 serializer가 allocation rate를 끌어올리는지 본다.\n- Monitor blocked / park event: lock, condition, pool, semaphore 대기가 몰리는지 본다.\n- Socket/file I/O: 외부 API, DB, disk wait가 latency와 겹치는지 본다.\n- Safepoint: stop-the-world가 GC인지, biased locking revocation 같은 다른 원인인지 분리한다.\n\nJFR hot method가 보인다고 바로 최적화하지 않는다. thread dump와 application metric에서 같은 path가 반복되는지 확인해야 한다.\n\n## Thread dump 해석\n\nThread state는 이름보다 stack 반복성이 중요하다.\n\n| 상태 | 흔한 의미 | 확인할 것 |\n|---|---|---|\n| RUNNABLE | CPU 사용 또는 native I/O 가능 | 같은 Java stack이 여러 dump에 반복되는가 |\n| BLOCKED | monitor 진입 대기 | lock owner와 기다리는 thread 수 |\n| WAITING | condition, pool, queue 대기 | 정상 idle인지 starvation인지 |\n| TIMED_WAITING | sleep, timed park, socket timeout | retry/backoff storm인지 |\n\nCPU가 높을 때 모든 thread가 RUNNABLE일 필요는 없다. 소수 hot thread가 CPU를 태울 수도 있고, 반대로 CPU usage가 높아 보이지만 container throttling 때문에 실제 progress가 느릴 수도 있다.\n\n## GC log 해석\n\nGC log는 pause 하나만 보지 않는다. allocation rate, promotion, heap after GC가 함께 중요하다.\n\n- young GC가 잦고 allocation rate가 높으면 object churn을 본다.\n- old generation이 GC 후에도 내려가지 않으면 retention이나 heap size 문제를 본다.\n- promotion failure나 evacuation failure가 있으면 pause가 길어질 수 있다.\n- GC pause 시각이 p99 spike와 겹치는지, spike 이후에 GC가 따라왔는지 구분한다.\n\nGC가 보인다는 이유만으로 heap 크기나 collector option부터 바꾸면 안 된다. allocation을 만든 application path가 원인일 수 있고, 외부 장애로 queue가 쌓이며 memory pressure가 뒤따랐을 수도 있다.\n\n## 1차 분기\n\n| 가설 | JFR 신호 | Thread dump 신호 | GC/OS 신호 |\n|---|---|---|---|\n| CPU-bound path | hot method 집중 | 반복 RUNNABLE stack | CPU high, throttling 없음 |\n| GC pressure | allocation event 증가 | mutator progress 낮음 | pause와 heap after GC 악화 |\n| Lock contention | monitor/park event | BLOCKED/park stack 반복 | CPU는 낮거나 일부만 높음 |\n| I/O wait | socket/file event | client wait stack 반복 | network/disk metric 악화 |\n| OS 압박 | JFR 원인 약함 | application stack 애매 | cgroup CPU/memory/disk 압박 |\n\n분기는 하나만 고르는 시험이 아니다. 예를 들어 downstream timeout이 retry storm을 만들고, retry가 allocation과 GC pause를 키울 수 있다. 그래도 first aid에서는 최초로 완화할 병목을 찾기 위해 시간 순서를 정리한다.\n\n## 운영 대응 순서\n\n증거 수집은 서비스 영향을 고려해 작은 범위부터 시작한다. continuous JFR이 있다면 해당 구간을 export하고, 없으면 짧은 recording으로 시작한다. thread dump는 부담이 작지만 너무 촘촘하게 오래 뜨면 로그와 저장소를 압박할 수 있다. GC log는 운영에서 항상 켜 두는 정책이 가장 좋다.\n\n수정은 하나의 가설을 작게 검증한다. pool size, GC option, timeout, retry, cache size를 한꺼번에 바꾸면 어떤 변화가 효과였는지 알기 어렵다. 장애 중에는 rollback 가능한 완화책을 먼저 적용하고, 재발 방지는 JFR과 load test로 따로 확인한다.\n\n## 증거를 연결하는 예시\n\n예를 들어 주문 API p99가 10초로 튀고 CPU도 90퍼센트까지 올라갔다고 하자. JFR에서 JSON serialization hot method와 allocation event가 같이 보이고, GC log에서는 young GC가 매우 자주 발생하며, thread dump에서는 같은 serialization stack이 여러 RUNNABLE thread에 반복된다. 이 경우에는 단순히 GC option을 바꾸기보다 응답 payload, serialization cache, allocation hotspot을 먼저 의심한다.\n\n반대로 CPU는 높지 않은데 p99가 튄다면 lock과 I/O를 먼저 본다. thread dump 여러 장에서 DB connection pool acquire stack이 반복되고 JFR socket read event가 downstream API timeout과 겹치면, JVM 내부 lock보다 외부 backpressure가 primary 가설이다. 이때 pool size만 늘리면 downstream 장애를 더 크게 만들 수 있으므로 timeout, retry, bulkhead, queue limit을 같이 본다.\n\n## 수집 산출물 정리 방식\n\n장애가 끝난 뒤에는 파일을 모았다는 사실보다 재현 가능한 설명을 남겨야 한다. JFR 파일 이름, thread dump 수집 시각, GC log 구간, 배포 버전, JVM option, container limit을 한 묶음으로 기록한다. timezone이 섞이면 timeline이 틀어지므로 UTC 또는 서비스 표준 timezone으로 맞춘다.\n\n분석 노트에는 결론보다 배제한 가설도 남긴다. CPU-bound가 아닌 이유, GC가 원인이 아니라 결과로 보이는 이유, lock contention이 특정 monitor에 집중되지 않았다는 근거를 쓰면 다음 장애 때 같은 추측을 반복하지 않는다.\n\n## 면접 답변 템플릿\n\n짧게 답할 때는 이렇게 말한다. Java latency 장애에서는 JFR로 CPU, allocation, lock, I/O event를 보고, thread dump를 여러 장 떠서 반복 stack과 thread state를 확인하고, GC log로 pause와 heap after GC를 본다. 세 자료를 timestamp로 맞춘 뒤 CPU-bound, GC pressure, lock contention, I/O wait, OS throttling을 분기한다. thread dump 한 장이나 GC pause 하나로 결론내리지 않는 것이 핵심이다.\n\n## 잘못된 대응\n\n- thread dump 한 장에서 보인 stack 하나로 원인을 확정한다.\n- GC pause가 보인다는 이유만으로 heap/GC option부터 바꾼다.\n- 장애 중 restart만 하고 JFR, GC log 구간, thread dump timestamp를 남기지 않는다.\n- CPU, memory, lock, I/O를 각각 따로 보고 timeline 상관관계를 맞추지 않는다.\n- JFR overhead를 과장해서 기본 관찰 지표를 모두 꺼 둔다.\n\n## 검증 체크리스트\n\n- p99 spike 시각과 수집 artifact 시각이 같은 timezone으로 맞춰져 있는가.\n- JFR hot stack과 thread dump 반복 stack이 같은 코드 path를 가리키는가.\n- GC pause가 latency spike보다 먼저인지, 뒤따라온 결과인지 구분했는가.\n- lock owner, pool owner, queue owner를 찾았는가.\n- OS/container throttling이 application 원인처럼 보이지 않게 분리했는가.\n- 변경 후 같은 load에서 JFR event, GC pause, p99가 함께 개선됐는가.\n\n## 한 줄 정리\n\nJava 성능 장애 first aid는 JFR, thread dump, GC log를 따로 읽는 일이 아니라 같은 시간축에 놓고 CPU, GC, lock, I/O, OS 압박을 분리하는 일이다.\n\n## Safe Next Docs\n\nJFR/JMC performance playbook에서 event 해석을 확장하고, safepoint stop-the-world diagnostics에서 pause와 safepoint를 분리해 본다. heap retention이나 OOM이 의심되면 OOM heap dump playbook으로 분기한다.\n",
   "aliases": [
-    "JFR thread dump GC first aid",
-    "Java latency first triage",
-    "JVM 장애 응급 분석",
-    "thread dump GC JFR 순서",
-    "CPU spike GC lock 구분",
-    "자바 성능 장애 첫 확인",
-    "JFR thread dump GC 조합",
-    "장애 중 thread dump",
-    "GC pause lock contention",
-    "performance incident first aid"
+    "Java 장애 JFR 순서",
+    "thread dump 여러 장",
+    "GC pause 원인 분리",
+    "CPU spike lock contention",
+    "JVM latency incident triage",
+    "자바 p99 장애 분석",
+    "JFR GC 로그 타임라인",
+    "스레드 덤프 RUNNABLE BLOCKED",
+    "운영 중 JFR 수집",
+    "lock contention GC 구분"
   ],
   "expected_queries": [
-    "Java 서비스 장애 때 JFR, thread dump, GC log를 어느 순서로 모아서 CPU, GC, lock을 구분해?",
-    "장애 중 thread dump 한 장이 아니라 여러 장을 떠야 하는 이유와 JFR first aid 기준을 알려줘",
+    "Java 서비스 장애 때 JFR, thread dump, GC log를 어떤 순서로 모아야 해?",
+    "thread dump 한 장이 아니라 여러 장을 떠야 하는 이유는 뭐야?",
     "CPU spike와 GC pause와 lock contention을 어떻게 구분해?",
-    "Java latency incident에서 GC log만 보기 전에 thread state와 JFR event를 같이 봐야 하는 이유는?",
-    "운영 장애 중 안전하게 수집할 JVM 진단 자료를 우선순위로 정리해줘",
-    "p99 spike가 생길 때 JFR, thread dump, GC 로그의 timestamp를 어떻게 맞춰?"
+    "Java p99 장애에서 JFR event와 GC log timestamp를 어떻게 맞춰?",
+    "운영 중 안전하게 수집할 JVM 진단 자료 우선순위를 정리해줘",
+    "GC pause가 보일 때 바로 heap 옵션을 바꾸면 안 되는 이유가 뭐야?"
   ],
   "symptoms": [
     "CPU가 높고 응답이 느려요",
@@ -47,8 +47,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/jfr-thread-dump-gc-first-aid-playbook.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

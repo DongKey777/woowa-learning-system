@@ -6,15 +6,21 @@
   "summary": "이 bridge는 예약/booking에서 non-overlapping interval set을 관리하는 자료구조 선택을 돕는다. TreeMap 이웃 구간 확인, 모든 예약 순회, half-open boundary 같은 질문을 다룬다.",
   "body_markdown": "# Disjoint Interval Booking Bridge\n\n## 미션 장면\n\n새 예약 구간이 기존 예약과 겹치면 안 된다. 예를 들어 같은 방, 같은 좌석, 같은 코트처럼 하나의 resource에 대해 예약 시간이 disjoint해야 한다면 `interval set` 문제로 모델링할 수 있다. 기존 구간들이 이미 겹치지 않고 `start` 기준으로 정렬되어 있다면 새 구간의 바로 이전/다음 이웃만 확인해도 충분하다.\n\n이 문서의 전제는 단일 resource 또는 resource별로 분리된 interval set이다. 여러 resource를 한 구조에 섞으면 이웃 구간이 다른 resource에서 나와 잘못된 충돌 판단을 할 수 있으므로 key를 `(resourceId, start)`로 잡거나 resource별 map을 둔다.\n\n## 선택 기준\n\n- 기존 예약들이 서로 겹치지 않는다는 invariant를 유지할 수 있으면 `start` 기준 ordered map/set이 적합하다.\n- 예약 수가 아주 작고 단순한 미션이면 list 전체 순회도 시작점으로는 가능하지만, 증가 가능성이 보이면 `TreeMap.floorEntry/ceilingEntry`를 고려한다.\n- 임의 interval과 겹치는 모든 구간을 자주 찾아야 하면 disjoint set보다 interval tree나 segment tree가 더 맞을 수 있다.\n- 시간 단위, timezone, 영업일 규칙처럼 domain boundary가 복잡하면 자료구조보다 interval 정규화가 먼저다.\n- 동시 예약 요청이 있으면 자료구조 선택과 별개로 transaction/lock/unique constraint가 필요하다.\n\n## Interval contract\n\n예약 구간은 먼저 `[start, end)` half-open interval로 고정한다. `start`는 포함하고 `end`는 포함하지 않는다는 뜻이다. 이 contract에서는 `[10, 11)`과 `[11, 12)`가 인접하지만 겹치지 않는다.\n\n저장 전 정규화도 contract 일부다. 날짜/시간 문자열, timezone, 영업일, 최소 예약 단위가 섞이면 같은 구간이 서로 다른 표현으로 들어올 수 있다. 자료구조에 넣기 전에는 비교 가능한 단일 time scale로 변환하고, `start < end`를 검증한다.\n\ninclusive interval인 `[start, end]`를 써야 하는 도메인도 있다. 그 경우 overlap 조건과 인접 조건이 모두 달라진다. 면접/리뷰에서는 \"half-open으로 두면 인접 예약이 자연스럽다\"는 선택 이유를 먼저 말하는 편이 안전하다.\n\n## 리뷰에서 보이는 냄새\n\n모든 기존 예약을 매번 훑으면 예약 수가 늘 때 느려진다. TreeMap이나 ordered set으로 시작 시간을 정렬해 이웃 구간을 빠르게 찾는다.\n\n## 개념 handoff\n\n`[start, end)` half-open boundary를 쓰면 앞 예약의 end와 다음 예약의 start가 같아도 겹치지 않는다. 이 기준이 없으면 인접 구간을 충돌로 오진한다.\n\n## 핵심 invariant\n\n- 모든 interval은 `start < end`를 만족해야 한다.\n- 같은 resource 안에서 저장된 interval들은 `start` 기준으로 strict하게 정렬되어야 한다.\n- 정렬 순서상 이웃한 두 interval은 항상 `previous.end <= current.start`를 만족해야 한다.\n- 새 interval `[s, e)`를 넣을 때 predecessor가 있으면 `predecessor.end <= s`여야 한다.\n- successor가 있으면 `e <= successor.start`여야 한다.\n- 삽입, 수정, 취소 뒤에도 위 조건이 유지되어야 한다. 수정은 key 변경이므로 보통 remove 후 insert 검증으로 처리한다.\n\n`TreeMap<Start, End>` 형태라면 같은 `start`는 key 충돌이다. 같은 시작 시각의 중복 예약을 조용히 덮어쓰지 않도록 `containsKey(start)` 또는 successor/predecessor 검증 전에 exact key 충돌을 명시적으로 다룬다.\n\n## Insert algorithm\n\n```text\nbook(resource, s, e):\n    require s < e\n    map = bookingsByResource[resource]\n\n    prev = map.floorEntry(s)     # greatest start <= s\n    if prev exists and prev.end > s:\n        reject overlap with previous interval\n\n    next = map.ceilingEntry(s)   # smallest start >= s\n    if next exists and e > next.start:\n        reject overlap with next interval\n\n    map.put(s, e)\n```\n\n왜 두 이웃만 보면 되는가: 기존 집합이 이미 disjoint이고 start로 정렬되어 있으면 predecessor보다 더 왼쪽의 interval은 `predecessor.end <= s`보다 더 앞에서 끝난다. successor보다 더 오른쪽의 interval은 `successor.start >= e`가 성립하면 그보다 늦게 시작한다. 따라서 새 구간과 겹칠 수 있는 후보는 바로 왼쪽과 바로 오른쪽뿐이다.\n\n## Complexity/운영 비용\n\n- `TreeMap` 기준 predecessor/successor 조회와 삽입은 각각 `O(log N)`이다.\n- list 전체 순회는 구현이 쉽지만 삽입마다 `O(N)`이고, 정렬 유지까지 하면 비용이 더 커진다.\n- 예약 변경/취소가 있으면 key 변경 대신 remove 후 insert로 invariant를 다시 검증한다.\n- 운영에서는 같은 시간대 동시 요청 race, DB isolation level, clock/timezone 변환 비용이 실제 버그 원인이 된다.\n- 저장소에도 `(resourceId, start, end)` 기준 index나 exclusion constraint를 두지 않으면 앱 메모리 검증만으로는 부족하다.\n\n메모리 비용은 예약 수 `N`에 대해 `O(N)`이다. resource별 TreeMap을 두면 각 resource의 예약 수를 `M`이라고 할 때 한 삽입은 `O(log M)`이 된다. 전체 예약 수가 커도 resource가 잘 분산되어 있으면 한 resource의 map 크기가 작아져 지연 시간이 안정된다.\n\nDB에서 interval overlap을 강하게 막아야 한다면 애플리케이션 TreeMap은 사전 검증일 뿐이다. PostgreSQL의 exclusion constraint, MySQL의 guard row/locking strategy, 또는 slot 단위 unique constraint처럼 저장소 수준의 동시성 제어가 별도로 필요하다.\n\n## 실패 반례\n\n- `[10, 11)`과 `[11, 12)`를 inclusive interval처럼 비교하면 인접 예약을 충돌로 오진한다.\n- predecessor만 확인하고 successor를 보지 않으면 새 `[11, 14)`가 기존 `[13, 15)`와 겹치는 것을 놓친다.\n- 시작 시간이 같은 예약을 map key 하나로 덮어쓰면 중복 요청을 조용히 잃어버린다.\n- 두 요청이 동시에 빈 slot을 확인한 뒤 둘 다 insert하면 memory 구조가 맞아도 DB에는 double booking이 생길 수 있다.\n- resource를 key에 포함하지 않으면 A방의 `[10, 11)` 때문에 B방의 `[10, 11)` 예약이 거절될 수 있다.\n- `start == end`를 허용하면 zero-length 예약이 boundary 검증을 통과하면서 실제 정책과 다른 결과를 만든다.\n- timezone 변환 전 local time 문자열을 그대로 비교하면 DST 전환일이나 지역 변경에서 정렬 순서가 깨질 수 있다.\n\n## 흔한 오해\n\n- \"정렬되어 있으니 하나만 보면 된다\"가 아니다. 새 구간의 바로 이전과 다음 이웃을 모두 봐야 한다.\n- 모든 interval 문제에 segment tree가 필요한 것은 아니다. non-overlap booking은 ordered map으로 충분한 경우가 많다.\n- half-open boundary는 취향이 아니라 인접 구간을 명확히 처리하기 위한 contract다.\n- 자료구조 검증은 domain validation을 대체하지 않는다. 시간대, 최소 예약 단위, 마감 시간은 별도로 검증한다.\n- 메모리 자료구조가 통과했다고 동시성까지 해결된 것은 아니다. 최종 write path에서 같은 invariant를 다시 보장해야 한다.\n\n## Verification checklist\n\n1. 기존 `[10, 11)`, `[13, 14)`에 새 `[11, 13)`을 넣으면 predecessor와 successor 조건이 모두 통과해야 한다.\n2. 기존 `[10, 11)`, `[13, 14)`에 새 `[12, 13)`을 넣으면 successor boundary `e <= 13`이 true라 통과한다.\n3. 기존 `[10, 11)`, `[13, 14)`에 새 `[11, 14)`를 넣으면 successor와 겹치므로 거절되어야 한다.\n4. 기존 `[10, 12)`에 새 `[9, 10)`은 predecessor가 없고 successor.start가 `10`이므로 통과한다.\n5. 같은 `resourceId`에서는 중복을 막고, 다른 `resourceId`에서는 같은 시간대 예약이 허용되는지 테스트한다.\n6. 동시 요청 테스트에서는 두 트랜잭션이 동시에 \"비어 있음\"을 읽어도 최종 저장소 invariant가 깨지지 않는지 확인한다.\n\n## Drill 후보\n\n`[start, end)` contract를 말로 고정한 뒤, `floorEntry(start)`와 `ceilingEntry(start)`만으로 삽입 가능 여부를 판단해 본다. 마지막에는 \"이 검증이 DB 동시성 제어를 대체하지 않는다\"까지 덧붙이면 미션 코드 리뷰 답변으로도 이어진다.\n",
   "aliases": [
-    "disjoint interval booking bridge",
-    "reservation non overlapping interval set",
-    "겹치지 않는 예약 구간",
-    "disjoint interval set 예약"
+    "예약 구간 중복 검사",
+    "겹치지 않는 예약 관리",
+    "TreeMap 예약 이웃 확인",
+    "반열림 구간 booking",
+    "non overlapping reservation intervals",
+    "ordered interval booking",
+    "floor ceiling overlap check",
+    "resource별 interval set"
   ],
   "expected_queries": [
-    "예약 구간이 서로 겹치지 않게 관리하려면 어떤 자료구조가 좋아?",
-    "새 interval을 넣기 전에 이웃 구간만 확인해도 되는 이유가 뭐야?",
-    "TreeMap으로 booking overlap을 어떻게 확인해?"
+    "예약 시간이 겹치지 않게 저장하려면 무엇을 확인해야 해?",
+    "TreeMap에서 이전 구간과 다음 구간만 보면 충분한 이유가 뭐야?",
+    "예약 구간은 왜 반열림으로 두는 게 좋아?",
+    "같은 시간 예약을 자원별로 분리하려면 키를 어떻게 잡아?",
+    "예약 수정은 왜 삭제 후 삽입으로 처리하는 게 안전해?"
   ],
   "symptoms": [
     "새 예약마다 모든 기존 예약을 훑어요",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/data-structure/disjoint-interval-booking-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

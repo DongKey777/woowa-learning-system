@@ -6,15 +6,21 @@
   "summary": "이 mission_bridge는 shopping-cart 쿠폰 중복 적용, 할인 조합, policy composition, checkout transaction boundary를 연결한다.",
   "body_markdown": "# shopping-cart 쿠폰 조합 정책 ↔ Policy Composition 브릿지\n\n## 한 줄 요약\n\n> 쿠폰 설계에서 개별 쿠폰 객체는 \"이 쿠폰 하나가 얼마를 깎는가\"를 닫고, 조합 정책은 \"여러 혜택을 어떤 순서와 배타 조건으로 확정할 것인가\"를 닫는다. 둘을 `CheckoutService`에 섞으면 할인 규칙, 중복 사용 방지, 주문 확정 트랜잭션이 한 메서드에 붙는다.\n\n## 미션 장면\n\nShopping-cart 미션에서 쿠폰이나 할인 요구가 들어오면 처음에는 checkout service에 조건문을 추가하기 쉽다. 예를 들어 금액 할인, 비율 할인, 특정 상품 할인, 회원 등급 할인, 중복 불가 같은 규칙이 한 곳에 모인다. 이때 중요한 질문은 \"할인을 계산하는 규칙\"과 \"여러 할인을 어떤 순서와 제약으로 조합하는 정책\"을 구분하는 것이다.\n\n할인 기능이 작을 때는 `calculateDiscount(cart, coupon)` 같은 함수 하나로 충분할 수 있다. 하지만 쿠폰 두 장을 함께 쓸 수 있는지, 등급 할인과 쿠폰 중 무엇을 먼저 적용하는지, 최대 할인 한도가 전체 합계 기준인지 쿠폰별 기준인지가 생기면 이야기가 달라진다. 이 순간부터는 개별 discount policy보다 composition policy가 리뷰의 중심이 된다.\n\n## 리뷰에서 보이는 냄새\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"`CheckoutService`에 쿠폰 `if`가 계속 늘어요\" | coupon type switch, 유효성, 할인 계산, 중복 가능 여부가 한 메서드에 있음 | 개별 쿠폰 계산과 조합 정책을 나눈다 |\n| \"쿠폰을 strategy로 나눴는데도 순서가 헷갈려요\" | `List<DiscountPolicy>` 순회 순서가 사실상 비즈니스 규칙 | 적용 순서와 배타 조건을 composition policy로 이름 붙인다 |\n| \"쿠폰 사용 처리까지 할인 객체에서 해도 되나요?\" | 할인 계산 중 coupon-use row 저장, 주문 생성, 장바구니 비우기가 섞임 | 정책 판정과 write 확정 트랜잭션을 분리한다 |\n\n리뷰 냄새는 `CheckoutService`가 coupon type switch, 사용 가능 여부, 할인 금액 계산, 중복 적용 순서, 최대 할인 한도를 모두 품을 때 나온다. 테스트도 \"주문 생성\" 하나를 검증하려고 상품, 장바구니, 쿠폰, 결제 fixture를 모두 만들어야 한다. 또 개별 쿠폰 전략(strategy)을 만들었는데 조합 순서가 list 순회 우연에 의존하면, 정책이 코드 밖에 숨어 있는 셈이다.\n\n## 책임 경계\n\n개별 coupon policy는 \"적용 가능한가(applicability)\"와 \"얼마를 할인하는가(discount calculation)\"를 닫는다. 예를 들어 `FixedAmountCoupon`, `PercentCoupon`, `CategoryCoupon`은 자신이 필요한 입력과 실패 이유를 알고 `DiscountDecision`을 돌려줄 수 있다.\n\n조합 policy는 다른 질문을 다룬다. 쿠폰과 회원 등급 할인은 같이 쓸 수 있는가, 상품 쿠폰을 먼저 적용한 뒤 장바구니 쿠폰을 적용하는가, 전체 할인액이 주문 금액의 30%를 넘으면 잘라야 하는가, 실패한 쿠폰이 하나라도 있으면 checkout 전체를 막는가를 결정한다. 이 규칙은 특정 쿠폰 타입의 구현이 아니라 주문 전체의 할인 계약이다.\n\nApplication service는 cart, 상품, 회원, 쿠폰 상태를 읽고 조합 정책에 판정을 맡긴 뒤, 확정된 할인 결과를 주문 snapshot으로 넘긴다. 여기서 service가 사라지는 것이 아니다. service는 유스케이스 순서와 트랜잭션 경계를 조립하고, policy는 도메인 결정을 계산한다.\n\n## transaction/event 경계\n\n쿠폰 조합 정책은 \"얼마를 할인할지\"를 결정하지만, \"쿠폰 사용 row를 누가 선점했는지\"까지 자동으로 보장하지 않는다. 같은 쿠폰 적용 요청이 재시도되거나 버튼이 두 번 눌리는 문제는 `database/shopping-cart-coupon-apply-once-unique-claim-bridge` 쪽의 UNIQUE claim과 existing row reuse 문제다. 할인 가능 여부 판정과 coupon-use write arbitration을 같은 `if`에 넣으면 실패 원인이 흐려진다.\n\nCheckout 트랜잭션 안에는 보통 확정된 주문, 주문 항목 snapshot, 적용된 할인 결과, 필요한 coupon-use 상태 변경처럼 함께 commit돼야 하는 로컬 사실만 둔다. 할인 계산 중 이메일 발송, 외부 이벤트 publish, 분석 로그 전송까지 직접 호출하면 정책 객체가 부작용을 품는다. 주문 완료 뒤 후속 작업은 domain event를 기록하거나 `AFTER_COMMIT`/outbox로 넘길 후보인지 별도로 본다.\n\n이 구분은 테스트에도 영향을 준다. 조합 정책 테스트는 cart와 coupon fixture만으로 \"A와 B는 같이 못 쓴다\", \"정액 할인 후 정률 할인을 적용한다\", \"총 할인 상한을 넘으면 cap한다\"를 확인한다. 트랜잭션 테스트는 같은 coupon-use가 두 번 생기지 않는지, 주문 확정과 할인 snapshot이 함께 저장되는지를 본다.\n\n## 구현 스케치\n\n간단한 형태는 다음 정도면 충분하다.\n\n- `DiscountPolicy`: 개별 쿠폰의 적용 가능 여부와 할인액을 계산한다.\n- `CouponCompositionPolicy`: 후보 할인들을 입력받아 적용 순서, 배타 조건, 총 할인 상한을 판정한다.\n- `DiscountDecision` 또는 `AppliedDiscounts`: 적용된 할인, 제외된 이유, 최종 할인액을 값으로 돌려준다.\n- `CheckoutService`: 최신 cart/product/coupon 상태를 읽고 정책을 호출한 뒤, 주문 snapshot과 coupon-use 상태를 같은 로컬 commit 경계에서 저장한다.\n\n미션에 없는 프로모션 엔진을 먼저 만들 필요는 없다. 다만 \"정렬 순서가 왜 이렇지?\", \"이 쿠폰끼리 같이 쓰면 안 된다는 규칙이 어디 있지?\", \"거절 이유를 누가 만들지?\"라는 질문이 반복되면 composition policy로 이름 붙일 시점이다.\n\n## 미션 PR 코멘트 패턴\n\n- \"쿠폰별 할인 계산은 나뉘었지만, 중복 가능 여부와 적용 순서가 list 순회에 숨어 있습니다. 조합 규칙을 별도 정책으로 드러내 보세요.\"\n- \"`CheckoutService`가 할인 계산, 쿠폰 사용 저장, 주문 확정까지 모두 직접 판단하고 있습니다. 판정과 commit 경계를 나눠 보세요.\"\n- \"Strategy로 쿠폰 타입만 분기해도 전체 할인 한도나 배타 조건은 해결되지 않습니다. 주문 단위 composition rule을 테스트로 고정해 주세요.\"\n- \"쿠폰 중복 클릭 방지는 할인 정책이 아니라 coupon-use claim 문제입니다. 정책 실패와 duplicate retry를 같은 예외로 묶지 마세요.\"\n\n## Drill 후보\n\n\"쿠폰을 strategy로 나누면 중복 적용 순서 문제도 자동으로 해결되는가?\"를 묻는다. 기대 답변은 개별 할인 계산과 전체 조합 정책은 다른 책임이라는 것이다. 이어서 \"그럼 쿠폰 사용 row 중복 생성도 composition policy가 막아야 하는가?\"를 물어본다. 여기서는 \"아니다. 할인 허용 여부는 policy, 같은 시도의 중복 write는 UNIQUE claim과 트랜잭션 문제\"라고 답해야 한다.\n\n흔한 실수는 모든 쿠폰을 객체로 만들었지만 어떤 쿠폰끼리 같이 쓸 수 있는지 테스트하지 않는 것이다. 다른 실수는 미션에 없는 복잡한 프로모션 엔진을 먼저 만들거나, 반대로 조합 정책과 DB 선점 문제를 전부 `CheckoutService`의 긴 조건문으로 숨기는 것이다.\n\n## 다음 학습\n\n- 개별 할인 규칙을 Policy Object로 올리는 기준은 `design-pattern/shopping-cart-coupon-promotion-policy-object-bridge`\n- checkout 입력 검증과 도메인 불변식을 가르려면 `software-engineering/shopping-cart-checkout-validation-domain-invariant-bridge`\n- 같은 쿠폰 적용 요청의 재시도와 중복 row 방지는 `database/shopping-cart-coupon-apply-once-unique-claim-bridge`\n- 주문 확정, 장바구니 비우기, 후속 이벤트의 commit 경계는 `spring/shopping-cart-order-flow-mission-bridge`\n",
   "aliases": [
-    "shopping cart coupon composition policy",
-    "쇼핑카트 쿠폰 조합 정책",
-    "coupon stacking rule mission bridge",
-    "discount policy object bridge"
+    "coupon composition policy",
+    "쿠폰 조합 정책",
+    "쿠폰 중복 적용 규칙",
+    "쇼핑카트 할인 조합",
+    "coupon stacking rule",
+    "discount composition rule",
+    "checkout discount policy",
+    "쿠폰 배타 조건"
   ],
   "expected_queries": [
-    "shopping-cart 쿠폰 중복 적용 규칙은 어디에 둬?",
-    "할인 정책이 늘어날 때 if문을 어떻게 줄여?",
-    "쿠폰 stack 가능 여부를 policy object로 빼는 기준은?"
+    "shopping-cart에서 쿠폰 여러 장을 같이 쓸 수 있는지는 어디서 판단해?",
+    "할인 정책을 strategy로 나눴는데 적용 순서가 계속 헷갈리면 어떻게 해?",
+    "쿠폰 중복 적용 규칙과 쿠폰 사용 저장은 왜 분리해야 해?",
+    "CheckoutService에 쿠폰 if문이 늘어날 때 어떤 객체로 빼야 해?",
+    "정액 쿠폰과 정률 쿠폰을 함께 적용할 때 테스트는 무엇을 고정해야 해?"
   ],
   "symptoms": [
     "CheckoutService에 쿠폰 if문이 계속 늘어납니다",
@@ -43,8 +49,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/shopping-cart-coupon-composition-policy-bridge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

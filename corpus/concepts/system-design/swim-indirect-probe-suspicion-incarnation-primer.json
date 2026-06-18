@@ -4,25 +4,26 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "SWIM은 direct ping 실패 후 다른 노드에게 ping-req indirect probe를 요청해 네트워크 경로 문제와 target 장애를 구분하려 한다. suspicion period와 incarnation number는 false positive를 줄이고, 살아 있는 노드가 자신에 대한 오래된 suspect/dead 소문을 반박하게 만드는 핵심 장치다.",
-  "body_markdown": "# SWIM Indirect Probe Suspicion Incarnation Primer\n\n> 한 줄 요약: SWIM의 indirect probe, suspicion, incarnation은 false positive를 줄이기 위한 안전장치다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: SWIM indirect probe, ping-req, suspicion period, incarnation number, refute suspect, false positive failure detection, GC pause, network partition\n\n## direct probe만으로 부족한 이유\n\nA가 B에게 ping을 보냈는데 ack가 없다고 해서 B가 죽었다고 단정할 수는 없다.\n\n- A와 B 사이 network path만 잠시 나쁠 수 있다.\n- B가 GC pause 중일 수 있다.\n- packet loss가 있었을 수 있다.\n- A의 timeout이 너무 짧을 수 있다.\n\n그래서 SWIM은 direct ping 실패 후 몇몇 helper에게 `ping-req`를 보내 B를 대신 probe하게 한다.\n\n## indirect probe\n\n```text\nA -> ping B  (no ack)\nA -> ping-req C,D,E for B\nC -> ping B, D -> ping B, E -> ping B\nif any helper gets ack from B -> B may be alive\nif none gets ack -> mark B suspect\n```\n\nIndirect probe는 단일 network path 문제를 줄인다. 하지만 이것도 확정 증명은 아니다. helper들도 같은 partition에 있을 수 있고, timeout 설정이 틀릴 수 있다.\n\n## suspicion period\n\n`dead`로 바로 바꾸지 않고 `suspect`로 둔다. suspicion period 동안 다른 노드가 \"B는 살아 있다\"는 더 최신 update를 퍼뜨리거나, B가 직접 자신을 refute할 수 있다.\n\n이 단계가 없으면 짧은 pause나 packet loss가 cluster에서 node removal로 번진다.\n\n## incarnation number\n\nIncarnation number는 membership update의 최신성을 구분하는 version이다. 어떤 노드가 자신에 대한 suspect rumor를 들었는데 실제로 살아 있다면, 자신의 incarnation을 올려 `alive` update를 gossip할 수 있다.\n\n```text\nB hears: B suspect inc=3\nB is alive\nB increments inc to 4\nB gossips: B alive inc=4\n```\n\n다른 노드는 더 높은 incarnation을 더 최신 update로 본다.\n\n## 운영 함정\n\n| 함정 | 결과 | 완화 |\n|---|---|---|\n| timeout이 너무 짧음 | false suspect 증가 | RTT 분포와 GC pause 반영 |\n| suspicion period가 너무 짧음 | 살아 있는 노드 dead 처리 | refutation window 확보 |\n| incarnation 처리 오류 | 오래된 rumor가 최신 상태를 덮음 | monotonic incarnation 검증 |\n| helper 수가 너무 적음 | indirect probe 효과 약함 | failure-domain-aware helper 선택 |\n| partition 중 auto-remove 과감 | split-brain routing 위험 | degraded mode와 manual gate |\n\n## 한 줄 정리\n\nSWIM의 direct ping 실패는 죽음 확정이 아니다. indirect probe, suspicion period, incarnation refutation으로 false positive를 줄이고 membership rumor의 최신성을 구분해야 한다.\n",
+  "body_markdown": "# SWIM Indirect Probe Suspicion Incarnation Primer\n\n> 한 줄 요약: SWIM은 direct ping 실패를 곧바로 dead로 확정하지 않고, indirect probe, suspicion period, incarnation number로 false positive를 줄이며 membership rumor의 최신성을 관리한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: SWIM indirect probe, ping-req, suspicion period, incarnation number, refute suspect, false positive failure detection, alive rumor, suspect rumor, membership gossip, GC pause, packet loss, network partition, helper probe\n\n## direct ping만으로 부족한 이유\n\nA가 B에게 ping을 보냈는데 timeout이 났다고 해서 B가 죽었다고 단정할 수는 없다. A와 B 사이의 network path만 순간적으로 나쁠 수 있고, B가 GC pause 중일 수 있고, packet loss가 있었을 수도 있다. A의 event loop가 밀려 ack를 늦게 처리했을 가능성도 있다.\n\n그래서 SWIM류 failure detection은 \"응답 없음 = dead\"로 바로 가지 않는다. direct ping이 실패하면 몇몇 helper에게 `ping-req`를 보내 같은 target을 다른 경로에서 확인한다. 이 단계는 target의 생존을 증명하는 완벽한 장치가 아니라, 단일 관측자의 네트워크 문제를 줄이는 장치다.\n\n```text\nA -> ping B        (timeout)\nA -> ping-req C,D  (B를 대신 확인해줘)\nC -> ping B\nD -> ping B\nB -> ack C or D\nC/D -> ack A\n```\n\nhelper 중 하나라도 B의 ack를 받으면 A는 B를 바로 dead로 처리하기보다 alive 가능성을 인정한다. 아무도 ack를 받지 못하면 B를 suspect로 표시할 수 있지만, 이때도 최종 제거가 아니라 의심 단계다.\n\n## indirect probe의 의미\n\nIndirect probe는 network path diversity를 얻기 위한 장치다. A-B 경로가 나빠도 C-B 경로는 살아 있을 수 있다. A의 local timeout이 너무 공격적이었더라도 다른 helper가 B의 응답을 받을 수 있다. 이 덕분에 짧은 packet loss나 한쪽 네트워크 흔들림이 cluster-wide removal로 번지는 확률을 줄인다.\n\n하지만 indirect probe도 오탐을 완전히 없애지는 못한다. helper들이 같은 rack이나 AZ에 몰려 있으면 같은 장애를 함께 겪을 수 있다. timeout이 전체적으로 너무 짧으면 모든 helper가 실패할 수 있다. target이 긴 GC pause 중이면 어느 경로에서도 응답하지 못할 수 있다. 따라서 helper 수, timeout, peer selection은 false positive와 detection latency의 trade-off로 봐야 한다.\n\n## suspicion period\n\nDirect와 indirect probe가 모두 실패해도 바로 `dead`로 바꾸지 않고 `suspect` 상태를 둔다. suspicion period는 target이나 다른 노드가 더 최신 alive 정보를 퍼뜨릴 시간을 주는 window다.\n\n```text\nB suspect inc=3 rumor spreads\nB is actually alive\nB hears suspect rumor about itself\nB increments incarnation to 4\nB gossips alive inc=4\n```\n\n이 window가 없으면 짧은 pause가 곧바로 node removal이 된다. service discovery나 routing layer가 그 removal을 믿고 traffic을 끊거나 shard ownership을 바꾸면 작은 네트워크 흔들림이 더 큰 장애가 된다. suspicion은 \"아마 죽었을 수 있다\"와 \"죽었다고 확정했다\"를 분리하는 단계다.\n\n## incarnation number\n\nIncarnation number는 membership update의 최신성을 판단하는 version이다. SWIM에서 어떤 노드에 대한 rumor는 상태만으로 비교하면 부족하다. `B suspect`와 `B alive`가 동시에 돌 때 어느 쪽이 최신인지 알아야 한다. 그래서 `alive inc=4`는 `suspect inc=3`보다 최신이고, 오래된 suspect rumor를 refute할 수 있다.\n\n중요한 규칙은 보통 \"자기 자신만 자신의 incarnation을 올려 refute한다\"는 감각이다. 다른 노드가 마음대로 B의 incarnation을 올리면 rumor ordering이 깨진다. B가 살아 있고 자신에 대한 suspect rumor를 들었을 때 더 높은 incarnation의 alive update를 gossip해야 cluster가 최신 상태로 수렴한다.\n\n## 상태 전이 감각\n\n| 관측 | 바로 할 일 | 왜 바로 dead가 아닌가 |\n|---|---|---|\n| direct ping timeout | indirect probe 요청 | 단일 path 문제일 수 있다 |\n| indirect probe도 실패 | suspect rumor 전파 | GC pause나 partition일 수 있다 |\n| suspect period 중 alive higher inc 수신 | suspect refute | 더 최신 rumor가 도착했다 |\n| suspicion period 만료 | dead로 전이 가능 | 반박 window가 끝났다 |\n| 오래된 alive lower inc 수신 | 무시 | stale rumor가 최신 suspect/dead를 덮으면 안 된다 |\n\n이 표에서 핵심은 status 자체보다 version 비교다. `alive`라는 단어가 더 좋아 보여도 incarnation이 낮으면 오래된 정보일 수 있다. 반대로 `suspect`라도 higher incarnation이면 더 최신 관측일 수 있다. 구현은 상태 우선이 아니라 `(node, incarnation, status precedence)`를 안정적으로 비교해야 한다.\n\n## 운영 튜닝\n\n| 파라미터 | 너무 공격적일 때 | 너무 보수적일 때 | 관찰 지표 |\n|---|---|---|---|\n| direct timeout | false suspect 증가 | 장애 감지가 늦다 | RTT 분포, timeout rate |\n| indirect helper 수 | probe traffic 증가 | path diversity 부족 | ping-req 성공률, helper failure domain |\n| suspicion period | 살아 있는 노드 dead 처리 | 죽은 노드 제거가 늦다 | refutation 비율, dead 전환 latency |\n| gossip interval | rumor가 빨리 퍼지지만 traffic 증가 | cluster view 수렴 지연 | convergence time, duplicate rumor |\n| incarnation 처리 | stale rumor가 최신을 덮을 수 있다 | refute가 늦게 반영된다 | ignored stale update 수 |\n\n좋은 설정은 \"가장 빨리 dead를 찍는 값\"이 아니다. 운영에서는 false positive가 false negative보다 더 비쌀 때가 많다. 잠깐 느린 노드를 죽었다고 보고 traffic/routing/shard 상태를 바꾸면 회복 비용이 커진다. 반대로 실제 죽은 노드를 너무 오래 살려 두면 요청 실패가 길어진다. SWIM tuning은 이 두 비용의 균형이다.\n\n## Consensus membership과 다른 점\n\nSWIM은 failure detection과 membership rumor dissemination에 가깝다. 모든 노드가 같은 순간에 같은 membership decision을 선형화해서 commit하는 consensus가 아니다. 그래서 SWIM view는 잠깐 서로 다를 수 있고, 각 노드는 rumor를 통해 점진적으로 수렴한다.\n\n이 차이는 설계에서 중요하다. SWIM에서 `suspect`가 퍼졌다고 곧바로 irreversible ownership transfer를 하면 위험하다. shard rebalancing, leader lease, quorum membership 변경처럼 강한 결정이 필요한 곳은 별도 consensus나 fencing을 붙여야 한다. SWIM은 그런 결정의 입력 신호가 될 수 있지만, 최종 안전 장치를 대체하지 않는다.\n\n## 흔한 구현 함정\n\n- direct timeout만 보고 바로 member list에서 제거한다.\n- helper를 같은 failure domain에서만 골라 indirect probe 효과를 잃는다.\n- suspicion period가 너무 짧아 GC pause를 node death로 오인한다.\n- incarnation 비교 없이 늦게 도착한 stale rumor가 최신 상태를 덮는다.\n- `suspect`와 `dead`를 같은 의미로 downstream에 전달한다.\n- refutation이 gossip으로 충분히 퍼지기 전에 routing이 과감하게 바뀐다.\n\n## 답변 템플릿\n\n면접이나 설계 설명에서는 이렇게 말하면 된다.\n\n\"SWIM은 direct ping timeout을 죽음 확정으로 보지 않습니다. 먼저 ping-req로 다른 helper 경로에서 target을 확인하고, 그래도 실패하면 suspect로 전파한 뒤 suspicion period 동안 반박할 시간을 둡니다. 살아 있는 target은 자신의 incarnation을 올린 alive update로 오래된 suspect rumor를 refute합니다. 이 구조는 false positive를 줄이는 failure detector이지, membership 변경을 강하게 합의하는 consensus는 아닙니다.\"\n\n## 한 줄 정리\n\nSWIM의 indirect probe, suspicion period, incarnation number는 모두 false positive를 줄이기 위한 장치다. direct ping 실패는 죽음 확정이 아니라 의심의 시작이며, 최신 rumor 비교와 refutation window가 있어야 살아 있는 노드가 오래된 suspect/dead 소문에 밀려나지 않는다.\n",
   "aliases": [
     "SWIM indirect probe",
     "ping-req",
     "suspicion period",
     "incarnation number",
     "refute suspect",
+    "false positive detection",
     "간접 프로브",
     "의심 기간",
     "인카네이션 번호",
-    "false positive detection"
+    "SWIM 의심 전파"
   ],
   "expected_queries": [
-    "SWIM에서 direct ping이 실패하면 왜 ping-req indirect probe를 먼저 해?",
-    "suspicion period를 두지 않고 바로 dead 처리하면 어떤 false positive가 생겨?",
-    "incarnation number로 오래된 suspect rumor를 refute하는 방식이 뭐야?",
-    "GC pause나 packet loss 때문에 살아 있는 노드가 suspect가 될 수 있는 이유는?",
-    "SWIM indirect probe helper 수와 timeout을 어떻게 운영 지표로 봐야 해?",
-    "suspect rumor보다 높은 incarnation alive update가 최신 상태로 취급되는 이유를 설명해줘"
+    "SWIM에서 direct ping 실패 후 왜 ping-req indirect probe를 거쳐?",
+    "suspicion period 없이 바로 dead 처리하면 어떤 오탐이 생겨?",
+    "incarnation number로 오래된 suspect 소문을 어떻게 반박해?",
+    "GC pause나 packet loss 때문에 살아 있는 노드가 suspect가 되는 이유가 뭐야?",
+    "SWIM의 helper 수, timeout, suspicion 시간을 운영에서 어떻게 조정해?",
+    "SWIM failure detection과 consensus membership은 무엇이 달라?"
   ],
   "symptoms": [
     "direct ping timeout만 보고 노드를 dead로 제거한다",
@@ -49,8 +50,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/swim-indirect-probe-suspicion-incarnation-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

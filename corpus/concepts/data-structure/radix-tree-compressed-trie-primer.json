@@ -6,15 +6,21 @@
   "summary": "이 primer는 Radix Tree를 path-compressed Trie로 설명하고 prefix search에서의 trade-off를 다룬다.",
   "body_markdown": "# Radix Tree Compressed Trie Primer\n\n## 한 줄 요약\n\n래딕스 트리(Radix Tree)는 한 글자씩 노드를 두는 트라이(Trie)를 경로 압축(path compression)해서, 분기 없는 연속 문자열을 하나의 edge label로 합친 prefix tree다.\n\n## 미션 진입 증상\n\n자동완성, route matching, IP prefix lookup처럼 prefix 기반 탐색이 필요한데 plain Trie의 노드 수가 너무 많아 보이면 compressed trie를 검토한다. 특히 긴 문자열이 많지만 실제 분기 지점은 적을 때 효과가 잘 보인다.\n\n## Trie와의 차이\n\nPlain Trie는 보통 edge 하나가 문자 하나 또는 token 하나를 뜻한다. 그래서 `romane`, `romanus`, `rubens`를 넣으면 `r -> o -> m -> a -> n` 같은 긴 단일 경로가 여러 노드로 펼쳐진다.\n\nRadix Tree는 분기가 없는 구간을 edge label 하나로 압축한다.\n\n```text\nplain trie:   r - o - m - a - n - e\ncompressed:   rom            an\n                \\             \\\n                 rub...        e / us\n```\n\n정확한 모양은 구현마다 다르지만 mental model은 같다. node는 \"여기서 key가 끝나거나, 다음 후보가 둘 이상으로 갈라지는 지점\"이고 edge는 그 사이의 문자열 조각이다.\n\n| 구분 | Plain Trie | Radix Tree |\n|---|---|---|\n| edge label | 보통 한 문자/토큰 | 여러 문자/토큰 문자열 |\n| 노드 수 | key 길이에 비례해 커지기 쉽다 | 분기점 수에 더 가깝다 |\n| lookup | 문자마다 child 이동 | edge label 전체 또는 일부 비교 |\n| insert/delete | 상대적으로 단순 | edge split/merge가 필요 |\n| 장점 | 구현 단순성 | 메모리 절감, pointer chasing 감소 |\n\n## 핵심 mental model\n\n탐색은 \"현재 query suffix가 어떤 edge label과 공통 prefix를 갖는가\"를 비교하며 내려간다.\n\n1. 현재 node의 outgoing edge 중 query의 다음 token과 같은 첫 token을 찾는다.\n2. 해당 edge label과 query suffix를 앞에서부터 비교한다.\n3. edge label이 전부 맞으면 label 길이만큼 query를 소비하고 child로 내려간다.\n4. query가 edge 중간에서 끝나면 exact match는 terminal 여부에 달리고, prefix match라면 그 edge 아래 후보가 존재할 수 있다.\n5. edge 중간에서 불일치하면 lookup 실패다.\n\n삽입에서는 edge 중간에서 공통 prefix가 끝날 수 있다. 이때 기존 edge를 공통 prefix edge와 나머지 edge로 split하고, 새 key의 나머지 suffix를 새 edge로 붙인다.\n\n예를 들어 기존 key `spring`이 있고 `sprout`을 넣으면 `spr` 아래에 `ing`, `out` 두 edge가 생겨야 한다. 이 split이 없으면 둘 중 하나의 key를 잃거나, 같은 node 아래 edge 첫 글자가 겹쳐 lookup이 모호해진다.\n\n## 불변식과 trade-off\n\nRadix Tree의 correctness는 압축 자체보다 edge invariant에 달려 있다.\n\n- 한 node의 outgoing edge들은 같은 첫 token을 공유하면 안 된다.\n- non-terminal node가 자식 하나만 갖는 상태는 가능하면 parent edge와 merge해 압축 상태를 유지한다.\n- key가 edge label 중간에서 끝날 수 있으므로 terminal marker는 node에 명확히 둔다. 필요하면 split해서 terminal node를 만든다.\n- exact lookup과 prefix lookup은 terminal 여부를 다르게 해석한다.\n- 삭제 뒤 자식이 하나뿐인 non-terminal node가 생기면 edge label을 merge할 수 있다.\n\n이 방식은 메모리를 줄이고 cache locality를 개선할 수 있지만, 삽입/삭제 때 edge label split/merge 구현이 더 복잡하다. 특히 Java 문자열을 자주 `substring`으로 잘라 새 객체를 만들면 압축으로 줄인 메모리를 allocation churn으로 다시 잃을 수 있다. 운영 구현에서는 label을 원본 key slice, byte array view, segment token 배열 등으로 표현할지까지 같이 정한다.\n\n## lookup trade-off\n\n복잡도는 단순히 `O(m)`이라고 말할 수 있지만, 상수항이 plain Trie와 다르다. `m`은 query 길이다.\n\n| 비용 축 | Radix Tree에서의 의미 |\n|---|---|\n| 비교 비용 | edge label을 여러 token 단위로 비교한다. 긴 label 비교는 빠른 bulk compare가 가능하지만 mismatch 위치를 찾아야 한다. |\n| 포인터 이동 | plain Trie보다 node 수가 적어 pointer chasing이 줄 수 있다. |\n| child 선택 | outgoing edge를 배열, 정렬 배열, Map, adaptive node 중 무엇으로 두는지에 따라 달라진다. |\n| update 비용 | insert/delete가 split/merge와 label 재배치를 동반한다. |\n| prefix enumeration | prefix node 또는 edge 중간 위치를 찾은 뒤 subtree를 순회해야 하므로 후보 수 비용은 여전히 남는다. |\n\n따라서 Radix Tree는 \"항상 Trie보다 빠른 구조\"가 아니다. key가 짧고 alphabet이 작고 update 코드 단순성이 중요하면 plain Trie가 낫다. 반대로 긴 key, sparse branching, prefix/longest-prefix match가 많으면 Radix Tree의 장점이 커진다.\n\n## exact, prefix, longest-prefix 구분\n\nRadix Tree를 쓸 때는 lookup semantics를 먼저 정해야 한다.\n\n- exact lookup: query 전체를 소비했고 terminal marker가 있어야 성공한다.\n- prefix search: query prefix를 소비한 지점 아래의 모든 terminal key를 후보로 모은다. query가 edge 중간에서 끝나도 그 edge 아래 후보가 prefix 후보가 될 수 있다.\n- longest-prefix match: router나 IP table처럼 query를 끝까지 소비하지 않아도 지나온 terminal 중 가장 긴 것을 답으로 삼는다.\n\nURL router에서는 `/api/orders/123`가 `/api/orders` rule에 걸리는지, segment boundary를 반드시 맞춰야 하는지 정책이 중요하다. 문자 단위 radix tree에 `/api/order`와 `/api/orders`를 넣으면 단순 prefix는 맞지만 route boundary는 다를 수 있다. path router라면 `/`로 나눈 segment를 token으로 삼는 radix tree가 더 안전할 수 있다.\n\n## 흔한 오해\n\nRadix Tree는 substring search용 만능 구조가 아니다. Prefix search에 강하고, 긴 본문 내부 substring 질의는 suffix array나 suffix automaton 계열이 더 맞을 수 있다. 또한 HashMap이 exact key lookup에 충분한 문제를 굳이 Radix Tree로 바꾸면 구현 비용만 늘 수 있다.\n\n또 하나의 오해는 \"compressed edge니까 문자열이면 무조건 이득\"이라는 생각이다. edge label 비교, split 객체 생성, Unicode normalization, concurrent update까지 들어가면 구현 비용이 plain Trie나 HashMap보다 훨씬 커진다. read-mostly dictionary라면 FST처럼 더 강하게 압축하는 구조가 낫고, ordered range scan이 핵심이면 TreeMap/B-tree 계열을 비교해야 한다.\n\n## 선택 기준\n\n| 질문 | 먼저 볼 구조 | 이유 |\n|---|---|---|\n| exact key lookup만 필요한가 | HashMap | prefix 구조를 살 필요가 없다 |\n| prefix 후보를 자주 모으고 구현 단순성이 중요한가 | Plain Trie | edge split/merge가 없다 |\n| 긴 key와 sparse branching 때문에 Trie 노드 수가 부담인가 | Radix Tree | single-child path를 edge label로 압축한다 |\n| fan-out 분포와 CPU cache locality까지 최적화해야 하나 | Adaptive Radix Tree | node representation을 fan-out에 맞춘다 |\n| read-mostly dictionary를 매우 작게 저장해야 하나 | FST | minimal automaton 압축이 더 강할 수 있다 |\n| 내부 substring 검색이 필요한가 | Suffix Array / Suffix Automaton | prefix tree의 문제가 아니다 |\n\n## 검증 체크리스트\n\nRadix Tree 구현은 작은 예제에서 split/merge bug가 잘 드러난다.\n\n- `romane`, `romanus`, `rubens`를 넣고 공통 prefix 분기가 의도대로 생기는지 확인한다.\n- `spring` 다음 `sprout` 삽입 시 `spr` split이 생기고 두 key가 모두 exact match되는지 확인한다.\n- terminal로 넣지 않은 `spr`이 exact lookup에서는 false인지 확인한다.\n- `prefix(\"spr\")`는 `spring`, `sprout`을 모두 찾는지 확인한다.\n- 삭제 뒤 자식 하나만 남은 non-terminal node가 merge되어도 남은 key lookup이 깨지지 않는지 확인한다.\n- route나 IP prefix 용도라면 longest-prefix match가 exact lookup과 섞이지 않는지 확인한다.\n\n## 드릴 축\n\n답변은 \"Trie의 node explosion\", \"compressed edge label\", \"outgoing edge 첫 token uniqueness\", \"edge label 비교\", \"split/merge 복잡도\", \"exact/prefix/longest-prefix lookup 차이\", \"prefix search에 적합\"을 포함한다. 예시는 `romane`, `romanus`, `rubens`처럼 공통 prefix가 갈라지는 단어 집합으로 설명하면 좋다.\n\n## Safe Next Docs\n\n문자열 index 선택은 `suffix-array-trie-hash-string-index-chooser`, prefix vs exact lookup 경계는 `trie-vs-hashmap-prefix-interview-chooser`로 이어진다.\n",
   "aliases": [
-    "radix tree compressed trie primer",
-    "compressed trie radix tree 입문",
-    "path compressed prefix tree",
-    "접두사 트리 압축 구조"
+    "래딕스 트리 입문",
+    "압축 트라이 구조",
+    "path compressed trie",
+    "prefix tree split merge",
+    "접두사 검색 자료구조",
+    "라우팅 테이블 prefix match",
+    "compressed trie 선택 기준",
+    "longest prefix match 트리"
   ],
   "expected_queries": [
-    "Radix Tree는 Trie와 뭐가 달라?",
-    "compressed trie는 메모리를 어떻게 줄여?",
-    "prefix routing table은 어떤 자료구조를 써?"
+    "래딕스 트리는 일반 트라이와 뭐가 달라?",
+    "압축 트라이에서 edge split은 왜 필요해?",
+    "prefix search에는 HashMap보다 Trie가 언제 나아?",
+    "URL 라우터에서 longest prefix match를 어떻게 처리해?",
+    "Radix Tree를 쓰면 항상 Trie보다 빠른가?"
   ],
   "symptoms": [
     "Trie가 항상 문자 하나당 노드 하나라고 생각합니다",
@@ -41,6 +47,11 @@
     "created_at": "2026-05-24",
     "last_modified": "2026-05-24",
     "legacy_path": "knowledge/cs/contents/data-structure/radix-tree-compressed-trie-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
+      }
+    ]
   }
 }

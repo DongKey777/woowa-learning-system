@@ -4,27 +4,26 @@
   "category": "database",
   "level": "advanced",
   "summary": "PostgreSQL vacuum, bloat, freeze, autovacuum을 MVCC visibility와 query latency 관점으로 진단하는 database playbook",
-  "body_markdown": "# PostgreSQL Vacuum Bloat Freeze Autovacuum Latency Playbook\n\n## 이 문서가 맡는 질문\nPostgreSQL vacuum, bloat, freeze, autovacuum을 MVCC visibility와 query latency 관점으로 진단하는 database playbook. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\ndead tuple과 bloat를 분리하고, freeze age와 autovacuum lag를 본다. index bloat와 visibility map 상태를 확인한 뒤 query p99와 checkpoint I/O를 같이 본다.\n\n## 실전 시나리오\nUPDATE가 많은 테이블에서 index scan은 느려지고 autovacuum은 계속 돌지만 bloat가 줄지 않는다. freeze age 경고와 query latency spike가 같은 시간대에 나온다.\n\n## CS 배경\nPostgreSQL MVCC는 old row version을 남기고 vacuum이 dead tuple을 회수한다. freeze는 transaction id wraparound를 막기 위한 별도 안전장치라 단순 청소와 다르다.\n\n## 핵심 불변식\n- dead tuple이 남아도 snapshot이 참조 중이면 제거하면 안 된다\n- freeze age는 wraparound safety와 직접 연결된다\n- index bloat는 heap vacuum만으로 해결되지 않을 수 있다\n- autovacuum cost delay는 foreground latency와 maintenance debt 사이의 tradeoff다\n\n## 판단 매트릭스\n- dead_tuple/bloat면 vacuum 통계와 table/index size\n- freeze 위험이면 age와 relfrozenxid\n- query p99면 visibility map과 heap fetch\n- maintenance window면 reindex/cluster/pg_repack 후보 분리\n\n## 예시\n```text\nn_dead_tup high + old xmin pinned -> find long transaction before tuning autovacuum\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\nvacuum은 성능 최적화가 아니라 MVCC garbage collection과 wraparound safety를 함께 맡는다. idle transaction이 하나만 남아도 vacuum의 의미가 달라진다.\n\n## 품질 관점\n품질은 PostgreSQL vacuum의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 long transaction, HOT update, index-only scan heap fetch, freeze threshold를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. dead tuple growth, autovacuum worker capacity, index bloat, I/O throttling를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. aggressive vacuum, checkpoint/writeback burst, heap fetch p99, lock wait during maintenance가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\nn_dead_tup, autovacuum_lag_seconds, relfrozenxid_age, index_bloat_ratio, heap_fetches, query_p99를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- VACUUM FULL만이 vacuum이라고 생각한다\n- autovacuum을 끄면 latency가 안정된다고 본다\n- bloat와 freeze 위험을 같은 문제로 묶는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## 한 줄 정리\nPostgreSQL vacuum은 dead tuple 청소, bloat 관리, freeze safety, query p99를 함께 보는 운영 루프다.\n",
+  "body_markdown": "# PostgreSQL Vacuum Bloat Freeze Autovacuum Latency Playbook\n\n## 이 문서가 맡는 질문\n\nPostgreSQL에서 vacuum, bloat, freeze, autovacuum lag가 query latency와 어떻게 연결되는지 진단하는 playbook이다. 이 문서는 VACUUM 명령 이름을 외우는 자료가 아니라, MVCC visibility, dead tuple 회수, transaction id wraparound 방지, p99 latency를 한 번에 분리해서 판단하는 기준을 제공한다.\n\n## 빠른 분기\n\n증상을 먼저 네 갈래로 나눈다.\n\n| 증상 | 먼저 볼 지표 | 자주 놓치는 원인 |\n|---|---|---|\n| dead tuple 증가 | `n_dead_tup`, last autovacuum | long transaction, old replication slot |\n| table bloat 증가 | table size, live/dead tuple 추정 | update pattern, fillfactor, HOT 실패 |\n| freeze age 경고 | `age(relfrozenxid)`, freeze max age | anti-wraparound vacuum 지연 |\n| query p99 spike | heap fetch, I/O, lock wait | visibility map 비어 index-only scan 실패 |\n\n중요한 점은 bloat와 freeze를 같은 문제로 묶지 않는 것이다. bloat는 공간과 scan 비용 문제이고, freeze는 transaction id wraparound safety 문제다. 둘 다 vacuum과 관련 있지만 위험의 성격과 대응 우선순위가 다르다.\n\n## CS 배경\n\nPostgreSQL MVCC는 UPDATE/DELETE 때 기존 row version을 바로 덮어쓰지 않는다. 다른 transaction snapshot이 아직 그 버전을 볼 수 있기 때문에 old tuple은 dead 상태가 되어도 즉시 제거되지 않는다. vacuum은 더 이상 어떤 snapshot도 필요로 하지 않는 dead tuple을 회수하고, visibility map을 갱신하며, freeze가 필요한 tuple의 transaction id를 안전한 값으로 바꾼다.\n\n따라서 vacuum은 단순 성능 최적화가 아니다. garbage collection, index-only scan 지원, transaction id wraparound 방지, maintenance I/O 제어가 한 작업에 섞여 있다.\n\n## 핵심 불변식\n\n- dead tuple이 남아도 오래된 snapshot이 참조 중이면 제거하면 안 된다.\n- `relfrozenxid` age가 커질수록 wraparound risk가 커진다.\n- heap tuple을 정리해도 index bloat가 자동으로 모두 줄어드는 것은 아니다.\n- visibility map이 충분히 채워져야 index-only scan이 heap fetch를 줄일 수 있다.\n- autovacuum cost delay와 worker capacity는 foreground latency와 maintenance debt 사이의 tradeoff다.\n\n## autovacuum이 돌지만 bloat가 줄지 않을 때\n\nautovacuum 로그나 통계에 실행 기록이 있다는 사실만으로 회수가 성공했다고 볼 수 없다. 아래를 순서대로 확인한다.\n\n1. 오래 열린 transaction, idle in transaction, prepared transaction, logical replication slot이 old xmin을 붙잡는지 본다.\n2. update가 HOT update로 처리되는지, indexed column update 때문에 index entry가 계속 늘어나는지 본다.\n3. autovacuum worker 수와 cost limit이 write workload를 따라가는지 본다.\n4. table bloat와 index bloat를 분리한다. heap vacuum만으로 부풀어진 index가 줄어들지 않을 수 있다.\n5. VACUUM FULL, CLUSTER, REINDEX, pg_repack 같은 rewrite 선택지는 lock과 운영 영향도를 따로 계산한다.\n\n```text\nn_dead_tup high + old xmin pinned -> autovacuum knob보다 long transaction 제거가 먼저다.\n```\n\n## freeze와 latency를 함께 보는 이유\n\nfreeze age 경고는 지금 당장 느린 쿼리 하나의 원인이라기보다, maintenance debt가 안전 영역을 벗어나고 있다는 신호다. 다만 debt가 커지면 anti-wraparound vacuum이 더 공격적으로 돌고, 이때 I/O와 lock 경합이 tail latency를 키울 수 있다.\n\n`age(relfrozenxid)`가 높고 autovacuum lag가 길다면 다음을 분리한다.\n\n- freeze 자체가 필요한가, dead tuple cleanup이 필요한가.\n- user query p99가 I/O 대기, lock wait, heap fetch 중 어디에서 늘어났는가.\n- checkpoint, background writer, autovacuum I/O가 같은 시간대에 겹쳤는가.\n- table별 debt가 한 곳에 몰렸는가, 전체 worker capacity가 부족한가.\n\n## visibility map과 index-only scan\n\nindex-only scan은 index만 읽는다는 이름과 달리, heap tuple이 모든 transaction에 visible하다는 근거가 필요하다. visibility map bit가 비어 있으면 PostgreSQL은 heap을 다시 확인해야 한다. 그래서 vacuum이 늦어지고 visibility map이 비면 같은 query plan이라도 heap fetch가 늘고 p99가 튈 수 있다.\n\n이 장면에서는 단순히 index를 더 만들기보다 아래를 먼저 본다.\n\n- `Heap Fetches`가 증가했는가.\n- vacuum 이후 visibility map이 회복되는가.\n- update가 잦은 table에서 index-only scan을 기대하는 것이 현실적인가.\n- covering index가 있어도 MVCC visibility 확인 비용이 남는지 설명할 수 있는가.\n\n## 운영 대응 선택지\n\n| 선택지 | 효과 | 주의점 |\n|---|---|---|\n| autovacuum scale factor 조정 | 더 빨리 vacuum 시작 | 작은 table과 큰 table의 threshold가 다름 |\n| cost limit/delay 조정 | maintenance 속도 변경 | foreground I/O와 충돌 가능 |\n| fillfactor 조정 | HOT update 가능성 증가 | 저장 공간을 일부 포기 |\n| REINDEX CONCURRENTLY | index bloat 완화 | 시간과 추가 디스크 필요 |\n| VACUUM FULL | heap rewrite로 공간 반환 | 강한 lock, 운영 중 위험 |\n| pg_repack | lock을 줄인 rewrite 후보 | extension, 추가 공간, 절차 필요 |\n\nautovacuum을 끄는 것은 보통 해결책이 아니다. 일시적으로 p99가 조용해 보여도 dead tuple, bloat, freeze debt가 더 커져 다음 장애를 키운다.\n\n## 성능과 레이턴시 관점\n\n평균 처리량 하나로 판단하지 않는다. `n_dead_tup`, table size, index size, `relfrozenxid` age, autovacuum duration, heap fetch, checkpoint write time, query p95/p99를 같은 시간축에 놓는다. vacuum 자체의 latency 영향과 vacuum이 밀려서 생긴 latency 영향을 분리해야 한다.\n\n실전 대시보드는 최소한 아래 축을 갖는다.\n\n- table별 dead tuple 증가율과 last autovacuum 시각\n- relation별 freeze age와 wraparound threshold 대비 비율\n- index-only scan의 heap fetch 변화\n- autovacuum worker 사용률과 실행 시간\n- query p99, lock wait, I/O wait, checkpoint burst\n\n## 진단 쿼리 읽는 법\n\n실제 운영에서는 한 쿼리 결과만 보고 결론내리지 않는다. `pg_stat_all_tables`에서 `n_dead_tup`, `last_autovacuum`, `vacuum_count`를 보고, relation size와 index size 추이를 같이 본다. `pg_stat_activity`에서는 오래 열린 transaction과 `idle in transaction`을 찾고, replication slot이나 long-running replica query가 xmin을 붙잡는지도 확인한다.\n\n숫자는 절대값보다 변화율과 table별 편차가 중요하다. 큰 table의 `n_dead_tup` 10만 개와 작은 table의 10만 개는 의미가 다르다. 그래서 threshold는 table size, write rate, query pattern과 함께 읽어야 한다. autovacuum 튜닝도 global parameter 하나로 끝내기보다 table별 storage parameter가 필요한지 판단한다.\n\n## 운영 변경의 안전 순서\n\n먼저 old xmin을 붙잡는 원인을 제거하고, 그 다음 autovacuum이 따라잡을 수 있는지 본다. 곧바로 VACUUM FULL을 실행하면 공간은 줄 수 있지만 강한 lock 때문에 장애가 커질 수 있다. 운영 중에는 `REINDEX CONCURRENTLY`, table별 autovacuum threshold 조정, fillfactor 조정, 배치 write rate 제한처럼 lock budget이 작은 선택지를 먼저 검토한다.\n\n변경 후에는 table size만 보지 않는다. query p99, heap fetch, autovacuum duration, checkpoint write burst, lock wait가 같이 좋아지는지 본다. bloat가 줄었지만 p99가 악화됐다면 maintenance 작업이 foreground I/O와 충돌했을 수 있다. 반대로 p99만 잠깐 좋아지고 freeze age가 계속 올라가면 safety debt가 남아 있는 것이다.\n\n## 면접 답변 템플릿\n\n짧게 답할 때는 이렇게 말한다. PostgreSQL vacuum은 MVCC 때문에 생긴 dead tuple을 회수하고 visibility map과 freeze safety를 관리한다. autovacuum이 돈다는 사실보다 old transaction이 cleanup을 막는지, bloat가 heap인지 index인지, freeze age가 wraparound threshold에 가까운지, 그리고 visibility map 부족이 heap fetch와 query p99를 올리는지를 순서대로 본다. 운영 대응은 autovacuum tuning만이 아니라 long transaction 제거, fillfactor, reindex, rewrite 작업의 lock budget까지 포함해서 고른다.\n\n## 자주 하는 오해\n\n- VACUUM FULL만이 vacuum이라고 생각한다.\n- autovacuum을 끄면 latency가 안정된다고 본다.\n- bloat와 freeze 위험을 같은 문제로 묶는다.\n- index-only scan이 항상 heap을 안 읽는다고 생각한다.\n- autovacuum이 실행됐다는 사실만으로 dead tuple 회수가 끝났다고 본다.\n\n## 실전 검증 루프\n\n1. 느린 query와 table을 고정한다.\n2. query plan에서 heap fetch, I/O, lock wait를 확인한다.\n3. table 통계에서 live/dead tuple, last vacuum, analyze 시각을 본다.\n4. `relfrozenxid` age와 old xmin pinning 원인을 확인한다.\n5. heap bloat와 index bloat를 따로 추정한다.\n6. autovacuum tuning, index rebuild, table rewrite 중 운영 lock budget에 맞는 후보를 고른다.\n7. 변경 후 p99와 maintenance debt가 함께 줄었는지 확인한다.\n\n## 한 줄 정리\n\nPostgreSQL vacuum은 dead tuple 청소, bloat 관리, freeze safety, query p99를 함께 보는 운영 루프다.\n",
   "aliases": [
-    "PostgreSQL vacuum bloat freeze autovacuum latency",
-    "dead tuple relfrozenxid autovacuum lag",
-    "visibility map heap fetch index bloat",
-    "PostgreSQL vacuum bloat",
-    "autovacuum lag latency",
-    "vacuum 지연",
-    "테이블 bloat",
-    "freeze age 경고",
-    "dead tuple 증가",
-    "heap fetch p99",
-    "autovacuum 안 줄어듦"
+    "autovacuum lag 진단",
+    "PostgreSQL dead tuple 증가",
+    "visibility map heap fetch",
+    "freeze age wraparound 경고",
+    "테이블 bloat p99 지연",
+    "인덱스 bloat 재색인",
+    "vacuum 지연 query latency",
+    "relfrozenxid age 확인",
+    "idle transaction vacuum 막힘",
+    "index only scan heap fetch"
   ],
   "expected_queries": [
-    "PostgreSQL에서 vacuum, bloat, freeze는 latency와 어떻게 연결돼?",
-    "autovacuum이 도는데도 테이블 bloat가 줄지 않으면 뭘 봐야 해?",
-    "freeze age 경고와 query p99 spike를 같이 어떻게 진단해?",
-    "PostgreSQL에서 vacuum 지연과 bloat가 query latency를 왜 올려?",
-    "dead tuple이 늘고 visibility map이 비어 index only scan이 heap fetch로 바뀌면 p99가 왜 튀어?",
-    "autovacuum lag와 relfrozenxid freeze age를 latency 장애에서 어떤 순서로 확인해?"
+    "PostgreSQL에서 vacuum 지연이 query p99를 올릴 때 어떤 지표부터 봐야 해?",
+    "autovacuum이 계속 도는데 dead tuple과 bloat가 줄지 않는 이유는 뭐야?",
+    "freeze age 경고와 relfrozenxid를 latency 장애에서 어떻게 해석해?",
+    "visibility map이 비어서 index only scan이 heap fetch로 바뀌면 왜 느려져?",
+    "idle transaction이 vacuum과 bloat 정리에 어떤 영향을 줘?",
+    "VACUUM FULL, REINDEX, pg_repack 중 운영 중에는 무엇을 골라야 해?"
   ],
   "symptoms": [
     "autovacuum lag bloat",
@@ -65,7 +64,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -74,6 +73,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch146"
       }
     ]
   }
