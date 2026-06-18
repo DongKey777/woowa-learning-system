@@ -6,6 +6,11 @@
   "summary": "explicit proxy는 CONNECT나 일반 HTTP 요청 전에 인증이 필요할 수 있고, 407은 그 경계가 아직 통과되지 않았다는 신호다.",
   "body_markdown": "# HTTP Proxy Auth, 407, Explicit Proxy\n\n> 한 줄 요약: explicit proxy는 CONNECT나 일반 HTTP 요청 전에 인증이 필요할 수 있고, 407은 그 경계가 아직 통과되지 않았다는 신호다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [HTTP Proxy CONNECT Tunnels](./http-proxy-connect-tunnels.md)\n> - [Proxy Header Normalization Chain, Trust Boundary](./proxy-header-normalization-chain-trust-boundary.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [Captive Portal, Intercepting Proxy Behavior](./captive-portal-intercepting-proxy-behavior.md)\n> - [ALB, ELB Retry Amplification, Proxy Chain](./alb-elb-retry-amplification-proxy-chain.md)\n\nretrieval-anchor-keywords: HTTP proxy auth, 407, explicit proxy, proxy authentication, proxy-authorization, connect tunnel, proxy ACL, enterprise proxy, credential prompt\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nexplicit proxy는 클라이언트가 명시적으로 통과해야 하는 프록시다.\n\n- 요청 전에 인증이 필요할 수 있다\n- 인증 실패는 `407 Proxy Authentication Required`로 보인다\n- CONNECT 터널과 일반 HTTP 요청 모두에 적용될 수 있다\n\n### Retrieval Anchors\n\n- `HTTP proxy auth`\n- `407`\n- `explicit proxy`\n- `proxy authentication`\n- `proxy-authorization`\n- `connect tunnel`\n- `proxy ACL`\n- `enterprise proxy`\n- `credential prompt`\n\n## 깊이 들어가기\n\n### 1. 407이 의미하는 것\n\n407은 origin 서버가 아니라 **프록시가** 인증을 요구하는 응답이다.\n\n- `WWW-Authenticate`가 아니라 `Proxy-Authenticate` 계열을 본다\n- 클라이언트는 `Proxy-Authorization` 헤더를 보내야 한다\n- 인증이 통과돼야 다음 단계로 간다\n\n### 2. 왜 enterprise 환경에서 자주 보이나\n\n사내 네트워크는 보통 outbound를 통제한다.\n\n- 인터넷 접근을 감사해야 한다\n- 허용된 사용자인지 확인해야 한다\n- 특정 도메인/포트를 제한해야 한다\n\n그래서 proxy auth가 흔하다.\n\n### 3. CONNECT와 어떻게 엮이나\n\nCONNECT도 proxy auth 뒤에서 열릴 수 있다.\n\n- 먼저 proxy 인증\n- 그 다음 터널 생성\n- 이후 TLS handshake 또는 TCP 데이터 전송\n\n즉, 인증이 안 되면 터널도 없다.\n\n### 4. 왜 디버깅이 어려운가\n\n- 브라우저는 credential prompt를 띄울 수 있다\n- CLI는 환경변수나 옵션으로 proxy를 넘겨야 한다\n- 앱은 proxy 인증 실패를 origin 실패처럼 보일 수 있다\n\n### 5. proxy ACL과의 관계\n\n인증만 통과해도 모든 목적지가 열리는 것은 아니다.\n\n- 호스트/포트 ACL\n- 카테고리 정책\n- 시간대별 정책\n\n이 겹치면 407 이후에 또 다른 거절이 있을 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 브라우저에서만 인터넷이 안 된다\n\nexplicit proxy 인증이 요구될 수 있다.\n\n### 시나리오 2: curl은 되는데 앱은 안 된다\n\n앱이 `Proxy-Authorization`을 전달하지 않거나 proxy 설정이 빠졌을 수 있다.\n\n### 시나리오 3: CONNECT는 되는데 HTTPS가 실패한다\n\nproxy auth는 통과했지만 downstream TLS/SNI 문제일 수 있다.\n\n## 코드로 보기\n\n### curl 예시\n\n```bash\ncurl -x http://proxy.example.com:3128 --proxy-user user:pass https://example.com -v\n```\n\n### 407 응답 감각\n\n```text\n407 Proxy Authentication Required\nProxy-Authenticate: Basic realm=\"corp\"\n```\n\n### 체크 포인트\n\n```text\n- is proxy auth enabled?\n- does CONNECT require auth?\n- are host/port ACLs separate?\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| explicit proxy auth | 통제가 쉽다 | 설정과 디버깅이 복잡하다 | 기업망 |\n| direct outbound | 단순하다 | 정책/감사가 약하다 | 신뢰망 |\n| proxy + ACL | 유연하다 | 정책이 복잡해진다 | 보안 게이트 |\n\n핵심은 407을 \"에러\"로만 보지 말고 **아직 신뢰 경계를 넘지 못했다는 신호**로 보는 것이다.\n\n## 운영 playbook\n\n### 재현 조건\n\n- 같은 URL이 브라우저에서는 credential prompt 후 열리지만 `curl`, JVM 앱, CI runner에서는 407로 실패한다.\n- HTTPS 요청에서 `CONNECT host:443` 단계가 끝나기 전에 proxy가 407을 반환한다.\n- proxy 인증은 통과했지만 별도 host/port ACL 또는 category policy에서 차단된다.\n\n### 확인 순서\n\n1. 응답 주체가 origin인지 proxy인지 status line과 `Proxy-Authenticate` 헤더로 확인한다.\n2. 클라이언트가 proxy 설정과 `Proxy-Authorization`을 실제로 보내는지 verbose log로 본다.\n3. CONNECT 요청이 인증 전/후 어느 단계에서 끊기는지 나눈다.\n4. 인증 성공 후에도 proxy ACL, SNI, destination port 정책이 따로 실패하는지 확인한다.\n\n### failure matrix\n\n| 관찰 | 더 가능성 높은 원인 | 다음 확인 |\n|---|---|---|\n| 401이 아니라 407 | origin 인증이 아니라 proxy 인증 문제 | `Proxy-Authenticate`, proxy config |\n| 브라우저만 성공 | 브라우저가 credential prompt/OS proxy 설정을 사용 | 앱 proxy env, JVM proxy property |\n| CONNECT 전에 407 | tunnel 생성 전 proxy auth 필요 | `curl -v -x ... --proxy-user ...` |\n| 407 이후 403/blocked page | 인증 이후 ACL 또는 category policy | host/port allowlist, proxy local reply |\n\n### 검증\n\n- proxy 인증 실패, origin 인증 실패, ACL 차단이 로그와 사용자 메시지에서 분리된다.\n- 앱 설정에 proxy host/port/credential 주입 경로가 있고 secret 노출 없이 갱신된다.\n- CONNECT/TLS/SNI 문제를 407로 잘못 묶지 않는다.\n\n## 꼬리질문\n\n> Q: 407은 무엇을 뜻하나요?\n> 핵심: 프록시 인증이 필요하다는 뜻이다.\n\n> Q: Proxy-Authorization은 어디에 쓰이나요?\n> 핵심: 프록시 인증을 통과시키는 요청 헤더다.\n\n> Q: CONNECT와의 관계는?\n> 핵심: 인증이 먼저이고, 그 다음에 터널이 열린다.\n\n## 한 줄 정리\n\nHTTP proxy auth의 407은 explicit proxy 경계에서 인증이 아직 끝나지 않았다는 뜻이며, CONNECT와 ACL까지 같이 봐야 한다.\n",
   "aliases": [
+    "HTTP Proxy Auth, 407, 개념",
+    "HTTP Proxy Auth, 407, 정리",
+    "HTTP Proxy Auth, 407, 실수",
+    "HTTP Proxy Auth, 407, 판단 기준",
+    "네트워크 HTTP Proxy Auth, 407,",
     "HTTP proxy auth",
     "407 Proxy Authentication Required",
     "explicit proxy",
@@ -50,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/http-proxy-auth-407-explicit-proxy.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch159"
+      }
+    ]
   }
 }

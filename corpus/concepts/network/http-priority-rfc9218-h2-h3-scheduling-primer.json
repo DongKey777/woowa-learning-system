@@ -6,14 +6,18 @@
   "summary": "이 문서는 RFC 9218 HTTP Priority를 Priority header, urgency u=0..7, incremental i, PRIORITY_UPDATE, HTTP/2 legacy priority tree, HTTP/3 scheduling differences, browser waterfall starvation 증상으로 설명하는 intermediate network primer다.",
   "body_markdown": "# HTTP Priority RFC 9218, H2/H3 Scheduling Primer\n\n> 한 줄 요약: HTTP Priority는 \"중요한 응답을 먼저 보내 달라\"는 scheduling hint이며, H2/H3 multiplexing, flow control, server policy를 대신하는 보장 장치가 아니다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [HTTP/2 Multiplexing and HOL Blocking](./http2-multiplexing-hol-blocking.md)\n- [HTTP/2 Flow Control, WINDOW_UPDATE, Stall](./http2-flow-control-window-update-stalls.md)\n- [HTTP/2 MAX_CONCURRENT_STREAMS, Pending Queue, Saturation](./http2-max-concurrent-streams-pending-queue-saturation.md)\n- [HTTP/2 vs HTTP/3 비교 chooser](./http2-vs-http3-comparison-chooser.md)\n- [HTTP/3 QUIC HOL, UDP Loss, Fallback, Migration Chooser](./http3-quic-head-of-line-connection-migration-chooser.md)\n- [Browser DevTools Waterfall Primer](./browser-devtools-waterfall-primer.md)\n\n검증 기준: RFC 9218의 Priority header, urgency, incremental, PRIORITY_UPDATE 개념과 RFC 9114의 HTTP/3 priority 차이를 운영 scheduling 관점으로 정리했다.\n\nretrieval-anchor-keywords: HTTP Priority, RFC 9218, Priority header, urgency u, incremental i, PRIORITY_UPDATE, H2 priority tree, H3 priority, resource scheduling, browser waterfall\n\n## Observable Symptoms\n\nHTTP Priority 문제는 \"프로토콜은 h2/h3인데 화면이 늦다\"로 시작한다. Network waterfall에서 HTML은 빨리 왔지만 CSS, critical JavaScript, above-the-fold image가 큰 이미지, prefetch, analytics, video segment 뒤에 밀린다. 서버 access log의 application time은 낮고, TCP/TLS connect도 빠르다. 그런데 browser resource timing에서는 중요한 리소스의 receive 구간이 늦게 시작되거나 bandwidth share가 이상하게 보인다.\n\n두 번째 증상은 관찰 칸 혼동이다. DevTools의 Priority column은 브라우저 내부 우선순위일 수 있고, `Priority` HTTP field는 wire에 실리는 신호이며, edge/CDN scheduler는 또 자체 정책을 가진다. 셋이 항상 같지 않다. 세 번째 증상은 H2와 H3의 오래된 설명을 섞는 것이다. HTTP/2의 legacy priority tree는 wire compatibility 때문에 흔적이 남아 있지만, RFC 9218은 더 단순한 절대 값 기반 신호를 제안한다. HTTP/3 자체는 RFC 9114 기준으로 priority signaling을 내장하지 않으므로, 별도 Priority header나 PRIORITY_UPDATE extension 관찰이 필요하다.\n\n## First-Branch Triage\n\n첫 분기는 \"scheduler가 실제 병목인가\"다. origin handler, DB query, cache miss, TLS handshake, DNS lookup, connection pool wait가 느리면 Priority header를 고쳐도 효과가 작다. 이미 여러 응답이 동시에 보낼 준비가 됐고, 같은 client-facing connection이나 edge egress bandwidth를 나눠 쓰는 상황에서만 scheduling hint가 의미 있다.\n\n두 번째 분기는 H2인지 H3인지다. H2에서는 옛 priority signal과 RFC 9218 signal이 공존할 수 있다. endpoint가 legacy H2 priority를 끄거나 무시한다면 `SETTINGS_NO_RFC7540_PRIORITIES` 같은 negotiation 흔적을 본다. 이 설정이 있다고 해서 RFC 9218을 반드시 쓴다는 뜻은 아니지만, \"옛 tree를 기대하면 안 되는 연결\"이라는 중요한 단서가 된다. 또한 많은 서버와 proxy가 priority signal을 완전히 반영하지 않을 수 있으므로, signal presence와 scheduling effect를 분리한다.\n\n세 번째 분기는 signal 형태다. `Priority: u=0`은 높은 urgency, `u=7`은 background에 가까운 낮은 urgency다. default는 중간값으로 생각하면 된다. `i`는 incremental response라는 뜻이다. progressive image, streaming-like payload, 부분적으로 읽을 때 가치가 있는 응답은 같은 urgency에서 bandwidth를 나눠 받을 수 있다. 반대로 non-incremental 큰 파일은 끝까지 받아야 쓸 수 있으므로 같은 urgency 안에서 한 번에 몰아주는 전략이 더 나을 수 있다.\n\n네 번째 분기는 reprioritization이다. 브라우저가 prefetch하던 script가 실제 navigation에서 critical해지면 처음 신호만으로는 부족하다. RFC 9218은 HTTP version별 `PRIORITY_UPDATE` frame으로 \"이 응답의 우선순위를 이제 바꿔 달라\"는 신호를 보낼 수 있게 한다. 이 frame은 hop-by-hop 성격이다. 따라서 browser가 보낸 업데이트가 origin까지 갔다고 단정하지 말고, client-edge, edge-origin 각 hop에서 소비되거나 재생성됐는지 확인한다.\n\n## Protocol Invariants\n\n- Priority signal은 scheduling input이다. 서버가 반드시 같은 순서로 전송한다는 확인 응답이 아니다.\n- `u`는 0부터 7까지이며 숫자가 작을수록 더 높은 precedence를 뜻한다.\n- `i`는 incremental 처리 가능성을 말한다. \"중요하다\"가 아니라 \"부분 수신도 가치가 있다\"는 힌트다.\n- Priority header는 request나 response에 실릴 수 있는 end-to-end 성격의 field다.\n- PRIORITY_UPDATE는 특정 hop에서 쓰는 reprioritization frame이며, intermediary가 소비하거나 새 신호로 바꿀 수 있다.\n- HTTP/2 legacy priority tree와 RFC 9218 Priority field는 같은 모델이 아니다.\n- HTTP/3는 stream 간 전역 ordering을 HTTP/2처럼 제공하지 않으므로, H2 frame 해석을 그대로 옮기면 안 된다.\n- Flow control, congestion control, packet loss, stream slot saturation은 priority보다 아래 또는 옆 계층의 병목이다.\n\n## Wrong-Bucket Neighbors\n\n`HTTP/2 flow control` bucket은 stream이 이미 열렸는데 `WINDOW_UPDATE` credit 부족으로 DATA가 멈출 때다. Priority는 \"무엇을 먼저 보낼지\"이고, flow control은 \"얼마나 더 보낼 수 있는지\"다.\n\n`MAX_CONCURRENT_STREAMS` bucket은 새 stream이 시작 전 pending queue에 서는 문제다. Priority header가 높아도 stream slot 자체가 없으면 request가 관찰되기 전에 밀릴 수 있다. `HTTP/3 UDP loss/fallback` bucket은 H3 connection 품질이나 H2 fallback 비율 문제다. critical CSS가 늦다고 해서 곧바로 priority scheduler를 탓하기 전에 UDP block, fallback, CDN cache miss, origin queue를 제외해야 한다.\n\n`Browser DevTools waterfall` bucket은 관찰 방법을 고정하는 입문 문서다. DevTools Priority column, Resource Timing, protocol column, response header를 따로 읽어야 한다. column 하나만으로 edge scheduler가 RFC 9218을 존중했다고 판단하면 안 된다.\n\n## Safe Next Docs\n\n- stream은 열렸는데 DATA가 멈추면 [HTTP/2 Flow Control, WINDOW_UPDATE, Stall](./http2-flow-control-window-update-stalls.md)\n- 요청이 시작 전부터 줄 서면 [HTTP/2 MAX_CONCURRENT_STREAMS, Pending Queue, Saturation](./http2-max-concurrent-streams-pending-queue-saturation.md)\n- H2/H3 선택 자체를 비교하려면 [HTTP/2 vs HTTP/3 비교 chooser](./http2-vs-http3-comparison-chooser.md)\n- H3 discovery와 fallback 증거를 보려면 [H3 Discovery Observability Primer](./h3-discovery-observability-primer.md)\n- waterfall 관찰이 처음이면 [Browser DevTools Waterfall Primer](./browser-devtools-waterfall-primer.md)\n\n## 한 줄 정리\n\nRFC 9218의 HTTP Priority는 `u`와 `i`로 client와 intermediary가 응답 scheduling 선호를 전달하는 간단한 공통 언어다. 하지만 실제 순서는 H2/H3 transport, proxy support, flow control, congestion, resource size, server policy가 함께 결정하므로, 신호 존재와 성능 효과를 항상 따로 검증해야 한다.\n",
   "aliases": [
+    "HTTP Priority RFC 9218, 개념",
+    "HTTP Priority RFC 9218, 정리",
+    "HTTP Priority RFC 9218, 실수",
+    "HTTP Priority RFC 9218, 판단 기준",
+    "네트워크 HTTP Priority RFC 9218,",
     "HTTP Priority RFC 9218",
     "Priority header",
     "urgency incremental priority",
     "PRIORITY_UPDATE",
     "H2 H3 scheduling",
     "browser resource priority",
-    "HTTP/3 priority signaling",
-    "SETTINGS_NO_RFC7540_PRIORITIES"
+    "HTTP/3 priority signaling"
   ],
   "expected_queries": [
     "RFC 9218 Priority header의 urgency와 incremental이 H2/H3 scheduling에서 어떤 의미인지 설명해줘",
@@ -53,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/http-priority-rfc9218-h2-h3-scheduling-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch159"
+      }
+    ]
   }
 }

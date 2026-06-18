@@ -6,14 +6,18 @@
   "summary": "reset storm은 죽은 연결을 재사용하거나 idle timeout이 엇갈릴 때 쌓이며, 재시도와 keep-alive가 그 폭풍을 더 키울 수 있다.",
   "body_markdown": "# TCP Reset Storms, Idle Reuse, Stale Sockets\n\n> 한 줄 요약: reset storm은 죽은 연결을 재사용하거나 idle timeout이 엇갈릴 때 쌓이며, 재시도와 keep-alive가 그 폭풍을 더 키울 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [FIN, RST, Half-Close, EOF](./fin-rst-half-close-eof-semantics.md)\n> - [Idle Timeout 불일치: LB, Proxy, App](./idle-timeout-mismatch-lb-proxy-app.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [TCP Keepalive vs App Heartbeat](./tcp-keepalive-vs-app-heartbeat.md)\n> - [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)\n> - [Connection Pool Starvation, Stale Idle Reuse, Debugging](./connection-pool-starvation-stale-idle-reuse-debugging.md)\n> - [Retry Storm Containment, Concurrency Limiter, Load Shedding](./retry-storm-containment-concurrency-limiter-load-shedding.md)\n\nretrieval-anchor-keywords: TCP reset storm, stale socket, idle reuse, ECONNRESET, connection pool eviction, connection churn, retry amplification, keep-alive reuse, proxy close\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nreset storm은 소켓이 연속으로 `ECONNRESET`을 뿜는 상태를 말한다.\n\n- 오래된 idle connection이 재사용된다\n- 중간 proxy나 LB가 이미 닫은 소켓을 앱이 믿는다\n- retry가 새 연결을 더 많이 만들며 상황을 악화시킨다\n\n### Retrieval Anchors\n\n- `TCP reset storm`\n- `stale socket`\n- `idle reuse`\n- `ECONNRESET`\n- `connection pool eviction`\n- `connection churn`\n- `retry amplification`\n- `keep-alive reuse`\n- `proxy close`\n\n## 깊이 들어가기\n\n### 1. reset storm은 왜 생기나\n\n대부분은 \"연결을 재사용했는데 이미 죽어 있었다\"에서 시작한다.\n\n- LB timeout이 더 짧다\n- proxy upstream idle timeout이 더 짧다\n- app pool이 너무 오래 된 소켓을 들고 있다\n\n### 2. 왜 폭풍처럼 보이나\n\n한 번 실패하면 retry가 더 붙는다.\n\n- 실패한 요청이 새 connection을 만든다\n- 새 connection이 또 stale path를 만날 수 있다\n- worker와 pool이 계속 흔들린다\n\n즉 reset storm은 단순 오류가 아니라 **재사용 정책과 retry 정책의 합성 실패**다.\n\n### 3. stale socket은 어떻게 발견하나\n\n많이 보이는 신호:\n\n- 첫 요청만 실패하고 다음은 성공\n- idle 뒤 첫 호출만 reset\n- 특정 backend에서만 `ECONNRESET`\n\n### 4. 왜 health check와 다르게 보이나\n\nhealth check는 살아 있는 노드만 본다.\n\n- 이미 붙은 connection reuse는 별개다\n- pool 안의 오래된 socket은 별도로 관리해야 한다\n- draining과 eviction이 필요하다\n\n### 5. 어디서 먼저 고쳐야 하나\n\n보통 다음 순서가 좋다.\n\n1. pool idle eviction\n2. peer timeout 정렬\n3. keepalive/heartbeat 추가\n4. retry budget 제한\n5. stale socket validation\n\n## 실전 시나리오\n\n### 시나리오 1: 특정 시간대에만 reset이 급증한다\n\nidle 후 첫 burst에서 stale socket reuse가 발생할 수 있다.\n\n### 시나리오 2: retry를 늘렸더니 더 많이 실패한다\n\nretry amplification으로 reset storm이 커질 수 있다.\n\n### 시나리오 3: proxy 뒤에서만 `ECONNRESET`이 뜬다\n\n중간 장비의 close 시점과 pool lifetime이 맞지 않을 수 있다.\n\n## 코드로 보기\n\n### 상태 관찰\n\n```bash\nss -tan state established\nss -tan state close-wait\nss -tan state time-wait\n```\n\n### 리트라이/에러 로그 감각\n\n```text\nECONNRESET after idle period\nretry -> new socket -> reset again\npool -> stale socket retained too long\n```\n\n### 운영 포인트\n\n```text\n- pool validation on borrow\n- idle eviction\n- timeout hierarchy\n- retry budget\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 오래 재사용 | handshake 비용이 줄어든다 | stale socket 위험이 커진다 | 안정적인 peer |\n| 짧게 재사용 | stale reuse를 줄인다 | churn과 handshake가 늘어난다 | 변동성 큰 경로 |\n| 검증 후 재사용 | 안정성이 좋다 | 구현이 복잡하다 | 운영 안정성이 중요한 경우 |\n\n핵심은 연결 재사용 자체가 아니라 **죽은 소켓을 얼마나 빨리 버리느냐**다.\n\n## 꼬리질문\n\n> Q: reset storm은 왜 생기나요?\n> 핵심: stale socket reuse와 timeout mismatch가 반복되기 때문이다.\n\n> Q: retry가 왜 문제를 키우나요?\n> 핵심: 실패한 요청이 새 연결과 더 많은 실패를 낳을 수 있다.\n\n> Q: 어떻게 줄이나요?\n> 핵심: pool eviction, timeout 정렬, keepalive, retry budget을 같이 맞춘다.\n\n## 한 줄 정리\n\nTCP reset storm은 오래된 소켓을 다시 믿는 순간 시작되므로, idle reuse를 줄이고 retry amplification을 막아야 한다.\n",
   "aliases": [
+    "TCP Reset Storms, Idle 개념",
+    "TCP Reset Storms, Idle 정리",
+    "TCP Reset Storms, Idle 실수",
+    "TCP Reset Storms, Idle 판단 기준",
+    "네트워크 TCP Reset Storms, Idle",
     "TCP reset storm",
     "stale socket",
     "idle reuse",
     "ECONNRESET storm",
     "connection pool eviction",
     "connection churn",
-    "retry amplification",
-    "keep-alive reuse"
+    "retry amplification"
   ],
   "expected_queries": [
     "TCP reset storm이 idle reuse stale socket 때문에 생기는 패턴은?",
@@ -52,8 +56,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/tcp-reset-storms-idle-reuse-stale-sockets.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch159"
+      }
+    ]
   }
 }

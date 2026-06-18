@@ -6,12 +6,18 @@
   "summary": "HTTP keep-alive timeout은 클라이언트, 프록시, LB, origin이 서로 다르게 잡으면 재사용 시점에만 고장 나는 소켓을 만든다.",
   "body_markdown": "# HTTP Keep-Alive Timeout Mismatch, Deeper Cases\n\n> 한 줄 요약: HTTP keep-alive timeout은 클라이언트, 프록시, LB, origin이 서로 다르게 잡으면 재사용 시점에만 고장 나는 소켓을 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Idle Timeout 불일치: LB, Proxy, App](./idle-timeout-mismatch-lb-proxy-app.md)\n> - [TCP Keepalive vs App Heartbeat](./tcp-keepalive-vs-app-heartbeat.md)\n> - [LB Connection Draining, Deployment Safe Close](./lb-connection-draining-deployment-safe-close.md)\n> - [TCP Reset Storms, Idle Reuse, Stale Sockets](./tcp-reset-storms-idle-reuse-stale-sockets.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [HTTP Request Body Drain, Early Reject, Keep-Alive Reuse](./http-request-body-drain-early-reject-keepalive-reuse.md)\n> - [Connection Pool Starvation, Stale Idle Reuse, Debugging](./connection-pool-starvation-stale-idle-reuse-debugging.md)\n> - [Spring WebClient Connection Pool and Timeout Tuning](../spring/spring-webclient-connection-pool-timeout-tuning.md)\n\nretrieval-anchor-keywords: HTTP keep-alive, connection pool, idle timeout, upstream timeout, stale socket, proxy timeout, origin keepalive, validation on borrow\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 재현 조건, 관찰 증거, failure matrix\n\n이 문서의 1차 분기는 \"요청 처리가 느린가\"가 아니라 \"idle connection을 재사용하는 순간 stale socket이 드러나는가\"다. `ECONNRESET`과 `broken pipe`는 신호이고, proof는 각 계층의 idle timeout과 재사용 시점을 검증/validation해야 얻는다.\n\n### 재현 조건\n\n- 일정 시간 idle 후 같은 pool connection으로 첫 요청을 다시 보낸다.\n- client pool eviction, proxy upstream/downstream idle timeout, origin keepalive를 각각 바꿔 실패율을 비교한다.\n- 배포/drain 이벤트가 있는 구간과 없는 구간을 나눠 reset 발생 시점을 본다.\n\n### 관찰 증거\n\n- 대부분 정상인데 idle 이후 첫 호출만 실패한다.\n- proxy 변경 뒤 `ECONNRESET`, `broken pipe`, close-wait가 늘어난다.\n- retry를 켜면 사용자 오류는 줄지만 tail latency와 upstream 요청 수가 같이 늘어난다.\n\n### failure matrix\n\n| 증상 | 1차 분기 | 관찰 신호 | 검증/validation | wrong-bucket / 오선택 |\n|---|---|---|---|---|\n| idle 뒤 첫 요청 실패 | stale socket reuse | 재사용 직후 reset, 두 번째 시도 정상 | pool idle age, proxy/origin close log, packet FIN/RST를 대조 | app handler timeout으로만 분류 |\n| 프록시 변경 후 reset 증가 | upstream/downstream timeout mismatch | 특정 hop에서만 close가 먼저 발생 | 각 hop의 keepalive timeout과 connection log를 비교 | client 네트워크 불안정으로만 분류 |\n| pool이 큰데 tail 악화 | stale socket + retry 증폭 | retry count와 p99가 함께 증가 | validation on borrow, eviction, retry budget 적용 전후를 비교 | 단순 pool 크기 부족으로만 분류 |\n\n## 핵심 개념\n\nHTTP keep-alive는 연결 재사용의 기본이다.  \n문제는 계층마다 timeout이 다르면, 재사용 시점에만 실패하는 오래된 소켓이 생긴다는 점이다.\n\n- client pool timeout\n- proxy downstream keepalive\n- proxy upstream keepalive\n- origin server keepalive\n\n### Retrieval Anchors\n\n- `HTTP keep-alive`\n- `connection pool`\n- `idle timeout`\n- `upstream timeout`\n- `stale socket`\n- `proxy timeout`\n- `origin keepalive`\n- `validation on borrow`\n\n## 깊이 들어가기\n\n### 1. 더 깊은 mismatch 패턴\n\n단순히 \"proxy와 app timeout이 다르다\"보다 더 복잡한 패턴이 있다.\n\n- client pool은 너무 오래 유지한다\n- proxy는 더 빨리 닫는다\n- origin은 그 중간 값이다\n- 결과적으로 중간 계층이 죽은 소켓을 재사용한다\n\n### 2. 왜 첫 요청만 실패하나\n\nidle 이후 첫 reuse가 가장 위험하다.\n\n- 소켓은 열려 있는 것처럼 보인다\n- 실제 peer는 이미 close 했다\n- `ECONNRESET` 또는 `broken pipe`가 바로 나온다\n\n### 3. validation on borrow가 필요한 이유\n\npool에서 꺼낼 때 소켓이 살아 있는지 확인해야 한다.\n\n- stale socket을 줄인다\n- timeout mismatch를 빨리 드러낸다\n- 하지만 약간의 비용이 든다\n\n### 4. keep-alive가 길면 좋은가\n\n항상 그렇지 않다.\n\n- 너무 길면 stale connection이 쌓인다\n- 너무 짧으면 handshake 비용이 늘어난다\n- 서비스 특성에 맞는 균형이 필요하다\n\n### 5. 배포와 같이 보면\n\ndraining 없이 서버를 내리면 keep-alive mismatch가 더 크게 보인다.\n또 request body를 다 안 읽고 early reject하는 경로가 있으면 [HTTP Request Body Drain, Early Reject, Keep-Alive Reuse](./http-request-body-drain-early-reject-keepalive-reuse.md)처럼 connection 재사용 자체가 더 민감해질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 거의 항상 괜찮다가 가끔 첫 호출만 깨진다\n\nkeep-alive reuse와 timeout mismatch를 의심한다.\n\n### 시나리오 2: 프록시만 바꾸자 reset이 늘었다\n\nproxy upstream/downstream timeout 차이가 벌어졌을 수 있다.\n\n### 시나리오 3: pool이 큰데 성능은 오히려 나쁘다\n\nstale socket과 retry가 섞여 있을 수 있다.\n\n## 코드로 보기\n\n### 관찰\n\n```bash\nss -tan state established\nss -tan state close-wait\n```\n\n### 정책 감각\n\n```text\n- client pool eviction\n- proxy idle timeout\n- origin keepalive\n- borrow-time validation\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 긴 keep-alive | 재사용 효율이 좋다 | stale socket 위험이 크다 | 안정된 경로 |\n| 짧은 keep-alive | mismatch를 줄인다 | handshake 비용이 늘어난다 | 변동성 큰 경로 |\n| 검증 포함 reuse | 안전하다 | 구현 비용이 있다 | 운영 안정성 중요 |\n\n핵심은 timeout 숫자보다 **재사용 순간의 검사 여부**다.\n\n## 꼬리질문\n\n> Q: HTTP keep-alive mismatch는 왜 재사용 시점에만 보이나요?\n> 핵심: 연결은 살아 보이지만 peer는 이미 닫았을 수 있기 때문이다.\n\n> Q: validation on borrow가 왜 필요한가요?\n> 핵심: pool에서 꺼낼 때 stale socket을 걸러내기 위해서다.\n\n> Q: keep-alive를 길게 두면 항상 좋나요?\n> 핵심: 아니다. stale connection과 reset이 늘 수 있다.\n\n## 한 줄 정리\n\nHTTP keep-alive timeout mismatch는 연결이 열린 것처럼 보이는 stale socket을 만들기 쉬워서, reuse 직전에 검증을 넣는 것이 중요하다.\n",
   "aliases": [
+    "HTTP Keep-Alive Timeout Mismatch, 개념",
+    "HTTP Keep-Alive Timeout Mismatch, 정리",
+    "HTTP Keep-Alive Timeout Mismatch, 실수",
+    "HTTP Keep-Alive Timeout Mismatch, 판단 기준",
+    "네트워크 HTTP Keep-Alive Timeout Mismatch,",
     "HTTP keep-alive timeout mismatch",
     "stale socket reuse",
     "validation on borrow",
     "origin keepalive timeout",
     "proxy upstream keepalive",
-    "first request after idle reset"
+    "first request after idle reset",
+    "http keepalive timeout mismatch guide"
   ],
   "expected_queries": [
     "HTTP keep-alive timeout mismatch 때문에 idle 뒤 첫 요청만 실패하는 이유는?",
@@ -51,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/http-keepalive-timeout-mismatch-deeper-cases.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch159"
+      }
+    ]
   }
 }
