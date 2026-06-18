@@ -1,0 +1,62 @@
+{
+  "id": "system-design/in-flight-request-coalescing-primer",
+  "title": "In-Flight Request Coalescing Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "In-flight request coalescing은 캐시 miss 순간 같은 key로 몰린 동시 요청이 각자 DB/API를 호출하지 않고, 하나의 진행 중 계산이나 Future를 공유하게 해서 cache stampede의 origin 폭주를 줄이는 패턴이다.",
+  "body_markdown": "# In-Flight Request Coalescing Primer\n\n> 한 줄 요약: 캐시 miss가 동시에 터졌을 때 같은 key의 요청들을 하나의 진행 중 작업에 붙여서, backend 호출은 한 번만 실행하고 나머지는 그 결과를 함께 받게 하는 패턴이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [Cache Stampede TTL Jitter Interview Playbook](./cache-stampede-ttl-jitter-interview-playbook.md)\n- [Redis SET NX Distributed Lock Beginner Primer](./redis-setnx-distributed-lock-beginner-primer.md)\n- [Rate Limit vs Queue Load Shedding Chooser](./rate-limit-vs-queue-load-shedding-chooser.md)\n\nretrieval-anchor-keywords: in-flight request coalescing, request coalescing cache stampede, singleflight cache miss, future sharing cache fill, per-key in-flight map, 캐시 미스 요청 합치기, 진행 중 요청 공유, hot key cache miss coalescing, stampede one backend call, cache fill deduplication\n\n## 먼저 잡는 mental model\n\n캐시 결과 저장과 in-flight coalescing은 서로 다른 시간대의 문제를 다룬다.\n\n- 캐시는 **이미 계산이 끝난 결과**를 저장한다.\n- In-flight coalescing은 **아직 계산 중인 결과**를 공유한다.\n\n예를 들어 `product:42` 캐시가 만료된 순간 200개의 요청이 동시에 들어왔다고 하자. 캐시 miss만 보면 200개 요청 모두 DB나 외부 API로 갈 수 있다. Coalescing을 두면 첫 요청만 `product:42`를 채우는 leader가 되고, 나머지 199개는 `Map<CacheKey, CompletableFuture<Value>>`에 이미 등록된 Future를 기다린다.\n\n```text\n요청 A: cache miss -> inFlight에 없음 -> backend 호출 시작, Future 등록\n요청 B: cache miss -> inFlight에 있음 -> 같은 Future 대기\n요청 C: cache miss -> inFlight에 있음 -> 같은 Future 대기\n\nbackend 1회 완료 -> A/B/C 모두 같은 결과 반환 -> cache 저장 -> inFlight 제거\n```\n\n핵심은 `전체 요청을 하나의 줄에 세운다`가 아니라 **같은 key의 같은 fill 작업만 하나로 합친다**는 점이다. `product:42`와 `product:77`은 서로 다른 key라서 동시에 각각 한 번씩 채워질 수 있다. 그래서 이 패턴의 scope는 보통 global이 아니라 per-key다.\n\n## 왜 cache stampede에 도움이 되나\n\nCache stampede에서 origin이 무너지는 이유는 miss 자체보다 **miss path의 중복 실행**이다. 인기 key 하나가 만료됐을 때 1000명이 동시에 오면, 같은 DB query나 같은 외부 API 호출이 1000번 반복된다. TTL jitter는 많은 key가 같은 시각에 만료되는 avalanche를 줄이지만, 단일 hot key가 지금 막 만료된 순간의 동시 miss는 여전히 남을 수 있다.\n\nIn-flight coalescing은 이 단일 hot key 폭주를 직접 줄인다.\n\n| 상황 | coalescing 없음 | coalescing 있음 |\n|---|---|---|\n| hot key miss 100개 | backend 100회 호출 | backend 1회 호출 + waiter 99개 |\n| leader 성공 | 각 요청이 따로 성공/실패 | 같은 결과를 fanout |\n| leader 지연 | backend pool을 여러 요청이 잡아먹음 | waiter latency는 늘지만 origin 중복은 제한 |\n| leader 실패 | 실패가 여러 번 섞여 보임 | 같은 실패가 여러 요청으로 퍼질 수 있음 |\n\n즉 이 패턴은 latency를 마법처럼 없애는 기술이 아니다. 같은 key 요청들이 leader 완료를 기다리기 때문에 waiter의 tail latency는 leader latency에 묶인다. 대신 DB connection, 외부 API quota, 비싼 계산 CPU를 중복으로 태우지 않는다.\n\n## 자주 하는 오해 바로잡기\n\n| 오해 | 왜 틀리기 쉬운가 | 더 정확한 이해 |\n|---|---|---|\n| `결과를 캐시에 저장하면 coalescing도 된 거 아닌가요?` | 첫 fill이 끝나기 전에는 캐시 결과가 아직 없다 | 결과 캐시와 진행 중 Future 공유를 분리한다 |\n| `Redis 분산락이랑 같은 거죠?` | 락은 owner를 정하는 coordination이고, coalescing은 기다리는 요청이 같은 결과를 받게 하는 wait sharing이다 | 단일 JVM은 Future Map으로 충분할 수 있고, 다중 인스턴스 전체 중복까지 줄이려면 lock/lease가 추가될 수 있다 |\n| `모든 요청을 큐에 넣으면 되지 않나요?` | queue는 순서를 만들 뿐 같은 key의 같은 작업을 하나로 합치지 않는다 | per-key dedup이 핵심이고, 다른 key는 독립적으로 흘러야 한다 |\n| `rate limit으로 막으면 같은 효과 아닌가요?` | rate limit은 caller나 global 유입을 제한하지만 성공한 요청들 안의 중복 fill은 그대로 남을 수 있다 | overload 보호와 miss 중복 제거는 다른 축이다 |\n| `leader가 실패하면 한 명만 실패하겠죠?` | 같은 Future를 기다린 waiter 모두가 같은 실패를 받을 수 있다 | error fanout 정책과 stale fallback을 미리 정해야 한다 |\n\n이 차이를 모르면 설계가 과해지기 쉽다. 단일 서비스 인스턴스에서 같은 key의 DB 조회 중복만 줄이면 되는 문제에 Redis lock부터 붙이면 장애 모드가 늘어난다. 반대로 여러 인스턴스가 모두 같은 hot key를 채우며 origin을 때리는 상황인데 JVM 안에서만 coalescing하면 인스턴스 수만큼 중복은 남는다.\n\n## Java 서비스 시나리오\n\n상품 상세 API가 Redis cache-aside를 쓰고 있다고 하자.\n\n```java\nclass ProductReadService {\n    private final ConcurrentHashMap<String, CompletableFuture<ProductDto>> inFlight = new ConcurrentHashMap<>();\n\n    ProductDto getProduct(long productId) {\n        String key = \"product:\" + productId;\n\n        ProductDto cached = cache.get(key);\n        if (cached != null) {\n            return cached;\n        }\n\n        CompletableFuture<ProductDto> future = inFlight.computeIfAbsent(key, ignored -> {\n            CompletableFuture<ProductDto> created = CompletableFuture.supplyAsync(() -> {\n                ProductDto loaded = productApiOrDb.load(productId);\n                cache.put(key, loaded, ttlWithJitter());\n                return loaded;\n            }, cacheFillExecutor);\n            created.whenComplete((value, error) -> inFlight.remove(key, created));\n            return created;\n        });\n\n        try {\n            return future.get(800, MILLISECONDS);\n        } catch (TimeoutException e) {\n            return staleOrFail(key, e);\n        } catch (ExecutionException e) {\n            throw translate(e.getCause());\n        } catch (InterruptedException e) {\n            Thread.currentThread().interrupt();\n            throw new RequestCancelledException(e);\n        }\n    }\n}\n```\n\n이 코드는 완성된 production 코드가 아니라 구조를 보여 주는 sketch다. 중요한 지점은 세 가지다.\n\n1. `computeIfAbsent`가 key별 leader를 하나만 만든다.\n2. follower는 같은 `CompletableFuture`를 기다린다.\n3. 완료된 Future는 `whenComplete`에서 `remove(key, created)`로 정리한다.\n\n실무에서는 이보다 더 조심해야 한다. 공유 Future에 waiter마다 `orTimeout`을 직접 걸면 timeout이 공용 Future를 예외 완료시켜 다른 waiter와 leader 결과까지 망가뜨릴 수 있다. 위 sketch처럼 각 요청은 `get(timeout)`으로 자기 대기만 빠져나오고, leader backend call은 별도 deadline 안에서 관리하는 식으로 **waiter timeout/cancellation과 leader backend call cancellation을 분리**하는 편이 안전하다.\n\n## 설계 체크포인트\n\n| 설계 질문 | 안전한 기본값 | 놓치면 생기는 문제 |\n|---|---|---|\n| scope는 무엇인가 | cache key 또는 normalized key 단위 | 다른 key까지 막아 head-of-line blocking이 생김 |\n| map key는 무엇인가 | tenant, locale, auth-sensitive dimension 포함 | 서로 다른 사용자 맥락이 같은 결과를 공유함 |\n| leader timeout은 얼마인가 | backend deadline과 cache fill budget을 명시 | waiter가 끝없이 묶이거나 pool이 고갈됨 |\n| waiter timeout은 무엇인가 | 사용자 요청 deadline 안에서 짧게 제한 | client timeout 뒤에도 서버가 의미 없이 기다림 |\n| leader 실패 시 waiter는 무엇을 받나 | 같은 error, stale value, 빠른 실패 중 선택 | error fanout이 갑자기 큰 장애처럼 보임 |\n| stale fallback을 허용하나 | 데이터별 freshness budget으로 결정 | 권한/재고/결제 같은 경로에서 오래된 값 반환 |\n| inFlight cleanup은 어디서 하나 | success/failure/timeout 모든 terminal path | 완료된 Future가 map에 남아 memory leak |\n| waiter 수를 제한하나 | hot key별 max waiter나 fallback 정책 | leader 하나에 요청 수천 개가 매달림 |\n\n특히 key 설계가 중요하다. `product:42`가 언어, 지역, 회원 등급, 실험군에 따라 다른 값을 내야 한다면 coalescing key에도 그 차원이 들어가야 한다. 캐시 key가 틀리면 stale data가 생기듯, coalescing key가 틀리면 **아직 저장도 안 된 잘못된 결과를 여러 요청에게 동시에 나눠 주는** 문제가 생긴다.\n\n## Failure mode: leader 실패와 error fanout\n\n가장 흔한 장애 모드는 leader가 느리거나 실패하는 경우다.\n\n```text\n1. product:42 캐시 miss\n2. 요청 A가 leader로 backend 호출 시작\n3. 요청 B~Z가 같은 Future 대기\n4. backend timeout 발생\n5. B~Z도 같은 timeout/exception을 받음\n6. 다음 요청들이 다시 leader가 되어 backend 재시도 폭주 가능\n```\n\n여기서 `backend 호출은 하나였으니 안전하다`로 끝나면 부족하다. 실패 결과가 많은 요청으로 fanout되고, 곧바로 다음 wave가 다시 leader를 만들 수 있다. 그래서 실패 path에는 보통 아래 장치를 같이 둔다.\n\n- 짧은 negative cache 또는 error cooldown: 같은 key의 즉시 재폭주를 막는다.\n- stale fallback: freshness가 허용되면 이전 값을 반환하고 background refresh를 시도한다.\n- bounded waiter: 이미 너무 많은 요청이 기다리면 일부는 빠르게 실패하거나 stale을 받는다.\n- retry budget: leader 내부 재시도를 무제한으로 하지 않는다.\n- metric 분리: `leader_success`, `leader_failure`, `waiter_timeout`, `stale_served`, `inflight_size`를 따로 본다.\n\n단, stale fallback은 도메인 선택이다. 상품 설명, 추천 목록, 랭킹처럼 잠깐 오래된 값이 허용되는 read path에는 실용적이다. 하지만 권한 판단, 결제 상태, 재고 확정 수량처럼 틀린 값이 사고로 이어지는 경로에서는 stale을 주지 말고 실패나 원천 확인을 선택해야 한다.\n\n## Local coalescing과 distributed lock의 경계\n\n단일 JVM의 `ConcurrentHashMap<Key, Future>`는 같은 프로세스 안의 중복만 줄인다. 서버가 20대면 같은 hot key miss 때 최대 20개의 leader가 생길 수 있다. 이 정도가 origin이 감당 가능한 수준이면 local coalescing만으로도 충분하다.\n\n인스턴스 전체에서 정말 하나만 fill해야 한다면 Redis lock, cache lease token, dogpile lock 같은 분산 coordination을 볼 수 있다. 하지만 그때도 lock은 결과 전달을 자동으로 해 주지 않는다. 한 인스턴스가 lock을 잡아 값을 채우는 동안 다른 인스턴스가 무엇을 할지 별도로 정해야 한다.\n\n- 짧게 기다렸다 cache를 다시 확인한다.\n- stale value를 반환한다.\n- busy/try-later를 반환한다.\n- fallback 없이 실패한다.\n\n즉 distributed lock은 coalescing의 확장판처럼 보일 수 있지만, 실제로는 `누가 fill할지`를 정하는 도구다. `기다리는 요청이 어떤 결과를 받을지`는 별도 프로토콜이다.\n\n## 언제 쓰고, 언제 조심할까\n\n| 상황 | 판단 |\n|---|---|\n| hot key miss가 origin QPS를 순간적으로 폭발시킴 | 좋은 후보 |\n| backend 호출 비용이 높고 결과를 여러 요청이 공유해도 안전함 | 좋은 후보 |\n| key별 결과가 사용자 권한, 세션, AB 실험군에 따라 달라짐 | key scope를 매우 보수적으로 잡아야 함 |\n| origin이 이미 전역 과부하이고 모든 key가 느림 | coalescing만으로 부족, admission/load shedding 필요 |\n| leader 작업이 오래 걸리고 waiter deadline이 짧음 | timeout과 stale/fail-fast 정책 없이는 tail latency 악화 |\n| 결과가 절대 stale이면 안 되는 결제/재고/권한 경로 | stale fallback 금지, source-of-truth 확인 우선 |\n\n## 운영에서 봐야 할 신호\n\nCoalescing이 제대로 동작하면 cache miss 시점에도 origin QPS가 key별로 제한된다. 대신 waiter 수와 wait time이 새로운 관측 대상이 된다.\n\n```text\ncache_fill_leader_total{key_class,result}\ncache_fill_waiter_total{key_class,result}\ninflight_requests{key_class}\nsingleflight_wait_duration_ms{key_class}\nleader_backend_duration_ms{key_class}\nwaiter_timeout_total{key_class}\nstale_served_total{reason=\"inflight_timeout\"}\ninflight_cleanup_lag_ms\n```\n\n평균 latency만 보면 효과를 놓치기 쉽다. origin QPS는 안정됐는데 p99가 늘었다면 leader가 느려서 waiter들이 같이 늦어진 것이다. 반대로 waiter가 거의 없고 leader만 계속 생긴다면 key normalization이 틀렸거나 coalescing scope가 너무 좁을 수 있다.\n\n## 꼬리질문\n\n> Q: in-flight coalescing을 넣으면 캐시 stampede가 완전히 해결되나요?\n> 의도: 단일 hot key 중복 fill과 전체 과부하를 구분하는지 확인\n> 핵심: 같은 key의 동시 miss 중복은 줄이지만, 많은 key avalanche, cache outage, origin 전역 포화는 TTL jitter, stale fallback, admission control과 함께 봐야 한다.\n\n> Q: follower가 timeout되면 leader도 취소해야 하나요?\n> 의도: waiter lifecycle과 backend fill lifecycle을 분리하는지 확인\n> 핵심: 보통 follower 한 명의 취소가 leader를 죽이면 다른 waiter까지 피해를 본다. leader는 별도 deadline으로 관리하고, 각 요청은 자기 timeout 안에서 빠져나오게 하는 편이 안전하다.\n\n## 한 줄 정리\n\nIn-flight request coalescing은 `캐시에 저장된 값`이 아니라 `지금 채우는 중인 값`을 공유하는 패턴이다. per-key Future 공유, timeout/cancellation 분리, error fanout, stale fallback, cleanup까지 같이 설계해야 cache stampede를 줄이면서도 새 tail-latency와 memory leak 문제를 만들지 않는다.\n",
+  "aliases": [
+    "request coalescing",
+    "in-flight coalescing",
+    "singleflight cache miss",
+    "per-key singleflight",
+    "future sharing cache fill",
+    "cache stampede coalescing",
+    "캐시 미스 요청 합치기",
+    "동시 요청 합치기",
+    "진행 중 요청 공유",
+    "핫키 중복 조회 방지"
+  ],
+  "expected_queries": [
+    "캐시 miss가 동시에 많이 나면 DB 호출을 하나로 합치는 방법이 뭐야?",
+    "singleflight가 캐시랑 뭐가 달라?",
+    "이거 Redis 락이랑 같은 거야?",
+    "핫키 만료되면 요청을 다 기다리게 해야 해?",
+    "Future를 Map에 넣어서 같은 key 요청이 같이 기다리는 구조를 Java 예시로 설명해줘",
+    "실패하거나 timeout 나면 기다리던 요청들은 어떻게 처리해야 해?"
+  ],
+  "symptoms": [
+    "인기 cache key가 만료될 때 같은 DB 조회가 동시에 수십 번 실행된다.",
+    "TTL jitter를 넣었는데도 단일 hot key miss 순간 backend QPS가 튄다.",
+    "Redis lock, queue, rate limit, request coalescing의 경계가 헷갈린다.",
+    "같은 Future를 기다리던 요청들이 leader timeout과 함께 한꺼번에 실패한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook"
+    ],
+    "next_docs": [
+      "system-design/singleflight-request-coalescing-stampede-primer",
+      "system-design/cache-lease-token-cooperative-fill-primer"
+    ],
+    "confusable_with": [
+      "system-design/redis-setnx-distributed-lock-beginner-primer",
+      "system-design/rate-limit-vs-queue-load-shedding-chooser",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-18",
+    "last_modified": "2026-06-18",
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "batch165-worker-a"
+      }
+    ]
+  }
+}
