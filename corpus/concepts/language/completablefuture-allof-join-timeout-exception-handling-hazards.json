@@ -6,12 +6,18 @@
   "summary": "이 문서는 CompletableFuture allOf, join/get, timeout, exceptionally/handle/whenComplete, partial success fan-in을 error flow와 background task lifecycle 관점으로 설명하는 advanced deep dive다.",
   "body_markdown": "# `CompletableFuture` `allOf`, `join`, Timeout, and Exception Handling Hazards\n\n> 한 줄 요약: `CompletableFuture` 체인은 조합이 쉬워 보여도 `allOf`, `join`, `orTimeout`, `handle`, `exceptionally`의 의미를 섞으면 실패 원인 은닉, partial success 누락, thread starvation, timeout 후 백그라운드 작업 잔류가 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [CompletableFuture Execution Model and Common Pool Pitfalls](./completablefuture-execution-model-common-pool-pitfalls.md)\n> - [`CompletableFuture.delayedExecutor`, Scheduler Hop, and Timer-Thread Hazards](./completablefuture-delayedexecutor-scheduler-hop-timer-thread-hazards.md)\n> - [CompletableFuture Cancellation Semantics](./completablefuture-cancellation-semantics.md)\n> - [Partial Success Fan-in Patterns](./partial-success-fan-in-patterns.md)\n> - [Thread Interruption and Cooperative Cancellation Playbook](./thread-interruption-cooperative-cancellation-playbook.md)\n> - [ThreadLocal Leaks and Context Propagation](./threadlocal-leaks-context-propagation.md)\n\n> retrieval-anchor-keywords: CompletableFuture allOf, anyOf, join vs get, CompletionException, ExecutionException, exceptionally, handle, whenComplete, timeout, orTimeout, completeOnTimeout, partial failure, fan-out fan-in, async error handling, background task leak, delayedExecutor, scheduler hop\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n`CompletableFuture`의 어려움은 \"비동기 실행\"보다 **실패 의미를 어디서 어떻게 회수하느냐**에 있다.\n\n특히 자주 헷갈리는 축은 이렇다.\n\n- `join()` vs `get()`\n- `allOf()`는 완료 합류인지 결과 집계인지\n- timeout은 내부 작업 중단인지 응답 deadline인지\n- `exceptionally()`는 복구인지 실패 은닉인지\n\n즉 체인을 읽을 때는 값 흐름만이 아니라 error flow를 같이 읽어야 한다.\n\n## 깊이 들어가기\n\n### 1. `join()`은 예외를 wrapper에 싸서 다시 던진다\n\n`join()`은 checked exception을 피할 수 있어 많이 쓰이지만,  \n실패 원인을 `CompletionException` 아래에 감싸서 올릴 수 있다.\n\n반면 `get()`은 `ExecutionException`, `InterruptedException`, `TimeoutException` 등으로 더 명시적으로 드러난다.\n\n즉 `join()`이 항상 더 편한 것이 아니라,  \n실패 경계가 흐려질 수 있다는 비용이 있다.\n\n### 2. `allOf()`는 결과를 모으지 않는다\n\n`allOf(f1, f2, f3)`는 \"모두 끝났는가\"만 알려준다.  \n각 결과는 직접 꺼내야 한다.\n\n문제는 여기서 partial failure semantics가 자주 빠진다는 점이다.\n\n- 하나라도 실패하면 전체를 실패로 볼 것인가\n- 성공한 일부 결과는 버릴 것인가\n- 개별 예외를 aggregate해서 보여줄 것인가\n\n이 정책이 없으면 fan-out/fan-in 코드는 production에서 디버깅하기 어려워진다.\n\n### 3. timeout은 작업 수명과 응답 수명을 분리해서 봐야 한다\n\n`orTimeout()`이나 `completeOnTimeout()`은 future의 completion semantics를 바꿀 수 있다.  \n하지만 실제 내부 작업이 멈춘다는 보장은 약하다.\n\n즉 다음은 다른 문제다.\n\n- 호출자가 언제 포기할지\n- 내부 computation이 언제 멈출지\n\n이 구분이 없으면 timeout 이후에도 DB/HTTP 작업이 계속 남는다.\n\n### 4. `exceptionally`, `handle`, `whenComplete`는 역할이 다르다\n\n- `exceptionally`: 실패를 다른 값으로 복구\n- `handle`: 성공/실패를 모두 받아 변환\n- `whenComplete`: 부수효과 관측, 보통 값 변환은 아님\n\n실무에서 흔한 함정은 `exceptionally`로 너무 일찍 fallback을 넣어  \n실패 원인이 사라지는 것이다.\n\n즉 fallback은 복구 전략이 분명할 때만 넣어야 한다.\n\n### 5. stage마다 executor와 context가 달라질 수 있다\n\n`allOf`/`join` 조합 자체보다 더 중요한 것은  \n그 앞 단계들이 어느 executor에서, 어떤 `ThreadLocal`/MDC context로 돌았는가다.\n\n즉 fan-out/fan-in 설계는:\n\n- 실패 집계\n- timeout 정책\n- context propagation\n- blocking 격리\n\n를 한 묶음으로 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 외부 API 세 개를 병렬 호출하는데 하나만 가끔 조용히 빠진다\n\n`exceptionally`가 너무 앞단에 붙어 실패를 빈 객체로 바꿨다.  \n결과적으로 장애는 숨겨지고 데이터만 비게 된다.\n\n### 시나리오 2: `allOf().join()` 후 원인 파악이 어렵다\n\n어느 future가 왜 실패했는지 집계하지 않았다.  \n운영 로그에는 wrapper exception만 남고, 개별 실패 문맥이 사라진다.\n\n### 시나리오 3: timeout은 났는데 downstream 부하는 계속 오른다\n\nfuture는 timeout으로 끝났지만 실제 HTTP/DB 작업은 계속 진행 중이다.  \n호출자 수명과 내부 작업 수명을 분리하지 않았기 때문이다.\n\n### 시나리오 4: async 체인 이후 traceId가 사라진다\n\n결과는 잘 모았지만 context propagation이 빠져  \n실패 분석이 더 어려워진다.\n\n## 코드로 보기\n\n### 1. `allOf()` 후 결과를 명시적으로 수집\n\n```java\nCompletableFuture<Void> all = CompletableFuture.allOf(userFuture, orderFuture, pointFuture);\n\nCompletableFuture<Dashboard> dashboardFuture = all.thenApply(ignored ->\n    new Dashboard(userFuture.join(), orderFuture.join(), pointFuture.join())\n);\n```\n\n여기서도 각 future의 실패 정책을 따로 정해야 한다.\n\n### 2. timeout과 fallback 구분\n\n```java\nCompletableFuture<Response> responseFuture =\n    remoteCall().orTimeout(500, java.util.concurrent.TimeUnit.MILLISECONDS);\n```\n\n이 코드는 future completion을 바꿀 뿐, 내부 작업 중단을 자동 보장하지는 않는다.\n\n### 3. 실패를 너무 일찍 삼키지 않기\n\n```java\nfuture\n    .whenComplete((value, error) -> logOutcome(value, error))\n    .thenApply(this::transform);\n```\n\n관측과 복구를 분리하는 편이 읽기 쉽다.\n\n### 4. 개별 실패를 모아 aggregate 만들기\n\n```java\nList<CompletableFuture<Result>> futures = List.of(f1, f2, f3);\n\nCompletableFuture<List<Result>> allResults =\n    CompletableFuture.allOf(futures.toArray(CompletableFuture[] ::new))\n        .thenApply(ignored -> futures.stream()\n            .map(CompletableFuture::join)\n            .toList());\n```\n\npartial success를 허용한다면 `Result` 타입 자체를 성공/실패 variant로 모델링하는 편이 낫다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| `join()` 위주 | 코드가 짧다 | wrapper exception 아래에서 실패 원인이 흐려질 수 있다 |\n| `allOf()` fan-in | 병렬 합류를 쉽게 표현한다 | 결과 수집/partial failure 정책은 직접 설계해야 한다 |\n| eager fallback | 응답을 빨리 만들 수 있다 | 장애와 데이터 손실을 조용히 숨길 수 있다 |\n| timeout 분리 설계 | 응답 수명과 작업 수명을 구분할 수 있다 | 코드와 취소 정책이 더 필요하다 |\n\n핵심은 `CompletableFuture`를 값 조합 도구가 아니라 error/timeout/context 조합 도구로 함께 읽는 것이다.\n\n## 꼬리질문\n\n> Q: `allOf()`는 결과를 자동으로 모아주나요?\n> 핵심: 아니다. 완료 합류만 해주고 각 결과는 직접 꺼내야 한다.\n\n> Q: `join()`이 항상 `get()`보다 좋은가요?\n> 핵심: 더 간단할 수 있지만 failure wrapper 때문에 원인 경계가 흐려질 수 있다.\n\n> Q: `orTimeout()`이면 내부 작업도 멈추나요?\n> 핵심: 아니다. future completion과 실제 computation 수명은 분리해서 봐야 한다.\n\n> Q: `exceptionally()`를 어디에 두면 되나요?\n> 핵심: fallback 의미가 분명한 boundary에만 두고, 너무 앞단에서 실패를 삼키지 않는 편이 안전하다.\n\n## 한 줄 정리\n\n`CompletableFuture` hazard의 본질은 executor보다 error flow와 timeout semantics이므로, `allOf`, `join`, fallback, cancellation을 한 정책으로 설계해야 한다.\n",
   "aliases": [
+    "CompletableFuture allOf, join, Timeout, 개념",
+    "CompletableFuture allOf, join, Timeout, 정리",
+    "CompletableFuture allOf, join, Timeout, 실수",
+    "CompletableFuture allOf, join, Timeout, 판단 기준",
+    "자바 CompletableFuture allOf, join, Timeout,",
     "CompletableFuture allOf join timeout hazards",
     "CompletableFuture allOf partial failure",
     "join vs get CompletionException",
     "CompletableFuture exceptionally handle whenComplete",
     "orTimeout completeOnTimeout",
-    "async fan-out fan-in failure"
+    "async fan-out fan-in failure",
+    "completablefuture allof join timeout guide"
   ],
   "expected_queries": [
     "CompletableFuture allOf는 결과를 모아 주는지 완료 합류만 하는지 설명해줘",
@@ -47,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/completablefuture-allof-join-timeout-exception-handling-hazards.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

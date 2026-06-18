@@ -6,12 +6,18 @@
   "summary": "인증서 회전은 단순 교체가 아니라 SNI별 라우팅과 bundle 배포가 함께 맞아야 하는 작업이라, 하나만 틀어져도 blast radius가 커진다.",
   "body_markdown": "# Certificate Rotation, SNI Blast Radius\n\n> 한 줄 요약: 인증서 회전은 단순 교체가 아니라 SNI별 라우팅과 bundle 배포가 함께 맞아야 하는 작업이라, 하나만 틀어져도 blast radius가 커진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TLS Certificate Chain, OCSP Stapling Failure Modes](./tls-certificate-chain-ocsp-stapling-failure-modes.md)\n> - [ALPN Negotiation Failure, Routing Mismatch](./alpn-negotiation-failure-routing-mismatch.md)\n> - [SNI, Routing Mismatch, Hostname Failure](./sni-routing-mismatch-hostname-failure.md)\n> - [TLS Session Resumption, 0-RTT, Replay Risk](./tls-session-resumption-0rtt-replay-risk.md)\n> - [API Gateway, Reverse Proxy 운영 포인트](./api-gateway-reverse-proxy-operational-points.md)\n\nretrieval-anchor-keywords: certificate rotation, SNI blast radius, fullchain, cert renewal, cert bundle, ingress rollout, TLS termination, staged rotation, hot reload\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n인증서 회전은 \"새 파일로 바꾸면 끝\"이 아니다.\n\n- SNI마다 다른 cert bundle이 있을 수 있다\n- LB, proxy, ingress가 각자 다른 배포 주기를 가질 수 있다\n- 잘못하면 특정 도메인만 대량 실패한다\n\n### Retrieval Anchors\n\n- `certificate rotation`\n- `SNI blast radius`\n- `fullchain`\n- `cert renewal`\n- `cert bundle`\n- `ingress rollout`\n- `TLS termination`\n- `staged rotation`\n- `hot reload`\n\n## 깊이 들어가기\n\n### 1. 왜 blast radius가 커지나\n\n한 IP에서 여러 도메인을 호스팅하는 경우가 많다.\n\n- SNI별로 인증서 선택\n- host별로 backend routing\n- 여러 리전/PoP에 동시에 배포\n\n회전 한 번이 전체 경로를 건드릴 수 있다.\n\n### 2. 어떤 실수가 흔한가\n\n- 중간 인증서 누락\n- 한 리전만 새 cert 적용\n- hot reload가 일부 worker에만 반영\n- SNI와 SAN이 안 맞는 bundle 배포\n- SNI를 보내지 않는 오래된 client, 잘못된 default certificate, ALPN별 listener 차이를 같은 문제로 뭉개는 것\n- mobile/app certificate pinning이 새 key를 거부하는데 일반 browser 검증만 보고 정상이라고 판단하는 것\n\n### 3. staged rotation이 왜 필요한가\n\n한 번에 바꾸면 blast radius가 크다.\n\n- 일부 트래픽만 새 인증서로 보낸다\n- 일정 시간 동안 old/new를 함께 유지한다\n- 문제가 없으면 전체를 전환한다\n\n### 4. hot reload가 만능이 아닌 이유\n\nhot reload는 편하지만, 설정 동기화가 느슨해질 수 있다.\n\n- 일부 프로세스만 새 설정을 읽는다\n- cache와 session resumption이 섞인다\n- 롤백이 어려워질 수 있다\n\n특히 \"새 cert를 배포했다\"와 \"모든 새 full handshake가 새 cert를 본다\"는 다르다. 기존 TLS connection은 계속 살아 있을 수 있고, session resumption/0-RTT 경로는 full handshake 관찰과 다르게 보일 수 있다. 검증은 SNI별 full handshake와 재개 경로를 나눠서 본다.\n\n### 5. 어디서 특히 아픈가\n\n- public ingress\n- multi-tenant gateway\n- gRPC/HTTP 혼합 endpoint\n- CDN origin 인증서 교체\n\n## 실전 시나리오\n\n### 시나리오 1: 특정 도메인만 인증서 에러가 난다\n\nSNI별 bundle 누락이나 SAN mismatch일 수 있다.\n\n### 시나리오 2: 새 인증서로 바꿨는데 일부 리전만 실패한다\n\n롤아웃이 완전히 끝나지 않았거나 hot reload가 일부만 반영됐을 수 있다.\n\n### 시나리오 3: 회전 직후 TLS 세션 재개 비율이 떨어진다\n\nticket key나 bundle 교체로 resumption cache가 흔들릴 수 있다.\n\n## 코드로 보기\n\n### 인증서 확인\n\n```bash\nopenssl x509 -in fullchain.pem -noout -dates -subject -issuer\nopenssl s_client -connect api.example.com:443 -servername api.example.com -showcerts\n```\n\n### 배포 감각\n\n```text\nstage 1: canary\nstage 2: partial rollout\nstage 3: full rollout\nstage 4: verify chain and SNI mapping\n```\n\n### 운영 체크\n\n```text\n- 모든 SNI가 새 cert를 보는가\n- intermediate가 포함됐는가\n- SAN이 실제 hostname과 맞는가\n- default cert가 의도한 fallback인가\n- OCSP stapling/chain status가 리전별로 일관적인가\n- pinned mobile/app client가 새 SPKI를 허용하는가\n- resumption key가 리전별로 일관적인가\n```\n\n### blast radius matrix\n\n| 축 | 확인 질문 | 실패하면 보이는 증상 |\n|---|---|---|\n| SNI -> cert mapping | 각 hostname이 의도한 bundle을 받나 | 특정 host만 hostname mismatch |\n| fullchain | leaf + intermediate chain이 완전한가 | 일부 client만 chain verify 실패 |\n| listener/ALPN | `h2`, `http/1.1`, `h3` entry가 같은 cert set을 보나 | 특정 protocol만 실패 |\n| region/PoP | 모든 edge가 같은 rollout stage인가 | 지역별 old/new cert 혼재 |\n| pinning | app/mobile pin set이 새 key를 포함하나 | browser는 정상인데 앱만 실패 |\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 한 번에 교체 | 단순하다 | blast radius가 크다 | 작은 환경 |\n| staged rotation | 안전하다 | 운영 절차가 복잡하다 | 대규모 서비스 |\n| hot reload | 무중단에 가깝다 | 반영 일관성 검증이 필요하다 | 상시 운영 |\n\n핵심은 인증서 교체를 파일 작업이 아니라 **라우팅/배포 작업**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: 인증서 rotation에서 가장 위험한 점은 무엇인가요?\n> 핵심: SNI별 bundle mismatch와 일부 리전만 반영되는 불일치다.\n\n> Q: 왜 staged rotation이 필요한가요?\n> 핵심: blast radius를 줄이고 문제가 있으면 빨리 되돌리기 위해서다.\n\n> Q: resumption과는 어떤 관계가 있나요?\n> 핵심: rotation이 resumption key와 bundle을 흔들어 세션 재개율을 바꿀 수 있다.\n\n## 한 줄 정리\n\n인증서 회전은 SNI와 배포 경로가 얽힌 작업이라, staged rollout과 chain 검증 없이 바꾸면 blast radius가 커진다.\n",
   "aliases": [
+    "Certificate Rotation, SNI Blast 개념",
+    "Certificate Rotation, SNI Blast 정리",
+    "Certificate Rotation, SNI Blast 실수",
+    "Certificate Rotation, SNI Blast 판단 기준",
+    "네트워크 Certificate Rotation, SNI Blast",
     "certificate rotation",
     "SNI blast radius",
     "fullchain bundle rollout",
     "cert renewal ingress",
     "TLS termination staged rotation",
-    "hot reload cert"
+    "hot reload cert",
+    "certificate rotation sni blast guide"
   ],
   "expected_queries": [
     "인증서 회전 후 특정 SNI만 실패하면 어디부터 봐야 해?",
@@ -51,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/certificate-rotation-sni-blast-radius.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

@@ -6,15 +6,18 @@
   "summary": "이 문서는 try-with-resources와 AutoCloseable close failure가 primary exception과 suppressed exception으로 기록되는 방식을 resource cleanup 진단 관점에서 설명하는 advanced playbook이다.",
   "body_markdown": "# Try-With-Resources and Suppressed Exceptions\n\n> 한 줄 요약: try-with-resources는 자원 해제를 자동화하지만, 본문 예외와 close 예외가 동시에 나올 수 있으므로 suppressed exceptions를 읽지 못하면 장애 원인을 반대로 해석할 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java IO, NIO, Serialization, JSON Mapping](./io-nio-serialization.md)\n> - [OOM Heap Dump Playbook](./oom-heap-dump-playbook.md)\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n> - [JFR and JMC Performance Playbook](./jfr-jmc-performance-playbook.md)\n\n> retrieval-anchor-keywords: try-with-resources, AutoCloseable, close, suppressed exception, exception masking, resource cleanup, finally, JDBC, file handle, network socket, primary exception\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\ntry-with-resources는 `AutoCloseable`을 자동으로 닫는다.  \n핵심은 close가 실패해도 본문 예외를 덮어쓰지 않도록 설계되어 있다는 점이다.\n\n본문에서 예외가 발생한 뒤 close에서도 예외가 발생하면, close 예외는 suppressed exception이 된다.  \n즉 \"진짜 원인\"은 primary exception일 가능성이 높다.\n\n## 깊이 들어가기\n\n### 1. 왜 suppressed exceptions가 중요한가\n\n자원 해제 실패는 자주 본문 실패와 함께 일어난다.\n\n- SQL query 실패 후 connection close 실패\n- 파일 처리 실패 후 stream close 실패\n- socket write 실패 후 flush/close 실패\n\n이때 close 예외만 보면 원인을 잘못 볼 수 있다.\n\n### 2. `finally`보다 try-with-resources가 좋은 이유\n\n`finally`는 수동으로 닫아야 해서 실수하기 쉽다.  \ntry-with-resources는 닫는 순서와 예외 처리를 JVM이 더 일관되게 관리한다.\n\n특히 다음 실수를 줄여 준다.\n\n- close 누락\n- 중복 close\n- 원인 예외 마스킹\n\n### 3. close 순서도 중요하다\n\n리소스가 여러 개면 선언 역순으로 닫힌다.  \n의존 관계가 있는 자원은 이 순서를 이해하고 있어야 한다.\n\n예:\n\n- buffered wrapper\n- underlying stream\n- JDBC statement/connection\n\n### 4. suppressed exceptions를 로그에서 버리면 안 된다\n\n애플리케이션 로깅이 primary exception만 찍고 suppressed를 버리면 close 실패가 사라진다.  \n하지만 그 close 실패가 커넥션 풀 고갈이나 파일 핸들 누수의 신호일 수 있다.\n\n## 재현 조건\n\nsuppressed exception은 본문과 close가 둘 다 실패해야 보인다.\n\n- `try` body에서 의도적으로 primary exception을 던진다\n- `AutoCloseable.close()`에서도 별도 exception을 던진다\n- resource를 두 개 이상 선언해 close 역순과 suppressed 순서를 확인한다\n- logging/exception translation layer가 `Throwable.getSuppressed()`를 보존하는지 본다\n\n재현할 때 close failure만 있는 케이스도 따로 둔다. body가 성공하고 close만 실패하면 그 close exception이 primary가 된다.\n\n## failure matrix\n\n| 상황 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| body 실패 + close 실패 | close가 root cause | body exception이 primary, close는 suppressed | `e.getSuppressed()`에 close failure |\n| close만 실패 | suppressed-only 문제 | close failure가 primary | body exception 없음 |\n| 여러 resource close 실패 | 마지막 resource만 문제 | 선언 역순 close 중 여러 suppressed | suppressed 배열에 복수 예외 |\n| manual finally가 body 예외를 덮음 | 원래 body가 없었음 | exception masking | finally close exception만 전파 |\n| 로그에 suppressed가 없음 | close는 정상 | logging/translation에서 손실 | 원본 throwable에는 suppressed 존재 |\n\n## 검증/validation\n\n- custom `AutoCloseable` test double로 body failure와 close failure 조합을 모두 만든다.\n- exception mapper, logging appender, tracing exporter가 suppressed exceptions를 유지하는지 테스트한다.\n- JDBC/file/socket cleanup 코드에서는 resource 선언 순서가 의존 관계와 맞는지 확인한다.\n- close failure metric을 primary/suppressed 구분과 함께 남겨 pool exhaustion이나 fd leak 신호를 놓치지 않는다.\n\n## 오해와 wrong bucket\n\n- suppressed exception을 \"중요하지 않은 예외\"로 분류하면 안 된다. root cause는 아닐 수 있지만 cleanup 실패 신호일 수 있다.\n- try-with-resources가 모든 cleanup 문제를 자동 해결한다고 보면 과하다. `close()`가 idempotent하고 관측 가능하게 설계돼야 한다.\n- `finally`가 더 명시적이어서 항상 안전하다는 설명은 wrong bucket이다. 수동 close는 primary exception masking을 직접 방지해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 파일 처리는 실패했는데 close도 실패한다\n\n이때 본문 예외가 먼저, close 예외가 나중에 붙는다.  \n원인 분석은 primary exception부터 해야 한다.\n\n### 시나리오 2: JDBC에서 connection leak처럼 보인다\n\ntry-with-resources를 쓰지 않으면 close 누락이 생기기 쉽다.  \n리소스 경계가 긴 코드일수록 자동화가 더 중요하다.\n\n### 시나리오 3: close 실패가 진짜 원인일 수 있다\n\n물론 close 예외가 늘 secondary인 것은 아니다.  \n자원 해제 과정에서 실제 장애가 드러나는 경우도 있으므로 suppressed를 함께 봐야 한다.\n\n## 코드로 보기\n\n### 1. 기본 try-with-resources\n\n```java\ntry (InputStream in = new FileInputStream(\"a.txt\");\n     OutputStream out = new FileOutputStream(\"b.txt\")) {\n    in.transferTo(out);\n}\n```\n\n### 2. suppressed exception 확인\n\n```java\ntry {\n    work();\n} catch (Exception e) {\n    for (Throwable suppressed : e.getSuppressed()) {\n        // close failure or secondary error\n    }\n    throw e;\n}\n```\n\n### 3. `AutoCloseable` 구현\n\n```java\npublic final class TempResource implements AutoCloseable {\n    @Override\n    public void close() {\n        // release native/file/socket resources\n    }\n}\n```\n\n### 4. 수동 finally보다 선언형 close가 명확하다\n\n```java\ntry (TempResource resource = new TempResource()) {\n    use(resource);\n}\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| try-with-resources | 자동 cleanup과 예외 처리에 강하다 | `AutoCloseable` 설계가 필요하다 |\n| finally | 유연하다 | 실수와 중복이 많다 |\n| 수동 close | 제어가 명시적이다 | 마스크/누락 위험이 있다 |\n| suppressed 로그 포함 | 원인 분석에 좋다 | 로그가 길어질 수 있다 |\n\n핵심은 자원 해제 실패를 본문 예외와 분리해서 읽는 것이다.\n\n## 꼬리질문\n\n> Q: suppressed exception은 왜 생기나요?\n> 핵심: 본문 예외가 이미 있는 상태에서 close가 또 실패하면 secondary error가 suppressed로 붙는다.\n\n> Q: try-with-resources가 `finally`보다 좋은 이유는 무엇인가요?\n> 핵심: close 누락과 예외 마스킹을 줄여 주기 때문이다.\n\n> Q: suppressed를 로그에 꼭 남겨야 하나요?\n> 핵심: 가능하면 남겨야 한다. close 실패가 누수나 downstream 장애의 신호일 수 있기 때문이다.\n\n## 한 줄 정리\n\ntry-with-resources는 cleanup을 안전하게 만들지만, primary exception과 suppressed exception을 함께 읽어야 진짜 원인을 놓치지 않는다.\n",
   "aliases": [
+    "자바 try-with-resources suppressed exception",
+    "Try With Resources and 개념",
+    "Try With Resources and 정리",
+    "Try With Resources and 실수",
+    "Try With Resources and 판단 기준",
     "Try-With-Resources and Suppressed Exceptions",
     "Java try-with-resources suppressed exception",
     "AutoCloseable close exception masking",
     "primary exception suppressed exception",
     "JDBC file socket close failure",
-    "자바 try-with-resources suppressed exception",
     "final",
-    "native",
-    "volatile"
+    "native"
   ],
   "expected_queries": [
     "try-with-resources에서 본문 예외와 close 예외가 동시에 나면 suppressed exception은 어떻게 읽어야 해?",
@@ -51,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/try-with-resources-suppressed-exceptions.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

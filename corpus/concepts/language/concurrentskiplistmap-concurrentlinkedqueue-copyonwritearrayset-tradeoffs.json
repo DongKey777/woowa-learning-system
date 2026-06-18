@@ -6,12 +6,18 @@
   "summary": "concurrent collection이라고 해서 용도가 비슷한 것은 아니다. 정렬된 concurrent map, lock-free FIFO queue, read-mostly snapshot set는 각자 전혀 다른 비용 모델을 가지며, 이를 혼동하면 stale iteration, ordering 오해, unbounded growth가 생긴다.",
   "body_markdown": "# `ConcurrentSkipListMap`, `ConcurrentLinkedQueue`, and `CopyOnWriteArraySet` Trade-offs\n\n> 한 줄 요약: concurrent collection이라고 해서 용도가 비슷한 것은 아니다. 정렬된 concurrent map, lock-free FIFO queue, read-mostly snapshot set는 각자 전혀 다른 비용 모델을 가지며, 이를 혼동하면 stale iteration, ordering 오해, unbounded growth가 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java Collections 성능 감각](./collections-performance.md)\n> - [`ConcurrentHashMap` Compound Actions and Hot-Key Contention](./concurrenthashmap-compound-actions-hot-key-contention.md)\n> - [`CopyOnWriteArrayList` Snapshot Iteration and Write Amplification](./copyonwritearraylist-snapshot-iteration-write-amplification.md)\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n\n> retrieval-anchor-keywords: ConcurrentSkipListMap, ConcurrentLinkedQueue, CopyOnWriteArraySet, concurrent collection tradeoff, sorted concurrent map, lock-free queue, snapshot set, weakly consistent iteration, concurrent ordering, unbounded queue growth, read mostly set\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n세 컬렉션은 각기 다른 질문에 답한다.\n\n- `ConcurrentSkipListMap`: 정렬된 key space가 필요한가\n- `ConcurrentLinkedQueue`: lock-free FIFO handoff가 필요한가\n- `CopyOnWriteArraySet`: 읽기가 압도적으로 많고 snapshot-style set이 필요한가\n\n즉 \"멀티스레드 컬렉션\"이라는 공통점만 보고 바꾸면 안 된다.\n\n## 깊이 들어가기\n\n### 1. `ConcurrentSkipListMap`은 concurrent + sorted map이다\n\n정렬과 범위 검색이 필요한 concurrent workload에 맞는다.\n\n- `ceilingKey`, `floorEntry`\n- range query\n- 자연 순서 기반 iteration\n\n하지만 hash map보다 보통 느리고, comparator/ordering semantics가 더 중요하다.\n\n즉 \"ConcurrentHashMap + 정렬\" 대체재가 아니라,  \n정렬된 key space가 본질일 때만 쓴다.\n\n### 2. `ConcurrentLinkedQueue`는 non-blocking FIFO다\n\n장점:\n\n- lock-free queue semantics\n- producer/consumer 경합에서 단순하다\n\n주의점:\n\n- bounded backpressure가 없다\n- queue size 판단이 비싸거나 애매할 수 있다\n- unbounded growth가 쉽게 생긴다\n\n즉 queue가 있다는 사실보다 \"얼마나 쌓일 수 있나\"가 더 중요하다.\n\n### 3. `CopyOnWriteArraySet`은 write 비용을 읽기 안정성으로 바꾼다\n\n이 set은 내부적으로 copy-on-write 특성을 공유한다.\n\n- iteration이 단순하다\n- 읽는 쪽 snapshot 안정성이 좋다\n- 쓰기가 드물 때 잘 맞는다\n\n하지만 add/remove가 잦으면 set이라도 write amplification이 그대로 문제다.\n\n즉 listener/subscriber registry에는 좋고, churn이 큰 membership set엔 부적합할 수 있다.\n\n### 4. weakly consistent vs snapshot vs current-state를 구분해야 한다\n\nconcurrent collection에서 iteration 의미가 중요하다.\n\n- weakly consistent iteration\n- snapshot iteration\n- current-state exactness\n\n이 셋은 다르다.\n\n정확한 \"지금 현재\" 판정을 business logic에 얹고 싶다면,  \n컬렉션 종류만 바꿔선 해결되지 않는다.\n\n### 5. boundedness는 별도 설계다\n\n특히 `ConcurrentLinkedQueue` 같은 lock-free queue는 쉽게 \"잘 돌아간다\"고 느껴진다.  \n하지만 bounded backpressure가 없으면 latency debt와 memory growth를 숨길 수 있다.\n\n즉 concurrent collection 선택은 thread safety보다 workload control과 함께 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 시각 순 정렬된 작업 예약 맵이 필요하다\n\nkey ordering과 range lookup이 핵심이면 `ConcurrentSkipListMap`이 자연스럽다.  \n단순 동시 접근만 필요하다면 `ConcurrentHashMap`이 더 싸다.\n\n### 시나리오 2: 이벤트 큐를 간단히 붙였는데 메모리가 늘어난다\n\n`ConcurrentLinkedQueue` 자체는 안전해 보여도,  \nconsumer가 늦으면 unbounded queue가 된다.\n\n### 시나리오 3: subscriber set을 자주 순회한다\n\n변경은 드물고 broadcast가 많다면 `CopyOnWriteArraySet`이 잘 맞을 수 있다.  \n반대로 connect/disconnect churn이 크면 비용이 커진다.\n\n## 코드로 보기\n\n### 1. 정렬된 concurrent map\n\n```java\njava.util.concurrent.ConcurrentSkipListMap<Long, Job> jobsByDeadline =\n    new java.util.concurrent.ConcurrentSkipListMap<>();\n```\n\n### 2. lock-free queue\n\n```java\njava.util.concurrent.ConcurrentLinkedQueue<Event> queue =\n    new java.util.concurrent.ConcurrentLinkedQueue<>();\n```\n\n### 3. read-mostly set\n\n```java\njava.util.concurrent.CopyOnWriteArraySet<Listener> listeners =\n    new java.util.concurrent.CopyOnWriteArraySet<>();\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| `ConcurrentSkipListMap` | 정렬과 범위 검색이 가능하다 | 해시 기반보다 무겁고 ordering contract가 중요하다 |\n| `ConcurrentLinkedQueue` | lock-free FIFO가 단순하다 | bounded backpressure가 없어 unbounded growth 위험이 있다 |\n| `CopyOnWriteArraySet` | read-mostly iteration이 단순하다 | write amplification이 크다 |\n\n핵심은 concurrent collection을 thread-safe container가 아니라 **ordering, boundedness, iteration semantics를 가진 contract**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: `ConcurrentSkipListMap`은 언제 쓰나요?\n> 핵심: 정렬된 key와 범위 검색이 동시성보다 본질일 때 쓴다.\n\n> Q: `ConcurrentLinkedQueue`면 큐 문제가 해결되나요?\n> 핵심: thread safety는 얻지만 backpressure와 boundedness는 별도 설계가 필요하다.\n\n> Q: `CopyOnWriteArraySet`은 어디에 잘 맞나요?\n> 핵심: read-mostly subscriber/listener set처럼 순회가 많고 변경이 드문 경우다.\n\n## 한 줄 정리\n\n`ConcurrentSkipListMap`, `ConcurrentLinkedQueue`, `CopyOnWriteArraySet`은 서로 다른 ordering·queueing·snapshot contract를 가진 도구라서, thread safety보다 workload 의미를 먼저 맞춰야 한다.\n",
   "aliases": [
+    "ConcurrentSkipListMap, ConcurrentLinkedQueue, and CopyOnWriteArraySet 개념",
+    "ConcurrentSkipListMap, ConcurrentLinkedQueue, and CopyOnWriteArraySet 정리",
+    "ConcurrentSkipListMap, ConcurrentLinkedQueue, and CopyOnWriteArraySet 실수",
+    "ConcurrentSkipListMap, ConcurrentLinkedQueue, and CopyOnWriteArraySet 판단 기준",
+    "자바 ConcurrentSkipListMap, ConcurrentLinkedQueue, and CopyOnWriteArraySet",
     "ConcurrentSkipListMap ConcurrentLinkedQueue CopyOnWriteArraySet tradeoffs",
     "Java concurrent collection tradeoffs",
     "ConcurrentLinkedQueue unbounded growth",
     "CopyOnWriteArraySet snapshot iteration",
     "ConcurrentSkipListMap range query",
-    "weakly consistent iteration"
+    "weakly consistent iteration",
+    "concurrentskiplistmap concurrentlinkedqueue copyonwritearrayset tradeoffs guide"
   ],
   "expected_queries": [
     "ConcurrentSkipListMap ConcurrentLinkedQueue CopyOnWriteArraySet을 workload 기준으로 비교해줘",
@@ -46,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/concurrentskiplistmap-concurrentlinkedqueue-copyonwritearrayset-tradeoffs.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

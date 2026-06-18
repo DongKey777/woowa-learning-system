@@ -6,16 +6,18 @@
   "summary": "저수준 원자 API를 고를 때는 \"CAS가 되는가\"보다 \"어떤 상태를 어떤 ordering으로 publish/read해야 하는가\"를 먼저 정해야 한다. 일반 애플리케이션은 Atomic*, lock, volatile reference로 끝나는 경우가 많고, VarHandle은 access mode를 명시해야 하는 라이브러리성 코드에서 빛난다.",
   "body_markdown": "# VarHandle, Unsafe, AtomicFieldUpdater Memory Ordering Chooser\n\n> 한 줄 요약: 저수준 원자 API를 고를 때는 \"CAS가 되는가\"보다 \"어떤 상태를 어떤 ordering으로 publish/read해야 하는가\"를 먼저 정해야 한다. 일반 애플리케이션은 `Atomic*`, lock, `volatile` reference로 끝나는 경우가 많고, `VarHandle`은 access mode를 명시해야 하는 라이브러리성 코드에서 빛난다.\n\n> 관련 문서:\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n> - [VarHandle, Unsafe, Atomics](./varhandle-unsafe-atomics.md)\n> - [Memory Barriers and VarHandle Fences](./memory-barriers-varhandle-fences.md)\n> - [Volatile Synchronized Atomic Visibility Chooser](./volatile-synchronized-atomic-visibility-chooser.md)\n> - [JCStress Concurrency Testing](./jcstress-concurrency-testing.md)\n\n> retrieval-anchor-keywords: VarHandle getPlain getOpaque getAcquire getVolatile setRelease setOpaque setVolatile, Unsafe compareAndSwap, AtomicReferenceFieldUpdater, AtomicIntegerFieldUpdater, memory ordering chooser, acquire release opaque plain volatile, CAS publication visibility, Java low level atomics\n\n## 10초 chooser\n\n| 요구사항 | 1차 선택 | 이유 |\n|---|---|---|\n| 단일 숫자/참조의 원자 갱신 | `AtomicInteger`, `AtomicLong`, `AtomicReference` | 가장 읽기 쉽고 JMM 의미가 표준 API에 묶여 있다. |\n| 기존 객체의 `volatile` field를 allocation 없이 갱신 | `Atomic*FieldUpdater` | 객체마다 wrapper를 만들지 않지만, field 제약과 reflective access 비용/가독성을 감수한다. |\n| field, array element, off-heap-like carrier에 access mode를 명시 | `VarHandle` | `plain`, `opaque`, `acquire/release`, `volatile`을 호출 지점에서 드러낸다. |\n| JDK 내부 수준의 특수 최적화 | `Unsafe` | 일반 서비스 코드에서는 회피가 기본이다. 표준 API와 타입 안전성을 잃는다. |\n| 여러 field invariant 보호 | lock 또는 immutable snapshot publish | CAS 하나로 복합 상태의 정합성을 만들 수 없다. |\n\n핵심 질문은 \"가장 빠른 도구가 무엇인가\"가 아니다. 먼저 `read-modify-write` 원자성이 필요한지, 다른 thread에 선행 write까지 보여야 하는지, 같은 변수 순서만 유지하면 되는지, 여러 field를 함께 보호해야 하는지 적는다. 그 문장이 없으면 access mode 선택은 거의 추측이 된다.\n\n## access mode mental model\n\n`VarHandle`의 access mode는 강도 순서처럼 보이지만, 무조건 강한 것을 쓰면 되는 메뉴가 아니다.\n\n- `plain`: 일반 field 접근에 가깝다. inter-thread ordering을 기대하지 않는다.\n- `opaque`: 같은 변수에 대한 coherent한 관찰은 더 강하지만, 다른 변수의 publish 순서를 보장하는 도구로 쓰지 않는다.\n- `release write`: 이 write 이전의 일반 write들이 release 뒤로 밀려 관찰되는 것을 막는 publish 쪽 경계다.\n- `acquire read`: acquire 이후의 read/write가 acquire 앞쪽으로 당겨져 관찰되는 것을 막는 consume 쪽 경계다.\n- `volatile read/write`: JMM의 volatile access 의미를 갖는 가장 익숙하고 강한 축이다.\n\n예를 들어 `payload`를 쓰고 `ready` flag를 올리는 구조라면 writer의 `setRelease(ready, true)`와 reader의 `getAcquire(ready)`가 같은 flag를 통해 연결될 때 publication 의도가 생긴다. 반대로 `getOpaque(ready)`로 flag만 봐 놓고 `payload`가 안전하게 보인다고 말하면 과하다. opaque는 progress marker나 racy-but-tolerant 상태 관찰에는 후보가 될 수 있지만, 객체 graph를 안전하게 publish하는 답으로 바로 쓰지 않는다.\n\n## AtomicFieldUpdater를 고를 때\n\n`AtomicReferenceFieldUpdater`, `AtomicIntegerFieldUpdater`, `AtomicLongFieldUpdater`는 오래된 코드나 객체 수가 아주 많은 구조에서 여전히 보인다. 장점은 field 자체를 업데이트하므로 객체마다 `AtomicReference` wrapper를 들고 있지 않아도 된다는 점이다. 단점도 분명하다.\n\n- 대상 field는 보통 `volatile`이어야 한다.\n- field 이름을 문자열로 넘기므로 리팩터링 안정성이 낮다.\n- access check와 generic 제약 때문에 코드가 장황하다.\n- update 대상이 여러 field invariant라면 여전히 부족하다.\n\n새 코드에서 같은 일을 한다면 `VarHandle`이 더 명시적인 경우가 많다. `MethodHandles.lookup().findVarHandle(...)`로 field handle을 만들고, 호출 지점에서 `compareAndSet`, `getAcquire`, `setRelease` 같은 의도를 드러낼 수 있기 때문이다. 다만 \"VarHandle을 썼다\"가 안전성을 증명하지 않는다. 어떤 access mode를 왜 선택했는지 리뷰 문장으로 남아야 한다.\n\n## Unsafe는 어느 bucket인가\n\n`Unsafe`는 \"더 빠른 Atomic\" bucket이 아니다. off-heap access, object layout, raw CAS, fence 등 JVM 내부에 가까운 권한을 열어 주는 escape hatch다. 일반 애플리케이션에서는 다음 순서가 안전하다.\n\n1. lock, immutable snapshot, concurrent collection으로 해결되는지 본다.\n2. 단일 변수면 `Atomic*` 또는 `volatile` reference를 본다.\n3. allocation/profile 때문에 field updater가 필요한지 측정한다.\n4. JDK 9+라면 `VarHandle`로 access mode를 명시한다.\n5. 그래도 안 되면 `Unsafe` 사용 이유와 검증 책임을 문서화한다.\n\n성능 가정만으로 `Unsafe`를 택하면 유지보수 비용이 즉시 커진다. API가 표준화되지 않은 경계에 가깝고, 타입 안전성도 약하며, JDK 버전 변화에 취약하다.\n\n## memory ordering caveats\n\nCAS는 단일 위치의 조건부 갱신을 원자적으로 만든다. 하지만 \"값을 바꿨다\"와 \"그 전에 준비한 데이터가 reader에게 안전하게 보인다\"는 같은 말이 아니다. CAS 메서드마다 memory effect가 있고, atomic class와 `VarHandle`의 mode별 메서드는 서로 다른 ordering 의도를 표현한다. 따라서 lock-free 구조에서는 다음을 분리한다.\n\n- linearization point: 어느 한 순간에 작업이 성공했다고 볼 것인가\n- publication edge: 성공 전에 쓴 데이터가 reader에게 보이는가\n- failure path: CAS 실패 후 읽은 값으로 무엇을 믿을 수 있는가\n- ABA 위험: 값이 같아 보여도 중간 변화 이력을 잃지 않는가\n- retry cost: 경합 중 spin이 CPU를 태우지 않는가\n\n`lazySet` 또는 release store는 \"언젠가 보이면 된다\"가 아니라 더 약한 ordering으로 publish하는 선택이다. reader 쪽 acquire나 volatile read와 짝을 생각하지 않으면 문장이 완성되지 않는다.\n\n## Wrong-bucket neighbors\n\n| 잘못 넣은 bucket | 왜 위험한가 | 더 나은 질문 |\n|---|---|---|\n| `volatile` counter를 VarHandle CAS 문제로 봄 | 핵심은 access API가 아니라 read-modify-write 원자성이다 | \"단일 증가인가, 복합 invariant인가?\" |\n| CPU cache coherence 문서로 바로 이동 | Java API 선택과 JMM happens-before 설명을 건너뛴다 | \"Java level synchronization edge가 있는가?\" |\n| `Unsafe`를 성능 해결책으로 가정 | 검증/호환성 비용이 드러나지 않는다 | \"측정된 allocation 또는 wrapper 비용이 있는가?\" |\n| `opaque`를 가벼운 volatile로 사용 | payload publication을 보장하지 않을 수 있다 | \"다른 변수의 선행 write까지 보여야 하는가?\" |\n| `AtomicFieldUpdater`를 복합 상태 보호로 사용 | field 하나만 원자 갱신될 뿐 도메인 불변식은 분리된다 | \"같은 critical section에 묶을 상태는 무엇인가?\" |\n\n## Verification steps\n\n먼저 공유 상태를 한 문장으로 적는다. \"ready가 true이면 payload의 모든 field 초기화가 보여야 한다\"처럼 reader가 믿는 조건을 문장화한다. 그 다음 writer access, reader access, CAS 성공/실패 경로를 표로 나눈다. 단순 stress loop 통과는 증명이 아니다. 중요한 primitive라면 JCStress outcome을 만들고, 실패 허용 outcome과 금지 outcome을 분리한다.\n\n코드 리뷰에서는 `getOpaque`, `getAcquire`, `getVolatile`이 섞인 지점마다 \"왜 이 강도인가\"를 묻는다. production에서는 retry count, CAS failure rate, CPU spin, latency tail, allocation 차이를 본다. 성능 때문에 저수준 API를 골랐다면 안전성 검증과 성능 측정이 둘 다 있어야 한다.\n\n## Safe Next Docs\n\nJMM 근거가 약하면 `java-memory-model-happens-before-volatile-final`로 돌아간다. access mode와 fence를 더 깊게 보려면 `memory-barriers-varhandle-fences`, 단일 counter 선택은 `volatile-synchronized-atomic-visibility-chooser`, outcome 검증은 `jcstress-concurrency-testing`으로 이어진다.\n",
   "aliases": [
+    "자바 VarHandle Unsafe AtomicFieldUpdater 선택",
+    "VarHandle Unsafe AtomicFieldUpdater Memory 개념",
+    "VarHandle Unsafe AtomicFieldUpdater Memory 정리",
+    "VarHandle Unsafe AtomicFieldUpdater Memory 실수",
+    "VarHandle Unsafe AtomicFieldUpdater Memory 판단 기준",
     "VarHandle Unsafe AtomicFieldUpdater memory ordering chooser",
     "Java VarHandle access mode chooser",
     "AtomicReferenceFieldUpdater vs VarHandle",
     "Unsafe compareAndSwap replacement",
     "acquire release opaque plain volatile access mode",
     "Java low level atomics ordering",
-    "자바 VarHandle Unsafe AtomicFieldUpdater 선택",
-    "Generic",
-    "final",
-    "synchronized"
+    "Generic"
   ],
   "expected_queries": [
     "VarHandle, Unsafe, AtomicFieldUpdater 중 어떤 것을 선택해야 해?",
@@ -54,8 +56,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/varhandle-unsafe-atomicfieldupdater-memory-ordering-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

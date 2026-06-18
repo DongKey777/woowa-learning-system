@@ -6,18 +6,18 @@
   "summary": "이 문서는 wait/notify와 Condition을 이벤트 전송이 아니라 condition predicate protocol로 다루는 playbook이다.",
   "body_markdown": "# `wait`/`notify`, `Condition`, Spurious Wakeup, and Lost Signal\n\n> 한 줄 요약: `wait()`/`notify()`와 `Condition.await()`/`signal()`은 이벤트 전송 API가 아니라 조건 대기 프로토콜이다. 조건(predicate), 락, 신호 순서를 잘못 잡으면 spurious wakeup, lost signal, 영원한 `WAITING`이 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Thread Interruption and Cooperative Cancellation Playbook](./thread-interruption-cooperative-cancellation-playbook.md)\n> - [Thread Dump State Interpretation](./thread-dump-state-interpretation.md)\n> - [Java Memory Model, Happens-Before, `volatile`, `final`](../java-memory-model-happens-before-volatile-final.md)\n> - [`LockSupport.park`/`unpark` Permit Semantics and Coordination Pitfalls](./locksupport-park-unpark-permit-semantics.md)\n> - [`Semaphore`, `CountDownLatch`, `CyclicBarrier`, and `Phaser` Coordination Semantics](./semaphore-countdownlatch-cyclicbarrier-phaser-coordination-semantics.md)\n> - [Executor Sizing, Queue, Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n\n> retrieval-anchor-keywords: wait notify, Condition await signal, spurious wakeup, lost notification, guarded block, monitor wait, notifyAll, signalAll, condition variable, happens-before, producer consumer, WAITING thread, Semaphore, CountDownLatch, LockSupport, park, unpark\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n대기는 \"신호를 받으면 진행한다\"가 아니라  \n\"공유 상태가 원하는 조건이 될 때까지 락을 잡은 채 확인하고, 아니면 잠든다\"로 이해해야 한다.\n\n즉 핵심은 signal 자체가 아니라 predicate다.\n\n- 조건은 공유 상태에 저장된다\n- 대기와 조건 확인은 같은 lock 아래서 이뤄진다\n- 깨어나도 조건을 다시 확인한다\n\n이 규칙을 놓치면 lost signal이 생긴다.\n\n## 깊이 들어가기\n\n### 1. `if`가 아니라 `while`로 조건을 감싼다\n\n`wait()`와 `await()`는 깨어났다고 해서 조건이 참이 되었다는 뜻이 아니다.\n\n- spurious wakeup이 있을 수 있다\n- 다른 스레드가 먼저 조건을 소비했을 수 있다\n- `notifyAll()`로 여러 스레드가 함께 깰 수 있다\n\n그래서 표준 패턴은 guarded block이다.\n\n```java\nwhile (!ready) {\n    lock.wait();\n}\n```\n\n여기서 중요한 것은 `while`이지 `wait()` 자체가 아니다.\n\n### 2. 조건과 신호는 같은 락 아래에서 움직여야 한다\n\n다음 순서가 깨지면 lost signal이 난다.\n\n- 스레드 A가 조건을 확인\n- 아직 false라고 보고 잠들 준비\n- 스레드 B가 조건을 true로 만들고 notify\n- A는 그 notify를 놓치고 영원히 대기\n\n이런 문제를 막으려면 조건 상태 변경과 signal이 같은 lock discipline 안에 있어야 한다.\n\n### 3. `notify()`와 `notifyAll()`은 선택 비용이 다르다\n\n`notify()`는 한 스레드만 깨운다.  \n효율적일 수 있지만, 서로 다른 조건을 기다리는 스레드가 섞여 있으면 잘못된 스레드를 깨울 수 있다.\n\n`notifyAll()`은 더 안전할 수 있지만, 깨어난 많은 스레드가 다시 잠들며 thundering herd를 만들 수 있다.\n\n`Condition`을 쓰면 조건 큐를 분리할 수 있어 의도를 더 명확히 표현하기 좋다.\n\n다만 문제 자체가 condition protocol이 아니라 bulkhead, one-shot gate, phase synchronization이라면 raw wait/notify보다 [Semaphore, CountDownLatch, CyclicBarrier, and Phaser Coordination Semantics](./semaphore-countdownlatch-cyclicbarrier-phaser-coordination-semantics.md) 쪽이 더 맞을 수 있다.\n\n### 4. `Condition`은 더 명시적이지만 규칙은 같다\n\n`ReentrantLock`의 `Condition`은 monitor wait/notify보다 표현력이 좋다.\n\n- 조건 큐를 여러 개 둘 수 있다\n- interruptible/timed wait를 명시할 수 있다\n- lock API와 같이 읽기 쉽다\n\n하지만 역시 predicate loop는 그대로 필요하다.  \n`await()`가 자동으로 조건을 보장해주지는 않는다.\n\n### 5. interruption과 timeout도 같이 설계해야 한다\n\n대기 코드는 정상 경로만 있으면 안 된다.\n\n- interrupt 시 어떻게 빠질지\n- timeout 후 어떤 상태를 반환할지\n- 깨어났지만 조건이 아직 false면 어떻게 재대기할지\n\n즉 wait/notify는 동시성 API이면서 취소 API이기도 하다.\n\n## 실전 시나리오\n\n### 시나리오 1: producer-consumer가 가끔 멈춘다\n\n`if (!ready) wait()` 패턴을 썼다면,  \nspurious wakeup이나 경쟁 소비 때문에 빈 큐를 읽으려다 꼬일 수 있다.\n\n### 시나리오 2: 서비스 시작 시 한 번만 notify했는데 worker가 못 깨어난다\n\n조건과 notify 순서가 다른 lock 아래에 있으면 lost signal이 생길 수 있다.  \n이건 재현이 어려워 운영에서 더 아프다.\n\n### 시나리오 3: thread dump에 `WAITING (on object monitor)`가 쌓인다\n\n문제는 단순히 wait를 썼다는 사실이 아니라,\n\n- 조건을 누가 true로 만드는지\n- 그 신호가 같은 monitor에서 나는지\n- 깨어난 뒤 누가 다시 false로 소비하는지\n\n를 보지 않았기 때문이다.\n\n### 시나리오 4: `notify()`를 써서 드물게 교착 비슷한 정지가 난다\n\n여러 종류의 대기 스레드가 같은 monitor를 기다리면,  \n잘못된 스레드 하나만 깨워 전체 진행이 멈춘 것처럼 보일 수 있다.\n\n## 코드로 보기\n\n### 1. monitor guarded block\n\n```java\nsynchronized (lock) {\n    while (!ready) {\n        lock.wait();\n    }\n    consume();\n}\n```\n\n### 2. 상태 변경 후 signal\n\n```java\nsynchronized (lock) {\n    ready = true;\n    lock.notifyAll();\n}\n```\n\n### 3. `Condition` 기반 producer-consumer\n\n```java\nimport java.util.ArrayDeque;\nimport java.util.Queue;\nimport java.util.concurrent.locks.Condition;\nimport java.util.concurrent.locks.ReentrantLock;\n\npublic final class BoundedBuffer<T> {\n    private final Queue<T> queue = new ArrayDeque<>();\n    private final int capacity;\n    private final ReentrantLock lock = new ReentrantLock();\n    private final Condition notEmpty = lock.newCondition();\n    private final Condition notFull = lock.newCondition();\n\n    public BoundedBuffer(int capacity) {\n        this.capacity = capacity;\n    }\n\n    public void put(T value) throws InterruptedException {\n        lock.lockInterruptibly();\n        try {\n            while (queue.size() == capacity) {\n                notFull.await();\n            }\n            queue.add(value);\n            notEmpty.signal();\n        } finally {\n            lock.unlock();\n        }\n    }\n\n    public T take() throws InterruptedException {\n        lock.lockInterruptibly();\n        try {\n            while (queue.isEmpty()) {\n                notEmpty.await();\n            }\n            T value = queue.remove();\n            notFull.signal();\n            return value;\n        } finally {\n            lock.unlock();\n        }\n    }\n}\n```\n\n### 4. 피해야 할 `if` 패턴\n\n```java\nsynchronized (lock) {\n    if (!ready) {\n        lock.wait();\n    }\n    consume();\n}\n```\n\n이 코드는 깨어난 뒤에도 조건이 여전히 참인지 보장하지 못한다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| raw `wait`/`notify` | JDK 기본 도구라 의존성이 적다 | 규칙을 조금만 놓쳐도 버그가 난다 |\n| `Condition` | 조건 큐를 분리해 의도를 더 잘 표현한다 | lock 관리 코드가 늘어난다 |\n| `BlockingQueue` 같은 고수준 유틸리티 | 구현 실수를 크게 줄인다 | 세밀한 프로토콜을 직접 통제하기 어렵다 |\n| `notifyAll()` 우선 | 안전성이 높다 | 깨어나는 스레드가 많아져 비용이 늘 수 있다 |\n\n핵심은 signal API보다 predicate와 lock discipline을 먼저 설계하는 것이다.\n\n## 꼬리질문\n\n> Q: 왜 `if` 대신 `while`을 써야 하나요?\n> 핵심: spurious wakeup과 경쟁 소비 때문에 깨어난 뒤에도 조건을 다시 확인해야 하기 때문이다.\n\n> Q: lost signal은 왜 생기나요?\n> 핵심: 조건 상태 변경과 대기/신호가 같은 락 규칙 아래에서 움직이지 않으면 신호를 놓칠 수 있다.\n\n> Q: `notify()`보다 `notifyAll()`이 항상 좋은가요?\n> 핵심: 안전성은 높지만 비용이 커질 수 있어 조건 큐 구조를 함께 봐야 한다.\n\n> Q: raw wait/notify를 직접 구현해야 하나요?\n> 핵심: 대부분은 `BlockingQueue`, `Semaphore`, `CountDownLatch` 같은 고수준 유틸리티가 더 안전하다.\n\n## 한 줄 정리\n\n`wait`/`notify`와 `Condition`은 신호 전달이 아니라 조건 대기 프로토콜이므로, predicate loop와 같은-lock discipline 없이 쓰면 lost signal과 영구 대기가 생기기 쉽다.\n",
   "aliases": [
+    "조건 대기 프로토콜",
+    "스퓨리어스 웨이크업",
+    "wait/notify, Condition, Spurious Wakeup, 개념",
+    "wait/notify, Condition, Spurious Wakeup, 정리",
+    "wait/notify, Condition, Spurious Wakeup, 실수",
     "wait notify Condition",
     "spurious wakeup",
     "lost signal",
     "lost notification",
     "guarded block",
     "Condition await signal",
-    "monitor wait",
-    "notifyAll",
-    "producer consumer",
-    "WAITING thread",
-    "조건 대기 프로토콜",
-    "스퓨리어스 웨이크업"
+    "monitor wait"
   ],
   "expected_queries": [
     "wait notify에서 왜 if가 아니라 while로 predicate를 다시 확인해야 하는지 spurious wakeup 기준으로 설명해줘",
@@ -54,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/wait-notify-condition-spurious-wakeup-lost-signal.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

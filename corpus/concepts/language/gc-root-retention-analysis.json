@@ -6,15 +6,18 @@
   "summary": "이 문서는 GC root retention analysis를 heap dump, reference chain, dominator tree, retained size, ThreadLocal, static field, classloader, JNI global reference 관점으로 진단하는 advanced playbook이다.",
   "body_markdown": "# GC Root Retention Analysis\n\n> 한 줄 요약: GC root 분석은 \"왜 객체가 아직 살아 있는가\"를 묻는 일이고, heap dump에서 root chain과 retention path를 읽어야 진짜 누수와 단순 장기 보관을 구분할 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [OOM Heap Dump Playbook](./oom-heap-dump-playbook.md)\n> - [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)\n> - [Phantom, Weak, and Soft References](./phantom-weak-soft-references.md)\n> - [ThreadLocal Leaks and Context Propagation](./threadlocal-leaks-context-propagation.md)\n\n> retrieval-anchor-keywords: GC root, retention path, reference chain, heap dump, dominator tree, retained size, leak analysis, thread local, static field, class loader, JNI global reference, local reference\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nGC root는 GC가 시작할 때 반드시 살아 있다고 보는 객체나 참조의 출발점이다.  \nheap dump에서 중요한 것은 객체 자체보다 **어떤 root에서 이어져서 살아남는가**다.\n\n대표 root 경로:\n\n- thread stack local\n- static field\n- JNI global reference\n- class loader\n- running thread\n- monitor / synchronization root\n\n## 깊이 들어가기\n\n### 1. retained size와 shallow size는 다르다\n\n- shallow size: 객체 자기 자신이 차지하는 크기\n- retained size: 그 객체가 유지시키는 전체 하위 그래프 크기\n\n누수 분석에서는 retained size가 훨씬 중요하다.\n\n### 2. dominator tree를 봐야 한다\n\n같은 객체가 여러 경로로 참조될 수 있다.  \n그중 실제로 retention을 지배하는 dominator를 찾아야 누수 원인을 좁힐 수 있다.\n\n### 3. GC root는 반드시 나쁜 것은 아니다\n\nthread local, cache, static registry는 의도된 보관일 수 있다.  \n문제는 한도와 해제 규칙이 없을 때다.\n\n### 4. classloader와 thread가 자주 root가 된다\n\nwebapp redeploy나 thread pool reuse가 있으면 root chain이 길어지고, 결국 메모리 회수 불능처럼 보일 수 있다.  \n관련해서 [ClassLoader Memory Leak Playbook](./classloader-memory-leak-playbook.md)과 [ThreadLocal Leaks and Context Propagation](./threadlocal-leaks-context-propagation.md)을 같이 보면 좋다.\n\n### 5. JNI root도 놓치기 쉽다\n\nnative code가 global reference를 잡으면 Java heap dump에서 원인이 흐릿해질 수 있다.  \n이 경우 native 쪽 자원 모델까지 봐야 한다.\n\n## 운영 playbook\n\n### 재현 조건\n\n- full GC 이후에도 특정 객체 그래프의 retained size가 줄지 않는다.\n- heap histogram의 object count는 보이지만 어떤 root가 살리는지 설명하지 못한다.\n- redeploy, thread pool reuse, listener 등록 이후 old classloader나 request context가 남는다.\n\n### 확인 순서\n\n1. histogram으로 많은 타입을 찾되, 결론은 heap dump dominator tree에서 낸다.\n2. retained size가 큰 dominator를 고르고 path to GC roots를 확인한다.\n3. root 종류를 `static`, `ThreadLocal`, classloader, JNI global reference, running thread로 나눈다.\n4. 해당 retention이 cache/registry/pool처럼 의도된 장기 보관인지, TTL/eviction/cleanup 없는 leak인지 확인한다.\n5. thread dump와 배포 시각을 맞춰 old classloader 또는 stale thread context를 검증한다.\n\n### failure matrix\n\n| 관찰 | 잘못된 결론 | 더 정확한 해석 |\n|---|---|---|\n| object count가 많다 | 그 타입이 곧 leak 원인이다 | 그 객체를 지배하는 dominator/root가 따로 있을 수 있다 |\n| shallow size가 작다 | 중요하지 않다 | retained graph가 크면 핵심 원인일 수 있다 |\n| static map이 크다 | 항상 leak이다 | bounded cache일 수 있으므로 한도와 eviction을 본다 |\n| old classloader가 남는다 | GC가 약하다 | thread/static/listener가 classloader graph를 붙잡을 수 있다 |\n\n### 검증\n\n- cleanup 후 같은 시나리오에서 retained size와 root path가 사라진다.\n- cache라면 size bound, TTL, eviction metric이 있고 leak이라면 owner reference가 제거된다.\n- redeploy 테스트에서 old classloader 수가 누적되지 않는다.\n\n## 실전 시나리오\n\n### 시나리오 1: heap이 계속 커지는데 어떤 객체가 잡고 있는지 모르겠다\n\nheap dump에서 retained size가 큰 dominator부터 본다.  \nstatic cache, thread local, listener, classloader를 우선 의심한다.\n\n### 시나리오 2: 누수처럼 보이지만 사실은 장기 보관이다\n\ncache, queue, buffer pool, preloaded registry는 의도된 retention일 수 있다.  \n그럴 때는 한도, TTL, eviction 정책을 함께 봐야 한다.\n\n### 시나리오 3: redeploy 후 메모리가 안 내려간다\n\nold classloader가 GC root chain에 남아 있을 가능성이 높다.  \ndominator tree와 thread dump를 같이 봐야 한다.\n\n## 코드로 보기\n\n### 1. static retention\n\n```java\nprivate static final List<Object> CACHE = new ArrayList<>();\n```\n\n### 2. ThreadLocal retention\n\n```java\nprivate static final ThreadLocal<Object> HOLDER = new ThreadLocal<>();\n```\n\n### 3. reference chain 감각\n\n```java\n// root -> cache -> service -> buffer -> payload\n```\n\n### 4. 진단 흐름\n\n```bash\njcmd <pid> GC.heap_dump /tmp/heap.hprof\njcmd <pid> GC.class_histogram\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| heap dump 분석 | retention path를 정확히 볼 수 있다 | 무겁고 시간이 든다 |\n| histogram | 빠른 초기 스캔이 가능하다 | root chain은 안 보인다 |\n| JFR | 시간축까지 함께 볼 수 있다 | heap graph는 약하다 |\n| runtime logging | 재현이 쉽다 | 장기 root chain 파악은 약하다 |\n\n핵심은 \"무슨 객체가 있나\"보다 \"무슨 root가 그 객체를 살리고 있나\"를 보는 것이다.\n\n## 꼬리질문\n\n> Q: GC root는 무엇인가요?\n> 핵심: GC가 시작할 때 살아 있다고 보는 참조의 출발점이다.\n\n> Q: retained size가 왜 중요한가요?\n> 핵심: 그 객체가 유지시키는 하위 그래프 전체 비용을 보여주기 때문이다.\n\n> Q: 누수와 장기 보관은 어떻게 구분하나요?\n> 핵심: 한도, eviction, TTL, 의도된 retention인지 여부를 함께 본다.\n\n## 한 줄 정리\n\nGC root 분석은 heap dump의 핵심이고, retained size와 dominator tree를 읽어야 실제 누수와 의도된 보관을 구분할 수 있다.\n",
   "aliases": [
+    "GC Root Retention Analysis 개념",
+    "GC Root Retention Analysis 정리",
+    "GC Root Retention Analysis 실수",
+    "GC Root Retention Analysis 판단 기준",
+    "자바 GC Root Retention Analysis",
     "GC root retention analysis",
     "heap dump retention path",
     "dominator tree retained size",
     "GC root reference chain",
     "ThreadLocal retention",
     "static field leak",
-    "classloader retention path",
-    "final",
-    "native"
+    "classloader retention path"
   ],
   "expected_queries": [
     "heap dump에서 GC root retention path를 따라 객체가 왜 살아 있는지 분석하는 방법을 알려줘",
@@ -49,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/gc-root-retention-analysis.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

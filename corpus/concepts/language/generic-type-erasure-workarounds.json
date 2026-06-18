@@ -6,16 +6,18 @@
   "summary": "이 문서는 Java generic type erasure를 runtime type information, Class<T>, TypeReference/super type token, generic factory, parser registry, PECS boundary 관점으로 설명하는 intermediate primer다.",
   "body_markdown": "# Generic Type Erasure Workarounds\n\n> 한 줄 요약: Java Generics는 런타임에 지워지기 때문에, 타입 정보가 꼭 필요하면 별도 보관 구조와 API 설계를 써야 한다.\n\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](../README.md)\n- [우아코스 백엔드 CS 로드맵](../../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../../data-structure/backend-data-structure-starter-pack.md)\n\n> 관련 문서:\n> - [Reflection, Generics, Annotations](./reflection-generics-annotations.md)\n> - [Reflection 비용과 대안](./reflection-cost-and-alternatives.md)\n> - [ClassLoader, Exception 경계, 객체 계약](./classloader-exception-boundaries-object-contracts.md)\n> - [Java Collections 성능 감각](./collections-performance.md)\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 필요한가](#왜-필요한가)\n- [타입 소거가 남기는 것](#타입-소거가-남기는-것)\n- [실전 우회 방법](#실전-우회-방법)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\nretrieval-anchor-keywords: generic type erasure, typereference, super type token, class<t> parameter, runtime generic type info, java type erasure workaround, list<user> deserialization, type token pattern, generic factory limitation, pecs boundary, generic type erasure workarounds basics, generic type erasure workarounds beginner, generic type erasure workarounds intro, java basics, beginner java\n\n## 왜 필요한가\n\n제네릭은 타입 안정성을 높이지만, Java는 런타임에서 대부분의 제네릭 정보를 지운다. 그래서 다음이 막힌다.\n\n- `new T()` 불가\n- `T[]` 생성 불가\n- `List<String>`과 `List<Integer>`를 런타임에 구분하기 어려움\n- `instanceof List<String>` 불가\n\n문제는 프레임워크와 직렬화, 리플렉션, 메시지 처리에서 **런타임 타입 정보가 꼭 필요**하다는 점이다.\n그래서 우회 패턴을 알아야 한다.\n\n## 타입 소거가 남기는 것\n\nJava는 컴파일 타임에 제네릭을 검증하고, 바이트코드에서는 raw type에 가깝게 바꾼다.\n\n```java\nList<String> names = new ArrayList<>();\nnames.add(\"kim\");\nString first = names.get(0);\n```\n\n실제로는 `Object` 경로와 캐스팅이 섞인다.\n그래서 타입 정보가 필요한 API는 별도로 넘겨야 한다.\n\n### 자주 막히는 지점\n\n- 역직렬화 시 `List<User>` 복원\n- 제네릭 팩토리에서 객체 생성\n- 공통 저장소/레지스트리 설계\n- 타입별 핸들러 매핑\n\n## 실전 우회 방법\n\n### 1. `Class<T>`를 직접 받기\n\n단일 타입이면 가장 단순하다.\n\n```java\npublic final class JsonReader<T> {\n    private final Class<T> type;\n\n    public JsonReader(Class<T> type) {\n        this.type = type;\n    }\n\n    public T read(String json) {\n        // type 기반으로 역직렬화\n        return null;\n    }\n}\n```\n\n### 2. `Type` 또는 super type token 사용\n\n컬렉션처럼 중첩 타입이 필요하면 `Class<T>`로는 부족하다.\n\n```java\nTypeReference<List<User>> ref = new TypeReference<List<User>>() {};\nType type = ref.getType();\n```\n\n익명 클래스의 상위 타입 정보는 `Signature` 메타데이터에 남기 때문에 복구할 수 있다.\n\n### 3. 타입을 API 입력으로 고정하지 말고 생성 시점에 주입\n\n```java\npublic interface Parser<T> {\n    T parse(String text);\n}\n\npublic final class ParserRegistry {\n    private final Map<Class<?>, Parser<?>> parsers = new HashMap<>();\n}\n```\n\n이렇게 하면 런타임에 타입을 다시 유추하지 않아도 된다.\n\n### 4. PECS로 읽기/쓰기 경계를 분리\n\n```java\npublic void copy(List<? extends Number> src, List<? super Number> dest) {\n    for (Number n : src) {\n        dest.add(n);\n    }\n}\n```\n\n타입 소거로 복잡해질수록, 읽기/쓰기 분리를 더 명확히 해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: Jackson이 `List<User>`를 잘못 복원함\n\n```java\nList<User> users = objectMapper.readValue(json, List.class);\n```\n\n이 코드는 `List<LinkedHashMap>`이 될 수 있다.\n해결은 `TypeReference<List<User>>`를 넘기는 것이다.\n\n### 시나리오 2: 제네릭 팩토리에서 캐스팅이 흩어짐\n\n캐스팅을 여러 곳에 두면, 실패가 늦게 터지고 원인이 분산된다.\n가능하면 경계에서 한 번만 복구하고, 내부는 강타입으로 유지한다.\n\n### 시나리오 3: 공통 저장소가 타입을 잃음\n\n`Map<String, Object>`는 편하지만, 결국 downcast 지옥이 온다.\n타입별 서브맵이나 `Class<T>` 키를 함께 두는 편이 낫다.\n\n## 코드로 보기\n\n### Type token 구현\n\n```java\npublic abstract class TypeToken<T> {\n    private final Type type;\n\n    protected TypeToken() {\n        Type superType = getClass().getGenericSuperclass();\n        ParameterizedType pt = (ParameterizedType) superType;\n        this.type = pt.getActualTypeArguments()[0];\n    }\n\n    public Type getType() {\n        return type;\n    }\n}\n```\n\n### 사용 예시\n\n```java\nTypeToken<List<User>> token = new TypeToken<List<User>>() {};\nType type = token.getType();\n```\n\n### 단일 타입 API\n\n```java\npublic final class CacheEntry<T> {\n    private final Class<T> type;\n    private final T value;\n\n    public CacheEntry(Class<T> type, T value) {\n        this.type = type;\n        this.value = value;\n    }\n}\n```\n\n## 트레이드오프\n\n| 방법 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| `Class<T>` 주입 | 단순하고 명시적이다 | 중첩 제네릭에 약하다 | 단일 DTO/서비스 |\n| `TypeReference`/token | 중첩 타입까지 복구 가능 | 구현이 복잡하다 | JSON/메시지 역직렬화 |\n| API에 타입 정보 명시 | 실패가 빠르다 | 호출부가 장황해진다 | 프레임워크/라이브러리 |\n| raw type + cast | 빨리 만든다 | 유지보수성이 나쁘다 | 피해야 한다 |\n\n핵심은 **런타임에 꼭 필요한 타입만 따로 보관**하는 것이다.\n\n## 꼬리질문\n\n> Q: Java에서 `List<String>`과 `List<Integer>`를 런타임에 구분하기 어려운 이유는 무엇인가요?\n> 의도: 타입 소거의 본질 이해 여부 확인\n> 핵심: 컴파일 타임 검증 후 바이트코드에서 타입 파라미터가 지워진다\n\n> Q: `TypeReference` 같은 패턴이 왜 동작하나요?\n> 의도: 제네릭 메타데이터가 어디에 남는지 확인\n> 핵심: 익명 클래스의 상위 타입 정보는 `.class` 메타데이터에 보존된다\n\n> Q: raw type 대신 우회 패턴을 써야 하는 이유는 무엇인가요?\n> 의도: 타입 안정성 유지 여부 확인\n> 핵심: 캐스팅 실패를 늦게 터뜨리지 않기 위해서다\n\n## 한 줄 정리\n\n제네릭은 런타임에 사라지므로, 타입 정보가 필요하면 `Class<T>`, `Type`, type token, PECS 같은 우회 장치를 명시적으로 써야 한다.\n",
   "aliases": [
+    "제네릭 타입 소거 우회",
+    "Generic Type Erasure Workarounds 개념",
+    "Generic Type Erasure Workarounds 정리",
+    "Generic Type Erasure Workarounds 실수",
+    "Generic Type Erasure Workarounds 판단 기준",
     "generic type erasure workarounds",
     "Java type erasure workaround",
     "TypeReference super type token",
     "Class<T> parameter",
     "runtime generic type info",
     "List<User> deserialization",
-    "제네릭 타입 소거 우회",
-    "Reflection",
-    "abstract",
-    "final"
+    "Reflection"
   ],
   "expected_queries": [
     "Java generic type erasure 때문에 List<String>과 List<Integer>를 runtime에 구분하기 어려운 이유가 뭐야?",
@@ -50,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/language/java/generic-type-erasure-workarounds.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

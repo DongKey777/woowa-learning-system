@@ -6,12 +6,18 @@
   "summary": "CDN은 캐시를 빨리 쓰는 기술이 아니라, 캐시 키와 무효화 규칙을 얼마나 정확히 설계하느냐의 문제다.",
   "body_markdown": "# CDN Cache Key와 Invalidation\n\n> 한 줄 요약: CDN은 캐시를 빨리 쓰는 기술이 아니라, 캐시 키와 무효화 규칙을 얼마나 정확히 설계하느냐의 문제다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Cache-Control 실전](./cache-control-practical.md)\n> - [HTTP의 무상태성과 쿠키, 세션, 캐시](./http-state-session-cache.md)\n> - [Vary와 Content Negotiation 기초: 언어, 압축, 응답 variant](./vary-content-negotiation-basics-language-compression.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [Compression, Cache, Vary, Accept-Encoding, Personalization](./compression-cache-vary-accept-encoding-personalization.md)\n> - [Cache, Vary, Accept-Encoding Edge Case Playbook](./cache-vary-accept-encoding-edge-case-playbook.md)\n> - [System Design](../system-design/README.md)\n\nretrieval-anchor-keywords: CDN cache key, invalidation, purge, vary, Accept-Language cache key, content negotiation key, cache busting, query string cache, edge cache, personalized response, surrogate key, cache segmentation\n\n---\n\n## 재현 조건, 관찰 증거, failure matrix\n\n이 문서의 1차 분기는 \"캐시가 빠른가 느린가\"가 아니라 \"cache key가 잘못 묶였는가, invalidation이 늦었는가, origin 부하가 purge로 증폭됐는가\"다. CDN hit/miss는 관찰 신호이고, proof는 같은 URL의 variant와 edge별 상태를 검증/validation해야 얻는다.\n\n### 재현 조건\n\n- 같은 URL을 다른 `Accept-Language`, `Accept-Encoding`, cookie/auth 상태로 반복 요청한다.\n- purge 직후 여러 edge POP 또는 region에서 같은 객체의 `Age`, `ETag`, body hash를 비교한다.\n- versioned asset과 unversioned dynamic response를 나눠서 hit ratio와 origin 요청량을 본다.\n\n### 관찰 증거\n\n- 특정 사용자/언어/권한에서만 다른 body가 섞인다.\n- purge API는 성공했지만 일부 edge에서 `Age`가 계속 증가한다.\n- 배포 직후 hit ratio가 급락하고 origin p95/p99가 같이 오른다.\n\n### failure matrix\n\n| 증상 | 1차 분기 | 관찰 신호 | 검증/validation | wrong-bucket / 오선택 |\n|---|---|---|---|---|\n| 다른 사용자 또는 언어 응답이 보임 | cache key 누락 | 같은 URL, 다른 cookie/language에서 같은 cache object | CDN cache key debug header와 body hash를 variant별로 비교 | app serializer 버그로만 분류 |\n| 수정 후 옛 응답이 남음 | invalidation 전파 지연 | edge별 `Age`와 purge 시점이 다름 | POP별 curl과 CDN purge job 상태를 대조 | origin DB replica lag로만 분류 |\n| purge 후 origin이 흔들림 | purge 폭주 | hit ratio 급락, origin request burst | purge 범위, TTL, stale-while-revalidate 설정을 timeline으로 확인 | CDN이 느리다고만 분류 |\n\n## 핵심 개념\n\nCDN 캐시는 보통 다음 질문으로 결정된다.\n\n- 어떤 응답을 저장할 것인가\n- 어떤 키로 저장할 것인가\n- 언제까지 유효한가\n- 언제 무효화할 것인가\n\n실무에서 캐시 사고는 대개 키 설계보다 무효화에서 터진다.  \n같은 URL인데 사용자/언어/권한/압축 여부가 다르면 같은 캐시를 쓰면 안 된다.\n\n### Retrieval Anchors\n\n- `CDN cache key`\n- `invalidation`\n- `purge`\n- `vary`\n- `cache busting`\n- `edge cache`\n- `surrogate key`\n- `cache segmentation`\n\n---\n\n## 깊이 들어가기\n\n### 1. Cache Key는 무엇으로 구성되는가\n\n기본적으로 키는 URL만이 아니다.\n\n자주 고려하는 요소:\n\n- path\n- query string\n- `Accept-Encoding`\n- `Accept-Language`\n- `Authorization` 유무\n- cookie\n- device type\n\n키를 너무 넓게 잡으면 캐시 적중률이 떨어지고, 너무 좁게 잡으면 데이터가 섞인다.\n\n### 2. Invalidation이 어려운 이유\n\nCDN은 \"오래된 것을 빨리 지우는\" 시스템이 아니라, **분산된 복사본을 일관되게 갱신하는 문제**를 가진다.\n\n대표 전략:\n\n- TTL 만료를 기다린다\n- purge API로 특정 URL을 제거한다\n- versioned URL을 사용한다\n- stale-while-revalidate를 쓴다\n\n### 3. Purge의 함정\n\n무작정 purge하면 다음 문제가 생긴다.\n\n- 캐시 미스가 한꺼번에 몰린다\n- origin 서버가 갑자기 때려 맞는다\n- purge 전파 지연으로 일부 엣지에서 옛 값이 남는다\n\n그래서 purge는 종종 \"정확하지만 느린 삭제\"다.\n\n### 4. Versioned URL이 강한 이유\n\n정적 자산에서는 파일명이 바뀌면 키도 바뀌게 만드는 방식이 실용적이다.\n\n예:\n\n- `app.js?v=123`\n- `app.9f3a1c.js`\n\n이 방식은 purge 부담을 줄이지만, 동적 응답에는 그대로 적용하기 어렵다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 잘못된 키로 로그인 사용자 응답이 섞임\n\n`/profile`을 `public`처럼 캐시하면 다른 사용자의 프로필이 노출될 수 있다.  \n문제는 캐시 서버가 아니라 **key와 header 설계**다.\n\n### 시나리오 2: 배포 후 purge가 폭주\n\n수백만 개의 URL을 purge하면 CDN과 origin이 동시에 흔들린다.  \n이때는 versioned asset, TTL 분산, stale-while-revalidate가 더 현실적이다.\n\n### 시나리오 3: 언어별 응답이 섞임\n\n`Accept-Language`를 키에 넣지 않으면 한 언어 응답이 다른 언어 사용자에게 나갈 수 있다.\n\n---\n\n## 코드로 보기\n\n### 캐시 키 정책 예시\n\n```text\nkey = host + path + normalized_query + accept-encoding + accept-language\n```\n\n### 무효화 전략 예시\n\n```bash\n# 특정 경로 purge\ncurl -X POST https://cdn.example.com/purge \\\n  -H 'Authorization: Bearer ...' \\\n  -d '{\"paths\":[\"/assets/app.9f3a1c.js\"]}'\n```\n\n### 설계 감각\n\n```text\n정적 자산 -> versioned URL + long TTL\n개인화 응답 -> private/no-store\n공개 API -> 짧은 TTL + ETag + revalidation\n핫 콘텐츠 -> purge + stale-while-revalidate 혼합\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| TTL 기반 | 단순하다 | 오래된 데이터가 남는다 | 변경이 드문 콘텐츠 |\n| purge 기반 | 정확하다 | 전파 지연과 폭주가 있다 | 즉시 정합성이 중요한 콘텐츠 |\n| versioned URL | 운영이 편하다 | 동적 응답에 적용이 어렵다 | 정적 자산 |\n| stale-while-revalidate | 빠르고 안정적이다 | 잠깐 옛 값을 허용한다 | 사용자 체감이 더 중요할 때 |\n\n---\n\n## 꼬리질문\n\n> Q: 캐시 키에 cookie를 넣으면 왜 적중률이 떨어지는가?\n> 의도: 키 설계가 캐시 효율을 좌우한다는 점을 이해하는지 확인\n> 핵심: 사용자별로 키가 갈라져 같은 응답도 재사용이 안 된다\n\n> Q: purge와 TTL 중 무엇이 더 낫나?\n> 의도: 운영 절차 관점의 판단 능력 확인\n> 핵심: 즉시 정합성, 트래픽, 전파 지연을 함께 봐야 한다\n\n## 한 줄 정리\n\nCDN 캐시는 저장보다도 키 설계와 무효화 전략이 핵심이며, 잘못 잡으면 성능보다 장애를 먼저 만든다.\n",
   "aliases": [
+    "CDN Cache Key와 Invalidation 개념",
+    "CDN Cache Key와 Invalidation 정리",
+    "CDN Cache Key와 Invalidation 실수",
+    "CDN Cache Key와 Invalidation 판단 기준",
+    "네트워크 CDN Cache Key와 Invalidation",
     "CDN cache key",
     "cache invalidation",
     "purge CDN",
     "surrogate key",
     "cache segmentation",
-    "query string cache key"
+    "query string cache key",
+    "cdn cache key invalidation guide"
   ],
   "expected_queries": [
     "CDN cache key에 path query Accept-Language Authorization Cookie를 어떻게 포함할지 설계해줘",
@@ -50,8 +56,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/cdn-cache-key-invalidation.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }

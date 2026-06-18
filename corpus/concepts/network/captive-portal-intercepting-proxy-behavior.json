@@ -6,12 +6,18 @@
   "summary": "captive portal과 intercepting proxy는 네트워크가 \"인터넷처럼 보이지만 아직 인터넷이 아닌\" 상태를 만들기 때문에, DNS와 TLS 실패가 이상하게 보일 수 있다.",
   "body_markdown": "# Captive Portal, Intercepting Proxy Behavior\n\n> 한 줄 요약: captive portal과 intercepting proxy는 네트워크가 \"인터넷처럼 보이지만 아직 인터넷이 아닌\" 상태를 만들기 때문에, DNS와 TLS 실패가 이상하게 보일 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [DNS over HTTPS Operational Trade-offs](./dns-over-https-operational-tradeoffs.md)\n> - [DNS Negative Caching, NXDOMAIN Behavior](./dns-negative-caching-nxdomain-behavior.md)\n> - [HTTP Proxy CONNECT Tunnels](./http-proxy-connect-tunnels.md)\n> - [TLS Certificate Chain, OCSP Stapling Failure Modes](./tls-certificate-chain-ocsp-stapling-failure-modes.md)\n> - [Happy Eyeballs, Dual-Stack Racing](./happy-eyeballs-dual-stack-racing.md)\n\nretrieval-anchor-keywords: captive portal, intercepting proxy, MITM, network login, DNS hijack, HTTPS interception, proxy auth, walled garden, portal detection\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nCaptive portal은 Wi-Fi나 네트워크에 접속했을 때, 인증/동의 페이지를 통과해야 인터넷이 되는 구조다.  \nIntercepting proxy는 DNS나 HTTP/TLS를 가로채서 portal 또는 정책 페이지로 유도할 수 있다.\n\n- DNS가 엉뚱한 IP를 돌려줄 수 있다\n- HTTP는 portal로 리다이렉트될 수 있다\n- HTTPS는 인증서 에러나 연결 실패처럼 보일 수 있다\n\n### Retrieval Anchors\n\n- `captive portal`\n- `intercepting proxy`\n- `MITM`\n- `network login`\n- `DNS hijack`\n- `HTTPS interception`\n- `proxy auth`\n- `walled garden`\n- `portal detection`\n\n## 깊이 들어가기\n\n### 1. 왜 이상하게 보이나\n\n사용자는 \"인터넷에 연결됨\"처럼 보는데 실제로는 제한된 네트워크일 수 있다.\n\n- 일부 도메인만 열려 있다\n- DNS가 portal로 유도될 수 있다\n- HTTPS 요청은 인증서 mismatch로 실패할 수 있다\n\n이때 \"HTTP는 로그인 HTML이 보이는데 HTTPS API는 body 없이 실패\"가 흔한 조합이다.\nHTTPS는 임의 portal로 조용히 redirect될 수 없고, HSTS가 있으면 사용자가 예외를\n누르는 흐름도 막힐 수 있다.\n\n### 2. portal이 DNS에 주는 영향\n\n네트워크는 DNS를 가로채서 로그인 페이지 주소를 알려줄 수 있다.\n\n- NXDOMAIN처럼 보이거나\n- 특정 IP로 강제되거나\n- 특정 DNS만 허용될 수 있다\n\nDoH나 VPN을 쓰면 DNS hijack 일부는 피할 수 있지만, portal이 아직 walled garden\n상태라면 외부 TCP/TLS 자체를 막을 수 있다. DNS만 정상처럼 보여도 인터넷 경로가\n열렸다고 단정하면 안 된다.\n\n### 3. HTTPS가 왜 특히 민감한가\n\nHTTPS는 인증서 검증 때문에 portal이나 intercepting proxy와 충돌하기 쉽다.\n\n- cert mismatch\n- TLS handshake failure\n- redirect가 안 보임\n- `NET::ERR_CERT_*`, `SSL_ERROR_*`, connection reset처럼 앱 HTTP status가 아닌 형태로 보임\n\n즉, 웹 앱이 아니라 **네트워크 상태**가 문제인 경우가 많다.\n\n### 4. portal detection이 왜 필요한가\n\n클라이언트는 \"지금 인터넷이 진짜 되는가\"를 감지하려고 한다.\n\n- captive portal인지 확인한다\n- 제한적 walled garden인지 확인한다\n- 로그인 후 정상 경로로 돌아왔는지 확인한다\n\n### 5. 운영에서 봐야 할 것\n\n- DNS 응답이 정상인지\n- HTTP가 로그인 페이지로 리다이렉트되는지\n- HTTPS가 인증서 오류인지 네트워크 차단인지\n- explicit proxy auth `407`인지, portal/interception인지\n\n## 실전 시나리오\n\n### 시나리오 1: 와이파이는 연결됐는데 앱은 다 실패한다\n\ncaptive portal이나 intercepting proxy를 의심한다.\n\n### 시나리오 2: 특정 도메인만 HTTP로 열리고 HTTPS는 실패한다\n\nportal/walled garden 정책일 수 있다.\n\n### 시나리오 3: DNS는 되는데 실제 접속이 안 된다\n\nportal이 DNS를 허용하지만 외부 목적지는 아직 막았을 수 있다.\n\n### 시나리오 4: proxy 설정은 없는데 proxy 장애처럼 보인다\n\nCaptive portal은 사용자가 설정한 explicit proxy가 아니라 네트워크가 중간에서\n가로채는 상태일 수 있다. 이 경우 `407 Proxy Authentication Required`보다 login\nHTML, certificate mismatch, reset이 더 흔하다.\n\n## 코드로 보기\n\n### portal 감지 감각\n\n```bash\ncurl -I http://example.com\ncurl -v https://example.com\ncurl -v -x http://proxy.example.com:3128 https://example.com\n```\n\n### DNS 확인\n\n```bash\ndig example.com\nnslookup example.com\n```\n\n### 체크 포인트\n\n```text\n- HTTP is redirected?\n- HTTPS certificate mismatched?\n- DNS answers are hijacked?\n- proxy auth 407 or portal login HTML?\n- same result after portal login?\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| captive portal | 네트워크 접근 제어가 쉽다 | 사용자 경험이 복잡하다 | 공용 Wi-Fi |\n| intercepting proxy | 정책 적용이 가능하다 | TLS와 프라이버시 이슈가 크다 | 기업 네트워크 |\n| open internet | 단순하다 | 제어가 약하다 | 일반 공개망 |\n\n핵심은 \"연결됨\"과 \"진짜 인터넷이 됨\"을 분리해서 봐야 한다는 점이다.\n\n## 운영 caveat\n\n- HTTP redirect가 보인다고 HTTPS도 같은 방식으로 redirect될 것이라고 기대하면 안 된다. HTTPS는 인증서 검증 때문에 실패 표면이 완전히 다르다.\n- captive portal과 explicit proxy는 다르다. explicit proxy는 클라이언트 설정과 `CONNECT`/`407` 흐름이 보이고, captive portal은 네트워크가 DNS/HTTP/TLS 경로를 가로챈다.\n- portal 로그인 전후를 같은 테스트로 비교한다. 로그인 후에도 같은 인증서 오류가 남으면 기업 TLS interception, 로컬 trust store, 실제 origin 인증서 문제까지 후보가 넓어진다.\n\n## 꼬리질문\n\n> Q: captive portal은 왜 문제를 만들나요?\n> 핵심: 네트워크가 부분적으로만 열려 있어 DNS/TLS 실패가 애매하게 보이기 때문이다.\n\n> Q: intercepting proxy와 MITM의 차이는?\n> 핵심: 기능적으로는 비슷한 면이 있지만, 운영 정책상 정당한 제어인지가 다르다.\n\n> Q: portal 여부를 어떻게 감지하나요?\n> 핵심: HTTP redirect, DNS 이상, TLS 실패 패턴을 함께 본다.\n\n> Q: 왜 HTTPS는 portal 페이지로 예쁘게 이동하지 않나요?\n> 핵심: 목적지 hostname과 portal 인증서가 맞지 않아 브라우저가 중간 페이지를 신뢰하지 않기 때문이다.\n\n## 한 줄 정리\n\nCaptive portal과 intercepting proxy는 네트워크를 부분적으로만 열어두기 때문에, HTTP redirect와 HTTPS/TLS 실패를 분리해서 앱 오류와 구분해야 한다.\n",
   "aliases": [
+    "Captive Portal, Intercepting Proxy 개념",
+    "Captive Portal, Intercepting Proxy 정리",
+    "Captive Portal, Intercepting Proxy 실수",
+    "Captive Portal, Intercepting Proxy 판단 기준",
+    "네트워크 Captive Portal, Intercepting Proxy",
     "captive portal",
     "intercepting proxy",
     "network login",
     "DNS hijack",
     "HTTPS interception",
-    "walled garden"
+    "walled garden",
+    "captive portal intercepting proxy guide"
   ],
   "expected_queries": [
     "Captive portal 때문에 DNS와 HTTPS가 이상하게 실패하는 흐름을 설명해줘",
@@ -51,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/network/captive-portal-intercepting-proxy-behavior.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch158"
+      }
+    ]
   }
 }
