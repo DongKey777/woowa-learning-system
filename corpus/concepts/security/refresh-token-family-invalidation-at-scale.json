@@ -4,7 +4,7 @@
   "category": "security",
   "level": "advanced",
   "summary": "이 문서는 security 카테고리에서 Refresh Token Family Invalidation at Scale를 다루는 deep_dive 문서다. refresh token family invalidation은 한 토큰을 끊는 문제가 아니라, 같은 family로 이어진 모든 세션과 디바이스를 분산 환경에서 일관되게 무효화하는 문제다. 검색 질의가 refresh token family, family invalidation, reuse detection, distributed revocation처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
-  "body_markdown": "# Refresh Token Family Invalidation at Scale\n\n> 한 줄 요약: refresh token family invalidation은 한 토큰을 끊는 문제가 아니라, 같은 family로 이어진 모든 세션과 디바이스를 분산 환경에서 일관되게 무효화하는 문제다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Refresh Token Rotation / Reuse Detection](./refresh-token-rotation-reuse-detection.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n> - [Device / Session Graph Revocation Design](./device-session-graph-revocation-design.md)\n> - [Token Introspection vs Self-Contained JWT](./token-introspection-vs-self-contained-jwt.md)\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n> - [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n> - [Security README: Browser / Session Coherence](./README.md#browser--session-coherence)\n\nretrieval-anchor-keywords: refresh token family, family invalidation, reuse detection, distributed revocation, session lineage, token graph, logout all devices, revocation propagation, token family id, replay containment, device session graph\n\n---\n\n## 핵심 개념\n\nrefresh token family는 rotation으로 연결된 토큰들의 계보다.  \n한 토큰이 rotation되면 다음 토큰이 자식이 되고, 이 family 전체가 하나의 세션 단위처럼 다뤄질 수 있다.\n\n문제는 유출이나 reuse가 발견됐을 때:\n\n- 어떤 토큰만 끊을지\n- family 전체를 끊을지\n- 모든 디바이스를 로그아웃할지\n- 어느 시점의 요청까지 인정할지\n\n를 정해야 한다는 점이다.\n\n즉 family invalidation은 \"토큰 하나 revoke\"가 아니라 \"세션 lineage 차단\"이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. family가 왜 필요한가\n\nrefresh token을 rotation하면 이전 토큰은 폐기된다.  \n하지만 family가 없으면 다음 문제가 생긴다.\n\n- 어떤 토큰이 최신인지 추적하기 어렵다\n- reuse가 발생했을 때 범위를 정하기 어렵다\n- 동시 refresh race를 설명하기 어렵다\n\n### 2. invalidation 범위를 정해야 한다\n\n대표 범위:\n\n- single token revoke\n- family revoke\n- user-wide revoke\n- tenant-wide emergency revoke\n\n보안 사고에서는 family revoke가 기본이 되는 경우가 많다.\n\n### 3. 분산 propagation이 핵심이다\n\n세션을 끊어도 여러 인스턴스가 다르게 판단하면 의미가 없다.\n\n- refresh token store\n- access token cache\n- introspection cache\n- edge/gateway cache\n\n모두 같은 revocation 상태를 봐야 한다.\n\n### 4. eventual consistency를 허용할지 정해야 한다\n\nrevocation이 즉시 반영되지 않으면 잠깐의 허용 창이 생긴다.\n\n- 짧은 access token\n- family-wide revoke\n- cache TTL 단축\n- event-driven invalidation\n\n이 조합으로 허용 창을 줄인다.\n\n### 5. family graph가 감사에 도움이 된다\n\n토큰 lineage를 기록하면:\n\n- 어느 토큰에서 유출이 시작됐는지\n- 어떤 세션이 영향을 받았는지\n- reuse가 어디서 발생했는지\n\n를 추적하기 쉽다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: refresh token reuse가 탐지됨\n\n대응:\n\n- 해당 family를 revoke한다\n- user-wide sign-out을 고려한다\n- suspicious device를 별도로 표시한다\n\n### 시나리오 2: 모든 디바이스에서 로그아웃해야 함\n\n대응:\n\n- user-wide family revoke를 수행한다\n- refresh lineage를 모두 끊는다\n- access token TTL이 짧아도 session version을 올린다\n\n### 시나리오 3: revocation이 일부 노드에만 반영됨\n\n대응:\n\n- propagation 지연을 측정한다\n- cache invalidation을 이벤트로 보낸다\n- emergency 시 introspection을 강화한다\n\n---\n\n## 코드로 보기\n\n### 1. family revoke 개념\n\n```java\npublic void revokeFamily(String familyId) {\n    refreshTokenRepository.revokeAllByFamilyId(familyId);\n    auditLogger.logAuth(null, familyId, \"FAMILY_REVOKED\", \"reuse_detected\");\n}\n```\n\n### 2. lineage 저장 개념\n\n```java\npublic RefreshToken issueChild(RefreshToken parent) {\n    return new RefreshToken(parent.familyId(), parent.id(), parent.userId(), randomValue());\n}\n```\n\n### 3. distributed invalidation 개념\n\n```text\n1. family_id를 중심으로 revoke한다\n2. cache와 store에 동시에 반영한다\n3. access token TTL을 짧게 유지한다\n4. emergency revoke는 user-wide까지 확장한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| single token revoke | 범위가 좁다 | reuse 대응이 약하다 | 경미한 오염 |\n| family revoke | 침해 확산을 줄인다 | 정상 세션도 같이 끊길 수 있다 | reuse/탈취 |\n| user-wide revoke | 가장 강하다 | UX 비용이 크다 | 계정 침해 |\n| tenant-wide revoke | 대규모 대응이 가능하다 | 영향이 매우 크다 | 긴급 사고 |\n\n판단 기준은 이렇다.\n\n- 유출이 단일 토큰인가 family 전체인가\n- 디바이스별 세션을 살릴 수 있는가\n- revocation propagation을 얼마나 빨리 할 수 있는가\n- cache staleness를 얼마나 허용할 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: refresh token family는 왜 필요한가요?\n> 의도: rotation lineage와 reuse 분석을 이해하는지 확인\n> 핵심: 어떤 토큰이 최신인지와 침해 범위를 추적하기 위해서다.\n\n> Q: family revoke와 single token revoke의 차이는 무엇인가요?\n> 의도: 침해 확산 범위를 이해하는지 확인\n> 핵심: family revoke는 연쇄된 세션 전체를 끊는다.\n\n> Q: 분산 환경에서 revocation이 어려운 이유는 무엇인가요?\n> 의도: propagation과 cache 일관성을 아는지 확인\n> 핵심: 모든 노드가 같은 revoke 상태를 봐야 하기 때문이다.\n\n> Q: access token TTL이 짧아도 family revoke가 필요한가요?\n> 의도: 토큰 수명과 세션 무효화를 구분하는지 확인\n> 핵심: 그렇다. refresh로 재발급되는 경로를 끊어야 한다.\n\n## 한 줄 정리\n\nrefresh token family invalidation은 한 토큰이 아니라 연결된 세션 계보 전체를 분산 환경에서 끊는 문제다.\n",
+  "body_markdown": "# Refresh Token Family Invalidation at Scale\n\n> 한 줄 요약: refresh token family invalidation은 한 토큰을 끊는 문제가 아니라, 같은 family로 이어진 모든 세션과 디바이스를 분산 환경에서 일관되게 무효화하는 문제다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Refresh Token Rotation / Reuse Detection](./refresh-token-rotation-reuse-detection.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n> - [Device / Session Graph Revocation Design](./device-session-graph-revocation-design.md)\n> - [Token Introspection vs Self-Contained JWT](./token-introspection-vs-self-contained-jwt.md)\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n> - [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n> - [Security README: Browser / Session Coherence](./README.md#browser--session-coherence)\n\nretrieval-anchor-keywords: refresh token family, family invalidation, reuse detection, distributed revocation, session lineage, token graph, logout all devices, revocation propagation, token family id, replay containment, device session graph\n\n---\n\n## 핵심 개념\n\nrefresh token family는 rotation으로 연결된 토큰들의 계보다.  \n한 토큰이 rotation되면 다음 토큰이 자식이 되고, 이 family 전체가 하나의 세션 단위처럼 다뤄질 수 있다.\n\n문제는 유출이나 reuse가 발견됐을 때:\n\n- 어떤 토큰만 끊을지\n- family 전체를 끊을지\n- 모든 디바이스를 로그아웃할지\n- 어느 시점의 요청까지 인정할지\n\n를 정해야 한다는 점이다.\n\n즉 family invalidation은 \"토큰 하나 revoke\"가 아니라 \"세션 lineage 차단\"이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. family가 왜 필요한가\n\nrefresh token을 rotation하면 이전 토큰은 폐기된다.  \n하지만 family가 없으면 다음 문제가 생긴다.\n\n- 어떤 토큰이 최신인지 추적하기 어렵다\n- reuse가 발생했을 때 범위를 정하기 어렵다\n- 동시 refresh race를 설명하기 어렵다\n\n### 2. invalidation 범위를 정해야 한다\n\n대표 범위:\n\n- single token revoke\n- family revoke\n- user-wide revoke\n- tenant-wide emergency revoke\n\n보안 사고에서는 family revoke가 기본이 되는 경우가 많다.\n\n### 3. 분산 propagation이 핵심이다\n\n세션을 끊어도 여러 인스턴스가 다르게 판단하면 의미가 없다.\n\n- refresh token store\n- access token cache\n- introspection cache\n- edge/gateway cache\n\n모두 같은 revocation 상태를 봐야 한다.\n\n### 4. eventual consistency를 허용할지 정해야 한다\n\nrevocation이 즉시 반영되지 않으면 잠깐의 허용 창이 생긴다.\n\n- 짧은 access token\n- family-wide revoke\n- cache TTL 단축\n- event-driven invalidation\n\n이 조합으로 허용 창을 줄인다.\n\n### 5. family graph가 감사에 도움이 된다\n\n토큰 lineage를 기록하면:\n\n- 어느 토큰에서 유출이 시작됐는지\n- 어떤 세션이 영향을 받았는지\n- reuse가 어디서 발생했는지\n\n를 추적하기 쉽다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: refresh token reuse가 탐지됨\n\n대응:\n\n- 해당 family를 revoke한다\n- user-wide sign-out을 고려한다\n- suspicious device를 별도로 표시한다\n\n### 시나리오 2: 모든 디바이스에서 로그아웃해야 함\n\n대응:\n\n- user-wide family revoke를 수행한다\n- refresh lineage를 모두 끊는다\n- access token TTL이 짧아도 session version을 올린다\n\n### 시나리오 3: revocation이 일부 노드에만 반영됨\n\n대응:\n\n- propagation 지연을 측정한다\n- cache invalidation을 이벤트로 보낸다\n- emergency 시 introspection을 강화한다\n\n---\n\n## 코드로 보기\n\n### 1. family revoke 개념\n\n```java\npublic void revokeFamily(String familyId) {\n    refreshTokenRepository.revokeAllByFamilyId(familyId);\n    auditLogger.logAuth(null, familyId, \"FAMILY_REVOKED\", \"reuse_detected\");\n}\n```\n\n### 2. lineage 저장 개념\n\n```java\npublic RefreshToken issueChild(RefreshToken parent) {\n    return new RefreshToken(parent.familyId(), parent.id(), parent.userId(), randomValue());\n}\n```\n\n### 3. distributed invalidation 개념\n\n```text\n1. family_id를 중심으로 revoke한다\n2. cache와 store에 동시에 반영한다\n3. access token TTL을 짧게 유지한다\n4. emergency revoke는 user-wide까지 확장한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| single token revoke | 범위가 좁다 | reuse 대응이 약하다 | 경미한 오염 |\n| family revoke | 침해 확산을 줄인다 | 정상 세션도 같이 끊길 수 있다 | reuse/탈취 |\n| user-wide revoke | 가장 강하다 | UX 비용이 크다 | 계정 침해 |\n| tenant-wide revoke | 대규모 대응이 가능하다 | 영향이 매우 크다 | 긴급 사고 |\n\n판단 기준은 이렇다.\n\n- 유출이 단일 토큰인가 family 전체인가\n- 디바이스별 세션을 살릴 수 있는가\n- revocation propagation을 얼마나 빨리 할 수 있는가\n- cache staleness를 얼마나 허용할 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: refresh token family는 왜 필요한가요?\n> 의도: rotation lineage와 reuse 분석을 이해하는지 확인\n> 핵심: 어떤 토큰이 최신인지와 침해 범위를 추적하기 위해서다.\n\n> Q: family revoke와 single token revoke의 차이는 무엇인가요?\n> 의도: 침해 확산 범위를 이해하는지 확인\n> 핵심: family revoke는 연쇄된 세션 전체를 끊는다.\n\n> Q: 분산 환경에서 revocation이 어려운 이유는 무엇인가요?\n> 의도: propagation과 cache 일관성을 아는지 확인\n> 핵심: 모든 노드가 같은 revoke 상태를 봐야 하기 때문이다.\n\n> Q: access token TTL이 짧아도 family revoke가 필요한가요?\n> 의도: 토큰 수명과 세션 무효화를 구분하는지 확인\n> 핵심: 그렇다. refresh로 재발급되는 경로를 끊어야 한다.\n\n## 한 줄 정리\n\nrefresh token family invalidation은 한 토큰이 아니라 연결된 세션 계보 전체를 분산 환경에서 끊는 문제다.\n\n## 운영 판단: reuse 탐지와 동시 refresh race를 구분한다\n\nRefresh token rotation에서는 같은 이전 토큰이 다시 보이는 상황이 모두 공격은 아니다. 모바일 앱의 네트워크 재시도, 두 탭의 거의 동시 refresh, provider 응답 유실 때문에 짧은 race window 안에서 같은 parent token이 두 번 제출될 수 있다. 반대로 시간이 지난 뒤 다른 IP나 device context에서 이전 토큰이 다시 나타나면 탈취 재사용 신호가 강하다.\n\n그래서 family invalidation 정책은 `reuse detected` 하나로 끝나지 않는다. token id, family id, parent id, issued_at, used_at, revoked_at, replaced_by, device id, client id, IP/region, user agent, request id를 함께 기록한다. 짧은 grace window 안의 동일 device race는 한쪽만 성공시키고 나머지는 replay-safe 실패로 처리할 수 있지만, window 밖 reuse나 다른 device reuse는 family revoke와 step-up, 모든 기기 로그아웃 후보가 된다.\n\n## Access token tail과 family revoke의 경계\n\nFamily revoke는 refresh 경로를 끊는다. 하지만 이미 발급된 access token이 완전히 사라졌다는 뜻은 아니다. self-contained JWT를 쓰면 access token은 exp까지 일부 verifier에서 통과할 수 있고, gateway나 authorization cache도 revocation event를 늦게 받을 수 있다. 그래서 고위험 route는 family revoke 이벤트와 함께 session version 또는 revoke-before check를 강하게 보고, 일반 route는 짧은 TTL과 propagation SLO로 tail을 관리한다.\n\n운영 지표에는 family revoke 요청 시각, 마지막 old access token 허용 시각, region별 deny 전환 시각, refresh reuse attempt count, device별 family impact count가 들어가야 한다. 이 지표가 있어야 `모든 기기 로그아웃했는데 왜 몇 요청이 더 통과했나`를 access token tail인지, refresh revoke 실패인지, authz cache stale인지 분리할 수 있다.\n",
   "aliases": [
     "refresh token family",
     "family invalidation",
@@ -13,17 +13,20 @@
     "session lineage",
     "token graph",
     "logout all devices",
-    "revocation propagation",
+    "분산 refresh revoke 전파",
     "token family id",
     "replay containment",
-    "device session graph",
-    "Refresh Token Family Invalidation at Scale"
+    "refresh family 전체 폐기",
+    "토큰 재사용 탐지 family revoke"
   ],
   "expected_queries": [
     "refresh token family invalidation은 왜 토큰 하나가 아니라 같은 family 전체를 끊어야 해?",
     "logout all devices나 reuse detection 후 여러 디바이스 세션을 어떻게 무효화해?",
     "분산 서버에서 refresh token family 폐기가 늦게 전파되면 어떤 문제가 생겨?",
-    "token family id와 session lineage를 저장하는 이유를 예시로 알려줘"
+    "token family id와 session lineage를 저장하는 이유를 예시로 알려줘",
+    "refresh token reuse가 감지되면 현재 토큰만 막을지 family 전체를 막을지 어떻게 판단해?",
+    "동시 refresh race와 탈취 reuse를 구분하려면 refresh family에 어떤 상태와 감사 로그가 필요해?",
+    "모든 기기 로그아웃을 할 때 refresh token family, access token tail, session version을 어떻게 같이 봐?"
   ],
   "symptoms": [
     "`Refresh Token Family Invalidation at Scale`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
@@ -33,13 +36,18 @@
   ],
   "relations": {
     "prerequisites": [
-      "security/api-key-basics"
+      "security/refresh-token-rotation-reuse-detection",
+      "security/session-cookie-jwt-basics"
     ],
     "next_docs": [
-      "security/api-key-vs-oauth-vs-client-credentials-primer"
+      "security/session-revocation-at-scale",
+      "security/device-session-graph-revocation-design",
+      "security/token-revoke-lag-authz-cache-bridge"
     ],
     "confusable_with": [
-      "security/device-session-graph-revocation-design"
+      "security/session-revocation-at-scale",
+      "security/device-session-graph-revocation-design",
+      "security/refresh-token-rotation-reuse-detection"
     ],
     "forbidden_for_queries": []
   },
@@ -47,8 +55,14 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/refresh-token-family-invalidation-at-scale.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch133",
+        "note": "Expanded refresh family invalidation, revoke lag, and session revocation lifecycle query surfaces."
+      }
+    ]
   }
 }
