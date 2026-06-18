@@ -6,18 +6,18 @@
   "summary": "EXPLAIN = *옵티마이저가 query를 어떻게 실행할지 예측*. 인덱스 사용 확인 + table scan 감지 + join 알고리즘 표시. EXPLAIN ANALYZE는 *진짜 실행하며 측정*.",
   "body_markdown": "# EXPLAIN 실행 계획 읽기 입문 — 인덱스 사용 여부 확인\n\n> 한 줄 요약: EXPLAIN = *옵티마이저가 query를 어떻게 실행할지 예측*. 인덱스 사용 확인 + table scan 감지 + join 알고리즘 표시. EXPLAIN ANALYZE는 *진짜 실행하며 측정*.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n```sql\n-- 인덱스 걸었는데 query 안 빨라짐\nCREATE INDEX idx_member_email ON member(email);\nSELECT * FROM member WHERE email = 'a@b.com';\n\n-- 진짜 인덱스 쓰는지 확인:\nEXPLAIN SELECT * FROM member WHERE email = 'a@b.com';\n```\n\nEXPLAIN 결과가 *type = ALL* (full table scan)이면 인덱스 무시. *type = ref / range / const* 등이면 인덱스 사용.\n\n핵심: **인덱스 *있다 ≠ 쓰인다***. EXPLAIN이 진실 검증.\n\n## MySQL EXPLAIN 핵심 컬럼\n\n```\nEXPLAIN SELECT * FROM member m JOIN orders o ON o.member_id = m.id WHERE m.name = '김자몽';\n```\n\n| 컬럼 | 의미 | 좋은 값 vs 나쁜 값 |\n|---|---|---|\n| `type` | 액세스 방식 | const/eq_ref/ref/range > index > ALL |\n| `key` | 실제 사용한 인덱스 | NULL = 인덱스 미사용 |\n| `key_len` | 인덱스 사용 byte 길이 | 길수록 효율 |\n| `rows` | 예측 row 수 | 적을수록 좋음 |\n| `Extra` | 추가 정보 (Using index, Using filesort, ...) | \"Using index\" 좋음, \"Using filesort\" 의심 |\n\n### `type` 값 의미\n\n| type | 의미 | 성능 |\n|---|---|---|\n| `system` | 1 row 테이블 | 최고 |\n| `const` | PK/unique로 1 row | 최고 |\n| `eq_ref` | JOIN에서 PK 매칭 | 매우 좋음 |\n| `ref` | 인덱스 prefix 매칭 | 좋음 |\n| `range` | 인덱스 범위 (`BETWEEN`, `<`, `>`) | 적당 |\n| `index` | 인덱스 전체 스캔 | 안 좋음 |\n| `ALL` | Full Table Scan | **최악** |\n\n## PostgreSQL EXPLAIN\n\n```\nEXPLAIN ANALYZE SELECT * FROM member WHERE email = 'a@b.com';\n```\n\n```\nSeq Scan on member  (cost=0.00..50.50 rows=1 width=100) (actual time=0.020..0.025 rows=1 loops=1)\n   Filter: (email = 'a@b.com')\n   Rows Removed by Filter: 999\n```\n\n- `Seq Scan` = Full Table Scan (MySQL `type=ALL`과 동일)\n- `Index Scan using idx_email` = 인덱스 사용\n- `cost=0.00..50.50` = 옵티마이저 예측 비용\n- `actual time=...` = ANALYZE 시 실제 측정\n\n### Plan 노드 종류\n\n| 노드 | 의미 |\n|---|---|\n| Seq Scan | Full Table Scan |\n| Index Scan | 인덱스로 row pointer 찾고 테이블 접근 |\n| Index Only Scan | 인덱스만으로 결과 완성 (covering) |\n| Bitmap Heap Scan + Bitmap Index Scan | range scan에 효율 |\n| Hash Join / Merge Join / Nested Loop | JOIN 알고리즘 |\n| Sort | ORDER BY (인덱스로 안 됨) |\n| Aggregate | GROUP BY / COUNT |\n\n## \"EXPLAIN vs EXPLAIN ANALYZE\"\n\n```sql\n-- 예측만 (안전, 빠름)\nEXPLAIN SELECT ...;\n\n-- 진짜 실행 + 실측 (느림, write는 위험)\nEXPLAIN ANALYZE SELECT ...;\n```\n\n⚠️ **EXPLAIN ANALYZE INSERT/UPDATE/DELETE**는 *진짜 변경 발생*. PostgreSQL에선 `BEGIN; EXPLAIN ANALYZE ...; ROLLBACK;`으로 롤백 가능.\n\n## \"인덱스 걸었는데 안 쓰임\" 원인\n\n가장 흔한 함정.\n\n### 1. `WHERE` 절에 함수 사용\n\n```sql\n-- ❌ 인덱스 무력화\nSELECT * FROM member WHERE LOWER(email) = 'a@b.com';\n\n-- ✓\nSELECT * FROM member WHERE email = LOWER('A@B.com');\n-- 또는 functional index: CREATE INDEX idx ON member(LOWER(email))\n```\n\n### 2. 데이터 형변환\n\n```sql\n-- email이 VARCHAR인데 숫자로 비교\nWHERE email = 123;   -- 인덱스 무력\n```\n\n### 3. `LIKE 'prefix%'` 외 wildcard\n\n```sql\nWHERE email LIKE 'abc%'   -- ✓ 인덱스 사용\nWHERE email LIKE '%abc'   -- ❌ 무력\nWHERE email LIKE '%abc%'  -- ❌ 무력\n```\n\n### 4. 옵티마이저가 *full scan이 더 빠를 거*라 판단\n\n```sql\n-- 테이블 10 row + 인덱스 부담 → 그냥 full scan\nSELECT * FROM small_table WHERE col = 'x';\n```\n\n### 5. 통계 정보 stale\n\n```sql\n-- 데이터 변경 후 통계 안 업데이트 → 옵티마이저 잘못 선택\nANALYZE table_name;   -- 통계 refresh\n```\n\n## \"Using filesort\" / \"Using temporary\" 의심\n\nEXPLAIN의 Extra 컬럼에서:\n\n- **Using filesort** — ORDER BY를 *인덱스로 안 됨* → 메모리/디스크 정렬 발생. 인덱스 ORDER BY 컬럼 추가 검토.\n- **Using temporary** — GROUP BY + ORDER BY 다른 칼럼 등으로 *임시 테이블*. 큰 결과면 disk-based, 느림.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"인덱스 걸었는데 query 안 빨라짐\" → 먼저 EXPLAIN. type=ALL이면 무력화 원인 의심.\n- \"조회 query가 갑자기 느려짐\" → 통계 stale 가능. ANALYZE 후 다시.\n- \"JOIN 결과가 폭증\" → EXPLAIN으로 rows estimate 확인. carthesian 의심.\n- \"ORDER BY 정렬이 느림\" → Extra에 Using filesort? 인덱스에 ORDER BY 컬럼 포함.\n- \"production에서 갑자기 slow query\" → EXPLAIN 비교 (이전 vs 현재). 옵티마이저가 plan 바꿨을 수도.\n\n## \"EXPLAIN을 어떻게 운영에 활용?\"\n\n```sql\n-- slow query log 활성화 (MySQL)\nSET GLOBAL slow_query_log = 1;\nSET GLOBAL long_query_time = 1;   -- 1초 이상 slow\n\n-- pg_stat_statements (PostgreSQL)\nCREATE EXTENSION pg_stat_statements;\nSELECT * FROM pg_stat_statements ORDER BY total_time DESC LIMIT 10;\n```\n\n운영 패턴:\n1. slow query log에서 느린 query 발견.\n2. EXPLAIN ANALYZE로 plan 확인.\n3. 인덱스 추가 또는 query 재작성.\n4. 다시 측정.\n\n## 자주 헷갈리는 지점\n\n- **\"EXPLAIN ANALYZE는 안전\"** — read query는 안전, INSERT/UPDATE/DELETE는 *진짜 변경*.\n- **\"인덱스가 있으니 무조건 쓰임\"** — 옵티마이저 판단. *small table*은 의도적 무시.\n- **\"`type=index`면 좋음\"** — *index 전체 스캔*. ALL보단 낫지만 ref/range가 좋음.\n- **\"cost=0이면 빠름\"** — 예측이지 실측 아님. ANALYZE로 진짜 측정.\n- **\"PostgreSQL EXPLAIN ANALYZE를 production에서 자주 실행\"** — *실제 실행 + lock 부담*. 부담 큰 query는 production 위험.\n\n## 빠른 확인 질문\n\n- EXPLAIN과 EXPLAIN ANALYZE 차이?\n  - EXPLAIN = 예측만, ANALYZE = *실제 실행 + 측정*.\n- \"인덱스 무시\" 가장 흔한 원인 두 가지?\n  - WHERE 절 함수 사용 / 데이터 형 변환.\n- \"Using filesort\"가 보이면?\n  - ORDER BY가 인덱스로 안 됨. 인덱스에 ORDER BY 컬럼 추가 검토.\n\n## 한 줄 정리\n\nEXPLAIN = 옵티마이저 *의도* 검증. 인덱스 사용 / table scan / join 알고리즘 표시. 인덱스 무력화 원인 (함수, 형변환, wildcard, stale 통계) 진단의 시작.\n\nretrieval-anchor-keywords: EXPLAIN execution plan, EXPLAIN ANALYZE, MySQL type ALL ref range, PostgreSQL Seq Scan Index Scan, Using filesort, Using temporary, Bitmap Index Scan, Hash Join Merge Join Nested Loop, query plan optimization, index not used reasons, ANALYZE statistics refresh, pg_stat_statements, slow query log, key_len rows estimate\n",
   "aliases": [
+    "실행 계획",
+    "인덱스 사용 확인",
+    "EXPLAIN 실행 계획 읽기 개념",
+    "EXPLAIN 실행 계획 읽기 정리",
+    "EXPLAIN 실행 계획 읽기 실수",
     "EXPLAIN",
     "EXPLAIN ANALYZE",
-    "실행 계획",
     "query plan",
     "execution plan",
     "index usage check",
-    "인덱스 사용 확인",
     "full table scan",
-    "row scan estimate",
-    "join algorithm choice",
-    "MySQL EXPLAIN",
-    "PostgreSQL EXPLAIN"
+    "row scan estimate"
   ],
   "expected_queries": [
     "EXPLAIN 결과를 어떻게 읽어?",
@@ -51,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/explain-execution-plan-reading-intermediate-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

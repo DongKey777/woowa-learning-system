@@ -6,16 +6,18 @@
   "summary": "lease handoff는 “주인이 바뀐다”를 안전하게 넘겨주는 절차이고, 겹침 구간과 fencing 없이는 사고가 난다.",
   "body_markdown": "# Lease Handoff Protocol\n\n> 한 줄 요약: lease handoff는 “주인이 바뀐다”를 안전하게 넘겨주는 절차이고, 겹침 구간과 fencing 없이는 사고가 난다.\n\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../spring/spring-persistence-transaction-web-service-repository-primer.md)\n\n관련 문서: [DB Lease와 Fencing Token](./db-lease-fencing-coordination.md), [Stale Lease Renewal Failure와 Fencing](./stale-lease-renewal-failure-fencing.md), [Replication Failover and Split Brain](./replication-failover-split-brain.md)\nretrieval-anchor-keywords: lease handoff, handoff protocol, ownership transfer, fencing token, grace period, lease handoff protocol basics, lease handoff protocol beginner, lease handoff protocol intro, database basics, beginner database, 처음 배우는데 lease handoff protocol, lease handoff protocol 입문, lease handoff protocol 기초, what is lease handoff protocol, how to lease handoff protocol\n\n## 핵심 개념\n\nLease handoff protocol은 현재 lease holder가 다음 holder에게 작업을 넘길 때의 안전 절차다.\n이 절차가 없으면 주인이 바뀌는 순간에 두 주체가 동시에 write할 수 있다.\n\n왜 중요한가:\n\n- 배치 worker, shard owner, leader 역할이 바뀌는 순간이 가장 위험하다\n- 단순 만료는 넘김이 아니라 끊김이다\n- handoff는 “새 주체에게 넘겨줌”과 “옛 주체를 확실히 멈춤”을 같이 해야 한다\n\n즉 handoff는 소유권 이전이 아니라 **중복 실행 없이 권한을 이전하는 프로토콜**이다.\n\n## 깊이 들어가기\n\n### 1. 왜 handoff가 필요한가\n\nlease 만료만 쓰면 다음 문제가 생긴다.\n\n- 옛 주체가 아직 끝내지 못한 작업이 있다\n- 새 주체가 바로 시작해서 중복 실행된다\n- 결과가 덮이거나 순서가 틀어진다\n\nhandoff는 이 충돌 구간을 줄이기 위해 있다.\n\n### 2. 안전한 handoff 단계\n\n전형적인 절차는 다음과 같다.\n\n1. 현재 holder가 drain 시작\n2. 새로운 work intake 중지\n3. progress 저장\n4. fencing token 증가\n5. 새 holder가 takeover\n6. 옛 holder는 write 중단\n\n핵심은 overlap이 생기더라도, write는 새 token만 통과해야 한다.\n\n### 3. grace period의 의미\n\n짧은 grace period는 in-flight 작업을 정리하는 데 유용하다.\n하지만 grace가 길어지면 두 주체가 동시에 살아 있는 시간이 늘어난다.\n\n그래서 grace는 “충분히 짧고, 충분히 명시적이어야” 한다.\n\n### 4. 손대면 안 되는 것\n\n- 옛 holder가 새 token 없이 계속 write하는 것\n- takeover 전에 새 holder가 무작정 실행하는 것\n- progress 저장 없이 handoff만 하는 것\n\nhandoff는 제어되지 않은 추측이 아니라, 상태 전이의 합의다.\n\n## 실전 시나리오\n\n### 시나리오 1: 배치가 작업 중간에 리더를 넘김\n\n옛 리더가 종료 직전이고 새 리더가 바로 시작하면 중복 처리 위험이 있다.\nhandoff protocol이 필요하다.\n\n### 시나리오 2: shard owner가 바뀌는 순간\n\npartition owner가 바뀔 때 progress와 fencing 없이 넘기면 같은 chunk를 두 번 처리할 수 있다.\n\n### 시나리오 3: 장애 후 강제 takeover\n\ngrace 없이 새 holder를 세우면 빠르지만, stale writer가 남을 수 있다.\nfencing이 필수다.\n\n## 재현 조건\n\n학습용 재현은 old holder가 멈췄다고 보이지만 실제로는 늦게 돌아오는 상황을 만든다.\n\n1. holder A가 lease를 얻고 chunk progress를 저장한다.\n2. A를 GC pause, sleep, network delay처럼 \"죽지는 않았지만 멈춘\" 상태로 둔다.\n3. lease deadline이 지난 뒤 holder B가 takeover하고 fencing token을 증가시킨다.\n4. A가 늦게 돌아와 같은 output을 write하려고 한다.\n5. 저장소가 old token write를 거부하는지 확인한다.\n\n## 확인 순서\n\n1. lease row의 `owner_id`, `fencing_token`, `expires_at`, `updated_at`을 본다.\n2. old holder가 신규 work intake를 멈췄는지와 마지막 committed progress가 어디인지 확인한다.\n3. new holder가 takeover한 token이 downstream write까지 전달되는지 확인한다.\n4. stale write가 token 조건 또는 output idempotency key에서 거부되는지 본다.\n5. grace period가 실제 작업 시간보다 과하게 길어 overlap window를 키우지 않는지 점검한다.\n\n## failure matrix\n\n| 증상 | 가능 원인 | 먼저 볼 것 |\n|---|---|---|\n| handoff 뒤 결과가 덮임 | old holder write에 fencing 검증 없음 | output table token/version 조건 |\n| takeover가 너무 잦음 | lease TTL이 처리 시간/GC pause보다 짧음 | renew interval, p99 pause, clock source |\n| takeover가 너무 늦음 | grace가 과하게 길거나 liveness 판단이 느림 | expires_at, heartbeat freshness |\n| 같은 chunk가 두 번 처리됨 | progress 저장 전 ownership 변경 | committed progress, chunk idempotency |\n| lease row가 hot spot | 모든 shard가 같은 row를 갱신 | lease key 분산, renew 주기 |\n\n## 검증\n\nhandoff 검증은 \"한 순간에 한 holder만 있었다\"가 아니라 \"겹침이 있어도 old holder 결과가 통과하지 못했다\"로 둔다.\n\n- token이 단조 증가하고 rollback되지 않는다.\n- 모든 write path가 현재 token 또는 더 높은 epoch 조건을 확인한다.\n- progress 저장과 takeover 순서가 로그로 재구성된다.\n- old holder 재등장 테스트에서 stale write가 거부된다.\n- clock skew가 있는 환경이면 DB server time 또는 monotonic epoch처럼 비교 기준을 명확히 둔다.\n\nlease는 소유권 표시이고 fencing은 stale write 방지다. 특정 DB row lock이 긴 작업 전체를 보호한다고 과장하지 말고, lock은 lease row 전이 순간의 직렬화 수단으로만 설명한다.\n\n## 코드로 보기\n\n```sql\n-- handoff 시 epoch 증가\nUPDATE lease_table\nSET owner_id = 'worker-b',\n    fencing_token = fencing_token + 1,\n    expires_at = NOW() + INTERVAL 30 SECOND\nWHERE name = 'daily-job';\n```\n\n```java\nvoid handoff() {\n    stopAcceptingNewChunks();\n    saveProgress();\n    leaseService.transferWithNewToken();\n    stopWritesOnOldOwner();\n}\n```\n\nhandoff는 “바통 넘기기”처럼 보이지만, 실제로는 **새 바통과 옛 바통의 동시 유효 시간을 최소화하는 절차**다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| hard expire | 단순하다 | 중복 위험이 있다 | 비중요 작업 |\n| grace handoff | 안전하다 | 구현이 복잡하다 | 중요한 배치/owner |\n| fencing-only takeover | stale write를 막는다 | progress 정리가 필요하다 | 분산 coordination |\n| manual handoff | 통제 가능 | 느리다 | 장애 복구 |\n\n## 꼬리질문\n\n> Q: lease handoff와 단순 만료의 차이는 무엇인가요?\n> 의도: 권한 넘김과 끊김을 구분하는지 확인\n> 핵심: handoff는 상태와 권한을 의도적으로 이전한다\n\n> Q: grace period가 왜 필요한가요?\n> 의도: in-flight 작업 정리를 아는지 확인\n> 핵심: 처리 중이던 chunk를 안전하게 마치기 위해서다\n\n> Q: handoff에서 fencing token이 왜 중요하나요?\n> 의도: old owner의 stale write를 막는지 확인\n> 핵심: 새 주체만 write를 통과시키는 최종 방어선이다\n\n## 한 줄 정리\n\nLease handoff protocol은 주체 교체 순간의 겹침을 통제하는 절차이고, fencing token이 있어야 옛 주체의 늦은 write를 막을 수 있다.\n",
   "aliases": [
+    "lease handoff 기초",
+    "lease 소유권 이전",
+    "Lease Handoff Protocol 개념",
+    "Lease Handoff Protocol 정리",
+    "Lease Handoff Protocol 실수",
     "lease handoff",
     "handoff protocol",
     "ownership transfer",
     "fencing token",
     "grace period",
     "lease handoff protocol",
-    "shard owner handoff",
-    "worker lease handoff",
-    "lease handoff 기초",
-    "lease 소유권 이전"
+    "shard owner handoff"
   ],
   "expected_queries": [
     "lease handoff protocol은 old holder를 멈추고 new holder로 ownership을 안전하게 넘기려면 어떤 단계가 필요해?",
@@ -50,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/lease-handoff-protocol.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

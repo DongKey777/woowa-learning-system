@@ -6,16 +6,18 @@
   "summary": "이 문서는 online backfill을 snapshot copy가 아니라 watermark, catch-up, idempotent chunk retry, validation으로 다루는 advanced playbook이다.",
   "body_markdown": "# Online Backfill Consistency와 워터마크 전략\n\n> 한 줄 요약: 백필은 “한 번 복사하면 끝”이 아니라, 복사 중에 들어오는 변경까지 포함해 정합성을 맞추는 절차다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [온라인 스키마 변경 전략](./online-schema-change-strategies.md), [CDC, Debezium, Outbox, Binlog](./cdc-debezium-outbox-binlog.md), [Idempotency Key and Deduplication](./idempotency-key-and-deduplication.md), [Online Backfill Verification, Drift Checks, and Cutover Gates](./online-backfill-verification-cutover-gates.md)\nretrieval-anchor-keywords: backfill watermark, chunk copy, dual write, catch-up, validation, checksum, sample diff, cutover gate\n\n## 핵심 개념\n\nOnline backfill은 운영 중인 테이블이나 새 구조에 기존 데이터를 채워 넣는 작업이다.\n문제는 복사가 시작된 뒤에도 원본 데이터는 계속 바뀐다는 점이다.\n\n왜 중요한가:\n\n- 컬럼 추가 후 기존 데이터를 새 컬럼에 채워야 한다\n- denormalized summary table을 만들 때 과거 데이터까지 맞춰야 한다\n- CDC 없이 큰 테이블을 옮기면 누락과 중복이 쉽게 생긴다\n\n백필의 핵심은 속도가 아니라 **복사 시점과 변경 시점의 경계**를 설계하는 것이다.\n\n## 깊이 들어가기\n\n### 1. 백필이 틀어지는 이유\n\n백필을 단순히 `INSERT INTO new SELECT FROM old`로 생각하면 안 된다.\n\n- 복사 중에 원본 row가 업데이트될 수 있다\n- 복사 후에 delete가 발생할 수 있다\n- 같은 row가 여러 번 재시도되며 중복될 수 있다\n- 일부 chunk는 성공하고 일부는 실패할 수 있다\n\n즉 backfill은 상태 전송이 아니라 **상태 동기화**다.\n\n### 2. 워터마크가 필요한 이유\n\n안전한 백필은 보통 기준점을 하나 둔다.\n\n- `created_at` 또는 `updated_at`\n- 증가하는 PK 범위\n- binlog position / LSN / GTID\n\n이 기준점 이전의 데이터를 먼저 복사하고, 이후 변경분은 catch-up 단계에서 다시 반영한다.\n\n이렇게 해야 “복사 중간에 바뀐 row”를 빠뜨리지 않는다.\n\n### 3. idempotent하게 만들어야 하는 이유\n\n백필 작업은 실패와 재시도가 기본값이다.\n\n- chunk 17이 두 번 실행될 수 있다\n- 네트워크 문제로 중간 결과를 다시 넣어야 할 수 있다\n- validation 후 일부 구간만 재처리할 수 있다\n\n그래서 `INSERT ... ON DUPLICATE KEY UPDATE`처럼 재실행해도 결과가 같아야 한다.\n\n## 실패 분기(failure matrix)\n\n| 분기(branch) | 관찰 증거 | 첫 조치 | 검증/중단(validation / stop) 조건 |\n|---|---|---|---|\n| 복사만 한 공백(copy-only gap) | snapshot copy 중 source update/delete 발생 | watermark를 잡고 catch-up phase를 추가 | watermark 이후 변경분이 target에 반영됨 |\n| chunk 재시도 덮어쓰기(chunk retry overwrite) | 같은 chunk 재실행 후 target 값이 더 낡아짐 | source version/updated_at 조건을 둔 idempotent upsert | 재실행해도 최신 source 기준 결과가 같음 |\n| 삭제/tombstone 누락 | source delete가 target에 남음 | tombstone, active flag, CDC delete event 처리 | deleted source가 target active set에서 제거됨 |\n| row count 오판(false pass) | count는 같지만 checksum/sample diff mismatch | bucket checksum과 핵심 컬럼 diff 수행 | mismatch bucket이 0 또는 승인 한도 이하 |\n| 전환 지연(cutover lag) | target read가 source 최신 write를 못 봄 | catch-up watermark/LSN/GTID drain | cutover horizon까지 lag 0이 확인됨 |\n\n### 4. validation은 어디서 해야 하나\n\n검증은 단순 row count로 끝나지 않는다.\n\n- row count 비교\n- checksum 비교\n- sample diff\n- late write 재동기화\n\n특히 count가 같아도 값이 다른 경우가 많으므로, 중요한 컬럼은 별도 검증이 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 새 요약 테이블을 만드는 동안 주문이 계속 들어옴\n\n과거 주문을 복사하는 동안 신규 주문이 계속 쌓인다.\n이때 watermark 없이 복사만 하면 일부 주문은 새 테이블에 안 들어간다.\n\n### 시나리오 2: 컬럼 백필이 재시도되면서 일부 row가 덮임\n\n`NULL -> 값` 채우기 작업이 chunk 재시도로 두 번 실행되면, idempotent하지 않은 쿼리는 결과를 망친다.\n\n### 시나리오 3: cutover 직전에 늦게 도착한 write가 빠짐\n\n복사와 live write를 분리하지 않으면 마지막 순간의 변경이 유실될 수 있다.\n그래서 cutover 전 catch-up 단계가 필요하다.\n\n## 백필 실행 순서(playbook)\n\n1. source와 target의 key, active predicate, delete semantics를 먼저 고정한다.\n2. snapshot watermark를 기록하고 chunk copy를 시작한다.\n3. 각 chunk는 idempotent upsert로 만들고 성공/실패 artifact를 남긴다.\n4. watermark 이후 변경은 CDC, dual write, 또는 updated_at catch-up으로 재반영한다.\n5. row count가 아니라 bucket checksum, sample diff, late write horizon을 같이 검증한다.\n6. validation gate가 통과될 때만 read/write route cutover를 진행한다.\n7. cutover 뒤 probation window 동안 shadow read mismatch를 계속 본다.\n\n## 코드로 보기\n\n```sql\n-- chunk copy: PK 범위로 끊어서 복사\nINSERT INTO user_profile_new (id, name, tier, updated_at)\nSELECT id, name, tier, updated_at\nFROM user_profile\nWHERE id BETWEEN 100000 AND 110000\nON DUPLICATE KEY UPDATE\n  name = VALUES(name),\n  tier = VALUES(tier),\n  updated_at = VALUES(updated_at);\n```\n\n```sql\n-- catch-up: 워터마크 이후의 변경 재반영\nUPDATE user_profile_new n\nJOIN user_profile o ON o.id = n.id\nSET n.name = o.name,\n    n.tier = o.tier,\n    n.updated_at = o.updated_at\nWHERE o.updated_at > '2026-04-09 12:00:00';\n```\n\n```sql\n-- 검증\nSELECT COUNT(*) FROM user_profile;\nSELECT COUNT(*) FROM user_profile_new;\n```\n\n실무에서는 여기에 checksum, sample query, tombstone 처리까지 붙여야 안정적이다.\n그리고 실제 cutover 전에는 row count, bucket checksum, late write horizon, shadow read 비교 같은 승인 gate가 필요하다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| snapshot copy only | 구현이 단순하다 | 변경 누락 위험이 있다 | 짧은 점검용 작업 |\n| snapshot + catch-up | 정합성이 높다 | 워터마크 관리가 필요하다 | 대부분의 온라인 백필 |\n| dual write | 즉시 반영에 가깝다 | 애플리케이션 복잡도가 높다 | 새 구조를 바로 써야 할 때 |\n| CDC replay | 자동화가 좋다 | 운영 파이프라인이 필요하다 | 대규모 마이그레이션 |\n\n## 꼬리질문\n\n> Q: 백필을 단순 `INSERT ... SELECT`로 끝내면 왜 안 되나요?\n> 의도: 복사 중에 발생하는 write를 놓치는 문제를 아는지 확인\n> 핵심: 복사와 변경이 동시에 일어나므로 catch-up이 필요하다\n\n> Q: 왜 워터마크가 필요한가요?\n> 의도: 정합성 경계를 이해하는지 확인\n> 핵심: 어느 시점까지 복사했는지 기준이 있어야 누락을 막는다\n\n> Q: 백필 작업을 재시도 가능하게 만들려면 무엇이 중요하나요?\n> 의도: idempotent 설계 감각 확인\n> 핵심: 중복 실행해도 최종 결과가 같아야 한다\n\n## 한 줄 정리\n\n온라인 백필은 대량 복사가 아니라, 워터마크·catch-up·idempotent 재시도로 원본 변경까지 포함해 맞추는 동기화 작업이다.\n",
   "aliases": [
+    "온라인 백필 워터마크",
+    "backfill 누락 방지",
+    "Online Backfill Consistency and 개념",
+    "Online Backfill Consistency and 정리",
+    "Online Backfill Consistency and 실수",
     "online backfill consistency",
     "backfill watermark",
     "chunk copy",
     "dual write catch-up",
     "validation checksum",
     "sample diff",
-    "late write catch up",
-    "온라인 백필 워터마크",
-    "backfill 누락 방지",
-    "chunk backfill idempotent"
+    "late write catch up"
   ],
   "expected_queries": [
     "온라인 백필에서 watermark와 catch-up이 왜 필요한지 설명해줘",
@@ -53,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/online-backfill-consistency.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

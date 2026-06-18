@@ -6,16 +6,18 @@
   "summary": "이 문서는 MySQL optimizer hints, FORCE INDEX, USE INDEX, IGNORE INDEX, index_merge plan을 통계 왜곡과 plan drift 관점에서 다루는 advanced deep dive다.",
   "body_markdown": "# MySQL Optimizer Hints and Index Merge\n\n> 한 줄 요약: 옵티마이저는 똑똑하지만 완벽하지 않다. 잘못된 실행 계획을 읽고, 필요할 때만 힌트로 좁히는 감각이 중요하다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [인덱스와 실행 계획](./index-and-explain.md)\n> - [쿼리 튜닝 체크리스트](./query-tuning-checklist.md)\n> - [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n> - [SQL 조인과 쿼리 실행 순서](./sql-joins-and-query-order.md)\n\n---\n\n> retrieval-anchor-keywords:\n> - MySQL optimizer hints\n> - USE INDEX\n> - FORCE INDEX\n> - IGNORE INDEX\n> - index merge\n> - index_merge_intersect\n> - index_merge_union\n> - optimizer switch\n\n## 핵심 개념\n\nMySQL 옵티마이저는 통계와 비용 모델을 바탕으로 실행 계획을 고른다. 대부분의 경우 이 선택이 맞지만, 항상 최선은 아니다.\n\n이 문서에서 다룰 핵심은 세 가지다.\n\n1. 옵티마이저가 왜 잘못된 계획을 고르는가\n2. `index_merge`가 언제 유용하고 언제 독이 되는가\n3. 힌트를 언제 쓰고 언제 쓰지 말아야 하는가\n\n힌트는 정답이 아니라 **의도를 강제로 드러내는 도구**다. 기본 설계를 대신하는 수단이 아니다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 옵티마이저는 통계에 의존한다\n\n실행 계획은 현재 데이터 분포를 정확히 안다는 가정 위에서 만들어진다. 그런데 실제 운영에서는 다음이 자주 어긋난다.\n\n- 테이블 분포가 급격히 바뀜\n- 통계가 오래됨\n- 특정 조건의 선택도가 예상과 다름\n- 조인 순서가 데이터 성장 후에 역전됨\n\n이 때문에 처음엔 빠르던 쿼리가, 데이터가 커진 뒤 갑자기 느려질 수 있다.\n\n### 2. `index_merge`는 여러 인덱스를 합치는 전략이다\n\nMySQL은 `OR` 조건이나 일부 교집합 조건에서 여러 인덱스를 합쳐 사용할 수 있다.\n\n대표적인 형태는 다음과 같다.\n\n- `union`\n- `sort_union`\n- `intersection`\n\n예를 들어 아래 쿼리가 있다고 하자.\n\n```sql\nSELECT id, status, created_at\nFROM orders\nWHERE user_id = 1001 OR status = 'PAID';\n```\n\n인덱스가 아래처럼 분리되어 있다면:\n\n```sql\nCREATE INDEX idx_orders_user_id ON orders(user_id);\nCREATE INDEX idx_orders_status ON orders(status);\n```\n\n옵티마이저는 `index_merge`를 고려할 수 있다.\n\n```text\ntype: index_merge\nkey: idx_orders_user_id,idx_orders_status\nExtra: Using union(idx_orders_user_id,idx_orders_status); Using where\n```\n\n이 방식은 종종 좋지만, 항상 좋은 것은 아니다. 두 인덱스에서 찾은 결과를 합치는 비용이 커지면 풀스캔보다 느려질 수 있다.\n\n### 3. 힌트는 계획을 좁히는 장치다\n\nMySQL에는 두 종류의 힌트 감각이 있다.\n\n- 테이블/인덱스 힌트: `USE INDEX`, `FORCE INDEX`, `IGNORE INDEX`\n- 옵티마이저 힌트: `/*+ ... */` 형태의 주석 힌트\n\n예:\n\n```sql\nSELECT /*+ INDEX(o idx_orders_user_status_created_at) */\n       o.id, o.status, o.created_at\nFROM orders o\nWHERE o.user_id = 1001\n  AND o.status = 'PAID'\nORDER BY o.created_at DESC\nLIMIT 20;\n```\n\n또는 특정 인덱스를 강제할 수 있다.\n\n```sql\nSELECT id, status, created_at\nFROM orders FORCE INDEX (idx_orders_user_status_created_at)\nWHERE user_id = 1001\n  AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n하지만 힌트는 보수적으로 써야 한다. 데이터 분포가 다시 바뀌면 힌트가 오히려 발목을 잡는다.\n\n### 4. `ANALYZE TABLE`은 종종 첫 번째 대응이다\n\n계획이 이상하면 무조건 힌트부터 넣기보다, 통계 갱신 여부를 먼저 본다.\n\n```sql\nANALYZE TABLE orders;\n```\n\n통계가 오래된 상태였다면, 힌트 없이도 계획이 좋아질 수 있다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: `index_merge`가 오히려 느려짐\n\n운영에서 아래 쿼리가 있다고 하자.\n\n```sql\nSELECT *\nFROM orders\nWHERE user_id = 1001 OR status = 'FAILED';\n```\n\n데이터가 커지면서 `status='FAILED'`가 전체의 18%를 차지하게 됐다. 그러면 `index_merge`로 많이 긁어오느니 차라리 한쪽 인덱스만 타는 편이 나을 수 있다.\n\n이 경우의 교훈은 이렇다.\n\n- 조건문이 인덱스 가능하다고 해서 항상 빠른 것은 아니다\n- `OR`는 index merge를 유도하지만, 결과 집합이 크면 비용이 폭증한다\n- 부분집합이 큰 컬럼은 힌트로 억지 제어하지 말고 쿼리 자체를 다시 설계해야 한다\n\n### 시나리오 2: 운영자가 임시 힌트로 장애를 넘김\n\n새 배포 후 조인 순서가 바뀌어 응답 시간이 40ms에서 3s로 튀었다. 원인은 통계 왜곡과 join order 선택이었다.\n\n이때 임시 조치로는 힌트를 써서 회복시킬 수 있다.\n\n하지만 장기적으로는:\n\n- 통계 갱신\n- 인덱스 재설계\n- 조인 쿼리 구조 수정\n\n이 필요하다.\n\n### 시나리오 3: `FORCE INDEX`가 새 데이터 분포에서 독이 됨\n\n처음에는 `FORCE INDEX`로 빠르게 해결했지만, 나중에 데이터가 바뀌며 그 인덱스가 더 이상 최선이 아니게 된다. 그 순간 힌트는 기술 부채가 된다.\n\n---\n\n## 코드로 보기\n\n### 테이블 예시\n\n```sql\nCREATE TABLE orders (\n  id BIGINT PRIMARY KEY,\n  user_id BIGINT NOT NULL,\n  status VARCHAR(20) NOT NULL,\n  created_at DATETIME NOT NULL,\n  total_amount DECIMAL(12,2) NOT NULL,\n  INDEX idx_orders_user_id (user_id),\n  INDEX idx_orders_status (status),\n  INDEX idx_orders_user_status_created_at (user_id, status, created_at)\n);\n```\n\n### 실행 계획 비교\n\n```sql\nEXPLAIN\nSELECT id, status, created_at\nFROM orders\nWHERE user_id = 1001\n  AND status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n잘못된 계획:\n\n```text\ntype: index_merge\nkey: idx_orders_user_id,idx_orders_status\nrows: 18340\nExtra: Using intersection(...); Using filesort\n```\n\n개선된 계획:\n\n```text\ntype: range\nkey: idx_orders_user_status_created_at\nrows: 20\nExtra: Using where; Using index\n```\n\n### 강제 힌트 예시\n\n```sql\nSELECT /*+ INDEX(o idx_orders_user_status_created_at) */\n       o.id, o.status, o.created_at\nFROM orders o\nWHERE o.user_id = 1001\n  AND o.status = 'PAID'\nORDER BY o.created_at DESC\nLIMIT 20;\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 옵티마이저 기본 선택 | 유지보수가 쉽다 | 통계가 틀리면 오판할 수 있다 | 일반적인 운영 쿼리 |\n| `index_merge` | `OR` 조건을 자연스럽게 처리한다 | 결과 집합이 크면 느릴 수 있다 | 조건 분산이 작을 때 |\n| `FORCE INDEX` | 계획을 즉시 고정할 수 있다 | 데이터 분포 변화에 취약하다 | 장애를 임시로 우회할 때 |\n| 쿼리/인덱스 재설계 | 장기적으로 안정적이다 | 시간과 검증이 필요하다 | 반복되는 느린 쿼리 |\n\n핵심 기준은 간단하다. **힌트는 응급처치, 설계는 치료다.**\n\n---\n\n## 꼬리질문\n\n> Q: index merge가 있으면 복합 인덱스는 필요 없나요?\n> 의도: index_merge와 compound index의 역할 구분 여부 확인\n> 핵심: index_merge는 임시 우회일 뿐, 정확한 접근 경로는 복합 인덱스가 더 낫다\n\n> Q: FORCE INDEX를 영구 해법으로 쓰면 왜 위험한가요?\n> 의도: 운영 변화에 따른 계획 붕괴 인식 여부 확인\n> 핵심: 데이터 분포가 바뀌면 고정 계획이 오히려 병목이 된다\n\n> Q: 통계 갱신과 힌트 중 무엇을 먼저 보나요?\n> 의도: 문제 진단 순서 확인\n> 핵심: 통계와 실행 계획을 먼저 확인하고, 힌트는 마지막 수단으로 둔다\n\n---\n\n## 한 줄 정리\n\n옵티마이저 힌트는 계획을 고정하는 수단이 아니라, 잘못된 선택을 임시로 좁히는 도구다. index merge는 유용하지만 복합 인덱스를 대체하지 못한다.\n",
   "aliases": [
+    "MySQL 힌트 언제 쓰나요",
+    "index merge가 느려요",
+    "MySQL Optimizer Hints and 개념",
+    "MySQL Optimizer Hints and 정리",
+    "MySQL Optimizer Hints and 실수",
     "MySQL optimizer hints",
     "USE INDEX",
     "FORCE INDEX",
     "IGNORE INDEX",
     "index merge",
     "index_merge_intersect",
-    "index_merge_union",
-    "optimizer switch",
-    "MySQL 힌트 언제 쓰나요",
-    "index merge가 느려요"
+    "index_merge_union"
   ],
   "expected_queries": [
     "MySQL index_merge plan이 언제 도움이 되고 언제 느려지는지 설명해줘",
@@ -51,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/mysql-optimizer-hints-index-merge.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "purge thread는 \"나중에 정리하는 백그라운드 작업\"이 아니라, 오래된 버전을 얼마나 빨리 치우느냐를 결정하는 시스템 스케줄러다.",
   "body_markdown": "# Purge Thread Scheduling and Lag Control\n\n> 한 줄 요약: purge thread는 \"나중에 정리하는 백그라운드 작업\"이 아니라, 오래된 버전을 얼마나 빨리 치우느냐를 결정하는 시스템 스케줄러다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: purge thread scheduling, purge lag, innodb_purge_threads, innodb_max_purge_lag, history list length, undo debt, MVCC cleanup, truncate frequency\n\n## 핵심 개념\n\n- 관련 문서:\n  - [MVCC History List Growth와 Snapshot Too Old](./mvcc-history-list-snapshot-too-old.md)\n  - [Undo Tablespace Truncation and Purge Debt](./undo-tablespace-truncation-purge-debt.md)\n  - [Change Buffer, Purge, History List Length](./change-buffer-purge-history-length.md)\n  - [Redo Log, Undo Log, Checkpoint, Crash Recovery](./redo-log-undo-log-checkpoint-crash-recovery.md)\n  - [Purge Backlog Remediation, Throttling, and Recovery Playbook](./purge-backlog-remediation-throttle-playbook.md)\n\npurge thread는 undo chain에서 더 이상 필요한 과거 버전을 정리하는 백그라운드 작업자다.  \n이 작업이 밀리면 history list length가 커지고, undo debt와 읽기 비용이 같이 증가한다.\n\n이 문서의 핵심은 다음이다.\n\n- purge는 MVCC의 뒷정리다\n- purge thread 수와 batch 전략이 lag를 좌우한다\n- 오래 열린 트랜잭션이 purge를 막는다\n- lag가 커지면 DML 자체를 늦추는 throttling이 필요할 수 있다\n\n## 깊이 들어가기\n\n### 1. purge는 무엇을 정리하나\n\nUPDATE/DELETE가 남긴 과거 버전은 당장 지울 수 없다.  \n활성 snapshot이 그 버전을 볼 수도 있기 때문이다.\n\n그래서 purge는 다음 조건이 맞을 때만 정리한다.\n\n- 어떤 활성 트랜잭션도 그 버전을 참조하지 않는다\n- undo chain에서 더 이상 필요한 연결이 아니다\n- 안전하게 지워도 현재 읽기 결과에 영향이 없다\n\n### 2. 스케줄링이 왜 중요한가\n\npurge는 단순히 \"있다/없다\"가 아니라, 얼마나 자주 얼마나 많이 돌릴지가 중요하다.\n\n- purge threads가 너무 적으면 lag가 쌓인다\n- 너무 많으면 background I/O와 CPU를 잡아먹는다\n- batch가 너무 크면 foreground와 경쟁한다\n\n즉 purge는 스레드 수보다 스케줄링 균형이 더 중요하다.\n\n### 3. lag control은 어떤 신호로 작동하나\n\nMySQL/InnoDB는 특정 lag 임계치에 도달하면 DML을 늦추는 전략을 사용할 수 있다.\n\n대표 변수:\n\n- `innodb_purge_threads`\n- `innodb_max_purge_lag`\n- `innodb_max_purge_lag_delay`\n- `innodb_purge_rseg_truncate_frequency`\n\n이 변수들은 \"정리 속도\"와 \"foreground 지연\"의 균형을 바꾼다.\n\n### 4. purge가 막히는 대표 원인\n\n- 긴 보고서 트랜잭션\n- 배치가 트랜잭션을 오래 유지함\n- replica apply 지연으로 정리 지연이 늘어나는 상황\n- snapshot을 너무 오래 잡고 있는 애플리케이션\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `purge thread scheduling`\n- `purge lag`\n- `innodb_purge_threads`\n- `innodb_max_purge_lag`\n- `history list length`\n- `undo debt`\n\n## 실전 시나리오\n\n### 시나리오 1. DML은 되는데 DB가 점점 무거워진다\n\npurge lag가 쌓이면 눈에 보이는 락이 없어도 디스크와 메모리 압박이 커진다.  \n`history list length`가 계속 오르면 purge thread가 따라가지 못한다는 뜻이다.\n\n### 시나리오 2. 오래된 SELECT 하나가 전체 정리를 막는다\n\n장기 snapshot이 purge 대상 버전을 계속 보존하게 만들면, 정리 thread를 늘려도 효과가 제한적일 수 있다.  \n이 경우 먼저 긴 트랜잭션을 찾아야 한다.\n\n### 시나리오 3. purge를 너무 공격적으로 돌리면 평시가 흔들린다\n\nbackground 정리를 세게 하면 foreground 쓰기와 I/O를 두고 경쟁한다.  \n그래서 purge는 무조건 빠르게가 아니라, 시스템 전체를 덜 흔드는 방식이 중요하다.\n\n## 코드로 보기\n\n### 설정 확인\n\n```sql\nSHOW VARIABLES LIKE 'innodb_purge_threads';\nSHOW VARIABLES LIKE 'innodb_max_purge_lag';\nSHOW VARIABLES LIKE 'innodb_max_purge_lag_delay';\nSHOW VARIABLES LIKE 'innodb_purge_rseg_truncate_frequency';\n```\n\n### 상태 확인\n\n```sql\nSHOW STATUS LIKE 'Innodb_history_list_length';\nSHOW ENGINE INNODB STATUS\\G\n```\n\n### 긴 트랜잭션 확인\n\n```sql\nSELECT trx_id, trx_started, trx_state, trx_query\nFROM information_schema.innodb_trx\nORDER BY trx_started;\n```\n\n### lag를 유발하는 작업 예시\n\n```sql\nUPDATE orders\nSET status = 'DONE'\nWHERE created_at >= '2026-04-01'\n  AND created_at <  '2026-04-08';\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| purge thread 증가 | 정리 속도를 높일 수 있다 | background I/O가 늘어난다 | lag가 계속 커질 때 |\n| lag 기반 throttling | undo debt 폭증을 막는다 | 쓰기 latency가 늘 수 있다 | 운영 안정성이 우선일 때 |\n| 긴 트랜잭션 줄이기 | 근본 원인을 제거한다 | 배치/리포트 설계가 필요하다 | 대부분의 서비스 |\n\n핵심은 purge thread를 \"정리 로봇\"이 아니라 **lag control 시스템**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: purge thread는 왜 중요한가요?\n> 의도: MVCC 뒷정리가 성능에 미치는 영향 이해 여부 확인\n> 핵심: 오래된 버전을 치우지 못하면 undo debt가 쌓인다\n\n> Q: purge lag가 커지면 무슨 일이 생기나요?\n> 의도: 정리 지연이 읽기/쓰기 모두에 영향을 준다는 점 확인\n> 핵심: history list length, 디스크 압박, 지연이 함께 증가한다\n\n> Q: purge를 무조건 빠르게 하면 안 되는 이유는?\n> 의도: foreground/background 경쟁을 아는지 확인\n> 핵심: 다른 쿼리와 I/O를 두고 싸우기 때문이다\n\n## 한 줄 정리\n\npurge thread scheduling은 과거 버전 정리 속도와 foreground 지연을 함께 조절하는 문제이고, lag control은 긴 트랜잭션을 줄일 때 가장 잘 작동한다.\n",
   "aliases": [
+    "Purge Thread Scheduling and 개념",
+    "Purge Thread Scheduling and 정리",
+    "Purge Thread Scheduling and 실수",
+    "Purge Thread Scheduling and 판단 기준",
+    "데이터베이스 Purge Thread Scheduling and",
     "purge thread scheduling",
     "purge lag",
     "innodb_purge_threads",
     "innodb_max_purge_lag",
     "history list length",
     "undo debt",
-    "MVCC cleanup",
-    "truncate frequency",
-    "purge lag control",
-    "purge thread tuning"
+    "MVCC cleanup"
   ],
   "expected_queries": [
     "InnoDB purge thread scheduling은 history list length와 undo debt에 어떤 영향을 줘?",
@@ -50,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/purge-thread-scheduling-lag-control.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

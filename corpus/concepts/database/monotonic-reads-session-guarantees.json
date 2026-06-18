@@ -6,16 +6,18 @@
   "summary": "이 문서는 monotonic reads, session guarantees, session watermark, sticky replica routing으로 같은 사용자 세션의 읽기가 뒤로 가지 않게 만드는 advanced symptom router다.",
   "body_markdown": "# Monotonic Reads와 Session Guarantees\n\n> 한 줄 요약: 한 세션 안에서는 시간이 뒤로 가지 않아야 하고, 그 약속을 지키려면 읽기 라우팅이 “가장 최근에 본 값”을 기억해야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md), [Read-Your-Writes와 Session Pinning 전략](./read-your-writes-session-pinning.md), [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md), [Client Consistency Tokens](./client-consistency-tokens.md), [Causal Consistency Intuition](./causal-consistency-intuition.md)\nretrieval-anchor-keywords: monotonic reads, monotonic read, session guarantees, session guarantee, session consistency, session-consistent reads, read goes backward, saw newer then older, same session sees older data, refresh shows older value again, sticky read, sticky session read, version token, session watermark, causal consistency, monotonic read broken, 세션 일관성, 읽기가 뒤로 감, 방금 본 값보다 옛값, 새로고침했더니 더 옛값\n\n## 증상별 바로 가기\n\n- `write는 성공했는데 바로 안 보인다`, `save succeeded but old value returned`처럼 freshness 자체가 아직 확보되지 않았으면 [Replica Lag and Read-after-write Strategies](./replica-lag-read-after-write-strategies.md)와 [Read-Your-Writes와 Session Pinning 전략](./read-your-writes-session-pinning.md)부터 본다.\n- `한 번 최신을 본 뒤 다시 옛값을 본다`, `saw newer then older`, `refresh shows older value again`처럼 같은 세션의 읽기가 뒤로 가면 이 문서에서 monotonic read와 session guarantee를 본다.\n- 서버 sticky session만으로 부족하고 탭/디바이스를 넘겨 같은 최신선을 운반해야 하면 [Client Consistency Tokens](./client-consistency-tokens.md)으로 이어 간다.\n- `원인보다 결과를 먼저 본다`, `comment visible before post`처럼 의미 순서까지 지켜야 하면 [Causal Consistency Intuition](./causal-consistency-intuition.md)을 같이 본다.\n\n## 핵심 개념\n\nMonotonic read는 같은 사용자가 연속해서 읽을 때, 더 과거의 상태를 다시 보지 않도록 하는 보장이다.\n\nfreshness entry 문서들이 \"최신 write가 한 번이라도 보이느냐\"를 다룬다면, monotonic read는 그다음 단계인 \"한 번 본 최신선보다 뒤로 다시 떨어지지 않느냐\"를 다룬다.\n\n왜 중요한가:\n\n- 사용자는 새로고침할수록 오래된 상태를 다시 보는 일을 이상하게 느낀다\n- replica routing이 바뀌면 같은 세션에서도 관측 시간이 뒤집힐 수 있다\n- read-your-writes보다 더 넓은 의미로, “읽기의 시간이 되돌아가지 않게” 만드는 게 핵심이다\n\nsession guarantee는 단일 쿼리의 정확성보다, **한 사용자 흐름의 관측 순서**를 지키는 문제다.\n\n## 깊이 들어가기\n\n### 1. monotonic read가 깨지는 이유\n\n다음 상황은 흔하다.\n\n- 첫 요청은 replica A를 읽는다\n- 두 번째 요청은 replica B를 읽는다\n- B가 A보다 조금 더 뒤처져 있다\n\n그러면 사용자는 같은 화면에서 이전에 봤던 값보다 더 오래된 값을 다시 본다.\n\n이 문제는 lag가 크지 않아도 발생한다.  \n핵심은 “늦은 replica”가 아니라 **서로 다른 replica 간 시간축이 다르다**는 점이다.\n\n### 2. session guarantee가 필요한 곳\n\nmonotonic read는 다음 경로에서 특히 중요하다.\n\n- 프로필 수정 후 목록/상세 이동\n- 관리자 상태 전이 후 재조회\n- 장바구니나 결제 상태처럼 순서가 중요한 화면\n\n이 경로에서는 단순 확장성보다 사용자 관측의 일관성이 더 중요하다.\n\n### 3. 구현 방식\n\n대표적인 구현은 다음과 같다.\n\n- 세션이 본 최소 version/LSN/GTID를 기억한다\n- replica가 그 version 이상인지 확인한다\n- 부족하면 primary나 더 앞선 replica로 보낸다\n\n이 방식은 read-your-writes보다 조금 넓다.  \n내가 쓴 것만 보는 게 아니라, **내가 이미 본 미래보다 뒤로 가지 않는 것**이 목표다.\n세션 메모리 대신 이 기준선을 클라이언트가 들고 다니게 하면 [Client Consistency Tokens](./client-consistency-tokens.md) 패턴이 된다.\n\n### 4. 어디까지 강하게 할 것인가\n\n모든 조회에 monotonic guarantee를 넣을 필요는 없다.\n\n- 검색 결과 목록은 약한 일관성으로도 충분할 수 있다\n- 결제/주문/권한 경로는 강하게 가져가야 한다\n- 관리자와 운영자 화면은 더 보수적이어야 한다\n\n즉 consistency는 전역 정책이 아니라 경로별 정책이다.\n\n## 실전 시나리오\n\n### 시나리오 1: 상태가 왔다 갔다 한다\n\n사용자가 주문 상태를 `PAID`로 본 뒤 새로고침했는데 `PENDING`으로 돌아간다.  \n이건 단순 lag보다 monotonic read 실패다.\n\n### 시나리오 2: 같은 세션에서 페이지가 뒤집힌다\n\n목록 페이지 1과 페이지 2가 서로 다른 replica를 타면, 정렬 결과가 뒤섞여 보일 수 있다.  \n이때는 세션 단위 라우팅이 필요하다.\n\n### 시나리오 3: 장애 후 다시 옛 상태를 본다\n\nfailover 직후 토폴로지가 바뀌면서 읽기 기준점이 흔들리면, 사용자는 시간을 거슬러 올라간 것처럼 느낀다.\n\n## 코드로 보기\n\n```java\nclass SessionReadContext {\n    private long minSeenVersion;\n\n    void observe(long version) {\n        if (version > minSeenVersion) {\n            minSeenVersion = version;\n        }\n    }\n\n    boolean canReadFrom(long replicaVersion) {\n        return replicaVersion >= minSeenVersion;\n    }\n}\n```\n\n```sql\n-- version column이나 commit token을 사용해 라우팅 기준을 만들 수 있다\nSELECT id, status, version\nFROM orders\nWHERE id = 9001;\n```\n\nmonotonic read의 핵심은 “최신을 본다”가 아니라, **한 세션 안에서 더 과거로 되돌아가지 않는다**는 점이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 무작위 replica 읽기 | 확장성이 좋다 | 시간 역행이 생길 수 있다 | 조회 위주 |\n| 세션 version pinning | 관측 순서가 안정적이다 | 라우팅이 복잡해진다 | 상태 전이 경로 |\n| primary fallback | 가장 안전하다 | primary 부하가 늘어난다 | 결제, 권한, 운영 화면 |\n| causal token 기반 라우팅 | 정교하다 | 인프라 요구가 높다 | 대규모 시스템 |\n\n## 꼬리질문\n\n> Q: monotonic read는 read-your-writes와 어떻게 다른가요?\n> 의도: 세션 보장 종류를 구분하는지 확인\n> 핵심: read-your-writes는 내가 쓴 것을 보는 것이고, monotonic read는 내가 본 것보다 뒤로 가지 않는 것이다\n\n> Q: 왜 replica lag이 작아도 monotonic read가 깨질 수 있나요?\n> 의도: 라우팅 전환 문제를 아는지 확인\n> 핵심: 서로 다른 replica의 관측 시점이 다를 수 있다\n\n> Q: 모든 API에 session guarantee를 넣어야 하나요?\n> 의도: 경로별 consistency 설계를 이해하는지 확인\n> 핵심: 중요한 경로에만 강하게 적용하는 것이 보통 더 현실적이다\n\n## 한 줄 정리\n\nMonotonic read는 한 세션의 시간이 뒤로 가지 않게 하는 보장이고, 그 약속은 replica 라우팅이 세션의 관측 버전을 기억할 때만 유지된다.\n",
   "aliases": [
+    "읽기가 뒤로 감",
+    "새로고침했더니 옛값이 다시 보여요",
+    "Monotonic Reads and Session 개념",
+    "Monotonic Reads and Session 정리",
+    "Monotonic Reads and Session 실수",
     "monotonic reads",
     "monotonic read",
     "session guarantees",
     "session consistency",
     "read goes backward",
     "saw newer then older",
-    "sticky session read",
-    "session watermark",
-    "읽기가 뒤로 감",
-    "새로고침했더니 옛값이 다시 보여요"
+    "sticky session read"
   ],
   "expected_queries": [
     "같은 세션에서 최신 값을 봤다가 다시 옛값을 보는 건 어떤 consistency 문제야?",
@@ -53,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/monotonic-reads-session-guarantees.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

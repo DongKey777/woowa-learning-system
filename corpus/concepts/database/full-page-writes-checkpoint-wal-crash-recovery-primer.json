@@ -6,16 +6,18 @@
   "summary": "PostgreSQL의 full_page_writes는 checkpoint 이후 어떤 data page가 처음 수정될 때 그 page 전체 이미지(full page image, FPI)를 WAL에 함께 남겨, crash 중 data page가 일부만 써지는 torn page 상황에서도 recovery가 page를 다시 신뢰할 수 있게 만드는 보호 장치다.",
   "body_markdown": "# PostgreSQL Full Page Writes, Checkpoint, WAL Crash Recovery Primer\n\n## 한 줄 요약\n\nPostgreSQL의 `full_page_writes`는 checkpoint 이후 어떤 data page가 처음 수정될 때 그 page 전체 이미지(full page image, FPI)를 WAL에 함께 남겨, crash 중 data page가 일부만 써지는 torn page 상황에서도 recovery가 page를 다시 신뢰할 수 있게 만드는 보호 장치다.\n\n## 왜 WAL record만으로 부족할 수 있나\n\n일반적인 WAL record는 \"이 page의 어떤 tuple/index entry를 이렇게 바꿨다\"는 변경 기록이다. 이 기록은 base page가 정상이라는 전제를 깔고 replay된다. 그런데 OS crash나 power loss가 page write 도중 발생하면 data file의 page가 절반만 새 내용이고 절반은 예전 내용인 torn page가 될 수 있다.\n\n이 상태에서 작은 WAL record만 replay하면 문제가 생긴다.\n\n- WAL record가 적용될 대상 page 자체가 이미 깨져 있을 수 있다.\n- page checksum이 맞지 않거나 LSN 경계가 애매해질 수 있다.\n- \"변경분\"은 남아 있지만 변경분을 얹을 정상 page가 없을 수 있다.\n\n그래서 PostgreSQL은 기본적으로 `full_page_writes = on`을 사용한다. checkpoint 이후 처음 수정되는 page는 변경 record만이 아니라 page 전체 이미지를 WAL에 함께 기록한다.\n\n## checkpoint 이후 첫 page modification 규칙\n\n핵심 규칙은 \"모든 수정마다 page 전체를 WAL에 넣는다\"가 아니다.\n\n```text\ncheckpoint 완료\n  -> page A가 checkpoint 이후 처음 수정됨\n  -> WAL에 full page image + 변경 record 기록\n  -> 같은 checkpoint 구간에서 page A가 다시 수정됨\n  -> 보통 변경 record만 기록\n  -> 다음 checkpoint 후 page A가 다시 처음 수정됨\n  -> 다시 full page image 기록 가능\n```\n\ncheckpoint는 \"여기까지의 dirty page는 data file에 반영되는 기준점\"을 만든다. checkpoint 이후 처음 수정된 page가 crash 전에 data file에 partially written 될 수 있으므로, recovery가 안전한 원본 이미지를 확보하려고 FPI를 남긴다.\n\n## WAL record와 full page image 구분\n\n| 구분 | WAL record | Full page image |\n|---|---|---|\n| 주된 내용 | 변경 작업의 논리/물리적 delta | page 전체 snapshot |\n| 크기 | 보통 작다 | page 크기에 가까워 크다 |\n| 전제 | 대상 page가 정상이어야 replay 가능 | torn page를 덮어쓸 수 있는 안전한 page image 제공 |\n| 발생 시점 | page 변경마다 기록될 수 있음 | checkpoint 이후 첫 page modification 때 주로 기록 |\n| 비용 | WAL volume이 상대적으로 작음 | WAL write amplification 증가 |\n\n짧게 말하면 WAL record는 \"어떻게 바꿨는가\"이고, full page image는 \"깨졌을 때 기준으로 삼을 page 전체\"다.\n\n## crash recovery에서 쓰이는 방식\n\ncrash 후 PostgreSQL은 마지막 checkpoint 이후 WAL을 읽어 redo를 수행한다. page의 LSN을 보고 이미 반영된 변경은 건너뛰고, 필요한 변경은 다시 적용한다. 이때 WAL에 full page image가 있으면 recovery는 손상되었을 수 있는 data file page를 FPI로 복원한 뒤 이후 WAL record를 적용할 수 있다.\n\n중요한 점은 `full_page_writes`가 backup이 아니라 crash recovery 보조 장치라는 것이다.\n\n- 정상적인 commit durability의 근거는 여전히 WAL flush와 설정된 sync 정책이다.\n- FPI는 page-level torn write 위험을 줄이는 장치다.\n- WAL archive와 base backup 없이는 임의 시점 복구(PITR)를 대신하지 않는다.\n\n## write amplification trade-off\n\n`full_page_writes`는 안전성을 올리는 대신 쓰기 비용을 키운다.\n\n- checkpoint 직후 많은 page가 처음 수정되면 WAL volume이 급증한다.\n- page 하나의 작은 tuple만 바꿔도 첫 수정이면 page 전체 image가 WAL에 들어갈 수 있다.\n- bulk update, index build, backfill, vacuum 패턴에 따라 WAL 생성량과 replication lag가 같이 늘 수 있다.\n- WAL 압축(`wal_compression`)을 켜면 FPI 비용을 줄일 수 있지만 CPU와 압축 효율 trade-off가 생긴다.\n\n그래서 운영에서는 `full_page_writes`를 단순히 \"성능 옵션\"으로 보지 않는다. WAL 용량, checkpoint 주기, archive bandwidth, replica apply lag, storage latency를 함께 봐야 한다.\n\n## fsync와 storage cache caveat\n\n`full_page_writes = on`이어도 storage 계층이 거짓말을 하면 보장이 약해진다. DB가 `fsync`나 유사한 flush 요청을 했는데 컨트롤러, 디스크 cache, 가상화 계층이 실제 stable storage에 쓰지 않고 완료를 응답하면 power loss에서 WAL이나 data page가 사라질 수 있다.\n\n따라서 crash safety를 말할 때는 아래를 같이 확인한다.\n\n- PostgreSQL의 `fsync`, `synchronous_commit`, `full_page_writes` 설정\n- storage write cache가 battery-backed인지\n- 파일시스템과 볼륨 계층이 flush/FUA 명령을 제대로 전달하는지\n- cloud volume의 durability 문서와 장애 모델\n\n`full_page_writes`는 torn page 위험을 줄이지만, 정직한 flush와 durable storage라는 하위 전제가 무너지면 혼자서 commit durability를 보장하지 못한다.\n\n## MySQL doublewrite buffer와의 경계\n\nMySQL InnoDB의 doublewrite buffer도 torn page를 줄이기 위한 장치지만 위치가 다르다.\n\n- PostgreSQL `full_page_writes`: checkpoint 이후 첫 page image를 WAL에 넣고, recovery 때 WAL에서 복원한다.\n- InnoDB doublewrite buffer: dirty page를 최종 data file 위치에 쓰기 전에 별도 doublewrite 영역에 먼저 써서 clean copy를 남긴다.\n- InnoDB redo log: 변경 기록을 replay하는 로그이며, doublewrite buffer와 역할이 다르다.\n\n둘 다 \"page가 일부만 써진다\"는 물리적 위험을 다루지만, PostgreSQL은 WAL에 FPI를 싣는 쪽이고 InnoDB는 data page flush 경로에 doublewrite 영역을 둔다는 차이가 있다.\n\n## 운영에서 보는 신호\n\n| 신호 | 해석 |\n|---|---|\n| checkpoint 직후 WAL 생성량 급증 | 많은 page가 첫 수정되며 FPI가 늘었을 수 있음 |\n| `pg_stat_wal.wal_fpi` 증가 | full page image 발생량 확인 |\n| archive backlog 증가 | FPI로 WAL volume이 늘어 archive 전송이 밀릴 수 있음 |\n| replica lag 증가 | WAL 전송/적용량 증가가 replica 지연으로 보일 수 있음 |\n| crash 후 checksum/page 오류 | storage, fsync, torn write 방어 설정을 함께 점검 |\n\n## 흔한 오해\n\n| 오해 | 더 정확한 설명 |\n|---|---|\n| WAL record만 있으면 torn page도 항상 복구된다 | delta record는 정상 base page가 필요하다. FPI는 깨진 page를 덮어쓸 기준 image를 제공한다. |\n| full page image는 매 update마다 항상 기록된다 | checkpoint 이후 해당 page의 첫 수정에서 주로 발생한다. |\n| full_page_writes를 끄면 성능만 좋아진다 | WAL volume은 줄 수 있지만 crash 중 torn page 복구 위험이 커진다. |\n| MySQL redo log의 역할과 PostgreSQL FPI가 같다 | redo는 변경 기록, FPI는 page 전체 image다. InnoDB의 torn page 방어는 doublewrite buffer와 더 가깝다. |\n| fsync가 꺼져 있어도 FPI가 있으니 안전하다 | FPI도 WAL에 durable하게 남아야 의미가 있다. storage flush 보장이 필요하다. |\n\n## 짧은 답변 템플릿\n\n\"PostgreSQL의 `full_page_writes`는 checkpoint 이후 처음 수정되는 page의 전체 이미지를 WAL에 남겨 torn page를 복구할 수 있게 합니다. 일반 WAL record는 변경분이어서 base page가 정상이라는 전제가 필요하지만, full page image는 crash recovery 중 깨진 page를 덮어쓸 기준이 됩니다. 대신 checkpoint 직후 write amplification과 WAL volume 증가가 생기고, fsync나 storage write cache가 정직하게 동작한다는 전제도 같이 확인해야 합니다. MySQL InnoDB doublewrite buffer는 같은 torn page 문제를 다루지만 WAL에 page image를 넣는 방식이 아니라 별도 doublewrite 영역을 거치는 flush-path 보호 장치입니다.\"\n\n## 검증 질문\n\n1. checkpoint 이후 같은 page를 세 번 수정했다면 full page image는 왜 보통 첫 수정 때만 필요한가?\n2. WAL record와 full page image가 crash recovery에서 각각 기대하는 전제는 무엇인가?\n3. `full_page_writes = off`가 성능상 유리해 보여도 운영 DB에서 위험한 이유는 무엇인가?\n4. storage write cache가 flush를 거짓 완료한다면 `full_page_writes = on`의 보장은 어떻게 약해지는가?\n5. PostgreSQL full page image와 MySQL InnoDB doublewrite buffer를 한 문단으로 구분해 설명해보라.\n\n## References\n\n- PostgreSQL Documentation: Write Ahead Log, `full_page_writes`, WAL configuration\n- PostgreSQL Documentation: Continuous Archiving and Point-in-Time Recovery\n- PostgreSQL Documentation: Reliability and the Write-Ahead Log\n- PostgreSQL `pg_stat_wal` view documentation\n- MySQL Reference Manual: InnoDB doublewrite buffer\n\n## Safe Next Docs\n\n- `write-ahead-log-durability-interview-primer`: WAL과 commit durability의 기본 구조\n- `doublewrite-buffer-torn-page-protection`: InnoDB doublewrite와 torn page 비교\n- `group-commit-binlog-fsync-durability`: fsync, group commit, durability trade-off\n",
   "aliases": [
+    "체크포인트 이후 첫 페이지 수정",
+    "찢어진 페이지 복구",
+    "PostgreSQL Full Page Writes, 개념",
+    "PostgreSQL Full Page Writes, 정리",
+    "PostgreSQL Full Page Writes, 실수",
     "PostgreSQL full_page_writes",
     "full page image",
     "full page write",
     "torn page protection",
     "WAL full page image",
     "checkpoint first page modification",
-    "PostgreSQL crash recovery",
-    "page write amplification",
-    "체크포인트 이후 첫 페이지 수정",
-    "찢어진 페이지 복구"
+    "PostgreSQL crash recovery"
   ],
   "expected_queries": [
     "PostgreSQL full_page_writes는 checkpoint 이후 첫 page modification에서 왜 full page image를 WAL에 넣어?",
@@ -52,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/full-page-writes-checkpoint-wal-crash-recovery-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

@@ -6,15 +6,18 @@
   "summary": "histogram은 한 번 만들고 끝나는 정보가 아니라, 데이터 분포가 바뀌면 흐려지고 다시 분석해야 하는 옵티마이저 자산이다.",
   "body_markdown": "# Histogram Drift and Auto-Analyze Thresholds\n\n> 한 줄 요약: histogram은 한 번 만들고 끝나는 정보가 아니라, 데이터 분포가 바뀌면 흐려지고 다시 분석해야 하는 옵티마이저 자산이다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: histogram drift, auto analyze threshold, persistent statistics, cardinality drift, ANALYZE TABLE, distribution shift, optimizer misestimate, statistics refresh\n\n## 핵심 개념\n\n- 관련 문서:\n  - [Statistics, Histograms, and Cardinality Estimation](./statistics-histograms-cardinality-estimation.md)\n  - [Secondary Index Maintenance Cost and ANALYZE Statistics Skew](./secondary-index-maintenance-cost-analyze-skew.md)\n  - [Optimizer Switch Knobs and Plan Stability](./optimizer-switch-plan-stability-invisible-indexes.md)\n\nhistogram은 컬럼 분포를 더 잘 추정하게 해 주지만, 데이터가 바뀌면 그 정보도 낡는다.  \n이걸 histogram drift라고 보면 된다.\n\n핵심은 다음이다.\n\n- 분포가 바뀌면 cardinality 추정도 바뀐다\n- auto-analyze는 즉시가 아니라 일정 조건에서만 돌아간다\n- 수동 ANALYZE가 더 빠른 경우가 많다\n\n## 깊이 들어가기\n\n### 1. histogram drift는 어떻게 생기나\n\n예를 들어 status 컬럼이 초기에 균등했는데, 시간이 지나 `PAID`가 95%가 되면 histogram은 더 이상 현실을 잘 나타내지 못한다.  \n이건 통계가 틀렸다는 뜻이 아니라, **통계의 기준 시점이 지나갔다**는 뜻이다.\n\n### 2. auto-analyze는 왜 즉시 갱신이 아닌가\n\n통계 갱신은 공짜가 아니다.  \n매 변경마다 바로 다시 분석하면 운영 비용이 커진다.\n\n그래서 엔진은 보통 일정한 변경량이나 조건을 보고 자동 갱신 여부를 판단한다.\n\n- InnoDB persistent statistics는 대체로 일정 비율의 변경 후 다시 계산을 고려한다\n- 정확한 임계치는 버전과 설정에 따라 달라질 수 있다\n- 즉각성과 비용 사이의 절충이다\n\n### 3. drift를 놓치면 어떤 plan이 깨지나\n\nhistogram drift가 생기면 다음이 흔들린다.\n\n- 인덱스 선택\n- join order\n- skip scan 유무\n- filesort vs index order\n\n그래서 plan regression이 생겼을 때 histograms와 auto-analyze 주기를 먼저 본다.\n\n### 4. auto-analyze만 믿지 말아야 하는 이유\n\n자동 갱신은 늦을 수 있다.  \n배포 직후, 이벤트 직후, 데이터 적재 직후처럼 분포가 크게 바뀌는 순간은 수동 ANALYZE가 더 안전하다.\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `histogram drift`\n- `auto analyze threshold`\n- `persistent statistics`\n- `distribution shift`\n- `ANALYZE TABLE`\n- `optimizer misestimate`\n\n## 실전 시나리오\n\n### 시나리오 1. 배포 후 특정 목록 쿼리만 느려졌다\n\n쿼리 구조는 같아도 분포가 바뀌면 optimizer가 다른 인덱스를 고를 수 있다.  \n이때는 히스토그램 drift와 stats refresh 여부를 먼저 본다.\n\n### 시나리오 2. 상태값이 한쪽으로 몰렸다\n\nstatus, type, flag 같은 컬럼은 시간이 지나면 거의 한쪽으로 쏠릴 수 있다.  \n자동 갱신만 기다리면 plan이 오래 틀어진 상태로 남을 수 있다.\n\n### 시나리오 3. 통계는 있는데 plan이 여전히 이상하다\n\nhistogram이 있어도 query shape가 바뀌면 잘 못 쓸 수 있다.  \n그렇기 때문에 인덱스와 통계를 함께 봐야 한다.\n\n## 코드로 보기\n\n### 히스토그램 확인\n\n```sql\nSELECT *\nFROM information_schema.column_statistics\nWHERE schema_name = 'mydb'\n  AND table_name = 'orders';\n```\n\n### 통계 갱신\n\n```sql\nANALYZE TABLE orders UPDATE HISTOGRAM ON status WITH 32 BUCKETS;\n```\n\n### 자동 재계산 관련 변수\n\n```sql\nSHOW VARIABLES LIKE 'innodb_stats_auto_recalc';\nSHOW VARIABLES LIKE 'innodb_stats_persistent';\n```\n\n### plan 비교\n\n```sql\nEXPLAIN ANALYZE\nSELECT id, status\nFROM orders\nWHERE status = 'PAID'\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| auto-analyze 의존 | 운영이 단순하다 | drift를 늦게 잡을 수 있다 | 분포 변화가 느릴 때 |\n| 수동 ANALYZE | 빠르게 plan을 되돌릴 수 있다 | 운영 작업이 추가된다 | 배포/적재 후 |\n| histogram 재생성 | skew 추정이 좋아진다 | 관리가 필요하다 | 편중이 심할 때 |\n\n핵심은 histogram을 \"만든 뒤 끝\"으로 보지 말고, **분포가 바뀔 때마다 다시 맞춰야 하는 옵티마이저 입력**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: histogram drift는 왜 생기나요?\n> 의도: 분포 변화와 통계 기준 시점의 차이를 아는지 확인\n> 핵심: 데이터 분포가 바뀌는데 통계가 따라가지 못하기 때문이다\n\n> Q: auto-analyze를 왜 무조건 기다리면 안 되나요?\n> 의도: 자동 갱신의 지연을 이해하는지 확인\n> 핵심: 임계치 기반이라 즉시 반영되지 않을 수 있다\n\n> Q: histogram이 있어도 plan이 틀릴 수 있나요?\n> 의도: histogram을 만능으로 보지 않는지 확인\n> 핵심: query shape와 분포 변화에 따라 여전히 빗나갈 수 있다\n\n## 한 줄 정리\n\nhistogram drift는 분포 변화로 통계가 낡는 현상이고, auto-analyze는 그 drift를 늦게 잡기 때문에 중요한 지점에서는 수동 ANALYZE가 필요하다.\n",
   "aliases": [
+    "왜 배포 후 실행 계획이 바뀌어요",
+    "Histogram Drift and Auto-Analyze 개념",
+    "Histogram Drift and Auto-Analyze 정리",
+    "Histogram Drift and Auto-Analyze 실수",
+    "Histogram Drift and Auto-Analyze 판단 기준",
     "histogram drift",
     "auto analyze threshold",
     "analyze table timing",
     "cardinality drift",
     "stale statistics",
     "plan drift after deploy",
-    "distribution shift",
-    "rows estimate mismatch",
-    "왜 배포 후 실행 계획이 바뀌어요"
+    "distribution shift"
   ],
   "expected_queries": [
     "histogram drift는 왜 생기고 언제 ANALYZE를 다시 해야 해?",
@@ -49,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/histogram-drift-auto-analyze-thresholds.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

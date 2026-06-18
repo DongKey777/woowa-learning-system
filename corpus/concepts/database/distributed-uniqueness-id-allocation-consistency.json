@@ -6,16 +6,18 @@
   "summary": "분산 환경에서 “유일해야 한다”는 요구는 단순한 생성 문제가 아니라, 충돌을 언제 발견하고 어떻게 회수할지의 문제다.",
   "body_markdown": "# Distributed Uniqueness와 ID Allocation Consistency\n\n> 한 줄 요약: 분산 환경에서 “유일해야 한다”는 요구는 단순한 생성 문제가 아니라, 충돌을 언제 발견하고 어떻게 회수할지의 문제다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md), [Hot Row Contention과 Counter Sharding](./hot-row-contention-counter-sharding.md), [Replication Failover and Split Brain](./replication-failover-split-brain.md)\nretrieval-anchor-keywords: distributed uniqueness, id allocation, unique constraint, ULID, snowflake, ticket pool\n\n## 핵심 개념\n\n분산 시스템에서 유일한 ID나 비즈니스 키를 만들 때는 단순히 숫자만 늘리면 끝나지 않는다.  \n문제는 생성 이후의 정합성이다.\n\n왜 중요한가:\n\n- 주문번호, 결제번호, 발급 토큰이 충돌하면 회복이 어렵다\n- 여러 인스턴스가 동시에 발급하면 중앙 시퀀스가 병목이 된다\n- failover나 재시도 상황에서 중복 생성이 뒤늦게 발견되면 더 복잡해진다\n\n즉 distributed uniqueness는 “생성”보다 **충돌 회피 + 충돌 감지 + 충돌 회수**를 함께 설계해야 한다.\n\n## 깊이 들어가기\n\n### 1. 유일성은 어디에서 강제해야 하나\n\n유일성은 보통 세 군데에서 강제할 수 있다.\n\n- DB unique constraint\n- 별도 allocator service\n- 애플리케이션에서 생성 규칙을 분산 합의로 관리\n\n가장 강한 보장은 DB constraint지만, 완전한 성능 확장성은 낮을 수 있다.  \n반대로 애플리케이션 생성은 빠르지만 collision 회수 로직이 중요해진다.\n\n### 2. 자동 증가 ID의 함정\n\n단일 auto-increment는 단순하지만 분산에서 병목이 된다.\n\n- 한 DB가 단일 발급원이 된다\n- failover 시 발급 순서가 뒤틀릴 수 있다\n- replicate 환경에서 번호 의미를 오해하면 안 된다\n\n숫자가 크다고 최신 데이터라는 보장은 없다.  \nID는 정렬 힌트일 뿐, 비즈니스 진실이 아니다.\n\n### 3. 분산 ID 방식의 차이\n\n- UUID: 충돌이 사실상 없지만 크고 정렬성이 약하다\n- ULID/K-Sortable ID: 분산성과 정렬성을 어느 정도 같이 노린다\n- Snowflake류: 시간 + worker + sequence로 빠르게 만든다\n\n이들은 모두 “충돌 가능성을 얼마나 낮출 것인가”의 다른 답이다.\n\n### 4. ticket pool과 range allocation\n\n중앙 서버가 한 건씩 발급하지 않고, 미리 범위를 묶어서 각 노드에 나눠 줄 수 있다.\n\n- `1~1000`은 A 노드\n- `1001~2000`은 B 노드\n\n이 방식은 병목을 줄이지만, 노드 장애 시 잔여 범위 처리와 회수가 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 주문번호가 중복 생성됨\n\n애플리케이션이 자체적으로 ID를 만들다가 재시도와 충돌이 겹치면, 같은 주문번호가 두 번 시도될 수 있다.  \n이 경우 DB unique constraint가 마지막 방어선이 된다.\n\n### 시나리오 2: failover 직후 시퀀스가 꼬인 것처럼 보임\n\n새 primary에서 발급 순서가 이전과 다르게 보일 수 있다.  \n하지만 순서와 유일성은 별개다.\n\n### 시나리오 3: 여러 인스턴스가 같은 prefix를 쓰는 설계 실수\n\nworker ID를 잘못 배포하면 Snowflake 류 ID가 충돌한다.  \n이건 코드보다 운영 설정 문제로 더 자주 발생한다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE orders (\n  id BIGINT PRIMARY KEY,\n  business_order_no VARCHAR(40) NOT NULL,\n  UNIQUE KEY uk_business_order_no (business_order_no)\n);\n```\n\n```java\n// ID 발급은 빠르더라도, 충돌 가능성을 완전히 0으로 믿지 않는다.\nString orderNo = idGenerator.next();\ntry {\n    orderRepository.save(orderNo);\n} catch (DuplicateKeyException e) {\n    throw new IllegalStateException(\"duplicate order number\", e);\n}\n```\n\n```text\ngood:\n  generate fast -> verify uniqueness -> commit once\n\nbad:\n  generate fast -> assume unique forever -> discover collision later\n```\n\n분산 ID는 생성 전략이고, unique constraint는 회수 전략이다. 둘을 같이 써야 안전하다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| DB auto-increment | 가장 단순하다 | 단일 병목이 된다 | 단일 primary, 낮은 규모 |\n| UUID | 충돌 걱정이 거의 없다 | 길고 인덱스 비용이 있다 | 분산 생성이 필요할 때 |\n| ULID/Snowflake | 정렬성과 분산성을 같이 노린다 | worker 설정이 중요하다 | 고성능 분산 발급 |\n| ticket pool | 발급 throughput이 높다 | 회수와 장애 처리가 필요하다 | 대량 ID 선점 |\n\n## 꼬리질문\n\n> Q: 분산 ID가 유일하면 unique constraint가 필요 없나요?\n> 의도: 생성과 보장을 구분하는지 확인\n> 핵심: 생성이 안전해도 마지막 방어선으로 constraint가 필요하다\n\n> Q: auto-increment가 왜 분산에 불리한가요?\n> 의도: 단일 발급원 병목을 이해하는지 확인\n> 핵심: 한 노드가 발급 경로가 되면서 확장성이 떨어진다\n\n> Q: ID의 정렬성과 비즈니스 정합성을 같은 것으로 봐도 되나요?\n> 의도: ID 의미 오해를 알아보는지 확인\n> 핵심: 번호 순서와 최신성/정합성은 별개다\n\n## 한 줄 정리\n\n분산 유일성은 ID를 빨리 만드는 문제가 아니라, 충돌이 생겨도 DB 제약과 회수 로직으로 안전하게 마무리하는 문제다.\n",
   "aliases": [
+    "분산 유일성",
+    "주문번호 중복",
+    "Distributed Uniqueness와 ID Allocation 개념",
+    "Distributed Uniqueness와 ID Allocation 정리",
+    "Distributed Uniqueness와 ID Allocation 실수",
     "distributed uniqueness",
     "id allocation consistency",
     "distributed id allocation",
     "unique constraint fallback",
     "ULID snowflake ticket pool",
     "business key collision",
-    "distributed id collision",
-    "분산 유일성",
-    "주문번호 중복",
-    "ticket pool allocation"
+    "distributed id collision"
   ],
   "expected_queries": [
     "분산 환경에서 주문번호 유일성은 ID 생성만으로 충분하지 않은 이유가 뭐야?",
@@ -50,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/distributed-uniqueness-id-allocation-consistency.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

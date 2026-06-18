@@ -6,16 +6,18 @@
   "summary": "이 문서는 Saga pivot transaction, compensation boundary, irreversible step, forward recovery를 distributed workflow 설계 관점으로 설명하는 advanced deep dive다.",
   "body_markdown": "# Saga Pivot Transaction Design\n\n> 한 줄 요약: Saga의 pivot transaction은 되돌리기 어려운 경계선이라, 그 전과 후의 실패 처리 방식이 완전히 달라진다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md), [Saga Reservation Consistency와 예약 상태 전이](./saga-reservation-consistency.md), [Exactly-Once 신화와 DB + Queue 경계](./exactly-once-myths-db-queue.md)\nretrieval-anchor-keywords: saga pivot, pivot transaction, compensation, forward recovery, irreversible step\n\n## 핵심 개념\n\nSaga는 여러 로컬 트랜잭션을 순서대로 실행하고, 실패하면 보상 작업으로 되돌리는 흐름이다.  \n그중 pivot transaction은 “여기까지는 되돌릴 수 있지만, 여기부터는 되돌리기 어렵다”는 경계다.\n\n왜 중요한가:\n\n- 결제 승인, 재고 홀드, 외부 예약 확정 같은 단계는 되돌리기 어렵다\n- pivot 이전 실패는 보상으로 처리할 수 있어도, pivot 이후는 forward recovery가 필요할 수 있다\n- pivot을 잘못 잡으면 보상 가능 구간과 불가 구간이 섞여 사고가 난다\n\n즉 pivot은 Saga의 기술 용어이면서, 실제로는 **업무적으로 되돌림 가능성이 끊기는 지점**이다.\n\n## 깊이 들어가기\n\n### 1. pivot이 필요한 이유\n\n모든 단계가 똑같이 되돌릴 수 있는 것은 아니다.\n\n- 주문 생성은 취소 가능할 수 있다\n- 재고 예약은 해제 가능할 수 있다\n- 결제 승인 이후는 환불 프로세스가 필요하다\n\n그래서 Saga는 단계들을 아무렇게나 나누지 않고, pivot을 기준으로 실패 처리 전략을 바꾼다.\n\n### 2. before pivot과 after pivot\n\nbefore pivot:\n\n- 실패하면 이전 단계들을 보상하면 된다\n- 아직 최종 의사결정 전이다\n\nafter pivot:\n\n- 실패하면 단순 롤백이 아니라 보상 또는 후속 처리 필요\n- 외부 시스템이 이미 결과를 본 상태일 수 있다\n\n이 차이를 모르고 “같이 롤백”하려 하면 정합성이 깨진다.\n\n### 3. pivot을 어디에 둘까\n\n보통 다음을 기준으로 둔다.\n\n- 되돌리기 비용\n- 외부 시스템 반영 여부\n- 사용자에게 이미 보였는지\n- 후속 작업의 비용\n\n가장 중요한 것은 기술 편의보다 **비즈니스 되돌림 가능성**이다.\n\n### 4. pivot 이후의 복구\n\nafter pivot 실패는 보상 작업만으로 끝나지 않을 수 있다.\n\n- 환불 요청\n- 재고 재조정\n- 운영자 수동 개입\n\n이 구간은 forward recovery와 운영 절차까지 포함해서 설계해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 생성 후 결제 승인 직전 실패\n\npivot 전이라면 주문만 취소하면 된다.  \n보상 비용이 상대적으로 낮다.\n\n### 시나리오 2: 결제 승인 후 재고 차감 실패\n\npivot 이후 실패다.  \n단순 롤백이 아니라 결제 취소나 보상 작업이 필요하다.\n\n### 시나리오 3: 외부 배송 예약 후 내부 저장 실패\n\n외부가 이미 상태를 바꿨다면, 내부 트랜잭션만 되돌릴 수 없다.  \npivot 이후는 회복 절차가 핵심이다.\n\n## 코드로 보기\n\n```java\nreserveInventory();\n// pivot: 결제 승인 이후는 되돌리기 어려운 경계\napprovePayment();\ntry {\n    confirmOrder();\n} catch (Exception e) {\n    compensatePayment();\n    releaseInventory();\n    throw e;\n}\n```\n\n```text\nbefore pivot:\n  rollback with compensation is acceptable\n\nafter pivot:\n  forward recovery or manual intervention may be required\n```\n\npivot은 “중간에 중요한 단계가 있다”가 아니라, **되돌림의 성격이 바뀌는 경계**다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| pivot 앞에 큰 작업 배치 | 보상이 쉽다 | 후속 처리가 늘어난다 | 되돌림 가능성을 우선할 때 |\n| pivot을 늦게 둠 | 최종 확정이 늦어진다 | 보상 범위가 넓어진다 | 사용자 확정 전에 검증이 많을 때 |\n| pivot을 빨리 둠 | 상태가 빨리 고정된다 | 복구가 어려워진다 | 외부 시스템 연동이 많은 경우 |\n| pivot + 운영 보상 | 강하다 | 복잡하다 | 고가치 비즈니스 |\n\n## 꼬리질문\n\n> Q: Saga의 pivot transaction은 왜 중요한가요?\n> 의도: 되돌릴 수 있는 구간과 아닌 구간을 구분하는지 확인\n> 핵심: 실패 처리 전략이 pivot 전후로 달라지기 때문이다\n\n> Q: pivot 이후 실패는 왜 단순 rollback이 아닌가요?\n> 의도: 외부 부작용과 되돌림 비용을 아는지 확인\n> 핵심: 이미 외부에 반영된 상태가 있을 수 있다\n\n> Q: pivot은 어떻게 정하나요?\n> 의도: 기술이 아니라 비즈니스 경계로 생각하는지 확인\n> 핵심: 되돌림 비용과 외부 반영 시점을 기준으로 정한다\n\n## 한 줄 정리\n\nSaga의 pivot transaction은 보상 가능 구간과 불가 구간을 나누는 경계이며, 그 이후 실패는 rollback이 아니라 recovery 문제다.\n",
   "aliases": [
+    "보상 트랜잭션 경계",
+    "Saga Pivot Transaction Design 개념",
+    "Saga Pivot Transaction Design 정리",
+    "Saga Pivot Transaction Design 실수",
+    "Saga Pivot Transaction Design 판단 기준",
     "saga pivot",
     "pivot transaction",
     "irreversible step",
     "compensation boundary",
     "forward recovery",
     "saga rollback boundary",
-    "business rollback boundary",
-    "payment pivot",
-    "external side effect boundary",
-    "보상 트랜잭션 경계"
+    "business rollback boundary"
   ],
   "expected_queries": [
     "Saga pivot transaction은 왜 보상 가능 구간과 forward recovery 구간을 나누는 경계야?",
@@ -52,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/saga-pivot-transaction-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

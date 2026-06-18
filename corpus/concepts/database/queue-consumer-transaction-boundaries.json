@@ -6,16 +6,18 @@
   "summary": "이 문서는 queue consumer에서 DB commit과 broker ack boundary를 맞추고 duplicate delivery, message loss, poison message, transactional inbox를 다루는 advanced playbook이다.",
   "body_markdown": "# Queue Consumer Transaction Boundaries\n\n> 한 줄 요약: 소비자 트랜잭션은 메시지 ack와 DB commit의 경계를 잘못 잡는 순간 중복과 유실을 동시에 만든다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Transaction Boundary, Isolation, and Locking Decision Framework](./transaction-boundary-isolation-locking-decision-framework.md), [Exactly-Once 신화와 DB + Queue 경계](./exactly-once-myths-db-queue.md), [Transactional Inbox와 Dedup Design](./transactional-inbox-dedup-design.md), [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md), [Queue Claim with `SKIP LOCKED`, Fairness, and Starvation Trade-offs](./queue-claim-skip-locked-fairness.md)\nretrieval-anchor-keywords: queue consumer transaction, ack boundary, commit boundary, message processing, consumer retry, skip locked, queue claim\n\n## 핵심 개념\n\nQueue consumer는 메시지를 받고, 비즈니스 처리를 수행한 뒤, ack를 보내는 흐름을 가진다.\n이때 트랜잭션 경계를 어디에 두느냐가 정합성을 좌우한다.\n\n왜 중요한가:\n\n- ack 전에 죽으면 메시지가 다시 올 수 있다\n- commit 전에 ack하면 메시지를 잃을 수 있다\n- 처리 범위를 너무 넓히면 락과 시간 비용이 커진다\n\n소비자 트랜잭션은 단순히 DB를 감싸는 것이 아니라, **메시지 전달과 상태 저장의 경계를 조정하는 일**이다.\n\n## 깊이 들어가기\n\n### 1. ack와 commit의 순서\n\n가장 흔한 원칙은 `commit -> ack`다.\n\n- DB 변경이 먼저 확정된다\n- 그 다음 메시지를 처리 완료로 알린다\n\n이 순서를 바꾸면 메시지 유실이 생길 수 있다.\n다만 claim 단계에서 `SKIP LOCKED`를 쓰는 경우, 처리 순서와 fairness는 별도 문제로 분리해서 봐야 한다.\n\n### 2. 트랜잭션을 너무 크게 잡으면\n\n- 메시지 하나 처리 중 lock이 오래 유지된다\n- DB가 느려지면 브로커 ack도 늦어진다\n- 실패 시 재시도가 무거워진다\n\n즉 소비자 트랜잭션은 가능한 짧아야 한다.\n\n### 3. 중간 처리와 외부 호출\n\n소비자가 외부 API를 호출해야 한다면 더 조심해야 한다.\n\n- 외부 호출 전 DB commit이 끝났는지\n- 외부 호출 실패 시 재시도 전략이 있는지\n- 중복 호출이 허용되는지\n\n외부 side effect는 트랜잭션 경계 밖으로 빼거나 outbox/consumer idempotency와 같이 설계해야 한다.\n\n### 4. poison message\n\n반복 실패하는 메시지는 무한 retry하면 안 된다.\n\n- DLQ로 보낸다\n- 실패 사유를 저장한다\n- 수동 재처리 경로를 둔다\n\n## 실전 시나리오\n\n### 시나리오 1: DB commit 전에 ack를 보내버림\n\n브로커는 처리 완료로 생각하지만 DB는 반영되지 않는다.\n이건 메시지 유실이다.\n\n### 시나리오 2: ack 전에 죽어서 같은 메시지가 다시 옴\n\n처리 완료가 이미 저장돼 있으면 inbox dedup으로 방어해야 한다.\n\n### 시나리오 3: 외부 호출이 긴 소비자\n\n트랜잭션이 길어지면 ack도 늦고 재시도도 폭주한다.\n이런 경우 경계를 더 잘게 나누어야 한다.\n\n## 재현/트리아지/실패 매트릭스/검증\n\n재현(repro)은 소비자를 일부러 끊는 위치를 나눠서 본다.\n\n| 끊는 위치 | 기대 관측 | 확인할 보장 |\n|---|---|---|\n| DB commit 전 | 메시지가 다시 오고 DB 변경은 없어야 한다 | DB transaction rollback |\n| DB commit 후 ack 전 | 메시지가 다시 올 수 있고 dedup이 막아야 한다 | broker는 at-least-once일 수 있음 |\n| ack 후 DB commit 전 | 데이터 유실 가능성이 보여야 한다 | ack는 DB commit을 보장하지 않음 |\n| 외부 호출 성공 후 DB commit 실패 | 외부 side effect 중복/보상 문제가 보여야 한다 | DB transaction은 외부 API를 rollback하지 않음 |\n\n트리아지(triage)는 \"어디까지 commit됐나\"를 먼저 복원한다.\n\n1. message id, consumer group, delivery attempt를 찾는다.\n2. inbox/dedup row가 있는지 본다.\n3. business row와 outbox row가 같은 DB transaction에 기록됐는지 확인한다.\n4. ack가 commit 이후에 호출됐는지 로그 순서를 본다.\n5. 외부 호출이 DB transaction 안에서 오래 connection을 잡았는지 본다.\n\n실패 매트릭스(failure matrix)는 이렇게 둔다.\n\n| 증상 | 흔한 원인 | 고칠 방향 |\n|---|---|---|\n| 처리됐는데 메시지가 또 옴 | commit 후 ack 전 crash | inbox unique key와 멱등 handler로 닫는다 |\n| 메시지는 사라졌는데 DB 반영 없음 | ack가 commit보다 먼저 나감 | ack는 commit 성공 후에만 보낸다 |\n| consumer lag와 DB lock wait가 같이 증가 | 긴 transaction 안 외부 호출 | 외부 호출을 outbox 이후 단계로 뺀다 |\n| 같은 poison message가 계속 재시도 | 실패 분류 없이 무한 retry | retry budget, dead-letter queue, 수동 복구 상태를 둔다 |\n\n검증(validation)은 \"정확히 한 번(exactly once)\"이라는 말을 쓰기 전에 통합 범위를 확인하는 것이다. DB와 broker를 XA/transactional broker로 실제 묶지 않았다면 보통 보장은 **DB 안의 원자성 + 메시지 중복을 견디는 멱등성(idempotency)** 이다. crash injection 테스트에서 재전달, 중복 처리, poison 격리가 모두 기대한 상태로 남아야 한다.\n\n## 코드로 보기\n\n```java\ntry {\n    tx.begin();\n    handleMessage(event);\n    tx.commit();\n    broker.ack(message);\n} catch (Exception e) {\n    tx.rollback();\n    broker.nack(message);\n}\n```\n\n```text\nbad:\n  ack first -> commit later\n\ngood:\n  commit first -> ack later\n```\n\nqueue consumer의 핵심은 메시지 처리와 ack의 경계를 정확히 잡아 **유실과 중복을 동시에 피하는 것**이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| commit then ack | 안전하다 | 약간 늦을 수 있다 | 일반적 해법 |\n| ack then commit | 빠르다 | 유실 위험이 있다 | 거의 없음 |\n| large transaction | 단순하다 | 락과 재시도 비용이 크다 | 드문 경우 |\n| inbox + short tx | 강하다 | 구현이 복잡하다 | 중요한 소비자 |\n\n## 꼬리질문\n\n> Q: consumer에서 왜 commit과 ack 순서가 중요한가요?\n> 의도: 유실과 중복을 동시에 이해하는지 확인\n> 핵심: 순서가 뒤집히면 메시지 유실 또는 중복이 생긴다\n\n> Q: 소비자 트랜잭션을 크게 잡으면 왜 안 좋은가요?\n> 의도: 락과 재시도 비용을 아는지 확인\n> 핵심: 처리 시간이 길어지고 ack가 늦어진다\n\n> Q: poison message는 어떻게 다뤄야 하나요?\n> 의도: 무한 retry의 위험을 아는지 확인\n> 핵심: DLQ와 수동 재처리 경로가 필요하다\n\n## 한 줄 정리\n\nQueue consumer의 트랜잭션 경계는 commit과 ack의 순서를 안전하게 맞추는 일이며, 보통 `commit -> ack`가 기본이다.\n",
   "aliases": [
+    "ack then commit 위험",
+    "메시지 ack DB commit 순서",
+    "Queue Consumer Transaction Boundaries 개념",
+    "Queue Consumer Transaction Boundaries 정리",
+    "Queue Consumer Transaction Boundaries 실수",
     "queue consumer transaction",
     "ack boundary",
     "commit boundary",
     "message processing",
     "consumer retry",
     "poison message",
-    "commit then ack",
-    "ack then commit 위험",
-    "consumer transaction boundary",
-    "메시지 ack DB commit 순서"
+    "commit then ack"
   ],
   "expected_queries": [
     "queue consumer에서 DB commit과 message ack 순서를 왜 commit then ack로 잡아야 해?",
@@ -51,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/queue-consumer-transaction-boundaries.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

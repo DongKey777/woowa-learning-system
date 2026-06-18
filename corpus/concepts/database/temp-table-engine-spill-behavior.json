@@ -6,16 +6,18 @@
   "summary": "temp table은 내부 작업공간이고, 어떤 엔진을 쓰느냐보다 언제 디스크로 spill 되느냐가 성능을 가른다.",
   "body_markdown": "# Temporary Table Engine Choice and Spill Behavior\n\n> 한 줄 요약: temp table은 내부 작업공간이고, 어떤 엔진을 쓰느냐보다 언제 디스크로 spill 되느냐가 성능을 가른다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: temporary table engine, in-memory temp table, on-disk temp table, spill behavior, internal temp table, TempTable engine, using temporary, using temporary using filesort, Created_tmp_tables, Created_tmp_disk_tables, temp table spill, group by temp table, distinct temp table, derived table materialization spill, tmp_table_size, max_heap_table_size, internal_tmp_mem_storage_engine, explain extra using temporary, rows are not huge but temp table spills, temp table disk fallback, 임시 테이블 엔진, 임시 테이블 spill\n\n## 핵심 개념\n\n- 관련 문서:\n  - [Sort Buffer, Temporary Table, and Spill Behavior](./sort-buffer-temp-table-spill.md)\n  - [Index Condition Pushdown, Filesort, Temporary Table](./index-condition-pushdown-filesort-temporary-table.md)\n  - [쿼리 튜닝 체크리스트](./query-tuning-checklist.md)\n  - [느린 쿼리 분석 플레이북](./slow-query-analysis-playbook.md)\n  - [Hash Join, Materialization, Join Buffer](./hash-join-materialization-join-buffer.md)\n\n## 이 문서가 맡는 EXPLAIN 범위\n\n이 문서는 `Using temporary`가 보일 때 \"임시 테이블이 생긴다\"를 넘어서 **어떤 internal temp table 경로가 spill을 만들었는가**를 읽는 세부 entry다.\n\n| 보이는 신호 | 여기서 바로 보는 것 | 먼저 돌아갈 문서 |\n| --- | --- | --- |\n| `Using temporary`와 `Created_tmp_disk_tables`가 같이 문제로 보임 | memory temp table 한계, row width, disk fallback 조건 | [Sort Buffer, Temporary Table, and Spill Behavior](./sort-buffer-temp-table-spill.md) |\n| `Using filesort`가 주증상이고 temp table은 부차적임 | 정렬 경로와 인덱스 순서 해석 | [Index Condition Pushdown, Filesort, Temporary Table](./index-condition-pushdown-filesort-temporary-table.md) |\n| `type = ALL`, `key = NULL`이라 temp table 이전에 스캔 폭이 과함 | 접근 경로와 sargability부터 재확인 | [인덱스와 실행 계획](./index-and-explain.md), [쿼리 튜닝 체크리스트](./query-tuning-checklist.md) |\n| `rows` 추정치나 plan drift 때문에 temp table 선택이 흔들림 | 통계와 cardinality 문제를 먼저 분리 | [Statistics, Histograms, and Cardinality Estimation](./statistics-histograms-cardinality-estimation.md) |\n\nMySQL의 내부 temporary table은 `GROUP BY`, `DISTINCT`, 파생 테이블, 정렬 중간 결과 등을 위해 쓰인다.  \n이때 핵심은 \"temp table을 쓰는가\"가 아니라, **어떤 엔진으로 유지되다가 언제 disk spill이 되는가**다.\n\n메모리 temp table은 빠르지만 제한이 있고, 디스크 temp table은 느리지만 버틸 수 있다.\n\n## 깊이 들어가기\n\n### 1. temp table은 왜 필요한가\n\n쿼리를 한 번에 결과로 못 만들면 중간 결과를 저장해야 한다.\n\n- `GROUP BY` 결과를 합쳐야 할 때\n- `DISTINCT` 중복 제거가 필요할 때\n- 파생 테이블을 재사용할 때\n- 조인/정렬 후 다시 정리해야 할 때\n\n### 2. 메모리 temp table과 디스크 temp table의 차이\n\n메모리 temp table은 빠르지만, row width와 row count가 커지면 한계를 넘는다.  \n그 경계를 넘으면 디스크로 spill된다.\n\n실무에서 볼 신호:\n\n- `Using temporary`\n- `Created_tmp_tables`\n- `Created_tmp_disk_tables`\n\n### 3. 엔진 선택이 항상 직접 드러나지는 않는다\n\nMySQL 버전과 설정에 따라 internal temp table의 구현이 달라질 수 있다.  \n하지만 운영 감각은 동일하다.\n\n- 메모리 안에서 끝나면 좋다\n- spill이 나면 디스크 I/O가 섞인다\n- row가 넓으면 더 빨리 spill된다\n\n### 4. 어떤 쿼리가 spill을 유발하나\n\n- 넓은 `SELECT *`\n- 큰 `GROUP BY`\n- `ORDER BY`와 `DISTINCT`의 결합\n- 조인 후 중간 결과가 큰 경우\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `temporary table engine`\n- `internal temp table`\n- `spill behavior`\n- `Created_tmp_disk_tables`\n- `tmp_table_size`\n- `max_heap_table_size`\n\n## 실전 시나리오\n\n### 시나리오 1. 집계 쿼리가 작은 데이터에서도 느리다\n\nrow 수는 많지 않은데도 느리다면 row width가 넓어 temp table이 spill되고 있을 수 있다.  \n필요 컬럼만 줄이는 것만으로도 효과가 크다.\n\n### 시나리오 2. 평소엔 메모리에서 끝나는데 특정 날만 느리다\n\n데이터 분포가 바뀌거나 특정 상태값이 몰리면 temp table이 디스크로 떨어질 수 있다.  \n통계와 분포를 같이 봐야 한다.\n\n### 시나리오 3. `DISTINCT`가 생각보다 무겁다\n\n중복 제거는 단순 비교가 아니라 정리 작업이다.  \n인덱스와 맞지 않으면 temp table이 커질 수 있다.\n\n## 코드로 보기\n\n### 설정 확인\n\n```sql\nSHOW VARIABLES LIKE 'tmp_table_size';\nSHOW VARIABLES LIKE 'max_heap_table_size';\nSHOW VARIABLES LIKE 'internal_tmp_mem_storage_engine';\n```\n\n### spill 관찰\n\n```sql\nSHOW STATUS LIKE 'Created_tmp_tables';\nSHOW STATUS LIKE 'Created_tmp_disk_tables';\n```\n\n### 예시 쿼리\n\n```sql\nEXPLAIN ANALYZE\nSELECT status, COUNT(*)\nFROM orders\nGROUP BY status\nORDER BY COUNT(*) DESC;\n```\n\n### row width 줄이기\n\n```sql\nSELECT status, COUNT(*)\nFROM orders\nWHERE created_at >= '2026-04-01'\nGROUP BY status;\n```\n\n필요 없는 컬럼을 덜 들고 가면 spill 가능성이 줄어든다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| memory temp table 유지 | 빠르다 | 메모리 한계를 넘으면 spill된다 | 작은 중간 결과 |\n| disk temp table 허용 | 큰 결과도 처리 가능 | I/O 비용이 증가한다 | 큰 집계/정렬 |\n| row width 축소 | spill 가능성을 줄인다 | 쿼리 수정이 필요하다 | API 응답 컬럼이 많을 때 |\n| tmp table 한도 증가 | 메모리 체류를 늘린다 | 전체 메모리 압박이 생길 수 있다 | 동시성이 낮고 여유 메모리가 있을 때 |\n\n핵심은 temp table을 없애는 게 아니라, **spill 전에 끝내도록 결과 폭을 제어하는 것**이다.\n\n## 꼬리질문\n\n> Q: internal temp table이 왜 생기나요?\n> 의도: 중간 결과가 필요한 이유를 이해하는지 확인\n> 핵심: 한 번에 최종 결과를 만들 수 없을 때 쓰기 때문이다\n\n> Q: spill이 왜 위험한가요?\n> 의도: 메모리와 디스크 경계의 의미를 아는지 확인\n> 핵심: 디스크 I/O가 섞이면서 latency가 급격히 늘 수 있다\n\n> Q: temp table을 줄이려면 무엇부터 보나요?\n> 의도: 쿼리 구조와 row width를 먼저 보는지 확인\n> 핵심: 필요한 컬럼과 필터 범위를 먼저 줄인다\n\n## 한 줄 정리\n\ntemporary table은 중간 결과를 관리하는 내부 작업공간이고, 메모리 한계를 넘는 순간 spill이 성능을 지배한다.\n",
   "aliases": [
+    "Temporary Table Engine Choice 개념",
+    "Temporary Table Engine Choice 정리",
+    "Temporary Table Engine Choice 실수",
+    "Temporary Table Engine Choice 판단 기준",
+    "데이터베이스 Temporary Table Engine Choice",
     "temporary table engine",
     "internal temp table",
     "temp table spill",
     "in-memory temp table",
     "on-disk temp table",
     "TempTable engine",
-    "Created_tmp_disk_tables",
-    "tmp_table_size",
-    "max_heap_table_size",
-    "Using temporary"
+    "Created_tmp_disk_tables"
   ],
   "expected_queries": [
     "Using temporary와 Created_tmp_disk_tables가 같이 늘면 temp table spill을 어떻게 분석해야 해?",
@@ -50,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/temp-table-engine-choice-spill-behavior.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

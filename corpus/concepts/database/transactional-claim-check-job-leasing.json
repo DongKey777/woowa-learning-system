@@ -6,16 +6,18 @@
   "summary": "이 문서는 transactional claim-check와 job leasing을 payload reference, lease row, work claim, worker ownership, takeover/fencing 관점으로 설명하는 advanced playbook이다.",
   "body_markdown": "# Transactional Claim-Check와 Job Leasing\n\n> 한 줄 요약: claim-check는 큰 작업 본문을 안전하게 분리해 두고, job leasing은 그 작업을 한 worker만 처리하게 만든다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [DB Lease와 Fencing Token](./db-lease-fencing-coordination.md), [Transactional Inbox와 Dedup Design](./transactional-inbox-dedup-design.md), [Exactly-Once 신화와 DB + Queue 경계](./exactly-once-myths-db-queue.md), [Queue Claim with `SKIP LOCKED`, Fairness, and Starvation Trade-offs](./queue-claim-skip-locked-fairness.md)\nretrieval-anchor-keywords: claim-check, job leasing, payload reference, work claim, lease row, skip locked, job ownership\n\n## 핵심 개념\n\nTransactional claim-check는 큰 payload를 직접 전달하지 않고, DB나 object storage에 저장한 뒤 참조만 넘기는 방식이다.\nJob leasing은 그 참조를 가진 작업을 한 worker가 일정 기간 독점하도록 만드는 패턴이다.\n\n왜 중요한가:\n\n- 큰 payload를 큐에 그대로 넣으면 중복 전송과 비용이 커진다\n- 동시에 여러 worker가 같은 작업을 집는 것을 막아야 한다\n- 작업 본문과 처리 소유권을 분리하면 복구가 쉬워진다\n\nclaim-check는 “무엇을 처리할지”를 분리하고, leasing은 “누가 처리할지”를 정한다.\n\n## 깊이 들어가기\n\n### 1. claim-check가 필요한 이유\n\n메시지에 본문을 다 넣는 대신:\n\n- payload를 DB나 storage에 저장\n- queue에는 참조 키만 전달\n- worker는 해당 키로 본문을 가져옴\n\n이렇게 하면 큐가 가벼워지고, 본문을 재처리하기 쉬워진다.\n\n### 2. job leasing이 필요한 이유\n\nclaim-check만 있으면 여러 worker가 같은 payload를 동시에 집을 수 있다.\n\n- 같은 job이 두 번 실행될 수 있다\n- 처리 순서가 꼬일 수 있다\n- 중복 side effect가 생길 수 있다\n\njob leasing은 claim row를 선점하고 lease를 갱신하는 방식으로 이를 방지한다.\n\n### 3. claim-check와 inbox의 차이\n\n- claim-check: 작업 본문을 분리하고 참조만 전달\n- inbox: 받은 메시지를 dedup하고 처리 여부를 기록\n\n둘은 함께 쓸 수 있지만 목적이 다르다.\n\n### 4. 실패 처리\n\n- lease 만료 후 다른 worker가 takeover\n- claim row는 처리 상태에 따라 다시 실행 가능\n- payload는 immutable하게 두는 것이 안전하다\n\n## 실전 시나리오\n\n### 시나리오 1: 대용량 리포트 생성\n\n리포트 본문이 크면 큐에 직접 싣기보다 claim-check로 저장하고 job leasing으로 한 worker만 처리하게 한다.\n\n### 시나리오 2: 첨부 파일 처리\n\n파일 참조만 큐에 넘기고, worker가 storage에서 가져와 처리한다.\n동시에 두 worker가 같은 파일을 만지지 않게 lease가 필요하다.\n\n### 시나리오 3: 재시도 중 중복 작업\n\n작업이 timeout되면 다른 worker가 이어받을 수 있어야 한다.\nlease와 claim row가 있으면 takeover가 가능하다.\n\n## 재현 조건\n\n재현(repro)은 worker crash와 lease expiry를 꼭 넣는다.\n\n| 재현 케이스 | 기대 관측 |\n|---|---|\n| payload 저장 후 job row 생성 전 crash | orphan payload를 찾거나 cleanup할 수 있어야 한다 |\n| job lease 획득 후 worker crash | lease timeout 뒤 다른 worker가 claim 가능해야 한다 |\n| lease 만료 직전 오래 걸리는 작업 | heartbeat/renew가 없으면 중복 worker가 생길 수 있다 |\n| output 저장 후 status update 실패 | output key dedup으로 중복 결과가 막혀야 한다 |\n\n## 확인 순서\n\n트리아지는 job row 하나를 기준으로 본다.\n\n1. claim-check payload 위치와 checksum이 유효한지 본다.\n2. job status, lease owner, lease deadline을 확인한다.\n3. worker heartbeat와 실제 작업 로그가 같은 owner인지 맞춘다.\n4. output idempotency key가 job id 또는 payload checksum에 묶였는지 본다.\n5. lease takeover가 필요한 경우 stale worker write를 fencing/output dedup이 막는지 확인한다.\n\n## failure matrix\n\n실패 매트릭스는 이렇게 둔다.\n\n| 증상 | 흔한 원인 | 고칠 방향 |\n|---|---|---|\n| 같은 파일이 두 번 처리됨 | lease 만료 후 중복 worker | output unique key, renew interval, fencing token |\n| job은 done인데 결과가 없음 | status와 output이 다른 transaction/저장소 | done 전 output 존재 검증 |\n| payload만 남고 job이 없음 | claim-check와 job create 사이 crash | transactional outbox 또는 orphan cleanup |\n| worker가 죽었는데 job이 영원히 running | lease deadline 없음 | time-bound lease와 recovery query |\n\n## 검증\n\n검증은 \"한 worker만 실행됐다\"가 아니라 \"두 worker가 실행돼도 최종 결과가 하나\"인지 봐야 한다.\n\n- `job_id` 또는 payload checksum 기준 output unique key가 있다.\n- lease owner가 바뀐 뒤 old owner 완료 write가 거부된다.\n- payload와 job row 생성 사이 crash를 orphan scan으로 찾을 수 있다.\n- `PROCESSING` job 중 lease deadline이 지난 row를 recovery query로 찾을 수 있다.\n- retry/replay 후 business side effect가 한 번만 남는다.\n\nlease는 일정 시간 동안 처리권을 주장하는 장치이지 정확히 한 번(exactly once) 실행 보장이 아니다. DB row lock이나 conditional update가 보장하는 것은 claim 순간의 배타성이고, 긴 외부 작업 전체의 배타성은 lease renew, fencing, output dedup까지 있어야 가까워진다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE job_claims (\n  job_id VARCHAR(100) PRIMARY KEY,\n  payload_ref VARCHAR(200) NOT NULL,\n  owner_id VARCHAR(100) NULL,\n  lease_expires_at DATETIME NULL,\n  status VARCHAR(20) NOT NULL\n);\n```\n\n```java\nif (claimRepository.tryAcquire(jobId, workerId)) {\n    Payload payload = payloadStore.load(payloadRef);\n    process(payload);\n    claimRepository.markDone(jobId);\n}\n```\n\nclaim-check는 payload를 분리하고, leasing은 **같은 작업을 한 번만 처리하게 만드는 소유권 제어**다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| direct queue payload | 단순하다 | 크기와 중복 비용이 크다 | 작은 메시지 |\n| claim-check | 큐가 가벼워진다 | storage 조회가 필요하다 | 대용량 payload |\n| claim-check + lease | 중복 처리 방지 | 구현이 복잡하다 | 중요한 job |\n| in-memory worker lock | 빠르다 | 장애 복구가 약하다 | 단일 프로세스 |\n\n## 꼬리질문\n\n> Q: claim-check와 job leasing은 왜 같이 쓰나요?\n> 의도: payload 분리와 소유권 제어를 구분하는지 확인\n> 핵심: 본문을 분리하고, 처리권을 한 worker로 제한하기 위해서다\n\n> Q: lease가 만료되면 어떤 일이 일어나나요?\n> 의도: takeover와 중복 위험을 아는지 확인\n> 핵심: 다른 worker가 이어받을 수 있지만 fencing이 필요하다\n\n> Q: claim-check를 쓰면 큐 중복이 사라지나요?\n> 의도: claim-check의 역할을 정확히 아는지 확인\n> 핵심: 아니다, 중복 방지와는 다른 문제다\n\n## 한 줄 정리\n\nTransactional claim-check는 큰 작업 본문을 분리하고, job leasing으로 그 작업을 한 worker만 안전하게 처리하게 만드는 패턴이다.\n",
   "aliases": [
+    "Transactional Claim-Check and Job 개념",
+    "Transactional Claim-Check and Job 정리",
+    "Transactional Claim-Check and Job 실수",
+    "Transactional Claim-Check and Job 판단 기준",
+    "데이터베이스 Transactional Claim-Check and Job",
     "transactional claim-check",
     "job leasing",
     "claim-check",
     "payload reference",
     "work claim",
     "lease row",
-    "skip locked",
-    "job ownership",
-    "payload ref worker",
-    "claim row takeover"
+    "skip locked"
   ],
   "expected_queries": [
     "claim-check와 job leasing은 각각 payload 분리와 worker ownership 문제를 어떻게 나눠 해결해?",
@@ -51,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/transactional-claim-check-job-leasing.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

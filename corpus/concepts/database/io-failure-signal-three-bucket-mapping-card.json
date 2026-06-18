@@ -6,16 +6,18 @@
   "summary": "HTTP timeout, gRPC DEADLINE_EXCEEDED, broker ack 실패는 \"에러 이름\"보다 먼저 busy / retryable / already-processed로 번역해야 다음 동작이 덜 흔들린다.",
   "body_markdown": "# I/O 유형별 실패신호 매핑 카드\n\n> 한 줄 요약: HTTP timeout, gRPC `DEADLINE_EXCEEDED`, broker ack 실패는 \"에러 이름\"보다 먼저 `busy` / `retryable` / `already-processed`로 번역해야 다음 동작이 덜 흔들린다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [3버킷 공통 용어 카드](./three-bucket-terms-common-card.md)\n- [트랜잭션 경계 체크리스트 카드](./transaction-boundary-external-io-checklist-card.md)\n- [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)\n- [Exactly-Once 신화와 DB + Queue 경계](./exactly-once-myths-db-queue.md)\n- [database 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: io failure signal mapping card, http 5xx timeout grpc deadline exceeded broker ack failure, busy retryable already processed, network failure to service outcome, ack timeout duplicate side effect, idempotency first-read card, timeout does not mean retry, deadline exceeded maybe committed, broker ack lost maybe published, beginner io retry mapping, i/o 실패신호 매핑 카드, http 5xx timeout grpc deadline exceeded 브로커 ack 실패, busy retryable already-processed 번역, 응답 유실 처리 완료 가능성, io failure signal three bucket mapping card basics\n\n## 먼저 멘탈모델\n\n초보자는 `timeout`, `5xx`, `ack 실패`를 보면 전부 \"다시 보내면 되나?\"로 읽기 쉽다.\n\n하지만 I/O 실패 신호는 **비즈니스 결과**를 직접 말해 주지 않는다.\n\n- `busy`: 지금 상대가 너무 바쁘거나 대기열이 막혀 있다\n- `retryable`: 이번 전송만 실패했고, 새 시도로 다시 해 볼 만하다\n- `already-processed`: 응답이나 ack만 놓쳤을 뿐, 상대는 이미 처리했을 수 있다\n\n핵심은 \"에러 이름\"보다 먼저 **상대가 이미 처리했을 가능성이 있나**를 묻는 것이다.\n\n## 10초 분류법\n\n| 먼저 볼 질문 | 번역 |\n|---|---|\n| 상대가 \"지금 너무 바빠\"라고 말하나 | `busy` |\n| 이번 시도는 중간에 끊겼지만 처리 시작 여부가 불확실한가 | `already-processed` |\n| 처리 시작 전에 확실히 거절되거나, 새 연결/새 트랜잭션으로 다시 보내도 의미가 같은가 | `retryable` |\n\n`already-processed`는 DB 문서의 `already exists`와 같은 자리라고 보면 된다.\n이미 winner가 생겼을 수도 있어서, 무작정 재실행보다 **결과 조회와 멱등성 확인**이 먼저다.\n\n## 신호별 첫 번역 표\n\n| I/O 신호 | 초보자용 첫 번역 | 이렇게 읽는 이유 | 첫 동작 |\n|---|---|---|---|\n| HTTP `503 Service Unavailable` | `busy` | 서버가 과부하이거나 임시로 못 받는다는 뜻에 가깝다 | 무한 재시도보다 backoff, 큐 길이, pool/hot key 확인 |\n| HTTP `500 Internal Server Error` | `retryable` 또는 `already-processed` | 단순 500만으로는 commit 전/후를 모른다 | 멱등 키가 있으면 결과 조회, 없으면 bounded retry를 매우 조심 |\n| HTTP `504 Gateway Timeout` / client read timeout | `already-processed` 쪽부터 의심 | 서버는 끝냈는데 응답만 늦거나 중간 프록시가 끊었을 수 있다 | 같은 요청 재실행 전 결과 조회 또는 idem key 재조회 |\n| gRPC `DEADLINE_EXCEEDED` | `already-processed` 또는 `busy` | caller deadline이 먼저 끝났을 뿐, server work는 계속될 수 있다 | server가 작업을 계속하는지 확인하고, idem key 기준 조회 우선 |\n| broker publish ack timeout | `already-processed` 쪽부터 의심 | 브로커 저장은 됐는데 producer가 ack만 못 받았을 수 있다 | 같은 메시지 재발행 전 event id 중복 확인 |\n| broker queue full / consumer too slow | `busy` | 지금은 밀려 있어서 처리 속도가 못 따라간다 | retry storm보다 backpressure, lag, concurrency 조정 |\n\n## 작은 비교 예시\n\n| 장면 | 잘못 읽기 쉬운 해석 | 먼저 둘 버킷 |\n|---|---|---|\n| 결제 API 호출 후 3초 client timeout | \"결제가 안 됐네, 바로 한 번 더 호출\" | `already-processed` |\n| 주문 서비스 gRPC 호출이 `DEADLINE_EXCEEDED`로 끝남 | \"server rollback이 확실하다\" | `already-processed` 또는 `busy` |\n| 이벤트 발행 후 producer ack timeout | \"브로커에 안 들어갔으니 같은 이벤트를 새 ID로 재발행\" | `already-processed` |\n| upstream이 `503`을 반복 반환 | \"몇 ms 간격으로 계속 때리면 언젠가 된다\" | `busy` |\n\n## 왜 `already-processed`가 중요한가\n\n이 버킷을 빼먹으면 중복 side effect가 생기기 쉽다.\n\n- 결제는 이미 승인됐는데 앱만 timeout을 봤을 수 있다\n- 주문은 이미 생성됐는데 API gateway가 `504`를 냈을 수 있다\n- 브로커는 이미 저장했는데 producer만 ack를 못 받았을 수 있다\n\n이럴 때 같은 의미의 요청을 새로 실행하면 중복 주문, 중복 결제, 중복 이벤트가 된다.\n\n그래서 I/O 실패 뒤 첫 질문은 \"`retry`할까?\"가 아니라 \"`이미 처리됐나?`\"여야 한다.\n\n## 자주 헷갈리는 지점\n\n- `timeout = retryable`이 아니다. timeout은 오히려 `already-processed` 신호일 때가 많다.\n- gRPC `DEADLINE_EXCEEDED`는 \"서버가 취소했다\"가 아니라 \"호출자의 시간 한도가 끝났다\"에 가깝다.\n- broker ack 실패는 \"publish 실패 확정\"이 아니라 \"publish 결과를 모른다\"일 수 있다.\n- `busy`는 재시도 금지가 아니라, 짧은 backoff와 혼잡 완화가 먼저라는 뜻이다.\n\n## 첫 대응 순서\n\n1. 멱등 키, 주문 번호, `event_id`처럼 결과를 재조회할 기준이 있는지 본다.\n2. `503`/queue full처럼 명확한 과부하 신호면 `busy`로 보고 backoff와 혼잡 원인부터 본다.\n3. `timeout`/`DEADLINE_EXCEEDED`/ack timeout이면 `already-processed`를 먼저 의심한다.\n4. 처리 시작 전 거절이 확실한 경우에만 `retryable`로 두고 bounded retry를 건다.\n\n## 다음에 이어서 볼 문서\n\n- DB 예외까지 같은 공통 언어로 묶고 싶으면 [3버킷 공통 용어 카드](./three-bucket-terms-common-card.md)\n- 왜 외부 I/O를 긴 트랜잭션 안에 두면 timeout 해석이 더 어려워지는지 보려면 [트랜잭션 경계 체크리스트 카드](./transaction-boundary-external-io-checklist-card.md)\n- idem key와 결과 재조회 패턴을 보려면 [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)\n- broker 중복 전달을 더 넓게 보려면 [Exactly-Once 신화와 DB + Queue 경계](./exactly-once-myths-db-queue.md)\n\n## 한 줄 정리\n\nHTTP timeout, gRPC `DEADLINE_EXCEEDED`, broker ack 실패는 \"에러 이름\"보다 먼저 `busy` / `retryable` / `already-processed`로 번역해야 다음 동작이 덜 흔들린다.\n",
   "aliases": [
+    "I/O 실패신호 매핑",
+    "I/O 유형별 실패신호 매핑 개념",
+    "I/O 유형별 실패신호 매핑 정리",
+    "I/O 유형별 실패신호 매핑 실수",
+    "I/O 유형별 실패신호 매핑 판단 기준",
     "io failure signal mapping card",
     "HTTP timeout gRPC deadline broker ack failure",
     "busy retryable already processed",
     "network failure service outcome",
     "ack timeout duplicate side effect",
     "timeout does not mean retry",
-    "deadline exceeded maybe committed",
-    "broker ack lost maybe published",
-    "I/O 실패신호 매핑",
-    "already-processed"
+    "deadline exceeded maybe committed"
   ],
   "expected_queries": [
     "HTTP timeout이나 gRPC DEADLINE_EXCEEDED를 바로 retryable로 보면 왜 위험해?",
@@ -51,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/io-failure-signal-three-bucket-mapping-card.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }

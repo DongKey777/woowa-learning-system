@@ -6,16 +6,18 @@
   "summary": "이 문서는 DB queue에서 FOR UPDATE SKIP LOCKED로 claim throughput을 높일 때 fairness, starvation, claim index scan cost, lease ownership tradeoff를 다루는 advanced deep dive다.",
   "body_markdown": "# Queue Claim with `SKIP LOCKED`, Fairness, and Starvation Trade-offs\n\n> 한 줄 요약: `SKIP LOCKED`는 queue claim throughput을 크게 올릴 수 있지만, 공정성과 오래 대기한 작업 보장까지 자동으로 해결해 주지는 않는다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Queue Consumer Transaction Boundaries](./queue-consumer-transaction-boundaries.md)\n- [Transactional Claim-Check와 Job Leasing](./transactional-claim-check-job-leasing.md)\n- [Advisory Locks와 Row Locks](./advisory-locks-vs-row-locks.md)\n- [Compare-and-Swap과 Pessimistic Locks](./compare-and-swap-vs-pessimistic-locks.md)\n- [Hot Row Contention과 Counter Sharding](./hot-row-contention-counter-sharding.md)\n- [Hot Updates, Secondary Index Churn, and Write-Path Contention](./hot-update-secondary-index-churn.md)\n\nretrieval-anchor-keywords: skip locked, queue claim, work stealing, job fairness, starvation, for update skip locked, queue throughput, claim ordering\n\n## 핵심 개념\n\nDB 기반 queue나 job table에서 흔히 쓰는 claim 패턴은 다음과 같다.\n\n```sql\nSELECT id\nFROM job_queue\nWHERE status = 'READY'\nORDER BY available_at\nLIMIT 1\nFOR UPDATE SKIP LOCKED;\n```\n\n이 패턴의 장점은 명확하다.\n\n- 이미 다른 worker가 잡은 row를 기다리지 않는다\n- worker 수를 늘려도 throughput이 잘 나오는 편이다\n- queue claim latency를 짧게 유지하기 쉽다\n\n하지만 비용도 있다.\n\n- 공정성이 약해질 수 있다\n- 특정 row가 계속 건너뛰어져 starvation이 생길 수 있다\n- hot prefix index에서 claim 경쟁이 지속될 수 있다\n\n즉 `SKIP LOCKED`는 \"기다리지 않는다\"는 성질을 주지만, **올바른 순서와 균형 처리까지 보장하는 것은 아니다**.\n\n## 깊이 들어가기\n\n### 1. `SKIP LOCKED`의 본질은 대기를 포기하고 다른 일을 찾는 것이다\n\n일반 `FOR UPDATE`는 잠긴 row를 만나면 기다린다.  \n`SKIP LOCKED`는 그 row를 건너뛰고 다음 후보를 찾는다.\n\n좋은 점:\n\n- worker thread가 줄 서서 기다리지 않는다\n- lock wait timeout이 줄어든다\n- 높은 동시성에서 claim throughput이 좋아진다\n\n하지만 이 선택은 곧 \"지금 잡기 쉬운 일 먼저 처리\"라는 정책을 뜻한다.\n\n### 2. ordering과 fairness는 별도 문제다\n\n`ORDER BY available_at`를 써도 실제 처리 순서는 완전히 보장되지 않을 수 있다.\n\n왜냐하면:\n\n- 가장 오래된 row가 이미 잠겨 있으면 건너뛴다\n- 그다음 row가 먼저 처리된다\n- 일부 오래된 row는 반복적으로 뒤로 밀릴 수 있다\n\n즉 `SKIP LOCKED`는 strict FIFO보다 **높은 가용성과 throughput**을 우선하는 선택이다.\n\n### 3. starvation은 장애가 아니라 설계 결과일 수 있다\n\n다음 상황에서 starvation이 생기기 쉽다.\n\n- 특정 row가 자주 실패해서 다시 READY로 돌아옴\n- 일부 worker가 긴 처리 시간을 가짐\n- 같은 prefix에서 claim 경쟁이 반복됨\n\n이때 queue가 \"멈춘 것\"처럼 보이지는 않아도, 특정 작업은 계속 뒤로 밀린다.\n\n그래서 `SKIP LOCKED` 기반 queue에는 보통 다음 중 하나가 필요하다.\n\n- retry/backoff 조정\n- priority bucket 분리\n- 오래 대기한 작업 재스캔\n- starvation watchdog\n\n### 4. claim index가 잘못되면 기다림 대신 스캔 비용이 커진다\n\n`SKIP LOCKED`가 만능처럼 보여도, claim 후보를 찾는 인덱스가 나쁘면:\n\n- 잠긴 row를 많이 건너뛰기 위해 더 긴 스캔을 하고\n- 같은 hot prefix를 여러 worker가 반복해서 훑고\n- 결국 throughput 이점이 줄어든다\n\n따라서 queue claim 설계는 SQL 문법보다:\n\n- `status`, `available_at` 인덱스 구조\n- partition/bucket 분산\n- queue depth 분포\n\n를 함께 봐야 한다.\n\n### 5. lease/heartbeat와 섞일 때는 claim과 ownership을 분리하는 게 좋다\n\n`SKIP LOCKED`는 \"누가 지금 집을까\"에는 좋지만, 긴 처리의 ownership까지 전부 맡기기는 불편할 수 있다.\n\n특히 긴 job에서는:\n\n- claim은 `SKIP LOCKED`로 빠르게\n- ownership 유지와 takeover는 lease row로\n\n분리하는 편이 안정적일 때가 많다.\n\n즉 queue entry 선점과 장기 실행 보장은 같은 문제가 아니다.\n\n### 6. `SKIP LOCKED`가 맞지 않는 경우도 있다\n\n다음 요구가 강하면 다른 패턴이 더 맞을 수 있다.\n\n- strict FIFO가 중요하다\n- 같은 partition 안의 순서 보장이 필수다\n- 일부 job starvation이 절대 허용되지 않는다\n\n이 경우는:\n\n- partitioned queue\n- advisory lock gate\n- lease coordinator\n- broker-native ordering\n\n같은 다른 구조를 검토해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1. queue worker 수를 늘렸더니 throughput은 좋아짐\n\n원인:\n\n- `SKIP LOCKED`가 lock wait를 줄여 worker가 놀지 않음\n\n추가 점검:\n\n- 오래된 job이 계속 뒤로 밀리는지\n- READY range 스캔 비용이 커지는지\n\n### 시나리오 2. 특정 재시도 job이 영원히 늦게 처리됨\n\n재시도된 job이 같은 hot prefix에 다시 들어오고, 다른 쉬운 job이 계속 먼저 잡힌다.\n\n대응:\n\n- retry backoff 증가\n- priority bucket 분리\n- starving job reaper 추가\n\n### 시나리오 3. 긴 job을 `SKIP LOCKED`만으로 처리\n\n처리 시간이 길면 claim row만으로 ownership을 오래 표현하기 어렵다.\n\n이 경우는:\n\n- claim은 짧게\n- 실행 ownership은 lease로\n\n나누는 편이 더 낫다.\n\n## 코드로 보기\n\n```sql\nSELECT id\nFROM job_queue\nWHERE status = 'READY'\n  AND available_at <= NOW()\nORDER BY available_at, id\nLIMIT 1\nFOR UPDATE SKIP LOCKED;\n```\n\n```sql\nUPDATE job_queue\nSET status = 'CLAIMED',\n    claimed_by = ?,\n    claimed_at = NOW()\nWHERE id = ?;\n```\n\n```text\nwatch metrics\n- claim success rate\n- rows scanned per claim\n- oldest READY age\n- retry bucket backlog\n```\n\n핵심은 claim SQL 하나보다, claim fairness와 starvation을 관찰하는 메트릭을 함께 두는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| `FOR UPDATE` 대기 | 순서가 비교적 단순하다 | worker가 기다리며 throughput이 떨어진다 | 동시성이 낮을 때 |\n| `SKIP LOCKED` | 높은 처리량과 낮은 wait를 준다 | fairness와 starvation 문제가 생길 수 있다 | high concurrency queue |\n| claim + lease 분리 | 긴 job ownership이 안정적이다 | 구조가 복잡해진다 | 장기 실행 job |\n| broker-native queue | ordering semantics가 강하다 | DB 일관성과 분리된다 | strict ordering 요구가 강할 때 |\n\n## 꼬리질문\n\n> Q: `SKIP LOCKED`를 쓰면 FIFO가 보장되나요?\n> 의도: throughput과 fairness를 구분하는지 확인\n> 핵심: 아니다. 잠긴 row를 건너뛰므로 실제 처리 순서는 어긋날 수 있다\n\n> Q: starvation은 왜 생기나요?\n> 의도: 오래된 row가 계속 밀리는 구조를 이해하는지 확인\n> 핵심: 잡기 쉬운 row가 반복적으로 먼저 선택되고 특정 row는 계속 건너뛰어질 수 있기 때문이다\n\n> Q: 긴 job에선 왜 lease를 같이 보나요?\n> 의도: claim과 ownership을 분리하는지 확인\n> 핵심: `SKIP LOCKED`는 빠른 선점에는 좋지만 장기 실행 ownership과 takeover 표현에는 부족할 수 있다\n\n## 한 줄 정리\n\n`SKIP LOCKED`는 queue claim의 wait를 줄여 throughput을 높이는 도구지만, fairness·starvation·ownership은 별도 설계와 메트릭으로 보완해야 한다.\n",
   "aliases": [
+    "SKIP LOCKED FIFO 보장",
+    "Queue Claim with SKIP 개념",
+    "Queue Claim with SKIP 정리",
+    "Queue Claim with SKIP 실수",
+    "Queue Claim with SKIP 판단 기준",
     "skip locked",
     "queue claim",
     "work stealing",
     "job fairness",
     "starvation",
     "for update skip locked",
-    "queue throughput",
-    "claim ordering",
-    "SKIP LOCKED FIFO 보장",
-    "queue starvation"
+    "queue throughput"
   ],
   "expected_queries": [
     "SKIP LOCKED를 쓰면 queue worker throughput은 좋아지지만 FIFO fairness가 깨질 수 있는 이유가 뭐야?",
@@ -53,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/queue-claim-skip-locked-fairness.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch156"
+      }
+    ]
   }
 }
