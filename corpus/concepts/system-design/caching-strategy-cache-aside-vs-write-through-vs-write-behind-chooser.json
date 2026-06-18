@@ -6,18 +6,18 @@
   "summary": "캐싱 전략은 *읽기/쓰기 흐름에서 캐시가 어떤 역할*을 하느냐로 갈린다.",
   "body_markdown": "# 캐싱 전략 — Cache-Aside vs Write-Through vs Write-Behind 어떻게 고를까\n\n> 한 줄 요약: 일반적 default = Cache-Aside. 강한 쓰기 정합성 = Write-Through. 쓰기 throughput 극대화 = Write-Behind(위험 큼). 패턴별 *정합성 ↔ 성능* trade-off 인식이 핵심.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n캐시 = \"느린 저장소 앞에 둔 빠른 저장소\". 같은 캐시여도 *어떤 시점에 어떻게 채우고 비우냐*가 패턴.\n\n```\n[Cache-Aside (Lazy Loading)] — 가장 흔함\n  읽기:  Cache HIT → 반환\n         Cache MISS → DB 조회 → Cache 저장 → 반환\n  쓰기:  DB 업데이트 → Cache invalidate (삭제 or update)\n\n[Read-Through]\n  앱은 Cache만 봄. Cache가 알아서 DB 호출.\n  Cache-Aside의 변형.\n\n[Write-Through]\n  쓰기: DB + Cache *동시* 동기 업데이트\n  읽기는 항상 fresh\n\n[Write-Behind (Write-Back)]\n  쓰기: Cache만 즉시 업데이트, DB는 *나중에 비동기*\n  매우 빠르지만 *crash 시 데이터 손실 가능*\n```\n\n## 한 장 정리\n\n| 전략 | 읽기 | 쓰기 | 정합성 | 성능 | 위험 |\n|---|---|---|---|---|---|\n| Cache-Aside | miss 시 DB → cache | DB만 + cache invalidate | eventual | 빠른 읽기 | stale risk |\n| Read-Through | cache 만, cache가 DB 위임 | (별도 전략) | depends | Cache-Aside와 비슷 | implementation 복잡 |\n| Write-Through | cache 우선 | DB + cache 동기 | strong (write 후 즉시 fresh) | 쓰기 느림 | cache 시스템 장애 시 쓰기 막힘 |\n| Write-Behind | cache 우선 | cache만 즉시, DB 비동기 | 매우 약함 | 매우 빠름 | crash 시 손실 |\n\n## \"Cache-Aside\" 패턴 상세\n\n```java\npublic Member findMember(Long id) {\n    Member cached = cache.get(\"member:\" + id);\n    if (cached != null) return cached;          // HIT\n\n    Member fresh = repository.findById(id).orElseThrow();\n    cache.put(\"member:\" + id, fresh, Duration.ofMinutes(10));\n    return fresh;\n}\n\npublic void updateMember(Member member) {\n    repository.save(member);\n    cache.delete(\"member:\" + id);   // invalidate (또는 update)\n}\n```\n\n장점:\n- 단순. 캐시 시스템 장애가 *읽기 성능만 영향*. 쓰기는 DB로 안전.\n- 데이터 일관성: 쓰기 후 invalidate → 다음 읽기 시 DB에서 fresh.\n\n함정:\n- \"delete vs update\" 선택 — update면 *쓰기 직후* fresh, delete면 *다음 읽기 시* fresh.\n- 동시성: 두 update가 동시에 들어오면 cache가 stale 가능. version + 비교 또는 짧은 TTL로 완화.\n- \"*Thundering herd*\" — TTL 만료 시 동시에 여러 요청이 DB로 밀려가 *cache stampede*. 방어: locking, probabilistic early refresh.\n\n## Read-Through — Cache-Aside의 변형\n\n앱 코드 입장에선 *cache만 본다*:\n\n```java\nMember m = cache.get(\"member:\" + id);   // cache가 알아서 DB 호출\n```\n\n차이: cache가 *DB 호출 책임을 캡슐화*. 앱이 단순해지지만 cache 시스템 자체에 의존성 ↑.\n\n라이브러리 예: Caffeine `LoadingCache`, Spring Cache `@Cacheable`.\n\n## Write-Through — 강한 쓰기 정합성\n\n```java\npublic void updateMember(Member member) {\n    transaction.begin();\n    repository.save(member);             // DB\n    cache.put(\"member:\" + id, member);   // cache 동기\n    transaction.commit();\n}\n```\n\n장점:\n- 쓰기 직후 *cache가 fresh*.\n- 데이터 정합 강함.\n\n단점:\n- 쓰기마다 *cache + DB 둘 다*. 쓰기 latency ↑.\n- cache 장애 시 *쓰기 자체 막힘* (트랜잭션 일부로 처리해야 정합성 보장).\n- 한 캐시가 분산되어 있으면 *각 노드 invalidate* 필요.\n\n## Write-Behind (Write-Back) — 위험 큰 패턴\n\n```\n쓰기 → Cache (메모리 + WAL) → 별도 worker가 batch로 DB flush\n```\n\n매우 빠른 쓰기. 하지만:\n\n- **Crash 시 손실** — 메모리에만 있는 쓰기 사라짐. WAL 없으면 회복 불가.\n- **순서 보장 어려움** — batch flush 순서가 application 순서와 다를 수 있음.\n- **DB와 Cache 사이 *영원한 영구 stale* 가능** — DB가 진실의 원천 아닌 상황.\n\n일반 비즈니스에선 *피하는 게 default*. 사용 case는 *count/metric 같이 손실 허용*되는 데이터.\n\n## \"어떻게 고를까?\" 결정 가이드\n\n```\n1. 단순 cache, 학습/일반?\n       → Cache-Aside\n\n2. 강한 쓰기 정합성 필요 (cache가 거의 source of truth)?\n       → Write-Through (단 cache 장애 위험 인지)\n\n3. 매우 높은 쓰기 throughput + 손실 허용?\n       → Write-Behind (counter/metric 같은 영역)\n\n4. 앱 코드를 단순하게?\n       → Read-Through (Spring `@Cacheable` 등)\n```\n\n## TTL — Cache Stale 다루기\n\n전략과 관계 없이 *TTL (Time-To-Live)*이 가장 단순한 정합성 안전망.\n\n```\nmember:42 TTL = 10분\n→ 10분 후 자동 만료, 다음 읽기는 DB에서 fresh\n```\n\ntrade-off: 짧으면 *fresh + DB 부담*, 길면 *stale*. 도메인에 따라 결정.\n\n- 회원 기본 정보: 10분~1시간 (변경 드뭄)\n- 재고/가격: 짧게 (수 초 ~ 1분)\n- 통계: 길게 (1일)\n\n## Cache Stampede / Thundering Herd\n\nTTL 만료 직후 *동시에 많은 요청이 cache miss + DB로 밀려감*.\n\n```\n시점 T-1: 캐시에서 응답\n시점 T0:  TTL 만료\n시점 T0+1ms: 1000 동시 요청이 모두 cache miss → 1000개가 DB로\n```\n\n방어:\n- **Locking** — 첫 miss만 DB 호출, 나머지는 대기.\n- **Probabilistic early refresh** — TTL 끝나기 *전*에 일부 요청이 미리 refresh.\n- **Stale-While-Revalidate** — stale 데이터 반환 + 백그라운드에서 fresh.\n\n## 자주 헷갈리는 지점\n\n- **\"캐시 = 빠르니까 다 캐시\"** — 정합성 비용 무시. 변경 자주 + 정합 중요한 데이터엔 부담.\n- **\"Cache-Aside의 invalidate는 항상 delete가 좋다\"** — delete는 *다음 읽기*에 DB 부담. update는 *쓰기 부담*. 도메인 결정.\n- **\"Write-Through가 항상 최고 정합\"** — cache 시스템 장애 시 *쓰기 막힘*. trade-off 있음.\n- **\"Write-Behind는 nginx도 쓰니까 안전\"** — 그 영역의 *영향 작은* 데이터 (로그). 비즈니스 데이터엔 위험.\n- **\"TTL이 무한이면 정합 100%\"** — invalidate 시점이 잘못되면 *영구 stale*. 짧은 TTL이 안전망.\n\n## 학습자가 자주 만나는 시나리오\n\n- 미션 \"회원 정보 조회 빠르게\" → Cache-Aside + Redis + TTL 10분.\n- \"장바구니 자주 변경\" → Cache-Aside + 짧은 TTL or Write-Through.\n- \"조회수 카운트\" → Write-Behind 또는 Redis INCR (별도 카운터).\n- \"캐시 무효화 timing 잘못\" → Cache-Aside + invalidate 코드 누락 가능성.\n\n## 빠른 확인 질문\n\n- Cache-Aside와 Write-Through의 핵심 차이?\n  - Cache-Aside는 *쓰기 시 cache invalidate 후 다음 읽기에 채움*, Write-Through는 *쓰기 시 즉시 cache update*.\n- Write-Behind의 본질 위험?\n  - Crash 시 *flush 안 된 데이터 손실*.\n- Cache stampede 방어 패턴 두 가지?\n  - Locking + Probabilistic early refresh (또는 Stale-While-Revalidate).\n\n## 한 줄 정리\n\n캐싱은 *읽기/쓰기 흐름에서 cache 역할*이 패턴 결정. 일반 default Cache-Aside, 강한 쓰기 정합 Write-Through, throughput 극대 Write-Behind(위험). TTL은 모든 패턴의 안전망.\n\nretrieval-anchor-keywords: Cache-Aside, Lazy Loading, Read-Through, Write-Through, Write-Behind Write-Back, cache consistency, cache invalidation, TTL Time-To-Live, cache stampede thundering herd, probabilistic early refresh, stale-while-revalidate, Spring Cache @Cacheable, Redis caching pattern, Caffeine LoadingCache\n",
   "aliases": [
+    "캐시 전략",
+    "캐싱 패턴",
+    "캐싱 전략 — Cache-Aside 개념",
+    "캐싱 전략 — Cache-Aside 정리",
+    "캐싱 전략 — Cache-Aside 실수",
     "Cache-Aside",
     "Lazy Loading",
     "Write-Through",
     "Write-Behind",
     "Write-Back",
     "Read-Through",
-    "캐시 전략",
-    "캐싱 패턴",
-    "cache consistency",
-    "cache invalidation strategy",
-    "Redis caching pattern",
-    "@Cacheable"
+    "cache consistency"
   ],
   "expected_queries": [
     "캐시 전략을 어떻게 골라?",
@@ -51,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch163"
+      }
+    ]
   }
 }

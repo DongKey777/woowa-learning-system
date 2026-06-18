@@ -6,18 +6,18 @@
   "summary": "이 문서는 system-design 카테고리에서 Event Bus Control Plane 설계를 다루는 deep_dive 문서다. event bus control plane은 토픽, 권한, 보존 정책, 라우팅, 재처리 규칙을 중앙에서 관리하는 이벤트 인프라 제어 시스템이다. 검색 질의가 event bus control plane, topic management, schema registry, retention policy처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
   "body_markdown": "# Event Bus Control Plane 설계\n\n> 한 줄 요약: event bus control plane은 토픽, 권한, 보존 정책, 라우팅, 재처리 규칙을 중앙에서 관리하는 이벤트 인프라 제어 시스템이다.\n\nretrieval-anchor-keywords: event bus control plane, topic management, schema registry, retention policy, routing rule, consumer group, replay, dead letter queue, event governance, partition assignment, backfill controller, consumer onboarding, control plane data plane, protocol version skew, capability gating\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Distributed Scheduler 설계](./distributed-scheduler-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n> - [Config Distribution System 설계](./config-distribution-system-design.md)\n> - [API Gateway Control Plane 설계](./api-gateway-control-plane-design.md)\n> - [Webhook Delivery Platform 설계](./webhook-delivery-platform-design.md)\n> - [Change Data Capture / Outbox Relay 설계](./change-data-capture-outbox-relay-design.md)\n> - [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)\n> - [Control Plane / Data Plane Separation 설계](./control-plane-data-plane-separation-design.md)\n> - [Protocol Version Skew / Compatibility 설계](./protocol-version-skew-compatibility-design.md)\n> - [Capability Negotiation / Feature Gating 설계](./capability-negotiation-feature-gating-design.md)\n\n## 핵심 개념\n\nEvent bus control plane은 메시지를 흘리는 시스템이 아니라,  \n이벤트 생태계를 운영하는 정책 시스템이다.\n\n- topic 생성/삭제\n- schema registry\n- retention / compaction\n- ACL / producer policy\n- consumer group governance\n- replay / backfill rules\n\n즉, 제어 평면은 이벤트 흐름의 질서와 안전성을 관리한다.\n\n## 깊이 들어가기\n\n### 1. 왜 control plane이 필요한가\n\nevent bus가 커지면 단순 publish/subscribe로는 부족하다.\n\n- 누가 어떤 topic에 쓸 수 있는가\n- 어떤 schema가 허용되는가\n- 얼마나 오래 보관하는가\n- replay가 가능한가\n- 어떤 consumer가 느려도 전체를 막지 않는가\n\n### 2. Capacity Estimation\n\n예:\n\n- 수천 topic\n- 수만 consumer group\n- 초당 수백만 event\n\n여기서 control plane 트래픽은 상대적으로 낮지만, 잘못된 policy가 data plane 전체를 망칠 수 있다.\n\n봐야 할 숫자:\n\n- topic count\n- partition count\n- consumer lag\n- schema update rate\n- routing rule propagation delay\n\n### 3. Topic governance\n\ntopic마다 정책이 달라질 수 있다.\n\n- retention days\n- compaction 여부\n- ordering guarantee\n- encryption policy\n- tenant ownership\n\ntopic은 무한정 늘어날 수 있으므로 naming convention과 lifecycle 관리가 필요하다.\n\n### 4. Schema registry\n\n이벤트는 스키마가 바뀐다.\n\n- backward compatible\n- forward compatible\n- versioned schema\n- validation on publish\n\nschema drift를 막지 않으면 consumer가 깨진다.\n\n### 5. Routing and replay\n\n이벤트는 다른 bus나 topic으로 복제될 수 있다.\n\n- fan-out routing\n- tenant partitioning\n- archived replay\n- DLQ redrive\n\nreplay는 강력하지만, 잘못 쓰면 duplicate storm이 된다.\n특히 신규 consumer bootstrap이나 대규모 reprocessing은 평소 publish 경로와 분리해, replay scope와 side effect suppression을 별도 control plane에서 다루는 편이 안전하다.\n\n### 6. Partition assignment\n\nconsumer group 운영도 control plane의 일부다.\n\n- static assignment\n- rebalancing\n- hot partition mitigation\n- tenant-aware partitioning\n\n이 부분은 [Consistent Hashing / Hot Key 전략](./consistent-hashing-hot-key-strategies.md)과 연결된다.\n\n### 7. Failure mode\n\ncontrol plane이 장애여도 data plane은 계속 돌아야 한다.\n\n- local cached policies\n- last-known-good configs\n- default retention/routing\n\n또한 replay와 backfill 작업은 control plane 장애 시 자동 확장되지 않도록 막아, 운영 중 잘못된 redrive가 전체 bus를 흔들지 않게 해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 새 topic 생성\n\n문제:\n\n- 서비스가 새 이벤트 토픽이 필요하다\n\n해결:\n\n- control plane에서 topic template 적용\n- schema 등록\n- ACL 생성\n\n### 시나리오 2: schema 변경\n\n문제:\n\n- 이벤트 필드를 추가해야 한다\n\n해결:\n\n- registry에 버전 추가\n- backward compatibility 검사\n\n### 시나리오 3: lag 증가\n\n문제:\n\n- consumer lag이 급증한다\n\n해결:\n\n- partition 재배치\n- hot partition 분리\n- DLQ 점검\n\n## 코드로 보기\n\n```pseudo\nfunction publish(event, topic):\n  schema = registry.validate(topic, event.schemaVersion)\n  if !policy.allowed(topic, event.producer):\n    reject()\n  bus.publish(topic, event)\n```\n\n```java\npublic void createTopic(TopicSpec spec) {\n    topicPolicyService.validate(spec);\n    topicRepository.create(spec);\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Open publish bus | 유연하다 | governance가 약하다 | 초기 플랫폼 |\n| Strong governance plane | 안전하다 | 운영 복잡도 증가 | 대규모 이벤트 플랫폼 |\n| Schema registry | 호환성 관리가 쉽다 | 버전 관리가 필요하다 | 실서비스 |\n| Replay-enabled bus | 복구가 강하다 | duplicate risk | event-sourced workloads |\n| Tenant-aware partitions | 격리가 좋다 | assignment가 복잡하다 | 멀티테넌트 |\n\n핵심은 event bus가 메시지 통로가 아니라 **이벤트 거버넌스를 수행하는 플랫폼**이라는 점이다.\n\n## 꼬리질문\n\n> Q: event bus control plane과 data plane은 어떻게 다르나요?\n> 의도: 정책과 전달 분리 이해 확인\n> 핵심: control plane은 규칙, data plane은 전달을 맡는다.\n\n> Q: schema registry는 왜 필요한가요?\n> 의도: 이벤트 호환성 이해 확인\n> 핵심: producer/consumer 진화를 안정적으로 관리하기 위해서다.\n\n> Q: replay가 왜 위험할 수 있나요?\n> 의도: 중복과 부작용 이해 확인\n> 핵심: 같은 이벤트가 다시 처리되어 duplicate side effect가 날 수 있다.\n\n> Q: hot partition은 어떻게 다루나요?\n> 의도: 부하 분산 이해 확인\n> 핵심: partition key 설계와 재배치가 필요하다.\n\n## 한 줄 정리\n\nEvent bus control plane은 topic, schema, retention, ACL, replay를 중앙에서 관리해 이벤트 플랫폼의 질서와 안전을 유지한다.\n",
   "aliases": [
+    "Event Bus Control Plane 개념",
+    "Event Bus Control Plane 정리",
+    "Event Bus Control Plane 실수",
+    "Event Bus Control Plane 판단 기준",
+    "시스템 설계 Event Bus Control Plane",
     "event bus control plane",
     "topic management",
     "schema registry",
     "retention policy",
     "routing rule",
     "consumer group",
-    "replay",
-    "dead letter queue",
-    "event governance",
-    "partition assignment",
-    "backfill controller",
-    "consumer onboarding"
+    "replay"
   ],
   "expected_queries": [
     "event bus에서 topic 생성, schema registry, retention policy를 control plane으로 관리하는 이유가 뭐야?",
@@ -45,8 +45,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/event-bus-control-plane-design.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch163"
+      }
+    ]
   }
 }

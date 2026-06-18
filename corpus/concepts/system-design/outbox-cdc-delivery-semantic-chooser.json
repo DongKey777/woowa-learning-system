@@ -6,13 +6,18 @@
   "summary": "이 chooser는 outbox, CDC, message delivery semantics를 비교한다. exactly once 오해, at-least-once 소비자 멱등성, relay 재시작 중복 전송, CDC lag 질문을 다룬다.",
   "body_markdown": "# Outbox CDC Delivery Semantic Chooser\n\n## 10초 chooser\n\n| 목표 | 후보 | 기본 가정 |\n|---|---|---|\n| DB commit과 publish 누락 방지 | transactional outbox | relay는 중복 전송 가능 |\n| DB 변경을 stream으로 추출 | CDC | lag와 schema evolution 관리 필요 |\n| business event contract 통제 | outbox event table + router | row 변경과 domain event는 다름 |\n| aggregate 순서 유지 | stable message key | Kafka ordering은 partition 범위 |\n| consumer 결과 중복 방지 | idempotent consumer | at-least-once를 전제로 설계 |\n\n## Topic-specific invariant\n\nOutbox와 CDC의 공통 불변식은 \"업무 DB commit과 이벤트 관측 지점을 최대한 같은 source of truth에 둔다\"이다. 주문을 저장했는데 이벤트 publish만 실패하는 dual-write 구멍을 줄이기 위해, 업무 변경과 outbox record를 같은 DB transaction에 넣거나 committed log를 CDC로 읽는다.\n\n하지만 이 불변식은 producer 쪽 누락 방지에 가깝다. consumer가 외부 DB를 두 번 갱신하거나 API를 두 번 호출하지 않는다는 보장은 별도다. 따라서 기본 delivery semantic은 at-least-once로 두고 consumer idempotency를 설계해야 한다. \"commit된 row를 관측한다\"와 \"domain event 의미를 약속한다\"도 다르다. downstream contract가 중요하면 row-level CDC만으로 해석을 맡기기보다 outbox payload에 event type/version을 명시한다.\n\n## 헷갈리는 축\n\nOutbox는 write와 event record를 같은 DB transaction에 넣어 누락을 줄인다. CDC는 committed change를 읽어 전달한다. 둘 다 consumer side effect까지 exactly-once로 만들어 주지는 않는다.\n\nOutbox relay가 row를 publish한 뒤 \"sent\" 표시 전에 죽으면 같은 row를 다시 보낼 수 있다. CDC connector가 재시작하거나 offset commit 경계가 흔들려도 downstream에는 중복이 보일 수 있다. 반대로 relay가 publish 전에 죽으면 나중에 같은 outbox row를 다시 읽어 보내면 되므로 누락 방지에는 강하다.\n\nDebezium Outbox Event Router를 쓰면 `id`를 header로 보내 dedup 기준을 노출하고, `aggregateid`를 message key로 써서 같은 aggregate를 같은 partition에 모으고, `aggregatetype`으로 topic을 라우팅할 수 있다. 이건 schema/topic/key routing 장치다. consumer가 header `id`를 저장하거나 `(aggregate_id, version)` unique guard를 두지 않으면 중복 side effect는 그대로 남는다.\n\n## Detailed chooser\n\n| 상황 | 선택 | 이유 | 반드시 붙일 장치 |\n|---|---|---|---|\n| 업무 write와 이벤트 publish를 함께 보장하고 싶다 | transactional outbox | 같은 DB transaction으로 dual-write 누락을 줄임 | outbox id, relay retry, consumer dedup |\n| 기존 DB 변경 전체를 stream으로 흘리고 싶다 | CDC | binlog/WAL에서 committed change를 읽음 | schema evolution, connector lag, snapshot 관리 |\n| 이벤트 payload를 도메인 이벤트로 통제하고 싶다 | outbox event table | payload와 event type을 애플리케이션이 명시 | event version, published_at/status |\n| DB row 변경을 범용으로 복제하고 싶다 | table-level CDC | 애플리케이션 수정이 적음 | noisy change filtering, PII filtering |\n| 정확히 한 번 외부 side effect가 필요하다 | outbox/CDC만으로 부족 | downstream write는 다른 transaction boundary | idempotency key, unique constraint, reconciliation |\n| connector 재시작 후에도 이어 읽고 싶다 | CDC offset + source log retention | offset만 있어도 원본 log가 purge되면 못 읽음 | binlog/WAL 보존, replication slot monitoring |\n| 주문별 이벤트 순서가 중요하다 | aggregate key partitioning | Kafka 순서는 topic partition 범위 | aggregate version, stale event skip |\n\n## Delivery semantic별 답변\n\n| Semantic | 의미 | outbox/CDC에서의 현실 | 설계 포인트 |\n|---|---|---|---|\n| at-most-once | 중복은 적지만 유실 가능 | 보통 목표로 삼지 않음 | publish 전 ack 금지 |\n| at-least-once | 유실을 줄이고 중복 허용 | outbox/CDC의 기본 운영 모델 | eventId, dedup table, idempotent handler |\n| exactly-once | 정해진 경계 안에서 record가 한 번만 반영 | Kafka/Kafka Connect 내부 경계로 제한해 봐야 함 | 외부 DB/API side effect는 idempotency로 보호 |\n\n## Routing and ordering guard\n\nTopic routing은 의미 경계다. `OrderCreated`와 `PaymentApproved`를 같은 table-level CDC stream에서 consumer가 추론하게 두면 migration, 운영 보정, backfill update와 business event가 섞인다. outbox payload에 `type`, `schema_version`, `aggregate_id`, `aggregate_version`을 넣고, Event Router 설정으로 topic/key/header를 명시하면 consumer contract가 훨씬 선명해진다.\n\nOrdering은 더 좁게 잡는다.\n\n- 같은 aggregate의 이벤트는 같은 key를 써서 같은 partition으로 보낸다.\n- partition 안 offset 순서만 믿고, topic/partition 전체 전역 순서는 요구하지 않는다.\n- consumer는 `aggregate_version`이나 watermark로 오래된 이벤트를 skip한다.\n- snapshot/read event와 streaming/live event를 구분해서 projection rebuild가 live state를 덮어쓰지 않게 한다.\n\n## Log tailing limits\n\nCDC는 \"offset이 있으니 언제든 재시작 가능\"이 아니다. MySQL binlog가 purge되거나 PostgreSQL replication slot/WAL 상태가 깨지면 connector가 마지막 위치에서 이어 읽지 못한다. PostgreSQL slot은 필요한 WAL을 붙잡는 대신, 오래 방치하면 디스크와 catalog bloat를 만든다. 그래서 delivery semantic을 말할 때는 항상 `connector offset`, `source log retention`, `snapshot/backfill`, `reconciliation`을 한 묶음으로 본다.\n\n## Wrong-bucket neighbor\n\n전달 인프라를 바꾸기 전에 consumer 멱등성이 있는지 먼저 본다. 중복 메시지를 처리하지 못하면 outbox relay 재시작이나 broker retry가 곧 데이터 중복으로 이어진다.\n\n## 흔한 오개념\n\n- \"Outbox를 쓰면 exactly-once다\": publish 누락을 줄일 뿐, relay 중복과 consumer side effect 중복은 남는다.\n- \"CDC는 DB commit 순서를 그대로 모든 consumer에 보장한다\": partitioning, connector, broker, consumer 처리 방식에 따라 downstream 순서는 다시 설계해야 한다.\n- \"sent=true를 먼저 찍고 publish하면 된다\": publish 실패 시 유실된다. publish 후 상태 갱신 실패는 중복으로 복구할 수 있지만, 반대 순서는 누락이 된다.\n- \"중복은 Kafka가 해결한다\": broker 중복 감소와 업무 side effect 멱등성은 다른 문제다.\n- \"Outbox Event Router가 dedup한다\": dedup 가능한 `id`를 노출할 뿐, 저장하고 무시하는 판단은 consumer 몫이다.\n- \"lag만 없으면 안전하다\": lag는 freshness 지표이고, dedup/correctness 지표와 별도다.\n\n## 실무 지표와 증거\n\n- outbox 지표: pending row 수, oldest pending age, relay retry count, publish success/failure, duplicate publish count\n- CDC 지표: connector lag, snapshot progress, offset commit, source log retention headroom, schema registry compatibility, dead letter count\n- consumer 지표: idempotency hit rate, duplicate eventId count, handler retry count, poison message count\n- correctness 지표: source row와 projection row mismatch, reconciliation repair count, missing event audit\n- 운영 증거: relay 재시작 실험, broker 장애 중 publish 재시도, consumer 중복 처리 테스트\n\n## 면접 답변 축\n\n1. 먼저 dual-write 문제를 말한다. DB commit 성공 후 publish 실패가 핵심 위험이다.\n2. Outbox는 같은 DB transaction에 event record를 저장해 누락을 줄이고, CDC는 committed log를 읽어 stream화한다고 구분한다.\n3. 둘 다 downstream side effect까지 exactly-once로 만들지는 못하므로 at-least-once와 consumer idempotency를 기본값으로 둔다.\n4. relay/connector lag, duplicate, DLQ, reconciliation으로 운영 검증한다고 답한다.\n5. payload 통제와 도메인 이벤트가 중요하면 outbox, 기존 변경 캡처와 복제가 중요하면 CDC 쪽으로 고른다.\n\n## Safe Next Docs\n\n구체 설계는 change data capture outbox relay design과 outbox-vs-cdc-vs-saga decision guide로 내려간다.\n",
   "aliases": [
-    "outbox cdc delivery semantic chooser",
-    "at least once exactly once outbox cdc",
     "outbox CDC 전달 보장 선택",
     "이벤트 delivery semantics 비교",
+    "Outbox CDC Delivery Semantic 개념",
+    "Outbox CDC Delivery Semantic 정리",
+    "Outbox CDC Delivery Semantic 실수",
+    "outbox cdc delivery semantic chooser",
+    "at least once exactly once outbox cdc",
     "Debezium Outbox Event Router topic key",
     "Kafka partition aggregate ordering",
-    "binlog WAL retention replay semantics"
+    "binlog WAL retention replay semantics",
+    "outbox cdc delivery semantic guide",
+    "outbox cdc delivery semantic checklist"
   ],
   "expected_queries": [
     "outbox와 CDC를 쓰면 exactly once가 되는 거야?",
@@ -42,8 +47,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/outbox-cdc-delivery-semantic-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch163"
+      }
+    ]
   }
 }

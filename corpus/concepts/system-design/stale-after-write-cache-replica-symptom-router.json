@@ -7,13 +7,17 @@
   "body_markdown": "# 방금 쓴 값이 다시 옛값으로 보임 — Cache / Replica / Projection freshness 분기\n\n> 한 줄 요약: stale-after-write는 \"캐시가 문제\" 한 마디로 끝나지 않는다. 캐시 히트 허용 조건, 캐시 미스 뒤 replica 선택, projection 적용 지연, 클라이언트 freshness token 전달을 순서대로 봐야 한다.\n\n**난이도: 🟡 Intermediate**\n\n## 증상을 네 갈래로 자르기\n\n### 증거 기반 30초 라우터\n\n실패한 read 요청 하나를 고정하고 `read_source`와 version 비교를 먼저 본다. 같은 \"옛값\"이어도 어느 저장소가 값을 냈는지에 따라 처방이 달라진다.\n\n| 관측 증거 | 먼저 의심할 경계 | 확인 질문 | 다음 조치 |\n|---|---|---|---|\n| `read_source=cache`, `served_version < required_version` | cache hit acceptance | cache entry에 version/watermark가 있고 hit 거절 조건이 있는가 | stale hit reject, cache key/version metadata 보강 |\n| `cache_invalidated=false` 또는 delete 실패 후 같은 key hit | cache invalidation | DB commit 이후 invalidation이 retryable하게 기록되는가 | after-commit invalidation, outbox/cache event, delete failure retry |\n| `read_source=replica`, primary의 `committed_version`이 더 큼 | replica lag | 최근 write 세션도 replica로 라우팅됐는가 | recent writer primary pinning, lag budget, causal token |\n| `read_source=projection`, `projection_watermark < required_version` | projection/read model lag | consumer가 해당 event id까지 적용했는가 | pending UX, polling, projection watermark 노출 |\n| `required_version`이 비어 있고 최신/옛값이 번갈아 보임 | client freshness context 손실 | write 응답의 version이 후속 read로 전달되는가 | client min-version 저장, BFF/gateway header passthrough |\n| `read_source=primary`인데 옛값 | write commit 또는 read 대상 혼동 | write가 실제 source of truth에 commit됐고 같은 tenant/key를 읽는가 | transaction boundary, key/tenant mismatch, write result audit |\n\n핵심은 \"캐시를 지웠다\"는 말만으로 replica 문제가 배제되지 않는다는 점이다. 캐시 미스 뒤에 replica나 projection으로 내려가면 cache layer는 정상이어도 여전히 stale response가 나온다.\n\n### 1. 캐시 히트가 너무 쉽게 허용된다\n\n장면:\n\n- 방금 업데이트했는데 cache hit가 그대로 반환된다.\n- 캐시 TTL은 짧지만 그 TTL 안에서는 옛값이 보인다.\n\n확인:\n\n- 최근 write를 한 세션인지 알 수 있는가\n- `min-version`이나 `updated_at` 기준으로 hit를 거절할 수 있는가\n- stale hit를 거절했을 때 어디로 fallback하는가\n- cache key별로 entry version, write version, invalidation event id를 남기는가\n\n이 갈래의 증거는 `cache_hit=true` 자체가 아니라 `cache_entry_version`과 `required_version`의 비교다. TTL이 남았더라도 사용자가 방금 본 write보다 낮은 version이면 그 hit는 거절되어야 한다.\n\n### 2. 캐시 미스 뒤 replica가 더 오래됐다\n\n장면:\n\n- 캐시를 삭제했는데도 옛값이 나온다.\n- primary를 보면 최신이고 replica를 보면 이전 값이다.\n\n확인:\n\n- 최근 write 이후 read를 replica로 보내도 되는 정책인가\n- session stickiness, causal token, primary fallback 기준이 있는가\n- lag metric을 응답 trace에 남기는가\n- replica가 반환한 row version과 primary committed version을 같은 key로 비교했는가\n\n이 갈래에서는 cache invalidation을 반복해도 해결되지 않는다. cache miss가 난 뒤 stale replica를 읽는 구조면 \"캐시 삭제 성공\"과 \"최신 read 보장\"은 별개의 사실이다.\n\n### 3. projection이나 read model이 아직 적용되지 않았다\n\n장면:\n\n- 원장 테이블은 최신인데 목록/검색/알림 read model은 이전 상태다.\n- 이벤트 consumer lag가 있거나 outbox relay가 지연된다.\n\n확인:\n\n- read model의 applied watermark를 알 수 있는가\n- 화면이 요구하는 최소 version보다 projection이 뒤처졌는가\n- 지연 시 pending/processing 상태를 보여줄 수 있는가\n- 목록과 상세이 서로 다른 source를 읽는다면 각 화면의 watermark를 따로 남기는가\n\n### 4. 클라이언트가 freshness context를 잃어버린다\n\n장면:\n\n- 저장 직후 첫 화면은 최신인데 다음 탭이나 새 요청에서 옛값이 보인다.\n- API gateway, BFF, frontend store 중 어딘가에서 version token이 빠진다.\n\n확인:\n\n- write 응답에 version이나 causal token을 돌려주는가\n- 후속 read 요청이 그 token을 전달하는가\n- cache, replica, projection이 같은 token을 해석하는가\n- API gateway, BFF, frontend store가 `min-version` header나 query param을 누락하지 않는가\n\n## Version 증거 해석\n\n| 비교 | 뜻 | 잘못 가기 쉬운 결론 |\n|---|---|---|\n| `served_version >= required_version` | 이 요청의 causal freshness 조건은 충족 | UI가 옛값이면 frontend store, response merge, 다른 필드를 본다 |\n| `served_version < required_version` | 사용자가 이미 본 write보다 낮은 값을 제공 | \"TTL이 짧으니 괜찮다\"가 아니라 stale response다 |\n| `required_version` 없음 | read path가 최신성 요구를 모름 | cache/replica가 알아서 최신을 보장한다고 가정하면 안 된다 |\n| `committed_version` 없음 | source of truth 기준점이 없음 | cache와 replica만 비교하면 원장 최신성을 증명할 수 없다 |\n| version은 맞는데 business field가 옛값 | version 부여 범위나 projection mapping 문제 | replica lag로 단정하지 말고 row/event/schema 매핑을 본다 |\n\n`updated_at`은 간단한 기준이 될 수 있지만 clock skew와 동시 update에 약하다. 가능하면 source of truth가 증가시키는 version, event sequence, commit LSN 같은 단조 기준을 사용한다.\n\n## Cache invalidation은 독립 축\n\nCache invalidation을 볼 때는 \"삭제 코드를 호출했다\"가 아니라 다음 증거가 남았는지 확인한다.\n\n```text\nwrite_request_id=<request-id>\ncommitted_version=<source-of-truth-version>\ncache_key=<entity-or-query-key>\ninvalidation_scheduled_at=<time>\ninvalidation_result=success|failed|unknown\nnext_cache_read=hit|miss\ncache_entry_version=<version>\nfallback_read_source=primary|replica|projection\n```\n\nDB commit 전에 cache를 지우면 rollback 시 불필요한 miss가 생긴다. DB commit 후 cache delete가 실패하면 옛 entry가 남는다. 그래서 after-commit hook, retryable invalidation log, outbox 기반 cache event처럼 실패를 다시 처리할 수 있는 증거가 필요하다.\n\n## 먼저 남길 관측값\n\n```text\nread_source=cache|replica|primary|projection\ncache_key=<key>\ncache_hit=true|false\ncache_entry_version=<cache_version>\ncache_invalidation_result=success|failed|missing\nhit_accept_reason=ttl_ok|min_version_ok|unchecked\nrequired_version=<client_min_version>\nserved_version=<response_version>\ncommitted_version=<source_of_truth_version>\nreplica_lag_ms=<observed_lag>\nprojection_watermark=<applied_event_id>\n```\n\n이 값이 없으면 \"가끔 옛값\"이라는 말만 남고 원인을 재현하기 어렵다.\n\n## 꼬리질문\n\n> Q: 캐시를 지우면 read-after-write 문제가 끝나나요?\n> 핵심: 아니다. 캐시 미스 뒤 replica나 projection으로 내려가면 여전히 stale일 수 있다.\n\n> Q: stale read를 완전히 없애려면 항상 primary만 읽어야 하나요?\n> 핵심: 비용이 크다. 최근 write가 있는 세션이나 중요한 화면에만 freshness token 기반 primary/fresh source를 요구하는 식으로 좁힌다.\n\n## 한 줄 정리\n\n방금 쓴 값이 옛값으로 보이면 캐시만 보지 말고 `cache hit 허용 -> replica fallback -> projection watermark -> client freshness token` 순서로 자른다.\n",
   "aliases": [
     "방금 쓴 값이 옛값",
+    "read after write 깨짐",
+    "방금 쓴 값이 다시 개념",
+    "방금 쓴 값이 다시 정리",
+    "방금 쓴 값이 다시 실수",
     "stale after write",
     "cache replica stale read",
-    "read after write 깨짐",
     "projection lag after update",
     "min version freshness",
     "read source version router",
-    "cache invalidation replica lag"
+    "cache invalidation replica lag",
+    "stale after write cache guide"
   ],
   "expected_queries": [
     "방금 수정한 값이 다시 예전 값으로 보이면 cache랑 replica 중 어디부터 봐?",
@@ -49,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/stale-after-write-cache-replica-symptom-router.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch163"
+      }
+    ]
   }
 }

@@ -6,16 +6,18 @@
   "summary": "분산 rate limiter는 알고리즘 이름보다 먼저 정확한 global quota를 지킬 것인지, 약간의 오차를 허용하고 latency/availability를 얻을 것인지를 정해야 한다.",
   "body_markdown": "# Distributed Rate Limiter Exact vs Approximate Chooser\n\n> 한 줄 요약: 분산 rate limiter는 알고리즘 이름보다 먼저 **정확한 global quota를 지킬 것인지, 약간의 오차를 허용하고 latency/availability를 얻을 것인지**를 정해야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Rate Limit vs Queue Load Shedding Chooser](./rate-limit-vs-queue-load-shedding-chooser.md)\n- [Token Bucket Hierarchical Tenant Fairness Chooser](./token-bucket-hierarchical-tenant-fairness-chooser.md)\n- [Rate Limiter Algorithms](../algorithm/rate-limiter-algorithms.md)\n- [Count-Min Sketch](../data-structure/count-min-sketch.md)\n\nretrieval-anchor-keywords: distributed rate limiter, exact global rate limit, approximate counter, token bucket, sliding window, Redis Lua, sharded counter, Count-Min Sketch, over-admit, under-admit, tenant fairness\n\n## 먼저 문제를 나누기\n\n단일 인스턴스 rate limiter는 비교적 단순하다.\n\n```text\nuser:123 -> 현재 process memory counter\n```\n\n하지만 API 서버가 20대라면 문제가 달라진다.\n\n```text\n각 서버가 user:123을 100 req/min 허용\n전체는 최대 2000 req/min까지 열릴 수 있음\n```\n\n그래서 distributed rate limiter는 \"서버별 한도\"와 \"전역 한도(global limit)\"를 분리해서 봐야 한다.\n\n## 10초 chooser\n\n| 요구 | 먼저 볼 설계 | 이유 |\n|---|---|---|\n| 결제/보안처럼 quota 초과를 거의 허용하면 안 됨 | exact centralized limiter | correctness가 latency보다 중요하다 |\n| 대규모 read API에서 약간의 over-admit 허용 | local bucket + periodic sync | 중앙 병목을 줄인다 |\n| tenant별 상대적 fairness가 중요 | hierarchical token bucket | global + tenant limit을 나눠 잡는다 |\n| cardinality가 매우 큰 key를 대략 제한 | approximate/sketch limiter | 메모리와 처리량을 줄인다 |\n| 시스템 보호가 목적이고 개별 사용자 공정성은 부차적 | load shedding/admission control | rate limit과 다른 overload control이다 |\n\n면접에서 좋은 답은 \"Redis로 하면 됩니다\"가 아니라, 한도 초과 허용치와 장애 시 정책을 먼저 묻는 것이다.\n\n## exact limiter\n\n정확한 limiter는 모든 요청이 같은 source of truth를 통과한다.\n\n대표 모양:\n\n- Redis + Lua script로 token bucket/sliding window를 원자적으로 갱신\n- DB row counter + transaction\n- strongly consistent KV/counter service\n\n장점:\n\n- global quota를 좁게 지킬 수 있다.\n- audit과 billing에 설명하기 쉽다.\n- client별 fairness 계산이 단순하다.\n\n비용:\n\n- 중앙 store가 latency path에 들어간다.\n- hot key가 생기면 store가 병목이 된다.\n- store 장애 시 fail-open/fail-closed 결정을 해야 한다.\n- multi-region에서는 round trip 또는 consistency 비용이 커진다.\n\n정확하다는 말은 장애가 없다는 뜻이 아니다. 정확성은 중앙 판단 지점에 의존한다.\n\n## approximate limiter\n\napproximate limiter는 약간의 오차를 허용하고 확장성을 얻는다.\n\n예시:\n\n- 각 instance가 local token bucket을 갖고 주기적으로 quota lease를 받는다.\n- key별 counter를 shard에 나눠 eventual merge한다.\n- Count-Min Sketch 같은 구조로 많은 key의 빈도를 추정한다.\n- CRDT counter로 region 간 merge를 허용한다.\n\n오차는 두 방향이 있다.\n\n| 오차 | 의미 | 위험 |\n|---|---|---|\n| over-admit | 실제 한도보다 많이 허용 | abuse, 비용 증가, downstream overload |\n| under-admit | 아직 한도가 남았는데 거절 | 정상 사용자 피해, 매출/UX 손실 |\n\n어떤 오차가 더 나쁜지는 도메인마다 다르다. 로그인 brute force 방어에서는 over-admit이 위험하고, public content read API에서는 약간의 over-admit이 허용될 수 있다.\n\n## local bucket + quota lease\n\n실무에서 자주 쓰는 타협은 중앙에서 큰 quota를 작게 나눠 각 instance에 lease하는 방식이다.\n\n```text\nglobal limit: user 1000 req/min\nserver A gets 100 tokens\nserver B gets 100 tokens\n...\n```\n\n장점:\n\n- 모든 요청이 중앙 store를 치지 않는다.\n- local decision이 빠르다.\n- 중앙 store 장애에도 짧은 시간 버틸 수 있다.\n\n주의:\n\n- lease가 너무 크면 over-admit 가능성이 커진다.\n- lease가 너무 작으면 refill traffic이 많아진다.\n- traffic skew가 있으면 어떤 instance는 token이 남고 어떤 instance는 부족하다.\n- server crash 시 미사용 token 회수 정책이 필요하다.\n\n이 설계는 exact와 approximate 사이의 조절 knob를 제공한다.\n\n## sketch 기반 limiter\n\nCount-Min Sketch 같은 구조는 많은 key의 빈도 추정에 강하다. 하지만 보통 exact per-user quota enforcement와 같은 의미는 아니다.\n\n적합한 곳:\n\n- 매우 많은 IP/user-agent/path 조합의 abuse 후보 탐지\n- observability에서 high-cardinality key의 대략적인 top offender 추정\n- soft limit 또는 추가 검사의 trigger\n\n부적합한 곳:\n\n- 과금 quota처럼 정확한 차감이 필요한 곳\n- false positive로 정상 사용자를 강하게 차단하면 안 되는 곳\n- window 경계와 key 삭제가 엄격해야 하는 곳\n\nSketch는 메모리를 줄이지만 충돌과 추정 오차를 만든다. 그래서 hard enforcement 앞단의 signal로 쓰거나, soft throttle 정책과 함께 쓰는 편이 안전하다.\n\n## failure mode matrix\n\n| 증상 | 가능한 원인 | 확인 |\n|---|---|---|\n| 전체 한도를 계속 초과 | 인스턴스별 local limit만 존재 | global aggregation |\n| Redis CPU/latency 급등 | hot key exact counter | key distribution, Lua time |\n| 특정 tenant만 과도하게 거절 | shard skew, lease 배분 문제 | per-tenant allow/deny ratio |\n| 장애 때 모든 요청 허용 | fail-open 정책 | incident policy, blast radius |\n| 정상 사용자가 갑자기 차단 | sketch false positive, clock/window drift | estimator error, window boundary |\n\n분산 limiter의 운영 지표는 allowed/denied만으로 부족하다. over-limit near miss, store latency, hot key, per-tenant fairness, fallback mode 진입 여부를 같이 봐야 한다.\n\n## tenant fairness와 overload protection 분리\n\nrate limit은 주로 \"누가 얼마나 쓸 수 있는가\"를 정한다. overload protection은 \"지금 시스템이 더 받을 수 있는가\"를 정한다.\n\n두 목적을 하나로 합치면 문제가 생긴다.\n\n- 특정 tenant가 quota 안에 있어도 전체 DB가 과부하이면 거절해야 할 수 있다.\n- 전체 시스템은 한가해도 한 tenant가 quota를 넘으면 제한해야 한다.\n- VIP tenant는 더 높은 quota를 갖지만, 전체 장애 상황에서는 degraded policy가 필요하다.\n\n그래서 실무 설계는 보통 계층적이다.\n\n```text\nglobal overload admission\n  -> tenant quota/fairness\n    -> user/API-key limit\n      -> endpoint-specific burst control\n```\n\n## 검증 질문\n\n1. API 서버가 여러 대일 때 local-only limiter가 global quota를 초과하는 이유는 무엇인가?\n2. exact centralized limiter의 병목과 장애 정책은 무엇인가?\n3. approximate limiter의 over-admit과 under-admit을 도메인별로 평가할 수 있는가?\n4. quota lease 크기가 크거나 작을 때 각각 어떤 문제가 생기는가?\n5. tenant fairness와 overload admission을 같은 정책으로 처리하면 왜 위험한가?\n\n## 안전한 다음 문서\n\n- 단일 알고리즘 기본기는 [Rate Limiter Algorithms](../algorithm/rate-limiter-algorithms.md)\n- tenant 계층화는 [Token Bucket Hierarchical Tenant Fairness Chooser](./token-bucket-hierarchical-tenant-fairness-chooser.md)\n- overload 제어와의 구분은 [Rate Limit vs Queue Load Shedding Chooser](./rate-limit-vs-queue-load-shedding-chooser.md)\n\n분산 rate limiter의 핵심은 \"정확한 알고리즘\"보다 \"어떤 오차와 장애 모드를 허용할 것인가\"다. 그 결정을 내려야 Redis, local lease, sketch, CRDT 중 무엇이 맞는지 보인다.\n",
   "aliases": [
+    "분산 rate limit",
+    "정확한 분산 카운터",
+    "Distributed Rate Limiter Exact 개념",
+    "Distributed Rate Limiter Exact 정리",
+    "Distributed Rate Limiter Exact 실수",
     "distributed rate limiter",
     "exact rate limiter",
     "approximate rate limiter",
     "global rate limit",
     "sharded rate limiter",
     "Redis rate limiter",
-    "sliding window counter distributed",
-    "rate limit fairness",
-    "분산 rate limit",
-    "정확한 분산 카운터"
+    "sliding window counter distributed"
   ],
   "expected_queries": [
     "분산 rate limiter에서 exact counter와 approximate counter를 언제 골라야 해?",
@@ -53,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/distributed-rate-limiter-exact-approximate-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch163"
+      }
+    ]
   }
 }
