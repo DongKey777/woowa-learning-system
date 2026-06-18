@@ -3,32 +3,34 @@
   "title": "Kafka Partition Key Ordering Primer",
   "category": "system-design",
   "level": "intermediate",
-  "summary": "Kafka에서 ordering은 topic 전체가 아니라 partition 내부에서 먼저 보장된다. 같은 업무 key를 같은 partition으로 보내는 partition key 선택이 순서 보장, hot partition, 병렬성 trade-off를 어떻게 만드는지 설명한다.",
-  "body_markdown": "# Kafka Partition Key Ordering Primer\n\n## 한 줄 요약\n\nKafka에서 순서를 지키고 싶은 단위가 있다면 그 단위의 record가 같은 partition으로 가야 한다. Partition key는 \"무엇의 순서를 지킬 것인가\"와 \"어디까지 병렬 처리할 것인가\"를 동시에 정하는 선택이다.\n\n## topic 전체 순서가 아닌 이유\n\nKafka topic은 여러 partition으로 나뉠 수 있다. 각 partition은 offset 순서를 갖지만, 서로 다른 partition 사이에는 전역 순서가 없다. 그래서 `order-1` 이벤트가 partition 0에, `order-2` 이벤트가 partition 1에 들어가면 두 주문 사이의 전체 순서를 기대하지 않는 것이 기본이다.\n\n문제는 같은 업무 객체의 이벤트가 여러 partition으로 흩어질 때다. 주문 상태가 `CREATED -> PAID -> CANCELED` 순서로 처리되어야 하는데 key가 없거나 매번 다른 key를 쓰면 consumer가 순서를 지키기 어렵다.\n\n## key 선택의 기본 질문\n\n1. 어떤 entity의 순서가 중요한가?\n2. 그 entity id를 key로 쓰면 같은 partition으로 모이는가?\n3. key 분포가 너무 치우치지 않는가?\n4. 같은 key가 한 partition에 몰려 처리량 병목이 되지 않는가?\n5. 재처리와 retry topic에서도 같은 ordering contract를 유지하는가?\n\n주문 상태는 `orderId`, 사용자 세션 이벤트는 `userId`, 문서 수정 이벤트는 `documentId`가 후보가 될 수 있다. 하지만 인기 상품 하나에 모든 이벤트가 몰리는 `productId` 같은 key는 hot partition을 만들 수 있다.\n\n## key와 partition의 관계\n\n일반적으로 producer는 key를 hash해 partition을 고른다. 같은 topic에서 partition 수가 바뀌지 않고 같은 partitioner를 쓰면 같은 key는 같은 partition으로 간다.\n\n```text\nkey = order-123 -> hash -> partition 4\nkey = order-123 -> hash -> partition 4\nkey = order-777 -> hash -> partition 1\n```\n\n이 모델 덕분에 같은 주문 이벤트는 partition 4 안에서 offset 순서를 갖는다. 단, consumer 내부에서 같은 partition record를 worker pool에 흩뿌려 out-of-order로 처리하면 partition ordering을 스스로 깨뜨릴 수 있다.\n\n## ordering과 hot partition trade-off\n\n| key 선택 | 장점 | 위험 |\n|---|---|---|\n| orderId | 주문별 순서가 명확 | 주문 하나가 매우 hot하면 병목 |\n| userId | 사용자별 세션 흐름 유지 | heavy user가 partition을 밀 수 있음 |\n| tenantId | tenant별 순서와 격리 | 큰 tenant가 hot partition 유발 |\n| random/no key | 분산은 쉬움 | 같은 entity 순서 보장 어려움 |\n| composite key | 분산과 순서 절충 | 어떤 순서를 포기했는지 설명 필요 |\n\n중요한 점은 key가 정답 하나가 아니라는 것이다. 순서를 지킬 범위를 좁게 잡을수록 병렬성이 좋아지고, 넓게 잡을수록 순서는 강해지지만 throughput이 줄 수 있다.\n\n## retry와 DLQ에서 순서가 흔들리는 경우\n\n실패 record를 retry topic으로 빼면 main topic의 partition 순서와 다른 경로가 생긴다. 이 방식은 poison record가 전체 partition을 막는 문제를 줄이지만, 나중 record가 먼저 처리되는 관측 순서를 만들 수 있다.\n\n따라서 retry topic을 쓸 때는 다음을 결정해야 한다.\n\n- 같은 key의 후속 이벤트를 계속 처리해도 되는가?\n- 실패 이벤트가 돌아왔을 때 상태 전이가 아직 유효한가?\n- handler가 version이나 state precondition으로 stale event를 거절하는가?\n- ordering보다 availability를 우선한 선택이라고 문서화했는가?\n\n## 흔한 오해\n\n- \"Kafka topic은 전체 순서가 있다\": partition이 여러 개면 partition 내부 순서만 말해야 한다.\n- \"key만 맞으면 end-to-end 순서가 보장된다\": consumer 내부 병렬 처리, retry topic, 외부 DB transaction 순서까지 봐야 한다.\n- \"random key가 분산이 좋으니 항상 좋다\": 같은 entity 순서가 필요한 경우에는 위험하다.\n- \"partition 수를 늘리면 같은 key도 더 빨라진다\": 같은 key는 보통 한 partition에 묶이므로 hot key는 그대로 병목일 수 있다.\n- \"retry topic은 순서 문제를 해결한다\": 실패 격리는 되지만 관측 순서와 보정 정책이 필요하다.\n\n## 검증 지표\n\n- key별 event count와 partition skew\n- partition별 lag와 oldest unprocessed age\n- per-key out-of-order detected count\n- retry topic으로 빠진 key의 후속 이벤트 처리 여부\n- consumer 내부 worker queue에서 같은 key가 병렬 처리되는지\n- state transition precondition 실패율\n\n## 면접 답변 축\n\nKafka ordering 질문에는 \"topic 전체가 아니라 partition 내부 offset 순서가 기본이고, 순서를 지킬 단위를 partition key로 선택한다\"고 답한다. 이어서 key 선택은 ordering scope와 hot partition trade-off를 만들며, consumer 내부 병렬 처리와 retry topic이 그 순서를 다시 흔들 수 있다고 말하면 된다.\n\n## Safe Next Docs\n\nKafka 기초는 `kafka-foundations-topic-partition-broker-offset-beginner-primer`, delivery semantics는 `kafka-ordering-delivery-interview-primer`, partition 내 병렬 처리와 commit gap은 `kafka-out-of-order-commit-offset-gap-parallelism`으로 이어진다.\n\n---\n\n## key 선택 예시\n\n주문 이벤트가 아래처럼 온다고 하자.\n\n```text\nOrderCreated(orderId=10)\nPaymentApproved(orderId=10)\nOrderCanceled(orderId=10)\n```\n\n이 세 이벤트의 상대 순서가 중요하면 `orderId`를 key로 잡아 같은 partition으로 보내는 편이 자연스럽다. 반대로 `userId`를 key로 잡으면 같은 사용자의 이벤트는 모이지만, 같은 주문의 이벤트가 다른 partition으로 갈 수 있다. key 선택은 어떤 entity의 순서가 중요한지를 고르는 결정이다.\n\n| key 후보 | 지키는 순서 | 위험 |\n|---|---|---|\n| `orderId` | 주문 단위 상태 전이 | hot order가 있으면 특정 partition 집중 |\n| `userId` | 사용자별 activity 순서 | 주문별 전이가 흩어질 수 있음 |\n| 없음 | producer partitioner에 맡김 | ordering claim을 하기 어렵다 |\n| constant key | 전체 순서에 가까워짐 | 한 partition 병목 |\n\n## retry topic과 순서\n\nRetry topic이나 DLQ를 쓰면 원래 partition log의 뒤 record가 먼저 처리될 수 있다. 예를 들어 offset 10이 retry topic으로 빠지고 offset 11이 main path에서 성공하면, downstream 관점의 처리 완료 순서는 11이 10보다 앞설 수 있다. 같은 key ordering이 중요한 흐름은 retry 설계도 ordering requirement와 같이 봐야 한다.\n\n## 추가 한 줄 정리\n\nKafka key는 routing hint가 아니라 ordering scope 선택이며, 어떤 business entity의 순서를 지킬지와 hot partition 위험을 함께 드러내는 설계 결정이다.\n\n## key skew를 발견했을 때\n\n같은 key에 traffic이 몰리면 ordering은 지켜지지만 특정 partition lag가 계속 커질 수 있다. 이때 key를 더 잘게 쪼개면 병렬성은 좋아질 수 있지만, 기존에 보장하던 entity 순서를 잃을 수 있다. 예를 들어 `sellerId`가 hot해서 `sellerId:bucket`으로 나누면 seller 전체 순서는 깨지고 bucket 내부 순서만 남는다.\n\n따라서 key 변경은 성능 튜닝만이 아니라 ordering contract 변경이다. consumer와 downstream이 어떤 순서를 실제로 요구하는지 먼저 확인하고, 필요하다면 entity별 command stream과 집계 stream을 분리하거나 hot entity 전용 처리 경로를 따로 두는 식으로 설계를 바꾼다.\n",
+  "summary": "Kafka에서 ordering은 topic 전체가 아니라 partition 내부 offset 순서로 보장된다. 같은 key는 같은 partition으로 보내 같은 entity 순서를 지키지만, key 선택은 ordering scope, hot partition, consumer 병렬성 사이의 trade-off를 만든다.",
+  "body_markdown": "# Kafka Partition Key Ordering Primer\n\n## 한 줄 요약\n\nKafka에서 같은 key는 보통 같은 partition으로 간다. 그래서 같은 주문, 같은 사용자, 같은 문서처럼 순서를 지켜야 하는 entity를 partition key로 잡으면 그 entity의 record들이 한 partition log 안에서 offset 순서를 갖는다. 단, 이것은 topic 전체 순서가 아니라 per-partition ordering이다.\n\n## Kafka에서 같은 key는 왜 같은 partition으로 보내?\n\nProducer는 record key를 partitioner에 넘기고, 기본적인 모델에서는 key hash로 partition을 고른다. 같은 topic에서 partition 수와 partitioner가 그대로라면 같은 key는 같은 partition으로 매핑된다.\n\n```text\nkey = order-123 -> hash -> partition 4 -> offset 10\nkey = order-123 -> hash -> partition 4 -> offset 11\nkey = user-77   -> hash -> partition 1 -> offset 80\n```\n\n이 구조 덕분에 `order-123`의 `CREATED -> PAID -> CANCELED` 이벤트는 partition 4 내부에서 순서대로 읽을 수 있다. Kafka가 \"같은 key는 같은 partition으로\" 보내는 이유는 같은 업무 단위의 순서를 한 append-only log 안에 모으기 위해서다.\n\n## topic 전체 순서가 보장되는 게 아닌 이유\n\nTopic은 여러 partition으로 나뉠 수 있고, 각 partition은 자기 offset 순서만 가진다. Partition 0의 offset 20과 partition 1의 offset 20 사이에는 전역적으로 누가 먼저라는 순서가 없다. Consumer도 partition별로 병렬 소비할 수 있으므로, `order-1`이 partition 0에 있고 `order-2`가 partition 1에 있으면 topic 전체에서 두 record의 처리 순서를 기대하면 안 된다.\n\n따라서 Kafka ordering을 말할 때는 \"topic 전체 순서\"가 아니라 \"같은 partition 안의 offset 순서\"라고 표현해야 한다. 모든 record를 하나의 partition에 넣으면 topic 전체 순서에 가까워지지만, 그 순간 병렬성은 거의 사라진다.\n\n## partition key를 잘못 잡으면 hot partition이 생기는 이유\n\nPartition key는 두 가지를 동시에 정한다.\n\n1. 어떤 entity의 순서를 지킬 것인가\n2. traffic을 partition들에 얼마나 고르게 나눌 것인가\n\n예를 들어 주문 상태 전이가 중요하면 `orderId`가 자연스럽다. 사용자별 activity 흐름이 중요하면 `userId`가 후보가 된다. 하지만 큰 tenant 하나에 이벤트가 몰리는데 `tenantId`를 key로 쓰면 그 tenant의 record가 한 partition으로 몰려 hot partition이 된다. 순서는 강해지지만 그 partition의 lag가 커지고 consumer 병렬성이 제한된다.\n\n| key 후보 | 지키는 순서 | 병렬성/분산 위험 |\n|---|---|---|\n| `orderId` | 주문별 상태 전이 | 특정 주문이 매우 hot하면 한 partition 병목 |\n| `userId` | 사용자별 활동 흐름 | heavy user가 partition lag를 키울 수 있음 |\n| `tenantId` | tenant별 순서와 격리 | 큰 tenant 하나가 hot partition을 만들 수 있음 |\n| `productId` | 상품별 이벤트 흐름 | 인기 상품 key가 과도하게 집중될 수 있음 |\n| constant key | topic 전체 순서에 가까움 | 사실상 한 partition 처리량에 묶임 |\n| null/no key | 분산은 쉬움 | 같은 entity 순서 보장을 주장하기 어려움 |\n\n좋은 key는 \"필요한 ordering scope\"를 충분히 지키면서도 traffic skew를 감당할 수 있어야 한다. 순서 범위를 넓게 잡을수록 병렬성은 줄고, 순서 범위를 잘게 나눌수록 처리량은 좋아지지만 기존에 기대하던 순서를 잃을 수 있다.\n\n## null key와 round-robin caveat\n\nKey가 null이면 producer는 같은 entity를 같은 partition으로 묶어준다는 약속을 하기 어렵다. Kafka client 버전과 partitioner 설정에 따라 round-robin 또는 sticky partitioning처럼 key 없는 record를 분산시키는 전략이 쓰일 수 있다. 이 방식은 throughput에는 유리하지만, 같은 주문의 후속 이벤트가 다른 partition으로 갈 수 있다.\n\n그래서 `key=null`로 produce하면서 \"같은 주문 이벤트는 순서대로 처리될 것\"이라고 말하면 설계 근거가 약하다. 순서가 필요한 흐름은 key를 명시하고, key가 없는 이벤트는 애초에 per-entity ordering claim을 하지 않는 편이 낫다.\n\n## partition 수 변경과 key migration\n\n같은 key가 같은 partition으로 간다는 말에는 전제가 있다. Topic의 partition 수가 바뀌거나 partitioner가 바뀌면 `hash(key) % partitionCount` 결과가 달라질 수 있고, 새 record가 이전과 다른 partition으로 갈 수 있다. 기존 log가 자동으로 재정렬되는 것도 아니다.\n\n따라서 partition count 변경, key schema 변경, `userId`에서 `orderId`로 바꾸는 repartitioning은 성능 튜닝이 아니라 ordering contract 변경이다. Migration 동안에는 old key와 new key가 공존할 수 있으므로 consumer가 어떤 기준으로 state를 읽고 갱신하는지, downstream이 어느 시점부터 새 ordering scope를 믿어도 되는지 명시해야 한다.\n\n## stateful processing의 전제\n\n같은 key를 같은 partition에 모으는 이유는 consumer가 key별 state를 순서대로 갱신하기 쉽게 만들기 위해서다. 예를 들어 주문 상태 store가 `CREATED -> PAID -> SHIPPED`만 허용한다면, 같은 `orderId` 이벤트를 한 partition에서 순서대로 읽는 것이 전제에 가깝다.\n\nKafka Streams의 state store도 이 아이디어와 맞닿아 있다. 같은 key가 같은 task/partition 쪽으로 모여야 local state를 일관되게 갱신할 수 있다. 다만 이 문서의 범위는 partition key와 ordering foundation이다. Streams의 repartition topic, changelog, standby replica 같은 세부 설계는 별도 문서로 넘긴다.\n\n## out-of-order commit과 consumer 내부 병렬 처리\n\nKey를 잘 골라도 consumer가 partition record를 worker pool에 무작정 흩뿌리면 순서를 스스로 깨뜨릴 수 있다. Partition 4에서 offset 10, 11을 순서대로 읽었더라도 offset 11 작업이 먼저 끝나고 commit되면 downstream 관점에서는 뒤 record가 먼저 반영될 수 있다.\n\n이 문제는 `kafka-out-of-order-commit-offset-gap-parallelism`의 주제다. 여기서는 원칙만 기억하면 된다. Kafka가 보장하는 것은 partition log의 read order이고, application이 병렬 처리와 commit 정책으로 그 순서를 유지할 책임이 남는다.\n\n## retry와 DLQ에서 순서가 흔들리는 경우\n\n실패 record를 retry topic이나 DLQ로 빼면 main topic의 partition 순서와 다른 경로가 생긴다. 예를 들어 offset 10이 retry로 빠지고 offset 11이 main path에서 성공하면, 처리 완료 순서는 11이 10보다 앞설 수 있다.\n\nRetry를 쓸 때는 다음을 정해야 한다.\n\n- 같은 key의 후속 이벤트를 계속 처리해도 되는가?\n- 실패 이벤트가 돌아왔을 때 현재 state 전이에 아직 유효한가?\n- handler가 version, sequence, state precondition으로 stale event를 거절하는가?\n- ordering보다 availability를 우선한 선택이라고 문서화했는가?\n\n## 흔한 오해\n\n- \"Kafka topic은 전체 순서가 있다\": partition이 여러 개면 partition 내부 순서만 말해야 한다.\n- \"같은 key면 무조건 end-to-end 순서가 보장된다\": consumer 내부 병렬 처리, commit, retry, 외부 DB 반영 순서까지 봐야 한다.\n- \"null key도 Kafka가 알아서 같은 entity를 묶어준다\": key가 없으면 entity 기준 partition affinity를 기대하기 어렵다.\n- \"partition 수를 늘리면 hot key도 빨라진다\": 같은 key는 보통 한 partition에 묶이므로 hot key 병목은 그대로일 수 있다.\n- \"key migration은 단순 배포다\": 어떤 순서 보장을 바꾸는지, old/new key 공존을 어떻게 처리하는지 설계해야 한다.\n\n## 검증 지표\n\n- key별 event count와 partition skew\n- partition별 lag와 oldest unprocessed age\n- per-key out-of-order detected count\n- null key 비율과 ordering claim이 있는 topic 여부\n- partition count 변경 또는 repartitioning 이후 key별 partition 이동률\n- consumer worker queue에서 같은 key가 동시에 처리되는지\n- state transition precondition 실패율\n\n## 면접 답변 축\n\nKafka ordering 질문에는 \"같은 key는 같은 partition으로 보내 partition 내부 offset 순서를 얻지만, topic 전체 순서는 보장되지 않는다\"고 답한다. 이어서 key 선택은 ordering scope와 hot partition, consumer 병렬성의 trade-off이며, partition 수 변경, key migration, retry, consumer 내부 병렬 처리가 그 순서를 다시 흔들 수 있다고 덧붙이면 된다.\n\n## Safe Next Docs\n\nKafka 기초는 `kafka-foundations-topic-partition-broker-offset-beginner-primer`, delivery semantics는 `kafka-ordering-delivery-interview-primer`, partition 내 병렬 처리와 commit gap은 `kafka-out-of-order-commit-offset-gap-parallelism`, partition count 판단은 `kafka-partition-count-consumer-parallelism-primer`로 이어진다.\n",
   "aliases": [
     "Kafka partition key ordering",
     "카프카 파티션 키",
     "topic 전체 순서",
     "partition ordering scope",
-    "orderId key Kafka",
-    "hot partition key",
-    "카프카 순서 범위",
-    "retry topic ordering",
     "same key same partition",
-    "키 선택 tradeoff"
+    "hot partition key",
+    "null key round robin",
+    "카프카 순서 범위",
+    "key repartitioning",
+    "ordering parallelism tradeoff",
+    "stateful processing key"
   ],
   "expected_queries": [
-    "Kafka에서 partition key를 어떻게 잡아야 같은 주문 이벤트 순서를 지킬 수 있어?",
-    "카프카 topic 전체 순서가 아니라 partition 내부 순서라고 말하는 이유가 뭐야?",
-    "orderId를 key로 쓰면 ordering은 좋아지지만 hot partition이 생길 수 있다는 말이 무슨 뜻이야?",
-    "Kafka retry topic을 쓰면 같은 key의 순서가 어떻게 흔들릴 수 있어?",
-    "consumer 내부에서 partition record를 병렬 처리하면 partition ordering을 깰 수 있어?",
-    "Kafka partition key 선택을 면접에서 ordering scope와 병렬성 trade-off로 설명해줘"
+    "Kafka에서 같은 key는 왜 같은 partition으로 보내?",
+    "topic 전체 순서가 보장되는 게 아닌 이유가 뭐야?",
+    "partition key를 잘못 잡으면 hot partition이 생기는 이유를 설명해줘",
+    "Kafka에서 null key나 round-robin produce를 쓰면 같은 entity 순서가 깨질 수 있어?",
+    "partition 수를 늘리거나 key를 migration하면 같은 key ordering contract가 어떻게 바뀌어?",
+    "Kafka retry topic을 쓰면 같은 key의 순서가 어떻게 흔들릴 수 있어?"
   ],
   "symptoms": [
     "Kafka topic 전체 순서가 보장된다고 말한다",
     "key 없이 produce하면서 같은 주문 이벤트 순서를 기대한다",
-    "retry topic으로 뺐는데 후속 이벤트가 먼저 처리되는 상황을 놓친다"
+    "retry topic으로 뺐는데 후속 이벤트가 먼저 처리되는 상황을 놓친다",
+    "partition 수 변경이나 key migration이 ordering contract 변경이라는 점을 놓친다"
   ],
   "relations": {
     "prerequisites": [
@@ -38,6 +40,7 @@
     "next_docs": [
       "system-design/kafka-ordering-delivery-interview-primer",
       "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/kafka-partition-count-consumer-parallelism-primer",
       "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager"
     ],
     "confusable_with": [
@@ -54,10 +57,10 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/system-design/kafka-partition-key-ordering-primer.md",
     "revision_history": [],
-    "updated_at": "2026-06-18T00:00:00+09:00",
-    "last_expansion_source": "y14-expansion-batch98-stream-c-kafka-foundation-depth"
+    "updated_at": "2026-06-19T00:00:00+09:00",
+    "last_expansion_source": "batch176-kafka-messaging-residuals"
   }
 }

@@ -1,0 +1,72 @@
+{
+  "id": "system-design/inline-retry-head-of-line-blocking-consumer-lag-card",
+  "title": "Inline Retry Head-of-Line Blocking Consumer Lag Card",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka consumer가 실패 record를 같은 partition 처리 loop 안에서 retry, sleep, backoff로 계속 붙잡으면 뒤 record가 시작하지 못해 partition head-of-line blocking이 생기고 consumer lag가 증가한다. 이 카드는 일반 retry나 DLQ 자체가 아니라, one bad message가 partition progress를 막아 lag와 max.poll.interval.ms 위험으로 이어지는 증상을 다룬다.",
+  "body_markdown": "# Inline Retry Head-of-Line Blocking Consumer Lag Card\n\n> 한 줄 요약: Kafka consumer에서 실패 메시지를 inline으로 계속 재시도하면 그 partition의 다음 record가 처리되지 못하고 consumer lag가 쌓인다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Inline Retry Head-of-Line Blocking Primer](./inline-retry-head-of-line-blocking-primer.md)\n- [Kafka Consumer Group Partition Ownership Primer](./kafka-consumer-group-partition-ownership-primer.md)\n- [Kafka Offset Commit Timing and At-Least-Once Card](./kafka-offset-commit-timing-at-least-once-card.md)\n- [Tiered Retry Topic Ladder, Backoff, and DLQ](./tiered-retry-topic-ladder-backoff-dlq.md)\n- [Kafka Consumer Group Rebalance: Cooperative vs Eager](./kafka-consumer-group-rebalance-cooperative-vs-eager.md)\n\nretrieval-anchor-keywords: Kafka inline retry consumer lag, one bad message blocks partition progress, retry sleep backoff in consumer loop, poison record partition lag, max.poll.interval.ms inline retry, pause resume retry topic ladder, 한 메시지 실패 뒤 record 밀림, 카프카 인라인 재시도 lag, retry topic으로 빼는 이유, consumer lag head-of-line blocking\n\n---\n\n## 문제: 실패 record 하나가 partition 진행을 붙잡는다\n\nKafka consumer는 partition에서 offset 순서대로 record를 가져오고, 같은 group 안에서 partition ownership을 가진 consumer가 그 partition의 진행을 책임진다. 이때 handler가 실패 record를 잡은 채 같은 call stack 안에서 retry하거나 `Thread.sleep`으로 backoff를 기다리면 뒤 record는 poll되어 있어도 업무 처리를 시작하지 못한다.\n\n```text\npartition 0\n  offset 120: poison record -> retry -> sleep 10s -> retry -> sleep 30s\n  offset 121: ready, but waits behind 120\n  offset 122: ready, but waits behind 120\n```\n\n이 증상은 retry 횟수만의 문제가 아니다. 핵심은 실패 record가 partition lane을 얼마나 오래 점유하느냐다. 한 메시지가 계속 실패하면 해당 partition의 committed offset이 전진하지 않고, consumer lag와 oldest record age가 커진다.\n\n---\n\n## 왜 consumer lag와 max.poll.interval.ms 위험이 같이 온다\n\nInline retry가 consumer loop를 오래 막으면 두 가지가 동시에 악화된다.\n\n| 현상 | 원인 | 결과 |\n|---|---|---|\n| partition lag 증가 | 실패 offset 뒤 record를 처리하지 못함 | 같은 partition의 정상 record도 뒤로 밀림 |\n| poll 간격 증가 | retry, sleep, 긴 timeout이 poll loop 안에서 실행됨 | `max.poll.interval.ms` 초과 시 group에서 쫓겨날 수 있음 |\n| 다른 partition 처리 지연 | single-thread consumer가 sleep 중이면 다른 assigned partition도 못 봄 | group 전체 처리량 저하 |\n| 반복 실패 noise | deterministic poison을 transient처럼 계속 재시도함 | lag, error log, downstream 호출이 함께 증가 |\n\n`max.poll.interval.ms`를 크게 늘리면 rebalance는 늦출 수 있지만, poison record가 partition progress를 막는 사실은 사라지지 않는다. timeout 값을 키워 숨기는 대신 실패를 main path에서 어떻게 분리할지 결정해야 한다.\n\n---\n\n## poison record를 transient failure처럼 다루면 생기는 일\n\n일시적인 502, 503, rate limit은 짧은 retry로 회복될 수 있다. 하지만 schema mismatch, deterministic parser bug, business invariant 위반처럼 같은 payload가 계속 실패하는 poison record는 같은 자리에서 반복해도 성공하지 않는다.\n\n```text\noffset 120: missing required field\nhandler: retry 1 -> retry 2 -> retry 3 -> sleep -> retry\npartition: 121, 122, 123 all waiting\n```\n\n이때 운영자가 보는 표면 증상은 \"consumer lag가 늘었다\"지만, 근본 원인은 consumer group 병렬성이 부족한 것이 아니라 한 partition의 앞 record를 실패 처리하지 못한 것이다. consumer를 더 늘려도 이미 한 consumer가 소유한 partition 내부의 121번 이후 record는 120번 처리 정책이 끝나기 전까지 진행되지 않는다.\n\n---\n\n## 대안 1: pause/resume은 sleep보다 낫지만 뒤 record는 여전히 기다린다\n\nKafka consumer API의 `pause(partition)` / `resume(partition)`은 실패 partition에서 더 가져오지 않으면서 poll loop와 heartbeat를 유지하는 데 쓸 수 있다. single-thread consumer가 `sleep`으로 멈추는 것보다 낫고, 같은 consumer가 맡은 다른 partition을 처리할 여지도 생긴다.\n\n다만 pause/resume은 실패 partition의 뒤 record를 먼저 처리하게 해 주는 장치가 아니다. partition ordering을 지키려면 offset 120을 붙잡는 동안 121 이후는 여전히 기다린다. 따라서 pause/resume은 \"poll loop와 heartbeat를 살려 두는 완화책\"이고, main partition의 뒤 record까지 계속 흘려보내려면 실패 record를 retry topic이나 DLQ 같은 별도 경로로 빼는 선택이 필요하다.\n\n---\n\n## 대안 2: retry topic ladder로 main path를 비운다\n\nRetry topic ladder는 실패 record를 `main -> retry-1m -> retry-10m -> DLQ` 같은 별도 topic으로 옮겨 main topic consumer가 뒤 record를 계속 처리하게 만드는 패턴이다.\n\n```text\nmain partition 0 offset 120 failure\n  -> publish to retry-1m with originalTopic/originalPartition/originalOffset/attempt\n  -> commit main offset according to policy\n  -> process offset 121, 122, 123\n```\n\n이 방식은 consumer lag를 줄일 수 있지만 공짜가 아니다. main topic에서 뒤 record가 먼저 처리될 수 있으므로 per-key ordering이 약해지고, retry publish 성공 후 main offset commit 실패 같은 at-least-once 중복 창도 생긴다. 그래서 retry topic ladder는 idempotent handler, attempt header, failure classification, DLQ replay runbook과 함께 설계해야 한다.\n\n---\n\n## 무엇과 다른가\n\n| 헷갈리는 주제 | 이 카드의 경계 |\n|---|---|\n| general retry | retry를 몇 번 할지가 아니라 retry가 consumer partition lane을 막는지가 핵심이다 |\n| DLQ | DLQ는 terminal failure를 격리하고 replay하는 운영 장치다. 이 카드는 DLQ로 가기 전 main partition이 막히는 증상을 다룬다 |\n| tiered retry topic | retry topic ladder는 해결 패턴이다. 이 카드는 왜 ladder가 필요한지, 즉 one bad message가 lag를 만드는 원인을 설명한다 |\n| Kafka rebalance | rebalance는 partition ownership 재조정이다. inline retry가 `max.poll.interval.ms`를 넘기면 rebalance가 결과로 생길 수 있지만 원인은 긴 처리와 sleep이다 |\n| offset commit timing | commit 전/후의 유실·중복 선택도 중요하지만, 여기서는 실패 record가 완료되지 않아 offset 자체가 전진하지 않는 문제가 중심이다 |\n\n---\n\n## 진단 질문\n\n1. 실패 record 처리 중 consumer thread가 `sleep`, 긴 timeout, blocking retry loop에 묶이는가?\n2. lag가 모든 partition이 아니라 특정 partition이나 특정 key 주변에서 먼저 증가하는가?\n3. poll 간격이나 processing latency가 `max.poll.interval.ms`에 가까워지는가?\n4. 실패가 transient인지, 같은 payload가 항상 실패하는 poison인지 분류했는가?\n5. 뒤 record를 막아도 되는 ordering 요구가 있는가, 아니면 retry topic으로 빼도 되는가?\n6. retry topic으로 publish한 뒤 main offset commit과 idempotency 중복 창을 설계했는가?\n\n---\n\n## 면접/리뷰 답변 골격\n\n\"Kafka consumer에서 한 메시지를 처리하다 실패했을 때 같은 partition consumer loop 안에서 계속 retry하거나 sleep하면 그 offset 뒤의 record가 처리되지 못합니다. 그래서 정상 record가 뒤에 있어도 partition progress가 멈추고 consumer lag가 커집니다. 시간이 길어지면 poll 간격이 늘어 `max.poll.interval.ms` 초과와 rebalance 위험도 생깁니다. 짧고 bounded된 retry는 가능하지만, 긴 backoff나 poison record는 pause/resume으로 poll loop를 살리거나 retry topic ladder, DLQ로 분리해야 합니다. retry topic으로 빼면 main path는 비지만 ordering과 at-least-once 중복 처리를 별도로 설계해야 합니다.\"\n\n## 한 줄 정리\n\nInline retry가 Kafka consumer lag를 만드는 이유는 실패 메시지가 retry 중인 동안 같은 partition의 뒤 record가 진행할 수 없기 때문이다. 그래서 긴 backoff와 poison record는 main consumer loop 안에서 붙잡지 말고 pause/resume, retry topic ladder, DLQ 정책으로 분리해 다룬다.\n",
+  "aliases": [
+    "Kafka inline retry consumer lag",
+    "inline retry HOL consumer lag",
+    "Kafka consumer retry sleep lag",
+    "poison record partition lag",
+    "max.poll.interval inline retry",
+    "one bad message blocks partition",
+    "카프카 인라인 재시도 lag",
+    "한 메시지 실패 뒤 record 밀림",
+    "retry topic으로 빼는 이유",
+    "consumer sleep backoff blocking",
+    "partition head-of-line retry"
+  ],
+  "expected_queries": [
+    "Kafka consumer에서 한 메시지만 계속 실패하면 왜 뒤 record가 밀려?",
+    "inline retry가 consumer lag를 만드는 이유가 뭐야?",
+    "retry topic으로 빼는 이유가 뭐야?",
+    "Kafka consumer loop에서 Thread.sleep backoff를 하면 max.poll.interval.ms랑 lag에 어떤 문제가 생겨?",
+    "poison record 하나 때문에 partition lag가 늘 때 pause/resume이랑 retry topic 중 뭘 봐야 해?",
+    "main topic에서 실패 메시지를 계속 재시도하면 뒤 메시지가 왜 처리 안 돼?"
+  ],
+  "symptoms": [
+    "consumer loop에서 실패 record를 잡고 sleep/retry해 같은 partition 뒤 record가 시작하지 못한다.",
+    "한 partition lag와 oldest age가 증가하고 poll 간격이 늘어 max.poll.interval.ms 초과 위험이 생긴다.",
+    "deterministic poison record를 retryable처럼 다뤄 main topic 진행이 멈춘다.",
+    "rebalance lag spike로만 보고 실제 원인인 inline retry 점유를 놓친다.",
+    "retry topic이나 DLQ가 아니라 같은 consumer 안 backoff로 긴 지연을 구현한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/inline-retry-head-of-line-blocking-primer",
+      "system-design/kafka-consumer-group-partition-ownership-primer",
+      "system-design/kafka-offset-commit-timing-at-least-once-card"
+    ],
+    "next_docs": [
+      "system-design/tiered-retry-topic-ladder-backoff-dlq",
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager",
+      "system-design/dlq-poison-message-replay-playbook"
+    ],
+    "confusable_with": [
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser",
+      "system-design/dlq-poison-message-replay-playbook",
+      "system-design/tiered-retry-topic-ladder-backoff-dlq",
+      "system-design/kafka-consumer-group-rebalance-cooperative-vs-eager"
+    ],
+    "forbidden_for_queries": [
+      "DLQ에 쌓인 poison message를 운영에서 어떻게 분류하고 replay해?",
+      "Kafka cooperative rebalance와 eager rebalance 차이를 설명해줘",
+      "retry timeout circuit breaker를 일반 장애 복원력 패턴으로 비교해줘",
+      "retry topic ladder의 attempt header와 DLQ runbook을 자세히 설계해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "batch176-kafka-messaging-residuals"
+      }
+    ]
+  }
+}
