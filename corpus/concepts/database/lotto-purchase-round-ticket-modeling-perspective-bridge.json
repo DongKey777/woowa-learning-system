@@ -6,17 +6,18 @@
   "summary": "이 문서는 lotto 미션에서 purchase, round, ticket, winning numbers를 DB 모델링 관점으로 나누는 bridge다. Purchase는 한 번의 구매 행위와 금액, Ticket은 개별 번호 조합, Round는 추첨 회차, WinningNumbers는 회차별 당첨 번호를 표현한다. 객체 모델과 테이블 모델을 억지로 1:1로 맞추기보다 cardinality와 조회 요구를 먼저 본다.",
   "body_markdown": "# Lotto Purchase, Round, Ticket Modeling Perspective Bridge\n\n## 모델링 기준\nPurchase는 사용자가 한 번에 산 묶음이다. Ticket은 실제 번호 6개를 가진 개별 항목이다. Round는 몇 회차인지와 추첨 일정을 가진다. WinningNumbers는 round에 속한 당첨 번호와 bonus number를 가진다. 한 purchase는 여러 ticket을 가질 수 있고, 한 round는 여러 purchase와 winning numbers를 연결한다.\n\n## 빠른 분기\n구매 금액과 구매 시각은 purchase에 둔다. 번호 조합은 ticket에 둔다. 당첨 번호는 winning numbers에 둔다. 회차 상태와 추첨 일자는 round에 둔다. 통계 조회가 많아지면 aggregation table이나 query model을 별도로 검토한다.\n\n## 흔한 오해\nLottos 일급 컬렉션이 있다고 반드시 lottos table이 필요한 것은 아니다. 테이블은 cardinality와 lifecycle로 나누고, domain 객체는 invariant와 행동으로 나눈다.\n\n## 실전 시나리오\n사용자가 5장을 구매하고, 나중에 특정 회차의 당첨번호가 입력된 뒤 통계를 조회한다고 하자. `round`는 회차와 추첨일, 당첨번호를 가진다. `purchase`는 사용자와 구매 시점, 금액을 가진다. `ticket`은 purchase에 속한 한 장의 번호 조합이다. 당첨번호를 ticket마다 복사하면 회차 수정이나 재채점이 어려워진다. 반대로 ticket이 round와 연결되지 않으면 어느 회차 기준인지 모호해진다.\n\n```text\n간단한 관계\nround(id, draw_date, winning_numbers, bonus_number)\npurchase(id, user_id, round_id, purchased_at, amount)\nticket(id, purchase_id, numbers)\n```\n\n## 다음 행동\n- 1회 구매가 여러 ticket을 가지는지 cardinality를 먼저 정한다.\n- 당첨번호는 round에 두고 ticket에는 구매 번호만 둔다.\n- 통계 조회는 purchase -> tickets -> round winning numbers 순서로 계산하거나 별도 result projection을 둔다.\n\n## 확인 질문\n이 데이터는 회차에 속하는가, 구매 행위에 속하는가, 구매 안의 개별 티켓에 속하는가?\n\n## CS 배경: entity relationship와 normalization\nPurchase, Round, Ticket 모델링은 ER modeling의 기본 문제다. Entity는 identity와 lifecycle을 가지고, relationship은 cardinality와 ownership을 가진다. `purchase 1:N ticket`, `round 1:N purchase`처럼 cardinality를 명확히 해야 중복 저장과 update anomaly를 줄일 수 있다.\n\nNormalization 관점에서는 당첨번호를 ticket마다 복사하지 않고 round에 둔다. 이렇게 하면 update anomaly를 줄이지만 join이 필요해진다. 조회 성능이 중요해지면 result projection이나 denormalized summary를 둘 수 있지만, source of truth와 projection을 구분해야 한다.\n\n## 깊게 볼 포인트\nER 모델링에서는 “사실을 한 번만 저장한다”는 원칙과 “자주 읽는 모양으로 빠르게 읽는다”는 요구가 충돌한다. Lotto에서는 ticket numbers를 정규화해 `ticket_number(ticket_id, number)`로 둘 수도 있고, 작은 고정 배열/JSON으로 둘 수도 있다. 전자는 제약과 검색이 명확하고, 후자는 단순하지만 DB 제약이 약해질 수 있다. Round winning numbers도 별도 child table로 둘지 value column으로 둘지 선택해야 한다. 중요한 것은 source of truth를 명확히 하고, 통계 조회 성능이 필요할 때 projection을 추가하되 원본과의 동기화 책임을 기록하는 것이다.\n\n## 추가 예시\n통계 조회 API가 느려지면 바로 원본 모델을 망가뜨리기보다 `round_result_summary` 같은 projection을 따로 둘 수 있다. 원본은 `round`, `purchase`, `ticket`으로 정규화하고, projection은 회차별 등수 count와 총 당첨금을 저장한다. 이때 projection은 언제 갱신되는지, 원본 수정 시 재계산 가능한지, source of truth가 아닌 캐시성 테이블인지 명확히 표시해야 한다.\n\n## 짧은 점검\nDB 모델을 고른 뒤에는 sample row 세 개를 직접 써 본다. 한 구매에 티켓 두 장, 같은 회차의 다른 구매 한 건, 다음 회차 구매 한 건을 넣어 보면 foreign key 위치와 중복 저장 여부가 바로 드러난다.\n\n## 품질 관점\n정합성, isolation, lock/plan/replication failure mode를 테스트와 실행 계획으로 함께 검증한다. 이 문서의 답변 품질은 `Lotto Purchase, Round, Ticket Modeling Perspective Bridge`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`query_p95_ms, lock_wait_p99_ms, rows_examined, plan_hash_change_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
   "aliases": [
+    "로또 구매 회차 티켓 모델링",
+    "로또 테이블 설계",
+    "구매 티켓 회차 당첨번호",
+    "Lotto Purchase, Round, Ticket 개념",
+    "Lotto Purchase, Round, Ticket 정리",
     "lotto purchase round ticket modeling",
     "lotto DB modeling",
     "purchase ticket round winning numbers",
     "lotto parent child table",
-    "로또 구매 회차 티켓 모델링",
-    "로또 테이블 설계",
-    "구매 티켓 회차 당첨번호",
     "lotto cardinality modeling",
     "lotto purchase ticket relationship",
-    "winning numbers round table",
-    "lotto purchase round ticket winning numbers database modeling cardinality parent child table"
+    "winning numbers round table"
   ],
   "expected_queries": [
     "lotto 구매 회차 티켓 당첨번호를 DB 테이블로 어떻게 나눠야 해?",
@@ -53,7 +54,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -66,6 +67,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch153"
       }
     ]
   }

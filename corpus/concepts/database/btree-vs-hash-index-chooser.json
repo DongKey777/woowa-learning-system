@@ -6,28 +6,18 @@
   "summary": "거의 모든 경우 B-Tree가 default이며, Hash는 \"정확히 등호 조회만\" + \"memory storage 또는 PostgreSQL\"이라는 좁은 조건에서만 의미가 있다. Partial / Expression / Covering 인덱스는 B-Tree의 변형.",
   "body_markdown": "# B-Tree vs Hash Index chooser — 인덱스 종류 선택\n\n> 한 줄 요약: 거의 모든 경우 **B-Tree가 default**이며, Hash는 \"정확히 등호 조회만\" +\n> \"memory storage 또는 PostgreSQL\"이라는 좁은 조건에서만 의미가 있다. Partial /\n> Expression / Covering 인덱스는 B-Tree의 변형.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [인덱스 기초](./index-basics.md)\n- [인덱스와 실행 계획](./index-and-explain.md)\n- [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n- [정규화 기초](./normalization-basics.md)\n- [database 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: btree vs hash index chooser, B-Tree default 인덱스, Hash index 등호 only, MySQL Memory storage hash, PostgreSQL hash 9.4+, partial index expression index, covering index 작동, selectivity 인덱스, bitmap index 낮은 cardinality, range vs equality 쿼리\n\n## 먼저 멘탈모델\n\n인덱스의 본질은 \"**WHERE 조건에 매칭되는 row를 빠르게 찾는 보조 자료구조**\".\n같은 목적이라도 자료구조에 따라 잘하는 쿼리 패턴이 다르다.\n\n| 인덱스 종류 | 자료구조 | 잘하는 쿼리 | 잘 못하는 쿼리 |\n|---|---|---|---|\n| **B-Tree** | balanced tree | equality, range, prefix LIKE, ORDER BY | full-text, complex pattern |\n| **Hash** | hash table | equality (=) only | range, ORDER BY, prefix |\n| **Bitmap** | bitmap | 낮은 cardinality (성별, 상태) | 높은 update 빈도 |\n| **Full-text** | inverted index | natural language search | 정확한 equality |\n| **Spatial** | R-tree, geohash | 위치 query | 일반 쿼리 |\n\n## 30초 분기표\n\n| 쿼리 패턴 | 권장 인덱스 |\n|---|---|\n| `WHERE id = 123` (PK 또는 unique) | B-Tree (default) |\n| `WHERE email = 'x@y.com'` (text equality) | B-Tree (또는 PostgreSQL Hash) |\n| `WHERE created_at > '2024-01-01'` (range) | **B-Tree** (Hash 안 됨) |\n| `ORDER BY ... LIMIT 10` | B-Tree |\n| `WHERE name LIKE 'kim%'` (prefix) | B-Tree |\n| `WHERE name LIKE '%kim%'` (substring) | **Full-text** (또는 B-Tree 못 씀) |\n| `WHERE status = 'active'` (2-3 값 only) | Bitmap (만 약 cardinality 낮을 때) |\n| `WHERE location_distance < 5km` | Spatial |\n| 자주 같이 조회되는 컬럼들 | **Covering index** |\n| 일부 row만 인덱스 (조건부) | **Partial index** |\n| 계산된 값으로 조회 (`LOWER(email)`) | **Expression index** |\n\n## B-Tree 인덱스 — Default\n\n### 작동 원리\n\n```\n        [50]\n       /    \\\n    [25]    [75]\n   /  \\    /  \\\n [10][30][60][90]\n```\n\n- 항상 정렬된 상태 유지\n- 깊이 O(log n) → 100만 row도 깊이 3-4\n- root → leaf 따라가며 매칭 row 찾음\n\n### B-Tree가 잘하는 것\n\n- **Equality**: `WHERE id = 5` → root → leaf로 O(log n)\n- **Range**: `WHERE id BETWEEN 10 AND 50` → leaf에서 정렬된 range scan\n- **ORDER BY**: 인덱스 정렬 순서가 그대로 답 → sort 생략\n- **Prefix LIKE**: `WHERE name LIKE 'kim%'` → range scan\n- **`IS NULL`**: 인덱스에 NULL도 들어 있음 (DB마다 다름)\n\n### B-Tree가 못 하는 것\n\n- **Suffix LIKE**: `WHERE name LIKE '%kim'` → 모든 row 봐야 함\n- **Function**: `WHERE LOWER(name) = 'kim'` → 인덱스 못 씀 (Expression index 필요)\n- **Full-text search**: \"이 단어가 어디 들어 있나\" → Full-text index 필요\n\n## Hash 인덱스 — 좁은 use case\n\n### 작동 원리\n\n```\nhash(\"kim\") = 1234\nhash(\"park\") = 5678\n\ntable:\n  1234 → [row pointer]\n  5678 → [row pointer]\n```\n\n- O(1) equality lookup (이론적으로)\n- 정렬 정보 없음 → range/ORDER BY 불가\n\n### MySQL Hash 인덱스 한정\n\n- **InnoDB는 hash 인덱스 직접 지원 X** (Adaptive Hash Index는 자동 최적화로 일부 lookup이 hash 처리되지만 사용자 제어 X)\n- **Memory storage engine**만 명시적 hash 인덱스 (temporary table 등)\n- 일반 쿼리에선 거의 안 쓰임\n\n```sql\n-- MySQL: 거의 의미 없음\nCREATE TABLE t (x INT, INDEX(x) USING HASH) ENGINE=MEMORY;\n```\n\n### PostgreSQL Hash 인덱스 (9.4+)\n\n- WAL-logged + crash-safe (9.6+)\n- 그러나 B-Tree보다 빠른 경우는 매우 좁음 (큰 string equality + 매우 high cardinality)\n\n```sql\n-- PostgreSQL\nCREATE INDEX users_email_hash ON users USING HASH (email);\n```\n\n**언제 의미**:\n- 매우 큰 column (long string) + equality only\n- B-Tree와 benchmark 후 의미 있을 때만\n\n**대부분의 경우**: B-Tree로 충분. Hash 인덱스는 검토 후 거의 안 쓰임.\n\n## Bitmap 인덱스\n\n```\nWHERE status = 'active'\nstatus: active, inactive, pending\n\nbitmap for 'active':  1 0 1 1 0 1 0 ... (row별 비트)\nbitmap for 'inactive': 0 1 0 0 1 0 0 ...\n```\n\n### 잘하는 것\n\n- 낮은 cardinality (값 종류 적음) + 큰 데이터\n- OR/AND 결합 (bitmap AND, OR로 매우 빠름)\n- DW (Data Warehouse) 같은 OLAP 환경\n\n### 못 하는 것\n\n- 높은 update 빈도: 매 update마다 bitmap 갱신 비용 ↑ → OLTP에는 부적합\n- 높은 cardinality: bitmap이 거의 모두 0/1 → 의미 없음\n\n### 지원\n\n- Oracle, PostgreSQL (bitmap scan은 자동), Greenplum, Druid\n- MySQL: 직접 지원 X\n\n## Partial Index — 조건부 인덱스\n\n```sql\n-- PostgreSQL\nCREATE INDEX users_active_idx ON users(email) WHERE active = true;\n```\n\n- 전체 row가 아니라 조건 만족 row만 인덱스\n- 인덱스 크기 감소 + 쿼리 성능 동일\n\n**언제**:\n- 자주 조회되는 부분이 전체의 일부\n- 예: \"active 사용자만 검색\" (전체 90%가 inactive)\n\n## Expression Index — 계산된 값\n\n```sql\n-- PostgreSQL / MySQL 8.0+\nCREATE INDEX users_lower_email ON users(LOWER(email));\n\n-- 쿼리\nWHERE LOWER(email) = 'x@y.com';  -- ← 이 인덱스 사용\n```\n\n- `LOWER(email)`처럼 함수 적용된 값으로 검색 시\n- 일반 인덱스는 함수 적용 시 못 씀\n\n**언제**:\n- case-insensitive 검색\n- date 일부만 추출 (`EXTRACT(YEAR FROM created_at)`)\n- 계산된 컬럼 검색\n\n## Covering Index — 인덱스만으로 답하기\n\n### 작동 원리\n\n```sql\n-- 인덱스: (status, created_at, email)\nCREATE INDEX users_idx ON users(status, created_at, email);\n\n-- 쿼리: 이 3 컬럼만 필요\nSELECT email FROM users WHERE status = 'active' ORDER BY created_at DESC LIMIT 10;\n```\n\n- 쿼리에 필요한 모든 컬럼이 인덱스에 있음\n- 인덱스만 보고 답 가능 → table 접근 (heap fetch) 생략\n- 매우 빠름\n\n### MySQL / PostgreSQL 표현\n\n- MySQL: \"Using index\" in EXPLAIN\n- PostgreSQL: \"Index Only Scan\"\n\n상세: [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n\n### 단점\n\n- 인덱스 크기 ↑ (모든 컬럼 포함)\n- INSERT/UPDATE 비용 ↑\n\n## Full-text Index\n\n```sql\n-- MySQL\nCREATE FULLTEXT INDEX posts_content_ft ON posts(content);\nSELECT * FROM posts WHERE MATCH(content) AGAINST('database tutorial' IN NATURAL LANGUAGE MODE);\n\n-- PostgreSQL\nCREATE INDEX posts_content_ft ON posts USING GIN (to_tsvector('english', content));\n```\n\n- 자연어 검색 (단어 분리, stemming, ranking)\n- \"data%\" prefix 검색은 B-Tree로도 OK, 하지만 \"이 문장의 관련 글\" 같은 검색은 Full-text\n\n**Production**: Elasticsearch, OpenSearch 같은 전용 도구가 더 강력.\n\n## Selectivity — 인덱스의 효력\n\n```\nSelectivity = distinct values / total rows\n```\n\n높음 (1에 가까움) → 좋은 인덱스 후보. 낮음 → 인덱스 무의미.\n\n| 컬럼 | Cardinality | Selectivity | 인덱스 효과 |\n|---|---|---|---|\n| `id` (PK) | n | 1.0 | 최고 |\n| `email` (UNIQUE) | ≈ n | ≈ 1.0 | 좋음 |\n| `status` (3가지: active/inactive/pending) | 3 | 3/n ≈ 0 | 매우 낮음 |\n| `country` (200 nations, n=1M) | 200 | 0.0002 | 낮음 |\n| `gender` (2가지) | 2 | 0.000002 | 사실상 의미 X |\n\n### Selectivity 낮은 컬럼\n\n- 인덱스로 좁혀도 전체의 30%+ row가 매칭 → DB가 인덱스 무시하고 full scan 선택\n- 차라리 인덱스 안 만드는 게 나음 (저장 공간 + update 비용 절약)\n\n### Selectivity 높이는 패턴\n\n```sql\n-- 단일 (status)는 selectivity 낮음\nCREATE INDEX users_status ON users(status);  -- 거의 의미 없음\n\n-- 복합 (status, created_at) → selectivity 높아짐\nCREATE INDEX users_status_created ON users(status, created_at);  -- 좋음\n```\n\n## Composite Index — 컬럼 순서\n\n```sql\nCREATE INDEX idx ON users(status, created_at, email);\n```\n\n이 인덱스가 잘 쓰이는 쿼리:\n- `WHERE status = ?` ✓\n- `WHERE status = ? AND created_at > ?` ✓\n- `WHERE status = ? AND created_at > ? AND email = ?` ✓\n- `WHERE status = ? ORDER BY created_at DESC` ✓\n\n잘 안 쓰이는:\n- `WHERE created_at > ?` (leading column 안 씀) ✗\n- `WHERE email = ?` (leading column 안 씀) ✗\n\n**leftmost prefix rule**: 인덱스 컬럼 순서대로 사용. 가장 자주 같이 쓰이는 / selectivity 높은 컬럼을 앞에.\n\n## 자주 헷갈리는 지점\n\n### \"Hash가 B-Tree보다 빠르다\"\n\n이론은 O(1) vs O(log n)이지만:\n- 실제 차이는 cache miss / branch prediction 등에 의해 미미\n- B-Tree는 range도 가능 (Hash 못함) → 활용도 ↑\n- B-Tree에 lookup도 매우 빠름 (depth 3-4)\n\n**MySQL InnoDB**는 사실상 hash 직접 사용 옵션 없음. **B-Tree 거의 항상 default**.\n\n### \"인덱스가 많을수록 빠르다\"\n\n읽기 빨라지지만:\n- 인덱스 자체 저장 공간 ↑\n- INSERT/UPDATE/DELETE 시 모든 인덱스 갱신\n- query planner가 인덱스 선택 시간 ↑\n\n권장: 자주 쓰는 쿼리 패턴에만 인덱스. 미리 다 만들지 말 것.\n\n### \"MySQL의 USING HASH는 InnoDB에서 작동\"\n\n작동하긴 하지만 거의 무의미. InnoDB는 secondary index를 모두 B-Tree로 저장.\n`USING HASH`를 명시해도 무시되거나 B-Tree로 변환.\n\n### \"Partial index는 PostgreSQL 전용\"\n\n거의 맞음. MySQL은 partial index 직접 지원 X. 대안: trigger 또는 별도 테이블.\n\n### \"Covering index는 항상 좋다\"\n\n크기 ↑ → INSERT/UPDATE 비용 ↑. 쿼리 빈도가 높지 않으면 일반 인덱스 + heap fetch가 더 효율.\n\n### \"Selectivity가 낮으면 인덱스 만들지 마라\"\n\n대부분 맞지만 예외:\n- 정렬에 인덱스 사용 (ORDER BY)\n- 다른 컬럼과 composite\n\n## 빠른 확인 질문\n\n- B-Tree의 default 선택 이유?  답: equality + range + ORDER BY + prefix LIKE 모두 가능\n- Hash 인덱스가 잘하는 것?  답: equality lookup만 (range/ORDER BY 불가)\n- MySQL에서 Hash 인덱스를 쓸 수 있는 곳?  답: Memory storage engine (실무에선 거의 안 씀)\n- Selectivity 낮으면?  답: 인덱스 효과 미미, DB가 full scan 선택\n- Covering index 핵심?  답: 쿼리 필요 컬럼 모두 인덱스에 → table 접근 생략\n- Composite index 순서 결정?  답: leftmost prefix rule, 자주 쓰이는/selectivity 높은 컬럼 앞에\n\n## 한 줄 정리\n\n인덱스 선택은 **B-Tree default 90%, Hash는 거의 안 씀, 나머지(Partial/Expression/\nCovering)는 B-Tree 변형이며 특정 쿼리 패턴 최적화 용도**다. selectivity와 composite\ncolumn 순서를 *쿼리 패턴 기준*으로 정하면 신입도 안전한 인덱스 설계가 가능하다.\n",
   "aliases": [
-    "btree vs hash index chooser",
     "B-Tree vs Hash 인덱스",
     "인덱스 종류 선택",
+    "hash index 언제 써",
+    "btree 언제 써",
+    "인덱스 종류 차이",
+    "btree vs hash index chooser",
     "index type chooser",
     "range scan index",
     "equality lookup index",
-    "hash index 언제 써",
-    "btree 언제 써",
     "covering index basics",
-    "인덱스 종류 차이",
     "mysql hash index",
-    "postgresql hash index",
-    "인덱스 자료구조",
-    "index data structure",
-    "range query 인덱스",
-    "= vs > 인덱스",
-    "index selectivity 선택도",
-    "partial index",
-    "expression index",
-    "full-text index",
-    "bitmap index",
-    "spatial index"
+    "postgresql hash index"
   ],
   "expected_queries": [
     "B-Tree 인덱스와 Hash 인덱스의 차이는 뭐고 각각 언제 써?",
@@ -64,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/btree-vs-hash-index-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch153"
+      }
+    ]
   }
 }

@@ -6,29 +6,18 @@
   "summary": "RDB(관계형)와 Document(문서형)의 본질적 차이는 \"데이터를 정규화해 join으로 합칠 것인가 vs aggregate(주문+상품+결제)를 한 문서로 통째 저장할 것인가\"의 모델링 철학이며, 트랜잭션/쿼리 패턴/스키마 진화 차원에서 trade-off가 갈린다.",
   "body_markdown": "# RDB vs Document DB chooser — 관계형과 문서형 첫 분기\n\n> 한 줄 요약: RDB(관계형)와 Document(문서형)의 본질적 차이는 \"**데이터를 정규화해\n> join으로 합칠 것인가** vs **aggregate(주문+상품+결제)를 한 문서로 통째 저장할\n> 것인가**\"의 모델링 철학이며, 트랜잭션/쿼리 패턴/스키마 진화 차원에서 trade-off가\n> 갈린다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [NoSQL 기초](./nosql-basics.md)\n- [트랜잭션 격리수준과 락](./transaction-isolation-locking.md)\n- [정규화 기초](./normalization-basics.md)\n- [트랜잭션 실전 시나리오](./transaction-case-studies.md)\n- [Cache 기초 primer](../system-design/cache-basics-primer.md)\n- [database 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: relational vs document db chooser, RDB Document 본질적 차이, MongoDB vs MySQL 선택, ACID vs BASE, aggregate root vs join, access pattern 기반 설계, NoSQL 4대 분류 key-value document column-family graph, polyglot persistence, DynamoDB Cassandra Redis 첫 분기\n\n## 먼저 멘탈모델 — 모델링 철학 차이\n\n같은 \"주문 정보\"를 두 DB에 저장한다면.\n\n### RDB (PostgreSQL, MySQL)\n\n```sql\n-- orders 테이블\nINSERT INTO orders(id, user_id, total) VALUES (1, 100, 50000);\n-- order_items 테이블\nINSERT INTO order_items(order_id, product_id, qty) VALUES (1, 200, 2);\nINSERT INTO order_items(order_id, product_id, qty) VALUES (1, 201, 1);\n-- payments 테이블\nINSERT INTO payments(order_id, method, amount) VALUES (1, 'CARD', 50000);\n\n-- 조회 시\nSELECT o.*, oi.*, p.*\nFROM orders o\nJOIN order_items oi ON o.id = oi.order_id\nJOIN payments p ON o.id = p.order_id\nWHERE o.id = 1;\n```\n\n→ 정규화: 데이터를 작은 단위(테이블)로 쪼개고 외래키로 연결, JOIN으로 합쳐 본다.\n\n### Document DB (MongoDB)\n\n```json\n// orders collection 1 document\n{\n  \"_id\": 1,\n  \"user_id\": 100,\n  \"total\": 50000,\n  \"items\": [\n    {\"product_id\": 200, \"qty\": 2},\n    {\"product_id\": 201, \"qty\": 1}\n  ],\n  \"payment\": {\"method\": \"CARD\", \"amount\": 50000}\n}\n```\n\n→ Aggregate: 한 주문에 필요한 모든 정보를 통째 한 문서에. JOIN 없음.\n\n## 30초 분기표\n\n| 결정 요소 | RDB 선호 | Document 선호 |\n|---|---|---|\n| **데이터 관계** | 많은 entity 간 관계 (n:m) | 한 aggregate에 자체 완결 |\n| **트랜잭션** | 강한 ACID 필요 | eventual 또는 단일 doc 트랜잭션 OK |\n| **쿼리 패턴** | ad-hoc 쿼리, 다양한 join | 정해진 access pattern |\n| **스키마 진화** | 안정적, 변경 적음 | 자주 진화, 필드 추가 |\n| **데이터 정합성** | 외래키, 제약 조건 강제 | 애플리케이션 보장 |\n| **확장성** | 수직 (단일 강력한 노드) | 수평 (sharding 쉬움) |\n\n## ACID vs BASE — 보장 모델 차이\n\n### ACID (RDB 표준)\n\n- **Atomicity**: 트랜잭션 all-or-nothing\n- **Consistency**: 제약 조건(FK, UNIQUE 등) 항상 유지\n- **Isolation**: 동시 트랜잭션 간 간섭 제어\n- **Durability**: 커밋 후 디스크 영속\n\n→ 강한 일관성. 트랜잭션 동안 다른 사람이 못 보거나 일관된 스냅샷만 봄.\n\n### BASE (대부분 NoSQL)\n\n- **Basically Available**: 가용성 우선\n- **Soft state**: 상태가 시간에 따라 변할 수 있음\n- **Eventually consistent**: 최종 일관성, 일시적 불일치 허용\n\n→ 가용성과 확장성 우선. 일관성은 시간 지나면 도달.\n\nCAP 정리 시각:\n- RDB(보통): CA 또는 CP — 가용성/일관성 강함, partition tolerance 약함\n- NoSQL(보통): AP — 가용성/partition tolerance 강함, 일관성 약함\n\n## 모델링 철학 — Aggregate vs Join\n\n### Join 중심 (RDB)\n\n- 데이터를 entity로 쪼갬\n- 외래키로 관계 표현\n- 쿼리 시 JOIN으로 합쳐 보기\n- 정규화로 중복 제거\n\n**장점**:\n- 한 entity 갱신 시 다른 entity에 영향 없음 (single source of truth)\n- ad-hoc 쿼리 강력 (어떤 JOIN이든 가능)\n\n**단점**:\n- 쿼리 시 JOIN 비용\n- 확장 어려움 (JOIN은 노드 간 잘 분산 안 됨)\n\n### Aggregate 중심 (Document)\n\n- 자주 함께 보는 데이터를 한 문서에\n- \"주문\" 하나에 items, payment, status 모두 nested\n- aggregate boundary가 트랜잭션 단위\n\n**장점**:\n- 한 번의 fetch로 다 가져옴 (no JOIN)\n- aggregate별 sharding 자연 (scaling 쉬움)\n- 스키마 유연 (각 문서가 다른 모양 가능)\n\n**단점**:\n- 중복 데이터 (user 정보가 여러 주문에 반복)\n- 갱신 일관성 어려움 (한 user 이름 바뀌면 모든 주문 갱신?)\n- ad-hoc 쿼리 약함\n\n## 4대 NoSQL 분류\n\n| 분류 | 대표 | 데이터 모델 | 강점 | 약점 |\n|---|---|---|---|---|\n| **Key-Value** | Redis, DynamoDB | key → opaque value | 가장 단순, 매우 빠름 | 쿼리 X (key만) |\n| **Document** | MongoDB, CouchDB | key → JSON-like document | 유연한 스키마, 부분 쿼리 가능 | 트랜잭션 제한 |\n| **Column-Family** | Cassandra, HBase | row × column family (sparse) | 매우 큰 데이터, 쓰기 강함 | join 약함, 복잡한 쿼리 X |\n| **Graph** | Neo4j | nodes + edges | 관계 traversal 빠름 | 큰 데이터 어려움 |\n\n신입 권장:\n- Key-Value (Redis): cache, session, leaderboard\n- Document (MongoDB): semi-structured 데이터, 빠른 진화 필요\n- RDB (PostgreSQL/MySQL): 거의 모든 일반 BE 시작점\n\n## 쿼리 패턴이 모델 선택을 좌우한다 (Access Pattern First)\n\n> \"**Design your data model around your access patterns**\" — DynamoDB 철학\n\n### RDB는 데이터 모델 먼저\n1. ERD 그리기\n2. 정규화\n3. 그 후 쿼리는 SQL 자유롭게 (JOIN 등)\n\n### NoSQL은 access pattern 먼저\n1. 어떤 쿼리를 자주 할 건가? (예: \"한 user의 최근 10주문\")\n2. 그 쿼리를 가장 효율적으로 만족하도록 데이터 배치\n3. 다른 쿼리는 별도 인덱스 또는 별도 모델\n\n**구체적 예시**:\n- \"user의 주문 목록\"이 90% 쿼리 → user_id가 partition key\n- \"상품의 누가 샀나\"는 가끔 → 별도 GSI (Global Secondary Index)\n\n### 신입 결정 흐름\n\n```\nQ1: 쿼리 패턴이 잘 예측되나? 변동이 적나?\n  Yes → RDB도 OK, NoSQL도 OK\n  No (ad-hoc 자주) → RDB 강함\n\nQ2: 데이터 간 관계가 많고 ACID 필요?\n  Yes → RDB\n  No (aggregate 단위 self-contained) → Document\n\nQ3: 매우 큰 throughput / 수평 확장 필요?\n  Yes → NoSQL (DynamoDB, Cassandra) 검토\n  No → RDB로 충분\n\nQ4: 그래프 traversal이 핵심?\n  Yes → Neo4j\n  No → 위 분기\n```\n\n## 실전 — 어느 DB?\n\n### MySQL / PostgreSQL — default first choice\n\n- 트랜잭션, 외래키, 다양한 쿼리, mature ecosystem\n- 신입은 거의 항상 여기서 시작\n\n### MongoDB — 빠른 진화 + aggregate root\n\n- 스키마가 자주 변하는 startup MVP\n- \"한 사용자의 모든 활동 로그\" 같은 aggregate root\n\n### Redis — 매우 빠른 lookup\n\n- 캐시, session store, leaderboard, rate limit counter\n- 보통 primary DB 옆에 보조 역할\n\n### DynamoDB / Cassandra — 매우 큰 throughput\n\n- 수십만 RPS 이상\n- access pattern이 잘 예측됨\n- 트랜잭션 단순 (단일 row 또는 제한적)\n\n### Neo4j — 관계 traversal\n\n- \"친구의 친구의 친구\" 같은 graph 쿼리\n- RDB로는 6+ JOIN 필요한 경우\n\n## Polyglot Persistence\n\n> 한 서비스에 여러 DB 동시 사용\n\n```\nWeb Service ── PostgreSQL (주문, 사용자, 트랜잭션)\n            ├─ Redis (session, cache)\n            ├─ Elasticsearch (검색)\n            └─ S3 (파일/이미지)\n```\n\n**장점**: 각 use case에 가장 적합한 도구\n**단점**: 운영 복잡도 ↑, 학습 곡선, 데이터 sync 어려움\n\n신입 권장: **시작은 1-2개로 단순하게**. 필요 시 polyglot 도입.\n\n## 자주 헷갈리는 지점\n\n### \"NoSQL이 항상 더 빠르다\"\n\n특정 access pattern에선 더 빠름. 그러나:\n- 잘못된 모델링이면 RDB보다 훨씬 느림\n- ad-hoc 쿼리는 거의 항상 RDB가 빠름\n- \"더 빠름\"은 \"내 use case에서 더 빠름\"이지 일반화 불가\n\n### \"MongoDB는 schema-less라 그냥 막 던지면 OK\"\n\n- 명시적 schema는 없지만 implicit schema는 있음 (코드가 어떤 필드 기대)\n- production에서 implicit schema 깨지면 코드가 fail\n- Mongoose 같은 schema validation 권장\n\n### \"Document에 nested 깊이는 무한 OK\"\n\nMongoDB는 깊이 100까지 가능하지만:\n- 너무 깊으면 query 어려움\n- 일부 부분만 update 시 전체 문서 rewrite\n- 권장: aggregate은 깊이 2-3 수준\n\n### \"Key-Value는 단순해서 쓸 일 없다\"\n\n매우 많이 씀. cache, session, distributed lock, rate limit, leaderboard — 모두 KV.\n\n### \"Polyglot Persistence가 항상 좋다\"\n\n운영 복잡도 ↑. 작은 팀 / 초기 시작은 한 DB로 충분. polyglot은 명확한 이유가 있을 때.\n\n### \"ACID는 NoSQL에 없다\"\n\n- MongoDB 4.0+ multi-document transactions 지원 (replica set)\n- DynamoDB transactions (제한적)\n- 단 RDB만큼 강하지 않음, 성능 비용 크게\n\n## 빠른 확인 질문\n\n- RDB와 Document DB의 본질적 차이?  답: Join 중심 정규화 vs Aggregate 통째 저장\n- ACID와 BASE 차이?  답: 강한 일관성 vs 가용성 우선 + 최종 일관성\n- 4대 NoSQL 분류?  답: Key-Value, Document, Column-Family, Graph\n- NoSQL access-pattern-first 의미?  답: 쿼리 패턴 먼저 정하고 그에 맞춰 모델 배치\n- 신입의 default 첫 DB?  답: RDB (PostgreSQL/MySQL) — 풍부한 기능, 익숙한 SQL\n- Polyglot persistence 권장 시점?  답: 단일 DB로 충분하지 않은 명확한 use case 있을 때\n\n## 한 줄 정리\n\nDB 선택은 \"**ACID vs BASE + Join vs Aggregate + ad-hoc vs 정해진 access pattern +\n수직 vs 수평 확장**\"의 4축 결합이며, 신입은 *PostgreSQL/MySQL을 default*로 시작해서\n캐시(Redis) → 부분 NoSQL(MongoDB) → 매우 큰 throughput(DynamoDB) 순서로 확장하면\n안전하다.\n",
   "aliases": [
-    "relational vs document db",
-    "RDB vs Document DB",
     "관계형 vs 문서형",
     "SQL vs NoSQL 입문",
     "어느 DB 써야 해",
+    "문서형 데이터베이스",
+    "시간 시계열 DB",
+    "relational vs document db",
+    "RDB vs Document DB",
     "MongoDB vs MySQL",
     "DynamoDB vs PostgreSQL",
     "nosql first choice",
     "document store",
-    "문서형 데이터베이스",
-    "key-value store",
-    "column family store",
-    "시간 시계열 DB",
-    "graph database",
-    "polyglot persistence",
-    "데이터 모델 선택",
-    "normalize vs denormalize design",
-    "aggregate root vs joined",
-    "schema design first 분기",
-    "트랜잭션 vs eventual consistency",
-    "ACID vs BASE",
-    "쿼리 패턴 우선",
-    "access pattern 기반 설계"
+    "key-value store"
   ],
   "expected_queries": [
     "관계형 DB(RDB)와 문서형 DB(Document)의 가장 핵심적 차이는 뭐야?",
@@ -66,8 +55,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/relational-vs-document-db-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch153"
+      }
+    ]
   }
 }

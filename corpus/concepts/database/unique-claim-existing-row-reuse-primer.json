@@ -6,30 +6,18 @@
   "summary": "이 문서는 UNIQUE claim + existing-row reuse를 idempotency key, PENDING/SUCCEEDED row, duplicate loser fresh read, locking read after claim 관점으로 설명하는 beginner primer다.",
   "body_markdown": "# UNIQUE Claim + Existing-Row Reuse Primer\n\n> 한 줄 요약: 멱등성 경로에서 \"누가 먼저 요청을 선점했는가\"는 `UNIQUE`가 정하고, 그 뒤의 `SELECT ... FOR UPDATE`는 **없는 row를 막는 용도**가 아니라 이미 생긴 `PENDING`/`SUCCEEDED` row를 관찰하거나 재사용하는 용도로만 본다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [PENDING Row Recovery Primer](./pending-row-recovery-primer.md)\n- [PostgreSQL / MySQL Claim SQL 미니 카드](./postgresql-mysql-claim-sql-mini-card.md)\n- [UNIQUE vs Locking-Read Duplicate Primer](./unique-vs-locking-read-duplicate-primer.md)\n- [DuplicateKeyException 이후 Fresh-Read 재분류 미니 카드](./duplicate-key-fresh-read-classifier-mini-card.md)\n- [Read-Before-Write Race Timeline Across MySQL and PostgreSQL](./read-before-write-race-timeline-mysql-postgresql.md)\n- [Empty-Result Locking Cheat Sheet for PostgreSQL and MySQL](./empty-result-locking-cheat-sheet-postgresql-mysql.md)\n- [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)\n- [Upsert Contention, Unique Index Arbitration, and Locking](./upsert-contention-unique-index-locking.md)\n- [database 카테고리 인덱스](./README.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: unique claim existing row reuse, unique claim row first, existing row reuse primer, idempotency pending succeeded row reuse, duplicate key then select for update, unique first locking read later, idempotency key pending succeeded primer, unique constraint claim then observe existing row, same key pending row reuse, same key succeeded row replay, loser reads existing row, winner row reuse primer, unique claim pattern beginner, insert pending unique then reuse row, unique claim existing row reuse primer basics, UNIQUE claim + existing row reuse, INSERT 후 duplicate → fresh read, idempotency PENDING row 재사용, duplicate winner row 조회, SELECT FOR UPDATE는 관찰자 단계, duplicate loser 처리 흐름, pending row claim 패턴, replay-safe insert 설계, winner row 식별 후 응답\n\n## 먼저 잡을 멘탈모델\n\n초보자는 이 패턴을 \"번호표 뽑기 + 전광판 확인\"으로 보면 쉽다.\n\n- `UNIQUE` insert: 번호표를 **누가 먼저 뽑았는지** 정한다.\n- existing-row read: 이미 뽑힌 번호표가 지금 `PENDING`인지 `SUCCEEDED`인지 **전광판으로 확인**한다.\n- later `FOR UPDATE`: 전광판이 아니라, **이미 있는 번호표 카드 자체를 잠깐 들고 상태를 안전하게 확인**하는 동작에 가깝다.\n\n핵심 한 줄:\n\n> 이 패턴에서 claim은 `UNIQUE`가 하고, locking read는 claim이 끝난 뒤 existing row를 다루는 보조 단계다.\n\n## 왜 이 패턴을 쓰나\n\n결제나 주문 같은 멱등성 API는 보통 이런 요구를 동시에 가진다.\n\n1. 같은 `idempotency_key`로 row는 하나만 만들어야 한다.\n2. 먼저 들어온 요청이 아직 끝나지 않았으면 뒤 요청은 그 `PENDING` row를 본 뒤 `in-progress`로 응답해야 한다.\n3. 먼저 들어온 요청이 이미 끝났으면 뒤 요청은 그 `SUCCEEDED` row를 재사용해 같은 결과를 돌려줘야 한다.\n\n이때 가장 흔한 안전한 출발점은 아래다.\n\n- `UNIQUE(idempotency_key)`로 **선점**\n- `status` 컬럼으로 `PENDING`/`SUCCEEDED` 구분\n- duplicate 뒤에는 새 row를 다시 만들려 하지 말고 **기존 row를 읽어 재사용**\n\n## 30초 결론표\n\n| 질문 | 짧은 답 |\n|---|---|\n| 같은 key의 첫 승자는 누가 정하나 | `UNIQUE`가 정한다 |\n| 뒤 요청이 `FOR UPDATE`를 먼저 걸면 claim까지 대신하나 | 아니다. row가 없으면 claim 자체는 못 끝낸다 |\n| duplicate 뒤 다음 행동은 무엇인가 | primary/fresh read로 existing row를 본다 |\n| existing row가 `PENDING`이면 | 보통 `in-progress`/`busy`로 응답하거나 짧게 폴링한다 |\n| existing row가 `SUCCEEDED`면 | 이전 성공 결과를 replay/reuse 한다 |\n| later locking read는 언제 의미가 있나 | row가 이미 있고, 그 row 상태를 원자적으로 확인하거나 이어서 갱신할 때 |\n\n## 가장 흔한 테이블 모양\n\n```sql\nCREATE TABLE payment_request (\n  id BIGINT PRIMARY KEY,\n  idempotency_key VARCHAR(100) NOT NULL,\n  request_hash CHAR(64) NOT NULL,\n  status VARCHAR(20) NOT NULL,\n  response_body TEXT NULL,\n  UNIQUE (idempotency_key)\n);\n```\n\n이 테이블에서 중요한 계약은 둘뿐이다.\n\n- 같은 `idempotency_key`로 row는 하나만 있다.\n- 그 한 row의 상태가 `PENDING -> SUCCEEDED`로 바뀐다.\n\n## 기본 흐름\n\n### 1. 먼저 들어온 요청이 `PENDING` row를 claim한다\n\nPostgreSQL:\n\n```sql\nINSERT INTO payment_request (id, idempotency_key, request_hash, status)\nVALUES (:id, :key, :hash, 'PENDING');\n```\n\nMySQL:\n\n```sql\nINSERT INTO payment_request (id, idempotency_key, request_hash, status)\nVALUES (:id, :key, :hash, 'PENDING');\n```\n\n여기서 핵심은 DB 문법 차이보다 **중복 승부가 write 시점에 난다**는 점이다.\n\n- insert 성공: 내가 winner다\n- duplicate/unique violation: 이미 다른 요청이 winner다\n\n### 2. loser는 새 row를 다시 만들지 않는다\n\n뒤 요청이 같은 key로 들어와 insert에서 패배했다면, 다음 질문은 \"`INSERT`를 다시 할까?\"가 아니다.\n\n다음 질문은 이것이다.\n\n> 이미 있는 그 row가 지금 `PENDING`인가, `SUCCEEDED`인가?\n\n그래서 beginner 기본값은 duplicate 뒤 fresh read다.\n\n```sql\nSELECT id, request_hash, status, response_body\nFROM payment_request\nWHERE idempotency_key = :key;\n```\n\n### 3. 상태에 따라 재사용 방식이 갈린다\n\n| existing row 상태 | 초보자 해석 | 흔한 응답 |\n|---|---|---|\n| `PENDING` | 먼저 들어온 요청이 아직 처리 중이다 | `202`, `409 in-progress`, `busy` |\n| `SUCCEEDED` | 이미 끝난 성공 결과가 있다 | 이전 성공 응답 replay |\n\n필요하면 `request_hash`도 같이 본다.\n\n- 같은 key + 같은 hash: 같은 요청 재전송일 가능성이 높다\n- 같은 key + 다른 hash: `409 conflict` 후보다\n\n## later locking read의 정확한 역할\n\n이 부분이 가장 자주 헷갈린다.\n\n### 잘못된 이해\n\n> \"`SELECT ... FOR UPDATE`를 나중에 쓸 거니까, 결국 이게 중복 claim도 해결해 주는 것 아닌가?\"\n\n아니다. 이 패턴에서는 claim이 이미 끝난 뒤다.\n\n- row가 없을 때 winner를 가르는 단계: `UNIQUE` insert\n- row가 이미 있을 때 상태를 안전하게 보는 단계: later locking read\n\n즉 `FOR UPDATE`의 대상은 **absence**가 아니라 **existing row**다.\n\n### 맞는 이해\n\nlater locking read는 보통 이런 상황에서만 의미가 있다.\n\n1. 기존 `PENDING` row를 보고 timeout recovery나 상태 전이를 이어서 판단해야 한다.\n2. 기존 `SUCCEEDED` row를 읽는 동안 다른 관리성 update와 섞이지 않게 한 트랜잭션 안에서 보고 싶다.\n3. row 하나를 기준으로 \"읽고 바로 같은 row를 갱신\"해야 한다.\n\n`PENDING` row를 언제 계속 `in-progress`로 두고, 언제 safe takeover를 허용할지는 [PENDING Row Recovery Primer](./pending-row-recovery-primer.md)에서 beginner 기준으로 따로 정리한다.\n\n예:\n\n```sql\nSELECT id, request_hash, status, response_body\nFROM payment_request\nWHERE idempotency_key = :key\nFOR UPDATE;\n```\n\n이 쿼리는 \"이 key가 비어 있나?\"를 예약하는 용도가 아니라, **이미 존재하는 row 하나를 잠그는 용도**다.\n\n## 짧은 타임라인\n\n| 시점 | 요청 A | 요청 B |\n|---|---|---|\n| t1 | `INSERT ... status='PENDING'` 성공 |  |\n| t2 | 외부 작업 진행 중 | 같은 key `INSERT` 시도 |\n| t3 |  | duplicate/unique violation |\n| t4 |  | existing row fresh read |\n| t5 | 상태가 `PENDING`이면 `in-progress` 응답 |  |\n| t6 | A가 `SUCCEEDED`로 update |  |\n| t7 | 이후 재시도 요청은 same row를 읽고 replay |  |\n\n포인트는 두 가지다.\n\n- B는 새 claim을 다시 시도하지 않는다.\n- B의 관심사는 \"내가 이기나?\"가 아니라 \"이미 있는 row를 어떻게 해석하나?\"다.\n\n## PostgreSQL과 MySQL에서 공통으로 안전하게 읽는 법\n\n초보자 기준 안전한 공통 규칙은 복잡하지 않다.\n\n1. row를 먼저 claim하는 책임은 `UNIQUE` insert에 둔다.\n2. duplicate 뒤 follow-up read는 replica나 stale snapshot이 아니라 가능한 한 primary/fresh read로 본다.\n3. locking read가 필요하더라도, 그것은 **existing row를 읽는 단계**에서만 쓴다.\n\n엔진별로 lock path 차이는 있지만, 위 세 줄은 PostgreSQL과 MySQL 모두에서 유지되는 beginner 규칙이다.\n\n## 자주 하는 오해\n\n- \"`FOR UPDATE`를 나중에 붙였으니 duplicate handling이 없어도 된다\"\n  - 아니다. 같은 key의 첫 승자는 여전히 `UNIQUE`가 정한다.\n- \"`PENDING` row를 봤으니 내가 takeover해서 새 row를 하나 더 만들면 된다\"\n  - 아니다. 이 패턴의 핵심은 **같은 key의 row를 재사용**하는 것이다.\n- \"`SUCCEEDED` row가 있으면 그냥 또 처리해도 같은 결과일 것이다\"\n  - 아니다. 멱등성은 보통 이전 성공 결과를 재사용하는 계약이다.\n- \"duplicate 뒤 같은 트랜잭션에서 한 번 더 읽으면 충분하다\"\n  - stale snapshot/replica read면 winner를 바로 못 볼 수 있다. fresh read 경로를 먼저 의심한다.\n- \"later locking read가 없으면 이 패턴이 성립하지 않는다\"\n  - 아니다. 단순 replay는 non-locking fresh read만으로도 충분한 경우가 많다.\n\n## 어떤 순간에 이 문서를 떠올리면 되나\n\n아래 문장이 보이면 이 primer가 맞는 출발점이다.\n\n- \"`idempotency_key`로 row를 먼저 하나만 만들고 싶다\"\n- \"뒤 요청은 `PENDING`이면 기다리지 말고 `in-progress`로 보내고 싶다\"\n- \"`SUCCEEDED`면 이전 응답을 그대로 돌려주고 싶다\"\n- \"`SELECT ... FOR UPDATE`가 duplicate prevention의 주인공인지 헷갈린다\"\n\n## 한 줄 정리\n\n이 패턴의 핵심은 \"`UNIQUE`가 row를 먼저 claim하고, 뒤 요청은 새 row를 만들지 말고 이미 있는 `PENDING`/`SUCCEEDED` row를 읽어 재사용한다\"는 점이다. later locking read가 있다면 그것도 **existing row를 다루는 단계**에서만 의미가 있다.\n",
   "aliases": [
+    "유니크 선점",
+    "기존 row 재사용",
+    "상태 row 선점",
+    "충돌 후 재조회",
+    "UNIQUE Claim and Existing-Row 개념",
     "unique claim existing row reuse",
     "unique claim row first",
     "existing row reuse primer",
     "idempotency pending succeeded row reuse",
     "duplicate key then select for update",
     "unique first locking read later",
-    "same key pending row reuse",
-    "same key succeeded row replay",
-    "winner row reuse",
-    "insert pending unique then reuse row",
-    "UNIQUE claim",
-    "유니크 선점",
-    "existing row reuse",
-    "기존 row 재사용",
-    "INSERT then SELECT FOR UPDATE",
-    "pending row claim",
-    "상태 row 선점",
-    "duplicate loser branch",
-    "winner loser split",
-    "INSERT pending row",
-    "read after duplicate",
-    "충돌 후 재조회",
-    "replay-safe insert",
-    "idempotent insert claim"
+    "same key pending row reuse"
   ],
   "expected_queries": [
     "idempotency path에서 UNIQUE insert가 winner를 정하고 loser는 existing PENDING or SUCCEEDED row를 재사용한다는 패턴을 설명해줘",
@@ -65,8 +53,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/unique-claim-existing-row-reuse-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch153"
+      }
+    ]
   }
 }

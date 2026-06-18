@@ -6,17 +6,18 @@
   "summary": "이 문서는 blackjack 미션에서 현재 게임 상태 테이블과 행동 로그 테이블을 함께 둘 때 정합성을 보는 bridge다. Current state는 빠른 조회와 현재 turn 판단에 유리하고, action log는 이력 재현과 감사에 유리하다. 둘을 같이 쓰면 한 transaction 안에서 상태 전이와 log append를 묶거나, log 기반 재구성 지연을 명시해야 한다.",
   "body_markdown": "# Blackjack Current State and Action Log Consistency Bridge\n\n## 모델 선택\n현재 상태만 저장하면 조회와 command 처리 흐름이 단순하다. 하지만 어떤 행동으로 현재 상태가 됐는지 추적하기 어렵다. 행동 로그만 저장하면 이력은 좋지만 매번 재구성 비용이 생긴다. 둘을 같이 쓰면 현재 상태와 로그 사이의 정합성 문제가 생긴다.\n\n## 빠른 분기\n사용자에게 현재 turn을 빠르게 보여줘야 하면 current state가 필요하다. 멘토 리뷰나 감사, replay가 중요하면 action log가 필요하다. 둘 다 필요하면 action append와 current state update를 같은 transaction으로 묶는지, 아니면 비동기 projection lag를 허용하는지 정해야 한다.\n\n## 흔한 오해\n로그가 있다고 현재 상태 정합성이 자동으로 맞지는 않는다. Current state만 고치고 log append를 빠뜨리면 replay 결과가 달라진다. Log만 믿고 매 요청마다 재생하면 성능과 동시성 비용이 커질 수 있다.\n\n## 실전 시나리오\n`game_state` 테이블에는 현재 손패와 상태가 있고, `game_action_log`에는 hit/stand 같은 행동이 append된다고 하자. action log insert는 성공했는데 current state update가 실패하면 재생 결과와 현재 상태가 달라진다. 둘을 같은 transaction에 묶을지, log를 source of truth로 두고 current state는 projection으로 재생성할지 먼저 결정해야 한다. Projection lag를 허용한다면 화면에서 “처리 중” 상태나 watermark가 필요할 수 있다.\n\n```text\n정합성 선택지\n1. same transaction: log append와 current state update를 함께 commit\n2. log first: log를 진실로 두고 current state는 재생 가능한 projection\n3. current only: 단순하지만 audit/replay가 약함\n```\n\n## 다음 행동\n- 현재 상태와 로그 중 어느 쪽이 source of truth인지 정한다.\n- 이중 쓰기를 한다면 transaction 경계와 unique action id를 둔다.\n- replay 테스트로 action log를 다시 적용했을 때 current state와 같은지 검증한다.\n\n## 확인 질문\n현재 상태 테이블은 진실인가, action log에서 빠르게 읽기 위해 만든 projection인가?\n\n## CS 배경: event sourcing, projection, dual write\nAction log를 source of truth로 두는 모델은 event sourcing과 닮았다. 상태를 직접 저장하는 대신 event sequence를 재생해 현재 상태를 만든다. Current state table은 query를 빠르게 하기 위한 projection이 될 수 있다. Projection은 빠르지만 log와 일시적으로 불일치할 수 있고, replay로 재생 가능해야 한다.\n\nDual write 문제는 두 저장소나 두 테이블에 같은 사실을 나눠 쓰다가 하나만 성공하는 failure mode다. 같은 transaction에 묶으면 atomicity는 좋아지지만 coupling이 커진다. 비동기 projection으로 분리하면 availability와 확장성은 좋아지지만 freshness와 reconciliation이 필요하다.\n\n## 깊게 볼 포인트\nCurrent state와 action log를 함께 둘 때는 reconciliation 전략이 필요하다. 주기적으로 log replay 결과와 current state checksum을 비교하거나, 각 state row에 last_action_id를 저장해 어디까지 반영됐는지 알 수 있게 한다. Log가 append-only라면 auditability와 debugging은 좋아지지만 storage growth와 privacy retention 문제가 생긴다. Current state만 있으면 조회는 단순하지만 “왜 이 상태가 됐는가”를 잃는다. Database 설계에서는 write amplification, query latency, recovery time, audit requirement를 함께 비교해야 한다. 이 주제는 event sourcing과 CQRS의 축소판으로 볼 수 있다.\n\n## 추가 예시\n행동 로그에는 `action_id`, `game_id`, `player_id`, `action_type`, `created_at`을 두고, 현재 상태에는 `game_id`, `status`, `last_action_id`, `updated_at`을 둘 수 있다. 같은 action이 재전송될 수 있으면 `action_id`에 UNIQUE를 둔다. 저장 후에는 `last_action_id`가 실제 마지막 로그와 맞는지 확인하는 검증 쿼리를 둘 수 있다. 이 작은 장치가 replay, 중복 제출, projection lag를 구분하는 근거가 된다.\n\n## 품질 관점\n정합성, isolation, lock/plan/replication failure mode를 테스트와 실행 계획으로 함께 검증한다. 이 문서의 답변 품질은 `Blackjack Current State and Action Log Consistency Bridge`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`query_p95_ms, lock_wait_p99_ms, rows_examined, plan_hash_change_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
   "aliases": [
+    "블랙잭 현재 상태 행동 로그",
+    "블랙잭 action log 정합성",
+    "blackjack 상태 로그 테이블",
+    "Blackjack Current State and 개념",
+    "Blackjack Current State and 정리",
     "blackjack current state action log",
     "blackjack action history consistency",
     "current state vs event log",
     "blackjack replay consistency",
-    "블랙잭 현재 상태 행동 로그",
-    "블랙잭 action log 정합성",
     "current state log transaction",
-    "blackjack 상태 로그 테이블",
     "action append state update",
-    "blackjack replay projection",
-    "blackjack current state action log consistency transaction replay projection state update append"
+    "blackjack replay projection"
   ],
   "expected_queries": [
     "blackjack 현재 상태 테이블과 행동 로그 테이블을 같이 둘 때 정합성은 어떻게 봐?",
@@ -53,7 +54,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -66,6 +67,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch153"
       }
     ]
   }

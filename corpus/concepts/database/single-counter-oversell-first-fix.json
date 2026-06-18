@@ -6,29 +6,18 @@
   "summary": "stock = 1 같은 single counter oversell은 보통 조건부 UPDATE -> version CAS -> FOR UPDATE 순서로 먼저 검토하면 되고, 핵심 기준은 \"한 SQL로 끝나는가 / stale write를 감지해야 하나 / 읽고 판단하는 절차가 남아 있나\"다.",
   "body_markdown": "# Single Counter Oversell First-Fix Card\n\n> 한 줄 요약: `stock = 1` 같은 single counter oversell은 보통 `조건부 UPDATE -> version CAS -> FOR UPDATE` 순서로 먼저 검토하면 되고, 핵심 기준은 \"한 SQL로 끝나는가 / stale write를 감지해야 하나 / 읽고 판단하는 절차가 남아 있나\"다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Single Counter vs Ledger vs Slot Inventory Oversell Decision Card](./single-counter-vs-ledger-vs-slot-inventory-oversell-decision-card.md)\n- [Lost Update vs Oversell vs Duplicate Insert Beginner Bridge](./lost-update-vs-oversell-vs-duplicate-insert-beginner-bridge.md)\n- [Compare-and-Set와 Version Columns](./compare-and-set-version-columns.md)\n- [Transaction Boundary, Isolation, and Locking Decision Framework](./transaction-boundary-isolation-locking-decision-framework.md)\n- [Spring @Transactional 기초](../spring/spring-transactional-basics.md)\n- [database 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: single counter oversell first fix, conditional update vs version cas vs for update, stock 1 oversell beginner, 마지막 재고 뭐부터 고르나요, 조건부 update 먼저인가요, version cas 언제 써요, for update 언제 써요, counter row oversell basics, single row inventory lock primer, what is conditional update, what is version cas, 처음 oversell fix, 헷갈리는 for update 선택, 단일 카운터 oversell 첫 해결, UPDATE WHERE stock > 0 패턴, conditional UPDATE vs FOR UPDATE, version CAS vs UPDATE-as-claim, atomic decrement 보장, stock 1 oversell 방어, @Version 활용 oversell, decrement-and-check SQL, 단일 row inventory lock\n\n## 핵심 개념\n\nsingle counter는 `inventory.stock = 7`처럼 **재고 truth가 한 row 숫자 하나**에 있는 모델이다.\n\n이때 초보자가 바로 `FOR UPDATE`로 뛰어들기 쉬운데, 더 안전한 첫 질문은 이것이다.\n\n- 이 차감 규칙을 `UPDATE ... WHERE stock > 0` 한 문장으로 닫을 수 있나?\n- 이미 읽어 온 값을 기준으로 \"내가 본 버전이 아직 최신일 때만 저장\"해야 하나?\n- 차감 전에 읽은 값으로 다른 business 판단을 해야 해서, read와 write를 묶어야 하나?\n\n짧은 기억법:\n\n- **한 SQL로 끝나면 조건부 `UPDATE`부터**\n- **stale write 감지가 핵심이면 version CAS**\n- **읽고 판단하는 절차가 남아 있으면 `FOR UPDATE`**\n\n## 한눈에 보기\n\n| 선택지 | 먼저 고르는 상황 | 실패 신호 | beginner 한 줄 판단 |\n|---|---|---|---|\n| 조건부 `UPDATE` | `stock > 0` 확인과 차감을 SQL 한 문장에 넣을 수 있음 | update count `0` | 제일 먼저 보는 기본값 |\n| version CAS | 사용자가 먼저 읽은 값/version을 들고 수정하고, stale write를 감지해야 함 | update count `0`, optimistic lock 예외 | \"내가 읽은 상태가 아직 맞나?\"를 저장 시점에 확인 |\n| `SELECT ... FOR UPDATE` | 읽은 뒤 여러 판단을 해야 해서 한 문장으로 못 닫음 | lock wait, deadlock, timeout | read-then-decide 절차를 짧게 직렬화 |\n\n중요한 caveat:\n\n- 이 카드는 **single counter 한 row** 기준이다.\n- 여러 row 합계나 날짜 범위 예약이면 guard row, slot row, serializable 같은 다른 문서가 더 맞을 수 있다.\n\n## 먼저 이렇게 고른다\n\n| 먼저 던질 질문 | `yes`면 | `no`면 |\n|---|---|---|\n| 차감 규칙이 `stock > 0` 같은 조건으로 **한 SQL**에 들어가나 | 조건부 `UPDATE`부터 본다 | 다음 질문 |\n| 이미 읽은 값이나 `version`이 바뀌었는지 **저장 시점 감지**가 핵심인가 | version CAS를 본다 | 다음 질문 |\n| 차감 전후로 추가 조회, 분기, 검증이 있어서 **읽고 판단**을 묶어야 하나 | `FOR UPDATE`를 본다 | 모델이 single counter인지 다시 확인 |\n\n보통 초보자 safe default는 이 순서다.\n\n1. 조건부 `UPDATE`로 끝나는지 본다\n2. UI/ORM 흐름상 stale write 감지가 중요하면 version CAS를 본다\n3. 정말로 read-then-write 절차가 남을 때만 `FOR UPDATE`를 붙인다\n\n## 세 선택지를 왜 그렇게 보나\n\n### 조건부 `UPDATE`\n\n```sql\nUPDATE inventory\nSET stock = stock - 1\nWHERE item_id = :id\n  AND stock > 0;\n```\n\n이 패턴은 \"재고가 남아 있을 때만 차감\"을 DB 한 문장에 넣는다.\n\n- 장점: 짧고 빠르다\n- 장점: read/write 사이 race를 줄인다\n- 신호: 영향받은 row가 `1`이면 성공, `0`이면 품절 또는 이미 소진\n\nsingle counter에서 oversell을 막는 **첫 기본값**인 이유는, 많은 경우 이 한 문장만으로 규칙을 닫을 수 있기 때문이다.\n\n### version CAS\n\n```sql\nUPDATE inventory\nSET stock = stock - 1,\n    version = version + 1\nWHERE item_id = :id\n  AND version = :version\n  AND stock > 0;\n```\n\nversion CAS는 \"내가 읽은 version이 아직 최신일 때만 저장\"하겠다는 뜻이다.\n\n- 장점: stale write를 명시적으로 감지한다\n- 장점: ORM `@Version`과 잘 연결된다\n- 주의: 충돌 시 retry나 conflict 응답 경계가 필요하다\n\n즉 \"재고 차감\" 자체보다 \"`내가 읽은 화면/상태가 아직 유효한가`\"가 중요할 때 CAS가 자연스럽다.\n\n### `FOR UPDATE`\n\n```sql\nSELECT stock\nFROM inventory\nWHERE item_id = :id\nFOR UPDATE;\n```\n\n`FOR UPDATE`는 차감 전에 row를 잠그고, 그 transaction 안에서 읽고 판단하고 저장하게 한다.\n\n- 장점: 한 요청씩 순서대로 판단하게 만들기 쉽다\n- 장점: 여러 조건을 읽은 뒤 결정하는 절차에 맞는다\n- 주의: lock wait, deadlock, throughput 저하가 붙을 수 있다\n\n그래서 `FOR UPDATE`는 \"항상 더 안전한 상위 해법\"이 아니라, **한 문장으로 못 닫는 read-then-decide 절차를 짧게 직렬화할 때** 고르는 카드다.\n\n## 흔한 오해와 함정\n\n- \"`FOR UPDATE`가 제일 안전하니 무조건 먼저죠?\"\n  - 아니다. single counter는 조건부 `UPDATE`가 더 짧고 단순한 첫 선택인 경우가 많다.\n- \"version CAS면 oversell을 항상 막죠?\"\n  - 아니다. single counter 한 row에서는 잘 맞지만, 여러 row 합계 invariant는 별도 장치가 필요할 수 있다.\n- \"조건부 `UPDATE`는 optimistic lock보다 약한 임시방편이죠?\"\n  - 아니다. 이 문제를 한 SQL로 닫을 수 있다면 오히려 가장 직접적인 해법일 수 있다.\n- \"`FOR UPDATE`를 쓰면 DB 종류와 상관없이 같은 식으로 동작하죠?\"\n  - 아니다. lock 범위와 대기 양상은 DB 엔진/격리수준에 따라 달라질 수 있다. beginner 기본 선택 순서를 잡는 데만 이 카드를 쓴다.\n\n## 실무에서 쓰는 모습\n\n| 장면 | 먼저 고를 것 | 이유 |\n|---|---|---|\n| 플래시 세일이지만 차감 규칙이 `stock > 0` 한 줄로 끝남 | 조건부 `UPDATE` | 가장 짧게 invariant를 닫는다 |\n| 관리 화면에서 사용자가 inventory를 보고 수동 조정하고 저장함 | version CAS | 누가 먼저 수정했는지 stale write를 보여 주기 좋다 |\n| 차감 전에 상태, 판매중 여부, 추가 counter를 함께 읽고 같은 판단 단위로 묶어야 함 | `FOR UPDATE` | read-then-decide 절차를 transaction 안에서 직렬화한다 |\n\n여기서 비유는 \"매표소 줄 세우기\"로 시작하면 쉽다. 다만 이 비유는 DB가 실제로 사람처럼 한 줄로만 서는 뜻은 아니다. 조건부 `UPDATE`는 줄을 길게 세우기보다, 창구에서 한 번에 처리하는 쪽에 더 가깝다.\n\n## 더 깊이 가려면\n\n- 먼저 이 문제가 정말 single counter인지 확인하려면 [Single Counter vs Ledger vs Slot Inventory Oversell Decision Card](./single-counter-vs-ledger-vs-slot-inventory-oversell-decision-card.md)\n- oversell과 lost update를 먼저 분리하려면 [Lost Update vs Oversell vs Duplicate Insert Beginner Bridge](./lost-update-vs-oversell-vs-duplicate-insert-beginner-bridge.md)\n- version CAS의 저장 시점 충돌 감지를 더 자세히 보려면 [Compare-and-Set와 Version Columns](./compare-and-set-version-columns.md)\n- 락 대기와 retry까지 포함해 더 넓게 고르려면 [Transaction Boundary, Isolation, and Locking Decision Framework](./transaction-boundary-isolation-locking-decision-framework.md)\n- `@Transactional`이 자동 해결사가 아니라는 점을 먼저 분리하려면 [Spring @Transactional 기초](../spring/spring-transactional-basics.md)\n\n## 면접/시니어 질문 미리보기\n\n> Q: single counter oversell에서 왜 `FOR UPDATE`보다 조건부 `UPDATE`를 먼저 보나요?\n> 의도: 가장 짧은 invariant enforcement를 먼저 고르는지 확인\n> 핵심: 한 SQL로 규칙을 닫을 수 있으면 lock hold time과 read/write race를 함께 줄일 수 있기 때문이다.\n\n> Q: version CAS는 조건부 `UPDATE`와 무엇이 다른가요?\n> 의도: 단순 조건부 차감과 stale write 감지를 구분하는지 확인\n> 핵심: CAS는 `내가 읽은 version이 아직 최신인가`를 함께 확인한다.\n\n> Q: `FOR UPDATE`는 언제 꼭 필요해지나요?\n> 의도: 락을 습관적으로 붙이지 않는지 확인\n> 핵심: read-then-decide 절차가 남아서 한 문장 SQL만으로 판단을 닫기 어려울 때다.\n\n## 한 줄 정리\n\nsingle counter oversell은 보통 `조건부 UPDATE`를 첫 기본값으로 보고, 읽은 상태의 최신성 확인이 중요하면 version CAS, 읽고 판단하는 절차가 남으면 그때 `FOR UPDATE`를 검토하면 된다.\n",
   "aliases": [
+    "마지막 재고 뭐부터",
+    "조건부 update 먼저",
+    "FOR UPDATE 언제",
+    "재고 초과 판매",
+    "단일 카운터",
     "single counter oversell first fix",
     "conditional update vs version CAS vs FOR UPDATE",
     "stock 1 oversell beginner",
     "counter row oversell",
     "single row inventory lock",
     "conditional update",
-    "version CAS",
-    "마지막 재고 뭐부터",
-    "조건부 update 먼저",
-    "FOR UPDATE 언제",
-    "oversell",
-    "재고 초과 판매",
-    "single counter",
-    "단일 카운터",
-    "UPDATE WHERE stock > 0",
-    "atomic decrement",
-    "원자적 감소",
-    "version-based CAS",
-    "compare-and-set DB",
-    "@Version optimistic",
-    "stale write detection",
-    "재고 lost update",
-    "decrement-and-check"
+    "version CAS"
   ],
   "expected_queries": [
     "stock 1 같은 single counter oversell은 conditional UPDATE, version CAS, FOR UPDATE 중 무엇부터 봐야 해?",
@@ -63,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/single-counter-oversell-first-fix-card.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch153"
+      }
+    ]
   }
 }
