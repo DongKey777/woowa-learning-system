@@ -6,19 +6,21 @@
   "summary": "이 문서는 cache, messaging, observability를 cache invalidation, at-least-once delivery, DLQ, logs/metrics/traces, production readiness 관점에서 연결하는 intermediate bridge다.",
   "body_markdown": "# 캐시, 메시징, 관측성 🟡 Intermediate\n\n\n> 한 줄 요약: 캐시, 메시징, 관측성 🟡 Intermediate는 입문자가 먼저 잡아야 할 핵심 기준과 실무에서 헷갈리는 경계를 한 문서에서 정리한다.\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../spring/spring-request-pipeline-bean-container-foundations-primer.md)\n\n\nretrieval-anchor-keywords: cache message observability basics, cache message observability beginner, cache message observability intro, software engineering basics, beginner software engineering, 처음 배우는데 cache message observability, cache message observability 입문, cache message observability 기초, what is cache message observability, how to cache message observability\n> 시스템이 커지면 CRUD만으로 설명이 안 된다 -- 캐시는 성능, 메시징은 결합도, 관측성은 생존의 문제다.\n\n> 관련 문서:\n> - [Software Engineering README: 캐시, 메시징, 관측성](./README.md#캐시-메시징-관측성)\n> - [테스트 전략과 테스트 더블](./testing-strategy-and-test-doubles.md)\n> - [Domain Event, Outbox, Inbox](./outbox-inbox-domain-events.md)\n> - [Production Readiness Review](./production-readiness-review.md)\n>\n> retrieval-anchor-keywords:\n> - cache observability\n> - messaging observability\n> - cache hit ratio\n> - cache miss\n> - consumer lag\n> - Kafka lag\n> - dead letter queue\n> - Prometheus alert\n> - 캐시 메트릭\n> - 관측성\n\n## 핵심 개념\n\n백엔드 시스템이 성장하면 세 가지 축이 필수가 된다.\n\n- **캐시**: 비싼 계산이나 조회 결과를 재사용해 응답 속도를 높인다\n- **메시징**: 직접 호출 대신 메시지로 작업을 전달해 결합도를 낮춘다\n- **관측성**: 시스템 내부 상태를 외부에서 이해할 수 있게 만든다\n\n세 가지 모두 \"없어도 동작하지만, 없으면 운영할 수 없는\" 영역이다.\n\n## 깊이 들어가기\n\n### 캐시\n\n#### 캐시 전략\n\n| 전략 | 읽기 | 쓰기 | 적합한 상황 |\n|------|------|------|------------|\n| Cache-Aside (Lazy) | 캐시 미스 시 DB 조회 후 캐시 적재 | 쓰기 시 DB만 갱신, 캐시 무효화 | 읽기 빈도 높고 쓰기 적은 경우 |\n| Read-Through | 캐시가 DB를 대신 조회 | - | 캐시 라이브러리가 지원할 때 |\n| Write-Through | - | 쓰기 시 캐시와 DB 동시 갱신 | 쓰기 후 즉시 읽기가 많을 때 |\n| Write-Behind | - | 쓰기를 캐시에만, 비동기로 DB 반영 | 쓰기 성능이 중요할 때 (데이터 유실 위험) |\n\n#### 캐시 무효화: 가장 어려운 문제\n\n```\n\"컴퓨터 과학에서 어려운 문제는 두 가지다: 캐시 무효화와 이름 짓기.\"\n-- Phil Karlton\n```\n\n실무에서 흔한 무효화 실수:\n\n1. **TTL만 설정하고 끝**: 데이터 변경 후 TTL 만료 전까지 오래된 값을 반환\n2. **쓰기 시 삭제만**: 동시 요청이 들어오면 stale 값이 다시 캐싱됨 (race condition)\n3. **모든 것을 캐싱**: 거의 안 읽히는 데이터까지 캐싱하면 메모리만 낭비\n\n#### 캐시를 어디에 둘 것인가\n\n```\n[클라이언트] → HTTP 캐시 (Cache-Control)\n     ↓\n[CDN/리버스 프록시] → 정적 리소스, 공개 API 응답\n     ↓\n[애플리케이션] → Local Cache (HashMap, Caffeine)\n     ↓\n[분산 캐시] → Redis, Memcached\n     ↓\n[DB 캐시] → Query Cache, Buffer Pool\n```\n\n**Local Cache vs 분산 Cache**:\n- Local: 빠르지만 인스턴스 간 불일치 가능\n- 분산: 일관성 확보 쉬우나 네트워크 비용 발생\n\n### 메시징\n\n#### 동기 호출 vs 비동기 메시징\n\n```java\n// 동기: 주문 서비스가 알림 서비스를 직접 호출\npublic void placeOrder(Order order) {\n    orderRepository.save(order);\n    notificationService.sendOrderConfirm(order);  // 알림 실패 → 주문도 실패?\n}\n\n// 비동기: 이벤트를 발행하고 끝\npublic void placeOrder(Order order) {\n    orderRepository.save(order);\n    eventPublisher.publish(new OrderPlaced(order.getId()));  // 알림은 구독자가 알아서\n}\n```\n\n동기 호출의 문제:\n- 알림 서비스 장애가 주문 서비스 장애로 전파\n- 후속 처리가 추가될 때마다 `placeOrder`를 수정해야 함\n\n#### 메시징에서 반드시 고려할 것\n\n## 깊이 들어가기 (계속 2)\n\n| 문제 | 설명 | 대응 |\n|------|------|------|\n| 메시지 유실 | 브로커 장애, 네트워크 단절 | Outbox 패턴, at-least-once 보장 |\n| 중복 수신 | 재전송, ack 실패 | 멱등성 처리, Inbox 패턴 |\n| 순서 역전 | 파티션, 재시도로 순서 꼬임 | 이벤트 내 시간 정보, 순서 무관한 설계 |\n| 포이즌 메시지 | 처리 불가한 메시지가 반복 재시도 | Dead Letter Queue |\n\n#### At-least-once vs At-most-once vs Exactly-once\n\n- **At-most-once**: 유실 가능, 중복 없음 (fire-and-forget)\n- **At-least-once**: 유실 없음, 중복 가능 (가장 흔한 선택)\n- **Exactly-once**: 이론적 이상, 실무에서는 \"at-least-once + 멱등성\"으로 근사\n\n### 관측성 (Observability)\n\n관측성은 \"로그를 많이 남기는 것\"이 아니다. **시스템 내부 상태를 외부에서 추론할 수 있는 능력**이다.\n\n#### 세 기둥 (Three Pillars)\n\n| 기둥 | 목적 | 예시 | 강점 |\n|------|------|------|------|\n| Logs | 특정 이벤트의 상세 기록 | \"주문 123 결제 실패: 잔액 부족\" | 디버깅, 감사 추적 |\n| Metrics | 집계된 수치 | 초당 요청 수, p99 응답 시간, 에러율 | 트렌드 파악, 알림 기준 |\n| Traces | 요청의 전체 경로 추적 | 주문→결제→재고→알림 호출 체인 | 병목 지점 발견, 분산 시스템 디버깅 |\n\n#### 로그를 \"잘\" 남기는 것\n\n```java\n// 나쁜 로그: 맥락 없음\nlog.error(\"에러 발생\");\n\n// 나쁜 로그: 너무 많은 정보 (개인정보 포함)\nlog.error(\"사용자 \" + user.getEmail() + \"의 카드번호 \" + card.getNumber() + \" 결제 실패\");\n\n// 좋은 로그: 구조화, 맥락 있음, 민감정보 제외\nlog.error(\"Payment failed. orderId={}, userId={}, reason={}, amount={}\",\n          order.getId(), user.getId(), e.getErrorCode(), order.getAmount());\n```\n\n**구조화 로그 (Structured Logging)**:\n- JSON 형태로 남기면 검색/필터가 쉬워진다\n- `traceId`를 포함하면 분산 시스템에서 요청 추적이 가능하다\n\n## 실전 시나리오\n\n### 시나리오: 상품 상세 조회 캐싱\n\n```\n1. 사용자가 상품 상세 페이지 요청\n2. Redis에서 먼저 조회 (Cache-Aside)\n3. 캐시 미스 → DB 조회 → Redis에 적재 (TTL 5분)\n4. 상품 정보 수정 시 → 해당 캐시 키 삭제\n5. 다음 조회 시 DB에서 새로 읽어 캐싱\n```\n\n**문제**: 인기 상품의 캐시가 만료되는 순간 수백 요청이 동시에 DB를 때린다 (Cache Stampede)\n\n**대응**:\n- 캐시 갱신 시 분산 락 사용 (한 요청만 DB 조회)\n- TTL에 랜덤 오프셋 추가 (일괄 만료 방지)\n- 백그라운드 갱신 (캐시 만료 전에 미리 갱신)\n\n## 코드로 보기\n\n### Cache-Aside 패턴 구현\n\n```java\n@Service\npublic class ProductService {\n\n    private final ProductRepository productRepository;\n    private final RedisTemplate<String, Product> redisTemplate;\n\n    public Product findById(Long id) {\n        String key = \"product:\" + id;\n\n        // 1. 캐시에서 조회\n        Product cached = redisTemplate.opsForValue().get(key);\n        if (cached != null) {\n            return cached;\n        }\n\n        // 2. DB에서 조회\n        Product product = productRepository.findById(id)\n            .orElseThrow(() -> new ProductNotFoundException(id));\n\n        // 3. 캐시에 적재\n        redisTemplate.opsForValue().set(key, product, Duration.ofMinutes(5));\n\n        return product;\n    }\n\n    public void update(Long id, ProductUpdateRequest request) {\n        Product product = productRepository.findById(id)\n            .orElseThrow(() -> new ProductNotFoundException(id));\n        product.update(request);\n        productRepository.save(product);\n\n        // 4. 캐시 무효화 (갱신이 아니라 삭제)\n        redisTemplate.delete(\"product:\" + id);\n    }\n}\n```\n\n### 메트릭 기반 알림 설정 예시\n\n## 코드로 보기 (계속 2)\n\n```yaml\n# Prometheus alert rule\ngroups:\n  - name: api-alerts\n    rules:\n      - alert: HighErrorRate\n        expr: rate(http_requests_total{status=~\"5..\"}[5m]) / rate(http_requests_total[5m]) > 0.05\n        for: 2m\n        labels:\n          severity: critical\n        annotations:\n          summary: \"5xx 에러율이 5%를 초과함\"\n\n      - alert: SlowResponseTime\n        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 3\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"p99 응답시간이 3초를 초과함\"\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 단점 |\n|------|------|------|\n| 공격적 캐싱 | 응답 빠름, DB 부하 감소 | 최신성 약화, 메모리 비용 |\n| 보수적 캐싱 | 최신 데이터 보장 | 느린 응답, DB 부하 |\n| 동기 호출 | 즉시 일관성, 디버깅 쉬움 | 결합도 높음, 장애 전파 |\n| 비동기 메시징 | 결합도 낮음, 확장 쉬움 | 최종 일관성, 디버깅 어려움 |\n| 로그 많이 | 디버깅 정보 풍부 | 저장 비용, 노이즈, 성능 영향 |\n| 로그 적게 | 비용 절감, 핵심만 | 장애 시 정보 부족 |\n\n## 꼬리질문\n\n- 캐시 히트율이 낮은데 캐시를 유지해야 하는 경우는 언제인가?\n- 메시징을 쓰면 트랜잭션 일관성을 어떻게 보장하는가? (Outbox 참고)\n- 메트릭과 로그 중 장애 대응에서 먼저 보는 것은?\n- 분산 트레이싱 없이 MSA를 디버깅할 수 있는가?\n- 캐시 워밍업은 언제, 어떻게 해야 하는가?\n\n## 한 줄 정리\n\n캐시는 \"빠르게\"가 아니라 일관성과의 거래이고, 메시징은 \"비동기\"가 아니라 결합도와의 거래이며, 관측성은 \"로그\"가 아니라 장애 시 살아남는 능력이다.\n",
   "aliases": [
-    "Cache Messaging Observability",
-    "캐시 메시징 관측성",
-    "cache hit ratio consumer lag traces",
-    "cache invalidation messaging DLQ",
+    "cache hit ratio consumer lag",
+    "cache invalidation DLQ traces",
     "outbox inbox observability",
     "backend observability basics",
-    "@Service"
+    "messaging lag alerting",
+    "캐시 메시징 관측성",
+    "캐시 무효화 관측",
+    "컨슈머 랙 알림",
+    "로그 메트릭 트레이스"
   ],
   "expected_queries": [
-    "cache messaging observability를 백엔드 운영에서 각각 어떤 문제를 푸는 축으로 보면 돼?",
-    "Cache-Aside, Read-Through, Write-Through, Write-Behind 전략은 언제 쓰고 어떤 invalidation 위험이 있어?",
-    "at-least-once messaging에서 duplicate, ordering, poison message를 idempotency, inbox, DLQ로 어떻게 다뤄?",
-    "logs metrics traces는 각각 어떤 운영 질문에 강하고 observability는 로그를 많이 남기는 것과 어떻게 달라?",
+    "캐시, 메시징, 관측성을 백엔드 운영에서 각각 어떤 문제를 푸는 축으로 보면 돼?",
+    "Cache-Aside랑 Read-Through, Write-Through, Write-Behind는 언제 쓰고 invalidation 위험은 뭐야?",
+    "at-least-once 메시징에서 중복 수신, 순서 역전, poison message를 idempotency, inbox, DLQ로 어떻게 다뤄?",
+    "logs, metrics, traces는 각각 어떤 운영 질문에 강하고 관측성은 로그 많이 남기는 것과 어떻게 달라?",
     "cache hit ratio, consumer lag, p99 latency, trace를 PRR에서 어떤 신호로 봐야 해?"
   ],
   "symptoms": [
@@ -48,12 +50,16 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/cache-message-observability.md",
     "revision_history": [
       {
         "date": "2026-05-28",
         "source": "relation-target-repair"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
       }
     ]
   }

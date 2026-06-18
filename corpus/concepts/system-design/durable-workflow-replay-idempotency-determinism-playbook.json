@@ -6,23 +6,21 @@
   "summary": "이 playbook은 durable workflow 엔진의 deterministic replay, activity idempotency, durable timers, side effects, versioning, retry semantics를 함께 다룬다. 검색 질의가 workflow replay, nondeterminism, activity retry, stale timer, version marker처럼 들어오면 long-running workflow 안전성으로 연결한다.",
   "body_markdown": "# Durable Workflow Replay Idempotency Determinism Playbook\n\n> 한 줄 요약: durable workflow의 안전성은 \"작업을 다시 실행할 수 있다\"가 아니라, replay는 같은 결정을 재현하고 activity는 중복 side effect를 흡수하며 timer와 retry는 versioned state 전이에 묶이는 데서 나온다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Workflow Orchestration + Saga 설계](./workflow-orchestration-saga-design.md)\n- [Effectively-Once Delivery and Idempotent Side Effects Deep Dive](./effectively-once-delivery-idempotent-side-effects-deep-dive.md)\n- [Idempotency Reconciliation Playbook](./idempotency-reconciliation-playbook.md)\n- [Replay / Repair Orchestration Control Plane 설계](./replay-repair-orchestration-control-plane-design.md)\n- [Job Queue 설계](./job-queue-design.md)\n- [DLQ Poison Message Replay Playbook](./dlq-poison-message-replay-playbook.md)\n- [멱등성 키와 중복 방지](../database/idempotency-key-and-deduplication.md)\n- [Process Manager Deadlines and Timeouts](../design-pattern/process-manager-deadlines-timeouts.md)\n- [Event Schema Versioning Compatibility](../software-engineering/event-schema-versioning-compatibility.md)\n\n---\n\n## 먼저 고정할 invariant\n\nDurable workflow의 invariant는 workflow decision과 external side effect를 분리하는 것이다. Workflow code는 history를 읽고 \"다음에 어떤 activity, timer, signal, child workflow를 예약할지\"를 결정한다. Activity code는 DB write, 결제 provider 호출, 이메일 발송, 파일 생성 같은 실제 side effect를 수행한다. 엔진이 crash 후 복구하거나 worker가 새 버전으로 뜨면 workflow function은 처음부터 다시 실행되는 것처럼 보일 수 있지만, 이미 기록된 history를 replay하면서 같은 command sequence를 재현해야 한다.\n\n따라서 workflow 안에서 `now()`, random, 직접 HTTP call, mutable global state, unordered map iteration, environment flag를 그대로 읽으면 위험하다. replay 시 같은 history를 보고도 다른 branch를 타면 nondeterminism이 된다. Durable workflow는 \"코드를 여러 번 실행해도 된다\"가 아니라 \"결정은 history와 deterministic API에만 의존해야 한다\"에 가깝다.\n\n## Replay mental model\n\nReplay는 업무를 다시 수행하는 것이 아니다. 이미 완료된 activity의 결과, timer fired event, signal payload, child workflow result를 history에서 읽어 workflow local state를 재구성하는 과정이다. 예를 들어 결제 activity가 과거에 성공했다면 replay는 결제 API를 다시 부르지 않고 history의 `paymentApproved` result를 돌려준다. 그 다음 workflow code가 당시와 같은 branch로 배송 예약 command를 만들면 안전하다.\n\n이 모델에서 workflow local variable은 durable storage가 아니다. Local variable은 replay로 재구성되는 cache이고, source of truth는 event history다. 반대로 activity 내부 local retry state는 replay 대상이 아니므로 activity가 crash 뒤 재시도될 수 있다. 그래서 activity에는 idempotency가 필요하고, workflow에는 determinism이 필요하다.\n\n## Workflow code에서 금지하거나 감싸야 할 것\n\n| 위험한 동작 | 왜 위험한가 | 안전한 대안 |\n|---|---|---|\n| system clock 직접 읽기 | replay 시 시간이 달라져 branch 변경 | workflow clock / recorded time API |\n| random UUID 생성 | command id나 key가 매번 달라짐 | deterministic UUID, recorded side effect |\n| 직접 외부 API 호출 | replay가 side effect를 반복 | activity로 분리 |\n| DB 조회로 branch 결정 | replay 시 DB 상태가 달라짐 | activity result를 history에 기록 |\n| feature flag 직접 읽기 | 배포 뒤 오래된 run이 새 branch를 탐 | version marker / patch gate |\n| unordered collection iteration | command 순서가 달라질 수 있음 | stable sort, deterministic key order |\n\n일부 엔진은 `sideEffect` 같은 API를 제공한다. 이것은 \"workflow 안에서 아무 side effect나 해도 된다\"는 허가가 아니라, nondeterministic 값을 한 번 계산해 history에 기록하고 replay 때 같은 값을 돌려주는 장치다. 외부 결제나 이메일처럼 업무 side effect가 있는 일은 여전히 activity로 빼야 한다.\n\n## Activity idempotency\n\nActivity는 at-least-once로 실행될 수 있다고 가정한다. Worker가 activity를 수행했지만 completion ack 전에 죽으면 엔진은 같은 activity를 다시 schedule할 수 있다. HTTP timeout이 났지만 provider는 결제를 성공시켰을 수도 있다. 그래서 activity request에는 업무 의미의 idempotency key가 들어가야 한다.\n\n키는 workflow id만으로 부족할 때가 많다. 같은 workflow 안에 결제 승인, 결제 취소, 포인트 적립, 알림 발송이 각각 다르면 `workflowId + stepName + attemptBusinessId`처럼 operation을 구분한다. 같은 key로 다른 payload가 오면 replay가 아니라 conflict로 처리한다. 결제 provider에도 provider idempotency key를 전달하고, 내부 DB에는 `(operation_id, payload_hash, status, result_reference)`를 남긴다. 성공 응답을 잃은 retry는 provider 조회나 내부 ledger로 기존 결과를 replay해야 한다.\n\nActivity retry는 \"성공할 때까지 무한 반복\"이 아니다. Retryable error, non-retryable business failure, timeout, cancellation, compensation trigger를 나눈다. `409 duplicate`, `400 invalid request`, `insufficient funds`는 같은 retry 정책을 쓰면 안 된다. Backoff와 max attempts는 downstream retry budget과 맞춰야 하며, workflow deadline이 끝난 뒤 activity retry가 계속 side effect를 만들지 않게 cancellation도 idempotent해야 한다.\n\n## Durable timer와 stale timeout\n\nWorkflow timer는 단순 sleep이 아니다. Timer schedule command가 history에 기록되고, due time이 되면 timer fired event가 들어와 replay 가능한 branch를 만든다. Worker가 죽어도 timer는 engine storage에 남아야 한다. 그래서 process memory의 scheduled executor만으로 long-running workflow timeout을 구현하면 durable하지 않다.\n\nTimer가 안전하려면 current state와 version token을 함께 본다. 예를 들어 주문 만료 timer를 예약한 뒤 결제가 성공했다면 늦게 도착한 expire timer가 주문을 취소하면 안 된다. Timer fired handler는 `workflowId`, `deadlineType`, `timerVersion`, `expectedState`를 확인하고 stale이면 no-op으로 끝내야 한다. Retry timer, reminder timer, expiration timer가 같은 key를 공유하면 서로를 잘못 취소할 수 있으므로 deadline type을 분리한다.\n\n## Versioning과 배포\n\n가장 자주 터지는 nondeterminism은 오래 실행 중인 workflow가 새 코드를 replay할 때 생긴다. 예전 history에는 `charge -> reserve -> email` command가 기록되어 있는데 새 코드가 `charge -> fraudCheck -> reserve -> email`을 만들면 기존 run의 replay가 깨질 수 있다. 새 workflow에는 새 branch를 쓰되, 기존 workflow에는 예전 branch를 유지해야 한다.\n\n실무 규칙은 세 가지다. 첫째, workflow command sequence를 바꾸는 변경은 version marker나 patch API 뒤에 둔다. 둘째, activity input/output schema는 오래된 history를 읽을 수 있게 backward compatible하게 바꾼다. 셋째, deprecated branch 제거는 해당 version을 쓰는 open workflow가 drain되었거나 migration workflow로 상태를 전환한 뒤에 한다. \"코드 배포는 한 번\"이어도 workflow history는 몇 주 또는 몇 달 살아 있을 수 있다.\n\n## Retry semantics를 나눠 말하기\n\nWorkflow retry와 activity retry는 다르다. Activity retry는 한 step의 external action을 다시 시도하는 정책이다. Workflow retry는 전체 workflow run을 실패 뒤 새 run으로 재시작하거나, 특정 failure를 부모가 다시 schedule하는 정책일 수 있다. 전체 workflow를 retry하면 이미 끝난 activity side effect가 다시 요청될 수 있으므로 idempotency key 범위를 run id가 아니라 business operation id로 잡아야 한다.\n\nChild workflow, signal, compensation도 retry 의미가 다르다. Signal은 중복 수신될 수 있으므로 signal id dedup이 필요하고, compensation은 원래 작업의 inverse가 아니라 업무적으로 허용된 수정 activity다. DLQ replay나 repair campaign은 workflow history를 우회해 side effect를 만들 수 있으므로 같은 operation id와 reconciliation check를 공유해야 한다.\n\n## 검증 checklist\n\n1. Workflow code에서 clock, random, network, DB read, global mutable state 사용을 grep하고 deterministic API 또는 activity로 옮긴다.\n2. 모든 activity input에 business operation id와 payload hash를 넣는다.\n3. Provider 호출은 provider idempotency key와 내부 status row를 함께 기록한다.\n4. Timer fired branch는 current state, deadline type, timerVersion을 확인한다.\n5. Command sequence 변경은 version marker 뒤에 두고 open workflow drain 계획을 만든다.\n6. Retry policy는 retryable technical error와 non-retryable business result를 분리한다.\n7. Replay test로 오래된 history sample을 새 worker code에서 재생한다.\n8. Reconciliation job이 activity success, provider state, internal ledger, workflow state mismatch를 찾게 한다.\n\n면접 답변에서는 \"workflow는 deterministic replay, activity는 idempotent side effect, timer는 durable history event, versioning은 open history와 호환되는 branch 관리, retry는 workflow와 activity 범위를 분리한다\"라고 잡으면 안전하다.\n",
   "aliases": [
-    "durable workflow replay playbook",
     "deterministic workflow replay",
     "activity idempotency workflow",
     "workflow side effect determinism",
     "durable timer retry semantics",
     "workflow versioning replay safety",
-    "Temporal style workflow determinism",
-    "long running workflow replay"
+    "워크플로 리플레이 결정성",
+    "액티비티 멱등성 재시도",
+    "장기 실행 워크플로 배포"
   ],
   "expected_queries": [
     "durable workflow에서 replay가 왜 deterministic해야 하는지 예시로 설명해줘",
-    "activity retry가 외부 side effect를 두 번 만들지 않게 하려면 어떤 idempotency key가 필요해?",
+    "activity retry가 결제나 알림 같은 외부 side effect를 두 번 만들지 않게 하려면 어떤 idempotency key가 필요해?",
     "workflow timer는 일반 queue delay와 무엇이 다르고 stale timeout을 어떻게 막아?",
-    "오래 실행 중인 workflow가 있는데 코드를 배포할 때 versioning을 어떻게 설계해야 해?",
-    "deterministic replay에서 현재 시간 random 외부 API 호출을 workflow 코드에 넣으면 왜 위험해?",
-    "workflow retry semantics와 activity retry semantics를 어떻게 나눠야 해?",
-    "Temporal 같은 durable workflow 엔진에서 side effect와 version marker를 언제 써야 해?"
+    "오래 실행 중인 workflow가 있는데 코드를 배포할 때 version marker를 어떻게 써야 해?",
+    "workflow 코드 안에서 현재 시간, random, 외부 API 호출을 직접 쓰면 replay 때 왜 위험해?"
   ],
   "symptoms": [
     "workflow 코드에서 현재 시간이나 random 값을 직접 읽어 replay 때 다른 분기로 간다",
@@ -53,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/durable-workflow-replay-idempotency-determinism-playbook.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }

@@ -7,18 +7,15 @@
   "body_markdown": "# CRDT G-Counter, PN-Counter, OR-Set Merge Semantics Primer\n\n> 한 줄 요약: CRDT는 \"나중에 대충 합친다\"가 아니라, 각 replica state가 monotonic하게 커지고 merge가 idempotent, commutative, associative라서 중복, 순서 뒤바뀜, 재전송이 있어도 같은 상태로 수렴하게 만든 데이터 타입이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Multi-Region Active-Active Conflict Resolution Chooser](./multi-region-active-active-conflict-resolution-chooser.md)\n- [Consistency Repair / Anti-Entropy Platform 설계](./consistency-repair-anti-entropy-platform-design.md)\n- [Read / Write Quorum & Staleness Budget 설계](./read-write-quorum-staleness-budget-design.md)\n- [Read Your Writes vs Monotonic Reads vs Causal Consistency Decision Guide](../database/read-your-writes-vs-monotonic-reads-vs-causal-consistency-decision-guide.md)\n\nretrieval-anchor-keywords: crdt, g-counter, pn-counter, or-set, observed remove set, add wins set, merge semantics, join semilattice, monotonic merge, state based crdt, tombstone, anti entropy\n\n---\n\n## 먼저 잡을 불변식\n\nState-based CRDT, 흔히 CvRDT라고 부르는 모델의 핵심은 **state가 join-semilattice 위에 있고 update와 merge가 그 순서를 거스르지 않는다**는 점이다. 여기서 monotonic은 사용자가 보는 숫자나 membership이 항상 증가한다는 뜻이 아니다. 내부 replica state가 \"정보를 잃지 않는 방향\"으로만 움직인다는 뜻이다.\n\n그래서 CRDT merge는 세 가지 성질을 가져야 한다.\n\n- commutative: A merge B와 B merge A가 같다\n- associative: 여러 replica를 어떤 묶음 순서로 합쳐도 같다\n- idempotent: 같은 state를 여러 번 받아도 결과가 한 번 받은 것과 같다\n\n이 성질 덕분에 anti-entropy background sync가 같은 payload를 다시 보내거나, replica가 서로 다른 순서로 gossip을 받아도 최종 수렴이 가능하다. 반대로 merge가 \"마지막 timestamp를 고른다\"처럼 정보를 버리면 CRDT라고 부르기 어렵고, LWW register 같은 별도 conflict policy로 봐야 한다.\n\n## G-Counter: pointwise max로 합치는 증가 전용 counter\n\nG-Counter는 replica마다 slot을 가진 vector로 생각하면 쉽다. Replica A가 increment하면 A slot만 증가시킨다. B가 increment하면 B slot만 증가시킨다. Merge는 각 slot별 maximum을 취한다.\n\n```text\nA: {A: 3, B: 0}\nB: {A: 1, B: 5}\nmerge = {A: max(3,1), B: max(0,5)} = {A: 3, B: 5}\nvalue = 8\n```\n\n여기서 sum을 merge하지 않는 이유가 중요하다. 단순히 전체 값을 더하면 같은 increment를 여러 번 받은 replica가 double count를 만들 수 있다. Slot별 max는 \"각 replica가 알고 있는 그 replica의 가장 큰 증가분\"만 남긴다. Max는 idempotent라 같은 state를 다시 받아도 값이 변하지 않는다.\n\nG-Counter가 맞는 데이터는 좋아요 총합, 조회 수의 eventually consistent 집계, shard별 additive metric처럼 감소가 없고 총량 제약이 없는 경우다. 재고, 잔액, 좌석처럼 `>= 0`이나 \"한 번만 배정\"이 필요한 값에는 이 단순 모델을 붙이면 안 된다.\n\n## PN-Counter: 감소는 값에서 보이고 state는 두 G-Counter다\n\nPN-Counter는 positive G-Counter와 negative G-Counter 두 개로 만든다. Increment는 P 쪽 자기 slot을 늘리고, decrement는 N 쪽 자기 slot을 늘린다. Merge는 P와 N 각각 pointwise max를 취한다. 읽을 때만 `sum(P) - sum(N)`으로 값을 계산한다.\n\n그래서 PN-Counter의 visible value는 줄어들 수 있다. 하지만 내부 state는 여전히 monotonic하다. Decrement는 \"N counter에 새로운 증가 정보가 추가됨\"이지, 기존 state를 지우는 작업이 아니다. 이 구분이 면접에서 자주 틀리는 지점이다. \"CRDT는 항상 값이 증가한다\"라고 말하면 PN-Counter를 설명할 수 없다. 더 정확한 답은 \"lattice state가 inflationary update와 join merge로 전진한다\"이다.\n\nPN-Counter도 전역 제약에는 약하다. 두 리전이 동시에 재고 1개를 각각 decrement하면 최종 value가 -1이 될 수 있다. CRDT는 수렴을 보장하지, 모든 business invariant를 공짜로 지키지 않는다. stock constraint에는 escrow, quota allocation, single writer, reservation ledger 같은 다른 설계가 필요하다.\n\n## OR-Set: remove는 관측한 add tag만 지운다\n\nOR-Set, observed-remove set은 element만 저장하지 않고 add operation마다 unique tag, 흔히 dot을 붙인다. `x`를 add하면 `(x, tag1)`이 생기고, 같은 `x`를 다시 add하면 `(x, tag2)`가 생길 수 있다. Remove는 \"내가 관측한 x의 add tag들\"을 tombstone 또는 remove set에 기록한다.\n\nMerge는 add-tag set과 remove-tag set을 union한다. Membership은 `x`에 대해 remove되지 않은 add tag가 하나라도 있으면 true다.\n\n중요한 edge case는 concurrent add/remove다.\n\n```text\nA가 x tag1을 본 뒤 remove(x) -> remove set에 tag1 기록\nB가 동시에 x tag2를 add -> A의 remove는 tag2를 아직 못 봄\nmerge 후 tag1은 제거, tag2는 살아 있음\n```\n\n즉 OR-Set은 보통 add-wins 성격을 갖는다. Remove는 \"이 element 이름을 영원히 삭제\"가 아니라 \"내가 본 add instance들을 삭제\"다. 이 semantics 덕분에 concurrent add가 silent하게 사라지지 않는다. 대신 tag metadata와 tombstone이 늘어난다. Tombstone compaction은 모든 relevant replica가 remove 정보를 충분히 봤다는 causal knowledge가 있을 때만 안전하다. 너무 빨리 지우면 늦게 도착한 add tag가 되살아나는 것처럼 보일 수 있다.\n\n## Anti-entropy와 delivery 요구\n\nState-based CRDT는 anti-entropy와 궁합이 좋다. 전체 state나 delta-state를 주기적으로 교환해도 merge가 idempotent라 중복 전달이 치명적이지 않다. 순서도 엄격하지 않다. 결국 각 replica가 같은 update 정보를 보게 되면 같은 join 결과로 수렴한다.\n\nOperation-based CRDT는 update operation을 전달해 효과를 적용하는 방식이라 요구가 다르다. 보통 reliable delivery, 중복 제어, causal delivery 같은 조건을 더 명시해야 한다. 면접에서 \"CRDT는 network가 아무렇게나 해도 된다\"라고 말하면 과장이다. 이 문서는 state-based merge 직관을 기준으로 잡고, delta나 op-based 구현은 별도 운영 조건을 확인해야 한다.\n\n## Wrong-bucket neighbors\n\n| 헷갈린 문서/개념 | 왜 wrong bucket인가 | 더 정확한 분기 |\n|---|---|---|\n| read/write quorum | quorum은 읽기와 쓰기 참여 replica 수의 교집합으로 stale 가능성을 낮추는 계약이다 | CRDT는 conflict가 생긴 뒤 merge 함수로 수렴시키는 데이터 타입이다 |\n| Raft/Paxos consensus | consensus는 하나의 순서나 값을 합의해 conflict를 줄인다 | CRDT는 concurrent update를 허용하고 합친다 |\n| LWW conflict policy | timestamp 하나를 골라 다른 update를 버린다 | CRDT merge는 정보를 보존하는 join이어야 한다 |\n| inventory reservation | 재고는 총량 제약이 핵심이다 | 단순 counter CRDT보다 escrow, reservation, ledger가 먼저다 |\n| generic anti-entropy repair | repair는 drift를 탐지하고 맞추는 운영 플랫폼이다 | CRDT는 repair payload가 안전히 합쳐지도록 만드는 data semantics다 |\n\n## Trade-offs\n\nCRDT를 선택할 때 얻는 것은 offline/local write 허용, active-active write 수용, retry-friendly merge다. 비용은 metadata와 semantics 제한이다. G-Counter는 replica slot 관리가 필요하고 replica membership 변경 시 slot lifecycle을 다뤄야 한다. PN-Counter는 decrement가 가능하지만 non-negative invariant를 보장하지 않는다. OR-Set은 tag와 tombstone 비용이 크고 compaction이 어렵다. 사용자에게 보이는 의미도 조심해야 한다. \"삭제했는데 다시 생겼다\"가 아니라 \"삭제와 동시 add가 있었다\"는 것을 UX나 audit에서 설명할 수 있어야 한다.\n\n## Interview answer axes\n\n좋은 답변은 알고리즘 이름보다 아래 축을 먼저 말한다.\n\n1. 어떤 데이터 타입인가: counter, set, register, map 중 무엇인가.\n2. merge invariant는 무엇인가: pointwise max, union, observed-remove 같은 join 규칙.\n3. update가 monotonic한가: 기존 정보를 지우지 않고 새 정보를 추가하는가.\n4. concurrent conflict 의미는 무엇인가: add-wins인지, remove-wins인지, 값 선택인지.\n5. metadata 비용은 무엇인가: replica slot, vector/dot, tombstone, compaction 조건.\n6. business invariant는 별도인가: stock, money, permission처럼 CRDT만으로 안 되는 제약이 있는가.\n7. 운영 경로는 무엇인가: anti-entropy, delta sync, causal context, observability를 어떻게 둘 것인가.\n\n## Safe Next Docs\n\nActive-active에서 CRDT, LWW, home-region, escrow를 고르는 문제는 [Multi-Region Active-Active Conflict Resolution Chooser](./multi-region-active-active-conflict-resolution-chooser.md)로 이어진다. Merge payload를 운영적으로 어떻게 찾아서 복구할지 궁금하면 [Consistency Repair / Anti-Entropy Platform 설계](./consistency-repair-anti-entropy-platform-design.md)를 보면 된다. Quorum intersection과 stale read budget을 비교하고 싶으면 [Read / Write Quorum & Staleness Budget 설계](./read-write-quorum-staleness-budget-design.md)로 넘어가면 된다.\n",
   "aliases": [
     "CRDT merge semantics",
-    "G-Counter",
-    "grow-only counter",
-    "PN-Counter",
-    "positive negative counter",
-    "OR-Set",
-    "observed remove set",
-    "add wins set",
+    "G-Counter merge",
+    "PN-Counter decrement",
+    "OR-Set observed remove",
     "state based CRDT",
-    "CvRDT",
     "join semilattice",
-    "monotonic merge",
-    "idempotent merge",
+    "CRDT 병합 규칙",
+    "G카운터 PN카운터",
+    "OR셋 동시 추가 삭제",
+    "멱등 병합",
     "CRDT tombstone"
   ],
   "expected_queries": [
@@ -55,8 +52,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/system-design/crdt-gcounter-pncounter-orset-merge-semantics-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }

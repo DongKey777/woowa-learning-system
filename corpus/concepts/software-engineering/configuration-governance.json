@@ -6,12 +6,14 @@
   "summary": "설정 변경은 코드 배포보다 가볍게 보이기 쉽지만, 실제로는 더 넓은 blast radius를 만들 수 있으므로 configuration governance는 config를 운영 변경으로 취급하고 검증과 점진 배포를 붙이는 방식이다.",
   "body_markdown": "# Configuration Governance and Runtime Safety\n\n> 한 줄 요약: 설정 변경은 코드 배포보다 가볍게 보이기 쉽지만, 실제로는 더 넓은 blast radius를 만들 수 있으므로 configuration governance는 config를 운영 변경으로 취급하고 검증과 점진 배포를 붙이는 방식이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Feature Flags, Rollout, Dependency Management](./feature-flags-rollout-dependency-management.md)\n> - [Kill Switch Fast-Fail Ops](./kill-switch-fast-fail-ops.md)\n> - [Release Policy, Change Freeze, and Error Budget Coupling](./release-policy-change-freeze-error-budget-coupling.md)\n> - [Production Readiness Review](./production-readiness-review.md)\n> - [Policy as Code and Architecture Linting](./policy-as-code-architecture-linting.md)\n\n> retrieval-anchor-keywords:\n> - configuration governance\n> - config as code\n> - runtime safety\n> - config blast radius\n> - configuration rollout\n> - config validation\n> - dynamic config\n> - config drift\n\n## 핵심 개념\n\n운영 사고 중 상당수는 코드가 아니라 설정 변경에서 시작된다.\ntimeout, retry, rate limit, endpoint, feature exposure, credential rotation 모두 config로 바뀔 수 있다.\n\n문제는 config가 가벼워 보여서 review와 검증을 건너뛰기 쉽다는 점이다.\n\nconfiguration governance는 다음을 요구한다.\n\n- 누가 바꾸는가\n- 무엇을 검증하는가\n- 어디까지 퍼지게 하는가\n- 잘못되면 어떻게 되돌리는가\n\n즉 config는 파일이 아니라 **운영 중인 시스템의 제어면(control plane)**이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 모든 config가 같은 위험도를 갖지 않는다\n\nconfig는 유형별로 나눠 봐야 한다.\n\n예:\n\n- cosmetic: 문구, 색상\n- behavioral: timeout, retry, rate limit\n- side-effect: 결제, 알림, 쓰기 허용 여부\n- secret/security: 키, endpoint, issuer\n\n같은 \"설정 변경\"이라도 blast radius와 rollback 난이도가 완전히 다르다.\n\n### 2. schema와 validation이 없으면 config는 런타임 코드가 된다\n\n좋은 config 시스템은 단순 key-value 저장소가 아니다.\n\n필요한 것:\n\n- 타입 검증\n- 허용 범위 검증\n- 필수값 확인\n- 환경별 기본값\n- deprecated key 경고\n\n즉 config도 compile 단계는 없지만 **입력 계약**은 있어야 한다.\n\n### 3. config rollout도 점진적으로 해야 한다\n\n코드 배포만 canary를 하는 팀이 많다.\n하지만 config도 다음처럼 단계적으로 풀어야 한다.\n\n- 특정 환경\n- 특정 서비스\n- 특정 사용자군\n- 특정 트래픽 비율\n\n특히 retry, timeout, write enable 같은 값은 한 번에 전체 반영하면 사고가 커진다.\n\n### 4. emergency override와 audit trail이 필요하다\n\n운영 사고 중에는 빠른 수정이 중요하다.\n하지만 빠르게 바꾸는 것과 무기록으로 바꾸는 것은 다르다.\n\n필요한 요소:\n\n- change reason\n- operator identity\n- change scope\n- before/after value\n- expiry 또는 재검토 시점\n\nconfig는 쉽게 바뀌어야 하지만, **쉽게 잊히면 안 된다**.\n\n### 5. config governance는 flag, kill switch, secret rotation과 이어진다\n\nconfig는 혼자 존재하지 않는다.\n\n- flag는 노출 제어\n- kill switch는 긴급 차단\n- secret rotation은 보안 운영\n- release policy는 변경 허용 범위 제어\n\n이 흐름이 분리되면 운영자는 무엇을 어디서 바꿔야 하는지 헷갈리게 된다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 결제 timeout을 늘린다\n\n사소해 보이지만 downstream 정체와 thread 고갈로 이어질 수 있다.\n이런 변경은 canary와 모니터링 없이 전체 반영하면 위험하다.\n\n### 시나리오 2: 알림 rate limit 값을 바꾼다\n\n너무 느슨하면 외부 연동 폭주가 날 수 있고, 너무 엄격하면 중요한 알림이 누락된다.\n값 검증과 rollback 경로가 필요하다.\n\n### 시나리오 3: 잘못된 endpoint로 설정이 바뀐다\n\n코드가 멀쩡해도 전 서비스가 잘못된 외부 시스템을 치게 된다.\nconfig validation과 environment guard가 없으면 피해가 크다.\n\n---\n\n## 런타임 안전 플레이북\n\n### 재현/트리거 조건\n\n다음 config 변경은 단순 값 수정으로 처리하지 않는다.\n\n- timeout, retry, rate limit, queue size처럼 부하를 바꾸는 값\n- write enable, payment provider, endpoint, issuer처럼 side effect를 바꾸는 값\n- secret rotation이나 auth/cors/cookie scope처럼 보안 경계를 바꾸는 값\n- 전체 tenant나 전체 region에 즉시 전파되는 dynamic config\n\n### 1차 분류(triage)\n\n1. config를 `cosmetic`, `behavioral`, `side_effect`, `secret_security` risk tier로 분류한다.\n2. blast radius를 service, environment, tenant, traffic percentage로 좁혀 적는다.\n3. validation rule, canary scope, rollback value, monitoring window를 변경 전 ticket에 붙인다.\n4. emergency override라면 expiry와 reentry owner를 같이 남긴다.\n\n### 실패 매트릭스\n\n| 증상 | 원인 후보 | 즉시 조치 |\n|---|---|---|\n| 배포 없이 장애가 난다 | config rollout guard 부재 | previous value로 rollback하고 staged rollout을 강제한다 |\n| 일부 tenant만 실패한다 | scope/override 누락 | config effective-value를 tenant별로 dump한다 |\n| retry 증가 뒤 downstream이 터진다 | behavioral config blast radius 과소평가 | retry budget과 dependency saturation metric을 같이 본다 |\n| 누가 왜 바꿨는지 모른다 | audit field 부족 | actor, reason, before/after, expiry 없는 변경을 차단한다 |\n\n### 검증/종료 기준\n\nconfig 변경은 다음이 확인되면 닫는다.\n\n- effective config가 의도한 scope에만 반영됐다\n- canary metric과 dependency saturation이 안정적이다\n- rollback path가 실제 previous value로 검증됐다\n- emergency override는 `expected_reentry_at` 또는 expiry 전에 정상 값으로 복귀했다\n\n---\n\n## 코드로 보기\n\n```yaml\nconfig_policy:\n  key: payment.retry.max_attempts\n  risk_tier: high\n  validate:\n    min: 0\n    max: 3\n  rollout:\n    strategy: canary\n    scope: 10_percent\n  rollback: previous_value\n```\n\n좋은 config는 값만 저장하지 않고, 위험도와 배포 규칙까지 같이 가진다.\n\n---\n\n## 트레이드오프\n\n| 선택 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 자유 수정 | 빠르다 | 사고가 커지기 쉽다 | 매우 작은 실험 |\n| config review + validation | 안전하다 | 속도가 조금 느려진다 | 일반 운영 |\n| tiered governance + staged rollout | 가장 안전하다 | 시스템 설계가 필요하다 | 고위험 서비스 |\n\nconfiguration governance의 목적은 운영자를 느리게 만드는 것이 아니라, **가벼워 보이는 변경이 큰 장애로 번지는 것을 막는 것**이다.\n\n---\n\n## 꼬리질문\n\n- 어떤 config는 즉시 적용 가능하고, 어떤 config는 PRR 수준 검토가 필요한가?\n- 설정 변경도 canary 대상인가?\n- 잘못된 값을 누가 얼마나 빨리 되돌릴 수 있는가?\n- flag, kill switch, secret rotation은 하나의 운영 모델로 보이고 있는가?\n\n## 한 줄 정리\n\nConfiguration governance and runtime safety는 설정 변경을 운영 변경으로 보고, 검증과 감사와 점진 배포를 붙여 config로 인한 대형 사고를 줄이는 방식이다.\n",
   "aliases": [
-    "Configuration Governance and Runtime Safety",
     "config governance",
     "config as code runtime safety",
     "configuration rollout",
     "config blast radius",
-    "dynamic config validation"
+    "dynamic config validation",
+    "설정 변경 거버넌스",
+    "런타임 설정 안전",
+    "설정 카나리 배포"
   ],
   "expected_queries": [
     "configuration governance는 config를 운영 변경으로 취급해 review validation staged rollout을 붙인다는 뜻이 뭐야?",
@@ -46,8 +48,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/configuration-governance-runtime-safety.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }

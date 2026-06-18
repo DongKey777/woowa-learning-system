@@ -6,17 +6,22 @@
   "summary": "이 chooser는 Request DTO, Command, Response DTO 이름과 책임을 구분한다. Controller DTO를 Service까지 넘김, DTO가 너무 많음, response와 entity 이름 혼동 같은 리뷰 표현을 다룬다.",
   "body_markdown": "# Request Command Response DTO Naming Chooser\n\n## 한 줄 요약\n\nRequest DTO는 바깥 요청 형식, Command는 유스케이스 입력, Response DTO는 바깥 응답 계약을 말한다. 이름을 잘 붙인다는 것은 \"이 객체를 누가 알아도 되는가\"와 \"무엇이 바뀔 때 같이 바뀌는가\"를 드러내는 일이다.\n\n## 10초 chooser\n\n| 객체 | 먼저 떠올릴 질문 | 보통 위치 | 알아도 되는 것 | 바뀌는 이유 |\n|---|---|---|---|---|\n| Request DTO | \"클라이언트가 무엇을 보냈나?\" | Controller input | JSON field, query/path, 웹 validation | API 입력 contract 변경 |\n| Command | \"어떤 유스케이스를 실행할 입력인가?\" | Controller -> Service 사이 | member id, domain id, raw value | application flow 변경 |\n| Response DTO | \"클라이언트에게 무엇을 약속해 돌려주나?\" | Controller output | 응답 field, status label, display value | 화면/API 응답 변경 |\n| Query View | \"조회 화면이 읽기 좋은 모양은 무엇인가?\" | query/read model | join 결과, 목록 row, projection | 조회 요구/성능 변경 |\n| Domain 객체 | \"항상 지켜야 하는 의미와 규칙은 무엇인가?\" | Service/Domain | 불변식, 행동, 값 의미 | 비즈니스 규칙 변경 |\n\n## 경계 판단 기준\n\n이름은 객체가 속한 boundary를 드러내야 한다. `CreateReservationRequest`는 HTTP 요청이다. `CreateReservationCommand`는 예약 생성 유스케이스 입력이다. `ReservationResponse`는 HTTP 응답이다. 이름이 같아 보이면 변경 이유도 같아지는지 확인한다.\n\n처음에는 세 질문으로 충분하다.\n\n1. 이 타입의 필드명은 외부 API 말투인가, 유스케이스 말투인가?\n2. 이 타입을 바꾸게 만드는 사람은 API 사용자, application flow, domain rule 중 누구인가?\n3. 이 타입을 import한 코드가 HTTP, JSON, DB 같은 바깥 세부를 몰라도 되는가?\n\n작은 미션에서는 Request DTO를 바로 Service에 넘겨도 동작한다. 다만 다음 신호가 보이면 Command로 한 번 번역하는 편이 안전하다.\n\n- HTTP field name이 Service 메서드 파라미터 이름을 지배한다.\n- Request DTO에 `toEntity()`가 생기고 Domain 생성 규칙을 우회한다.\n- 같은 유스케이스가 웹, 콘솔, batch 등 여러 입력 경로에서 호출된다.\n- Service 테스트가 JSON request shape를 알아야 한다.\n- `@JsonProperty`, `@NotBlank(message = \"...\")`, `@DateTimeFormat` 같은 웹 세부가 application package로 들어온다.\n- Controller가 인증 principal, path variable, request body를 섞어 Service에 넘기는 규칙을 매번 반복한다.\n\nResponse DTO는 Domain이나 Entity의 이름을 그대로 복사해도 되지만 책임은 다르다. `ReservationResponse`가 theme name, formatted time, status label을 담는 것은 응답 모양의 책임이다. Entity가 그 필드를 직접 맞추기 시작하면 저장 모델이 화면 요구사항에 끌려간다.\n\n## before / after로 보기\n\n### before: Request가 application 안쪽까지 흐른다\n\n```java\n@PostMapping(\"/reservations\")\nResponseEntity<ReservationResponse> create(\n        @AuthenticationPrincipal MemberPrincipal principal,\n        @RequestBody CreateReservationRequest request\n) {\n    Reservation reservation = reservationService.create(principal.id(), request);\n    return ResponseEntity.created(...).body(ReservationResponse.from(reservation));\n}\n```\n\n이 자체가 항상 틀린 코드는 아니다. 문제는 Service가 `request.getThemeId()`, JSON field name, web validation annotation을 함께 알기 시작할 때다. 그 순간 Service 테스트는 \"예약 생성\"보다 \"HTTP 요청 모양\"에 묶인다.\n\n### after: Controller가 웹 입력을 유스케이스 입력으로 번역한다\n\n```java\nrecord CreateReservationRequest(Long themeId, Long timeId, LocalDate date) {\n    CreateReservationCommand toCommand(long memberId) {\n        return new CreateReservationCommand(memberId, themeId, timeId, date);\n    }\n}\n\nrecord CreateReservationCommand(\n        long memberId,\n        long themeId,\n        long timeId,\n        LocalDate date\n) {\n}\n```\n\nController는 HTTP에서 온 값과 인증 정보를 합쳐 Command를 만든다. Service는 `CreateReservationCommand`만 보고 예약 생성 흐름을 판단한다. 이러면 API field 이름을 바꾸는 일과 유스케이스 입력을 바꾸는 일이 분리된다.\n\n## 검증 위치와 이름\n\n이름을 나눌 때 검증 책임도 같이 보면 덜 헷갈린다.\n\n| 검증 | 예시 | 자연스러운 위치 |\n|---|---|---|\n| 형식 검증 | `date`가 비어 있지 않다, `themeId`가 숫자다 | Request DTO / Controller |\n| 유스케이스 입력 검증 | 로그인한 회원이 예약을 만들 수 있다 | Service / application policy |\n| 도메인 불변식 | 예약 날짜가 과거일 수 없다, 로또 번호는 1-45다 | Domain / Value Object |\n| 저장소 기반 중복 검증 | 같은 날짜/시간 예약이 이미 존재한다 | Service가 Repository contract로 확인 |\n\n그래서 `CreateReservationRequest` 안의 `@NotNull`은 자연스럽지만, \"중복 예약이면 실패\" 판단까지 Request DTO에 들어가면 이상하다. 중복 여부는 HTTP 형식이 아니라 유스케이스와 저장소 상태의 문제다.\n\n## 코드 리뷰 냄새\n\n- `CreateReservationRequest`가 Service, Domain, Repository까지 그대로 전달된다.\n- `Command`라고 이름 붙였지만 `@NotBlank`, `@JsonProperty` 같은 HTTP 세부가 들어 있다.\n- `Response`가 Entity를 감싸기만 하고 lazy loading 문제를 숨긴다.\n- `Dto`라는 이름 하나로 request, command, response를 모두 부른다.\n- `toEntity()`가 DTO 안에서 Repository 조회가 필요한 변환까지 처리한다.\n- `ReservationDto` 하나가 요청, 저장, 응답, 테스트 fixture에서 모두 쓰인다.\n- `Response` 타입을 내부 정책 판단용 snapshot으로 재사용한다.\n- `Command`가 domain method를 직접 호출하며 계산을 늘려 Domain 객체처럼 행동한다.\n\n## 리뷰 문장으로 번역하기\n\n| 리뷰에서 들은 말 | 실제로 점검할 질문 |\n|---|---|\n| \"DTO가 너무 안쪽까지 들어옵니다\" | Service가 HTTP/JSON 세부를 알아야만 동작하는가? |\n| \"Command로 나누는 게 좋겠습니다\" | 유스케이스 입력과 API 입력의 변경 이유가 갈라졌는가? |\n| \"Response와 Entity를 분리하세요\" | 응답 field 때문에 저장 모델이나 lazy loading이 흔들리는가? |\n| \"DTO가 너무 많습니다\" | 정말 변경 이유가 같은데 이름만 늘렸는가, 아니면 다른 책임을 분리했는가? |\n| \"`toEntity()`가 위험합니다\" | DTO가 repository 조회나 domain invariant 우회를 맡고 있지 않은가? |\n\n## 흔한 오해\n\nDTO 수를 줄이는 것이 항상 좋은 설계는 아니다. 변경 이유가 다른 객체를 하나로 합치면 나중에 이름과 검증 위치가 꼬인다.\n\n반대로 Command를 항상 만들어야 하는 것도 아니다. 한 Controller에서만 쓰이고 field 이름이 유스케이스 언어와 같으며 Service 테스트가 HTTP 세부를 몰라도 된다면 Request DTO를 직접 넘기는 선택도 가능하다.\n\n`Command`는 Domain 객체가 아니다. Command는 유스케이스를 시작하기 위한 입력 묶음이고, Domain은 규칙과 행동을 가진다. Command에 도메인 계산이 늘어나면 이름만 바뀐 DTO가 된다.\n\n`Response`와 `Query View`도 항상 분리해야 하는 것은 아니다. 작은 목록 API 하나에서 조회 결과 모양과 외부 응답 계약이 정말 같다면 같은 타입으로 시작할 수 있다. 하지만 admin 목록 row, dashboard projection, 외부 공개 API가 갈라지기 시작하면 `ReservationAdminRowView`와 `ReservationAdminResponse`처럼 이름을 나누는 편이 바뀌는 이유를 보존한다.\n\n## 미션 예시\n\n예약 생성에서 request field가 `reservation_date`, `theme_id`, `time_id`라면 Controller는 `CreateReservationRequest`를 받는다. Service에는 `CreateReservationCommand(memberId, date, themeId, timeId)`로 넘길 수 있다. Service는 Command를 보고 `Reservation` Domain을 만들고, Controller는 결과를 `ReservationResponse`로 반환한다. 여기서 request field가 snake_case인지 camelCase인지는 Service가 몰라도 된다.\n\n장바구니 미션에서 `AddCartItemRequest(productId, quantity)`가 HTTP session의 member id와 합쳐져 `AddCartItemCommand(memberId, productId, quantity)`가 된다. 같은 상품이면 수량을 합칠지, 품절이면 실패할지는 Command가 아니라 Service와 Domain 규칙이다.\n\n로또 콘솔 미션에서는 HTTP가 없으므로 Request DTO/Response DTO가 필요 없다. 입력 파싱 결과를 `PurchaseCommand`처럼 둘지, 바로 `Money`로 바꿀지는 복잡도에 따라 결정한다.\n\n## 빠른 결정 규칙\n\n- 웹 annotation이 붙어 있으면 Request DTO 쪽이다.\n- 유스케이스 이름으로 읽히고 HTTP를 몰라도 되면 Command 쪽이다.\n- 클라이언트에게 약속한 JSON field를 담으면 Response DTO 쪽이다.\n- 조회 성능이나 화면 row에 맞춘 모양이면 Query View 쪽이다.\n- 규칙을 지키고 행동해야 하면 Domain 쪽이다.\n\n## Safe Next Docs\n\n이름 선택을 더 점검하려면 `software-engineering/command-dto-vs-query-view-naming-checklist`로 간다. DTO와 Domain/Entity 경계가 헷갈리면 `software-engineering/dto-domain-entity-boundary-primer`를 먼저 본다.\n",
   "aliases": [
-    "request command response dto naming chooser",
-    "dto naming command query response",
-    "Request Command Response DTO 이름 선택",
+    "dto naming chooser",
+    "request command response naming",
+    "command dto response split",
+    "controller dto service boundary",
     "요청 명령 응답 DTO 구분",
-    "@PostMapping",
-    "@RequestBody"
+    "DTO 이름 선택 기준",
+    "Request DTO Command 차이",
+    "응답 DTO Entity 분리",
+    "Command 객체 책임"
   ],
   "expected_queries": [
-    "Request DTO와 Command와 Response DTO 이름은 어떻게 나눠?",
-    "Controller DTO를 Service까지 넘겨도 돼?",
-    "Command 객체를 만들면 DTO가 너무 많아지는 거 아니야?"
+    "Request DTO와 Command는 언제 나눠야 해?",
+    "Controller DTO를 Service에 그대로 넘겨도 괜찮아?",
+    "Response DTO 이름을 Entity랑 똑같이 둬도 돼?",
+    "Command를 만들면 DTO가 너무 많아지는 것 같아",
+    "웹 요청 필드명과 유스케이스 입력 이름을 어떻게 분리해?"
   ],
   "symptoms": [
     "Request DTO가 Service와 Domain까지 흘러가요",
@@ -40,8 +45,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/request-command-response-dto-naming-chooser.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }

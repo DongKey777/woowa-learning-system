@@ -6,17 +6,20 @@
   "summary": "관리자 API 실패는 먼저 실제 HTTP status를 보고, 그 다음 인증 복원과 권한 판정을 나눠야 한다.",
   "body_markdown": "# Roomescape Auth Status Code Triage Drill\n\n> 한 줄 요약: 관리자 API 실패는 먼저 실제 HTTP status를 보고, 그 다음 인증 복원과 권한 판정을 나눠야 한다.\n\n**난이도: Beginner**\n\n## 풀이 기준\n\n룸이스케이프 관리자(Admin) 인증 문제는 \"브라우저에 무엇이 보였나\"보다 \"Network 탭의 실제 HTTP status가 무엇인가\"를 먼저 본다. 로그인 HTML이 응답 본문으로 들어왔으면 API가 JSON을 준 것이 아니라 login redirect를 따라간 결과일 수 있다. 콘솔의 CORS 문구도 최종 원인이 아닐 수 있으므로, 요청 method, status, redirect location, response header, request `Cookie` header를 같이 본다.\n\n인증 실패(authentication failure)는 principal이 없는 상태다. Form login 화면 흐름에서는 `302` login redirect가 나올 수 있고, REST API 계약에서는 `401 Unauthorized`로 표현하는 편이 흔하다. 이미 principal이 복원됐지만 role이나 authority가 부족하면 인가 실패(authorization failure)이고 보통 `403 Forbidden`이다. 이 둘을 섞으면 SecurityFilterChain matcher, SecurityContext 저장, 권한 매핑을 한꺼번에 바꾸게 된다.\n\n리소스 소유권(resource ownership)은 role check와 별개다. `MEMBER` role은 있어도 남의 예약을 취소할 수는 없다. 이때 정책상 `403`으로 \"권한 없음\"을 드러낼 수도 있고, 리소스 존재 자체를 숨기기 위해 은닉형 `404`를 선택할 수도 있다. 중요한 것은 endpoint마다 섞지 않고, 같은 실패 의미에 같은 status와 response body shape를 유지하는 것이다.\n\n## 기대 답변 축\n\n- Network 탭에서 최종 화면이 아니라 최초 응답의 status, redirect, header, request `Cookie`를 확인한다.\n- login page redirect 흐름(`302`)과 API JSON 오류 계약(`401`)을 분리한다.\n- principal 없음은 authentication 문제이고, principal은 있으나 role/authority가 부족하면 authorization 문제라고 말한다.\n- role authorization과 resource ownership authorization을 분리한다.\n- 남의 예약, 없는 예약, 숨김 정책을 `403`과 은닉형 `404` 중 팀 계약으로 고정한다.\n- MockMvc/API 테스트는 status만이 아니라 redirect 여부, JSON body shape, side effect 부재까지 확인한다.\n\n## 문제 1\n\n상황:\n\n```text\n관리자 API 호출 결과가 로그인 페이지 HTML로 바뀌어 돌아온다.\n```\n\n답:\n\n인증되지 않은 요청으로 처리되어 인증 진입점(authentication entry point)이 동작했을 가능성이 크다. Network 탭에서 첫 응답 status가 `302`인지, `Location`이 login인지, 브라우저가 redirect를 따라가 최종 HTML을 받은 것인지 구분한다. API 응답이어야 한다면 entry point를 JSON `401`로 맞추는 정책도 검토한다.\n\n약점 태그: `login-redirect-vs-api-json`, `authentication-entrypoint`, `network-first-status`\n\n## 문제 2\n\n상황:\n\n```text\n로그인 직후 쿠키는 있는데 다음 admin 요청에서 SecurityContext가 비어 있다.\n```\n\n답:\n\nrole check보다 세션 복원(session restore) 문제를 먼저 본다. Application 탭이 아니라 admin 요청의 `Cookie` header에 세션 쿠키가 실리는지 확인한다. 그 다음 SecurityContextRepository, SessionCreationPolicy, session store, custom filter에서 SecurityContext를 덮어쓰는지 본다.\n\n약점 태그: `securitycontext-restore`, `cookie-header`, `session-policy`\n\n## 문제 3\n\n상황:\n\n```text\nprincipal은 복원됐지만 admin endpoint에서 403이 나온다.\n```\n\n답:\n\n인증은 됐고 인가가 실패한 장면이다. 사용자의 authority/role 이름, `ROLE_` prefix 처리, SecurityFilterChain의 matcher 순서, method security가 기대와 맞는지 본다. 이때 SavedRequest나 cookie 설정을 계속 바꾸는 것은 우선순위가 낮다.\n\n약점 태그: `403-after-authentication`, `role-prefix`, `matcher-order`\n\n## 문제 4\n\n상황:\n\n```text\n회원 B가 회원 A의 예약 id로 DELETE /reservations/{id}를 호출한다.\n로그인은 되어 있고 MEMBER role도 있다.\n```\n\n답:\n\nrole은 통과했지만 resource ownership 확인이 필요한 장면이다. `hasRole(\"MEMBER\")`만으로 허용하면 IDOR/BOLA 위험이 생긴다. 서비스 입력에 현재 `memberId`를 포함하고, `reservationId + memberId`로 조회하거나 조회 직후 owner를 비교한다. 외부 응답은 정책에 따라 `403` 또는 은닉형 `404`로 고정하고, 내부 로그에는 actor, target id, decision을 남긴다. 소유자는 맞지만 이미 취소된 예약이면 권한 문제가 아니라 상태 충돌이므로 `409` 후보로 분리한다.\n\n약점 태그: `role-vs-ownership`, `idor`, `403-vs-404-concealment`\n\n## 빠른 체크\n\n| 실제 신호 | 먼저 볼 곳 |\n|---|---|\n| `302` login redirect | authentication entry point |\n| `401` JSON response | unauthenticated API response contract |\n| `403` | authenticated but forbidden |\n| 은닉형 `404` | 리소스 존재 노출을 숨기는 ownership 정책 |\n| browser console CORS 문구 | Network status와 response header부터 확인 |\n\n## 테스트 축\n\n| 테스트 장면 | 기대 확인 |\n|---|---|\n| API 요청에 인증 쿠키/토큰이 없음 | browser flow면 `302` login redirect, API 계약이면 JSON `401` |\n| 인증 없이 admin API를 호출하고 `Accept: application/json`을 보냄 | HTML login page가 아니라 공통 error body가 내려오는지 |\n| MEMBER가 ADMIN endpoint 호출 | principal은 있으므로 `403`, role/authority 매핑 확인 |\n| 회원 B가 회원 A 예약 취소 | 정책에 따라 `403` 또는 은닉형 `404`, 예약 row와 결제/이벤트 side effect 없음 |\n| 존재하지 않는 예약 id | `404`, 남의 예약 은닉 정책과 body shape 일관성 |\n| 내 예약이지만 이미 취소됨 | ownership 통과 후 business state conflict로 `409` 후보 |\n\nMockMvc 테스트는 `andExpect(redirectedUrlPattern(...))`처럼 redirect를 검증할지, `status().isUnauthorized()`와 JSON body를 검증할지 API 계약에 맞춰 분리한다. 보안 테스트는 성공/실패 status만 보지 말고 실패 후 DB 상태가 바뀌지 않았는지도 확인한다.\n\n## 흔한 오답\n\n| 오답 | 왜 약한가 |\n|---|---|\n| \"로그인 페이지가 보였으니 CORS 문제다.\" | 실제 최초 응답이 `302`, `401`, `403`인지 보지 않았다. |\n| \"쿠키가 브라우저에 있으니 인증은 된 것이다.\" | 요청 `Cookie` header에 실렸는지, 서버가 SecurityContext를 복원했는지가 별도다. |\n| \"로그인했는데 막히면 전부 403이다.\" | 남의 리소스는 정책상 은닉형 `404`도 가능하고, 없는 리소스 `404`와 일관성을 봐야 한다. |\n| \"`MEMBER` role이면 회원 예약은 모두 접근 가능하다.\" | role authorization과 object ownership authorization을 섞은 답이다. |\n| \"테스트는 status만 보면 된다.\" | redirect 여부, error body shape, side effect 부재를 놓치면 API 계약과 보안 회귀를 못 잡는다. |\n\n## 검증 질문\n\n| 질문 | 확인하려는 경계 |\n|---|---|\n| Network 탭에서 최종 HTML이 아니라 최초 응답 status와 `Location`을 봤는가? | login redirect vs API JSON |\n| 이 endpoint는 브라우저 page flow인가, JSON API flow인가? | `302` vs `401` 계약 |\n| principal이 없는가, principal은 있는데 authority가 부족한가? | authentication vs authorization |\n| role check 이후 target resource owner도 확인하는가? | role vs resource ownership |\n| 남의 예약과 없는 예약을 외부에서 구분시키는가, 숨기는가? | `403` vs 은닉형 `404` |\n| 실패 요청 후 예약 상태, 결제 취소, 이벤트 발행이 그대로인가? | authorization 실패의 side effect 차단 |\n\n## 복습 포인트\n\n정답 문장은 \"principal이 없어서 `401`/`302`인가, principal은 있지만 권한이 없어 `403`인가\"를 반드시 포함해야 한다. CORS는 브라우저가 응답을 읽지 못하게 하는 표면 증상일 수 있지만, 서버가 이미 `401`이나 `403`을 냈는지와 별개로 확인한다.\n",
   "aliases": [
-    "roomescape auth status code drill",
+    "roomescape auth status drill",
     "룸이스케이프 인증 인가 상태코드 드릴",
     "admin 302 401 403 triage",
     "SecurityContext 403 drill",
-    "로그인됐는데 admin forbidden 문제"
+    "관리자 API 401 403 구분",
+    "로그인 리다이렉트 API 오류",
+    "세션 복원 권한 실패",
+    "resource ownership status policy"
   ],
   "expected_queries": [
-    "roomescape admin API가 302 401 403 중 뭔지 문제로 구분하고 싶어",
-    "로그인됐는데 관리자 API가 forbidden이면 어디부터 봐야 해?",
-    "SecurityContext와 session 복원 문제를 짧은 드릴로 풀어줘",
-    "CORS처럼 보이는 auth 실패를 roomescape에서 어떻게 분기해?"
+    "roomescape 관리자 API가 302 401 403 중 어디에 걸렸는지 구분해줘",
+    "로그인은 됐는데 admin 요청이 403이면 무엇부터 확인해야 해?",
+    "SecurityContext가 다음 요청에서 비는 문제를 세션 복원 관점으로 풀어줘",
+    "남의 예약 취소 요청은 403과 404 중 어떤 기준으로 나눠야 해?"
   ],
   "symptoms": [
     "roomescape 관리자 API가 302, 401, 403 중 무엇으로 실패하는지 구분하지 못한다",
@@ -44,8 +47,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/roomescape-auth-status-code-triage-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }

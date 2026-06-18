@@ -4,26 +4,27 @@
   "category": "security",
   "level": "advanced",
   "summary": "이 문서는 security 카테고리에서 WebAuthn / Passkeys / Phishing-Resistant Login를 다루는 deep_dive 문서다. passkey는 \"비밀번호를 대신하는 로그인 수단\"이 아니라, origin에 묶인 공개키 인증으로 피싱과 재사용 공격을 구조적으로 줄이는 방법이다. 검색 질의가 WebAuthn, passkey, phishing-resistant login, public key credential처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
-  "body_markdown": "# WebAuthn / Passkeys / Phishing-Resistant Login\n\n> 한 줄 요약: passkey는 \"비밀번호를 대신하는 로그인 수단\"이 아니라, origin에 묶인 공개키 인증으로 피싱과 재사용 공격을 구조적으로 줄이는 방법이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [인증과 인가의 차이](./authentication-vs-authorization.md)\n> - [XSS / CSRF / Spring Security](./xss-csrf-spring-security.md)\n> - [Password Storage: bcrypt / scrypt / Argon2](./password-storage-bcrypt-scrypt-argon2.md)\n> - [OAuth2 Authorization Code Grant](./oauth2-authorization-code-grant.md)\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n\nretrieval-anchor-keywords: WebAuthn, passkey, phishing-resistant login, public key credential, authenticator, origin binding, RP ID, attestation, assertion, user verification, discoverable credential\n\n---\n\n## 핵심 개념\n\nWebAuthn은 브라우저와 인증기(authenticator)가 협력해서 공개키 기반 인증을 수행하는 표준이다.  \npasskey는 WebAuthn을 사용자가 쉽게 쓰도록 만든 경험 중심 이름에 가깝다.\n\n핵심은 비밀번호와 다르게 다음 성질을 갖는다는 점이다.\n\n- 서버가 비밀을 저장하지 않는다\n- 브라우저 origin에 묶인다\n- 피싱 사이트로는 같은 credential을 재사용할 수 없다\n- 생체인식이나 디바이스 잠금과 결합할 수 있다\n\n즉 passkey는 \"기억해야 할 비밀\"을 없애는 게 아니라, \"서명 가능한 신원\"으로 바꾸는 방식이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. WebAuthn은 무엇을 보장하나\n\nWebAuthn 흐름은 크게 registration과 authentication으로 나뉜다.\n\n- registration: 새 공개키를 서버에 등록한다\n- authentication: challenge에 대해 개인키로 서명한 assertion을 보낸다\n\n중요한 보장은 다음과 같다.\n\n- 개인키는 기기 밖으로 나오지 않는다\n- 서명은 특정 `origin`과 `RP ID`에 묶인다\n- 공격자가 비슷한 UI를 보여줘도 다른 origin이면 재사용이 어렵다\n\n### 2. passkey가 피싱에 강한 이유\n\n피싱 사이트의 핵심은 사용자를 속여 자격 증명을 입력하게 만드는 것이다.  \npasskey는 credential이 웹사이트 origin에 묶이므로, 가짜 사이트가 같은 credential을 받아쓰지 못한다.\n\n이건 비밀번호와 본질적으로 다르다.\n\n- 비밀번호는 입력하면 끝이다\n- passkey는 서명 대상이 origin과 challenge에 묶인다\n\n그래서 \"문자열 탈취\"보다 \"정당한 origin에서만 서명 가능\"이 핵심 방어가 된다.\n\n### 3. attestation과 assertion은 다르다\n\n- `attestation`: 어떤 종류의 인증기가 등록되었는지에 대한 증명\n- `assertion`: 실제 로그인 시 챌린지에 대한 응답\n\n실무에서는 attestation을 너무 강하게 믿지 않는다.\n\n- 기기 모델 식별이 민감할 수 있다\n- 정책상 attestation을 최소화할 수 있다\n- 로그인 성공의 본질은 assertion 검증이다\n\n### 4. discoverable credential과 usernameless login\n\npasskey는 사용자를 username 입력 없이 로그인시키는 흐름도 지원한다.\n\n- 브라우저나 플랫폼이 저장된 credential을 찾는다\n- 사용자는 기기 잠금이나 생체인식만 통과하면 된다\n\n하지만 이 편의성은 다음과 함께 봐야 한다.\n\n- 계정 복구 경로\n- 다중 디바이스 동기화\n- 분실 기기 처리\n- fallback login 정책\n\n### 5. fallback이 없으면 운영이 어려워진다\n\npasskey가 좋아도 현실에서는 늘 예외가 있다.\n\n- 플랫폼이 WebAuthn을 완전히 지원하지 않는다\n- 사용자가 새 기기로 옮겼다\n- 기업 환경에서 생체인식이 제한된다\n\n그래서 보통 다음과 같이 설계한다.\n\n- passkey를 primary로 둔다\n- 복구 코드를 별도로 둔다\n- 기존 비밀번호 또는 OTP를 제한적 fallback으로 둔다\n- 계정 복구는 더 엄격하게 검증한다\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 피싱 사이트가 사용자의 passkey를 훔치려 함\n\n문제:\n\n- 공격자가 로그인 페이지를 복제한다\n- 사용자는 비슷한 화면에서 로그인한다고 착각한다\n\n대응:\n\n- credential은 origin-bound이므로 다른 origin에서 재사용되지 않는다\n- 사용자가 실제 origin을 확인하도록 UX를 설계한다\n- 이메일 링크 로그인보다 passkey를 우선한다\n\n### 시나리오 2: 기기 분실 후 계정이 잠길까 걱정됨\n\n문제:\n\n- passkey만 쓰면 새 기기 로그인 경로가 막힐 수 있다\n\n대응:\n\n- 계정 복구 경로를 따로 둔다\n- 복구 시에는 stronger verification을 요구한다\n- 등록된 passkey 목록과 revoke 기능을 제공한다\n\n### 시나리오 3: 여러 기기 간 동기화가 불안함\n\n문제:\n\n- platform passkey sync 정책이 사용자 기대와 다르다\n\n대응:\n\n- 동기화 가능 credential과 device-bound credential의 차이를 설명한다\n- 지원 기기 기준을 문서화한다\n- passkey 외 fallback을 정리한다\n\n---\n\n## 코드로 보기\n\n### 1. registration challenge 발급 개념\n\n```java\npublic PublicKeyCredentialCreationOptions beginRegistration(User user) {\n    String challenge = challengeService.issue(user.id());\n\n    return PublicKeyCredentialCreationOptions.builder()\n        .rp(RelyingPartyEntity.builder()\n            .id(\"example.com\")\n            .name(\"Example\")\n            .build())\n        .user(UserEntity.builder()\n            .id(user.id().toString().getBytes(StandardCharsets.UTF_8))\n            .name(user.email())\n            .displayName(user.displayName())\n            .build())\n        .challenge(challenge.getBytes(StandardCharsets.UTF_8))\n        .build();\n}\n```\n\n### 2. assertion 검증 개념\n\n```java\npublic void verifyAssertion(String credentialId, byte[] clientDataJSON, byte[] authenticatorData, byte[] signature) {\n    Challenge challenge = challengeService.consume();\n    PublicKey publicKey = credentialRepository.findPublicKeyByCredentialId(credentialId);\n\n    webauthnVerifier.verify(\n        publicKey,\n        challenge.value(),\n        clientDataJSON,\n        authenticatorData,\n        signature,\n        \"example.com\"\n    );\n}\n```\n\n### 3. 계정 복구 정책\n\n```text\n1. passkey를 기본 인증 수단으로 둔다\n2. fallback은 제한적으로만 제공한다\n3. recovery path는 더 높은 검증 강도를 요구한다\n4. 등록/삭제/새 디바이스 추가는 별도 감사 로그를 남긴다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| passkey only | 피싱에 강하고 UX가 좋다 | 복구와 호환성 설계가 어렵다 | 소비자 대상, modern browser 중심 |\n| passkey + fallback | 운영이 현실적이다 | fallback이 약점이 될 수 있다 | 대부분의 서비스 |\n| password only | 구현이 쉽다 | 피싱과 재사용에 취약하다 | 점진적 전환 전 |\n| passkey + device binding | 더 강하다 | 기기 이동성이 떨어진다 | 높은 보안 요구 |\n\n판단 기준은 이렇다.\n\n- 피싱이 주된 위협인가\n- 계정 복구 UX를 얼마나 허용할 수 있는가\n- 플랫폼 호환성을 얼마나 넓게 가져가야 하는가\n- fallback 경로가 다시 취약점이 되지 않는가\n\n---\n\n## 꼬리질문\n\n> Q: passkey가 비밀번호보다 안전한 이유는 무엇인가요?\n> 의도: origin-bound 공개키 인증의 핵심을 이해하는지 확인\n> 핵심: 비밀을 입력하지 않고, 같은 credential을 피싱 origin에서 재사용할 수 없기 때문이다.\n\n> Q: attestation과 assertion의 차이는 무엇인가요?\n> 의도: 등록 단계와 로그인 단계의 역할을 구분하는지 확인\n> 핵심: attestation은 등록 장치의 증명, assertion은 로그인 시 챌린지 응답이다.\n\n> Q: passkey만 쓰면 계정 복구는 끝나나요?\n> 의도: 운영 현실을 이해하는지 확인\n> 핵심: 아니다. 분실 기기와 fallback을 고려한 복구 경로가 필요하다.\n\n> Q: 사용자에게 origin 확인이 왜 중요한가요?\n> 의도: 피싱 방어가 UX와 연결되는지 확인\n> 핵심: passkey는 origin-bound이므로 진짜 사이트에서만 써야 한다.\n\n## 한 줄 정리\n\nWebAuthn/passkey는 비밀번호를 더 복잡하게 만드는 기술이 아니라, 피싱에 강한 origin-bound 로그인 체계로 바꾸는 기술이다.\n",
+  "body_markdown": "# WebAuthn / Passkeys / Phishing-Resistant Login\n\n> 한 줄 요약: passkey는 \"비밀번호를 대신하는 로그인 수단\"이 아니라, origin에 묶인 공개키 인증으로 피싱과 재사용 공격을 구조적으로 줄이는 방법이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [인증과 인가의 차이](./authentication-vs-authorization.md)\n> - [XSS / CSRF / Spring Security](./xss-csrf-spring-security.md)\n> - [Password Storage: bcrypt / scrypt / Argon2](./password-storage-bcrypt-scrypt-argon2.md)\n> - [OAuth2 Authorization Code Grant](./oauth2-authorization-code-grant.md)\n> - [JWT 깊이 파기](./jwt-deep-dive.md)\n\nretrieval-anchor-keywords: WebAuthn, passkey, phishing-resistant login, public key credential, authenticator, origin binding, RP ID, attestation, assertion, user verification, discoverable credential\n\n---\n\n## 핵심 개념\n\nWebAuthn은 브라우저와 인증기(authenticator)가 협력해서 공개키 기반 인증을 수행하는 표준이다.  \npasskey는 WebAuthn을 사용자가 쉽게 쓰도록 만든 경험 중심 이름에 가깝다.\n\n핵심은 비밀번호와 다르게 다음 성질을 갖는다는 점이다.\n\n- 서버가 비밀을 저장하지 않는다\n- 브라우저 origin에 묶인다\n- 피싱 사이트로는 같은 credential을 재사용할 수 없다\n- 생체인식이나 디바이스 잠금과 결합할 수 있다\n\n즉 passkey는 \"기억해야 할 비밀\"을 없애는 게 아니라, \"서명 가능한 신원\"으로 바꾸는 방식이다.\n\n---\n\n## 깊이 들어가기\n\n### 1. WebAuthn은 무엇을 보장하나\n\nWebAuthn 흐름은 크게 registration과 authentication으로 나뉜다.\n\n- registration: 새 공개키를 서버에 등록한다\n- authentication: challenge에 대해 개인키로 서명한 assertion을 보낸다\n\n중요한 보장은 다음과 같다.\n\n- 개인키는 기기 밖으로 나오지 않는다\n- 서명은 특정 `origin`과 `RP ID`에 묶인다\n- 공격자가 비슷한 UI를 보여줘도 다른 origin이면 재사용이 어렵다\n\n### 2. passkey가 피싱에 강한 이유\n\n피싱 사이트의 핵심은 사용자를 속여 자격 증명을 입력하게 만드는 것이다.  \npasskey는 credential이 웹사이트 origin에 묶이므로, 가짜 사이트가 같은 credential을 받아쓰지 못한다.\n\n이건 비밀번호와 본질적으로 다르다.\n\n- 비밀번호는 입력하면 끝이다\n- passkey는 서명 대상이 origin과 challenge에 묶인다\n\n그래서 \"문자열 탈취\"보다 \"정당한 origin에서만 서명 가능\"이 핵심 방어가 된다.\n\n### 3. attestation과 assertion은 다르다\n\n- `attestation`: 어떤 종류의 인증기가 등록되었는지에 대한 증명\n- `assertion`: 실제 로그인 시 챌린지에 대한 응답\n\n실무에서는 attestation을 너무 강하게 믿지 않는다.\n\n- 기기 모델 식별이 민감할 수 있다\n- 정책상 attestation을 최소화할 수 있다\n- 로그인 성공의 본질은 assertion 검증이다\n\n### 4. discoverable credential과 usernameless login\n\npasskey는 사용자를 username 입력 없이 로그인시키는 흐름도 지원한다.\n\n- 브라우저나 플랫폼이 저장된 credential을 찾는다\n- 사용자는 기기 잠금이나 생체인식만 통과하면 된다\n\n하지만 이 편의성은 다음과 함께 봐야 한다.\n\n- 계정 복구 경로\n- 다중 디바이스 동기화\n- 분실 기기 처리\n- fallback login 정책\n\n### 5. fallback이 없으면 운영이 어려워진다\n\npasskey가 좋아도 현실에서는 늘 예외가 있다.\n\n- 플랫폼이 WebAuthn을 완전히 지원하지 않는다\n- 사용자가 새 기기로 옮겼다\n- 기업 환경에서 생체인식이 제한된다\n\n그래서 보통 다음과 같이 설계한다.\n\n- passkey를 primary로 둔다\n- 복구 코드를 별도로 둔다\n- 기존 비밀번호 또는 OTP를 제한적 fallback으로 둔다\n- 계정 복구는 더 엄격하게 검증한다\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 피싱 사이트가 사용자의 passkey를 훔치려 함\n\n문제:\n\n- 공격자가 로그인 페이지를 복제한다\n- 사용자는 비슷한 화면에서 로그인한다고 착각한다\n\n대응:\n\n- credential은 origin-bound이므로 다른 origin에서 재사용되지 않는다\n- 사용자가 실제 origin을 확인하도록 UX를 설계한다\n- 이메일 링크 로그인보다 passkey를 우선한다\n\n### 시나리오 2: 기기 분실 후 계정이 잠길까 걱정됨\n\n문제:\n\n- passkey만 쓰면 새 기기 로그인 경로가 막힐 수 있다\n\n대응:\n\n- 계정 복구 경로를 따로 둔다\n- 복구 시에는 stronger verification을 요구한다\n- 등록된 passkey 목록과 revoke 기능을 제공한다\n\n### 시나리오 3: 여러 기기 간 동기화가 불안함\n\n문제:\n\n- platform passkey sync 정책이 사용자 기대와 다르다\n\n대응:\n\n- 동기화 가능 credential과 device-bound credential의 차이를 설명한다\n- 지원 기기 기준을 문서화한다\n- passkey 외 fallback을 정리한다\n\n---\n\n## 코드로 보기\n\n### 1. registration challenge 발급 개념\n\n```java\npublic PublicKeyCredentialCreationOptions beginRegistration(User user) {\n    String challenge = challengeService.issue(user.id());\n\n    return PublicKeyCredentialCreationOptions.builder()\n        .rp(RelyingPartyEntity.builder()\n            .id(\"example.com\")\n            .name(\"Example\")\n            .build())\n        .user(UserEntity.builder()\n            .id(user.id().toString().getBytes(StandardCharsets.UTF_8))\n            .name(user.email())\n            .displayName(user.displayName())\n            .build())\n        .challenge(challenge.getBytes(StandardCharsets.UTF_8))\n        .build();\n}\n```\n\n### 2. assertion 검증 개념\n\n```java\npublic void verifyAssertion(String credentialId, byte[] clientDataJSON, byte[] authenticatorData, byte[] signature) {\n    Challenge challenge = challengeService.consume();\n    PublicKey publicKey = credentialRepository.findPublicKeyByCredentialId(credentialId);\n\n    webauthnVerifier.verify(\n        publicKey,\n        challenge.value(),\n        clientDataJSON,\n        authenticatorData,\n        signature,\n        \"example.com\"\n    );\n}\n```\n\n### 3. 계정 복구 정책\n\n```text\n1. passkey를 기본 인증 수단으로 둔다\n2. fallback은 제한적으로만 제공한다\n3. recovery path는 더 높은 검증 강도를 요구한다\n4. 등록/삭제/새 디바이스 추가는 별도 감사 로그를 남긴다\n```\n\n## 운영 설계에서 빠뜨리기 쉬운 검증\n\npasskey rollout은 registration API와 authentication API를 만드는 것으로 끝나지 않는다. 서버는 매 요청마다 `challenge`, `origin`, `RP ID`, credential id, user verification 결과를 같은 기준으로 검증해야 하고, challenge는 짧게 살고 한 번만 소비되어야 한다. challenge를 재사용하거나 만료 시간을 길게 두면 WebAuthn의 피싱 저항성과 별개로 replay 표면이 생긴다.\n\n운영에서 특히 조심할 지점은 fallback이다. passkey 자체는 origin-bound라 강하지만, 계정 복구가 이메일 링크와 약한 본인 확인만으로 열려 있으면 공격자는 passkey를 뚫지 않고 복구 경로로 돌아간다. 그래서 새 passkey 등록, passkey 삭제, 새 디바이스 추가, recovery flow 성공은 일반 로그인 성공보다 더 강한 감사 로그와 알림 대상이 된다.\n\n`signCount` 같은 authenticator counter도 맥락을 보고 써야 한다. 일부 동기화 passkey 환경에서는 counter 의미가 약하거나 일정하지 않을 수 있으므로, counter 이상만으로 계정을 잠그기보다 credential type, platform 정책, 최근 등록/복구 이벤트와 함께 본다. 반대로 enterprise device-bound credential처럼 강한 장치 정책이 있는 환경에서는 attestation policy와 device inventory가 더 중요해진다.\n\n정리하면 WebAuthn의 본질은 공개키 서명 검증이지만, 서비스의 보안 품질은 registration, authentication, recovery, audit가 같은 threat model 안에서 이어질 때 나온다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| passkey only | 피싱에 강하고 UX가 좋다 | 복구와 호환성 설계가 어렵다 | 소비자 대상, modern browser 중심 |\n| passkey + fallback | 운영이 현실적이다 | fallback이 약점이 될 수 있다 | 대부분의 서비스 |\n| password only | 구현이 쉽다 | 피싱과 재사용에 취약하다 | 점진적 전환 전 |\n| passkey + device binding | 더 강하다 | 기기 이동성이 떨어진다 | 높은 보안 요구 |\n\n판단 기준은 이렇다.\n\n- 피싱이 주된 위협인가\n- 계정 복구 UX를 얼마나 허용할 수 있는가\n- 플랫폼 호환성을 얼마나 넓게 가져가야 하는가\n- fallback 경로가 다시 취약점이 되지 않는가\n\n---\n\n## 꼬리질문\n\n> Q: passkey가 비밀번호보다 안전한 이유는 무엇인가요?\n> 의도: origin-bound 공개키 인증의 핵심을 이해하는지 확인\n> 핵심: 비밀을 입력하지 않고, 같은 credential을 피싱 origin에서 재사용할 수 없기 때문이다.\n\n> Q: attestation과 assertion의 차이는 무엇인가요?\n> 의도: 등록 단계와 로그인 단계의 역할을 구분하는지 확인\n> 핵심: attestation은 등록 장치의 증명, assertion은 로그인 시 챌린지 응답이다.\n\n> Q: passkey만 쓰면 계정 복구는 끝나나요?\n> 의도: 운영 현실을 이해하는지 확인\n> 핵심: 아니다. 분실 기기와 fallback을 고려한 복구 경로가 필요하다.\n\n> Q: 사용자에게 origin 확인이 왜 중요한가요?\n> 의도: 피싱 방어가 UX와 연결되는지 확인\n> 핵심: passkey는 origin-bound이므로 진짜 사이트에서만 써야 한다.\n\n## 한 줄 정리\n\nWebAuthn/passkey는 비밀번호를 더 복잡하게 만드는 기술이 아니라, 피싱에 강한 origin-bound 로그인 체계로 바꾸는 기술이다.\n",
   "aliases": [
     "WebAuthn",
     "passkey",
-    "phishing-resistant login",
+    "phishing resistant login",
     "public key credential",
     "authenticator",
     "origin binding",
     "RP ID",
-    "attestation",
-    "assertion",
     "user verification",
     "discoverable credential",
-    "WebAuthn / Passkeys / Phishing-Resistant Login"
+    "패스키 로그인",
+    "피싱 방지 로그인",
+    "공개키 인증"
   ],
   "expected_queries": [
-    "passkey는 비밀번호를 대체한다기보다 origin에 묶인 공개키 인증이라 피싱에 강한 거야?",
-    "WebAuthn에서 RP ID와 origin binding이 맞지 않으면 왜 로그인 검증이 실패해?",
+    "passkey가 피싱 사이트에서는 같은 credential을 못 쓰는 이유를 origin binding으로 설명해줘",
+    "WebAuthn에서 RP ID와 origin이 맞지 않으면 왜 로그인 검증이 실패해?",
     "public key credential을 등록하고 challenge에 서명해서 로그인하는 흐름을 설명해줘",
-    "passkey를 도입할 때 authenticator 분실, 계정 복구, attestation을 어떻게 고려해야 해?"
+    "passkey를 도입할 때 authenticator 분실, 계정 복구, fallback을 어떻게 설계해야 해?",
+    "attestation과 assertion 차이가 passkey 로그인 운영에서 왜 중요해?"
   ],
   "symptoms": [
     "`WebAuthn / Passkeys / Phishing-Resistant Login`를 정의 수준으로만 알고 실제 인증, 인가, 위협 모델, 운영 대응와 연결하지 못한다",
@@ -33,21 +34,35 @@
   ],
   "relations": {
     "prerequisites": [
-      "security/authentication-vs-authorization"
+      "security/authentication-vs-authorization",
+      "security/public-key-digital-signature-primer"
     ],
     "next_docs": [
-      "security/authority-transfer-vs-revoke-lag-primer-bridge",
-      "security/social-login-to-local-session-bridge"
+      "security/webauthn-passkey-registration-authentication-flow-primer",
+      "security/webauthn-attestation-vs-assertion-passkey-chooser",
+      "security/passkey-account-recovery-and-device-loss-risk-design"
     ],
-    "confusable_with": [],
+    "confusable_with": [
+      "security/password-storage-bcrypt-scrypt-argon2",
+      "security/mfa-step-up-auth-design"
+    ],
     "forbidden_for_queries": []
   },
   "learner_query_patterns": [],
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/webauthn-passkeys-phishing-resistant-login.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150",
+        "changes": [
+          "alias-query-contract-repair",
+          "body-floor-expansion"
+        ]
+      }
+    ]
   }
 }

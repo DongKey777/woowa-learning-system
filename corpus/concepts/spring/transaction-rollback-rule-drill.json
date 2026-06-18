@@ -6,18 +6,21 @@
   "summary": "이 drill은 Spring @Transactional rollback rule을 연습한다. checked exception commit, RuntimeException rollback, rollbackFor, catch 후 rollback-only 같은 약점 신호를 다룬다.",
   "body_markdown": "# Transaction Rollback Rule Drill\n\n## 질문\n\n`@Transactional` 메서드에서 checked exception이 밖으로 던져졌다. `rollbackFor`를 따로 지정하지 않았다면 기본적으로 commit일까 rollback일까?\n\n## 정확한 정의로 고정하기\n\nSpring 선언적 transaction의 rollback rule은 \"메서드 안에서 예외가 발생했는가\"가 아니라 transaction interceptor가 boundary 밖으로 빠져나가는 결과를 보고 판단한다. 기본 규칙은 `RuntimeException`과 `Error`가 밖으로 전파되면 rollback 대상이고, checked exception은 기본적으로 rollback 대상이 아니다. checked exception도 rollback해야 한다면 `rollbackFor` 같은 명시 규칙을 둔다.\n\n이 규칙은 proxy/advice가 적용된 boundary에서 동작한다. self-invocation으로 proxy를 지나지 않거나, 예외를 내부에서 catch하고 정상 반환하면 interceptor가 보는 사건이 달라진다. 또한 같은 physical transaction이 이미 rollback-only로 표시된 경우는 \"예외 타입 rule\" 문제가 아니라 commit 불가 상태를 commit하려는 문제다.\n\n## 기대 답변 축\n\n- Spring 기본은 checked exception commit, RuntimeException/Error rollback이라고 말한다.\n- 비즈니스 실패를 checked exception으로 표현한다면 `rollbackFor`를 검토해야 한다.\n- rollback-only 문제와 rollback rule 문제를 구분한다.\n- 예외가 proxy boundary 밖으로 전파됐는지, catch 후 정상 반환했는지, self-invocation으로 advice가 빠졌는지를 확인한다.\n\n## 면접 답변 골격\n\n1. 먼저 \"어떤 예외 타입이 transaction interceptor 밖으로 전파됐는가\"를 본다.\n2. Spring 선언적 트랜잭션의 기본 rollback rule은 `RuntimeException`과 `Error` 중심이라고 말한다.\n3. checked exception은 기본적으로 rollback 대상이 아니므로, 별도 설정이 없다면 commit될 수 있다고 답한다.\n4. 해당 checked exception이 비즈니스 실패이며 데이터 변경을 취소해야 한다면 `rollbackFor = SomeCheckedException.class` 같은 명시 규칙을 둔다.\n5. 예외를 catch하고 정상 반환하면 \"예외가 밖으로 전파되지 않았다\"는 별도 상황이므로, 기본 rollback rule만으로는 rollback을 기대하면 안 된다고 정리한다.\n6. 프로젝트가 Spring 6.2+의 전역 rollback 기본값 변경 같은 설정을 썼다면 기본 답변에 예외가 생길 수 있으므로 실제 `@EnableTransactionManagement`/transaction attribute 설정을 확인한다고 덧붙인다.\n\n## 상황별 판별\n\n| 상황 | 기본 판단 | 면접에서 붙일 설명 |\n|---|---|---|\n| `RuntimeException`이 밖으로 전파됨 | rollback | unchecked exception은 기본 rollback 대상이다. |\n| checked exception이 밖으로 전파됨 | commit 가능 | `rollbackFor`가 없으면 Spring 기본 규칙상 rollback 대상이 아니다. |\n| checked exception + `rollbackFor` | rollback | 선언 규칙이 기본 규칙을 확장한다. |\n| 내부에서 예외 catch 후 정상 반환 | commit 가능 | transaction interceptor는 정상 종료로 볼 수 있다. |\n| 내부 트랜잭션이 rollback-only 표시 | outer commit 시 예외 가능 | rollback rule보다 propagation/rollback-only 문제다. |\n| `noRollbackFor`가 더 구체적으로 match | commit 가능 | rollback rule과 no-rollback rule이 겹치면 strongest matching rule이 이긴다. |\n| `rollbackForClassName = \"Exception\"` | 과도한 rollback 가능 | pattern rule은 substring match라 의도치 않은 exception까지 걸릴 수 있다. |\n\n## 함정 질문\n\n\"catch했는데도 rollback됐어요\"라는 증상은 두 갈래로 나눠야 한다. 같은 transaction 안에서 이미 rollback-only가 표시된 뒤 catch했다면 commit 시점에 `UnexpectedRollbackException`이 날 수 있다. 반대로 rollback-only 표시 없이 checked exception을 catch하고 정상 반환했다면 기본적으로 commit될 수 있다.\n\n## Wrong-bucket cases\n\n| 증상 | 잘못 넣은 bucket | 먼저 확인할 것 |\n|---|---|---|\n| checked exception이 밖으로 나갔는데 row가 남았다 | JPA flush가 rollback을 막았다 | exception type, `rollbackFor`, transaction log의 commit/rollback decision을 본다. flush는 SQL 전송 시점이고 commit/rollback rule과 다르다. |\n| `UnexpectedRollbackException`이 보인다 | checked exception commit 문제 | 같은 physical transaction 안에서 runtime exception이나 `setRollbackOnly()`가 먼저 있었는지 본다. |\n| `@ControllerAdvice`에서 400으로 매핑했다 | HTTP status가 rollback을 결정 | transaction은 controller response status가 아니라 service boundary의 exception propagation과 rule로 판단한다. |\n| 같은 클래스 내부 메서드 호출에서 rollback이 안 됐다 | rollback rule이 틀렸다 | self-invocation으로 proxy advice를 지나지 않았는지 확인한다. |\n| 테스트에서는 DB가 항상 rollback된다 | production rollback rule이 안전하다 | Spring test의 test-managed transaction rollback과 application transaction rule을 분리해서 본다. |\n| `rollbackFor = Exception.class`를 전부 붙였다 | 안전한 일괄 해결 | commit되어야 하는 비즈니스 거절, audit 기록, retry/idempotency 정책까지 같이 깨질 수 있다. |\n\n## 운영 caveat\n\n- rollback rule은 transaction boundary 밖으로 전파된 exception을 기준으로 한다. catch-and-continue는 별도 설계다.\n- `rollbackFor`/`noRollbackFor`는 type 기반 rule을 우선 고려한다. class-name pattern은 substring match라 `CustomExceptionV2`나 nested exception까지 걸릴 수 있다.\n- `REQUIRED` 내부 scope에서 rollback-only가 표시되면 outer가 정상 반환을 시도해도 commit 시점에 실패할 수 있다.\n- `REQUIRES_NEW`는 별도 physical transaction이므로 main transaction rollback과 audit/log transaction 보존을 분리할 때 후보가 될 수 있다. 단, connection pool과 idempotency 비용을 같이 본다.\n- async/Future, Vavr `Try`, 전역 rollback 기본값 변경처럼 Spring 버전과 설정에 따른 특수 경로가 있다. 면접 답변에서는 기본 규칙을 먼저 말하고, 운영 확인에서는 실제 transaction attribute를 확인한다.\n\n## 검증 질문\n\n1. 예외가 실제로 proxy boundary 밖으로 전파됐는가, 아니면 service 내부에서 catch됐는가?\n2. runtime exception, checked exception, `Error`, wrapped exception 중 최종으로 interceptor가 본 타입은 무엇인가?\n3. `rollbackFor`, `noRollbackFor`, class-name pattern, 전역 rollback 설정이 있는가?\n4. transaction log에서 completion이 commit인지 rollback인지 확인했는가?\n5. `UnexpectedRollbackException`이 있다면 최초 rollback-only 표시 지점은 어디인가?\n6. 같은 클래스 내부 호출, private/final method, test-managed transaction 때문에 advice 적용 여부를 착각한 것은 아닌가?\n\n## 짧은 모범 답변\n\n`@Transactional`의 기본 rollback rule은 예외 발생 자체가 아니라 transaction interceptor 밖으로 전파된 예외 타입을 기준으로 판단합니다. `RuntimeException`과 `Error`는 기본 rollback 대상이고, checked exception은 `rollbackFor`를 지정하지 않으면 commit될 수 있습니다. 다만 catch 후 정상 반환, self-invocation, 이미 rollback-only가 표시된 상황은 별도 문제라서 boundary와 propagation을 같이 확인해야 합니다.\n\n## 약점 태그\n\n`checked-exception-commit`, `rollbackFor`, `rollback-only`\n\n## 복습 연결 concept\n\n`spring/checked-exception-commit-rollback-chooser`\n",
   "aliases": [
-    "transaction rollback rule drill",
-    "checked runtime exception rollback practice",
-    "트랜잭션 rollback rule drill",
-    "checked exception commit 연습",
-    "@Controller",
-    "@ControllerAdvice",
-    "@Transactional"
+    "spring rollback rule practice",
+    "checked exception commit drill",
+    "rollbackFor 연습",
+    "트랜잭션 롤백 규칙",
+    "checked 예외 커밋",
+    "롤백온리 구분",
+    "@Transactional rollbackFor",
+    "UnexpectedRollbackException drill"
   ],
   "expected_queries": [
-    "checked exception과 RuntimeException rollback 규칙 drill을 풀고 싶어",
-    "rollbackFor가 필요한 상황을 연습해줘",
-    "예외를 catch했을 때 rollback-only가 되는지 문제로 확인하고 싶어"
+    "checked exception과 RuntimeException rollback 규칙을 문제로 연습하고 싶어",
+    "rollbackFor를 언제 붙여야 하는지 예시로 확인해줘",
+    "예외를 catch했을 때 rollback-only가 되는지 drill로 점검하고 싶어",
+    "Spring @Transactional에서 checked exception이 commit되는 경우를 설명해줘",
+    "UnexpectedRollbackException과 rollback rule 차이를 헷갈리지 않게 연습해줘"
   ],
   "symptoms": [
     "checked exception인데 rollback된다고 생각해요",
@@ -40,8 +43,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/spring/transaction-rollback-rule-drill.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }

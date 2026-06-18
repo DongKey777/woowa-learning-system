@@ -6,18 +6,22 @@
   "summary": "이 문서는 Controller, Service, Repository 책임 분리를 묻는 초보자 질문에 답하는 primer다. 뚱뚱한 Controller, Service 책임, Repository 경계, 레이어 분리 리뷰 같은 표현을 이 문서로 연결한다.",
   "body_markdown": "# Controller Service Repository Boundary Primer\n\n## 한 줄 요약\n\nController는 HTTP 모양, Service는 유스케이스 결정, Repository는 저장소 접근 계약을 맡는다. 경계는 클래스 이름보다 \"무엇을 알고 있어도 되는가\"로 나누는 편이 안정적이다.\n\n## 10초 chooser\n\n| 코드가 하는 일 | 둘 위치 | 알아도 되는 것 | 모르면 좋은 것 |\n|---|---|---|---|\n| path variable, request body, status code, redirect 처리 | Controller | HTTP, 인증 principal, Request/Response DTO | SQL, EntityManager, domain 내부 계산 |\n| \"예약 생성\", \"주문 확정\", \"로또 구매\" 흐름 결정 | Service | Command, Domain, Repository contract, transaction | JSON field, status code, table/index |\n| 저장, 조회, 존재 여부 확인 | Repository | 저장소 API, mapping, query | HTTP, 화면 응답, 할인/예약 정책 owner |\n| 한 객체가 항상 지켜야 하는 규칙 | Domain / Entity / Value Object | 자기 값, 불변식, 행동 | Controller, Repository 구현 세부 |\n\n## 경계 판단 기준\n\nController는 HTTP를 모르는 코드로 요청을 넘기기 전 번역한다. `@RequestBody`, `@PathVariable`, `ResponseEntity`, status code는 Controller에 남기는 것이 자연스럽다.\n\nService는 한 유스케이스를 완료하기 위해 필요한 순서를 조율한다. Repository를 몇 번 호출할지, 어떤 Domain 객체를 만들지, 실패하면 어디까지 롤백할지 결정한다. 단순한 CRUD에서도 트랜잭션 경계가 생기면 Service 책임이 생긴다.\n\nRepository는 저장소와 대화하는 방법을 숨긴다. Service가 SQL, table, join, ORM lazy loading 세부를 알아야 한다면 Repository contract가 새고 있는 것이다.\n\nDomain은 유스케이스마다 바뀌지 않는 규칙을 갖는다. Service가 `if (reservationTime.isBeforeNow())` 같은 객체 내부 규칙을 반복하면 Domain이 자기 책임을 잃고 있을 수 있다.\n\n## 변경 이유로 다시 나누기\n\n레이어 이름보다 \"어떤 요구사항이 바뀔 때 이 코드가 바뀌나\"를 보면 더 정확하다.\n\n| 변경 | 같이 바뀌면 자연스러운 곳 | 같이 바뀌면 의심할 곳 |\n|---|---|---|\n| HTTP status code, URL, JSON field | Controller | Service, Repository |\n| 예약 생성 순서, 중복 확인 정책, 트랜잭션 범위 | Service | Controller, Repository 구현 |\n| 테이블명, fetch join, index, ORM mapping | Repository | Service, Domain |\n| 날짜 범위, 수량 제한, 상태 전이 불변식 | Domain | Controller, Repository |\n\n예를 들어 예약 생성 실패를 400으로 보낼지 409로 보낼지는 Controller/exception handler 문제다. 하지만 \"이미 예약된 시간은 생성할 수 없다\"는 유스케이스/도메인 문제다. 이 둘이 같은 메서드 안에서 섞이면 리뷰에서 \"Controller가 뚱뚱하다\"거나 \"Service가 HTTP를 안다\"는 말이 나온다.\n\n## 요청 흐름 예시\n\n```text\nHTTP request\n  -> Controller: request body/path/principal을 읽고 command로 번역\n  -> Service: 중복 확인, domain 생성, transaction 조율\n  -> Domain: 날짜/시간/수량 같은 불변식 보장\n  -> Repository: 필요한 저장/조회 contract 수행\n  -> Controller: 결과를 response DTO와 HTTP status로 변환\n```\n\n이 흐름에서 각 레이어는 바로 옆 경계의 언어만 알면 된다. Controller는 저장소 구현을 모르고, Repository는 응답 status를 모른다. Service는 둘 사이에서 \"예약 생성\"이라는 application 문장을 유지한다.\n\n## before / after로 보기\n\n### before: Controller가 use case와 persistence까지 안다\n\n```java\n@PostMapping(\"/reservations\")\nResponseEntity<ReservationResponse> create(@RequestBody CreateReservationRequest request) {\n    if (reservationRepository.existsByDateAndTimeId(request.date(), request.timeId())) {\n        throw new DuplicateReservationException();\n    }\n    Reservation reservation = new Reservation(request.date(), request.timeId(), request.themeId());\n    Reservation saved = reservationRepository.save(reservation);\n    return ResponseEntity.status(HttpStatus.CREATED).body(ReservationResponse.from(saved));\n}\n```\n\nController가 HTTP 처리, 중복 정책, domain 생성, repository 호출을 모두 안다. 테스트도 Controller test 하나에 비즈니스 규칙과 저장소 조건이 묶이기 쉽다.\n\n### after: Service가 유스케이스를 조율한다\n\n```java\n@PostMapping(\"/reservations\")\nResponseEntity<ReservationResponse> create(@RequestBody CreateReservationRequest request) {\n    ReservationResult result = reservationService.create(request.toCommand());\n    return ResponseEntity.status(HttpStatus.CREATED).body(ReservationResponse.from(result));\n}\n\nclass ReservationService {\n    @Transactional\n    ReservationResult create(CreateReservationCommand command) {\n        if (reservationRepository.existsByDateAndTimeId(command.date(), command.timeId())) {\n            throw new DuplicateReservationException();\n        }\n        Reservation reservation = Reservation.create(command.date(), command.timeId(), command.themeId());\n        return ReservationResult.from(reservationRepository.save(reservation));\n    }\n}\n```\n\n이제 Controller는 HTTP contract에 집중하고, Service는 유스케이스 순서와 transaction을 잡는다. Repository는 저장소 질문을 contract로 제공한다.\n\n## Service가 얇아도 되는가\n\nService가 무조건 두꺼워야 하는 것은 아니다. `repository.save(entity)` 한 줄뿐이고 트랜잭션, 정책, 외부 조합이 없다면 별도 Service가 아직 큰 가치를 주지 못할 수 있다.\n\n하지만 다음 중 하나라도 생기면 Service 경계가 의미를 갖는다.\n\n- 하나의 요청에서 Repository를 2개 이상 조합한다.\n- 중복 확인, 권한 확인, 상태 전이 같은 use case rule이 있다.\n- 실패 시 rollback 범위를 정해야 한다.\n- Controller가 아닌 다른 입구에서 같은 유스케이스를 호출할 가능성이 있다.\n- Controller test가 비즈니스 규칙 검증을 독점하기 시작한다.\n\n즉 \"Service가 얇다\"는 말만으로 나쁘다고 판단하지 않는다. 얇은데도 유스케이스 경계를 고정해 주는지, 아니면 이름만 있는 pass-through인지 봐야 한다.\n\n## 코드 리뷰 냄새\n\n리뷰에서 \"Controller가 너무 많은 일을 한다\", \"Repository에 정책이 들어갔다\"는 말을 들으면 레이어 경계가 흐려졌다는 신호다.\n\n- Controller가 Request DTO를 Domain으로 바꾸고 Repository까지 직접 호출한다.\n- Service 메서드가 `repository.save(entity)` 한 줄뿐인데 트랜잭션, 예외, 정책 책임도 없다.\n- Repository 메서드 안에서 \"VIP 회원이면 할인\" 같은 도메인 결정을 한다.\n- Service가 `reservation_time` 테이블 컬럼명이나 join 구조를 알고 있다.\n- Controller test가 비즈니스 규칙의 유일한 테스트가 된다.\n- Repository가 `ReservationResponse`나 `AdminReservationRowResponse`를 반환한다.\n- Domain 객체가 `@RequestBody`, `ResponseEntity`, `JdbcTemplate` 같은 바깥 세부를 import한다.\n- Service가 HTTP exception/status code 이름으로 분기한다.\n- Controller가 duplicate reservation check, stock decrease, payment confirmation 같은 use case ordering을 직접 잡는다.\n\n## 검증 책임을 나누는 법\n\n| 질문 | 자연스러운 위치 |\n|---|---|\n| \"요청 body에 필드가 없나?\" | Controller / Request DTO |\n| \"이 사용자가 이 행동을 해도 되나?\" | Service / authorization policy |\n| \"이 값 자체가 말이 되나?\" | Domain / Value Object |\n| \"이미 같은 상태가 저장돼 있나?\" | Service가 Repository로 확인 |\n| \"DB unique constraint가 깨졌나?\" | Repository 구현 / infrastructure exception mapping |\n\n검증을 모두 Controller에 두면 웹 입구가 use case owner가 된다. 반대로 모든 검증을 Repository에 두면 저장소가 정책 owner가 된다. 어떤 지식이 필요한 검증인지 먼저 묻는 것이 핵심이다.\n\n## 미션 예시\n\n예약 생성 요청이라면 Controller는 `CreateReservationRequest`를 받고 201 응답을 만든다. Service는 `memberId`, `themeId`, `timeId`, `date`로 예약 가능 여부를 확인하고 `Reservation`을 생성한다. Repository는 `existsByDateAndTimeId(date, timeId)`나 `save(reservation)`처럼 저장소 계약을 제공한다.\n\n장바구니 미션이라면 Controller는 HTTP session 또는 인증 principal에서 사용자 식별자를 꺼낸다. Service는 같은 상품을 추가할 때 수량을 합칠지 결정한다. Repository는 장바구니 항목 조회와 저장을 담당한다.\n\n로또 콘솔 미션처럼 HTTP와 DB가 없는 단계에서는 Controller/Repository 이름을 억지로 만들 필요가 없다. 입력을 읽는 view/adapter, 구매 금액과 로또 번호 규칙을 가진 Domain, 게임 흐름을 조율하는 service 정도로 충분할 수 있다. 계층 이름보다 변경 이유와 지식 경계가 먼저다.\n\n## 흔한 오해\n\nService가 있다고 해서 모든 조건문이 Service에 있어야 하는 것은 아니다. 값 자체의 불변식은 Domain에 두고, 여러 객체나 저장소를 조합하는 흐름은 Service에 둔다.\n\nRepository가 \"비즈니스와 무관한 SQL 상자\"라는 뜻도 아니다. Repository 메서드 이름은 유스케이스가 이해할 수 있는 조회 계약을 말해야 한다. 다만 \"예약 가능 판단\" 자체를 Repository가 결정하면 저장소가 정책 owner가 된다.\n\nController가 얇아야 한다는 말은 Controller가 아무 일도 하지 말라는 뜻이 아니다. 웹 입력을 application layer가 이해할 command로 바꾸고, 예외를 HTTP 응답으로 바꾸는 일은 Controller의 책임이다.\n\n3계층으로 나눴다고 자동으로 좋은 설계가 되는 것도 아니다. Controller가 Service를 호출하고 Service가 Repository를 호출하더라도, Request DTO와 Entity와 Response가 한 타입으로 흐르면 책임은 여전히 섞여 있다.\n\n## 빠른 점검 질문\n\n- 이 코드는 HTTP가 없어도 테스트할 수 있는가?\n- DB schema가 바뀌면 Service 코드까지 바뀌는가?\n- status code가 바뀌면 Service test가 깨지는가?\n- 도메인 규칙을 Controller test에서만 검증하고 있지 않은가?\n- Repository method 이름이 \"무엇을 원한다\"보다 \"어떤 SQL을 친다\"에 가깝지 않은가?\n\n## Safe Next Docs\n\n다음에는 `software-engineering/dto-domain-entity-boundary-primer`로 데이터 모양과 규칙의 위치를 분리한다. 저장소 경계가 더 헷갈리면 `software-engineering/repository-contract-beginner-primer`를 먼저 본다.\n",
   "aliases": [
-    "controller service repository responsibility split",
+    "controller service repository split",
     "layer responsibility beginner",
+    "service repository boundary",
+    "thin controller service logic",
     "컨트롤러 서비스 리포지토리 책임",
     "레이어 경계 입문",
-    "@PathVariable",
-    "@PostMapping",
-    "@RequestBody"
+    "서비스 리포지토리 경계",
+    "뚱뚱한 컨트롤러 분리",
+    "repository contract boundary"
   ],
   "expected_queries": [
-    "Controller Service Repository는 각각 무슨 책임을 가져야 해?",
-    "서비스에 로직을 둔다는데 어디까지가 서비스 책임이야?",
-    "리포지토리랑 서비스 경계가 헷갈려"
+    "Controller Service Repository는 각각 어디까지 책임져야 해?",
+    "Controller가 Repository를 바로 호출하면 왜 문제야?",
+    "Service가 너무 얇아도 계층을 나누는 게 맞아?",
+    "Repository에 비즈니스 조건문을 넣어도 되는지 헷갈려",
+    "뚱뚱한 Controller 리뷰를 받았는데 어떻게 나눠?"
   ],
   "symptoms": [
     "Controller가 너무 뚱뚱하다는 리뷰를 받았어요",
@@ -42,8 +46,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/software-engineering/controller-service-repository-boundary-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch150"
+      }
+    ]
   }
 }
