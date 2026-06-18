@@ -6,14 +6,18 @@
   "summary": "이미 winner가 확정됐으면 already exists, 아직 결론을 못 본 혼잡이면 busy, 이번 시도 전체를 새로 시작해야 하면 retryable을 먼저 고른다.",
   "body_markdown": "# Already Exists vs Busy vs Retryable 결정 가이드\n\n## 한 줄 요약\n\n> 이미 winner가 확정됐으면 `already exists`, 아직 결론을 못 본 혼잡이면 `busy`, 이번 시도 전체를 새로 시작해야 하면 `retryable`을 먼저 고른다.\n\n## 미션 진입 증상\n\n| 학습자 발화 | 미션 장면 | 이 문서에서 먼저 잡을 것 |\n|---|---|---|\n| \"duplicate key, lock timeout, deadlock을 전부 같은 retry로 처리하고 있어요\" | DB 예외를 서비스 응답으로 번역하는 단계 | already exists, busy, retryable 세 버킷을 먼저 고른다 |\n| \"23505, 1205, 40001을 어디에 둬야 할지 감이 안 와요\" | PostgreSQL/MySQL 에러코드 기반 triage | winner 확인, 혼잡, transaction 재시작 의미를 분리한다 |\n| \"중복 생성 실패가 conflict인지 잠깐 뒤 재시도인지 모르겠어요\" | duplicate row, lock wait, serialization failure가 섞인 리뷰 | 이미 승자가 있는지, 아직 못 본 건지, 새 판으로 다시 해야 하는지 묻는다 |\n\n## 결정 매트릭스\n\n| 지금 받은 신호 | `already exists` | `busy` | `retryable` |\n| --- | --- | --- | --- |\n| 대표 장면 | duplicate key, 같은 idempotency key 선점 | lock timeout, pool borrow timeout, `55P03` | deadlock, `40001`, 직렬화 충돌 |\n| 먼저 던질 질문 | 이미 winner row가 있나 | 아직 누가 이길지 못 봤나 | 같은 로직을 새 transaction으로 다시 계산해야 하나 |\n| 기본 동작 | fresh read로 winner 의미 확인 | 짧은 대기 실패나 혼잡으로 분류 | 트랜잭션 전체 bounded retry |\n| 흔한 학습자 표현 | \"이미 있으면 같은 성공으로 봐도 되나?\" | \"지금 막혀서 못 끝난 건가?\" | \"이번 판만 다시 시작하면 되나?\" |\n| HTTP/서비스 감각 | replay 또는 `409` 후보 | `202`, `429`, `503` 후보 | 내부 retry 후 실패 시 `503` 후보 |\n\n짧게 외우면 `already exists`는 승자 확인, `busy`는 혼잡 해석, `retryable`은 새 판 시작이다.\n\n## 흔한 오선택\n\n가장 흔한 오선택은 duplicate key를 보자마자 무조건 재시도하는 경우다. 학습자 표현으로는 \"실패했으니 한 번 더 넣으면 되지 않나?\"에 가깝다. 하지만 이 경우는 이미 winner가 있을 가능성이 크므로, 다시 쓰기보다 winner row를 fresh read로 확인하는 쪽이 먼저다.\n\n반대로 lock timeout과 pool timeout을 `409 conflict`처럼 읽는 것도 자주 틀린다. 여기서는 이미 존재함을 확인한 것이 아니라 아직 결과를 못 본 혼잡일 수 있다. 즉 `busy`로 읽고, per-key 혼잡인지 시스템 혼잡인지부터 나누는 편이 맞다.\n\ndeadlock이나 serialization failure를 duplicate key와 같은 버킷에 넣는 것도 위험하다. 이 신호들은 \"이미 있는 row를 읽어 끝내라\"보다 \"이번 transaction 시도 전체를 버리고 다시 계산하라\"에 가깝다. SQL 한 줄 재시도가 아니라 트랜잭션 경계 재시도가 핵심이다.\n\n## 에러 신호별 버킷 매핑 — 실제 예외 코드와 처리 흐름\n\n추상적인 \"버킷\"이 실제 코드에서 어떻게 보이는지 PostgreSQL과 MySQL 기준으로 정리한다.\n\n### Already Exists — unique constraint violation\n\n```text\nPostgreSQL SQLState : 23505\nMySQL SQLState     : 23000 (Error 1062)\nSpring 예외        : DataIntegrityViolationException (중첩: PSQLException / SQLIntegrityConstraintViolationException)\n```\n\n**무엇을 의미하나**: DB가 \"이미 winner row가 있음\"을 확인했다. 같은 값으로 다시 INSERT해도 동일한 에러가 반복되므로 재시도가 아무 의미 없다.\n\n**호출자가 해야 할 일**: 예외를 잡은 즉시 fresh SELECT로 winner row를 읽고, 그 row가 내 요청과 동일한 의도인지 판단한다.\n\n```java\ntry {\n    purchaseRepository.insert(purchase);\n} catch (DataIntegrityViolationException e) {\n    // 재시도 금지 — winner를 먼저 확인한다\n    return purchaseRepository.findByIdempotencyKey(purchase.getIdempotencyKey())\n        .map(existing -> PurchaseResult.alreadyProcessed(existing))\n        .orElseThrow(() -> new IllegalStateException(\"winner 확인 실패\", e));\n}\n```\n\n### Busy — lock timeout / pool borrow timeout\n\n```text\nPostgreSQL SQLState : 55P03 (lock_not_available, SET lock_timeout + SELECT ... FOR UPDATE NOWAIT)\nMySQL SQLState     : HY000 (Error 1205, lock wait timeout exceeded)\nSpring 예외        : QueryTimeoutException 또는 CannotAcquireLockException\n```\n\n**무엇을 의미하나**: 아직 다른 트랜잭션이 끝나지 않아서 결과를 못 봤다. winner가 확정된 것이 아니라 지금 당장 혼잡한 상태다.\n\n**호출자가 해야 할 일**: 논리 충돌이 아니므로 `409 Conflict`를 내리는 것은 틀리다. per-key 혼잡인지(한 row에 동시 접근) 시스템 전체 혼잡인지를 나눈 뒤 `503 Service Unavailable` 또는 짧은 `202 Accepted` + 재조회 안내를 고려한다.\n\n### Retryable — deadlock / serialization failure\n\n```text\nPostgreSQL SQLState : 40001 (serialization_failure), 40P01 (deadlock_detected)\nMySQL SQLState     : 40001 (Error 1213, Deadlock found)\nSpring 예외        : CannotAcquireLockException / ConcurrencyFailureException (deadlock·serialization 모두 SQLState 40 계열로 매핑)\n```\n\n**무엇을 의미하나**: DB가 사이클을 탐지해서 트랜잭션 하나를 강제로 롤백했다. \"로직을 다시 계산해서 새 트랜잭션으로 재시작\"이 DB의 명시적 권고다.\n\n**호출자가 해야 할 일**: SQL 한 줄만 재시도하면 안 된다. 트랜잭션 경계 전체를 재시작해야 하고, 횟수 제한(bounded retry)과 지수 백오프를 둔다.\n\n```java\nint attempt = 0;\nwhile (attempt < MAX_RETRY) {\n    try {\n        return transactionTemplate.execute(status -> doPurchase(command));\n    } catch (CannotAcquireLockException e) {\n        // deadlock → 트랜잭션 전체 재시작\n        if (++attempt >= MAX_RETRY) throw new ServiceUnavailableException(\"일시적 충돌, 잠시 후 다시 시도해주세요\", e);\n        Thread.sleep(backoffMs(attempt));\n    }\n}\n```\n\n### 세 버킷을 한눈에\n\n```text\n에러 신호              SQLState 예시   버킷           재시도?   HTTP 후보\n---------------------- --------------- -------------- --------- ----------\nunique constraint 위반 23505 / 23000   already exists ✗         409 또는 200\nlock timeout           55P03 / HY000   busy           상황에 따라 503 / 202\ndeadlock               40P01 / 40001   retryable      ✓ (bounded) 503 후 재시도\nserialization failure  40001           retryable      ✓ (bounded) 503 후 재시도\ntransient conn error   08006 / 08S01   retryable      ✓ (bounded) 503 후 재시도\n```\n\n`already exists`는 재시도 금지, `retryable`은 트랜잭션 경계 재시작, `busy`는 혼잡 해석 후 판단이라는 세 갈래가 핵심이다.\n\n## 스스로 점검\n\n- 내 서비스 코드에서 `DataIntegrityViolationException`을 잡는 곳이 있다면, 거기서 fresh SELECT를 하고 있나? 아니면 곧바로 에러 응답을 내리고 있나?\n- deadlock을 retry 한다면 트랜잭션 경계 바깥에서 루프를 도나, `@Transactional` 메서드 안에서 재시도하나? 둘의 차이가 왜 중요한지 설명할 수 있나?\n\n## 다음 학습\n\n## 다음 학습\n\nduplicate key 뒤에 winner row를 어떻게 다시 읽고 replay, conflict, processing으로 나누는지 더 짧게 붙잡고 싶으면 [DuplicateKeyException 이후 Fresh-Read 재분류 미니 카드](./duplicate-key-fresh-read-classifier-mini-card.md)를 보면 된다.\n\n`already exists`와 `retryable` 경계가 특히 헷갈리면 [Duplicate Key vs Serialization Failure 미니 카드](./duplicate-key-vs-serialization-failure-mini-card.md)로 내려가서 loser signal의 의미를 다시 고정하면 된다.\n\ntimeout과 lock 계열을 `busy` 안에서 더 세분화하고 싶으면 [DB Timeout 첫 분류 결정 가이드](./db-timeout-first-splitter.md)와 [Timeout 에러코드 매핑 미니카드](./timeout-errorcode-mapping-mini-card.md)를 이어서 보는 편이 안전하다.\n",
   "aliases": [
+    "중복키 busy retryable 구분",
+    "이미 있음 혼잡 재시도 분기",
+    "Already Exists vs Busy 개념",
+    "Already Exists vs Busy 정리",
+    "Already Exists vs Busy 실수",
     "already exists vs busy vs retryable",
     "duplicate key vs busy vs retryable",
     "db error outcome chooser",
     "duplicate conflict or retry chooser",
     "lock timeout or retryable split",
     "23505 1205 40001 what to do",
-    "중복키 busy retryable 구분",
-    "이미 있음 혼잡 재시도 분기"
+    "already exists vs busy guide"
   ],
   "expected_queries": [
     "중복키가 나왔을 때와 락 대기 실패가 났을 때를 같은 retry 정책으로 보면 어디서 틀어져?",
@@ -50,8 +54,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-31",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/already-exists-vs-busy-vs-retryable-decision-guide.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch155"
+      }
+    ]
   }
 }

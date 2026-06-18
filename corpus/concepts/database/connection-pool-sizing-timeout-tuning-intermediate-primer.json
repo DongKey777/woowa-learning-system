@@ -7,17 +7,17 @@
   "body_markdown": "# Connection Pool 튜닝 입문 — Size · Timeout · Validation\n\n> 한 줄 요약: HikariCP 4축 튜닝 — *pool size + 3 timeouts*. 일반 시작값: size 10-20, connection-timeout 30s, idle-timeout 10m, max-lifetime DB idle보다 *짧게*. pool starvation은 *transaction이 길게 connection 잡고 있는* 신호.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n```\n[Application]                          [DB Server]\n    │                                       │\n    Pool [conn1, conn2, ..., connN] ←──────── connections\n    │\n    ├─ Request 1: getConnection() → conn1 borrow → query → return\n    ├─ Request 2: getConnection() → conn2 borrow → query → return\n    ...\n    └─ Request N+1: pool 꽉 참 → connection-timeout 대기 → 타임아웃 시 예외\n```\n\n각 connection은 *재사용*. 매번 새로 만들면 *3-way handshake + auth* 비용 비쌈 (~수십 ms).\n\n## 한 장 정리 — HikariCP 핵심 4축\n\n| 설정 | 기본값 (HikariCP) | 의미 | 권장 시작값 |\n|---|---|---|---|\n| `maximum-pool-size` | 10 | 동시 connection 최대 | CPU 코어 × 2~4 |\n| `minimum-idle` | maximum-pool-size | 항상 유지할 최소 idle | maximum-pool-size 동일 (또는 별도) |\n| `connection-timeout` | 30000 (30s) | pool에서 connection 얻기까지 wait | 30s (운영) / 5s (개발 fail-fast) |\n| `idle-timeout` | 600000 (10m) | idle connection 폐기 기간 | 10m |\n| `max-lifetime` | 1800000 (30m) | connection 강제 교체 주기 | DB side timeout보다 30s 짧게 |\n| `leak-detection-threshold` | 0 (off) | connection 보유 경고 임계 | 운영 60000 (60s) 권장 |\n\n## \"pool-size를 어떻게 정해?\"\n\n학습자 자주 묻는 질문 + 빈번한 오해.\n\n**공식적 권장 (HikariCP 문서)**:\n```\npool_size = (core_count × 2) + effective_spindle_count\n```\n- core_count: DB 서버 CPU 코어\n- effective_spindle_count: 디스크 IO 동시성 (SSD = 1, HDD = N)\n\n**경험 시작값**: 10-20.\n**큰 트래픽 + 짧은 query**: 20-50.\n**OLAP / 긴 query**: 50+.\n\n**큰 오해**: *\"더 많으면 더 빠르다\"* — 아니다. **DB 측 connection 한계 + thread context switch overhead**로 *오히려 throughput ↓*. Little's Law:\n\n```\n요구 처리량 = pool size / 평균 query 시간\n```\n\n예: 평균 50ms query, pool size 10 → 처리량 200 req/s. 더 큰 처리량이 필요하면 *DB 자체 scale* 또는 *query 최적화*가 답이지 pool 늘리기 ❌.\n\n## \"Timeout 3가지\" 정확 이해\n\n```\n[connection-timeout]\n  pool에서 connection 얻기까지 wait 한계\n  → 시간 초과면 SQLException (\"Could not get connection within 30s\")\n\n[idle-timeout]\n  pool 안 connection이 *사용 안 됨*. 이 시간 후 close\n  → 트래픽 줄 때 리소스 절약\n\n[max-lifetime]\n  connection이 *얼마나 오래 살아 있을지* 강제 한계\n  → 연결 누수, DB 측 idle timeout 회피\n  → DB의 wait_timeout (MySQL) / idle_in_transaction_session_timeout (PG) 보다 *짧게*\n```\n\n⚠️ DB가 idle connection을 *자기가 끊으면* pool의 *유효하지 않은 connection*이 borrow → query fail. `max-lifetime`이 *DB 한계 - 30초* 정도여야 안전.\n\n## Pool Starvation — 자주 만나는 증상\n\n```\n[증상]\n  요청 응답 시간이 갑자기 길어짐 (예: 평소 100ms → 30s)\n  → connection-timeout 임박/초과\n  → SQLException (\"Could not get connection\")\n\n[원인]\n  1. 트래픽 ↑ vs pool size ↓\n  2. transaction이 *너무 길게* connection 보유 (예: 외부 API 호출 inside transaction)\n  3. connection leak (return 안 됨)\n  4. DB slow query (모든 connection이 같은 slow query)\n```\n\n**진단**:\n```yaml\nspring:\n  datasource:\n    hikari:\n      leak-detection-threshold: 60000   # 60s 이상 보유 시 stack trace 로그\n```\n\n이걸 운영 모드로 켜면 *connection 보유한 thread + stack*이 로그에 떠 *어디서 transaction이 길게 잡고 있는지* 추적 가능.\n\n## \"Transaction과 Connection Pool 상호작용\"\n\n```java\n@Transactional   // ← Spring AOP가 메서드 진입 시 connection borrow\npublic void process(Long id) {\n    repository.save(...);\n    externalApiClient.call();   // ❌ 외부 API 동안 connection 잡고 있음\n    repository.update(...);\n}\n```\n\n이 패턴이 pool starvation의 주범. 외부 API가 500ms 걸리면 *connection도 500ms 잡힘*. 동시 요청 N개 = pool size N 소진.\n\n**해결**:\n- 외부 API 호출을 transaction *밖*으로.\n- 또는 transaction 분리 (`@Transactional(propagation = REQUIRES_NEW)` + 작은 단위).\n- **transaction 안 외부 IO 호출 금지**가 원칙.\n\n## Validation Query / TestOnBorrow\n\n```yaml\nspring:\n  datasource:\n    hikari:\n      connection-test-query: SELECT 1   # 옛 패턴 (deprecated in JDBC4+)\n      validation-timeout: 5000\n```\n\nJDBC4+에서는 *isValid()* 자동 — 별도 query 불필요. HikariCP 기본이 가장 안전.\n\n## 자주 헷갈리는 지점\n\n- **\"pool size 큰 게 빠르다\"** — Little's Law로 *throughput 한계* 결정. 무작정 키우면 *DB 부담 + 응답 더 느려질 수 있음*.\n- **\"connection-timeout = query timeout\"** — *다르다*. connection-timeout은 *pool에서 얻기까지*, query timeout은 *query 실행 시간 (JDBC statement timeout)*.\n- **\"max-lifetime을 안 켜도 OK\"** — DB 측 idle timeout이 *조용히* connection 끊으면 pool에 *죽은 connection*. max-lifetime이 안전망.\n- **\"connection leak은 코드 버그만\"** — 대부분 transaction 안 외부 호출 / 긴 transaction.\n- **\"HikariCP 기본값이면 충분\"** — 일반적으로 OK. 단 `leak-detection-threshold`는 *운영에서 켜야* 디버깅 가능.\n\n## 학습자가 자주 만나는 시나리오\n\n- 학습 미션 → HikariCP 기본값 그대로. pool size 10이면 충분.\n- 운영 첫 배포 → leak-detection-threshold = 60s 켜기. 진단 도구.\n- \"트래픽 ↑인데 응답 ↑\" → 단순 pool size 늘리기 ❌. *transaction 길이* 측정 먼저.\n- \"DB 끊겼다는 에러 발생\" → max-lifetime이 DB idle timeout보다 작은지 확인.\n\n## 빠른 확인 질문\n\n- pool-size를 무작정 키우면 안 되는 이유?\n  - Little's Law: 처리량 = size / 평균 query 시간. DB 한계로 *throughput 한계* 결정.\n- max-lifetime이 DB idle timeout보다 *짧게* 설정해야 하는 이유?\n  - DB가 자기가 끊은 connection을 pool에서 borrow하면 query fail.\n- pool starvation 가장 흔한 원인?\n  - Transaction이 *길게* connection 잡고 있음 (예: 외부 API in transaction).\n\n## 한 줄 정리\n\nConnection Pool 튜닝 = *pool size + 3 timeouts + leak-detection*. 일반 시작값 size 10-20. 큰 pool이 *항상 빠른 건 아님*. pool starvation은 *transaction 길이* 의심부터.\n\nretrieval-anchor-keywords: Connection Pool tuning, HikariCP configuration, maximum-pool-size sizing, Little's Law throughput, connection-timeout idle-timeout max-lifetime, leak-detection-threshold, pool starvation debugging, transaction in connection pool, external API in transaction antipattern, MySQL wait_timeout, PostgreSQL idle_in_transaction_session_timeout, JDBC isValid\n",
   "aliases": [
     "Connection Pool 튜닝",
+    "DB 커넥션 풀",
+    "Connection Pool 튜닝 입문 개념",
+    "Connection Pool 튜닝 입문 정리",
+    "Connection Pool 튜닝 입문 실수",
     "HikariCP",
     "maximum-pool-size",
     "minimum-idle",
     "connection-timeout",
     "idle-timeout",
     "max-lifetime",
-    "leak detection threshold",
-    "connection pool sizing",
-    "DB 커넥션 풀",
-    "pool starvation",
-    "@Transactional"
+    "leak detection threshold"
   ],
   "expected_queries": [
     "Connection Pool 사이즈를 어떻게 정해?",
@@ -51,8 +51,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/connection-pool-sizing-timeout-tuning-intermediate-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch155"
+      }
+    ]
   }
 }

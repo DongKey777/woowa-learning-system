@@ -6,16 +6,18 @@
   "summary": "CAS는 충돌을 나중에 감지하고, pessimistic lock은 충돌을 미리 막는다.",
   "body_markdown": "# Compare-and-Swap과 Pessimistic Locks\n\n> 한 줄 요약: CAS는 충돌을 나중에 감지하고, pessimistic lock은 충돌을 미리 막는다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Transaction Boundary, Isolation, and Locking Decision Framework](./transaction-boundary-isolation-locking-decision-framework.md), [Compare-and-Set와 Version Columns](./compare-and-set-version-columns.md), [Lost Update Detection Patterns](./lost-update-detection-patterns.md), [Advisory Locks와 Row Locks](./advisory-locks-vs-row-locks.md), [Queue Claim with `SKIP LOCKED`, Fairness, and Starvation Trade-offs](./queue-claim-skip-locked-fairness.md), [Spring/JPA 락킹 예제 가이드](./spring-jpa-locking-example-guide.md)\nretrieval-anchor-keywords: compare and swap, pessimistic lock, optimistic lock, version column, select for update, skip locked, CAS vs pessimistic locking, lost update prevention, retry on version conflict, lock first or retry later\n\n## 10초 chooser\n\n| 질문 | CAS/version check 쪽 | pessimistic lock 쪽 |\n|---|---|---|\n| 충돌 빈도 | 낮거나 burst가 짧다 | 같은 key/slot에 자주 몰린다 |\n| 실패 비용 | 사용자에게 재시도/재조회가 가능하다 | 중복 차감, 중복 예약처럼 치명적이다 |\n| 작업 길이 | 짧은 DB write 중심이다 | 잠근 뒤 판단해야 할 상태가 작고 명확하다 |\n| 외부 I/O | transaction 밖으로 뺄 수 있다 | lock 안에 넣으면 위험 신호다 |\n| 관측 지표 | version conflict rate, retry success | lock wait, deadlock, queueing time |\n\n빠른 판단은 \"기다리게 할 것인가, 실패를 감지하고 다시 시도할 것인가\"다. CAS는 retry budget과 사용자 경험이 같이 있어야 하고, pessimistic lock은 lock 범위와 보유 시간이 같이 짧아야 한다.\n\n## wrong-bucket / 오선택\n\n- 충돌이 낮은 프로필/설정 수정에 `SELECT ... FOR UPDATE`를 먼저 붙이면 대기와 deadlock surface가 불필요하게 커진다.\n- 재고 1개, 동일 시간 예약, 같은 idempotency key 같은 hot path에 CAS만 두고 무한 retry하면 실패율과 tail latency가 커진다.\n- `FOR UPDATE`가 \"비즈니스 불변식 전체\"를 자동 보호한다고 말하면 위험하다. 반환된 row, index range, isolation level, engine 동작에 따라 보호 범위가 달라진다.\n- CAS가 성공했다는 사실은 외부 side effect가 한 번만 발생했다는 뜻이 아니다. 결제, 메시지, 알림은 idempotency/outbox가 별도로 필요하다.\n- retry가 쉬운 작업인지 확인하지 않고 optimistic lock을 선택하면 사용자에게 충돌 해결 책임이 넘어간다.\n\n## 핵심 개념\n\nCAS와 pessimistic lock은 둘 다 동시성 충돌을 다루지만 철학이 다르다.\n\n왜 중요한가:\n\n- 충돌이 적은 작업과 많은 작업은 같은 해법이 아니다\n- 락을 오래 잡으면 대기와 데드락이 늘고, CAS는 재시도가 늘 수 있다\n- 어떤 문제는 빨리 실패하는 게 맞고, 어떤 문제는 먼저 막는 게 맞다\n\n핵심은 “더 안전한 것”이 아니라, **작업 특성에 맞는 경합 제어 방식**을 고르는 것이다.\n\n## 깊이 들어가기\n\n### 1. CAS의 성격\n\nCAS는 읽은 version이 맞을 때만 저장한다.\n\n- 장점: 락을 오래 잡지 않는다\n- 단점: 충돌 시 재시도 필요\n\n읽기 비중이 높고 충돌이 낮을 때 강하다.\n\n### 2. pessimistic lock의 성격\n\npessimistic lock은 `SELECT ... FOR UPDATE`처럼 먼저 잠근다.\n\n- 장점: 충돌이 잦아도 안전하다\n- 단점: 대기와 데드락 가능성이 커진다\n\n충돌이 잦고, 한 번의 실패가 치명적일 때 적합하다.\n\n### 3. 어떤 상황에서 CAS가 더 낫나\n\n- 프로필 변경\n- 설정값 수정\n- 읽고 계산 후 저장하는 작업\n\n이런 경우는 보통 재시도가 쉬워 CAS가 유리하다.\n\n### 4. 어떤 상황에서 pessimistic lock이 더 낫나\n\n- 재고 1개 구매\n- 순서가 중요한 예약\n- 다수 row를 읽고 일관된 결정을 내려야 하는 경우\n\n이 경우는 충돌을 빨리 끝내는 것이 중요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 프로필 수정이 자주 겹침\n\n충돌이 빈번하지 않고 재시도가 쉬우면 CAS가 더 낫다.\n\n### 시나리오 2: 재고 차감이 몰림\n\n충돌이 많고 한 번의 중복 차감이 치명적이면 pessimistic lock이 더 낫다.\n\n### 시나리오 3: 긴 작업과 섞임\n\n외부 호출이 섞인 긴 작업에 pessimistic lock을 쓰면 대기가 길어진다.  \n이럴 때는 CAS + 짧은 검증이 더 안전할 수 있다.\n\n## 코드로 보기\n\n```sql\n-- CAS\nUPDATE inventory\nSET stock = stock - 1, version = version + 1\nWHERE sku = 'SKU-1' AND version = 7 AND stock > 0;\n\n-- pessimistic lock\nSTART TRANSACTION;\nSELECT stock FROM inventory WHERE sku = 'SKU-1' FOR UPDATE;\nUPDATE inventory SET stock = stock - 1 WHERE sku = 'SKU-1';\nCOMMIT;\n```\n\n```java\n// 충돌이 많지 않으면 CAS, 충돌이 많으면 lock을 고려한다.\n```\n\nCAS는 충돌을 감지하고, pessimistic lock은 충돌을 피한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| CAS/version check | 확장성이 좋다 | 재시도가 필요하다 | 충돌이 낮을 때 |\n| pessimistic lock | 결과가 안정적이다 | 경합이 커진다 | 충돌이 높을 때 |\n| hybrid | 유연하다 | 정책이 복잡하다 | 상황별 선택 필요 |\n| no lock | 단순하다 | lost update 위험 | 거의 없음 |\n\n## 검증 포인트\n\n| 선택 | 먼저 확인할 증거 |\n|---|---|\n| CAS 유지 | conflict rate가 낮고, 재시도 성공률이 높고, 중복 side effect가 없다 |\n| pessimistic lock 전환 | 같은 key 대기 시간이 retry 폭증보다 작고, transaction 안 작업이 짧다 |\n| hybrid | conflict threshold, fallback 조건, retry/lock metric이 분리되어 있다 |\n| 구조 변경 | hot key가 계속 몰려 lock/CAS 어느 쪽도 tail latency를 잡지 못한다 |\n\n운영 판단은 \"이론상 안전한가\"보다 \"현재 conflict bucket이 어디인가\"를 먼저 봐야 한다. DB 엔진별 lock 범위는 문법만으로 단정하지 말고 실행 계획, isolation level, 실제 wait event로 확인한다.\n\n## 꼬리질문\n\n> Q: CAS와 pessimistic lock의 차이는 무엇인가요?\n> 의도: 충돌 감지와 충돌 예방의 차이를 아는지 확인\n> 핵심: CAS는 나중에 확인하고, pessimistic lock은 미리 막는다\n\n> Q: 언제 CAS가 더 적합한가요?\n> 의도: 재시도 가능한 작업의 특성을 아는지 확인\n> 핵심: 충돌이 적고 재시도 비용이 낮을 때다\n\n> Q: 언제 pessimistic lock이 더 적합한가요?\n> 의도: 충돌이 잦은 작업의 안정성을 아는지 확인\n> 핵심: 중복이나 순서 꼬임이 치명적일 때다\n\n## 한 줄 정리\n\nCAS는 나중에 충돌을 감지하는 방식이고, pessimistic lock은 미리 충돌을 막는 방식이다.\n",
   "aliases": [
+    "비관적 락 CAS",
+    "낙관적 락 비관적 락",
+    "Compare-and-Swap vs Pessimistic Locks 개념",
+    "Compare-and-Swap vs Pessimistic Locks 정리",
+    "Compare-and-Swap vs Pessimistic Locks 실수",
     "compare and swap vs pessimistic locks",
     "compare and swap",
     "pessimistic lock",
     "optimistic lock vs pessimistic lock",
     "version column vs select for update",
     "CAS vs pessimistic locking",
-    "lock first or retry later",
-    "lost update prevention",
-    "비관적 락 CAS",
-    "낙관적 락 비관적 락"
+    "lock first or retry later"
   ],
   "expected_queries": [
     "CAS와 pessimistic lock은 충돌을 나중에 감지하는 방식과 미리 막는 방식으로 어떻게 달라?",
@@ -55,8 +57,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/compare-and-swap-vs-pessimistic-locks.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch155"
+      }
+    ]
   }
 }

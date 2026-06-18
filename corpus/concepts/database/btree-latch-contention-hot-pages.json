@@ -6,15 +6,18 @@
   "summary": "B-Tree가 느려지는 순간은 키를 못 찾아서가 아니라, 같은 page와 같은 latch를 너무 많은 세션이 두드릴 때다.",
   "body_markdown": "# B-Tree Latch Contention and Hot Pages\n\n> 한 줄 요약: B-Tree가 느려지는 순간은 키를 못 찾아서가 아니라, 같은 page와 같은 latch를 너무 많은 세션이 두드릴 때다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: B-Tree latch contention, page latch, hot page, buffer pool latch, leaf page contention, insert hotspot, mutex, rw-lock\n\n## 핵심 개념\n\n- 관련 문서:\n  - [InnoDB Buffer Pool Internals](./innodb-buffer-pool-internals.md)\n  - [Adaptive Hash Index Trade-offs](./adaptive-hash-index-tradeoffs.md)\n  - [Insert Hotspot Page Contention](./insert-hotspot-page-contention.md)\n  - [Clustered Index Locality](./clustered-index-locality.md)\n\nB-Tree 내부에는 페이지 자체를 보호하는 latch가 있다.  \n이건 row lock과 다르다.\n\n- row lock은 트랜잭션 정합성을 지킨다\n- latch는 B-Tree 구조와 page 내용을 순간적으로 보호한다\n\n핫 페이지가 생기면 같은 leaf page를 너무 많은 세션이 만지게 되고,  \n그 결과 latch contention이 병목이 된다.\n\n## 역할별로 먼저 볼 것\n\n| 역할 | 먼저 확인할 질문 | 봐야 할 증거 |\n|---|---|---|\n| 백엔드 개발자 | PK/인덱스 키가 같은 page 끝으로 몰리나 | 시간순 key, tenant hot key, insert pattern |\n| DBA | row lock 대기 없이 내부 latch/mutex가 튀나 | InnoDB status, performance schema, engine metrics |\n| 운영 담당 | TPS plateau와 CPU/IO 대기가 같이 보이나 | throughput curve, wait event, hot page 단서 |\n| 리뷰어 | isolation level이나 row lock으로만 설명했나 | latch와 transaction lock 분리 설명 |\n\n이 문서는 \"락이 걸렸다\"를 넓게 말하는 문서가 아니다. **트랜잭션 row lock이 아니라 B-Tree page 구조를 보호하는 짧은 내부 latch 경합**을 다룬다.\n\n## 깊이 들어가기\n\n### 1. latch는 왜 필요한가\n\nB-Tree는 검색과 삽입 중에 노드 분할, 포인터 갱신, 페이지 연결을 한다.  \n이때 구조가 깨지지 않도록 짧게 잡는 락이 latch다.\n\n중요한 점:\n\n- 매우 짧은 임계구역 보호\n- 트랜잭션 락보다 훨씬 내부적\n- hot page가 있으면 경합이 급증\n\n### 2. hot page는 어떻게 생기는가\n\n같은 범위에 쓰기나 읽기가 몰리면 특정 page만 계속 바뀐다.\n\n- 시간순 PK 마지막 페이지\n- 인기 사용자/카운터 row가 몰린 페이지\n- 특정 tenant의 최근 데이터 페이지\n\n이런 곳이 hot page가 된다.\n\n### 3. latch contention과 row contention은 다르다\n\nrow lock이 없어도 latch contention은 생길 수 있다.  \n반대로 row lock이 강해도 latch는 덜할 수 있다.\n\n그래서 \"락 대기\"를 볼 때는 row-level만 보지 말고 page-level도 생각해야 한다.\n\n### 4. read-mostly여도 경합이 생긴다\n\n읽기라고 항상 안전한 게 아니다.  \n일반 consistent read가 row lock을 잡는 것은 아니지만, 같은 index/page를 매우 자주 탐색하면 search latch, buffer pool latch, AHI 관련 mutex/rw-lock 같은 engine 내부 경합이 드러날 수 있다.\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `B-Tree latch contention`\n- `page latch`\n- `hot page`\n- `leaf page contention`\n- `mutex`\n- `rw-lock`\n\n## 실전 시나리오\n\n### 시나리오 1. insert TPS가 특정 순간부터 안 늘어난다\n\n모든 요청이 한쪽 끝 page에 몰리면, row lock보다 latch가 먼저 병목이 될 수 있다.  \n이때는 PK 패턴과 page split, hot page를 같이 봐야 한다.\n\n### 시나리오 2. AHI를 껐더니 일부 부하는 나아졌다\n\n같은 hot path에서 AHI와 latch가 경쟁했다면, AHI를 끄는 것이 전체 경합을 줄이는 데 도움이 될 수 있다.  \n하지만 이것은 근본 해결이 아니라 증상 완화일 수 있다.\n\n### 시나리오 3. 특정 tenant만 유독 느리다\n\n한 tenant의 최근 데이터가 같은 page에 몰려 있으면, 그 page가 hot page가 된다.  \n멀티테넌트 구조에서는 이런 쏠림이 더 자주 드러난다.\n\n## 코드로 보기\n\n### insert hotspot 감각\n\n```sql\nINSERT INTO orders (id, user_id, status, created_at)\nVALUES (900001, 1001, 'PAID', NOW());\n```\n\n### 상태 점검\n\n```sql\nSHOW ENGINE INNODB STATUS\\G\n```\n\n### 경합 완화 힌트\n\n```sql\nSHOW VARIABLES LIKE 'innodb_buffer_pool_instances';\nSHOW VARIABLES LIKE 'innodb_adaptive_hash_index';\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| latch 경합 감수 | 구현이 단순하다 | hot page에서 병목이 된다 | 트래픽이 적을 때 |\n| page hotspot 분산 | 경합이 줄 수 있다 | PK/인덱스 설계가 복잡해진다 | 고빈도 insert/read |\n| AHI 조절 | 경합을 줄일 수 있다 | read 성능이 흔들릴 수 있다 | 특정 hot path |\n\n핵심은 latch contention을 row lock 문제로 오해하지 않고, **B-Tree page 자체의 병목**으로 보는 것이다.\n\n## wrong-bucket 신호\n\n| 질문 | 더 맞는 bucket | 이유 |\n|---|---|---|\n| 두 transaction이 같은 row를 갱신하다 기다린다 | transaction isolation/row lock | 데이터 row 충돌이다 |\n| gap lock이나 next-key lock 때문에 insert가 막힌다 | gap lock/next-key lock | isolation과 range lock 문제다 |\n| storage engine 선택이 B+Tree냐 LSM이냐 | B+Tree vs LSM chooser | 구조 선택 비교다 |\n| checkpoint age 이후 commit latency가 튄다 | checkpoint/flush storm | flush pressure 문제다 |\n\nrow lock wait이 보이지 않는다고 \"락 문제가 아니다\"라고 결론 내리면 안 된다. 다만 이 문서의 lock은 SQL-level row lock이 아니라 engine 내부 latch다.\n\n## validation checklist\n\n진단할 때는 아래 순서로 확인한다.\n\n1. row lock/deadlock 지표와 latch/mutex/page wait 지표를 분리했다.\n2. 시간순 PK, monotonically increasing secondary index, tenant별 최신 데이터 쏠림을 확인했다.\n3. page split, fill factor, clustered index locality, AHI 경합을 함께 봤다.\n4. isolation level 변경만으로 해결된다고 말하지 않는다.\n5. hot page 분산, key 설계 변경, batching, shard/partition 같은 구조적 완화책을 검토했다.\n6. AHI 비활성화는 일부 workload 실험일 뿐 일반 해법으로 단정하지 않는다.\n\n## 꼬리질문\n\n> Q: latch와 row lock은 어떻게 다른가요?\n> 의도: 내부 구조 보호와 트랜잭션 보호를 구분하는지 확인\n> 핵심: latch는 순간적 구조 보호, row lock은 정합성 보호다\n\n> Q: hot page는 왜 생기나요?\n> 의도: PK 패턴과 접근 쏠림을 아는지 확인\n> 핵심: 같은 페이지로 읽기/쓰기가 몰리기 때문이다\n\n> Q: latch contention을 줄이려면 무엇을 먼저 보나요?\n> 의도: 구조적 병목을 찾는 순서를 아는지 확인\n> 핵심: PK 순서, insert 패턴, hotspot 분산이다\n\n## 한 줄 정리\n\nB-Tree latch contention은 같은 page를 너무 많은 세션이 만질 때 생기는 내부 경합이고, PK와 access pattern을 바꾸지 않으면 반복된다.\n",
   "aliases": [
+    "페이지 latch 경합",
+    "B-Tree Latch Contention and 개념",
+    "B-Tree Latch Contention and 정리",
+    "B-Tree Latch Contention and 실수",
+    "B-Tree Latch Contention and 판단 기준",
     "b-tree latch contention",
     "page latch",
     "hot page",
     "buffer pool latch",
     "leaf page contention",
     "insert hotspot",
-    "row lock vs latch",
-    "BTree hot page",
-    "페이지 latch 경합"
+    "row lock vs latch"
   ],
   "expected_queries": [
     "B-Tree latch contention은 row lock과 다르게 page 구조를 짧게 보호하는 내부 경합이라는 뜻이야?",
@@ -53,8 +56,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/database/btree-latch-contention-hot-pages.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch155"
+      }
+    ]
   }
 }
