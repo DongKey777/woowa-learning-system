@@ -4,16 +4,23 @@
   "category": "language",
   "level": "advanced",
   "summary": "latency 측정은 histogram보다 먼저 요청 도착 모델을 바로 세워야 coordinated omission을 피할 수 있다.",
-  "body_markdown": "    # Coordinated Omission Hdrhistogram JMH Latency Measurement\n\n    ## 이 문서가 맡는 질문\n    coordinated omission, HDR Histogram, JMH benchmark pitfall을 연결해 latency 측정 품질을 다루는 language deep dive다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    load generator가 closed-loop인지 open-loop인지, 지연 동안 새 요청을 발행했는지, histogram이 long tail을 보존하는지 먼저 확인한다.\n\n    ## 실전 시나리오\n    벤치마크 p99는 20ms인데 실제 사용자 p99는 2초다. 느린 응답을 기다리는 동안 요청을 만들지 않는 closed-loop 측정이 coordinated omission을 만든 경우다.\n\n    ## CS 배경\n    coordinated omission은 시스템이 느릴 때 측정자가 그 느림을 덜 샘플링하는 오류다. HDR Histogram은 넓은 값 범위의 latency distribution을 보존하지만 입력 샘플링이 틀리면 좋은 도구도 왜곡된 진실을 저장한다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - 측정 도구는 요청 도착 과정을 왜곡하지 않아야 한다\n- latency histogram은 긴 꼬리를 버리지 않아야 한다\n- JMH microbenchmark는 end-to-end queueing latency를 대표하지 않는다\n- p99는 sample count와 coordinated omission 보정 여부를 함께 표시한다\n\n    ## 판단 매트릭스\n    - micro method cost면 JMH\n- service latency면 open-loop/load generator\n- tail distribution이면 HDR Histogram\n- queueing 포함이면 arrival schedule 고정\n\n    ## 예시\n    ```text\n    closed loop: send next after response; open loop: send according to schedule even while previous request is slow\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    측정 품질이 낮으면 성능 개선은 숫자 장식이 된다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 injected pause, fixed arrival rate, closed-loop comparison, histogram precision, warmup/cold split를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. throughput, allocation, GC pause, measurement overhead, sample count를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. corrected p99, max latency, pause visibility, load generator scheduling jitter가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    corrected_p99_ms, uncorrected_p99_ms, coordinated_omission_gap, sample_count, load_generator_jitter_ms를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - JMH p99가 서비스 p99를 대표한다고 생각한다\n- 평균 latency가 낮으면 coordinated omission은 중요하지 않다고 본다\n- Histogram 도구가 좋으면 샘플링 오류도 자동으로 고쳐진다고 믿는다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    latency 측정은 histogram보다 먼저 요청 도착 모델을 바로 세워야 coordinated omission을 피할 수 있다.\n",
+  "body_markdown": "# Coordinated Omission, HdrHistogram, JMH Latency Measurement\n\n## 이 문서가 맡는 질문\n서비스 지연을 재려면 p99 숫자보다 먼저 요청이 언제 도착한다고 가정했는지 정해야 한다. coordinated omission은 시스템이 멈추거나 느려진 시간 동안 측정자가 새 요청을 덜 넣어서 긴 지연을 표본에서 빠뜨리는 오류다. HdrHistogram은 넓은 latency 범위와 percentile을 잘 보존하지만, 틀린 도착 모델로 들어온 샘플을 진실로 바꾸지는 못한다. JMH도 Java 17/21에서 microbenchmark를 안정적으로 돌리는 도구이지, 큐잉과 외부 트래픽이 있는 서비스 p99를 대신하는 도구가 아니다.\n\n## 빠른 분기\n단일 메서드 비용을 보고 싶으면 JMH를 쓴다. 사용자 요청의 end-to-end latency를 보고 싶으면 open-loop 또는 도착 스케줄이 고정된 load generator를 쓴다. closed-loop client가 응답을 받은 뒤 다음 요청을 보내는 구조라면 장애 구간의 요청 도착이 줄어들어 p99가 실제보다 낮게 보일 수 있다. histogram을 읽을 때는 uncorrected 값인지, expected interval로 보정한 값인지, sample count와 max가 충분한지 함께 적어야 한다.\n\n## 실전 시나리오\n서비스가 1초 동안 STW pause나 lock convoy 때문에 멈췄다고 하자. closed-loop 부하 생성기는 요청 하나가 1초 동안 막혀 있는 동안 다음 요청을 만들지 않는다. 그 결과 실제로는 10ms마다 요청이 왔어야 하는 시간대의 100개 지연이 표본에 들어오지 않고, histogram에는 1초짜리 샘플 하나만 남을 수 있다. 운영 대시보드 p99는 2초인데 벤치마크 p99는 20ms라면, 먼저 개선 코드를 의심하기보다 측정자가 느린 시간 동안 무엇을 샘플링했는지 확인해야 한다.\n\n## 측정 모델\nopen-loop 모델은 응답 완료와 무관하게 미리 정한 arrival schedule에 따라 요청을 보낸다. 이 모델은 서비스가 느려져도 대기열이 쌓이는 모습을 드러낸다. closed-loop 모델은 client concurrency를 일정하게 유지하기에는 유용하지만, 실제 사용자가 계속 들어오는 시스템의 도착률을 대표하지 못할 수 있다. fixed rate load, concurrency limited load, replay traffic은 서로 다른 질문에 답한다. 따라서 p99를 비교할 때는 요청 도착률, 동시성, queue 포함 여부, timeout 정책을 같이 적어야 한다.\n\n## HdrHistogram의 역할\nHdrHistogram은 큰 값 범위를 정해진 유효 자릿수로 저장하고 percentile을 빠르게 계산한다. `recordValueWithExpectedInterval` 같은 보정 API는 관측된 긴 지연 하나가 그 사이에 누락했을 법한 interval들을 histogram에 추가해 coordinated omission 영향을 완화한다. 하지만 이 보정은 expected interval 가정이 맞을 때만 의미가 있고, 실제 부하 생성기가 너무 느리거나 timeout으로 요청을 버린 경우를 자동 복구하지 않는다. 정답은 좋은 histogram 하나가 아니라 올바른 arrival model, 충분한 sample count, max latency 공개, 보정 여부 표시를 함께 두는 것이다.\n\n## JMH와 서비스 p99의 경계\nJMH는 warmup, fork, dead-code elimination 방지, JIT 안정화 같은 microbenchmark 함정을 줄여 준다. Java 17/21에서 특정 메서드의 allocation, branch, inlining 영향을 비교할 때는 좋은 선택이다. 그러나 JMH sample time의 percentile을 HTTP 서비스 p99로 읽으면 큐잉, thread pool 대기, GC pause, socket timeout, retry amplification이 빠진다. JMH 결과는 code path 후보를 좁히는 근거이고, 서비스 tail latency는 별도 부하 모델과 tracing으로 검증해야 한다.\n\n## 판단 매트릭스\n- method cost: JMH benchmark mode, warmup, fork, allocation profiler를 확인한다.\n- service latency: arrival schedule, concurrency, queue 포함 여부, timeout을 고정한다.\n- tail distribution: HdrHistogram의 significant digits, max, sample count를 공개한다.\n- coordinated omission 의심: closed-loop와 open-loop 결과, corrected와 uncorrected histogram을 나란히 본다.\n- Java runtime 영향: GC pause, safepoint, JIT warmup, thread pool saturation을 trace와 함께 본다.\n\n## 자주 하는 오해\n- JMH에서 낮은 p99가 나오면 서비스 p99도 낮다고 본다.\n- HdrHistogram을 쓰면 coordinated omission이 자동으로 사라진다고 믿는다.\n- 평균 latency가 좋아졌으니 tail 측정 오류는 무시해도 된다고 생각한다.\n- 부하 생성기 CPU가 바쁘거나 scheduler jitter가 큰데도 서버 지연으로만 해석한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 먼저 closed-loop인지 open-loop인지 말하고, 그다음 histogram이 어떤 샘플을 받았는지 설명해야 한다. p50, p95, p99, max, sample count, corrected p99, uncorrected p99를 나누고, JMH 결과를 서비스 latency로 확대 해석하지 않는다고 선을 긋는다. 마지막에는 injected pause, fixed arrival rate, trace span, GC/JFR event를 같이 보며 숫자가 실제 사용자 대기 시간을 대표하는지 검증한다고 말한다.\n\n## 한 줄 정리\ncoordinated omission을 피하려면 histogram 도구보다 먼저 요청 도착 모델과 누락된 대기 시간을 명시해야 한다.\n",
   "aliases": [
-    "Coordinated Omission Hdrhistogram JMH Latency Measurement",
-    "coordinated omission HDR Histogram JMH latency measurement open loop closed loop p99 benchmark quality",
-    "coordinated omission 때문에 p99 latency 측정이 왜 틀어질 수 있어?"
+    "coordinated omission p99 왜곡",
+    "HdrHistogram latency 보정",
+    "JMH 서비스 지연 함정",
+    "closed loop 측정 오류",
+    "open loop latency 측정",
+    "느린 응답이 누락되는 측정",
+    "p99가 실제보다 낮게 나와요",
+    "히스토그램만으로 지연을 믿어도 돼"
   ],
   "expected_queries": [
-    "coordinated omission 때문에 p99 latency 측정이 왜 틀어질 수 있어?",
-    "coordinated omission HDR Histogram JMH latency measurement open loop closed loop p99 benchmark quality",
-    "latency 측정은 histogram보다 먼저 요청 도착 모델을 바로 세워야 coordinated omission을 피할 수 있다."
+    "부하 테스트 p99가 운영 p99보다 낮게 나오는 이유가 뭐야?",
+    "coordinated omission이 latency histogram을 어떻게 왜곡해?",
+    "JMH로 측정한 지연 시간을 서비스 p99로 봐도 돼?",
+    "closed loop 부하 생성기에서 느린 응답이 왜 누락돼?",
+    "HdrHistogram corrected histogram은 언제 써야 해?"
   ],
   "symptoms": [
     "corrected_p99_ms",
@@ -49,11 +56,15 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-27",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
         "source": "y14-batch7"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

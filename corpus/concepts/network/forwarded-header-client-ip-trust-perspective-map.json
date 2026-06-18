@@ -4,20 +4,25 @@
   "category": "network",
   "level": "advanced",
   "summary": "X-Forwarded-For, Forwarded, X-Real-IP, Proxy Protocol을 trust boundary 관점으로 판단하는 network/security perspective map",
-  "body_markdown": "# Forwarded Header, Client IP, Trust Boundary Perspective Map\n\n## 이 문서가 맡는 질문\nclient IP는 헤더 하나를 읽으면 끝나는 값이 아니다. 어느 proxy가 신뢰 경계 안에 있는지, 외부 client가 spoof한 header를 어디서 제거하는지 정해야 한다.\n\n## 빠른 분기\n단일 reverse proxy면 그 proxy가 덮어쓴 header, 다중 proxy면 trusted hop chain, L4 passthrough면 Proxy Protocol을 본다.\n\n## 실전 시나리오\nrate limit을 X-Forwarded-For 첫 번째 값으로 했는데 외부 사용자가 header를 직접 조작하면 다른 IP로 우회할 수 있다. edge proxy가 외부 header를 drop하고 새로 설정해야 한다.\n\n## CS 배경\nForwarded header는 application-layer metadata이고 spoof 가능하다. Proxy Protocol은 L4에서 original peer 정보를 전달하지만 양 끝이 명시적으로 지원해야 한다. Trust boundary는 어떤 hop의 metadata를 신뢰할지 정하는 보안 결정이다.\n\n## header 정규화 예시\n```nginx\n# edge trust boundary: do not preserve client-supplied X-Forwarded-*.\nproxy_set_header X-Forwarded-For $remote_addr;\nproxy_set_header X-Real-IP $remote_addr;\nproxy_set_header Forwarded \"for=$remote_addr;proto=$scheme;host=$host\";\n```\n\ntrusted internal proxy hop에서만 기존 trusted chain에 append한다. edge에서 기존 XFF chain에 append하는 helper를 그대로 쓰면 client가 보낸 spoofed XFF가 chain 앞에 보존될 수 있다.\napplication은 trusted proxy CIDR에서 온 요청의 header만 해석해야 한다. 직접 app으로 들어온 요청의 XFF는 무시한다.\n\n## 깊게 볼 포인트\nclient IP는 감사, rate limit, geo routing, security alert에 쓰이므로 잘못 믿으면 우회나 오탐이 생긴다. 개인정보 로그 정책도 함께 봐야 한다.\n\n## 다음 행동\n1. trusted proxy hop과 CIDR을 문서화한다\n2. edge에서 incoming forwarded header를 제거한다\n3. app에서 trusted source일 때만 파싱한다\n4. rate limit key와 audit log를 테스트한다\n\n## 확인 질문\n이 header는 신뢰된 proxy가 쓴 것인가, 아니면 외부 client가 마음대로 넣은 값인가?\n\n## 추가 실전 포인트\nX-Forwarded-For chain은 보통 `client, proxy1, proxy2`처럼 누적되지만, 신뢰할 수 있는 것은 trusted proxy가 추가한 부분뿐이다. application은 오른쪽부터 trusted proxy CIDR을 제거하며 처음 만나는 untrusted hop을 client 후보로 삼는 식의 명시적 알고리즘을 가져야 한다. edge를 우회해 app에 직접 접근할 수 있다면 그 요청의 forwarded header는 모두 버려야 한다.\n\n## 판단 매트릭스\n- X-Forwarded-For: chain이지만 spoof 가능하므로 trusted hop 계산이 필요하다\n- X-Real-IP: 단일 값이라 단순하지만 chain 정보가 없다\n- Proxy Protocol: L4 original peer 전달이지만 endpoint 지원이 필요하다\n- 리뷰 질문: 직접 app 접근 경로가 forwarded header 신뢰를 우회하지 않는가\n\n## 측정 지표와 레이턴시\nspoof attempt block rate, unknown proxy count, rate-limit bypass test, header parse error, auth/rate-limit filter p95를 본다. 품질은 우회 차단, 성능은 parse overhead, 레이턴시는 보안 필터 p95로 판단한다.\n\n## 자주 하는 오해\n- XFF 첫 값이 항상 진짜 client라고 본다\n- proxy가 많을수록 header를 더 믿어도 된다고 생각한다\n- client IP를 개인정보/보안 데이터로 다루지 않는다\n\n이 오해를 줄이려면 먼저 실패 모드와 관찰 증거를 나누고, 그 다음 용어를 붙인다. 같은 현상이 자료구조, 런타임, 네트워크, 운영 지표에서 다르게 보일 수 있으므로 code path와 runtime signal을 함께 확인한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 forwarded header와 trust boundary를 먼저 나누고, trusted proxy list와 spoof 방어를 설명해야 한다. 마지막에는 bypass test, unknown proxy, filter p95로 검증한다고 말한다.\n\n## 실전 검증 루프\n1. direct-to-app 요청에 spoofed XFF를 넣어 테스트한다\n2. trusted proxy CIDR 밖 header를 무시한다\n3. multi-hop chain parsing fixture를 만든다\n4. rate limit key 우회 테스트를 둔다\n5. 로그 PII retention을 확인한다\n\n이 루프를 지키면 Forwarded Header, Client IP, Trust Boundary Perspective Map 문서는 단순 정의 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nX-Forwarded-For, Forwarded, X-Real-IP, Proxy Protocol을 trust boundary 관점으로 판단하는 network/security perspective map\n\n## 품질 관점\n프로토콜 상태, timeout, retry, 중간 장비, client/server 관측값을 분리해 같은 증상을 재현한다. 이 문서의 답변 품질은 `Forwarded Header, Client IP, Trust Boundary Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p99_ms, retransmit_or_retry_count, timeout_count, connection_reuse_ratio`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# Forwarded Header, Client IP, Trust Boundary Perspective Map\n\n## 이 문서가 맡는 질문\n\n클라이언트 IP는 `X-Forwarded-For` 첫 값을 읽으면 끝나는 값이 아니다. Forwarded 계열 header는 HTTP 요청 안의 값이므로 인터넷 클라이언트가 직접 넣을 수 있다. 안전한 설계는 \"어느 proxy가 이 값을 새로 쓰거나 append할 권한이 있는가\"를 먼저 정하고, 그 신뢰 경계 밖에서 온 header는 버리는 것이다.\n\n## 빠른 분기\n\n- edge proxy가 하나라면 외부에서 온 forwarded header를 제거하고 edge가 본 remote address로 새 값을 만든다.\n- proxy가 여러 겹이면 trusted hop 목록과 CIDR을 두고 오른쪽에서부터 신뢰된 proxy를 제거하며 client 후보를 계산한다.\n- L4 passthrough나 TCP proxy에서 원본 주소가 필요하면 HTTP header가 아니라 Proxy Protocol 지원 여부와 네트워크 접근 경계를 본다.\n- rate limit, audit, allowlist에 IP를 쓴다면 spoofed header를 넣은 direct-to-app 요청으로 우회 테스트를 해야 한다.\n\n## 핵심 mental model\n\n`X-Forwarded-For`는 보통 `client, proxy1, proxy2`처럼 누적된다. 하지만 체인 전체가 진실이라는 뜻은 아니다. 신뢰할 수 있는 것은 내가 관리하는 proxy가 추가한 부분뿐이다. 애플리케이션이 trusted proxy에서 온 요청인지 확인하지 않고 header를 파싱하면, 공격자는 `X-Forwarded-For: 127.0.0.1` 또는 허용된 사내 IP를 직접 넣어 rate limit과 allowlist를 우회할 수 있다.\n\n`X-Real-IP`는 단일 값이라 단순하지만 chain 정보를 잃는다. 표준 `Forwarded` header는 `for`, `proto`, `host`를 구조화하지만 여전히 HTTP header라 spoof 가능하다. Proxy Protocol은 TCP 연결 시작 부분에서 LB가 원본 peer 정보를 전달하는 방식이라 HTTP header spoofing과 다른 경계에 있지만, listener가 Proxy Protocol을 기대하고 있고 외부가 그 listener에 직접 붙을 수 없을 때만 안전하다.\n\n## 구현 기준\n\nedge에서는 client가 보낸 forwarded 계열 header를 보존하지 않는 것이 기본이다. 내부 proxy가 여러 개라면 append 규칙을 문서화하고, 애플리케이션에는 trusted proxy CIDR 또는 mTLS로 식별된 proxy에서 온 요청만 해석하게 한다. app을 직접 호출할 수 있는 네트워크 경로가 남아 있다면 그 요청의 forwarded header는 모두 무시해야 한다.\n\n파싱 알고리즘은 배포 토폴로지와 같이 고정한다. 예를 들어 오른쪽 끝 hop이 내 edge proxy이고 그 앞 hop도 내가 관리하는 internal proxy라면 오른쪽부터 trusted hop을 제거한다. 제거 후 처음 만나는 untrusted 주소가 client 후보가 된다. 이 규칙은 cloud LB, ingress controller, service mesh sidecar가 추가될 때마다 다시 검증해야 한다.\n\n## 관측 증거\n\n- access log에는 raw header 전체보다 normalized client IP, matched trusted proxy, reject reason을 남긴다.\n- rate limit key가 normalized IP를 쓰는지, user/account key와 함께 쓰는지 확인한다.\n- unknown proxy hop, private/reserved address in external header, malformed Forwarded value를 별도 metric으로 둔다.\n- direct-to-app 경로, bypassed edge, 잘못된 CIDR 설정은 보안 테스트로 재현한다.\n- 개인정보 관점에서는 client IP retention, masking, audit 접근 권한도 함께 정한다.\n\n## 답변에서 피할 단정\n\n\"XFF 첫 값이 진짜 client\"라는 규칙은 단일 edge가 외부 header를 확실히 제거한다는 전제가 있을 때만 의미가 있다. \"프록시가 많으니 더 믿을 수 있다\"도 틀리다. proxy가 늘수록 신뢰 경계와 append 규칙이 더 중요해진다.\n\n좋은 답변은 client IP 추출을 보안 결정으로 다룬다. edge에서 header를 정규화하고, app은 trusted source에서 온 header만 파싱하며, rate limit과 audit log는 spoof 시나리오로 검증한다고 말해야 한다.\n\n## 경계 사례\n\nCDN, cloud LB, ingress, service mesh가 함께 있으면 \"마지막 proxy 하나\"만 믿는 규칙으로 부족하다. CDN이 이미 `X-Forwarded-For`를 append했고 cloud LB가 다시 append하며 ingress가 `X-Real-IP`를 덮어쓰는 식으로 값이 섞일 수 있다. 이때는 제품별 기본 동작을 문서화하고, 실제 request를 한 번 통과시켜 hop별로 어떤 header가 추가/삭제되는지 확인한다.\n\n내부 batch나 health check가 private IP로 직접 app을 호출하는 경로도 주의해야 한다. 이 경로에서 forwarded header를 그대로 믿으면 외부 공격이 아니어도 audit log와 rate limit key가 왜곡된다. 내부 호출은 별도 allowlist와 service identity를 쓰고, 사용자 client IP와 섞지 않는 편이 안전하다.",
   "aliases": [
-    "X-Forwarded-For trust boundary",
-    "Forwarded header client IP spoofing",
-    "Proxy Protocol X-Real-IP",
-    "client IP rate limit",
-    "Forwarded Header, Client IP, Trust Boundary Perspective Map",
-    "forwarded header client ip trust perspective map",
-    "X-Forwarded-For trust boundary Forwarded header client IP spoofing Proxy Protocol X-Real-IP"
+    "X-Forwarded-For 신뢰 경계",
+    "Forwarded header 위조",
+    "클라이언트 IP 추출 기준",
+    "trusted proxy CIDR",
+    "X-Real-IP 믿어도 되나",
+    "Proxy Protocol 원본 IP",
+    "프록시 뒤 실제 IP",
+    "rate limit IP 우회",
+    "다중 프록시 header chain",
+    "직접 app 접근 차단"
   ],
   "expected_queries": [
-    "X-Forwarded-For에서 진짜 client IP를 어떻게 믿어?",
-    "client IP 기반 rate limit이 proxy 뒤에서 안전하려면?",
-    "Forwarded header로 client IP를 읽을 때 trust boundary와 spoofing을 어떻게 막아?"
+    "X-Forwarded-For에서 진짜 client IP를 그냥 첫 번째 값으로 믿으면 왜 위험해?",
+    "trusted proxy 뒤에서 client IP를 뽑을 때 Forwarded header 체인을 어떻게 검증해?",
+    "X-Real-IP와 Proxy Protocol은 어떤 환경에서 쓰고 어디까지 신뢰해야 해?",
+    "rate limit을 client IP 기준으로 걸 때 프록시 헤더 위조를 어떻게 막아?",
+    "로드밸런서가 여러 겹일 때 원본 IP를 로그에 남기는 안전한 기준은 뭐야?"
   ],
   "symptoms": [
     "XFF 첫 값이 항상 진짜 client라고 본다",
@@ -58,7 +63,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -71,6 +76,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

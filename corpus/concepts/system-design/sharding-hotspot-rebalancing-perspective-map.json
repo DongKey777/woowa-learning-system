@@ -4,20 +4,24 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "shard key, hotspot, resharding, tenant rebalancing을 데이터 분산 관점으로 판단하는 system design perspective map",
-  "body_markdown": "# Sharding, Hotspot, Rebalancing Perspective Map\n\n## 이 문서가 맡는 질문\nsharding은 데이터를 나누는 것보다 어떤 key로 부하와 성장을 나눌지 정하는 문제다. 잘못된 shard key는 hotspot과 rebalancing 비용을 만든다.\n\n## 빠른 분기\n특정 tenant/key가 몰리면 hotspot, shard가 커지면 rebalancing, range key가 단조 증가하면 insert hotspot, query가 cross-shard면 access pattern을 본다.\n\n## 실전 시나리오\ntenant_id로 shard했는데 한 대형 tenant가 전체 트래픽의 40%를 차지하면 한 shard가 병목이 된다. tenant split이나 virtual shard, dedicated shard가 필요할 수 있다.\n\n## CS 배경\nSharding은 horizontal partitioning이다. Consistent hashing, range partition, directory-based routing은 movement와 query locality trade-off가 다르다. Rebalancing은 data movement와 dual-write/read consistency를 요구한다.\n\n## routing table 예시\n```json\n{\"tenant-a\":\"shard-01\",\"tenant-big\":\"shard-09-dedicated\",\"tenant-c\":\"shard-02\"}\n```\ndirectory routing은 유연하지만 routing table consistency와 cache invalidation이 필요하다.\n\n## 깊게 볼 포인트\nshard key는 query pattern, transaction boundary, growth skew를 함께 봐야 한다. rebalancing은 online migration이므로 cutover와 rollback window가 필요하다.\n\n## 다음 행동\n1. key distribution과 top tenant를 측정한다\n2. query locality와 cross-shard 비율을 본다\n3. virtual shard/directory routing을 검토한다\n4. rebalancing migration plan을 만든다\n\n## 확인 질문\n이 shard key는 데이터 양뿐 아니라 QPS와 hot tenant skew까지 분산하는가?\n\n## 추가 실전 포인트\nRebalancing은 routing metadata 변경과 data movement가 동시에 일어나는 작업이다. 안전한 절차는 새 shard로 backfill, dual-write 또는 change capture로 delta 동기화, shadow read 검증, routing cutover, old shard drain 순서가 된다. 이 동안 tenant별 p99와 cross-shard query 비율을 따로 봐야 migration이 전체 평균 뒤에 숨지 않는다.\n\n## 추가 실전 포인트\nRebalancing 검증은 row count만으로 부족하다. shard별 checksum, sample shadow read, dual-read mismatch count, high-watermark lag를 함께 본다. 특히 tenant 단위 이동에서는 이동 중 write가 누락되지 않도록 CDC delta나 write fence를 두고, cutover 후 old shard를 바로 지우지 말고 rollback window를 남긴다.\n\n## 판단 매트릭스\n- Hash sharding: 균등 분산은 좋지만 range query가 어렵다\n- Range sharding: range query는 좋지만 hot range가 생긴다\n- Directory routing: 유연하지만 metadata consistency가 필요하다\n- 리뷰 질문: rebalancing 중 read/write correctness가 보장되는가\n\n## 측정 지표와 레이턴시\nper-shard QPS, storage skew, hot key p99, cross-shard query count, rebalance throughput, migration lag를 본다. 품질은 routing correctness, 성능은 균등 부하, 레이턴시는 hot shard p99와 migration 중 tail로 판단한다.\n\n## 자주 하는 오해\n- shard 수를 늘리면 hotspot이 자동 해결된다고 본다\n- 데이터 크기만 보고 QPS skew를 놓친다\n- rebalancing을 단순 copy 작업으로 본다\n\n이 오해를 줄이려면 먼저 실패 모드와 관찰 증거를 나누고, 그 다음 용어를 붙인다. 같은 현상이 자료구조, 런타임, 네트워크, 운영 지표에서 다르게 보일 수 있으므로 code path와 runtime signal을 함께 확인한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 shard key, hotspot, routing, rebalancing을 분리해야 한다. 마지막에는 per-shard QPS, skew, migration lag, p99로 품질/성능/레이턴시를 검증한다고 말한다.\n\n## 실전 검증 루프\n1. key distribution histogram을 만든다\n2. top tenant QPS와 storage를 분리해 본다\n3. virtual shard 시뮬레이션을 한다\n4. online rebalance dual-read/write를 테스트한다\n5. migration 중 p99와 오류율을 기록한다\n\n이 루프를 지키면 Sharding, Hotspot, Rebalancing Perspective Map 문서는 단순 정의 카드가 아니라 실제 증상을 CS 개념, 구현 경계, 운영 지표로 연결하는 학습 도구가 된다.\n\n## 한 줄 정리\nshard key, hotspot, resharding, tenant rebalancing을 데이터 분산 관점으로 판단하는 system design perspective map\n\n## 품질 관점\n시스템 설계 품질은 SLO, failure mode, capacity, recovery를 같은 시나리오에서 검증한다. 이 문서의 답변 품질은 `Sharding, Hotspot, Rebalancing Perspective Map`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`slo_burn_rate, saturation_pct, recovery_time_ms, p99_latency_ms`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# Sharding, Hotspot, Rebalancing Perspective Map\n\n## 이 문서가 맡는 질문\n\nSharding은 데이터를 여러 곳에 나누는 기술보다, 어떤 축으로 성장과 부하를 나눌지 정하는 운영 설계다. 좋은 shard key는 저장량, QPS, query locality, transaction boundary, tenant skew를 함께 분산한다. 데이터 양만 균등해도 특정 tenant나 key가 traffic 대부분을 만들면 한 shard의 p99가 전체 서비스 p99가 된다.\n\n이 문서는 shard key 선택, hotspot 식별, online rebalancing 절차를 한 지도에서 본다. 면접이나 리뷰에서는 \"shard 수를 늘린다\"보다 어떤 skew를 봤고, 어떤 routing과 migration으로 안전하게 옮길지 설명해야 한다.\n\n## 10초 분기\n\n| 증상 | 먼저 볼 축 | 가능한 대응 |\n|---|---|---|\n| 한 tenant가 QPS 대부분을 차지함 | tenant skew, hot partition | tenant split, dedicated shard, virtual shard |\n| id가 단조 증가하며 한 range에 몰림 | range insert hotspot | hash suffix, time bucket, range split |\n| cross-shard join이 늘어남 | query locality | read model, denormalization, routing key 재검토 |\n| shard별 저장량만 불균형 | storage skew | split/merge, virtual shard 재배치 |\n| migration 중 mismatch 발생 | routing과 write 동기화 | write fence, CDC delta, shadow read, rollback window |\n\n## shard key 판단 기준\n\nShard key는 write path와 read path를 동시에 본다. `tenant_id`는 tenant 단위 조회와 권한 경계가 명확할 때 좋지만, 대형 tenant 하나가 전체 트래픽을 만들면 hot shard가 된다. `user_id` hash는 균등 분산에 유리하지만 tenant 단위 집계나 관리자 조회가 cross-shard가 될 수 있다. 시간 range key는 최근 데이터 조회에 좋지만 최신 range가 insert hotspot이 되기 쉽다.\n\nHash sharding은 균등 분산이 쉽지만 range query와 locality가 약하다. Range sharding은 범위 조회가 좋지만 hot range가 생긴다. Directory routing은 tenant나 virtual shard를 유연하게 옮길 수 있지만 routing table consistency, cache invalidation, control plane 장애가 새 failure mode가 된다.\n\n## hotspot을 증거로 분리하기\n\nHotspot은 평균 QPS로 잘 보이지 않는다. per-shard QPS, top key QPS, tenant별 p99, storage skew, connection pool wait, lock wait를 같은 시간축에서 본다. 한 shard의 CPU가 높아도 원인이 큰 tenant인지, hot row인지, range insert인지, cross-shard fanout인지에 따라 해결책이 다르다.\n\nShard를 더 많이 만드는 것만으로 hot key가 자동 분산되지는 않는다. key 하나가 모든 요청을 받으면 hash ring 위의 한 지점이 계속 뜨겁다. 이때는 key 자체를 쪼갤 수 있는지, tenant를 dedicated shard로 빼야 하는지, write aggregation을 분산해야 하는지, read cache나 queue로 흡수할 수 있는지를 따로 본다.\n\n## online rebalancing 절차\n\n안전한 rebalancing은 copy 작업이 아니라 routing metadata와 write consistency를 함께 바꾸는 작업이다.\n\n1. 이동할 tenant/key range와 source of truth를 고정한다.\n2. 새 shard를 만들고 snapshot backfill을 수행한다.\n3. CDC나 dual-write로 backfill 이후 delta를 따라잡는다.\n4. shadow read, checksum, row count, high-watermark lag로 검증한다.\n5. cutover 직전에 write fence 또는 짧은 drain으로 마지막 delta를 닫는다.\n6. routing table을 versioned update로 바꾸고 client cache를 무효화한다.\n7. old shard는 즉시 삭제하지 않고 rollback window 동안 read-only 또는 drain 상태로 둔다.\n\n이 과정에서 routing table이 여러 client cache에 퍼져 있으면 split-brain routing이 생길 수 있다. routing version, TTL, control plane audit, emergency rollback path가 필요하다.\n\n## migration 검증 지표\n\n- shard별 QPS, storage, CPU, connection pool saturation\n- top tenant/key p95/p99 latency와 error rate\n- cross-shard query count, fanout width, scatter-gather timeout\n- backfill throughput, CDC lag, high-watermark lag\n- shadow read mismatch, checksum mismatch, duplicate/missing row count\n- routing cache stale hit, cutover rollback count, old shard residual traffic\n\nRow count만 맞는다고 충분하지 않다. 이동 중 write가 빠졌는지, 같은 key가 양쪽에 쓰였는지, cutover 후 stale routing이 남았는지를 별도 지표로 봐야 한다.\n\n## 흔한 오답\n\nShard key를 데이터 크기만 보고 고르면 QPS skew와 transaction boundary를 놓친다. Rebalancing을 `copy 후 switch`로만 말하면 이동 중 write, client routing cache, rollback window가 빠진다. Cross-shard query 비용을 무시하면 shard는 늘었는데 query latency와 장애 범위가 커질 수 있다.\n\n## 답변 골격\n\n\"먼저 shard key 후보를 storage뿐 아니라 QPS, top tenant skew, query locality, transaction boundary로 비교합니다. Hotspot이 생기면 shard 수를 늘리기 전에 hot tenant인지, hot range인지, hot row인지 증거를 나눕니다. 대응은 virtual shard, directory routing, tenant split, dedicated shard, read model 등을 고르고, online rebalancing은 backfill, CDC delta, shadow read, checksum, write fence, versioned routing cutover, rollback window 순서로 설계합니다. 운영 지표는 per-shard QPS/storage, top key p99, cross-shard query count, migration lag, mismatch count를 봅니다.\"\n",
   "aliases": [
-    "sharding hotspot rebalancing",
-    "shard key tenant hotspot",
-    "virtual shard directory routing",
-    "resharding migration",
-    "Sharding, Hotspot, Rebalancing Perspective Map",
-    "sharding hotspot rebalancing perspective map",
-    "sharding hotspot rebalancing shard key tenant hotspot virtual shard directory routing"
+    "shard key hotspot 분산",
+    "hot tenant 재분산",
+    "virtual shard routing",
+    "온라인 shard rebalancing",
+    "tenant split dedicated shard",
+    "range shard insert hotspot",
+    "directory routing consistency",
+    "샤딩 키 고르는 기준",
+    "shard migration 검증"
   ],
   "expected_queries": [
-    "shard key는 데이터 양만 보고 정하면 돼?",
-    "hot tenant 때문에 한 shard만 느릴 때 어떻게 재분산해?",
-    "sharding에서 hotspot과 rebalancing, latency를 어떻게 설계해?"
+    "샤딩 키를 데이터 크기 말고 무엇으로 골라야 해?",
+    "hot tenant 하나가 shard를 독점하면 어떻게 나눠?",
+    "online rebalancing 중 write 누락을 어떻게 막아?",
+    "virtual shard랑 directory routing은 언제 써?",
+    "range sharding에서 insert hotspot이 생기면 어떻게 해?"
   ],
   "symptoms": [
     "shard 수를 늘리면 hotspot이 자동 해결된다고 본다",
@@ -58,7 +62,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -71,6 +75,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

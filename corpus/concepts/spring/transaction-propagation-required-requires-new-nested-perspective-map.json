@@ -4,28 +4,23 @@
   "category": "spring",
   "level": "intermediate",
   "summary": "Spring transaction propagation을 REQUIRED, REQUIRES_NEW, NESTED, rollback-only, connection pool 관점으로 나누는 문서다. 전파는 transaction이 이미 있을 때 합류할지, 새로 만들지, savepoint를 만들지 정하는 규칙이다. REQUIRED, REQUIRES_NEW, NESTED는 이름보다 물리 경계와 rollback 의미가 중요하다.",
-  "body_markdown": "# Spring Transaction Propagation Perspective Map - REQUIRED, REQUIRES_NEW, NESTED\n\n## 이 문서가 맡는 질문\n전파는 transaction이 이미 있을 때 합류할지, 새로 만들지, savepoint를 만들지 정하는 규칙이다. REQUIRED, REQUIRES_NEW, NESTED는 이름보다 물리 경계와 rollback 의미가 중요하다.\n\n## 빠른 분기\n같은 invariant를 함께 commit/rollback해야 하면 REQUIRED를 본다. 감사 로그처럼 독립 commit이 필요하면 REQUIRES_NEW를 본다. 부분 rollback이면 NESTED와 savepoint 지원을 본다.\n\n## 실전 시나리오\n주문 저장 중 감사 로그는 남기고 주문은 rollback해야 한다면 audit service를 REQUIRES_NEW로 분리할 수 있다. 하지만 outer transaction이 connection을 잡은 상태에서 inner transaction이 또 connection을 요구하므로 pool 여유가 필요하다.\n\n## CS 배경\nTransaction propagation은 logical transaction scope와 physical resource binding을 다룬다. REQUIRED는 기존 transaction에 참여한다. REQUIRES_NEW는 outer를 suspend하고 새 transaction/connection을 연다. NESTED는 savepoint로 같은 physical transaction 안의 부분 rollback을 시도한다.\n\n## 깊게 볼 포인트\n예외를 catch해도 rollback-only marker가 찍히면 outer commit 때 UnexpectedRollbackException이 날 수 있다. REQUIRES_NEW는 정합성 경계를 쪼개므로 같은 invariant를 나누면 위험하다. NESTED는 JDBC savepoint와 transaction manager 지원이 필요하다.\n\n## 다음 행동\n1. 함께 실패해야 하는 data invariant를 먼저 적는다. 2. 독립 commit이 필요한 side effect인지 구분한다. 3. connection pool 여유와 nested 지원 여부를 확인한다. 4. rollback-only 재현 테스트를 둔다.\n\n## 확인 질문\n이 내부 작업은 바깥 transaction과 운명을 같이해야 하는가, 바깥 실패와 무관하게 남아야 하는가, 아니면 savepoint로 일부만 되돌리면 되는가?\n\n## 추가 예시\n결제 승인 후 outbox 저장은 같은 transaction이어야 할 수 있다. 반면 audit log는 독립 commit을 택할 수 있다. 둘을 모두 REQUIRES_NEW로 처리하면 부분 커밋 추적이 어려워진다.\n\n## 실패 코드 예시\n```java\n@Transactional\npublic void outer() {\n    this.innerRequiresNew(); // self-invocation: proxy를 거치지 않을 수 있다\n}\n\n@Transactional(propagation = Propagation.REQUIRES_NEW)\npublic void innerRequiresNew() { ... }\n```\nSpring transaction은 보통 proxy 기반이므로 같은 객체 내부 호출은 annotation 기대와 다르게 동작할 수 있다. 전파 문제를 검증할 때는 별도 bean을 통해 호출하고, 실제 connection acquire와 rollback-only 상태를 로그로 확인해야 한다.\n\n## 판단 매트릭스\n- REQUIRED 근거: 같은 business invariant를 하나의 physical transaction으로 묶어야 하는지 본다.\n- REQUIRES_NEW 근거: 독립 commit이 필요하지만 추가 connection과 partial commit 위험을 감당할 수 있는지 확인한다.\n- NESTED 근거: JDBC savepoint와 transaction manager가 지원하고 같은 physical transaction 안 부분 rollback이면 고려한다.\n- 리뷰 질문: propagation 문제를 isolation level, proxy/self-invocation, exception rollback 규칙과 혼동하지 않는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 transaction duration, connection acquire latency, rollback-only count, UnexpectedRollbackException count이다. REQUIRES_NEW는 inner transaction을 위해 추가 connection을 요구할 수 있다. 그래서 p95 transaction duration과 pool acquire latency를 함께 본다. \n\n## 자주 하는 오해\n- 전파 옵션을 단순히 annotation 이름으로 외운다\n- REQUIRES_NEW가 항상 안전한 분리라고 생각한다\n- NESTED가 모든 JPA 환경에서 동일하게 된다고 믿는다\n이 오해를 줄이려면 annotation 이름보다 logical scope와 physical resource binding을 분리한다. self-invocation이면 proxy가 적용되지 않을 수 있고, checked exception은 기본 rollback 대상이 아니라는 점도 함께 봐야 한다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 내부 작업이 outer transaction과 같은 invariant인지 독립 side effect인지 분류한다. 그 다음 REQUIRED, REQUIRES_NEW, NESTED의 physical connection, rollback-only, savepoint 의미를 설명한다. 마지막에는 데이터 품질, connection pool 성능, transaction duration과 acquire latency를 지표로 붙인다.\n\n## 실전 검증 루프\n1. outer/inner service 호출을 실제 Spring bean proxy 경유로 재현한다.\n2. RuntimeException, checked exception, catch 후 rollback-only 상황을 각각 테스트한다.\n3. REQUIRES_NEW에서 pool size가 부족할 때 acquire latency와 deadlock 위험을 확인한다.\n4. NESTED는 사용하는 transaction manager와 DB가 savepoint를 지원하는지 검증한다.\n5. transaction duration p95, connection acquire p95, UnexpectedRollbackException count를 기록한다.\n\n이 루프를 지키면 transaction propagation 문서는 옵션 암기가 아니라 commit boundary와 resource binding을 배우는 자료가 된다.\n\n## 품질 관점\n프레임워크 annotation 존재보다 실제 proxy/filter/transaction/runtime boundary를 통합 테스트로 확인한다. 이 문서의 답변 품질은 `Spring Transaction Propagation Perspective Map - REQUIRED, REQUIRES_NEW, NESTED`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p95_ms, advisor_or_filter_order, transaction_duration_ms, error_mapping_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
+  "body_markdown": "# Spring Transaction Propagation Perspective Map - REQUIRED, REQUIRES_NEW, NESTED\n\n## 이 문서가 맡는 질문\n전파는 transaction이 이미 있을 때 합류할지, 새로 만들지, savepoint를 만들지 정하는 규칙이다. REQUIRED, REQUIRES_NEW, NESTED는 이름보다 물리 경계와 rollback 의미가 중요하다.\n\n## 빠른 분기\n같은 invariant를 함께 commit/rollback해야 하면 REQUIRED를 본다. 감사 로그처럼 독립 commit이 필요하면 REQUIRES_NEW를 본다. 부분 rollback이면 NESTED와 savepoint 지원을 본다.\n\n## 실전 시나리오\n주문 저장 중 감사 로그는 남기고 주문은 rollback해야 한다면 audit service를 REQUIRES_NEW로 분리할 수 있다. 하지만 outer transaction이 connection을 잡은 상태에서 inner transaction이 또 connection을 요구하므로 pool 여유가 필요하다.\n\n## CS 배경\nTransaction propagation은 logical transaction scope와 physical resource binding을 다룬다. REQUIRED는 기존 transaction에 참여한다. REQUIRES_NEW는 outer를 suspend하고 새 transaction/connection을 연다. NESTED는 savepoint로 같은 physical transaction 안의 부분 rollback을 시도한다.\n\n## 깊게 볼 포인트\n예외를 catch해도 rollback-only marker가 찍히면 outer commit 때 UnexpectedRollbackException이 날 수 있다. REQUIRES_NEW는 정합성 경계를 쪼개므로 같은 invariant를 나누면 위험하다. NESTED는 JDBC savepoint와 transaction manager 지원이 필요하다.\n\n## 다음 행동\n1. 함께 실패해야 하는 data invariant를 먼저 적는다. 2. 독립 commit이 필요한 side effect인지 구분한다. 3. connection pool 여유와 nested 지원 여부를 확인한다. 4. rollback-only 재현 테스트를 둔다.\n\n## 확인 질문\n이 내부 작업은 바깥 transaction과 운명을 같이해야 하는가, 바깥 실패와 무관하게 남아야 하는가, 아니면 savepoint로 일부만 되돌리면 되는가?\n\n## 추가 예시\n결제 승인 후 outbox 저장은 같은 transaction이어야 할 수 있다. 반면 audit log는 독립 commit을 택할 수 있다. 둘을 모두 REQUIRES_NEW로 처리하면 부분 커밋 추적이 어려워진다.\n\n## 실패 코드 예시\n```java\n@Transactional\npublic void outer() {\n    this.innerRequiresNew(); // self-invocation: proxy를 거치지 않을 수 있다\n}\n\n@Transactional(propagation = Propagation.REQUIRES_NEW)\npublic void innerRequiresNew() { ... }\n```\nSpring transaction은 보통 proxy 기반이므로 같은 객체 내부 호출은 annotation 기대와 다르게 동작할 수 있다. 전파 문제를 검증할 때는 별도 bean을 통해 호출하고, 실제 connection acquire와 rollback-only 상태를 로그로 확인해야 한다.\n\n## 판단 매트릭스\n- REQUIRED 근거: 같은 business invariant를 하나의 physical transaction으로 묶어야 하는지 본다.\n- REQUIRES_NEW 근거: 독립 commit이 필요하지만 추가 connection과 partial commit 위험을 감당할 수 있는지 확인한다.\n- NESTED 근거: JDBC savepoint와 transaction manager가 지원하고 같은 physical transaction 안 부분 rollback이면 고려한다.\n- 리뷰 질문: propagation 문제를 isolation level, proxy/self-invocation, exception rollback 규칙과 혼동하지 않는가?\n\n## 측정 지표와 레이턴시\n핵심 지표는 transaction duration, connection acquire latency, rollback-only count, UnexpectedRollbackException count이다. REQUIRES_NEW는 inner transaction을 위해 추가 connection을 요구할 수 있다. 그래서 p95 transaction duration과 pool acquire latency를 함께 본다. \n\n## 자주 하는 오해\n- 전파 옵션을 단순히 annotation 이름으로 외운다\n- REQUIRES_NEW가 항상 안전한 분리라고 생각한다\n- NESTED가 모든 JPA 환경에서 동일하게 된다고 믿는다\n이 오해를 줄이려면 annotation 이름보다 logical scope와 physical resource binding을 분리한다. self-invocation이면 proxy가 적용되지 않을 수 있고, checked exception은 기본 rollback 대상이 아니라는 점도 함께 봐야 한다.\n\n## 학습자가 답변에 포함해야 할 구조\n먼저 내부 작업이 outer transaction과 같은 invariant인지 독립 side effect인지 분류한다. 그 다음 REQUIRED, REQUIRES_NEW, NESTED의 physical connection, rollback-only, savepoint 의미를 설명한다. 마지막에는 데이터 품질, connection pool 성능, transaction duration과 acquire latency를 지표로 붙인다.\n\n## 실전 검증 루프\n1. outer/inner service 호출을 실제 Spring bean proxy 경유로 재현한다.\n2. RuntimeException, checked exception, catch 후 rollback-only 상황을 각각 테스트한다.\n3. REQUIRES_NEW에서 pool size가 부족할 때 acquire latency와 deadlock 위험을 확인한다.\n4. NESTED는 사용하는 transaction manager와 DB가 savepoint를 지원하는지 검증한다.\n5. transaction duration p95, connection acquire p95, UnexpectedRollbackException count를 기록한다.\n\n이 루프를 지키면 transaction propagation 문서는 옵션 암기가 아니라 commit boundary와 resource binding을 배우는 자료가 된다.\n\n## Spring Boot 3 / Spring 6 기준 세부 판단\nSpring Boot 3 애플리케이션의 `@Transactional`은 보통 Spring Framework 6의 proxy 기반 transaction advice로 적용된다. 그래서 propagation 판단은 annotation 선언만 보지 않고 실제 호출이 Spring bean proxy를 통과했는지부터 확인한다.\n\n- `REQUIRED`는 이미 열린 transaction이 있으면 같은 logical scope에 참여한다. 내부에서 예외를 catch해도 transaction interceptor가 rollback-only를 표시한 뒤라면 outer commit 시점에 `UnexpectedRollbackException`이 날 수 있다.\n- `REQUIRES_NEW`는 outer transaction을 suspend하고 독립 physical transaction을 시작한다. 보통 inner 작업이 별도 connection을 필요로 하므로, 같은 요청 안에서 outer가 connection을 잡은 채 inner가 pool에서 하나를 더 빌리는 흐름을 관측해야 한다.\n- `NESTED`는 새 physical transaction이 아니라 savepoint 기반 부분 rollback 후보이다. JDBC savepoint와 transaction manager 지원이 필요하므로, JPA라고 항상 같은 방식으로 동작한다고 전제하지 않는다.\n- 기본 rollback 규칙은 `RuntimeException`과 `Error` 중심이다. checked exception까지 rollback해야 하면 `rollbackFor`를 명시하고, 그 정책이 service API의 실패 의미와 맞는지 검토한다.\n- 외부 API 호출, 메시지 발행, 감사 로그는 propagation만으로 정합성이 끝나지 않는다. 본 데이터와 같은 invariant이면 `REQUIRED`, 실패 감사 row처럼 독립적으로 남겨야 하면 `REQUIRES_NEW`, commit 후 전달이면 after-commit/outbox를 함께 비교한다.\n\n## 품질 관점\n프레임워크 annotation 존재보다 실제 proxy/filter/transaction/runtime boundary를 통합 테스트로 확인한다. 이 문서의 답변 품질은 `Spring Transaction Propagation Perspective Map - REQUIRED, REQUIRES_NEW, NESTED`를 단순 용어가 아니라 선택 기준, 실패 모드, 검증 방법까지 연결하는지로 판단한다. 특히 비슷한 이웃 문서와 섞일 때 primary answer가 왜 이 문서인지 설명할 수 있어야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 판단하지 않는다. 입력 크기, 큐/락/캐시/네트워크/런타임 비용 중 무엇이 병목인지 분리하고, 작은 synthetic case와 production-like case를 따로 측정한다. 최적화가 correctness invariant를 흐리면 성능 개선으로 인정하지 않는다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path, retry, queueing, lock wait, cache miss를 함께 본다. 학습 답변에는 latency budget과 관측 지표가 포함되어야 하며, 개선 전후가 같은 조건에서 비교되어야 한다.\n\n## 주제별 추가 지표\n`request_p95_ms, advisor_or_filter_order, transaction_duration_ms, error_mapping_count`를 최소 지표로 둔다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 기준이며, 단순 통과/실패보다 어떤 경계가 병목인지 드러내야 한다.\n",
   "aliases": [
-    "Spring transaction propagation perspective",
-    "REQUIRED REQUIRES_NEW NESTED",
     "스프링 트랜잭션 전파",
-    "rollback only UnexpectedRollbackException",
-    "REQUIRES_NEW connection pool",
-    "NESTED savepoint",
-    "transaction propagation chooser",
-    "독립 커밋 부분 롤백",
-    "Spring @Transactional propagation",
+    "REQUIRES_NEW 커넥션 풀",
+    "NESTED savepoint 롤백",
+    "rollback only 예외",
+    "@Transactional 전파 옵션",
     "outer inner transaction",
-    "Spring transaction propagation REQUIRED REQUIRES_NEW NESTED rollback-only savepoint connection pool"
+    "Spring 6 transaction propagation",
+    "부분 커밋 판단"
   ],
   "expected_queries": [
-    "REQUIRED REQUIRES_NEW NESTED를 어떻게 구분해?",
-    "Spring transaction propagation을 connection pool과 같이 설명해줘",
-    "REQUIRES_NEW를 쓰면 왜 connection pool이 필요해?",
-    "NESTED와 REQUIRES_NEW 차이가 뭐야?",
-    "rollback-only 때문에 UnexpectedRollbackException이 나는 흐름은?",
-    "감사 로그를 독립 커밋하려면 어떤 전파가 맞아?",
-    "Spring transaction propagation에서 REQUIRED REQUIRES_NEW NESTED를 어떻게 구분해?"
+    "REQUIRED랑 REQUIRES_NEW는 실제 커넥션이 어떻게 달라져?",
+    "Spring에서 rollback-only가 찍히면 왜 나중에 예외가 나와?",
+    "NESTED는 JPA에서도 항상 savepoint처럼 동작해?",
+    "감사 로그만 따로 커밋하려면 어떤 전파를 써야 해?",
+    "checked exception에서도 rollback하려면 무엇을 확인해야 해?"
   ],
   "symptoms": [
     "전파 옵션을 단순히 annotation 이름으로 외운다",
@@ -54,7 +49,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -67,6 +62,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

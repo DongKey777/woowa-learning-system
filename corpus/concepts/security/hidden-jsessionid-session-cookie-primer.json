@@ -4,17 +4,23 @@
   "category": "security",
   "level": "beginner",
   "summary": "이 primer는 JSESSIONID 세션 쿠키가 브라우저에 저장되고 요청에 자동 첨부되는 흐름을 설명한다. 코드에서 토큰을 안 보내는데 로그인 유지, hidden JSESSIONID, 세션 쿠키 자동 전송 질문을 다룬다.",
-  "body_markdown": "# Hidden JSESSIONID Session Cookie Primer\n\n## 한 줄 요약\n\n서버 세션 인증에서는 브라우저가 `JSESSIONID` 같은 세션 쿠키를 저장하고, Domain/Path/SameSite/Secure 조건이 맞는 요청에 자동으로 붙인다. 애플리케이션 코드에서 매번 `Authorization` header를 직접 만들지 않아도 로그인 상태가 유지될 수 있다.\n\n## 미션 진입 증상\n\n로그인 후 JavaScript 코드에 토큰 저장 로직이 없는데도 인증이 유지된다. `localStorage`나 전역 상태에는 아무 값도 없는데 Network 탭에는 `Cookie: JSESSIONID=...`가 보인다.\n\n반대로 브라우저 Application 탭에는 `JSESSIONID`가 보이는데 실제 API 요청에는 Cookie header가 빠져 401이 난다. 이때는 \"세션이 없다\"가 아니라 쿠키 전송 조건을 먼저 봐야 한다.\n\n가끔 URL에 `;jsessionid=...`가 붙어 보이면 hidden field가 아니라 URL rewriting fallback일 수 있다. 보안상 노출 범위가 커지므로 가능하면 쿠키 기반 전송으로 고정하는 편이 안전하다.\n\n## 관찰 증거\n\n- 로그인 응답에 `Set-Cookie: JSESSIONID=...; Path=/; HttpOnly; SameSite=...`가 있는지 본다.\n- 다음 API 요청의 Request Headers에 `Cookie: JSESSIONID=...`가 실제로 붙었는지 본다.\n- 서버 로그에서 같은 session id 또는 session hash가 동일 principal로 매핑되는지 확인한다.\n- 401이면 인증 세션을 못 찾은 쪽이고, 403이면 세션은 찾았지만 권한 판단에서 막힌 쪽일 가능성이 크다.\n- cross-origin 요청이라면 `fetch`/XHR의 credentials 옵션, 서버 CORS의 credential 허용, `SameSite=None; Secure` 조건을 같이 본다.\n\n## 10초 분기\n\n| 관찰 | 먼저 볼 것 | 의미 |\n|---|---|---|\n| `Set-Cookie`가 없다 | 로그인 핸들러가 세션을 만들었는지 | 서버가 아직 브라우저에 session handle을 준 적이 없다 |\n| 쿠키 저장은 됐지만 요청에 안 붙는다 | Domain/Path/SameSite/Secure/CORS credentials | 브라우저 전송 규칙 문제다 |\n| 쿠키는 붙는데 401이다 | 서버 세션 만료, 세션 저장소, 로드밸런서 sticky/session store | handle은 왔지만 서버가 인증 상태를 못 찾는다 |\n| 쿠키는 붙는데 403이다 | resource-level authorization, role/permission check | 인증과 권한 판단을 분리해서 봐야 한다 |\n| URL에 `;jsessionid`가 보인다 | URL rewriting 설정, cookie disabled fallback | 세션 식별자가 URL/로그/referrer에 새기 쉬운 상태다 |\n\n## 핵심 mental model\n\n쿠키는 브라우저 저장소이자 전송 규칙이다. 서버는 쿠키 값으로 세션 저장소의 인증 상태를 찾고, 브라우저는 scope 조건이 맞는 요청에 쿠키를 자동 첨부한다.\n\n`JSESSIONID` 자체는 사용자의 권한 목록이 아니다. 보통은 서버 세션을 찾는 bearer handle이고, 실제 인증 객체와 SecurityContext는 서버 측 세션 저장소에 있다.\n\n## 보안 의미와 운영 의미\n\n보안 의미는 session id를 가진 사람이 같은 인증 세션을 사용할 수 있다는 점이다. 그래서 `HttpOnly`, `Secure`, `SameSite`, 로그인 직후 session id rotation, logout 시 서버 세션 폐기가 중요하다.\n\n운영 의미는 서버가 그 session id를 안정적으로 찾을 수 있어야 한다는 점이다. 단일 서버 memory session, Redis 같은 shared session store, sticky session, session TTL 설정이 여기로 들어간다.\n\n두 축을 섞으면 원인 분석이 흔들린다. Cookie header가 안 붙는 문제는 브라우저 전송 조건이고, 세션 저장소에서 못 찾는 문제는 운영 저장소/TTL 문제이며, 리소스 접근이 막히는 문제는 authorization 문제다.\n\n## 흔한 오해\n\n- `JSESSIONID`가 코드에 없으니 인증도 없다고 보면 안 된다. 브라우저가 Cookie header를 자동으로 만든다.\n- `HttpOnly`면 서버로 전송되지 않는다고 오해하기 쉽다. `HttpOnly`는 JavaScript 접근을 막는 속성이고, 브라우저 요청 전송은 계속 된다.\n- 쿠키가 자동 첨부되면 CSRF 위험도 같이 봐야 한다. \"자동이라 편하다\"와 \"자동이라 공격 요청에도 붙을 수 있다\"가 같은 성질에서 나온다.\n- `JSESSIONID`가 보인다고 authorization까지 통과한 것은 아니다. 인증 세션 확인과 resource-level 권한 판단은 별도 단계다.\n\n## Safe Next Docs\n\n쿠키가 보이는데 안 붙는 증상이 있으면 `security/cookie-visible-but-not-sent-symptom-router`로 이어서 본다.\n\n세션 쿠키와 JWT의 차이를 정리하려면 `security/session-cookie-jwt-basics`를 먼저 보고, 인증과 권한 경계를 헷갈리면 `security/authentication-authorization-session-foundations`로 이동한다.\n",
+  "body_markdown": "# Hidden JSESSIONID Session Cookie Primer\n\n## 한 줄 요약\n\n서버 세션 인증에서는 브라우저가 `JSESSIONID` 같은 세션 쿠키를 저장하고, Domain/Path/SameSite/Secure 조건이 맞는 요청에 자동으로 붙인다. 애플리케이션 코드에서 매번 `Authorization` header를 직접 만들지 않아도 로그인 상태가 유지될 수 있다.\n\n## 미션 진입 증상\n\n로그인 후 JavaScript 코드에 토큰 저장 로직이 없는데도 인증이 유지된다. `localStorage`나 전역 상태에는 아무 값도 없는데 Network 탭에는 `Cookie: JSESSIONID=...`가 보인다.\n\n반대로 브라우저 Application 탭에는 `JSESSIONID`가 보이는데 실제 API 요청에는 Cookie header가 빠져 401이 난다. 이때는 \"세션이 없다\"가 아니라 쿠키 전송 조건을 먼저 봐야 한다.\n\n가끔 URL에 `;jsessionid=...`가 붙어 보이면 hidden field가 아니라 URL rewriting fallback일 수 있다. 보안상 노출 범위가 커지므로 가능하면 쿠키 기반 전송으로 고정하는 편이 안전하다.\n\n## 관찰 증거\n\n- 로그인 응답에 `Set-Cookie: JSESSIONID=...; Path=/; HttpOnly; SameSite=...`가 있는지 본다.\n- 다음 API 요청의 Request Headers에 `Cookie: JSESSIONID=...`가 실제로 붙었는지 본다.\n- 서버 로그에서 같은 session id 또는 session hash가 동일 principal로 매핑되는지 확인한다.\n- 401이면 인증 세션을 못 찾은 쪽이고, 403이면 세션은 찾았지만 권한 판단에서 막힌 쪽일 가능성이 크다.\n- cross-origin 요청이라면 `fetch`/XHR의 credentials 옵션, 서버 CORS의 credential 허용, `SameSite=None; Secure` 조건을 같이 본다.\n\n## 10초 분기\n\n| 관찰 | 먼저 볼 것 | 의미 |\n|---|---|---|\n| `Set-Cookie`가 없다 | 로그인 핸들러가 세션을 만들었는지 | 서버가 아직 브라우저에 session handle을 준 적이 없다 |\n| 쿠키 저장은 됐지만 요청에 안 붙는다 | Domain/Path/SameSite/Secure/CORS credentials | 브라우저 전송 규칙 문제다 |\n| 쿠키는 붙는데 401이다 | 서버 세션 만료, 세션 저장소, 로드밸런서 sticky/session store | handle은 왔지만 서버가 인증 상태를 못 찾는다 |\n| 쿠키는 붙는데 403이다 | resource-level authorization, role/permission check | 인증과 권한 판단을 분리해서 봐야 한다 |\n| URL에 `;jsessionid`가 보인다 | URL rewriting 설정, cookie disabled fallback | 세션 식별자가 URL/로그/referrer에 새기 쉬운 상태다 |\n\n## 핵심 mental model\n\n쿠키는 브라우저 저장소이자 전송 규칙이다. 서버는 쿠키 값으로 세션 저장소의 인증 상태를 찾고, 브라우저는 scope 조건이 맞는 요청에 쿠키를 자동 첨부한다.\n\n`JSESSIONID` 자체는 사용자의 권한 목록이 아니다. 보통은 서버 세션을 찾는 bearer handle이고, 실제 인증 객체와 SecurityContext는 서버 측 세션 저장소에 있다.\n\n## 보안 의미와 운영 의미\n\n보안 의미는 session id를 가진 사람이 같은 인증 세션을 사용할 수 있다는 점이다. 그래서 `HttpOnly`, `Secure`, `SameSite`, 로그인 직후 session id rotation, logout 시 서버 세션 폐기가 중요하다.\n\n운영 의미는 서버가 그 session id를 안정적으로 찾을 수 있어야 한다는 점이다. 단일 서버 memory session, Redis 같은 shared session store, sticky session, session TTL 설정이 여기로 들어간다.\n\n두 축을 섞으면 원인 분석이 흔들린다. Cookie header가 안 붙는 문제는 브라우저 전송 조건이고, 세션 저장소에서 못 찾는 문제는 운영 저장소/TTL 문제이며, 리소스 접근이 막히는 문제는 authorization 문제다.\n\n## 흔한 오해\n\n- `JSESSIONID`가 코드에 없으니 인증도 없다고 보면 안 된다. 브라우저가 Cookie header를 자동으로 만든다.\n- `HttpOnly`면 서버로 전송되지 않는다고 오해하기 쉽다. `HttpOnly`는 JavaScript 접근을 막는 속성이고, 브라우저 요청 전송은 계속 된다.\n- 쿠키가 자동 첨부되면 CSRF 위험도 같이 봐야 한다. \"자동이라 편하다\"와 \"자동이라 공격 요청에도 붙을 수 있다\"가 같은 성질에서 나온다.\n- `JSESSIONID`가 보인다고 authorization까지 통과한 것은 아니다. 인증 세션 확인과 resource-level 권한 판단은 별도 단계다.\n\n## Spring 관찰 포인트\n\nSpring MVC/Spring Security 앱에서 form login이나 세션 기반 인증을 쓰면 로그인 성공 뒤 응답에 세션 쿠키가 내려갈 수 있다. `SecurityContext`는 보통 서버 측 session에 연결되므로, 프론트엔드 코드에 token 저장 로직이 없어도 다음 요청에서 같은 세션을 찾을 수 있다.\n\n`JSESSIONID`를 JavaScript로 읽어서 직접 header에 붙이는 방식은 권장하지 않는다. 세션 식별자는 `HttpOnly`, `Secure`, 적절한 `SameSite`, session fixation 방어, logout invalidation으로 보호하고, cross-origin이면 credentials와 CORS 허용 범위를 좁게 맞춘다.\n\n## Safe Next Docs\n\n쿠키가 보이는데 안 붙는 증상이 있으면 `security/cookie-visible-but-not-sent-symptom-router`로 이어서 본다.\n\n세션 쿠키와 JWT의 차이를 정리하려면 `security/session-cookie-jwt-basics`를 먼저 보고, 인증과 권한 경계를 헷갈리면 `security/authentication-authorization-session-foundations`로 이동한다.\n\n## 브라우저가 자동으로 보내는 값이라는 경계\n\nJSESSIONID는 애플리케이션 코드가 매 요청마다 직접 붙이는 토큰처럼 보이지 않을 수 있다. 서버가 `Set-Cookie`로 세션 식별자를 내려주면 브라우저는 같은 site/path 조건에 맞는 요청에 쿠키를 자동 첨부한다. 그래서 프론트 코드에서 Authorization header를 못 찾았는데도 로그인 상태가 유지되는 현상이 생긴다. 이 문서의 핵심은 hidden parameter가 아니라 cookie storage와 automatic attachment다.\n\n입문자가 자주 하는 실수는 \"내 코드가 토큰을 안 보내니 인증 정보가 없다\"고 보는 것이다. DevTools Network에서 request cookie, response `Set-Cookie`, cookie domain/path, SameSite, Secure, HttpOnly를 같이 봐야 한다. CORS 환경에서는 `credentials: include`와 서버의 `Access-Control-Allow-Credentials`도 맞아야 브라우저가 쿠키를 보내고 저장한다.\n\n## 로그아웃과 세션 만료 관찰\n\n서버 세션 로그아웃은 보통 서버 저장소의 session invalidation과 browser cookie 만료 지시가 함께 필요하다. 서버에서 세션만 지웠는데 브라우저 쿠키가 남아 있으면 다음 요청에 오래된 JSESSIONID가 다시 붙고, 서버는 새 익명 세션을 만들 수도 있다. 반대로 쿠키만 지웠는데 서버 세션이 남아 있으면 다른 경로에서 같은 식별자를 쓰는 위험한 설계가 될 수 있다.\n\n면접 답변에서는 JSESSIONID를 비밀 데이터 자체가 아니라 서버 세션을 찾는 key로 설명한다. 그래서 탈취되면 세션 하이재킹 위험이 있고, HTTPS, Secure, HttpOnly, SameSite, session rotation, logout invalidation을 함께 다룬다.\n\n## roomescape 로그인 흐름에 연결하기\n\nRoomescape admin 로그인에서 서버가 세션을 만들면 응답에는 `Set-Cookie: JSESSIONID=...`가 내려간다. 이후 예약 목록 API를 호출할 때 프론트 코드가 세션 id를 직접 읽어 header에 넣지 않아도, 브라우저는 쿠키 조건이 맞으면 자동으로 붙인다. 그래서 서버 필터나 Spring Security는 요청 cookie에서 세션 id를 찾고, 서버 저장소의 SecurityContext를 복원할 수 있다.\n\n문제가 생기면 먼저 Network 탭에서 로그인 응답의 Set-Cookie와 다음 요청의 Cookie를 나란히 본다. 도메인/포트가 다르거나 SameSite/Secure 조건이 맞지 않거나, fetch credentials 설정이 빠지면 로그인 성공 응답을 받아도 다음 요청에는 쿠키가 빠질 수 있다. 이 증상은 비밀번호 검증 실패가 아니라 브라우저 cookie policy와 CORS credentials 경계 문제다.\n",
   "aliases": [
-    "hidden jsessionid session cookie",
-    "jsessionid browser session primer",
     "숨은 JSESSIONID 세션 쿠키",
-    "세션 쿠키가 자동으로 붙는 이유"
+    "세션 쿠키 자동 전송",
+    "토큰 없이 로그인 유지",
+    "쿠키는 보이는데 401",
+    "JSESSIONID 자동으로 붙음",
+    "Spring 세션 쿠키",
+    "browser session cookie",
+    "jsessionid cookie primer"
   ],
   "expected_queries": [
     "JSESSIONID를 코드에서 안 보내는데 왜 로그인 상태가 유지돼?",
     "브라우저가 세션 쿠키를 자동으로 붙인다는 게 무슨 뜻이야?",
-    "JSESSIONID가 hidden field처럼 보이지 않아서 헷갈려"
+    "JSESSIONID가 hidden field처럼 보이지 않아서 헷갈려",
+    "Application 탭에는 쿠키가 있는데 API 요청에서 401이 나는 이유가 뭐야?",
+    "Spring Security 세션 로그인에서 프론트가 토큰을 저장하지 않아도 되는 이유가 뭐야?"
   ],
   "symptoms": [
     "코드에는 토큰 저장이 없는데 인증이 돼요",
@@ -38,8 +44,13 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-18",
     "legacy_path": "knowledge/cs/contents/security/hidden-jsessionid-session-cookie-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
+      }
+    ]
   }
 }

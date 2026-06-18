@@ -4,18 +4,24 @@
   "category": "network",
   "level": "advanced",
   "summary": "DNS resolver cache, stale answer, negative TTL, SERVFAIL을 장애 전파와 recovery latency 관점으로 진단하는 network playbook",
-  "body_markdown": "# DNS Resolver Cache Stale Negative TTL SERVFAIL Playbook\n\n## 이 문서가 맡는 질문\nDNS resolver cache, stale answer, negative TTL, SERVFAIL을 장애 전파와 recovery latency 관점으로 진단하는 network playbook. 이 문서는 이름 정의가 아니라 실제 설계/디버깅 상황에서 어떤 불변식과 측정값으로 판단할지 연결한다.\n\n## 빠른 분기\nNXDOMAIN/NODATA negative cache와 SERVFAIL을 구분한다. authoritative, recursive, client cache 중 어디서 stale한지 본다. TTL, SOA minimum, retry/backoff, failover record propagation latency를 측정한다.\n\n## 실전 시나리오\n장애 조치로 DNS record를 바꿨지만 일부 클라이언트만 계속 옛 IP를 보거나 NXDOMAIN을 캐시한다. authoritative는 정상인데 recursive resolver가 오래 틀린 답을 준다.\n\n## CS 배경\nDNS는 authoritative server, recursive resolver, OS/application cache가 계층적으로 답을 저장한다. negative caching은 존재하지 않는 이름도 TTL 동안 기억하므로 복구 시간을 늘릴 수 있다.\n\n## 핵심 불변식\n- NXDOMAIN/NODATA와 SERVFAIL은 캐시 의미가 다르다\n- TTL을 줄여도 이미 캐시된 답은 즉시 사라지지 않는다\n- authoritative 정상은 recursive/client 정상의 충분조건이 아니다\n- failover 설계에는 DNS propagation latency budget이 필요하다\n\n## 판단 매트릭스\n- 존재하지 않는 이름이면 SOA negative TTL 확인\n- SERVFAIL이면 DNSSEC/authoritative chain/timeout 확인\n- stale A/AAAA면 resolver별 cache age 비교\n- 서비스 failover면 client resolver diversity 측정\n\n## 예시\n```text\ndig @recursive name A +trace; compare authoritative answer, resolver TTL remaining, client cache behavior\n```\n이 예시는 API 이름을 외우는 용도가 아니라 boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n## 깊게 볼 포인트\nDNS 장애는 네트워크 연결 문제가 아니라 cache consistency 문제로 나타날 때가 많다. 같은 이름도 resolver마다 다른 시간축을 가진다.\n\n## 품질 관점\n품질은 DNS resolver의 happy path보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 NXDOMAIN cache, SERVFAIL, resolver diversity, TTL already cached를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다.\n\n## 성능 관점\n성능은 평균 처리량 하나로 보지 않는다. resolver query volume, retry backoff, cache hit, authoritative latency를 분리해서 측정하고, 작은 synthetic case와 실제 traffic shape를 나눠 benchmark한다.\n\n## 레이턴시 관점\n레이턴시는 p50보다 p95/p99와 cold path를 본다. negative TTL expiry, recursive timeout, client cache stale duration, failover propagation가 tail latency를 키우는지 trace span과 histogram으로 확인한다.\n\n## 주제별 추가 지표\nnegative_cache_ttl_remaining, servfail_rate, resolver_answer_divergence, authoritative_latency_ms, failover_propagation_p95를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n## 자주 하는 오해\n- TTL을 0으로 바꾸면 모든 client가 즉시 새 값을 본다고 생각한다\n- SERVFAIL도 NXDOMAIN처럼 negative cache된다고 단정한다\n- authoritative DNS만 보고 client 장애를 닫는다\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다.\n\n## 실전 검증 루프\n1. 증상을 한 문장으로 고정한다\n2. 관련 boundary와 ownership을 표시한다\n3. correctness invariant를 먼저 쓴다\n4. synthetic case와 production-like case를 나눠 측정한다\n5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n## 한 줄 정리\nDNS 복구 품질은 authoritative record보다 resolver/client cache가 언제 새 답을 보느냐로 결정된다.\n",
+  "body_markdown": "# DNS Resolver Cache Stale Negative TTL SERVFAIL Playbook\n\n## 이 문서가 맡는 질문\nDNS 장애 조치 후 일부 사용자만 옛 IP를 보거나 방금 만든 이름을 NXDOMAIN으로 계속 보는 상황을 다룬다. 목표는 DNS를 새로 배포하는 법이 아니라 authoritative server, recursive resolver, OS cache, application cache 중 어디에 잘못된 시간축이 남았는지 재현 가능한 순서로 좁히는 것이다.\n\n## 빠른 분기\n먼저 응답 코드를 나눈다. `NOERROR`와 A/AAAA가 있으면 stale positive answer이고, `NXDOMAIN`이나 `NOERROR`+empty answer는 negative cache 후보이며, `SERVFAIL`은 authoritative timeout, DNSSEC validation, lame delegation, resolver policy를 의심한다. 같은 이름을 authoritative에 직접 물었을 때는 정상인데 recursive resolver만 다르면 propagation 문제가 아니라 resolver cache 또는 validation 경로 문제다.\n\n## 실전 시나리오\n장애 조치로 `api.example.com`의 A record를 새 IP로 바꿨다. 일부 사용자는 1분 안에 새 IP를 보지만, 특정 통신사망 사용자는 20분 동안 옛 IP를 본다. 다른 팀은 방금 추가한 `v2.api.example.com`이 계속 NXDOMAIN이라고 말한다. 운영자가 authoritative zone file만 보고 정상으로 닫으면 장애는 끝나지 않는다. recursive resolver마다 TTL remaining, serve-stale 설정, negative TTL, DNSSEC chain 상태가 다르기 때문이다.\n\n## CS 배경\nDNS는 authoritative server가 원천 데이터를 갖고 recursive resolver가 사용자 대신 질의해 캐시하는 계층 구조다. positive answer는 record TTL 동안 캐시된다. negative caching은 존재하지 않는 이름도 SOA와 함께 캐시하며, 보통 negative answer의 TTL은 SOA record TTL과 SOA MINIMUM 중 작은 값 또는 resolver 정책으로 결정된다. 그래서 이름을 나중에 만들 계획이라면 먼저 NXDOMAIN을 넓게 퍼뜨리지 않는 설계가 중요하다.\n\n## 핵심 불변식\n- TTL을 낮춰도 이미 캐시된 answer의 남은 TTL은 자동으로 줄지 않는다.\n- authoritative server가 새 값을 돌려주는 것은 recursive resolver와 client cache가 새 값을 본다는 뜻이 아니다.\n- NXDOMAIN/NODATA negative cache와 SERVFAIL은 같은 실패가 아니다.\n- SERVFAIL은 보통 영구 부재가 아니라 resolution 실패이므로 DNSSEC, timeout, delegation, resolver 정책을 확인해야 한다.\n- resolver가 serve-stale을 켜면 authoritative가 잠깐 느리거나 실패할 때 만료된 옛 answer를 임시로 줄 수 있다.\n- JVM, browser, libc, sidecar DNS cache처럼 application 근처 cache도 별도 TTL을 가질 수 있다.\n\n## 진단 순서\n1. 사용자 증상에서 이름, record type, resolver IP, 관측 시각, 받은 RCODE와 TTL remaining을 수집한다.\n2. authoritative nameserver에 직접 질의해 원천 값과 SOA serial을 확인한다.\n3. 문제가 재현되는 recursive resolver와 정상 resolver를 나란히 질의해 answer, RCODE, remaining TTL을 비교한다.\n4. NXDOMAIN/NODATA면 authority section의 SOA와 negative TTL을 기록한다.\n5. SERVFAIL이면 `+trace`, DNSSEC validation, DS/DNSKEY, delegation glue, authoritative timeout을 분리한다.\n6. client runtime cache를 비우거나 우회한 질의로 OS/application cache 영향인지 확인한다.\n\n## 명령 예시\n```text\ndig @1.1.1.1 api.example.com A +ttlunits\ndig @8.8.8.8 api.example.com A +dnssec\ndig @ns1.example.com api.example.com A +norecurse\ndig api.example.com A +trace\n```\n이 예시는 특정 public resolver를 정답으로 삼기 위한 것이 아니다. authoritative와 recursive, 정상 resolver와 문제 resolver, positive answer와 negative answer를 같은 시각에 비교하기 위한 최소 관찰점이다.\n\n## 판단 매트릭스\n- stale positive answer: authoritative는 새 IP인데 recursive resolver가 옛 IP와 큰 TTL을 준다. 이미 캐시된 TTL, serve-stale, resolver 정책을 본다.\n- negative cache: authoritative에는 record가 생겼지만 recursive resolver가 NXDOMAIN/NODATA를 준다. SOA negative TTL과 언제 처음 NXDOMAIN이 퍼졌는지 본다.\n- SERVFAIL: answer가 없고 failure가 난다. DNSSEC validation 실패, authoritative timeout, lame delegation, broken glue, EDNS fragmentation을 확인한다.\n- client-only stale: recursive resolver는 정상인데 특정 앱만 옛 값을 쓴다. JVM DNS cache, local dnsmasq, browser cache, sidecar resolver를 본다.\n- failover latency: 모든 resolver가 결국 수렴하지만 시간이 길다. 사전 TTL 낮춤 시점과 실제 cutover 시점의 차이를 검토한다.\n\n## 복구 플레이북\n가장 먼저 할 일은 record를 다시 여러 번 바꾸는 것이 아니라 관측 지점을 고정하는 것이다. 잘못된 recursive resolver가 하나뿐이면 해당 resolver의 캐시 만료를 기다리거나 운영 채널을 통해 purge를 요청한다. 내부 resolver라면 cache flush와 negative cache policy를 조정할 수 있지만, 인터넷 전체 public resolver의 캐시는 임의로 즉시 지울 수 없다고 봐야 한다. DNSSEC SERVFAIL이면 record 값을 바꾸기 전에 DS/DNSKEY/RRSIG 만료와 zone signing 상태를 고친다.\n\n## 예방 설계\n장애 조치에 DNS를 쓰려면 cutover 직전에 TTL을 낮추는 것이 아니라 이전 TTL 기간만큼 먼저 낮춰 두어야 한다. 새 이름을 나중에 만들 계획이면 배포 전부터 placeholder record나 stable CNAME을 준비해 NXDOMAIN negative cache를 피한다. user-facing endpoint는 짧은 TTL만 믿지 말고 health check, load balancer failover, client retry budget을 함께 설계한다. mission-critical 경로에서는 resolver diversity를 모니터링하고 public resolver별 answer divergence를 alert로 둔다.\n\n## 운영 커뮤니케이션\nDNS 장애에서는 같은 시각에도 사용자마다 다른 답을 볼 수 있다는 점을 먼저 공유해야 한다. 상태 공유에는 authoritative 기준값, 문제가 남은 resolver 목록, 각 resolver의 TTL remaining, 예상 만료 시각을 함께 적는다. \"전파 중\"이라는 표현만 쓰면 누구의 cache가 언제 풀리는지 모호하다. 내부 resolver를 쓰는 서비스라면 flush 여부와 재발 방지 설정 변경을 별도로 기록하고, public resolver는 purge 가능 여부보다 실제 관측 TTL을 근거로 복구 시간을 말한다.\n\n## 테스트 케이스\n릴리즈 전에는 낮은 TTL positive answer, 높은 TTL positive answer, 배포 전 NXDOMAIN, DNSSEC 서명 만료, authoritative timeout, client runtime cache를 나눠 재현한다. 각 케이스는 같은 이름을 여러 resolver에 동시에 묻고, 장애 조치 후 어떤 resolver가 어느 순서로 수렴하는지 기록해야 한다. 이렇게 해야 장애 당일에 \"DNS가 이상하다\"가 아니라 stale positive, negative cache, SERVFAIL, client-only stale 중 하나로 바로 분류할 수 있다.\n\n## 측정 지표\n`resolver_answer_divergence`, `negative_cache_ttl_remaining`, `servfail_rate`, `authoritative_latency_ms`, `dnssec_validation_failure`, `failover_propagation_p95`, `client_cache_stale_duration`을 본다. 특히 propagation p95는 record 변경 시각부터 대다수 resolver가 새 answer를 주는 시각까지로 정의해야 한다. 단순히 authoritative update 성공 시각을 복구 완료 시각으로 쓰면 실제 사용자 복구 시간을 과소평가한다.\n\n## 자주 하는 오해\n- TTL을 지금 30초로 낮추면 과거에 1시간 TTL로 캐시된 answer도 즉시 줄어든다고 생각한다.\n- SERVFAIL을 NXDOMAIN처럼 존재하지 않는 이름이라고 해석한다.\n- authoritative query 하나만 정상이면 사용자 resolver도 정상이라고 닫는다.\n- DNS failover는 record만 바꾸면 끝나는 control plane이라고 본다.\n- cache flush를 모든 사용자에게 적용할 수 있는 복구 방법이라고 기대한다.\n\n## 학습자가 답변에 포함해야 할 구조\n답변은 먼저 RCODE와 record type을 분리해야 한다. 그 다음 authoritative, recursive, client cache의 ownership을 나누고, TTL remaining과 SOA negative TTL을 근거로 어떤 cache가 문제인지 말한다. 마지막에는 SERVFAIL이면 DNSSEC/timeout/delegation을 확인하고, failover라면 사전 TTL 낮춤과 resolver별 propagation p95를 검증 계획으로 붙인다.\n\n## 실전 검증 루프\n1. 같은 이름을 여러 resolver와 authoritative에 동시에 질의한다.\n2. answer 값, RCODE, TTL remaining, SOA serial을 표로 만든다.\n3. positive stale, negative cache, SERVFAIL, client-only stale 중 하나로 분류한다.\n4. 원인별 복구 방법을 선택하고 사용자가 실제로 보는 resolver에서 재확인한다.\n5. 장애 종료 후 cutover runbook에 TTL 사전 조정 시간과 negative cache 회피 전략을 적는다.\n\n## 재발 방지 기록\n사후에는 변경 전 TTL, 변경 시각, 처음 오류가 관측된 resolver, 마지막 stale answer 만료 시각을 남긴다. 다음 장애 조치에서는 같은 record를 즉시 덮어쓰는 대신 resolver별 수렴 상태를 보고 의사결정하도록 runbook에 반영한다.\n\n## 한 줄 정리\nDNS 복구 품질은 authoritative record가 바뀐 순간이 아니라 recursive resolver와 client cache가 새 시간축으로 수렴한 순간으로 판단한다.\n\nDNS 장애 답변은 positive cache와 negative cache를 같은 캐시라고 뭉개지 않고, 어떤 응답 코드가 어느 TTL로 어느 resolver에 남았는지 시간축으로 고정해야 한다.\n",
   "aliases": [
-    "DNS resolver stale cache negative TTL SERVFAIL",
-    "NXDOMAIN NODATA SOA minimum cache",
-    "DNS failover propagation latency",
-    "DNS Resolver Cache Stale Negative TTL SERVFAIL Playbook",
-    "DNS resolver cache stale answer negative TTL NXDOMAIN SERVFAIL authoritative recursive client cache failover propagation latency"
+    "stale DNS cache",
+    "negative TTL 진단",
+    "NXDOMAIN 캐시 복구",
+    "SERVFAIL 원인 추적",
+    "DNS 장애조치 지연",
+    "recursive resolver divergence",
+    "authoritative recursive 비교",
+    "DNSSEC SERVFAIL 검증",
+    "클라이언트 DNS 캐시"
   ],
   "expected_queries": [
-    "DNS failover 후 일부 클라이언트가 옛 IP나 NXDOMAIN을 보는 이유가 뭐야?",
-    "negative TTL과 SERVFAIL은 장애 복구에서 어떻게 달라?",
-    "DNS resolver cache stale answer를 어떻게 추적해?"
+    "DNS 레코드를 바꿨는데 일부 사용자만 계속 옛 IP를 보는 이유가 뭐야?",
+    "NXDOMAIN이 캐시된 상태에서 새 도메인을 만들면 언제 복구돼?",
+    "SERVFAIL이 날 때 DNSSEC 문제인지 resolver 캐시 문제인지 어떻게 구분해?",
+    "authoritative DNS는 정상인데 특정 resolver만 다른 답을 줄 때 무엇을 봐야 해?",
+    "DNS 장애조치 전에 TTL을 어떻게 준비해야 실제 복구가 빨라져?"
   ],
   "symptoms": [
     "stale DNS answer",
@@ -56,7 +62,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-05-28",
+    "last_modified": "2026-06-18",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -65,6 +71,10 @@
       {
         "date": "2026-05-28",
         "source": "y14-qrels-anchor-sync"
+      },
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
       }
     ]
   }

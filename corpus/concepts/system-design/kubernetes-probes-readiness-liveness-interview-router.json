@@ -4,17 +4,23 @@
   "category": "system-design",
   "level": "intermediate",
   "summary": "이 symptom_router는 Kubernetes readiness, liveness, startup probe를 면접/운영 증상으로 구분한다.",
-  "body_markdown": "# Kubernetes Probes Readiness Liveness Interview Router\n\n## 핵심 구분\n\n- `readinessProbe`는 \"이 Pod가 지금 트래픽을 받아도 되는가\"를 말한다. 실패하면 Pod는 NotReady가 되고 Service/EndpointSlice에서 새 트래픽 대상에서 빠질 수 있지만, container를 재시작하지는 않는다.\n- `livenessProbe`는 \"이 container를 재시작해야 할 만큼 내부적으로 멈췄는가\"를 말한다. 반복 실패하면 kubelet이 container를 재시작한다.\n- `startupProbe`는 느린 시작을 위한 보호막이다. 설정되어 있으면 성공하기 전까지 liveness/readiness 판단을 늦추고, 실패 한도를 넘으면 시작 실패로 보고 container를 재시작한다.\n\n면접에서 핵심 불변식(invariant)은 \"트래픽 수신 가능 여부\"와 \"프로세스 재시작 필요 여부\"를 섞지 않는 것이다. Readiness는 Pod가 살아 있어도 잠시 트래픽을 받지 않게 만들 수 있다. Liveness는 프로세스를 죽이고 다시 띄우는 강한 조치다. Startup probe는 liveness가 너무 빨리 개입하지 않게 해 준다.\n\n## 1차 symptom router\n\n| 증상 | 먼저 의심 | 확인할 증거 |\n|---|---|---|\n| 배포 직후 아직 초기화 중인데 요청을 받음 | readiness 누락/너무 관대함 | EndpointSlice 등록 시점, app ready log, readiness 응답 |\n| DB나 외부 API가 느릴 때 Pod가 계속 재시작 | liveness에 외부 의존성 포함 | `restartCount`, `Last State`, probe failure event |\n| JVM warm-up, cache load, migration 대기 중 재시작 | startup probe 부족 | startup failure event, `failureThreshold * periodSeconds` 예산 |\n| rolling update 중 간헐적 503 | readiness flap 또는 drain 부족 | endpoint churn, in-flight request, termination event |\n\n## Wrong-bucket / caveat\n\n| 잘못 넣은 위치 | 왜 위험한가 | 더 나은 판단 |\n|---|---|---|\n| DB ping을 liveness에 넣음 | DB 장애가 app restart 폭풍으로 바뀐다 | 프로세스 hang이 아니면 liveness에서 뺀다 |\n| readiness가 항상 200 | schema, cache, downstream 준비 전에도 트래픽을 받는다 | 요청 처리에 필요한 최소 준비 조건을 둔다 |\n| 모든 외부 의존성을 readiness에 깊게 검사 | 전역 장애 때 모든 Pod가 endpoint에서 빠져 503이 커질 수 있다 | 핵심 의존성만 짧고 안정적으로 확인하고 circuit breaker/degraded mode와 함께 본다 |\n| startup probe를 readiness 대체로 사용 | 시작 성공 후에도 트래픽 가능 여부는 계속 변한다 | startup은 초기 보호, readiness는 지속적인 트래픽 gate다 |\n\n## 운영 검증 질문\n\n- `kubectl describe pod`에서 probe failure event와 restart 시점이 실제 장애 시점과 맞는가?\n- readiness 실패가 EndpointSlice에서 빠지는 것으로 이어졌는가, 아니면 app은 NotReady인데 트래픽이 계속 들어오는가?\n- probe `timeoutSeconds`, `periodSeconds`, `failureThreshold`가 정상 tail latency보다 지나치게 짧지는 않은가?\n- 종료 경로는 probe와 별개로 `preStop`, `terminationGracePeriodSeconds`, connection draining을 고려했는가?\n\n## 면접 답변 골격\n\nReadiness는 \"트래픽을 받아도 되는가\", liveness는 \"container를 재시작해야 하는가\"다. DB health를 liveness에 과하게 넣으면 외부 DB 지연이 Pod restart 폭풍으로 번질 수 있다. 반대로 readiness에 아무 조건도 없으면 앱이 아직 schema, cache, dependency 준비를 못 했는데 Service가 트래픽을 보낼 수 있다. Startup probe는 느린 초기화 동안 liveness가 조기 개입하지 않게 하는 별도 장치다.\n\n보장 범위도 정확히 말한다. Readiness 실패는 새 트래픽을 줄이는 데 도움을 주지만, 이미 열린 연결(in-flight request)을 즉시 사라지게 보장하지 않는다. Graceful shutdown, preStop hook, connection draining이 별도로 필요할 수 있다. Liveness는 deadlock이나 process hang을 복구할 수 있지만, 근본 원인이 외부 장애나 잘못된 설정이면 재시작은 위험을 줄이지 못하고 오히려 증폭할 수 있다. Startup probe는 느린 시작을 보호하지만, readiness를 대체하지 않는다.\n\n## 관련 playbook\n\n배포 중 안전한 종료와 drain은 `lb-connection-draining-deployment-safe-close`로 이어진다. Pod, Deployment, Service 기본 역할이 헷갈리면 먼저 `kubernetes-pod-deployment-service-interview-primer`로 돌아간다.\n",
+  "body_markdown": "# Kubernetes Probes Readiness Liveness Interview Router\n\n## 핵심 구분\n\n- `readinessProbe`는 \"이 Pod가 지금 트래픽을 받아도 되는가\"를 말한다. 실패하면 Pod는 NotReady가 되고 Service/EndpointSlice에서 새 트래픽 대상에서 빠질 수 있지만, container를 재시작하지는 않는다.\n- `livenessProbe`는 \"이 container를 재시작해야 할 만큼 내부적으로 멈췄는가\"를 말한다. 반복 실패하면 kubelet이 container를 재시작한다.\n- `startupProbe`는 느린 시작을 위한 보호막이다. 설정되어 있으면 성공하기 전까지 liveness/readiness 판단을 늦추고, 실패 한도를 넘으면 시작 실패로 보고 container를 재시작한다.\n\n면접에서 핵심 불변식(invariant)은 \"트래픽 수신 가능 여부\"와 \"프로세스 재시작 필요 여부\"를 섞지 않는 것이다. Readiness는 Pod가 살아 있어도 잠시 트래픽을 받지 않게 만들 수 있다. Liveness는 프로세스를 죽이고 다시 띄우는 강한 조치다. Startup probe는 liveness가 너무 빨리 개입하지 않게 해 준다.\n\n## 1차 symptom router\n\n| 증상 | 먼저 의심 | 확인할 증거 |\n|---|---|---|\n| 배포 직후 아직 초기화 중인데 요청을 받음 | readiness 누락/너무 관대함 | EndpointSlice 등록 시점, app ready log, readiness 응답 |\n| DB나 외부 API가 느릴 때 Pod가 계속 재시작 | liveness에 외부 의존성 포함 | `restartCount`, `Last State`, probe failure event |\n| JVM warm-up, cache load, migration 대기 중 재시작 | startup probe 부족 | startup failure event, `failureThreshold * periodSeconds` 예산 |\n| rolling update 중 간헐적 503 | readiness flap 또는 drain 부족 | endpoint churn, in-flight request, termination event |\n\n## Wrong-bucket / caveat\n\n| 잘못 넣은 위치 | 왜 위험한가 | 더 나은 판단 |\n|---|---|---|\n| DB ping을 liveness에 넣음 | DB 장애가 app restart 폭풍으로 바뀐다 | 프로세스 hang이 아니면 liveness에서 뺀다 |\n| readiness가 항상 200 | schema, cache, downstream 준비 전에도 트래픽을 받는다 | 요청 처리에 필요한 최소 준비 조건을 둔다 |\n| 모든 외부 의존성을 readiness에 깊게 검사 | 전역 장애 때 모든 Pod가 endpoint에서 빠져 503이 커질 수 있다 | 핵심 의존성만 짧고 안정적으로 확인하고 circuit breaker/degraded mode와 함께 본다 |\n| startup probe를 readiness 대체로 사용 | 시작 성공 후에도 트래픽 가능 여부는 계속 변한다 | startup은 초기 보호, readiness는 지속적인 트래픽 gate다 |\n\n## 운영 검증 질문\n\n- `kubectl describe pod`에서 probe failure event와 restart 시점이 실제 장애 시점과 맞는가?\n- readiness 실패가 EndpointSlice에서 빠지는 것으로 이어졌는가, 아니면 app은 NotReady인데 트래픽이 계속 들어오는가?\n- probe `timeoutSeconds`, `periodSeconds`, `failureThreshold`가 정상 tail latency보다 지나치게 짧지는 않은가?\n- 종료 경로는 probe와 별개로 `preStop`, `terminationGracePeriodSeconds`, connection draining을 고려했는가?\n\n## 면접 답변 골격\n\nReadiness는 \"트래픽을 받아도 되는가\", liveness는 \"container를 재시작해야 하는가\"다. DB health를 liveness에 과하게 넣으면 외부 DB 지연이 Pod restart 폭풍으로 번질 수 있다. 반대로 readiness에 아무 조건도 없으면 앱이 아직 schema, cache, dependency 준비를 못 했는데 Service가 트래픽을 보낼 수 있다. Startup probe는 느린 초기화 동안 liveness가 조기 개입하지 않게 하는 별도 장치다.\n\n보장 범위도 정확히 말한다. Readiness 실패는 새 트래픽을 줄이는 데 도움을 주지만, 이미 열린 연결(in-flight request)을 즉시 사라지게 보장하지 않는다. Graceful shutdown, preStop hook, connection draining이 별도로 필요할 수 있다. Liveness는 deadlock이나 process hang을 복구할 수 있지만, 근본 원인이 외부 장애나 잘못된 설정이면 재시작은 위험을 줄이지 못하고 오히려 증폭할 수 있다. Startup probe는 느린 시작을 보호하지만, readiness를 대체하지 않는다.\n\n## 운영 안전장치\n\nProbe endpoint는 실제 요청 처리 경로를 망가뜨리지 않을 만큼 가벼워야 한다. Readiness에서 DB, cache, message broker를 모두 깊게 조회하면 장애 때 probe 자체가 부하원이 되고, 모든 Pod가 동시에 NotReady가 되어 남은 capacity가 사라질 수 있다. 반대로 readiness가 단순 process alive만 보면 schema migration, cache warmup, downstream credential 준비 전에도 traffic을 받는다. 안전한 기준은 \"대표 요청을 처리하는 데 필요한 최소 조건\"과 \"짧은 timeout으로 판단 가능한 조건\"이다.\n\nLiveness는 복구 수단이 아니라 마지막 탈출구다. Deadlock, event loop hang, fatal state처럼 같은 process를 유지해도 회복 가능성이 낮은 상태에만 연결한다. 외부 dependency timeout, 일시적 DB failover, feature flag misconfig는 재시작으로 고쳐지지 않을 수 있으므로 liveness에 넣기보다 readiness, circuit breaker, degraded mode, alert로 분리한다.\n\nProbe 값은 latency budget과 함께 산다. `timeoutSeconds`가 app의 정상 p99보다 짧으면 정상 tail request 중에도 실패하고, `failureThreshold * periodSeconds`가 너무 작으면 짧은 GC pause나 node pressure가 restart로 이어진다. Startup probe 예산은 cold start 최악값, image pull 이후 initialization, JVM warmup, cache seed 시간을 포함해서 잡고, 배포마다 실제 start duration histogram으로 조정한다.\n\n## 관련 playbook\n\n배포 중 안전한 종료와 drain은 `lb-connection-draining-deployment-safe-close`로 이어진다. Pod, Deployment, Service 기본 역할이 헷갈리면 먼저 `kubernetes-pod-deployment-service-interview-primer`로 돌아간다.\n",
   "aliases": [
     "Kubernetes probes interview",
     "readiness liveness startup 차이",
     "쿠버네티스 프로브 면접",
-    "probe misconfiguration router"
+    "probe misconfiguration router",
+    "readiness liveness 면접 답변",
+    "쿠버네티스 readiness liveness 구분",
+    "startup probe 언제 쓰는지",
+    "프로브 설정 실수 라우터"
   ],
   "expected_queries": [
     "readiness liveness startup probe 차이를 면접에서 어떻게 설명해?",
     "DB가 잠깐 느릴 때 liveness가 죽이면 왜 위험해?",
-    "배포 직후 503이 나는 probe 원인을 분석해줘"
+    "배포 직후 503이 나는 probe 원인을 분석해줘",
+    "JVM warmup이 긴 서비스에서 startup probe 예산은 어떻게 잡아?",
+    "readiness에 외부 의존성 health check를 어디까지 넣어야 안전해?"
   ],
   "symptoms": [
     "앱은 시작 중인데 Service가 트래픽을 보내요",
@@ -40,6 +46,11 @@
     "created_at": "2026-05-24",
     "last_modified": "2026-05-24",
     "legacy_path": "knowledge/cs/contents/system-design/kubernetes-probes-readiness-liveness-interview-router.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-18",
+        "source": "y14-expansion-batch144"
+      }
+    ]
   }
 }
