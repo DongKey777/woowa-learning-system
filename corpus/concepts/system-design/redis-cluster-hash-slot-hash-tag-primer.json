@@ -1,0 +1,62 @@
+{
+  "id": "system-design/redis-cluster-hash-slot-hash-tag-primer",
+  "title": "Redis Cluster Hash Slot Hash Tag Same-Slot Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis Cluster는 key를 16,384개 hash slot에 매핑하고 slot 소유 노드로 명령을 보낸다. hash tag는 `{...}` 안의 부분만 hashing해서 관련 key를 같은 slot에 묶는 장치이며, `MGET`, `MSET`, Lua script, transaction처럼 여러 key를 한 명령 경계에서 다루는 작업은 같은 slot이어야 한다. Pipeline은 transaction이 아니지만 cluster client가 요청을 slot별 node로 나눠 보내야 하므로, multi-key batch를 설계할 때 same-slot grouping과 hot slot 위험을 함께 본다.",
+  "body_markdown": "# Redis Cluster Hash Slot Hash Tag Same-Slot Primer\n\n> 한 줄 요약: Redis Cluster는 key를 16,384개 hash slot에 배치하고, 여러 key를 한 명령에서 다루려면 그 key들이 같은 slot에 있어야 한다. hash tag는 관련 key를 일부러 같은 slot에 묶는 도구지만, 잘못 쓰면 slot 분산을 망가뜨려 hot slot을 만든다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Redis Basics In-Memory KV Single Thread Primer](./redis-basics-in-memory-kv-single-thread-primer.md)\n- [Redis 자료구조 String Hash List Set ZSet 입문](./redis-data-types-string-hash-list-set-zset-primer.md)\n- [Redis Hot Key Big Key Operations Primer](./redis-hot-key-big-key-operations-primer.md)\n- [Hot Key Skew Mitigation Interview Playbook](./hot-key-skew-mitigation-interview-playbook.md)\n\nretrieval-anchor-keywords: Redis Cluster hash slot, Redis Cluster 16384 slots, Redis hash tag, Redis key hash tag braces, Redis CROSSSLOT error, Redis multi-key same slot, Redis MGET same slot, Redis Lua same slot, Redis pipeline same-slot grouping, Redis MOVED ASK redirection, Redis Cluster slot distribution, 레디스 클러스터 해시 슬롯, 레디스 해시 태그, 레디스 CROSSSLOT, 멀티키 같은 슬롯, 파이프라인 슬롯별 묶기\n\n---\n\n## 먼저 잡을 mental model\n\n단일 Redis 노드에서는 모든 key가 한 process의 keyspace 안에 있다. Redis Cluster에서는 keyspace가 여러 노드로 나뉜다. Redis는 각 key를 CRC16 기반 hash로 0부터 16383까지의 **hash slot** 중 하나에 배치하고, cluster의 각 master node가 slot 범위를 나눠 가진다.\n\n```text\nkey -> hash slot -> slot owner node\n```\n\n그래서 cluster client는 `GET user:42`를 아무 노드에나 보내는 것이 아니라, key가 속한 slot을 계산하고 그 slot을 가진 node로 보낸다. slot 소유자가 바뀌었거나 client의 slot cache가 오래되면 `MOVED`나 resharding 중 `ASK` redirection을 보고 갱신한다.\n\n여기서 중요한 설계 질문은 하나다.\n\n```text\n이 명령은 key 하나만 보나, 여러 key를 한 서버 경계에서 같이 보나?\n```\n\nkey 하나짜리 명령은 해당 key의 slot으로 보내면 된다. 여러 key를 한 명령이나 script 안에서 같이 읽고 쓰려면 Redis Cluster가 한 node 안에서 처리할 수 있어야 하므로 key들이 같은 slot이어야 한다.\n\n---\n\n## Hash slot과 node 배치\n\nRedis Cluster의 hash slot은 노드 개수와 직접 같은 개념이 아니다. slot은 16,384개로 고정된 논리 단위이고, node는 그 slot들을 나눠 가진다.\n\n| 개념 | 의미 |\n|---|---|\n| key | 애플리케이션이 쓰는 Redis key 이름 |\n| hash slot | key가 매핑되는 0-16383 사이 논리 shard |\n| node | slot 일부를 소유하고 명령을 처리하는 Redis master |\n| resharding | slot 소유권을 한 node에서 다른 node로 옮기는 작업 |\n\n노드가 3개면 각 node가 대략 slot의 1/3씩 가진다. 노드를 추가하거나 제거할 때 key를 하나씩 임의로 흩뿌리는 것이 아니라 slot 단위로 소유권을 옮긴다. 이 때문에 client는 slot map을 캐시하고, redirection을 만나면 갱신한다.\n\n이 구조는 consistent hashing ring과 비슷하게 보일 수 있지만 Redis Cluster의 설명에서는 먼저 slot을 기준으로 말하는 것이 정확하다. 운영에서 보는 단위도 보통 \"이 key가 어느 slot인가\", \"이 slot을 어느 node가 갖고 있는가\", \"이 slot이 너무 뜨거운가\"다.\n\n---\n\n## Hash tag가 하는 일\n\nhash tag는 key 전체가 아니라 `{`와 `}` 사이의 문자열만 hash input으로 쓰게 하는 규칙이다.\n\n```text\nuser:{42}:profile\nuser:{42}:cart\nuser:{42}:coupon\n```\n\n위 key들은 전체 이름은 다르지만 hash tag가 모두 `42`라서 같은 slot으로 간다. 반대로 아래 key들은 hash tag가 없으므로 key 전체가 hash 대상이다.\n\n```text\nuser:42:profile\nuser:42:cart\nuser:42:coupon\n```\n\nhash tag의 목적은 관련 key를 같은 slot에 모아 multi-key command, transaction, Lua script 같은 서버 측 연산을 가능하게 만드는 것이다. 예를 들어 사용자별 장바구니와 쿠폰을 한 script에서 같이 검증해야 한다면 `cart:{userId}`와 `coupon:{userId}`처럼 같은 tag를 붙일 수 있다.\n\n다만 hash tag는 분산을 일부러 줄이는 도구다. 모든 key를 `{global}`처럼 묶으면 cluster를 쓰면서도 한 slot에 트래픽과 메모리를 몰아넣는다. hash tag는 correctness 경계가 필요한 작은 key group에만 쓴다.\n\n---\n\n## CROSSSLOT이 나는 이유\n\nRedis Cluster에서 아래처럼 서로 다른 slot의 key를 한 명령에 넣으면 `CROSSSLOT` 오류가 난다.\n\n```text\nMGET user:42:profile user:42:cart\n```\n\n두 key가 우연히 같은 slot이면 동작할 수도 있지만, 그런 우연에 기대면 안 된다. Cluster는 multi-key command가 단일 node에서 처리될 수 있어야 한다. 서로 다른 node의 key를 한 명령에서 원자적으로 읽고 쓰는 분산 transaction을 제공하지 않는다.\n\n같은 사용자 범위에서 반드시 multi-key 처리가 필요하다면 key naming을 처음부터 same-slot으로 설계한다.\n\n```text\nMGET user:{42}:profile user:{42}:cart\n```\n\n이제 두 key는 같은 hash tag `42`를 쓰므로 같은 slot에 들어간다. `MSET`, `SUNIONSTORE`, `ZINTERSTORE`, Lua script, transaction 안의 여러 key도 같은 관점으로 본다. 명령이 여러 key를 한 서버 경계에서 묶는다면 same-slot 제약을 먼저 확인한다.\n\n---\n\n## Pipeline과 same-slot grouping\n\nPipeline은 여러 명령을 한 번에 보내 네트워크 왕복을 줄이는 방식이다. Pipeline 자체는 transaction도 아니고, cluster의 cross-slot 제약을 없애지도 않는다.\n\nCluster client는 pipeline 안의 명령을 key slot별로 나눠 각 node에 보내야 한다. 예를 들어 1,000개의 `GET`을 pipeline으로 보낼 때 key가 여러 slot에 흩어져 있으면 client는 node별 sub-pipeline을 만들고 결과 순서를 다시 맞춘다.\n\n```text\npipeline commands\n  -> group by slot owner node\n  -> send sub-pipeline to each node\n  -> merge responses in original order\n```\n\n단일 key 명령만 모은 pipeline이라면 slot이 달라도 client가 나눠 처리할 수 있다. 하지만 pipeline 안에 `MGET a b` 같은 multi-key command가 있고 `a`, `b`가 다른 slot이면 그 명령 자체가 실패한다.\n\n그래서 batch API를 설계할 때는 두 층을 구분한다.\n\n| 상황 | 설계 기준 |\n|---|---|\n| 단일 key 명령 여러 개 | client가 slot owner별로 pipeline을 나눌 수 있다 |\n| 하나의 multi-key command | 모든 key가 같은 slot이어야 한다 |\n| 사용자 단위 작은 key group | hash tag로 `{userId}`를 공유할 수 있다 |\n| 전체 유저를 한 tag로 묶는 batch | hot slot과 memory skew 위험이 크다 |\n\n---\n\n## Key naming 예시\n\n사용자 42의 profile, cart, coupon을 한 Lua script에서 같이 검증해야 한다고 하자.\n\n```text\nuser:{42}:profile\ncart:{42}\ncoupon:{42}:available\n```\n\n이 key들은 prefix가 달라도 hash tag가 같으므로 같은 slot이다. 같은 사용자의 작은 묶음을 하나의 node에서 처리할 수 있다.\n\n반대로 tenant 전체를 `{tenantA}`로 묶는 것은 조심해야 한다.\n\n```text\norder:{tenantA}:1\norder:{tenantA}:2\norder:{tenantA}:3\n```\n\ntenantA 트래픽이 크면 모든 주문 key가 한 slot으로 몰린다. tenant 단위 원자성이 정말 필요한지, 사용자나 주문 id 단위로 더 작게 tag를 쪼갤 수 있는지, cross-key 처리를 애플리케이션에서 분리할 수 있는지 봐야 한다.\n\nhash tag는 \"같은 비즈니스 도메인\"을 묶는 장치가 아니라 \"한 Redis node에서 같이 처리해야 하는 최소 key set\"을 묶는 장치로 보는 편이 안전하다.\n\n---\n\n## 운영과 면접에서 자주 놓치는 점\n\n1. Cluster에서 key 분산 단위는 node가 아니라 hash slot이다.\n2. hash tag는 중괄호 안의 부분만 hash하게 해서 같은 slot 배치를 강제한다.\n3. multi-key command, Lua script, transaction은 같은 slot key들로 제한된다.\n4. Pipeline은 RTT를 줄이는 방법이지 cross-slot multi-key 연산을 가능하게 하는 방법이 아니다.\n5. 너무 넓은 hash tag는 hot slot, hot node, memory skew를 만든다.\n6. resharding이나 failover 중에는 client의 slot cache, `MOVED`, `ASK` 처리까지 봐야 한다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 왜 위험한가 | 더 정확한 관점 |\n|---|---|---|\n| key prefix가 같으면 같은 node로 간다 | Redis Cluster는 prefix가 아니라 hash slot으로 배치한다 | hash tag가 없으면 key 전체가 hash input이다 |\n| hash tag는 검색용 namespace다 | tag는 조회 필터가 아니라 slot 배치 규칙이다 | 같은 slot이 필요한 key group에만 쓴다 |\n| pipeline이면 cross-slot도 묶을 수 있다 | pipeline은 여러 명령 전송 최적화일 뿐이다 | multi-key command 자체는 same-slot이어야 한다 |\n| 모든 user key를 `{user}`로 묶으면 편하다 | 한 slot에 트래픽과 메모리가 몰린다 | `{userId}`처럼 작은 원자성 경계로 제한한다 |\n| Redis Cluster는 분산 transaction을 해준다 | 서로 다른 slot의 key를 한 원자 경계로 묶지 않는다 | 필요하면 DB transaction, saga, idempotency를 검토한다 |\n\n---\n\n## 한 줄 정리\n\nRedis Cluster 설계에서는 key가 어떤 hash slot에 가는지, 여러 key가 같은 slot에 있어야 하는지, hash tag가 hot slot을 만들지 않는지를 같이 봐야 한다. hash tag는 multi-key correctness를 위한 좁은 도구이고, pipeline은 slot별 전송 최적화일 뿐 cross-slot 제약을 없애지 않는다.\n",
+  "aliases": [
+    "Redis Cluster hash slot",
+    "Redis hash tag",
+    "Redis CROSSSLOT",
+    "Redis 여러 키 같은 슬롯",
+    "Redis pipeline 슬롯별 묶기",
+    "Redis Cluster key distribution",
+    "레디스 클러스터 해시 슬롯",
+    "Redis 해시 태그",
+    "레디스 CROSSSLOT 에러",
+    "멀티키 명령 같은 슬롯",
+    "파이프라인 같은 슬롯 묶기"
+  ],
+  "expected_queries": [
+    "Redis Cluster에서 hash slot이 뭔지랑 key가 노드에 배치되는 과정을 설명해줘",
+    "Redis에서 CROSSSLOT 에러가 나는 이유와 hash tag로 어떻게 피하는지 궁금해",
+    "MGET이나 Lua처럼 여러 key를 쓰는 명령은 왜 같은 slot이어야 해?",
+    "user:{42}:profile 같은 key 이름에서 중괄호 hash tag를 언제 써야 해?",
+    "Redis pipeline을 클러스터에서 보낼 때 slot별로 묶어야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "Redis Cluster에서 key prefix가 같으면 같은 node에 간다고 오해한다.",
+    "CROSSSLOT 오류를 pipeline이나 retry로 해결하려고 하고 key naming 경계를 보지 않는다.",
+    "hash tag를 namespace나 검색 필터처럼 생각해 너무 넓은 tag로 hot slot을 만든다.",
+    "multi-key command와 단일 key command 여러 개를 pipeline으로 보내는 경우를 구분하지 못한다.",
+    "slot map, MOVED, ASK redirection을 모르고 cluster client가 어떤 node로 명령을 보내는지 설명하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-basics-in-memory-kv-single-thread-primer",
+      "system-design/redis-data-types-string-hash-list-set-zset-primer"
+    ],
+    "next_docs": [
+      "system-design/redis-hot-key-big-key-operations-primer",
+      "system-design/hot-key-skew-mitigation-interview-playbook"
+    ],
+    "confusable_with": [
+      "system-design/consistent-hashing-hot-key-strategies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "batch206-worker1",
+        "note": "Added Redis Cluster hash slot, hash tag, CROSSSLOT, and same-slot pipeline grouping primer."
+      }
+    ]
+  }
+}

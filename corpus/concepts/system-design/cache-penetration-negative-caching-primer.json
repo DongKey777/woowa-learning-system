@@ -1,0 +1,61 @@
+{
+  "id": "system-design/cache-penetration-negative-caching-primer",
+  "title": "Cache Penetration Negative Caching Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Cache penetration은 존재하지 않는 key 조회가 cache miss를 계속 통과해 DB/API 같은 origin까지 반복 도달하는 문제다. Negative caching은 `not found` 결과를 짧은 TTL로 캐시에 저장해 반복 miss를 흡수하지만, 새 데이터가 생성된 뒤에도 TTL 동안 없다고 보일 수 있는 stale negative risk를 함께 설계해야 한다.",
+  "body_markdown": "# Cache Penetration Negative Caching Primer\n\n> 한 줄 요약: cache penetration은 없는 key 요청이 cache miss를 계속 뚫고 origin까지 가는 문제이고, negative caching은 `없음` 결과를 짧게 캐시해 반복 조회를 막는 완화책이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Cache 기초 primer](./cache-basics-primer.md)\n- [캐싱 전략 chooser](./caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser.md)\n- [Bloom Filter Cache Guard Primer](../data-structure/bloom-filter-cache-guard-primer.md)\n- [Cache Admission Policy Design](./cache-admission-policy-design.md)\n\nretrieval-anchor-keywords: cache penetration, negative cache, null cache, nonexistent key lookup, repeated missing key DB hit, cache miss DB protection, short TTL not found cache, stale negative cache, Bloom filter cache guard difference, 없는 key 반복 조회, 없는 값 캐시, null 결과 캐시\n\n## 문제를 먼저 정확히 나누기\n\nCache penetration은 \"캐시가 있는데도 값이 없다\"가 아니라, **없는 key라는 결과가 보호되지 않아 매번 origin까지 내려가는 현상**이다.\n\n예를 들어 상품 상세 API에서 `product:99999999`가 존재하지 않는다고 하자. 첫 요청은 cache miss 후 DB를 조회하고 `not found`를 받는다. 이 결과를 캐시에 남기지 않으면 다음 요청도, 그다음 요청도 똑같이 cache miss 후 DB를 조회한다.\n\n```text\nGET /products/99999999\n  cache.get(product:99999999) -> miss\n  db.select(id=99999999) -> not found\n  response 404\n\nsame request repeated 10,000 times\n  every request repeats the same DB miss\n```\n\n이게 crawler, 잘못된 client retry, 랜덤 ID 공격, 오래된 링크에서 반복되면 DB QPS와 p95가 실제 존재하는 상품 조회와 무관하게 오른다. 캐시 hit ratio만 보면 \"어차피 없는 값이라 miss\"처럼 보이지만, origin 입장에서는 같은 실패 조회가 계속 들어오는 부하다.\n\n## Negative Cache / Null Cache\n\nNegative caching은 `값이 없음`이라는 결과 자체를 짧게 저장한다.\n\n```text\nkey: product:99999999\nvalue: NEGATIVE_NOT_FOUND\nttl: 30s\n```\n\n다음 요청은 DB까지 가지 않고 cache에서 바로 404 또는 empty result를 반환한다.\n\n```text\n1. cache miss\n2. DB 조회 결과가 not found\n3. cache.set(key, NEGATIVE_NOT_FOUND, ttl=30s)\n4. 이후 30초 동안 같은 key는 cache hit로 404 반환\n```\n\n여기서 중요한 점은 negative entry가 일반 데이터와 같은 의미의 값이 아니라는 것이다. 이것은 \"이 key는 최근 origin 확인 결과 없었다\"는 임시 메모다. 그래서 TTL은 보통 짧고, write path나 생성 path에서 지울 수 있으면 더 안전하다.\n\n## 왜 TTL을 짧게 잡나\n\nNegative cache의 핵심 위험은 stale negative다. 없던 데이터가 새로 생겼는데, 이전 `not found` 캐시가 아직 살아 있으면 사용자는 TTL 동안 계속 \"없다\"는 응답을 본다.\n\n```text\n00:00 product:42 조회 -> DB not found -> negative cache TTL 60s\n00:10 product:42 생성 완료\n00:20 product:42 조회 -> negative cache hit -> 잘못된 404\n01:00 negative cache 만료 후에야 실제 상품 조회 가능\n```\n\n따라서 TTL은 \"origin 보호\"와 \"새 데이터가 안 보이는 시간\"의 trade-off다.\n\n| 상황 | TTL 감각 | 이유 |\n|---|---|---|\n| ID가 한번 정해지면 거의 생성되지 않음 | 조금 길게 가능 | stale negative 비용이 낮다 |\n| 사용자가 방금 만든 리소스를 바로 조회함 | 매우 짧게 또는 생성 시 invalidate | 새 데이터 은닉 비용이 크다 |\n| 랜덤 ID 공격 방어 | 짧은 TTL + rate limit | 무한히 많은 key를 오래 저장하면 cache pollution |\n| 검색 결과 empty list | query 정규화 후 짧게 | 조건 변화나 인덱싱 지연으로 곧 생길 수 있다 |\n\n실무에서는 10초, 30초, 1분 같은 짧은 출발점으로 두고, 생성/수정 이벤트가 있다면 해당 negative key를 삭제한다. `null`을 그대로 저장하면 application code가 실제 cache miss와 구분하지 못할 수 있으므로 sentinel value나 typed wrapper를 둔다.\n\n## Cache-Aside에서의 구현 감각\n\nCache-aside 읽기 경로에서는 positive hit, negative hit, miss를 분리해야 한다.\n\n```java\nCacheValue cached = cache.get(key);\nif (cached != null) {\n    if (cached.isNegative()) {\n        return NotFound.cached();\n    }\n    return cached.payload();\n}\n\nOptional<Product> product = repository.findById(id);\nif (product.isPresent()) {\n    cache.set(key, CacheValue.positive(product.get()), positiveTtl);\n    return product.get();\n}\n\ncache.set(key, CacheValue.negative(\"not_found\"), negativeTtl);\nreturn NotFound.fresh();\n```\n\n이 코드에서 `cached == null`은 cache miss이고, `cached.isNegative()`는 negative cache hit다. 둘을 섞으면 \"캐시에 없음\"과 \"원본에도 없음이라고 최근에 확인함\"을 구분하지 못한다.\n\n생성 경로가 있으면 같이 본다.\n\n```text\ncreate product:42\n  DB insert commit\n  cache.delete(product:42)        # old negative entry 제거\n  optional: cache.set(product:42, positive value)\n```\n\nwrite-through처럼 생성 시 캐시를 바로 채울 수 있으면 stale negative window가 더 작아진다. 그래도 부분 실패를 생각해 TTL 안전망은 남긴다.\n\n## Bloom Guard와 다른 점\n\nNegative cache와 Bloom filter cache guard는 둘 다 없는 key 조회를 줄이지만 위치와 의미가 다르다.\n\n| 항목 | Negative cache | Bloom filter guard |\n|---|---|---|\n| 저장하는 것 | 특정 key의 최근 `not found` 결과 | 존재 가능한 key 집합의 membership 요약 |\n| 동작 위치 | cache miss 후 origin 결과를 보고 저장 | cache/DB 조회 전에 빠르게 차단 |\n| 정확도 | TTL 안에서는 저장된 결과를 그대로 믿음 | `없음`은 강하게 말하고 `있음`은 후보일 뿐 |\n| 주요 위험 | 새 데이터 생성 뒤 stale negative 404 | stale filter, false positive 증가, 운영 false negative |\n| 좋은 조합 | 반복되는 같은 nonexistent key | 랜덤하게 넓은 keyspace를 때리는 요청 |\n\n쉽게 말하면 negative cache는 \"방금 확인해 보니 이 key는 없었다\"를 기억한다. Bloom guard는 \"이 key가 애초에 존재 가능한 집합에 들어 있나\"를 확률적으로 거른다. 랜덤한 없는 key가 무한히 들어오면 negative cache만으로는 cache에 없는 key entry가 계속 쌓일 수 있으므로 admission policy, rate limit, Bloom guard를 같이 검토한다.\n\n## 운영에서 볼 지표\n\n평균 cache hit ratio보다 아래 지표가 더 직접적이다.\n\n| 지표 | 의미 |\n|---|---|\n| `negative_cache_set_total` | origin not found 결과를 negative entry로 저장한 횟수 |\n| `negative_cache_hit_total` | 반복 nonexistent lookup을 cache에서 막은 횟수 |\n| `negative_cache_stale_report_total` | 생성된 데이터가 negative entry 때문에 안 보인 신고/검출 |\n| `origin_not_found_qps` | DB/API까지 내려간 not found 조회량 |\n| `negative_entry_evicted_total` | negative entry가 cache 용량을 밀어내는지 확인 |\n| `create_negative_invalidate_total` | 생성 경로에서 old negative entry를 지운 횟수 |\n\n로그와 metric label에는 raw key 전체를 넣지 말고 key class, route, hashed key, TTL bucket 정도만 둔다. 없는 key 공격은 high-cardinality metric 폭발을 같이 만들 수 있다.\n\n## 흔한 오해\n\n- \"404는 실패니까 캐시하면 안 된다\"가 아니다. 반복되는 같은 404가 origin을 때리면 짧게 캐시하는 편이 안전할 수 있다.\n- \"negative TTL을 길게 잡을수록 좋다\"가 아니다. 길수록 DB는 보호되지만 새 데이터가 안 보이는 시간이 늘어난다.\n- \"null을 저장하면 끝\"이 아니다. cache miss와 cached null을 구분할 sentinel이 필요하다.\n- \"Bloom filter를 두면 negative cache가 필요 없다\"가 아니다. Bloom false positive로 통과한 없는 key나 최근 not found 결과는 negative cache가 더 직접적으로 흡수한다.\n- \"DNS negative caching과 같은 말\"이 아니다. DNS는 resolver/NXDOMAIN/SOA TTL 맥락이고, 여기서는 application cache miss와 origin 보호 설계다.\n\n## 답변 뼈대\n\n리뷰나 면접에서는 이렇게 말하면 흔들리지 않는다.\n\n1. 존재하지 않는 key 조회가 매번 cache miss 후 DB/API까지 내려가는 cache penetration 문제라고 정의한다.\n2. origin에서 not found를 받은 뒤 sentinel value로 negative entry를 저장하고 짧은 TTL을 둔다.\n3. cache miss, positive hit, negative hit을 코드에서 구분한다.\n4. 새 데이터 생성 경로에서는 old negative entry를 지우거나 positive value로 덮는다.\n5. stale negative risk 때문에 TTL을 짧게 두고, 랜덤 key 공격에는 admission policy, rate limit, Bloom guard를 같이 본다.\n6. Bloom guard는 조회 전 membership 차단이고 negative cache는 조회 후 not found 결과 캐시라고 구분한다.\n\n## 확인 질문\n\n> Q: 없는 상품 ID 조회가 계속 DB까지 내려가면 어떤 캐시 패턴을 먼저 생각하나요?\n> 핵심: not found 결과를 짧게 저장하는 negative cache/null cache를 검토한다.\n\n> Q: negative cache의 가장 큰 위험은 무엇인가요?\n> 핵심: 데이터가 새로 생긴 뒤에도 TTL 동안 stale negative 때문에 계속 404가 보일 수 있다.\n\n> Q: Bloom filter와 negative cache는 어떻게 다르나요?\n> 핵심: Bloom guard는 조회 전에 존재 가능성을 거르고, negative cache는 origin에서 확인한 `없음` 결과를 TTL 동안 재사용한다.\n\n## 한 줄 정리\n\nCache penetration을 막는 negative caching의 핵심은 반복 nonexistent-key miss를 짧게 흡수하되, 새 데이터 생성 시 stale negative가 오래 남지 않도록 TTL, invalidation, admission 정책을 함께 설계하는 것이다.\n",
+  "aliases": [
+    "cache penetration",
+    "negative cache",
+    "null cache",
+    "존재하지 않는 키 캐시",
+    "없는 값 캐싱",
+    "없는 상품 조회 캐시",
+    "캐시 관통",
+    "404 응답 캐시",
+    "stale negative cache",
+    "not found TTL"
+  ],
+  "expected_queries": [
+    "없는 상품 id 조회가 계속 DB까지 가는데 캐시로 어떻게 막아?",
+    "negative cache랑 null cache가 뭐야?",
+    "존재하지 않는 key를 캐시에 저장해도 괜찮아?",
+    "없는 값 캐시 TTL을 길게 잡으면 어떤 문제가 생겨?",
+    "cache penetration 막을 때 Bloom Filter랑 negative cache는 뭐가 달라?",
+    "새로 생성된 데이터가 negative cache 때문에 계속 404로 보일 수 있어?"
+  ],
+  "symptoms": [
+    "존재하지 않는 key 조회가 cache miss를 거쳐 매번 DB/API까지 내려간다.",
+    "404나 empty result는 캐시하면 안 된다고 생각해 반복 miss 부하를 방치한다.",
+    "negative cache TTL을 길게 잡아 새로 생성된 데이터가 한동안 보이지 않는다.",
+    "cached null과 cache miss를 구분하지 못해 읽기 경로가 흔들린다.",
+    "Bloom filter guard와 negative cache를 같은 장치로 설명한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer",
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser"
+    ],
+    "next_docs": [
+      "data-structure/bloom-filter-cache-guard-primer",
+      "system-design/cache-admission-policy-design"
+    ],
+    "confusable_with": [
+      "network/dns-negative-caching-nxdomain-behavior"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "batch206-worker3"
+      }
+    ]
+  }
+}
