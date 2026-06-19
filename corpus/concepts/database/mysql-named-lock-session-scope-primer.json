@@ -1,0 +1,76 @@
+{
+  "id": "database/mysql-named-lock-session-scope-primer",
+  "title": "MySQL Named Lock GET_LOCK Session Scope Primer",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "MySQL named lock은 이름 문자열로 잡는 advisory lock이고, row나 transaction이 아니라 DB session에 묶인다. 커넥션 풀 환경에서는 GET_LOCK과 RELEASE_LOCK이 같은 물리 커넥션에서 실행되는지, commit/rollback으로 풀린다고 착각하지 않는지가 핵심이다.",
+  "body_markdown": "# MySQL Named Lock GET_LOCK Session Scope Primer\n\n> 한 줄 요약: MySQL `GET_LOCK()`은 데이터 row가 아니라 이름을 잠그는 advisory lock이고, transaction이 아니라 DB session에 묶인다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Connection Pool](./connection-pool.md)\n- [Advisory Locks vs Row Locks](./advisory-locks-vs-row-locks.md)\n- [FOR UPDATE Row Lock vs Advisory Lock vs Lease/Fencing 결정 가이드](./for-update-vs-advisory-lock-vs-lease-fencing-decision-guide.md)\n- [Transaction Locking Connection Pool Primer](./transaction-locking-connection-pool-primer.md)\n\nretrieval-anchor-keywords: MySQL named lock, GET_LOCK, RELEASE_LOCK, advisory lock session scope, connection pool named lock, transaction rollback does not release named lock, MySQL 락 세션, named lock 커넥션 풀\n\n## named lock은 무엇을 잠그나\n\nMySQL named lock은 row를 잠그는 것이 아니라 문자열 이름을 잠근다.\n\n```sql\nSELECT GET_LOCK('settlement:2026-06-19', 3);\n-- critical section\nSELECT RELEASE_LOCK('settlement:2026-06-19');\n```\n\n이 방식은 \"같은 이름의 작업을 동시에 한 번만 실행\"하고 싶을 때 쓸 수 있다. 예를 들어 같은 정산 job, 같은 tenant report 생성, 같은 migration step 진입을 짧게 막는 장면이다.\n\n하지만 named lock은 row lock이 아니다. 테이블 row를 보호하려면 row lock, unique constraint, optimistic version 같은 데이터 경계가 별도로 필요하다.\n\n## session scope가 핵심이다\n\nMySQL named lock은 transaction이 아니라 DB session에 묶인다고 이해하는 편이 안전하다. 여기서 session은 애플리케이션 로그인 세션이 아니라 DB 서버가 보는 연결 상태다.\n\n중요한 결과는 두 가지다.\n\n- `COMMIT`이나 `ROLLBACK`을 했다고 named lock이 자동으로 풀린다고 가정하면 안 된다.\n- `RELEASE_LOCK()`은 lock을 잡은 같은 DB session에서 실행되어야 한다.\n\n커넥션 풀을 쓰면 애플리케이션 코드의 `Connection` 객체와 실제 물리 DB session의 생명주기를 구분해야 한다. `GET_LOCK`을 실행한 뒤 같은 physical connection을 유지하지 못하면 unlock이 기대와 다르게 동작할 수 있다.\n\n## 커넥션 풀에서 흔한 함정\n\n```text\nrequest A borrows connection #7\n  -> GET_LOCK('daily-job') 성공\n  -> connection을 pool에 반환하거나 다른 경로로 이동\nrequest B borrows connection #12\n  -> RELEASE_LOCK('daily-job') 실행\n  -> 같은 session이 아니라 unlock 실패 또는 기대와 다른 결과\n```\n\n코드상으로는 같은 서비스 메서드처럼 보여도 proxy, transaction boundary, pool 반환 시점이 끼면 물리 session이 바뀔 수 있다. 그래서 named lock을 쓸 때는 lock 획득, critical section, unlock이 같은 connection/session 위에서 닫히는지 테스트해야 한다.\n\n또 timeout과 finally unlock도 필요하다. Lock을 잡은 session이 죽으면 DB가 정리할 수 있지만, 애플리케이션이 살아 있으면서 unlock을 빠뜨리면 다른 작업이 계속 막힐 수 있다.\n\n## 언제 피해야 하나\n\nNamed lock은 짧은 진입 게이트에는 쓸 수 있지만, 긴 작업 ownership이나 stale worker 차단에는 부족하다. Worker가 오래 멈췄다가 돌아와 결과를 쓰는 문제까지 막으려면 lease와 fencing token 같은 업무 상태 모델이 필요하다.\n\n또 재고 차감처럼 실제 row 정합성을 지켜야 하는 장면에서 named lock만 믿는 것도 위험하다. 참여하지 않는 코드 경로가 같은 row를 바꾸면 named lock은 아무것도 막지 못한다.\n\n## 흔한 오해\n\n- `ROLLBACK`하면 named lock도 같이 풀린다고 생각한다.\n- `GET_LOCK`과 `RELEASE_LOCK`을 다른 커넥션에서 실행해도 된다고 본다.\n- named lock이 row lock처럼 데이터 변경을 직접 보호한다고 착각한다.\n- 긴 배치 작업을 named lock 하나로 끝까지 보호하려 한다.\n- Redis lock, row lock, lease/fencing과 선택 기준을 나누지 않는다.\n\n## 한 줄 정리\n\nMySQL named lock은 이름 기반 advisory lock이며 DB session에 묶인다. 커넥션 풀에서는 같은 physical connection에서 획득과 해제를 닫고, 데이터 row 정합성이나 긴 작업 ownership은 별도 도구로 분리해야 한다.\n",
+  "aliases": [
+    "MySQL named lock",
+    "GET_LOCK 세션",
+    "RELEASE_LOCK 같은 커넥션",
+    "named lock 커넥션 풀",
+    "MySQL advisory lock",
+    "트랜잭션으로 안 풀리는 락",
+    "DB 세션 락",
+    "GET_LOCK RELEASE_LOCK",
+    "named lock session scope",
+    "커밋해도 안 풀리는 락"
+  ],
+  "expected_queries": [
+    "GET_LOCK이 세션에 묶인다는 뜻이 뭐야?",
+    "MySQL named lock은 commit이나 rollback하면 자동으로 풀려?",
+    "GET_LOCK과 RELEASE_LOCK을 다른 커넥션에서 실행하면 왜 위험해?",
+    "커넥션 풀에서 named lock은 뭐가 위험해?",
+    "named lock과 row lock은 뭐가 달라?"
+  ],
+  "symptoms": [
+    "named lock을 transaction-scoped lock처럼 이해한다",
+    "커넥션 풀에서 GET_LOCK과 RELEASE_LOCK이 같은 DB session에서 실행되는지 확인하지 않는다",
+    "named lock으로 row 정합성이나 긴 작업 fencing까지 해결하려 한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/connection-pool",
+      "database/advisory-locks-vs-row-locks",
+      "database/db-session-connection-transaction-scope-primer"
+    ],
+    "next_docs": [
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide",
+      "database/transaction-locking-connection-pool-primer"
+    ],
+    "confusable_with": [
+      "database/lock-basics",
+      "database/advisory-locks-vs-row-locks",
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide"
+    ],
+    "forbidden_for_queries": [
+      "row lock과 gap lock으로 phantom을 막는 법을 설명해줘",
+      "lease fencing token으로 stale worker write를 막는 설계를 해줘"
+    ]
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "MySQL GET_LOCK이 transaction이 아니라 session에 묶인다는 의미를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "커넥션 풀에서 named lock 획득과 해제 커넥션이 달라질 수 있는지 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/database/mysql-named-lock-session-scope-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch203-db-foundation-ladder"
+      }
+    ]
+  }
+}
