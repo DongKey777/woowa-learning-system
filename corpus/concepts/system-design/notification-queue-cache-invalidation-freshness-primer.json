@@ -1,0 +1,59 @@
+{
+  "id": "system-design/notification-queue-cache-invalidation-freshness-primer",
+  "title": "Notification Queue 기반 Cache Invalidation Freshness 입문",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "쓰기 발생 후 notification queue로 cache invalidation 또는 refresh 신호를 보내 read-optimized cache의 최신성을 맞추는 패턴이다. 핵심은 메시지를 보냈다는 사실이 아니라 누락, 중복, 순서 뒤바뀜, stale window를 version과 TTL, 재조회 fallback으로 제한하는 것이다.",
+  "body_markdown": "# Notification Queue 기반 Cache Invalidation Freshness 입문\n\n> 한 줄 요약: 쓰기 후 cache를 지우는 신호를 큐로 보내도, 유실과 순서 문제를 버틸 version/fallback이 필요하다.\n\n## 어디에 쓰나\n\nread-optimized cache를 운영하면 write path와 read path가 분리된다. 상품, 가게, 권한, 설정 같은 데이터가 바뀌었을 때 cache가 예전 값을 계속 주지 않도록 무효화나 refresh 신호를 보내야 한다.\n\n```text\nwrite DB transaction\n  -> data change + invalidation/outbox row commit\n  -> cache worker consumes\n  -> evict or refresh cache key\n  -> read path observes newer version\n```\n\n## queue가 해결하는 것과 못 하는 것\n\nQueue는 write path에서 cache 작업을 분리하고 retry 지점을 만든다. 하지만 queue에 넣었다고 cache 최신성이 자동 보장되지는 않는다. 무효화 신호가 반드시 남아야 한다면 데이터 변경과 같은 transaction에 outbox 또는 invalidation row를 저장해야 한다. commit 이후 enqueue만 호출하면 commit은 성공했는데 enqueue가 실패하는 구멍이 생기므로, 그 경우에는 TTL, reconciliation, source fallback으로 유실을 제한한다고 명시해야 한다.\n\n| 위험 | 필요한 방어 |\n|---|---|\n| invalidation message 유실 | TTL, periodic reconciliation, source fallback |\n| 중복 invalidation | evict/refresh를 idempotent하게 처리 |\n| 순서 뒤바뀜 | version이나 updated_at으로 오래된 신호 skip |\n| worker lag | cache age, queue lag, stale read 지표 |\n| evict 후 stampede | refresh-ahead, request collapsing, stale-while-revalidate |\n\n## 무효화와 갱신 선택\n\nEvict는 단순하지만 다음 read가 origin을 때린다. Refresh는 사용자 miss를 줄일 수 있지만 worker가 원본 조회와 cache write 부하를 감당해야 한다. 어떤 방식을 쓰든 cache value에는 가능하면 source version이나 generated_at을 넣어야 한다.\n\n민감한 경로라면 read path가 cache version을 확인하고, 너무 오래됐거나 요구 version보다 낮으면 source 또는 stricter read path로 우회할 수 있다.\n\n## 흔한 오해\n\n- notification queue가 있으면 cache stale 문제가 사라진다고 본다.\n- `DEL key` 메시지를 보냈으니 순서 문제도 끝났다고 생각한다.\n- cache value에 version이 없어 오래된 refresh가 최신 값을 덮어쓴다.\n- worker lag와 stale read를 같은 지표로 보지 않는다.\n\n## 한 줄 정리\n\nNotification queue 기반 invalidation은 write와 cache 갱신을 분리하는 수단이고, 실제 freshness 계약은 version, TTL, lag 지표, fallback read로 완성된다.\n",
+  "aliases": [
+    "쓰기 후 캐시 무효화를 큐로 보내도 돼?",
+    "notification queue로 cache invalidation하면 최신성이 보장돼?",
+    "캐시 삭제 메시지를 놓치면 어떡해?",
+    "cache invalidation 이벤트 순서가 바뀌면 어떻게 해?",
+    "캐시 version으로 오래된 갱신을 막을 수 있어?",
+    "write 후 cache refresh worker가 필요한 경우는 언제야?",
+    "무효화 큐 lag로 stale cache가 생겨",
+    "evict와 refresh는 뭐가 달라?"
+  ],
+  "expected_queries": [
+    "쓰기 발생 시 알림 큐로 캐시를 무효화하면 최신성이 자동으로 맞아?",
+    "cache invalidation 메시지가 유실되거나 중복되면 어떻게 방어해야 해?",
+    "오래된 refresh 이벤트가 최신 cache 값을 덮어쓰지 못하게 하려면 뭘 둬야 해?",
+    "evict 방식과 refresh 방식은 read path 부하와 freshness에서 어떻게 달라?",
+    "notification queue lag와 cache age를 같이 봐야 하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "DB는 바뀌었는데 read cache가 오래된 값을 계속 반환한다.",
+    "cache evict 이벤트가 밀리면서 특정 화면만 stale하게 보인다.",
+    "중복/역순 refresh로 cache가 이전 버전으로 되돌아간다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-invalidation-patterns-primer",
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection"
+    ],
+    "next_docs": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "spring/spring-cache-transaction-after-commit-eviction-consistency",
+      "system-design/notification-read-to-min-version-bridge"
+    ],
+    "confusable_with": [
+      "system-design/redis-cache-aside-write-through-interview-chooser",
+      "spring/cacheable-redis-caffeine-interview-router",
+      "system-design/notification-system-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch217"
+      }
+    ]
+  }
+}
