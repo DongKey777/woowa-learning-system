@@ -1,0 +1,69 @@
+{
+  "id": "system-design/kafka-read-committed-lso-isolation-primer",
+  "title": "Kafka read_committed and Last Stable Offset Isolation Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka consumer의 `isolation.level=read_committed`는 transaction이 아직 결정되지 않았거나 abort된 record를 애플리케이션에 보여주지 않는다. 이 문서는 LSO(Last Stable Offset)가 high watermark와 log end offset과 어떻게 다르고, open transaction 때문에 lag가 이상해 보일 수 있으며, control record가 offset은 차지하지만 consumer record로는 표면화되지 않는다는 점을 중급자 관점에서 연결한다.",
+  "aliases": [
+    "Kafka read_committed consumer",
+    "Kafka Last Stable Offset",
+    "Kafka LSO high watermark 차이",
+    "read_committed isolation level",
+    "abort된 transaction 안 보임",
+    "카프카 read_committed",
+    "카프카 LSO",
+    "트랜잭션 메시지 안 보임",
+    "consumer lag 이상함",
+    "control record poll 안 나옴"
+  ],
+  "expected_queries": [
+    "read_committed가 뭐야?",
+    "LSO가 뭐야?",
+    "카프카 트랜잭션 메시지가 왜 안 보여?",
+    "consumer lag이 이상해. read_committed 때문일 수 있어?",
+    "Kafka LSO와 high watermark, log end offset 차이를 설명해줘",
+    "Kafka control record는 consumer poll 결과에 왜 안 나와?"
+  ],
+  "symptoms": [
+    "`read_committed`를 DB의 read committed isolation과 같은 의미로만 이해한다",
+    "consumer lag이 늘었는데 애플리케이션 poll에는 record가 안 보여서 원인을 못 잡는다",
+    "offset gap을 보고 Kafka가 record를 잃었다고 오해한다",
+    "control record가 consumer handler로 전달된다고 생각한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-transaction-coordinator-control-records-primer",
+      "system-design/kafka-offset-commit-timing-at-least-once-card",
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge"
+    ],
+    "next_docs": [
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser",
+      "system-design/outbox-cdc-delivery-semantic-chooser"
+    ],
+    "confusable_with": [
+      "system-design/kafka-out-of-order-commit-offset-gap-parallelism",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser",
+      "database/exactly-once-myths-db-queue",
+      "database/isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka transaction coordinator 내부 상태와 transaction log를 설명해줘",
+      "Kafka idempotent producer의 producer id와 sequence number를 설명해줘",
+      "Kafka offset commit timing과 at-least-once 중복 처리를 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "corpus-improvement-cycle2-v4"
+      }
+    ]
+  },
+  "body_markdown": "# Kafka read_committed and Last Stable Offset Isolation Primer\n\n## 한 줄 요약\n\n`isolation.level=read_committed` consumer는 Kafka log의 모든 offset을 애플리케이션 record로 보여주는 모드가 아니다. 아직 commit/abort가 결정되지 않은 transaction 뒤쪽은 LSO 때문에 멈춰 보일 수 있고, abort된 transactional record와 transaction control record는 poll 결과에서 걸러질 수 있다.\n\nretrieval-anchor-keywords: Kafka read_committed consumer, Last Stable Offset, LSO, high watermark, log end offset, aborted transaction filtering, control record offset gap, 카프카 트랜잭션 메시지 안 보임, consumer lag 이상함\n\n---\n\n## read_committed가 숨기는 것\n\nKafka transactional producer는 여러 record를 하나의 transaction으로 묶어 append할 수 있다. Consumer가 `read_committed`로 읽으면 Kafka는 transaction 결과가 확정되기 전까지 그 record들을 애플리케이션에 넘기지 않는다.\n\n핵심은 atomic visibility다.\n\n- committed transaction의 record는 transaction commit marker가 확인된 뒤 보인다.\n- aborted transaction의 record는 log에는 남아도 애플리케이션 record로 보이지 않는다.\n- open transaction의 record는 아직 결과가 없으므로 보이지 않는다.\n- open transaction보다 뒤에 있는 non-transactional record도 LSO 경계 뒤라면 같이 대기할 수 있다.\n\n따라서 `카프카 트랜잭션 메시지가 왜 안 보여?`라는 증상은 payload가 사라졌다는 뜻이 아닐 수 있다. Consumer가 `read_committed`이고 partition 앞쪽에 아직 닫히지 않은 transaction이 있으면, log end offset이 앞으로 갔어도 애플리케이션은 LSO 앞까지만 볼 수 있다.\n\n---\n\n## LSO, high watermark, log end offset\n\nOffset 관련 용어를 한 줄로 섞으면 lag 해석이 무너진다.\n\n| 용어 | 대략적 의미 | consumer 해석 |\n|---|---|---|\n| Log End Offset, LEO | 해당 replica log의 다음 append 위치 | 가장 앞선 물리적 끝에 가깝지만 replication 안정성과 visibility를 뜻하지 않는다 |\n| High Watermark, HW | in-sync replica들이 복제했다고 볼 수 있는 경계 | 일반 fetch가 읽을 수 있는 안정 복제 경계로 쓰인다 |\n| Last Stable Offset, LSO | 아직 결과가 확정되지 않은 가장 이른 transaction 앞의 경계 | `read_committed` consumer의 visibility 상한으로 봐야 한다 |\n\nOpen transaction이 없으면 LSO는 보통 HW를 따라간다. 하지만 오래 열린 transaction이 있으면 HW와 LEO는 계속 전진해도 LSO는 그 transaction 시작 근처에 머물 수 있다.\n\n```text\noffset: 40 41 42 43 44 45 46 47\n        A  T1 T1 B  C  T1 D  E\n             ^ open transaction T1 시작\n\nread_committed visibility upper bound: LSO near 41\n애플리케이션은 41 뒤쪽의 B, C, D, E도 아직 못 볼 수 있음\n```\n\n여기서 B, C, D, E가 non-transactional record여도 앞의 open transaction을 건너뛰어 순서를 깨고 보여주지 않는다고 이해하면 안전하다. Transaction이 commit되면 T1 record와 뒤 record들이 순서대로 열리고, abort되면 T1 record는 숨겨진 채 뒤 record들이 진행된다.\n\n---\n\n## lag이 이상해 보이는 이유\n\nConsumer lag dashboard는 어떤 기준 offset과 비교하느냐에 따라 다르게 보인다. 많은 운영 지표는 consumer committed offset을 high watermark나 log end 쪽 끝과 비교한다. 그런데 `read_committed` consumer는 LSO 뒤 record를 애플리케이션에 받을 수 없다.\n\n그래서 다음 현상이 가능하다.\n\n```text\ncommitted offset: 100\nLSO:              105\nhigh watermark:   180\nlog end offset:   182\n```\n\n이 경우 dashboard lag은 80개 전후로 보일 수 있지만, 애플리케이션이 지금 당장 처리 가능한 visible lag은 5개에 가까울 수 있다. 나머지는 아직 transaction 결과가 확정되지 않았거나 control record/aborted record 때문에 애플리케이션 record로 나타나지 않을 수 있다.\n\n운영 판단은 이렇게 나눠야 한다.\n\n- handler가 느린가: visible record 처리 latency와 commit 지연을 본다.\n- transaction이 오래 열려 있는가: LSO가 HW보다 오래 뒤처지는지 본다.\n- abort가 많은가: offset은 전진하는데 app record 수가 적고 gap이 많은지 본다.\n- producer 쪽 문제가 있는가: transaction timeout, abort rate, fencing 같은 producer/transaction 지표를 본다.\n\n`consumer lag이 이상해`라는 말만으로 consumer handler를 늘리면 틀릴 수 있다. LSO에 막힌 lag은 consumer instance를 늘려도 풀리지 않고, transaction을 닫는 쪽 원인을 봐야 한다.\n\n---\n\n## control record와 offset gap\n\nKafka transaction 결과는 log 안의 control record로 표시된다. Commit marker나 abort marker 같은 control record는 내부 메타데이터이며 일반 application payload가 아니다.\n\n중요한 점은 두 가지다.\n\n1. Control record도 log offset을 차지할 수 있다.\n2. Consumer API는 control record를 일반 `ConsumerRecord`처럼 handler에 넘기지 않는다.\n\n그래서 poll 결과의 offset이 이렇게 보일 수 있다.\n\n```text\nlog offsets:       10 11 12 13 14 15\nlog contents:      R  C  A  A  C  R\napp poll returns:  10             15\n```\n\n여기서 C는 control record, A는 aborted transactional record라고 보면 된다. 애플리케이션은 offset 10 다음에 15를 받았다고 해서 Kafka가 11부터 14를 유실했다고 결론내리면 안 된다. 그 offset들은 내부 marker이거나 `read_committed`에서 숨겨야 하는 record였을 수 있다.\n\nOffset gap은 세 가지 후보로 먼저 나눈다.\n\n- control record가 offset을 차지했지만 app record로는 filtering됨\n- aborted transaction record가 `read_committed`에서 filtering됨\n- out-of-order commit이나 manual seek처럼 consumer position을 직접 움직임\n\n마지막 항목은 이 문서의 중심이 아니다. 일반 offset commit timing과 partition 내부 gap tracking은 `kafka-offset-commit-timing-at-least-once-card`와 `kafka-out-of-order-commit-offset-gap-parallelism`에서 따로 다룬다.\n\n---\n\n## DB read committed와 다른 점\n\n이름이 비슷하지만 Kafka의 `read_committed`를 RDB isolation level과 그대로 대응시키면 안 된다. Kafka에서 이 설정은 consumer가 transactional record를 볼 때 transaction 결과가 확정된 record만 노출하겠다는 fetch visibility 옵션에 가깝다.\n\n| 질문 | Kafka read_committed 관점 |\n|---|---|\n| uncommitted record를 볼 수 있나 | 볼 수 없다 |\n| aborted record를 볼 수 있나 | 애플리케이션 record로는 볼 수 없다 |\n| non-transactional record는 항상 바로 보이나 | LSO 뒤라면 앞 open transaction 때문에 지연될 수 있다 |\n| control record를 handler가 받나 | 받지 않는다 |\n| 외부 DB side effect도 exactly once가 되나 | 아니다. Kafka transaction 범위 밖은 별도 idempotency가 필요하다 |\n\n---\n\n## 면접 답변 골격\n\n`read_committed`는 Kafka transactional producer가 쓴 record를 consumer에게 노출할 때, commit된 transaction만 보여주고 abort된 transaction은 숨기는 isolation 설정입니다. 이때 consumer는 high watermark나 log end offset까지 항상 읽는 것이 아니라 LSO, 즉 아직 결정되지 않은 가장 이른 transaction 앞 경계까지만 읽을 수 있습니다. 그래서 open transaction이 오래 남으면 dashboard lag은 커 보이는데 poll에는 record가 적게 나올 수 있습니다. 또 transaction commit/abort를 나타내는 control record는 offset은 차지하지만 application `ConsumerRecord`로는 전달되지 않아서 offset gap이 생길 수 있습니다.\n\n---\n\n## 범위 밖으로 넘길 것\n\n이 문서는 consumer visibility와 LSO 해석에 집중한다. 다음 주제는 여기서 깊게 흡수하지 않는다.\n\n- transaction coordinator 내부 상태와 transaction log 구조\n- idempotent producer의 producer id, epoch, sequence number dedup\n- 일반 offset commit timing, auto commit, at-least-once retry 설계\n- 외부 DB/API side effect의 exactly-once 보장 주장\n\n## 한 줄 정리\n\nKafka `read_committed`에서 안 보이는 record는 없어졌다는 뜻보다 아직 LSO 뒤에 있거나 abort/control filtering 대상일 가능성이 먼저다. Lag을 해석할 때는 committed offset 대 HW/LEO만 보지 말고 LSO와 transaction 상태를 함께 봐야 한다.\n"
+}

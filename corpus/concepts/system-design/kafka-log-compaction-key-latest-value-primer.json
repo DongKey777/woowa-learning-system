@@ -1,0 +1,84 @@
+{
+  "id": "system-design/kafka-log-compaction-key-latest-value-primer",
+  "title": "Kafka Log Compaction Key Latest Value Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka log compaction은 compacted topic에서 같은 key의 최신 value를 결국 남기도록 오래된 record를 정리하는 cleanup 정책이다. 시간/크기 retention처럼 오래된 segment를 통째로 지우는 모델과 다르며, state restore, changelog topic, cache warmup에 유용하지만 compaction 전 중복 record와 tombstone 처리, key별 ordering 범위를 함께 이해해야 한다.",
+  "body_markdown": "# Kafka Log Compaction Key Latest Value Primer\n\n## 한 줄 요약\n\nKafka log compaction은 compacted topic에서 같은 key의 오래된 값을 나중에 정리하고, key별 최신 value를 복원 가능한 형태로 남기는 cleanup 정책이다. 즉시 중복을 없애는 dedup 기능도 아니고, 시간/크기 retention과 같은 삭제 정책도 아니다.\n\n## compacted topic의 mental model\n\nKafka topic은 partition log에 record를 append한다. 일반 retention은 오래된 segment를 시간이나 크기 기준으로 지우지만, log compaction은 key를 기준으로 본다.\n\n```text\nkey=A value=v1 offset=10\nkey=B value=x1 offset=11\nkey=A value=v2 offset=12\n\ncompaction 후에는 보통 A의 v2, B의 x1이 복원에 필요한 최신 상태로 남는다\n```\n\n중요한 단어는 `eventually`다. Producer가 `A=v2`를 썼다고 broker log에서 `A=v1`이 즉시 사라지는 것은 아니다. Log cleaner가 닫힌 segment를 나중에 훑으면서 같은 key의 이전 값을 제거한다. 그래서 consumer는 compaction 전 구간에서 같은 key의 여러 값을 볼 수 있고, restore logic은 offset 순서대로 적용해 마지막 값이 이기도록 만들어야 한다.\n\n## tombstone은 삭제 marker다\n\nCompacted topic에서 특정 key를 삭제하고 싶을 때는 보통 key는 그대로 두고 value를 null로 둔 record를 쓴다. 이것을 tombstone이라고 부른다.\n\n```text\nkey=user-7 value={\"name\":\"Lee\"}\nkey=user-7 value=null   # tombstone\n```\n\nTombstone은 `user-7`의 최신 상태가 \"없음\"이라는 marker다. State store나 cache restore consumer는 tombstone을 읽으면 해당 key를 map에서 제거한다. Tombstone도 영원히 보장되는 별도 DB row가 아니다. 삭제 marker가 충분히 전파될 시간을 가진 뒤 compaction 과정에서 tombstone 자체도 정리될 수 있다. 그래서 tombstone retention 시간은 느린 consumer나 restore 작업이 delete marker를 볼 수 있을 만큼 잡아야 한다.\n\n## time/size retention과 다른 점\n\n| 구분 | 기준 | 남기는 것 | 조심할 점 |\n|---|---|---|---|\n| Time retention | record/segment age | 최근 기간의 log | key의 최신값도 오래되면 사라질 수 있다 |\n| Size retention | topic/partition 크기 | 크기 한도 안의 log | 오래된 최신값이 밀려날 수 있다 |\n| Log compaction | record key | key별 최신 value 또는 tombstone 의미 | cleanup은 비동기라 이전 값이 한동안 보일 수 있다 |\n\nCompaction은 보존 기간을 늘리는 마법이 아니다. `cleanup.policy=compact,delete`처럼 delete retention과 같이 쓰면 key별 최신값을 남기되 너무 오래된 segment도 지울 수 있다. 반대로 compact only topic은 상태 복원용 log로 오래 유지하는 경우가 많다. 설계할 때는 \"얼마 동안 record를 보관할까\"와 \"key별 최신 상태를 복원할 수 있을까\"를 분리해서 말해야 한다.\n\n## 어디에 유용한가\n\nLog compaction은 최신 상태 테이블을 log로 재구성해야 할 때 잘 맞는다.\n\n- Kafka Streams state store changelog: 로컬 state store를 잃었을 때 changelog를 읽어 복원한다.\n- Cache warmup: service가 시작할 때 compacted topic을 처음부터 읽어 key-value cache를 채운다.\n- Metadata/config topic: 사용자 설정, feature flag, routing metadata처럼 최신값만 의미 있는 데이터를 배포한다.\n- Projection rebuild: key별 최종 상태를 빠르게 따라잡고 이후 live update를 이어 읽는다.\n\n이 패턴의 핵심은 consumer가 log를 순서대로 읽으며 `state[key] = value`를 적용하고, tombstone이면 `delete state[key]`를 적용하는 것이다.\n\n## Caveat: duplicates before compaction\n\nCompacted topic을 읽는 consumer는 같은 key를 여러 번 볼 수 있다. 이것은 이상 현상이 아니다. Compaction 전에는 이전 값과 최신 값이 함께 남아 있고, compaction 후에도 cleaner가 모든 duplicate를 즉시 제거했다는 보장은 없다.\n\n따라서 compacted topic consumer는 보통 upsert 방식이어야 한다. `insert only`로 처리하면 같은 key의 이전 값이 중복 row를 만들 수 있다. Cache나 state store라면 key로 덮어쓰고, tombstone이면 삭제하는 식으로 처리한다.\n\n## Caveat: ordering scope is still partition/key\n\nKafka의 순서는 partition 안 offset 순서다. 같은 key가 같은 partition으로 가는 동안에는 restore consumer가 그 partition을 offset 순서대로 읽어 key의 마지막 값을 계산할 수 있다. 하지만 topic 전체의 전역 순서를 기대하면 안 된다.\n\nCompaction은 남은 record의 상대적 offset 순서를 뒤섞는 기능이 아니다. 다만 중간 record가 제거될 수 있으므로, compacted topic을 \"모든 변경 이력을 보존하는 event sourcing log\"처럼 쓰면 안 된다. 모든 상태 변경 하나하나가 감사나 재계산에 필요하면 별도의 immutable event log가 필요하고, compacted topic은 최신 상태 snapshot/changelog 성격으로 보는 편이 안전하다.\n\n## 경계\n\n이 문서는 Kafka topic cleanup으로서의 log compaction만 다룬다. MirrorMaker 복제 정책, transaction과 `read_committed`, LSM tree나 데이터베이스 storage compaction은 다른 주제다. 이름에 compaction이 들어가도 문제의 층이 다르므로 섞지 않는다.\n\n## 흔한 오해\n\n- \"compaction을 켜면 key 중복이 즉시 사라진다\": cleaner가 나중에 처리하므로 이전 값이 한동안 보일 수 있다.\n- \"compacted topic은 retention이 없는 무한 저장소다\": delete retention이나 tombstone retention, disk 한계와 운영 정책을 함께 봐야 한다.\n- \"tombstone은 그냥 빈 메시지다\": null value는 key 삭제 의도를 나타내는 marker로 해석해야 한다.\n- \"compacted topic이면 event sourcing이 된다\": 중간 변경 이력이 제거될 수 있어 전체 history 보존 용도가 아니다.\n- \"ordering은 topic 전체에서 보장된다\": 최신값 계산도 partition/key 범위의 순서로 이해해야 한다.\n\n## 면접 답변 축\n\nKafka log compaction을 설명할 때는 `key가 있는 record`, `같은 key의 최신 value를 eventually 남김`, `tombstone은 delete marker`, `time/size retention과 다른 cleanup 기준`, `state restore/changelog/cache warmup에 유용`, `compaction 전 duplicate와 per-key ordering caveat` 순서로 말하면 된다.\n\n## 한 줄 정리\n\nCompacted topic은 key별 최신 상태를 log에서 복원하기 위한 도구다. 최신값만 결국 남는다는 의미이지, 즉시 dedup되거나 모든 event history가 보존된다는 의미는 아니다.\n",
+  "aliases": [
+    "Kafka log compaction",
+    "compacted topic",
+    "Kafka tombstone",
+    "카프카 로그 컴팩션",
+    "카프카 compacted topic",
+    "Kafka key별 최신값",
+    "tombstone 메시지",
+    "Kafka 최신값 보존",
+    "카프카 tombstone 삭제"
+  ],
+  "expected_queries": [
+    "Kafka log compaction이 뭐야?",
+    "Kafka에서 키별 최신값만 남기는 이유가 뭐야?",
+    "Kafka tombstone 메시지가 뭐야?",
+    "compacted topic은 time retention이랑 뭐가 달라?",
+    "Kafka compacted topic을 state restore나 cache warmup에 쓰는 이유가 뭐야?",
+    "log compaction 전에는 같은 key duplicate가 보일 수 있어?"
+  ],
+  "symptoms": [
+    "log compaction을 시간 기반 retention과 같은 삭제 정책으로 설명한다",
+    "compacted topic에서 같은 key의 이전 값이 즉시 사라진다고 가정한다",
+    "tombstone record를 삭제 marker가 아니라 빈 메시지로만 이해한다",
+    "compacted topic을 모든 변경 이력을 보존하는 event sourcing log처럼 사용한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge"
+    ],
+    "next_docs": [
+      "system-design/kafka-streams-state-store-rocksdb-changelog-standby-recovery-primer",
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/event-sourcing-cqrs-primer"
+    ],
+    "confusable_with": [
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "system-design/event-sourcing-cqrs-primer",
+      "database/lsm-compaction-tombstone-read-amplification-playbook",
+      "system-design/data-retention-deletion-tombstone-gdpr-playbook"
+    ],
+    "forbidden_for_queries": [
+      "Kafka MirrorMaker 복제 정책을 설명해줘",
+      "Kafka transaction과 read_committed를 설명해줘",
+      "LSM tree compaction을 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "Kafka log compaction이 무엇인지 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "compacted topic과 retention의 차이를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "tombstone 메시지의 의미를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-log-compaction-key-latest-value-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "corpus-improvement-cycle2-v4"
+      }
+    ]
+  }
+}

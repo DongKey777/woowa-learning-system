@@ -1,0 +1,67 @@
+{
+  "id": "system-design/kafka-replication-isr-acks-min-insync-primer",
+  "title": "Kafka Replication ISR Acks Min Insync Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka replication durability를 leader/follower replica, ISR, replication factor, producer acks, min.insync.replicas, unclean leader election 기준으로 정리한다. 핵심은 `acks=all`만으로 안전을 단정하지 않고, 현재 ISR 크기와 min ISR, leader failover 정책까지 함께 보며 durability와 availability trade-off를 설명하는 것이다.",
+  "body_markdown": "# Kafka Replication ISR Acks Min Insync Primer\n\n## 한 줄 요약\n\nKafka에서 produce 성공의 내구성은 `replication.factor`, leader/follower replica, ISR, producer `acks`, `min.insync.replicas`, unclean leader election 정책을 함께 봐야 한다. `acks=all`은 강한 설정이지만, `min.insync.replicas=1`이거나 ISR이 leader 하나로 줄어든 상태를 허용하면 장애 때 기대한 만큼 안전하지 않을 수 있다.\n\n## 먼저 잡을 그림\n\nKafka topic partition은 여러 replica를 가질 수 있고, 그중 하나가 leader다. Producer write는 leader로 들어가고, follower replica는 leader log를 따라온다.\n\n```text\npartition orders-0\n  leader replica:   broker-1\n  follower replica: broker-2\n  follower replica: broker-3\n```\n\n`replication.factor=3`은 이 partition log의 복사본을 최대 3개 둔다는 뜻이다. 하지만 세 replica가 항상 같은 위치까지 따라온다는 뜻은 아니다. 실제 produce durability 판단에서는 현재 leader와 충분히 따라온 follower들의 집합인 ISR이 중요하다.\n\n## 용어를 분리하기\n\n| 용어 | 의미 | 헷갈리기 쉬운 점 |\n|---|---|---|\n| Leader replica | 해당 partition의 write/read 요청을 주로 받는 replica | leader에 append됐다고 모든 follower에 복제된 것은 아니다 |\n| Follower replica | leader log를 fetch해서 따라오는 replica | 늦어지면 ISR에서 빠질 수 있다 |\n| Replication factor | partition마다 유지하려는 replica 개수 | 현재 동기 복제 성공 개수가 아니다 |\n| ISR | leader와 충분히 따라온 in-sync replica 집합 | RF보다 작아질 수 있고, 장애 때 계속 변한다 |\n| `acks=0` | producer가 broker 응답을 기다리지 않음 | 빠르지만 성공 여부를 거의 모른다 |\n| `acks=1` | leader append 후 ack | follower 복제 전 leader 장애면 손실 가능성이 있다 |\n| `acks=all` | 현재 ISR replica들의 ack를 기다림 | min ISR이 낮으면 기대보다 약할 수 있다 |\n| `min.insync.replicas` | `acks=all` write를 받아들이기 위한 최소 ISR 크기 | `acks=1`을 강하게 만들어 주는 설정이 아니다 |\n\n## acks별 durability 감각\n\n`acks=0`은 fire-and-forget에 가깝다. Producer는 broker가 record를 받았는지 확인하지 않으므로 latency는 낮을 수 있지만, 네트워크 오류나 broker reject를 놓칠 수 있다.\n\n`acks=1`은 leader가 record를 log에 append하면 성공으로 본다. 이때 follower가 아직 복제하기 전 leader가 죽고, 새 leader가 그 record를 갖고 있지 않으면 손실될 수 있다. 그래서 `acks=1` 성공은 leader 단일 replica 기준의 성공이지 다중 replica 내구성 보장이 아니다.\n\n`acks=all` 또는 `acks=-1`은 leader가 현재 ISR에 있는 replica들의 ack를 기다린다. 이 설정은 Kafka 내부 복제 내구성을 높이는 핵심 축이다. 다만 ISR 자체가 leader 하나로 줄어든 상태에서도 write를 받아들이면 `all`이라는 이름과 달리 실제로는 한 replica에만 남은 record가 될 수 있다.\n\n## min.insync.replicas가 필요한 이유\n\n`min.insync.replicas`는 `acks=all`일 때 \"이 정도 ISR이 살아 있지 않으면 write를 실패시키자\"는 안전장치다.\n\n예를 들어 `replication.factor=3`, `min.insync.replicas=2`, producer `acks=all`이라고 하자.\n\n| 현재 ISR | write 결과 | 해석 |\n|---|---|---|\n| broker-1, broker-2, broker-3 | 성공 가능 | 세 replica가 따라오는 정상 상태 |\n| broker-1, broker-2 | 성공 가능 | 하나가 빠져도 최소 2개가 남아 있음 |\n| broker-1 | 실패해야 함 | leader 하나만 남은 상태의 write를 거절해 손실 위험을 줄임 |\n\n이 실패는 단순 장애가 아니라 의도된 backpressure다. 내구성을 지키기 위해 availability를 일부 포기하는 선택이다. 반대로 `min.insync.replicas=1`이면 ISR이 leader 하나만 남아도 `acks=all` write가 성공할 수 있으므로 장애 허용 수준이 낮아진다.\n\n## unclean leader election 위험\n\nLeader가 죽었을 때 가장 안전한 failover는 ISR 안에 있던 replica를 새 leader로 고르는 것이다. ISR replica는 leader를 충분히 따라왔기 때문에 이미 ack된 record를 잃을 가능성이 낮다.\n\n문제는 ISR replica가 하나도 살아 있지 않거나, cluster가 availability를 우선해 out-of-sync replica를 leader로 세우는 경우다. 이것이 unclean leader election이다. 서비스는 빨리 다시 열릴 수 있지만, 예전 leader에는 있었고 새 leader에는 없는 record가 사라질 수 있다.\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| unclean election 비활성 | ack된 record 손실 위험을 낮춤 | ISR replica가 돌아올 때까지 partition unavailable 가능 |\n| unclean election 활성 | 장애 상황에서 partition을 빨리 열 수 있음 | out-of-sync replica 승격으로 데이터 손실 가능 |\n\n즉 unclean leader election은 failover 성능 옵션이 아니라 durability와 availability의 경계선이다.\n\n## durability와 availability trade-off\n\nKafka replication 설정은 \"무조건 강하게\" 또는 \"무조건 빠르게\"가 아니라 경로별 요구사항에 맞춘다.\n\n| 목표 | 흔한 방향 | 받아들이는 비용 |\n|---|---|---|\n| 중요한 주문/결제 이벤트 | RF 3, `acks=all`, min ISR 2, unclean election 비활성 | broker 장애 중 produce 실패 증가 |\n| 로그성 telemetry | `acks=1` 또는 더 느슨한 정책 | 일부 손실 가능성 |\n| 장애 중 write availability 우선 | 낮은 min ISR 또는 unclean election 허용 | leader 장애나 failover 때 손실 가능성 |\n| 내구성 우선 운영 | ISR shrink 시 write reject를 정상 신호로 처리 | retry, buffer, degradation 설계 필요 |\n\n중요한 점은 producer retry나 idempotent producer가 이 표를 대신하지 않는다는 것이다. Retry는 실패를 다시 시도하는 방법이고, idempotent producer는 producer 재시도 중복을 줄이는 장치다. Broker replication durability는 ISR과 ack 정책으로 따로 닫아야 한다.\n\n## 운영에서 확인할 신호\n\n- topic별 `replication.factor`\n- producer별 `acks` 설정\n- topic/broker별 `min.insync.replicas`\n- under-replicated partition 수\n- ISR shrink/expand 빈도\n- `NotEnoughReplicas` 또는 `NotEnoughReplicasAfterAppend` 오류\n- leader election 횟수와 unclean leader election 발생 여부\n- broker 장애 중 producer retry, timeout, buffer 증가\n\n운영 알림은 단순히 broker up/down만 보면 부족하다. ISR이 줄어든 상태에서 write가 계속 성공하는지, 아니면 의도대로 reject되는지 봐야 내구성 설정이 실제로 작동하는지 알 수 있다.\n\n## 흔한 오해\n\n- \"replication factor 3이면 항상 세 벌에 저장된다\": 현재 ISR은 1이나 2로 줄어들 수 있다.\n- \"`acks=all`이면 무조건 안전하다\": min ISR이 낮거나 unclean election을 허용하면 손실 위험이 남는다.\n- \"`min.insync.replicas`를 올리면 availability도 좋아진다\": 내구성은 좋아지지만 ISR 부족 때 write 실패가 늘 수 있다.\n- \"unclean leader election은 빠른 복구 옵션일 뿐이다\": out-of-sync replica가 leader가 되면 ack된 record도 잃을 수 있다.\n- \"producer batching이나 compression을 조정하면 durability가 좋아진다\": throughput/latency 튜닝과 replication durability는 다른 축이다.\n\n## 면접 답변 축\n\nKafka replication durability 질문에는 \"partition마다 leader와 follower replica가 있고, producer write는 leader로 들어간 뒤 ISR follower들이 따라온다\"고 시작한다. 이어서 `replication.factor`는 목표 복제본 수, ISR은 현재 동기 상태 집합, `acks`는 producer가 어디까지 ack를 기다리는지, `min.insync.replicas`는 `acks=all`에서 최소 ISR 미달 write를 거절하는 안전장치라고 분리한다. 마지막으로 unclean leader election을 켜면 availability는 올라갈 수 있지만 out-of-sync replica 승격으로 데이터 손실 위험이 생긴다고 trade-off를 붙이면 된다.\n\n## 범위 밖\n\n이 문서는 broker replication durability foundation만 다룬다. Producer idempotence, transactions, `read_committed`, MirrorMaker, cluster 간 offset translation, log compaction은 별도 문서에서 다룬다.\n",
+  "aliases": [
+    "Kafka replication ISR",
+    "Kafka acks=all min.insync",
+    "카프카 ISR",
+    "카프카 acks all",
+    "min.insync.replicas",
+    "replication factor ISR",
+    "Kafka leader follower replica",
+    "카프카 복제 내구성",
+    "unclean leader election",
+    "Kafka acks 내구성 차이"
+  ],
+  "expected_queries": [
+    "카프카 ISR이 뭐야?",
+    "acks=all이면 안전한 거야?",
+    "min.insync.replicas가 왜 필요해?",
+    "replication factor 3이면 broker 하나가 죽어도 Kafka write는 안전한 거야?",
+    "unclean leader election을 켜면 어떤 데이터 손실 위험이 있어?",
+    "Kafka acks=1과 acks=all의 durability 차이를 설명해줘"
+  ],
+  "symptoms": [
+    "acks=all만 켜면 항상 안전하다고 생각한다",
+    "replication factor와 ISR을 같은 의미로 쓴다",
+    "unclean leader election을 단순 failover 옵션으로만 본다",
+    "acks=1 produce 성공을 다중 replica durable commit으로 오해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge"
+    ],
+    "next_docs": [
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/producer-retry-duplicate-origin-primer",
+      "system-design/failover-redundancy-primer"
+    ],
+    "confusable_with": [
+      "system-design/kafka-producer-batching-compression-tradeoff",
+      "system-design/kafka-partition-key-ordering-primer",
+      "system-design/producer-retry-duplicate-origin-primer",
+      "system-design/queue-delivery-semantics-beginner-primer"
+    ],
+    "forbidden_for_queries": [
+      "Kafka idempotent producer와 transaction으로 exactly-once를 설명해줘",
+      "Kafka read_committed isolation level을 설명해줘",
+      "MirrorMaker로 Kafka 클러스터 간 복제를 설계해줘",
+      "Kafka log compaction과 retention 차이를 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-replication-isr-acks-min-insync-primer.md",
+    "revision_history": [],
+    "updated_at": "2026-06-19T00:00:00+09:00",
+    "last_expansion_source": "corpus-improvement-cycle2-v4"
+  }
+}

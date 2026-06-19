@@ -1,0 +1,72 @@
+{
+  "id": "system-design/kafka-transaction-coordinator-control-records-primer",
+  "title": "Kafka Transaction Coordinator Control Records Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka transaction internals를 transactional.id, transaction coordinator, __transaction_state, producer epoch fencing, commit/abort control record 관점으로 연결한다. 핵심은 여러 topic partition에 이미 append된 record들을 coordinator가 하나의 transaction outcome으로 묶고, 각 partition에 marker를 써서 commit 또는 abort를 확정한다는 점이다. DB transaction 일반론이나 read_committed/LSO consumer visibility 세부 규칙이 아니라 Kafka 내부 원자적 write 경계의 입문 교량이다.",
+  "body_markdown": "# Kafka Transaction Coordinator Control Records Primer\n\n> 한 줄 요약: Kafka transaction은 `transactional.id`로 producer identity를 안정화하고, transaction coordinator가 `__transaction_state`에 상태를 저장한 뒤, 관련 partition에 commit/abort control record를 써서 여러 partition write의 outcome을 하나로 확정한다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Kafka Producer Consumer Flow, Offset, and Retention Beginner Bridge](./kafka-producer-consumer-flow-offset-retention-beginner-bridge.md)\n- [Producer Retry Duplicate Origin Primer](./producer-retry-duplicate-origin-primer.md)\n- [Kafka Ordering Delivery Interview Primer](./kafka-ordering-delivery-interview-primer.md)\n- [Exactly Once Stream Processing Idempotent Sinks Checkpoint Chooser](./exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser.md)\n\nretrieval-anchor-keywords: Kafka transaction coordinator, transactional.id, __transaction_state, Kafka control records, commit marker, abort marker, producer epoch fencing, zombie producer fencing, multi partition transaction atomic write, transaction markers, WriteTxnMarkers, EndTxn, 카프카 트랜잭션 코디네이터, 카프카 컨트롤 레코드, 좀비 프로듀서 fencing\n\n## 이 문서가 맡는 질문\n\n이 문서는 Kafka가 여러 partition에 쓴 record를 어떻게 하나의 transaction 결과로 묶는지 설명한다. 초점은 producer와 broker 내부 경계다.\n\n다루는 것:\n\n- `transactional.id`가 왜 필요한지\n- transaction coordinator가 어떤 역할을 하는지\n- `__transaction_state`가 무엇을 저장하는지\n- producer epoch가 zombie producer를 어떻게 fence하는지\n- commit marker와 abort marker가 왜 partition log에 들어가는지\n\n다루지 않는 것:\n\n- 관계형 DB transaction의 isolation level 일반론\n- consumer `read_committed`, Last Stable Offset, aborted transaction index의 세부 동작\n- 외부 DB, HTTP API, 결제 시스템 side effect까지 포함한 exactly-once 보장\n\n## 먼저 잡는 mental model\n\nKafka transaction은 이미 여러 partition log에 append된 data record에 나중에 결과표를 붙이는 구조에 가깝다.\n\n```text\nproducer with transactional.id\n  -> coordinator에서 producer id / epoch 확보\n  -> topic A partition 0에 record append\n  -> topic B partition 2에 record append\n  -> EndTxn(commit or abort)\n  -> coordinator가 각 partition에 transaction marker 기록\n```\n\nData record는 commit 결정 전에 partition log에 들어갈 수 있다. 그래서 Kafka transaction을 DB처럼 모든 write를 숨겨 두었다가 commit 순간에 한 번에 물리 반영한다고 상상하면 틀린다. Kafka는 log append 구조 위에서 transaction outcome을 marker로 확정한다.\n\n## transactional.id: 재시작해도 같은 producer identity를 찾는 이름\n\n`transactional.id`는 application instance가 Kafka transaction을 쓸 때 고정해서 주는 logical producer identity다. Coordinator는 이 id를 기준으로 producer id와 producer epoch를 관리한다.\n\n이 값이 중요한 이유는 재시작 때문이다. 같은 job이 죽었다가 다시 뜨면 새 네트워크 연결과 새 process를 갖지만, 같은 `transactional.id`로 coordinator에게 돌아온다. Coordinator는 이 id에 새 epoch를 부여하고 이전 epoch의 producer를 오래된 producer로 만든다.\n\n주의할 점은 `transactional.id`가 business transaction id가 아니라는 것이다. 주문 1건마다 새로 만드는 id가 아니라, transaction을 수행하는 producer instance를 식별하는 안정적인 이름에 가깝다.\n\n## transaction coordinator와 __transaction_state\n\nTransaction coordinator는 특정 `transactional.id`의 transaction metadata를 관리하는 broker 역할이다. 어떤 broker가 coordinator가 될지는 `transactional.id`가 매핑되는 `__transaction_state` partition의 leader로 결정된다.\n\n`__transaction_state`는 Kafka 내부 compacted topic이다. 여기에 coordinator가 다음 같은 정보를 기록한다.\n\n| 정보 | 의미 |\n|---|---|\n| transactional id | producer instance를 찾는 logical key |\n| producer id / epoch | broker가 old producer 요청을 거절하는 fencing 기준 |\n| transaction state | ongoing, prepare commit, prepare abort, complete 같은 진행 상태 |\n| touched partitions | marker를 써야 하는 topic partition 목록 |\n| timeout / metadata | 열린 transaction 정리와 복구에 필요한 정보 |\n\n이 topic은 사용자가 consume해서 업무 이벤트로 처리하는 topic이 아니다. Coordinator 복구와 transaction state 관리용 내부 log다.\n\n## producer epoch와 zombie fencing\n\nZombie producer는 이미 새 producer가 같은 `transactional.id`를 이어받았는데, 예전 producer process가 아직 살아 있거나 네트워크 지연 뒤에 늦게 요청을 보내는 상황이다.\n\n```text\nproducer P1(epoch 3) starts transaction\nP1 pauses or network partitions\nproducer P2 starts with same transactional.id\ncoordinator assigns epoch 4\nP1 comes back and tries to write or commit\nbroker rejects P1 because epoch 3 is stale\n```\n\n이 fencing이 없으면 오래된 producer가 늦게 commit을 보내 새 producer의 transaction과 섞일 수 있다. Producer epoch는 이런 old owner를 잘라내기 위한 단순한 세대 번호다.\n\n## commit marker와 abort marker\n\nCommit marker와 abort marker는 user payload record가 아니라 control record다. Coordinator가 transaction outcome을 결정한 뒤, transaction에 포함된 각 partition leader에게 marker 작성을 요청한다.\n\n| marker | partition log에서의 의미 | high-level 효과 |\n|---|---|---|\n| commit marker | 이 transaction의 records는 committed outcome이다 | transaction 결과가 성공으로 닫힘 |\n| abort marker | 이 transaction의 records는 aborted outcome이다 | transaction 결과가 실패로 닫힘 |\n\nAbort가 data record를 즉시 물리 삭제한다는 뜻은 아니다. Log에는 record와 marker가 함께 남을 수 있고, consumer visibility와 compaction/cleanup은 별도 규칙을 따른다. 여기서 중요한 것은 각 partition이 같은 transaction 결과를 알 수 있도록 control record를 가진다는 점이다.\n\n## 여러 partition write의 atomicity\n\nKafka transaction의 atomicity는 여러 topic partition에 걸친 Kafka write outcome을 하나로 묶는다는 뜻이다.\n\n예를 들어 producer가 A-0, A-1, B-3에 record를 썼다면, coordinator는 touched partition 목록을 알고 있다. Commit 시에는 각 partition에 commit marker를 쓰고, abort 시에는 각 partition에 abort marker를 쓴다. 그래서 transaction outcome 관점에서는 일부 partition만 commit되고 일부 partition은 abort되는 상태를 목표로 하지 않는다.\n\n단, 이 atomicity의 범위는 Kafka transaction에 들어간 Kafka records다. 외부 DB insert, REST API call, email 발송은 Kafka marker와 같은 transaction에 자동으로 묶이지 않는다. 그런 side effect는 idempotency key, outbox, reconciliation 같은 별도 장치가 필요하다.\n\n## 흔한 오해\n\n- `transactional.id`를 주문 id나 결제 id 같은 business transaction id로 이해한다.\n- `__transaction_state`를 사용자가 읽는 업무 topic으로 본다.\n- Abort marker가 이미 append된 data record를 즉시 삭제한다고 생각한다.\n- Commit marker를 producer가 직접 payload로 보내는 특별 메시지로 이해한다.\n- Producer epoch fencing 없이도 old producer가 안전하게 공존할 수 있다고 본다.\n- Kafka transaction을 켜면 외부 DB/API side effect까지 exactly-once가 된다고 말한다.\n- 이 문서를 `read_committed` consumer visibility와 LSO 세부 규칙 문서로 사용한다.\n\n## 면접 답변 축\n\nKafka transaction internals 질문에는 먼저 `transactional.id`로 producer identity를 고정하고 coordinator가 producer id와 epoch를 관리한다고 답한다. 이어서 coordinator가 `__transaction_state`에 transaction metadata와 touched partition 목록을 저장하고, commit/abort 결정 후 각 partition에 control record marker를 써서 outcome을 확정한다고 설명한다. 마지막으로 producer epoch는 zombie producer fencing 장치이고, 보장 범위는 Kafka records에 한정되며 외부 side effect는 별도 idempotency가 필요하다고 선을 긋는다.\n\n## 한 줄 정리\n\nKafka transaction coordinator는 `transactional.id`별 producer epoch와 transaction state를 관리하고, `__transaction_state`와 commit/abort control record를 통해 여러 partition write를 하나의 Kafka transaction outcome으로 닫는다.\n",
+  "aliases": [
+    "Kafka transaction coordinator",
+    "Kafka transaction control record",
+    "Kafka commit abort marker",
+    "transactional.id fencing",
+    "__transaction_state topic",
+    "producer epoch fencing",
+    "카프카 트랜잭션 코디네이터",
+    "커밋 어보트 마커",
+    "좀비 프로듀서 fencing",
+    "카프카 컨트롤 레코드",
+    "여러 partition transaction commit"
+  ],
+  "expected_queries": [
+    "카프카 트랜잭션 코디네이터가 뭐야?",
+    "commit marker abort marker가 뭐야?",
+    "__transaction_state가 뭐야?",
+    "좀비 프로듀서 fencing은 Kafka transaction에서 어떻게 동작해?",
+    "Kafka transaction은 여러 partition에 쓴 record를 어떻게 원자적으로 commit해?",
+    "transactional.id와 producer epoch가 왜 필요한지 high level로 설명해줘"
+  ],
+  "symptoms": [
+    "transactional.id를 business transaction id로 오해한다.",
+    "commit marker와 abort marker를 일반 payload record처럼 이해한다.",
+    "abort가 partition log의 data record를 즉시 물리 삭제한다고 생각한다.",
+    "producer epoch fencing 없이 old producer 요청도 안전하다고 본다.",
+    "Kafka transaction이 외부 DB/API side effect까지 자동으로 묶는다고 가정한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "system-design/producer-retry-duplicate-origin-primer",
+      "system-design/kafka-idempotent-producer-pid-sequence-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-read-committed-lso-isolation-primer",
+      "system-design/kafka-ordering-delivery-interview-primer",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+    ],
+    "confusable_with": [
+      "system-design/kafka-read-committed-lso-isolation-primer",
+      "database/transaction-basics",
+      "database/exactly-once-myths-db-queue",
+      "system-design/producer-retry-duplicate-origin-primer",
+      "system-design/exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser"
+    ],
+    "forbidden_for_queries": [
+      "Kafka consumer read_committed와 LSO 세부 동작을 설명해줘",
+      "DB transaction isolation level을 Kafka transaction과 비교해줘",
+      "외부 결제 API 호출까지 exactly-once로 묶는 방법을 알려줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "corpus-improvement-cycle2-v4"
+      }
+    ]
+  }
+}
