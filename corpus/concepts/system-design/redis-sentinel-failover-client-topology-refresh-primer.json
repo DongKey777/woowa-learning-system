@@ -1,0 +1,61 @@
+{
+  "id": "system-design/redis-sentinel-failover-client-topology-refresh-primer",
+  "title": "Redis Sentinel failover 뒤 client topology를 갱신하는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis Sentinel은 데이터 프록시가 아니라 master를 감시하고 장애 시 replica를 새 master로 승격하는 control-plane이므로, 애플리케이션 client가 새 master 주소를 다시 발견하고 연결을 갱신해야 쓰기 복구가 완료된다. Failover 동안 짧은 쓰기 실패, 오래된 master로의 연결, replica lag, 오래된 master fencing, split-brain 방지 설정을 함께 봐야 한다.",
+  "body_markdown": "# Redis Sentinel failover 뒤 client topology를 갱신하는 법\n\n> 한 줄 요약: Sentinel failover는 새 master를 뽑는 일이고, 애플리케이션이 그 master로 다시 붙는 일은 client topology refresh가 맡는다.\n\n## 기본 흐름\n\nSentinel은 Redis traffic을 대신 받아 전달하는 proxy가 아니다. Redis master를 감시하다가 장애라고 판단하면 replica 중 하나를 promote하고, 나머지 replica가 새 master를 바라보게 만드는 control-plane이다. 이때 애플리케이션은 고정 IP 하나만 믿기보다 master name으로 Sentinel에 현재 master를 물어보거나 Sentinel-aware client를 써야 한다.\n\n```text\nold master down\nSentinel quorum marks objective down\nleader election authorizes failover\nreplica promoted to new master\nclient discovers new master\nwrites resume after reconnect\n```\n\n## 확인할 것\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| 장애 판단은 안전한가 | quorum, leader election, down-after-milliseconds, network partition |\n| client는 새 master를 아는가 | Sentinel-aware client, DNS/proxy refresh, reconnect |\n| failover 중 쓰기는 어떻게 되나 | retry budget, idempotency, unknown outcome |\n| 데이터 손실 가능성은 | async replication lag, AOF/RDB policy, WAIT 한계 |\n\nSentinel은 Redis Cluster의 hash slot redirection과 다르다. Cluster는 slot owner를 따라가는 구조이고, Sentinel은 하나의 master-replica group에서 master 주소를 다시 찾는 구조다. 그래서 `MOVED`/`ASK`가 아니라 current master discovery와 reconnect가 핵심이다.\n\nFailover가 끝났어도 모든 client가 즉시 새 master로 붙는 것은 아니다. connection pool이 오래된 connection을 들고 있거나 DNS cache가 늦게 바뀌거나 client가 Sentinel event를 반영하지 못하면 `READONLY`, connection refused, write timeout, old master write 같은 증상이 남는다. Refresh trigger는 startup, reconnect, write failure, `READONLY`/role mismatch, Sentinel switch event, 주기적 safety check처럼 여러 층에 둔다.\n\n관측은 Sentinel이 보고한 master, client가 알고 있는 master, Redis `ROLE`, pool endpoint version, failover timestamp, replication offset과 lag를 같은 타임라인에 놓고 본다. Sentinel이 새 master를 선출해도 네트워크로 고립된 old master에 client가 계속 닿을 수 있다면 Sentinel 자체가 그 client의 쓰기를 자동으로 fencing하지 않는다. 쓰기 경로는 current master 확인, topology refresh, split-brain 방지 설정, 필요하면 애플리케이션 차원의 idempotency와 reconciliation으로 닫아야 한다.\n\n## 흔한 오해\n\n- Sentinel이 failover하면 애플리케이션 연결도 자동으로 새 master에 붙는다고 본다.\n- replication이 비동기라는 점을 잊고 acknowledged write가 절대 유실되지 않는다고 말한다.\n- failover 중 retry가 모두 안전하다고 보고 idempotency를 빼먹는다.\n- Redis Cluster redirection과 Sentinel master discovery를 같은 문제로 본다.\n- 오래된 pool connection이나 DNS cache를 확인하지 않는다.\n\n## 한 줄 정리\n\nRedis Sentinel 운영에서는 새 master 선출뿐 아니라 client가 새 topology를 발견하고, failover 중 쓰기 결과를 안전하게 다루는지가 복구 품질을 결정한다.\n",
+  "aliases": [
+    "Redis Sentinel failover",
+    "레디스 Sentinel 새 master 찾기",
+    "Sentinel-aware client",
+    "Redis master 주소 갱신",
+    "failover 뒤 READONLY 에러",
+    "Redis failover 중 쓰기 실패",
+    "old master로 계속 붙는 Redis client",
+    "Sentinel quorum",
+    "Sentinel이 프록시야?",
+    "Sentinel get master addr by name"
+  ],
+  "expected_queries": [
+    "Redis Sentinel failover 뒤 애플리케이션 client는 새 master 주소를 어떻게 알아?",
+    "Sentinel이 master를 바꿨는데 connection pool이 old master에 계속 붙으면 어떤 증상이 나와?",
+    "Redis failover 중 쓰기 요청은 retry해도 항상 안전한 거야?",
+    "Redis Sentinel과 Redis Cluster MOVED redirection은 뭐가 달라?",
+    "Sentinel quorum과 replica lag를 failover 때 왜 같이 봐야 해?"
+  ],
+  "symptoms": [
+    "Failover 뒤에도 일부 애플리케이션이 old master에 쓰려고 한다.",
+    "새 master 선출 직후 write timeout이나 READONLY error가 증가한다.",
+    "Failover 중 성공 여부를 모르는 쓰기를 재시도하면서 중복 처리가 생긴다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-basics-in-memory-kv-single-thread-primer",
+      "database/primary-replica-failover-recovery-beginner-primer"
+    ],
+    "next_docs": [
+      "database/failover-visibility-window-topology-cache-playbook",
+      "database/failover-split-brain-fencing-playbook",
+      "network/non-idempotent-retry-unknown-outcome-guardrail"
+    ],
+    "confusable_with": [
+      "system-design/redis-cluster-hash-slot-hash-tag-primer",
+      "system-design/redis-cluster-moved-ask-resharding-client-redirection-playbook",
+      "system-design/redis-maxmemory-eviction-policy-memory-pressure-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch221"
+      }
+    ]
+  }
+}

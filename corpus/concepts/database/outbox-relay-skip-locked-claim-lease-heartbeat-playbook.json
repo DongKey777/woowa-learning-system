@@ -1,0 +1,61 @@
+{
+  "id": "database/outbox-relay-skip-locked-claim-lease-heartbeat-playbook",
+  "title": "outbox relay가 SKIP LOCKED와 lease로 안전하게 claim하는 법",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "Outbox relay가 여러 worker로 event를 발행하려면 row를 claim하는 순간, lease 만료, heartbeat 연장, publish 성공 뒤 ack/delete 순서를 명확히 해야 한다. `SKIP LOCKED`는 경쟁 worker가 같은 row를 잡지 않게 도와주지만, worker crash, lease timeout, 중복 publish, starvation을 막으려면 idempotent publisher와 recovery scan이 필요하다.",
+  "body_markdown": "# outbox relay가 SKIP LOCKED와 lease로 안전하게 claim하는 법\n\n> 한 줄 요약: outbox relay의 핵심은 row를 빨리 가져오는 것이 아니라, worker가 죽어도 누가 다시 가져갈 수 있는지까지 정하는 것이다.\n\n## 기본 흐름\n\n여러 relay worker가 같은 outbox table을 읽으면 같은 event를 동시에 publish할 수 있다. 그래서 worker는 처리할 row를 짧게 claim하고, 처리 중이라는 표시와 lease 만료 시각을 남긴다.\n\n```text\nclaim rows with FOR UPDATE SKIP LOCKED\nset PROCESSING, owner_id, lease_until, attempts\ncommit claim transaction\npublish message outside DB lock\nmark published with owner/version condition after downstream ack\n```\n\n## 설계 질문\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| claim은 원자적인가 | transaction, status transition, batch size |\n| worker가 죽으면 | lease_until 만료 뒤 다른 worker가 reclaim |\n| 오래 처리하면 | heartbeat로 lease 연장, max lease budget |\n| 중복 publish는 | message id, idempotent consumer, relay dedup |\n| 공정성은 | ordering key, starvation, retry backoff |\n\n`SKIP LOCKED`는 이미 잠긴 row를 기다리지 않고 건너뛰게 해 처리량을 올린다. 하지만 broker publish 동안 DB row lock을 잡고 있으면 connection과 lock을 오래 붙잡아 전체 relay를 막을 수 있다. 보통은 짧은 transaction에서 `PROCESSING`, `owner_id`, `lease_until`, `attempts`를 저장하고 commit한 뒤 외부 publish를 수행한다.\n\n이것만으로 exactly-once publish가 되지는 않는다. Publish는 DB transaction 밖의 외부 side effect인 경우가 많아서, relay가 메시지를 보낸 뒤 ack 표시 전에 죽으면 같은 row를 다시 publish할 수 있다. 그래서 안정적인 `event_id`, message key, envelope를 유지하고 consumer dedup/idempotent transition이 기본이다. Published 표시도 `owner_id`, status, lease/version이 아직 내가 claim한 값인지 확인하는 conditional update로 닫는다.\n\nLease가 너무 짧으면 느린 publish가 아직 진행 중인데 다른 worker가 같은 row를 다시 잡는다. 너무 길면 죽은 worker의 row가 오래 묶인다. Lease 만료는 중복 실행 가능성을 열어 주는 visibility timeout이지 exactly-once 보장이 아니다. Heartbeat는 살아 있는 worker가 lease를 연장한다는 신호이며, oldest claimed age와 expired lease count를 운영 지표로 봐야 한다.\n\n## 흔한 오해\n\n- `SKIP LOCKED`를 쓰면 중복 publish가 완전히 사라진다고 본다.\n- worker crash 뒤 claim된 row를 누가 다시 처리할지 정하지 않는다.\n- lease를 길게 잡으면 안전하다고만 보고 backlog 지연을 보지 않는다.\n- publish 성공과 DB ack 표시 사이 crash를 고려하지 않는다.\n- ordering이 필요한 aggregate event를 여러 worker가 마음대로 섞어 보낸다.\n\n## 한 줄 정리\n\nOutbox relay claim 설계는 `SKIP LOCKED` 조회보다 lease, heartbeat, idempotency, publish-ack crash window를 함께 닫는 운영 계약이다.\n",
+  "aliases": [
+    "outbox relay SKIP LOCKED",
+    "outbox row를 worker가 잠깐 맡기",
+    "relay worker heartbeat",
+    "claim된 outbox row 다시 처리하기",
+    "outbox publish 중 worker 죽으면",
+    "lease_until 만료 후 재처리",
+    "outbox 중복 publish 막기",
+    "outbox worker가 row를 잡고 처리하기",
+    "outbox poller SKIP LOCKED",
+    "publish 후 markSent 전에 죽음"
+  ],
+  "expected_queries": [
+    "outbox relay worker가 SKIP LOCKED로 row를 claim할 때 worker가 죽으면 누가 다시 처리해?",
+    "outbox publish는 성공했는데 DB에 published 표시하기 전에 죽으면 중복 발행을 어떻게 막아?",
+    "relay worker heartbeat와 lease_until은 어떤 기준으로 잡아야 해?",
+    "FOR UPDATE SKIP LOCKED를 쓰면 outbox 메시지가 exactly once로 나가는 거야?",
+    "여러 outbox worker가 같은 aggregate event 순서를 섞지 않으려면 뭘 봐야 해?"
+  ],
+  "symptoms": [
+    "relay worker가 죽은 뒤 claimed 상태 row가 오래 남아 publish되지 않는다.",
+    "같은 outbox event가 두 번 publish되어 consumer dedup이 필요해진다.",
+    "SKIP LOCKED batch가 빠른 row만 계속 가져가고 오래된 row가 밀린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/queue-claim-skip-locked-fairness",
+      "database/transactional-claim-check-job-leasing"
+    ],
+    "next_docs": [
+      "design-pattern/outbox-relay-idempotent-publisher",
+      "database/outbox-saga-eventual-consistency",
+      "system-design/queue-backpressure-idempotency-perspective-map"
+    ],
+    "confusable_with": [
+      "system-design/job-queue-design",
+      "database/cdc-debezium-outbox-binlog",
+      "spring/service-layer-external-io-after-commit-outbox-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch221"
+      }
+    ]
+  }
+}

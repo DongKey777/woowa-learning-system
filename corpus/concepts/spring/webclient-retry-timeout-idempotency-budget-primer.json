@@ -1,0 +1,61 @@
+{
+  "id": "spring/webclient-retry-timeout-idempotency-budget-primer",
+  "title": "WebClient retry와 timeout budget을 멱등성 기준으로 정하는 법",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "WebClient retry는 timeout을 숨기는 자동 복구가 아니라, pool acquire/connect/write/read/response 같은 timeout phase를 구분한 뒤 전체 latency budget 안에서 안전하게 다시 보낼 수 있는 요청만 제한적으로 재시도하는 정책이다. 요청 bytes가 나간 뒤 결과를 모르는 쓰기에는 idempotency key와 조회/복구 경로가 필요하다.",
+  "body_markdown": "# WebClient retry와 timeout budget을 멱등성 기준으로 정하는 법\n\n> 한 줄 요약: retry를 붙이기 전에 이 요청을 다시 보내도 같은 결과로 수렴하는지와 전체 timeout budget을 먼저 정해야 한다.\n\n## 먼저 나눌 질문\n\nWebClient에서 pool acquire timeout, DNS/TCP connect timeout, TLS handshake, request write, first byte/body read, response timeout, caller deadline을 구분하고 retry를 붙이면 일시 장애에 강해질 수 있다. `pendingAcquireTimeout`, Netty connect timeout, `responseTimeout`, read/write handler, Reactor `timeout()`은 같은 의미가 아니다. Pool acquire timeout은 이번 attempt가 connection도 얻지 못했다는 뜻이고, connect timeout은 연결 성립 전 실패다. 반대로 request bytes가 일부라도 나간 뒤 write/read/response timeout이 났다면 원격 서버가 처리했는지 모르는 unknown outcome일 수 있다.\n\n```text\nclient sends payment approve\nclient times out waiting response\nserver may have approved payment\nclient retries same request\n```\n\n## retry 가능성 판단\n\n| 요청 | retry 기본 판단 |\n|---|---|\n| GET 조회 | 대체로 가능하지만 timeout budget과 cache 영향 확인 |\n| PUT/DELETE with stable resource identity | method semantics는 idempotent여도 version/precondition과 반복 side effect 확인 필요 |\n| POST 결제/주문 생성 | 결과 확인, idempotency key, 중복 방지 없이는 위험 |\n| streaming/SSE | 일반 retry보다 reconnect/replay protocol 필요 |\n\nRetry마다 새 timeout을 통째로 쓰면 사용자 요청 전체 latency가 예측 불가능하게 늘어난다. 그래서 attempt timeout, max attempts, backoff, jitter, total deadline, 남은 deadline 전달을 함께 둔다. 예를 들어 전체 1초 budget 안에서 300ms 시도 2번과 짧은 backoff를 쓸지, 한 번만 기다릴지 정해야 한다.\n\nWebClient connection pool 문제가 원인인데 retry만 늘리면 같은 constrained pool에 다시 들어가 pending acquire 대기가 더 쌓일 수 있다. `PoolAcquireTimeoutException`, DNS/connect timeout, response timeout, 5xx, 429는 원인이 다르므로 같은 retry 정책으로 묶지 않는다. Circuit breaker, bulkhead, rate limit도 retry 증폭을 막기 위한 이웃 정책이다. Idempotency key는 요청 bytes가 나간 뒤 결과를 모르는 POST/side-effect call을 다시 보낼 때의 replay 기준이어야 하며, 같은 key로 다른 payload가 오면 성공 replay가 아니라 conflict로 다뤄야 한다.\n\n## 흔한 오해\n\n- timeout이면 서버가 처리하지 않았다고 단정한다.\n- 모든 5xx와 timeout에 같은 retry를 붙인다.\n- POST 요청도 retry하면 언젠가 성공하니 안전하다고 본다.\n- retry 횟수만 정하고 전체 deadline을 정하지 않는다.\n- connection pool 포화에 retry를 더해 대기열을 더 키운다.\n\n## 한 줄 정리\n\nWebClient retry는 멱등성과 전체 deadline 안에서만 안전하며, timeout 원인을 구분하지 않으면 장애 완화가 아니라 중복 side effect와 부하 증폭이 된다.\n",
+  "aliases": [
+    "WebClient retry timeout",
+    "웹클라이언트 재시도 기준",
+    "WebClient pool acquire timeout과 retry",
+    "WebClient responseTimeout 뒤 재시도",
+    "WebClient total deadline",
+    "pending acquire timeout에 retry",
+    "WebClient POST timeout 후 idempotency key",
+    "retry에 backoff와 jitter를 얼마나 둘까",
+    "Mono.timeout vs responseTimeout",
+    "요청이 나간 뒤 timeout은 결과를 모를 수 있음"
+  ],
+  "expected_queries": [
+    "WebClient에서 pool acquire timeout과 response timeout은 retry 판단이 어떻게 달라?",
+    "WebClient POST 요청에서 bytes가 나간 뒤 timeout됐으면 idempotency key 없이 재시도해도 돼?",
+    "WebClient retry 횟수와 전체 timeout budget은 어떻게 같이 잡아야 해?",
+    "pending acquire timeout이 원인인데 retry를 늘리면 왜 더 나빠질 수 있어?",
+    "WebClient의 Mono.timeout과 responseTimeout은 retry 정책에서 어떻게 구분해야 해?"
+  ],
+  "symptoms": [
+    "timeout 뒤 같은 POST를 재시도해 외부 side effect가 중복된다.",
+    "retry를 늘린 뒤 WebClient connection pool 대기가 더 길어진다.",
+    "attempt timeout은 짧지만 전체 사용자 요청 latency가 길게 늘어진다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/webclient-connection-pool-timeout-tuning",
+      "network/non-idempotent-retry-unknown-outcome-guardrail"
+    ],
+    "next_docs": [
+      "spring/resilience4j-retry-circuit-breaker-bulkhead",
+      "design-pattern/circuit-breaker-bulkhead-timeout-pattern-language",
+      "spring/webclient-eventloop-blocking-dns-codec-pool-latency-router"
+    ],
+    "confusable_with": [
+      "spring/webclient-vs-resttemplate",
+      "spring/restclient-webclient-http-interface-decision-guide",
+      "system-design/queue-backpressure-idempotency-perspective-map"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch221"
+      }
+    ]
+  }
+}

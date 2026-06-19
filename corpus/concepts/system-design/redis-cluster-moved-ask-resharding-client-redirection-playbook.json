@@ -1,0 +1,61 @@
+{
+  "id": "system-design/redis-cluster-moved-ask-resharding-client-redirection-playbook",
+  "title": "Redis Cluster MOVED와 ASK redirection을 처리하는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis Cluster에서 `MOVED`는 slot 소유자가 바뀌었으니 client slot map을 갱신하라는 신호이고, `ASK`는 resharding 중인 slot을 이번 명령만 임시 대상 노드로 보내라는 신호다. Cluster client는 redirection을 따라가고 slot cache를 갱신해야 하며, multi-key 명령은 여전히 same-slot 제약을 지켜야 한다.",
+  "body_markdown": "# Redis Cluster MOVED와 ASK redirection을 처리하는 법\n\n> 한 줄 요약: MOVED는 slot map을 고치라는 신호이고, ASK는 migration 중인 slot에 대해 이번 요청만 임시로 따라가라는 신호다.\n\n## 언제 보이나\n\nRedis Cluster client는 key를 hash slot으로 계산하고, 그 slot을 가진 node로 명령을 보낸다. 그런데 resharding, failover, topology refresh 지연 때문에 client가 오래된 slot map을 들고 있으면 Redis가 redirection error를 돌려준다.\n\n```text\nclient sends GET user:7 to node A\nnode A replies MOVED 9189 10.0.0.8:6379\nclient refreshes slot map\nclient retries GET user:7 to node B\n```\n\n## MOVED와 ASK 차이\n\n| 신호 | 의미 | client 행동 |\n|---|---|---|\n| MOVED | 해당 slot의 소유자가 다른 node로 바뀌었다 | slot map을 갱신하고 새 owner로 재시도 |\n| ASK | resharding 중이라 이번 명령만 다른 node에 물어봐라 | 대상 node에 `ASKING` 후 이번 명령만 재시도 |\n| TRYAGAIN | migration/importing 중 지금은 처리할 수 없다 | 짧은 backoff 뒤 retry, slot map 영구 갱신 신호로 보지 않음 |\n\n`MOVED`를 받았는데 같은 node에 계속 재시도하면 redirect loop나 timeout으로 보일 수 있다. 반대로 `ASK`를 영구 slot map 변경처럼 저장하면 migration 중의 임시 상태를 잘못 확정할 수 있다.\n\nCluster client 라이브러리가 이 과정을 자동 처리하더라도 운영에서는 slot cache refresh, redirect 횟수, topology refresh 주기, 재시도 budget을 관측해야 한다. Client가 `CLUSTER SLOTS`나 `CLUSTER SHARDS` 같은 metadata로 topology cache를 갱신하는지, redirect가 특정 slot과 node에 몰리는지도 같이 본다. Resharding 중에는 정상적인 redirection이 잠깐 늘 수 있지만, 계속 증가하면 client가 topology를 갱신하지 못하거나 일부 node가 불안정하다는 신호일 수 있다.\n\nPipeline이나 batch 요청은 slot owner별로 나누어 보내고, 각 명령의 redirection을 따로 처리해야 한다. 응답 순서를 다시 맞추는 책임은 client에 남아 있으며, redirect retry가 write timeout의 결과 불확실성까지 해결해 주지는 않는다. 여러 key가 같은 slot에 있어야 한다는 CROSSSLOT 설계는 기존 hash slot/hash tag 문서의 소유 영역이고, 이 문서에서는 redirection 처리 caveat로만 본다.\n\nRedirect target이 private IP나 잘못된 hostname으로 나오면 client의 MOVED/ASK 처리 자체가 맞아도 timeout이 난다. Kubernetes, NAT, container 환경에서는 `cluster-announce-*` 계열 설정과 client에서 접근 가능한 endpoint가 맞는지 확인해야 한다.\n\n## 흔한 오해\n\n- Redis Cluster에서 prefix가 같으면 같은 node로 간다고 본다.\n- MOVED와 ASK를 둘 다 같은 영구 redirect로 처리한다.\n- pipeline이나 retry를 쓰면 cross-slot multi-key 제약이 사라진다고 생각한다.\n- client slot cache refresh 실패를 Redis 장애로만 본다.\n- resharding 중 redirect 증가를 전부 오류로 alert한다.\n\n## 한 줄 정리\n\nRedis Cluster redirection은 client가 slot topology 변화를 따라가는 경계이며, MOVED와 ASK의 의미를 구분하지 못하면 retry 폭증이나 stale slot cache 장애로 이어진다.\n",
+  "aliases": [
+    "Redis MOVED",
+    "Redis ASK redirection",
+    "레디스 클러스터 MOVED 에러",
+    "Redis slot map 갱신",
+    "resharding 중 ASKING",
+    "Redis Cluster redirect loop",
+    "MOVED랑 ASK 차이",
+    "클러스터 slot cache가 오래됨",
+    "Redis Cluster topology cache",
+    "ASKING은 왜 한 번만 써?"
+  ],
+  "expected_queries": [
+    "Redis Cluster에서 MOVED 에러가 나오면 client는 slot map을 어떻게 갱신해야 해?",
+    "Redis ASK redirection은 MOVED랑 뭐가 다르고 왜 ASKING을 보내야 해?",
+    "resharding 중 Redis client가 redirect loop에 빠지면 어디를 봐야 해?",
+    "Redis Cluster에서 TRYAGAIN은 MOVED처럼 slot map을 바꾸라는 뜻이야?",
+    "slot cache가 오래된 Redis client는 어떤 증상으로 보여?"
+  ],
+  "symptoms": [
+    "Redis Cluster resharding 뒤 client가 같은 node에 계속 재시도한다.",
+    "MOVED/ASK redirection이 늘면서 요청 timeout이 증가한다.",
+    "Redirect target이 private IP로 내려와 client가 새 node에 연결하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-cluster-hash-slot-hash-tag-primer",
+      "system-design/redis-basics-in-memory-kv-single-thread-primer"
+    ],
+    "next_docs": [
+      "system-design/shard-rebalancing-partition-relocation-design",
+      "system-design/hot-key-skew-mitigation-interview-playbook",
+      "system-design/redis-hot-key-big-key-operations-primer"
+    ],
+    "confusable_with": [
+      "system-design/redis-key-naming-namespace-primer",
+      "system-design/redis-client-side-caching-tracking-invalidation-primer",
+      "system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch221"
+      }
+    ]
+  }
+}

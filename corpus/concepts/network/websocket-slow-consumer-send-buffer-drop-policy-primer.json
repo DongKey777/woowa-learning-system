@@ -1,0 +1,61 @@
+{
+  "id": "network/websocket-slow-consumer-send-buffer-drop-policy-primer",
+  "title": "느린 WebSocket client가 send buffer를 밀어 올릴 때의 처리법",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "WebSocket server가 빠르게 메시지를 만들고 client가 천천히 읽으면 connection별 send buffer와 application queue가 쌓여 메모리, latency, fan-out 지연을 키운다. 느린 consumer를 무한히 기다릴지, 오래된 메시지를 버릴지, 연결을 끊을지, replay 가능한 저장소로 넘길지 drop policy를 정해야 한다.",
+  "body_markdown": "# 느린 WebSocket client가 send buffer를 밀어 올릴 때의 처리법\n\n> 한 줄 요약: WebSocket backpressure는 서버 전체 문제가 되기 전에 connection별 queue 한도와 버릴 기준을 정해야 한다.\n\n## 문제가 되는 장면\n\n채팅, 알림, 시세처럼 서버가 계속 메시지를 보내는데 어떤 client의 네트워크가 느리거나 브라우저가 읽지 못하면 서버의 send buffer나 application queue가 쌓인다. WebSocket ping/pong이 성공한다는 것은 연결 liveness를 보여 줄 뿐, 사용자 payload가 지연 없이 소비되고 있다는 뜻은 아니다. 이 client 하나를 계속 기다리면 같은 event loop, thread, room broadcast가 같이 느려질 수 있다.\n\n```text\nproducer emits messages faster than client reads\nper-connection queue grows\nmemory and send latency increase\nserver applies drop or disconnect policy\n```\n\n## 정책 선택\n\n| 요구 | 가능한 정책 |\n|---|---|\n| 모든 메시지가 반드시 필요 | DB inbox, stream replay, backpressure to producer |\n| 최신 상태만 중요 | old message drop, coalesce latest state |\n| 실시간성이 더 중요 | queue limit 초과 시 disconnect |\n| 사용자별 차이가 큼 | per-connection quota, slow consumer metrics |\n\nWebSocket 자체가 durable queue는 아니다. 연결이 느리거나 끊긴 동안의 메시지를 반드시 회복해야 한다면 DB inbox, durable log, Kafka 같은 저장 경로가 따로 있어야 한다. SSE replay buffer도 retention window 안에서만 도움이 되며, durable 저장소가 뒷받침되지 않으면 장시간 offline replay를 보장하지 않는다. 반대로 presence, typing, progress 같은 신호는 오래된 메시지를 버리고 최신 상태만 보내는 편이 낫다.\n\n운영에서는 connection별 queued bytes, queued message count, oldest queued age, write-blocked duration, dropped/coalesced count, disconnect reason, ping/pong RTT를 남긴다. High-watermark에서 drop이나 close를 걸고 low-watermark 아래로 내려왔을 때만 다시 정상 전송으로 보는 식의 hysteresis도 필요할 수 있다. 전체 active connection 수만 보면 느린 소수 client가 서버 메모리를 잡아먹는 상황을 놓칠 수 있다.\n\n## 흔한 오해\n\n- WebSocket send 호출이 성공하면 client가 이미 메시지를 처리했다고 본다.\n- 느린 client 하나를 무한히 기다려도 다른 client에 영향이 없다고 생각한다.\n- 모든 메시지를 WebSocket buffer에 쌓아 두면 offline replay가 된다고 착각한다.\n- drop policy 없이 queue 크기만 늘린다.\n- 느린 consumer와 heartbeat timeout을 같은 원인으로만 본다.\n\n## 한 줄 정리\n\n느린 WebSocket consumer는 connection별 backpressure 문제이며, queue 한도와 drop/disconnect/replay 정책을 정하지 않으면 한 client의 지연이 서버 전체 지연으로 번질 수 있다.\n",
+  "aliases": [
+    "WebSocket slow consumer",
+    "웹소켓 느린 클라이언트",
+    "send buffer가 계속 쌓임",
+    "WebSocket message drop policy",
+    "느린 client 때문에 broadcast 지연",
+    "per-connection queue limit",
+    "웹소켓 큐가 메모리를 먹음",
+    "오래된 WebSocket 메시지 버리기",
+    "ping pong은 되는데 메시지는 밀려",
+    "per-client outbound queue overflow"
+  ],
+  "expected_queries": [
+    "WebSocket client가 느리게 읽어서 send buffer가 쌓이면 서버는 메시지를 계속 기다려야 해?",
+    "느린 웹소켓 클라이언트 하나 때문에 broadcast가 늦어질 때 어떤 drop policy를 둬야 해?",
+    "WebSocket queue limit을 넘으면 오래된 메시지를 버릴지 연결을 끊을지 어떻게 정해?",
+    "웹소켓으로 보낸 메시지는 client가 처리한 것까지 보장하는 거야?",
+    "offline replay가 필요한 알림을 WebSocket send buffer에만 쌓아 두면 왜 위험해?"
+  ],
+  "symptoms": [
+    "특정 client의 send queue가 커지면서 서버 메모리가 증가한다.",
+    "방 하나에 느린 client가 섞이면 전체 broadcast latency가 오른다.",
+    "연결이 끊긴 사용자에게 보낼 메시지를 WebSocket buffer에만 의존한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/websocket-basics",
+      "network/websocket-heartbeat-backpressure-reconnect"
+    ],
+    "next_docs": [
+      "system-design/websocket-cross-server-fanout-pubsub-kafka-primer",
+      "system-design/queue-backpressure-idempotency-perspective-map",
+      "network/client-disconnect-499-broken-pipe-cancellation-proxy-chain"
+    ],
+    "confusable_with": [
+      "network/websocket-vs-sse-vs-long-polling-realtime-intermediate-primer",
+      "spring/sse-disconnect-observability-patterns",
+      "system-design/publish-subscribe-messaging-basics-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch221"
+      }
+    ]
+  }
+}
