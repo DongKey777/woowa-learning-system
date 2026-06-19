@@ -1,0 +1,69 @@
+{
+  "id": "spring/jpa-persistence-context-lifecycle-primer",
+  "title": "JPA Persistence Context Lifecycle Primer",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "영속성 컨텍스트는 EntityManager가 관리하는 작업 단위이고, Spring JPA 기본 흐름에서는 보통 트랜잭션 경계에서 열리고 닫힌다. OSIV가 켜져 있으면 웹 요청 끝까지 더 오래 살아 있어 lazy loading은 가능해지지만, 숨은 SQL과 경계 혼동이 생길 수 있다.",
+  "body_markdown": "# JPA Persistence Context Lifecycle Primer\n\n> 한 줄 요약: 영속성 컨텍스트는 EntityManager가 관리하는 작업 단위이고, Spring JPA 기본 흐름에서는 보통 transaction 경계에서 열리고 닫히며, OSIV가 켜지면 request 끝까지 더 오래 살아 있을 수 있다.\n\n## 이 문서가 맡는 질문\n\n학습자 질문은 보통 이렇게 들어온다.\n\n- 영속성 컨텍스트가 언제 열리고 닫히나\n- `@Transactional` 메서드가 끝나면 엔티티는 어떻게 되나\n- OSIV를 켜면 transaction은 끝났는데 왜 lazy loading이 되나\n- `flush`, `clear`, `detach`, `close`가 각각 어떤 경계인가\n\n이 문서는 깊은 튜닝보다 lifecycle 감각을 먼저 잡는 중간 다리다. 더 깊은 `flush/clear/detach` 세부는 별도 문서로 넘기고, 여기서는 언제 managed가 되고 언제 detached가 되는지에 집중한다.\n\nretrieval-anchor-keywords: persistence context lifecycle, EntityManager lifecycle, transaction scoped persistence context, Spring JPA transaction boundary, OSIV request boundary, managed detached lifecycle, persistence context close, clear detach flush boundary, 영속성 컨텍스트 언제 열리고 닫히나, 트랜잭션 끝나면 detached, OpenEntityManagerInViewFilter\n\n## 먼저 한 줄 모델\n\nSpring에서 JPA를 쓸 때 application code가 주입받는 `EntityManager`는 보통 proxy다. 실제 작업에 쓰이는 persistence context는 transaction manager나 OSIV 같은 infrastructure가 필요한 시점에 만들고 현재 thread에 묶는다.\n\n가장 흔한 기본 흐름은 이것이다.\n\n```text\nservice @Transactional 진입\n  -> transaction begin\n  -> EntityManager / persistence context가 현재 thread에 bind\n  -> repository 조회와 저장이 같은 persistence context를 공유\n  -> managed entity 변경을 dirty checking 대상으로 추적\n  -> commit 직전 또는 query 전 flush\n  -> commit 또는 rollback\n  -> transaction-scoped persistence context 종료\n  -> managed였던 entity는 detached가 됨\n```\n\n즉 persistence context는 단순 cache가 아니라 transaction 동안 엔티티 identity와 변경 추적을 맡는 작업 메모리다.\n\n## transaction-scoped context\n\nSpring JPA의 기본 감각은 transaction-scoped persistence context다. `@Transactional` public service method에 들어가면 transaction manager가 EntityManager를 준비하고, 그 안에서 조회한 entity는 managed state가 된다.\n\n```text\n@Transactional method 시작\n  -> persistence context 열림\nfindById\n  -> entity managed\nentity.changeName\n  -> dirty checking 후보\nmethod 정상 종료\n  -> flush 후 commit\n  -> persistence context 닫힘\n  -> entity detached\n```\n\n여기서 중요한 점은 `save()` 호출 여부보다 entity state다. 이미 managed인 entity를 바꾸면 persistence context가 변경을 기억하고 flush 시점에 SQL로 보낼 수 있다. 반대로 persistence context가 닫힌 뒤 detached가 된 entity를 바꿔도 자동 dirty checking은 일어나지 않는다.\n\n## request와 transaction은 같은 경계가 아니다\n\nHTTP request 하나가 항상 persistence context 하나라는 뜻은 아니다. OSIV 설정에 따라 request와 transaction의 관계가 달라진다.\n\n| 설정 감각 | persistence context 수명 | transaction 수명 | 보이는 효과 |\n|---|---|---|---|\n| OSIV off | 보통 service transaction 끝에서 닫힘 | service transaction과 거의 같이 끝남 | controller나 serializer에서 lazy 접근하면 빨리 실패한다 |\n| OSIV on | request 시작부터 끝까지 열려 있을 수 있음 | service transaction은 중간에 끝남 | controller나 JSON serialization 중 lazy loading SQL이 나갈 수 있다 |\n\nOSIV on에서는 service transaction이 commit된 뒤에도 persistence context가 request 끝까지 살아 있을 수 있다. 그래서 controller나 Jackson 직렬화가 lazy association을 읽어도 예외가 안 날 수 있다.\n\n하지만 이건 transaction이 계속 열려 있다는 뜻이 아니다. DB 접근이 web response 단계로 밀려 나가고, 어떤 field가 SQL을 유발했는지 숨기기 쉬워진다는 뜻이다.\n\n## managed와 detached를 lifecycle로 보기\n\n엔티티 상태를 lifecycle에 붙이면 덜 헷갈린다.\n\n| 상태 | 언제 생기나 | 무엇이 가능한가 | 흔한 착각 |\n|---|---|---|---|\n| transient | 아직 persistence context에 붙지 않은 새 객체 | 그냥 Java 객체처럼 사용 | id가 있으면 곧바로 managed라고 생각함 |\n| managed | 열린 persistence context 안에서 조회되거나 persist됨 | dirty checking, lazy loading, first-level cache | 모든 request 동안 계속 managed라고 생각함 |\n| detached | persistence context close, clear, detach 뒤 | 값은 읽을 수 있지만 자동 추적은 안 됨 | 필드 수정이 commit 때 자동 반영된다고 생각함 |\n| removed | managed entity가 remove 대상이 됨 | flush 때 delete SQL 후보 | Java 객체가 바로 사라진다고 생각함 |\n\n`LazyInitializationException`은 보통 detached 상태에서 아직 초기화되지 않은 lazy association을 읽으려 할 때 드러난다. 그래서 질문의 핵심은 lazy 자체보다 그 getter를 호출한 시점에 열린 persistence context가 있었는가다.\n\n## flush, clear, detach는 닫힘과 다르다\n\nLifecycle을 볼 때 네 동사를 분리해야 한다.\n\n| 동작 | 의미 | persistence context는 계속 열려 있나 | entity 상태 변화 |\n|---|---|---|---|\n| `flush()` | 변경 내용을 SQL로 동기화 | 예 | managed 상태는 유지됨 |\n| `clear()` | 관리 중인 모든 entity를 분리 | 예 | 전부 detached |\n| `detach(entity)` | 특정 entity만 분리 | 예 | 그 entity만 detached |\n| `close()` | EntityManager와 persistence context 종료 | 아니오 | 남아 있던 managed entity가 detached |\n\n따라서 `flush()`는 commit도 아니고 close도 아니다. SQL을 보낼 뿐 rollback 가능성은 남아 있고, entity도 여전히 managed일 수 있다. 반면 `clear()`와 `detach()`는 persistence context를 닫지는 않지만 managed boundary를 끊는다.\n\n## OSIV가 lifecycle 감각을 흔드는 지점\n\nOSIV가 켜져 있으면 아래 흐름이 가능하다.\n\n```text\nrequest 시작\n  -> OSIV가 EntityManager / persistence context open\nservice @Transactional 시작\n  -> 같은 persistence context가 transaction에 참여\nrepository 조회\n  -> entity managed\nservice 종료\n  -> flush / commit\n  -> transaction 종료\ncontroller / serializer\n  -> lazy association 접근\n  -> 추가 SQL 가능\nrequest 종료\n  -> persistence context close\n  -> entity detached\n```\n\n이 흐름은 초반에는 편하다. service 밖에서도 lazy loading이 되기 때문이다. 하지만 운영에서는 query count가 response shape에 따라 바뀌고, connection hold time이나 serialization 단계 SQL을 추적해야 하는 비용이 생긴다.\n\n그래서 OSIV는 LazyInitializationException을 없애는 만능 해결책이 아니라, persistence context 수명을 request boundary까지 늘리는 trade-off다.\n\n## 빠른 라우팅 경계\n\n| 학습자 질문 | 이 문서에서 답할 부분 | 다음에 볼 문서 |\n|---|---|---|\n| 영속성 컨텍스트가 언제 열리고 닫혀? | transaction-scoped와 OSIV request-scoped 수명 | 이 문서 |\n| flush와 commit이 같은 거야? | flush는 SQL 동기화, commit은 확정 | JPA Flush Commit Transaction Interview Router |\n| clear나 detach를 언제 써? | managed boundary를 끊는 동작 | Persistence Context Flush Clear Detach Boundaries |\n| LazyInitializationException이 왜 나? | close 이후 lazy 접근 가능성 | LazyInitializationException Debug Sequence |\n| OSIV를 켜도 돼? | request 끝까지 context를 열어 두는 효과 | Open Session In View Trade-offs |\n| save, persist, merge가 헷갈려 | entity state transition 문제 | Spring Data JPA save, persist, and merge State Transitions |\n\n## 실전 점검 순서\n\n1. 지금 코드가 `@Transactional` service boundary 안인지 확인한다.\n2. entity를 조회한 시점과 DTO로 닫은 시점을 분리한다.\n3. service 밖 controller, serializer, view에서 lazy getter가 호출되는지 본다.\n4. OSIV on/off에 따라 persistence context가 request 끝까지 살아 있는지 해석한다.\n5. `flush()`를 close나 commit으로 착각하지 않는다.\n6. `clear()`나 `detach()` 뒤에는 entity 수정과 lazy 접근이 자동 추적되지 않는다고 본다.\n\n## 리뷰에서 쓰는 한 문장\n\n리뷰 답변에서는 이렇게 말하면 안전하다.\n\n```text\nSpring JPA 기본값에서는 service transaction 동안 persistence context가 열리고, commit 또는 rollback 후 닫히면서 managed entity가 detached가 됩니다. OSIV가 켜져 있으면 request 끝까지 context가 남아 lazy loading이 가능하지만, 그만큼 응답 계층 SQL과 경계 혼동이 생길 수 있습니다.\n```\n\n## 한 줄 정리\n\n영속성 컨텍스트의 생명주기는 transaction boundary가 기본이고 OSIV가 있으면 request boundary까지 늘어날 수 있으며, close 이후 entity는 detached가 되어 dirty checking과 안전한 lazy loading을 더 이상 기대할 수 없다.\n",
+  "aliases": [
+    "영속성 컨텍스트가 언제 열리고 닫히나",
+    "persistence context lifecycle",
+    "transaction-scoped EntityManager 생명주기",
+    "transaction scoped persistence context",
+    "OSIV에서 영속성 컨텍스트가 요청 끝까지 가나요",
+    "managed 상태와 detached 상태 전환",
+    "트랜잭션 끝나면 엔티티가 detached 되나요",
+    "OSIV 켜면 영속성 컨텍스트가 요청 끝까지 가나요",
+    "EntityManager가 언제 닫혀요",
+    "flush clear detach close 차이"
+  ],
+  "expected_queries": [
+    "영속성 컨텍스트가 언제 열리고 닫히는지 transaction scoped와 OSIV 기준으로 설명해줘",
+    "@Transactional 메서드가 끝나면 managed entity가 detached 되는 흐름을 알려줘",
+    "OSIV가 켜져 있으면 transaction은 끝났는데 lazy loading이 되는 이유가 뭐야?",
+    "flush, clear, detach는 persistence context close와 어떤 점이 달라?",
+    "LazyInitializationException은 persistence context close와 어떻게 연결돼?"
+  ],
+  "symptoms": [
+    "HTTP 요청, 트랜잭션, 영속성 컨텍스트의 경계를 모두 같은 것으로 착각한다.",
+    "트랜잭션이 끝난 뒤에도 entity가 계속 managed라고 생각해 dirty checking이나 lazy loading을 기대한다.",
+    "OSIV가 켜져 예외가 사라지면 조회 경계 문제가 해결됐다고 오해한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/transactional-basics",
+      "spring/spring-persistence-transaction-web-service-repository-primer"
+    ],
+    "next_docs": [
+      "spring/persistence-context-flush-clear-detach-boundaries",
+      "spring/open-session-in-view-tradeoffs",
+      "spring/spring-lazyinitializationexception-debug-sequence",
+      "spring/data-jpa-save-persist-merge-state-transitions"
+    ],
+    "confusable_with": [
+      "spring/jpa-flush-commit-transaction-interview-router",
+      "spring/open-session-in-view-tradeoffs",
+      "spring/spring-lazyinitializationexception-debug-sequence"
+    ],
+    "forbidden_for_queries": [
+      "spring/persistence-context-flush-clear-detach-boundaries",
+      "spring/jpa-flush-commit-transaction-interview-router",
+      "spring/open-session-in-view-tradeoffs",
+      "spring/spring-lazyinitializationexception-debug-sequence",
+      "spring/datajpatest-bulk-update-stale-state-mini-guide",
+      "database/hibernate-jdbc-batch-size-flush-clear-primer"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch210"
+      }
+    ]
+  }
+}

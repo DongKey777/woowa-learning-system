@@ -1,0 +1,69 @@
+{
+  "id": "language/memory-visibility-instruction-reordering-volatile-primer",
+  "title": "Memory Visibility, Instruction Reordering, volatile Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "이 primer는 Java에서 다른 스레드가 초기화가 보장되지 않은 객체 참조를 보거나, 코드에 쓴 순서와 다른 관찰 결과가 생긴다는 말을 visibility, happens-before, instruction reordering, volatile write/read 관점으로 풀어 설명한다.",
+  "body_markdown": "# Memory Visibility, Instruction Reordering, `volatile` Primer\n\n## 이 문서가 맡는 질문\n\n\"다른 스레드가 안 만든 객체를 본다\", \"명령 순서가 바뀐다\"는 말은 객체가 마법처럼 생기거나 코드 줄이 실제로 사라진다는 뜻이 아니다. 더 정확히는 **한 스레드의 write들이 다른 스레드에게 어떤 순서와 값으로 관찰되는지 보장되지 않을 수 있다**는 뜻이다.\n\n이 문서는 Java Memory Model을 처음부터 다시 설명하기보다, 아래 상황을 이해하는 데 집중한다.\n\n```java\nclass Holder {\n    int data;\n    boolean ready;\n\n    void writer() {\n        data = 42;\n        ready = true;\n    }\n\n    int reader() {\n        if (ready) {\n            return data;\n        }\n        return -1;\n    }\n}\n```\n\n코드만 보면 `data = 42`가 먼저고 `ready = true`가 나중이다. 하지만 두 필드가 일반 필드이고 두 스레드 사이에 happens-before edge가 없으면 reader가 `ready == true`를 보고도 `data == 0`을 볼 수 있다고 설명한다. 이 현상이 바로 visibility와 reordering을 함께 봐야 하는 이유다.\n\n## Visibility: 쓴 값과 보이는 값은 다르다\n\n멀티스레드 코드에서는 \"writer가 값을 썼다\"와 \"reader가 그 값을 본다\"가 같은 말이 아니다. 각 스레드는 레지스터, CPU cache, JIT 최적화, 실행 타이밍의 영향을 받는다. Java 코드의 정답은 하드웨어 세부를 직접 외우는 것이 아니라 JMM의 synchronization 규칙으로 판단한다.\n\n가시성 문제가 있으면 이런 증상이 나온다.\n\n- 한 스레드가 `stop = true`를 썼는데 다른 스레드 loop가 멈추지 않는다.\n- `ready == true`는 보였는데 `data`는 예전 값처럼 보인다.\n- 객체 reference는 보였는데 생성자에서 넣은 non-final field 값이 보장되지 않은 것처럼 보인다.\n\n여기서 \"안 만든 객체를 본다\"는 표현은 보통 **참조는 publish됐지만 초기화 write들이 reader에게 안전하게 이어진다는 보장이 없다**는 뜻이다. 객체 메모리 자체가 없는 것을 읽는다는 말이 아니라, 참조 전달과 필드 초기화 관찰 사이에 필요한 happens-before가 빠졌다는 말에 가깝다.\n\n## Happens-before: 관찰을 제한하는 순서 관계\n\n`happens-before`는 벽시계 시간으로 먼저 실행됐다는 뜻이 아니다. JMM이 \"앞 action의 write가 뒤 action에서 어떻게 관찰될 수 있는지\"를 제한하는 관계다.\n\n대표적인 edge는 다음과 같다.\n\n| edge | 실전 의미 |\n|---|---|\n| 같은 스레드의 program order | 한 스레드 안에서 앞 action은 뒤 action보다 happens-before다. |\n| 같은 monitor의 unlock -> 이후 lock | `synchronized`로 같은 lock을 쓰면 write/read가 이어진다. |\n| 같은 volatile 변수의 write -> 이후 read | volatile write를 본 thread는 그 write 이전 action까지 함께 볼 수 있다. |\n| thread start/join | 시작 전 설정, 종료 후 결과 읽기에 edge가 생긴다. |\n\n중요한 점은 transitivity다. `data = 42`가 `ready = true`보다 program order상 앞에 있고, `ready`의 volatile write가 reader의 volatile read와 이어지면, reader가 `ready == true`를 본 뒤 읽는 `data`에도 앞선 write의 가시성이 이어질 수 있다.\n\n## Instruction reordering: 코드 줄 순서와 관찰 순서\n\n컴파일러, JIT, CPU는 단일 스레드 결과를 깨지 않는 범위에서 명령을 재배치할 수 있다. 같은 스레드 안에서 `writer()`를 실행한 사람에게는 `data = 42; ready = true;`가 정상으로 보이면 된다. 하지만 다른 스레드가 중간 상태를 관찰할 수 있는 공유 변수라면 문제가 달라진다.\n\n재배치를 이해할 때는 \"실제로 반드시 순서를 바꿨다\"고 단정하지 말고, **동기화가 없으면 JMM이 그런 관찰 결과를 금지하지 않는다**고 보는 편이 안전하다.\n\n```java\nclass UnsafePublication {\n    Helper helper;\n    boolean ready;\n\n    void init() {\n        Helper h = new Helper(42);\n        helper = h;\n        ready = true;\n    }\n\n    int use() {\n        if (ready) {\n            return helper.value();\n        }\n        return -1;\n    }\n}\n```\n\n이 코드에서 `ready`와 `helper`가 일반 필드라면 reader가 `ready == true`를 봤다는 사실만으로 `helper`와 그 내부 상태가 안전하게 초기화되어 보인다고 말할 수 없다. 그래서 publication 신호를 어떤 synchronization edge로 만들지 정해야 한다.\n\n## volatile write/read가 만드는 직관\n\n`volatile`은 단순히 \"항상 최신값\"이라는 별명이 아니다. 같은 volatile 변수에 대한 write/read는 synchronization action이고, volatile write는 이후 같은 변수의 volatile read와 synchronizes-with 관계를 만들 수 있다.\n\n```java\nclass SafeSignal {\n    int data;\n    volatile boolean ready;\n\n    void writer() {\n        data = 42;\n        ready = true;     // volatile write\n    }\n\n    int reader() {\n        if (ready) {      // volatile read\n            return data;\n        }\n        return -1;\n    }\n}\n```\n\nreader가 `ready == true`를 읽었다면, writer의 `ready = true` 이전에 있던 `data = 42`까지 관찰 가능한 순서 안으로 들어온다. 실무 직관으로는 volatile write가 \"여기까지 쓴 내용을 내보내는 신호\"이고, volatile read가 \"그 신호를 받은 뒤 읽기 시작하는 경계\"라고 볼 수 있다.\n\n단, edge는 **같은 volatile 변수**를 통해 만들어진다. `ready`를 volatile로 쓰고 reader가 전혀 다른 일반 flag를 읽으면 이 설명이 이어지지 않는다.\n\n## Safe publication intuition\n\n객체를 다른 스레드에 넘길 때 안전하게 publish한다는 말은, reader가 reference만 보는 것이 아니라 생성과 초기화 write도 함께 믿을 수 있게 만드는 것이다.\n\n대표 선택지는 다음과 같다.\n\n| publish 방법 | 직관 |\n|---|---|\n| `static final` 또는 class initialization | JVM의 class initialization 규칙을 활용한다. |\n| 생성자에서 `final` 필드 세팅 후 `this` escape 금지 | final field initialization 보장을 활용한다. |\n| volatile reference에 완성된 immutable snapshot 대입 | 참조 교체를 volatile write/read edge로 publish한다. |\n| 같은 lock으로 write/read | unlock -> lock happens-before를 활용한다. |\n| thread-safe queue, future, latch 같은 concurrent abstraction | 내부 synchronization edge를 사용한다. |\n\n반대로 생성자 안에서 `this`를 다른 곳에 등록하거나, mutable 객체를 만들다 말고 공유 저장소에 넣거나, publish 이후 내부 필드를 동기화 없이 계속 바꾸면 safe publication 설명만으로는 부족하다.\n\n## volatile은 왜 atomic increment가 아닌가\n\n`volatile`은 visibility와 ordering에는 도움을 주지만 `count++` 전체를 하나로 묶지 않는다.\n\n```java\nclass Counter {\n    private volatile int count;\n\n    void increment() {\n        count++;\n    }\n}\n```\n\n`count++`는 한 줄이어도 세 단계다.\n\n```text\n1. count 읽기\n2. 1 더하기\n3. count 쓰기\n```\n\n두 스레드가 동시에 같은 old value를 읽으면 둘 다 같은 next value를 쓰고 증가분 하나가 사라진다. volatile read/write는 각 단계의 가시성/순서 성질을 주지만, 읽기-수정-쓰기 사이에 다른 스레드가 끼어드는 것을 막지 않는다. 정확한 단일 counter 증가는 `AtomicInteger.incrementAndGet()`, 여러 필드 불변식은 `synchronized`나 lock 같은 더 큰 경계가 필요하다.\n\n## Boundary: 어디로 넘길까\n\n- happens-before 규칙 자체가 처음이면 `language/java-memory-model-happens-before-beginner-primer`가 먼저다.\n- `volatile`, `synchronized`, `AtomicInteger` 중 무엇을 골라야 하는 질문이면 `language/volatile-synchronized-atomic-visibility-chooser`가 맡는다.\n- double-checked locking이나 singleton 구현 세부가 질문이면 `design-pattern/singleton-java`가 맡는다.\n- `volatile int count++`가 왜 누락되는지에 집중한 질문이면 `language/java-volatile-counter-atomicity-cause-router`가 맡는다.\n\n## 한 줄 정리\n\n다른 스레드가 \"안 만든 객체\"를 본다는 말은 참조와 초기화 write 사이의 가시성 보장이 빠졌다는 뜻이고, `volatile`은 같은 변수의 write/read로 그런 publication 신호를 만들 수 있지만 `count++` 같은 복합 연산을 원자적으로 만들지는 않는다.\n",
+  "aliases": [
+    "memory visibility와 instruction reordering이 volatile과 무슨 관계야?",
+    "Java 메모리 가시성과 재배치",
+    "volatile safe publication",
+    "volatile write/read의 happens-before 관계",
+    "다른 스레드가 초기화 덜 된 객체를 봄",
+    "명령어 재배치 volatile",
+    "메모리 가시성 volatile",
+    "부분 초기화 객체",
+    "ready=true가 data=42보다 먼저 보이는 이유",
+    "volatile ready flag 가시성"
+  ],
+  "expected_queries": [
+    "다른 스레드가 초기화 덜 된 객체를 보거나 명령 순서가 바뀐다는 게 무슨 말이야",
+    "volatile이 있으면 왜 ready 플래그를 본 뒤 data도 안전하게 보인다고 해?",
+    "객체 참조는 보이는데 필드 초기화가 안 보일 수 있다는 말을 예시로 설명해줘",
+    "명령어 재배치 때문에 ready=true가 data=42보다 먼저 보일 수 있다는 게 무슨 뜻이야",
+    "volatile ready flag가 data write의 가시성을 어떻게 보장해?"
+  ],
+  "symptoms": [
+    "다른 스레드가 초기화가 덜 된 객체를 볼 수 있다는 설명이 감이 안 온다",
+    "코드 순서대로 썼는데 왜 다른 스레드에서는 순서가 바뀐 것처럼 보이는지 모르겠다",
+    "volatile이 가시성은 보장하지만 원자성은 보장하지 않는다는 말을 섞어서 이해한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/java-thread-basics",
+      "language/java-memory-model-happens-before-beginner-primer"
+    ],
+    "next_docs": [
+      "language/java-memory-model-happens-before-volatile-final",
+      "language/volatile-synchronized-atomic-visibility-chooser",
+      "design-pattern/singleton-java",
+      "language/java-volatile-counter-atomicity-cause-router"
+    ],
+    "confusable_with": [
+      "language/java-memory-model-happens-before-beginner-primer",
+      "language/volatile-synchronized-atomic-visibility-chooser",
+      "design-pattern/singleton-java",
+      "language/java-volatile-counter-atomicity-cause-router"
+    ],
+    "forbidden_for_queries": [
+      "language/java-memory-model-happens-before-beginner-primer",
+      "language/java-volatile-counter-atomicity-cause-router",
+      "language/volatile-synchronized-atomic-visibility-chooser",
+      "language/volatile-synchronized-atomic-interview-drill"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "source": "y14-expansion-batch210",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch210"
+      }
+    ]
+  }
+}

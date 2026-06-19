@@ -1,0 +1,65 @@
+{
+  "id": "language/jvm-object-promotion-young-old-generation-primer",
+  "title": "JVM 객체 승급 Promotion Young to Old Generation Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "객체 promotion은 minor GC에서 살아남은 young 객체가 age, tenuring threshold, survivor 공간 압박, old 여유 공간 같은 조건에 따라 Survivor에 남거나 Old generation으로 옮겨지는 메커니즘이다.",
+  "body_markdown": "# JVM 객체 승급 Promotion Young to Old Generation Primer\n\n> 한 줄 요약: 객체는 minor GC에서 살아남았다고 바로 Old로 가는 것이 아니라, Survivor를 오가며 age가 쌓이고 tenuring threshold나 Survivor 압박 조건을 만나면 Old generation으로 promotion된다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [JVM 메모리 영역과 GC 기초](./jvm-memory-area-gc-basics.md)\n- [GC Generational Interview Primer](./gc-generational-interview-primer.md)\n- [GC Allocation Rate Symptom Router](./gc-allocation-rate-symptom-router.md)\n- [TLAB and PLAB Allocation Intuition](./tlab-plab-allocation-intuition.md)\n- [G1 Evacuation Failure To-Space Exhausted Allocation Stall Bridge](./g1-evacuation-failure-to-space-exhausted-allocation-stall-bridge.md)\n\nretrieval-anchor-keywords: JVM object promotion, young to old generation promotion, minor GC promotion condition, Eden Survivor Old generation, tenuring threshold, object age, Survivor space pressure, promotion failure, 자바 객체 승급 조건, Young에서 Old로 승급, Survivor 공간 압박으로 Old 승급\n\n---\n\n## 먼저 잡을 그림\n\n세대별 GC에서 heap은 보통 새 객체가 들어오는 Young 영역과 오래 살아남은 객체가 모이는 Old 영역으로 나누어 설명한다. Young 안에는 다시 Eden과 Survivor 영역이 있다.\n\n```text\nYoung generation\n  Eden      : 새 객체가 주로 처음 할당되는 곳\n  Survivor  : minor GC에서 살아남은 객체를 잠시 보관하는 곳\n\nOld generation\n  오래 살아남았거나 Survivor에 둘 공간이 부족해 승급된 객체가 모이는 곳\n```\n\n새 객체는 대체로 Eden에 만들어진다. Eden이 차거나 young 수집 조건이 맞으면 minor GC가 돈다. 이때 GC는 Young 안에서 아직 도달 가능한 객체를 찾고, 죽은 객체는 버리며, 살아남은 객체는 Survivor 또는 Old로 복사한다.\n\n중요한 질문은 이것이다.\n\n```text\n살아남은 객체를 Survivor에 한 번 더 둘 것인가, Old로 승급할 것인가?\n```\n\n이 판단을 age, tenuring threshold, Survivor 공간, Old 공간 여유가 함께 만든다.\n\n---\n\n## 기본 경로: Eden -> Survivor -> Old\n\n가장 단순한 흐름은 아래와 같다.\n\n1. 객체가 Eden에 할당된다.\n2. minor GC가 발생한다.\n3. 아직 참조되는 객체는 Survivor로 복사된다.\n4. 다음 minor GC에서도 살아남으면 다른 Survivor로 복사되며 age가 증가한다.\n5. age가 tenuring threshold에 도달하거나 Survivor에 둘 수 없으면 Old로 promotion된다.\n\nSurvivor는 보통 두 공간을 번갈아 쓴다고 설명한다. 한 번의 minor GC가 끝나면 살아남은 객체가 한쪽 Survivor로 모이고, 다음 minor GC에서는 반대쪽 Survivor로 복사된다. 이 복사를 거칠 때마다 JVM은 객체가 몇 번 살아남았는지 age를 추적한다.\n\n여기서 age는 비즈니스 시간의 나이가 아니다. \"몇 초 살았나\"가 아니라 \"young GC를 몇 번 버텼나\"에 가깝다.\n\n---\n\n## 조건 1: age와 tenuring threshold\n\n가장 교과서적인 promotion 조건은 객체 age가 tenuring threshold 이상이 되는 것이다.\n\n```text\n객체가 minor GC를 여러 번 살아남음\n  -> age 증가\n  -> age >= tenuring threshold\n  -> Old generation으로 promotion\n```\n\nHotSpot에는 `MaxTenuringThreshold` 같은 상한 개념이 있고, collector와 상황에 따라 실제 threshold는 동적으로 조정될 수 있다. 그래서 면접 답변에서 \"무조건 15번 살아남으면 Old로 간다\"처럼 고정 숫자로 말하면 위험하다.\n\n더 안전한 표현은 이렇다.\n\n> 객체가 young GC를 반복해서 살아남으면 age가 올라가고, 현재 JVM이 정한 tenuring threshold에 도달하면 Old로 승급될 수 있다.\n\n이 표현이 좋은 이유는 collector, JDK 버전, Survivor 사용량에 따라 실제 판단이 달라질 여지를 남기기 때문이다.\n\n---\n\n## 조건 2: Survivor 공간 압박\n\nPromotion은 age만으로 결정되지 않는다. Survivor 영역에 살아남은 객체를 모두 담기 어려우면 threshold에 아직 도달하지 않은 객체도 Old로 밀려날 수 있다.\n\n예를 들어 minor GC 후 살아남은 객체가 너무 많다고 하자.\n\n```text\nEden live objects + 기존 Survivor live objects\n  -> 다음 Survivor에 복사해야 함\n  -> Survivor가 부족함\n  -> 일부 객체를 Old로 promotion\n```\n\n이 상황을 Survivor pressure 또는 survivor overflow 관점으로 볼 수 있다. 객체가 특별히 오래 산 것이 아니라, Young 안에 보관할 공간이 부족해서 Old로 빨리 간 것이다.\n\n그래서 \"Old에 있다 = 정말 오래 쓰는 객체\"라고 단정하면 안 된다. Old에 있는 이유는 오래 살아남아서일 수도 있고, Survivor 공간 압박 때문에 일찍 promotion됐기 때문일 수도 있다.\n\n---\n\n## 조건 3: Old generation에 받을 공간이 있어야 한다\n\nPromotion은 결국 살아남은 객체를 Old에 복사하는 일이다. 따라서 Old generation에 여유가 있어야 한다.\n\nOld에 여유가 충분하면 promotion은 정상 경로로 끝난다. 하지만 Old가 이미 많이 차 있거나, 필요한 크기의 객체를 받을 수 없는 상태라면 promotion이 실패할 수 있다. 이것을 넓게 promotion failure 또는 allocation failure 계열 신호로 볼 수 있다.\n\nPromotion failure의 핵심은 아래 한 문장이다.\n\n```text\nOld로 보내야 하는 live object가 있는데, Old가 그 객체를 받을 공간을 마련하지 못한 상태다.\n```\n\n이 경우 collector는 더 강한 정리 작업, Full GC, compacting pause, 또는 collector별 fallback 경로로 갈 수 있다. 운영에서는 GC log에서 promotion rate, old occupancy, after-GC live size, pause 원인을 같은 시간축으로 봐야 한다.\n\n---\n\n## 빠른 판단표\n\n| 상황 | 보통 일어나는 일 | 해석 |\n|---|---|---|\n| Eden 객체가 minor GC 때 죽음 | 회수됨 | promotion 대상이 아니다 |\n| Eden 객체가 처음 살아남음 | Survivor로 복사 | 아직 young 안에서 더 관찰한다 |\n| Survivor 객체가 여러 번 살아남음 | age 증가 | threshold에 가까워진다 |\n| age가 tenuring threshold 이상 | Old로 promotion | 오래 살아남은 객체로 취급한다 |\n| Survivor가 부족함 | 일부 객체가 Old로 조기 promotion | age만으로 설명하면 부족하다 |\n| Old가 받을 공간이 부족함 | promotion failure 가능 | Full GC나 긴 pause로 이어질 수 있다 |\n\n이 표에서 핵심은 \"살아남았다\"와 \"승급된다\"가 같은 말이 아니라는 점이다. 살아남은 객체는 Survivor에 남을 수도 있고 Old로 갈 수도 있다.\n\n---\n\n## 질문에 바로 답하기\n\n\"객체가 young에서 old로 승급되는 조건이 뭐야?\"라고 물으면 아래처럼 답하면 된다.\n\n> minor GC에서 객체가 살아남으면 보통 Survivor로 복사되고 age가 올라간다. 이 age가 현재 tenuring threshold에 도달하면 Old generation으로 promotion된다. 다만 Survivor 공간이 부족하면 threshold에 도달하지 않았어도 일부 객체가 Old로 조기 승급될 수 있다. 반대로 Old에 받을 공간이 부족하면 promotion failure가 나고 Full GC나 collector별 fallback으로 이어질 수 있다.\n\n여기서 빠뜨리면 안 되는 단어는 네 개다.\n\n- minor GC\n- age\n- tenuring threshold\n- Survivor pressure\n\nPromotion failure까지 물어보면 Old 공간 여유도 함께 붙인다.\n\n---\n\n## 경계: 이 문서가 맡지 않는 것\n\n이 문서는 promotion 조건 자체를 설명한다. 더 넓은 GC 면접 답변은 [GC Generational Interview Primer](./gc-generational-interview-primer.md)에서 다룬다. GC root, generational hypothesis, STW, remembered set까지 한 번에 설명하려는 문서가 아니다.\n\n큰 객체나 humongous allocation처럼 collector-specific 경로로 바로 Old 또는 별도 영역에 배치되는 경우도 있다. 이 문서는 그런 모든 Old 도달 경로가 아니라, minor GC에서 살아남은 객체가 Survivor와 age를 거쳐 Old로 넘어가는 promotion mental model을 다룬다.\n\nTLAB/PLAB는 할당과 GC 복사 경로의 buffer 감각이다. 객체가 처음 어디에 빠르게 할당되는지, GC worker가 복사할 때 어떤 buffer를 쓰는지 궁금하면 [TLAB and PLAB Allocation Intuition](./tlab-plab-allocation-intuition.md)으로 넘긴다. 이 문서에서는 TLAB refill이나 PLAB sizing을 promotion 조건으로 깊게 다루지 않는다.\n\nG1의 `to-space exhausted`, evacuation failure, allocation stall은 promotion pressure가 운영 장애로 커진 고급 사례다. 그 로그 해석은 [G1 Evacuation Failure To-Space Exhausted Allocation Stall Bridge](./g1-evacuation-failure-to-space-exhausted-allocation-stall-bridge.md)에서 본다. 여기서는 foundation 단계로 \"Old가 받을 공간이 부족하면 promotion failure가 될 수 있다\"까지만 잡는다.\n\n---\n\n## 흔한 오해\n\n| 오해 | 더 정확한 설명 |\n|---|---|\n| 살아남은 객체는 바로 Old로 간다 | 보통 Survivor를 거치며 age를 쌓는다 |\n| promotion은 age만 보면 된다 | Survivor 공간 압박과 Old 여유도 본다 |\n| threshold는 항상 고정 숫자다 | JVM과 collector가 동적으로 조정할 수 있다 |\n| Old에 있으면 반드시 오래 쓰는 객체다 | Survivor 부족 때문에 조기 promotion됐을 수도 있다 |\n| promotion failure는 minor GC가 느린 정도다 | Old가 live object를 받을 공간을 못 만든 심각한 압박 신호일 수 있다 |\n\n---\n\n## 미션 코드에 붙이는 감각\n\n웹 요청마다 임시 DTO, 문자열, 리스트가 많이 만들어져도 대부분 짧게 죽으면 Eden에서 회수된다. 이런 경우는 promotion보다 allocation rate와 young GC 빈도가 먼저 보인다.\n\n반대로 요청 상태, cache, static collection, session, queue처럼 여러 GC를 버티는 객체가 늘면 Survivor를 반복해서 거치거나 Old로 승급한다. 이때 Old occupancy가 빠르게 차면 단순히 \"객체를 많이 만든다\"가 아니라 \"살아남는 객체가 많다\"는 신호일 수 있다.\n\n운영에서 확인할 질문은 세 가지다.\n\n1. minor GC 뒤 살아남는 객체가 얼마나 많은가?\n2. Survivor에 남는가, Old로 promotion되는가?\n3. Old promotion 이후에도 다음 GC에서 회복되는가, 아니면 old occupancy baseline이 계속 올라가는가?\n\n---\n\n## 한 줄 정리\n\n객체 promotion은 minor GC에서 살아남은 객체가 age와 tenuring threshold를 만족하거나 Survivor 공간 압박을 받을 때 Old generation으로 옮겨지는 과정이며, Old가 받을 공간을 마련하지 못하면 promotion failure로 이어질 수 있다.\n",
+  "aliases": [
+    "JVM object promotion",
+    "young generation에서 old generation으로 언제 승급돼?",
+    "minor GC에서 tenuring threshold가 무슨 역할을 해?",
+    "Survivor 공간이 부족하면 왜 Old로 승급돼?",
+    "객체 승급 조건",
+    "Young에서 Old로 승급",
+    "자바 객체 승급",
+    "객체 age와 tenuring threshold",
+    "Survivor 공간 압박으로 Old로 승급돼?",
+    "minor GC 뒤 객체가 Old generation으로 이동해요"
+  ],
+  "expected_queries": [
+    "객체가 young에서 old로 승급되는 조건이 뭐야",
+    "minor GC에서 살아남은 객체는 언제 Survivor에 남고 언제 Old로 가?",
+    "tenuring threshold랑 객체 age가 promotion 조건에 어떻게 작용해?",
+    "Survivor 영역이 부족하면 아직 threshold 안 된 객체도 Old로 승급돼?",
+    "promotion failure가 왜 생기고 일반 promotion pressure와 어떻게 달라?"
+  ],
+  "symptoms": [
+    "객체가 minor GC에서 살아남으면 바로 Old로 간다고 설명해 Survivor와 age 단계를 놓친다.",
+    "promotion 조건을 tenuring threshold 하나로만 외워 Survivor 공간 압박과 조기 promotion을 설명하지 못한다.",
+    "Old generation에 객체가 있다는 사실을 모두 오래 쓰는 객체나 leak으로 단정한다.",
+    "promotion failure를 G1 evacuation failure 세부 로그와 섞어 Old 공간 부족 신호를 분리하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jvm-memory-area-gc-basics",
+      "language/gc-generational-interview-primer"
+    ],
+    "next_docs": [
+      "language/gc-allocation-rate-symptom-router",
+      "language/jvm-gc-allocation-pause-tail-latency-perspective-map"
+    ],
+    "confusable_with": [
+      "language/tlab-plab-allocation-intuition",
+      "language/g1-evacuation-failure-to-space-exhausted-allocation-stall-bridge",
+      "language/allocation-rate-vs-memory-leak-chooser"
+    ],
+    "forbidden_for_queries": [
+      "language/g1-evacuation-failure-to-space-exhausted-allocation-stall-bridge",
+      "language/tlab-plab-allocation-intuition",
+      "language/gc-generational-interview-primer"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch210"
+      }
+    ]
+  }
+}

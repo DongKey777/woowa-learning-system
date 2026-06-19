@@ -1,0 +1,67 @@
+{
+  "id": "spring/runtime-configuration-refresh-primer",
+  "title": "Spring Runtime Configuration Refresh Primer",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "Spring runtime configuration refresh는 새 설정을 다시 fetch해 Environment에 반영하고, refresh 가능한 Bean만 rebind 또는 재생성하는 제한된 갱신 절차다. Config Server에 값이 있다는 사실, 실행 중인 client가 새 값을 가져왔다는 사실, Bean이 그 값을 다시 쓰고 있다는 사실을 분리해야 한다.",
+  "body_markdown": "# Spring Runtime Configuration Refresh Primer\n\n> 한 줄 요약: runtime configuration refresh는 새 설정을 가져와 Environment에 합치고, refresh 가능한 Bean만 다시 바인딩하거나 재생성하는 제한된 갱신 절차다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Spring Cloud Config Server Basics Primer](./spring-cloud-config-server-basics-primer.md)\n- [설정값이 안 바뀌어요 원인 라우터](./config-value-not-changing-cause-router.md)\n- [Spring Boot Actuator observability primer](./spring-boot-actuator-observability-primer.md)\n- [Spring ApplicationContext Refresh Phases](./application-context-refresh-phases.md)\n\nretrieval-anchor-keywords: runtime configuration refresh, dynamic config refresh, Spring Cloud RefreshScope, actuator refresh, EnvironmentChangeEvent, ContextRefresher, Spring Cloud Bus refresh, config fetch rebind, 서버 안 끄고 설정 다시 읽기, 설정값 동적 반영\n\n## 핵심 개념\n\n서버를 끄지 않고 설정을 다시 읽는다는 말은 세 일을 합친 표현이다.\n\n1. config source에서 새 값을 다시 fetch한다.\n2. 새 key/value를 Spring Environment에 반영하고 바뀐 key를 계산한다.\n3. 그 값을 사용하는 Bean이 refresh 가능한 방식이면 다시 바인딩하거나 proxy 뒤 target을 새로 만든다.\n\n이 셋 중 하나라도 빠지면 Config Server나 Git에는 새 값이 있는데 애플리케이션은 예전 값처럼 동작할 수 있다.\n\n## Runtime refresh 흐름\n\nSpring Cloud 환경에서 대표적인 흐름은 `POST /actuator/refresh`다. 이 endpoint는 Config Client가 원격 Config Server나 외부 property source에서 값을 다시 읽도록 만들고, 변경된 property key를 기준으로 `EnvironmentChangeEvent`를 발행한다. 단순히 `Environment`에 새 값이 들어온 것만으로 모든 객체 상태가 바뀌지는 않는다.\n\n```text\noperator or webhook\n-> POST /actuator/refresh\n-> config fetch\n-> Environment refresh and changed keys\n-> configuration properties rebind\n-> @RefreshScope target invalidation\n-> next access creates refreshed bean target\n```\n\n여기서 refresh는 전체 `ApplicationContext`를 처음부터 다시 부팅하는 작업이 아니다. BeanDefinition을 전부 다시 스캔하고 모든 singleton을 다시 만드는 startup refresh와 다르다.\n\n## Bean rebinding과 `@RefreshScope`\n\n`@ConfigurationProperties`처럼 Binder가 관리하는 설정 객체는 변경 key에 따라 다시 bind될 수 있다. 하지만 생성자에서 값을 복사해 만든 client, `@PostConstruct`에서 만든 cache, static field, 외부 connection pool 내부 옵션은 자동으로 새 값으로 바뀌지 않을 수 있다.\n\n`@RefreshScope`는 Bean 앞에 proxy를 두고 refresh 시 기존 target을 버린 뒤 다음 호출 때 새 target을 만들게 한다. 그래서 timeout, endpoint URL, feature toggle처럼 새 Bean을 만들어도 안전한 값에는 도움이 된다. 반대로 `DataSource`, message listener, scheduler, thread pool처럼 lifecycle과 connection state가 얽힌 Bean은 refresh 중 순간적인 끊김, 중복 실행, partial state가 생길 수 있다.\n\n## Spring Cloud Bus\n\n인스턴스가 여러 대면 각 노드에 `/actuator/refresh`를 직접 치는 방식은 누락과 순서 문제가 생긴다. Spring Cloud Bus는 message broker를 통해 refresh event를 퍼뜨려 여러 Config Client가 같은 변경 신호를 받게 한다.\n\nBus가 해결하는 것은 fan-out이다. 새 설정의 안전성, schema validation, canary, 모든 Bean의 재바인딩 가능성까지 보장하지는 않는다. 따라서 refresh event 수신 로그, changed keys, 적용된 config version, 인스턴스별 health/readiness를 같이 봐야 한다.\n\n## 언제 restart나 rollout이 더 안전한가\n\nRuntime refresh는 작은 동작 파라미터에 맞다. 예를 들면 timeout, retry 횟수, endpoint URL, feature flag처럼 새 요청부터 적용되어도 괜찮고 rollback도 쉬운 값이다.\n\n아래 경우는 rollout이나 restart가 더 안전하다.\n\n- Bean graph 자체가 바뀐다.\n- DB pool, Kafka consumer, scheduler, thread pool처럼 lifecycle이 긴 자원이 바뀐다.\n- 보안 credential, 암호화 key, 권한 정책처럼 audit와 rotation 절차가 필요한 값이다.\n- constructor-bound immutable 설정이 여러 Bean에 복사되어 있다.\n- 일부 인스턴스만 새 값이 적용되면 장애가 나는 설정이다.\n\n이때는 readiness drain, rolling restart, canary, versioned config, last-known-good rollback을 붙이는 편이 낫다.\n\n## 경계 짚기\n\nConfig Server basics는 중앙 저장소에서 어떤 설정을 제공하는지와 client가 어떻게 가져오는지의 문제다. 이 문서는 이미 실행 중인 client가 그 값을 다시 fetch하고 Bean 세계에 반영하는 경계만 다룬다.\n\nApplicationContext refresh phases는 컨테이너 부팅 단계 전체를 설명한다. 여기서 말하는 runtime refresh는 Spring Cloud의 제한된 refresh/rebind 메커니즘이며, 시작 시점의 full context refresh와 같은 의미가 아니다.\n\n## 흔한 실패 패턴\n\n| 증상 | 먼저 볼 곳 |\n|---|---|\n| Config Server에는 새 값이 보이지만 앱은 예전 값이다 | client가 refresh/fetch를 했는지 본다 |\n| `/actuator/refresh` 결과 changed key는 있는데 동작이 그대로다 | 값이 Bean 생성 시점에 복사됐는지 본다 |\n| 한 인스턴스만 값이 바뀌었다 | Bus fan-out, broker, instance log를 본다 |\n| refresh 뒤 connection 오류가 생겼다 | runtime refresh보다 rollout 대상인지 본다 |\n| refresh endpoint가 외부에 열려 있다 | actuator exposure와 security를 먼저 닫는다 |\n\n## 한 줄 정리\n\n설정 동적 갱신은 새 값을 가져오는 일, Environment에 반영하는 일, Bean이 그 값을 다시 쓰게 만드는 일을 분리해서 봐야 한다. 작은 파라미터는 refresh가 편하지만 lifecycle이 큰 자원은 restart와 rollout이 더 예측 가능하다.\n",
+  "aliases": [
+    "runtime configuration refresh",
+    "dynamic config refresh",
+    "Spring 설정 런타임 갱신",
+    "서버 안 끄고 설정 다시 읽기",
+    "설정값 동적 반영",
+    "@RefreshScope",
+    "/actuator/refresh",
+    "Spring Cloud Bus refresh",
+    "EnvironmentChangeEvent로 설정값이 rebind돼요"
+  ],
+  "expected_queries": [
+    "서버를 안 끄고도 바뀐 설정을 어떻게 다시 읽어들여?",
+    "Spring에서 Config Server 값을 바꾼 뒤 실행 중인 앱에 다시 반영하려면?",
+    "@RefreshScope와 /actuator/refresh는 어떤 순서로 동작해?",
+    "설정 변경을 Spring Cloud Bus로 여러 인스턴스에 전파할 때 주의할 점은?",
+    "언제 runtime refresh보다 rollout이나 restart가 더 안전해?"
+  ],
+  "symptoms": [
+    "Config Server에는 새 값이 있는데 실행 중인 애플리케이션은 예전 설정처럼 동작한다",
+    "/actuator/refresh를 호출했지만 어떤 Bean이 다시 바인딩되거나 재생성되는지 설명하지 못한다",
+    "여러 인스턴스 중 일부만 새 설정을 쓰는 상황에서 Bus와 rollout 경계를 구분하지 못한다",
+    "ApplicationContext refresh와 Spring Cloud runtime refresh를 같은 의미로 본다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-cloud-config-server-basics-primer",
+      "spring/value-vs-configurationproperties-env-guide",
+      "spring/spring-boot-actuator-observability-primer"
+    ],
+    "next_docs": [
+      "spring/config-value-not-changing-cause-router",
+      "spring/actuator-exposure-security",
+      "system-design/config-distribution-system-design"
+    ],
+    "confusable_with": [
+      "spring/application-context-refresh-phases",
+      "spring/spring-cloud-config-server-basics-primer",
+      "spring/config-additional-location-primer"
+    ],
+    "forbidden_for_queries": [
+      "spring/spring-cloud-config-server-basics-primer",
+      "spring/application-context-refresh-phases",
+      "spring/external-config-file-precedence-primer"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/spring/runtime-configuration-refresh-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch210"
+      }
+    ]
+  }
+}
