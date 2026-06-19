@@ -1,0 +1,78 @@
+{
+  "id": "software-engineering/database-per-service-ownership-primer",
+  "title": "Database Per Service Ownership Primer",
+  "category": "software-engineering",
+  "level": "intermediate",
+  "summary": "이 문서는 MSA에서 서비스별 DB 소유권이 스키마와 데이터 변경 책임을 나누는 장치라는 점을 설명하고, 공유 DB와 cross-service join이 distributed monolith를 만드는 이유, API/events/outbox/read model 대안, 트랜잭션과 리포팅 tradeoff, shared DB에서 분리하는 migration 순서를 다루는 beginner/intermediate primer다.",
+  "body_markdown": "# Database Per Service Ownership Primer\n\n> 한 줄 요약: 서비스마다 DB를 따로 둔다는 말은 물리 서버를 무조건 하나씩 사라는 뜻이 아니라, 각 서비스가 자기 스키마와 데이터 변경 책임을 소유하고 다른 서비스는 API나 이벤트 계약으로만 접근하게 만든다는 뜻이다.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 잡을 말\n\n초심자가 \"MSA에서 DB를 같이 쓰면 왜 안 돼?\"라고 물을 때 핵심은 DB 제품이나 인스턴스 개수가 아니다. 핵심은 **소유권**이다.\n\n- 주문 서비스는 주문 테이블과 주문 상태 전이 규칙을 소유한다\n- 결제 서비스는 결제 테이블과 승인/취소 규칙을 소유한다\n- 회원 서비스는 회원 프로필과 인증에 필요한 데이터를 소유한다\n\n다른 서비스는 그 테이블을 직접 읽거나 수정하지 않는다. 필요한 정보는 API로 조회하거나, 이벤트를 받아 자기 read model에 복제한다.\n\n## 왜 각 서비스가 자기 schema/data를 소유하나\n\n서비스를 나누는 이유는 변경과 장애의 책임을 나누기 위해서다. 그런데 DB를 공유하면 이 책임이 다시 한곳에 묶인다.\n\n예를 들어 주문 서비스가 회원 테이블을 직접 join해서 주문 목록을 만든다고 하자.\n\n```sql\nSELECT o.id, o.status, m.name\nFROM orders o\nJOIN members m ON o.member_id = m.id;\n```\n\n겉으로는 편하다. 하지만 이제 주문 서비스는 회원 테이블의 컬럼명, null 규칙, 인덱스, 배포 시점까지 알아야 한다. 회원 서비스가 `members.name`을 분리하거나 의미를 바꾸면 주문 서비스가 깨질 수 있다.\n\n즉 cross-service table join은 빠른 조회처럼 보이지만, 실제로는 **다른 서비스의 내부 모델에 직접 의존**하는 것이다.\n\n## 공유 DB가 distributed monolith가 되는 이유\n\n공유 DB는 서비스가 여러 개로 배포돼도 내부 결합을 남긴다.\n\n| 공유 DB 습관 | 겉보기 장점 | 실제 문제 |\n|---|---|---|\n| 다른 서비스 테이블 직접 join | 조회가 쉽다 | 상대 서비스 schema 변경에 같이 깨진다 |\n| 다른 서비스 테이블 직접 update | transaction이 편하다 | 도메인 규칙 owner가 흐려진다 |\n| 공통 FK와 trigger에 의존 | 무결성이 강해 보인다 | 배포 순서와 장애 범위가 다시 하나가 된다 |\n| 리포팅 쿼리가 운영 테이블 전체를 읽음 | 별도 파이프라인이 없다 | 운영 DB 부하와 schema coupling이 커진다 |\n\n이 상태는 서비스 이름만 나뉜 모놀리스에 가깝다. 프로세스는 분산됐는데 데이터 owner는 분리되지 않아, 변경 비용과 장애 전파는 그대로 남는다.\n\n## 대신 무엇을 쓰나\n\n### 1. 동기 조회는 API 계약으로 닫는다\n\n주문 서비스가 회원 이름이 필요하면 회원 테이블을 join하지 않고 회원 서비스 API를 호출한다.\n\n```text\norder-service -> member-service: GET /members/{id}\n```\n\n장점은 회원 서비스가 내부 스키마를 바꿔도 API 계약만 지키면 주문 서비스가 덜 흔들린다는 점이다. 단점은 latency, timeout, fallback을 설계해야 한다는 점이다.\n\n### 2. 상태 변화는 이벤트로 알린다\n\n회원 이름 변경, 주문 생성, 결제 승인 같은 사실은 이벤트로 발행할 수 있다.\n\n```text\nMemberNameChanged -> order-read-model updates customer display name\nOrderPlaced -> payment-service starts approval flow\n```\n\n중요한 이벤트라면 outbox를 함께 둔다. 업무 데이터 저장과 보낼 이벤트 기록을 같은 local transaction에 묶어, DB 저장은 성공했는데 이벤트가 사라지는 구간을 줄인다.\n\n### 3. 조회 화면은 read model로 만든다\n\n관리자 주문 목록처럼 여러 서비스 데이터를 한 번에 보여줘야 하는 화면은 운영 테이블을 직접 join하기보다 읽기 전용 모델을 만든다.\n\n```text\nmember-service events + order-service events + payment-service events\n  -> admin_order_summary read model\n  -> admin API reads one projection\n```\n\nread model은 새로운 원본이 아니라 projection이다. 그래서 freshness lag, rebuild, reconciliation, owner를 같이 정해야 한다.\n\n## 트랜잭션 tradeoff\n\n서비스별 DB를 택하면 한 서비스 안에서는 local transaction을 유지할 수 있지만, 여러 서비스에 걸친 ACID transaction은 기본값이 아니다.\n\n| 요구 | 공유 DB에서 쉬운 점 | 서비스별 DB에서 필요한 설계 |\n|---|---|---|\n| 주문 생성과 결제 요청 | 한 transaction처럼 묶기 쉽다 | 주문 저장 후 이벤트/outbox, 결제 서비스 재시도, 보상 흐름 |\n| 재고 차감과 주문 확정 | FK와 lock에 기대기 쉽다 | 예약/확정 상태, idempotency key, saga 또는 workflow |\n| 사용자가 방금 쓴 값 보기 | 같은 DB read면 단순하다 | API 응답에 확정 상태를 포함하거나 read model lag를 다룬다 |\n\n따라서 database-per-service는 정합성을 포기하는 선택이 아니다. 정합성 경계를 작게 만들고, 경계 밖은 명시적인 메시지, 재시도, 보상으로 다루는 선택이다.\n\n## 리포팅 tradeoff\n\n리포팅은 서비스별 DB에서 가장 빨리 불편해지는 영역이다. 한 화면에 주문, 회원, 결제, 쿠폰 데이터가 모두 필요할 수 있기 때문이다.\n\n이때 선택지는 보통 세 가지다.\n\n1. 작은 화면은 API composition으로 만든다\n2. 반복 조회는 read model이나 summary table로 만든다\n3. 분석/정산은 warehouse나 batch pipeline으로 분리한다\n\n운영 서비스 테이블을 직접 cross-service join하는 것은 빠른 해결처럼 보여도 owner와 부하를 다시 섞는다. 리포팅용 projection은 source of truth가 아니며, freshness와 drift 검증이 붙어야 한다.\n\n## shared DB에서 옮기는 순서\n\n처음부터 모든 DB를 한 번에 나누려 하면 위험하다. 보통은 아래 순서가 더 안전하다.\n\n1. 테이블별 owner를 먼저 정한다\n2. 다른 서비스 테이블을 직접 읽는 query를 찾는다\n3. write path부터 막는다. 다른 서비스 테이블 직접 update는 가장 위험하다\n4. 읽기 의존은 API나 read model로 하나씩 대체한다\n5. 새 schema는 owner 서비스만 변경하게 한다\n6. outbox/event/rebuild/reconciliation 경로를 만든 뒤 cutover한다\n7. 오래된 shared DB 접근 권한과 query를 제거한다\n\n이 순서는 migration이다. 단순히 DB connection string을 바꾸는 일이 아니라, 데이터 owner와 복구 경로를 바꾸는 일이다.\n\n## 경계: 인접 문서와 어떻게 다른가\n\n- `monolith-to-msa-failure-patterns`는 MSA 전환 전체의 실패 신호를 넓게 본다. 이 문서는 그중 **DB 소유권과 cross-service data access**만 좁혀 설명한다.\n- `normalization-vs-denormalization-vs-summary-table`은 한 bounded context 안에서 원본 row, 중복 컬럼, summary table을 고르는 이야기다. 이 문서는 **서비스 경계를 넘는 테이블 접근 금지**가 중심이다.\n- `same-db-query-repository-vs-separate-read-store`는 같은 서비스/같은 DB 안의 query model escalation을 다룬다. 이 문서의 read model은 여러 서비스 데이터를 계약으로 받아 만든 projection일 수 있다.\n\n## 자주 하는 오해\n\n- \"DB를 따로 둔다\"는 말이 항상 물리 DB 인스턴스를 분리한다는 뜻은 아니다. 초기에는 같은 DB 서버를 써도 schema owner와 접근 권한을 분리하는 단계부터 시작할 수 있다.\n- \"조인을 못 하면 성능이 나빠진다\"로 끝나지 않는다. API composition, cache, read model, summary table을 상황에 맞게 선택한다.\n- \"eventual consistency니까 아무 때나 늦어도 된다\"가 아니다. 사용자에게 즉시 보여야 하는 값과 늦어도 되는 값을 나눠야 한다.\n- \"공유 DB가 항상 악\"이라기보다, MSA라고 부르면서 공유 DB 내부 모델에 기대면 독립 배포와 owner 분리가 성립하지 않는다는 점이 문제다.\n\n## 한 줄 정리\n\nDatabase-per-service는 서비스마다 자기 데이터의 owner가 되고, 다른 서비스는 테이블이 아니라 API, 이벤트, outbox, read model 같은 계약으로 연결하게 만드는 경계 설계다.",
+  "aliases": [
+    "서비스마다 DB를 따로 둔다는 뜻",
+    "MSA에서 DB 같이 쓰면 왜 안 돼",
+    "서비스별 데이터 소유권",
+    "각 서비스가 자기 스키마만 소유하기",
+    "database per service가 뭐야",
+    "서비스별 DB ownership",
+    "공유 DB가 distributed monolith가 됨",
+    "다른 서비스 테이블 join 위험",
+    "서비스 DB를 API와 이벤트로 연결하기",
+    "공유 DB가 분산 모놀리스가 되는 이유"
+  ],
+  "expected_queries": [
+    "서비스마다 DB를 따로 둔다는 게 무슨 뜻이야",
+    "MSA에서 DB 같이 쓰면 왜 안 돼",
+    "주문 서비스에서 회원 테이블을 조인하면 뭐가 문제야?",
+    "서비스별 DB로 나누면 트랜잭션이랑 리포팅은 어떻게 처리해?",
+    "공유 DB에서 서비스별 DB로 천천히 옮기는 순서를 알려줘"
+  ],
+  "symptoms": [
+    "서비스는 나눴지만 다른 서비스 테이블을 직접 join하거나 update해 schema 변경과 배포 순서가 다시 묶인다",
+    "서비스별 DB를 물리 인스턴스 분리로만 이해하고 schema owner, 접근 권한, API/event 계약을 함께 보지 못한다",
+    "공유 DB에서 벗어나려 할 때 API composition, outbox, read model, summary projection, reconciliation 중 무엇을 선택해야 하는지 헷갈린다",
+    "MSA 전환의 일반 실패 패턴과 정규화/summary table 선택 문제를 서비스 간 데이터 소유권 문제와 섞어서 판단한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "software-engineering/ddd-domain-bounded-context-beginner-primer",
+      "database/normalization-basics"
+    ],
+    "next_docs": [
+      "software-engineering/outbox-inbox-domain-events",
+      "software-engineering/same-db-query-repository-vs-separate-read-store",
+      "software-engineering/strangler-fig-migration-contract-cutover",
+      "database/normalization-vs-denormalization-vs-summary-table-decision-guide",
+      "software-engineering/service-ownership-catalog-boundaries",
+      "software-engineering/schema-contract-evolution-cross-service",
+      "system-design/source-of-truth-derived-data-primer",
+      "system-design/dual-write-avoidance-migration-bridge-design",
+      "database/outbox-vs-cdc-vs-saga-decision-guide",
+      "database/xa-two-phase-commit-pitfalls"
+    ],
+    "confusable_with": [
+      "software-engineering/monolith-to-msa-failure-patterns",
+      "software-engineering/bounded-context-failure-patterns",
+      "software-engineering/consistency-boundary",
+      "software-engineering/same-db-query-repository-vs-separate-read-store",
+      "database/normalization-vs-denormalization-vs-summary-table-decision-guide",
+      "software-engineering/service-ownership-catalog-boundaries"
+    ],
+    "forbidden_for_queries": [
+      "software-engineering/monolith-to-msa-failure-patterns",
+      "software-engineering/same-db-query-repository-vs-separate-read-store",
+      "database/normalization-vs-denormalization-vs-summary-table-decision-guide",
+      "database/xa-two-phase-commit-pitfalls"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "source": "y14-expansion-batch208",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch208"
+      }
+    ]
+  }
+}
