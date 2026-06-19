@@ -1,0 +1,60 @@
+{
+  "id": "system-design/websocket-cross-server-fanout-pubsub-kafka-primer",
+  "title": "여러 웹소켓 서버에 흩어진 사용자에게 메시지를 보내는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "WebSocket 서버는 자기 서버에 연결된 클라이언트에게만 바로 보낼 수 있는 경계일 뿐, 다른 서버에 붙은 사용자를 자동으로 찾아 주지 않는다. 여러 서버에 연결이 흩어져 있으면 connection registry, room membership, Redis Pub/Sub 또는 Kafka 같은 서버 간 전달 경로, 느린 연결과 오프라인 사용자 처리 기준이 필요하다.",
+  "body_markdown": "# 여러 웹소켓 서버에 흩어진 사용자에게 메시지를 보내는 법\n\n> 한 줄 요약: WebSocket은 한 서버와 한 client의 연결이고, 여러 서버로 메시지를 퍼뜨리는 일은 별도 fan-out 경로가 맡아야 한다.\n\n## 문제가 되는 장면\n\n사용자 A는 app-1에, 사용자 B는 app-2에 WebSocket으로 붙어 있을 수 있다. app-1에서 채팅 메시지가 생겼다고 해서 app-2의 연결까지 자동으로 알 수는 없다. 그래서 서버 간 전달 경로가 필요하다.\n\n```text\nmessage write\n  -> delivery topic/channel\n  -> target websocket node receives\n  -> send only to locally connected clients\n```\n\n## 고를 기준\n\n| 요구 | 더 가까운 선택 |\n|---|---|\n| 놓쳐도 다음 조회로 회복되는 실시간 힌트 | Redis Pub/Sub |\n| 메시지 저장, replay, consumer offset 필요 | Kafka/Event Stream |\n| 특정 사용자 연결 위치로만 보내기 | connection registry + node routing |\n| 작은 단일 서버 실습 | in-memory connection map |\n| offline 사용자 처리 | DB inbox, push, unread count |\n\nConnection registry는 `user/session -> nodeId/connectionId`를 담는 위치 표다. connect, disconnect, heartbeat 때 갱신하고 TTL을 둬서 끊긴 연결을 정리한다. 방 membership은 누가 방에 속하는지이고, connection registry는 지금 어느 서버에 붙어 있는지라서 서로 다른 상태다.\n\nRedis Pub/Sub은 온라인 fire-and-forget 전달에 가깝다. subscriber ack, backlog, 자동 replay가 없으므로 WebSocket node가 끊겨 있던 동안의 메시지는 DB inbox, unread count, push, 재조회 같은 별도 경로로 회복해야 한다.\n\nKafka를 쓴다고 모든 WebSocket 서버가 자동으로 같은 메시지를 받는 것은 아니다. 같은 consumer group 안에서는 partition 메시지가 서버들 사이에 나뉜다. 모든 WebSocket node가 받아야 하는 broadcast라면 서버별 group, 별도 fan-out service, 또는 connection registry를 기준으로 target node에 라우팅하는 구조를 따로 정해야 한다. 서버별 group은 각 node가 durable subscriber처럼 동작하므로 재시작 뒤 retained record를 다시 읽을 수 있고, 이때 message id, expiry, dedupe 기준도 같이 필요하다.\n\n## 흔한 오해\n\n- WebSocket만 쓰면 여러 서버 fan-out이 자동으로 된다고 본다.\n- Redis Pub/Sub을 쓰면서 offline 사용자 재전송까지 기대한다.\n- Kafka consumer group 하나에 WebSocket 서버를 모두 넣으면 모든 서버가 같은 메시지를 받을 거라고 본다.\n- 방 membership과 실제 연결 위치를 같은 자료구조로 뭉친다.\n- 느린 client 하나가 서버 전체 send loop를 막게 둔다.\n\n## 한 줄 정리\n\nWebSocket은 client와 붙어 있는 I/O 경계이고, 여러 서버에 흩어진 사용자에게 메시지를 전달하려면 서버 간 전달 경로와 연결 위치, replay 필요 여부를 따로 설계해야 한다.\n",
+  "aliases": [
+    "여러 서버 WebSocket fan-out",
+    "웹소켓 서버가 여러 대면 메시지를 어떻게 보내?",
+    "WebSocket cross-server delivery",
+    "Redis Pub/Sub으로 웹소켓 broadcast",
+    "Kafka로 채팅 메시지 전달",
+    "웹소켓 서버는 연결만 관리해?",
+    "다른 서버에 붙은 사용자에게 메시지 보내기",
+    "채팅 서버 fan-out 구조"
+  ],
+  "expected_queries": [
+    "웹소켓 서버가 여러 대면 다른 서버에 붙은 사용자에게 메시지를 어떻게 전달해?",
+    "여러 웹소켓 서버에 메시지를 보내려고 Redis Pub/Sub이나 Kafka를 연결한다는 게 무슨 뜻이야?",
+    "Redis Pub/Sub으로 채팅 broadcast를 할 때 offline 사용자 재전송은 왜 별도 설계가 필요해?",
+    "채팅방 membership과 실제 WebSocket 연결 위치를 왜 나눠서 봐야 해?",
+    "느린 웹소켓 클라이언트가 많을 때 전송 루프와 backpressure는 어떻게 봐야 해?"
+  ],
+  "symptoms": [
+    "한 서버에서 보낸 WebSocket 메시지가 다른 서버에 붙은 사용자에게 가지 않는다.",
+    "Redis Pub/Sub을 쓰면 offline 사용자도 나중에 메시지를 받을 거라고 기대한다.",
+    "느린 client 때문에 broadcast 처리 지연이 전체 서버로 번진다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/websocket-basics",
+      "system-design/publish-subscribe-messaging-basics-primer",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "next_docs": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "network/websocket-heartbeat-backpressure-reconnect",
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer"
+    ],
+    "confusable_with": [
+      "network/websocket-vs-sse-vs-long-polling-realtime-intermediate-primer",
+      "system-design/newsfeed-fanout-interview-chooser",
+      "system-design/message-queue-pubsub-stream-interview-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch219"
+      }
+    ]
+  }
+}

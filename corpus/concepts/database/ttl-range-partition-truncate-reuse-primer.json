@@ -1,0 +1,63 @@
+{
+  "id": "database/ttl-range-partition-truncate-reuse-primer",
+  "title": "TTL 범위 파티션을 통째로 비우고 재사용하는 법",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "만료 시간이 비슷한 메시지나 로그를 같은 range partition, table, bucket에 모아 두면 한 건씩 delete하는 대신 만료 구간 전체를 drop, truncate, rotate하거나 재사용할 수 있다. 이 방식은 삭제 비용을 줄이지만 보관/삭제 기준이 다른 데이터를 섞으면 안 되고, FK, audit, trigger, CDC, identity reset, metadata lock, 저장소별 rollback 의미를 따로 확인해야 한다.",
+  "body_markdown": "# TTL 범위 파티션을 통째로 비우고 재사용하는 법\n\n> 한 줄 요약: 만료 정책이 같은 데이터만 같은 파티션에 넣어야 통째 비우거나 재사용할 수 있다.\n\n## 왜 나누나\n\n수십억 건의 메시지, 로그, 임시 상태를 한 건씩 지우면 정리 작업 자체가 큰 부하가 된다. 반대로 1일, 7일, 30일처럼 보관 기간이 같은 데이터를 처음부터 다른 range partition이나 table, physical bucket에 넣으면 만료된 묶음을 통째로 drop, truncate, rotate할 수 있다.\n\n```text\np_2026_06_19_short_retention -> active writes\np_2026_06_18_short_retention -> read/drain\np_2026_06_17_short_retention -> truncate or rotation candidate\n```\n\n## 설계 질문\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| 같은 보관/삭제 기준인가 | 모든 row를 같이 지워도 되는지 |\n| 정리 중 트래픽은 어디로 가나 | 새 partition routing, drain, read fallback |\n| truncate/drop이 안전한가 | FK, audit, trigger, CDC, metadata lock |\n| 재사용해도 되는가 | identity reset, statistics, old reader, backup |\n\n이미 날짜 range가 정해진 파티션을 truncate해도 그 파티션의 range boundary가 미래 날짜로 바뀌는 것은 아니다. 미래 bucket으로 재사용하려면 table/bucket rotation, detach/drop/recreate, exchange/add partition 같은 DDL 또는 라우팅 전환이 필요하다.\n\n## 흔한 오해\n\n- TTL을 붙이면 row가 만료 시각에 정확히 물리적으로 사라진다고 본다.\n- 만료 시간이 다른 데이터를 같은 파티션에 섞어 truncate할 수 없게 만든다.\n- Redis key prefix나 namespace만 나누면 DB partition truncate처럼 통째 비울 수 있다고 본다.\n- Redis key prefix는 naming convention일 뿐 물리 파티션이 아니며, 보통 SCAN + DEL/UNLINK가 필요하다. FLUSHDB는 dedicated logical DB나 instance에서만 검토한다.\n- partition truncate가 항상 rollback 가능하거나 항상 불가능하다고 단정한다.\n- audit, CDC, FK, metadata lock 같은 DB별 의미를 보지 않는다.\n\n## 한 줄 정리\n\nTTL range partition truncate/reuse는 빠른 삭제 기술이 아니라, 보관 운명이 같은 데이터만 한 묶음에 넣어 안전하게 비우고 rotation하는 retention 설계다.\n",
+  "aliases": [
+    "TTL range partitioning",
+    "TTL별 range partition",
+    "만료 데이터 range partition",
+    "만료 파티션 통째로 비우기",
+    "오래된 데이터를 한 건씩 지우지 않기",
+    "partition truncate reuse",
+    "time bucket partition cleanup",
+    "expired data partition reuse",
+    "만료 시간이 같은 데이터끼리 분리",
+    "대량 만료 데이터 truncate"
+  ],
+  "expected_queries": [
+    "메시지를 TTL별 range partition에 나누면 만료된 데이터를 한 건씩 delete하지 않고 어떻게 통째로 비워?",
+    "오래된 데이터를 delete batch 대신 partition truncate로 정리하려면 어떤 기준으로 파티션을 나눠야 해?",
+    "만료 시간이 다른 데이터를 같은 파티션에 섞으면 왜 truncate 재사용이 어려워져?",
+    "TTL 범위 파티션을 정리하는 동안 새 쓰기와 기존 읽기 요청은 어디로 보내야 해?",
+    "보관 정책이나 감사 요구가 있는 데이터는 TTL 파티션을 비우기 전에 무엇을 확인해야 해?"
+  ],
+  "symptoms": [
+    "대량 만료 데이터를 delete job으로 지우다가 저장소 p99가 튄다.",
+    "TTL이 다른 데이터가 섞여 있어 오래된 파티션을 통째로 비우지 못한다.",
+    "정리 중 기존 파티션을 읽는 요청과 새 쓰기 라우팅이 섞인다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/partition-pruning-hot-cold-data",
+      "database/truncate-vs-delete-cost-rollback-primer"
+    ],
+    "next_docs": [
+      "database/hbase-column-family-physical-boundary-primer",
+      "database/hbase-versioning-tombstone-ttl-compaction-semantics-playbook",
+      "database/hbase-compaction-policy-minor-major-offpeak-playbook",
+      "system-design/data-retention-deletion-tombstone-gdpr-playbook"
+    ],
+    "confusable_with": [
+      "system-design/redis-ttl-key-expiration-mechanics-primer",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook",
+      "database/purge-backlog-remediation-throttle-playbook",
+      "database/lsm-compaction-tombstone-read-amplification-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch219"
+      }
+    ]
+  }
+}
