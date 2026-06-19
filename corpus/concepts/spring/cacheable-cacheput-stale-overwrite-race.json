@@ -1,0 +1,72 @@
+{
+  "id": "spring/cacheable-cacheput-stale-overwrite-race",
+  "title": "@Cacheable과 @CachePut의 오래된 값 덮어쓰기 race",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "느린 @Cacheable miss가 오래된 값을 계산하는 동안 @CachePut이 새 값을 써도, 늦게 끝난 @Cacheable이 다시 오래된 값을 cache에 put하면 stale overwrite가 생긴다. 이 문제는 key 설계가 아니라 읽기 miss와 쓰기 update의 시간 순서 문제다.",
+  "body_markdown": "# @Cacheable과 @CachePut의 오래된 값 덮어쓰기 race\n\n> 한 줄 요약: `@Cacheable` miss가 오래 걸린 뒤 stale result를 put하면, 그 사이 `@CachePut`이 쓴 최신 값이 다시 덮일 수 있다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Spring Cache Abstraction Traps](./cache-abstraction-traps.md)\n- [Spring Cache Transaction After Commit Eviction Consistency](./spring-cache-transaction-after-commit-eviction-consistency.md)\n- [Cache Key Generation Pitfalls](./cache-key-generation-pitfalls.md)\n\nretrieval-anchor-keywords: @Cacheable @CachePut race, stale overwrite cacheable, cache put old value, Spring cache stale overwrite, slow cache miss overwrites update, cacheable cacheput 동시 실행\n\n---\n\n## race timeline\n\n문제는 같은 key에 대해 read miss와 write update가 겹칠 때 생긴다.\n\n```text\nT1 read: @Cacheable miss -> DB에서 v1 읽기 시작\nT2 write: DB를 v2로 변경 -> @CachePut key=v2 저장\nT1 read: 늦게 끝남 -> @Cacheable이 v1을 cache에 put\n결과: cache에는 v1, DB에는 v2\n```\n\n`@CachePut`을 썼는데도 stale 값이 돌아오는 이유는 update가 실패한 것이 아니라, 늦게 끝난 read miss가 마지막 writer가 됐기 때문이다.\n\n## key 문제가 아닌 경우가 있다\n\nSpring Cache 문제를 보면 보통 key부터 의심한다. 물론 key는 중요하지만, 이 race는 key가 정확해도 발생할 수 있다.\n\n- read miss가 오래 걸린다.\n- write가 그 사이 최신 값을 cache에 넣는다.\n- read miss result가 오래된 snapshot이다.\n- cache abstraction은 기본적으로 version compare를 하지 않는다.\n\n즉 같은 key에 대한 put 순서가 정합성 경계를 흔든다.\n\n## 대응 방향\n\n| 선택지 | 효과 | 주의점 |\n|---|---|---|\n| after-commit evict only | rollback/commit timing 문제는 줄인다 | in-flight `@Cacheable` miss가 evict 뒤 stale value를 put하는 race는 단독으로 막지 못한다 |\n| delayed second evict / double delete | 긴 read miss가 늦게 stale fill한 뒤 다시 지울 수 있다 | delay window 산정과 일시 stale 허용 여부가 필요하다 |\n| versioned value | cache value에 version/updatedAt을 넣어 오래된 put을 거부 | cache backend나 wrapper logic 필요 |\n| singleflight/lock | 같은 key의 read fill과 write를 직렬화 | hot key에서 대기 증가 |\n| 캐시 대상 축소 | mutable 상태는 cache하지 않음 | 성능 이득을 포기 |\n\n`@CachePut`은 항상 최신 값을 보장하는 마법이 아니다. 캐시 backend가 마지막 write wins로 동작하면 늦게 도착한 stale put이 이길 수 있다.\n\n## 운영에서 볼 신호\n\n- DB row의 `updated_at`보다 cache value version이 낮다.\n- update 직후 잠깐 최신 값이 보였다가 다시 과거 값이 보인다.\n- cache miss latency가 길고 같은 key update가 겹친다.\n- `@Cacheable`과 `@CachePut`이 같은 cache name/key를 공유한다.\n\n## 흔한 오해\n\n- `@CachePut`을 붙이면 concurrent read miss보다 항상 이긴다고 생각한다.\n- stale cache를 전부 TTL 문제로만 본다.\n- transaction commit 전에 cache를 바꾸고 rollback 경로를 보지 않는다.\n- mutable 결제/상태 데이터를 단순 조회 cache처럼 다룬다.\n\n## 한 줄 정리\n\n`@Cacheable`과 `@CachePut`의 stale overwrite race는 캐시 key가 아니라 같은 key에 대한 read fill과 write update의 도착 순서 문제이므로, version guard/CAS, read-fill과 write를 함께 감싸는 per-key lock, delayed second eviction, 또는 cache 대상 축소 중 하나로 경계를 정해야 한다.\n",
+  "aliases": [
+    "@Cacheable @CachePut race",
+    "@Cacheable이 @CachePut 최신값을 다시 덮는 race",
+    "CachePut이 덮였어요",
+    "캐시 오래된 값 재덮어쓰기",
+    "느린 Cacheable miss",
+    "Spring cache race",
+    "Cacheable이 최신 캐시를 덮음",
+    "stale cache 다시 덮임",
+    "CachePut 최신값 보장돼?"
+  ],
+  "expected_queries": [
+    "@Cacheable 조회가 느리게 끝나면서 @CachePut이 쓴 최신 값을 다시 덮을 수 있어?",
+    "Cacheable이 miss로 읽은 오래된 값이 나중에 cache에 put되는 race를 설명해줘",
+    "@CachePut을 썼는데 update 직후 다시 예전 값이 보이는 이유가 뭐야?",
+    "Spring Cache에서 read miss와 write update가 동시에 오면 어떻게 stale overwrite를 막아?",
+    "mutable 상태값에 @Cacheable과 @CachePut을 같이 쓰면 왜 위험해?"
+  ],
+  "symptoms": [
+    "업데이트 직후 최신 값이 보였다가 다시 과거 값이 cache에서 나온다",
+    "느린 read miss와 write update가 같은 cache key에 동시에 접근한다",
+    "cache key는 맞는데 stale overwrite가 반복된다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/cache-abstraction-traps",
+      "spring/spring-cache-abstraction-cacheable-redis-caffeine-intermediate-primer",
+      "spring/cache-key-generation-pitfalls"
+    ],
+    "next_docs": [
+      "spring/spring-cache-transaction-after-commit-eviction-consistency",
+      "language/concurrenthashmap-compound-actions-hot-key-contention",
+      "system-design/cache-fill-invalidation-race-ordering-primer"
+    ],
+    "confusable_with": [
+      "spring/cache-key-generation-pitfalls",
+      "spring/spring-cache-transaction-after-commit-eviction-consistency",
+      "system-design/cache-stampede-interview-router"
+    ],
+    "forbidden_for_queries": [
+      "spring/cache-key-generation-pitfalls",
+      "system-design/cache-stampede-interview-router",
+      "spring/spring-cache-transaction-after-commit-eviction-consistency"
+    ]
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "Cacheable과 CachePut 동시 실행으로 오래된 값이 최신 캐시를 덮는 race를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/spring/cacheable-cacheput-stale-overwrite-race.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch213"
+      }
+    ]
+  }
+}

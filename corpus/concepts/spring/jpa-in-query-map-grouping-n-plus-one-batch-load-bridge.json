@@ -1,0 +1,72 @@
+{
+  "id": "spring/jpa-in-query-map-grouping-n-plus-one-batch-load-bridge",
+  "title": "JPA 목록 DTO N+1을 IN 쿼리와 Map 조립으로 줄이기",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "목록 DTO를 만들 때 루프 안에서 repository를 계속 호출하면 N+1이 된다. 부모 ID를 모아 IN 쿼리로 한 번에 자식 row를 가져온 뒤 Map이나 groupingBy로 다시 붙이면 query count와 응답 모양을 같이 통제할 수 있다.",
+  "body_markdown": "# JPA 목록 DTO N+1을 IN 쿼리와 Map 조립으로 줄이기\n\n> 한 줄 요약: 루프 안 단건 조회를 부모 ID 기반 IN 쿼리 + Map/groupingBy 조립으로 바꾸면, 배치성 read API의 N+1을 fetch join 없이 줄일 수 있다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Spring JPA N+1 Beginner Symptom Router](./spring-jpa-n-plus-one-beginner-symptom-router.md)\n- [JPA Batch Fetch IN Clause Primer](./jpa-batch-fetch-in-clause-primer.md)\n- [Spring Fetch Join vs EntityGraph DTO Read Mini Card](./spring-fetch-join-vs-entitygraph-dto-read-mini-card.md)\n- [Stream groupingBy Result Shape Primer](../language/stream-groupingby-result-shape-primer.md)\n\nretrieval-anchor-keywords: JPA IN query map grouping, batch load child rows, N+1 map grouping, IN parent id groupingBy, DTO assembly N+1, repository loop to IN query, order preserving IN result\n\n---\n\n## 이 패턴이 맡는 문제\n\n이 문서는 JPA fetch plan 자체보다 **응답 DTO 조립 과정에서 생기는 반복 조회**를 다룬다.\n\n```text\norders 조회 1번\nfor each order:\n  orderLineRepository.findByOrderId(order.id)  // N번\n```\n\n이 구조는 fetch join으로만 풀 필요가 없다. 화면에 필요한 parent 목록을 먼저 고정한 뒤, child row를 `where order_id in (...)`로 한 번에 가져오고, 애플리케이션에서 `Map<orderId, List<LineDto>>`로 다시 붙일 수 있다.\n\n```text\norders 조회 1번\nlines where order_id in (...) 조회 1번\nlines.groupBy(orderId)\norders 순서대로 DTO 조립\n```\n\n## fetch join과 다른 점\n\nFetch join은 이번 쿼리에서 entity graph를 같이 당겨오는 전략이다. 반면 IN query + Map grouping은 parent 조회와 child 조회를 의도적으로 분리한다.\n\n이 분리가 유용한 경우:\n\n- collection fetch join 때문에 pagination이 깨질 수 있다.\n- child가 화면 일부 필드만 필요해서 DTO projection이 더 낫다.\n- 여러 child 테이블을 각각 한 번씩 가져와 조립해야 한다.\n- parent 정렬과 paging은 parent query가 책임져야 한다.\n\n즉 이 패턴은 ORM magic이 아니라 read model assembly다.\n\n## 구현할 때 놓치기 쉬운 것\n\nIN 쿼리 결과 순서는 parent 순서와 같다고 보장하지 않는 편이 안전하다. 그래서 결과를 그대로 zip하지 말고 key로 다시 붙인다.\n\n```java\nList<Long> orderIds = orders.stream().map(Order::id).toList();\nMap<Long, List<OrderLineDto>> linesByOrderId = lineRepository.findByOrderIdIn(orderIds)\n        .stream()\n        .collect(groupingBy(OrderLineDto::orderId));\n\nreturn orders.stream()\n        .map(order -> OrderResponse.of(order, linesByOrderId.getOrDefault(order.id(), List.of())))\n        .toList();\n```\n\n또 IN list가 너무 커지면 chunking이나 pagination 크기 제한이 필요하다. 한 번으로 줄이겠다고 모든 ID를 밀어 넣으면 DB parameter limit, plan 변화, packet 크기 문제가 생길 수 있다.\n\n## 운영에서 확인할 신호\n\n- API 1회당 SQL count가 parent 1 + child 종류 수로 고정되는가\n- page size를 늘렸을 때 SQL count가 선형으로 늘지 않는가\n- IN list 크기와 DB parameter limit이 안전한가\n- child 누락을 빈 리스트로 처리하는가\n- parent 정렬이 응답에서 유지되는가\n\n## 흔한 오해\n\n- `@BatchSize`만 켜면 DTO 조립 루프의 repository 호출도 자동으로 사라진다고 생각한다.\n- IN 결과를 parent 순서와 같은 배열로 보고 index로 붙인다.\n- child가 없는 parent를 누락시켜 응답 개수가 줄어든다.\n- query count만 줄이고 응답 정렬이나 pagination contract를 깨뜨린다.\n\n## 한 줄 정리\n\nIN 쿼리 + Map grouping은 JPA N+1을 ORM 설정만으로 숨기지 않고, read API가 필요한 parent/child 데이터를 명시적으로 나눠 가져온 뒤 key로 안전하게 조립하는 패턴이다.\n",
+  "aliases": [
+    "JPA IN query grouping",
+    "IN 쿼리 Map 조립",
+    "N+1 Map grouping",
+    "부모 ID로 자식 일괄 조회",
+    "DTO 조립 N+1",
+    "repository loop 없애기",
+    "groupingBy orderId",
+    "IN절 결과 순서 보장돼?",
+    "배치 조회 Map 매칭"
+  ],
+  "expected_queries": [
+    "배치 화면 DTO 만들 때 루프 안 findById 때문에 N+1이 나면 어떻게 고쳐?",
+    "부모 id를 모아서 IN 쿼리로 자식 row를 가져온 뒤 Map으로 붙이는 패턴을 설명해줘",
+    "IN 쿼리 결과가 부모 목록 순서랑 같다고 믿으면 왜 위험해?",
+    "fetch join 대신 IN query와 groupingBy로 DTO를 조립하는 기준이 뭐야?",
+    "JPA batch fetch와 직접 IN query Map 조립은 뭐가 달라?"
+  ],
+  "symptoms": [
+    "목록 API에서 parent 개수만큼 repository 단건 조회가 반복된다",
+    "IN 쿼리 결과를 index 순서로 붙여 잘못된 child가 섞인다",
+    "collection fetch join과 pagination 충돌을 피할 read assembly 선택지를 모른다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/spring-jpa-n-plus-one-beginner-symptom-router",
+      "spring/spring-fetch-join-vs-entitygraph-dto-read-mini-card",
+      "language/stream-groupingby-result-shape-primer"
+    ],
+    "next_docs": [
+      "spring/jpa-batch-fetch-in-clause-primer",
+      "spring/data-jpa-pagination-count-query-pitfalls",
+      "language/collectors-tomap-duplicate-key-primer"
+    ],
+    "confusable_with": [
+      "spring/jpa-batch-fetch-in-clause-primer",
+      "spring/spring-fetch-join-vs-entitygraph-dto-read-mini-card",
+      "database/hibernate-jdbc-batch-size-flush-clear-primer"
+    ],
+    "forbidden_for_queries": [
+      "spring/jpa-batch-fetch-in-clause-primer",
+      "database/hibernate-jdbc-batch-size-flush-clear-primer",
+      "spring/spring-fetch-join-vs-entitygraph-dto-read-mini-card"
+    ]
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "DTO 조립 루프의 N+1을 IN 쿼리와 Map grouping으로 바꾸는 법을 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/spring/jpa-in-query-map-grouping-n-plus-one-batch-load-bridge.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch213"
+      }
+    ]
+  }
+}
