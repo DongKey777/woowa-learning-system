@@ -132,7 +132,7 @@ deps: `sentence-transformers`, `transformers`, `lancedb`, `numpy`, `pyarrow`, `j
 ```bash
 bin/index-fetch
 ```
-GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.4` (release별 약 13-19MB, SHA256 검증) → `state/index/`. 소요 ~15초.
+GitHub Releases `DongKey777/woowa-learning-system` → `paradigm-v2-index-v1.0.5` (release별 약 13-19MB, SHA256 검증) → `state/index/`. 소요 ~15초.
 
 **기존 학습자 재진입(git pull 후)**: `state/index/`가 있으면 무인자 `bin/index-fetch`는 건너뛴다. 새 release 자동 반영은 `bin/index-fetch --auto-upgrade` — 설치된 `manifest.release_tag`가 최신 tag보다 낡았을 때만 재fetch, 이미 최신이거나 tag 없는 로컬 빌드면 no-op. `bin/bootstrap`이 이 플래그를 넘기고 인덱스가 교체된 경우에만 daemon 재시작.
 
