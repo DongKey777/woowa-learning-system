@@ -1,0 +1,83 @@
+{
+  "id": "system-design/kafka-bidirectional-mirroring-echo-loop-primer",
+  "title": "Kafka Bidirectional Mirroring Echo Loop Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "두 Kafka 클러스터를 양방향으로 복제하면 A에서 B로 간 record가 다시 B에서 A로 돌아오는 echo loop가 생길 수 있다. source cluster/data center header, topic naming, replication policy로 원본을 식별하고 되돌려 보내지 않는 규칙을 둬야 한다.",
+  "body_markdown": "# Kafka Bidirectional Mirroring Echo Loop Primer\n\n> 한 줄 요약: 양방향 Kafka mirroring은 재해 복구와 지역 분산에 유용하지만, 원본 표시 없이 양쪽을 모두 복제하면 같은 메시지가 끝없이 되돌아오는 echo loop가 생긴다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Kafka Message Header Metadata Primer](./kafka-message-header-metadata-primer.md)\n- [Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer](./kafka-foundations-topic-partition-broker-offset-beginner-primer.md)\n- [Global Traffic Failover Control Plane Design](./global-traffic-failover-control-plane-design.md)\n- [Failover Redundancy Primer](./failover-redundancy-primer.md)\n\nretrieval-anchor-keywords: Kafka bidirectional mirroring, Kafka echo loop, MirrorMaker2 loop, source DC header, origin cluster header, active active Kafka replication, 양방향 Kafka 미러링, 카프카 복제 루프, 소스 클러스터 헤더\n\n## 문제가 생기는 모양\n\n두 데이터센터 A와 B가 있고, 둘 다 같은 topic을 서로에게 복제한다고 하자.\n\n```text\nA topic -> replicate -> B topic\nB topic -> replicate -> A topic\n```\n\n단방향이면 복제된 record가 목적지에 한 번 도착하고 끝난다. 하지만 양방향이면 B가 받은 복제 record를 새 local record처럼 보고 다시 A로 보낼 수 있다. A도 같은 일을 반복하면 메시지가 핑퐁처럼 계속 돈다.\n\n이것이 echo loop다. record 수가 늘고 lag이 커지며, downstream consumer가 중복 side effect를 만들 수 있다.\n\n## 막는 기본 원리\n\n핵심은 record의 **origin**을 잃지 않는 것이다. 보통 다음 중 하나 이상을 쓴다.\n\n- `source_dc` 또는 `origin_cluster` header를 붙인다.\n- 복제된 topic과 local-write topic의 이름을 분리한다.\n- replication policy가 이미 건너온 cluster로 다시 보내지 않도록 필터링한다.\n- consumer side effect는 idempotent하게 만든다.\n\n예를 들어 A에서 처음 만들어진 record에는 `source_dc=A`를 붙인다. B의 replicator는 이 record를 A로 다시 보낼 때 `source_dc=A`를 보고 skip한다. B에서 새로 만들어진 record는 `source_dc=B`이므로 A로 복제할 수 있다.\n\n## active-active와 active-passive를 구분하자\n\n| 구조 | 복제 방향 | echo loop 위험 | 설계 초점 |\n|---|---|---|---|\n| active-passive | 주로 한 방향 | 낮음 | failover 시 lag와 offset 복구 |\n| active-active | 양방향 | 높음 | origin 식별, conflict, loop 방지 |\n\n양방향 복제는 단순히 단방향 복제를 두 개 켠 것이 아니다. 양쪽 모두 write source가 될 수 있으므로 origin, conflict, idempotency 규칙이 필요하다.\n\n## 운영에서 보는 증상\n\n- topic record 수가 실제 트래픽보다 빠르게 증가한다.\n- 같은 key/event id가 양쪽 클러스터에서 반복적으로 보인다.\n- source header가 없거나 모든 record가 local origin처럼 보인다.\n- 복제 connector lag이 줄지 않고 downstream side effect가 중복된다.\n\n이 증상을 보면 broker 성능보다 먼저 복제 필터와 header 보존을 확인한다.\n\n## 흔한 오해\n\n- 양방향 미러링은 단방향 mirroring 두 개를 켜면 끝난다고 생각한다.\n- idempotent consumer가 있으면 echo loop 자체를 막지 않아도 된다고 생각한다. 멱등성은 피해를 줄이지만 불필요한 복제 부하는 남는다.\n- source header를 붙였지만 connector가 header를 보존하는지 테스트하지 않는다.\n- topic prefix만으로 loop 방지가 항상 충분하다고 믿는다.\n\n## 한 줄 정리\n\nKafka 양방향 mirroring에서는 record의 원본을 잃으면 같은 메시지가 계속 되돌아올 수 있다. source header나 topic policy로 origin을 보존하고, 되돌아가는 경로를 명시적으로 차단해야 한다.\n",
+  "aliases": [
+    "Kafka bidirectional mirroring",
+    "Kafka echo loop",
+    "카프카 양방향 미러링",
+    "양방향 복제 루프",
+    "source dc header loop",
+    "origin cluster header",
+    "MirrorMaker echo loop",
+    "active active Kafka replication",
+    "카프카 복제 핑퐁",
+    "소스 클러스터 헤더"
+  ],
+  "expected_queries": [
+    "양방향 Kafka 미러링에서 메시지가 무한히 되돌아오는 이유가 뭐야?",
+    "두 데이터센터 Kafka를 서로 복제할 때 echo loop를 어떻게 막아?",
+    "source_dc header로 Kafka 복제 루프를 막는다는 게 무슨 뜻이야?",
+    "active-active Kafka replication은 단방향 미러링 두 개랑 뭐가 달라?",
+    "MirrorMaker 같은 복제 도구에서 origin cluster를 왜 보존해야 해?",
+    "Kafka 복제 루프가 생기면 운영에서 어떤 증상이 보여?"
+  ],
+  "symptoms": [
+    "양방향 mirroring을 단방향 복제 두 개로만 설명한다",
+    "source cluster header 없이 loop 방지 규칙을 세운다",
+    "중복 consumer 멱등성만으로 복제 루프 부하를 해결한다고 말한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-message-header-metadata-primer",
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/failover-redundancy-primer"
+    ],
+    "next_docs": [
+      "system-design/kafka-cluster-offset-translation-failover-primer",
+      "system-design/global-traffic-failover-control-plane-design",
+      "database/failover-split-brain-fencing-playbook"
+    ],
+    "confusable_with": [
+      "system-design/kafka-partition-key-ordering-primer",
+      "database/mysql-gtid-binlog-replication-failover-chooser",
+      "system-design/sharding-replication-partitioning-interview-drill"
+    ],
+    "forbidden_for_queries": [
+      "Kafka partition key가 ordering에 미치는 영향을 설명해줘",
+      "MySQL GTID binlog replication failover를 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "양방향 Kafka 미러링 루프를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "source data center header의 용도를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "active-active 복제가 왜 어려운지 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-bidirectional-mirroring-echo-loop-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch199-kafka-foundation-ladder"
+      }
+    ]
+  }
+}

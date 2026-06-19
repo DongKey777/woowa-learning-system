@@ -1,0 +1,83 @@
+{
+  "id": "system-design/kafka-connect-source-sink-connector-primer",
+  "title": "Kafka Connect Source/Sink Connector Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Kafka Connect는 애플리케이션 코드 안에 producer/consumer를 직접 심는 대신, 외부 시스템과 Kafka topic 사이의 데이터 이동을 connector와 task로 분리하는 프레임워크다. Source connector는 외부 시스템에서 Kafka로 쓰고, Sink connector는 Kafka에서 외부 시스템으로 반영한다.",
+  "body_markdown": "# Kafka Connect Source/Sink Connector Primer\n\n> 한 줄 요약: Kafka Connect는 외부 시스템과 Kafka 사이의 데이터 이동을 connector 설정과 task 실행으로 분리하고, Source는 Kafka로 들여오며 Sink는 Kafka 밖으로 내보낸다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Kafka Foundations: Topic, Partition, Broker, Offset Beginner Primer](./kafka-foundations-topic-partition-broker-offset-beginner-primer.md)\n- [Kafka Producer Consumer Flow, Offset, and Retention Beginner Bridge](./kafka-producer-consumer-flow-offset-retention-beginner-bridge.md)\n- [CDC, Debezium, Outbox, Binlog Delivery Boundaries](../database/cdc-debezium-outbox-binlog.md)\n- [Outbox CDC Delivery Semantic Chooser](./outbox-cdc-delivery-semantic-chooser.md)\n\nretrieval-anchor-keywords: Kafka Connect, source connector, sink connector, connector task worker, 카프카 커넥트, 소스 커넥터, 싱크 커넥터, Debezium source connector, JDBC sink connector, external system to Kafka, Kafka to external system\n\n## 먼저 나눌 것\n\nKafka를 처음 쓰면 모든 데이터 이동을 애플리케이션 코드의 producer와 consumer로 구현하려고 하기 쉽다. Kafka Connect는 그중 반복되는 통합 작업을 별도 런타임으로 뺀다.\n\n- Source connector: DB, 파일, SaaS, CDC 로그 같은 외부 시스템에서 읽어 Kafka topic에 record를 쓴다.\n- Sink connector: Kafka topic을 읽어 검색 인덱스, DB, 오브젝트 스토리지 같은 외부 시스템에 반영한다.\n- Worker: connector를 실행하는 프로세스다.\n- Task: connector가 병렬 실행을 위해 나눈 실제 작업 단위다.\n\n즉 Connect는 비즈니스 처리 로직을 대신하는 도구가 아니라 **데이터 이동 경계**를 표준화하는 도구다.\n\n## Source와 Sink를 반대로 이해하면 생기는 실수\n\n| 방향 | 읽는 곳 | 쓰는 곳 | 예시 |\n|---|---|---|---|\n| Source connector | 외부 시스템 | Kafka topic | MySQL binlog를 읽어 `orders` topic에 발행 |\n| Sink connector | Kafka topic | 외부 시스템 | `orders` topic을 읽어 Elasticsearch index에 반영 |\n\n이 방향이 중요한 이유는 장애 복구 질문이 달라지기 때문이다. Source connector는 외부 시스템의 읽기 위치와 Kafka produce 성공을 같이 봐야 하고, Sink connector는 Kafka offset과 외부 시스템 반영의 멱등성을 같이 봐야 한다.\n\n## 애플리케이션 consumer와 무엇이 다른가\n\n애플리케이션 consumer는 보통 도메인 결정을 한다. 예를 들어 주문 이벤트를 보고 쿠폰을 발급하거나 알림을 보낸다. 반면 Sink connector는 보통 같은 데이터를 다른 저장소에 옮기거나 색인한다.\n\n그래서 connector를 고를 때는 먼저 질문이 다르다.\n\n- 이 작업은 범용 데이터 이동인가?\n- 외부 시스템에 이미 검증된 connector가 있는가?\n- 실패 시 같은 record를 다시 써도 안전한가?\n- schema 변화와 offset 복구를 누가 책임지는가?\n\n비즈니스 규칙이 많고 보상/상태 전이가 필요하면 connector보다 애플리케이션 consumer가 더 맞을 수 있다.\n\n## 운영에서 보는 증상\n\nconnector가 느리거나 멈추면 Kafka 자체 문제처럼 보이지만, 실제 원인은 외부 시스템인 경우가 많다.\n\n| 증상 | 먼저 볼 것 | 이유 |\n|---|---|---|\n| source lag 증가 | 외부 DB read, binlog/WAL retention, connector task error | Kafka로 쓰기 전에 source 읽기가 막힐 수 있다 |\n| sink lag 증가 | 외부 sink latency, bulk size, retry/backoff | Kafka는 빠른데 목적지가 느릴 수 있다 |\n| 중복 반영 | sink idempotency, primary key, upsert mode | Connect는 재시도할 수 있고 외부 side effect는 별도다 |\n| schema 오류 | converter, schema registry, nullable/default 변화 | record 직렬화와 목적지 schema가 어긋날 수 있다 |\n\n## 흔한 오해\n\n- Kafka Connect를 쓰면 exactly-once가 외부 시스템까지 자동 보장된다고 생각한다.\n- Source connector와 Sink connector 방향을 이름만 보고 헷갈린다.\n- connector 설정만 배포하면 외부 시스템 부하와 schema 변화가 사라진다고 믿는다.\n- 모든 consumer를 connector로 바꿔야 한다고 생각한다. 도메인 로직은 애플리케이션 consumer에 남기는 편이 낫다.\n\n## 한 줄 정리\n\nKafka Connect는 Kafka와 외부 시스템 사이의 반복적인 데이터 이동을 맡기는 통합 런타임이다. Source는 Kafka로 들여오고, Sink는 Kafka 밖으로 내보내며, 장애 복구는 offset과 외부 side effect를 함께 봐야 한다.\n",
+  "aliases": [
+    "Kafka Connect source sink",
+    "카프카 커넥트",
+    "소스 커넥터 싱크 커넥터",
+    "Kafka source connector",
+    "Kafka sink connector",
+    "connector task worker",
+    "Debezium source connector",
+    "JDBC sink connector",
+    "카프카 외부 시스템 연동",
+    "connector offset 복구"
+  ],
+  "expected_queries": [
+    "카프카 커넥트랑 소스 싱크 커넥터가 뭐야?",
+    "Kafka Source connector와 Sink connector 방향이 어떻게 달라?",
+    "DB 변경분을 Kafka로 보내는 건 source connector야 sink connector야?",
+    "Kafka Connect worker와 task는 각각 무슨 역할을 해?",
+    "Kafka connector를 쓰면 외부 DB 반영도 exactly-once가 자동으로 돼?",
+    "비즈니스 로직 consumer와 Kafka Sink connector는 언제 구분해야 해?"
+  ],
+  "symptoms": [
+    "source connector와 sink connector 방향을 반대로 설명한다",
+    "connector를 쓰면 외부 side effect 멱등성이 자동 보장된다고 말한다",
+    "Kafka lag만 보고 외부 source/sink latency를 확인하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "next_docs": [
+      "database/cdc-debezium-outbox-binlog",
+      "system-design/outbox-cdc-delivery-semantic-chooser",
+      "system-design/kafka-cluster-offset-translation-failover-primer"
+    ],
+    "confusable_with": [
+      "system-design/kafka-producer-consumer-flow-offset-retention-beginner-bridge",
+      "database/cdc-debezium-outbox-binlog",
+      "software-engineering/message-driven-adapter"
+    ],
+    "forbidden_for_queries": [
+      "Kafka partition key ordering과 hot partition을 설명해줘",
+      "Kafka consumer group rebalance cooperative와 eager 차이를 알려줘"
+    ]
+  },
+  "learner_query_patterns": [
+    {
+      "pattern": "카프카 커넥트가 뭔지 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "source connector와 sink connector 방향을 헷갈린다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    },
+    {
+      "pattern": "connector와 직접 consumer 구현의 경계를 묻는다",
+      "match_count": 1,
+      "added_at": "2026-06-19"
+    }
+  ],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/system-design/kafka-connect-source-sink-connector-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch199-kafka-foundation-ladder"
+      }
+    ]
+  }
+}
