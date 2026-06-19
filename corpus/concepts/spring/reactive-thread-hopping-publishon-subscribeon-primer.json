@@ -1,0 +1,58 @@
+{
+  "id": "spring/reactive-thread-hopping-publishon-subscribeon-primer",
+  "title": "Reactive thread hopping과 publishOn/subscribeOn 입문",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "Reactive pipeline에서는 같은 요청이라도 signal 처리 thread가 operator 위치에 따라 바뀔 수 있다. subscribeOn은 source 쪽 subscription 경계를, publishOn은 이후 downstream 실행 경계를 주로 바꾸며, 이 thread hopping을 모르면 로그 순서, MDC/SecurityContext 손실, block 위치를 잘못 해석한다.",
+  "body_markdown": "# Reactive thread hopping과 publishOn/subscribeOn 입문\n\n> 한 줄 요약: `subscribeOn`은 source 쪽 subscription 실행 위치에, `publishOn`은 이후 downstream signal 처리 위치에 주로 영향을 주며, 이 thread hopping을 알아야 로그와 context 손실을 제대로 읽을 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n## thread hopping이란 무엇인가\n\nReactive pipeline에서는 하나의 요청이 항상 같은 thread에서 끝까지 흐르지 않을 수 있다. operator 위치와 scheduler에 따라 어떤 단계는 event-loop에서, 어떤 단계는 boundedElastic worker에서, 어떤 단계는 parallel worker에서 실행될 수 있다.\n\n이렇게 실행 thread가 바뀌는 현상을 thread hopping이라고 부를 수 있다.\n\n초보자가 마주치는 증상은 보통 이렇다.\n\n- 로그 thread name이 중간에 바뀐다.\n- MDC나 SecurityContext가 갑자기 사라진다.\n- `block()`이 어디서 호출됐는지 thread dump만 보고 헷갈린다.\n- `publishOn`을 넣었는데 앞쪽 호출은 그대로 event-loop에서 돈다.\n\n## subscribeOn 감각\n\n`subscribeOn`은 subscription이 source 쪽으로 올라가는 경로에 영향을 준다. 그래서 source 작업이 어느 scheduler에서 시작될지 바꾸려 할 때 자주 쓴다.\n\n```java\nMono.fromCallable(() -> legacyClient.call())\n    .subscribeOn(Schedulers.boundedElastic());\n```\n\n이 예에서는 blocking source 호출을 boundedElastic에서 시작하게 하려는 의도가 분명하다.\n\n## publishOn 감각\n\n`publishOn`은 그 operator 이후 downstream 신호 처리를 지정한 scheduler로 넘긴다.\n\n```java\nsource\n    .publishOn(Schedulers.parallel())\n    .map(this::cpuHeavyTransform)\n    .map(this::toResponse);\n```\n\n이 경우 `publishOn` 뒤의 변환은 parallel worker에서 이어질 수 있다. 하지만 `publishOn` 앞 source가 어디서 실행되는지는 별도 문제다.\n\n## 가장 흔한 실수\n\n```java\nMono.fromCallable(() -> blockingCall())\n    .map(this::convert)\n    .publishOn(Schedulers.boundedElastic());\n```\n\n이 코드는 blocking source를 이미 실행한 뒤 downstream만 옮기는 모양이 될 수 있다. 의도가 blocking isolation이라면 `subscribeOn` 위치를 먼저 봐야 한다.\n\n반대로 모든 곳에 `subscribeOn`을 여러 개 붙인다고 각 단계가 다 바뀌는 것도 아니다. chain에서 어떤 source와 subscription 경계에 적용되는지 이해해야 한다.\n\n## context 손실과 관측성\n\nthread hopping은 ThreadLocal 기반 문맥과 충돌한다.\n\n- MDC trace id\n- SecurityContext\n- request attribute\n- transaction context\n\n이 값들이 일반 ThreadLocal에만 있으면 scheduler 전환 뒤 사라진 것처럼 보일 수 있다. Reactor에서는 context propagation을 별도로 이해해야 하고, Spring Security/WebFlux도 servlet ThreadLocal 모델과 다르게 읽어야 한다.\n\n## 디버깅 체크리스트\n\n| 질문 | 확인할 것 |\n|---|---|\n| 어느 구간이 blocking source인가 | source operator와 `subscribeOn` 위치 |\n| 어느 구간부터 다른 thread인가 | `publishOn` 위치와 이후 operator |\n| context가 어디서 사라졌나 | thread name, MDC, Reactor context, security context |\n| event-loop가 막혔나 | blocking call stack과 scheduler 적용 전후 |\n| timeout이 어느 구간 예산인가 | timeout operator 위치와 scheduler queue 지연 |\n\n## 흔한 오해\n\n- `publishOn`을 붙이면 앞쪽 source까지 옮겨진다고 생각한다.\n- `subscribeOn`을 여러 번 붙이면 단계별로 thread가 계속 바뀐다고 생각한다.\n- thread hopping을 성능 문제로만 보고 context/보안/관측성 문제를 놓친다.\n- WebFlux에서도 servlet MVC처럼 ThreadLocal이 요청 끝까지 안정적으로 따라온다고 믿는다.\n\n## 다음 학습\n\n`publishOn`과 `subscribeOn`의 경계가 보이면 WebFlux event-loop blocking, WebClient latency router, SecurityContext propagation 같은 문서를 읽을 준비가 된다.\n\n## 한 줄 정리\n\nReactive thread hopping은 operator 위치와 scheduler 선택이 만든 실행 경계이며, `publishOn`과 `subscribeOn`을 구분해야 block 위치와 context 손실을 설명할 수 있다.\n",
+  "aliases": [
+    "publishOn subscribeOn 차이",
+    "Reactive thread hopping",
+    "Reactor 스레드 바뀜",
+    "subscribeOn이 뭐야?",
+    "publishOn이 뭐야?",
+    "MDC 사라지는 이유",
+    "WebFlux ThreadLocal 문제",
+    "boundedElastic subscribeOn"
+  ],
+  "expected_queries": [
+    "publishOn과 subscribeOn은 Reactor에서 어떻게 달라?",
+    "publishOn을 넣었는데 blocking 호출이 왜 그대로 event loop에서 돌아?",
+    "Reactive pipeline에서 thread name이 중간에 바뀌는 이유가 뭐야?",
+    "WebFlux에서 MDC나 SecurityContext가 scheduler 전환 뒤 사라질 수 있어?",
+    "blocking source를 boundedElastic로 옮기려면 publishOn이야 subscribeOn이야?"
+  ],
+  "symptoms": [
+    "publishOn이 source 실행 위치까지 바꾼다고 생각한다.",
+    "thread hopping을 보고 로그가 꼬였다고만 판단하고 scheduler 경계를 보지 않는다.",
+    "ThreadLocal 기반 context가 reactive pipeline에서 자동 전파된다고 믿는다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/reactor-scheduler-boundedelastic-parallel-primer"
+    ],
+    "next_docs": [
+      "spring/reactive-blocking-bridge-boundedelastic-block-traps",
+      "spring/securitycontext-propagation-async-reactive-boundaries",
+      "spring/webclient-eventloop-blocking-dns-codec-pool-latency-router"
+    ],
+    "confusable_with": [
+      "spring/scheduler-async-boundaries",
+      "language/threadlocal-leaks-context-propagation",
+      "language/completablefuture-execution-model-common-pool-pitfalls"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch196"
+      }
+    ]
+  }
+}

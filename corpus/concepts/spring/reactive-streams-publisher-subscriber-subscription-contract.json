@@ -1,0 +1,57 @@
+{
+  "id": "spring/reactive-streams-publisher-subscriber-subscription-contract",
+  "title": "Reactive Streams Publisher/Subscriber/Subscription 계약",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "Reactive Streams의 핵심은 Publisher가 값을 마음대로 밀어 넣는 구조가 아니라, Subscriber가 Subscription으로 demand를 요청하고 Publisher가 그 예산 안에서 신호를 보내는 계약이다. 이 계약을 알아야 Reactor의 backpressure, cancellation, WebFlux stream 동작을 초보자가 연결할 수 있다.",
+  "body_markdown": "# Reactive Streams Publisher/Subscriber/Subscription 계약\n\n> 한 줄 요약: Reactive Streams는 `Publisher`가 마음대로 값을 미는 규칙이 아니라, `Subscriber`가 `Subscription.request(n)`으로 받을 수 있는 만큼을 알리고 그 예산 안에서 신호가 흐르게 하는 계약이다.\n\n**난이도: 🟡 Intermediate**\n\n## 세 역할부터 잡기\n\nReactive Streams에는 이름이 비슷해서 헷갈리는 세 역할이 있다.\n\n| 역할 | 한 줄 감각 | 묻는 질문 |\n|---|---|---|\n| `Publisher` | 값을 낼 수 있는 쪽 | 어떤 신호를 만들 수 있나 |\n| `Subscriber` | 값을 받는 쪽 | 얼마나 받고 어떻게 처리하나 |\n| `Subscription` | 둘 사이의 연결권 | 더 받을지, 취소할지 어떻게 말하나 |\n\n초보자에게 가장 중요한 포인트는 `Subscription`이다. 단순 callback 구조라면 producer가 준비되는 대로 계속 밀어 넣을 수 있다. Reactive Streams에서는 subscriber가 `request(n)`으로 수요를 알려야 하고, publisher는 그 수요를 넘어 `onNext`를 보내면 안 된다.\n\n## Demand가 왜 중요한가\n\n대량 이벤트, SSE, WebClient streaming, DB row stream 같은 흐름에서 받는 쪽이 느리면 큐가 쌓인다. 큐가 무한하면 OOM이 나고, 큐가 유한하면 어디선가 막히거나 버려야 한다.\n\nReactive Streams demand는 이 문제를 API 계약 안으로 끌고 온다.\n\n```text\nSubscriber: 10개까지 처리할 수 있어요\nPublisher: 그럼 onNext를 최대 10번까지만 보낼게요\nSubscriber: 처리했으니 5개 더 주세요\nPublisher: 다시 5개 예산 안에서 보낼게요\n```\n\n이 감각이 있어야 `backpressure`가 단순히 \"느리게 처리\"가 아니라 \"수요를 기준으로 흐름을 제한\"하는 뜻임을 이해할 수 있다.\n\n## 최소 신호 흐름\n\n아주 단순화하면 정상 흐름은 아래와 같다.\n\n```text\npublisher.subscribe(subscriber)\nsubscriber.onSubscribe(subscription)\nsubscriber requests demand\npublisher emits onNext within demand\npublisher eventually onComplete\n```\n\n오류가 나면 `onError`가 terminal signal이다. subscriber가 더 이상 필요 없으면 `cancel()`로 흐름을 끊을 수 있다.\n\n## WebFlux/Reactor에서 왜 보이나\n\nReactor의 `Mono`와 `Flux`는 Reactive Streams Publisher다. WebFlux는 반환된 publisher를 구독하고 HTTP 응답으로 이어 붙인다. 그래서 controller가 `Flux`를 반환하면 \"List를 통째로 response body에 넣었다\"가 아니라, framework가 subscriber 역할을 하며 응답 write와 연결한다.\n\n이 연결이 보이면 아래 질문을 더 정확히 말할 수 있다.\n\n- client가 끊겼을 때 cancellation은 어디로 전파되나\n- downstream이 느릴 때 source는 얼마나 더 만들 수 있나\n- operator가 demand를 어떻게 바꾸나\n- 무제한 request가 들어간 흐름은 어디서 위험해지나\n\n## 흔한 오해\n\n- `Publisher`는 observer pattern의 subject와 완전히 같지 않다. demand와 cancellation 계약이 있다.\n- `Subscriber`가 느려도 publisher가 계속 밀어 넣어도 된다고 보면 backpressure를 놓친다.\n- `Subscription`을 단순 연결 객체로 보면 `request(n)`과 `cancel()`의 의미를 놓친다.\n- 모든 operator가 demand를 그대로 통과시키는 것은 아니다. buffering, prefetch, flatMap concurrency는 demand 모양을 바꿀 수 있다.\n\n## 작은 코드 감각\n\n```java\nFlux.range(1, 100)\n    .doOnRequest(n -> log.info(\"request {}\", n))\n    .subscribe(value -> log.info(\"value {}\", value));\n```\n\n실무에서는 직접 `Subscriber`를 구현하는 일보다, operator와 framework가 만들어 내는 demand를 읽는 일이 더 많다. 그래도 `request(n)` 감각을 알고 있으면 WebFlux streaming이나 Reactor Netty 지연을 볼 때 \"누가 누구에게 얼마나 달라고 했는가\"를 질문할 수 있다.\n\n## 다음 학습\n\n이 계약 다음에는 terminal signal 규칙과 operator chain의 signal 흐름을 봐야 한다. `Publisher`/`Subscriber`만 알면 구조는 보이지만, `onNext` 뒤에 `onError`가 올 수 있는지, `onComplete` 뒤에 값이 올 수 있는지 같은 규칙을 알아야 디버깅이 된다.\n\n## 한 줄 정리\n\nReactive Streams의 핵심은 publisher가 값을 무제한 밀어 넣지 않고, subscriber가 subscription을 통해 demand와 cancellation을 말하는 계약이다.\n",
+  "aliases": [
+    "Reactive Streams 계약",
+    "Publisher Subscriber Subscription",
+    "request n 의미",
+    "Subscription이 뭐야?",
+    "리액티브 스트림 demand",
+    "Subscriber가 request 하는 이유",
+    "Reactive Streams 처음",
+    "backpressure request n"
+  ],
+  "expected_queries": [
+    "Reactive Streams에서 Publisher Subscriber Subscription은 각각 무슨 역할이야?",
+    "Subscription.request(n)은 왜 필요한 거야?",
+    "Publisher가 subscriber보다 빠르면 Reactive Streams는 어떻게 막아?",
+    "Reactor backpressure를 이해하려면 request demand를 어떻게 봐야 해?",
+    "WebFlux에서 Flux를 반환하면 누가 subscribe하는 거야?"
+  ],
+  "symptoms": [
+    "Publisher와 Subscriber를 단순 observer pattern처럼만 이해한다.",
+    "request(n)을 모르고 backpressure를 큐 크기 문제로만 본다.",
+    "Subscription cancel이 client disconnect나 timeout과 연결될 수 있음을 놓친다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/reactor-mono-flux-basics"
+    ],
+    "next_docs": [
+      "spring/reactive-streams-signal-sequence-rules",
+      "spring/reactor-operator-chain-signal-flow",
+      "system-design/backpressure-and-load-shedding-design"
+    ],
+    "confusable_with": [
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser",
+      "system-design/backpressure-and-load-shedding-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch196"
+      }
+    ]
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "spring/reactor-vs-coroutines-backpressure-timer-chooser",
+  "title": "Reactor vs 코루틴 선택 기준: backpressure와 타이머",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "단일 요청-응답 API는 코루틴이 더 단순할 수 있지만, 대량 stream, backpressure, window/timer 기반 집계, signal-level cancellation이 핵심이면 Reactor가 더 자연스러울 수 있다. 선택 기준은 유행이 아니라 흐름 제어와 운영 관측성 요구다.",
+  "body_markdown": "# Reactor vs 코루틴 선택 기준: backpressure와 타이머\n\n> 한 줄 요약: 단일 요청-응답 API는 코루틴이 단순할 수 있고, 대량 stream·backpressure·window/timer 기반 집계가 핵심이면 Reactor가 더 자연스러울 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n## 선택 질문을 바꿔야 한다\n\n\"Reactor가 좋아요, 코루틴이 좋아요?\"라는 질문은 너무 넓다. 먼저 workload를 나눠야 한다.\n\n- 단일 HTTP 요청을 받아 외부 API 몇 개를 호출하고 응답한다.\n- 여러 이벤트를 계속 받아 window 단위로 집계한다.\n- client가 느릴 수 있고 downstream demand를 반영해야 한다.\n- timeout, retry, cancellation을 signal 단위로 관측해야 한다.\n\n앞의 경우는 코루틴이 더 읽기 쉬울 수 있다. 뒤의 경우는 Reactor의 stream/demand/operator 모델이 더 잘 맞을 수 있다.\n\n## 코루틴이 자연스러운 경우\n\n코루틴은 sequential code처럼 비동기 흐름을 쓰기 좋다.\n\n```kotlin\nsuspend fun findOrder(id: Long): OrderResponse {\n    val order = orderClient.find(id)\n    val payment = paymentClient.find(order.paymentId)\n    return OrderResponse(order, payment)\n}\n```\n\n단일 요청-응답, fan-out/fan-in, timeout 예산이 비교적 단순한 흐름에서는 코드가 읽기 쉽다. 팀이 Kotlin과 coroutine context를 잘 이해한다면 운영 복잡도도 낮을 수 있다.\n\n## Reactor가 자연스러운 경우\n\nReactor는 여러 값이 계속 흐르고, downstream demand와 operator 조합이 중요한 경우 강점이 있다.\n\n- `Flux` event stream\n- SSE/WebSocket streaming\n- window/buffer/groupBy 기반 집계\n- backpressure가 실제 제품 요구인 pipeline\n- signal-level cancel/error/complete 관측\n- Reactor Netty/WebClient/WebFlux와 밀접한 경계\n\n예를 들어 초당 많은 이벤트를 받아 5초 window로 묶고, downstream이 느리면 demand를 조절해야 한다면 Reactor operator 모델이 요구사항과 더 직접적으로 맞는다.\n\n## Backpressure가 선택 기준이 되는 이유\n\n코루틴도 채널, Flow, dispatcher로 흐름 제어를 할 수 있다. 하지만 Spring WebFlux와 Reactor Netty 경계에서 이미 Reactive Streams demand가 제품 요구와 맞물린다면 Reactor를 끝까지 유지하는 편이 자연스러울 수 있다.\n\n반대로 단순 CRUD API에 Reactor를 전면 도입하고 중간마다 `block()`한다면, 복잡도만 늘고 장점은 줄어든다.\n\n## 타이머와 window 처리\n\n대량 stream 처리에서는 \"5초마다\", \"100개씩\", \"timeout 전까지\", \"late event를 어떻게\" 같은 time/window 질문이 많이 나온다. Reactor operator는 이런 흐름을 직접 표현할 수 있다.\n\n```java\nevents\n    .windowTimeout(100, Duration.ofSeconds(5))\n    .flatMap(this::aggregate);\n```\n\n하지만 operator 하나로 설계가 끝나는 것은 아니다. window 기준, clock, retry, duplicate, cancellation, backpressure까지 운영 정책으로 닫아야 한다.\n\n## 선택 매트릭스\n\n| 질문 | 코루틴 쪽이 자연스러운 신호 | Reactor 쪽이 자연스러운 신호 |\n|---|---|---|\n| 값 개수 | 요청당 결과 하나 | 계속 흐르는 여러 값 |\n| 코드 모양 | 순차 흐름이 중요 | operator pipeline이 중요 |\n| 부하 제어 | dispatcher/queue로 충분 | Reactive Streams demand가 핵심 |\n| 시간 처리 | 단순 timeout | window, buffer, timer stream |\n| Spring 경계 | MVC/Kotlin suspend API | WebFlux/Reactor Netty/SSE |\n| 팀 학습 비용 | Kotlin coroutine에 익숙 | Reactor signal/operator에 익숙 |\n\n## 흔한 오해\n\n- 코루틴이면 backpressure 고민이 사라진다고 생각한다.\n- Reactor를 쓰면 모든 API가 자동으로 고성능이 된다고 생각한다.\n- WebClient를 썼다는 이유만으로 전체 서비스를 Reactor로 바꾼다.\n- 단일 요청-응답을 굳이 복잡한 Flux pipeline으로 만든다.\n- stream/window 요구가 있는데 단순 suspend 함수로만 밀어붙인다.\n\n## 실무 판단 순서\n\n1. 값이 하나인가, 여러 값의 흐름인가?\n2. downstream 속도가 요구사항에 영향을 주는가?\n3. window/timer/grouping이 핵심인가?\n4. WebFlux/Reactor Netty 경계를 얼마나 유지해야 하는가?\n5. 팀이 디버깅할 수 있는 실행 모델은 무엇인가?\n\n이 다섯 질문에 답하면 \"무엇이 더 최신인가\"가 아니라 \"이 문제의 제약에 무엇이 더 자연스러운가\"로 고를 수 있다.\n\n## 한 줄 정리\n\nReactor와 코루틴 선택은 취향 문제가 아니라, 단일 요청-응답인지 stream/backpressure/window 처리인지에 따라 실행 모델과 관측 비용을 고르는 문제다.\n",
+  "aliases": [
+    "Reactor 코루틴 선택",
+    "Reactor vs coroutine",
+    "코루틴이랑 Reactor 차이",
+    "backpressure 필요할 때 Reactor",
+    "단일 API는 코루틴?",
+    "Flux window 타이머",
+    "WebFlux 코루틴 비교",
+    "코루틴 backpressure"
+  ],
+  "expected_queries": [
+    "단일 요청-응답 API는 코루틴이 낫고 대량 스트림은 Reactor가 나은 기준이 뭐야?",
+    "Reactor와 코루틴 중 backpressure가 중요하면 뭘 골라야 해?",
+    "WebFlux를 쓰면 코루틴보다 Reactor를 끝까지 써야 해?",
+    "이벤트를 window로 묶고 타이머로 집계할 때 Reactor가 왜 자연스러워?",
+    "코루틴을 쓰면 reactive backpressure 고민이 사라지는 거야?"
+  ],
+  "symptoms": [
+    "Reactor와 코루틴을 유행이나 선호로만 비교한다.",
+    "단일 요청-응답 API에 불필요한 Flux pipeline을 만든다.",
+    "대량 stream 요구가 있는데 backpressure와 timer 처리를 설계하지 않는다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/reactor-mono-flux-basics",
+      "spring/reactive-streams-publisher-subscriber-subscription-contract",
+      "language/coroutine-basics"
+    ],
+    "next_docs": [
+      "spring/webflux-vs-mvc",
+      "spring/reactive-blocking-bridge-boundedelastic-block-traps",
+      "language/virtual-thread-reactive-db"
+    ],
+    "confusable_with": [
+      "language/coroutine-basics",
+      "language/virtual-thread-reactive-db",
+      "spring/webclient-vs-resttemplate"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch196"
+      }
+    ]
+  }
+}
