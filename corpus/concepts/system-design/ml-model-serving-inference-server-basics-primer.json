@@ -1,0 +1,67 @@
+{
+  "id": "system-design/ml-model-serving-inference-server-basics-primer",
+  "title": "ML Model Serving / Inference Server Basics Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "모델 서빙은 학습이 끝난 모델 artifact를 운영 inference 경로에 올려 입력 feature를 붙이고, 모델 실행 결과를 제품 응답이나 배치 산출물에 맞게 후처리하는 영역이다. 별도 inference server는 그 배포 형태 중 하나이며, latency budget, feature freshness, runtime 자원, 모델 버전과 rollback까지 함께 설계해야 한다.",
+  "body_markdown": "# ML Model Serving / Inference Server Basics Primer\n\n> 한 줄 요약: 모델 서빙은 학습된 모델 파일을 운영 경로에 올려 online 요청이나 batch 작업에서 feature를 모으고, 전처리한 입력을 모델에 넣어 예측 결과를 돌려주는 실행 영역이다.\n\nretrieval-anchor-keywords: model serving, inference server, online inference, ML 모델 서빙, 추론 서버, feature fetch, preprocessing, postprocessing, model artifact, model version, canary rollback, GPU inference latency, recommendation feature store boundary\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Recommendation / Feed Ranking Architecture](./recommendation-feed-ranking-architecture.md)\n- [Request Deadline and Timeout Budget Primer](./request-deadline-timeout-budget-primer.md)\n- [가용성과 SLA/SLO/SLI 기초](./availability-and-sla-basics.md)\n- [Batch vs Stream Processing Beginner Primer](./batch-vs-stream-processing-beginner-primer.md)\n- [Canary BlueGreen Rollback Interview Drill](./canary-bluegreen-rollback-interview-drill.md)\n\n## 모델 서빙이 무엇인가\n\n머신러닝 모델을 만든 뒤에는 두 세계가 나뉜다.\n\n- training: 과거 데이터를 모아 모델을 학습한다\n- serving: 학습된 모델을 실제 요청에서 호출한다\n\n모델 서빙은 두 번째 영역이다. 학습 결과물인 model artifact를 서버가 로드하고, 사용자의 요청이 들어오면 모델이 이해하는 입력으로 바꿔 예측값을 만든다. 추천에서는 상품이나 게시글 후보에 점수를 매기고, 검색에서는 랭킹 점수를 보정하고, 사기 탐지에서는 위험 점수를 계산할 수 있다.\n\n여기서 model artifact는 단순히 코드 한 줄이 아니다. 보통 아래가 함께 묶인다.\n\n- 모델 가중치 파일\n- 입력 feature schema\n- tokenizer, scaler, embedding table 같은 전처리 자원\n- 모델 실행 runtime 정보\n- model version과 학습 데이터/실험 정보\n\n서빙 서버는 이 artifact를 읽어 메모리에 올리고, 요청마다 같은 방식으로 실행한다. 다만 모델 서빙이 항상 별도 서버라는 뜻은 아니다. 작은 모델은 제품 API 안에 embedded runtime으로 붙을 수 있고, 대량 점수 계산은 batch inference job으로 돌 수 있으며, 자원 격리나 독립 배포가 필요하면 별도 inference server로 분리한다.\n\n## Inference server로 분리할지 보는 기준\n\n별도 inference server는 모델 서빙의 한 배포 형태다. 보통 아래 조건이 강하면 분리 쪽으로 기운다.\n\n| 분리 쪽 신호 | embedded/API 내부 실행 쪽 신호 |\n|---|---|\n| GPU, Python runtime, 큰 모델처럼 제품 API와 자원 특성이 다르다 | 작은 모델이고 같은 JVM/프로세스에서 실행해도 latency와 운영이 단순하다 |\n| 모델 버전 canary, rollback, traffic split을 코드 배포와 따로 하고 싶다 | 네트워크 hop을 줄이는 것이 더 중요하고 모델 변경 빈도가 낮다 |\n| 여러 제품 API가 같은 모델을 공유한다 | 한 서비스의 작은 판단 로직에 가깝다 |\n| dynamic batching, queueing, model warmup, runtime isolation이 필요하다 | 요청량이 낮고 batch/queue 운영이 오히려 복잡하다 |\n\n따라서 \"모델 서버랑 API 서버를 왜 분리해?\"라는 질문의 답은 항상 분리하라는 뜻이 아니라, runtime·스케일링·버전·자원 격리의 변경 축이 제품 API와 달라질 때 분리한다는 것이다.\n\n## 일반 API 서버와 무엇이 다른가\n\n별도 inference server로 두면 겉으로는 `POST /predict` 같은 API 서버처럼 보인다. 하지만 추론 서버는 일반 CRUD API보다 운영상 챙길 축이 더 많다.\n\n| 축 | 일반 API 서버 | 추론 서버 |\n|---|---|---|\n| 핵심 작업 | 비즈니스 로직과 DB 조회 | feature 준비와 모델 실행 |\n| 입력 | 요청 body, DB row | feature vector, tensor, token |\n| 자원 병목 | DB, cache, downstream | feature fetch, CPU/GPU, model queue |\n| 변경 단위 | 코드/설정 버전 | 코드 + model version + feature schema |\n| 실패 대응 | 에러 응답, fallback | default score, lightweight model, 이전 모델 rollback |\n\n그래서 추론 서버를 설계할 때는 \"API로 모델을 호출한다\"에서 멈추면 부족하다. 요청 전처리, feature 조회, 모델 실행, 후처리, 관측성, 버전 전환을 한 요청 경로로 봐야 한다.\n\n## 온라인 요청은 이렇게 흐른다\n\n가장 단순한 별도 inference server 기반 온라인 추론 흐름은 아래와 같다. Embedded serving이면 Product API 내부 단계로 접히고, batch inference면 Client 요청 대신 batch job이 입력 묶음을 넘긴다.\n\n```text\nClient / Product API\n  -> Inference Server\n      -> Validate request\n      -> Fetch features\n      -> Preprocess / build tensor\n      -> Run model\n      -> Postprocess score\n  -> Product API response\n```\n\n각 단계의 역할은 다르다.\n\n- inference request: 사용자 ID, 후보 item ID, 문장, 이미지 URL처럼 모델이 판단할 대상을 담는다.\n- feature fetch: 사용자 최근 행동, 상품 통계, 콘텐츠 embedding 같은 입력 feature를 feature store나 cache에서 가져온다.\n- preprocessing: 누락값 채우기, 정규화, tokenization, tensor 변환을 한다.\n- model execution: CPU, GPU, JVM runtime, Python runtime 같은 실행 환경에서 모델을 돌린다.\n- postprocessing: raw score를 정렬 점수, label, threshold 결과, 설명 가능한 응답 형식으로 바꾼다.\n\n느려지는 곳도 이 단계마다 다르다. 모델 자체가 20ms여도 feature fetch가 80ms이고 queue wait가 50ms면 사용자는 150ms 이상을 본다.\n\n## Feature store와의 경계\n\nfeature store는 feature를 저장하고 제공하는 쪽이고, inference server는 그 feature를 사용해 모델을 실행하는 쪽이다.\n\n경계를 단순히 나누면 이렇다.\n\n| 컴포넌트 | 책임 |\n|---|---|\n| feature store | 최신 feature 조회, offline/online feature 일관성, freshness 관리 |\n| inference server | feature schema 검증, 전처리, 모델 실행, score 후처리 |\n| recommendation architecture | 후보 생성, feature fetch 조율, 모델 점수 사용, re-ranking, 실험 |\n\n추천 시스템에서는 추론 서버가 전체가 아니다. 후보 생성이 먼저 후보를 줄이고, feature store가 필요한 입력을 주고, inference server가 후보별 점수를 만들고, re-ranking이 다양성이나 정책을 반영한다. 따라서 \"추천이 느리다\"는 말은 모델 서버만 보면 안 된다. 후보 수, feature fetch fanout, model batch size, 후처리 rule cost를 함께 봐야 한다.\n\n## Online inference와 batch inference\n\n온라인 추론은 사용자의 요청 시간 안에서 모델을 호출한다. 홈 피드 열기, 검색어 입력, 결제 위험 점수처럼 바로 응답해야 하는 흐름이다. 장점은 최신 상황을 반영할 수 있다는 점이고, 단점은 latency budget과 SLA를 직접 소모한다는 점이다.\n\n배치 추론은 많은 대상을 미리 모아서 점수를 계산한다. 매일 상품 추천 점수를 갱신하거나, 사용자 세그먼트를 밤에 다시 계산하는 방식이다. 장점은 throughput과 비용을 최적화하기 쉽고 재처리가 단순하다는 점이다. 단점은 최신성이 낮다.\n\n| 선택 | 적합한 경우 | 조심할 점 |\n|---|---|---|\n| online inference | 최신 행동이 품질에 중요하고 응답 시점에 판단해야 함 | p95/p99 latency, timeout, fallback |\n| batch inference | 늦어도 되는 대량 점수 계산 | stale score, 재처리 범위, 데이터 drift |\n| hybrid | batch score를 기본값으로 두고 online에서 일부 보정 | 두 결과의 version과 freshness 추적 |\n\n초급 단계에서는 \"실시간이 더 좋다\"가 아니라 \"최신성이 필요한 만큼만 온라인 경로에 올린다\"고 잡으면 된다.\n\n## Latency budget과 SLA\n\n추론 서버가 제품 API 안에 들어오면 모델 실행 시간도 사용자가 기다리는 시간의 일부가 된다. 예를 들어 홈 피드 p95 목표가 250ms라면 추론 서버가 마음대로 200ms를 써도 되는 것이 아니다.\n\n```text\nFeed API p95 target 250ms\n  candidate generation 40ms\n  feature fetch 70ms\n  inference server 60ms\n  re-ranking / response 50ms\n  buffer 30ms\n```\n\n이 예산 안에서 inference server는 다시 나뉜다.\n\n- request validation\n- feature schema check\n- preprocessing\n- model queue wait\n- model execution\n- postprocessing\n\n운영 지표도 `model_latency_ms` 하나만 두면 부족하다. 최소한 `feature_fetch_latency_ms`, `preprocess_latency_ms`, `model_queue_wait_ms`, `model_execution_ms`, `postprocess_latency_ms`, `timeout_rate`, `fallback_rate`, `model_version`을 함께 봐야 한다.\n\n## CPU, GPU, JVM runtime은 어떻게 보면 되나\n\n입문 단계에서는 runtime을 깊게 외울 필요는 없다. 다만 어떤 자원이 병목인지 구분해야 한다.\n\n- CPU inference: 작은 모델, 낮은 QPS, 배치 크기가 작을 때 단순하다. scale-out이 쉽지만 큰 모델은 비용이 커질 수 있다.\n- GPU inference: 큰 딥러닝 모델이나 batch 처리에 강하다. 대신 queueing, batch size, warmup, GPU memory를 관리해야 한다.\n- JVM runtime: Java/Kotlin 서비스 안에서 모델 runtime을 붙이거나 별도 서버를 호출할 때 보인다. 장점은 기존 backend 운영과 붙이기 쉽다는 점이고, 조심할 점은 GC, thread pool, native runtime 경계다.\n- Python runtime: 모델 생태계와 가깝지만 dependency, cold start, worker isolation을 신경 써야 한다.\n\n중요한 질문은 \"GPU를 쓰느냐\"보다 \"요청이 어디에서 기다리느냐\"다. GPU 실행은 빠른데 queue wait가 길 수 있고, CPU는 실행 시간이 길지만 운영은 단순할 수 있다.\n\n## 모델 버전, canary, rollback\n\n모델은 코드처럼 버전이 바뀐다. 더 정확한 모델을 새로 배포해도 latency가 늘거나 특정 사용자군 품질이 떨어질 수 있다. 그래서 model version을 응답 trace와 지표에 남겨야 한다.\n\n새 모델 배포 흐름은 보통 이렇게 잡는다.\n\n1. 새 model artifact를 등록한다.\n2. 작은 traffic이나 특정 cohort에만 보낸다.\n3. error rate, p95/p99 latency, timeout, fallback, 품질 지표를 본다.\n4. 문제가 없으면 점진 확대한다.\n5. 지표가 나빠지면 이전 model version으로 rollback하거나 traffic을 줄인다.\n\nrollback이 안전하려면 feature schema도 중요하다. 새 모델이 새 feature를 필수로 요구하는데 이전 경로에 그 feature가 없으면 rollback만으로 복구되지 않을 수 있다. 그래서 모델 배포에는 model artifact, feature schema, preprocessing code, postprocessing rule의 호환성을 같이 봐야 한다.\n\n## 흔한 오해\n\n- 모델 서빙을 \"학습 코드에 API만 붙인 것\"으로 생각한다. 운영에서는 artifact, feature, runtime, version이 모두 포함된다.\n- 추론 서버 latency를 모델 실행 시간으로만 본다. 실제 병목은 feature fetch나 queue wait인 경우가 많다.\n- feature store가 있으면 추론 서버가 단순해진다고 생각한다. schema 검증, fallback, postprocessing은 여전히 서버 책임이다.\n- 온라인 추론이 항상 batch보다 좋다고 생각한다. 최신성이 덜 중요한 점수는 batch로 미리 계산하는 편이 더 안정적일 수 있다.\n- 새 모델 정확도가 높으면 바로 전체 배포해도 된다고 생각한다. latency, 비용, slice별 품질, rollback 가능성을 같이 봐야 한다.\n\n## 한 줄 정리\n\n모델 서빙은 모델 파일을 API로 감싸는 작업만이 아니라, feature fetch부터 전처리, runtime 실행, 후처리, latency budget, 모델 버전 canary/rollback까지 포함하는 운영 inference 경로다. 별도 추론 서버는 그 요구가 API 서버와 달라질 때 선택하는 배포 형태다.\n",
+  "aliases": [
+    "모델 서빙이 뭐야",
+    "추론 서버는 뭐 하는 서버야?",
+    "모델 서버랑 일반 API 서버는 뭐가 달라?",
+    "실시간 ML 추론",
+    "model serving이 뭐야",
+    "inference server가 뭐야",
+    "online inference가 느린 이유",
+    "feature fetch랑 scoring 중 어디서 병목이 생겨?",
+    "모델 버전을 canary로 내렸다가 rollback하려면 뭘 봐?",
+    "GPU 추론과 CPU 추론의 지연은 왜 달라?"
+  ],
+  "expected_queries": [
+    "모델 서빙이 뭐야? 학습된 모델을 API로 호출한다는 게 무슨 뜻이야?",
+    "추론 서버는 일반 API 서버랑 뭐가 달라?",
+    "ML 모델을 실시간으로 호출하면 후보 생성, feature fetch, inference 중 어디가 느려져?",
+    "추천 시스템에서 feature store랑 모델 서빙 서버의 경계가 어떻게 나뉘어?",
+    "모델 버전을 canary로 배포하고 rollback할 때 무엇을 봐야 해?"
+  ],
+  "symptoms": [
+    "모델 서빙을 학습 코드에 API endpoint만 붙인 것으로 이해한다",
+    "실시간 ML 호출이 느릴 때 모델 실행 시간만 보고 feature fetch나 queue wait를 놓친다",
+    "새 모델 배포에서 model version, feature schema, rollback 가능성을 함께 보지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/system-design-foundations",
+      "system-design/request-deadline-timeout-budget-primer",
+      "system-design/batch-vs-stream-processing-beginner-primer"
+    ],
+    "next_docs": [
+      "system-design/recommendation-feed-ranking-architecture",
+      "system-design/automated-canary-analysis-rollback-platform-design",
+      "system-design/production-latency-layer-router",
+      "system-design/feature-store-basics-primer",
+      "system-design/online-serving-vs-offline-batch-primer"
+    ],
+    "confusable_with": [
+      "system-design/recommendation-feed-ranking-architecture",
+      "system-design/batch-vs-stream-processing-beginner-primer",
+      "system-design/api-gateway-basics",
+      "system-design/feature-store-basics-primer",
+      "system-design/online-serving-vs-offline-batch-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/system-design/ml-model-serving-inference-server-basics-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch209"
+      }
+    ]
+  }
+}

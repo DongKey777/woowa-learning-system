@@ -1,0 +1,68 @@
+{
+  "id": "system-design/feature-store-basics-primer",
+  "title": "Feature Store Basics Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "피처는 모델이 예측할 때 읽는 입력값이고, 피처 스토어는 학습용 offline feature와 서빙용 online feature를 같은 정의와 시점 기준으로 관리하는 계층이다. 핵심은 Redis 같은 online store와 warehouse 같은 offline store를 붙이는 기술 이름보다 training-serving skew, freshness, point-in-time correctness를 운영 계약으로 줄이는 데 있다.",
+  "body_markdown": "# Feature Store Basics Primer\n\n> 한 줄 요약: 피처 스토어는 모델 입력값을 학습과 서빙에서 같은 의미로 쓰게 만드는 feature 관리 계층이다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Source of Truth vs Derived Data Primer](./source-of-truth-derived-data-primer.md)\n- [Batch vs Stream Processing Beginner Primer](./batch-vs-stream-processing-beginner-primer.md)\n- [Redis Basics In-Memory KV Single Thread Primer](./redis-basics-in-memory-kv-single-thread-primer.md)\n- [Recommendation / Feed Ranking Architecture](./recommendation-feed-ranking-architecture.md)\n\nretrieval-anchor-keywords: feature store, 피처 스토어, machine learning feature, model input, online feature, offline feature, training-serving skew, point-in-time correctness, feature freshness, Redis online store, warehouse offline store\n\n## 피처란 무엇인가\n\n머신러닝에서 feature는 모델이 예측할 때 받는 입력값이다. 추천 피드라면 사용자 나이, 최근 7일 클릭 수, 아이템 카테고리, 작성자 차단 여부, 사용자와 아이템의 거리 같은 값이 feature가 될 수 있다. 모델은 이 값들을 feature vector로 받아 클릭 확률, 구매 확률, 위험 점수 같은 출력을 만든다.\n\n중요한 점은 feature가 단순한 DB 컬럼 이름이 아니라는 것이다. 예를 들어 최근 7일 클릭 수는 집계 기준 시각, 이벤트 필터, 중복 제거, late event 처리, 결측값 기본값이 모두 붙은 계산 규칙이다. 같은 이름의 feature라도 학습 때와 서빙 때 계산 규칙이 다르면 모델이 본 세계가 달라진다.\n\n## 피처 스토어가 필요한 이유\n\n피처 스토어는 feature 정의, 생성 파이프라인, 저장 위치, 버전, freshness, 조회 API를 한곳에서 관리하려는 계층이다. 목표는 모델 개발자가 매번 warehouse 쿼리와 Redis key를 따로 맞추게 하는 것이 아니라, 같은 feature를 학습 데이터 생성과 실시간 서빙에서 같은 의미로 쓰게 하는 것이다.\n\n대표 책임은 네 가지다.\n\n| 책임 | 의미 |\n|---|---|\n| feature definition | 어떤 원천 데이터에서 어떤 규칙으로 값을 계산하는지 관리한다 |\n| offline feature | 학습과 backfill을 위해 warehouse나 lake에 시간축으로 저장한다 |\n| online feature | 실시간 inference를 위해 Redis 같은 낮은 지연 store에 최신 값을 둔다 |\n| monitoring | freshness lag, missing ratio, skew, default 사용률을 추적한다 |\n\n## Online feature와 offline feature\n\nOffline feature는 보통 학습 데이터 생성에 쓰인다. warehouse, data lake, batch table처럼 많은 과거 데이터를 시간 범위로 읽기 좋은 저장소가 어울린다. 하루치 클릭 집계, 사용자 장기 관심사, 상품 통계처럼 재계산과 검증이 중요한 값이 여기에 쌓인다.\n\nOnline feature는 실제 요청 중 모델이 빠르게 읽어야 하는 값이다. Redis, DynamoDB, Cassandra, RocksDB 기반 serving store처럼 key lookup latency가 낮은 저장소가 자주 쓰인다. 홈 피드 요청에서 사용자 1명과 후보 아이템 500개의 feature를 읽어야 하면 warehouse를 직접 때릴 수 없다.\n\n하지만 online과 offline이 따로 있으면 정합성 문제가 생긴다. 같은 feature 이름이 warehouse에서는 SQL batch로 계산되고 Redis에는 stream processor가 갱신한다면, 필터 조건이나 window 기준이 조금만 달라도 모델은 학습 때 본 분포와 다른 입력을 받는다.\n\n## Training-serving skew\n\nTraining-serving skew는 학습 때 사용한 feature와 서빙 때 실제로 들어가는 feature가 달라지는 문제다.\n\n흔한 원인은 아래와 같다.\n\n- 학습 SQL과 서빙 코드가 같은 feature를 서로 다르게 계산한다.\n- 학습 데이터에는 미래 이벤트가 섞였지만 서빙 시점에는 그 정보를 알 수 없다.\n- Redis online store의 feature가 stream lag 때문에 늦게 갱신된다.\n- 결측값 default가 학습과 서빙에서 다르다.\n- feature version이 바뀌었는데 model version과 함께 고정되지 않았다.\n\n이 skew는 모델 알고리즘 문제가 아니라 데이터 계약 문제로 봐야 한다. offline metric은 좋은데 production 품질이 떨어지거나 특정 bucket에서 점수 분포가 달라지면 feature skew를 먼저 의심할 수 있다.\n\n## Freshness와 point-in-time correctness\n\nFreshness는 feature가 얼마나 최신인가를 뜻한다. 최근 클릭, 장바구니 상태, 차단 여부처럼 최신성이 중요한 feature는 몇 초 지연도 품질이나 정책 위반으로 이어질 수 있다. 반대로 장기 선호도 embedding은 몇 시간 늦어도 괜찮을 수 있다.\n\nPoint-in-time correctness는 학습 샘플을 만들 때 예측 시점에 알 수 있었던 feature만 써야 한다는 기준이다. 예를 들어 12:00에 클릭할지 예측하는 학습 샘플에 12:05의 구매 이벤트가 반영된 feature를 넣으면 미래를 본 셈이다. offline 성능은 좋아 보이지만 실제 서빙에서는 재현할 수 없다.\n\n그래서 feature table에는 보통 event time, feature computed time, valid time, ingestion time 같은 시각 정보가 필요하다. 학습 데이터 생성은 label 시점보다 이전에 유효했던 feature snapshot만 join해야 한다. 이 기준이 없으면 warehouse에 모든 과거 데이터가 있어도 안전한 학습 데이터가 아니다.\n\n## Redis와 warehouse 예시\n\n간단한 추천 모델을 생각해 보자.\n\n- Warehouse에는 사용자별 최근 7일 클릭 수, 카테고리별 선호도, 아이템별 노출 통계가 날짜와 feature time 기준으로 저장된다.\n- Stream processor는 클릭 이벤트를 받아 Redis의 사용자별 hot feature를 갱신한다.\n- Model serving은 요청마다 Redis에서 online feature를 읽고, 없으면 default나 stale snapshot으로 fallback한다.\n- Training job은 warehouse에서 label 시점 이전의 offline feature만 join해 학습 데이터를 만든다.\n\n이 구조에서 Redis는 빠른 online lookup 예시일 뿐이다. Redis TTL, eviction, replication lag는 cache/Redis 문서의 주제다. Feature store 관점의 질문은 이 Redis 값이 offline feature 정의와 같은 의미인지, 어느 시점까지 반영됐는지, stale이면 모델이 어떤 fallback을 쓰는지다.\n\nWarehouse도 단순 보관소가 아니다. 과거 feature를 재현하고, backfill하고, model version별 학습 데이터를 다시 만들 수 있어야 한다. 오늘의 최신 값만 남기면 point-in-time 학습을 할 수 없다.\n\n## 어디까지가 이 문서의 범위인가\n\n피처 스토어는 추천 시스템 전체 아키텍처가 아니다. Candidate generation, ranking model, re-ranking, A/B test, latency budget 전체는 recommendation architecture 문서가 맡는다. 이 문서는 그중 모델 입력 feature를 어떻게 학습과 서빙에서 일관되게 관리하는지에 집중한다.\n\n피처 스토어는 Redis 캐시 전략 문서도 아니다. Cache-aside, write-through, eviction, TTL 튜닝은 Redis/cache 문서가 맡는다. 이 문서는 Redis를 online feature store 예시로만 다루고, feature definition, freshness, skew, point-in-time correctness를 중심으로 본다.\n\n## 설계 체크리스트\n\n1. 각 feature의 source of truth와 계산 규칙이 문서화되어 있는가?\n2. offline과 online이 같은 feature definition과 version을 공유하는가?\n3. feature마다 freshness SLO와 허용 가능한 stale 범위가 있는가?\n4. 학습 데이터 join이 label 시점 이전 feature만 사용하도록 보장하는가?\n5. online store timeout, missing feature, stale feature 때 fallback 정책이 있는가?\n6. model response trace에 model version, feature version, feature age, fallback reason이 남는가?\n\n## 흔한 오해\n\n- 피처를 그냥 모델 입력 컬럼 목록으로만 본다.\n- Redis에 값을 넣으면 feature store가 완성된다고 생각한다.\n- offline 학습 성능이 좋으면 online 서빙도 같은 성능이 나온다고 가정한다.\n- 최신 feature가 항상 좋은 feature라고 생각하고 point-in-time correctness를 놓친다.\n- recommendation architecture 전체 문제와 feature consistency 문제를 구분하지 못한다.\n\n## 한 줄 정리\n\n피처 스토어의 핵심은 빠른 저장소 하나를 고르는 것이 아니라, 모델 입력값을 학습 시점과 서빙 시점에서 같은 의미와 같은 시간 기준으로 유지하는 것이다.\n",
+  "aliases": [
+    "피처 스토어가 뭐야?",
+    "feature store가 뭐야",
+    "머신러닝 피처 저장소",
+    "온라인 피처랑 오프라인 피처가 왜 달라?",
+    "training-serving skew",
+    "학습 서빙 스큐",
+    "point-in-time feature가 왜 중요해",
+    "피처 freshness가 왜 중요해?",
+    "모델 입력값을 어떻게 관리해?",
+    "online feature랑 offline feature를 어떻게 맞춰?"
+  ],
+  "expected_queries": [
+    "피처 스토어는 왜 따로 두는 거야?",
+    "머신러닝에서 피처는 모델 입력이라는 게 무슨 뜻이야?",
+    "온라인 피처랑 오프라인 피처 차이가 뭐야?",
+    "training serving skew가 왜 생겨?",
+    "Redis에 최신 피처를 두고 warehouse로 학습하면 어떤 정합성 문제가 생겨?",
+    "point-in-time correctness가 feature store에서 왜 중요해?"
+  ],
+  "symptoms": [
+    "모델 입력 feature를 단순 DB 컬럼 목록으로만 보고 계산 시점과 정의 버전을 놓친다",
+    "offline 학습용 feature와 online 서빙용 feature가 다르게 계산되어도 같은 이름이면 된다고 생각한다",
+    "Redis에 최신 값을 넣는 문제와 feature store의 skew, freshness, point-in-time correctness 문제를 구분하지 못한다",
+    "추천 시스템 전체 아키텍처 질문과 feature consistency 질문을 한 문서로 뭉뚱그린다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/source-of-truth-derived-data-primer",
+      "system-design/batch-vs-stream-processing-beginner-primer",
+      "system-design/redis-basics-in-memory-kv-single-thread-primer"
+    ],
+    "next_docs": [
+      "system-design/recommendation-feed-ranking-architecture",
+      "system-design/read-model-freshness-perspective-map-cache-replica-projection",
+      "system-design/materialized-view-vs-search-index-vs-cache-derived-data-chooser",
+      "system-design/online-serving-vs-offline-batch-primer",
+      "system-design/ml-model-serving-inference-server-basics-primer"
+    ],
+    "confusable_with": [
+      "system-design/recommendation-feed-ranking-architecture",
+      "system-design/redis-cache-aside-write-through-interview-chooser",
+      "system-design/distributed-cache-design",
+      "system-design/ml-model-serving-inference-server-basics-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/system-design/feature-store-basics-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch209"
+      }
+    ]
+  }
+}

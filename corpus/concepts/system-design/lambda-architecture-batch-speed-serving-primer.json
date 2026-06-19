@@ -1,0 +1,67 @@
+{
+  "id": "system-design/lambda-architecture-batch-speed-serving-primer",
+  "title": "Lambda Architecture Batch Speed Serving Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "람다 아키텍처는 과거 전체 데이터를 다시 계산하는 batch layer와 최근 이벤트를 낮은 지연으로 반영하는 speed layer를 함께 두고, serving layer에서 두 결과를 합쳐 조회하는 설계다. 배치는 정확성, 재현성, rebuild를 맡고 speed는 최신성을 맡지만, 두 경로의 로직 중복, cutoff, 충돌 보정, restatement 비용을 함께 설계해야 한다.",
+  "body_markdown": "# Lambda Architecture Batch Speed Serving Primer\n\n> 한 줄 요약: 람다 아키텍처는 느리지만 다시 계산 가능한 batch view와 빠르지만 임시성이 있는 speed view를 함께 두고, serving layer에서 둘을 합쳐 정확성과 최신성 사이의 간격을 줄이는 패턴이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Batch vs Stream Processing Beginner Primer](./batch-vs-stream-processing-beginner-primer.md)\n- [Streaming Analytics Pipeline 설계](./streaming-analytics-pipeline-design.md)\n- [Historical Backfill / Replay Platform 설계](./historical-backfill-replay-platform-design.md)\n- [Read Model Rebuild Backfill Playbook](./read-model-rebuild-backfill-playbook.md)\n\nretrieval-anchor-keywords: lambda architecture, batch layer, speed layer, serving layer, kappa architecture, batch view, real-time view, reconciliation, read model rebuild, streaming analytics\n\n## 이 문서가 맡는 질문\n\n학습자가 묻는 핵심은 보통 이것이다.\n\n- 람다 아키텍처가 뭐야?\n- 배치 레이어랑 실시간 레이어를 왜 둘 다 둬?\n- Lambda architecture랑 Kappa architecture 차이가 뭐야?\n\n답은 단순히 배치 + 스트림을 같이 쓴다는 말이 아니다. 같은 비즈니스 결과를 두 경로로 만들 때, 어떤 경로를 신뢰 기준으로 삼고 어떤 경로를 최신성 보완으로 둘지 정하는 설계다.\n\n## 세 레이어의 역할\n\n| 레이어 | 맡는 일 | 강점 | 약점 |\n|---|---|---|---|\n| Batch layer | 원본 데이터 전체나 큰 구간을 다시 계산해 batch view를 만든다 | 정확성, 재현성, backfill, rebuild | 결과가 늦다 |\n| Speed layer | 최근 이벤트를 계속 처리해 real-time view를 만든다 | 낮은 지연, 신선한 대시보드 | late event, 중복, 장애 복구가 어렵다 |\n| Serving layer | batch view와 speed view를 조회 시점에 합치거나 pre-merge해서 제공한다 | 사용자에게 하나의 read model처럼 보인다 | merge 기준과 충돌 처리가 필요하다 |\n\n예를 들어 주문 집계 대시보드를 만든다고 하자. Batch layer는 어제까지의 주문을 전체 재계산해 안정적인 기준값을 만든다. Speed layer는 오늘 들어온 주문 이벤트를 초 단위로 더한다. Serving layer는 어제까지의 batch view와 오늘 speed view를 합쳐 현재 숫자를 보여준다.\n\n## 왜 둘 다 두는가\n\nBatch layer의 가치는 정확성과 복구 가능성이다. 원본 로그나 source of truth가 남아 있으면 같은 범위를 다시 돌려 결과를 재생성할 수 있다. 스트림 처리 코드에 버그가 있었거나 late event가 누락됐거나 집계 로직이 바뀌었을 때도 batch rebuild로 기준값을 다시 만들 수 있다.\n\nSpeed layer의 가치는 최신성이다. Batch job이 하루에 한 번 돈다면 사용자는 오늘 발생한 이벤트를 너무 늦게 본다. Speed layer는 아직 batch가 닫히지 않은 구간을 낮은 지연으로 채워 준다.\n\n그래서 람다 아키텍처의 기본 감각은 이렇다.\n\n```text\nanswer = stable_batch_view(up_to_cutoff) + realtime_speed_view(after_cutoff)\n```\n\n여기서 `cutoff`는 매우 중요하다. 두 레이어가 같은 이벤트를 동시에 포함하면 중복 집계가 되고, 둘 다 포함하지 않으면 누락이 생긴다.\n\n## Serving layer에서 생기는 비용\n\n람다 아키텍처는 공짜가 아니다. 가장 큰 비용은 같은 의미의 계산을 두 경로에서 유지해야 한다는 점이다.\n\n- batch job과 speed job의 집계 로직이 달라질 수 있다.\n- batch cutoff와 speed offset이 어긋나면 중복이나 누락이 생긴다.\n- speed layer가 낸 임시 결과를 batch 결과가 도착했을 때 덮어쓸지, diff로 보정할지 정해야 한다.\n- 사용자가 이미 본 대시보드 숫자가 batch correction으로 바뀔 수 있다.\n- late event와 replay 결과가 어느 window까지 반영되는지 정책이 필요하다.\n\n실무에서는 serving layer에 단순 덧셈 이상의 계약이 필요하다. 예를 들면 batch version, speed watermark, last applied event id, correction marker, old/new view comparison 같은 증거가 있어야 한다.\n\n## Kappa architecture와의 차이\n\nKappa architecture는 보통 batch layer를 없애고, durable event log와 stream processor 하나로 live 처리와 재처리를 모두 해결하려는 접근이다. 과거를 다시 계산해야 하면 같은 스트림 코드를 처음 offset부터 replay한다.\n\n| 선택 | 잘 맞는 경우 | 주의할 점 |\n|---|---|---|\n| Lambda | 정확한 batch rebuild와 낮은 지연 조회가 모두 중요하고, batch 계산이 운영 기준값 역할을 할 때 | 두 코드 경로와 serving merge 비용이 크다 |\n| Kappa | 이벤트 로그가 충분히 오래 보존되고, 같은 stream processor replay로 과거 재계산이 가능할 때 | 긴 replay 비용, handler version 변화, sink idempotency를 설계해야 한다 |\n| Pure batch | 몇 분에서 하루 지연이 허용되고 결과 정확성이 더 중요할 때 | freshness가 낮다 |\n| Pure streaming | 짧은 지연이 중요하고 replay와 checkpoint로 correctness를 감당할 수 있을 때 | 복구, late data, sink 정합성 검증이 어렵다 |\n\nKappa가 항상 더 현대적이라서 좋은 선택은 아니다. 반대로 Lambda가 항상 더 안전한 것도 아니다. 핵심은 과거 재계산의 비용, 로그 보존 기간, 지연 요구, 결과 보정 UX, 운영팀이 감당할 코드 경로 수다.\n\n## Streaming analytics pipeline과의 경계\n\nStreaming analytics pipeline은 이벤트를 실시간으로 받아 window aggregation, sessionization, anomaly detection 같은 분석을 수행하는 처리 파이프라인이다. 이것만으로는 람다 아키텍처라고 부르지 않는다.\n\n람다 아키텍처라고 부르려면 보통 다음이 함께 있어야 한다.\n\n1. batch layer가 별도로 기준 view를 만든다.\n2. speed layer가 batch cutoff 이후의 최신 view를 만든다.\n3. serving layer가 두 결과를 같은 query model로 합친다.\n4. batch 결과가 도착했을 때 speed 결과를 reconcile하는 정책이 있다.\n\n즉 streaming analytics는 speed layer의 구현일 수 있지만, batch rebuild와 serving merge 계약이 없으면 그냥 스트리밍 분석 파이프라인이다.\n\n## Read model rebuild와의 경계\n\nRead model rebuild는 기존 projection이나 조회 모델을 source of truth에서 다시 만드는 운영 절차다. 람다 아키텍처의 batch layer가 read model rebuild와 비슷한 일을 할 수 있지만 목적이 다르다.\n\n- read model rebuild는 보통 장애 복구, schema 변경, projection drift 수정 같은 일회성 또는 운영 절차다.\n- lambda batch layer는 정상 운영 중에도 반복적으로 기준 view를 만든다.\n- rebuild playbook은 snapshot, cutoff, catch-up, cutover의 안전 절차를 강조한다.\n- lambda serving layer는 매 조회 또는 주기적 publish 시 batch view와 speed view를 어떻게 합칠지 강조한다.\n\n따라서 람다 아키텍처를 설명할 때 rebuild 절차만 말하면 speed layer와 serving merge의 본질을 놓친다. 반대로 read model rebuild 문제에 람다 아키텍처를 꺼내면 불필요하게 큰 구조가 될 수 있다.\n\n## 설계할 때 먼저 묻는 질문\n\n| 질문 | 이유 |\n|---|---|\n| 사용자는 몇 초까지 stale한 값을 허용할 수 있는가? | speed layer가 필요한지 결정한다 |\n| 원본 로그나 source snapshot을 얼마나 오래 보존하는가? | batch rebuild 가능성을 결정한다 |\n| batch cutoff와 speed offset을 어떻게 맞출 것인가? | 중복과 누락을 막는다 |\n| batch 결과가 speed 결과와 다르면 무엇을 신뢰할 것인가? | reconciliation 정책을 정한다 |\n| 같은 집계 로직을 두 경로에서 어떻게 검증할 것인가? | drift를 줄인다 |\n\n## 흔한 오해\n\n- Kafka를 쓰면 자동으로 람다 아키텍처라고 생각한다.\n- batch layer는 느려서 불필요하고 speed layer만 있으면 된다고 생각한다.\n- serving layer merge를 단순 덧셈으로만 보고 cutoff와 late event를 빼먹는다.\n- Kappa architecture를 쓰면 과거 재처리 비용이 사라진다고 생각한다.\n- read model rebuild 절차와 람다 아키텍처 전체를 같은 말로 섞는다.\n\n## 한 줄 정리\n\n람다 아키텍처는 batch layer로 신뢰 가능한 기준값을 재계산하고 speed layer로 최신 구간을 빠르게 메우는 대신, serving layer의 merge, cutoff, correction, drift 검증 비용을 명시적으로 떠안는 설계다.\n",
+  "aliases": [
+    "람다 아키텍처",
+    "람다 아키텍처에서 배치랑 실시간을 왜 나눠?",
+    "배치 레이어 실시간 레이어 같이 쓰는 이유",
+    "배치 레이어랑 스피드 레이어는 뭐가 달라?",
+    "실시간 대시보드에 배치 보정이 왜 필요해?",
+    "배치 재계산과 실시간 보정",
+    "Lambda architecture",
+    "Lambda vs Kappa architecture",
+    "batch, speed, serving layer가 어떻게 이어져?",
+    "serving layer는 batch 결과랑 speed 결과를 어떻게 합쳐?"
+  ],
+  "expected_queries": [
+    "람다 아키텍처가 뭐야?",
+    "배치 레이어랑 실시간 레이어를 왜 둘 다 둬?",
+    "Lambda architecture랑 Kappa architecture 차이가 뭐야?",
+    "실시간 대시보드에서 batch 결과와 speed layer 결과를 serving layer가 어떻게 합쳐?",
+    "스트림 처리가 있는데도 batch layer로 다시 계산하는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "배치와 스트림을 같이 쓰면 모두 람다 아키텍처라고 단정한다",
+    "speed layer의 낮은 지연만 설명하고 batch layer의 rebuild와 correctness 역할을 빼먹는다",
+    "serving layer에서 cutoff, 중복, 누락, correction 정책을 설계하지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/batch-vs-stream-processing-beginner-primer",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "next_docs": [
+      "system-design/streaming-analytics-pipeline-design",
+      "system-design/historical-backfill-replay-platform-design",
+      "system-design/read-model-rebuild-backfill-playbook",
+      "system-design/analytics-late-data-reconciliation-design"
+    ],
+    "confusable_with": [
+      "system-design/streaming-analytics-pipeline-design",
+      "system-design/read-model-rebuild-backfill-playbook",
+      "system-design/stateful-stream-processor-state-store-checkpoint-recovery-design",
+      "system-design/event-time-processing-watermark-late-data-chooser"
+    ],
+    "forbidden_for_queries": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "spring/spring-batch-job-step-reader-processor-writer-beginner-primer",
+      "system-design/read-model-rebuild-backfill-playbook"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch209"
+      }
+    ]
+  }
+}
