@@ -1,0 +1,65 @@
+{
+  "id": "network/large-payload-chunking-resumable-transfer-primer",
+  "title": "Large Payload Chunking and Resumable Transfer Primer",
+  "category": "network",
+  "level": "intermediate",
+  "summary": "큰 업로드나 다운로드를 한 번의 거대한 요청으로 처리하지 않고 애플리케이션 단위 조각으로 나누면 메모리, timeout, 재시도, 진행률 관측의 경계를 작게 만들 수 있다.",
+  "body_markdown": "# Large Payload Chunking and Resumable Transfer Primer\n\n## 이 문서가 맡는 질문\n\n큰 데이터를 청크로 쪼개서 전송한다는 말은 여러 층에서 쓰인다. HTTP/1.1의 `Transfer-Encoding: chunked`는 wire message framing이고, application-level chunking은 파일이나 payload를 애플리케이션이 정한 조각 단위로 나누어 여러 요청이나 record로 보내는 설계다. Object storage의 multipart upload는 provider가 제공하는 part/session/finalize 절차이고, Range/resume은 이미 받은 byte 뒤쪽을 다시 요청하는 다운로드 재개 기법이다.\n\n이 문서는 특정 S3 multipart 규칙이나 `206 Partial Content`의 validator deep dive가 아니라, 왜 큰 payload를 작은 경계로 나누는지와 그때 어떤 운영 지표를 봐야 하는지에 집중한다.\n\n## 네 가지 chunking을 먼저 구분한다\n\n| 이름 | 경계가 생기는 층 | 주로 해결하는 문제 | 이 문서에서의 위치 |\n|---|---|---|---|\n| HTTP chunked framing | HTTP/1.1 message framing | 전체 body 길이를 미리 모를 때 body 끝을 표현 | 전송 framing의 기초로만 다룬다 |\n| Application-level chunking | 서비스 API 또는 클라이언트 프로토콜 | 큰 payload를 retry 가능한 단위로 나누기 | 본문 핵심 |\n| Multipart upload | Object storage upload session | 큰 object의 part 업로드와 complete | 심화 문서로 넘긴다 |\n| Range/resume | HTTP byte range | 다운로드 중단 후 남은 byte 재요청 | 심화 문서로 넘긴다 |\n\n가장 중요한 구분은 `chunked transfer encoding`이 곧바로 재개 가능한 업로드를 만들어 주지는 않는다는 점이다. HTTP chunked는 receiver가 HTTP body boundary를 알 수 있게 하는 framing이다. 반면 application-level chunking은 `uploadId`, `chunkIndex`, `offset`, `size`, `checksum`, `idempotency key` 같은 필드를 통해 각 조각을 독립적으로 검증하고 재시도할 수 있게 만든다.\n\n## 큰 payload를 나누는 이유\n\n첫째, 메모리 경계가 작아진다. 서버가 2GB 파일을 한 번에 읽어 검증하거나 proxy가 전체 body를 버퍼링하면 heap, temp disk, gateway buffer가 먼저 한계에 닿는다. chunk 단위로 읽고 쓰면 한 번에 들고 있는 byte 수와 backpressure 지점이 명확해진다.\n\n둘째, timeout 경계가 작아진다. 한 요청이 10분 동안 열린 채로 있어야 성공하는 구조는 client timeout, load balancer idle timeout, application read timeout, upstream deadline 중 하나에 걸리기 쉽다. chunk 요청을 작게 나누면 각 요청의 SLA와 재시도 정책을 현실적인 값으로 둘 수 있다.\n\n셋째, retry 비용이 줄어든다. 900MB 중 890MB까지 보낸 뒤 마지막 네트워크 오류가 났을 때 전체를 처음부터 다시 보내면 사용자 경험과 비용이 크게 나빠진다. chunk 단위로 성공 상태를 저장하면 실패한 조각만 다시 보낼 수 있다.\n\n넷째, 관측이 쉬워진다. 단일 거대 요청은 실패하면 `upload failed` 한 줄로 남기 쉽다. chunking을 쓰면 어느 offset, 몇 번째 chunk, 어떤 checksum, 어느 phase에서 실패했는지 남길 수 있어 운영자가 병목을 좁힐 수 있다.\n\n## 설계할 때 정해야 하는 계약\n\nApplication-level chunking에는 최소한 아래 계약이 필요하다.\n\n- session id: 같은 logical payload를 묶는 id\n- chunk identity: chunk number 또는 byte offset\n- expected size: 각 chunk와 전체 payload의 크기\n- integrity check: chunk checksum과 가능하면 전체 checksum\n- idempotency: 같은 chunk 재전송을 중복 write로 처리하지 않는 규칙\n- ordering rule: 순서대로만 받을지, 순서 없이 받은 뒤 조립할지\n- completion rule: 모든 chunk가 모였다는 판단과 finalize 시점\n- expiry and cleanup: 오래된 session과 partial data를 지우는 정책\n\n이 계약이 없으면 chunking은 단지 요청 수를 늘린 것뿐이다. 예를 들어 클라이언트가 `chunk 7`을 두 번 보내거나, `chunk 8`이 빠졌는데 complete를 호출하거나, 같은 파일명이지만 다른 payload의 조각이 섞이는 상황을 막을 수 있어야 한다.\n\n## Chunk size를 고르는 감각\n\nchunk size는 작을수록 재시도 비용이 줄고 progress가 자주 갱신되지만, 요청 수와 metadata write가 늘어난다. 너무 크면 다시 거대한 요청이 되어 memory와 timeout 문제가 돌아온다. 그래서 정답 크기 하나를 외우기보다 다음 관점으로 고른다.\n\n- 네트워크가 불안정한 모바일 업로드는 실패 chunk만 다시 보내기 쉬운 크기를 우선한다\n- 서버가 virus scan, parsing, transcoding을 chunk마다 할 수 있으면 worker memory에 맞춘다\n- object storage나 proxy가 최소 part size, max request body, idle timeout을 갖고 있으면 그 제약을 넘지 않는다\n- p95 upload latency와 retry rate를 보고 너무 작은 chunk로 인한 overhead가 커지는지 확인한다\n\n운영에서는 처음부터 병렬 업로드를 기본값으로 두기보다, 순차 chunking으로 correctness를 닫고 나서 병렬도를 올리는 편이 안전하다. 병렬 전송을 켜면 reorder, duplicate, partial completion, client cancel cleanup을 모두 처리해야 한다.\n\n## 실패와 재개 절차\n\n재개 가능한 업로드의 기본 흐름은 단순하다. 서버는 initiate 단계에서 session을 만들고, 클라이언트는 각 chunk를 보낸다. 서버는 chunk를 저장하기 전에 session owner, offset, size, checksum, 이미 받은 chunk인지 확인한다. 실패가 나면 클라이언트는 서버의 received chunk map 또는 next offset을 조회하고 빠진 chunk만 다시 보낸다. 마지막에는 complete 요청에서 전체 size와 checksum을 검증한 뒤 available 상태로 전환한다.\n\n여기서 중요한 것은 `성공 응답을 못 받았다`와 `서버가 저장하지 않았다`를 구분하는 것이다. 클라이언트 timeout이 났어도 서버가 chunk를 이미 저장했을 수 있다. 그래서 retry는 blind append가 아니라 같은 chunk identity로 idempotent하게 보내야 한다.\n\n## 관측 포인트\n\n운영 지표는 byte 총량보다 phase별 실패를 더 잘 보여야 한다.\n\n- active upload sessions, expired sessions, orphan partial bytes\n- chunk upload latency p50/p95/p99, chunk retry count, duplicate chunk count\n- checksum mismatch, missing chunk on complete, complete failure by reason\n- client cancel rate, timeout by gateway/application/storage phase\n- in-flight bytes, temp disk usage, worker memory high watermark\n- resume success rate, full restart fallback rate, cleanup lag\n\n알람은 `전체 업로드 실패율` 하나만 두면 늦다. checksum mismatch가 늘면 client slicing 버그나 proxy 변환을 의심하고, duplicate chunk가 늘면 client timeout 또는 응답 유실을 본다. orphan partial bytes가 증가하면 session expiry와 cleanup worker가 따라가지 못하는 것이다.\n\n## 헷갈리기 쉬운 경계\n\nHTTP chunked framing은 application chunk의 checksum, offset, retry 상태를 대신하지 않는다. Multipart upload는 object storage에 큰 object를 올리는 구체적인 운영 절차이므로, session finalize와 incomplete part cleanup은 별도 문서에서 본다. Range request는 다운로드 재개에서 같은 representation인지 확인하는 문제라서 validator와 `206` 응답 해석이 핵심이다. Spring Batch chunk는 transaction 처리 단위라 네트워크 payload 분할과 용어만 비슷하다.\n\n## 한 줄 정리\n\n큰 payload chunking의 핵심은 데이터를 잘게 자르는 행위 자체가 아니라, 각 조각을 검증하고 재시도하고 관측할 수 있는 application 경계를 설계하는 것이다.\n",
+  "aliases": [
+    "large payload chunking",
+    "application-level chunking",
+    "업로드 재개 가능한 전송",
+    "큰 데이터 청킹",
+    "대용량 페이로드 분할 전송",
+    "큰 파일 청크 업로드",
+    "청크 단위 재시도",
+    "분할 업로드 재개",
+    "청크마다 재시도하기",
+    "큰 업로드 타임아웃 줄이기"
+  ],
+  "expected_queries": [
+    "큰 데이터를 청크로 쪼개서 전송하는 청킹의 개념을 설명해줘",
+    "큰 파일 업로드를 한 번에 보내지 않고 나누면 retry와 timeout이 어떻게 달라져?",
+    "HTTP chunked 전송이랑 앱에서 파일을 조각내는 건 뭐가 달라?",
+    "대용량 다운로드나 업로드를 재개 가능하게 만들 때 chunk size와 checksum은 어떻게 정해?",
+    "S3 멀티파트나 Range 요청을 쓰지 않고도 앱에서 큰 데이터를 나눠 보내는 기준이 뭐야?"
+  ],
+  "symptoms": [
+    "큰 파일 업로드를 단일 요청으로만 처리해 timeout과 메모리 한계가 자주 난다.",
+    "HTTP chunked transfer encoding을 쓰면 자동으로 업로드 재개가 된다고 착각한다.",
+    "chunk index, offset, checksum, idempotency key 없이 조각을 받아 duplicate나 missing chunk를 구분하지 못한다.",
+    "전체 실패율만 보고 어느 chunk, 어느 phase에서 재시도가 늘어나는지 관측하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "network/http-message-framing-content-length-chunked-basics"
+    ],
+    "next_docs": [
+      "system-design/object-storage-presigned-url-multipart-upload-playbook",
+      "network/range-request-206-resume-download-cache-validator-chooser",
+      "network/http2-flow-control-window-update-stalls"
+    ],
+    "confusable_with": [
+      "network/http-message-framing-content-length-chunked-basics",
+      "system-design/object-storage-presigned-url-multipart-upload-playbook",
+      "network/range-request-206-resume-download-cache-validator-chooser",
+      "spring/batch-chunk-retry-skip"
+    ],
+    "forbidden_for_queries": [
+      "S3 multipart upload의 CompleteMultipartUpload, ETag, lifecycle cleanup을 깊게 설명해줘",
+      "HTTP Range 206, If-Range, ETag, CDN partial cache를 자세히 설계해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "foundation-ladder-batch205"
+      }
+    ]
+  }
+}

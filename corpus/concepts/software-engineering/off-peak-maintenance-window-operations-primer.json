@@ -1,0 +1,63 @@
+{
+  "id": "software-engineering/off-peak-maintenance-window-operations-primer",
+  "title": "Off-Peak Operations and Maintenance Windows",
+  "category": "software-engineering",
+  "level": "beginner",
+  "summary": "트래픽이 적은 시간대에 무거운 batch, index, backfill 작업을 돌리는 이유는 사용자 요청과 운영 작업이 같은 CPU, IO, DB connection, lock, cache, queue budget을 두고 경쟁하기 때문이다. 좋은 maintenance window는 새벽이라는 시각만이 아니라 시작 조건, 중단 기준, rollback owner, 사용자 영향 공지까지 포함한 운영 약속이다.",
+  "body_markdown": "# Off-Peak Operations and Maintenance Windows\n\n> 한 줄 요약: 비피크 시간대는 \"사용자가 없으니 마음대로 돌리는 시간\"이 아니라, 무거운 작업의 blast radius를 줄이고 이상 신호가 보이면 멈출 수 있게 만든 운영 창이다.\n\n## 왜 트래픽이 적은 시간대를 고르는가\n\n무거운 운영 작업은 사용자 요청과 같은 자원을 쓴다. batch job은 DB read/write와 CPU를 쓰고, backfill은 오래된 범위를 많이 읽고 쓰며, index나 report rebuild는 IO, lock, cache locality, queue lag에 영향을 줄 수 있다. 피크 시간대에는 사용자의 주문, 예약, 조회 요청도 같은 자원을 쓰기 때문에 작은 지연 증가가 곧 사용자 체감 장애로 번질 수 있다.\n\n그래서 비피크 시간대의 목적은 작업을 \"숨기는 것\"이 아니다. 같은 문제가 생겨도 영향을 받는 사용자를 줄이고, 운영자가 지표를 보며 멈출 시간을 확보하는 것이다. 새벽에 돌리면 안전한 것이 아니라, 새벽에도 멈출 기준과 담당자가 있어야 안전해진다.\n\n## 피크와 비피크는 서비스마다 다르다\n\n피크 시간은 단순히 낮, 비피크 시간은 단순히 새벽으로 외우면 안 된다. 음식 주문 서비스는 식사 시간이 피크일 수 있고, 출퇴근 앱은 아침과 저녁이 피크일 수 있다. 관리자 리포트는 월요일 오전이나 월말에 몰릴 수 있고, 해외 사용자가 있으면 한국 새벽이 다른 지역의 업무 시간일 수 있다.\n\n따라서 maintenance window를 정할 때는 최근 트래픽 그래프, 핵심 API latency, DB CPU와 connection 사용량, queue lag, 외부 API rate limit, 기존 정기 batch 일정을 같이 본다. 특히 여러 무거운 작업을 모두 새벽 2시에 몰아넣으면 비피크가 아니라 내부 피크를 직접 만드는 셈이다.\n\n## maintenance window에 포함되어야 할 것\n\n좋은 maintenance window는 \"언제 시작한다\"보다 넓다. 최소한 아래 항목이 있어야 한다.\n\n- 작업 범위: 어떤 tenant, 날짜 범위, 테이블, 파일, job run을 건드리는가\n- 예상 비용: 대략 몇 건을 읽고 쓰며, 얼마나 오래 걸릴 것으로 보는가\n- 시작 조건: 직전 에러율, p95/p99 latency, DB/queue 상태가 정상인가\n- 중단 기준: error rate, latency, lock wait, replica lag, queue lag, external API 429 등이 어디까지 오르면 멈추는가\n- rollback owner: 지표가 나빠졌을 때 누가 pause, abort, rollback, flag off를 결정하는가\n- 사용자 영향: 느려질 수 있는 화면, 읽기 전용 전환, 공지 필요 여부가 있는가\n\n핵심은 숫자와 사람이 같이 있어야 한다는 점이다. \"문제 생기면 대응\"은 기준이 아니다. 문제가 생겼을 때 모두가 같은 행동을 할 수 있어야 window다.\n\n## 어떤 작업을 비피크에 돌릴지 판단하기\n\n비피크 후보는 보통 사용자 요청과 직접 경쟁하는 작업이다. 예를 들면 대량 backfill, 오래 걸리는 batch 정산, 리포트 재생성, 검색 색인 재빌드, 캐시 대량 warm-up, 데이터 보정 스크립트가 있다. 반대로 작고 멱등하며 즉시 되돌릴 수 있고 자원 사용량이 낮은 작업은 꼭 별도 window가 필요하지 않을 수 있다.\n\n판단 질문은 간단하다.\n\n- 실패하면 사용자 요청이 느려지거나 실패하는가\n- 중간에 멈춰도 안전하게 재개할 수 있는가\n- 작업량을 chunk로 줄이거나 throttle할 수 있는가\n- read path나 write path를 바꾼다면 되돌릴 owner가 있는가\n- 작업 완료 후 결과가 맞는지 확인할 방법이 있는가\n\n이 질문에 답하지 못하면 시간대만 새벽으로 바꿔도 위험은 그대로 남는다.\n\n## 작업 중에는 끝까지 버티지 않는다\n\n운영 작업은 성공률보다 사용자 영향을 먼저 본다. 예를 들어 backfill이 80% 진행됐더라도 p99 latency가 급등하고 error rate가 오르면 계속 밀어붙일 이유가 없다. pause로 회복 가능한지, abort해야 하는지, 이미 노출한 경로를 rollback해야 하는지 미리 나눠 두어야 한다.\n\n초심자가 자주 놓치는 점은 rollback owner가 \"나중에 원인 분석할 사람\"이 아니라는 점이다. rollback owner는 window 중에 결정을 내릴 권한을 가진 사람이다. 작업 담당자가 지표를 보고 있어도, 실제로 멈출 권한이 없으면 중단 기준은 문서에만 남는다.\n\n## 사용자 영향은 0이 아니라 작게 만드는 것이다\n\n비피크라고 해서 사용자 영향이 0이 되지는 않는다. 늦게 주문하는 사용자, 관리자, 해외 사용자, 내부 운영자가 있을 수 있다. 또한 작업이 DB, cache, queue 같은 공용 인프라를 건드리면 직접 관련 없는 화면도 느려질 수 있다.\n\n그래서 사용자 영향은 이렇게 말해야 한다.\n\n- \"영향 없음\"이 아니라 \"예상 영향은 조회 p95 10% 이내, 오류율 증가 없음\"처럼 관찰 가능한 문장으로 둔다\n- 영향이 있을 수 있으면 사전 공지, read-only 전환, feature flag off, traffic reduction 같은 완화 수단을 준비한다\n- 작업 뒤에는 완료 여부뿐 아니라 latency, error rate, queue lag, 데이터 검증 결과가 기준 안으로 돌아왔는지 확인한다\n\n## 흔한 실수\n\n- \"새벽이라 괜찮다\"고 생각하고 중단 기준 없이 대량 작업을 시작한다\n- 모든 batch, index, report job을 같은 시간대에 몰아 내부 피크를 만든다\n- 작업 완료만 보고 사용자-facing metric이 정상으로 돌아왔는지 확인하지 않는다\n- rollback owner 없이 여러 사람이 대시보드만 보고 있다\n- 비피크 작업을 DB 인덱스 세부 튜닝 문제로만 보고, 사용자 영향과 운영 의사결정을 분리하지 못한다\n\n## 한 줄 정리\n\n무거운 작업을 비피크에 돌리는 이유는 작업을 편하게 하기 위해서가 아니라, 사용자 영향이 작을 때 시작하고 이상하면 정해진 사람이 정해진 기준으로 빨리 멈추기 위해서다.\n",
+  "aliases": [
+    "off-peak maintenance window",
+    "low traffic maintenance window",
+    "off-peak batch scheduling",
+    "maintenance window operations",
+    "트래픽 낮을 때 무거운 작업",
+    "비피크 작업 시간대",
+    "트래픽 적은 시간대 작업",
+    "트래픽 낮은 시간대 무거운 작업",
+    "새벽 배치 운영",
+    "피크 시간대 회피"
+  ],
+  "expected_queries": [
+    "트래픽이 낮은 시간대에 무거운 작업을 돌리는 이유가 뭐야?",
+    "배치나 데이터 정리 같은 무거운 작업은 피크 시간을 피해서 언제 실행해야 해?",
+    "maintenance window를 정할 때 중단 기준과 rollback 담당자는 왜 미리 정해야 해?",
+    "새벽에 무거운 batch 작업을 돌리면 사용자 영향이 정말 없어지는 거야?",
+    "off-peak 작업 중 latency나 error rate가 오르면 언제 멈춰야 해?"
+  ],
+  "symptoms": [
+    "트래픽이 적은 시간대면 무거운 batch나 데이터 정리 작업을 아무 기준 없이 돌려도 된다고 생각한다",
+    "maintenance window를 시각만 정하는 것으로 보고 error rate, latency, lag 같은 중단 기준을 빼먹는다",
+    "작업 중 지표가 나빠졌을 때 pause, abort, rollback을 누가 결정하는지 정하지 않았다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/batch-vs-stream-processing-beginner-primer"
+    ],
+    "next_docs": [
+      "software-engineering/batch-job-scope",
+      "database/online-backfill-verification-cutover-gates",
+      "database/index-maintenance-window-rollout-playbook"
+    ],
+    "confusable_with": [
+      "database/index-maintenance-window-rollout-playbook",
+      "database/online-backfill-verification-cutover-gates"
+    ],
+    "forbidden_for_queries": [
+      "CREATE INDEX 구문과 DBMS별 인덱스 알고리즘을 자세히 설명해줘",
+      "Spring Batch JobRepository와 StepExecution 스키마를 깊게 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "legacy_path": "knowledge/cs/contents/software-engineering/off-peak-maintenance-window-operations-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "foundation-ladder-batch205"
+      }
+    ]
+  }
+}

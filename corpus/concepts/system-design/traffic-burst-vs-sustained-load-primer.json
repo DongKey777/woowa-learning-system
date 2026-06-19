@@ -1,0 +1,60 @@
+{
+  "id": "system-design/traffic-burst-vs-sustained-load-primer",
+  "title": "Traffic Bursts and Sustained Load Primer",
+  "category": "system-design",
+  "level": "beginner",
+  "summary": "평균 부하, 피크 부하, 짧은 burst/spike, 이벤트성 몰림, 재시도로 증폭된 트래픽, 지속 부하를 구분해 운영 지표에서 무엇을 먼저 봐야 하는지 설명한다.",
+  "body_markdown": "# Traffic Bursts and Sustained Load Primer\n\n## 한 줄 요약\n\n트래픽 스파이크는 평균 부하가 아니라 짧은 시간 창의 피크와 지속 시간을 봐야 한다. 같은 1분 평균 1,000 RPS라도 60초 내내 1,000 RPS인 경우와 5초 동안 8,000 RPS가 몰리고 나머지는 조용한 경우는 시스템이 받는 압력이 다르다.\n\n## 기본 용어\n\n평균 부하는 긴 시간 창에서 본 대표값이다. 하루 평균 주문 수, 5분 평균 RPS, 평균 CPU 같은 값이 여기에 속한다. 평균은 trend를 보기에 좋지만 짧은 순간의 queue 적체, connection pool 포화, timeout 폭증을 숨길 수 있다.\n\n피크 부하는 관측 구간에서 가장 높은 순간 부하다. 운영에서는 `1초 최대 RPS`, `10초 rolling max`, `p95 per-second RPS`처럼 짧은 window로 본다. 피크 부하가 capacity headroom보다 크면 평균이 낮아도 잠깐의 queue wait와 tail latency가 크게 튈 수 있다.\n\nBurst 또는 spike는 짧은 시간에 유입량이 평소보다 급격히 증가하는 현상이다. 이벤트 오픈, 앱 푸시, 쿠폰 공개, 인기 상품 판매 시작처럼 외부 원인으로 생길 수도 있고, timeout 이후 client retry가 한꺼번에 붙으면서 내부적으로 증폭될 수도 있다.\n\nSustained load는 높은 부하가 오래 유지되는 상태다. 짧은 burst는 queue, cache, auto scaling warm capacity, connection reuse로 흡수할 여지가 있지만, 지속 부하는 결국 평균 처리율이 평균 유입률을 따라잡아야 한다. 처리율이 모자라면 backlog slope가 계속 양수가 되고 latency가 시간이 지날수록 나빠진다.\n\n## flash crowd와 retry-amplified spike\n\nFlash crowd는 많은 실제 사용자가 같은 시점에 몰리는 spike다. 예를 들어 티켓 오픈, 라이브 방송 링크 공개, 대형 할인 시작처럼 정상 사용자의 동시 관심이 원인이다. 이 경우 관측 포인트는 `unique user`, `new session`, `edge request rate`, `cache hit ratio`, `hot endpoint`다.\n\nRetry-amplified spike는 원래 사용자 수보다 내부 요청 수가 더 커지는 spike다. 첫 요청이 느려지거나 timeout되면 client, gateway, SDK, job worker가 재시도하고, 그 재시도가 다시 queue를 밀어 더 많은 timeout을 만든다. 이 경우 관측 포인트는 `retry attempt rate`, `attempt number`, `timeout cause`, `Retry-After 준수`, `same idempotency key 반복`이다.\n\n두 현상은 dashboard에서 모두 RPS 증가로 보일 수 있지만 대응 질문이 다르다. Flash crowd는 capacity, cache, hot key, traffic forecast를 먼저 보고, retry-amplified spike는 timeout budget과 retry budget, jitter, 중복 요청 억제를 먼저 본다.\n\n## 짧은 burst와 지속 부하 대응 차이\n\n짧은 burst는 시스템이 잠깐 흔들린 뒤 회복할 수 있는지 보는 문제다. 중요한 지표는 최대 RPS뿐 아니라 burst duration, queue depth peak, oldest queued age, p99 latency, error spike 후 회복 시간이다. 3초 burst라면 약간의 queue wait로 끝날 수 있지만, 같은 피크가 3분 지속되면 backlog가 계속 쌓인다.\n\n지속 부하는 평균 처리율이 충분한지 보는 문제다. 완료 throughput이 유입량보다 낮은 상태가 계속되면 queue는 완충 장치가 아니라 지연과 timeout을 키우는 저장소가 된다. 이때는 `arrival rate`, `accepted rate`, `completed throughput`, `backlog slope`를 같이 봐야 한다.\n\n| 구분 | 먼저 보는 것 | 흔한 판단 실수 | 다음 질문 |\n|---|---|---|---|\n| 평균 부하 | 장기 RPS, 평균 CPU, 평균 latency | 평균이 낮으니 안전하다고 봄 | 짧은 window의 peak는 얼마인가? |\n| 피크 부하 | 1초/10초 rolling max, p99 latency | 최대값 하나만 보고 과도하게 일반화 | 얼마나 오래 지속됐는가? |\n| 짧은 burst | duration, queue depth peak, recovery time | queue가 있으니 무조건 흡수된다고 봄 | oldest age가 timeout budget 안에 있었나? |\n| 지속 부하 | completed throughput, backlog slope | queue 크기만 늘리면 된다고 봄 | 유입률을 처리율이 따라잡는가? |\n| retry spike | retry count, attempt distribution | 사용자 증가로만 해석 | 원 요청 대비 내부 요청이 몇 배인가? |\n\n## 운영 관측 체크리스트\n\n트래픽이 갑자기 튀었다는 말을 들으면 먼저 시간 창을 좁힌다. 5분 평균 그래프만 보지 말고 1초 또는 10초 단위 max와 percentile을 확인한다. 그다음 유입량과 완료량을 분리한다. 들어온 요청이 늘었는지, 시스템 안에서 재시도와 fan-out이 늘었는지, 실제 완료 throughput도 같이 늘었는지 구분해야 한다.\n\n- traffic: edge RPS, endpoint별 RPS, tenant/user별 분포, burst duration\n- latency: p50/p95/p99, queue wait, pool wait, timeout-before-start\n- saturation: active worker, DB pool active/pending, queue depth, oldest queued age\n- retries: retry attempt rate, attempt number, retry source, idempotency key 중복\n- recovery: peak 이후 backlog가 줄어드는 속도, error rate 정상화 시간\n\n좋은 incident note는 `평균 800 RPS`가 아니라 `12:00:03부터 18초 동안 checkout POST가 평소 700 RPS에서 4,800 RPS로 상승했고, retry attempt가 1.6배로 늘었으며, completed throughput은 2,900 RPS에서 flat했다`처럼 말한다. 이렇게 써야 burst인지 sustained overload의 시작인지, 실제 사용자 crowd인지 retry 증폭인지 다음 판단이 가능하다.\n\n## 흔한 오개념\n\n첫째, 평균 부하가 낮으면 안전하다는 생각이다. 평균은 spike를 희석한다. 둘째, 피크 RPS만 알면 충분하다는 생각이다. 피크의 높이와 지속 시간이 함께 있어야 queue가 흡수 가능한지 판단할 수 있다. 셋째, retry는 성공률을 높이기만 한다는 생각이다. timeout 직후 즉시 재시도가 몰리면 원래 부하보다 더 큰 내부 spike를 만들 수 있다. 넷째, burst 대응과 지속 부하 대응을 같은 문제로 보는 것이다. 짧은 burst는 headroom과 완충, 지속 부하는 처리율과 admission 경계가 핵심이다.\n\n## 다음에 이어서 볼 것\n\n용량을 숫자로 잡는 관점은 `system-design/littles-law-capacity-planning-primer`로 이어진다. 지속 과부하에서 queue, admission, shedding을 고르는 문제는 `system-design/overload-control-admission-queue-load-shedding-router`로 넘긴다. optional work를 줄여 핵심 경로를 보호하는 운영 정책은 `system-design/brownout-load-shedding-graceful-degradation-playbook`에서 다룬다.\n",
+  "aliases": [
+    "traffic burst vs sustained load",
+    "트래픽 튀는 현상",
+    "스파이크 지표 보기",
+    "flash crowd traffic spike",
+    "재시도로 증폭된 트래픽",
+    "트래픽 스파이크",
+    "부하 스파이크",
+    "갑자기 트래픽이 튐",
+    "평균 부하와 피크 부하",
+    "짧은 burst와 지속 부하"
+  ],
+  "expected_queries": [
+    "트래픽이 갑자기 튀는 부하 스파이크가 뭐야",
+    "평균 부하랑 피크 부하는 어떻게 다르게 봐야 해?",
+    "짧은 burst와 sustained load는 운영 대응이 왜 달라?",
+    "이벤트 때문에 몰린 트래픽이랑 재시도 때문에 늘어난 요청을 지표로 어떻게 구분해?",
+    "5분 평균 RPS는 괜찮은데 p99 latency가 튀는 이유를 부하 관점에서 설명해줘",
+    "트래픽 spike가 왔을 때 dashboard에서 먼저 봐야 할 지표는 뭐야?"
+  ],
+  "symptoms": [
+    "평균 RPS는 낮은데 특정 순간 p99 latency와 timeout이 튑니다",
+    "이벤트 오픈 직후 queue depth가 잠깐 치솟고 다시 내려옵니다",
+    "timeout 이후 retry가 붙으면서 실제 사용자 증가보다 내부 요청 수가 더 크게 늘어납니다"
+  ],
+  "relations": {
+    "prerequisites": [],
+    "next_docs": [
+      "system-design/littles-law-capacity-planning-primer",
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/brownout-load-shedding-graceful-degradation-playbook",
+      "system-design/peak-ewma-latency-aware-load-balancing"
+    ],
+    "confusable_with": [
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/peak-ewma-latency-aware-load-balancing"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "foundation-ladder-batch205",
+        "note": "Added beginner primer for traffic bursts, spikes, flash crowds, retry-amplified spikes, and sustained load observability."
+      }
+    ]
+  }
+}
