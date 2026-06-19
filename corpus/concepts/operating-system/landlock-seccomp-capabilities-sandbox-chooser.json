@@ -6,10 +6,6 @@
   "summary": "Landlock, seccomp, capabilities는 모두 \"제한\"처럼 보이지만 각각 filesystem/network access, syscall surface, root privilege budget을 다루는 서로 다른 계층이다.",
   "body_markdown": "# Landlock, seccomp, Capabilities Sandbox Chooser\n\n> 한 줄 요약: Landlock, seccomp, capabilities는 모두 \"제한\"처럼 보이지만 각각 filesystem/network access, syscall surface, root privilege budget을 다루는 서로 다른 계층이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Seccomp Basics, Backend Teams](./seccomp-basics-backend-teams.md)\n> - [시스템 콜과 User-Kernel Boundary](./syscall-user-kernel-boundary.md)\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [Namespace Crossings, /proc Visibility](./namespace-crossings-proc-visibility.md)\n> - [clone flags: thread-like, process-like, namespace-isolated](./clone-flags-thread-like-process-like-namespace-isolated.md)\n> - [Least Privilege RBAC Basics](../security/least-privilege-rbac-basics.md)\n> - [Role Permission Resource Authz Chooser](../security/role-permission-resource-authz-chooser.md)\n\n> retrieval-anchor-keywords: Landlock, seccomp, Linux capabilities, no_new_privs, CAP_SYS_ADMIN, capability bounding set, ambient capabilities, syscall allowlist, LSM sandbox, container hardening, least privilege runtime, SIGSYS, SECCOMP_RET_ERRNO, landlock ABI\n\n## 10-second chooser\n\n| 원하는 제한 | 먼저 볼 계층 | 맞는 이유 |\n|---|---|---|\n| 프로세스가 접근할 수 있는 파일 hierarchy나 일부 TCP port를 줄이고 싶다 | Landlock | unprivileged process가 자기 자신과 descendants에 LSM policy를 stack한다 |\n| 허용 syscall 목록을 줄여 kernel attack surface를 좁히고 싶다 | seccomp | syscall number, arch, argument 일부를 BPF filter로 판단한다 |\n| root 전체가 아니라 특정 privileged operation만 허용하거나 제거하고 싶다 | capabilities | `CAP_NET_BIND_SERVICE`, `CAP_CHOWN`처럼 root 권한을 조각낸다 |\n| PID, mount, network view를 나누거나 CPU/memory를 제한하고 싶다 | namespace/cgroup | 보이는 세계와 resource accounting 문제다 |\n| 사용자 A가 리소스 B를 봐도 되는지 결정하고 싶다 | app authorization | kernel sandbox가 아니라 business policy다 |\n\nLandlock은 \"이 프로세스가 앞으로 볼 수 있는 filesystem/network 범위를 더 줄인다\"에 가깝다. stackable LSM이라 기존 DAC, mount namespace, AppArmor/SELinux 같은 다른 접근 제어 위에 추가된다. 중요한 감각은 self-restriction이다. 한 번 ruleset을 enforce하면 제거할 수 없고, 이후 더 좁히는 layer만 추가할 수 있다. 그래서 보통 설정 파일, plugin, static asset, network destination을 열어 둔 뒤 worker 실행 전에 `no_new_privs`와 함께 적용한다.\n\nseccomp는 path나 user identity를 모른다. 커널로 내려가는 syscall entry를 보고 allow, errno, trap, kill, user notification 같은 action을 고른다. `openat`을 막으면 특정 디렉터리만 막는 것이 아니라 해당 syscall surface 전체가 영향을 받는다. 반대로 `openat`을 허용하면 seccomp만으로 `/etc/shadow`와 `/tmp/app.log`를 구분하지 못한다. path policy는 Landlock, mount namespace, read-only filesystem, LSM policy와 조합해야 한다.\n\ncapabilities는 sandbox라기보다 privilege budget이다. root가 하던 일을 작은 권한 조각으로 쪼개고, process의 permitted/effective/inheritable/ambient/bounding set과 file capability가 `execve()`에서 변환된다. `CAP_NET_BIND_SERVICE`처럼 좁은 capability는 유용하지만, `CAP_SYS_ADMIN`은 너무 많은 kernel operation을 포함해서 \"거의 root\"처럼 취급해야 한다. capability를 줄이면 attack surface가 줄지만, syscall 자체나 path hierarchy가 자동으로 막히지는 않는다.\n\n## Kernel semantics caveats\n\n세 계층 모두 `no_new_privs`와 exec boundary를 같이 봐야 한다. seccomp filter를 일반 process가 설치하려면 보통 `PR_SET_NO_NEW_PRIVS`가 필요하고, Landlock도 self restriction 전에 privilege 상승을 막는 흐름으로 설계한다. capabilities는 exec 때 file capability, ambient set, bounding set에 의해 다시 계산된다. 따라서 \"drop했다\"는 로그만으로 다음 exec 뒤 권한 상태를 증명하면 안 된다.\n\nLandlock은 kernel ABI version이 중요하다. 낮은 ABI에서는 `REFER`, `TRUNCATE`, network rule, scoped signal/abstract UNIX socket 같은 기능이 없거나 다르다. 안전한 프로그램은 runtime에 ABI를 조회하고, 지원하지 않는 access right를 제거한 뒤 best-effort로 적용했는지 기록해야 한다. kernel이 Landlock을 지원하지 않거나 비활성화했을 때는 `ENOSYS`, `EOPNOTSUPP` 같은 초기화 실패가 나올 수 있다.\n\nseccomp는 architecture check가 필수다. syscall number만 보고 필터링하면 x86_64, i386, x32 같은 호출 convention 차이에 취약해질 수 있다. glibc wrapper가 예상한 이름과 다른 syscall을 부를 수도 있고, `clock_gettime` 같은 일부 경로는 vDSO를 타다가 fallback 때만 실제 syscall로 보일 수 있다. 관측 기반 allowlist를 만들 때는 architecture, libc, JVM/native library, observability agent까지 포함해야 한다.\n\nLandlock의 file semantics도 단순 path string filter가 아니다. opened fd에는 일부 right가 fd와 함께 남을 수 있고, truncate/ioctl 관련 권한은 open 시점과 후속 operation의 관계를 따진다. bind mount, OverlayFS, already-open descriptor, fd passing이 있으면 \"이 path를 막았다\"는 직관과 다르게 보일 수 있다.\n\n## Observable failure modes\n\n| 증상 | 가까운 원인 | 확인 포인트 |\n|---|---|---|\n| profile 적용 뒤 process가 `SIGSYS`로 종료된다 | seccomp kill/trap action | audit log, runtime event, `si_syscall`, `si_arch` |\n| syscall이 `EPERM`이나 설정한 errno로 실패한다 | seccomp `ERRNO` 또는 capability 부족 | seccomp profile과 `CapEff`, `CapBnd`를 함께 확인 |\n| file open은 되는데 rename/link가 `EXDEV` 또는 `EACCES`다 | Landlock refer/remove/make right 부족 | ABI version, source/destination hierarchy rights |\n| `bind(80)`이 실패한다 | `CAP_NET_BIND_SERVICE` 없음 또는 namespace policy | `/proc/<pid>/status` capability fields, unit/container config |\n| sandbox는 적용됐지만 sibling thread는 다르게 보인다 | per-thread enforcement/version caveat | TSYNC support, clone timing, parent/sibling relation |\n\n진단은 세 줄로 고정한다. \"어떤 namespace에서 보고 있는가\", \"어떤 capability set을 갖고 있는가\", \"어떤 syscall/path가 실제로 막혔는가\"다. `strace` 하나만으로는 부족하다. seccomp가 `ptrace`나 `strace` 자체를 어렵게 만들 수 있고, container runtime이 이미 기본 seccomp/capability policy를 적용했을 수 있다.\n\n## Wrong-bucket neighbors\n\ncontainer는 완성된 sandbox가 아니다. namespace는 보이는 세계를 나누고 cgroup은 resource 사용량을 제한하지만, syscall surface와 privileged operation은 별도 정책이 필요하다.\n\nseccomp를 file path ACL로 쓰면 wrong bucket이다. `openat`을 허용할지 말지는 말할 수 있어도 어느 directory가 안전한지는 말하지 못한다.\n\ncapability drop을 syscall allowlist로 착각해도 wrong bucket이다. `CAP_SYS_ADMIN`을 제거해도 일반 syscall은 여전히 호출될 수 있고, 반대로 syscall을 막아도 남은 capability가 다른 kernel path를 열 수 있다.\n\nLandlock을 application authorization으로 쓰는 것도 wrong bucket이다. \"내 예약만 볼 수 있는가\", \"tenant A 관리자인가\"는 kernel object가 아니라 domain resource policy다.\n\n## Safe Next Docs\n\nsyscall filter 자체가 약하면 [Seccomp Basics, Backend Teams](./seccomp-basics-backend-teams.md)를 먼저 읽는다. container와 namespace/cgroup의 역할 분리가 약하면 [container, cgroup, namespace](./container-cgroup-namespace.md)가 안전한 다음 문서다. kernel privilege와 product-level permission을 분리해야 한다면 [Least Privilege RBAC Basics](../security/least-privilege-rbac-basics.md)와 [Role Permission Resource Authz Chooser](../security/role-permission-resource-authz-chooser.md)로 이어가면 된다.\n",
   "aliases": [
-    "Landlock seccomp Capabilities Sandbox 개념",
-    "Landlock seccomp Capabilities Sandbox 정리",
-    "Landlock seccomp Capabilities Sandbox 실수",
-    "Landlock seccomp Capabilities Sandbox 판단 기준",
     "운영체제 Landlock seccomp Capabilities Sandbox",
     "Linux sandbox chooser",
     "Landlock seccomp capabilities",
@@ -17,7 +13,9 @@
     "capability drop",
     "no_new_privs sandbox",
     "container hardening primitives",
-    "least privilege kernel boundary"
+    "least privilege kernel boundary",
+    "syscall 제한과 파일 접근 제한 분리",
+    "CAP_SYS_ADMIN을 남기면 왜 위험해?"
   ],
   "expected_queries": [
     "Landlock, seccomp, Linux capabilities는 각각 어떤 sandbox 문제에 써야 해?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/landlock-seccomp-capabilities-sandbox-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

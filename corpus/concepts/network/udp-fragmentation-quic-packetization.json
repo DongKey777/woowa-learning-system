@@ -6,10 +6,6 @@
   "summary": "UDP/IP fragment 하나가 사라지면 datagram 전체가 재조립되지 못할 수 있으므로, QUIC은 packetization과 MTU를 신중하게 다뤄야 한다.",
   "body_markdown": "# UDP Fragmentation, QUIC Packetization\n\n> 한 줄 요약: UDP/IP fragment 하나가 사라지면 datagram 전체가 재조립되지 못할 수 있으므로, QUIC은 packetization과 MTU를 신중하게 다뤄야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [MTU, PMTUD, ICMP Blackhole Path Diagnostics](./mtu-pmtud-icmp-blackhole-path-diagnostics.md)\n> - [HTTP/3, QUIC Practical Trade-offs](./http3-quic-practical-tradeoffs.md)\n> - [QUIC Connection Migration, Path Change](./quic-connection-migration-path-change.md)\n> - [Packet Loss, Jitter, Reordering Diagnostics](./packet-loss-jitter-reordering-diagnostics.md)\n> - [TCP Fast Open Trade-offs](./tcp-fast-open-tradeoffs.md)\n\nretrieval-anchor-keywords: UDP fragmentation, QUIC packetization, PMTU, datagram, loss, reassembly, MTU, crypto overhead, path MTU\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nUDP 자체는 TCP처럼 세그먼트 재전송과 순서 보장을 제공하지 않는다. QUIC은 UDP 위에서 신뢰성, 혼잡 제어, 손실 복구를 구현하지만, 경로 MTU보다 큰 UDP datagram을 IP fragment에 맡기는 것은 여전히 취약하다.\n\n- 조각난 UDP fragment가 하나만 빠져도 전체 datagram이 죽을 수 있다\n- QUIC은 이를 피하려고 packetization과 PMTU를 매우 중요하게 다룬다\n- 큰 payload를 무심코 쪼개지 않도록 설계해야 한다\n\n### Retrieval Anchors\n\n- `UDP fragmentation`\n- `QUIC packetization`\n- `PMTU`\n- `datagram`\n- `loss`\n- `reassembly`\n- `MTU`\n- `crypto overhead`\n- `path MTU`\n\n## 깊이 들어가기\n\n### 1. UDP fragmentation이 왜 위험한가\n\nUDP는 메시지 경계가 있지만, 네트워크는 여전히 MTU 제약을 받는다.\n\n- 패킷이 너무 크면 fragment로 쪼개질 수 있다\n- fragment 하나만 잃어도 전체 datagram이 실패한다\n- 재조립은 TCP보다 훨씬 취약하게 보일 수 있다\n\n### 2. QUIC이 packetization을 조심하는 이유\n\nQUIC은 UDP 위에서 동작하지만, 안정성은 스스로 챙겨야 한다.\n\n- MTU를 고려해 packet size를 제한한다\n- 암호화 오버헤드까지 감안해야 한다\n- path change와 손실 환경에서 깨지지 않게 해야 한다\n\n### 3. PMTU가 왜 중요하나\n\nQUIC은 경로 MTU가 얼마인지 잘못 추정하면 손실이 커질 수 있다.\n\n- 큰 packet은 blackhole에 걸릴 수 있다\n- 작은 packet은 오버헤드가 커진다\n- 적절한 균형이 필요하다\n\n### 4. 왜 TCP보다 더 민감해 보이나\n\nTCP는 세그먼트화, 재전송, 흐름 제어가 커널 TCP stack에 내장돼 있고 MSS/PMTUD와 함께 동작한다.\n\n- UDP는 그런 보호를 transport 자체가 제공하지 않는다\n- QUIC이 이를 메우지만, packetization과 PMTU 실수는 그대로 체감된다\n- 손실과 지터를 packet 크기로 더 민감하게 느낄 수 있다\n\n### 5. 운영에서 보는 신호\n\n- path MTU보다 큰 packet을 보내는가\n- 특정 네트워크에서만 loss가 커지는가\n- QUIC packet size가 지나치게 큰가\n\n## 실전 시나리오\n\n### 시나리오 1: HTTP/3는 되는데 특정 네트워크에서만 끊긴다\n\nUDP fragmentation, PMTU, middlebox 문제일 수 있다.\n\n### 시나리오 2: 큰 스트림이 작은 요청까지 느리게 만든다\n\npacketization과 loss 복구가 연결 전체 체감을 흔들 수 있다.\n\n### 시나리오 3: VPN이나 터널 뒤에서만 QUIC이 불안정하다\n\nMTU blackhole과 조각화 문제가 겹쳤을 수 있다.\n\n## 운영 Playbook\n\n### 재현 조건\n\n- HTTP/2/TCP는 안정적인데 HTTP/3/QUIC만 특정 ISP, VPN, 터널, 사내망에서 불안정하다.\n- 작은 요청은 성공하지만 큰 response, handshake 이후 migration/path change, upload에서 loss가 커진다.\n- UDP 443이 허용돼도 큰 UDP datagram이나 ICMP Packet Too Big 처리가 경로에서 깨진다.\n\n### 확인 순서\n\n1. TCP 문제와 분리한다: 같은 origin에서 HTTP/2와 HTTP/3 성공률/latency를 비교한다.\n2. UDP 차단인지 MTU 문제인지 분리한다: 작은 QUIC packet은 되는지, 큰 transfer에서만 나빠지는지 본다.\n3. packet capture에서 IP fragmentation, ICMP Packet Too Big, UDP length 분포를 확인한다.\n4. VPN/터널 환경이면 outer header overhead를 뺀 effective MTU를 계산한다.\n5. 서버/라이브러리의 QUIC max UDP payload size, DPLPMTUD/PMTUD 설정, fallback 동작을 확인한다.\n\n### Failure Matrix\n\n| 관찰 | 1차 bucket | 다음 확인 |\n|------|------------|-----------|\n| UDP 443 자체가 실패 | UDP block/middlebox | HTTP/2 fallback, firewall |\n| 작은 요청 성공, 큰 transfer 실패 | PMTU/fragmentation | UDP length, ICMP PTB, effective MTU |\n| VPN에서만 실패 | tunnel overhead | interface MTU, encapsulation headers |\n| path change 뒤 악화 | QUIC path validation/MTU 재탐색 | connection migration logs |\n| loss가 크지만 fragment 없음 | congestion/loss/jitter | RTT/loss, pacing, congestion control |\n\n### 검증\n\npacket size를 낮춰 성공률이 올라간다면 PMTU bucket 가능성이 커진다. 하지만 최종 검증은 HTTP/3 success rate, retransmission/loss, fallback rate, p95/p99 latency가 대상 네트워크별로 개선되는지 보는 것이다.\n\n## 코드로 보기\n\n### 관찰\n\n```bash\ntcpdump -i any udp port 443\nss -tunap\ntracepath <host>\nping -M do -s <size> <host>\n```\n\n### 감각\n\n```text\nsmall QUIC packets\n-> fewer fragmentation risks\n-> more overhead\n\nlarge QUIC packets\n-> better efficiency\n-> more MTU risk\n```\n\n### 체크 포인트\n\n```text\n- packet size under path MTU\n- fragmentation avoided\n- loss under specific networks\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 큰 packet | 오버헤드가 적다 | MTU/fragmentation 위험이 크다 | 안정 경로 |\n| 작은 packet | 손실/blackhole에 강하다 | 오버헤드가 늘어난다 | 변동성 큰 경로 |\n| adaptive packetization | 균형이 좋다 | 구현/튜닝이 복잡하다 | QUIC 운영 |\n\n핵심은 UDP 위에서는 packet 크기 자체가 운영 안정성의 일부라는 점이다.\n\n## 꼬리질문\n\n> Q: UDP fragmentation이 왜 위험한가요?\n> 핵심: fragment 하나만 사라져도 전체 datagram이 실패하기 때문이다.\n\n> Q: QUIC packetization이 왜 중요한가요?\n> 핵심: UDP 위에서 MTU와 loss를 직접 다뤄야 하기 때문이다.\n\n> Q: 큰 packet과 작은 packet의 trade-off는?\n> 핵심: 효율과 안정성의 균형이다.\n\n## 한 줄 정리\n\nUDP fragmentation은 손실에 취약하므로, QUIC은 packetization과 MTU를 조심스럽게 맞춰야 안정적으로 동작한다.\n",
   "aliases": [
-    "UDP Fragmentation, QUIC Packetization 개념",
-    "UDP Fragmentation, QUIC Packetization 정리",
-    "UDP Fragmentation, QUIC Packetization 실수",
-    "UDP Fragmentation, QUIC Packetization 판단 기준",
     "네트워크 UDP Fragmentation, QUIC Packetization",
     "UDP fragmentation",
     "QUIC packetization",
@@ -17,7 +13,9 @@
     "path MTU",
     "datagram reassembly",
     "QUIC packet size",
-    "UDP loss fragmentation"
+    "UDP loss fragmentation",
+    "HTTP/3가 VPN에서만 끊기는 이유",
+    "QUIC packet size 크게 잡아도 돼"
   ],
   "expected_queries": [
     "UDP fragmentation이 QUIC HTTP/3에서 왜 위험해?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/udp-fragmentation-quic-packetization.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

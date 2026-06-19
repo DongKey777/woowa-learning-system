@@ -7,17 +7,15 @@
   "body_markdown": "# Clustered Index Locality\n\n> 한 줄 요약: clustered index는 PK 순서로 데이터가 물리적으로 가까워지게 만들어, point lookup과 범위 조회의 locality를 결정한다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: clustered index, primary key locality, leaf page locality, page split, secondary index lookup, physical clustering, range scan, random I/O\n\n## 핵심 개념\n\n- 관련 문서:\n  - [인덱스와 실행 계획](./index-and-explain.md)\n  - [커버링 인덱스와 복합 인덱스 컬럼 순서](./covering-index-composite-ordering.md)\n  - [Covering Index vs Index-Only Scan](./covering-index-vs-index-only-scan.md)\n  - [InnoDB Buffer Pool Internals](./innodb-buffer-pool-internals.md)\n\nInnoDB에서 clustered index는 단순한 인덱스가 아니라 **테이블 자체의 정렬 축**이다.  \n즉 PK가 곧 데이터의 물리적 배치 방식에 영향을 준다.\n\n이게 중요한 이유는 다음 때문이다.\n\n- 같은 PK 근처 row는 같은 page에 모이기 쉽다\n- 범위 조회가 더 자연스럽다\n- secondary index lookup 후 primary key로 본문을 찾는 비용이 locality에 따라 달라진다\n\n## 깊이 들어가기\n\n### 1. clustered index는 무엇을 클러스터링하는가\n\nInnoDB의 primary key leaf는 단순 포인터가 아니라 실제 row 데이터를 담는다.  \n그래서 PK 순서가 곧 데이터 페이지 배치에 큰 영향을 준다.\n\n결과적으로:\n\n- PK 증가형은 append 패턴과 잘 맞는다\n- 랜덤 PK는 page split과 분산을 늘릴 수 있다\n- 범위 조회는 같은 leaf page를 연속적으로 읽기 쉬워진다\n\n### 2. locality가 좋으면 왜 빨라지나\n\nlocality가 좋다는 건 근처 데이터를 함께 읽는다는 뜻이다.\n\n- buffer pool hit 가능성이 높아진다\n- disk seek가 줄어든다\n- range scan이 효율적이다\n\n반대로 locality가 나쁘면:\n\n- page miss가 늘고\n- 랜덤 I/O가 증가하고\n- page split이 잦아질 수 있다\n\n### 3. secondary index는 locality를 우회하지 못한다\n\nsecondary index는 결국 primary key로 본문을 찾는다.  \n따라서 secondary index가 잘 설계되어 있어도 clustered locality가 나쁘면 본문 접근 비용이 남는다.\n\n### 4. PK 선택이 사실상 물리 배치 설계다\n\nUUID 같은 랜덤 PK는 분산 장점이 있어 보이지만, InnoDB에서는 page split과 locality 저하를 부를 수 있다.  \n반면 monotonic PK는 locality에 유리하지만 hot spot을 만들 수 있다.\n\n즉 PK는 단순 식별자가 아니라 **쓰기 패턴과 페이지 구조를 같이 정하는 결정**이다.\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `clustered index`\n- `primary key locality`\n- `page split`\n- `random I/O`\n- `range scan`\n- `secondary index lookup`\n\n## 실전 시나리오\n\n### 시나리오 1. PK가 UUID로 바뀌고 나서 insert가 흔들린다\n\n랜덤 PK는 페이지 끝에만 쓰는 형태가 아니어서 split과 재배치가 늘 수 있다.  \n이때는 PK 설계가 테이블의 locality를 깨고 있는지 봐야 한다.\n\n### 시나리오 2. 최근 주문 조회는 빠른데 오래된 주문 조회가 튄다\n\nPK 순서가 생성 시점과 맞으면 최근 데이터는 잘 붙어 있지만, 오래된 범위는 buffer pool에서 밀려날 수 있다.  \nhot/cold 데이터 경계와도 연결된다.\n\n### 시나리오 3. secondary index는 있는데 본문 조회가 계속 많다\n\n조회 조건이 secondary index에만 맞고 본문 row는 랜덤하게 흩어져 있으면 locality 이득이 줄어든다.  \n이 경우 covering index나 PK 재설계가 필요할 수 있다.\n\n## 코드로 보기\n\n### PK가 locality에 미치는 예시\n\n```sql\nCREATE TABLE orders (\n  id BIGINT PRIMARY KEY,\n  user_id BIGINT NOT NULL,\n  status VARCHAR(20) NOT NULL,\n  created_at DATETIME NOT NULL,\n  INDEX idx_orders_user_created_at (user_id, created_at)\n);\n```\n\n### 범위 조회\n\n```sql\nEXPLAIN\nSELECT *\nFROM orders\nWHERE id BETWEEN 100000 AND 100500;\n```\n\n### page split 감각 확인\n\n```sql\nSHOW ENGINE INNODB STATUS\\G\n```\n\n### locality를 고려한 설계 감각\n\n```sql\nSELECT id, created_at\nFROM orders\nWHERE created_at >= '2026-04-01'\nORDER BY id;\n```\n\nPK와 access pattern이 얼마나 맞는지 생각해 본다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| monotonic PK | locality가 좋다 | hot spot이 생길 수 있다 | OLTP 중심 |\n| random PK | 분산이 좋다 | page split과 locality 저하 | 분산 식별자 우선일 때 |\n| covering index 추가 | 본문 접근을 줄인다 | index size와 write cost 증가 | 반복 목록 조회 |\n| PK 재설계 | 구조를 바로잡을 수 있다 | 대규모 migration이 필요하다 | 장기적으로 locality가 중요할 때 |\n\n핵심은 clustered index를 \"그냥 PK 저장 방식\"이 아니라 **물리 locality를 결정하는 축**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: clustered index가 왜 locality에 중요한가요?\n> 의도: PK와 물리 배치 관계를 이해하는지 확인\n> 핵심: PK 순서가 데이터 페이지 정렬에 직접 영향을 준다\n\n> Q: UUID PK가 왜 문제될 수 있나요?\n> 의도: 랜덤 쓰기와 page split의 관계 확인\n> 핵심: 데이터가 흩어져 page split과 랜덤 I/O가 늘 수 있다\n\n> Q: secondary index만 좋으면 충분하지 않나요?\n> 의도: 본문 접근 비용을 무시하지 않는지 확인\n> 핵심: 결국 primary key로 본문을 찾아야 한다\n\n## 한 줄 정리\n\nclustered index는 PK 순서로 데이터가 모이는 방식이라, locality가 좋으면 읽기와 쓰기 모두 유리하지만 PK 설계가 곧 물리 배치 설계가 된다.\n",
   "aliases": [
     "클러스터드 인덱스 locality",
-    "Clustered Index Locality 개념",
-    "Clustered Index Locality 정리",
-    "Clustered Index Locality 실수",
-    "Clustered Index Locality 판단 기준",
     "clustered index",
     "clustered index locality",
     "primary key locality",
     "leaf page locality",
     "page split locality",
     "secondary index lookup",
-    "physical clustering"
+    "physical clustering",
+    "UUID PK가 locality를 망침",
+    "clustered index는 물리 배치인가"
   ],
   "expected_queries": [
     "InnoDB clustered index는 primary key 순서가 테이블 물리 locality를 결정한다는 뜻이야?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/clustered-index-locality.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

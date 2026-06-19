@@ -6,10 +6,6 @@
   "summary": "connection draining은 앱과 LB가 기존 연결을 마무리하게 해주는 운영 절차이고, FIN/RST는 그 절차가 실제 소켓에서 어떻게 보이는지다.",
   "body_markdown": "# Connection Draining vs FIN, RST, Graceful Close\n\n> 한 줄 요약: connection draining은 앱과 LB가 기존 연결을 마무리하게 해주는 운영 절차이고, FIN/RST는 그 절차가 실제 소켓에서 어떻게 보이는지다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [LB Connection Draining, Deployment Safe Close](./lb-connection-draining-deployment-safe-close.md)\n> - [FIN, RST, Half-Close, EOF](./fin-rst-half-close-eof-semantics.md)\n> - [Idle Timeout 불일치: LB, Proxy, App](./idle-timeout-mismatch-lb-proxy-app.md)\n> - [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [HTTP/2 RST_STREAM, GOAWAY, Streaming Failure Semantics](./http2-rst-stream-goaway-streaming-failure-semantics.md)\n\nretrieval-anchor-keywords: connection draining, FIN, RST, graceful close, deregistration delay, half-close, close_notify, shutdown, socket lifecycle\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [추천 공식 자료](#추천-공식-자료)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nconnection draining은 새 연결은 다른 곳으로 보내고, 기존 연결은 정해진 grace window 안에서 마무리하게 하는 것이다.\n\n- FIN은 한 방향 TCP byte stream을 orderly close하겠다는 신호다\n- RST는 해당 TCP 연결 상태를 즉시 버리라는 신호에 가깝다\n- draining은 앱/LB가 가능한 연결을 graceful protocol signal 쪽으로 유도하도록 만드는 운영 절차다\n\n여기서 FIN은 **한 방향의 TCP byte stream 종료**이지, 곧바로 \"비즈니스 요청 성공\"이라는 뜻은 아니다. RST도 항상 애플리케이션 버그는 아니다. Draining은 단일 옵션이 아니라 \"새 요청 차단, 기존 요청 완료, keep-alive 축소, long-lived stream 처리, deadline 이후 강제 종료\"를 시간 순서로 맞추는 배포 절차다. FIN/RST는 그 절차가 socket과 proxy log에서 어떻게 관찰되는지에 가깝다.\n\n### Retrieval Anchors\n\n- `connection draining`\n- `FIN`\n- `RST`\n- `graceful close`\n- `deregistration delay`\n- `half-close`\n- `close_notify`\n- `shutdown`\n- `socket lifecycle`\n\n## 깊이 들어가기\n\n### 1. draining과 graceful close의 관계\n\ndraining이 잘 되면 많은 정상 요청은 FIN, TLS `close_notify`, HTTP/2 또는 HTTP/3 GOAWAY 같은 graceful signal 쪽으로 마무리된다.\n\n- 새 요청은 더 이상 받지 않는다\n- 이미 진행 중인 요청은 응답을 끝낸다\n- 가능한 연결은 graceful 처리 경로를 탄다\n\n일반적인 순서는 다음과 같다.\n\n1. Readiness를 false로 바꿔 새 traffic 선정을 멈춘다.\n2. LB target deregistration delay 또는 mesh drain window 동안 기존 요청을 받쳐 준다.\n3. App은 새 작업 수락을 멈추고 in-flight 요청에 deadline을 준다.\n4. Keep-alive idle connection에는 `Connection: close`, GOAWAY, max connection age 같은 신호를 써서 새 요청 재사용을 줄인다.\n5. Grace period가 끝난 뒤 남은 연결만 force close한다.\n\n주의할 점은 계층마다 \"graceful\"의 의미가 다르다는 것이다. TCP FIN은 socket byte stream의 한 방향을 닫는 신호이고, TLS `close_notify`는 TLS record stream 종료 신호이며, HTTP/2/HTTP/3 GOAWAY는 새 stream/request 수락 범위를 줄이는 신호다. 배포 절차는 이 신호들을 같은 방향으로 정렬하는 일이지, 하나의 FIN packet만 확인하는 일이 아니다.\n\n### 2. draining과 RST의 차이\n\nRST는 보통 다음 상황에서 보인다.\n\n- 서버가 강제 종료된다\n- proxy가 세션을 버린다\n- timeout이 너무 짧아 끊는다\n\ndraining이 없다면 shutdown 순간이 RST처럼 보일 수 있다.\n\n하지만 RST가 항상 버그는 아니다. Deadline을 초과한 upload, 이미 취소된 client, protocol violation, proxy overload 방어에서는 RST나 HTTP/2 `RST_STREAM`이 의도된 정리 신호일 수 있다. 문제는 \"배포 중 정상 요청이 예측 없이 reset됐는가\"다.\n\n따라서 리뷰나 장애 분석에서는 \"RST가 있었다\"에서 멈추지 않는다. 다음을 같이 확인한다.\n\n- 요청이 이미 application에 도달해 side effect를 만들었는가\n- response body framing이 완료됐는가\n- client cancel, timeout, overload 정책처럼 의도된 reset 이유가 있는가\n- deploy marker와 reset 증가가 같은 시간축에 겹치는가\n\n### 3. half-close가 왜 관련되나\n\n요청을 다 받은 뒤 응답만 보내는 프로토콜은 half-close 감각이 중요하다.\n\n- 클라이언트는 더 보내지 않는다\n- 서버는 아직 응답을 보낼 수 있다\n- 종료 시점이 앞뒤로 다를 수 있다\n\n### 4. TLS에서는 어떻게 보이나\n\nTLS는 `close_notify` 같은 종료 신호가 관여할 수 있다.\n\n- 평문 TCP와 소켓 종료가 1:1로 안 보일 수 있다\n- proxy가 중간에서 종료를 변환할 수 있다\n- 앱은 graceful close와 RST를 구분해야 한다\n\nTLS `close_notify`가 없다고 항상 데이터 손실은 아니지만, response body 길이와 framing을 확인하지 않으면 truncation을 놓칠 수 있다. HTTP/1.1 content-length, chunked terminator, HTTP/2 frame 종료, HTTP/3 stream 종료, gRPC trailers처럼 상위 프로토콜의 완료 신호와 함께 봐야 한다.\n\n### 5. 운영 절차와 연결되는 지점\n\n- readiness false\n- 새 연결 차단\n- 기존 연결 마무리\n- 종료 후 reset 최소화\n\n### 6. 배포 안전성 체크리스트\n\n- Readiness false가 LB health check에서 빠지는 시간보다 먼저 적용되는가\n- Deregistration delay가 p99 request time, upload/download, streaming duration과 맞는가\n- App graceful shutdown timeout이 LB drain window보다 너무 짧지 않은가\n- Client pool idle lifetime이 server/LB idle timeout보다 길어 stale reuse를 만들지 않는가\n- HTTP/2/gRPC는 GOAWAY와 max connection age로 새 stream 유입을 멈추는가\n- Metrics에서 FIN, RST, 499/client abort, 502/504, in-flight request를 같은 deploy marker와 겹쳐 보는가\n\n### 7. 역할에 맞는 답변 프레임\n\n리뷰에서는 \"graceful shutdown을 넣자\"에서 멈추지 말고 \"readiness false -> LB deregistration delay -> app graceful timeout -> protocol close signal -> force close deadline\" 순서로 말한다. 장애 분석에서는 client EOF, proxy reset, origin 정상 로그가 서로 모순이 아니라 서로 다른 관찰 지점일 수 있음을 먼저 정렬한다.\n\n특히 \"FIN이면 정상, RST면 비정상\"처럼 단순화하지 않는다. 더 좋은 질문은 \"이 connection close가 어떤 계층의 deadline/정책/오류에 의해 발생했고, request processing boundary는 어디까지 지나갔나\"다.\n\n## 실전 시나리오\n\n### 시나리오 1: 배포 중 reset이 생긴다\n\ndraining 없이 서버를 내렸을 가능성이 크다.\n\n또는 readiness false는 되었지만 LB target 제거 전파보다 pod/process 종료가 먼저 끝났을 수 있다. 배포 이벤트, target health transition, app shutdown timestamp를 한 타임라인에 놓는다.\n\n### 시나리오 2: client는 EOF를 보는데 server 로그는 정상이다\n\n정상 종료 경로일 수 있다.\n\n### 시나리오 3: keep-alive가 길어서 종료 타이밍이 늦다\n\ndraining window와 pool lifetime을 맞춰야 한다.\n\n## 코드로 보기\n\n### 상태 관찰\n\n```bash\nss -tan state close-wait\nss -tan state time-wait\ntcpdump -i eth0 'tcp[tcpflags] & (tcp-fin|tcp-rst) != 0'\n```\n\n### 종료 흐름 감각\n\n```text\ndrain -> no new traffic\nfinish active requests\nsend GOAWAY / close_notify / FIN when the protocol layer supports it\nuse RST or immediate close only when deadline, cancel, or error policy requires it\n```\n\n### 로그 상관 감각\n\n```text\ndeploy marker\n-> readiness false\n-> LB target draining\n-> in-flight reaches zero or deadline\n-> GOAWAY/Connection: close/FIN\n-> force close only after grace\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| graceful draining | 정상 요청 손실과 retry 혼선을 줄인다 | 종료가 느릴 수 있다 | 일반 배포 |\n| immediate close | 자원을 빠르게 회수한다 | reset/EOF 혼선이 생긴다 | deadline 초과, 오류 방어, 긴급 종료 |\n| long drain window | long-lived connection에 유리 | 자원 회수가 늦다 | streaming, upload/download |\n\n핵심은 운영 절차가 FIN/RST를 실제로 어떻게 만들지 이해하는 것이다.\n\n## 꼬리질문\n\n> Q: connection draining과 FIN의 관계는?\n> 핵심: draining은 가능하면 FIN, TLS close_notify, GOAWAY 같은 graceful signal로 끝나도록 정렬하는 운영 절차다.\n\n> Q: RST는 언제 보이나요?\n> 핵심: 강제 종료, timeout, proxy discard, protocol error, client cancel에서 보일 수 있다.\n\n> Q: 왜 graceful close가 중요한가요?\n> 핵심: 배포와 scale-in에서 불필요한 reset과 데이터 손실을 줄이기 위해서다.\n\n## 추천 공식 자료\n\n- RFC 9293, Transmission Control Protocol: https://www.rfc-editor.org/rfc/rfc9293\n- RFC 8446, TLS 1.3 alerts and `close_notify`: https://www.rfc-editor.org/rfc/rfc8446.html\n- RFC 9113, HTTP/2 GOAWAY and connection errors: https://www.rfc-editor.org/rfc/rfc9113.html\n- RFC 9114, HTTP/3 connection shutdown and GOAWAY: https://www.rfc-editor.org/rfc/rfc9114.html\n\n## 한 줄 정리\n\nconnection draining은 새 유입 차단, 기존 요청 마무리, protocol-level graceful signal, force-close deadline을 정렬하는 운영 절차이고, FIN/RST는 그 결과 중 TCP 계층에서 보이는 일부 신호다.\n",
   "aliases": [
-    "Connection Draining vs FIN, 개념",
-    "Connection Draining vs FIN, 정리",
-    "Connection Draining vs FIN, 실수",
-    "Connection Draining vs FIN, 판단 기준",
     "네트워크 Connection Draining vs FIN,",
     "connection draining",
     "FIN RST graceful close",
@@ -17,7 +13,9 @@
     "half-close socket lifecycle",
     "close_notify shutdown",
     "deployment safe close",
-    "connection draining vs fin guide"
+    "connection draining vs fin guide",
+    "배포 중 RST가 늘었어",
+    "FIN은 정상이고 RST는 장애야"
   ],
   "expected_queries": [
     "connection draining과 FIN RST graceful close는 각각 어떤 층의 개념이야?",
@@ -58,12 +56,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/connection-draining-vs-fin-rst-graceful-close.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

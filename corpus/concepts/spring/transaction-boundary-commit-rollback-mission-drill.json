@@ -7,17 +7,15 @@
   "body_markdown": "# Transaction Boundary Commit / Rollback Mission Drill\n\n> 한 줄 요약: 트랜잭션 경계는 repository마다 붙이는 장식이 아니라, 하나의 유스케이스가 함께 성공하거나 함께 실패해야 하는 범위다.\n\n**난이도: Beginner**\n\n## 풀이 기준\n\n미션 코드에서 트랜잭션 경계(transaction boundary)를 고를 때는 \"어느 테이블을 쓰는가\"보다 \"하나의 유스케이스가 어떤 상태 변경을 함께 확정해야 하는가\"를 먼저 본다. 보통 controller가 아니라 application service 메서드가 commit owner가 된다. repository마다 `@Transactional`을 흩뿌리면 여러 저장 작업이 각각 성공해도 전체 유스케이스가 실패하는 상황을 설명하기 어렵다.\n\nSpring의 기본 rollback 규칙도 정확히 말해야 한다. 기본적으로 runtime exception과 error는 rollback 대상이고, checked exception은 별도 설정이 없으면 commit될 수 있다. 내부에서 예외를 잡고 정상 반환하면 rollback이 일어나지 않는다. 이미 rollback-only로 표시된 트랜잭션을 바깥에서 commit하려고 하면 `UnexpectedRollbackException`이 날 수 있다.\n\n## 기대 답변 축\n\n- 어느 메서드가 commit owner인지 유스케이스 단위로 고른다.\n- `flush`는 SQL 동기화이고 `commit`은 transaction 확정이라고 구분한다.\n- runtime exception, checked exception, `rollbackFor`, catch 후 정상 반환을 rollback rule로 설명한다.\n- `REQUIRED`, `REQUIRES_NEW`, rollback-only처럼 propagation이 물리 transaction을 어떻게 나누거나 공유하는지 본다.\n- 외부 I/O와 listener는 after-commit/outbox/보상 전략으로 분리할지 판단한다.\n- 테스트가 기본 rollback 때문에 commit 이후 동작을 가리는지 확인한다.\n\n## 문제 1\n\n```text\nreserve()가 예약 저장, 포인트 차감, 알림 전송을 한 메서드에서 수행한다.\n```\n\n답:\n\n예약 저장과 포인트 차감은 같은 비즈니스 상태 전이(business state transition)이면 같은 transaction 후보가 될 수 있다. 둘 중 하나만 commit되면 안 되는지로 판단한다. 알림 전송은 외부 I/O라 DB rollback으로 되돌릴 수 없다. 그래서 commit 이후 이벤트(after-commit event), outbox, 재시도 가능한 별도 작업으로 분리하는 편이 보수적이다.\n\n## 문제 2\n\n```text\ncheckout()이 order 저장 전에 payment API를 호출하고, 실패하면 DB 작업은 없다.\n```\n\n답:\n\n외부 승인과 로컬 DB commit을 하나의 rollback으로 착각하면 안 된다. 결제사가 이미 승인한 결과는 내 DB transaction이 rollback된다고 자동 취소되지 않는다. 승인 요청 전후로 주문 상태를 어떻게 기록할지, 실패 보상(compensation)과 idempotency key를 어떻게 둘지 별도 설계가 필요하다.\n\n## 문제 3\n\n```text\n@DataJpaTest에서 flush가 성공했으니 AFTER_COMMIT listener도 검증됐다고 본다.\n```\n\n답:\n\n아니다. `flush`는 persistence context의 변경을 DB에 동기화하는 것이고, `commit`은 트랜잭션을 확정하는 것이다. 테스트가 기본 rollback으로 끝나면 after-commit listener, commit hook, 다른 transaction에서의 가시성은 검증되지 않을 수 있다. commit-visible 테스트나 `TestTransaction` 같은 도구를 따로 쓴다.\n\n## 문제 4\n\n```text\ncancel()이 예약 상태를 취소로 바꾼 뒤 checked exception을 던진다.\n```\n\n답:\n\n기본 설정만으로는 rollback된다고 단정하면 안 된다. checked exception을 rollback 대상으로 삼으려면 `rollbackFor`를 지정하거나 예외 계층을 재설계한다. 더 중요한 것은 \"이 예외가 나면 예약 취소가 확정돼도 되는가\"라는 유스케이스 정책이다.\n\n## 문제 5\n\n```text\ncheckout()의 outer transaction 안에서 auditLog()를 `REQUIRES_NEW`로 호출했다. 이후 checkout()이 RuntimeException으로 rollback된다.\n```\n\n답:\n\n`REQUIRES_NEW`는 보통 별도 physical transaction을 열어 outer transaction과 commit/rollback을 분리한다. 그래서 audit log가 이미 commit됐다면 outer rollback으로 자동 취소되지 않는다. 이것이 의도한 감사 로그라면 후보가 될 수 있지만, 주문과 함께 사라져야 하는 row라면 propagation 선택이 틀렸을 수 있다. 반대로 `REQUIRED`로 같은 transaction을 공유하면 내부 실패가 rollback-only를 만들고 outer commit 시 `UnexpectedRollbackException`으로 드러날 수 있다.\n\n## 문제 6\n\n```text\n예약 저장 후 `@TransactionalEventListener(phase = AFTER_COMMIT)`로 쿠폰을 발급한다. 테스트는 `@SpringBootTest @Transactional` 안에서 repository row만 assert한다.\n```\n\n답:\n\n테스트가 transaction rollback 안에서 끝나면 after-commit listener가 실행되지 않았는데도 row assert만 통과할 수 있다. 이 경우 테스트는 \"예약 row가 flush될 수 있음\"만 봤고, \"commit 이후 쿠폰 발급 side effect\"는 보지 못했다. listener를 검증하려면 transaction을 실제 commit하게 만들거나 `TestTransaction.end()`, 별도 commit-visible integration test, outbox row 검증처럼 commit boundary를 드러내는 테스트가 필요하다.\n\n## 오답 교정\n\n| 오답 | 왜 위험한가 | 교정 |\n|---|---|---|\n| \"repository마다 `@Transactional`이면 충분하다\" | 유스케이스 일부만 commit되는 상태를 설명하기 어렵다 | application service 메서드를 commit owner 후보로 본다 |\n| \"`flush`가 성공했으니 commit도 성공했다\" | flush 이후 rollback, constraint 지연, after-commit 누락을 가릴 수 있다 | flush와 commit-visible 검증을 분리한다 |\n| \"checked exception이 나면 당연히 rollback\" | Spring 기본 규칙에서는 commit될 수 있다 | `rollbackFor` 또는 예외 계층 정책을 확인한다 |\n| \"`REQUIRES_NEW`는 더 안전하다\" | outer rollback과 분리되어 일부 상태가 남을 수 있고 connection 비용도 든다 | 분리 commit이 비즈니스적으로 맞는지 먼저 묻는다 |\n| \"@Transactional 테스트가 통과했으니 운영 commit도 안전하다\" | 테스트-managed rollback이 commit 이후 listener/visibility를 가릴 수 있다 | commit-visible 테스트를 별도로 둔다 |\n| \"외부 API 호출도 transaction 안에 넣으면 같이 rollback된다\" | 외부 시스템 side effect는 DB rollback으로 취소되지 않는다 | after-commit, outbox, compensation, idempotency를 설계한다 |\n\n## 빠른 체크\n\n| 질문 | 판단 |\n|---|---|\n| 한 유스케이스의 상태 변경인가 | service/application method 경계 |\n| 외부 I/O가 섞였는가 | commit 밖으로 분리 후보 |\n| 테스트가 rollback 안쪽만 보는가 | commit-visible 보강 후보 |\n| 여러 repository가 각각 commit하는가 | transaction owner 불명확 신호 |\n| checked exception이 밖으로 나가는가 | 기본 commit 가능성 확인 |\n| propagation이 transaction을 나누는가 | partial commit/rollback-only 확인 |\n| after-commit listener가 핵심인가 | 실제 commit 테스트 필요 |\n\n## 복습 포인트\n\n정답은 \"`@Transactional`을 붙이면 안전하다\"가 아니다. 함께 commit되어야 하는 범위, rollback 대상 예외, 외부 시스템과의 보상 전략, 테스트가 실제 commit을 보는지까지 말해야 한다.\n\n## 검증 질문\n\n1. 이 유스케이스에서 함께 commit되어야 하는 DB 변경 목록은 무엇인가?\n2. 예외가 runtime exception인지 checked exception인지, proxy boundary 밖으로 전파되는지 확인했는가?\n3. checked exception을 rollback해야 한다면 `rollbackFor`나 예외 타입 정책이 명시되어 있는가?\n4. `REQUIRED`/`REQUIRES_NEW`/`NESTED` 선택이 partial commit이나 rollback-only를 만들 가능성은 없는가?\n5. 외부 결제, 알림, 쿠폰 발급은 DB commit 전 실행인지 after-commit 실행인지 설명할 수 있는가?\n6. 테스트가 `flush`만 확인하는지, 실제 commit 이후 listener와 다른 transaction visibility까지 확인하는지 구분했는가?\n\n## 짧은 모범 답변\n\n트랜잭션 경계는 repository 개수가 아니라 유스케이스가 함께 확정해야 하는 상태 변경으로 잡습니다. `flush`는 DB로 SQL을 보내는 동기화이고 `commit`은 확정이므로 after-commit listener나 다른 transaction 가시성은 별도 검증이 필요합니다. Spring 기본 rollback은 runtime exception 중심이고 checked exception은 commit될 수 있으므로, propagation과 테스트 rollback masking까지 같이 확인해야 합니다.\n",
   "aliases": [
     "트랜잭션 경계 드릴",
-    "Transaction Boundary Commit / 개념",
-    "Transaction Boundary Commit / 정리",
-    "Transaction Boundary Commit / 실수",
-    "Transaction Boundary Commit / 판단 기준",
     "transaction boundary mission drill",
     "commit rollback boundary drill",
     "@Transactional mission exercise",
     "service transaction drill",
     "@DataJpaTest",
     "@SpringBootTest",
-    "transaction boundary commit rollback guide"
+    "transaction boundary commit rollback guide",
+    "미션에서 commit owner 찾는 연습",
+    "결제 실패 시 어디까지 rollback될까"
   ],
   "expected_queries": [
     "미션 코드에서 @Transactional 경계를 문제로 연습하고 싶어",
@@ -52,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/transaction-boundary-commit-rollback-mission-drill.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch163"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

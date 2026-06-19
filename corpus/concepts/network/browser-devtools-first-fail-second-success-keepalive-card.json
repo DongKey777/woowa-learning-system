@@ -6,10 +6,6 @@
   "summary": "한동안 idle이던 뒤 같은 요청이 처음은 실패하고 바로 다음은 성공하면, DevTools row 두 줄을 나란히 놓고 \"stale idle connection 재사용 실패 후 새 연결 성공\" 후보를 먼저 읽는 편이 빠르다.",
   "body_markdown": "# Browser DevTools 첫 실패 후 두 번째 성공 trace 카드\n\n> 한 줄 요약: 한동안 idle이던 뒤 같은 요청이 `처음은 실패`하고 `바로 다음은 성공`하면, DevTools row 두 줄을 나란히 놓고 \"stale idle connection 재사용 실패 후 새 연결 성공\" 후보를 먼저 읽는 편이 빠르다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Keep-Alive 켰는데 왜 idle 뒤 첫 요청만 실패할까? (Stale Idle Connection Primer)](./keepalive-reuse-stale-idle-connection-primer.md)\n- [Browser DevTools Waterfall Primer: DNS, Connect, SSL, Waiting 읽기](./browser-devtools-waterfall-primer.md)\n- [Browser DevTools 첫 확인 체크리스트 1분판](./browser-devtools-first-checklist-1minute-card.md)\n- [HTTP keep-alive vs TCP keepalive vs idle timeout vs heartbeat](./http-keep-alive-vs-tcp-keepalive-idle-timeout-heartbeat-primer.md)\n- [Spring WebClient Connection Pool / Timeout Tuning](../spring/spring-webclient-connection-pool-timeout-tuning.md)\n- [network 카테고리 인덱스](./README.md)\n\nretrieval-anchor-keywords: devtools first fail second success, first request after idle fails, retry succeeds after idle, stale idle connection trace, keep-alive retry pattern, network tab same url twice, waterfall idle first fail, 왜 첫 요청만 실패해요, 처음 실패하고 두번째 성공, keepalive timeout mismatch trace, failed then 200 devtools, idle 뒤 첫 요청 실패, what is stale idle reuse, browser network retry after idle\n\n## 핵심 개념\n\n이 카드는 \"원인 확정\" 문서가 아니라 **trace 첫 판독 카드**다.  \n한동안 조용했다가 같은 URL이 거의 연달아 두 번 보이고, 첫 줄은 `(failed)`나 reset 계열 실패 후보이고 둘째 줄은 `200`/`204`처럼 성공이면, 먼저 떠올릴 질문은 \"앱이 두 번 호출했나?\"보다 \"idle 동안 죽은 연결을 재사용했다가 새 연결로 다시 갔나?\"다.\n\n다만 이 패턴이 항상 keep-alive 문제라는 뜻은 아니다. 자동 retry 여부는 브라우저, 프록시, HTTP 클라이언트, 메서드 멱등성에 따라 다르고, `POST`나 부작용 있는 요청은 같은 방식으로 재시도되지 않을 수 있다. 이 카드는 **증상 후보를 빨리 좁히는 법**까지만 다룬다.\n\n## 한눈에 보기\n\n| DevTools에서 보이는 묶음 | 먼저 붙일 해석 | 왜 그렇게 보나 |\n|---|---|---|\n| idle 뒤 같은 URL 두 줄, 첫 줄 `(failed)`, 둘째 줄 `200` | stale idle connection reuse 후보 | 첫 시도는 죽은 연결, 다음 시도는 새 연결일 수 있다 |\n| 첫 줄에는 `dns/connect/ssl`이 거의 없고 둘째 줄에서 새 연결 흔적이 보임 | \"재사용 실패 -> 새 연결 성공\" 쪽 근거가 강해진다 | 첫 줄은 기존 소켓을 믿었고, 둘째 줄은 다시 붙었을 수 있다 |\n| 첫 줄과 둘째 줄의 `Connection ID` 또는 `Remote Address`가 바뀜 | 앱 중복 호출보다 recovery trace 후보 | 같은 URL이어도 다른 연결/경로일 수 있다 |\n| 같은 URL 두 줄이지만 둘 다 `200`이고 간격도 규칙적 | retry보다 앱/프론트 중복 호출 후보 | 실패 복구가 아니라 의도적 두 번 호출일 수 있다 |\n\n짧게 외우면 이렇다.\n\n```text\nidle 뒤 first fail + immediate success\n= stale idle reuse / keep-alive timeout mismatch 후보부터 본다\n```\n\n## 어떻게 읽나\n\n### 1. 먼저 \"같은 요청 두 줄\"인지 확인한다\n\nURL만 같다고 끝내지 말고 method, query, initiator, 시간 간격을 같이 본다.\n\n- 같은 method와 거의 같은 payload인가\n- 둘째 줄이 첫 줄 직후 수십~수백 ms 안에 붙는가\n- JS가 의도적으로 두 번 호출한 증거가 있는가\n\n이 단계의 목적은 \"진짜 retry 후보\"와 \"원래 두 번 호출\"을 먼저 가르는 것이다.\n\n### 2. 첫 줄이 실패 메모인지, 숫자 응답인지 본다\n\n가장 흔한 첫 줄은 `(failed)` 같은 브라우저 메모지만, 환경에 따라 `502`, `503`, `504`, `connection reset`에 가까운 증상으로 보일 수도 있다. 즉 첫 줄의 표현은 구현마다 다를 수 있고, 중요한 것은 **idle 뒤 첫 시도가 재사용 지점에서 깨졌는가**다.\n\n초기 판독에 유용한 칸은 아래 넷이다.\n\n- `Status`: 실패 메모인지 숫자 응답인지\n- `Waterfall`: 첫 줄에 새 연결 준비가 거의 없었는지\n- `Connection ID`: 둘째 줄에서 새 연결로 갈아탔는지\n- `Remote Address`: 목적지나 edge가 바뀌었는지\n\n### 3. waterfall에서 \"첫 줄은 reuse, 둘째 줄은 reconnect\" 흔적을 찾는다\n\n이 패턴에서는 첫 줄이 기존 keep-alive 연결을 믿고 시작해서 `dns/connect/ssl`이 거의 안 보일 수 있다. 반대로 둘째 줄은 실패 뒤 새 연결을 만들면서 `connect`나 `ssl`이 다시 보이거나, 적어도 `Connection ID`가 달라질 수 있다.\n\n브라우저와 프로토콜에 따라 표시 방식은 다르다. 특히 HTTP/2나 HTTP/3에서는 waterfall만으로 단정하기보다 `Connection ID`, `Remote Address`, timing 변화를 함께 보는 편이 안전하다.\n\n### 4. 이렇게 메모하면 오분류가 줄어든다\n\n```text\nidle 뒤 같은 URL 2줄\n1차 실패: reused connection 후보\n2차 성공: new connection retry 후보\n다음 확인: keep-alive timeout / pool idle timeout / proxy idle timeout\n```\n\n## 흔한 오해와 함정\n\n- \"`같은 URL이 두 번 보이니 프론트가 버그로 두 번 쐈다`\"라고 바로 단정한다. 먼저 첫 줄 실패 여부와 시간 간격을 본다.\n- \"`retry succeeds`면 서버가 잠깐 느렸나 보다\"라고 넘긴다. idle 뒤에만 반복되면 stale idle reuse가 더 설명력이 높다.\n- waterfall에 `connect/ssl`이 안 보여서 네트워크 문제가 아니라고 생각한다. 오히려 기존 연결 재사용 시도였을 수 있다.\n- 이 패턴을 모든 메서드에 똑같이 적용한다. 자동 retry는 보통 안전한 요청에서 더 흔하고, `POST`는 브라우저/라이브러리/프록시에 따라 보수적으로 달라진다.\n- keep-alive가 켜져 있으면 항상 좋은 일만 생긴다고 생각한다. keep-alive는 재사용 기능이지, timeout 불일치를 자동으로 해결해 주는 기능이 아니다.\n\n## 실무에서 쓰는 모습\n\n아래 같은 trace라면 초급자보다 한 단계 더 나아간 1차 메모를 남길 수 있다.\n\n| 순서 | URL | Status | Waterfall 단서 | Connection ID | 첫 해석 |\n|---|---|---|---|---|---|\n| 1 | `GET /api/me` | `(failed)` | `dns/connect/ssl` 거의 없음 | `18` | 기존 idle 연결 reuse 실패 후보 |\n| 2 | `GET /api/me` | `200` | 바로 뒤 새 연결 timing 후보 | `24` | 새 연결 성공 후보 |\n\n반대로 아래 장면은 이 카드보다 \"중복 호출\" 쪽으로 먼저 읽는 편이 낫다.\n\n| 순서 | URL | Status | Connection ID | 첫 해석 |\n|---|---|---|---|---|\n| 1 | `GET /api/me` | `200` | `18` | 정상 응답 |\n| 2 | `GET /api/me` | `200` | `18` | 같은 연결에서 반복 호출된 앱/프론트 동작 후보 |\n\ntrace를 보고 팀에 한 줄로 공유할 때는 아래 정도면 충분하다.\n\n```text\nidle 뒤 첫 GET만 실패하고 바로 재시도는 성공.\nDevTools상 same URL 2줄이며 첫 줄은 reused connection 실패, 둘째 줄은 new connection 성공 후보.\nkeep-alive idle timeout mismatch / stale idle connection 먼저 확인 필요.\n```\n\n## 더 깊이 가려면\n\n- 증상 자체를 먼저 잡으려면 [Keep-Alive 켰는데 왜 idle 뒤 첫 요청만 실패할까? (Stale Idle Connection Primer)](./keepalive-reuse-stale-idle-connection-primer.md)\n- waterfall 칸 의미를 다시 읽으려면 [Browser DevTools Waterfall Primer: DNS, Connect, SSL, Waiting 읽기](./browser-devtools-waterfall-primer.md)\n- DevTools 네 칸 첫 판독 순서를 더 짧게 복습하려면 [Browser DevTools 첫 확인 체크리스트 1분판](./browser-devtools-first-checklist-1minute-card.md)\n- 용어를 `keep-alive`/`tcp keepalive`/`idle timeout`으로 나누려면 [HTTP keep-alive vs TCP keepalive vs idle timeout vs heartbeat](./http-keep-alive-vs-tcp-keepalive-idle-timeout-heartbeat-primer.md)\n- Java/Spring 클라이언트 풀 설정으로 이어 보려면 [Spring WebClient Connection Pool / Timeout Tuning](../spring/spring-webclient-connection-pool-timeout-tuning.md)\n\n## 한 줄 정리\n\nidle 뒤 `처음 실패하고 바로 다음은 성공`하는 trace는 DevTools에서 같은 URL 두 줄과 연결 재사용 단서를 함께 보고, stale idle connection 재사용 실패 후 새 연결 성공 후보를 먼저 적는 것이 가장 빠르다.\n",
   "aliases": [
-    "Browser DevTools 첫 실패 개념",
-    "Browser DevTools 첫 실패 정리",
-    "Browser DevTools 첫 실패 실수",
-    "Browser DevTools 첫 실패 판단 기준",
     "네트워크 Browser DevTools 첫 실패",
     "first fail second success",
     "stale idle connection trace",
@@ -17,7 +13,9 @@
     "keepalive timeout mismatch",
     "failed then 200 devtools",
     "idle first request fails",
-    "browser devtools first fail guide"
+    "browser devtools first fail guide",
+    "idle 후 첫 요청만 실패해",
+    "같은 URL 실패했다가 바로 성공"
   ],
   "expected_queries": [
     "idle 뒤 첫 요청은 failed인데 두 번째는 200이면 무엇부터 의심해야 해?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/browser-devtools-first-fail-second-success-keepalive-card.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

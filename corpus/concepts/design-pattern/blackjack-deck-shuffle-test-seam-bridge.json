@@ -7,17 +7,13 @@
   "body_markdown": "# Blackjack Deck Shuffle Test Seam Bridge\n\n## 한 줄 요약\n\n블랙잭 game flow 테스트는 `Random`을 예측하려는 문제가 아니라 \"이번 라운드에 공급될 카드 순서\"를 통제하는 문제다. 셔플은 덱 준비 경계에서 다루고, 라운드 규칙은 결정적인 `CardSource`나 fake deck으로 검증한다.\n\n## 미션 장면\n\n블랙잭에서 학습자가 자주 겪는 문제는 \"카드가 랜덤이라 테스트가 가끔 깨져요\"이다. 여기서 분리해야 할 것은 셔플을 잘했는지와, 정해진 카드 순서에서 게임 흐름이 맞는지다. 게임 흐름 테스트에는 카드 공급 순서를 고정하는 랜덤 이음새(test seam)가 필요하다. `Deck`이 내부에서 바로 `Collections.shuffle()`을 호출하고 service가 그 `Deck`을 직접 만들면 player blackjack, dealer bust, push를 같은 입력으로 재현하기 어렵다.\n\n블랙잭은 racingcar처럼 숫자 하나만 고정하면 끝나는 구조가 아니다. 처음 두 장은 player와 dealer에게 번갈아 배분되고, 이후 hit는 같은 덱에서 이어서 소비된다. 그래서 test seam은 \"다음 난수\"보다 \"다음 카드\"에 가까워야 한다. 흐름 테스트가 검증하고 싶은 것은 셔플 품질이 아니라, `A, K, 10, 6, 9` 같은 공급 순서에서 player blackjack이나 dealer bust가 항상 같은 결과로 닫히는지다.\n\n## 경계 나누기\n\n| 관심사 | 책임을 둘 곳 | 테스트에서 고정할 것 |\n|---|---|---|\n| 52장 덱 생성과 셔플 | `DeckFactory`, `Shuffler`, production `Deck` 초기화 | 셔플 후 52장 보존, 중복 없음, 모든 카드 포함 |\n| 라운드 진행과 카드 소비 | `Game`, `Round`, `DealerTurn`이 의존하는 `CardSource` | 카드가 앞에서부터 한 장씩 소비되는 순서 |\n| 점수, bust, winner | `Hand`, `Score`, `WinnerPolicy` 같은 도메인 규칙 | 이미 받은 손패와 최종 상태 |\n\n이렇게 나누면 `Random` 주입은 덱 준비 테스트의 선택지가 되고, 라운드 흐름 테스트의 핵심은 deterministic card source가 된다. seed를 고정한 `Random`으로 flow 테스트를 통과시키는 방식은 카드 배분 순서나 JDK shuffle 구현에 묶일 수 있다. 리뷰에서 더 강한 답은 \"seed를 맞췄습니다\"가 아니라 \"flow 테스트에는 카드를 직접 공급하고, shuffle은 별도 invariant로 봅니다\"이다.\n\n## 설계 스케치\n\n도메인 규칙은 카드가 어디서 왔는지보다 \"다음 카드가 무엇인가\"만 알면 된다.\n\n```java\npublic interface CardSource {\n    Card draw();\n}\n```\n\nProduction에서는 전체 카드 목록을 만들고 섞은 `Deck`이 `CardSource` 역할을 해도 된다. 중요한 점은 `GameService`나 `Round`가 `new Deck()`과 `Collections.shuffle()`을 직접 호출하지 않는 것이다. 조립 경계에서 `DeckFactory`가 섞인 덱을 만들고, round는 이미 준비된 `CardSource`를 받는다.\n\n```java\nRound round = new Round(deckFactory.shuffledDeck());\n```\n\n테스트에서는 queue 기반 fake가 충분하다.\n\n```java\nfinal class FixedCardSource implements CardSource {\n    private final Queue<Card> cards;\n\n    FixedCardSource(List<Card> cards) {\n        this.cards = new ArrayDeque<>(cards);\n    }\n\n    public Card draw() {\n        if (cards.isEmpty()) {\n            throw new IllegalStateException(\"no card left\");\n        }\n        return cards.remove();\n    }\n}\n```\n\n이 fake는 내부 shuffle 호출을 확인하기 위한 mock이 아니다. player 첫 카드, dealer 첫 카드, player 둘째 카드, dealer 둘째 카드, dealer hit 카드처럼 소비 순서를 재현하기 위한 도구다. 테스트가 `draw()` 호출 횟수만 검증하면 구현 세부에 묶인다. 테스트는 같은 카드 순서에서 같은 hand, bust, winner result가 나오는지를 봐야 한다.\n\n## 리뷰에서 보이는 냄새\n\n테스트가 원하는 카드가 나올 때까지 반복하거나, seed 값을 바꿔 맞추거나, `Deck.shuffle()` 호출 여부를 mock으로 검증하면 리뷰에서 냄새가 난다. 그 테스트는 \"게임 결과\"가 아니라 \"내부 구현 순서\"에 묶인다. 더 나쁜 신호는 테스트를 위해 production 코드에 `if (test)`나 `shuffle=false` 플래그가 들어가는 경우다.\n\n또 다른 냄새는 `GameService`가 라운드 시작, 덱 생성, 셔플, 카드 배분, 승패 판정을 모두 갖는 것이다. 이 구조에서는 테스트 더블을 넣을 자리가 없어 service 테스트가 실제 random과 콘솔 입력까지 끌고 들어온다. 경계를 바꾸면 service는 라운드 조립과 유스케이스 흐름을 담당하고, 도메인은 받은 카드로 규칙을 닫으며, randomness는 adapter나 factory 쪽에 머문다.\n\n## 개념 문서 handoff\n\n개선 방향은 카드 공급자(card source)를 주입 가능한 경계로 두는 것이다. 이름은 `Deck`, `CardProvider`, `CardSource` 중 무엇이어도 되지만, 테스트에서는 미리 정한 카드 목록을 앞에서부터 반환하는 결정적 덱(deterministic fake deck)을 넣을 수 있어야 한다. Production 구현은 초기화 시 한 번 섞은 뒤 draw만 담당한다. shuffle 테스트는 \"52장 유지\", \"중복 없음\", \"순열 가능\"처럼 덱 자체의 불변식(invariant)을 본다.\n\n리뷰에서는 interface 여부보다 책임 경계가 먼저다. game flow 테스트가 `A, K, 10, 6` 같은 순서를 주입해 같은 결과를 얻는가? draw 한 번에 카드가 한 장 소비되고, 덱이 비었을 때 정책이 명확한가? 이 질문에 답하면 seam이 실제로 유효하다.\n\n## 검증 체크리스트\n\n- player blackjack, dealer bust, push, player hit 후 bust를 각각 고정 카드 목록으로 재현한다.\n- 테스트는 `shuffle()`이 호출됐는지보다 최종 hand, score, winner result를 검증한다.\n- draw 한 번은 카드 한 장만 소비하고, 이미 소비된 카드는 다시 나오지 않는다.\n- 카드 부족은 조용히 `null`을 반환하지 않고 명확한 예외나 실패 정책으로 드러난다.\n- full deck 생성/셔플 검증은 라운드 flow 테스트와 분리해 52장 보존, 중복 없음, 전체 카드 포함을 본다.\n- production randomness는 factory, shuffler, adapter 같은 조립 경계에 두고 도메인 규칙 안으로 숨기지 않는다.\n\n## Drill 후보\n\n\"Deck을 interface로 만들면 항상 좋은가?\"로 복습한다. 기대 답변은 아니다. 랜덤을 통제해야 하는 테스트가 있고, 그 seam이 round 재현 비용을 줄일 때 유효하다. 패턴 이름보다 draw 순서, 카드 소비, shuffle 책임을 설명해야 한다.\n",
   "aliases": [
     "블랙잭 덱 셔플 테스트 seam",
-    "Blackjack Deck Shuffle Test 개념",
-    "Blackjack Deck Shuffle Test 정리",
-    "Blackjack Deck Shuffle Test 실수",
-    "Blackjack Deck Shuffle Test 판단 기준",
     "blackjack deck shuffle test seam",
     "deterministic deck mission bridge",
     "card draw random strategy",
     "fixed card source blackjack",
     "blackjack deck factory boundary",
-    "blackjack deck shuffle test guide",
-    "blackjack deck shuffle test checklist"
+    "블랙잭 카드 순서 테스트 고정",
+    "Deck 랜덤 셔플을 테스트에서 빼기"
   ],
   "expected_queries": [
     "blackjack deck shuffle 때문에 테스트가 랜덤이면 어떻게 해?",
@@ -51,12 +47,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/design-pattern/blackjack-deck-shuffle-test-seam-bridge.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch157"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 6 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

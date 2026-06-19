@@ -6,10 +6,6 @@
   "summary": "WAND와 Block-Max WAND는 posting list의 score upper bound와 현재 top-k threshold를 비교해 \"절대 top-k에 못 들어갈 문서\"를 건너뛰는 inverted index 동적 pruning 기법이다.",
   "body_markdown": "# Inverted Index WAND / Block-Max WAND Chooser\n\n> 한 줄 요약: WAND와 Block-Max WAND는 posting list의 score upper bound와 현재 top-k threshold를 비교해 \"절대 top-k에 못 들어갈 문서\"를 건너뛰는 inverted index 동적 pruning 기법이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Search Inverted Index Interview Primer](../system-design/search-inverted-index-interview-primer.md)\n> - [Search 시스템 설계](../system-design/search-system-design.md)\n> - [Search Indexing Pipeline 설계](../system-design/search-indexing-pipeline-design.md)\n> - [Elias-Fano Encoded Posting List](./elias-fano-encoded-posting-list.md)\n> - [고차원 벡터 양자화 — PQ vs OPQ vs RVQ chooser](./vector-quantization-rvq-pq-opq-chooser.md)\n\n> retrieval-anchor-keywords: wand algorithm, block-max wand, bmwand, maxscore, dynamic pruning, top-k retrieval pruning, posting list upper bound, bm25 pruning, inverted index wand, exact top-k pruning, disjunctive query pruning\n\n## 먼저 잡을 출처 맥락\n\n[Search Inverted Index Interview Primer](../system-design/search-inverted-index-interview-primer.md)는 term에서 posting list로 가는 구조를 설명한다. 이 문서는 그 다음 단계다. query term이 여러 개일 때 검색 엔진은 각 term의 posting list를 열고, 문서별 BM25 같은 점수를 합산해 top-k를 뽑아야 한다. 단순 구현은 query term의 posting을 모두 훑고 모든 후보 문서를 채점한 뒤 정렬한다. WAND와 Block-Max WAND의 질문은 \"정답 top-k는 그대로 두면서, 채점 자체를 얼마나 덜 할 수 있는가\"다.\n\n여기서 [Elias-Fano Encoded Posting List](./elias-fano-encoded-posting-list.md)는 posting list를 작게 들고 skip/select를 가능하게 하는 저장 형식 쪽 문서다. WAND는 저장 형식보다 query execution 알고리즘에 가깝다. 압축된 posting list든 일반 docID 배열이든, cursor advance와 upper bound metadata가 있으면 같은 사고를 적용할 수 있다.\n\n## 기본 재료: Posting, Upper Bound, Threshold\n\n각 query term `t`는 posting list를 가진다. posting에는 보통 docID, term frequency, field 정보, position 같은 값이 있고, ranking 시점에는 \"이 term이 이 문서 점수에 기여할 수 있는 값\"으로 바뀐다. BM25라면 term frequency, document length, idf가 score contribution을 만든다.\n\nWAND 계열이 쓰는 핵심 metadata는 upper bound다. `UB(t)`는 term `t`가 어떤 문서에 기여할 수 있는 최대 점수다. query가 `spring security session`이라면 각 term의 posting list마다 \"이 term 하나로 최대 몇 점까지 줄 수 있는가\"를 알고 있다고 생각하면 된다. 여러 term의 upper bound 합이 현재 top-k heap의 최저 점수, 즉 threshold보다 작거나 같다면 그 조합은 top-k를 이길 수 없다.\n\nthreshold는 top-k heap이 채워진 뒤부터 의미가 커진다. k=10이면 일단 10개 문서가 들어간 순간 10등 점수가 threshold가 된다. 이후 어떤 후보의 가능한 최대 점수가 threshold를 넘지 못하면 exact score를 계산하지 않고 건너뛸 수 있다.\n\n## WAND의 선택 기준\n\nWAND는 posting cursor들을 현재 docID 기준으로 정렬해 보며 pivot을 찾는다. 작은 docID 쪽 cursor부터 upper bound를 더하다가 합이 threshold를 넘는 지점이 pivot이다. pivot 전까지의 term들만으로는 threshold를 넘을 가능성이 없고, pivot까지 포함해야 가능성이 생긴다는 뜻이다.\n\n이때 pivot docID보다 작은 cursor들은 pivot docID까지 advance할 수 있다. 어떤 문서가 여러 posting list에 나타나더라도, 그 문서가 top-k를 이길 가능성이 없다면 모든 term score를 계산할 필요가 없다. 반대로 pivot까지 필요한 posting들이 같은 docID에 모이면 그 문서는 실제 score를 계산한다. 계산 결과가 top-k heap에 들어가면 threshold가 올라가고, 이후 pruning은 더 공격적으로 된다.\n\nWAND가 잘 맞는 장면은 disjunctive query다. OR 성격으로 후보가 넓고, 흔한 term의 posting list가 길고, top-k만 필요할 때 효과가 크다. 반대로 후보가 원래 작거나, AND filter가 먼저 강하게 줄여 주거나, k가 너무 크면 threshold가 늦게 올라가 pruning 효과가 작다.\n\n## Block-Max WAND의 추가 차이\n\nBlock-Max WAND는 term 전체 upper bound만 보지 않는다. posting list를 docID range block으로 나누고, 각 block마다 max score를 저장한다. 예를 들어 term `spring`의 전체 `UB`는 7.2일 수 있지만, docID 100000-100999 block에서는 그 term이 최대 1.1점밖에 못 줄 수 있다. WAND가 전역 upper bound로 \"가능할지도 모른다\"고 보는 후보를, Block-Max WAND는 block-local upper bound로 더 많이 버릴 수 있다.\n\n대신 index metadata가 늘어난다. block 경계, block max score, block skip 정보가 필요하고, analyzer나 scoring formula가 바뀌면 이 metadata도 재생성해야 한다. [Search Indexing Pipeline 설계](../system-design/search-indexing-pipeline-design.md)의 reindex, backfill, alias cutover가 중요한 이유다. ranking feature를 추가했는데 block max가 그 feature를 반영하지 않으면 pruning이 안전하지 않다.\n\nBlock-Max WAND는 score 분포가 block마다 많이 다를수록 유리하다. 흔한 term이라도 어떤 block에서는 거의 낮은 tf만 나오고, 다른 block에서는 field boost가 강할 수 있다. 그런 차이를 block max가 잡아 주면 cursor가 통째로 다음 block으로 건너뛴다.\n\n## Exact와 Approximate를 구분하기\n\nWAND와 Block-Max WAND는 원칙적으로 exact top-k 알고리즘이다. \"정확한 scoring function에 대해 안전한 upper bound를 갖고 있고, pruning 조건이 그 upper bound만 사용한다\"면 exhaustive scoring과 같은 top-k를 반환한다. 계산하지 않은 문서는 top-k에 들어갈 수 없다는 증명이 있기 때문이다.\n\n이 점이 HNSW, PQ/OPQ 같은 ANN/양자화 문서와 다르다. HNSW는 후보 탐색 자체가 근사라서 nearest neighbor를 놓칠 수 있다. PQ/OPQ는 거리 계산이 원본 벡터 거리의 근사다. 반면 WAND는 lexical inverted index 위에서 불가능한 후보를 안전하게 버리는 pruning이다.\n\n다만 제품 구현은 approximate 모드로 변할 수 있다. 예를 들어 impact-ordered list에서 early termination을 강하게 걸거나, upper bound가 일부 ranking feature를 빠뜨리거나, learned reranker 점수를 1차 pruning bound에 포함하지 못하는데도 최종 top-k 보장을 주장하면 exact가 아니다. \"WAND를 썼다\"가 아니라 \"어떤 scoring stage까지 exact를 보장하나\"를 물어야 한다.\n\n## 선택표\n\n| 상황 | 먼저 볼 후보 | 이유 |\n|---|---|---|\n| BM25 top-k를 exhaustive scoring과 같은 결과로 빠르게 내고 싶다 | WAND | per-term upper bound와 heap threshold로 안전 pruning |\n| 긴 posting list에서 block별 score 편차가 크다 | Block-Max WAND | block-local max로 더 많은 range skip |\n| semantic vector nearest neighbor가 목표다 | HNSW / vector index | posting list score pruning 문제가 아니다 |\n| 권한/품절/tenant filter가 강하다 | filter-aware execution | pruning 전에 후보 공간이 달라질 수 있다 |\n| phrase/proximity 점수가 최종 ranking에 크다 | two-phase scoring 주의 | upper bound가 phrase 점수를 안전하게 포함해야 한다 |\n\n## 운영 함정\n\n상한은 반드시 안전해야 한다. 실제 점수가 upper bound를 넘는 문서가 하나라도 있으면 pruning이 정답을 버릴 수 있다. field boost, recency boost, popularity, personalization을 더한다면 그 feature의 최대 기여도도 bound에 들어가야 한다.\n\nshard도 주의한다. 각 shard에서 local top-k를 뽑고 coordinator가 merge한다면 shard-local threshold와 global threshold의 관계를 설계해야 한다. shard별 document distribution이 다르면 어떤 shard에서는 threshold가 빨리 올라가고 다른 shard에서는 pruning이 약할 수 있다.\n\n마지막으로 WAND는 결과 품질을 올리는 ranking 함수가 아니다. 같은 scoring function을 더 적은 채점으로 실행하는 방법이다. no-result, analyzer mismatch, freshness gap, ACL leak 같은 문제는 [Search 시스템 설계](../system-design/search-system-design.md)와 [Document Search / Ranking Platform 설계](../system-design/document-search-ranking-platform-design.md)의 영역이다.\n\n## 한 줄 정리\n\nWAND는 term 단위 upper bound와 top-k threshold로 문서 채점을 줄이고, Block-Max WAND는 그 bound를 block 단위로 더 날카롭게 만든다. upper bound가 안전하면 exact top-k pruning이고, ANN처럼 recall을 의도적으로 포기하는 방법이 아니다.\n",
   "aliases": [
-    "Inverted Index WAND / 개념",
-    "Inverted Index WAND / 정리",
-    "Inverted Index WAND / 실수",
-    "Inverted Index WAND / 판단 기준",
     "자료구조 Inverted Index WAND /",
     "wand algorithm",
     "block-max wand",
@@ -17,7 +13,9 @@
     "maxscore",
     "dynamic pruning",
     "top-k retrieval pruning",
-    "posting list upper bound"
+    "posting list upper bound",
+    "검색 결과 top k 안전하게 건너뛰기",
+    "역색인 점수 상한 pruning"
   ],
   "expected_queries": [
     "WAND와 Block-Max WAND는 posting list에서 top-k 후보를 어떻게 안전하게 건너뛰어?",
@@ -53,12 +51,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/data-structure/inverted-index-wand-block-max-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

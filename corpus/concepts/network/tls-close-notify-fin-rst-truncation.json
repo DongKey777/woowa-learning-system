@@ -6,10 +6,6 @@
   "summary": "TCP의 FIN과 RST는 연결 종료를 말할 뿐이고, TLS의 close_notify는 암호화된 바이트 스트림이 정상적으로 끝났다는 신호라서 둘을 혼동하면 truncation과 EOF 해석이 흔들린다.",
   "body_markdown": "# TLS close_notify, FIN/RST, Truncation\n\n> 한 줄 요약: TCP의 `FIN`과 `RST`는 연결 종료를 말할 뿐이고, TLS의 `close_notify`는 암호화된 바이트 스트림이 정상적으로 끝났다는 신호라서 둘을 혼동하면 truncation과 EOF 해석이 흔들린다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [FIN, RST, Half-Close, EOF](./fin-rst-half-close-eof-semantics.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [mTLS Handshake Failure Diagnosis](./mtls-handshake-failure-diagnosis.md)\n> - [TLS Certificate Chain, OCSP Stapling Failure Modes](./tls-certificate-chain-ocsp-stapling-failure-modes.md)\n> - [Connection Draining vs FIN/RST Graceful Close](./connection-draining-vs-fin-rst-graceful-close.md)\n\nretrieval-anchor-keywords: TLS close_notify, truncation, FIN, RST, EOF, TLS shutdown, SSL_ERROR_ZERO_RETURN, SSL_ERROR_SYSCALL, graceful close, encrypted stream end, truncation attack\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nTLS는 TCP 위에 올라가지만, 종료 의미는 TCP와 완전히 같지 않다.\n\n- TCP `FIN`: 더 이상 보낼 바이트가 없다는 뜻\n- TCP `RST`: 연결 상태를 즉시 버리라는 뜻\n- TLS `close_notify`: 암호화된 레코드 스트림이 정상적으로 끝났다는 뜻\n\n따라서 애플리케이션은 \"소켓이 닫혔다\"만 보지 말고, **TLS 계층이 정상 종료를 확인했는지**도 같이 봐야 한다.\n\n### Retrieval Anchors\n\n- `TLS close_notify`\n- `truncation`\n- `FIN`\n- `RST`\n- `EOF`\n- `TLS shutdown`\n- `SSL_ERROR_ZERO_RETURN`\n- `SSL_ERROR_SYSCALL`\n\n## 깊이 들어가기\n\n### 1. 왜 TLS는 별도 종료 신호가 필요한가\n\nTLS는 평문 바이트가 아니라 암호화된 record를 주고받는다.\n\n- 마지막 record가 정상적으로 끝났는지\n- 중간에서 잘려 나간 것은 아닌지\n- peer가 의도적으로 종료했는지\n\n를 알기 위해 `close_notify` alert를 쓴다.\n\n즉 TCP FIN만으로는 \"전송이 끝났다\"를 말할 수 있어도, **TLS record가 온전하게 끝났다**를 충분히 말해 주지 못한다.\n\n### 2. `close_notify` 없이 FIN만 오면 왜 애매한가\n\n이 경우 라이브러리와 프로토콜에 따라 해석이 달라질 수 있다.\n\n- 일부는 그냥 EOF처럼 본다\n- 일부는 truncation 가능성이 있다고 경고한다\n- HTTP처럼 Content-Length나 framing이 있는 상위 프로토콜은 덜 위험할 수 있다\n\n하지만 framing이 약하거나 application-level integrity가 약하면 문제를 놓칠 수 있다.\n\n### 3. proxy와 TLS termination 지점이 많을수록 더 헷갈린다\n\n다음 경로를 생각해 보자.\n\n- client <-> edge LB TLS\n- edge LB <-> ingress TLS\n- ingress <-> app plain TCP 또는 TLS\n\n한 홉에서 `close_notify`가 잘 갔더라도 다른 홉에서는 그냥 FIN/RST로 끝날 수 있다.  \n그래서 \"TLS는 정상 종료\"와 \"소켓은 정상 종료\"가 홉마다 다를 수 있다.\n\n### 4. truncation은 \"중간까지만 읽고 성공처럼 보이는\" 상황이다\n\n예를 들어:\n\n- response body가 아직 남았는데 연결이 닫혔다\n- app이 EOF를 성공으로 처리했다\n- 상위 프로토콜 framing 검증이 약했다\n\n그러면 부분 응답을 완전한 응답처럼 오해할 수 있다.\n\n특히 프록시나 라이브러리가 EOF를 너무 관대하게 다루면, 실제 원인인 RST 또는 비정상 종료가 묻힐 수 있다.\n\n### 5. graceful drain에서도 TLS shutdown 순서가 중요하다\n\n배포나 drain 중에는 보통:\n\n- 새 요청은 받지 않게 하고\n- 진행 중 응답을 마무리하고\n- 가능하면 TLS `close_notify` 후 TCP FIN으로 닫는 편이 안전하다\n\n반대로 시간을 아끼려고 바로 RST를 보내면:\n\n- client는 `connection reset`\n- TLS 라이브러리는 비정상 종료\n- 일부 응답은 truncation처럼 보일 수 있다\n\n### 6. EOF와 TLS alert를 구분해서 관찰해야 한다\n\n운영에서 다음 로그는 같은 말이 아니다.\n\n- plain EOF\n- `SSL_ERROR_ZERO_RETURN`\n- `SSL_ERROR_SYSCALL`\n- `connection reset by peer`\n\n이 구분이 있어야 \"정상 종료\", \"TCP 비정상 종료\", \"TLS 계층 비정상 종료\"를 분리할 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 프록시 뒤에서만 응답 본문이 가끔 짧다\n\n가능한 원인:\n\n- drain 중 upstream이 `close_notify` 없이 FIN/RST를 보냈다\n- proxy가 EOF를 성공처럼 전달했다\n- 상위 응답 framing 검증이 약하다\n\n### 시나리오 2: TLS handshake는 성공하는데 종료 단계에서만 에러가 난다\n\n핸드셰이크가 아니라 shutdown 순서 문제일 수 있다.\n\n- 응답 전송 후 즉시 프로세스 종료\n- proxy가 linger 없이 소켓 정리\n- LB drain timeout이 너무 짧다\n\n### 시나리오 3: HTTP는 멀쩡한데 custom TLS 프로토콜에서 간헐적 데이터 누락이 보인다\n\n상위 프로토콜 framing이 약하면 `close_notify` 부재의 위험이 더 직접적으로 드러난다.\n\n### 시나리오 4: 앱 로그에는 EOF뿐인데 네트워크 팀은 reset을 본다\n\n앱은 TLS 라이브러리 추상화만 보고, 네트워크는 TCP 레벨만 보고 있을 수 있다.  \n두 관점을 합쳐야 shutdown 원인을 정확히 본다.\n\n## 코드로 보기\n\n### 종료 패킷 관찰 힌트\n\n```bash\ntcpdump -i eth0 'tcp[tcpflags] & (tcp-fin|tcp-rst) != 0'\n```\n\n### TLS 종료 동작 감각 보기\n\n```bash\nopenssl s_client -connect api.example.com:443 -servername api.example.com\n```\n\n### 관찰 포인트\n\n```text\n- close_notify를 보낸 뒤 FIN으로 닫는가\n- drain 중 RST가 늘어나는가\n- EOF와 SSL shutdown error를 구분해 기록하는가\n- partial body / content-length mismatch가 있는가\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| close_notify 후 graceful FIN | 종료 의미가 명확하다 | 종료 절차가 조금 더 길다 | 정상 drain, 민감한 프로토콜 |\n| TCP FIN만 사용 | 단순하다 | TLS 계층 정상 종료 의미가 약하다 | 상위 framing이 강한 단순 경로 |\n| 즉시 RST 종료 | 빨리 정리된다 | truncation과 reset 오류를 키운다 | 비정상 상황, 강제 종료 |\n| strict shutdown 검증 | 이상 종료를 빨리 찾는다 | 일부 legacy peer와 호환성이 떨어질 수 있다 | 금융, 파일 전송, 엄격한 무결성 |\n\n핵심은 TLS 종료를 단순 소켓 close로 다루지 않고 **암호화된 스트림의 완전성 문제**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: TCP FIN과 TLS `close_notify`의 차이는 무엇인가요?\n> 핵심: FIN은 바이트 스트림 종료, `close_notify`는 TLS record 스트림이 정상 종료됐다는 신호다.\n\n> Q: `close_notify`가 없으면 항상 위험한가요?\n> 핵심: 항상 즉시 취약한 것은 아니지만, EOF 해석과 truncation 검증이 약해질 수 있다.\n\n> Q: 왜 프록시 체인에서 더 헷갈리나요?\n> 핵심: 홉마다 TLS 종료 지점과 소켓 종료 방식이 달라서 한 곳의 정상 종료가 다른 홉에서는 비정상처럼 보일 수 있다.\n\n## 한 줄 정리\n\nTLS의 `close_notify`는 TCP FIN/RST와 다른 종료 의미를 가지므로, 배포 드레인이나 프록시 체인에서 이를 무시하면 truncation과 EOF 해석 오류가 숨어들 수 있다.\n",
   "aliases": [
-    "TLS close_notify, FIN/RST, Truncation 개념",
-    "TLS close_notify, FIN/RST, Truncation 정리",
-    "TLS close_notify, FIN/RST, Truncation 실수",
-    "TLS close_notify, FIN/RST, Truncation 판단 기준",
     "네트워크 TLS close_notify, FIN/RST, Truncation",
     "TLS close_notify",
     "TLS truncation",
@@ -17,7 +13,9 @@
     "SSL_ERROR_ZERO_RETURN",
     "SSL_ERROR_SYSCALL",
     "TLS shutdown",
-    "graceful TLS close"
+    "graceful TLS close",
+    "close_notify 없이 EOF가 오면",
+    "TLS 종료와 TCP FIN 차이"
   ],
   "expected_queries": [
     "TLS close_notify와 TCP FIN/RST는 어떻게 달라?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/tls-close-notify-fin-rst-truncation.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

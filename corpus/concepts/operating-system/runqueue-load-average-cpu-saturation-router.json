@@ -6,10 +6,6 @@
   "summary": "load average는 병목 이름이 아니라 압력 신호다. runnable queue, I/O wait, steal time, cgroup throttling을 분리해야 CPU saturation인지 알 수 있다.",
   "body_markdown": "# Runqueue, Load Average, CPU Saturation Router\n\n> 한 줄 요약: `load average`는 병목 이름이 아니라 압력 신호다. runnable queue, I/O wait, steal time, cgroup throttling을 분리해야 CPU saturation인지 알 수 있다.\n\n**난이도: 🟡 Intermediate**\n\n> 관련 문서:\n> - [vmstat Counters, Runtime Pressure](./vmstat-counters-runtime-pressure.md)\n> - [Run Queue, Load Average, CPU Saturation](./run-queue-load-average-cpu-saturation.md)\n> - [Load Average Triage: CPU Saturation vs cgroup Throttling vs I/O Wait](./load-average-triage-cpu-saturation-cgroup-throttling-io-wait.md)\n> - [Cgroup CPU Throttling, Quota, Runtime Debugging](./cgroup-cpu-throttling-quota-runtime-debugging.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n> - [Scheduler Wakeup Latency, runqlat, Queueing Debugging](./scheduler-wakeup-latency-runqlat-debugging.md)\n\n> retrieval-anchor-keywords: runqueue load average router, run queue vs load average, cpu saturation vs iowait, cgroup throttling load average, vmstat r b wa st, /proc/loadavg state R state D, procs_running procs_blocked, steal time CPU, cpu.stat nr_throttled throttled_usec, cpu.pressure io.pressure, high load average but low cpu, runnable queue caveat, top iowait caveat\n\n## 먼저 용어를 분리한다\n\n| 용어 | 의미 | 헷갈리면 생기는 실수 |\n|------|------|------|\n| load average | `/proc/loadavg`의 1/5/15분 평균 압력. Linux man page 기준으로 run queue의 R 상태와 disk I/O 대기 D 상태가 섞인다 | load가 높다는 이유만으로 CPU 부족으로 단정한다 |\n| run queue / runnable queue | 지금 실행 가능하지만 CPU를 기다리는 태스크 대기열 | `vmstat r` 하나만 보고 cgroup throttling, steal time을 놓친다 |\n| CPU saturation | CPU가 runnable work를 충분히 빨리 처리하지 못해 queueing delay가 생기는 상태 | worker 수를 더 늘려 context switch와 cache miss를 키운다 |\n| I/O wait | 태스크가 disk/filesystem/reclaim/writeback 등 외부 완료를 기다리는 상태 | CPU 증설로 해결하려 한다 |\n| steal time | 가상화 환경에서 hypervisor가 vCPU 시간을 가져간 상태 | guest 내부 앱 병목으로 오해한다 |\n| cgroup throttling | host CPU 여유와 별개로 cgroup CPU quota가 소진되어 runnable task가 못 뛰는 상태 | node CPU가 낮다는 이유로 CPU 병목을 지운다 |\n\n이 문서는 깊은 scheduler 분석으로 들어가기 전에 \"어느 문서로 내려갈지\"를 정하는 router다.\n\n## 1분 관측 순서\n\n```bash\nuptime\nvmstat 1\ncat /proc/loadavg\ncat /proc/stat | grep -E 'procs_running|procs_blocked'\ncat /proc/pressure/cpu 2>/dev/null\ncat /proc/pressure/io 2>/dev/null\ncat /sys/fs/cgroup/cpu.stat 2>/dev/null\ncat /sys/fs/cgroup/cpu.max 2>/dev/null\n```\n\ncontainer/cgroup 안쪽을 보고 있다면 아래도 같이 본다.\n\n```bash\ncat /sys/fs/cgroup/cpu.pressure 2>/dev/null\ncat /sys/fs/cgroup/io.pressure 2>/dev/null\n```\n\n`vmstat` 첫 줄은 boot 이후 평균이 섞이므로, 원인 판단은 `vmstat 1`처럼 interval sample로 한다.\n\n## 라우팅 테이블\n\n| 관찰 조합 | 가까운 bucket | 다음 문서 |\n|------|------|------|\n| `vmstat r`이 지속적으로 높고 `wa`, `st`, `nr_throttled`가 조용하다 | CPU saturation 또는 runnable backlog | [Run Queue, Load Average, CPU Saturation](./run-queue-load-average-cpu-saturation.md) |\n| `load average`가 높은데 `b`, `wa`, `io.pressure`가 같이 높다 | I/O wait, filesystem wait, reclaim/writeback | [Scheduler Fairness, Page Cache, File System Basics](./scheduler-fairness-page-cache.md) |\n| host CPU는 낮아 보이는데 `cpu.stat`의 `nr_throttled`, `throttled_usec`가 계속 오른다 | cgroup CPU throttling | [Cgroup CPU Throttling, Quota, Runtime Debugging](./cgroup-cpu-throttling-quota-runtime-debugging.md) |\n| `st`가 높거나 VM에서만 CPU 시간이 사라진다 | steal time / hypervisor contention | provider/host layer 확인, `mpstat`, hypervisor metric |\n| `r`은 낮은데 latency만 높다 | CPU scheduler보다 lock, GC, downstream, page fault, I/O 가능성 | [vmstat Counters, Runtime Pressure](./vmstat-counters-runtime-pressure.md)에서 다른 축으로 재분기 |\n| `cpu.pressure`가 높고 `r`도 높다 | 실제 runnable stall | [Scheduler Wakeup Latency, runqlat, Queueing Debugging](./scheduler-wakeup-latency-runqlat-debugging.md) |\n\n## 각 bucket의 증거\n\n### CPU saturation\n\n가까운 신호:\n\n- `vmstat r`이 logical CPU 수 대비 지속적으로 높다\n- `us`/`sy`가 높고 `wa`/`st`가 낮다\n- `cpu.pressure`의 `some`이 같이 오른다\n- `runqlat`이나 scheduler latency 분포가 두꺼워진다\n\n주의:\n\n- CPU 사용률이 100%가 아니어도 특정 cgroup, CPU affinity, NUMA node에서는 포화일 수 있다\n- thread를 늘리면 처리량보다 queueing delay와 context switch가 먼저 늘 수 있다\n\n### I/O wait 또는 blocked wait\n\n가까운 신호:\n\n- `/proc/loadavg`는 높은데 `vmstat b`가 같이 오른다\n- `wa`, `bi/bo`, `io.pressure`가 같이 움직인다\n- `/proc/stat`의 `procs_blocked`가 늘어난다\n- page cache miss, writeback, direct reclaim, filesystem wait가 latency와 겹친다\n\n주의:\n\n- `iowait`은 CPU가 I/O를 직접 기다린다는 뜻이 아니라, outstanding I/O가 있는 동안 idle로 집계된 시간에 가깝다\n- multi-core 환경에서는 `wa=0`만 보고 I/O wait 가능성을 완전히 지우면 안 된다\n\n### cgroup throttling\n\n가까운 신호:\n\n- `cpu.max`에 quota가 걸려 있다\n- `cpu.stat`의 `nr_throttled`, `throttled_usec`가 interval마다 증가한다\n- host CPU는 남아 보이는데 cgroup `cpu.pressure`가 높다\n- latency spike가 quota period와 비슷한 리듬을 가진다\n\n주의:\n\n- cgroup v2 기준 파일은 `cpu.max`, `cpu.stat`, `cpu.pressure`다. cgroup v1은 파일명이 다르다\n- nice나 thread 우선순위 조정은 quota 소진 문제를 해결하지 못한다\n\n### steal time\n\n가까운 신호:\n\n- `vmstat st`나 `mpstat %steal`이 오른다\n- guest 내부 workload는 runnable인데 실제 CPU time을 받지 못한다\n- 같은 앱이 bare metal이나 다른 VM host에서는 재현되지 않는다\n\n주의:\n\n- steal time은 앱 코드 레벨 병목이 아니라 hypervisor/host contention 신호다\n- guest 내부 `top`만으로는 host 경쟁 원인을 볼 수 없다\n\n## 흔한 오해\n\n### load average가 코어 수보다 크면 무조건 CPU saturation인가?\n\n아니다. Linux load average는 runnable R 상태뿐 아니라 disk I/O 대기 D 상태도 섞을 수 있다. 먼저 `vmstat r/b`, `wa`, PSI, cgroup throttle을 같이 본다.\n\n### `vmstat r`이 높으면 무조건 CPU가 부족한가?\n\n아니다. runnable work가 많다는 뜻에 가깝지만, cgroup quota가 잘라서 못 뛰는지, steal time 때문에 못 뛰는지 확인해야 한다.\n\n### `wa`가 낮으면 I/O는 지워도 되나?\n\n아니다. `/proc/stat` 기반 CPU state는 sampling과 attribution caveat가 있다. `io.pressure`, `vmstat b`, `iostat`, page cache/reclaim counter로 확인한다.\n\n### top의 `%CPU`만 보면 충분한가?\n\n아니다. `top`은 process/thread 단위 힌트이고, cgroup quota, steal time, blocked wait, PSI를 설명하지 못할 수 있다.\n\n## 다음 액션\n\n1. `vmstat 1`로 `r`, `b`, `wa`, `st`를 같은 timestamp에 본다.\n2. quota 환경이면 `cpu.max`, `cpu.stat`, `cpu.pressure`를 바로 붙인다.\n3. I/O나 reclaim 냄새가 나면 `io.pressure`, `/proc/vmstat`, `/proc/meminfo`, `iostat`로 내려간다.\n4. CPU saturation으로 좁혀졌을 때만 worker 수, CPU 증설, hot path 최적화, runqlat 분석을 논의한다.\n\n## 한 줄 정리\n\n`load average`는 \"CPU가 부족하다\"가 아니라 \"R/D 상태 압력이 있다\"는 신호다. run queue, I/O wait, steal time, cgroup throttling을 분리한 뒤에야 CPU saturation이라고 말할 수 있다.\n",
   "aliases": [
-    "Runqueue Load Average CPU 개념",
-    "Runqueue Load Average CPU 정리",
-    "Runqueue Load Average CPU 실수",
-    "Runqueue Load Average CPU 판단 기준",
     "운영체제 Runqueue Load Average CPU",
     "runqueue load average CPU saturation router",
     "load average vs run queue",
@@ -17,7 +13,8 @@
     "CPU saturation IO wait steal throttling",
     "high load average router",
     "vmstat r b wa st router",
-    "runqueue load average cpu guide"
+    "high load가 CPU 병목인지 가르는 법",
+    "vmstat r b wa st 해석 순서"
   ],
   "expected_queries": [
     "load average와 run queue, CPU saturation을 어떻게 구분해?",
@@ -53,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/runqueue-load-average-cpu-saturation-router.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

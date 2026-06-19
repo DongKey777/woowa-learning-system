@@ -7,17 +7,13 @@
   "body_markdown": "# eBPF kprobe uprobe Tracepoint USDT Chooser\n\n## 10초 chooser\n\n| 보고 싶은 것 | 먼저 고를 probe | 안정성 감각 |\n|---|---|---|\n| 커널이 공개한 이벤트와 필드 | tracepoint | 가장 안정적인 축에 가깝다 |\n| 커널 내부 함수 진입/복귀 | kprobe/kretprobe | 강력하지만 kernel version과 함수명 변화에 취약하다 |\n| 유저 프로세스 함수 진입/복귀 | uprobe/uretprobe | binary, symbol, JIT, 배포 버전에 묶인다 |\n| 앱이나 런타임이 의도적으로 노출한 event | USDT | provider가 유지하면 user-space 관측 중 가장 계약에 가깝다 |\n\n핵심은 \"어디에 붙일 수 있나\"가 아니라 \"붙인 지점이 운영 중에 계속 같은 의미를 유지하나\"다. eBPF verifier가 memory safety를 돕는 것과 attach point의 semantic stability는 다른 문제다. tracepoint는 커널이 이벤트로 노출한 표면이라 필드와 의미가 비교적 안정적이다. kprobe는 커널 내부 구현 함수에 직접 붙기 때문에 원하는 위치를 정밀하게 볼 수 있지만, kernel upgrade, config, inlining, symbol visibility에 따라 깨질 수 있다. uprobe는 user-space 함수에 붙는 kprobe 같은 도구이고, USDT는 애플리케이션 또는 런타임이 \"여기를 관측하라\"고 심어 둔 정적 probe다.\n\n## 관측 경계부터 고른다\n\n질문이 \"syscall latency 분포가 이상한가\"라면 syscall tracepoint나 BCC/bpftrace의 기존 도구가 먼저다. 질문이 \"이 kernel 함수의 특정 분기에서 시간이 새는가\"라면 kprobe가 필요할 수 있다. 질문이 \"우리 프로세스의 `parseOrder()` 호출 시간이 튀는가\"라면 uprobe 후보가 된다. 질문이 \"런타임이 제공하는 GC, request, database client event를 안정적으로 받고 싶은가\"라면 USDT 또는 언어 런타임의 공식 event surface가 더 낫다.\n\n운영 판단에서는 다음 순서로 보수적으로 간다.\n\n1. 이미 있는 metrics, logs, traces, JFR 같은 language-level event로 답할 수 있는가.\n2. 커널 tracepoint처럼 안정적인 event가 있는가.\n3. symbol과 버전이 통제되는 user-space binary에 uprobe를 붙일 수 있는가.\n4. 마지막으로 kernel internal kprobe가 필요한가.\n\n이 순서는 \"최신 기술\" 순서가 아니라 blast radius와 유지보수 순서다.\n\n## probe별 tradeoff\n\ntracepoint는 `sched:sched_switch`, `syscalls:sys_enter_*`, `tcp:*`처럼 커널이 이벤트로 내보내는 지점에 붙는다. 필드가 문서화된 ABI처럼 완전히 영원하다고 말하면 과장이지만, kprobe보다 의미가 흔들릴 가능성이 낮다. 단점은 원하는 내부 지점이 tracepoint로 없으면 볼 수 없고, 노출된 필드가 충분하지 않을 수 있다는 점이다.\n\nkprobe는 커널 함수에 동적으로 붙는다. 내부 wait path, 특정 filesystem 함수, TCP 처리 함수처럼 tracepoint가 없는 영역을 볼 때 강력하다. 대신 kernel version, config, module load 상태, BTF 유무, 함수 rename, static inline 최적화에 민감하다. \"내 노드에서 된다\"와 \"fleet 전체에서 안전하다\"는 다르다. production에서는 kernel release matrix를 확인하고, attach 실패가 조용히 무시되지 않게 로그와 fallback을 둔다.\n\nuprobe는 user-space binary의 함수 주소에 붙는다. C/C++ native daemon, nginx module, libc 함수, JVM native library 호출처럼 process 내부 경계를 볼 수 있다. 하지만 stripped binary, ASLR, container image 버전, JIT code movement, frame pointer 부재, symbol mismatch가 흔한 실패 원인이다. Java method 자체를 uprobe로 직접 보겠다는 접근은 대개 wrong bucket이다. JVM 내부는 JFR, async-profiler, Java agent, runtime-specific event가 더 직접적이다.\n\nUSDT는 app 또는 runtime이 미리 심은 정적 tracepoint다. provider/name/argument가 계약처럼 유지되면 uprobe보다 안정적이다. Node.js, Ruby, PostgreSQL, JVM 일부 영역처럼 ecosystem이 USDT를 제공할 수 있다. 단점은 원하는 probe가 미리 심겨 있어야 하고, 배포 빌드 옵션이나 runtime 설정에 따라 빠질 수 있다는 점이다.\n\n## production safety caveats\n\neBPF는 zero overhead가 아니다. 높은 이벤트율에 stack capture를 매번 붙이면 CPU와 memory pressure가 생긴다. map key에 request id, user id, path 전체 같은 high cardinality label을 넣으면 map이 커지고 eviction/drop 때문에 결과가 왜곡된다. ring buffer나 perf buffer drop count, lost event, attach failure, verifier reject, sampling rate를 결과와 함께 기록해야 한다.\n\n권한도 설계의 일부다. root, `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`, kernel lockdown, container PID namespace, cgroup filter에 따라 보이는 범위가 달라진다. 운영에서는 \"관측 대상 pid/cgroup을 좁히고, 짧은 window로 수집하고, aggregate histogram으로 남기며, 원시 인자와 payload는 redaction한다\"는 원칙을 둔다. 파일 경로, SQL, HTTP header, user argument는 PII가 될 수 있다.\n\n예시 명령은 관측 방식을 설명하기 위한 형태다.\n\n```bash\n# tracepoint 예시: syscall entry count를 aggregate로 본다\nsudo bpftrace -e 'tracepoint:syscalls:sys_enter_futex { @[comm] = count(); }'\n\n# kprobe 예시: 내부 함수 attach 가능 여부와 이벤트율을 좁게 확인한다\nsudo bpftrace -e 'kprobe:tcp_sendmsg /pid == TARGET/ { @calls = count(); }'\n\n# uprobe 예시: 특정 binary symbol에 짧게 붙인다\nsudo bpftrace -e 'uprobe:/usr/lib/libc.so.6:malloc { @[comm] = count(); }'\n\n# USDT 예시: provider가 노출한 probe를 확인한 뒤 붙인다\nsudo bpftrace -l 'usdt:/path/to/bin:*'\n```\n\n운영 runbook에는 \"명령을 그대로 실행\"보다 \"대상 pid/cgroup, 기간, sampling, cardinality, drop 확인, rollback\"이 먼저 적혀야 한다.\n\n## wrong-bucket neighbors\n\nCPU hot method를 찾는 질문은 eBPF probe chooser가 아니라 `perf`, async-profiler, JFR 쪽이다. eBPF로 Java method를 모두 관측하려 하면 symbol/JIT 문제와 overhead가 먼저 온다. 반대로 kernel scheduler wakeup이나 futex wait를 JFR만으로 설명하려 하면 kernel boundary 증거가 빠진다.\n\nfalse sharing, cache line bouncing, HITM처럼 hardware coherence 증거가 핵심인 질문도 다른 bucket이다. 이 문서는 attach point 선택 문서이지 cache-line contention playbook이 아니다. 그 경우는 `perf c2c`와 cache coherence 문서로 넘어간다.\n\n메모리 일관성 bug 자체를 설명해야 하는 질문도 이 문서의 범위 밖이다. probe는 관측 위치를 고르는 도구이고, visibility와 ordering은 별도 모델로 검증한다.\n\n## 답변 패턴\n\n면접이나 리뷰에서는 \"tracepoint가 있으면 tracepoint를 먼저 보고, 없으면 kprobe로 내부 구현을 좁힌다. user-space 함수는 uprobe지만, 앱이 USDT를 제공하면 USDT가 더 안정적이다. production에서는 overhead, cardinality, drop, 권한, PII, kernel/binary version drift를 같이 통제한다\"라고 답하면 된다.\n\n## Safe Next Docs\n\n도구 전체 선택은 `ebpf-perf-strace-production-tracing`, off-CPU와 scheduler 지연은 `scheduler-wakeup-latency-runqlat-debugging`, futex와 lock 대기는 `lock-contention-futex-offcpu-debugging`으로 이어진다. JVM 내부 CPU 분석은 `async-profiler-vs-jfr-comparison`, cache line 경쟁은 `perf-c2c-cache-line-contention-false-sharing-playbook`을 다음 문서로 잡는다.\n",
   "aliases": [
     "kprobe uprobe tracepoint USDT 차이",
-    "eBPF kprobe uprobe Tracepoint 개념",
-    "eBPF kprobe uprobe Tracepoint 정리",
-    "eBPF kprobe uprobe Tracepoint 실수",
-    "eBPF kprobe uprobe Tracepoint 판단 기준",
     "eBPF probe chooser",
     "tracepoint vs kprobe",
     "uprobe vs USDT",
     "probe stability tradeoff",
     "production eBPF attach point",
-    "ebpf kprobe uprobe tracepoint guide",
-    "ebpf kprobe uprobe tracepoint checklist"
+    "kprobe랑 tracepoint 중 뭘 골라?",
+    "USDT가 uprobe보다 나은 때"
   ],
   "expected_queries": [
     "eBPF에서 kprobe uprobe tracepoint USDT를 어떻게 골라?",
@@ -53,12 +49,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/ebpf-kprobe-uprobe-tracepoint-usdt-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 6 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

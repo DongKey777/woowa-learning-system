@@ -6,10 +6,6 @@
   "summary": "느린 요청의 상당수는 upstream이 응답을 늦게 해서가 아니라, 요청이 실제 네트워크 I/O를 시작하기도 전에 worker queue나 connection pool 대기열에서 시간을 태워서 생긴다.",
   "body_markdown": "# Upstream Queueing, Connection Pool Wait, Tail Latency\n\n> 한 줄 요약: 느린 요청의 상당수는 upstream이 응답을 늦게 해서가 아니라, 요청이 실제 네트워크 I/O를 시작하기도 전에 worker queue나 connection pool 대기열에서 시간을 태워서 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Timeout Budget Propagation Across Proxy, Gateway, Service Hops](./timeout-budget-propagation-proxy-gateway-service-hop-chain.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [Accept Queue, SYN Backlog, Listen Overflow](./accept-queue-syn-backlog-listen-overflow.md)\n> - [Proxy Retry Budget Discipline](./proxy-retry-budget-discipline.md)\n> - [Timeout 타입: connect, read, write](./timeout-types-connect-read-write.md)\n> - [HTTP/2 MAX_CONCURRENT_STREAMS, Pending Queue, Saturation](./http2-max-concurrent-streams-pending-queue-saturation.md)\n> - [Connection Pool Starvation, Stale Idle Reuse, Debugging](./connection-pool-starvation-stale-idle-reuse-debugging.md)\n> - [Retry Storm Containment, Concurrency Limiter, Load Shedding](./retry-storm-containment-concurrency-limiter-load-shedding.md)\n> - [Queue Saturation Attribution, Metrics, Runbook](./queue-saturation-attribution-metrics-runbook.md)\n\nretrieval-anchor-keywords: upstream queueing, connection pool wait, pending requests, pool acquisition timeout, pending acquire, tail latency, queue length, concurrency limit, head of line in queue, fail-fast\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [운영 플레이북](#운영-플레이북reprotriagefailure-matrixvalidation)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n요청이 느리다고 해서 곧바로 upstream 처리 시간이 긴 것은 아니다.\n\n실제 지연은 종종 두 단계로 나뉜다.\n\n- queue wait: 아직 연결도 못 잡고 대기하는 시간\n- service time: 실제 connect, TLS, request/response에 쓰는 시간\n\nconnection pool, proxy worker, sidecar, event loop가 모두 queue를 만들 수 있다.\n\n### Retrieval Anchors\n\n- `upstream queueing`\n- `connection pool wait`\n- `pending requests`\n- `pool acquisition timeout`\n- `pending acquire`\n- `tail latency`\n- `queue length`\n- `concurrency limit`\n\n## 깊이 들어가기\n\n### 1. connect latency와 \"connect를 시작하기 전 대기\"는 다르다\n\n운영 대시보드가 `connect time`만 보여 주면 놓치는 구간이 있다.\n\n- pool에 idle connection이 없어 기다린다\n- max connections 제한 때문에 대기한다\n- proxy worker queue에서 dispatch 자체가 늦는다\n\n이 시간은 네트워크가 아니라 **로컬 자원 경쟁**이다.\n그런데 사용자 입장에서는 이미 요청이 느리다.\n\n### 2. connection pool은 캐시이면서 동시성 제한기다\n\npool은 연결 재사용 도구이기도 하지만, 동시에 active connection 수를 제한하는 semaphore 역할도 한다.\n\n- active connection이 가득 차면\n- 새 요청은 pending queue에 선다\n- queue가 길어질수록 tail latency가 급격히 악화된다\n\n특히 per-host pool은 특정 upstream 하나가 느려질 때 그 호스트에 대한 대기열만 급증시키기도 한다.\n\n### 3. queue는 평균보다 꼬리를 더 망친다\n\n처리량이 한계에 가까워질수록 작은 흔들림도 queue를 빠르게 키운다.\n\n- 평균 latency는 잠깐만 오른다\n- p95 / p99는 급격히 튄다\n- timeout budget은 queue에서 먼저 타 버린다\n\n그래서 \"upstream 평균 응답은 80ms라서 괜찮다\"는 말이 tail latency를 설명하지 못한다.\n\n### 4. pending queue를 크게 두면 장애를 숨길 수 있다\n\n대기열을 크게 두면 순간 burst는 흡수한다.\n하지만 지속적인 overload에서는 다음 문제가 생긴다.\n\n- 이미 불가능한 요청도 오래 기다린다\n- budget이 바닥난 뒤에야 dispatch된다\n- retry가 또 새 요청을 queue에 넣는다\n\n즉 큰 queue는 완충재이면서 동시에 **지연 증폭기**다.\n\n### 5. long-lived stream이 pool을 독점하면 unary RPC도 같이 느려진다\n\n동일 pool에 다음이 섞이면 흔히 문제가 생긴다.\n\n- 대용량 upload\n- server streaming\n- WebSocket / SSE 유사 장기 연결\n- 짧은 unary API\n\n활성 연결 수만 보면 적어 보여도, 오래 살아 있는 stream이 scarce connection을 붙잡아 pending queue를 만들 수 있다.\n\n### 6. queue는 한 곳에만 있지 않다\n\n실제 경로에는 여러 queue가 겹친다.\n\n- gateway worker queue\n- client-side connection pool pending queue\n- H2 pending stream queue\n- sidecar dispatch queue\n- thread pool or event loop task queue\n\n문제는 각 계층이 자기 queue만 보고 \"나는 정상\"이라고 말하기 쉽다는 점이다.\nend-to-end 관점에서는 모두 같은 예산을 태우는 대기 시간이다.\n\n## 실전 시나리오\n\n### 시나리오 1: upstream 서비스는 멀쩡한데 API gateway p99만 튄다\n\n가능한 원인:\n\n- gateway worker queue가 길다\n- upstream connection pool이 포화됐다\n- 실제 네트워크 I/O 전 대기 시간이 대부분이다\n\n### 시나리오 2: 배포 직후 잠깐 504가 늘었다\n\n새 인스턴스가 warm-up 전이라 service time이 잠깐 늘고, 그 결과 pending queue가 급증해 timeout budget을 먼저 태운 패턴일 수 있다.\n\n### 시나리오 3: streaming 요청 추가 후 짧은 API도 느려졌다\n\n같은 pool을 공유하고 있으면 long-lived stream이 scarce connection을 붙잡아 unary request 대기열을 만든다.\n\n### 시나리오 4: retry를 넣었더니 성공률은 조금 오르는데 꼬리 지연이 폭발한다\n\n기존 queue 위에 재시도 요청까지 얹어 overload를 증폭시킨 전형적인 패턴이다.\n\n## 코드로 보기\n\n### 관찰 포인트\n\n```text\n- active connections\n- idle connections\n- pending acquire count\n- pending acquire wait ms\n- queue wait vs upstream service time\n- timeout before dispatch count\n```\n\n### 정책 감각\n\n```text\nmax_connections: bounded\npending_queue: bounded\npending_acquire_timeout: shorter than remaining budget floor\nseparate pools for long-lived and short-lived traffic\n```\n\n### 현장 질문\n\n```text\n- 이 요청은 언제 socket을 실제로 잡았는가\n- connect time 앞에 local queue wait가 있었는가\n- 같은 pool에 streaming과 unary가 섞여 있는가\n- timeout이 upstream 응답 전인지 dispatch 전인지 구분되는가\n```\n\n## 운영 플레이북(Repro/Triage/Failure Matrix/Validation)\n\n### 재현(Repro)\n\n학습자가 \"upstream은 빠른데 gateway p99만 튀어요\"라고 하면, connect 이후 시간이 아니라 connect 전에 기다린 시간을 만든다.\n\n1. client pool max connection과 pending acquire queue를 낮춘다.\n2. 짧은 unary 요청과 long-lived streaming 요청을 같은 pool에 섞는다.\n3. pending acquire time, connect time, TLS time, upstream service time, caller timeout remaining budget을 분리해 기록한다.\n4. pending queue size와 acquisition timeout을 바꿨을 때 p95/p99가 어떻게 움직이는지 본다.\n\n### 분류(Triage)\n\n- upstream service time이 정상이라는 것은 app 처리 지연이 작다는 증거(evidence)이지, caller path가 빠르다는 증명(proof)이 아니다.\n- connect latency가 낮아도 pending acquire wait가 길면 요청은 네트워크 I/O 시작 전부터 timeout budget을 태운다.\n- queue length 증가는 overload의 증거일 수 있지만, 어느 queue(worker, pool, sidecar, proxy)인지 구분해야 한다.\n\n### 실패 매트릭스(Failure matrix)\n\n| 학습자 관찰 | 우선 bucket | 잘못된 처방 |\n|---|---|---|\n| connect time은 낮고 pending acquire만 높다 | connection pool wait | DNS/TCP 튜닝부터 한다 |\n| upstream p50은 정상인데 gateway p99가 높다 | caller-side queueing | upstream instance만 늘린다 |\n| streaming 추가 후 짧은 API가 느리다 | pool sharing/head-of-line | timeout만 늘린다 |\n| retry 후 성공률은 조금 오르고 p99 폭증 | retry storm + queue amplification | retry 횟수를 더 늘린다 |\n\n### 검증(Validation)\n\n- pool을 streaming/unary로 분리하거나 pending queue를 fail-fast로 줄였을 때 tail latency가 내려가는지 본다.\n- pending acquire timeout이 caller deadline보다 짧아야 queue에서 예산을 다 태우지 않는다.\n- concurrency limit 변경은 p99 개선의 증거일 뿐이며, proof는 queue time histogram과 upstream service time이 함께 분리될 때만 말한다.\n- 대기열을 키운 후 성공률만 보지 말고 timeout budget 소모와 drop 시점을 같이 본다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 큰 pending queue | 순간 burst를 흡수한다 | 지속 overload에서 꼬리 지연과 zombie work가 늘어난다 | 짧은 burst가 잦을 때 |\n| 작은 queue + fail-fast | tail latency와 자원 낭비를 줄인다 | 에러율이 더 빨리 드러난다 | 안정성 우선 경로 |\n| shared pool | 단순하고 재사용 효율이 좋다 | long-lived traffic이 short request를 가로막을 수 있다 | 트래픽 특성이 비슷할 때 |\n| pool 분리 | 격리가 잘 된다 | 설정과 운영 복잡도가 늘어난다 | streaming과 unary 혼합 경로 |\n\n핵심은 tail latency를 upstream 응답 시간만으로 보지 않고 **I/O 시작 전 queueing 시간까지 포함해 해석하는 것**이다.\n\n## 꼬리질문\n\n> Q: connection pool wait는 왜 네트워크 문제처럼 보이나요?\n> 핵심: 사용자 입장에서는 이미 요청이 느리지만, 실제로는 아직 네트워크 I/O도 시작하지 않았을 수 있기 때문이다.\n\n> Q: pending queue를 크게 두면 왜 위험한가요?\n> 핵심: 순간 burst는 흡수해도 지속 overload에서는 timeout budget과 retry를 더 많이 태운다.\n\n> Q: streaming과 unary를 같은 pool에 넣으면 왜 안 좋은가요?\n> 핵심: 장수명 연결이 scarce connection을 붙잡아 짧은 요청의 대기열을 키울 수 있다.\n\n## 한 줄 정리\n\n느린 요청의 원인을 정확히 찾으려면 upstream service time만 보지 말고, connection pool과 worker queue에서 I/O 시작 전 이미 얼마나 기다렸는지부터 분리해 봐야 한다.\n",
   "aliases": [
-    "Upstream Queueing, Connection Pool 개념",
-    "Upstream Queueing, Connection Pool 정리",
-    "Upstream Queueing, Connection Pool 실수",
-    "Upstream Queueing, Connection Pool 판단 기준",
     "네트워크 Upstream Queueing, Connection Pool",
     "upstream queueing",
     "connection pool wait",
@@ -17,7 +13,9 @@
     "pool acquisition timeout",
     "tail latency queue",
     "head of line in queue",
-    "fail-fast queueing"
+    "fail-fast queueing",
+    "upstream은 빠른데 p99만 튀어",
+    "connect 전에 pool에서 기다리는 시간"
   ],
   "expected_queries": [
     "upstream은 빠른데 connection pool wait 때문에 p99가 튀는 패턴을 설명해줘",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/upstream-queueing-connection-pool-wait-tail-latency.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

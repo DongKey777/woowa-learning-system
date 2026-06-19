@@ -6,10 +6,6 @@
   "summary": "컨테이너에서 \"작은 수정\"처럼 보여도 OverlayFS는 lower layer의 파일을 upperdir로 copy-up 하면서 예상보다 큰 I/O와 writable layer 증가를 만들 수 있다.",
   "body_markdown": "# OverlayFS Copy-up, Container Layering, Runtime Debugging\n\n> 한 줄 요약: 컨테이너에서 \"작은 수정\"처럼 보여도 OverlayFS는 lower layer의 파일을 upperdir로 copy-up 하면서 예상보다 큰 I/O와 writable layer 증가를 만들 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [VFS, Dentry, Inode Cache Pressure](./vfs-dentry-inode-cache-pressure.md)\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n> - [Fsync Tail Latency, Dirty Writeback, Backend Debugging](./fsync-tail-latency-dirty-writeback-debugging.md)\n> - [tmpfs, shmem, /dev/shm, Cgroup Memory Accounting](./tmpfs-shmem-cgroup-memory-accounting.md)\n\n> retrieval-anchor-keywords: overlayfs, overlay, copy-up, copy_up, upperdir, lowerdir, workdir, whiteout, opaque directory, container writable layer, image layer, writable layer growth\n\n## 핵심 개념\n\nOverlayFS는 여러 read-only lower layer와 하나의 writable upper layer를 합쳐 하나의 파일 시스템처럼 보이게 만드는 union filesystem이다. 많은 컨테이너 런타임이 이미지 레이어와 컨테이너 writable layer를 표현할 때 이 모델을 사용한다.\n\n- `lowerdir`: 주로 이미지 레이어처럼 read-only로 보이는 부분이다\n- `upperdir`: 컨테이너 실행 중 변경 사항이 기록되는 writable layer다\n- `workdir`: OverlayFS 내부 작업용 디렉터리다\n- `copy-up`: lower에 있던 파일을 수정하려 할 때 upper로 복사한 뒤 그 사본을 바꾸는 동작이다\n- `whiteout` / `opaque directory`: lower에 있는 파일이나 디렉터리를 merged view에서 숨기는 표시다\n\n왜 중요한가:\n\n- `chown -R`, `chmod -R`, startup 시 템플릿 rewrite 같은 작업이 대량 copy-up으로 바뀔 수 있다\n- 애플리케이션이 image path 아래에 로그나 임시 파일을 쓰면 upperdir가 빠르게 커질 수 있다\n- tail latency 원인이 \"앱이 한 줄 썼다\"가 아니라 \"커널이 파일 전체를 upper로 올렸다\"일 수 있다\n\n이 문서의 첫 분기는 **container 안에서 보이는 merged path**와 **host/runtime이 관리하는 lower/upper/workdir**를 분리하는 것이다. 컨테이너 내부의 `/app/config.yml`만 보면 \"파일 하나 수정\"이지만, 실제 증거는 host의 overlay mount option, upperdir 증가량, underlying filesystem writeback에 남는다.\n\n## 깊이 들어가기\n\n### 1. copy-up 비용은 수정량이 아니라 객체 경계로 보아야 한다\n\nOverlayFS에서 lowerdir의 파일을 수정하려면 먼저 upperdir에 writable copy가 필요하다. 그래서 몇 바이트만 고쳐도 비용은 \"몇 바이트를 썼는가\"보다 \"어떤 파일을 upper로 끌어올렸는가\"에 더 가깝다.\n\n- 큰 파일의 일부만 바꿔도 첫 변경 시점에는 copy-up 비용이 붙을 수 있다\n- write access가 필요한 open, 일부 metadata 변경, hard link 생성이 copy-up을 유발할 수 있다\n- 첫 write가 끝난 뒤에는 upperdir 사본을 계속 사용하므로 이후 비용 패턴이 달라진다\n\n즉 애플리케이션 로그에서 `write()`는 작아 보여도, 실제 저장 비용은 copy-up + dirty writeback + `fsync()` 대기로 구성될 수 있다.\n\n주의할 점은 kernel option에 따라 metadata-only copy-up(`metacopy`)처럼 지연된 data copy가 가능하다는 것이다. 그래서 \"metadata 변경은 항상 전체 data copy\"라고 단정하지 말고, mount option과 xattr 기반 동작을 확인한다. 반대로 `O_RDWR` open처럼 write access가 필요한 접근은 실제 data write가 뒤따르지 않아도 copy-up 후보가 될 수 있으므로, 애플리케이션의 \"작게 썼다\" 로그와 kernel storage work를 분리해서 본다.\n\n### 2. delete는 lower layer를 지우는 것이 아니라 merged view를 가린다\n\n컨테이너 안에서 lower layer에 있던 파일을 삭제하면 보통 lower 자체가 지워지지 않는다. 대신 upperdir에 whiteout이 생겨 merged view에서만 안 보이게 만든다.\n\n- 현재 컨테이너에서는 삭제된 것처럼 보인다\n- 같은 이미지를 다시 띄운 새 컨테이너에서는 그 파일이 다시 보일 수 있다\n- \"지웠는데 이미지 용량이 왜 안 줄지?\" 같은 혼란이 생긴다\n\n그래서 runtime writable layer와 image layer의 저장 의미를 분리해서 생각해야 한다.\n\n### 3. copy-up 뒤에는 일반 파일 시스템 비용이 다시 나타난다\n\ncopy-up은 시작점일 뿐이다. upperdir에 파일이 생긴 뒤에는 일반 파일 시스템과 동일하게 page cache, dirty writeback, journal commit, flush queue의 영향을 받는다.\n\n- copy-up이 큰 파일일수록 dirty page를 빠르게 만든다\n- 같은 노드의 다른 writer와 storage queue를 공유한다\n- `fsync()` 기반 durability 경로가 있다면 copy-up 직후 p99가 더 크게 튈 수 있다\n\n즉 OverlayFS 문제는 \"컨테이너 전용\"으로 끝나지 않고, 결국 [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md) 문제로 이어진다.\n\n컨테이너/호스트 경계도 분리해야 한다. 애플리케이션은 컨테이너 namespace 안의 path를 보지만, `upperdir`와 `workdir`는 보통 host runtime storage 아래에 있다. cgroup memory는 page cache와 tmpfs/shmem accounting에 영향을 줄 수 있지만, overlay upperdir의 디스크 사용량 자체는 container filesystem quota, node ephemeral storage, runtime storage policy와 같이 봐야 한다.\n\n### 4. mutable hot path는 image path 밖으로 빼는 편이 낫다\n\n다음과 같은 경로는 image layer 아래보다 별도 volume이나 tmpfs가 더 적합한 경우가 많다.\n\n- request 중 계속 append되는 로그\n- 업로드 staging 파일\n- unzip, render, export 같은 중간 산출물\n- SQLite, local queue, WAL처럼 지속적으로 write와 sync가 일어나는 파일\n\n이렇게 나누면 image layer는 immutable artifact로 유지되고, writable hot path는 I/O 특성에 맞게 분리할 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 컨테이너 startup만 유독 느리다\n\n가능한 원인:\n\n- entrypoint에서 `chown -R` 또는 `chmod -R`를 수행한다\n- lower layer의 많은 파일이 upperdir로 copy-up 된다\n- startup 직후 dirty writeback이 몰린다\n\n진단:\n\n```bash\nfindmnt -t overlay -o TARGET,SOURCE,OPTIONS\ndu -sh <upperdir>\nstrace -ff -ttT -e trace=chmod,fchmodat,chown,fchownat,rename,openat,write <entrypoint-cmd>\n```\n\n판단 포인트:\n\n- startup 전후 upperdir가 급격히 커지는가\n- 메타데이터 작업 직후 writeback pressure가 붙는가\n- read-only artifact를 매번 \"수정해서 쓰는\" 초기화 방식인가\n\n첫 확인은 host에서 한다. 컨테이너 내부에서 mount option이 가려질 수 있으므로, 가능하면 node/runtime 쪽 `findmnt` 출력에서 `lowerdir=`, `upperdir=`, `workdir=`, `metacopy=`를 직접 확인한다.\n\n컨테이너 runtime이 overlayfs가 아닌 storage driver를 쓰거나, rootless/runtime 설정 때문에 host path가 다르게 보일 수도 있다. 그래서 `overlayfs가 원인이다`라고 시작하지 말고, 먼저 mount type과 upperdir 존재를 확인한 뒤 copy-up 가설로 내려간다.\n\n### 시나리오 2: API 서버가 image path 아래에 로그를 남긴다\n\n가능한 원인:\n\n- 처음 append 시 lower 파일 copy-up이 일어난다\n- 이후 upperdir에서 dirty page와 `fsync()` 대기가 쌓인다\n- 컨테이너 재시작 전까지 writable layer가 계속 커진다\n\n대응 감각:\n\n- 로그 경로를 volume이나 host log path로 분리한다\n- image 안에 둘 파일은 immutable artifact로 유지한다\n- write-heavy local state는 tmpfs 또는 전용 볼륨으로 나눈다\n\n### 시나리오 3: 파일을 지웠는데도 저장소 경보가 바로 줄지 않는다\n\n가능한 원인:\n\n- lower layer 파일은 whiteout으로만 가려졌다\n- upperdir 쪽 다른 copy-up 파일이 남아 있다\n- open file descriptor가 남아 있어 공간 회수가 늦는다\n\n이때는 \"이미지 용량\", \"upperdir 사용량\", \"열린 삭제 파일\"을 따로 봐야 한다.\n\n검증:\n\n```bash\n# host/runtime 관점의 overlay layer와 upperdir 확인\nfindmnt -t overlay -o TARGET,OPTIONS\ndu -sh <upperdir>\n\n# 컨테이너 프로세스가 삭제된 파일을 붙잡는지 확인\nlsof -p <pid> | grep deleted\n\n# copy-up 후보 syscall과 fsync tail을 시간축으로 본다\nstrace -ff -ttT -e trace=openat,chmod,fchmodat,chown,fchownat,link,rename,write,fsync,fdatasync -p <pid>\n```\n\n조치 후에는 같은 startup 또는 같은 request를 재현해 `upperdir` 증가량, write latency, `fsync` tail, node ephemeral storage 사용량이 실제로 줄었는지 본다.\n\n## 코드로 보기\n\n### merged view mental model\n\n```text\nlowerdir=/layers/base:/layers/app\nupperdir=/containers/123/upper\n\nread /app/config.yml\n  -> lower에서 보일 수 있다\n\nfirst write /app/config.yml\n  -> lower의 파일을 upper로 copy-up\n  -> 이후에는 upper 사본을 수정\n```\n\n### overlay mount 확인\n\n```bash\nfindmnt -t overlay -o TARGET,SOURCE,OPTIONS\nmount | rg overlay\n```\n\n### writable hot path 분리 예시\n\n```text\n/app                 -> image artifact, 가능하면 read-only 유지\n/var/lib/myapp       -> volume, 지속 상태 저장\n/var/log/myapp       -> volume 또는 외부 log path\n/tmp/myapp           -> tmpfs 또는 host tmp\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| OverlayFS writable layer 유지 | 배포가 단순하다 | copy-up과 upperdir growth를 감수해야 한다 | 작은 변경만 있을 때 |\n| Volume으로 분리 | write path를 명확히 분리한다 | 운영 객체가 늘어난다 | DB, queue, upload, log |\n| tmpfs 사용 | 빠르고 image 오염이 없다 | 메모리를 먹고 재시작 시 사라진다 | 짧은 임시 작업 |\n| 이미지를 immutable하게 유지 | startup/운영 예측이 쉬워진다 | 런타임 커스터마이징이 줄어든다 | 표준화된 서비스 운영 |\n\n## 꼬리질문\n\n> Q: OverlayFS의 copy-up은 왜 tail latency를 만들 수 있나요?\n> 핵심: 작은 수정처럼 보여도 먼저 upperdir에 writable copy를 만들어야 해서 I/O가 객체 단위로 커질 수 있기 때문이다.\n\n> Q: 컨테이너에서 파일 삭제가 왜 image 용량 감소와 다를 수 있나요?\n> 핵심: lower layer를 직접 지우는 것이 아니라 whiteout으로 현재 merged view만 가리는 경우가 많기 때문이다.\n\n> Q: 로그나 임시 파일을 image path에 두면 왜 안 좋나요?\n> 핵심: immutable artifact와 write-heavy path가 섞여 copy-up, writeback, upperdir growth가 함께 생기기 때문이다.\n\n## 한 줄 정리\n\nOverlayFS는 컨테이너 파일 시스템을 단순하게 보여 주지만, 실제 write 비용은 copy-up과 upperdir growth 형태로 드러나므로 mutable path를 image layer와 분리해서 보는 감각이 중요하다.\n",
   "aliases": [
-    "OverlayFS Copy-up Container Layering 개념",
-    "OverlayFS Copy-up Container Layering 정리",
-    "OverlayFS Copy-up Container Layering 실수",
-    "OverlayFS Copy-up Container Layering 판단 기준",
     "운영체제 OverlayFS Copy-up Container Layering",
     "OverlayFS copy-up",
     "container writable layer growth",
@@ -17,7 +13,9 @@
     "copy-up I/O spike",
     "upperdir lower layer",
     "container filesystem latency",
-    "overlayfs copy up container guide"
+    "overlayfs copy up container guide",
+    "container 작은 수정이 copy-up을 부를 때",
+    "writable layer가 갑자기 커졌어"
   ],
   "expected_queries": [
     "OverlayFS copy-up은 container에서 작은 수정도 왜 큰 I/O로 만들 수 있어?",
@@ -44,12 +42,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/overlayfs-copy-up-container-layering-debugging.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

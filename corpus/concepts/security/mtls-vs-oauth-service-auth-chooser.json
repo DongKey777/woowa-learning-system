@@ -6,10 +6,6 @@
   "summary": "이 chooser는 service-to-service authentication에서 mTLS와 OAuth를 고르는 기준을 다룬다. mTLS는 transport layer에서 workload/client identity를 증명하고, OAuth access token은 audience와 scope로 protected resource 접근 권한을 표현한다. 둘은 대체재가 아니라 identity, authorization, replay resistance, rotation 경계를 나누는 선택지다.",
   "body_markdown": "# mTLS vs OAuth Service Auth Chooser\n\n> 한 줄 요약: mTLS는 \"연결한 workload가 누구인가\"를 전송 계층에서 증명하고, OAuth는 \"이 token이 어떤 API에 어떤 범위로 허용되는가\"를 권한 계약으로 표현한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Service-to-Service Auth: mTLS, JWT, SPIFFE](./service-to-service-auth-mtls-jwt-spiffe.md)\n- [mTLS Client Auth vs Certificate-Bound Access Token](./mtls-client-auth-vs-certificate-bound-access-token.md)\n- [OAuth Client Authentication: `private_key_jwt`, mTLS](./oauth-client-authentication-private-key-jwt-mtls.md)\n- [OAuth Scope vs API Audience vs Application Permission](./oauth-scope-vs-api-audience-vs-application-permission.md)\n- [TLS Handshake Primer](./tls-https-handshake-primer.md)\n\nretrieval-anchor-keywords: mtls oauth service auth, transport identity authorization, workload identity scope, oauth audience scope, mtls not user authz, client credentials mtls, certificate-bound access token, sender constrained token, cert rotation revocation\n\n## 핵심 선택 축\n\n서비스 인증에서 mTLS와 OAuth를 \"둘 중 하나\"로만 보면 설계가 틀어진다. mTLS는 TLS handshake에서 client certificate와 private key 보유를 확인해 연결 주체를 식별한다. OAuth는 access token으로 resource server가 audience, scope, 만료, client 또는 사용자 컨텍스트를 판단하게 한다.\n\n질문은 두 가지다. 전송 계층에서 지금 연결한 workload를 믿을 수 있어야 하는가, 그리고 API 권한을 audience/scope/policy로 표현해야 하는가. 첫 번째는 mTLS가 강하고, 두 번째는 OAuth가 강하다. 내부 mesh, partner API, high-risk API에서는 둘을 같이 쓰는 경우가 흔하다.\n\n## 30초 chooser\n\n| 요구사항 | 우선 선택 | 이유 | 빠지기 쉬운 함정 |\n|---|---|---|---|\n| 내부 서비스가 매 연결마다 서로를 확인해야 한다 | mTLS | 연결 주체와 채널을 동시에 보호한다 | \"호출 가능 권한\"까지 자동 부여하지 않는다 |\n| API별 권한, tenant, scope, audience가 필요하다 | OAuth access token | resource server가 권한 계약을 검증한다 | bearer token은 탈취되면 재사용될 수 있다 |\n| token replay를 줄여야 한다 | certificate-bound token 또는 DPoP | token 사용자를 key/cert에 묶는다 | resource server가 binding을 검증해야 효과가 있다 |\n| partner B2B 호출이다 | OAuth Client Credentials + 선택적 mTLS | 계약, scope, audit을 token에 싣고 연결도 제한한다 | 인증서 rotation과 token TTL을 따로 관리한다 |\n| gateway에서 TLS를 종료한다 | mTLS 검증 주체와 전달 경로를 명확히 한다 | backend는 검증된 caller identity가 필요하다 | 임의 header를 그대로 믿으면 경계가 깨진다 |\n\n## mTLS가 증명하는 것\n\nmTLS는 일반 TLS에 client authentication을 더한다. 서버가 `CertificateRequest`를 보내고 client가 인증서와 서명을 제시하면, 서버는 신뢰한 CA, SAN, subject, policy에 맞는지 확인한다. 결과는 \"이 연결은 등록된 workload가 private key를 보유한 상태에서 만들었다\"는 신호다.\n\n하지만 mTLS는 사용자 인가가 아니다. `orders-api` 인증서가 맞다는 사실만으로 \"이 사용자의 예약을 취소해도 된다\"가 나오지 않는다. workload identity는 호출 주체를 말하고, user authorization은 resource ownership, role, scope, tenant policy를 봐야 한다.\n\nLoad balancer나 sidecar가 mTLS를 종료하면 애플리케이션은 원본 client certificate를 직접 보지 못한다. 이때 backend로 넘기는 `x-client-cert`, `x-spiffe-id`, `x-forwarded-client-cert` 값은 trusted proxy가 덮어쓴다는 보장이 있어야 한다. 외부 요청이 같은 header를 주입할 수 있으면 mTLS 경계는 사라진다.\n\n## OAuth가 증명하는 것\n\nOAuth access token은 보호된 resource에 접근하기 위한 권한 표현이다. token은 보통 만료, scope, client, subject, audience 또는 resource indicator를 담거나 introspection으로 조회된다. Client Credentials 흐름이라면 사용자가 아니라 client가 자기 이름으로 접근한다. 사용자 위임 흐름이라면 사용자와 client가 함께 권한 판단에 들어간다.\n\nOAuth의 강점은 API별 정책이다. `inventory.read`, `reservation.cancel`, `aud=payment-api`처럼 \"어디에 무엇을 할 수 있는가\"를 mTLS 인증서 subject보다 명확히 표현한다.\n\n반대로 bearer token은 새면 다른 연결에서도 쓰일 수 있다. 그래서 high-risk 경로에서는 mTLS 위에서만 token을 받거나, RFC 8705식 certificate-bound access token처럼 token의 `cnf`에 certificate thumbprint를 묶어 resource server가 현재 TLS client certificate와 비교하게 한다. 이때 token endpoint의 mTLS client auth와 token 사용 시점의 proof-of-possession을 구분해야 한다.\n\n## 조합 패턴\n\n첫째, **mTLS only**는 내부 mesh에서 \"등록된 서비스끼리만 호출\"이면 충분할 수 있다. 그러나 API별 세밀한 권한이나 사용자 컨텍스트가 필요해지면 부족하다.\n\n둘째, **OAuth only**는 public internet API나 SaaS API에서 흔하다. HTTPS는 기본이고 token이 권한 계약을 담당한다. 다만 bearer replay와 client secret 유출을 따로 방어해야 한다.\n\n셋째, **mTLS + OAuth**는 고위험 서비스 호출의 표준적인 조합이다. mTLS로 workload identity와 채널을 제한하고, OAuth로 audience/scope를 검증한다. 장애 시 \"mTLS 에러면 bearer처럼 통과\" 같은 fallback을 넣으면 안 된다.\n\n넷째, **OAuth mTLS client authentication**은 token endpoint에서 client가 인증서로 자신을 증명하는 방식이다. 이것만으로 resource server의 token replay가 자동 차단되지는 않는다. replay 저항까지 원하면 certificate-bound access token을 발급하고 모든 resource server가 binding을 검증해야 한다.\n\n## 운영 체크\n\n인증서 rotation은 권한 변경과 다르다. cert가 바뀌면 trust bundle rollout, old/new cert overlap, client 재시작, revocation window를 본다. API 권한을 회수하려면 OAuth scope, audience, policy, token TTL, introspection cache를 본다. 인증서 폐기로 권한 정책을 대신하면 배포 장애와 인가 누락이 섞인다.\n\n로그도 분리한다. mTLS handshake 실패는 trust chain, SAN mismatch, expired cert, proxy termination 문제인 경우가 많다. OAuth 401/403은 token 만료, audience mismatch, scope 부족, subject policy 문제다.\n\n## 한 줄 정리\n\nmTLS는 호출한 workload의 전송 신원을, OAuth는 token의 audience와 scope 권한을 맡긴다. 서비스 인증 설계는 둘을 대체재가 아니라 서로 다른 경계의 조합으로 봐야 한다.\n",
   "aliases": [
-    "mTLS vs OAuth Service 개념",
-    "mTLS vs OAuth Service 정리",
-    "mTLS vs OAuth Service 실수",
-    "mTLS vs OAuth Service 판단 기준",
     "보안 mTLS vs OAuth Service",
     "mTLS vs OAuth service auth",
     "mutual TLS service authentication",
@@ -17,7 +13,9 @@
     "client certificate service auth",
     "OAuth client credentials with mTLS",
     "certificate-bound access token",
-    "sender constrained token"
+    "sender constrained token",
+    "서비스 간 mTLS와 OAuth 같이 써?",
+    "audience scope는 왜 따로 봐?"
   ],
   "expected_queries": [
     "서비스 간 호출에서 mTLS와 OAuth Client Credentials를 어떤 기준으로 같이 쓰거나 나눠야 해?",
@@ -56,12 +54,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/security/mtls-vs-oauth-service-auth-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch161"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

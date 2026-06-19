@@ -6,10 +6,6 @@
   "summary": "huge page는 TLB miss를 줄여 성능을 올릴 수 있지만, 잘못 켜면 compaction과 fault stall이 지연을 더 키울 수 있다.",
   "body_markdown": "# THP, Huge Pages, TLB Latency\n\n> 한 줄 요약: huge page는 TLB miss를 줄여 성능을 올릴 수 있지만, 잘못 켜면 compaction과 fault stall이 지연을 더 키울 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TLB and Page Table Walk Bridge](./tlb-page-table-walk-bridge.md)\n> - [NUMA, Page Replacement, Thrashing](./memory-management-numa-page-replacement-thrashing.md)\n> - [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n> - [CFS Scheduler, nice, CPU Fairness](./cfs-scheduler-nice-cpu-fairness.md)\n> - [NUMA Production Debugging](./numa-production-debugging.md)\n> - [Page Cache, Dirty Writeback, fsync](./page-cache-dirty-writeback-fsync.md)\n\n> retrieval-anchor-keywords: THP, transparent huge pages, huge pages, AnonHugePages, TLB miss, compaction, khugepaged, dTLB-load-misses, madvise\n\n## 핵심 개념\n\nTLB는 가상 주소를 물리 주소로 바꾸는 캐시다. 페이지 수가 많아질수록 TLB miss 가능성이 높아지고, 그만큼 주소 변환 비용이 늘어난다. Huge page는 더 큰 페이지 크기를 써서 TLB 압력을 줄인다.\n\n- 일반 페이지는 보통 4KB 단위다\n- huge page는 보통 2MB 단위다\n- THP(`Transparent Huge Pages`)는 애플리케이션이 따로 huge page를 요청하지 않아도 커널이 자동으로 큰 페이지를 만들도록 시도한다\n\n왜 중요한가:\n\n- 메모리 집합이 큰 JVM, DB, 캐시 서버에서 TLB miss가 성능을 흔든다\n- huge page는 throughput을 올릴 수 있지만, 메모리 단편화와 compaction 비용이 생길 수 있다\n- latency 민감한 서버에서는 \"빠른 평균\"과 \"느린 꼬리\"가 동시에 보일 수 있다\n\n이 문서는 [NUMA, Page Replacement, Thrashing](./memory-management-numa-page-replacement-thrashing.md)에서 본 메모리 지역성과 fault를, huge page 관점으로 더 좁혀서 본다.\n\n## 깊이 들어가기\n\n### 1. TLB miss는 단순 캐시 미스가 아니다\n\nTLB miss는 데이터 자체가 아니라 **주소 변환**이 늦어진다는 뜻이다.\n\n- 페이지가 많을수록 변환 항목이 커진다\n- 랜덤 접근이 많을수록 TLB locality가 깨진다\n- 큰 워킹셋은 TLB를 더 압박한다\n\n즉 huge page는 메모리 크기를 늘리는 것이 아니라, **주소 변환 표의 압박을 줄이는 방법**이다.\n\n### 2. THP는 편하지만 예측이 어렵다\n\nTHP는 운영을 편하게 만들 수 있지만, 내부적으로는 다음 작업이 수반된다.\n\n- 페이지 병합\n- compaction\n- memory reclaim\n- huge page 분해(splitting)\n\n그래서 THP는 \"그냥 켜면 좋은 기능\"이 아니다. 워크로드가 memory-friendly할 때 강하고, fragmentation이 심하면 지연을 키울 수 있다.\n\n### 3. huge page의 이득과 비용\n\n이득:\n\n- TLB miss 감소\n- 메모리 대형 워킹셋에서 throughput 개선\n- 일부 DB/JVM에서 CPU 효율 개선\n\n비용:\n\n- compaction stall 가능성\n- memory fragmentation 악화\n- page split 비용\n- latency spike 가능성\n\n### 4. `madvise()`와 `always`는 의미가 다르다\n\nTHP 정책은 보통 다음처럼 본다.\n\n- `always`: 최대한 자동으로 huge page를 만든다\n- `madvise`: 앱이 원할 때만 huge page를 시도한다\n- `never`: THP를 쓰지 않는다\n\n운영에서 중요한 것은 \"켜짐/꺼짐\"이 아니라 **어떤 워크로드에 어떤 정책이 맞는가**다.\n\n## 실전 시나리오\n\n### 시나리오 1: JVM 힙은 커졌는데 CPU 효율이 좋아지지 않는다\n\n가능한 원인:\n\n- heap은 커졌지만 TLB miss가 병목이다\n- THP가 너무 공격적으로 compaction을 일으킨다\n- GC와 page split이 겹친다\n\n진단:\n\n```bash\ncat /sys/kernel/mm/transparent_hugepage/enabled\ncat /sys/kernel/mm/transparent_hugepage/defrag\ngrep -E 'AnonHugePages|HugePages|Hugepagesize' /proc/meminfo\ncat /proc/<pid>/smaps_rollup | grep -E 'AnonHugePages|Rss|Pss'\n```\n\n### 시나리오 2: latency spike가 간헐적으로 생긴다\n\n가능한 원인:\n\n- compaction이 burst로 발생한다\n- huge page 확보를 위해 커널이 오래 막힌다\n- 메모리 단편화가 심해서 THP 생성이 어렵다\n\n진단:\n\n```bash\ngrep -E 'compact|thp' /proc/vmstat\nperf stat -p <pid> -e dTLB-load-misses,dTLB-loads,minor-faults -- sleep 30\n```\n\n### 시나리오 3: DB나 캐시 서버가 더 느려졌다\n\n가능한 원인:\n\n- big pages로 이득을 보지만 latency가 더 중요하다\n- 워크로드가 랜덤 접근 위주라 huge page 이득이 적다\n- NUMA locality와 함께 봐야 한다\n\n이때는 [NUMA Production Debugging](./numa-production-debugging.md)과 같이 봐야 한다. huge page가 좋아도 원격 메모리를 많이 타면 손해다.\n\n## 코드로 보기\n\n### THP 정책 확인\n\n```bash\ncat /sys/kernel/mm/transparent_hugepage/enabled\ncat /sys/kernel/mm/transparent_hugepage/defrag\n```\n\n### 프로세스가 huge page를 얼마나 쓰는지 확인\n\n```bash\ngrep -R \"AnonHugePages\" /proc/<pid>/smaps 2>/dev/null | head\ncat /proc/<pid>/smaps_rollup | grep AnonHugePages\n```\n\n### 앱이 huge page를 원할 때의 힌트\n\n```c\n// 의사 코드: 특정 메모리 구간에 huge page를 유도\nvoid *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\nmadvise(p, len, MADV_HUGEPAGE);\n```\n\n### TLB 압박을 보는 perf 샘플\n\n```bash\nperf stat -p <pid> -e dTLB-load-misses,dTLB-loads,iTLB-load-misses,minor-faults -- sleep 30\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| THP `always` | 자동화가 쉽다 | compaction stall 위험 | throughput 우선 워크로드 |\n| THP `madvise` | 제어가 쉽다 | 앱 수정/운영 판단 필요 | latency-sensitive 서비스 |\n| THP `never` | 예측 가능하다 | TLB 이득을 놓친다 | 꼬리 지연이 더 중요한 경우 |\n| explicit huge pages | 확실하게 쓴다 | 운영 복잡도가 높다 | DB, 특수 메모리 집약 앱 |\n\n핵심은 huge page 자체가 아니라, **주소 변환 비용과 compaction 비용 중 무엇이 더 비싼가**다.\n\n## 꼬리질문\n\n> Q: huge page는 왜 TLB에 유리한가요?\n> 핵심: 한 번의 TLB entry가 더 많은 메모리를 커버하기 때문이다.\n\n> Q: THP가 항상 좋은가요?\n> 핵심: 아니다. compaction과 fragmentation 때문에 latency가 나빠질 수 있다.\n\n> Q: `madvise(MADV_HUGEPAGE)`는 무엇을 보장하나요?\n> 핵심: 보장이 아니라 힌트다. 커널이 상황에 따라 결정한다.\n\n> Q: huge page를 켰는데도 CPU가 안 줄면 왜 그런가요?\n> 핵심: 병목이 TLB가 아니라 reclaim, lock, I/O, NUMA일 수 있다.\n\n## 한 줄 정리\n\nTHP와 huge page는 TLB 압력을 줄이는 강력한 수단이지만, compaction과 fragmentation 비용이 커지면 latency 서버에서는 역효과가 날 수 있다.\n",
   "aliases": [
-    "THP Huge Pages TLB 개념",
-    "THP Huge Pages TLB 정리",
-    "THP Huge Pages TLB 실수",
-    "THP Huge Pages TLB 판단 기준",
     "운영체제 THP Huge Pages TLB",
     "THP huge pages TLB latency",
     "transparent huge pages",
@@ -17,7 +13,8 @@
     "compaction fault stall",
     "huge page latency spike",
     "khugepaged THP",
-    "thp huge pages tlb guide"
+    "THP 켰더니 tail latency가 튀는 이유",
+    "huge page compaction 때문에 멈칫할 때"
   ],
   "expected_queries": [
     "THP와 huge page는 TLB miss를 줄이지만 왜 latency spike를 만들 수 있어?",
@@ -46,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/thp-huge-pages-tlb-latency.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

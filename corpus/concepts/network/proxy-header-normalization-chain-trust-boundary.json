@@ -6,10 +6,6 @@
   "summary": "프록시 헤더는 누적만 해서는 안 되고, 각 홉에서 정규화와 재작성 규칙을 지켜야 신뢰 경계가 흐트러지지 않는다.",
   "body_markdown": "# Proxy Header Normalization Chain, Trust Boundary\n\n> 한 줄 요약: 프록시 헤더는 누적만 해서는 안 되고, 각 홉에서 정규화와 재작성 규칙을 지켜야 신뢰 경계가 흐트러지지 않는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Forwarded, X-Forwarded-For, X-Real-IP와 Trust Boundary](./forwarded-x-forwarded-for-x-real-ip-trust-boundary.md)\n> - [API Gateway, Reverse Proxy 운영 포인트](./api-gateway-reverse-proxy-operational-points.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [Proxy Protocol, Client IP, Trust Boundary](./proxy-protocol-client-ip-trust-boundary.md)\n> - [ALB, ELB Retry Amplification, Proxy Chain](./alb-elb-retry-amplification-proxy-chain.md)\n\nretrieval-anchor-keywords: header normalization, proxy chain, trust boundary, X-Forwarded-For, Forwarded, header rewriting, sanitization, canonicalization, ingress chain\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 재현 조건, 관찰 증거, failure matrix\n\n이 문서의 1차 분기는 \"헤더가 있는가\"가 아니라 \"trust boundary 안에서 정규화된 값인가\"다. `X-Forwarded-For`나 `Forwarded` 존재 자체는 신호이고, proof는 외부 입력 제거와 trusted hop 재작성 규칙을 검증/validation해야 얻는다.\n\n### 재현 조건\n\n- client가 임의의 `X-Forwarded-*`와 `Forwarded` header를 넣어 보낸 뒤 app 로그에 남는 값을 본다.\n- CDN/WAF/LB/proxy 각 hop에서 header가 append되는지 rewrite되는지 샘플 요청으로 비교한다.\n- proto/host/client IP를 의도적으로 다르게 넣어 canonical form이 유지되는지 확인한다.\n\n### 관찰 증거\n\n- 로그마다 client IP 순서가 다르거나 중복 header가 남는다.\n- secure cookie, redirect URL, rate limit이 proxy 뒤에서만 어긋난다.\n- 외부에서 주입한 header 값이 app까지 도달한다.\n\n### failure matrix\n\n| 증상 | 1차 분기 | 관찰 신호 | 검증/validation | wrong-bucket / 오선택 |\n|---|---|---|---|---|\n| client IP가 요청마다 다름 | header normalization 불일치 | hop별 append/rewrite 순서가 다름 | 각 proxy log와 app access log의 canonical header를 비교 | rate limit 알고리즘 버그로만 분류 |\n| secure cookie/redirect가 깨짐 | proto/host 재작성 오류 | `X-Forwarded-Proto`가 http로 남음 | boundary rewrite rule과 framework trusted proxy 설정을 확인 | 브라우저 cookie 정책으로만 분류 |\n| spoofed IP가 반영됨 | trust boundary 누락 | 외부 주입 header가 app 로그에 남음 | edge에서 del-header/rewrite가 되는지 실요청으로 확인 | 사용자 NAT 문제로만 분류 |\n\n## 핵심 개념\n\nproxy 헤더는 단순히 \"전달\"하는 게 아니라 **정규화(normalization)** 해야 한다.\n\n- 외부에서 들어온 값은 제거하거나 재작성한다\n- trusted proxy가 붙인 값만 누적한다\n- hop마다 동일한 정책으로 canonical form을 유지한다\n\n### Retrieval Anchors\n\n- `header normalization`\n- `proxy chain`\n- `trust boundary`\n- `X-Forwarded-For`\n- `Forwarded`\n- `header rewriting`\n- `sanitization`\n- `canonicalization`\n- `ingress chain`\n\n## 깊이 들어가기\n\n### 1. 왜 normalization이 필요한가\n\n헤더는 문자열이다.\n\n- 공격자가 임의로 넣을 수 있다\n- 중간 프록시가 여러 번 붙으면 값이 길어질 수 있다\n- 서로 다른 형식이 섞일 수 있다\n\n그래서 \"읽기\"보다 \"정리\"가 먼저다.\n\n### 2. chain에서 어떤 일이 일어나나\n\n예를 들어 체인이 다음과 같다면:\n\n```text\nClient -> CDN -> WAF -> LB -> Proxy -> App\n```\n\n각 홉은 다음 역할을 한다.\n\n- CDN/WAF: 외부 입력을 제거하고 신뢰 가능한 정보를 남긴다\n- LB: 원본 IP와 proto를 정리한다\n- Proxy: 다시 canonical header를 만든다\n- App: 마지막으로 trusted chain만 읽는다\n\n### 3. 잘못된 normalization이 만드는 문제\n\n- 헤더가 중복된다\n- IP 순서가 뒤집힌다\n- proto/host가 일치하지 않는다\n- trust boundary 밖의 값이 남는다\n\n### 4. 왜 canonical form이 중요한가\n\n운영과 로그 분석은 한 가지 형태를 기대한다.\n\n- `Forwarded`만 쓰거나\n- `X-Forwarded-*`만 쓰거나\n- 둘을 함께 쓰더라도 우선순위를 정해야 한다\n\n형식이 일정하지 않으면 tracing이 꼬인다.\n\n### 5. 어디서 끊어야 하나\n\n외부 경계에서 들어온 값은 한 번 초기화하는 편이 안전하다.\n\n- 익명 client header는 버린다\n- trusted proxy가 재작성한다\n- app은 마지막 chain만 읽는다\n\n## 실전 시나리오\n\n### 시나리오 1: 로그마다 client IP가 다르게 나온다\n\n정규화 규칙이 홉마다 달라졌을 수 있다.\n\n### 시나리오 2: proto가 http로 찍혀 secure cookie가 깨진다\n\nproxy chain 중간에서 `X-Forwarded-Proto`가 재작성되지 않았을 수 있다.\n\n### 시나리오 3: CDN 뒤에서만 rate limit이 이상하다\n\ntrust boundary 밖의 헤더가 chain에 섞였을 가능성이 있다.\n\n## 코드로 보기\n\n### Nginx 정규화 감각\n\n```nginx\nproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\nproxy_set_header X-Forwarded-Proto $scheme;\nproxy_set_header X-Forwarded-Host $host;\n```\n\n### HAProxy 감각\n\n```haproxy\nhttp-request del-header X-Forwarded-For\nhttp-request set-header X-Forwarded-For %[src]\n```\n\n### 체크 포인트\n\n```text\n- external headers are stripped\n- trusted proxy headers are rewritten\n- app sees canonical chain only\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| append only | 구현이 쉽다 | 공격자 값이 남을 수 있다 | 내부 통제 낮음 |\n| rewrite at boundary | 신뢰성이 높다 | 설정이 늘어난다 | 일반 운영 |\n| strict canonicalization | 분석이 쉽다 | 호환성 조정이 필요하다 | 대규모 체인 |\n\n핵심은 \"헤더를 전달했다\"가 아니라 **신뢰 가능한 형태로 정리했다**다.\n\n## 꼬리질문\n\n> Q: proxy header normalization이 왜 필요한가요?\n> 핵심: 여러 홉을 거치며 들어온 값을 신뢰 가능한 형태로 정리해야 하기 때문이다.\n\n> Q: append만 하면 안 되나요?\n> 핵심: 외부 입력이 섞인 채 남아 trust boundary가 흐려질 수 있다.\n\n> Q: app은 무엇을 믿어야 하나요?\n> 핵심: canonicalized chain과 trusted proxy가 다시 쓴 값만 믿어야 한다.\n\n## 한 줄 정리\n\nproxy 헤더는 단순 전달이 아니라 각 홉에서 정규화해야 하며, canonical chain만 남겨야 trust boundary가 유지된다.\n",
   "aliases": [
-    "Proxy Header Normalization Chain, 개념",
-    "Proxy Header Normalization Chain, 정리",
-    "Proxy Header Normalization Chain, 실수",
-    "Proxy Header Normalization Chain, 판단 기준",
     "네트워크 Proxy Header Normalization Chain,",
     "proxy header normalization",
     "proxy chain trust boundary",
@@ -17,7 +13,9 @@
     "Forwarded header rewriting",
     "header sanitization",
     "ingress chain canonicalization",
-    "X-Forwarded-Proto secure cookie"
+    "X-Forwarded-Proto secure cookie",
+    "X-Forwarded-For를 어디서부터 믿어야 해?",
+    "외부 Forwarded header는 왜 지워야 해?"
   ],
   "expected_queries": [
     "proxy chain에서 X-Forwarded-For를 어떻게 normalize해야 안전해?",
@@ -56,12 +54,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/proxy-header-normalization-chain-trust-boundary.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

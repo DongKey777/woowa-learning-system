@@ -6,10 +6,6 @@
   "summary": "GRE와 IPsec 터널은 헤더 오버헤드를 더해 실제 MTU를 줄이므로, PMTUD와 MSS clamp를 같이 보지 않으면 조용한 blackhole이 생긴다.",
   "body_markdown": "# GRE, IPsec Tunnel MTU Effects\n\n> 한 줄 요약: GRE와 IPsec 터널은 헤더 오버헤드를 더해 실제 MTU를 줄이므로, PMTUD와 MSS clamp를 같이 보지 않으면 조용한 blackhole이 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [MTU, PMTUD, ICMP Blackhole Path Diagnostics](./mtu-pmtud-icmp-blackhole-path-diagnostics.md)\n> - [MTU, Fragmentation, MSS, Blackhole](./mtu-fragmentation-mss-blackhole.md)\n> - [Packet Loss, Jitter, Reordering Diagnostics](./packet-loss-jitter-reordering-diagnostics.md)\n> - [NAT64, DNS64 Intuition](./nat64-dns64-operational-intuition.md)\n> - [Anycast Routing Trade-offs, Edge Failover](./anycast-routing-tradeoffs-edge-failover.md)\n\nretrieval-anchor-keywords: GRE, IPsec, tunnel MTU, encapsulation overhead, MSS clamp, PMTUD, blackhole, tunnel header, VPN path\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nGRE와 IPsec은 패킷을 또 한 번 감싸기 때문에 실제로 보낼 수 있는 payload가 줄어든다.\n\n- tunnel header overhead가 생긴다\n- 경로 MTU가 예상보다 작아진다\n- PMTUD가 깨지면 blackhole이 된다\n\n### Retrieval Anchors\n\n- `GRE`\n- `IPsec`\n- `tunnel MTU`\n- `encapsulation overhead`\n- `MSS clamp`\n- `PMTUD`\n- `blackhole`\n- `tunnel header`\n- `VPN path`\n\n## 깊이 들어가기\n\n### 1. 왜 MTU가 줄어드나\n\n터널은 원래 패킷을 다른 패킷에 넣는다.\n\n- GRE 헤더가 추가된다\n- IPsec이 암호화/인증 오버헤드를 더한다\n- 실제로 남는 payload가 작아진다\n\n오버헤드는 조합마다 다르다. GRE key/checksum 사용 여부, outer IPv4/IPv6,\nESP tunnel mode, NAT-T UDP/4500, cipher padding과 authentication tag에 따라\n남는 MTU가 달라진다. 그래서 \"GRE/IPsec이면 항상 몇 바이트\"처럼 외우기보다\n현재 터널 설정으로 effective MTU를 계산하고 측정해야 한다.\n\n### 2. 왜 조용히 실패하나\n\n터널 뒤쪽의 경로 MTU가 작아도 ICMP가 막히면 송신자가 못 배운다.\n\n- 작은 요청은 된다\n- 큰 응답만 실패한다\n- retry로도 잘 안 풀린다\n\nPMTUD가 동작하려면 IPv4의 `Fragmentation Needed` 또는 IPv6의 `Packet Too Big`\n피드백이 돌아와야 한다. 중간 방화벽이 이 ICMP를 막거나 IPsec 장비가 fragment를\n정책상 버리면 애플리케이션에는 timeout, partial download, random packet loss처럼\n보일 수 있다.\n\n### 3. GRE와 IPsec이 같이 쓰이면\n\n오버헤드가 더 커진다.\n\n- 패킷이 더 쉽게 fragment 된다\n- PMTUD 의존도가 높아진다\n- MSS clamp가 사실상 필요할 수 있다\n\n단, MSS clamp는 TCP SYN에서 MSS를 낮추는 완화책이다. UDP, QUIC, 일부 ICMP,\n이미 열린 long-lived connection에는 직접 적용되지 않는다. HTTP/3나 VPN 위 UDP\n트래픽이 문제라면 interface MTU, application datagram size, tunnel policy까지\n따로 낮춰야 한다.\n\n### 4. 어디서 흔한가\n\n- site-to-site VPN\n- 사내망 연결\n- 클라우드 간 터널\n- edge to edge 보안 경로\n\n### 5. 운영에서 보아야 할 것\n\n- tunnel mode인지 transport mode인지\n- 실제 경로 MTU\n- ICMP 차단 여부\n- MSS clamp 적용 여부\n\n### 6. 운영 playbook\n\n터널 MTU 사고는 \"패킷 손실\"로 뭉뚱그리면 느리게 잡힌다. 먼저 transport와 방향을 나눈다.\n\n| 관찰 | 1차 의심 | 바로 확인할 증거 |\n|---|---|---|\n| 작은 요청은 되고 큰 응답만 실패 | return path MTU blackhole | 응답 방향 packet size, ICMP too-big 수신 여부 |\n| TCP만 안정되고 UDP/QUIC만 실패 | MSS clamp가 TCP에만 먹힘 | UDP datagram size, tunnel interface MTU |\n| 특정 VPN 사용자만 실패 | client tunnel profile 차이 | client MTU, NAT-T 여부, split tunnel policy |\n| fragment가 보이는데 tail latency가 큼 | outer fragmentation/reassembly 비용 | fragment loss, reassembly drop, IPsec policy log |\n\n실전 순서는 보통 이렇게 둔다.\n\n1. 문제가 TCP인지 UDP/QUIC인지 먼저 나눈다.\n2. client -> server와 server -> client 방향을 따로 측정한다.\n3. 현재 tunnel 조합의 header overhead를 계산하고 effective MTU를 잡는다.\n4. ICMP `Fragmentation Needed` 또는 `Packet Too Big`이 돌아오는지 packet capture로 본다.\n5. TCP라면 MSS clamp가 SYN 양방향에 실제 반영되는지 확인한다.\n6. TCP 외 트래픽도 실패하면 tunnel interface MTU나 application payload size까지 낮춘다.\n\n## 실전 시나리오\n\n### 시나리오 1: 터널 안에서만 큰 응답이 실패한다\n\nMTU blackhole 또는 MSS mismatch를 의심한다.\n\n### 시나리오 2: IPsec을 붙인 뒤 느려졌다\n\npacketization이 바뀌고 재전송이 늘었을 수 있다.\n\n### 시나리오 3: 특정 VPN 사용자만 이상하다\n\nclient-side tunnel MTU가 다를 수 있다.\n\n## 코드로 보기\n\n### 확인 명령\n\n```bash\nip link show\nip route get 203.0.113.10\ntracepath 203.0.113.10\nping -M do -s 1372 203.0.113.10\n```\n\n### 관찰 포인트\n\n```text\n- encapsulation overhead\n- actual path MTU\n- ICMP feedback\n- MSS clamp present?\n- TCP only or UDP/QUIC affected?\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| GRE/IPsec tunnel | 보안과 연결성이 좋다 | MTU 오버헤드가 생긴다 | 사내/사이트 간 연결 |\n| direct routing | 단순하다 | 보안과 경로 통제가 약하다 | 단순 경로 |\n| tunnel + MSS clamp | blackhole 완화 | 근본 MTU를 바꾸진 않는다 | 운영 안정화 |\n| tunnel interface MTU 축소 | TCP 외 트래픽에도 일관되다 | payload 효율이 줄고 전체 경로 영향이 크다 | 터널 내부 전체가 blackhole일 때 |\n\n핵심은 터널을 넣을수록 경로 MTU를 다시 계산해야 한다는 점이다.\n\n### 운영 caveat\n\n- 터널 장비가 outer packet fragmentation을 허용한다고 해서 좋은 상태는 아니다. fragment 손실, 재조립 비용, IPsec policy drop 때문에 tail failure가 늘 수 있다.\n- DF bit를 지우거나 fragment를 허용하는 방식은 증상 완화일 수 있지만 PMTUD 문제를 숨긴다. 장기적으로는 ICMP feedback, tunnel MTU, MSS/packet size를 맞추는 편이 낫다.\n- 한쪽 방향만 실패할 수 있다. 요청은 작고 응답만 큰 API라면 client에서 server로의 path보다 server에서 client로 돌아오는 tunnel path MTU를 따로 봐야 한다.\n\n## 꼬리질문\n\n> Q: GRE/IPsec이 왜 MTU를 줄이나요?\n> 핵심: 패킷에 추가 헤더와 암호화 오버헤드가 붙기 때문이다.\n\n> Q: 왜 blackhole이 생기나요?\n> 핵심: PMTUD 피드백이 막히면 송신자가 큰 패킷을 계속 보내기 때문이다.\n\n> Q: MSS clamp는 왜 쓰나요?\n> 핵심: 터널 뒤의 실제 MTU에 맞춰 처음부터 작게 보내기 위해서다.\n\n## 한 줄 정리\n\nGRE와 IPsec 터널은 encapsulation overhead로 실제 MTU를 줄이므로, PMTUD와 MSS clamp를 함께 맞추되 TCP 외 트래픽과 터널별 오버헤드 차이까지 확인해야 한다.\n",
   "aliases": [
-    "GRE, IPsec Tunnel MTU 개념",
-    "GRE, IPsec Tunnel MTU 정리",
-    "GRE, IPsec Tunnel MTU 실수",
-    "GRE, IPsec Tunnel MTU 판단 기준",
     "네트워크 GRE, IPsec Tunnel MTU",
     "GRE IPsec tunnel MTU",
     "tunnel MTU",
@@ -17,7 +13,9 @@
     "MSS clamp",
     "PMTUD blackhole",
     "VPN path MTU",
-    "gre ipsec tunnel mtu guide"
+    "gre ipsec tunnel mtu guide",
+    "VPN에서 큰 파일만 안 받아져요",
+    "터널 붙인 뒤 MTU를 다시 잡아야 해?"
   ],
   "expected_queries": [
     "GRE와 IPsec 터널을 쓰면 MTU가 왜 줄고 MSS clamp가 왜 필요해?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/gre-ipsec-tunnel-mtu-effects.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

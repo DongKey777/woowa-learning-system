@@ -6,10 +6,6 @@
   "summary": "Consistent Hashing의 재배치 비용은 이론상 이동 key 비율뿐 아니라 vnode 편차, replica 정책, cache miss, migration throttle이 만든 운영 비용까지 함께 계산해야 한다.",
   "body_markdown": "# Consistent Hashing Rebalancing Cost Model\n\n> 한 줄 요약: Consistent Hashing의 재배치 비용은 이론상 이동 key 비율뿐 아니라 vnode 편차, replica 정책, cache miss, migration throttle이 만든 운영 비용까지 함께 계산해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Consistent Hashing Ring](./consistent-hashing-ring.md)\n> - [HashMap 내부 구조](./hashmap-internals.md)\n> - [Top-k Streaming and Heavy Hitters](../algorithm/top-k-streaming-heavy-hitters.md)\n\n> retrieval-anchor-keywords: consistent hashing rebalancing cost, vnode distribution, key movement, shard migration, rehash cost, partition movement, load skew, cluster expansion, rebalance model\n\n## 핵심 개념\n\nConsistent hashing을 쓴다고 재배치 비용이 0이 되는 건 아니다.\n중요한 건 \"얼마나 많이 옮겨야 하느냐\"를 모델링하는 것이다.\n\n재배치 비용은 대략 다음에 좌우된다.\n\n- 추가/삭제된 노드 수\n- vnode 수\n- 키 분포의 편차\n- replica 정책\n- key당 byte 크기와 rebuild bandwidth\n- 이동 중 cache hit rate와 tail latency 예산\n\n## 깊이 들어가기\n\n### 1. 왜 전체가 아니라 일부만 움직이나\n\n링에서 노드가 바뀌면 그 노드의 구간만 주로 영향받는다.\n\n즉 전체 키를 다 옮기지 않고 국소적인 key range만 이동한다.\n\n감각적으로는 균등한 ring에서 노드가 `N -> N + 1`로 늘면 새 노드가 맡는 구간, 즉 전체의 약 `1 / (N + 1)`이 새 소유자로 이동한다.\n노드 하나가 사라지면 그 노드가 갖고 있던 약 `1 / N` 구간이 successor 쪽으로 이동한다.\n이 숫자는 평균값이고, 실제 값은 vnode 배치와 key skew 때문에 흔들린다.\n\n### 2. vnode 개수의 영향\n\nvnode가 많을수록 분포가 좋아지고, 단일 물리 노드가 먹는 편차가 줄어든다.\n\n하지만 vnode가 너무 많으면 관리 오버헤드가 커진다.\n\nvnode는 \"이동 총량을 0으로 만드는 장치\"가 아니라 \"이동 단위를 잘게 쪼개 편차와 hotspot을 줄이는 장치\"다.\nvnode 수를 늘리면 다음 비용도 같이 늘 수 있다.\n\n- ring metadata 크기\n- owner map 배포 비용\n- routing cache invalidation 비용\n- migration task 수와 progress tracking 비용\n\n### 3. 비용 모델링 감각\n\n실무에서는 다음을 같이 본다.\n\n- 이동해야 하는 key 수\n- 이동 중 캐시 미스 비용\n- metadata 업데이트 비용\n- replica 재배치 비용\n\n즉 \"몇 개 옮겼나\"만이 아니라 \"옮기는 동안 시스템이 얼마나 흔들리나\"도 중요하다.\n\n간단한 1차 모델은 아래처럼 잡을 수 있다.\n\n| 항목 | 계산 감각 |\n|---|---|\n| primary key movement | 추가 노드: `totalKeys / newNodeCount`, 제거 노드: 제거 노드의 실제 owned keys |\n| bytes to copy | `movedKeys * averageValueBytes` plus metadata/serialization overhead |\n| replica rebuild | replica factor와 placement policy에 따라 primary 이동보다 커질 수 있다 |\n| cache miss debt | 이동된 key 중 warm cache가 사라지는 비율과 refill latency |\n| control-plane cost | ring version 배포, client refresh, stale owner retry |\n\nreplica가 `R`개라고 해서 비용이 항상 정확히 `R`배는 아니다.\nread replica만 재워밍하면 되는 경우도 있고, quorum/write placement가 바뀌면 primary 이동보다 더 넓은 owner set이 흔들릴 수도 있다.\n\n### 4. backend 운영에서의 의미\n\n클러스터 확장이나 장애 조치에서 rebalancing은 흔하다.\n\n- 새 노드 투입\n- 장애 노드 제거\n- 테넌트 재배치\n\n정책이 없으면 consistent hashing도 운영이 어려워진다.\n\n운영 playbook에는 보통 다음 guard가 필요하다.\n\n- migration concurrency와 MB/s throttle\n- old owner와 new owner의 dual-read 또는 forwarding 기간\n- ring version mismatch 감지\n- hot key 별도 pinning 또는 split 정책\n- rollback 시 owner map을 되돌릴 수 있는 versioned metadata\n\nstop condition도 명시해야 한다.\n\n- p95/p99 latency가 예산을 넘는다\n- cache hit rate가 사전 정의한 하한 아래로 떨어진다\n- owner mismatch, duplicate write, stale read가 관측된다\n- migration backlog가 줄지 않고 증가한다\n- hot vnode 하나가 migration bandwidth 대부분을 독점한다\n\n## 실전 시나리오\n\n### 시나리오 1: 캐시 클러스터 확장\n\n새 노드를 추가할 때 전체 캐시를 비우지 않아도 된다.\n\n하지만 이동된 key는 새 노드에서 cold miss가 날 수 있다.\n확장 직후 miss storm이 문제라면 이동량보다 warm-up 속도, backend DB 보호, admission 정책을 먼저 본다.\n\n### 시나리오 2: 장애 복구\n\n특정 샤드가 사라져도 주변 노드가 그 구간만 흡수하면 된다.\n\n### 시나리오 3: 오판\n\n재배치 비용이 작다고 무조건 좋진 않다.\n운영 메타데이터와 key skew가 심하면 여전히 병목이 된다.\n\n또 \"평균 이동 비율\"만 보면 hot key가 숨어버린다.\n상위 key traffic이 특정 vnode에 몰려 있으면 이동 key 수는 작아도 latency 영향은 클 수 있다.\n\n## 코드로 보기\n\n```java\npublic class RebalancingCostModel {\n    public long estimateAddedNodeMovedKeys(long totalKeys, int oldPhysicalNodes) {\n        if (oldPhysicalNodes <= 0) return totalKeys;\n        int newPhysicalNodes = oldPhysicalNodes + 1;\n        return Math.max(1, totalKeys / newPhysicalNodes);\n    }\n\n    public long estimateRemovedNodeMovedKeys(long removedNodeOwnedKeys) {\n        return Math.max(0, removedNodeOwnedKeys);\n    }\n\n    public long estimateCopyBytes(long movedKeys, long averageValueBytes, int replicaWrites) {\n        int copies = Math.max(1, replicaWrites);\n        return movedKeys * averageValueBytes * copies;\n    }\n}\n```\n\n이 코드는 균등 분포 가정의 출발점일 뿐이다.\n실전에서는 실제 vnode별 key count, byte size, QPS, hot key 분포를 측정값으로 넣어 보정해야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Consistent Hashing | 일부 키만 옮긴다 | vnode/운영 정책이 필요하다 | 노드 변동이 잦을 때 |\n| Full Rehash | 단순하다 | 모든 키가 이동한다 | 작은 시스템 |\n| Central Repartition | 제어가 쉽다 | 중앙 제어점이 생긴다 | 명시적 운영이 중요할 때 |\n\n## 꼬리질문\n\n> Q: 왜 vnode가 재배치 비용에 영향을 주나?\n> 의도: 분포와 이동 단위를 이해하는지 확인\n> 핵심: 더 잘게 나눌수록 이동이 고르게 분산되기 때문이다.\n\n> Q: rebalancing cost는 무엇으로 구성되나?\n> 의도: 운영 비용을 단순 key move 이상으로 보는지 확인\n> 핵심: key 이동, metadata, cache miss, replica 비용이다.\n\n> Q: consistent hashing이 있다고 운영이 끝나는가?\n> 의도: 설계와 운영을 구분하는지 확인\n> 핵심: 아니다. 정책과 관측이 필요하다.\n\n## 한 줄 정리\n\nConsistent hashing의 재배치 비용은 이동되는 키 구간 크기와 vnode 분포, replica 정책을 함께 봐야 현실적으로 판단할 수 있다.\n",
   "aliases": [
-    "Consistent Hashing Rebalancing Cost 개념",
-    "Consistent Hashing Rebalancing Cost 정리",
-    "Consistent Hashing Rebalancing Cost 실수",
-    "Consistent Hashing Rebalancing Cost 판단 기준",
     "자료구조 Consistent Hashing Rebalancing Cost",
     "consistent hashing rebalancing cost",
     "vnode distribution",
@@ -17,7 +13,9 @@
     "shard migration cost",
     "cluster expansion rebalance",
     "partition movement",
-    "load skew consistent hashing"
+    "load skew consistent hashing",
+    "consistent hashing도 migration 비용 있나요",
+    "vnode 수가 skew를 줄이는 이유"
   ],
   "expected_queries": [
     "Consistent Hashing에서 노드 추가 삭제 시 실제로 얼마나 많은 key가 움직여?",
@@ -51,12 +49,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/data-structure/consistent-hashing-rebalancing-cost-model.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "affinity는 특정 코어에 작업과 인터럽트를 붙여 locality를 살리는 도구지만, 잘못 고정하면 한 코어만 뜨거워지고 나머지는 놀게 된다.",
   "body_markdown": "# CPU Affinity, IRQ Affinity, Core Locality\n\n> 한 줄 요약: affinity는 특정 코어에 작업과 인터럽트를 붙여 locality를 살리는 도구지만, 잘못 고정하면 한 코어만 뜨거워지고 나머지는 놀게 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Softirq, Hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)\n> - [Run Queue, Load Average, CPU Saturation](./run-queue-load-average-cpu-saturation.md)\n> - [CPU Migration, Load Balancing, Locality Debugging](./cpu-migration-load-balancing-locality-debugging.md)\n> - [AutoNUMA vs Manual Locality Trade-offs](./autonuma-vs-manual-locality-tradeoffs.md)\n> - [Scheduler Classes, nice, RT Trade-offs](./scheduler-classes-nice-rt-tradeoffs.md)\n> - [NUMA Auto Balancing, Runtime Debugging](./numa-autobalancing-runtime-debugging.md)\n> - [CFS Scheduler, nice, CPU Fairness](./cfs-scheduler-nice-cpu-fairness.md)\n\n> retrieval-anchor-keywords: cpu affinity, irq affinity, taskset, sched_setaffinity, smp_affinity, core locality, cache locality, RSS, NUMA node, hot core\n\n## 핵심 개념\n\nCPU affinity는 특정 프로세스나 스레드를 특정 CPU에 가깝게 묶는 설정이다. IRQ affinity는 장치 인터럽트를 특정 CPU에 배정하는 설정이다. 둘 다 locality를 높이기 위한 수단이지만, 과하면 균형이 깨진다.\n\n- `sched_setaffinity`: 태스크의 CPU 집합을 제한한다\n- `smp_affinity`: IRQ가 어느 CPU에서 처리될지 정한다\n- `core locality`: 자주 쓰는 캐시와 데이터가 같은 코어 근처에 남는 성질이다\n- `hot core`: 한 코어에 일과 인터럽트가 몰린 상태다\n\n왜 중요한가:\n\n- locality는 좋아질 수 있지만 부하 분산은 나빠질 수 있다\n- IRQ와 worker가 같은 코어에 붙으면 경합이 커질 수 있다\n- NUMA와 함께 보면 더 복잡해진다\n\n이 문서는 [Softirq, Hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)와 [NUMA Auto Balancing, Runtime Debugging](./numa-autobalancing-runtime-debugging.md)를 CPU 배치 관점으로 연결한다.\n\n## 깊이 들어가기\n\n### 1. affinity는 캐시 locality를 돕는다\n\n작업을 같은 코어 근처에서 돌리면 캐시가 재사용될 가능성이 높다.\n\n- hot data가 같은 코어에 남는다\n- TLB와 cache miss를 줄일 수 있다\n- 하지만 분산이 부족하면 병목이 생긴다\n\n### 2. IRQ affinity는 네트워크와 저장장치 latency에 직접 영향이 있다\n\n인터럽트를 어느 CPU가 처리하느냐는 실제 packet completion과 wakeup latency에 연결된다.\n\n- 너무 흩어지면 cache locality가 깨진다\n- 너무 모이면 한 코어가 포화된다\n- worker affinity와 맞춰야 한다\n\n### 3. affinity는 고정이 아니라 설계다\n\n- CPU pinning\n- IRQ pinning\n- NUMA node alignment\n- worker placement\n\n이걸 같이 설계해야 한다. 한 가지만 고정하면 다른 축이 흔들릴 수 있다.\n\n### 4. affinity는 throughput과 tail latency 사이 선택이다\n\n일반적으로 locality가 좋아지면 평균은 좋아질 수 있지만, hot core가 생기면 꼬리 지연이 나빠질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 특정 CPU만 100%에 가깝다\n\n가능한 원인:\n\n- task affinity가 지나치게 좁다\n- IRQ가 한 코어에 몰린다\n- worker와 interrupt가 같은 코어에서 싸운다\n\n진단:\n\n```bash\ntop -H\ntaskset -cp <pid>\ncat /proc/interrupts\n```\n\n### 시나리오 2: affinity를 주고 나서 성능이 좋아졌다가 다시 흔들린다\n\n가능한 원인:\n\n- hot core가 생겼다\n- batch/interrupt와 API가 섞인다\n- NUMA locality는 좋아졌지만 load balance가 깨졌다\n\n### 시나리오 3: 네트워크 latency만 이상하게 튄다\n\n가능한 원인:\n\n- IRQ affinity가 network worker와 안 맞는다\n- softirq가 특정 CPU를 잡아먹는다\n- cache locality보다 load imbalance가 더 크다\n\n이 경우는 [Softirq, Hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)도 함께 본다.\n\n## 코드로 보기\n\n### 프로세스 affinity 보기\n\n```bash\ntaskset -cp <pid>\n```\n\n### IRQ affinity 보기\n\n```bash\nfor i in /proc/irq/*/smp_affinity_list; do echo \"$i\"; cat \"$i\"; done | head\n```\n\n### affinity 변경 예시\n\n```bash\ntaskset -cp 0,1 <pid>\n```\n\n### 단순 모델\n\n```text\naffinity improves locality\n  -> cache hits rise\n  -> but load balance can collapse\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| pinning 강화 | locality가 좋아진다 | hot core가 생길 수 있다 | low-latency path |\n| pinning 완화 | load balance가 좋아진다 | cache miss가 늘 수 있다 | 일반 서버 |\n| IRQ 분산 | 특정 코어 포화를 줄인다 | locality가 깨질 수 있다 | NIC/스토리지 집약 |\n| worker/IRQ alignment | completion latency를 줄인다 | 운영 설계가 복잡하다 | latency-sensitive service |\n\n## 꼬리질문\n\n> Q: CPU affinity와 IRQ affinity는 왜 같이 보나요?\n> 핵심: 인터럽트와 워커가 같은 데이터와 캐시를 공유하기 때문이다.\n\n> Q: affinity를 주면 무조건 빨라지나요?\n> 핵심: 아니다. locality는 좋아져도 load balance가 깨질 수 있다.\n\n> Q: hot core가 왜 문제가 되나요?\n> 핵심: 한 코어만 포화되고 tail latency가 튀기 때문이다.\n\n## 한 줄 정리\n\nCPU affinity와 IRQ affinity는 locality를 살리지만, 균형을 잃으면 한 코어 포화와 latency 악화를 만들 수 있다.\n",
   "aliases": [
-    "CPU Affinity IRQ Affinity 개념",
-    "CPU Affinity IRQ Affinity 정리",
-    "CPU Affinity IRQ Affinity 실수",
-    "CPU Affinity IRQ Affinity 판단 기준",
     "운영체제 CPU Affinity IRQ Affinity",
     "CPU affinity IRQ affinity",
     "core locality",
@@ -17,7 +13,8 @@
     "hot core imbalance",
     "CPU pinning locality",
     "interrupt affinity tuning",
-    "cpu affinity irq affinity guide"
+    "taskset으로 고정했는데 한 코어만 뜨거워",
+    "IRQ affinity도 같이 맞춰야 해?"
   ],
   "expected_queries": [
     "CPU affinity와 IRQ affinity는 core locality를 어떻게 개선하거나 망칠 수 있어?",
@@ -46,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/cpu-affinity-irq-affinity-core-locality.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

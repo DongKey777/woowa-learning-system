@@ -7,17 +7,15 @@
   "body_markdown": "# Domain Service vs Pattern Abuse\n\n> 한 줄 요약: Domain Service는 엔티티에 넣기 어려운 도메인 규칙을 담는 용도지만, 책임이 쌓이면 곧바로 패턴 과사용과 God Service가 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Ports and Adapters vs GoF 패턴](./ports-and-adapters-vs-classic-patterns.md)\n> - [Specification Pattern](./specification-pattern.md)\n> - [Transaction Script vs Rich Domain Model](./transaction-script-vs-rich-domain-model.md)\n> - [상태 패턴: 워크플로와 결제 상태를 코드로 모델링하기](./state-pattern-workflow-payment.md)\n> - [안티 패턴](./anti-pattern.md)\n> - [God Object / Spaghetti / Golden Hammer](./god-object-spaghetti-golden-hammer.md)\n\n---\n\n## 핵심 개념\n\nDomain Service는 DDD에서 **엔티티나 값 객체에 넣기 어색한 도메인 규칙**을 담는 객체다.  \n하지만 이름에 \"Service\"가 붙는 순간 모든 로직이 빨려 들어가면서 패턴 과사용이 발생하기 쉽다.\n\n이 문서가 다루는 핵심은 두 가지다.\n\n- 언제 Domain Service가 필요한가\n- 언제 Domain Service가 사실상 비대해진 잡동사니인지\n\n판별 질문은 단순하다. **이 객체가 도메인 판단을 하는가, 아니면 유스케이스 진행과 인프라 호출을 조립하는가**다. 전자는 Domain Service 후보이고, 후자는 Application Service나 orchestrator 경계에 더 가깝다.\n\n## chooser table\n\n| 넣고 싶은 로직 | 더 맞는 위치 | 이유 | 잘못 넣었을 때 냄새 |\n|---|---|---|---|\n| 주문 상태가 `PAID`일 때만 취소 가능 | `Order` entity/state object | 한 aggregate의 현재 상태 불변식이다 | Domain Service가 단순 getter 조합 helper가 된다 |\n| 주문 총액과 회원 등급으로 할인율 계산 | `DiscountPolicy` 또는 policy object | 정책 변동 축이 독립적이고 테스트 단위가 선명하다 | `OrderService`가 할인 if문 저장소가 된다 |\n| 두 계좌 간 송금 가능 여부 판단 | Domain Service | source/target/account limit처럼 한 entity에 넣기 어색한 도메인 판단이다 | 억지로 한 entity가 상대 entity 규칙까지 알게 된다 |\n| 주문 생성, 저장, outbox 기록, 알림 요청 | Application Service / use case | 흐름 조립과 transaction boundary 결정이다 | Domain Service가 persistence와 external call을 품는다 |\n| PG 승인 요청, 배송 API 호출 | Port/adapter를 application layer가 호출 | 외부 시스템 protocol이지 domain rule이 아니다 | 도메인 테스트가 네트워크 실패 모델에 묶인다 |\n| 화면 DTO 변환, paging, admin search | Query Service / Read Model | read contract와 표현 요구다 | Domain Service가 조회 모델 조립기가 된다 |\n\n## wrong-bucket examples\n\n| 잘못된 분류 | 왜 틀렸나 | 더 나은 bucket |\n|---|---|---|\n| `OrderDomainService.cancel(orderId)`가 repository에서 주문을 찾고 저장까지 한다 | 도메인 판단보다 use case orchestration이 중심이다 | `CancelOrderUseCase`가 load/save, `Order.cancel()`이 invariant |\n| `PaymentDomainService.approve()`가 PG client를 직접 호출한다 | 외부 승인 protocol을 도메인 규칙으로 착각했다 | application service + `PaymentGatewayPort` |\n| 모든 validation을 `OrderService.validate()`에 둔다 | 형식 검증, 권한 검증, 도메인 불변식이 한 bucket에 섞인다 | layered validation + entity guard + policy |\n| service를 줄이려고 모든 정책을 `Order`에 넣는다 | aggregate가 모르는 외부 정책과 다른 aggregate 판단까지 끌어온다 | entity, policy, domain service를 규칙 성격별로 분리 |\n\n### Retrieval Anchors\n\n- `domain service`\n- `application service`\n- `anemic domain model`\n- `transaction script`\n- `rich domain model`\n- `god service`\n- `pattern abuse`\n\n---\n\n## 깊이 들어가기\n\n### 1. Domain Service가 필요한 경우\n\n엔티티 한 개의 책임으로 표현하기 어려운 도메인 규칙이 있을 때다.\n\n- 여러 엔티티를 함께 판단해야 한다\n- 정책이 도메인 언어로 존재한다\n- 값 객체나 엔티티에 넣으면 의미가 흐려진다\n\n예를 들어 \"두 계정 사이의 송금 가능 여부\"는 한 계정 엔티티만으로는 설명하기 어렵다.\n\n### 2. Service가 과해지는 신호\n\n- `UserService`, `OrderService`, `PaymentService`가 모든 걸 처리한다\n- 상태 변경, 검증, 외부 호출, 매핑이 한 클래스에 섞인다\n- 같은 서비스 안에 유스케이스와 도메인 규칙이 뒤섞인다\n- 메서드가 엔티티 생성, 검증, 저장, 이벤트 발행까지 다 한다\n\n이때는 Domain Service가 아니라 **Application Service + Domain Model + Policy Object**로 나눠야 할 가능성이 크다.\n\n### 3. 엔티티 행동을 먼저 의심해보자\n\n서비스를 만들기 전에 먼저 묻는 게 좋다.\n\n- 이 규칙은 엔티티의 상태와 직접 관련이 있는가\n- 이 규칙은 여러 애그리게잇을 함께 다뤄야 하는가\n- 이 규칙은 정책 객체나 상태 객체로 더 자연스럽지 않은가\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 송금 서비스\n\n송금 가능 여부, 한도 검사, 수수료 계산은 계좌 하나의 메서드보다 Domain Service가 적합할 수 있다.\n\n### 시나리오 2: 주문 할인 계산\n\n할인 계산이 계속 커지면 Service 대신 Specification이나 Policy Object를 분리하는 편이 낫다.\n\n### 시나리오 3: 주문 취소\n\n취소 가능 여부는 상태 패턴, 취소 수수료는 Policy Object, 흐름 조립은 Application Service가 맡는 식이 더 안전하다.\n\n---\n\n## 코드로 보기\n\n### 적절한 Domain Service\n\n```java\n@Service\npublic class TransferDomainService {\n    public TransferDecision canTransfer(Account source, Account target, Money amount) {\n        if (!source.isActive() || !target.isActive()) {\n            return TransferDecision.denied(\"inactive account\");\n        }\n        if (source.balance().isLessThan(amount)) {\n            return TransferDecision.denied(\"insufficient balance\");\n        }\n        return TransferDecision.allowed();\n    }\n}\n```\n\n### 과해진 Service\n\n```java\n@Service\npublic class OrderService {\n    public void process(OrderRequest request) {\n        validate(request);\n        updateStatus(request);\n        sendEmail(request);\n        publishEvent(request);\n        callExternalApi(request);\n        save(request);\n    }\n}\n```\n\n이런 구조는 도메인 서비스가 아니라 서비스 객체에 모든 책임이 붙은 상태다.\n\n### 나누는 방식\n\n```java\n@Service\npublic class PlaceOrderUseCase {\n    private final DiscountPolicy discountPolicy;\n    private final OrderRepository repository;\n\n    public void place(PlaceOrderCommand command) {\n        int discounted = discountPolicy.apply(command.amount());\n        Order order = Order.place(command, discounted);\n        repository.save(order);\n    }\n}\n```\n\nDomain Service는 도메인 규칙을, Application Service는 유스케이스 흐름을 담당한다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 엔티티 메서드 | 응집도가 높다 | 여러 엔티티 규칙을 담기 어렵다 | 한 개체의 상태 규칙 |\n| Domain Service | 도메인 규칙을 모을 수 있다 | 비대해지기 쉽다 | 여러 엔티티에 걸친 규칙 |\n| Application Service | 흐름이 보인다 | 도메인 규칙이 섞이기 쉽다 | 유스케이스 조립 |\n\n판단 기준은 다음과 같다.\n\n- 상태와 직접 관련된 규칙은 엔티티나 상태 객체로 보낸다\n- 여러 애그리게잇을 함께 다루는 규칙은 Domain Service를 본다\n- 외부 호출, 저장, 이벤트는 Application Service가 조립한다\n\n---\n\n## 꼬리질문\n\n> Q: Domain Service와 Application Service의 차이는 무엇인가요?\n> 의도: 도메인 규칙과 유스케이스 조립을 분리하는지 확인한다.\n> 핵심: 도메인 서비스는 규칙, 애플리케이션 서비스는 흐름이다.\n\n> Q: Service 클래스가 커지면 왜 위험한가요?\n> 의도: 서비스가 God Object가 되는 경로를 아는지 확인한다.\n> 핵심: 책임이 섞여 변경 이유가 한곳에 모인다.\n\n> Q: Service를 줄이기 위해 무조건 엔티티에 로직을 넣어야 하나요?\n> 의도: 극단적으로 반대편으로 가는 실수를 피하는지 확인한다.\n> 핵심: 아니다. 정책 객체, 상태 객체, Specification도 함께 고려해야 한다.\n\n## 한 줄 정리\n\nDomain Service는 여러 엔티티에 걸친 도메인 규칙을 담는 그릇이지만, 책임이 커지면 곧바로 패턴 과사용과 God Service가 된다.\n",
   "aliases": [
     "service에 모든 로직",
-    "Domain Service vs Pattern 개념",
-    "Domain Service vs Pattern 정리",
-    "Domain Service vs Pattern 실수",
-    "Domain Service vs Pattern 판단 기준",
     "domain service",
     "application service",
     "anemic domain model",
     "transaction script",
     "rich domain model",
     "god service",
-    "pattern abuse"
+    "pattern abuse",
+    "Service에 로직이 다 모일 때",
+    "Domain Service와 Application Service 차이"
   ],
   "expected_queries": [
     "Domain Service와 Application Service는 도메인 규칙과 유스케이스 조립 관점에서 어떻게 달라?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/design-pattern/domain-service-vs-pattern-abuse.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch157"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

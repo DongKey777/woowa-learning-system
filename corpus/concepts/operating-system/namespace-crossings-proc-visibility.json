@@ -6,10 +6,6 @@
   "summary": "namespace를 넘나들면 같은 프로세스와 /proc 경로가 다르게 보이므로, 진단은 \"어디서 보고 있나\"를 먼저 고정해야 한다.",
   "body_markdown": "# Namespace Crossings, /proc Visibility\n\n> 한 줄 요약: namespace를 넘나들면 같은 프로세스와 /proc 경로가 다르게 보이므로, 진단은 \"어디서 보고 있나\"를 먼저 고정해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [PID Namespace, Init Semantics](./pid-namespace-init-semantics.md)\n> - [PID Limits, Process Table Exhaustion](./pid-limit-process-table-exhaustion.md)\n> - [FD Exhaustion, ulimit, Diagnostics](./fd-exhaustion-ulimit-diagnostics.md)\n> - [signals, process supervision](./signals-process-supervision.md)\n\n> retrieval-anchor-keywords: namespace crossing, /proc visibility, /proc/PID/ns, /proc/PID/root, nsenter, mount namespace, pid namespace, procfs\n\n## 핵심 개념\n\nnamespace는 프로세스가 보는 세계를 나눈다. `/proc`은 procfs가 마운트된 방식과 조회하는 프로세스의 namespace/capability 영향을 받으므로, namespace를 넘어서면 같은 대상도 다르게 보일 수 있다.\n\n- `procfs`: 프로세스 정보를 보여주는 가상 파일 시스템이다\n- `/proc/<pid>/ns`: 프로세스 namespace 링크를 보여준다\n- `/proc/<pid>/root`: 그 프로세스가 보는 루트다\n\n왜 중요한가:\n\n- host와 container에서 보이는 PID가 다르다\n- mount namespace를 넘으면 파일 경로가 달라진다\n- 진단 위치를 잘못 잡으면 사실과 다르게 해석할 수 있다\n\n이 문서는 [container, cgroup, namespace](./container-cgroup-namespace.md)와 [PID Namespace, Init Semantics](./pid-namespace-init-semantics.md)를 `/proc` 시점에서 묶는다.\n\n## 깊이 들어가기\n\n### 1. /proc은 현재 시야의 산물이다\n\n같은 PID라도 namespace가 다르면 다르게 보인다.\n\n- host와 container의 `/proc`은 같지 않다\n- 진단 대상 프로세스의 namespace를 맞춰야 한다\n- `nsenter`가 중요하다\n- container runtime의 procfs mask, `hidepid`, capability 제한도 visibility에 영향을 줄 수 있다\n\n### 2. namespace crossing은 경로와 권한을 바꾼다\n\n- mount namespace: 파일 경로가 달라진다\n- pid namespace: PID 숫자가 달라진다\n- network namespace: 인터페이스/포트가 달라진다\n\n### 3. /proc visibility는 디버깅의 출발점이다\n\n진단 전에 다음을 먼저 확인한다.\n\n- 지금 host namespace인지\n- target process namespace인지\n- `/proc/<pid>/root`가 어디를 가리키는지\n\n### 4. 경계를 넘나들면 같은 명령도 다르게 동작한다\n\n예를 들어 `ps`, `ls`, `cat /proc/1/status`는 namespace에 따라 전혀 다른 세계를 보여준다.\n\n## 실전 시나리오\n\n### 시나리오 1: 컨테이너 안에서는 PID가 다르게 보인다\n\n가능한 원인:\n\n- PID namespace가 분리됐다\n- host PID와 container PID를 혼동했다\n\n진단:\n\n```bash\nls -l /proc/<pid>/ns\ncat /proc/<pid>/status | grep -E 'NSpid|PPid|Pid'\nnsenter --target <host-pid> --pid --mount --uts --net --preserve-credentials sh\n```\n\n### 시나리오 2: 파일이 있는데 컨테이너 안에서 안 보인다\n\n가능한 원인:\n\n- mount namespace가 다르다\n- `/proc/<pid>/root`가 다른 루트를 가리킨다\n\n### 시나리오 3: 진단 스크립트가 host에서는 되는데 container에서는 다르다\n\n가능한 원인:\n\n- proc visibility 차이\n- capability나 permission 차이\n- namespace crossing 미고려\n\n## 운영 Playbook\n\n### 관찰 증거\n\n- host의 `/proc/<host-pid>/status`에는 `NSpid`가 여러 개 보이는데 container 안 `ps`의 PID와 다르다.\n- `/proc/<pid>/root`, `/proc/<pid>/cwd`, `/proc/<pid>/fd` 링크가 host path와 container path를 다르게 가리킨다.\n- `ss`, `ip addr`, `/proc/net/*` 결과가 host와 target net namespace에서 다르다.\n- `Permission denied`가 namespace 문제가 아니라 capability, LSM, procfs mount option 문제일 수 있다.\n\n### 확인 순서\n\n1. 먼저 관측 위치를 기록한다: host shell, `kubectl exec`, sidecar, `nsenter` 중 어디인가.\n2. host PID를 기준으로 `ls -l /proc/<pid>/ns`와 `cat /proc/<pid>/status | grep NSpid`를 확인한다.\n3. 파일 경로 문제면 `/proc/<pid>/root` 아래에서 같은 path를 다시 본다.\n4. 네트워크 문제면 `nsenter --target <pid> --net ss -lntup`처럼 net namespace를 맞춘다.\n5. signal/fd 진단이면 PID namespace뿐 아니라 권한과 user namespace/capability를 같이 확인한다.\n\n### Failure Matrix\n\n| 증상 | 1차 분기 | 다음 확인 |\n|------|----------|-----------|\n| PID가 host와 container에서 다르다 | PID namespace | `NSpid`, `/proc/<pid>/ns/pid` |\n| 파일이 host에는 있는데 대상 프로세스에는 없다 | mount namespace/root 차이 | `/proc/<pid>/root`, mountinfo |\n| port listen이 한쪽에서만 보인다 | network namespace | `nsenter --net ss`, `/proc/<pid>/ns/net` |\n| `/proc/<pid>/fd` 접근 실패 | 권한/capability/LSM | effective uid, user namespace, AppArmor/SELinux |\n| `kill` 대상이 틀린다 | PID mapping 혼동 | host PID와 namespace PID 매핑 |\n\n### 검증\n\n같은 명령을 host와 target namespace에서 각각 실행해 차이를 의도적으로 확인한다. 원인 설명은 \"container에서 안 보임\"이 아니라 \"PID namespace는 다르고 mount namespace는 같음\"처럼 어떤 namespace가 다른지까지 고정해야 재현 가능하다.\n\n## 코드로 보기\n\n### namespace 링크 확인\n\n```bash\nls -l /proc/<pid>/ns\nls -l /proc/<pid>/root\n```\n\n### namespace 진입\n\n```bash\nnsenter --target <host-pid> --pid --mount --uts --net sh\n```\n\n### `/proc` 시야 고정\n\n```bash\nreadlink /proc/<pid>/ns/pid\nreadlink /proc/<pid>/ns/mnt\ncat /proc/<pid>/mountinfo | head\n```\n\n### 단순 모델\n\n```text\nsame process\n  -> different namespace\n  -> different /proc view\n  -> different diagnosis if context is wrong\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| host에서 진단 | 전체를 본다 | container context를 놓칠 수 있다 | 노드 장애 |\n| namespace 안에서 진단 | 대상과 일치한다 | host와 차이를 이해해야 한다 | 컨테이너 장애 |\n| nsenter 활용 | 정확한 시야를 얻는다 | 사용이 복잡하다 | 심화 분석 |\n\n## 꼬리질문\n\n> Q: /proc은 왜 namespace마다 다르게 보이나요?\n> 핵심: 현재 프로세스의 namespace 시야를 반영하기 때문이다.\n\n> Q: `/proc/<pid>/root`는 무엇을 보여주나요?\n> 핵심: 그 프로세스가 보는 루트 디렉터리다.\n\n> Q: namespace crossing 진단의 첫 단계는?\n> 핵심: 지금 어디 시야에서 보고 있는지 고정하는 것이다.\n\n## 한 줄 정리\n\nnamespace crossing에서는 /proc의 관측 시야가 바뀌므로, host와 container의 PID, root, network를 같은 맥락에서 맞춰 봐야 한다.\n",
   "aliases": [
-    "Namespace Crossings proc Visibility 개념",
-    "Namespace Crossings proc Visibility 정리",
-    "Namespace Crossings proc Visibility 실수",
-    "Namespace Crossings proc Visibility 판단 기준",
     "운영체제 Namespace Crossings proc Visibility",
     "namespace crossing proc visibility",
     "container proc view",
@@ -17,7 +13,8 @@
     "host vs container proc",
     "nsenter diagnostics",
     "process identity namespace",
-    "namespace crossings proc visibility guide"
+    "host와 container에서 PID가 다르게 보여",
+    "nsenter 후 /proc 기준이 바뀌어"
   ],
   "expected_queries": [
     "namespace를 넘나들면 /proc visibility와 PID가 왜 다르게 보여?",
@@ -44,12 +41,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/namespace-crossings-proc-visibility.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

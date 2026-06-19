@@ -6,10 +6,6 @@
   "summary": "Flyweight 패턴은 공유 가능한 내부 상태를 재사용해 메모리를 줄이지만, 외부 상태와 섞이면 캐시처럼 보이는 공유 버그가 생긴다.",
   "body_markdown": "# Flyweight: 캐시와 상태 공유의 경계\n\n> 한 줄 요약: Flyweight 패턴은 공유 가능한 내부 상태를 재사용해 메모리를 줄이지만, 외부 상태와 섞이면 캐시처럼 보이는 공유 버그가 생긴다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Singleton (싱글톤)](./singleton.md)\n> - [Registry Pattern](./registry-pattern.md)\n> - [Prototype Pattern Caveats](./prototype-pattern-caveats.md)\n> - [안티 패턴](./anti-pattern.md)\n\n---\n\n## 핵심 개념\n\nFlyweight는 **많이 생성되는 객체의 공통 상태를 공유해 메모리 사용을 줄이는 패턴**이다.  \n핵심은 내부 상태와 외부 상태를 분리하는 것이다.\n\nbackend에서는 이 패턴이 다음처럼 보인다.\n\n- 대량의 코드 테이블 객체\n- 문서 렌더링 토큰\n- 반복되는 정책 객체\n- 동일 타입의 많은 작은 값 객체\n\n## 10초 chooser\n\n먼저 \"재사용하려는 이유가 메모리인가, 조회 비용/신선도인가\"를 나눈다.\n\n| 10초 질문 | 선택 후보 | wrong-bucket 비용 |\n|---|---|---|\n| 같은 불변 값 객체가 수십만 개 반복되어 메모리가 문제인가? | Flyweight | cache eviction/freshness 설계만 늘고 메모리 중복은 남는다 |\n| 원격 조회나 계산 비용이 비싸서 결과를 잠시 저장하는가? | Cache | 공유 객체에 만료/갱신 정책이 섞여 상태 버그가 난다 |\n| 객체 안에 요청별 좌표, 사용자, 시간, 권한 같은 값이 들어가는가? | Flyweight 아님, 외부 상태 분리 필요 | 한 요청의 값이 다른 요청에 보이는 shared mutable bug가 난다 |\n| 생성 비용보다 동시 사용 개수가 문제인가? | Pool 또는 rate 제한 검토 | Flyweight로 착각해 lifecycle/반납 문제를 놓친다 |\n\n헷갈리는 축은 세 가지다.\n\n- **intrinsic vs extrinsic**: 공유 객체 안에는 변하지 않는 intrinsic state만 둔다.\n- **memory sharing vs freshness**: Flyweight는 신선도 문제를 풀지 않는다. cache는 만료와 invalidation이 핵심이다.\n- **object reuse vs object pool**: pool은 제한된 자원을 빌리고 반납하는 lifecycle 문제다.\n\n### Retrieval Anchors\n\n- `flyweight pattern`\n- `shared intrinsic state`\n- `extrinsic state`\n- `memory optimization`\n- `object pooling tradeoff`\n\n---\n\n## 깊이 들어가기\n\n### 1. 내부 상태는 공유하고 외부 상태는 넘긴다\n\nFlyweight는 객체 안에 모든 걸 넣지 않는다.\n\n- 내부 상태: 공유 가능하고 변하지 않는 값\n- 외부 상태: 호출 시점마다 달라지는 값\n\n이 분리가 없으면 공유가 곧 버그가 된다.\n\n### 2. 캐시와 비슷하지만 목적이 다르다\n\nFlyweight는 \"같은 객체를 재사용\"한다는 점에서 캐시처럼 보인다.  \n하지만 목적은 속도보다 메모리 절약과 중복 제거에 가깝다.\n\n### 3. 상태 공유는 테스트를 어렵게 만든다\n\n공유 객체가 mutable하면 한 곳의 변경이 다른 곳에 영향을 준다.\n\n- 동시성 위험\n- 디버깅 난이도 상승\n- 예측 불가능한 참조 공유\n\n### 4. 오선택 확인 질문\n\n- 공유 객체의 field 중 요청마다 달라지는 값이 있는가?\n- test A가 먼저 실행될 때와 test B가 먼저 실행될 때 결과가 달라지는가?\n- cache miss/hit, eviction, TTL을 말하고 있다면 실제 문제는 Flyweight가 아니라 cache인가?\n- `Map<Key, Object>`가 커지는 이유가 객체 중복 때문인지, stale data를 오래 잡고 있기 때문인지 확인했는가?\n\n하나라도 예이면 Flyweight 적용 전에 상태 분리와 cache 목적을 다시 쪼갠다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 코드값/등급 객체\n\n변하지 않는 코드값을 Flyweight로 공유할 수 있다.\n\n### 시나리오 2: 대량 렌더링 토큰\n\n같은 스타일 정보를 재사용하면서 외부 좌표만 바꾸는 식이 적합하다.\n\n### 시나리오 3: 권한/정책 상수\n\n공유 가능한 규칙 오브젝트는 메모리를 아낄 수 있다.\n\n---\n\n## 코드로 보기\n\n### Flyweight Factory\n\n```java\npublic class GradeFlyweightFactory {\n    private final Map<String, Grade> cache = new HashMap<>();\n\n    public Grade get(String code) {\n        return cache.computeIfAbsent(code, Grade::new);\n    }\n}\n```\n\n### 외부 상태 분리\n\n```java\npublic record RenderContext(int x, int y, String color) {}\n\npublic class TextToken {\n    private final String text;\n\n    public void render(RenderContext context) {\n        // text는 공유, 위치는 외부 상태\n    }\n}\n```\n\n### 주의\n\n```java\n// mutable state를 공유하면 Flyweight가 아니라 shared mutable bug가 된다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 새 객체 생성 | 단순하다 | 메모리 사용이 늘어난다 | 객체 수가 적을 때 |\n| Flyweight | 메모리를 아낀다 | 외부 상태 분리가 필요하다 | 객체가 대량 생성될 때 |\n| 캐시 | 재사용이 쉽다 | eviction과 일관성 문제가 있다 | 조회 비용이 높을 때 |\n\n판단 기준은 다음과 같다.\n\n- 내부 상태가 정말 공유 가능하면 Flyweight\n- 값이 자주 바뀌면 캐시나 새 객체가 더 낫다\n- mutable 공유는 피한다\n\n---\n\n## 꼬리질문\n\n> Q: Flyweight와 캐시는 같은가요?\n> 의도: 재사용 목적과 메모리 절약 목적을 구분하는지 확인한다.\n> 핵심: 겹치는 부분은 있지만 목적이 다르다.\n\n> Q: 내부 상태와 외부 상태의 차이는 무엇인가요?\n> 의도: 공유 가능성의 기준을 아는지 확인한다.\n> 핵심: 내부 상태는 공유, 외부 상태는 호출 시점에 전달한다.\n\n> Q: Flyweight가 위험한 이유는 무엇인가요?\n> 의도: mutable shared state의 위험을 아는지 확인한다.\n> 핵심: 공유 객체가 예기치 않게 오염될 수 있다.\n\n## 한 줄 정리\n\nFlyweight는 대량 객체의 공통 상태를 공유해 메모리를 아끼지만, 외부 상태 분리가 안 되면 공유 버그로 바뀐다.\n",
   "aliases": [
-    "Flyweight Cache State Sharing 개념",
-    "Flyweight Cache State Sharing 정리",
-    "Flyweight Cache State Sharing 실수",
-    "Flyweight Cache State Sharing 판단 기준",
     "디자인패턴 Flyweight Cache State Sharing",
     "flyweight pattern",
     "shared intrinsic state",
@@ -17,7 +13,9 @@
     "memory optimization",
     "object pooling tradeoff",
     "flyweight vs cache",
-    "shared mutable state"
+    "shared mutable state",
+    "Flyweight와 cache는 왜 달라?",
+    "공유 객체에 mutable state가 섞일 때"
   ],
   "expected_queries": [
     "Flyweight는 내부 상태를 공유하고 외부 상태를 호출 시점에 넘기는 패턴이라는 게 무슨 뜻이야?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/design-pattern/flyweight-cache-state-sharing-tradeoffs.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch157"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

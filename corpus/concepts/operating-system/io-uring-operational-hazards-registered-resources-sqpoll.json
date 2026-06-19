@@ -6,10 +6,6 @@
   "summary": "io_uring은 빠를 수 있지만, SQ/CQ 자체보다 pointer lifetime, registered resource pinning, SQPOLL 특성, CQ consumption discipline을 틀리면 운영에서 훨씬 더 교묘한 장애를 만든다.",
   "body_markdown": "# io_uring Operational Hazards, Registered Resources, SQPOLL\n\n> 한 줄 요약: `io_uring`은 빠를 수 있지만, SQ/CQ 자체보다 pointer lifetime, registered resource pinning, SQPOLL 특성, CQ consumption discipline을 틀리면 운영에서 훨씬 더 교묘한 장애를 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [io_uring SQ, CQ Basics](./io-uring-sq-cq-basics.md)\n> - [io_uring CQ Overflow, Provided Buffers, IOWQ Worker Placement](./io-uring-cq-overflow-provided-buffers-iowq-placement.md)\n> - [io_uring Provided Buffer Rings, Fixed Buffers, Memory Pressure](./io-uring-provided-buffers-fixed-buffers-memory-pressure.md)\n> - [io_uring SQPOLL fdinfo Matrix and Worker-Mode Submit-Side Debugging](./io-uring-sqpoll-fdinfo-worker-mode-submit-debugging.md)\n> - [io_uring Cancel Scope with Fixed Files and Mixed recv/send/poll Paths](./io-uring-cancel-scope-fixed-files-mixed-ops.md)\n> - [io_uring Multishot Cancel, Rearm, Drain, Shutdown](./io-uring-multishot-cancel-rearm-drain-shutdown.md)\n> - [epoll, kqueue, io_uring](./epoll-kqueue-io-uring.md)\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n> - [pipe, socketpair, eventfd, memfd IPC Selection](./pipe-socketpair-eventfd-memfd-ipc-selection.md)\n\n> retrieval-anchor-keywords: io_uring hazards, SQPOLL, SqThread, SqThreadCpu, io_uring-sq, IORING_SQ_NEED_WAKEUP, registered buffers, fixed buffers, fixed files, direct descriptors, cancel scope, cancel user_data, cancel_fd, IORING_ASYNC_CANCEL_FD_FIXED, IORING_ASYNC_CANCEL_OP, CQ overflow, pointer lifetime, submit stable, memlock, RLIMIT_MEMLOCK, provided buffers, provided buffer low-water, multishot cancel, request teardown, io_uring operations debugging\n\n## 핵심 개념\n\n`io_uring` 입문 문서만 보면 \"SQE 넣고 CQE 받는다\"로 단순해 보이지만, 운영 문제는 그 사이의 자원 수명과 polling 모델에서 자주 터진다. 특히 registered buffer/file, SQPOLL, CQ draining은 일반 `read/write` 사고방식과 다르게 관리해야 한다.\n\n- `registered buffers`: 커널이 장기 참조하거나 pinning하는 버퍼다\n- `fixed files`: registered file set을 인덱스로 쓰는 방식이다\n- `SQPOLL`: 커널 poll thread가 submission queue를 직접 관찰하는 모드다\n- `CQ draining`: CQE를 제때 수거하는 운영 discipline이다\n\n왜 중요한가:\n\n- pointer lifetime을 잘못 잡으면 드물게만 터지는 memory corruption/invalid I/O처럼 보일 수 있다\n- registered resources는 성능 대신 pinning/memlock/lifecycle 부채를 만든다\n- CQ를 늦게 비우면 backpressure가 숨은 곳에서 폭발한다\n\n## 깊이 들어가기\n\n### 1. submit 완료와 operation 완료는 다른 순간이다\n\n`io_uring`에서 많은 초보 버그는 \"submit이 끝났으니 이제 메모리를 바꿔도 된다\"는 오해에서 나온다.\n\n- 일부 submission-time pointer는 submit 이후 안정성이 줄어들 수 있다\n- 하지만 I/O 데이터 버퍼는 completion까지 살아 있어야 하는 경우가 많다\n- SQPOLL에서는 pointer lifetime 감각이 더 길어진다\n\n즉 `submit done != data lifetime over`다.\n\n### 2. registered buffers/files는 성능 대신 pinning 부채를 만든다\n\nregistered resource의 장점은 분명하다.\n\n- per-I/O overhead 감소\n- fixed file index로 lookup 비용 절감\n- high-rate path에서 batching 효과 상승\n\n하지만 운영 함정도 있다.\n\n- buffer pinning이 `RLIMIT_MEMLOCK`과 충돌할 수 있다\n- huge page 일부만 써도 전체가 pinning될 수 있다\n- resource update/unregister가 in-flight I/O 때문에 즉시 해제되지 않을 수 있다\n\n그래서 \"등록해 두면 빨라진다\"보다 \"등록한 자원을 언제까지 누가 쥐고 있나\"가 중요하다.\n\n### 3. SQPOLL은 syscall을 줄이지만 수명/권한/CPU 모델을 바꾼다\n\nSQPOLL은 submit syscall을 줄일 수 있지만, 일반 모드와 운영 특성이 다르다.\n\n- polling thread가 queue를 본다\n- 커널 버전/설정에 따라 privilege 감각이 달라질 수 있다\n- pointer stability 요구와 CPU affinity 고민이 커진다\n\n특히 \"가볍게 켜면 자동으로 빨라질 것\"처럼 취급하면 안 된다. SQPOLL은 성능 옵션이면서 동시에 운영 모델 변경이다.\nsubmit-side stall을 볼 때 `SqThread`, `SqThreadCpu`, regular ring 대비 scheduler target이 어떻게 달라지는지는 [io_uring SQPOLL fdinfo Matrix and Worker-Mode Submit-Side Debugging](./io-uring-sqpoll-fdinfo-worker-mode-submit-debugging.md)에서 바로 이어서 본다.\n\n### 4. CQ를 늦게 비우면 completion side backpressure가 생긴다\n\n많은 팀이 submit path만 본다. 하지만 completion consumer가 느리면 문제는 CQ에서 생긴다.\n\n- CQE를 늦게 수거한다\n- eventfd notification 수와 CQE 수를 1:1로 오해한다\n- completion 폭주가 handler backlog로 바뀐다\n\n즉 `io_uring`의 bottleneck은 submit보다 \"completion을 누가 어떻게 소비하느냐\"에서 더 자주 드러난다.\n\n## 실전 시나리오\n\n### 시나리오 1: 특정 요청에서만 아주 드물게 잘못된 버퍼가 보인다\n\n가능한 원인:\n\n- submit 후 completion 전에 버퍼 수명을 끝냈다\n- SQPOLL 환경에서 pointer 안정성 가정을 잘못했다\n- registered buffer update 타이밍과 in-flight I/O가 겹쳤다\n\n대응 감각:\n\n- submit/cqe 사이 버퍼 수명을 문서화한다\n- reusable buffer pool과 per-request buffer를 섞지 않는다\n- fixed buffer update는 inflight 경계와 같이 본다\n\n### 시나리오 2: registered buffer를 켰더니 어떤 노드에서만 이상하게 실패한다\n\n가능한 원인:\n\n- `RLIMIT_MEMLOCK` 제약\n- huge page pinning이 예상보다 크다\n- buffer가 anonymous/file-backed 조건과 안 맞는다\n\n### 시나리오 3: CPU는 줄었는데 latency는 오히려 들쭉날쭉하다\n\n가능한 원인:\n\n- SQPOLL thread 배치가 나쁘다\n- CQ consumer가 일정하지 않다\n- batching 효과보다 completion skew가 더 크다\n\n이 경우는 `io_uring` 도입을 \"syscall 감소\" 하나로만 평가하면 안 된다.\n\n## 코드로 보기\n\n### 운영 체크 감각\n\n```text\nSQ path\n  -> how long must pointers stay valid?\n\nregistered resources\n  -> how much memory/file pinning debt exists?\n\nCQ path\n  -> who drains completions, and how quickly?\n```\n\n### 질문형 체크리스트\n\n```text\nAre submitted data buffers alive until completion?\nAre fixed resources updated only with inflight safety in mind?\nDoes SQPOLL change the CPU/ownership model in this service?\nCan the completion side fall behind under burst load?\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| plain io_uring | batching 이점을 얻기 쉽다 | lifecycle discipline이 여전히 필요하다 | moderate async I/O |\n| registered buffers/files | per-I/O overhead를 줄인다 | pinning과 update complexity가 커진다 | very hot path |\n| SQPOLL | submit syscall을 더 줄일 수 있다 | 운영 모델과 pointer lifetime 감각이 더 복잡해진다 | highly tuned servers |\n| classic epoll + sync ops | 디버깅이 직관적이다 | submit/completion overhead는 남는다 | simpler operations |\n\n## 꼬리질문\n\n> Q: `io_uring_submit()`가 끝나면 버퍼를 바로 재사용해도 되나요?\n> 핵심: 항상 그런 것은 아니다. 실제 I/O 데이터 버퍼는 completion까지 안정성이 필요한 경우가 많다.\n\n> Q: registered buffer는 왜 운영에서 위험할 수 있나요?\n> 핵심: 성능은 좋아지지만 pinning, memlock, update lifecycle 부채를 만들기 때문이다.\n\n> Q: SQPOLL은 그냥 더 빠른 옵션인가요?\n> 핵심: 아니다. syscall 비용을 줄이는 대신 CPU 배치와 lifetime 모델까지 바꾸는 운영 옵션이다.\n\n## 한 줄 정리\n\n`io_uring`의 진짜 운영 난이도는 비동기 I/O 자체보다, \"자원 수명을 누가 언제까지 책임지는가\"를 일반 syscall 모델보다 훨씬 엄격하게 관리해야 한다는 데 있다.\n",
   "aliases": [
-    "io_uring Operational Hazards Registered 개념",
-    "io_uring Operational Hazards Registered 정리",
-    "io_uring Operational Hazards Registered 실수",
-    "io_uring Operational Hazards Registered 판단 기준",
     "운영체제 io_uring Operational Hazards Registered",
     "io_uring operational hazards",
     "registered resources pinning",
@@ -17,7 +13,9 @@
     "CQ consumption discipline",
     "pointer lifetime io_uring",
     "registered buffers files lifecycle",
-    "io uring operational hazards guide"
+    "io uring operational hazards guide",
+    "io_uring이 빠른데 운영 장애가 늘어",
+    "SQPOLL 켜면 무엇을 관측해야 해?"
   ],
   "expected_queries": [
     "io_uring 운영에서 registered resources, SQPOLL, CQ consumption의 hazard는 뭐야?",
@@ -46,12 +44,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/io-uring-operational-hazards-registered-resources-sqpoll.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

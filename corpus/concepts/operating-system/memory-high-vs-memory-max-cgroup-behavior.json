@@ -6,10 +6,6 @@
   "summary": "memory.high는 압박을 먼저 주는 완충선이고, memory.max는 그 선을 넘었을 때의 하드 리밋이라 둘의 성격이 완전히 다르다.",
   "body_markdown": "# memory.high vs memory.max, Cgroup Behavior\n\n> 한 줄 요약: `memory.high`는 압박을 먼저 주는 완충선이고, `memory.max`는 그 선을 넘었을 때의 하드 리밋이라 둘의 성격이 완전히 다르다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [OOM Killer, cgroup Memory Pressure](./oom-killer-cgroup-memory-pressure.md)\n> - [OOM Killer Scoring, Victim Selection](./oom-killer-scoring-victim-selection.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [tmpfs, shmem, /dev/shm, Cgroup Memory Accounting](./tmpfs-shmem-cgroup-memory-accounting.md)\n> - [Workingset Refault, Page Cache Reclaim, Runtime Debugging](./workingset-refault-page-cache-reclaim-debugging.md)\n> - [memory.reclaim, Cgroup v2 Proactive Reclaim](./memory-reclaim-cgroup-v2-proactive-reclaim.md)\n\n> retrieval-anchor-keywords: memory.high, memory.max, memory events, throttling, reclaim, cgroup v2, soft limit, hard limit, memory pressure\n\n## 핵심 개념\n\ncgroup v2에서 메모리 제어는 한 단계가 아니다. `memory.high`는 압박을 주며 reclaim을 유도하는 soft-ish 경계이고, `memory.max`는 절대 상한이다.\n\n- `memory.high`: 넘으면 reclaim 압박이 강해진다\n- `memory.max`: 넘으면 할당이 실패하거나 OOM으로 이어질 수 있다\n- `memory.events`: high/max/oom 계열 이벤트를 본다\n\n왜 중요한가:\n\n- `memory.high`는 OOM 전에 느려지게 만들 수 있다\n- `memory.max`는 즉시 실패를 만들 수 있다\n- 둘을 혼동하면 \"느려진 건지 죽은 건지\"를 잘못 해석한다\n\n이 문서는 [OOM Killer, cgroup Memory Pressure](./oom-killer-cgroup-memory-pressure.md)와 [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)를 cgroup 경계 관점에서 이어준다.\n\n## 깊이 들어가기\n\n### 1. `memory.high`는 soft throttle/reclaim 경계다\n\n이 선을 넘으면 커널은 해당 cgroup에 더 강한 reclaim 압박을 건다.\n\n- alloc path가 느려질 수 있다\n- page cache와 anon memory 회수가 늘 수 있다\n- OOM 전에 latency가 먼저 오른다\n\n중요한 점은 `memory.high` 초과 자체가 OOM을 뜻하지 않는다는 것이다. cgroup v2 문서 기준으로 high boundary 초과는 throttling과 direct reclaim으로 이어지며, OOM killer를 직접 호출하지 않는다. 극단적인 상황에서는 high limit을 일시적으로 넘은 상태가 관측될 수 있다.\n\n### 2. `memory.max`는 하드 리밋이다\n\n`memory.max`를 넘으면 더 이상 정상적인 allocation 경로를 보장할 수 없다.\n\n- 실패가 표면화될 수 있다\n- OOM으로 이어질 수 있다\n- 서비스는 갑자기 죽거나 재시작한다\n\n다만 `memory.max`도 \"항상 즉시 kill\"로 해석하면 안 된다. 커널은 reclaim으로 사용량을 낮추려 하고, 실패하면 cgroup OOM 상태로 들어간다. `memory.events`의 `max`, `oom`, `oom_kill`을 나눠 보면 \"max 근처까지 갔는지\", \"allocation 실패 직전까지 갔는지\", \"실제로 kill이 있었는지\"를 분리할 수 있다.\n\n### 3. 둘의 역할은 다르다\n\n- `memory.high`: \"좀 줄여\"라는 신호\n- `memory.max`: \"이 이상은 안 돼\"라는 제한\n\n### 4. 운영에서는 둘을 함께 설계해야 한다\n\n한쪽만 잡으면 한계가 분명하다.\n\n- high만 있으면 압박은 줄 수 있어도 안전 상한이 없다\n- max만 있으면 급격한 OOM이 날 수 있다\n- workload 특성에 맞는 완충 구간이 필요하다\n\n## 10초 Chooser\n\n| 상황 | 먼저 볼 bucket |\n|------|----------------|\n| 죽지는 않는데 `memory.pressure`와 latency가 오른다 | `memory.high` 초과와 reclaim/throttle |\n| 일정 순간 컨테이너가 죽거나 OOMKilled가 난다 | `memory.max` hard limit |\n| 노드 전체는 여유인데 특정 cgroup만 느리다 | cgroup-local reclaim, `memory.events`, `memory.stat` |\n| file read p99가 같이 나빠진다 | page cache reclaim과 workingset refault |\n\n### Wrong-Bucket 경고\n\n- `memory.high` 이벤트를 OOM으로 단정하면 느린 장애를 놓친다.\n- `memory.max` OOM을 단순 latency 문제로 보면 hard limit 재발을 막지 못한다.\n- 호스트 free memory만 보고 cgroup 내부 pressure를 무시하면 컨테이너 단위 reclaim을 놓친다.\n- tmpfs/shmem 사용량을 일반 heap leak으로만 보면 file cache eviction 원인을 놓칠 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 죽지는 않는데 점점 느려진다\n\n가능한 원인:\n\n- `memory.high`를 자주 넘는다\n- reclaim이 강해진다\n- PSI memory pressure가 먼저 튄다\n- tmpfs/shmem usage가 file cache를 같이 밀 수 있다\n\n진단:\n\n```bash\ncat /sys/fs/cgroup/memory.high\ncat /sys/fs/cgroup/memory.max\ncat /sys/fs/cgroup/memory.events\ncat /sys/fs/cgroup/memory.events.local 2>/dev/null || true\ngrep -E '^(anon|file|kernel|slab|sock|workingset_refault)' /sys/fs/cgroup/memory.stat\ncat /sys/fs/cgroup/memory.pressure\n```\n\n### 시나리오 2: 일정 시점에 OOMKilled가 난다\n\n가능한 원인:\n\n- `memory.max`가 너무 낮다\n- burst가 high를 지나 max까지 바로 간다\n- working set이 limit보다 크다\n\n### 시나리오 3: high를 낮췄더니 latency는 좋아졌는데 처리량이 줄었다\n\n가능한 원인:\n\n- reclaim이 너무 자주 일어난다\n- page cache가 일찍 밀린다\n- throttling이 과하다\n\n## 코드로 보기\n\n### cgroup 메모리 설정 확인\n\n```bash\ncat /sys/fs/cgroup/memory.high\ncat /sys/fs/cgroup/memory.max\ncat /sys/fs/cgroup/memory.current\n```\n\n### 이벤트와 pressure 함께 보기\n\n```bash\nwatch -n 1 'cat /sys/fs/cgroup/memory.events; echo; cat /sys/fs/cgroup/memory.pressure'\n```\n\n해석 포인트:\n\n- `events.high`만 증가하고 `oom_kill`이 0이면 우선 latency/reclaim 문제로 본다.\n- `events.max`, `oom`, `oom_kill`이 같이 증가하면 hard limit 재설계나 burst 완충이 필요하다.\n- `memory.events`는 계층적 값이고, 현재 cgroup 자체만 보려면 가능한 환경에서 `memory.events.local`도 함께 본다.\n- `memory.stat`의 `anon`과 `file`을 나눠야 heap leak, page cache pressure, tmpfs/shmem 증가를 섞지 않는다.\n\n### 설정 예시\n\n```bash\necho 4294967296 > /sys/fs/cgroup/memory.high\necho 5368709120 > /sys/fs/cgroup/memory.max\n```\n\n### 감각 모델\n\n```text\nmemory.current approaches high\n  -> reclaim pressure rises\nmemory.current exceeds max\n  -> allocations fail or OOM path triggers\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| 낮은 `memory.high` | 압박을 조기에 막는다 | latency와 throughput이 줄 수 있다 | 느린 장애 방지 |\n| 높은 `memory.high` | burst 흡수가 쉽다 | OOM에 가까워질 수 있다 | 트래픽 변동 큼 |\n| 낮은 `memory.max` | 노드 안정성에 좋다 | 갑작스런 OOM 위험 | 강한 격리 필요 |\n| 높은 `memory.max` | 여유가 생긴다 | noisy neighbor 위험 | 단일 워크로드 |\n\n## 꼬리질문\n\n> Q: `memory.high`와 `memory.max`의 차이는?\n> 핵심: 전자는 압박을 유도하는 경계, 후자는 하드 리밋이다.\n\n> Q: `memory.high`를 넘으면 바로 죽나요?\n> 핵심: 아니다. 주로 reclaim 압박과 latency 증가가 먼저 온다.\n\n> Q: `memory.max`만 있으면 충분한가요?\n> 핵심: 아니다. high가 있어야 느린 장애를 더 일찍 본다.\n\n## 한 줄 정리\n\n`memory.high`는 느린 장애를 먼저 보게 하는 압박선이고, `memory.max`는 진짜 경계를 막는 하드 리밋이다.\n",
   "aliases": [
-    "memory.high vs memory.max Cgroup 개념",
-    "memory.high vs memory.max Cgroup 정리",
-    "memory.high vs memory.max Cgroup 실수",
-    "memory.high vs memory.max Cgroup 판단 기준",
     "운영체제 memory.high vs memory.max Cgroup",
     "memory.high vs memory.max",
     "cgroup memory high max",
@@ -17,7 +13,9 @@
     "memory pressure cgroup",
     "reclaim before OOM",
     "cgroup memory events",
-    "memory high vs memory guide"
+    "memory high vs memory guide",
+    "memory.high에서 먼저 reclaim이 걸려",
+    "memory.max OOM과 high throttle 구분"
   ],
   "expected_queries": [
     "memory.high와 memory.max는 cgroup에서 어떤 성격이 달라?",
@@ -50,12 +48,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/memory-high-vs-memory-max-cgroup-behavior.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

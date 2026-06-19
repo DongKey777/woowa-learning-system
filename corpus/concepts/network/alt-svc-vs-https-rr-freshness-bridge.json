@@ -6,10 +6,6 @@
   "summary": "Alt-Svc vs HTTPS RR Freshness Bridge는 입문자가 먼저 잡아야 할 핵심 기준과 실무에서 헷갈리는 경계를 한 문서에서 정리한다. DNS의 HTTPS RR TTL과 HTTP 응답의 Alt-Svc ma가 서로 다른 시간축으로 움직일 수 있다는 점을, \"첫 방문은 DNS 힌트, 반복 방문은 브라우저 메모 후보\"라는 감각으로 이어 주는 beginner bridge",
   "body_markdown": "# Alt-Svc vs HTTPS RR Freshness Bridge\n\n\n> 한 줄 요약: Alt-Svc vs HTTPS RR Freshness Bridge는 입문자가 먼저 잡아야 할 핵심 기준과 실무에서 헷갈리는 경계를 한 문서에서 정리한다.\n> DNS의 `HTTPS` RR TTL과 HTTP 응답의 `Alt-Svc` `ma`가 서로 다른 시간축으로 움직일 수 있다는 점을, \"`첫 방문`은 DNS 힌트, `반복 방문`은 브라우저 메모 후보\"라는 감각으로 이어 주는 beginner bridge\n\n**난이도: 🟢 Beginner**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../security/session-cookie-jwt-basics.md)\n\n> 관련 문서:\n> - [Alt-Svc와 HTTPS RR, SVCB: H3 discovery와 coalescing bridge](./alt-svc-https-rr-h3-discovery-coalescing-bridge.md)\n> - [Alt-Svc Cache Lifecycle Basics](./alt-svc-cache-lifecycle-basics.md)\n> - [Alt-Svc `ma`, Cache Scope, 421 Reuse Primer](./alt-svc-ma-cache-scope-421-reuse-primer.md)\n> - [H3 Discovery Observability Primer: Alt-Svc vs HTTPS RR 확인하기](./h3-discovery-observability-primer.md)\n> - [Stale HTTPS RR H3 Fallback Primer](./stale-https-rr-h3-fallback-primer.md)\n> - [HTTPS RR Resolver Drift Primer: browser DoH, OS resolver, `dig`가 왜 다르게 보이나](./https-rr-resolver-drift-primer.md)\n> - [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n\nretrieval-anchor-keywords: alt-svc vs https rr freshness, https rr ttl vs alt-svc ma, h3 first visit repeat visit freshness, dns hint lifetime vs http hint lifetime, alt-svc ma disagreement, https rr cache lifetime, first visit h3 repeat visit h3, stale alt-svc fresh dns, fresh alt-svc stale dns, h3 selection time axis, dns h3 hint ttl, alt-svc max age h3, first visit dns repeat visit alt-svc, dns ttl vs alt-svc ma beginner, alt svc vs https rr freshness bridge basics\n\n<details>\n<summary>Table of Contents</summary>\n\n- [먼저 잡는 mental model](#먼저-잡는-mental-model)\n- [왜 둘의 신선도가 어긋날 수 있나](#왜-둘의-신선도가-어긋날-수-있나)\n- [한눈 비교표](#한눈-비교표)\n- [첫 방문 vs 반복 방문을 가르는 핵심](#첫-방문-vs-반복-방문을-가르는-핵심)\n- [두 타이머가 어긋나는 대표 장면 3개](#두-타이머가-어긋나는-대표-장면-3개)\n- [짧은 예시 타임라인](#짧은-예시-타임라인)\n- [자주 헷갈리는 포인트](#자주-헷갈리는-포인트)\n- [다음에 이어서 볼 문서](#다음에-이어서-볼-문서)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 먼저 잡는 mental model\n\n초급자는 두 메모장을 따로 떠올리면 된다.\n\n- DNS `HTTPS` RR TTL: \"`출발 전에` resolver가 들고 있는 H3 힌트의 수명\"\n- `Alt-Svc` `ma`: \"`응답을 한 번 받은 뒤` browser가 들고 있는 H3 힌트의 수명\"\n\n둘 다 H3 discovery 힌트지만, **같은 캐시가 아니고 시작 시점도 다르다**.\n\n그래서 가장 짧은 감각은 이렇다.\n\n- `첫 방문` H3는 DNS `HTTPS` RR 쪽 설명력이 더 크다\n- `반복 방문` H3는 warm `Alt-Svc` 쪽 설명력이 더 크다\n- 둘이 동시에 있을 수도 있고, 둘 중 하나만 살아 있을 수도 있다\n\n단, `반복 방문`은 \"`다시 왔다`\"는 뜻일 뿐이다.\n기존 connection 재사용일 수도 있어서, `반복 방문`만 보고 곧바로 `새 connection에서 H3를 다시 골랐다`고 말하면 안 된다.\n\n### Retrieval Anchors\n\n- `HTTPS RR TTL vs Alt-Svc ma`\n- `H3 first visit repeat visit freshness`\n- `DNS hint lifetime vs HTTP hint lifetime`\n- `first visit DNS repeat visit Alt-Svc`\n\n---\n\n## 왜 둘의 신선도가 어긋날 수 있나\n\n둘은 배운 위치도 다르고, 만료를 세기 시작하는 순간도 다르다.\n\n| 힌트 | 어디서 배우나 | 언제 배우나 | 수명 표현 |\n|---|---|---|---|\n| DNS `HTTPS` RR | DNS answer | 첫 HTTP 요청 전일 수 있음 | DNS TTL |\n| `Alt-Svc` | HTTP response header | 첫 응답을 받은 뒤 | `ma` |\n\n그래서 아래처럼 자연스럽게 어긋난다.\n\n- DNS TTL은 짧은데 `Alt-Svc` `ma`는 길 수 있다\n- DNS TTL은 긴데 `Alt-Svc` `ma`는 짧을 수 있다\n- DNS answer는 이미 바뀌었는데 browser의 `Alt-Svc` 메모는 예전 값을 들고 있을 수 있다\n- `Alt-Svc`는 만료됐는데 DNS는 아직 H3를 계속 광고할 수 있다\n\n핵심은 \"`누가 먼저 배웠고 지금 누가 아직 기억하나`\"다.\n\n## 한눈 비교표\n\n| 질문 | DNS `HTTPS` RR | `Alt-Svc` |\n|---|---|---|\n| 주로 언제 힘을 쓰나 | 첫 방문, 새 resolver 조회 시 | 응답을 한 번 본 뒤의 반복 방문 |\n| 수명이 뜻하는 것 | DNS 힌트를 resolver/cache가 얼마나 기억하나 | H3 힌트를 browser가 얼마나 기억하나 |\n| 관찰 위치 | `dig HTTPS`, resolver path, DNS trace | response header, browser Alt-Svc cache 흔적 |\n| 만료 후 흔한 모습 | 첫 방문 H3 근거가 약해짐 | repeat visit H3 근거가 약해짐 |\n| 중요한 주의점 | browser DoH/OS resolver/`dig`가 다를 수 있음 | `ma`는 connection lifetime이 아님 |\n\n이 표를 줄여 외우면:\n\n- DNS는 출발 전 힌트\n- `Alt-Svc`는 응답 후 메모\n- 둘의 TTL이 같을 이유는 없다\n\n## 첫 방문 vs 반복 방문을 가르는 핵심\n\n입문자가 가장 많이 헷갈리는 질문은 \"`왜 첫 방문은 H2인데 다시 오면 H3지?`\"와 \"`왜 다시 와도 H2지?`\"다.\n\n이때 먼저 아래처럼 가른다.\n\n| 장면 | 먼저 보는 힌트 | 초급자 해석 |\n|---|---|---|\n| 완전히 새로운 방문인데 바로 `h3` | DNS `HTTPS` RR | 출발 전에 H3 근거를 배운 경우일 수 있다 |\n| 첫 응답은 `h2`, 그다음 새 연결이 `h3` | `Alt-Svc` | 첫 응답이 다음 연결용 힌트를 남긴 경우일 수 있다 |\n| 반복 방문인데 계속 `h3` | DNS 또는 warm `Alt-Svc` 둘 다 가능 | 어느 힌트가 아직 살아 있는지 따로 봐야 한다 |\n| 반복 방문인데 갑자기 `h2` | DNS TTL 만료, `Alt-Svc` 만료, fallback 중 하나일 수 있다 | \"repeat visit\"만으로 한 원인으로 못 박으면 안 된다 |\n\n한 줄로 줄이면:\n\n- `첫 방문` 질문은 DNS부터\n- `반복 방문` 질문은 `Alt-Svc` cache부터\n- 그 전에 `기존 connection reuse인가, 새 connection 생성인가`를 먼저 분리한다\n- 다만 둘이 함께 있을 수 있으니 증거를 분리해서 본다\n\n## 두 타이머가 어긋나는 대표 장면 3개\n\n### 1. DNS TTL은 짧고 `Alt-Svc` `ma`는 긴 경우\n\n예:\n\n- DNS `HTTPS` RR TTL = 60초\n- `Alt-Svc: h3=\"edge.example.net:443\"; ma=86400`\n\n초급자 해석:\n\n- 새로 온 사용자는 60초 뒤 fresh DNS answer에서 H3 근거를 못 볼 수 있다\n- 하지만 이미 한 번 방문한 browser는 하루 동안 `Alt-Svc` 메모를 들고 repeat visit에서 계속 H3를 시도할 수 있다\n\n즉:\n\n- `첫 방문`은 H2로 시작할 수 있다\n- `반복 방문`은 여전히 H3일 수 있다\n\n### 2. DNS TTL은 길고 `Alt-Svc` `ma`는 짧은 경우\n\n예:\n\n- DNS `HTTPS` RR TTL = 3600초\n- `Alt-Svc: h3=\":443\"; ma=300`\n\n초급자 해석:\n\n- browser가 예전 `Alt-Svc` 메모를 잊어도, fresh DNS 조회가 있으면 여전히 첫 방문부터 H3를 시도할 근거가 남아 있을 수 있다\n- 그래서 \"`Alt-Svc`가 만료됐으니 이제 H3는 끝\"이라고 읽으면 안 된다\n\n즉:\n\n- repeat visit에서 `Alt-Svc` 설명력은 약해질 수 있다\n- 그래도 DNS 쪽은 아직 H3를 밀어 줄 수 있다\n\n### 3. DNS는 새 현실, `Alt-Svc`는 옛 메모인 경우\n\n예:\n\n- 운영자가 DNS `HTTPS` RR을 새 edge로 바꿨다\n- 어떤 browser는 이전 응답에서 배운 `Alt-Svc`를 아직 들고 있다\n\n초급자 해석:\n\n- 새 사용자와 기존 사용자가 서로 다른 H3 endpoint를 시도할 수 있다\n- 기존 사용자는 stale `Alt-Svc` 때문에 예전 H3 경로를 먼저 시도했다가 fallback 또는 `421` recovery를 볼 수 있다\n- DNS cache 쪽이 stale하면 `421` 없이 H3 시도 단계에서 조용히 `h2` fallback으로 끝날 수도 있다\n\n이 장면은 \"`DNS는 이미 바뀌었는데 왜 어떤 사용자는 예전 경로를 타지?`\"라는 질문을 설명해 준다.\n\n## 짧은 예시 타임라인\n\n아래 한 줄 시나리오만 잡으면 실무 trace 읽기가 쉬워진다.\n\n```text\n09:00 DNS HTTPS RR: h3 광고, TTL 60\n09:01 첫 방문 사용자 A: DNS 힌트로 바로 H3 성공\n09:02 응답에서 Alt-Svc: h3=\"edge-old\"; ma=86400 학습\n09:10 운영 변경: DNS HTTPS RR은 h3 광고 제거 또는 새 edge로 변경\n09:20 새 사용자 B: fresh DNS 기준으로 H2 시작 또는 새 edge로 H3 시도\n09:20 기존 사용자 A: browser의 warm Alt-Svc 때문에 예전 edge-old H3를 먼저 시도\n```\n\n이 시나리오에서 beginner 결론은 간단하다.\n\n- 사용자 B의 `첫 방문`은 **현재 DNS 현실** 영향을 더 받는다\n- 사용자 A의 `반복 방문`은 **브라우저가 전에 배운 `Alt-Svc` 메모** 영향을 더 받을 수 있다\n\n## 자주 헷갈리는 포인트\n\n- DNS TTL과 `Alt-Svc` `ma`를 같은 캐시의 TTL로 읽으면 안 된다.\n- `Alt-Svc` `ma`가 길다고 모든 새 사용자 첫 방문이 H3가 되는 것은 아니다.\n- DNS `HTTPS` RR TTL이 길다고 browser가 꼭 `Alt-Svc`를 볼 때까지 기다리는 것도 아니다.\n- repeat visit이 항상 `Alt-Svc` 때문이라고 단정하면 안 된다.\n  - fresh DNS 조회가 다시 일어나면 DNS 쪽 힌트가 더 직접적일 수 있다.\n- repeat visit이 항상 새 connection이라고 단정하면 안 된다.\n  - 같은 H2/H3 connection 재사용이면 freshness보다 connection reuse가 먼저 보일 수 있다.\n- `Alt-Svc`가 stale하다고 해서 DNS도 stale하다고 단정하면 안 된다.\n  - 두 타이머는 서로 독립적으로 어긋날 수 있다.\n\n## 다음에 이어서 볼 문서\n\n- discovery 자체를 더 크게 묶어 보려면 [Alt-Svc와 HTTPS RR, SVCB: H3 discovery와 coalescing bridge](./alt-svc-https-rr-h3-discovery-coalescing-bridge.md)\n- `Alt-Svc` warm/expired/stale 흐름을 더 자세히 보려면 [Alt-Svc Cache Lifecycle Basics](./alt-svc-cache-lifecycle-basics.md)\n- \"`ma`는 정확히 무엇의 수명인가\"를 따로 잡으려면 [Alt-Svc `ma`, Cache Scope, 421 Reuse Primer](./alt-svc-ma-cache-scope-421-reuse-primer.md)\n- browser와 `dig`의 DNS 관측이 왜 다를 수 있는지 보려면 [HTTPS RR Resolver Drift Primer: browser DoH, OS resolver, `dig`가 왜 다르게 보이나](./https-rr-resolver-drift-primer.md)\n\n## 한 줄 정리\n\nDNS `HTTPS` RR TTL은 \"`출발 전에` 배우는 H3 힌트의 수명\", `Alt-Svc` `ma`는 \"`응답 뒤에` browser가 기억하는 H3 힌트의 수명\"이어서, 둘이 어긋나면 `첫 방문` H3 선택과 `반복 방문` H3 선택이 서로 다른 이유로 달라질 수 있다.\n",
   "aliases": [
-    "Alt-Svc vs HTTPS RR 개념",
-    "Alt-Svc vs HTTPS RR 정리",
-    "Alt-Svc vs HTTPS RR 실수",
-    "Alt-Svc vs HTTPS RR 판단 기준",
     "네트워크 Alt-Svc vs HTTPS RR",
     "Alt-Svc vs HTTPS RR freshness",
     "HTTPS RR TTL vs Alt-Svc ma",
@@ -17,7 +13,9 @@
     "first visit DNS repeat visit Alt-Svc",
     "stale Alt-Svc fresh DNS",
     "fresh Alt-Svc stale DNS",
-    "H3 selection time axis"
+    "H3 selection time axis",
+    "DNS HTTPS RR TTL과 ma 차이",
+    "DNS는 fresh인데 Alt-Svc는 stale"
   ],
   "expected_queries": [
     "DNS HTTPS RR TTL과 Alt-Svc ma는 왜 서로 다른 H3 freshness time axis야?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/alt-svc-vs-https-rr-freshness-bridge.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -7,17 +7,15 @@
   "body_markdown": "# Ghost Reads와 Mixed Routing Write Fence Tokens\n\n> 한 줄 요약: failover 직후 옛 경로와 새 경로가 섞이면 유령 같은 읽기/쓰기가 생기고, fence token이 있어야 늦은 주체를 막을 수 있다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Failover Promotion과 Read Divergence](./failover-promotion-read-divergence.md), [Replication Failover and Split Brain](./replication-failover-split-brain.md), [DB Lease와 Fencing Token](./db-lease-fencing-coordination.md)\nretrieval-anchor-keywords: ghost read, mixed routing, write fence token, epoch token, stale route\n\n## 핵심 개념\n\nGhost read는 사용자가 같은 엔티티를 읽는데, 일부 경로는 옛 primary나 옛 replica를 보고 일부는 새 primary를 보는 상황에서 생기는 이상 현상이다.\n\n왜 중요한가:\n\n- failover 직후 데이터가 생겼다 사라졌다 하는 것처럼 보일 수 있다\n- 옛 경로가 늦은 write를 받아 새 primary의 상태를 덮을 수 있다\n- mixed routing은 읽기 문제처럼 보이지만 실제로는 write 안전성 문제다\n\nfence token은 이런 상황에서 stale writer를 거르는 마지막 방어선이다.\n\n## 깊이 들어가기\n\n### 1. ghost read가 생기는 이유\n\n혼합 라우팅은 보통 전환 과정에서 생긴다.\n\n- 일부 요청은 새 primary로 간다\n- 일부 요청은 캐시된 옛 endpoint를 사용한다\n- 일부 replica는 아직 옛 상태를 보여준다\n\n그러면 같은 사용자가 짧은 시간 안에 서로 다른 진실을 본다.\n\n### 2. 왜 write fence token이 필요한가\n\n옛 경로가 늦게 살아나서 write를 시도할 수 있기 때문이다.\n\n- old primary가 살아난다\n- 네트워크 지연으로 늦은 write가 도착한다\n- 새 primary의 상태를 덮는다\n\nfence token은 현재 epoch보다 낮은 write를 거부해서 이 문제를 막는다.\n\n### 3. epoch 기반 라우팅\n\n실무에서는 leader epoch 또는 fencing sequence를 두고,\n\n- 새 primary 승격 시 epoch를 증가시키고\n- 모든 write는 현재 epoch를 함께 보낸다\n- 저장소는 낮은 epoch를 거절한다\n\n이렇게 하면 늦은 주체가 아무리 살아 있어도 최신 상태를 덮지 못한다.\n\n### 4. 읽기와 쓰기를 같이 보아야 하는 이유\n\nghost read는 읽기 이상처럼 보이지만, 실제 원인은 stale writer일 수 있다.\n\n- 읽기만 바꾸면 잠시 좋아진다\n- stale write가 남아 있으면 다시 망가진다\n\n그래서 mixed routing은 읽기 정책과 write fencing을 같이 묶어야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: failover 후 주문 상태가 왔다 갔다 함\n\n한 요청은 새 primary를 보고, 다른 요청은 옛 경로를 본다.  \n상태가 ghost처럼 나타났다 사라진다.\n\n### 시나리오 2: 옛 primary가 뒤늦게 update를 덮어씀\n\nfencing이 없으면 stale node가 새 primary의 결과를 덮을 수 있다.  \n이건 read inconsistency가 아니라 write corruption이다.\n\n### 시나리오 3: 캐시 무효화가 늦어 mixed routing이 길어진다\n\n토폴로지 업데이트와 endpoint 무효화가 늦으면, ghost read가 더 오래 지속된다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE account_state (\n  id BIGINT PRIMARY KEY,\n  balance BIGINT NOT NULL,\n  fencing_epoch BIGINT NOT NULL\n);\n\nUPDATE account_state\nSET balance = balance - 1000,\n    fencing_epoch = 42\nWHERE id = 1\n  AND fencing_epoch < 42;\n```\n\n```java\nclass WriteRequest {\n    long epoch;\n}\n\nboolean accept(WriteRequest req, long currentEpoch) {\n    return req.epoch >= currentEpoch;\n}\n```\n\n```text\nbad:\n  old route writes without epoch -> new state gets overwritten\n\ngood:\n  old route writes with stale epoch -> server rejects it\n```\n\nFence token은 “옛 주체를 기다려 주는 장치”가 아니라, **옛 주체를 더 이상 쓰지 못하게 만드는 장치**다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| mixed routing without fence | 구현이 쉽다 | stale write와 ghost read가 생긴다 | 거의 없음 |\n| epoch-based fencing | stale write를 막는다 | 토큰 관리가 필요하다 | failover가 있는 시스템 |\n| pure primary routing | 단순하다 | 확장성이 낮다 | 핵심 경로 |\n| read routing only fix | 읽기만 안정적이다 | 쓰기 위험이 남는다 | 임시 완화 |\n\n## 꼬리질문\n\n> Q: ghost read는 단순히 replica lag 문제인가요?\n> 의도: mixed routing과 stale write까지 보는지 확인\n> 핵심: lag뿐 아니라 옛 경로가 섞이는 것도 원인이다\n\n> Q: fence token은 왜 읽기보다 쓰기에 더 중요하나요?\n> 의도: stale writer 차단의 중요성을 아는지 확인\n> 핵심: 읽기 혼란보다 더 위험한 건 오래된 쓰기가 최신 상태를 덮는 것이다\n\n> Q: epoch를 어디서 관리해야 하나요?\n> 의도: failover 시 단조 증가하는 ownership token 개념을 아는지 확인\n> 핵심: 승격 이벤트와 함께 증가시키고 모든 write에 전달해야 한다\n\n## 한 줄 정리\n\nGhost read는 mixed routing에서 생기는 이상 현상이고, write fence token은 옛 경로의 늦은 쓰기를 거부해서 새 primary의 진실을 지키는 안전장치다.\n",
   "aliases": [
     "유령 읽기",
-    "Ghost Reads와 Mixed Routing 개념",
-    "Ghost Reads와 Mixed Routing 정리",
-    "Ghost Reads와 Mixed Routing 실수",
-    "Ghost Reads와 Mixed Routing 판단 기준",
     "ghost read",
     "mixed routing",
     "write fence token",
     "epoch token",
     "stale route",
     "stale writer fencing",
-    "failover ghost reads"
+    "failover ghost reads",
+    "failover 후 데이터가 사라져요",
+    "old primary가 늦게 덮어써요"
   ],
   "expected_queries": [
     "failover 직후 ghost read가 생길 때 mixed routing과 stale writer를 어떻게 구분해?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/ghost-reads-mixed-routing-write-fence-tokens.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -7,17 +7,13 @@
   "body_markdown": "# Service Deprecation and Sunset Lifecycle\n\n> 한 줄 요약: 서비스 deprecation은 오래된 API를 지우는 일이 아니라, 대체 경로와 관측 가능성을 유지한 채 소비자를 안전하게 이동시키는 수명 종료 관리다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [API Versioning, Contract Testing, Anti-Corruption Layer](./api-versioning-contract-testing-anti-corruption-layer.md)\n> - [Strangler Fig Migration, Contract, Cutover](./strangler-fig-migration-contract-cutover.md)\n> - [Service Ownership and Catalog Boundaries](./service-ownership-catalog-boundaries.md)\n> - [ADRs and Decision Records at Scale](./adr-decision-records-at-scale.md)\n> - [Incident Review and Learning Loop Architecture](./incident-review-learning-loop-architecture.md)\n> - [Service Portfolio Lifecycle Governance](./service-portfolio-lifecycle-governance.md)\n> - [Deprecation Enforcement, Tombstone, and Sunset Guardrails](./deprecation-enforcement-tombstone-guardrails.md)\n> - [Backward Compatibility Waivers and Consumer Exception Governance](./backward-compatibility-waiver-consumer-exception-governance.md)\n> - [Consumer Exception Operating Model](./consumer-exception-operating-model.md)\n> - [Shadow Process Officialization and Absorption Criteria](./shadow-process-officialization-absorption-criteria.md)\n\n> retrieval-anchor-keywords:\n> - service deprecation\n> - sunset lifecycle\n> - replacement service\n> - tombstone\n> - migration window\n> - consumer notice\n> - hard delete\n> - backward compatibility\n> - retire vs absorb\n> - sunset exception path\n> - deprecation extension governance\n> - sunset allowlist absorb\n\n> 읽기 가이드:\n> - 돌아가기: [Software Engineering README - Service Deprecation and Sunset Lifecycle](./README.md#service-deprecation-and-sunset-lifecycle)\n> - 다음 단계: [Deprecation Enforcement, Tombstone, and Sunset Guardrails](./deprecation-enforcement-tombstone-guardrails.md)\n\n## 핵심 개념\n\n서비스 deprecation은 \"없애자\"가 아니다.\n정확히는 **소비자들이 안전하게 떠날 수 있는 종료 절차를 설계하는 것**이다.\n\n대부분의 서비스는 다음 이유로 바로 지우면 안 된다.\n\n- 아직 쓰는 소비자가 있다\n- 계약과 데이터가 뒤섞여 있다\n- 호출 빈도는 낮아도 중요한 배치가 남아 있다\n- 운영 대시보드와 알림이 아직 참조 중이다\n\n즉 sunset은 기능 삭제가 아니라 **책임 있는 철수**다.\n\n---\n\n## 1차 분기와 재현 조건\n\ndeprecation 질문을 받으면 먼저 \"무엇을 지우려는가\"보다 \"누가 아직 이 경로를 믿고 있는가\"를 나눈다.\n\n| 1차 분기 | 재현 조건 | 먼저 보는 증거 |\n|---|---|---|\n| API contract 종료 | 구 endpoint에 남은 호출이 있거나 consumer migration window가 열려 있다 | access log, consumer id, deprecation header 응답 |\n| 내부 batch/event 종료 | endpoint는 사라졌지만 job, topic, consumer group이 남아 있다 | scheduler 목록, topic lag, consumer group offset, dead-letter |\n| data/resource 정리 | 코드 제거 뒤 테이블, dashboard, alert가 남아 있다 | DB table usage, dashboard query, alert rule target |\n| exception/extension 관리 | sunset 연장 요청이 DM, spreadsheet, 개별 allowlist로 흐른다 | exception backlog, waiver record, owner approval trail |\n\n## 관찰 증거와 failure matrix\n\nsunset readiness는 \"삭제 PR이 준비됐다\"가 아니라 **남은 사용 흔적이 관찰 가능한가**로 판단한다.\n\n| failure mode | 관찰 증거 | 잘못된 해석 | 대응 |\n|---|---|---|---|\n| 숨은 소비자 | 낮은 빈도의 production 호출, 야간 batch access | traffic이 적으니 삭제 가능 | 마지막 호출 시각과 consumer owner를 확인한 뒤 tombstone window를 둔다 |\n| 주변 리소스 잔존 | topic, table, dashboard, alert rule이 deprecated 이름을 참조 | API만 내리면 종료 | dependency cleanup ticket을 sunset plan에 묶는다 |\n| extension drift | sunset 연장 사유가 사람별 문서에 흩어짐 | 현장 예외니까 따로 둔다 | exception backlog와 expiry date를 공식화한다 |\n| 관측 조기 제거 | 삭제 전에 로그/metric label을 먼저 지움 | 노이즈 정리 | delete 전까지 호출자 식별과 tombstone metric을 유지한다 |\n\n## 검증/validation\n\n종료 직전 validation은 아래 순서로 한다.\n\n1. 최근 window에서 `consumer_count == 0`인지 로그와 gateway metric으로 확인한다.\n2. batch, event consumer, dashboard, alert rule이 replacement path를 보도록 바뀌었는지 확인한다.\n3. tombstone 응답이 consumer에게 replacement와 sunset date를 알려 주는지 확인한다.\n4. hard delete 후 rollback 또는 temporary re-enable 경로가 필요한지 ADR에 남긴다.\n\n## 흔한 오해 / wrong-bucket 오선택\n\n- \"사용량이 낮다\"를 \"삭제해도 된다\"로 오선택하면 quarterly batch나 장애 시 fallback consumer를 놓친다.\n- \"deprecation header를 붙였다\"를 \"migration이 끝났다\"로 오해하면 실제 owner별 전환 상태를 못 본다.\n- \"API endpoint 삭제\"를 \"service sunset\"으로 좁히면 topic, table, dashboard, alert 같은 운영 표면이 남는다.\n- \"연장 요청은 예외니까 문서 밖에서 처리\"하면 exception backlog가 사라져 다음 review에서 같은 논의를 반복한다.\n\n---\n\n## 깊이 들어가기\n\n### 1. deprecation은 공지부터 시작한다\n\n좋은 종료는 먼저 알려야 한다.\n\n필요한 것:\n\n- 종료 예정일\n- 대체 서비스/경로\n- 남은 migration window\n- 영향받는 소비자 목록\n- 연락 채널\n\n공지 없이 지우면 기술적으로는 깔끔해 보여도, 운영적으로는 사고다.\n\n### 2. sunset은 단계적으로 진행해야 한다\n\n보통 순서는 이렇다.\n\n1. deprecation 공지\n2. 신규 사용 차단\n3. 기존 소비자 migration\n4. read-only 또는 tombstone 모드\n5. 최종 종료\n6. 데이터/리소스 정리\n\n이 순서는 소비자에게 준비 시간을 주고, 내부 관측을 유지한다.\n\n### 3. deprecated path 주변의 예외 경로는 retire할지 absorb할지 먼저 정해야 한다\n\n서비스 자체는 sunset 대상이어도, 그 주변의 exception path는 두 종류로 나뉜다.\n\n- 이미 exception registry, waiver review, tombstone policy가 있는데 사람들이 slack DM이나 개인 시트로 마감 연장을 처리한다면: 그 bypass는 **retire** 대상이다\n- 서비스별 allowlist, extension count, replacement readiness, tombstone reason code를 매번 같은 형태로 따로 적고 있다면: 그 반복 데이터는 **absorb** 대상이다\n\n핵심 질문은 단순하다.\n\n- 공식 경로가 이미 있는데 사람들이 우회하는가 -> retire\n- 반복되는 structured data가 공식 registry/gateway에 못 들어가고 있는가 -> absorb\n\n이 기준을 [Shadow Process Officialization and Absorption Criteria](./shadow-process-officialization-absorption-criteria.md)와 같은 언어로 써 두면, sunset governance와 consumer exception review가 서로 다른 말로 같은 문제를 설명하지 않게 된다.\n특히 deprecation 연장 request는 [Consumer Exception Operating Model](./consumer-exception-operating-model.md)과 [Backward Compatibility Waivers and Consumer Exception Governance](./backward-compatibility-waiver-consumer-exception-governance.md)에서 관리하는 exception backlog와 연결해 보는 편이 안전하다.\n\n### 4. 관측 가능성을 먼저 줄이지 말아야 한다\n\n서비스를 내리기 전에 다음을 남겨야 한다.\n\n- 에러 로그\n- 호출 통계\n- 소비자 식별\n- 마지막 요청 시각\n\n이게 없으면 누가 아직 쓰는지 알 수 없다.\n\n### 5. hard delete는 가장 마지막이다\n\nAPI endpoint를 내리는 것과, backing data를 지우는 것은 다르다.\n\n특히 다음은 더 늦게 지워야 한다.\n\n- 이벤트 토픽\n- DB 테이블\n- 배치 job\n- 대시보드\n- 알림 rule\n\n서비스는 코드보다 주변 의존성이 더 오래 남을 수 있다.\n\n### 6. 종료는 ADR과 연결되어야 한다\n\n왜 종료하는지, 무엇이 대체인지, 어떤 조건이 충족되면 지우는지 남겨야 한다.\n이 문맥은 [ADRs and Decision Records at Scale](./adr-decision-records-at-scale.md)와 직접 연결된다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 낡은 조회 API를 종료한다\n\n조회 API를 새 BFF와 새 contract로 옮겼다면:\n\n- 구 API에 deprecation header를 붙인다\n- 소비자 목록을 추적한다\n- 일정 기간 후 read-only로 전환한다\n- 마지막에 endpoint를 제거한다\n\n### 시나리오 2: 내부 서비스가 더 이상 필요 없다\n\n같은 기능을 제공하는 새 서비스가 안정화되면, 옛 서비스는 tombstone 상태로 바꾸고 호출 차단을 걸 수 있다.\n하지만 바로 제거하지 말고 로그와 관측을 남긴다.\n\n### 시나리오 3: 배치와 이벤트가 남아 있다\n\nAPI는 지웠는데, 배치 job과 이벤트 consumer가 옛 서비스 이름을 바라보는 경우가 많다.\n그래서 deprecation은 코드 삭제보다 dependencies cleanup이 더 오래 걸린다.\n\n---\n\n## 코드로 보기\n\n```yaml\ndeprecation_plan:\n  announce: 2026-05-01\n  stop_new_consumers: true\n  tombstone_after: 30d\n  delete_after:\n    - consumer_count == 0\n    - last_access < 14d\n    - dashboards_migrated: true\n```\n\n종료 조건이 명시되어야 sunset이 감정이 아닌 절차가 된다.\n\n---\n\n## 트레이드오프\n\n| 선택 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 즉시 삭제 | 단순하다 | 소비자 충격이 크다 | 외부 노출이 없고 안전할 때 |\n| tombstone 후 삭제 | 안전하다 | 종료가 길어진다 | 소비자가 남아 있을 때 |\n| 장기 sunset | 리스크가 낮다 | 유지비가 든다 | 중요한 서비스일 때 |\n\ndeprecation은 지우는 속도가 아니라 **안전하게 떠나게 하는 능력**으로 평가해야 한다.\n\n---\n\n## 꼬리질문\n\n- 누가 종료 결정을 승인하는가?\n- 소비자 migration이 끝났는지 어떻게 확인하는가?\n- 읽기/쓰기 경로는 언제 분리할 것인가?\n- tombstone 상태를 운영 도구가 이해하는가?\n- 남은 sunset side path는 retire 대상인가, absorb 대상인가?\n\n## 한 줄 정리\n\n서비스 deprecation은 서비스 삭제가 아니라, 소비자 migration과 관측 가능성을 유지한 채 수명을 정리하는 lifecycle 관리다.\n",
   "aliases": [
     "서비스 종료 수명주기",
-    "Service Deprecation and Sunset 개념",
-    "Service Deprecation and Sunset 정리",
-    "Service Deprecation and Sunset 실수",
-    "Service Deprecation and Sunset 판단 기준",
     "service deprecation sunset lifecycle",
     "service sunset governance",
     "tombstone lifecycle",
     "replacement service migration",
     "deprecation extension governance",
-    "service deprecation sunset lifecycle guide",
-    "service deprecation sunset lifecycle checklist"
+    "서비스 sunset 절차를 어떻게 잡아?",
+    "deprecated 서비스 새 사용 막기"
   ],
   "expected_queries": [
     "service deprecation을 단순 삭제가 아니라 consumer migration과 관측 가능한 sunset lifecycle로 설계하려면 어떻게 해야 해?",
@@ -55,12 +51,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/software-engineering/service-deprecation-sunset-lifecycle.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch161"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 6 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

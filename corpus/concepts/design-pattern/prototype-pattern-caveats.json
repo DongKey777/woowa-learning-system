@@ -7,17 +7,15 @@
   "body_markdown": "# Prototype Pattern Caveats: 복제의 편리함이 만드는 함정\n\n> 한 줄 요약: Prototype 패턴은 객체를 복제해 빠르게 새 인스턴스를 만들게 하지만, 얕은 복사와 상태 공유가 쉽게 사고를 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [빌더 (Builder)](./builder-pattern.md)\n> - [Immutable Builder and Wither Patterns](./immutable-builder-wither-patterns.md)\n> - [팩토리 (Factory)](./factory.md)\n> - [안티 패턴](./anti-pattern.md)\n\n---\n\n## 핵심 개념\n\nPrototype 패턴은 **기존 객체를 복제해 새 객체를 만드는 방식**이다.  \n생성 비용이 큰 객체, 동일한 설정을 가진 객체, 템플릿 기반 인스턴스 생성에 유용하다.\n\n하지만 backend에서 prototype은 생각보다 조심해서 써야 한다.\n\n- 얕은 복사와 깊은 복사를 구분해야 한다\n- 참조형 필드가 공유될 수 있다\n- 복제 후 불변성 보장이 필요하다\n\n## 재현 조건\n\n다음 상황이면 Prototype을 검토하되, copy semantics부터 검증한다.\n\n- 기본값이 많은 템플릿 객체에서 일부 값만 바꾼 사본을 자주 만든다.\n- 생성 비용이 크거나 초기화 순서가 복잡해 매번 새로 조립하기 어렵다.\n- 복제 대상에 collection, child object, mutable config가 포함되어 있다.\n- 복제 후 원본과 사본이 서로 영향을 주면 안 되는 요구가 명확하다.\n\n단순히 생성자 파라미터가 많아서 불편한 정도라면 Builder가 더 명시적일 수 있다.\n\n## 확인 순서\n\n1. **필드별 복사 정책을 적는다**: primitive/immutable은 공유 가능, mutable collection/child는 복사 필요 여부를 정한다.\n2. **원본 변경 테스트를 만든다**: 복제 후 원본의 list/child를 바꿔 사본이 오염되는지 확인한다.\n3. **사본 변경 테스트를 만든다**: 사본 변경이 원본에 새지 않는지 확인한다.\n4. **복제 API를 고른다**: Java `clone()`보다 copy constructor/static factory가 의도를 드러내는지 본다.\n5. **불변 대안을 비교한다**: wither/toBuilder로 충분하면 Prototype보다 그쪽이 읽기 쉽다.\n\n### Retrieval Anchors\n\n- `prototype pattern caveats`\n- `clone semantics`\n- `shallow copy deep copy`\n- `copy constructor`\n- `object snapshot`\n\n---\n\n## 깊이 들어가기\n\n### 1. 복제가 빠르다고 안전한 건 아니다\n\nPrototype은 초기화 비용을 줄이기 쉽다.\n하지만 복제된 객체가 내부 참조를 공유하면 원본이 오염될 수 있다.\n\n이건 특히 다음에서 위험하다.\n\n- 설정 객체\n- 컬렉션 필드\n- mutable child object\n\n### 2. clone보다 copy constructor가 낫기도 하다\n\nJava의 `clone()`은 이해하기 어렵고, 예외와 깊은 복사 책임이 불명확하다.  \n실무에서는 복사 생성자나 정적 팩토리가 더 명시적일 때가 많다.\n\n### 3. 불변 객체와 함께 쓰면 안정적이다\n\n불변 객체는 prototype과 궁합이 좋다.  \n복사 후 바뀌지 않는다면 참조 공유의 위험이 훨씬 줄어든다.\n\n### 4. failure matrix\n\n| 실패 모드 | 관찰 증거 | 수정 방향 |\n|---|---|---|\n| shallow copy 오염 | 원본 list에 값을 추가했더니 사본도 바뀐다 | mutable field를 defensive copy하거나 불변 collection으로 바꾼다 |\n| clone 계약 불명확 | `CloneNotSupportedException`, `super.clone()`, deep copy 기준이 흩어져 있다 | copy constructor/static factory로 복사 정책을 코드에 드러낸다 |\n| Prototype 과사용 | 복잡한 생성이 아니라 호출부 가독성 문제뿐이다 | Builder 또는 named factory로 바꾼다 |\n| snapshot이라고 했지만 live reference 공유 | 복제본이 원본 child object를 그대로 참조한다 | snapshot boundary에서 deep copy 또는 immutable child로 고정한다 |\n\n## 검증\n\n- field별 shallow/deep/share 정책이 코드나 테스트에서 보이는가?\n- mutable collection은 `new ArrayList`, `List.copyOf`, 전용 copy method 중 하나로 처리되는가?\n- 복제 후 invariant 검증이 다시 실행되는가?\n- \"빠른 복제\" 때문에 domain rule을 우회하지 않는가?\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 템플릿 기반 주문 생성\n\n기본 배송 설정, 기본 정책, 기본 라우팅 정보를 복제해 새 주문을 만든다.\n\n### 시나리오 2: 테스트 픽스처 복제\n\n비슷한 상태의 테스트 객체를 빠르게 만들 때 유용하다.\n\n### 시나리오 3: 복잡한 설정 사본\n\n외부 API 설정을 바탕으로 약간만 바꾼 인스턴스를 만들 수 있다.\n\n---\n\n## 코드로 보기\n\n### Prototype 스타일\n\n```java\npublic class PaymentConfig implements Cloneable {\n    private String endpoint;\n    private List<String> headers;\n\n    @Override\n    public PaymentConfig clone() {\n        try {\n            PaymentConfig copy = (PaymentConfig) super.clone();\n            copy.headers = new ArrayList<>(this.headers);\n            return copy;\n        } catch (CloneNotSupportedException e) {\n            throw new IllegalStateException(e);\n        }\n    }\n}\n```\n\n### 복사 생성자\n\n```java\npublic PaymentConfig(PaymentConfig source) {\n    this.endpoint = source.endpoint;\n    this.headers = new ArrayList<>(source.headers);\n}\n```\n\n### Wither 대안\n\n```java\npublic PaymentConfig withEndpoint(String endpoint) {\n    return new PaymentConfig(endpoint, List.copyOf(this.headers));\n}\n```\n\nPrototype보다 명시적인 복제가 더 안전한 경우가 많다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 새로 생성 | 가장 명확하다 | 초기화 비용이 크다 | 생성이 단순할 때 |\n| Prototype | 빠르게 복제한다 | 공유 상태 위험이 있다 | 템플릿이 반복될 때 |\n| Builder/Wither | 명시적이다 | 코드가 길어진다 | 부분 수정이 잦을 때 |\n\n판단 기준은 다음과 같다.\n\n- 복제 대상이 불변이면 Prototype이 덜 위험하다\n- mutable 참조가 있으면 깊은 복사를 반드시 확인한다\n- 생성이 복잡하면 Builder가 더 읽기 쉽다\n\n---\n\n## 꼬리질문\n\n> Q: Prototype이 왜 위험하다고 하나요?\n> 의도: 복제의 편의와 상태 공유 위험을 아는지 확인한다.\n> 핵심: 얕은 복사로 인해 내부 참조가 공유될 수 있다.\n\n> Q: clone보다 copy constructor가 나은가요?\n> 의도: 명시성과 유지보수를 고려하는지 확인한다.\n> 핵심: 대부분의 backend 코드에서는 더 낫다.\n\n> Q: Prototype은 불변 객체와 어떤 관계인가요?\n> 의도: 복제 안정성을 아는지 확인한다.\n> 핵심: 불변 객체일수록 복제의 위험이 줄어든다.\n\n## 한 줄 정리\n\nPrototype 패턴은 복제를 쉽게 만들지만, 얕은 복사와 공유 상태 때문에 copy constructor나 Wither가 더 안전할 수 있다.\n",
   "aliases": [
     "복제 패턴 주의점",
-    "Prototype Pattern Caveats 개념",
-    "Prototype Pattern Caveats 정리",
-    "Prototype Pattern Caveats 실수",
-    "Prototype Pattern Caveats 판단 기준",
     "prototype pattern caveats",
     "clone semantics",
     "shallow copy deep copy",
     "copy constructor",
     "object snapshot",
     "prototype vs builder",
-    "clone vs copy constructor"
+    "clone vs copy constructor",
+    "얕은 복사 때문에 원본도 바뀜",
+    "clone보다 copy constructor가 나을 때"
   ],
   "expected_queries": [
     "Prototype Pattern은 기존 객체를 복제해 새 객체를 만들지만 shallow copy와 shared reference가 위험한 이유가 뭐야?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/design-pattern/prototype-pattern-caveats.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch157"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

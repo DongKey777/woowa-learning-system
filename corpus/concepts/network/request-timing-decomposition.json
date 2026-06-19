@@ -6,10 +6,6 @@
   "summary": "요청이 2초 걸렸다\"는 말만으로는 원인을 못 찾는다. DNS, connect, TLS, queue wait, TTFB, TTLB를 분리해 봐야 어느 계층이 실제로 시간을 태웠는지 보인다.",
   "body_markdown": "# Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB\n\n> 한 줄 요약: \"요청이 2초 걸렸다\"는 말만으로는 원인을 못 찾는다. DNS, connect, TLS, queue wait, TTFB, TTLB를 분리해 봐야 어느 계층이 실제로 시간을 태웠는지 보인다.\n>\n> 문서 역할: 이 문서는 network 운영 cluster 안에서 **latency breakdown 관측과 원인 분해**를 맡는 deep dive다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Browser DevTools Waterfall Primer: DNS, Connect, SSL, Waiting 읽기](./browser-devtools-waterfall-primer.md)\n> - [Timeout 타입: connect, read, write](./timeout-types-connect-read-write.md)\n> - [Upstream Queueing, Connection Pool Wait, Tail Latency](./upstream-queueing-connection-pool-wait-tail-latency.md)\n> - [TLS Session Resumption, 0-RTT, Replay Risk](./tls-session-resumption-0rtt-replay-risk.md)\n> - [Packet Loss, Jitter, Reordering Diagnostics](./packet-loss-jitter-reordering-diagnostics.md)\n> - [Happy Eyeballs, Dual-Stack Racing](./happy-eyeballs-dual-stack-racing.md)\n> - [Queue Saturation Attribution, Metrics, Runbook](./queue-saturation-attribution-metrics-runbook.md)\n> - [Network, Spring Request Lifecycle, Timeout, Disconnect Bridge](./network-spring-request-lifecycle-timeout-disconnect-bridge.md)\n> - [Spring MVC 요청 생명주기](../spring/spring-mvc-request-lifecycle.md)\n> - [Spring RestClient vs WebClient Lifecycle Boundaries](../spring/spring-restclient-vs-webclient-lifecycle-boundaries.md)\n\nretrieval-anchor-keywords: request timing decomposition, DNS time, connect time, TLS handshake time, TTFB, TTLB, queue wait, time_namelookup, time_connect, time_appconnect, time_starttransfer, latency breakdown\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 이 문서 다음에 보면 좋은 문서\n\n- DevTools `dns`/`connect`/`ssl`/`waiting` 라벨을 먼저 읽고 싶다면 [Browser DevTools Waterfall Primer: DNS, Connect, SSL, Waiting 읽기](./browser-devtools-waterfall-primer.md)부터 본다.\n- 전체 예산 설계는 [Timeout Budget Propagation Across Proxy, Gateway, Service Hops](./timeout-budget-propagation-proxy-gateway-service-hop-chain.md)로 이어진다.\n- 재시도 / 타임아웃 정책 자체는 [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)과 같이 보는 편이 좋다.\n- queue wait가 병목으로 보이면 [Upstream Queueing, Connection Pool Wait, Tail Latency](./upstream-queueing-connection-pool-wait-tail-latency.md)를 이어서 본다.\n\n## 핵심 개념\n\n전체 latency는 하나의 시간이 아니라 여러 구간의 합이다.\n\n- DNS resolution\n- TCP connect\n- TLS handshake\n- local queue wait\n- request write\n- TTFB(time to first byte)\n- TTLB(time to last byte)\n\n중요한 점은 일부 대시보드가 이 중 몇 개만 보여 준다는 점이다.  \n그래서 실제 병목은 queue wait인데 connect가 느리다고 오해하거나, TLS는 빠른데 TTFB만 보고 네트워크 탓을 하기도 쉽다.\n\n### Retrieval Anchors\n\n- `request timing decomposition`\n- `DNS time`\n- `connect time`\n- `TLS handshake time`\n- `TTFB`\n- `TTLB`\n- `queue wait`\n- `latency breakdown`\n\n## 깊이 들어가기\n\n### 1. phase timing은 누적값이라는 점을 먼저 이해해야 한다\n\n예를 들어 curl 계열 지표는 보통 이런 감각이다.\n\n- `time_namelookup`: DNS까지 누적\n- `time_connect`: TCP connect까지 누적\n- `time_appconnect`: TLS까지 누적\n- `time_starttransfer`: first byte까지 누적\n- `time_total`: 전체 완료까지 누적\n\n즉 각 값을 바로 비교하기보다 **구간 차이**를 봐야 한다.\n\n- DNS 구간 = `time_namelookup`\n- connect 구간 = `time_connect - time_namelookup`\n- TLS 구간 = `time_appconnect - time_connect`\n- server think + upstream wait + first byte 지연 = `time_starttransfer - time_appconnect`\n- body transfer 구간 = `time_total - time_starttransfer`\n\n### 2. TTFB는 서버 코드 시간과 같은 말이 아니다\n\nTTFB가 길다고 해서 무조건 앱 로직이 느린 건 아니다.\n\nTTFB 안에는 여러 요소가 섞일 수 있다.\n\n- upstream connection pool wait\n- proxy worker queue\n- TLS resumption 실패\n- auth / rate limit / routing\n- app compute\n- DB lock or queueing\n- response header가 나가기 전 buffering\n\n그래서 TTFB를 \"서버 처리 시간\"으로 단순 치환하면 자주 틀린다.\n\n### 3. TTLB는 body streaming과 flush 정책까지 포함한다\n\nfirst byte가 빨라도 total이 늦을 수 있다.\n\n- large response body\n- slow client download\n- proxy buffering\n- chunk flush 간격\n- TLS record coalescing\n\n특히 streaming API는 TTFB보다 **chunk cadence와 TTLB**가 더 의미 있을 수 있다.\n\n### 4. queue wait는 phase timing에서 가장 쉽게 사라진다\n\n로컬 queueing은 네트워크 계층 바깥에서 발생할 수 있다.\n\n- request가 아직 socket도 못 잡았다\n- H2 pending stream queue에서 기다린다\n- worker queue에서 dispatch 전 대기한다\n\n이 구간은 connect/tls 계측만으로는 사라진다.  \n그래서 \"connect는 5ms인데 왜 요청은 700ms냐\" 같은 현상이 생긴다.\n\n### 5. TLS와 DNS는 캐시 hit 여부에 따라 분포가 갈린다\n\nphase timing이 bimodal하게 보이면 cache hit/miss를 의심할 수 있다.\n\n- DNS cache hit vs miss\n- TLS resumption hit vs full handshake\n- idle keep-alive reuse vs 새 connection\n\n평균으로만 보면 이런 분포가 묻힌다.\n\n### 6. proxy chain에서는 hop별 timing을 따로 남겨야 한다\n\nedge 하나만 보면 실제 병목을 놓친다.\n\n- edge access log의 request time\n- upstream connect time\n- upstream first byte time\n- application internal queue wait\n- downstream write time\n\n이런 구간이 분리되어야 \"edge는 2초, app은 80ms\" 같은 상황을 설명할 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: `time_appconnect`는 빠른데 `time_starttransfer`만 늦다\n\n가능한 원인:\n\n- app compute 또는 DB lock\n- proxy auth/routing\n- upstream queueing\n- H2 pending stream queue\n\n### 시나리오 2: `time_total`만 길고 TTFB는 정상이다\n\n가능한 원인:\n\n- large body 전송\n- slow client\n- proxy buffering\n- flush 간격이 길다\n\n### 시나리오 3: 첫 요청만 느리고 이후는 빠르다\n\nDNS miss, full handshake, warm-up, cold connection을 의심할 수 있다.\n\n### 시나리오 4: 평균은 괜찮은데 p99만 튄다\n\n일부 요청만:\n\n- DNS miss\n- connect retransmission\n- queue saturation\n- slow downstream write\n\n를 만나는 분포일 수 있다.\n\n## 코드로 보기\n\n### curl timing 감각\n\n```bash\ncurl -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\\n' \\\n  -o /dev/null -s https://api.example.com\n```\n\n### phase를 차이로 해석하는 감각\n\n```text\ndns   = namelookup\ntcp   = connect - namelookup\ntls   = appconnect - connect\nttfb  = starttransfer - appconnect\nbody  = total - starttransfer\n```\n\n### 관찰 포인트\n\n```text\n- queue wait를 phase timing 밖에서 별도 계측하는가\n- upstream connect / first byte / total을 hop마다 남기는가\n- first request vs reused connection 분포가 분리되는가\n- TTFB와 TTLB를 같은 원인으로 뭉개고 있지 않은가\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| coarse total latency만 수집 | 단순하다 | 병목 위치를 거의 못 찾는다 | 아주 초기 모니터링 |\n| phase timing 수집 | 원인 분해가 빨라진다 | 계측 포인트가 늘어난다 | 운영 서비스 |\n| hop별 상세 timing | blame이 쉬워진다 | 로그/메트릭 설계가 복잡하다 | proxy chain, microservices |\n| sampled deep tracing | 세밀한 원인 분석이 가능하다 | 지속적 전량 수집은 비싸다 | p99/p999 조사 |\n\n핵심은 latency를 총합 하나로 보지 않고 **구간 차이와 분포**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: TTFB가 길면 항상 서버 코드가 느린 건가요?\n> 핵심: 아니다. queue wait, TLS, routing, upstream wait도 first byte 전 구간에 포함될 수 있다.\n\n> Q: TTLB가 길면 무엇을 의심하나요?\n> 핵심: 큰 body, slow client, buffering, flush 정책을 먼저 본다.\n\n> Q: 왜 queue wait가 phase timing에서 잘 안 보이나요?\n> 핵심: socket을 잡기 전 로컬 대기는 네트워크 timing 지표 밖에 숨어 있을 수 있기 때문이다.\n\n## 한 줄 정리\n\n정확한 네트워크 진단은 \"전체 2초\"가 아니라 DNS, connect, TLS, queue, TTFB, TTLB를 분해해서 어느 구간이 실제로 꼬리를 만들었는지 보는 것에서 시작한다.\n",
   "aliases": [
-    "Request Timing Decomposition: DNS, 개념",
-    "Request Timing Decomposition: DNS, 정리",
-    "Request Timing Decomposition: DNS, 실수",
-    "Request Timing Decomposition: DNS, 판단 기준",
     "네트워크 Request Timing Decomposition: DNS,",
     "request timing decomposition",
     "TTFB",
@@ -17,7 +13,9 @@
     "DNS time",
     "connect time",
     "TLS handshake",
-    "latency breakdown"
+    "latency breakdown",
+    "TTFB는 빠른데 TTLB가 느려요",
+    "DNS connect TLS 중 어디서 느려?"
   ],
   "expected_queries": [
     "TTFB랑 TTLB는 뭐가 달라?",
@@ -52,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

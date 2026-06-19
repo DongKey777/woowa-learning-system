@@ -6,10 +6,6 @@
   "summary": "idle 후 keep-alive 재사용 시 RST가 나는 것은 대개 중간 장비가 소켓을 먼저 닫았는데 클라이언트 풀만 아직 믿고 있기 때문이다.",
   "body_markdown": "# RST on Idle Keep-Alive Reuse\n\n> 한 줄 요약: idle 후 keep-alive 재사용 시 RST가 나는 것은 대개 중간 장비가 소켓을 먼저 닫았는데 클라이언트 풀만 아직 믿고 있기 때문이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TCP Reset Storms, Idle Reuse, Stale Sockets](./tcp-reset-storms-idle-reuse-stale-sockets.md)\n> - [Idle Timeout 불일치: LB, Proxy, App](./idle-timeout-mismatch-lb-proxy-app.md)\n> - [HTTP Keep-Alive Timeout Mismatch, Deeper Cases](./http-keepalive-timeout-mismatch-deeper-cases.md)\n> - [FIN, RST, Half-Close, EOF](./fin-rst-half-close-eof-semantics.md)\n> - [LB Connection Draining, Deployment Safe Close](./lb-connection-draining-deployment-safe-close.md)\n\nretrieval-anchor-keywords: RST, idle reuse, keep-alive, stale socket, broken pipe, ECONNRESET, proxy close, connection pool, first request after idle\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nidle 후 keep-alive 재사용 시 RST가 나는 건 아주 흔한 패턴이다.\n\n- client pool은 연결이 살아 있다고 본다\n- LB/proxy/origin은 이미 idle timeout으로 닫았다\n- 첫 재사용에서 바로 RST가 난다\n\n진입 증상은 보통 \"한동안 조용하다가 첫 요청만 실패하고, 바로 retry하면 성공한다\"다. 이때 RST를 애플리케이션 crash 증거로 바로 해석하지 말고, **client가 믿는 connection lifetime**과 **중간 장비가 허용하는 idle lifetime**이 어긋났는지 먼저 본다.\n\n### Retrieval Anchors\n\n- `RST`\n- `idle reuse`\n- `keep-alive`\n- `stale socket`\n- `broken pipe`\n- `ECONNRESET`\n- `proxy close`\n- `connection pool`\n- `first request after idle`\n\n## 깊이 들어가기\n\n### 1. 왜 첫 요청만 터지나\n\nidle 구간 동안 중간 장비가 연결을 정리했을 수 있다.\n\n- pool은 아직 객체를 가지고 있다\n- OS는 파일 디스크립터가 열려 있다\n- 실제 peer는 이미 사라졌다\n\n즉 \"소켓 객체가 pool에 있다\"는 말과 \"다음 write/read가 성공한다\"는 말은 다르다. stale connection은 재사용 시점이 되기 전까지 조용히 숨어 있을 수 있다.\n\n### 2. 왜 RST로 보이나\n\n정상 종료가 아니라 강제 종료나 상태 불일치일 때 흔하다.\n\n- peer가 소켓 상태를 버렸다\n- timeout mismatch가 있었다\n- 드물게 proxy가 세션을 정리했다\n\n### 3. 왜 디버깅이 어렵나\n\n재사용하기 전까지 아무 문제가 없기 때문이다.\n\n- 새 연결은 잘 된다\n- idle 뒤 첫 재사용만 실패한다\n- 이후 retry는 성공할 수 있다\n\n### 4. 무엇을 먼저 보나\n\n- pool idle lifetime\n- LB/proxy timeout\n- connection validation\n- retry behavior\n\n확인 순서는 다음처럼 잡는다.\n\n1. 실패가 idle 직후 첫 요청에 몰리는지 시간 분포를 본다.\n2. client pool의 max idle time이 LB/proxy/origin idle timeout보다 짧은지 확인한다.\n3. 실패 직후 retry가 새 연결로 성공하는지 본다.\n4. 배포/드레인 중이면 기존 connection을 닫는 주체와 새 요청 유입 차단 시점을 확인한다.\n5. 패킷 캡처가 가능하면 RST를 보낸 쪽이 client, proxy, origin 중 어디인지 대조한다.\n\n### 5. 예방책\n\n- borrow 시 validation\n- idle eviction\n- timeout hierarchy 정렬\n- draining과 함께 배포\n\n## 실전 시나리오\n\n### 시나리오 1: 가끔만 broken pipe가 난다\n\nidle reuse와 RST를 의심한다.\n\n### 시나리오 2: 배포 후에만 reset이 늘어난다\n\ndraining이 충분하지 않거나 timeout이 바뀌었을 수 있다.\n\n### 시나리오 3: 특정 프록시 뒤에서만 실패한다\n\n중간 장비가 먼저 닫았는데 app pool이 오래 믿고 있을 수 있다.\n\n## 코드로 보기\n\n### 관찰\n\n```bash\nss -tan state established\ntcpdump -i eth0 'tcp[tcpflags] & tcp-rst != 0'\n```\n\n### Failure matrix\n\n| 관찰 증거 | 더 그럴듯한 원인 | 다음 확인 |\n|---|---|---|\n| idle 직후 첫 요청만 `ECONNRESET`, retry 성공 | stale pooled connection | pool idle eviction, validation on borrow |\n| 배포/스케일인 직후 RST 증가 | draining 또는 safe close 미흡 | LB deregistration delay, connection draining |\n| 특정 proxy 경로에서만 reset | proxy idle timeout이 더 짧음 | client idle lifetime < proxy timeout인지 |\n| 긴 요청 중간에 reset | idle reuse보다 중간 경로 종료/timeout 가능성 | read timeout, upstream timeout, proxy log |\n\n### 정책 감각\n\n```text\nvalidate on borrow\nevict idle before proxy timeout\nalign client pool with upstream lifetime\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 오래 재사용 | handshake 비용이 적다 | idle reuse RST 위험이 있다 | 안정적인 peer |\n| 자주 재연결 | stale risk가 줄어든다 | 비용이 늘어난다 | 변동성 큰 경로 |\n| 검증 후 재사용 | 안정성이 높다 | 약간 느리다 | 운영 안정성이 중요할 때 |\n\n핵심은 재사용 자체가 아니라 **재사용 직전에 실제 살아 있는지**다.\n\n## 꼬리질문\n\n> Q: idle reuse에서 RST가 왜 나나요?\n> 핵심: 중간 장비가 이미 닫은 연결을 client pool이 다시 쓰기 때문이다.\n\n> Q: broken pipe와 다른가요?\n> 핵심: 둘 다 닫힌 소켓에 write할 때 보이지만 원인은 동일 계열이다.\n\n> Q: 어떻게 줄이나요?\n> 핵심: validation, eviction, timeout 정렬, draining을 같이 쓴다.\n\n## 한 줄 정리\n\nidle keep-alive reuse에서 RST가 나면 소켓은 살아 보여도 peer는 이미 닫힌 상태이므로 pool 검증과 timeout 정렬이 필요하다.\n",
   "aliases": [
-    "RST on Idle Keep-Alive 개념",
-    "RST on Idle Keep-Alive 정리",
-    "RST on Idle Keep-Alive 실수",
-    "RST on Idle Keep-Alive 판단 기준",
     "네트워크 RST on Idle Keep-Alive",
     "RST on idle keep-alive reuse",
     "idle reuse RST",
@@ -17,7 +13,9 @@
     "ECONNRESET after idle",
     "broken pipe after idle",
     "first request after idle",
-    "connection pool stale"
+    "connection pool stale",
+    "idle 뒤 ECONNRESET이 첫 요청에만 나요",
+    "connection pool이 죽은 소켓을 재사용해요"
   ],
   "expected_queries": [
     "idle 후 keep-alive 재사용 시 RST가 나는 이유는?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/rst-on-idle-keepalive-reuse.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

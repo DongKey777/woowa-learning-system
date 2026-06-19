@@ -6,10 +6,6 @@
   "summary": "파일을 지웠다고 공간이 바로 돌아오는 것은 아니며, 프로세스가 그 inode를 계속 열고 있으면 디렉터리에서는 사라져도 디스크와 tmpfs 메모리는 계속 점유될 수 있다.",
   "body_markdown": "# Deleted-but-Open Files, Log Rotation, Space Leak Debugging\n\n> 한 줄 요약: 파일을 지웠다고 공간이 바로 돌아오는 것은 아니며, 프로세스가 그 inode를 계속 열고 있으면 디렉터리에서는 사라져도 디스크와 tmpfs 메모리는 계속 점유될 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [O_CLOEXEC, FD Inheritance, Exec-Time Leaks](./o-cloexec-fd-inheritance-exec-leaks.md)\n> - [Rename Atomicity, Directory fsync, Crash Consistency](./rename-atomicity-directory-fsync-crash-consistency.md)\n> - [tmpfs, shmem, /dev/shm, Cgroup Memory Accounting](./tmpfs-shmem-cgroup-memory-accounting.md)\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [Sparse Files, fallocate, Hole Punching](./sparse-file-fallocate-hole-punching.md)\n\n> retrieval-anchor-keywords: deleted open file, unlinked file, disk space leak, lsof +L1, log rotation, inode still open, deleted but open, tmpfs leak, /proc/pid/fd, hidden disk usage\n\n## 핵심 개념\n\n유닉스 계열 파일 수명은 \"이름\"과 \"열린 참조\"가 분리된다. 그래서 파일 이름을 `unlink`해도, 어떤 프로세스가 그 파일을 여전히 열고 있으면 실제 inode와 데이터 블록은 남아 있을 수 있다.\n\n- `directory entry`: 사람이 경로로 보는 이름이다\n- `inode`: 파일 내용과 메타데이터의 실제 객체다\n- `open file`: 프로세스가 그 inode를 여전히 참조하고 있는 상태다\n- `unlink`: 이름을 제거하는 동작이지, 열린 참조를 강제로 끊는 동작은 아니다\n\n왜 중요한가:\n\n- 로그 파일을 지웠는데 디스크 사용량이 안 줄어드는 장애를 설명할 수 있다\n- tmpfs나 `/dev/shm`에서도 같은 현상이 메모리 pressure로 나타날 수 있다\n- 잘못된 log rotation이나 temp-file cleanup이 \"숨은 사용량\"을 만들 수 있다\n\n## 깊이 들어가기\n\n### 1. 파일 삭제와 공간 회수는 같은 순간이 아니다\n\n운영자가 `rm huge.log`를 했다고 해서 곧바로 블록이 반납되는 것은 아니다.\n\n- path에서는 파일이 안 보인다\n- 하지만 프로세스가 fd를 계속 잡고 있으면 inode는 남아 있다\n- 마지막 참조가 닫힐 때 실제 공간 회수가 일어난다\n\n그래서 `ls`로는 사라졌는데 `df`는 안 줄어드는 상황이 생긴다.\n\n### 2. log rotation에서 자주 터지는 이유\n\n애플리케이션이 로그 파일을 열어 둔 상태에서 운영자가 파일을 지우거나, rotation 도구가 copy-truncate 대신 예상과 다른 방식을 쓰면 문제가 생길 수 있다.\n\n- old log를 rename했는데 프로세스는 old fd에 계속 append한다\n- old log를 unlink했는데 프로세스는 계속 쓰고 있다\n- 새 경로는 비어 보이는데 실제 디스크는 old inode가 먹고 있다\n\n즉 \"경로 기준 rotation\"과 \"fd 기준 write target\"을 구분해야 한다.\n\n### 3. tmpfs에서도 똑같이 터지지만 증상은 메모리다\n\ntmpfs에 있는 파일을 unlink해도 열린 fd나 mmap이 남아 있으면 사용량이 남을 수 있다.\n\n- 디스크 leak처럼 보이지 않는다\n- `memory.current`, `shmem`, OOM 경로로 나타난다\n- `/dev/shm`에 쌓이면 브라우저/IPC 워크로드가 이상하게 죽을 수 있다\n\n그래서 deleted-open 문제는 스토리지 문제이자 메모리 문제다.\n\n### 4. 해결은 \"지우기\"가 아니라 \"닫기 또는 재열기\"다\n\n운영 대응에서 핵심은 파일 이름 삭제가 아니라 참조 끊기다.\n\n- 프로세스가 fd를 닫게 한다\n- 로그 재오픈 신호를 보낸다\n- 재시작으로 fd 수명을 끊는다\n\n즉 space leak는 cleanup job보다 lifecycle bug로 보는 편이 맞다.\n\n## Symptom Router 역할\n\n### 관찰 증거\n\n- `df`는 줄지 않는데 `du`로 보이는 파일 합계는 작다\n- `lsof +L1` 또는 `/proc/<pid>/fd`에서 `(deleted)`가 붙은 큰 파일이 보인다\n- tmpfs라면 disk usage보다 `memory.stat`의 `shmem`/`file` 또는 cgroup memory usage가 남는다\n- log rotation 직후 새 파일 경로와 실제 writer fd가 다른 inode를 가리킨다\n\n### 1차 분기\n\n| 증상 | 우선 bucket | 첫 확인 |\n|------|-------------|---------|\n| `df`만 높고 경로에는 파일이 없다 | deleted-but-open inode | `lsof +L1`, `/proc/*/fd` |\n| `/dev/shm` usage가 안 내려간다 | tmpfs/shmem open reference | `memory.stat`, `maps`, fd |\n| rotation 뒤 로그가 새 파일에 안 쌓인다 | reopen 실패 | writer signal/restart, inode 비교 |\n| copy-truncate 중 로그가 섞인다 | rotation 전략과 write 경쟁 | writer append 방식, collector 동작 |\n\n### 다음 확인\n\n문제를 찾은 뒤에는 무조건 `rm`을 반복하지 말고, 해당 프로세스가 fd를 닫거나 로그 파일을 재오픈하는 경로가 있는지 확인한다. sidecar log collector, shell redirection, child process의 inherited fd도 같은 inode를 잡고 있을 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 로그를 지웠는데 `df`가 안 줄어든다\n\n가능한 원인:\n\n- 애플리케이션이 deleted inode를 계속 열고 있다\n- log rotate 이후 재오픈이 안 됐다\n- sidecar/collector가 old file을 쥐고 있다\n\n진단:\n\n```bash\nlsof +L1\nls -l /proc/<pid>/fd\nreadlink /proc/<pid>/fd/<fd>\n```\n\n판단 포인트:\n\n- `(deleted)`가 붙은 파일이 큰 크기로 남아 있는가\n- 어느 프로세스가 어떤 fd로 쥐고 있는가\n- log writer뿐 아니라 collector도 같이 잡고 있는가\n\n### 시나리오 2: `/dev/shm` 파일을 지웠는데 컨테이너 메모리가 안 내려간다\n\n가능한 원인:\n\n- mmap이 살아 있다\n- worker가 fd를 닫지 않았다\n- tmpfs이므로 디스크가 아니라 shmem 사용량으로 남는다\n\n진단:\n\n```bash\nlsof +L1 2>/dev/null | rg '/dev/shm|tmpfs'\ncat /sys/fs/cgroup/memory.stat | rg 'shmem|file'\ncat /proc/<pid>/maps | rg '/dev/shm'\n```\n\n### 시나리오 3: copy-truncate 이후 로그가 뒤엉키거나 usage가 이상하다\n\n가능한 원인:\n\n- writer가 old fd를 그대로 쓴다\n- truncate 타이밍과 write가 경쟁한다\n- rotation 전략이 애플리케이션 write 모델과 안 맞는다\n\n이 경우는 log rotation 정책을 \"경로 이름 관리\"가 아니라 \"fd 수명 관리\" 관점으로 재검토해야 한다.\n\n## 코드로 보기\n\n### 삭제 후에도 열린 fd가 남는 mental model\n\n```text\nprocess opens app.log\n  -> fd points to inode X\nrm app.log\n  -> directory entry removed\n  -> fd still points to inode X\nprocess keeps writing\n  -> disk/tmpfs usage remains hidden from pathname view\n```\n\n### 운영 triage\n\n```bash\nlsof +L1\nfind /proc/*/fd -lname '*deleted*' 2>/dev/null | head\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| rename + reopen rotation | writer 수명과 경로를 맞추기 쉽다 | 애플리케이션 reopen 지원이 필요하다 | 장기 실행 로그 프로세스 |\n| copy-truncate | 단순해 보인다 | 경쟁과 hidden usage를 만들 수 있다 | reopen이 어려운 레거시 |\n| temp file unlink after open | cleanup가 쉬워 보일 수 있다 | fd가 남으면 hidden usage가 된다 | 짧은 임시 파일에서만 신중히 |\n| 재시작으로 fd 정리 | 확실하다 | 서비스 영향이 있다 | 긴급 대응 |\n\n## 꼬리질문\n\n> Q: 파일을 지웠는데 왜 `df`가 안 줄어드나요?\n> 핵심: 경로 이름은 사라졌지만 열린 fd가 inode를 계속 참조하고 있어 실제 공간 회수가 안 됐기 때문이다.\n\n> Q: `ls`로 안 보이는데 usage가 남을 수 있나요?\n> 핵심: 그렇다. pathname view와 open-file lifetime은 분리되어 있다.\n\n> Q: tmpfs에서도 같은 현상이 있나요?\n> 핵심: 있다. 다만 디스크 usage 대신 shmem/memory pressure로 보이는 것이 다르다.\n\n## 한 줄 정리\n\ndeleted-open file 문제는 \"지웠는데 안 지워진 파일\"이 아니라, \"이름은 사라졌지만 fd 수명이 아직 끝나지 않은 inode\" 문제다.\n",
   "aliases": [
-    "Deleted Open File Space 개념",
-    "Deleted Open File Space 정리",
-    "Deleted Open File Space 실수",
-    "Deleted Open File Space 판단 기준",
     "운영체제 Deleted Open File Space",
     "deleted open file space leak",
     "lsof +L1",
@@ -17,7 +13,8 @@
     "unlinked file disk usage",
     "tmpfs deleted file leak",
     "proc pid fd deleted",
-    "deleted open file space guide"
+    "삭제한 로그인데 df가 그대로야",
+    "lsof +L1은 언제 확인해?"
   ],
   "expected_queries": [
     "삭제한 파일인데 디스크 공간이 바로 돌아오지 않는 이유는?",
@@ -44,12 +41,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/deleted-open-file-space-leak-log-rotation.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

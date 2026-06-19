@@ -6,10 +6,6 @@
   "summary": "이 문서는 security 카테고리에서 AuthZ Decision Logging Design를 다루는 deep_dive 문서다. authz decision log는 허용/거부 결과만 남기는 것이 아니라, 정책 버전과 평가 근거까지 기록해야 나중에 재현 가능한 증거가 된다. 검색 질의가 authz decision logging, decision reason, policy version, allow deny처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
   "body_markdown": "# AuthZ Decision Logging Design\n\n> 한 줄 요약: authz decision log는 허용/거부 결과만 남기는 것이 아니라, 정책 버전과 평가 근거까지 기록해야 나중에 재현 가능한 증거가 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n> - [Authorization Caching / Staleness](./authorization-caching-staleness.md)\n> - [Permission Model Drift / AuthZ Graph Design](./permission-model-drift-authz-graph-design.md)\n> - [IDOR / BOLA Patterns and Fixes](./idor-bola-patterns-and-fixes.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n> - [Auth Observability: SLI / SLO / Alerting](./auth-observability-sli-slo-alerting.md)\n> - [Authorization Runtime Signals / Shadow Evaluation](./authorization-runtime-signals-shadow-evaluation.md)\n> - [SCIM Drift / Reconciliation](./scim-drift-reconciliation.md)\n> - [System Design: Session Store / Claim-Version Cutover 설계](../system-design/session-store-claim-version-cutover-design.md)\n\nretrieval-anchor-keywords: authz decision logging, decision reason, policy version, allow deny, PDP, PEP, traceability, resource owner, policy engine, security telemetry, deny spike, decision metrics, shadow divergence, claim schema version, store generation, reconciliation run id, directory event id, cleanup evidence, retirement evidence, legacy parser hit\n\n---\n\n## 핵심 개념\n\nauthz decision logging은 누가 어떤 자원에 어떤 동작을 하려 했고, 그 결과가 왜 allow 또는 deny였는지를 기록하는 설계다.\n\n단순 access log와 다른 점:\n\n- 요청이 왔다는 사실만 기록하지 않는다\n- 권한 판단 결과를 기록한다\n- 어떤 정책 버전과 어떤 근거로 결정했는지 남긴다\n\n즉 authz decision log는 \"무슨 일이 일어났는가\"가 아니라 \"왜 그렇게 판단했는가\"까지 담아야 한다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 무엇을 기록해야 하나\n\n기본 필드:\n\n- actor id\n- tenant id\n- resource id\n- action\n- decision allow/deny\n- policy version\n- evaluation timestamp\n- request id / correlation id\n\n가능하면 추가:\n\n- resource owner\n- rule id\n- reason code\n- risk score\n- cache hit 여부\n\n### 2. reason code가 중요하다\n\n단순히 deny만 남기면 나중에 분석이 어렵다.\n\n예:\n\n- `DENY_NOT_OWNER`\n- `DENY_TENANT_MISMATCH`\n- `DENY_POLICY_VERSION_STALE`\n- `DENY_ROLE_MISSING`\n\nreason code가 있어야 공격 탐지와 정책 개선이 쉬워진다.\n\n### 3. cleanup / retirement 증거를 위해 cutover join key를 남긴다\n\nauthority transfer나 claim-version cutover에서는 allow/deny만 남겨서는 부족하다.\nold session authority, old claim semantic, incomplete SCIM repair가 같은 증상으로 보일 수 있기 때문이다.\n\nretirement evidence에 자주 필요한 필드:\n\n- `claim_schema_version`\n- `store_generation`\n- `session_id`, `refresh_family_id`\n- `authz_epoch`, `revoke_before`\n- `directory_event_id`, `reconciliation_run_id`\n- `shadow_policy_version`, `legacy_parser_hit`\n\n이 키가 있어야 [SCIM Drift / Reconciliation](./scim-drift-reconciliation.md)에서 나온 lifecycle repair와\n[Session Store / Claim-Version Cutover 설계](../system-design/session-store-claim-version-cutover-design.md)의 cleanup gate를\n같은 allow/deny event 위에서 설명할 수 있다.\n\n### 4. log와 policy engine을 분리해야 한다\n\n권한 결정을 내리는 엔진과 기록하는 레이어는 분리한다.\n\n- PDP가 결정을 만든다\n- PEP가 실행한다\n- logger가 독립적으로 남긴다\n\n한 함수에서 전부 하면 테스트와 운영이 어려워진다.\n\n### 5. sensitive data는 기록하지 않는다\n\ndecision log는 강력하지만 위험할 수 있다.\n\n- token 원문\n- password\n- secret\n- 과도한 PII\n\n필요한 식별자만 남긴다.\n\n### 6. deny와 allow 모두 기록할지 결정해야 한다\n\n모두 남기면 분석은 좋지만 비용이 든다.\n\n- allow는 샘플링할 수 있다\n- deny는 대부분 full capture가 필요하다\n\n정책과 규모에 맞게 분리한다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 관리자 권한 남용 경로를 추적해야 함\n\n대응:\n\n- allow/deny와 policy version을 함께 본다\n- admin action만 별도 스트림으로 묶는다\n- correlation id로 앞뒤 요청을 연결한다\n\n### 시나리오 2: 권한 회수 후에도 allow가 발생함\n\n대응:\n\n- stale policy version이 남았는지 본다\n- cache hit 여부를 기록한다\n- session revocation 로그와 대조한다\n\n### 시나리오 3: audit와 decision log가 뒤섞여 분석이 어려움\n\n대응:\n\n- audit log는 사건 중심\n- decision log는 정책 평가 중심\n- 둘을 별도 sink로 보낸다\n\n---\n\n## 코드로 보기\n\n### 1. decision log 기록\n\n```java\npublic AuthorizationDecision decide(UserPrincipal user, String resourceId, String action) {\n    AuthorizationDecision decision = policyEngine.evaluate(user, resourceId, action);\n    decisionLogger.log(\n        user.id(),\n        user.tenantId(),\n        resourceId,\n        action,\n        decision.allowed(),\n        decision.reasonCode(),\n        user.policyVersion()\n    );\n    return decision;\n}\n```\n\n### 2. reason code enum\n\n```java\npublic enum DecisionReason {\n    ALLOW_OWNER,\n    ALLOW_ADMIN,\n    DENY_NOT_OWNER,\n    DENY_TENANT_MISMATCH,\n    DENY_ROLE_MISSING,\n    DENY_STALE_POLICY\n}\n```\n\n### 3. log sink 분리\n\n```text\n1. authz decision은 별도 sink로 보낸다\n2. audit log와 포맷을 다르게 둔다\n3. policy version과 reason code를 항상 포함한다\n4. 민감 값은 마스킹한다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| allow/deny only | 단순하다 | 재현성이 약하다 | 아주 작은 시스템 |\n| reason code 포함 | 분석과 forensic에 좋다 | 설계가 필요하다 | 대부분의 서비스 |\n| full policy trace | 재현성이 높다 | 비용과 민감정보 관리가 필요하다 | 고보안/규제 환경 |\n\n판단 기준은 이렇다.\n\n- deny 원인을 얼마나 빨리 알아야 하는가\n- 정책 버전 차이를 추적해야 하는가\n- 어떤 resource에 대한 결정을 재현해야 하는가\n- 로그 보관과 개인정보 제약을 만족할 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: authz decision log에는 무엇을 남겨야 하나요?\n> 의도: 근거와 버전의 중요성을 아는지 확인\n> 핵심: actor, resource, action, decision, reason code, policy version이다.\n\n> Q: reason code가 왜 필요한가요?\n> 의도: 단순 결과와 분석 가능성의 차이를 아는지 확인\n> 핵심: 왜 deny/allow가 났는지 재현할 수 있기 때문이다.\n\n> Q: audit log와 어떻게 다른가요?\n> 의도: 사건 기록과 결정 기록을 구분하는지 확인\n> 핵심: audit는 사건 중심, decision log는 정책 평가 중심이다.\n\n> Q: policy version을 왜 기록하나요?\n> 의도: drift와 stale policy 분석을 아는지 확인\n> 핵심: 어떤 정책 기준으로 판단했는지 재현하기 위해서다.\n\n## 한 줄 정리\n\nauthz decision logging은 결과만이 아니라 정책 버전과 reason code를 남겨야 나중에 재현 가능한 보안 증거가 된다.\n",
   "aliases": [
-    "AuthZ Decision Logging Design 개념",
-    "AuthZ Decision Logging Design 정리",
-    "AuthZ Decision Logging Design 실수",
-    "AuthZ Decision Logging Design 판단 기준",
     "보안 AuthZ Decision Logging Design",
     "authz decision logging",
     "decision reason",
@@ -17,7 +13,9 @@
     "allow deny",
     "PDP",
     "PEP",
-    "traceability"
+    "traceability",
+    "인가 결정 이유를 로그에 남기기",
+    "allow deny만 남기면 재현이 안 됨"
   ],
   "expected_queries": [
     "authz decision log에 allow deny만 남기면 왜 나중에 정책 판단을 재현하기 어려워?",
@@ -45,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/security/authz-decision-logging-design.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

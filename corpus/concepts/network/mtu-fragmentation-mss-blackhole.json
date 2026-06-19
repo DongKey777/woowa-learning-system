@@ -6,10 +6,6 @@
   "summary": "MTU 문제는 \"패킷이 크다\"가 아니라, 경로 중간 장비가 조용히 버려서 연결이 느려지거나 멈추는 운영 문제로 봐야 한다.",
   "body_markdown": "# MTU, Fragmentation, MSS, Blackhole\n\n> 한 줄 요약: MTU 문제는 \"패킷이 크다\"가 아니라, 경로 중간 장비가 조용히 버려서 연결이 느려지거나 멈추는 운영 문제로 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TCP 혼잡 제어](./tcp-congestion-control.md)\n> - [Timeout, Retry, Backoff 실전](./timeout-retry-backoff-practical.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [HTTP/3, QUIC Practical Trade-offs](./http3-quic-practical-tradeoffs.md)\n> - [HTTP Response Compression, Buffering, Streaming Trade-offs](./http-response-compression-buffering-streaming-tradeoffs.md)\n\nretrieval-anchor-keywords: MTU, fragmentation, MSS, PMTUD, blackhole, ICMP fragmentation needed, DF bit, tunnel overhead, path MTU, packet too big\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 이 주제가 중요한가](#왜-이-주제가-중요한가)\n- [MTU와 Fragmentation](#mtu와-fragmentation)\n- [MSS와 Path MTU Discovery](#mss와-path-mtu-discovery)\n- [Blackhole이 생기는 이유](#blackhole이-생기는-이유)\n- [실전 장애 패턴](#실전-장애-패턴)\n- [코드로 보기](#코드로-보기)\n- [면접에서 자주 나오는 질문](#면접에서-자주-나오는-질문)\n\n</details>\n\n## 왜 이 주제가 중요한가\n\nMTU 이슈는 평소에는 티가 잘 안 난다.\n\n- 짧은 API 요청은 정상처럼 보인다\n- 특정 요청만 유독 느리다\n- 재시도하면 가끔 된다\n- 운영자가 보면 서버 CPU는 멀쩡하다\n\n그래서 MTU 문제는 종종 애플리케이션 문제, TLS 문제, 네트워크 불안정으로 오해된다.\n\n핵심은 **경로 중간에 있는 장비가 더 큰 패킷을 처리하지 못할 때 어떤 일이 벌어지는가**다.\n\n### Retrieval Anchors\n\n- `MTU`\n- `fragmentation`\n- `MSS`\n- `PMTUD`\n- `blackhole`\n- `ICMP fragmentation needed`\n- `tunnel overhead`\n- `path MTU`\n\n---\n\n## MTU와 Fragmentation\n\n### MTU란\n\n`MTU(Maximum Transmission Unit)`는 한 번에 전송할 수 있는 패킷의 최대 크기다.\n\n- 이더넷은 흔히 1500 bytes를 기본으로 본다\n- VPN, 터널, 클라우드 오버레이를 타면 더 줄어들 수 있다\n- MTU는 링크별 특성이고, 경로 전체는 그보다 더 보수적으로 봐야 한다\n\n### Fragmentation이란\n\n패킷이 MTU보다 크면 쪼개서 보내야 한다.\n\n- IP 계층에서 조각나면 `fragmentation`이 발생한다\n- 조각이 중간에 하나라도 빠지면 원본 복원이 실패한다\n- 조각이 많아질수록 손실과 재조립 비용이 늘어난다\n\n실무에서는 fragmentation 자체를 적극적으로 쓰기보다, 애초에 **작게 보내는 방향**을 선호한다.\n\n### 왜 피하려고 하나\n\n- 중간 장비가 fragment를 다루기 싫어한다\n- 방화벽이 fragment를 드롭하기도 한다\n- 추적과 디버깅이 어려워진다\n\n즉 fragmentation은 \"이론적으로 가능\"과 \"운영에서 안전\"이 다르다.\n\n---\n\n## MSS와 Path MTU Discovery\n\n### MSS란\n\n`MSS(Maximum Segment Size)`는 TCP payload가 한 세그먼트에 담길 수 있는 최대 크기다.\n\n- MTU에서 IP/TCP 헤더를 뺀 값으로 생각하면 된다\n- 실제로는 이 값을 기준으로 TCP가 보내는 덩어리를 맞춘다\n- 그래서 TCP에서는 MTU보다 MSS를 더 자주 조정한다\n\n### Path MTU Discovery\n\n경로 상에서 가장 작은 MTU를 찾아, 그 크기에 맞춰 보내려는 방식이다.\n\n- 보통은 큰 패킷을 보내보고\n- 중간 장비가 `ICMP Fragmentation Needed` 같은 신호를 돌려주면\n- 그보다 작은 크기로 조정한다\n\n문제는 이 신호가 막히면 경로 탐지가 실패한다는 점이다.\n\n### MSS clamping\n\nVPN, NAT, LB, 터널 구간에서는 MSS를 강제로 낮추는 방식이 자주 쓰인다.\n\n- 경로를 완벽히 알기 어렵다\n- 중간에서 ICMP가 막힐 수 있다\n- 그래서 최초부터 안전한 MSS로 제한한다\n\n운영 관점에서는 이게 가장 단순하고 덜 아픈 해결책인 경우가 많다.\n\n---\n\n## Blackhole이 생기는 이유\n\n`MTU blackhole`은 패킷이 너무 커서 중간에서 버려지는데, 송신자가 그 사실을 제대로 못 알아채는 상황이다.\n\n### 대표 원인\n\n- ICMP 메시지가 방화벽에서 차단된다\n- PMTUD가 작동하지 않는다\n- 터널/VPN 헤더 때문에 실제 경로 MTU가 생각보다 작다\n- 일부 장비가 fragment 또는 oversized packet을 조용히 드롭한다\n\n### 왜 조용히 고장 나나\n\nTCP는 손실을 재전송으로 흡수하려고 한다.\n\n- 작은 패킷은 정상적으로 흐른다\n- 큰 패킷만 계속 실패한다\n- retry를 해도 같은 크기라면 계속 실패한다\n\n그래서 사용자는 \"가끔 느림\"으로 느끼고, 운영자는 \"원인 불명 timeout\"으로 본다.\n\n### 특히 많이 보이는 환경\n\n- VPN 접속 뒤의 사내 시스템\n- 클라우드 VPC 피어링\n- 로드밸런서 뒤의 서비스 체인\n- TLS가 붙은 큰 응답, 특히 헤더가 많은 경우\n\n---\n\n## 실전 장애 패턴\n\n### 1. 로그인은 되는데 특정 API만 timeout이 난다\n\n원인 후보:\n\n- 요청 바디가 크다\n- 응답 헤더가 크다\n- MTU가 작은 경로를 지나고 있다\n- ICMP 차단으로 PMTUD가 깨졌다\n\n### 2. 작은 요청은 괜찮고, 큰 응답만 실패한다\n\n이건 MTU blackhole의 전형적인 신호다.\n\n- 리스트 API는 정상\n- 파일 다운로드나 대형 JSON 응답만 실패\n- gzip 여부에 따라 증상이 달라지기도 한다\n\n### 3. VPN 뒤에서만 느리다\n\n터널 헤더가 추가되면 실제 payload가 줄어든다.\n\n- 기본 MTU를 그대로 쓰면 패킷이 커진다\n- 중간에서 잘리거나 드롭된다\n- MSS clamp나 MTU 조정이 필요하다\n\n### 4. TLS 붙인 뒤부터 문제가 보인다\n\nTLS 자체가 MTU를 깨는 건 아니지만,\n\n- 헤더와 레코드 경계\n- 프록시 체인\n- HTTP/2, 쿠키, 인증 헤더 증가\n\n같은 이유로 실제 패킷 크기가 커질 수 있다.\n\n---\n\n## 코드로 보기\n\n### MTU 확인\n\n```bash\nip link show\nip route get 203.0.113.10\n```\n\n### 경로 MTU 감지\n\n```bash\ntracepath api.example.com\n```\n\n### 패킷 크기 테스트\n\n```bash\nping -M do -s 1472 api.example.com\n```\n\n이 테스트는 MTU 1500 환경에서 헤더를 뺀 payload를 기준으로 맞추는 감각을 보는 데 유용하다.\n\n### TCP 세그먼트 관찰\n\n```bash\ntcpdump -i eth0 host api.example.com\nss -ti dst api.example.com\n```\n\n관찰 포인트:\n\n- retransmission이 늘어나는지\n- MSS가 의도한 값으로 잡히는지\n- 특정 경로에서만 손실이 반복되는지\n\n### 운영에서 볼 설정 감각\n\n```nginx\nproxy_buffering off;\nproxy_http_version 1.1;\n```\n\n버퍼링이나 연결 재사용 자체가 MTU 문제를 해결하지는 않지만, 증상을 숨기거나 더 잘 드러나게 만들 수 있다.\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| fragmentation 허용 | 큰 패킷도 전달 가능 | 손실과 디버깅 비용 증가 | 제한적으로만 |\n| MSS clamping | 운영이 단순하다 | 전 구간 최적화는 아니다 | VPN, 터널, LB |\n| PMTUD 의존 | 경로에 맞게 자동 조정 | ICMP 차단에 취약하다 | 네트워크가 정상적일 때 |\n| 패킷을 작게 설계 | 가장 안전하다 | 프로토콜 설계 제약이 생긴다 | API, 메시징, 업로드 |\n\n핵심은 **MTU는 성능 최적화보다 장애 회피 관점에서 먼저 다뤄야 한다**는 점이다.\n\n---\n\n## 면접에서 자주 나오는 질문\n\n### Q. MTU와 MSS의 차이는 무엇인가요?\n\n- MTU는 링크 계층 기준의 최대 전송 단위이고, MSS는 TCP 세그먼트의 payload 최대 크기다.\n\n### Q. Path MTU Discovery는 왜 필요한가요?\n\n- 경로 중 가장 작은 MTU에 맞춰 패킷 크기를 조정해 fragmentation과 손실을 줄이기 위해서다.\n\n### Q. MTU blackhole은 왜 생기나요?\n\n- 큰 패킷이 중간에서 드롭되는데, 그 사실을 알려주는 ICMP가 막혀서 송신자가 크기를 줄이지 못하기 때문이다.\n\n### Q. 실무에서는 어떻게 막나요?\n\n- MSS clamping, MTU 조정, ICMP 허용, 터널 구간 재설계처럼 경로 전체를 기준으로 보수적으로 맞춘다.\n\n---\n\n## 한 줄 정리\n\nMTU 문제는 \"패킷이 안 간다\"가 아니라, **경로 상의 작은 MTU와 ICMP 차단 때문에 조용히 실패하는 운영 장애**다.\n",
   "aliases": [
-    "MTU, Fragmentation, MSS, Blackhole 개념",
-    "MTU, Fragmentation, MSS, Blackhole 정리",
-    "MTU, Fragmentation, MSS, Blackhole 실수",
-    "MTU, Fragmentation, MSS, Blackhole 판단 기준",
     "네트워크 MTU, Fragmentation, MSS, Blackhole",
     "MTU",
     "fragmentation",
@@ -17,7 +13,9 @@
     "PMTUD",
     "MTU blackhole",
     "ICMP fragmentation needed",
-    "MSS clamping"
+    "MSS clamping",
+    "큰 요청만 멈추면 MTU 문제일까?",
+    "VPN 뒤에서 큰 패킷만 안 가요"
   ],
   "expected_queries": [
     "MTU fragmentation MSS blackhole 문제를 어떻게 설명해?",
@@ -56,12 +54,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/mtu-fragmentation-mss-blackhole.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

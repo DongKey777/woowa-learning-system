@@ -6,10 +6,6 @@
   "summary": "MVCC 읽기는 현재 row를 보는 게 아니라, undo record chain을 따라가며 내 read view에 맞는 버전을 찾는 과정이다.",
   "body_markdown": "# Undo Record Version Chain Traversal\n\n> 한 줄 요약: MVCC 읽기는 현재 row를 보는 게 아니라, undo record chain을 따라가며 내 read view에 맞는 버전을 찾는 과정이다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: undo record, version chain traversal, read view, consistent read, undo chain, MVCC visibility, rollback segment\n\n## 핵심 개념\n\n- 관련 문서:\n  - [MVCC Read View and Consistent Read Internals](./mvcc-read-view-consistent-read-internals.md)\n  - [MVCC History List Growth와 Snapshot Too Old](./mvcc-history-list-snapshot-too-old.md)\n  - [Redo Log, Undo Log, Checkpoint, Crash Recovery](./redo-log-undo-log-checkpoint-crash-recovery.md)\n\nundo record는 과거 row 버전을 담는다.  \nconsistent read는 이 undo record를 따라가며 내가 볼 수 있는 버전을 찾는다.\n\n핵심은 다음이다.\n\n- 최신 row가 내 snapshot에 보이지 않으면 undo를 따라간다\n- chain이 길수록 읽기 비용이 늘어난다\n- purge가 밀리면 traversal 비용이 커진다\n\n## 깊이 들어가기\n\n### 1. version chain은 어떻게 생기나\n\nrow가 UPDATE될 때마다 이전 버전은 undo 쪽에 남고, 새 버전이 앞으로 나온다.  \n그러면 row는 단일 값이 아니라 \"버전들의 연결 리스트\"가 된다.\n\n### 2. traversal은 언제 시작되나\n\n현재 버전이 내 read view에 보이지 않으면 traversal이 시작된다.\n\n- 트랜잭션 시작 시점 snapshot과 안 맞을 때\n- repeatable read에서 같은 snapshot을 유지할 때\n- 오래 열린 트랜잭션이 있을 때\n\n### 3. traversal이 느려지는 이유\n\nchain이 길수록 뒤로 더 많이 돌아가야 한다.\n\n- 업데이트가 많았다\n- purge가 밀렸다\n- 오래된 snapshot이 살아 있다\n\n이런 조건이 겹치면 읽기가 눈에 띄게 무거워질 수 있다.\n\n### 4. rollback과 traversal은 다르다\n\nrollback은 실패한 트랜잭션을 되돌리는 경로다.  \ntraversal은 읽기 시점에 보이는 버전을 찾는 경로다.\n\n같은 undo를 쓰지만 목적이 다르다.\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `undo record`\n- `version chain traversal`\n- `undo chain`\n- `consistent read`\n- `rollback segment`\n- `MVCC visibility`\n\n## 실전 시나리오\n\n### 시나리오 1. SELECT가 단순한데도 느리다\n\nindex는 좋아 보이는데 읽기가 느리면 undo chain traversal 비용이 있을 수 있다.  \n특히 update가 많은 테이블에서 자주 보인다.\n\n### 시나리오 2. 긴 트랜잭션이 있는 날만 느리다\n\n오래 살아 있는 snapshot이 있으면 purge가 버전을 못 지운다.  \n그 결과 traversal chain이 길어진다.\n\n### 시나리오 3. 배치 이후 read latency가 늘었다\n\n대량 update가 undo chain을 늘려서 이후 read path가 더 길어질 수 있다.  \n따라서 쓰기 배치와 읽기 SLA를 함께 봐야 한다.\n\n## 코드로 보기\n\n### read view와 version chain 감각\n\n```sql\n-- session 1\nSTART TRANSACTION;\nSELECT status FROM orders WHERE id = 1;\n\n-- session 2\nUPDATE orders SET status = 'DONE' WHERE id = 1;\nCOMMIT;\n```\n\n### 긴 트랜잭션 확인\n\n```sql\nSELECT trx_id, trx_started, trx_state, trx_query\nFROM information_schema.innodb_trx\nORDER BY trx_started;\n```\n\n### 상태 확인\n\n```sql\nSHOW ENGINE INNODB STATUS\\G\nSHOW STATUS LIKE 'Innodb_history_list_length';\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| chain traversal 허용 | snapshot read가 가능하다 | 길어지면 느려진다 | MVCC 기본 |\n| purge lag 줄이기 | traversal 비용을 줄인다 | 운영 관리가 필요하다 | 읽기 SLA가 민감할 때 |\n| 긴 트랜잭션 축소 | 근본 원인을 제거한다 | 배치/리포트 설계가 필요하다 | 대부분의 운영 DB |\n\n핵심은 undo record traversal을 \"숨겨진 세부 구현\"이 아니라, **읽기 성능을 좌우하는 실제 경로**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: undo record chain을 왜 따라가나요?\n> 의도: consistent read의 본질을 아는지 확인\n> 핵심: 내 read view에 맞는 과거 버전을 찾기 위해서다\n\n> Q: chain이 길면 왜 느려지나요?\n> 의도: traversal 비용과 purge lag를 이해하는지 확인\n> 핵심: 더 많은 버전을 뒤로 추적해야 하기 때문이다\n\n> Q: rollback과 traversal의 차이는 무엇인가요?\n> 의도: 같은 undo를 쓰는 다른 목적을 구분하는지 확인\n> 핵심: rollback은 되돌리기, traversal은 읽기 버전 찾기다\n\n## 한 줄 정리\n\nundo record version chain traversal은 consistent read가 최신 row 대신 read view에 맞는 과거 버전을 찾기 위해 undo를 뒤로 따라가는 과정이다.\n",
   "aliases": [
-    "Undo Record Version Chain 개념",
-    "Undo Record Version Chain 정리",
-    "Undo Record Version Chain 실수",
-    "Undo Record Version Chain 판단 기준",
     "데이터베이스 Undo Record Version Chain",
     "undo record",
     "version chain traversal",
@@ -17,7 +13,9 @@
     "consistent read",
     "undo chain",
     "MVCC visibility",
-    "rollback segment"
+    "rollback segment",
+    "MVCC가 undo chain을 따라가요",
+    "history list length 때문에 SELECT 느려요"
   ],
   "expected_queries": [
     "MVCC consistent read는 왜 최신 row가 아니라 undo record chain을 따라가며 read view에 맞는 버전을 찾는 거야?",
@@ -52,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/undo-record-version-chain-traversal.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

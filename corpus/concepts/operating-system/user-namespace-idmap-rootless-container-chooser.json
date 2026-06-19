@@ -6,10 +6,6 @@
   "summary": "user namespace는 process credential을 다른 UID/GID range에 매핑하고, idmapped mount는 filesystem ownership view를 mount 단위로 바꾸며, rootless container의 capabilities는 보통 host initial namespace 권한이 아니다.",
   "body_markdown": "# User Namespace, Idmapped Mounts, Rootless Container Chooser\n\n> 한 줄 요약: user namespace는 process credential을 다른 UID/GID range에 매핑하고, idmapped mount는 filesystem ownership view를 mount 단위로 바꾸며, rootless container의 capabilities는 보통 host initial namespace 권한이 아니다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [container, cgroup, namespace](./container-cgroup-namespace.md)\n> - [Namespace Crossings, /proc Visibility](./namespace-crossings-proc-visibility.md)\n> - [clone flags: thread-like, process-like, namespace-isolated](./clone-flags-thread-like-process-like-namespace-isolated.md)\n> - [Landlock, seccomp, Capabilities Sandbox Chooser](./landlock-seccomp-capabilities-sandbox-chooser.md)\n> - [OverlayFS Copy-up, Container Layering, Runtime Debugging](./overlayfs-copy-up-container-layering-debugging.md)\n> - [Seccomp Basics, Backend Teams](./seccomp-basics-backend-teams.md)\n\n> retrieval-anchor-keywords: user namespace, idmapped mount, rootless container, uid_map, gid_map, subuid, subgid, namespace capabilities, container root, host root, bind mount ownership, CAP_SYS_ADMIN, rootless podman, rootless docker\n\n## 10-second chooser\n\n| 문제 | 먼저 볼 계층 | 이유 |\n|---|---|---|\n| container 안 UID 0을 host의 unprivileged UID로 보이게 하고 싶다 | user namespace | process credential mapping 문제다 |\n| bind mount 파일 ownership이 container와 host에서 다르게 보여야 한다 | idmapped mount | mount view의 UID/GID translation 문제다 |\n| rootless runtime이 넓은 host 권한 없이 container를 띄워야 한다 | rootless container stack | user namespace, helper, storage, network, cgroup delegation 조합이다 |\n| `CAP_SYS_ADMIN`이 있는데 mount가 실패한다 | capability scope | capability가 어느 user namespace에서 유효한지 봐야 한다 |\n| container가 CPU/memory를 얼마나 쓰는지 제한하고 싶다 | cgroup | identity mapping이 아니라 resource accounting 문제다 |\n\n이 문서는 [container, cgroup, namespace](./container-cgroup-namespace.md)의 user namespace 한 줄을 운영 관점으로 확장한다. 핵심은 \"root처럼 보임\"과 \"host root 권한\"을 분리하는 것이다.\n\n## User namespace: process identity translation\n\nUser namespace는 process가 보는 UID/GID와 parent namespace가 보는 UID/GID를 매핑한다. Rootless container에서 container 내부 UID 0은 host initial namespace의 UID 0이 아니라, 보통 호출한 사용자 또는 `/etc/subuid`, `/etc/subgid`에 배정된 subordinate range의 한 값으로 보인다.\n\n`uid_map`과 `gid_map`은 \"container id range -> parent namespace id range\"의 번역표다. 예를 들어 container `0..65535`가 host `100000..165535`로 매핑되면, container 안 파일 owner `0`은 host에서 `100000`처럼 보일 수 있다. 이 구조는 host root 없이도 container 내부에서는 root-like workflow를 제공하지만, host 전체 권한을 주는 것은 아니다.\n\n보수적으로 볼 점:\n\n- map에 없는 UID/GID는 표현할 수 없거나 overflow id처럼 보일 수 있다\n- `newuidmap`, `newgidmap` helper와 `/etc/subuid`, `/etc/subgid` 구성이 깨지면 넓은 range mapping이 실패한다\n- single-ID mapping만 있는 rootless 환경은 많은 ownership-preserving workload에 약하다\n- namespace 생성 순서, `setgroups` 제한, runtime policy가 gid mapping에 영향을 준다\n\n## Idmapped mounts: filesystem view translation\n\nIdmapped mount는 process credential mapping과 다르다. 같은 underlying filesystem object라도 특정 mount를 통해 볼 때 ownership을 다른 UID/GID mapping으로 보여줄 수 있다. 목적은 \"host 파일을 실제로 대량 chown하지 않고 container view에 맞춘 ownership을 제공\"하는 데 가깝다.\n\n그래서 idmapped mount는 bind mount permission 문제의 좋은 후보가 될 수 있다. 예를 들어 source tree는 host 사용자 소유로 남기고, container 안에서는 app UID가 소유한 것처럼 보여야 할 때 유용하다. 단, 이것은 무조건 켜지는 기능이 아니다. kernel, filesystem, mount API, runtime support, 보안 정책에 따라 지원 범위가 다르다. OverlayFS, network filesystem, older kernel 조합에서는 기대와 다를 수 있으므로 \"idmap이면 된다\"가 아니라 \"이 mount와 filesystem이 idmap을 지원한다\"를 확인해야 한다.\n\nIdmapped mount도 권한 우회 장치가 아니다. DAC permission, LSM, read-only mount, capability checks, namespace ownership이 계속 작동한다. 다만 VFS ownership interpretation이 mount 단위로 달라지므로, chmod/chown로 host state를 바꾸기 전에 검토할 선택지가 생긴다.\n\n## Rootless container capability limits\n\nLinux capabilities는 user namespace와 함께 해석된다. Container 안에서 `CapEff`에 `CAP_SYS_ADMIN`이 보인다고 해서 initial host namespace의 모든 admin operation이 열리는 것은 아니다. 많은 capability check는 대상 kernel object가 어느 user namespace에 속하는지, 또는 operation이 initial namespace privilege를 요구하는지에 따라 실패할 수 있다.\n\n흔한 오해:\n\n- \"container root니까 host mount도 마음대로 가능하다\"는 틀렸다\n- \"`CAP_NET_ADMIN`이 있으니 host network를 바꿀 수 있다\"도 보통 틀렸다\n- \"`CAP_CHOWN`이 있으니 host bind mount 모든 파일 owner를 바꿀 수 있다\"는 mapping과 filesystem policy를 봐야 한다\n- rootless runtime에서 low port bind, cgroup controller, device access, overlay storage는 별도 설정과 kernel support의 영향을 받는다\n\nRootless는 보안적으로 의미가 있지만 완전한 sandbox라는 뜻은 아니다. 같은 사용자 계정의 host 파일 접근, writable bind mount, exposed socket, runtime helper, FUSE storage, user-level network stack 같은 경계를 따로 봐야 한다. Seccomp, capability drop, read-only mount, LSM, cgroup, application authorization은 여전히 필요하다.\n\n## Decision path\n\n먼저 관측 위치를 고정한다. Host shell, container shell, `nsenter`, sidecar가 서로 다른 UID, PID, mount view를 보여줄 수 있다. `/proc/<pid>/uid_map`, `/proc/<pid>/gid_map`, `/proc/<pid>/status`의 capability fields, `/proc/<pid>/mountinfo`, runtime inspect output을 함께 본다.\n\n다음으로 문제를 bucket에 넣는다.\n\n| 증상 | 더 가까운 원인 | 확인 |\n|---|---|---|\n| container에서는 root인데 bind mount write가 실패한다 | UID/GID map 또는 mount permission | `uid_map`, `gid_map`, file owner, mount flags |\n| host 파일 owner가 이상한 큰 숫자로 보인다 | subordinate id range translation | `/etc/subuid`, `/etc/subgid`, runtime mapping |\n| `chown`이 실패하거나 owner가 보존되지 않는다 | unmapped id 또는 filesystem limitation | map coverage, filesystem support |\n| mount/network admin syscall이 `EPERM`이다 | capability scope 또는 seccomp/LSM | `CapEff`, user namespace owner, seccomp profile |\n| cgroup limit 설정이 안 된다 | cgroup delegation 문제 | cgroup v2 delegation, runtime rootless support |\n\n## Conservative choices\n\nFile ownership mismatch를 해결할 때 host tree에 `chown -R`부터 하지 않는다. 먼저 user namespace map, idmapped mount support, named volume, copy-up behavior, read-only bind, runtime-specific volume option을 비교한다. Host ownership을 바꾸는 방식은 rollback 비용이 크고, 다른 developer tool이나 CI permission을 깨뜨리기 쉽다.\n\nSecurity explanation에서는 \"rootless라 안전하다\" 대신 더 좁게 말한다. Rootless는 container runtime과 workload가 host UID 0 없이 동작하게 만들어 host-wide privilege blast radius를 줄인다. 하지만 같은 사용자가 접근 가능한 host resource, delegated cgroup, user network proxy, mounted secrets, and application credentials는 그대로 보호해야 한다.\n\nCapability explanation에서도 \"capability가 있다/없다\"만 말하지 않는다. 어느 namespace의 capability인지, 대상 object가 어느 namespace에 owned되는지, seccomp/LSM이 별도로 막는지, filesystem이 idmap을 지원하는지를 함께 적어야 실제 장애 원인과 맞는다.\n\n## 한 줄 정리\n\nUser namespace는 process id를 번역하고, idmapped mount는 mount ownership view를 번역하며, rootless container의 capabilities는 host root 권한이 아니므로 permission 문제는 mapping, mount, capability scope, filesystem support를 나눠서 판단해야 한다.\n",
   "aliases": [
-    "User Namespace, Idmapped Mounts, 개념",
-    "User Namespace, Idmapped Mounts, 정리",
-    "User Namespace, Idmapped Mounts, 실수",
-    "User Namespace, Idmapped Mounts, 판단 기준",
     "운영체제 User Namespace, Idmapped Mounts,",
     "user namespace idmap",
     "idmapped mounts",
@@ -17,7 +13,9 @@
     "subuid subgid mapping",
     "container root host user mapping",
     "userns capabilities",
-    "rootless container chooser"
+    "rootless container chooser",
+    "rootless container의 UID 0이 host root가 아닐 때",
+    "bind mount permission을 idmapped mount로 풀 때"
   ],
   "expected_queries": [
     "rootless container에서 UID 0이 host root가 아니라는 말을 어떻게 설명해?",
@@ -52,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/user-namespace-idmap-rootless-container-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

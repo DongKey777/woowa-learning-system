@@ -7,17 +7,15 @@
   "body_markdown": "# Cache Eviction Policy — LRU vs LFU vs ARC 어떻게 고를까\n\n> 한 줄 요약: LRU = 최근 안 쓴 것 제거 (단순/일반), LFU = 적게 쓴 것 제거 (hot key 보존), ARC/W-TinyLFU = 둘 동적 균형 (Caffeine default).\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n캐시 크기 제한 = 100. 가득 차면 *하나 쫓아내야 새 entry 받음*. 어느 걸 쫓아낼까?\n\n```\n[LRU] — Least Recently Used\n  최근 access timestamp 추적 → 가장 오래된 것 제거\n  \n[LFU] — Least Frequently Used\n  access count 추적 → 가장 적게 쓰인 것 제거\n\n[FIFO] — First In First Out\n  들어온 순서 → 가장 오래된 것 제거 (access 무관)\n\n[Random]\n  무작위 — 단순, 학습 가치 (Spotify 등 실제 사용)\n\n[ARC] — Adaptive Replacement Cache (IBM)\n  LRU + LFU 두 list 동적 균형\n\n[W-TinyLFU] — Caffeine (Java)\n  frequency sketch (Count-Min Sketch) + LRU window\n  현대 default\n```\n\n## 한 장 정리\n\n| 정책 | 기반 | hit rate (일반) | 메모리 overhead | 적합 |\n|---|---|---|---|---|\n| FIFO | 순서 | 낮음 | O(N) | 단순, 학습 |\n| Random | 무작위 | 낮음-중 | O(0) | 매우 단순 |\n| **LRU** | 최근 access | 중-높음 | O(N) (linked list + hashmap) | 일반 default |\n| **LFU** | access count | 중-매우높음 (hot pattern) | O(N) + count | hot key 강한 패턴 |\n| Clock | 회전 reference bit | LRU와 비슷 | O(N) (간단) | OS page replacement |\n| ARC | LRU+LFU 동적 | 매우 높음 | O(N) × 2 | DB cache, ZFS |\n| **W-TinyLFU** | frequency sketch + window | 매우 높음 | 작음 | Caffeine, modern |\n\n## \"LRU vs LFU\" 핵심 차이\n\n```\n시간 순 access 패턴:\n  A A A A A B B C D E F G H ... (A가 *과거*에 hot, 이후 안 씀)\n\n캐시 크기 = 3.\n\nLRU 결과:\n  A A A A A B B C D E F G H\n  → 마지막 [F G H], A는 *과거 hot이지만 최근 안 쓰임* → 제거됨\n\nLFU 결과:\n  A는 5번 access — *count 큼*\n  → A 보존 + F G H 중 하나 제거 (count 1)\n  → 마지막 [A F H] or [A G H]\n```\n\nLRU: *최근성* 중심. LFU: *빈도* 중심.\n\n**자주 쓰이는 hot key가 *과거에 인기*면 LFU가 보존**. *최근 패턴이 다르면* LRU.\n\n## mental model: 캐시는 \"누구를 들일까\"와 \"누구를 내보낼까\"를 같이 결정한다\n\neviction policy를 `가득 찼을 때 쫓아내기`로만 보면 절반만 본 것이다. 운영급 캐시는 새 entry를 바로 들일지, 잠깐 관찰할지도 같이 판단한다.\n\n| 질문 | LRU 쪽 감각 | LFU 쪽 감각 | ARC/W-TinyLFU 쪽 감각 |\n|---|---|---|---|\n| 최근 트래픽이 계속 바뀌나 | 잘 따라간다 | 과거 hot이 남아 느릴 수 있다 | window로 새 trend를 시험한다 |\n| 소수 hot key가 반복되나 | scan에 밀릴 수 있다 | 잘 보존한다 | frequency sketch로 보존한다 |\n| 한번 훑는 대량 scan이 많나 | 기존 hot key를 밀어낼 수 있다 | count 높은 key는 버틴다 | scan pollution을 줄인다 |\n| 구현 복잡도를 낮춰야 하나 | 가장 단순하다 | aging/count 관리가 필요하다 | 라이브러리(Caffeine)를 쓰는 편이 안전하다 |\n\n학습 단계에서는 LRU로 시작하고, `scan 때문에 hot key가 밀린다` 또는 `인기 key가 오래 살아야 한다`는 증거가 생기면 LFU/W-TinyLFU로 넘어간다.\n\n## \"그래서 LFU가 항상 좋은가?\"\n\n함정:\n- **새 entry 빠르게 evict** — count 0이라 자주 제거됨. 새 trend 학습 못함.\n- **\"hot key가 영원히 캐시 점유\"** — 옛 hot이 새 hot으로 교체 어려움. *aging*으로 보완.\n\nARC가 이를 해결: *LRU 부분 + LFU 부분*을 *동적 비율 조정*.\n\n## W-TinyLFU (Caffeine default) 동작 요약\n\n```\n1. 모든 access를 *Count-Min Sketch*로 frequency 추정 (작은 메모리)\n2. 새 entry 와도 *기존 entry frequency*와 비교\n3. 새 entry frequency가 *기존 evict 후보보다 작으면* 기존 유지\n4. 자주 쓰이는 새 entry만 *진입 허용*\n```\n\n→ **새 entry \"test 기간\"이 짧음 → hot key 보존 + 효과적 trend 추적**.\n\nCaffeine은 *Java의 default 권장 cache library* — 그냥 쓰면 W-TinyLFU.\n\n## 학습자가 자주 만나는 시나리오\n\n- 단순 in-memory cache → LRU (`LinkedHashMap` `removeEldestEntry`).\n- Spring Cache + 단순 → ConcurrentMapCacheManager (eviction 없음 + TTL).\n- Spring Cache + 성능 → CaffeineCacheManager (W-TinyLFU).\n- Redis cache → `maxmemory-policy` 설정 (`allkeys-lru`, `allkeys-lfu`, `volatile-ttl`).\n\n## \"Cache hit rate를 어떻게 측정/튜닝?\"\n\n```java\n// Caffeine 측정\nLoadingCache<String, Member> cache = Caffeine.newBuilder()\n    .maximumSize(10_000)\n    .recordStats()\n    .build(loader);\n\nCacheStats stats = cache.stats();\ndouble hitRate = stats.hitRate();   // 0.0 ~ 1.0\nlong evictions = stats.evictionCount();\n```\n\n튜닝:\n- hit rate < 70% → cache size 작거나 eviction policy 안 맞음.\n- evictionCount 폭증 → working set이 cache size보다 큼.\n- *miss penalty* (DB 호출 시간) × miss rate = cache 효과 측정.\n\n## Eviction Policy 선택 결정\n\n```\n1. 단순 학습 / 작은 cache?\n       → LRU (LinkedHashMap)\n\n2. Java + 운영급 cache?\n       → Caffeine (W-TinyLFU). 기본값 충분.\n\n3. Hot key 강한 패턴 (e.g., 인기 상품)?\n       → LFU 또는 W-TinyLFU.\n\n4. Redis 분산 cache?\n       → maxmemory-policy: allkeys-lru (default) 또는 allkeys-lfu.\n\n5. DB buffer pool?\n       → DB가 자동 (보통 LRU 변형 또는 ARC).\n```\n\n## route table: 증상에서 정책으로\n\n| 관찰한 증상 | 먼저 의심할 원인 | 후보 정책/조치 | wrong-bucket note |\n|---|---|---|---|\n| cache hit rate가 낮고 eviction이 많다 | working set이 cache보다 크다 | size 조정, key/cardinality 점검 | 정책만 바꿔도 해결된다고 단정하지 않는다 |\n| 인기 상품 key가 대량 scan 뒤 사라진다 | recency-only 정책의 scan pollution | LFU, W-TinyLFU, admission window | TTL 문제가 아니라 eviction 문제일 수 있다 |\n| 새로 인기 있는 key가 늦게 들어온다 | LFU count가 오래 남는다 | aging/decay 있는 LFU, W-TinyLFU | LFU가 항상 좋은 정책은 아니다 |\n| 데이터가 오래되어 틀린 값을 준다 | eviction이 아니라 freshness 문제 | TTL, invalidation, write-through/cache-aside 검토 | 교체 정책이 stale data를 자동 해결하지 않는다 |\n| Redis가 메모리 초과로 key를 지운다 | maxmemory-policy 선택 문제 | `allkeys-lru`, `allkeys-lfu`, `volatile-ttl` 비교 | 애플리케이션 LRU 구현과 Redis 정책을 섞지 않는다 |\n\n## 자주 헷갈리는 지점\n\n- **\"LRU가 최고\"** — 옛날 default. 현대는 W-TinyLFU.\n- **\"LFU = 영원히 hot 보존\"** — aging 없으면 그렇지만 *modern LFU는 decay*.\n- **\"FIFO = LRU\"** — 다름. FIFO는 *순서*, LRU는 *최근 access*.\n- **\"TTL이면 eviction policy 무의미\"** — TTL은 *시간 기반*, eviction은 *크기 기반*. 같이 사용.\n- **\"cache size 무한대 = hit rate 100%\"** — 메모리 한계. *최적 size = working set 크기*.\n- **\"hit rate만 높으면 성공\"** — miss penalty, stale risk, eviction churn을 같이 봐야 한다.\n\n## 안전한 다음 문서\n\n| 다음 질문 | 문서 |\n|---|---|\n| LRU를 직접 구현해야 한다 | [LRU Cache Design](./lru-cache-design.md) |\n| 캐시 전략 자체가 cache-aside/write-through 중 무엇인지 헷갈린다 | [Caching Strategy Chooser](../system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser.md) |\n| stale cache와 동기화 문제가 중심이다 | [Redis cache aside/write-through chooser](../system-design/redis-cache-aside-write-through-interview-chooser.md) |\n\n## 빠른 확인 질문\n\n- LRU와 LFU 핵심 차이?\n  - LRU = *최근성*, LFU = *빈도*.\n- W-TinyLFU의 핵심 idea?\n  - *Count-Min Sketch*로 작은 메모리에 frequency 추적 + LRU window 결합.\n- Cache hit rate 측정 시 함께 봐야 할 metric?\n  - eviction count, miss penalty, working set 크기.\n\n## 한 줄 정리\n\nCache eviction policy는 *최근성 ↔ 빈도 ↔ 동적 균형*. 일반 default LRU, 운영급 Caffeine W-TinyLFU. Redis는 maxmemory-policy 설정.\n\nretrieval-anchor-keywords: LRU LFU cache eviction, Adaptive Replacement Cache ARC, W-TinyLFU Caffeine, Count-Min Sketch, cache hit rate stats, eviction policy selection, FIFO Random cache, Spring CaffeineCacheManager, Redis maxmemory-policy, allkeys-lru allkeys-lfu, LinkedHashMap removeEldestEntry, OS page replacement Clock algorithm\n",
   "aliases": [
     "캐시 교체 정책",
-    "Cache Eviction Policy — 개념",
-    "Cache Eviction Policy — 정리",
-    "Cache Eviction Policy — 실수",
-    "Cache Eviction Policy — 판단 기준",
     "LRU",
     "LFU",
     "ARC",
     "FIFO",
     "cache eviction",
     "eviction policy",
-    "cache replacement"
+    "cache replacement",
+    "LRU LFU 언제 고르지",
+    "hot key를 오래 남기는 캐시 정책"
   ],
   "expected_queries": [
     "LRU와 LFU 차이가 뭐야?",
@@ -51,12 +49,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/data-structure/cache-eviction-lru-vs-lfu-vs-arc-intermediate-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

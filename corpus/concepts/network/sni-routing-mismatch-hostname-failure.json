@@ -6,10 +6,6 @@
   "summary": "SNI는 TLS 단계에서 어떤 인증서와 라우팅을 쓸지 정하는 신호라서, hostname과 backend 매칭이 어긋나면 같은 IP에서도 전혀 다른 서비스처럼 보일 수 있다.",
   "body_markdown": "# SNI, Routing Mismatch, Hostname Failure\n\n> 한 줄 요약: SNI는 TLS 단계에서 어떤 인증서와 라우팅을 쓸지 정하는 신호라서, hostname과 backend 매칭이 어긋나면 같은 IP에서도 전혀 다른 서비스처럼 보일 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Forwarded, X-Forwarded-For, X-Real-IP와 Trust Boundary](./forwarded-x-forwarded-for-x-real-ip-trust-boundary.md)\n> - [TLS Certificate Chain, OCSP Stapling Failure Modes](./tls-certificate-chain-ocsp-stapling-failure-modes.md)\n> - [ALPN Negotiation Failure, Routing Mismatch](./alpn-negotiation-failure-routing-mismatch.md)\n> - [API Gateway, Reverse Proxy 운영 포인트](./api-gateway-reverse-proxy-operational-points.md)\n> - [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n\nretrieval-anchor-keywords: SNI, hostname routing, virtual host, certificate mismatch, host header, TLS termination, reverse proxy routing, multi-tenant ingress\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 재현 조건, 관찰 증거, failure matrix\n\n이 문서의 1차 분기는 \"TLS가 실패했는가\"가 아니라 \"SNI, certificate SAN, HTTP Host, backend route 중 어디가 서로 다른 호스트를 가리키는가\"다. 인증서 에러는 신호이고, proof는 handshake와 HTTP 라우팅을 따로 검증/validation해야 얻는다.\n\n### 재현 조건\n\n- 같은 IP에 대해 `openssl s_client -servername <host>` 값을 바꿔 인증서와 selected route를 비교한다.\n- `curl --resolve` 또는 직접 IP + `Host` header로 SNI와 Host가 같은 경우/다른 경우를 나눠 요청한다.\n- health check host/path와 실제 고객 hostname을 비교한다.\n\n### 관찰 증거\n\n- 특정 hostname만 certificate mismatch가 난다.\n- 인증서는 맞는데 default backend나 다른 서비스 응답이 나온다.\n- 내부 client만 실패하고 브라우저는 정상이다.\n\n### failure matrix\n\n| 증상 | 1차 분기 | 관찰 신호 | 검증/validation | wrong-bucket / 오선택 |\n|---|---|---|---|---|\n| 특정 도메인 인증서 에러 | SNI -> cert 선택 오류 | SAN에 요청 hostname 없음 | `openssl s_client -servername`과 cert SAN을 확인 | 인증서 만료로만 분류 |\n| 인증서는 맞지만 응답이 다름 | Host/backend route mismatch | default backend, 421, 예상 밖 body | SNI, Host header, ingress rule, access log route를 대조 | app business route 버그로만 분류 |\n| 내부 client만 실패 | client SNI 누락/오설정 | IP 직접 접속 또는 wrong hostname | client TLS config와 packet/handshake log를 확인 | LB 전체 장애로만 분류 |\n\n## 핵심 개념\n\nSNI(Server Name Indication)는 TLS handshake에서 클라이언트가 \"내가 접속하려는 호스트 이름\"을 알려주는 신호다.\n\n- 같은 IP에 여러 인증서를 둘 수 있다\n- TLS 종료 지점이 호스트별로 분기할 수 있다\n- 잘못된 SNI는 인증서 mismatch와 라우팅 mismatch를 함께 만든다\n\n### Retrieval Anchors\n\n- `SNI`\n- `hostname routing`\n- `virtual host`\n- `certificate mismatch`\n- `host header`\n- `TLS termination`\n- `reverse proxy routing`\n- `multi-tenant ingress`\n\n## 깊이 들어가기\n\n### 1. SNI가 왜 필요한가\n\n하나의 IP에 여러 사이트나 서비스가 붙을 수 있다.\n\n- `api.example.com`\n- `admin.example.com`\n- `static.example.com`\n\nTLS handshake 전에 서버는 아직 어떤 인증서를 줘야 할지 모를 수 있다.  \nSNI가 그 힌트를 준다.\n\n### 2. routing mismatch는 어떻게 생기나\n\nSNI, Host header, backend route가 서로 다르면 이상해진다.\n\n- TLS 단계에서는 A로 들어왔는데\n- HTTP Host header는 B이고\n- proxy는 C backend로 보낸다\n\n이 경우 인증서는 맞는데 서비스는 틀리거나, 반대로 서비스는 맞는데 인증서가 틀릴 수 있다.\n\n### 3. multi-tenant ingress에서 왜 민감한가\n\n한 LB나 ingress에 여러 팀/서비스가 모이면:\n\n- SNI 기반 인증서 선택\n- Host 기반 라우팅\n- path 기반 라우팅\n\n이 셋이 같이 돌아간다.  \n설정이 조금만 어긋나도 \"가끔 다른 서비스로 보이는\" 증상이 생긴다.\n\n### 4. health check와 왜 엇갈리나\n\nhealth check는 보통 단순한 host나 path를 본다.\n\n- 실제 고객 트래픽의 SNI와 다를 수 있다\n- health check는 통과하지만 특정 hostname만 실패할 수 있다\n- ingress rule이 특정 도메인에만 잘못 적용될 수 있다\n\n### 5. hostname failure가 주는 신호\n\n- certificate mismatch\n- 421 Misdirected Request\n- default backend로 빠짐\n- 잘못된 virtual host 응답\n\n## 실전 시나리오\n\n### 시나리오 1: 같은 LB인데 특정 도메인만 인증서 에러가 난다\n\nSNI에 맞는 cert bundle이 없거나 routing table이 틀렸을 수 있다.\n\n### 시나리오 2: 브라우저는 되는데 내부 클라이언트만 실패한다\n\n내부 SDK가 SNI를 안 보내거나 잘못된 hostname을 넣고 있을 수 있다.\n\n### 시나리오 3: 인증서는 맞는데 응답 내용이 이상하다\n\nhost header와 SNI가 달라 다른 backend로 라우팅됐을 수 있다.\n\n## 코드로 보기\n\n### SNI 확인\n\n```bash\nopenssl s_client -connect api.example.com:443 -servername api.example.com\n```\n\n### Host header 확인\n\n```bash\ncurl -H 'Host: api.example.com' https://1.2.3.4/\n```\n\n### 프록시 라우팅 감각\n\n```text\nSNI -> certificate choice\nHost header -> HTTP routing\npath -> backend handler\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| SNI 기반 멀티테넌시 | IP를 아낄 수 있다 | 라우팅 실수가 복잡해진다 | 여러 도메인 운영 |\n| 전용 IP/전용 cert | 단순하다 | 비용과 관리량이 늘어난다 | 민감한 서비스 |\n| Host 기반 분기 | 유연하다 | TLS와 HTTP 설정이 어긋날 수 있다 | reverse proxy |\n\n핵심은 SNI와 Host를 따로 보되, 운영에서는 둘이 같은 의도를 가리키는지 확인하는 것이다.\n\n## 꼬리질문\n\n> Q: SNI는 왜 필요한가요?\n> 핵심: TLS handshake 전에 어떤 인증서를 줄지 서버가 알기 위해서다.\n\n> Q: SNI와 Host header가 다르면 어떻게 되나요?\n> 핵심: 인증서와 라우팅이 서로 다른 backend를 가리킬 수 있다.\n\n> Q: multi-tenant ingress에서 왜 자주 깨지나요?\n> 핵심: 인증서 선택, 라우팅 규칙, health check가 함께 맞아야 하기 때문이다.\n\n## 한 줄 정리\n\nSNI는 TLS 단계의 호스트 힌트이므로, hostname과 라우팅 규칙이 어긋나면 같은 IP에서도 인증서와 backend가 서로 다른 서비스를 가리킬 수 있다.\n",
   "aliases": [
-    "SNI, Routing Mismatch, Hostname 개념",
-    "SNI, Routing Mismatch, Hostname 정리",
-    "SNI, Routing Mismatch, Hostname 실수",
-    "SNI, Routing Mismatch, Hostname 판단 기준",
     "네트워크 SNI, Routing Mismatch, Hostname",
     "SNI routing mismatch",
     "hostname routing",
@@ -17,7 +13,9 @@
     "certificate mismatch",
     "Host header mismatch",
     "TLS termination routing",
-    "multi-tenant ingress"
+    "multi-tenant ingress",
+    "SNI랑 Host header는 어느 단계야?",
+    "같은 IP인데 hostname마다 인증서가 달라요"
   ],
   "expected_queries": [
     "SNI routing mismatch 때문에 같은 IP에서 다른 서비스처럼 보이는 이유는?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/sni-routing-mismatch-hostname-failure.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "이 문서는 ConcurrentHashMap advanced deep dive로, individual operation safety와 compound action atomicity, computeIfAbsent mapping function, hot-key contention, mutable value safety, weakly consistent iteration, LongAdder counter를 분리한다.",
   "body_markdown": "# `ConcurrentHashMap` Compound Actions and Hot-Key Contention\n\n> 한 줄 요약: `ConcurrentHashMap`은 개별 연산을 thread-safe하게 만들어주지만, check-then-act race, 긴 `computeIfAbsent()` 로더, hot-key contention, weakly consistent iteration까지 자동으로 해결해주지는 않는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Java 동시성 유틸리티](./java-concurrency-utilities.md)\n> - [Java Collections 성능 감각](./collections-performance.md)\n> - [`CopyOnWriteArrayList` Snapshot Iteration and Write Amplification](./copyonwritearraylist-snapshot-iteration-write-amplification.md)\n> - [Executor Sizing, Queue, Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n> - [CompletableFuture Execution Model and Common Pool Pitfalls](./completablefuture-execution-model-common-pool-pitfalls.md)\n> - [OOM Heap Dump Playbook](./oom-heap-dump-playbook.md)\n\n> retrieval-anchor-keywords: ConcurrentHashMap, compound action, check-then-act, computeIfAbsent, compute, merge, LongAdder, hot key contention, cache stampede, per-key lock, weakly consistent iterator, recursive update, mapping function, concurrent counter, CopyOnWriteArrayList\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n`ConcurrentHashMap`을 쓴다고 해서 모든 동시성 문제가 끝나는 것은 아니다.\n\n이 맵이 잘해주는 것은 주로 다음이다.\n\n- 개별 `get`/`put`/`remove`의 thread-safe execution\n- 다중 스레드에서의 높은 read concurrency\n- coarse-grained global lock보다 나은 확장성\n\n하지만 다음은 직접 설계해야 한다.\n\n- check-then-act workflow의 원자성\n- 한 key에 작업이 몰릴 때의 hot-key contention\n- map 안에 담긴 mutable value의 thread safety\n- iteration 시점의 snapshot 일관성\n\n즉 `ConcurrentHashMap`은 concurrent container이지 concurrent business transaction이 아니다.\n\n## 깊이 들어가기\n\n### 1. 개별 연산 안전성과 복합 동작 안전성은 다르다\n\n다음 코드는 여전히 경쟁 상태를 만들 수 있다.\n\n```java\nValue value = map.get(key);\nif (value == null) {\n    value = load(key);\n    map.put(key, value);\n}\n```\n\n각 줄은 안전할 수 있어도, 전체 workflow는 원자적이지 않다.  \n여러 스레드가 동시에 `null`을 보고 중복 load를 수행할 수 있다.\n\n그래서 compound action에는 `computeIfAbsent`, `compute`, `merge` 같은 API를 고려해야 한다.\n\n### 2. `computeIfAbsent()`는 loader를 감싸는 만능 캐시가 아니다\n\n`computeIfAbsent()`는 per-key race를 줄이는 데 유용하지만, mapping function이 길거나 blocking이면 그 key는 사실상 직렬화된다.\n\n주의점:\n\n- mapping function은 짧고 부작용이 적어야 한다\n- 같은 map을 다시 건드리면 recursive update 문제가 생길 수 있다\n- DB/HTTP 호출을 그 안에서 바로 하면 hot key에서 병목이 커진다\n\n특히 \"한 key에 대한 중복 load 방지\"와 \"느린 외부 호출 실행\"을 한 함수에 같이 넣으면 생각보다 쉽게 막힌다.\n\n### 3. hot key는 map 선택보다 access pattern 문제다\n\n`ConcurrentHashMap`은 많은 key가 퍼져 있을 때 잘 확장된다.  \n하지만 모두가 같은 key를 두드리면 자료구조보다 그 key가 병목이다.\n\n대표 패턴:\n\n- 인기 상품 하나의 cache key\n- tenant 하나에 요청 집중\n- 전역 설정 하나를 모든 요청이 매번 reload\n\n이때는 `ConcurrentHashMap`보다 상위 전략이 필요하다.\n\n- stale-while-revalidate\n- single-flight future\n- batching\n- read-through cache 계층\n\n### 4. counter는 `LongAdder`가 더 잘 맞을 때가 많다\n\n높은 contention에서 `AtomicLong` 하나는 한 지점에 CAS 경쟁을 집중시킨다.  \n빈도 집계나 metrics counter처럼 읽기보다 쓰기가 많으면 `LongAdder`가 유리할 수 있다.\n\n그래서 흔한 패턴이 이렇다.\n\n```java\ncounts.computeIfAbsent(key, ignored -> new LongAdder()).increment();\n```\n\n단, `LongAdder`도 정확한 snapshot 타이밍이 아주 엄격한 곳에는 맞지 않을 수 있다.\n\n### 5. iteration은 snapshot이 아니다\n\n`ConcurrentHashMap`의 iterator와 aggregate method는 weakly consistent하다.\n\n- concurrent update 중에도 `ConcurrentModificationException` 없이 돌 수 있다\n- 하지만 \"정확히 이 순간의 전체 상태\"를 보장하지 않는다\n\n즉 monitoring, best-effort sweep에는 잘 맞지만,  \n정확한 승인/정산/배치 판정에 그대로 쓰면 위험하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 캐시 miss에서 DB가 두 번씩 호출된다\n\n`get` 후 `put` 패턴을 쓰면 race window가 열린다.  \n같은 key를 동시에 본 스레드가 각자 DB를 때린다.\n\n이때 문제는 DB가 아니라 compound action 설계다.\n\n### 시나리오 2: `computeIfAbsent()` 안에서 외부 API를 호출한다\n\n특정 key가 인기면 같은 key의 요청들이 그 mapping function 뒤에 줄선다.  \nlatency spike가 생기고 executor queue까지 밀릴 수 있다.\n\n### 시나리오 3: value 객체 자체가 안전하지 않다\n\n맵은 thread-safe여도, 안에 든 `ArrayList`나 mutable DTO는 별개다.  \n`map.get(key).add(...)`는 map이 보호해주지 않는다.\n\n### 시나리오 4: iteration 결과로 business decision을 내린다\n\n배치 스레드가 map을 순회하며 \"남은 작업이 0개\"라고 판단했는데,  \n동시에 다른 스레드가 task를 추가했다면 그 결론은 믿기 어렵다.\n\n## 코드로 보기\n\n### 1. check-then-act anti-pattern\n\n```java\npublic Value getOrLoad(String key) {\n    Value cached = cache.get(key);\n    if (cached != null) {\n        return cached;\n    }\n\n    Value loaded = loadFromDatabase(key);\n    cache.put(key, loaded);\n    return loaded;\n}\n```\n\n### 2. 짧은 mapping function만 두고 실제 load는 future로 분리\n\n```java\nimport java.util.concurrent.CompletableFuture;\nimport java.util.concurrent.ConcurrentHashMap;\n\npublic final class SingleFlightCache {\n    private final ConcurrentHashMap<String, CompletableFuture<Value>> inflight = new ConcurrentHashMap<>();\n\n    public CompletableFuture<Value> load(String key) {\n        return inflight.computeIfAbsent(key, ignored ->\n            CompletableFuture.supplyAsync(() -> loadFromDatabase(key))\n                .whenComplete((result, error) -> inflight.remove(key))\n        );\n    }\n\n    private Value loadFromDatabase(String key) {\n        return new Value(key);\n    }\n\n    private record Value(String key) {}\n}\n```\n\n핵심은 mapping function 안에서 오래 blocking하지 않고, duplicate collapse만 맡기는 것이다.\n\n### 3. 고경합 카운터\n\n```java\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.concurrent.atomic.LongAdder;\n\nConcurrentHashMap<String, LongAdder> counts = new ConcurrentHashMap<>();\ncounts.computeIfAbsent(\"tenant-a\", ignored -> new LongAdder()).increment();\n```\n\n### 4. value thread safety는 별도 고려\n\n```java\ncache.computeIfAbsent(key, ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())\n    .add(event);\n```\n\n어떤 value 타입을 담는지가 map만큼 중요하다.\n이 예시의 snapshot iteration 비용과 write amplification은 [CopyOnWriteArrayList Snapshot Iteration and Write Amplification](./copyonwritearraylist-snapshot-iteration-write-amplification.md)에서 이어서 볼 수 있다.\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| `ConcurrentHashMap` 기본 연산 | 사용이 쉽고 read-heavy workload에 강하다 | compound action correctness는 직접 챙겨야 한다 |\n| `computeIfAbsent()` | per-key race를 줄인다 | 긴 mapping function은 hot key 병목을 만든다 |\n| `LongAdder` | 고경합 카운터에 유리하다 | 정확한 순간값 semantics가 더 느슨하다 |\n| 외부 캐시/loader 계층 | stampede 제어와 eviction을 체계화할 수 있다 | 운영 복잡도와 의존성이 늘어난다 |\n\n핵심은 자료구조 선택보다 \"어떤 key에 어떤 동작을 얼마나 오래 묶는가\"다.\n\n## 꼬리질문\n\n> Q: `ConcurrentHashMap`이면 `get` 후 `put`도 안전한가요?\n> 핵심: 개별 연산은 안전해도 전체 workflow는 race를 만들 수 있다.\n\n> Q: `computeIfAbsent()` 안에서 DB 호출해도 되나요?\n> 핵심: 가능은 하지만 hot key에서 병목과 tail latency를 크게 만들 수 있어 매우 신중해야 한다.\n\n> Q: 왜 `LongAdder`를 쓰나요?\n> 핵심: 높은 contention에서 단일 CAS 지점을 줄여 counter update 확장성을 높이기 위해서다.\n\n> Q: map이 thread-safe면 value도 안전한가요?\n> 핵심: 아니다. container의 안전성과 value object의 안전성은 별개다.\n\n## 한 줄 정리\n\n`ConcurrentHashMap`은 좋은 concurrent container지만, compound action 원자성, hot-key collapse, value thread safety는 여전히 애플리케이션이 설계해야 한다.\n",
   "aliases": [
-    "ConcurrentHashMap Compound Actions and 개념",
-    "ConcurrentHashMap Compound Actions and 정리",
-    "ConcurrentHashMap Compound Actions and 실수",
-    "ConcurrentHashMap Compound Actions and 판단 기준",
     "자바 ConcurrentHashMap Compound Actions and",
     "ConcurrentHashMap compound actions",
     "ConcurrentHashMap hot key contention",
@@ -17,7 +13,9 @@
     "check then act race",
     "weakly consistent iterator",
     "LongAdder counter",
-    "single flight cache"
+    "single flight cache",
+    "ConcurrentHashMap compute가 hot key에서 막혀?",
+    "get 후 put은 원자적이지 않아?"
   ],
   "expected_queries": [
     "ConcurrentHashMap에서 get 후 put check-then-act race가 왜 생겨?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/language/java/concurrenthashmap-compound-actions-hot-key-contention.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

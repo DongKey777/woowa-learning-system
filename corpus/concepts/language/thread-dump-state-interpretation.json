@@ -7,17 +7,15 @@
   "body_markdown": "# Thread Dump State Interpretation\n\n> 한 줄 요약: thread dump의 `RUNNABLE`, `BLOCKED`, `WAITING`, `TIMED_WAITING`, `in native` 같은 상태는 \"지금 무엇을 기다리는가\"를 보여주며, 진짜 병목은 상태 이름보다 그 상태에 들어간 이유와 소유자다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Safepoint and Stop-the-World Diagnostics](./safepoint-stop-the-world-diagnostics.md)\n> - [JFR Event Interpretation](./jfr-event-interpretation.md)\n> - [Executor Sizing, Queue, Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n> - [`wait`/`notify`, `Condition`, Spurious Wakeup, and Lost Signal](./wait-notify-condition-spurious-wakeup-lost-signal.md)\n> - [`LockSupport.park`/`unpark` Permit Semantics and Coordination Pitfalls](./locksupport-park-unpark-permit-semantics.md)\n> - [JNI Native Call Overhead](./jni-native-call-overhead.md)\n\n> retrieval-anchor-keywords: thread dump, RUNNABLE, BLOCKED, WAITING, TIMED_WAITING, in native, monitor owner, lock contention, parked thread, native blocked, native waiting, thread state interpretation, wait notify, Condition, lost signal, LockSupport, park, unpark, blocker\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [재현 조건](#재현-조건)\n- [failure matrix](#failure-matrix)\n- [검증/validation](#검증validation)\n- [오해와 wrong bucket](#오해와-wrong-bucket)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nthread dump는 JVM thread의 순간 스냅샷이다.  \n상태 이름만 보고 단정하면 안 되고, stack trace와 lock owner를 같이 읽어야 한다.\n\n대표 상태:\n\n- `RUNNABLE`\n- `BLOCKED`\n- `WAITING`\n- `TIMED_WAITING`\n- `in native`\n\n## 깊이 들어가기\n\n### 1. RUNNABLE이 항상 \"잘 도는 중\"은 아니다\n\nRUNNABLE은 OS 관점에서 실행 가능 상태라는 뜻이지, CPU를 실제로 계속 먹고 있다는 뜻은 아니다.  \nbusy loop, native spin, hot lock loop가 다 RUNNABLE로 보일 수 있다.\n\n### 2. BLOCKED는 monitor 경쟁의 신호다\n\n`BLOCKED`는 synchronized monitor 진입을 못 하고 있는 경우가 많다.  \n이때 가장 먼저 봐야 할 것은 lock owner와 lock을 오래 쥐는 코드다.\n\n### 3. WAITING과 TIMED_WAITING은 자발적 대기다\n\n- `WAITING`: `Object.wait()`, `LockSupport.park()` 같은 무기한 대기\n- `TIMED_WAITING`: sleep, timed park, timed wait\n\n대기 자체는 정상일 수 있다.  \n중요한 것은 \"왜 여기서 멈춰 있는가\"다.\n\n특히 `Object.wait()`나 `Condition.await()`가 보이면 predicate loop와 signal 규약이 맞는지 [wait/notify, Condition, Spurious Wakeup, and Lost Signal](./wait-notify-condition-spurious-wakeup-lost-signal.md)을 같이 보는 편이 좋다.\n`LockSupport.park()`가 보이면 permit가 남아 있었는지, blocker가 무엇인지, interrupt로 깼는지도 함께 봐야 한다.\n\n### 4. in native는 JVM 밖 구간일 수 있다\n\nnative method, JNI, JVM 내부 작업이 섞이면 `in native`로 보일 수 있다.  \n이 상태만으로는 좋고 나쁨을 판단할 수 없다.\n\n### 5. thread dump는 pause를 유발할 수 있다\n\nthread dump를 뜨는 순간 모든 thread를 잠깐 멈춰야 하므로, 관측 자체가 짧은 pause를 만들 수 있다.  \n그래서 thread dump는 증거로 쓰되 과도하게 남발하지 않는 것이 좋다.\n\n## 재현 조건\n\nthread dump 해석은 한 장의 상태표보다 같은 시간대의 여러 증거를 모을 때 유효하다.\n\n- 지연이 발생하는 순간에 thread dump를 2~3회 간격을 두고 뜬다\n- 같은 시간창의 CPU, GC pause, pool queue length, request latency를 함께 본다\n- `BLOCKED` thread가 있으면 owner thread stack도 같이 찾는다\n- `WAITING`/`TIMED_WAITING`이 많으면 queue, scheduler, park blocker가 정상 대기인지 확인한다\n\n재현의 핵심은 \"상태 이름이 무엇인가\"가 아니라 \"같은 stack이 반복되는가, owner가 누구인가, 시간축에서 움직이는가\"다.\n\n## failure matrix\n\n| dump 신호 | 잘못 넣기 쉬운 bucket | 더 정확한 bucket | 확인할 신호 |\n|---|---|---|---|\n| `RUNNABLE` 다수 | 모두 CPU 사용 중 | 실행 가능 또는 native/I/O 포함 | CPU profile, stack top |\n| `BLOCKED` 다수 | thread 부족 | monitor contention | owner thread, locked monitor |\n| `WAITING` 다수 | 무조건 장애 | queue/park/join 정상 대기 가능 | blocker, queue depth, producer 상태 |\n| `TIMED_WAITING` 다수 | sleep 때문에 느림 | timer/backoff/polling/idle worker | stack과 scheduler metric |\n| `in native` | JVM 밖이라 분석 불가 | JNI/socket/native wait 후보 | JFR/OS profiler와 대조 |\n\n## 검증/validation\n\n- 같은 thread가 여러 dump에서 같은 lock owner를 기다리는지 확인한다.\n- `BLOCKED`는 blocked thread보다 owner thread stack을 먼저 읽는다.\n- `WAITING`/`TIMED_WAITING`은 queue length, condition predicate, `LockSupport` blocker와 함께 해석한다.\n- thread dump 결론은 JFR, GC log, OS CPU profile, application metric 중 하나 이상으로 교차 확인한다.\n\n## 오해와 wrong bucket\n\n- `RUNNABLE`을 \"건강하게 실행 중\"으로만 해석하면 wrong bucket이다. socket read나 native wait처럼 CPU를 거의 쓰지 않는 stack도 RUNNABLE 계열로 보일 수 있다.\n- `WAITING`이 많다는 사실만으로 deadlock을 단정하면 안 된다. worker pool이 idle이면 WAITING이 정상일 수 있다.\n- thread dump 하나로 원인을 확정하는 것은 위험하다. 순간 스냅샷이므로 반복성과 소유자, 시간축 증거가 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: BLOCKED가 몰려 있다\n\n공유 lock, 거대한 synchronized 블록, 싱글 워커, 혹은 잘못된 resource serialization을 의심한다.\n\n### 시나리오 2: WAITING이 많다\n\n생산자/소비자 구조, queue backpressure, `join()`, `park()` 등을 본다.  \n정상적인 대기인지, 교착에 가까운 대기인지 구분해야 한다.\n\n### 시나리오 3: RUNNABLE인데 CPU는 낮다\n\nnative wait, spin, lock contention, scheduler 문제, I/O 경합을 의심한다.  \nJFR이나 OS-level profiling과 같이 봐야 한다.\n\n## 코드로 보기\n\n### 1. monitor contention 예\n\n```java\npublic class SharedCounter {\n    private int value;\n\n    public synchronized int increment() {\n        return ++value;\n    }\n}\n```\n\n### 2. wait/notify 예\n\n```java\nsynchronized (lock) {\n    while (!ready) {\n        lock.wait();\n    }\n}\n```\n\n### 3. park/wait 감각\n\n```java\njava.util.concurrent.locks.LockSupport.parkNanos(1_000_000L);\n```\n\n### 4. thread dump를 읽는 감각\n\n```text\nThread-1 BLOCKED on monitor owned by Thread-7\nThread-2 WAITING on condition queue\nThread-3 in native\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| thread dump | 즉시 상태를 볼 수 있다 | 관측 순간 pause가 생긴다 |\n| JFR | 시간축과 상태를 함께 본다 | 해석에 시간이 든다 |\n| OS profiler | CPU/lock 진단이 강하다 | JVM 내부 맥락은 약할 수 있다 |\n| 단순 로그 | 구현이 쉽다 | 상태의 실제 원인을 놓치기 쉽다 |\n\n핵심은 thread dump를 상태표가 아니라 원인 탐색의 출발점으로 쓰는 것이다.\n\n## 꼬리질문\n\n> Q: RUNNABLE인데 왜 느릴 수 있나요?\n> 핵심: busy spin, native 구간, lock 경합, scheduler 영향이 있을 수 있다.\n\n> Q: BLOCKED와 WAITING 차이는 무엇인가요?\n> 핵심: BLOCKED는 monitor 진입 대기이고, WAITING은 wait/park 같은 자발적 대기다.\n\n> Q: thread dump만으로 원인을 확정할 수 있나요?\n> 핵심: 보통은 안 된다. lock owner, stack trace, JFR 같은 보조 증거가 필요하다.\n\n## 한 줄 정리\n\nthread dump 상태는 증상 힌트일 뿐이고, 진짜 병목은 상태를 만든 lock owner, wait reason, native 구간, 그리고 시간축 맥락을 함께 봐야 드러난다.\n",
   "aliases": [
     "Java thread dump 읽기",
-    "Thread Dump State Interpretation 개념",
-    "Thread Dump State Interpretation 정리",
-    "Thread Dump State Interpretation 실수",
-    "Thread Dump State Interpretation 판단 기준",
     "thread dump state interpretation",
     "RUNNABLE BLOCKED WAITING TIMED_WAITING",
     "jstack state meaning",
     "parked thread meaning",
     "blocked thread owner",
     "thread dump latency triage",
-    "native"
+    "native",
+    "thread dump에서 WAITING이 많으면 문제야?",
+    "blocked thread의 lock owner 찾기"
   ],
   "expected_queries": [
     "Java thread dump에서 RUNNABLE BLOCKED WAITING TIMED_WAITING을 어떻게 읽어야 해?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/language/java/thread-dump-state-interpretation.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

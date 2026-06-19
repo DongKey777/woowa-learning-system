@@ -6,10 +6,6 @@
   "summary": "heap-backed timer queue에서 head를 꺼내는 일과 queue 중간의 timer를 remove하는 일은 같은 비용 모양이 아니며, 정확한 취소를 하려면 handle과 equals() 기준을 따로 생각해야 한다.",
   "body_markdown": "# DelayQueue Remove Cost Primer\n\n> 한 줄 요약: heap-backed timer queue에서 head를 꺼내는 일과 queue 중간의 timer를 `remove`하는 일은 같은 비용 모양이 아니며, 정확한 취소를 하려면 `handle`과 `equals()` 기준을 따로 생각해야 한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [힙 기초](./heap-basics.md)\n- [Java PriorityQueue Pitfalls](./java-priorityqueue-pitfalls.md)\n- [ScheduledFuture Cancellation Bridge](./scheduledfuture-cancel-stale-entries.md)\n- [Timer Cancellation and Reschedule Stale Entry Primer](./timer-cancellation-reschedule-stale-entry-primer.md)\n- [DelayQueue vs PriorityQueue Timer Pitfalls](./delayqueue-vs-priorityqueue-timer-pitfalls.md)\n\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\nretrieval-anchor-keywords: delayqueue remove cost, delayqueue remove o(n), heap arbitrary remove, heap head removal vs arbitrary remove, timer queue cancel remove cost, timer queue remove handle, timer queue equality caveat, scheduledfuture removeoncancelpolicy cost, removeoncancelpolicy linear remove, delayqueue cancel by handle, delayqueue cancel by equals, heap middle delete timer, delayed task remove cost, heap timer queue beginner primer, delayqueue remove cost primer basics\n\n## 먼저 그림부터\n\n놀이공원 줄을 떠올리면 쉽다.\n\n- head removal은 **맨 앞 사람 한 명 빼기**다.\n- arbitrary `remove`는 **줄 중간의 특정 사람 찾은 뒤 빼기**다.\n\n힙(heap)은 \"맨 앞 사람이 누구인가\"만 빠르게 알려 준다.\n줄 중간의 누구를 지우고 싶을 때는, 보통 먼저 그 사람을 **찾아야** 한다.\n\n그래서 beginner용 핵심 문장은 이것이다.\n\n> `poll()`/`take()`가 빠르다고 해서 `remove(ticket)`도 같은 모양으로 빠르다고 생각하면 안 된다.\n\n## 한눈에 비교\n\n| 하고 싶은 일 | heap이 바로 아는 것 | 보통 드는 비용 감각 |\n|---|---|---|\n| head 보기 (`peek`) | 루트 | `O(1)` |\n| head 꺼내기 (`poll`, `take`) | 루트 | `O(log n)` |\n| 특정 timer 지우기 (`remove(x)`) | 모름, 먼저 찾아야 함 | 보통 `O(n)` 탐색 + heap 복구 |\n| 취소만 표시하고 나중에 버리기 | queue 밖 최신성 상태 | cancel 경로는 가볍고 cleanup은 나중으로 밀림 |\n\n여기서 세 번째 줄이 포인트다.\n\n- heap은 루트 접근에는 강하다\n- 하지만 \"이 timer가 지금 몇 번째 칸에 있지?\"는 기본적으로 모른다\n- 그래서 arbitrary remove는 head removal과 다른 비용 모양을 가진다\n\nJava의 `DelayQueue`/`PriorityQueue` 계열을 beginner 감각으로 읽으면 보통 이렇게 이해하면 충분하다.\n\n- head removal: root를 빼고 sift down/up 하면 된다\n- arbitrary remove: 대상 entry를 선형 탐색으로 찾고, 찾은 뒤에야 sift down/up을 한다\n\n## 왜 이런 차이가 생기나\n\n힙은 **전체 정렬 구조**가 아니라 **루트만 빠른 부분 정렬 구조**다.\n\n예를 들어 min-heap은 아래만 보장한다.\n\n- 부모는 자식보다 작거나 같다\n- 그래서 가장 작은 값은 루트에 있다\n\n하지만 힙은 아래를 보장하지 않는다.\n\n- 값 `x`가 배열 몇 번 칸에 있는지\n- 같은 `taskId`를 가진 timer가 몇 개 있는지\n- \"중간의 그 ticket\"으로 바로 점프하는 방법\n\n그래서 특정 timer를 없애려면 보통 두 단계가 필요하다.\n\n1. 원하는 entry를 찾는다\n2. 그 자리를 메운 뒤 heap 성질을 다시 맞춘다\n\n초보자에게 중요한 건 1번이 루트 제거에는 없지만, arbitrary remove에는 있다는 점이다.\n\n## `handle`이 있으면 왜 얘기가 달라지나\n\n여기서 `handle`은 \"그때 넣은 바로 그 ticket을 가리키는 손잡이\"라고 생각하면 된다.\n\n| 내가 손에 쥔 것 | 무엇을 지우려는 뜻이 되나 | 남는 caveat |\n|---|---|---|\n| exact ticket reference | \"그때 넣은 그 entry\" | 그래도 queue가 index를 따로 안 들고 있으면 내부 탐색이 남을 수 있다 |\n| `ScheduledFuture` 같은 취소 핸들 | \"그 예약 하나\" | 구현에 따라 즉시 제거가 아니라 cancelled 상태만 바꿀 수도 있다 |\n| 새로 만든 equal-looking 객체 | \"`equals()`가 같다고 보는 아무 entry 하나\" | duplicate/generation이 있으면 잘못된 entry를 건드릴 수 있다 |\n| logical task id만 | \"작업 A 관련 timer\" 정도 | reschedule된 여러 ticket 중 어떤 것을 지울지 모호하다 |\n\n핵심은 이것이다.\n\n> exact handle은 **의도**를 분명하게 해 주지만, 비용까지 자동으로 `poll()` 수준으로 낮춰 주는 것은 아니다.\n\n`O(log n)`에 가까운 arbitrary remove를 하려면 보통 추가 구조가 더 필요하다.\n\n- entry가 자신의 heap index를 안다\n- 외부 map이 `taskId -> heap index`를 들고 있다\n- handle이 node 위치와 함께 관리된다\n\n즉 \"정확히 무엇을 지울지\"와 \"얼마나 싸게 지울지\"는 다른 문제다.\n\n## `equals()`로 찾을 때 왜 timer queue가 더 헷갈리나\n\ntimer queue는 같은 logical task가 여러 ticket으로 존재하기 쉽다.\n\n- cancel 전에 오래된 ticket이 남아 있을 수 있다\n- reschedule하면서 새 deadline의 ticket을 다시 넣을 수 있다\n- latest-wins 정책이면 예전 generation ticket이 stale entry가 된다\n\n예를 들어 이런 상황을 보자.\n\n| ticket | taskId | generation | deadline |\n|---|---|---:|---:|\n| old | `A` | 1 | 10초 |\n| new | `A` | 2 | 30초 |\n\n그런데 `equals()`가 `taskId`만 본다면 둘 다 \"같은 A\"다.\n\n이 상태에서\n\n```java\nqueue.remove(new TimerTicket(\"A\"));\n```\n\n처럼 생각하면 초보자가 흔히 빠지는 함정이 생긴다.\n\n- old ticket을 지운다고 믿었지만 new ticket이 지워질 수 있다\n- new ticket을 지운다고 믿었지만 old stale ticket만 사라질 수 있다\n- `equals()` 기준이 deadline/generation과 안 맞으면 아예 못 찾을 수도 있다\n\n즉 timer queue에서는 \"`같은 작업`\"과 \"`같은 scheduled entry`\"를 구분해야 한다.\n\n## beginner용 안전한 기준\n\n취소/재예약이 섞이는 timer queue에서는 아래 기준이 안전하다.\n\n| 상황 | 더 안전한 기본값 |\n|---|---|\n| 정확히 그 예약 하나를 취소하고 싶다 | schedule 시 돌려받은 handle/reference를 잡고 간다 |\n| reschedule이 잦다 | 기존 entry를 broad equality로 찾기보다 새 ticket + stale skip을 먼저 검토한다 |\n| 같은 task의 여러 generation이 공존할 수 있다 | `taskId`만으로 `equals()`를 잡지 않는다 |\n| cancel hot path가 매우 뜨겁다 | 즉시 `remove` 비용이 cancel 경로로 들어오는지 먼저 본다 |\n\n실무에서 lazy stale skip이 자주 나오는 이유도 여기 있다.\n\n- `remove`를 매번 정확히 찾는 비용을 취소 시점에 내지 않는다\n- 대신 worker가 head로 올라온 오래된 ticket을 버린다\n- 메모리 retention과 stale cleanup 비용은 뒤로 밀린다\n\n즉시 제거가 틀렸다는 뜻은 아니다.\n다만 **head pop과 같은 비용 감각으로 생각하면 설계가 어긋나기 쉽다**는 뜻이다.\n\n## 자주 하는 오해\n\n1. heap은 정렬돼 있으니 특정 원소도 빨리 찾을 수 있다고 생각한다.\n2. exact handle이 있으면 `remove` 비용도 자동으로 `O(log n)`일 것이라고 생각한다.\n3. `equals()`가 같은 객체면 어느 ticket을 지워도 괜찮다고 생각한다.\n4. `taskId` 하나만 같으면 reschedule 전후 ticket도 같은 entry라고 생각한다.\n5. `removeOnCancelPolicy(true)`는 공짜로 queue를 깨끗하게 만든다고 생각한다.\n\n특히 5번은 주의해야 한다.\nqueue를 빨리 깨끗하게 만드는 대신, 그 cleanup 비용을 `cancel()` 쪽으로 당겨올 수 있다.\n\n## 작은 재현과 검증\n\n학습용 재현은 두 경로를 나눠 보면 된다.\n\n```text\ncase A: head에 가까운 timer를 poll/take로 제거한다.\ncase B: queue 중간의 특정 timer를 remove(ticket)로 제거한다.\n```\n\n검증할 질문:\n\n1. 제거하려는 ticket을 찾는 과정이 있는가?\n2. 같은 `taskId`의 여러 generation이 있을 때 정확히 어느 entry가 지워지는가?\n3. cancel path에서 제거 비용을 내는가, worker가 head에서 stale skip하는가?\n4. queue 크기 감소와 실행 correctness를 같은 신호로 섞지 않았는가?\n\n`equals()` 검증은 특히 중요하다.\n\n```text\nold: taskId=A, generation=1, deadline=10s\nnew: taskId=A, generation=2, deadline=30s\n```\n\n`equals()`가 `taskId`만 보면 두 ticket은 같은 것으로 보인다.\n이때 \"A를 지웠다\"는 말은 정확하지 않고, \"어느 generation을 지웠는가\"를 따로 증명해야 한다.\n\n## 다음 문서로 이어가기\n\n- `ScheduledFuture.cancel()`과 `removeOnCancelPolicy` trade-off를 API 쪽에서 보고 싶으면 [ScheduledFuture Cancellation Bridge](./scheduledfuture-cancel-stale-entries.md)\n- `DelayQueue`에서 cancel/reschedule과 stale skip 정책을 같이 보고 싶으면 [Timer Cancellation and Reschedule Stale Entry Primer](./timer-cancellation-reschedule-stale-entry-primer.md)\n- heap에서 `remove(Object)`가 왜 stale-entry 패턴과 연결되는지 더 넓게 보려면 [Java PriorityQueue Pitfalls](./java-priorityqueue-pitfalls.md)\n- timer queue 구조 선택까지 넓히려면 [DelayQueue vs PriorityQueue Timer Pitfalls](./delayqueue-vs-priorityqueue-timer-pitfalls.md)\n\n## 한 줄 정리\n\nheap-backed timer queue에서 head removal은 \"루트 하나 빼기\"지만, arbitrary `remove`는 보통 \"원하는 ticket 찾기 + heap 복구\"다.\n그래서 cancellation 설계에서는 `handle`, `equals()`, stale-entry 정책을 같이 봐야 한다.\n",
   "aliases": [
-    "DelayQueue Remove Cost Primer 개념",
-    "DelayQueue Remove Cost Primer 정리",
-    "DelayQueue Remove Cost Primer 실수",
-    "DelayQueue Remove Cost Primer 판단 기준",
     "자료구조 DelayQueue Remove Cost Primer",
     "DelayQueue remove cost",
     "heap arbitrary remove",
@@ -17,7 +13,9 @@
     "removeOnCancelPolicy linear remove",
     "heap middle delete timer",
     "DelayQueue cancel by handle",
-    "poll take vs remove cost"
+    "poll take vs remove cost",
+    "DelayQueue 중간 원소 삭제 비용",
+    "timer cancel마다 remove해도 괜찮아"
   ],
   "expected_queries": [
     "DelayQueue에서 take와 poll은 빠른데 remove(ticket)는 왜 비쌀 수 있어?",
@@ -56,12 +54,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/data-structure/delayqueue-remove-cost-primer.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

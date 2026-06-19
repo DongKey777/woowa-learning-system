@@ -6,10 +6,6 @@
   "summary": "캐시의 실패는 저장소보다 key 설계에서 먼저 시작되며, key가 불완전하면 캐시 히트가 아니라 데이터 오염이 된다.",
   "body_markdown": "# Spring Cache Key Generation Pitfalls\n\n> 한 줄 요약: 캐시의 실패는 저장소보다 key 설계에서 먼저 시작되며, key가 불완전하면 캐시 히트가 아니라 데이터 오염이 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Cache 추상화 함정](./spring-cache-abstraction-traps.md)\n> - [AOP와 프록시 메커니즘](./aop-proxy-mechanism.md)\n> - [@Transactional 깊이 파기](./transactional-deep-dive.md)\n> - [Spring Open Session In View Trade-offs](./spring-open-session-in-view-tradeoffs.md)\n> - [Spring Test Slices와 Context Caching](./spring-test-slices-context-caching.md)\n\nretrieval-anchor-keywords: cache key generation, key generator, cache poisoning, key collision, tenant-aware key, locale-aware key, cache invalidation, self invocation\n\n## 핵심 개념\n\nSpring Cache에서 key는 단순 문자열이 아니다.\n\n그 key가 무엇을 식별하는지 명확해야 한다.\n\n- 사용자별인지\n- 테넌트별인지\n- locale별인지\n- 권한별인지\n- 필터 조건별인지\n\nkey가 이 정보를 빠뜨리면 캐시는 빨라지는 대신 틀린 응답을 줄 수 있다.\n\n## 깊이 들어가기\n\n### 1. key는 응답의 정체성을 표현한다\n\n```java\n@Cacheable(cacheNames = \"product\", key = \"#id\")\npublic ProductDto find(Long id) {\n    ...\n}\n```\n\n이 key는 단순해 보이지만, 실제로는 \"id만 같으면 같은 응답\"이라는 계약이다.\n\n그 계약이 맞는지 먼저 봐야 한다.\n\n### 2. key에 빠지기 쉬운 요소들이 있다\n\n- tenant id\n- locale\n- auth role\n- page/sort/filter\n- version\n\n예를 들어 같은 product id라도 사용자 권한에 따라 내려가는 필드가 다르면 key가 같으면 안 된다.\n\n### 3. collisions보다 더 무서운 것은 silent misuse다\n\nkey collision은 드러나기 쉽지만, 더 위험한 건 \"틀린 key인데도 cache hit처럼 보이는 경우\"다.\n\n이 경우 장애가 아니라 정합성 문제로 남는다.\n\n### 4. key generator는 규칙을 강제하는 도구다\n\n```java\n@Bean\npublic KeyGenerator tenantLocaleKeyGenerator() {\n    return (target, method, params) -> {\n        return method.getName() + \":\" + TenantContext.currentTenant()\n            + \":\" + LocaleContextHolder.getLocale()\n            + \":\" + Arrays.deepToString(params);\n    };\n}\n```\n\n이런 식으로 공통 규칙을 두면 key 실수를 줄일 수 있다.\n\n### 5. invalidation은 key 설계와 같이 봐야 한다\n\n무효화가 잘 안 되는 경우는 key가 너무 넓거나 너무 좁을 때다.\n\n- 너무 넓다: 서로 다른 응답이 같은 key로 묶인다\n- 너무 좁다: 캐시 히트율이 너무 낮아진다\n\n## 실전 시나리오\n\n### 시나리오 1: 사용자 A 응답이 사용자 B에게 간다\n\n원인 후보:\n\n- locale이 key에 빠졌다\n- tenant가 key에 빠졌다\n- role별 응답 차이를 무시했다\n\n### 시나리오 2: key는 맞는데 히트율이 낮다\n\n대개 key가 너무 세분화되어 있다.\n\n- timestamp를 넣었다\n- page size와 sort가 불필요하게 다양하다\n- request header를 전부 key에 넣었다\n\n### 시나리오 3: 캐시를 지웠는데도 값이 계속 보인다\n\n다른 key를 지우고 있었거나, 조회 path와 invalidation path가 다른 규칙을 쓰고 있을 수 있다.\n\n### 시나리오 4: `@Cacheable`은 맞는데 self-invocation으로 안 탄다\n\n이 문제는 [Spring Cache 추상화 함정](./spring-cache-abstraction-traps.md)과 [AOP와 프록시 메커니즘](./aop-proxy-mechanism.md)에서 보는 전형적 함정이다.\n\n## 근거로 확인할 것\n\ncache key 문제는 key 문자열을 직접 보지 않으면 추측으로 흐르기 쉽다.\n\n- 대표 요청 10개 정도를 골라 \"요청 조건 -> 생성 key -> 응답 정체성\" 표를 만든다. 같은 key가 나온 두 요청은 정말 같은 응답을 받아도 되는지 확인한다.\n- `SimpleKey`, SpEL key, custom `KeyGenerator` 중 무엇이 key를 만드는지 코드 위치를 고정한다. Spring의 기본 key generator는 파라미터를 기반으로 하지만, 응답 정체성에 필요한 context 값까지 자동으로 넣어 주지는 않는다.\n- `tenant`, `locale`, `role`, `viewerId`, `page`, `sort`, `filter`, `feature flag`, `version` 중 결과를 바꾸는 축을 빠뜨리지 않았는지 테스트한다.\n- `@CacheEvict`와 `@CachePut`이 조회와 같은 key generator 또는 같은 SpEL 식을 쓰는지 본다. 조회 key와 삭제 key가 다르면 \"지웠는데 계속 보인다\"가 된다.\n- key cardinality도 측정한다. timestamp, random request id, 전체 header dump를 key에 넣으면 오염은 줄어도 hit율이 사라지고 backend memory가 먼저 터진다.\n\n공식 Spring Cache 문서는 cache가 key-value store라서 각 메서드 호출을 cache access key로 번역해야 하며, default key generation이 맞지 않으면 SpEL `key`나 custom `KeyGenerator`로 전략을 바꾸라고 설명한다.\n\n## 중단 조건\n\n아래 조건을 만족하면 key generation 수정을 멈춰도 된다.\n\n- 같은 응답을 받아야 하는 요청만 같은 key로 모이고, 다른 사용자/권한/tenant/locale 응답은 key가 갈린다.\n- key 생성 규칙이 조회, put, evict, bulk invalidation에서 동일하게 적용된다.\n- key cardinality와 TTL이 backend capacity 안에 들어온다.\n- 권한 변경, locale 변경, tenant 전환, pagination/sort 변경을 포함한 regression test가 있다.\n- key generator 변경 후 old key와 new key가 공존하는 배포 기간의 cleanup 또는 version prefix 전략이 있다.\n\n## 코드로 보기\n\n### 잘못된 key\n\n```java\n@Cacheable(cacheNames = \"product\", key = \"#id\")\npublic ProductDto findForViewer(Long id) {\n    ...\n}\n```\n\n### tenant-aware key generator\n\n```java\n@Bean\npublic KeyGenerator productKeyGenerator() {\n    return (target, method, params) ->\n        TenantContext.currentTenant() + \":\" + Arrays.deepToString(params);\n}\n```\n\n### cacheable with compound key\n\n```java\n@Cacheable(cacheNames = \"feed\", key = \"#userId + ':' + #locale\")\npublic FeedDto findFeed(Long userId, String locale) {\n    ...\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 단순 key | 쉽다 | 오염 위험이 있다 | 정말 식별자가 하나일 때 |\n| compound key | 안전하다 | 길어질 수 있다 | locale/tenant/role 반영 |\n| custom KeyGenerator | 규칙을 강제할 수 있다 | 코드가 늘어난다 | 여러 캐시에서 공통 규칙 |\n| raw method args | 구현이 빠르다 | 의도를 숨기기 쉽다 | 아주 단순한 경우 |\n\n핵심은 key를 \"캐시 주소\"로 보고, **응답 정체성이 무엇인지 먼저 정의하는 것**이다.\n\n## 꼬리질문\n\n> Q: 캐시 key 설계에서 가장 먼저 봐야 하는 것은 무엇인가?\n> 의도: 응답 정체성 이해 확인\n> 핵심: 어떤 조건이 결과를 바꾸는지다.\n\n> Q: key collision보다 더 위험한 것은 무엇인가?\n> 의도: 조용한 데이터 오염 이해 확인\n> 핵심: 틀린 key로 캐시 히트가 나는 경우다.\n\n> Q: tenant/locale/role이 key에 빠지면 어떤 문제가 생기는가?\n> 의도: 멀티테넌트/권한 캐시 인식 확인\n> 핵심: 다른 사용자에게 잘못된 응답이 갈 수 있다.\n\n> Q: custom KeyGenerator를 쓰는 이유는 무엇인가?\n> 의도: 규칙 강제 이해 확인\n> 핵심: 캐시 key 규칙을 한곳에서 통일하기 위해서다.\n\n## 한 줄 정리\n\n캐시 key는 성능 최적화의 부품이 아니라 응답 정체성을 표현하는 계약이므로, 빠뜨린 축이 있으면 캐시가 데이터를 오염시킨다.\n",
   "aliases": [
-    "Spring Cache Key Generation 개념",
-    "Spring Cache Key Generation 정리",
-    "Spring Cache Key Generation 실수",
-    "Spring Cache Key Generation 판단 기준",
     "스프링 Spring Cache Key Generation",
     "Spring cache key generation",
     "KeyGenerator",
@@ -17,7 +13,9 @@
     "cache poisoning",
     "tenant-aware cache key",
     "locale-aware cache key",
-    "cache invalidation"
+    "cache invalidation",
+    "캐시 key에 tenant를 넣어야 하나요",
+    "다른 사용자 캐시가 섞여 보여요"
   ],
   "expected_queries": [
     "Spring Cache key에는 어떤 값을 반드시 포함해야 해?",
@@ -46,12 +44,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/spring-cache-key-generation-pitfalls.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch162"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

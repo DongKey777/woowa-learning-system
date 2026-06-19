@@ -7,17 +7,15 @@
   "body_markdown": "# Read Repair와 Failover Reconciliation\n\n> 한 줄 요약: failover가 끝난 뒤에는 읽기 경로를 바로잡는 것만큼, 이미 갈라진 데이터를 다시 맞추는 작업이 중요하다.\n\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n- [연결 입문 문서](../spring/spring-persistence-transaction-web-service-repository-primer.md)\n\n관련 문서: [Failover Promotion과 Read Divergence](./failover-promotion-read-divergence.md), [Replication Failover and Split Brain](./replication-failover-split-brain.md), [Replica Read Routing Anomalies와 세션 일관성](./replica-read-routing-anomalies.md), [Failover Visibility Window, Topology Cache, and Freshness Playbook](./failover-visibility-window-topology-cache-playbook.md), [Commit Horizon After Failover, Loss Boundaries, and Verification](./commit-horizon-after-failover-verification.md)\nretrieval-anchor-keywords: read repair, reconciliation, failover recovery, divergence scan, version check, visibility window, commit horizon, read repair reconciliation after failover basics, read repair reconciliation after failover beginner, read repair reconciliation after failover intro, database basics, beginner database, 처음 배우는데 read repair reconciliation after failover, read repair reconciliation after failover 입문, read repair reconciliation after failover 기초\n\n## 핵심 개념\n\nRead repair는 읽을 때 divergence를 발견하고 바로잡는 패턴이다.\nFailover reconciliation은 failover 이후 이미 생긴 불일치를 배치나 검사로 정리하는 작업이다.\n\n왜 중요한가:\n\n- failover 직후 일부 데이터가 old primary, new primary, cache, search index 사이에 갈라질 수 있다\n- 읽기 경로만 고쳐도 과거에 이미 생긴 불일치는 남을 수 있다\n- 운영자는 “지금은 정상”과 “이미 틀어진 데이터가 남음”을 분리해서 봐야 한다\n\n즉 failover 복구는 라우팅 전환으로 끝나지 않고, **잔여 불일치 정리**까지 포함한다.\n\n## 깊이 들어가기\n\n### 1. read repair가 필요한 이유\n\n혼합 라우팅이나 lag 때문에 어떤 요청은 오래된 값을 보았을 수 있다.\n\n- 캐시가 옛 버전을 저장\n- 검색 인덱스가 늦게 갱신\n- replica가 잠깐 뒤처진 값을 읽음\n\n이때 읽기 시점에 버전 비교를 하고, 더 새로운 값으로 고치는 작업이 read repair다.\n\n### 2. reconciliation이 왜 별도인가\n\nread repair는 보통 요청 경로에서 일부 문제를 바로 잡는 반면, reconciliation은 시스템 전체를 훑는다.\n\n- primary와 replica의 version 비교\n- cache와 DB 비교\n- read model과 write model 비교\n\nfailover 직후에는 한 번의 read repair로는 부족할 수 있다.\n\n### 3. 어떤 데이터를 재검증해야 하나\n\n우선순위는 보통 다음과 같다.\n\n- 결제 상태\n- 주문 상태\n- 권한/멤버십\n- 재고/예약\n\n정합성이 중요한 데이터부터 version 기반 재검증을 수행해야 한다.\n\n### 4. repair의 위험\n\n- 옛 값이 authoritative source를 덮을 수 있다\n- repair job 자체가 대량 트래픽을 일으킬 수 있다\n- version 비교 없이 덮어쓰면 데이터 손상이 더 커질 수 있다\n\n그래서 repair는 반드시 **버전 비교 + 단일 진실원**을 기준으로 해야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: failover 후 검색 결과와 DB 상태가 다름\n\nDB는 정상인데 검색 인덱스가 옛 상태면, 사용자는 데이터가 사라진 것으로 느낀다.\n이때 reconciliation job으로 search index를 다시 맞춰야 한다.\n\n### 시나리오 2: 캐시가 오래된 주문 상태를 품고 있음\n\nfailover 전 읽은 캐시가 살아있으면, 새 primary와 다른 상태를 보여준다.\nread repair가 필요하다.\n\n### 시나리오 3: 일부 레코드만 옛 primary에 남아 있음\n\n잘못된 failover 또는 지연된 write로 일부 row가 갈라졌다면, version diff scan으로 재동기화해야 한다.\n\n## 재현 조건\n\n재현(repro)은 failover window를 작게 만든 뒤 stale read와 누락 record를 따로 만든다.\n\n| 재현 케이스 | 기대 관측 | 맞는 복구 |\n|---|---|---|\n| cache가 옛 상태를 반환 | 특정 key read에서만 차이 | read repair로 해당 key 갱신 |\n| search index가 일부 row를 놓침 | 목록/검색에서 누락 | reconciliation scan 후 재색인 |\n| old primary에만 write 존재 | 장애 window의 subset 누락 | source-of-truth 결정 후 merge/replay |\n| 양쪽에 서로 다른 write 존재 | conflict resolution 필요 | 자동 repair 전에 사람/정책 개입 |\n\n## 확인 순서\n\n트리아지는 \"무엇이 진실인가\"를 먼저 고른다.\n\n1. 새 primary, old primary, backup, event log 중 source of truth를 정한다.\n2. 장애 시작/종료 시각과 replication lag 범위를 잡는다.\n3. read repair로 고칠 key-level 문제인지, reconciliation job이 필요한 set-level 문제인지 나눈다.\n4. repair write가 다시 event를 발행해 중복 side effect를 만들지 확인한다.\n\n## failure matrix\n\n실패 매트릭스는 아래처럼 둔다.\n\n| 증상 | wrong bucket | 맞는 bucket |\n|---|---|---|\n| 한 사용자의 상세 화면만 stale | 전체 재빌드 | read repair |\n| 장애 window의 주문 목록이 일부 비어 있음 | 상세 조회 때마다 우연히 수정 | reconciliation |\n| 서로 다른 두 상태가 모두 결제 완료처럼 보임 | 마지막 write wins 무조건 적용 | conflict policy |\n| repair 후 알림이 다시 발송됨 | 단순 update | side effect 억제 repair |\n\n## 검증\n\n검증은 sample key만 맞추지 말고 window coverage를 본다.\n\n- 장애 window의 lower/upper commit horizon이 남아 있다.\n- 후보 집합 count, checksum, sample diff가 source of truth 기준으로 맞는다.\n- repair write가 알림, 정산, 외부 이벤트를 다시 발행하지 않는다.\n- read repair hit rate가 시간이 지나며 감소한다.\n- reconciliation skipped/conflict bucket이 운영자가 설명할 수 있는 상태로 남는다.\n\nread repair는 관측된 key 하나를 고치는 보장이고, reconciliation은 정한 후보 집합을 훑어 drift를 줄이는 보장이다. 둘 다 \"failover 동안 잃은 모든 write를 자동으로 알아서 복원한다\"는 보장은 아니다.\n\n## 코드로 보기\n\n```sql\n-- 버전 비교 후 더 새로운 쪽을 authoritative source로 선택\nSELECT id, status, version\nFROM orders\nWHERE id = 9001;\n```\n\n```java\nif (cacheVersion < dbVersion) {\n    cache.put(orderId, dbValue);\n}\n```\n\n```text\nrepair flow:\n  detect divergence -> choose source of truth -> update stale projection\n```\n\nread repair는 “읽다가 고친다”이고, reconciliation은 “한 번 훑고 정리한다”다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| read repair | 즉시성 좋음 | 요청 경로가 무거워질 수 있다 | 자주 읽는 핵심 데이터 |\n| reconciliation job | 전체 정리가 가능 | 배치 지연이 있다 | failover 이후 정리 |\n| full rebuild | 단순하다 | 비용이 크다 | 불일치가 광범위할 때 |\n| 버전 기반 부분 repair | 효율적이다 | 버전 관리가 필요하다 | 대부분의 운영 케이스 |\n\n## 꼬리질문\n\n> Q: failover 뒤에 왜 read repair가 필요한가요?\n> 의도: 라우팅 전환만으로는 오래된 projection이 남을 수 있음을 아는지 확인\n> 핵심: 읽기 경로와 저장된 파생 데이터는 따로 틀어질 수 있다\n\n> Q: reconciliation과 read repair의 차이는 무엇인가요?\n> 의도: 즉시 수정과 전체 스캔 정리를 구분하는지 확인\n> 핵심: read repair는 요청 경로, reconciliation은 배치/점검 경로다\n\n> Q: repair할 때 가장 중요한 안전장치는 무엇인가요?\n> 의도: 덮어쓰기 손상을 막는 기준을 아는지 확인\n> 핵심: 단일 진실원과 version 비교다\n\n## 한 줄 정리\n\nFailover 이후에는 읽기 라우팅을 고치는 것뿐 아니라, 이미 갈라진 캐시와 projection을 version 기반으로 다시 맞추는 reconciliation이 필요하다.\n",
   "aliases": [
     "failover 후 데이터 불일치",
-    "Read Repair and Failover 개념",
-    "Read Repair and Failover 정리",
-    "Read Repair and Failover 실수",
-    "Read Repair and Failover 판단 기준",
     "read repair",
     "failover reconciliation",
     "divergence scan",
     "version based repair",
     "stale projection repair",
     "cache DB mismatch after failover",
-    "read model reconciliation"
+    "read model reconciliation",
+    "failover 후 stale cache 고치기",
+    "read repair와 reconciliation 차이"
   ],
   "expected_queries": [
     "failover 이후 캐시와 DB 값이 다를 때 read repair와 reconciliation을 어떻게 나눠야 해?",
@@ -53,12 +51,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/read-repair-reconciliation-after-failover.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

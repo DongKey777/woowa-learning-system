@@ -7,17 +7,15 @@
   "body_markdown": "# Summary Drift Detection, Invalidation, and Bounded Rebuild\n\n> 한 줄 요약: summary table은 refresh만 잘 돌린다고 안전하지 않고, 원본과 어긋난 drift를 어떻게 탐지하고 어느 범위만 다시 계산할지 준비돼 있어야 운영이 가능하다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Incremental Summary Table Refresh and Watermark Discipline](./incremental-summary-table-refresh-watermark.md)\n- [정규화와 반정규화 트레이드오프](./normalization-denormalization-tradeoffs.md)\n- [CDC Gap Repair, Reconciliation, and Rebuild Boundaries](./cdc-gap-repair-reconciliation-playbook.md)\n- [Replica Lag Observability와 Routing SLO](./replica-lag-observability-routing-slo.md)\n- [Online Backfill Consistency와 워터마크 전략](./online-backfill-consistency.md)\n- [Projection Freshness SLO Pattern](../design-pattern/projection-freshness-slo-pattern.md)\n- [Projection Applied Watermark Basics](../system-design/projection-applied-watermark-basics.md)\n\nretrieval-anchor-keywords: summary drift detection, bounded rebuild, bucket invalidation, summary reconciliation, stale aggregate repair, projection drift, freshness contract, rebuild scope, summary drift monitor, summary drift alarm, 요약 테이블 값이 원본과 달라요, 왜 summary 값이 계속 어긋나요, 일부 bucket만 다시 계산, rebuild 범위 어디까지\n\n## 핵심 개념\n\nsummary table은 증분 refresh가 잘 돌아도 다음 이유로 틀어질 수 있다.\n\n- late event\n- 중복 이벤트\n- 역보정 누락\n- 수동 데이터 수정\n- CDC gap\n- 배포 버그\n\n즉 summary 운영의 핵심은 refresh 그 자체보다, **drift를 발견하고 bounded rebuild로 고치는 능력**이다.\n\n중요한 질문:\n\n- summary가 틀렸는지 어떻게 감지하는가\n- 전체 rebuild 대신 어느 bucket만 invalidation 할 수 있는가\n- rebuild 중에도 사용자에게 어떤 freshness 계약을 줄 것인가\n\n## 깊이 들어가기\n\n### 1. drift는 조용히 쌓이기 때문에 별도 검증 루프가 필요하다\n\n많은 팀이 refresh checkpoint가 움직이면 summary가 건강하다고 생각한다.  \n하지만 checkpoint는 \"파이프라인이 돌았다\"는 뜻일 뿐, 결과가 맞다는 보장은 아니다.\n\n그래서 별도 drift detection loop가 필요하다.\n\n- source count와 summary count 비교\n- 특정 bucket의 aggregate checksum 비교\n- 표본 샘플 검증\n- business invariant 검증\n\n즉 refresh observability와 correctness observability는 다른 층위다.\n\n### 2. invalidation 단위는 bucket 또는 aggregate scope로 미리 정해야 한다\n\nbounded rebuild를 하려면 먼저 rebuild unit이 정의돼 있어야 한다.\n\n예:\n\n- 일별 매출 summary는 `order_date`\n- tenant별 사용량은 `(tenant_id, month)`\n- 상품별 재고 projection은 `sku_id`\n\n이 단위가 있어야:\n\n- drift 발견 시 전체를 날리지 않고\n- 해당 범위만 stale 처리하고\n- source recompute를 적용할 수 있다\n\n즉 summary schema는 조회용 컬럼만이 아니라 **repair scope를 표현하는 컬럼**도 가져야 한다.\n\n### 3. rebuild는 \"다시 계산\"만이 아니라 \"old result를 어떻게 대체할지\" 문제다\n\nbounded rebuild 방식은 보통 셋 중 하나다.\n\n- delete then insert\n- upsert overwrite\n- shadow bucket build 후 atomic swap\n\n선택 기준:\n\n- 읽기 중간에 비어 보여도 되는가\n- rebuild가 오래 걸리는가\n- partial result 노출을 허용하는가\n\n읽기 가용성이 중요하면 shadow build 후 swap이 더 안전하다.\n\n### 4. drift detection과 freshness contract를 함께 노출해야 한다\n\nsummary가 stale할 수 있다는 사실을 시스템이 숨기면 운영 판단이 틀어진다.\n\n권장 메타데이터:\n\n- last successful refresh time\n- last verified time\n- drift suspected flag\n- rebuild in progress flag\n\n이렇게 해야 사용자나 운영자가 \"이 수치는 최신인가, 검증됐는가, 지금 재구성 중인가\"를 알 수 있다.\n\n### 5. 수동 수정과 backfill은 drift의 흔한 원인이다\n\n운영에서 의외로 많은 drift는 시스템 버그보다:\n\n- 운영 SQL 직접 수정\n- historical backfill\n- migration 스크립트\n\n에서 생긴다.\n\n그래서 summary를 쓰는 시스템에서는 manual change가 발생할 때:\n\n- 영향 scope invalidation\n- rebuild job enqueue\n- verification afterwards\n\n를 같이 자동화하는 편이 안전하다.\n\n### 6. bounded rebuild가 없으면 결국 full rebuild만 남는다\n\nfull rebuild는 단순하고 매력적이지만, 데이터가 커질수록 다음 문제가 생긴다.\n\n- 오래 걸린다\n- resource spike가 크다\n- freshness 공백이 길어진다\n- 장애 시 반복 수행이 어렵다\n\n그래서 summary를 오래 운영하려면 처음부터 \"부분 재계산\"을 1급 기능으로 봐야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1. 하루 매출 대시보드가 특정 날짜만 틀림\n\n전체 refresh는 정상인데 환불 이벤트 일부가 누락됐다.\n\n좋은 대응:\n\n- 해당 날짜 bucket invalidation\n- source of truth 재집계\n- 검증 후 bucket overwrite\n\n### 시나리오 2. 특정 테넌트 월간 사용량만 계속 어긋남\n\ntenant-specific migration 이후 그 고객 데이터만 drift가 난다.\n\n이때는 `(tenant_id, month)` 범위를 repair unit으로 갖고 있어야 전체 시스템을 흔들지 않는다.\n\n### 시나리오 3. 운영자가 과거 주문 상태를 직접 수정함\n\nsource row만 수정하고 summary invalidation을 안 걸면 drift가 남는다.\n\n교훈:\n\n- 수동 수정은 summary rebuild trigger와 묶어야 한다\n- backfill tooling이 summary invalidation을 자동 수행해야 한다\n\n## 코드로 보기\n\n```sql\nCREATE TABLE summary_rebuild_scope (\n  scope_id BIGINT PRIMARY KEY,\n  summary_name VARCHAR(100) NOT NULL,\n  scope_key VARCHAR(255) NOT NULL,\n  rebuild_status VARCHAR(20) NOT NULL,\n  requested_at TIMESTAMP NOT NULL,\n  completed_at TIMESTAMP NULL\n);\n```\n\n```sql\nCREATE TABLE summary_health (\n  summary_name VARCHAR(100) PRIMARY KEY,\n  last_refreshed_at TIMESTAMP NOT NULL,\n  last_verified_at TIMESTAMP NOT NULL,\n  drift_suspected BOOLEAN NOT NULL,\n  rebuild_in_progress BOOLEAN NOT NULL\n);\n```\n\n```java\nif (driftDetector.suspects(summaryName, scopeKey)) {\n    rebuildQueue.enqueue(summaryName, scopeKey);\n}\n```\n\n핵심은 drift를 발견했을 때 사람 손으로 전체 rebuild를 고민하는 게 아니라, scope 단위 invalidation과 rebuild를 기계적으로 실행할 수 있게 만드는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| full rebuild only | 구현이 단순하다 | 큰 데이터에서 너무 무겁다 | 초기 단계 |\n| bounded rebuild | blast radius가 작고 빠르다 | scope 설계가 필요하다 | 대부분의 운영 summary |\n| shadow rebuild + swap | partial result 노출을 줄인다 | 구현이 더 복잡하다 | 읽기 가용성이 중요할 때 |\n| drift verification loop | correctness를 지속 확인한다 | 추가 계산 비용이 든다 | 중요한 재무/사용량 지표 |\n\n## 꼬리질문\n\n> Q: refresh checkpoint가 움직이면 summary가 맞다고 볼 수 있나요?\n> 의도: pipeline health와 correctness를 구분하는지 확인\n> 핵심: 아니다. drift detection과 source-to-summary verification이 별도로 필요하다\n\n> Q: bounded rebuild를 하려면 무엇을 먼저 설계해야 하나요?\n> 의도: repair scope 관점을 이해하는지 확인\n> 핵심: bucket이나 aggregate scope 같은 rebuild unit이 summary schema에 드러나 있어야 한다\n\n> Q: drift를 발견했을 때 왜 full rebuild보다 부분 rebuild가 좋은가요?\n> 의도: 운영 blast radius 감각 확인\n> 핵심: resource spike와 freshness 공백을 줄이고 검증 범위를 좁힐 수 있기 때문이다\n\n## 한 줄 정리\n\nsummary 운영의 완성도는 증분 refresh 속도보다, drift를 검출하고 scope 단위 invalidation·rebuild·verification으로 빠르게 복구할 수 있는지에 달려 있다.\n",
   "aliases": [
     "왜 요약 테이블 값이 원본과 달라요",
-    "Summary Drift Detection, Invalidation, 개념",
-    "Summary Drift Detection, Invalidation, 정리",
-    "Summary Drift Detection, Invalidation, 실수",
-    "Summary Drift Detection, Invalidation, 판단 기준",
     "summary drift detection",
     "bounded rebuild",
     "summary invalidation",
     "stale aggregate repair",
     "projection drift",
     "freshness contract",
-    "summary table drift"
+    "summary table drift",
+    "요약 테이블 값이 안 맞아요",
+    "stale aggregate 일부만 다시 계산하기"
   ],
   "expected_queries": [
     "summary table 값이 원본과 달라질 때 drift를 어떻게 탐지해?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/summary-drift-detection-bounded-rebuild.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

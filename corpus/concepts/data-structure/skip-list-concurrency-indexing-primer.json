@@ -6,10 +6,6 @@
   "summary": "Skip List는 probabilistic level shortcut으로 ordered search를 빠르게 하는 구조이고, concurrent skip list는 여기에 별도의 동시성 프로토콜을 얹은 구현이지 자동으로 lock-free가 되는 자료구조가 아니다.",
   "body_markdown": "# Skip List Concurrency Indexing Primer\n\n> 한 줄 요약: Skip List는 probabilistic level shortcut으로 ordered search를 빠르게 하는 구조이고, concurrent skip list는 여기에 별도의 동시성 프로토콜을 얹은 구현이지 자동으로 lock-free가 되는 자료구조가 아니다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Skip List](./skip-list.md)\n> - [Concurrent Skip List Internals](./concurrent-skiplist-internals.md)\n> - [Treap vs Skip List](./treap-vs-skip-list.md)\n> - [TreeMap, HashMap, LinkedHashMap 비교](./treemap-vs-hashmap-vs-linkedhashmap.md)\n> - [Hazard Pointers vs Epoch Based Reclamation](./hazard-pointers-vs-epoch-based-reclamation.md)\n> - [Reclamation Cost Tradeoffs](./reclamation-cost-tradeoffs.md)\n\n> retrieval-anchor-keywords: skip list concurrency, probabilistic search, concurrent skip list, ordered index, range scan caveat, lock free caveat, fine grained locking, bottom layer order, concurrent ordered map, memory reclamation\n\n## 핵심 개념\n\nSkip List를 이해할 때 두 층을 분리해야 한다.\n\n- 자료구조 원리: random level promotion으로 평균 `O(log n)` ordered search를 만든다\n- concurrent 구현: 여러 thread가 같은 ordered index를 안전하게 update/scan하도록 lock, validation, CAS, mark/unlink 같은 규약을 붙인다\n\n첫 번째가 있다고 두 번째가 자동으로 생기지 않는다.\n단일 thread Skip List는 그냥 pointer 기반 ordered index이고, thread-safe하지 않다.\n\n## probabilistic search mechanics\n\nSkip List의 바닥 level은 모든 key를 정렬 순서로 연결한 linked list다.\n상위 level은 일부 node만 올라와 있는 shortcut이다.\n\n탐색은 보통 이렇게 움직인다.\n\n1. 가장 높은 level에서 시작한다.\n2. 다음 node의 key가 목표보다 작으면 오른쪽으로 간다.\n3. 더 갈 수 없으면 한 level 내려간다.\n4. bottom level에서 후보 key를 확인한다.\n\nrandom promotion이 균등하게 동작하면 level 높이가 로그 감각으로 유지되어 평균 탐색이 빠르다.\n하지만 worst case는 여전히 `O(n)`이고, deterministic balanced tree와 같은 최악 보장을 주지는 않는다.\n\n## ordered index로 보는 이유\n\nSkip List의 장점은 단순 membership보다 ordered API에서 드러난다.\n\n- `ceilingKey`, `floorKey`, `higherEntry` 같은 neighbor query\n- `fromKey` 이후 순회\n- deadline, score, offset 같은 정렬 key range scan\n- tree rotation 없이 pointer update로 삽입/삭제 경로를 표현하는 구현 shape\n\nexact key lookup만 필요하면 concurrent hash structure가 더 단순하고 cache locality도 나을 수 있다.\nSkip List는 \"정렬 순서가 기능 요구사항인가\"를 먼저 확인하고 고른다.\n\n## concurrency caveat\n\n\"Skip List는 concurrent에 좋다\"는 말은 \"상위 level shortcut이 있어서 lock-free다\"라는 뜻이 아니다.\n구현은 여러 방식이 가능하다.\n\n| 구현 방식 | 감각 | caveat |\n|---|---|---|\n| coarse lock | 전체 구조를 하나의 lock으로 보호한다 | 단순하지만 update 경합이 크다 |\n| fine-grained lock | search path 주변 node만 잠근다 | deadlock 순서와 validation이 필요하다 |\n| optimistic validation | 먼저 찾고 연결 직전에 predecessor/successor 상태를 검증한다 | retry와 starvation 가능성이 있다 |\n| lock-free design | CAS, logical mark, physical unlink로 progress를 보장한다 | ABA, memory reclamation, linearization point가 어렵다 |\n\n따라서 \"Skip List를 쓴다\"와 \"lock-free 구현을 쓴다\"는 별개의 주장이다.\n라이브러리 이름에 concurrent가 붙어 있어도 iterator, range view, compound operation의 consistency 계약은 문서로 확인해야 한다.\n\n## range scan consistency\n\nConcurrent ordered index에서 range scan은 특히 조심한다.\n\n- scan 중 insert가 들어오면 결과에 보일 수도 있고 안 보일 수도 있다\n- remove가 logical mark만 된 상태로 보일 수 있다\n- weakly consistent iterator는 snapshot isolation을 뜻하지 않는다\n- `contains` 후 `put` 같은 compound action은 별도 원자성을 보장하지 않을 수 있다\n\n정확한 snapshot이 필요하면 Skip List만으로 해결하려 하지 말고 versioning, copy-on-write, transaction boundary, external lock을 검토한다.\n\n## 운영 evidence와 stop condition\n\n도입 전에는 다음 증거를 잡는다.\n\n| 확인할 것 | 이유 |\n|---|---|\n| ordered operation 비율 | exact lookup 중심이면 과한 구조일 수 있다 |\n| update contention | pointer update retry와 lock 경합을 확인한다 |\n| range scan 길이 | 긴 scan이 writer를 방해하거나 stale view를 만들 수 있다 |\n| allocation/GC 압력 | node와 level pointer가 많이 생긴다 |\n| iterator consistency 요구 | weak consistency로 충분한지 확인한다 |\n\n다음 조건이면 Skip List 선택을 멈춘다.\n\n- 정렬/neighbor/range API가 필요 없고 exact lookup만 많다\n- deterministic worst-case latency가 강한 요구사항이다\n- snapshot range scan이 필수인데 별도 versioning 계획이 없다\n- native lock-free 구현인데 reclamation 전략을 검증하지 않았다\n- rank/select/subtree aggregate가 핵심인데 span augmentation을 설계하지 않았다\n\n## 코드로 보기\n\n```java\nimport java.util.NavigableMap;\nimport java.util.concurrent.ConcurrentSkipListMap;\n\npublic class DeadlineIndex {\n    private final NavigableMap<Long, String> tasks = new ConcurrentSkipListMap<>();\n\n    public void schedule(long deadlineMillis, String taskId) {\n        tasks.put(deadlineMillis, taskId);\n    }\n\n    public String firstReadyTask(long nowMillis) {\n        var entry = tasks.floorEntry(nowMillis);\n        return entry == null ? null : entry.getValue();\n    }\n}\n```\n\n이 코드는 라이브러리 사용 감각만 보여준다.\n실제 scheduler라면 같은 deadline 중복 key, claim 원자성, remove race, retry policy를 별도로 설계해야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Concurrent Skip List | ordered query와 concurrent update를 함께 제공한다 | allocation, pointer chasing, consistency caveat가 있다 | range/neighbor query가 기능 요구사항일 때 |\n| Concurrent Hash Map | exact lookup이 단순하고 빠르다 | 정렬 순서와 range scan이 없다 | key lookup 중심일 때 |\n| Locked TreeMap | deterministic ordered map semantics를 이해하기 쉽다 | coarse lock이면 경합이 크다 | 작은 자료구조나 낮은 write concurrency |\n| Immutable snapshot | scan consistency가 강하다 | copy/build 비용이 있다 | read-mostly snapshot 조회 |\n\n## 꼬리질문\n\n> Q: Skip List가 평균 O(log n)인 이유는?\n> 의도: probabilistic level shortcut을 이해하는지 확인\n> 핵심: 일부 node가 상위 level shortcut으로 올라가 search path를 로그 감각으로 줄인다.\n\n> Q: concurrent skip list가 lock-free라는 말은 언제 틀리나?\n> 의도: 자료구조와 구현 progress guarantee를 분리하는지 확인\n> 핵심: lock-free는 CAS/mark/unlink/reclamation 프로토콜을 갖춘 특정 구현의 성질이지 Skip List 자체의 기본 속성이 아니다.\n\n> Q: range scan에서 무엇을 확인해야 하나?\n> 의도: ordered index의 동시성 계약을 보는지 확인\n> 핵심: iterator가 snapshot인지 weakly consistent인지, scan 중 update가 결과에 어떻게 반영되는지 확인한다.\n\n## 한 줄 정리\n\nSkip List는 probabilistic ordered search 구조이고, concurrent indexing에 쓰려면 lock 방식, validation, range scan consistency, memory reclamation을 별도 설계해야 한다.\n",
   "aliases": [
-    "Skip List Concurrency Indexing 개념",
-    "Skip List Concurrency Indexing 정리",
-    "Skip List Concurrency Indexing 실수",
-    "Skip List Concurrency Indexing 판단 기준",
     "자료구조 Skip List Concurrency Indexing",
     "skip list concurrency indexing",
     "concurrent skip list primer",
@@ -17,7 +13,9 @@
     "probabilistic search index",
     "skip list not lock free by default",
     "concurrent ordered map skip list",
-    "skip list range scan caveat"
+    "skip list range scan caveat",
+    "Skip List가 자동 lock-free는 아님",
+    "동시성 ordered map으로 skip list 보기"
   ],
   "expected_queries": [
     "Skip List의 probabilistic search와 concurrent skip list 구현은 어떻게 구분해야 해?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/data-structure/skip-list-concurrency-indexing-primer.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

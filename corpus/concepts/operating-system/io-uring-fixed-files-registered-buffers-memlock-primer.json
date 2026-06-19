@@ -6,10 +6,6 @@
   "summary": "io_uring fixed files와 registered buffers는 \"빠른 fd lookup\"과 \"빠른 buffer mapping\"처럼 보이지만, 운영 관점에서는 slot ownership과 pinned-memory budget을 장기 계약으로 만드는 기능이다. fixed file slot은 connection identity가 아니라 재사용 가능한 lookup key이고, registered buffer는 provided buffer recycle과 다른 memlock/cgroup 비용을 가진다.",
   "body_markdown": "# io_uring fixed files, registered buffers, memlock primer\n\n> 한 줄 요약: `io_uring` fixed files와 registered buffers는 \"빠른 fd lookup\"과 \"빠른 buffer mapping\"처럼 보이지만, 운영 관점에서는 **slot ownership과 pinned-memory budget을 장기 계약으로 만드는 기능**이다. fixed file slot은 connection identity가 아니라 재사용 가능한 lookup key이고, registered buffer는 provided buffer recycle과 다른 memlock/cgroup 비용을 가진다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [io_uring Operational Hazards, Registered Resources, SQPOLL](./io-uring-operational-hazards-registered-resources-sqpoll.md)\n> - [io_uring Direct Descriptor Slot Reuse, files_update close_direct Timing, Lifecycle Hygiene](./io-uring-direct-descriptor-slot-reuse-files-update-close-direct-hygiene.md)\n> - [io_uring Provided Buffer Rings, Fixed Buffers, Memory Pressure](./io-uring-provided-buffers-fixed-buffers-memory-pressure.md)\n> - [io_uring Cancel Scope with Fixed Files and Mixed recv/send/poll Paths](./io-uring-cancel-scope-fixed-files-mixed-ops.md)\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n\n> retrieval-anchor-keywords: io_uring fixed files, registered buffers, memlock, RLIMIT_MEMLOCK, IORING_REGISTER_FILES, IORING_REGISTER_BUFFERS, IOSQE_FIXED_FILE, fixed file table, direct descriptor slot, registered buffer pinning, cgroup memory accounting, EMFILE, ENOMEM, EBADF, inflight completion lifetime, provided buffers wrong bucket\n\n## 보장 범위와 invariant\n\n이 primer의 ownership invariant는 하나다.\n\n`fixed resource slot`은 object identity가 아니라 **커널이 이미 참조를 잡은 이후에도 userspace table이 바뀔 수 있는 lookup boundary**다. 따라서 앱은 slot 번호, registered buffer index, logical connection, in-flight request generation을 같은 식별자로 취급하면 안 된다.\n\nfixed files는 ring 전용 file table에 fd 참조를 등록해 `IOSQE_FIXED_FILE`로 lookup 비용을 줄인다. registered buffers는 `IORING_REGISTER_BUFFERS`로 user memory range를 미리 등록해 반복 I/O마다 접근성 확인, page pin, mapping setup 비용을 줄인다. 둘 다 per-I/O overhead를 줄이지만, 둘 다 \"submit이 빠르다\" 대신 \"lifetime을 더 오래 책임진다\"는 부채를 만든다.\n\n안전한 mental model은 이렇다.\n\n- fixed file slot: 현재 slot이 어떤 file을 가리키는지 나타내는 **recyclable index**\n- registered buffer index: 어떤 memory range 안에서 fixed I/O가 허용되는지 나타내는 **pinned range handle**\n- request `user_data`: completion을 어느 logical generation에 귀속할지 나타내는 **app identity**\n- memlock/cgroup budget: fixed buffer 등록이 실패하거나 tail latency를 흔드는 **resource ceiling**\n\n## provided buffer와 다른 bucket\n\nprovided buffer ring은 recv/read completion 시점에 커널이 pool에서 buffer를 고르는 receive-side admission control에 가깝다. 반면 registered buffer는 I/O submit 전에 이미 특정 memory range를 고정해 둔다. 그래서 \"provided buffer를 크게 잡았다\"와 \"registered buffer를 많이 잡았다\"는 같은 말이 아니다.\n\nwrong-bucket 신호:\n\n- `-ENOBUFS`를 보자마자 registered buffer memlock 문제로만 본다. provided buffer pool 고갈과 fixed buffer 등록 실패는 다른 경로다.\n- `ENOMEM`을 보자마자 payload recycle leak으로만 본다. `IORING_REGISTER_BUFFERS`는 memlock 또는 cgroup accounting에 걸릴 수 있다.\n- fixed file `slot 12`를 connection id처럼 로그에 박는다. slot은 재사용될 수 있고 late CQE는 old file reference로 올 수 있다.\n- buffer unregister/update가 끝났다고 즉시 모든 in-flight I/O가 그 memory를 놓았다고 본다.\n\n## operational symptoms\n\n운영에서 fixed resource 문제가 터질 때는 에러 하나로 깔끔하게 나오지 않는다.\n\n| 증상 | 먼저 볼 invariant | 흔한 원인 |\n|---|---|---|\n| 특정 배포 노드에서만 `IORING_REGISTER_BUFFERS`가 `ENOMEM` | pinned memory budget | `RLIMIT_MEMLOCK`, privilege 차이, kernel/cgroup accounting 차이 |\n| fixed-file request가 간헐적으로 `-EBADF` | namespace mutation timing | `files_update`/`close_direct` 완료 전 새 submit 허용 |\n| late CQE가 새 connection에 붙는다 | slot identity 분리 | slot 번호만으로 routing, generation 없는 `user_data` |\n| fd 등록이 `EMFILE` 계열로 실패 | fixed file table + per-user fd limit | registered file count와 `RLIMIT_NOFILE` 계산 누락 |\n| unregister 뒤 memory pressure가 바로 안 내려간다 | inflight completion lifetime | old request가 아직 registered range를 참조 |\n\n특히 `ENOMEM`은 \"RAM이 없다\" 하나로 좁히면 위험하다. man page 기준으로 buffer registration은 memory locking limit에 걸릴 수 있고, kernel version과 worker model에 따라 memlock 대신 cgroup memory accounting으로 해석되는 환경도 있다. 같은 binary라도 container limit, capability, huge page 사용 여부, kernel feature set이 다르면 증상이 달라진다.\n\n## fixed files ownership\n\nfixed files는 `IORING_REGISTER_FILES`로 ring-private file table을 만들고, request에서 `IOSQE_FIXED_FILE`을 켜서 slot을 참조한다. 이때 slot 번호는 fd 객체가 아니다. request가 issue되며 slot lookup을 끝내면, 이후 userspace가 slot을 update하거나 close_direct로 비워도 old request는 이미 잡은 file reference로 completion될 수 있다.\n\n그래서 fixed file 운영 규칙은 다음 순서가 안전하다.\n\n1. logical generation에서 새 submit/rearm을 멈춘다.\n2. request별 `user_data`로 in-flight를 추적한다.\n3. 필요한 cancel을 보내고 target CQE를 drain한다.\n4. 그 다음 `files_update`나 `close_direct`로 slot namespace를 바꾼다.\n5. mutation completion을 확인한 뒤 userspace `slot -> owner` map을 publish한다.\n\n이 순서를 거꾸로 잡으면 slot table은 새 connection을 가리키는데 old CQE가 도착한다. 로그에서는 \"새 소켓이 이상한 데이터를 받았다\"처럼 보이지만 실제 원인은 old generation completion accounting이다.\n\n## registered buffers ownership\n\nregistered buffer는 memory range를 kernel이 장기적으로 쓸 수 있게 만든다. 사용자는 fixed read/write 계열에서 `buf_index`를 지정하고, SQE의 `addr/len`은 등록된 range 안에 있어야 한다. 따라서 registered buffer slot은 malloc/free 생명주기가 아니라 registration/unregistration 생명주기로 관리해야 한다.\n\n운영 invariant:\n\n- 등록된 range는 completion까지 안정적이어야 한다.\n- huge page를 조금만 써도 더 큰 단위가 pinning될 수 있다.\n- file-backed memory 제한, per-buffer size 제한, memlock/cgroup accounting을 배포 환경별로 확인한다.\n- zerocopy나 fixed-buffer send에서는 data CQE와 memory reuse 가능 시점이 다를 수 있다.\n\nbuffer pool allocator가 \"free list에 돌아왔다\"고 말해도, 그 말이 registered buffer unpin을 뜻하지는 않는다. free list ownership, per-I/O completion, registration lifetime은 세 층이다.\n\n## trade-offs\n\n| 선택 | 장점 | 비용 | 안전한 사용처 |\n|---|---|---|---|\n| normal fd + normal buffer | 단순하고 디버깅이 쉽다 | per-I/O lookup/mapping 비용 | 중간 규모, 운영 단순성 우선 |\n| fixed files만 사용 | fd lookup 비용 감소 | slot reuse와 cancel scope 복잡도 | hot connection set, stable lifecycle |\n| registered buffers만 사용 | 반복 buffer mapping 비용 감소 | memlock/cgroup/pinning 예산 필요 | 고정 크기 반복 I/O |\n| 둘 다 사용 | fast path 최대화 | slot, memory, completion lifetime을 모두 추적 | 성숙한 reactor와 telemetry가 있는 서버 |\n\n성능상 이득은 실제 hot path에서만 의미 있다. connection churn이 크고 payload lifetime이 들쭉날쭉하면 fixed resource가 오히려 teardown과 observability 비용을 키운다.\n\n## safe next docs\n\nslot reuse와 late CQE가 주제라면 [Direct Descriptor Slot Reuse](./io-uring-direct-descriptor-slot-reuse-files-update-close-direct-hygiene.md)로 간다. receive-side pool sizing과 `-ENOBUFS`가 주제라면 [Provided Buffer Rings, Fixed Buffers, Memory Pressure](./io-uring-provided-buffers-fixed-buffers-memory-pressure.md)로 간다. cancel scope가 헷갈리면 [Cancel Scope with Fixed Files](./io-uring-cancel-scope-fixed-files-mixed-ops.md)를 먼저 읽는다.\n\n## 한 줄 정리\n\nfixed files와 registered buffers는 `io_uring`의 빠른 길이지만, 빠른 길일수록 \"slot은 누구 것인가\", \"memory는 언제까지 pinning되는가\", \"completion은 어느 generation에 속하는가\"를 분리해서 기록해야 한다.\n",
   "aliases": [
-    "io_uring Fixed Files Registered 개념",
-    "io_uring Fixed Files Registered 정리",
-    "io_uring Fixed Files Registered 실수",
-    "io_uring Fixed Files Registered 판단 기준",
     "운영체제 io_uring Fixed Files Registered",
     "io_uring fixed files registered buffers memlock",
     "fixed file table and registered buffer budget",
@@ -17,7 +13,9 @@
     "registered resource ownership invariant",
     "RLIMIT_MEMLOCK io_uring primer",
     "fixed fd slot buffer pinning",
-    "io uring fixed files guide"
+    "io uring fixed files guide",
+    "fixed files가 memlock을 얼마나 잡아?",
+    "registered buffer pinning 비용이 궁금해"
   ],
   "expected_queries": [
     "io_uring fixed files와 registered buffers를 켤 때 memlock 예산을 어떻게 봐?",
@@ -49,12 +47,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/io-uring-fixed-files-registered-buffers-memlock-primer.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "NUMA auto balancing은 메모리를 \"자동으로 더 좋게\" 만들려는 시도지만, 워크로드에 따라 page migration과 hint fault가 오히려 지연을 키울 수 있다.",
   "body_markdown": "# NUMA Auto Balancing, Runtime Debugging\n\n> 한 줄 요약: NUMA auto balancing은 메모리를 \"자동으로 더 좋게\" 만들려는 시도지만, 워크로드에 따라 page migration과 hint fault가 오히려 지연을 키울 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [NUMA, Page Replacement, Thrashing](./memory-management-numa-page-replacement-thrashing.md)\n> - [NUMA Production Debugging](./numa-production-debugging.md)\n> - [NUMA First-Touch, Remote Memory, Locality Debugging](./numa-first-touch-remote-memory-locality-debugging.md)\n> - [AutoNUMA vs Manual Locality Trade-offs](./autonuma-vs-manual-locality-tradeoffs.md)\n> - [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)\n> - [THP, Huge Pages, TLB Latency](./thp-huge-pages-tlb-latency.md)\n> - [PSI, Pressure Stall Information, Runtime Debugging](./psi-pressure-stall-information-runtime-debugging.md)\n\n> retrieval-anchor-keywords: autoNUMA, numa balancing, numa_hint_faults, numa_pages_migrated, page migration, local memory, remote memory, memory locality\n\n## 핵심 개념\n\nNUMA auto balancing은 스레드가 실제로 많이 접근하는 메모리를 더 가까운 NUMA 노드로 옮기려는 커널 기능이다. 목적은 locality를 개선하는 것이지만, 실제로는 page migration과 hint fault가 추가 비용을 만든다.\n\n- `AutoNUMA`: 자동으로 메모리 위치를 재조정하려는 메커니즘이다\n- `hint fault`: 커널이 페이지 접근 패턴을 알아내기 위해 일부 fault를 유도하는 방식이다\n- `page migration`: 페이지를 다른 NUMA 노드로 옮기는 작업이다\n- `local memory`: 현재 CPU와 가까운 메모리다\n- `remote memory`: 다른 NUMA 노드에 있는 메모리다\n\n왜 중요한가:\n\n- CPU는 남아 보여도 remote memory 때문에 느릴 수 있다\n- AutoNUMA가 도움이 되는 서버도 있지만, latency 민감한 경로에서는 흔들릴 수 있다\n- JVM, DB, 큰 heap 서버는 locality 변화가 바로 tail latency로 드러난다\n\n이 문서는 [NUMA Production Debugging](./numa-production-debugging.md)과 [NUMA, Page Replacement, Thrashing](./memory-management-numa-page-replacement-thrashing.md)를 더 운영 관점으로 이어준다.\n\n## 깊이 들어가기\n\n### 1. AutoNUMA는 locality를 추정하는 기능이다\n\n커널은 모든 페이지의 \"정답 위치\"를 미리 알 수 없다. 그래서 접근 패턴을 보고 자주 쓰는 페이지를 더 가까운 쪽으로 옮기려 한다.\n\n- 자주 쓰는 데이터는 local memory로 옮기려 한다\n- 잘못 추정하면 migration 비용만 늘어난다\n- 짧은 생명주기의 데이터에는 오히려 불리할 수 있다\n\n### 2. page migration은 공짜가 아니다\n\n페이지를 옮기는 동안 다음 비용이 생긴다.\n\n- old page와 new page를 동시에 관리한다\n- 잠금과 복사 비용이 생긴다\n- fault와 migration이 tail latency를 만들 수 있다\n\n즉 AutoNUMA는 \"더 가까이 배치\"라는 이득과 \"옮기느라 드는 비용\"을 같이 봐야 한다.\n\n### 3. hint fault는 관찰을 위한 비용이다\n\n커널은 실제 접근을 추적하기 위해 hint fault를 사용한다. 이 과정은 locality 판단에는 좋지만, 애플리케이션 관점에서는 추가 fault처럼 보인다.\n\n### 4. 모든 워크로드가 AutoNUMA에 잘 맞지는 않는다\n\n- 대형 JVM heap\n- 대용량 DB buffer pool\n- CPU affinity가 강한 서버\n- 짧고 bursty한 요청이 많은 API\n\n이런 경우는 auto balancing이 이득보다 변동성을 더 키울 수 있다.\n\n## Playbook 역할\n\n### 재현 조건\n\n- CPU 사용률은 여유가 있는데 특정 요청이나 worker의 p99가 흔들린다\n- `numa_hint_faults`, `numa_pages_migrated`, remote memory 비율이 spike 구간과 같이 움직인다\n- worker affinity, cpuset, first-touch 정책을 바꾼 뒤 latency 특성이 달라진다\n\n### 확인 순서\n\n1. `numastat -p <pid>`로 local/remote memory 비율을 본다.\n2. `/proc/<pid>/numa_maps`에서 hot mapping이 어느 node에 놓였는지 확인한다.\n3. `/proc/vmstat`의 NUMA hint fault와 migration counter를 spike 전후 delta로 비교한다.\n4. AutoNUMA를 끄고 켜는 실험은 동일 부하와 짧은 관찰 창에서 비교하며, manual placement와 함께 검증한다.\n\n### Failure Matrix\n\n| 관찰 | 더 가까운 원인 | 다음 확인 |\n|------|----------------|-----------|\n| remote memory가 높고 migration은 낮음 | 배치/first-touch 문제 | cpuset, `numactl`, warm-up 위치 |\n| migration과 hint fault가 높고 p99가 흔들림 | AutoNUMA 비용이 이득보다 큼 | AutoNUMA off 실험, affinity 고정 |\n| worker를 늘릴수록 remote access 증가 | thread migration과 locality 붕괴 | CPU migration, run queue, cpuset 폭 |\n| 한 node만 memory pressure 높음 | NUMA-local reclaim 또는 imbalance | node별 free/cache, `numastat` |\n\n### 검증\n\nlocal memory 비율이 좋아졌다는 사실만으로 성공 판단을 끝내지 않는다. migration delta, p99, throughput, CPU migration, GC pause나 DB stall을 같은 구간에서 비교해야 AutoNUMA가 실제로 이득인지 알 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: CPU 사용률은 낮은데 p99가 흔들린다\n\n가능한 원인:\n\n- remote memory access가 많다\n- AutoNUMA migration이 계속 일어난다\n- hot page가 잘못된 NUMA 노드에 있다\n\n진단:\n\n```bash\nnumastat -p <pid>\ncat /proc/<pid>/numa_maps | head\ncat /proc/vmstat | grep -E 'numa_hint_faults|numa_pages_migrated'\n```\n\n### 시나리오 2: 워커를 늘렸더니 오히려 느려졌다\n\n가능한 원인:\n\n- 스레드가 다른 소켓 사이를 오간다\n- 메모리 locality가 깨진다\n- migration이 캐시 locality까지 흔든다\n\n### 시나리오 3: 특정 시간대에만 간헐적 지연이 보인다\n\n가능한 원인:\n\n- AutoNUMA의 재배치 주기와 부하가 겹친다\n- background migration이 burst와 충돌한다\n- page fault와 reclaim이 함께 흔들린다\n\n이 경우는 [Major, Minor Page Faults, Runtime Diagnostics](./major-minor-page-faults-runtime-diagnostics.md)와 같이 본다.\n\n## 코드로 보기\n\n### AutoNUMA 관련 상태 확인\n\n```bash\ncat /proc/sys/kernel/numa_balancing\nnumactl --show\n```\n\n### 프로세스별 locality 확인\n\n```bash\ncat /proc/<pid>/numa_maps | sed -n '1,20p'\nnumastat -p <pid>\n```\n\n### migration 감각을 보는 의사 코드\n\n```text\naccess pattern observed\n  -> hot pages estimated\n  -> page migration scheduled\n  -> locality improves or extra stall appears\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| AutoNUMA on | locality 개선 가능 | migration 비용이 든다 | locality가 중요한 대형 서버 |\n| AutoNUMA off | 예측 가능성이 높다 | remote memory를 방치할 수 있다 | latency 민감 경로 |\n| manual placement | 제어가 정밀하다 | 운영 복잡도 높다 | DB/JVM 핵심 서버 |\n\n## 꼬리질문\n\n> Q: AutoNUMA는 항상 좋은가요?\n> 핵심: 항상 좋지 않다. 잘못된 migration은 오히려 지연을 키운다.\n\n> Q: hint fault는 왜 생기나요?\n> 핵심: 커널이 실제 접근 패턴을 학습하기 위해서다.\n\n> Q: NUMA 문제를 CPU 문제와 어떻게 구분하나요?\n> 핵심: CPU는 남아 있는데 remote memory와 page migration이 늘면 NUMA를 의심한다.\n\n## 한 줄 정리\n\nNUMA auto balancing은 locality를 개선하려는 기능이지만, production에서는 migration 비용과 hint fault 때문에 오히려 tail latency를 흔들 수 있다.\n",
   "aliases": [
-    "NUMA Auto Balancing Runtime 개념",
-    "NUMA Auto Balancing Runtime 정리",
-    "NUMA Auto Balancing Runtime 실수",
-    "NUMA Auto Balancing Runtime 판단 기준",
     "운영체제 NUMA Auto Balancing Runtime",
     "NUMA auto balancing debugging",
     "automatic NUMA balancing",
@@ -17,7 +13,9 @@
     "page migration latency",
     "remote memory access",
     "autonuma runtime",
-    "numa autobalancing runtime debugging guide"
+    "numa autobalancing runtime debugging guide",
+    "AutoNUMA가 오히려 latency를 올려",
+    "hint fault가 page migration을 부를 때"
   ],
   "expected_queries": [
     "NUMA auto balancing은 항상 memory locality를 좋게 만들어?",
@@ -46,12 +44,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/numa-autobalancing-runtime-debugging.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

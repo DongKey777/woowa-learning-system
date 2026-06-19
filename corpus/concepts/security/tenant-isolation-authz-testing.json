@@ -7,17 +7,15 @@
   "body_markdown": "# Tenant Isolation / AuthZ Testing\n\n> 한 줄 요약: tenant isolation 테스트는 \"한 테넌트의 권한이 다른 테넌트로 새지 않는가\"를 시스템적으로 검증하는 보안 테스트다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Permission Checks In REST Flows](./permission-checks-rest-flows-primer.md)\n- [Role vs Scope vs Ownership Primer](./role-vs-scope-vs-ownership-primer.md)\n- [IDOR / BOLA Patterns and Fixes](./idor-bola-patterns-and-fixes.md)\n- [Delegated Admin / Tenant RBAC](./delegated-admin-tenant-rbac.md)\n- [PDP / PEP Boundaries Design](./pdp-pep-boundaries-design.md)\n- [Permission Model Drift / AuthZ Graph Design](./permission-model-drift-authz-graph-design.md)\n- [Authorization Caching / Staleness](./authorization-caching-staleness.md)\n- [Authorization Graph Caching](./authorization-graph-caching.md)\n- [Audit Logging for Auth / AuthZ Traceability](./audit-logging-auth-authz-traceability.md)\n- [System Design: Auth Session Troubleshooting Bridge](../system-design/README.md#system-design-auth-session-troubleshooting-bridge)\n\nretrieval-anchor-keywords: tenant isolation, authz testing, owner mismatch, tenant mismatch, controller test, service test, integration test, cross-tenant access, ownership, tenant boundary, negative test, 로그인 됐는데 왜 403, 같은 테넌트인데 남의 주문, 다른 테넌트 주문 차단, 처음 배우는 tenant test\n\n---\n\n## 핵심 개념\n\ntenant isolation은 multi-tenant 시스템에서 가장 중요한 보안 경계 중 하나다.\nauthz testing은 이 경계가 코드, API, cache, BFF, admin tooling에서 모두 지켜지는지 검증한다.\n\n핵심 목표:\n\n- 다른 tenant의 데이터가 보이지 않는가\n- 다른 tenant의 객체를 수정할 수 없는가\n- delegated admin이 범위를 넘지 않는가\n- cache가 tenant를 섞지 않는가\n\n즉 테스트는 기능 확인이 아니라 경계 붕괴를 잡아내는 도구다.\n\n초보자 기준으로는 먼저 둘을 나눠 기억하면 된다.\n\n- `owner mismatch`: 같은 tenant 안이지만 `내 객체가 아닌데` 접근하는 경우\n- `tenant mismatch`: 객체 자체가 아예 `다른 tenant 것`인 경우\n\n`owner mismatch`는 object-level 권한 누락을 잡는 테스트고, `tenant mismatch`는 tenant boundary 붕괴를 잡는 테스트다.\n\n---\n\n## 30초 구분표: deny test 3종\n\n한 번에 다 외우려 하지 말고, 아래 표로 \"어느 층에서 무엇을 막는지\"만 먼저 고정하면 된다.\n\n| test 층 | 무엇을 빠르게 확인하나 | `owner mismatch` 예시 | `tenant mismatch` 예시 | 보통 보는 응답/예외 |\n|---|---|---|---|---|\n| controller | route에서 잘못된 id 요청이 바로 거부되는가 | `GET /orders/{id}`에서 같은 tenant 남의 주문 조회 | header의 active tenant는 A인데 주문은 tenant B 것 | `403` 또는 concealment 정책이면 `404` |\n| service | 핵심 비즈니스 규칙이 HTTP 밖에서도 유지되는가 | `cancelOrder(actor, orderId)`에서 actor가 owner가 아님 | actor membership는 tenant A인데 order는 tenant B 소속 | `AccessDeniedException` 같은 도메인 예외 |\n| integration | filter, repo, cache, 메시지 흐름까지 tenant 경계가 안 새는가 | list/search가 남의 row를 섞어 줌 | async export나 cache key가 tenant B 데이터를 포함 | API deny, 빈 목록, output 검증 실패 |\n\n표를 짧게 읽는 법:\n\n- controller test는 `입구에서 거부되는가`\n- service test는 `핵심 규칙이 직접 호출에도 버티는가`\n- integration test는 `저장소, cache, 비동기 경로까지 안 새는가`\n\n## 자주 헷갈리는 지점\n\n### 1. `owner mismatch`와 `tenant mismatch`는 대체재가 아니다\n\n둘 다 deny여도 실패 이유가 다르다.\n\n- `owner mismatch`: 같은 tenant 안에서 object rule이 틀림\n- `tenant mismatch`: tenant selection, membership, query scope 자체가 틀림\n\n예를 들어 tenant A의 support user가 tenant A 주문은 보되 자기 담당 고객 주문만 수정 가능하다면:\n\n- 남의 담당 주문 수정 실패는 `owner mismatch`\n- tenant B 주문 조회 시도 실패는 `tenant mismatch`\n\n### 2. positive test보다 negative test가 중요하다\n\n보안 테스트는 \"되는가\"보다 \"안 되는가\"를 먼저 본다.\n\n- 다른 tenant resource 접근이 거부되는가\n- 같은 tenant라도 남의 객체 수정이 거부되는가\n- cross-tenant list가 비어 있는가\n- delegated admin이 tenant scope를 넘지 않는가\n\n### 3. same user, different tenant를 따로 만들어야 한다\n\n같은 사용자라도 tenant가 바뀌면 권한이 달라질 수 있다.\n\n- membership\n- role\n- delegated access\n- policy version\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: order API가 다른 tenant 데이터를 반환함\n\n대응:\n\n- tenant-specific test fixture를 만든다\n- owner와 tenant 둘 다 검증한다\n- list/detail/update/delete 모두 테스트한다\n\n### 시나리오 2: export job이 cross-tenant 데이터를 포함함\n\n대응:\n\n- async job에도 tenant context를 전달한다\n- output artifact를 검사한다\n- queue message에 tenant id를 명시한다\n\n### 시나리오 3: cache 때문에 이전 tenant 권한이 남음\n\n대응:\n\n- policy version을 바꾸는 negative test를 넣는다\n- cache invalidation 후 거부되는지 본다\n- delegated admin revoke나 tenant ownership move 뒤 graph invalidation 전후를 모두 검증한다\n- stale decision을 metric으로 잡는다\n\nrelationship-based authz를 쓰면 cache test는 decision TTL 확인으로 끝나지 않는다.\ntenant ownership edge나 delegated admin scope가 바뀐 뒤 PDP snapshot과 각 PEP cache가 함께 수렴하는지까지 봐야 한다.\n이 운영 경계는 [PDP / PEP Boundaries Design](./pdp-pep-boundaries-design.md)과 [Authorization Graph Caching](./authorization-graph-caching.md) 문맥이다.\n\n---\n\n## 코드로 보기\n\n### 1. controller: tenant mismatch deny\n\n```java\n@Test\nvoid getOrder_rejectsTenantMismatch() throws Exception {\n    mockMvc.perform(get(\"/orders/{id}\", tenantBOrderId)\n            .header(\"X-Tenant-Id\", TENANT_A)\n            .with(user(tenantAUser)))\n        .andExpect(status().isForbidden());\n}\n```\n\n### 2. service: owner mismatch deny\n\n```java\n@Test\nvoid cancelOrder_rejectsOwnerMismatch() {\n    assertThatThrownBy(() -> orderService.cancelOrder(tenantAUser, sameTenantOtherOwnerOrderId))\n        .isInstanceOf(AccessDeniedException.class);\n}\n```\n\n### 3. integration: tenant filter 누락 방지\n\n```java\n@Test\nvoid listOrders_returnsOnlyActiveTenantRows() {\n    List<Order> orders = orderQueryService.listOrders(tenantAUser, TENANT_A);\n\n    assertThat(orders)\n        .extracting(Order::tenantId)\n        .containsOnly(TENANT_A);\n    assertThat(orders)\n        .extracting(Order::id)\n        .doesNotContain(tenantBOrderId);\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| unit-only authz test | 빠르다 | 경계 누락을 놓칠 수 있다 | 보조 수단 |\n| integration authz test | 현실적이다 | 느리다 | 핵심 경계 |\n| end-to-end tenant test | 가장 믿음직하다 | 유지비가 높다 | 중요한 경로 |\n| negative-only suite | 보안 경계에 강하다 | 기능 coverage가 부족할 수 있다 | 보안 우선 |\n\n판단 기준은 이렇다.\n\n- tenant boundary가 중요한가\n- cache와 async path가 포함되는가\n- BFF나 admin tool이 섞이는가\n- negative test를 자동화할 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: tenant isolation 테스트에서 가장 중요한 것은 무엇인가요?\n> 의도: 경계 붕괴를 검증하는 관점을 아는지 확인\n> 핵심: 다른 tenant 데이터가 새지 않는지 보는 것이다.\n\n> Q: negative test가 왜 중요한가요?\n> 의도: 보안 테스트의 특성을 아는지 확인\n> 핵심: 안 되는 요청이 실제로 거부되는지 확인해야 하기 때문이다.\n\n> Q: cache와 async job도 왜 테스트해야 하나요?\n> 의도: hidden path를 아는지 확인\n> 핵심: 경계가 그 경로에서 깨질 수 있기 때문이다.\n\n> Q: same user, different tenant를 왜 따로 보나요?\n> 의도: 멤버십과 권한 분리 이해 확인\n> 핵심: 같은 사람이라도 tenant마다 권한이 다를 수 있기 때문이다.\n\n## 한 줄 정리\n\ntenant isolation authz testing은 cross-tenant access가 코드와 비동기 경로에서 모두 차단되는지 검증하는 보안 테스트다.\n",
   "aliases": [
     "로그인 됐는데 왜 403",
-    "Tenant Isolation / AuthZ 개념",
-    "Tenant Isolation / AuthZ 정리",
-    "Tenant Isolation / AuthZ 실수",
-    "Tenant Isolation / AuthZ 판단 기준",
     "tenant isolation",
     "authz testing",
     "owner mismatch",
     "tenant mismatch",
     "controller test",
     "service test",
-    "integration test"
+    "integration test",
+    "다른 테넌트 데이터가 보이면 안 돼요",
+    "owner mismatch를 테스트에서 잡고 싶어요"
   ],
   "expected_queries": [
     "한 테넌트 사용자가 다른 테넌트 예약이나 주문을 못 보게 하는 테스트를 어떻게 짜?",
@@ -45,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/security/tenant-isolation-authz-testing.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch161"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "kworker saturation은 커널의 deferred work가 밀리는 상태라서, 유저 CPU가 아니라 커널 worker backlog와 softirq 후속 처리를 봐야 한다.",
   "body_markdown": "# Kworker Saturation, Runtime Diagnostics\n\n> 한 줄 요약: kworker saturation은 커널의 deferred work가 밀리는 상태라서, 유저 CPU가 아니라 커널 worker backlog와 softirq 후속 처리를 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Workqueues, Kthreads, Debugging](./workqueues-kthreads-debugging.md)\n> - [Softirq, Hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)\n> - [kswapd vs Direct Reclaim, Latency](./kswapd-vs-direct-reclaim-latency.md)\n> - [CPU Affinity, IRQ Affinity, Core Locality](./cpu-affinity-irq-affinity-core-locality.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n\n> retrieval-anchor-keywords: kworker saturation, workqueue backlog, worker threads, kworker, deferred work, /sys/kernel/debug/workqueue, kernel backlog, saturation\n\n## 핵심 개념\n\nkworker는 커널 workqueue의 실제 실행자다. 이들이 포화되면 deferred work가 밀려서 I/O completion, reclaim, filesystem maintenance 같은 작업이 늦어진다.\n\n- `kworker`: workqueue를 처리하는 커널 worker다\n- `backlog`: 아직 실행되지 못한 work item이다\n- `deferred work`: 즉시 처리하지 않고 뒤로 넘긴 커널 작업이다\n\n왜 중요한가:\n\n- user-space CPU가 낮아도 시스템이 느릴 수 있다\n- kworker가 밀리면 커널 내부 후속 작업이 전부 늦어진다\n- 특정 호스트에서만 latency가 흔들리는 원인이 될 수 있다\n\n이 문서는 [Workqueues, Kthreads, Debugging](./workqueues-kthreads-debugging.md)을 saturation 관점으로 좁힌다.\n\n## 깊이 들어가기\n\n### 1. kworker는 커널의 뒤처리 담당이다\n\n커널은 오래 걸리는 작업을 workqueue에 넘긴다.\n\n- flush\n- reclaim 보조\n- filesystem deferred work\n- device-related follow-up\n\n### 2. saturation은 backlog, CPU 시간, 지연 상관관계로 좁힌다\n\n커널과 배포판 설정에 따라 workqueue 내부 상태를 직접 읽는 방법은 다르다. 그래서 \"kworker가 보인다\"만으로 결론 내리지 말고, 같은 시간대의 관찰 증거를 맞춘다.\n\n- `ps`/`top -H`에서 특정 `kworker/*`가 지속적으로 CPU를 쓴다\n- `perf top`/`perf record -g`에서 filesystem, block, network, reclaim 관련 kernel symbol이 같이 보인다\n- `iostat`, PSI, application p99가 같은 창에서 흔들린다\n- debugfs workqueue 통계나 ftrace workqueue event가 가능한 환경이면 enqueue/execute 간격을 본다\n\n### 3. CPU affinity와도 연결된다\n\nworker가 특정 코어에 몰리면 hot core가 생길 수 있다.\n\n### 4. kworker 포화는 증상이 더 늦게 보일 수 있다\n\n유저 스레드는 멀쩡해 보여도 커널 후속 작업이 밀리면 전체 tail latency가 나빠진다.\n\n## 실전 시나리오\n\n### 시나리오 1: I/O 후속 처리가 늦는다\n\n가능한 원인:\n\n- kworker backlog가 쌓였다\n- deferred flush가 밀린다\n- workqueue가 포화됐다\n\n진단:\n\n```bash\nps -eLo pid,tid,psr,comm | grep kworker | head\nmount | grep debugfs || sudo mount -t debugfs none /sys/kernel/debug\nls /sys/kernel/debug/workqueue 2>/dev/null\nperf top -g\n```\n\n### 시나리오 2: 배치/리클레임 이후 시스템이 굼뜨다\n\n가능한 원인:\n\n- reclaim 관련 work가 폭주\n- kworker가 CPU를 확보하지 못함\n- softirq 이후 작업이 밀림\n\n### 시나리오 3: 특정 코어만 busy하다\n\n가능한 원인:\n\n- worker affinity가 나쁘다\n- IRQ와 worker가 같은 코어에 몰린다\n- cache locality는 좋아도 load balance가 깨진다\n\n## 운영 Playbook\n\n### 재현 조건\n\n- 장애 시간대의 user CPU가 낮거나 애매한데 p99, fsync, I/O completion, reclaim 지표가 같이 나빠진다.\n- 같은 workload를 낮은 동시성으로 돌리면 사라지고, burst나 특정 디바이스/파일시스템 작업에서 재현된다.\n- container 안보다 host에서 `kworker/*`, softirq, block I/O 지표가 더 뚜렷하게 보인다.\n\n### 확인 순서\n\n1. `pidstat -u -t 1`, `top -H`, `ps -eLo pid,tid,psr,stat,comm`으로 kworker CPU와 CPU placement를 본다.\n2. `iostat -x 1`, `cat /proc/pressure/{cpu,io,memory}`로 user latency와 커널 압박이 같은 시간대인지 맞춘다.\n3. 가능하면 `perf top -g` 또는 짧은 `perf record -g -a -- sleep 10`으로 어떤 kernel path가 시간을 쓰는지 본다.\n4. debugfs/ftrace가 허용되면 `/sys/kernel/debug/workqueue`와 workqueue tracepoint로 enqueue/execute 지연을 확인한다.\n5. IRQ/softirq 쪽이면 `/proc/interrupts`, `/proc/softirqs`, NIC queue affinity까지 이어서 본다.\n\n### Failure Matrix\n\n| 관찰 | 더 가능성 높은 bucket | 다음 확인 |\n|------|----------------------|-----------|\n| `kworker` CPU 높고 block/fs symbol이 많다 | writeback/fs deferred work | dirty/writeback, fsync p99, storage queue |\n| `kworker`보다 `ksoftirqd`가 높다 | softirq saturation | `/proc/softirqs`, NIC drops, IRQ affinity |\n| `kswapd`/direct reclaim이 같이 보인다 | memory reclaim | PSI memory, major fault, cgroup memory events |\n| user thread CPU가 대부분이다 | app hot path | profiler/flamegraph 우선 |\n| 특정 CPU만 바쁘다 | affinity/locality skew | `psr`, `/proc/interrupts`, cpuset/cgroup affinity |\n\n### 검증\n\n튜닝 후에는 kworker CPU가 줄었다는 사실보다 tail latency와 원인 지표가 함께 내려갔는지 본다. 예를 들어 IRQ affinity를 바꿨다면 softirq 분포와 p99가 같이 안정돼야 하고, writeback을 조절했다면 dirty/writeback burst와 fsync tail이 같이 줄어야 한다.\n\n## 코드로 보기\n\n### kworker 관찰\n\n```bash\nps -eLo pid,tid,psr,comm | grep kworker | head\n```\n\n### workqueue 감각\n\n```text\nkernel event\n  -> queued as deferred work\n  -> kworker executes later\n  -> if backlog grows, completion latency increases\n```\n\n### 주의할 점\n\n`/sys/kernel/debug/workqueue`와 tracepoint는 커널 설정, debugfs mount, 권한에 따라 보이지 않을 수 있다. 그런 환경에서는 `perf`, PSI, block/network 지표, kworker thread CPU를 시간축으로 맞춰 간접 증거를 쌓는다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| workqueue 사용 | 즉시 경로를 짧게 한다 | backlog가 생길 수 있다 | 일반 kernel deferred work |\n| worker 분산 | 포화를 줄일 수 있다 | locality가 깨질 수 있다 | 고트래픽 host |\n| affinity 고정 | 예측성이 좋아진다 | hot core 위험 | latency tuning |\n\n## 꼬리질문\n\n> Q: kworker saturation은 왜 문제인가요?\n> 핵심: 커널이 뒤에서 해야 할 일이 밀려 전체 latency가 늘기 때문이다.\n\n> Q: user-space CPU가 낮은데도 왜 느릴 수 있나요?\n> 핵심: 커널 deferred work가 병목일 수 있다.\n\n> Q: 어디를 먼저 보나요?\n> 핵심: `kworker` 개수와 backlog, 그리고 IRQ/softirq 분포를 본다.\n\n## 한 줄 정리\n\nkworker saturation은 커널 후속 작업이 밀려 생기는 숨은 병목이므로, 유저 CPU보다 workqueue backlog와 worker 배치를 봐야 한다.\n",
   "aliases": [
-    "Kworker Saturation Runtime Diagnostics 개념",
-    "Kworker Saturation Runtime Diagnostics 정리",
-    "Kworker Saturation Runtime Diagnostics 실수",
-    "Kworker Saturation Runtime Diagnostics 판단 기준",
     "운영체제 Kworker Saturation Runtime Diagnostics",
     "kworker saturation",
     "kernel worker backlog",
@@ -17,7 +13,8 @@
     "deferred work saturation",
     "softirq follow-up work",
     "kworker p99 latency",
-    "kworker saturation runtime diagnostics guide"
+    "kworker backlog가 p99를 올릴 때",
+    "user CPU는 낮은데 worker가 밀려"
   ],
   "expected_queries": [
     "kworker saturation은 user CPU 사용률이 아니라 kernel worker backlog를 봐야 해?",
@@ -44,12 +41,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/kworker-saturation-runtime-diagnostics.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

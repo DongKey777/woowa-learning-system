@@ -6,10 +6,6 @@
   "summary": "accept()가 EMFILE로 실패하면 이미 새 client socket을 받을 fd 슬롯이 없다는 뜻이므로, reserve fd로 숨 쉴 공간을 만들고 listener를 잠깐 진정시킨 뒤 limit 계층과 fd 증가 원인을 분리해야 한다.",
   "body_markdown": "# File Descriptor Exhaustion Accept EMFILE Playbook\n\n> 한 줄 요약: `accept()`가 `EMFILE`로 실패하면 이미 새 client socket을 받을 fd 슬롯이 없다는 뜻이므로, reserve fd로 숨 쉴 공간을 만들고 listener를 잠깐 진정시킨 뒤 limit 계층과 fd 증가 원인을 분리해야 한다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [File Descriptor Ulimit Interview Router](./file-descriptor-ulimit-interview-router.md)\n- [File Descriptor Leak Symptom Router](./file-descriptor-leak-symptom-router.md)\n- [File Descriptor vs Ephemeral Port Exhaustion Chooser](./file-descriptor-ephemeral-port-exhaustion-chooser.md)\n- [Container FD Pressure Bridge](./container-fd-pressure-emfile-enfile-bridge.md)\n- [RLIMIT NOFILE, NPROC Governance](./rlimit-nofile-nproc-governance.md)\n\nretrieval-anchor-keywords: accept EMFILE, accept4, reserve fd trick, RLIMIT_NOFILE, LimitNOFILE, ENFILE, too many open files, fd exhaustion, listener recovery, open file limit hierarchy\n\n## 이 문서의 좁은 역할\n\n기존 router 문서들은 `Too many open files`를 어디로 분기할지 설명한다. 이 문서는 production listener가 이미 `accept()` 실패를 내고 있을 때의 회복 절차에 집중한다. 목표는 장애 중 새 연결을 더 망가뜨리지 않으면서 원인 증거를 보존하는 것이다.\n\nLinux에서 `RLIMIT_NOFILE`은 프로세스가 열 수 있는 fd 번호의 상한을 정한다. `open()`, `socket()`, `accept()` 같은 호출은 프로세스 한도에 닿으면 `EMFILE`, 시스템 전체 open file 한도에 닿으면 `ENFILE`을 반환할 수 있다. 따라서 accept loop의 첫 질문은 \"이 프로세스가 꽉 찼나, 호스트 전체가 꽉 찼나\"다.\n\n## 장애 중 즉시 확인\n\n가장 먼저 로그와 카운터를 시간축으로 묶는다.\n\n```bash\ndate\ncat /proc/<pid>/limits | grep -i \"open files\"\nls /proc/<pid>/fd | wc -l\nlsof -p <pid> | awk 'NR>1 {count[$5]++} END {for (t in count) print count[t], t}' | sort -nr\ncat /proc/sys/fs/file-nr\ncat /proc/sys/fs/file-max\n```\n\n애플리케이션 metric도 같은 창에서 본다.\n\n```text\naccept error count by errno\nopen/socket/connect error count by errno\ncurrent open fd count\naccepted connection count\nactive connection, idle connection, close rate\nlistener backlog overflow 또는 accept queue 관련 지표\nprocess restart count\n```\n\n`EMFILE`이면 같은 프로세스의 `/proc/<pid>/fd`와 `Max open files`를 먼저 본다. `ENFILE`이면 단일 프로세스보다 host file table, 여러 서비스의 동시 실패, container와 host 관측 차이를 같이 본다.\n\n## reserve fd trick의 목적\n\naccept loop가 fd를 모두 써버리면 오류를 기록하거나 health endpoint를 처리하거나 한 연결을 정리하는 작업조차 fd 부족에 막힐 수 있다. 그래서 서버 시작 시 `/dev/null` 같은 안전한 파일을 하나 열어 reserve fd로 보관해 둔다. `accept()`가 `EMFILE`을 반환하면 이 reserve fd를 닫아 fd 슬롯 하나를 임시로 만들고, backlog에 이미 들어온 연결 하나를 `accept()`한 뒤 즉시 close하여 client가 무한 대기하지 않게 한다. 그다음 reserve fd를 다시 열고, listener read 이벤트를 잠깐 비활성화하거나 짧은 backoff를 둔다.\n\n개념 흐름은 아래와 같다.\n\n```text\nstartup:\n  reserve_fd = open(\"/dev/null\")\n\naccept loop:\n  fd = accept4(listener, SOCK_NONBLOCK | SOCK_CLOEXEC)\n  if fd >= 0:\n    handle(fd)\n  if errno == EMFILE:\n    close(reserve_fd)\n    tmp = accept4(listener, SOCK_NONBLOCK | SOCK_CLOEXEC)\n    if tmp >= 0:\n      close(tmp)\n    reserve_fd = open(\"/dev/null\")\n    pause_accept_events_briefly()\n```\n\n이 패턴은 근본 해결이 아니다. 목적은 overload 상태에서 무한 busy loop, backlog 고착, 로그 폭주를 줄이고 운영자가 원인을 볼 시간을 버는 것이다. reserve fd를 여러 개 두거나 정상 요청 처리를 계속 밀어 넣는 식으로 쓰면 장애를 숨길 수 있다.\n\n## accept loop에서 조심할 점\n\nLinux의 `accept()`는 새 socket을 반환하고, 실패하면 `errno`로 원인을 알려준다. `accept4()`를 쓰면 `SOCK_NONBLOCK`, `SOCK_CLOEXEC`를 새 fd에 직접 붙일 수 있다. 새 accepted socket이 listening socket의 file status flag를 그대로 상속한다고 가정하지 말고, nonblocking과 close-on-exec 정책은 명시적으로 잡는다.\n\n`epoll` 또는 `poll`이 readable을 알려도 실제 `accept()` 시점에는 다른 thread가 먼저 가져갔거나 네트워크 오류로 대기 연결이 없어졌을 수 있다. 따라서 nonblocking listener에서 `EAGAIN`/`EWOULDBLOCK`은 정상 종료 조건으로 다루고, `EMFILE`은 별도 회복 경로로 다룬다. `EMFILE`에서 즉시 tight retry를 돌면 CPU와 로그만 태운다.\n\n## limit hierarchy\n\n운영에서는 shell에서 본 `ulimit -n` 하나만으로 결론내리지 않는다.\n\n| 계층 | 확인 대상 | 흔한 함정 |\n|---|---|---|\n| process | `/proc/<pid>/limits`, `/proc/<pid>/fd` | 배포 shell의 ulimit과 실제 service limit이 다름 |\n| service manager | systemd `LimitNOFILE=`, default limit | unit override 후 daemon-reload/restart 누락 |\n| container runtime | container/pod nofile 설정 | container 안과 host pid 관측이 다름 |\n| host-wide | `/proc/sys/fs/file-nr`, `/proc/sys/fs/file-max` | 단일 앱은 여유 있어도 node 전체가 `ENFILE` 후보 |\n| application | pool size, keep-alive, timeout, close path | limit 상향이 leak를 숨김 |\n\n`LimitNOFILE`이나 container limit 상향은 headroom 완화다. fd count slope가 계속 증가하면 장애 시점만 늦춘 것이므로, 수정 여부는 slope와 fd type mix로 검증한다.\n\n## 원인 분기\n\n| 관찰 | 먼저 의심 | 다음 액션 |\n|---|---|---|\n| fd count가 `Max open files`에 단조 증가 | fd leak 또는 connection lifecycle 누락 | `lsof` type diff, recent deploy, close path |\n| `IPv4/IPv6` fd가 traffic 종료 후에도 안 줄어듦 | accepted socket close 누락, slow client, keep-alive 과다 | active/idle, read timeout, connection max age |\n| `CLOSE_WAIT`가 많음 | peer close 후 local close 누락 | response body/stream close 경로 |\n| `REG` 또는 `(deleted)`가 많음 | file stream/log rotation fd 유지 | logger reopen, try-with-resources |\n| 여러 프로세스가 동시에 실패 | host-wide `ENFILE` 또는 node pressure | top fd holders, file table metric |\n| fd count는 낮은데 outbound 실패가 많음 | ephemeral port/conntrack 쪽 가능성 | `ss`, `EADDRNOTAVAIL`, port range 문서로 분기 |\n\n## safe recovery playbook\n\n1. accept error를 errno별로 계측한다. `EMFILE`과 `ENFILE`을 같은 \"too many open files\" 문자열로만 저장하지 않는다.\n2. reserve fd 회복 경로가 있으면 작동 여부를 확인한다. 없으면 긴급 패치보다 restart와 traffic drain이 더 안전한지 판단한다.\n3. listener를 잠깐 backoff한다. readiness를 내리거나 load balancer에서 인스턴스를 빼서 새 연결 유입을 줄인다.\n4. `/proc/<pid>/fd`와 `lsof`를 두 번 찍어 slope와 type mix를 확보한다.\n5. headroom이 낮다면 `LimitNOFILE`, container limit, process soft/hard limit 상향과 재시작 계획을 세운다.\n6. leak나 lifecycle 누락이면 code path를 고친다. HTTP response body, file stream, DB connection, subprocess pipe, epoll registration cleanup을 본다.\n7. 완화 후 fd count가 plateau를 만드는지, accept error가 사라지는지, backlog와 timeout이 내려가는지 확인한다.\n\n## 과잉 결론 방지\n\n- `EMFILE`은 socket, pipe, eventfd, epoll fd까지 포함한 process fd 한도 신호다.\n- `ENFILE`은 host-wide open file pressure 후보라 관측 범위가 다르다.\n- limit 상향은 leak 수정이 아니다. 증가율이 그대로면 다시 장애가 난다.\n- `TIME_WAIT`가 많다는 이유만으로 fd leak라고 단정하지 않는다.\n- reserve fd trick은 처리 능력 증가가 아니라 accept loop 안전장치다.\n\n## 검증 기준\n\n성공 조건은 단순히 재시작 후 로그가 조용해진 것이 아니다.\n\n- `accept()`/`accept4()`의 `EMFILE` 또는 `ENFILE` 카운터가 0으로 돌아왔는가.\n- `/proc/<pid>/fd` 증가 slope가 traffic 안정화 뒤 plateau를 만드는가.\n- fd type mix에서 문제 유형이 줄었는가.\n- listener backlog, pending connection, timeout rate가 같이 내려갔는가.\n- limit 상향 뒤에도 host-wide `file-nr`와 다른 서비스 영향이 안전한가.\n\n## Primary Sources\n\n- [`getrlimit(2)` Linux manual page](https://www.man7.org/linux/man-pages/man2/getrlimit.2.html)\n- [`open(2)` Linux manual page](https://man7.org/linux/man-pages/man2/open.2.html)\n- [`accept(2)` Linux manual page](https://man7.org/linux/man-pages/man2/accept.2.html)\n- [`socket(2)` Linux manual page](https://man7.org/linux/man-pages/man2/socket.2.html)\n- [`epoll(7)` Linux manual page](https://man7.org/linux/man-pages/man7/epoll.7.html)\n",
   "aliases": [
-    "File Descriptor Exhaustion Accept 개념",
-    "File Descriptor Exhaustion Accept 정리",
-    "File Descriptor Exhaustion Accept 실수",
-    "File Descriptor Exhaustion Accept 판단 기준",
     "운영체제 File Descriptor Exhaustion Accept",
     "accept EMFILE recovery playbook",
     "reserve fd trick",
@@ -17,7 +13,9 @@
     "file descriptor exhaustion accept",
     "listener EMFILE recovery",
     "production accept loop EMFILE",
-    "RLIMIT_NOFILE accept failure"
+    "RLIMIT_NOFILE accept failure",
+    "accept가 EMFILE이면 어떻게 복구해?",
+    "reserve fd trick이 왜 필요해?"
   ],
   "expected_queries": [
     "accept 루프에서 EMFILE이 나면 reserve fd trick으로 어떻게 안전하게 복구해?",
@@ -50,12 +48,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/file-descriptor-exhaustion-accept-emfile-playbook.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

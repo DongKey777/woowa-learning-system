@@ -7,17 +7,13 @@
   "body_markdown": "# Deployment Rollout, Rollback, Canary, Blue-Green\n\n\n> 한 줄 요약: Deployment Rollout, Rollback, Canary, Blue-Green는 입문자가 먼저 잡아야 할 핵심 기준과 실무에서 헷갈리는 경계를 한 문서에서 정리한다.\n**난이도: 🟡 Intermediate**\n\n\n관련 문서:\n\n- [카테고리 README](./README.md)\n- [Data Migration Rehearsal, Reconciliation, Cutover](./data-migration-rehearsal-reconciliation-cutover.md)\n- [Deploy Rollback Safety / Compatibility Envelope 설계](../system-design/deploy-rollback-safety-compatibility-envelope-design.md)\n- [우아코스 백엔드 CS 로드맵](../../JUNIOR-BACKEND-ROADMAP.md)\n\n\nretrieval-anchor-keywords: deployment rollout basics, rollback basics, canary vs blue green, rolling deployment basics, progressive delivery intro, 배포 전략 처음, canary 언제 써요, blue green 뭐예요, 롤백 왜 어려워요, schema change rollback, what is canary deployment, deployment rollback checklist\n> 배포를 \"코드를 올리는 행위\"가 아니라 \"변경을 안전하게 관찰 가능한 방식으로 흘리는 과정\"으로 설명하는 문서\n\n<details>\n<summary>Table of Contents</summary>\n\n- [왜 배포 전략을 따로 생각해야 하는가](#왜-배포-전략을-따로-생각해야-하는가)\n- [배포와 릴리스는 다르다](#배포와-릴리스는-다르다)\n- [대표 전략 비교](#대표-전략-비교)\n- [Canary 배포](#canary-배포)\n- [Blue-Green 배포](#blue-green-배포)\n- [Rolling 배포와 점진 확장](#rolling-배포와-점진-확장)\n- [롤백 전략](#롤백-전략)\n- [배포를 안전하게 만드는 운영 장치](#배포를-안전하게-만드는-운영-장치)\n- [전환 판단 기준](#전환-판단-기준)\n- [시니어 관점 질문](#시니어-관점-질문)\n\n</details>\n\n> retrieval-anchor-keywords:\n> - deployment rollout\n> - rollback\n> - canary deployment\n> - blue-green deployment\n> - rolling deployment\n> - release vs deploy\n> - progressive delivery\n> - 배포 전략\n\n## 왜 배포 전략을 따로 생각해야 하는가\n\n코드가 맞아도 배포가 잘못되면 서비스는 깨진다.\n\n- 기능은 정상인데 설정 하나 때문에 장애가 날 수 있다\n- 한 번에 전체 트래픽에 적용하면 실패 범위가 너무 크다\n- 데이터베이스 변경은 애플리케이션 코드보다 되돌리기 어렵다\n\n즉 배포 전략은 단순한 배포 순서가 아니라 **실패 확률과 실패 비용을 조절하는 설계**다.\n\n---\n\n## 배포와 릴리스는 다르다\n\n두 용어를 분리해서 생각해야 한다.\n\n- 배포(deploy): 새로운 코드를 운영 환경에 올리는 행위\n- 릴리스(release): 사용자가 새 기능을 실제로 쓰게 되는 순간\n\nFeature Flag를 쓰면 이 둘을 분리할 수 있다.\n\n- 코드는 먼저 배포한다\n- 기능 활성화는 나중에 한다\n- 문제가 생기면 기능만 끄고 코드 배포는 유지할 수 있다\n\n이 분리가 중요한 이유는 \"배포는 기술 문제, 릴리스는 제품 문제\"이기 때문이다.\n\n---\n\n## 대표 전략 비교\n\n배포 전략은 보통 다음 축으로 비교한다.\n\n- 얼마나 빨리 전체 트래픽에 노출되는가\n- 실패 시 영향 범위를 얼마나 줄일 수 있는가\n- 롤백이 얼마나 쉬운가\n- 인프라 비용이 얼마나 드는가\n\n대표 전략:\n\n- Rolling\n- Canary\n- Blue-Green\n\n각 전략은 정답이 아니라 **상황별 타협안**이다.\n\n빠르게 고르려면 아래처럼 생각하면 된다.\n\n| 상황 | 먼저 떠올릴 전략 | 이유 | 바로 확인할 caveat |\n|---|---|---|---|\n| 오류를 작은 비율로 먼저 보고 싶다 | Canary | 실제 사용자 트래픽으로 점진 검증 가능 | 지표 해석이 약하면 잘못된 확대/롤백 판단을 할 수 있다 |\n| 전환 스위치를 빠르게 되돌리고 싶다 | Blue-Green | 트래픽 전환과 원복이 단순하다 | DB/schema/data 변화는 별도 rollback 설계가 필요하다 |\n| 인프라를 두 벌 두기 어렵다 | Rolling | 기존 환경 안에서 점진 교체 가능 | 신구 버전 혼재 구간의 호환성이 중요하다 |\n\n---\n\n## Canary 배포\n\nCanary는 전체 트래픽 중 일부만 새 버전으로 보내는 방식이다.\n\n핵심 아이디어:\n\n- 새 버전을 먼저 소수 사용자에게만 노출한다\n- 지표가 정상인지 확인한다\n- 문제가 없으면 트래픽 비율을 점진적으로 늘린다\n\n장점:\n\n- 장애를 작은 범위에 가둔다\n- 실제 사용자 트래픽으로 검증할 수 있다\n- 성능 저하나 비정상 응답을 조기에 발견할 수 있다\n\n단점:\n\n- 트래픽 분기와 관측 체계가 필요하다\n- 지표 해석을 잘못하면 잘못된 결정을 내릴 수 있다\n- 상태가 있는 세션, 캐시, 외부 연동이 있으면 검증이 복잡해진다\n\nCanary에서 봐야 할 지표:\n\n- 5xx 비율\n- p95/p99 응답 시간\n- 타임아웃 비율\n- 핵심 비즈니스 전환율\n- 신규 에러 로그와 알림\n\nCanary는 \"조금만 바꾸고 관찰한다\"는 철학을 구현한 방식이다.\n\n---\n\n## Blue-Green 배포\n\nBlue-Green은 동일한 환경을 두 개 둔 뒤, 트래픽 스위치를 한 번에 전환하는 방식이다.\n\n- Blue: 현재 운영 중인 버전\n- Green: 새 버전\n\n장점:\n\n- 전환이 빠르다\n- 문제가 생기면 다시 원복하기 쉽다\n- 전환 전까지 새 버전을 완전히 검증할 수 있다\n\n단점:\n\n- 같은 환경을 두 벌 유지하므로 비용이 든다\n- 데이터베이스 스키마가 바뀌면 단순 전환으로 끝나지 않는다\n- 배포는 쉬워도 데이터 호환성은 별도 문제다\n\nBlue-Green이 잘 맞는 경우:\n\n- 무상태(stateless) 서비스\n- 트래픽 전환이 명확한 서비스\n- 빠른 롤백이 중요한 서비스\n\n즉 Blue-Green은 인프라 전환 문제를 잘 푸는 전략이지, 데이터 진화 문제까지 자동으로 해결하지는 않는다.\n\n---\n\n## Rolling 배포와 점진 확장\n\nRolling 배포는 일부 인스턴스를 새 버전으로 바꾸고, 상태를 보면서 나머지를 교체하는 방식이다.\n\n장점:\n\n- 전체 환경을 새로 만들지 않아도 된다\n- 인프라 비용이 비교적 낮다\n- Kubernetes 같은 오케스트레이션과 잘 맞는다\n\n주의점:\n\n- 이전 버전과 새 버전이 동시에 살아 있는 시간이 있다\n- 호환성 없는 변경은 위험하다\n- 배포 중간에 요청이 어느 버전으로 갈지 불안정할 수 있다\n\n그래서 Rolling 배포에서는 다음이 중요하다.\n\n- 전후 버전 호환성\n- 세션/캐시 처리\n- 무중단 스키마 변경\n\n점진 확장은 기술적으로는 Rolling과 비슷해 보이지만, 운영 목표는 더 명확하다.\n\n- 사용자 경험을 망치지 않는다\n- 장애가 발생해도 일부에서 멈춘다\n- 확장 속도보다 안정성을 우선한다\n\n---\n\n## 롤백 전략\n\n롤백은 단순히 이전 버전으로 되돌리는 일이 아니다.\n\n롤백에는 세 가지 층위가 있다.\n\n1. 코드 롤백\n2. 설정/플래그 롤백\n3. 데이터 롤백 또는 보정\n\n가장 쉬운 것은 코드 롤백이지만, 데이터가 이미 변경되었다면 충분하지 않을 수 있다.\n\n### 코드 롤백\n\n- 새 버전에서만 생긴 버그를 이전 버전으로 되돌린다\n- 배포 아티팩트가 남아 있어야 한다\n- 이전 버전이 현재 데이터와 호환되어야 한다\n\n### 설정 롤백\n\n- Feature Flag를 끄거나\n- 라우팅 비율을 줄이거나\n- 외부 연동을 비활성화한다\n\n이 방식은 빠르고 위험이 낮다.\n\n### 데이터 롤백\n\n가장 어렵다.\n\n- 이미 저장된 데이터는 코드만 되돌려서는 복구되지 않는다\n- 스키마 삭제는 대개 되돌릴 수 없다\n- 대량 재처리나 보정 작업이 필요할 수 있다\n\n여기서 입문자가 많이 헷갈리는 지점은 \"`배포 롤백` = `모든 변경 원상복구`\"라고 생각하는 것이다.\n실제론 보통 아래처럼 분리해서 본다.\n\n| 되돌리는 대상 | 보통 빠른가 | 왜 그런가 |\n|---|---|---|\n| 코드 아티팩트 | 비교적 빠름 | 이전 버전 이미지나 바이너리만 살아 있으면 되기 쉽다 |\n| 설정/플래그 | 가장 빠름 | 라우팅 비율, feature flag, 토글은 데이터 모양을 바꾸지 않는 경우가 많다 |\n| 데이터/스키마 | 느리거나 불가 | 이미 쓴 값, 삭제한 컬럼, 외부 전파된 이벤트는 자동 원복되지 않는다 |\n\n그래서 실무에서는 \"되돌릴 수 있는 변경\"보다 **앞으로만 가도 안전한 변경**을 선호한다.\n\n예:\n\n- 컬럼 추가 후 이전 코드와 새 코드를 동시에 지원\n- 기존 필드는 바로 삭제하지 않기\n- 읽기/쓰기 경로를 분리해 단계적으로 전환하기\n\n즉 좋은 롤백은 \"실패 후에 고치는 능력\"보다 **실패해도 망가지지 않는 구조**를 만드는 데 가깝다.\n\n---\n\n## 배포를 안전하게 만드는 운영 장치\n\n배포 전략은 모니터링이 없으면 작동하지 않는다.\n\n필수 장치:\n\n- 구조화된 로그\n- 메트릭 대시보드\n- 에러 추적\n- 배포 알림\n- 즉시 끌 수 있는 차단 스위치\n\n관찰 포인트:\n\n- 배포 직후 에러율 변화\n- 특정 API만 느려지는지\n- 외부 의존성 실패가 늘었는지\n- 캐시 미스와 DB 부하가 변했는지\n\n좋은 운영은 \"문제가 생기면 알게 되는 것\"이 아니라 **문제가 어느 단계에서 생겼는지 좁혀가는 것**이다.\n\n---\n\n## 전환 판단 기준\n\n어떤 전략을 선택할지는 배포 대상의 특성에 따라 달라진다.\n\n- 빠른 검증이 필요하면 Canary\n- 빠른 원복이 중요하면 Blue-Green\n- 인프라 비용을 아껴야 하면 Rolling\n- 사용자 규모가 작고 위험이 낮으면 단순 배포도 가능\n\n판단할 때는 다음 질문이 유용하다.\n\n- 이 변경은 코드만 되돌리면 끝나는가?\n- 이전 버전과 새 버전이 동시에 살아도 안전한가?\n- 트래픽 일부에만 노출했을 때 의미 있는 신호를 볼 수 있는가?\n- 장애가 나면 어떤 레버를 먼저 당길 것인가?\n\n---\n\n## 시니어 관점 질문\n\n- 이 변경은 배포와 릴리스를 분리해야 하는가?\n- 롤백이 코드로 끝나는가, 데이터까지 영향을 주는가?\n- 새 버전과 구 버전이 동시에 동작해도 안전한가?\n- 장애를 줄이는 데 가장 효과적인 제어 지점은 무엇인가?\n- 지표가 좋아 보여도 실제 사용자 경험이 나빠질 수 있는가?\n\n## 한 줄 정리\n\nDeployment Rollout, Rollback, Canary, Blue-Green는 입문자가 먼저 잡아야 할 핵심 기준과 실무에서 헷갈리는 경계를 한 문서에서 정리한다.\n",
   "aliases": [
     "배포 전략 롤백 카나리 블루그린",
-    "Deployment Rollout, Rollback, Canary, 개념",
-    "Deployment Rollout, Rollback, Canary, 정리",
-    "Deployment Rollout, Rollback, Canary, 실수",
-    "Deployment Rollout, Rollback, Canary, 판단 기준",
     "Deployment Rollout Rollback Canary Blue-Green",
     "canary vs blue green vs rolling deployment",
     "deployment rollback basics",
     "progressive delivery intro",
     "release vs deploy rollout",
-    "deployment rollout strategy guide",
-    "deployment rollout strategy checklist"
+    "카나리랑 블루그린 언제 골라?",
+    "롤백은 코드만 되돌리면 돼?"
   ],
   "expected_queries": [
     "canary, blue-green, rolling deployment를 언제 선택해야 하는지 비교해줘",
@@ -56,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/software-engineering/deployment-rollout-rollback-canary-blue-green.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch161"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 6 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "MySQL GTID failover에서 promotion 후보는 \"가장 lag가 낮은 replica\"가 아니라, old source의 commit history를 가장 많이 실행 완료했고 errant transaction이 없으며 old source가 확실히 fenced된 replica다.",
   "body_markdown": "# MySQL GTID Binlog Replication Failover Chooser\n\n> 한 줄 요약: MySQL GTID failover에서 promotion 후보는 \"가장 lag가 낮은 replica\"가 아니라, old source의 commit history를 가장 많이 **실행 완료**했고 errant transaction이 없으며 old source가 확실히 fenced된 replica다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Replication Failover and Split Brain](./replication-failover-split-brain.md)\n- [Replication Lag Forensics and Root-Cause Playbook](./replication-lag-forensics-root-cause-playbook.md)\n- [Commit Horizon After Failover, Loss Boundaries, and Verification](./commit-horizon-after-failover-verification.md)\n- [Failover Split-Brain Fencing Playbook](./failover-split-brain-fencing-playbook.md)\n- [Primary Switch와 Write Fencing](./primary-switch-write-fencing.md)\n- [Group Commit, Binlog, Fsync Durability](./group-commit-binlog-fsync-durability.md)\n\nretrieval-anchor-keywords: mysql gtid failover, binlog replication failover, source replica promotion, Retrieved_Gtid_Set Executed_Gtid_Set, errant transaction, GTID_SUBTRACT, GTID_SUBSET, semi synchronous replication boundary, source fencing, split brain, write loss boundary, MySQL replica promotion chooser\n\n## 먼저 나눌 축\n\nMySQL replication에서 source는 commit된 변경을 binary log에 남기고, replica는 그 log event를 받아 relay log에 저장한 뒤 적용한다. GTID는 binlog에 기록된 transaction의 전역 식별자라서 failover 때 \"어떤 서버가 어떤 transaction을 이미 처리했는가\"를 비교하는 기준이 된다.\n\n헷갈리기 쉬운 축은 세 가지다.\n\n| 축 | 의미 | promotion 판단에서의 함정 |\n|---|---|---|\n| `Retrieved_Gtid_Set` | replica가 source에서 받아 relay log에 가진 GTID set | 받아 둔 것일 뿐 데이터에 적용됐다는 뜻은 아니다 |\n| `Executed_Gtid_Set` | 그 서버가 실제로 실행 완료한 GTID set | promotion 후보의 commit horizon 판단 기준에 더 가깝다 |\n| errant transaction | source가 아닌 replica 쪽에서 생긴 독자 GTID | 새 source로 승격하면 다른 replica와 history가 갈라질 수 있다 |\n\n그래서 \"가장 많이 retrieve한 replica\"보다 \"가장 안전하게 execute한 replica\"를 먼저 본다.\n\n## 후보 선택 순서\n\n### 1. old source를 먼저 fence한다\n\npromotion 전에 old source가 아직 write를 받을 수 있으면 GTID 비교가 맞아도 split-brain을 막지 못한다.\n\n먼저 해야 할 일:\n\n- application write endpoint 차단\n- old source read-only 또는 network isolation\n- orchestration lock, lease, fencing token 확인\n- old source가 살아 있으면 `SHOW BINARY LOG STATUS`의 `Executed_Gtid_Set` 기록\n\nGTID는 loss boundary를 계산하는 도구지, 두 source가 동시에 write를 받는 상황을 자동으로 막는 도구가 아니다.\n\n### 2. 각 replica의 retrieved와 executed를 분리해서 본다\n\n각 replica에서 `SHOW REPLICA STATUS\\G`를 보고 아래를 분리한다.\n\n```sql\nSHOW REPLICA STATUS\\G\n-- Retrieved_Gtid_Set: source에서 받아온 GTID set\n-- Executed_Gtid_Set: 이 replica가 적용 완료한 GTID set\n-- Auto_Position: 1 이면 GTID auto-position 사용\n```\n\n판단 규칙:\n\n- `Retrieved_Gtid_Set == Executed_Gtid_Set`에 가까울수록 relay log backlog가 적다\n- `GTID_SUBTRACT(Retrieved_Gtid_Set, Executed_Gtid_Set)`가 비어 있지 않으면 받은 뒤 아직 적용하지 않은 transaction이 있다\n- promotion 직전에는 적용이 끝날 때까지 기다리거나, 적용되지 않은 구간을 loss/reconciliation 후보로 명시해야 한다\n\n받았지만 적용하지 않은 transaction은 \"복구 가능한 후보\"일 수는 있어도, 새 source가 즉시 제공할 데이터 상태는 아니다.\n\n### 3. candidate가 다른 replica의 실행 history를 포함하는지 비교한다\n\n후보 `C`가 다른 replica `R`보다 뒤처지지 않았는지는 개념적으로 아래처럼 본다.\n\n```sql\n-- R의 executed GTID가 C에 모두 들어 있으면 C는 R보다 뒤처지지 않는다.\nSELECT GTID_SUBSET('<R Executed_Gtid_Set>', '<C Executed_Gtid_Set>');\n\n-- 비어 있지 않으면 C가 R에 비해 놓친 GTID가 있다.\nSELECT GTID_SUBTRACT('<R Executed_Gtid_Set>', '<C Executed_Gtid_Set>');\n```\n\nold source의 `Executed_Gtid_Set`을 신뢰할 수 있으면 더 직접적이다.\n\n```sql\n-- 비어 있지 않으면 candidate가 old source의 일부 commit을 못 가진다.\nSELECT GTID_SUBTRACT('<old source Executed_Gtid_Set>', '<candidate Executed_Gtid_Set>');\n```\n\n이 값이 비어 있지 않은데 바로 promotion하면, 그 GTID 구간은 write loss 또는 business reconciliation 대상이다.\n\n### 4. errant transaction을 배제한다\n\nerrant transaction은 replica에서 직접 실행된 local write처럼 source의 정상 history 밖에서 생긴 GTID다. 후보의 `Executed_Gtid_Set`에 old source history에 없는 GTID가 있으면 위험 신호다.\n\n예:\n\n```sql\n-- 비어 있지 않으면 candidate가 old source에 없는 GTID를 갖고 있다.\nSELECT GTID_SUBTRACT('<candidate Executed_Gtid_Set>', '<old source Executed_Gtid_Set>');\n```\n\n이 값이 곧바로 전부 문제라는 뜻은 아니다. multi-source, deliberate maintenance, restored backup의 `gtid_purged` 같은 정상 맥락도 있다. 하지만 failover promotion에서는 \"왜 candidate에만 있는가\"를 설명하지 못하면 승격 후보에서 빼는 쪽이 안전하다.\n\n## 선택표\n\n| 상황 | 해석 | 권장 선택 |\n|---|---|---|\n| candidate의 `Executed_Gtid_Set`이 old source와 같고 errant가 없다 | 가장 단순한 승격 후보 | source fencing 확인 후 promotion |\n| candidate가 old source보다 일부 GTID를 놓쳤다 | write loss boundary가 생긴다 | 더 최신 replica를 찾거나 loss/reconciliation 범위를 먼저 계산 |\n| candidate가 retrieved는 많이 했지만 executed가 뒤처졌다 | relay log backlog가 남아 있다 | applier 완료를 기다린 뒤 재비교 |\n| candidate에 old source에 없는 GTID가 있다 | errant transaction 가능성 | 설명/정리 전 promotion 금지 |\n| 두 replica가 서로 다른 GTID를 가지고 있다 | history가 갈라졌을 수 있다 | 자동 promotion보다 수동 forensic과 business 영향 분석 |\n\n## semi-sync는 무엇을 줄이고, 무엇을 못 줄이나\n\nSemi-synchronous replication은 async보다 data loss 가능성을 줄인다. source가 commit path에서 적어도 설정된 수의 replica가 event를 받아 log에 기록했다는 acknowledgment를 기다리기 때문이다.\n\n하지만 경계가 있다.\n\n- semi-sync ack는 보통 \"replica가 받아서 relay log에 기록했다\"는 신호이지, replica가 transaction을 실행 완료했다는 신호가 아니다\n- timeout이 나면 source가 async로 되돌아갈 수 있다\n- ack한 replica가 promotion 후보인지 별도 확인해야 한다\n- old source fencing 없이는 split-brain을 막지 못한다\n\n따라서 semi-sync를 켰어도 failover 판단은 여전히 `Executed_Gtid_Set`, relay log backlog, errant transaction, fencing 상태를 같이 봐야 한다.\n\n## data loss와 split-brain caveat\n\nGTID 비교는 \"어떤 transaction이 어디까지 실행됐는가\"를 보여 준다. 그러나 운영 사고에서 더 큰 손상은 두 갈래다.\n\n- data loss: old source에는 commit됐지만 promoted replica에는 없는 GTID 구간이 있다\n- split-brain: old source와 new source가 동시에 write를 받아 서로 다른 GTID history를 만든다\n\ndata loss는 commit horizon과 reconciliation 문제다. split-brain은 fencing과 routing authority 문제다. GTID failover runbook은 두 문제를 한 번에 닫아야 한다.\n\n## 짧은 공식 문서 링크\n\n- MySQL 8.4 Reference Manual, GTID Format and Storage: https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html\n- MySQL 8.4 Reference Manual, Using GTIDs for Failover and Scaleout: https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-failover.html\n- MySQL 8.4 Reference Manual, Checking Replication Status: https://dev.mysql.com/doc/refman/8.4/en/replication-administration-status.html\n- MySQL 8.4 Reference Manual, Semisynchronous Replication: https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html\n- MySQL 8.4 Reference Manual, GTID Functions: https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html\n\n## 검증 질문\n\n1. `Retrieved_Gtid_Set`에는 있지만 `Executed_Gtid_Set`에는 없는 GTID가 있을 때, 왜 그 replica를 즉시 source로 승격하면 위험한가?\n2. `GTID_SUBTRACT(old_source_executed, candidate_executed)` 결과가 비어 있지 않으면 어떤 비즈니스 검증이 필요할까?\n3. candidate의 `Executed_Gtid_Set`에 old source에 없는 GTID가 있으면 왜 errant transaction을 의심해야 할까?\n4. semi-sync ack를 받은 transaction과 replica에서 실행 완료된 transaction은 어떤 점에서 다른가?\n5. GTID set 비교가 통과해도 old source fencing이 빠지면 split-brain이 생길 수 있는 이유는 무엇인가?\n",
   "aliases": [
-    "MySQL GTID Binlog Replication 개념",
-    "MySQL GTID Binlog Replication 정리",
-    "MySQL GTID Binlog Replication 실수",
-    "MySQL GTID Binlog Replication 판단 기준",
     "데이터베이스 MySQL GTID Binlog Replication",
     "mysql gtid failover chooser",
     "GTID replica promotion",
@@ -17,7 +13,9 @@
     "Retrieved_Gtid_Set",
     "Executed_Gtid_Set",
     "errant transaction",
-    "source replica promotion"
+    "source replica promotion",
+    "GTID set으로 승격 후보 고르기",
+    "Retrieved와 Executed 차이"
   ],
   "expected_queries": [
     "MySQL GTID 기반 failover에서 승격할 replica를 어떻게 골라?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/mysql-gtid-binlog-replication-failover-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "이 문서는 lock primitive bridge로, mutex, semaphore, spinlock, futex를 waiting strategy 관점에서 비교한다.",
   "body_markdown": "# Futex, Mutex, Semaphore, Spinlock\n\n> 한 줄 요약: 락은 모두 기다림을 다르게 처리한다. 짧게 끝나면 spin, 오래 기다리면 sleep이 기본 감각이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [컨텍스트 스위칭, 데드락, lock-free](./context-switching-deadlock-lockfree.md)\n> - [CPU 캐시, 코히어런시, 메모리 배리어](./cpu-cache-coherence-memory-barrier.md)\n> - [file descriptor, socket, syscall cost](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [Lock Contention, Futex Wait, Off-CPU Debugging](./lock-contention-futex-offcpu-debugging.md)\n> - [Futex Requeue, Priority Inheritance, Convoy Debugging](./futex-requeue-priority-inheritance-convoy-debugging.md)\n\n> retrieval-anchor-keywords: futex, mutex, semaphore, spinlock, futex_wait, futex_wake, futex requeue, priority inheritance, lock contention, spin wait, sleeping lock, critical section\n\n---\n\n## 핵심 개념\n\n동시성 제어는 결국 \"누가 자원을 얼마나 기다릴 것인가\"의 문제다.\n\n- `mutex`: 상호 배제를 위한 기본 락\n- `semaphore`: 허용 개수를 세는 동기화 도구\n- `spinlock`: 잠들지 않고 바쁘게 확인하는 락\n- `futex`: 사용자 공간에서 빠르게 처리하고, 필요할 때만 커널이 개입하는 Linux 메커니즘\n\n왜 중요한가:\n\n- 서버는 항상 락을 쓴다\n- 락을 잘못 고르면 CPU 낭비, latency 증가, starvation이 생긴다\n- Java `synchronized`, `ReentrantLock` 같은 도구의 배경에도 같은 감각이 있다\n\n---\n\n## 깊이 들어가기\n\n### 1. mutex\n\nmutex는 한 번에 한 스레드만 들어가게 한다.\n\n- 임계 구간이 길면 안전하다\n- 대기가 길어지면 sleep 기반이 유리하다\n\n실무에서는 보통 \"기본 선택지\"다.\n\n### 2. semaphore\n\nsemaphore는 자원의 개수를 관리한다.\n\n- DB connection permit 수 제한\n- worker 동시 실행 수 제한\n- 외부 API rate-limiting 보조 수단\n\n락과 달리 \"하나만 들어가게\"가 아니라 \"몇 개까지 허용할지\"를 다룬다.\n\n### 3. spinlock\n\nspinlock은 잠들지 않고 계속 확인한다.\n\n장점:\n\n- 매우 짧은 임계 구간에서는 sleep/wakeup 오버헤드를 피할 수 있다\n\n단점:\n\n- 오래 잡히면 CPU를 태운다\n- 컨텍스트 스위칭보다 더 비쌀 수 있다\n\n### 4. futex\n\nfutex는 user space fast path를 먼저 시도하고, 경쟁이 생기면 커널이 sleep/wake를 돕는다.\n\n핵심 감각:\n\n- uncontended일 때는 빠르다\n- contended일 때만 커널 개입이 늘어난다\n\n즉 \"항상 커널로 들어가는 락\"이 아니라, **대부분은 사용자 공간에서 끝내고 필요할 때만 커널을 부르는 구조**다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 락 경합으로 p99가 늘어남\n\n임계 구간이 길어지면 mutex 대기가 늘고, 워커가 묶인다.\n\n진단:\n\n```bash\nstrace -e futex -p <pid>\nperf top\njstack <pid>\npidstat -w -p <pid> 1\n```\n\n### 시나리오 2: spinlock이 CPU 100%를 먹음\n\n임계 구간이 길거나 경쟁이 높으면 spin이 오히려 손해다.\n\n이럴 때는:\n\n- critical section을 줄이고\n- sleep 기반 락으로 바꾸고\n- 동시성 자체를 제한해야 한다\n\n### 시나리오 3: DB connection pool을 semaphore로 감싼다\n\n허용 개수를 넘기면 더 기다리게 해야 한다.  \n이때 semaphore 감각이 맞다.\n\n### 시나리오 4: JVM에서 모니터 경합이 늘어난다\n\nJava의 락도 결국 대기와 깨우기 문제가 핵심이다.  \n락 구현은 언어 문법이 아니라 스케줄링/대기 비용과 연결된다.\n\n---\n\n## 코드로 보기\n\n### semaphore로 동시성 제한\n\n```java\nSemaphore permits = new Semaphore(10);\n\npublic void handle() throws InterruptedException {\n    permits.acquire();\n    try {\n        // 최대 10개만 동시에 실행\n    } finally {\n        permits.release();\n    }\n}\n```\n\n### spin의 개념\n\n```c\nwhile (!try_lock()) {\n    // busy wait\n}\n```\n\n짧게 끝나면 유리할 수 있지만, 길어지면 CPU를 낭비한다.\n\n### futex 감각 보기\n\n```bash\nstrace -e futex -p <pid>\n# FUTEX_WAIT, FUTEX_WAKE가 보이면 대기/깨우기 경로를 탄다\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| mutex | 단순하고 안전하다 | 경합 시 대기 비용 | 일반 임계 구간 |\n| semaphore | 개수 제한에 적합 | 사용 실수 시 논리 깨짐 | 동시 실행 제한 |\n| spinlock | 매우 짧으면 빠르다 | CPU를 태운다 | 커널/극단적으로 짧은 구간 |\n| futex | uncontended fast path가 빠르다 | 구현 감각이 어렵다 | Linux user-space 락 |\n\n---\n\n## 꼬리질문\n\n> Q: spinlock은 왜 위험한가요?\n> 의도: 기다림 방식의 차이를 아는지 확인\n> 핵심: 잠들지 않아서 CPU를 지속적으로 소모한다.\n\n> Q: semaphore와 mutex의 차이는?\n> 의도: 개수 제어와 상호 배제를 구분하는지 확인\n> 핵심: mutex는 1명만, semaphore는 N명까지 허용한다.\n\n> Q: futex는 왜 필요한가요?\n> 의도: 사용자 공간 fast path 개념 이해 확인\n> 핵심: 경쟁이 없을 때 커널 진입을 피하고, 필요할 때만 sleep/wake를 한다.\n\n---\n\n## 한 줄 정리\n\n락은 모두 기다림을 다르게 처리한다. 짧은 구간이면 spinning, 길어지면 sleeping, 운영에서는 경쟁 패턴에 맞는 선택이 중요하다.\n",
   "aliases": [
-    "Futex Mutex Semaphore Spinlock 개념",
-    "Futex Mutex Semaphore Spinlock 정리",
-    "Futex Mutex Semaphore Spinlock 실수",
-    "Futex Mutex Semaphore Spinlock 판단 기준",
     "운영체제 Futex Mutex Semaphore Spinlock",
     "futex mutex semaphore spinlock",
     "futex wait wake",
@@ -17,7 +13,9 @@
     "spinlock busy wait",
     "sleeping lock vs spinning lock",
     "lock contention",
-    "critical section wait strategy"
+    "critical section wait strategy",
+    "mutex랑 semaphore는 기다림이 어떻게 달라?",
+    "spinlock은 언제 CPU를 낭비해?"
   ],
   "expected_queries": [
     "mutex와 semaphore와 spinlock은 기다리는 방식이 어떻게 달라?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/futex-mutex-semaphore-spinlock.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

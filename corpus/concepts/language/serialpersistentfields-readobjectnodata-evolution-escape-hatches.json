@@ -7,17 +7,15 @@
   "body_markdown": "# `serialPersistentFields`, `readObjectNoData`, and Native Serialization Evolution Escape Hatches\n\n> 한 줄 요약: Java native serialization은 기본적으로 현재 필드 구조에 끌려가지만, `serialPersistentFields`와 `readObjectNoData()`는 그 계약을 부분적으로 통제할 수 있는 escape hatch다. 다만 강력한 대신 더 쉽게 불투명한 호환성 코드를 만든다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Serialization Compatibility and `serialVersionUID`](./serialization-compatibility-serial-version-uid.md)\n> - [Serialization Proxy Pattern and Invariant Preservation](./serialization-proxy-pattern-invariant-preservation.md)\n> - [Record Serialization Evolution](./record-serialization-evolution.md)\n> - [Value Object Invariants, Canonicalization, and Boundary Design](./value-object-invariants-canonicalization-boundary-design.md)\n\n> retrieval-anchor-keywords: serialPersistentFields, readObjectNoData, putFields, readFields, native serialization evolution, persistent field schema, hierarchy change, InvalidObjectException, serialization hook, backward compatibility, forward compatibility\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n기본 native serialization은 \"현재 non-transient 필드\"를 중심으로 움직인다.  \n하지만 실제 운영에서는 저장 계약을 조금 더 의식적으로 통제하고 싶을 때가 있다.\n\n그때 등장하는 도구가:\n\n- `serialPersistentFields`\n- `ObjectOutputStream.PutField` / `ObjectInputStream.GetField`\n- `readObjectNoData()`\n\n이다.\n\n즉 이 기능들은 serialization proxy만큼 경계를 완전히 분리하진 못하지만,  \n기본 직렬화보다 더 명시적인 field contract를 만들게 해준다.\n\n## 깊이 들어가기\n\n### 1. `serialPersistentFields`는 \"저장할 필드 목록\"을 직접 적는 방식이다\n\n이 기능을 쓰면 실제 클래스 필드와 별개로  \n\"직렬화 포맷에 포함할 persistent field 목록\"을 명시할 수 있다.\n\n즉 다음 같은 용도에 쓸 수 있다.\n\n- 내부 필드는 바꿨지만 저장 계약은 유지하고 싶다\n- derived field를 저장에서 빼고 싶다\n- 필드 이름/구성을 더 안정적으로 유지하고 싶다\n\n하지만 그만큼 기본 직렬화의 단순함을 버린다.\n\n### 2. `putFields`/`readFields`는 명시적 mapping 레이어다\n\n이 방식은 사실상 \"작은 schema mapping\"을 직접 쓰는 것이다.\n\n- 어떤 이름으로 저장할지\n- 없는 필드를 어떻게 기본값 처리할지\n- 읽은 뒤 어떻게 현재 객체 상태로 옮길지\n\n즉 이 코드는 serializer hook이면서 migration code다.\n\n### 3. `readObjectNoData()`는 hierarchy 변화 같은 edge case를 다룬다\n\n이 메서드는 stream에 해당 클래스 데이터가 없을 때 호출될 수 있다.  \n예를 들어 class hierarchy가 바뀌었거나 예상과 다른 형태의 stream을 읽을 때 의미가 생긴다.\n\n일반 서비스 코드에서 자주 쓰이진 않지만,  \n오래된 직렬화 데이터와 class evolution이 복잡하게 얽힌 경우엔 마지막 safety net 역할을 할 수 있다.\n\n### 4. 이 escape hatch들은 복잡도를 줄이지 않는다\n\n중요한 점은:\n\n- 호환성 통제는 좋아질 수 있다\n- 하지만 reasoning 비용은 크게 증가한다\n\n즉 이 기능들은 \"쉽게 만드는 도구\"가 아니라  \n\"어쩔 수 없이 기본 직렬화 위에서 계약을 더 명시하는 도구\"에 가깝다.\n\n### 5. value object와 장기 저장 포맷에서는 proxy나 schema DTO가 더 자주 낫다\n\n`serialPersistentFields`가 쓸모 없다는 뜻은 아니다.  \n다만 value object invariant와 장기 포맷 진화까지 생각하면,\n\n- serialization proxy\n- 명시적 JSON/schema DTO\n\n가 더 읽기 쉽고 운영하기 쉬운 경우가 많다.\n\n## 실전 시나리오\n\n### 시나리오 1: 내부 필드 구조를 바꾸고도 저장 포맷은 유지하고 싶다\n\n이전엔 `firstName`, `lastName`을 저장했는데,  \n현재 객체는 `displayName` 하나만 가진다.\n\n기본 직렬화만 믿으면 깨지기 쉽지만, persistent field mapping을 두면 완충이 가능하다.\n\n### 시나리오 2: 클래스 계층 변화 후 오래된 데이터가 애매하게 읽힌다\n\nstream에는 특정 superclass 데이터가 없는데 현재 클래스 계층에는 생겼다.  \n이런 edge case에서 `readObjectNoData()`를 통해 안전한 기본 상태를 강제할 수 있다.\n\n### 시나리오 3: 호환성 코드는 늘었는데 아무도 이해 못 한다\n\nescape hatch를 과하게 쓰면 \"돌아가긴 하는데 왜 그런지 모르는\" serialization layer가 된다.  \n이 경우는 차라리 proxy나 명시적 schema로 갈아타는 편이 낫다.\n\n## 코드로 보기\n\n### 1. persistent field 목록 명시\n\n```java\nimport java.io.ObjectStreamField;\nimport java.io.Serializable;\n\npublic final class LegacyUser implements Serializable {\n    private static final ObjectStreamField[] serialPersistentFields = {\n        new ObjectStreamField(\"userId\", String.class),\n        new ObjectStreamField(\"displayName\", String.class)\n    };\n\n    private final String userId;\n    private final String displayName;\n\n    public LegacyUser(String userId, String displayName) {\n        this.userId = userId;\n        this.displayName = displayName;\n    }\n}\n```\n\n### 2. 명시적 write/read mapping\n\n```java\nprivate void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {\n    java.io.ObjectOutputStream.PutField fields = out.putFields();\n    fields.put(\"userId\", userId);\n    fields.put(\"displayName\", displayName);\n    out.writeFields();\n}\n\nprivate void readObject(java.io.ObjectInputStream in) throws java.io.IOException, ClassNotFoundException {\n    java.io.ObjectInputStream.GetField fields = in.readFields();\n    String restoredUserId = (String) fields.get(\"userId\", null);\n    String restoredDisplayName = (String) fields.get(\"displayName\", \"\");\n    if (restoredUserId == null) {\n        throw new java.io.InvalidObjectException(\"userId missing\");\n    }\n}\n```\n\n### 3. no data edge case\n\n```java\nprivate void readObjectNoData() throws java.io.ObjectStreamException {\n    throw new java.io.InvalidObjectException(\"required serialized data missing\");\n}\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| 기본 직렬화 | 단순하다 | field 구조 변화에 끌려가고 계약 통제가 약하다 |\n| `serialPersistentFields` + mapping | 필드 계약을 더 명시할 수 있다 | hook 코드와 migration complexity가 커진다 |\n| serialization proxy | invariant와 boundary control이 더 명확하다 | 보일러플레이트가 늘어난다 |\n| JSON/schema DTO | 상호운용성과 가독성이 높다 | 별도 DTO와 변환 계층이 필요하다 |\n\n핵심은 이 기능들을 편의 기능이 아니라 \"기본 직렬화의 부족함을 메우는 escape hatch\"로 보는 것이다.\n\n## 꼬리질문\n\n> Q: `serialPersistentFields`는 언제 의미가 있나요?\n> 핵심: 실제 클래스 필드와 저장 계약을 약간 분리해 유지하고 싶을 때 의미가 있다.\n\n> Q: `readObjectNoData()`는 왜 존재하나요?\n> 핵심: hierarchy 변화나 예상치 못한 stream 형태에서 해당 클래스 데이터가 없을 때 안전한 기본 동작을 정의하기 위해서다.\n\n> Q: 이 기능들을 쓰면 native serialization이 안전해지나요?\n> 핵심: 더 통제할 수는 있지만, 복잡도와 reasoning 비용도 크게 늘어난다.\n\n> Q: 언제 proxy나 DTO가 더 낫나요?\n> 핵심: invariant가 중요하고 장기 진화가 필요한 대부분의 서비스 코드에선 더 읽기 쉽고 운영하기 좋다.\n\n## 한 줄 정리\n\n`serialPersistentFields`와 `readObjectNoData()`는 native serialization 위에서 계약을 더 명시하는 탈출구이지만, 강한 만큼 복잡도도 커서 정말 필요한 곳에만 써야 한다.\n",
   "aliases": [
     "자바 serialPersistentFields readObjectNoData",
-    "serialPersistentFields readObjectNoData Evolution Escape 개념",
-    "serialPersistentFields readObjectNoData Evolution Escape 정리",
-    "serialPersistentFields readObjectNoData Evolution Escape 실수",
-    "serialPersistentFields readObjectNoData Evolution Escape 판단 기준",
     "serialPersistentFields readObjectNoData evolution escape hatches",
     "Java serialPersistentFields PutField GetField",
     "readObjectNoData native serialization",
     "persistent field schema evolution",
     "native serialization escape hatch",
     "final",
-    "record"
+    "record",
+    "직렬화 필드 스키마를 따로 두기",
+    "readObjectNoData가 호출되는 상황"
   ],
   "expected_queries": [
     "serialPersistentFields는 실제 클래스 필드와 별개로 persistent field schema를 어떻게 통제해?",
@@ -53,12 +51,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/language/java/serialpersistentfields-readobjectnodata-evolution-escape-hatches.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

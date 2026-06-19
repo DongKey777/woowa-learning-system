@@ -6,10 +6,6 @@
   "summary": "DoH와 DoT는 둘 다 DNS 질의를 암호화하지만, 기업 환경에서는 \"어느 resolver를 믿고, 어떤 DNS view와 정책을 유지할 것인가\"가 선택의 핵심이다.",
   "body_markdown": "# DoH vs DoT, Split-Horizon, Enterprise DNS Chooser\n\n> 한 줄 요약: DoH와 DoT는 둘 다 DNS 질의를 암호화하지만, 기업 환경에서는 \"어느 resolver를 믿고, 어떤 DNS view와 정책을 유지할 것인가\"가 선택의 핵심이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [DNS over HTTPS Operational Trade-offs](./dns-over-https-operational-tradeoffs.md)\n- [DNS Split-Horizon Behavior](./dns-split-horizon-behavior.md)\n- [HTTPS RR Resolver Drift Primer](./https-rr-resolver-drift-primer.md)\n- [DNS Negative Cache TTL Debugging Playbook](./dns-negative-cache-ttl-debugging-playbook.md)\n- [DNSSEC Validation SERVFAIL Chain of Trust Playbook](./dnssec-validation-servfail-chain-of-trust-playbook.md)\n\n검증 기준: DoH는 RFC 8484, DoT는 RFC 7858 계열의 운영 모델을 기준으로 보고, DNSSEC validation과 enterprise policy는 별도 계층으로 분리한다.\n\nretrieval-anchor-keywords: DoH vs DoT enterprise chooser, encrypted DNS split horizon, browser secure DNS, DNS over HTTPS policy, DNS over TLS port 853, resolver bootstrap trust, managed resolver, public resolver, dig browser mismatch\n\n## 먼저 자르는 질문\n\n첫 질문은 \"암호화할까 말까\"가 아니라 `resolver owner`다. 클라이언트가 회사 resolver에 묻는다면 기업은 내부 zone, 악성 도메인 차단, 감사 로그, 지역별 routing 정책을 유지할 수 있다. 클라이언트가 브라우저 내장 public DoH resolver로 직접 나가면 질의 구간 privacy는 좋아질 수 있지만, 사내 DNS view와 정책을 우회할 수 있다. 이때 보안이 자동으로 좋아진다고 말하면 과장이다. 신뢰가 로컬 네트워크에서 선택한 recursive resolver로 이동했을 뿐이며, 그 resolver는 여전히 질의 내용을 볼 수 있다.\n\n## DoH와 DoT 비교 축\n\n| 축 | DoH | DoT |\n|---|---|---|\n| 전송 | HTTPS 위 DNS 메시지 | TLS 위 DNS 메시지 |\n| 흔한 포트 | 443 | 853 |\n| 정책 관찰 | 일반 웹 트래픽과 섞여 구분이 어렵다 | 전용 포트라 allow/block 경계가 비교적 명확하다 |\n| 브라우저 통합 | Secure DNS 설정으로 앱/브라우저별 우회가 쉽다 | OS나 네트워크 resolver 정책과 더 자주 묶인다 |\n| enterprise 적합성 | 관리형 DoH endpoint와 브라우저 정책이 있으면 가능하다 | 전용 resolver와 egress 정책으로 다루기 쉽다 |\n\n둘 다 client와 recursive resolver 사이를 암호화한다. 둘 다 authoritative DNS, resolver cache, DNSSEC validation 실패, split-horizon view 불일치를 없애지 않는다. 그래서 \"DoH는 더 private, DoT는 더 enterprise\"처럼 단순화하지 말고, 배포 지점과 정책 소유자를 같이 봐야 한다.\n\n## Privacy와 Policy의 경계\n\nDoH/DoT는 카페 Wi-Fi, ISP, 중간 장비가 평문 DNS 질의를 쉽게 보는 문제를 줄인다. 그러나 resolver 자체는 질의를 본다. 접속 대상의 IP, TLS SNI, HTTP Host, CDN edge log 같은 다른 관찰면도 남을 수 있다. 또한 DNSSEC는 \"응답 데이터가 서명 체인에 맞는가\"를 검증하는 기술이지, resolver에게 질의를 숨기는 기술이 아니다.\n\n기업망에서는 DNS가 보안 제어 지점이다. 악성 도메인 차단, 내부 서비스 이름, DLP/감사 로그, 지역별 failover가 resolver 정책에 들어간다. public DoH를 무제한 허용하면 이 제어 지점을 브라우저나 앱이 우회한다. 반대로 모든 encrypted DNS를 막으면 외부망 사용자 privacy와 모바일 일관성이 나빠질 수 있다. 실무 선택지는 보통 셋이다. 회사 관리 DoH/DoT resolver를 제공한다. 관리 브라우저 정책으로 허용 resolver를 고정한다. 내부 zone은 system resolver로, 외부 개인 트래픽은 별도 정책으로 나눈다.\n\n## Split-Horizon에서 깨지는 방식\n\nsplit-horizon DNS는 같은 이름에 대해 내부에서는 private IP, 외부에서는 public IP를 준다. 브라우저가 public DoH resolver를 쓰면 내부 view를 못 보고 `NXDOMAIN`, public IP, 또는 다른 `HTTPS` RR/SVCB hint를 받을 수 있다. 그러면 터미널 `dig`는 회사 DNS 기준으로 정상인데 브라우저는 실패한다. 반대로 VPN 클라이언트가 system resolver를 바꿨지만 브라우저 Secure DNS가 계속 public resolver를 쓰면 VPN 접속 여부와 상관없이 외부 view가 유지된다.\n\n이 문제를 DNS 전파 지연으로 부르면 디버깅이 길어진다. 먼저 \"누가 누구에게 물었는가\"를 맞춘다. browser DoH provider, OS stub resolver, VPN pushed resolver, `dig @resolver`, authoritative nameserver를 같은 표에 놓고 answer, TTL, policy view를 비교해야 한다.\n\n## Debugging 선택\n\nDoT는 전용 포트를 쓰므로 네트워크 정책 확인이 상대적으로 쉽다. 방화벽에서 853 egress가 막혔는지, resolver certificate가 맞는지, TLS handshake가 되는지부터 본다. DoH는 HTTPS와 섞이므로 \"443이 열려 있다\"가 충분한 증거가 아니다. URL path, HTTP status, content type, 브라우저 managed policy, fallback mode를 같이 본다.\n\n검증 명령 예시는 다음처럼 관찰 지점을 분리한다.\n\n```bash\ndig @internal-resolver corp.example A\ndig @public-resolver corp.example A\ncurl -sS -H 'accept: application/dns-json' 'https://resolver.example/dns-query?name=corp.example&type=A'\nopenssl s_client -connect resolver.example:853 -servername resolver.example\n```\n\n이 명령은 운영 resolver 이름으로 바꿔서 쓰는 진단 템플릿이다. `curl` 결과만으로 브라우저가 같은 resolver를 쓴다고 단정하지 말고, 브라우저 Secure DNS 설정과 enterprise policy도 확인한다.\n\n## Bootstrap과 Trust\n\nencrypted DNS도 bootstrap이 필요하다. resolver endpoint가 도메인 이름이면 그 이름을 처음 어떻게 해석할지 정해야 한다. resolver IP를 고정하면 초기 의존성은 줄지만 운영 변경과 certificate name 검증이 까다로워진다. resolver hostname을 쓰면 certificate validation은 자연스럽지만, 초기 해석이 system resolver나 preconfigured mapping에 의존할 수 있다.\n\ntrust 질문도 분리한다. \"전송 중 누가 볼 수 있는가\"는 TLS가 줄인다. \"resolver가 어떤 정책으로 답하는가\"는 resolver 운영자가 결정한다. \"응답이 원본 zone과 맞는가\"는 DNSSEC validation 문제다. 세 질문을 섞으면 DoH/DoT가 모든 DNS 신뢰 문제를 해결한다고 오해하게 된다.\n\n## Wrong-Bucket Neighbors\n\n`captive portal`은 로그인 전 네트워크가 DNS나 HTTP를 가로채는 문제다. DoH가 실패할 수는 있지만, 핵심은 walled garden과 intercepting proxy다. `OCSP/CRL`과 `TLS certificate chain`은 DNS 해석 이후의 certificate revocation 또는 chain 검증 문제다. resolver trust와 TLS trust가 연결되긴 하지만, 내부 도메인 resolution이 다른 문제를 certificate 장애로 밀어 넣으면 안 된다. `negative cache TTL`은 이미 같은 resolver view 안에서 오래된 NXDOMAIN이 남는 문제다. 브라우저가 아예 다른 DoH resolver를 보는 문제와 먼저 구분한다.\n\n## Verification Questions\n\n- 이 클라이언트는 browser DoH, OS resolver, VPN resolver, 앱 내 resolver 중 어느 경로를 쓰는가?\n- 내부 도메인과 public 도메인 모두 같은 resolver policy를 타야 하는가, 아니면 분리해야 하는가?\n- public DoH로 내부 이름이 유출되거나 외부 view를 받는 상황을 허용할 것인가?\n- failure mode는 fail-open인가 fail-closed인가?\n- resolver certificate, endpoint bootstrap, logging retention, filtering policy의 소유자가 문서화돼 있는가?\n\n## 한 줄 정리\n\nDoH/DoT 선택은 암호화 기능 비교가 아니라 privacy, split-horizon view, resolver policy, 디버깅 가능성, bootstrap trust를 같은 표에 놓고 고르는 운영 설계 문제다.\n",
   "aliases": [
-    "DoH vs DoT, Split-Horizon, 개념",
-    "DoH vs DoT, Split-Horizon, 정리",
-    "DoH vs DoT, Split-Horizon, 실수",
-    "DoH vs DoT, Split-Horizon, 판단 기준",
     "네트워크 DoH vs DoT, Split-Horizon,",
     "DoH vs DoT enterprise DNS",
     "DNS over HTTPS vs DNS over TLS",
@@ -17,7 +13,9 @@
     "browser secure DNS policy",
     "enterprise resolver chooser",
     "resolver bootstrap trust",
-    "managed DNS privacy policy"
+    "managed DNS privacy policy",
+    "회사 내부망에서 Secure DNS 써도 되나요",
+    "DoH 켠 뒤 사내 도메인이 안 돼요"
   ],
   "expected_queries": [
     "회사 split horizon DNS가 있는데 브라우저 DoH와 DoT 중 무엇을 골라야 해?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/doh-dot-split-horizon-enterprise-dns-chooser.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

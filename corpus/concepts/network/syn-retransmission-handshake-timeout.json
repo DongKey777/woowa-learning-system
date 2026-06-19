@@ -6,10 +6,6 @@
   "summary": "SYN 재전송은 네트워크가 연결 수립에 실패했다는 신호이고, handshake timeout은 그 실패를 앱이 언제 포기할지 정하는 운영 경계다.",
   "body_markdown": "# SYN Retransmission, Handshake Timeout Behavior\n\n> 한 줄 요약: SYN 재전송은 네트워크가 연결 수립에 실패했다는 신호이고, handshake timeout은 그 실패를 앱이 언제 포기할지 정하는 운영 경계다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Timeout 타입: connect, read, write](./timeout-types-connect-read-write.md)\n> - [NAT, Conntrack, Ephemeral Port Exhaustion](./nat-conntrack-ephemeral-port-exhaustion.md)\n> - [TCP 혼잡 제어](./tcp-congestion-control.md)\n> - [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n> - [TLS, 로드밸런싱, 프록시](./tls-loadbalancing-proxy.md)\n> - [Accept Queue, SYN Backlog, Listen Overflow](./accept-queue-syn-backlog-listen-overflow.md)\n\nretrieval-anchor-keywords: SYN retransmission, handshake timeout, SYN-SENT, SYN-ACK, connect timeout, tcp_syn_retries, retransmission timeout, SYN cookie, three-way handshake\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nTCP 연결은 3-way handshake로 시작한다.\n\n- SYN: 연결을 시작하고 싶다\n- SYN-ACK: 알겠다, 나도 준비됐다\n- ACK: 좋다, 연결을 확정하자\n\n이 과정에서 SYN이 되돌아오지 않으면 커널은 재전송을 시도한다.  \n애플리케이션은 이를 보통 `connect timeout`이나 handshake timeout으로 본다.\n\n재현 조건을 만들 때는 \"서버 handler가 느린가\"가 아니라 \"연결이 성립되기 전 어느 지점에서 패킷이 멈추는가\"를 분리해야 한다. 같은 timeout 로그라도 connect timeout은 request body나 controller 실행 전 단계다.\n\n### Retrieval Anchors\n\n- `SYN retransmission`\n- `handshake timeout`\n- `SYN-SENT`\n- `SYN-ACK`\n- `connect timeout`\n- `tcp_syn_retries`\n- `retransmission timeout`\n- `SYN cookie`\n\n## 깊이 들어가기\n\n### 1. SYN retransmission이 의미하는 것\n\nSYN을 보냈는데 응답이 없으면 보통 아래 중 하나다.\n\n- 대상 호스트가 죽었다\n- 경로 중간에 차단이 있다\n- 방화벽이 SYN을 드롭한다\n- LB가 과부하라서 연결을 받지 못한다\n\n이때 커널은 바로 포기하지 않고 몇 번 더 시도한다.\n\n- 일시적 패킷 손실일 수도 있기 때문이다\n- 첫 패킷만 사라졌을 수도 있기 때문이다\n\n### 2. handshake timeout은 왜 따로 봐야 하나\n\nconnect timeout을 너무 길게 잡으면:\n\n- 사용자가 오래 기다린다\n- worker thread가 묶인다\n- retry가 늦게 시작된다\n\n너무 짧게 잡으면:\n\n- 잠깐의 혼잡도 실패로 보인다\n- 불필요한 retry가 늘 수 있다\n\n즉 handshake timeout은 네트워크 불안정과 사용자 체감 사이의 균형점이다.\n\n### 3. SYN-SENT 상태는 무엇을 말하나\n\n클라이언트가 SYN을 보냈고 아직 연결이 성사되지 않은 상태다.\n\n- `ss -tan state syn-sent`로 볼 수 있다\n- 이 상태가 많으면 connect path가 막혔을 수 있다\n- NAT, firewall, LB, backend 과부하를 의심한다\n\n### 4. 왜 LB나 프록시 문제처럼 보이나\n\nSYN 단계에서 막히면 앱은 응답을 받지 못한다.\n\n- 서버 코드가 아니라 네트워크 앞단일 수 있다\n- health check는 멀쩡한데 실제 connect만 실패할 수 있다\n- 특정 포트만 막힐 수도 있다\n\n### 5. 재전송이 늘면 무엇을 의심하나\n\nSYN 재전송은 손실, drop, overload의 합성 결과일 수 있다.\n\n- 방화벽 정책\n- conntrack 포화\n- backend accept backlog 부족\n- SYN cookie 사용 여부\n\n이 문서는 [NAT, Conntrack, Ephemeral Port Exhaustion](./nat-conntrack-ephemeral-port-exhaustion.md)와 함께 보면 좋다.\n\n## 실전 시나리오\n\n### 시나리오 1: connect timeout만 간헐적으로 난다\n\n원인 후보:\n\n- LB 건강 상태가 불안정하다\n- 경로 일부에서 SYN이 드롭된다\n- NAT 포트가 부족하다\n\n### 시나리오 2: 배포 직후 connection storm이 생긴다\n\n대량의 새 연결이 동시에 붙으면 SYN backlog가 밀릴 수 있다.\n\n- 신규 인스턴스가 아직 warm하지 않다\n- health check는 통과하지만 실제 accept는 늦다\n- retry가 더 많은 SYN을 만든다\n\n### 시나리오 3: 특정 환경에서만 접속이 아예 안 된다\n\n기업망, VPN, 클라우드 경로에서 SYN 차단이 흔하다.\n\n- DNS는 되는데 connect가 안 된다\n- ping은 되는데 TCP만 안 된다\n- 방화벽이 첫 패킷을 드롭한다\n\n### 시나리오 4: timeout을 늘렸는데 해결이 안 된다\n\n문제는 단순한 대기 시간이 아니라, handshake가 끝나지 않는 경로일 수 있다.\n\n- 잘못된 목적지\n- blackhole\n- NAT exhaustion\n- middlebox 정책\n\n## 확인 순서\n\n1. 클라이언트 로그에서 connect timeout과 read/write timeout을 먼저 분리한다.\n2. `ss -tan state syn-sent`로 클라이언트의 미완료 연결이 쌓이는지 본다.\n3. 서버/LB 쪽 `SYN-RECV`, accept backlog, listen overflow counter를 확인한다.\n4. 같은 목적지에 대해 다른 네트워크, 다른 포트, HTTP/2/HTTP/3 fallback 여부를 비교한다.\n5. NAT/conntrack/ephemeral port 사용률을 확인해 local source port 압박을 배제한다.\n6. timeout을 늘리기 전에 retry fan-out이 SYN 폭주를 키우는지 본다.\n\n## Failure matrix\n\n| 관찰 증거 | 가능한 원인 | 다음 확인 |\n|---|---|---|\n| client `SYN-SENT`만 증가 | SYN 또는 SYN-ACK 경로 drop | firewall, route, LB, packet capture |\n| server `SYN-RECV` 증가 | 마지막 ACK 지연/drop 또는 backlog pressure | `tcp_max_syn_backlog`, SYN cookie, LB burst |\n| 특정 NAT 뒤 client만 실패 | ephemeral port/conntrack 압박 | NAT table, local port range, connection churn |\n| health check 정상, 사용자 connect 실패 | health check 조건이 실제 burst를 대표하지 않음 | LB target distribution, keep-alive reuse |\n| connect timeout을 늘려도 실패 | blackhole 또는 정책 drop | 목적지/포트/보안그룹/routing 확인 |\n\n## 운영/테스트 검증\n\n- synthetic connect probe는 `GET /health` 성공률만이 아니라 TCP connect latency를 별도로 기록한다.\n- 장애 재현 테스트는 read timeout이 아니라 connect timeout이 발생하도록 목적지 drop, LB backlog, NAT pressure 중 하나를 통제한다.\n- 복구 검증은 \"timeout 감소\"뿐 아니라 `SYN-SENT`/`SYN-RECV` 감소와 retry rate 감소를 같이 본다.\n\n## 코드로 보기\n\n### 커널 상태 확인\n\n```bash\nss -tan state syn-sent\nss -tan state syn-recv\nsysctl net.ipv4.tcp_syn_retries\n```\n\n### connect timeout 감각\n\n```java\nHttpClient client = HttpClient.newBuilder()\n    .connectTimeout(Duration.ofSeconds(1))\n    .build();\n```\n\n### SYN 재전송 관찰\n\n```bash\ntcpdump -i eth0 'tcp[tcpflags] & tcp-syn != 0'\n```\n\n### 현장 체크 포인트\n\n```text\n- SYN-SENT 수가 급증하는가\n- connect timeout이 특정 대역에서만 나는가\n- LB health check와 실제 connect 경로가 같은가\n- NAT / conntrack limit이 찼는가\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 짧은 connect timeout | 빨리 실패한다 | 일시적 흔들림에도 민감하다 | 외부 의존성이 많을 때 |\n| 긴 connect timeout | 순간 장애를 흡수한다 | thread와 retry가 묶인다 | 내부 안정망이 있을 때 |\n| SYN 재전송 허용 | 일시적 손실을 견딘다 | 연결 성립이 늦어진다 | 기본 TCP 동작 |\n\n핵심은 connect timeout을 \"충분히 길게\"가 아니라 **실패 경로를 드러낼 만큼만** 두는 것이다.\n\n## 꼬리질문\n\n> Q: SYN 재전송이 보이면 무엇을 의심하나요?\n> 핵심: 네트워크 드롭, 방화벽, LB 과부하, NAT 포트 고갈을 먼저 본다.\n\n> Q: handshake timeout과 read timeout의 차이는 무엇인가요?\n> 핵심: handshake timeout은 연결 수립 전, read timeout은 연결 이후 응답 대기다.\n\n> Q: SYN-SENT가 많으면 항상 서버 문제인가요?\n> 핵심: 아니다. 경로 중간 장비, NAT, 방화벽 문제일 수 있다.\n\n## 한 줄 정리\n\nSYN 재전송은 연결 수립 실패의 신호이고, handshake timeout은 그 실패를 앱이 언제 포기할지 정하는 경계라서 connect 경로를 따로 봐야 한다.\n",
   "aliases": [
-    "SYN Retransmission, Handshake Timeout 개념",
-    "SYN Retransmission, Handshake Timeout 정리",
-    "SYN Retransmission, Handshake Timeout 실수",
-    "SYN Retransmission, Handshake Timeout 판단 기준",
     "네트워크 SYN Retransmission, Handshake Timeout",
     "SYN retransmission",
     "handshake timeout",
@@ -17,7 +13,9 @@
     "SYN-ACK timeout",
     "connect timeout",
     "tcp_syn_retries",
-    "three-way handshake"
+    "three-way handshake",
+    "SYN 재전송이 계속 늘어날 때",
+    "SYN-SENT가 쌓이고 연결이 안 될 때"
   ],
   "expected_queries": [
     "SYN retransmission이 많고 connect timeout이 날 때 무엇을 의심해야 해?",
@@ -58,12 +56,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/syn-retransmission-handshake-timeout.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

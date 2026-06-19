@@ -7,17 +7,13 @@
   "body_markdown": "# Micrometer Actuator Observability Interview Drill\n\n## 질문\n\n\"Spring Actuator와 Micrometer를 사용한 observability를 설명하고 tag cardinality 문제를 말해 주세요.\"\n\n## 기대 답변 축\n\n- Actuator는 health, metrics, env 등 운영 endpoint를 제공한다.\n- Micrometer는 application metric을 여러 backend로 내보내는 facade 역할을 한다.\n- 낮은 cardinality tag는 집계에 유용하지만 userId, orderId 같은 high cardinality tag는 time series 폭증을 만든다.\n- 개별 요청 추적은 metric tag가 아니라 trace/span과 log correlation으로 다루는 편이 맞다.\n- metrics는 \"얼마나 많이/느리게/자주\"를, traces는 \"이 요청이 어디를 지나갔는지\"를, logs는 \"그때 어떤 사건이 있었는지\"를 증거로 준다.\n- API status와 exception taxonomy는 metric/log/trace에서 같은 이름 체계를 써야 장애 분석이 이어진다.\n\n## 역할 분리\n\nActuator는 애플리케이션의 운영 endpoint를 노출한다. `/actuator/health`, `/actuator/metrics`, `/actuator/prometheus`, `/actuator/loggers`처럼 상태 확인과 운영 진단을 위한 입구를 제공하지만, endpoint를 켜는 것만으로 좋은 관측성이 자동 완성되지는 않는다. 어떤 지표를 보고 장애를 판단할지, 어떤 tag를 붙일지, 어떤 endpoint를 외부에 노출할지 정책이 필요하다.\n\nMicrometer는 metric instrumentation facade다. 애플리케이션 코드는 `Counter`, `Timer`, `Gauge` 같은 추상화로 metric을 기록하고, Prometheus, CloudWatch, Datadog 같은 backend는 registry로 연결한다. 따라서 Micrometer의 관심사는 \"측정값을 어떤 이름과 tag로 기록할 것인가\"이고, Actuator의 관심사는 \"그 측정값과 운영 정보를 어떻게 노출할 것인가\"에 가깝다.\n\nObservability는 metrics, traces, logs를 함께 보는 활동이다. metrics는 집계된 경향을 빠르게 보고, traces는 한 요청이 여러 컴포넌트를 지나간 경로와 지연을 추적하며, logs는 특정 사건의 상세 맥락을 남긴다.\n\n## 증거 사슬로 설명하기\n\n면접에서 좋은 답변은 도구 이름보다 \"어떤 질문에 어떤 증거를 쓰는가\"를 먼저 말한다.\n\n| 질문 | 먼저 보는 증거 | 다음 증거 | 해석 |\n|---|---|---|---|\n| 장애 범위가 커졌나? | metric | dashboard/alert | 5xx rate, latency p95, queue size처럼 집계 지표로 영향 범위를 본다. |\n| 특정 요청이 어디서 느렸나? | trace | span timing | controller, service, DB, 외부 API 중 어느 구간이 시간을 썼는지 본다. |\n| 그 요청에서 어떤 값/상태였나? | log | trace id correlation | error code, domain state, external response code 같은 사건 맥락을 확인한다. |\n| 배포 후 바뀐 운영 상태가 있나? | Actuator endpoint | health/info/loggers | readiness, dependency health, logger level, build/version 정보를 확인한다. |\n\n예를 들어 `409 Conflict`가 늘었다면 metric은 \"conflict가 증가했다\"를 알려 준다. trace는 특정 요청 경로를 보여 주고, log는 `reservation_conflict`, `game_already_finished` 같은 안정적인 error code와 trace id로 실제 원인을 좁힌다. metric tag에 `reservationId`를 넣어 개별 요청을 찾으려 하면 cardinality 비용이 터진다.\n\n## Cardinality 경계\n\nmetric tag는 집계를 위한 차원이다. `method=GET`, `status=200`, `uri=/reservations/{id}`처럼 값의 종류가 제한된 tag는 유용하다. 반대로 `userId`, `reservationId`, raw URL path처럼 값이 계속 늘어나는 tag는 time series 수를 폭증시켜 저장 비용, query latency, backend memory를 악화시킨다.\n\n개별 요청을 찾고 싶다면 metric tag에 id를 넣지 말고 trace id를 log에 함께 남긴다. metric에서 \"5xx가 늘었다\"를 보고, trace에서 느린 구간을 찾고, log에서 해당 trace id의 상세 오류를 확인하는 식으로 역할을 나눈다.\n\n## Micrometer 설계 포인트\n\n| 대상 | Micrometer 도구 | 좋은 tag | 피할 tag |\n|---|---|---|---|\n| HTTP latency | `Timer` / 자동 `http.server.requests` | method, templated uri, status, outcome | raw path, query string, userId |\n| business event | `Counter` | action, result, error_code | orderId, reservationId, email |\n| 현재 상태 | `Gauge` | component, bounded state | request-specific value |\n| 외부 호출 | `Timer` 또는 observation | remote_system, outcome, status_class | full URL, payload id |\n\ncustom metric 이름은 단위와 이벤트를 드러내야 한다. `reservation.create`보다 `reservation.create.requests`나 `reservation.create.duration`처럼 counter/timer 성격을 구분하면 backend에서 해석하기 쉽다. tag 값은 enum처럼 bounded해야 하고, API error code와 handler taxonomy를 공유하면 400/404/409/500 분석이 흐트러지지 않는다.\n\n## Actuator 운영 경계\n\nActuator endpoint는 강력한 운영 입구라서 노출 정책이 중요하다. `/actuator/health`와 `/actuator/prometheus`는 운영에 자주 쓰이지만, `/actuator/env`, `/actuator/beans`, `/actuator/loggers` 같은 endpoint는 내부 정보나 설정 변경 능력을 드러낼 수 있다. 외부 공개 여부, 인증, 네트워크 제한, management port 분리를 함께 설명해야 한다.\n\nhealth도 \"green이면 사용자 경험이 정상\"이라는 뜻은 아니다. readiness는 traffic을 받아도 되는지를, liveness는 process 재시작 필요성을, business metric은 실제 성공률과 지연을 보여 준다. 결제 실패율이 급증해도 DB health가 green일 수 있으므로 health와 business metric을 분리해서 본다.\n\n## 면접 답변 골격\n\n\"Actuator는 health, metrics, prometheus 같은 운영 endpoint를 제공하고, Micrometer는 metric을 backend 독립적으로 기록하는 facade입니다. 관측성은 이 둘을 켠다고 끝나는 것이 아니라 metrics, traces, logs를 목적에 맞게 설계하는 일입니다. metric은 5xx rate, latency p95, 409 conflict 증가 같은 집계 증거를 주고, trace는 한 요청의 span 경로와 지연을 보여 주며, log는 trace id와 error code로 사건 맥락을 남깁니다. metric tag는 낮은 cardinality의 집계 축으로 제한하고, userId나 reservationId처럼 무한히 늘 수 있는 값은 trace/log correlation으로 다룹니다.\"\n\n## 약점 태그\n\n- `actuator-magic`: Actuator만 켜면 관측성이 된다고 생각함\n- `tag-cardinality`: high-cardinality label 비용을 모름\n- `trace-vs-metric`: per-request 추적과 집계 지표를 섞음\n\n## 운영 체크리스트\n\n| 항목 | 확인 |\n|---|---|\n| endpoint 노출 | health/prometheus 외 민감 endpoint는 인증과 네트워크 제한 적용 |\n| metric 이름 | business action과 단위를 드러내는 안정적인 이름 사용 |\n| tag 설계 | bounded value만 tag로 사용하고 raw id/path는 제외 |\n| latency | `Timer`와 percentile/histogram 필요성을 backend 비용과 함께 검토 |\n| correlation | trace id를 log pattern에 포함해 장애 분석 경로 연결 |\n| status taxonomy | ControllerAdvice의 error code/status와 metric/log tag 이름을 맞춤 |\n| alert | symptom metric에 alert를 걸고 trace/log는 drill-down 증거로 사용 |\n\n## Drill follow-up\n\n- `/reservations/1`, `/reservations/2`를 그대로 `uri` tag로 남기면 왜 위험한가?\n- health endpoint가 green이면 사용자 경험도 정상이라고 볼 수 있는가?\n- 결제 실패 건수를 Counter로 둘 때 tag에 어떤 값을 넣고 어떤 값은 빼야 하는가?\n- 409 conflict가 갑자기 늘었을 때 metric, trace, log를 어떤 순서로 볼 것인가?\n- trace id를 metric tag로 넣으면 왜 안 되는가?\n\n## 복습 연결\n\nMicrometer tracing은 `spring-observability-micrometer-tracing`, cardinality pitfall은 `spring-micrometer-tag-cardinality-pitfalls`로 이어진다.\n",
   "aliases": [
     "Spring observability 면접",
-    "Micrometer Actuator Observability Interview 개념",
-    "Micrometer Actuator Observability Interview 정리",
-    "Micrometer Actuator Observability Interview 실수",
-    "Micrometer Actuator Observability Interview 판단 기준",
     "Micrometer Actuator interview",
     "Actuator metrics tracing answer",
     "Micrometer tag cardinality drill",
     "metric log trace evidence",
     "observability evidence chain",
-    "micrometer actuator observability interview guide",
-    "micrometer actuator observability interview checklist"
+    "Actuator와 Micrometer 면접 답변",
+    "관측성 면접에서 tag cardinality 설명"
   ],
   "expected_queries": [
     "Spring Actuator와 Micrometer를 면접에서 어떻게 설명해?",
@@ -49,12 +45,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/micrometer-actuator-observability-interview-drill.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch162"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 6 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -7,17 +7,15 @@
   "body_markdown": "# Change Buffer Merge Debt\n\n> 한 줄 요약: change buffer merge debt는 일부 secondary index 반영을 미룬 비용이 나중에 드러나는 뒤늦은 정산이며, 읽기 병목으로 돌아올 수 있다.\n\n**난이도: 🔴 Advanced**\n\nretrieval-anchor-keywords: change buffer merge debt, delayed merge, secondary index merge, write debt, buffer pool miss, I/O spike, innodb_change_buffering\n\n## 핵심 개념\n\n- 관련 문서:\n  - [Change Buffer Myths vs Reality](./change-buffer-myths-vs-reality.md)\n  - [Change Buffer, Purge, History List Length](./change-buffer-purge-history-length.md)\n  - [Secondary Index Change Propagation Path](./secondary-index-change-propagation-path.md)\n\nchange buffer merge debt는 버퍼 풀에 없는 non-unique secondary index page의 변경을 뒤로 미루다 보니, 나중에 merge가 몰려 비용이 드러나는 현상이다.\n즉 지금 낸 쓰기 비용을 나중에 치르는 구조다.\n\n핵심은 다음이다.\n\n- write path는 가벼워 보일 수 있다\n- 나중에 merge와 read path가 무거워질 수 있다\n- merge debt가 커지면 latency spike가 생긴다\n\n## 깊이 들어가기\n\n### 1. 왜 debt라고 부르나\n\nchange buffer는 즉시 반영 대신 변경을 저장한다.  \n그렇기 때문에 아직 치르지 않은 비용이 쌓인다.\n\n이 미지급 비용이 merge debt다.\n\n- 디스크에 아직 반영되지 않은 non-unique secondary index change\n- 나중에 page가 읽힐 때 합쳐야 하는 작업\n- backlog가 늘수록 비용도 커짐\n\n### 2. merge debt가 커지는 조건\n\n- non-unique secondary index가 많다\n- 해당 page가 버퍼 풀에 자주 없다\n- write-heavy workload가 지속된다\n- read path가 나중으로 밀린다\n\n즉 \"쓰기만 많고 읽기는 나중\"인 시스템에서 잘 커진다.\n\n### 3. merge debt가 터질 때 보이는 증상\n\n- 갑자기 read latency가 튄다\n- buffer pool miss가 늘어난다\n- 백그라운드 I/O가 늘어난다\n- 특정 시점에 page merge가 몰린다\n\n### 4. debt를 줄이는 방법\n\n- secondary index 수를 줄인다\n- 버퍼 풀 핫셋을 늘린다\n- 대량 적재와 일반 트래픽을 시간적으로 분리한다\n- read/write 워크로드를 분리한다\n\n### 5. retrieval anchors\n\n이 문서를 다시 찾을 때 유용한 키워드는 다음이다.\n\n- `change buffer merge debt`\n- `delayed merge`\n- `secondary index merge`\n- `write debt`\n- `buffer pool miss`\n- `I/O spike`\n\n## 실전 시나리오\n\n### 시나리오 1. 배치 직후 조회가 느려진다\n\n배치가 change buffer에 많은 변경을 쌓아 두면, 뒤이어 오는 조회가 merge debt를 치르게 된다.  \n그래서 배치 성공과 서비스 안정성은 별개다.\n\n### 시나리오 2. 쓰기 지연을 줄였는데 반대편이 터진다\n\nwrite latency만 보고 change buffer를 좋아하면, 나중에 read path가 무거워질 수 있다.  \n이건 성능을 시간 이동한 것뿐이다.\n\n### 시나리오 3. 핫 페이지와 merge debt가 겹친다\n\n과거에는 cold였던 secondary index page가 조회 경로에서 다시 읽힐 때 미뤄 둔 merge가 같이 처리되면, read path가 더 불안정해진다.\n그래서 merge debt는 단순 백그라운드 작업이 아니다.\n\n## 코드로 보기\n\n### 상태 확인\n\n```sql\nSHOW VARIABLES LIKE 'innodb_change_buffering';\nSHOW STATUS LIKE 'Innodb_ibuf_size';\nSHOW ENGINE INNODB STATUS\\G\n```\n\n### write-heavy 예시\n\n```sql\nINSERT INTO event_log (id, user_id, event_type, created_at)\nVALUES (1, 1001, 'CLICK', NOW());\n```\n\n### 배치와 조회 분리\n\n```sql\n-- 배치 시간대 분리 예시\nUPDATE orders\nSET status = 'DONE'\nWHERE created_at >= '2026-04-01'\n  AND created_at <  '2026-04-08';\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| change buffer 활용 | 즉시 random secondary page read를 줄일 수 있다 | merge debt가 생긴다 | write-heavy OLTP |\n| change buffer 의존 축소 | read path 안정성이 좋아진다 | 즉시 I/O가 늘 수 있다 | 읽기 SLA가 중요할 때 |\n| secondary index 축소 | debt 생성 자체를 줄인다 | 일부 조회가 느려질 수 있다 | write 비용이 민감할 때 |\n\n핵심은 merge debt를 \"백그라운드 비용\"으로만 보지 말고, **미뤄진 읽기/쓰기 비용의 합계**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: change buffer merge debt는 왜 생기나요?\n> 의도: 지연 반영의 비용 구조를 이해하는지 확인\n> 핵심: 즉시 반영하지 않은 non-unique secondary index 변경이 쌓이기 때문이다\n\n> Q: merge debt가 터지면 무엇이 느려지나요?\n> 의도: read path 영향까지 아는지 확인\n> 핵심: 나중에 읽기와 I/O가 같이 흔들린다\n\n> Q: debt를 줄이는 가장 좋은 방법은 무엇인가요?\n> 의도: 근본 원인 제거를 생각하는지 확인\n> 핵심: secondary index와 워크로드 분리를 줄이는 것이다\n\n## 한 줄 정리\n\nchange buffer merge debt는 미뤄 둔 non-unique secondary index 변경의 비용이 나중에 몰려오는 현상이며, 결국 read latency와 I/O spike로 돌아올 수 있다.\n",
   "aliases": [
     "변경 버퍼 merge debt",
-    "Change Buffer Merge Debt 개념",
-    "Change Buffer Merge Debt 정리",
-    "Change Buffer Merge Debt 실수",
-    "Change Buffer Merge Debt 판단 기준",
     "change buffer merge debt",
     "delayed merge",
     "secondary index merge",
     "write debt",
     "buffer pool miss",
     "I/O spike",
-    "innodb_change_buffering"
+    "innodb_change_buffering",
+    "쓰기 배치 뒤 조회가 느려짐",
+    "change buffer 비용이 나중에 터짐"
   ],
   "expected_queries": [
     "change buffer merge debt는 secondary index 변경을 나중에 merge하면서 read latency와 I/O spike로 돌아오는 현상이야?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/change-buffer-merge-debt.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

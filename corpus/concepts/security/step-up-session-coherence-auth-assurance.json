@@ -6,10 +6,6 @@
   "summary": "이 문서는 security 카테고리에서 Step-Up Session Coherence / Auth Assurance를 다루는 deep_dive 문서다. step-up auth의 핵심은 MFA를 한 번 더 붙이는 것이 아니라, 기본 세션과 상승된 보증 수준 세션을 구분하고 `auth_time`, assurance level, 만료, revoke 범위를 일관되게 운영하는 것이다. 검색 질의가 step-up session, auth assurance, reauthentication, elevated session처럼 들어오면 인증/인가 보안 설계, 운영 진단, 사고 대응 관점으로 연결한다.",
   "body_markdown": "# Step-Up Session Coherence / Auth Assurance\n\n> 한 줄 요약: step-up auth의 핵심은 MFA를 한 번 더 붙이는 것이 아니라, 기본 세션과 상승된 보증 수준 세션을 구분하고 `auth_time`, assurance level, 만료, revoke 범위를 일관되게 운영하는 것이다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [MFA / Step-Up Auth Design](./mfa-step-up-auth-design.md)\n> - [OIDC Back-Channel Logout / Session Coherence](./oidc-backchannel-logout-session-coherence.md)\n> - [Session Revocation at Scale](./session-revocation-at-scale.md)\n> - [Session Quarantine / Partial Lockdown Patterns](./session-quarantine-partial-lockdown-patterns.md)\n> - [Session Inventory UX / Revocation Scope Design](./session-inventory-ux-revocation-scope-design.md)\n> - [Browser / BFF Token Boundary / Session Translation](./browser-bff-token-boundary-session-translation.md)\n> - [Token Misuse Detection / Replay Containment](./token-misuse-detection-replay-containment.md)\n> - [Password Reset Threat Modeling](./password-reset-threat-modeling.md)\n> - [Spring `SecurityContextRepository` and `SessionCreationPolicy` Boundaries](../spring/spring-securitycontextrepository-sessioncreationpolicy-boundaries.md)\n> - [Session Store Design at Scale](../system-design/session-store-design-at-scale.md)\n> - [Security README: Browser / Session Coherence](./README.md#browser--session-coherence)\n\nretrieval-anchor-keywords: step-up session, auth assurance, reauthentication, elevated session, auth_time, acr, amr, session age, step-up TTL, sensitive action reauth, assurance level, session coherence, session quarantine\n\n## 이 문서 다음에 보면 좋은 문서\n\n- step-up 상태를 사용자와 operator 화면에서 어떤 revoke scope로 보여 줄지는 [Session Inventory UX / Revocation Scope Design](./session-inventory-ux-revocation-scope-design.md)로 이어진다.\n\n---\n\n## 핵심 개념\n\nstep-up auth를 도입한 시스템에서 흔한 실수는 \"추가 인증을 한 번 더 받았으니 이제 세션이 강해졌다\"로 끝내는 것이다.\n\n실제로는 질문이 더 많다.\n\n- 어떤 세션이 기본 세션인가\n- 어떤 작업부터 높은 assurance를 요구하는가\n- step-up 결과를 얼마나 오래 믿을 것인가\n- 로그아웃, 비밀번호 변경, device mismatch 때 elevated state를 어떻게 끊을 것인가\n\n즉 step-up의 본질은 MFA 수단보다 세션 coherence다.\n\n---\n\n## 깊이 들어가기\n\n### 1. 로그인 세션과 elevated 세션은 같은 것이 아니다\n\n보통 사용자에게는 \"로그인됨\"이라는 하나의 상태만 보이지만, 시스템은 더 세밀하게 봐야 한다.\n\n- base session: 일반 페이지와 저위험 API 접근용\n- elevated session or grant: 송금, 비밀번호 변경, 관리자 작업용\n\n이 둘을 구분하지 않으면 문제가 생긴다.\n\n- 한번 step-up 후 모든 기능이 영구적으로 높은 보증 수준이 된다\n- 반대로 고위험 작업마다 불필요하게 계속 재인증하게 된다\n\n### 2. assurance는 role이 아니라 최근성(freshness)까지 포함한다\n\n민감 작업에 필요한 건 \"이 사용자가 관리자다\"만이 아니다.\n\n- 정말 최근에 강한 인증을 했는가\n- 어떤 수단으로 인증했는가\n- 현재 device/session가 그 인증과 이어지는가\n\n그래서 보통 step-up 판단에는 이런 정보가 필요하다.\n\n- `auth_time`\n- `acr` 또는 내부 assurance level\n- `amr` 또는 사용한 인증 수단\n- session age\n- 최근 risk signal\n\n즉 step-up은 \"누구인가\"와 \"얼마나 최근에 얼마나 강하게 확인했는가\"를 같이 본다.\n\n### 3. elevated 상태는 별도 artifact로 두는 편이 안전하다\n\n좋지 않은 패턴:\n\n- 기존 세션 플래그 하나를 `mfa=true`로 영구 수정\n\n더 나은 패턴:\n\n- base session은 그대로 유지\n- 별도의 step-up grant를 발급\n- grant에 scope, issued_at, expires_at, reason을 둔다\n\n예:\n\n- `payments.transfer`\n- `admin.user.disable`\n- `settings.password.change`\n\n이렇게 해야 고위험 작업 범위를 제한하고, 만료와 revoke도 명확해진다.\n\n### 4. TTL은 risk tier별로 달라야 한다\n\n모든 step-up 결과를 같은 시간 동안 신뢰할 필요는 없다.\n\n- 비밀번호 변경: 매우 짧게\n- 대량 송금: 한 번의 작업에만\n- 관리자 읽기 전용 콘솔: 조금 더 길게\n\nstep-up TTL이 너무 길면 세션 탈취 피해가 커지고, 너무 짧으면 UX가 무너진다.\n\n핵심은 작업 클래스를 나누는 것이다.\n\n### 5. browser/BFF 구조에서는 step-up 상태도 서버 측 세션으로 보는 편이 낫다\n\n브라우저에 elevated claim을 오래 노출하면 곤란하다.\n\n- 탭 복제\n- XSS 후 elevated token 재사용\n- logout 시 일부 탭만 상태가 남음\n\n그래서 BFF 구조라면 보통:\n\n- browser는 step-up challenge 결과 자체를 오래 들지 않음\n- BFF/session store가 elevated grant를 관리\n- downstream에는 필요한 순간에만 좁은 elevated context를 보냄\n\n### 6. federated login에서는 IdP assurance와 local assurance를 혼동하면 안 된다\n\n외부 IdP가 강한 인증을 했더라도, 우리 앱에서 어떤 작업까지 허용할지는 별도 정책일 수 있다.\n\n예를 들어:\n\n- IdP에서 MFA 완료\n- 하지만 우리 앱은 관리자 기능 전용 local reauth를 요구\n\n즉 external `acr`을 그대로 내부 최종 권한으로 쓰기보다, local assurance mapping이 필요하다.\n\n### 7. misuse containment와 step-up은 연결돼야 한다\n\n위험 신호가 올라왔다고 바로 global logout만 할 필요는 없다.\n\n중간 대응으로 step-up이 유용하다.\n\n- ASN/UA 급변\n- device binding mismatch\n- 약한 replay signal\n- support admin acting-on-behalf-of 작업\n\n이 경우:\n\n- read는 허용\n- write는 elevated grant 요구\n- refresh는 잠시 quarantine\n\n같은 단계적 정책이 가능하다.\n\n### 8. revoke 범위를 정의하지 않으면 elevated state가 남는다\n\n반드시 정해야 할 것:\n\n- base session logout 시 elevated grant도 같이 끊는가\n- 비밀번호 변경 시 모든 elevated grant를 끊는가\n- account lockout 시 device별 grant를 어떻게 fan-out하는가\n- federated logout가 local elevated grant도 종료하는가\n\nelevated state는 세션의 일부이므로 revoke 모델에 포함되어야 한다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 한번 MFA 후 관리자 위험 작업이 하루 종일 열린다\n\n문제:\n\n- step-up 결과를 base session에 영구 플래그로 덮어썼다\n\n대응:\n\n- 별도 elevated grant로 분리한다\n- action scope와 짧은 TTL을 둔다\n- base session과 revoke를 연결한다\n\n### 시나리오 2: 사용자는 방금 로그인했는데도 비밀번호 변경 때마다 계속 MFA를 요구받는다\n\n문제:\n\n- 어떤 assurance level이면 충분한지 정책이 없다\n\n대응:\n\n- 작업별 required assurance와 freshness window를 문서화한다\n- 최근 strong auth면 재사용 가능한 짧은 grant를 둔다\n\n### 시나리오 3: federated logout 후에도 민감 작업이 계속 가능하다\n\n문제:\n\n- local elevated grant가 별도 revoke되지 않는다\n\n대응:\n\n- logout fan-out에 elevated grant store를 포함한다\n- issuer/sub/sid와 local elevated grant mapping을 둔다\n\n---\n\n## 코드로 보기\n\n### 1. elevated grant 개념\n\n```java\npublic record StepUpGrant(\n        String sessionId,\n        String subject,\n        String scope,\n        String assuranceLevel,\n        Instant issuedAt,\n        Instant expiresAt\n) {\n}\n```\n\n### 2. 작업별 assurance 검사 예시\n\n```java\npublic void requireAssurance(UserSession session, String action) {\n    StepUpPolicy policy = policyRepository.findByAction(action);\n    StepUpGrant grant = grantRepository.findActiveGrant(session.id(), action);\n\n    if (grant == null || grant.expiresAt().isBefore(Instant.now())) {\n        throw new ReauthenticationRequiredException(policy.requiredLevel());\n    }\n}\n```\n\n### 3. 운영 체크리스트\n\n```text\n1. base session과 elevated grant가 분리되어 있는가\n2. action class별 required assurance와 freshness가 정의돼 있는가\n3. logout, password change, account disable이 elevated state도 함께 revoke하는가\n4. external IdP assurance와 local assurance mapping이 구분되는가\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|--------|------|------|----------------|\n| base session에 MFA 플래그만 둠 | 구현이 단순하다 | scope, TTL, revoke가 흐려진다 | 가능하면 피한다 |\n| action-scoped elevated grant | 세밀한 control이 가능하다 | session mapping이 복잡하다 | 민감 작업이 많은 서비스 |\n| 긴 step-up TTL | UX가 좋다 | 탈취 피해 창이 길다 | 낮은 위험 읽기 위주 |\n| 짧은 one-shot step-up | 가장 보수적이다 | UX 부담이 크다 | 송금, 권한 변경, 관리자 파괴 작업 |\n\n판단 기준은 이렇다.\n\n- 어떤 작업이 높은 assurance를 요구하는가\n- 재인증 UX를 어느 정도 감당할 수 있는가\n- BFF/session store에서 elevated state를 운영할 수 있는가\n- federated logout와 local revoke를 같이 맞출 수 있는가\n\n---\n\n## 꼬리질문\n\n> Q: step-up auth는 MFA를 한 번 더 붙이는 것과 같은가요?\n> 의도: 수단과 세션 모델을 구분하는지 확인\n> 핵심: 아니다. step-up은 특정 작업에 더 높은 assurance를 요구하는 세션 정책이다.\n\n> Q: 왜 elevated 상태를 base session과 분리하나요?\n> 의도: scope와 revoke의 필요를 이해하는지 확인\n> 핵심: 어떤 작업에만, 얼마나 오래, 어떤 조건에서 높은 보증을 인정할지 제어하기 위해서다.\n\n> Q: 외부 IdP가 MFA를 했으면 우리 앱도 무조건 높은 assurance로 봐도 되나요?\n> 의도: external assurance와 local policy를 구분하는지 확인\n> 핵심: 아니다. 내부 민감 작업 정책은 별도 mapping과 freshness 기준이 필요할 수 있다.\n\n> Q: logout 시 elevated grant도 같이 끊어야 하나요?\n> 의도: session coherence 범위를 이해하는지 확인\n> 핵심: 그렇다. elevated state가 남으면 민감 작업만 계속 열려 있는 비일관성이 생긴다.\n\n## 한 줄 정리\n\nStep-up auth를 운영 가능하게 만드는 핵심은 MFA 수단보다 base session과 elevated grant의 분리, assurance freshness, revoke 일관성을 세션 모델 안에 넣는 것이다.\n",
   "aliases": [
-    "Step-Up Session Coherence / 개념",
-    "Step-Up Session Coherence / 정리",
-    "Step-Up Session Coherence / 실수",
-    "Step-Up Session Coherence / 판단 기준",
     "보안 Step-Up Session Coherence /",
     "step-up session",
     "auth assurance",
@@ -17,7 +13,9 @@
     "elevated session",
     "auth_time",
     "acr",
-    "amr"
+    "amr",
+    "민감 작업 전에 재인증이 필요해요",
+    "auth_time과 acr을 언제 확인해요"
   ],
   "expected_queries": [
     "step-up 인증을 통과한 상태와 기본 로그인 세션을 같은 세션처럼 보면 왜 위험해?",
@@ -47,12 +45,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/security/step-up-session-coherence-auth-assurance.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch161"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

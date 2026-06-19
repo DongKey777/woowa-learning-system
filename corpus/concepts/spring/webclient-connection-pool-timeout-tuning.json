@@ -6,10 +6,6 @@
   "summary": "WebClient는 비동기라고 해서 자동으로 안전한 것이 아니며, connection pool과 timeout을 안 맞추면 느린 upstream을 더 오래 붙잡는 클라이언트가 된다.",
   "body_markdown": "# Spring WebClient Connection Pool and Timeout Tuning\n\n> 한 줄 요약: WebClient는 비동기라고 해서 자동으로 안전한 것이 아니며, connection pool과 timeout을 안 맞추면 느린 upstream을 더 오래 붙잡는 클라이언트가 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring WebClient vs RestTemplate](./spring-webclient-vs-resttemplate.md)\n> - [Spring `@Async` Context Propagation and RestClient / HTTP Interface Clients](./spring-async-context-propagation-restclient-http-interface-clients.md)\n> - [Spring Resilience4j: Retry, CircuitBreaker, Bulkhead](./spring-resilience4j-retry-circuit-breaker-bulkhead.md)\n> - [Spring Observability with Micrometer Tracing](./spring-observability-micrometer-tracing.md)\n> - [Timeout types: connect/read/write](../network/timeout-types-connect-read-write.md)\n> - [Request Timing Decomposition: DNS, Connect, TLS, TTFB, TTLB](../network/request-timing-decomposition-dns-connect-tls-ttfb-ttlb.md)\n> - [Timeout Budget Propagation Across Proxy, Gateway, Service Hops](../network/timeout-budget-propagation-proxy-gateway-service-hop-chain.md)\n> - [Connection Pool Starvation, Stale Idle Reuse, Debugging](../network/connection-pool-starvation-stale-idle-reuse-debugging.md)\n> - [Upstream Queueing, Connection Pool Wait, Tail Latency](../network/upstream-queueing-connection-pool-wait-tail-latency.md)\n> - [Service Mesh Local Reply, Timeout, Reset Attribution](../network/service-mesh-local-reply-timeout-reset-attribution.md)\n> - [Network, Spring Request Lifecycle, Timeout, Disconnect Bridge](../network/network-spring-request-lifecycle-timeout-disconnect-bridge.md)\n\nretrieval-anchor-keywords: WebClient, connection pool, Reactor Netty, response timeout, connect timeout, pending acquire timeout, max connections, proxy timeout, http client tuning, connection pool wait, stale idle reuse, upstream queueing, service mesh local reply\n\n## 핵심 개념\n\nWebClient는 reactive client이지만, 그 아래에는 실제 네트워크 자원 관리가 있다.\n\n- connection pool\n- connect timeout\n- response timeout\n- pending acquire timeout\n- max connections\n\n이 값들이 맞지 않으면 WebClient는 \"비동기라서 빠르다\"가 아니라 **느린 upstream을 더 오래 버티는 클라이언트**가 된다.\n\n## 깊이 들어가기\n\n### 1. WebClient는 Reactor Netty 설정에 크게 의존한다\n\n실제 네트워크 성능은 `HttpClient` 설정에서 나온다.\n\n```java\nHttpClient httpClient = HttpClient.create()\n    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000)\n    .responseTimeout(Duration.ofSeconds(3));\n```\n\n### 2. pool이 작으면 pending acquire가 늘어난다\n\n동시 요청이 많아도 커넥션이 충분하지 않으면 대기열이 쌓인다.\n\n- max connections\n- pending acquire timeout\n- idle timeout\n\n이 값들을 함께 봐야 한다.\n\n### 3. timeout은 종류가 다르다\n\n`connect timeout`, `response timeout`, `read timeout`은 의미가 다르다.\n\n이 차이를 섞으면 \"왜 실패했는지\"가 흐려진다.\n\n### 4. retry보다 timeout이 먼저다\n\ntimeout 없이 retry를 늘리면 upstream을 더 오래 붙잡게 된다.\n\n이 문맥은 [Spring Resilience4j: Retry, CircuitBreaker, Bulkhead](./spring-resilience4j-retry-circuit-breaker-bulkhead.md)와 같이 봐야 한다.\n\n### 5. connection pool 튜닝은 트래픽 패턴에 맞춰야 한다\n\n- fan-out이 많으면 pool이 더 필요할 수 있다\n- API가 느리면 pool보다 timeout이 더 중요할 수 있다\n- 한 upstream에 집중되면 bulkhead가 더 낫다\n\n## 1차 분기\n\nWebClient 장애는 먼저 \"reactive인데 왜 느리지\"가 아니라 **대기 위치**를 분리한다.\n\n| 1차 분기 | 재현 조건 | 관찰 증거 | 먼저 볼 설정 |\n|---|---|---|---|\n| pool acquire 대기 | 동시 요청 증가 시 pending acquire가 늘어난다 | acquire wait time, pending queue, max connection 포화 | `maxConnections`, `pendingAcquireTimeout` |\n| connect 지연 | upstream host에 연결 자체가 늦다 | connect timeout, DNS/TCP/TLS timing | connect timeout, DNS/LB 경로 |\n| response 지연 | 연결은 됐지만 첫 응답이나 전체 응답이 늦다 | TTFB/TTLB 증가, response timeout | `responseTimeout`, read/write timeout |\n| retry amplification | 장애 때 호출 수와 점유 시간이 더 늘어난다 | retry count, duplicate span, pool 점유 증가 | timeout budget, retry limit, circuit breaker |\n| blocking contamination | event-loop가 막히거나 tail latency가 튄다 | `block()` 사용, event-loop thread stack | boundedElastic 분리, blocking 제거 |\n\n## 재현 조건과 관찰 증거\n\n튜닝 전후에는 같은 부하 조건에서 아래를 같이 본다.\n\n- pool acquire wait, active connection, pending acquire count가 어떻게 변하는가?\n- connect, TLS, TTFB, TTLB 중 어느 구간이 timeout budget을 쓰는가?\n- retry가 붙은 요청이 같은 upstream connection을 오래 점유하는가?\n- WebClient span과 upstream/server span의 시간이 맞물리는가?\n\n## failure matrix\n\n| failure mode | 흔한 증상 | wrong-bucket / 오선택 | 검증/validation |\n|---|---|---|---|\n| pool starvation | p99만 튀고 CPU는 여유 | WebClient는 non-blocking이라 pool 문제가 없다고 봄 | pending acquire metric과 max connection 포화 확인 |\n| timeout 혼동 | 실패 원인이 connect인지 response인지 불명확 | timeout 하나로 전부 해결 | timeout 종류별 exception/metric 분리 |\n| retry storm | upstream 장애 때 더 느려짐 | retry를 안정성으로만 봄 | retry budget과 circuit breaker open 여부 확인 |\n| 긴 timeout | 장애가 늦게 드러나고 자원 점유가 길다 | 실패를 줄이는 설정으로 오해 | upstream SLO와 caller budget보다 timeout이 짧은지 확인 |\n\n## 흔한 오해\n\n- WebClient를 쓰면 connection pool exhaustion에서 자동으로 안전하다고 보면 안 된다.\n- pool을 키우는 것은 client 대기를 줄일 수 있지만 upstream 압력을 키울 수 있다.\n- retry는 timeout과 circuit breaker 없이 붙이면 회복력이 아니라 장애 증폭기가 된다.\n- `timeout()` operator 하나로 connect/read/response/pool acquire 의미가 모두 정리되는 것은 아니다.\n\n## 실전 시나리오\n\n### 시나리오 1: WebClient를 썼는데도 느리다\n\n원인 후보:\n\n- 내부에서 block()을 했다\n- pool이 작다\n- timeout이 없다\n- retry가 과하다\n\n### 시나리오 2: 동시에 많이 호출하면 pending acquire가 늘어난다\n\n커넥션 풀에서 커넥션을 빌리지 못하고 기다리는 것이다.\n\n### 시나리오 3: upstream이 느릴 때 전체 요청이 밀린다\n\ntimeout이 없으면 스레드와 커넥션이 같이 묶인다.\n\n### 시나리오 4: 장애는 아닌데 p99만 튄다\n\npool exhaustion이나 backpressure 없는 fan-out일 수 있다.\n\n## 코드로 보기\n\n### tuned WebClient bean\n\n```java\n@Bean\npublic WebClient webClient() {\n    ConnectionProvider provider = ConnectionProvider.builder(\"app\")\n        .maxConnections(200)\n        .pendingAcquireTimeout(Duration.ofSeconds(2))\n        .build();\n\n    HttpClient httpClient = HttpClient.create(provider)\n        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 2000)\n        .responseTimeout(Duration.ofSeconds(3));\n\n    return WebClient.builder()\n        .clientConnector(new ReactorClientHttpConnector(httpClient))\n        .build();\n}\n```\n\n### timeout operator\n\n```java\nwebClient.get()\n    .uri(\"/feed\")\n    .retrieve()\n    .bodyToMono(String.class)\n    .timeout(Duration.ofSeconds(2));\n```\n\n### retry with caution\n\n```java\nwebClient.get()\n    .uri(\"/profile\")\n    .retrieve()\n    .bodyToMono(Profile.class)\n    .retry(1);\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 작은 pool | 자원 사용이 적다 | 대기열이 빨리 찬다 | low traffic |\n| 큰 pool | 동시성을 받는다 | upstream 압력이 커질 수 있다 | fan-out heavy |\n| 짧은 timeout | 빠르게 실패한다 | transient failure에 민감하다 | latency-sensitive |\n| 긴 timeout | 실패를 덜 낸다 | 자원을 오래 묶는다 | 느린 업스트림 허용 |\n\n핵심은 WebClient를 \"코드\"가 아니라 **네트워크 자원 관리자**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: WebClient가 느릴 때 가장 먼저 보는 것은 무엇인가?\n> 의도: 네트워크 튜닝 순서 이해 확인\n> 핵심: pool, timeout, block() 사용 여부다.\n\n> Q: connect timeout과 response timeout의 차이는 무엇인가?\n> 의도: timeout 종류 구분 확인\n> 핵심: 연결 자체와 응답 대기 구간이 다르다.\n\n> Q: pending acquire timeout은 무엇을 의미하는가?\n> 의도: pool 대기 이해 확인\n> 핵심: 커넥션을 빌리지 못하고 기다리는 시간 제한이다.\n\n> Q: retry보다 timeout이 먼저인 이유는 무엇인가?\n> 의도: retry storm 이해 확인\n> 핵심: timeout이 없으면 실패를 빨리 감지하지 못한다.\n\n## 한 줄 정리\n\nWebClient는 비동기 호출 도구이지만, connection pool과 timeout이 맞지 않으면 결국 느린 upstream을 오래 기다리는 클라이언트가 된다.\n",
   "aliases": [
-    "Spring WebClient Connection Pool 개념",
-    "Spring WebClient Connection Pool 정리",
-    "Spring WebClient Connection Pool 실수",
-    "Spring WebClient Connection Pool 판단 기준",
     "스프링 Spring WebClient Connection Pool",
     "WebClient connection pool timeout",
     "Reactor Netty pool tuning",
@@ -17,7 +13,9 @@
     "connect response read write timeout",
     "upstream slow WebClient",
     "reactive client resource exhaustion",
-    "@Async"
+    "@Async",
+    "WebClient timeout은 어디부터 잡아야 해?",
+    "pending acquire timeout이 왜 나와?"
   ],
   "expected_queries": [
     "WebClient connection pool과 timeout은 어떻게 같이 튜닝해야 해?",
@@ -46,12 +44,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/spring-webclient-connection-pool-timeout-tuning.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch163"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

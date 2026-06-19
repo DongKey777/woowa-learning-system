@@ -6,10 +6,6 @@
   "summary": "connection draining은 배포나 scale-in 중에 기존 연결을 갑자기 자르지 않고 마무리하게 만들어, 불필요한 502와 reset을 줄인다.",
   "body_markdown": "# LB Connection Draining, Deployment Safe Close\n\n> 한 줄 요약: connection draining은 배포나 scale-in 중에 기존 연결을 갑자기 자르지 않고 마무리하게 만들어, 불필요한 502와 reset을 줄인다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Load Balancer 헬스체크 실패 패턴](./load-balancer-healthcheck-failure-patterns.md)\n> - [Idle Timeout 불일치: LB, Proxy, App](./idle-timeout-mismatch-lb-proxy-app.md)\n> - [Connection Keep-Alive, Load Balancing, Circuit Breaker](./connection-keepalive-loadbalancing-circuit-breaker.md)\n> - [FIN, RST, Half-Close, EOF](./fin-rst-half-close-eof-semantics.md)\n> - [API Gateway, Reverse Proxy 운영 포인트](./api-gateway-reverse-proxy-operational-points.md)\n\nretrieval-anchor-keywords: connection draining, deployment safe close, graceful shutdown, deregistration delay, scale-in, preStop, load balancer, connection reuse, drain timeout\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nconnection draining은 LB가 기존 연결을 즉시 끊지 않고, 새 연결만 다른 곳으로 보내며 **기존 연결을 천천히 마무리**하게 하는 운영 방식이다.\n\n- 배포 중 연결이 갑자기 reset되지 않는다\n- scale-in 시 사용자 요청이 덜 깨진다\n- 오래된 keep-alive 연결을 부드럽게 종료한다\n\n### Retrieval Anchors\n\n- `connection draining`\n- `deployment safe close`\n- `graceful shutdown`\n- `deregistration delay`\n- `scale-in`\n- `preStop`\n- `load balancer`\n- `connection reuse`\n- `drain timeout`\n\n## 깊이 들어가기\n\n### 1. 왜 필요한가\n\n서버를 그냥 종료하면 연결이 갑자기 끊긴다.\n\n- 요청 처리 중 응답이 날아간다\n- proxy와 client에 reset이 보인다\n- 배포가 사용자 장애처럼 보인다\n\ndraining은 이 상황을 줄이기 위한 완충 장치다.\n\n### 2. 어떤 계층이 draining을 하나\n\n- LB: 새 연결을 막고 기존 연결은 유지한다\n- proxy: upstream 연결을 서서히 정리한다\n- app: shutdown hook으로 더 이상 새 작업을 받지 않는다\n\n각 층이 자기 역할을 해야 한다.\n\n### 3. 왜 health check만으로는 부족한가\n\nhealth check가 false를 반환한다고 해서 기존 연결이 즉시 안전하게 닫히는 건 아니다.\n\n- 이미 붙어 있는 keep-alive는 남는다\n- streaming 요청은 더 오래 유지될 수 있다\n- backend는 종료 전에 요청을 마무리해야 한다\n\n### 4. drain timeout을 어떻게 보나\n\ndrain timeout은 너무 짧으면 reset이 늘고, 너무 길면 배포가 느려진다.\n\n- 트래픽 패턴\n- 평균 요청 시간\n- 스트리밍 여부\n- keep-alive 길이\n\n이 네 가지를 같이 봐야 한다.\n\n### 5. safe close의 핵심\n\n진짜 중요한 것은 \"빨리 내리는 것\"이 아니라 **새 요청을 안 받으면서 기존 요청을 끝내는 것**이다.\n\n## 실전 시나리오\n\n### 시나리오 1: 배포 직후 502가 늘어난다\n\ndraining 없이 인스턴스를 내렸을 수 있다.\n\n### 시나리오 2: scale-in 때만 간헐적 reset이 난다\n\n기존 연결이 살아 있는데 backend를 먼저 종료했을 가능성이 있다.\n\n### 시나리오 3: WebSocket/streaming 서비스가 배포 때 깨진다\n\ndrain window가 스트리밍 수명보다 짧을 수 있다.\n\n## 코드로 보기\n\n### Kubernetes preStop 감각\n\n```yaml\nlifecycle:\n  preStop:\n    exec:\n      command: [\"sh\", \"-c\", \"sleep 10\"]\n```\n\n### 앱 종료 흐름 감각\n\n```text\n1. readiness false\n2. 새 트래픽 중단\n3. 기존 요청 마무리\n4. 종료\n```\n\n### 운영 명령\n\n```bash\nkubectl get endpoints\nkubectl describe pod my-app\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| 즉시 종료 | 빠르다 | reset과 에러가 늘 수 있다 | 비정상 종료 |\n| draining 사용 | 요청 손실이 줄어든다 | 배포/종료가 느려진다 | 일반 배포 |\n| 긴 drain window | 스트리밍에 유리하다 | 자원 회수가 늦다 | long-lived connection |\n\n핵심은 종료를 \"꺼버리는 것\"이 아니라 **새로 안 받고 기존을 끝내는 것**이다.\n\n## 꼬리질문\n\n> Q: connection draining은 왜 필요한가요?\n> 핵심: 배포나 scale-in 때 기존 요청이 갑자기 끊기지 않게 하려고 쓴다.\n\n> Q: health check만으로 충분하지 않나요?\n> 핵심: 아니다. 이미 붙은 연결은 별도의 종료 절차가 필요하다.\n\n> Q: drain timeout은 어떻게 생각하나요?\n> 핵심: 평균 요청 시간과 long-lived connection 수명보다 여유 있게 잡는다.\n\n## 한 줄 정리\n\nconnection draining은 배포와 축소 과정에서 기존 연결을 부드럽게 끝내는 장치라서, reset과 502를 줄이려면 readiness와 함께 써야 한다.\n",
   "aliases": [
-    "LB Connection Draining, Deployment 개념",
-    "LB Connection Draining, Deployment 정리",
-    "LB Connection Draining, Deployment 실수",
-    "LB Connection Draining, Deployment 판단 기준",
     "네트워크 LB Connection Draining, Deployment",
     "connection draining",
     "deployment safe close",
@@ -17,7 +13,9 @@
     "deregistration delay",
     "scale-in preStop",
     "load balancer draining",
-    "lb connection draining deployment guide"
+    "lb connection draining deployment guide",
+    "배포 중 기존 연결은 언제 끊어야 해?",
+    "readiness 내렸는데 502가 나는 이유"
   ],
   "expected_queries": [
     "배포 직후 502와 reset이 늘면 connection draining을 어떻게 확인해?",
@@ -56,12 +54,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/lb-connection-draining-deployment-safe-close.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

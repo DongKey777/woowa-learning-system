@@ -6,10 +6,6 @@
   "summary": "Testcontainers는 \"실제와 비슷한 테스트\"를 쉽게 만들지만, 어떤 경계까지 컨테이너로 올리고 어떤 부분은 slice/mock으로 남길지 결정해야 테스트가 느려지지 않는다.",
   "body_markdown": "# Spring Testcontainers Boundary Strategy\n\n> 한 줄 요약: Testcontainers는 \"실제와 비슷한 테스트\"를 쉽게 만들지만, 어떤 경계까지 컨테이너로 올리고 어떤 부분은 slice/mock으로 남길지 결정해야 테스트가 느려지지 않는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Test Slices와 Context Caching](./spring-test-slices-context-caching.md)\n> - [Spring Test Property Override Boundaries: `@SpringBootTest(properties)`, `@TestPropertySource`, `@DynamicPropertySource`, context cache](./spring-test-property-override-boundaries-primer.md)\n> - [Spring `@DynamicPropertySource` vs `@ServiceConnection`: Testcontainers에서 언제 수동 property wiring이 아직 필요한가](./spring-dynamicpropertysource-vs-serviceconnection-primer.md)\n> - [Spring Boot 자동 구성 (Auto-configuration)](./spring-boot-autoconfiguration.md)\n> - [Spring Transaction Debugging Playbook](./spring-transaction-debugging-playbook.md)\n> - [Spring Open Session In View Trade-offs](./spring-open-session-in-view-tradeoffs.md)\n> - [Spring Delivery Reliability: `@Retryable`, Resilience4j, and Outbox Relay Worker Design](./spring-delivery-reliability-retryable-resilience4j-outbox-relay.md)\n\nretrieval-anchor-keywords: Testcontainers, integration test, boundary strategy, docker container, ephemeral dependency, reusable container, slice test, full integration test, dynamic property source\n\n## 문서 역할과 정확성 가드\n\n이 문서는 Testcontainers 사용법 자체보다 **테스트 경계 설계**를 맡는다.\n\n| 읽는 사람 | 먼저 볼 질문 |\n|---|---|\n| 미션 구현자 | 실제 DB/broker 차이가 중요한 테스트만 container로 올렸는가 |\n| 리뷰어 | mock/slice/container/full integration 경계가 근거 없이 섞였는가 |\n| 운영 관점 학습자 | 느린 suite의 원인이 container 수인지, Spring context split인지, 데이터 격리인지 분리했는가 |\n\nSpring Boot 공식 문서 기준으로 조심할 점은 아래다.\n\n- `@ServiceConnection`을 쓰려면 `spring-boot-testcontainers` test dependency가 필요하다. annotation 하나만 붙인다고 모든 프로젝트에서 동작하는 것은 아니다.\n- `@ServiceConnection`은 지원되는 container와 connection details가 맞을 때 auto-configuration에 연결 정보를 제공한다. 모든 외부 서비스나 임의 property를 자동으로 해결한다고 말하면 과하다.\n- `GenericContainer`처럼 이미지나 서비스 타입을 Boot가 추론하기 어려운 경우에는 `@ServiceConnection(name = \"...\")` 힌트가 필요할 수 있다.\n- `@DynamicPropertySource`는 더 장황하지만 유연한 대안이다. `@ServiceConnection`과 경쟁 관계라기보다 \"Boot가 아는 service connection\"과 \"직접 property를 등록해야 하는 경우\"의 선택지로 본다.\n- container가 떠도 readiness, migration, seed data, test data isolation은 별도 문제다. Testcontainers가 자동으로 테스트 안정성을 보장한다고 쓰지 않는다.\n\n## 핵심 개념\n\nTestcontainers는 테스트에서 외부 의존성을 실제에 가깝게 띄워 주는 도구다.\n\n좋은 점은 분명하다.\n\n- DB, Kafka, Redis 같은 의존성을 실제처럼 다룰 수 있다\n- 로컬/CI 환경 차이를 줄일 수 있다\n- \"내 코드만 되는 테스트\"를 줄일 수 있다\n\n하지만 컨테이너를 너무 많이 올리면 테스트는 금방 느려진다.\n\n그래서 중요한 질문은 \"Testcontainers를 쓸까 말까\"가 아니라, **어떤 경계까지 containerized integration으로 검증할까**다.\n\n## 깊이 들어가기\n\n### 1. Testcontainers는 외부 의존성을 현실화한다\n\n```java\n@Testcontainers\n@SpringBootTest\nclass OrderIntegrationTest {\n\n    @Container\n    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(\"postgres:16\");\n}\n```\n\n이 방식은 실제 DB와 유사한 동작을 확인하는 데 좋다.\n\n- SQL 방언 차이\n- 락/트랜잭션 경계\n- 인덱스와 제약 조건\n- 마이그레이션 스크립트\n\n### 2. 모든 테스트를 full integration으로 만들 필요는 없다\n\nTestcontainers를 무조건 모든 테스트에 붙이면 느려진다.\n\n그래서 보통 경계를 나눈다.\n\n- slice test: controller, repository, serializer 단위\n- container test: DB, broker, cache 같은 외부 경계\n- full integration test: 핵심 플로우만\n\n이 문맥은 [Spring Test Slices와 Context Caching](./spring-test-slices-context-caching.md)과 같이 봐야 한다.\n\n### 3. 컨테이너를 어디에 둘지 정해야 한다\n\nTestcontainers 경계는 보통 다음 중 하나다.\n\n- repository layer만 container로 검증\n- service layer까지 포함하되 외부 API는 mock\n- end-to-end 핵심 시나리오만 container로 검증\n\n모든 걸 실제로 올리면 좋아 보이지만, 속도와 유지보수 비용이 급격히 오른다.\n\n### 4. DynamicPropertySource로 런타임 주소를 주입한다\n\n컨테이너는 실행 시점에 host/port가 정해지므로, Spring 테스트에 동적으로 주입해야 한다.\n\n```java\n@DynamicPropertySource\nstatic void overrideProps(DynamicPropertyRegistry registry) {\n    registry.add(\"spring.datasource.url\", postgres::getJdbcUrl);\n    registry.add(\"spring.datasource.username\", postgres::getUsername);\n    registry.add(\"spring.datasource.password\", postgres::getPassword);\n}\n```\n\n이 패턴이 없으면 테스트는 실제 컨테이너를 띄워도 앱 설정이 그 주소를 못 본다.\n\nSpring Boot 3.1+에서는 지원되는 서비스라면 `@ServiceConnection`으로 더 짧게 쓸 수 있다.\n\n```java\n@Container\n@ServiceConnection\nstatic PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(\"postgres:16\");\n```\n\n다만 이 예시는 \"PostgreSQL connection details를 Boot auto-configuration에 연결한다\"는 뜻이지,\n테스트가 필요로 하는 모든 custom property, schema 준비, seed data까지 자동으로 처리한다는 뜻은 아니다.\ncustom image나 `GenericContainer`를 쓰면 `name` 힌트나 `@DynamicPropertySource`가 여전히 더 명확할 수 있다.\n\n```java\n@Bean\n@ServiceConnection(name = \"redis\")\nGenericContainer<?> redisContainer() {\n    return new GenericContainer<>(\"redis:7\");\n}\n```\n\n### 5. 재사용 가능한 컨테이너와 격리 사이의 균형을 봐야 한다\n\n컨테이너 재사용은 빠르지만, 상태 오염 위험이 있다.\n\n반대로 매번 새로 띄우면 느리지만, 깨끗하다.\n\n운영 전략은 보통 다음과 같다.\n\n- 로컬 개발: 재사용 우선\n- CI: 격리 우선\n- flakey test 조사: 깨끗한 컨테이너 우선\n\n## 실전 시나리오\n\n### 시나리오 1: 테스트는 통과하는데 운영 DB에서는 실패한다\n\n대개 다음 원인이 있다.\n\n- H2 같은 in-memory DB와 실제 DB 방언 차이\n- 제약 조건이 다르다\n- 트랜잭션 락 동작이 다르다\n\n이때 Testcontainers는 in-memory 대신 실제 DB를 쓰게 해 차이를 줄여 준다.\n\n### 시나리오 2: 컨테이너 테스트가 너무 느리다\n\n원인 후보:\n\n- 너무 많은 컨테이너를 띄운다\n- 매 테스트마다 context를 새로 올린다\n- full integration test가 너무 많다\n\n대응:\n\n- slice test와 container test를 분리한다\n- 컨테이너를 static fixture로 관리한다\n- 느린 시나리오는 소수만 남긴다\n\n### 시나리오 3: CI에서는 잘 되는데 로컬에서 깨진다\n\n흔한 이유는 포트 충돌, 네트워크, 환경 변수 차이다.\n\nTestcontainers는 이런 차이를 줄이지만, 테스트가 외부 상태를 너무 많이 공유하면 여전히 불안정할 수 있다.\n\n### 시나리오 4: outbox/queue 같은 비동기 경로를 테스트하고 싶다\n\n이 경우는 단순 unit test보다 container 기반 통합 테스트가 더 적합할 수 있다.\n\n- 실제 DB\n- 실제 broker\n- 실제 relay worker\n\n이 조합은 [Spring Delivery Reliability: `@Retryable`, Resilience4j, and Outbox Relay Worker Design](./spring-delivery-reliability-retryable-resilience4j-outbox-relay.md)와 잘 맞는다.\n\n## 코드로 보기\n\n### PostgreSQL container\n\n```java\n@Testcontainers\n@SpringBootTest\nclass ProductRepositoryTest {\n\n    @Container\n    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(\"postgres:16\");\n\n    @DynamicPropertySource\n    static void properties(DynamicPropertyRegistry registry) {\n        registry.add(\"spring.datasource.url\", postgres::getJdbcUrl);\n        registry.add(\"spring.datasource.username\", postgres::getUsername);\n        registry.add(\"spring.datasource.password\", postgres::getPassword);\n    }\n}\n```\n\n### slice + container 혼합 전략\n\n```java\n@DataJpaTest\nclass ProductRepositorySliceTest {\n}\n```\n\n```java\n@SpringBootTest\nclass ProductFlowIntegrationTest {\n}\n```\n\n### 실제 브로커와 함께 테스트하는 예\n\n```java\n@Testcontainers\nclass OutboxRelayIntegrationTest {\n\n    @Container\n    static KafkaContainer kafka = new KafkaContainer(\n        DockerImageName.parse(\"confluentinc/cp-kafka:7.6.0\")\n    );\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| unit test + mock | 빠르다 | 현실성이 낮다 | 순수 로직 |\n| slice test | 경계가 좁고 빠르다 | 외부 의존성은 못 본다 | 레이어 계약 |\n| Testcontainers | 실제와 가깝다 | 느리고 운영 비용이 있다 | DB, broker, cache 검증 |\n| full end-to-end | 가장 현실적이다 | 가장 비싸다 | 핵심 비즈니스 플로우 |\n\n핵심은 Testcontainers를 쓰는지보다, **테스트 피라미드의 어디에 두는가**다.\n\n## 꼬리질문\n\n> Q: Testcontainers와 `@DataJpaTest`는 어떻게 같이 쓸 수 있는가?\n> 의도: slice와 container 결합 이해 확인\n> 핵심: slice 범위 안에서 실제 DB를 붙일 수 있다.\n\n> Q: 컨테이너 테스트가 느려지는 가장 흔한 이유는 무엇인가?\n> 의도: 비용 구조 이해 확인\n> 핵심: 너무 많은 full context와 너무 많은 컨테이너다.\n\n> Q: `DynamicPropertySource`는 왜 필요한가?\n> 의도: 런타임 설정 주입 이해 확인\n> 핵심: 컨테이너 주소가 실행 시점에 정해지기 때문이다.\n\n> Q: H2만 쓰면 안 되는 경우는 언제인가?\n> 의도: 현실 DB 차이 이해 확인\n> 핵심: 락, 제약, SQL 방언, 트랜잭션 차이가 중요한 경우다.\n\n## 한 줄 정리\n\nTestcontainers는 실제 의존성을 테스트로 끌어오지만, slice와 full integration의 경계를 정하지 않으면 테스트가 느리고 비싸진다.\n",
   "aliases": [
-    "Spring Testcontainers Boundary Strategy 개념",
-    "Spring Testcontainers Boundary Strategy 정리",
-    "Spring Testcontainers Boundary Strategy 실수",
-    "Spring Testcontainers Boundary Strategy 판단 기준",
     "스프링 Spring Testcontainers Boundary Strategy",
     "Spring Testcontainers boundary",
     "real dependency vs mock slice",
@@ -17,7 +13,9 @@
     "container test slow",
     "integration test boundary",
     "test pyramid container strategy",
-    "@Bean"
+    "@Bean",
+    "Testcontainers를 어디까지 써야 할까",
+    "실제 DB와 mock 경계 나누기"
   ],
   "expected_queries": [
     "Spring Testcontainers는 어느 테스트 경계까지 적용하는 게 좋아?",
@@ -46,12 +44,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/spring-testcontainers-boundary-strategy.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch163"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

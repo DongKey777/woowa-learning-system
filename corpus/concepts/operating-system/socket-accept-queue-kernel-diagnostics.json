@@ -6,10 +6,6 @@
   "summary": "accept queue 문제는 애플리케이션의 accept() 속도만 볼 게 아니라, 커널이 백로그를 어떻게 쌓고 버리는지를 같이 봐야 정확히 진단된다.",
   "body_markdown": "# Socket Accept Queue, Kernel Diagnostics\n\n> 한 줄 요약: accept queue 문제는 애플리케이션의 `accept()` 속도만 볼 게 아니라, 커널이 백로그를 어떻게 쌓고 버리는지를 같이 봐야 정확히 진단된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TCP Backlog, somaxconn, Listen Queue](./tcp-backlog-somaxconn-listen-queue.md)\n> - [Listener Overload Thresholds and Accept Pause Policy](./listener-overload-thresholds-accept-pause-policy.md)\n> - [`tcp_abort_on_overflow`, Backlog Buffering, and Immediate Post-Accept Rejection](./tcp-abort-on-overflow-fast-fail-policy.md)\n> - [Accept Overload Observability Playbook](./accept-overload-observability-playbook.md)\n> - [Thundering Herd, Accept, Wakeup](./thundering-herd-accept-wakeup.md)\n> - [Softirq, Hardirq, Latency Server Debugging](./softirq-hardirq-latency-server-debugging.md)\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [eBPF, perf, strace, and Production Tracing](./ebpf-perf-strace-production-tracing.md)\n\n> retrieval-anchor-keywords: accept queue, sk_ack_backlog, sk_max_ack_backlog, effective backlog, ListenOverflows, ListenDrops, tcp_abort_on_overflow, SYN backlog, ss -ltn, /proc/net/netstat, listener overload, accept pause threshold, session-init queue, accept overload observability playbook, backlog fill ratio, kernel queue vs CQ queue, immediate post-accept rejection, accept overflow fast fail, kernel-side fast fail\n\n## 핵심 개념\n\nTCP listen socket은 handshake를 마친 연결을 accept queue에 쌓는다. 이 큐가 넘치면 새 연결은 지연되거나 드랍된다.\n\n- `sk_ack_backlog`: 현재 accept queue에 쌓인 연결 수다\n- `sk_max_ack_backlog`: accept queue의 최대치다\n- `ListenOverflows`, `ListenDrops`: 커널이 backlog를 못 받아낸 흔적이다\n\n왜 중요한가:\n\n- 애플리케이션의 `accept()`가 느려도 문제가 생긴다\n- SYN backlog와 accept queue는 다른 병목이다\n- softirq와 scheduler 지연이 accept queue를 간접적으로 망가뜨릴 수 있다\n\n이 문서는 [TCP Backlog, somaxconn, Listen Queue](./tcp-backlog-somaxconn-listen-queue.md)를 커널 관측 지표 중심으로 더 좁힌다. `ss -ltn`, `ListenOverflows`/`ListenDrops`, `io_uring` CQ를 같은 시간축에서 묶는 step-oriented 흐름은 [Accept Overload Observability Playbook](./accept-overload-observability-playbook.md)에서 이어서 본다.\n\n## 깊이 들어가기\n\n### 1. accept queue는 handshake 이후의 대기열이다\n\n클라이언트가 3-way handshake를 끝냈다고 바로 앱이 받는 것은 아니다.\n\n- 커널이 먼저 큐에 둔다\n- 앱이 `accept()`해야 user space로 넘어간다\n- 큐가 꽉 차면 연결이 밀린다\n\n### 2. 커널 카운터를 같이 봐야 한다\n\n- `ListenOverflows`\n- `ListenDrops`\n- `Syncookies`\n\n이 지표들은 backlog가 실제로 압박받는지 알려준다.\n\n### 3. 단순 accept 속도만의 문제가 아닐 수 있다\n\n- IRQ/softirq가 밀린다\n- worker가 CPU를 못 받는다\n- fd exhaustion이 먼저 온다\n\n### 4. backlog overflow는 클라이언트 체감 장애다\n\n앱 로그보다 먼저 클라이언트 timeout, 재전송, connection reset으로 나타날 수 있다.\n\n이 지점에서 중요한 운영 질문은 \"overflow를 잠깐 버스트로 흡수할지\", \"`tcp_abort_on_overflow`로 바로 reset할지\", \"`accept()` 직후 user space에서 빠르게 거절할지\"다. 그 failure boundary 선택 자체는 [`tcp_abort_on_overflow`, Backlog Buffering, and Immediate Post-Accept Rejection](./tcp-abort-on-overflow-fast-fail-policy.md)에서 따로 다룬다.\n\n## 실전 시나리오\n\n### 시나리오 1: connect timeout이 증가한다\n\n가능한 원인:\n\n- accept queue가 꽉 찼다\n- 앱의 accept loop가 느리다\n- backlog가 너무 작다\n\n진단:\n\n```bash\nss -ltnp\ncat /proc/net/netstat | grep -E 'ListenOverflows|ListenDrops|Syncookies'\n```\n\n### 시나리오 2: 배포 직후만 연결이 흔들린다\n\n가능한 원인:\n\n- cold start로 accept 속도가 낮다\n- thundering herd가 일어난다\n- readiness가 너무 빨리 올라간다\n\n### 시나리오 3: CPU는 멀쩡한데 listen 큐만 가득 찬다\n\n가능한 원인:\n\n- wakeup/softirq 지연\n- connection burst\n- accept path에서 fd 생성이 늦다\n\n## 코드로 보기\n\n### listen socket 상태 확인\n\n```bash\nss -ltnp\n```\n\n### 커널 카운터 확인\n\n```bash\ncat /proc/net/netstat | grep -E 'ListenOverflows|ListenDrops|Syncookies'\n```\n\n### 단순 모델\n\n```text\nhandshake completes\n  -> kernel enqueues to accept queue\n  -> app accept() drains queue\n  -> if drain is slow, overflows appear\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| backlog 상향 | 버스트 흡수에 좋다 | 메모리와 지연이 늘 수 있다 | 피크 트래픽 |\n| accept loop 최적화 | 큐 드레인을 빠르게 한다 | 구현 복잡도 증가 | 고성능 서버 |\n| `SO_REUSEPORT` | 경합을 줄인다 | 배치와 운영이 복잡하다 | 멀티워커 |\n\n## 꼬리질문\n\n> Q: `ListenDrops`는 무엇을 의미하나요?\n> 핵심: 커널이 accept queue나 관련 경로에서 연결을 버렸다는 신호다.\n\n> Q: accept queue와 SYN backlog는 같나요?\n> 핵심: 아니다. handshake 이전과 이후의 다른 큐다.\n\n> Q: accept queue 문제를 어떻게 구분하나요?\n> 핵심: `ss -ltnp`와 `/proc/net/netstat`를 같이 본다.\n\n## 한 줄 정리\n\naccept queue 장애는 커널 큐 지표와 함께 봐야 하며, `accept()` 속도와 softirq/IRQ 지연이 함께 병목을 만든다.\n",
   "aliases": [
-    "Socket Accept Queue, Kernel 개념",
-    "Socket Accept Queue, Kernel 정리",
-    "Socket Accept Queue, Kernel 실수",
-    "Socket Accept Queue, Kernel 판단 기준",
     "운영체제 Socket Accept Queue, Kernel",
     "socket accept queue kernel diagnostics",
     "accept queue kernel diagnostics",
@@ -17,7 +13,9 @@
     "sk_max_ack_backlog basics",
     "ListenOverflows ListenDrops meaning",
     "ss ltn backlog diagnosis",
-    "accept queue overflow diagnosis"
+    "accept queue overflow diagnosis",
+    "ListenOverflows가 늘 때 accept queue 보기",
+    "ss -ltn으로 backlog 상태 읽기"
   ],
   "expected_queries": [
     "accept queue가 찼는지 커널 지표로 먼저 확인하는 문서가 필요해",
@@ -49,12 +47,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/socket-accept-queue-kernel-diagnostics.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

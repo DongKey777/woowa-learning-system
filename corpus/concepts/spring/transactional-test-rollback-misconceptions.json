@@ -6,10 +6,6 @@
   "summary": "@Transactional 테스트가 자동으로 모든 부작용을 되돌린다고 믿으면 안 되며, 트랜잭션 범위 밖의 작업은 그대로 남을 수 있다.",
   "body_markdown": "# Spring Transactional Test Rollback Misconceptions\n\n> 한 줄 요약: `@Transactional` 테스트가 자동으로 모든 부작용을 되돌린다고 믿으면 안 되며, 트랜잭션 범위 밖의 작업은 그대로 남을 수 있다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Test Slices와 Context Caching](./spring-test-slices-context-caching.md)\n> - [Spring Test Slice `@Import` / `@TestConfiguration` Boundary Leaks](./spring-test-slice-import-testconfiguration-boundaries.md)\n> - [Spring `@DataJpaTest` Flush / Clear / Rollback Visibility Pitfalls](./spring-datajpatest-flush-clear-rollback-visibility-pitfalls.md)\n> - [Spring Testcontainers Boundary Strategy](./spring-testcontainers-boundary-strategy.md)\n> - [@Transactional 깊이 파기](./transactional-deep-dive.md)\n> - [Spring `@Transactional` and `@Async` Composition Traps](./spring-transactional-async-composition-traps.md)\n> - [Spring Transaction Debugging Playbook](./spring-transaction-debugging-playbook.md)\n> - [Spring Transaction Synchronization Callbacks and `afterCommit` Pitfalls](./spring-transaction-synchronization-aftercommit-pitfalls.md)\n\nretrieval-anchor-keywords: transactional test, rollback misconception, test transaction, integration test rollback, test managed transaction, commit in tests, async side effects, database cleanup, rollback test vs commit visible, after commit verification test, DataJpaTest enough when, commit path boundary card\n\n## 핵심 개념\n\nSpring 테스트에서 `@Transactional`을 붙이면 보통 테스트 메서드가 끝나고 롤백된다.\n\n하지만 이것이 의미하는 것은 \"DB 트랜잭션 안에 있는 변경\"일 뿐이다.\n\n- 비동기 작업\n- 외부 API 호출\n- 파일 생성\n- 다른 transaction manager 커밋\n\n이런 것들은 그대로 남을 수 있다.\n\n## 깊이 들어가기\n\n### 1. 테스트 트랜잭션은 테스트 경계에 묶인다\n\n테스트 프레임워크가 관리하는 transaction과 실제 애플리케이션 로직의 경계는 다를 수 있다.\n\n### 2. 커밋을 강제하는 코드가 있으면 롤백과 무관하다\n\n`REQUIRES_NEW` 같은 별도 경계는 테스트 롤백과 분리될 수 있다.\n\n이 문맥은 [@Transactional 깊이 파기](./transactional-deep-dive.md)와 [Spring Transaction Synchronization Callbacks and `afterCommit` Pitfalls](./spring-transaction-synchronization-aftercommit-pitfalls.md)와 같이 봐야 한다.\n\n### 3. async side effect는 롤백되지 않는다\n\n`@Async`로 보낸 작업은 테스트 트랜잭션과 별개로 실행될 수 있다.\n\n### 4. DB rollback만으로는 충분하지 않다\n\n테스트 후 데이터 정리는 DB, queue, cache, filesystem, external service를 모두 고려해야 한다.\n\n### 5. commit을 검증하고 싶다면 별도 테스트가 필요하다\n\n트랜잭션 롤백을 기대하는 테스트와 실제 commit 흐름을 검증하는 테스트는 다르게 설계해야 한다.\n\n초급자라면 먼저 이렇게 자르면 된다.\n\n- repository 매핑/쿼리/flush 시점 검증: `@DataJpaTest`가 먼저다\n- commit 뒤 다른 경계에서 보이는 효과 검증: 더 넓은 테스트가 필요하다\n\n이 구분을 더 짧은 비교표로 보고 싶다면 [Spring `@DataJpaTest` Flush / Clear / Rollback Visibility Pitfalls](./spring-datajpatest-flush-clear-rollback-visibility-pitfalls.md)의 \"언제 `@DataJpaTest` rollback으로 충분하고, 언제 더 넓혀야 하나\" 섹션을 같이 보면 된다.\n\n## 실전 시나리오\n\n### 시나리오 1: 테스트가 끝났는데 outbox row가 남는다\n\n별도 트랜잭션이나 비동기 relay 때문일 수 있다.\n\n### 시나리오 2: DB는 깨끗한데 파일은 남는다\n\n파일 시스템은 DB 롤백과 무관하다.\n\n### 시나리오 3: 테스트는 롤백되는데 외부 API는 호출됐다\n\n외부 side effect는 자동으로 되돌려지지 않는다.\n\n### 시나리오 4: `@Commit` / `@Rollback(false)`를 남용한다\n\n테스트가 서로에게 오염을 남길 수 있다.\n\n## 코드로 보기\n\n### transactional test\n\n```java\n@SpringBootTest\n@Transactional\nclass OrderServiceTest {\n\n    @Test\n    void placeOrder() {\n        orderService.placeOrder();\n    }\n}\n```\n\n### commit test\n\n```java\n@Commit\n@Test\nvoid shouldPersist() {\n}\n```\n\n### async side effect\n\n```java\n@Async\npublic void sendMail() {\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| transactional test | DB cleanup이 쉽다 | commit 경로를 못 본다 | 일반 통합 테스트 |\n| commit test | 실제 저장을 본다 | 오염 관리가 어렵다 | commit 검증 |\n| manual cleanup | 명시적이다 | 번거롭다 | 외부 side effect |\n\n핵심은 test rollback을 \"만능 청소기\"가 아니라, **DB 트랜잭션에만 적용되는 경계**로 이해하는 것이다.\n\n## Playbook: 재현 조건\n\n테스트 rollback 오해는 \"테스트가 끝나면 모든 것이 원복된다\"는 가정에서 시작한다. 재현할 때는 side effect 종류를 분리한다.\n\n- test-managed transaction 안에서 저장한 DB row가 rollback되는지 본다.\n- `REQUIRES_NEW`, 별도 transaction manager, manual commit이 테스트 rollback 밖으로 나가는지 본다.\n- `@Async`, scheduler, event listener가 테스트 method 종료 전후 어느 thread에서 실행되는지 본다.\n- outbox relay, message broker, file, cache, external API 호출이 남는지 본다.\n- `@Commit`, `@Rollback(false)`가 class/method에 남아 있는지 확인한다.\n\n## Playbook: 확인 순서\n\n1. 테스트 annotation을 본다. `@Transactional`이 테스트 method에 적용되는지, slice test인지 full context인지 확인한다.\n2. 검증하려는 것이 repository flush/constraint인지, 실제 commit 후 관측 가능한 효과인지 나눈다.\n3. 서비스 코드 안에 `REQUIRES_NEW`, `TransactionTemplate`, manual transaction boundary가 있는지 찾는다.\n4. after-commit callback과 `@TransactionalEventListener(AFTER_COMMIT)`는 테스트 rollback에서 실행되지 않을 수도 있고, commit test에서는 실행될 수 있음을 분리한다.\n5. 비동기 side effect는 await/cleanup 전략을 별도로 둔다.\n6. commit path를 검증해야 하면 rollback test와 분리하고, 테스트 데이터 cleanup을 명시한다.\n\n## Playbook: failure matrix\n\n| 증상 | 흔한 원인 | 확인/처방 |\n|---|---|---|\n| 테스트 후 DB row가 남음 | `@Commit`, `@Rollback(false)`, `REQUIRES_NEW`, 다른 transaction manager | annotation, propagation, datasource/tx manager 확인 |\n| rollback test에서 after-commit listener가 안 돎 | 테스트 transaction이 commit되지 않음 | commit path 별도 테스트, `TestTransaction` 사용 검토 |\n| DB는 깨끗한데 메시지/파일이 남음 | DB rollback 밖 side effect | fake adapter, temp dir cleanup, broker purge |\n| constraint violation이 테스트 끝까지 안 보임 | flush 전이라 DB가 아직 검사하지 않음 | `flush()`/`clear()` 또는 repository slice 검증 |\n| 테스트 간 간헐 오염 | async 작업이 늦게 완료, cache/session 공유 | await, cache clear, isolated fixtures |\n\n## Playbook: 검증\n\n- rollback을 기대하는 테스트는 \"DB 변경이 남지 않는다\"까지만 검증한다.\n- commit 이후 동작을 검증하는 테스트는 commit을 실제로 만들고 cleanup 책임을 명시한다.\n- outbox/after-commit은 rollback test 하나로 판단하지 말고 commit path와 relay path를 따로 둔다.\n- 외부 side effect는 mock/fake로 차단하거나 테스트 종료 후 관측 가능한 cleanup을 둔다.\n- `@DataJpaTest`는 repository mapping, query, flush 검증에 집중하고 web/service side effect 보장으로 확장하지 않는다.\n\n## 꼬리질문\n\n> Q: `@Transactional` 테스트가 모두 되돌리는 것은 무엇인가?\n> 의도: 테스트 경계 이해 확인\n> 핵심: 테스트 관리 트랜잭션 안의 DB 변경이다.\n\n> Q: 왜 async side effect는 롤백되지 않는가?\n> 의도: 트랜잭션과 스레드 경계 이해 확인\n> 핵심: 다른 스레드/경계에서 실행되기 때문이다.\n\n> Q: `@Commit`은 언제 쓰는가?\n> 의도: commit path 검증 이해 확인\n> 핵심: 실제 저장을 확인해야 할 때다.\n\n> Q: DB rollback만으로 충분하지 않은 이유는 무엇인가?\n> 의도: 외부 side effect 인식 확인\n> 핵심: 파일, 메시지, 외부 호출은 따로 관리해야 한다.\n\n## 한 줄 정리\n\nTransactional test rollback은 DB 경계에만 적용되므로, async와 외부 side effect는 별도 정리와 검증이 필요하다.\n",
   "aliases": [
-    "Spring Transactional Test Rollback 개념",
-    "Spring Transactional Test Rollback 정리",
-    "Spring Transactional Test Rollback 실수",
-    "Spring Transactional Test Rollback 판단 기준",
     "스프링 Spring Transactional Test Rollback",
     "@Transactional test rollback misconception",
     "test rollback side effects",
@@ -17,7 +13,9 @@
     "DataJpaTest rollback visibility",
     "Testcontainers transaction rollback",
     "async side effect not rolled back",
-    "@Async"
+    "@Async",
+    "@Transactional 테스트 밖 부작용은 남나요",
+    "afterCommit 작업은 테스트 rollback 밖인가"
   ],
   "expected_queries": [
     "@Transactional test는 모든 부작용을 자동 rollback해?",
@@ -45,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/spring-transactional-test-rollback-misconceptions.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch163"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "가장 오래 안 쓴 항목부터 버리는 캐시 정책으로, HashMap과 이중 연결 리스트 조합이 정석이다.",
   "body_markdown": "# LRU Cache Design\n\n> 한 줄 요약: 가장 오래 안 쓴 항목부터 버리는 캐시 정책으로, `HashMap`과 이중 연결 리스트 조합이 정석이다.\n\n**난이도: 🟡 Intermediate**\n\n\n> 관련 문서:\n> - [HashMap 내부 구조](./hashmap-internals.md)\n> - [TreeMap, HashMap, LinkedHashMap 비교](./treemap-vs-hashmap-vs-linkedhashmap.md)\n> - [Bloom Filter](./bloom-filter.md)\n> - [분산 캐시 설계](../system-design/distributed-cache-design.md)\n\n> retrieval-anchor-keywords: lru cache, least recently used, linkedhashmap, hashmap doubly linked list, cache eviction, access order, local cache, bounded cache, eviction policy, locality\n\n## 핵심 개념\n\nLRU(Least Recently Used) 캐시는 \"최근에 가장 덜 사용한 항목을 먼저 내보내는\" 정책이다.\n\n왜 필요할까?\n\n- 캐시 공간은 항상 제한되어 있다.\n- 가장 최근에 쓴 데이터가 앞으로도 다시 쓰일 확률이 높다.\n- 지역성(locality)을 활용하면 적은 메모리로 높은 적중률을 얻을 수 있다.\n\nLRU의 핵심은 두 가지다.\n\n- 키로 빠르게 조회할 수 있어야 한다.\n- 최근 사용 순서를 빠르게 갱신할 수 있어야 한다.\n\n## 10초 선택기\n\n| 요구 | 선택 | 확인할 점 |\n|---|---|---|\n| 작은 로컬 캐시, 크기 제한만 필요 | `LinkedHashMap(accessOrder=true)` | 동시성 요구가 낮은가 |\n| `get/put/evict`를 직접 설명해야 함 | `HashMap + doubly linked list` | node remove/insert가 O(1)인가 |\n| TTL, eviction reason, metric 필요 | 캐시 라이브러리 또는 커스텀 정책 | LRU 하나로 충분한가 |\n| 고동시성 local cache | Caffeine 같은 검증된 라이브러리 | eviction/admission/expire 통계를 같이 볼 수 있는가 |\n| 여러 서버가 공유해야 함 | 분산 캐시 | local LRU와 consistency 요구를 분리 |\n\n## 깊이 들어가기\n\n### 1. 왜 `HashMap + Doubly Linked List`인가\n\n`HashMap`은 키 조회가 빠르고, 이중 연결 리스트는 노드를 앞뒤로 옮기기 쉽다.\n\n조합하면 다음 연산을 O(1) 수준으로 만들 수 있다.\n\n- `get(key)`\n- `put(key, value)`\n- `move-to-front`\n- `evict-tail`\n\n### 2. `LinkedHashMap`이 자주 쓰이는 이유\n\nJava에서는 `LinkedHashMap`이 이미 접근 순서 유지와 제거 훅을 제공한다.\n직접 구현할 수 있지만, 단순한 로컬 캐시라면 `LinkedHashMap`이 더 실용적이다.\n\n```java\nimport java.util.LinkedHashMap;\nimport java.util.Map;\n\nMap<String, String> cache = new LinkedHashMap<>(16, 0.75f, true) {\n    @Override\n    protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {\n        return size() > 1000;\n    }\n};\n```\n\n`true`는 access-order를 의미한다.\n`get()` 호출만으로도 최근 사용 순서가 갱신된다.\n\n### 3. 수동 구현이 필요한 경우\n\n세밀한 정책이 필요할 때는 직접 이중 연결 리스트를 제어하는 편이 낫다.\n\n- TTL과 LRU를 함께 써야 할 때\n- 메트릭과 eviction reason을 자세히 남겨야 할 때\n- 멀티스레드 제어를 세밀하게 하고 싶을 때\n\n## 헷갈리는 축\n\n| 축 | 확인할 것 | 오해 |\n|---|---|---|\n| lookup vs order | `HashMap`은 key lookup, list는 recency order | HashMap만 있으면 tail eviction도 빠르다고 생각 |\n| access-order vs insertion-order | `get()`도 순서를 바꾸는가 | 넣은 순서만 보고 LRU라고 착각 |\n| local cache vs distributed cache | 한 JVM 안의 eviction인가 | local LRU로 서버 간 일관성을 해결하려 함 |\n| eviction vs expiration | 용량 때문에 내보내는가, 시간이 지나 만료되는가 | TTL과 LRU를 같은 정책으로 봄 |\n\n## production guardrail\n\nLRU 구현은 면접용 invariant와 운영용 cache가 갈리는 지점이 뚜렷하다.\n\n- `capacity <= 0`은 생성 시점에 막는다. 그렇지 않으면 tail sentinel을 지우려는 버그가 생긴다.\n- `LinkedHashMap`과 아래 `HashMap + list` 예제는 thread-safe가 아니다. access-order에서는 여러 스레드가 `get()`만 해도 recency list가 변경된다.\n- 단순히 읽기 락처럼 다루면 안 된다. recency 갱신은 쓰기이므로, 작은 캐시는 외부 동기화로 직렬화하고 고동시성 캐시는 Caffeine 같은 검증된 라이브러리를 우선 검토한다.\n- 크기 기준 eviction과 weight 기준 eviction은 다르다. value 크기 편차가 크면 entry count만으로 메모리 상한을 지키기 어렵다.\n- TTL/expire-after-access는 \"오래 안 쓴 항목 제거\"와 다른 축이다. 둘을 섞으면 eviction reason을 따로 남겨야 장애 분석이 된다.\n\n---\n\n## 실전 시나리오\n\n### 시나리오 1: 로컬 핫키 캐시\n\n애플리케이션 레벨에서 자주 읽는 설정값이나 사용자 세션을 캐싱할 때 LRU가 잘 맞는다.\n\n문제는 캐시 크기를 잘못 잡으면 다음이 생긴다.\n\n- 너무 작으면 미스가 많아진다.\n- 너무 크면 GC 압박과 메모리 사용량이 커진다.\n\n### 시나리오 2: 잘못된 eviction 정책\n\nLFU가 좋아 보이지만 최근 폭발적인 트래픽 패턴에 약할 수 있다.\n반대로 LRU는 \"오래된 항목\"을 내보내므로 burst 이후 복구가 단순하다.\n\n### 시나리오 3: 오선택 신호\n\n| 오선택 | 증상 | 수정 |\n|---|---|---|\n| `HashMap`만으로 LRU 구현 | 가장 오래 안 쓴 key를 찾으려 매번 순회한다 | doubly linked list를 같이 둔다 |\n| insertion-order `LinkedHashMap` 사용 | 조회한 항목도 오래된 것으로 밀려 eviction된다 | accessOrder를 `true`로 둔다 |\n| 동시 접근이 많은데 plain `LinkedHashMap` 사용 | 순서 list가 깨지거나 race가 생긴다 | synchronization, `Caffeine` 같은 라이브러리 검토 |\n| TTL 요구를 LRU로만 처리 | 오래 안 쓴 항목은 나가지만 만료 시간이 지난 항목이 남는다 | TTL wheel/expire-after 정책 추가 |\n\n---\n\n## 코드로 보기\n\n아래 구현은 LRU invariant를 설명하는 단일 스레드 예제다. 운영 캐시는 동시성 제어, eviction callback, weight, TTL, null value 정책을 별도로 설계해야 한다.\n\n```java\nimport java.util.HashMap;\nimport java.util.Map;\n\npublic class LruCache<K, V> {\n    private final int capacity;\n    private final Map<K, Node<K, V>> index = new HashMap<>();\n    private final Node<K, V> head = new Node<>(null, null);\n    private final Node<K, V> tail = new Node<>(null, null);\n\n    public LruCache(int capacity) {\n        if (capacity <= 0) {\n            throw new IllegalArgumentException(\"capacity must be positive\");\n        }\n        this.capacity = capacity;\n        head.next = tail;\n        tail.prev = head;\n    }\n\n    public V get(K key) {\n        Node<K, V> node = index.get(key);\n        if (node == null) return null;\n        moveToFront(node);\n        return node.value;\n    }\n\n    public void put(K key, V value) {\n        Node<K, V> node = index.get(key);\n        if (node != null) {\n            node.value = value;\n            moveToFront(node);\n            return;\n        }\n\n        if (index.size() == capacity) {\n            Node<K, V> lru = tail.prev;\n            remove(lru);\n            index.remove(lru.key);\n        }\n\n        Node<K, V> created = new Node<>(key, value);\n        index.put(key, created);\n        insertFront(created);\n    }\n\n    private void moveToFront(Node<K, V> node) {\n        remove(node);\n        insertFront(node);\n    }\n\n    private void remove(Node<K, V> node) {\n        node.prev.next = node.next;\n        node.next.prev = node.prev;\n    }\n\n    private void insertFront(Node<K, V> node) {\n        node.next = head.next;\n        node.prev = head;\n        head.next.prev = node;\n        head.next = node;\n    }\n\n    private static final class Node<K, V> {\n        K key;\n        V value;\n        Node<K, V> prev;\n        Node<K, V> next;\n\n        Node(K key, V value) {\n            this.key = key;\n            this.value = value;\n        }\n    }\n}\n```\n\n---\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| LRU | 구현이 직관적이고 최근성에 강함 | 오래됐지만 자주 쓰는 항목을 내보낼 수 있음 | 일반적인 로컬 캐시 |\n| LFU | 자주 쓰는 항목을 오래 보존함 | 구현과 갱신 비용이 복잡함 | 반복 접근이 강한 워크로드 |\n| FIFO | 단순함 | 지역성을 거의 활용하지 못함 | 아주 단순한 버퍼 |\n| LinkedHashMap | 구현이 쉽고 실수 적음 | 정책을 세밀하게 커스터마이즈하기 어려움 | 빠른 구현이 필요할 때 |\n\nLRU는 만능이 아니다.\n트래픽이 갑자기 바뀌는 시스템에서는 TTL, LFU, admission policy를 같이 봐야 한다.\n\n---\n\n## 꼬리질문\n\n> Q: 왜 `HashMap`만으로는 LRU를 만들기 어려운가?\n> 의도: 조회와 순서 관리의 두 요구를 분리해서 생각하는지 확인\n> 핵심: 순서 갱신이 O(1)이 아니면 캐시 정책이 느려진다.\n\n> Q: `LinkedHashMap`으로 충분한데 굳이 직접 구현하는 경우는 언제인가?\n> 의도: 표준 라이브러리와 커스텀 구현의 경계 이해 확인\n> 핵심: 관측성, 동시성, TTL 조합, 상세 정책이 필요할 때다.\n\n> Q: LRU가 잘못 맞는 워크로드는 무엇인가?\n> 의도: 정책 선택을 상황 기반으로 보는지 확인\n> 핵심: 반복적으로 뜨거운 항목과 일시적 버스트가 섞인 경우다.\n\n## 한 줄 정리\n\nLRU 캐시는 최근 사용 순서를 빠르게 갱신해야 하므로, `HashMap`과 이중 연결 리스트의 조합이 표준 해법이다.\n",
   "aliases": [
-    "LRU Cache Design 개념",
-    "LRU Cache Design 정리",
-    "LRU Cache Design 실수",
-    "LRU Cache Design 판단 기준",
     "자료구조 LRU Cache Design",
     "LRU cache",
     "Least Recently Used cache",
@@ -17,7 +13,9 @@
     "cache eviction policy",
     "access order cache",
     "LinkedHashMap LRU",
-    "bounded local cache"
+    "bounded local cache",
+    "가장 오래 안 쓴 캐시 구현",
+    "캐시 조회와 eviction O1로 만들기"
   ],
   "expected_queries": [
     "LRU Cache는 왜 HashMap과 doubly linked list를 같이 써?",
@@ -55,12 +53,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/data-structure/lru-cache-design.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch155"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "NAT64와 DNS64는 IPv6-only 세계에서 IPv4 서비스를 이어주는 브리지지만, DNS와 주소 변환이 함께 맞아야 한다.",
   "body_markdown": "# NAT64, DNS64 Intuition\n\n> 한 줄 요약: NAT64와 DNS64는 IPv6-only 세계에서 IPv4 서비스를 이어주는 브리지지만, DNS와 주소 변환이 함께 맞아야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [IPv4 vs IPv6 Operational Trade-offs](./ipv4-vs-ipv6-operational-tradeoffs.md)\n> - [Happy Eyeballs, Dual-Stack Racing](./happy-eyeballs-dual-stack-racing.md)\n> - [DNS, CDN, HTTP/2, HTTP/3](./dns-cdn-websocket-http2-http3.md)\n> - [DNS TTL Cache Failure Patterns](./dns-ttl-cache-failure-patterns.md)\n> - [DNS Negative Caching, NXDOMAIN Behavior](./dns-negative-caching-nxdomain-behavior.md)\n\nretrieval-anchor-keywords: NAT64, DNS64, IPv6-only, IPv4 reachability, address synthesis, translator, prefix, dual-stack migration, transport translation\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nNAT64와 DNS64는 IPv6-only 클라이언트가 IPv4-only 목적지에 접속할 수 있게 하는 조합이다.\n\n- `DNS64`: IPv4 주소를 IPv6 주소처럼 합성한다\n- `NAT64`: 합성된 IPv6 트래픽을 IPv4 목적지로 변환한다\n\n이 조합은 이름 기반 연결에서 IPv6-only 클라이언트가 IPv4-only 목적지에 접근할 수 있게 한다.\n\n단, NAT64/DNS64는 \"IPv4가 사라진다\"가 아니라 IPv6-only client와 IPv4-only destination 사이에 변환 책임이 생긴다는 뜻이다. DNS, routing, translator state, application address handling 중 하나만 어긋나도 증상은 단순한 timeout이나 특정 API 장애처럼 보일 수 있다.\n\n### Retrieval Anchors\n\n- `NAT64`\n- `DNS64`\n- `IPv6-only`\n- `IPv4 reachability`\n- `address synthesis`\n- `translator`\n- `prefix`\n- `dual-stack migration`\n- `transport translation`\n\n## 깊이 들어가기\n\n### 1. 왜 이런 장치가 필요한가\n\nIPv6-only 환경이 늘어나면, 아직 IPv4만 있는 서비스에 접근해야 할 수 있다.\n\n- 외부 API가 IPv4 only일 수 있다\n- 레거시 DB나 관리 도구가 IPv4만 지원할 수 있다\n- 클라이언트는 IPv6-only로 유지하고 싶다\n\n### 2. DNS64는 무엇을 하는가\n\nIPv4 전용 이름이 조회되면, DNS64는 그 IPv4를 IPv6 형태로 합성한다.\n\n- 실제 IPv6 주소처럼 보인다\n- NAT64의 prefix를 붙인다\n- 클라이언트는 IPv6로 접속하는 것처럼 느낀다\n\nDNS64는 보통 AAAA가 없는 이름에 대해 A 응답을 바탕으로 합성 AAAA를 만든다. 이미 native AAAA가 있는 서비스라면 그 native IPv6 경로가 우선될 수 있고, 이 경우 NAT64 translator는 관여하지 않는다. 그래서 \"AAAA가 보인다\"만으로 native IPv6인지 DNS64 합성인지 단정하면 안 된다.\n\n합성 여부를 볼 때는 well-known prefix `64:ff9b::/96` 또는 환경별 NAT64 prefix를 확인한다. 운영망은 custom prefix를 쓸 수 있으므로 prefix discovery와 라우팅 정책을 함께 본다.\n\n### 3. NAT64는 무엇을 하는가\n\nNAT64는 그 IPv6 트래픽을 IPv4 목적지로 번역한다.\n\n- 주소 family를 넘나든다\n- 클라이언트는 IPv6-only여도 된다\n- backend는 IPv4-only여도 된다\n\n### 4. 왜 운영이 까다로운가\n\nDNS64와 NAT64는 함께 가야 한다.\n\n- DNS 결과가 맞아야 한다\n- prefix와 translator가 일관돼야 한다\n- 일부 앱은 합성 주소를 이상하게 볼 수 있다\n\n추가로 다음 edge case를 분리해야 한다.\n\n- 앱이 literal IPv4 address를 직접 사용하면 DNS64가 개입할 수 없다\n- IP allowlist, audit log, geo policy가 translator의 IPv4 egress 주소를 보게 될 수 있다\n- FTP, SIP처럼 payload 안에 IP를 담는 프로토콜은 단순 주소 변환만으로 부족할 수 있다\n- MTU, fragmentation, PMTUD 문제가 translator 경로에서만 보일 수 있다\n- TLS SNI와 certificate 검증은 이름 기준이므로 합성 주소 자체가 인증서를 대체하지 않는다\n\n### 5. 언제 특히 유용한가\n\n- 모바일 네트워크\n- 신규 IPv6-only 클라이언트\n- 레거시 IPv4 서비스로의 브리지\n\n### 6. 장애 분리 playbook\n\nIPv6-only 환경에서 \"어떤 IPv4 서비스만 안 된다\"면 다음 순서로 나눈다.\n\n1. Client가 실제 IPv6-only인지, dual-stack fallback이 숨어 있는지 확인한다.\n2. 같은 이름에 native AAAA가 있는지, DNS64가 A 기반 합성 AAAA를 만들었는지 구분한다.\n3. 합성 prefix가 해당 NAT64 translator로 라우팅되는지 확인한다.\n4. Translator에서 IPv4 목적지로 나가는 egress, allowlist, return path가 정상인지 본다.\n5. Literal IPv4, custom DNS resolver, DoH, application DNS cache가 DNS64를 우회하지 않는지 확인한다.\n6. Happy Eyeballs가 native IPv6 실패를 IPv4/NAT64 문제처럼 숨기지 않는지 timing을 분해한다.\n\n### 7. 역할에 맞는 답변 프레임\n\n초급 설명에서는 \"DNS64는 주소 합성, NAT64는 패킷 변환\"이면 충분하다. 운영 답변에서는 \"native AAAA, synthesized AAAA, translator reachability, IPv4 egress policy, app literal-IP 사용 여부\"를 분리해야 한다. 특히 NAT64 장애를 backend 장애로 단정하지 말고 translator 앞뒤에서 각각 packet과 log를 본다.\n\n## 실전 시나리오\n\n### 시나리오 1: IPv6-only 망에서 어떤 사이트는 되고 어떤 사이트는 안 된다\n\n사용 중인 resolver 경로에서 DNS64 합성이 이뤄지지 않거나 NAT64 translator 경로가 막힌 경우다.\n\n또는 해당 앱이 system resolver를 쓰지 않고 자체 DoH/resolver를 사용해 DNS64 합성을 우회했을 수 있다.\n\n### 시나리오 2: 연결은 되는데 특정 API만 느리다\n\naddress synthesis와 translator 경로 품질이 원인일 수 있다.\n\n### 시나리오 3: DNS는 합성했는데 backend가 연결을 거부한다\n\nTranslator egress allowlist, prefix mismatch, routing 문제를 의심한다.\n\nBackend allowlist가 NAT64 translator의 egress IPv4를 허용하지 않는 경우도 흔하다. 이때 backend는 \"낯선 IPv4 client\"로 보고 거부한다.\n\n## 코드로 보기\n\n### 확인 명령\n\n```bash\ndig AAAA example.com\ndig A example.com\n```\n\n### 관찰 감각\n\n```text\nIPv6-only client\n-> DNS64 synthesizes AAAA\n-> NAT64 translates to IPv4\n```\n\n### 체크 포인트\n\n```text\n- DNS64 prefix is consistent\n- NAT64 translator is reachable\n- backend IPv4 path is healthy\n- app does not bypass DNS64 with literal IPv4 or custom resolver\n- allowlist/log attribution expects translator egress address\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| dual-stack 직접 연결 | 단순하고 자연스럽다 | IPv4/IPv6 둘 다 운영해야 한다 | 호환성 우선 |\n| NAT64/DNS64 | IPv6-only 전환이 쉽다 | 번역 계층이 생긴다 | 전환기/모바일 |\n| IPv4 fallback | 구현이 쉽다 | IPv6 전환 이득이 줄어든다 | 임시 대응 |\n\n핵심은 IPv6-only로 가는 동안 **IPv4 세상을 어떻게 안전하게 이어 붙일지**다.\n\n## 꼬리질문\n\n> Q: DNS64와 NAT64의 차이는 무엇인가요?\n> 핵심: DNS64는 주소를 합성하고 NAT64는 실제 트래픽을 번역한다.\n\n> Q: 왜 둘이 같이 필요하나요?\n> 핵심: 하나는 이름 해석, 다른 하나는 연결 전달을 담당하기 때문이다.\n\n> Q: 운영에서 조심할 점은?\n> 핵심: prefix, translator, DNS 정책이 서로 어긋나지 않게 해야 한다.\n\n## 한 줄 정리\n\nNAT64와 DNS64는 IPv6-only 환경에서 IPv4 서비스를 이어주는 브리지이므로, 주소 합성과 번역 경로를 같이 운영해야 한다.\n",
   "aliases": [
-    "NAT64, DNS64 Operational Intuition 개념",
-    "NAT64, DNS64 Operational Intuition 정리",
-    "NAT64, DNS64 Operational Intuition 실수",
-    "NAT64, DNS64 Operational Intuition 판단 기준",
     "네트워크 NAT64, DNS64 Operational Intuition",
     "NAT64",
     "DNS64",
@@ -17,7 +13,9 @@
     "IPv4 reachability",
     "address synthesis",
     "NAT64 translator",
-    "DNS64 prefix"
+    "DNS64 prefix",
+    "IPv6-only에서 IPv4 사이트 접속하려면?",
+    "DNS64 합성 AAAA가 진짜 IPv6야?"
   ],
   "expected_queries": [
     "NAT64와 DNS64는 IPv6-only 환경에서 어떻게 IPv4-only 서비스에 연결해?",
@@ -56,12 +54,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/nat64-dns64-operational-intuition.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch159"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -6,10 +6,6 @@
   "summary": "CUBIC은 손실을 보고 속도를 조절하고, BBR은 대역폭과 RTT 모델을 보고 보내는 양을 정하므로, 네트워크 성질에 따라 체감이 다르다.",
   "body_markdown": "# BBR vs CUBIC Congestion Intuition\n\n> 한 줄 요약: CUBIC은 손실을 보고 속도를 조절하고, BBR은 대역폭과 RTT 모델을 보고 보내는 양을 정하므로, 네트워크 성질에 따라 체감이 다르다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [TCP 혼잡 제어](./tcp-congestion-control.md)\n> - [ECN, Congestion Signal, Tail Latency](./ecn-congestion-signal-tail-latency.md)\n> - [Packet Loss, Jitter, Reordering Diagnostics](./packet-loss-jitter-reordering-diagnostics.md)\n> - [HTTP/2 멀티플렉싱과 HOL blocking](./http2-multiplexing-hol-blocking.md)\n> - [HTTP/3, QUIC Practical Trade-offs](./http3-quic-practical-tradeoffs.md)\n\nretrieval-anchor-keywords: BBR, CUBIC, congestion control, bandwidth delay product, queue, pacing, RTT, loss-based, model-based\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [추천 공식 자료](#추천-공식-자료)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\nTCP 혼잡 제어의 대표적인 두 감각은 CUBIC과 BBR이다.\n\n- `CUBIC`: 혼잡 window를 cubic 함수로 키우고, congestion event 뒤 줄이는 표준 TCP 혼잡 제어다\n- `BBR`: delivery rate, RTT, loss를 관찰해 bottleneck bandwidth와 BDP 모델을 만들고 pacing rate와 in-flight 양을 조절한다\n\n둘은 \"네트워크가 감당할 수 있는 속도\"를 찾는다는 목적은 같지만, 접근 방식이 다르다. CUBIC이 loss만 보고 BBR이 loss를 전혀 안 본다는 뜻은 아니다. 더 정확히는 **CUBIC은 손실/혼잡 이벤트 뒤 window 곡선으로 회복**하고, **BBR은 최근 전송률과 RTT 샘플로 경로 모델을 계속 갱신**한다.\n\n### Retrieval Anchors\n\n- `BBR`\n- `CUBIC`\n- `congestion control`\n- `bandwidth delay product`\n- `queue`\n- `pacing`\n- `RTT`\n- `loss-based`\n- `model-based`\n\n## 깊이 들어가기\n\n### 1. CUBIC은 무엇을 보고 조절하나\n\nCUBIC은 손실과 congestion event를 중요한 신호로 본다.\n\n- 손실이 적으면 더 보낸다\n- 손실이 나면 줄인다\n- 줄인 뒤에는 cubic window growth로 다시 탐색한다\n\n이 방식은 널리 배포되어 있고 RFC 9438로 표준화되어 있다. 다만 loss나 queue overflow가 주요 신호가 되는 경로에서는 혼잡을 이미 만든 뒤 반응하는 모양이 될 수 있다. ECN/AQM이 붙으면 \"패킷이 떨어진 뒤에만 반응\"이라고 단정하기도 어렵기 때문에, 운영에서는 loss, ECN mark, RTT 증가를 같이 본다.\n\n### 2. BBR은 무엇이 다른가\n\nBBR은 손실만 보지 않고, 전송 가능 대역폭과 RTT를 기반으로 동작한다.\n\n- 얼마나 빨리 보낼 수 있는지 추정한다\n- 큐를 불필요하게 키우지 않도록 pacing한다\n- 모델이 허용하는 in-flight 양을 조절한다\n\n즉 BBR은 \"버티다가 줄이는\" 느낌보다 **경로 모델에 맞춰 보내는** 느낌이 강하다. 단, 모델 기반이라고 해서 항상 더 낮은 tail latency나 더 좋은 fairness를 보장하지는 않는다. buffer 크기, RTT 차이, competing flow가 CUBIC인지 BBR인지, BBR 버전과 커널 구현에 따라 결과가 달라진다.\n\n### 3. 왜 체감이 다르나\n\n네트워크 특성이 다르면 두 알고리즘의 성격 차이가 커진다.\n\n- shallow buffer나 random loss가 많은 경로에서는 BBR의 model/pacing이 이득을 줄 수 있다\n- 깊은 버퍼에서 CUBIC이 큐를 오래 채우면 RTT와 p99가 흔들릴 수 있다\n- 같은 bottleneck을 공유하는 flow 조합에 따라 BBR/CUBIC fairness는 달라질 수 있다\n- 대역폭이 넉넉해도 큐가 생기면 지연이 커질 수 있다\n\n### 4. 어떤 현상이 보이나\n\n- BBR은 throughput은 괜찮은데 큐 패턴이 다르게 보일 수 있다\n- CUBIC은 congestion event 이후 줄이고 cubic growth로 회복하는 패턴이 보일 수 있다\n- 어떤 경로에서는 둘 중 하나가 tail latency를 더 좋게 만들 수 있지만, 이것은 경로 조건과 경쟁 flow에 묶인 관찰이다\n\n### 5. 운영에서 왜 알아야 하나\n\n클라이언트와 서버의 TCP 스택이 어떤 알고리즘을 쓰는지에 따라:\n\n- retry 빈도\n- p99 latency\n- bulk transfer 체감\n- long-lived connection behavior\n\n가 달라질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 대역폭은 충분한데 지연이 이상하다\n\n큐가 과도하게 쌓였는지, pacing이 달라졌는지 봐야 한다. BBR/CUBIC 이름만 보지 말고 `rtt`, `rttvar`, `retrans`, `pacing_rate`, `cwnd`, queue depth, ECN mark를 같은 시간축에 놓는다.\n\n### 시나리오 2: 한 리전은 괜찮고 다른 리전만 느리다\n\nRTT와 loss profile이 다르면 알고리즘 체감도 달라질 수 있다. 특히 transcontinental path, shallow-buffer edge, mobile network처럼 BDP와 loss 원인이 달라지는 경로에서는 같은 알고리즘도 다른 결과를 낸다.\n\n### 시나리오 3: bulk upload는 빠른데 작은 RPC가 느리다\n\n혼잡 제어와 [Nagle 알고리즘과 Delayed ACK](./nagle-delayed-ack-small-packet-latency.md), [HTTP/2 멀티플렉싱과 HOL blocking](./http2-multiplexing-hol-blocking.md)을 함께 봐야 한다.\n\n## 코드로 보기\n\n### 현재 설정 확인\n\n```bash\nsysctl net.ipv4.tcp_congestion_control\nss -ti dst api.example.com\n```\n\n### 지표로 보기\n\n```text\n- pacing_rate\n- cwnd\n- rtt\n- retrans\n```\n\n### 실험 감각\n\n```text\nCUBIC: standardized TCP congestion control, cubic cwnd growth after congestion events\nBBR: model-based, pacing-oriented, BtlBw/RTprop/BDP-aware\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|--------|------|------|-------------|\n| CUBIC | 표준화되고 널리 배포됐다 | loss/queue 기반 반응이 늦게 보일 수 있다 | 일반 인터넷, 기본 TCP 스택 |\n| BBR | pacing과 경로 모델로 queue pressure를 낮출 수 있다 | fairness와 tail latency가 경로/경쟁 flow에 민감하다 | shallow buffer, random loss, edge/mobile 후보 |\n| 혼합 운영 | 환경별 최적화 가능 | 분석이 복잡하다 | 대규모 서비스 |\n\n핵심은 어떤 알고리즘이 \"더 좋다\"가 아니라 **우리 경로가 어떤 혼잡 신호를 잘 받아들이는가**다.\n\n## 꼬리질문\n\n> Q: CUBIC과 BBR의 차이는 무엇인가요?\n> 핵심: CUBIC은 손실 기반, BBR은 대역폭/RTT 모델 기반이다.\n\n> Q: 왜 BBR이 더 매끄럽게 느껴질 수 있나요?\n> 핵심: 손실만 기다리기보다 pacing과 BDP 모델로 queue pressure를 낮추려 하기 때문이다.\n\n> Q: 어떤 환경에서 차이가 커지나요?\n> 핵심: RTT, loss, queueing 특성이 다를 때 체감 차이가 커진다.\n\n> Q: BBR이 항상 CUBIC보다 공정한가요?\n> 핵심: 아니다. BBR draft도 approximately fair sharing을 목표로 하지만, 실제 fairness는 RTT, buffer, competing flow, 구현 버전에 따라 측정해야 한다.\n\n## 추천 공식 자료\n\n- RFC 9438, CUBIC for Fast and Long-Distance Networks: https://www.rfc-editor.org/rfc/rfc9438\n- IETF Internet-Draft, BBR Congestion Control: https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/\n- ACM Queue, BBR: Congestion-Based Congestion Control: https://queue.acm.org/detail.cfm?id=3022184\n- RFC 9293, Transmission Control Protocol: https://www.rfc-editor.org/rfc/rfc9293\n\n## 한 줄 정리\n\nBBR과 CUBIC은 둘 다 혼잡 제어지만, CUBIC은 표준화된 window-growth/loss-response 계열이고 BBR은 delivery-rate/RTT 기반 경로 모델 계열이라서 경로와 경쟁 flow에 따라 latency, throughput, fairness 체감이 달라진다.\n",
   "aliases": [
-    "BBR vs CUBIC Congestion 개념",
-    "BBR vs CUBIC Congestion 정리",
-    "BBR vs CUBIC Congestion 실수",
-    "BBR vs CUBIC Congestion 판단 기준",
     "네트워크 BBR vs CUBIC Congestion",
     "BBR vs CUBIC",
     "TCP congestion control",
@@ -17,7 +13,9 @@
     "model based congestion control",
     "bandwidth delay product",
     "pacing RTT queue",
-    "CUBIC loss BBR bandwidth RTT"
+    "CUBIC loss BBR bandwidth RTT",
+    "BBR은 손실 안 보고 조절해",
+    "대역폭 충분한데 p99가 튀어"
   ],
   "expected_queries": [
     "BBR과 CUBIC은 loss-based와 bandwidth RTT model-based 관점에서 어떻게 달라?",
@@ -57,12 +55,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/network/bbr-vs-cubic-congestion-intuition.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

@@ -7,17 +7,15 @@
   "body_markdown": "# Saga Reservation Consistency와 예약 상태 전이\n\n> 한 줄 요약: 예약은 확정이 아니라 홀드이며, Saga에서는 그 홀드를 언제 잡고 언제 풀지까지 정합성의 일부다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Outbox, Saga, Eventual Consistency](./outbox-saga-eventual-consistency.md), [트랜잭션 실전 시나리오](./transaction-case-studies.md), [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)\nretrieval-anchor-keywords: saga reservation, inventory hold, seat booking, compensation, reservation ttl\n\n## 핵심 개념\n\n예약형 Saga는 하나의 큰 작업을 여러 단계로 쪼개고, 각 단계가 실패하면 보상 작업으로 되돌리는 모델이다.\n예약은 그중에서도 가장 자주 깨지는 단계다.\n\n왜 중요한가:\n\n- 좌석, 재고, 쿠폰, 방 배정은 “미리 잡고 나중에 확정”하는 흐름이 많다\n- 예약과 확정 사이에 시간차가 있으면 중간 실패를 처리해야 한다\n- 예약이 풀리지 않거나 중복 해제되면 정합성이 깨진다\n\n예약은 실제 확정이 아니라 **임시 소유권**이다.\n\n## 깊이 들어가기\n\n### 1. reservation이 필요한 이유\n\n동시 경쟁이 있는 자원은 바로 확정하면 충돌이 잦다.\n\n- 좌석 1개에 두 명이 몰린다\n- 재고가 적고 결제가 외부 시스템을 거친다\n- 쿠폰은 선착순이라 경쟁이 심하다\n\n이때 먼저 reservation을 잡고, 이후 결제/검증이 끝나면 confirm한다.\n\n### 2. 예약 상태 전이\n\n대표적인 상태는 다음과 같다.\n\n- `HOLD`\n- `CONFIRMED`\n- `CANCELLED`\n- `EXPIRED`\n\n중요한 점은 상태 전이가 단방향이어야 한다는 것이다.\n이미 expired된 예약이 다시 confirmed 되면 안 된다.\n\n### 상태 전이 실패 분기(failure matrix)\n\n| 현재 상태 | 들어온 command | 허용 여부 | 필요한 보장 |\n|---|---|---|---|\n| 없음 | `HOLD` | 조건부 허용 | resource invariant를 constraint/guard/slot claim으로 확인하고 idempotency key를 기록 |\n| `HOLD` | 같은 요청 `HOLD` 재시도 | 멱등 replay | 같은 idempotency key와 payload이면 기존 reservation을 반환 |\n| `HOLD` | 다른 요청 `HOLD` | resource 규칙에 따라 거절 또는 다른 resource 배정 | 같은 resource 중복 점유는 DB arbitration이 막아야 함 |\n| `HOLD` | `CONFIRM` | TTL 안이면 허용 | 결제/외부 승인 결과와 reservation owner가 일치해야 함 |\n| `HOLD` | `CANCEL` / `EXPIRE` | 허용 | release가 idempotent해야 하고 두 번 풀어도 수량이 음수/초과가 되면 안 됨 |\n| `EXPIRED` | 늦은 `CONFIRM` | 기본 거절 또는 재검증 분기(branch) | expired row를 그대로 confirmed로 되살리면 안 됨 |\n| `CONFIRMED` | `CANCEL` | 정책에 따라 별도 refund/cancel saga | 단순 hold release와 다르게 회계/환불 side effect를 분리 |\n\n### 3. 보상 작업의 함정\n\nSaga의 보상은 단순한 rollback이 아니다.\n\n- 결제 취소는 실제 환불이 될 수 있다\n- 재고 해제는 이미 다른 요청이 잡았을 수 있다\n- 좌석 해제는 타임아웃과 경합할 수 있다\n\n그래서 보상은 “반대 동작”이지, 이전 상태의 완전 복원은 아니다.\n\n### 4. TTL과 만료 처리\n\n예약은 영원히 잡아두면 안 된다.\n\n- 사용자가 결제를 중단할 수 있다\n- 클라이언트가 죽을 수 있다\n- 외부 승인 대기가 길어질 수 있다\n\nTTL 기반 만료와 배경 정리 작업이 필요하다.\n\n## 분기/복구(triage) 순서\n\n유령 hold나 중복 해제가 보이면 아래 순서로 본다.\n\n1. resource별 active `HOLD`와 `CONFIRMED` 수가 실제 capacity와 맞는지 본다.\n2. 같은 idempotency key로 reservation row가 여러 개 생겼는지 본다.\n3. `expires_at < now`인데 active predicate에 남아 있는 row를 찾는다.\n4. `CONFIRM`/`CANCEL`/`EXPIRE` worker가 같은 상태 전이 조건을 쓰는지 확인한다.\n5. release는 reservation id 기준으로 한 번만 반영됐는지 ledger나 version으로 검증한다.\n\n중단 조건은 단순하다. 상태 전이는 단방향이고, 같은 command 재시도는 같은 결과를 내며, 만료된 hold가 active capacity를 계속 잡지 않는다는 증거가 있어야 한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 좌석 예약 후 결제 실패\n\n예약은 잡혔지만 결제가 실패했다면, reservation을 풀어야 한다.\n이 과정이 누락되면 좌석이 유령처럼 사라진다.\n\n### 시나리오 2: 재시도 때문에 예약이 두 번 생성됨\n\n같은 요청이 재시도되면 reservation row가 중복될 수 있다.\n멱등성 키로 예약 선점을 막아야 한다.\n\n### 시나리오 3: 만료 직후 confirm이 도착함\n\nTTL이 만료된 뒤 confirm이 늦게 오면, 시스템은 이를 거절하거나 재검증해야 한다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE reservations (\n  reservation_id VARCHAR(80) PRIMARY KEY,\n  resource_id BIGINT NOT NULL,\n  status VARCHAR(20) NOT NULL,\n  expires_at DATETIME NOT NULL,\n  UNIQUE KEY uk_resource_active (resource_id, status)\n);\n\n-- 예약 선점\nINSERT INTO reservations (reservation_id, resource_id, status, expires_at)\nVALUES ('r-1001', 42, 'HOLD', NOW() + INTERVAL 5 MINUTE);\n```\n\n```java\n// saga step\nreserve();\ntry {\n    pay();\n    confirm();\n} catch (Exception e) {\n    cancelReservation();\n    throw e;\n}\n```\n\n예약은 성공/실패를 넘어, **언제까지 잡고 언제 풀지**가 같이 설계돼야 한다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 즉시 확정 | 단순하다 | 경합과 실패가 많다 | 경쟁이 거의 없을 때 |\n| HOLD 후 CONFIRM | 충돌을 줄인다 | TTL과 보상 로직이 필요하다 | 예약/좌석/재고 |\n| optimistic recheck | 구현이 가볍다 | 경쟁이 심하면 실패가 늘어난다 | 중간 규모 |\n| hold + idempotent retry | 안정적이다 | 설계가 복잡하다 | 분산 워크플로우 |\n\n## 꼬리질문\n\n> Q: 예약과 확정의 차이는 무엇인가요?\n> 의도: 임시 소유권과 최종 커밋을 구분하는지 확인\n> 핵심: 예약은 홀드이고 확정은 최종 상태다\n\n> Q: Saga의 보상이 왜 rollback과 다른가요?\n> 의도: 외부 부작용이 있는 작업의 되돌림을 아는지 확인\n> 핵심: 보상은 반대 업무이지 시간 역행이 아니다\n\n> Q: 예약 TTL이 왜 필요한가요?\n> 의도: 유실된 세션과 유령 홀드 문제를 아는지 확인\n> 핵심: 실패한 사용자의 홀드가 영원히 남지 않게 하기 위해서다\n\n## 한 줄 정리\n\nSaga의 예약은 임시 소유권이며, HOLD-CONFIRM-CANCEL 전이를 멱등하고 만료 가능하게 설계해야 정합성이 유지된다.\n",
   "aliases": [
     "예약 상태 전이",
-    "Saga Reservation Consistency and 개념",
-    "Saga Reservation Consistency and 정리",
-    "Saga Reservation Consistency and 실수",
-    "Saga Reservation Consistency and 판단 기준",
     "saga reservation",
     "inventory hold",
     "seat booking hold",
     "reservation ttl",
     "HOLD CONFIRM CANCEL",
     "temporary ownership",
-    "reservation compensation"
+    "reservation compensation",
+    "예약 HOLD CONFIRM CANCEL 흐름",
+    "TTL 만료된 예약 풀기"
   ],
   "expected_queries": [
     "Saga에서 예약 HOLD, CONFIRM, CANCEL, EXPIRED 상태 전이를 어떻게 설계해야 해?",
@@ -52,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/saga-reservation-consistency.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

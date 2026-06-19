@@ -7,17 +7,15 @@
   "body_markdown": "# JPA Dirty Checking, `@Version`, and Cascade Trade-offs\n\n> 한 줄 요약: JPA의 dirty checking은 \"save를 안 해도 반영된다\"는 편리함이 아니라, 영속성 컨텍스트가 들고 있는 스냅샷과 현재 상태를 commit 시점에 비교해 UPDATE를 만드는 설계이고, `@Version`과 cascade를 함께 이해하지 못하면 silent overwrite와 이중 flush가 바로 따라붙는다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Data JPA `save`, `persist`, `merge` State Transitions](./spring-data-jpa-save-persist-merge-state-transitions.md)\n> - [@Transactional 깊이 파기](./transactional-deep-dive.md)\n> - [트랜잭션 격리수준과 락](../database/transaction-isolation-locking.md)\n> - [Compare-and-Set Version Columns](../database/compare-and-set-version-columns.md)\n\n### Retrieval Anchors\n\n- `JPA dirty checking`\n- `영속성 컨텍스트 변경 감지`\n- `@Version optimistic locking`\n- `OptimisticLockException`\n- `cascade persist`\n- `cascade merge`\n- `cascade remove`\n- `orphanRemoval`\n- `flush 시점 UPDATE`\n- `snapshot 비교`\n- `detached entity merge overwrite`\n\n## 핵심 개념\n\nJPA에서 \"save를 호출하지 않았는데도 값이 반영된다\"는 현상은 마법이 아니다.\n\n영속성 컨텍스트는 엔티티를 처음 로드하거나 `persist`할 때 **스냅샷**을 같이 저장한다. 트랜잭션 커밋 직전의 flush 시점이 되면, 컨텍스트는 스냅샷과 현재 엔티티 상태를 필드 단위로 비교한다. 값이 달라진 엔티티만 `UPDATE`가 만들어져 DB에 반영된다. 이것이 dirty checking이다.\n\n중요한 건 세 가지다.\n\n- **스냅샷은 필드 단위 비교다.** null → null도 변경 아님, 빈 문자열 → 빈 문자열도 변경 아님. 하지만 컬렉션은 참조 비교가 아니라 요소 단위로 비교되므로 `setCategories(new ArrayList<>(old))` 같은 재할당은 변경으로 감지된다.\n- **Flush 시점은 trigger 기반이다.** 기본적으로 commit 직전, JPQL 실행 직전, `flush()` 직접 호출 시 발생한다. 즉 dirty checking은 커밋에 붙어 있는 게 아니라 flush에 붙어 있다.\n- **Dirty 판정은 항상 관리(managed) 상태여야 유효하다.** detached 엔티티는 컨텍스트 밖에 있어서 snapshot이 없고, `merge()`로 다시 붙여야만 변경 감지 경로에 올라간다.\n\n## 깊이 들어가기\n\n### 1. `@Version`은 \"누가 먼저 썼는가\"의 증거다\n\ndirty checking은 \"내가 바꾼 필드\"만 알려준다. 하지만 동시에 다른 트랜잭션이 같은 행을 바꿨는지는 모른다. 이때 필요한 게 `@Version`이다.\n\n```java\n@Entity\nclass Order {\n    @Id Long id;\n    @Version Long version;\n    int totalAmount;\n}\n```\n\nHibernate는 `UPDATE orders SET total_amount=?, version=version+1 WHERE id=? AND version=?`로 쿼리를 만든다. 영향받은 행이 0이면 `OptimisticLockException`을 던진다.\n\n즉 `@Version`은 두 가지를 동시에 한다.\n\n- commit 시점에 \"내가 읽은 버전 == DB 버전\"이라는 invariant를 강제한다\n- 실패 시 애플리케이션이 **읽고 → 판단하고 → 다시 쓰는** 재시도 경로를 만들 수 있게 한다\n\n`@Version` 없는 dirty checking은 **last writer wins**다. 동시 수정이 일어나면 뒤에 flush한 쪽이 앞 트랜잭션의 변경을 조용히 덮어쓴다. 이 silent overwrite는 로그에도 남지 않는다.\n\n### 2. Cascade는 \"연결된 엔티티도 같이 저장\"이 아니다\n\ncascade를 \"관계된 것도 자동으로 같이 저장\"으로 외우면 위험하다. cascade는 **영속성 연산을 어떻게 전파할지**를 정의한다.\n\n- `CascadeType.PERSIST`: 부모를 persist할 때 자식도 persist. 단, 자식이 이미 detached면 `PersistentObjectException`.\n- `CascadeType.MERGE`: 부모를 merge할 때 자식도 merge. detached 객체 그래프를 붙일 때 주로 쓴다.\n- `CascadeType.REMOVE`: 부모 제거 시 자식도 제거. 하지만 컬렉션에서 요소만 빼는 것은 remove가 아니라 **orphan**이다.\n- `orphanRemoval=true`: 컬렉션에서 빠진 자식이 부모 연관을 잃으면 DELETE. `REMOVE`와 별개 동작이다.\n\n실수는 거의 항상 둘 중 하나다.\n\n- `CascadeType.ALL`로 몰아두고 자식 엔티티를 직접 리포지토리에서 save하면 flush 순서 때문에 **이중 INSERT**가 발생한다.\n- `orphanRemoval=true`를 켜두고 컬렉션을 `clear()`한 뒤 다시 채우면, 비즈니스 로직은 \"교체\"지만 JPA는 **전체 DELETE 후 INSERT**를 만든다. unique constraint가 있으면 즉시 터진다.\n\n### 3. Dirty checking + `@Version` + cascade의 충돌 지점\n\n세 가지가 합쳐지는 시나리오를 생각해 보자.\n\n부모 `Order`에 `@Version`이 있고, `OrderLine`에 `cascade = {PERSIST, MERGE}`가 걸려 있다. 부모 필드만 바뀌고 자식은 건드리지 않은 경우에도, Hibernate는 스냅샷 비교 후 **부모만** UPDATE한다. 버전은 parent 버전만 증가한다.\n\n반대로 자식 한 줄만 바꾼 경우 — 부모 필드는 그대로고 자식 필드만 바뀌었다. 이때 부모 `@Version`은 **증가하지 않는다.** 이게 함정이다. aggregate root 관점에서 보면 \"주문이 변경되었다\"인데 `@Version`은 부모 필드 변화에만 반응하므로, 자식 변경은 동시성 제어 바깥에 있다.\n\n해법은 두 가지 중 하나다.\n\n- `@OptimisticLocking(type = OptimisticLockType.ALL)` — 모든 필드를 WHERE 조건에 넣는다. 쓰기 비용이 커지지만 자식 변화까지 반영된다.\n- **Aggregate 단위 명시적 터치**: `order.touch()` 같이 자식 변경 시 부모의 필드(`updatedAt` 등)를 일부러 바꿔 dirty 판정을 유도한다. 이게 \"aggregate version\"을 만드는 흔한 패턴이다.\n\n## 실전 시나리오\n\n### 시나리오 1: \"save 호출했는데 값이 안 바뀌어요\"\n\n트랜잭션 바깥에서 `findById` → 값 변경 → `save` 호출. 그런데 DB가 그대로다. 원인은 거의 항상 **detached → save**이고, save 내부에서 `merge`가 돌면서 다른 트랜잭션이 먼저 쓴 값을 덮어쓴 것이다. `@Version`이 없기 때문에 조용히 지나갔다.\n\n진단: `findById`와 `save` 사이가 같은 `@Transactional` 범위 안인지 확인한다. 밖이면 `@Version` 없이는 정합성을 보장할 수 없다.\n\n### 시나리오 2: 배치에서 flush timing 때문에 메모리가 터진다\n\ndirty checking은 영속성 컨텍스트에 남아있는 모든 managed entity를 매 flush마다 훑는다. 배치에서 10만 건을 loop로 update하면 매 flush마다 10만 건 비교가 벌어진다.\n\n처방:\n- `EntityManager#clear()`를 주기적으로 호출해 컨텍스트를 비운다 (Spring Batch 사용 시 StatelessItemReader 고려)\n- `hibernate.jdbc.batch_size` + `@BatchSize`로 batched UPDATE를 유도한다\n- 애초에 JPA 대신 JDBC bulk update가 맞을 수 있다\n\n### 시나리오 3: cascade가 걸린 엔티티를 직접 repository로 save했더니 중복 INSERT\n\n부모 aggregate에 `cascade = PERSIST`가 걸린 `OrderLine` 컬렉션이 있는데, 서비스 레이어에서 `orderLineRepository.save(line)`을 직접 호출. 부모 flush 시 cascade PERSIST가 또 돌면서 같은 자식을 두 번 INSERT 시도한다.\n\n처방: cascade가 걸린 관계는 **부모를 통해서만** 저장한다. 자식 리포지토리를 두지 않는 게 안전하다.\n\n## 코드로 보기\n\n```java\n@Entity\nclass Order {\n    @Id\n    @GeneratedValue\n    Long id;\n\n    @Version\n    Long version;\n\n    @Enumerated(EnumType.STRING)\n    OrderStatus status;\n\n    Instant updatedAt;\n\n    @OneToMany(mappedBy = \"order\",\n               cascade = {CascadeType.PERSIST, CascadeType.MERGE},\n               orphanRemoval = true)\n    List<OrderLine> lines = new ArrayList<>();\n\n    void changeLineQuantity(Long lineId, int newQty) {\n        OrderLine target = lines.stream()\n            .filter(l -> l.getId().equals(lineId))\n            .findFirst()\n            .orElseThrow();\n        target.changeQuantity(newQty);\n        this.updatedAt = Instant.now();  // aggregate 터치로 부모 버전도 증가\n    }\n}\n\n@Service\n@Transactional\nclass OrderService {\n    OrderService(OrderRepository orders) { this.orders = orders; }\n    private final OrderRepository orders;\n\n    void updateLineQuantity(Long orderId, Long lineId, int qty) {\n        Order order = orders.findById(orderId).orElseThrow();\n        order.changeLineQuantity(lineId, qty);\n        // save 호출 불필요 — commit 직전 dirty checking이 UPDATE를 만든다\n    }\n}\n```\n\n핵심은 `changeLineQuantity` 안의 `this.updatedAt = Instant.now()` 한 줄이다. 자식 필드만 바꿨을 때 `@Version`이 증가하지 않는 함정을 부모 필드 터치로 해결한다.\n\n## 트레이드오프\n\n| 전략 | 장점 | 비용 |\n|---|---|---|\n| `@Version` + aggregate touch | 간결, 애그리거트 경계를 코드에 강제 | 부모 터치를 잊으면 동시성 체크 누락 |\n| `@OptimisticLocking(ALL)` | 모든 필드 자동 반영 | WHERE 절 폭증, 인덱스 활용 어려움 |\n| Pessimistic lock (`select for update`) | 동시성 자체를 배제 | 락 경합, 데드락 리스크, throughput 하락 |\n| Dirty checking 끄기 (`readOnly=true` + 명시적 JDBC) | 예측 가능한 쿼리, 배치에 유리 | JPA 장점 상실, 코드 복잡도 증가 |\n\n## 꼬리질문\n\n- `save()`를 호출하지 않아도 반영되는 경우와, 호출해도 반영되지 않는 경우를 각각 언제 만날 수 있나?\n- `@Version`이 있는 엔티티가 자식 변경만 있을 때 버전이 증가하지 않는 이유는?\n- `orphanRemoval=true`와 `CascadeType.REMOVE`의 차이를 동시성 관점에서 설명할 수 있나?\n- dirty checking이 꺼진 상태(`readOnly=true`)에서 발생하는 실수는 어떤 종류인가?\n\n## 한 줄 정리\n\nDirty checking은 영속성 컨텍스트의 스냅샷 비교 결과일 뿐이고, 동시성은 `@Version`이, 전파 경계는 cascade가 맡는다. 세 축을 따로 생각해야 silent overwrite와 이중 flush를 피할 수 있다.\n",
   "aliases": [
     "영속성 컨텍스트 변경 감지",
-    "JPA Dirty Checking, @Version, 개념",
-    "JPA Dirty Checking, @Version, 정리",
-    "JPA Dirty Checking, @Version, 실수",
-    "JPA Dirty Checking, @Version, 판단 기준",
     "JPA dirty checking",
     "@Version optimistic locking",
     "cascade persist merge remove",
     "orphanRemoval",
     "detached entity merge overwrite",
     "flush snapshot comparison",
-    "@Service"
+    "@Service",
+    "dirty checking이 UPDATE 만드는 시점",
+    "merge가 기존 값을 덮어쓰는 상황"
   ],
   "expected_queries": [
     "JPA dirty checking은 언제 UPDATE를 만들어?",
@@ -45,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/jpa-dirty-checking-version-strategy.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch162"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

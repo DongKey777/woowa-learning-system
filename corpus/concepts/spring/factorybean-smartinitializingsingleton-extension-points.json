@@ -6,10 +6,6 @@
   "summary": "FactoryBean은 \"Bean을 만드는 Bean\"이고 SmartInitializingSingleton은 \"모든 singleton 초기화 이후\" 훅이므로, 둘을 모르면 컨테이너 확장 코드를 만들 때 생성 시점과 제품 객체를 자주 혼동하게 된다.",
   "body_markdown": "# Spring `FactoryBean` and `SmartInitializingSingleton` Extension Points\n\n> 한 줄 요약: `FactoryBean`은 \"Bean을 만드는 Bean\"이고 `SmartInitializingSingleton`은 \"모든 singleton 초기화 이후\" 훅이므로, 둘을 모르면 컨테이너 확장 코드를 만들 때 생성 시점과 제품 객체를 자주 혼동하게 된다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [IoC 컨테이너와 DI](./ioc-di-container.md)\n> - [Spring BeanFactoryPostProcessor vs BeanPostProcessor Lifecycle](./spring-beanfactorypostprocessor-vs-beanpostprocessor-lifecycle.md)\n> - [Spring ApplicationContext Refresh Phases](./spring-application-context-refresh-phases.md)\n> - [Spring `@Configuration`, `proxyBeanMethods`, and BeanPostProcessor Chain](./spring-configuration-proxybeanmethods-beanpostprocessor-chain.md)\n> - [Spring Startup Bean Graph Debugging Playbook](./spring-startup-bean-graph-debugging-playbook.md)\n\nretrieval-anchor-keywords: FactoryBean, SmartInitializingSingleton, &beanName, object produced by FactoryBean, singleton after initialization hook, container extension point, startup callback, bean factory product vs factory\n\n## 핵심 개념\n\nSpring 컨테이너는 단순히 클래스를 new 해서 주입하는 수준을 넘어서, Bean 생성 자체를 커스터마이징할 수 있는 여러 확장 지점을 제공한다.\n\n그중 실무에서 은근히 헷갈리는 둘이 있다.\n\n- `FactoryBean`\n- `SmartInitializingSingleton`\n\n핵심 차이는 이렇다.\n\n- `FactoryBean`: \"무엇을 만들지\"를 커스터마이징한다\n- `SmartInitializingSingleton`: \"singleton들이 다 올라온 뒤 무엇을 할지\"를 정한다\n\n즉 하나는 **제품 객체 생산**, 다른 하나는 **시작 후 후처리 타이밍**이다.\n\n## 깊이 들어가기\n\n### 1. `FactoryBean`은 자기 자신보다 \"생산물\"이 중요하다\n\n일반 Bean은 컨테이너에서 꺼내면 그 Bean 자신이 나온다.\n\n하지만 `FactoryBean`은 다르다.\n\n컨테이너가 이 Bean을 보면 보통 다음처럼 동작한다.\n\n- factory bean 자신을 직접 주기보다\n- `getObject()`가 만든 제품 객체를 Bean으로 취급한다\n\n즉 `FactoryBean<Foo>`를 등록하면, 주입 지점에서는 `Foo`를 받는 감각에 가깝다.\n\n이 차이를 모르면 \"왜 타입이 안 맞지?\" 또는 \"왜 내가 등록한 클래스가 아니라 다른 객체가 나오지?\" 같은 혼란이 생긴다.\n\n### 2. factory 자체가 필요할 땐 `&beanName`으로 본다\n\nSpring은 보통 `FactoryBean`의 산출물을 노출한다.\n\nfactory 자체가 필요하면 이름 앞에 `&`를 붙여야 한다.\n\n```java\nObject factoryItself = applicationContext.getBean(\"&clientFactory\");\n```\n\n이 규칙을 모르면 디버깅 시 실제로 보고 싶은 대상이\n\n- 생산된 client 객체인지\n- 그걸 만드는 factory 객체인지\n\n계속 섞인다.\n\n### 3. `FactoryBean`은 복잡한 객체 생성 캡슐화에 맞다\n\n다음처럼 단순 생성자를 넘는 조립이 필요할 때 자주 쓴다.\n\n- proxy client 생성\n- 외부 메타데이터 기반 객체 생성\n- 라이브러리 adapter 인스턴스 래핑\n\n즉 `FactoryBean`의 포인트는 \"생성 로직이 복잡하다\"가 아니라, **제품 객체를 Spring Bean 생태계에 자연스럽게 얹고 싶다**는 데 있다.\n\n### 4. `SmartInitializingSingleton`은 `@PostConstruct`보다 늦다\n\n`@PostConstruct`는 개별 Bean 초기화 직후다.\n\n반면 `SmartInitializingSingleton#afterSingletonsInstantiated()`는 일반 singleton들이 모두 올라온 뒤에 호출된다.\n\n이 차이가 중요한 이유:\n\n- 다른 singleton들이 다 준비된 뒤 registry 스캔을 하고 싶을 때\n- 여러 bean을 모아 테이블/매핑/메타데이터를 완성하고 싶을 때\n- startup 시점에 \"전체 그림\"이 필요한 작업을 하고 싶을 때\n\n즉 `SmartInitializingSingleton`은 **개별 Bean 초기화 훅이 아니라, singleton 집합이 준비된 뒤의 훅**이다.\n\n### 5. 하지만 시작 작업을 다 여기에 넣으면 startup을 망칠 수 있다\n\n이 훅은 유용하지만, 아래를 넣으면 위험하다.\n\n- 무거운 외부 네트워크 호출\n- 긴 캐시 preload\n- 실패해도 되는 비필수 warmup\n\n이런 작업은 startup critical path에 들어가 버릴 수 있다.\n\n즉 `SmartInitializingSingleton`은 \"나중에 시작되는 훅\"이지만, 여전히 **startup 경로의 일부**라는 점을 잊으면 안 된다.\n\n### 6. 컨테이너 디버깅에서는 둘의 역할을 분리해서 봐야 한다\n\n다음 증상은 `FactoryBean` 의심:\n\n- 실제 주입 객체 타입이 예상과 다르다\n- `&beanName`과 일반 bean 조회 결과가 다르다\n- 생성 로직이 숨겨져 있다\n\n다음 증상은 `SmartInitializingSingleton` 의심:\n\n- startup 후반부에만 실패한다\n- 모든 bean이 뜬 뒤 registry 스캔에서 터진다\n- 개별 Bean 초기화는 됐는데 마지막 wiring 단계에서 깨진다\n\n즉 둘 다 \"확장 포인트\"지만, **어느 단계에서 개입하는지**가 완전히 다르다.\n\n## 실전 시나리오\n\n### 시나리오 1: 라이브러리 client를 Spring Bean처럼 노출하고 싶다\n\n단순 `@Bean` 메서드보다 생성 로직과 제품 타입을 더 깔끔하게 캡슐화하고 싶다면 `FactoryBean`이 맞을 수 있다.\n\n### 시나리오 2: 모든 handler bean을 모아 registry를 구성해야 한다\n\n개별 handler의 `@PostConstruct`보다, 전체 singleton들이 준비된 뒤 한 번에 스캔하는 `SmartInitializingSingleton`이 더 자연스럽다.\n\n### 시나리오 3: startup 마지막쯤 mysterious failure가 난다\n\n개별 Bean 생성이 아니라 `afterSingletonsInstantiated()` 단계에서 실패했을 수 있다.\n\n### 시나리오 4: 디버깅 중 bean 조회 결과가 예상 타입이 아니다\n\n`FactoryBean`의 제품을 보고 있는지, factory 자체를 보고 있는지부터 확인해야 한다.\n\n## 코드로 보기\n\n### `FactoryBean`\n\n```java\npublic class PaymentClientFactoryBean implements FactoryBean<PaymentClient> {\n\n    @Override\n    public PaymentClient getObject() {\n        return new PaymentClient(\"https://api.example.com\");\n    }\n\n    @Override\n    public Class<?> getObjectType() {\n        return PaymentClient.class;\n    }\n}\n```\n\n### `SmartInitializingSingleton`\n\n```java\n@Component\npublic class HandlerRegistryInitializer implements SmartInitializingSingleton {\n\n    private final List<CommandHandler> handlers;\n\n    public HandlerRegistryInitializer(List<CommandHandler> handlers) {\n        this.handlers = handlers;\n    }\n\n    @Override\n    public void afterSingletonsInstantiated() {\n        // 모든 singleton handler가 준비된 뒤 registry 구성\n    }\n}\n```\n\n### factory 자체 조회\n\n```java\nObject factory = applicationContext.getBean(\"&paymentClientFactoryBean\");\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| 일반 `@Bean` | 단순하고 읽기 쉽다 | 복잡한 생성 캡슐화에는 약하다 | 보통의 객체 생성 |\n| `FactoryBean` | 제품 생성 로직을 Spring Bean 계약 안에 숨길 수 있다 | factory와 product 개념이 헷갈리기 쉽다 | proxy client, adapter, 복잡한 생성 |\n| `@PostConstruct` | 개별 Bean 초기화가 단순하다 | 전체 singleton 집합이 준비됐다는 보장이 약하다 | 가벼운 per-bean 초기화 |\n| `SmartInitializingSingleton` | singleton 전체가 준비된 뒤 후처리가 가능하다 | startup 경로를 무겁게 만들 수 있다 | registry 스캔, 전체 초기화 조립 |\n\n핵심은 `FactoryBean`과 `SmartInitializingSingleton`을 둘 다 \"초기화 관련 기능\"으로 뭉뚱그리지 않고, **생산물 제어와 startup 시점 제어라는 서로 다른 축**으로 보는 것이다.\n\n## 꼬리질문\n\n> Q: `FactoryBean`을 등록했을 때 컨테이너가 보통 노출하는 것은 무엇인가?\n> 의도: factory vs product 구분 확인\n> 핵심: factory 자신보다 `getObject()`가 만든 제품 객체다.\n\n> Q: `&beanName`은 언제 필요한가?\n> 의도: factory 자체 조회 규칙 확인\n> 핵심: `FactoryBean`의 산출물이 아니라 factory 객체 자체를 보고 싶을 때다.\n\n> Q: `SmartInitializingSingleton`이 `@PostConstruct`와 다른 점은 무엇인가?\n> 의도: startup 시점 차이 이해 확인\n> 핵심: 개별 Bean 초기화 직후가 아니라, 일반 singleton들이 모두 준비된 뒤 호출된다는 점이다.\n\n> Q: 왜 `SmartInitializingSingleton`에 무거운 로직을 넣으면 안 좋은가?\n> 의도: startup critical path 인식 확인\n> 핵심: 애플리케이션 startup 경로를 직접 무겁게 만들 수 있기 때문이다.\n\n## 한 줄 정리\n\n`FactoryBean`은 제품 객체 생성의 확장 포인트이고, `SmartInitializingSingleton`은 singleton 집합이 준비된 뒤 실행되는 startup 훅이다.\n",
   "aliases": [
-    "Spring FactoryBean and SmartInitializingSingleton 개념",
-    "Spring FactoryBean and SmartInitializingSingleton 정리",
-    "Spring FactoryBean and SmartInitializingSingleton 실수",
-    "Spring FactoryBean and SmartInitializingSingleton 판단 기준",
     "스프링 Spring FactoryBean and SmartInitializingSingleton",
     "FactoryBean",
     "SmartInitializingSingleton",
@@ -17,7 +13,9 @@
     "singleton after initialization hook",
     "startup callback",
     "bean factory product vs factory",
-    "@Bean"
+    "@Bean",
+    "FactoryBean 자체와 만든 객체가 헷갈려요",
+    "모든 singleton 생성 뒤 실행할 훅이 필요해요"
   ],
   "expected_queries": [
     "Spring FactoryBean은 일반 Bean과 어떻게 달라?",
@@ -45,12 +43,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/spring-factorybean-smartinitializingsingleton-extension-points.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch162"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

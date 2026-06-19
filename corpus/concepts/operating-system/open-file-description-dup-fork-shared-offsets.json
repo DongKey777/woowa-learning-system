@@ -6,10 +6,6 @@
   "summary": "file descriptor 숫자는 각각 달라도 같은 open file description을 공유하면 offset, append mode, nonblocking 상태가 함께 움직일 수 있어 로그 쓰기, 파이프라인, 서브프로세스 I/O에서 예상과 다른 동작이 나온다.",
   "body_markdown": "# Open File Description, dup, fork, Shared Offsets\n\n> 한 줄 요약: file descriptor 숫자는 각각 달라도 같은 open file description을 공유하면 offset, append mode, nonblocking 상태가 함께 움직일 수 있어 로그 쓰기, 파이프라인, 서브프로세스 I/O에서 예상과 다른 동작이 나온다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [File Descriptor, Socket, Syscall Cost, and Server Impact](./file-descriptor-socket-syscall-cost-server-impact.md)\n> - [O_CLOEXEC, FD Inheritance, Exec-Time Leaks](./o-cloexec-fd-inheritance-exec-leaks.md)\n> - [Fork, Exec, Copy-on-Write Behavior](./fork-exec-copy-on-write-behavior.md)\n> - [pipe, socketpair, eventfd, memfd IPC Selection](./pipe-socketpair-eventfd-memfd-ipc-selection.md)\n> - [deleted-but-open files, log rotation, space leak debugging](./deleted-open-file-space-leak-log-rotation.md)\n\n> retrieval-anchor-keywords: open file description, dup, dup2, dup3, fork fd sharing, shared offset, O_APPEND, O_NONBLOCK, file status flags, per-fd flags, shared file position\n\n## 핵심 개념\n\n백엔드 개발자가 자주 보는 것은 `int fd`지만, 커널이 실제로 추적하는 중요한 단위는 open file description이다. `dup()`이나 `fork()`로 만들어진 여러 fd가 같은 open file description을 가리키면, 이들은 같은 file offset과 일부 file status를 공유한다.\n\n- `file descriptor`: 프로세스 로컬의 정수 핸들이다\n- `open file description`: 열린 파일 객체에 대한 커널 쪽 실제 참조다\n- `dup*()`: 새로운 fd 번호를 만들지만, 보통 같은 open file description을 공유한다\n- `fork()`: 자식이 부모의 열린 참조를 이어받는다\n\n왜 중요한가:\n\n- `read()`/`write()`/`lseek()`가 서로 다른 fd에서도 같은 offset을 움직일 수 있다\n- `O_APPEND`, `O_NONBLOCK` 같은 상태가 shared behavior를 만든다\n- \"별도 fd니까 독립적이겠지\"라는 가정이 로그/파이프/소켓 경로에서 틀릴 수 있다\n\n## 깊이 들어가기\n\n### 1. `dup()`은 새 open이 아니라 새 참조다\n\n`dup`, `dup2`, `dup3`는 파일을 다시 여는 것이 아니라, 기존 열린 객체를 가리키는 새 번호를 만든다.\n\n- file offset을 공유한다\n- append/nonblocking 같은 status도 공유될 수 있다\n- close-on-exec 같은 descriptor flag는 공유되지 않을 수 있다\n\n즉 숫자는 둘이지만 실제 열린 객체는 하나일 수 있다.\n\n### 2. `fork()` 뒤 parent/child도 같은 열린 객체를 볼 수 있다\n\n자식 프로세스는 부모의 fd table을 이어받고, 많은 경우 그 참조는 같은 open file description을 본다.\n\n- parent가 읽으면 child의 다음 offset도 달라질 수 있다\n- child가 nonblocking으로 바꾸면 parent도 영향을 받을 수 있다\n- pipe/socket에서 half-close/EOF 감각이 꼬일 수 있다\n\n그래서 subprocess I/O 설계는 \"누가 어떤 번호를 갖는가\"보다 \"누가 같은 열린 객체를 공유하는가\"를 먼저 봐야 한다.\n\n### 3. 독립 offset이 필요하면 추가 `open()`이 필요하다\n\n동일한 path를 다시 `open()`하면 보통 별도 open file description을 얻는다.\n\n- 같은 경로라도 offset이 독립적이다\n- `dup()`과 다르게 status/state 공유가 줄어든다\n- read cursor를 분리하고 싶을 때 유용하다\n\n즉 \"새 번호가 필요하다\"와 \"새 열린 객체가 필요하다\"는 다른 요구다.\n\n### 4. 이 차이는 서버에서 생각보다 자주 문제를 만든다\n\n- subprocess stdout/stderr redirect\n- logger fd reuse\n- parent/child pipeline\n- 같은 file을 여러 reader가 읽는 유틸리티\n\n문제는 보통 race처럼 보이지만, 실제로는 shared offset/shared status semantics다.\n\n## 실전 시나리오\n\n### 시나리오 1: 두 워커가 같은 파일을 읽는데 cursor가 꼬인다\n\n가능한 원인:\n\n- `dup()`한 fd를 각 워커가 나눠 들고 있다\n- 같은 open file description을 공유한다\n- 한쪽의 `read()`가 다른 쪽의 offset을 움직인다\n\n대응 감각:\n\n- 독립 cursor가 필요하면 각자 `open()`한다\n- `dup()`은 새 번호이지 새 cursor가 아니라는 점을 문서화한다\n\n### 시나리오 2: child에 넘긴 fd 설정 변경이 parent에도 영향을 준다\n\n가능한 원인:\n\n- `O_NONBLOCK` 변경이 shared status로 전파된다\n- parent/child가 같은 열린 객체를 보고 있다\n- close-on-exec와 file status flag를 혼동했다\n\n이 경우는 per-fd flag와 shared file status를 구분해야 한다.\n\n### 시나리오 3: append logger가 예상과 다른 순서로 섞인다\n\n가능한 원인:\n\n- 여러 참조가 같은 open description을 공유한다\n- `O_APPEND`와 write atomicity 기대가 뒤섞인다\n- rotation/reopen 시점과 old/new fd 수명이 겹친다\n\n이 경우는 append semantics와 deleted-open/rotation 문제를 같이 봐야 한다.\n\n## 코드로 보기\n\n### 같은 열린 객체를 공유하는 경우\n\n```c\nint fd1 = open(\"data.log\", O_WRONLY | O_APPEND);\nint fd2 = dup(fd1);\n```\n\n### 독립 열린 객체가 필요한 경우\n\n```c\nint fd1 = open(\"data.log\", O_WRONLY | O_APPEND);\nint fd2 = open(\"data.log\", O_WRONLY | O_APPEND);\n```\n\n### mental model\n\n```text\ndup(fd)\n  -> new number\n  -> same underlying open description\n\nopen(path)\n  -> usually new number\n  -> new underlying open description\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 쓰는가 |\n|------|------|------|-------------|\n| `dup()` 공유 | handoff가 단순하다 | offset/status sharing이 숨은 coupling이 된다 | redirect, inherited I/O |\n| 별도 `open()` | 독립 cursor와 state를 갖기 쉽다 | open 비용과 lifecycle 관리가 늘어난다 | independent readers/writers |\n| `fork()` 후 공유 유지 | 표준 유닉스 동작과 잘 맞는다 | parent/child side effect가 생긴다 | 단순 pipeline |\n| `exec()` 전 재구성 | 수명 경계를 명확히 나눌 수 있다 | setup 코드가 늘어난다 | supervisor/subprocess hygiene |\n\n## 꼬리질문\n\n> Q: `dup()`한 fd 둘은 완전히 독립적인가요?\n> 핵심: 아니다. 번호는 달라도 같은 open file description을 공유하면 offset과 일부 status가 함께 움직일 수 있다.\n\n> Q: 독립 file offset이 필요하면 어떻게 하나요?\n> 핵심: 보통 같은 path를 다시 `open()`해 별도 open file description을 얻어야 한다.\n\n> Q: `FD_CLOEXEC`와 `O_NONBLOCK`는 같은 층의 설정인가요?\n> 핵심: 아니다. close-on-exec는 descriptor flag이고, nonblocking은 shared file status 쪽이라 영향 범위가 다르다.\n\n## 한 줄 정리\n\nbackend에서 fd 버그를 줄이려면 \"숫자 fd\"보다 \"같은 open file description을 공유하고 있는가\"를 먼저 생각하는 습관이 중요하다.\n",
   "aliases": [
-    "Open File Description dup 개념",
-    "Open File Description dup 정리",
-    "Open File Description dup 실수",
-    "Open File Description dup 판단 기준",
     "운영체제 Open File Description dup",
     "open file description shared offset",
     "dup fork fd shared offsets",
@@ -17,7 +13,8 @@
     "nonblocking shared status flags",
     "subprocess IO shared offset",
     "file descriptor vs open file description",
-    "open file description dup guide"
+    "dup 후 offset이 같이 움직여",
+    "fd 번호는 다른데 O_APPEND가 공유돼"
   ],
   "expected_queries": [
     "file descriptor 번호가 달라도 같은 open file description을 공유하면 무엇이 함께 움직여?",
@@ -49,12 +46,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/operating-system/open-file-description-dup-fork-shared-offsets.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch160"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 5 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

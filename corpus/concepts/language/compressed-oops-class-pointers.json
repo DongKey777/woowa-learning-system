@@ -6,10 +6,6 @@
   "summary": "compressed oops와 compressed class pointers는 64-bit JVM에서 포인터 표현을 줄여 메모리 효율과 캐시 친화성을 얻는 HotSpot 최적화이지만, heap 크기와 object header 해석을 같이 봐야 한다.",
   "body_markdown": "# Compressed Oops and Class Pointers\n\n> 한 줄 요약: compressed oops와 compressed class pointers는 64-bit JVM에서 포인터 표현을 줄여 메모리 효율과 캐시 친화성을 얻는 HotSpot 최적화이지만, heap 크기와 object header 해석을 같이 봐야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Stack vs Heap Escape Intuition](./stack-vs-heap-escape-intuition.md)\n> - [Object Layout and JOL Intuition](./object-layout-jol-intuition.md)\n> - [Direct Buffer Off-Heap Memory Troubleshooting](./direct-buffer-offheap-memory-troubleshooting.md)\n> - [Class Data Sharing and AppCDS](./class-data-sharing-appcds.md)\n\n> retrieval-anchor-keywords: compressed oops, class pointer, compressed class pointers, oop, object header, mark word, 64-bit JVM, heap footprint, pointer compression, HotSpot, narrow oop, narrow klass\n\n<details>\n<summary>Table of Contents</summary>\n\n- [핵심 개념](#핵심-개념)\n- [깊이 들어가기](#깊이-들어가기)\n- [실전 시나리오](#실전-시나리오)\n- [코드로 보기](#코드로-보기)\n- [트레이드오프](#트레이드오프)\n- [꼬리질문](#꼬리질문)\n- [한 줄 정리](#한-줄-정리)\n\n</details>\n\n## 핵심 개념\n\n64-bit JVM은 주소 공간이 넓지만, 모든 reference를 64-bit로 그대로 들고 다니면 메모리와 캐시 비용이 커진다.  \n그래서 HotSpot은 많은 경우 compressed oops를 사용해 reference를 더 작은 형태로 저장한다.\n\n비슷하게 클래스 메타데이터 참조에도 compressed class pointers가 쓰일 수 있다.\n\n### 왜 이게 중요한가\n\n- heap 사용량이 줄어들 수 있다\n- object graph가 더 캐시 친화적이 된다\n- object header와 포인터 해석을 이해해야 도구 출력이 덜 헷갈린다\n\n## 깊이 들어가기\n\n### 1. compressed oops는 무엇을 압축하는가\n\noop는 ordinary object pointer다.  \ncompressed oops는 이 포인터를 바로 64-bit로 저장하지 않고, 더 작은 표현으로 관리해서 메모리를 아낀다.\n\n즉 \"reference가 작아진다\"는 것은 주소 공간을 줄이는 것이 아니라 **표현 방식**을 바꾸는 것이다.\n\n### 2. class pointer도 비슷한 최적화가 있다\n\n객체는 자기 class 메타데이터도 참조한다.  \n이 class pointer도 compressed representation을 사용할 수 있다.\n\n그래서 object layout을 볼 때는 다음을 같이 봐야 한다.\n\n- mark word\n- klass pointer\n- instance fields\n\n### 3. 언제 이득이 큰가\n\n- 많은 객체를 오래 들고 있을 때\n- reference-heavy object graph일 때\n- cache locality가 중요할 때\n\n반대로 이미 메모리 압박이 작거나 객체 수가 적으면 체감이 덜할 수 있다.\n\n### 4. heap 크기와 함께 봐야 한다\n\ncompressed oops는 heap 크기에 따라 활성화/비활성화 조건이 달라질 수 있다.  \n즉 \"같은 JVM\"이라도 heap sizing이 바뀌면 포인터 표현과 성능 감각이 달라질 수 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: heap을 키웠더니 메모리 감각이 달라진다\n\nheap 크기 변화는 object layout과 pointer compression의 전제에 영향을 줄 수 있다.  \n그래서 단순히 `-Xmx`만 보고 성능을 해석하면 틀릴 수 있다.\n\n### 시나리오 2: object header를 봤는데 숫자가 이상하다\n\nJOL 같은 도구에서 헤더를 해석할 때 compressed klass pointer와 mark word를 구분해야 한다.  \n압축 여부를 모르고 보면 layout이 이상해 보일 수 있다.\n\n### 시나리오 3: 캐시 hit가 생각보다 낮다\n\nreference 자체가 더 작아지면 cache density가 좋아질 수 있다.  \n물론 애플리케이션의 접근 패턴이 더 중요하지만, heap footprint 최적화는 무시하기 어렵다.\n\n## 코드로 보기\n\n### 1. 객체 수가 많은 구조\n\n```java\nimport java.util.ArrayList;\nimport java.util.List;\n\npublic class Graph {\n    private final List<Node> nodes = new ArrayList<>();\n\n    public void add(Node node) {\n        nodes.add(node);\n    }\n\n    record Node(String id, List<Node> children) {}\n}\n```\n\n### 2. 관측 커맨드\n\n```bash\njava -XX:+UnlockDiagnosticVMOptions -XX:+PrintFlagsFinal -version | grep UseCompressed\n```\n\n### 3. 레이아웃을 읽는 감각\n\n```java\n// 객체의 실제 footprint는 fields만이 아니라\n// header, klass pointer, alignment, compressed reference 표현에 영향을 받는다.\n```\n\n## 트레이드오프\n\n| 선택 | 장점 | 비용 |\n|---|---|---|\n| compressed oops | 메모리와 캐시 효율이 좋아질 수 있다 | 주소 해석이 더 복잡하다 |\n| plain 64-bit pointers | 단순하다 | footprint가 커질 수 있다 |\n| 큰 heap | 여유가 생긴다 | compression 전제가 달라질 수 있다 |\n| 작은 heap | compact하다 | 압박이 빨리 올 수 있다 |\n\n핵심은 포인터 크기를 \"구현 디테일\"로만 보지 말고 heap footprint와 캐시 효율의 핵심 변수로 보는 것이다.\n\n## 꼬리질문\n\n> Q: compressed oops는 왜 쓰나요?\n> 핵심: 64-bit JVM에서 reference 표현을 줄여 메모리와 캐시 효율을 얻기 위해서다.\n\n> Q: class pointer도 압축되나요?\n> 핵심: HotSpot은 compressed class pointers를 사용할 수 있다.\n\n> Q: object layout을 볼 때 무엇을 같이 봐야 하나요?\n> 핵심: mark word, klass pointer, field alignment, reference 표현을 함께 봐야 한다.\n\n## 한 줄 정리\n\ncompressed oops와 compressed class pointers는 64-bit JVM의 메모리 절약 장치이고, object layout과 heap sizing 해석의 기본 전제가 된다.\n",
   "aliases": [
-    "Compressed Oops and Class 개념",
-    "Compressed Oops and Class 정리",
-    "Compressed Oops and Class 실수",
-    "Compressed Oops and Class 판단 기준",
     "자바 Compressed Oops and Class",
     "compressed oops",
     "compressed class pointers",
@@ -17,7 +13,9 @@
     "narrow klass",
     "Java object header pointer compression",
     "HotSpot pointer compression",
-    "compressed ordinary object pointer"
+    "compressed ordinary object pointer",
+    "Compressed Oops가 메모리를 줄여?",
+    "heap 크면 compressed pointer가 꺼져?"
   ],
   "expected_queries": [
     "HotSpot compressed oops와 compressed class pointers가 heap footprint를 줄이는 원리를 설명해줘",
@@ -51,12 +49,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/language/java/compressed-oops-class-pointers.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch158"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

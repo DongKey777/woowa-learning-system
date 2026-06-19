@@ -6,10 +6,6 @@
   "summary": "오래 도는 작업은 살아 있음을 알리는 heartbeat가 필요하지만, 그 heartbeat가 락 점유를 대신해 주지는 않는다.",
   "body_markdown": "# Transaction Heartbeat와 Long-Running Job Locking\n\n> 한 줄 요약: 오래 도는 작업은 살아 있음을 알리는 heartbeat가 필요하지만, 그 heartbeat가 락 점유를 대신해 주지는 않는다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서: [Transaction Timeout과 Lock Timeout](./transaction-timeout-vs-lock-timeout.md), [Metadata Lock and DDL Blocking](./metadata-lock-ddl-blocking.md), [DB Lease와 Fencing Token](./db-lease-fencing-coordination.md)\nretrieval-anchor-keywords: transaction heartbeat, long-running job, lease renewal, heartbeat lock, job progress\n\n## 핵심 개념\n\nLong-running job은 한 번에 끝나지 않기 때문에, 작업이 아직 살아 있는지와 작업이 정합성을 지키고 있는지를 따로 관리해야 한다.\n\n왜 중요한가:\n\n- 배치나 마이그레이션은 수분에서 수시간 걸릴 수 있다\n- 작업이 멈춘 것인지, 오래 걸리는 것인지 구분이 필요하다\n- heartbeat만 믿고 트랜잭션을 너무 오래 유지하면 락이 쌓인다\n\nheartbeat는 주로 “죽지 않았다”는 신호이고, 락은 “아직 소유 중이다”라는 신호다.\n둘은 같은 것이 아니다.\n\n## 깊이 들어가기\n\n### 1. heartbeat가 필요한 이유\n\n오래 도는 작업은 외부에서 보면 멈춘 것처럼 보일 수 있다.\n\n- 배치가 chunk 단위로 처리된다\n- 마이그레이션이 단계별로 진행된다\n- 백필이 중간에 IO 병목을 만난다\n\n이때 heartbeat를 남겨서 작업 관리자나 coordinator가 상태를 판단하게 한다.\n\n### 2. heartbeat가 락을 대체하지 못하는 이유\n\nheartbeat가 있다고 해서 락을 계속 잡아도 된다는 뜻은 아니다.\n\n- 트랜잭션이 오래 열려 있으면 row lock과 MDL이 유지될 수 있다\n- heartbeat는 상태 신호일 뿐 데이터 잠금이 아니다\n- 살아 있다는 이유로 긴 락을 유지하면 전체 경합이 커진다\n\n즉 heartbeat는 작업 상태 모니터링이고, 락 전략은 별도로 설계해야 한다.\n\n### 3. chunked job과 heartbeat\n\n좋은 패턴은 보통 이렇다.\n\n- 작은 chunk마다 커밋한다\n- chunk 완료 후 heartbeat를 갱신한다\n- 다음 chunk는 새 트랜잭션으로 진행한다\n\n이 방식은 락 점유 시간을 줄이고, 중간 실패 복구도 쉬워진다.\n\n### 4. heartbeat가 너무 잦으면 생기는 문제\n\n- DB write가 많아진다\n- coordinator row가 핫스팟이 된다\n- 상태 갱신 자체가 병목이 된다\n\nheartbeat는 충분히 자주, 하지만 과하게 자주 보내지 않는 균형이 필요하다.\n\n## 실전 시나리오\n\n### 시나리오 1: 밤새 도는 백필이 멈춘 것처럼 보임\n\n작업이 실제로는 chunk 30을 처리 중인데, 모니터링은 갱신이 없어서 실패로 오인한다.\nheartbeat가 있으면 이런 오판을 줄일 수 있다.\n\n### 시나리오 2: heartbeat 때문에 오히려 DB가 느려짐\n\n작업 상태 테이블을 초당 여러 번 갱신하면, 그 row 자체가 핫 row가 된다.\n이 경우 heartbeat 주기를 늘려야 한다.\n\n### 시나리오 3: 오래 열린 트랜잭션이 배포를 막음\n\n작업이 살아 있다고 판단되어 트랜잭션을 계속 유지하면 MDL과 row lock이 함께 오래 남을 수 있다.\nheartbeat와 락 수명은 분리해야 한다.\n\n## 재현/트리아지/실패 매트릭스/검증\n\n재현(repro)은 heartbeat가 살아 있는데 DB 관점에서는 오래 열린 transaction인 상황을 만든다.\n\n| 재현 케이스 | 기대 관측 |\n|---|---|\n| 큰 job을 하나의 transaction으로 실행 | row lock 또는 old snapshot이 오래 유지됨 |\n| transaction 밖 heartbeat만 갱신 | liveness는 보이지만 DB lock은 그대로 |\n| chunk commit 없이 heartbeat만 자주 보냄 | cleanup/vacuum/purge debt가 줄지 않음 |\n| lease renew가 늦음 | 다른 worker가 같은 job을 claim할 수 있음 |\n\n트리아지(triage)는 두 시계를 분리한다.\n\n1. heartbeat timestamp: worker process가 살아 있는가\n2. transaction age: DB transaction이 얼마나 오래 열려 있는가\n3. lock wait/blocker: 다른 query를 막는가\n4. chunk progress: commit된 단위가 실제로 앞으로 가는가\n\n실패 매트릭스(failure matrix)는 아래처럼 둔다.\n\n| 증상 | 잘못된 해석 | 맞는 해석/액션 |\n|---|---|---|\n| heartbeat가 계속 찍힘 | DB도 안전함 | long transaction age를 따로 확인 |\n| lock wait가 길어짐 | heartbeat 주기 부족 | chunk size와 transaction 범위 축소 |\n| 같은 job을 두 worker가 처리 | heartbeat만 있으면 독점 | lease deadline + fencing/output dedup 필요 |\n| vacuum/purge가 밀림 | cleanup 설정 부족 | old transaction/snapshot을 먼저 찾음 |\n\n검증(validation)은 heartbeat freshness와 transaction age를 동시에 assert한다. heartbeat는 \"작업자가 죽지 않았다\"는 관측이고, DB row lock이나 MVCC snapshot을 자동으로 갱신/해제하지 않는다. 긴 작업의 보장은 chunk commit, lease renew, idempotent output이 같이 있어야 한다.\n\n## 코드로 보기\n\n```sql\nCREATE TABLE job_heartbeat (\n  job_name VARCHAR(100) PRIMARY KEY,\n  worker_id VARCHAR(100) NOT NULL,\n  last_seen_at DATETIME NOT NULL,\n  progress_pct INT NOT NULL\n);\n\nUPDATE job_heartbeat\nSET last_seen_at = NOW(),\n    progress_pct = 60\nWHERE job_name = 'daily-backfill';\n```\n\n```java\nfor (Chunk chunk : chunks) {\n    processChunk(chunk);\n    updateHeartbeat(jobName, workerId, chunk.progress());\n    commitChunk();\n}\n```\n\nheartbeat는 작업이 아직 살아 있음을 보여주지만, **트랜잭션과 락을 오래 붙잡아도 된다는 허가증은 아니다**.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| 긴 단일 트랜잭션 + heartbeat | 단순하다 | 락과 MDL이 오래 간다 | 거의 없음 |\n| chunked transaction + heartbeat | 복구가 쉽다 | 구현이 더 복잡하다 | 대부분의 장기 작업 |\n| 외부 coordinator + heartbeat | 관측성이 좋다 | 운영 요소가 늘어난다 | 대규모 배치 |\n| heartbeat 없는 작업 | 구현이 쉽다 | 중단 감지가 어렵다 | 매우 짧은 작업 |\n\n## 꼬리질문\n\n> Q: heartbeat가 있는데 왜 락이 오래 문제되나요?\n> 의도: 상태 신호와 락 점유를 분리해서 아는지 확인\n> 핵심: 살아 있음을 알리는 것과 자원을 오래 잡는 것은 별개다\n\n> Q: 장기 작업은 왜 chunk로 나누나요?\n> 의도: 롤백과 경합 비용을 이해하는지 확인\n> 핵심: 락 점유를 줄이고 복구 지점을 만들기 위해서다\n\n> Q: heartbeat를 너무 자주 갱신하면 무슨 일이 생기나요?\n> 의도: coordinator row가 병목이 되는 점을 아는지 확인\n> 핵심: 상태 테이블 자체가 핫스팟이 된다\n\n## 한 줄 정리\n\nTransaction heartbeat는 장기 작업의 생존 신호이고, 락은 chunk 단위로 짧게 유지해야 한다.\n",
   "aliases": [
-    "Transaction Heartbeat and Long-Running 개념",
-    "Transaction Heartbeat and Long-Running 정리",
-    "Transaction Heartbeat and Long-Running 실수",
-    "Transaction Heartbeat and Long-Running 판단 기준",
     "데이터베이스 Transaction Heartbeat and Long-Running",
     "transaction heartbeat",
     "long-running job",
@@ -17,7 +13,9 @@
     "heartbeat lock",
     "job progress",
     "chunked transaction heartbeat",
-    "long transaction locking"
+    "long transaction locking",
+    "heartbeat가 lock을 대신하나요",
+    "긴 배치는 chunk마다 commit하기"
   ],
   "expected_queries": [
     "long-running job에서 heartbeat는 살아 있음 신호이고 DB lock 소유권을 대체하지 못한다는 뜻이 뭐야?",
@@ -52,12 +50,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/database/transaction-heartbeat-long-running-job-locking.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch156"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }

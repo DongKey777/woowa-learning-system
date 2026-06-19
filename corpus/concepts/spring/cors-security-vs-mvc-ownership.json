@@ -6,10 +6,6 @@
   "summary": "CORS는 Security와 MVC 어디서나 보일 수 있지만, 실제로는 필터 체인과 핸들러 레이어 중 어디가 정책의 주인이냐를 분리해야 한다.",
   "body_markdown": "# Spring CORS: Security vs MVC Ownership\n\n> 한 줄 요약: CORS는 Security와 MVC 어디서나 보일 수 있지만, 실제로는 필터 체인과 핸들러 레이어 중 어디가 정책의 주인이냐를 분리해야 한다.\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Spring Security Filter Chain Ordering](./spring-security-filter-chain-ordering.md)\n> - [Spring MVC Filter, Interceptor, and ControllerAdvice Boundaries](./spring-mvc-filter-interceptor-controlleradvice-boundaries.md)\n> - [Spring Security 아키텍처](./spring-security-architecture.md)\n> - [Spring MVC 요청 생명주기](./spring-mvc-request-lifecycle.md)\n> - [Spring Content Negotiation Pitfalls](./spring-content-negotiation-pitfalls.md)\n\nretrieval-anchor-keywords: CORS, preflight, Access-Control-Allow-Origin, Access-Control-Allow-Credentials, Security filter chain, MVC config, cross-origin request, preflight request\n\n## 핵심 개념\n\nCORS는 브라우저 정책이므로 서버는 그 요청에 맞는 헤더를 제공해야 한다.\n\n문제는 이 정책이 Security와 MVC 둘 다에 연결될 수 있다는 점이다.\n\n- Security에서 막힐 수 있다\n- MVC CORS config에서 처리될 수 있다\n- preflight 요청은 인증 전에 거를 수도 있다\n\n그래서 ownership을 명확히 해야 한다.\n\n## 깊이 들어가기\n\n### 1. preflight는 OPTIONS 요청이다\n\n브라우저는 실제 요청 전에 OPTIONS preflight를 보낼 수 있다.\n\n### 2. Security가 먼저 막을 수 있다\n\n이 문맥은 [Spring Security Filter Chain Ordering](./spring-security-filter-chain-ordering.md)와 같이 봐야 한다.\n\n필터 체인이 OPTIONS를 차단하면 CORS 설정이 있어도 실패한다.\n\n### 3. MVC CORS config는 핸들러 수준이다\n\n```java\n@Configuration\npublic class WebConfig implements WebMvcConfigurer {\n}\n```\n\n이런 방식은 컨트롤러 매핑과 함께 CORS 정책을 관리한다.\n\n### 4. allowCredentials와 wildcard는 주의해야 한다\n\ncredentials를 쓰면서 `*`를 쓰면 안 되는 경우가 있다.\n\n### 5. 경계는 \"누가 먼저 응답하느냐\"로 보인다\n\n필터가 먼저 응답하면 MVC는 도달하지 못한다.\n\n## 실전 시나리오\n\n### 시나리오 1: 브라우저에서만 CORS 에러가 난다\n\ncurl은 되는데 브라우저가 막는다면 preflight 문제일 수 있다.\n\n### 시나리오 2: Security를 켜자 CORS가 깨진다\n\n필터 순서나 Security CORS 설정을 봐야 한다.\n\n### 시나리오 3: 특정 origin만 허용하고 싶다\n\n정확한 origin 관리가 필요하다.\n\n### 시나리오 4: 개발환경과 운영환경이 다르다\n\n환경별 origin 차이를 분리해야 한다.\n\n## wrong-bucket/confusable 비교\n\nCORS 실패는 브라우저 화면에 같은 문구로 보이지만 원인 버킷은 다를 수 있다. 먼저 \"누가 응답을 끝냈는가\"로 가른다.\n\n| 증상 | 맞는 첫 버킷 | wrong bucket | 왜 틀렸나 |\n|---|---|---|---|\n| OPTIONS preflight가 `401/403`으로 끝난다 | Security filter chain | MVC CORS mapping | filter가 먼저 응답하면 handler mapping까지 도달하지 않는다 |\n| controller까지 도달한 실제 요청에 CORS header가 없다 | MVC CORS config 또는 handler mapping | 인증 실패 | 인증은 통과했는데 응답 header 정책이 빠진 문제일 수 있다 |\n| curl은 되는데 브라우저만 막힌다 | 브라우저 CORS 정책 / preflight | 서버 API 기능 실패 | curl은 CORS를 강제하지 않으므로 서버 기능 성공과 브라우저 허용은 다르다 |\n| credential 요청에서 wildcard origin을 쓴다 | CORS header 조합 문제 | session 저장소 문제 | cookie가 안 가는 것처럼 보여도 먼저 `Access-Control-Allow-*` 조합을 봐야 한다 |\n| Security와 MVC에 둘 다 CORS가 있다 | ownership 중복 | \"둘 다 있으니 더 안전\" | 중복 정책은 실제 owner를 숨기고 환경별 drift를 만든다 |\n\nNetwork 탭의 preflight status와 response header는 \"어느 레이어가 먼저 응답했는지\"를 **suggest**한다. 하지만 filter order나 handler mapping 소유권은 Spring debug log, security chain 설정, 실제 등록된 CORS config로 확인해야 한다.\n\n## 코드로 보기\n\n### Security CORS\n\n```java\n@Bean\nSecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {\n    return http\n        .cors(cors -> {})\n        .build();\n}\n```\n\n### MVC CORS\n\n```java\n@Configuration\npublic class CorsConfig implements WebMvcConfigurer {\n\n    @Override\n    public void addCorsMappings(CorsRegistry registry) {\n        registry.addMapping(\"/api/**\")\n            .allowedOrigins(\"https://example.com\");\n    }\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Security ownership | 보안 정책과 통합된다 | 설정이 복잡해질 수 있다 | 인증이 필요한 API |\n| MVC ownership | 라우트별 정책이 명확하다 | Security와 중복될 수 있다 | 단순 CORS |\n| 둘 다 사용 | 세밀하게 조정된다 | 중복/충돌 위험 | 복잡한 서비스 |\n\n핵심은 CORS를 \"브라우저 에러\"가 아니라 **보안 필터와 MVC 처리 책임의 경계**로 보는 것이다.\n\n## 꼬리질문\n\n> Q: preflight 요청은 왜 필요한가?\n> 의도: 브라우저 교차 출처 정책 이해 확인\n> 핵심: 실제 요청 전에 허용 여부를 확인하기 위해서다.\n\n> Q: Security와 MVC 중 어디가 CORS의 주인이 되어야 하는가?\n> 의도: ownership 판단 확인\n> 핵심: 보안 정책은 보통 Security, 라우트 단 정책은 MVC다.\n\n> Q: `allowCredentials`와 `*`가 왜 문제인가?\n> 의도: CORS 헤더 제약 이해 확인\n> 핵심: credentials를 허용할 때 wildcard가 제한될 수 있다.\n\n> Q: 브라우저만 실패하고 curl은 성공하는 이유는 무엇인가?\n> 의도: preflight 이해 확인\n> 핵심: 브라우저가 CORS preflight를 추가로 수행하기 때문이다.\n\n## 한 줄 정리\n\nCORS는 Security와 MVC가 모두 관여할 수 있지만, 실제 책임 주체를 분리해야 preflight와 허용 헤더가 일관되게 동작한다.\n",
   "aliases": [
-    "Spring CORS: Security vs 개념",
-    "Spring CORS: Security vs 정리",
-    "Spring CORS: Security vs 실수",
-    "Spring CORS: Security vs 판단 기준",
     "스프링 Spring CORS: Security vs",
     "cors",
     "preflight",
@@ -17,7 +13,9 @@
     "access-control-allow-credentials",
     "security filter chain",
     "mvc config",
-    "cross-origin request"
+    "cross-origin request",
+    "preflight가 인증 전에 막혀요",
+    "CORS 설정 주인을 Security로 둘까요 MVC로 둘까요"
   ],
   "expected_queries": [
     "Spring CORS 설정을 Security에 둬야 해 MVC에 둬야 해?",
@@ -54,12 +52,22 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-19",
     "legacy_path": "knowledge/cs/contents/spring/spring-cors-security-vs-mvc-ownership.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch162"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-19",
+        "source": "cycle2-generated-filler-repair",
+        "note": "added natural Korean aliases"
       }
     ]
   }
