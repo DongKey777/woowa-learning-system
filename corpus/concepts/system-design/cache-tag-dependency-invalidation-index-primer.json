@@ -1,0 +1,61 @@
+{
+  "id": "system-design/cache-tag-dependency-invalidation-index-primer",
+  "title": "cache tag와 dependency index로 관련 캐시를 함께 지우는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Cache tag 또는 dependency index는 어떤 entity, tag, surrogate key가 어떤 cache key들을 만들었는지 역방향으로 기록해 두고, 원본이 바뀔 때 관련 list/detail/page 캐시를 함께 지우는 패턴이다. 관련 캐시를 넓게 찾을 수 있지만 index 유지, fan-out 폭증, stale dependency, CDN surrogate-key와 app cache의 경계를 따로 관리해야 한다.",
+  "body_markdown": "# cache tag와 dependency index로 관련 캐시를 함께 지우는 법\n\n> 한 줄 요약: list/detail 캐시를 같이 지우려면 cache key만 저장하지 말고 어떤 원본에 의존했는지도 추적해야 한다.\n\n## 왜 필요한가\n\n상품 상세 캐시만 지우면 상품 목록, 검색 결과, 추천 영역, 카테고리 페이지는 여전히 예전 값을 보여 줄 수 있다. cache tag 방식은 캐시를 만들 때 그 캐시가 의존한 원본을 tag로 함께 기록한다.\n\n```text\ncache key: product:list:category:book:page:1\nregistered tags: product:42, category:book\n\nproduct 42 updated\n  -> dependency index lookup product:42\n  -> delete related list/detail/page cache keys\n```\n\n## 설계 질문\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| tag는 무엇인가 | entity id, category, tenant, surrogate key |\n| index는 어디에 두나 | App Redis set, DB table, CDN은 header 선언 뒤 내부 mapping |\n| 누가 등록하고 지우나 | cache fill path, write path, background cleanup |\n| fan-out은 통제되나 | tag당 key 수, pagination 폭, batch delete |\n\n이 패턴은 CDN의 surrogate-key purge와 닮았지만 완전히 같지는 않다. CDN에서는 response header에 surrogate key를 붙이고 edge/CDN이 내부적으로 key mapping을 관리한다. 애플리케이션 내부 캐시는 Redis set이나 DB table로 dependency index를 직접 유지할 수 있다. 두 계층을 같이 쓰면 어떤 원본 변경이 어느 계층까지 purge되어야 하는지 분리해야 한다.\n\n가장 흔한 실패는 index가 실제 캐시 key보다 오래 남거나 반대로 누락되는 것이다. cache fill 중 실패, key TTL 만료, partial delete, tag 폭증을 고려하지 않으면 stale index가 쌓이거나 중요한 캐시가 남는다. Index entry에 TTL을 둔다면 cache key TTL보다 짧아서는 안 되고, cache fill과 index 갱신이 같이 성공하거나 같이 되돌아가야 한다. key 수가 큰 tag는 namespace generation이나 coarse tag로 바꾸는 선택지가 필요하다.\n\n상품이 바뀌면 현재 목록에 들어 있던 cache만 지우면 충분하지 않을 때도 있다. 가격, 카테고리, 재고, 정렬 점수가 바뀌어 어떤 목록에 새로 들어가거나 빠질 수 있다면 old/new predicate 기준으로 관련 카테고리와 필터를 함께 무효화하거나, 더 큰 coarse tag나 generation bump로 처리해야 한다.\n\n여기서 말하는 tag는 cache invalidation용 dependency label이다. Redis Cluster의 hash tag처럼 같은 slot에 key를 모으는 문법과는 목적이 다르다. Tag purge도 즉시 전역 일관성을 보장하지 않으므로 propagation latency와 purge 뒤 miss storm을 운영 지표로 봐야 한다.\n\n## 흔한 오해\n\n- detail cache만 지우면 list cache도 자동으로 바뀐다고 본다.\n- tag index 유지 비용을 무시하고 모든 캐시에 모든 tag를 붙인다.\n- CDN surrogate-key purge와 Redis app cache delete를 같은 명령 하나로 처리된다고 본다.\n- stale dependency index가 있어도 delete는 항상 정확할 거라고 기대한다.\n- pagination list cache가 얼마나 많이 생기는지 세지 않는다.\n\n## 한 줄 정리\n\nCache tag invalidation은 관련 캐시를 찾기 위한 역방향 index 설계이며, tag fan-out과 stale index를 통제하지 못하면 무효화 자체가 새 병목이 된다.\n",
+  "aliases": [
+    "cache tag invalidation",
+    "캐시 의존성 인덱스",
+    "CDN surrogate key로 관련 캐시 지우기",
+    "목록 캐시와 상세 캐시 같이 지우기",
+    "상품 변경 때 목록 캐시 같이 지우기",
+    "태그 기반 캐시 무효화",
+    "캐시 key 의존 관계 기록하기",
+    "관련 캐시 key 목록 관리",
+    "tag invalidation을 쓰려면 key 목록을 어디서 관리해?"
+  ],
+  "expected_queries": [
+    "상품 하나가 바뀌었을 때 detail 캐시뿐 아니라 여러 list 캐시까지 같이 지우려면 tag를 어떻게 관리해?",
+    "어떤 캐시가 상품 데이터를 보고 있는지 기록하려면 어디에 저장해야 해?",
+    "목록 페이지 캐시가 많은데 상품이 바뀌면 지울 캐시 키를 어떻게 찾아?",
+    "CDN의 surrogate key랑 Redis 캐시 태그는 같은 방식이야?",
+    "캐시 태그를 너무 많이 붙이면 지울 때 왜 느려지거나 꼬일 수 있어?",
+    "Redis Cluster hash tag랑 캐시 무효화 tag는 이름만 같은 거야?"
+  ],
+  "symptoms": [
+    "상품 상세는 갱신됐지만 목록과 검색 결과 캐시는 예전 값을 보여 준다.",
+    "tag 하나에 매달린 cache key가 너무 많아 purge가 느려진다.",
+    "dependency index가 stale해져 이미 사라진 cache key를 계속 지우려 한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-invalidation-patterns-primer",
+      "spring/cache-key-generation-pitfalls"
+    ],
+    "next_docs": [
+      "network/cdn-cache-key-invalidation",
+      "system-design/cdn-cache-key-invalidation-perspective-map",
+      "system-design/cache-versioned-namespace-generation-invalidation-primer"
+    ],
+    "confusable_with": [
+      "security/authorization-graph-cache-relationship-cache-primer",
+      "system-design/redis-cluster-hash-slot-hash-tag-primer",
+      "system-design/materialized-view-vs-search-index-vs-cache-derived-data-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch220"
+      }
+    ]
+  }
+}

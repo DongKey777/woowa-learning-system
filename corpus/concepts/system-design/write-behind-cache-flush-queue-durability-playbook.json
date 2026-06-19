@@ -1,0 +1,61 @@
+{
+  "id": "system-design/write-behind-cache-flush-queue-durability-playbook",
+  "title": "write-behind cache에서 flush queue를 잃지 않는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Write-behind cache는 응답 시점에는 cache나 flush queue가 잠깐 원본 데이터 역할을 맡고, worker가 나중에 DB로 반영한다. 그래서 ack 전에 durable queue, WAL, outbox 같은 기록이 먼저 남아야 하며, worker crash 뒤 replay, idempotent flush, 순서와 conflict 처리 없이는 지연 쓰기가 데이터 유실로 이어질 수 있다.",
+  "body_markdown": "# write-behind cache에서 flush queue를 잃지 않는 법\n\n> 한 줄 요약: write-behind는 빠른 응답을 얻는 대신, DB에 쓰기 전까지의 변경을 안전하게 보관할 책임이 생긴다.\n\n## 위험한 지점\n\nWrite-through는 요청 경로에서 DB까지 쓰고 나서 응답하는 쪽에 가깝다. Write-behind는 DB 쓰기를 flush worker가 나중에 처리한다. 이때 성공 응답 전에 durable flush record가 먼저 남거나 cache 갱신과 flush record가 atomic하게 묶여야 한다. cache만 바뀌고 record append가 실패하면 dirty cache value가 보이지만 replay할 근거가 없는 상태가 된다. 이 사이에는 cache나 flush queue가 사실상 최신 상태의 유일한 근거가 될 수 있다.\n\n```text\nappend durable flush record\nupdate cache or atomically bind cache+record\nack to client\nworker writes DB later\nworker crash -> replay pending records\n```\n\n## 필요한 장치\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| ack 전에 무엇이 durable한가 | WAL, outbox, persisted queue, disk-backed stream |\n| worker가 죽으면 어떻게 하나 | pending replay, retry, poison message 처리 |\n| 같은 쓰기를 여러 번 보내면 | idempotency key, version, compare-and-set |\n| 순서가 바뀌면 | per-entity ordering, conflict resolution |\n| cache가 사라지면 | DB와 flush log 중 어디서 복구하는지 |\n\nRedis RDB/AOF를 켰다고 곧바로 DB transaction과 같은 보장이 생기는 것은 아니다. Redis에 남은 cache value와 아직 DB에 쓰지 않은 변경 기록을 어떻게 함께 복구할지, AOF fsync 정책에서 어느 정도 유실을 감수하는지, worker가 중복 flush할 때 DB가 안전한지까지 봐야 한다. Pub/Sub은 durable flush queue가 아니며, Redis Streams를 쓰더라도 pending entry recovery, retention, idempotency, downstream 성공 뒤 `XACK` 같은 운영 규칙이 필요하다.\n\n제품 요구에 따라 write-behind는 여러 변경을 합쳐 latest value만 저장할 수도 있고, 모든 mutation을 순서대로 남겨야 할 수도 있다. 두 요구를 섞으면 replay 결과가 달라진다. 그래서 per-entity ordering key, conflict resolution, retry/backoff, oldest pending age alert, DLQ나 quarantine 기준을 같이 둔다.\n\nWrite-behind는 counters, analytics, session-like state처럼 약간 늦게 반영되어도 되는 영역에서 검토하기 쉽다. 주문 결제, 재고 차감, 권한 변경처럼 DB가 즉시 source of truth여야 하는 흐름에는 outbox나 transaction boundary를 먼저 설계하고, write-behind를 단순 성능 최적화처럼 끼워 넣지 않는다.\n\n## 흔한 오해\n\n- cache에 먼저 썼으니 성공 응답을 줘도 DB 유실 가능성이 없다고 본다.\n- Redis persistence를 켰으니 flush queue durability도 자동으로 해결됐다고 본다.\n- worker crash 뒤 replay와 idempotency를 설계하지 않는다.\n- 같은 entity의 업데이트 순서가 바뀌어도 마지막 값이 항상 맞을 거라고 기대한다.\n- write-behind와 outbox를 같은 문제의 같은 해법으로 뭉친다.\n\n## 한 줄 정리\n\nWrite-behind cache는 DB 쓰기 지연을 선택하는 구조라서, 응답 전에 durable flush record를 남기고 worker 재시작 뒤 안전하게 replay할 수 있어야 한다.\n",
+  "aliases": [
+    "write-behind flush queue",
+    "수정된 캐시 값을 DB에 나중에 쓰기",
+    "DB에 나중에 쓰기",
+    "write-behind에도 WAL이 필요해?",
+    "flush worker 죽으면 데이터 사라져?",
+    "DB에 나중에 쓰는 캐시",
+    "write-behind 실패 후 다시 실행하기",
+    "캐시가 잠깐 원본 데이터 역할을 하는 구조",
+    "flush queue를 Redis로 둬도 durable해?",
+    "Pub/Sub으로 DB 반영 worker 깨워도 메시지 안 잃어?"
+  ],
+  "expected_queries": [
+    "write-behind cache에서 DB에 늦게 쓰기 전에 flush worker가 죽으면 데이터가 사라지지 않게 뭘 해야 해?",
+    "캐시를 먼저 바꾸고 DB에는 나중에 쓰는 구조에서는 어떤 큐가 필요해?",
+    "Redis persistence를 켜면 write-behind flush queue 유실 문제가 자동으로 해결돼?",
+    "write-behind worker가 재시작해도 같은 작업을 안전하게 다시 처리하려면 어떻게 해야 해?",
+    "write-behind에서 캐시가 잠깐 원본 데이터 역할을 한다는 게 무슨 뜻이야?"
+  ],
+  "symptoms": [
+    "성공 응답 뒤 flush worker가 죽어 DB에 변경이 남지 않는다.",
+    "worker 재시작 후 같은 변경을 중복으로 DB에 반영한다.",
+    "cache에는 최신값이 있었지만 Redis 재시작이나 eviction 뒤 복구 기준이 없다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/caching-strategy-cache-aside-vs-write-through-vs-write-behind-chooser",
+      "system-design/redis-cache-aside-write-through-interview-chooser"
+    ],
+    "next_docs": [
+      "system-design/outbox-cdc-delivery-semantic-chooser",
+      "database/outbox-saga-eventual-consistency",
+      "system-design/queue-backpressure-idempotency-perspective-map"
+    ],
+    "confusable_with": [
+      "system-design/redis-persistence-rdb-vs-aof-primer",
+      "database/cdc-debezium-outbox-binlog",
+      "spring/service-layer-external-io-after-commit-outbox-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch220"
+      }
+    ]
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "system-design/redis-maxmemory-eviction-policy-memory-pressure-playbook",
+  "title": "Redis maxmemory eviction을 TTL 문제와 구분하는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis maxmemory eviction은 TTL 만료나 애플리케이션 invalidation이 아니라, 설정된 메모리 한도 근처에서 policy에 따라 key를 밀어내는 capacity pressure 신호다. `evicted_keys`, `used_memory_dataset`, `mem_not_counted_for_evict`, RSS, fragmentation, `OOM command not allowed`, policy 종류를 함께 봐야 하며, eviction은 cache miss와 원본 DB 부하로 이어질 수 있다.",
+  "body_markdown": "# Redis maxmemory eviction을 TTL 문제와 구분하는 법\n\n> 한 줄 요약: key가 사라졌다고 모두 TTL 만료가 아니라, maxmemory 압박으로 Redis가 key를 밀어냈을 수 있다.\n\n## 먼저 볼 지표\n\nRedis에서 캐시 key가 예상보다 빨리 사라지면 TTL, delete, invalidation만 볼 수 있다. 하지만 `maxmemory`가 설정되어 있고 메모리 사용량이 한도에 가까우면 Redis는 `maxmemory-policy`에 따라 key를 제거하거나 쓰기를 거절한다.\n\n```text\nINFO stats  -> evicted_keys 증가\nINFO memory -> used_memory, used_memory_dataset, mem_not_counted_for_evict, used_memory_rss\nCONFIG GET maxmemory maxmemory-policy\nclient error -> OOM command not allowed\n```\n\n## policy 차이\n\n| policy | 의미 |\n|---|---|\n| noeviction | 메모리 한도에서 쓰기 명령 거절 |\n| allkeys-lru/lfu/random | 모든 key 중에서 제거 후보 선택 |\n| volatile-lru/lfu/random | expire가 있는 key 중에서 LRU, LFU, random 기준으로 후보 선택 |\n| volatile-ttl | expire가 있는 key 중 TTL이 짧은 key를 우선 제거 |\n\nEviction은 Redis가 캐시를 정리하는 정상 동작일 수 있지만, 애플리케이션 입장에서는 cache miss가 늘고 원본 DB 부하가 튄다. TTL 전에 사라진 key가 많다면 `evicted_keys` 증가와 같은 시간대의 DB QPS, latency, hot key, big key, value size 변화를 함께 봐야 한다.\n\n`volatile-*` policy는 TTL이 있는 key만 eviction 후보로 삼는다. expire가 붙은 후보가 충분하지 않으면 메모리가 찼는데도 쓰기가 거절되는 장면이 나올 수 있다. Redis의 LRU/LFU도 전체 key를 완벽히 정렬하는 방식이 아니라 sampling 기반 근사라서, 항상 가장 오래된 key가 먼저 사라진다고 보면 안 된다.\n\n`used_memory`, `used_memory_dataset`, `mem_not_counted_for_evict`와 OS에서 보는 RSS가 다를 수도 있다. allocator fragmentation, replication backlog, client output buffer, AOF rewrite 같은 요인 때문에 RSS가 커질 수 있으며, 정책 판단과 운영 한도는 Redis 버전과 설정에 따라 다르게 해석해야 한다. Redis maxmemory eviction과 OS OOM은 같은 사건이 아니다. 그래서 단순히 TTL을 늘리거나 줄이기 전에 `expired_keys`, `evicted_keys`, rejected write, hit/miss, memory profile을 함께 확인한다.\n\n## 흔한 오해\n\n- key가 사라졌으니 TTL이 짧아서라고만 판단한다.\n- `volatile-*` policy를 쓰면서 expire 없는 key도 eviction될 거라고 기대한다.\n- `noeviction`에서 쓰기 실패가 Redis 장애라고만 보고 memory pressure를 보지 않는다.\n- eviction으로 늘어난 cache miss가 DB 장애처럼 보이는 흐름을 놓친다.\n- RSS와 used_memory 차이를 무시하고 maxmemory를 너무 촘촘하게 잡는다.\n\n## 한 줄 정리\n\nRedis eviction은 무효화 로직이 아니라 메모리 한도에서 발생하는 운영 신호이며, policy와 memory 지표를 봐야 TTL 문제와 구분할 수 있다.\n",
+  "aliases": [
+    "Redis maxmemory-policy",
+    "allkeys-lru eviction",
+    "volatile-ttl",
+    "evicted_keys 증가",
+    "OOM command not allowed",
+    "Redis 메모리 압력",
+    "캐시가 TTL 전에 사라짐",
+    "used_memory_rss 확인",
+    "메모리 조각화 때문에 Redis 메모리가 커져 보여",
+    "TTL 만료랑 eviction 차이가 뭐야?",
+    "noeviction인데 왜 쓰기 에러가 나?"
+  ],
+  "expected_queries": [
+    "Redis maxmemory-policy 때문에 evicted_keys가 늘면 TTL 문제가 아니라 메모리 압력인지 어떻게 봐?",
+    "캐시 key가 TTL 전에 사라질 때 Redis eviction과 invalidation을 어떻게 구분해?",
+    "allkeys-lru와 volatile-ttl은 어떤 키를 삭제 후보로 삼는 게 달라?",
+    "Redis OOM command not allowed가 나오면 noeviction 정책과 memory 지표를 어떻게 확인해야 해?",
+    "Redis eviction이 늘면 왜 DB 부하와 cache miss가 같이 튈 수 있어?"
+  ],
+  "symptoms": [
+    "TTL이 남은 cache key가 사라지고 `evicted_keys`가 증가한다.",
+    "Redis 쓰기에서 `OOM command not allowed`가 발생한다.",
+    "cache miss 증가 뒤 원본 DB latency가 함께 오른다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-ttl-key-expiration-mechanics-primer",
+      "data-structure/cache-eviction-lru-vs-lfu-vs-arc-intermediate-chooser"
+    ],
+    "next_docs": [
+      "system-design/redis-eviction-vs-replication-stale-cache-bridge",
+      "system-design/redis-hot-key-big-key-operations-primer",
+      "system-design/redis-keyspace-notification-expiration-invalidation-caveats-primer"
+    ],
+    "confusable_with": [
+      "system-design/cache-stampede-ttl-jitter-interview-playbook",
+      "system-design/redis-basics-in-memory-kv-single-thread-primer",
+      "data-structure/lru-lfu-ttl-cache-eviction-perspective-map"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch220"
+      }
+    ]
+  }
+}

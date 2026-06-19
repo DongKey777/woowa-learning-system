@@ -1,0 +1,60 @@
+{
+  "id": "system-design/redis-keyspace-notification-expiration-invalidation-caveats-primer",
+  "title": "Redis expired keyspace notification을 스케줄러로 착각하지 않는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis keyspace notification의 expired event는 key가 실제로 삭제될 때 Pub/Sub으로 날아오는 best-effort 신호다. `notify-keyspace-events` 설정이 필요하고, TTL 만료 시각에 정확히 실행되는 durable scheduler가 아니며, subscriber 중단이나 Redis 재시작 동안의 이벤트는 놓칠 수 있다.",
+  "body_markdown": "# Redis expired keyspace notification을 스케줄러로 착각하지 않는 법\n\n> 한 줄 요약: expired event는 만료된 사실을 알려 주는 휘발성 신호이지, 정확한 시각에 반드시 실행되는 작업 큐가 아니다.\n\n## 어떤 기능인가\n\nRedis는 설정을 켜면 key 변경, 만료, 삭제 같은 이벤트를 Pub/Sub 채널로 보낼 수 있다. 기본은 꺼져 있으며, expired keyevent를 받으려면 보통 `notify-keyspace-events Ex`처럼 event 채널과 expired class를 켠다. 예를 들어 expired event를 구독하면 key가 만료되어 실제 삭제될 때 `__keyevent@0__:expired` 같은 채널로 알림을 받을 수 있다.\n\n```text\nSET reservation:hold:7 value EX 300\n... key is deleted by active or lazy expiration ...\nRedis publishes expired event\nsubscriber reacts if it is connected at that moment\n```\n\n## 조심할 점\n\n| 기대 | 실제 의미 |\n|---|---|\n| TTL 시각에 정확히 실행 | active/lazy expiration으로 삭제되는 시점에 event |\n| 꺼져 있어도 나중에 받음 | Pub/Sub이므로 subscriber offline 동안 유실 |\n| Redis restart 뒤에도 보존 | durable queue가 아니어서 event backlog 없음 |\n| 모든 업무 작업의 source of truth | 보조 신호로 쓰고 주기 reconcile 필요 |\n\n만료 이벤트는 캐시 정리, 보조 인덱스 청소, soft reminder 같은 힌트에는 쓸 수 있다. 하지만 결제 취소, 예약 확정 해제, 재고 복구처럼 반드시 한 번 실행되어야 하는 업무 흐름은 DB 상태, durable queue, outbox, scheduled job 같은 회복 가능한 경로가 필요하다.\n\nTTL이 끝난 순간 key가 즉시 물리적으로 사라지는 것도 아니다. Redis는 만료 key를 접근 시 lazy하게 지우거나 주기적인 active expiration으로 정리한다. 그래서 이벤트가 늦게 보일 수 있고, 서버 부하, active expiration 주기, TTL key 수에 따라 관측 타이밍이 달라진다.\n\n`expire`와 `expired`도 다르다. TTL을 설정할 때 생기는 이벤트와, TTL이 지난 key가 실제 삭제될 때 생기는 이벤트를 섞으면 안 된다. expired event 메시지는 보통 key 이름만 알려 주며 사라진 value를 되살려 주지 않는다. Redis Cluster에서는 notification 관측이 node 단위라 전체 keyspace를 보려면 각 node 구독과 유실 복구 전략을 따로 둔다. TTL 만료가 아니라 maxmemory 정책으로 밀려난 key는 expiration이 아니라 eviction 신호로 봐야 한다.\n\n## 흔한 오해\n\n- expired event를 cron이나 delayed queue 대체재로 본다.\n- subscriber가 죽어 있던 동안의 만료 이벤트를 Redis가 쌓아 둘 거라고 기대한다.\n- TTL 시간이 끝나는 정확한 순간에 event가 발행된다고 단정한다.\n- 설정을 켜지 않고도 keyspace notification이 기본으로 나온다고 본다.\n- 이벤트만 믿고 DB 상태 재확인이나 reconciliation job을 두지 않는다.\n\n## 한 줄 정리\n\nRedis expired keyspace notification은 유용한 보조 신호지만, 정확성이나 내구성이 필요한 만료 업무는 별도의 durable workflow로 닫아야 한다.\n",
+  "aliases": [
+    "Redis keyspace notifications",
+    "Redis expired event",
+    "__keyevent__:expired",
+    "TTL 만료 이벤트로 작업 실행",
+    "expired 이벤트 유실",
+    "Redis keyevent로 캐시 지우기",
+    "만료 알림이 늦게 오는 이유",
+    "TTL 만료 이벤트를 스케줄러처럼 써도 돼?",
+    "expired 이벤트에 value도 같이 와?"
+  ],
+  "expected_queries": [
+    "Redis expired keyspace notification을 TTL 만료 스케줄러처럼 써도 돼?",
+    "Redis expired event가 TTL 시각보다 늦게 올 수 있는 이유가 뭐야?",
+    "만료 이벤트를 듣는 구독자가 꺼져 있으면 나중에 다시 받을 수 있어?",
+    "Redis 만료 이벤트로 예약 작업을 처리할 때 왜 따로 큐가 필요해?",
+    "Redis notify-keyspace-events를 켜도 만료 이벤트만 믿으면 안 되는 이유가 뭐야?"
+  ],
+  "symptoms": [
+    "TTL 만료 이벤트를 놓쳐 예약 상태가 정리되지 않는다.",
+    "expired event가 예상한 시각보다 늦게 들어온다.",
+    "subscriber 재시작 동안 발생한 keyspace notification을 복구하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-ttl-key-expiration-mechanics-primer",
+      "system-design/publish-subscribe-messaging-basics-primer"
+    ],
+    "next_docs": [
+      "system-design/redis-maxmemory-eviction-policy-memory-pressure-playbook",
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "system-design/redis-client-side-caching-tracking-invalidation-primer"
+    ],
+    "confusable_with": [
+      "system-design/notification-queue-cache-invalidation-freshness-primer",
+      "system-design/cache-versioned-namespace-generation-invalidation-primer",
+      "system-design/message-queue-vs-event-stream-vs-pub-sub-intermediate-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch220"
+      }
+    ]
+  }
+}

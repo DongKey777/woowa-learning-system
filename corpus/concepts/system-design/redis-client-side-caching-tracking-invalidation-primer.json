@@ -1,0 +1,61 @@
+{
+  "id": "system-design/redis-client-side-caching-tracking-invalidation-primer",
+  "title": "Redis CLIENT TRACKING으로 로컬 캐시를 무효화하는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis CLIENT TRACKING은 Redis가 클라이언트가 읽은 key를 추적하다가 값이 바뀌거나 만료, eviction될 때 invalidation push를 보내 주는 server-assisted client-side caching 기능이다. 서버가 로컬 캐시 값을 대신 보관해 주는 것은 아니며, push는 durable 메시지가 아니므로 연결이 끊긴 동안 놓친 신호를 flush, version check, 재조회로 회복해야 한다.",
+  "body_markdown": "# Redis CLIENT TRACKING으로 로컬 캐시를 무효화하는 법\n\n> 한 줄 요약: Redis CLIENT TRACKING은 로컬 캐시를 빨리 버리라는 힌트를 보내는 기능이지, 내구성 있는 invalidation queue가 아니다.\n\n## 언제 쓰나\n\n애플리케이션 프로세스 안에 자주 읽는 Redis 값을 잠깐 들고 있고 싶을 때가 있다. 이때 무작정 TTL만 길게 잡으면 Redis 값이 바뀌었는데 로컬 캐시가 오래된 값을 계속 줄 수 있다. CLIENT TRACKING을 켜면 Redis가 클라이언트가 읽은 key를 기억했다가 그 key가 변경되거나 만료, eviction, 내부 추적 정보 정리의 영향을 받을 때 invalidation push를 보낼 수 있다.\n\n```text\nclient reads user:7 -> local cache stores value\nother writer updates user:7\nRedis sends invalidation for user:7\nclient drops local user:7 and reloads later\n```\n\n## 설계할 것\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| 어떤 key를 추적하나 | 일반 tracking, BCAST prefix, OPTIN/OPTOUT |\n| push를 어떻게 받나 | RESP3 push, redirect connection, client library 지원 |\n| 신호를 놓치면 어떻게 하나 | reconnect 때 local cache flush, version check, 짧은 TTL |\n| 서버 부담은 괜찮나 | tracking table memory, key fan-out, prefix 범위 |\n\nCLIENT TRACKING은 Redis Pub/Sub 채널을 직접 설계하는 방식과 다르다. 애플리케이션이 임의의 topic에 메시지를 publish하는 것이 아니라, Redis가 읽힌 key와 변경된 key를 기준으로 invalidation hint를 만든다. 반대로 Pub/Sub처럼 durable backlog, ack, replay를 기대하면 안 된다.\n\n이 기능은 Redis key 변경을 도와주는 것이지, Redis 뒤에 있는 DB 변경까지 자동으로 아는 기능은 아니다. Redis가 cache-aside 계층이면 DB만 바뀌고 Redis key를 건드리지 않은 변경은 CLIENT TRACKING invalidation으로 보이지 않는다. 기본 tracking은 connection이 읽은 key를 기록하므로 실제로 애플리케이션이 local cache에 저장하지 않은 key까지 invalidation될 수 있고, BCAST mode는 per-key tracking 부담을 줄이는 대신 prefix 단위로 더 넓은 신호를 보낸다.\n\n연결이 끊겼던 동안 어떤 key가 바뀌었는지는 완전히 복구하기 어렵다. 그래서 재연결 시 로컬 캐시를 통째로 비우거나, value에 version을 넣어 읽을 때 검증하거나, TTL을 짧게 둬서 오래된 값의 수명을 제한한다. 별도 redirect connection으로 invalidation을 받는 구조에서는 무효화 신호가 read 응답보다 먼저 도착할 수 있어, in-flight key를 곧바로 local cache에 저장하지 않도록 placeholder나 재확인 절차도 필요하다. Cluster나 replica 읽기처럼 Redis node가 여러 개이면 어떤 node에서 tracking을 켰고 어느 연결로 push를 받는지도 함께 맞춰야 한다.\n\n## 흔한 오해\n\n- CLIENT TRACKING을 켜면 Redis가 로컬 캐시 값을 저장해 준다고 본다.\n- invalidation push가 message queue처럼 끊긴 동안 쌓였다가 replay된다고 기대한다.\n- app-level Redis Pub/Sub invalidation과 server-assisted tracking을 같은 구조로 본다.\n- 재연결 시 기존 local cache를 그대로 믿는다.\n- prefix를 넓게 잡아 모든 변경이 모든 client로 퍼져도 괜찮다고 본다.\n\n## 한 줄 정리\n\nRedis CLIENT TRACKING은 로컬 캐시와 Redis 사이의 staleness를 줄이는 힌트 경로이며, 유실과 재연결을 전제로 한 flush 또는 version 검증이 같이 있어야 한다.\n",
+  "aliases": [
+    "Redis CLIENT TRACKING",
+    "레디스 client-side caching",
+    "RESP3로 캐시 무효화 알림 받기",
+    "Redis 서버가 도와주는 클라이언트 캐시",
+    "CLIENT TRACKING BCAST 모드",
+    "로컬 캐시에 지우라는 알림 보내기",
+    "클라이언트 캐시가 끊긴 동안 놓친 신호",
+    "Redis 서버가 캐시 key 변경을 알려주기",
+    "DB만 바뀌면 CLIENT TRACKING이 알 수 있어?"
+  ],
+  "expected_queries": [
+    "Redis CLIENT TRACKING을 쓰면 키가 바뀌었다는 알림을 어떻게 받아?",
+    "Redis client-side caching은 Pub/Sub으로 직접 무효화하는 방식과 뭐가 달라?",
+    "CLIENT TRACKING 연결이 끊긴 동안 놓친 무효화 알림은 어떻게 보완해야 해?",
+    "Redis에 다시 연결했을 때 로컬 캐시를 왜 비워야 해?",
+    "BCAST로 너무 많은 키를 추적하면 어떤 문제가 생겨?"
+  ],
+  "symptoms": [
+    "로컬 캐시가 Redis 업데이트 뒤에도 오래된 값을 돌려준다.",
+    "CLIENT TRACKING push를 durable queue처럼 믿고 재연결 처리를 빼먹는다.",
+    "Redis Pub/Sub invalidation과 CLIENT TRACKING의 책임을 섞어 설계한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser",
+      "system-design/redis-ttl-key-expiration-mechanics-primer"
+    ],
+    "next_docs": [
+      "system-design/notification-queue-cache-invalidation-freshness-primer",
+      "system-design/cache-versioned-namespace-generation-invalidation-primer",
+      "system-design/cache-acceptance-rules-for-causal-reads"
+    ],
+    "confusable_with": [
+      "system-design/publish-subscribe-messaging-basics-primer",
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "spring/cacheable-redis-caffeine-interview-router"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch220"
+      }
+    ]
+  }
+}

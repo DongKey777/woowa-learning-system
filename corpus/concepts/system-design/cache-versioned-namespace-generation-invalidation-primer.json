@@ -1,0 +1,62 @@
+{
+  "id": "system-design/cache-versioned-namespace-generation-invalidation-primer",
+  "title": "캐시 namespace version을 올려 대량 무효화하는 법",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "캐시 namespace version 또는 generation key 방식은 모든 캐시 key를 직접 삭제하지 않고 key prefix나 version을 올려 새 namespace로 읽고 쓰게 만드는 대량 무효화 패턴이다. 오래된 key는 TTL이나 cleanup이 일관되게 적용될 때 자연 정리되므로 삭제 폭풍을 줄일 수 있지만, version 조회 일관성, key 생성 규칙, stampede, 이전 namespace의 잔존 비용을 함께 설계해야 한다.",
+  "body_markdown": "# 캐시 namespace version을 올려 대량 무효화하는 법\n\n> 한 줄 요약: 대량 캐시 삭제 대신 key가 바라보는 세대를 바꾸면 새 요청은 새 namespace를 쓰고, 예전 key는 TTL로 사라진다.\n\n## 기본 흐름\n\n테넌트, 카테고리, 권한 정책처럼 묶음 단위로 캐시를 무효화해야 할 때 모든 key를 찾아 삭제하면 느리고 위험할 수 있다. 이때 현재 generation 값을 따로 두고 cache key에 포함한다.\n\n```text\ncurrent tenant:7:cache_generation = 41\ncache key = tenant:7:v41:product-list:page:1\n\ninvalidate tenant 7\n  -> generation 41 -> 42\n  -> new reads use tenant:7:v42:...\n  -> old v41 keys expire later\n```\n\n## 설계 포인트\n\n| 질문 | 봐야 할 것 |\n|---|---|\n| generation은 어디서 읽나 | Redis key, DB column, config store |\n| 변경과 읽기 순서는 안전한가 | bump 원자성, stale generation cache, race |\n| 오래된 key는 어떻게 줄이나 | TTL, memory budget, background cleanup |\n| 새 namespace 첫 요청은 괜찮나 | stampede 방지, warmup, singleflight |\n\n이 방식은 Redis TTL이나 keyspace notification과 다르다. TTL은 key마다 만료 시각을 두는 것이고, namespace generation은 key 이름을 바꿔 새 조회가 이전 key를 더 이상 찾지 않게 하는 방식이다. 그래서 대량 delete 없이도 빠르게 논리적 무효화가 가능하다.\n\n하지만 generation 값을 로컬에 오래 캐시하면 무효화가 늦게 반영된다. generation lookup 자체를 캐싱한다면 짧은 TTL, push invalidation, version check가 필요하다. L1 cache가 있는 서버도 read path에서 generation marker를 확인하지 않으면 Pub/Sub 신호를 놓친 뒤 예전 값을 계속 줄 수 있다. 또한 bump 직후 많은 요청이 동시에 새 key를 채우면 원본 DB에 부하가 몰릴 수 있으므로 lock, request coalescing, prewarm을 같이 본다.\n\nGeneration bump는 source of truth 변경이 commit된 뒤에 연결되어야 한다. commit 전에 먼저 version을 올리면 새 namespace를 채우는 요청이 예전 DB 값을 다시 읽어 새 key에 넣을 수 있다. Commit 뒤에도 lagging replica나 오래된 snapshot에서 읽으면 새 namespace에 낡은 payload를 채울 수 있으므로 source version, min-version check, primary read guard 같은 기준이 필요할 수 있다. 그리고 version을 올리는 것은 cleanup이 아니므로 old namespace key의 TTL, memory budget, cleanup ownership을 따로 둔다.\n\n## 흔한 오해\n\n- generation을 올리면 old key가 물리적으로 즉시 삭제된다고 본다.\n- key 생성 코드 일부만 version을 붙여 같은 데이터가 두 namespace에 섞인다.\n- generation 값을 로컬에 오래 들고 있어 무효화 효과가 사라진다.\n- 대량 delete를 피했으니 stampede도 없을 거라고 착각한다.\n- tenant마다 generation을 나눠야 하는데 전역 version 하나로 모든 캐시를 흔든다.\n\n## 한 줄 정리\n\nCache namespace generation은 삭제가 아니라 key 공간 전환으로 대량 무효화를 처리하는 방식이며, generation 조회와 새 namespace 채우기 부하까지 같이 설계해야 한다.\n",
+  "aliases": [
+    "cache namespace version",
+    "캐시 세대 값",
+    "버전 붙인 캐시 키로 무효화하기",
+    "캐시 버전 올리기",
+    "테넌트별 캐시 세대 관리",
+    "캐시 key 세대 올리기",
+    "캐시를 전부 지우지 않고 새 namespace 쓰기",
+    "tenant 캐시 버전 올리기",
+    "v2 key로 바꾸면 v1 캐시는 자동으로 없어져?",
+    "무효화 메시지를 놓쳐도 캐시 버전으로 보완할 수 있어?"
+  ],
+  "expected_queries": [
+    "테넌트 캐시를 전부 지우지 않고 namespace version을 올려 새 key로 갈아타는 방식은 어떻게 동작해?",
+    "캐시 세대를 올리면 예전 캐시 키는 언제 없어져?",
+    "캐시 키에 버전을 붙이면 한 번에 delete를 많이 안 해도 되는 이유가 뭐야?",
+    "캐시 버전을 올린 직후 요청이 몰려서 캐시를 한꺼번에 다시 만들지 않게 하려면 어떻게 해?",
+    "generation 값을 로컬에 캐시하면 무효화가 늦게 보일 수 있는 이유가 뭐야?",
+    "DB 커밋 전에 캐시 버전을 올리면 새 캐시 키에 예전 값이 들어갈 수 있어?"
+  ],
+  "symptoms": [
+    "캐시를 전부 삭제하려고 SCAN/DEL을 돌리다가 Redis가 느려진다.",
+    "version bump 뒤에도 일부 서버가 예전 namespace key를 계속 읽는다.",
+    "대량 무효화 직후 새 namespace를 채우는 요청이 DB로 몰린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-invalidation-patterns-primer",
+      "spring/cache-key-generation-pitfalls"
+    ],
+    "next_docs": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "system-design/cache-fill-invalidation-race-ordering-primer",
+      "system-design/cache-tag-dependency-invalidation-index-primer"
+    ],
+    "confusable_with": [
+      "system-design/redis-ttl-key-expiration-mechanics-primer",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook",
+      "system-design/redis-client-side-caching-tracking-invalidation-primer"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch220"
+      }
+    ]
+  }
+}
