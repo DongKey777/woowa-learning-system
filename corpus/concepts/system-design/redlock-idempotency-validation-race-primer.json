@@ -1,0 +1,59 @@
+{
+  "id": "system-design/redlock-idempotency-validation-race-primer",
+  "title": "RedLock만으로 중복 요청 멱등성을 막을 수 있을까",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "중복 요청 두 개가 동시에 들어오면 둘 다 '아직 처리 안 됨'을 읽고 외부 처리나 DB write로 진입할 수 있다. RedLock 같은 분산락은 같은 idempotency key 검증 구간의 동시 진입을 줄일 수 있지만, 최종 안전성은 idempotency record, unique constraint, request hash, replay response가 맡아야 한다.",
+  "body_markdown": "# RedLock만으로 중복 요청 멱등성을 막을 수 있을까\n\n> 한 줄 요약: 락은 중복 요청이 동시에 검증 구간에 들어오는 것을 줄이고, 멱등성 테이블은 최종 처리 결과를 한 번으로 수렴시킨다.\n\n## race가 생기는 순간\n\n중복 결제, 중복 쿠폰 발급, 중복 예약 요청에서 흔한 흐름은 이렇다.\n\n```text\nA: idempotency key 없음 확인\nB: idempotency key 없음 확인\nA: 외부 호출 또는 DB write\nB: 외부 호출 또는 DB write\n```\n\n두 요청이 모두 검증을 통과하면 나중에 unique constraint가 터지거나, 더 나쁘게는 외부 side effect가 두 번 나갈 수 있다.\n\n## RedLock이 맡을 수 있는 것\n\n분산락은 같은 key의 검증 구간에 동시에 들어오는 요청 수를 줄인다. 예를 들어 `lock:idempotency:{key}`를 잡고 idempotency record를 생성하거나 기존 결과를 읽는다. 하지만 락은 TTL 만료, owner 상실, 네트워크 지연이 있으므로 처리 결과의 최종 진실이 되면 안 된다.\n\n| 계층 | 역할 |\n|---|---|\n| distributed lock | 같은 key의 동시 검증 진입을 줄임 |\n| idempotency record | `PROCESSING/SUCCEEDED/FAILED` 상태와 request hash 저장 |\n| unique constraint | 같은 key의 중복 row 생성 차단 |\n| replay response | 같은 요청은 기존 결과를 반환 |\n| reconciliation | unknown/processing stuck 상태 복구 |\n\n## 안전한 흐름\n\n1. idempotency key와 request hash를 계산한다.\n2. 가능하면 짧은 lock 아래에서 idempotency row를 claim한다.\n3. 이미 같은 hash로 성공했다면 기존 response를 replay한다.\n4. 같은 key 다른 hash는 conflict로 거절한다.\n5. 외부 side effect는 provider idempotency key나 내부 처리 이력과 연결한다.\n6. lock이 실패하거나 만료되어도 unique/idempotency record가 최종 방어선이 되게 한다.\n\n## 흔한 오해\n\n- RedLock만 있으면 idempotency table이 필요 없다고 본다.\n- 락 TTL이 충분히 길면 외부 호출 중복이 완전히 사라진다고 믿는다.\n- 같은 key 다른 payload를 기존 성공으로 replay한다.\n- `PROCESSING`이 오래 남았을 때 복구 정책이 없다.\n\n## 한 줄 정리\n\nRedLock은 중복 요청의 검증 race를 줄이는 admission guard이고, 멱등성의 최종 계약은 request hash가 포함된 idempotency record와 replay 가능한 결과 저장소가 닫아야 한다.\n",
+  "aliases": [
+    "중복 요청이 둘 다 검증 통과해요",
+    "RedLock으로 멱등성 race 막기",
+    "idempotency key 검증 race",
+    "분산락만 있으면 멱등성이 돼?",
+    "같은 결제 요청이 두 번 처리돼",
+    "멱등 처리 중 상태가 오래 남아 있으면 어떻게 해?",
+    "request hash가 다른 중복 key",
+    "RedLock을 어디까지 믿고 멱등 처리를 해야 해?"
+  ],
+  "expected_queries": [
+    "동시에 들어온 중복 요청이 둘 다 검증을 통과해 두 번 처리되는 문제를 어떻게 막아?",
+    "RedLock을 써도 idempotency record와 unique constraint가 필요한 이유가 뭐야?",
+    "같은 idempotency key에 다른 request hash가 들어오면 왜 conflict로 막아야 해?",
+    "락 TTL이 만료돼도 중복 결제나 쿠폰 발급이 안 나게 하려면 어디서 최종 방어해야 해?",
+    "PROCESSING 상태가 오래 남은 idempotency key는 어떻게 복구해야 해?"
+  ],
+  "symptoms": [
+    "같은 idempotency key 요청 두 개가 동시에 들어와 둘 다 외부 호출을 시작한다.",
+    "분산락을 잡았지만 TTL 만료 뒤 stale owner가 결과를 쓴다.",
+    "request hash 검증 없이 같은 key면 무조건 이전 응답을 돌려준다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/idempotency-key-and-deduplication",
+      "system-design/redis-setnx-distributed-lock-beginner-primer"
+    ],
+    "next_docs": [
+      "system-design/idempotency-key-store-dedup-window-replay-safe-retry-design",
+      "system-design/distributed-lock-lease-fencing-perspective-map",
+      "database/unique-vs-idempotency-key-vs-pending-row-recovery-decision-guide"
+    ],
+    "confusable_with": [
+      "system-design/distributed-lock-design",
+      "database/shopping-cart-payment-idempotency-stock-bridge",
+      "system-design/payment-system-ledger-idempotency-reconciliation-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch218"
+      }
+    ]
+  }
+}

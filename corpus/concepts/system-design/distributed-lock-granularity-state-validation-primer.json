@@ -1,0 +1,59 @@
+{
+  "id": "system-design/distributed-lock-granularity-state-validation-primer",
+  "title": "분산락 범위와 상태 검증은 어디까지 잡아야 할까",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "분산락 범위가 너무 넓으면 병렬성이 죽고, 너무 좁으면 같은 상태 전이를 다른 key로 동시에 통과시킨다. 안전한 패턴은 lock 안에서 현재 상태와 operation key를 짧게 검증/claim하고, 오래 걸리는 외부 작업은 lock 밖에서 수행하되 최종 write는 version, fencing, idempotency로 다시 검증하는 것이다.",
+  "body_markdown": "# 분산락 범위와 상태 검증은 어디까지 잡아야 할까\n\n> 한 줄 요약: 락 안에서는 상태를 짧게 잡아두고, 긴 작업은 밖으로 빼되 마지막 write에서 version/fencing을 다시 확인한다.\n\n## granularity가 왜 어려운가\n\n락 key를 `all-inventory`처럼 넓게 잡으면 모든 작업이 한 줄로 서서 throughput이 무너진다. 반대로 `sku:{id}`만 잠갔는데 실제 상태 전이는 `(warehouse, sku, order, allocation)`을 함께 봐야 한다면 다른 key로 들어온 취소/할당 요청이 동시에 통과할 수 있다.\n\n## 안전한 경계\n\n| 단계 | lock 안 | lock 밖 |\n|---|---|---|\n| 짧은 검증 | 현재 상태, version, operation 중복 확인 | 외부 API, 긴 계산, 대량 조회 |\n| 상태 잡기 | `PROCESSING` row, transition token 저장 | 비싼 작업 실행 |\n| 최종 반영 | version/fencing/idempotency 재검증 | 실패 시 보상/재시도 |\n\n이 구조는 \"락 밖에서 아무거나 해도 된다\"가 아니다. lock 밖 작업이 끝난 뒤에는 처음 잡아 둔 상태가 아직 유효한지 다시 확인해야 한다. 그 검증 없이 결과를 쓰면 lock 밖 병렬 처리가 stale write가 된다.\n\n## key를 고르는 질문\n\n- 같은 상태 전이를 두 요청이 동시에 통과하면 안 되는 최소 business key는 무엇인가\n- 취소, 재시도, 운영자 변경이 같은 key를 쓰는가\n- lock 안에서 외부 I/O를 기다리고 있지는 않은가\n- lock TTL이 끝난 뒤 stale owner를 막을 version/fencing이 있는가\n- lock 획득 실패를 재시도, 대기, 빠른 실패 중 무엇으로 처리할 것인가\n\n## 흔한 오해\n\n- lock 범위를 넓히면 안전해지기만 한다고 본다.\n- lock을 좁게 잡고도 상태 key 정합성을 검증하지 않는다.\n- 외부 API 호출을 lock 안에 넣어 TTL과 tail latency를 키운다.\n- lock 밖에서 끝난 결과를 version 확인 없이 저장한다.\n\n## 한 줄 정리\n\n분산락 granularity는 병렬성과 정합성의 절충이고, 좋은 경계는 lock 안에서 상태를 짧게 잡아두고 긴 작업은 밖에서 수행한 뒤 최종 version/fencing/idempotency로 다시 닫는 것이다.\n",
+  "aliases": [
+    "분산락 범위를 어디까지 잡아야 해?",
+    "락 안에서는 상태만 검증하고 싶어",
+    "락 밖에서 병렬 처리해도 돼?",
+    "distributed lock granularity",
+    "락 key를 너무 넓게 잡음",
+    "락 key가 너무 좁아서 race",
+    "상태만 먼저 잡아두고 외부 작업은 나중에 해도 돼?",
+    "락을 놓친 요청이 나중에 저장하는 걸 어떻게 막아?"
+  ],
+  "expected_queries": [
+    "분산락 범위를 너무 넓게 잡으면 병렬성이 죽고 너무 좁으면 정합성이 깨지는 기준을 어떻게 잡아?",
+    "락 안에서는 상태만 검증하고 실제 작업은 락 밖에서 병렬로 돌리는 패턴은 어떻게 안전하게 만들어?",
+    "락 안에서 외부 API를 오래 호출하면 왜 위험해?",
+    "락 밖에서 작업한 결과를 최종 저장할 때 version이나 fencing을 다시 확인해야 하는 이유가 뭐야?",
+    "취소, 재시도, 운영자 변경이 서로 다른 기준으로 상태를 바꾸면 어떤 race가 생겨?"
+  ],
+  "symptoms": [
+    "하나의 global lock 때문에 모든 재고 작업이 직렬화된다.",
+    "서로 다른 lock key를 잡은 할당과 취소가 같은 상태를 동시에 바꾼다.",
+    "외부 API 대기 중 lock TTL이 끝나 stale owner가 늦게 write한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/distributed-lock-design",
+      "system-design/distributed-lock-lease-fencing-perspective-map"
+    ],
+    "next_docs": [
+      "database/allocation-cancel-zombie-state-idempotent-transition-primer",
+      "database/reservation-reschedule-cancellation-transition-patterns",
+      "system-design/redlock-idempotency-validation-race-primer"
+    ],
+    "confusable_with": [
+      "system-design/redis-setnx-distributed-lock-beginner-primer",
+      "database/for-update-vs-advisory-lock-vs-lease-fencing-decision-guide",
+      "system-design/distributed-lock-interview-drill"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch218"
+      }
+    ]
+  }
+}

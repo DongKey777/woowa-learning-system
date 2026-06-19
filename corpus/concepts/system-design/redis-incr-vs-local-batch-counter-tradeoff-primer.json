@@ -1,0 +1,59 @@
+{
+  "id": "system-design/redis-incr-vs-local-batch-counter-tradeoff-primer",
+  "title": "Redis INCR와 서버별 로컬 카운트 중 무엇을 써야 할까",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "선착순 수량 제한에서 Redis INCR은 반환값을 보고 바로 성공/실패를 가를 때 중앙의 수량 문턱이 되지만 Redis hot key와 RTT 비용이 생긴다. 서버별로 잠깐 세고 나중에 한 번에 반영하는 방식은 빠르지만, 미리 받은 몫, 서버 장애, 남은 몫 회수, 초과 발급 허용 기준, 사후 보정을 정해야 한다.",
+  "body_markdown": "# Redis INCR와 서버별 로컬 카운트 중 무엇을 써야 할까\n\n> 한 줄 요약: Redis INCR은 반환값으로 즉시 accept/reject할 때 중앙 gate 역할을 하고, 서버별 임시 카운트는 미리 받은 몫이나 초과 허용량과 보정 책임을 받아들이는 선택이다.\n\n## 두 방식의 차이\n\n선착순 쿠폰 1,000장을 제한할 때 가장 단순한 방식은 Redis `INCR`로 중앙 counter를 증가시키고 반환값이 limit 이하인 요청만 성공으로 확정하는 것이다. 초과 반환값은 실패 처리하거나 보정해야 하며, `INCR` 자체가 주문/쿠폰 DB write까지 원자적으로 묶어 주지는 않는다.\n\n반대로 각 애플리케이션 서버가 임시로 성공 수를 세다가 나중에 한 번에 반영하면 Redis 왕복과 hot key pressure는 줄지만, 서버별 buffer가 동시에 성공을 허용해 limit을 넘길 수 있다. 더 안전한 변형은 중앙에서 작은 quota lease를 먼저 받고 로컬에서는 그 quota 안에서만 성공시키는 방식이다. 이때도 만료, 잔여 반납, crash 복구, reconciliation이 필요하다.\n\n| 방식 | 장점 | 비용 |\n|---|---|---|\n| Redis INCR/Lua claim | 중앙 원자 counter, 반환값 기반 초과 제어 | hot key, Redis RTT, downstream write는 별도 guard 필요 |\n| 서버별 임시 카운트 후 반영 | 빠른 admission, Redis 부하 감소 | crash 손실, bounded overshoot, reconciliation 필요 |\n| quota lease | hot key 압력 완화, 초과 제어 가능 | stranded quota, lease 만료/회수, fairness skew |\n\n## 무엇을 먼저 정하나\n\n- 초과 성공을 0으로 막아야 하는가, 소량 초과를 보정할 수 있는가\n- 성공 응답을 낸 뒤 취소/보상할 수 있는가\n- Redis hot key가 병목인지 측정됐는가\n- batch 모델이 중앙 quota lease인지, 단순 사후 반영인지\n- 반영 실패나 서버 crash 때 성공 응답과 남은 quota를 어떻게 복구할 것인가\n- 사용자에게 pending을 줄지 즉시 success를 줄지\n\n정확히 1,000명만 성공해야 한다면 중앙 gate 없이 서버별 임시 카운트만 쓰는 설계는 위험하다. Redis hot key가 병목이라면 먼저 queue, sharding, striped guard, Lua claim, 작은 quota lease 같은 대안을 검토하고, 초과 허용 모델은 제품/운영 정책으로 명시해야 한다.\n\n## 흔한 오해\n\n- 서버별 임시 카운트를 쓰면 Redis 병목이 사라지고 정확도도 유지된다고 본다.\n- Redis INCR만 쓰면 downstream 주문/쿠폰 발급 중복도 자동으로 막힌다고 본다.\n- 한 번에 반영하는 작업이 실패하거나 서버가 죽었을 때 이미 성공 응답한 사용자를 추적하지 않는다.\n- quota lease의 미사용분, 만료, 회수 정책을 두지 않는다.\n- 초과 허용량을 제품/운영 기준으로 정하지 않는다.\n\n## 한 줄 정리\n\nRedis INCR과 서버별 임시 카운트의 선택은 성능 튜닝이 아니라 반환값 기반의 정확한 admission, quota lease, bounded overshoot 중 무엇을 제품이 허용하는지 정하는 수량 제한 설계다.\n",
+  "aliases": [
+    "Redis INCR로 선착순 카운트",
+    "서버별 임시 카운트를 나중에 한 번에 반영",
+    "선착순 수량 제한 Redis INCR",
+    "쿠폰 카운터 hot key",
+    "서버별 임시 카운트로 약간 초과 허용",
+    "조금 초과 발급되는 걸 허용해도 돼?",
+    "Redis 왕복 줄이려다 초과 발급",
+    "INCR와 batch counter 차이"
+  ],
+  "expected_queries": [
+    "선착순 쿠폰 재고 카운트를 Redis INCR로 정확히 할지 로컬 집계 후 배치로 할지 어떻게 골라?",
+    "서버마다 임시로 세고 나중에 한 번에 반영하면 왜 약간 초과 성공이 날 수 있어?",
+    "Redis INCR은 원자적인데도 hot key와 RTT 비용이 문제가 되는 이유가 뭐야?",
+    "서버가 성공 응답을 줬는데 한 번에 반영하기 전에 죽으면 어떻게 보정해야 해?",
+    "약간 초과 발급될 수 있다면 미리 어떤 기준을 정해야 해?"
+  ],
+  "symptoms": [
+    "Redis INCR key 하나가 hot key가 되어 이벤트 처리 p99가 튄다.",
+    "서버별 임시 카운트로 성공 응답을 줬지만 반영 실패 뒤 실제 발급 수가 맞지 않는다.",
+    "정확히 제한해야 하는 이벤트에서 batch counter로 초과 성공이 발생한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/redis-single-thread-atomic-commands-incr-primer",
+      "database/single-counter-vs-ledger-vs-slot-inventory-oversell-decision"
+    ],
+    "next_docs": [
+      "system-design/redis-hot-key-big-key-operations-primer",
+      "system-design/flash-sale-burst-traffic-isolation-primer",
+      "database/limited-stock-replica-counter-primary-read-primer"
+    ],
+    "confusable_with": [
+      "database/single-counter-oversell-first-fix",
+      "system-design/redis-setnx-distributed-lock-beginner-primer",
+      "system-design/hot-key-skew-mitigation-interview-playbook"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch218"
+      }
+    ]
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "database/allocation-cancel-zombie-state-idempotent-transition-primer",
+  "title": "할당과 취소가 동시에 들어올 때 재고 상태를 맞추는 법",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "할당과 취소가 동시에 들어오면 재고는 잡혔는데 주문 상태는 취소, 또는 취소됐는데 재고 점유 기록이 active로 남을 수 있다. 할당, 취소, 만료는 같은 주문/할당 상태와 version guard를 통과하게 만들고, 같은 명령의 재시도만 같은 idempotency key를 재사용해야 주문 상태와 재고 기록이 함께 움직인다.",
+  "body_markdown": "# 할당과 취소가 동시에 들어올 때 재고 상태를 맞추는 법\n\n> 한 줄 요약: 할당과 취소를 별도 update로 보면 재고 기록과 주문 상태가 갈라진다. 같은 상태 전이 경계에서 한 번만 적용되게 해야 한다.\n\n## 남은 재고 점유란\n\n동시에 들어온 두 요청이 다른 surface를 먼저 바꾸면 이상한 중간 상태가 영구화될 수 있다.\n\n```text\nA: 재고 점유 row 생성\nB: 주문 상태 CANCELED로 변경\nA: 주문 상태 ALLOCATED로 변경 실패 또는 늦은 반영\n결과: 취소 주문에 active 재고 점유가 남음\n```\n\n반대 방향도 가능하다. 주문은 할당됐다고 보이는데 재고 점유 row가 없거나, 취소됐는데 재고 점유가 풀리지 않는다. 이런 상태는 단순 UI 버그가 아니라 state transition과 inventory truth가 다른 경로로 움직인 결과다.\n\n## 안전한 transition 원칙\n\n| 원칙 | 설명 |\n|---|---|\n| 같은 aggregate guard | 할당, 취소, 만료는 같은 order/allocation aggregate와 transition log/version guard를 통과한다 |\n| 고유 operation id | 각 명령은 고유 operation id를 가지고, 같은 명령의 retry만 같은 idempotency key를 재사용한다 |\n| current state guard | `ALLOCATING -> CANCELED` 같은 허용 전이를 명시한다 |\n| inventory delta once | 재고 잡기/풀기 변화량을 한 번만 적용한다 |\n| 복구 evidence | 나중에 맞춰 볼 수 있도록 주문 상태와 재고 점유 상태를 남긴다 |\n\n상태 전이는 label만 바꾸는 작업이 아니다. 주문 상태, 재고 점유 row, counter/ledger, history가 같은 transaction 또는 같은 idempotent transition 결과에 묶여야 한다.\n\n## 흔한 오해\n\n- cancel은 상태만 바꾸면 되고 재고 release는 나중에 해도 된다고 본다.\n- allocation worker와 cancel API가 서로 다른 aggregate/state guard를 써서 같은 주문 상태를 독립적으로 바꾼다.\n- 같은 요청 재시도가 재고 변화량을 다시 적용한다.\n- 남은 재고 점유를 나중에 맞추는 배치로만 고치고 앞단 전이 guard를 두지 않는다.\n\n## 한 줄 정리\n\n할당-취소 동시 처리 문제는 lock 하나보다 상태머신, version guard, command별 idempotency, 재고 변화량 one-shot 적용을 함께 설계해야 남은 재고 점유를 막을 수 있다.\n",
+  "aliases": [
+    "할당과 취소가 동시에 들어오면 어떻게 해?",
+    "재고는 잡혔는데 주문은 취소됨",
+    "취소됐는데 재고 점유가 남아 있어",
+    "취소됐는데 재고 hold가 남아",
+    "멱등 상태전이로 zombie 막기",
+    "할당/취소가 동시에 들어오는 문제",
+    "재고 release가 두 번 돼요",
+    "주문 상태와 allocation row가 안 맞아"
+  ],
+  "expected_queries": [
+    "할당과 취소가 동시에 들어오면 재고는 할당됐는데 주문 상태는 취소로 남는 race를 어떻게 막아?",
+    "취소된 주문에 활성 재고 점유 기록이 남는 상태는 어떤 전이 설계가 부족해서 생겨?",
+    "할당, 취소, 만료 처리가 같은 기준으로 상태를 바꿔야 하는 이유가 뭐야?",
+    "재고 풀기나 재고 변화량이 두 번 적용되지 않게 하려면 어떤 idempotency 기록이 필요해?",
+    "남은 재고 점유를 나중에 맞추는 배치로만 고치면 왜 부족해?"
+  ],
+  "symptoms": [
+    "취소 주문인데 재고 hold가 active로 남아 있다.",
+    "allocation worker와 cancel API가 서로 다른 상태 key로 같은 주문을 바꾼다.",
+    "retry나 만료 배치가 같은 재고 delta를 두 번 적용한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/inventory-reservation-vs-deduction-chooser",
+      "database/reservation-reschedule-cancellation-transition-patterns"
+    ],
+    "next_docs": [
+      "system-design/distributed-lock-granularity-state-validation-primer",
+      "system-design/idempotency-reconciliation-playbook",
+      "database/shopping-cart-payment-idempotency-stock-bridge"
+    ],
+    "confusable_with": [
+      "database/reservation-reschedule-cancellation-transition-patterns",
+      "database/last-stock-sold-twice-symptom-router",
+      "system-design/inventory-reservation-system-design"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "improvement-cycle2-v4-batch218"
+      }
+    ]
+  }
+}
