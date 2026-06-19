@@ -1,0 +1,71 @@
+{
+  "id": "system-design/request-fanout-traffic-amplification-primer",
+  "title": "Request Fanout Traffic Amplification Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "하나의 주문, 결제, 조회 요청이 정상 처리 과정에서 여러 downstream API를 호출하면서 외부 트래픽을 구조적으로 증폭하는 request fanout traffic amplification을 설명한다. 재시도 때문에 같은 호출을 반복하는 retry amplification과 달리, 이 문서의 초점은 첫 시도 자체가 가진 fanout 폭과 capacity 계산이다.",
+  "body_markdown": "# Request Fanout Traffic Amplification Primer\n\n## 한 줄 요약\n\nRequest fanout traffic amplification은 요청 하나가 정상 처리 경로에서 여러 downstream API를 호출해 내부와 외부 QPS를 곱셈으로 키우는 현상이다. 예를 들어 주문 API 150 TPS가 요청마다 18개 downstream API를 호출하면, retry가 없어도 외부 호출은 최대 `150 * 18 = 2700 TPS`가 된다.\n\n## 이 문서가 맡는 질문\n\n이 문서는 \"사용자 요청은 150 TPS인데 왜 외부 API는 2700 TPS를 맞나요?\" 같은 질문을 다룬다. 핵심은 장애 중 반복 시도가 아니라, 정상 business flow 안에 숨어 있는 구조적 fanout 폭이다.\n\n```text\n1 payment/order request\n  -> member API\n  -> coupon API\n  -> point API\n  -> inventory API\n  -> pricing API\n  -> fraud API\n  -> ledger API\n  -> notification API\n  -> ... 16~20 downstream calls\n\n150 incoming TPS * 18 calls/request = 2700 outbound TPS\n```\n\n이 숫자는 평균 호출 수만으로 끝나지 않는다. 요청 경로별 fanout 폭, 병렬/직렬 배치, optional call 비율, timeout, downstream quota, connection pool, bulkhead를 같이 봐야 한다.\n\n## 핵심 불변식\n\n- 구조적 fanout은 retry가 0회여도 발생한다.\n- 외부 QPS는 `ingress TPS * downstream calls per request`로 먼저 계산한다.\n- fanout 폭이 넓을수록 가장 느린 branch, quota 초과, connection pool 포화 가능성이 커진다.\n- capacity planning은 endpoint TPS가 아니라 dependency별 outbound TPS와 concurrency를 기준으로 해야 한다.\n- fanout reduction은 cache, batching, precomputed read model, async split, optional call shedding으로 접근한다.\n\n## 먼저 계산할 값\n\n| 값 | 질문 | 예시 |\n|---|---|---|\n| ingress TPS | 앞단 API로 초당 몇 요청이 들어오는가 | 주문 생성 150 TPS |\n| fanout width | 요청 하나가 몇 downstream API를 호출하는가 | 평균 18개, p95 22개 |\n| dependency split | 어떤 API가 모든 요청에서 호출되는가 | 결제/재고 100%, 쿠폰 40% |\n| concurrency | 호출이 얼마나 오래 살아 있는가 | 2700 TPS * 평균 120ms = 약 324 in-flight |\n| quota/headroom | downstream 한도와 burst 여유가 충분한가 | provider quota 2000 TPS면 부족 |\n\n## 경계 구분\n\n### retry amplification과 다르다\n\nRetry amplification은 실패나 timeout 뒤 같은 logical work가 여러 attempt로 반복되는 문제다. Request fanout amplification은 첫 번째 정상 attempt 안에서 이미 여러 API가 호출되는 문제다.\n\n```text\nstructural fanout: 1 request -> 18 distinct downstream calls\nretry amplification: 1 downstream call -> timeout -> same call retried 3 times\n```\n\n두 현상은 함께 나타날 수 있다. 구조적 fanout 18개 위에 retry 2회가 붙으면 최악의 outbound 시도 수는 더 커진다. 하지만 원인과 1차 완화책은 다르다. 구조적 fanout은 호출 그래프와 product flow를 줄여야 하고, retry amplification은 retry owner, budget, backoff를 다뤄야 한다.\n\n### read-path waterfall과 다르다\n\nRead-path waterfall은 한 요청의 stage별 latency를 trace에서 분해하는 관점이다. Fanout amplification은 같은 요청이 몇 개의 outbound 호출을 만들어 dependency traffic을 키우는지 보는 관점이다. Waterfall은 \"어디서 시간이 쓰였나\"이고, fanout amplification은 \"몇 개의 downstream work를 만들었나\"이다.\n\n### request deadline과 다르다\n\nDeadline과 timeout budget은 남은 시간 안에서 어느 호출을 시작해도 되는지 정한다. Fanout amplification은 그 전에 호출 수와 dependency별 부하가 감당 가능한지 묻는다. Deadline만 잘 전파해도 150 TPS가 2700 outbound TPS로 바뀌는 구조 자체는 사라지지 않는다.\n\n### overload control과 다르다\n\nOverload control은 이미 처리 한계에 가까울 때 admission, queue limit, shedding으로 시스템 안에 들어오는 일을 제한한다. Fanout amplification은 overload가 터지기 전 설계 단계에서 \"이 endpoint 하나가 downstream에 얼마의 traffic을 만든다\"를 계산하게 한다. Overload control은 방어선이고, fanout 계산은 용량과 호출 그래프의 원인 분석이다.\n\n## 설계 완화책\n\n| 완화책 | 효과 | 주의점 |\n|---|---|---|\n| 호출 그래프 축소 | request당 downstream call 수를 직접 줄임 | 도메인 책임을 무리하게 합치지 않는다 |\n| cache/read model | 반복 조회 fanout을 local read로 치환 | freshness와 invalidation 계약 필요 |\n| batching/coalescing | 같은 요청 안의 여러 lookup을 묶음 | tail latency와 partial failure 처리 필요 |\n| async split | 필수 응답 경로에서 후처리를 분리 | 사용자에게 즉시 필요한 결과인지 구분 필요 |\n| optional call shedding | 추천, 알림, 분석 같은 저가치 호출을 부하 때 생략 | core contract와 degraded marker 필요 |\n| bulkhead/concurrency limit | 특정 dependency 포화를 다른 dependency로 전파하지 않음 | 너무 낮으면 정상 traffic도 실패 가능 |\n\n## 관찰 지표\n\n- inbound TPS per endpoint\n- outbound calls per request 평균/p95/p99\n- dependency별 outbound TPS와 error rate\n- dependency별 in-flight outbound requests\n- connection pool active/pending acquire\n- fanout width별 end-to-end latency\n- optional call skip/shed rate\n- downstream quota 사용률과 429/503 비율\n\n## 실전 답변 구조\n\n1. 먼저 endpoint의 ingress TPS를 말한다.\n2. 요청당 downstream call 수 평균과 p95를 계산한다.\n3. dependency별 필수/선택 호출을 나눈다.\n4. `TPS * fanout width`로 outbound TPS와 in-flight를 산출한다.\n5. retry 증폭과 구조적 fanout을 분리해서 말한다.\n6. cache, batching, async split, optional shedding, bulkhead 중 어떤 축으로 줄일지 제안한다.\n\n## 한 줄 정리\n\nRequest fanout traffic amplification은 retry가 없어도 endpoint TPS가 downstream 호출 수만큼 곱해지는 구조적 부하이며, 용량 산정은 앞단 TPS가 아니라 dependency별 outbound TPS와 fanout 폭에서 시작해야 한다.\n",
+  "aliases": [
+    "요청 fanout 증폭",
+    "API 팬아웃 부하",
+    "다운스트림 호출 폭증",
+    "요청당 외부 호출 수",
+    "구조적 트래픽 증폭",
+    "fanout traffic amplification",
+    "per-request API fanout",
+    "downstream call amplification",
+    "outbound QPS multiplier",
+    "structural fanout load"
+  ],
+  "expected_queries": [
+    "주문 API는 150 TPS인데 downstream API 호출이 왜 2700 TPS까지 늘어날 수 있어?",
+    "요청 하나가 16개 API를 부르면 capacity planning을 어떻게 계산해야 해?",
+    "retry가 없는데도 외부 API QPS가 앞단 트래픽보다 훨씬 큰 이유가 뭐야?",
+    "결제 요청의 구조적 fanout과 retry amplification을 어떻게 구분해?",
+    "요청당 downstream 호출 수가 많을 때 cache, batching, async 분리를 어떤 기준으로 골라?"
+  ],
+  "symptoms": [
+    "앞단 TPS는 낮은데 외부 API quota가 먼저 터진다",
+    "주문 요청 하나가 여러 서비스 호출을 만들어 dependency pool이 포화된다",
+    "retry를 줄였는데도 outbound QPS가 충분히 낮아지지 않는다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/qps-tps-throughput-metrics-beginner-bridge",
+      "system-design/fan-out-fan-in-parallel-merge-basics",
+      "system-design/request-deadline-timeout-budget-primer"
+    ],
+    "next_docs": [
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/backpressure-and-load-shedding-design",
+      "system-design/sync-api-vs-async-job-decision-chooser",
+      "system-design/scatter-gather-distributed-search-chooser"
+    ],
+    "confusable_with": [
+      "system-design/retry-amplification-and-backpressure-primer",
+      "system-design/read-path-waterfall-tail-latency-debugging-map",
+      "system-design/request-deadline-timeout-budget-primer",
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/search-shard-replica-fanout-tail-latency-playbook"
+    ],
+    "forbidden_for_queries": [
+      "system-design/retry-amplification-and-backpressure-primer",
+      "system-design/read-path-waterfall-tail-latency-debugging-map",
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/fan-out-fan-in-parallel-merge-basics"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "corpus-improvement-cycle2-v4",
+        "note": "Initial primer for structural per-request API fanout traffic amplification and its boundaries with retry, waterfall, deadline, and overload concepts."
+      }
+    ]
+  }
+}

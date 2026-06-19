@@ -1,0 +1,66 @@
+{
+  "id": "system-design/external-partner-tps-rate-limiter-primer",
+  "title": "External Partner TPS Rate Limiter Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "External partner TPS rate limiting은 사용자별 남용 방지가 아니라 외부 증권사, 결제사, 브로커, 사내 공용 API가 약속한 전송 TPS를 넘지 않도록 outbound 호출 속도를 제어하는 설계다. 이 문서는 RateLimiter, bounded queue, shed/defer, Retry-After/backoff, timeout/retry/circuit breaker와의 경계를 다룬다.",
+  "body_markdown": "# External Partner TPS Rate Limiter Primer\n\n> 한 줄 요약: 외부 partner TPS limiter는 “사용자가 너무 많이 호출한다”를 막는 장치가 아니라, 우리 서비스가 외부 증권사/결제사/브로커에 보내는 outbound 호출 속도를 계약된 한도 안에 묶는 장치다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Rate Limiting 기초](./rate-limiting-basics.md)\n- [Rate Limiting 알고리즘 비교](./rate-limiting-token-bucket-vs-sliding-window-vs-fixed-window-intermediate-primer.md)\n- [Rate Limit vs Queue Load Shedding Chooser](./rate-limit-vs-queue-load-shedding-chooser.md)\n- [Retry Timeout Circuit Breaker Beginner Chooser](./retry-timeout-circuit-breaker-beginner-chooser.md)\n- [Resilience4j Retry Circuit Breaker Bulkhead](../spring/resilience4j-retry-circuit-breaker-bulkhead.md)\n\nretrieval-anchor-keywords: external partner TPS limiter, outbound rate limiter, partner quota protection, broker TPS control, Resilience4j outbound RateLimiter, external API TPS budget, 증권사 전송 TPS 제한, 외부 API 호출 속도 제어, partner 429 Retry-After backoff\n\n---\n\n## 사용자 rate limit과 다른 점\n\n일반 rate limit은 보통 사용자, IP, tenant가 너무 많은 요청을 보내는 것을 막는다. External partner limiter는 방향이 반대다. 우리 내부 트래픽이 많아질 때 외부 dependency가 감당할 수 있는 속도보다 빠르게 호출하지 않도록 outbound 쪽을 제한한다.\n\n예를 들어 미국 장 개장 직후 주문이 20배 늘면, 내부 queue에는 주문이 쌓일 수 있다. 하지만 외부 증권사가 초당 500건만 받을 수 있다면 우리 worker를 100개 늘려도 partner에는 500 TPS 이하로 보내야 한다.\n\n## 먼저 정할 것\n\n| 질문 | 예시 |\n|---|---|\n| limit key | partner, account, product, region 중 무엇으로 나눌까 |\n| budget | 초당/분당 몇 건, burst는 얼마까지 허용할까 |\n| queue policy | 기다릴 수 있는 요청과 빨리 실패시킬 요청은 무엇인가 |\n| retry policy | 429/503/timeout을 어떻게 다르게 재시도할까 |\n| user response | 지연, 접수 후 비동기 처리, 실패 응답 중 무엇을 줄까 |\n\nLimiter만 넣으면 끝나는 것이 아니다. limiter 앞 queue가 무한이면 memory와 latency가 터진다. limiter 뒤 retry가 blind하면 제한을 우회해 partner를 다시 때린다.\n\n## 429, 5xx, timeout을 나누기\n\nPartner가 429나 quota exceeded를 주면 대개 “속도를 낮춰라”는 신호다. 이때 `Retry-After`나 partner 문서의 backoff를 따른다. 5xx는 partner 장애일 수 있어 circuit breaker와 fallback을 같이 본다. Timeout은 응답을 모르는 상태라 idempotency key와 unknown outcome recovery가 필요할 수 있다.\n\n```text\n429 / quota    -> rate budget 조정, Retry-After 존중\n5xx burst      -> circuit breaker, fallback, brownout\ntimeout        -> idempotent retry, unknown outcome 확인\nlocal queue full -> shed/defer, user-facing contract\n```\n\n## 동기 API와 비동기 worker 경계\n\n사용자 요청 안에서 partner 호출을 끝내야 하면 limiter wait budget이 짧아야 한다. 기다리다 deadline을 다 쓰면 사용자 p99만 망가진다. 반대로 주문 접수 후 비동기 전송이 가능한 경로라면 queue와 worker를 두고 partner TPS에 맞춰 천천히 drain할 수 있다.\n\n이 차이를 숨기면 “rate limit 걸었더니 timeout만 늘었다”가 된다. 동기 API에서는 제한을 넘는 요청을 빨리 거절하거나 접수형 async job으로 바꾸는 판단이 필요하다.\n\n## Circuit breaker와의 경계\n\nRate limiter는 정상 partner를 너무 빠르게 호출하지 않게 한다. Circuit breaker는 실패율이 높아졌을 때 호출 자체를 잠시 막는다. 둘은 대체재가 아니다.\n\n- partner가 건강하지만 quota가 낮다: rate limiter 중심\n- partner가 실패를 많이 낸다: circuit breaker 중심\n- 내부 queue가 넘친다: load shedding/admission 중심\n- 같은 요청을 다시 보내도 안전해야 한다: idempotency/retry 중심\n\n## 한 줄 정리\n\nExternal partner TPS limiter는 outbound dependency 계약을 지키는 장치다. limit key, queue budget, shed/defer 정책, partner 429/5xx/timeout 해석, retry/circuit breaker 경계를 함께 정해야 실제로 외부 호출 폭주를 막을 수 있다.\n",
+  "aliases": [
+    "외부 API TPS 제한",
+    "partner TPS rate limit",
+    "outbound rate limiter",
+    "증권사 전송 TPS 제어",
+    "외부 브로커 호출 속도 제한",
+    "Resilience4j outbound RateLimiter",
+    "partner quota 보호",
+    "외부 dependency 호출량 제한",
+    "Retry-After backoff"
+  ],
+  "expected_queries": [
+    "외부 증권사 API가 초당 500건만 받으면 우리 worker 호출 속도는 어떻게 제한해?",
+    "사용자 rate limit이 아니라 외부 partner TPS를 보호하는 rate limiter는 뭐가 달라?",
+    "partner가 429 Retry-After를 주면 queue와 retry를 어떻게 설계해야 해?",
+    "시장 개장 때 주문이 20배 늘면 외부 브로커 전송 TPS를 어떻게 제어해?",
+    "RateLimiter와 circuit breaker는 외부 API 보호에서 역할이 어떻게 달라?"
+  ],
+  "symptoms": [
+    "내부 worker를 늘린 뒤 외부 partner quota 초과와 429가 증가한다",
+    "rate limiter 앞 queue를 무한히 쌓아 사용자 timeout과 memory pressure가 커진다",
+    "partner 429, 5xx, timeout을 모두 같은 retry로 처리해 호출 폭주를 만든다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/rate-limiting-basics",
+      "system-design/rate-limiting-token-bucket-vs-sliding-window-vs-fixed-window-intermediate-primer",
+      "spring/resilience4j-retry-circuit-breaker-bulkhead"
+    ],
+    "next_docs": [
+      "system-design/rate-limit-vs-queue-load-shedding-chooser",
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser",
+      "network/timeout-retry-backoff-practical",
+      "system-design/remote-call-tristate-unknown-idempotent-recovery"
+    ],
+    "confusable_with": [
+      "system-design/distributed-rate-limiter-exact-approximate-chooser",
+      "system-design/backpressure-vs-load-shedding-vs-rate-limit-interview-chooser",
+      "spring/delivery-reliability-retryable-resilience4j-outbox-relay"
+    ],
+    "forbidden_for_queries": [
+      "system-design/rate-limiter-token-bucket-window-perspective-map",
+      "system-design/distributed-rate-limiter-exact-approximate-chooser",
+      "system-design/retry-timeout-circuit-breaker-beginner-chooser"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "y14-expansion-batch211"
+      }
+    ]
+  }
+}

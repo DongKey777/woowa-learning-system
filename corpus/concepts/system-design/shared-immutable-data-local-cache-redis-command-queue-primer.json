@@ -1,0 +1,73 @@
+{
+  "id": "system-design/shared-immutable-data-local-cache-redis-command-queue-primer",
+  "title": "Shared Immutable Data Local Cache Redis Command Queue Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Redis hit rate는 높지만 전역 설정, 코드 테이블, 카테고리, 정책 snapshot처럼 거의 바뀌지 않는 공통 데이터를 모든 요청이 Redis에서 다시 읽어 command queue, connection pool, network hop을 키우는 상황을 다룬다. 핵심은 generic local-vs-distributed cache 선택이 아니라, stale 허용 범위가 명시된 read-mostly common data만 per-instance immutable snapshot으로 올리고 version, TTL, warming, invalidation risk를 관리해 Redis 원격 캐시 부하를 줄이는 판단이다.",
+  "body_markdown": "# Shared Immutable Data Local Cache Redis Command Queue Primer\n\n> 한 줄 요약: 모든 요청이 같은 공통 read-mostly 값을 Redis에서 다시 읽고 있다면, 그 값이 작고 stale 허용 범위가 명확할 때만 per-instance immutable local snapshot으로 빼서 Redis command queue와 remote cache load를 줄인다.\n\n**난이도: Intermediate**\n\n관련 문서:\n\n- [Local vs Distributed Cache L1/L2 Primer](./local-vs-distributed-cache-l1-l2-primer.md)\n- [Near Cache L1/L2 Pub/Sub Invalidation Primer](./near-cache-l1-l2-pubsub-invalidation-primer.md)\n- [Cache Stampede TTL Jitter Interview Playbook](./cache-stampede-ttl-jitter-interview-playbook.md)\n- [Redis Hot Key vs Big Key Operations Primer](./redis-hot-key-big-key-operations-primer.md)\n- [Redis Cache Aside Write Through Interview Chooser](./redis-cache-aside-write-through-interview-chooser.md)\n\nretrieval-anchor-keywords: shared immutable local cache, common read-mostly local cache, Redis command queue 줄이는 local cache, reduce Redis remote cache load, per instance immutable snapshot, stale tolerant common data cache, versioned local snapshot cache, Redis hot read local snapshot, 공통 데이터 로컬 캐시, 레디스 명령 큐 완화, 읽기 많은 불변 데이터 캐시\n\n---\n\n## 이 문서가 맡는 질문\n\n이 문서는 Redis를 이미 쓰고 있고 hit rate도 높은데, 같은 전역 데이터 조회가 모든 요청에서 Redis까지 내려가 Redis command queue, client connection pool 대기, network round trip, serialization 비용을 키우는 상황을 맡는다.\n\n대표 질문은 이런 형태다.\n\n- 모든 API 요청이 `GET global:config`나 `HGET code-table`을 호출한다.\n- 값은 작고 거의 바뀌지 않지만 Redis QPS와 p99가 같이 오른다.\n- Redis hot key 완화책으로 local cache가 보이는데 stale 위험을 어디까지 봐야 할지 모르겠다.\n- 서버마다 로컬에 올려도 되는 공통 데이터와 절대 올리면 안 되는 데이터를 가르고 싶다.\n\n핵심은 cache 전략 이름이 아니라 **데이터 선별**이다. 모든 Redis key를 L1에 복제하는 것이 아니라, 공통이고 작고 read-mostly이고 stale budget이 명시된 일부 데이터만 immutable snapshot으로 올린다.\n\n---\n\n## 좋은 후보와 나쁜 후보\n\n| 구분 | 좋은 후보 | 피해야 할 후보 |\n|---|---|---|\n| 공유 범위 | 모든 사용자나 tenant가 같은 값 | 사용자별 session, cart, 권한 상태 |\n| 변경 빈도 | 배포, admin 변경, 배치로 드물게 변경 | 요청마다 바뀌거나 write-after-read가 잦음 |\n| stale 허용 | 몇 초에서 몇 분 늦어도 제품적으로 안전 | 결제 승인, 재고 차감, 권한 회수처럼 즉시 반영 필요 |\n| 크기 | 작은 code map, 카테고리, 정책 snapshot | 큰 profile blob, 큰 hash, 큰 zset 전체 |\n| 읽기 경로 | 거의 모든 요청에서 반복 조회 | 긴 꼬리 key나 tenant별 저빈도 조회 |\n| 갱신 경로 | version, updated_at, generation이 있음 | 누가 언제 바꾸는지 추적이 어려움 |\n\n좋은 예시는 국가 코드, 배송 타입 코드, 화면 문구 매핑, 상품 카테고리 taxonomy, read-only feature flag fallback, 요금제 표시용 metadata, stale 허용 정책 snapshot이다. 나쁜 예시는 로그인 세션, 개별 사용자 권한 결정, 예약 가능 수량, 결제 상태, 장바구니, 실시간 재고다.\n\n---\n\n## 설계 형태\n\n```text\nrequest -> immutable local snapshot -> Redis L2 -> source of truth\n```\n\nlocal snapshot은 mutable map을 여기저기서 직접 고치는 구조가 아니다. 새 version을 만들고 검증한 뒤 reference를 atomic swap한다. 읽기 스레드는 잠금 없이 현재 snapshot을 보고, refresh worker만 다음 snapshot을 준비한다.\n\n기본 규칙:\n\n1. snapshot에는 `version`, `loaded_at`, `expires_at`, `source`를 같이 둔다.\n2. 매 요청마다 Redis에서 version marker를 확인하지 않는다. 그러면 Redis command queue 절감 효과가 사라진다.\n3. version check는 짧은 주기 poll, TTL refresh, admin invalidation, deploy warmup 같은 별도 경로로 제한한다.\n4. refresh 실패 시 stale을 계속 줄 수 있는 최대 시간을 정한다.\n5. stale 허용 시간이 끝나면 fail-open, fail-closed, Redis fallback 중 하나를 도메인별로 정한다.\n\n이 구조는 Redis를 없애는 것이 아니다. Redis는 startup warm, refresh source, fallback L2로 남고, hot read path에서만 Redis command를 피한다.\n\n---\n\n## Per-instance warming\n\n각 instance가 뜰 때 같은 key를 동시에 Redis에서 읽으면 warmup 자체가 burst가 된다. 그래서 warming도 설계 대상이다.\n\n- startup에서 필요한 최소 snapshot만 먼저 읽고 나머지는 lazy warm한다.\n- instance별 jitter와 concurrency limit을 둔다.\n- readiness는 필수 snapshot과 선택 snapshot을 나눈다.\n- warmup 실패 시 이전 local snapshot을 재사용할 수 있는지 정한다.\n- deploy 직후 `local_cache_warm_duration`, `warm_failure_total`, Redis command QPS를 같이 본다.\n\n작은 서비스에서는 단순 TTL refresh로 충분할 수 있다. 하지만 instance 수가 많고 공통 데이터가 hot path에 있으면 warmup을 통제하지 않으면 Redis 부하를 줄이려다 배포 순간 Redis를 더 밀어 넣을 수 있다.\n\n---\n\n## Version과 invalidation risk\n\n이 패턴의 위험은 성능이 아니라 stale decision이다. Redis Pub/Sub invalidation을 붙이면 near-cache coherence 문제가 되지만, 이 문서의 기본값은 더 단순하다.\n\n- 값은 versioned immutable snapshot으로 저장한다.\n- 변경자는 version을 증가시키고 Redis나 source에 새 snapshot을 기록한다.\n- 각 instance는 TTL 또는 periodic poll에서 새 version을 발견하면 새 snapshot을 로드한다.\n- 요청이 최신 version을 반드시 요구하면 local hit을 쓰지 말고 Redis 또는 source of truth로 내려간다.\n- stale hit count와 max hit age를 관측한다.\n\n권한 회수, 결제 승인, 재고 차감처럼 stale이 사고가 되는 경로는 이 패턴의 주 대상이 아니다. 그런 경로는 local snapshot을 UI 표시나 fallback hint 정도로만 쓰고 최종 결정은 원본, version compare, DB constraint에서 닫아야 한다.\n\n---\n\n## Redis command queue를 줄였는지 보는 지표\n\n성공 기준은 local hit rate만이 아니다. Redis와 application 양쪽의 대기 신호를 같이 봐야 한다.\n\n| 지표 | 의미 |\n|---|---|\n| `local_snapshot_hit_total{dataset}` | Redis까지 내려가지 않은 read 수 |\n| `redis_command_total{key_class}` | 공통 데이터 key의 Redis command 감소 여부 |\n| `redis_command_latency_ms` | Redis event loop와 network hop 지연 |\n| `client_pool_pending` | app Redis client connection pool 대기 |\n| `snapshot_version_age_seconds` | stale window가 budget 안인지 |\n| `snapshot_refresh_failure_total` | refresh 실패로 stale이 길어지는지 |\n| `redis_fallback_total{reason}` | local miss, expired, version required 등의 fallback 원인 |\n\nRedis p99가 줄어도 stale budget을 넘으면 실패다. 반대로 local hit이 낮아도 Redis command queue가 병목이 아니었다면 이 패턴은 과한 최적화일 수 있다.\n\n---\n\n## 경계\n\n- `local-vs-distributed-cache-l1-l2`는 Caffeine과 Redis의 역할 선택을 설명한다. 이 문서는 이미 Redis remote cache가 있고, 그 앞에서 일부 공통 read-mostly 데이터만 local immutable snapshot으로 빼는 좁은 최적화다.\n- `near-cache invalidation`은 여러 instance의 L1을 Pub/Sub, version, generation으로 맞추는 coherence 설계다. 이 문서는 Pub/Sub coherence보다 stale budget이 넓은 공통 데이터와 주기적 version refresh를 먼저 본다.\n- `cache stampede`는 TTL 만료나 miss path가 origin을 동시에 때리는 문제다. 이 문서는 hit path가 Redis까지 너무 많이 내려가 command queue를 키우는 문제다.\n- `Redis hot key/big key`는 Redis key별 traffic concentration과 value size 운영 진단이다. 이 문서는 그 진단 뒤에 값이 작고 거의 불변인 hot read key를 local snapshot으로 뺄 수 있는지 판단한다.\n- `cache-aside`는 miss 때 DB에서 읽어 Redis를 채우는 read/write pattern이다. 이 문서는 매 요청 Redis GET 자체를 줄이는 local read path 최적화다.\n\n## 한 줄 정리\n\n공통 데이터 local cache는 Redis를 대체하는 일반 캐시 전략이 아니라, 작고 거의 불변이며 stale 허용 범위가 명확한 일부 hot read 데이터만 per-instance immutable snapshot으로 올려 Redis command queue를 줄이는 선택이다. 데이터 선별, per-instance warming, version/TTL, stale 관측이 없으면 성능 최적화가 stale 사고로 바뀐다.\n",
+  "aliases": [
+    "shared immutable local cache",
+    "common read-mostly local cache",
+    "Redis command queue 줄이는 local cache",
+    "partial local cache for common data",
+    "per instance cache warming",
+    "versioned local snapshot cache",
+    "Redis 원격 캐시 호출 줄이기",
+    "공통 데이터 로컬 캐시",
+    "읽기 많은 불변 데이터 캐시",
+    "레디스 명령 큐 완화"
+  ],
+  "expected_queries": [
+    "Redis에 있는 공통 설정값을 매 요청마다 읽는데 로컬 캐시로 줄여도 돼?",
+    "read-only에 가까운 카테고리나 코드 테이블은 Caffeine에 올려 Redis command queue를 줄일 수 있어?",
+    "여러 서버가 같은 공통 데이터를 로컬 캐시하면 stale 위험은 어떻게 판단해?",
+    "Redis hot key처럼 보이는데 값이 거의 안 바뀌는 전역 설정은 local immutable snapshot으로 빼도 될까?",
+    "per-instance warming과 version 값으로 공통 데이터 로컬 캐시를 안전하게 운영하는 기준이 뭐야?"
+  ],
+  "symptoms": [
+    "Redis hit rate는 높지만 모든 요청이 같은 공통 key를 읽어 Redis command QPS와 p99가 같이 오른다.",
+    "전역 설정, 코드 테이블, 카테고리처럼 거의 바뀌지 않는 작은 데이터를 매번 remote cache에서 읽는다.",
+    "local cache를 붙이면 된다고만 말하고 stale 허용 범위, version, warming 실패 정책을 나누지 못한다.",
+    "사용자별 session, 권한 회수, 재고처럼 stale이 위험한 데이터를 공통 immutable local cache 후보로 섞는다.",
+    "배포 직후 모든 instance가 동시에 Redis에서 snapshot을 warm해 원격 cache burst를 만든다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/cache-basics-primer",
+      "system-design/redis-basics-in-memory-kv-single-thread-primer",
+      "system-design/local-vs-distributed-cache-l1-l2-primer"
+    ],
+    "next_docs": [
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "system-design/redis-hot-key-big-key-operations-primer",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook",
+      "system-design/rejected-hit-observability-primer"
+    ],
+    "confusable_with": [
+      "system-design/local-vs-distributed-cache-l1-l2-primer",
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook",
+      "system-design/redis-hot-key-big-key-operations-primer",
+      "system-design/redis-cache-aside-write-through-interview-chooser"
+    ],
+    "forbidden_for_queries": [
+      "system-design/local-vs-distributed-cache-l1-l2-primer",
+      "system-design/near-cache-l1-l2-pubsub-invalidation-primer",
+      "system-design/cache-stampede-ttl-jitter-interview-playbook",
+      "system-design/redis-hot-key-big-key-operations-primer"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": [
+      {
+        "date": "2026-06-19",
+        "source": "corpus-improvement-cycle2-v4",
+        "note": "Created Tier-S intermediate primer for shared immutable common data local caching to reduce Redis command queueing and remote cache load."
+      }
+    ]
+  }
+}

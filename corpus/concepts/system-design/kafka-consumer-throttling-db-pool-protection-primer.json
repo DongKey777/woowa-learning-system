@@ -1,0 +1,66 @@
+{
+  "id": "system-design/kafka-consumer-throttling-db-pool-protection-primer",
+  "title": "Kafka Consumer Throttling for DB Pool Protection Primer",
+  "category": "system-design",
+  "level": "intermediate",
+  "summary": "Traffic spike 때 Kafka consumer가 DB 처리량보다 빠르게 record를 끌어오면 lag를 줄이려는 시도가 DB connection pool pending acquire, query backlog, timeout을 키울 수 있다. 이 primer는 consumer poll/processing concurrency, pause/resume, rate budget을 DB pool 상태에 맞춰 조절하고, DB 보호를 위해 lag 증가를 의도적으로 받아들이는 판단을 다룬다.",
+  "body_markdown": "# Kafka Consumer Throttling for DB Pool Protection Primer\n\n## 한 줄 요약\n\nKafka consumer throttling은 lag를 무조건 빨리 줄이는 전략이 아니다. Traffic spike 동안 DB가 감당할 수 있는 동시 query 수보다 consumer processing concurrency가 커지면, consumer lag는 줄어도 DB connection pool pending acquire와 query backlog가 먼저 터진다. 이때는 Kafka lag를 buffer로 쓰고, consumer가 새 record를 가져오거나 처리 worker에 넘기는 속도를 DB pool 건강도에 맞춰 낮춘다.\n\n핵심 invariant는 간단하다.\n\n```text\nconsumer in-flight DB work <= DB pool과 query latency가 건강하게 감당할 수 있는 범위\n```\n\n## 해결하려는 증상\n\n| 관찰 | 의미 |\n|---|---|\n| Kafka lag를 줄이려고 consumer/worker를 늘린 뒤 DB pending acquire가 증가 | Kafka 처리 병렬성이 DB 동시성 budget을 초과했다 |\n| CPU는 남는데 Hikari active=max, acquire timeout 증가 | app CPU가 아니라 DB connection 또는 query 실행이 병목이다 |\n| poll한 record가 내부 executor queue에 계속 쌓임 | Kafka에서 꺼낸 뒤 app 내부 backlog로 옮겨졌을 뿐이다 |\n| DB가 느려진 동안 inline retry도 같이 증가 | consumer가 DB를 보호하지 못하고 재시도로 부하를 증폭한다 |\n| pause/resume 후 lag가 증가 | 실패가 아니라 DB 보호를 위해 backlog 위치를 Kafka에 남긴 결과일 수 있다 |\n\n## 제어 지점\n\nKafka consumer에서 조절할 수 있는 지점은 여러 개다. 하나의 knob만 보지 말고 흐름 전체를 본다.\n\n1. `max.poll.records`로 한 번에 가져오는 batch 크기를 제한한다.\n2. Record 처리 worker를 bounded queue 또는 semaphore로 제한한다.\n3. DB write/read를 시작하기 전 permit을 얻어 in-flight DB work를 제한한다.\n4. Permit이 없거나 DB pool pending acquire가 높으면 assigned partition을 `pause()`한다.\n5. `pause()` 중에도 `poll()`은 계속 호출해 heartbeat와 rebalance 안정성을 유지한다.\n6. DB가 회복되면 `resume()`을 한 번에 전부 열지 말고 작은 rate budget으로 단계적으로 연다.\n7. Offset commit은 처리 완료 이후로 맞추고, 내부 병렬 처리 시 offset gap을 따로 관리한다.\n\n즉 throttling의 목표는 record를 Kafka에서 app memory로 빨리 옮기는 것이 아니라, DB가 처리 가능한 만큼만 처리 경계 안으로 들이는 것이다.\n\n## DB pool 신호로 throttle 걸기\n\n좋은 throttle 신호는 consumer lag 하나가 아니라 DB pool과 query backlog 쪽이다.\n\n| 신호 | throttle 판단 |\n|---|---|\n| `active connections / max`가 높고 idle이 거의 없음 | 새 DB work admission을 줄인다 |\n| `pending acquire` 또는 borrow wait p95가 증가 | consumer processing concurrency를 낮추거나 pause한다 |\n| acquire timeout 증가 | 이미 pool 대기가 사용자/worker deadline을 넘고 있다 |\n| query p95/p99 증가와 slow query backlog | pool만이 아니라 DB 실행 자체가 느려졌다 |\n| consumer handler queue depth와 oldest age 증가 | Kafka backlog를 app 내부 queue로 옮기고 있다 |\n| DB 회복 뒤 retry rate가 높음 | resume보다 retry budget 축소와 jitter가 먼저일 수 있다 |\n\n간단한 pseudo flow는 이렇다.\n\n```pseudo\nif db.pendingAcquire > pending_budget or db.borrowWaitP95 > wait_budget:\n    pause(assignedPartitions)\n    shrinkProcessingPermits()\n\nif paused and db.pendingAcquire == 0 and db.borrowWaitP95 < resume_budget:\n    resumeSomePartitions()\n    openRateBudgetGradually()\n```\n\nThreshold는 고정 숫자보다 deadline과 pool 크기에서 시작한다. 예를 들어 DB pool이 40개인데 consumer worker가 200개면, spike 때 160개 이상은 connection을 기다리는 backlog가 될 수 있다. Consumer별 permit 합계는 DB pool 전체를 독점하지 않도록 HTTP request, scheduler, batch 같은 다른 DB 사용자와 나눠 잡는다.\n\n## pause/resume을 쓸 때의 주의점\n\n`pause()`는 consumer group에서 나가는 것이 아니다. Partition assignment는 유지하면서 해당 partition에서 새 record를 fetch하지 않게 하는 흐름 제어다. 그래서 pause 중에도 `poll()`을 너무 오래 멈추면 안 된다. Heartbeat와 `max.poll.interval.ms`를 고려해 consumer가 살아 있음을 계속 유지해야 한다.\n\nResume은 복구 신호가 보였다는 이유로 한 번에 열면 다시 DB pool을 채울 수 있다. 작은 partition subset, 작은 batch, 낮은 permit에서 시작해 pending acquire와 query latency가 안정적인지 본다. DB가 안정된 뒤 lag drain 속도를 올리는 것이 순서다.\n\n## lag trade-off\n\nThrottling은 backlog를 없애지 않는다. Backlog 위치를 DB pool과 app executor queue에서 Kafka lag로 옮기는 선택이다. 이 선택은 보통 더 안전하다.\n\n- Kafka lag는 retention과 lag age로 관리할 수 있다.\n- DB pending acquire는 핵심 API까지 같이 느리게 만들 수 있다.\n- App 내부 queue는 memory pressure와 timeout-after-start를 만든다.\n- DB query backlog는 lock wait, slow query, retry storm으로 번질 수 있다.\n\n따라서 consumer lag 증가 자체를 실패로 보지 않는다. Lag count와 lag age, business freshness SLO, Kafka retention 여유, DLQ/poison message 여부를 같이 본다. DB 보호 때문에 lag가 늘었고 핵심 API p99와 DB acquire wait가 회복됐다면 throttling은 의도대로 동작한 것이다.\n\n## 경계: partition parallelism과 다르다\n\n`kafka-partition-count-consumer-parallelism-primer`는 partition 수가 같은 consumer group의 active consumer 수 상한을 만든다는 이야기다. 이 문서는 이미 consumer가 DB를 너무 세게 누르는 상황에서 처리 admission을 낮추는 이야기다.\n\n- Partition parallelism 질문: consumer를 더 늘려도 idle이 생기는가, hot partition인가.\n- Consumer throttling 질문: 지금 consumer가 DB pool과 query capacity보다 많은 일을 동시에 시작하는가.\n- 둘의 연결점: lag가 높아도 DB pending acquire가 높으면 partition/consumer 증설보다 throttling이 먼저일 수 있다.\n\n## 경계: generic backpressure와 다르다\n\n일반 backpressure 문서는 queue, reject, load shedding의 넓은 원칙을 다룬다. 이 문서는 Kafka consumer의 구체적인 제어면에 초점을 둔다.\n\n- `max.poll.records`, handler executor concurrency, per-record permit\n- `pause()`/`resume()`과 poll heartbeat 유지\n- DB pool active/idle/pending acquire를 admission 신호로 사용\n- lag 증가를 허용하고 resume rate를 단계적으로 여는 운영 판단\n\n즉 backpressure 원칙을 Kafka consumer와 DB pool 사이에 적용한 부분/intermediate 카드다.\n\n## 경계: connection pool 튜닝과 다르다\n\nDB connection pool 문제가 보인다고 pool max를 먼저 올리면 위험하다. Query latency가 이미 늘었거나 DB CPU/lock이 병목이면 pool을 키우는 것은 더 많은 query를 동시에 밀어 넣는 일이 된다. 이 문서의 우선순위는 pool size 튜닝이 아니라 consumer가 pool 앞에서 기다리는 work 수를 제한하는 것이다.\n\nConnection pool 문서는 pool size, borrow timeout, leak, transaction hold time을 자세히 본다. 이 문서는 그 신호 중 pending acquire와 borrow wait를 consumer admission control의 입력으로 쓰는 쪽에 초점을 둔다.\n\n## 경계: retry/backpressure와 다르다\n\nDB timeout이 났다고 consumer가 즉시 inline retry를 늘리면 lag는 잠깐 줄어 보일 수 있지만 DB 부하는 더 커진다. Retry는 idempotency, backoff, jitter, retry budget, DLQ와 함께 설계해야 한다. Throttling은 retry 전에 새 DB work 유입량을 줄이는 장치다.\n\n장애 중에는 다음 순서가 안전하다.\n\n1. 새 record 처리 admission을 줄인다.\n2. DB pending acquire와 borrow wait가 내려오는지 본다.\n3. 이미 실패한 record는 bounded retry와 DLQ 정책으로 보낸다.\n4. DB가 회복된 뒤 resume과 lag drain을 단계적으로 연다.\n\n## 운영 체크리스트\n\n1. Consumer별 assigned partition, `max.poll.records`, worker concurrency, handler queue depth를 확인한다.\n2. DB pool active/idle/pending acquire, borrow wait, acquire timeout, query p95/p99를 같은 dashboard에서 본다.\n3. HTTP request와 batch도 같은 DB pool을 쓰는지 확인하고 consumer permit이 pool 전체를 독점하지 않게 한다.\n4. Lag count뿐 아니라 lag age와 retention 여유를 본다.\n5. Pause 중에도 poll heartbeat가 유지되는지 확인한다.\n6. Resume은 partition subset 또는 token budget으로 단계적으로 열고, pending acquire가 다시 증가하면 즉시 줄인다.\n7. Offset commit은 처리 완료 기준으로 유지하고, 내부 병렬 처리에서는 앞 offset 실패가 뒤 offset commit을 밀지 않는지 본다.\n\n## 면접 답변 축\n\nKafka consumer lag가 높다고 무조건 consumer를 늘리면 안 된다. Handler가 DB를 쓰는 구조라면 consumer processing concurrency가 DB connection pool과 query capacity를 초과해 pending acquire, acquire timeout, query backlog를 만들 수 있다. 이때는 `max.poll.records`, worker semaphore, `pause()`/`resume()`, rate budget으로 새 DB work admission을 제한하고, Kafka lag를 의도적으로 받아들여 DB와 핵심 API를 보호한다. Partition 수 조정은 active consumer 상한 문제이고, 여기서는 downstream DB pool을 보호하기 위해 이미 들어오는 소비 속도를 낮추는 문제가 핵심이다.\n",
+  "aliases": [
+    "Kafka consumer DB pool throttling",
+    "카프카 컨슈머 DB 풀 보호",
+    "컨슈머 처리량 제한",
+    "카프카 pause resume",
+    "DB pending acquire 기준 throttling",
+    "consumer lag와 DB 보호",
+    "consumer poll concurrency limit",
+    "Kafka consumer rate budget",
+    "DB 커넥션 풀 고갈 방지",
+    "consumer throttling during traffic spikes"
+  ],
+  "expected_queries": [
+    "Kafka consumer가 몰려서 DB connection pool pending acquire가 늘 때 어떻게 throttle해?",
+    "consumer lag는 쌓이는데 DB 풀을 보호하려면 pause/resume을 어떻게 써?",
+    "max.poll.records랑 worker concurrency를 DB pool 크기에 맞추는 기준이 뭐야?",
+    "트래픽 spike 때 Kafka consumer를 늘렸더니 DB query backlog가 터지는 이유가 뭐야?",
+    "Kafka consumer throttling은 partition 수 조정이나 일반 backpressure랑 뭐가 달라?"
+  ],
+  "symptoms": [
+    "Kafka lag를 줄이려고 consumer worker를 늘린 뒤 DB pending acquire와 acquire timeout이 증가한다",
+    "CPU는 남는데 DB connection pool active가 max에 붙고 query backlog가 늘어난다",
+    "Consumer가 poll한 record를 app 내부 queue에 쌓아 memory pressure와 timeout이 커진다",
+    "DB가 느려진 동안 consumer inline retry가 늘어 DB 부하가 더 커진다",
+    "pause/resume을 적용하자 consumer lag는 늘었지만 DB pool wait와 핵심 API p99가 회복된다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "system-design/kafka-foundations-topic-partition-broker-offset-beginner-primer",
+      "database/connection-pool-starvation-symptom-router",
+      "system-design/littles-law-capacity-planning-primer"
+    ],
+    "next_docs": [
+      "database/connection-pool-sizing-timeout-tuning-intermediate-primer",
+      "database/connection-borrow-wait-vs-query-execution-time-primer",
+      "system-design/overload-control-admission-queue-load-shedding-router",
+      "system-design/kafka-offset-commit-timing-at-least-once-card"
+    ],
+    "confusable_with": [
+      "system-design/kafka-partition-count-consumer-parallelism-primer",
+      "system-design/backpressure-vs-load-shedding-vs-rate-limit-interview-chooser",
+      "database/connection-pool-starvation-symptom-router",
+      "system-design/retry-amplification-and-backpressure-primer"
+    ],
+    "forbidden_for_queries": [
+      "system-design/kafka-partition-count-consumer-parallelism-primer",
+      "database/connection-pool-starvation-symptom-router",
+      "system-design/retry-amplification-and-backpressure-primer",
+      "system-design/rate-limit-vs-queue-load-shedding-chooser"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-19",
+    "last_modified": "2026-06-19",
+    "revision_history": []
+  }
+}
