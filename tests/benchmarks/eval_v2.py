@@ -195,6 +195,12 @@ def main(argv: list[str] | None = None) -> int:
                 gate_fail.append(f"{key} {val:.3f} < baseline {ref:.3f} − {margin} (회귀)")
         report["gate"] = {"pass": not gate_fail, "mode": "delta_vs_baseline",
                           "failures": gate_fail}
+    # write report for release_acceptance to gate on (Phase 4 integration)
+    rdir = REPO_ROOT / "reports"
+    rdir.mkdir(exist_ok=True)
+    (rdir / "eval_v2_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if not gate_fail else 1

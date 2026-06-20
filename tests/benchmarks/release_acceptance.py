@@ -462,6 +462,38 @@ def _y13_gate_checks() -> list[dict]:
             entry["would_pass"] = would_pass
         out.append(entry)
 
+    # eval-framework-v2 multi-tier gate (T-A/T-C/T-F per-category, baseline-relative).
+    # Blocking on the baseline-relative regression check when the report exists; if
+    # eval_v2 wasn't run, a report_only marker keeps legacy release flow unbroken.
+    ev2 = _read_json(REPO_ROOT / "reports" / "eval_v2_report.json")
+    if ev2:
+        ev2_gate = ev2.get("gate", {})
+        tc_cov = ev2.get("T-C coverage", {})
+        tf_found = ev2.get("T-F foundation", {})
+        ev2_gates = [
+            ("eval_v2_baseline_gate", bool(ev2_gate.get("pass")), True, "==", False),
+            ("eval_v2_tc_hit5", tc_cov.get("hit5"), 0.0, ">=", True),
+            ("eval_v2_tc_ndcg5", tc_cov.get("ndcg5_mean"), 0.0, ">=", True),
+            ("eval_v2_tf_top5_recall", tf_found.get("hit5"), 0.0, ">=", True),
+        ]
+        for name, observed, threshold, op, report_only in ev2_gates:
+            if op == ">=":
+                would_pass = observed is not None and observed >= threshold
+            else:
+                would_pass = observed == threshold
+            entry = {"category": "K_Y13_gates", "name": name, "observed": observed,
+                     "threshold": threshold, "op": op,
+                     "pass": True if report_only else would_pass}
+            if report_only:
+                entry["report_only"] = True
+                entry["would_pass"] = would_pass
+            out.append(entry)
+    else:
+        out.append({"category": "K_Y13_gates", "name": "eval_v2_report",
+                    "observed": None, "threshold": "present", "op": "==",
+                    "pass": True, "report_only": True, "would_pass": False,
+                    "note": "eval_v2 not run (Phase 4) — multi-tier gate skipped"})
+
     cohort_legacy_report = _read_json(REPO_ROOT / "reports" / "cohort_y13_vs_legacy.json")
     cohort_legacy = (cohort_legacy_report or {}).get("legacy", {})
     cohort_legacy_sha = (cohort_legacy_report or {}).get("qrel_sha256")
