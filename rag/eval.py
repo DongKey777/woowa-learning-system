@@ -122,13 +122,39 @@ def dcg_at_k(relevances: list[float], k: int) -> float:
     return total
 
 
-def ndcg_at_k(retrieved_ids: list[str], expected_ids: list[str], k: int) -> float:
-    """NDCG@k using binary relevance against expected concept ids."""
+def ndcg_at_k(
+    retrieved_ids: list[str],
+    expected_ids: list[str],
+    k: int,
+    acceptable_ids: list[str] | None = None,
+) -> float:
+    """NDCG@k with graded relevance.
+
+    When ``acceptable_ids`` is None this is binary (eval-framework-v2 T-X/legacy):
+    expected→gain 3, else 0; nDCG normalisation makes that identical to the old
+    gain-1 binary form (the 2**rel-1 factor cancels in DCG/IDCG).
+
+    When ``acceptable_ids`` is given (eval-framework-v2 graded tiers): primary
+    (``expected_ids``)→gain 3, acceptable (sibling/alt path)→gain 1, else 0. This
+    credits "acceptable at rank 1, primary at rank 2" as partial score, so corpus
+    growth (sibling competition) shows as graceful nDCG dip, not a binary cliff.
+    """
     expected = set(expected_ids)
-    if not expected:
+    acceptable = set(acceptable_ids or []) - expected  # primary wins ties
+    if not expected and not acceptable:
         return 0.0
-    relevances = [1.0 if cid in expected else 0.0 for cid in retrieved_ids[:k]]
-    ideal_relevances = [1.0] * min(len(expected), k)
+
+    def gain(cid: str) -> float:
+        if cid in expected:
+            return 3.0
+        if cid in acceptable:
+            return 1.0
+        return 0.0
+
+    relevances = [gain(cid) for cid in retrieved_ids[:k]]
+    ideal_relevances = sorted(
+        [3.0] * len(expected) + [1.0] * len(acceptable), reverse=True
+    )[:k]
     ideal = dcg_at_k(ideal_relevances, k)
     if ideal == 0:
         return 0.0
@@ -139,12 +165,22 @@ def retrieval_metrics(
     retrieved_ids: list[str],
     expected_ids: list[str],
     k: int = 5,
+    acceptable_ids: list[str] | None = None,
 ) -> dict[str, float]:
-    """Compute per-query ranking metrics used by Y13 gates."""
+    """Per-query ranking metrics (Y13 gates / eval-framework-v2).
+
+    ``acceptable_ids`` None → legacy binary (recall/mrr/ndcg against expected).
+    Given → recall/mrr against expected∪acceptable (the "relevant" set, unchanged
+    from the old flattened form) while nDCG is graded (primary=3, acceptable=1).
+    """
+    if acceptable_ids is None:
+        relevant = expected_ids
+    else:
+        relevant = list(dict.fromkeys(list(expected_ids) + list(acceptable_ids)))
     return {
-        f"recall_at_{k}": recall_at_k(retrieved_ids, expected_ids, k),
-        "mrr": reciprocal_rank(retrieved_ids, expected_ids),
-        f"ndcg_at_{k}": ndcg_at_k(retrieved_ids, expected_ids, k),
+        f"recall_at_{k}": recall_at_k(retrieved_ids, relevant, k),
+        "mrr": reciprocal_rank(retrieved_ids, relevant),
+        f"ndcg_at_{k}": ndcg_at_k(retrieved_ids, expected_ids, k, acceptable_ids=acceptable_ids),
     }
 
 
