@@ -1,10 +1,33 @@
 # Verification results — current operations + corpus/retrieval historical phase results
 
-최신 측정 날짜: 2026-06-09
-브랜치: `main`
-기준: 2026-06-09에는 학습 telemetry와 PR archive 운영 상태를 정비하고, 코드 변경 사항을 full pytest + state health gate로 검증했다. 2026-05-31 corpus/retrieval release 결과는 아래 historical section으로 보존한다.
+최신 측정 날짜: 2026-06-22
+브랜치: `research/top1-top5` → `main`
+기준: 2026-06-22에는 세션-side 검색 파이프라인(HyDE 쿼리재작성 + CC fusion + margin-gated rerank + top-K 내용주입)을 구현·검증했다. 이전 운영/코퍼스 결과는 아래 historical section으로 보존한다.
 
-## 0. 최신 — telemetry/archive maintenance verification (2026-06-09)
+## 0. 최신 — 세션-side 풀 파이프라인 (HyDE+CC+rerank+내용주입) (2026-06-22)
+
+### 0.1 한 줄 요약
+dense-top-1 핀 제거(CC α=0.92) + 세션 HyDE 키워드 확장 + dense top-5 세션 rerank + top-K summary/body 주입.
+게이트 회귀 0(golden 58/58, eval_v2 PASS, pytest 734), 프롬프트 −248자, latency 순증 ~0(daemon +1ms).
+
+### 0.2 헤드라인 — 게이트 가시 vs 풀 파이프라인 실측
+| 측정 경로 | top1 | top5 | 비고 |
+|---|---|---|---|
+| golden (CC effect) | 58/58 | — | kafka 라벨 1개 갱신(리밸런스 artifact) |
+| eval_v2 T-A (권위) | 0.756→0.800 | — | CC +4.4pp |
+| eval_v2 T-C | 0.430→0.477 | 0.678→0.697 | CC +4.7pp |
+| cohort real_learner_qrels | 0.756→0.800 | →0.900 | 권위 +4.4pp |
+| **full_pipeline_eval (521, 4-arm)** | **0.484→0.860** | **0.718→0.929** | arm0 rrf→arm3 full, **+38pp** |
+
+레버 기여(full_pipeline top1): CC +4pp(게이트 가시) / HyDE +24pp / rerank +9pp. **게이트는 CC만 보므로 +4pp, 풀 파이프라인 실측은 +38pp**(HyDE·rerank가 세션 행동이라 게이트 비가시). 검증 방식: `tests/benchmarks/full_pipeline_eval.py` (§testing-guide 2.7).
+
+### 0.3 정직한 calibration
+521 tier는 naive floor 측정. 실 학습자 82%가 기술용어 → 실세계 평균 이득은 +4~+38pp 사이(쿼리 naive 정도 비례), 큰 이득은 naive/짧은/absent 쿼리 + citation 정확도/환각↓에 집중.
+
+### 0.4 재현
+`python3 tests/benchmarks/full_pipeline_eval.py` (daemon CC 기본). golden: `bin/golden verify`. eval_v2: `python3 tests/benchmarks/eval_v2.py`.
+
+## 0-old. telemetry/archive maintenance verification (2026-06-09)
 
 ### 0.1 한 줄 요약
 

@@ -153,6 +153,12 @@ Phase L 측정:
   - executable `bin/ask` uses a shell + AF_UNIX `nc` fast path for warm daemon text/JSON output; direct `python3 bin/ask` remains compatible and falls back to the Python client
   - manual override keywords are first-class: `그냥 답해` skips RAG, `RAG로 깊게` forces CS RAG, `코치 모드` forces coaching; override tokens are stripped from retrieval query before search
   - search-result cache stores post-rerank unpersonalized hits for default encoder calls; stable lexical rerank cache keys keep repeated AI-session prompts on the cache path while profile adjustment remains per request
+  - **세션-side 검색 파이프라인 (2026-06-22)**: 검색 품질의 큰 레버가 세션(LLM) 행동/ask 경로에 있다. 게이트(golden/eval_v2/cohort, search action 경로)는 fusion만 본다.
+    - **CC fusion 기본** (`core/lexical_fusion.py`, `WOOWA_FUSION_MODE=cc α=0.92`): dense-top-1 하드핀 제거 + min-max 정규화 convex combination(`_fuse_lexical_cc`) + dense-anchor(K=5). `WOOWA_FUSION_MODE=rrf`로 legacy 복원. golden 58/58·eval_v2 PASS.
+    - **margin 노출** (`rag/search.py:search_with_margin`): dense top1-top2 raw cosine margin → `response_hints.rerank_gate`(τ=0.05). `search()`는 shim(50+ caller 불변).
+    - **내용주입** (`core/lazy_loader.py:_hits_to_dicts(corpus)`): ask 경로 rag_hits에 top-5 summary(문장경계 250)+top-2 body(800) 주입 → 세션이 추가 패스 없이 rerank+답변(환각↓). 게이트 경로(search action, corpus 미주입)는 5필드 불변.
+    - **세션 지시** (CLAUDE.md §4.2): positional 쿼리를 concept-vocab HyDE 키워드로 확장(absent recall 회복); `rerank_gate`로 margin-gated rerank(저margin만 top-5 의미 재정렬, answer-gen에 fold, breakage-guard). 추가 LLM 패스 0.
+    - 풀 파이프라인 측정: `tests/benchmarks/full_pipeline_eval.py` (4-arm, fixture로 HyDE/rerank 재현). v1: top1 0.484→0.860(+38pp), top5 0.718→0.929.
   - warm socket p50/p95: **4.1ms / 6.3ms**
   - warm CLI p50/p95: **43.9ms / 47.6ms**
   - first ask after ready p50/p95: **187.2ms / 196.0ms**

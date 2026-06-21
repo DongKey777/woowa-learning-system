@@ -99,11 +99,12 @@ def load(
         elif name == ARTIFACT_PREDICT:
             out[name] = _load_predict(repo, state_root)
     if route.need_rag and query:
-        hits, personalization = _load_rag_hits(
+        hits, personalization, dense_margin = _load_rag_hits(
             query, corpus=corpus, learner_profile=learner_profile,
             state_root=state_root,
         )
         out["rag_hits"] = hits
+        out["rag_dense_margin"] = dense_margin
         if personalization is not None:
             out["personalization"] = personalization
     return out
@@ -115,25 +116,27 @@ def _load_rag_hits(
     corpus=None,
     learner_profile: LearnerProfile | None = None,
     state_root: Path = DEFAULT_STATE_ROOT,
-) -> tuple[list[dict], dict | None]:
-    """Invoke rag.search.
+) -> tuple[list[dict], dict | None, float | None]:
+    """Invoke rag.search. Returns (hit_dicts, personalization, dense_margin).
 
     Priority: (1) in-process if corpus injected (daemon ask path — avoids
     self-recursion), (2) daemon socket (bin/ask fallback warm path),
-    (3) in-process cold (daemon unavailable).
+    (3) in-process cold (daemon unavailable). dense_margin is the raw dense
+    top1-top2 cosine gap (in-process path only; None elsewhere) for rerank gating.
     """
     if corpus is not None:
         # In-process path (daemon ask handler injects corpus)
         try:
-            from rag.search import search
+            from rag.search import search_with_margin
             from core.lexical_fusion import make_lexical_fusion_fn
-            hits = search(query, top_k=top_k, relations_expand=3,
-                          rerank_fn=make_lexical_fusion_fn(corpus, expand=8),
-                          corpus=corpus)
+            hits, dense_margin = search_with_margin(
+                query, top_k=top_k, relations_expand=3,
+                rerank_fn=make_lexical_fusion_fn(corpus, expand=8),
+                corpus=corpus)
             hits, personalization = _personalize_hits(hits, learner_profile)
-            return _hits_to_dicts(hits), personalization
+            return _hits_to_dicts(hits, corpus=corpus), personalization, dense_margin
         except Exception as exc:
-            return [{"error": f"rag.search failed: {exc!s}"}], None
+            return [{"error": f"rag.search failed: {exc!s}"}], None, None
     try:
         from core import daemon as rag_daemon
         hit_dicts = rag_daemon.search(query, top_k=top_k,
@@ -141,18 +144,18 @@ def _load_rag_hits(
         if hit_dicts is not None:
             hits = _dicts_to_hits(hit_dicts)
             if not hits:
-                return hit_dicts, None
+                return hit_dicts, None, None
             hits, personalization = _personalize_hits(hits, learner_profile)
-            return _hits_to_dicts(hits), personalization
+            return _hits_to_dicts(hits, corpus=corpus), personalization, None
     except Exception:
         pass
     try:
         from rag.search import search
         hits = search(query, top_k=top_k, relations_expand=3)
         hits, personalization = _personalize_hits(hits, learner_profile)
-        return _hits_to_dicts(hits), personalization
+        return _hits_to_dicts(hits, corpus=corpus), personalization, None
     except Exception as exc:
-        return [{"error": f"rag.search unavailable: {exc!s}"}], None
+        return [{"error": f"rag.search unavailable: {exc!s}"}], None, None
 
 
 def personalization_active() -> bool:
@@ -195,12 +198,43 @@ def _personalize_hits(
     }
 
 
-def _hits_to_dicts(hits: list[SearchHit]) -> list[dict]:
-    return [
-        {"concept_id": h.concept_id, "score": round(h.score, 4),
-         "category": h.category, "title": h.title, "source": h.source}
-        for h in hits
-    ]
+def _summary_sentence_cut(text: str, cap: int = 250) -> str:
+    """Truncate at a sentence boundary near `cap` (avoids mid-sentence cuts that
+    cripple the session-side rerank signal — adversarial review defect A)."""
+    text = (text or "").strip()
+    if len(text) <= cap:
+        return text
+    head = text[:cap]
+    for sep in (". ", ".\n", "? ", "! ", "다. ", "다.\n", "요. ", "요.\n"):
+        i = head.rfind(sep)
+        if i > cap * 0.5:
+            return head[: i + len(sep)].strip()
+    return head.strip()
+
+
+def _hits_to_dicts(hits: list[SearchHit], corpus=None, body_top_k: int = 2) -> list[dict]:
+    """Render hits to prompt dicts. When `corpus` is supplied (daemon ask path),
+    inject top-K summary + top-2 body so the session can rerank + answer in one
+    reasoning pass (no hidden Read pass / parametric hallucination). top-2 body
+    grounds the likely answer concept + its close alternative at modest token
+    cost. The gate path (daemon search action) calls without corpus → unchanged
+    5-field dicts."""
+    concepts = getattr(corpus, "concepts", None) if corpus is not None else None
+    out: list[dict] = []
+    for idx, h in enumerate(hits):
+        d = {"concept_id": h.concept_id, "score": round(h.score, 4),
+             "category": h.category, "title": h.title, "source": h.source}
+        if concepts is not None:
+            concept = concepts.get(h.concept_id) or {}
+            summary = _summary_sentence_cut(concept.get("summary") or "", 250)
+            if summary:
+                d["summary"] = summary
+            if idx < body_top_k:
+                body = (concept.get("body_markdown") or "").strip()
+                if body:
+                    d["body"] = body[:800]
+        out.append(d)
+    return out
 
 
 def _dicts_to_hits(hit_dicts: list[dict]) -> list[SearchHit]:

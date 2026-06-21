@@ -112,13 +112,15 @@ python3 bin/ask "테스트"
 1. **모드 선택** — 학습자 발화를 읽고 아래 §4.2.2 카탈로그에서 가장 맞는 라우팅 모드를 직접 고른다(`--mode`).
 2. **`bin/ask` 자동 호출** — 학습 turn은 다음 형태로 호출한다:
    `bin/ask "<재작성한 검색 쿼리>" --raw-utterance "<학습자 원문 발화>" --session-mode learning --mode <mode> [--repo <repo>]`
-   - positional = 세션이 기술어휘로 **재작성한** 검색 쿼리(검색에 실제로 넘어가는 텍스트).
-   - `--raw-utterance` = 학습자가 실제로 친 **원문 한국어 발화**(재작성 전). raw→rewritten 쌍 축적용 — 발화를 그대로 넘긴다(요약·재작성 금지).
+   - positional = 세션이 학습자 의도를 **concept-vocabulary 기술키워드로 확장한 HyDE 형태**(검색에 넘어가는 텍스트). naive 발화의 핵심 명사를 코퍼스 어휘(클래스/패턴/메커니즘 용어)로 치환·보강해 dense recall 천장(정답이 후보 밖)을 회복한다. 예: *"빈 등록 왜 해"* → `스프링 빈 등록 ApplicationContext IoC 컨테이너 의존성주입 @Component 컴포넌트스캔`. **가상 정답 문서를 길게 생성하지 말고**(별도 패스 비용) 올바른 기술키워드 부착이면 족하다(R12 실측: 싼 키워드로 absent top5 0.28→0.88). 이 확장은 **ask 인자를 만드는 동일 추론 패스 안에서 inline** 처리한다(별도 LLM 패스로 빼면 wall-clock 배증). 이미 기술어휘인 발화는 그대로 둔다(82%).
+   - `--raw-utterance` = 학습자가 실제로 친 **원문 한국어 발화**(HyDE 확장 전). raw→rewritten 쌍 축적용 — 발화를 그대로 넘긴다(요약·HyDE 확장 금지, 'Verify raw source' 정책).
    - `--session-mode learning` = 학습 세션 명시(provenance `explicit`). 생략하면 env/`default`로 떨어진다.
    - `--mode`는 **라우팅 모드** 오버라이드다(세션 모드와 별개). 어느 라우팅 모드인지 확신이 안 서면 `--mode`를 빼고 호출 → 키워드 router(`detect_mode`)가 결정(deterministic 하한선).
-3. 응답 받은 prompt markdown을 그대로 사용해 학습자에게 한국어 답변 생성.
+3. 응답 받은 prompt markdown을 그대로 사용해 학습자에게 한국어 답변 생성. 이때 `response_hints.rerank_gate`로 분기한다(margin-gated 세션 rerank):
+   - `"trust_top1"` (dense margin 충분): rag_hits 순서를 신뢰. 재정렬 추론 **생략**하고 top-1 중심으로 인용·focus(토큰 절약 + 확실한 top-1을 rerank가 깨지 않게 보호).
+   - `"rerank"` (margin 낮음/없음): rag_hits top-5의 `↳`(summary)·`↳본문`(body)을 학습자 의도와 의미 대조해, **답변을 쓰는 그 추론 안에서** 가장 맞는 concept를 top-1로 골라 인용·설명 focus에 반영. **별도 호출·별도 패스 금지**(답변 작문과 동시 = 추가 LLM 패스 0). 단 **dense top-1보다 명백히 더 맞는 후보가 있을 때만 교체**(애매하면 dense 순서 유지 — sibling 오교체 방지). 새 concept 발명 금지(rag_hits 안에서만 재정렬).
 4. 첫 줄 헤더: `[Mode: <router_mode>]` (예: `[Mode: cs_qa]`, `[Mode: coaching]`).
-5. 답변 끝에 `참고:` 블록으로 인용 (최대 3개 concept_id).
+5. 답변 끝에 `참고:` 블록으로 인용 (최대 3개 concept_id). rerank로 top-1이 바뀐 경우 그 concept를 참고 첫 줄에 둔다.
 
 ### 4.2.1 답변 본문 수집 규칙
 - UX가 우선이다. 답변 본문 수집 실패가 학습 답변을 막으면 안 된다.
@@ -254,7 +256,8 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | `bin/reclassify-history --last 1000` | router rule 변경 후 dispatch drift |
 | `bin/cohort-eval --cohort-file C.json` | release 전 50-q cohort 정확도 |
 | `bin/cohort-compare --control A --candidate B --fail-on-drift` | A/B gate |
-| `bin/golden verify` | CI per-commit golden top-1 |
+| `bin/golden verify` | CI per-commit golden top-1 (CC fusion 가시, HyDE/rerank 비가시) |
+| `tests/benchmarks/full_pipeline_eval.py` | **세션-side 풀 파이프라인 4-arm**(HyDE+CC+rerank, fixture 재현). 게이트가 못 보는 HyDE/rerank 이득 측정 |
 | `bin/rag-eval` | F1 RAG quality regression (Phase K) |
 | `bin/router-generalization-eval` | 20-fixture router accuracy |
 | `bin/learner-log-rag-eval --limit 50` | 실제 history replay drift |

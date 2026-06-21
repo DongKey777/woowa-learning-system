@@ -83,11 +83,26 @@ def _pick_top3(rag_hits: list[dict]) -> list[dict]:
     return out
 
 
+RERANK_GATE_TAU = 0.05  # raw dense top1-top2 cosine margin; <τ → session reranks
+
+
+def _rerank_gate(dense_margin: float | None) -> str:
+    """trust_top1 = session may trust dense top-1 (skip rerank reasoning, also
+    protected from rerank-breakage). rerank = low/unknown confidence → session
+    reorders top-K by the injected summaries. τ=0.05 (empirical: margin weakly
+    separates correct/wrong top-1, so gate is conservative — breakage protection
+    on the most confident, rerank otherwise)."""
+    if dense_margin is None:
+        return "rerank"
+    return "trust_top1" if dense_margin >= RERANK_GATE_TAU else "rerank"
+
+
 def _build_response_hints(
     route: RouteDecision,
     valid_hits: list[dict],
     downgrade_reason: str | None,
     reformulated_query: str | None,
+    dense_margin: float | None = None,
 ) -> dict:
     """Build the response_hints dict that the AI session pastes verbatim.
 
@@ -104,6 +119,8 @@ def _build_response_hints(
             "tier_downgrade": downgrade_reason or "tier_0_fallback",
             "fallback_disclaimer": FALLBACK_DISCLAIMER,
             "reformulated_query": reformulated_query,
+            "dense_margin": dense_margin,
+            "rerank_gate": _rerank_gate(dense_margin),
         }
     cids = [h["concept_id"] for h in valid_hits]
     trace = [
@@ -123,6 +140,8 @@ def _build_response_hints(
         "tier_downgrade": None,
         "fallback_disclaimer": None,
         "reformulated_query": reformulated_query,
+        "dense_margin": dense_margin,
+        "rerank_gate": _rerank_gate(dense_margin),
     }
 
 
@@ -237,8 +256,9 @@ def compose(
     markdown = "\n\n".join(p for p in parts if p)
 
     reformulated_query = (artifacts or {}).get("reformulated_query")
+    dense_margin = (artifacts or {}).get("rag_dense_margin")
     response_hints = _build_response_hints(
-        route, valid_hits, downgrade_reason, reformulated_query
+        route, valid_hits, downgrade_reason, reformulated_query, dense_margin
     )
     response_quality_hint = _build_response_quality_hint(
         source_event_id,
@@ -382,6 +402,10 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
             else:
                 parts.append(f"  - [{h.get('category')}] `{h.get('concept_id')}` — {h.get('title')} "
                              f"(score {h.get('score'):.3f}, src={h.get('source')})")
+                if h.get("summary"):
+                    parts.append(f"      ↳ {h['summary']}")
+                if h.get("body"):
+                    parts.append(f"      ↳본문: {h['body']}")
     return "\n".join(parts)
 
 
