@@ -56,8 +56,45 @@ def search(
     index_dir: Path = DEFAULT_INDEX_DIR,
     corpus_dir: Path = DEFAULT_CORPUS_DIR,
 ) -> list[SearchHit]:
+    """Backward-compatible thin shim — returns hits only (50+ callers unchanged)."""
+    return _search_impl(
+        query, top_k=top_k, relations_expand=relations_expand, rerank_fn=rerank_fn,
+        encode_fn=encode_fn, corpus=corpus, index_dir=index_dir, corpus_dir=corpus_dir,
+    )[0]
+
+
+def search_with_margin(
+    query: str,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    relations_expand: int = DEFAULT_RELATIONS_EXPAND,
+    rerank_fn: Callable[[str, list[SearchHit]], list[SearchHit]] | None = None,
+    encode_fn: Callable[[str], np.ndarray] | None = None,
+    corpus: LoadedCorpus | None = None,
+    index_dir: Path = DEFAULT_INDEX_DIR,
+    corpus_dir: Path = DEFAULT_CORPUS_DIR,
+) -> tuple[list[SearchHit], float | None]:
+    """Like search() but also returns the raw dense top1-top2 cosine margin
+    (None when no dense top-2 — exact/lexical/empty paths). Feeds rerank gating."""
+    return _search_impl(
+        query, top_k=top_k, relations_expand=relations_expand, rerank_fn=rerank_fn,
+        encode_fn=encode_fn, corpus=corpus, index_dir=index_dir, corpus_dir=corpus_dir,
+    )
+
+
+def _search_impl(
+    query: str,
+    *,
+    top_k: int,
+    relations_expand: int,
+    rerank_fn: Callable[[str, list[SearchHit]], list[SearchHit]] | None,
+    encode_fn: Callable[[str], np.ndarray] | None,
+    corpus: LoadedCorpus | None,
+    index_dir: Path,
+    corpus_dir: Path,
+) -> tuple[list[SearchHit], float | None]:
     if not query.strip():
-        return []
+        return [], None
 
     loaded_corpus = corpus
     exact_hits: list[SearchHit] = []
@@ -72,7 +109,7 @@ def search(
         if relations_expand > 0:
             assert loaded_corpus is not None
             shortcut_hits.extend(_walk_relations(shortcut_hits, loaded_corpus, relations_expand))
-        return shortcut_hits
+        return shortcut_hits, None  # exact shortcut → no dense margin (conservative=rerank)
 
     if (
         encode_fn is None
@@ -85,7 +122,7 @@ def search(
         if lexical_hits:
             if relations_expand > 0:
                 lexical_hits.extend(_walk_relations(lexical_hits, loaded_corpus, relations_expand))
-            return lexical_hits
+            return lexical_hits, None  # lexical fallback → no dense margin
 
     cache_key = None
     if encode_fn is None:
@@ -100,7 +137,8 @@ def search(
         )
         cached = _SEARCH_RESULT_CACHE.get(cache_key)
         if cached is not None:
-            return list(cached)
+            cached_hits, cached_margin = cached
+            return list(cached_hits), cached_margin
 
     if encode_fn is None:
         from rag.encoder import encode_query  # lazy ML import
@@ -125,6 +163,11 @@ def search(
             )
         )
 
+    # raw dense top1-top2 cosine margin — captured BEFORE relations/rerank
+    dense_margin = (
+        dense_hits[0].score - dense_hits[1].score if len(dense_hits) >= 2 else None
+    )
+
     if relations_expand > 0 and dense_hits:
         if loaded_corpus is None:
             loaded_corpus = _load_search_corpus(corpus_dir)
@@ -136,9 +179,9 @@ def search(
     if cache_key is not None:
         if len(_SEARCH_RESULT_CACHE) >= _SEARCH_CACHE_MAX:
             _SEARCH_RESULT_CACHE.pop(next(iter(_SEARCH_RESULT_CACHE)))
-        _SEARCH_RESULT_CACHE[cache_key] = tuple(dense_hits)
+        _SEARCH_RESULT_CACHE[cache_key] = (tuple(dense_hits), dense_margin)
 
-    return dense_hits
+    return dense_hits, dense_margin
 
 
 def _load_search_corpus(corpus_dir: Path) -> LoadedCorpus:

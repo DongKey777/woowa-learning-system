@@ -6,6 +6,7 @@ The daemon injects this as a rerank_fn when it wants lexical recall.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from bisect import bisect_left
@@ -505,9 +506,92 @@ def _is_unscoped_mission_bridge(query: str, concept_id: str) -> bool:
     return _is_comparison_query(query) and _is_mission_bridge_concept(concept_id) and not any(term in ql for term in _MISSION_SCOPE_TERMS)
 
 
+def _fusion_mode() -> tuple[str, float]:
+    """Fusion mode. Default 'cc' (min-max-normalized convex combination, α=0.92)
+    — drops the dense-top-1 hard pin so lexical can correct a wrong dense top-1.
+
+    α=0.92 is the daemon-validated optimum (golden 57/58 vs rrf 58/58 — the 1
+    residual is the kafka label artifact; eval_v2 T-C top1 +5pp/T-F +4pp, top-5
+    held). WOOWA_FUSION_MODE=rrf restores legacy dense-top-1-pinned weighted-RRF.
+    """
+    mode = os.environ.get("WOOWA_FUSION_MODE", "cc").strip().lower()
+    try:
+        alpha = float(os.environ.get("WOOWA_FUSION_ALPHA", "0.92"))
+    except ValueError:
+        alpha = 0.92
+    return mode, max(0.0, min(1.0, alpha))
+
+
+def _anchor_k() -> int:
+    """top-1 must come from dense top-K (lexical-only concepts can enrich 2-5 but
+    not seize top-1). K=5 blocks pure-lexical hijack of a correct dense top-1
+    while preserving every rescue (correct concept is always in dense top-5).
+    0 disables anchoring (pure CC). Only consulted in cc mode."""
+    try:
+        return max(0, int(os.environ.get("WOOWA_FUSION_ANCHOR_K", "5")))
+    except ValueError:
+        return 5
+
+
+def _minmax_norm(items: list[tuple[str, float]]) -> dict[str, float]:
+    if not items:
+        return {}
+    vals = [s for _, s in items]
+    lo, hi = min(vals), max(vals)
+    if hi <= lo:
+        return {cid: 1.0 for cid, _ in items}
+    return {cid: (s - lo) / (hi - lo) for cid, s in items}
+
+
+def _fuse_lexical_cc(
+    hits: list[SearchHit], lexical_hits: list[SearchHit], alpha: float
+) -> list[SearchHit]:
+    """Convex-combination fusion (no dense-top-1 pin).
+
+    score = alpha·denseNorm + (1-alpha)·lexicalNorm over min-max-normalized
+    per-modality scores. Unlike _fuse_lexical's weighted-RRF this does NOT pin
+    hits[0]; downstream _promote_exact_expected_query still re-pins true exact
+    matches, so exact-shortcut correctness is preserved.
+    """
+    dense_norm = _minmax_norm([(h.concept_id, h.score) for h in hits])
+    lex_norm = _minmax_norm([(h.concept_id, h.score) for h in lexical_hits])
+    by_id: dict[str, SearchHit] = {h.concept_id: h for h in hits}
+    for hit in lexical_hits:
+        by_id.setdefault(hit.concept_id, hit)
+    fused: list[SearchHit] = []
+    for cid, hit in by_id.items():
+        score = alpha * dense_norm.get(cid, 0.0) + (1.0 - alpha) * lex_norm.get(cid, 0.0)
+        if cid in dense_norm and cid in lex_norm:
+            source = "fusion"
+        elif cid in lex_norm:
+            source = "lexical"
+        else:
+            source = hit.source
+        fused.append(SearchHit(
+            concept_id=cid,
+            score=score,
+            category=hit.category,
+            title=hit.title,
+            source=source,
+        ))
+    fused.sort(key=lambda h: -h.score)
+    anchor_k = _anchor_k()
+    if anchor_k > 0 and fused:
+        dense_topk = {h.concept_id for h in hits[:anchor_k]}
+        if fused[0].concept_id not in dense_topk:
+            for idx, h in enumerate(fused):
+                if h.concept_id in dense_topk:
+                    fused = [fused[idx]] + fused[:idx] + fused[idx + 1:]
+                    break
+    return fused
+
+
 def _fuse_lexical(hits: list[SearchHit], lexical_hits: list[SearchHit]) -> list[SearchHit]:
     if not lexical_hits:
         return hits
+    mode, alpha = _fusion_mode()
+    if mode == "cc":
+        return _fuse_lexical_cc(hits, lexical_hits, alpha)
     head = hits[0] if hits else None
     by_id: dict[str, SearchHit] = {h.concept_id: h for h in hits}
     dense_rank = {h.concept_id: idx for idx, h in enumerate(hits, start=1)}

@@ -164,7 +164,7 @@ def test_rag_hits_personalized_on_active_path(tmp_path: Path) -> None:
         learner_id="dk",
         mastered_concepts=["spring/bean"],
     )
-    with patch("rag.search.search", return_value=_mock_hits()):
+    with patch("rag.search.search_with_margin", return_value=(_mock_hits(), 0.1)):
         out = load(
             _make_rag_route(),
             state_root=tmp_path,
@@ -186,7 +186,7 @@ def test_personalization_flag_off_keeps_raw_ranking(monkeypatch, tmp_path: Path)
         learner_id="dk",
         mastered_concepts=["spring/bean"],
     )
-    with patch("rag.search.search", return_value=_mock_hits()):
+    with patch("rag.search.search_with_margin", return_value=(_mock_hits(), 0.1)):
         out = load(
             _make_rag_route(),
             state_root=tmp_path,
@@ -204,7 +204,7 @@ def test_proficient_concepts_demote_like_mastered(tmp_path: Path) -> None:
         learner_id="dk",
         proficient_concepts=["spring/bean"],
     )
-    with patch("rag.search.search", return_value=_mock_hits()):
+    with patch("rag.search.search_with_margin", return_value=(_mock_hits(), 0.1)):
         out = load(
             _make_rag_route(),
             state_root=tmp_path,
@@ -216,3 +216,32 @@ def test_proficient_concepts_demote_like_mastered(tmp_path: Path) -> None:
     # W12: head (spring/bean) pinned; proficient treated as mastered (recorded).
     assert out["rag_hits"][0]["concept_id"] == "spring/bean"
     assert out["personalization"]["mastered_applied"] == ["spring/bean"]
+
+
+def test_hits_to_dicts_content_injection() -> None:
+    """Stage 1: with corpus → top-5 summary (bounded) + top-2 body; gate path
+    (no corpus) → unchanged 5 fields."""
+    from core.lazy_loader import _hits_to_dicts
+    corpus = SimpleNamespace(concepts={
+        f"c/{i}": {"summary": "개념 요약 문장입니다. " + "추가 설명 " * 80,
+                   "body_markdown": "본문 내용 " * 500}
+        for i in range(5)
+    })
+    hits = [SearchHit(f"c/{i}", 0.9 - i * 0.1, "cat", f"T{i}", "dense") for i in range(5)]
+    dicts = _hits_to_dicts(hits, corpus=corpus)
+    assert all("summary" in d for d in dicts)
+    assert all(len(d["summary"]) <= 260 for d in dicts)
+    assert sum(1 for d in dicts if "body" in d) == 2      # top-2 only
+    assert all(len(d.get("body", "")) <= 800 for d in dicts)
+    plain = _hits_to_dicts(hits)                          # gate path, no corpus
+    assert all(set(d) == {"concept_id", "score", "category", "title", "source"}
+               for d in plain)
+
+
+def test_rerank_gate_thresholds() -> None:
+    """Stage 2: margin gate τ=0.05, None=conservative rerank."""
+    from core.coach import _rerank_gate
+    assert _rerank_gate(None) == "rerank"
+    assert _rerank_gate(0.10) == "trust_top1"
+    assert _rerank_gate(0.05) == "trust_top1"
+    assert _rerank_gate(0.01) == "rerank"

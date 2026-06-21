@@ -113,6 +113,25 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/deep_scenarios_phase_p.p
 
 기대: 10/10 pass.
 
+### 2.7 Full-pipeline 4-arm eval (HyDE→CC→rerank, 세션-side)
+
+```bash
+WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_pipeline_eval.py
+```
+
+**전제**: daemon (CC 기본). 소요: ~1분 (521쿼리 × 2 daemon search). 출력: stdout + `tests/fixtures/full_pipeline_baseline.json`.
+
+**왜 필요한가 — 검증 방식의 핵심**: golden/eval_v2/cohort 게이트는 **raw 쿼리를 daemon `search` action에 넣어** 측정하므로 **CC fusion만** 본다. 검색 품질의 큰 레버인 **HyDE 쿼리재작성·세션 rerank·내용주입**은 세션(LLM) 행동/ask 경로라 그 게이트에 **안 잡힌다**. 이 벤치는 세션 행동을 **캐시 fixture**로 재현해 풀 파이프라인을 deterministic하게 측정한다:
+- `full_pipeline_hyde_v1.json` — concept-vocab HyDE 키워드(14-agent workflow 생성)
+- `full_pipeline_rerank_v1.json` — blind rerank 선택(7-agent workflow, qid→concept_id)
+- `full_pipeline_queries_v1.json` — 521 쿼리(T-C+T-F) + 정답 + dense stratum
+
+4-arm: arm0 raw+rrf(recorded) / arm1 raw+cc(게이트가 봄) / arm2 +HyDE / arm3 +rerank(full). gate = arm3 top1 회귀(>baseline−0.05) 시 FAIL.
+
+기대(v1): top1 arm0 0.484 → arm1 0.526 → arm2 0.768 → **arm3 0.860 (+38pp)**, top5 0.718→0.929.
+
+**Live refresh** (쿼리/코퍼스 변경 시 fixture 재생성, Claude 세션 필요): (1) tier 쿼리로 HyDE 생성 workflow(14-agent, concept-vocab 키워드), (2) HyDE 후보의 rerank-addressable에 blind rerank workflow(7-agent, breakage-guard), (3) 출력을 fixture로 저장. 절차는 reports/top1-top5-research/VERIFICATION-METHOD.md.
+
 ---
 
 ## 3. 한 번에 모두 (CI / release gate)
