@@ -164,10 +164,18 @@ def personalization_active() -> bool:
 
 
 def _mastered_like(profile: LearnerProfile | None) -> list[str]:
-    return [] if profile is None else (
-        list(profile.mastered_concepts)
-        + list(getattr(profile, "proficient_concepts", []))
-    )
+    """mastered + proficient, minus W7 self-declared-beginner. Subtracting the
+    beginner set here (mirrors daemon.py must_skip computation) makes the W7 flag
+    fully effective: a flagged concept is neither explanation-suppressed nor
+    retrieval-demoted, so an over-promoted basic stays surfaced + re-explained."""
+    if profile is None:
+        return []
+    beginner = set(getattr(profile, "self_declared_beginner_concepts", []) or [])
+    return [
+        c for c in (list(profile.mastered_concepts)
+                    + list(getattr(profile, "proficient_concepts", [])))
+        if c not in beginner
+    ]
 
 
 def _personalize_hits(

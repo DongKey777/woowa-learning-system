@@ -83,6 +83,29 @@ def _pick_top3(rag_hits: list[dict]) -> list[dict]:
     return out
 
 
+def _reorder_must_skip_by_relevance(must_skip, rag_hits):
+    """Order must_skip so concepts retrieved for THIS query come first.
+
+    The prompt cap (_user_section [:10]) otherwise keeps an arbitrary alphabetical
+    slice; relevance-first means the mastered basics OF the current topic survive
+    the cap instead of being dropped, so the session doesn't re-explain a concept
+    the learner already knows. No-op (same order) when ≤10 — the cap is inactive
+    and all are shown anyway, so the rendered prompt stays byte-identical — or when
+    no rag_hits carry concept_ids (no relevance signal). Stable within each group.
+    """
+    ms = list(must_skip or [])
+    if len(ms) <= 10:
+        return ms
+    rag_cids = {
+        h.get("concept_id")
+        for h in (rag_hits or [])
+        if isinstance(h, dict) and h.get("concept_id")
+    }
+    if not rag_cids:
+        return ms
+    return [c for c in ms if c in rag_cids] + [c for c in ms if c not in rag_cids]
+
+
 RERANK_GATE_TAU = 0.05  # raw dense top1-top2 cosine margin; <τ → session reranks
 
 
@@ -251,6 +274,14 @@ def compose(
     parts.append(_artifact_section(route, artifacts, repo))
     if recent_history:
         parts.append(_recent_history(recent_history))
+    if learner_context and learner_context.get("must_skip_explanations_of"):
+        # Relevance-order must_skip (only changes anything when >10) so the prompt
+        # cap keeps the query-relevant mastered concepts, not an alphabetical slice.
+        learner_context = {
+            **learner_context,
+            "must_skip_explanations_of": _reorder_must_skip_by_relevance(
+                learner_context["must_skip_explanations_of"], rag_hits),
+        }
     parts.append(_user_section(prompt, repo, learner_id, learner_context))
     parts.append(_answer_format(route, downgrade_reason))
     markdown = "\n\n".join(p for p in parts if p)

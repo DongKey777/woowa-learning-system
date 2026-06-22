@@ -97,7 +97,14 @@ def save_anchors(
         "anchor_count": len(anchors),
         "anchors": [asdict(a) for a in anchors],
     }
-    out.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+    serialized = json.dumps(body, ensure_ascii=False, indent=2)
+    # Skip the write when content is byte-identical so the file's mtime is
+    # preserved. Downstream cross-crew-build keys freshness on review_anchors.json
+    # mtime (not content), so an unconditional rewrite of unchanged anchors would
+    # bump the mtime and force a needless BGE-M3 re-embed every data-bearing sync.
+    if out.exists() and out.read_text(encoding="utf-8") == serialized:
+        return out
+    out.write_text(serialized, encoding="utf-8")
     return out
 
 

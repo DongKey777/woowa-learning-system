@@ -245,3 +245,18 @@ def test_rerank_gate_thresholds() -> None:
     assert _rerank_gate(0.10) == "trust_top1"
     assert _rerank_gate(0.05) == "trust_top1"
     assert _rerank_gate(0.01) == "rerank"
+
+
+def test_mastered_like_subtracts_beginner() -> None:
+    """P1 (W7): self-declared-beginner concepts are excluded from the
+    retrieval-demotion input, so a flagged over-promoted concept stays surfaced."""
+    from core.lazy_loader import _mastered_like
+    prof = SimpleNamespace(
+        mastered_concepts=["spring/x"],
+        proficient_concepts=["spring/bean-di-basics", "db/y"],
+        self_declared_beginner_concepts=["spring/bean-di-basics"],
+    )
+    out = _mastered_like(prof)
+    assert "spring/bean-di-basics" not in out   # flagged → not demoted
+    assert "spring/x" in out and "db/y" in out
+    assert _mastered_like(None) == []

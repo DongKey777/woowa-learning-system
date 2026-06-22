@@ -62,8 +62,9 @@ class DrillOffer:
     question: str
     expected_terms: list[str]
     source: str  # "expected_queries[0]" / "learner_query_patterns[0]" / fallback
-    created_at: float
-    ttl_turns: int = 5
+    created_at: float  # epoch; staleness/expiry is time-based via
+    # core.state.DRILL_PENDING_TTL_SECS (W8: a pending older than 24h is unlinked
+    # on load_pending_triggers, unblocking build_offer_if_due's one-open guard).
 
 
 @dataclass(frozen=True)

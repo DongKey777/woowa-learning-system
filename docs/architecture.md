@@ -88,7 +88,7 @@ Phase N9 측정: coaching mode markdown에 3 persona 모두 surface (MENTOR + RE
 ### Daemon integration (Phase K 핵심 fix)
 - 매 `bin/ask` turn → daemon이 `rag_ask` event를 `history.jsonl`에 append (mode/router_mode/top_concept_ids/latency_ms 포함)
 - 학습자 코드 작성/수정 turn → AI 세션이 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 호출 (`missions/<repo>/...` 경로에서 repo 자동 추론)
-- drill answer turn → `bin/learn-event --event-type drill_answer --score s --silent` 호출
+- drill answer turn → `bin/learn-event --event-type drill_answer --answer "<원문>" --silent` 호출 (자유텍스트 `--answer`가 pending drill을 4-dim 자동 채점; `--drill-score` 수동경로는 자동채점 우회)
 - 모든 이벤트가 `core/feedback.record_turn` → `core/mastery.promote` 자동 trigger
 
 ### 현재 상태

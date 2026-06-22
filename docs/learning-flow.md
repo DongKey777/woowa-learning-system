@@ -263,7 +263,7 @@ bin/pr-thread-status --repo spring-roomescape-waiting --pr 391 --silent
 **학습자**: 답변 작성 (예: *"Bean은 Spring 컨테이너가 관리하는 객체이고 DI로 협력 객체 받아…"*)
 
 **AI 세션 자동**:
-- `core/drill.score_pending_answer()` 호출 (또는 `bin/learn-event --event-type drill_answer --score 0.85 --silent`)
+- `core/drill.score_pending_answer()` 호출 (또는 `bin/learn-event --event-type drill_answer --answer "<원문>" --silent` — 자유텍스트가 자동 4-dim 채점. `--drill-score`는 수동경로로 자동채점 우회)
 - 4 dimension 채점 (accuracy/depth/practicality/completeness)
 - 결과를 학습자에게 한국어로 풀어서 보고:
 

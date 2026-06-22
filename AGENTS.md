@@ -220,7 +220,7 @@ python3 bin/ask "테스트"
 
 ### 4.4 Drill / Self-assessment
 - daemon 응답에 `drill_offer` artifact 포함 시 → question 학습자에게 surface
-- 답변 받으면 `bin/learn-event --event-type drill_answer --concept-ids <id> --score <s>` 자동 호출, 4-dim 결과 한국어로 보고
+- 답변 받으면 `bin/learn-event --event-type drill_answer --answer "<학습자 원문 답변>"` 자동 호출 — 자유텍스트 `--answer`가 pending drill을 4-dim 자동 채점(score_pending_answer). 결과 한국어로 보고. `--drill-score`(수동)는 자동채점 우회하니 금지
 - self-assessment는 `pending_self_assessment` trigger 있을 때만 인정. random *"DI 8점"* (no pending) → 거절 + cs_qa fallback
 
 ### 4.5 톤

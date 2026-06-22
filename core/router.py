@@ -333,10 +333,12 @@ def _f11_decision() -> RouteDecision:
 
 # Router modes the AI session may force via an explicit mode_override. f11_anchor
 # is built inline (route() fast-path), the rest flow through _from_intent's
-# mode-keyed dispatch. tier_0_fallback is intentionally excluded — it's a guard
-# outcome, never an intent the AI should select.
+# mode-keyed dispatch. tier_0_fallback AND tool_only are intentionally excluded —
+# both are non-intent outcomes (tier_0_fallback = a cosine guard result, tool_only
+# = a force-token detection), never an intent the AI should select. An explicit
+# --mode tool_only therefore defers to keyword routing (CLAUDE.md §4.2.2).
 _VALID_OVERRIDE_MODES = frozenset({
-    "tool_only", "cs_qa", "coaching", "drill", "retro", "self_assess",
+    "cs_qa", "coaching", "drill", "retro", "self_assess",
     "pr_diff_evolution", "cross_mission", "memory_review", "pr_review",
     "reviewer_profile", "learning_path", "pr_meta", "thread_recon", "temporal",
     "meta_analytics", "cohort", "predict", "f11_anchor",
