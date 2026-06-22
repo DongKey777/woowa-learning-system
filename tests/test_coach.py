@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.coach import compose
+from core.coach import _reorder_must_skip_by_relevance, compose
 from core.lazy_loader import load
 from core.router import (
     PERSONA_MENTOR,
@@ -131,3 +131,31 @@ def test_compose_surfaces_cognitive_trigger() -> None:
     assert "### cognitive_trigger" in prompt
     assert "self_assessment" in prompt
     assert "trigger_session_id: s1" in prompt
+
+
+def test_reorder_must_skip_noop_when_ten_or_fewer() -> None:
+    # ≤10 concepts: the prompt cap is inactive, so order must stay identical
+    # (guarantees byte-identical prompt for the current learner with 8).
+    ms = [f"c/concept-{i}" for i in range(8)]
+    hits = [{"concept_id": "c/concept-7"}]  # a relevant hit
+    assert _reorder_must_skip_by_relevance(ms, hits) == ms
+
+
+def test_reorder_must_skip_relevant_survives_cap_when_over_ten() -> None:
+    # A mastered concept relevant to THIS query but alphabetically last would be
+    # dropped by the [:10] cap; relevance-reorder must move it into the top 10.
+    ms = [f"a/concept-{i:02d}" for i in range(12)] + ["zzz/jpa-persistence"]
+    assert "zzz/jpa-persistence" not in ms[:10]  # alphabetical slice drops it
+    hits = [{"concept_id": "zzz/jpa-persistence"}]
+    reordered = _reorder_must_skip_by_relevance(ms, hits)
+    assert reordered[0] == "zzz/jpa-persistence"
+    assert "zzz/jpa-persistence" in reordered[:10]
+    # Stable: the non-relevant tail keeps its original order.
+    assert reordered[1:] == ms[:12]
+
+
+def test_reorder_must_skip_noop_without_rag_concept_ids() -> None:
+    # No relevance signal (cs_qa with no retrieval) → preserve current behavior.
+    ms = [f"a/concept-{i:02d}" for i in range(13)]
+    assert _reorder_must_skip_by_relevance(ms, []) == ms
+    assert _reorder_must_skip_by_relevance(ms, [{"no_cid": 1}]) == ms
