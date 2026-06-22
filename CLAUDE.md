@@ -273,7 +273,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 | pending self_assessment + 학습자가 점수 회신 | `bin/learn-self-assess --trigger-session-id <id> --score N --silent` |
 | drill 명시 발화 (*"확인 질문 풀자"*) | `bin/learn-drill {offer\|answer\|status\|cancel}` |
 | *"내 프로필 보여줘"*, *"학습 상태"* | `bin/learner-profile show` |
-| profile 재계산 (10 turn 마다) | `bin/learner-profile recompute --silent` |
+| profile 재계산 (10 turn 마다) | `bin/profile-recompute --silent` (`bin/learner-profile recompute`는 `--silent` 미수락) |
 | per-repo 선호 set | `bin/set-profile --repo <r> --field <f> --value <v>` |
 | global+repo profile 확인 | `bin/show-profile [--repo <r>]` |
 | 멘토 패턴 분석 | `bin/reviewer-profile --repo <r> --reviewer-login <l>` |
