@@ -281,7 +281,7 @@ bin/phase9-gate
 
 | Wrapper | Purpose | Bench |
 |---|---|---|
-| `bin/learn-pr-retro --repo R [--include-bot]` | PR retrospective: recurring mentor signals + unresolved threads + timeline | p50 1.2ms |
+| `bin/learn-pr-retro --repo R [--include-bot] [--no-write]` | PR retrospective: recurring mentor signals + unresolved threads + timeline. 기본은 스냅샷을 `pr_retrospective/<r>.json`에 저장하고, `--no-write`(또는 read-only인 `--live`)면 저장 skip | p50 1.2ms |
 | `bin/learn-record-code --file-path P --summary S` | code_attempt event + auto concept inference + repo inference from `missions/<r>/...` | p95 1.19ms (168× faster) |
 | `bin/learn-test --path build/test-results/test/` | JUnit XML → test_result events, stable event_id (idempotent) | p50 3.6ms (333× faster) |
 | `bin/learn-response-quality --source-event-id E --response-file -` / `--response-path answer.md` | full-response telemetry; path mode avoids transcript duplication, stdin is universal fallback, redacted full body + excerpt ≤5000 chars + summary/declared citation auto-extract; full body capture also marks matching pending capture `captured` | p95 0.16ms, drift 100%, PII 100% |
@@ -378,7 +378,7 @@ bin/phase9-gate
 | Wrapper | Purpose |
 |---|---|
 | `bin/pr-thread-status --repo R --pr N [--silent] [--no-snapshot]` | 라이브 3소스 정합 + GraphQL 상태 + 델타 + 라운드 타임라인. 미답변 스레드를 좌표(path/line/root body/diff_hunk)와 함께 surface. 스냅샷: `state/repos/<r>/pr_threads/<n>.json` |
-| `bin/learn-pr-retro --repo R --live` | 아카이브 회고의 stale "unresolved"를 라이브 status(answered/resolved/outdated)로 정정 |
+| `bin/learn-pr-retro --repo R --live [--no-write]` | 아카이브 회고의 stale "unresolved"를 라이브 status(answered/resolved/outdated)로 정정. `--live`는 read-only라 스냅샷(`pr_retrospective/<r>.json`)을 mutate하지 않는다(`pr-thread-status --no-snapshot` parity) |
 
 ### Bench totals (Phase T-X)
 

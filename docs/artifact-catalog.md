@@ -247,7 +247,7 @@ Mode B 측정 스크립트(`tests/benchmarks/*.py`, `bin/rag-eval`, `bin/cohort-
 | state/index/concepts.lance/ | `bin/corpus-build` 또는 release fetch | daemon search | corpus 변경 후 |
 | state/learner/history.jsonl | daemon ask 매 turn | recent_history + profile recompute | append-only |
 | state/learner/mastery_graph.sqlite | `core/feedback.record_turn` | profile.json compute | 매 evidence event |
-| state/learner/profile.json | `bin/profile-recompute` / `bin/learner-profile recompute` | router pending_triggers + 학습자 surface | history 누적 후 |
+| state/learner/profile.json | `bin/profile-recompute` / `bin/learner-profile recompute` | router pending_triggers + 학습자 surface | history 누적 후 + `bin/sync-prs` refresh(evidence-sync 직후 재투영) |
 | state/learner/review_anchors.json | `anchors/extract.py` | F11 매칭 source | repo sync 후 optional |
 | state/repos/<repo>/mission_patterns.json | `bin/mission-patterns-build` | coaching prompt | 학습자 신규 PR 후 |
 | state/repos/<repo>/cross_crew_review_graph.parquet | `bin/cross-crew-build` | F11 prompt | anchors 갱신 후 |

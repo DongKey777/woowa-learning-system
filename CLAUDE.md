@@ -214,6 +214,7 @@ bin/sync-prs --repo <r> --owner woowacourse
   → 2. (자동) mission-patterns-build refresh
   → 3. (자동) anchors-build refresh (학습자 own threads 추가)
   → 4. (자동) cross-crew-build refresh (anchors × cohort 다시 매칭)
+  → 5. (자동) profile-recompute (evidence-sync로 승급된 mastery를 profile.json에 즉시 재투영 — 다음 10-turn recompute까지 stale 방지)
 ```
 
 woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 생성을 단독으로 처리한다. 학습자 외울 명령은 0개다.
@@ -303,7 +304,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 ### 5.1 모든 작업
 - `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령 (또는 개별 `bin/ask` 호출에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨된다.
 - 변경은 commit 기반 reproducible. 측정 결과는 로컬 `reports/`에 저장 (gitignored — public clone에 안 들어감). 헤드라인 metric은 `docs/verification-results.md`에 inline로 정리한다.
-- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 696 passed 유지.
+- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 745 passed 유지.
 
 ### 5.2 측정 명령
 ```bash

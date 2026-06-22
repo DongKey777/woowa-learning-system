@@ -7,20 +7,21 @@ cd /Users/idonghun/IdeaProjects/woowa-learning-system
 python3 -m pytest tests/ -q
 ```
 
-현재 **696 passed**.
+현재 **745 passed**.
 
 주요 test 모듈:
 - `test_router.py` — router decision (force-token override, AI 세션 mode override, f11 fast-path, 키워드 dispatch, cs_qa guard)
 - `test_intent_prompt.py` / `test_phase8_intent_dispatch.py` — intent classification
 - `test_drill.py` — 12 drill tests (offer/scoring/spaced repetition)
 - `test_lazy_loader.py` — artifact loading
-- `test_coach.py` — multi-agent prompt composition
+- `test_coach.py` — multi-agent prompt composition (must_skip 질문 관련도 재정렬 포함)
+- `test_ask_render.py` — 세션 노출 stdout slimming (warm daemon `_render_ask_stdout` ↔ cold `bin/ask`가 동일 `SESSION_HINT_KEYS` subset으로 축소; citation 배열 drop parity)
 - `test_mastery.py` / `test_feedback.py` — Bloom autoloop
 - `test_search.py` / `test_anchors.py` / `test_mission.py` — RAG / anchors / F10 forward
 - `test_peer_pr.py` — peer PR analysis
 - `test_phase8_code_metrics.py` — LOC budget + entry point count
 
-회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 696 passed 유지 확인. fresh dev 환경에서는 먼저 `bin/setup --dev`로 pytest/pandas/pylance 포함 dev extra를 설치한다.
+회귀 검증: 모든 코드 변경 후 `pytest` 실행하여 745 passed 유지 확인. fresh dev 환경에서는 먼저 `bin/setup --dev`로 pytest/pandas/pylance 포함 dev extra를 설치한다.
 
 ---
 
@@ -232,5 +233,5 @@ sqlite3 state/learner/mastery_graph.sqlite \
 기대:
 - ping: `{"alive": true}`
 - ask: `[Mode: cs_qa]` markdown 응답
-- pytest: `696 passed`
+- pytest: `745 passed`
 - mastery: reset 직후는 empty 가능, 실제 learning/code/drill event 누적 후 attempted/proficient/mastered가 생김

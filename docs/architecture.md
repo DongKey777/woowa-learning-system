@@ -158,6 +158,8 @@ Phase L 측정:
     - **margin 노출** (`rag/search.py:search_with_margin`): dense top1-top2 raw cosine margin → `response_hints.rerank_gate`(τ=0.05). `search()`는 shim(50+ caller 불변).
     - **내용주입** (`core/lazy_loader.py:_hits_to_dicts(corpus)`): ask 경로 rag_hits에 top-5 summary(문장경계 250)+top-2 body(800) 주입 → 세션이 추가 패스 없이 rerank+답변(환각↓). 게이트 경로(search action, corpus 미주입)는 5필드 불변.
     - **세션 지시** (CLAUDE.md §4.2): positional 쿼리를 concept-vocab HyDE 키워드로 확장(absent recall 회복); `rerank_gate`로 margin-gated rerank(저margin만 top-5 의미 재정렬, answer-gen에 fold, breakage-guard). 추가 LLM 패스 0.
+    - **세션 출력 slim** (`core/ask_render.py`): warm/cold ask 텍스트 출력은 `session_response_hints`가 `SESSION_HINT_KEYS`(citation_markdown·rerank_gate·dense_margin·reformulated_query·tier_downgrade·fallback_disclaimer) allow-list로 추려 세션이 실제 쓰는 hint만 노출. 병렬 citation 배열(`citation_paths`/`_concept_ids`/`_trace`)+풀 `response_quality_hint`는 `--json`/transcript에만. daemon(`_render_ask_stdout`)·`bin/ask`(warm)·`bin/ask`(cold `--no-daemon`) 세 경로가 같은 헬퍼를 써 drift 차단(매 학습턴 ~800토큰 절감).
+    - **must_skip 관련도 재정렬** (`core/coach.py:_reorder_must_skip_by_relevance`): 프롬프트 must_skip cap을 알파벳순이 아니라 현재 질문 rag_hits.concept_id 관련도순으로 정렬(>10 개념 학습자에서 관련 마스터 개념이 cap에 살아남게). ≤10이면 no-op(byte-identical).
     - 풀 파이프라인 측정: `tests/benchmarks/full_pipeline_eval.py` (4-arm, fixture로 HyDE/rerank 재현). v1: top1 0.484→0.860(+38pp), top5 0.718→0.929.
   - warm socket p50/p95: **4.1ms / 6.3ms**
   - warm CLI p50/p95: **43.9ms / 47.6ms**
