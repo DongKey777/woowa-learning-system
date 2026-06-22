@@ -98,7 +98,7 @@ bin/learn-event --event-type <type> [--concept-ids id1,id2] [--score 0.85] [--mo
 
 event-type:
 - `code_attempt` — 학습자 미션 파일 수정/생성. `--concept-ids` 필수 (mission_patterns에서 추출 가능)
-- `drill_answer` — drill 답변. `--concept-ids` + `--score` (0..1) 필수
+- `drill_answer` — drill 답변. **`--answer "<원문>"`** (자유텍스트 → pending drill 4-dim 자동 채점, score_pending_answer). `--drill-concept`+`--drill-score`는 수동 점수 경로(자동채점 우회, 권장 X)
 - `self_assessment` — 학습자 자기 평가 (pending_self_assessment trigger 있을 때만)
 - `pr_merge` — PR merge 알림. `--concept-ids` 필수 (1.0 weight)
 - `mentor_accept` — mentor 리뷰 thread resolved. `--concept-ids` 필수 (0.9 weight)

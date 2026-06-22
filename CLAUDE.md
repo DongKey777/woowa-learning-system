@@ -179,8 +179,8 @@ python3 bin/ask "테스트"
 `missions/<repo>/...` 경로에서는 repo를 자동 추론한다. "코드 어때?" 단독은 트리거하지 않음 (파일 path 불명확).
 
 ### 4.4 Drill / Self-assessment
-- daemon `ask`가 drill mode dispatch + `drill_offer` artifact 포함 시 → 학습자에게 question surface.
-- 학습자 답변 받으면 자동 `bin/learn-event --event-type drill_answer --concept-ids <id> --score <s>` 호출. 4-dimension 채점 결과 학습자에게 한국어로 풀어서 보고.
+- daemon `ask`가 drill mode dispatch + `drill_offer` artifact 포함 시 → 학습자에게 question surface. drill_offer를 surface했으면 **다음 학습자 발화에서 반드시 answer 커맨드를 호출**(이 연결이 빠지면 채점 루프가 완주 안 됨).
+- 학습자 답변 받으면 자동 `bin/learn-event --event-type drill_answer --answer "<학습자 원문 답변>"` 호출 — 자유텍스트 `--answer`가 pending drill을 **4-dimension 자동 채점**(`score_pending_answer`)한다. 채점 결과를 학습자에게 한국어로 풀어서 보고. ⚠ `--drill-score`(수동 점수)는 자동 채점을 우회하므로 쓰지 말 것. (`bin/learn-drill answer --answer "..."`도 동등.)
 - self-assessment는 `pending_self_assessment` trigger가 있을 때만 인정. 학습자 random *"DI 8점"* (pending 없음) → 정중히 거절 + cs_qa 모드로 fallback.
 
 ### 4.5 응답 톤
