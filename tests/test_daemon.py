@@ -100,7 +100,13 @@ def test_render_ask_stdout_matches_cli_text_shape() -> None:
         "budget": 4500,
         "personas": ["mentor"],
         "reason": "unit",
-        "response_hints": {"citation_paths": ["spring/bean"]},
+        # Mix of a session-facing key (citation_markdown) and telemetry-only keys
+        # (citation_paths / citation_trace) the warm path must now slim away.
+        "response_hints": {
+            "citation_markdown": "참고:\n- spring/bean",
+            "citation_paths": ["spring/bean"],
+            "citation_trace": [{"id": "bean", "score": 0.9}],
+        },
         "response_quality_hint": {"source_event_id": "ask-1"},
     }, json_route=True)
 
@@ -108,6 +114,10 @@ def test_render_ask_stdout_matches_cli_text_shape() -> None:
     assert "# response_hints: " in text
     assert "# response_quality_hint: " in text
     assert text.endswith("# prompt\n")
+    # The warm path slims to the session subset — telemetry arrays must not leak.
+    assert "citation_markdown" in text
+    assert "citation_paths" not in text
+    assert "citation_trace" not in text
 
 
 def test_module_exports() -> None:

@@ -117,6 +117,11 @@ def ask(
         return None
 
 def _render_ask_stdout(resp: dict, json_route: bool = False) -> str:
+    # Slim to the session-facing subset (shared with bin/ask via core.ask_render)
+    # — the parallel citation arrays + full quality hint are telemetry and stay
+    # in --json / the Stop-hook transcript, not in what the session re-reads.
+    from core.ask_render import session_quality_hint, session_response_hints
+
     lines: list[str] = []
     if json_route:
         lines.append("# RouteDecision: " + json.dumps({
@@ -125,10 +130,10 @@ def _render_ask_stdout(resp: dict, json_route: bool = False) -> str:
             "budget_tokens": resp.get("budget"),
             "reason": resp.get("reason"),
         }, ensure_ascii=False))
-    hints = resp.get("response_hints")
+    hints = session_response_hints(resp.get("response_hints"))
     if hints:
         lines.append("# response_hints: " + json.dumps(hints, ensure_ascii=False))
-    rq_hint = resp.get("response_quality_hint")
+    rq_hint = session_quality_hint(resp.get("response_quality_hint"))
     if rq_hint:
         lines.append("# response_quality_hint: " + json.dumps(rq_hint, ensure_ascii=False))
     lines.append(resp["markdown"])
