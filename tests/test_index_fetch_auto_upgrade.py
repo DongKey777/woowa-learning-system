@@ -39,6 +39,25 @@ def test_needs_auto_upgrade_on_release_drift() -> None:
     assert f("", latest, True) is False             # empty tag → protected
 
 
+def test_needs_auto_upgrade_never_downgrades() -> None:
+    # Regression: a stale DEFAULT_TAG must not pull a newer installed index
+    # backwards. Comparison is by parsed version, not string inequality.
+    f = index_fetch._needs_auto_upgrade
+    newer = "paradigm-v2-index-v1.0.5"
+    stale_target = "paradigm-v2-index-v1.0.3"
+    assert f(newer, stale_target, True) is False     # newer installed → no downgrade
+    assert f(stale_target, newer, True) is True      # genuinely older → upgrade
+
+
+def test_tag_version_parses_index_suffix() -> None:
+    v = index_fetch._tag_version
+    assert v("paradigm-v2-index-v1.0.5") == (1, 0, 5)
+    assert v("paradigm-v2-index-v1.0.10") > v("paradigm-v2-index-v1.0.9")
+    assert v(None) is None
+    assert v("") is None
+    assert v("no-version-here") is None
+
+
 def test_manifest_release_tag_reads_field(tmp_path: Path) -> None:
     mf = tmp_path / "manifest.json"
     mf.write_text(json.dumps({"release_tag": "paradigm-v2-index-v1.0.3"}),

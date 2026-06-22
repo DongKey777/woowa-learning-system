@@ -4,7 +4,7 @@
 학습자 기기에서 로컬 인덱스 빌드는 절대 금지 (M4 15-30분 + 4-6GB RAM).
 Maintainer가 RunPod 등에서 빌드 후 publish한 release artifact만 사용.
 
-Default tag: paradigm-v2-index-v1.0.3
+Default tag: paradigm-v2-index-v1.0.5
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -20,7 +21,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-DEFAULT_TAG = "paradigm-v2-index-v1.0.3"
+DEFAULT_TAG = "paradigm-v2-index-v1.0.5"
 # Per-release tarball SHA256 (integrity check). Add one entry per published release.
 # Asset name convention is "<tag>.tar.zst"; --pattern derives from --tag when omitted.
 KNOWN_SHA256 = {
@@ -82,14 +83,42 @@ def _manifest_release_tag(path: Path) -> str | None:
         return None
 
 
+def _tag_version(tag: str | None) -> tuple[int, ...] | None:
+    """Parse the trailing vN.N.N of a release tag into a comparable int tuple.
+
+    'paradigm-v2-index-v1.0.5' → (1, 0, 5). The leading 'v2' (paradigm schema
+    version) is ignored; only the last v<digits> group is the index version.
+    Returns None when no numeric version is present (unparseable / local build).
+    """
+    if not tag:
+        return None
+    matches = re.findall(r"v(\d+(?:\.\d+)*)", tag)
+    if not matches:
+        return None
+    try:
+        return tuple(int(p) for p in matches[-1].split("."))
+    except ValueError:
+        return None
+
+
 def _needs_auto_upgrade(installed_tag: str | None, target_tag: str,
                         auto_upgrade: bool) -> bool:
-    """Re-fetch only when an installed *released* index is older than target.
+    """Re-fetch only when an installed *released* index is strictly older than
+    target — never on a newer-installed index (that would silently downgrade).
 
-    A locally-built index has no release_tag (only sync-index-metadata sets it),
+    Compares the parsed vN.N.N index version rather than raw string equality:
+    an installed v1.0.5 against a stale target v1.0.3 must NOT "upgrade". A
+    locally-built index has no release_tag (only sync-index-metadata sets it),
     so installed_tag=None never triggers an upgrade — protects maintainer builds.
+    Unparseable tags are treated conservatively (no upgrade).
     """
-    return bool(auto_upgrade and installed_tag and installed_tag != target_tag)
+    if not (auto_upgrade and installed_tag):
+        return False
+    installed_ver = _tag_version(installed_tag)
+    target_ver = _tag_version(target_tag)
+    if installed_ver is None or target_ver is None:
+        return False
+    return installed_ver < target_ver
 
 
 def main(argv: list[str] | None = None) -> int:
