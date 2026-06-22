@@ -84,7 +84,7 @@ macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라
 
 ### Step 2 — HuggingFace 모델 캐시 warm-up
 
-첫 daemon 시작 시 `BAAI/bge-m3` (~3GB) + reranker 자동 다운로드.
+첫 daemon 시작 시 `BAAI/bge-m3` (~3GB, dense 인코더)만 자동 다운로드한다. cross-encoder reranker(`bge-reranker-v2-m3`)는 라이브 ask 파이프라인에 없어 받지 않는다 — 라이브 경로는 CC fusion + 세션 rerank를 쓴다(`rag/reranker.py`는 lazy-load 모듈이지만 `collect_cs_qa_context`/테스트에서만 호출, daemon 미경유).
 
 ```bash
 # 사전 캐시하려면
