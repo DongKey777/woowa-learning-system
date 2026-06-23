@@ -27,6 +27,14 @@ REPAIR_BODY_DIR = "capture-repair-bodies"
 # existing supersede window and leaves wide margin over the genuine latency.
 STALE_PENDING_AGE_S = 900.0
 
+# A pending whose status is terminal is a redundant tracking record (the captured
+# answer lives in response-quality.jsonl). They were never deleted, so the dir
+# grew without bound and every hook re-globbed + re-parsed all of them. Delete
+# terminal files older than this retention (a grace window for late consumers).
+TERMINAL_PENDING_STATUSES = frozenset({
+    "captured", "superseded_by_later_capture", "expired_orphan"})
+TERMINAL_PENDING_RETENTION_S = 86400.0  # 1 day
+
 
 def is_internal_capture_meta_prompt(prompt: str | None) -> bool:
     """Return True for prompts whose only purpose is finding a source id."""
@@ -191,6 +199,40 @@ def expire_stale_pending_captures(
         _atomic_write_json(path, row)
         expired += 1
     return expired
+
+
+def compact_terminal_pending_captures(
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+    retention_s: float = TERMINAL_PENDING_RETENTION_S,
+) -> int:
+    """Delete terminal pending-capture files older than ``retention_s``.
+
+    Once a pending is captured/superseded/expired its file is a redundant
+    tracking record — the answer lives in response-quality.jsonl, and
+    latest_pending_capture/expire/supersede already skip terminal statuses. They
+    were never removed, so the directory grew without bound and every hook
+    re-globbed + re-parsed all of them. Bounds the pool. Returns the count removed.
+    """
+    root = pending_capture_dir(state_root)
+    if not root.exists():
+        return 0
+    cutoff = time.time() - retention_s
+    removed = 0
+    for path in root.glob("*.json"):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if row.get("status") not in TERMINAL_PENDING_STATUSES:
+            continue
+        age_ts = float(row.get("updated_at") or row.get("captured_at")
+                       or row.get("created_at") or 0.0)
+        if age_ts >= cutoff:
+            continue
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
 
 
 def update_pending_capture(
@@ -467,6 +509,7 @@ def capture_from_hook_payload(
     # attach to a pending whose own turn never produced a learner answer.
     if not source_event_id:
         expire_stale_pending_captures(state_root=state_root)
+        compact_terminal_pending_captures(state_root=state_root)
     pending = (
         load_pending_capture(source_event_id, state_root=state_root)
         if source_event_id else latest_pending_capture(state_root=state_root)
@@ -735,12 +778,45 @@ def drain_repair_queue(
                 drain_errors += 1
                 continue
 
+    # Compaction: drop rows drain can never action — write-only
+    # ignored_non_learning diagnostics (90%+ of the queue) and pending_repair rows
+    # with no source_event_id (structurally unrepairable). They re-parsed on every
+    # hook and only grew. Re-read first (the apply loop may have appended markers),
+    # keep repair-relevant + unparseable rows, rewrite atomically. Best-effort.
+    compacted = 0
+    if apply:
+        try:
+            kept_lines: list[str] = []
+            for line in queue_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    kept_lines.append(line)
+                    continue
+                status = d.get("status") if isinstance(d, dict) else None
+                if status == "ignored_non_learning" or (
+                    status == "pending_repair" and not d.get("source_event_id")
+                ):
+                    compacted += 1
+                    continue
+                kept_lines.append(line)
+            if compacted:
+                tmp = queue_path.with_suffix(".jsonl.compact-tmp")
+                tmp.write_text(
+                    "".join(s + "\n" for s in kept_lines), encoding="utf-8")
+                tmp.replace(queue_path)
+        except OSError:
+            pass
+
     return {
         "scanned": len(rows),
         "repairable": len(repairable),
         "applied": applied,
         "unrecoverable": unrecoverable,
         "drain_errors": drain_errors,
+        "compacted": compacted,
     }
 
 
