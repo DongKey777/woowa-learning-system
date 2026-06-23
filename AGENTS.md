@@ -209,7 +209,7 @@ python3 bin/ask "테스트"
 
 ### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
 
-발화가 2개 이상 독립 주제면 주제별로 분해한다(한 벡터에 여러 주제 = dense 평균화로 모든 인텐트에서 어중간). 1순위는 단일 `bin/ask` + `--reformulated-query`(추가 pending capture 없음). sub-ask로 N번 쪼개면 pending capture N개가 생기고 Stop hook은 최신 1개만 연결하므로 `bin/capture-repair --sync-pending`으로 정합한다. `--raw-utterance`는 한 호출에만(중복 = raw→rewritten 쌍 오염). 개념 부재 기인 미스는 분해로 못 고치며 코퍼스 과제다.
+발화가 2개 이상 독립 주제면 **주제별 `bin/ask`를 N회 따로 호출**한다(쿼리 1개→벡터 1개, `rag/search.py` `q_vec = encode_fn(query)`). 한 문자열에 여러 주제를 섞으면 dense 평균화로 어휘 센 주제가 벡터를 점령하고 나머지 sub-intent gold가 top-5 밖 탈락한다(실측 per-sub-intent recall@5 53%→분해 100%, +47pp). `--reformulated-query` 단일 호출도 `retrieval_query`로 합쳐져 한 벡터가 되므로 이 희석을 못 막는다 — 1순위가 될 수 없다. sub-ask N회면 pending capture N개·Stop hook은 최신 1개만 연결하므로 직후 `bin/capture-repair --sync-pending`로 정합한다(분해의 정상 비용). N회 결과는 한 답변에 주제별 섹션으로 합쳐 모든 sub-intent를 corpus 근거로 커버(주제 간 근거 섞기 금지). `--raw-utterance`는 첫 호출 한 번에만(중복 = raw→rewritten 쌍 오염). **False-positive 가드**: 번호/옵션 나열 단일주제(락 전략 3개, DI 3가지)는 분해 금지 — 정답 개념이 다른 클러스터에 흩어지는 진짜 2+ 주제만 분해, 모호하면 단일 검색(보수적 안전). 개념 부재 기인 미스는 분해로 못 고치며 코퍼스 과제다.
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:

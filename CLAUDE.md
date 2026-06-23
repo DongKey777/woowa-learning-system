@@ -166,10 +166,14 @@ python3 bin/ask "테스트"
 
 ### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
 
-발화가 **2개 이상 독립 주제**를 담으면(예: "서블릿 응답 + 자동구성 + WAS") 주제별로 분해해 검색 적중을 높인다 — 한 벡터에 여러 주제를 섞으면 dense가 평균화돼 모든 인텐트에서 어중간해진다(실측: 풀 쿼리 미스, sub-쿼리 단독은 적중).
-- **1순위**: 단일 `bin/ask` 호출에 `--reformulated-query`로 주제별 재작성을 넘긴다(추가 pending capture 없음 — 텔레메트리 정합 유지).
-- 굳이 sub-ask로 N번 쪼개면 pending capture가 N개 생기고 Stop hook은 최신 1개에만 연결되므로, 후속으로 `bin/capture-repair --sync-pending`을 돌려 stale pending을 정합한다.
-- `--raw-utterance`는 **한 호출에만** 넘긴다(중복 전달 시 raw→rewritten 쌍 오염 — 'Verify raw source' 정책). 개념 부재 기인 미스("WAS와 웹서버 차이" 단독 무관 1위)는 분해로 못 고치며 코퍼스 확장 과제다(분리 인식).
+발화가 **2개 이상 독립 주제**를 담으면(예: "서블릿 응답 어디로 + 스프링부트 톰캣 자동 + WAS vs 웹서버") 주제별로 따로 검색해야 모든 주제가 답변에 살아남는다. retrieval은 쿼리 한 개당 벡터 한 개라(`rag/search.py`: `q_vec = encode_fn(query)` — 쿼리 1개 → 임베딩 1개), 여러 주제를 한 문자열에 섞으면 dense가 평균화되면서 어휘가 센 한 주제로 벡터가 쏠리고 나머지 sub-intent의 정답 문서가 top-5 밖으로 탈락한다. 그러면 그 주제는 근거가 안 잡혀 답변에서 통째로 빠지거나(missing) 근거 없이 얼버무리게 된다(hand-wave). 실측: per-sub-intent recall@5가 합친 단일벡터 53% → 주제별 분해 100%(+47pp). mi-06("@Repository 빈 등록 + 인터페이스 구현체 교체")은 단일벡터가 인터페이스/DIP 쪽으로 hijack돼 빈 등록 메커니즘 문서가 전부 탈락(combined recall 0.0), mi-02의 E2E 테스트비용 gold는 트랜잭션 어휘에 밀려 combined top-15 밖으로 도달 불가였다.
+
+- **정공법(진짜 2+ 독립주제): 주제별 `bin/ask`를 N회 따로 호출**한다. 각 호출의 positional에 그 주제만 담은 재작성 쿼리를 넣어 주제마다 독립 벡터로 검색해야 hijack을 피한다. `--reformulated-query` 한 번에 모든 주제를 욱여넣는 단일 호출로는 이 희석을 못 막는다 — 그 인자도 결국 한 문자열(`retrieval_query`)로 합쳐져 벡터 하나가 되므로 합친 단일벡터와 똑같이 약한 주제가 탈락한다.
+- **텔레메트리 정합**: sub-ask를 N회 하면 pending capture가 N개 생기고 Stop hook은 가장 최근 1개에만 최종 답변을 연결한다. 그래서 sub-ask 묶음 직후 `bin/capture-repair --sync-pending`을 한 번 돌려 stale pending을 `response-quality.jsonl` 기준으로 재동기화한다. 이건 분해의 정상 비용이지 회피 사유가 아니다 — 답변 완전성이 우선이다.
+- **답변 종합**: N회 검색 결과를 따로따로 surface하지 말고, 한 답변 안에서 주제별 섹션으로 합쳐 모든 sub-intent를 corpus 근거로 커버한다. 각 주제는 자기 검색에서 잡힌 concept만 인용한다(주제 간 근거 섞기 금지).
+- `--raw-utterance`는 **첫 호출 한 번에만** 학습자 원문 발화를 넘긴다(여러 sub-ask에 중복 전달하면 raw→rewritten 쌍이 오염 — 'Verify raw source' 정책). 개념 부재 기인 미스("WAS와 웹서버 차이" 단독인데 무관 1위)는 분해로 못 고치고 코퍼스 확장 과제다(원인 분리 인식).
+
+**False-positive 가드 — 단일 주제는 분해 금지.** 한 주제를 번호나 옵션으로 나열한 것(예: "락 전략 행잠금/게이트락/토큰 중 뭐 먼저", "DI 방식 3가지 비교")은 주제가 하나라 그대로 단일 검색한다. 분해는 서로 독립적이고 정답 개념이 다른 클러스터에 있는 진짜 2+ 주제일 때만 한다(예: 빈 등록 메커니즘 vs 구현체 교체 DIP, 트랜잭션 격리 vs E2E 테스트비용). 판정은 표면 기호('+', 번호)가 아니라 정답 개념이 정말 다른 클러스터에 흩어지는지로 한다 — 모호하면 분해하지 않는다(단일 검색이 보수적으로 안전). 단일 주제 발화와 직전 turn을 가리키는 anaphora("그거 더 설명해줘")는 종전대로 세션-HyDE 단일 호출로 처리한다.
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 조건 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
