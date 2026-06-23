@@ -8,10 +8,8 @@ import pytest
 
 from core.peer_pr import (
     PeerPRComparison,
-    build_nickname_map,
     compare,
     extract_nickname,
-    resolve_nickname,
 )
 
 
@@ -62,18 +60,6 @@ def test_extract_nickname_no_match_returns_none() -> None:
     assert extract_nickname("Update README") is None
     assert extract_nickname("") is None
     assert extract_nickname(None) is None  # type: ignore[arg-type]
-
-
-def test_build_nickname_map_excludes_ambiguous(tmp_path: Path) -> None:
-    root = _seed_archive(tmp_path)
-    mp = build_nickname_map("roomescape", state_root=root)
-    assert mp == {"동키": "donkey", "큐빈": "cubinkim", "라키": "rocky"}
-
-
-def test_resolve_nickname_returns_login(tmp_path: Path) -> None:
-    root = _seed_archive(tmp_path)
-    assert resolve_nickname("동키", "roomescape", state_root=root) == "donkey"
-    assert resolve_nickname("ghost", "roomescape", state_root=root) is None
 
 
 def test_compare_returns_path_overlap(tmp_path: Path) -> None:

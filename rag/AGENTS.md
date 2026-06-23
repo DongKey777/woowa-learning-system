@@ -16,7 +16,7 @@
 | Embeddings | `encoder.py` | BGE-M3 via transformers/sentence-transformers |
 | Index build/load | `index.py` | Lance tables, drift checks, reports |
 | Search | `search.py` | exact shortcut, fallback, cached query path |
-| Personalization | `personalization.py`, `lexical.py`, `reranker.py` | post-retrieval ranking adjustments |
+| Personalization | `personalization.py`, `lexical.py` | post-retrieval ranking adjustments |
 | Evaluation | `eval.py` | judge prompt and ranking metrics |
 
 ## Conventions
