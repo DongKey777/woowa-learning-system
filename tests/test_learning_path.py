@@ -174,3 +174,15 @@ def test_save_round_trip_and_key_parity(tmp_path: Path, monkeypatch) -> None:
     assert loaded["learner_login"] == LEARNER
     assert loaded["mastery_distribution"]["proficient"] == 2
     assert loaded["mastery_distribution"]["total"] == 3
+
+
+def test_unmet_prereqs_only_reference_surfaced_candidates(tmp_path: Path, monkeypatch) -> None:
+    # unmet must not reference a concept truncated out of next_concepts (dangling
+    # recommendation). Invariant holds regardless of corpus size.
+    from core.identity import resolve_learner_login
+    learner = resolve_learner_login(tmp_path, explicit="DongKey777")
+    record_evidence("spring/bean-di-basics", "mission_use", state_root=tmp_path)
+    rep = analyze(learner, tmp_path)
+    surfaced = {c["concept_id"] for c in rep.get("next_concepts", [])}
+    for u in rep.get("unmet_prereqs", []):
+        assert u["concept_id"] in surfaced

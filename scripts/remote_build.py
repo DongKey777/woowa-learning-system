@@ -148,13 +148,19 @@ def run(
     pod_id = pod["id"]
     print(f"[runpod] pod created: {pod_id}")
 
+    _terminated = {"done": False}
+
     def _terminate(signum=None, frame=None):
-        if not keep_pod:
-            try:
-                runpod.terminate_pod(pod_id)
-                print(f"[runpod] terminated pod {pod_id}")
-            except Exception as exc:
-                print(f"[runpod] terminate failed: {exc}", file=sys.stderr)
+        # Registered as the SIGINT/SIGTERM handler AND called from finally, so a
+        # signal would terminate the pod twice. Guard it idempotent.
+        if not _terminated["done"]:
+            _terminated["done"] = True
+            if not keep_pod:
+                try:
+                    runpod.terminate_pod(pod_id)
+                    print(f"[runpod] terminated pod {pod_id}")
+                except Exception as exc:
+                    print(f"[runpod] terminate failed: {exc}", file=sys.stderr)
         if signum is not None:
             sys.exit(130)
 

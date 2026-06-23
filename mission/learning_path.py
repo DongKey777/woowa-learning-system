@@ -151,7 +151,11 @@ def analyze(learner_login: str = "DongKey777",
     next_concepts.sort(
         key=lambda c: (0 if c["ready"] else 1, -c["prereqs_met"], c["concept_id"]))
     next_concepts = next_concepts[:_TOP_NEXT]
-    unmet = unmet[:_TOP_UNMET]
+    # Keep only unmet-prereq rows for candidates that survived the next_concepts
+    # truncation — otherwise unmet could reference a concept the learner never
+    # sees in next_concepts (a dangling, inconsistent recommendation).
+    surviving = {c["concept_id"] for c in next_concepts}
+    unmet = [u for u in unmet if u["concept_id"] in surviving][:_TOP_UNMET]
 
     # confusable_with edges touching known ∪ candidate. Dedupe unordered pairs.
     candidate_ids = {c["concept_id"] for c in next_concepts}
