@@ -292,3 +292,36 @@ def test_collect_partial_advances_cursor(monkeypatch, tmp_path: Path) -> None:
     conn.close()
     # Cursor = updated_at of #2 (last clean PR), not #3 and not wall-clock.
     assert finished_at == "2026-05-02T00:00:00Z"
+
+
+def test_collect_budget_exhaustion_records_one_marker_not_per_pr_flood(
+        monkeypatch, tmp_path: Path) -> None:
+    """When the gh budget is exhausted mid-loop, the run records ONE budget
+    marker and stops — it does not flood the DB with a failure row per remaining
+    PR (A-12)."""
+    pulls = [[
+        {"number": 1, "updated_at": "2026-05-01T00:00:00Z"},
+        {"number": 2, "updated_at": "2026-05-02T00:00:00Z"},
+        {"number": 3, "updated_at": "2026-05-03T00:00:00Z"},
+    ]]
+    responses = {
+        "user": json.dumps({"login": "t"}),
+        "repos/o/r/pulls?state=all&per_page=100": json.dumps(pulls),
+    }
+    for n, ts in [(1, "2026-05-01T00:00:00Z")]:  # only #1 fits the cap
+        responses[f"repos/o/r/pulls/{n}"] = _pr_detail(n, ts)
+        responses[f"repos/o/r/pulls/{n}/files?per_page=100"] = json.dumps([[]])
+        responses[f"repos/o/r/pulls/{n}/reviews?per_page=100"] = json.dumps([[]])
+        responses[f"repos/o/r/pulls/{n}/comments?per_page=100"] = json.dumps([[]])
+        responses[f"repos/o/r/issues/{n}/comments?per_page=100"] = json.dumps([[]])
+    _patch_gh(monkeypatch, responses)
+
+    # auth(1)+list(1)+5 for #1 = 7 → caps before #2.
+    report = collect_prs.collect(owner="o", repo="r",
+                                 db_path=tmp_path / "d.sqlite3", max_calls=7)
+    assert report.finished_status == "partial"
+    assert report.prs_processed == 1
+    assert report.prs_skipped == 2          # #2 and #3 skipped at once
+    # exactly one budget marker — not one failure per remaining PR
+    assert len(report.failures) == 1
+    assert report.failures[0]["endpoint"] == "gh_budget"

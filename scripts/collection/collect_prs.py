@@ -132,7 +132,20 @@ def collect(
         clean_prefix = True
 
         # 3. per-PR detail + files + reviews + comments
-        for pr in prs_filtered:
+        for idx, pr in enumerate(prs_filtered):
+            # Stop before the gh-call budget is exhausted — otherwise every
+            # remaining PR's fetches fail and flood the DB with redundant failure
+            # rows + per-PR commits. Record ONE budget marker (keeps the run
+            # 'partial', not the per-PR flood) and leave the cursor un-advanced.
+            if client.max_calls is not None and client.calls_used >= client.max_calls:
+                remaining = len(prs_filtered) - idx
+                report.failures.append({
+                    "endpoint": "gh_budget",
+                    "error": f"gh call cap exhausted ({client.calls_used}/{client.max_calls}); "
+                             f"{remaining} PR(s) skipped"})
+                report.prs_skipped += remaining
+                clean_prefix = False
+                break
             number = pr["number"]
             try:
                 detail = client.fetch_pull_request_detail(number)

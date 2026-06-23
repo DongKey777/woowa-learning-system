@@ -151,11 +151,15 @@ def ingest_junit_dir(
         cases = _parse_xml(xml_path)
         for case in cases:
             report.cases_total += 1
+            # Concept inference per failed case is computed once and reused below
+            # (it was called twice per failed case: the running set + the payload).
+            inferred = (_infer_uncertain_from_failed(case.classname)
+                        if case.status == "failed" else [])
             if case.status == "passed":
                 report.cases_passed += 1
             elif case.status == "failed":
                 report.cases_failed += 1
-                inferred_uncertain.update(_infer_uncertain_from_failed(case.classname))
+                inferred_uncertain.update(inferred)
             else:
                 report.cases_skipped += 1
 
@@ -177,8 +181,7 @@ def ingest_junit_dir(
                     "status": case.status,
                     "failure_message": case.failure_message,
                     "xml_path": case.xml_path,
-                    "concept_ids": (_infer_uncertain_from_failed(case.classname)
-                                    if case.status == "failed" else []),
+                    "concept_ids": inferred,
                 },
             }
             append_history_event(event, state_root=state_root)
