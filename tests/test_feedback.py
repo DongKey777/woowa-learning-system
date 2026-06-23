@@ -243,3 +243,33 @@ def test_reconcile_drops_reclassified_evidence_preserves_pr_sync(tmp_path: Path)
     assert again["dropped_concepts"] == 0
     assert again["demoted"] == []
     assert get("c/pr", state_root=tmp_path).bloom_level == "proficient"
+
+
+def test_reconcile_recomputes_familiar_at_wall_clock_not_max_ts(tmp_path: Path) -> None:
+    # A concept with 3 evidence from 3 distinct history-derived sources clustered
+    # ~20 days ago. Under wall-clock (the production compact_all semantics) it has
+    # aged out of the 14-day familiar window -> attempted. reconcile must agree —
+    # it must NOT manufacture a stale 'familiar' by anchoring recency to the
+    # concept's own max(ts), or it would flip on the next sync's compact_all.
+    import time
+
+    from core.mastery import compact_all
+
+    old = time.time() - 20 * 24 * 3600
+    append_history_event(
+        {"event_id": "e1", "event_type": "rag_ask", "mode": "learning",
+         "ts": old, "payload": {"top_concept_ids": ["c/stale"]}}, state_root=tmp_path)
+    append_history_event(
+        {"event_id": "e2", "event_type": "drill_answer", "mode": "learning",
+         "ts": old + 60, "payload": {"concept_id": "c/stale", "score": 8}}, state_root=tmp_path)
+    append_history_event(
+        {"event_id": "e3", "event_type": "self_assessment", "mode": "learning",
+         "ts": old + 120, "payload": {"concept_id": "c/stale"}}, state_root=tmp_path)
+    replay_history(state_root=tmp_path)
+
+    reconcile_mastery_with_history_labels(state_root=tmp_path)
+    # 3 sources but all ~20d old -> outside the 14-day familiar window at wall-clock
+    assert get("c/stale", state_root=tmp_path).bloom_level == "attempted"
+    # reconcile agrees with the production promotion path (no familiar flicker)
+    compact_all(state_root=tmp_path)
+    assert get("c/stale", state_root=tmp_path).bloom_level == "attempted"

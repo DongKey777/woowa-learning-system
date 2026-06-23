@@ -50,6 +50,31 @@ def _is_partial_source_id(source_event_id: str | None) -> bool:
     return bool(source_event_id and "-PARTIAL" in source_event_id)
 
 
+def _rebuild_cross_repo_projections(state_root: Path, learner_id: str) -> None:
+    """Rebuild the 4 cross-repo projections that embed a mastery snapshot.
+
+    A mastery mutation outside the sync-prs pipeline (this cleanup path) leaves
+    learning_path / memory_review / cross_mission / meta_analytics frozen at the
+    last sync — lazy_loader serves them from disk with no rebuild-on-read, so a
+    learner would otherwise see pre-clean bloom levels and the dropped phantom
+    concepts. profile + unified_profile are refreshed by the caller; these four
+    are not, so refresh them here too. Per-builder guarded — a missing per-repo
+    input (anchors/mission_patterns) must not abort the cleanup."""
+    import importlib
+
+    for mod_name, save_fn in (
+        ("mission.learning_path", "save_learning_path"),
+        ("mission.memory_review", "save_memory_review"),
+        ("mission.cross_mission", "save_cross_mission"),
+        ("mission.meta_analytics", "save_meta_analytics"),
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            getattr(mod, save_fn)(mod.analyze(learner_id, state_root), state_root)
+        except Exception as exc:  # best-effort; next sync-prs rebuilds anyway
+            print(f"warn: {mod_name} rebuild skipped ({exc})", file=sys.stderr)
+
+
 def _reset_profiles(state_root: Path, learner_id: str) -> None:
     from core.feedback import reconcile_mastery_with_history_labels, replay_history
     from core.mastery import _db_path
@@ -66,6 +91,9 @@ def _reset_profiles(state_root: Path, learner_id: str) -> None:
         replay_history(state_root=state_root)
     profile = recompute_profile(learner_id, state_root=state_root)
     rebuild_unified_projection(learner_id, state_root=state_root, profile=profile)
+    # Mastery just changed outside sync-prs; re-project the 4 cross-repo views
+    # that bake a mastery snapshot so they don't serve pre-clean bloom levels.
+    _rebuild_cross_repo_projections(state_root, learner_id)
 
 
 def main(argv: list[str] | None = None) -> int:

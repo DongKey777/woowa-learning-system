@@ -262,10 +262,17 @@ def delete_evidence_by_sources(
 
 def prune_orphans_and_recompute(state_root: Path = DEFAULT_STATE_ROOT) -> dict:
     """Drop mastery rows that have no evidence left, then recompute evidence_count,
-    last_seen_at, and Bloom level for every surviving concept **as of its own
-    latest evidence ts**. Using each concept's latest ts (not wall-clock now)
-    keeps the recompute from spuriously time-decaying concepts whose evidence is
-    merely old — it reflects only which evidence remains. Returns {dropped, recomputed}."""
+    last_seen_at, and Bloom level for every surviving concept at **wall-clock now**.
+
+    The recompute uses the same clock as the steady-state promotion path
+    (``compact_all`` -> ``promote(now=None)`` -> ``time.time()``, driven by
+    ``evidence_sync.sync_repo``). The familiar tier is recency-based by design (a
+    14-day window from *now*; see ``test_familiar_window_excludes_old_events``),
+    so anchoring the recompute to each concept's own latest ts would manufacture
+    a "familiar" that the very next sync demotes — leaving the familiar tier
+    non-idempotent across the pipeline. Wall-clock keeps reconcile consistent
+    with the live path; the time-independent tiers (proficient = pr_merge AND
+    mentor_accept) are unaffected by the clock. Returns {dropped, recomputed}."""
     with _connect(state_root) as conn:
         have = {r["concept_id"] for r in conn.execute("SELECT DISTINCT concept_id FROM evidence")}
         tracked = [r["concept_id"] for r in conn.execute("SELECT concept_id FROM mastery")]
@@ -283,6 +290,6 @@ def prune_orphans_and_recompute(state_root: Path = DEFAULT_STATE_ROOT) -> dict:
                 "UPDATE mastery SET evidence_count=?, last_seen_at=? WHERE concept_id=?",
                 (cnt, mx, c),
             )
-    for c, (cnt, mx) in latest.items():
-        promote(c, state_root=state_root, now=mx)
+    for c in latest:
+        promote(c, state_root=state_root)  # now=None -> wall-clock, matches compact_all
     return {"dropped": len(dropped), "recomputed": len(latest)}
