@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -229,3 +230,59 @@ def compact_all(state_root: Path = DEFAULT_STATE_ROOT, now: float | None = None)
         if before is None or after_level != before.bloom_level:
             promoted += 1
     return promoted
+
+
+def current_levels(state_root: Path = DEFAULT_STATE_ROOT) -> dict[str, str]:
+    """Snapshot {concept_id: bloom_level} for every tracked concept."""
+    with _connect(state_root) as conn:
+        return {
+            r["concept_id"]: r["bloom_level"]
+            for r in conn.execute("SELECT concept_id, bloom_level FROM mastery")
+        }
+
+
+def delete_evidence_by_sources(
+    sources: Iterable[str], state_root: Path = DEFAULT_STATE_ROOT
+) -> int:
+    """Delete every evidence row whose source is in ``sources``. Returns the row
+    count removed. Lets a caller rebuild one provenance of evidence (e.g. the
+    history-derived mission_use/drill_score/self_assess) without touching the
+    others (pr_merge/mentor_accept, which live only in this store)."""
+    src = list(sources)
+    if not src:
+        return 0
+    placeholders = ",".join("?" * len(src))
+    with _connect(state_root) as conn:
+        removed = conn.execute(
+            f"SELECT COUNT(*) FROM evidence WHERE source IN ({placeholders})", src
+        ).fetchone()[0]
+        conn.execute(f"DELETE FROM evidence WHERE source IN ({placeholders})", src)
+    return removed
+
+
+def prune_orphans_and_recompute(state_root: Path = DEFAULT_STATE_ROOT) -> dict:
+    """Drop mastery rows that have no evidence left, then recompute evidence_count,
+    last_seen_at, and Bloom level for every surviving concept **as of its own
+    latest evidence ts**. Using each concept's latest ts (not wall-clock now)
+    keeps the recompute from spuriously time-decaying concepts whose evidence is
+    merely old — it reflects only which evidence remains. Returns {dropped, recomputed}."""
+    with _connect(state_root) as conn:
+        have = {r["concept_id"] for r in conn.execute("SELECT DISTINCT concept_id FROM evidence")}
+        tracked = [r["concept_id"] for r in conn.execute("SELECT concept_id FROM mastery")]
+        dropped = [c for c in tracked if c not in have]
+        for c in dropped:
+            conn.execute("DELETE FROM mastery WHERE concept_id=?", (c,))
+        latest = {
+            r["concept_id"]: (r["cnt"], r["mx"])
+            for r in conn.execute(
+                "SELECT concept_id, COUNT(*) AS cnt, MAX(ts) AS mx FROM evidence GROUP BY concept_id"
+            )
+        }
+        for c, (cnt, mx) in latest.items():
+            conn.execute(
+                "UPDATE mastery SET evidence_count=?, last_seen_at=? WHERE concept_id=?",
+                (cnt, mx, c),
+            )
+    for c, (cnt, mx) in latest.items():
+        promote(c, state_root=state_root, now=mx)
+    return {"dropped": len(dropped), "recomputed": len(latest)}

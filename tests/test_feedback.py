@@ -7,6 +7,7 @@ from pathlib import Path
 from core.feedback import (
     ingest_mentor_accept,
     ingest_pr_merge,
+    reconcile_mastery_with_history_labels,
     record_turn,
     replay_history,
 )
@@ -189,3 +190,56 @@ def test_drill_score_normalized_from_legacy_10_point(tmp_path: Path) -> None:
         state_root=tmp_path,
     )
     assert get("spring/bean", state_root=tmp_path).bloom_level == "mastered"
+
+
+def _relabel_history_mode(state_root: Path, event_id: str, new_mode: str) -> None:
+    path = state_root / "learner" / "history.jsonl"
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        ev = json.loads(line)
+        if ev.get("event_id") == event_id:
+            ev["mode"] = new_mode
+            ev["mode_source"] = "backfill_reclassified"
+        out.append(json.dumps(ev, ensure_ascii=False))
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def test_reconcile_drops_reclassified_evidence_preserves_pr_sync(tmp_path: Path) -> None:
+    # A genuine learning turn (stays), a turn that will be reclassified to dev
+    # (its mission_use must be purged), and a PR-sync-only proficient concept
+    # (pr_merge+mentor_accept live only in the store — must NOT be wiped).
+    append_history_event(
+        {"event_id": "ask-learn", "event_type": "rag_ask", "mode": "learning",
+         "ts": 1000.0, "payload": {"prompt": "DI 설명", "top_concept_ids": ["c/keep"]}},
+        state_root=tmp_path,
+    )
+    append_history_event(
+        {"event_id": "ask-dev", "event_type": "rag_ask", "mode": "learning",
+         "ts": 1001.0, "payload": {"prompt": "코퍼스 확장 측정", "top_concept_ids": ["c/phantom"]}},
+        state_root=tmp_path,
+    )
+    replay_history(state_root=tmp_path)
+    ingest_pr_merge(["c/pr"], state_root=tmp_path, ts=1002.0)
+    ingest_mentor_accept(["c/pr"], state_root=tmp_path, ts=1003.0)
+    assert get("c/phantom", state_root=tmp_path) is not None
+    assert get("c/pr", state_root=tmp_path).bloom_level == "proficient"
+
+    # the migration relabels the dev turn AFTER mastery already counted it
+    _relabel_history_mode(tmp_path, "ask-dev", "development")
+    result = reconcile_mastery_with_history_labels(state_root=tmp_path)
+
+    # phantom concept (only the now-dev event) is dropped
+    assert get("c/phantom", state_root=tmp_path) is None
+    assert result["dropped_concepts"] == 1
+    # genuine learning evidence survives
+    assert get("c/keep", state_root=tmp_path) is not None
+    # PR-sync evidence preserved — naive unlink+replay would have wiped this
+    assert get("c/pr", state_root=tmp_path).bloom_level == "proficient"
+
+    # idempotent: a second pass changes nothing
+    again = reconcile_mastery_with_history_labels(state_root=tmp_path)
+    assert again["dropped_concepts"] == 0
+    assert again["demoted"] == []
+    assert get("c/pr", state_root=tmp_path).bloom_level == "proficient"
