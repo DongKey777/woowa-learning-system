@@ -1,8 +1,7 @@
 """SQLite PR archive — read interface only.
 
 Ingest reuses legacy `bin/bootstrap-repo` until Phase 9 migration. This
-module exposes the minimum query surface needed by core/peer_pr.py +
-core/context.py:
+module exposes the minimum query surface needed by core/peer_pr.py:
 
 - list_prs(repo, author_login=None, limit=10)
 - get_pr(repo, pr_number)

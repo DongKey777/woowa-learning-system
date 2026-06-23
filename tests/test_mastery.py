@@ -150,3 +150,12 @@ def test_familiar_window_excludes_old_events(tmp_path: Path) -> None:
     record_evidence("spring/bean", "self_assess", state_root=tmp_path, ts=old)
     record_evidence("spring/bean", "mission_use", state_root=tmp_path, ts=old)
     assert promote("spring/bean", state_root=tmp_path, now=now) == "attempted"
+
+
+def test_record_evidence_last_seen_at_keeps_max_not_last_written(tmp_path) -> None:
+    from core.mastery import get
+    # A later-arriving OLDER event must not regress recency: sync_repo emits
+    # pr_merge(merged_at, later) then mentor_accept(reply ts, earlier) for one concept.
+    record_evidence("c/x", "mission_use", state_root=tmp_path, ts=5000.0)
+    record_evidence("c/x", "mentor_accept", state_root=tmp_path, ts=1000.0)
+    assert get("c/x", state_root=tmp_path).last_seen_at == 5000.0

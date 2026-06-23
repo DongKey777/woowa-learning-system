@@ -11,7 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.mining.jsonl_iter import iter_jsonl, parse_since_ts, sample_jsonl  # noqa: E402
+from scripts.mining.jsonl_iter import iter_jsonl, parse_since_ts  # noqa: E402
 
 
 def _seed(tmp_path: Path) -> Path:
@@ -64,12 +64,6 @@ def test_iter_jsonl_missing_returns_empty(tmp_path: Path) -> None:
     assert list(iter_jsonl(tmp_path / "missing.jsonl")) == []
 
 
-def test_sample_jsonl_returns_n_or_all(tmp_path: Path) -> None:
-    p = _seed(tmp_path)
-    s3 = sample_jsonl(p, n=3, seed=42)
-    assert len(s3) == 3
-    s100 = sample_jsonl(p, n=100, seed=42)
-    assert len(s100) == 5  # all valid events
 
 
 def test_iter_jsonl_combined_filters(tmp_path: Path) -> None:

@@ -259,6 +259,20 @@ def start_background(
 # ── server (daemon) ───────────────────────────────────────────────────────
 
 
+def _safe_send(conn, data: bytes) -> bool:
+    """Send on a client connection, swallowing a disconnect. Returns False if the
+    client is gone. A BrokenPipe/OSError here must NEVER propagate: the error-path
+    send sits inside the per-connection ``except`` block, so a raise there unwinds
+    past the request loop into the outer ``finally`` that closes + unlinks the
+    daemon socket and pid — i.e. one client that disconnects before reading the
+    response (Ctrl-C, timeout) would tear the whole daemon down."""
+    try:
+        conn.sendall(data)
+        return True
+    except OSError:
+        return False
+
+
 def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
     """Daemon main loop. Loads BGE-M3 once, serves search + ask requests forever."""
     sp = _socket_path(state_root)
@@ -689,7 +703,7 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                 else:
                     conn.sendall(json.dumps({"error": f"unknown action {action}"}).encode() + b"\n")
             except Exception as exc:  # noqa: BLE001
-                conn.sendall(json.dumps({"error": str(exc)}).encode() + b"\n")
+                _safe_send(conn, json.dumps({"error": str(exc)}).encode() + b"\n")
             finally:
                 conn.close()
     finally:

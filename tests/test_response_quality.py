@@ -598,3 +598,10 @@ def test_learn_response_quality_cli_summary_only_marks_body_not_captured(
     assert "body_not_captured" in row["contract_flags"]
     assert "token_efficient_summary_only" in row["contract_flags"]
     assert "declared_citation_unverified" in row["contract_flags"]
+
+
+def test_detect_citation_drift_extra_and_mismatch_cooccur() -> None:
+    # declared carries an unexpected path AND misses an expected one — both must
+    # flag (an elif chain used to mask citation_mismatch behind extra_citation).
+    assert detect_citation_drift(["a.md", "b.md"], ["a.md", "c.md"]) == {
+        "extra_citation", "citation_mismatch"}

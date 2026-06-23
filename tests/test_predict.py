@@ -292,3 +292,12 @@ def test_save_round_trip_to_right_path(tmp_path: Path) -> None:
 def test_now_timestamp_is_deterministic(tmp_path: Path) -> None:
     rep = analyze_repo("demo", LEARNER, tmp_path, now=0.0)
     assert rep["generated_at"].startswith("1970-01-01T00:00:00")
+
+
+def test_projection_sentence_small_pr_not_inverted() -> None:
+    # percentile = 나보다 작거나 같은 동료 비율 (coach.py 정의): pct=4 = 작은 PR.
+    # 기존 '상위 4 percentile'은 작은 PR을 '큰/상위'로 뒤집어 학습자에게 노출했다.
+    from mission.predict import _projection_sentence
+    s = _projection_sentence(4, None, None, None, None)
+    assert "상위" not in s
+    assert "동기 4%보다 큰" in s

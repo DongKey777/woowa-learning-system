@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import random
 import re
 import time
 from datetime import datetime, timezone
@@ -102,14 +101,6 @@ def iter_jsonl(path: Path, since_ts: float | None = None,
             yielded += 1
             if limit and yielded >= limit:
                 break
-
-
-def sample_jsonl(path: Path, n: int, seed: int = 0, **filters) -> list[dict]:
-    """Reservoir sample n events."""
-    pool = list(iter_jsonl(path, **filters))
-    if n >= len(pool):
-        return pool
-    return random.Random(seed).sample(pool, n)
 
 
 def is_fixture_or_demo_row(row: dict) -> bool:

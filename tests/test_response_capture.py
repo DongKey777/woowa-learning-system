@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from core.response_capture import (  # noqa: E402
     append_repair_queue,
     capture_from_hook_payload,
+    compact_terminal_pending_captures,
     create_pending_capture,
     drain_repair_queue,
     expire_stale_pending_captures,
@@ -424,3 +425,79 @@ def test_drain_scans_repairable_beyond_last_limit_lines(tmp_path: Path) -> None:
     assert summary["applied"] == 1  # found despite being beyond the last 2 lines
     quality = (state / "learner" / "response-quality.jsonl").read_text(encoding="utf-8")
     assert "ask-early-repairable" in quality
+
+
+def test_non_learning_body_does_not_overwrite_fresh_learning_pending(tmp_path: Path) -> None:
+    # A fresh learning pending is open; a non-learning Stop message (no source_event_id,
+    # inside the age-cap window) attaches via recency only — it must NOT overwrite the
+    # real answer. The body-shape guard previously ran only when no pending was found.
+    state = tmp_path / "state"
+    event = _ask_event()
+    append_history_event(event, state_root=state)
+    create_pending_capture(event, state_root=state)
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "네, 시스템 작업 완료했습니다. 빌드 통과."},
+        client="claude", state_root=state,
+    )
+    assert result["ignored"] is True
+    assert result["reason"] == "non_learning_hook_message"
+    assert load_pending_capture("ask-hook", state_root=state)["status"] == "pending"
+    assert not (state / "learner" / "response-quality.jsonl").exists()
+
+
+def test_learning_body_with_preamble_attaches_to_fresh_pending(tmp_path: Path) -> None:
+    # A genuine answer with a short conversational preamble before [Mode: must still
+    # attach (the broadened guard accepts [Mode: within the first 400 chars).
+    state = tmp_path / "state"
+    event = _ask_event()
+    append_history_event(event, state_root=state)
+    create_pending_capture(event, state_root=state)
+    body = ("읽었어요. 정리할게요.\n\n[Mode: cs_qa]\n\n격리 수준 설명\n\n"
+            "참고:\n- database/transaction-isolation-locking\n")
+    result = capture_from_hook_payload(
+        {"last_assistant_message": body}, client="claude", state_root=state,
+        learner_id="DongKey777")
+    assert result["ok"] is True and result.get("ignored") is not True
+    assert load_pending_capture("ask-hook", state_root=state)["status"] == "captured"
+
+
+def test_compact_terminal_pending_captures_removes_old_terminal_only(tmp_path: Path) -> None:
+    # Terminal pending files (captured/superseded/expired) older than retention are
+    # redundant tracking records and must be deleted; recent terminal + any active
+    # pending stay.
+    state = tmp_path / "state"
+    old = time.time() - 2 * 86400
+    recent = time.time() - 60
+    _write_pending(state, "ask-captured-old", created_at=old, status="captured")
+    _write_pending(state, "ask-superseded-old", created_at=old,
+                   status="superseded_by_later_capture")
+    _write_pending(state, "ask-captured-recent", created_at=recent, status="captured")
+    _write_pending(state, "ask-active", created_at=old, status="pending")
+
+    removed = compact_terminal_pending_captures(state_root=state)
+    assert removed == 2
+    assert load_pending_capture("ask-captured-old", state_root=state) is None
+    assert load_pending_capture("ask-superseded-old", state_root=state) is None
+    assert load_pending_capture("ask-captured-recent", state_root=state) is not None
+    assert load_pending_capture("ask-active", state_root=state) is not None
+
+
+def test_drain_compacts_ignored_and_unrepairable_rows(tmp_path: Path) -> None:
+    # drain drops write-only ignored_non_learning diagnostics + no-sid pending_repair
+    # (unrepairable), keeping repair-relevant rows — bounds the append-only queue.
+    state = tmp_path / "state"
+    (state / "learner").mkdir(parents=True)
+    qp = repair_queue_path(state)
+    rows = [
+        {"reason": "non_learning_hook_message", "status": "ignored_non_learning"},
+        {"reason": "non_learning_hook_message", "status": "ignored_non_learning"},
+        {"reason": "body_missing", "status": "pending_repair"},  # no sid → dropped
+        {"reason": "pending_missing", "status": "pending_repair",
+         "source_event_id": "ask-x", "repair_body_path": "learner/x.md"},  # kept
+    ]
+    qp.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    summary = drain_repair_queue(state_root=state)
+    assert summary["compacted"] == 3
+    remaining = [json.loads(l) for l in qp.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert all(r.get("status") != "ignored_non_learning" for r in remaining)
+    assert any(r.get("source_event_id") == "ask-x" for r in remaining)

@@ -40,3 +40,23 @@ def test_backfill_skips_non_production_isolation_id_without_error() -> None:
     assert changed is False
     assert skipped is False
     assert skipped_non_prod is True
+
+
+def test_rewrite_line_skips_dev_test_row_with_legacy_id() -> None:
+    # A dev/test row carrying a legacy learner_id must NOT be canonicalized to the
+    # real learner identity (the legacy check used to run before the mode skip).
+    import json as _json
+
+    from scripts.migration.canonical_id_backfill import _rewrite_line
+
+    line = _json.dumps({"learner_id": "default", "mode": "development", "e": "x"})
+    out, changed, _backfilled, skipped = _rewrite_line(line, canonical="DongKey777")
+    assert changed is False
+    assert skipped is True
+    assert _json.loads(out)["learner_id"] == "default"  # untouched
+
+    # a production row with a legacy id is still canonicalized
+    prod = _json.dumps({"learner_id": "default", "mode": "learning"})
+    out2, changed2, _b2, _s2 = _rewrite_line(prod, canonical="DongKey777")
+    assert changed2 is True
+    assert _json.loads(out2)["learner_id"] == "DongKey777"

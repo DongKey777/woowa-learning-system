@@ -51,14 +51,17 @@ def _rewrite_line(line: str, *, canonical: str) -> tuple[str, bool, bool, bool]:
     original = row.get("learner_id")
     if original == canonical:
         return json.dumps(row, ensure_ascii=False), False, False, False
+    # Skip dev/test rows BEFORE canonicalizing: a non-production row carrying a
+    # legacy learner_id must not be rewritten to the real learner identity (the
+    # legacy check used to run first, canonicalizing dev/test rows).
+    if row.get("mode") in NON_PRODUCTION_MODES:
+        return json.dumps(row, ensure_ascii=False), False, False, True
     if original in LEGACY_VALUES:
         row["learner_id"] = canonical
         row.setdefault("_canonical_id_source", _source_label(original))
         if row.get("_backfilled_from"):
             row.setdefault("_provisional", True)
         return json.dumps(row, ensure_ascii=False), True, False, False
-    if row.get("mode") in NON_PRODUCTION_MODES:
-        return json.dumps(row, ensure_ascii=False), False, False, True
     row["_canonical_id_skipped"] = _source_label(original)
     return json.dumps(row, ensure_ascii=False), False, True, False
 

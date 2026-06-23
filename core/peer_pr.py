@@ -18,7 +18,6 @@ from core.archive import (
     get_diff_files,
     get_pr,
     get_review_threads,
-    list_prs,
 )
 
 NICKNAME_PATTERNS = (
@@ -47,23 +46,6 @@ def extract_nickname(title: str) -> str | None:
         if m:
             return m.group(1)
     return None
-
-
-def build_nickname_map(repo: str, state_root=DEFAULT_STATE_ROOT) -> dict[str, str]:
-    """Mine nickname → author_login from recent PRs. Ambiguous nicknames dropped."""
-    prs = list_prs(repo, limit=500, state_root=state_root)
-    pairs: dict[str, set[str]] = {}
-    for pr in prs:
-        nick = extract_nickname(pr.get("title", ""))
-        login = pr.get("author_login")
-        if nick and login:
-            pairs.setdefault(nick, set()).add(login)
-    return {nick: next(iter(logins)) for nick, logins in pairs.items() if len(logins) == 1}
-
-
-def resolve_nickname(nickname: str, repo: str, state_root=DEFAULT_STATE_ROOT) -> str | None:
-    """Return author_login for nickname or None if unknown/ambiguous."""
-    return build_nickname_map(repo, state_root).get(nickname)
 
 
 def compare(
