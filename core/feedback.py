@@ -104,6 +104,55 @@ def replay_history(state_root: Path = DEFAULT_STATE_ROOT, mode_filter: str = "le
     return count
 
 
+def reconcile_mastery_with_history_labels(
+    state_root: Path = DEFAULT_STATE_ROOT,
+) -> dict:
+    """Make mastery_graph consistent with the CURRENT history.jsonl mode labels.
+
+    The store mixes two evidence provenances:
+      - history-derived (mission_use/drill_score/self_assess): a projection of
+        learning-labeled history events, reproducible by ``replay_history``.
+      - PR-sync-derived (pr_merge/mentor_accept): ingested from GitHub by
+        ``ingest_pr_merge``/``ingest_mentor_accept``, absent from history.jsonl,
+        so NOT reproducible by a replay — and these drive every promotion.
+
+    When a reclassify migration relabels events (learning -> development), the
+    history-derived evidence it already wrote stays behind (the events were
+    learning at write time), inflating mastery with dev/fixture activity. A
+    naive ``db.unlink()`` + replay would also wipe every pr_merge/mentor_accept
+    row (every promotion). Instead this deletes only the history-derived
+    evidence, replays it from the current learning events, drops concepts left
+    with no evidence, and recomputes levels — preserving PR-sync evidence
+    untouched. Idempotent. Returns
+    {removed_evidence, replayed_evidence, dropped_concepts, demoted}.
+    """
+    from core.mastery import (
+        _db_path,
+        current_levels,
+        delete_evidence_by_sources,
+        prune_orphans_and_recompute,
+    )
+
+    if not _db_path(state_root).exists():
+        return {"removed_evidence": 0, "replayed_evidence": 0,
+                "dropped_concepts": 0, "demoted": []}
+
+    before = current_levels(state_root)
+    removed = delete_evidence_by_sources(sorted(set(EVENT_TO_SOURCE.values())), state_root)
+    replayed = replay_history(state_root=state_root)
+    pruned = prune_orphans_and_recompute(state_root)
+    after = current_levels(state_root)
+
+    rank = {lvl: i for i, lvl in enumerate(("attempted", "familiar", "proficient", "mastered"))}
+    demoted = [
+        {"concept_id": c, "from": before[c], "to": after.get(c, "(removed)")}
+        for c in before
+        if rank.get(after.get(c, "attempted"), 0) < rank.get(before[c], 0)
+    ]
+    return {"removed_evidence": removed, "replayed_evidence": replayed,
+            "dropped_concepts": pruned["dropped"], "demoted": demoted}
+
+
 def _extract_concepts(payload: dict) -> list[str]:
     """Pull concept_ids from various event payload shapes."""
     candidates: list = []

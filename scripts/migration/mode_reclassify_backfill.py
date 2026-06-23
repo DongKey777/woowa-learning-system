@@ -253,6 +253,17 @@ def apply(state_root: Path, ids: set[str], *, dry_run: bool) -> dict[str, Any]:
         for p in files
     ]
     flipped_total = sum(int(r["flipped"]) for r in results)
+    # Relabeling learning->development in history.jsonl leaves the mastery graph
+    # inconsistent: the now-dev events already wrote history-derived evidence
+    # (mission_use) into mastery_graph.sqlite while they were labeled learning.
+    # Reconcile rebuilds that evidence from the CURRENT labels (preserving the
+    # PR-sync pr_merge/mentor_accept evidence that no replay can reproduce), so
+    # the migration leaves no orphaned mastery evidence behind.
+    mastery_reconcile: dict[str, Any] | None = None
+    if not dry_run and flipped_total:
+        from core.feedback import reconcile_mastery_with_history_labels
+
+        mastery_reconcile = reconcile_mastery_with_history_labels(state_root=state_root)
     return {
         "phase": "apply",
         "dry_run": dry_run,
@@ -262,6 +273,7 @@ def apply(state_root: Path, ids: set[str], *, dry_run: bool) -> dict[str, Any]:
             None if dry_run or flipped_total == 0 else str(backup_root)
         ),
         "files": results,
+        "mastery_reconcile": mastery_reconcile,
     }
 
 
