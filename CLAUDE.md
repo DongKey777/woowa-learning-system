@@ -125,7 +125,8 @@ python3 bin/ask "테스트"
 ### 4.2.1 답변 본문 수집 규칙
 - UX가 우선이다. 답변 본문 수집 실패가 학습 답변을 막으면 안 된다.
 - Claude Code hook 환경에서는 `Stop` hook이 `bin/capture-response`를 호출해 최종 답변 전체를 자동 수집한다.
-- `bin/ask`는 learning turn마다 pending capture를 만들고, hook은 가장 최근 pending에 최종 답변을 연결한다.
+- `bin/ask`는 **genuine 학습 turn(learning 모드 + `--raw-utterance` 있는)마다** pending capture를 만들고, hook은 가장 최근 pending에 최종 답변을 연결한다. raw_utterance 없는 bare 프로브·dev 호출은 pending을 만들지 않는다(`daemon._is_capturable_learning_turn` 게이팅) — 안 그러면 hook이 세션의 다음 무관 메시지를 그 pending에 잘못 연결한다(과거 dev 프로브가 시스템작업 narration을 흡수한 오염의 원인).
+- **attach 측 age-cap**: 학습 답변은 자기 pending에 ~1분 안에 붙는다(실측 중앙 0.9분). hook이 source_event_id 없이 '가장 최근 pending'에 붙일 때, **15분(`STALE_PENDING_AGE_S`)을 넘긴 pending은 orphan으로 자동 만료**(`status=expired_orphan`)되어 뒤늦은 무관 답변을 흡수하지 못한다(`latest_pending_capture` age-cap + `expire_stale_pending_captures`). 학습 turn이 라이브 sync/분석을 띄워 즉답이 진행상태 한 줄뿐이면 그 status가 답변으로 잡힐 수 있으니(빠른 잔여 케이스), 그런 작업은 §3대로 dev 모드로 선언하거나 종합 답변을 최종 Stop 메시지로 둔다.
 - hook 수집 실패 시 `state/learner/capture-repair-queue.jsonl`에 남기고, 학습자에게는 짧게만 안내한다: *"학습 기록 저장은 나중에 자동 보정할게."*
 - `# response_quality_hint.command_template` 수동 실행은 hook이 없는 환경의 fallback이다.
 - 토큰 효율 수동 fallback은 `full_body_path_template`의 `--response-path <answer.md>`다.
@@ -169,7 +170,7 @@ python3 bin/ask "테스트"
 발화가 **2개 이상 독립 주제**를 담으면(예: "서블릿 응답 어디로 + 스프링부트 톰캣 자동 + WAS vs 웹서버") 주제별로 따로 검색해야 모든 주제가 답변에 살아남는다. retrieval은 쿼리 한 개당 벡터 한 개라(`rag/search.py`: `q_vec = encode_fn(query)` — 쿼리 1개 → 임베딩 1개), 여러 주제를 한 문자열에 섞으면 dense가 평균화되면서 어휘가 센 한 주제로 벡터가 쏠리고 나머지 sub-intent의 정답 문서가 top-5 밖으로 탈락한다. 그러면 그 주제는 근거가 안 잡혀 답변에서 통째로 빠지거나(missing) 근거 없이 얼버무리게 된다(hand-wave). 실측: per-sub-intent recall@5가 합친 단일벡터 53% → 주제별 분해 100%(+47pp). mi-06("@Repository 빈 등록 + 인터페이스 구현체 교체")은 단일벡터가 인터페이스/DIP 쪽으로 hijack돼 빈 등록 메커니즘 문서가 전부 탈락(combined recall 0.0), mi-02의 E2E 테스트비용 gold는 트랜잭션 어휘에 밀려 combined top-15 밖으로 도달 불가였다.
 
 - **정공법(진짜 2+ 독립주제): 주제별 `bin/ask`를 N회 따로 호출**한다. 각 호출의 positional에 그 주제만 담은 재작성 쿼리를 넣어 주제마다 독립 벡터로 검색해야 hijack을 피한다. `--reformulated-query` 한 번에 모든 주제를 욱여넣는 단일 호출로는 이 희석을 못 막는다 — 그 인자도 결국 한 문자열(`retrieval_query`)로 합쳐져 벡터 하나가 되므로 합친 단일벡터와 똑같이 약한 주제가 탈락한다.
-- **텔레메트리 정합**: sub-ask를 N회 하면 pending capture가 N개 생기고 Stop hook은 가장 최근 1개에만 최종 답변을 연결한다. 그래서 sub-ask 묶음 직후 `bin/capture-repair --sync-pending`을 한 번 돌려 stale pending을 `response-quality.jsonl` 기준으로 재동기화한다. 이건 분해의 정상 비용이지 회피 사유가 아니다 — 답변 완전성이 우선이다.
+- **텔레메트리**: `--raw-utterance`를 첫 sub-ask에만 넘기므로(아래), daemon은 **첫 호출만 pending capture를 만들고** 나머지 sub-ask(raw_utterance 없음)는 capture를 만들지 않는다(`daemon._is_capturable_learning_turn` 게이팅). Stop hook은 그 하나의 pending에 종합 답변을 연결하므로 N-pending 오염도 capture-repair도 없다.
 - **답변 종합**: N회 검색 결과를 따로따로 surface하지 말고, 한 답변 안에서 주제별 섹션으로 합쳐 모든 sub-intent를 corpus 근거로 커버한다. 각 주제는 자기 검색에서 잡힌 concept만 인용한다(주제 간 근거 섞기 금지).
 - `--raw-utterance`는 **첫 호출 한 번에만** 학습자 원문 발화를 넘긴다(여러 sub-ask에 중복 전달하면 raw→rewritten 쌍이 오염 — 'Verify raw source' 정책). 개념 부재 기인 미스("WAS와 웹서버 차이" 단독인데 무관 1위)는 분해로 못 고치고 코퍼스 확장 과제다(원인 분리 인식).
 

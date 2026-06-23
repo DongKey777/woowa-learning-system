@@ -140,6 +140,16 @@ def _render_ask_stdout(resp: dict, json_route: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _is_capturable_learning_turn(event_mode: str | None, raw_utterance) -> bool:
+    """A pending capture is created only for a genuine learning turn — one in
+    learning mode that carries a real learner utterance (--raw-utterance, the
+    CLAUDE.md §4.2 contract marker). Bare bin/ask probes and multi-intent
+    sub-asks (no raw_utterance) are excluded so the Stop hook's latest-pending
+    attach can't silently absorb the session's next unrelated message into them.
+    """
+    return event_mode == "learning" and bool(raw_utterance)
+
+
 def ping(state_root: Path = DEFAULT_STATE_ROOT) -> bool:
     sp = _socket_path(state_root)
     if not sp.exists():
@@ -631,11 +641,21 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     try:
                         if not internal_meta_prompt:
                             append_history_event(event, state_root=state_root)
-                            create_pending_capture(
-                                event,
-                                state_root=state_root,
-                                expected_citation_paths=list(response_hints["citation_paths"]),
-                            )
+                            # A pending capture exists to record the learner's answer
+                            # to a genuine learning turn — one carrying a real learner
+                            # utterance (--raw-utterance, CLAUDE.md §4.2). A bare bin/ask
+                            # probe or a multi-intent sub-ask (no raw_utterance) must NOT
+                            # create one: the Stop hook attaches the session's NEXT final
+                            # message to latest_pending_capture() without verifying it
+                            # answers that turn, so an ungated probe pending silently
+                            # absorbs unrelated dev-work narration. Mirrors the
+                            # event_mode=="learning" gate record_turn already applies.
+                            if _is_capturable_learning_turn(event_mode, req.get("raw_utterance")):
+                                create_pending_capture(
+                                    event,
+                                    state_root=state_root,
+                                    expected_citation_paths=list(response_hints["citation_paths"]),
+                                )
                         if event_mode == "learning" and not internal_meta_prompt:
                             record_turn(event, state_root=state_root)
                     except Exception as exc:  # noqa: BLE001
