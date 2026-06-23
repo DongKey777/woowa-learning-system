@@ -424,3 +424,37 @@ def test_drain_scans_repairable_beyond_last_limit_lines(tmp_path: Path) -> None:
     assert summary["applied"] == 1  # found despite being beyond the last 2 lines
     quality = (state / "learner" / "response-quality.jsonl").read_text(encoding="utf-8")
     assert "ask-early-repairable" in quality
+
+
+def test_non_learning_body_does_not_overwrite_fresh_learning_pending(tmp_path: Path) -> None:
+    # A fresh learning pending is open; a non-learning Stop message (no source_event_id,
+    # inside the age-cap window) attaches via recency only — it must NOT overwrite the
+    # real answer. The body-shape guard previously ran only when no pending was found.
+    state = tmp_path / "state"
+    event = _ask_event()
+    append_history_event(event, state_root=state)
+    create_pending_capture(event, state_root=state)
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "네, 시스템 작업 완료했습니다. 빌드 통과."},
+        client="claude", state_root=state,
+    )
+    assert result["ignored"] is True
+    assert result["reason"] == "non_learning_hook_message"
+    assert load_pending_capture("ask-hook", state_root=state)["status"] == "pending"
+    assert not (state / "learner" / "response-quality.jsonl").exists()
+
+
+def test_learning_body_with_preamble_attaches_to_fresh_pending(tmp_path: Path) -> None:
+    # A genuine answer with a short conversational preamble before [Mode: must still
+    # attach (the broadened guard accepts [Mode: within the first 400 chars).
+    state = tmp_path / "state"
+    event = _ask_event()
+    append_history_event(event, state_root=state)
+    create_pending_capture(event, state_root=state)
+    body = ("읽었어요. 정리할게요.\n\n[Mode: cs_qa]\n\n격리 수준 설명\n\n"
+            "참고:\n- database/transaction-isolation-locking\n")
+    result = capture_from_hook_payload(
+        {"last_assistant_message": body}, client="claude", state_root=state,
+        learner_id="DongKey777")
+    assert result["ok"] is True and result.get("ignored") is not True
+    assert load_pending_capture("ask-hook", state_root=state)["status"] == "captured"

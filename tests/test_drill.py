@@ -212,3 +212,22 @@ def test_proactive_offer_marker_round_trip(tmp_path: Path) -> None:
     assert read_last_proactive_offer_at(tmp_path) is None
     write_last_proactive_offer_at(1234.5, tmp_path)
     assert read_last_proactive_offer_at(tmp_path) == 1234.5
+
+
+def test_score_upserts_due_entry_not_appends(tmp_path: Path) -> None:
+    # A prior review left a past-due entry for the concept. Answering must REPLACE
+    # it with the new band, not append a 2nd row — append-only grew the list every
+    # cycle and the stale past-due row kept getting re-offered (spaced-repetition
+    # band delay ignored).
+    sr = _seed_state(tmp_path)
+    (sr / "learner" / "drill_due.json").write_text(json.dumps([
+        {"concept_id": "spring/bean-di-basics", "next_due_ts": 0.0,
+         "level": "weak", "last_score": 0.2}
+    ]), encoding="utf-8")
+    build_offer_if_due(state_root=sr, uncertain_concept_ids=["spring/bean-di-basics"])
+    score_pending_answer("간단한 답변", state_root=sr, now=1_000_000.0)
+    due = json.loads((sr / "learner" / "drill_due.json").read_text())
+    assert len([d for d in due if d["concept_id"] == "spring/bean-di-basics"]) == 1
+    assert due[0]["next_due_ts"] > 1_000_000.0  # rescheduled to the future
+    # no longer past-due → review offer won't re-fire on the stale entry
+    assert build_review_offer_if_due(state_root=sr, now=1_000_000.0) is None

@@ -316,8 +316,14 @@ def score_pending_answer(
             due_list = json.loads(due_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             due_list = []
+    # Upsert by concept: drop any prior due entry for this concept before adding
+    # the new band. Append-only accumulated a fresh row every review while the old
+    # past-due row stayed, so the same concept was re-offered every cycle and the
+    # due list grew without bound (spaced-repetition band delay was ignored).
+    cid = offer_d.get("concept_id")
+    due_list = [d for d in due_list if d.get("concept_id") != cid]
     due_list.append({
-        "concept_id": offer_d.get("concept_id"),
+        "concept_id": cid,
         "level": level,
         "next_due_ts": due_ts,
         "last_score": score.total,

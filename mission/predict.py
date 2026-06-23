@@ -177,7 +177,9 @@ def _projection_sentence(pct: int | None, rounds: int | None,
     """One natural Korean sentence assembled ONLY from non-null numbers."""
     parts: list[str] = []
     if pct is not None:
-        parts.append(f"이번 PR 규모는 동기들 중 상위 {pct} percentile 정도라")
+        # percentile = 나보다 작거나 같은 동료 비율(coach.py 정의) — 낮을수록 작은 PR.
+        # 기존 '상위 N percentile'은 낮은 pct를 '큰 PR'로 뒤집어 읽혔다.
+        parts.append(f"이번 PR 규모는 동기 {pct}%보다 큰 편이라")
     if rounds is not None and median_rounds is not None:
         parts.append(
             f"지난 PR 리뷰가 {rounds}라운드였고 동기 평균은 {median_rounds}라운드라 "

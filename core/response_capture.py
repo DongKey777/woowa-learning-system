@@ -437,9 +437,17 @@ def _text_from_value(value: Any) -> str | None:
 
 
 def looks_like_learning_answer_body(body: str | None) -> bool:
-    """Return True when a hook body looks like a learner-facing answer."""
+    """Return True when a hook body looks like a learner-facing answer.
+
+    A learning answer carries a ``[Mode: ...]`` header (CLAUDE.md §4.2 step 4) —
+    usually first, occasionally after a short conversational preamble — or a
+    ``참고:`` citation block. System-work narration (a one-line build/sync
+    progress status) carries neither, so this rejects it while still accepting
+    preamble-then-[Mode:] coaching. A genuinely [Mode:-less answer may false-
+    negative; that is the accepted cost of not letting narration overwrite a
+    real captured answer on the recency-only attribution path."""
     text = (body or "").lstrip()
-    return text.startswith("[Mode:")
+    return "[Mode:" in text[:400] or "\n참고:" in text or text.startswith("참고:")
 
 
 def capture_from_hook_payload(
@@ -452,6 +460,9 @@ def capture_from_hook_payload(
     """Capture a hook response or enqueue a non-blocking repair row."""
     body = extract_hook_response_body(payload, client=client)
     source_event_id = _source_event_id_from_payload(payload)
+    # The live Claude Stop hook injects no source_event_id, so attribution falls
+    # back to the most-recent open pending matched by recency alone (not identity).
+    attributed_via_latest = source_event_id is None
     # Close stale orphans before the most-recent lookup so this answer cannot
     # attach to a pending whose own turn never produced a learner answer.
     if not source_event_id:
@@ -512,6 +523,29 @@ def capture_from_hook_payload(
             response_body=body,
         )
         return {"ok": False, "reason": "pending_missing", "source_event_id": source_event_id}
+
+    # Attribution came from the latest-pending fallback (recency, not identity),
+    # so a non-learning final message — e.g. a one-line progress status from a
+    # sync the learning turn launched — would otherwise overwrite the real
+    # learning answer in this open pending. The body-shape guard at 491 only runs
+    # when NO pending is found; apply it here too. If the body is not a learning
+    # answer, leave the pending open and route the message to the repair queue.
+    if attributed_via_latest and not looks_like_learning_answer_body(body):
+        append_repair_queue(
+            "non_learning_hook_message",
+            state_root=state_root,
+            status="ignored_non_learning",
+            source_event_id=source_event_id,
+            client=client,
+            details={"payload_keys": sorted(str(k) for k in payload.keys()),
+                     "attributed_via_latest": True},
+        )
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "non_learning_hook_message",
+            "source_event_id": source_event_id,
+        }
 
     ev = load_source_event(source_event_id, state_root=state_root)
     if ev is None:
