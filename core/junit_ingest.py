@@ -70,8 +70,7 @@ def _parse_xml(path: Path) -> list[TestCaseResult]:
             if failure is not None or error is not None:
                 msg_node = failure if failure is not None else error
                 status = "failed"
-                failure_message = (msg_node.get("message") or
-                                    (msg_node.text or "")[:300])
+                failure_message = (msg_node.get("message") or msg_node.text or "")[:300]
             elif skipped is not None:
                 status = "skipped"
                 failure_message = None

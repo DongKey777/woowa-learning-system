@@ -137,3 +137,17 @@ def test_ingest_failed_test_adds_inferred_concepts(tmp_path: Path) -> None:
 </testsuite>""", encoding="utf-8")
     report = ingest_junit_dir(xml_dir, state_root=state)
     assert "spring/mvc-controller-basics" in report.inferred_uncertain_concepts
+
+
+def test_parse_xml_failure_message_attr_capped_at_300(tmp_path: Path) -> None:
+    # The 300-char cap must apply to the message ATTRIBUTE too, not only the
+    # element-text fallback (a misplaced paren capped only the text branch).
+    long = "X" * 1000
+    p = tmp_path / "TEST-com.foo.LongTest.xml"
+    p.write_text(
+        '<testsuite name="t" tests="1" failures="1">'
+        '<testcase classname="com.foo.LongTest" name="big" time="0">'
+        f'<failure message="{long}" type="AssertionError">short</failure>'
+        '</testcase></testsuite>', encoding="utf-8")
+    case = [c for c in _parse_xml(p) if c.status == "failed"][0]
+    assert len(case.failure_message) == 300

@@ -202,3 +202,25 @@ def test_is_capturable_learning_turn_gates_on_raw_utterance() -> None:
     # Dev-mode asks — NOT captured regardless of utterance.
     assert f("development", "트랜잭션 격리") is False
     assert f("development", None) is False
+
+
+def test_safe_send_swallows_client_disconnect() -> None:
+    from core.daemon import _safe_send
+
+    class _Gone:
+        def sendall(self, data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    class _Ok:
+        def __init__(self):
+            self.sent = b""
+
+        def sendall(self, data):
+            self.sent += data
+
+    # must NOT raise — a propagating BrokenPipe here unwinds the serve loop into
+    # the outer finally that unlinks the daemon socket + pid (kills the daemon).
+    assert _safe_send(_Gone(), b"x") is False
+    ok = _Ok()
+    assert _safe_send(ok, b"hello") is True
+    assert ok.sent == b"hello"

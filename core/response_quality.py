@@ -84,10 +84,15 @@ def detect_citation_drift(
     dec = set(declared or [])
     if exp and not dec:
         flags.add("missing_citation")
-    elif dec - exp:
-        flags.add("extra_citation")
-    elif exp - dec:
-        flags.add("citation_mismatch")
+    else:
+        # extra and mismatch are independent: declared can carry an unexpected
+        # path AND miss an expected one at once. An elif chain masked
+        # citation_mismatch whenever extra_citation also fired (docstring says
+        # mismatch = "any subset miss").
+        if dec - exp:
+            flags.add("extra_citation")
+        if exp - dec:
+            flags.add("citation_mismatch")
     return flags
 
 

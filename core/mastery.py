@@ -128,7 +128,8 @@ def record_evidence(
         conn.execute(
             "INSERT INTO mastery(concept_id, bloom_level, evidence_count, last_seen_at) "
             "VALUES(?, 'attempted', 1, ?) "
-            "ON CONFLICT(concept_id) DO UPDATE SET evidence_count = evidence_count + 1, last_seen_at = excluded.last_seen_at",
+            "ON CONFLICT(concept_id) DO UPDATE SET evidence_count = evidence_count + 1, "
+            "last_seen_at = MAX(last_seen_at, excluded.last_seen_at)",
             (concept_id, now),
         )
     return eid
