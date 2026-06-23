@@ -20,6 +20,13 @@ PENDING_DIR = "pending-captures"
 REPAIR_QUEUE = "capture-repair-queue.jsonl"
 REPAIR_BODY_DIR = "capture-repair-bodies"
 
+# A learner-facing answer attaches to its pending within ~1 min (measured
+# median 0.9 min over real captures). A pending still open past this age is an
+# orphan — the turn produced no captured learner answer — and must not absorb a
+# later, unrelated answer (capture-attribution pollution). 15 min matches the
+# existing supersede window and leaves wide margin over the genuine latency.
+STALE_PENDING_AGE_S = 900.0
+
 
 def is_internal_capture_meta_prompt(prompt: str | None) -> bool:
     """Return True for prompts whose only purpose is finding a source id."""
@@ -115,24 +122,75 @@ def latest_pending_capture(
     *,
     state_root: Path = DEFAULT_STATE_ROOT,
     statuses: set[str] | None = None,
+    max_age_s: float | None = STALE_PENDING_AGE_S,
 ) -> dict[str, Any] | None:
+    """Return the most recent open pending capture, ignoring stale orphans.
+
+    The Stop hook carries no source_event_id, so it falls back to this
+    most-recent lookup to attach a learner answer. A learner-facing answer
+    attaches to its own pending within ~1 min (median 0.9). A pending still
+    open after ``max_age_s`` is an orphan — the turn never produced a captured
+    learner answer (Mode-B work in a mixed session, an abandoned ask). Returning
+    such a row would mis-attach a much later, unrelated answer to it (the
+    capture-attribution pollution). ``max_age_s=None`` disables the age cap.
+    """
     statuses = statuses or {"pending", "failed_pending_repair"}
     root = pending_capture_dir(state_root)
     if not root.exists():
         return None
+    cutoff = (time.time() - max_age_s) if max_age_s is not None else None
     rows: list[dict[str, Any]] = []
     for path in root.glob("*.json"):
         try:
             row = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
-        if row.get("status") in statuses:
-            row["_path"] = str(path)
-            rows.append(row)
+        if row.get("status") not in statuses:
+            continue
+        if cutoff is not None and float(row.get("created_at") or 0.0) < cutoff:
+            continue  # stale orphan — a fresh answer must not attach to it
+        row["_path"] = str(path)
+        rows.append(row)
     if not rows:
         return None
     rows.sort(key=lambda r: (float(r.get("created_at") or 0.0), str(r.get("source_event_id"))))
     return rows[-1]
+
+
+def expire_stale_pending_captures(
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+    max_age_s: float = STALE_PENDING_AGE_S,
+) -> int:
+    """Close pending rows older than ``max_age_s`` as orphans.
+
+    Companion to ``latest_pending_capture``'s age cap: the cap stops a stale
+    pending from absorbing an unrelated answer, and this sweep marks those
+    orphans terminal so the pending pool does not grow without bound and the
+    orphan is observable (``status='expired_orphan'``) instead of silently
+    skipped. Called opportunistically from the capture path. Returns the count
+    of newly expired rows.
+    """
+    root = pending_capture_dir(state_root)
+    if not root.exists():
+        return 0
+    cutoff = time.time() - max_age_s
+    expired = 0
+    for path in root.glob("*.json"):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if row.get("status") not in {"pending", "failed_pending_repair"}:
+            continue
+        if float(row.get("created_at") or 0.0) >= cutoff:
+            continue
+        row["status"] = "expired_orphan"
+        row["updated_at"] = time.time()
+        row["expired_reason"] = "stale_orphan_no_answer"
+        _atomic_write_json(path, row)
+        expired += 1
+    return expired
 
 
 def update_pending_capture(
@@ -394,6 +452,10 @@ def capture_from_hook_payload(
     """Capture a hook response or enqueue a non-blocking repair row."""
     body = extract_hook_response_body(payload, client=client)
     source_event_id = _source_event_id_from_payload(payload)
+    # Close stale orphans before the most-recent lookup so this answer cannot
+    # attach to a pending whose own turn never produced a learner answer.
+    if not source_event_id:
+        expire_stale_pending_captures(state_root=state_root)
     pending = (
         load_pending_capture(source_event_id, state_root=state_root)
         if source_event_id else latest_pending_capture(state_root=state_root)
@@ -533,13 +595,18 @@ def drain_repair_queue(
     Used by both bin/capture-repair (explicit) and capture_from_hook_payload's
     success path (opportunistic), so successful hooks gradually drain backlog
     without a separate cron/daemon job.
+
+    ``limit`` caps how many repairs are APPLIED per call (bounding work), not how
+    many rows are scanned. The whole queue is scanned every call — capping the
+    scan window instead would strand repairable rows older than the last
+    ``limit`` lines, never draining them.
     """
     queue_path = repair_queue_path(state_root)
     if not queue_path.exists():
         return {"scanned": 0, "repairable": 0, "applied": 0, "unrecoverable": 0, "drain_errors": 0}
 
     rows: list[dict[str, Any]] = []
-    for line in queue_path.read_text(encoding="utf-8").splitlines()[-limit:]:
+    for line in queue_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
@@ -589,6 +656,8 @@ def drain_repair_queue(
         from core.response_quality import record_response_quality
 
         for row, ev, body_path in repairable:
+            if applied >= limit:
+                break  # bound applied repairs per call; rest drain next call
             try:
                 body = body_path.read_text(encoding="utf-8")
                 expected, repo = _source_event_metadata(ev)

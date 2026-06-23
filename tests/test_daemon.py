@@ -186,3 +186,19 @@ def test_start_background_spawns_detached_process(monkeypatch, tmp_path: Path) -
     kwargs = popen.call_args.kwargs
     assert kwargs["start_new_session"] is True
     assert kwargs["stdin"] is daemon.subprocess.DEVNULL
+
+
+def test_is_capturable_learning_turn_gates_on_raw_utterance() -> None:
+    """Pending capture is created only for a genuine learning turn (learning mode
+    + real learner utterance). Bare probes / multi-intent sub-asks (no
+    raw_utterance) and dev-mode asks must be excluded — else the Stop hook's
+    latest-pending attach absorbs the session's next unrelated message."""
+    f = daemon._is_capturable_learning_turn
+    # Genuine learning turn — captured.
+    assert f("learning", "빈 등록이 뭐야") is True
+    # Bare probe in (default) learning mode but no --raw-utterance — NOT captured.
+    assert f("learning", None) is False
+    assert f("learning", "") is False
+    # Dev-mode asks — NOT captured regardless of utterance.
+    assert f("development", "트랜잭션 격리") is False
+    assert f("development", None) is False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -13,8 +14,11 @@ from core.response_capture import (  # noqa: E402
     capture_from_hook_payload,
     create_pending_capture,
     drain_repair_queue,
+    expire_stale_pending_captures,
     is_internal_capture_meta_prompt,
+    latest_pending_capture,
     load_pending_capture,
+    pending_capture_dir,
     repair_queue_path,
     sync_pending_captures_from_quality,
 )
@@ -316,3 +320,107 @@ def test_learning_data_clean_hard_deletes_orphans(tmp_path: Path) -> None:
     remaining_history = (learner / "history.jsonl").read_text(encoding="utf-8")
     assert "ask-ok" in remaining_history
     assert "ask-meta" not in remaining_history
+
+
+def _write_pending(state: Path, sid: str, created_at: float, status: str = "pending") -> None:
+    pending_dir = pending_capture_dir(state)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    (pending_dir / f"{sid}.json").write_text(json.dumps({
+        "schema_id": "response-capture-pending-v1",
+        "source_event_id": sid,
+        "repo": "spring-roomescape-waiting",
+        "prompt": "테스트",
+        "status": status,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "attempts": 0,
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def test_age_cap_excludes_stale_pending_from_latest_lookup(tmp_path: Path) -> None:
+    # A pending older than the age cap is a stale orphan — latest_pending_capture
+    # must not return it, so a much later answer can't attach to it.
+    state = tmp_path / "state"
+    _write_pending(state, "ask-stale", created_at=time.time() - 5000)
+    assert latest_pending_capture(state_root=state) is None
+    # ...but with the cap disabled the stale row is still reachable.
+    assert latest_pending_capture(state_root=state, max_age_s=None) is not None
+
+
+def test_modeb_narration_does_not_pollute_stale_learning_pending(tmp_path: Path) -> None:
+    # The pollution case: a genuine learning pending sat open (the learner answer
+    # never came), then a later Mode-B narration Stop message arrives. The stale
+    # pending must be expired (not absorb the narration), and the narration is
+    # routed to the repair queue as non-learning rather than captured.
+    state = tmp_path / "state"
+    _write_pending(state, "ask-orphan", created_at=time.time() - 5000)
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "## 검증 완료\n\npytest 745/745 passed, 커밋·푸시 끝."},
+        client="claude",
+        state_root=state,
+    )
+    assert result["ok"] is True
+    assert result["ignored"] is True  # not attached to the stale pending
+    orphan = load_pending_capture("ask-orphan", state_root=state)
+    assert orphan is not None
+    assert orphan["status"] == "expired_orphan"  # GC closed it, observable
+    assert not (state / "learner" / "response-quality.jsonl").exists()
+
+
+def test_answer_attaches_to_fresh_pending_not_stale_orphan(tmp_path: Path) -> None:
+    # With both a stale orphan and a fresh pending open, a fresh learner answer
+    # must attach to the fresh one — not the older orphan (the mis-attribution
+    # that inflated capture latency to hours).
+    state = tmp_path / "state"
+    _write_pending(state, "ask-old-orphan", created_at=time.time() - 5000)
+    fresh = _ask_event()
+    fresh["event_id"] = "ask-fresh"
+    append_history_event(fresh, state_root=state)
+    create_pending_capture(fresh, state_root=state)
+
+    result = capture_from_hook_payload(
+        {"last_assistant_message": "[Mode: cs_qa]\n\n격리 수준 답변\n\n참고:\n- database/transaction-isolation-locking\n"},
+        client="claude",
+        state_root=state,
+        learner_id="DongKey777",
+    )
+    assert result["ok"] is True
+    assert result["source_event_id"] == "ask-fresh"
+    assert load_pending_capture("ask-fresh", state_root=state)["status"] == "captured"
+    assert load_pending_capture("ask-old-orphan", state_root=state)["status"] == "expired_orphan"
+
+
+def test_expire_stale_pending_captures_marks_only_old(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _write_pending(state, "ask-old", created_at=time.time() - 5000)
+    _write_pending(state, "ask-recent", created_at=time.time() - 60)
+    n = expire_stale_pending_captures(state_root=state)
+    assert n == 1
+    assert load_pending_capture("ask-old", state_root=state)["status"] == "expired_orphan"
+    assert load_pending_capture("ask-recent", state_root=state)["status"] == "pending"
+
+
+def test_drain_scans_repairable_beyond_last_limit_lines(tmp_path: Path) -> None:
+    # Regression: drain used to scan only the last `limit` queue lines, stranding
+    # repairable rows older than that window. The repairable row is enqueued first,
+    # then pushed past the window by filler rows; drain must still find + apply it.
+    state = tmp_path / "state"
+    early = _ask_event()
+    early["event_id"] = "ask-early-repairable"
+    append_history_event(early, state_root=state)
+    append_repair_queue(
+        "pending_missing",
+        state_root=state,
+        source_event_id="ask-early-repairable",
+        client="claude",
+        response_body="[Mode: cs_qa]\n\n예전 본문\n\n참고:\n- database/transaction-isolation-locking\n",
+    )
+    queue_path = repair_queue_path(state)
+    for i in range(5):  # filler non-repairable rows push the early row out of a small window
+        with queue_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"reason": "body_missing", "status": "ignored_non_learning", "i": i}) + "\n")
+
+    summary = drain_repair_queue(state_root=state, learner_id="DongKey777", limit=2)
+    assert summary["applied"] == 1  # found despite being beyond the last 2 lines
+    quality = (state / "learner" / "response-quality.jsonl").read_text(encoding="utf-8")
+    assert "ask-early-repairable" in quality

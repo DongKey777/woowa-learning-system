@@ -191,7 +191,7 @@ python3 bin/ask "테스트"
 ### 4.2.1 답변 본문 수집 규칙
 - UX가 우선이다. 답변 본문 수집 실패가 학습 답변을 막으면 안 된다.
 - Claude/Codex/Gemini hook이 가능한 환경은 `bin/capture-response`가 최종 답변을 자동 수집한다.
-- `bin/ask`는 learning turn마다 pending capture를 만들고, hook은 가장 최근 pending에 최종 답변을 연결한다.
+- `bin/ask`는 **genuine 학습 turn(learning 모드 + `--raw-utterance`)마다** pending capture를 만들고(raw 없는 bare 프로브·dev 호출은 안 만듦, `daemon._is_capturable_learning_turn`), hook은 가장 최근 pending에 최종 답변을 연결한다. **15분(`STALE_PENDING_AGE_S`)을 넘긴 pending은 orphan으로 자동 만료**(`expire_stale_pending_captures`)되어 뒤늦은 무관 답변을 흡수하지 못한다 — 이 둘이 dev narration이 학습 pending에 잘못 붙던 capture-attribution 오염을 막는다.
 - hook 수집 실패 시 `state/learner/capture-repair-queue.jsonl`에 남기고, 학습자에게는 짧게만 안내한다: *"학습 기록 저장은 나중에 자동 보정할게."*
 - `# response_quality_hint.command_template` 수동 실행은 hook이 없는 환경의 fallback이다.
 - 수동 full-body fallback은 `full_body_path_template`의 `--response-path <answer.md>`를 우선 사용한다.
@@ -209,7 +209,7 @@ python3 bin/ask "테스트"
 
 ### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
 
-발화가 2개 이상 독립 주제면 **주제별 `bin/ask`를 N회 따로 호출**한다(쿼리 1개→벡터 1개, `rag/search.py` `q_vec = encode_fn(query)`). 한 문자열에 여러 주제를 섞으면 dense 평균화로 어휘 센 주제가 벡터를 점령하고 나머지 sub-intent gold가 top-5 밖 탈락한다(실측 per-sub-intent recall@5 53%→분해 100%, +47pp). `--reformulated-query` 단일 호출도 `retrieval_query`로 합쳐져 한 벡터가 되므로 이 희석을 못 막는다 — 1순위가 될 수 없다. sub-ask N회면 pending capture N개·Stop hook은 최신 1개만 연결하므로 직후 `bin/capture-repair --sync-pending`로 정합한다(분해의 정상 비용). N회 결과는 한 답변에 주제별 섹션으로 합쳐 모든 sub-intent를 corpus 근거로 커버(주제 간 근거 섞기 금지). `--raw-utterance`는 첫 호출 한 번에만(중복 = raw→rewritten 쌍 오염). **False-positive 가드**: 번호/옵션 나열 단일주제(락 전략 3개, DI 3가지)는 분해 금지 — 정답 개념이 다른 클러스터에 흩어지는 진짜 2+ 주제만 분해, 모호하면 단일 검색(보수적 안전). 개념 부재 기인 미스는 분해로 못 고치며 코퍼스 과제다.
+발화가 2개 이상 독립 주제면 **주제별 `bin/ask`를 N회 따로 호출**한다(쿼리 1개→벡터 1개, `rag/search.py` `q_vec = encode_fn(query)`). 한 문자열에 여러 주제를 섞으면 dense 평균화로 어휘 센 주제가 벡터를 점령하고 나머지 sub-intent gold가 top-5 밖 탈락한다(실측 per-sub-intent recall@5 53%→분해 100%, +47pp). `--reformulated-query` 단일 호출도 `retrieval_query`로 합쳐져 한 벡터가 되므로 이 희석을 못 막는다 — 1순위가 될 수 없다. `--raw-utterance`를 첫 sub-ask에만 넘기므로 daemon은 첫 호출만 pending capture를 만들고 나머지 sub-ask(raw_utterance 없음)는 안 만든다(`daemon._is_capturable_learning_turn` 게이팅) — N-pending 오염도 capture-repair도 없다. N회 결과는 한 답변에 주제별 섹션으로 합쳐 모든 sub-intent를 corpus 근거로 커버(주제 간 근거 섞기 금지). `--raw-utterance`는 첫 호출 한 번에만(중복 = raw→rewritten 쌍 오염). **False-positive 가드**: 번호/옵션 나열 단일주제(락 전략 3개, DI 3가지)는 분해 금지 — 정답 개념이 다른 클러스터에 흩어지는 진짜 2+ 주제만 분해, 모호하면 단일 검색(보수적 안전). 개념 부재 기인 미스는 분해로 못 고치며 코퍼스 과제다.
 
 ### 4.3 학습자 코드 작성/수정 시
 다음 둘 중 하나면 `bin/learn-record-code --file-path <p> --summary "<1줄>" --lines-added N --lines-removed M --silent` 자동 호출:
