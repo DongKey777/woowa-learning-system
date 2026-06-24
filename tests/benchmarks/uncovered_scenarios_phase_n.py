@@ -97,39 +97,54 @@ def mastered_concepts() -> list[str]:
     return [r["concept_id"] for r in rows]
 
 
+def mastery_snapshot() -> list[tuple]:
+    """Full mastery table (concept_id, bloom_level, evidence_count), ordered.
+    The N1 persistence invariant snapshots THIS — not only the (currently empty)
+    'mastered' level — so survives-restart is a non-vacuous check over the live
+    ~296-row table rather than a trivially-true [] == [] comparison."""
+    conn = sqlite3.connect(STATE / "learner" / "mastery_graph.sqlite")
+    try:
+        return conn.execute(
+            "SELECT concept_id, bloom_level, evidence_count FROM mastery "
+            "ORDER BY concept_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 # ── N1 state persistence ──────────────────────────────────────────────────
 
 def n1_state_persistence() -> ScenarioResult:
     """Mastery in SQLite must survive daemon restart."""
     global LAST_RESTART_MASTERY_CHECK
     if LAST_RESTART_MASTERY_CHECK:
-        mastered_before = LAST_RESTART_MASTERY_CHECK["before"]
-        mastered_after = LAST_RESTART_MASTERY_CHECK["after"]
+        snap_before = LAST_RESTART_MASTERY_CHECK["before"]
+        snap_after = LAST_RESTART_MASTERY_CHECK["after"]
         restarted = LAST_RESTART_MASTERY_CHECK["restarted"]
         restart_details = LAST_RESTART_MASTERY_CHECK["restart_details"]
-        method = "reuse N3 daemon restart evidence → compare mastery before/after"
+        method = "reuse N3 daemon restart evidence → compare full mastery table before/after"
     else:
-        mastered_before = mastered_concepts()
+        snap_before = mastery_snapshot()
         restarted, restart_details = restart_daemon("/tmp/daemon_n1.log")
-        mastered_after = mastered_concepts()
-        method = "dump mastery sqlite → restart daemon → re-dump → compare"
+        snap_after = mastery_snapshot()
+        method = "dump full mastery sqlite → restart daemon → re-dump → compare"
 
-    survived = sorted(mastered_before) == sorted(mastered_after)
+    # Persistence invariant = the FULL mastery table is byte-identical across a
+    # real restart, over a non-empty table. Snapshotting only the 'mastered' level
+    # (empty in the live state) made survived = ([] == []) trivially true — a
+    # restart that wiped the 296-row table would still have "passed". The
+    # non-emptiness clause now guards real data (296 live rows), NOT the bogus
+    # mastered-accumulation count it replaced.
+    survived = snap_before == snap_after
     return ScenarioResult(
         name="N1_state_persistence",
         description="mastery survives daemon stop→start",
-        observed=f"{len(mastered_before)} mastered before, {len(mastered_after)} after, "
+        observed=f"{len(snap_before)} mastery rows before, {len(snap_after)} after, "
                  f"identical: {survived}, restarted: {restarted}",
-        # Persistence invariant = the mastery set is byte-identical across a real
-        # restart. The old `len(mastered_after) > 0` clause tested data ACCUMULATION
-        # (≥1 mastered concept in the live state), not persistence — and the live
-        # state legitimately has 0 'mastered' when no graded-drill / aged-self-assess
-        # evidence exists, which made this scenario fail for a reason unrelated to
-        # what it claims to verify.
-        passed=restarted and survived,
+        passed=restarted and survived and len(snap_after) > 0,
         method=method,
-        details={"mastered_before_n": len(mastered_before),
-                 "mastered_after_n": len(mastered_after),
+        details={"rows_before_n": len(snap_before),
+                 "rows_after_n": len(snap_after),
                  "restart": restart_details},
     )
 
@@ -163,7 +178,7 @@ def n2_three_turn_history_foldin() -> ScenarioResult:
 def n3_fallback_no_daemon() -> ScenarioResult:
     """Stop daemon → bin/ask --no-daemon should still work (in-process)."""
     global LAST_RESTART_MASTERY_CHECK
-    mastered_before = mastered_concepts()
+    snap_before = mastery_snapshot()
     # Stop daemon.
     subprocess.run(["bin/rag-daemon", "stop"], cwd=REPO_ROOT,
                    capture_output=True, text=True)
@@ -177,10 +192,10 @@ def n3_fallback_no_daemon() -> ScenarioResult:
 
     # Restart daemon for subsequent scenarios. start-bg already waits for ping.
     restarted, restart_details = restart_daemon("/tmp/daemon_n3.log")
-    mastered_after = mastered_concepts()
+    snap_after = mastery_snapshot()
     LAST_RESTART_MASTERY_CHECK = {
-        "before": mastered_before,
-        "after": mastered_after,
+        "before": snap_before,
+        "after": snap_after,
         "restarted": restarted,
         "restart_details": restart_details,
     }

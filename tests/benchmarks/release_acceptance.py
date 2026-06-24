@@ -112,6 +112,11 @@ def _run_unit_suite() -> dict:
 # (intent.DRILL_ANSWER_HINT_PATTERN) and breaks deterministic dispatch. We quiesce
 # the transient pending-drill artifacts around just these benches — snapshot then
 # restore, never discarding the learner's real in-flight pending drill.
+# NB: pending_triggers.json (a live self_assessment) is intentionally NOT quiesced
+# — no current fixture uses a bare score-shaped prompt that the anchored
+# SCORE_LIKE_PATTERN (^\s*\d{1,2}\s*점\s*$) would catch ('DI 8점' fails the ^ anchor),
+# so a pending self_assessment cannot hijack any scenario today. Add it here if a
+# future fixture introduces a pure-score prompt.
 _ROUTING_SENSITIVE = {"full_scenario_comparison", "reformulated_query_path"}
 _TRANSIENT_STATE_FILES = ("drill_pending.json", "drill_offer_meta.json")
 

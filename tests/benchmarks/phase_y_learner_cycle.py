@@ -38,7 +38,9 @@ def _run(cmd, timeout=60, stdin=None):
 
 def _parse_json_safe(text: str) -> dict:
     try:
-        return json.loads(text)
+        # strict=False tolerates raw control chars (e.g. a newline echoed inside a
+        # session-start JSON string field), so a real event_id is still recovered.
+        return json.loads(text, strict=False)
     except Exception:
         return {}
 
@@ -49,10 +51,13 @@ def measure() -> dict:
     insights: list[str] = []
     REPO = "spring-roomescape-waiting"
 
-    # S1. session-start (warm — caches from earlier benches)
+    # S1. session-start (warm — caches from earlier benches). NOT --silent: its
+    # JSON carries the real rag_ask event_id from session-start's internal ask,
+    # which S7 needs to exercise the genuine rag_ask→history→lookup join (rather
+    # than a synthetic 'demo-event' orphan).
     r1 = _run([PY, "bin/session-start", "--repo", REPO,
                 "--prompt", "Bean DI 더 자세히",
-                "--path", str(MISSION), "--silent"])
+                "--path", str(MISSION)])
     j1 = _parse_json_safe(r1["stdout"])
     steps.append({"step": "S1_session_start", "rc": r1["rc"], "ms": r1["ms"],
                    "boot_type": j1.get("boot_type"),
@@ -114,27 +119,33 @@ def measure() -> dict:
                    "cases_total": j6.get("cases_total"),
                    "events_appended": j6.get("events_appended")})
 
-    # S7. learn-response-quality (use S1 event_id if available)
-    event_id = j1.get("event_id") or "demo-event"
-    # --allow-orphan: S1 runs session-start --silent (no event_id on stdout), so
-    # event_id falls back to the synthetic 'demo-event'. The W5 orphan guard
-    # (no matching rag_ask event) returns rc=2 without this documented tests/repair
-    # flag. The guard itself is correct data-integrity behavior — the bench just
-    # needs to opt into the synthetic-id smoke path.
-    r7 = _run([PY, "bin/learn-response-quality",
-                "--source-event-id", event_id, "--allow-orphan",
-                "--response-summary", "Bean DI 답변",
-                "--response-text", "Bean은 IoC 컨테이너가 관리하는 객체입니다",
-                "--expected-citation", "spring/bean-di-basics",
-                "--declared-citation", "spring/bean-di-basics",
-                "--repo", REPO, "--silent"])
-    steps.append({"step": "S7_learn_response_quality", "rc": r7["rc"], "ms": r7["ms"]})
+    # S7. learn-response-quality — exercise the REAL rag_ask→history→lookup join
+    # using S1's actual event_id. No --allow-orphan / no synthetic 'demo-event':
+    # that escape hatch skips the very join this step verifies AND writes orphan
+    # rows into production telemetry. If the daemon was down (no real event_id),
+    # skip cleanly instead of fabricating an orphan.
+    event_id = j1.get("event_id")
+    if event_id:
+        r7 = _run([PY, "bin/learn-response-quality",
+                    "--source-event-id", event_id,
+                    "--response-summary", "Bean DI 답변",
+                    "--response-text", "Bean은 IoC 컨테이너가 관리하는 객체입니다",
+                    "--expected-citation", "spring/bean-di-basics",
+                    "--declared-citation", "spring/bean-di-basics",
+                    "--repo", REPO, "--silent"])
+        steps.append({"step": "S7_learn_response_quality", "rc": r7["rc"], "ms": r7["ms"]})
+    else:
+        steps.append({"step": "S7_learn_response_quality", "rc": 0,
+                       "skip": "no real event_id (daemon down?)"})
 
-    # S8. learn-feedback (helpful signal)
-    r8 = _run([PY, "bin/learn-feedback", "--signal", "helpful",
-                "--hit", "spring/bean-di-basics",
-                "--source-event-id", event_id, "--silent"])
-    steps.append({"step": "S8_learn_feedback", "rc": r8["rc"], "ms": r8["ms"]})
+    # S8. learn-feedback (helpful signal) — same real event_id, skip if absent.
+    if event_id:
+        r8 = _run([PY, "bin/learn-feedback", "--signal", "helpful",
+                    "--hit", "spring/bean-di-basics",
+                    "--source-event-id", event_id, "--silent"])
+        steps.append({"step": "S8_learn_feedback", "rc": r8["rc"], "ms": r8["ms"]})
+    else:
+        steps.append({"step": "S8_learn_feedback", "rc": 0, "skip": "no real event_id"})
 
     # S9. profile-recompute (post-cycle)
     r9 = _run([PY, "bin/profile-recompute", "--silent"])
