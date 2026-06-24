@@ -273,3 +273,17 @@ def test_reconcile_recomputes_familiar_at_wall_clock_not_max_ts(tmp_path: Path) 
     # reconcile agrees with the production promotion path (no familiar flicker)
     compact_all(state_root=tmp_path)
     assert get("c/stale", state_root=tmp_path).bloom_level == "attempted"
+
+
+def test_drill_weight_below_strong_threshold_not_mastered(tmp_path: Path) -> None:
+    from core.mastery import get, promote, record_evidence
+    now = 1_000_000.0
+    ingest_pr_merge(["c/x"], state_root=tmp_path, ts=now - 100)
+    ingest_mentor_accept(["c/x"], state_root=tmp_path, ts=now - 50)  # proficient
+    # 0.7×0.79 = 0.553 < 0.559 → not a strong drill → stays proficient
+    record_evidence("c/x", "drill_score", score=0.79, state_root=tmp_path, ts=now)
+    assert promote("c/x", state_root=tmp_path, now=now) == "proficient"
+    # 0.7×0.8 = 0.5599999… ≥ 0.559 → strong → mastered (score=8 path unbroken)
+    record_evidence("c/x", "drill_score", score=0.8, state_root=tmp_path, ts=now)
+    assert promote("c/x", state_root=tmp_path, now=now) == "mastered"
+    assert get("c/x", state_root=tmp_path).bloom_level == "mastered"

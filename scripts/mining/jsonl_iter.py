@@ -87,6 +87,8 @@ def iter_jsonl(path: Path, since_ts: float | None = None,
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(ev, dict):
+                continue  # a bare JSON scalar (42, "x") parses but has no .get
             if event_type and ev.get("event_type") != event_type:
                 continue
             if mode is not None and ev.get("mode") != mode:
