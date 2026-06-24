@@ -311,6 +311,53 @@ def append_jsonl_locked(path: Path, row: dict) -> None:
             f.write(line)
 
 
+def rewrite_jsonl_locked(path: Path, keep) -> int:
+    """In-place filter a jsonl file under the SAME fcntl LOCK_EX that
+    ``append_jsonl_locked`` takes, so a concurrent append cannot be lost to a
+    read-modify-write race. ``keep(parsed_or_None, raw_line) -> bool`` decides
+    each line; unparseable lines are passed as ``parsed=None`` (conservatively
+    kept by most callers). Returns the count of rows removed. Falls back to an
+    unlocked rewrite on Windows / unsupported filesystems."""
+    if not path.exists():
+        return 0
+
+    def _filter(text: str):
+        kept: list[str] = []
+        removed = 0
+        for ln in text.splitlines():
+            if not ln.strip():
+                continue
+            try:
+                parsed = json.loads(ln)
+            except json.JSONDecodeError:
+                parsed = None
+            if keep(parsed, ln):
+                kept.append(ln)
+            else:
+                removed += 1
+        return kept, removed
+
+    try:
+        import fcntl
+        with path.open("r+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                kept, removed = _filter(f.read())
+                if removed:
+                    f.seek(0)
+                    f.truncate()
+                    f.write("".join(s + "\n" for s in kept))
+                    f.flush()
+                return removed
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        kept, removed = _filter(path.read_text(encoding="utf-8"))
+        if removed:
+            path.write_text("".join(s + "\n" for s in kept), encoding="utf-8")
+        return removed
+
+
 def append_history_event(event: dict, state_root: Path = DEFAULT_STATE_ROOT) -> None:
     """Append one event line to history.jsonl. Caller supplies event_id + ts."""
     event = {**event, "ts": event.get("ts", time.time())}

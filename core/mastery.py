@@ -77,6 +77,11 @@ def _connect(state_root: Path = DEFAULT_STATE_ROOT):
     p = _db_path(state_root)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p))
+    # Wait up to 5s for a concurrent writer's lock instead of erroring out
+    # immediately (default busy_timeout=0). sync-prs/profile-recompute/drill all
+    # write this DB while the daemon records per-ask evidence; without this the
+    # loser got 'database is locked' and the daemon swallowed it → lost evidence.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     key = str(p)
     if key not in _SCHEMA_INITIALIZED:

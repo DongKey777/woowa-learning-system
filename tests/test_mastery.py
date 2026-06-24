@@ -159,3 +159,12 @@ def test_record_evidence_last_seen_at_keeps_max_not_last_written(tmp_path) -> No
     record_evidence("c/x", "mission_use", state_root=tmp_path, ts=5000.0)
     record_evidence("c/x", "mentor_accept", state_root=tmp_path, ts=1000.0)
     assert get("c/x", state_root=tmp_path).last_seen_at == 5000.0
+
+
+def test_connection_sets_busy_timeout(tmp_path) -> None:
+    # Without busy_timeout a concurrent writer's lock makes the loser raise
+    # 'database is locked' immediately (default 0); the daemon swallowed that →
+    # lost evidence. 5s wait lets the loser succeed.
+    from core.mastery import _connect
+    with _connect(state_root=tmp_path) as conn:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000

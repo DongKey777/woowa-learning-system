@@ -103,6 +103,7 @@ def _list_prs_from_sqlite(repo: str, learner_login: str,
     if not db.exists():
         return []
     conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA busy_timeout=5000")  # wait for concurrent writer, don't error
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
@@ -149,6 +150,7 @@ def _target_pr_threads(
     if not db.exists():
         return []
     conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA busy_timeout=5000")  # wait for concurrent writer, don't error
     conn.row_factory = sqlite3.Row
     try:
         # learner reply lookup table

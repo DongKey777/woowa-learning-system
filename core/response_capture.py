@@ -14,7 +14,12 @@ from typing import Any
 
 from core.response import parse_response
 from core.response_quality import record_response_quality, redact_pii
-from core.state import DEFAULT_STATE_ROOT, append_jsonl_locked, atomic_write_json
+from core.state import (
+    DEFAULT_STATE_ROOT,
+    append_jsonl_locked,
+    atomic_write_json,
+    rewrite_jsonl_locked,
+)
 
 PENDING_DIR = "pending-captures"
 REPAIR_QUEUE = "capture-repair-queue.jsonl"
@@ -783,32 +788,19 @@ def drain_repair_queue(
     # with no source_event_id (structurally unrepairable). They re-parsed on every
     # hook and only grew. Re-read first (the apply loop may have appended markers),
     # keep repair-relevant + unparseable rows, rewrite atomically. Best-effort.
-    compacted = 0
-    if apply:
-        try:
-            kept_lines: list[str] = []
-            for line in queue_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    kept_lines.append(line)
-                    continue
-                status = d.get("status") if isinstance(d, dict) else None
-                if status == "ignored_non_learning" or (
-                    status == "pending_repair" and not d.get("source_event_id")
-                ):
-                    compacted += 1
-                    continue
-                kept_lines.append(line)
-            if compacted:
-                tmp = queue_path.with_suffix(".jsonl.compact-tmp")
-                tmp.write_text(
-                    "".join(s + "\n" for s in kept_lines), encoding="utf-8")
-                tmp.replace(queue_path)
-        except OSError:
-            pass
+    # Rewrite must hold the SAME fcntl LOCK_EX appenders use — an earlier
+    # unlocked read+tmp.replace could clobber a concurrent append (a genuine
+    # learner-answer repair row appended by an overlapping hook), silently losing
+    # it. rewrite_jsonl_locked serializes against append_jsonl_locked.
+    def _keep(d, _line) -> bool:
+        status = d.get("status") if isinstance(d, dict) else None
+        if status == "ignored_non_learning":
+            return False  # write-only diagnostic, drain never actions it
+        if status == "pending_repair" and not (isinstance(d, dict) and d.get("source_event_id")):
+            return False  # structurally unrepairable: no source id
+        return True
+
+    compacted = rewrite_jsonl_locked(queue_path, _keep) if apply else 0
 
     return {
         "scanned": len(rows),

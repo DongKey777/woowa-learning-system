@@ -124,6 +124,7 @@ def sync_repo(
     mentor_accept_emitted = 0
 
     conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA busy_timeout=5000")  # wait for concurrent writer, don't error
     conn.row_factory = sqlite3.Row
     try:
         login_col = _review_login_col(conn)
