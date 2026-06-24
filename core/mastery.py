@@ -119,6 +119,11 @@ def record_evidence(
     now = ts if ts is not None else time.time()
     with _connect(state_root) as conn:
         if dedup_key is not None:
+            # Take the write lock BEFORE the existence check so a concurrent
+            # same-key insert can't slip between this SELECT and the INSERT below
+            # (both saw empty → both inserted → duplicate). busy_timeout makes the
+            # loser wait for the winner's commit, then it sees the row and dedups.
+            conn.execute("BEGIN IMMEDIATE")
             prior = conn.execute(
                 "SELECT id FROM evidence WHERE json_extract(payload_json,'$.dedup_key')=? LIMIT 1",
                 (dedup_key,),
@@ -171,7 +176,9 @@ def _compute_level(evs: list[sqlite3.Row], now: float) -> str:
     distinct_sources_recent = {e["source"] for e in recent_window}
     has_pr_merge = any(e["source"] == "pr_merge" for e in evs)
     has_mentor_accept = any(e["source"] == "mentor_accept" for e in evs)
-    has_strong_drill = any(e["source"] == "drill_score" and e["weight"] >= 0.55 for e in evs)  # 0.7 × 0.8 = ~0.56 (float precision)
+    # Strong drill = score>=0.8 → weight 0.7×0.8 = 0.5599999… (float). 0.559 keeps
+    # that while excluding score 0.79 (weight 0.553) which a 0.55 cutoff let leak in.
+    has_strong_drill = any(e["source"] == "drill_score" and e["weight"] >= 0.559 for e in evs)
     has_self_assess_retained = any(
         e["source"] == "self_assess" and now - e["ts"] >= RETENTION_WINDOW_SECS for e in evs
     )

@@ -98,3 +98,12 @@ def test_parse_since_ts_relative_epoch_and_iso() -> None:
 def test_parse_since_ts_rejects_invalid_value() -> None:
     with pytest.raises(ValueError):
         parse_since_ts("last week")
+
+
+def test_iter_jsonl_skips_bare_scalar_line(tmp_path: Path) -> None:
+    # A valid JSON scalar (42, "x") parses but has no .get — must be skipped, not crash.
+    p = tmp_path / "h.jsonl"
+    p.write_text('{"event_type":"rag_ask"}\n42\n"str"\nnot-json\n{"event_type":"drill_answer"}\n',
+                 encoding="utf-8")
+    out = list(iter_jsonl(p))
+    assert [e.get("event_type") for e in out] == ["rag_ask", "drill_answer"]
