@@ -185,6 +185,8 @@ def test_entry_point_count() -> None:
                    "reclassify-history", "cohort-eval", "cohort-compare",
                    "golden", "rag-eval", "router-generalization-eval",
                    "learner-log-rag-eval",
+                   # Corpus exact-shortcut ownership gate (monotonic-quality lint)
+                   "corpus-lint",
                    # Phase X new wrappers (maintenance + sub-commands)
                    "sync-index-metadata", "drill-grade-prepare", "learn-feedback",
                    "learn-self-assess", "learn-drill", "learner-profile",

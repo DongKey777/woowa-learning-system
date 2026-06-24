@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""bin/corpus-lint — exact-shortcut ownership regression gate (monotonic quality).
+
+Recomputes the corpus "fire+shadow" set (curation/ownership.fire_and_shadow) — every
+normalized query string where the exact shortcut resolves to a single winner while a
+DIFFERENT concept also carries it (the steal surface) — and diffs it against the frozen
+baseline tests/fixtures/exact_owner_baseline.json. FAILS (exit 1) on any NEW fire+shadow
+or any winner FLIP, i.e. when a newly added/edited concept steals or shadows an existing
+canonical owner. This is the one guard that catches the steal class (e.g. "DI가 뭐야?"
+→ software-engineering/dependency-injection-basics shadowing spring/bean-di-basics)
+BEFORE a RunPod rebuild, so corpus expansion cannot silently regress an existing query.
+
+Verified (2026-06-24): the fire+shadow criterion flags exactly the 12 current steals
+with 0 false positives against the 1017 benign same-tier alias collisions (which return
+[] → dense fallback, 97.6% benign). See curation/ownership.py for the measured rationale.
+
+Wire as a BLOCKING pre-encode step in bin/corpus-build and a pre-write check in
+curation/apply_changes so steals are caught at the cheapest point (no rebuild needed).
+
+Usage:
+  bin/corpus-lint                 # gate: exit 1 if any new steal / flip vs baseline
+  bin/corpus-lint --json          # machine-readable diff
+  bin/corpus-lint --rebaseline    # regenerate the baseline (intentional ownership change)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from curation.ownership import diff_against_baseline, fire_and_shadow  # noqa: E402
+from rag.corpus_loader import load_corpus  # noqa: E402
+
+BASELINE_PATH = REPO_ROOT / "tests" / "fixtures" / "exact_owner_baseline.json"
+
+
+def _load_baseline() -> dict:
+    if not BASELINE_PATH.exists():
+        return {}
+    return json.loads(BASELINE_PATH.read_text(encoding="utf-8")).get("norms", {})
+
+
+def _write_baseline(current: dict) -> None:
+    doc = ("Frozen exact-shortcut fire+shadow baseline (curation/ownership.fire_and_shadow). "
+           "bin/corpus-lint fails on any NEW fire+shadow or winner flip vs this. "
+           "Regenerate intentionally via bin/corpus-lint --rebaseline when ownership is "
+           "deliberately changed (e.g. moving 'DI가 뭐야?' to spring/bean-di-basics).")
+    BASELINE_PATH.write_text(
+        json.dumps({"_doc": doc, "norms": current}, ensure_ascii=False,
+                   indent=2, sort_keys=True),
+        encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--rebaseline", action="store_true",
+                        help="regenerate the baseline from the current corpus")
+    args = parser.parse_args(argv)
+
+    corpus = load_corpus()
+    current = fire_and_shadow(corpus)
+
+    if args.rebaseline:
+        _write_baseline(current)
+        print(f"rebaselined: {len(current)} fire+shadow norms → {BASELINE_PATH}")
+        return 0
+
+    baseline = _load_baseline()
+    diff = diff_against_baseline(current, baseline)
+    new_steals, flipped = diff["new_steals"], diff["flipped"]
+    ok = not new_steals and not flipped
+
+    if args.json:
+        print(json.dumps({
+            "fire_shadow_total": len(current),
+            "baseline_total": len(baseline),
+            "new_steals": new_steals,
+            "flipped": flipped,
+            "pass": ok,
+        }, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
+    if ok:
+        print(f"✓ corpus-lint OK — {len(current)} fire+shadow norms, all baselined, "
+              f"no new steals or owner flips.")
+        return 0
+
+    print(f"✗ corpus-lint FAILED — exact-shortcut ownership regression.\n")
+    if new_steals:
+        print(f"  NEW steals ({len(new_steals)}) — a concept now shadows an existing owner:")
+        for n, info in sorted(new_steals.items()):
+            print(f"    '{n}' → winner={info['winner']} shadows {info['shadowed']}")
+    if flipped:
+        print(f"  FLIPPED owners ({len(flipped)}):")
+        for n, info in sorted(flipped.items()):
+            print(f"    '{n}': {info['baseline_winner']} → {info['now_winner']}")
+    print("\n  Fix: demote the stolen phrase to an alias on the non-canonical concept, "
+          "or — if the ownership change is intentional — run `bin/corpus-lint --rebaseline`.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

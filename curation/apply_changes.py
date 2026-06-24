@@ -1,17 +1,27 @@
 """Apply ProposedChange list to corpus/concepts/*.json.
 
-Reversible: writes original JSON to .bak before mutation. Caller decides
-whether to keep or revert via curation log.
+Caller decides whether to keep or revert via the curation log (the original JSON is
+recoverable from git, not a .bak sidecar).
+
+Ownership guard: after applying, this recomputes the exact-shortcut fire+shadow set
+(curation/ownership.fire_and_shadow) and reports any change that newly STEALS/shadows
+an existing canonical owner — the "DI가 뭐야?" regression class — in
+ApplyResult.ownership_new_steals. This is the cheapest catch point (no RunPod rebuild
+needed to discover a steal); bin/corpus-build runs the same gate as the hard backstop.
+The check reuses the production resolver, so it inherits the verified 0-false-positive
+property (benign same-tier alias collisions are NOT flagged).
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 from curation.propose_changes import ProposedChange
 from rag.corpus_loader import DEFAULT_CORPUS_DIR
+
+_BASELINE_PATH = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "exact_owner_baseline.json"
 
 
 @dataclass
@@ -19,6 +29,7 @@ class ApplyResult:
     applied: list[ProposedChange]
     skipped: list[tuple[ProposedChange, str]]  # (change, reason)
     touched_paths: list[Path]
+    ownership_new_steals: dict = field(default_factory=dict)  # norm -> info (new fire+shadow vs baseline)
 
 
 def apply(
@@ -68,7 +79,25 @@ def apply(
         touched.append(target)
         applied.append(change)
 
-    return ApplyResult(applied=applied, skipped=skipped, touched_paths=touched)
+    ownership_new_steals = _ownership_new_steals(corpus_dir) if (touched and not dry_run) else {}
+    return ApplyResult(applied=applied, skipped=skipped, touched_paths=touched,
+                       ownership_new_steals=ownership_new_steals)
+
+
+def _ownership_new_steals(corpus_dir: Path) -> dict:
+    """Recompute fire+shadow over the written corpus and return steals not in the
+    frozen baseline (a change shadowed an existing canonical owner). Empty when the
+    batch introduced no exact-shortcut regression. Reuses the production resolver, so
+    benign same-tier alias collisions are not flagged (verified 0 false positives)."""
+    try:
+        from curation.ownership import diff_against_baseline, fire_and_shadow
+        from rag.corpus_loader import load_corpus
+        baseline = (json.loads(_BASELINE_PATH.read_text(encoding="utf-8")).get("norms", {})
+                    if _BASELINE_PATH.exists() else {})
+        diff = diff_against_baseline(fire_and_shadow(load_corpus(corpus_dir=corpus_dir)), baseline)
+        return {**diff["new_steals"], **diff["flipped"]}
+    except Exception:
+        return {}  # never let the advisory guard break an apply
 
 
 def _mutate(entity: dict, change: ProposedChange) -> dict | None:

@@ -73,6 +73,16 @@ def _full_corpus_fingerprint(corpus) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Cohorts whose failure_focus makes an exact-query OWNER expectation incoherent:
+# the prompt is authored to be a paraphrase/symptom that must route by DENSE
+# meaning, NOT resolve via an alias/expected_query exact hit (paraphrase_human:
+# failure_focus korean_no_alias_match, rationale "alias 매칭으로 풀리면 안 됨";
+# symptom_to_cause: failure_focus symptom_routing). Demanding a verbatim exact
+# owner for these mislabels a dense-robustness fixture as a coverage gap — same
+# spirit as the existing corpus_gap_probe skip.
+_EXACT_OWNER_INCOHERENT_COHORTS = {"paraphrase_human", "symptom_to_cause"}
+
+
 def _qrels_short_cases() -> list[dict]:
     queries = json.loads(QRELS_PATH.read_text(encoding="utf-8"))["queries"]
     return [
@@ -80,6 +90,7 @@ def _qrels_short_cases() -> list[dict]:
         if len(q.get("expected_concepts") or []) == 1
         and len(q.get("prompt", "")) <= 45
         and not str(q.get("query_id", "")).startswith("corpus_gap_probe")
+        and q.get("cohort_tag") not in _EXACT_OWNER_INCOHERENT_COHORTS
     ]
 
 

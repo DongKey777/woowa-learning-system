@@ -370,3 +370,4 @@ WOOWA_SESSION_MODE=development python3 tests/benchmarks/full_scenario_comparison
 - [`docs/artifact-catalog.md`](docs/artifact-catalog.md) — `state/` `reports/` `corpus/` 구조
 - [`docs/testing-guide.md`](docs/testing-guide.md) — release acceptance와 benchmark 재현
 - [`docs/verification-results.md`](docs/verification-results.md) — 모든 측정 결과 인덱스
+- [`docs/corpus-expansion-quality.md`](docs/corpus-expansion-quality.md) — 코퍼스 확장 단조-품질 가드(`bin/corpus-lint` exact-shortcut 소유권 회귀 차단) + 프로세스
