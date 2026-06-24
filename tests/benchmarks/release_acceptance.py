@@ -106,6 +106,38 @@ def _run_unit_suite() -> dict:
     }
 
 
+# Benches whose mode-dispatch / fallback assertions assume a CLEAN routing state
+# (no pending drill). They run bin/ask against the live daemon + real state, so a
+# leftover pending drill in state/learner/ flips answer-shaped prompts to mode=drill
+# (intent.DRILL_ANSWER_HINT_PATTERN) and breaks deterministic dispatch. We quiesce
+# the transient pending-drill artifacts around just these benches — snapshot then
+# restore, never discarding the learner's real in-flight pending drill.
+_ROUTING_SENSITIVE = {"full_scenario_comparison", "reformulated_query_path"}
+_TRANSIENT_STATE_FILES = ("drill_pending.json", "drill_offer_meta.json")
+
+
+def _snapshot_routing_state() -> dict:
+    learner = REPO_ROOT / "state" / "learner"
+    snap: dict = {}
+    for fn in _TRANSIENT_STATE_FILES:
+        p = learner / fn
+        snap[fn] = p.read_text(encoding="utf-8") if p.exists() else None
+        if p.exists():
+            p.unlink()
+    return snap
+
+
+def _restore_routing_state(snap: dict) -> None:
+    learner = REPO_ROOT / "state" / "learner"
+    for fn, content in snap.items():
+        p = learner / fn
+        if content is None:
+            if p.exists():
+                p.unlink()
+        else:
+            p.write_text(content, encoding="utf-8")
+
+
 def _run_bench(category: str, name: str, path: Path, timeout: int) -> dict:
     if not path.exists():
         return {"category": category, "name": name, "rc": -1, "ms": 0,
@@ -121,25 +153,30 @@ def _run_bench(category: str, name: str, path: Path, timeout: int) -> dict:
             "--first-ask", "3",
             "--cold-timeout-s", "45",
         ]
+    snap = _snapshot_routing_state() if name in _ROUTING_SENSITIVE else None
     t0 = time.perf_counter()
     try:
-        r = subprocess.run(
-            [sys.executable, str(path), *extra_args],
-            cwd=REPO_ROOT,
-            capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "WOOWA_SESSION_MODE": "development"},
-        )
-        elapsed = (time.perf_counter() - t0) * 1000
-        return {
-            "category": category, "name": name,
-            "rc": r.returncode, "ms": round(elapsed, 1),
-            "stdout_tail": (r.stdout or "")[-200:],
-            "stderr_tail": (r.stderr or "")[-200:],
-            "pass": r.returncode == 0,
-        }
-    except subprocess.TimeoutExpired:
-        return {"category": category, "name": name, "rc": 124, "ms": -1,
-                "timeout": True, "pass": False}
+        try:
+            r = subprocess.run(
+                [sys.executable, str(path), *extra_args],
+                cwd=REPO_ROOT,
+                capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "WOOWA_SESSION_MODE": "development"},
+            )
+            elapsed = (time.perf_counter() - t0) * 1000
+            return {
+                "category": category, "name": name,
+                "rc": r.returncode, "ms": round(elapsed, 1),
+                "stdout_tail": (r.stdout or "")[-200:],
+                "stderr_tail": (r.stderr or "")[-200:],
+                "pass": r.returncode == 0,
+            }
+        except subprocess.TimeoutExpired:
+            return {"category": category, "name": name, "rc": 124, "ms": -1,
+                    "timeout": True, "pass": False}
+    finally:
+        if snap is not None:
+            _restore_routing_state(snap)
 
 
 def _architectural_checks() -> list[dict]:

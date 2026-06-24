@@ -116,8 +116,13 @@ def measure() -> dict:
 
     # S7. learn-response-quality (use S1 event_id if available)
     event_id = j1.get("event_id") or "demo-event"
+    # --allow-orphan: S1 runs session-start --silent (no event_id on stdout), so
+    # event_id falls back to the synthetic 'demo-event'. The W5 orphan guard
+    # (no matching rag_ask event) returns rc=2 without this documented tests/repair
+    # flag. The guard itself is correct data-integrity behavior — the bench just
+    # needs to opt into the synthetic-id smoke path.
     r7 = _run([PY, "bin/learn-response-quality",
-                "--source-event-id", event_id,
+                "--source-event-id", event_id, "--allow-orphan",
                 "--response-summary", "Bean DI 답변",
                 "--response-text", "Bean은 IoC 컨테이너가 관리하는 객체입니다",
                 "--expected-citation", "spring/bean-di-basics",

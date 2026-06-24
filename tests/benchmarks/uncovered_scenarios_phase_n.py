@@ -120,7 +120,13 @@ def n1_state_persistence() -> ScenarioResult:
         description="mastery survives daemon stop→start",
         observed=f"{len(mastered_before)} mastered before, {len(mastered_after)} after, "
                  f"identical: {survived}, restarted: {restarted}",
-        passed=restarted and survived and len(mastered_after) > 0,
+        # Persistence invariant = the mastery set is byte-identical across a real
+        # restart. The old `len(mastered_after) > 0` clause tested data ACCUMULATION
+        # (≥1 mastered concept in the live state), not persistence — and the live
+        # state legitimately has 0 'mastered' when no graded-drill / aged-self-assess
+        # evidence exists, which made this scenario fail for a reason unrelated to
+        # what it claims to verify.
+        passed=restarted and survived,
         method=method,
         details={"mastered_before_n": len(mastered_before),
                  "mastered_after_n": len(mastered_after),
