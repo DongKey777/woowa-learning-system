@@ -99,8 +99,17 @@ SAMPLES = [
     ("머지까지 얼마나 걸렸는지 보여줘", "roomescape-waiting", None, None, "temporal"),
 
     # cohort — family F, repo-gated (동료 대비 내 PR 위치), before retro (2)
+    # NB: these also guard peer_compare precedence — peer_compare is checked
+    # BEFORE cohort, so a cohort utterance with no peer keyword must still route
+    # cohort, not get stolen.
     ("동기들에 비해 내 PR 어때?", "roomescape-member", None, None, "cohort"),
     ("평균에 비해 내 위치는 어디야?", "roomescape-member", None, None, "cohort"),
+
+    # peer_compare — family P, repo-gated (동기 코드 정성 비교), before cohort (2)
+    # + a repo-gate negative (the keyword family is repo-gated like cohort).
+    ("동기 코드 비교해줘", "roomescape-waiting", None, None, "peer_compare"),
+    ("동기들은 이 미션 어떻게 짰어?", "roomescape-waiting", None, None, "peer_compare"),
+    ("동기 코드 비교해줘", None, None, None, "cs_qa"),  # repo-gate: no repo → not peer_compare
 
     # meta_analytics — family E, cross-repo (학습 메타 패턴), before retro (2)
     ("내가 자주 묻는 개념 뭐야?", None, None, None, "meta_analytics"),
@@ -124,7 +133,7 @@ SAMPLES = [
 
 def test_intent_dispatch_accuracy_50_sample() -> None:
     """D13 falsification gate — must hit ≥95% accuracy."""
-    assert len(SAMPLES) == 74, f"expected 74 samples, got {len(SAMPLES)}"
+    assert len(SAMPLES) == 77, f"expected 77 samples, got {len(SAMPLES)}"
 
     correct = 0
     failures: list[tuple[str, str, str]] = []

@@ -33,6 +33,7 @@ from core.router import (
     ARTIFACT_META_ANALYTICS,
     ARTIFACT_COHORT,
     ARTIFACT_PREDICT,
+    ARTIFACT_PEER_PR,
     RouteDecision,
 )
 from core.state import LearnerProfile
@@ -98,6 +99,8 @@ def load(
             out[name] = _load_cohort(repo, state_root)
         elif name == ARTIFACT_PREDICT:
             out[name] = _load_predict(repo, state_root)
+        elif name == ARTIFACT_PEER_PR:
+            out[name] = _load_peer_pr(repo, state_root)
     if route.need_rag and query:
         hits, personalization, dense_margin = _load_rag_hits(
             query, corpus=corpus, learner_profile=learner_profile,
@@ -616,6 +619,47 @@ def _load_predict_cached(path_str: str, mtime: float, top_n: int = 10) -> dict:
         "likely_hotspot_files": data.get("likely_hotspot_files", [])[:top_n],
         "smell_warnings": data.get("smell_warnings", [])[:top_n],
         "review_load_projection": data.get("review_load_projection", {}),
+        "counts": data.get("counts", {}),
+    }
+
+
+def _load_peer_pr(repo: str | None, state_root: Path) -> dict:
+    """Prebuilt peer-PR comparison artifact (bin/peer-pr-build).
+
+    Repo-scoped (mirrors _load_cohort): reads state/repos/<repo>/peer_pr.json.
+    The builder already produces the flat prompt shape (path-string lists,
+    string-keyed peer_files/threads) and caps every list, so we just gate to a
+    prompt-friendly top-N. ``missing=True`` when the builder hasn't run."""
+    if not repo:
+        return {"repo": None, "ready": False, "missing": True,
+                "learner_pr": {}, "peer_prs": [], "selection": []}
+    p = state_root / "repos" / repo / "peer_pr.json"
+    if not p.exists():
+        return {"repo": repo, "ready": False, "missing": True,
+                "learner_pr": {}, "peer_prs": [], "selection": []}
+    return _load_peer_pr_cached(str(p), p.stat().st_mtime)
+
+
+@lru_cache(maxsize=4)
+def _load_peer_pr_cached(path_str: str, mtime: float, top_paths: int = 20) -> dict:
+    data = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    return {
+        "ready": True,
+        "repo": data.get("repo"),
+        "status": data.get("status"),
+        "learner_login": data.get("learner_login"),
+        "learner_pr": data.get("learner_pr", {}),
+        "learner_files": data.get("learner_files", [])[:top_paths],
+        "peer_prs": data.get("peer_prs", []),
+        "peer_files": {k: (v or [])[:top_paths]
+                       for k, v in (data.get("peer_files") or {}).items()},
+        "peer_only_files": {k: (v or [])[:top_paths]
+                            for k, v in (data.get("peer_only_files") or {}).items()},
+        "common_paths": data.get("common_paths", [])[:top_paths],
+        "learner_only_paths": data.get("learner_only_paths", [])[:top_paths],
+        "peer_only_paths": data.get("peer_only_paths", [])[:top_paths],
+        "representative_threads": data.get("representative_threads", {}),
+        "selection": data.get("selection", []),
         "counts": data.get("counts", {}),
     }
 

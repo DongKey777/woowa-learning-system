@@ -115,6 +115,7 @@ state/
 │       ├── temporal.json           # mode temporal (learn-temporal-build)
 │       ├── thread_recon.json       # mode thread_recon (learn-thread-recon-build)
 │       ├── cohort.json             # mode cohort (learn-cohort-build)
+│       ├── peer_pr.json            # mode peer_compare — learner-vs-most-similar-peers diff (peer-pr-build)
 │       ├── predict.json            # mode predict — fuses C/F/H artifacts (learn-predict-build)
 │       ├── pr_threads/<n>.json     # live PR review-cycle snapshot per PR (pr-thread-status; delta source)
 │       ├── actions/                # coach-run action snapshots (coach-run.json, …)

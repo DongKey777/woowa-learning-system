@@ -255,6 +255,23 @@ COHORT_KEYWORDS = (
     "평균에 비해", "내 위치는", "내 순위", "동기들과 비교",
     "코호트 비교", "다른 학습자에 비해",
 )
+# Family P (peer_compare) — 같은 미션 동기/피어 PR과의 정성 코드 diff 비교(어떤 파일을
+# 어떻게 짰나 + 동기가 받은 멘토 지적). repo-gated. cohort(F)의 "비해/위치/순위" 정량
+# percentile과 구분되는 코드-비교 의도. cohort보다 먼저 검사돼 "동기 코드 비교"/"동기 풀이
+# 비교"가 cohort의 "동기들과 비교"보다 먼저 잡힌다. "내 pr이랑 비교"/"내 코드랑 비교"는
+# retro "내 pr"·coaching "내 코드"보다 먼저(더 구체적) 검사돼 비교 의도를 claim한다.
+# ⚠ f11 fast-path(cross-crew anchor)는 route()에서 detect_mode보다 먼저 utterance 단위로
+# 검사된다. 키워드 자체는 F11_KEYWORDS의 부분문자열이 아니지만, 발화가 별도의 broad F11
+# 토큰을 품으면("같은 미션 다른 사람 코드"→F11 "다른 사람 코드"; "...비교 의견"→F11 "비교
+# 의견") f11_anchor로 먼저 라우팅된다. 이 경계는 의도된 것(f11도 cross-crew 코드를 surface)
+# 이고, AI 세션의 1차 경로인 --mode peer_compare override는 f11 fast-path보다 앞서므로
+# 그런 발화도 명시 모드로는 정확히 peer_compare로 간다.
+PEER_COMPARE_KEYWORDS = (
+    "동기 pr", "피어 pr", "peer pr",
+    "동기 코드 비교", "동기 코드랑", "동기들 코드", "동기들은 이 미션",
+    "동기 풀이 비교", "같은 미션 다른 사람", "같은 미션 동기",
+    "내 pr이랑 비교", "내 코드랑 비교", "피어 비교",
+)
 # Family K (predict) — C(reviewer_profile)+F(cohort)+H(pr_diff_evolution) 합성한
 # 푸시 전 예측. repo-gated. pr_diff_evolution "리뷰 전 점검"/"자주 지적받은 파일"/
 # "코드 스멜", pr_review "멘토가 남긴"/"멘토 코멘트", reviewer_profile "멘토 어떤"과
@@ -353,6 +370,12 @@ def detect_mode(
             if kw in pl:
                 return IntentDecision(
                     "temporal", f"temporal keyword '{kw}'", 0.85)
+
+    if repo:
+        for kw in PEER_COMPARE_KEYWORDS:
+            if kw in pl:
+                return IntentDecision(
+                    "peer_compare", f"peer_compare keyword '{kw}'", 0.85)
 
     if repo:
         for kw in COHORT_KEYWORDS:

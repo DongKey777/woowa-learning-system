@@ -203,3 +203,14 @@ def test_mode_override_f11_builds_anchor_decision() -> None:
     assert d.need_anchors is True
     assert ARTIFACT_CROSS_CREW in d.lazy_artifacts
     assert ARTIFACT_ANCHORS in d.lazy_artifacts
+
+
+def test_mode_override_peer_compare_builds_peer_pr_decision() -> None:
+    """--mode peer_compare (the primary live entry) must be a valid override
+    that wires the peer_pr artifact + mission context."""
+    from core.router import ARTIFACT_PEER_PR
+    d = route("내 코드 어때", repo="x", mode_override="peer_compare")
+    assert d.mode == "peer_compare"
+    assert d.need_mission_ctx is True
+    assert ARTIFACT_PEER_PR in d.lazy_artifacts
+    assert ARTIFACT_MISSION_PATTERNS in d.lazy_artifacts

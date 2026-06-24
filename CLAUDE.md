@@ -159,7 +159,8 @@ python3 bin/ask "테스트"
 | `thread_recon` | 리뷰 스레드 대화 복원 | 권장 |
 | `temporal` | 라운드 latency, 정체 구간 같은 시간축 | 권장 |
 | `meta_analytics` | 재질문/드릴 추세/과신 같은 학습 메타 분석 | — |
-| `cohort` | 동기들과 비교해 내 PR이 어디쯤인지 | 권장 |
+| `cohort` | 동기들과 비교해 내 PR이 **어디쯤**인지(크기/리뷰 수 정량 percentile) | 권장 |
+| `peer_compare` | 같은 미션 동기들은 코드를 **어떻게** 짰는지(파일 diff + 동기가 받은 멘토 지적, 정성). cohort=정량 위치, peer_compare=정성 코드/리뷰 비교 | 필수 |
 | `predict` | 올리기 전에 어떤 리뷰가 올지 미리 보기 | 권장 |
 | `f11_anchor` | 내 리뷰 anchor가 다른 크루는 어땠는지(cross-crew) | 필수 |
 

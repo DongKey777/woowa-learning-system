@@ -159,3 +159,92 @@ def test_reorder_must_skip_noop_without_rag_concept_ids() -> None:
     ms = [f"a/concept-{i:02d}" for i in range(13)]
     assert _reorder_must_skip_by_relevance(ms, []) == ms
     assert _reorder_must_skip_by_relevance(ms, [{"no_cid": 1}]) == ms
+
+
+def test_render_peer_pr_renders_comparison() -> None:
+    from core.router import RouteDecision
+
+    r = RouteDecision(
+        mode="peer_compare", need_rag=False, need_mission_ctx=True,
+        need_anchors=False, personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+        budget_tokens=7000, lazy_artifacts=["peer_pr"], reason="test",
+    )
+    arts = {
+        "peer_pr": {
+            "ready": True, "status": "ok", "repo": "roomescape",
+            "learner_pr": {"number": 489, "nickname": "동키",
+                           "additions": 634, "deletions": 22},
+            "learner_files": ["src/main/A.java", "src/main/Z.java"],
+            "peer_prs": [{"number": 430, "nickname": "티온",
+                          "author_login": "bee9827",
+                          "additions": 100, "deletions": 5}],
+            "peer_files": {"430": ["src/main/A.java", "src/main/B.java"]},
+            "peer_only_files": {"430": ["src/main/B.java"]},
+            "common_paths": ["src/main/A.java"],
+            "learner_only_paths": ["src/main/Z.java"],
+            "peer_only_paths": ["src/main/B.java"],
+            "representative_threads": {"430": [{"root": {
+                "author_login": "jamie9504", "path": "src/main/B.java",
+                "line": 12, "body": "디미터의 법칙을 알아보세요."}, "reply_count": 1}]},
+            "selection": [{"number": 430, "nickname": "티온",
+                           "author_login": "bee9827", "jaccard": 0.273,
+                           "common_files": 12}],
+            "counts": {"peers": 1},
+        }
+    }
+    prompt, _, _, _ = compose(r, arts, "동기들은 이 미션 어떻게 짰어?", repo="roomescape")
+    assert "### peer_pr" in prompt
+    assert "#489" in prompt and "동키" in prompt
+    assert "티온" in prompt and "bee9827" in prompt
+    assert "Jaccard 0.273" in prompt
+    # learner-only vs peer-only file partition surfaces
+    assert "나만 건드린 파일" in prompt
+    assert "이 동기만 건드린 파일" in prompt and "B.java" in prompt
+    # the real mentor thread on the peer's PR is the learning gold
+    assert "디미터의 법칙" in prompt and "jamie9504" in prompt
+
+
+def test_render_peer_pr_graceful_when_unbuilt() -> None:
+    from core.router import RouteDecision
+
+    r = RouteDecision(
+        mode="peer_compare", need_rag=False, need_mission_ctx=True,
+        need_anchors=False, personas=[PERSONA_REVIEWER], budget_tokens=7000,
+        lazy_artifacts=["peer_pr"], reason="test",
+    )
+    prompt, _, _, _ = compose(
+        r, {"peer_pr": {"repo": "r", "ready": False, "missing": True}},
+        "동기 비교", repo="r")
+    assert "peer_pr (NOT YET BUILT" in prompt
+
+
+def test_render_peer_pr_no_peer_status() -> None:
+    from core.router import RouteDecision
+
+    r = RouteDecision(
+        mode="peer_compare", need_rag=False, need_mission_ctx=True,
+        need_anchors=False, personas=[PERSONA_REVIEWER], budget_tokens=7000,
+        lazy_artifacts=["peer_pr"], reason="test",
+    )
+    prompt, _, _, _ = compose(
+        r, {"peer_pr": {"ready": True, "status": "no_peer", "repo": "r"}},
+        "동기 비교", repo="r")
+    assert "비교할 동기 PR이 아직 없어" in prompt
+
+
+def test_render_peer_pr_status_branches() -> None:
+    from core.router import RouteDecision
+
+    r = RouteDecision(
+        mode="peer_compare", need_rag=False, need_mission_ctx=True,
+        need_anchors=False, personas=[PERSONA_REVIEWER], budget_tokens=7000,
+        lazy_artifacts=["peer_pr"], reason="test",
+    )
+    for status, expected in [
+        ("missing_archive", "동기 비교용 archive가 아직 없어"),
+        ("no_learner_pr", "비교할 내 PR이 아직 없어"),
+    ]:
+        prompt, _, _, _ = compose(
+            r, {"peer_pr": {"ready": True, "status": status, "repo": "r"}},
+            "동기 비교", repo="r")
+        assert expected in prompt, f"status={status} missing its render text"

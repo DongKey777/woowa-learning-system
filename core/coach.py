@@ -396,6 +396,8 @@ def _artifact_section(route: RouteDecision, artifacts: dict, repo: str | None) -
         parts.append(_render_cohort(artifacts["cohort"]))
     if "predict" in artifacts:
         parts.append(_render_predict(artifacts["predict"]))
+    if "peer_pr" in artifacts:
+        parts.append(_render_peer_pr(artifacts["peer_pr"]))
     if "drill_offer" in artifacts:
         do = artifacts["drill_offer"]
         parts.append(f"### drill_offer (concept={do.get('concept_id')})")
@@ -928,6 +930,85 @@ def _render_predict(art: dict) -> str:
         proj_text = proj.get("projection")
         if proj_text:
             lines.append(f"- 리뷰 부담 전망: {proj_text}")
+    return "\n".join(lines)
+
+
+_PEER_PR_FILE_CAP = 12
+_PEER_PR_THREAD_CAP = 3
+_PEER_PR_BODY_CAP = 400
+
+
+def _render_peer_pr(art: dict) -> str:
+    if art.get("missing") or not art.get("ready"):
+        return "### peer_pr (NOT YET BUILT — bin/peer-pr-build pending)"
+    status = art.get("status")
+    if status == "missing_archive":
+        return ("### peer_pr\n"
+                "- 동기 비교용 archive가 아직 없어 (status=missing_archive).")
+    if status == "no_learner_pr":
+        return ("### peer_pr\n"
+                "- 비교할 내 PR이 아직 없어 (status=no_learner_pr).")
+    if status == "no_peer":
+        return ("### peer_pr\n"
+                "- 비교할 동기 PR이 아직 없어 (status=no_peer).")
+
+    learner = art.get("learner_pr", {})
+    lnick = learner.get("nickname") or "나"
+    lines = [
+        "### peer_pr (동기 PR 비교 — 같은 미션에서 가장 비슷한 동기 코드/리뷰, archive 실측)",
+        "데이터 100% archive 실측 — 없는 PR/파일/멘토 코멘트 지어내지 마. 동기 코드는 참고용이지 베껴 쓰라는 게 아님.",
+        (f"- 내 PR #{learner.get('number')} '{lnick}' "
+         f"(+{learner.get('additions', 0)}/-{learner.get('deletions', 0)}, "
+         f"파일 {len(art.get('learner_files', []))}개)"),
+        (f"- 비교 대상 = 내 PR과 파일 구성이 가장 비슷한 동기(Jaccard) "
+         f"{len(art.get('peer_prs', []))}명"),
+    ]
+    common = art.get("common_paths", [])
+    if common:
+        lines.append(
+            f"- 공통으로 건드린 파일 ({len(common)}개): "
+            + ", ".join(_short_path(p) for p in common[:_PEER_PR_FILE_CAP]))
+    lonly = art.get("learner_only_paths", [])
+    if lonly:
+        lines.append(
+            f"- 나만 건드린 파일: "
+            + ", ".join(_short_path(p) for p in lonly[:_PEER_PR_FILE_CAP]))
+
+    threads = art.get("representative_threads") or {}
+    peer_only_files = art.get("peer_only_files") or {}
+    for p in art.get("peer_prs", []):
+        num = p.get("number")
+        nick = p.get("nickname") or p.get("author_login")
+        # selection rationale (jaccard / common file count) when available
+        sel = next((s for s in art.get("selection", [])
+                    if s.get("number") == num), {})
+        rationale = ""
+        if sel:
+            rationale = (f" (Jaccard {sel.get('jaccard')}, "
+                         f"공통 {sel.get('common_files')}파일)")
+        lines.append(
+            f"- 동기 #{num} {nick}({p.get('author_login')}) "
+            f"(+{p.get('additions', 0)}/-{p.get('deletions', 0)}){rationale}")
+        # peer-only = files this peer touched that the learner did NOT.
+        # Precomputed by the builder against the FULL learner path set — do NOT
+        # re-derive from the capped learner_files (a shared file beyond the cap
+        # would be mislabeled as peer-only under the "지어내지 마" framing).
+        peer_only = peer_only_files.get(str(num)) or peer_only_files.get(num) or []
+        if peer_only:
+            lines.append(
+                f"    이 동기만 건드린 파일: "
+                + ", ".join(_short_path(f) for f in peer_only[:_PEER_PR_FILE_CAP]))
+        ts = threads.get(str(num)) or threads.get(num) or []
+        for t in ts[:_PEER_PR_THREAD_CAP]:
+            root = t.get("root", {})
+            body = (root.get("body") or "")[:_PEER_PR_BODY_CAP].replace("\n", " ")
+            loc = _short_path(root.get("path") or "")
+            ln = root.get("line")
+            loc = f"{loc}:{ln}" if loc and ln else loc
+            rc = t.get("reply_count", 0)
+            rc_str = f" (reply {rc})" if rc else ""
+            lines.append(
+                f"    멘토 리뷰({root.get('author_login')}) {loc}{rc_str}: \"{body}\"")
     return "\n".join(lines)
 
 

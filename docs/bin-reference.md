@@ -366,6 +366,7 @@ bin/phase9-gate
 | `bin/learn-temporal-build --repo R` | `temporal` | `state/repos/<r>/temporal.json` |
 | `bin/learn-thread-recon-build --repo R` | `thread_recon` | `state/repos/<r>/thread_recon.json` |
 | `bin/learn-cohort-build --repo R` | `cohort` | `state/repos/<r>/cohort.json` |
+| `bin/peer-pr-build --repo R` | `peer_compare` | `state/repos/<r>/peer_pr.json` |
 | `bin/learn-cross-mission-build` | `cross_mission` | `state/learner/cross_mission.json` |
 | `bin/learn-learning-path-build` | `learning_path` | `state/learner/learning_path.json` |
 | `bin/learn-memory-review-build` | `memory_review` | `state/learner/memory_review.json` |
@@ -391,6 +392,6 @@ bin/phase9-gate
 | X | 11 | 11/11 |
 | **합계** | **51** | **49/49 bench + 28/28 unit + release archive gate** |
 
-위 51은 Phase T-X wrapper만 센 것이다. 여기에 상단 core entries + 위 "Mode feature builders" 14개 + Live PR review cycle의 `bin/pr-thread-status`(신규)까지 더한 **Total bin/\* in woowa-learning-system: 81 entries** (`find bin -maxdepth 1 -type f`). 학습자 외울 명령 = 0개.
+위 51은 Phase T-X wrapper만 센 것이다. 여기에 상단 core entries + 위 "Mode feature builders" 15개 + Live PR review cycle의 `bin/pr-thread-status`(신규)까지 더한 **Total bin/\* in woowa-learning-system: 84 entries** (`find bin -maxdepth 1 -type f`). 학습자 외울 명령 = 0개.
 
 Full regression via meta-runner: `python3 tests/benchmarks/phase_y_all_benches.py` → 14 benches. 13개는 무조건 PASS. 14번째 `phase_t_e2e_integration.py`는 7개 wrapper STEP은 항상 green이지만 S2가 **라이브 학습자 진척**(`experience_level==advanced` + mastered ≥ 5)을 스냅샷 assert하므로, 학습자가 그 마일스톤에 도달했을 때만 14/14다(코드 회귀 아님 — DongKey777 현재 0 mastered/9 proficient면 13/14).
