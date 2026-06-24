@@ -50,7 +50,7 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 | Release acceptance | **96/96 RELEASE READY** |
 | Y13 Quality / Performance / Latency gates | **47/47 ✅** |
 | Y14 corpus closure qrels | **14/14 top1=1.000, p95≤3.6ms ✅** |
-| Unit tests | **696 passed** |
+| Unit tests | **780 passed** |
 | System health | `doctor` **6/6**, `validate-state` **ok** |
 | Mission readiness (`spring-roomescape-waiting`) | **4/4 ready**, cross-crew anchors **31** |
 | PR archive sync (`spring-roomescape-waiting`) | **91 PRs**, review comments **2190** |
@@ -94,7 +94,8 @@ AI 세션은 답변 직후 학습 데이터를 자동 저장한다. Claude/Codex
 | `reviewer_profile` (C) | 멘토가 어떤 스타일로 리뷰하는지 | *"내 멘토 리뷰 스타일 어때?"* |
 | `learning_path` (D) | 지금 실력에 맞춰 다음 학습 순서 추천 | *"다음에 뭐 배우면 좋을지 알려줘"* |
 | `meta_analytics` (E) | 내가 자주 묻는 것과 학습 패턴 짚기 | *"내가 자주 묻는 개념 뭐야?"* |
-| `cohort` (F) | 동기들과 비교해 내 PR이 어디쯤인지 | *"동기들에 비해 내 PR 어때?"* |
+| `cohort` (F) | 동기들과 비교해 내 PR이 어디쯤인지(정량 percentile) | *"동기들에 비해 내 PR 어때?"* |
+| `peer_compare` (P) | 같은 미션 동기들이 코드를 어떻게 짰는지(파일 diff + 동기가 받은 멘토 지적, 정성 비교) | *"동기들은 이 미션 어떻게 짰어?"* |
 | `thread_recon` (G) | 리뷰 스레드를 통째로 복원 | *"내 리뷰 스레드 통째로 보여줘"* |
 | `pr_diff_evolution` (H) | 라운드마다 코드가 어떻게 바뀌었는지 + 리뷰→수정 연결 | *"라운드별 코드 변화 보여줘"* |
 | `temporal` (I) | 리뷰 주기와 오래 멈춘 구간 짚기 | *"내 리뷰까지 얼마나 걸렸어?"* |

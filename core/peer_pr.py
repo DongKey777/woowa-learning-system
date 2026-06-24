@@ -21,6 +21,10 @@ from core.archive import (
 )
 
 NICKNAME_PATTERNS = (
+    # Real Woowa format (dominant): `[..stage..] 닉네임(본명) 미션 제출합니다.`
+    # The nickname sits right after the closing `]`, before the `(본명)` paren.
+    re.compile(r"\]\s*([가-힣]{2,10})\s*\("),           # ] 닉네임(본명)
+    re.compile(r"\]\s*([가-힣]{2,10})\s+미션"),          # ] 닉네임 미션
     re.compile(r"\[[^\]]*\]\s*([가-힣]{2,6})\s*$"),     # [..stage..] 닉네임
     re.compile(r"^([가-힣]{2,6})\s+미션"),               # 닉네임 미션
     re.compile(r"\s([가-힣]{2,6})\s*$"),                 # trailing Korean word

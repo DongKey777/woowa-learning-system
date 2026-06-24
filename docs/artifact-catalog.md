@@ -4,7 +4,7 @@
 
 ```
 corpus/
-├── concepts/                      # 3339 JSON entities (1 concept = 1 file)
+├── concepts/                      # 3654 JSON entities (1 concept = 1 file)
 │   ├── algorithm/*.json
 │   ├── data-structure/*.json
 │   ├── database/*.json
@@ -16,7 +16,7 @@ corpus/
 │   ├── software-engineering/*.json
 │   ├── spring/*.json
 │   └── system-design/*.json
-├── concept_graph.json             # ~5MB — nodes (3339) + edges (prerequisite 6172, confusable_with N)
+├── concept_graph.json             # ~5MB — nodes (3654) + edges (prerequisite 6931, confusable_with N)
 └── schemas/
     └── concept.schema.json        # JSON schema (validation)
 ```
@@ -66,9 +66,9 @@ corpus/
     ...
   },
   "edges": {
-    "prerequisite": [["from_id", "to_id"], ...],   # 6172 pairs
+    "prerequisite": [["from_id", "to_id"], ...],   # 6931 pairs
     "confusable_with": [...],
-    "extends": [...]
+    "next_docs": [...]
   },
   "stats": {...}
 }
@@ -115,6 +115,7 @@ state/
 │       ├── temporal.json           # mode temporal (learn-temporal-build)
 │       ├── thread_recon.json       # mode thread_recon (learn-thread-recon-build)
 │       ├── cohort.json             # mode cohort (learn-cohort-build)
+│       ├── peer_pr.json            # mode peer_compare — learner-vs-most-similar-peers diff (peer-pr-build)
 │       ├── predict.json            # mode predict — fuses C/F/H artifacts (learn-predict-build)
 │       ├── pr_threads/<n>.json     # live PR review-cycle snapshot per PR (pr-thread-status; delta source)
 │       ├── actions/                # coach-run action snapshots (coach-run.json, …)

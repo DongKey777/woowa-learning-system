@@ -105,7 +105,7 @@ GitHub Releases (`DongKey777/woowa-learning-system`)에 publish된 사전 빌드
 
 - 소요: 10-20초 (네트워크 광대역)
 - 의존: `gh` CLI (미설치면 한국어로 OS별 설치 안내)
-- 기본 tag: `paradigm-v2-index-v1.0.3`
+- 기본 tag: `paradigm-v2-index-v1.0.5`
 - **기존 학습자 재진입(git pull 후)**: `state/index/`가 이미 있으면 무인자 `bin/index-fetch`는 건너뛴다. 새 release를 자동 반영하려면 `bin/index-fetch --auto-upgrade` — 설치된 `manifest.release_tag`가 코드 최신 tag보다 낡았을 때만 재fetch하고, 이미 최신이거나 tag 없는 로컬 빌드면 no-op. `bin/bootstrap`이 이 플래그를 자동으로 넘기고, 인덱스가 실제로 교체된 경우에만 daemon을 재시작한다.
 
 #### 🚫 학습자 기기 로컬 빌드 절대 금지

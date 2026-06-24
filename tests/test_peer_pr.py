@@ -18,32 +18,34 @@ def _seed_archive(tmp_path: Path, repo: str = "roomescape") -> Path:
     arch_dir.mkdir(parents=True)
     db = arch_dir / "prs.sqlite3"
     conn = sqlite3.connect(str(db))
+    # paradigm-v2 collection schema (the *_current tables). PR number → surrogate
+    # id: 37→1, 38→2, 40→4, 41→5. Child rows reference pull_request_id.
     conn.executescript(
         """
-        CREATE TABLE pull_requests (
-            number INTEGER PRIMARY KEY, title TEXT, author_login TEXT,
+        CREATE TABLE pull_requests_current (
+            id INTEGER PRIMARY KEY, number INTEGER, title TEXT, author_login TEXT,
             additions INTEGER, deletions INTEGER
         );
         CREATE TABLE pull_request_files_current (
-            pr_number INTEGER, path TEXT, additions INTEGER, deletions INTEGER, patch_text TEXT
+            pull_request_id INTEGER, path TEXT, additions INTEGER, deletions INTEGER, patch_text TEXT
         );
-        CREATE TABLE review_comments (
-            id INTEGER PRIMARY KEY, pr_number INTEGER, body TEXT, path TEXT, line INTEGER,
-            in_reply_to_id INTEGER, author_login TEXT
+        CREATE TABLE pull_request_review_comments_current (
+            github_comment_id INTEGER PRIMARY KEY, pull_request_id INTEGER, body TEXT,
+            path TEXT, line INTEGER, in_reply_to_github_comment_id INTEGER, user_login TEXT
         );
-        INSERT INTO pull_requests VALUES (37, '[1단계 - 콘솔] 동키', 'donkey', 120, 30);
-        INSERT INTO pull_requests VALUES (38, '[2단계 - DB] 동키', 'donkey', 80, 10);
-        INSERT INTO pull_requests VALUES (40, '[1단계 - 콘솔] 큐빈', 'cubinkim', 150, 40);
-        INSERT INTO pull_requests VALUES (41, '[2단계] 라키', 'rocky', 200, 50);
+        INSERT INTO pull_requests_current VALUES (1, 37, '[1단계 - 콘솔] 동키', 'donkey', 120, 30);
+        INSERT INTO pull_requests_current VALUES (2, 38, '[2단계 - DB] 동키', 'donkey', 80, 10);
+        INSERT INTO pull_requests_current VALUES (4, 40, '[1단계 - 콘솔] 큐빈', 'cubinkim', 150, 40);
+        INSERT INTO pull_requests_current VALUES (5, 41, '[2단계] 라키', 'rocky', 200, 50);
         INSERT INTO pull_request_files_current VALUES
-            (37, 'src/main/X.java', 80, 10, 'X content'),
-            (37, 'src/main/Y.java', 40, 20, 'Y content'),
-            (40, 'src/main/X.java', 90, 5, 'cubin X'),
-            (40, 'src/main/Z.java', 60, 0, 'cubin Z');
-        INSERT INTO review_comments VALUES
-            (1, 37, 'use builder', 'X.java', 10, NULL, 'mentor'),
-            (2, 37, 'thanks', 'X.java', 10, 1, 'donkey'),
-            (3, 40, 'split this', 'Z.java', 5, NULL, 'mentor');
+            (1, 'src/main/X.java', 80, 10, 'X content'),
+            (1, 'src/main/Y.java', 40, 20, 'Y content'),
+            (4, 'src/main/X.java', 90, 5, 'cubin X'),
+            (4, 'src/main/Z.java', 60, 0, 'cubin Z');
+        INSERT INTO pull_request_review_comments_current VALUES
+            (1, 1, 'use builder', 'X.java', 10, NULL, 'mentor'),
+            (2, 1, 'thanks', 'X.java', 10, 1, 'donkey'),
+            (3, 4, 'split this', 'Z.java', 5, NULL, 'mentor');
         """
     )
     conn.commit()
@@ -54,6 +56,15 @@ def _seed_archive(tmp_path: Path, repo: str = "roomescape") -> Path:
 def test_extract_nickname_step_console() -> None:
     assert extract_nickname("[1단계 - 콘솔] 동키") == "동키"
     assert extract_nickname("[2단계 - DB] 큐빈") == "큐빈"
+
+
+def test_extract_nickname_real_woowa_format() -> None:
+    # The dominant real title form: `[..stage..] 닉네임(본명) 미션 제출합니다.`
+    assert extract_nickname(
+        "[🚀 사이클2 - 미션 (예약 대기 승인)] 동키(이동훈) 미션 제출합니다.") == "동키"
+    assert extract_nickname(
+        "[1 - 2단계 방탈출 예약 대기] 릴리(최윤서) 미션 제출합니다.") == "릴리"
+    assert extract_nickname("[STEP 1,2] 테바(김성겸) 미션 제출합니다.") == "테바"
 
 
 def test_extract_nickname_no_match_returns_none() -> None:

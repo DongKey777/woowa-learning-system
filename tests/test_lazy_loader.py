@@ -260,3 +260,39 @@ def test_mastered_like_subtracts_beginner() -> None:
     assert "spring/bean-di-basics" not in out   # flagged → not demoted
     assert "spring/x" in out and "db/y" in out
     assert _mastered_like(None) == []
+
+
+def test_peer_pr_missing_when_unbuilt(tmp_path: Path) -> None:
+    from core.router import ARTIFACT_PEER_PR
+    r = _make_route([ARTIFACT_PEER_PR])
+    out = load(r, repo="roomescape", state_root=tmp_path)
+    assert out[ARTIFACT_PEER_PR]["missing"] is True
+    assert out[ARTIFACT_PEER_PR]["ready"] is False
+
+
+def test_peer_pr_loads_prebuilt_json(tmp_path: Path) -> None:
+    from core.router import ARTIFACT_PEER_PR
+    repo_dir = tmp_path / "repos" / "roomescape"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "peer_pr.json").write_text(json.dumps({
+        "repo": "roomescape", "status": "ok",
+        "learner_pr": {"number": 489, "nickname": "동키"},
+        "learner_files": ["A.java"],
+        "peer_prs": [{"number": 430, "nickname": "티온", "author_login": "bee9827"}],
+        "peer_files": {"430": ["A.java", "B.java"]},
+        "peer_only_files": {"430": ["B.java"]},
+        "common_paths": ["A.java"], "learner_only_paths": [],
+        "peer_only_paths": ["B.java"],
+        "representative_threads": {"430": []},
+        "selection": [{"number": 430, "jaccard": 0.27}],
+        "counts": {"peers": 1},
+    }, ensure_ascii=False), encoding="utf-8")
+    r = _make_route([ARTIFACT_PEER_PR])
+    out = load(r, repo="roomescape", state_root=tmp_path)
+    art = out[ARTIFACT_PEER_PR]
+    assert art["ready"] is True and art["status"] == "ok"
+    assert art["learner_pr"]["number"] == 489
+    # string-keyed peer_files / peer_only_files survive the JSON load (no int/str drift)
+    assert "430" in art["peer_files"]
+    assert art["peer_only_files"]["430"] == ["B.java"]
+    assert art["selection"][0]["jaccard"] == 0.27

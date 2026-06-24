@@ -159,7 +159,8 @@ python3 bin/ask "테스트"
 | `thread_recon` | 리뷰 스레드 대화 복원 | 권장 |
 | `temporal` | 라운드 latency, 정체 구간 같은 시간축 | 권장 |
 | `meta_analytics` | 재질문/드릴 추세/과신 같은 학습 메타 분석 | — |
-| `cohort` | 동기들과 비교해 내 PR이 어디쯤인지 | 권장 |
+| `cohort` | 동기들과 비교해 내 PR이 **어디쯤**인지(크기/리뷰 수 정량 percentile) | 권장 |
+| `peer_compare` | 같은 미션 동기들은 코드를 **어떻게** 짰는지(파일 diff + 동기가 받은 멘토 지적, 정성). cohort=정량 위치, peer_compare=정성 코드/리뷰 비교 | 필수 |
 | `predict` | 올리기 전에 어떤 리뷰가 올지 미리 보기 | 권장 |
 | `f11_anchor` | 내 리뷰 anchor가 다른 크루는 어땠는지(cross-crew) | 필수 |
 
@@ -309,7 +310,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 ### 5.1 모든 작업
 - `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령 (또는 개별 `bin/ask` 호출에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨된다.
 - 변경은 commit 기반 reproducible. 측정 결과는 로컬 `reports/`에 저장 (gitignored — public clone에 안 들어감). 헤드라인 metric은 `docs/verification-results.md`에 inline로 정리한다.
-- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 745 passed 유지.
+- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 780 passed 유지.
 
 ### 5.2 측정 명령
 ```bash

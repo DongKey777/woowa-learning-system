@@ -219,6 +219,8 @@ def test_entry_point_count() -> None:
                    "learn-cohort-build",
                    # A~N usecases F7 K: pre-push review prediction (C+F+H synthesis)
                    "learn-predict-build",
+                   # Family P: learner-vs-most-similar-peers qualitative diff (mode peer_compare)
+                   "peer-pr-build",
                    # Live pending-aware PR review-thread reconciliation
                    "pr-thread-status",
                    # UX-first response capture hooks/repair

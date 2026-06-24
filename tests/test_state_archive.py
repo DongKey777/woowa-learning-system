@@ -113,32 +113,35 @@ def _seed_archive(tmp_path: Path, repo: str = "roomescape") -> Path:
     arch_dir.mkdir(parents=True)
     db_path = arch_dir / "prs.sqlite3"
     conn = sqlite3.connect(str(db_path))
+    # paradigm-v2 collection schema (the *_current tables). Child tables join on
+    # the surrogate pull_request_id, NOT the GitHub PR number — see
+    # scripts/collection/schema.sql. PR 37→id 1, 38→id 2, 39→id 3.
     conn.executescript(
         """
-        CREATE TABLE pull_requests (
-            number INTEGER PRIMARY KEY,
-            title TEXT, author_login TEXT,
+        CREATE TABLE pull_requests_current (
+            id INTEGER PRIMARY KEY,
+            number INTEGER, title TEXT, author_login TEXT,
             additions INTEGER, deletions INTEGER
         );
         CREATE TABLE pull_request_files_current (
-            pr_number INTEGER, path TEXT,
+            pull_request_id INTEGER, path TEXT,
             additions INTEGER, deletions INTEGER, patch_text TEXT
         );
-        CREATE TABLE review_comments (
-            id INTEGER PRIMARY KEY,
-            pr_number INTEGER, body TEXT, path TEXT, line INTEGER,
-            in_reply_to_id INTEGER, author_login TEXT
+        CREATE TABLE pull_request_review_comments_current (
+            github_comment_id INTEGER PRIMARY KEY,
+            pull_request_id INTEGER, body TEXT, path TEXT, line INTEGER,
+            in_reply_to_github_comment_id INTEGER, user_login TEXT
         );
-        INSERT INTO pull_requests VALUES (37, 'Step1 DB', 'donkey', 120, 30);
-        INSERT INTO pull_requests VALUES (38, 'Step2 layers', 'donkey', 80, 10);
-        INSERT INTO pull_requests VALUES (39, 'Peer PR', 'cubinkim', 200, 50);
+        INSERT INTO pull_requests_current VALUES (1, 37, 'Step1 DB', 'donkey', 120, 30);
+        INSERT INTO pull_requests_current VALUES (2, 38, 'Step2 layers', 'donkey', 80, 10);
+        INSERT INTO pull_requests_current VALUES (3, 39, 'Peer PR', 'cubinkim', 200, 50);
         INSERT INTO pull_request_files_current VALUES
-            (37, 'src/main/java/X.java', 80, 10, 'diff text X'),
-            (37, 'src/main/java/Y.java', 40, 20, 'diff text Y');
-        INSERT INTO review_comments VALUES
-            (1, 37, 'consider X', 'X.java', 10, NULL, 'mentor'),
-            (2, 37, 'agreed', 'X.java', 10, 1, 'donkey'),
-            (3, 37, 'standalone', 'Y.java', 5, NULL, 'mentor');
+            (1, 'src/main/java/X.java', 80, 10, 'diff text X'),
+            (1, 'src/main/java/Y.java', 40, 20, 'diff text Y');
+        INSERT INTO pull_request_review_comments_current VALUES
+            (1, 1, 'consider X', 'X.java', 10, NULL, 'mentor'),
+            (2, 1, 'agreed', 'X.java', 10, 1, 'donkey'),
+            (3, 1, 'standalone', 'Y.java', 5, NULL, 'mentor');
         """
     )
     conn.commit()
@@ -181,6 +184,14 @@ def test_get_review_threads_groups_replies(tmp_path: Path) -> None:
     assert len(threaded) == 1
     assert threaded[0]["root"]["id"] == 1
     assert threaded[0]["replies"][0]["body"] == "agreed"
+
+
+def test_diff_files_and_threads_empty_for_absent_pr(tmp_path: Path) -> None:
+    # The number→pull_request_id resolution returns None for a PR not in the
+    # archive; both child-table queries must degrade to [] (not crash).
+    root = _seed_archive(tmp_path)
+    assert get_diff_files("roomescape", 999, state_root=root) == []
+    assert get_review_threads("roomescape", 999, state_root=root) == []
 
 
 def test_archive_missing_raises(tmp_path: Path) -> None:

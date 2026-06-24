@@ -52,7 +52,8 @@ state/learner/mastery_graph.sqlite : attempted → familiar → proficient → m
 | `thread_recon` | 리뷰 스레드 대화 복원 | REVIEWER + MENTOR | thread_recon + mission_patterns | 6000 |
 | `temporal` | 라운드 latency·정체 구간 시간축 | MENTOR + REVIEWER | temporal + mission_patterns | 6000 |
 | `meta_analytics` | 재질문/드릴 추세/과신 학습 메타 | MENTOR + SOCRATIC | meta_analytics + mastery | 6000 |
-| `cohort` | 동기 대비 내 PR 위치 | MENTOR + REVIEWER | cohort + mission_patterns | 6000 |
+| `cohort` | 동기 대비 내 PR 위치(정량 percentile) | MENTOR + REVIEWER | cohort + mission_patterns | 6000 |
+| `peer_compare` | 같은 미션 동기 PR 정성 코드 비교(파일 diff + 동기가 받은 멘토 지적) | REVIEWER + MENTOR | peer_pr + mission_patterns | 7000 |
 | `predict` | 올리기 전 받을 리뷰 미리 보기 | REVIEWER + MENTOR | predict + mission_patterns | 7000 |
 | `f11_anchor` | 내 anchor가 다른 크루는 어땠는지(cross-crew) | REVIEWER + MENTOR | review_anchors + cross_crew_review_graph + mission_patterns | 12000 |
 
@@ -201,7 +202,7 @@ Historical Phase M in-process cold/warm numbers are superseded by the Y13 daemon
 - **Append-heavy + queryable** → SQLite (`mastery_graph.sqlite`)
 - **Read-mostly small** → JSON (`review_anchors.json`, `mission_patterns.json`, `drill_pending.json`, `drill_due.json`)
 - **Large columnar** → Parquet (`cross_crew_review_graph.parquet`)
-- **Immutable corpus** → JSON adjacency (`concept_graph.json` 3339 nodes / 6172 prereq edges / ~5MB)
+- **Immutable corpus** → JSON adjacency (`concept_graph.json` 3654 nodes / 6931 prereq edges / ~5MB)
 - **Dense embed index** → Lance (`state/index/concepts.lance` ~13.4MB release artifact; rebuild after each 200 staged corpus docs)
 - **Append-only event log** → JSONL (`history.jsonl`)
 
@@ -222,13 +223,13 @@ the selected `--index-dir`, so a remote release artifact is self-contained.
 published archive contains both sidecars and the same dense/full corpus hashes
 as the current index.
 
-Core runtime package breakdown (Python files under package dirs): **8667 LOC**.
-- `core/`: 6500 (router + lazy_loader + coach + daemon + mastery + feedback + drill + profile/session/onboarding/state + …)
-- `rag/`: 1149 (encoder + search + index + corpus_loader + personalization + reranker)
-- `mission/`: 395 (extract.py + graph.py)
-- `anchors/`: 326 (extract.py + match.py)
-- `curation/`: 297
-- `scripts/`: 829
+Core runtime package breakdown (Python files under package dirs): **17175 LOC**.
+- `core/`: 9925 (router + lazy_loader + coach + daemon + mastery + feedback + drill + profile/session/onboarding/state + …)
+- `rag/`: 1337 (encoder + search + index + corpus_loader + personalization + reranker)
+- `mission/`: 3558 (extract.py + graph.py + per-mode analysis: cohort/peer_pr/predict/reviewer_profile/diff_evolution/cross_mission/temporal/thread_recon/learning_path/memory_review/meta_analytics/pr_meta/pr_review)
+- `anchors/`: 448 (extract.py + match.py)
+- `curation/`: 393
+- `scripts/`: 1514
 
 ## 11. Development principles (4 원칙, commit 자체점검)
 

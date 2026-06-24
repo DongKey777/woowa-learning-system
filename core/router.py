@@ -74,6 +74,7 @@ ARTIFACT_TEMPORAL = "temporal"
 ARTIFACT_META_ANALYTICS = "meta_analytics"
 ARTIFACT_COHORT = "cohort"
 ARTIFACT_PREDICT = "predict"
+ARTIFACT_PEER_PR = "peer_pr"
 
 PERSONA_MENTOR = "mentor"
 PERSONA_REVIEWER = "reviewer"
@@ -307,6 +308,14 @@ def _from_intent(intent: IntentDecision, reason_override: str | None = None) -> 
             lazy_artifacts=[ARTIFACT_PREDICT, ARTIFACT_MISSION_PATTERNS],
             reason=intent.reason, confidence=intent.confidence,
         )
+    if mode == "peer_compare":
+        return RouteDecision(
+            mode=mode, need_rag=False, need_mission_ctx=True, need_anchors=False,
+            personas=[PERSONA_REVIEWER, PERSONA_MENTOR],
+            budget_tokens=7000,
+            lazy_artifacts=[ARTIFACT_PEER_PR, ARTIFACT_MISSION_PATTERNS],
+            reason=intent.reason, confidence=intent.confidence,
+        )
     # fallback: treat as cs_qa minimal
     return RouteDecision(
         mode="cs_qa", need_rag=True, need_mission_ctx=False, need_anchors=False,
@@ -341,7 +350,7 @@ _VALID_OVERRIDE_MODES = frozenset({
     "cs_qa", "coaching", "drill", "retro", "self_assess",
     "pr_diff_evolution", "cross_mission", "memory_review", "pr_review",
     "reviewer_profile", "learning_path", "pr_meta", "thread_recon", "temporal",
-    "meta_analytics", "cohort", "predict", "f11_anchor",
+    "meta_analytics", "cohort", "predict", "peer_compare", "f11_anchor",
 })
 
 

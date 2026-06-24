@@ -16,7 +16,7 @@ Woowa mission learning system: Python flat-layout RAG daemon + CLI wrappers + le
 
 ```text
 woowa-learning-system/
-├── bin/        # 81+ user/operator commands; thin wrappers over core/rag/mission
+├── bin/        # 84 user/operator commands; thin wrappers over core/rag/mission
 ├── core/       # daemon, routing, prompt, state, telemetry, learner profile
 ├── rag/        # corpus load, BGE-M3 encode, Lance index, retrieval/fusion
 ├── mission/    # system-side mission/PR analytics; writes state/repos artifacts
@@ -205,7 +205,7 @@ python3 bin/ask "테스트"
 
 ### 4.2.2 모드 카탈로그 (AI가 `--mode`로 직접 선택)
 
-키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). AI 세션이 발화 의미를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로, 키워드 router는 deterministic fallback. 모드 목록과 선택 기준은 CLAUDE.md §4.2.2와 동일하다 — `cs_qa` / `coaching` / `drill` / `self_assess` / `retro` / `pr_diff_evolution`(코드 변화·리뷰 반영) / `cross_mission`(미션 간 개념·반복 실수) / `memory_review`(사각지대·복습) / `pr_review`(받은 리뷰) / `reviewer_profile`(멘토 성향) / `learning_path`(다음 학습) / `pr_meta`(PR 품질·크기) / `thread_recon`(스레드 복원) / `temporal`(시간축) / `meta_analytics`(학습 메타) / `cohort`(동기 비교) / `predict`(리뷰 미리 보기) / `f11_anchor`(cross-crew). `tool_only`/`tier_0_fallback`은 직접 고르지 않는다.
+키워드 router는 학습자가 특정 단어를 그대로 쳤을 때만 모드를 맞춘다(paraphrase recall 낮음). AI 세션이 발화 의미를 읽고 모드를 골라 `--mode`로 넘기는 게 1차 경로, 키워드 router는 deterministic fallback. 모드 목록과 선택 기준은 CLAUDE.md §4.2.2와 동일하다 — `cs_qa` / `coaching` / `drill` / `self_assess` / `retro` / `pr_diff_evolution`(코드 변화·리뷰 반영) / `cross_mission`(미션 간 개념·반복 실수) / `memory_review`(사각지대·복습) / `pr_review`(받은 리뷰) / `reviewer_profile`(멘토 성향) / `learning_path`(다음 학습) / `pr_meta`(PR 품질·크기) / `thread_recon`(스레드 복원) / `temporal`(시간축) / `meta_analytics`(학습 메타) / `cohort`(동기 비교 — 정량 위치) / `peer_compare`(동기 코드 정성 비교 — 파일 diff + 동기가 받은 멘토 지적) / `predict`(리뷰 미리 보기) / `f11_anchor`(cross-crew). `tool_only`/`tier_0_fallback`은 직접 고르지 않는다.
 
 ### 4.2.3 멀티 인텐트 분해 (W16/P1-15)
 
@@ -255,7 +255,7 @@ CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 - **Phase W (12 mining/analytics, Mode B)**: `bin/feedback-mine`, `bin/response-quality-mine`, `bin/routing-analyze`, `bin/learning-turn-audit`, `bin/learning-path-graph-audit`, `bin/reclassify-history`, `bin/cohort-eval/compare`, `bin/golden`, `bin/rag-eval`, `bin/router-generalization-eval`, `bin/learner-log-rag-eval`.
 - **Phase X (11 maintenance + sub-commands)**: `bin/index-pack`, `bin/sync-index-metadata`, `bin/drill-grade-prepare`, `bin/learn-feedback/self-assess/drill`, `bin/learner-profile` (show/recompute/set/clear/redact), `bin/set-profile/show-profile`, `bin/reviewer-profile` (alias), `bin/rag-remote-build`.
 
-위 Phase T-X 외에 **Mode feature builders 14개**(`anchors-build`, `learn-evidence-sync`, `pr-diff-evolution-build`, `learn-pr-meta-build`, `learn-pr-review-build`, `learn-predict-build`, `reviewer-profile-build`, `learn-temporal-build`, `learn-thread-recon-build`, `learn-cohort-build`, `learn-cross-mission-build`, `learn-learning-path-build`, `learn-memory-review-build`, `learn-meta-analytics-build` — §4.2.2 고급 모드 artifact 사전 빌드)와 Live PR review cycle `bin/pr-thread-status`(라이브 정합)가 더 있다. woowa-learning-system `bin/*` 합계: **81 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출. 자세한 usage는 [`docs/bin-reference.md`](docs/bin-reference.md).
+위 Phase T-X 외에 **Mode feature builders 15개**(`anchors-build`, `learn-evidence-sync`, `pr-diff-evolution-build`, `learn-pr-meta-build`, `learn-pr-review-build`, `learn-predict-build`, `reviewer-profile-build`, `learn-temporal-build`, `learn-thread-recon-build`, `learn-cohort-build`, `peer-pr-build`, `learn-cross-mission-build`, `learn-learning-path-build`, `learn-memory-review-build`, `learn-meta-analytics-build` — §4.2.2 고급 모드 artifact 사전 빌드)와 Live PR review cycle `bin/pr-thread-status`(라이브 정합)가 더 있다. woowa-learning-system `bin/*` 합계: **84 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출. 자세한 usage는 [`docs/bin-reference.md`](docs/bin-reference.md).
 
 ---
 
@@ -264,7 +264,7 @@ CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set (또는 개별 `bin/ask`에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨.
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 745 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 780 passed 유지)
 
 ### 5.2 측정 명령
 ```bash
