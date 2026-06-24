@@ -61,7 +61,7 @@ class DrillOffer:
     concept_id: str
     question: str
     expected_terms: list[str]
-    source: str  # "expected_queries[0]" / "learner_query_patterns[0]" / fallback
+    source: str  # "expected_queries[i]" / "learner_query_patterns[0]" / fallback
     created_at: float  # epoch; staleness/expiry is time-based via
     # core.state.DRILL_PENDING_TTL_SECS (W8: a pending older than 24h is unlinked
     # on load_pending_triggers, unblocking build_offer_if_due's one-open guard).
@@ -178,20 +178,25 @@ def build_offer_if_due(
         concept = _load_concept(cid)
         if not concept:
             continue
-        # Prefer expected_queries[0]; fall back to learner_query_patterns[0]
+        # Prefer the first substantive expected_query (len>=10); fall back to
+        # learner_query_patterns[0]. EQ[0] is often a short "<term>이/가 뭐야?"
+        # that doubles as the exact-shortcut surface but is too thin to drill on
+        # — scan past it rather than dropping the concept (latent drill-break).
         eq = concept.get("expected_queries") or []
         lqp = concept.get("learner_query_patterns") or []
         source = None
         question = None
-        if eq and isinstance(eq[0], str) and len(eq[0]) >= 10:
-            question = eq[0]
-            source = "expected_queries[0]"
-        elif lqp:
+        for idx, candidate in enumerate(eq):
+            if isinstance(candidate, str) and len(candidate) >= 10:
+                question = candidate
+                source = f"expected_queries[{idx}]"
+                break
+        if not question and lqp:
             pattern = _learner_query_pattern_text(lqp[0])
             if pattern and len(pattern) >= 10:
                 question = pattern
                 source = "learner_query_patterns[0]"
-        if not question:
+        if not question or source is None:
             continue
         if not question.rstrip().endswith(("?", "?")):
             question = question.rstrip() + "?"

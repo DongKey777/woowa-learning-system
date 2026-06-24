@@ -86,6 +86,46 @@ def test_build_offer_uses_schema_object_learner_query_pattern(
     assert offer.source == "learner_query_patterns[0]"
 
 
+def test_build_offer_scans_past_short_expected_query_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EQ[0] is a short '<term>이/가 뭐야?' (the exact-shortcut surface, <10 chars)
+    but a later EQ is substantive — build_offer must scan past [0] rather than
+    drop the concept. Guards the latent drill-break class (e.g. aop-basics,
+    lock-basics) where a short EQ[0] + empty learner_query_patterns yielded None."""
+    corpus_dir = tmp_path / "concepts"
+    (corpus_dir / "spring").mkdir(parents=True)
+    concept = {
+        "id": "spring/short-eq-zero",
+        "title": "Short EQ Zero",
+        "category": "spring",
+        "level": "beginner",
+        "summary": "Concept whose expected_queries[0] is too short to drill on.",
+        "body_markdown": "Body content for scan-past-short-eq test.",
+        "expected_queries": ["AOP가 뭐야?", "관점 지향 프로그래밍이 왜 필요해?"],
+        "learner_query_patterns": [],
+        "metadata": {
+            "schema_version": "v2",
+            "created_at": "2026-06-25",
+            "last_modified": "2026-06-25",
+        },
+    }
+    (corpus_dir / "spring" / "short-eq-zero.json").write_text(
+        json.dumps(concept, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(drill_module, "CORPUS_DIR", corpus_dir)
+
+    offer = build_offer_if_due(
+        state_root=_seed_state(tmp_path),
+        uncertain_concept_ids=["spring/short-eq-zero"],
+    )
+    assert offer is not None
+    assert offer.question == "관점 지향 프로그래밍이 왜 필요해?"
+    assert offer.source == "expected_queries[1]"
+
+
 def test_build_offer_returns_none_when_pending_exists(tmp_path: Path) -> None:
     """Single open offer at a time — second call returns None."""
     sr = _seed_state(tmp_path)
