@@ -6,9 +6,9 @@ wins only when exactly ONE concept owns the normalized string there, otherwise t
 ambiguity guard returns [] (dense fallback). Ownership is therefore a GLOBAL property
 of the whole corpus, but nothing in author→build→release computes it — so a newly
 added concept can register an expected_query/alias that an EXISTING canonical concept
-already owns and silently STEAL the shortcut (verified instance: "DI가 뭐야?" now
-resolves to software-engineering/dependency-injection-basics, shadowing the canonical
-spring/bean-di-basics).
+already owns and silently STEAL the shortcut (verified instance: "DI가 뭐야?" WAS
+resolving to software-engineering/dependency-injection-basics, shadowing the canonical
+spring/bean-di-basics — since corrected by relocating the phrase to bean-di, db52ff62).
 
 This module computes the "fire+shadow" set — every normalized string where the
 shortcut FIRES (single winner) AND a DIFFERENT concept also carries that string at
@@ -17,7 +17,8 @@ grandfathers what exists today; the lint (bin/corpus-lint) fails the build on an
 fire+shadow or any winner FLIP, so a future steal is caught before BGE-M3 even encodes.
 
 Verified design (hypothesis→measured, 2026-06-24, live corpus 3654 concepts):
-  - fire+shadow = exactly 12 today; only "DI가 뭐야" currently breaks a gate.
+  - fire+shadow = 12 at discovery; the one gate-breaking case ("DI가 뭐야") was then
+    corrected (ownership moved to spring/bean-di-basics), so the frozen baseline is 11.
   - Same-tier alias ambiguity (the shortcut returns [] → dense) = 1017, and a full
     dense sweep showed 97.6% benign — those are NOT fire+shadow and are NOT flagged
     (overlap with fire+shadow = 0), so the lint has 0 false positives on them.
@@ -25,7 +26,7 @@ Verified design (hypothesis→measured, 2026-06-24, live corpus 3654 concepts):
     an expected_queries-only lint would miss 7 alias→title steals; a created_at
     "newer shadows older" heuristic fails (steal pairs share a day). The fire+shadow
     set computed via the production resolver is the only criterion that is both
-    complete (12/12) and FP-free (0/1017).
+    complete (caught all 12 discovered steals) and FP-free (0/1017).
 
 Reuses rag.search._exact_query_shortcut_hits as the single source of truth for the
 winner so the lint sees EXACTLY what the runtime resolver sees (no reimplementation

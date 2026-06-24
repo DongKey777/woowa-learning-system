@@ -21,8 +21,8 @@ bin/corpus-lint --json       # 기계 판독
 bin/corpus-lint --rebaseline # 의도적 소유권 변경 시 baseline 재생성
 ```
 
-- **기준**: `curation/ownership.fire_and_shadow` — production resolver를 재사용(divergence 0)해 fire+shadow set 계산 후 `tests/fixtures/exact_owner_baseline.json`(현재 12 grandfather)과 diff. **새 fire+shadow**나 **winner flip**이면 차단.
-- **검증된 비례성**: 12/12 완전 검출 + benign 1017 alias 충돌엔 **FP 0**. (blanket 차단=FP 1017, EQ-only=FN 7, created_at 휴리스틱=방향신호 없음, self-resolution 불변식=DI 못 잡음, per-query 단조 게이트=steal에 장님 — 전부 실측 기각.)
+- **기준**: `curation/ownership.fire_and_shadow` — production resolver를 재사용(divergence 0)해 fire+shadow set 계산 후 `tests/fixtures/exact_owner_baseline.json`(현재 **11** grandfather, DI 교정 후)과 diff. **새 fire+shadow**나 **winner flip**이면 차단.
+- **검증된 비례성**: 발견된 12개 완전 검출 + benign 1017 alias 충돌엔 **FP 0**. (blanket 차단=FP 1017, EQ-only=FN 7, created_at 휴리스틱=방향신호 없음, self-resolution 불변식=DI 못 잡음, per-query 단조 게이트=steal에 장님 — 전부 실측 기각.)
 - **index 불필요**, `load_corpus()`로 ~1s.
 
 **배선**: `bin/corpus-build`가 encode(15-30분) **직전**에 이 게이트를 돌려 회귀 코퍼스를 못 굽게 한다(RunPod 빌드도 corpus-build 경유라 자동 적용). `curation/apply_changes`는 apply 후 `ownership_new_steals`로 authoring 시점 조기 보고.
@@ -39,13 +39,16 @@ bin/corpus-lint --rebaseline # 의도적 소유권 변경 시 baseline 재생성
 - **권위 = `tests/fixtures/real_learner_qrels_v1.json`**(held-out 실제). 배치마다 새 concept의 gold를 **append**, **숫자 맞추려 재라벨 금지**(그게 회귀를 숨긴다).
 - **synth `r3_qrels_real_v1`는 report_only**(cross-check). 단일-gold 라벨이 코퍼스 성장보다 낡아(형제 rank1 아티팩트) blocking 부적합 — `learner_top1`(acceptable∪expected)·`vs-legacy`가 blocking 신호. synth는 **버전마다 재생성하지 않는다**(self-referential 편향 재유입).
 
-## 지금 남은 실제 손상 (한 번의 RunPod 사이클로 해결)
+## DI 교정 — 완료 (corpus 편집 커밋, baseline 12→11)
 
-빌드 가드는 *미래* steal을 막는다. *기존* 12 fire+shadow 중 게이트 깨는 DI는 corpus 편집으로 고친다. **이 corpus 편집은 `fix/di-canonical-owner` 브랜치에 staged됨**(corpus 변경은 dense fingerprint를 바꿔 인덱스가 corpus보다 뒤처지므로, main 일관성을 위해 브랜치에 둔다 — RunPod 빌드 후 머지):
+빌드 가드는 *미래* steal을 막고, *기존* 12 fire+shadow 중 게이트 깨던 DI는 corpus 편집으로 **교정 완료**(브랜치 `fix/di-canonical-owner`, 커밋 db52ff62):
 
 - `software-engineering/dependency-injection-basics.json`: `expected_queries`/`aliases`에서 `"DI가 뭐야?"`/`"DI가 뭐야"` 제거.
-- `spring/bean-di-basics.json`: `expected_queries`에 `"DI가 뭐야?"` 추가(canonical owner 회복).
-- `bin/corpus-lint --rebaseline`(DI가 baseline에서 사라짐, 12→11) → (RunPod) `bin/corpus-build` → release → 브랜치 머지.
-- 나머지 11 fire+shadow + 24 wrong-alias는 advisory(대부분 합리적 형제) — RunPod 사이클에서 triage.
+- `spring/bean-di-basics.json`: `expected_queries` **끝**에 `"DI가 뭐야?"` 추가(canonical owner 회복; [0]이 아니라 끝인 이유는 아래 ⚠ drill 커플링).
+- `bin/corpus-lint --rebaseline` 적용 완료 → baseline 11.
+
+**잔여(사용자 액션)**: corpus 편집이 dense fingerprint를 바꿔 인덱스가 corpus보다 뒤처진다 → RunPod `bin/corpus-build`로 dense 재빌드 → `gh release` → 브랜치 머지. exact_query 게이트는 lexical이라 corpus 편집만으로 이미 통과(인덱스 무관); RunPod는 dense 품질 회복용(soft drift, hard 게이트 아님).
+
+**나머지 11 fire+shadow triage(2026-06-25 재점검 실측)**: 대부분 합리적 — 영어 전문용어 7개는 winner가 비교/개요 진입점, 한국어 3개는 winner가 정당한 canonical owner. 의미상 borderline은 `캐시 기초`(→HTTP캐싱)·`추상 클래스 vs 인터페이스`(→design-pattern chooser) 2개뿐이고 둘 다 winner가 오답은 아님(방어 가능). same-tier alias 충돌 1017개는 전부 dense fallback이라 single-winner steal 없음 — 즉시 조치 불요.
 
 > ⚠ **검증으로 발견한 corpus 편집 커플링**: `expected_queries[0]`는 drill 질문으로도 쓰이고 `len>=10` 이어야 한다(`core/drill.py:186`). 짧은 표현(`"DI가 뭐야?"` 8자)을 [0]에 두면 `build_offer_if_due`가 None을 반환해 drill이 깨진다(pytest `test_drill`이 잡음). exact-shortcut은 위치 무관이므로 짧은 표현은 배열 **끝**에 추가하고 [0]은 substantive 질문으로 둔다. corpus 편집은 항상 전체 pytest로 검증할 것.
