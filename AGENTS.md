@@ -16,7 +16,7 @@ Woowa mission learning system: Python flat-layout RAG daemon + CLI wrappers + le
 
 ```text
 woowa-learning-system/
-├── bin/        # 84 user/operator commands; thin wrappers over core/rag/mission
+├── bin/        # 85 user/operator commands; thin wrappers over core/rag/mission
 ├── core/       # daemon, routing, prompt, state, telemetry, learner profile
 ├── rag/        # corpus load, BGE-M3 encode, Lance index, retrieval/fusion
 ├── mission/    # system-side mission/PR analytics; writes state/repos artifacts
@@ -255,7 +255,7 @@ CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 - **Phase W (12 mining/analytics, Mode B)**: `bin/feedback-mine`, `bin/response-quality-mine`, `bin/routing-analyze`, `bin/learning-turn-audit`, `bin/learning-path-graph-audit`, `bin/reclassify-history`, `bin/cohort-eval/compare`, `bin/golden`, `bin/rag-eval`, `bin/router-generalization-eval`, `bin/learner-log-rag-eval`.
 - **Phase X (11 maintenance + sub-commands)**: `bin/index-pack`, `bin/sync-index-metadata`, `bin/drill-grade-prepare`, `bin/learn-feedback/self-assess/drill`, `bin/learner-profile` (show/recompute/set/clear/redact), `bin/set-profile/show-profile`, `bin/reviewer-profile` (alias), `bin/rag-remote-build`.
 
-위 Phase T-X 외에 **Mode feature builders 15개**(`anchors-build`, `learn-evidence-sync`, `pr-diff-evolution-build`, `learn-pr-meta-build`, `learn-pr-review-build`, `learn-predict-build`, `reviewer-profile-build`, `learn-temporal-build`, `learn-thread-recon-build`, `learn-cohort-build`, `peer-pr-build`, `learn-cross-mission-build`, `learn-learning-path-build`, `learn-memory-review-build`, `learn-meta-analytics-build` — §4.2.2 고급 모드 artifact 사전 빌드)와 Live PR review cycle `bin/pr-thread-status`(라이브 정합)가 더 있다. woowa-learning-system `bin/*` 합계: **84 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출. 자세한 usage는 [`docs/bin-reference.md`](docs/bin-reference.md).
+위 Phase T-X 외에 **Mode feature builders 15개**(`anchors-build`, `learn-evidence-sync`, `pr-diff-evolution-build`, `learn-pr-meta-build`, `learn-pr-review-build`, `learn-predict-build`, `reviewer-profile-build`, `learn-temporal-build`, `learn-thread-recon-build`, `learn-cohort-build`, `peer-pr-build`, `learn-cross-mission-build`, `learn-learning-path-build`, `learn-memory-review-build`, `learn-meta-analytics-build` — §4.2.2 고급 모드 artifact 사전 빌드)와 Live PR review cycle `bin/pr-thread-status`(라이브 정합), corpus 품질 게이트 `bin/corpus-lint`(exact-shortcut 소유권 회귀 차단)가 더 있다. woowa-learning-system `bin/*` 합계: **85 entries**. 학습자 외울 명령 = 0개, AI 세션이 의도 감지로 자동 호출. 자세한 usage는 [`docs/bin-reference.md`](docs/bin-reference.md).
 
 ---
 

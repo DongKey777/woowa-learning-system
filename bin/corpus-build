@@ -41,7 +41,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR)
     parser.add_argument("--index-dir", type=Path, default=DEFAULT_INDEX_DIR)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--skip-ownership-lint", action="store_true",
+                        help="bypass the exact-shortcut ownership gate (NOT recommended)")
     args = parser.parse_args(argv)
+
+    # Pre-encode ownership gate: refuse to spend 15-30 min of BGE-M3 encode on a
+    # corpus that introduced a new exact-shortcut steal (a concept shadowing an
+    # existing canonical owner — the "DI가 뭐야?" regression class). Cheap (~1s,
+    # no index) and runs BEFORE the expensive build. See bin/corpus-lint.
+    if not args.skip_ownership_lint:
+        from curation.ownership import diff_against_baseline, fire_and_shadow
+        baseline_path = REPO_ROOT / "tests" / "fixtures" / "exact_owner_baseline.json"
+        baseline = (json.loads(baseline_path.read_text(encoding="utf-8")).get("norms", {})
+                    if baseline_path.exists() else {})
+        _lint_corpus = load_corpus(corpus_dir=args.corpus_dir, strict=True)
+        _diff = diff_against_baseline(fire_and_shadow(_lint_corpus), baseline)
+        if _diff["new_steals"] or _diff["flipped"]:
+            print("ABORT: exact-shortcut ownership regression — run `bin/corpus-lint` "
+                  "to see the new steals/flips; fix the corpus or `--rebaseline` if "
+                  "the ownership change is intentional.", file=sys.stderr)
+            return 1
 
     print(f"Building index: corpus={args.corpus_dir} → index={args.index_dir}")
     report = build_index(
