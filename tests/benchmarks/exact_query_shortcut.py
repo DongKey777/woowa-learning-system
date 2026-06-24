@@ -47,7 +47,9 @@ CASES = [
     },
     {
         "kind": "expected_query",
-        "query": "Stream API",
+        # corpus owns the fuller "Stream API 사용" (bare "Stream API" is ambiguous);
+        # match the phrasing the concept actually registers as its expected_query.
+        "query": "Stream API 사용",
         "expected": "language/java-stream-lambda-basics",
     },
     {

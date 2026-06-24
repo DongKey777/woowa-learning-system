@@ -41,9 +41,11 @@ bin/corpus-lint --rebaseline # 의도적 소유권 변경 시 baseline 재생성
 
 ## 지금 남은 실제 손상 (한 번의 RunPod 사이클로 해결)
 
-빌드 가드는 *미래* steal을 막는다. *기존* 12 fire+shadow 중 게이트 깨는 DI는 RunPod corpus 편집으로 고친다:
+빌드 가드는 *미래* steal을 막는다. *기존* 12 fire+shadow 중 게이트 깨는 DI는 corpus 편집으로 고친다. **이 corpus 편집은 `fix/di-canonical-owner` 브랜치에 staged됨**(corpus 변경은 dense fingerprint를 바꿔 인덱스가 corpus보다 뒤처지므로, main 일관성을 위해 브랜치에 둔다 — RunPod 빌드 후 머지):
 
-- `software-engineering/dependency-injection-basics.json`: `expected_queries`에서 `"DI가 뭐야?"` 제거 + `aliases`에서 `"DI가 뭐야"` 제거(cross-tier ambiguity 회피).
+- `software-engineering/dependency-injection-basics.json`: `expected_queries`/`aliases`에서 `"DI가 뭐야?"`/`"DI가 뭐야"` 제거.
 - `spring/bean-di-basics.json`: `expected_queries`에 `"DI가 뭐야?"` 추가(canonical owner 회복).
-- 그 후 `bin/corpus-lint --rebaseline`(DI가 baseline에서 사라짐) → `bin/corpus-build` → release.
+- `bin/corpus-lint --rebaseline`(DI가 baseline에서 사라짐, 12→11) → (RunPod) `bin/corpus-build` → release → 브랜치 머지.
 - 나머지 11 fire+shadow + 24 wrong-alias는 advisory(대부분 합리적 형제) — RunPod 사이클에서 triage.
+
+> ⚠ **검증으로 발견한 corpus 편집 커플링**: `expected_queries[0]`는 drill 질문으로도 쓰이고 `len>=10` 이어야 한다(`core/drill.py:186`). 짧은 표현(`"DI가 뭐야?"` 8자)을 [0]에 두면 `build_offer_if_due`가 None을 반환해 drill이 깨진다(pytest `test_drill`이 잡음). exact-shortcut은 위치 무관이므로 짧은 표현은 배열 **끝**에 추가하고 [0]은 substantive 질문으로 둔다. corpus 편집은 항상 전체 pytest로 검증할 것.
