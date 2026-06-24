@@ -501,3 +501,44 @@ def test_drain_compacts_ignored_and_unrepairable_rows(tmp_path: Path) -> None:
     remaining = [json.loads(l) for l in qp.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert all(r.get("status") != "ignored_non_learning" for r in remaining)
     assert any(r.get("source_event_id") == "ask-x" for r in remaining)
+
+
+def test_rewrite_jsonl_locked_filters_and_keeps_unparseable(tmp_path: Path) -> None:
+    from core.state import rewrite_jsonl_locked
+    p = tmp_path / "q.jsonl"
+    p.write_text('{"status":"drop"}\n{"status":"keep","id":1}\nnot-json\n', encoding="utf-8")
+    removed = rewrite_jsonl_locked(
+        p, lambda d, ln: not (isinstance(d, dict) and d.get("status") == "drop"))
+    assert removed == 1
+    lines = p.read_text(encoding="utf-8").splitlines()
+    assert '{"status":"keep","id":1}' in lines
+    assert "not-json" in lines  # unparseable conservatively kept
+
+
+def test_rewrite_jsonl_locked_no_lost_append_under_concurrency(tmp_path: Path) -> None:
+    # The lock must prevent a concurrent append from being clobbered by the
+    # compaction's read-modify-write (the batch4-2 regression lost learner rows).
+    import threading
+
+    from core.state import append_jsonl_locked, rewrite_jsonl_locked
+    p = tmp_path / "q.jsonl"
+    for i in range(40):
+        append_jsonl_locked(p, {"status": "drop", "i": i})  # ensure rewrite fires
+    appended, stop = [], threading.Event()
+
+    def _appender():
+        i = 0
+        while not stop.is_set():
+            append_jsonl_locked(p, {"status": "keep", "id": f"a{i}"})
+            appended.append(f"a{i}")
+            i += 1
+
+    t = threading.Thread(target=_appender)
+    t.start()
+    for _ in range(40):
+        rewrite_jsonl_locked(p, lambda d, ln: not (isinstance(d, dict) and d.get("status") == "drop"))
+    stop.set()
+    t.join()
+    rewrite_jsonl_locked(p, lambda d, ln: not (isinstance(d, dict) and d.get("status") == "drop"))
+    survived = {json.loads(ln)["id"] for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()}
+    assert set(appended) <= survived  # every appended keep-row survived (no lost update)

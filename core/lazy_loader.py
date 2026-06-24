@@ -267,6 +267,7 @@ def _load_mastery(state_root: Path) -> dict:
     if not db.exists():
         return _empty_mastery()
     conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA busy_timeout=5000")  # wait for concurrent writer, don't error
     conn.row_factory = sqlite3.Row
     try:
         # summary

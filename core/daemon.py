@@ -14,6 +14,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent / "state"
 DAEMON_TIMEOUT = 30  # seconds per request
+_MAX_REQUEST_BYTES = 16 * 1024 * 1024  # cap one request's read (no-newline flood guard)
 PID_FILE = "rag-daemon.pid"
 SOCKET_FILE = "rag-daemon.sock"
 LISTEN_BACKLOG = 32
@@ -409,6 +410,12 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
     try:
         while True:
             conn, _ = srv.accept()
+            # Bound each connection's read: the loop is single-threaded serial,
+            # so a client that connects then stalls (partial send, no trailing
+            # newline, dead AI-session socket) would block recv() forever and
+            # freeze every other ask + ping. A recv deadline + byte cap means one
+            # stuck client can't starve the rest (head-of-line DoS).
+            conn.settimeout(DAEMON_TIMEOUT)
             try:
                 data = b""
                 while b"\n" not in data:
@@ -416,6 +423,8 @@ def serve(state_root: Path = DEFAULT_STATE_ROOT) -> None:
                     if not chunk:
                         break
                     data += chunk
+                    if len(data) > _MAX_REQUEST_BYTES:
+                        break
                 if not data:
                     conn.close()
                     continue
