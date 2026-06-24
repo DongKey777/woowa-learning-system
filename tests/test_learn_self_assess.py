@@ -90,3 +90,24 @@ def test_no_pending_trigger_rejected_regardless_of_score(tmp_path: Path) -> None
     ])
     assert rc == 1
     assert "no matching pending" in err
+
+
+def test_self_assess_records_mastery_evidence(tmp_path: Path) -> None:
+    # The canonical CLI must emit self_assess mastery evidence (record_turn), not
+    # just append history — previously a self-assessment never became corroborating
+    # evidence toward a promotion (diverged from the learn-event path).
+    import sqlite3
+    mod = _load_cli()
+    _seed_pending(tmp_path)
+    rc, _out, _ = _run(mod, [
+        "--trigger-session-id", "s1", "--score", "8",
+        "--state-root", str(tmp_path), "--learner-id", "testuser",
+    ])
+    assert rc == 0
+    db = tmp_path / "learner" / "mastery_graph.sqlite"
+    assert db.exists()
+    conn = sqlite3.connect(str(db))
+    rows = conn.execute(
+        "SELECT concept_id, source FROM evidence WHERE source='self_assess'").fetchall()
+    conn.close()
+    assert ("spring/di", "self_assess") in rows

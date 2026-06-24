@@ -119,6 +119,11 @@ def record_evidence(
     now = ts if ts is not None else time.time()
     with _connect(state_root) as conn:
         if dedup_key is not None:
+            # Take the write lock BEFORE the existence check so a concurrent
+            # same-key insert can't slip between this SELECT and the INSERT below
+            # (both saw empty → both inserted → duplicate). busy_timeout makes the
+            # loser wait for the winner's commit, then it sees the row and dedups.
+            conn.execute("BEGIN IMMEDIATE")
             prior = conn.execute(
                 "SELECT id FROM evidence WHERE json_extract(payload_json,'$.dedup_key')=? LIMIT 1",
                 (dedup_key,),

@@ -168,3 +168,30 @@ def test_connection_sets_busy_timeout(tmp_path) -> None:
     from core.mastery import _connect
     with _connect(state_root=tmp_path) as conn:
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
+def test_record_evidence_dedup_no_duplicate_under_concurrency(tmp_path) -> None:
+    # Concurrent same-dedup_key inserts must produce exactly one row (the
+    # SELECT-then-INSERT used to race → duplicates). BEGIN IMMEDIATE + busy_timeout
+    # serialize the check-then-insert.
+    import threading
+
+    from core.mastery import _connect, record_evidence
+    record_evidence("c/seed", "mission_use", state_root=tmp_path)  # init schema
+    results, barrier = [], threading.Barrier(4)
+
+    def _ins() -> None:
+        barrier.wait()
+        results.append(record_evidence("c/dup", "pr_merge", state_root=tmp_path, dedup_key="K1"))
+
+    threads = [threading.Thread(target=_ins) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    with _connect(tmp_path) as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE json_extract(payload_json,'$.dedup_key')='K1'"
+        ).fetchone()[0]
+    assert n == 1
+    assert len(set(results)) == 1  # all callers got the same id
