@@ -225,7 +225,7 @@ as the current index.
 
 Core runtime package breakdown (Python files under package dirs): **17175 LOC**.
 - `core/`: 9925 (router + lazy_loader + coach + daemon + mastery + feedback + drill + profile/session/onboarding/state + …)
-- `rag/`: 1337 (encoder + search + index + corpus_loader + personalization + reranker)
+- `rag/`: 1337 (encoder + search + index + corpus_loader + personalization + eval)
 - `mission/`: 3558 (extract.py + graph.py + per-mode analysis: cohort/peer_pr/predict/reviewer_profile/diff_evolution/cross_mission/temporal/thread_recon/learning_path/memory_review/meta_analytics/pr_meta/pr_review)
 - `anchors/`: 448 (extract.py + match.py)
 - `curation/`: 393

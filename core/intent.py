@@ -1,25 +1,32 @@
 """Intent dispatcher — choose mode for unified bin/ask entry (D13+D14).
 
-Heuristic 1st pass returns one of:
-  "self_assess" | "drill" | "retro" | "coaching" | "cs_qa" | "tool_only"
+Heuristic 1st pass returns a router mode: the original 6 (self_assess, drill,
+retro, coaching, cs_qa, tool_only) plus the Family A-P analytics modes
+(pr_diff_evolution, cross_mission, memory_review, pr_review, reviewer_profile,
+learning_path, pr_meta, thread_recon, temporal, peer_compare, cohort, predict,
+meta_analytics). detect_mode() is the authoritative dispatch.
 
 AI session in Phase 6.5 may override if it disagrees, but 95% accuracy on
 the 50-sample falsification set (D13) must come from this layer.
 
-Priority order (first match wins):
-  1. pending self-assessment + short score-like reply → self_assess
+Priority order (first match wins) — see detect_mode() for the exact chain:
+  0. short greeting / ack → tool_only
+  1. pending self-assessment + score-like reply → self_assess
   2. pending drill + answer-shaped reply → drill
-  3. retro keywords (회고/반복/내 PR/정밀) → retro
-  4. repo specified + coaching keywords → coaching
-  5. TOOL_TOKENS in prompt → tool_only
-  6. default → cs_qa
+  3. Family A-P keyword checks (several repo-gated) → that family mode
+  4. retro keywords (회고/반복/내 PR/정밀) → retro
+  5. repo specified + coaching keywords → coaching
+  6. TOOL_TOKENS in prompt → tool_only
+  7. default → cs_qa
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
-# D6: ONLY tool tokens kept (legacy CS_DOMAIN/LEARNING/DEPTH lexicons removed)
+# D6 fast-path lexicon. (The legacy CS_DOMAIN/LEARNING/DEPTH lexicons were removed
+# in D6; Phase Y11 P0.5 later re-added a minimal CS_TOKENS/LEARNING_INTENT guard
+# set below — see should_use_rag.)
 TOOL_TOKENS = (
     "gradle", "maven", "git ", "github actions", "intellij", "vscode",
     "homebrew", "brew install", "brew ", "npm install", "npm ", "pip install", "pip ",

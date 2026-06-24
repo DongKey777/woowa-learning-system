@@ -79,7 +79,7 @@ bin/rag-daemon status   # JSON: pid/uptime/socket/health
 - BGE-M3 + corpus + lazy_loader 메모리에 keep
 - single-thread (single-learner 설계)
 - 시작 후 ~5-10초 prewarm — `state/rag-daemon.log`에 `ready` 출력
-- env `WOOWA_RAG_NO_DAEMON=1` 로 비활성 (in-process fallback)
+- `bin/ask --no-daemon` 플래그로 daemon 우회 (in-process fallback)
 
 권장 시작:
 ```bash
@@ -182,7 +182,7 @@ Build 후 publish 흐름:
 bin/index-pack --force && bin/index-pack --verify-only   # archive_sha256 기록
 cp state/index.tar.zst /tmp/paradigm-v2-index-v1.0.5
 gh release create paradigm-v2-index-v1.0.5 /tmp/paradigm-v2-index-v1.0.5 \
-    --title "woowa-learning-system Lance index v1.0.3" --notes "...SHA256..."
+    --title "woowa-learning-system Lance index v1.0.5" --notes "...SHA256..."
 # 이후 학습자는 bin/index-fetch --tag paradigm-v2-index-v1.0.5 로 업데이트
 ```
 **새 release마다 필수**: `bin/index-fetch`의 `KNOWN_SHA256`에 `{tag: archive_sha256}` 한 줄 추가 + `DEFAULT_TAG`를 새 tag로 bump. (`sync-index-metadata`는 문서/manifest만 갱신하고 index-fetch 상수는 건드리지 않는다.)
@@ -270,8 +270,8 @@ bin/phase9-gate
 |---|---|
 | `WOOWA_SESSION_MODE` | `learn-event` (이벤트 mode 태깅), `ask` (history append mode) |
 | `HF_HUB_OFFLINE` | `corpus-build`, `cross-crew-build`, `rag-daemon` (BGE-M3 fetch 우회) |
-| `WOOWA_RAG_NO_DAEMON` | `ask` (daemon 우회, in-process) |
-| `WOOWA_RAG_DAEMON_IDLE_UNLOAD_SECS` | `rag-daemon` (N초 idle 후 모델 cache 해제, default 0 = off) |
+
+(daemon 우회는 env var가 아니라 `bin/ask --no-daemon` 플래그다.)
 
 ---
 
