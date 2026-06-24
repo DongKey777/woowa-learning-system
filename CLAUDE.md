@@ -310,7 +310,7 @@ woowa-learning-system은 repo 준비, 학습 상태, RAG 검색, 코칭 context 
 ### 5.1 모든 작업
 - `WOOWA_SESSION_MODE=development` 환경 변수 set 후 후속 명령 (또는 개별 `bin/ask` 호출에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨된다.
 - 변경은 commit 기반 reproducible. 측정 결과는 로컬 `reports/`에 저장 (gitignored — public clone에 안 들어감). 헤드라인 metric은 `docs/verification-results.md`에 inline로 정리한다.
-- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 745 passed 유지.
+- 회귀 검증: `pytest tests/ -q` 모든 변경 후. 현재 780 passed 유지.
 
 ### 5.2 측정 명령
 ```bash

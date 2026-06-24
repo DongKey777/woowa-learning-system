@@ -16,7 +16,7 @@ Woowa mission learning system: Python flat-layout RAG daemon + CLI wrappers + le
 
 ```text
 woowa-learning-system/
-├── bin/        # 81+ user/operator commands; thin wrappers over core/rag/mission
+├── bin/        # 84 user/operator commands; thin wrappers over core/rag/mission
 ├── core/       # daemon, routing, prompt, state, telemetry, learner profile
 ├── rag/        # corpus load, BGE-M3 encode, Lance index, retrieval/fusion
 ├── mission/    # system-side mission/PR analytics; writes state/repos artifacts
@@ -264,7 +264,7 @@ CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 ### 5.1 매 작업
 - `WOOWA_SESSION_MODE=development` set (또는 개별 `bin/ask`에 `--session-mode development` 명시 — provenance `explicit`). 둘 다 dev 텔레메트리로 라벨.
 - commit 기반 reproducible
-- 회귀 검증: `pytest tests/ -q` (현재 745 passed 유지)
+- 회귀 검증: `pytest tests/ -q` (현재 780 passed 유지)
 
 ### 5.2 측정 명령
 ```bash
