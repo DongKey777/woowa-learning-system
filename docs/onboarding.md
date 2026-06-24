@@ -84,7 +84,7 @@ macOS Homebrew / Debian 시스템 Python은 PEP 668 (externally-managed)이라
 
 ### Step 2 — HuggingFace 모델 캐시 warm-up
 
-첫 daemon 시작 시 `BAAI/bge-m3` (~3GB, dense 인코더)만 자동 다운로드한다. cross-encoder reranker(`bge-reranker-v2-m3`)는 라이브 ask 파이프라인에 없어 받지 않는다 — 라이브 경로는 CC fusion + 세션 rerank를 쓴다(`rag/reranker.py`는 lazy-load 모듈이지만 `collect_cs_qa_context`/테스트에서만 호출, daemon 미경유).
+첫 daemon 시작 시 `BAAI/bge-m3` (~3GB, dense 인코더)만 자동 다운로드한다. cross-encoder reranker(`bge-reranker-v2-m3`)는 라이브 ask 파이프라인에 없어 받지 않는다 — 라이브 경로는 CC fusion + 세션 rerank를 쓴다(cross-encoder reranker 모듈은 dead-code로 제거됨).
 
 ```bash
 # 사전 캐시하려면
@@ -235,7 +235,8 @@ bin/capture-repair --sync-pending --last 50
 |---|---|---|
 | `WOOWA_SESSION_MODE` | `learning` | Mode A (learning) vs Mode B (development). development = personalization stream에서 제외 |
 | `HF_HUB_OFFLINE` | unset | set이면 HuggingFace 모델 사전 캐시만 사용 (offline 환경) |
-| `WOOWA_RAG_NO_DAEMON` | unset | set이면 daemon 우회, in-process fallback (debug/CI) |
+
+(daemon 우회는 env var가 아니라 `bin/ask --no-daemon` 플래그다 — debug/CI.)
 
 추가 env는 [`bin-reference.md`](bin-reference.md) 각 entry 절 참조.
 

@@ -2,8 +2,8 @@
 empty when an artifact does not exist yet (e.g. mission_patterns before
 Phase B build).
 
-Token-budget critical: never load all 5 artifacts at once. The router's
-`lazy_artifacts` list is the contract.
+Token-budget critical: never load every artifact at once — load only what the
+router's `lazy_artifacts` list asks for (that list is the contract).
 """
 from __future__ import annotations
 

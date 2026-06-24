@@ -246,7 +246,7 @@ python3 bin/ask "테스트"
 | *"세션 시작"*, *"학습 시작"* | `bin/session-start --repo <r> --prompt "<intent>" --path missions/<r> --silent` |
 | 세션이 **판단**상 학습자가 특정 개념을 *아직 잘 모른다/처음/기초부터*로 드러낼 때 (W7 — 키워드 매칭 아닌 의미 판단) | `bin/learn-beginner-flag --concept <id> --silent` — 그 concept를 `must_skip_explanations_of`에서 제외할 뿐 아니라 retrieval 강등(`_mastered_like`)에서도 빼서 항상 표면화+재설명(mastery 과승급 자기신고 override). 확실히 익혔으면 `--clear` |
 
-### 4.7 Phase U-X auto-call (2026-05-26 신설 45 wrappers)
+### 4.7 Phase U-X auto-call (2026-05-26 신설 44 wrappers)
 
 CLAUDE.md §4.7-4.10과 동일 contract. 핵심 요약:
 

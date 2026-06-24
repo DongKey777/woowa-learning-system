@@ -4,7 +4,7 @@ Runs every measurable verification in paradigm-v2 sequentially and
 aggregates pass/fail into a single acceptance report.
 
 Categories:
-  A. Unit test suite (319+ tests)
+  A. Unit test suite (full pytest suite)
   B. Phase J/K/L/M/N/P (foundation benches)
   C. Phase T learner automation (7 wrappers + e2e integration)
   D. Phase U onboarding/collection (10 wrappers + collection layer)

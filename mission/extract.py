@@ -1,8 +1,8 @@
 """Java code → concept_id pattern extraction (F10 forward, D-D).
 
 Tier 1 (regex annotations): Spring annotations — measured 95-98% precision
-on DongKey777 archive sample. Uses ANNOTATION_TO_CONCEPT map (33 entries
-covering ~80% of mission Java surface).
+on DongKey777 archive sample. Uses the ANNOTATION_TO_CONCEPT map (covering
+~80% of mission Java surface).
 
 Tier 2 (regex method invocations): API call patterns like JdbcTemplate.query,
 Stream.of, CompletableFuture.thenApply. Lighter than Treesitter AST; covers
@@ -22,7 +22,7 @@ from pathlib import Path
 # ── concept mapping tables ────────────────────────────────────────────────
 
 ANNOTATION_TO_CONCEPT: dict[str, str] = {
-    # All concept_ids verified against live 3199-concept corpus (corpus_loader)
+    # All concept_ids verified against the live corpus (corpus_loader)
     # Stereotypes — corpus has no dedicated stereotypes doc; fall back to bean-di
     "@Component": "spring/bean-di-basics",
     "@Service": "spring/bean-di-basics",

@@ -1,16 +1,16 @@
 """Minimal RunPod build harness for woowa-learning-system.
 
 Replaces legacy 12-step paramiko harness with 8-step system-ssh flow.
-Build target: 3339 concepts × BGE-M3 dense → Lance index ≤20MB.
+Build target: the full concept corpus × BGE-M3 dense → Lance index ≤20MB.
 
 Steps:
-  1. Pod create (A100 PCIe, 96GB RAM, runpod/pytorch:2.4 image)
+  1. Pod create (A100 PCIe, 16GB RAM min, runpod/pytorch:2.4 image)
   2. Wait SSH ready
   3. shallow fetch DongKey777/woowa-learning-system @ commit
   4. pip install --break-system-packages: lancedb pyarrow sentence-transformers
      FlagEmbedding jsonschema
   5. warm BGE-M3 (HF download)
-  6. python -m bin.corpus-build → /workspace/state/index/
+  6. python bin/corpus-build → /workspace/state/index/
   7. tar + zstd → /workspace/index.tar.zst, scp to local
   8. Pod terminate (always — try/finally)
 
