@@ -3,7 +3,7 @@
   "title": "JSON column vs normalized table tradeoff",
   "category": "database",
   "level": "intermediate",
-  "summary": "JSON column은 선호 설정, 느슨한 metadata, 주문 시점 스냅샷처럼 한 owner row와 함께 읽고 쓰는 문서형 데이터에 유용하다. 하지만 field별 조회, 인덱스, FK/unique/check, 검증 책임, 부분 갱신, 마이그레이션/백필이 중요해지면 정규화된 테이블이 더 안전하다. JSON은 정규화의 대체재가 아니라 유연성과 관계형 제약 사이의 선택이다.",
+  "summary": "JSON column은 선호 설정, 느슨한 metadata, 주문 시점 스냅샷처럼 한 owner row와 함께 읽고 쓰는 문서형 데이터에 유용하다. 하지만 JSON 컬럼이 유연하더라도 field별 조회, 인덱스, FK나 unique 같은 invariant, 검증 책임, 부분 갱신, 마이그레이션/백필이 중요해지면 정규화된 테이블이 더 안전하다. JSON은 정규화의 대체재가 아니라 유연성과 관계형 제약 사이의 선택이다.",
   "body_markdown": "# JSON column vs normalized table tradeoff\n\n> 한 줄 요약: JSON column은 통째로 소유되는 문서형 부가 데이터에 좋고, 조회/제약/부분 갱신/마이그레이션이 중요해지면 정규화가 더 낫다.\n\n**난이도: 🟡 Intermediate**\n\nretrieval-anchor-keywords: JSON column vs normalized table, denormalized JSON blob, relational modeling, JSONB tradeoff, schema flexibility, foreign key constraint, partial update, JSON path index, generated column index, schema migration backfill, database modeling tradeoff\n\n## 먼저 멘탈모델\n\nRDB의 JSON column은 한 row 안에 작은 문서를 넣는 선택이다.\n\n```text\nmember(id, email, preferences_json)\nproduct(id, name, metadata_json)\norder(id, status, shipping_address_snapshot_json)\n```\n\n정규화는 그 안의 값을 독립된 row와 column으로 꺼내 DB가 직접 제약, 검색, 조인을 다루게 하는 선택이다.\n\n```text\nmember(id, email)\nmember_notification_setting(member_id, channel, enabled)\n\nproduct(id, name)\nproduct_tag(product_id, tag_id)\ntag(id, name)\n```\n\n질문은 \"JSON 컬럼에 통째로 저장해도 돼?\"가 아니라 **그 값이 독립적으로 조회, 검증, 참조, 갱신되어야 하는가**다.\n\n## JSON column이 받아들일 만한 경우\n\n- owner row와 생명주기가 같다. 예: 회원의 UI preferences/settings blob.\n- 대부분 통째로 읽고 통째로 저장한다. field 하나만 자주 검색하거나 정렬하지 않는다.\n- 값이 sparse하거나 자주 늘어나는 부가 metadata다. 예: 상품 노출 실험값, 외부 연동 payload의 일부.\n- DB FK/unique/check보다 애플리케이션 validator나 JSON schema로 검증해도 충분하다.\n- 조회 조건이 몇 개로 고정되어 있고, 필요한 JSON path index 또는 generated column index를 명시적으로 설계할 수 있다.\n- 주문 시점 스냅샷처럼 일부러 현재 master data와 분리해 보존해야 한다. 예: 주문 당시 고객 배송지, 주문 item 옵션명/가격 snapshot.\n\n이 경우에도 문서 크기, 허용 field, version, 기본값, 제거 정책은 코드나 문서에 남겨야 한다. schema가 없는 것이 아니라 **schema의 소유자가 DB에서 애플리케이션으로 이동한 것**이다.\n\n## normalized table이 더 나은 신호\n\n- 그 값이 다른 테이블에서 참조된다. 예: tag, option, address를 여러 곳에서 재사용한다.\n- field별 unique, FK, check constraint가 비즈니스 invariant다.\n- filter, sort, join, aggregate가 자주 필요하다. 예: 특정 tag를 가진 상품 검색, option별 재고/가격 집계.\n- 일부 field만 자주 수정된다. JSON 전체 overwrite가 아니라 row/column 경계를 명확히 나누는 편이 낫다.\n- 권한, 감사 로그, 변경 이력, soft delete, 부분 rollback이 field나 child row 단위로 필요하다.\n- 데이터가 커져서 JSON path index를 계속 추가하거나 expression index/generate column이 늘어난다.\n\n## 예시로 나누기\n\n| 데이터 | JSON column이 자연스러운 경우 | 정규화가 자연스러운 경우 |\n|---|---|---|\n| preferences/settings | 사용자의 화면 테마, 알림 UI 옵션처럼 owner와 함께 읽고 저장 | 알림 채널별 정책을 검색/집계하거나 관리자 화면에서 개별 제약이 필요 |\n| flexible metadata | 실험용 key-value, 외부 API 부가 payload, 드문 optional field | metadata key가 상품 검색 조건, 정렬 조건, 가격 정책 조건이 됨 |\n| order item/customer address snapshot | 주문 당시 옵션명, 주소, 가격을 그대로 보존 | 주소록, 상품 옵션, 재고처럼 현재 master data와 관계를 유지해야 함 |\n| tags/options | 화면 표시용 임시 label 묶음 | tag 자체가 검색, 추천, 중복 방지, 다대다 관계의 주체가 됨 |\n\n## 조회성과 인덱스 제약\n\nJSON path index가 있으면 일부 조회는 빨라질 수 있다. 하지만 일반 column index처럼 모든 문제를 깔끔하게 해결하지는 않는다.\n\n- DB마다 JSON 함수, path 문법, index 지원이 다르다.\n- path별 index가 늘면 쓰기 비용과 운영 복잡도가 증가한다.\n- planner가 복잡한 JSON 조건을 항상 기대처럼 쓰지 않을 수 있다.\n- join, range query, sort, aggregate가 많으면 일반 column이 더 예측 가능하다.\n- 자주 조회되는 JSON field는 generated column으로 빼거나 아예 정규화하는 것이 나을 수 있다.\n\n초기에는 JSON으로 시작해도 된다. 다만 \"이 field가 검색 조건이 되면 column/table로 승격한다\" 같은 승격 기준을 미리 두면 뒤늦은 대규모 수정이 줄어든다.\n\n## schema evolution과 validation ownership\n\n정규화된 table은 migration으로 column, constraint, FK를 바꾸며 DB가 많은 검증을 맡는다. JSON column은 구조 변경이 쉬워 보이지만 실제로는 다음 책임이 생긴다.\n\n- 새 field의 기본값과 null 처리 규칙을 애플리케이션이 알아야 한다.\n- 오래된 row의 JSON에는 field가 없을 수 있어 reader가 하위 호환되어야 한다.\n- JSON 내부 enum, 숫자 범위, 필수 field 검증 위치를 정해야 한다.\n- consumer가 여러 개면 문서 version이나 변환 로직이 필요할 수 있다.\n- 나중에 column/table로 빼려면 backfill, dual-read, dual-write, 검증 쿼리, cleanup 순서를 계획해야 한다.\n\n즉 JSON은 migration을 없애는 도구가 아니라 migration을 늦추거나 애플리케이션 쪽으로 옮기는 도구일 수 있다.\n\n## 부분 갱신과 동시성은 다음 개념으로 이어진다\n\nJSON field 하나만 바꾸는 것처럼 보여도 ORM이나 애플리케이션이 문서 전체를 read-modify-write하면 같은 column을 다시 쓰는 작업이 된다. DB JSON partial update 함수로 특정 path만 갱신할 수도 있지만, DB별 문법과 ORM 동작을 확인해야 한다.\n\n여기서는 모델링 선택의 신호만 보면 된다. **서로 다른 요청이 JSON 내부의 서로 다른 field를 자주 바꾼다**면 정규화, version CAS, row lock, JSON partial update 같은 충돌 경계를 따로 설계해야 한다. lost update 자체는 다음 문서에서 다룬다.\n\n## 선택 체크리스트\n\n- 이 데이터에 독립 identity와 lifecycle이 있는가?\n- DB가 FK/unique/check로 지켜야 하는 invariant인가?\n- 조회 조건, 정렬, 집계, join에 자주 등장하는가?\n- field 하나만 고치는 API가 많은가?\n- JSON 구조를 바꿀 때 reader, writer, backfill 순서가 명확한가?\n- 나중에 column/table로 승격할 기준과 검증 방법이 있는가?\n\n## 한 줄 정리\n\nJSON column은 owner row에 딸린 유연한 문서나 snapshot에는 좋은 선택이다. 하지만 field가 검색 조건, 관계, 제약, 동시 수정, 이력의 주체가 되는 순간에는 normalized table이 더 단순하고 안전한 모델이 된다.\n",
   "aliases": [
     "JSON 컬럼",
@@ -15,16 +15,16 @@
     "normalized table",
     "JSONB tradeoff",
     "denormalized JSON",
-    "schema flexibility",
-    "JSON path index",
-    "partial JSON update"
+    "FK unique invariant",
+    "유연한 JSON 컬럼 정규화",
+    "DB 제약 필요한 JSON"
   ],
   "expected_queries": [
     "JSON 컬럼에 통째로 저장해도 돼?",
     "정규화랑 JSON 컬럼은 언제 나눠?",
     "JSON column과 normalized table은 어떤 기준으로 선택해야 해?",
     "부가 metadata는 JSON column에 넣고 핵심 관계는 정규화하는 기준이 뭐야?",
-    "JSON path index를 쓰면 normalized table을 완전히 대체할 수 있어?",
+    "JSON 컬럼에 FK나 unique invariant가 필요하면 정규화 기준을 어떻게 잡아?",
     "field별 조회와 부분 update가 많아지면 JSON blob이 왜 불리해져?"
   ],
   "symptoms": [
