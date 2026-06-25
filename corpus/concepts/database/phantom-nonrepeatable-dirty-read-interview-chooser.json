@@ -3,7 +3,7 @@
   "title": "Phantom Nonrepeatable Dirty Read Interview Chooser",
   "category": "database",
   "level": "intermediate",
-  "summary": "이 chooser는 dirty read, non-repeatable read, phantom read를 면접 질문에서 구분한다.",
+  "summary": "이 chooser는 commit 안 된 값을 읽는 dirty read, 같은 row 값이 달라지는 non-repeatable read, 조건에 맞는 row 집합이 바뀌는 phantom read를 면접 질문에서 구분한다.",
   "body_markdown": "# Phantom Nonrepeatable Dirty Read Interview Chooser\n\n## 10초 chooser\n\n| anomaly | 관찰 | 핵심 |\n|---|---|---|\n| Dirty Read | commit 전 데이터를 읽음 | rollback될 값을 봄 |\n| Non-repeatable Read | 같은 row를 다시 읽었더니 값이 바뀜 | 다른 transaction update commit |\n| Phantom Read | 같은 조건 검색에서 row 집합이 바뀜 | insert/delete로 범위 결과 변화 |\n\n## Topic-specific invariant\n\n세 anomaly를 가르는 불변식은 \"무엇을 다시 봤는가\"다.\n\n> dirty read는 commit되지 않은 version을 읽은 문제, non-repeatable read는 이미 존재하던 같은 row의 committed version이 바뀐 문제, phantom read는 predicate에 맞는 row set 자체가 바뀐 문제다.\n\n이 구분이 잡히면 \"값이 바뀐 것\"과 \"row가 새로 나타난 것\"을 같은 말로 섞지 않게 된다.\n\n## timeline으로 보기\n\n### Dirty Read\n\n```text\nT1: UPDATE account SET balance = 0 WHERE id = 1  -- 아직 commit 안 함\nT2: SELECT balance FROM account WHERE id = 1     -- 0을 읽음\nT1: ROLLBACK\n```\n\nT2는 현실에 남지 않을 값을 읽었다. 핵심은 \"commit 전 값\"이다.\n\n### Non-repeatable Read\n\n```text\nT1: SELECT balance FROM account WHERE id = 1  -- 100\nT2: UPDATE account SET balance = 80 WHERE id = 1\nT2: COMMIT\nT1: SELECT balance FROM account WHERE id = 1  -- 80\n```\n\nT1은 같은 row를 다시 읽었는데 committed value가 바뀌었다. 핵심은 \"같은 row의 version 변화\"다.\n\n### Phantom Read\n\n```text\nT1: SELECT * FROM reservation WHERE room_id = 1 AND date = '2026-05-14'  -- 0 rows\nT2: INSERT INTO reservation(room_id, date) VALUES (1, '2026-05-14')\nT2: COMMIT\nT1: SELECT * FROM reservation WHERE room_id = 1 AND date = '2026-05-14'  -- 1 row\n```\n\nT1은 같은 조건을 다시 검색했는데 결과 집합이 달라졌다. 핵심은 \"predicate 범위에 새 row가 끼어든 것\"이다.\n\n## isolation level과 연결할 때의 주의점\n\n| anomaly | 보통의 방어 축 | 주의점 |\n|---|---|---|\n| Dirty Read | `READ COMMITTED` 이상 | 많은 DB는 `READ UNCOMMITTED`도 실제 dirty read를 막는 경우가 있다 |\n| Non-repeatable Read | snapshot / `REPEATABLE READ` | plain read 안정성과 write conflict 방어는 다르다 |\n| Phantom Read | predicate/range 보호, serializable, constraint | DB별 MVCC와 gap/predicate lock 구현 차이가 크다 |\n\nANSI isolation 이름만 외우면 실제 엔진 답변이 흔들린다. PostgreSQL의 `REPEATABLE READ`는 snapshot isolation 성격이 강하고, MySQL InnoDB의 `REPEATABLE READ`는 consistent read와 locking read, next-key lock 맥락을 나눠 봐야 한다.\n\n## 실무 지표와 증거\n\n| 증거 | 어떤 anomaly를 의심하나 |\n|---|---|\n| 같은 transaction/request 안의 두 SELECT 결과 | non-repeatable 또는 phantom 여부 |\n| 첫 query가 primary key exact lookup인지 predicate range인지 | same-row 문제인지 row-set 문제인지 분리 |\n| 격리 수준과 SQL 형태 | plain SELECT, `FOR UPDATE`, unique insert, serializable retry 차이 |\n| concurrent transaction timeline | 누가 commit 전 값을 봤는지, commit 후 값을 봤는지 |\n| duplicate booking/absence check 실패 | phantom 또는 write skew성 range invariant 문제 |\n| serialization failure/deadlock/gap lock wait | DB가 range 보호를 시도한 증거 |\n\n## 흔한 오개념\n\n| 오개념 | 왜 위험한가 | 더 정확한 답 |\n|---|---|---|\n| dirty read는 commit된 최신 값을 읽는 것이다 | dirty의 의미는 commit 전이라 rollback될 수 있다는 뜻이다 | commit 전/후를 기준으로 구분한다 |\n| non-repeatable read와 phantom은 둘 다 \"두 번 읽었더니 다름\"이다 | 같은 row value 변화와 predicate row set 변화가 다르다 | row identity를 먼저 본다 |\n| `REPEATABLE READ`면 phantom은 항상 없다 | 엔진과 SQL path에 따라 다르다 | PostgreSQL/MySQL 구현 차이를 확인한다 |\n| phantom은 조회 화면에서 row가 늘어나는 UX 버그다 | 핵심은 transaction predicate가 보호되지 않아 저장 판단이 깨질 수 있다는 점이다 | absence/range invariant를 봐야 한다 |\n| isolation level만 올리면 모든 동시성 문제가 끝난다 | lost update/write skew/phantom은 저장 시점 guardrail이 필요할 수 있다 | constraint, lock, serializable retry를 같이 본다 |\n\n## 면접 답변 축\n\n1. dirty read는 commit되지 않은 값을 읽는 것이다.\n2. non-repeatable read는 같은 row를 다시 읽었을 때 committed value가 달라지는 것이다.\n3. phantom read는 같은 predicate로 검색했을 때 row set이 달라지는 것이다.\n4. isolation level 표준명과 실제 DB 구현은 다를 수 있으므로 PostgreSQL/MySQL 차이를 확인한다.\n5. 특히 phantom은 \"읽기 결과가 다르다\"를 넘어 absence check, 예약 중복, 범위 불변식 문제로 이어질 수 있다.\n\n## 짧은 예시 답변\n\n\"Dirty read는 아직 commit되지 않아 rollback될 수 있는 값을 읽는 문제입니다. Non-repeatable read는 같은 row를 다시 읽었는데 다른 transaction의 commit 때문에 값이 바뀐 문제고, phantom read는 같은 조건 검색에서 row 집합이 바뀐 문제입니다. 그래서 값 변화인지 row set 변화인지 먼저 나누고, 실제 방어는 DB별 isolation 구현과 locking read, constraint, serializable retry까지 확인하겠습니다.\"\n\n## Safe Next Docs\n\n격리 수준 비교는 `isolation-level-read-committed-vs-repeatable-read-vs-serializable-intermediate-primer`로 이어진다.\n",
   "aliases": [
     "dirty read phantom read 차이",
@@ -15,7 +15,11 @@
     "isolation anomaly interview",
     "isolation anomaly",
     "phantom-nonrepeatable-dirty-read-interview-chooser",
-    "phantom nonrepeatable dirty read interview chooser"
+    "phantom nonrepeatable dirty read interview chooser",
+    "커밋 안 된 값 같은 행 두 번 조건 행 개수 구분",
+    "같은 행 값 변화와 조건 결과 증가 차이",
+    "dirty nonrepeatable phantom 세 상황 구분",
+    "면접에서 격리 이상현상 깔끔하게 말하기"
   ],
   "expected_queries": [
     "Dirty Read Non-repeatable Read Phantom Read 차이를 면접에서 어떻게 설명해?",
@@ -23,12 +27,16 @@
     "isolation anomaly를 예시로 정리해줘",
     "Phantom Nonrepeatable Dirty Read Interview Chooser를 언제 쓰는지 예제로 설명해줘",
     "Phantom Nonrepeatable Dirty Read 개념을 데이터베이스 관점에서 정리해줘",
-    "Phantom Nonrepeatable Dirty Read 구현할 때 자주 하는 실수는 뭐야?"
+    "Phantom Nonrepeatable Dirty Read 구현할 때 자주 하는 실수는 뭐야?",
+    "commit 전 값을 읽는 경우, 같은 row를 두 번 읽었는데 값이 바뀌는 경우, 조건 row 수가 늘어나는 경우를 어떻게 구분해?",
+    "dirty read, non-repeatable read, phantom read를 면접 답변으로 짧게 나누는 기준이 뭐야?"
   ],
   "symptoms": [
     "non-repeatable read와 phantom read를 같은 말로 써요",
     "dirty read를 commit된 값 읽기로 오해해요",
-    "isolation level별로 어떤 anomaly가 막히는지 헷갈려요"
+    "isolation level별로 어떤 anomaly가 막히는지 헷갈려요",
+    "값이 달라진 건지 row 집합이 늘어난 건지 구분하지 못해요",
+    "commit 안 된 값, 같은 행의 재조회 변화, 조건 결과 변화가 한꺼번에 헷갈려요"
   ],
   "relations": {
     "prerequisites": [
@@ -58,6 +66,11 @@
         "date": "2026-06-19",
         "source": "cycle2-generated-filler-repair",
         "note": "removed 2 generated filler aliases"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w76-database-symptom-surfaces",
+        "note": "added natural isolation anomaly interview surfaces"
       }
     ]
   }

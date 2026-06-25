@@ -3,7 +3,7 @@
   "title": "Commit Horizon After Failover, Loss Boundaries, and Verification",
   "category": "database",
   "level": "advanced",
-  "summary": "이 문서는 failover 뒤 새 primary가 포함한 last applied position, commit horizon, loss boundary를 기준으로 write loss와 reconciliation 범위를 검증하는 advanced playbook이다.",
+  "summary": "이 문서는 DB failover나 node promotion 뒤 새 primary가 어디까지 반영했는지, old node의 마지막 durable write와 비교해 어느 commit 구간이 사라졌을 수 있는지 확인하는 advanced playbook이다.",
   "body_markdown": "# Commit Horizon After Failover, Loss Boundaries, and Verification\n\n> 한 줄 요약: failover 뒤 가장 중요한 질문은 \"누가 primary인가\"보다, 새 primary가 어디까지의 commit horizon을 포함하고 있고 어느 구간부터는 유실 또는 재검증 대상이 되는가다.\n\n**난이도: 🔴 Advanced**\n\n관련 문서:\n\n- [Replication Failover and Split Brain](./replication-failover-split-brain.md)\n- [Primary Switch와 Write Fencing](./primary-switch-write-fencing.md)\n- [Failover Promotion과 Read Divergence](./failover-promotion-read-divergence.md)\n- [Failover Visibility Window, Topology Cache, and Freshness Playbook](./failover-visibility-window-topology-cache-playbook.md)\n- [Read Repair와 Failover Reconciliation](./read-repair-reconciliation-after-failover.md)\n\nretrieval-anchor-keywords: commit horizon after failover, promotion verification, failover loss boundary, last applied position, write loss audit, failover verification, backend db recovery\n\n## 핵심 개념\n\nfailover 직후에는 보통 \"새 primary 승격 완료\"만 확인하고 넘어가기 쉽다.  \n하지만 운영적으로 더 중요한 건 다음이다.\n\n- 새 primary가 마지막으로 포함한 commit 위치는 어디인가\n- old primary에는 있었지만 새 primary에는 없을 수 있는 구간이 있는가\n- 그 구간에 해당하는 비즈니스 작업은 무엇인가\n\n즉 failover verification의 핵심은 topology보다 **commit horizon 확인**이다.\n\n## 깊이 들어가기\n\n### 1. commit horizon은 \"새 primary가 확실히 가진 마지막 진실 시점\"이다\n\nreplica 승격 시점에 새 primary는 어떤 지점까지 적용했는지 갖고 있다.\n\n- 그 이전 commit: 비교적 안전한 포함 구간\n- 그 이후 commit: 유실 가능 또는 재검증 필요 구간\n\n이 경계가 바로 loss boundary다.\n\n### 2. 최신 replica 승격과 충분한 horizon 확보는 같은 말이 아니다\n\n승격 대상이 가장 최신 replica여도:\n\n- 마지막 몇 초 트랜잭션이 빠져 있을 수 있고\n- giant transaction은 partially visible하지 않지만 뒤 트랜잭션만 빠져 있을 수 있고\n- external side effect는 이미 나갔는데 DB commit은 새 primary에 없을 수 있다\n\n그래서 \"가장 최신\"보다 **정확히 어디까지 확정됐는가**가 중요하다.\n\n### 3. failover 뒤엔 손실 가능 구간을 비즈니스 이벤트로 투영해야 한다\n\nDB 위치 차이만 알면 운영자가 바로 움직이기 어렵다.\n\n필요한 해석:\n\n- 어떤 order/payment/user change가 영향받았는가\n- outbox/event relay와 commit 순서가 어땠는가\n- 외부 결제 승인/웹훅 발송은 이미 일어났는가\n\n즉 commit horizon은 기술 지표이면서 **재무/주문/권한 영향 범위 계산의 기준점**이다.\n\n### 4. verification은 \"새 primary 포함 구간\"과 \"재검토 구간\"을 나눠야 한다\n\n추천 절차:\n\n1. promotion 시점의 last applied position 기록\n2. old primary의 last durable / last accepted write 경계 확인\n3. gap 구간 추정\n4. 해당 구간의 비즈니스 row / outbox / side effect를 재검토\n\n핵심은 failover를 binary success/fail로 보지 않고, **확실한 포함 구간과 불확실 구간을 분리**하는 것이다.\n\n### 5. read consistency 문제와 write loss 문제를 섞으면 안 된다\n\n사용자 증상은 비슷할 수 있다.\n\n- \"방금 쓴 게 안 보여요\"\n\n하지만 원인은 다르다.\n\n- visibility window 문제\n- replica lag 문제\n- 실제 write loss / horizon gap 문제\n\ncommit horizon 문서는 세 번째를 다룬다.  \n즉 \"안 보인다\"가 아니라 **실제로 새 primary에 없는가**를 확인하는 문제다.\n\n### 6. post-failover reconciliation도 horizon 기준으로 잘라야 한다\n\n무조건 전체 데이터를 재검증할 필요는 없다.\n\n더 현실적인 범위:\n\n- failover 직전 N분\n- 특정 affected aggregate\n- 특정 outbox/event ids\n\n즉 reconciliation 범위도 commit horizon gap에서 역산하는 편이 낫다.\n\n## 실전 시나리오\n\n### 시나리오 1. 결제 승인 직후 failover\n\n외부 결제사는 성공했지만 새 primary에는 payment row가 없다.\n\n이 경우는:\n\n- commit horizon 이후 구간 손실 가능성\n- payment provider record와 DB 재조인\n- outbox/idempotency key 기준 복구\n\n가 필요하다.\n\n### 시나리오 2. 대량 배치 중 failover\n\n작은 트랜잭션이 여러 개면 일부만 빠졌을 수 있다.  \n한 giant transaction이면 통째로 적용 전이거나 적용 후일 가능성이 높다.\n\n즉 write shape에 따라 horizon 해석이 달라진다.\n\n### 시나리오 3. failover 후 read는 정상처럼 보임\n\nvisibility는 정상인데 특정 최근 주문만 빠져 있다면, routing 문제가 아니라 commit horizon gap일 수 있다.\n\n## 코드로 보기\n\n```text\npost-failover verification\n1. new primary last applied position\n2. old primary last durable/accepted position\n3. uncertain gap interval\n4. affected business rows/events\n5. replay or manual reconciliation plan\n```\n\n```sql\n-- 예시 감각: 승격 후 read-only 상태와 topology 확인\nSELECT @@read_only, @@super_read_only;\n```\n\n```sql\n-- outbox / idempotency row를 horizon 주변 범위로 재검토\nSELECT *\nFROM outbox_event\nWHERE created_at >= NOW() - INTERVAL 10 MINUTE;\n```\n\n핵심은 특정 SQL보다, promotion 순간의 위치 정보와 비즈니스 row를 연결해 손실 가능 구간을 줄이는 것이다.\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|------|------|------|------|\n| failover success만 확인 | 빠르다 | 손실 구간을 놓친다 | 비중요 서비스 |\n| commit horizon 검증 | loss boundary가 명확해진다 | 운영 절차가 늘어난다 | 주문/결제/권한 데이터 |\n| 전체 재검증 | 안전감이 높다 | 비용이 크다 | 영향 범위가 불명확할 때 |\n| horizon 기반 부분 reconciliation | 현실적이다 | 위치/이벤트 매핑이 필요하다 | 운영 성숙도가 있을 때 |\n\n## 꼬리질문\n\n> Q: failover 뒤 왜 commit horizon을 확인해야 하나요?\n> 의도: topology 전환과 데이터 포함 범위를 분리하는지 확인\n> 핵심: 새 primary가 어디까지의 commit을 실제로 포함했는지 알아야 손실 가능 구간을 알 수 있기 때문이다\n\n> Q: stale read와 commit horizon gap은 같은 문제인가요?\n> 의도: visibility 문제와 write loss 문제를 구분하는지 확인\n> 핵심: 아니다. 전자는 읽기 경로 문제일 수 있고, 후자는 새 primary에 실제로 데이터가 없을 수 있는 문제다\n\n> Q: failover 후 무엇을 재검증 대상으로 삼나요?\n> 의도: 기술 위치와 비즈니스 영향 범위를 연결하는지 확인\n> 핵심: horizon 이후 uncertain 구간에 해당하는 주문, 결제, outbox, idempotency row를 우선 본다\n\n## 한 줄 정리\n\nfailover verification의 핵심은 승격 성공이 아니라, 새 primary가 확실히 포함한 commit horizon과 그 이후 uncertain 구간을 비즈니스 영향 범위로 번역해 재검증하는 것이다.\n",
   "aliases": [
     "failover 뒤 유실 구간",
@@ -15,19 +15,27 @@
     "write loss audit",
     "failover verification",
     "commit horizon gap",
-    "failover 뒤 어디까지 commit됐나"
+    "failover 뒤 어디까지 commit됐나",
+    "DB 노드 승격 뒤 쓰기 유실 확인",
+    "옛 노드 commit 일부가 새 primary에 없는지 점검",
+    "어디까지 반영됐고 어디부터 유실인지 확인",
+    "promotion 뒤 반영 구간 검증 절차"
   ],
   "expected_queries": [
     "failover 후 새 primary의 commit horizon과 loss boundary를 어떻게 확인해?",
     "last applied position 이후 구간에 write loss가 있는지 어떤 순서로 감사해야 해?",
     "외부 결제는 성공했는데 failover 후 payment row가 없으면 어떤 verification을 해야 해?",
     "failover visibility window와 실제 write loss horizon gap을 어떻게 구분해?",
-    "post-failover reconciliation 범위를 commit horizon 기준으로 어떻게 자르면 돼?"
+    "post-failover reconciliation 범위를 commit horizon 기준으로 어떻게 자르면 돼?",
+    "DB가 승격된 뒤 old primary에는 있던 commit이 새 primary에 빠졌는지 어떻게 확인해?",
+    "failover 후 어느 시점까지의 write가 반영됐고 어떤 구간을 재검증해야 하는지 절차가 궁금해"
   ],
   "symptoms": [
     "failover 뒤 새 primary가 어디까지 commit을 포함했는지 확인하지 못하고 있어",
     "외부 결제나 outbox side effect는 나갔는데 새 primary에 row가 없는지 검증해야 해",
-    "방금 쓴 값이 안 보이는 문제가 replica lag인지 실제 write loss인지 분리해야 해"
+    "방금 쓴 값이 안 보이는 문제가 replica lag인지 실제 write loss인지 분리해야 해",
+    "노드 승격 이후 일부 최근 쓰기가 새 primary에서 사라졌는지 확인해야 해",
+    "old primary와 new primary의 마지막 반영 위치 차이를 비즈니스 row 범위로 바꿔야 해"
   ],
   "relations": {
     "prerequisites": [
@@ -69,6 +77,11 @@
         "date": "2026-06-19",
         "source": "cycle2-generated-filler-repair",
         "note": "added natural Korean aliases"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w76-database-symptom-surfaces",
+        "note": "added natural failover verification learner surfaces"
       }
     ]
   }
