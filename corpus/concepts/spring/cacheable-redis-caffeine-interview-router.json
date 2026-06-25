@@ -3,7 +3,7 @@
   "title": "Cacheable Redis Caffeine Interview Router",
   "category": "spring",
   "level": "intermediate",
-  "summary": "Spring @Cacheable 질문을 Redis/Caffeine 선택, cache key 범위, transaction 후 eviction, local stale, proxy self-invocation 증상으로 라우팅하는 symptom router.",
+  "summary": "Spring @Cacheable 질문을 Redis/Caffeine 선택, cache key 범위, transaction 후 eviction, local stale, proxy self-invocation 증상으로 라우팅하는 symptom router. Spring Cache에서 Redis랑 Caffeine은 공유 범위, latency, stale window 기준으로 고른다.",
   "body_markdown": "# Cacheable Redis Caffeine Interview Router\n\n## 자연어 진입점\n\n이 문서는 `@Cacheable` 질문을 저장소 선택 문제가 아니라 캐시가 놓인 경계 문제로 라우팅한다. 학습자가 Redis와 Caffeine 중 무엇을 써야 하는지, key에 tenant/user가 빠져 데이터가 섞이는지, update 뒤 stale data가 남는지, 같은 클래스 내부 호출에서 annotation이 왜 안 먹는지를 물을 때 이 라우터로 들어온다.\n\n대표 발화:\n\n- `@Cacheable 붙였는데 이건 Redis 캐시야 Caffeine 캐시야?`\n- `여러 서버에서 로컬 캐시 쓰면 값이 안 맞을 수 있지 않나?`\n- `key에 userId나 tenantId를 언제 넣어야 하는지 모르겠어`\n- `DB 업데이트하고 @CacheEvict 했는데 트랜잭션 롤백되면 어떻게 돼?`\n- `같은 클래스 안에서 캐시 메서드 호출하면 왜 적용이 안 돼?`\n\n## 1차 라우팅 질문\n\n먼저 cache backend 이름보다 다음 질문을 앞에 둔다.\n\n| 먼저 물을 것 | Redis 쪽으로 기우는 경우 | Caffeine 쪽으로 기우는 경우 |\n|---|---|---|\n| 여러 instance가 같은 값을 봐야 하나 | API 응답, 세션성 데이터, expensive query 결과를 공유해야 한다 | 한 JVM 안 반복 조회만 줄이면 충분하다 |\n| stale window를 어디까지 허용하나 | cluster-wide invalidation, TTL, event 기반 eviction을 설명해야 한다 | instance별 값 차이와 짧은 TTL을 감수할 수 있다 |\n| 장애 비용은 무엇인가 | network hop, timeout, serialization, Redis 장애 fallback을 다룬다 | process memory, restart loss, capacity eviction을 다룬다 |\n| key가 결과 동등성을 표현하나 | tenant/user/locale/permission/version/paging이 빠지면 데이터가 섞인다 | user별 key를 과하게 넣으면 hit ratio가 무너진다 |\n\n## @Cacheable 요청 흐름\n\n`@Cacheable`은 Redis 호출 문법이 아니다. Spring bean method 호출이 proxy를 통과하면 cache interceptor가 cache name과 key를 계산하고, `CacheManager` 또는 `CacheResolver`가 선택한 backend에서 값을 찾는다. hit면 method body를 실행하지 않고 반환하고, miss면 method를 실행한 뒤 반환값을 cache에 넣는다.\n\n따라서 면접 답변은 메서드 결과 저장에서 끝내지 말고 proxy 경계, key 경계, backend 경계, invalidation 경계를 같이 말해야 한다.\n\n## Redis vs Caffeine 선택\n\n| 선택 | 좋은 답변 | 빠지는 함정 |\n|---|---|---|\n| Caffeine | local in-memory cache라 빠르고 한 instance 안 hot lookup에 적합하다 | 서버마다 값이 다르고 재시작하면 사라지며 다른 instance eviction이 자동 전파되지 않는다 |\n| Redis | 여러 instance가 공유하는 external cache라 공통 조회 결과나 cross-instance hit에 적합하다 | shared store일 뿐 DB와의 정합성, TTL, serialization, 장애 처리는 별도 설계다 |\n| 둘 다 | Redis를 source cache로 두고 Caffeine을 near-cache로 쓰면 latency를 줄일 수 있다 | local stale window, invalidation 순서, event 누락 시 복구 전략을 설명해야 한다 |\n\n## key 설계: tenant/user 실수\n\ncache key는 같은 결과로 재사용해도 되는 조건을 표현해야 한다. tenant, user, locale, permission, region, paging, sort, version처럼 반환값을 바꾸는 축이 빠지면 다른 사용자의 가격, 권한, 언어, 노출 상태가 섞일 수 있다. 반대로 결과가 동일한데 userId를 무조건 넣으면 key cardinality가 커지고 hit ratio가 떨어진다.\n\n면접에서는 SpEL 문법보다 다음 문장이 중요하다. 먼저 같은 응답으로 보아도 되는 조건을 정의하고, 그 조건만 key에 넣어 너무 적지도 너무 많지도 않게 설계한다.\n\n## 쓰기 경로와 transaction 타이밍\n\n캐시 사고는 조회 annotation보다 update 뒤 eviction 타이밍에서 자주 난다. DB와 cache는 같은 원자적 저장소가 아니므로 commit 전 cache evict, commit 후 evict 실패, rollback 이후 stale/miss window를 따로 봐야 한다.\n\n| 상황 | 위험 | 확인 |\n|---|---|---|\n| commit 전 evict | rollback되면 DB 값은 그대로인데 cache만 비어 stampede가 생길 수 있다 | transaction-aware cache manager, after-commit hook |\n| commit 후 evict 실패 | DB는 바뀌었는데 오래된 cache가 계속 반환된다 | retry, TTL, outbox/event 기반 invalidation |\n| `@CachePut` 남용 | 반환 객체와 commit 후 DB 상태가 다르면 cache가 틀릴 수 있다 | flush/commit 이후 관찰값, write model 분리 |\n| local Caffeine evict만 수행 | 현재 instance만 비우고 다른 instance local cache는 남는다 | pub/sub, domain event, 짧은 TTL, Redis 공유 cache |\n\n정합성이 중요한 권한, 결제, 재고성 응답은 캐시를 맞추는 방법보다 DB가 authoritative source라는 경계와 stale 허용치를 먼저 정한다.\n\n## stale local cache 라우팅\n\n여러 서버에서 Caffeine만 쓰면 각 JVM이 서로 다른 복사본을 가진다. 한 서버에서 update 후 local cache를 비워도 다른 서버의 local cache는 모른다. 이 질문은 Redis로 바꾸면 끝인가가 아니라 shared cache, pub/sub invalidation, 짧은 TTL, versioned key, event 재처리 중 어떤 방식으로 stale window를 줄일지로 라우팅한다.\n\n`@Cacheable(sync = true)`는 같은 JVM 안에서 동시 miss를 줄이는 옵션으로 설명한다. Redis 전체에 대한 distributed lock이나 cluster-wide stampede 해결책으로 말하면 과장이다.\n\n## proxy self-invocation 라우팅\n\nannotation이 안 먹는 질문은 backend보다 AOP 경계를 먼저 본다. Spring Cache는 일반적으로 Spring bean proxy를 통과한 public method call에서 동작한다. 같은 객체 내부의 `this.cachedMethod()`, private helper, 직접 `new`로 만든 객체 호출은 proxy를 우회하므로 cache advice가 적용되지 않을 수 있다.\n\n## 면접 답변 골격\n\n`@Cacheable`은 method 결과를 cache abstraction으로 감싸는 기능이고, Redis와 Caffeine은 그 값을 어디에 둘지에 대한 선택입니다. 여러 instance가 같은 cache를 봐야 하거나 운영상 공유가 필요하면 Redis, 한 JVM 안의 짧은 반복 조회를 줄이는 목적이면 Caffeine이 맞습니다. 다만 둘 다 key 설계와 invalidation을 자동 해결하지 않으므로 tenant/user 같은 결과 변경 축, transaction commit 이후 eviction, local cache stale window, proxy self-invocation 여부를 같이 확인하겠습니다.\n\n## 빠른 오답 신호\n\n- Redis를 쓰면 분산 환경 정합성이 자동으로 해결된다고 말한다.\n- key를 productId 하나로 두고 tenant, user, permission, locale 차이를 무시한다.\n- `@CacheEvict`만 붙이면 transaction rollback과 commit 후 evict 실패가 사라진다고 본다.\n- 여러 instance의 Caffeine local cache가 자동으로 같은 값을 유지한다고 가정한다.\n- 같은 클래스 내부 호출이나 private method에 붙인 `@Cacheable`이 항상 동작한다고 말한다.\n\n## 관련 playbook\n\nkey 함정은 `spring-cache-key-generation-pitfalls`로 이어진다.\n\n## 라우터로 답할 때의 최소 분기\n이 문서는 Spring Cache 자체 문법 설명보다 질문을 올바른 bucket으로 보내는 데 초점을 둔다. 저장 위치를 묻는 질문은 CacheManager와 backend 선택으로, 사용자 데이터가 섞인 증상은 key scope로, DB commit 뒤 stale 값이 보이는 증상은 eviction timing과 local cache invalidation으로 분기한다.\n",
   "aliases": [
     "@Cacheable Redis Caffeine 라우팅",
@@ -14,10 +14,11 @@
     "local Caffeine stale cache",
     "Spring cache self invocation",
     "캐시 key 사용자 섞임",
-    "near cache invalidation"
+    "near cache invalidation",
+    "Spring Cache Redis Caffeine 선택"
   ],
   "expected_queries": [
-    "Redis랑 Caffeine 중에 어떤 캐시에 저장되는지 어떻게 구분해?",
+    "Spring Cache에서 Redis랑 Caffeine은 공유 범위와 지연 기준으로 어떻게 골라?",
     "면접에서 Redis 캐시랑 Caffeine 로컬 캐시는 왜 나눠서 답해야 해?",
     "캐시 key에 tenantId나 userId 빼먹으면 실제로 뭐가 터져?",
     "DB 업데이트 후 @CacheEvict가 transaction commit 전에 실행되면 stale 문제가 생길까?",
@@ -48,12 +49,17 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-26",
     "legacy_path": "knowledge/cs/contents/spring/cacheable-redis-caffeine-interview-router.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch144"
+      },
+      {
+        "date": "2026-06-26",
+        "source": "cycle4-w156-y14-recall",
+        "note": "added Spring Cache Redis versus Caffeine chooser learner surface"
       }
     ]
   }
