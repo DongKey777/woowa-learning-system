@@ -1,0 +1,55 @@
+{
+  "id": "security/session-timeout-idle-absolute-renewal-policy",
+  "title": "Session Timeout Idle Absolute Renewal Policy",
+  "category": "security",
+  "level": "intermediate",
+  "summary": "이 문서는 session lifecycle에서 idle timeout, absolute timeout, renewal timeout을 분리해 hijacked session 노출 시간을 줄이고, remember-me와 revocation 정책을 섞지 않는 보안 설계 카드다.",
+  "body_markdown": "# Session Timeout Idle Absolute Renewal Policy\n\n> 한 줄 요약: idle timeout은 조용히 방치된 세션을 끊고, absolute timeout은 활동 중이어도 최대 수명을 제한하며, renewal은 같은 로그인 흐름 안에서 session id 노출 시간을 줄이는 보조 장치다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n- [세션·쿠키·JWT 기초](./session-cookie-jwt-basics.md)\n- [Signed Cookies / Server Sessions / JWT Trade-offs](./signed-cookies-server-sessions-jwt-tradeoffs.md)\n- [Session Revocation at Scale](./session-revocation-at-scale.md)\n- [Session Store Design at Scale](../system-design/session-store-design-at-scale.md)\n- [Refresh Token Rotation / Reuse Detection](./refresh-token-rotation-reuse-detection.md)\n\nretrieval-anchor-keywords: session idle timeout, absolute timeout, renewal timeout, sliding session, session lifecycle timeout, remember me boundary, session max age, reauthentication after risk event, hijacked session exposure window, idle vs absolute session timeout\n\n## 세 가지 timeout을 분리한다\n\n| 정책 | 끊는 기준 | 줄이는 위험 | 흔한 오해 |\n|---|---|---|---|\n| idle timeout | 마지막 활동 이후 일정 시간 | 자리를 비운 브라우저나 방치된 session 탈취 | 사용자가 계속 활동하면 영원히 살아도 된다고 생각함 |\n| absolute timeout | 최초 인증 또는 session 생성 이후 최대 시간 | 탈취된 session id가 무기한 쓰이는 위험 | idle timeout이 있으면 absolute는 필요 없다고 생각함 |\n| renewal timeout | 일정 주기마다 session id 재발급 | 오래 노출된 같은 session id 재사용 | renewal이 logout/revoke를 대체한다고 생각함 |\n\nOWASP session guidance의 핵심도 idle과 absolute를 함께 두라는 쪽이다. 값은 서비스 위험도에 따라 달라진다. 결제, 관리자, 개인정보 같은 고위험 화면은 짧게 잡고, 저위험 읽기 앱은 더 길게 잡을 수 있다.\n\n## 설계 순서\n\n1. session 종류를 나눈다: browser session, remember-me, refresh token, step-up challenge를 같은 TTL로 묶지 않는다.\n2. 위험도별 idle timeout을 정한다: 고위험 route는 더 짧게, 일반 browsing은 UX를 고려한다.\n3. absolute timeout을 별도로 둔다: 활동이 계속돼도 최대 수명 후에는 재인증한다.\n4. renewal을 넣을지 결정한다: session id rotation은 race와 이전 id grace window를 같이 설계해야 한다.\n5. password change, MFA reset, role change 같은 risk event는 timeout 대기가 아니라 즉시 revoke 또는 step-up으로 처리한다.\n6. server-side 만료 판단을 authoritative하게 둔다. client countdown UI는 안내일 뿐 보안 판정이 아니다.\n\n## 흔한 실패 장면\n\n| 증상 | 더 가까운 원인 | 먼저 볼 것 |\n|---|---|---|\n| 사용자가 하루 종일 활동하면 session이 계속 살아 있다 | absolute timeout 부재 | created_at 기준 max age 검증 |\n| logout 했는데 다른 tab은 계속 통과한다 | revocation/state propagation 문제 | session revoke event와 cache invalidation |\n| remember-me cookie가 민감 API까지 바로 통과한다 | assurance level 분리 실패 | reauthentication/step-up policy |\n| session id를 주기적으로 바꾸다 가끔 튕긴다 | renewal race | old id grace window와 atomic swap |\n| idle timeout UI만 있고 서버는 계속 허용한다 | client-only timeout | server-side last_seen 검증 |\n\n## 구현 감각\n\n서버 session store에는 최소한 `created_at`, `last_seen_at`, `expires_at` 또는 `absolute_expires_at`, `revoked_at`, `assurance_level` 같은 판단 재료가 있어야 한다. 매 요청에서 last seen을 무조건 쓰면 write amplification이 커지므로 coarse-grained update나 sliding window throttle을 둔다. 하지만 최종 허용/거절은 항상 서버 시간이 기준이어야 한다.\n\nJWT만 쓰는 구조에서도 같은 질문은 사라지지 않는다. Access token에는 짧은 만료를 두고, refresh token family에는 rotation, reuse detection, absolute lifetime, device revoke를 둔다. self-contained token이라는 이유로 risk event revoke를 포기하면 session lifecycle 보장이 약해진다.\n\n## 꼬리질문\n\n> Q: idle timeout과 absolute timeout 중 하나만 두면 안 되나요?\n> 핵심: idle은 방치된 세션을 줄이고 absolute는 활동 중인 탈취 세션의 최대 수명을 제한하므로 서로 보완한다.\n\n> Q: remember-me를 켜면 absolute timeout을 길게 둬도 되나요?\n> 핵심: remember-me는 낮은 assurance 재인증 수단으로 보고 민감 route는 step-up을 요구해야 한다.\n\n> Q: client timer로 session timeout을 처리해도 되나요?\n> 핵심: UX 안내는 가능하지만 보안 판정은 server-side session metadata로 해야 한다.\n\n## 한 줄 정리\n\nSession timeout 설계는 하나의 TTL 숫자가 아니라 idle, absolute, renewal, revoke, step-up을 분리해 session 탈취 노출 시간과 사용자 UX를 함께 조절하는 정책이다.",
+  "aliases": [
+    "session idle timeout",
+    "absolute session timeout",
+    "session renewal timeout",
+    "세션 유휴 만료",
+    "세션 절대 만료",
+    "세션 만료 정책",
+    "session lifecycle timeout",
+    "remember-me timeout boundary"
+  ],
+  "expected_queries": [
+    "session idle timeout과 absolute timeout은 각각 어떤 위험을 줄이고 왜 둘 다 필요해?",
+    "로그인 세션이 계속 활동 중이어도 일정 시간 뒤 재인증해야 하는 이유가 뭐야?",
+    "remember-me, refresh token, browser session의 timeout 정책을 왜 같은 TTL로 묶으면 안 돼?",
+    "session renewal timeout으로 id를 주기적으로 바꿀 때 race와 old id grace window를 어떻게 봐야 해?",
+    "client-side countdown만으로 session timeout을 처리하면 왜 보안 판정이 약해져?"
+  ],
+  "symptoms": [
+    "idle timeout만 두고 absolute timeout 없이 활동 중인 세션을 무기한 허용한다.",
+    "remember-me와 정상 로그인 session을 같은 assurance로 보고 민감 API step-up을 생략한다.",
+    "client timer가 만료됐는지만 보고 server-side session metadata 검증을 빠뜨린다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "security/session-cookie-jwt-basics"
+    ],
+    "next_docs": [
+      "security/session-revocation-at-scale",
+      "security/refresh-token-rotation-reuse-detection",
+      "system-design/session-store-design-at-scale"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-Sec-web-w06",
+        "note": "Added session lifecycle timeout surface from OWASP Session Management guidance."
+      }
+    ]
+  }
+}
