@@ -3,7 +3,7 @@
   "title": "Mobile Push Notification Pipeline 설계",
   "category": "system-design",
   "level": "advanced",
-  "summary": "이 문서는 system-design 카테고리에서 Mobile Push Notification Pipeline 설계를 다루는 deep_dive 문서다. mobile push pipeline은 APNs/FCM을 통해 모바일 기기로 알림을 전달하고, 토큰 수명, collapse, 우선순위, 사용자 선호를 함께 관리하는 시스템이다. 검색 질의가 mobile push, APNs, FCM, device token처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "summary": "이 문서는 system-design 카테고리에서 Mobile Push Notification Pipeline 설계를 다루는 deep_dive 문서다. mobile push pipeline은 APNs/FCM을 통해 모바일 기기로 알림을 전달하고, 기기 토큰 만료, collapse 묶음 발송, 우선순위, 사용자 선호를 함께 관리하는 시스템이다. 검색 질의가 mobile push, APNs, FCM, device token, 앱 알림 서버처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
   "body_markdown": "# Mobile Push Notification Pipeline 설계\n\n> 한 줄 요약: mobile push pipeline은 APNs/FCM을 통해 모바일 기기로 알림을 전달하고, 토큰 수명, collapse, 우선순위, 사용자 선호를 함께 관리하는 시스템이다.\n\nretrieval-anchor-keywords: mobile push, APNs, FCM, device token, collapse key, priority, silent push, token refresh, delivery receipt, notification routing\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Notification 시스템 설계](./notification-system-design.md)\n> - [Notification Preferences Graph 설계](./notification-preferences-graph-design.md)\n> - [Email Delivery Platform 설계](./email-delivery-platform-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)\n\n## 핵심 개념\n\n모바일 push는 단순 알림 전송이 아니다.  \n실전에서는 아래를 함께 관리한다.\n\n- device token lifecycle\n- APNs/FCM provider integration\n- priority and collapse\n- quiet hours와 preferences\n- silent push\n- delivery telemetry\n\n즉, 모바일 push는 OS 제약을 고려한 고신뢰 알림 배달 파이프라인이다.\n\n## 깊이 들어가기\n\n### 1. push 채널의 특성\n\npush는 앱이 종료되어 있어도 도달할 수 있지만, 제약이 많다.\n\n- 토큰이 만료된다\n- OS가 메시지를 drop할 수 있다\n- 백그라운드 제한이 있다\n- 너무 많은 알림은 suppression된다\n\n### 2. Capacity Estimation\n\n예:\n\n- 일 1억 푸시 시도\n- 성공률 98%\n- 재시도율 3%\n\n실제 병목은 전송량보다 provider rate limit과 device token quality다.\n\n봐야 할 숫자:\n\n- send QPS\n- delivery success rate\n- token invalidation rate\n- collapse rate\n- provider response latency\n\n### 3. 파이프라인\n\n```text\nEvent\n  -> Preference Check\n  -> Template / Localization\n  -> Token Lookup\n  -> Provider Adapter\n  -> Delivery Tracking\n  -> Token Cleanup\n```\n\n### 4. token lifecycle\n\n모바일 토큰은 영구적이지 않다.\n\n- app reinstall\n- device reset\n- OS update\n- user opt-out\n\n그래서 invalid token을 빠르게 정리해야 한다.\n\n### 5. collapse와 priority\n\n같은 채널에 알림이 많이 오면 합칠 필요가 있다.\n\n- collapse key\n- latest-only semantics\n- high priority vs normal priority\n- silent push vs visible push\n\n### 6. user preference와 quiet hours\n\n모바일 push도 선호도 그래프와 연결된다.\n\n- marketing push off\n- security push on\n- quiet hours override\n\n이 부분은 [Notification Preferences Graph 설계](./notification-preferences-graph-design.md)와 함께 보면 좋다.\n\n### 7. telemetry and feedback\n\npush는 delivered 여부를 완전히 알기 어렵다.\n\n- sent\n- accepted by provider\n- device invalid\n- open/click when available\n\n메트릭이 중요하다.  \n이 부분은 [Metrics Pipeline / TSDB 설계](./metrics-pipeline-tsdb-design.md)와 연결된다.\n\n## 실전 시나리오\n\n### 시나리오 1: 결제 보안 푸시\n\n문제:\n\n- 즉시 도착해야 한다\n\n해결:\n\n- high priority push\n- user preference override\n- fallback in-app notification\n\n### 시나리오 2: 마케팅 푸시 대량 발송\n\n문제:\n\n- burst가 생기고 사용자 반응이 떨어진다\n\n해결:\n\n- rate limit\n- collapse\n- send window 분산\n\n### 시나리오 3: invalid token 폭증\n\n문제:\n\n- provider 응답에 invalid token이 늘었다\n\n해결:\n\n- token cleanup job\n- provider-specific quarantine\n\n## 코드로 보기\n\n```pseudo\nfunction sendPush(event):\n  if !preference.allows(event.userId, event.type):\n    return\n  token = tokenStore.get(event.deviceId)\n  result = provider.send(token, buildPayload(event))\n  if result.invalidToken:\n    tokenStore.delete(token)\n```\n\n```java\npublic void send(NotificationEvent event) {\n    pushAdapter.send(event, tokenRepository.lookup(event.deviceId()));\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| direct push | 빠르다 | provider 제약이 크다 | 모바일 핵심 |\n| queue-based push | 탄력적이다 | 상태 추적이 필요하다 | 실서비스 |\n| collapse-first | 알림 피로를 줄인다 | 일부 메시지 손실 | 빈번한 알림 |\n| high-priority only | 도달성이 좋다 | 비용/정책 제한 | 보안/결제 |\n| silent push | UX 제어가 좋다 | OS 제약이 많다 | 동기화/백그라운드 |\n\n핵심은 모바일 push가 이메일보다 더 제약이 많고, **OS/provider/token lifecycle을 함께 운영해야 하는 채널**이라는 점이다.\n\n## 꼬리질문\n\n> Q: push token은 왜 자주 바뀌나요?\n> 의도: 토큰 lifecycle 이해 확인\n> 핵심: 앱 재설치, OS 정책, device 변경으로 바뀔 수 있다.\n\n> Q: collapse key는 왜 필요한가요?\n> 의도: 알림 폭주 제어 이해 확인\n> 핵심: 같은 종류 알림을 합쳐 사용자를 덜 피로하게 한다.\n\n> Q: silent push는 왜 어려운가요?\n> 의도: OS background 제약 이해 확인\n> 핵심: 백그라운드 제한과 전달 보장이 약하다.\n\n> Q: 모바일 push와 email은 무엇이 다른가요?\n> 의도: 채널별 제약 차이 이해 확인\n> 핵심: push는 즉시성과 OS 제약, email은 도달성과 평판이 중심이다.\n\n## 한 줄 정리\n\nMobile push notification pipeline은 APNs/FCM 제약과 토큰 생명주기, collapse, 선호도를 함께 다루는 모바일 알림 배달 시스템이다.\n\n",
   "aliases": [
     "mobile push",
@@ -11,21 +11,21 @@
     "FCM",
     "device token",
     "collapse key",
-    "silent push",
-    "delivery receipt",
     "푸시 알림",
     "모바일 푸시",
     "디바이스 토큰",
-    "알림 collapse",
-    "무음 푸시"
+    "앱 알림 서버",
+    "안드로이드 아이폰 푸시",
+    "기기 등록 토큰 만료",
+    "배터리 아끼는 알림 묶음"
   ],
   "expected_queries": [
     "푸시 알림을 바로 FCM/APNs에 보내면 되는 것 같은데 device token 수명과 retry를 왜 관리해야 해?",
     "collapse key와 priority는 모바일 알림 중복과 배터리 사용에 어떤 영향을 줘?",
     "사용자 알림 설정, quiet hours, token refresh를 push pipeline 어디에서 처리해?",
     "APNs와 FCM 응답을 보고 invalid token을 정리하지 않으면 어떤 문제가 생겨?",
-    "모바일 푸시에서 APNs/FCM 응답을 보고 invalid token을 언제 삭제해야 해?",
-    "collapse key와 priority를 잘못 쓰면 중복 알림과 지연이 어떻게 달라져?"
+    "안드로이드/iOS 앱 알림 서버에서 기기 토큰 만료와 묶음 발송은 어디서 처리해?",
+    "푸시를 배터리 아끼려고 합쳐 보내려면 collapse key를 파이프라인 어디에 둬?"
   ],
   "symptoms": [
     "`Mobile Push Notification Pipeline 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",
@@ -61,6 +61,11 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-audit-natural-entrypoint-repair"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w80-system-design-platform-surfaces",
+        "note": "added natural Korean mobile push token and collapse entrypoints"
       }
     ]
   }
