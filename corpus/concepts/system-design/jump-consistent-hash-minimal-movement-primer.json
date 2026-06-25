@@ -3,7 +3,7 @@
   "title": "Jump Consistent Hash Minimal Movement Primer",
   "category": "system-design",
   "level": "intermediate",
-  "summary": "이 primer는 Jump consistent hash를 dense bucket count 기반 minimal movement placement로 설명한다. 핵심은 bucketCount가 N에서 N+1로 늘 때 기존 key는 그대로 있거나 새 bucket으로만 이동한다는 invariant와, 임의 bucket 제거와 weight 처리에는 별도 mapping layer가 필요하다는 caveat다.",
+  "summary": "이 primer는 Jump consistent hash를 ring이나 node list를 들고 있지 않아도 dense bucket count만으로 계산하는 minimal movement placement로 설명한다. 핵심은 bucketCount가 N에서 N+1로 늘 때 기존 key는 그대로 있거나 새 bucket으로만 이동한다는 invariant와, 임의 bucket 제거와 weight 처리에는 별도 mapping layer가 필요하다는 caveat다.",
   "body_markdown": "# Jump Consistent Hash Minimal Movement Primer\n\n> 한 줄 요약: Jump consistent hash는 key와 조밀한 bucket count만으로 owner bucket을 계산해, bucket을 append 할 때 기대 이동량을 새 bucket 몫으로 제한하는 memoryless placement 함수다.\n\nretrieval-anchor-keywords: jump consistent hash, jump hash, minimal movement, dense bucket id, append only bucket, memoryless consistent hashing, shard placement, bucket count, key movement invariant\n\n## 먼저 잡을 invariant\n\nJump consistent hash의 핵심 invariant는 **bucket 수가 `N`에서 `N+1`로 늘 때 key는 기존 bucket에 그대로 남거나 새 bucket `N`으로만 이동한다**는 것이다. 새 bucket이 전체 hash space에서 기대하는 몫은 대략 `1/(N+1)`이므로, 평균적으로 그 정도 key만 움직인다. 이것이 단순 modulo의 `hash(key) % N`과 가장 큰 차이다. modulo는 `N`이 바뀌면 나머지 값이 대부분 바뀌어 대다수 key가 다른 bucket으로 간다.\n\n이 invariant에는 중요한 조건이 붙는다. bucket id는 `0..N-1`처럼 조밀해야 하고, 변화는 주로 마지막에 새 bucket을 붙이는 형태여야 한다. `bucket 3`을 제거한 뒤 `4`를 `3`으로 당겨 재번호를 매기면 key가 대량 이동한다. 그래서 Jump hash를 \"임의 node 제거까지 안전한 consistent hashing\"이라고 말하면 과장이다.\n\n## Mental model\n\nJump hash는 ring을 저장하지 않는다. key의 64-bit hash를 deterministic pseudo-random sequence처럼 사용해 \"이 key가 마지막으로 jump한 bucket\"을 계산한다. 결과는 항상 `0 <= bucket < bucketCount`다. 같은 key와 같은 bucket count를 넣으면 모든 client가 같은 bucket을 얻는다.\n\n실무적으로는 아래처럼 생각하면 된다.\n\n```text\nbucket = jumpHash(hash(key), bucketCount)\nphysicalNode = bucketDirectory[bucket]\n```\n\n첫 줄은 metadata가 거의 없는 순수 함수다. 두 번째 줄은 운영자가 관리하는 mapping이다. 작은 시스템에서는 bucket이 곧 physical node일 수 있지만, 보통은 logical bucket을 physical node에 따로 배치한다. 그래야 physical node 교체, drain, weight 조정, rack-aware placement를 hash 함수와 분리할 수 있다.\n\n## 언제 잘 맞나\n\nJump hash는 다음 조건에서 특히 좋다.\n\n- bucket 수가 많지 않거나 매우 많아도 routing table을 client에 뿌리고 싶지 않다.\n- bucket id가 조밀하고 append 중심으로 늘어난다.\n- key placement가 빠르고 deterministic해야 한다.\n- ring vnode metadata를 저장하거나 배포하는 비용이 부담스럽다.\n- logical bucket layer를 두고 physical placement는 별도 control plane이 관리한다.\n\n예를 들어 cache partition을 256개 logical bucket으로 두고, 서비스 성장에 따라 512개로 늘리는 모델은 jump와 잘 맞는다. `256 -> 257` 같은 한 bucket append는 이동량이 작고, 여러 bucket을 단계적으로 추가하면 cache miss와 backend QPS 상승을 throttling하기 쉽다.\n\n## 언제 피해야 하나\n\n다음 조건에서는 jump hash 단독 선택이 위험하다.\n\n- 임의 bucket 제거가 자주 있다.\n- node id가 sparse하고 non-contiguous다.\n- weight가 자주 바뀐다.\n- replica top-k 순서가 필요하다.\n- membership set이 작고 자주 변해 candidate scan 비용이 문제가 아니다.\n- bucket directory version이 client마다 오래 갈라질 수 있다.\n\n특히 physical node 장애를 \"bucket count를 하나 줄이면 되겠지\"로 처리하면 안 된다. `N`을 줄이면 마지막 bucket 제거에는 비교적 맞지만, 중간 bucket이 죽은 경우에는 dense id를 유지하려고 재번호를 매길 가능성이 높다. 더 안전한 방식은 logical bucket id를 유지하고, 죽은 node에 있던 bucket들을 directory에서 다른 physical node로 옮기는 것이다. 이때 movement는 jump 함수가 아니라 directory rebalance 정책이 만든다.\n\n## Weighted node caveats\n\nJump hash 자체는 weighted node를 직접 표현하지 않는다. `bucketCount` 안에서는 각 bucket이 대체로 같은 확률을 갖는다. capacity가 다른 physical node에 적용하려면 보통 두 단계가 필요하다.\n\n1. 충분히 많은 logical bucket을 만든다.\n2. weight에 맞춰 logical bucket 개수를 physical node에 배정한다.\n\n예를 들어 큰 node가 작은 node의 2배 capacity라면 큰 node에 logical bucket을 2배 가까이 배정한다. 하지만 이 방식은 key count 기준 weight일 뿐이다. 실제 부하는 key별 value size, read/write ratio, hot key 분포에 좌우된다. 또한 weight를 바꾸면 logical bucket directory가 바뀌므로, jump hash의 append movement와 directory movement를 분리해서 측정해야 한다.\n\n임의 weight 변경이 핵심 요구라면 weighted HRW나 vnode 기반 ring이 더 자연스러울 수 있다. HRW는 검증된 weighted scoring으로 per-key winner 확률을 조정할 수 있고, ring은 vnode 개수로 capacity를 표현할 수 있다. Jump는 \"memoryless dense bucket placement\"에 강하고, \"arbitrary weighted membership\"에는 보조 계층이 필요하다.\n\n## Virtual node vs HRW vs Jump\n\nVirtual node ring은 metadata가 있지만 운영자가 볼 수 있는 owner map이 있다. vnode별 key count, migration task, replica placement를 명시적으로 추적하기 좋다. 대신 client가 ring version을 맞춰야 하고, vnode 수가 많아지면 metadata와 migration bookkeeping이 늘어난다.\n\nRendezvous hashing은 key마다 candidate node score를 계산한다. ring table이 필요 없고 임의 node 제거가 자연스럽다. 제거된 node가 winner였던 key만 next best node로 간다. top-k replica order도 score 정렬로 만들기 쉽다. 단점은 candidate 수에 비례하는 계산 비용과 candidate set consistency다.\n\nJump hash는 candidate scan도 ring metadata도 거의 없다. 계산은 빠르고 결과는 bucket count에만 의존한다. 하지만 dense bucket id와 append/change pattern이 계약이다. 이 계약 밖으로 나가면 minimal movement 보장을 알고리즘 이름만으로 기대할 수 없다.\n\n## Operational metrics\n\nJump hash 운영에서는 다음을 본다.\n\n- `bucketCount` 변경 전후 moved key ratio와 moved bytes\n- 새 bucket으로 간 key의 cache hit ratio, backend refill QPS\n- bucket별 QPS, bytes, p99 latency, max/mean ratio\n- physical node별 logical bucket count와 실제 resource 사용량\n- bucket directory version mismatch, stale client 비율\n- wrong bucket redirect, owner mismatch, retry rate\n- hot key top-N이 특정 bucket에 몰리는지\n- bucket append batch size와 warm-up completion time\n\n검증은 작은 샘플 hash만 보면 부족하다. 실제 key distribution, value size, traffic weight를 넣고 \"새 bucket으로 이동한 key가 전체 QPS의 몇 퍼센트인가\"를 봐야 한다. key 수 movement가 1%여도 그 안에 hot key가 있으면 p99는 크게 흔들릴 수 있다.\n\n## Wrong-bucket neighbors\n\n| 헷갈린 개념 | 왜 wrong bucket인가 | 더 정확한 분기 |\n|---|---|---|\n| consistent hash ring | ring과 vnode로 owner range를 관리한다 | Jump는 ring table 없이 dense bucket count로 계산한다 |\n| rendezvous hashing | 모든 candidate score를 비교해 winner를 고른다 | Jump는 candidate set이 아니라 bucket count를 입력으로 쓴다 |\n| shard key selection | 어떤 field를 key로 쓸지 고르는 문제다 | Jump는 이미 정한 key를 bucket으로 배치하는 함수다 |\n| shard rebalancing | data copy, catch-up, cutover 절차다 | Jump는 move 대상 계산의 한 조각일 뿐이다 |\n| modulo hashing | 구현은 단순하지만 N 변경 때 대량 remap된다 | Jump는 append 시 minimal movement invariant가 있다 |\n\n## Safe Next Docs\n\n전체 placement 선택은 `system-design/rendezvous-hashing-vs-consistent-hashing-shard-placement-chooser`로 이어진다. ring과 vnode mechanics는 `data-structure/consistent-hashing-ring`, 이동량과 cache miss 비용은 `data-structure/consistent-hashing-rebalancing-cost-model`, logical bucket을 실제 node로 옮기는 절차는 `system-design/shard-rebalancing-partition-relocation-design`에서 이어서 본다.\n",
   "aliases": [
     "점프 일관 해시",
@@ -14,14 +14,18 @@
     "append only bucket hash",
     "dense bucket consistent hash",
     "bucket 추가 때 key movement 작게",
+    "노드 목록 없이 key 배치",
+    "ring 없이 minimal movement hash",
+    "노드 추가 key 거의 안 움직임",
     "weighted node에 jump hash 쓸 때 주의"
   ],
   "expected_queries": [
     "Jump consistent hash는 어떤 invariant 때문에 movement가 작아?",
     "jump hash는 consistent hash ring과 뭐가 달라?",
     "bucket 수가 늘 때 jump hash의 key movement는 얼마나 돼?",
-    "jump consistent hash를 weighted node cluster에 써도 돼?",
-    "dense bucket id가 깨지면 jump hash가 왜 위험해?"
+    "dense bucket id가 깨지면 jump hash가 왜 위험해?",
+    "노드를 하나 추가할 때 ring table 없이 key 이동을 작게 만드는 해시가 뭐야?",
+    "Jump hash는 노드 목록을 메모리에 들고 있지 않아도 minimal movement가 되는 이유가 뭐야?"
   ],
   "symptoms": [
     "jump hash도 consistent hashing이니 임의 shard 제거에 안전하다고 말한다",
@@ -65,6 +69,11 @@
         "date": "2026-06-19",
         "source": "cycle2-generated-filler-repair",
         "note": "added natural Korean aliases"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w80-system-design-platform-surfaces",
+        "note": "added natural Korean memoryless node-addition entrypoints"
       }
     ]
   }

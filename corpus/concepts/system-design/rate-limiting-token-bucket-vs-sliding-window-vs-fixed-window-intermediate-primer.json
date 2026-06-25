@@ -3,7 +3,7 @@
   "title": "Rate Limiting 알고리즘 비교 — Token Bucket vs Sliding Window vs Fixed Window",
   "category": "system-design",
   "level": "intermediate",
-  "summary": "Token Bucket = burst 허용, Sliding Window = 정확/fair, Fixed Window = 단순하지만 edge burst. 분산 환경은 Redis INCR + TTL이 표준 구현.",
+  "summary": "Token Bucket = burst 허용, Sliding Window = 정확/fair, Fixed Window = 단순하지만 edge burst. 초당 API 호출 제한에서 순간적으로 몰리는 트래픽을 어디까지 봐줄지는 bucket capacity, window 폭, edge burst 허용 여부로 고른다. 분산 환경은 Redis INCR + TTL이 표준 구현.",
   "body_markdown": "# Rate Limiting 알고리즘 비교 — Token Bucket vs Sliding Window vs Fixed Window\n\n> 한 줄 요약: Token Bucket = burst 허용, Sliding Window = 정확/fair, Fixed Window = 단순하지만 edge burst. 분산 환경은 Redis INCR + TTL이 표준 구현.\n\n**난이도: 🟡 Intermediate**\n\n## 먼저 멘탈모델\n\n같은 \"1분당 60회 제한\"이라도 *어떻게 카운트*하느냐에 따라 trade-off가 다르다.\n\n```\n[Token Bucket]\n  버킷에 토큰이 일정 속도로 채워짐 (예: 1초당 1개)\n  요청 → 토큰 1개 소비 (없으면 거절)\n  버킷 size = burst limit (예: 60 토큰 저장 → 60 burst 가능)\n\n[Leaky Bucket]\n  요청을 큐에 넣고 일정 속도로 처리\n  큐가 차면 거절\n  output rate가 고정 → burst 없음 (smooth)\n\n[Fixed Window]\n  매분 0초 ~ 59초 카운터\n  60회 넘으면 거절\n  단순하지만 *경계에서 burst* (59초에 60 + 다음 분 0초에 60 = 120 in 1초)\n\n[Sliding Window Log]\n  각 요청 시각을 log에 기록\n  최근 N초간 요청 수 계산\n  정확하지만 *메모리 비쌈* (요청마다 entry)\n\n[Sliding Window Counter]\n  Fixed Window + 이전 윈도우 비례 가중\n  편하면서도 edge burst 완화\n```\n\n## 한 장 정리\n\n| 알고리즘 | Burst 허용 | 정확성 | 메모리 | 분산 구현 | 일반 사용 |\n|---|---|---|---|---|---|\n| Token Bucket | ✓ (burst limit까지) | 중 | O(1) per user | Redis INCR + refill | API rate limit default |\n| Leaky Bucket | ❌ (smooth) | 중 | O(1) per user | Redis sorted set or queue | 처리 속도 제어 (workflow) |\n| Fixed Window | (전체 window 안) | 낮음 (edge burst) | O(1) per user | Redis INCR + TTL | 단순 limit, dev/test |\n| Sliding Window Log | ✓ | 높음 | O(N) per user | Redis sorted set | 정확한 제한 필수 시 |\n| Sliding Window Counter | 부분 | 중-높음 | O(1) per user | Redis hash | 일반 운영 권장 |\n\n## Token Bucket — 가장 흔한 default\n\n```\nbucket capacity = 60   # max burst\nrefill rate = 1 token/sec\n\n요청 처리:\n  if bucket > 0:\n    bucket -= 1; 처리\n  else:\n    거절 (429 Too Many Requests)\n```\n\nSpring Cloud Gateway, Nginx limit_req, AWS API Gateway가 대부분 Token Bucket 또는 변형.\n\n**Why default?**\n- *Burst 허용* — 사용자가 *가끔 빠르게* 작업해도 OK (UX 친화적).\n- 단순한 *bucket size + refill rate* 두 파라미터.\n- O(1) 메모리.\n\n## Fixed Window 함정 — Edge Burst\n\n```\nlimit = 60 / minute (Fixed Window)\n\n00:59 초: 사용자 60 요청 → 모두 허용 (이 윈도우의 카운터)\n01:00 초: 사용자 60 요청 → 모두 허용 (새 윈도우)\n→ 1초간 120 요청 통과!\n```\n\n이게 *edge burst*. Fixed Window가 단순하지만 *2배 부담*을 일시 통과시킬 수 있다.\n\n방어: Sliding Window Counter — *이전 윈도우의 카운터를 비례 가중*해 더 정확.\n\n## 분산 환경 — Redis 구현\n\n```\n# Token Bucket (Lua script in Redis for atomicity)\nlocal key = KEYS[1]\nlocal capacity = tonumber(ARGV[1])\nlocal refill_rate = tonumber(ARGV[2])\nlocal now = tonumber(ARGV[3])\n\nlocal bucket = redis.call('HMGET', key, 'tokens', 'last_refill')\nlocal tokens = tonumber(bucket[1]) or capacity\nlocal last = tonumber(bucket[2]) or now\n\nlocal delta = (now - last) * refill_rate\ntokens = math.min(capacity, tokens + delta)\n\nif tokens >= 1 then\n    tokens = tokens - 1\n    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)\n    redis.call('EXPIRE', key, 60)\n    return 1\nelse\n    return 0\nend\n```\n\nSpring Boot 환경: bucket4j 라이브러리 (in-memory or Redis backend).\n\n## \"어떤 알고리즘 골라야 해?\" 결정\n\n```\n1. 일반 API rate limit?\n       → Token Bucket. 권장 default.\n\n2. workflow 또는 backend 처리 속도 smooth하게?\n       → Leaky Bucket.\n\n3. 정확한 N초당 M 요청 (예: 결제 fraud 방어)?\n       → Sliding Window Log.\n\n4. 단순함이 우선 (사내 API, dev/test)?\n       → Fixed Window. edge burst 인지.\n\n5. 운영 일반?\n       → Sliding Window Counter 또는 Token Bucket.\n```\n\n## Token Bucket vs Leaky Bucket — 자주 헷갈림\n\n```\n[Token Bucket]\n  burst 허용 (capacity까지 한 번에 사용)\n  refill로 회복\n  사용자 친화적\n\n[Leaky Bucket]\n  output rate 고정\n  burst 없음\n  큐 over flow 시 drop\n  smooth 트래픽 강제 (downstream 보호 중요 시)\n```\n\n이 둘은 *직관 반대*. Token = 토큰을 *소비*, Leaky = 요청을 *흘림*. 적용 의도가 다르다.\n\n## 학습자가 자주 만나는 시나리오\n\n- \"API 1분당 60회 제한\" → 90% Token Bucket. 60 capacity + 1 token/sec refill.\n- \"결제 분당 5회 정확히 (fraud)\" → Sliding Window Log.\n- \"대시보드 호출 너무 잦음\" → Token Bucket + burst 허용.\n- \"외부 API 보호 (downstream slow)\" → Leaky Bucket (smooth).\n- \"사내 dev API 단순 제한\" → Fixed Window OK.\n\n## 분산 환경 함정\n\n- **여러 인스턴스가 자체 카운터** → 각 인스턴스가 60회 ⇒ 전체 N×60. **반드시 공유 store** (Redis).\n- **Redis 장애 시 fail-open or fail-closed** — 정책 명시. fail-open이 보통(서비스 우선) but fraud 영역은 fail-closed.\n- **너무 fine-grained per-user** → Redis key 폭증. 합리적 grouping.\n\n## 자주 헷갈리는 지점\n\n- **\"Fixed Window가 단순하니까 안전\"** — edge burst로 2배 부담 가능.\n- **\"Token Bucket = burst 허용 = 위험\"** — capacity 설정이 burst limit. 합리적 capacity면 안전.\n- **\"Sliding Window Log가 정확하니 best\"** — 메모리 O(N per user). 대규모는 부담.\n- **\"분산 환경 = 항상 Redis\"** — 작은 시스템은 single instance OK. scale-out 시점에 도입.\n- **\"rate limit이 부담\"** — UX 친화적 fallback (429 + Retry-After 헤더) 같이 디자인.\n\n## 빠른 확인 질문\n\n- Token Bucket과 Leaky Bucket 핵심 차이?\n  - Token = burst 허용 (capacity까지), Leaky = output rate 고정 (smooth).\n- Fixed Window의 edge burst 문제?\n  - 윈도우 경계에서 *전후 limit 합*만큼 통과 가능.\n- 분산 환경에서 rate limit 일반 구현?\n  - Redis + Lua script (atomic) + TTL.\n\n## 한 줄 정리\n\nRate Limiting 알고리즘은 *burst 허용 ↔ 정확성 ↔ 메모리* trade-off. 일반 default Token Bucket, 정확성 우선 Sliding Window, 단순함 Fixed Window. 분산은 Redis 표준.\n\nretrieval-anchor-keywords: Rate limiting algorithm, Token Bucket, Leaky Bucket, Fixed Window, Sliding Window Log, Sliding Window Counter, edge burst, refill rate, bucket capacity, Spring Cloud Gateway rate limit, bucket4j Java, Redis INCR rate limit, 429 Too Many Requests, Retry-After header, distributed rate limit\n",
   "aliases": [
     "Rate Limiting 알고리즘",
@@ -12,10 +12,11 @@
     "Sliding Window Log",
     "Sliding Window Counter",
     "Fixed Window",
-    "처리량 제한",
     "트래픽 제한",
     "API 제한",
-    "throttling algorithm",
+    "초당 100회 API 제한",
+    "순간 몰림 허용 기준",
+    "burst 허용 계산 방식",
     "알고리즘 비교"
   ],
   "expected_queries": [
@@ -23,8 +24,8 @@
     "Token Bucket과 Sliding Window 어떤 거 골라?",
     "Fixed Window가 edge burst 문제가 뭐야?",
     "분산 환경에서 rate limit 어떻게 공유해?",
-    "Leaky Bucket과 Token Bucket 차이는?",
-    "API rate limit 어떻게 구현해?"
+    "초당 100회 API 제한에서 순간 몰림을 허용하려면 Token Bucket과 Sliding Window 중 뭘 골라?",
+    "API 호출 제한에서 burst를 어디까지 봐줄지 알고리즘별 기준이 뭐야?"
   ],
   "symptoms": [
     "Token Bucket과 Leaky Bucket 차이를 모름",
@@ -50,8 +51,14 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-05-24",
+    "last_modified": "2026-06-25",
     "legacy_path": "knowledge/cs/contents/system-design/rate-limiting-token-bucket-vs-sliding-window-vs-fixed-window-intermediate-primer.md",
-    "revision_history": []
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w80-system-design-platform-surfaces",
+        "note": "added natural Korean API burst algorithm entrypoints"
+      }
+    ]
   }
 }
