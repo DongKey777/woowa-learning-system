@@ -3,7 +3,7 @@
   "title": "트랜잭션 실전 시나리오",
   "category": "database",
   "level": "advanced",
-  "summary": "트랜잭션은 보통 ACID로 외우기 쉽다.",
+  "summary": "포인트 차감과 주문 생성처럼 둘 중 하나만 성공하면 데이터가 꼬이는 작업은 같은 성공/실패 운명을 가져야 하며, 이 문서는 그런 transaction boundary 실전 시나리오를 다룬다.",
   "body_markdown": "# 트랜잭션 실전 시나리오\n\n**난이도: 🔴 Advanced**\n\n> 트랜잭션을 정의로만 외우지 않고 실제 정합성 문제에 연결하기 위한 문서\n>\n> 문서 역할: 이 문서는 anomaly catalog라기보다, \"어떤 작업을 같은 트랜잭션 경계에 묶어야 하나\"를 빠르게 익히는 **survey 문서**다.\n\n<details>\n<summary>Table of Contents</summary>\n\n- [이 문서 다음에 볼 focused 문서](#이-문서-다음에-볼-focused-문서)\n- [왜 이 문서가 필요한가](#왜-이-문서가-필요한가)\n- [시나리오 1. 중복 결제](#시나리오-1-중복-결제)\n- [시나리오 2. 재고 차감](#시나리오-2-재고-차감)\n- [시나리오 3. 포인트 차감과 주문 생성](#시나리오-3-포인트-차감과-주문-생성)\n- [시나리오 4. 장기 게임 저장](#시나리오-4-장기-게임-저장)\n- [시니어 관점 질문](#시니어-관점-질문)\n\n</details>\n\nretrieval-anchor-keywords: transaction case study, transaction boundary, idempotency key with transaction, inventory deduction race, optimistic lock vs pessimistic lock, atomic update, duplicate payment prevention, order creation consistency, consistency unit, transaction scenario interview\n\n## 이 문서 다음에 볼 focused 문서\n\n- write skew, phantom read 같은 anomaly 자체를 보려면 [Write Skew와 Phantom Read 사례](./write-skew-phantom-read-case-studies.md)를 본다.\n- 락 경합과 데드락 triage는 [Deadlock Case Study](./deadlock-case-study.md), [Lock Wait, Deadlock, and Latch Contention Triage Playbook](./lock-wait-deadlock-latch-triage-playbook.md)로 내려간다.\n- 멱등성과 중복 요청 경계는 [멱등성 키와 중복 방지](./idempotency-key-and-deduplication.md)에서 더 명확히 본다.\n- 부분 롤백과 저장 지점은 [Savepoint와 Partial Rollback](./savepoint-partial-rollback.md)으로 이어진다.\n\n## 왜 이 문서가 필요한가\n\n트랜잭션은 보통 ACID로 외우기 쉽다.\n하지만 실무에서는 “이걸 왜 트랜잭션으로 묶어야 하지?”가 더 중요하다.\n\n이 문서는 실제 서비스에서 자주 나오는 정합성 시나리오를 통해,\n\n- 어떤 작업을 한 트랜잭션으로 묶어야 하는지\n- 어디서 실패하면 안 되는지\n- 어떤 대안을 고려해야 하는지\n\n를 익히기 위해 만든다.\n\n---\n\n## 시나리오 1. 중복 결제\n\n### 문제\n\n클라이언트가 결제 요청을 보냈는데 응답이 늦어져 같은 요청을 다시 보낼 수 있다.\n\n이때 서버가 요청을 단순히 두 번 처리하면\n\n- 주문 1건에 대해 결제가 2번 일어나거나\n- 외부 PG 호출이 2번 일어나거나\n- 내부 결제 기록이 중복 저장될 수 있다\n\n### 핵심 포인트\n\n- 트랜잭션만으로는 완전히 해결되지 않는다\n- **idempotency key** 또는 **중복 요청 식별자**가 필요할 수 있다\n\n즉 이 문제는\n\n- DB 트랜잭션\n- API 멱등성\n\n둘을 같이 봐야 한다.\n\n---\n\n## 시나리오 2. 재고 차감\n\n### 문제\n\n재고가 1개 남아 있는데, 두 요청이 동시에 “재고 확인 -> 차감”을 하면\n둘 다 성공해버릴 수 있다.\n\n### 잘못된 흐름\n\n1. 재고 조회\n2. 애플리케이션에서 `if (stock > 0)` 확인\n3. update\n\n이 사이에 다른 요청이 끼어들면 정합성이 깨질 수 있다.\n\n### 해결 방향\n\n- 트랜잭션 + 락\n- 원자적 update\n- 버전 기반 낙관적 락\n\n즉 “읽고 판단하고 다시 쓰는” 흐름이 안전한지 항상 의심해야 한다.\n\n---\n\n## 시나리오 3. 포인트 차감과 주문 생성\n\n### 문제\n\n한 요청 안에서\n\n- 포인트 차감\n- 주문 생성\n\n두 작업이 같이 일어난다고 하자.\n\n만약 포인트는 차감됐는데 주문 생성이 실패하면 데이터가 꼬인다.\n\n### 핵심\n\n이건 전형적인 **한 트랜잭션으로 묶여야 하는 작업**이다.\n\n즉 다음 둘은 같이 성공하거나 같이 실패해야 한다.\n\n- `UPDATE points ...`\n- `INSERT orders ...`\n\n---\n\n## 시나리오 4. 장기 게임 저장\n\n장기 게임에서 한 수를 둘 때 DB에 반영해야 하는 변화는 보통 이렇다.\n\n- 현재 턴 변경\n- 게임 상태 변경\n- 이동한 말 위치 변경\n- 잡힌 말 삭제\n\n이 네 작업 중 하나라도 빠지면 게임 상태가 깨진다.\n\n예:\n\n- `pieces`는 이동했는데\n- `games.turn`은 안 바뀜\n\n이런 상태는 곧바로 복원 문제로 이어진다.\n\n즉 **매 수 저장은 하나의 트랜잭션으로 묶여야 한다.**\n\n---\n\n## 재현/트리아지/검증 playbook\n\n재현(repro)은 각 시나리오에서 \"동시에 두 번\"과 \"중간 실패\"를 반드시 넣는다.\n\n| 시나리오 | 재현 입력 | 기대 실패 |\n|---|---|---|\n| 중복 결제 | 같은 idempotency key로 두 요청 | 두 번째는 이미 처리된 결과를 돌려줘야 한다 |\n| 재고 차감 | 재고 1개에 주문 2개 동시 실행 | 한쪽만 commit되거나 constraint가 막아야 한다 |\n| 포인트 차감 + 주문 생성 | 포인트 차감 후 주문 생성 직전 예외 | 둘 다 rollback되거나 보상 기록이 남아야 한다 |\n| 장기 게임 저장 | 같은 game version으로 두 저장 | stale version이 거절돼야 한다 |\n\n트리아지(triage)는 먼저 invariant를 한 문장으로 쓴다.\n\n1. \"결제는 request key당 한 번만 capture된다.\"\n2. \"재고는 0 아래로 내려가지 않는다.\"\n3. \"포인트 차감과 주문 생성은 같은 성공/실패 운명이다.\"\n4. \"게임 저장은 이전 version 위에만 적용된다.\"\n\n실패 매트릭스(failure matrix)는 해법보다 보장을 먼저 보게 만든다.\n\n| 증상 | 필요한 DB 보장 | 흔한 잘못된 선택 |\n|---|---|---|\n| 중복 결제 | unique idempotency key + 상태 재조회 | 결제 API만 retry하면 된다고 봄 |\n| 음수 재고 | conditional update 또는 row lock/constraint | read 후 애플리케이션 if만 믿음 |\n| 반쪽 주문 | 같은 DB transaction 또는 saga 보상 | 외부 호출까지 DB rollback된다고 믿음 |\n| 마지막 저장 덮어쓰기 | optimistic version check | 긴 transaction으로 사용자 입력을 기다림 |\n\n검증(validation)은 \"테스트가 한 번 통과\"가 아니라 concurrency harness로 닫는다. 최소한 두 thread, crash point, duplicate request를 넣고 최종 row count/상태/version을 assert한다. DB transaction이 보장하는 것은 같은 DB 안의 원자성과 격리이지, 결제사 호출이나 메시지 ack까지 자동으로 되돌리는 것이 아니다.\n\n---\n\n## 시니어 관점 질문\n\n- 이 작업이 정말 한 트랜잭션이어야 하는가, 아니면 결국 분리 가능한가?\n- 트랜잭션 범위를 넓히면 어떤 성능 비용이 생기는가?\n- 멱등성과 트랜잭션 중 무엇이 더 핵심인 문제인가?\n- DB 트랜잭션만으로 해결 안 되는 문제는 무엇인가?\n",
   "aliases": [
     "정합성 시나리오",
@@ -13,7 +13,11 @@
     "idempotency key",
     "inventory race",
     "duplicate payment",
-    "concurrent payment inventory consistency"
+    "concurrent payment inventory consistency",
+    "포인트 차감 주문 생성 실패",
+    "일부 작업만 성공해서 데이터 꼬임",
+    "partial failure atomicity",
+    "한 요청 안에서 같이 성공하거나 rollback"
   ],
   "expected_queries": [
     "중복 결제는 트랜잭션만으로 막을 수 있어?",
@@ -21,12 +25,16 @@
     "동시 결제, 동시 재고 차감 같은 시나리오에서 데이터 깨지는 걸 어떻게 막아?",
     "idempotency key랑 transaction은 어떻게 같이 봐?",
     "주문 생성 정합성은 어디까지 같은 트랜잭션이야?",
-    "재고가 1개 남았는데 두 요청이 동시에 성공해서 -1이 됐어요"
+    "재고가 1개 남았는데 두 요청이 동시에 성공해서 -1이 됐어요",
+    "포인트는 차감됐는데 주문 생성이 실패했다면 어떤 transaction boundary가 빠진 거야?",
+    "한 서비스 요청에서 일부 DB 변경만 commit되어 데이터가 꼬일 때 무엇을 같은 트랜잭션으로 묶어야 해?"
   ],
   "symptoms": [
     "중복 결제 요청이 두 번 처리됐어요",
     "재고가 1개 남는데 두 요청이 동시에 성공해버렸어요",
-    "포인트는 차감됐는데 주문 생성이 실패해서 데이터가 꼬였어요"
+    "포인트 변경만 반영되고 주문 저장이 빠져 상태가 어긋났어요",
+    "한 요청 안의 여러 저장 작업 중 앞부분만 성공하고 뒤 작업이 실패했어요",
+    "같이 성공하거나 같이 실패해야 하는 DB 변경을 따로 commit하고 있어요"
   ],
   "relations": {
     "prerequisites": [
@@ -55,6 +63,11 @@
         "date": "2026-06-19",
         "source": "cycle2-generated-filler-repair",
         "note": "removed 4 generated filler aliases"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w76-database-symptom-surfaces",
+        "note": "added natural partial-failure transaction surfaces"
       }
     ]
   }
