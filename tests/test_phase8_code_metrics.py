@@ -187,6 +187,8 @@ def test_entry_point_count() -> None:
                    "learner-log-rag-eval",
                    # Corpus exact-shortcut ownership gate (monotonic-quality lint)
                    "corpus-lint",
+                   # Cycle4 pipeline gates: confusable_with integrity + A-F gate wrapper
+                   "corpus-relations-lint", "corpus-gate",
                    # Phase X new wrappers (maintenance + sub-commands)
                    "sync-index-metadata", "drill-grade-prepare", "learn-feedback",
                    "learn-self-assess", "learn-drill", "learner-profile",

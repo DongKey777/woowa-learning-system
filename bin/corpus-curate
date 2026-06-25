@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,11 +42,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply:
         text = args.apply.read_text(encoding="utf-8")
         proposals = parse_proposals(text)
-        result = apply(proposals, corpus_dir=args.corpus_dir, dry_run=args.dry_run)
+        # Inject the apply timestamp so the rollback log (state/curation/applied-<ts>.jsonl)
+        # has a deterministic name per invocation (apply() never reads the clock itself).
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        result = apply(proposals, corpus_dir=args.corpus_dir, dry_run=args.dry_run, timestamp=ts)
         print(f"Applied: {len(result.applied)}")
         print(f"Skipped: {len(result.skipped)}")
         for ch, reason in result.skipped[:10]:
             print(f"  skip {ch.target_concept_id} ({ch.operation}): {reason}")
+        # Surface any ownership steal the batch introduced (Gate E) — silence here was
+        # how a steal slipped through the automation path. A non-empty set FAILS (exit 1).
+        if result.ownership_new_steals:
+            print(f"\n✗ ownership regression — {len(result.ownership_new_steals)} new exact-shortcut "
+                  f"steal(s) introduced (a change now shadows an existing canonical owner):")
+            for norm, info in sorted(result.ownership_new_steals.items()):
+                if "winner" in info:  # new_steals shape
+                    print(f"    '{norm}' → winner={info['winner']} shadows {info.get('shadowed')}")
+                else:  # flipped shape
+                    print(f"    '{norm}': {info.get('baseline_winner')} → {info.get('now_winner')}")
+            print("  Fix: demote the stolen phrase to an alias on the non-canonical concept, "
+                  "or run `bin/corpus-lint --rebaseline` if the ownership change is intentional.")
+            return 1
         return 0 if not result.skipped else 1
 
     signals = mine(args.history)

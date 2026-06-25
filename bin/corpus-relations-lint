@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""bin/corpus-relations-lint — confusable_with relation integrity gate (index-free).
+
+Scans relations.confusable_with (curation/relations.scan_relations) for three
+structural defects that silently degrade sibling disambiguation:
+
+  - dangling: a confusable_with target id that no concept in the corpus owns
+    (typo / rename / deleted concept) — always a defect.
+  - self: a concept lists its OWN id — meaningless, always a defect.
+  - asymmetric: A lists B but B does not list A back (the sibling edge is only
+    half-wired, so the missing side never surfaces its sibling on a rerank).
+
+EXIT POLICY (asymmetric is advisory by default — the live corpus carries a large
+pre-existing one-way set accumulated over growth, so corpus-wide symmetry is a
+maintainer reconciliation decision, not a per-batch block):
+  - dangling + self  → HARD FAIL (exit 1) — unambiguous defects.
+  - asymmetric       → REPORTED (advisory, exit 0) by default.
+       --base <ref>       hard-fail on defects/asymmetric involving concepts CHANGED
+                          vs <ref> — the per-batch gate (your batch must not leave a
+                          one-way edge it owns; use add_confusable reciprocal).
+       --strict-symmetry  hard-fail on asymmetric corpus-wide (after reconciliation).
+
+Index-free (load_corpus ~1s, no dense index / no daemon / no BGE-M3) — cheap enough
+for a pre-commit / pre-build gate, mirrors bin/corpus-lint.
+
+Usage:
+  bin/corpus-relations-lint                      # hard: dangling/self; report: asymmetric
+  bin/corpus-relations-lint --base origin/main   # per-batch: + changed concepts symmetric
+  bin/corpus-relations-lint --strict-symmetry    # hard-fail asymmetric corpus-wide
+  bin/corpus-relations-lint --json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from curation.relations import _confusable_targets, scan_relations, summary_counts  # noqa: E402
+from rag.corpus_loader import load_corpus  # noqa: E402
+
+
+def _changed_concept_ids(base: str) -> set[str]:
+    """concept ids whose JSON changed vs <base> (git-diff scoped per-batch gate)."""
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", base, "--", "corpus/concepts"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set()
+    ids: set[str] = set()
+    for line in out.split():
+        if line.startswith("corpus/concepts/") and line.endswith(".json"):
+            ids.add(line[len("corpus/concepts/"):-len(".json")])
+    return ids
+
+
+def _base_confusable(base: str, cid: str) -> set[str]:
+    """confusable_with target set of <cid> at git ref <base> (empty if new/absent)."""
+    try:
+        raw = subprocess.run(
+            ["git", "show", f"{base}:corpus/concepts/{cid}.json"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, check=True).stdout
+        return set(_confusable_targets(json.loads(raw)))
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _new_edge_defects(base: str, changed: set[str], corpus) -> tuple[list, list, list]:
+    """Defects on confusable_with edges this batch ADDED vs <base> (precise per-batch
+    gate — pre-existing asymmetry on a concept touched for other reasons is NOT the
+    batch's responsibility, same rule as Gate F dead-paths)."""
+    ids = set(corpus.concepts)
+    new_self: list[str] = []
+    new_dangling: list[list[str]] = []
+    new_asym: list[list[str]] = []
+    for cid in sorted(changed):
+        concept = corpus.concepts.get(cid)
+        if concept is None:
+            continue
+        added = set(_confusable_targets(concept)) - _base_confusable(base, cid)
+        for t in sorted(added):
+            if t == cid:
+                new_self.append(cid)
+            elif t not in ids:
+                new_dangling.append([cid, t])
+            elif cid not in set(_confusable_targets(corpus.concepts[t])):
+                new_asym.append([cid, t])
+    return new_dangling, new_self, new_asym
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--strict-symmetry", action="store_true",
+                        help="hard-fail on asymmetric edges corpus-wide")
+    parser.add_argument("--base", default=None,
+                        help="hard-fail on defects/asymmetric involving concepts changed vs this git ref")
+    args = parser.parse_args(argv)
+
+    corpus = load_corpus()
+    scan = scan_relations(corpus)
+    counts = summary_counts(scan)
+
+    changed = _changed_concept_ids(args.base) if args.base else None
+    if changed is not None:
+        # precise: only edges this batch ADDED vs base (not pre-existing asymmetry on
+        # a concept touched for other reasons).
+        hard_dangling, hard_self, hard_asym = _new_edge_defects(args.base, changed, corpus)
+    else:
+        hard_dangling = scan["dangling"]
+        hard_self = scan["self"]
+        hard_asym = scan["asymmetric"] if args.strict_symmetry else []
+
+    failed = bool(hard_dangling or hard_self or hard_asym)
+    scope = (f"changed vs {args.base}" if changed is not None
+             else ("strict-symmetry" if args.strict_symmetry else "default"))
+
+    if args.json:
+        print(json.dumps({
+            "concept_count": len(corpus.concepts),
+            "counts": counts,
+            "asymmetric": scan["asymmetric"],
+            "dangling": scan["dangling"],
+            "self": scan["self"],
+            "scope": scope,
+            "hard_failures": {"dangling": hard_dangling, "self": hard_self, "asymmetric": hard_asym},
+            "pass": not failed,
+        }, ensure_ascii=False, indent=2))
+        return 1 if failed else 0
+
+    if scan["asymmetric"] and changed is None and not args.strict_symmetry:
+        print(f"• asymmetric confusable_with: {len(scan['asymmetric'])} one-way edges "
+              f"(advisory — corpus-wide reconciliation is a maintainer decision; use "
+              f"--base <ref> for the per-batch gate or --strict-symmetry to enforce).")
+
+    if not failed:
+        extra = (", 0 asymmetric in changed" if changed is not None
+                 else (", 0 asymmetric" if args.strict_symmetry else ""))
+        print(f"✓ corpus-relations-lint OK ({scope}) — {len(corpus.concepts)} concepts: "
+              f"0 dangling, 0 self{extra}.")
+        return 0
+
+    print(f"✗ corpus-relations-lint FAILED ({scope}) — confusable_with integrity.\n")
+    if hard_self:
+        print(f"  SELF references ({len(hard_self)}) — concept lists its own id:")
+        for cid in hard_self:
+            print(f"    {cid}")
+    if hard_dangling:
+        print(f"  DANGLING targets ({len(hard_dangling)}) — target id not in corpus:")
+        for cid, target in hard_dangling:
+            print(f"    {cid} → {target} (missing)")
+    if hard_asym:
+        print(f"  ASYMMETRIC ({len(hard_asym)}) — A lists B but not vice versa:")
+        for a, b in hard_asym:
+            print(f"    {a} → {b}  (add {a} to {b}'s confusable_with, or drop the edge)")
+    print("\n  Fix: add the missing back-reference (or drop the one-way edge), remove "
+          "self-references, repair dangling target ids. add_confusable(reciprocal=True) "
+          "prevents new one-way edges.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

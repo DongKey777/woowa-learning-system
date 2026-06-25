@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""bin/corpus-gate — one-shot corpus-expansion gate runner (orphan|filler|path|contract|all).
+
+Ports the per-batch corpus-expansion gates from the cycle instruction docs into a single
+index-free wrapper so an external authoring AI runs ONE line per batch instead of copy-
+pasting the heredoc python from CORPUS-EXPANSION-INSTRUCTIONS each time. Every subcommand
+runs over the field-only corpus (rag.corpus_loader.load_corpus, ~1s, no dense index / no
+BGE-M3), so it is cheap enough for a pre-commit / pre-build gate.
+
+Subcommands (mirror the documented gates):
+  orphan    Gate B / v4 §6.1 — protected exact-surface orphan. A protected entrypoint
+            surface (Spring/DI, OS/Memory, DB/Lock, Algorithm/DS, Web/Security) that the
+            batch DELETED and that NO concept now owns at title/aliases/EQ → FAIL. If a
+            different, more-precise concept reowns the same exact surface → REOWNED
+            (report-only). Scope = git diff origin/main..HEAD on corpus/concepts only.
+  filler    Gate C / v4 §6.2 — anti-filler. same-stem suffix 2+ (개념/정리/실수/판단 기준/
+            guide/checklist on one stem) → HARD FAIL; malformed dangling vs/↔/· + suffix
+            → HARD FAIL; raw-suffix singles → report (keep only genuine natural language).
+            Scope = whole corpus (a structural template tell, batch-agnostic).
+  path      Gate F / v6 §4 — fixture path realness. Every primary/acceptable/forbidden
+            path in the batch's y14_expansion_* fixtures must derive from a real concept
+            id (<category>/<slug> flat). Scope = git-diff (this batch's changed/new
+            fixtures only — pre-existing accumulated dead-paths are the maintainer's).
+  contract  Gate A / v4 §4 — contract hygiene, CONSERVATIVE. Schema-validates the corpus
+            (load_corpus strict=True) and REPORTS the alias/EQ/title/relation distribution
+            (alias 6-12, EQ 4-6, title-exact-alias, global EQ exact-dup, relation self/
+            missing). The live corpus already carries pre-existing distribution items
+            (e.g. title-exact-alias), so contract NEVER hard-fails on a count — it prints
+            the report and exits 0. NEW-violation judgement is the authoring AI's.
+
+  all       orphan+filler+path = HARD (exit 1 on any fail); contract = report-only.
+            Aggregate exit code = 1 iff any hard gate failed.
+
+Usage:
+  bin/corpus-gate all                 # run every gate (hard: orphan/filler/path)
+  bin/corpus-gate orphan              # single gate
+  bin/corpus-gate contract --json     # machine-readable contract distribution
+  bin/corpus-gate path --base origin/main
+  bin/corpus-gate all --json
+
+Notes:
+  - git-scoped gates (orphan, path) diff against --base (default origin/main). If the base
+    ref is missing, they print a warning and SKIP (graceful — never a hard fail on a
+    detached/offline worktree).
+  - The live 3654-concept corpus is maintained to pass orphan/filler/path, so on a clean
+    worktree (no batch changes) every hard gate is a no-op PASS.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from rag.corpus_loader import load_corpus  # noqa: E402
+from rag.search import _norm_exact  # noqa: E402
+
+CONCEPTS_DIR = REPO_ROOT / "corpus" / "concepts"
+
+# ── Protected entrypoint surfaces (v4 §5 / §6.1). Deleting one of these without a concept
+#    reowning the exact surface is a semantic-preservation regression → orphan FAIL. ───────
+PROTECTED = {
+    "DI", "DI가 말야?", "처음 배우는데 DI가 말야?", "의존성 주입이 말야?", "MMU", "TLB", "swap", "스왝",
+    "page fault", "page fault가 뭐예요?", "페이지 폴트가 말야?", "MMU가 말야?", "TLB가 말야?", "swap이 말야?",
+    "락", "잠금", "락이 말야?", "잠금이 말야?", "낙관적 락이 말야?", "비관적 락이 말야?", "낙관적 락과 비관적 락 차이가 말야?",
+    "분산 락", "분산 락이 말야?", "distributed lock", "distributed lock이 말야?", "로드밸런서가 말야?",
+    "BFS", "DFS", "DP", "이분 탐색", "이진 탐색 기초", "binary search 처음 배우는데", "백트래킹", "백트래킹 입문",
+    "그리디", "슬라이딩 윈도우", "유니온 파인드", "백엔드 알고리즘 입문", "처음 알고리즘 공부", "양방향 bfs",
+    "HTTP 버전이 말야?", "Content-Type이랑 Accept 차이가 말야?", "CORS가 말야?", "XSS랑 CSRF가 말야?", "JWT가 말야?", "OAuth가 말야?",
+}
+
+# Anti-orphan uses a casefold/whitespace norm matching v4 §6.1 (NOT _norm_exact, which also
+# strips trailing punctuation — protected surfaces include the literal "?" so we preserve it).
+_orphan_norm_re = re.compile(r"\s+")
+
+
+def _orphan_norm(v) -> str:
+    return _orphan_norm_re.sub(" ", str(v).strip()).casefold()
+
+
+# Anti-filler regexes (v4 §6.2, verbatim).
+_FILLER_SUFFIX = re.compile(r"\s+(개념|정리|실수|판단 기준|guide|checklist)$", re.I)
+_FILLER_MALFORMED = re.compile(r"(\bvs\b|↔|·)\s*(개념|정리|guide|checklist)$|vs\s+(개념|guide)$", re.I)
+
+# Relation fields whose VALUES are concept ids (forbidden_for_queries holds query strings,
+# not ids, so it is excluded from the relation missing/self contract check).
+_ID_RELATION_FIELDS = ("prerequisites", "next_docs", "confusable_with")
+
+
+# ─────────────────────────────────────────────────────────────────
+# git helpers (graceful when the base ref is absent)
+# ─────────────────────────────────────────────────────────────────
+def _base_exists(base: str) -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", base],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    ).returncode == 0
+
+
+def _git_lines(args: list[str]) -> list[str]:
+    out = subprocess.run(
+        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    return out.stdout.split()
+
+
+def _show_at(base: str, path: str) -> dict | None:
+    """git show base:path → parsed JSON, or None if the path didn't exist at base."""
+    out = subprocess.run(
+        ["git", "show", f"{base}:{path}"], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────
+# Gate B — Anti-Orphan (v4 §6.1)
+# ─────────────────────────────────────────────────────────────────
+def gate_orphan(base: str) -> dict:
+    """Protected exact-surface orphan check, scoped to corpus/concepts changed vs base.
+
+    Returns {status, skipped, orphan: [...], reowned: [...]}. status ∈
+    {"pass","fail","skip"}. A protected surface deleted by the batch with NO concept
+    owning it anywhere → orphan (fail). Deleted but reowned by another concept → report.
+    """
+    if not _base_exists(base):
+        return {"status": "skip", "skipped": True, "reason": f"base ref '{base}' missing",
+                "orphan": [], "reowned": []}
+
+    pn = {_orphan_norm(v): v for v in PROTECTED}
+
+    # Current global ownership of every normalized surface across title/aliases/EQ.
+    owners: dict[str, list] = {}
+    for p in CONCEPTS_DIR.rglob("*.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        for f in ("title", "aliases", "expected_queries"):
+            vals = [d.get("title")] if f == "title" else (d.get(f) or [])
+            for v in vals:
+                if v:
+                    owners.setdefault(_orphan_norm(v), []).append((d.get("id"), f))
+
+    changed = _git_lines(["diff", "--name-only", f"{base}..HEAD", "--", "corpus/concepts"])
+    orphan: list = []
+    reowned: list = []
+    for path in changed:
+        p = REPO_ROOT / path
+        if not p.exists():
+            continue  # deleted file — whole-concept removal handled by ownership above
+        old = _show_at(base, path)
+        if old is None:
+            continue  # newly added file — nothing removed
+        try:
+            cur = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        for f in ("title", "aliases", "expected_queries"):
+            ov = [old.get(f)] if f == "title" else (old.get(f) or [])
+            cv = [cur.get(f)] if f == "title" else (cur.get(f) or [])
+            for v in sorted(set(map(str, ov)) - set(map(str, cv))):
+                k = _orphan_norm(v)
+                if k not in pn:
+                    continue
+                (reowned if owners.get(k) else orphan).append([path, f, v])
+
+    return {
+        "status": "fail" if orphan else "pass",
+        "skipped": False,
+        "orphan": orphan,
+        "reowned": reowned,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Gate C — Anti-Filler (v4 §6.2)
+# ─────────────────────────────────────────────────────────────────
+def _filler_stem(a) -> str:
+    return _FILLER_SUFFIX.sub("", str(a)).strip().casefold()
+
+
+def gate_filler() -> dict:
+    """Whole-corpus anti-filler. same-stem suffix 2+ and malformed dangling are HARD;
+    raw-suffix singles are reported. Returns {status, same_stem, malformed, raw_single,
+    same_stem_examples, malformed_examples}."""
+    same_stem = raw_single = malformed = 0
+    same_stem_ex: list = []
+    malformed_ex: list = []
+    for p in CONCEPTS_DIR.rglob("*.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        al = d.get("aliases") or []
+        bystem: dict[str, list] = {}
+        for a in al:
+            if _FILLER_SUFFIX.search(str(a)):
+                bystem.setdefault(_filler_stem(a), []).append(a)
+        for stem, group in bystem.items():
+            if len(group) >= 2:
+                same_stem += len(group)
+                same_stem_ex.append([d.get("id"), group])
+        raw_single += sum(1 for a in al if _FILLER_SUFFIX.search(str(a)))
+        for a in al:
+            if _FILLER_MALFORMED.search(str(a)):
+                malformed += 1
+                malformed_ex.append([d.get("id"), a])
+
+    return {
+        "status": "fail" if (same_stem or malformed) else "pass",
+        "same_stem": same_stem,
+        "malformed": malformed,
+        "raw_single": raw_single,
+        "same_stem_examples": same_stem_ex[:50],
+        "malformed_examples": malformed_ex[:50],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Gate F — Fixture path realness (v6 §4)
+# ─────────────────────────────────────────────────────────────────
+def _cid_of(path: str) -> str:
+    """contents/<cat>/<slug>.md → <cat>/<slug>; <cat>/<slug>.md → <cat>/<slug>."""
+    s = str(path)
+    if s.startswith("contents/"):
+        s = s[len("contents/"):]
+    if s.endswith(".md"):
+        s = s[:-3]
+    return s
+
+
+def gate_path(base: str, corpus) -> dict:
+    """Fixture path realness, scoped to THIS batch's changed/new y14_expansion_* fixtures.
+
+    Returns {status, skipped, changed_fixtures, dead_paths}. Every primary/acceptable/
+    forbidden path in a changed fixture must map to a real concept id."""
+    if not _base_exists(base):
+        return {"status": "skip", "skipped": True, "reason": f"base ref '{base}' missing",
+                "changed_fixtures": 0, "dead_paths": []}
+
+    ids = set(corpus.concepts)
+    tracked = _git_lines(["diff", "--name-only", base, "--", "tests/fixtures/"])
+    untracked = _git_lines(["ls-files", "--others", "--exclude-standard", "--", "tests/fixtures/"])
+    changed = [
+        f for f in set(tracked + untracked)
+        if "y14_expansion_" in f and f.endswith(".json") and (REPO_ROOT / f).exists()
+    ]
+
+    bad: list = []
+    for fx in changed:
+        try:
+            d = json.loads((REPO_ROOT / fx).read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        queries = d if isinstance(d, list) else d.get("queries", [])
+        for q in queries:
+            if not isinstance(q, dict):
+                continue
+            for field in ("primary_paths", "acceptable_paths", "forbidden_paths"):
+                for pth in (q.get(field) or []):
+                    if _cid_of(pth) not in ids:
+                        bad.append([fx, field, pth])
+
+    return {
+        "status": "fail" if bad else "pass",
+        "skipped": False,
+        "changed_fixtures": len(changed),
+        "dead_paths": bad,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Gate A — Contract hygiene (CONSERVATIVE report — v4 §4)
+# ─────────────────────────────────────────────────────────────────
+def gate_contract(corpus) -> dict:
+    """Schema-validate (already done by load_corpus strict=True) and REPORT the contract
+    distribution. NEVER hard-fails on a count — the live corpus already carries pre-existing
+    distribution items (title-exact-alias etc.). NEW-violation judgement is the author's.
+
+    Reports per v4 Gate A: alias 6-12, EQ 4-6, title-exact-alias, global EQ exact-dup,
+    relation self/missing-target (over id-bearing relation fields only)."""
+    ids = set(corpus.concepts)
+    alias_lt6 = alias_gt12 = eq_lt4 = eq_gt6 = title_exact_alias = 0
+    rel_self = rel_missing = 0
+    eq_norm: dict[str, set] = {}
+    alias_examples: list = []
+
+    for cid, d in corpus.concepts.items():
+        al = d.get("aliases") or []
+        eq = d.get("expected_queries") or []
+        if len(al) < 6:
+            alias_lt6 += 1
+            if len(alias_examples) < 20:
+                alias_examples.append([cid, "alias<6", len(al)])
+        if len(al) > 12:
+            alias_gt12 += 1
+            if len(alias_examples) < 20:
+                alias_examples.append([cid, "alias>12", len(al)])
+        if len(eq) < 4:
+            eq_lt4 += 1
+        if len(eq) > 6:
+            eq_gt6 += 1
+        tn = _norm_exact(d.get("title") or "")
+        if tn and any(_norm_exact(a) == tn for a in al):
+            title_exact_alias += 1
+        for q in eq:
+            n = _norm_exact(q)
+            if n:
+                eq_norm.setdefault(n, set()).add(cid)
+        rels = d.get("relations") or {}
+        for field in _ID_RELATION_FIELDS:
+            for v in (rels.get(field) or []):
+                if v == cid:
+                    rel_self += 1
+                elif v not in ids:
+                    rel_missing += 1
+
+    global_eq_dup = sum(1 for cs in eq_norm.values() if len(cs) > 1)
+
+    return {
+        "status": "report",  # never hard-fails
+        "concepts": len(corpus.concepts),
+        "schema_failures": len(corpus.failures),
+        "alias_below_6": alias_lt6,
+        "alias_above_12": alias_gt12,
+        "eq_below_4": eq_lt4,
+        "eq_above_6": eq_gt6,
+        "title_exact_alias": title_exact_alias,
+        "global_eq_exact_dup_norms": global_eq_dup,
+        "relation_self": rel_self,
+        "relation_missing_target": rel_missing,
+        "alias_outlier_examples": alias_examples,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Text rendering
+# ─────────────────────────────────────────────────────────────────
+def _print_orphan(r: dict) -> None:
+    if r.get("skipped"):
+        print(f"⚠ orphan SKIP — {r['reason']} (cannot diff; graceful skip).")
+        return
+    if r["status"] == "pass":
+        print(f"✓ orphan OK — 0 protected exact-surface orphans "
+              f"(reowned report-only: {len(r['reowned'])}).")
+    else:
+        print(f"✗ orphan FAIL — {len(r['orphan'])} protected surface(s) deleted with no owner:")
+        for path, f, v in r["orphan"][:50]:
+            print(f"    ORPHAN [{f}] '{v}'  ({path})")
+    if r["reowned"]:
+        print(f"  REOWNED (report-only, {len(r['reowned'])}):")
+        for path, f, v in r["reowned"][:20]:
+            print(f"    REOWNED [{f}] '{v}'  ({path})")
+
+
+def _print_filler(r: dict) -> None:
+    if r["status"] == "pass":
+        print(f"✓ filler OK — same-stem 2+ = 0, malformed = 0 "
+              f"(raw-suffix singles report-only: {r['raw_single']}).")
+    else:
+        print(f"✗ filler FAIL — same-stem 2+ = {r['same_stem']}, malformed = {r['malformed']} "
+              f"(raw-suffix singles: {r['raw_single']}).")
+        for cid, group in r["same_stem_examples"][:20]:
+            print(f"    SAME-STEM {cid}: {group}")
+        for cid, a in r["malformed_examples"][:20]:
+            print(f"    MALFORMED {cid}: '{a}'")
+
+
+def _print_path(r: dict) -> None:
+    if r.get("skipped"):
+        print(f"⚠ path SKIP — {r['reason']} (cannot diff; graceful skip).")
+        return
+    if r["status"] == "pass":
+        print(f"✓ path OK — {r['changed_fixtures']} changed fixture(s), 0 dead paths.")
+    else:
+        print(f"✗ path FAIL — {len(r['dead_paths'])} dead path(s) in "
+              f"{r['changed_fixtures']} changed fixture(s):")
+        for fx, field, pth in r["dead_paths"][:50]:
+            print(f"    DEAD [{field}] '{pth}'  ({fx})")
+
+
+def _print_contract(r: dict) -> None:
+    print(f"• contract REPORT — {r['concepts']} concepts, "
+          f"{r['schema_failures']} schema failures (load_corpus strict).")
+    print(f"    alias<6: {r['alias_below_6']}   alias>12: {r['alias_above_12']}")
+    print(f"    EQ<4: {r['eq_below_4']}   EQ>6: {r['eq_above_6']}")
+    print(f"    title-exact-alias: {r['title_exact_alias']}")
+    print(f"    global EQ exact-dup norms: {r['global_eq_exact_dup_norms']}")
+    print(f"    relation self: {r['relation_self']}   relation missing-target: {r['relation_missing_target']}")
+    print("    (report-only — NEW-violation judgement is the authoring AI's; no hard fail.)")
+
+
+# ─────────────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────────────
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("gate", choices=["orphan", "filler", "path", "contract", "all"],
+                        help="which gate to run")
+    parser.add_argument("--base", default="origin/main",
+                        help="git base ref for diff-scoped gates (default: origin/main)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    # filler + contract need the loaded corpus; path needs ids; orphan reads files directly.
+    corpus = None
+    if args.gate in ("filler", "contract", "path", "all"):
+        corpus = load_corpus()  # strict=True → schema validation (raises on schema break)
+
+    results: dict[str, dict] = {}
+    if args.gate in ("orphan", "all"):
+        results["orphan"] = gate_orphan(args.base)
+    if args.gate in ("filler", "all"):
+        results["filler"] = gate_filler()
+    if args.gate in ("path", "all"):
+        results["path"] = gate_path(args.base, corpus)
+    if args.gate in ("contract", "all"):
+        results["contract"] = gate_contract(corpus)
+
+    # Hard gates: orphan, filler, path (a "fail" status fails the run; "skip"/"pass" don't).
+    hard_failed = any(
+        results.get(g, {}).get("status") == "fail" for g in ("orphan", "filler", "path")
+    )
+
+    if args.json:
+        print(json.dumps({
+            "gate": args.gate,
+            "base": args.base,
+            "results": results,
+            "hard_failed": hard_failed,
+        }, ensure_ascii=False, indent=2))
+        return 1 if hard_failed else 0
+
+    if "orphan" in results:
+        _print_orphan(results["orphan"])
+    if "filler" in results:
+        _print_filler(results["filler"])
+    if "path" in results:
+        _print_path(results["path"])
+    if "contract" in results:
+        _print_contract(results["contract"])
+
+    if args.gate == "all":
+        verdict = "FAIL" if hard_failed else "PASS"
+        print(f"\n=== corpus-gate all: {verdict} "
+              f"(hard gates: orphan/filler/path; contract report-only) ===")
+    return 1 if hard_failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
