@@ -4,7 +4,7 @@
   "category": "system-design",
   "level": "advanced",
   "summary": "tenant fairness는 noisy neighbor가 있어도 각 tenant의 latency budget을 지키는 admission과 isolation 설계다.",
-  "body_markdown": "    # Tenant Fairness Noisy Neighbor Backpressure Bridge\n\n    ## 이 문서가 맡는 질문\n    multi-tenant fairness, noisy neighbor, rate limit, queue/backpressure를 한 설계로 묶는 system-design bridge다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    tenant별 quota, shared pool, per-tenant queue, load shedding, cell/routing isolation, noisy neighbor 지표를 본다.\n\n    ## 실전 시나리오\n    한 대형 tenant의 대량 요청 때문에 다른 tenant checkout latency가 같이 튄다. 전체 CPU 평균은 정상이어도 fairness가 깨진 상태다.\n\n    ## CS 배경\n    shared infrastructure는 자원 효율을 높이지만 tenant 간 간섭을 만든다. fairness는 전체 처리량과 다르게 각 tenant가 약속된 latency/throughput을 받는지 보는 isolation 문제다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - tenant identity는 admission control과 metric tag에 보존되어야 한다\n- shared queue 하나는 noisy tenant가 tail latency를 전파할 수 있다\n- rate limit은 거절이고 backpressure는 속도 조절이며 load shedding은 보호 동작이다\n- fairness SLO는 global average와 별도로 본다\n\n    ## 판단 매트릭스\n    - 요청량 과다 tenant면 hierarchical token bucket\n- queue 간섭이면 per-tenant queue\n- 장애 반경이면 cell isolation\n- 보호 우선이면 load shedding과 priority\n\n    ## 예시\n    ```text\n    tenant A floods queue; per-tenant limiter caps A and keeps tenant B checkout p95 within SLO\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    tenant fairness는 착한 평균 성능보다 나쁜 이웃이 있을 때의 사용자 경험을 보는 설계다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 single noisy tenant, many small tenants, burst recovery, priority tenant, cell failover를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. per-tenant throughput, queue depth, shed rate, limiter cost, routing overhead를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. per-tenant p95/p99, queue wait p99, noisy-neighbor recovery time, shed response latency가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    tenant_p99_ms, per_tenant_queue_depth, noisy_neighbor_shed_count, fairness_index, rate_limit_decision_p99_ms를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - 전체 평균 latency가 좋으면 tenant fairness도 좋다고 본다\n- rate limit과 backpressure와 load shedding을 같은 말로 쓴다\n- tenant tag가 로그에만 있으면 제어에도 충분하다고 생각한다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    tenant fairness는 noisy neighbor가 있어도 각 tenant의 latency budget을 지키는 admission과 isolation 설계다.\n",
+  "body_markdown": "    # Tenant Fairness Noisy Neighbor Backpressure Bridge\n\n    ## 이 문서가 맡는 질문\n    multi-tenant fairness, noisy neighbor, rate limit, queue/backpressure를 한 설계로 묶는 system-design bridge다. 이 문서는 용어 정의에서 멈추지 않고, 실제 설계/디버깅 상황에서 어떤 근거로 선택하고 어떤 지표로 검증할지 연결한다.\n\n    ## 빠른 분기\n    tenant별 quota, shared pool, per-tenant queue, load shedding, cell/routing isolation, noisy neighbor 지표를 본다.\n\n    ## 실전 시나리오\n    한 대형 tenant의 대량 요청 때문에 다른 tenant checkout latency가 같이 튄다. 전체 CPU 평균은 정상이어도 fairness가 깨진 상태다.\n\n    ## CS 배경\n    shared infrastructure는 자원 효율을 높이지만 tenant 간 간섭을 만든다. fairness는 전체 처리량과 다르게 각 tenant가 약속된 latency/throughput을 받는지 보는 isolation 문제다. 핵심은 표면 API나 프레임워크 이름이 아니라, 상태 공간, 큐, 락, 캐시, 네트워크 전송, 권한 판정, 트랜잭션 경계 중 무엇이 correctness를 결정하는지 먼저 고정하는 것이다. 이 배경을 놓치면 평균 성능은 좋아 보여도 tail latency나 장애 복구 시나리오에서 설명력이 사라진다.\n\n    ## 핵심 불변식\n    - tenant identity는 admission control과 metric tag에 보존되어야 한다\n- shared queue 하나는 noisy tenant가 tail latency를 전파할 수 있다\n- rate limit은 거절이고 backpressure는 속도 조절이며 load shedding은 보호 동작이다\n- fairness SLO는 global average와 별도로 본다\n\n    ## 판단 매트릭스\n    - 요청량 과다 tenant면 hierarchical token bucket\n- queue 간섭이면 per-tenant queue\n- 장애 반경이면 cell isolation\n- 보호 우선이면 load shedding과 priority\n\n    ## 예시\n    ```text\n    tenant A floods queue; per-tenant limiter caps A and keeps tenant B checkout p95 within SLO\n    ```\n    이 예시는 구현 세부를 외우기 위한 것이 아니라, boundary와 invariant를 한 번에 드러내기 위한 것이다.\n\n    ## 깊게 볼 포인트\n    tenant fairness는 착한 평균 성능보다 나쁜 이웃이 있을 때의 사용자 경험을 보는 설계다. 특히 잘못된 비교 대상과 섞이면 retrieval도 학습도 흐려진다. 이 문서의 역할은 비슷한 후보를 모두 긍정하는 것이 아니라, 어떤 상황에서 왜 이 후보가 primary answer인지 분명히 하는 데 있다.\n\n    ## 품질 관점\n    품질은 happy path 설명보다 boundary condition과 잘못된 후보 배제를 얼마나 재현 가능하게 설명하는지로 본다. 테스트는 single noisy tenant, many small tenants, burst recovery, priority tenant, cell failover를 포함해야 하며, 실패 시 어떤 invariant가 깨졌는지 바로 드러나야 한다. 문서 품질도 같은 기준으로 본다. 답변이 선택 근거, 실패 모드, 관측 지표, 재현 절차를 분리하지 못하면 학습자는 키워드는 기억해도 실제 문제를 풀지 못한다.\n\n    ## 성능 관점\n    성능은 평균 처리량 하나로 보지 않는다. per-tenant throughput, queue depth, shed rate, limiter cost, routing overhead를 분리해서 측정하고, 작은 synthetic case와 production-like traffic shape를 나눠 benchmark한다. 자료구조나 시스템 선택은 CPU, 메모리, I/O, 네트워크, lock contention 중 어디에 비용을 옮기는지까지 같이 설명해야 한다.\n\n    ## 레이턴시 관점\n    레이턴시는 항상 p50보다 p95/p99, cold path, retry/queue amplification을 같이 본다. per-tenant p95/p99, queue wait p99, noisy-neighbor recovery time, shed response latency가 tail latency를 키우는지 trace span과 histogram으로 확인한다. 이 배치의 모든 문서는 품질, 성능, 레이턴시를 동시에 우월하게 만들기 위한 학습 단위이므로, 답변에는 latency budget과 측정 방법이 반드시 들어가야 한다.\n\n    ## 주제별 추가 지표\n    tenant_p99_ms, per_tenant_queue_depth, noisy_neighbor_shed_count, fairness_index, rate_limit_decision_p99_ms를 주제별 지표로 본다. 이 지표들은 품질, 성능, 레이턴시를 한 화면에서 비교하기 위한 최소 세트다.\n\n    ## 자주 하는 오해\n    - 전체 평균 latency가 좋으면 tenant fairness도 좋다고 본다\n- rate limit과 backpressure와 load shedding을 같은 말로 쓴다\n- tenant tag가 로그에만 있으면 제어에도 충분하다고 생각한다\n\n    ## 학습자가 답변에 포함해야 할 구조\n    답변은 문제 신호, 핵심 불변식, 선택지 비교, 실패 시 관측 지표, 레이턴시 예산을 차례로 말해야 한다. 마지막에는 어떤 테스트와 대시보드로 검증할지 제시한다. 미션 코드와 연결되는 경우에는 domain rule, transaction boundary, external side effect, retry policy를 따로 분리해야 한다.\n\n    ## 실전 검증 루프\n    1. 증상을 한 문장으로 고정한다\n    2. 관련 boundary와 ownership을 표시한다\n    3. correctness invariant를 먼저 쓴다\n    4. synthetic case와 production-like case를 나눠 측정한다\n    5. 품질, 성능, 레이턴시 지표를 함께 비교한다\n    6. 결과를 다음 학습 문서와 qrels에 반영한다\n\n    ## 한 줄 정리\n    tenant fairness는 noisy neighbor가 있어도 각 tenant의 latency budget을 지키는 admission과 isolation 설계다.\n\n## 한 tenant가 다른 tenant를 느리게 만들 때\n\nNoisy neighbor 문제는 단순히 큰 고객을 막는 문제가 아니다. 먼저 어느 shared resource가 tenant별로 고갈되는지 봐야 한다. 공용 queue, DB connection pool, cache command queue, worker pool, shard hot key 중 어디에서 한 tenant가 대기열을 차지하는지 분리한다.\n\n완화는 작은 손잡이부터 적용한다. Tenant별 queue와 concurrency cap으로 서로의 p99를 분리하고, rate limit이나 admission control로 초과 유입을 막는다. 그래도 shared resource가 계속 흔들리면 shard 분리, dedicated cell, 별도 pool 같은 isolation으로 넘어간다. 전체 처리량을 조금 포기하더라도 다른 tenant의 latency budget을 지키는 것이 fairness의 목표다.\n",
   "aliases": [
     "멀티테넌트간섭",
     "테넌트별큐분리",
@@ -13,9 +13,9 @@
     "tenant p99 튐",
     "noisy neighbor 격리",
     "테넌트 공정성",
-    "테넌트공정성",
+    "한 테넌트 트래픽 몰림",
     "시끄러운 이웃 문제",
-    "시끄러운이웃문제",
+    "다른 테넌트 느려짐",
     "멀티 테넌트 간섭",
     "tenant rate limit"
   ],
@@ -23,9 +23,9 @@
     "multi-tenant 서비스에서 noisy neighbor가 다른 tenant latency를 망치면 fairness를 어떻게 설계해?",
     "한 tenant 트래픽이 몰려서 다른 tenant p99까지 망치면 어떻게 막아?",
     "tenant별 큐나 rate limit을 두면 noisy neighbor를 어떻게 줄여?",
-    "multi-tenant에서 공정성과 전체 처리량은 어떻게 trade-off야?",
     "공용 큐 하나 때문에 특정 고객 부하가 전체 지연으로 번질 때 backpressure는 어디에 걸어야 해?",
-    "테넌트별 admission control이랑 load shedding 기준을 어떻게 잡아?"
+    "테넌트별 admission control이랑 load shedding 기준을 어떻게 잡아?",
+    "한 테넌트가 트래픽을 몰아서 다른 테넌트가 느려지면 어떻게 막아?"
   ],
   "symptoms": [
     "tenant_p99_ms",
@@ -62,7 +62,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-25",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -75,6 +75,11 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-audit-natural-entrypoint-repair"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-admission-fairness-overload-w43",
+        "note": "added natural Korean tenant noisy-neighbor learner surface"
       }
     ]
   }
