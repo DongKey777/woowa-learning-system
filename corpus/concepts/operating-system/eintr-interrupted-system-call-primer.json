@@ -1,0 +1,54 @@
+{
+  "id": "operating-system/eintr-interrupted-system-call-primer",
+  "title": "EINTR와 시스템 콜 중단",
+  "category": "operating-system",
+  "level": "beginner",
+  "summary": "EINTR는 시스템 콜이 작업을 끝내기 전에 signal delivery로 중단되어 `-1`과 함께 보고되는 오류 코드다. 이것은 데이터가 일부 읽힌 성공 반환이나 EOF와 다르며, 호출별 재시도 가능성, `SA_RESTART`, deadline 재계산을 함께 봐야 한다.",
+  "body_markdown": "# EINTR와 시스템 콜 중단\n\n> 한 줄 요약: EINTR는 시스템 콜이 signal 때문에 일을 끝내기 전에 끊겨서, 호출자가 재시도 여부를 결정해야 하는 상태다.\n\n**난이도: 🟢 Beginner**\n\nretrieval-anchor-keywords: EINTR, interrupted system call, system call interrupted by signal, signal delivery, retry on EINTR, SA_RESTART, read EINTR, errno EINTR, timeout recompute after EINTR, partial read vs EINTR\n\n## 핵심 개념\n\n시스템 콜은 커널 안에서 파일 읽기, 대기, pipe read, process wait 같은 일을 한다. 그런데 그 도중 프로세스에 signal이 전달되면, 일부 시스템 콜은 작업을 끝내지 못하고 사용자 코드로 돌아올 수 있다. 이때 대표적으로 보이는 errno가 `EINTR`다.\n\n`EINTR`의 핵심은 \"실패했으니 무조건 치명적\"이 아니라 **signal 때문에 중단됐으니 호출자가 다시 시도할지 판단해야 한다**는 점이다.\n\n```c\nssize_t n = read(fd, buf, sizeof buf);\nif (n == -1 && errno == EINTR) {\n    // 데이터 읽기 전 signal로 중단됨. 재시도 여부를 정책으로 결정한다.\n}\n```\n\nLinux `read(2)` 기준으로 `EINTR`는 데이터가 읽히기 전에 signal로 중단된 경우다. 이미 일부 바이트를 읽었다면 `read()`는 `-1/EINTR`가 아니라 읽은 바이트 수를 양수로 돌려줄 수 있다.\n\n## 한눈에 보기\n\n| 표면 | 의미 | 헷갈리기 쉬운 것 |\n|---|---|---|\n| `-1` + `errno=EINTR` | signal 때문에 시스템 콜이 중단됨 | EOF가 아님 |\n| 양수 반환 | 일부라도 성공적으로 처리함 | EINTR가 아님 |\n| `0` from `read()` | EOF | signal 중단이 아님 |\n| `-1` + `EAGAIN` | nonblocking에서 지금은 진행 불가 | EINTR와 재시도 조건이 다름 |\n| 자동 재시작 | libc/kernel가 일부 호출을 다시 시작할 수 있음 | 항상 보장되는 것은 아님 |\n\n## 언제 재시도하나\n\n많은 blocking 시스템 콜 wrapper는 `EINTR`면 다시 호출하는 루프를 둔다. 하지만 무조건 같은 인자로 재시도하면 안 되는 경우도 있다.\n\n- timeout이나 deadline이 있으면 남은 시간을 다시 계산해야 한다.\n- 일부 작업이 이미 성공한 호출과 섞이면 중복 side effect를 조심해야 한다.\n- 사용자가 `Ctrl-C` 같은 signal로 중단 의도를 보냈다면 재시도하지 않아야 할 수 있다.\n\n따라서 입문 단계의 규칙은 단순하다.\n\n```text\nEINTR를 보면:\n1. 이 호출이 idempotent하게 재시도 가능한가?\n2. timeout/deadline을 다시 계산해야 하는가?\n3. signal 자체를 종료/취소 의도로 처리해야 하는가?\n```\n\n## SA_RESTART와 portable code\n\nsignal handler를 설치할 때 `SA_RESTART`가 있으면 일부 시스템 콜은 signal handler 이후 자동으로 재시작될 수 있다. 하지만 모든 호출, 모든 상황이 자동 재시작되는 것은 아니다. 그래서 시스템 프로그래밍에서는 여전히 `EINTR` 분기를 명시적으로 다루는 코드가 필요하다.\n\n특히 `select`, `poll`, `nanosleep`, timeout이 걸린 대기류는 signal 이후 남은 시간을 어떻게 볼지가 중요하다. 단순히 같은 timeout으로 재시도하면 전체 대기 시간이 의도보다 길어질 수 있다.\n\n## 부분 읽기와 구분하기\n\n`read()`에서 가장 자주 하는 실수는 `EINTR`, 부분 읽기, EOF를 한데 묶는 것이다.\n\n- 부분 읽기: 양수 count가 반환된 성공이다.\n- EOF: 0이 반환된다.\n- EINTR: `-1`이고 `errno`가 `EINTR`다.\n\n즉 `read()` 루프에서는 먼저 반환값 부호를 나누고, `-1`일 때만 `errno`를 본다. 짧은 양수 반환을 `EINTR`처럼 버리면 이미 받은 데이터를 잃을 수 있다.\n\n## 흔한 오해와 함정\n\n- \"EINTR는 다시 시도하면 항상 안전하다\" — timeout, 취소 signal, side effect가 있으면 정책 판단이 필요하다.\n- \"signal handler가 있으면 모든 시스템 콜이 EINTR로 돌아온다\" — `SA_RESTART`와 호출 종류에 따라 자동 재시작될 수 있다.\n- \"read가 짧게 반환됐으니 EINTR다\" — 양수 반환은 성공이다. `errno`는 `-1`일 때만 의미 있게 본다.\n- \"EINTR는 EOF다\" — EOF는 0 반환이고, EINTR는 `-1` 오류 경로다.\n\n## 실무에서 쓰는 모습\n\n서버나 CLI 도구에서 signal을 받는 코드는 이런 형태가 많다.\n\n```text\nloop:\n  rc = blocking_syscall(...)\n  if rc >= 0:\n    handle success\n  else if errno == EINTR:\n    if shutdown_requested:\n      break\n    recompute timeout\n    continue\n  else:\n    handle real error\n```\n\n핵심은 `EINTR`를 무시하거나 치명 오류로만 보지 않고, signal 처리 정책과 I/O 루프 정책 사이의 접점으로 보는 것이다.\n\n## 더 깊이 가려면\n\n- `read()`의 양수/0/-1 반환값은 [read 반환값, 부분 읽기, EOF](./read-return-count-eof-primer.md)에서 먼저 고정한다.\n- signal mask와 ignore/handler 차이는 [Signal Mask vs Disposition Bridge](./signal-mask-vs-disposition-fork-exec-posix-spawn.md)에서 본다.\n- 운영에서 signal 상태를 `/proc`으로 보는 방법은 [proc pid status Signal Fields Debugging Primer](./proc-pid-status-signal-fields-debugging-primer.md)로 이어진다.\n\n## 한 줄 정리\n\nEINTR는 시스템 콜이 signal 때문에 완료 전에 돌아온 상태다. 안전한 코드는 EOF, 부분 성공, nonblocking, EINTR를 서로 다른 가지로 나누고, 재시도할 때 timeout과 취소 의도를 다시 계산한다.",
+  "aliases": [
+    "EINTR",
+    "interrupted system call",
+    "시스템 콜 중단",
+    "시스템콜 중단",
+    "signal interrupted syscall",
+    "errno EINTR",
+    "retry on EINTR",
+    "SA_RESTART",
+    "read EINTR",
+    "EINTR 재시도"
+  ],
+  "expected_queries": [
+    "EINTR는 시스템 콜이 signal 때문에 중단됐다는 뜻인데 언제 재시도해야 해?",
+    "read에서 EINTR와 partial read와 EOF는 반환값이 어떻게 달라?",
+    "signal handler를 설치하면 시스템 콜이 항상 interrupted system call로 실패해?",
+    "SA_RESTART가 있으면 EINTR 처리를 아예 안 해도 되는지 설명해줘",
+    "timeout이 있는 poll이나 read를 EINTR 후 재시도할 때 무엇을 다시 계산해야 해?"
+  ],
+  "symptoms": [
+    "로그에 Interrupted system call이 보이는데 치명 오류인지 재시도 대상인지 모르겠어요",
+    "Ctrl-C나 SIGTERM 처리와 blocking read 루프가 같이 있을 때 종료가 꼬여요",
+    "EINTR를 무조건 continue했더니 timeout이 예상보다 길어졌어요"
+  ],
+  "relations": {
+    "prerequisites": [
+      "operating-system/syscall-basics",
+      "operating-system/signals-process-supervision"
+    ],
+    "next_docs": [
+      "operating-system/read-return-count-eof-primer",
+      "operating-system/signal-mask-vs-disposition-fork-exec-posix-spawn",
+      "operating-system/proc-pid-status-signal-fields-debugging-primer"
+    ],
+    "confusable_with": [
+      "operating-system/read-return-count-eof-primer",
+      "operating-system/signal-mask-vs-disposition-fork-exec-posix-spawn"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25"
+  }
+}
