@@ -1,0 +1,61 @@
+{
+  "id": "language/jvm-linking-verify-prepare-resolve-primer",
+  "title": "JVM Linking: Verify, Prepare, Resolve Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "JVM linking은 loaded class를 실행 가능한 runtime state로 결합하는 과정이며 verification, preparation, resolution으로 나뉜다. verification은 class file 구조와 bytecode type discipline을 확인하고, preparation은 static field storage를 만들고 default value를 넣으며, resolution은 constant pool의 symbolic reference를 실제 class, field, method 참조로 확인한다. 초기화는 그 다음 단계로, static initializer 실행과 구분해야 한다.",
+  "body_markdown": "# JVM Linking: Verify, Prepare, Resolve Primer\n\n> 한 줄 요약: JVM linking은 loaded binary class를 실행 가능한 runtime state로 결합하는 단계이고, verify는 안전한 bytecode인지 확인하고, prepare는 static storage를 default value로 만들고, resolve는 symbolic reference를 실제 target으로 확인한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [JVM Runtime Constant Pool and Symbolic References Primer](./jvm-runtime-constant-pool-symbolic-reference-primer.md)\n- [Java Binary Compatibility and Linkage Errors](./java-binary-compatibility-linkage-errors.md)\n- [Classpath vs Module Path Split Package Linkage Debugging](./classpath-vs-module-path-split-package-linkage-debugging.md)\n- [Classloader Delegation Edge Cases](./classloader-delegation-edge-cases.md)\n- [Class Initialization Ordering](./class-initialization-ordering.md)\n\nretrieval-anchor-keywords: JVM linking, verify prepare resolve, class loading linking initialization, bytecode verification, VerifyError, preparation static fields default values, resolution symbolic references, NoSuchMethodError, NoSuchFieldError, LinkageError, JLS 12.3, JVMS 5.4\n\n## loading, linking, initialization을 나누기\n\nJava 실행 흐름을 설명할 때 가장 먼저 피해야 할 말은 \"클래스를 로딩하면 static initializer가 바로 돈다\" 같은 단순화다. 스펙 관점에서는 아래처럼 나눈다.\n\n```text\nload\n  -> link\n      -> verify\n      -> prepare\n      -> resolve (구현에 따라 lazy/early 가능)\n  -> initialize\n      -> static field initializer와 static block 실행\n```\n\nJLS는 linking을 binary class/interface를 JVM runtime state에 결합하는 과정으로 설명하고, linking 안에는 verification, preparation, resolution이 있다.\n\n## verify: bytecode가 JVM 규칙을 지키는가\n\nVerification은 class file과 bytecode가 JVM의 구조적 제약과 type discipline을 지키는지 확인한다.\n\n예를 들면:\n\n- instruction opcode가 유효한가\n- branch target이 instruction 중간이 아니라 instruction 시작점인가\n- method signature가 구조적으로 맞는가\n- operand stack과 local variable type 흐름이 맞는가\n\n실패하면 `VerifyError` 같은 `LinkageError` 계열로 드러날 수 있다. 중요한 점은 verification이 \"비즈니스 로직이 맞는가\"를 보는 단계가 아니라, JVM이 안전하게 실행할 수 있는 binary representation인지 보는 단계라는 것이다.\n\n## prepare: static storage와 default value\n\nPreparation은 class variable, 즉 static field를 위한 storage를 만들고 default value로 초기화한다.\n\n```java\nclass Config {\n    static int timeout = 30;\n    static final String NAME = \"app\";\n}\n```\n\n초급자가 자주 헷갈리는 부분은 여기다.\n\n- preparation: `timeout` storage가 생기고 기본값 `0` 상태가 된다.\n- initialization: `timeout = 30` 같은 initializer와 static block이 실행된다.\n\n즉 \"static field에 explicit initializer 값이 들어가는 단계\"는 preparation이 아니라 initialization이다. 단, compile-time constant와 ConstantValue 속성은 별도 nuance가 있으므로 면접 답변에서는 먼저 default value와 initializer 실행 시점을 분리하는 것이 안전하다.\n\n## resolve: symbolic reference를 확인한다\n\nResolution은 runtime constant pool의 symbolic reference를 실제 class, field, method, interface method 같은 target으로 확인하는 과정이다.\n\n예를 들어 `invokevirtual`이 어떤 method를 호출하려면 constant pool에 있는 method reference가 실제 class hierarchy에서 유효한지 확인해야 한다. 이때 target class loading, access control, loader constraint, field/method lookup이 엮일 수 있다.\n\n대표 실패:\n\n| 실패 신호 | 먼저 의심할 것 |\n|---|---|\n| `NoSuchMethodError` | compile 때 본 method와 runtime jar의 binary shape가 다름 |\n| `NoSuchFieldError` | field가 사라졌거나 다른 version이 runtime에 올라옴 |\n| `IllegalAccessError` | binary는 있으나 access check 실패 |\n| `IncompatibleClassChangeError` | class/interface/static/instance 기대가 runtime shape와 다름 |\n\n## resolution은 언제 일어나나\n\nResolution은 항상 class load 직후 모든 reference에 대해 한 번에 끝난다고 외우면 안 된다. JLS는 구현이 symbolic reference를 아주 이른 시점에 모두 resolve할 수도 있고, 실제 사용될 때 하나씩 lazy하게 resolve할 수도 있다고 설명한다. 다만 linkage error는 그 reference가 필요한 program action 지점에서 던져져야 한다.\n\n이 때문에 어떤 오류는 애플리케이션 시작 시점에 터지고, 어떤 오류는 특정 endpoint를 처음 밟을 때만 터질 수 있다. 운영에서는 \"부팅 성공\"과 \"모든 bytecode reference resolution 성공\"을 같은 뜻으로 보면 안 된다.\n\n## 답변할 때의 체크리스트\n\n1. Loading은 binary representation으로 `Class` 객체를 만드는 단계다.\n2. Linking은 verify, prepare, resolve를 포함한다.\n3. Verify는 bytecode 구조와 type discipline을 검사한다.\n4. Prepare는 static field storage와 default values를 만든다.\n5. Resolve는 symbolic reference를 실제 runtime target으로 확인한다.\n6. Initialization은 static initializer와 explicit field initializer 실행이다.\n7. Resolution은 lazy일 수 있으므로 linkage error가 특정 runtime path에서 늦게 보일 수 있다.\n\n## Spec references\n\n- JLS Java SE 26 §12.3 Linking of Classes and Interfaces: `https://docs.oracle.com/javase/specs/jls/se26/html/jls-12.html#jls-12.3`\n- JLS Java SE 26 §12.3.1-§12.3.3 Verify/Prepare/Resolve overview: `https://docs.oracle.com/javase/specs/jls/se26/html/jls-12.html#jls-12.3.1`\n- JVMS Java SE 26 §5.4 Linking: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-5.html#jvms-5.4`\n\n## 한 줄 정리\n\nJVM linking은 \"로딩과 초기화 사이\"에서 bytecode를 검증하고 static storage를 준비하고 symbolic reference를 해석하는 단계이므로, static initializer 실행과 runtime linkage error를 같은 단계로 뭉개지 않는 것이 핵심이다.\n",
+  "aliases": [
+    "JVM linking verify prepare resolve",
+    "verify prepare resolve",
+    "class loading linking initialization",
+    "bytecode verification VerifyError",
+    "preparation static default values",
+    "resolution symbolic references",
+    "JVM 링크 단계",
+    "검증 준비 해석",
+    "static 기본값 준비",
+    "lazy resolution linkage error",
+    "JLS 12.3 linking"
+  ],
+  "expected_queries": [
+    "JVM linking에서 verify prepare resolve가 각각 뭘 하고 initialization이랑 뭐가 달라?",
+    "static field가 preparation 때 default value가 되고 static initializer는 initialization 때 돈다는 말이 헷갈려",
+    "NoSuchMethodError나 IncompatibleClassChangeError가 resolution 단계에서 늦게 터질 수 있는 이유를 설명해줘",
+    "bytecode verification은 어떤 걸 검사하고 VerifyError는 언제 나는지 JVM linking 기준으로 알려줘",
+    "class loading linking initialization 순서를 JLS/JVMS 기준으로 면접 답변처럼 정리해줘"
+  ],
+  "symptoms": [
+    "loading, linking, initialization을 한 단계로 뭉쳐 static initializer 실행 시점을 잘못 설명한다.",
+    "preparation을 explicit static initializer 실행으로 오해해 default value와 initialization value를 구분하지 못한다.",
+    "resolution이 lazy일 수 있다는 점을 놓쳐 특정 endpoint 첫 호출에서 LinkageError가 나는 현상을 설명하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jvm-runtime-constant-pool-symbolic-reference-primer"
+    ],
+    "next_docs": [
+      "language/java-binary-compatibility-linkage-errors",
+      "language/classpath-vs-module-path-split-package-linkage-debugging",
+      "language/classloader-delegation-edge-cases",
+      "language/class-initialization-ordering"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": [
+      "Spring Bean 초기화 순서와 lifecycle callback을 설명해줘",
+      "JIT warmup과 C1 C2 tiered compilation을 설명해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-Lang-JVM"
+      }
+    ]
+  }
+}
