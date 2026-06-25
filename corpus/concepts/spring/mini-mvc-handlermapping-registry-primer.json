@@ -1,0 +1,57 @@
+{
+  "id": "spring/mini-mvc-handlermapping-registry-primer",
+  "title": "미니 MVC HandlerMapping Registry 직접 구현 입문",
+  "category": "spring",
+  "level": "intermediate",
+  "summary": "미니 MVC의 HandlerMapping registry는 annotation scan 결과를 HTTP method와 path key로 정리하는 routing table이다. Controller scan과 달리 class를 찾는 단계가 아니고, DispatcherServlet invocation과 달리 handler를 실행하지 않는다.",
+  "body_markdown": "# 미니 MVC HandlerMapping Registry 직접 구현 입문\n\n> 한 줄 요약: HandlerMapping registry는 reflection으로 찾은 handler 후보를 `HTTP method + path` key로 정리해, 요청이 들어왔을 때 실행할 handler를 빠르게 고르는 얇은 routing table이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [미니 MVC Controller 스캔과 Reflection 입문](./mini-mvc-controller-scanning-reflection-primer.md)\n- [DispatcherServlet HandlerMapping Ordering and 405 Caveat](./dispatcherservlet-handlermapping-ordering-405-caveat.md)\n- [HTTP 메서드와 REST 멱등성 입문](../network/http-methods-rest-idempotency-basics.md)\n\nretrieval-anchor-keywords: mini mvc handlermapping registry, route table 직접 구현, HTTP method path handler key, handler registry mapping conflict, @GetMapping route registration, 컨트롤러 스캔 다음 라우팅 테이블, 404 405 직접 구현\n\n## 핵심 개념\n\ncontroller scanner가 만든 `HandlerDefinition`은 아직 흩어진 후보 목록이다. HandlerMapping registry는 이 후보들을 요청 lookup이 가능한 구조로 바꾼다.\n\n```text\nHandlerDefinition 목록\n  -> key: GET /reservations\n  -> value: ReservationController#list\n```\n\n이 단계의 핵심 질문은 세 가지다.\n\n1. key를 무엇으로 볼 것인가: path만 볼지, HTTP method까지 묶을지\n2. 충돌을 어떻게 막을 것인가: 같은 key가 두 번 등록되면 실패시킬지\n3. 조회 실패를 어떻게 구분할 것인가: path 자체가 없는 404인지, path는 있는데 method가 다른 405인지\n\nSpring의 실제 HandlerMapping은 훨씬 많은 조건을 다루지만, 미니 프레임워크에서는 이 세 축만 잡아도 라우팅의 뼈대가 보인다.\n\n## 한눈에 보기\n\n| 책임 | registry가 한다 | scanner/dispatcher가 하지 않는다 |\n|---|---|---|\n| route 등록 | path + method key로 handler 저장 | class annotation을 다시 읽지 않는다 |\n| 중복 감지 | 같은 key가 두 번 나오면 시작 시 실패 | 요청 때 우연히 고르지 않는다 |\n| 요청 조회 | 들어온 method/path에 맞는 handler 반환 | controller instance 생성은 하지 않는다 |\n| 404/405 구분 | path 후보와 method 후보를 나눠 본다 | 비즈니스 예외로 처리하지 않는다 |\n\n## 작은 구현 모델\n\n```java\nrecord RouteKey(HttpMethod method, String path) {}\n\nfinal class HandlerMappingRegistry {\n    private final Map<RouteKey, HandlerDefinition> mappings = new HashMap<>();\n\n    void register(HandlerDefinition handler) {\n        RouteKey key = new RouteKey(handler.httpMethod(), handler.path());\n        if (mappings.putIfAbsent(key, handler) != null) {\n            throw new IllegalStateException(\"duplicated route: \" + key);\n        }\n    }\n\n    Optional<HandlerDefinition> find(HttpMethod method, String path) {\n        return Optional.ofNullable(mappings.get(new RouteKey(method, path)));\n    }\n}\n```\n\n처음에는 pattern matching, path variable, consumes/produces까지 넣지 않는다. 먼저 exact path와 HTTP method key로 route ownership을 분명히 한다.\n\n## 404와 405를 직접 나누는 감각\n\n미니 구현에서도 아래 구분은 중요하다.\n\n| 들어온 요청 | registry 상태 | 더 가까운 응답 |\n|---|---|---|\n| `GET /rooms` | `GET /rooms` 있음 | handler 실행 |\n| `POST /rooms` | `GET /rooms`만 있음 | 405 후보 |\n| `GET /room` | `/room` path 자체 없음 | 404 후보 |\n\n이 구분을 하지 않으면 모든 실패가 \"handler 없음\"으로만 보이고, 프론트가 HTTP method를 잘못 보낸 상황을 path 오타처럼 디버깅하게 된다.\n\n## 흔한 오해와 함정\n\n- \"HandlerMapping은 reflection scan 그 자체다\"라고 섞는다. scan은 후보 수집이고 mapping은 request key로 찾는 구조다.\n- \"path만 key로 삼으면 된다\"고 생각한다. 같은 path라도 GET/POST가 다른 handler일 수 있다.\n- \"중복 route가 있으면 요청 때 더 맞는 것을 고르면 된다\"고 미룬다. 미니 프레임워크에서는 시작 시점에 중복을 터뜨리는 편이 안전하다.\n- \"404/405는 ControllerAdvice에서 정하면 된다\"고 본다. 응답 바디는 advice가 정리할 수 있어도, 404/405의 원인은 mapping lookup 단계에서 갈린다.\n\n## 더 깊이 가려면\n\n- registry가 고른 handler를 실제로 호출하는 흐름은 [미니 MVC DispatcherServlet 호출 파이프라인](./mini-mvc-dispatcher-invocation-primer.md)으로 이어진다.\n- Spring의 여러 HandlerMapping ordering과 405 caveat는 [DispatcherServlet HandlerMapping Ordering and 405 Caveat](./dispatcherservlet-handlermapping-ordering-405-caveat.md)에서 더 자세히 본다.\n\n## 한 줄 정리\n\nHandlerMapping registry는 controller scan 결과를 `method + path -> handler`로 바꾸는 routing table이며, 직접 구현할 때도 404와 405를 나눌 수 있게 key와 실패 이유를 분리해야 한다.\n",
+  "aliases": [
+    "HandlerMapping 직접 구현",
+    "route table 직접 구현",
+    "미니 MVC 라우팅 테이블",
+    "HTTP method path key",
+    "handler registry",
+    "404 405 직접 구현",
+    "@GetMapping 등록",
+    "request mapping registry"
+  ],
+  "expected_queries": [
+    "@GetMapping으로 찾은 메서드들을 method path 기준 route table에 어떻게 등록해?",
+    "미니 MVC에서 HandlerMapping registry는 controller scan 결과를 어떻게 조회 구조로 바꿔?",
+    "직접 만든 라우터에서 404와 405를 path 후보와 HTTP method 후보로 나누려면 어떻게 봐?",
+    "같은 path와 method가 두 번 등록되면 프레임워크 시작 때 실패시키는 게 왜 안전해?"
+  ],
+  "symptoms": [
+    "path만 key로 삼아 GET과 POST handler를 덮어쓴다",
+    "controller scan과 request lookup table을 같은 단계로 구현한다",
+    "중복 route를 요청 시점에 아무 handler나 고르는 문제로 남긴다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "spring/mini-mvc-controller-scanning-reflection-primer",
+      "network/http-methods-rest-idempotency-basics"
+    ],
+    "next_docs": [
+      "spring/mini-mvc-dispatcher-invocation-primer",
+      "spring/dispatcherservlet-handlermapping-ordering-405-caveat"
+    ],
+    "confusable_with": [
+      "spring/mini-mvc-controller-scanning-reflection-primer",
+      "spring/mini-mvc-dispatcher-invocation-primer",
+      "spring/dispatcherservlet-handlermapping-ordering-405-caveat"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-framework-impl-bridge-w31"
+      }
+    ]
+  }
+}
