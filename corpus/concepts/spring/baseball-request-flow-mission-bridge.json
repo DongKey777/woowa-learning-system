@@ -3,7 +3,7 @@
   "title": "Baseball Request Flow Mission Bridge",
   "category": "spring",
   "level": "beginner",
-  "summary": "이 mission_bridge는 숫자야구 콘솔 미션을 Spring 요청 흐름으로 옮길 때 Controller Service Repository Domain 경계를 잡는다. while loop를 Controller로 옮김, singleton bean에 게임 상태 저장 같은 증상을 다룬다.",
+  "summary": "이 mission_bridge는 숫자야구 콘솔 미션을 Spring 요청 흐름으로 옮길 때 Controller Service Repository Domain 경계를 잡는다. while loop를 Controller로 옮김, singleton bean에 게임 상태 저장 같은 증상을 다룬다. 웹으로 옮긴 뒤 while문과 게임 상태를 Controller, Service, Repository 중 어디에 둘지 묻는 장면을 다룬다.",
   "body_markdown": "# Baseball Request Flow Mission Bridge\n\n## 미션 장면\n\n콘솔 숫자야구는 하나의 loop 안에서 입력, 검증, 판정, 출력이 이어진다. Spring으로 옮기면 한 HTTP 요청이 한 턴을 처리하고, 상태는 요청 밖 저장소나 세션 경계에서 다뤄야 한다.\n\n콘솔의 `while`은 프로그램이 사용자 한 명을 붙잡고 진행하는 제어 흐름이다. HTTP에서는 요청 하나가 들어오고 응답을 반환하면 서버 스레드는 그 요청을 끝낸다. 그래서 \"계속 진행 중인 게임\"은 Controller 지역 변수나 singleton bean field가 아니라 `gameId`, session key, DB row, in-memory repository 같은 별도 식별 경계로 다시 찾아야 한다.\n\n## 리뷰에서 보이는 냄새\n\nController에 `while` loop를 옮기거나 singleton Bean 필드에 현재 게임 상태를 저장하면 여러 사용자 요청이 섞일 수 있다. 입력 형식 검증과 도메인 판정도 분리하지 않으면 테스트가 흐려진다.\n\n리뷰 코멘트가 \"Controller가 너무 많은 걸 한다\"라면 보통 아래 책임이 한 메서드에 섞인 상태다.\n\n| 섞인 책임 | 자연스러운 위치 | 이유 |\n|---|---|---|\n| HTTP body/path/query 파싱 | Controller | transport format을 command로 바꾼다 |\n| 숫자 개수, 문자 형식, 빈 값 | request DTO validation | 요청 형식 오류를 빠르게 거른다 |\n| 중복 숫자, strike/ball 판정 | Domain | 게임 규칙은 HTTP 없이도 테스트돼야 한다 |\n| 게임 조회, 턴 진행, 저장 | Service | request 밖 상태와 transaction/use case를 조율한다 |\n| 저장소 조회/저장 세부 | Repository | Service가 필요한 Game을 가져오고 저장하는 persistence boundary다 |\n\n## 개념 handoff\n\nController는 요청을 한 턴의 command로 바꾸고, Service는 게임 진행 유스케이스를 실행하고, Repository는 요청 밖 게임 상태를 조회/저장하며, Domain은 strike/ball 판정 규칙을 가진다.\n\n예를 들어 `POST /games`는 새 게임을 만들고 `gameId`를 돌려준다. `POST /games/{gameId}/guesses`는 사용자의 추측을 한 턴 command로 받아 저장된 게임을 찾고, domain에 판정을 맡긴 뒤 결과를 저장하고 응답 DTO로 바꾼다.\n\n```text\nHTTP request\n  -> Controller: path/body를 command로 변환\n  -> Validation: 형식 오류를 400으로 변환할 수 있는지 확인\n  -> Service: 한 턴 진행 use case 시작, transaction boundary 결정\n  -> Repository: gameId로 Game 조회\n  -> Domain: 숫자야구 규칙과 상태 전이를 보호\n  -> Repository: 바뀐 Game 또는 TurnResult 저장\n  -> Controller: result DTO와 status code 반환\n```\n\n## Controller-Service-Repository 흐름\n\n| 단계 | 책임 | 하지 말아야 할 일 |\n|---|---|---|\n| Controller | `gameId`, request body, validation error를 HTTP 계약으로 다룬다 | `while` loop, random answer 생성 정책, repository 직접 조합 |\n| Service | `startGame`, `guess` 같은 use case를 열고 repository와 domain을 조율한다 | HTTP status/body 세부를 결정하거나 strike/ball 알고리즘을 직접 품는다 |\n| Repository | `Game`을 id로 찾고 저장한다 | 게임 규칙을 판단하거나 controller DTO를 안다 |\n| Domain | 정답/추측 값의 invariant와 strike/ball 판정을 보호한다 | request/session/database API에 의존한다 |\n\nService가 Repository를 거쳐 저장된 Game을 불러오고 Domain method를 호출하면, 같은 규칙을 HTTP 없이도 테스트할 수 있다. 반대로 Controller가 Repository에서 entity를 꺼내 바로 `play()`와 `save()`를 섞으면 요청 변환, 저장소, 규칙이 한곳에 묶여 변경 비용이 커진다.\n\n## 면접 답변 축\n\n- 콘솔 loop는 HTTP endpoint와 request lifecycle로 분해한다.\n- 사용자별 진행 상태는 singleton bean field가 아니라 식별자와 저장소 경계로 관리한다.\n- request validation은 \"입력이 비어 있지 않은가\", \"숫자 세 자리 형식인가\" 같은 transport 근처 검증, domain rule은 \"중복 없는 서로 다른 숫자인가\"와 \"strike/ball 판정\" 같은 invariant로 나눈다.\n- Controller 테스트는 binding/status/response shape에 집중하고, domain 테스트는 Spring 없이 판정 규칙을 검증한다.\n- Service 테스트는 \"게임을 찾아 한 턴을 진행하고 저장한다\"는 Controller-Service-Repository 순서를 본다.\n- Repository 테스트는 저장/조회 쿼리와 persistence mapping을 확인하고, 게임 규칙 검증을 대신하지 않는다.\n\n## 헷갈리는 질문\n\n| 질문 | 답변 방향 |\n|---|---|\n| 세션에 게임 객체를 통째로 넣어도 되나 | 작게는 가능해도 session은 식별/연결 경계로 보고 실제 상태는 저장소로 빼는 쪽이 확장과 테스트가 쉽다 |\n| Controller에서 `Game.play()`만 호출하면 괜찮나 | HTTP 변환만 한다면 괜찮지만 카드/숫자 생성, 저장, 상태 분기까지 알면 경계가 샌다 |\n| 입력 검증은 domain에만 두면 되나 | malformed request와 domain invariant를 나누고, 중복 방어는 domain에서도 유지한다 |\n| Repository를 Controller에서 바로 호출해도 되나 | 단순 조회 화면은 가능해도 게임 턴 진행처럼 상태 전이가 있는 use case는 Service에서 transaction과 규칙 호출 순서를 잡는 편이 안전하다 |\n\n## Drill 후보\n\n\"새 게임 시작\"과 \"숫자 추측\"을 각각 HTTP endpoint로 나눈다면 어떤 상태가 요청 바깥에 남아야 하는지, 그리고 Service가 어떤 Repository method를 호출해야 하는지 써 본다.\n",
   "aliases": [
     "숫자야구 요청 흐름",
@@ -13,13 +13,16 @@
     "baseball controller service domain",
     "baseball controller service repository",
     "숫자야구를 Controller Service로 나누고 싶어요",
-    "게임 루프를 HTTP 요청으로 옮기려면"
+    "게임 루프를 HTTP 요청으로 옮기려면",
+    "숫자야구 while문과 게임 상태 계층",
+    "콘솔 숫자야구 웹 계층 분리"
   ],
   "expected_queries": [
     "숫자야구 미션을 Spring으로 옮기면 Controller Service Domain 흐름이 어떻게 돼?",
     "숫자야구 Spring에서 Controller Service Repository 흐름을 어떻게 잡아?",
     "baseball 게임 입력 검증은 어느 레이어에 둬야 해?",
-    "콘솔 게임 루프를 HTTP 요청 흐름으로 바꾸면 뭐가 달라져?"
+    "콘솔 게임 루프를 HTTP 요청 흐름으로 바꾸면 뭐가 달라져?",
+    "숫자야구를 웹으로 옮길 때 while문과 게임 상태는 어느 계층에 둬야 해?"
   ],
   "symptoms": [
     "콘솔 while loop를 Controller에 그대로 옮기고 있어요",
@@ -60,6 +63,10 @@
         "date": "2026-06-19",
         "source": "cycle2-generated-filler-repair",
         "note": "added natural Korean aliases"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w62-spring-basics-surfaces"
       }
     ]
   }
