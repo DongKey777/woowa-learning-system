@@ -3,27 +3,27 @@
   "title": "메모리 관리 기초",
   "category": "operating-system",
   "level": "beginner",
-  "summary": "이 문서는 운영체제 입문자가 주소 공간, 페이지 테이블, RAM 연결과 힙, 스택, RSS, VSZ를 한 장의 메모리 그림으로 처음 잡는 primer다. 예약한 공간과 실제 상주분, 함수 호출 메모리, 동적 할당 영역, 처음 접근할 때 붙는 페이지, OOM과 다른 fault 축을 `주소 공간 큰 그림 -> 가상 메모리 -> page fault -> runtime 지표` 순서로 분리한다.",
+  "summary": "이 문서는 운영체제 입문자가 주소 공간, 페이지 테이블, RAM 연결과 힙, 스택, RSS, VSZ를 한 장의 메모리 그림으로 처음 잡는 primer다. MMU, TLB, page fault, swap이 한꺼번에 헷갈리거나 VSZ, RSS, heap used가 다르게 보일 때 `주소 공간 큰 그림 -> 가상 메모리 -> fault/swap -> runtime 지표` 순서로 분리한다.",
   "body_markdown": "# 메모리 관리 기초\n\n> 한 줄 요약: 운영체제는 각 프로세스에게 독립된 가상 주소 공간을 주고, 실제 물리 메모리와의 연결은 페이지 테이블로 관리해 격리와 효율을 동시에 달성한다.\n\n**난이도: 🟢 Beginner**\n\n관련 문서:\n\n- [Process, Thread, Virtual Memory, Context Switch, Scheduler Basics](./process-thread-virtual-memory-context-switch-scheduler-basics.md)\n- [가상 메모리 기초](./virtual-memory-basics.md)\n- [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md)\n- [Page Table Overhead, Memory Footprint](./page-table-overhead-memory-footprint.md)\n- [Swap-In, Reclaim, and Major Fault Path Primer](./swap-in-reclaim-fault-path-primer.md)\n- [operating-system 카테고리 인덱스](./README.md)\n- [Java Thread Basics](../language/java/java-thread-basics.md)\n\nretrieval-anchor-keywords: 메모리 관리 기초, virtual memory beginner, page table basics, heap vs stack, page fault basics, address space basics, lazy allocation basics, first touch memory, stack overflow vs oom, rss vs vsz, heap vs rss, memory basics self-check, memory management basics basics, memory management basics beginner, memory management basics intro, 메모리 관리 처음 배우는데, 가상 메모리 vs 물리 메모리, heap vs stack 차이, page table 동작, TLB 의미, RSS vs VSZ 차이, page fault 발생 원인, OOM kill 의미, stack overflow vs heap OOM\n\n## Self-check Primer Handoff\n\n> **이 문서는 self-check 빠른 점검 루트의 3단계다**\n>\n> - 언제 읽나: 스케줄링 감각은 있는데 virtual memory, heap/stack, page fault, RSS/VSZ가 한데 엉켜 메모리 지표를 말로 설명하기 어려울 때 읽는다.\n> - 선행 문서: [CPU 스케줄링 기초](./cpu-scheduling-basics.md)까지 보고 오면 \"CPU 대기\"와 \"메모리 fault\"를 다른 축으로 분리하기 쉬워진다.\n> - 후행 문서: [시스템 콜 기초](./syscall-basics.md)에서 앱 코드가 커널 경계와 어떻게 만나는지 마지막 축을 붙여 self-check 4편을 마무리한다.\n\n## 먼저 잡는 멘탈 모델\n\n메모리 관리는 \"프로세스가 보는 지도(가상 주소)\"와 \"실제 창고(RAM)\"를 연결하는 일이다.\n\n- 개발자는 가상 주소를 사용한다.\n- OS와 CPU가 페이지 테이블로 가상 주소를 물리 주소에 매핑한다.\n- 그래서 각 프로세스는 자기만의 독립 공간을 가진 것처럼 동작한다.\n\n핵심은 **주소를 쓰는 주체(프로세스)와 실제 저장 위치(RAM)가 분리되어 있다**는 점이다.\n\n## 핵심 개념\n\n\"메모리\"는 여러 의미로 쓰인다. 입문 수준에서 꼭 정리해야 하는 세 가지 질문이 있다.\n\n1. 프로세스는 왜 서로의 메모리를 볼 수 없는가\n2. 힙과 스택은 어떻게 다른가\n3. 프로그램이 쓰는 주소와 실제 RAM 주소는 같은가\n\n이 세 질문이 운영체제 메모리 관리의 입문 핵심이다.\n\n## 한눈에 보기\n\n각 프로세스가 보는 가상 주소 공간은 역할별로 구역이 나뉜다. 높은 주소부터 낮은 주소 순서로 보면 다음과 같다.\n\n```text\n프로세스의 가상 주소 공간 (논리 구조)\n┌──────────────┐  높은 주소\n│   커널 영역   │  (OS 전용)\n├──────────────┤\n│    스택       │  ↓ 함수 호출마다 증가\n│   (stack)    │\n├──────────────┤\n│   빈 공간     │\n├──────────────┤\n│    힙         │  ↑ 동적 할당마다 증가\n│   (heap)     │\n├──────────────┤\n│  BSS/데이터   │  전역/정적 변수\n├──────────────┤\n│   코드(text)  │  실행 가능한 명령어\n└──────────────┘  낮은 주소\n```\n\n각 영역의 핵심 포인트:\n\n| 영역 | 성장 방향 | 관리 주체 | 흔한 문제 |\n|------|-----------|-----------|-----------|\n| 스택 | 위→아래 | OS/컴파일러 자동 | stack overflow (너무 깊은 재귀) |\n| 힙 | 아래→위 | 프로그래머 또는 GC | memory leak, fragmentation |\n| BSS/데이터 | 고정 | 링커/OS | 대형 전역 변수 |\n| 코드(text) | 고정 | 링커/OS | 읽기 전용, 공유 가능 |\n\n스택은 스레드마다 독립적으로 존재하지만, 힙은 같은 프로세스의 스레드가 공유한다는 점이 가장 중요한 구분이다.\n\n## 상세 분해\n\n### 가상 메모리와 물리 메모리\n\n프로그램 내에서 보는 주소는 **가상 주소(virtual address)**다. 이 주소는 실제 RAM의 위치와 다를 수 있다. OS와 하드웨어가 페이지 테이블을 통해 가상 주소를 물리 주소로 변환한다.\n\n이 덕분에 두 가지가 가능하다.\n\n- **격리**: 프로세스 A는 프로세스 B의 가상 주소 범위를 접근해도 실제로는 자기 페이지를 본다.\n- **오버커밋**: 여러 프로세스가 합산하면 RAM보다 큰 가상 공간을 쓰는 것처럼 선언해도 실제로 쓸 때만 물리 메모리를 할당한다.\n\n### 힙(heap) vs 스택(stack)\n\n| 항목 | 스택 | 힙 |\n|------|------|----|\n| 용도 | 함수 호출, 지역 변수 | 동적 할당 객체 |\n| 관리 주체 | OS / 컴파일러 자동 | 프로그래머 또는 GC |\n| 속도 | 매우 빠름 | 상대적으로 느림 |\n| 크기 | 제한적 (보통 MB 단위) | 훨씬 큼 (힙 영역 전체) |\n| 생존 주기 | 함수 종료 시 자동 해제 | 명시적 해제 또는 GC까지 |\n\n### 페이지와 페이지 폴트\n\n물리 메모리는 **페이지(page)** 단위(보통 4KB)로 나뉜다. 프로세스가 특정 가상 주소에 접근했을 때 해당 페이지가 아직 물리 메모리에 없으면 **페이지 폴트(page fault)**가 발생한다.\n\n- **minor fault**: 페이지 매핑만 비어 있고 실제 데이터는 이미 메모리에 있는 경우\n- **major fault**: 디스크 I/O가 필요해 페이지를 읽어와야 하는 경우\n\n즉, page fault가 모두 \"디스크를 읽는 비싼 사건\"은 아니다.\n\n## 아주 작은 예시: `malloc(100MB)` 했는데 RSS가 바로 안 늘어나는 이유\n\n| 시점 | OS에서 일어나는 일 | 관찰 포인트 |\n|------|--------------------|-------------|\n| `malloc(100MB)` 호출 | 큰 가상 주소 범위를 예약 | VSZ는 증가할 수 있음 |\n| 아직 접근 안 함 | 물리 페이지는 대부분 미할당 | RSS 변화가 작을 수 있음 |\n| 배열을 실제로 순회하며 쓰기(first touch) | 페이지 폴트 발생 후 물리 페이지 할당 | RSS가 점진적으로 증가 |\n\n초급자에게 중요한 포인트는 \"할당 요청\"과 \"실제 물리 메모리 사용\" 시점이 다를 수 있다는 점이다.\n\n현장에서 자주 보는 지표도 함께 구분해 두자.\n\n| 지표 | 뜻 | 흔한 오해 |\n|------|----|-----------|\n| VSZ | 프로세스가 예약한 가상 주소 공간 크기 | \"VSZ가 크면 RAM을 그만큼 실제 사용 중\" |\n| RSS | 현재 RAM에 올라온 물리 페이지 양 | \"RSS만 보면 힙/스택/파일캐시 원인이 모두 구분됨\" |\n| Heap Used(런타임 지표) | 런타임/GC가 추적하는 힙 객체 사용량 | \"Heap Used = RSS\" |\n\n`VSZ > RSS`는 흔한 정상 상태다. lazy allocation과 메모리 매핑 파일 때문에 두 값이 다르게 움직이는 경우가 많다.\n\n초심자는 세 지표를 \"같은 메모리를 다른 각도에서 본 숫자\"로 이해하면 덜 헷갈린다.\n\n| 비교 질문 | VSZ | RSS | Heap Used |\n|-----------|-----|-----|-----------|\n| 무엇을 세나 | 예약한 가상 주소 전체 | 지금 RAM에 올라온 페이지 | 런타임이 추적한 힙 객체 |\n| 힙을 포함하나 | 포함할 수 있음 | 힙 일부/전체가 반영될 수 있음 | 바로 그 대상 |\n| 스택을 포함하나 | 포함할 수 있음 | 스택 페이지가 올라오면 포함 | 포함 안 함 |\n| `mmap` 파일/공유 라이브러리 포함하나 | 포함할 수 있음 | 실제 상주분만 포함 | 포함 안 함 |\n\n포함 관계를 아주 거칠게 그리면 \"`heap`은 프로세스 주소 공간(VSZ)의 한 영역\"이고, \"RSS는 그중 지금 실제 RAM에 올라온 페이지들의 합\"이다. 그래서 힙이 커도 아직 접근하지 않았다면 RSS가 바로 안 늘 수 있고, 반대로 RSS가 커도 원인이 힙이 아니라 `mmap`이나 스택일 수 있다.\n\n## 초보 질문을 어느 메모리 문서로 보낼까\n\n처음에는 메모리 단어가 한꺼번에 나온다. 이 문서는 전체 지도를 잡는 입구이고, 세부 질문은 아래처럼 넘긴다.\n\n| 학습자 질문 | 먼저 볼 축 | 다음 문서 |\n|---|---|---|\n| \"프로세스마다 주소가 따로 보인다는 게 뭐야?\" | 가상 주소 공간과 격리 | 가상 메모리 기초 |\n| \"처음 접근할 때 메모리가 붙는다는 게 뭐야?\" | lazy allocation과 first touch | Demand Paging and Page Fault Primer |\n| \"TLB miss와 page fault가 같은 말이야?\" | 주소 변환 캐시와 fault 분리 | TLB and Page Table Walk Bridge |\n| \"RSS가 늘었는데 힙 누수야?\" | 런타임 지표와 OS 상주분 분리 | Page Fault Minor Major Observability Primer |\n| \"느린데 CPU인지 메모리인지 모르겠어\" | CPU run queue와 fault/reclaim 분리 | CPU 스케줄링 기초, CPU/Memory/I/O 첫 분류 |\n\n짧게 말하면 이 문서는 `메모리 지도`, 가상 메모리는 `주소 변환`, demand paging은 `처음 쓸 때 준비`, TLB 문서는 `변환 캐시`, 런타임 진단 문서는 `관측 신호`를 담당한다.\n\n\n## 흔한 오해와 함정\n\n- \"메모리를 할당하면 바로 RAM을 쓴다\" — 현대 OS는 lazy allocation을 쓴다. 실제 접근이 일어날 때까지 물리 메모리를 붙이지 않는다.\n- \"스택 오버플로우는 메모리 부족 때문이다\" — 스택은 크기 제한이 있어, 재귀 깊이가 너무 깊거나 지역 변수가 너무 크면 스택 영역을 넘어 오버플로우가 발생한다.\n- \"힙에 올린 객체는 즉시 사라진다\" — Java/Python 같은 GC 언어에서는 참조가 끊겨도 GC가 실행되기 전까지 메모리를 차지한다.\n- \"가상 메모리 = 스왑\" — 스왑은 가상 메모리의 일부 상황일 뿐이고, 가상 메모리 핵심은 주소 공간 격리와 매핑 추상화다.\n- \"OOM은 항상 OS 전체 RAM 부족\" — 애플리케이션 런타임 한도(예: JVM `-Xmx`) 초과로도 OOM이 발생한다.\n- \"RSS가 늘었으니 힙 누수다\" — 힙 외에도 page cache, mmap, 네이티브 메모리 증가가 원인일 수 있다. 힙 덤프와 OS 메모리 지표를 함께 봐야 한다.\n\n자주 나오는 오독 두 가지:\n\n- \"`VSZ`가 10GB니까 이 프로세스가 RAM 10GB를 먹는다\" — 예약 주소 공간이 클 뿐일 수 있다. first touch 전이라면 실제 RAM 사용은 훨씬 작을 수 있다.\n- \"`RSS`가 늘었고 JVM heap도 커 보이니 둘은 같은 숫자다\" — RSS에는 힙 말고 스택, 코드, 공유 라이브러리, `mmap` 상주분도 함께 들어간다.\n\n초심자용 빠른 분류 규칙:\n\n| 지금 보이는 증상 | 먼저 의심할 축 |\n|------------------|----------------|\n| `StackOverflowError` | 스택 깊이(재귀), 스레드 스택 한도 |\n| `OutOfMemoryError: Java heap space` | 런타임 힙 한도(`-Xmx`), 객체 생존 |\n| RSS만 계속 증가 | 힙 외 메모리(`mmap`, native, page cache) 포함 여부 |\n\n## 다음으로 어디를 읽을까? (초심자 라우팅)\n\n| 지금 막힌 질문 | 다음 문서 | 이유 |\n|----------------|-----------|------|\n| \"가상 주소 -> 물리 주소 변환이 아직 추상적이다\" | [가상 메모리 기초](./virtual-memory-basics.md) | 주소 변환과 보호 모델을 더 짧은 흐름으로 다시 고정할 수 있다. |\n| \"minor/major fault가 언제 갈리는지 더 보고 싶다\" | [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md) | first-touch와 fault 분기를 실행 흐름으로 묶어 이해할 수 있다. |\n| \"major fault가 왜 지연을 크게 만드는지 궁금하다\" | [Swap-In, Reclaim, and Major Fault Path Primer](./swap-in-reclaim-fault-path-primer.md) | reclaim/swap-in 경로를 실무 지연 관점으로 연결할 수 있다. |\n\n## 실무에서 쓰는 모습\n\nJava 개발자 입장에서 운영체제 메모리 관리 지식이 필요한 순간은 크게 두 가지다.\n\n1. **OutOfMemoryError**: JVM 힙이 가득 찼을 때 발생한다. OS 가상 메모리 관점에서는 물리 RAM이 아직 남아도 JVM 힙 설정(-Xmx)을 초과하면 발생한다.\n2. **StackOverflowError**: 재귀 호출이 너무 깊어 스레드의 스택 크기 제한을 초과할 때 발생한다.\n\n두 오류 모두 OS 메모리 구조를 알면 원인을 훨씬 빠르게 파악할 수 있다.\n\n## 다음 deep-dive 다시 고르기\n\n> **Beginner handoff box**\n>\n> - \"fault가 언제 minor/major로 갈리는지\"를 먼저 보려면: [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md)\n> - \"major fault가 지연으로 커지는 경로\"를 보려면: [Swap-In, Reclaim, and Major Fault Path Primer](./swap-in-reclaim-fault-path-primer.md)\n> - \"reclaim/캐시 압박 신호까지\" 확장하려면: [workingset refault, page cache reclaim 디버깅](./workingset-refault-page-cache-reclaim-debugging.md)\n\n## 더 깊이 가려면\n\n- [가상 메모리 기초](./virtual-memory-basics.md) — 주소 변환과 보호(격리) 개념을 더 짧게 복습한다.\n- [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md) — first touch, major/minor fault를 한 흐름으로 본다.\n- [Swap-In, Reclaim, and Major Fault Path Primer](./swap-in-reclaim-fault-path-primer.md) — major fault가 느려지는 실제 경로를 파고든다.\n- [Page Table Overhead, Memory Footprint](./page-table-overhead-memory-footprint.md) — 페이지 테이블 자체의 메모리 비용을 분석한다.\n\n## 면접/시니어 질문 미리보기\n\n1. **힙과 스택의 차이는 무엇인가요?**\n   의도: 메모리 영역 구분 기본기 확인. 핵심 답: \"스택은 함수 호출 때마다 자동으로 관리되는 영역이고, 힙은 동적 할당으로 사용하며 GC나 명시적 해제가 필요하다.\"\n\n2. **페이지 폴트는 무조건 나쁜 것인가요?**\n   의도: 지연 할당 이해 확인. 핵심 답: \"처음 접근 시 발생하는 minor fault는 정상 동작이다. disk에서 읽어와야 하는 major fault가 잦아지면 성능 문제가 된다.\"\n\n## Self-check (자가 점검 5문항)\n\n아래 질문은 시험이 아니라, 지금 이해한 축을 말로 꺼내 보고 다음 문서를 고르기 위한 점검이다. 먼저 짧게 답해 보고, 막히면 바로 아래 `힌트`만 확인해 보자.\n\n1. 가상 메모리와 물리 메모리를 \"지도와 창고\" 비유로 구분해 설명할 수 있는가?\n   힌트: 프로세스는 지도(가상 주소)만 보고 일하고, OS가 실제 창고(RAM) 위치를 연결해 준다고 보면 된다.\n2. `malloc()` 또는 객체 생성 직후 RSS가 바로 늘지 않을 수 있는 이유(lazy allocation, first touch)를 말할 수 있는가?\n   힌트: \"예약\"과 \"실사용\" 시점이 다르기 때문에, 실제 접근 전에는 물리 페이지가 아직 붙지 않을 수 있다.\n3. `StackOverflowError`와 `OutOfMemoryError`를 같은 메모리 문제로 뭉치지 않고 서로 다른 축(스택 한도 vs 힙 한도/생존 객체)으로 나눌 수 있는가?\n   힌트: 전자는 호출 깊이/스택 한도 문제, 후자는 힙 용량·객체 생존 문제라 진단 출발점이 다르다.\n4. `VSZ`, `RSS`, 런타임 힙 사용량이 왜 항상 같지 않은지 설명할 수 있는가?\n   힌트: 가상 예약 공간, 실제 RAM 상주량, 런타임 힙 관찰 범위가 서로 다른 지표이기 때문이다.\n5. major fault 증가가 지연과 연결되는 이유를 \"디스크/swap 접근 가능성\" 관점으로 설명할 수 있는가?\n   힌트: major fault는 느린 저장장치 경로를 탈 수 있어 요청 처리 중 긴 꼬리 지연을 만들기 쉽다.\n\n## 여기까지 이해했으면 다음 deep-dive\n\n> **Beginner handoff box**\n>\n> - \"`page fault`는 정확히 언제 왜 생기지?`\"가 궁금하면: [Demand Paging and Page Fault Primer](./demand-paging-page-fault-primer.md)\n> - \"`VSZ`, `RSS`, 힙 사용량은 왜 다르게 보이지?`\"가 궁금하면: [가상 메모리 기초](./virtual-memory-basics.md)\n> - \"`major fault`는 느린 저장장치 경로와 어떻게 이어지지?`\"가 궁금하면: [Swap-In, Reclaim, and Major Fault Path Primer](./swap-in-reclaim-fault-path-primer.md)\n> - \"`메모리가 부족한데 page cache reclaim 신호는 어디서 읽지?`\"가 궁금하면: [workingset refault, page cache reclaim 디버깅](./workingset-refault-page-cache-reclaim-debugging.md)\n> - \"`다른 operating-system primer는 어디서 다시 고르지?`\"가 궁금하면: [Operating System README - 입문 primer](./README.md#입문-primer)\n\n## 한 줄 정리\n\n가상 메모리는 프로세스마다 독립된 주소 공간을 주고, 페이지 테이블이 이를 물리 메모리와 연결해 격리·효율·지연 할당을 동시에 달성한다.\n",
   "aliases": [
-    "페이지 폴트가 뭐야?",
-    "MMU",
-    "TLB",
+    "MMU TLB page fault swap 큰 그림",
+    "OS 메모리 기초",
+    "VSZ RSS heap used",
     "RSS",
     "VSZ",
-    "page fault가 뭐예요",
-    "페이지 폴트",
+    "주소 공간 페이지 테이블 RAM",
+    "heap stack RSS VSZ",
     "swap",
-    "page fault",
+    "가상 주소 물리 메모리",
     "OOM kill",
-    "page fault basics",
+    "메모리 지표 큰 그림",
     "stack overflow vs oom"
   ],
   "expected_queries": [
-    "page fault가 뭐예요?",
-    "swap이 뭐야?",
-    "TLB가 뭐야?",
-    "MMU가 뭐야?",
+    "MMU와 TLB, page fault, swap을 메모리 큰 그림에서 연결해서 보고 싶어",
+    "VSZ, RSS, heap used가 서로 다른 이유를 OS 메모리 기초에서 설명해줘",
+    "가상 주소, 물리 메모리, first touch를 메모리 지도에서 연결해줘",
+    "stack overflow와 OOM, page fault를 같은 메모리 문제로 묶지 않고 구분하고 싶어",
     "프로세스 주소 공간, 페이지 테이블, RAM 연결을 입문자 눈높이로 한 번에 정리해줘",
     "heap과 stack, RSS와 VSZ가 왜 다른 숫자인지 운영체제 기본 개념부터 알고 싶어"
   ],
@@ -75,7 +75,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-25",
+    "last_modified": "2026-06-26",
     "legacy_path": "knowledge/cs/contents/operating-system/memory-management-basics.md",
     "revision_history": [
       {
@@ -96,6 +96,13 @@
       {
         "date": "2026-06-25",
         "source": "cycle4-enrich-OS-mem-w29"
+      },
+      {
+        "date": "2026-06-26",
+        "source": "cycle4-w171-y14-recall",
+        "changes": [
+          "replaced bare page-fault exact surfaces with broad memory overview queries"
+        ]
       }
     ]
   }
