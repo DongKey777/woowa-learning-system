@@ -3,7 +3,7 @@
   "title": "Email Delivery Platform 설계",
   "category": "system-design",
   "level": "advanced",
-  "summary": "이 문서는 system-design 카테고리에서 Email Delivery Platform 설계를 다루는 deep_dive 문서다. 이메일 전송 플랫폼은 SMTP/ESP 연동, 큐 기반 재시도, 평판 관리, 발송 최적화를 함께 다루는 대규모 메시지 배달 시스템이다. 검색 질의가 email delivery platform, smtp, esp, bounce처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
+  "summary": "이 문서는 system-design 카테고리에서 Email Delivery Platform 설계를 다루는 deep_dive 문서다. 이메일 전송 플랫폼은 SMTP/ESP 연동, 큐 기반 retry, bounce와 complaint에 따른 suppression, ESP/domain 평판 관리, 뉴스레터 대량 발송 최적화를 함께 다루는 대규모 메시지 배달 시스템이다. 검색 질의가 email delivery platform, smtp, esp, bounce처럼 들어오면 확장성, 일관성, 장애 격리, 운영 검증 관점으로 연결한다.",
   "body_markdown": "# Email Delivery Platform 설계\n\n> 한 줄 요약: 이메일 전송 플랫폼은 SMTP/ESP 연동, 큐 기반 재시도, 평판 관리, 발송 최적화를 함께 다루는 대규모 메시지 배달 시스템이다.\n\nretrieval-anchor-keywords: email delivery platform, smtp, esp, bounce, complaint, suppression list, retry, queue, domain reputation, warmup, unsubscribe\n\n**난이도: 🔴 Advanced**\n\n> 관련 문서:\n> - [Notification 시스템 설계](./notification-system-design.md)\n> - [Job Queue 설계](./job-queue-design.md)\n> - [Timeout, Retry, Backoff 실전](../network/timeout-retry-backoff-practical.md)\n> - [Webhook Delivery Platform 설계](./webhook-delivery-platform-design.md)\n> - [Rate Limiter 설계](./rate-limiter-design.md)\n> - [Audit Log Pipeline 설계](./audit-log-pipeline-design.md)\n\n## 핵심 개념\n\nEmail delivery는 단순 SMTP 호출이 아니다. 실전에서는 아래를 함께 관리해야 한다.\n\n- 발송 큐와 worker pool\n- 도메인 평판과 warm-up\n- bounce, complaint, unsubscribe 처리\n- 템플릿 렌더링과 개인화\n- 중복 발송 방지\n- retry와 backoff\n\n즉, 이메일 플랫폼은 비동기 메시징과 reputation management의 결합이다.\n\n## 깊이 들어가기\n\n### 1. 어떤 메일을 보내는가\n\n보통 다음으로 나눈다.\n\n- transactional email\n- notification email\n- marketing email\n- system alert email\n\n각 유형은 SLA와 우선순위가 다르다.  \n주문 확인 메일과 마케팅 메일을 같은 큐에 넣으면 안 된다.\n\n### 2. Capacity Estimation\n\n예:\n\n- 일 5,000만 통\n- 피크 2,000 msg/sec\n- 재시도율 5%\n\n이때 발송량보다 더 중요한 것은 provider 제한과 domain throughput이다.  \n특히 Gmail, Outlook 같은 수신 도메인별 처리율을 고려해야 한다.\n\n봐야 할 숫자:\n\n- send rate\n- bounce rate\n- complaint rate\n- queue depth\n- provider error rate\n\n### 3. 아키텍처\n\n```text\nApp Event\n  -> Email Queue\n  -> Template Renderer\n  -> Policy / Suppression Check\n  -> ESP Adapter\n  -> Delivery Tracking\n  -> Bounce / Complaint Processor\n```\n\n### 4. 발송 평판\n\n이메일은 보내기만 하면 끝이 아니다.\n\n- domain warming\n- SPF/DKIM/DMARC\n- complaint suppression\n- bounce suppression\n- list hygiene\n\n평판이 무너지면 같은 메일도 스팸함으로 간다.\n\n### 5. 재시도와 실패 분류\n\n모든 실패를 동일하게 다루면 안 된다.\n\n- transient SMTP error -> retry\n- hard bounce -> suppression\n- soft bounce -> limited retry\n- complaint -> unsubscribe or stop\n\n실패는 분류해야 운영이 가능하다.\n\n### 6. 템플릿과 개인화\n\n메일 내용은 흔히 템플릿으로 생성된다.\n\n- subject template\n- body template\n- locale-specific rendering\n- personalization token\n\n렌더링 실패도 별도 실패로 다뤄야 한다.\n\n### 7. Tracking\n\n메일은 수신 여부와 행동이 중요하다.\n\n- delivered\n- opened\n- clicked\n- bounced\n- complained\n\n다만 open tracking은 privacy와 신뢰성 한계가 있다.\n\n## 실전 시나리오\n\n### 시나리오 1: 주문 확인 메일\n\n문제:\n\n- 즉시 도달해야 한다\n\n해결:\n\n- transactional queue 우선\n- retry는 짧게\n- bounce는 별도 기록\n\n### 시나리오 2: 대량 캠페인 발송\n\n문제:\n\n- 수백만 명에게 보내면 burst가 생긴다\n\n해결:\n\n- domain별 rate limit\n- warm-up 단계\n- throttling\n\n### 시나리오 3: 스팸 신고 증가\n\n문제:\n\n- 특정 캠페인에서 complaint가 늘었다\n\n해결:\n\n- suppression list 반영\n- 세그먼트별 발송 중단\n- 평판 지표 점검\n\n## 코드로 보기\n\n```pseudo\nfunction sendEmail(job):\n  if suppression.exists(job.recipient):\n    return\n  rendered = template.render(job.template, job.variables)\n  result = esp.send(rendered)\n  track(result)\n```\n\n```java\npublic void handle(EmailJob job) {\n    if (suppressionService.isSuppressed(job.recipient())) return;\n    espClient.send(templateService.render(job));\n}\n```\n\n## 트레이드오프\n\n| 선택지 | 장점 | 단점 | 언제 선택하는가 |\n|---|---|---|---|\n| Sync SMTP | 단순하다 | 느리고 불안정하다 | 소규모 |\n| Async queue | 탄력적이다 | 상태 추적이 필요하다 | 대부분의 서비스 |\n| ESP managed | 운영이 쉽다 | vendor lock-in | 빠른 출시 |\n| Self-hosted MTA | 제어가 강하다 | 평판 운영이 어렵다 | 대규모 메일 |\n| Domain throttling | 안정적이다 | 발송 지연 | 대량 캠페인 |\n\n핵심은 이메일이 단순 전송이 아니라 **수신 성공률과 평판을 지속적으로 관리하는 배달 시스템**이라는 점이다.\n\n## 꼬리질문\n\n> Q: bounce와 complaint는 왜 다르게 다뤄야 하나요?\n> 의도: 실패 유형 분류 이해 확인\n> 핵심: bounce는 주소/전달 실패, complaint는 사용자 거부 신호다.\n\n> Q: transactional과 marketing을 왜 분리하나요?\n> 의도: 우선순위와 평판 격리 이해 확인\n> 핵심: 중요한 메일이 캠페인 폭주에 밀리면 안 된다.\n\n> Q: 도메인 warm-up은 왜 필요한가요?\n> 의도: reputation management 이해 확인\n> 핵심: 새 발송 도메인은 바로 대량 발송하면 스팸 의심을 받는다.\n\n> Q: open tracking은 완벽한가요?\n> 의도: observability 한계 이해 확인\n> 핵심: privacy와 차단 때문에 정확하지 않을 수 있다.\n\n## 한 줄 정리\n\nEmail delivery platform은 큐 기반 발송과 bounce/complaint 처리, 도메인 평판 관리를 결합해 고신뢰 메시지 배달을 제공한다.\n\n",
   "aliases": [
     "email delivery platform",
@@ -15,13 +15,17 @@
     "도메인 평판",
     "메일 발송 큐",
     "반송 처리",
-    "수신거부 목록"
+    "수신거부 목록",
+    "뉴스레터 대량 발송 평판",
+    "bounce complaint retry suppression"
   ],
   "expected_queries": [
     "이메일을 바로 SMTP로 쏘지 않고 queue와 ESP를 거쳐 보내는 이유가 뭐야?",
     "bounce나 complaint가 쌓이면 suppression list와 domain reputation을 어떻게 관리해?",
     "대량 메일 발송에서 retry를 무작정 하면 스팸 평판이 나빠질 수 있는 이유가 뭐야?",
-    "email delivery platform에서 warmup과 rate limit은 왜 같이 봐야 해?"
+    "email delivery platform에서 warmup과 rate limit은 왜 같이 봐야 해?",
+    "뉴스레터 대량 발송에서 bounce와 complaint가 늘 때 ESP 평판을 지키려면 queue와 suppression을 어떻게 설계해?",
+    "메일 발송 큐에서 retry와 suppression을 나눠 ESP domain reputation을 보호하는 기준은 뭐야?"
   ],
   "symptoms": [
     "`Email Delivery Platform 설계`를 정의 수준으로만 알고 실제 장애, 지연, 용량, 일관성 trade-off와 연결하지 못한다",

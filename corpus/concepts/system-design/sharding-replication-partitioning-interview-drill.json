@@ -3,7 +3,7 @@
   "title": "Sharding Replication Partitioning Interview Drill",
   "category": "system-design",
   "level": "intermediate",
-  "summary": "이 drill은 sharding, replication, partitioning 차이를 면접 답변으로 정리한다. 데이터 배치, 읽기 확장, 쓰기 확장, shard key skew를 다룬다.",
+  "summary": "이 drill은 sharding, replication, partitioning 차이를 면접 답변으로 정리한다. 샤딩, 복제, 파티셔닝을 read scaling과 write scaling 기준으로 구분하고, 데이터 배치, 읽기 확장, 쓰기 확장, shard key skew를 다룬다.",
   "body_markdown": "# Sharding Replication Partitioning Interview Drill\n\n## 질문\n\n\"Sharding, replication, partitioning의 차이와 shard key 선택 기준을 설명해 주세요.\"\n\n## 30초 답변\n\nReplication은 같은 데이터를 여러 node에 복제해 read availability와 failover를 돕는다. Sharding은 데이터를 shard key 기준으로 나눠 여러 node에 배치해 storage/write scale-out을 노린다. Partitioning은 한 DB 안에서 table/index를 쪼개는 의미로도 쓰이므로 distributed shard와 범위를 구분해야 한다. Shard key는 cardinality, 분포, query pattern, hot tenant, rebalancing 비용을 함께 보고 고른다.\n\n## 관찰 증거\n\n| 증상 | 먼저 의심할 축 | 이유 |\n|---|---|---|\n| primary write CPU와 storage가 한계 | Sharding | 쓰기/저장 공간을 여러 node로 나눌 필요 |\n| read QPS가 높고 write는 버팀 | Replication | read replica로 읽기 확장 가능 |\n| 최신 write 직후 replica read가 오래된 값 | Replication lag | read-after-write consistency 문제 |\n| 한 테이블이 너무 커 partition pruning이 필요 | DB partitioning | 한 DB 내부 관리/쿼리 최적화 문제 |\n| 특정 tenant만 shard p99를 올림 | Shard skew | key 분포와 hot tenant 문제 |\n\n관찰 없이 \"샤딩하면 확장된다\"라고 답하면 부족하다. 병목이 CPU인지, storage인지, read인지, write인지, hot key인지에 따라 선택이 달라진다.\n\n## 차이 정리\n\n| 개념 | 데이터 배치 | 주효과 | 비용 |\n|---|---|---|---|\n| Replication | 같은 데이터의 복사본 | read scale, failover | replica lag, consistency, failover split-brain |\n| Sharding | 서로 다른 데이터 조각 | write/storage scale | cross-shard query, transaction, rebalance |\n| Partitioning | table/index 내부 분할 | pruning, 관리 편의 | partition key 설계, local/global index trade-off |\n\n## consistency trade-off\n\nReplication을 쓰면 read를 replica로 분산할 수 있지만 read-after-write가 깨질 수 있다. 사용자가 방금 수정한 프로필을 즉시 다시 읽어야 한다면 primary read, session stickiness, version check, read-your-writes token 같은 전략이 필요하다. 반대로 상품 목록처럼 약간 stale해도 되는 데이터는 replica read로 비용을 줄일 수 있다.\n\nSharding은 쓰기 확장을 돕지만 global consistency를 어렵게 만든다. Cross-shard transaction은 2PC나 saga 같은 복잡도를 부르고, join/query도 scatter-gather가 될 수 있다. 그래서 aggregate boundary를 잘 잡고, shard key가 주요 query와 함께 움직이도록 설계해야 한다.\n\n## shard key 선택 기준\n\n1. High cardinality: 값 종류가 적으면 shard가 고르게 나뉘지 않는다.\n2. 균등 분포: 일부 tenant/user/order prefix가 hot shard를 만들지 않아야 한다.\n3. Query locality: 자주 함께 읽고 쓰는 데이터를 같은 shard에 둘 수 있어야 한다.\n4. Growth: 시간이 지나도 특정 shard만 커지지 않아야 한다.\n5. Rebalancing: split/move 시 영향 범위와 routing metadata 갱신 비용을 감당할 수 있어야 한다.\n\n`created_at` 같은 시간 기반 key는 최근 shard에 write가 몰릴 수 있다. `tenant_id`는 tenant isolation에 좋지만 대형 tenant 하나가 hot shard가 될 수 있다. `user_id`는 분포가 나을 수 있지만 tenant 단위 query가 scatter될 수 있다. 면접에서는 하나의 정답보다 어떤 query와 병목을 기준으로 고르는지 말해야 한다.\n\n## fallback과 migration\n\n샤딩은 한 번에 바꾸기 어렵기 때문에 dual-write, dual-read verification, backfill, cutover, rollback plan이 필요하다. Routing metadata 장애 시 기본 shard로 몰아넣는 fallback은 데이터 오염을 만들 수 있으므로 fail-fast가 더 안전할 수 있다. Read replica 장애는 primary fallback이 가능하지만, 트래픽을 모두 primary로 돌리면 write path까지 무너질 수 있어 rate limit이 필요하다.\n\n## 약점 태그\n\n- `replication-vs-sharding`: 읽기 복제와 쓰기 분산을 구분하지 못함\n- `partition-scope`: DB partition과 distributed shard 범위를 섞음\n- `skew-blind`: hot tenant/hot key skew를 고려하지 않음\n\n## 복습 연결\n\nkey 선택은 `shard-key-selection-basics`, 재배치는 `shard-rebalancing-partition-relocation-design`로 이어간다.\n",
   "aliases": [
     "sharding replication partitioning drill",
@@ -15,14 +15,16 @@
     "shard key skew",
     "read scaling replication",
     "데이터 배치 면접",
-    "horizontal partitioning"
+    "horizontal partitioning",
+    "read scaling write scaling 구분",
+    "샤딩 복제 파티셔닝 scaling 면접"
   ],
   "expected_queries": [
     "sharding replication partitioning 차이를 면접에서 어떻게 말해?",
     "shard key를 고를 때 어떤 기준을 봐야 해?",
     "복제와 샤딩은 스케일링 효과가 어떻게 달라?",
     "replication은 read scaling에 도움이 되지만 write capacity를 나누는 sharding과 어떻게 달라?",
-    "DB partitioning과 시스템 sharding을 같은 말처럼 쓰면 왜 혼동이 생겨?",
+    "샤딩 복제 파티셔닝을 read scaling write scaling으로 구분하는 면접 답변은?",
     "shard key cardinality와 skew를 면접 답변에서 어떻게 설명해?"
   ],
   "symptoms": [
