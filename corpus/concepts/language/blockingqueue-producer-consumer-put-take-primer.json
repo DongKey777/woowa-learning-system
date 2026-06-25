@@ -1,0 +1,66 @@
+{
+  "id": "language/blockingqueue-producer-consumer-put-take-primer",
+  "title": "BlockingQueue Producer-Consumer Put/Take Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "BlockingQueue는 producer-consumer handoff를 put/take, timed offer/poll, bounded capacity, interruption, shutdown signal까지 포함해 표현하는 thread-safe queue 계약이다.",
+  "body_markdown": "# BlockingQueue Producer-Consumer Put/Take Primer\n\n> 한 줄 요약: `BlockingQueue`는 producer가 `put`으로 넣고 consumer가 `take`로 꺼내는 동시성 queue이며, 비어 있거나 가득 찬 순간을 busy-wait가 아니라 blocking/backpressure 계약으로 표현한다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Java Queue Interface Processing Order Primer](./queue-interface-processing-order-primer.md)\n- [BlockingQueue, TransferQueue, and ConcurrentSkipListSet Semantics](./blockingqueue-transferqueue-concurrentskiplistset-semantics.md)\n- [Java Concurrent Collections vs synchronized wrapper](./concurrent-collections-vs-synchronized-wrapper-intermediate-bridge.md)\n- [Executor Sizing, Queue, and Rejection Policy](./executor-sizing-queue-rejection-policy.md)\n- [Thread Interruption and Cooperative Cancellation Playbook](./thread-interruption-cooperative-cancellation-playbook.md)\n\nretrieval-anchor-keywords: java blockingqueue producer consumer put take, BlockingQueue put take offer poll timeout, bounded blocking queue backpressure, blockingqueue poison pill shutdown, blockingqueue happens-before producer consumer, ArrayBlockingQueue LinkedBlockingQueue SynchronousQueue, 자바 BlockingQueue 생산자 소비자, put take 차이, offer timeout poll timeout, blocking queue backpressure, 큐가 비면 기다리고 꽉 차면 기다림, producer consumer queue beginner\n\n## 왜 이 문서가 필요한가\n\nproducer-consumer 코드는 처음에는 `Queue`와 `while` 루프로 직접 만들고 싶어진다.\n하지만 여러 스레드가 동시에 넣고 꺼내는 순간에는 아래 질문이 생긴다.\n\n- 비어 있을 때 consumer는 계속 돌면서 확인해야 하나?\n- 가득 찼을 때 producer는 실패해야 하나, 기다려야 하나?\n- producer가 넣기 전 한 작업이 consumer에게 보이는가?\n- 종료 신호는 queue 자체가 제공하나?\n\n`BlockingQueue`는 이 질문 중 \"기다림\"과 \"thread-safe handoff\"를 인터페이스 계약으로 올려 준다.\n\n## producer-consumer 기본 모양\n\n```java\nimport java.util.concurrent.BlockingQueue;\nimport java.util.concurrent.LinkedBlockingQueue;\n\nfinal class WorkerExample {\n    private final BlockingQueue<String> queue = new LinkedBlockingQueue<>(100);\n\n    void produce(String job) throws InterruptedException {\n        queue.put(job); // 가득 차면 space가 날 때까지 기다림\n    }\n\n    void consumeLoop() throws InterruptedException {\n        while (true) {\n            String job = queue.take(); // 비어 있으면 element가 올 때까지 기다림\n            handle(job);\n        }\n    }\n\n    private void handle(String job) {\n        System.out.println(job);\n    }\n}\n```\n\n이 예시의 핵심은 `sleep`으로 빈 queue를 다시 확인하지 않는다는 점이다.\nconsumer는 `take()`에서 멈춰 있고, producer가 넣으면 깨어난다.\n\n## 네 가지 실패 처리 방식\n\n`BlockingQueue`는 immediate failure, special value, indefinite block, timed block을 모두 제공한다.\n\n| 상황 | 예외 | special value | 계속 기다림 | 시간 제한 |\n|---|---|---|---|---|\n| 넣기 | `add(e)` | `offer(e)` | `put(e)` | `offer(e, time, unit)` |\n| 꺼내기 | `remove()` | `poll()` | `take()` | `poll(time, unit)` |\n| 보기 | `element()` | `peek()` | 해당 없음 | 해당 없음 |\n\nproducer-consumer에서 가장 먼저 익힐 축은 `put`과 `take`다.\n그다음 운영 요구에 따라 \"절대 무한 대기하면 안 된다\"면 timed `offer`/`poll`로 바꾼다.\n\n## bounded queue는 backpressure 계약이다\n\n`new LinkedBlockingQueue<>(100)`처럼 capacity를 정하면 producer가 무한히 밀어 넣지 못한다.\n가득 차면 `put`은 기다리고, `offer`는 실패를 알려 줄 수 있다.\n\n이 capacity는 단순 성능 옵션이 아니라 시스템 계약이다.\n\n- consumer가 느리면 queue가 차오른다.\n- queue가 차면 producer가 느려지거나 실패한다.\n- 이 지점에서 backpressure, drop, retry, reject 정책을 정한다.\n\n무제한 queue는 당장은 편해 보여도 장애 시 메모리와 latency debt를 키울 수 있다.\n\n## shutdown은 queue가 자동으로 해 주지 않는다\n\n`BlockingQueue` 자체에는 \"이제 더 이상 원소가 안 들어온다\"는 close/shutdown 메서드가 없다.\n그래서 종료는 보통 별도 신호로 설계한다.\n\n대표적인 방식은 poison pill이다.\n\n```java\nstatic final String POISON = \"__STOP__\";\n\nvoid consumer() throws InterruptedException {\n    while (true) {\n        String job = queue.take();\n        if (POISON.equals(job)) {\n            break;\n        }\n        handle(job);\n    }\n}\n```\n\nconsumer가 여러 개라면 각 consumer가 종료 신호를 받을 수 있게 pill 개수나 별도 shutdown protocol을 정해야 한다.\n또 `InterruptedException`을 무시하지 않는 것도 중요하다.\n\n## memory visibility까지 같이 기억하기\n\n`BlockingQueue`는 concurrent collection이다.\nproducer thread가 어떤 객체를 queue에 넣기 전에 한 작업은, 다른 thread가 그 원소를 queue에서 꺼낸 뒤 관측하는 작업과 happens-before 관계를 가진다.\n\n즉 직접 `synchronized`를 여기저기 붙이는 것보다, handoff를 `BlockingQueue`로 명확히 표현하는 편이 더 안전한 기본값이다.\n단, queue에 넣은 뒤 같은 mutable object를 다른 thread가 계속 고치면 별도의 공유 상태 문제가 다시 생긴다.\n\n## 자주 하는 오해\n\n- `Queue`에 `synchronized`만 붙이면 `BlockingQueue`와 같다고 생각한다.\n- `isEmpty()`를 보고 나서 `take()`하면 안전한 check-then-act가 된다고 생각한다.\n- `remainingCapacity()`를 절대 정확한 admission control 값처럼 믿는다.\n- `InterruptedException`을 catch하고 아무것도 하지 않는다.\n- `BlockingQueue`에 close가 있다고 가정한다.\n\n## 빠른 체크리스트\n\n- producer가 너무 빠를 때 기다릴지, 실패할지, 버릴지 정했는가?\n- consumer가 없을 때 producer가 어디까지 쌓을 수 있는가?\n- consumer가 느릴 때 queue length를 metric으로 볼 수 있는가?\n- 종료 신호와 interruption 처리를 설계했는가?\n- 단순 `Queue` 질문인지, 동시성 handoff 질문인지 분리했는가?\n\n## 한 줄 정리\n\nproducer-consumer에서 `BlockingQueue`는 thread-safe 대기열이면서 backpressure 경계이므로, `put/take`로 기본 handoff를 만들고 capacity, timeout, shutdown, interruption 정책을 명시해야 한다.\n",
+  "aliases": [
+    "BlockingQueue producer consumer",
+    "BlockingQueue put take primer",
+    "Java BlockingQueue 생산자 소비자",
+    "put take offer poll timeout",
+    "bounded blocking queue backpressure",
+    "BlockingQueue poison pill shutdown",
+    "BlockingQueue happens-before",
+    "큐가 비면 기다리고 꽉 차면 기다림",
+    "producer consumer queue beginner",
+    "blockingqueue-producer-consumer-put-take-primer"
+  ],
+  "expected_queries": [
+    "BlockingQueue로 producer consumer를 만들 때 put과 take가 각각 언제 기다리는지 설명해줘",
+    "BlockingQueue add offer put offer timeout, remove poll take poll timeout을 표로 비교해줘",
+    "bounded BlockingQueue가 backpressure 계약이라는 말이 무슨 뜻이야?",
+    "BlockingQueue에는 close shutdown이 없는데 poison pill과 interrupt를 어떻게 설계해야 해?",
+    "producer가 put하기 전 작업이 consumer가 take한 뒤 보이는 happens-before 의미를 알려줘",
+    "BlockingQueue에서 producer가 put으로 넣고 consumer가 take로 꺼내면 어느 쪽이 언제 멈춰?"
+  ],
+  "symptoms": [
+    "Queue에 synchronized와 sleep loop를 붙여 producer-consumer를 직접 만들려 하고 put/take blocking 계약을 쓰지 못해",
+    "bounded queue가 가득 찼을 때 기다림, 실패, drop 정책을 정하지 않아 장애 시 latency debt가 커져",
+    "BlockingQueue에 close가 있다고 가정하거나 InterruptedException을 삼켜 consumer shutdown이 꼬여"
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/queue-interface-processing-order-primer",
+      "language/java-memory-model-happens-before-beginner-primer"
+    ],
+    "next_docs": [
+      "language/blockingqueue-transferqueue-concurrentskiplistset-semantics",
+      "language/executor-sizing-queue-rejection-policy",
+      "language/thread-interruption-cooperative-cancellation-playbook"
+    ],
+    "confusable_with": [
+      "language/queue-interface-processing-order-primer",
+      "language/blockingqueue-transferqueue-concurrentskiplistset-semantics",
+      "language/concurrent-collections-vs-synchronized-wrapper-intermediate-bridge",
+      "language/executor-sizing-queue-rejection-policy",
+      "language/wait-notify-condition-spurious-wakeup-lost-signal",
+      "language/java-collections-list-set-map-selection-chooser"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "legacy_path": "knowledge/cs/contents/language/java/blockingqueue-producer-consumer-put-take-primer.md",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-Lang-coll-w13"
+      }
+    ]
+  }
+}
