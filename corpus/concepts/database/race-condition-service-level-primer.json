@@ -3,7 +3,7 @@
   "title": "Service-Level Race Condition 입문서",
   "category": "database",
   "level": "intermediate",
-  "summary": "Service 계층의 \"조회 후 없으면 INSERT\" 흐름은 두 요청 사이의 시간 갭에서 같은 데이터를 동시에 통과시키므로, DB 제약이나 락 같은 별도 중재 장치가 필요하다.",
+  "summary": "Service 계층의 \"조회 후 없으면 INSERT\" 흐름은 두 요청 사이의 시간 갭에서 같은 데이터를 동시에 통과시키므로, DB 제약이나 락 같은 별도 중재 장치가 필요하다. 대기 등록처럼 reservation row를 공유 mutex로 빌려 동시 대기 등록 race를 직렬화하는 경우도 같은 관점으로 본다.",
   "body_markdown": "# Service-Level Race Condition 입문서\n\n> 한 줄 요약: Service 계층의 \"조회 후 없으면 INSERT\" 흐름은 두 요청 사이의 시간 갭에서 같은 데이터를 동시에 통과시키므로, DB 제약이나 락 같은 별도 중재 장치가 필요하다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n- [constraint-first-booking-primer](constraint-first-booking-primer.md) — race condition을 막는 첫 갈래\n- [transaction-isolation-basics](transaction-isolation-basics.md) — 격리 수준이 어디까지 막아주는지\n- [phantom-safe-booking-patterns-primer](phantom-safe-booking-patterns-primer.md) — phantom-safe 예약 패턴\n\nretrieval-anchor-keywords: Service 사전 조회 race, check-then-act, TOCTOU, UNIQUE constraint vs 비관 락\n\n## 처음 보는 3개 질문\n\n- **Q1**. `if (repository.existsBy(...)) throw new DuplicateException(); else repository.save(...)` 가 왜 안전하지 않은가?\n- **Q2**. `@Transactional`을 붙이면 동시 요청이 직렬화되지 않나?\n- **Q3**. 격리 수준을 SERIALIZABLE로 올리면 사전 조회 race를 막을 수 있나?\n\n## 멘탈 모델 — \"사전 조회\" 와 \"쓰기\" 사이의 시간 갭\n\n```\nT1: SELECT count(*) FROM reservation WHERE date=X AND time=Y  → 0\nT2: SELECT count(*) FROM reservation WHERE date=X AND time=Y  → 0\nT1: INSERT INTO reservation (date, time, ...) VALUES (X, Y, ...)\nT2: INSERT INTO reservation (date, time, ...) VALUES (X, Y, ...)  ← 둘 다 통과\n```\n\nT1과 T2 사이의 시간 갭이 곧 race window. 사전 조회는 \"그 순간의 스냅샷\" 만 보여주므로 그 사이에 다른 트랜잭션이 같은 결정을 내릴 수 있다. 이걸 **TOCTOU** (Time-of-Check to Time-of-Use) 라고 부른다.\n\n## 흔한 오해 정리\n\n| 오해 | 실제 |\n|---|---|\n| `@Transactional` 이 동시 요청을 직렬화한다 | 트랜잭션 경계만 만든다. 다른 트랜잭션이 같은 SELECT를 동시에 실행할 수 있다 |\n| READ_COMMITTED 격리 수준이 사전 조회를 보호한다 | 다른 트랜잭션의 commit된 row만 보지 못하게 할 뿐, 사전 조회와 INSERT 사이에 다른 트랜잭션 INSERT가 끼어드는 걸 막지 않는다 |\n| REPEATABLE_READ 면 안전하다 | 같은 row 반복 조회를 보호하지만, 새 row INSERT (phantom) 는 별도 메커니즘이 필요하다 |\n| SERIALIZABLE 로 올리면 모든 race 사라진다 | 맞지만 모든 트랜잭션을 직렬화하는 비용이 매우 크다 — production에서 거의 안 씀 |\n\n## 무엇이 실제로 막아주나\n\n1. **UNIQUE constraint** (가장 단순) — DB가 같은 키 두 번 INSERT를 reject. application 코드 race window 무관. → `constraint-first-booking-primer.md`\n2. **비관 락** (`SELECT ... FOR UPDATE`) — 사전 조회 시 row 잠금. 첫 트랜잭션이 commit/rollback 전까지 두 번째 트랜잭션 대기. 단 빈 row에는 락이 안 걸려 phantom INSERT가 따로 들어오면 못 막음.\n3. **낙관 락** — version 컬럼으로 commit 시점에 충돌 감지. 충돌 시 retry. UPDATE 흐름에는 효율적이지만 INSERT race에는 적용 어려움.\n4. **분산 락 / 외부 mutex** — Redis 또는 DB advisory lock. application 레벨에서 mutex처럼 동작. 추가 인프라.\n\n## 학습자 실제 코드와 매핑 (spring-roomescape 미션)\n\n```java\n@Service\npublic class ReservationService {\n    @Transactional\n    public Reservation create(LocalDate date, Long timeId, Long themeId) {\n        if (reservationRepository.existsByDateAndTimeAndTheme(date, timeId, themeId)) {\n            throw new DuplicateReservationException();\n        }\n        return reservationRepository.save(new Reservation(date, timeId, themeId));\n    }\n}\n```\n\n이 코드의 race window: `existsBy` 와 `save` 사이. 동시 요청 둘이 같이 `existsBy=false` 를 본 후 둘 다 `save` 한다.\n\n**가장 단순한 해결**: schema.sql 에 UNIQUE constraint 추가.\n\n```sql\nALTER TABLE reservation ADD CONSTRAINT uk_reservation_slot\n  UNIQUE (date, time_id, theme_id);\n```\n\n이제 두 번째 INSERT 는 DB가 거절. application 코드는 `DataIntegrityViolationException` 을 catch 해서 `DuplicateReservationException` 으로 변환.\n\n## 해결 선택 순서\n\n먼저 invariant를 한 문장으로 고정한다. \"같은 날짜, 시간, 테마에는 예약이 하나만 존재한다\"처럼 데이터 자체의 규칙이면 application 사전 조회보다 DB constraint가 우선이다. 이 방식은 두 요청이 동시에 들어와도 commit 시점에 저장소가 한쪽을 거절하므로 service 코드의 race window에 덜 의존한다.\n\n다음으로 빈 row 문제를 확인한다. `SELECT ... FOR UPDATE`는 이미 존재하는 row를 잠글 때 강하지만, 아직 없는 예약 slot을 조회하면 잠글 row가 없다. 이 경우 slot row나 guard row를 미리 두고 그 row를 잠그거나, unique constraint로 insert 충돌을 받아내는 쪽이 더 직접적이다. 그래서 \"락을 걸면 된다\"가 아니라 \"무엇을 잠그는가\"를 먼저 말해야 한다.\n\n마지막으로 실패를 사용자 계약으로 바꾼다. DB가 duplicate key를 거절하면 그대로 500으로 노출하지 않고, application 예외로 번역해 `409 Conflict`나 도메인 중복 오류로 응답한다. 재시도 가능한 충돌인지, 사용자가 입력을 바꿔야 하는 충돌인지도 분리한다.\n\n## 테스트에서 재현하기\n\nRace condition은 단일 스레드 테스트로 잘 보이지 않는다. 같은 slot을 향해 두 요청을 동시에 보내고, 둘 중 하나만 성공하는지를 본다. 테스트는 \"사전 조회가 true를 반환하는가\"보다 최종 DB row 개수와 응답 의미를 확인해야 한다.\n\n좋은 회귀 테스트는 성공한 요청 수, 실패한 요청의 예외/상태 코드, 최종 row 수를 함께 본다. unique constraint를 넣었다면 두 번째 요청이 어떤 SQL 예외로 실패하는지보다, service 경계에서 중복 예약 오류로 번역되는지가 더 중요하다.\n\n## 한 줄 정리\n\nService 계층의 \"조회 후 INSERT\" 는 트랜잭션이나 격리 수준만으로 race 를 막지 못한다. DB 제약(UNIQUE) 이나 명시적 락이 필요하며, 가장 단순한 정답은 UNIQUE constraint 다.\n\n## 서비스 레벨에서 막는 법\n\nRace condition은 DB isolation만의 문제가 아니다. 같은 쿠폰을 두 요청이 동시에 사용하거나, 같은 예약 좌석을 두 사용자가 동시에 확정하는 흐름에서는 서비스 메서드의 읽기-검증-쓰기 사이가 위험 구간이 된다. 해결책은 도메인마다 다르다. unique constraint로 중복 생성을 막을 수 있고, version column으로 lost update를 감지할 수 있으며, `SELECT FOR UPDATE`나 분산락으로 임계 구역을 직렬화할 수도 있다. 중요한 것은 실패했을 때 재시도할 수 있는지, 사용자에게 어떤 응답을 줄지까지 포함하는 것이다.\n\n## 답변 마무리\n\n\"동시 요청에서 읽기-검증-쓰기 사이가 벌어지면 서비스 레벨 race가 생깁니다. DB 제약, version check, row lock, 재시도 정책 중 도메인 부작용에 맞는 방어를 고르고 실패 응답까지 설계하겠습니다.\"\n",
   "aliases": [
     "사전 조회 후 insert",
@@ -15,14 +15,17 @@
     "트랜잭션으로 안 막히는 중복",
     "UNIQUE 제약 우선",
     "exists 후 save 동시성",
-    "서비스 동시성 검증 실패"
+    "서비스 동시성 검증 실패",
+    "reservation row를 공유 mutex로 빌리는 락",
+    "동시 대기 등록 race 직렬화"
   ],
   "expected_queries": [
     "Service에서 exists로 확인하고 save하면 동시 요청에 안전해?",
     "두 요청이 동시에 들어와 같은 예약이 중복 저장되는 이유가 뭐야?",
     "@Transactional을 붙였는데도 중복 insert가 생기는 이유는?",
     "격리 수준을 올리는 것과 UNIQUE 제약 중 무엇을 먼저 봐야 해?",
-    "빈 row를 조회하고 FOR UPDATE를 걸면 phantom insert도 막을 수 있어?"
+    "빈 row를 조회하고 FOR UPDATE를 걸면 phantom insert도 막을 수 있어?",
+    "reservation row를 잠가 동시 대기 등록 race를 직렬화하는 이유는?"
   ],
   "symptoms": [
     "Service에서 존재 여부 조회 후 없으면 insert 하는데 동시 요청 두 개가 같이 통과해서 중복 row가 생긴다",
@@ -51,12 +54,17 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-24",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-25",
     "legacy_path": "knowledge/cs/contents/database/race-condition-service-level-primer.md",
     "revision_history": [
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch146"
+      },
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-w127-core-fixture-recall",
+        "note": "added reservation-row mutex race surfaces"
       }
     ]
   }
