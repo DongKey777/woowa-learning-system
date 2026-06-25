@@ -1,0 +1,61 @@
+{
+  "id": "database/async-vs-semisync-replication-boundaries",
+  "title": "Async vs Semisynchronous Replication Boundaries",
+  "category": "database",
+  "level": "advanced",
+  "summary": "Asynchronous replication은 source commit 이후 replica 전파 지연과 손실 window를 남기고, semisynchronous replication은 적어도 일부 replica의 receipt/logging ack를 기다리지만 replica apply 완료나 split-brain 방지를 보장하지 않는다.",
+  "body_markdown": "# Async vs Semisynchronous Replication Boundaries\n\n> 한 줄 요약: async replication은 빠른 대신 lag/loss window를 남기고, semi-sync는 ack 대상을 늘려 data-loss 가능성을 줄이지만 replica에서 실행 완료됐다는 뜻은 아니다.\n\nretrieval-anchor-keywords: asynchronous replication, semisynchronous replication, semi sync, MySQL semi synchronous replication, PostgreSQL synchronous replication, replica ack, relay log, WAL, replication lag, data loss window, failover commit horizon, async replication loss, semi-sync timeout\n\n## Async replication의 경계\n\nAsynchronous replication에서는 source가 local commit을 끝낸 뒤 replica가 나중에 log를 받아 적용한다. MySQL 공식 문서는 기본 replication이 asynchronous이며, source는 replica가 transaction을 retrieve/process했는지 알지 못하고 source crash 시 committed transaction이 어떤 replica에도 전달되지 않았을 수 있다고 설명한다. PostgreSQL 문서도 log shipping은 transaction commit 뒤 WAL record가 보내지는 asynchronous 방식이라 catastrophic failure 시 아직 shipped되지 않은 transaction loss window가 있다고 설명한다.\n\n따라서 async를 쓰면 아래가 설계 항목이 된다.\n\n- replica lag p95/p99와 stale read budget\n- failover 시 promoted replica의 commit horizon\n- read-after-write가 필요한 endpoint의 primary routing 또는 token routing\n- old primary fencing과 split-brain 방지\n\n## Semi-sync는 무엇을 줄이나\n\nMySQL semisynchronous replication은 source가 transaction commit path에서 적어도 설정된 수의 replica가 event를 received/logged 했다는 ack를 기다리는 방식이다. 이때 source는 모든 replica를 기다리지 않고, replica가 event를 fully executed/committed 했다는 ack도 기다리지 않는다.\n\n즉 semi-sync가 줄이는 것은 \"source crash 직전에 commit 성공을 돌려줬는데 아무 replica도 그 event를 못 받은\" 위험이다. 하지만 다음을 자동 보장하지 않는다.\n\n- promoted replica가 그 transaction을 이미 apply했는가\n- ack한 replica가 실제 promotion 대상인가\n- timeout 후 async fallback 동안 어떤 transaction이 생겼는가\n- old source가 다시 write를 받아 split-brain을 만들지 않는가\n- read replica가 즉시 read-your-writes를 만족하는가\n\nMySQL 문서는 timeout이 발생하면 source가 asynchronous replication으로 되돌아갈 수 있다고 설명한다. 그래서 semi-sync 상태 지표와 fallback 구간을 운영 로그에 남겨야 한다.\n\n## PostgreSQL synchronous replication과 비교할 때\n\nPostgreSQL은 `synchronous_standby_names`와 `synchronous_commit`으로 commit이 standby confirmation을 기다리게 만들 수 있다. `remote_write`는 standby가 commit record를 receive/write한 지점, `remote_apply`는 standby가 replay해서 query에 visible한 지점까지 기다리는 옵션이다. 용어가 MySQL semi-sync와 완전히 같지는 않으므로, 엔진별로 \"무엇을 기다렸는가\"를 정확히 말해야 한다.\n\n## Failover 답변 체크리스트\n\n| 질문 | async | semi-sync |\n|---|---|---|\n| commit latency | 낮다 | replica ack round trip만큼 증가 |\n| data loss window | replica 전파 지연만큼 존재 | ack 받은 transaction은 적어도 일부 replica에 logged 됐을 가능성이 높다 |\n| replica apply 완료 | 보장 안 함 | 보장 안 함 |\n| timeout/fallback | 일반 lag 관리 | semi-sync가 async로 fallback될 수 있어 상태 확인 필요 |\n| split-brain 방지 | 별도 fencing 필요 | 여전히 별도 fencing 필요 |\n\n## 면접 한 문장\n\n\"Semi-sync는 async보다 durability confidence를 높이지만, replica apply 완료나 failover 안전성을 자동으로 주지는 않습니다. 그래서 promotion은 ack 여부가 아니라 executed position, relay/apply backlog, errant transaction, old source fencing을 같이 봐야 합니다.\"\n\n## 근거와 읽을거리\n\n- MySQL 8.4 Reference Manual, Semisynchronous Replication: https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html\n- PostgreSQL 18 Documentation, Log-Shipping Standby Servers / Synchronous Replication: https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION\n- 기존 로컬 ref: `database/mysql-gtid-binlog-replication-failover-chooser`, `database/replica-lag-read-after-write-strategies`\n\n## 한 줄 정리\n\nAsync와 semi-sync의 차이는 \"복제가 됐나\"가 아니라 commit이 client에게 성공으로 돌아가기 전에 어떤 replica progress 지점까지 기다렸는가다.\n",
+  "aliases": [
+    "async replication vs semi-sync",
+    "semisynchronous replication",
+    "MySQL semi sync boundary",
+    "replica ack relay log",
+    "replication data loss window",
+    "비동기 복제 반동기 복제",
+    "semi sync가 보장하는 것",
+    "replica apply 완료 아님",
+    "synchronous_commit remote_write remote_apply",
+    "failover commit horizon"
+  ],
+  "expected_queries": [
+    "async replication과 semi-sync replication은 failover data loss 측면에서 뭐가 달라?",
+    "MySQL semi-sync ack는 replica가 실행 완료했다는 뜻이 아닌 이유가 뭐야?",
+    "semi-sync를 켜도 old source fencing과 Executed_Gtid_Set 확인이 필요한 이유를 설명해줘",
+    "PostgreSQL synchronous_commit remote_write remote_apply와 MySQL semi-sync를 어떻게 비교해야 해?",
+    "replica lag와 semi-sync timeout fallback을 운영에서 어떤 지표로 봐야 해?"
+  ],
+  "symptoms": [
+    "semi-sync를 켜면 replica read가 즉시 최신이고 failover도 자동 안전하다고 오해한다",
+    "async replication의 lag와 failover loss window를 read-after-write 문제와 연결하지 못한다",
+    "ack, relay log 기록, apply 완료, client-visible replay를 같은 단계로 섞어 설명한다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/mvcc-replication-sharding",
+      "database/replica-lag-read-after-write-strategies"
+    ],
+    "next_docs": [
+      "database/mysql-gtid-binlog-replication-failover-chooser",
+      "database/commit-horizon-after-failover-verification",
+      "database/failover-split-brain-fencing-playbook"
+    ],
+    "confusable_with": [
+      "database/replication-failover-split-brain",
+      "database/primary-switch-write-fencing",
+      "database/read-your-writes-session-pinning"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-DB-gap-w20"
+      }
+    ]
+  }
+}

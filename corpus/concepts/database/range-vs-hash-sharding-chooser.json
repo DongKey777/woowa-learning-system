@@ -1,0 +1,61 @@
+{
+  "id": "database/range-vs-hash-sharding-chooser",
+  "title": "Range vs Hash Sharding Chooser",
+  "category": "database",
+  "level": "intermediate",
+  "summary": "Range sharding은 순서와 범위 조회 locality를 얻는 대신 hot range 위험이 있고, hash sharding은 분산을 얻는 대신 range query와 재샤딩 비용을 만든다.",
+  "body_markdown": "# Range vs Hash Sharding Chooser\n\n> 한 줄 요약: range는 읽기 locality와 retention에 강하고 hash는 균등 분산에 강하지만, 둘 다 shard key와 access pattern이 맞지 않으면 hot shard나 scatter-gather를 만든다.\n\nretrieval-anchor-keywords: range sharding, hash sharding, range partitioning, hash partitioning, shard key, hot shard, hot range, scatter gather, resharding, time bucket hotspot, tenant shard, user id hash shard, 범위 샤딩, 해시 샤딩\n\n## partitioning과 sharding을 먼저 분리한다\n\nPostgreSQL 문서는 table partitioning을 하나의 큰 논리 table을 더 작은 물리 조각으로 나누는 기능으로 설명하고, built-in 방식으로 range, list, hash partitioning을 제공한다. 이것은 한 PostgreSQL cluster 안의 table partitioning 설명이다. Sharding은 보통 여러 database node에 데이터를 나누고 application/router가 shard를 고르는 더 큰 운영 문제다.\n\n그래도 key 선택의 trade-off는 비슷하다.\n\n- range 방식: key 값의 구간으로 나눈다.\n- hash 방식: partition/shard key의 hash 결과를 modulus/remainder나 placement rule로 나눈다.\n\n## Range sharding이 맞는 신호\n\nRange는 정렬된 key의 연속 구간이 의미 있을 때 유리하다.\n\n| 좋은 신호 | 이유 |\n|---|---|\n| 날짜별 보관, 삭제, archive가 중요하다 | 오래된 range를 detach/drop하거나 별도 저장소로 옮기기 쉽다 |\n| 대부분의 query가 `created_at between ...` 같은 range다 | 한두 shard/partition만 읽는 pruning이 가능하다 |\n| business object ID range가 운영 단위와 맞는다 | 장애 범위와 backfill 범위를 사람이 설명하기 쉽다 |\n\n위험은 최신 구간이나 특정 ID 구간이 계속 뜨거워지는 것이다. 이벤트 로그를 `created_at` range만으로 shard routing하면 모든 write가 newest shard로 몰릴 수 있다.\n\n## Hash sharding이 맞는 신호\n\nHash는 key가 충분히 다양하고 point lookup이 많을 때 부하를 펴기 쉽다.\n\n| 좋은 신호 | 이유 |\n|---|---|\n| `user_id`, `order_id` point lookup이 대부분이다 | hash(key)로 단일 shard를 바로 찾을 수 있다 |\n| 최신 시간대에 write가 몰리지만 owner key는 넓게 퍼진다 | time hotspot을 여러 shard에 분산한다 |\n| 특정 range ordering보다 균등 write spread가 더 중요하다 | hot range를 줄인다 |\n\n단점은 range query와 운영 reasoning이다. `last 7 days`나 `tenant 전체 정산`이 shard key와 맞지 않으면 모든 shard를 읽는 scatter-gather가 된다. shard 수를 바꾸면 단순 `hash % N`은 대부분의 key 위치가 바뀌므로 consistent hashing, virtual bucket, directory table, dual write/backfill 같은 migration 장치가 필요하다.\n\n## 빠른 선택표\n\n| 질문 | range 쪽 답 | hash 쪽 답 |\n|---|---|---|\n| 가장 중요한 query가 range scan인가 point lookup인가 | range scan | point lookup |\n| retention/delete 단위가 key range인가 | 예 | 아니오 또는 별도 lifecycle |\n| write가 최신 구간 하나로 몰리는가 | 위험 신호 | 완화 후보 |\n| cross-shard aggregate를 자주 하는가 | key range와 맞으면 유리 | scatter-gather 가능성 높음 |\n| 재샤딩을 어떻게 할 것인가 | range split/move | bucket remap/consistent hash/directory 필요 |\n\n## hybrid가 흔한 이유\n\n실무에서는 하나만 쓰지 않는 경우가 많다. 예를 들어 `hash(user_id)`로 shard를 고르고, 각 shard 안에서는 `created_at` range partition을 둔다. 이렇게 하면 write spread와 retention/pruning을 분리할 수 있다. 반대로 tenant SaaS에서는 `tenant_id` range/directory로 큰 tenant를 전용 shard로 승격하고, 작은 tenant는 hash bucket에 모을 수 있다.\n\n## 근거와 읽을거리\n\n- PostgreSQL 18 Documentation, Table Partitioning: https://www.postgresql.org/docs/current/ddl-partitioning.html\n- 기존 로컬 ref: `database/mvcc-replication-sharding`, `system-design/shard-key-selection-basics`, `database/multi-tenant-tenant-id-index-topology`\n\n## 한 줄 정리\n\nRange vs hash의 선택은 \"어느 알고리즘이 더 좋은가\"가 아니라, range locality와 retention을 살릴지, 균등 분산과 point lookup을 살릴지의 access-pattern 결정이다.\n",
+  "aliases": [
+    "range sharding vs hash sharding",
+    "range partitioning hash partitioning",
+    "shard key range hash",
+    "hot range hot shard",
+    "scatter gather sharding",
+    "범위 샤딩 해시 샤딩",
+    "샤딩 range hash 차이",
+    "time bucket hotspot",
+    "hash shard resharding",
+    "range shard retention"
+  ],
+  "expected_queries": [
+    "range sharding과 hash sharding은 어떤 access pattern에서 각각 유리해?",
+    "created_at 기준 range shard가 최신 구간 hotspot을 만드는 이유가 뭐야?",
+    "hash sharding은 균등 분산은 좋지만 range query에서 왜 scatter gather가 돼?",
+    "PostgreSQL range/hash partitioning과 여러 DB shard 설계를 어떻게 구분해야 해?",
+    "hash(user_id) shard 안에 created_at range partition을 같이 두는 hybrid가 왜 흔해?"
+  ],
+  "symptoms": [
+    "range partitioning과 sharding을 같은 말로 섞고 node routing 비용을 놓친다",
+    "hash sharding을 쓰면 모든 query가 빨라진다고 보고 range query scatter-gather를 놓친다",
+    "time range key가 retention에는 좋지만 최신 write hotspot을 만들 수 있다는 점을 놓친다"
+  ],
+  "relations": {
+    "prerequisites": [
+      "database/mvcc-replication-sharding",
+      "database/partition-pruning-hot-cold-data"
+    ],
+    "next_docs": [
+      "database/multi-tenant-tenant-id-index-topology",
+      "database/tenant-split-out-routing-cutover",
+      "system-design/shard-rebalancing-partition-relocation-design"
+    ],
+    "confusable_with": [
+      "database/partition-pruning-hot-cold-data",
+      "system-design/shard-key-selection-basics",
+      "system-design/consistent-hashing-hot-key-strategies"
+    ],
+    "forbidden_for_queries": []
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-DB-gap-w20"
+      }
+    ]
+  }
+}
