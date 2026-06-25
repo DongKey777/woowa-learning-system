@@ -1,0 +1,61 @@
+{
+  "id": "language/hotspot-tiered-compilation-c1-c2-primer",
+  "title": "HotSpot Tiered Compilation C1/C2 Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "HotSpot tiered compilation은 interpreter로 빠르게 시작하고, profiling을 모으면서 빠른 컴파일 단계와 더 최적화가 강한 단계 사이를 오가며 startup과 peak throughput의 균형을 잡는 구현 전략이다. C1은 빠른 컴파일과 profiling, C2는 더 비싼 최적화와 peak performance 쪽으로 이해하면 된다. C1/C2는 JVMS 계약이 아니라 HotSpot 구현 세부이므로 JIT warmup, code cache, deoptimization 관측과 함께 말해야 한다.",
+  "body_markdown": "# HotSpot Tiered Compilation C1/C2 Primer\n\n> 한 줄 요약: HotSpot tiered compilation은 interpreter, 빠른 profiling-oriented compilation, 더 비싼 optimizing compilation을 조합해 startup latency와 long-running throughput 사이 균형을 잡는 구현 전략이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [Interpreter to JIT Hot Code Compilation Beginner Bridge](./interpreter-to-jit-hot-code-compilation-beginner-bridge.md)\n- [JIT Warmup and Deoptimization](./jit-warmup-deoptimization.md)\n- [Code Cache and JIT Profiling](./code-cache-jit-profiling.md)\n- [OSR On-Stack Replacement Loop Backedge Compilation](./osr-on-stack-replacement-loop-backedge-compilation.md)\n- [JVM deploy warmup cold start - class loading, cache, tiered JIT](./jvm-deploy-warmup-cold-start-tiered-jit.md)\n\nretrieval-anchor-keywords: HotSpot tiered compilation, C1 compiler, C2 compiler, client compiler server compiler, interpreter profiling, tiered JIT, warmup latency, compiler queue, PrintCompilation tier levels, code cache, C1 C2 차이, JVM tiered compilation C1 C2\n\n## 왜 tiered compilation이 필요한가\n\nJIT는 양쪽 비용이 있다.\n\n- 너무 늦게 컴파일하면 초반 요청이 interpreter로 오래 돈다.\n- 너무 빨리 최고 수준 최적화를 하면 compile CPU와 startup 비용이 커진다.\n- profile이 적을 때 공격적으로 최적화하면 나중에 deoptimization이 늘 수 있다.\n\nTiered compilation은 이 균형을 맞추려는 HotSpot 구현 전략이다. 처음에는 interpreter로 빠르게 시작하고, 실행 정보를 모으면서 낮은 비용의 compiled code를 만들고, 충분히 hot하고 profile이 안정된 code에는 더 비싼 최적화를 적용할 수 있다.\n\n## C1과 C2를 어떻게 말할까\n\n면접 답변에서는 이렇게 단순화하면 안전하다.\n\n| 이름 | 역할 감각 | 주의 |\n|---|---|---|\n| interpreter | bytecode를 바로 실행하고 profile을 모으기 시작 | 시작은 빠르지만 반복 실행은 느릴 수 있다 |\n| C1, client compiler | 비교적 빠르게 compiled code를 만들고 profiling을 계속 돕는 단계 | peak 최적화보다 startup/warmup 균형 쪽으로 본다 |\n| C2, server compiler | 더 공격적인 최적화로 hot path throughput을 노리는 단계 | compile 비용, code cache, deopt 가정이 따라온다 |\n\nC1/C2라는 이름은 JVMS가 요구하는 표준 API가 아니라 HotSpot 구현 세부다. 다른 JVM은 다른 compiler pipeline을 가질 수 있고, 같은 HotSpot도 버전과 option에 따라 tier 전이가 달라질 수 있다.\n\n## \"무조건 C1 다음 C2\"로 외우면 안 된다\n\n현실의 전이는 workload와 JVM option의 영향을 받는다.\n\n- method invocation count와 loop backedge count\n- compiler queue와 CPU 여유\n- method size와 inlining 가능성\n- type profile 안정성\n- code cache 압박\n- OSR 대상인 긴 loop인지 여부\n- `-XX:-TieredCompilation` 같은 option\n\n그래서 learner 답변은 특정 threshold 숫자를 외우기보다, \"hotness와 profile evidence에 따라 더 비싼 compilation tier가 선택될 수 있다\"라고 말하는 편이 정확하다.\n\n## 운영에서 어떤 증거를 보나\n\n| 증거 | 해석 |\n|---|---|\n| JFR `Compilation` event | 어떤 method가 언제 compile됐는지 본다 |\n| `PrintCompilation` | 재현 환경에서 tier 전이와 nmethod 상태를 본다 |\n| `jcmd <pid> Compiler.codecache` | compiled code 저장 공간과 압박을 본다 |\n| request ordinal / instance age latency | 첫 N개 요청과 steady-state를 분리한다 |\n| deoptimization event | compiler가 세운 profile 가정이 깨졌는지 본다 |\n\n배포 직후 p99가 높을 때 `tiered JIT 때문입니다`로 끝내면 부족하다. class loading, connection first acquire, cache miss, GC도 함께 cold path에 섞인다. tiered compilation은 JFR compilation event와 request timeline이 겹칠 때 근거가 된다.\n\n## JMH와 연결하기\n\nMicrobenchmark는 tiered compilation 때문에 특히 흔들린다. warmup이 부족하면 interpreter/C1/C2 전환 중간을 측정하고, 입력 분포가 production과 다르면 C2가 세운 type/branch profile 가정도 달라진다. 그래서 JMH는 warmup, fork, blackhole뿐 아니라 production-like input shape까지 같이 봐야 한다.\n\n## Spec and implementation references\n\n- JVMS Java SE 26 §2.13 Public Design, Private Implementation: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html#jvms-2.13`\n- Oracle Java HotSpot VM Performance Enhancements - Tiered Compilation: `https://docs.oracle.com/javase/8/docs/technotes/guides/vm/performance-enhancements-7.html#tieredcompilation`\n\n## 한 줄 정리\n\nC1/C2 tiered compilation은 Java 언어 스펙 지식이 아니라 HotSpot runtime 관측 지식이므로, startup, warmup, profile, code cache, deoptimization까지 한 흐름으로 설명해야 한다.\n",
+  "aliases": [
+    "HotSpot tiered compilation C1 C2",
+    "C1 compiler C2 compiler",
+    "client compiler server compiler",
+    "tiered JIT C1 C2",
+    "PrintCompilation tier level",
+    "C1 C2 warmup",
+    "C1 C2 차이",
+    "JIT 웜업 단계",
+    "HotSpot 단계별 컴파일",
+    "HotSpot client server compiler",
+    "tiered compilation warmup latency"
+  ],
+  "expected_queries": [
+    "HotSpot tiered compilation에서 C1 C2가 각각 무슨 역할이고 interpreter랑 어떻게 이어져?",
+    "C1은 빠른 profiling 컴파일이고 C2는 더 공격적인 최적화라는 말을 JVM warmup 관점으로 설명해줘",
+    "Java 서버 첫 요청이 느린 현상을 tiered JIT C1 C2 code cache JFR로 어떻게 관측해?",
+    "C1 다음에 항상 C2로 간다고 외우면 왜 위험한지 HotSpot tiered compilation 기준으로 알려줘",
+    "JMH warmup에서 interpreter C1 C2 전환을 왜 조심해야 하는지 설명해줘"
+  ],
+  "symptoms": [
+    "C1/C2를 Java 표준 스펙처럼 설명하고 HotSpot 구현 세부라는 점을 놓친다.",
+    "서버 warmup을 막연히 JIT 때문이라고만 말하고 JFR compilation, code cache, request ordinal 증거를 제시하지 못한다.",
+    "tiered compilation을 고정 단계 암기로 외워 compiler queue, profile 안정성, OSR, code cache 영향을 고려하지 않는다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/interpreter-to-jit-hot-code-compilation-beginner-bridge"
+    ],
+    "next_docs": [
+      "language/jit-warmup-deoptimization",
+      "language/code-cache-jit-profiling",
+      "language/osr-on-stack-replacement-loop-backedge-compilation",
+      "language/jmh-benchmarking-pitfalls"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": [
+      "bytecode verification verify prepare resolve를 설명해줘",
+      "G1과 ZGC collector를 비교해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-Lang-JVM"
+      }
+    ]
+  }
+}

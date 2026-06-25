@@ -1,0 +1,61 @@
+{
+  "id": "language/gc-mark-sweep-vs-mark-compact-fragmentation-primer",
+  "title": "GC Mark-Sweep vs Mark-Compact Fragmentation Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "mark-sweep와 mark-compact는 tracing GC를 설명할 때 쓰는 기본 mental model이다. 둘 다 root에서 reachable object를 표시하는 mark 단계로 시작하지만, sweep은 unreachable slot을 free list로 되돌리는 데 가까워 fragmentation을 남길 수 있고, compact는 살아 있는 객체를 모아 빈 공간을 연속화하면서 참조 갱신과 이동 비용을 지불한다. 실제 HotSpot collector는 더 복잡하므로 이 둘을 collector 이름과 1:1로 매핑하면 안 된다.",
+  "body_markdown": "# GC Mark-Sweep vs Mark-Compact Fragmentation Primer\n\n> 한 줄 요약: mark-sweep는 unreachable object를 지워 free space를 만들지만 fragmentation을 남길 수 있고, mark-compact는 live object를 모아 연속 공간을 되찾는 대신 object 이동과 reference update 비용을 낸다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [JVM 메모리 영역과 GC 기초](./jvm-memory-area-gc-basics.md)\n- [GC Generational Interview Primer](./gc-generational-interview-primer.md)\n- [GC Allocation Rate Symptom Router](./gc-allocation-rate-symptom-router.md)\n- [G1 GC vs ZGC](./g1-vs-zgc.md)\n- [Heap Dump Retained Size Primer](./heap-dump-retained-size-primer.md)\n\nretrieval-anchor-keywords: mark-sweep, mark compact, mark-compact, sweep fragmentation, heap fragmentation, compaction pause, live object movement, reference update, GC algorithm mental model, JVM heap automatic storage management, GC roots reachability\n\n## 먼저 보는 공통점: mark\n\n둘 다 출발점은 reachability다.\n\n```text\nGC roots\n  -> reachable object graph를 따라가며 live 표시\n  -> 표시되지 않은 객체는 unreachable\n```\n\n즉 mark 단계는 \"필요해 보이는가\"가 아니라 \"root에서 닿는가\"를 본다. static collection, ThreadLocal, stack local variable, JNI reference가 잡고 있으면 business상 더 이상 필요 없어도 live로 표시될 수 있다.\n\n## mark-sweep: 지우지만 빈칸이 흩어진다\n\nMark-sweep mental model은 단순하다.\n\n1. root에서 닿는 객체를 mark한다.\n2. heap을 훑으면서 mark되지 않은 객체 영역을 free로 돌린다.\n3. 살아 있는 객체는 대체로 제자리에 둔다.\n\n장점은 live object를 이동하지 않는 단순성이다. 하지만 단점은 fragmentation이다.\n\n```text\nbefore: [live][dead][live][dead][dead][live]\nafter : [live][free][live][free][free][live]\n```\n\n전체 free space가 충분해도 큰 contiguous allocation을 넣을 연속 공간이 부족할 수 있다. free list 관리, allocation search 비용, 큰 객체 할당 실패가 여기서 연결된다.\n\n## mark-compact: 모아서 연속 공간을 만든다\n\nMark-compact는 mark 뒤에 live object를 한쪽으로 모아 빈 공간을 연속화한다.\n\n```text\nbefore: [live][free][live][free][free][live]\nafter : [live][live][live][free][free][free]\n```\n\n이 방식은 fragmentation을 줄이고 bump-pointer allocation 같은 빠른 할당 경로를 다시 만들 수 있다. 대신 비용이 있다.\n\n- live object를 이동해야 한다.\n- 그 object를 가리키던 reference를 새 주소로 갱신해야 한다.\n- 이동 중 application thread를 멈추거나 barrier/protocol을 써야 한다.\n- live set이 크면 compaction 비용이 커진다.\n\n그래서 compaction은 \"항상 좋은 정리\"가 아니라 fragmentation 해소와 pause/CPU/reference update 비용의 tradeoff다.\n\n## 실제 JVM collector와 1:1로 외우지 않기\n\nJVMS는 heap이 자동 storage management system으로 관리된다고 말하지만, 어떤 GC 알고리즘을 써야 하는지는 구현에 맡긴다. HotSpot의 G1, ZGC, Shenandoah, Parallel, Serial 같은 collector는 region, concurrent marking, evacuation, relocation barrier, remembered set 등 더 복잡한 구현을 가진다.\n\n따라서 면접에서 안전한 표현은 이렇다.\n\n- mark-sweep/mark-compact는 GC algorithm mental model이다.\n- 실제 collector는 이 단계들을 변형하거나 region 단위로 나누거나 concurrent하게 수행할 수 있다.\n- collector 이름을 듣고 \"이건 순수 mark-sweep\"이라고 단정하지 않는다.\n- 운영 판단은 GC log/JFR의 pause cause, live set, allocation rate, fragmentation/evacuation failure 신호를 봐야 한다.\n\n## 증상으로 나누기\n\n| 증상 | mark-sweep 관점 | mark-compact 관점 |\n|---|---|---|\n| heap free는 있는데 큰 객체 할당이 실패한다 | free space가 조각났을 수 있다 | compaction/evacuation으로 연속 공간 회복 가능성이 있다 |\n| pause가 live object 양에 비례해 길어진다 | sweep보다 live graph mark 비용을 본다 | 이동/reference update 비용도 본다 |\n| GC 후 heap 기준선이 내려가지 않는다 | unreachable이 아니라 reachable retention일 수 있다 | compact해도 live object 자체가 많으면 해결되지 않는다 |\n| allocation은 빠른데 가끔 큰 pause가 난다 | fragmentation cleanup 타이밍을 본다 | compaction 또는 evacuation pause 후보를 본다 |\n\n## 답변할 때의 뼈대\n\n1. GC는 root reachability를 기준으로 live object를 mark한다.\n2. Mark-sweep는 dead object 영역을 free로 되돌리지만 live object를 보통 제자리에 둔다.\n3. 그래서 fragmentation이 남을 수 있고 큰 연속 allocation에 불리할 수 있다.\n4. Mark-compact는 live object를 모아 free space를 연속화한다.\n5. 대신 object 이동, reference update, barrier 또는 pause 비용을 낸다.\n6. 실제 JVM collector는 이 mental model보다 복잡하고, JVMS는 특정 알고리즘을 강제하지 않는다.\n\n## Spec references\n\n- JVMS Java SE 26 §2.5.3 Heap: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html#jvms-2.5.3`\n- JVMS Java SE 26 §2.13 Public Design, Private Implementation: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html#jvms-2.13`\n\n## 한 줄 정리\n\nmark-sweep와 mark-compact의 차이는 \"죽은 객체를 지우는가\"가 아니라, 지운 뒤 heap free space가 흩어진 채 남는지 아니면 live object 이동 비용을 내고 연속화하는지다.\n",
+  "aliases": [
+    "mark-sweep GC",
+    "mark compact GC",
+    "mark-compact GC",
+    "GC heap fragmentation",
+    "sweep fragmentation",
+    "compaction pause",
+    "마크 스윕 GC",
+    "마크 컴팩트 GC",
+    "힙 단편화 GC",
+    "live object movement",
+    "mark sweep vs mark compact"
+  ],
+  "expected_queries": [
+    "mark-sweep랑 mark-compact GC는 둘 다 mark를 하는데 fragmentation 관점에서 뭐가 달라?",
+    "heap free space는 남았는데 큰 객체 allocation이 실패할 수 있다는 말을 mark-sweep fragmentation으로 설명해줘",
+    "mark-compact가 live object를 옮기면 reference update와 pause 비용이 생긴다는 걸 쉽게 알려줘",
+    "JVM GC에서 mark sweep compact를 collector 이름이 아니라 mental model로 봐야 하는 이유가 뭐야?",
+    "GC roots reachability 이후 sweep과 compact 단계가 각각 어떤 tradeoff를 가지는지 정리해줘"
+  ],
+  "symptoms": [
+    "mark-sweep와 mark-compact를 둘 다 객체 삭제라고만 보고 fragmentation과 compaction 비용을 구분하지 못한다.",
+    "heap 사용량만 보고 큰 allocation 실패를 이해하려 해 contiguous free space 문제를 놓친다.",
+    "JVMS가 특정 GC 알고리즘을 정한다고 착각해 실제 HotSpot collector의 구현 차이를 무시한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jvm-memory-area-gc-basics",
+      "language/gc-generational-interview-primer"
+    ],
+    "next_docs": [
+      "language/gc-allocation-rate-symptom-router",
+      "language/g1-vs-zgc",
+      "language/heap-dump-retained-size-primer"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": [
+      "ZGC colored pointer와 load barrier를 설명해줘",
+      "Heap dump dominator tree retained size를 분석해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-Lang-JVM"
+      }
+    ]
+  }
+}

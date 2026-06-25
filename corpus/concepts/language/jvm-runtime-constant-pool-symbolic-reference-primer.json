@@ -1,0 +1,61 @@
+{
+  "id": "language/jvm-runtime-constant-pool-symbolic-reference-primer",
+  "title": "JVM Runtime Constant Pool and Symbolic References Primer",
+  "category": "language",
+  "level": "intermediate",
+  "summary": "runtime constant pool은 class file constant_pool을 로딩한 뒤 JVM 실행 상태로 가져온 per-class/per-interface 자료구조다. 여기에는 리터럴뿐 아니라 class, field, method, interface method, method handle, dynamic constant 같은 symbolic reference가 들어가고, 일부 항목은 실행 중 resolution을 거쳐 더 직접적인 참조처럼 쓰일 수 있다. StringTable이나 heap String 객체와 같은 pool로 설명하면 메모리 영역과 linkage 오류를 섞게 된다.",
+  "body_markdown": "# JVM Runtime Constant Pool and Symbolic References Primer\n\n> 한 줄 요약: runtime constant pool은 `.class` 파일의 constant pool을 로딩한 뒤 JVM의 실행 상태로 가져온 per-class/per-interface symbol table이고, symbolic reference가 resolution을 통해 실제 class, field, method 접근으로 연결되는 출발점이다.\n\n**난이도: 🟡 Intermediate**\n\n관련 문서:\n\n- [String Intern, Constant Pool, and Memory Deep Dive](./string-intern-constant-pool-memory-deep-dive.md)\n- [JVM Linking: Verify, Prepare, Resolve Primer](./jvm-linking-verify-prepare-resolve-primer.md)\n- [Classpath vs Module Path Split Package Linkage Debugging](./classpath-vs-module-path-split-package-linkage-debugging.md)\n- [Java Binary Compatibility and Linkage Errors](./java-binary-compatibility-linkage-errors.md)\n- [JVM 메모리 영역과 GC 기초](./jvm-memory-area-gc-basics.md)\n\nretrieval-anchor-keywords: runtime constant pool, run-time constant pool, class file constant_pool, symbolic reference, constant pool resolution, ldc, getstatic, invokevirtual, NoSuchMethodError, NoSuchFieldError, Class constant pool vs runtime constant pool, StringTable과 runtime constant pool 차이, JVMS 2.5.5, JVMS 4.4\n\n## 먼저 구분할 것\n\n`constant pool`이라는 말은 보통 세 층이 섞인다.\n\n| 이름 | 위치 감각 | 하는 일 |\n|---|---|---|\n| class file `constant_pool` | `.class` 파일 안 | 숫자/문자열 리터럴, type descriptor, class/field/method symbolic reference를 담는다 |\n| runtime constant pool | class 또는 interface가 로딩된 뒤 JVM run-time data area 안 | class file constant pool 정보를 실행 중 lookup/resolution에 쓰는 형태로 들고 있다 |\n| StringTable / string pool | VM이 interned `String`을 canonicalize하는 테이블 | 문자열 identity canonicalization을 담당한다 |\n\n그래서 runtime constant pool을 \"문자열 객체가 저장되는 heap 공간\"이라고 말하면 틀어진다. runtime constant pool의 핵심은 `String` 객체 보관이 아니라, **bytecode가 참조하는 이름과 descriptor를 runtime linkage에 쓰는 symbol table**이라는 점이다.\n\n## symbolic reference란 무엇인가\n\n컴파일된 class file은 처음부터 모든 target object address를 들고 있지 않는다. 예를 들어 bytecode의 `getstatic`, `invokevirtual`, `invokestatic`, `ldc` 같은 명령은 constant pool index를 통해 어떤 class, field, method, constant를 가리킨다.\n\n단순한 그림은 이렇다.\n\n```text\nbytecode instruction\n  -> constant_pool index\n  -> CONSTANT_Methodref / CONSTANT_Fieldref / CONSTANT_Class ...\n  -> resolution\n  -> 실제 class, field, method 접근 가능 여부 확인\n```\n\n여기서 `CONSTANT_Methodref` 같은 항목은 \"이 이름과 descriptor를 가진 method\"라는 symbolic reference다. resolution 시점에 JVM은 class loading, access check, loader constraint, field/method lookup을 수행하고 실패하면 `NoSuchMethodError`, `NoSuchFieldError`, `IllegalAccessError`, `IncompatibleClassChangeError` 같은 linkage 계열 오류가 날 수 있다.\n\n## runtime constant pool은 언제 문제가 드러나나\n\n가장 흔한 운영 증상은 버전 불일치다.\n\n```text\ncompile time: library A v2에는 method m(String)이 있었다\nruntime: classpath에는 library A v1만 올라왔다\nbytecode: CONSTANT_Methodref는 m(String)을 가리킨다\nresolution: target method lookup 실패 -> NoSuchMethodError\n```\n\n이때 source compile이 성공했다는 사실은 runtime resolution 성공을 보장하지 않는다. classpath shadowing, fat jar 중복, module path split package, container image의 오래된 jar가 모두 같은 class name을 다른 binary shape로 제공할 수 있다.\n\n## String intern 질문과 어떻게 다르나\n\n`String.intern()` 질문에서 runtime constant pool이 자주 등장하지만, 답변의 중심은 다르다.\n\n- string intern: 같은 content를 가진 `String` identity를 canonicalize할지의 문제\n- runtime constant pool: class loading 뒤 bytecode symbol을 실행 중 lookup/resolution하는 문제\n- class file constant pool: `.class` 파일 구조와 binary symbol table 문제\n\n문자열 리터럴이 constant pool 항목으로 표현될 수 있고, `ldc`가 constant pool을 통해 constant를 가져올 수는 있다. 하지만 heap dump에서 `String` 객체가 보인다고 해서 runtime constant pool 자체가 heap에 있다는 뜻은 아니다. memory 관측은 heap/metaspace/StringTable로, linkage 관측은 constant pool reference/resolution으로 나눠야 한다.\n\n## 답변할 때의 뼈대\n\n1. `.class` 파일에는 `constant_pool` table이 있고 bytecode는 index로 그 항목을 참조한다.\n2. class 또는 interface가 로딩되면 per-class/per-interface runtime constant pool이 만들어진다.\n3. runtime constant pool에는 literal뿐 아니라 class, field, method 같은 symbolic reference가 있다.\n4. resolution은 symbolic reference가 실제 runtime target으로 맞는지 확인하는 과정이다.\n5. 실패하면 compile error가 아니라 `LinkageError` 계열 runtime error로 드러날 수 있다.\n6. StringTable과 runtime constant pool은 둘 다 pool이라는 이름이지만 책임이 다르다.\n\n## Spec references\n\n- JVMS Java SE 26 §2.5.5 Run-Time Constant Pool: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-2.html#jvms-2.5.5`\n- JVMS Java SE 26 §4.4 The Constant Pool: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-4.html#jvms-4.4`\n- JVMS Java SE 26 §5.4.3 Resolution: `https://docs.oracle.com/javase/specs/jvms/se26/html/jvms-5.html#jvms-5.4.3`\n\n## 한 줄 정리\n\nruntime constant pool은 문자열 저장소가 아니라 class가 실행 중 사용할 symbolic reference와 constant를 담는 linkage 자료구조이므로, StringTable/heap 메모리 질문과 linkage error 질문을 분리해서 설명해야 한다.\n",
+  "aliases": [
+    "runtime constant pool",
+    "run-time constant pool",
+    "JVM runtime constant pool",
+    "class file constant_pool vs runtime constant pool",
+    "symbolic reference resolution",
+    "constant pool symbolic reference",
+    "CONSTANT_Methodref runtime resolution",
+    "런타임 상수 풀",
+    "심볼릭 참조 해석",
+    "상수 풀과 StringTable 차이",
+    "StringTable과 runtime constant pool 차이"
+  ],
+  "expected_queries": [
+    "runtime constant pool이 class file constant_pool이랑 뭐가 다르고 symbolic reference resolution이랑 어떻게 연결돼?",
+    "String pool이랑 runtime constant pool을 같은 pool로 설명하면 왜 틀린지 JVM 메모리 기준으로 알려줘",
+    "NoSuchMethodError가 compile은 됐는데 runtime constant pool resolution에서 날 수 있다는 게 무슨 뜻이야?",
+    "bytecode의 getstatic invokevirtual이 constant pool index를 통해 field method를 찾는 흐름을 설명해줘",
+    "class file constant pool, runtime constant pool, StringTable을 JVM 스펙 기준으로 구분해줘"
+  ],
+  "symptoms": [
+    "runtime constant pool을 interned String 객체 저장소로 이해해 StringTable과 heap String 객체를 섞어 말한다.",
+    "NoSuchMethodError나 NoSuchFieldError를 컴파일러 오류처럼 보고 classpath/runtime binary mismatch를 놓친다.",
+    "bytecode instruction이 constant pool index와 symbolic reference를 거쳐 target을 찾는 흐름을 설명하지 못한다."
+  ],
+  "relations": {
+    "prerequisites": [
+      "language/jvm-memory-area-gc-basics"
+    ],
+    "next_docs": [
+      "language/jvm-linking-verify-prepare-resolve-primer",
+      "language/string-intern-constant-pool-memory-deep-dive",
+      "language/classpath-vs-module-path-split-package-linkage-debugging",
+      "language/java-binary-compatibility-linkage-errors"
+    ],
+    "confusable_with": [],
+    "forbidden_for_queries": [
+      "String.intern을 언제 써야 메모리를 줄일 수 있어?",
+      "G1 String Deduplication과 Compact Strings를 비교해줘"
+    ]
+  },
+  "learner_query_patterns": [],
+  "metadata": {
+    "schema_version": "v2",
+    "created_at": "2026-06-25",
+    "last_modified": "2026-06-25",
+    "revision_history": [
+      {
+        "date": "2026-06-25",
+        "source": "cycle4-Lang-JVM"
+      }
+    ]
+  }
+}
