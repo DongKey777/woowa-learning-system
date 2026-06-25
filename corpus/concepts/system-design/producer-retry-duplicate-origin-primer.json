@@ -3,7 +3,7 @@
   "title": "Producer Retry Duplicate Origin Primer",
   "category": "system-design",
   "level": "intermediate",
-  "summary": "메시지 producer가 timeout이나 ack lost 상황에서 retry할 때 duplicate event가 생길 수 있는 원인을 설명한다. Kafka idempotent producer, request id, dedup key, consumer idempotency가 각각 어느 중복을 막는지 구분한다.",
+  "summary": "메시지 producer가 timeout이나 ack lost 상황에서 retry할 때 broker에는 이미 append가 됐을 수 있어 duplicate event가 생기는 원인을 설명한다. Kafka idempotent producer, request id, dedup key, consumer idempotency가 각각 어느 중복을 막는지 구분한다.",
   "body_markdown": "# Producer Retry Duplicate Origin Primer\n\n## 한 줄 요약\n\nProducer retry는 유실을 줄이지만 중복의 출발점이 될 수 있다. Broker가 이미 record를 받았는데 ack가 producer에게 도착하지 않으면 producer는 실패로 오해하고 다시 보낼 수 있다. 그래서 producer-side dedup과 consumer idempotency를 나눠 설계해야 한다.\n\n## duplicate는 어디서 시작되나\n\n분산 시스템에서 timeout은 실패 확정이 아니다. Producer가 broker로 record를 보냈고 broker가 저장했지만, ack packet이 늦거나 사라질 수 있다. Producer는 timeout을 보고 retry한다.\n\n```text\nproducer -> broker: record A\nbroker append succeeds\nbroker -> producer: ack lost\nproducer timeout\nproducer retry record A\n```\n\n이 흐름에서 broker log에 A가 두 번 들어갈 수 있다. Kafka idempotent producer는 이 특정 문제를 줄이기 위해 producer id와 sequence number로 중복 append를 감지한다. 하지만 이것이 consumer가 record를 다시 읽는 문제나 외부 DB side effect 중복까지 모두 해결한다는 뜻은 아니다.\n\n## producer retry와 consumer redelivery는 다르다\n\n| 중복 출발점 | 예시 | 막는 장치 |\n|---|---|---|\n| Producer retry duplicate | ack lost 후 같은 record 재전송 | producer idempotence, request id, broker dedup |\n| Consumer redelivery duplicate | 처리 후 offset commit/ack 전 crash | idempotent consumer, processed event table |\n| Replay duplicate | backfill/replay로 과거 record 재처리 | replay-safe handler, dedup key |\n| External callback duplicate | provider webhook retry | event id dedup, idempotency key |\n\n이 네 가지를 모두 \"중복 처리\"라고만 말하면 설계가 흐려진다. Producer retry duplicate는 log에 같은 logical event가 두 번 쓰일 수 있는 문제이고, consumer redelivery는 같은 log record를 다시 처리할 수 있는 문제다.\n\n## Kafka idempotent producer가 막는 범위\n\nKafka idempotent producer는 producer session 안에서 broker가 같은 sequence의 record를 중복 append하지 않도록 돕는다. 이 기능은 producer retry로 인한 duplicate append를 줄인다.\n\n하지만 아래는 별도 문제다.\n\n- consumer가 처리 후 offset commit 전에 죽어 같은 record를 다시 읽는 문제\n- 외부 DB update가 이미 됐는데 다시 handler가 실행되는 문제\n- producer application이 event id를 새로 만들어 같은 business event를 다시 발행하는 문제\n- retry topic이나 replay job이 같은 event를 다시 흘리는 문제\n\n즉 idempotent producer는 필요한 장치일 수 있지만 end-to-end exactly-once를 혼자 만들지 않는다.\n\n## request id와 event id\n\nProducer가 업무 이벤트를 만들 때는 logical event id를 안정적으로 잡는 것이 중요하다. 같은 주문 결제 완료 이벤트라면 retry마다 새 event id를 만들기보다 같은 business event를 식별할 수 있어야 downstream dedup이 가능하다.\n\n| id 종류 | 쓰임 | 주의점 |\n|---|---|---|\n| request id | producer 요청 추적 | retry마다 바뀌면 dedup key로 약함 |\n| event id | logical event 식별 | downstream dedup의 기본 후보 |\n| idempotency key | 같은 command 재시도 식별 | payload/status contract 필요 |\n| producer sequence | broker append dedup | broker/protocol 범위 안의 장치 |\n\n## 설계 순서\n\n1. Producer retry가 필요한 실패를 정의한다.\n2. Timeout이 unknown outcome임을 인정한다.\n3. Logical event id를 안정적으로 만든다.\n4. Broker가 지원하면 producer idempotence를 켠다.\n5. Consumer는 event id 또는 business key로 idempotent하게 처리한다.\n6. Replay와 retry topic도 같은 dedup contract를 사용한다.\n7. Duplicate metric과 dedup hit rate를 관찰한다.\n\n## 흔한 오해\n\n- \"producer retry는 안전하다\": ack lost unknown outcome에서는 duplicate origin이 될 수 있다.\n- \"Kafka idempotent producer면 consumer idempotency가 필요 없다\": producer duplicate append와 consumer redelivery는 다른 문제다.\n- \"timeout이면 실패했으니 새 event id로 다시 보내면 된다\": 실제로는 broker append가 성공했을 수 있다.\n- \"dedup은 consumer만 하면 된다\": broker log 중복과 downstream side effect 중복을 모두 관찰해야 한다.\n- \"exactly-once 옵션을 켜면 외부 API까지 해결된다\": 외부 side effect는 해당 시스템의 idempotency와 reconciliation이 필요하다.\n\n## 운영 지표\n\n- producer retry count and timeout rate\n- broker duplicate sequence rejection count\n- event id duplicate count\n- consumer idempotency hit count\n- same business key multiple event count\n- timeout 후 eventual success ratio\n- replay duplicate suppression count\n- downstream unique constraint conflict count\n\n## 면접 답변 축\n\nProducer retry 중복 질문에는 \"timeout은 결과 불명이라 broker append가 성공했는데 ack만 잃었을 수 있고, retry가 같은 logical event를 다시 보낼 수 있다\"고 답한다. 이어서 Kafka idempotent producer는 duplicate append를 줄이지만 consumer redelivery와 외부 DB side effect는 별도 idempotency로 막아야 한다고 선을 긋는다.\n\n## Safe Next Docs\n\nKafka producer/consumer 흐름은 `kafka-producer-consumer-flow-offset-retention-beginner-bridge`, delivery semantics는 `queue-delivery-semantics-beginner-primer`, Kafka exactly-once 범위는 `exactly-once-stream-processing-idempotent-sinks-checkpoint-chooser`로 이어진다.\n\n---\n\n## stable event id가 중요한 이유\n\nProducer retry 중복을 downstream에서 흡수하려면 같은 business event가 같은 id를 가져야 한다. timeout이 났다고 retry 때마다 새 event id를 만들면 consumer는 두 record가 같은 사실의 재시도인지 알기 어렵다.\n\n```text\nbad:\n  attempt1 -> eventId=e1, timeout unknown\n  retry    -> eventId=e2\n\ngood:\n  attempt1 -> eventId=order-10-paid-v1, timeout unknown\n  retry    -> eventId=order-10-paid-v1\n```\n\nIdempotent producer는 producer session과 sequence 관점의 중복 append를 줄이는 데 도움을 줄 수 있지만, business idempotency key를 대신하지 않는다. 외부 DB insert, email 발송, 결제 후속 처리 같은 side effect는 event id나 business key로 한 번만 반영되도록 별도 방어가 필요하다.\n\n## retry 판단 질문\n\n- ack timeout이 실패 확정인가, unknown인가?\n- 같은 record를 retry할 때 key, event id, payload hash가 안정적인가?\n- producer idempotence가 켜져 있어도 consumer side effect dedup이 필요한가?\n- ordering이 중요한 key에서 retry와 max.in.flight 설정이 순서를 흔들 수 있는가?\n\n## 추가 한 줄 정리\n\nProducer retry 중복의 핵심은 broker append 결과가 unknown인 상태에서 같은 business event를 다시 보내는 것이며, stable event id 없이는 downstream dedup이 급격히 어려워진다.\n",
   "aliases": [
     "producer retry duplicate",
@@ -15,7 +15,8 @@
     "Kafka idempotent producer",
     "재시도 중복 발행",
     "broker append duplicate",
-    "consumer idempotency 구분"
+    "broker에는 이미 append",
+    "retry했는데 중복 이벤트"
   ],
   "expected_queries": [
     "producer가 timeout 후 retry하면 왜 같은 이벤트가 두 번 발행될 수 있어?",
@@ -23,7 +24,7 @@
     "Kafka idempotent producer가 막는 중복과 consumer idempotency가 막는 중복은 뭐가 달라?",
     "producer retry 때마다 event id를 새로 만들면 downstream dedup이 어려운 이유가 뭐야?",
     "timeout은 실패 확정이 아니라 unknown outcome이라는 걸 메시지 발행에서 어떻게 설명해?",
-    "producer duplicate append와 consumer redelivery duplicate를 구분해서 말해줘"
+    "producer timeout 후 retry했는데 broker append가 이미 성공했을 수 있으면 왜 중복 이벤트가 생겨?"
   ],
   "symptoms": [
     "producer timeout 후 같은 business event가 두 번 발행된다",
@@ -54,7 +55,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-06-17",
-    "last_modified": "2026-06-17",
+    "last_modified": "2026-06-26",
     "legacy_path": "knowledge/cs/contents/system-design/producer-retry-duplicate-origin-primer.md",
     "revision_history": [],
     "updated_at": "2026-06-18T00:00:00+09:00",
