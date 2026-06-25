@@ -3,7 +3,7 @@
   "title": "Authorization Decision Cache Invalidation Latency SLO Playbook",
   "category": "security",
   "level": "advanced",
-  "summary": "authorization cache는 decision latency와 revocation freshness를 함께 SLO로 잡아야 안전하다.",
+  "summary": "authorization cache는 decision latency와 revocation freshness를 함께 SLO로 잡아야 안전하다. role 제거 뒤 stale allow가 남는 시간을 p99로 측정하는 revocation freshness 지표를 포함한다.",
   "body_markdown": "# Authorization Decision Cache Invalidation Latency SLO Playbook\n\n## 이 문서가 맡는 질문\n\nAuthorization decision cache를 둘 때 decision latency, revocation freshness, invalidation propagation, stale allow 위험을 어떻게 함께 SLO로 잡을지 설명한다. 이 문서는 cache hit ratio를 높이는 튜닝 문서가 아니라, 권한 변경이 실제 API 허용/거부 결정에 반영되는 시간을 보안 요구사항으로 다루는 playbook이다.\n\n## 빠른 분기\n\n권한을 제거했는데 몇 분 동안 접근이 계속 허용된다면 아래를 먼저 나눈다.\n\n| 질문 | 확인할 것 | 위험 |\n|---|---|---|\n| 어디에 cache가 있는가 | PEP local cache, gateway, PDP, session claim | invalidation 범위 누락 |\n| 무엇을 cache하는가 | allow, deny, role, group, policy version | stale allow 또는 stale deny |\n| 어떻게 무효화하는가 | TTL, push event, version check, polling | propagation lag |\n| 장애 때 어떻게 동작하는가 | fail open, fail closed, degraded allowlist | 보안과 가용성 tradeoff |\n\ncache hit ratio가 높아도 권한 회수 freshness SLO를 위반하면 좋은 설계가 아니다. 보안 cache는 빠른 결정을 만드는 동시에 오래된 결정을 계속 믿게 만드는 위험을 만든다.\n\n## 핵심 불변식\n\n- 권한 변경 이벤트는 cache invalidation 경로를 가져야 한다.\n- stale allow와 stale deny는 같은 severity가 아니다.\n- negative cache TTL은 권한 복구 지연을 만들 수 있다.\n- decision latency와 revocation freshness는 별도 SLO로 측정한다.\n- cache key에는 tenant, subject, resource, action, policy version 같은 판정 차원이 빠지면 안 된다.\n- multi-region 환경에서는 propagation lag budget을 명시해야 한다.\n\n## CS 배경\n\n인가 시스템은 보통 PEP와 PDP로 나뉜다. PEP는 API gateway, service filter, method interceptor처럼 요청을 막거나 통과시키는 위치이고, PDP는 policy와 subject/resource 속성을 바탕으로 allow/deny 결정을 내리는 위치다. decision cache는 PEP 가까이에 둘수록 latency를 줄이지만, 권한 변경이 반영되기까지 오래된 결정을 사용할 가능성이 커진다.\n\n따라서 cache 설계의 질문은 단순히 TTL을 몇 초로 할지가 아니다. 어떤 결정이 cache되는지, 권한 변경 이벤트가 어느 cache까지 도달하는지, 이벤트 손실과 region 지연을 어떻게 감지하는지, stale 상태에서 allow와 deny 중 어느 쪽으로 실패할지까지 포함한다.\n\n## SLO를 둘로 나누기\n\n최소 두 SLO를 따로 둔다.\n\n```text\nauthz_decision_p99_ms: 평상시 인가 결정 응답 시간\nrevocation_propagation_p99_ms: 권한 회수 후 모든 PEP가 새 결정을 적용하기까지 걸린 시간\n```\n\n첫 번째만 보면 cache가 항상 좋아 보인다. 두 번째를 보지 않으면 role revoke, group removal, policy deny 추가가 늦게 반영되어도 장애로 잡히지 않는다. 특히 stale allow는 제거된 권한으로 API 접근이 계속되는 보안 사고가 될 수 있다. stale deny는 사용자가 일시적으로 막히는 가용성 문제에 가깝지만, 운영 영향은 여전히 측정해야 한다.\n\n## invalidation 전략 비교\n\n| 전략 | 장점 | 약점 | 적합한 상황 |\n|---|---|---|---|\n| 짧은 TTL | 구현 단순, event 의존 낮음 | p99 miss penalty 증가, freshness 상한이 TTL | 약한 freshness 요구 |\n| push invalidation | 빠른 revoke 반영 | event loss, fanout, ordering 필요 | 강한 revocation 요구 |\n| policy version check | stale decision 탐지 쉬움 | 저장소 조회 또는 metadata 전파 필요 | 중앙 policy version 관리 가능 |\n| cache stampede 보호 | PDP 보호 | 오래된 allow 연장 위험 | fail-open 조건이 명확할 때 |\n| session claim 재발급 | 읽기 빠름 | token 만료 전 claim stale | 짧은 token lifetime 또는 introspection 필요 |\n\n현실적인 설계는 보통 하나만 쓰지 않는다. 예를 들어 push invalidation을 기본으로 두고, 이벤트 손실 대비로 짧은 max TTL과 policy version mismatch 탐지를 함께 둔다.\n\n## cache key와 negative cache\n\n인가 cache key가 너무 작으면 잘못된 allow가 생긴다. 최소한 subject, tenant, resource, action, policy version 또는 role version이 들어가야 한다. resource owner나 ABAC attribute가 policy에 쓰이면 그 값도 key나 version에 반영해야 한다.\n\nnegative cache도 조심해야 한다. 방금 권한을 부여했는데 deny 결과를 오래 cache하면 사용자는 계속 막힌다. stale deny는 stale allow보다 보안 위험은 낮을 수 있지만, 운영에서는 권한 복구 지연과 고객 장애가 된다. 그래서 allow TTL과 deny TTL을 다르게 두거나, 권한 부여 이벤트에서 deny cache도 무효화해야 한다.\n\n## 장애와 degraded mode\n\nPDP가 느리거나 invalidation event bus가 지연될 때 정책을 미리 정해야 한다. 모든 요청을 fail closed하면 보안은 강하지만 서비스 가용성이 무너질 수 있다. fail open은 가용성은 지키지만 stale allow 위험이 커진다. 보통은 action별로 다르게 둔다.\n\n- 결제, 관리자 기능, 개인정보 조회는 fail closed가 기본 후보다.\n- 공개 읽기나 낮은 위험 기능은 짧은 stale window를 허용할 수 있다.\n- break-glass나 emergency access는 별도 감사 로그와 짧은 만료가 필요하다.\n- degraded allowlist는 누가, 언제, 어떤 근거로 바꿨는지 추적해야 한다.\n\n## 관측 지표\n\n한 화면에 최소한 아래 지표를 둔다.\n\n- `authz_cache_hit_ratio`: hit ratio가 좋아져도 freshness를 대체하지 않는다.\n- `authz_decision_p99_ms`: PDP 호출, cache miss, network hop을 포함한 결정 지연.\n- `revocation_p99_ms`: 권한 변경 시각부터 모든 PEP 반영까지의 지연.\n- `stale_allow_count`: 권한 회수 후에도 허용된 결정 수.\n- `stale_deny_count`: 권한 부여 후에도 거부된 결정 수.\n- `invalidation_event_lag_ms`: event 발행, 전달, 적용 단계별 지연.\n- `policy_version_mismatch`: PEP가 오래된 policy version으로 판단한 횟수.\n\n## 테스트 시나리오\n\n테스트는 happy path allow만 보면 안 된다. role revoke, group membership removal, deny policy 추가, 권한 재부여, event loss, out-of-order event, region partition, PDP timeout을 포함한다.\n\n```text\nt0: user A has role admin\nt1: role admin removed\nt2: all PEP caches must stop allowing admin action within 5s\nt3: stale allow count must be zero after SLO window\n```\n\n이 테스트는 synthetic traffic과 production-like traffic을 나눠 돌린다. synthetic test는 정확한 stale window를 재기 쉽고, production-like test는 fanout, queue lag, cache stampede, retry amplification을 드러낸다.\n\n## 설계 리뷰 질문\n\n설계 리뷰에서는 cache를 어디에 두는지보다 어떤 변경 이벤트가 어떤 cache를 지우는지 먼저 묻는다. 사용자의 role이 바뀌는 이벤트, group membership이 바뀌는 이벤트, policy document가 바뀌는 이벤트는 서로 다른 source에서 나올 수 있다. 세 이벤트 중 하나만 invalidation에 연결되면 특정 경로에서 stale allow가 남는다.\n\n또한 cache hit을 위해 decision 결과 전체를 저장하는지, subject attribute만 저장하는지, policy evaluation 결과와 resource attribute를 같이 저장하는지 구분해야 한다. 저장 단위가 커질수록 miss penalty는 줄지만 invalidation fanout과 stale window는 커진다. 이 tradeoff를 SLO 숫자로 말하지 못하면 단순 성능 튜닝으로 흐르기 쉽다.\n\n## 감사와 사고 대응\n\nstale allow는 탐지 후 감사 로그로 재구성할 수 있어야 한다. 권한 변경 시각, decision id, policy version, PEP instance, cache key, cache age, request id를 남기면 어떤 요청이 오래된 결정으로 통과했는지 추적할 수 있다. 이 정보가 없으면 stale allow count는 알 수 있어도 사고 범위 산정이 어렵다.\n\n권한 회수 SLO를 위반했을 때의 대응도 미리 정한다. 특정 PEP cache flush, policy version 강제 증가, token revocation list 갱신, region별 traffic drain 같은 운영 절차가 있어야 한다. 모든 cache를 한 번에 비우면 PDP에 thundering herd가 생길 수 있으므로 rate limit과 backoff도 같이 준비한다.\n\n## 면접 답변 템플릿\n\n짧게 답할 때는 이렇게 말한다. 인가 decision cache는 p99 latency를 줄이지만 권한 회수 freshness를 늦출 수 있으므로 `authz_decision_p99`와 `revocation_propagation_p99`를 따로 SLO로 둔다. stale allow는 보안 위험이고 stale deny는 가용성 문제라 severity가 다르다. TTL만 믿지 말고 권한 변경 이벤트 기반 invalidation, policy version, cache key 차원, event loss 대비 max TTL을 함께 설계하고 stale allow count를 측정한다.\n\n## 자주 하는 오해\n\n- authz cache hit ratio가 높으면 품질도 좋다고 본다.\n- TTL을 짧게 하면 revocation 문제가 완전히 해결된다고 생각한다.\n- stale allow와 stale deny를 같은 운영 이슈로 취급한다.\n- JWT claim에 role을 넣었으니 server-side invalidation이 필요 없다고 본다.\n- multi-region propagation lag를 평균값으로만 본다.\n\n## 학습자가 답변에 포함해야 할 구조\n\n답변은 문제 신호, cache 위치, cache key, invalidation 방식, stale allow/deny 위험, latency SLO, freshness SLO, 장애 시 degrade 정책을 차례로 말해야 한다. 마지막에는 권한 회수 테스트와 대시보드 지표를 제시한다.\n\n## 실전 검증 루프\n\n1. 권한 변경 이벤트의 source of truth를 고정한다.\n2. PEP와 PDP 위치, cache 계층, session/token claim을 그린다.\n3. allow cache와 deny cache의 TTL과 invalidation 경로를 분리한다.\n4. stale allow가 허용되는 최대 시간을 SLO로 적는다.\n5. role revoke, group removal, policy deny 추가를 테스트한다.\n6. event loss와 region lag를 주입해 propagation p99를 측정한다.\n7. hit ratio 개선이 freshness SLO를 악화시키지 않았는지 확인한다.\n\n## 한 줄 정리\n\nauthorization cache는 decision latency와 revocation freshness를 함께 SLO로 잡아야 안전하다.\n",
   "aliases": [
     "권한 회수 반영 지연",
@@ -15,14 +15,15 @@
     "권한 변경 전파 시간",
     "권한 캐시 SLO",
     "authz cache revoke lag",
-    "negative cache 복구 지연"
+    "negative cache 복구 지연",
+    "stale allow가 p99로 남는 시간"
   ],
   "expected_queries": [
     "권한을 제거했는데 캐시 때문에 계속 허용되면 어떤 SLO를 봐야 해?",
     "authorization decision cache에서 stale allow와 stale deny를 왜 다르게 봐야 해?",
     "인가 캐시 TTL을 줄이는 것만으로 revocation freshness 문제가 해결돼?",
     "권한 변경 이벤트가 여러 PEP cache에 반영되는 시간을 어떻게 측정해?",
-    "authz cache hit ratio가 좋아도 보안 품질이 나쁠 수 있는 이유가 뭐야?",
+    "role 제거 뒤 stale allow가 남는 시간을 p99로 측정할 때 어떤 지표가 필요해?",
     "multi-region 권한 캐시에서 invalidation lag를 어떻게 예산으로 잡아?"
   ],
   "symptoms": [
@@ -59,7 +60,7 @@
   "metadata": {
     "schema_version": "v2",
     "created_at": "2026-05-27",
-    "last_modified": "2026-06-18",
+    "last_modified": "2026-06-26",
     "revision_history": [
       {
         "date": "2026-05-27",
@@ -68,6 +69,11 @@
       {
         "date": "2026-06-18",
         "source": "y14-expansion-batch146"
+      },
+      {
+        "date": "2026-06-26",
+        "source": "cycle4-w156-y14-recall",
+        "note": "added stale allow p99 revocation freshness learner surface"
       }
     ]
   }
