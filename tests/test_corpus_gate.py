@@ -70,7 +70,8 @@ def test_all_json_shape(capsys) -> None:
     assert rc == 0
     assert payload["gate"] == "all"
     assert payload["hard_failed"] is False
-    assert set(payload["results"]) == {"orphan", "filler", "path", "contract"}
+    assert set(payload["results"]) == {"orphan", "filler", "path", "surface", "contract"}
+    assert payload["results"]["surface"]["status"] == "pass"
     assert payload["results"]["contract"]["status"] == "report"
     assert payload["results"]["contract"]["concepts"] > 3000
 
@@ -203,6 +204,106 @@ def test_path_passes_when_all_paths_real(monkeypatch, tmp_path) -> None:
     assert r["status"] == "pass"
     assert r["changed_fixtures"] == 1
     assert r["dead_paths"] == []
+
+
+# ─────────────────────────────────────────────────────────────────
+# Synthetic surface preservation (Gate S) — old alias/EQ deletion cannot silently grow.
+# ─────────────────────────────────────────────────────────────────
+def test_surface_detects_new_exact_surface_loss(monkeypatch, tmp_path) -> None:
+    concepts_dir = tmp_path / "corpus" / "concepts" / "spring"
+    concepts_dir.mkdir(parents=True)
+    cur_file = concepts_dir / "bean-di-basics.json"
+    cur_file.write_text(json.dumps({
+        "id": "spring/bean-di-basics", "title": "Bean DI",
+        "aliases": [], "expected_queries": [],
+    }), encoding="utf-8")
+
+    old_doc = {
+        "id": "spring/bean-di-basics", "title": "Bean DI",
+        "aliases": ["constructor injection"], "expected_queries": ["DI가 뭐야?"],
+    }
+
+    class _Corpus:
+        concepts = {
+            "spring/bean-di-basics": {
+                "id": "spring/bean-di-basics", "title": "Bean DI",
+                "aliases": [], "expected_queries": [],
+            }
+        }
+
+    monkeypatch.setattr(gate, "CONCEPTS_DIR", tmp_path / "corpus" / "concepts")
+    monkeypatch.setattr(gate, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(gate, "_base_exists", lambda base: True)
+    monkeypatch.setattr(gate, "_git_lines",
+                        lambda args: ["corpus/concepts/spring/bean-di-basics.json"])
+    monkeypatch.setattr(gate, "_show_at", lambda base, path: old_doc)
+
+    r = gate.gate_surface("origin/main", _Corpus(), baseline_path=tmp_path / "baseline.json")
+    assert r["status"] == "fail"
+    lost = {row["surface"] for row in r["new_losses"]}
+    assert {"constructor injection", "DI가 뭐야?"} <= lost
+
+
+def test_surface_allows_same_concept_reownership(monkeypatch, tmp_path) -> None:
+    concepts_dir = tmp_path / "corpus" / "concepts" / "spring"
+    concepts_dir.mkdir(parents=True)
+    cur_file = concepts_dir / "bean-di-basics.json"
+    cur_file.write_text(json.dumps({
+        "id": "spring/bean-di-basics", "title": "Bean DI",
+        "aliases": ["constructor injection"], "expected_queries": [],
+    }), encoding="utf-8")
+
+    old_doc = {
+        "id": "spring/bean-di-basics", "title": "Bean DI",
+        "aliases": [], "expected_queries": ["constructor injection"],
+    }
+
+    class _Corpus:
+        concepts = {
+            "spring/bean-di-basics": {
+                "id": "spring/bean-di-basics", "title": "Bean DI",
+                "aliases": ["constructor injection"], "expected_queries": [],
+            }
+        }
+
+    monkeypatch.setattr(gate, "CONCEPTS_DIR", tmp_path / "corpus" / "concepts")
+    monkeypatch.setattr(gate, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(gate, "_base_exists", lambda base: True)
+    monkeypatch.setattr(gate, "_git_lines",
+                        lambda args: ["corpus/concepts/spring/bean-di-basics.json"])
+    monkeypatch.setattr(gate, "_show_at", lambda base, path: old_doc)
+
+    r = gate.gate_surface("origin/main", _Corpus(), baseline_path=tmp_path / "baseline.json")
+    assert r["status"] == "pass"
+    assert r["new_losses"] == []
+
+
+def test_surface_baselined_loss_is_allowed_and_resolved_is_reported(monkeypatch, tmp_path) -> None:
+    loss = {
+        "concept_id": "spring/bean-di-basics",
+        "path": "corpus/concepts/spring/bean-di-basics.json",
+        "field": "aliases",
+        "surface": "legacy shortcut",
+        "norm": "legacy shortcut",
+    }
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({"losses": [loss]}), encoding="utf-8")
+
+    class _Corpus:
+        concepts = {
+            "spring/bean-di-basics": {
+                "id": "spring/bean-di-basics", "title": "Bean DI",
+                "aliases": [], "expected_queries": [],
+            }
+        }
+
+    monkeypatch.setattr(gate, "_base_exists", lambda base: True)
+    monkeypatch.setattr(gate, "_git_lines", lambda args: [])
+
+    r = gate.gate_surface("origin/main", _Corpus(), baseline_path=baseline)
+    assert r["status"] == "pass"
+    assert r["new_losses"] == []
+    assert r["resolved"] == [loss]
 
 
 # ─────────────────────────────────────────────────────────────────

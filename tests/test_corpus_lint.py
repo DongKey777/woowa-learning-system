@@ -1,8 +1,8 @@
 """Exact-shortcut ownership lint — pins the monotonic-quality guard.
 
 Verifies curation/ownership.fire_and_shadow + diff_against_baseline: the live corpus
-matches its frozen baseline (no un-baselined steal), a synthetically injected steal is
-caught, and benign same-tier alias ambiguities are NOT flagged (0 false positives).
+does not exceed its frozen baseline (no un-baselined steal), a synthetically injected
+steal is caught, and benign same-tier alias ambiguities are NOT flagged (0 false positives).
 """
 from __future__ import annotations
 
@@ -35,13 +35,14 @@ def test_live_corpus_has_no_unbaselined_steal() -> None:
     assert diff["flipped"] == {}, f"owner flips: {diff['flipped']}"
 
 
-def test_baseline_is_non_empty_and_matches_current() -> None:
-    """Baseline = the current fire+shadow snapshot (grandfathered)."""
+def test_baseline_is_non_empty_and_covers_current() -> None:
+    """Baseline grandfathers known fire+shadow rows. Rows that disappear are repairs,
+    so current may be a strict subset of baseline but must not grow outside it."""
     corpus = load_corpus()
     current = fire_and_shadow(corpus)
     baseline = _baseline_norms()
     assert baseline, "baseline must not be empty"
-    assert set(current) == set(baseline), "baseline drifted from current fire+shadow"
+    assert set(current) <= set(baseline), "current fire+shadow escaped the baseline"
 
 
 def test_detects_injected_steal() -> None:

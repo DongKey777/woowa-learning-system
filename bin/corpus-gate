@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bin/corpus-gate — one-shot corpus-expansion gate runner (orphan|filler|path|contract|all).
+"""bin/corpus-gate — one-shot corpus-expansion gate runner (orphan|filler|path|surface|contract|all).
 
 Ports the per-batch corpus-expansion gates from the cycle instruction docs into a single
 index-free wrapper so an external authoring AI runs ONE line per batch instead of copy-
@@ -21,6 +21,11 @@ Subcommands (mirror the documented gates):
             path in the batch's y14_expansion_* fixtures must derive from a real concept
             id (<category>/<slug> flat). Scope = git-diff (this batch's changed/new
             fixtures only — pre-existing accumulated dead-paths are the maintainer's).
+  surface   Gate S — exact-surface preservation. A corpus edit must not delete an old
+            title/alias/EQ surface from its concept unless that same concept still owns
+            the normalized surface somewhere in title/aliases/EQ. Existing cycle4 losses
+            are frozen in tests/fixtures/exact_surface_loss_baseline.json; NEW losses
+            fail hard, resolved baseline losses are allowed.
   contract  Gate A / v4 §4 — contract hygiene, CONSERVATIVE. Schema-validates the corpus
             (load_corpus strict=True) and REPORTS the alias/EQ/title/relation distribution
             (alias 6-12, EQ 4-6, title-exact-alias, global EQ exact-dup, relation self/
@@ -28,7 +33,7 @@ Subcommands (mirror the documented gates):
             (e.g. title-exact-alias), so contract NEVER hard-fails on a count — it prints
             the report and exits 0. NEW-violation judgement is the authoring AI's.
 
-  all       orphan+filler+path = HARD (exit 1 on any fail); contract = report-only.
+  all       orphan+filler+path+surface = HARD (exit 1 on any fail); contract = report-only.
             Aggregate exit code = 1 iff any hard gate failed.
 
 Usage:
@@ -36,13 +41,14 @@ Usage:
   bin/corpus-gate orphan              # single gate
   bin/corpus-gate contract --json     # machine-readable contract distribution
   bin/corpus-gate path --base origin/main
+  bin/corpus-gate surface --rebaseline
   bin/corpus-gate all --json
 
 Notes:
   - git-scoped gates (orphan, path) diff against --base (default origin/main). If the base
     ref is missing, they print a warning and SKIP (graceful — never a hard fail on a
     detached/offline worktree).
-  - The live 3654-concept corpus is maintained to pass orphan/filler/path, so on a clean
+  - The live corpus is maintained to pass orphan/filler/path/surface, so on a clean
     worktree (no batch changes) every hard gate is a no-op PASS.
 """
 from __future__ import annotations
@@ -61,6 +67,7 @@ from rag.corpus_loader import load_corpus  # noqa: E402
 from rag.search import _norm_exact  # noqa: E402
 
 CONCEPTS_DIR = REPO_ROOT / "corpus" / "concepts"
+SURFACE_BASELINE_PATH = REPO_ROOT / "tests" / "fixtures" / "exact_surface_loss_baseline.json"
 
 # ── Protected entrypoint surfaces (v4 §5 / §6.1). Deleting one of these without a concept
 #    reowning the exact surface is a semantic-preservation regression → orphan FAIL. ───────
@@ -280,6 +287,122 @@ def gate_path(base: str, corpus) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
+# Gate S — Exact-surface preservation
+# ─────────────────────────────────────────────────────────────────
+def _surface_values(doc: dict, field: str) -> list[str]:
+    if field == "title":
+        return [str(doc.get("title") or "")]
+    return [str(v) for v in (doc.get(field) or [])]
+
+
+def _current_surface_owners(corpus) -> dict[str, set[str]]:
+    owners: dict[str, set[str]] = {}
+    for cid, d in corpus.concepts.items():
+        for field in ("title", "aliases", "expected_queries"):
+            for value in _surface_values(d, field):
+                norm = _norm_exact(value)
+                if norm:
+                    owners.setdefault(norm, set()).add(cid)
+    return owners
+
+
+def _surface_loss_key(row: dict) -> str:
+    return f"{row['concept_id']}\t{row['field']}\t{row['norm']}"
+
+
+def _load_surface_baseline(path: Path = SURFACE_BASELINE_PATH) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("losses", [])
+    return {_surface_loss_key(row): row for row in rows}
+
+
+def _write_surface_baseline(rows: list[dict], path: Path = SURFACE_BASELINE_PATH) -> None:
+    doc = (
+        "Frozen exact-surface loss baseline for bin/corpus-gate surface. "
+        "Rows are old title/alias/EQ surfaces removed by the branch that the same concept "
+        "no longer owns anywhere in title/aliases/EQ. New rows fail; disappeared rows are "
+        "repairs. Regenerate only after an intentional corrective pass."
+    )
+    path.write_text(
+        json.dumps({"_doc": doc, "losses": rows}, ensure_ascii=False, indent=2,
+                   sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def surface_losses(base: str, corpus) -> list[dict]:
+    """Diff-scoped old-surface losses for changed existing concept files.
+
+    A deleted surface is OK if the same concept still owns its normalized value in any
+    exact-bearing field. This preserves learner/code shortcut surfaces without blocking
+    legitimate alias/EQ movement inside the same concept.
+    """
+    owners = _current_surface_owners(corpus)
+    changed = _git_lines(["diff", "--name-only", f"{base}..HEAD", "--", "corpus/concepts"])
+    rows: list[dict] = []
+    for path in changed:
+        p = REPO_ROOT / path
+        if not p.exists():
+            continue
+        old = _show_at(base, path)
+        if old is None:
+            continue
+        try:
+            cur = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        cid = str(cur.get("id") or old.get("id") or "")
+        if not cid:
+            continue
+        for field in ("title", "aliases", "expected_queries"):
+            old_values = {str(v) for v in _surface_values(old, field) if str(v).strip()}
+            cur_values = {str(v) for v in _surface_values(cur, field) if str(v).strip()}
+            for value in sorted(old_values - cur_values):
+                norm = _norm_exact(value)
+                if not norm or cid in owners.get(norm, set()):
+                    continue
+                rows.append({
+                    "concept_id": cid,
+                    "path": path,
+                    "field": field,
+                    "surface": value,
+                    "norm": norm,
+                })
+    rows.sort(key=_surface_loss_key)
+    return rows
+
+
+def gate_surface(base: str, corpus, *, rebaseline: bool = False,
+                 baseline_path: Path = SURFACE_BASELINE_PATH) -> dict:
+    if not _base_exists(base):
+        return {"status": "skip", "skipped": True, "reason": f"base ref '{base}' missing",
+                "loss_count": 0, "baseline_count": 0, "new_losses": [], "resolved": []}
+
+    rows = surface_losses(base, corpus)
+    if rebaseline:
+        _write_surface_baseline(rows, baseline_path)
+        return {"status": "pass", "skipped": False, "rebaselined": True,
+                "baseline_path": str(baseline_path), "loss_count": len(rows),
+                "baseline_count": len(rows), "new_losses": [], "resolved": []}
+
+    baseline = _load_surface_baseline(baseline_path)
+    current = {_surface_loss_key(row): row for row in rows}
+    new_losses = [current[k] for k in sorted(set(current) - set(baseline))]
+    resolved = [baseline[k] for k in sorted(set(baseline) - set(current))]
+    return {
+        "status": "fail" if new_losses else "pass",
+        "skipped": False,
+        "rebaselined": False,
+        "loss_count": len(rows),
+        "baseline_count": len(baseline),
+        "new_losses": new_losses,
+        "resolved": resolved,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
 # Gate A — Contract hygiene (CONSERVATIVE report — v4 §4)
 # ─────────────────────────────────────────────────────────────────
 def gate_contract(corpus) -> dict:
@@ -389,6 +512,24 @@ def _print_path(r: dict) -> None:
             print(f"    DEAD [{field}] '{pth}'  ({fx})")
 
 
+def _print_surface(r: dict) -> None:
+    if r.get("skipped"):
+        print(f"⚠ surface SKIP — {r['reason']} (cannot diff; graceful skip).")
+        return
+    if r.get("rebaselined"):
+        print(f"✓ surface REBASELINED — {r['loss_count']} exact-surface loss(es) frozen "
+              f"at {r['baseline_path']}.")
+        return
+    if r["status"] == "pass":
+        print(f"✓ surface OK — {r['loss_count']} exact-surface loss(es), "
+              f"baseline {r['baseline_count']}, new 0, resolved {len(r['resolved'])}.")
+    else:
+        print(f"✗ surface FAIL — {len(r['new_losses'])} new exact-surface loss(es) "
+              f"(current {r['loss_count']}, baseline {r['baseline_count']}):")
+        for row in r["new_losses"][:50]:
+            print(f"    LOST [{row['field']}] '{row['surface']}'  ({row['path']})")
+
+
 def _print_contract(r: dict) -> None:
     print(f"• contract REPORT — {r['concepts']} concepts, "
           f"{r['schema_failures']} schema failures (load_corpus strict).")
@@ -406,16 +547,21 @@ def _print_contract(r: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("gate", choices=["orphan", "filler", "path", "contract", "all"],
+    parser.add_argument("gate", choices=["orphan", "filler", "path", "surface", "contract", "all"],
                         help="which gate to run")
     parser.add_argument("--base", default="origin/main",
                         help="git base ref for diff-scoped gates (default: origin/main)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--rebaseline", action="store_true",
+                        help="for surface gate only: regenerate exact-surface loss baseline")
     args = parser.parse_args(argv)
 
-    # filler + contract need the loaded corpus; path needs ids; orphan reads files directly.
+    if args.rebaseline and args.gate != "surface":
+        parser.error("--rebaseline is only supported with the surface gate")
+
+    # filler + contract need the loaded corpus; path needs ids; surface needs ownership.
     corpus = None
-    if args.gate in ("filler", "contract", "path", "all"):
+    if args.gate in ("filler", "contract", "path", "surface", "all"):
         corpus = load_corpus()  # strict=True → schema validation (raises on schema break)
 
     results: dict[str, dict] = {}
@@ -425,12 +571,14 @@ def main(argv: list[str] | None = None) -> int:
         results["filler"] = gate_filler()
     if args.gate in ("path", "all"):
         results["path"] = gate_path(args.base, corpus)
+    if args.gate in ("surface", "all"):
+        results["surface"] = gate_surface(args.base, corpus, rebaseline=args.rebaseline)
     if args.gate in ("contract", "all"):
         results["contract"] = gate_contract(corpus)
 
-    # Hard gates: orphan, filler, path (a "fail" status fails the run; "skip"/"pass" don't).
+    # Hard gates: orphan, filler, path, surface (a "fail" status fails the run; "skip"/"pass" don't).
     hard_failed = any(
-        results.get(g, {}).get("status") == "fail" for g in ("orphan", "filler", "path")
+        results.get(g, {}).get("status") == "fail" for g in ("orphan", "filler", "path", "surface")
     )
 
     if args.json:
@@ -448,13 +596,15 @@ def main(argv: list[str] | None = None) -> int:
         _print_filler(results["filler"])
     if "path" in results:
         _print_path(results["path"])
+    if "surface" in results:
+        _print_surface(results["surface"])
     if "contract" in results:
         _print_contract(results["contract"])
 
     if args.gate == "all":
         verdict = "FAIL" if hard_failed else "PASS"
         print(f"\n=== corpus-gate all: {verdict} "
-              f"(hard gates: orphan/filler/path; contract report-only) ===")
+              f"(hard gates: orphan/filler/path/surface; contract report-only) ===")
     return 1 if hard_failed else 0
 
 
